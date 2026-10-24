@@ -3,8 +3,7 @@
 
 //! Per-command usage: argument syntax + a one-line description for every
 //! native command in `main::NATIVE`. Rendered by `noo <words> --help` and by
-//! the "did not understand these arguments" hint before a Python
-//! fall-through. A test in `main.rs` pins this table to the registry 1:1,
+//! the "did not understand these arguments" usage error (exit 2). A test in `main.rs` pins this table to the registry 1:1,
 //! so adding a native command without a usage line fails the build's tests.
 //!
 //! Conventions: syntax lists the command's OWN arguments only (no `noo`, no
@@ -439,6 +438,53 @@ pub fn lookup(words: &[&str]) -> Option<(&'static str, &'static str)> {
         .map(|(_, s, d)| (*s, *d))
 }
 
+/// A native group (or nested group) followed by a word or flag it does not
+/// own. `path` is the deepest command path that parsed (`cluster class`),
+/// `unknown` the first token after it, `near` the nearest real next word:
+/// `--verify` is the subcommand `verify` typed as a flag; `verfy` is a typo.
+#[derive(Debug)]
+pub(crate) struct Misuse {
+    pub path: Vec<String>,
+    pub unknown: Option<String>,
+    pub near: Option<&'static str>,
+}
+
+/// `argv` (starting at the command word) names a native group but not a
+/// command under it. `None` when the first word is not a native group, or
+/// when a complete command row is followed by arguments (those are its
+/// arguments, not a verb).
+pub(crate) fn native_group_misuse(argv: &[String]) -> Option<Misuse> {
+    argv.first().filter(|w| is_native_group(w))?;
+    // Walk down while the next word extends a known command path.
+    let mut path: Vec<&str> = vec![argv[0].as_str()];
+    for tok in &argv[1..] {
+        if tok.starts_with('-') || is_command(&path) {
+            break;
+        }
+        if subcommands_under(&path).contains(&tok.as_str()) {
+            path.push(tok.as_str());
+        } else {
+            break;
+        }
+    }
+    if is_command(&path) && argv.len() > path.len() {
+        return None;
+    }
+    let subs = subcommands_under(&path);
+    let unknown = argv.get(path.len()).cloned();
+    let near = unknown.as_ref().and_then(|tok| {
+        let bare = tok.trim_start_matches('-');
+        if bare.is_empty() {
+            return None;
+        }
+        subs.iter()
+            .copied()
+            .find(|s| *s == bare)
+            .or_else(|| subs.iter().copied().find(|s| crate::edit_distance(s, bare) <= 2))
+    });
+    Some(Misuse { path: path.iter().map(|s| s.to_string()).collect(), unknown, near })
+}
+
 #[cfg(test)]
 mod tests {
     /// By design, `--break-glass` is gone. No usage line
@@ -486,5 +532,48 @@ mod tests {
         let (syntax, desc) = super::lookup(&["security", "at-rest", "create-volume"]).expect("at-rest create-volume");
         assert!(syntax.contains("--defer-recovery-key") && syntax.contains("--size <GiB>"), "{syntax}");
         assert!(desc.contains("recovery key once"), "{desc}");
+    }
+}
+
+#[cfg(test)]
+mod misuse_tests {
+    use super::*;
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_flag_typed_subcommand_is_matched_to_the_subcommand() {
+        let m = native_group_misuse(&argv(&["cluster", "--verify"])).expect("misuse");
+        assert_eq!(m.path, vec!["cluster"]);
+        assert_eq!(m.near, Some("verify"));
+    }
+
+    #[test]
+    fn a_typo_gets_the_nearest_subcommand_and_garbage_gets_none() {
+        let m = native_group_misuse(&argv(&["cluster", "verfy"])).expect("misuse");
+        assert_eq!(m.near, Some("verify"));
+        let m = native_group_misuse(&argv(&["cluster", "--zzzzzzzz"])).expect("misuse");
+        assert_eq!(m.near, None);
+        assert!(native_group_misuse(&argv(&["definitelynotacommand"])).is_none());
+    }
+
+    #[test]
+    fn the_unknown_token_is_the_one_after_the_deepest_parsed_level() {
+        let m = native_group_misuse(&argv(&["cluster", "bogus", "chat-default", "host3/vllm"])).expect("misuse");
+        assert_eq!(m.unknown.as_deref(), Some("bogus"));
+        // i136a: `class` parsed; `show` is the wrong word, not `class`.
+        let m = native_group_misuse(&argv(&["cluster", "class", "show", "chat-default"])).expect("misuse");
+        assert_eq!(m.path, vec!["cluster", "class"]);
+        assert_eq!(m.unknown.as_deref(), Some("show"));
+        let m = native_group_misuse(&argv(&["cluster", "class", "lst"])).expect("misuse");
+        assert_eq!(m.near, Some("list"));
+        // a complete nested command with arguments is not a misuse
+        assert!(native_group_misuse(&argv(&["cluster", "class", "set", "chat-default", "host3/vllm"])).is_none());
+        // `security keys list`: the verb is `service-key`
+        let m = native_group_misuse(&argv(&["security", "keys", "list"])).expect("misuse");
+        assert_eq!(m.unknown.as_deref(), Some("keys"));
+        assert!(subcommands_under(&["security"]).contains(&"service-key"));
     }
 }

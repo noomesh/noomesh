@@ -579,16 +579,15 @@ fn rotate_all_with_nothing_expiring_is_a_noop() {
 #[test]
 fn rotate_all_unknown_flag_is_a_usage_error() {
     // Unknown flags → Unhandled → a native USAGE error (exit 2) that
-    // prints the command's own usage. It used to fall through to the
-    // Python passthrough and complain about a missing `noo-py`, which was
-    // never the operator's actual problem (2026-09-03).
+    // prints the command's own usage. It used to fall through to a Python
+    // CLI and complain about a missing one, which was never the operator's
+    // actual problem (2026-09-03); nothing is exec'd now.
     let repo = install_repo("repo");
     let pki = scratch("pki");
     let mut cmd = Command::new(bin());
     cmd.args(["security", "pki", "rotate-all", "--bogus"])
         .env("NOO_REPO_ROOT", &repo)
         .env("NOO_PKI_DIR", &pki)
-        .env("NOO_PY_CLI", "/nonexistent/noo-py")
         .env("PATH", "/usr/bin:/bin");
     let out = cmd.output().unwrap();
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));

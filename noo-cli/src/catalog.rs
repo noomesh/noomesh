@@ -254,7 +254,7 @@ fn is_approved(model: &Value, backend: Option<&str>) -> bool {
 
 /// Apply the vendor+task allow-list, then publisher ranking. strict →
 /// approved only; prefer → approved first with the rest tagged unapproved;
-/// off → passthrough. Every read path (cache, stale cache, live, offline)
+/// off → unfiltered. Every read path (cache, stale cache, live, offline)
 /// goes through here, so this is where the catalog's order is decided.
 pub fn filter_approved(models: Vec<Value>, backend: Option<&str>) -> Vec<Value> {
     let mode = std::env::var("NOO_MODEL_FILTER_MODE")

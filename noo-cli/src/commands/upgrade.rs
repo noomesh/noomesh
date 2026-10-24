@@ -161,11 +161,11 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             v if v.starts_with("--version=") => {
                 pin = Some(v["--version=".len()..].trim_start_matches("noo-cli-v").to_string());
             }
-            // Native-only command: bad args must print usage HERE. Returning
-            // Unhandled fell through to the Python CLI, which has no
+            // Native-only command: bad args must print usage HERE. (Returning
+            // Unhandled used to fall through to a Python CLI, which has no
             // `upgrade` at all — an operator on an older binary running a
-            // newer flag got "noo-py: No such command 'upgrade'" (live
-            // 2026-08-23 with 0.2.23 + --all).
+            // newer flag got "No such command 'upgrade'" (live 2026-08-23
+            // with 0.2.23 + --all).)
             // `noo upgrade --stack v0.2.8` — a bare stack version is the tag
             // (the operator typed exactly this on the first rail walk).
             v if v.starts_with('v') && v.len() > 1

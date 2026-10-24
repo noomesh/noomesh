@@ -11,7 +11,7 @@ Does not cover: the fleet of nodes (`noo cluster`), or moving a controller betwe
 - `noo config get`/`set` read and write the gateway's runtime config, which is `noomesh.yaml` on disk; `noo security posture set` (Security) is the separate allow-list of security gates in the database.
 - `noo heartbeat` is the **cron** scheduler for user-facing tasks (briefings, reports, reindexes); `noo autonomy` (Fleet) is the self-healing engine; `noo proactive` (Agents & channels) is the rule-triggered notifier.
 - `noo logs` reads container logs **through the gateway and node-agents** (and Loki, for `query`); `noo stack logs` reads `docker logs` on this host directly.
-- `noo plugins list` finds executable `noo-<name>` shims on `PATH` (git-style); bare `noo plugins` is the only word left that passes through to the Python CLI, for in-process Python-package plugins. `noo skills` (Fleet) runs sandboxed containers; `noo prompt-skills` (Memory & knowledge) are prompt templates.
+- `noo plugins list` finds executable `noo-<name>` shims on `PATH` (git-style); bare `noo plugins` prints its usage and exits 2. Nothing in `noo` hands off to a Python CLI: an unknown command or subcommand prints a usage error and exits 2, and Python-package plugins (`~/.noo/plugins`) are not served by this binary. `noo skills` (Fleet) runs sandboxed containers; `noo prompt-skills` (Memory & knowledge) are prompt templates.
 
 ## Recipes
 

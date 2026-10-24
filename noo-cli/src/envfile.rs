@@ -8,11 +8,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// Repo root WITHOUT deriving it from the Python CLI path: `$NOO_REPO_ROOT`,
-/// else the standalone state home, else the checkout the process stands in,
-/// else the (possibly absent) state home directory. This is the
-/// non-recursive core that `python_cli_path`'s venv fallback uses — see the
-/// note on [`repo_root`].
+/// Repo root: `$NOO_REPO_ROOT`, else the standalone state home, else the
+/// checkout the process stands in, else the (possibly absent) state home
+/// directory. [`repo_root`] is this; the name stays for existing callers.
 ///
 /// The former last resort — a blind guess at `~/pai-assistant` — is gone
 /// It was the trap that made a dev clone
@@ -86,43 +84,18 @@ fn cwd_repo_root() -> Option<PathBuf> {
 }
 
 /// Locate the install root: $NOO_REPO_ROOT, else the standalone state home
-/// (`~/.noo` with its marker: the state home IS the install),
-/// else the checkout the process stands in, else derived from the Python CLI
-/// path (…/venv/bin/noo-py → repo), else the state home directory itself
+/// (`~/.noo` with its marker: the state home IS the install), else the
+/// checkout the process stands in, else the state home directory itself
 /// (no more `~/pai-assistant` guess — see [`repo_root_static`]).
 ///
-/// The python-derivation step calls [`crate::passthrough::python_cli_path`],
-/// whose own venv fallback needs a repo root. To avoid mutual recursion
-/// (repo_root → python_cli_path → repo_root → …, which stack-overflows on any
-/// host with no `$NOO_REPO_ROOT` and no Python `noo` on PATH — i.e. the
-/// standalone binary's core scenario), that fallback uses the non-recursive
-/// [`repo_root_static`] instead. Behaviour is unchanged for hosts that DON'T
-/// hit the recursion: whenever python_cli_path reaches its venv fallback the
-/// python-derivation branch here would have recursed forever anyway, so it
-/// could never have legitimately returned a python-derived path.
+/// There used to be a rung between the checkout and the state home that
+/// derived the root from the Python CLI's location (`<repo>/venv/bin/<cli>`
+/// -> `<repo>`). It is gone with the Python fall-through (the CLI no longer
+/// execs any Python): that rung made a dev checkout's venv decide which
+/// install a command targeted, so a box with a stray Python CLI on PATH
+/// could resolve the wrong root. The root is now
+/// declared (`NOO_REPO_ROOT`), the install (`~/.noo`), or where you stand.
 pub fn repo_root() -> PathBuf {
-    if let Ok(r) = std::env::var("NOO_REPO_ROOT") {
-        return PathBuf::from(r);
-    }
-    // Standalone install first: the state home
-    // IS the install — see standalone_home for the ranking rationale and
-    // the NOO_REPO_ROOT escape for devs who mean the checkout.
-    if let Some(d) = standalone_home() {
-        return d;
-    }
-    // In-checkout beats python-derived and canonical: standing inside a
-    // repo means THAT repo, same rule as git. See cwd_repo_root.
-    if let Some(d) = cwd_repo_root() {
-        return d;
-    }
-    if let Some(py) = crate::passthrough::python_cli_path() {
-        // <repo>/venv/bin/noo-py → <repo>
-        if let Some(root) = py.ancestors().nth(3) {
-            if root.join(".env").exists() || root.join("pyproject.toml").exists() {
-                return root.to_path_buf();
-            }
-        }
-    }
     repo_root_static()
 }
 
@@ -137,7 +110,7 @@ pub enum RootSource {
     Standalone,
     /// A checkout the cwd happens to be inside.
     Cwd,
-    /// Derived from the Python CLI's venv path, or the bare state home.
+    /// Nothing declared, no install, no checkout: the bare state home.
     Derived,
 }
 
@@ -155,7 +128,7 @@ impl RootSource {
             Self::Declared => "$NOO_REPO_ROOT",
             Self::Standalone => "the standalone install home (~/.noo, .noo-standalone marker)",
             Self::Cwd => "the checkout this command was run from",
-            Self::Derived => "derived (python venv path / state home)",
+            Self::Derived => "derived (the bare state home)",
         }
     }
 }

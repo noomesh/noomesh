@@ -139,13 +139,7 @@ struct Finding {
 /// Hints that are deliberately not literal, checkable commands. Every entry
 /// needs a reason; `every_suggested_command_parses` fails if an entry
 /// matches nothing (a stale allow-list hides real drift).
-const ALLOWED: &[(&str, &str, &str)] = &[
-    (
-        "commands/chat.rs",
-        "noo chat --no-use-cluster",
-        "offered only when passthrough::python_cli_path() finds a Python CLI; the flag is that CLI's, not the native parser's",
-    ),
-];
+const ALLOWED: &[(&str, &str, &str)] = &[];
 
 // ── global flags (see main.rs `resolve_with`) ────────────────────────────
 

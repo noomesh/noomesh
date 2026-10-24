@@ -18,7 +18,7 @@ fn bin() -> &'static str {
 fn run(args: &[&str]) -> Output {
     Command::new(bin())
         .args(args)
-        // No inherited env: no NOO_PY_CLI / PATH python fallback, no repo
+        // No inherited env: no PATH, no repo
         // detection surprises — the standalone-host scenario.
         .env_clear()
         .stdin(Stdio::null())
@@ -40,14 +40,14 @@ fn onboard_tui_without_tty_exits_2_with_guidance() {
 #[test]
 fn onboard_tui_guard_fires_with_any_flag_combination() {
     // Flag parity: skip flags / --reconfigure combine with --tui; the guard
-    // (not a Python fall-through, not a flag error) must still answer.
+    // (not a flag error) must still answer.
     let out = run(&["onboard", "--tui", "--reconfigure", "--skip-model", "--skip-channels"]);
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("interactive terminal"), "stderr: {err}");
     assert!(
         !err.contains("requires the Python install"),
-        "--tui must be native, not a Python passthrough: {err}"
+        "--tui must be native: {err}"
     );
 }
 

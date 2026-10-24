@@ -243,15 +243,9 @@ pub fn chat(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             ExitCode::GatewayUnreachable,
             "gateway_unreachable",
             &format!("cluster gateway at {base} is not reachable"),
-            // Offer the Python CLI's local-agent fallback only where a Python
-            // CLI exists: a standalone host has none, and `--no-use-cluster`
-            // is that CLI's flag, not this parser's (2026-09-30).
-            Some(if crate::passthrough::python_cli_path().is_some() {
-                "start the stack with `noo stack start`, or use the Python CLI's \
-                 local-agent fallback: `noo chat --no-use-cluster`"
-            } else {
-                "start the stack with `noo stack start`, then check it with `noo health`"
-            }),
+            // `--no-use-cluster` was the Python CLI's flag, never this
+            // parser's; nothing reaches that CLI any more.
+            Some("start the stack with `noo stack start`, then check it with `noo health`"),
         );
     }
 

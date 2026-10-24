@@ -16,7 +16,7 @@
 //! Nor is the answer "database with the file as a backup". That is exactly
 //! the shape `gateway-rust/src/addons.rs` warns about above `resolve()`:
 //! the same boolean once lived in `.env`, this launcher, the wizard, the
-//! gateway table and the compose passthrough, and on 2026-08-05 evolve's
+//! gateway table and the compose pass-through, and on 2026-08-05 evolve's
 //! schema was silently never provisioned because one of the copies never
 //! reached the gateway. A value with two homes gets a silent winner.
 //!
