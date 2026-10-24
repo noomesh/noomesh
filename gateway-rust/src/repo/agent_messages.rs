@@ -157,9 +157,13 @@ fn row_json(r: &sqlx::postgres::PgRow) -> Value {
     })
 }
 
-/// One exact name: what it sent or received, plus thread-addressed posts in
-/// threads it took part in.
-const AGENT_CLAUSE: &str = " AND (from_agent = $N OR to_agent = $N OR (to_agent = 'thread' AND thread_id IN \
+/// One exact name: what it sent or received, mail to its bare account (the
+/// fan-out rule `Caller::may_read` applies: mail to `owner` reaches every
+/// `owner/…` session), plus thread-addressed posts in threads it took part
+/// in. `split_part(name, '/', 1)` is the account (`auth::account_of`); for a
+/// bare account it is the name itself, already covered.
+const AGENT_CLAUSE: &str = " AND (from_agent = $N OR to_agent = $N OR to_agent = split_part($N, '/', 1) \
+    OR (to_agent = 'thread' AND thread_id IN \
     (SELECT thread_id FROM noo_agent_messages WHERE from_agent = $N OR to_agent = $N)))";
 
 /// An ACCOUNT's view: [`AGENT_CLAUSE`] widened from one name to the name
@@ -403,6 +407,17 @@ mod owner_tests {
         let src = include_str!("agent_messages.rs");
         let body = src.split("pub async fn threads(").nth(1).expect("threads fn");
         assert!(body.contains("owner_scope_clause(o)"), "threads must reuse the owner clause");
+    }
+
+    /// A session lists what `may_read` lets it read: mail to its bare
+    /// account fans out to it. Without this a session's inbox hid mail its
+    /// own reader would accept.
+    #[test]
+    fn a_sessions_list_includes_mail_to_its_account() {
+        assert!(AGENT_CLAUSE.contains("to_agent = split_part($N, '/', 1)"), "{AGENT_CLAUSE}");
+        // the thread seat stays the exact name: account mail does not seat a session in a thread
+        let sub = AGENT_CLAUSE.split("SELECT thread_id").nth(1).unwrap();
+        assert!(!sub.contains("split_part"), "{sub}");
     }
 
     #[test]
