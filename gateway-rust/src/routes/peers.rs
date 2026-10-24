@@ -27,6 +27,7 @@
 //! provided at registration time (default 3600s). Active WebSocket connections
 //! are tracked in `state.peer_connections` (in-memory, lost on restart).
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 use axum::{
     Router,
@@ -367,14 +368,11 @@ async fn peer_register(
 
     // Minting an agent identity is an identity event: who minted it, for
     // which agent, for how long. The token itself is never logged.
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "peer_token_minted",
-        "info",
-        &minter,
-        &format!("agent:{agent_id}"),
-        "success",
-        json!({ "agent_id": &agent_id, "ttl_seconds": ttl, "expires_at": expires_at }),
+        AuditEvent::new(AuditKind::PeerTokenMinted, &minter, &format!("agent:{agent_id}"))
+            .outcome(crate::audit::Outcome::custom("success"))
+            .details(json!({ "agent_id": &agent_id, "ttl_seconds": ttl, "expires_at": expires_at })),
     )
     .await;
 
@@ -503,14 +501,11 @@ async fn peer_deregister(
         "peer_deregistered"
     );
 
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "peer_deregistered",
-        "info",
-        &actor,
-        &format!("agent:{agent_id}"),
-        "success",
-        json!({ "agent_id": &agent_id, "removed_kv": removed_kv, "was_connected": was_connected }),
+        AuditEvent::new(AuditKind::PeerDeregistered, &actor, &format!("agent:{agent_id}"))
+            .outcome(crate::audit::Outcome::custom("success"))
+            .details(json!({ "agent_id": &agent_id, "removed_kv": removed_kv, "was_connected": was_connected })),
     )
     .await;
 

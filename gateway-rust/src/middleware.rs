@@ -3,6 +3,7 @@
 
 //! Axum middleware — rate limiting, request logging, tool call security.
 
+use crate::audit::{AuditEvent, AuditKind};
 use axum::{
     extract::{ConnectInfo, Request, State},
     http::StatusCode,
@@ -856,7 +857,7 @@ pub async fn effective_risk(state: &AppState, call: &ToolCall) -> RiskLevel {
 }
 
 /// One `noo_security_audit` row for a Medium or High tool execution decision (the writer
-/// is the HMAC-chained `audit_event`; with no audit key the row is refused and logged, as
+/// is the HMAC-chained `audit::record`; with no audit key the row is refused and logged, as
 /// for every other event). `decision` is what the gate did: `allowed`, `approved`,
 /// `denied`, `timeout` or `blocked`. Low-risk calls are not audited here.
 pub(crate) async fn audit_tool_decision(
@@ -872,14 +873,19 @@ pub(crate) async fn audit_tool_decision(
     }
     let turn = crate::routes::communication::turn_principal();
     let actor = if turn.requester.is_empty() { "unattended".to_string() } else { turn.requester.clone() };
-    crate::routes::core::audit_event(
+    // Allowed and approved calls are routine (`Info`, the kind's default); a
+    // denied, timed-out or blocked one is not.
+    let severity = if decision == "allowed" || decision == "approved" {
+        crate::audit::Severity::Info
+    } else {
+        crate::audit::Severity::Warning
+    };
+    crate::audit::record(
         &state.db,
-        "tool_exec",
-        if decision == "allowed" || decision == "approved" { "info" } else { "warning" },
-        &actor,
-        &format!("tool:{}", call.name),
-        decision,
-        serde_json::json!({
+        AuditEvent::new(AuditKind::ToolExec, &actor, &format!("tool:{}", call.name))
+            .outcome(decision)
+            .severity(severity)
+            .details(serde_json::json!({
             "tool": call.name,
             "risk": risk.to_string(),
             "decision": decision,
@@ -887,7 +893,7 @@ pub(crate) async fn audit_tool_decision(
             "conversation_id": turn.conversation_id,
             "channel": turn.channel,
             "request_id": request_id,
-        }),
+        })),
     )
     .await;
 }
@@ -969,14 +975,11 @@ pub async fn before_tool_call(
             } else {
                 // strict mode keeps the immediate deny. Record it so it
                 // is observable and feeds the noo_exec_denials_5m metric.
-                crate::routes::core::audit_event(
+                crate::audit::record(
                     &state.db,
-                    "exec_denied",
-                    "warning",
-                    "gateway",
-                    &format!("tool:{}", call.name),
-                    "denied",
-                    serde_json::json!({ "risk": risk_level.to_string(), "mode": mode }),
+                    AuditEvent::new(AuditKind::ExecDenied, "gateway", &format!("tool:{}", call.name))
+                        .outcome(crate::audit::Outcome::Denied)
+                        .details(serde_json::json!({ "risk": risk_level.to_string(), "mode": mode })),
                 )
                 .await;
                 audit_tool_decision(state, call, risk_level, "blocked", &mode, &request_id).await;
@@ -1124,21 +1127,18 @@ async fn wait_for_exec_approval(
         return ExecApprovalOutcome::TimedOut { request_id, secs: 0 };
     }
 
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "exec_approval_requested",
-        "warning",
-        "gateway",
-        &format!("tool:{}", call.name),
-        "pending",
-        serde_json::json!({
+        AuditEvent::new(AuditKind::ExecApprovalRequested, "gateway", &format!("tool:{}", call.name))
+            .outcome(crate::audit::Outcome::custom("pending"))
+            .details(serde_json::json!({
             "request_id": request_id,
             "risk": risk.to_string(),
             "window_secs": timeout_secs,
             "requester": principal.requester,
             "conversation_id": principal.conversation_id,
             "channel": principal.channel,
-        }),
+        })),
     )
     .await;
 
@@ -1196,20 +1196,23 @@ async fn wait_for_exec_approval(
             Ok(Some((status, resolved_by))) => match status.as_str() {
                 "approved" => {
                     let by = resolved_by.unwrap_or_else(|| "operator".into());
-                    crate::routes::core::audit_event(
-                        &state.db, "exec_approval_decided", "info", "gateway",
-                        &format!("tool:{}", call.name), "approved",
-                        serde_json::json!({"request_id": request_id, "by": by}),
+                    crate::audit::record(
+                        &state.db,
+                        AuditEvent::new(AuditKind::ExecApprovalDecided, "gateway", &format!("tool:{}", call.name))
+                            .outcome(crate::audit::Outcome::custom("approved"))
+                            .details(serde_json::json!({"request_id": request_id, "by": by})),
                     ).await;
                     tracing::info!(request_id = %request_id, by = %by, "exec_approval.approved");
                     return ExecApprovalOutcome::Approved;
                 }
                 "denied" => {
                     let by = resolved_by.unwrap_or_else(|| "operator".into());
-                    crate::routes::core::audit_event(
-                        &state.db, "exec_approval_decided", "warning", "gateway",
-                        &format!("tool:{}", call.name), "denied",
-                        serde_json::json!({"request_id": request_id, "by": by}),
+                    crate::audit::record(
+                        &state.db,
+                        AuditEvent::new(AuditKind::ExecApprovalDecided, "gateway", &format!("tool:{}", call.name))
+                            .outcome(crate::audit::Outcome::Denied)
+                            .severity(crate::audit::Severity::Warning)
+                            .details(serde_json::json!({"request_id": request_id, "by": by})),
                     ).await;
                     return ExecApprovalOutcome::Denied { by, request_id };
                 }
@@ -1235,10 +1238,12 @@ async fn wait_for_exec_approval(
             .bind(&request_id)
             .execute(&state.db)
             .await;
-            crate::routes::core::audit_event(
-                &state.db, "exec_approval_decided", "warning", "gateway",
-                &format!("tool:{}", call.name), "expired",
-                serde_json::json!({"request_id": request_id, "window_secs": timeout_secs}),
+            crate::audit::record(
+                &state.db,
+                AuditEvent::new(AuditKind::ExecApprovalDecided, "gateway", &format!("tool:{}", call.name))
+                    .outcome(crate::audit::Outcome::custom("expired"))
+                    .severity(crate::audit::Severity::Warning)
+                    .details(serde_json::json!({"request_id": request_id, "window_secs": timeout_secs})),
             ).await;
             return ExecApprovalOutcome::TimedOut { request_id, secs: timeout_secs };
         }

@@ -54,6 +54,7 @@
 //!   matter how many times the run is interrupted. (The first writer wins; a
 //!   message row is immutable apart from `read_at`/`delivered_at`.)
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::collections::HashSet;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
@@ -412,14 +413,11 @@ pub async fn export(
 ) -> Result<Value, ExportError> {
     if !operator {
         if wanted_decrypt {
-            crate::routes::core::audit_event(
+            crate::audit::record(
                 db,
-                "agent_archive_decrypt",
-                "warning",
-                actor,
-                month_arg,
-                "denied",
-                json!({ "month": month_arg, "reason": "not an operator" }),
+                AuditEvent::new(AuditKind::AgentArchiveDecrypt, actor, month_arg)
+                    .outcome(crate::audit::Outcome::Denied)
+                    .details(json!({ "month": month_arg, "reason": "not an operator" })),
             )
             .await;
         }
@@ -441,14 +439,10 @@ pub async fn export(
         let Some(keys) = decrypt else {
             return Err(ExportError::NoKey("no review key on this controller, so sealed bodies cannot be opened".into()));
         };
-        let recorded = crate::routes::core::audit_event_required(
+        let recorded = crate::audit::record_required(
             db,
-            "agent_archive_decrypt",
-            "warning",
-            actor,
-            &format!("{y:04}-{m:02}"),
-            "ok",
-            json!({ "month": format!("{y:04}-{m:02}"), "file": name, "rows": rows.len(), "by": actor }),
+            AuditEvent::new(AuditKind::AgentArchiveDecrypt, actor, &format!("{y:04}-{m:02}"))
+                .details(json!({ "month": format!("{y:04}-{m:02}"), "file": name, "rows": rows.len(), "by": actor })),
         )
         .await;
         if !recorded {

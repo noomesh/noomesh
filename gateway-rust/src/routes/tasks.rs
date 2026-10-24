@@ -28,6 +28,7 @@
 //! the harness of the node holding its model, or in this process. Only
 //! the owner or an operator may read or stop it.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 
 use axum::{
@@ -139,7 +140,12 @@ async fn tasks_create(State(state): State<Arc<AppState>>, ctx: Option<Extension<
         }
     }
     let started = crate::tasks::start(&state, &task).await.map_err(|e| AppError::Internal(e.to_string()))?;
-    crate::routes::core::audit_event(&state.db, "task_created", "info", &user, &task.id, "started", json!({"node": started.node, "dispatched": started.dispatched, "loop_budget": task.loop_budget, "token_budget": task.token_budget})).await;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::TaskCreated, &user, &task.id)
+            .outcome(crate::audit::Outcome::custom("started"))
+            .details(json!({"node": started.node, "dispatched": started.dispatched, "loop_budget": task.loop_budget, "token_budget": task.token_budget})),
+    ).await;
     let task = crate::tasks::get(&state.db, &task.id).await.map_err(|e| AppError::Internal(e.to_string()))?.unwrap_or(task);
     // `dispatched` and `why` say whether a NODE took the turn and, when
     // none did, what stopped it. Without them the answer is a container
@@ -268,7 +274,12 @@ async fn tasks_resubmit(State(state): State<Arc<AppState>>, ctx: Option<Extensio
     let req = body.map(|Json(b)| b).unwrap_or_default();
     let (after, started) = crate::task_budget::resubmit(&state, &task, req.token_budget).await?;
     let (user, _) = person(&ctx)?;
-    crate::routes::core::audit_event(&state.db, "task_resubmitted", "info", &user, &task.id, if started.is_some() { "resumed" } else { "adjusted" }, json!({"token_budget": after.token_budget, "tokens_spent": after.tokens_spent})).await;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::TaskResubmitted, &user, &task.id)
+            .outcome(if started.is_some() { crate::audit::Outcome::custom("resumed") } else { crate::audit::Outcome::custom("adjusted") })
+            .details(json!({"token_budget": after.token_budget, "tokens_spent": after.tokens_spent})),
+    ).await;
     Ok(Json(json!({
         "task": after,
         "resumed": started.is_some(),
@@ -299,7 +310,12 @@ async fn tasks_answer(State(state): State<Arc<AppState>>, ctx: Option<Extension<
     let task = owner_only(&state, &ctx, &adt, &id).await?;
     let (after, started) = crate::task_budget::answer(&state, &task, &req.text).await?;
     let (user, _) = person(&ctx)?;
-    crate::routes::core::audit_event(&state.db, "task_answered", "info", &user, &task.id, "resumed", json!({"node": started.node})).await;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::TaskAnswered, &user, &task.id)
+            .outcome(crate::audit::Outcome::custom("resumed"))
+            .details(json!({"node": started.node})),
+    ).await;
     Ok(Json(json!({"task": after, "node": started.node, "dispatched": started.dispatched, "queued": started.queued, "why": started.why})))
 }
 
@@ -308,7 +324,12 @@ async fn tasks_stop(State(state): State<Arc<AppState>>, ctx: Option<Extension<Re
     let task = owned(&state, &ctx, &adt, &id).await?;
     let stopped = crate::tasks::stop(&state.db, &task.id).await.map_err(|e| AppError::Internal(e.to_string()))?;
     let (user, _) = person(&ctx)?;
-    crate::routes::core::audit_event(&state.db, "task_stopped", "info", &user, &task.id, if stopped { "stopped" } else { "not_running" }, json!({"was": task.state})).await;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::TaskStopped, &user, &task.id)
+            .outcome(if stopped { crate::audit::Outcome::custom("stopped") } else { crate::audit::Outcome::custom("not_running") })
+            .details(json!({"was": task.state})),
+    ).await;
     Ok(Json(json!({"stopped": stopped, "task_id": task.id})))
 }
 
@@ -339,7 +360,12 @@ async fn tasks_stop_via(State(state): State<Arc<AppState>>, ctx: Option<Extensio
     };
     let ids = crate::tasks::stop_via(&state.db, &owner, via).await.map_err(|e| AppError::Internal(e.to_string()))?;
     for id in &ids {
-        crate::routes::core::audit_event(&state.db, "task_stopped", "info", &user, id, "background_revoked", json!({"via": via, "owner": owner})).await;
+        crate::audit::record(
+            &state.db,
+            AuditEvent::new(AuditKind::TaskStopped, &user, id)
+                .outcome(crate::audit::Outcome::custom("background_revoked"))
+                .details(json!({"via": via, "owner": owner})),
+        ).await;
     }
     Ok(Json(json!({"stopped": ids, "count": ids.len(), "via": via, "owner": owner})))
 }

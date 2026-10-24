@@ -30,6 +30,7 @@
 //! these 24 tools through bespoke prose formatters. Those formatters were dropped
 //! (four returned a single field; two truncated lists silently).
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
@@ -831,14 +832,10 @@ async fn handle(
             // tracing line lives as long as the log buffer, and "which key
             // called which tool" is exactly what an operator needs after
             // handing a key to someone.
-            crate::routes::core::audit_event(
+            crate::audit::record(
                 &state.db,
-                "mcp_tool_call",
-                "info",
-                &format!("{}:{}", caller.consumer, caller.user),
-                name,
-                "ok",
-                json!({ "door": "user", "consumer": caller.consumer, "user": caller.user, "tool": name, "era": env.era.as_str() }),
+                AuditEvent::new(AuditKind::McpToolCall, &format!("{}:{}", caller.consumer, caller.user), name)
+                    .details(json!({ "door": "user", "consumer": caller.consumer, "user": caller.user, "tool": name, "era": env.era.as_str() })),
             )
             .await;
 

@@ -42,6 +42,7 @@
 //! inside, signed with the fleet signing key (`noo kiosk` seat staging) — the
 //! gateway never sees plaintext, exactly like a node bundle.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -212,14 +213,10 @@ async fn seat_token_create(
     let gateway = enroll_url(&controller_url()).map_err(AppError::Unavailable)?;
     let ca_sha256 = cluster_ca_fingerprint_from(&cluster_ca_candidates()).map_err(AppError::Unavailable)?;
     let t = mint_seat_token(&state.db, &seat, ttl, &by).await?;
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "seat_token_create",
-        "warning",
-        &by,
-        &format!("seat-token:{}", t.id),
-        "ok",
-        json!({ "token_id": t.id.to_string(), "seat": seat, "ttl_seconds": ttl, "role": "seat" }),
+        AuditEvent::new(AuditKind::SeatTokenCreate, &by, &format!("seat-token:{}", t.id))
+            .details(json!({ "token_id": t.id.to_string(), "seat": seat, "ttl_seconds": ttl, "role": "seat" })),
     )
     .await;
     Ok(Json(json!({
@@ -299,8 +296,11 @@ async fn seat_token_revoke(
     if updated.rows_affected() == 0 {
         return Err(AppError::NotFound(format!("seat token {id} not found")));
     }
-    crate::routes::core::audit_event(&state.db, "seat_token_revoke", "info", &by,
-        &format!("seat-token:{id}"), "ok", json!({ "token_id": id.to_string() })).await;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::SeatTokenRevoke, &by, &format!("seat-token:{id}"))
+            .details(json!({ "token_id": id.to_string() })),
+    ).await;
     Ok(Json(json!({ "status": "ok", "id": id.to_string(), "revoked": true })))
 }
 
@@ -466,8 +466,12 @@ async fn seat_enroll(
         let ip = ip.clone();
         async move {
             let resource = id.map(|i| format!("seat-token:{i}")).unwrap_or_else(|| "seat-token:unknown".into());
-            crate::routes::core::audit_event(&db, "seat_token_denied", "warning", "anonymous", &resource,
-                "denied", json!({ "reason": reason.as_str(), "ip": ip })).await;
+            crate::audit::record(
+                &db,
+                AuditEvent::new(AuditKind::SeatTokenDenied, "anonymous", &resource)
+                    .outcome(crate::audit::Outcome::Denied)
+                    .details(json!({ "reason": reason.as_str(), "ip": ip })),
+            ).await;
             AppError::Forbidden(DENIED_MSG.into())
         }
     };
@@ -495,8 +499,11 @@ async fn seat_enroll(
         Err((reason, id)) => return Err(deny(reason, id).await),
     };
     record_seat(&state.db, &seat, cert, facts, enroll_user, id).await?;
-    crate::routes::core::audit_event(&state.db, "seat_enrolled", "warning", "anonymous",
-        &format!("seat:{seat}"), "ok", json!({ "token_id": id.to_string(), "seat": seat, "ip": ip })).await;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::SeatEnrolled, "anonymous", &format!("seat:{seat}"))
+            .details(json!({ "token_id": id.to_string(), "seat": seat, "ip": ip })),
+    ).await;
     tracing::info!(seat = %seat, ip = %ip, "seat_enrolled");
     Ok(Json(json!({
         "status": "ok",
@@ -586,8 +593,11 @@ async fn seat_bundle_put(
     if r.rows_affected() == 0 {
         return Err(AppError::NotFound(format!("no seat named '{seat}' is enrolled")));
     }
-    crate::routes::core::audit_event(&state.db, "seat_bundle_staged", "warning", &by,
-        &format!("seat-bundle:{seat}"), "ok", json!({ "seat": seat, "bytes": body.len() })).await;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::SeatBundleStaged, &by, &format!("seat-bundle:{seat}"))
+            .details(json!({ "seat": seat, "bytes": body.len() })),
+    ).await;
     Ok(Json(json!({ "status": "staged", "seat": seat, "bytes": body.len() })))
 }
 
@@ -765,9 +775,14 @@ async fn seat_apply_report(
     .bind(&msg)
     .execute(&state.db)
     .await?;
-    crate::routes::core::audit_event(&state.db, "seat_bundle_applied",
-        if rc == 0 { "info" } else { "warning" }, &format!("seat:{seat}"), &format!("seat-bundle:{seat}"),
-        if rc == 0 { "ok" } else { "failed" }, json!({ "seat": seat, "rc": rc, "sha": sha, "msg": msg })).await;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::SeatBundleApplied, &format!("seat:{seat}"), &format!("seat-bundle:{seat}"))
+            .outcome(if rc == 0 { crate::audit::Outcome::Ok } else { crate::audit::Outcome::custom("failed") })
+            .severity(if rc == 0 { crate::audit::Severity::Info } else { crate::audit::Severity::Warning })
+            .details(json!({ "seat": seat, "rc": rc, "sha": sha, "msg": msg })),
+    )
+    .await;
     Ok(Json(json!({ "recorded": true, "seat": seat, "rc": rc })))
 }
 

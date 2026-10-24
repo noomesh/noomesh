@@ -19,6 +19,7 @@
 //! research) and is treated as operator-tier, the same as everywhere else
 //! a cluster caller has no person behind it.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::str::FromStr;
 
 use serde_json::{json, Value};
@@ -315,14 +316,11 @@ async fn record(state: &AppState, server: &str, tool: &str, user: Option<&str>, 
     {
         tracing::warn!(error = %e, "mcp_call_record_failed");
     }
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "mcp_external_call",
-        "info",
-        user.unwrap_or("internal"),
-        &full_name(server, tool),
-        if ok { "ok" } else { "error" },
-        json!({ "server": server, "tool": tool, "ms": ms }),
+        AuditEvent::new(AuditKind::McpExternalCall, user.unwrap_or("internal"), &full_name(server, tool))
+            .outcome(if ok { crate::audit::Outcome::Ok } else { crate::audit::Outcome::Error })
+            .details(json!({ "server": server, "tool": tool, "ms": ms })),
     )
     .await;
 }

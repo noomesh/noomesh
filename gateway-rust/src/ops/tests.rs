@@ -1932,7 +1932,7 @@ fn the_audit_intent_row_precedes_the_worker_call_in_the_source() {
     let start = src.find("pub(crate) async fn entity_cleanup_run").expect("entity_cleanup_run");
     let b = &src[start..];
     let b = &b[..b.find("\n}\n").unwrap()];
-    let required = b.find("audit_event_required(").expect("an applied run is audited through audit_event_required");
+    let required = b.find("audit::record_required(").expect("an applied run is audited through audit::record_required");
     let worker = b.find("ask_worker(").expect("asks the worker");
     assert!(required < worker, "audit first, then delete");
     assert!(b.find("graph.recluster").unwrap() < required, "the busy check precedes the intent row");

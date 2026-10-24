@@ -49,6 +49,7 @@
 //! wrong-CIDR. The distinction is recorded internally in the
 //! `bootstrap_token_denied` audit row, never in the response.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -565,20 +566,16 @@ async fn bootstrap_token_create(
     // Audit the ID, never the raw token or its hash: the raw value is a live
     // credential and the hash is the verifier — an audit reader needs
     // neither to answer "who minted what, when".
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "bootstrap_token_create",
-        "warning",
-        &by,
-        &format!("bootstrap-token:{id}"),
-        "ok",
-        json!({
+        AuditEvent::new(AuditKind::BootstrapTokenCreate, &by, &format!("bootstrap-token:{id}"))
+            .details(json!({
             "token_id": id.to_string(),
             "ttl_seconds": ttl,
             "role_hint": role_hint,
             "allowed_cidr": allowed_cidr,
             "tailnet_key": !tsk.is_empty(),
-        }),
+        })),
     )
     .await;
 
@@ -712,14 +709,10 @@ async fn bootstrap_token_revoke(
         return Err(AppError::NotFound(format!("bootstrap token {id} not found")));
     }
 
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "bootstrap_token_revoke",
-        "info",
-        &by,
-        &format!("bootstrap-token:{id}"),
-        "ok",
-        json!({ "token_id": id.to_string() }),
+        AuditEvent::new(AuditKind::BootstrapTokenRevoke, &by, &format!("bootstrap-token:{id}"))
+            .details(json!({ "token_id": id.to_string() })),
     )
     .await;
     Ok(Json(json!({ "status": "ok", "id": id.to_string(), "revoked": true })))
@@ -818,14 +811,11 @@ async fn cluster_bootstrap(
             let resource = token_id
                 .map(|id| format!("bootstrap-token:{id}"))
                 .unwrap_or_else(|| "bootstrap-token:unknown".to_string());
-            crate::routes::core::audit_event(
+            crate::audit::record(
                 &db,
-                "bootstrap_token_denied",
-                "warning",
-                "anonymous",
-                &resource,
-                "denied",
-                json!({ "reason": reason.as_str(), "ip": ip }),
+                AuditEvent::new(AuditKind::BootstrapTokenDenied, "anonymous", &resource)
+                    .outcome(crate::audit::Outcome::Denied)
+                    .details(json!({ "reason": reason.as_str(), "ip": ip })),
             )
             .await;
             AppError::Forbidden(DENIED_MSG.into())
@@ -950,14 +940,10 @@ async fn cluster_bootstrap(
         .execute(&state.db)
         .await?;
 
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "bootstrap_token_used",
-        "warning",
-        "anonymous",
-        &format!("bootstrap-token:{id}"),
-        "ok",
-        json!({ "token_id": id.to_string(), "ip": peer_ip.to_string(), "role_hint": role_hint }),
+        AuditEvent::new(AuditKind::BootstrapTokenUsed, "anonymous", &format!("bootstrap-token:{id}"))
+            .details(json!({ "token_id": id.to_string(), "ip": peer_ip.to_string(), "role_hint": role_hint })),
     )
     .await;
     tracing::info!(token_id = %id, ip = %peer_ip, "bootstrap_token_used");
@@ -1061,9 +1047,11 @@ async fn enroll_tailnet(
         let db = state.db.clone();
         let ip = body.tailnet_ip.clone();
         async move {
-            crate::routes::core::audit_event(
-                &db, "tailnet_enroll_denied", "warning", "anonymous",
-                &format!("tailnet-enroll:{ip}"), "denied", json!({ "reason": reason }),
+            crate::audit::record(
+                &db,
+                AuditEvent::new(AuditKind::TailnetEnrollDenied, "anonymous", &format!("tailnet-enroll:{ip}"))
+                    .outcome(crate::audit::Outcome::Denied)
+                    .details(json!({ "reason": reason })),
             ).await;
             AppError::Forbidden("tailnet enrollment denied".into())
         }
@@ -1143,13 +1131,13 @@ async fn enroll_tailnet(
         .execute(&state.db)
         .await?;
 
-    crate::routes::core::audit_event(
-        &state.db, "tailnet_enroll_admitted", "warning", "anonymous",
-        &format!("bootstrap-token:{}", row.0), "ok",
-        json!({
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::TailnetEnrollAdmitted, "anonymous", &format!("bootstrap-token:{}", row.0))
+            .details(json!({
             "node_name": node_name, "tailnet_ip": body.tailnet_ip,
             "tag": required_tag, "peer": peer.ip().to_string(),
-        }),
+        })),
     )
     .await;
     tracing::info!(node = %node_name, ip = %body.tailnet_ip, "tailnet_enroll_admitted");
@@ -1173,13 +1161,14 @@ async fn name_conflict_audit(
     holder: &crate::node_name_claim::NameHolder,
     lane: &str,
 ) {
-    crate::routes::core::audit_event(
-        db, "enroll_name_conflict", "warning", "anonymous",
-        &format!("node:{name}"), "denied",
-        json!({
+    crate::audit::record(
+        db,
+        AuditEvent::new(AuditKind::EnrollNameConflict, "anonymous", &format!("node:{name}"))
+            .outcome(crate::audit::Outcome::Denied)
+            .details(json!({
             "node_name": name, "claimant": addr, "lane": lane,
             "held_by": holder.addrs, "controller": holder.controller,
-        }),
+        })),
     )
     .await;
     tracing::warn!(node = %name, claimant = %addr, held_by = ?holder.addrs, controller = holder.controller, lane,
@@ -1289,14 +1278,10 @@ async fn cli_asset_put(
     .await?;
     let actor = ctx.as_ref().map(|Extension(r)| r.sub.clone())
         .unwrap_or_else(|| "gateway".into());
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "cli_asset_uploaded",
-        "warning",
-        &actor,
-        &format!("cli-asset:{name}"),
-        "ok",
-        json!({ "name": name, "version": version, "bytes": body.len() }),
+        AuditEvent::new(AuditKind::CliAssetUploaded, &actor, &format!("cli-asset:{name}"))
+            .details(json!({ "name": name, "version": version, "bytes": body.len() })),
     )
     .await;
     Ok(Json(json!({"ok": true, "name": name, "sha256": actual, "version": version, "bytes": body.len()})))
@@ -1370,14 +1355,10 @@ async fn provision_bundle_put(
     .await?;
     let actor = ctx.as_ref().map(|Extension(r)| r.sub.clone())
         .unwrap_or_else(|| "gateway".into());
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "provision_bundle_staged",
-        "warning",
-        &actor,
-        &format!("provision-bundle:{node}"),
-        "ok",
-        json!({ "node": node, "bytes": body.len() }),
+        AuditEvent::new(AuditKind::ProvisionBundleStaged, &actor, &format!("provision-bundle:{node}"))
+            .details(json!({ "node": node, "bytes": body.len() })),
     )
     .await;
     Ok(Json(json!({ "status": "staged", "node": node, "bytes": body.len() })))
@@ -1609,15 +1590,13 @@ async fn bundle_apply_report(
     .bind(&msg)
     .execute(&state.db)
     .await?;
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "bundle_apply_reported",
-        if rc == 0 { "info" } else { "warning" },
-        &format!("node:{node}"),
-        &format!("provision-bundle:{node}"),
-        if rc == 0 { "ok" } else { "failed" },
-        json!({ "node": node, "rc": rc, "sha": sha, "msg": msg,
-                "proved_by": proved_by }),
+        AuditEvent::new(AuditKind::BundleApplyReported, &format!("node:{node}"), &format!("provision-bundle:{node}"))
+            .outcome(if rc == 0 { crate::audit::Outcome::Ok } else { crate::audit::Outcome::custom("failed") })
+            .severity(if rc == 0 { crate::audit::Severity::Info } else { crate::audit::Severity::Warning })
+            .details(json!({ "node": node, "rc": rc, "sha": sha, "msg": msg,
+                "proved_by": proved_by })),
     )
     .await;
     Ok(Json(json!({ "recorded": true, "node": node, "rc": rc, "signed": birth_signed })))
@@ -2064,7 +2043,7 @@ mod tests {
     /// returning the one uniform message. Assert the uniform constant is the
     /// ONLY Forbidden body in the redemption handler, and that the reason
     /// enum never leaks into a response ("reason" appears only next to
-    /// audit_event calls).
+    /// audit::record calls).
     #[test]
     fn redemption_failures_are_uniform() {
         let src = include_str!("bootstrap.rs");
@@ -2100,7 +2079,7 @@ mod tests {
         assert!(!create.contains(".bind(&raw)"), "the raw token must never be bound to SQL");
         // The audit call's arguments (everything up to its `.await`) must not
         // carry the raw token or the hash.
-        let audit_start = create.find("audit_event").unwrap();
+        let audit_start = create.find("audit::record").unwrap();
         let after = &create[audit_start..];
         let audit_call = &after[..after.find(".await").expect("audit call is awaited")];
         assert!(!audit_call.contains("raw"), "audit details must not include the raw token");
@@ -2141,7 +2120,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} not found"));
             let body = &src[start..src[start..].find("\n}\n").unwrap_or(src.len() - start) + start];
             assert!(
-                body.contains("audit_event"),
+                body.contains("audit::record"),
                 "mutating bootstrap route handler {name} writes no audit row"
             );
         }

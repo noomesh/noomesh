@@ -15,6 +15,7 @@
 //! OBSERVABILITY-bucket count endpoints (phase-0 classification) that
 //! must keep answering to REPORT a provider outage.
 
+use crate::audit::{AuditEvent, AuditKind, Outcome as AuditOutcome, Severity};
 use std::sync::Arc;
 use axum::{
     Router,
@@ -215,12 +216,19 @@ async fn audit_retag(
         .map(|c| crate::auth::account_of(&c.sub).to_string())
         .unwrap_or_else(|| "cluster".to_string());
     let (severity, outcome, details) = retag_audit_row(body, response);
-    super::core::audit_event(&state.db, "kb_retag", severity, &actor, "kb:docs", outcome, details).await;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::KbRetag, &actor, "kb:docs")
+            .outcome(outcome)
+            .severity(severity)
+            .details(details),
+    )
+    .await;
 }
 
 /// `(severity, outcome, details)` of the audit row for an applied retag.
 /// Pure so a test can pin what is recorded.
-fn retag_audit_row(body: &Value, response: &Value) -> (&'static str, &'static str, Value) {
+fn retag_audit_row(body: &Value, response: &Value) -> (Severity, AuditOutcome, Value) {
     let payload = response.get("data").unwrap_or(response);
     let error = payload.get("error").and_then(|e| e.as_str());
     let ids: Vec<Value> = payload
@@ -229,8 +237,8 @@ fn retag_audit_row(body: &Value, response: &Value) -> (&'static str, &'static st
         .map(|d| d.iter().filter_map(|x| x.get("doc_id").cloned()).take(50).collect())
         .unwrap_or_default();
     (
-        if error.is_some() { "warning" } else { "info" },
-        if error.is_some() { "refused" } else { "ok" },
+        if error.is_some() { Severity::Warning } else { Severity::Info },
+        if error.is_some() { AuditOutcome::custom("refused") } else { AuditOutcome::Ok },
         json!({
             "roles": body.get("roles"),
             "match": body.get("match"),
@@ -272,7 +280,7 @@ async fn docs_hold(
     match state.memory().kb_hold(&body).await {
         Ok(response) => {
             if applying {
-                audit_hold(&state, &ctx, "kb_hold", &body, &response).await;
+                audit_hold(&state, &ctx, AuditKind::KbHold, &body, &response).await;
             }
             delegation::worker_ok(response)
         }
@@ -295,7 +303,7 @@ async fn docs_unhold(
     match state.memory().kb_unhold(&body).await {
         Ok(response) => {
             if applying {
-                audit_hold(&state, &ctx, "kb_unhold", &body, &response).await;
+                audit_hold(&state, &ctx, AuditKind::KbUnhold, &body, &response).await;
             }
             delegation::worker_ok(response)
         }
@@ -320,7 +328,7 @@ async fn docs_purge(
     match state.memory().kb_purge(&body).await {
         Ok(response) => {
             if applying {
-                audit_hold(&state, &ctx, "kb_purge", &body, &response).await;
+                audit_hold(&state, &ctx, AuditKind::KbPurge, &body, &response).await;
             }
             delegation::worker_ok(response)
         }
@@ -361,7 +369,7 @@ struct HeldQuery {
 async fn audit_hold(
     state: &AppState,
     ctx: &Option<axum::Extension<crate::auth::RequesterCtx>>,
-    event: &str,
+    event: AuditKind,
     body: &Value,
     response: &Value,
 ) {
@@ -369,17 +377,24 @@ async fn audit_hold(
         .as_ref()
         .map(|c| crate::auth::account_of(&c.sub).to_string())
         .unwrap_or_else(|| "cluster".to_string());
-    let (severity, outcome, details) = hold_audit_row(event, body, response);
-    super::core::audit_event(&state.db, event, severity, &actor, "kb:docs", outcome, details).await;
+    let (severity, outcome, details) = hold_audit_row(&event, body, response);
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(event, &actor, "kb:docs")
+            .outcome(outcome)
+            .severity(severity)
+            .details(details),
+    )
+    .await;
 }
 
 /// `(severity, outcome, details)` of the audit row. Pure so a test can pin it.
-fn hold_audit_row(event: &str, body: &Value, response: &Value) -> (&'static str, &'static str, Value) {
+fn hold_audit_row(event: &AuditKind, body: &Value, response: &Value) -> (Severity, AuditOutcome, Value) {
     let payload = response.get("data").unwrap_or(response);
     let error = payload.get("error").and_then(|e| e.as_str());
     (
-        if error.is_some() || event == "kb_purge" { "warning" } else { "info" },
-        if error.is_some() { "refused" } else { "ok" },
+        if error.is_some() || *event == AuditKind::KbPurge { Severity::Warning } else { Severity::Info },
+        if error.is_some() { AuditOutcome::custom("refused") } else { AuditOutcome::Ok },
         json!({
             "reason": body.get("reason"),
             "title_prefix": body.get("title_prefix"),
@@ -1835,14 +1850,12 @@ pub(crate) fn entity_cleanup_audit_details(request: &Value, report: Option<&Valu
     })
 }
 
-const ENTITY_CLEANUP_AUDIT_EVENT: &str = "graph_entity_cleanup";
-
 /// What `POST /api/v1/graph/entity-cleanup` does. One body for the route's op
 /// and for `POST /api/v1/ops {type: "graph.entity_cleanup"}`.
 ///
 /// AUDIT. An APPLIED run writes two `noo_security_audit` rows. The first,
 /// `outcome: started`, is written BEFORE the worker is asked and through
-/// `audit_event_required`: a destructive run must not happen unaudited, so if
+/// `audit::record_required`: a destructive run must not happen unaudited, so if
 /// the row cannot be written (no `NOO_AUDIT_HMAC_KEY`, the partition heal
 /// failed) nothing is deleted and the answer is 503. The second, written after
 /// (`ok` / `busy` / `failed`), carries the counts and the run id and is
@@ -1958,15 +1971,12 @@ where
                 "busy: a graph recluster is running; try again when it has finished",
             );
         }
-        let started = ENTITY_CLEANUP_AUDIT_EVENT;
-        if !super::core::audit_event_required(
+        if !crate::audit::record_required(
             db,
-            started,
-            "warning",
-            actor,
-            "graph:entities",
-            "started",
-            with_extra(entity_cleanup_audit_details(&request, None, "apply"), &caller.extra),
+            AuditEvent::new(AuditKind::GraphEntityCleanup, actor, "graph:entities")
+                .outcome(AuditOutcome::custom("started"))
+                .severity(Severity::Warning)
+                .details(with_extra(entity_cleanup_audit_details(&request, None, "apply"), &caller.extra)),
         )
         .await
         {
@@ -2002,17 +2012,15 @@ where
     };
     if apply {
         let result = if busy { "busy" } else if outcome.failure.is_some() { "failed" } else { "ok" };
-        super::core::audit_event(
+        crate::audit::record(
             db,
-            ENTITY_CLEANUP_AUDIT_EVENT,
-            if result == "ok" { "warning" } else { "error" },
-            actor,
-            "graph:entities",
-            result,
-            with_extra(
-                entity_cleanup_audit_details(&request, if outcome.failure.is_none() { Some(&payload) } else { None }, "apply"),
-                &caller.extra,
-            ),
+            AuditEvent::new(AuditKind::GraphEntityCleanup, actor, "graph:entities")
+                .outcome(result)
+                .severity(if result == "ok" { Severity::Warning } else { Severity::Error })
+                .details(with_extra(
+                    entity_cleanup_audit_details(&request, if outcome.failure.is_none() { Some(&payload) } else { None }, "apply"),
+                    &caller.extra,
+                )),
         )
         .await;
     }
@@ -2298,7 +2306,7 @@ mod docs_audience_tests {
         let resp = json!({"data": {"status": "ok", "matched": 2, "applied": 2, "roles": ["user:alice"],
             "documents": [{"doc_id": "d1", "from": ["admin"], "to": ["user:alice"]}, {"doc_id": "d2"}]}});
         let (sev, outcome, d) = retag_audit_row(&body, &resp);
-        assert_eq!((sev, outcome), ("info", "ok"));
+        assert_eq!((sev, outcome), (Severity::Info, AuditOutcome::Ok));
         assert_eq!(d["roles"], json!(["user:alice"]));
         assert_eq!(d["match"], "gdrive://*");
         assert_eq!(d["relabel"], true);
@@ -2307,7 +2315,7 @@ mod docs_audience_tests {
         // A refused apply is recorded too, as a warning with the reason.
         let refused = json!({"error": "not yours to tag into: ['admin']"});
         let (sev, outcome, d) = retag_audit_row(&body, &refused);
-        assert_eq!((sev, outcome), ("warning", "refused"));
+        assert_eq!((sev, outcome), (Severity::Warning, AuditOutcome::custom("refused")));
         assert!(d["error"].as_str().unwrap().contains("not yours"));
     }
 
@@ -2347,15 +2355,15 @@ mod docs_audience_tests {
     fn hold_audit_row_records_what_was_asked_and_done() {
         let body = json!({"title_prefix": "p", "reason": "r", "apply": true});
         let ok = json!({"count": 3, "applied": 3, "doc_ids": ["a", "b", "c"]});
-        let (sev, outcome, d) = hold_audit_row("kb_hold", &body, &ok);
-        assert_eq!((sev, outcome), ("info", "ok"));
+        let (sev, outcome, d) = hold_audit_row(&AuditKind::KbHold, &body, &ok);
+        assert_eq!((sev, outcome), (Severity::Info, AuditOutcome::Ok));
         assert_eq!(d["count"], 3);
         assert_eq!(d["reason"], "r");
         // a purge is always at least a warning, and a refusal is recorded
-        let (sev, _, _) = hold_audit_row("kb_purge", &body, &json!({"count": 1, "deleted": 1}));
-        assert_eq!(sev, "warning");
-        let (sev, outcome, d) = hold_audit_row("kb_hold", &body, &json!({"error": "a hold needs a reason"}));
-        assert_eq!((sev, outcome), ("warning", "refused"));
+        let (sev, _, _) = hold_audit_row(&AuditKind::KbPurge, &body, &json!({"count": 1, "deleted": 1}));
+        assert_eq!(sev, Severity::Warning);
+        let (sev, outcome, d) = hold_audit_row(&AuditKind::KbHold, &body, &json!({"error": "a hold needs a reason"}));
+        assert_eq!((sev, outcome), (Severity::Warning, AuditOutcome::custom("refused")));
         assert_eq!(d["error"], "a hold needs a reason");
     }
 

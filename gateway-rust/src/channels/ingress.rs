@@ -37,6 +37,7 @@
 //! The windows are different on purpose — a person who tries twice in a
 //! minute should get told twice; the audit trail only needs the pattern.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -73,18 +74,15 @@ pub async fn admit(db: &PgPool, channel: &str, channel_user_id: &str) -> Admissi
     }
 
     if first_in_window("audit", channel, channel_user_id, AUDIT_WINDOW) {
-        crate::routes::core::audit_event(
+        crate::audit::record(
             db,
-            "channel_ingress_denied",
-            "warning",
-            &format!("{channel}:{channel_user_id}"),
-            &format!("channel:{channel}"),
-            "denied",
-            serde_json::json!({
+            AuditEvent::new(AuditKind::ChannelIngressDenied, &format!("{channel}:{channel_user_id}"), &format!("channel:{channel}"))
+                .outcome(crate::audit::Outcome::Denied)
+                .details(serde_json::json!({
                 "channel": channel,
                 "channel_user_id": channel_user_id,
                 "reason": "sender is not linked to a noomesh account",
-            }),
+            })),
         )
         .await;
     }

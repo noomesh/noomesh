@@ -190,7 +190,7 @@ mod ingress_and_approval_binding_tests {
         // what production never had, so the audit assertions below passed
         // against a database that did not resemble the live one.
         //
-        // The writer heals its own partition now (`routes::core::
+        // The writer heals its own partition now (`audit::
         // audit_insert`), so leaving this empty is what proves it.
 
         // Prove the fixture before trusting any assertion made against it.
@@ -319,7 +319,7 @@ mod ingress_and_approval_binding_tests {
     /// doc and the runbook both promised an audited refusal. Two silent
     /// layers were stacked — a startup hook that asked for
     /// `public.noo_ensure_audit_partition` on a `mesh`-layout install and
-    /// warned once when it was not found, and an `audit_event` that threw
+    /// warned once when it was not found, and an `audit::record` that threw
     /// its own insert error away — so the only evidence was an empty table.
     ///
     /// This test starts from zero partitions deliberately. It fails on the

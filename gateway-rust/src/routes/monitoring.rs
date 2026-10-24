@@ -34,6 +34,7 @@
 //! install that issues it AFTER the gateway came up should not have to
 //! restart to make the button work. One small file read per click.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 
 use axum::{extract::State, routing::post, Extension, Json, Router};
@@ -314,14 +315,10 @@ async fn grafana_session(
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(ttl as i64);
 
     tracing::info!(account, role = role.as_str(), grafana_role, ttl, "grafana_session_issued");
-    super::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "grafana_session_issued",
-        "info",
-        account,
-        "grafana",
-        "ok",
-        json!({ "role": role.as_str(), "grafana_role": grafana_role, "jti": jti, "expires_in": ttl }),
+        AuditEvent::new(AuditKind::GrafanaSessionIssued, account, "grafana")
+            .details(json!({ "role": role.as_str(), "grafana_role": grafana_role, "jti": jti, "expires_in": ttl })),
     )
     .await;
 

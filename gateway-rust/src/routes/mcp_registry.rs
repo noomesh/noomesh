@@ -33,6 +33,7 @@
 //! - **Owner is a uuid**, resolved from the caller's name at insert;
 //!   never a name column.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 
 use axum::{
@@ -324,9 +325,10 @@ async fn server_create(
     if res.rows_affected() == 0 {
         return Err(AppError::BadRequest(format!("server '{}' already exists — `noo mcp server show {}` or update it", body.id, body.id)));
     }
-    crate::routes::core::audit_event(
-        &state.db, "mcp_server_register", "info", &actor_label(&actor), &body.id, "ok",
-        json!({ "transport": body.transport, "kind": body.kind, "audience": body.audience }),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::McpServerRegister, &actor_label(&actor), &body.id)
+            .details(json!({ "transport": body.transport, "kind": body.kind, "audience": body.audience })),
     )
     .await;
     Ok(Json(json!({ "status": "ok", "id": body.id, "note": "registered; place it on a node with `noo mcp place <id> <node>` — tools are discovered when phase B lands" })))
@@ -432,9 +434,10 @@ async fn server_update(
     .bind(body.enabled)
     .execute(&state.db)
     .await?;
-    crate::routes::core::audit_event(
-        &state.db, "mcp_server_update", "info", &actor_label(&actor), &id, "ok",
-        json!({ "spec": body.spec.is_some(), "kind": body.kind, "audience": body.audience, "enabled": body.enabled }),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::McpServerUpdate, &actor_label(&actor), &id)
+            .details(json!({ "spec": body.spec.is_some(), "kind": body.kind, "audience": body.audience, "enabled": body.enabled })),
     )
     .await;
     Ok(Json(json!({ "status": "ok", "id": id })))
@@ -450,7 +453,10 @@ async fn server_delete(
     if res.rows_affected() == 0 {
         return Err(AppError::NotFound(format!("no MCP server '{id}'")));
     }
-    crate::routes::core::audit_event(&state.db, "mcp_server_remove", "info", &actor_label(&actor), &id, "ok", json!({})).await;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::McpServerRemove, &actor_label(&actor), &id),
+    ).await;
     Ok(Json(json!({ "status": "ok", "id": id, "removed": true })))
 }
 
@@ -501,9 +507,10 @@ async fn placement_put(
     .bind(&desired)
     .execute(&state.db)
     .await?;
-    crate::routes::core::audit_event(
-        &state.db, "mcp_server_place", "info", &actor_label(&actor), &id, "ok",
-        json!({ "node": node, "desired_state": desired }),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::McpServerPlace, &actor_label(&actor), &id)
+            .details(json!({ "node": node, "desired_state": desired })),
     )
     .await;
     Ok(Json(json!({ "status": "ok", "id": id, "node": node, "desired_state": desired,
@@ -524,7 +531,11 @@ async fn placement_delete(
     if res.rows_affected() == 0 {
         return Err(AppError::NotFound(format!("'{id}' is not placed on '{node}'")));
     }
-    crate::routes::core::audit_event(&state.db, "mcp_server_unplace", "info", &actor_label(&actor), &id, "ok", json!({ "node": node })).await;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::McpServerUnplace, &actor_label(&actor), &id)
+            .details(json!({ "node": node })),
+    ).await;
     Ok(Json(json!({ "status": "ok", "id": id, "node": node, "removed": true })))
 }
 

@@ -127,6 +127,7 @@ mod addon_registry;
 mod google_drive;
 mod agent_activities;
 mod agent_meta_loop;
+mod audit;
 mod audit_partition;
 mod agent_mail_archive;
 mod audit_integrity;
