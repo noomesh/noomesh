@@ -67,6 +67,10 @@ case "$args" in
     svc="${args##*com.docker.compose.service=}"; svc="${svc%% *}"
     grep -qx "$svc" "$RUNNING" 2>/dev/null && echo "cid-$svc" ;;
   "ps --filter"*"status=running"*) cat "$RUNNING" 2>/dev/null ;;
+  "compose "*" stop "*)
+    # `docker compose ... stop <svc>...`: every name after `stop` stops.
+    seen=""; for a in "$@"; do [ -n "$seen" ] && { grep -vx "$a" "$RUNNING" > "$RUNNING.t"; mv "$RUNNING.t" "$RUNNING"; }
+      [ "$a" = stop ] && seen=1; done ;;
   "stop "*)
     for c in "${@:2}"; do grep -vx "${c#cid-}" "$RUNNING" > "$RUNNING.t"; mv "$RUNNING.t" "$RUNNING"; done ;;
   *"config --services"*)
@@ -321,3 +325,34 @@ addon_own_services {overlay}
     r = subprocess.run(["bash", "-c", body], cwd=tmp_path, capture_output=True, text=True,
                        env={"PATH": "/usr/bin:/bin", "NOO_ADDON_MAP_OVERRIDE": "1", "NOO_ADDON_MAP": ""})
     assert r.stdout.split() == ["mine"], (r.stdout, r.stderr)
+
+
+def test_a_switched_off_addon_that_extends_the_gateway_never_stops_the_gateway(tmp_path: Path) -> None:
+    # The same helper serves addons_stop_disabled (0.6.10 on: `noo stack
+    # start` after `noo addons disable evolve`, evolve's bundle still on disk):
+    # its overlay names `gateway`, and only its OWN service may be stopped.
+    root = tmp_path / "root"
+    (root / "scripts").mkdir(parents=True)
+    shutil.copy(ROOT / "scripts" / "lib-addons.sh", root / "scripts" / "lib-addons.sh")
+    shutil.copy(ROOT / "docker-compose.cluster.yml", root / "docker-compose.cluster.yml")
+    (root / "addons" / "rhold").mkdir(parents=True)
+    (root / "addons" / "rhold" / "docker-compose.yml").write_text(EXTENDS_GATEWAY_OVERLAY)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "docker").write_text(FAKE_DOCKER)
+    (bindir / "docker").chmod(0o755)
+    (tmp_path / "running").write_text(RUNNING_BEFORE)
+    body = f"""
+. {root}/scripts/lib-addons.sh
+COMPOSE_FILES="-f {root}/docker-compose.cluster.yml"
+addons_stop_leftovers addons_stop_disabled; echo "rc=$?"
+"""
+    env = {"PATH": f"{bindir}:{os.environ['PATH']}", "HOME": str(tmp_path), "LOGF": str(tmp_path / "log"),
+           "RUNNING": str(tmp_path / "running"), "FAKE_SERVICES_NEED_PROFILE": "1",
+           "NOO_ADDON_MAP_OVERRIDE": "1", "NOO_ADDON_MAP": "rhold=0\n"}
+    r = subprocess.run(["bash", "-c", body], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
+    assert "rc=0" in r.stdout, (r.stdout, r.stderr)
+    stops = [l for l in (tmp_path / "log").read_text().splitlines() if " stop " in l]
+    assert stops and all(l.endswith(" stop noo-rhold") for l in stops), stops
+    running = _running(tmp_path)
+    assert "gateway" in running and "noo-rhold" not in running, running
