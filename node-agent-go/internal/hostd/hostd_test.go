@@ -20,6 +20,8 @@ import (
 type fakeRunner struct {
 	calls [][]string
 	dirs  []string
+	// envs records the extraEnv of each Run, parallel to calls.
+	envs [][]string
 	// rc maps a substring of the joined argv to the exit code to return, so a
 	// test can make one specific step fail.
 	rc map[string]int
@@ -30,7 +32,8 @@ type fakeRunner struct {
 	stderr map[string]string
 }
 
-func (f *fakeRunner) Run(_ context.Context, dir string, _ []string, name string, args ...string) (int, string) {
+func (f *fakeRunner) Run(_ context.Context, dir string, env []string, name string, args ...string) (int, string) {
+	f.envs = append(f.envs, env)
 	f.dirs = append(f.dirs, dir)
 	argv := append([]string{name}, args...)
 	f.calls = append(f.calls, argv)

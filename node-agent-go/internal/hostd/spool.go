@@ -115,6 +115,10 @@ type Result struct {
 	DurationMS int64  `json:"duration_ms,omitempty"`
 	Artifact   string `json:"artifact,omitempty"`
 	Bytes      int64  `json:"bytes,omitempty"`
+	// Offsite is the backup's off-site outcome as the script reported it
+	// ("copied 3 artifact(s) to dir:/mnt/x", "FAILED: ...", "declined ...",
+	// "not configured ..."), so the run's text can state it. Only `backup`.
+	Offsite string `json:"offsite,omitempty"`
 }
 
 // Heartbeat is published to <spool>/hostd.heartbeat.json on a fixed interval.
@@ -155,6 +159,11 @@ type Heartbeat struct {
 	// is the agent's cue to request one; Running=false with LastError =
 	// the child keeps dying. Worker mode only; absent on older daemons.
 	JournalFollow *JournalFollowState `json:"journal_follow,omitempty"`
+	// Backup is the newest Postgres dump in the backup directory, read from
+	// the files each beat. Controller mode only; absent on workers and on older
+	// daemons. It is the backup-age signal that does not depend on the
+	// database or the heartbeat scheduler (see BackupFacts).
+	Backup *BackupFacts `json:"backup,omitempty"`
 }
 
 // HeartbeatFile is the fixed name callers look for. It is not a <name>.cmd

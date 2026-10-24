@@ -94,6 +94,9 @@ func (e *Engine) writeHeartbeat(started string, interval time.Duration) {
 		// as not running on the very next heartbeat.
 		JournalFollow: e.journalState(),
 	}
+	if e.Mode != ModeWorker {
+		hb.Backup = CollectBackupFacts(BackupDir())
+	}
 	if err := writeJSONAtomic(filepath.Join(e.Spool, HeartbeatFile), hb); err != nil {
 		// Log, do not exit. A spool that briefly cannot be written (the bind
 		// mount remounting during a compose operation) should not take the

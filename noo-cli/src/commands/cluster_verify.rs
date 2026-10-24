@@ -1922,6 +1922,35 @@ pub(crate) fn metrics_scrape_check(mtls: Option<bool>, missing_leaves: &[&str]) 
     ok("metrics scrape", "Prometheus authenticates by its leaf; people need Operator/Admin")
 }
 
+/// The `last backup` row: how old the last good backup is, from the dump
+/// files AND the task history (`backups::freshness`). OK inside a day plus
+/// grace, WARN over, FAIL over two days; a disagreement between the witnesses
+/// is in the detail and keeps the row from reading plain OK.
+pub(crate) fn backup_age_check(f: &crate::commands::backups::Freshness) -> Check {
+    use crate::commands::backups::{Level, BACKUP_AGE_REMEDY};
+    match f.level {
+        Level::Ok => ok("last backup", f.detail.clone()),
+        Level::Warn => warn("last backup", f.detail.clone(), Some(BACKUP_AGE_REMEDY.to_string())),
+        Level::Fail => fail("last backup", f.detail.clone(), BACKUP_AGE_REMEDY),
+    }
+}
+
+/// The `off-site backup` row. Undecided is a WARN with `noo backups setup`;
+/// `none` chosen on purpose is an accepted gap and stays quiet.
+pub(crate) fn offsite_backup_check(
+    configured: &Result<Option<crate::commands::backups::Destination>, String>,
+    state: &crate::commands::backups::Offsite,
+) -> Check {
+    use crate::commands::backups::{Destination, Level};
+    let (level, detail, remedy) = crate::commands::backups::offsite_row(configured, state);
+    match level {
+        Level::Ok if matches!(configured, Ok(Some(Destination::Declined))) => accepted("off-site backup", detail),
+        Level::Ok => ok("off-site backup", detail),
+        Level::Warn => warn("off-site backup", detail, remedy.map(String::from)),
+        Level::Fail => fail("off-site backup", detail, remedy.unwrap_or("noo backups setup")),
+    }
+}
+
 /// The service leaves the monitoring stack authenticates with.
 pub(crate) const MONITORING_LEAVES: &[&str] = &["prometheus", "alertmanager", "grafana", "node-exporter", "nvidia-exporter"];
 
@@ -5152,6 +5181,21 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         };
         let mut checks = controller_checks(&posture, &keys, &required, (sc, &secrets), &exposure, &strangers, audit_errors, tailnet_missing, entitlement);
         checks.push(system_credentials_check(crate::commands::systems::store_missing_credentials()));
+        // Is there a recent backup, and is it anywhere but this machine? 2026-10-24:
+        // the 03:30 run never happened and nothing said so; every dump sat on the
+        // disk next to the data.
+        checks.push(backup_age_check(&crate::commands::backups::live_freshness(g)));
+        {
+            let configured = crate::commands::backups::current();
+            let newest = crate::commands::backups::newest_dump().map(|(n, _)| n);
+            let marker = std::fs::read_to_string(crate::commands::secrets::backup_dir().join(".offsite-last")).ok();
+            let state = crate::commands::backups::offsite_state(
+                configured.as_ref().ok().and_then(|c| c.as_ref()),
+                marker.as_deref(),
+                newest.as_deref(),
+            );
+            checks.push(offsite_backup_check(&configured, &state));
+        }
         // i67: the controller's own node (when this box runs one) rides the rail.
         if let Some(me) = crate::commands::provision::self_node_name()
             .filter(|_| std::path::Path::new("/usr/local/bin/noo-node-agent").is_file())
@@ -9689,5 +9733,45 @@ mod gpu_contention_tests {
         let rows = node_checks(&n, "v0.6.2", "0.6.2", 0, None);
         let gpu = rows.iter().find(|c| c.name == "gpu").expect("a gpu row");
         assert_eq!(gpu.verdict, Verdict::Warn);
+    }
+}
+
+#[cfg(test)]
+mod backup_rows_tests {
+    use super::*;
+    use crate::commands::backups::{freshness, Destination, History, Offsite, BACKUP_INTERVAL_SECS as DAY};
+
+    const NOW: i64 = 1_792_000_000;
+    const H: i64 = 3600;
+
+    fn row(age_h: i64) -> Check {
+        backup_age_check(&freshness(Some(NOW - age_h * H), History::At(NOW - age_h * H), NOW, DAY))
+    }
+
+    #[test]
+    fn the_last_backup_row_is_ok_warn_fail_by_age_with_the_run_it_now_remedy() {
+        assert_eq!(row(5).verdict, Verdict::Ok);
+        let w = row(30);
+        assert_eq!(w.verdict, Verdict::Warn);
+        assert!(w.remedy.as_deref().unwrap().contains("noo heartbeat run database_backup"));
+        let f = row(49);
+        assert_eq!(f.verdict, Verdict::Fail);
+        assert!(f.remedy.as_deref().unwrap().contains("noo heartbeat history database_backup"));
+    }
+
+    #[test]
+    fn a_disagreement_is_in_the_row() {
+        let c = backup_age_check(&freshness(Some(NOW - 2 * H), History::At(NOW - 40 * H), NOW, DAY));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("DISAGREEMENT"), "{}", c.detail);
+    }
+
+    #[test]
+    fn undecided_offsite_warns_with_setup_and_none_is_accepted() {
+        let c = offsite_backup_check(&Ok(None), &Offsite::NoDump);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.remedy.as_deref(), Some("noo backups setup"));
+        assert!(c.detail.contains("every backup is on this machine"));
+        assert_eq!(offsite_backup_check(&Ok(Some(Destination::Declined)), &Offsite::NoDump).verdict, Verdict::Accepted);
     }
 }
