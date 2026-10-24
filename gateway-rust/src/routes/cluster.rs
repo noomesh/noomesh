@@ -1994,10 +1994,9 @@ pub(crate) async fn restart_agent_via_rail(
 async fn control_probe(
     State(state): State<Arc<AppState>>,
     caller: Option<axum::Extension<crate::auth::ClusterNode>>,
-    requester: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    _op: crate::authz::OperatorOrInternal,
     Path(node_id): Path<String>,
 ) -> AppResult {
-    super::operator_read_guard(&requester)?;
     if caller.is_some() {
         return Err(AppError::Forbidden("a node may not probe the controller's control paths".into()));
     }
@@ -2150,11 +2149,11 @@ async fn clean_node(
 /// - One hold or release runs on a node at a time (409 `transition_in_progress`).
 async fn gpu_hold(
     State(state): State<Arc<AppState>>,
-    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    operator: crate::authz::Operator,
     Path(node_id): Path<String>,
     body: Option<Json<Value>>,
 ) -> AppResult {
-    let actor = gpu_hold_actor(&ctx)?;
+    let actor = operator.sub().to_string();
     let b = body.map(|Json(b)| b).unwrap_or_else(|| json!({}));
     let text = |k: &str, max: usize| -> String {
         b.get(k).and_then(Value::as_str).unwrap_or("").trim().chars().take(max).collect()
@@ -2198,11 +2197,11 @@ async fn gpu_hold(
 /// `operation_id` is a legacy release** (an older CLI): a force, audited so.
 async fn gpu_release(
     State(state): State<Arc<AppState>>,
-    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    operator: crate::authz::Operator,
     Path(node_id): Path<String>,
     body: Option<Json<Value>>,
 ) -> AppResult {
-    let actor = gpu_hold_actor(&ctx)?;
+    let actor = operator.sub().to_string();
     let b = body.map(|Json(b)| b).unwrap_or_else(|| json!({}));
     let operation_id: String = b.get("operation_id").and_then(Value::as_str).unwrap_or("").trim().chars().take(64).collect();
     let legacy = operation_id.is_empty();
@@ -2220,14 +2219,6 @@ async fn gpu_release(
 /// request says otherwise; the cap keeps a typo from parking a node.
 pub(crate) const GPU_DRAIN_TIMEOUT_DEFAULT_SECS: u64 = 120;
 pub(crate) const GPU_DRAIN_TIMEOUT_MAX_SECS: u64 = 900;
-
-/// The operator gate for the GPU hold routes: role Operator or above.
-pub(crate) fn gpu_hold_actor(ctx: &Option<axum::Extension<crate::auth::RequesterCtx>>) -> Result<String, AppError> {
-    match ctx {
-        Some(axum::Extension(r)) if r.role >= crate::auth::Role::Operator => Ok(r.sub.clone()),
-        _ => Err(AppError::Forbidden("operator role required to hold or release a node's GPU".into())),
-    }
-}
 
 /// The per-node transition lock: one hold or release in flight per node at
 /// a time, across every caller of this gateway (the agent refuses a second
@@ -2406,14 +2397,11 @@ const NODE_BENCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(9
 /// POST /api/cluster/nodes/{node_id}/bench
 async fn node_bench(
     State(state): State<Arc<AppState>>,
-    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    operator: crate::authz::Operator,
     Path(node_id): Path<String>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let actor = match ctx {
-        Some(axum::Extension(ref r)) if r.role >= crate::auth::Role::Operator => r.sub.clone(),
-        _ => return AppError::Forbidden("operator role required to bench a node".into()).into_response(),
-    };
+    let actor = operator.sub().to_string();
     let link = match crate::node_link::NodeLink::for_node(&state, &node_id).await {
         Ok(l) => l,
         Err(e) => return e.into_response(),
@@ -3445,14 +3433,14 @@ pub(crate) async fn models_pull(
 async fn desired_config_get(
     State(state): State<Arc<AppState>>,
     caller: Option<axum::Extension<crate::auth::ClusterNode>>,
-    requester: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    _op: crate::authz::OperatorOrInternal,
     Path(node_id): Path<String>,
 ) -> AppResult {
     // A JWT caller below Operator is refused (a `read` account used to pass:
     // the tier gate let every GET through and this handler assumed any
     // non-node caller was an operator). A node carries ClusterNode and no
-    // RequesterCtx, so this does not touch the node path below.
-    super::operator_read_guard(&requester)?;
+    // RequesterCtx, so this does not touch the node path below. The refusal is
+    // the `OperatorOrInternal` extractor in the signature.
     // A node may read its OWN config and no other. the design
     //
     // Before this, the handler took node_id from the PATH and returned that
@@ -6575,15 +6563,13 @@ mod heartbeat_carry_tests {
     /// The GPU hold routes are operator-only, and both are audited.
     #[test]
     fn gpu_hold_is_operator_only_and_audited() {
-        assert!(gpu_hold_actor(&None).is_err(), "no requester: refused");
         // The code above the tests only: this test's own literals would
         // otherwise satisfy every `contains` below.
         let src = include_str!("cluster.rs").split("fn gpu_hold_is_operator_only_and_audited").next().unwrap();
         for name in ["async fn gpu_hold(", "async fn gpu_release("] {
             let h = src.split(name).nth(1).expect(name).split("\nasync fn ").next().unwrap();
-            let gate = h.find("gpu_hold_actor(&ctx)?").expect("the operator gate");
-            let body = h.find("body.map(").expect("the body read");
-            assert!(gate < body, "{name}: the operator gate must run before the body is read");
+            // The extractor runs before the handler body, so the body can never be read first.
+            assert!(h.contains("operator: crate::authz::Operator"), "{name}: the operator gate");
             assert!(h.contains("\"legacy\": legacy"), "{name}: a legacy call is audited as such");
         }
         let op = src.split("async fn gpu_hold_op(").nth(1).expect("gpu_hold_op")
@@ -6631,7 +6617,7 @@ mod heartbeat_carry_tests {
         assert_eq!(NODE_BENCH_TIMEOUT, std::time::Duration::from_secs(900));
         let src = include_str!("cluster.rs").split("fn node_bench_is_operator_only_audited_and_generous").next().unwrap();
         let h = src.split("async fn node_bench(").nth(1).expect("node_bench").split("\nasync fn ").next().unwrap();
-        assert!(h.contains("r.role >= crate::auth::Role::Operator"), "the operator gate");
+        assert!(h.contains("operator: crate::authz::Operator"), "the operator gate");
         assert!(h.contains(".request(reqwest::Method::POST, \"/bench\")"));
         assert!(h.contains(".timeout(NODE_BENCH_TIMEOUT)"));
         assert!(h.contains("audit_event("), "a bench must be audited");

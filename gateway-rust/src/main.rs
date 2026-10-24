@@ -60,6 +60,7 @@
 #![allow(clippy::collapsible_match)]
 
 mod auth;
+mod authz;
 mod birth_proof;
 mod bus;
 mod bus_principal;

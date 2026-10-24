@@ -13,6 +13,9 @@
 //! Persisted in a NATS KV bucket (no TTL, file-backed with the rest of
 //! JetStream) so it survives a gateway restart; each entry carries its own
 //! expiry, which is checked on read.
+//!
+//! The three routes take the `authz::Operator` extractor: a logged-in
+//! Operator or above, and a call with no user (cluster HMAC) is refused.
 
 use std::sync::Arc;
 
@@ -21,6 +24,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::authz::Operator;
 use crate::routes::{AppError, AppResult};
 use crate::state::AppState;
 
@@ -114,23 +118,14 @@ fn now_secs() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-fn require_operator(ctx: &Option<axum::Extension<crate::auth::RequesterCtx>>) -> Result<String, AppError> {
-    match ctx {
-        Some(axum::Extension(r)) if r.role >= crate::auth::Role::Operator => Ok(r.sub.clone()),
-        _ => Err(AppError::Forbidden(
-            "operator role required to change node maintenance".into(),
-        )),
-    }
-}
-
 /// PUT /api/cluster/nodes/{node_id}/maintenance — body `{reason, until_secs?}`.
 pub async fn maintenance_on(
     State(state): State<Arc<AppState>>,
-    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    operator: Operator,
     Path(node_id): Path<String>,
     Json(body): Json<Value>,
 ) -> AppResult {
-    let by = require_operator(&ctx)?;
+    let by = operator.sub().to_string();
     if !valid_node(&node_id) {
         return Err(AppError::BadRequest("invalid node id".into()));
     }
@@ -163,10 +158,9 @@ pub async fn maintenance_on(
 /// DELETE /api/cluster/nodes/{node_id}/maintenance.
 pub async fn maintenance_off(
     State(state): State<Arc<AppState>>,
-    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    _operator: Operator,
     Path(node_id): Path<String>,
 ) -> AppResult {
-    require_operator(&ctx)?;
     if !valid_node(&node_id) {
         return Err(AppError::BadRequest("invalid node id".into()));
     }
@@ -182,9 +176,8 @@ pub async fn maintenance_off(
 /// GET /api/cluster/maintenance — the windows currently open.
 pub async fn maintenance_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    _operator: Operator,
 ) -> AppResult {
-    require_operator(&ctx)?;
     let entries = active(&state.js, now_secs()).await;
     Ok(Json(json!({"maintenance": entries})))
 }

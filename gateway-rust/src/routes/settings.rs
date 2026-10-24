@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 use super::{AppError, AppJson, AppResult};
+use crate::authz::{Operator, OperatorOrInternal};
 use axum::http::header;
 
 
@@ -474,11 +475,8 @@ fn credential_write_refusal(paths: &[String]) -> Value {
 /// GET /api/config — Return full config as JSON (from cache).
 async fn config_get(
     State(state): State<Arc<AppState>>,
-    requester: Option<Extension<crate::auth::RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> impl IntoResponse {
-    if let Err(e) = super::operator_read_guard(&requester) {
-        return e.into_response();
-    }
     let config = config_with_legacy_mirrors(&*state.config_yaml.read().await);
     (StatusCode::OK, Json(redact_credentials(&config))).into_response()
 }
@@ -486,12 +484,9 @@ async fn config_get(
 /// GET /api/config/{section} — Return a single config section (from cache).
 async fn config_get_section(
     State(state): State<Arc<AppState>>,
-    requester: Option<Extension<crate::auth::RequesterCtx>>,
+    _op: OperatorOrInternal,
     Path(section): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = super::operator_read_guard(&requester) {
-        return e.into_response();
-    }
     let config = state.config_yaml.read().await;
     let effective = effective_config_section(&config, &section);
 
@@ -836,11 +831,8 @@ fn top_level_keys(body: &Value) -> Vec<String> {
 /// Now reads directly from the YAML config cache instead of delegating to Python.
 async fn settings_get(
     State(state): State<Arc<AppState>>,
-    requester: Option<Extension<crate::auth::RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> impl IntoResponse {
-    if let Err(e) = super::operator_read_guard(&requester) {
-        return e.into_response();
-    }
     let config = redact_credentials(&*state.config_yaml.read().await);
     (StatusCode::OK, Json(config)).into_response()
 }
@@ -894,11 +886,8 @@ async fn settings_update(
 /// Returns the config as a YAML file attachment for backup/export.
 async fn settings_export(
     State(state): State<Arc<AppState>>,
-    requester: Option<Extension<crate::auth::RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> impl IntoResponse {
-    if let Err(e) = super::operator_read_guard(&requester) {
-        return e.into_response();
-    }
     let config = redact_credentials(&*state.config_yaml.read().await);
 
     // Convert JSON Value -> YAML string
@@ -1744,9 +1733,8 @@ fn flag_truthy(raw: &str) -> bool {
 /// Python handler.
 async fn settings_flags_list(
     State(state): State<Arc<AppState>>,
-    requester: Option<Extension<crate::auth::RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    super::operator_read_guard(&requester)?;
     let mut db_keys: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     // Who last wrote each row, and when: `noo kiosk labels status` and the
     // verify row answer "who turned names on" from this, not from a log.
@@ -2195,16 +2183,6 @@ pub(crate) async fn refresh_skill_decisions(state: &AppState) -> Result<(), Stri
     Ok(())
 }
 
-/// The operator-or-admin login that may read proposals and decide them.
-fn skill_reviewer(ctx: &Option<Extension<crate::auth::RequesterCtx>>) -> Result<String, AppError> {
-    match ctx {
-        Some(Extension(r)) if r.role >= crate::auth::Role::Operator => Ok(r.sub.clone()),
-        _ => Err(AppError::Forbidden(
-            "prompt-skill proposals are for a logged-in operator or admin (`noo auth login`)".into(),
-        )),
-    }
-}
-
 /// Deciding is a PERSON's act: a worker-delegated token (what a tool call
 /// carries back), a harness token, an MCP-door key, a service identity or an
 /// account that is not an enabled user is refused, exactly as the exec-approval
@@ -2226,10 +2204,9 @@ fn skill_decider_refusal(origin: &crate::task_guard::Origin) -> Result<(), AppEr
 /// that predate this feature, or written while the table was unreachable).
 async fn prompt_skills_proposals(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<crate::auth::RequesterCtx>>,
+    _reviewer: Operator,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> AppResult {
-    skill_reviewer(&ctx)?;
     let status = q.get("status").map(String::as_str).filter(|s| !s.is_empty());
     if let Some(st) = status {
         if !["pending", "promoted", "rejected", "superseded", "withdrawn"].contains(&st) {
@@ -2255,12 +2232,13 @@ async fn prompt_skills_proposals(
 async fn prompt_skills_decide(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
+    reviewer: Operator,
     ctx: Option<Extension<crate::auth::RequesterCtx>>,
     Json(body): Json<Value>,
 ) -> AppResult {
     use crate::prompt_skills::SkillTrust;
     use crate::repo::prompt_skill_proposals::{decide, DecideError};
-    let by = skill_reviewer(&ctx)?;
+    let by = reviewer.sub().to_string();
     skill_decider_refusal(&crate::task_guard::resolve_origin(&state.db, &ctx).await)?;
     let trust = match body.get("decision").and_then(Value::as_str) {
         Some("promote") => SkillTrust::Promoted,
@@ -2454,11 +2432,14 @@ mod tests {
     /// Reading and deciding need an operator or admin login; a plain user does not pass.
     #[test]
     fn skill_proposals_need_an_operator_login() {
-        use crate::auth::Role;
-        assert_eq!(skill_reviewer(&skill_ctx("olive", Role::Operator, None, false)).unwrap(), "olive");
-        assert!(skill_reviewer(&skill_ctx("olive", Role::Admin, None, false)).is_ok());
-        assert!(matches!(skill_reviewer(&skill_ctx("bob", Role::User, None, false)), Err(AppError::Forbidden(_))));
-        assert!(matches!(skill_reviewer(&None), Err(AppError::Forbidden(_))));
+        // The refusal is the `Operator` extractor (`authz::tests` drives it
+        // through a router); what is pinned here is that both routes take it.
+        let code = &include_str!("settings.rs")[..include_str!("settings.rs").find("#[cfg(test)]").unwrap()];
+        for sig in ["async fn prompt_skills_proposals(", "async fn prompt_skills_decide("] {
+            let at = code.find(sig).expect(sig);
+            let head = &code[at..at + code[at..].find(") -> AppResult").unwrap()];
+            assert!(head.contains(": Operator"), "{sig} must take the Operator extractor");
+        }
     }
 
     /// The wiring the pure rules cannot see: the decide route runs both gates
@@ -2475,9 +2456,10 @@ mod tests {
             rest[..end].to_string()
         };
         let decide = body_of("async fn prompt_skills_decide(");
-        let (gate, person, write) = (decide.find("skill_reviewer(").unwrap(), decide.find("skill_decider_refusal(").unwrap(), decide.find("decide(&state.db").unwrap());
-        assert!(gate < write && person < write, "both gates run before the decision is recorded");
-        assert!(body_of("async fn prompt_skills_proposals(").contains("skill_reviewer("), "listing is operator-only");
+        let (person, write) = (decide.find("skill_decider_refusal(").unwrap(), decide.find("decide(&state.db").unwrap());
+        assert!(decide.contains("reviewer: Operator"), "the operator gate is the extractor, which runs first");
+        assert!(person < write, "the person gate runs before the decision is recorded");
+        assert!(body_of("async fn prompt_skills_proposals(").contains("_reviewer: Operator"), "listing is operator-only");
         for f in ["async fn prompt_skills_create(", "async fn prompt_skills_update("] {
             assert!(body_of(f).contains("open_skill_proposal("), "{f} must file a promotion proposal");
         }
