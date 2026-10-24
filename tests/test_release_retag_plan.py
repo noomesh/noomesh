@@ -58,12 +58,13 @@ MAINS = {"trellion": "TRE_MAIN"}
 
 
 def _plan(tag="stack-v1.2.3", trees=None, rcs=("stack-v1.2.3-rc.2", "stack-v1.2.3-rc.1"),
-          sibs=None, lock=LOCK, bases=None):
+          sibs=None, lock=LOCK, bases=None, changed=None):
     trees = trees or {"stack-v1.2.3": "T", "stack-v1.2.3-rc.2": "T", "stack-v1.2.3-rc.1": "T"}
     return P.plan(tag, "o/r", sibs or MAINS, "t", "t", lock_text=lock, bases_text=bases,
                   tree_of=lambda ref: trees[ref], commit_of=lambda ref: "C-" + ref,
                   list_rcs=lambda final: list(rcs),
-                  sib_tree=lambda repo, sha, tok: SIB_TREES[sha])
+                  sib_tree=lambda repo, sha, tok: SIB_TREES[sha],
+                  changed_of=lambda prev, new: changed)
 
 
 def test_equal_trees_retag_everything_but_the_tag_stamped_images():

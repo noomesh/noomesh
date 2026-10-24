@@ -119,6 +119,23 @@ func Admit(ctx context.Context, backend string) (release func(), err error) {
 	}
 }
 
+// Track counts one request in flight on the backend WITHOUT waiting for a
+// slot, and returns its release (call exactly once). It is for traffic that
+// must never queue here but has to be seen by whoever decides on background
+// work: query-time /embed. The pulled-embedding worker (proposal i179) keeps
+// one slot free for those requests, and it can only see them if they are
+// counted. Slots stay a cap for Admit only; Track may push in_flight past
+// them, which makes Admit's next caller wait, as it should.
+func Track(backend string) (release func()) {
+	if backend == "" {
+		return func() {}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	inFlight[backend]++
+	return releaseFor(backend)
+}
+
 func releaseFor(backend string) func() {
 	var once sync.Once
 	return func() {

@@ -43,9 +43,10 @@
 # Environment (all optional):
 #   NOO_STUDIO_MEM          box memory cap                       (default 10g)
 #   NOO_STUDIO_CPUS         box CPU cap                          (default 4)
+#   NOO_STUDIO_REC_MEM      recorder memory cap                  (default 6g)
 #   NOO_STUDIO_VHS_IMAGE    recorder image   (default ghcr.io/charmbracelet/vhs:latest)
 #   NOO_STUDIO_BASE_IMAGE   box base image                       (default ubuntu:24.04)
-#   NOO_STUDIO_CACHE_IMAGE  pull-through cache image             (default registry:2)
+#   NOO_STUDIO_CACHE_IMAGE  pull-through cache image             (default registry:3)
 #   NOO_DEMO_INSTALL_URL, NOO_DEMO_MASK_NAMES   passed through to the recorder
 set -euo pipefail
 
@@ -60,19 +61,24 @@ VHS_IMAGE="${NOO_STUDIO_VHS_IMAGE:-ghcr.io/charmbracelet/vhs:latest}"
 CACHE=noo-demo-cache
 CACHE_VOL=noo-demo-cache
 CACHE_NET=noo-demo
-CACHE_IMAGE="${NOO_STUDIO_CACHE_IMAGE:-registry:2}"
+# registry:3 (distribution 3.x): registry:2 is built on go1.20 and its upstream
+# dial to ghcr.io failed blobs with HTTP/2 PROTOCOL_ERROR (2026-10-23).
+CACHE_IMAGE="${NOO_STUDIO_CACHE_IMAGE:-registry:3}"
 CACHE_DIR="$ROOT/demo-out/cache"   # the cache's throwaway CA and its ghcr.io leaf (git-ignored)
 CACHE_UPSTREAM=https://ghcr.io
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 need_docker() { command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || die "docker is not available to this user"; }
-box_exists() { docker inspect "$BOX" >/dev/null 2>&1; }
-box_is_ours() { [ "$(docker inspect -f '{{index .Config.Labels "noo-demo-box"}}' "$BOX" 2>/dev/null)" = "1" ]; }
-box_running() { [ "$(docker inspect -f '{{.State.Running}}' "$BOX" 2>/dev/null)" = "true" ]; }
-cache_exists() { docker inspect "$CACHE" >/dev/null 2>&1; }
-cache_is_ours() { [ "$(docker inspect -f '{{index .Config.Labels "noo-demo-cache"}}' "$CACHE" 2>/dev/null)" = "1" ]; }
-cache_running() { cache_is_ours && [ "$(docker inspect -f '{{.State.Running}}' "$CACHE" 2>/dev/null)" = "true" ]; }
-cache_ip() { docker inspect -f "{{(index .NetworkSettings.Networks \"$CACHE_NET\").IPAddress}}" "$CACHE" 2>/dev/null; }
+# `--type container` everywhere: `docker inspect NAME` also matches a VOLUME of
+# that name, and the cache volume IS called noo-demo-cache (2026-10-24: a seeded
+# volume made `cache up` refuse "not the studio's cache").
+box_exists() { docker inspect --type container "$BOX" >/dev/null 2>&1; }
+box_is_ours() { [ "$(docker inspect --type container -f '{{index .Config.Labels "noo-demo-box"}}' "$BOX" 2>/dev/null)" = "1" ]; }
+box_running() { [ "$(docker inspect --type container -f '{{.State.Running}}' "$BOX" 2>/dev/null)" = "true" ]; }
+cache_exists() { docker inspect --type container "$CACHE" >/dev/null 2>&1; }
+cache_is_ours() { [ "$(docker inspect --type container -f '{{index .Config.Labels "noo-demo-cache"}}' "$CACHE" 2>/dev/null)" = "1" ]; }
+cache_running() { cache_is_ours && [ "$(docker inspect --type container -f '{{.State.Running}}' "$CACHE" 2>/dev/null)" = "true" ]; }
+cache_ip() { docker inspect --type container -f "{{(index .NetworkSettings.Networks \"$CACHE_NET\").IPAddress}}" "$CACHE" 2>/dev/null; }
 # The cache answers AS ghcr.io, so it needs a certificate for that name. A
 # throwaway CA of its own signs it; the box trusts that CA (system store and
 # /etc/docker/certs.d/ghcr.io) and nothing else does. Keys never leave demo-out/.
@@ -206,7 +212,11 @@ cmd_record() {
   for v in NOO_DEMO_INSTALL_URL NOO_DEMO_MASK_NAMES; do
     [ -z "${!v:-}" ] || passenv+=(-e "$v=${!v}")
   done
-  docker run --rm --name "$REC" --cpus 2 \
+  # The recorder is capped: vhs's render is the memory peak of a take, and an
+  # uncapped one took a 19 GiB WSL2 host down twice (2026-10-23). The GIF is
+  # no longer rendered by vhs at all (record-onboarding.sh makes it from the
+  # MP4, streaming), so the cap is a backstop, not the budget.
+  docker run --rm --name "$REC" --cpus 2 --memory "${NOO_STUDIO_REC_MEM:-6g}" \
     -v "$ROOT":/work -w /work \
     -v "$(command -v docker)":/usr/local/bin/docker:ro \
     -v /var/run/docker.sock:/var/run/docker.sock \
@@ -232,7 +242,7 @@ cmd_down() {
 cmd_status() {
   need_docker
   if box_exists; then
-    echo "box: $(docker inspect -f '{{.State.Status}}' "$BOX") (host $(docker exec "$BOX" hostname 2>/dev/null || echo '?'))"
+    echo "box: $(docker inspect --type container -f '{{.State.Status}}' "$BOX") (host $(docker exec "$BOX" hostname 2>/dev/null || echo '?'))"
     docker exec -u you "$BOX" sh -c 'command -v noo >/dev/null 2>&1 && echo "noo installed: $(noo --version 2>&1 | head -1)" || echo "noo: not installed (clean)"' 2>/dev/null || true
   else
     echo "box: none"
@@ -295,7 +305,7 @@ cmd_cache_purge() {
 cmd_cache_status() {
   need_docker
   if cache_exists; then
-    echo "cache: $(docker inspect -f '{{.State.Status}}' "$CACHE") at $(cache_ip) on network $CACHE_NET$(cache_is_ours || echo ' (NOT the studio'"'"'s: no label)')"
+    echo "cache: $(docker inspect --type container -f '{{.State.Status}}' "$CACHE") at $(cache_ip) on network $CACHE_NET$(cache_is_ours || echo ' (NOT the studio'"'"'s: no label)')"
   else
     echo "cache: none"
   fi

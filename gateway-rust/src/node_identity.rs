@@ -380,7 +380,7 @@ mod tests {
             p.distinguished_name.push(rcgen::DnType::OrganizationName, SERVICE_ORG);
             p.extended_key_usages = ekus;
             let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-            p.signed_by(&kp, &ca, &ca_key).unwrap().der().to_vec()
+            p.signed_by(&kp, &rcgen::Issuer::from_params(&ca_params, &ca_key)).unwrap().der().to_vec()
         };
         use rcgen::ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
         // noo-worker joined in 1276's second half: same profile, same verdict.

@@ -58,6 +58,10 @@ pub enum Verdict {
     /// A readiness miss explained by a container that started moments ago
     /// Neither OK nor FAIL, and not a pass.
     Starting,
+    /// A gap the person has accepted on the record (i10a: the at-rest
+    /// opt-out). Still states plainly what is exposed; never fails the verb,
+    /// and is not a pass.
+    Accepted,
 }
 
 pub(crate) fn ok(name: &'static str, detail: impl Into<String>) -> Check {
@@ -65,6 +69,9 @@ pub(crate) fn ok(name: &'static str, detail: impl Into<String>) -> Check {
 }
 fn warn(name: &'static str, detail: impl Into<String>, remedy: Option<String>) -> Check {
     Check { name, verdict: Verdict::Warn, detail: detail.into(), remedy }
+}
+fn accepted(name: &'static str, detail: impl Into<String>) -> Check {
+    Check { name, verdict: Verdict::Accepted, detail: detail.into(), remedy: None }
 }
 fn fail(name: &'static str, detail: impl Into<String>, remedy: impl Into<String>) -> Check {
     Check { name, verdict: Verdict::Fail, detail: detail.into(), remedy: Some(remedy.into()) }
@@ -139,6 +146,48 @@ pub(crate) fn control_bus_row(id: &str, n: &Value) -> Check {
                 (Some(true), _) => fail(NAME, p["detail"].as_str().unwrap_or("the round trip failed").to_string(),
                     format!("noo cluster nats-users render   # re-render the grants; then noo cluster restart-agent {id}")),
                 _ => warn(NAME, format!("NOT CHECKED — {}", p["detail"].as_str().unwrap_or("the gateway did not run the round-trip probe (older gateway)")),
+                    None),
+            }
+        }
+    }
+}
+
+/// The `streaming over tunnel` row (i131 phase 2). The verdicts, in order:
+/// - the node does not advertise `control_transports.tunnel` (an older agent,
+///   or its tunnel is not connected right now): NOT CHECKED, never ok.
+///   Streaming calls use HTTPS :8081.
+/// - it advertises it and the gateway's stream round trip over the tunnel
+///   answered: ok, with the round trip time and the per-node counters of
+///   streams carried by each transport.
+/// - it advertises it and the round trip failed (including "the gateway holds
+///   no live tunnel for it"): FAIL. The node says it is connected and the
+///   gateway cannot use it.
+/// - it advertises it but no probe result reached us (an older gateway, or
+///   the probe call failed): NOT CHECKED.
+pub(crate) fn tunnel_row(id: &str, n: &Value) -> Check {
+    const NAME: &str = "streaming over tunnel";
+    let advertised = n["control_transports"]["tunnel"].as_bool();
+    let https_only = "streaming calls use HTTPS :8081 for this node";
+    match advertised {
+        None => warn(NAME, format!("NOT CHECKED — the agent does not report control_transports (older agent); {https_only}"),
+            Some(format!("noo cluster provision {id} --wait"))),
+        Some(false) => warn(NAME, format!("NOT CHECKED — the node does not advertise a tunnel (an older agent, or its tunnel is not connected); {https_only}"),
+            Some(format!("noo cluster logs {id}   # 'node tunnel' lines say why it is not connected"))),
+        Some(true) => {
+            let p = &n["tunnel_probe"];
+            match (p["checked"].as_bool(), p["ok"].as_bool()) {
+                (Some(true), Some(true)) => {
+                    let c = &n["control_calls"];
+                    let counts = if c.is_object() {
+                        format!("; since the gateway started: {} stream(s) over the tunnel, {} over HTTPS", c["tunnel"].as_u64().unwrap_or(0), c["https_other"].as_u64().unwrap_or(0))
+                    } else {
+                        String::new()
+                    };
+                    ok(NAME, format!("stream round trip over the tunnel in {} ms{counts}", p["rtt_ms"].as_u64().unwrap_or(0)))
+                }
+                (Some(true), _) => fail(NAME, p["detail"].as_str().unwrap_or("the stream round trip failed").to_string(),
+                    format!("noo cluster logs {id}   # 'node tunnel' lines; the node reconnects on its own, and `NOO_AGENT_TUNNEL=off` or `NOO_NODE_TUNNEL=0` turns the tunnel off on purpose")),
+                _ => warn(NAME, format!("NOT CHECKED — {}", p["detail"].as_str().unwrap_or("the gateway did not run the tunnel probe (older gateway)")),
                     None),
             }
         }
@@ -224,6 +273,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     // 2b. Control over the bus (i131): the small control calls ride NATS on a
     //     connection the node holds outbound instead of the :8081 listener.
     out.push(control_bus_row(id, n));
+    out.push(tunnel_row(id, n));
 
     // 3. Agent version pairs with the controller's release.
     match n["app_version"].as_str().and_then(agent_version_tag) {
@@ -996,9 +1046,19 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
     } else {
         None
     };
+    // Streaming over the tunnel: the same shape. One stream round trip,
+    // run by the gateway, only for a node that says it holds a tunnel.
+    let tunnel_probe = if n["control_transports"]["tunnel"].as_bool() == Some(true) {
+        get_json_opt(g, &format!("/api/cluster/nodes/{}/tunnel-probe", crate::commands::urlencode(&id)), true, 15)
+    } else {
+        None
+    };
     if let Some(obj) = n.as_object_mut() {
         if let Some(p) = bus_probe {
             obj.insert("bus_control_probe".into(), p);
+        }
+        if let Some(p) = tunnel_probe {
+            obj.insert("tunnel_probe".into(), p);
         }
         if !unstaged.is_empty() {
             obj.insert("unstaged_images".into(), serde_json::json!(unstaged));
@@ -1862,6 +1922,35 @@ pub(crate) fn metrics_scrape_check(mtls: Option<bool>, missing_leaves: &[&str]) 
     ok("metrics scrape", "Prometheus authenticates by its leaf; people need Operator/Admin")
 }
 
+/// The `last backup` row: how old the last good backup is, from the dump
+/// files AND the task history (`backups::freshness`). OK inside a day plus
+/// grace, WARN over, FAIL over two days; a disagreement between the witnesses
+/// is in the detail and keeps the row from reading plain OK.
+pub(crate) fn backup_age_check(f: &crate::commands::backups::Freshness) -> Check {
+    use crate::commands::backups::{Level, BACKUP_AGE_REMEDY};
+    match f.level {
+        Level::Ok => ok("last backup", f.detail.clone()),
+        Level::Warn => warn("last backup", f.detail.clone(), Some(BACKUP_AGE_REMEDY.to_string())),
+        Level::Fail => fail("last backup", f.detail.clone(), BACKUP_AGE_REMEDY),
+    }
+}
+
+/// The `off-site backup` row. Undecided is a WARN with `noo backups setup`;
+/// `none` chosen on purpose is an accepted gap and stays quiet.
+pub(crate) fn offsite_backup_check(
+    configured: &Result<Option<crate::commands::backups::Destination>, String>,
+    state: &crate::commands::backups::Offsite,
+) -> Check {
+    use crate::commands::backups::{Destination, Level};
+    let (level, detail, remedy) = crate::commands::backups::offsite_row(configured, state);
+    match level {
+        Level::Ok if matches!(configured, Ok(Some(Destination::Declined))) => accepted("off-site backup", detail),
+        Level::Ok => ok("off-site backup", detail),
+        Level::Warn => warn("off-site backup", detail, remedy.map(String::from)),
+        Level::Fail => fail("off-site backup", detail, remedy.unwrap_or("noo backups setup")),
+    }
+}
+
 /// The service leaves the monitoring stack authenticates with.
 pub(crate) const MONITORING_LEAVES: &[&str] = &["prometheus", "alertmanager", "grafana", "node-exporter", "nvidia-exporter"];
 
@@ -2518,6 +2607,10 @@ pub(crate) struct SandboxProbe {
     pub leaf: String,
     /// Plain HTTP to the same port.
     pub plain: String,
+    /// The `/health` body the leaf dial read, parsed; `None` when no body
+    /// came back (the listener row says why). Absent from an older probe.
+    #[serde(default)]
+    pub health: Option<Value>,
 }
 
 const SANDBOX_REMEDY_RESTART: &str = "noo stack restart --force sandbox";
@@ -2595,11 +2688,90 @@ pub(crate) fn sandbox_listener_check(compose: Option<&str>, probe: Option<&Sandb
     ok(ROW, "client certificate required from every caller (none and plaintext refused, the gateway's leaf accepted); no published port")
 }
 
+/// The "sandbox executor" row (i161, noomesh#278): model-written code runs
+/// as the sandbox's own executor uid, one of 64 below the server, never
+/// as the server process (which can read the sandbox's leaf key in
+/// process mode and signal uvicorn). The sandbox says so itself in
+/// `/health`: `executor.uid` is the first executor uid, or null with the
+/// reason the code would run as the server (no user in the image, the
+/// server holds no CAP_SETUID/SETGID/KILL because it was started around
+/// the compose entrypoint, no setpriv). The row reads the body the live
+/// probe fetched over the gateway's leaf; a sandbox from before 0.6.10
+/// reports no `executor` at all, which is NOT CHECKED, not a pass.
+pub(crate) fn sandbox_executor_check(probe: Option<&SandboxProbe>) -> Check {
+    const ROW: &str = "sandbox executor";
+    let Some(p) = probe else {
+        return warn(ROW, "not probed live (gateway or sandbox container not running)", Some("noo stack status".into()));
+    };
+    let Some(h) = p.health.as_ref().filter(|h| h.is_object()) else {
+        return warn(
+            ROW,
+            format!("the gateway's leaf got no /health body from the sandbox ({}); see the sandbox listener row", p.leaf),
+            Some(SANDBOX_REMEDY_RESTART.into()),
+        );
+    };
+    let Some(ex) = h.get("executor").filter(|e| e.is_object()) else {
+        return warn(
+            ROW,
+            "NOT CHECKED — the sandbox image predates the executor uid (0.6.10): code runs as the server's own uid until the stack is upgraded",
+            Some("noo upgrade --stack".into()),
+        );
+    };
+    let detail = ex["detail"].as_str().unwrap_or("").to_string();
+    let Some(uid) = ex["uid"].as_u64() else {
+        let why = if detail.is_empty() { "the sandbox reports no executor uid".to_string() } else { detail };
+        return fail(
+            ROW,
+            format!("code runs as the SERVER's uid: {why} — in process mode it can read the sandbox's leaf key and signal the server"),
+            SANDBOX_REMEDY_RESTART,
+        );
+    };
+    let iso = &h["isolation"];
+    let mode = iso["mode"].as_str().unwrap_or("unknown");
+    let active = iso["active"].as_str().unwrap_or("unknown");
+    if active == "none" {
+        return fail(
+            ROW,
+            format!(
+                "the executor uid is in place ({detail}) but the configured {mode} isolation cannot run ({}) — the sandbox refuses calls until it can",
+                iso["detail"].as_str().unwrap_or("no detail")
+            ),
+            "on a host whose AppArmor blocks bwrap (Ubuntu 24.04+): sudo install -m 0644 docker/apparmor-noo-sandbox /etc/apparmor.d/noo-sandbox && sudo apparmor_parser -r /etc/apparmor.d/noo-sandbox, then NOO_SANDBOX_APPARMOR=noo-sandbox in .env (docs/reference/env.md) and: noo stack restart --force sandbox",
+        );
+    }
+    ok(ROW, format!("code runs as {detail}, uid {uid} first, never as the server; isolation {active}"))
+}
+
 /// Run on the gateway's own interpreter (its runtime image is DHI python,
 /// no shell): dial `sandbox:9000` three ways and print one JSON line. TCP
 /// is opened BEFORE TLS so a down sandbox reads `unreachable`, never as a
-/// refusal that would pass the row.
+/// refusal that would pass the row. A fourth dial, over the leaf again,
+/// reads the whole `/health` body for the executor row (`health`, or
+/// null when nothing parsable came back).
 const SANDBOX_PROBE_PY: &str = r#"import json,os,socket,ssl
+def health():
+    try:
+        raw=socket.create_connection(('sandbox',9000),timeout=5)
+    except OSError:
+        return None
+    try:
+        c=ssl.create_default_context(cafile=os.environ['NOO_TLS_CA'])
+        c.load_cert_chain(os.environ['NOO_TLS_CERT'],os.environ['NOO_TLS_KEY'])
+        s=c.wrap_socket(raw,server_hostname='sandbox')
+        s.sendall(b'GET /health HTTP/1.1\r\nHost: sandbox\r\nConnection: close\r\n\r\n')
+        b=b''
+        while len(b)<65536:
+            d=s.recv(4096)
+            if not d: break
+            b+=d
+        head,_,body=b.partition(b'\r\n\r\n')
+        if not head.startswith(b'HTTP/'): return None
+        j=json.loads(body.decode('utf-8','replace'))
+        return j if isinstance(j,dict) else None
+    except (ssl.SSLError,OSError,KeyError,ValueError):
+        return None
+    finally:
+        raw.close()
 def dial(tls,cert):
     try:
         raw=socket.create_connection(('sandbox',9000),timeout=5)
@@ -2619,7 +2791,7 @@ def dial(tls,cert):
         return 'refused: %s'%(e,)
     finally:
         raw.close()
-print(json.dumps({'no_cert':dial(True,False),'leaf':dial(True,True),'plain':dial(False,False)}))
+print(json.dumps({'no_cert':dial(True,False),'leaf':dial(True,True),'plain':dial(False,False),'health':health()}))
 "#;
 
 fn sandbox_live_probe() -> Option<SandboxProbe> {
@@ -3114,7 +3286,14 @@ fn block_device_encrypted(dev: &str) -> Option<bool> {
     if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    lsblk_types_say_crypt(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The verdict of an `lsblk -sno TYPE` listing: any `crypt` row = dm-crypt.
+/// The i10a state volume lists `crypt` then `loop` (a LUKS2 mapping over a
+/// loop device over `<data_root>/state.luks2`), so every row under it reads
+/// encrypted. `None` for an empty listing.
+pub(crate) fn lsblk_types_say_crypt(text: &str) -> Option<bool> {
     let types: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     if types.is_empty() {
         return None;
@@ -3146,23 +3325,43 @@ pub(crate) fn at_rest_dirs(env: &dyn Fn(&str) -> Option<String>) -> Vec<AtRestDi
     let get = |k: &str| env(k).filter(|v| !v.trim().is_empty()).map(|v| v.trim().trim_end_matches('/').to_string());
     let root = get("NOO_DATA_ROOT").unwrap_or_else(|| crate::commands::data_root::DEFAULT_DATA_ROOT.into());
     let home = get("HOME").unwrap_or_else(|| "/root".into());
-    let pg = get("NOO_PG_DATA").unwrap_or_else(|| format!("{root}/postgres"));
+    // The sensitive state set binds under NOO_STATE_ROOT (default: the data
+    // root, so nothing moves while it is unset); NOO_PG_DATA still wins for
+    // postgres. i10a.
+    let state = crate::commands::data_root::state_root_of(get("NOO_STATE_ROOT").as_deref(), &root);
+    let pg = get("NOO_PG_DATA").unwrap_or_else(|| format!("{state}/postgres"));
     let pki = get("NOO_PKI_DIR").unwrap_or_else(|| format!("{home}/.config/mesh/pki"));
     let age = get("SOPS_AGE_KEY_FILE")
         .and_then(|f| std::path::Path::new(&f).parent().map(|p| p.to_string_lossy().into_owned()))
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| format!("{home}/.config/sops/age"));
     vec![
-        AtRestDir { name: "loki at rest", what: LOKI_WHAT, path: format!("{root}/loki") },
+        AtRestDir { name: "loki at rest", what: LOKI_WHAT, path: format!("{state}/loki") },
         AtRestDir { name: "postgres at rest", what: "the database files (every account, session, message and memory)", path: pg },
-        AtRestDir { name: "redis at rest", what: "the Redis dumps (RDB/AOF: sessions, rate limits, cached results)", path: format!("{root}/redis") },
-        AtRestDir { name: "nats at rest", what: "the JetStream streams (queued tasks, agent mail, KV)", path: format!("{root}/nats") },
-        AtRestDir { name: "prometheus at rest", what: "the TSDB blocks (node names, rates, security signals)", path: format!("{root}/prometheus") },
-        AtRestDir { name: "grafana at rest", what: "Grafana's own database (users, sessions, dashboards)", path: format!("{root}/grafana") },
-        AtRestDir { name: "noo-data at rest", what: "the gateway's data volume (uploads, artifacts, state)", path: format!("{root}/noo-data") },
+        AtRestDir { name: "redis at rest", what: "the Redis dumps (RDB/AOF: sessions, rate limits, cached results)", path: format!("{state}/redis") },
+        AtRestDir { name: "nats at rest", what: "the JetStream streams (queued tasks, agent mail, KV)", path: format!("{state}/nats") },
+        AtRestDir { name: "prometheus at rest", what: "the TSDB blocks (node names, rates, security signals)", path: format!("{state}/prometheus") },
+        AtRestDir { name: "grafana at rest", what: "Grafana's own database (users, sessions, dashboards)", path: format!("{state}/grafana") },
+        AtRestDir { name: "noo-data at rest", what: "the gateway's data volume (uploads, artifacts, state)", path: format!("{state}/noo-data") },
         AtRestDir { name: "pki at rest", what: "the cluster CA and every service private key", path: pki },
         AtRestDir { name: "age key at rest", what: "the SOPS age key, which decrypts env.sops and so every other secret", path: age },
     ]
+}
+
+/// Remedy for a row in the clear (operator decision i10a, 2026-10-11: no
+/// full-disk LUKS, a reinstall is not acceptable on a running controller).
+/// The two secret-key rows get the TPM-sealing plan, the data-root rows the
+/// LUKS2-volume plan. Both say what it protects (a drive in someone else's
+/// hands) and what it does not (root on the running machine). Planned, not
+/// built: no command is named. Rows with the same text print once.
+const AT_REST_REMEDY_KEYS: &str = "planned (i10a): seal these keys to this machine's TPM so they decrypt only into RAM at service start. Until then anyone holding the drive can read them; root on the running machine always can.";
+const AT_REST_REMEDY_DATA: &str = "planned (i10a): move the data root onto a LUKS2 volume on this disk (no reinstall), unlocked at boot by this machine's TPM. Until then anyone holding the drive can read these files; root on the running machine always can.";
+
+fn at_rest_remedy(name: &str) -> &'static str {
+    match name {
+        "pki at rest" | "age key at rest" => AT_REST_REMEDY_KEYS,
+        _ => AT_REST_REMEDY_DATA,
+    }
 }
 
 /// One "<name> at rest" row. Nothing here encrypts its own files (Loki's
@@ -3170,7 +3369,39 @@ pub(crate) fn at_rest_dirs(env: &dyn Fn(&str) -> Option<String>) -> Vec<AtRestDi
 /// files), so what protects them at rest is the host's disk encryption — a
 /// fact each row reports and never assumes. A WARN, never a failure: it is
 /// the operator's control, and the row exists so the gap is visible.
+#[cfg(test)]
 pub(crate) fn at_rest_check(name: &'static str, what: &str, data_dir: &str, exists: bool, mount: Option<(&str, &str)>, encrypted: Option<bool>) -> Check {
+    at_rest_check_with(name, what, data_dir, exists, mount, encrypted, None, None)
+}
+
+/// The text of an accepted at-rest row: who and when from the recorded
+/// decision, the operator's own sentence about the data, and what is exposed.
+pub(crate) fn accepted_detail(d: &crate::commands::at_rest::AcceptedState, what: &str) -> String {
+    format!(
+        "accepted risk (opted out by {} at {}): {} In the clear: {what}",
+        d.updated_by.as_deref().unwrap_or("an unknown person"),
+        d.updated_at.as_deref().unwrap_or("an unknown time"),
+        crate::commands::at_rest::DISCLOSURE_OFF,
+    )
+}
+
+/// [`at_rest_check`] with the person's recorded decision and this machine's
+/// TPM facts (i10a). Only a row that IS in the clear changes:
+///
+/// - the person opted out: ACCEPTED, still saying the data is unencrypted;
+/// - no usable TPM here: WARN with the reason, and how to get one as the remedy;
+/// - a TPM and no decision: WARN, the #351 remedy (what the setup will do).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn at_rest_check_with(
+    name: &'static str,
+    what: &str,
+    data_dir: &str,
+    exists: bool,
+    mount: Option<(&str, &str)>,
+    encrypted: Option<bool>,
+    decision: Option<&crate::commands::at_rest::AcceptedState>,
+    tpm: Option<&crate::commands::at_rest::TpmFacts>,
+) -> Check {
     if !exists {
         return warn(name, format!("{data_dir} does not exist on this host — nothing to judge (not created yet, or the path is set elsewhere)"), None);
     }
@@ -3183,11 +3414,27 @@ pub(crate) fn at_rest_check(name: &'static str, what: &str, data_dir: &str, exis
     };
     match encrypted {
         Some(true) => ok(name, format!("{data_dir} is on {dev} ({mp}), a dm-crypt device")),
-        Some(false) => warn(
-            name,
-            format!("{data_dir} is on {dev} ({mp}), not a dm-crypt device — in the clear on that disk: {what}"),
-            Some("encrypt the data root's disk (LUKS) or accept it: access to the files is root on the controller, as for Postgres".into()),
-        ),
+        Some(false) => {
+            if let Some(d) = decision.filter(|d| d.accepted) {
+                return accepted(name, accepted_detail(d, what));
+            }
+            match tpm.filter(|t| !t.tpm2_usable()) {
+                Some(t) => warn(
+                    name,
+                    format!(
+                        "{data_dir} is on {dev} ({mp}), not a dm-crypt device — in the clear on that disk: {what}; \
+                         it cannot be encrypted here: {}",
+                        t.unavailable_reason()
+                    ),
+                    Some(crate::commands::at_rest::enable_hint(t)),
+                ),
+                None => warn(
+                    name,
+                    format!("{data_dir} is on {dev} ({mp}), not a dm-crypt device — in the clear on that disk: {what}"),
+                    Some(at_rest_remedy(name).into()),
+                ),
+            }
+        }
         None => warn(
             name,
             format!("{data_dir} is on {dev} ({mp}); could not determine whether that device is encrypted (lsblk unavailable, or not a block device)"),
@@ -3202,6 +3449,159 @@ pub(crate) fn at_rest_check(name: &'static str, what: &str, data_dir: &str, exis
 #[cfg(test)]
 pub(crate) fn loki_at_rest_check(data_dir: &str, mount: Option<(&str, &str)>, encrypted: Option<bool>) -> Check {
     at_rest_check("loki at rest", LOKI_WHAT, data_dir, true, mount, encrypted)
+}
+
+/// The "at-rest tpm" row (i10a): what this machine can do about encrypting
+/// at rest. Facts only; nothing here seals anything yet. WARN, never FAIL: a
+/// machine with no TPM is a fact to know, not a broken invariant.
+pub(crate) fn at_rest_tpm_check(f: &crate::commands::at_rest::TpmFacts) -> Check {
+    const NAME: &str = "at-rest tpm";
+    if !f.tpm2_usable() {
+        return warn(NAME, f.tpm_phrase(), Some(crate::commands::at_rest::enable_hint(f)));
+    }
+    let missing = f.missing_tools();
+    if !missing.is_empty() {
+        return warn(
+            NAME,
+            format!("TPM 2.0 present; missing tools: {}", missing.join(", ")),
+            Some("install cryptsetup and a systemd that ships systemd-creds and systemd-cryptenroll (v250 or newer)".into()),
+        );
+    }
+    let sb = match f.secure_boot {
+        Some(true) => "Secure Boot on (PCR 7 can be bound)".to_string(),
+        _ => format!(
+            "Secure Boot {}: sealed keys would be TPM-only, and a live-USB boot is not blocked",
+            f.secure_boot_phrase()
+        ),
+    };
+    ok(NAME, format!("TPM 2.0 present; {sb}"))
+}
+
+/// The "at-rest swap" row (i10a): secrets in memory can be paged out to a
+/// swap device, so swap must be absent, zram, or on a dm-crypt device.
+/// `proc_swaps` is `/proc/swaps`; `encrypted(filename, type)` answers whether
+/// the device behind a swap entry is dm-crypt (`None` = could not tell).
+pub(crate) fn at_rest_swap_check(proc_swaps: &str, encrypted: &dyn Fn(&str, &str) -> Option<bool>) -> Check {
+    const NAME: &str = "at-rest swap";
+    let mut clear: Vec<String> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+    let mut total = 0;
+    for line in proc_swaps.lines().skip(1) {
+        let mut it = line.split_whitespace();
+        let (Some(file), Some(ty)) = (it.next(), it.next()) else { continue };
+        total += 1;
+        if file.starts_with("/dev/zram") {
+            continue;
+        }
+        match encrypted(file, ty) {
+            Some(true) => {}
+            Some(false) => clear.push(file.to_string()),
+            None => unknown.push(file.to_string()),
+        }
+    }
+    if total == 0 {
+        return ok(NAME, "no swap is active");
+    }
+    if !clear.is_empty() {
+        return warn(
+            NAME,
+            format!("swap on {} is not encrypted: secrets in memory can be written to disk", clear.join(", ")),
+            Some("use zram or encrypted swap (a cryptswap entry in /etc/crypttab with a random key), or turn swap off: sudo swapoff -a and remove it from /etc/fstab".into()),
+        );
+    }
+    if !unknown.is_empty() {
+        return warn(
+            NAME,
+            format!("could not determine whether swap on {} is encrypted (lsblk unavailable, or not a block device)", unknown.join(", ")),
+            None,
+        );
+    }
+    ok(NAME, format!("{total} swap device(s), each zram or on dm-crypt"))
+}
+
+/// One place that holds sensitive state outside the nine at-rest rows.
+pub(crate) struct OutsideItem {
+    pub what: String,
+    pub path: String,
+    pub encrypted: Option<bool>,
+}
+
+/// The "at-rest outside the set" row (i10a): the `claude-config` and
+/// `alertmanager-data` docker volumes, docker's json logs and journald are
+/// not among the nine rows but can hold sensitive text. WARN while any sits
+/// on a device that is not dm-crypt; ACCEPTED when the person opted out.
+pub(crate) fn at_rest_outside_check(
+    items: &[OutsideItem],
+    decision: Option<&crate::commands::at_rest::AcceptedState>,
+) -> Check {
+    const NAME: &str = "at-rest outside the set";
+    let exposed: Vec<String> = items
+        .iter()
+        .filter(|i| i.encrypted != Some(true))
+        .map(|i| match i.encrypted {
+            Some(false) => format!("{} ({})", i.what, i.path),
+            _ => format!("{} ({}, encryption unknown)", i.what, i.path),
+        })
+        .collect();
+    if exposed.is_empty() {
+        return ok(
+            NAME,
+            if items.is_empty() {
+                "none of claude-config, alertmanager-data, docker logs or journald found on disk here".to_string()
+            } else {
+                format!("{} location(s) outside the nine rows, all on dm-crypt", items.len())
+            },
+        );
+    }
+    let list = exposed.join(", ");
+    if let Some(d) = decision.filter(|d| d.accepted) {
+        return accepted(NAME, accepted_detail(d, &list));
+    }
+    warn(
+        NAME,
+        format!("in the clear, outside the nine rows above: {list}"),
+        Some("planned (i10a): claude-config and alertmanager-data ride the encrypted state volume; docker logs and journald need their own handling. Until then anyone holding the drive can read them.".into()),
+    )
+}
+
+/// Lines of `docker <args>` stdout; empty when docker is absent or refuses.
+fn docker_lines(args: &[&str]) -> Vec<String> {
+    Command::new("docker")
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// The sensitive locations outside the nine rows that exist on this host,
+/// with whether the device under each is dm-crypt.
+fn outside_items(proc_mounts: &str) -> Vec<OutsideItem> {
+    let mut found: Vec<(String, String)> = Vec::new();
+    let volumes = docker_lines(&["volume", "ls", "--format", "{{.Name}}"]);
+    for suffix in ["claude-config", "alertmanager-data"] {
+        if let Some(v) = volumes.iter().find(|n| n.ends_with(suffix)) {
+            if let Some(mp) = docker_lines(&["volume", "inspect", "--format", "{{.Mountpoint}}", v]).into_iter().next() {
+                found.push((format!("docker volume {suffix}"), mp));
+            }
+        }
+    }
+    if let Some(root) = docker_lines(&["info", "--format", "{{.DockerRootDir}}"]).into_iter().next() {
+        // The directory is root-only: its path decides the device, no read is needed.
+        found.push(("docker json logs".to_string(), format!("{}/containers", root.trim_end_matches('/'))));
+    }
+    // Persistent journald only; /run/log/journal is RAM.
+    if std::path::Path::new("/var/log/journal").is_dir() {
+        found.push(("journald".to_string(), "/var/log/journal".to_string()));
+    }
+    found
+        .into_iter()
+        .map(|(what, path)| {
+            let encrypted = mount_of(proc_mounts, &path).and_then(|(dev, _)| block_device_encrypted(&dev));
+            OutsideItem { what, path, encrypted }
+        })
+        .collect()
 }
 
 /// The "monitoring web config" row (shipped tree, no probe). Every service
@@ -3324,7 +3724,7 @@ pub(crate) fn logs_last_seen_check(metrics: Option<&str>, nodes: &[(String, bool
 /// REFUSES it: a count names an add-on image older than the
 /// change, or one with no key, whose gateway calls are all failing.
 pub(crate) const GATEWAY_LEGACY_LANES: &[&str] =
-    &["self_call_shared_secret", "cluster_hmac_non_inference", "node_token_no_cert", "addon_shared_secret_refused", "cluster_hmac_v1"];
+    &["node_token_no_cert", "addon_shared_secret_refused", "cluster_hmac_v1"];
 pub(crate) const GATEWAY_LANE_COMPARATORS: &[&str] = &["node_token_with_cert", "addon_exchanged_token", "operator_client_cert", "cluster_hmac_v2"];
 /// Counted REFUSALS, not admissions: a `noo` CLI older than the
 /// break-glass removal signing with the controller secret. Every count is
@@ -3338,6 +3738,11 @@ pub(crate) const GATEWAY_REFUSED_CONTROLLER_LANE: &str = "controller_shared_secr
 /// A fleet-secret HMAC that did not come from a
 /// node (a controller service still holding the node credential).
 pub(crate) const GATEWAY_REFUSED_FLEET_OFF_NODE_LANE: &str = "fleet_secret_off_node_refused";
+/// A fleet-secret HMAC on the inference surface, REFUSED. The
+/// `NOO_SELF_CALL_SHARED_SECRET` bridge that once admitted it is deleted
+/// (the lane `self_call_shared_secret` is no longer counted); every count
+/// is a caller without a service key of its own, whose calls all fail.
+pub(crate) const GATEWAY_REFUSED_SELF_CALL_LANE: &str = "self_call_shared_secret_refused";
 /// A v1 cluster token REFUSED because `NOO_CLUSTER_TOKEN_V1=0` closed the
 /// gate — on the gateway (`/metrics`, by caller) and on each node (its
 /// `legacy_lanes`). Never part of `cluster_hmac_v1`, which is admissions
@@ -3496,13 +3901,19 @@ pub(crate) fn legacy_lanes_check(metrics: Option<&str>, fleet: &[Value], now_uni
     let (refused, refused_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let (c_refused, c_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_CONTROLLER_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let (f_refused, f_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_FLEET_OFF_NODE_LANE).map(Vec::as_slice).unwrap_or(&[]));
+    let (s_refused, s_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_SELF_CALL_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let (v1_refused, v1_who) = lane_breakdown(g.lanes.get(V1_REFUSED_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let node_v1_who = if node_v1_refused.is_empty() { String::new() } else { format!(" ({})", node_v1_refused.join(", ")) };
-    let detail = format!("{detail}; {GATEWAY_REFUSED_LANE} {refused}{refused_who}; {GATEWAY_REFUSED_CONTROLLER_LANE} {c_refused}{c_who}; {GATEWAY_REFUSED_FLEET_OFF_NODE_LANE} {f_refused}{f_who}; {V1_REFUSED_LANE} gateway refused (by caller) {v1_refused}{v1_who}, nodes refused (by node) {node_v1_refused_n}{node_v1_who}");
+    let detail = format!("{detail}; {GATEWAY_REFUSED_LANE} {refused}{refused_who}; {GATEWAY_REFUSED_CONTROLLER_LANE} {c_refused}{c_who}; {GATEWAY_REFUSED_FLEET_OFF_NODE_LANE} {f_refused}{f_who}; {GATEWAY_REFUSED_SELF_CALL_LANE} {s_refused}{s_who}; {V1_REFUSED_LANE} gateway refused (by caller) {v1_refused}{v1_who}, nodes refused (by node) {node_v1_refused_n}{node_v1_who}");
     if f_refused > 0 {
         return warn(NAME,
             format!("a non-node caller signed with the fleet secret and was REFUSED {f_refused} time(s){f_who} — {detail}"),
             Some("noo security service-key provision <consumer>   # a controller service presents its own key, never the node credential".into()));
+    }
+    if s_refused > 0 {
+        return warn(NAME,
+            format!("a caller signed with the fleet secret on the inference surface and was REFUSED {s_refused} time(s){s_who} — {detail}"),
+            Some("noo security service-key issue <consumer>   # the caller named above has no key of its own; the shared secret never buys inference".into()));
     }
     if c_refused > 0 {
         return warn(NAME,
@@ -4382,6 +4793,49 @@ pub(crate) fn addon_pins_check(ec: i32, v: &Value) -> Check {
     ok("add-on pins", format!("{} verified for {stack} (key {})", rows.len(), keys.join(", ")))
 }
 
+/// The `provisioned add-ons` row: one line per add-on whose database was
+/// provisioned without switching it on, worded exactly as `noo addons show`
+/// words it. `None` when there is none (no row at all, not a green one).
+pub(crate) fn provisioned_addons_check(root: &std::path::Path) -> Option<Check> {
+    let declared = crate::commands::addons::declared_map_at(&root.join("noomesh.yaml")).unwrap_or_default();
+    let marks = crate::addons::provisioned::read_all(root);
+    provisioned_addons_row(&crate::addons::provisioned::only(&marks, &declared))
+}
+
+pub(crate) fn provisioned_addons_row(only: &[&crate::addons::provisioned::Marker]) -> Option<Check> {
+    if only.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = only
+        .iter()
+        .map(|m| format!("{}: {} (schema {})", m.addon, crate::addons::provisioned::WORDS, m.schema))
+        .collect();
+    Some(ok("provisioned add-ons", lines.join("; ")))
+}
+
+#[cfg(test)]
+mod provisioned_addons_tests {
+    use super::{provisioned_addons_row, Verdict};
+    use crate::addons::provisioned::Marker;
+
+    #[test]
+    fn a_provisioned_addon_reads_as_provisioned_with_services_not_started() {
+        let m = Marker {
+            addon: "pai-voice".into(),
+            schema: "pai_voice".into(),
+            role: "noo_pai_voice".into(),
+            ddl_role: "noo_pai_voice_ddl".into(),
+            version: "0.1.0".into(),
+            lock_sha256: String::new(),
+            provisioned_at: 0,
+        };
+        let c = provisioned_addons_row(&[&m]).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("pai-voice: provisioned (services not started)"), "{}", c.detail);
+        assert!(provisioned_addons_row(&[]).is_none(), "no provisioned add-on, no row");
+    }
+}
+
 /// An enabled system (evolve, trellion) whose credentials
 /// are not in the store. Nothing is broken YET — the running gateway
 /// provisioned before the switch flipped — but the next restart is a
@@ -4549,17 +5003,27 @@ mod gateway_redis_tests {
     }
 }
 
+/// The seat rows whose WARN remedy is the only way out and must print in a
+/// `seat <name>` section: the layout moves (`seat-sync --migrate`, run on the
+/// seat under sudo) and the display. 0.6.10 printed the legacy-layout WARN
+/// only in `--json`.
+const SEAT_WARN_REMEDY_ROWS: [&str; 3] = ["seat layout", "display binaries", "display"];
+
 /// The `(remedy, row name)` pairs a section prints under its table: every
 /// FAIL row's, and in the controller section every WARN row's too. In a
 /// node section only the held `gpu` WARN prints its remedy: `gpu release` is
 /// the one way out of an operator hold and was visible only in `--json`
 /// (rehearsal 0.6.7-rc.1 F4). Other node WARNs stay remedy-less on purpose.
+/// In a seat section the layout and display WARNs print theirs
+/// ([`SEAT_WARN_REMEDY_ROWS`]).
 fn remedies_to_print<'a>(title: &str, checks: &'a [Check]) -> Vec<(&'a str, Vec<&'a str>)> {
     // An identical remedy is printed once, with every row it covers (the
     // v0.2.97 roll printed one LUKS remedy nine times, once per `* at rest`).
+    let seat_section = title.starts_with("seat ");
     let mut out: Vec<(&str, Vec<&str>)> = Vec::new();
     for c in checks.iter()
-        .filter(|c| c.verdict == Verdict::Fail || (c.verdict == Verdict::Warn && (title == "controller" || c.name == "gpu")))
+        .filter(|c| c.verdict == Verdict::Fail || (c.verdict == Verdict::Warn && (title == "controller" || c.name == "gpu"
+            || (seat_section && SEAT_WARN_REMEDY_ROWS.contains(&c.name)))))
     {
         let Some(r) = c.remedy.as_deref() else { continue };
         match out.iter_mut().find(|(x, _)| *x == r) {
@@ -4578,6 +5042,8 @@ fn render(title: &str, checks: &[Check]) -> bool {
             Verdict::Warn => (Glyph::Warn, ui::warn(&c.detail)),
             Verdict::Fail => (Glyph::Err, ui::err(&c.detail)),
             Verdict::Starting => (Glyph::Warn, ui::warn(&c.detail)),
+            // Plain text: the row states what is exposed and must be read, not dimmed.
+            Verdict::Accepted => (Glyph::Accepted, c.detail.clone()),
         };
         vec![ui::glyph_cell(glyph), c.name.to_string(), detail]
     }).collect();
@@ -4726,6 +5192,21 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         };
         let mut checks = controller_checks(&posture, &keys, &required, (sc, &secrets), &exposure, &strangers, audit_errors, tailnet_missing, entitlement);
         checks.push(system_credentials_check(crate::commands::systems::store_missing_credentials()));
+        // Is there a recent backup, and is it anywhere but this machine? 2026-10-24:
+        // the 03:30 run never happened and nothing said so; every dump sat on the
+        // disk next to the data.
+        checks.push(backup_age_check(&crate::commands::backups::live_freshness(g)));
+        {
+            let configured = crate::commands::backups::current();
+            let newest = crate::commands::backups::newest_dump().map(|(n, _)| n);
+            let marker = std::fs::read_to_string(crate::commands::secrets::backup_dir().join(".offsite-last")).ok();
+            let state = crate::commands::backups::offsite_state(
+                configured.as_ref().ok().and_then(|c| c.as_ref()),
+                marker.as_deref(),
+                newest.as_deref(),
+            );
+            checks.push(offsite_backup_check(&configured, &state));
+        }
         // i67: the controller's own node (when this box runs one) rides the rail.
         if let Some(me) = crate::commands::provision::self_node_name()
             .filter(|_| std::path::Path::new("/usr/local/bin/noo-node-agent").is_file())
@@ -4754,6 +5235,11 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 checks.push(addon_pins_check(ec, &pins));
             }
             Err(e) => checks.push(fail("add-on pins", format!("which add-ons are on is unknown: {e}"), "noo addons list")),
+        }
+        // Add-ons whose schema and roles exist (`--provision-only`) while no
+        // service of theirs is composed: said as such, never as "off".
+        if let Some(c) = provisioned_addons_check(&crate::envfile::repo_root()) {
+            checks.push(c);
         }
         let missing: Vec<&str> = MONITORING_LEAVES
             .iter()
@@ -4852,7 +5338,11 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // its uvicorn with a required client certificate, and the gateway
         // container proves it live — no cert and plaintext refused, its own
         // leaf accepted.
-        checks.push(sandbox_listener_check(compose.as_deref(), sandbox_live_probe().as_ref()));
+        let sandbox_probe = sandbox_live_probe();
+        checks.push(sandbox_listener_check(compose.as_deref(), sandbox_probe.as_ref()));
+        // The sandbox executor (i161): the health body that probe read over
+        // the gateway's leaf says which uid model-written code runs as.
+        checks.push(sandbox_executor_check(sandbox_probe.as_ref()));
         // The voice doors (mTLS doors phase 2): only when the overlay is
         // composed; then the same static + live three-way proof per door.
         let voice_on = addon_on("voice");
@@ -4906,12 +5396,60 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // clear (`at_rest_dirs`): the process env is what the launcher
         // resolved from `.env`, so the paths are the ones compose bound.
         let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+        // What this machine can do (TPM) and what the person decided
+        // (`noo security at-rest opt-out`): the rows below read both.
+        let tpm_facts = crate::commands::at_rest::TpmFacts::probe(std::path::Path::new("/"));
+        let at_rest_flags = get_json_opt(g, "/api/settings/flags", true, 10);
+        let at_rest_decision = at_rest_flags.as_ref().and_then(crate::commands::at_rest::state_from_flags);
+        checks.push(at_rest_tpm_check(&tpm_facts));
         for row in at_rest_dirs(&|k| std::env::var(k).ok()) {
+            // A key sealed to the TPM (i10a PR-B) is judged by what sealed
+            // it, where the live copy is, and what plaintext remains — not
+            // by the disk under its directory.
+            if row.name == "age key at rest" {
+                if let Some(c) = crate::commands::at_rest_seal::sealed_age_key_row(&mounts) {
+                    checks.push(c);
+                    continue;
+                }
+            }
             let exists = std::path::Path::new(&row.path).is_dir();
             let mount = if exists { mount_of(&mounts, &row.path) } else { None };
             let encrypted = mount.as_ref().and_then(|(dev, _)| block_device_encrypted(dev));
-            checks.push(at_rest_check(row.name, row.what, &row.path, exists, mount.as_ref().map(|(d, m)| (d.as_str(), m.as_str())), encrypted));
+            checks.push(at_rest_check_with(
+                row.name,
+                row.what,
+                &row.path,
+                exists,
+                mount.as_ref().map(|(d, m)| (d.as_str(), m.as_str())),
+                encrypted,
+                at_rest_decision.as_ref(),
+                Some(&tpm_facts),
+            ));
         }
+        checks.push(at_rest_swap_check(
+            &std::fs::read_to_string("/proc/swaps").unwrap_or_default(),
+            &|file, ty| {
+                let dev = if ty == "file" { mount_of(&mounts, file).map(|(d, _)| d)? } else { file.to_string() };
+                block_device_encrypted(&dev)
+            },
+        ));
+        checks.push(at_rest_outside_check(&outside_items(&mounts), at_rest_decision.as_ref()));
+        // The encrypted state volume and its recovery key (i10a PR-C).
+        checks.extend(crate::commands::at_rest_volume::rows_live(
+            &mounts,
+            at_rest_flags.as_ref(),
+            at_rest_decision.as_ref(),
+            &tpm_facts,
+        ));
+        // The sealed key's PCR policy vs Secure Boot now (only when sealed).
+        if let Some(c) = crate::commands::at_rest_seal::pcr_binding_row_live() {
+            checks.push(c);
+        }
+        // The data root must still be on the filesystem recorded for it: a
+        // missing data disk must never let postgres initialise an empty
+        // database (2026-10-24). The criterion is the shell library the
+        // launchers and hostd run.
+        checks.push(crate::commands::data_root::mount_row(&crate::envfile::repo_root()));
         checks.push(monitoring_web_config_check(compose.as_deref()));
         // The runtime images (redis + monitoring) are the family their keys
         // and data are handed to (0.6.1: the upstream family, restart loops).
@@ -5039,7 +5577,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 fn checks_json(checks: &[Check]) -> Value {
     Value::Array(checks.iter().map(|c| serde_json::json!({
         "name": c.name,
-        "verdict": match c.verdict { Verdict::Ok => "ok", Verdict::Warn => "warn", Verdict::Fail => "fail", Verdict::Starting => "starting" },
+        "verdict": match c.verdict { Verdict::Ok => "ok", Verdict::Warn => "warn", Verdict::Fail => "fail", Verdict::Starting => "starting", Verdict::Accepted => "accepted" },
         "detail": c.detail,
         "remedy": c.remedy,
     })).collect())
@@ -5354,15 +5892,24 @@ mod tests {
 
     #[test]
     fn identical_remedies_print_once_with_every_row_they_cover() {
-        let luks = "encrypt the data root's disk (LUKS) or accept it";
+        let luks = at_rest_remedy("loki at rest");
+        assert_ne!(luks, at_rest_remedy("age key at rest"));
         let rows = vec![
             warn("loki at rest", "plaintext", Some(luks.into())),
             warn("loki", "other", Some("noo health".into())),
             warn("postgres at rest", "plaintext", Some(luks.into())),
-            warn("age key at rest", "plaintext", Some(luks.into())),
+            warn("age key at rest", "plaintext", Some(at_rest_remedy("age key at rest").into())),
+            warn("pki at rest", "plaintext", Some(at_rest_remedy("pki at rest").into())),
         ];
         let c = remedies_to_print("controller", &rows);
-        assert_eq!(c, vec![(luks, vec!["loki at rest", "postgres at rest", "age key at rest"]), ("noo health", vec!["loki"])]);
+        assert_eq!(
+            c,
+            vec![
+                (luks, vec!["loki at rest", "postgres at rest"]),
+                ("noo health", vec!["loki"]),
+                (at_rest_remedy("age key at rest"), vec!["age key at rest", "pki at rest"]),
+            ]
+        );
         // Node sections group identical FAIL remedies the same way.
         let fails = vec![fail("a", "x", "noo fix"), fail("b", "x", "noo fix")];
         assert_eq!(remedies_to_print("node n", &fails), vec![("noo fix", vec!["a", "b"])]);
@@ -5807,13 +6354,67 @@ mod tests {
         assert!(r.detail.contains("gateway's own bus"), "{}", r.detail);
     }
 
+    // ── streaming over tunnel (i131 phase 2) ──────────────────────────
+
+    fn tunnel_row_of(n: &Value, now: i64) -> Check {
+        node_checks(n, "v0.2.70", "0.5.57", now, Some(true)).into_iter().find(|c| c.name == "streaming over tunnel").expect("the row is always present")
+    }
+
+    #[test]
+    fn streaming_over_tunnel_is_not_checked_for_a_node_that_does_not_advertise_it() {
+        let now = 1_800_000_000;
+        // No field at all: an older agent.
+        let r = tunnel_row_of(&healthy(now), now);
+        assert_eq!(r.verdict, Verdict::Warn, "{}", r.detail);
+        assert!(r.detail.starts_with("NOT CHECKED") && r.detail.contains("HTTPS"), "{}", r.detail);
+        // Reports transports, tunnel false: the same, with the logs remedy.
+        let n = with_transports(now, serde_json::json!({"https_listener": true, "nats_rpc": true, "tunnel": false}));
+        let r = tunnel_row_of(&n, now);
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.starts_with("NOT CHECKED"), "{}", r.detail);
+        assert!(r.remedy.as_deref().unwrap().contains("noo cluster logs"));
+        // Never ok for a node that did not advertise it, whatever a probe field says.
+        let mut n = n;
+        n["tunnel_probe"] = serde_json::json!({"checked": true, "ok": true, "rtt_ms": 3});
+        assert_eq!(tunnel_row_of(&n, now).verdict, Verdict::Warn, "a verdict from a probe nobody asked for is not a pass");
+    }
+
+    #[test]
+    fn streaming_over_tunnel_passes_only_on_a_stream_round_trip() {
+        let now = 1_800_000_000;
+        let adv = || with_transports(now, serde_json::json!({"https_listener": true, "nats_rpc": true, "tunnel": true}));
+        // Answered, with the counters.
+        let mut n = adv();
+        n["tunnel_probe"] = serde_json::json!({"advertised": true, "checked": true, "ok": true, "rtt_ms": 9});
+        n["control_calls"] = serde_json::json!({"bus": 4, "https_control": 0, "https_other": 2, "fallbacks": 0, "tunnel": 31, "tunnel_aborts": 0});
+        let r = tunnel_row_of(&n, now);
+        assert_eq!(r.verdict, Verdict::Ok);
+        assert!(r.detail.contains("9 ms") && r.detail.contains("31 stream(s) over the tunnel, 2 over HTTPS"), "{}", r.detail);
+        // Claims a tunnel, the gateway holds none or it does not answer: FAIL.
+        let mut n = adv();
+        n["tunnel_probe"] = serde_json::json!({"advertised": true, "checked": true, "ok": false, "detail": "the node advertises a tunnel but this gateway holds no live tunnel for it"});
+        let r = tunnel_row_of(&n, now);
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert!(r.detail.contains("no live tunnel") && r.remedy.as_deref().unwrap().contains("noo cluster logs"));
+        // Claims it, no probe result reached us (older gateway, or the call failed): not a pass.
+        let r = tunnel_row_of(&adv(), now);
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.starts_with("NOT CHECKED"), "{}", r.detail);
+        // The gateway could not try (tunnels switched off there): NOT CHECKED with its reason.
+        let mut n = adv();
+        n["tunnel_probe"] = serde_json::json!({"advertised": true, "checked": false, "ok": false, "detail": "node tunnels are switched off on this gateway (NOO_NODE_TUNNEL)"});
+        let r = tunnel_row_of(&n, now);
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.contains("NOO_NODE_TUNNEL"), "{}", r.detail);
+    }
+
     #[test]
     fn a_healthy_node_passes_every_invariant() {
         let now = 1_800_000_000;
         let c = node_checks(&healthy(now), "v0.2.70", "0.5.57", now, Some(true));
         let failed: Vec<_> = c.iter().filter(|c| c.verdict == Verdict::Fail).map(|c| c.name).collect();
         assert!(failed.is_empty(), "{failed:?}");
-        assert_eq!(c.len(), 21, "fifteen node invariants (the log shipper, peer identity, control over bus, backend doors, vendor telemetry, backend images and data root among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
+        assert_eq!(c.len(), 22, "sixteen node invariants (the log shipper, peer identity, control over bus, streaming over tunnel, backend doors, vendor telemetry, backend images and data root among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
     }
 
     /// The door refusals ride the heartbeat as `backend_tls` (refused to
@@ -6520,7 +7121,7 @@ mod tests {
         let keys = serde_json::json!({ "keys": [
             // superseded row with the wide grant must not mask the live one
             { "consumer": "svc:trellion", "active": true, "superseded_at": "2026-09-01T00:00:00Z",
-              "scopes": ["addon", "chat", "embeddings", "metrics"] },
+              "scopes": ["addon", "chat", "embeddings", "metrics", "voice:transcribe"] },
             { "consumer": "svc:trellion", "active": true, "superseded_at": null,
               "scopes": ["addon", "chat", "embeddings"] },
             { "consumer": "svc:evolve", "active": true, "superseded_at": null, "scopes": evolve_full },
@@ -6533,7 +7134,7 @@ mod tests {
 
         let fixed = serde_json::json!({ "keys": [
             { "consumer": "svc:trellion", "active": true, "superseded_at": null,
-              "scopes": ["addon", "chat", "embeddings", "metrics"] },
+              "scopes": ["addon", "chat", "embeddings", "metrics", "voice:transcribe"] },
         ]});
         assert_eq!(service_key_grants_check(&fixed, &required).verdict, Verdict::Ok,
             "a consumer with no key is the `service keys` row's business, not this one's");
@@ -7102,7 +7703,59 @@ mod tests {
     const SANDBOX_COMPOSE_OK: &str = "services:\n  sandbox:\n    entrypoint: []\n    command: &sandbox-command\n      - python\n      - -m\n      - uvicorn\n      - noomesh.sandbox.app:app\n      - --port\n      - \"9000\"\n      - --ssl-certfile\n      - /tls/services/sandbox/service.crt\n      - --ssl-keyfile\n      - /tls/services/sandbox/service.key\n      - --ssl-ca-certs\n      - /tls/ca.crt\n      - --ssl-cert-reqs\n      - \"2\"\n    expose:\n      - \"9000\"\n  sandbox-extra:\n    command: *sandbox-command\n  postgres:\n    ports:\n      - \"5432:5432\"\n";
 
     fn sandbox_probe(no_cert: &str, leaf: &str, plain: &str) -> SandboxProbe {
-        SandboxProbe { no_cert: no_cert.into(), leaf: leaf.into(), plain: plain.into() }
+        SandboxProbe { no_cert: no_cert.into(), leaf: leaf.into(), plain: plain.into(), health: None }
+    }
+
+    fn sandbox_health(executor: Value, isolation: Value) -> SandboxProbe {
+        let mut p = sandbox_probe("refused: x", "answered HTTP/1.1 200 OK", "refused: y");
+        p.health = Some(serde_json::json!({"status": "healthy", "executor": executor, "isolation": isolation}));
+        p
+    }
+
+    /// The executor row: OK only when the sandbox reports an executor uid
+    /// and its isolation is active. A null uid is a FAIL that quotes the
+    /// sandbox's reason; a body with no `executor` is an older image, NOT
+    /// CHECKED; no body or no probe is a WARN that points at the listener
+    /// row — never a pass by absence.
+    #[test]
+    fn the_sandbox_executor_row_reads_the_uid_the_sandbox_reports() {
+        let bwrap = serde_json::json!({"mode": "bwrap", "active": "bwrap", "detail": "bwrap 0.9.0"});
+        let good = sandbox_health(serde_json::json!({"uid": 65600, "slots": 64, "detail": "sandbox-exec (uids 65600-65663)"}), bwrap.clone());
+        let c = sandbox_executor_check(Some(&good));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.contains("uids 65600-65663") && c.detail.contains("uid 65600 first") && c.detail.contains("isolation bwrap"), "{}", c.detail);
+
+        let as_server = sandbox_health(
+            serde_json::json!({"uid": null, "slots": 0, "detail": "the server holds no CAP_SETUID/CAP_SETGID/CAP_KILL (start it through the compose entrypoint): code runs as the server's uid"}),
+            bwrap.clone(),
+        );
+        let c = sandbox_executor_check(Some(&as_server));
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("SERVER's uid") && c.detail.contains("compose entrypoint"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some(SANDBOX_REMEDY_RESTART));
+
+        let unusable = sandbox_health(
+            serde_json::json!({"uid": 65600, "slots": 64, "detail": "sandbox-exec (uids 65600-65663)"}),
+            serde_json::json!({"mode": "bwrap", "active": "none", "detail": "bwrap: setting up uid map: Permission denied"}),
+        );
+        let c = sandbox_executor_check(Some(&unusable));
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("cannot run") && c.detail.contains("uid map"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap().contains("/etc/apparmor.d/noo-sandbox") && c.remedy.as_deref().unwrap().contains("NOO_SANDBOX_APPARMOR=noo-sandbox"), "{:?}", c.remedy);
+
+        // an older sandbox image: a health body with no executor at all
+        let mut old = sandbox_probe("refused: x", "answered HTTP/1.1 200 OK", "refused: y");
+        old.health = Some(serde_json::json!({"status": "healthy", "isolation": bwrap}));
+        let c = sandbox_executor_check(Some(&old));
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.starts_with("NOT CHECKED") && c.detail.contains("0.6.10"), "{}", c.detail);
+
+        // no body (the leaf dial was refused): a WARN naming the listener row
+        let none = sandbox_probe("refused: x", "refused: [SSL: CERTIFICATE_VERIFY_FAILED]", "refused: y");
+        let c = sandbox_executor_check(Some(&none));
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("sandbox listener row") && c.detail.contains("CERTIFICATE_VERIFY_FAILED"), "{}", c.detail);
+        assert_eq!(sandbox_executor_check(None).verdict, Verdict::Warn);
     }
 
     /// The sandbox row: OK only when compose requires a client certificate
@@ -7161,6 +7814,12 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
         let parsed: SandboxProbe = serde_json::from_str(r#"{"no_cert": "refused: a", "leaf": "answered HTTP/1.1 200 OK", "plain": "refused: b"}"#).unwrap();
         assert_eq!(parsed, sandbox_probe("refused: a", "answered HTTP/1.1 200 OK", "refused: b"));
+        // the probe's fourth field: the health body, or null, and absent from an older probe
+        let with: SandboxProbe = serde_json::from_str(r#"{"no_cert": "refused: a", "leaf": "answered HTTP/1.1 200 OK", "plain": "refused: b", "health": {"executor": {"uid": 65600}}}"#).unwrap();
+        assert_eq!(with.health.as_ref().unwrap()["executor"]["uid"], 65600);
+        let null: SandboxProbe = serde_json::from_str(r#"{"no_cert": "refused: a", "leaf": "refused: c", "plain": "refused: b", "health": null}"#).unwrap();
+        assert_eq!(null.health, None);
+        assert!(SANDBOX_PROBE_PY.contains("'health':health()") && SANDBOX_PROBE_PY.contains("GET /health"));
         assert!(SANDBOX_PROBE_PY.contains("('sandbox',9000)") && SANDBOX_PROBE_PY.contains("NOO_TLS_CERT"));
         assert!(!SANDBOX_PROBE_PY.contains("CERT_NONE") && !SANDBOX_PROBE_PY.contains("check_hostname"));
     }
@@ -7686,6 +8345,183 @@ mod tests {
         assert_eq!(loki_at_rest_check("/x/loki", None, Some(true)).verdict, Verdict::Warn, "no mount = no claim");
     }
 
+    // ── i10a PR-A: the recorded at-rest decision, TPM facts, the new rows ──
+
+    fn tpm_facts(tpm: crate::commands::at_rest::TpmState) -> crate::commands::at_rest::TpmFacts {
+        use crate::commands::at_rest::{Cpu, Tools, TpmFacts};
+        TpmFacts {
+            tpm,
+            secure_boot: Some(true),
+            container: false,
+            wsl: false,
+            vm: None,
+            sys_vendor: String::new(),
+            product_name: String::new(),
+            cpu: Cpu::Intel,
+            tools: Tools { systemd_creds: true, systemd_cryptenroll: true, cryptsetup: true },
+        }
+    }
+
+    fn opted_out() -> crate::commands::at_rest::AcceptedState {
+        crate::commands::at_rest::AcceptedState {
+            accepted: true,
+            source: "db".into(),
+            updated_by: Some("alice".into()),
+            updated_at: Some("2026-10-23T12:00:00Z".into()),
+        }
+    }
+
+    /// A row in the clear, with a recorded opt-out, is ACCEPTED: it names who
+    /// and when, still says the data is unencrypted and what is exposed, has
+    /// no remedy to nag with, and does not fail the verb.
+    #[test]
+    fn an_opt_out_turns_a_plaintext_row_into_accepted_risk_that_still_says_unencrypted() {
+        use crate::commands::at_rest::TpmState;
+        let m = Some(("/dev/nvme0n1p1", "/media/alice/data"));
+        let d = opted_out();
+        for tpm in [None, Some(tpm_facts(TpmState::Tpm2)), Some(tpm_facts(TpmState::Absent))] {
+            let c = at_rest_check_with("postgres at rest", "the database files", "/media/alice/data/noo/postgres", true, m, Some(false), Some(&d), tpm.as_ref());
+            assert_eq!(c.verdict, Verdict::Accepted, "{}", c.detail);
+            assert_eq!(
+                c.detail,
+                "accepted risk (opted out by alice at 2026-10-23T12:00:00Z): Your data is stored unencrypted on disk. Anyone with the drive can read it. In the clear: the database files"
+            );
+            assert!(c.detail.contains("unencrypted"));
+            assert_eq!(c.remedy, None);
+        }
+        // not accepted (flag false): the plain warning, not Accepted
+        let mut off = opted_out();
+        off.accepted = false;
+        let c = at_rest_check_with("postgres at rest", "x", "/d", true, m, Some(false), Some(&off), None);
+        assert_eq!(c.verdict, Verdict::Warn);
+        // an encrypted row is OK whatever was decided
+        let c = at_rest_check_with("postgres at rest", "x", "/d", true, m, Some(true), Some(&d), None);
+        assert_eq!(c.verdict, Verdict::Ok);
+    }
+
+    /// No usable TPM and no decision: WARN naming the reason, with the way
+    /// to enable one as the remedy. A TPM and no decision: the #351 remedy.
+    #[test]
+    fn a_plaintext_row_without_a_tpm_says_why_and_how_and_with_one_keeps_the_plan_remedy() {
+        use crate::commands::at_rest::TpmState;
+        let m = Some(("/dev/vda1", "/"));
+        let none = tpm_facts(TpmState::Absent);
+        let c = at_rest_check_with("loki at rest", LOKI_WHAT, "/x/loki", true, m, Some(false), None, Some(&none));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("no TPM was found"), "{}", c.detail);
+        assert!(c.detail.contains("in the clear"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap().contains("Intel PTT"), "{:?}", c.remedy);
+        let mut wsl = tpm_facts(TpmState::Absent);
+        wsl.wsl = true;
+        let c = at_rest_check_with("loki at rest", LOKI_WHAT, "/x/loki", true, m, Some(false), None, Some(&wsl));
+        assert!(c.remedy.as_deref().unwrap().contains("run on the host"), "{:?}", c.remedy);
+
+        let with = tpm_facts(TpmState::Tpm2);
+        let c = at_rest_check_with("age key at rest", "the SOPS age key", "/h/.config/sops/age", true, m, Some(false), None, Some(&with));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.remedy.as_deref(), Some(AT_REST_REMEDY_KEYS), "a TPM and no decision keeps the #351 remedy");
+        let c = at_rest_check_with("loki at rest", LOKI_WHAT, "/x/loki", true, m, Some(false), None, Some(&with));
+        assert_eq!(c.remedy.as_deref(), Some(AT_REST_REMEDY_DATA));
+    }
+
+    /// Accepted is its own verdict: "accepted" in --json, a distinct glyph,
+    /// never counted as a failure, and carries no remedy to print.
+    #[test]
+    fn accepted_is_its_own_verdict_in_json_and_never_fails_the_exit_code() {
+        let rows = vec![
+            accepted("postgres at rest", "accepted risk (opted out by alice at t): x"),
+            ok("a", "fine"),
+            warn("w", "careful", Some("do it".into())),
+        ];
+        let j = checks_json(&rows);
+        assert_eq!(j[0]["verdict"], "accepted");
+        assert_eq!(j[1]["verdict"], "ok");
+        assert_eq!(j[2]["verdict"], "warn");
+        // the same predicate the exit code uses
+        assert!(rows.iter().all(|c| c.verdict != Verdict::Fail && c.verdict != Verdict::Starting));
+        assert!(remedies_to_print("controller", &rows).iter().all(|(_, names)| !names.contains(&"postgres at rest")));
+        assert_ne!(Verdict::Accepted, Verdict::Ok, "accepted is not a pass");
+        assert_ne!(Verdict::Accepted, Verdict::Warn);
+        assert_ne!(ui::glyph(Glyph::Accepted), ui::glyph(Glyph::Warn));
+        assert_ne!(ui::glyph(Glyph::Accepted), ui::glyph(Glyph::Ok));
+        // render() is the one place a row becomes a glyph; it must not drop Accepted into a failure.
+        assert!(render("controller", &rows));
+    }
+
+    #[test]
+    fn the_at_rest_tpm_row_reports_the_machine_and_never_fails() {
+        use crate::commands::at_rest::TpmState;
+        let c = at_rest_tpm_check(&tpm_facts(TpmState::Tpm2));
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("TPM 2.0 present") && c.detail.contains("PCR 7 can be bound"), "{}", c.detail);
+        let mut nosb = tpm_facts(TpmState::Tpm2);
+        nosb.secure_boot = Some(false);
+        let c = at_rest_tpm_check(&nosb);
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("live-USB boot is not blocked"), "{}", c.detail);
+        let mut notools = tpm_facts(TpmState::Tpm2);
+        notools.tools.cryptsetup = false;
+        let c = at_rest_tpm_check(&notools);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("cryptsetup"), "{}", c.detail);
+        let c = at_rest_tpm_check(&tpm_facts(TpmState::Tpm12));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("1.2"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap().contains("not supported"));
+    }
+
+    #[test]
+    fn the_at_rest_swap_row_wants_no_swap_zram_or_dm_crypt() {
+        let header = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
+        let enc = |file: &str, _ty: &str| match file {
+            "/dev/mapper/cryptswap" => Some(true),
+            "/swapfile" | "/dev/sda2" => Some(false),
+            _ => None,
+        };
+        assert_eq!(at_rest_swap_check(header, &enc).verdict, Verdict::Ok, "no swap");
+        assert_eq!(at_rest_swap_check("", &enc).verdict, Verdict::Ok, "unreadable /proc/swaps is no swap");
+        let zram = format!("{header}/dev/zram0 partition 8388604 0 100\n");
+        assert_eq!(at_rest_swap_check(&zram, &enc).verdict, Verdict::Ok);
+        let crypt = format!("{header}/dev/mapper/cryptswap partition 8388604 0 -2\n");
+        assert_eq!(at_rest_swap_check(&crypt, &enc).verdict, Verdict::Ok);
+        let plain = format!("{header}/swapfile file 8388604 0 -2\n/dev/zram0 partition 1 0 100\n");
+        let c = at_rest_swap_check(&plain, &enc);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("/swapfile") && c.detail.contains("written to disk"), "{}", c.detail);
+        assert!(c.remedy.is_some());
+        let unknown = format!("{header}/dev/sdz9 partition 1 0 -2\n");
+        let c = at_rest_swap_check(&unknown, &enc);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("could not determine"), "{}", c.detail);
+    }
+
+    #[test]
+    fn the_outside_the_set_row_lists_what_is_in_the_clear_and_honours_the_opt_out() {
+        let item = |what: &str, path: &str, enc| OutsideItem { what: what.into(), path: path.into(), encrypted: enc };
+        assert_eq!(at_rest_outside_check(&[], None).verdict, Verdict::Ok);
+        let enc = [item("journald", "/var/log/journal", Some(true))];
+        assert_eq!(at_rest_outside_check(&enc, None).verdict, Verdict::Ok);
+        let items = [
+            item("docker volume claude-config", "/var/lib/docker/volumes/x_claude-config/_data", Some(false)),
+            item("docker volume alertmanager-data", "/var/lib/docker/volumes/x_alertmanager-data/_data", Some(false)),
+            item("docker json logs", "/var/lib/docker/containers", Some(false)),
+            item("journald", "/var/log/journal", Some(true)),
+        ];
+        let c = at_rest_outside_check(&items, None);
+        assert_eq!(c.verdict, Verdict::Warn);
+        for want in ["claude-config", "alertmanager-data", "docker json logs"] {
+            assert!(c.detail.contains(want), "{want} missing: {}", c.detail);
+        }
+        assert!(!c.detail.contains("journald"), "an encrypted location was listed as exposed: {}", c.detail);
+        let c = at_rest_outside_check(&items, Some(&opted_out()));
+        assert_eq!(c.verdict, Verdict::Accepted);
+        assert!(c.detail.contains("alice") && c.detail.contains("unencrypted") && c.detail.contains("claude-config"), "{}", c.detail);
+        let unknown = [item("journald", "/var/log/journal", None)];
+        let c = at_rest_outside_check(&unknown, None);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("encryption unknown"), "{}", c.detail);
+    }
+
     /// The at-rest table resolves each directory the way the stack does:
     /// compose's `NOO_DATA_ROOT` binds, `NOO_PG_DATA` (onboard's NTFS
     /// redirect) for Postgres, `NOO_PKI_DIR`, and the age key's directory.
@@ -7711,6 +8547,32 @@ mod tests {
         assert_eq!(path("age key at rest"), "/home/alice/.config/sops/age");
         assert!(rows.iter().all(|r| r.name.ends_with(" at rest")), "one naming for the whole table");
         assert_eq!(rows.len(), 9);
+
+        // NOO_STATE_ROOT moves exactly the state set; NOO_PG_DATA still wins
+        // for postgres; the PKI / age rows are untouched by it.
+        let env_s = |k: &str| -> Option<String> {
+            match k {
+                "NOO_DATA_ROOT" => Some("/media/alice/data/noo".into()),
+                "NOO_STATE_ROOT" => Some("/mnt/state/".into()),
+                "HOME" => Some("/home/alice".into()),
+                _ => None,
+            }
+        };
+        let rows_s = at_rest_dirs(&env_s);
+        let path_s = |name: &str| rows_s.iter().find(|r| r.name == name).unwrap().path.clone();
+        for (row, dir) in [("loki", "loki"), ("postgres", "postgres"), ("redis", "redis"), ("nats", "nats"), ("prometheus", "prometheus"), ("grafana", "grafana"), ("noo-data", "noo-data")] {
+            assert_eq!(path_s(&format!("{row} at rest")), format!("/mnt/state/{dir}"), "{row} reads the state root");
+        }
+        assert_eq!(path_s("pki at rest"), "/home/alice/.config/mesh/pki");
+        let env_pg = |k: &str| -> Option<String> {
+            match k {
+                "NOO_STATE_ROOT" => Some("/mnt/state".into()),
+                "NOO_PG_DATA" => Some("/home/alice/noo/postgres".into()),
+                _ => None,
+            }
+        };
+        let pg_row = at_rest_dirs(&env_pg).into_iter().find(|r| r.name == "postgres at rest").unwrap();
+        assert_eq!(pg_row.path, "/home/alice/noo/postgres", "NOO_PG_DATA keeps precedence over the state root");
 
         // The overrides the wizard writes / the operator exports.
         let env2 = |k: &str| -> Option<String> {
@@ -7752,7 +8614,15 @@ mod tests {
             if on_home {
                 assert_eq!(c.verdict, Verdict::Warn, "{}: {}", row.name, c.detail);
                 assert!(c.detail.contains("in the clear") && c.detail.contains(row.what), "{}: {}", row.name, c.detail);
-                assert!(c.remedy.as_deref().unwrap_or("").contains("LUKS"), "{}", row.name);
+                let remedy = c.remedy.as_deref().unwrap_or("");
+                if row.name == "pki at rest" || row.name == "age key at rest" {
+                    assert!(remedy.contains("seal these keys to this machine's TPM"), "{}: {remedy}", row.name);
+                    assert!(!remedy.contains("LUKS"), "{}: keys are sealed, not volume-encrypted: {remedy}", row.name);
+                } else {
+                    assert!(remedy.contains("LUKS2 volume on this disk (no reinstall)"), "{}: {remedy}", row.name);
+                }
+                assert!(remedy.contains("root on the running machine always can"), "{}: must disclose what it does not cover", row.name);
+                assert!(!remedy.contains("encrypt the data root's disk"), "{}: full-disk LUKS is not the plan", row.name);
             } else {
                 assert_eq!(c.verdict, Verdict::Ok, "{}: {}", row.name, c.detail);
             }
@@ -8015,16 +8885,16 @@ mod tests {
     #[test]
     fn the_lane_metrics_parse_per_lane_and_caller() {
         let text = lane_metrics(1_790_000_000, &[
-            r#"noo_legacy_lane_uses_total{caller="trellion",door="controller",lane="self_call_shared_secret"} 10"#,
-            r#"noo_legacy_lane_uses_total{caller="worker",door="controller",lane="self_call_shared_secret"} 2"#,
-            r#"noo_legacy_lane_uses_total{caller="trellion",kind="controller",lane="cluster_hmac_non_inference",route_class="graph"} 3"#,
-            r#"noo_legacy_lane_uses_total{caller="trellion",kind="controller",lane="cluster_hmac_non_inference",route_class="rag"} 4"#,
+            r#"noo_legacy_lane_uses_total{caller="trellion",door="cluster",lane="self_call_shared_secret_refused"} 10"#,
+            r#"noo_legacy_lane_uses_total{caller="worker",door="cluster",lane="self_call_shared_secret_refused"} 2"#,
+            r#"noo_legacy_lane_uses_total{caller="trellion",lane="addon_shared_secret_refused",route_class="graph"} 3"#,
+            r#"noo_legacy_lane_uses_total{caller="trellion",lane="addon_shared_secret_refused",route_class="rag"} 4"#,
             r#"noo_legacy_lane_uses_total{lane="node_token_no_cert",node="host9",route_class="cluster"} 5"#,
         ]);
         let g = parse_legacy_lane_metrics(&text);
         assert_eq!(g.start_unix, Some(1_790_000_000));
-        assert_eq!(g.lanes["self_call_shared_secret"], vec![("trellion".to_string(), 10), ("worker".to_string(), 2)]);
-        assert_eq!(g.lanes["cluster_hmac_non_inference"], vec![("trellion".to_string(), 7)], "route classes fold into the caller");
+        assert_eq!(g.lanes["self_call_shared_secret_refused"], vec![("trellion".to_string(), 10), ("worker".to_string(), 2)]);
+        assert_eq!(g.lanes["addon_shared_secret_refused"], vec![("trellion".to_string(), 7)], "route classes fold into the caller");
         assert_eq!(g.lanes["node_token_no_cert"], vec![("host9".to_string(), 5)]);
     }
 
@@ -8058,13 +8928,34 @@ mod tests {
     fn any_gateway_lane_in_use_warns_naming_it_and_its_caller() {
         let now = 1_790_000_000;
         let text = lane_metrics(now - 86_400, &[
-            r#"noo_legacy_lane_uses_total{caller="evolve",kind="controller",lane="cluster_hmac_non_inference",route_class="hofstadter"} 12"#,
+            r#"noo_legacy_lane_uses_total{caller="host9",lane="cluster_hmac_v1",route_class="cluster"} 12"#,
         ]);
         let lanes = serde_json::json!({ "since_unix": now - 86_400, "static_token": 0, "whois_non_controller": 0 });
         let c = legacy_lanes_check(Some(&text), &[lane_node("host3", now, Some(lanes))], now);
         assert_eq!(c.verdict, Verdict::Warn);
-        assert!(c.detail.contains("in use: cluster_hmac_non_inference"), "{}", c.detail);
-        assert!(c.detail.contains("cluster_hmac_non_inference 12 (evolve 12)"), "{}", c.detail);
+        assert!(c.detail.contains("in use: cluster_hmac_v1 (gateway admitted)"), "{}", c.detail);
+        assert!(c.detail.contains("cluster_hmac_v1 12 (host9 12)"), "{}", c.detail);
+    }
+
+    /// The retired self-call bridge is a REFUSAL now: a count warns naming
+    /// the caller and the key to mint, and is never "in use" (nothing
+    /// admitted it). The two retired admission lanes are no longer read.
+    #[test]
+    fn a_refused_self_call_warns_with_the_service_key_and_retired_lanes_are_not_read() {
+        let now = 1_790_000_000;
+        let text = lane_metrics(now - 86_400, &[
+            r#"noo_legacy_lane_uses_total{caller="host9",door="cluster",lane="self_call_shared_secret_refused"} 5"#,
+        ]);
+        let lanes = serde_json::json!({ "since_unix": now - 86_400, "static_token": 0, "whois_non_controller": 0 });
+        let c = legacy_lanes_check(Some(&text), &[lane_node("host3", now, Some(lanes.clone()))], now);
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("REFUSED 5 time(s) (host9 5)"), "{}", c.detail);
+        assert!(!c.detail.contains("in use:"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap_or("").contains("noo security service-key issue"), "{:?}", c.remedy);
+        let quiet = legacy_lanes_check(Some(&lane_metrics(now - 86_400, &[])), &[lane_node("host3", now, Some(lanes))], now);
+        assert_eq!(quiet.verdict, Verdict::Ok, "{}", quiet.detail);
+        assert!(quiet.detail.contains("self_call_shared_secret_refused 0"), "{}", quiet.detail);
+        assert!(!quiet.detail.contains("cluster_hmac_non_inference") && !quiet.detail.contains("self_call_shared_secret "), "{}", quiet.detail);
     }
 
     /// An add-on's shared-secret HMAC is REFUSED by the
@@ -8189,6 +9080,7 @@ mod tests {
             let needle = format!("= \"{lane}\";");
             assert!(gw.contains(&needle) || refused.contains(&needle), "the gateway declares no lane {lane}");
         }
+        assert!(gw.contains(&format!("= \"{GATEWAY_REFUSED_SELF_CALL_LANE}\";")), "the gateway declares no lane {GATEWAY_REFUSED_SELF_CALL_LANE}");
         assert!(gw.contains("pub const METRIC: &str = \"noo_legacy_lane_uses_total\";"));
         let core = include_str!("../../../gateway-rust/src/routes/core.rs");
         assert!(core.contains("noo_gateway_start_time_seconds {}"), "the start gauge's rendering moved");
@@ -8838,6 +9730,32 @@ mod gpu_contention_tests {
         assert!(remedies_to_print("host3", &other).is_empty());
     }
 
+    /// A seat whose display runs from a home directory (the 0.6.10
+    /// migration) or that is still on the root layout: the WARN remedy is
+    /// the one command that fixes it, and it prints in the seat's section.
+    #[test]
+    fn seat_layout_and_display_warn_remedies_print_in_the_seat_section() {
+        let seen = "2025-10-09T08:53:10Z";
+        let now = parse_rfc3339_unix(seen).unwrap() + 10;
+        let seat = serde_json::json!({"seat_name": "homeserver", "enroll_user": "rbwolf", "last_seen": seen,
+            "heartbeat": {"cli_version": "0.6.11", "layout": "user", "user_cli_current": true, "kiosk_serve": "active",
+                          "kiosk_display": "active", "kiosk_bins": "home", "console_build": "stack-v0.6.11"}});
+        let checks = crate::commands::kiosk_seat::seat_checks(&seat, "0.6.11", "stack-v0.6.11", now);
+        let row = checks.iter().find(|c| c.name == "display binaries").expect("the home layout is a row");
+        assert_eq!(row.verdict, Verdict::Warn, "a display that still runs is a WARN");
+        let want = "on homeserver: sudo ~rbwolf/.local/libexec/noo-seat/noo kiosk seat-sync --migrate";
+        let r = remedies_to_print("seat homeserver", &checks);
+        assert!(r.iter().any(|(rem, names)| *rem == want && names.contains(&"display binaries")), "{r:?}");
+        // The same WARN in a node section stays remedy-less (only gpu prints there).
+        assert!(remedies_to_print("homeserver", &checks).iter().all(|(rem, _)| *rem != want));
+        // The legacy root layout's WARN prints in the seat section too.
+        let legacy = vec![warn("seat layout", "still on the root layout", Some("on s: sudo /usr/local/libexec/noo-seat/noo kiosk seat-sync --migrate".into()))];
+        assert_eq!(remedies_to_print("seat s", &legacy).len(), 1);
+        // Other seat WARNs keep the node rule.
+        let other = vec![warn("seat cli", "x", Some("noo upgrade --seats".into()))];
+        assert!(remedies_to_print("seat s", &other).is_empty());
+    }
+
     #[test]
     fn not_measured_is_ok_and_absent_is_no_row() {
         let c = gpu_contention_check(&node(serde_json::json!({"state": "free", "method": "not-measured"}))).unwrap();
@@ -8853,5 +9771,45 @@ mod gpu_contention_tests {
         let rows = node_checks(&n, "v0.6.2", "0.6.2", 0, None);
         let gpu = rows.iter().find(|c| c.name == "gpu").expect("a gpu row");
         assert_eq!(gpu.verdict, Verdict::Warn);
+    }
+}
+
+#[cfg(test)]
+mod backup_rows_tests {
+    use super::*;
+    use crate::commands::backups::{freshness, Destination, History, Offsite, BACKUP_INTERVAL_SECS as DAY};
+
+    const NOW: i64 = 1_792_000_000;
+    const H: i64 = 3600;
+
+    fn row(age_h: i64) -> Check {
+        backup_age_check(&freshness(Some(NOW - age_h * H), History::At(NOW - age_h * H), NOW, DAY))
+    }
+
+    #[test]
+    fn the_last_backup_row_is_ok_warn_fail_by_age_with_the_run_it_now_remedy() {
+        assert_eq!(row(5).verdict, Verdict::Ok);
+        let w = row(30);
+        assert_eq!(w.verdict, Verdict::Warn);
+        assert!(w.remedy.as_deref().unwrap().contains("noo heartbeat run database_backup"));
+        let f = row(49);
+        assert_eq!(f.verdict, Verdict::Fail);
+        assert!(f.remedy.as_deref().unwrap().contains("noo heartbeat history database_backup"));
+    }
+
+    #[test]
+    fn a_disagreement_is_in_the_row() {
+        let c = backup_age_check(&freshness(Some(NOW - 2 * H), History::At(NOW - 40 * H), NOW, DAY));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("DISAGREEMENT"), "{}", c.detail);
+    }
+
+    #[test]
+    fn undecided_offsite_warns_with_setup_and_none_is_accepted() {
+        let c = offsite_backup_check(&Ok(None), &Offsite::NoDump);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.remedy.as_deref(), Some("noo backups setup"));
+        assert!(c.detail.contains("every backup is on this machine"));
+        assert_eq!(offsite_backup_check(&Ok(Some(Destination::Declined)), &Offsite::NoDump).verdict, Verdict::Accepted);
     }
 }

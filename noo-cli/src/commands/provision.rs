@@ -820,7 +820,8 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             println!("{}", ui::note(&format!(
                 "NODE_AGENT_BIND / NOO_CLUSTER_TOKEN_V1 withheld from this bundle: {node} reports \
                  {node_app_version}, whose applier predates them and would refuse the whole agent-env. \
-                 The bundle carries the newer CLI; the next restage carries both keys.")));
+                 The bundle carries the newer CLI; once {node} reports it, re-run \
+                 `noo cluster provision {node}` to apply the agent keys.")));
         }
         drop_env_keys(&env_body, CLUSTER_TRUST_ENV_KEYS)
     };
@@ -2133,16 +2134,14 @@ fn sops_credentials(root: &Path) -> Result<Creds, String> {
     }
     let mut cmd = crate::commands::secrets::sops_command().map_err(|e| e.to_string())?;
     cmd.args(["-d", "--input-type", "dotenv", "--output-type", "dotenv"]).arg(&path);
-    if std::env::var("SOPS_AGE_KEY_FILE").is_err() {
-        if let Ok(home) = std::env::var("HOME") {
-            cmd.env("SOPS_AGE_KEY_FILE", format!("{home}/.config/sops/age/keys.txt"));
-        }
-    }
+    // SOPS_AGE_KEY_FILE, the TPM-sealed runtime key, or the default (i10a).
+    let age_key = crate::age_key::path();
+    cmd.env("SOPS_AGE_KEY_FILE", &age_key);
     let out = cmd.output().map_err(|e| format!("could not run sops: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "sops could not decrypt {} (exit {}) — age key at ~/.config/sops/age/keys.txt or $SOPS_AGE_KEY_FILE?",
-            path.display(), out.status.code().unwrap_or(-1)));
+            "sops could not decrypt {} (exit {}) — is the age key at {}?",
+            path.display(), out.status.code().unwrap_or(-1), age_key.display()));
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let get = |k: &str| -> String {
@@ -3863,16 +3862,30 @@ pub(crate) const CLUSTER_TRUST_ENV_KEYS: &[&str] = &["NODE_AGENT_BIND", "NOO_CLU
 /// The first CLI whose Mac applier accepts [`CLUSTER_TRUST_ENV_KEYS`] in an
 /// `agent-env` payload (node_fetch.rs `AGENT_ENV_KEYS`). A Linux node is
 /// never withheld from: `noo-apply.sh` self-updates before it validates.
-const CLUSTER_TRUST_KEYS_MAC_FLOOR: (u32, u32, u32) = (0, 6, 8);
+///
+/// This is the TAG the keys first shipped in, not the version the change was
+/// written against: the keys landed on dev while 0.6.8 was in flight and were
+/// first released in noo-cli-v0.6.10. With the floor at 0.6.8, a 0.6.9 Mac
+/// (mcmini, 2026-10-23) was sent the keys and its applier refused the whole
+/// bundle with exit 65 — including the CLI that would have taught it the keys.
+/// The applier now self-updates before it validates (node_fetch.rs
+/// `verify_bundle_with`), so this floor is belt-and-braces for Macs whose
+/// applier predates that too. A future template key joins
+/// [`CLUSTER_TRUST_ENV_KEYS`]'s treatment by being added to a table like this
+/// one with its own floor (tests/test_apply_env_unit_shape.py fails first).
+const CLUSTER_TRUST_KEYS_MAC_FLOOR: (u32, u32, u32) = (0, 6, 10);
 
-/// Does this node's applier accept the cluster-trust keys? An unreadable
-/// version is assumed capable (as for the leaf kinds): withholding on a parse
-/// failure would silently leave a node unable to close its gates.
+/// Does this node's applier accept the cluster-trust keys? On a Mac an
+/// unreadable or missing version is assumed OLD: omitting the keys is
+/// harmless (the agent defaults both) while sending them to an applier that
+/// predates them strands the whole bundle, including the newer CLI that
+/// would have taught it. The next restage, once the node reports the new
+/// version, carries them.
 pub(crate) fn applier_knows_cluster_trust_keys(darwin: bool, app_version: &str) -> bool {
     if !darwin {
         return true;
     }
-    super::node_leaves::cli_version_triple(app_version).is_none_or(|v| v >= CLUSTER_TRUST_KEYS_MAC_FLOOR)
+    super::node_leaves::cli_version_triple(app_version).is_some_and(|v| v >= CLUSTER_TRUST_KEYS_MAC_FLOOR)
 }
 
 /// `body` without the lines that set any of `keys`.
@@ -3997,7 +4010,7 @@ mod cluster_trust_tests {
     fn an_unset_gate_or_an_older_gateway_renders_nothing() {
         let unset = json!({"posture": [{"key": "NOO_CLUSTER_TOKEN_V1", "db_value": null, "running": null}]});
         assert_eq!(v1_gate_from_posture(&unset), None);
-        let old = json!({"posture": [{"key": "NOO_SELF_CALL_SHARED_SECRET", "db_value": "0"}]});
+        let old = json!({"posture": [{"key": "NOO_EXEC_APPROVAL_MODE", "db_value": "approval"}]});
         assert_eq!(v1_gate_from_posture(&old), None);
         assert_eq!(v1_gate_from_posture(&json!({})), None);
     }
@@ -4017,8 +4030,77 @@ mod cluster_trust_tests {
     fn an_old_mac_applier_is_not_sent_keys_it_would_refuse() {
         assert!(applier_knows_cluster_trust_keys(false, "noo-cli-v0.5.1"), "linux self-updates its applier");
         assert!(!applier_knows_cluster_trust_keys(true, "noo-cli-v0.6.7+abc"));
-        assert!(applier_knows_cluster_trust_keys(true, "noo-cli-v0.6.8"));
-        assert!(applier_knows_cluster_trust_keys(true, "unknown"), "an unreadable version is assumed capable");
+        // 0.6.8 and 0.6.9 shipped WITHOUT the keys in the Mac applier's
+        // allow-list; mcmini on noo-cli-v0.6.9 refused the 0.6.10 bundle.
+        assert!(!applier_knows_cluster_trust_keys(true, "noo-cli-v0.6.8"));
+        assert!(!applier_knows_cluster_trust_keys(true, "noo-cli-v0.6.9+bdf4c07"));
+        assert!(applier_knows_cluster_trust_keys(true, "noo-cli-v0.6.10+c6c4814"));
+        assert!(applier_knows_cluster_trust_keys(true, "noo-cli-v0.6.11+abc"));
+        assert!(!applier_knows_cluster_trust_keys(true, "unknown"), "an unreadable Mac version is assumed old");
+        assert!(!applier_knows_cluster_trust_keys(true, ""), "no reported version is assumed old");
+        assert!(applier_knows_cluster_trust_keys(false, "noo-cli-v0.6.9"), "linux path unaffected");
+        assert!(applier_knows_cluster_trust_keys(false, ""));
+    }
+
+    /// The agent-env keys the v0.6.9 Mac applier accepts (node_fetch.rs
+    /// `AGENT_ENV_KEYS` at noo-cli-v0.6.9), frozen as a fixture.
+    const MAC_0_6_9_AGENT_ENV_KEYS: &[&str] = &[
+        "NODE_ID", "NODE_IP", "NODE_TIER", "GPU_MODEL", "CONTROLLER_URL", "NATS_URL",
+        "NOO_NODE_AGENT_TOKEN", "NOO_CLUSTER_SECRET", "NOO_PKI_DIR", "NOO_TLS_CA", "NOO_TLS_CERT",
+        "NOO_TLS_KEY", "NOO_MTLS_NODES", "OLLAMA_URL", "NOO_SELF_NODE", "NOO_DATA_ROOT",
+        "HF_CACHE_DIR", "MODELS_DIR", "OLLAMA_DATA_DIR", "NOO_MODEL_CACHE_URL", "PATH",
+        "NOO_FORCE_GPU", "NOO_OLLAMA_GPU_COUNT", "NOO_IMAGE_PREFIX", "NOO_IMAGE_TAG",
+        "NODE_AGENT_PORT", "LOG_LEVEL", "DOCKER_HOST", "NOO_APPLY_ACCEPT_CA_SIGNED",
+    ];
+
+    /// Render the REAL template the way provision does for a node reporting
+    /// `app_version`, and return the env that would be bundled.
+    fn bundled_env(darwin: bool, app_version: &str) -> Option<String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let path = root.join("node-agent-go/deploy/noo-node-agent.env.tmpl");
+        if !path.exists() {
+            eprintln!("crate-only build (no repo tree) -- agent-env compat check skipped");
+            return None;
+        }
+        let tmpl = std::fs::read_to_string(&path).unwrap();
+        let body = render_env_template(&tmpl, &super::tests::full_vars()).unwrap();
+        Some(if applier_knows_cluster_trust_keys(darwin, app_version) {
+            body
+        } else {
+            drop_env_keys(&body, CLUSTER_TRUST_ENV_KEYS)
+        })
+    }
+
+    fn env_keys(body: &str) -> Vec<&str> {
+        body.lines().filter(|l| !l.trim_start().starts_with('#'))
+            .filter_map(|l| l.split_once('=').map(|(k, _)| k)).collect()
+    }
+
+    #[test]
+    fn a_0_6_9_mac_gets_an_agent_env_its_applier_accepts() {
+        for v in ["noo-cli-v0.6.9+abc", "noo-cli-v0.6.8", "", "unknown"] {
+            let Some(body) = bundled_env(true, v) else { return };
+            let keys = env_keys(&body);
+            for k in CLUSTER_TRUST_ENV_KEYS {
+                assert!(!keys.contains(k), "{v}: {k} must be withheld:\n{body}");
+            }
+            for k in &keys {
+                assert!(MAC_0_6_9_AGENT_ENV_KEYS.contains(k),
+                    "{v}: {k} is not in the 0.6.9 applier's allow-list, so it would refuse the bundle:\n{body}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_0_6_10_mac_and_every_linux_node_get_the_trust_keys() {
+        for (darwin, v) in [(true, "noo-cli-v0.6.10"), (true, "noo-cli-v0.6.11+x"),
+                            (false, "noo-cli-v0.6.9"), (false, "stack-v0.6.9"), (false, "")] {
+            let Some(body) = bundled_env(darwin, v) else { return };
+            let keys = env_keys(&body);
+            for k in CLUSTER_TRUST_ENV_KEYS {
+                assert!(keys.contains(k), "darwin={darwin} {v}: {k} missing:\n{body}");
+            }
+        }
     }
 
     #[test]
@@ -4537,7 +4619,7 @@ mod tests {
         }
     }
 
-    fn full_vars() -> BTreeMap<&'static str, String> {
+    pub(super) fn full_vars() -> BTreeMap<&'static str, String> {
         let mut v = BTreeMap::new();
         for k in ["na_node_id","node_ip","node_tier","gpu_model","controller_url","nats_url",
                   "noo_node_agent_token","noo_cluster_secret",

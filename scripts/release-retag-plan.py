@@ -36,6 +36,17 @@ provably the same:
       node-agent  --build-arg NODE_AGENT_VERSION / NODE_AGENT_COMMIT are the
                   tag and its commit.
 
+PER-IMAGE RE-TAG (rc only). An rc whose tree differs from every earlier rc
+(rc.7 = rc.6 + a two-line Cargo.lock bump rebuilt all 13 images, ~25 min) is
+compared against the highest LOWER rc: `git diff --name-only <rc>..<tag>`
+against each image's declared build inputs (scripts/release-image-inputs.json;
+tests/test_release_image_inputs.py fails when a Dockerfile COPYs a path the
+table does not list). An image none of whose inputs changed, whose parent
+images (deps-core, deps-base) are also re-tagged, and whose sibling trees are
+equal, is re-tagged from that rc; the rest build. A change to the release lane
+itself (workflow, this script, the table, .dockerignore) rebuilds everything.
+A final never uses this path: it re-tags only from an equal-tree rc.
+
 Anything else — no earlier rc with an equal tree, the rc lock missing or
 unreadable, a sibling tree that differs, an image missing from the rc lock —
 answers BUILD for the affected image(s). Failing open costs a rebuild; failing
@@ -99,6 +110,140 @@ TAG_STAMPED = {"gateway": "embeds the console built as stack-$TAG",
                "node-agent": "NODE_AGENT_VERSION/COMMIT build args are the tag"}
 # Base images the lock does not list; re-tagged by their rc TAG, not a lock digest.
 NOT_IN_LOCK = {"deps-core", "deps-base"}
+
+
+INPUTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "release-image-inputs.json")
+
+
+def load_inputs(path: str = INPUTS_FILE) -> dict:
+    with open(path) as f:
+        return json.load(f)
+
+
+def glob_regex(glob: str) -> "re.Pattern[str]":
+    """`**` crosses directories, `*`/`?` do not."""
+    out, i = "", 0
+    while i < len(glob):
+        if glob.startswith("**", i):
+            out += ".*"
+            i += 2
+            continue
+        c = glob[i]
+        out += "[^/]*" if c == "*" else "[^/]" if c == "?" else re.escape(c)
+        i += 1
+    return re.compile(out + r"\Z")
+
+
+def covers(globs, path: str) -> bool:
+    """Is `path` (a file or a directory) matched by one of `globs`? A directory
+    is covered when the glob matches something inside it."""
+    path = path.strip("/")
+    return any(glob_regex(g).match(path) or glob_regex(g).match(path + "/x") for g in globs)
+
+
+def dockerfile_sources(text: str) -> list[tuple[str, str]]:
+    """(source, why-unresolvable-or-"") for every COPY/ADD source that comes
+    from the BUILD CONTEXT. `COPY --from=...` (a stage, an image or a named
+    context such as trellion) is not a context path and is skipped; sources
+    that cannot be resolved statically (variables, URLs, heredocs) come back
+    with a reason so the stale-table guard fails on them instead of ignoring."""
+    import shlex
+    logical, cur = [], ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not cur and (not line or line.startswith("#")):
+            continue
+        if cur and line.startswith("#"):
+            continue
+        cur += (" " if cur else "") + line.rstrip("\\").strip()
+        if not line.endswith("\\"):
+            logical.append(cur)
+            cur = ""
+    if cur:
+        logical.append(cur)
+    out: list[tuple[str, str]] = []
+    for line in logical:
+        m = re.match(r"(COPY|ADD)\s+(.*)$", line, re.I)
+        if not m:
+            continue
+        rest = m.group(2).strip()
+        if rest.startswith("["):
+            try:
+                toks = json.loads(rest)
+            except ValueError:
+                out.append((rest, "unparseable JSON-form COPY/ADD"))
+                continue
+        else:
+            toks = shlex.split(rest)
+        flags = [t for t in toks if t.startswith("--")]
+        args = [t for t in toks if not t.startswith("--")]
+        if any(f.startswith("--from") for f in flags):
+            continue
+        for src in args[:-1]:
+            if src.startswith("<<"):
+                out.append((src, "heredoc source"))
+            elif re.match(r"[a-z][a-z0-9+.-]*://", src, re.I):
+                out.append((src, "remote URL (not pinned by the tree)"))
+            elif "$" in src:
+                out.append((src, "variable in source path"))
+            else:
+                out.append((src, ""))
+    return out
+
+
+def uncovered_sources(text: str, context: str, inputs) -> list[str]:
+    """Context paths the Dockerfile COPYs/ADDs that `inputs` does not cover,
+    as repo-relative paths (or `path (reason)` when unresolvable)."""
+    ctx = os.path.normpath(context)
+    bad = []
+    for src, reason in dockerfile_sources(text):
+        if reason:
+            bad.append(f"{src} ({reason})")
+            continue
+        rel = os.path.normpath(os.path.join(ctx, src)) if src not in (".", "./") else ctx
+        rel = "" if rel == "." else rel
+        if not covers(list(inputs), rel) and not (rel == "" and "**" in inputs):
+            bad.append(rel or ".")
+    return bad
+
+
+def changed_files(prev: str, new: str) -> list[str] | None:
+    """Paths that differ between two tags (renames split into delete + add);
+    None when git cannot say."""
+    try:
+        return git("diff", "--name-only", "--no-renames", f"{prev}..{new}").splitlines()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def input_changes(changed: list[str], table: dict) -> tuple[dict[str, str], str]:
+    """({image: reason it must be rebuilt}, lane-change reason or "").
+
+    An image is listed when one of its own inputs changed or a parent image is
+    rebuilt. An image missing from the table is listed too."""
+    lane = [f for f in changed if covers(table.get("lane", []), f)]
+    if lane:
+        return {}, "release lane changed (" + ", ".join(lane[:3]) + (", ..." if len(lane) > 3 else "") + ")"
+    images = table.get("images", {})
+    rebuild: dict[str, str] = {}
+    for img in SIBLING_INPUTS:
+        spec = images.get(img)
+        if not isinstance(spec, dict) or not spec.get("inputs"):
+            rebuild[img] = "no declared build inputs"
+            continue
+        hit = [f for f in changed if covers(spec["inputs"], f)]
+        if hit:
+            rebuild[img] = "inputs changed: " + ", ".join(hit[:3]) + (", ..." if len(hit) > 3 else "")
+    moved = True
+    while moved:  # a rebuilt parent changes every image built FROM it
+        moved = False
+        for img in SIBLING_INPUTS:
+            spec = images.get(img) or {}
+            for parent in spec.get("parents", []):
+                if parent in rebuild and img not in rebuild:
+                    rebuild[img] = f"parent {parent} rebuilds"
+                    moved = True
+    return rebuild, ""
 
 
 def git(*args: str) -> str:
@@ -192,7 +337,8 @@ def plan(final_tag: str, repo: str, sibling_shas: dict[str, str],
          bases_text: str | None = "fetch",
          tree_of=lambda ref: git("rev-parse", f"{ref}^{{tree}}"),
          commit_of=lambda ref: git("rev-parse", f"{ref}^{{commit}}"),
-         list_rcs=rc_tags, sib_tree=sibling_tree) -> dict:
+         list_rcs=rc_tags, sib_tree=sibling_tree,
+         changed_of=changed_files, inputs_table=None) -> dict:
     build_all = {img: False for img in SIBLING_INPUTS}
     result = {"rc_tag": "", "rc_commit": "", "retag": build_all, "rc_digests": {}, "why": {}}
 
@@ -203,17 +349,35 @@ def plan(final_tag: str, repo: str, sibling_shas: dict[str, str],
     if os.environ.get("RELEASE_RETAG", "").strip().lower() == "off":
         return everything("re-tagging disabled by the repo variable RELEASE_RETAG=off")
     final_tree = tree_of(final_tag)
-    rc = next((t for t in candidates(final_tag, list_rcs) if tree_of(t) == final_tree), None)
+    cands = candidates(final_tag, list_rcs)
+    rc = next((t for t in cands if tree_of(t) == final_tree), None)
+    rebuild: dict[str, str] = {}   # per-image: why this image builds although an rc exists
     if rc is None:
-        if "-rc." in final_tag:
-            return everything(f"no earlier rc of {final_tag.rsplit('-rc.', 1)[0]} has this tree ({final_tree[:12]})")
-        return everything(f"no {final_tag}-rc.N has this tree ({final_tree[:12]})")
+        if "-rc." not in final_tag:
+            return everything(f"no {final_tag}-rc.N has this tree ({final_tree[:12]})")
+        miss = f"no earlier rc of {final_tag.rsplit('-rc.', 1)[0]} has this tree ({final_tree[:12]})"
+        if not cands:
+            return everything(miss)
+        # Per-image: diff against the highest lower rc. Any doubt builds.
+        rc = cands[0]
+        try:
+            table = inputs_table if inputs_table is not None else load_inputs()
+            changed = changed_of(rc, final_tag)
+        except (OSError, ValueError) as e:
+            return everything(f"{miss}; release-image-inputs.json unreadable ({e})")
+        if changed is None:
+            return everything(f"{miss}; could not diff {rc}..{final_tag}")
+        rebuild, lane = input_changes(changed, table)
+        if lane:
+            return everything(f"{miss}; {lane}")
     result["rc_tag"], result["rc_commit"] = rc, commit_of(rc)
     try:
         text = lock_text if lock_text is not None else fetch_lock(repo, rc, gh_token)
     except (urllib.error.URLError, LookupError, KeyError, json.JSONDecodeError) as e:
         return everything(f"could not read {rc}.lock ({e})")
     digests, sources = parse_lock(text)
+    if not digests:
+        return everything(f"{rc}.lock lists no image digests (unreadable?)")
     if bases_text == "fetch":
         bases_text = fetch_bases(repo, rc, gh_token)
     bases = parse_lock(bases_text)[0] if bases_text else {}
@@ -242,12 +406,15 @@ def plan(final_tag: str, repo: str, sibling_shas: dict[str, str],
         if img not in NOT_IN_LOCK and img not in digests:
             retag[img], why[img] = False, f"rebuild: {rc}.lock has no {img} digest"
             continue
+        if img in rebuild:
+            retag[img], why[img] = False, f"rebuild: {rebuild[img]} (vs {rc})"
+            continue
         bad = [sib_equal[s][1] for s in sibs if not sib_equal[s][0]]
         if bad:
             retag[img], why[img] = False, "rebuild: " + "; ".join(bad)
             continue
         retag[img] = True
-        why[img] = f"re-tag from {rc}" + (": " + "; ".join(sib_equal[s][1] for s in sibs) if sibs else "")
+        why[img] = f"re-tag from {rc}" + ("" if tree_of(rc) == final_tree else ": no build input changed") + (": " + "; ".join(sib_equal[s][1] for s in sibs) if sibs else "")
         if img in NOT_IN_LOCK and img not in digests:
             # An rc cut before stack-<rc>.bases existed: the re-tag is checked
             # only against the rc TAG (it must still resolve), not a recorded

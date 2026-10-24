@@ -27,7 +27,7 @@ All modules must stay cheap to import: heavy/optional dependencies
 FastAPI) are imported lazily inside handler bodies, on purpose.
 
 Reference implementations of handlers whose subjects were ported to native
-Rust live in ``legacy/python-workers-reference/`` (2026-08-08 sweep) — they
+Rust were removed in the 2026-08-08 sweep (history in git log before that) — they
 are NOT importable from here. Everything below either registers a live
 subject or is a helper a live path still calls.
 """

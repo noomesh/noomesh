@@ -1,0 +1,80 @@
+# AppArmor profile for the noomesh sandbox container (noo-sandbox,
+# noo-sandbox-extra) on hosts whose AppArmor confines Docker containers:
+# Ubuntu 24.04 and later, and the Pop!_OS releases built on it.
+#
+# Docker's own `docker-default` profile denies every mount and, on hosts
+# that restrict unprivileged user namespaces through AppArmor, the user
+# namespace too. Bubblewrap needs both: each `python_exec` call runs under
+# `bwrap --unshare-all`, which creates a user namespace and, inside it,
+# mounts a private /proc, /dev and tmpfs and pivots into them. Without this
+# profile the sandbox on such a host fails every call with "No permissions
+# to create new namespace" or "Can't mount proc", and the documented escape
+# hatch is `NOO_SANDBOX_APPARMOR=unconfined`, which gives up the whole
+# profile to regain two rules.
+#
+# This profile is docker-default (moby profiles/apparmor/template.go,
+# v27.5.1) with exactly that difference: the user-namespace rule and the
+# mount rules Bubblewrap needs, instead of `deny mount,`. Every other rule
+# is Docker's, verbatim: the /proc and /sys write denials, the ptrace and
+# signal scoping. The mounts a call makes stay inside its own user
+# namespace: the container holds no CAP_SYS_ADMIN (cap_drop ALL, plus
+# SETUID/SETGID/KILL for the executor launcher), so a mount outside a user
+# namespace fails on the capability before this profile is consulted, and
+# the seccomp profile (docker/seccomp-sandbox.json) still gates every
+# other syscall as Docker ships it.
+#
+# Install (root, once per host); the sandbox is then started with it:
+#   sudo install -m 0644 docker/apparmor-noo-sandbox /etc/apparmor.d/noo-sandbox
+#   sudo apparmor_parser -r /etc/apparmor.d/noo-sandbox
+#   NOO_SANDBOX_APPARMOR=noo-sandbox in .env, then: noo stack restart --force sandbox
+# `userns,` needs AppArmor 4.0 (Ubuntu 24.04). On an older parser the
+# profile does not load, and the sandbox keeps docker-default, where
+# Bubblewrap already works (the userns restriction is a 24.04 change).
+# Shape pinned by tests/test_sandbox_apparmor_profile.py; parse-checked by
+# scripts/check-apparmor-profile.sh against the 24.04 parser.
+
+#include <tunables/global>
+
+profile noo-sandbox flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  network,
+  capability,
+  file,
+  umount,
+  # Host (privileged) processes may send signals to container processes.
+  signal (receive) peer=unconfined,
+  # runc may send signals to container processes (for "docker stop").
+  signal (receive) peer=runc,
+  # crun may send signals to container processes (for "docker stop" when used with crun OCI runtime).
+  signal (receive) peer=crun,
+  # Container processes may send signals amongst themselves.
+  signal (send,receive) peer=noo-sandbox,
+
+  deny @{PROC}/* w,   # deny write for all files directly in /proc (not in a subdir)
+  # deny write to files not in /proc/<number>/** or /proc/sys/**
+  deny @{PROC}/{[^1-9],[^1-9][^0-9],[^1-9s][^0-9y][^0-9s],[^1-9][^0-9][^0-9][^0-9/]*}/** w,
+  deny @{PROC}/sys/[^k]** w,  # deny /proc/sys except /proc/sys/k* (effectively /proc/sys/kernel)
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,  # deny everything except shm* in /proc/sys/kernel/
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+
+  # Bubblewrap (the one difference from docker-default): a user namespace
+  # per call, and inside it the private /proc, /dev, tmpfs and bind mounts
+  # it pivots into. docker-default has `deny mount,` here.
+  userns,
+  mount,
+  pivot_root,
+
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/devices/virtual/powercap/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+  # suppress ptrace denials when using 'docker ps' or using 'ps' inside a container
+  ptrace (trace,read,tracedby,readby) peer=noo-sandbox,
+}

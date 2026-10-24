@@ -53,7 +53,7 @@ pub fn heartbeat_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
                 body["enabled_count"].as_u64().unwrap_or(0)
             ),
         ),
-        ("recent runs (24h)", body["recent_runs_24h"].as_u64().unwrap_or(0).to_string()),
+        ("recent runs (24h)", ui::count(&body, "recent_runs_24h")),
     ];
     if let Some(t) = last_tick {
         rows.push(("last tick", t));

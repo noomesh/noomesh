@@ -7,6 +7,7 @@ import { StatTiles } from '@/components/StatTiles';
 import { useGraph, type GraphFilters } from './useGraph';
 import { StagedPrunes } from './StagedPrunes';
 import { layoutGraph, radiusFor, colorFor, type LayoutNode } from '@/lib/graph/layout';
+import { dash } from '@/lib/num';
 
 const DEFAULTS: GraphFilters = { limit: 200, minDegree: 2, entityType: '' };
 
@@ -88,7 +89,7 @@ export function GraphPanel() {
               { label: 'Entities', value: g.data.nodeCount.toLocaleString() },
               { label: 'Edges', value: g.data.edgeCount.toLocaleString() },
               { label: 'Types', value: g.data.types.length },
-              { label: 'Max degree', value: g.data.maxDegree },
+              { label: 'Max degree', value: dash(g.data.maxDegree) },
             ]}
           />
 
@@ -170,7 +171,7 @@ export function GraphPanel() {
                         onClick={() => setSelected((s) => (s === n.id ? null : n.id))}
                       >
                         <circle cx={n.x} cy={n.y} r={r} fill={colorFor(n.type)} />
-                        <title>{`${n.name}${n.type ? ` · ${n.type}` : ''} · ${n.degree} edges`}</title>
+                        <title>{`${n.name}${n.type ? ` · ${n.type}` : ''} · ${dash(n.degree)} edges`}</title>
                         {/* Only label what's readable — every label at 200 nodes is soup. */}
                         {(r > 9 || n.id === selected) && (
                           <text x={n.x} y={n.y - r - 4} textAnchor="middle">
@@ -210,7 +211,7 @@ export function GraphPanel() {
             <div className="graph-sel">
               <span className="gs-name">{sel.name}</span>
               {sel.type && <span className="gs-type">{sel.type}</span>}
-              <span className="gs-deg">{sel.degree} edges</span>
+              <span className="gs-deg">{dash(sel.degree)} edges</span>
               <span className="gs-hint">
                 {(neighbours?.size ?? 1) - 1} neighbour
                 {(neighbours?.size ?? 1) - 1 === 1 ? '' : 's'} in view

@@ -25,7 +25,7 @@ To add or modify a tool the LLM can call: see "How to add a tool" in
 Lives at the top level (NOT inside `tools/` or `cluster/`) so it can be
 imported by both planes without creating a cross-boundary dependency:
 
-    (archived: legacy/python-cluster-reference/tool_registry.py) ──┐
+    (removed; git log before 2026-08-08) ──┐
                                  ├──→ noomesh.tool_spec  (this file)
     tools/base.py + registry.py ─┘
 

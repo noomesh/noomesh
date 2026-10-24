@@ -132,7 +132,12 @@ token is burned (`this machine is already enrolled in a DIFFERENT mesh`,
 exit 78). On macOS the agent arrives through the `net.noomesh.fetch`
 LaunchDaemon, which runs `noo node fetch` every minute; `noo enroll
 --resume` re-runs only that arming step. `noo node fetch` refuses to run on
-Linux (nodes there use the systemd `noo-fetch` timer).
+Linux (nodes there use the systemd `noo-fetch` timer). The daemon's copy is
+`/usr/local/bin/noo`, maintained by the rail: a bundle that carries a different
+CLI installs it (verified against the signed manifest, never an older applier
+generation) and re-runs the apply under it before judging any kind or env key,
+so a Mac is never stranded by a bundle its own CLI predates. `noo upgrade` in
+a shell updates only the shell's copy (usually `~/.local/bin/noo`).
 
 ### Upgrade
 
@@ -334,7 +339,7 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 |---|---|---|
 | `noo addons list` | — | Show every add-on: declared, effective and whether the licence grants it |
 | `noo addons show` | `<name>` | Show one add-on's switch, pin, and the database and workloads its signed bundle declares |
-| `noo addons enable` | `<name> [--force] [--lock <path\|https-url>]` | Pin an add-on's signed lock, mint its credentials and key, then declare it ON |
+| `noo addons enable` | `<name> [--force] [--lock <path\|https-url>] [--provision-only]` | Pin an add-on's signed lock, mint credentials, declare it ON (--provision-only: DB only) |
 | `noo addons trust-key` | `<name> <pubkey> [--registry <host/path>] [--dev] [--expires <dur>]` | Trust a third-party add-on's signing key; --dev --expires (max 30d): a temporary dev key |
 | `noo addons untrust-key` | `<name> [<pubkey>] [--dev]` | Stop trusting a third-party add-on's signing key; --dev removes its dev key(s) |
 | `noo addons set` | `<name> --delegate tasks\|off` | Let an add-on act on a person's tasks (needs its manifest to declare it too) |

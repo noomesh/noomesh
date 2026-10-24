@@ -113,9 +113,17 @@ type Reporter struct {
 	// broken. nil = this agent has no messaging at all.
 	busStatus func() any
 
+	// pullEmbed reports the bulk-embedding pull worker's models and whether
+	// its consumers are bound. Nil = this node does not run the worker; the
+	// key is then omitted.
+	pullEmbed func() any
+
 	// natsRPC reports whether control over the bus is live on this node
 	// (subscription accepted by the server, no later refusal). nil = false.
 	natsRPC func() bool
+	// tunnel reports whether the node-held tunnel to the controller is up
+	// right now (internal/tunnel). nil = this build has none.
+	tunnel func() bool
 
 	// gpuContention is the shared-GPU yield's report (internal/gpuyield),
 	// sent as `gpu_contention`. nil = not wired; the key is then omitted.
@@ -269,10 +277,20 @@ func (r *Reporter) gpuContentionReport() any {
 // every heartbeat as `nats_status`.
 func (r *Reporter) SetBusStatus(f func() any) { r.busStatus = f }
 
+// SetPullEmbed installs the provider of the heartbeat's pull_embed field,
+// {"models": [...], "bound": bool}. For humans and the console; the gateway
+// routes on the consumer's own state, not on this claim.
+func (r *Reporter) SetPullEmbed(f func() any) { r.pullEmbed = f }
+
 // SetNatsRPC installs the probe behind control_transports.nats_rpc. The
 // agent passes ctrlrpc.Service.Ready, so the field is true only while the
 // node can actually answer a control call on the bus.
 func (r *Reporter) SetNatsRPC(f func() bool) { r.natsRPC = f }
+
+// SetTunnel installs the probe behind control_transports.tunnel. The agent
+// passes tunnel.Client.Connected, so the field is true only while the tunnel
+// is up and the controller can send streaming calls down it.
+func (r *Reporter) SetTunnel(f func() bool) { r.tunnel = f }
 
 // natsStatus returns the value to send. nil when no provider is installed —
 // a heartbeat that omits the field means "this agent build does not report
@@ -515,6 +533,11 @@ func (r *Reporter) SendHeartbeat() {
 		payload["nats_status"] = bus
 	}
 	clk.mark("bus")
+	if r.pullEmbed != nil {
+		if pe := r.pullEmbed(); pe != nil {
+			payload["pull_embed"] = pe
+		}
+	}
 
 	// Omitted, never empty: an older agent reports nothing here, and the
 	// controller must not read that as "every backend is container-managed".
@@ -1006,9 +1029,11 @@ func UsableHostIP(ip string) string { return usableHostIP([]string{ip}) }
 // controlTransports reports how the controller can reach this agent. The
 // HTTPS listener is always offered; "nats_rpc" is true only while control
 // over the bus is live (the subscription was accepted by the server and no
-// permission refusal has been seen since); "tunnel" stays false until the
-// node-held tunnel ships.
+// permission refusal has been seen since); "tunnel" is true only while the
+// node-held tunnel to the controller is connected, so a gateway never routes
+// a stream into a tunnel that is not there.
 func (r *Reporter) controlTransports() map[string]bool {
 	rpc := r.natsRPC != nil && r.natsRPC()
-	return map[string]bool{"https_listener": true, "nats_rpc": rpc, "tunnel": false}
+	tun := r.tunnel != nil && r.tunnel()
+	return map[string]bool{"https_listener": true, "nats_rpc": rpc, "tunnel": tun}
 }

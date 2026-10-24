@@ -12,6 +12,7 @@ export function Sidebar({ active, onSelect }: { active: string; onSelect: (id: s
   const { isOperator } = useAuth();
   // Shared query key with the Cluster tab — no extra polling.
   const cluster = useClusterNodes();
+  // Only read after the isLoading/isError branches below; 0 here is the "nothing yet" layout default.
   const online = cluster.data?.stats.online ?? 0;
 
   // Groups start open. They used to start collapsed, which meant a fresh
@@ -28,7 +29,7 @@ export function Sidebar({ active, onSelect }: { active: string; onSelect: (id: s
   // scopes too). Note `admin` is a CORE tab since 2026-08-27, so this gate now
   // runs in the open-source build as well — a non-operator on an OSS install
   // sees 13 tabs, not 14.
-  const OPERATOR_TABS = ['admin', 'model-prefs', 'skills'];
+  const OPERATOR_TABS = ['admin', 'model-prefs', 'skills', 'traffic'];
   const visible = (item: NavItem) => !OPERATOR_TABS.includes(item.id) || isOperator;
 
   const renderBtn = (item: NavItem) => (

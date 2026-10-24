@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { meterLevel } from '@/lib/meter';
 import { useObservability, type AddonState } from './useObservability';
+import { dash } from '@/lib/num';
 import { groupBackendDoors, type ContainerRow } from './doorGroups';
 import { useGrafanaSession, sendTab, type TabHandle } from './useGrafanaSession';
 import {
@@ -17,7 +18,7 @@ import {
   recordAutoOpen,
 } from './grafanaArrival';
 
-const gb = (mb: number) => (mb / 1024).toFixed(1);
+const gb = (mb: number | null) => dash(mb, (n) => (n / 1024).toFixed(1));
 
 const ADDON_BADGE: Record<AddonState, string> = {
   enabled: 'on',
@@ -130,7 +131,7 @@ function DoorBadge({ row }: { row: ContainerRow }) {
   const d = row.door;
   const title =
     row.doorWarning ??
-    (d ? `${d.name}: ${d.status} · cpu ${d.cpu.toFixed(1)}% · mem ${gb(d.memUsed)} GB` : undefined);
+    (d ? `${d.name}: ${d.status} · cpu ${dash(d.cpu, (n) => `${n.toFixed(1)}%`)} · mem ${gb(d.memUsed)} GB` : undefined);
   return (
     <span className={cn('door-badge', row.doorWarning ? 'warn' : row.doorState)} title={title}>
       mTLS door {DOOR_LABEL[row.doorState]}
@@ -230,7 +231,7 @@ export function ObservabilityPanel() {
                     <DoorBadge row={c} />
                   </div>
                   <div className="obs-c-metrics">
-                    <span>cpu {c.cpu.toFixed(1)}%</span>
+                    <span>cpu {dash(c.cpu, (n) => `${n.toFixed(1)}%`)}</span>
                     <span>
                       mem {gb(c.memUsed)}/{gb(c.memLimit)} GB
                     </span>

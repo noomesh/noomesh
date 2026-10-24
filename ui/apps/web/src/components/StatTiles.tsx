@@ -2,10 +2,12 @@
 // Copyright 2026 PersonifAI LLC
 
 import { cn } from '@/lib/utils';
+import { DASH } from '@/lib/num';
 
 export interface StatTile {
   label: string;
-  value: string | number;
+  /** null = the gateway did not send it: renders a dash, never 0. */
+  value: string | number | null;
   hot?: boolean;
 }
 
@@ -15,7 +17,7 @@ export function StatTiles({ tiles }: { tiles: StatTile[] }) {
     <div className="tiles">
       {tiles.map((t) => (
         <div key={t.label} className={cn('tile', t.hot && 'hot')}>
-          <div className="v">{t.value}</div>
+          <div className="v">{t.value ?? DASH}</div>
           <div className="k">{t.label}</div>
         </div>
       ))}

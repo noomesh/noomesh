@@ -17,7 +17,8 @@ export interface LayoutNode {
   id: string;
   name: string;
   type: string;
-  degree: number;
+  /** null = unreported by the gateway; draws as a minimum-size node. */
+  degree: number | null;
   x: number;
   y: number;
 }
@@ -29,7 +30,7 @@ export interface LayoutEdge {
 }
 
 export interface GraphInput {
-  nodes: { id: string; name: string; type: string; degree: number }[];
+  nodes: { id: string; name: string; type: string; degree: number | null }[];
   edges: LayoutEdge[];
 }
 
@@ -185,8 +186,9 @@ function fitToViewport(nodes: LayoutNode[]): void {
 }
 
 /** Node radius from degree — sqrt so a 100-edge hub doesn't dwarf everything. */
-export function radiusFor(degree: number, maxDegree: number): number {
-  const t = maxDegree > 0 ? Math.sqrt(degree) / Math.sqrt(maxDegree) : 0;
+export function radiusFor(degree: number | null, maxDegree: number | null): number {
+  // Layout only: an unreported degree sizes as the smallest node; the panel text shows a dash.
+  const t = maxDegree !== null && maxDegree > 0 ? Math.sqrt(degree ?? 0) / Math.sqrt(maxDegree) : 0;
   return 4 + t * 13;
 }
 

@@ -1141,7 +1141,7 @@ pub const CORE_REGISTRY: &[SecretSpec] = &[
         class: Class::ProviderIssued,
         gen_bytes: 0,
         consequence: "issued by login.tailscale.com/admin/settings/keys and they EXPIRE \
-                      (typically 90d); `cluster mint-join-key` / `set-primary` start failing \
+                      (typically 90d); `cluster invite` / `set-primary` start failing \
                       once it lapses, which looks like a network fault",
         // Gateway-only since an earlier release: the Python reader
         // (cluster/tailscale.py) is reached only from the `noomesh cluster
@@ -1407,7 +1407,7 @@ impl SecretStore {
 
     /// Plaintext of a stored value, for use as a bearer credential in an
     /// API call made by THIS process. The second and last deliberate escape
-    /// hatch from "no accessor returns a value": `cluster mint-join-key` /
+    /// hatch from "no accessor returns a value": `cluster invite` /
     /// `set-primary` call the Tailscale API from the CLI itself, and
     /// NOO_TAILSCALE_API_KEY lives in the sops store — NOT in `.env`, which
     /// is exactly where the old "add it to .env" hint invited it (the
@@ -1502,13 +1502,17 @@ impl std::fmt::Display for StoreLoadError {
                  scripts/noo-secrets-sops-init.sh, or put its directory on PATH"
             ),
             StoreLoadError::SopsFailedToRun { detail } => write!(f, "could not run sops: {detail}"),
+            // The path is `crate::age_key::path()`: SOPS_AGE_KEY_FILE, the
+            // TPM-sealed runtime key (i10a), or ~/.config/sops/age/keys.txt.
             StoreLoadError::DecryptFailed { path, exit, age_key_present: false } => write!(
                 f,
-                "sops could not decrypt {} (exit {exit}): no age key at \
-                 ~/.config/sops/age/keys.txt and $SOPS_AGE_KEY_FILE names none — restore the key \
+                "sops could not decrypt {} (exit {exit}): no age key at {} — restore the key \
                  from its backup (docs/security/secrets.md, 'Back up and restore the age key') \
-                 or point SOPS_AGE_KEY_FILE at it",
-                path.display()
+                 or point SOPS_AGE_KEY_FILE at it; if it is sealed to this machine's TPM: \
+                 systemctl status {}",
+                path.display(),
+                crate::age_key::path().display(),
+                crate::age_key::UNSEAL_UNIT
             ),
             StoreLoadError::DecryptFailed { path, exit, age_key_present: true } => write!(
                 f,
@@ -1611,12 +1615,8 @@ fn age_key_present() -> bool {
     if std::env::var_os("SOPS_AGE_KEY").is_some() {
         return true;
     }
-    if let Some(p) = std::env::var_os("SOPS_AGE_KEY_FILE") {
-        return Path::new(&p).is_file();
-    }
-    std::env::var_os("HOME")
-        .map(|h| Path::new(&h).join(".config/sops/age/keys.txt").is_file())
-        .unwrap_or(false)
+    // SOPS_AGE_KEY_FILE, the sealed runtime key, or the default (i10a).
+    crate::age_key::path().is_file()
 }
 
 /// Decrypt the store to dotenv TEXT, in memory. The one decrypt path for
@@ -7660,11 +7660,14 @@ mod provision_tests {
         // Read from the overlay, not restated: the default IS the declaration.
         let declared = addon_decl("evolve").unwrap().scopes;
         assert_eq!(evolve[1..], declared.iter().map(|s| s.to_string()).collect::<Vec<_>>()[..]);
-        for c in ["svc:trellion", "svc:trellion-intel"] {
-            assert_eq!(provisioned_scopes(c, &[]),
-                vec!["addon".to_string(), "chat".to_string(), "embeddings".to_string(), "metrics".to_string()],
-                "{c}: inference plus metrics (phase C moves its counters onto the gateway)");
-        }
+        assert_eq!(provisioned_scopes("svc:trellion-intel", &[]),
+            vec!["addon".to_string(), "chat".to_string(), "embeddings".to_string(), "metrics".to_string()],
+            "trellion-intel: inference plus metrics (phase C moves its counters onto the gateway)");
+        // trellion also transcribes audio it ingests, through the gateway's STT routes.
+        assert_eq!(provisioned_scopes("svc:trellion", &[]),
+            vec!["addon".to_string(), "chat".to_string(), "embeddings".to_string(), "metrics".to_string(),
+                 "voice:transcribe".to_string()],
+            "trellion: inference, metrics, and the transcribe routes");
         // The core worker's default is a declared row, not a fallthrough.
         assert_eq!(provisioned_scopes("svc:worker", &[]),
             vec!["addon".to_string(), "chat".to_string(), "embeddings".to_string()]);
@@ -7696,8 +7699,8 @@ mod provision_tests {
         let key = serde_json::json!({ "scopes": ["addon", "chat", "embeddings"] });
         let r = provision_request("svc:trellion", &[], Some(&vocab), Some(&key));
         assert!(!r.overridden);
-        assert_eq!(r.declared, vec!["chat", "embeddings", "metrics"]);
-        assert_eq!(r.diff, Some((vec!["metrics".to_string()], vec![])));
+        assert_eq!(r.declared, vec!["chat", "embeddings", "metrics", "voice:transcribe"]);
+        assert_eq!(r.diff, Some((vec!["metrics".to_string(), "voice:transcribe".to_string()], vec![])));
 
         // An older gateway without the listing: no routes, no refusals —
         // the mint's own 400 speaks, as before.

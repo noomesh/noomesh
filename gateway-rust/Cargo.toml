@@ -11,7 +11,7 @@ description = "Mesh Gateway — Rust implementation"
 [dependencies]
 # Web framework
 axum = { version = "0.8", features = ["ws", "json", "multipart"] }
-axum-extra = { version = "0.10", features = ["cookie"] }
+axum-extra = { version = "0.12", features = ["cookie"] }
 rand = "0.10"
 base64 = "0.23"
 # Intelligent-tier entitlement verification (entitlement.rs). Already in the
@@ -31,28 +31,37 @@ tokio-stream = "0.1"
 # (routes/reservations.rs) and add-on WS routes (addon_ws.rs). The same
 # tokio-tungstenite axum's `ws` feature pins; the TLS hop is tokio-rustls
 # over the cluster's rustls config (tls.rs).
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 futures = "0.3"
 
 # HTTP client (for LLM backends)
-# default-features = false: reqwest's default TLS is native-tls, which links
-# OpenSSL — so the gateway carried BOTH stacks and the builder needed
+# default-features = false: reqwest's default TLS was native-tls (0.12), which
+# links OpenSSL, so the gateway carried BOTH stacks and the builder needed
 # libssl-dev, while every TLS decision in the tree (tls.rs, bus.rs, the
 # rustls provider) is rustls. Found 2026-09-18 when the harness binary had
-# to cross-compile for aarch64 and darwin: OpenSSL was
-# the one C dependency with no cross story. Nothing used it.
-# rustls-tls-native-roots: with native-tls gone (#248) the DEFAULT client
-# would trust only Mozilla's bundled roots, where OpenSSL trusted the system
-# store. Cluster calls pin the cluster CA explicitly and never noticed; the
-# external MCP client dials whatever an operator registered, and a server
-# behind a private CA installed in the system store would have failed after
-# the roll with no line of config changed. Both stores, as before.
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls", "rustls-tls-native-roots", "charset", "http2"] }
+# to cross-compile for aarch64 and darwin: OpenSSL was the one C dependency
+# with no cross story. Nothing used it.
+# reqwest 0.13 renamed the TLS features: `rustls` = rustls + the aws-lc-rs
+# provider (the one main.rs installs, and already in the tree via axum-server,
+# fred and sqlx) + rustls-platform-verifier, which trusts the SYSTEM store.
+# The old `rustls-tls` / `rustls-tls-native-roots` features are gone, and
+# `query` and `form` are now features of their own.
+# Both stores, as before (without the system store the DEFAULT client would
+# trust only Mozilla's roots, where OpenSSL trusted the system store): the external MCP client dials whatever an operator
+# registered, and a server behind a private CA installed in the system store
+# must keep working. The system store comes from the platform verifier; the
+# bundled Mozilla roots are merged in by tls::client_builder() through
+# tls_certs_merge (webpki-root-certs below). Cluster calls pin the cluster CA
+# through a preconfigured rustls config and trust ONLY it (tls.rs).
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "multipart", "query", "form", "rustls", "charset", "http2", "system-proxy"] }
+# Mozilla roots as DER certificates, for reqwest's tls_certs_merge (reqwest 0.13
+# ships no bundled roots). Same Mozilla set as webpki-roots, in the form reqwest takes.
+webpki-root-certs = "1"
 
 # NATS messaging + KV
 # websockets is off because NATS is reached over tls:// only; it keeps
 # tokio-websockets and webpki-roots 0.26 out of the tree. All other defaults kept.
-async-nats = { version = "0.49", default-features = false, features = ["server_2_10", "server_2_11", "server_2_12", "server_2_14", "service", "ring", "jetstream", "nkeys", "crypto", "object-store", "kv", "nuid"] }
+async-nats = { version = "0.50", default-features = false, features = ["server_2_10", "server_2_11", "server_2_12", "server_2_14", "service", "ring", "jetstream", "nkeys", "crypto", "object-store", "kv", "nuid"] }
 
 # Database
 sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "json", "chrono", "uuid", "tls-rustls-ring"] }
@@ -65,7 +74,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Auth
-jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_crypto", "use_pem"] }
+# The aws-lc-rs backend, not rust_crypto: rust_crypto signs ES256 through
+# p256 -> elliptic-curve -> crypto-bigint 0.5, whose constant-time arithmetic
+# is not (RUSTSEC-2026-0387; the fix is crypto-bigint 0.7, which p256 0.13
+# cannot take). This gateway holds long-lived ES256 private keys (the JWT
+# signing key, jwks.rs; the Grafana SSO key, routes/monitoring.rs), so a
+# timing leak in signing is the case that matters. aws-lc-rs is already the
+# process's rustls provider (main.rs), so no new C dependency comes with it.
+# Both backends accept only PKCS#8 EC keys (jsonwebtoken's PEM layer), so
+# key handling is unchanged.
+jsonwebtoken = { version = "11.1", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 hmac = "0.13"
 sha2 = "0.11"
 bcrypt = "0.17"
@@ -126,7 +144,7 @@ chrono-tz = "0.10"
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 # Cron expression parsing (heartbeat scheduler + autonomy intervals).
 # Matches the Python `croniter` semantics used by `gateway/heartbeat.py`.
-cron = "0.12"
+cron = "0.17"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 anyhow = "1"
@@ -142,7 +160,7 @@ serde_urlencoded = "0.7"
 # for that: it was already compiled for the test profile and is already in
 # Cargo.lock, so this adds nothing to the build graph. Still the only
 # non-test use; certificate ISSUANCE lives in noo-cli, not here.
-rcgen = "0.13"
+rcgen = "0.14"
 flate2 = "1"
 
 [dev-dependencies]

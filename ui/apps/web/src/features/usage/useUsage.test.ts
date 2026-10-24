@@ -57,13 +57,35 @@ describe('useUsage', () => {
     expect(out.rows[0]!.total).toBe(300);
   });
 
-  it('tolerates missing counts rather than rendering NaN', async () => {
+  it('reports missing counts as null, never 0 and never NaN (i195 E1)', async () => {
     H.get.mockResolvedValue({ data: { rows: [{ key: 'x' }] } });
     useUsage('all', 'source');
-    const out = (await runQueryFn()) as { total: number; rows: { total: number }[] };
+    const out = (await runQueryFn()) as {
+      total: number | null;
+      requests: number | null;
+      rows: { total: number | null; promptTokens: number | null; requests: number | null }[];
+    };
 
-    expect(out.total).toBe(0);
-    expect(out.rows[0]!.total).toBe(0);
+    expect(out.total).toBeNull();
+    expect(out.requests).toBeNull();
+    expect(out.rows[0]!.total).toBeNull();
+    expect(out.rows[0]!.promptTokens).toBeNull();
+    expect(out.rows[0]!.requests).toBeNull();
+  });
+
+  it('a partial row has a null total and sorts after the rows that reported', async () => {
+    H.get.mockResolvedValue({
+      data: {
+        rows: [
+          { key: 'partial', prompt_tokens: 999 },
+          { key: 'full', prompt_tokens: 1, completion_tokens: 1 },
+        ],
+      },
+    });
+    useUsage('all', 'source');
+    const out = (await runQueryFn()) as { rows: { key: string; total: number | null }[] };
+    expect(out.rows.map((r) => r.key)).toEqual(['full', 'partial']);
+    expect(out.rows[1]!.total).toBeNull();
   });
 
   it('throws when the endpoint errors, so the panel shows its error state', async () => {

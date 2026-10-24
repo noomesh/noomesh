@@ -1496,35 +1496,30 @@ fn chat_unreachable_gateway_points_at_mesh_start_and_exits_3() {
     assert!(stderr.contains("noo stack start"), "actionable hint expected, stderr was: {stderr}");
 }
 
-/// The Python CLI's `--no-use-cluster` fallback is offered only where a
-/// Python CLI exists; a standalone host has none and gets `noo health`.
+/// An unreachable gateway gets the standalone hint (`noo stack start`, then
+/// `noo health`). The Python CLI's `--no-use-cluster` fallback is never
+/// offered, even with a Python CLI sitting right there: nothing in `noo`
+/// reaches it any more.
 #[test]
-fn chat_unreachable_gateway_offers_the_python_fallback_only_when_present() {
+fn chat_unreachable_gateway_never_offers_the_python_fallback() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
-    let empty = std::env::temp_dir().join(format!("noo-no-py-{}", std::process::id()));
-    std::fs::create_dir_all(&empty).unwrap();
-    let fake_py = empty.join("noo-py-shim");
+    let dir = std::env::temp_dir().join(format!("noo-no-py-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fake_py = dir.join("a-python-cli");
     std::fs::write(&fake_py, "#!/bin/sh\nexit 0\n").unwrap();
 
-    // No Python CLI: NOO_PY_CLI points nowhere and PATH holds nothing.
-    let out = run(
-        &["--gateway", &gw(port), "chat", "--message", "hi"],
-        &[("NOO_PY_CLI", ""), ("PATH", empty.to_str().unwrap())],
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!stderr.contains("--no-use-cluster"), "no Python CLI, no fallback pointer: {stderr}");
-    assert!(stderr.contains("noo health"), "standalone hint expected: {stderr}");
-
-    // A Python CLI present: the fallback is offered.
-    let out = run(
-        &["--gateway", &gw(port), "chat", "--message", "hi"],
-        &[("NOO_PY_CLI", fake_py.to_str().unwrap())],
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("--no-use-cluster"), "Python-fallback pointer expected: {stderr}");
-    let _ = std::fs::remove_dir_all(&empty);
+    for env in [
+        vec![("PATH", dir.to_str().unwrap())],
+        vec![("PATH", dir.to_str().unwrap()), ("NOO_PY_CLI", fake_py.to_str().unwrap())],
+    ] {
+        let out = run(&["--gateway", &gw(port), "chat", "--message", "hi"], &env);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("--no-use-cluster"), "no Python fallback pointer: {stderr}");
+        assert!(stderr.contains("noo health"), "standalone hint expected: {stderr}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2118,19 +2113,14 @@ fn security_service_key_issue_defaults_full_scopes() {
 }
 
 #[test]
-fn security_unported_sibling_commands_still_pass_through() {
-    // `security scan` / `generate-secret` are Phase-2: with no Python present
-    // the passthrough error surfaces (exit 2) — they must NOT be swallowed by
-    // the native security block.
-    let out = run(&["--gateway", &gw(closed_port()), "security", "scan"], &[]);
-    // Either Python serves it (dev box) or the passthrough error fires — but
-    // it must not hit the mock/native path. Native handlers would exit 0/3/4/5.
-    let code = out.status.code();
-    assert!(
-        code == Some(2) || code == Some(0) || code == Some(1),
-        "unexpected exit {code:?}; stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+fn security_unknown_sibling_is_a_usage_error_not_a_hand_off() {
+    // A word the native security group does not own prints the group's
+    // subcommands and exits 2 — it never reaches the gateway, and nothing is
+    // exec'd.
+    let out = run(&["--gateway", &gw(closed_port()), "security", "no-such-verb"], &[]);
+    let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert_eq!(out.status.code(), Some(2), "stderr: {err}");
+    assert!(err.contains("unknown command `no-such-verb` under `noo security`"), "stderr: {err}");
 }
 
 // ── WP-B2: stack mgmt ───────────────────────────────────────────────────
@@ -2515,9 +2505,10 @@ fn cluster_seed_missing_file_errors() {
 // minutes. The desired column alone cannot say that, and the node's own
 // report was on a different screen.
 
-/// Two calls: the desired-config, then the node list the ACTUAL column reads.
+/// Two calls, in `cluster show`'s order (`desired` is its alias since i195
+/// decision 1): the node list first, then the desired-config.
 fn desired_mock(desired: &str, nodes: &str) -> Mock {
-    Mock::start_seq(vec![ok_json(desired), ok_json(nodes)])
+    Mock::start_seq(vec![ok_json(nodes), ok_json(desired)])
 }
 
 #[test]
@@ -2557,11 +2548,13 @@ fn cluster_desired_prints_actual_beside_desired() {
 
 #[test]
 fn cluster_desired_shows_a_dash_when_the_node_has_not_reported() {
-    // Absence is never a negative (CLI_STYLE_GUIDE §4): a node that has
-    // said nothing must not render as "not running".
+    // Absence is never a negative (CLI_STYLE_GUIDE §4): a registered node
+    // that has said nothing (no `running_backends` yet) must not render as
+    // "not running". (An unregistered node is `show`'s "not registered",
+    // exit 1 — a different screen.)
     let desired = r#"{"node":{"data_root":"/opt/noo"},"placements":[
         {"backend":"vllm","model":"gemma","desired_state":"running"}]}"#;
-    let nodes = r#"{"nodes":[]}"#;
+    let nodes = r#"{"nodes":[{"id":"n1"}]}"#;
     let mock = desired_mock(desired, nodes);
     let out = run(&["--gateway", &gw(mock.port), "cluster", "desired", "n1"], &[]);
     let _ = mock.requests();
@@ -4325,6 +4318,23 @@ fn jobs_list_error_body_is_not_no_jobs_found() {
     );
 }
 
+/// The gateway's one answer to a Redis outage is 503 `redis_reconnecting`
+/// (never a 200 with an `error` key). The CLI prints the `detail` sentence and
+/// the retry, and exits non-zero (5, a gateway refusal) — not the raw JSON.
+#[test]
+fn jobs_list_redis_reconnecting_prints_detail_and_retry() {
+    let body = r#"{"error":"redis_reconnecting","detail":"Redis not connected: this needs the gateway's Redis client, which is not connected yet — retry shortly","retry_after_secs":5}"#;
+    let mock = Mock::start(503, "Service Unavailable", "application/json", body, 1);
+    let out = run(&["--gateway", &gw(mock.port), "jobs", "list"], &[]);
+    let _ = mock.requests();
+    assert_eq!(out.status.code(), Some(5));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Redis not connected: this needs"), "stderr: {stderr}");
+    assert!(stderr.contains("retry in 5s"), "stderr: {stderr}");
+    assert!(!stderr.contains("redis_reconnecting"), "machine code leaked: {stderr}");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("no jobs"));
+}
+
 /// `jobs history` reads the `history` key the route actually sends (it has
 /// never sent `jobs`, so the table used to be empty no matter what Redis held).
 #[test]
@@ -4961,7 +4971,7 @@ fn models_switch_refuses_without_yes_when_there_is_no_terminal() {
 }
 
 #[test]
-fn stack_stop_and_clean_short_v_never_reach_the_passthrough() {
+fn stack_stop_and_clean_short_v_is_refused_before_the_script_runs() {
     let (root, log) = recording_script_root("stop-shortv", "noomesh-stop.sh");
     let env = [("NOO_REPO_ROOT", root.display().to_string())];
     let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();

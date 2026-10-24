@@ -18,7 +18,7 @@
 //!
 //! WP-B2 adds the remaining self-management commands: `reset` (spawns
 //! scripts/noomesh-reset.sh; destructive → agent-first confirm contract),
-//! `ollama` (docker-exec passthrough with inherited stdio), and
+//! `ollama` (docker-exec pass-through with inherited stdio), and
 //! `install-watcher` — now a retired stub (the bash host watcher is gone;
 //! noo-hostd executes the host spool).
 
@@ -541,7 +541,7 @@ pub fn mesh_start(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             "--pull" => pull = true,
             "--build" => build = true,
             // Launcher-script modes: the flags were Python-CLI-only, which
-            // made a worker-less controller (no noo-py) unable to spell
+            // made a worker-less controller (no Python CLI) unable to spell
             // `noo stack start --dist --tag vX` at all (host8, 2026-08-31).
             "--dist" => dist = true,
             "--dev" => dev = true,

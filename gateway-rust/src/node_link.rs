@@ -24,6 +24,14 @@
 //! over the bus and everything else (streaming, bulk, an old node, a link
 //! resolved by address rather than by node id) over HTTPS unchanged.
 //!
+//! A node that advertises `control_transports.tunnel` also holds an outbound
+//! WebSocket tunnel to the gateway (i131 phase 2, [`crate::tunnel`]). Streaming
+//! and bulk calls (inference SSE, the container proxy, logs bodies, device
+//! blobs) and any other call the bus does not take go down it while it is up;
+//! with no live tunnel, an old node, or `NOO_NODE_TUNNEL=0` they go over HTTPS
+//! exactly as before. Nothing about a call site changes: the signatures below
+//! are the same, only how the request is carried differs.
+//!
 //! - [`NodeLink::request`]: a unary call (the body is read once, whole). It
 //!   returns a [`NodeRequest`], which has the builder methods callers use
 //!   (`json`, `timeout`, `header`, `body`) and a `send()` that picks the
@@ -101,6 +109,8 @@ pub struct NodeLink {
     nats_rpc: bool,
     /// The gateway's bus, when this link was resolved with state.
     bus: Option<async_nats::Client>,
+    /// The node's record says it holds a tunnel to this gateway.
+    tunnel: bool,
 }
 
 impl NodeLink {
@@ -140,7 +150,7 @@ impl NodeLink {
     }
 
     fn with_node(base: String, node_id: &str) -> Self {
-        Self { base, node_id: Some(node_id.to_string()), auth: Auth::Node, nats_rpc: false, bus: None }
+        Self { base, node_id: Some(node_id.to_string()), auth: Auth::Node, nats_rpc: false, bus: None, tunnel: false }
     }
 
     /// Read what the node says it offers from its record. `nats_rpc` needs a
@@ -158,19 +168,25 @@ impl NodeLink {
             .as_deref()
             .is_some_and(|id| crate::nats_credentials::subject_token(id) == id);
         self.nats_rpc = says && one_token;
+        self.tunnel = record
+            .get(TRANSPORTS_FIELD)
+            .and_then(|t| t.get("tunnel"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && self.node_id.is_some();
         self
     }
 
     /// The agent on `ip` (`https://{ip}:AGENT_PORT`), for paths that already
     /// hold the address (inference discovery, the coordinator).
     pub fn for_ip(ip: &str) -> Self {
-        Self { base: format!("https://{ip}:{AGENT_PORT}"), node_id: None, auth: Auth::Node, nats_rpc: false, bus: None }
+        Self { base: format!("https://{ip}:{AGENT_PORT}"), node_id: None, auth: Auth::Node, nats_rpc: false, bus: None, tunnel: false }
     }
 
     /// The agent at an address the caller already holds (a record's
     /// `agent_url`, a backend URL).
     pub fn for_base(url: &str) -> Self {
-        Self { base: url.to_string(), node_id: None, auth: Auth::Node, nats_rpc: false, bus: None }
+        Self { base: url.to_string(), node_id: None, auth: Auth::Node, nats_rpc: false, bus: None, tunnel: false }
     }
 
     /// The controller's own agent: `NOO_SELF_AGENT_URL`, else derived from
@@ -182,7 +198,7 @@ impl NodeLink {
 
     /// The controller's own agent at a known address.
     pub(crate) fn self_agent_at(base: String) -> Self {
-        Self { base, node_id: None, auth: Auth::SelfAgent, nats_rpc: false, bus: None }
+        Self { base, node_id: None, auth: Auth::SelfAgent, nats_rpc: false, bus: None, tunnel: false }
     }
 
     /// The agent's base URL.
@@ -200,6 +216,22 @@ impl NodeLink {
     /// `base` + `path` (`path` starts with `/` and may carry a query).
     pub fn url(&self, path: &str) -> String {
         format!("{}{}", self.base.trim_end_matches('/'), path)
+    }
+
+    /// The node whose tunnel this link may use, if any: a link resolved by node
+    /// id uses it when the record advertises one; a link that only holds an
+    /// address (`for_base`, `for_ip`: most call sites) finds the node by the
+    /// `host:port` its tunnel registered, and only while that tunnel is live.
+    /// Never the controller's own agent. `None` when tunnels are switched off.
+    fn tunnel_node(&self) -> Option<String> {
+        if !crate::tunnel::enabled() {
+            return None;
+        }
+        match (&self.node_id, self.auth) {
+            (Some(id), Auth::Node) if self.tunnel => Some(id.clone()),
+            (None, Auth::Node) => crate::tunnel::node_for_base(&self.base),
+            _ => None,
+        }
     }
 
     /// The credential this link presents for `url`, if any.
@@ -236,13 +268,20 @@ impl NodeLink {
         let count_key = self.node_id.clone().unwrap_or_else(|| {
             self.base.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string()
         });
+        // The tunnel is chosen at send time (a tunnel can drop between here and
+        // there); here we only record which node's tunnel to look for.
+        let tunnel = self.tunnel_node();
         NodeRequest {
-            http: self.build(method, path),
+            http: self.build(method.clone(), path),
             bus: target.zip(cop.clone()),
             is_control: cop.is_some(),
             body: Some(Vec::new()),
             timeout: None,
             count_key,
+            tunnel,
+            method,
+            path: path.to_string(),
+            headers: Vec::new(),
         }
     }
 
@@ -276,13 +315,73 @@ impl NodeLink {
         }
     }
 
+    /// One stream round trip over the node's tunnel, never falling back to
+    /// HTTPS: the answer to "does streaming over the tunnel work for this
+    /// node". `checked` is false (and `ok` false) when it could not be tried:
+    /// the node does not advertise `control_transports.tunnel`, or tunnels are
+    /// switched off on this gateway.
+    pub async fn probe_tunnel(&self) -> Value {
+        let node = self.node_id.clone().unwrap_or_default();
+        if !self.tunnel {
+            return json!({"advertised": false, "checked": false, "ok": false,
+                "detail": "the node does not advertise control_transports.tunnel"});
+        }
+        if !crate::tunnel::enabled() {
+            return json!({"advertised": true, "checked": false, "ok": false,
+                "detail": "node tunnels are switched off on this gateway (NOO_NODE_TUNNEL)"});
+        }
+        let Some(sess) = crate::tunnel::hub().live(&node) else {
+            return json!({"advertised": true, "checked": true, "ok": false,
+                "detail": "the node advertises a tunnel but this gateway holds no live tunnel for it (it reconnects within seconds after a gateway restart)"});
+        };
+        let started = std::time::Instant::now();
+        let req = crate::tunnel::TunnelRequest {
+            method: "GET".into(),
+            path: "/health".into(),
+            headers: Vec::new(),
+            body: crate::tunnel::TunnelBody::Bytes(Vec::new()),
+        };
+        let outcome = async {
+            let resp = sess.request(req, Some(std::time::Duration::from_secs(10))).await?;
+            let status = resp.status;
+            let mut body = resp.body;
+            let mut n = 0usize;
+            use futures::StreamExt;
+            while let Some(chunk) = body.next().await {
+                n += chunk?.len();
+            }
+            Ok::<_, crate::tunnel::TunnelError>((status, n))
+        }
+        .await;
+        match outcome {
+            Ok((200, n)) if n > 0 => json!({"advertised": true, "checked": true, "ok": true,
+                "rtt_ms": started.elapsed().as_millis() as u64, "detail": "health answered over the tunnel"}),
+            Ok((status, _)) => json!({"advertised": true, "checked": true, "ok": false,
+                "detail": format!("the node answered {status} over the tunnel")}),
+            Err(e) => json!({"advertised": true, "checked": true, "ok": false,
+                "detail": format!("no answer over the tunnel ({e}) although the node advertises it")}),
+        }
+    }
+
     /// A call whose response body is read incrementally: the same
     /// credential as [`NodeLink::request`], on the stream client (no total
     /// timeout, an idle bound between reads). No call site holds a node link
-    /// and streams yet (the SSE paths hold a backend URL and use
-    /// [`backend_stream`]); this is the entry for the ones that will.
+    /// and streams yet (the SSE paths hold a
+    /// backend URL and use [`backend_stream`]); this is the entry for the
+    /// ones that will.
+    ///
+    /// When the node advertises a tunnel and one is live, the request is
+    /// carried by it (through the loopback door, [`crate::tunnel_door`]): the
+    /// returned builder is the same type, aimed at the door; the answer is
+    /// read the same way. With no live tunnel it is the HTTPS request.
     #[allow(dead_code)]
     pub fn stream(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
+        if let Some(node) = self.tunnel_node() {
+            if let Some(door) = crate::tunnel_door::door_url(&node, path) {
+                let req = crate::tls::cluster_stream_client().request(method, door.as_str());
+                return crate::tunnel_door::mark(req, &door);
+            }
+        }
         self.build_on(&crate::tls::cluster_stream_client(), method, path)
     }
 
@@ -324,6 +423,13 @@ pub struct NodeRequest {
     body: Option<Vec<u8>>,
     timeout: Option<std::time::Duration>,
     count_key: String,
+    /// The node, when it advertises a tunnel and tunnels are enabled.
+    tunnel: Option<String>,
+    method: Method,
+    path: String,
+    /// Headers set with [`NodeRequest::header`], for the tunnel (the bus
+    /// carries none).
+    headers: Vec<(String, String)>,
 }
 
 impl NodeRequest {
@@ -358,7 +464,16 @@ impl NodeRequest {
         reqwest::header::HeaderValue: TryFrom<V>,
         <reqwest::header::HeaderValue as TryFrom<V>>::Error: Into<axum::http::Error>,
     {
-        self.http = self.http.header(key, value);
+        if let (Ok(name), Ok(val)) =
+            (reqwest::header::HeaderName::try_from(key), reqwest::header::HeaderValue::try_from(value))
+        {
+            self.headers.push((name.as_str().to_string(), String::from_utf8_lossy(val.as_bytes()).into_owned()));
+            self.http = with_header(self.http, name.as_str(), val.as_bytes());
+        } else {
+            // As before: an invalid header is an error when the call is sent,
+            // not a silent omission.
+            self.http = with_header(self.http, "invalid header", b"x");
+        }
         self
     }
 
@@ -375,7 +490,47 @@ impl NodeRequest {
 
     /// Send it.
     pub async fn send(self) -> Result<reqwest::Response, reqwest::Error> {
-        let Self { http, bus, is_control, body, timeout, count_key } = self;
+        let Self { http, bus, is_control, body, timeout, count_key, tunnel, method, path, headers } = self;
+        // Not for the bus: the node's tunnel, when it has one live; HTTPS
+        // otherwise. A call whose body cannot be read back (a stream) stays
+        // on HTTPS, as it does for the bus.
+        if bus.is_none() || body.is_none() {
+            if let (Some(node), Some(bytes)) = (tunnel.as_deref(), body.as_ref()) {
+                if let Some(sess) = crate::tunnel::hub().live(node) {
+                    let treq = crate::tunnel::TunnelRequest {
+                        method: method.as_str().to_string(),
+                        path,
+                        headers,
+                        body: crate::tunnel::TunnelBody::Bytes(bytes.clone()),
+                    };
+                    match sess.request(treq, timeout).await {
+                        Ok(resp) => return Ok(crate::tunnel::into_reqwest(resp)),
+                        // The per-node cap is the answer, not a reason to find
+                        // another door: that would defeat the cap.
+                        Err(e @ crate::tunnel::TunnelError::Busy { .. }) => {
+                            return Ok(crate::tunnel::busy_response(&e));
+                        }
+                        // Nothing reached the node (the tunnel closed between
+                        // the check and the send): HTTPS is a first attempt.
+                        Err(e) if e.nothing_sent() => {}
+                        // The node may have started the work. A read may be
+                        // repeated over HTTPS once; anything else is reported
+                        // as the node being unreachable and never retried.
+                        Err(e) => {
+                            crate::node_rpc::note_tunnel_abort(&count_key);
+                            if matches!(method, Method::GET | Method::HEAD) {
+                                tracing::warn!(node = %node, error = %e, "call over the tunnel failed; reading over HTTPS once");
+                                crate::node_rpc::note_fallback(&count_key);
+                            } else {
+                                return Err(crate::node_rpc::unreachable_error(node, "tunnel-lost").await);
+                            }
+                        }
+                    }
+                }
+            }
+            crate::node_rpc::note_https(&count_key, is_control);
+            return http.send().await;
+        }
         let (Some((target, cop)), Some(body)) = (bus, body) else {
             crate::node_rpc::note_https(&count_key, is_control);
             return http.send().await;
@@ -413,6 +568,13 @@ impl NodeRequest {
             }
         }
     }
+}
+
+/// `RequestBuilder::header` with concrete types, called from outside the
+/// generic `NodeRequest::header`: inside it, rustc prefers that function's
+/// `HeaderName: TryFrom<K>` bound over the blanket impls and rejects it.
+fn with_header(rb: reqwest::RequestBuilder, name: &str, value: &[u8]) -> reqwest::RequestBuilder {
+    rb.header(name, value)
 }
 
 /// A unary call to a backend URL the caller already holds. The URL may be a
@@ -454,7 +616,12 @@ pub fn backend_stream_on(
     url: &str,
     backend_type: &str,
 ) -> reqwest::RequestBuilder {
-    crate::coordinator::with_backend_hint_url(client.request(method, url), url, backend_type)
+    // A node that holds a live tunnel carries the stream down it (through the
+    // loopback door); anything else is the HTTPS request, counted. The hint
+    // and credential are decided on the ORIGINAL url, as always.
+    let target = crate::tunnel_door::carry(url);
+    let req = crate::tunnel_door::mark(client.request(method, target.as_str()), &target);
+    crate::coordinator::with_backend_hint_url(req, url, backend_type)
 }
 
 /// The node is in `mesh_nodes` but registered without `agent_url` or
@@ -616,6 +783,19 @@ mod tests {
         }
         // A dot would name a subject nobody listens on.
         assert!(!NodeLink::from_record("pop.os", Some(&says(json!({"nats_rpc": true})))).unwrap().nats_rpc);
+    }
+
+    #[test]
+    fn only_a_node_link_that_advertises_a_tunnel_looks_for_one_and_never_the_controllers_own_agent() {
+        let adv = json!({"ip_address": "10.0.0.9", TRANSPORTS_FIELD: {"tunnel": true}});
+        assert_eq!(NodeLink::from_record("host9", Some(&adv)).unwrap().tunnel_node().as_deref(), Some("host9"));
+        let quiet = json!({"ip_address": "10.0.0.9", TRANSPORTS_FIELD: {"tunnel": false}});
+        assert_eq!(NodeLink::from_record("host9", Some(&quiet)).unwrap().tunnel_node(), None);
+        assert_eq!(NodeLink::from_record("host9", Some(&json!({"ip_address": "10.0.0.9"}))).unwrap().tunnel_node(), None);
+        // The controller's own agent is reached the way it always was.
+        assert_eq!(NodeLink::self_agent_at("https://host9.tail:8081".into()).tunnel_node(), None);
+        // An address-only link finds nothing when no tunnel registered that address.
+        assert_eq!(NodeLink::for_ip("10.99.99.99").tunnel_node(), None);
     }
 
     #[test]

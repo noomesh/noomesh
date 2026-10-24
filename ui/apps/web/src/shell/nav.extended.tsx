@@ -23,6 +23,8 @@ export const EXTENDED_NAV: NavSection[] = [
       { id: 'jobs', label: 'Jobs', status: 'live' },
       { id: 'proposals', label: 'Proposals', status: 'live' },
       { id: 'channels', label: 'Channels', status: 'live' },
+      // Operator-only: every agent-to-agent thread, not just your own.
+      { id: 'traffic', label: 'Agent traffic', status: 'live' },
     ],
   },
   {
@@ -59,6 +61,7 @@ export const EXTENDED_ICONS: Record<string, ReactNode> = {
       <path d="M13 7l-2 4-4 2 2-4z" />
     </>
   ),
+  traffic: <path d="M3 7h11M11 4l3 3-3 3M17 13H6M9 10l-3 3 3 3" />,
   files: <path d="M3 6h5l2 2h7v8H3z" />,
   brain: (
     <>

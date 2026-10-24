@@ -341,7 +341,7 @@ impl DriverRail for RemoteRuntime {
     }
 
     async fn task_done(&self, task_id: &str, result: &str, failed: bool) -> Result<String> {
-        let v = self.call(HarnessOp::TaskDone { task_id: task_id.to_string(), result: result.to_string(), failed }).await?;
+        let v = self.call(HarnessOp::TaskDone { task_id: task_id.to_string(), result: result.to_string(), failed, text_answer: false }).await?;
         Ok(v.get("state").and_then(|s| s.as_str()).unwrap_or("").to_string())
     }
 

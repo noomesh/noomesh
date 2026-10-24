@@ -51,8 +51,9 @@ _reown_host_paths() {  # <host dir>  (stdin: paths)
     sed -e "s#^/d/#$1/#" -e "s#^/d\$#$1#"
 }
 
-# reown_nonroot_dirs <data root> <service>...
-# Each service's data lives at <data root>/<service>. Returns 1 (after
+# reown_nonroot_dirs <state root> <service>...
+# Each service's data lives at <state root>/<service> (the state root is
+# NOO_STATE_ROOT, defaulting to the data root; i10a). Returns 1 (after
 # printing why) when a directory is still not wholly 65532:65532.
 reown_nonroot_dirs() {
     local root="$1"; shift

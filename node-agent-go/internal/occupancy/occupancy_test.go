@@ -196,3 +196,31 @@ func TestDrainingClosesAdmissionAndReset(t *testing.T) {
 		t.Fatal("Reset clears draining")
 	}
 }
+
+// Track is for query-time traffic that must never queue here: it counts
+// even when every slot is taken, and returns at once.
+func TestTrackCountsWithoutWaiting(t *testing.T) {
+	Reset()
+	t.Cleanup(Reset)
+	SetSlots(map[string]int{"ollama": 1})
+	hold, _ := Admit(context.Background(), "ollama")
+	defer hold()
+
+	done := make(chan func(), 1)
+	go func() { done <- Track("ollama") }()
+	var rel func()
+	select {
+	case rel = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Track waited for a slot; query-time traffic must never queue")
+	}
+	if n := InFlight("ollama"); n != 2 {
+		t.Fatalf("in_flight = %d, want 2 (the admitted request + the tracked one)", n)
+	}
+	rel()
+	rel()
+	if n := InFlight("ollama"); n != 1 {
+		t.Fatalf("after release in_flight = %d, want 1", n)
+	}
+	Track("")() // no backend: nothing to count, and no panic
+}

@@ -82,8 +82,10 @@ python3 -m pytest -q         # post-install smoke test (unit suite)
 To run the checks by hand instead, before you push:
 `pre-commit run --from-ref origin/dev --to-ref HEAD`.
 
-The editable install gives you the Python reference CLI as `noo-py`. The
-`noo` you operate with is the Rust binary; install it from the release
+The editable install also leaves a legacy Python CLI on your venv's PATH as
+`noo-py`. The `noo` you operate with is the Rust binary, and it never runs
+that script: an unknown command or subcommand prints a usage error and
+exits 2 rather than falling through to Python. Install the Rust binary from the release
 one-liner in the [README](../../README.md#quick-start) or build it from
 `noo-cli/` (below).
 
@@ -272,7 +274,7 @@ the persona flow and autonomy smoke checks.
 
 Shared fixtures in `tests/conftest.py`: `test_config` (an `AppConfig` with
 memory off and two tool loops), `temp_config_file`, `tool_result_ok` /
-`tool_result_fail`, `tool_parser`, `mock_tool_registry`,
+`tool_result_fail`, `mock_tool_registry`,
 `sample_channel_message`, `sample_telegram_update`.
 
 A large share of the suite is **parity and guard tests** rather than unit

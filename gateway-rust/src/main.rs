@@ -83,12 +83,15 @@ mod dependency_watchdog;
 mod node_agent_auth;
 mod node_link;
 mod node_rpc;
+mod tunnel;
+mod tunnel_door;
 mod maintenance;
 mod node_reachability;
 mod model_presence;
 mod placement_fit;
 mod role_capability;
 mod backup_completion;
+mod backup_overdue;
 mod placement_stuck;
 mod self_node;
 mod node_name_claim;
@@ -96,6 +99,7 @@ mod redact;
 mod egress;
 mod dlq_drain;
 mod drive;
+mod embed_jobs;
 mod embedding_client;
 mod embedding_spaces;
 mod google_auth;
@@ -152,6 +156,7 @@ mod jwks;
 mod mcp_session;
 mod role_provision;
 mod system_provision;
+mod system_provision_cli;
 mod startup_tasks;
 mod repo;
 mod ingest_loop;
@@ -169,6 +174,8 @@ mod controller_hmac_refusal;
 mod operator_auth;
 mod log_gate;
 mod loop_health;
+mod measured;
+mod redis_or_unavailable;
 mod ops;
 mod erasure_archive;
 mod agent_roles;
@@ -246,9 +253,9 @@ async fn health_probe() -> ! {
     // reason, rather than reporting healthy against an unidentified peer:
     // "unhealthy because I cannot establish who answered" is the honest
     // verdict, and the message says which file to fix.
-    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(5));
+    let mut builder = tls::client_builder().timeout(Duration::from_secs(5));
     match tls::cluster_ca_certificate() {
-        Ok(Some(cert)) => builder = builder.add_root_certificate(cert),
+        Ok(Some(cert)) => builder = builder.tls_certs_merge([cert]),
         Ok(None) => {}
         Err(e) => {
             eprintln!("health: {e}");
@@ -312,6 +319,18 @@ async fn main() -> Result<()> {
                 .init();
             std::process::exit(harness::probe::main(&argv[3..]).await);
         }
+    }
+
+    // `provision-system`: the broker, once, for the one system the request on
+    // stdin names (`noo addons enable --provision-only`, via `docker exec -i`).
+    // Its report is stdout, so logs go to stderr; no config file, no
+    // listener, no AppState. See system_provision_cli.
+    if std::env::args().nth(1).as_deref() == Some("provision-system") {
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+            .init();
+        std::process::exit(system_provision_cli::main().await);
     }
 
     // Structured logging (matches Python structlog output)

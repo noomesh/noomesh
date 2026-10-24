@@ -3636,7 +3636,7 @@
           "admin"
         ],
         "summary": "Get job",
-        "description": "[native] Returns details for a specific job.",
+        "description": "[native] Returns details for a specific job. For a completed `embed_batch` job, `?vectors=1` adds `vectors` (one float32 row per input) read from a 15-minute side key; once it has expired the answer is 410.",
         "operationId": "get_job",
         "parameters": [
           {
@@ -3646,11 +3646,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "vectors",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1",
+                "true"
+              ]
+            }
           }
         ],
         "responses": {
           "200": {
             "description": "OK"
+          },
+          "410": {
+            "description": "The job's vectors expired; resubmit the batch"
           }
         }
       },
@@ -14237,7 +14252,18 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "all",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Operators only: include every session's data, not just the caller's own. 403 for anyone else."
+          }
+        ]
       },
       "post": {
         "tags": [
@@ -14349,7 +14375,18 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "all",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Operators only: include every session's data, not just the caller's own. 403 for anyone else."
+          }
+        ]
       }
     },
     "/api/agents/keys/review": {
@@ -15933,6 +15970,15 @@
               "type": "string"
             },
             "description": "Account to list. Defaults to the caller's own."
+          },
+          {
+            "name": "all",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Operators only: include every session's data, not just the caller's own. 403 for anyone else."
           }
         ],
         "responses": {
@@ -15983,6 +16029,106 @@
           },
           "403": {
             "description": "The caller may not list that account's presence."
+          }
+        }
+      }
+    },
+    "/api/agents/whoami": {
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "This session's own agent name",
+        "operationId": "agent_whoami",
+        "description": "The acting agent name of this session (the address other sessions use to message it), its account, the harness the credential arrived through, and whether it is privileged.",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "account": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "harness": {
+                      "type": "string"
+                    },
+                    "privileged": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agents/name": {
+      "post": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "Name this MCP session",
+        "operationId": "agent_name",
+        "description": "Give the calling MCP session a name its person chose: {\"name\": \"general\"} turns <account>/<type>-<random> into <account>/<type>-general, the address other sessions then use. The type half (the client, e.g. claude) is kept. Only a session can be renamed. A name another live session of the account already holds is shared (a name is a mailbox); shared_with counts the sessions already there. Mail already sent to the old name stays addressed to it.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "The session half of the new name: 1-64 of A-Z a-z 0-9 _ -."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "account": {
+                      "type": "string"
+                    },
+                    "previous": {
+                      "type": "string"
+                    },
+                    "shared_with": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not an MCP session, or an invalid name."
           }
         }
       }
@@ -19946,6 +20092,465 @@
             }
           }
         ]
+      }
+    },
+    "/api/cluster/nodes/{node_id}/tunnel-probe": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get tunnel probe",
+        "description": "[native] GET /api/cluster/nodes/{node_id}/tunnel-probe",
+        "operationId": "tunnel_probe",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/node/tunnel": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get tunnel",
+        "description": "[native] GET /api/node/tunnel: the node's upgrade. Admission: a node-actor cluster token (the auth layer put it in `ClusterNode`), on a connection whose mTLS leaf names the same node, with a certificate thumbprint to bind the hello to. Anything less is refused with the remedy. After the upgrade the node must still answer the gateway's signed challenge.",
+        "operationId": "upgrade",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/external/embeddings/jobs": {
+      "post": {
+        "tags": [
+          "external"
+        ],
+        "summary": "Embeddings job (external)",
+        "description": "[native] Submit a bulk embedding batch as a job. Workers claim it from a JetStream work queue (`path: pull`); when no node is pulling for the model the gateway embeds it itself (`path: push`). Poll `GET /api/external/embeddings/jobs/{job_id}?vectors=1` for the vectors, kept 15 minutes. At most 64 texts per job and the encoded result must fit the 600 KiB cap (413 names it). `space` wins over `model` when both are given; both follow the synchronous route's rules (`<space>@next` embeds with a migration's next model). Authenticated by a **service key** with the `embeddings` scope. The synchronous `POST /api/external/embeddings` is unchanged and never queues.",
+        "operationId": "embeddings_job_submit",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "input"
+                ],
+                "properties": {
+                  "input": {
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "array",
+                        "maxItems": 64,
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    ]
+                  },
+                  "space": {
+                    "type": "string",
+                    "description": "Embedding space; the default space when absent."
+                  },
+                  "model": {
+                    "type": "string",
+                    "description": "Alias as on the synchronous route; used when `space` is absent."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "job_id": {
+                      "type": "string"
+                    },
+                    "path": {
+                      "type": "string",
+                      "enum": [
+                        "pull",
+                        "push"
+                      ]
+                    },
+                    "model": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad input, or an unknown embedding space",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "message": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "string"
+                        },
+                        "ref": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The service key lacks the `embeddings` scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "message": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "string"
+                        },
+                        "ref": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`<space>@next` without a migration, or a migration that has not started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "message": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "string"
+                        },
+                        "ref": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Over the batch cap; the message names the cap",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "message": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "string"
+                        },
+                        "ref": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The model's work queue is full; `Retry-After` says when to retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "message": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "string"
+                        },
+                        "ref": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No node serves the model, or the job store is down",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "message": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "string"
+                        },
+                        "ref": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/external/embeddings/jobs/{job_id}": {
+      "get": {
+        "tags": [
+          "external"
+        ],
+        "summary": "Embeddings job status (external)",
+        "description": "[native] One embedding job, as its submitter sees it (a job another consumer submitted is 404). With `vectors=1`, a completed job adds `vectors`: one row of float32 per input, in order. The vectors are kept 15 minutes after completion; after that the answer is 410 and the batch is resubmitted. The same job is readable at `GET /api/jobs/{job_id}` by a caller that reaches the scheduler routes.",
+        "operationId": "embeddings_job_status",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "vectors",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1",
+                "true"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "job_id": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "queued",
+                        "running",
+                        "completed",
+                        "dead",
+                        "cancelled"
+                      ]
+                    },
+                    "path": {
+                      "type": "string",
+                      "enum": [
+                        "pull",
+                        "push"
+                      ]
+                    },
+                    "model": {
+                      "type": "string"
+                    },
+                    "space": {
+                      "type": "string"
+                    },
+                    "n": {
+                      "type": "integer"
+                    },
+                    "dims": {
+                      "type": "integer"
+                    },
+                    "node_id": {
+                      "type": "string"
+                    },
+                    "error": {
+                      "type": "string"
+                    },
+                    "status_detail": {
+                      "type": "string"
+                    },
+                    "created_at": {
+                      "type": "string"
+                    },
+                    "completed_at": {
+                      "type": "string"
+                    },
+                    "vectors": {
+                      "type": "array",
+                      "items": {
+                        "type": "array",
+                        "items": {
+                          "type": "number"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The service key lacks the `embeddings` scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "message": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "string"
+                        },
+                        "ref": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such job, or not this consumer's",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "message": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "string"
+                        },
+                        "ref": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "The vectors expired; resubmit the batch"
+          },
+          "503": {
+            "description": "The job store did not answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "message": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "string"
+                        },
+                        "ref": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     }
   },

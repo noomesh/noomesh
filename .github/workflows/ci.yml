@@ -447,7 +447,7 @@ jobs:
     # per run, no token, and no network call that can take a green run down.
     - name: Upload coverage artifact
       if: always()
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
       with:
         name: coverage-py
         path: coverage.xml
@@ -467,7 +467,7 @@ jobs:
 
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-    - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff   # v5
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v7.0.0
       with:
         go-version-file: node-agent-go/go.mod
         cache-dependency-path: node-agent-go/go.sum
@@ -582,7 +582,7 @@ jobs:
     - name: Restore cargo cache
       id: cargo-cache
       if: needs.scope.outputs.gateway == 'true'
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830   # v4
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
       with:
         path: |
           ~/.cargo/registry
@@ -688,7 +688,7 @@ jobs:
         working-directory: ui
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020   # v4
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1   # v7.1.0
       with:
         node-version: 22
         cache: npm
@@ -918,7 +918,7 @@ jobs:
     - name: Restore cargo cache
       id: cargo-cache
       if: needs.scope.outputs.sqlx == 'true' && steps.trellion.outputs.public == 'true'
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830   # v4
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
       with:
         path: |
           ~/.cargo/registry
@@ -1036,12 +1036,12 @@ jobs:
         key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # noo-cli is the Rust front door: native commands dispatched by a
-  # first-match registry, everything else passed through to the Python CLI.
+  # first-match registry; everything else is a usage error (exit 2).
   # This job gates the dispatch/contract so a handler edit can't silently
   # break routing:
   #   - clippy (-D warnings) with the crate's documented pre-existing allows
-  #   - cargo test: registry-integrity + resolve() dispatch + passthrough
-  #     taxonomy + the onboard unit tests
+  #   - cargo test: registry-integrity + resolve() dispatch + the unknown-verb
+  #     contract + the onboard unit tests
   #   - tests/smoke.sh: gateway-free standalone contract on the built binary
   # `cargo fmt --check` is intentionally omitted: the ported handler modules
   # are not rustfmt-clean under default settings (the rust-gateway job also
@@ -1140,7 +1140,7 @@ jobs:
     - name: Restore cargo cache
       id: cargo-cache
       if: needs.scope.outputs.cli == 'true'
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830   # v4
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
       with:
         path: |
           ~/.cargo/registry
@@ -1348,7 +1348,7 @@ jobs:
     - name: Restore cargo cache
       id: cargo-cache
       if: needs.scope.outputs.code == 'true' && needs.scope.outputs.deferred != 'true'
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830   # v4
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
       with:
         path: |
           ~/.cargo/registry
@@ -1378,7 +1378,7 @@ jobs:
             grep -q "local-first AI agent mesh" <<<"$out"
 
             # 2. Native gateway command with no gateway: a clean, structured
-            #    exit 3 (gateway_unreachable) — never a crash or a passthrough.
+            #    exit 3 (gateway_unreachable) — never a crash.
             set +e
             out="$(noo health --json 2>&1)"
             rc=$?
@@ -1387,24 +1387,30 @@ jobs:
             grep -q "gateway_unreachable" <<<"$out"
           '
 
-    # PY_ONLY message contract: never-port commands must print the
-    # actionable "requires the Python install" message, exit 2.
-    # (Pick from the PY_ONLY list in noo-cli/src/passthrough.rs.) The retired
-    # `tui` gets its own assertion: native pointer, exit 1, no Python involved.
-    - name: PY_ONLY message contract
+    # Unknown-verb contract: a bare group and an unknown verb print a usage
+    # error and exit 2 on a box with no Python (nothing is ever exec'd). The
+    # retired `tui` gets its own assertion: native pointer, exit 1.
+    - name: Unknown-verb contract
       if: needs.scope.outputs.code == 'true' && needs.scope.outputs.deferred != 'true'
       run: |
         set -eux
         docker run --rm -v "${PWD}/noo-cli/target/release/noo":/usr/local/bin/noo:ro \
           ubuntu:24.04 bash -euxc '
-            # 3. A PY_ONLY command with no Python: friendly actionable message,
-            #    exit 2 — not a stack trace, not a silent failure.
+            # 3. A bare group: usage error, exit 2.
             set +e
             out="$(noo plugins 2>&1)"
             rc=$?
             set -e
             [ "$rc" -eq 2 ]
-            grep -q "requires the Python install" <<<"$out"
+            grep -qi "needs a subcommand" <<<"$out"
+            # 3a. An unknown verb: exit 2, named, never a Python hint.
+            set +e
+            out="$(noo definitelynotacommand 2>&1)"
+            rc=$?
+            set -e
+            [ "$rc" -eq 2 ]
+            grep -qi "unknown command" <<<"$out"
+            if grep -qi "python" <<<"$out"; then exit 1; fi
             # 3b. The RETIRED tui: native pointer message, exit 1.
             set +e
             out="$(noo tui 2>&1)"
@@ -1686,7 +1692,7 @@ jobs:
 
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-    - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff   # v5
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v7.0.0
       with:
         go-version-file: node-agent-go/go.mod
         cache-dependency-path: node-agent-go/go.sum

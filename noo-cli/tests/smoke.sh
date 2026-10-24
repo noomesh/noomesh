@@ -9,17 +9,17 @@
 # must hold on a shipped host with no Python toolchain and no gateway. Every
 # case runs the binary under `env -i` (empty environment: no PATH, no Python,
 # no repo `.env`, no NOO_* config) so we test exactly the "nothing installed"
-# path, including the no-Python passthrough messages and the native
+# path, including the unknown-verb usage errors and the native
 # version/help banners.
 #
 # Contract asserted (exit code + output substring):
 #   1. --version                        -> exit 0, prints a version line
 #   2. bare `noo` / --help              -> exit 0, prints the native group banner
-#   3. `db revision` (RETIRED 2026-09-03; DEV_ONLY is empty) -> exit 2, the
-#      native-group message, no NOO_PY_CLI hint, NOT "developer command"
-#   4. bare `plugins` (py-only)         -> exit 2, mentions the Python install
+#   3. `db revision` (RETIRED 2026-09-03) -> exit 2, unknown subcommand of a
+#      native group, never a Python hint
+#   4. bare `plugins`                   -> exit 2, needs a subcommand
 #   4c. `tui` (RETIRED 2026-08-16)      -> exit 1, native pointer message
-#   5. unported cmd (no python)         -> exit 2, mentions NOO_PY_CLI; native
+#   5. unknown verb                     -> exit 2, unknown command; native
 #      `chat` refuses non-TTY REPL with the --message hint
 #   6. native gateway cmd, unreachable  -> exit 3 (gateway unreachable)
 #
@@ -80,24 +80,16 @@ run 0 "noo (noomesh CLI, alias: pai)" -- --version
 run 0 "local-first AI agent mesh" -- --help
 run 0 "local-first AI agent mesh"    # bare `noo` (no args)
 
-# 3. DEV_ONLY is empty since 2026-09-03 (`db revision` retired with the sqlx
-#    cutover): a retired subcommand of a native group is just an unknown
-#    command with no Python behind it — the native-group message, not the
-#    "developer command" one. Guards against the list quietly regrowing.
-run 2 "is not a subcommand of" -- db revision
-if env -i "$BIN" db revision 2>&1 </dev/null | grep -q "NOO_PY_CLI"; then
-    echo "FAIL noo db revision must not prescribe NOO_PY_CLI (db is native)"; fail=$((fail+1))
-fi
-if env -i "$BIN" db revision 2>&1 </dev/null | grep -q "developer command"; then
-    echo "FAIL noo db revision must not be flagged developer-only (DEV_ONLY is empty)"; fail=$((fail+1))
+# 3. A retired subcommand of a native group is an unknown subcommand: exit 2,
+#    the offending word named, the real subcommands listed. Nothing is
+#    exec'd and no Python is ever suggested.
+run 2 "unknown command" -- db revision
+if env -i "$BIN" db revision 2>&1 </dev/null | grep -qi "python\|NOO_PY_CLI"; then
+    echo "FAIL noo db revision must not mention Python"; fail=$((fail+1))
 fi
 
-# 4. A never-port (py-only) command with no Python -> "requires the Python
-#    install" message, for a py-only group. (`voice status` filled this
-#    slot until WP-V made voice native; `tui` until its 2026-08-16
-#    retirement. Bare `plugins` is the last PY_ONLY entry — Python-package
-#    plugin loading is inherently Python.)
-run 2 "requires the Python install" -- plugins
+# 4. A bare group is a usage error too (exit 2), never a Python hand-off.
+run 2 "needs a subcommand" -- plugins
 
 # 4b. The native onboarding TUI needs a real terminal: non-TTY stdin/stdout
 #     -> clear guard message pointing at plain `noo onboard` / --ci, exit 2.
@@ -107,18 +99,16 @@ run 2 "interactive terminal" -- onboard --tui
 #     the dashboard / `noo chat` — no Python involved, generic exit 1.
 run 1 "retired" -- tui
 
-# 5. A command served only by Python, with no Python -> the message points
-#    the user at NOO_PY_CLI. (`mcp external-setup` went native with WP-M;
-#    `tui` held this slot until retirement; bare `plugins` remains.)
-run 2 "NOO_PY_CLI" -- plugins
+# 5. An unknown verb: exit 2, unknown command, nothing exec'd.
+run 2 "unknown command" -- definitelynotacommand
 
 # 5b. `chat` is native now: non-TTY without --message refuses cleanly (no hang,
-#     no passthrough) and names the one-shot escape hatch.
+#     no hand-off) and names the one-shot escape hatch.
 run 2 "--message" -- chat
 
 # 6. A native gateway command against an unreachable gateway -> exit 3.
-#    (This also guards the repo_root/python_cli_path recursion fix: on a bare
-#    host this path used to stack-overflow instead of returning a clean rc.)
+#    (On a bare host this path used to stack-overflow instead of returning
+#    a clean rc.)
 run 3 "" -- --gateway https://127.0.0.1:59999 health
 
 # 7. WP-PL: git-style `noo-<name>` plugin shims (dispatch + native list).
@@ -168,7 +158,7 @@ else
 fi
 # 7e. Without the shim on PATH (empty env), the same word is an unknown
 #     command answered natively (exit 2, suggestions) — never a plugin
-#     error, and no longer a Python passthrough (0.3.27).
+#     error (never a plugin error, never a Python hand-off).
 run 2 "nknown command" -- frobnicate a
 rm -rf "$plugdir"
 

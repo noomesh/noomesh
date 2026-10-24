@@ -378,6 +378,60 @@ pub(crate) fn wire_key<'a>(spec: &'a ToolSpec, field: &'a str) -> &'a str {
     spec.aliases.get(field).map(String::as_str).unwrap_or(field)
 }
 
+/// Refuse an argument the tool's schema does not declare.
+///
+/// The request is built from the arguments the client sent, so an unknown
+/// one used to be silently dropped: `noo_agent_thread(thread_id=…)` (the
+/// parameter is `thread`) ran with NO thread filter and returned every
+/// message. A dropped filter widens a read, so it is an error naming what
+/// the tool does accept. A schema with no declared properties (the
+/// no-argument tools) or with `additionalProperties: true` is not checked;
+/// an alias wire key is accepted as well as the field name.
+pub(crate) fn unknown_args(spec: &ToolSpec, args: &Map<String, Value>) -> Option<String> {
+    let aliases: Vec<&str> = spec.aliases.values().map(String::as_str).collect();
+    unknown_keys(&spec.name, &spec.input_schema, &aliases, args)
+}
+
+/// The shared check behind [`unknown_args`] and the native task tools: the
+/// arguments the schema does not declare, as one refusal naming them and the
+/// accepted keys. A no-argument tool (no declared properties) accepts
+/// NOTHING, so a stray filter on it is refused rather than dropped; only an
+/// explicit `additionalProperties: true` opts out. `extra_ok` are wire keys
+/// accepted although undeclared (aliases).
+pub(crate) fn unknown_keys(
+    tool: &str,
+    schema: &Value,
+    extra_ok: &[&str],
+    args: &Map<String, Value>,
+) -> Option<String> {
+    if schema.get("additionalProperties") == Some(&Value::Bool(true)) {
+        return None;
+    }
+    let empty = Map::new();
+    let props = schema.get("properties").and_then(Value::as_object).unwrap_or(&empty);
+    let bad: Vec<&str> = args
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !props.contains_key(*k) && !extra_ok.contains(k))
+        .collect();
+    if bad.is_empty() {
+        return None;
+    }
+    let mut expected: Vec<&str> = props.keys().map(String::as_str).collect();
+    expected.sort_unstable();
+    Some(format!(
+        "unknown argument{} {} for {}; {}",
+        if bad.len() > 1 { "s" } else { "" },
+        bad.iter().map(|b| format!("'{b}'")).collect::<Vec<_>>().join(", "),
+        tool,
+        if expected.is_empty() {
+            "this tool takes no arguments".to_string()
+        } else {
+            format!("expected one of: {}", expected.join(", "))
+        }
+    ))
+}
+
 /// Substitute `{placeholder}` segments in the path from the arguments, and
 /// return the keys consumed so they are not ALSO sent as body/query params.
 pub(crate) fn build_path(
@@ -406,6 +460,18 @@ pub(crate) fn build_path(
             }
             path = path.replace(&placeholder, &percent_encode_segment(&rendered));
             consumed.push(field.clone());
+        }
+    }
+    // A placeholder no argument filled would go out literally
+    // (`/api/config/{section}`) and fail with the braces in the message.
+    // Refuse it here, naming the argument the caller left out.
+    if let Some(open) = path.find('{') {
+        if let Some(len) = path[open..].find('}') {
+            return Err(format!(
+                "missing required argument '{}' for {}",
+                &path[open + 1..open + len],
+                spec.name
+            ));
         }
     }
     Ok((path, consumed))
@@ -505,6 +571,9 @@ pub(crate) async fn execute_spec(
     args: &Map<String, Value>,
     auth_header: (String, String),
 ) -> Result<Value, String> {
+    if let Some(e) = unknown_args(spec, args) {
+        return Err(e);
+    }
     let (path, consumed) = build_path(spec, args)?;
     let rest = remaining_args(spec, args, &consumed);
     let rest = match body_payload(spec, args) {
@@ -535,7 +604,7 @@ pub(crate) async fn execute_spec(
     // NOO_SELF_URL. A misconfiguration pointing off-host would then be
     // silently unauthenticated rather than a loud TLS error.
     let mut builder =
-        reqwest::Client::builder().timeout(std::time::Duration::from_secs(spec.timeout_secs));
+        crate::tls::client_builder().timeout(std::time::Duration::from_secs(spec.timeout_secs));
     if base.starts_with("https://") {
         // No cluster CA configured — a public cert (tailscale serve) or
         // plain dev. Leave the system roots in place rather than weakening
@@ -543,7 +612,7 @@ pub(crate) async fn execute_spec(
         if let Some(ca) = std::env::var("NOO_TLS_CA").ok().filter(|s| !s.is_empty()) {
             match std::fs::read(&ca) {
                 Ok(pem) => match crate::tls::certificate_from_pem(&pem) {
-                    Ok(cert) => builder = builder.add_root_certificate(cert),
+                    Ok(cert) => builder = builder.tls_certs_merge([cert]),
                     Err(e) => return Err(format!("NOO_TLS_CA at {ca} is not valid PEM: {e}")),
                 },
                 Err(e) => return Err(format!("cannot read NOO_TLS_CA at {ca}: {e}")),
@@ -1190,7 +1259,7 @@ mod tests {
 
 #[cfg(test)]
 mod body_field_tests {
-    use super::{body_payload, remaining_args, ToolSpec};
+    use super::{body_payload, build_path, remaining_args, unknown_args, ToolSpec};
     use serde_json::{json, Map, Value};
     use std::collections::HashMap;
 
@@ -1222,6 +1291,38 @@ mod body_field_tests {
         assert_eq!(got.get("NOO_X").and_then(Value::as_str), Some("1"));
         assert!(!got.contains_key("updates"), "must not wrap: {got:?}");
         assert!(!got.contains_key("section"), "path arg must not leak in");
+    }
+
+    /// `thread_id` for a tool whose parameter is `thread` used to be dropped,
+    /// running the read unfiltered. It must be refused, naming the real keys.
+    #[test]
+    fn an_undeclared_argument_is_refused_not_dropped() {
+        let mut spec = spec_with("");
+        spec.name = "noo_agent_thread".into();
+        spec.input_schema = json!({"type": "object", "properties": {"thread": {}, "limit": {}}});
+        let e = unknown_args(&spec, &args(json!({"thread_id": "thr_x"}))).expect("refused");
+        assert!(e.contains("unknown argument 'thread_id' for noo_agent_thread"), "{e}");
+        assert!(e.contains("expected one of: limit, thread"), "{e}");
+        assert!(unknown_args(&spec, &args(json!({"thread": "thr_x", "limit": 5}))).is_none());
+        // a no-argument tool accepts nothing: a stray filter is refused too
+        spec.input_schema = json!({"type": "object", "properties": {}});
+        let e = unknown_args(&spec, &args(json!({"anything": 1}))).expect("refused");
+        assert!(e.contains("takes no arguments"), "{e}");
+        assert!(unknown_args(&spec, &args(json!({}))).is_none());
+        // an explicit additionalProperties:true opts out
+        spec.input_schema = json!({"type": "object", "additionalProperties": true});
+        assert!(unknown_args(&spec, &args(json!({"anything": 1}))).is_none());
+    }
+
+    #[test]
+    fn an_unfilled_path_placeholder_is_refused_naming_the_argument() {
+        let mut spec = spec_with("");
+        spec.name = "noo_config_get".into();
+        spec.path = "/api/config/{section}".into();
+        let e = build_path(&spec, &args(json!({}))).unwrap_err();
+        assert!(e.contains("missing required argument 'section'"), "{e}");
+        let (p, _) = build_path(&spec, &args(json!({"section": "heartbeat"}))).unwrap();
+        assert_eq!(p, "/api/config/heartbeat");
     }
 
     /// The opt-in must not change every other tool.

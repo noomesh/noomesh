@@ -298,13 +298,59 @@ func opRebuild(ctx context.Context, e *Engine, _ string, c *Command) (int, strin
 // you do not have.
 func opBackup(ctx context.Context, e *Engine, _ string, _ *Command) (int, string) {
 	name, args := withSecrets(e.Root, filepath.Join(e.Root, "scripts", "backup-controller.sh"))
-	return e.Runner.Run(ctx, e.Root, nil, name, args...)
+	return e.Runner.Run(ctx, e.Root, backupExtraEnv(e.Root), name, args...)
+}
+
+// backupExtraEnv carries NOO_BACKUP_OFFSITE into the backup run. withSecrets
+// loads the secret store and noomesh.yaml but NOT the checkout's plain .env,
+// which is where `noo backups setup` records the destination — so a spooled
+// backup saw it unset, said "not configured", and exited 0 (2026-10-24). The
+// script now resolves it itself as well; passing it here keeps the two from
+// ever disagreeing. An exported value in hostd's own environment wins, as it
+// does in the script.
+func backupExtraEnv(root string) []string {
+	if strings.TrimSpace(os.Getenv("NOO_BACKUP_OFFSITE")) != "" {
+		return nil
+	}
+	if v := envFileValue(filepath.Join(root, ".env"), "NOO_BACKUP_OFFSITE"); v != "" {
+		return []string{"NOO_BACKUP_OFFSITE=" + v}
+	}
+	return nil
+}
+
+// envFileValue is the last uncommented `KEY=value` (optionally `export `ed,
+// optionally quoted) in an env file, or "" when absent or unreadable.
+func envFileValue(path, key string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	val := ""
+	for _, line := range strings.Split(string(b), "\n") {
+		l := strings.TrimSpace(line)
+		l = strings.TrimSpace(strings.TrimPrefix(l, "export "))
+		k, v, ok := strings.Cut(l, "=")
+		if !ok || strings.HasPrefix(l, "#") || strings.TrimSpace(k) != key {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+			v = v[1 : len(v)-1]
+		}
+		val = v
+	}
+	return val
 }
 
 // backupArtifactMarker prefixes the stderr line backup-controller.sh prints
 // naming the dump it wrote. Stdout is discarded by the Runner, so the path
 // rides the one stream that is captured.
 const backupArtifactMarker = "NOO_BACKUP_ARTIFACT="
+
+// backupOffsiteMarker prefixes the stderr line naming the off-site outcome.
+// Without it a success result could not say whether anything left the machine
+// (2026-10-24: a configured destination read as unset, the run reported OK).
+const backupOffsiteMarker = "NOO_BACKUP_OFFSITE_RESULT="
 
 // annotateBackup turns a finished backup's stderr into Result fields: it
 // strips the marker line, then names the dump and its size so the gateway can
@@ -319,6 +365,10 @@ func annotateBackup(r Result) Result {
 	for _, line := range strings.Split(r.Stderr, "\n") {
 		if p, ok := strings.CutPrefix(strings.TrimSpace(line), backupArtifactMarker); ok {
 			path = strings.TrimSpace(p)
+			continue
+		}
+		if p, ok := strings.CutPrefix(strings.TrimSpace(line), backupOffsiteMarker); ok {
+			r.Offsite = strings.TrimSpace(p)
 			continue
 		}
 		kept = append(kept, line)

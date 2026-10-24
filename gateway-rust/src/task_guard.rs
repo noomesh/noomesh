@@ -1514,7 +1514,8 @@ mod tests {
         assert!(include_str!("heartbeat_actions.rs").contains("settings::get(\"NOO_REPORTS_DRIVE_FOLDER_ID\")"));
         let st = include_str!("routes/settings.rs");
         let set = &st[st.find("async fn settings_flags_set(").unwrap()..];
-        assert!(set[..set.find("STRING_REGISTRY.iter().find").unwrap()].contains("EGRESS_TARGET_SETTINGS"));
+        assert!(set[..set.find("STRING_REGISTRY.iter().find").unwrap()].contains("needs_person("));
+        assert!(st[st.find("pub(crate) fn needs_person(").unwrap()..].contains("EGRESS_TARGET_SETTINGS"));
         assert!(EGRESS_TARGET_SETTINGS.contains(&"NOO_REPORTS_DRIVE_FOLDER_ID"));
         let users = include_str!("routes/users.rs");
         let decide = &users[users.find("async fn proposal_decide(").unwrap()..];

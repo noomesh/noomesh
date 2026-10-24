@@ -207,7 +207,7 @@ Index("idx_heartbeat_runs_started_at", PaiHeartbeatRun.started_at.desc())
 
 
 # ======================================================================
-# Channel Recipients  (source: channels/router.py)
+# Channel Recipients  (source: former channels/router.py, deleted)
 # ======================================================================
 
 class PaiChannelRecipient(Base):

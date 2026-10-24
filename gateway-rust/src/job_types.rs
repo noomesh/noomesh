@@ -34,6 +34,11 @@ pub enum Executor {
     Node,
     /// Executed in the gateway process; never dispatched to a node.
     Gateway,
+    /// Claimed by a worker from a JetStream work queue (`embed_batch`, i179),
+    /// or run by the gateway itself when no worker is pulling. Created only
+    /// by its own route; never submitted over `/api/jobs/submit`, never put
+    /// on `noo:jobs:queue`, never published to `tasks.dispatch.<node>`.
+    Pull,
 }
 
 /// Every job type the cluster can execute, and its executor.
@@ -52,6 +57,8 @@ pub const JOB_TYPES: &[(&str, Executor)] = &[
     ("tool_exec", Executor::Node),
     // ── Gateway-executed (in-process, node_id="gateway") ──
     ("test_run", Executor::Gateway),
+    // ── Pulled from a work queue (src/embed_jobs.rs; no Go executor case) ──
+    ("embed_batch", Executor::Pull),
 ];
 
 /// Job types that once existed and were retired, with the reason.
@@ -86,10 +93,13 @@ pub fn executor_for(job_type: &str) -> Option<Executor> {
         .map(|(_, ex)| *ex)
 }
 
-/// Comma-separated list of every executable type, for error messages.
+/// Comma-separated list of every type a caller may SUBMIT, for error
+/// messages. `Pull` types are left out: they have their own route, and
+/// listing one here would invite the submit this list is meant to explain.
 pub fn known_types() -> String {
     JOB_TYPES
         .iter()
+        .filter(|(_, ex)| *ex != Executor::Pull)
         .map(|(name, _)| *name)
         .collect::<Vec<_>>()
         .join(", ")
@@ -160,9 +170,22 @@ mod tests {
     fn error_message_names_the_valid_types() {
         let msg = unknown_type_error("smoke");
         assert!(msg.contains("'smoke'"));
-        for (name, _) in JOB_TYPES {
+        for (name, ex) in JOB_TYPES {
+            if *ex == Executor::Pull {
+                assert!(!msg.contains(name), "{name} is not submittable and must not be offered");
+                continue;
+            }
             assert!(msg.contains(name), "error message omits {name}");
         }
+    }
+
+    #[test]
+    fn embed_batch_is_pulled_and_never_node_dispatched() {
+        // The janitor expires a queued type whose executor is not `Node`,
+        // `submit_job_to_redis` refuses it, and `route_by_executor` turns
+        // /api/jobs/submit away: all three key off this one row.
+        assert_eq!(executor_for("embed_batch"), Some(Executor::Pull));
+        assert_ne!(executor_for("embed_batch"), Some(Executor::Node));
     }
 
     #[test]

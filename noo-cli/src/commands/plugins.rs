@@ -3,19 +3,17 @@
 
 //! `noo plugins …` + git-style `noo-<name>` shim discovery (WP-PL).
 //!
-//! Two plugin worlds COEXIST and don't overlap:
+//! A plugin is an **executable shim**: any executable named `noo-<name>` on
+//! PATH or in the user plugins dir (`~/.config/mesh/plugins/bin/`, created on
+//! demand), exactly like `git-<name>`. `noo plugins list` enumerates them and
+//! the dispatcher (main.rs) exec()s `noo-<word>` when a command word matches
+//! no native entry — builtins → plugins → unknown command (usage, exit 2).
 //!
-//! - **Executable shims (this module, native)** — any executable named
-//!   `noo-<name>` on PATH or in the user plugins dir
-//!   (`~/.config/mesh/plugins/bin/`, created on demand) is a plugin, exactly
-//!   like `git-<name>`. `noo plugins list` enumerates them and the dispatcher
-//!   (main.rs) exec()s `noo-<word>` when a command word matches no native
-//!   entry — builtins → plugins → Python passthrough.
-//! - **Python-package plugins (Python CLI)** — directories with a `plugin.py`
-//!   under `~/.noo/plugins` (`PluginManager.discover_plugins`), IMPORTED
-//!   in-process by the gateway/Python CLI. The static binary can't execute
-//!   Python, so those remain the Python CLI's surface (`noo-py plugins list`);
-//!   the native list prints a pointer when a Python install is present.
+//! Nothing here goes to a Python CLI, ever. Python-package plugins
+//! (directories with a `plugin.py` under `~/.noo/plugins`, imported
+//! in-process by the old Python CLI) are NOT listed or served by this binary:
+//! the static binary cannot execute Python and no longer hands anything to
+//! one. `noo plugins list` therefore shows shims only.
 //!
 //! Security posture:
 //! - only files with the executable bit are considered;
@@ -25,8 +23,8 @@
 //!
 //! De-dup is by name, first hit wins: PATH order first, the user plugins dir
 //! is searched LAST (an explicit PATH install overrides a dropped-in shim).
-//! `noo-py` is reserved — it is the Python CLI itself (passthrough.rs), never
-//! a plugin.
+//! The name `py` is reserved: the old Python CLI's console script is never a
+//! plugin (so a dev venv's script is not listed).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -34,8 +32,7 @@ use std::time::{Duration, Instant};
 use crate::{Globals, Unhandled};
 use crate::ui::{self, Col};
 
-/// Shim names that are never plugins: `noo-py` is the side-by-side Python
-/// CLI the passthrough execs (see passthrough.rs resolution order).
+/// Shim names that are never plugins: the old Python CLI's console script.
 pub const RESERVED_PLUGIN_NAMES: &[&str] = &["py"];
 
 /// A discovered `noo-<name>` executable.
@@ -180,7 +177,7 @@ pub fn probe_description(path: &Path) -> Option<String> {
 
 /// `noo plugins list` — table of executable shim plugins (name, path,
 /// optional `--noo-plugin-info` description). Any extra argument →
-/// Unhandled (the Python CLI owns whatever surface that is).
+/// Unhandled (usage error, exit 2).
 pub fn plugins_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if !args.is_empty() {
         return Err(Unhandled);
@@ -199,7 +196,6 @@ pub fn plugins_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             (s, d)
         })
         .collect();
-    let python_present = crate::passthrough::python_cli_path().is_some();
 
     if g.json {
         let arr: Vec<serde_json::Value> = described
@@ -212,16 +208,10 @@ pub fn plugins_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 })
             })
             .collect();
-        let mut obj = serde_json::json!({
+        let obj = serde_json::json!({
             "plugins": arr,
             "plugins_dir": plugins_dir.to_string_lossy(),
         });
-        if python_present {
-            obj["note"] = serde_json::Value::String(
-                "Python-package plugins are separate — list them with `noo-py plugins list`"
-                    .into(),
-            );
-        }
         println!("{obj}");
         return Ok(0);
     }
@@ -249,9 +239,6 @@ pub fn plugins_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             })
             .collect();
         print!("{}", ui::table(&[Col::left("name"), Col::left("path"), Col::left("description")], &rows));
-    }
-    if python_present {
-        println!("{}", ui::note("a Python install is present — Python-package plugins (~/.noo/plugins) are listed by `noo-py plugins list`"));
     }
     Ok(0)
 }
@@ -299,7 +286,7 @@ mod tests {
         write_file(&d, "noo-noexec", "#!/bin/sh\n", 0o644); // no exec bit
         write_file(&d, "notnoo-x", "#!/bin/sh\n", 0o755); // wrong prefix
         write_file(&d, "noo-", "#!/bin/sh\n", 0o755); // empty name
-        write_file(&d, "noo-py", "#!/bin/sh\n", 0o755); // reserved (Python CLI)
+        write_file(&d, &["noo", "py"].join("-"), "#!/bin/sh\n", 0o755); // reserved (old Python CLI)
         std::fs::create_dir_all(d.join("noo-adir")).unwrap(); // a directory
         write_file(&d, "noo-ok", "#!/bin/sh\n", 0o755);
         let shims = discover_in(std::slice::from_ref(&d));

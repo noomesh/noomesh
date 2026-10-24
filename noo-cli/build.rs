@@ -79,6 +79,10 @@ const STANDALONE_FILES: &[&str] = &[
     "scripts/lib-config.sh",
     "scripts/lib-instance.sh",
     "scripts/lib-secrets.sh",
+    // Every launcher refuses a closed encrypted state volume (i10a).
+    "scripts/lib-state-volume.sh",
+    // ...and refuse a data root that is not on its recorded filesystem.
+    "scripts/lib-data-root-mount.sh",
     "scripts/lib-dist.sh",
     // The compose file list has one home; every
     // launcher sources it, so a standalone install must ship it.
@@ -161,6 +165,11 @@ const STANDALONE_FILES: &[&str] = &[
     // tests/test_standalone_slice_ships_compose_host_files.py pins this
     // list against the compose files so the next one cannot slip.
     "docker/seccomp-sandbox.json",
+    // The sandbox's AppArmor profile for Ubuntu 24.04+ hosts (docker-default
+    // plus the user-namespace and mount rules Bubblewrap needs). Not mounted
+    // by compose: the operator installs it into /etc/apparmor.d once, so a
+    // --dist controller must have the file to install.
+    "docker/apparmor-noo-sandbox",
     // Redis reads its password from the environment through this script
     // instead of from a compose `command:` line, so a --dist
     // controller needs the script or redis will not start at all.

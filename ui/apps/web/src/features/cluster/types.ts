@@ -11,7 +11,8 @@ export interface ClusterNode {
   id: string;
   hostname: string;
   ip: string;
-  tier: number;
+  /** null = the gateway did not report a tier (renders a dash, never T0). */
+  tier: number | null;
   status: string;
   gpu?: string;
   vramTotal?: number;

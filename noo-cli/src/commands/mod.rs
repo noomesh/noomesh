@@ -8,8 +8,13 @@
 //! stderr, exit code per the contract in output.rs.
 
 pub mod addons;
+pub mod at_rest;
+pub mod at_rest_migrate;
+pub mod at_rest_recovery;
+pub mod at_rest_volume;
 pub mod channel;
 pub mod addon_enable;
+pub mod addon_provision;
 pub mod addon_pins;
 pub mod backups;
 pub mod agents;
@@ -77,6 +82,7 @@ pub mod secrets;
 pub mod secrets_remove;
 pub mod secrets_reveal;
 pub mod plaintext_env;
+pub mod at_rest_seal;
 pub mod secrets_delivery;
 pub mod container_files;
 pub mod offboard;
@@ -109,14 +115,13 @@ pub use channels::{channels_export, channels_import, channels_status, channels_t
 pub use chat::chat;
 pub use nats_users::{cluster_nats_creds_rotate, cluster_nats_users_render};
 pub use cluster::{
-    cluster_add_companion, cluster_add_monitor, cluster_assign, cluster_clean_node,
+    cluster_add_companion, cluster_add_monitor, cluster_assign, cluster_clean_node, cluster_stage_images,
     cluster_clear_cooldowns, cluster_desired, cluster_down, cluster_fit, cluster_proposals, cluster_forget, cluster_init_secret,
     cluster_logs, cluster_show, cluster_place, cluster_restart_agent, cluster_maintenance,
     cluster_scale, cluster_set_config, cluster_status, cluster_sync_model_files,
     cluster_exec, cluster_reconnect, cluster_sync_models, cluster_unplace, cluster_up,
 };
 pub use browser::{browser_open, browser_status, browser_stop};
-pub use image_stage::cluster_stage_images;
 pub use cluster_provision::{
     cluster_invite,
     cluster_auto_place, cluster_bootstrap_token_create,
@@ -198,6 +203,7 @@ pub use security::{
 pub use secrets::{secrets_audit, secrets_resync, secrets_rotate, secrets_tidy};
 pub use secrets_remove::secrets_remove;
 pub use secrets_reveal::secrets_reveal;
+pub use at_rest_seal::{at_rest_finalize, at_rest_seal};
 // ── Fleet secret convergence (WP-FS): the missing push half of a rotation.
 pub use cluster_host_telemetry::{cluster_host_telemetry_apply, cluster_host_telemetry_usage};
 pub use cluster_vendor::{cluster_vendor_install, cluster_vendor_stage, cluster_vendor_status, cluster_vendor_usage};
@@ -227,7 +233,7 @@ pub use usage::{usage, usage_me};
 /// `noo tui` — RETIRED 2026-08-16. Native so the answer needs no Python and
 /// a broken venv can't turn it into a traceback: the web dashboard
 /// (noo-mesh-ui-web, served by the gateway) is the interactive UI; `noo
-/// chat` covers the terminal. Module archived at legacy/python-tui-reference/.
+/// chat` covers the terminal. Module was removed (history in git log before 2026-08-08).
 pub fn tui_retired(g: &crate::Globals, _args: &[String]) -> Result<i32, crate::Unhandled> {
     crate::output::fail(
         g.json,
@@ -254,7 +260,7 @@ pub use models::models_refresh;
 pub mod addon_cli;
 
 /// Destructive-operation confirmation, agent-first (shared by `stack clean`,
-/// `cluster down`, `cluster scale`). Semantics:
+/// `cluster down`). Semantics:
 ///   `--yes/-y`      → proceed, no prompt (the agent path).
 ///   `--json`        → NEVER prompt: without --yes emit the JSON error
 ///                     contract on stderr and exit 1.
@@ -431,4 +437,8 @@ pub use addon_pins::{addons_launch_pins, addons_upgrade, addons_verify};
 pub use addons::{addons_disable, addons_enable, addons_list, addons_set, addons_show, addons_trust_key, addons_untrust_key};
 pub use backups::{backups_setup, backups_status};
 pub use kiosk::*;
+pub use at_rest::{security_at_rest_opt_in, security_at_rest_opt_out, security_at_rest_status};
+pub use at_rest_migrate::{security_at_rest_migrate, security_at_rest_wipe_plaintext};
+pub use at_rest_recovery::{security_at_rest_preflight_firmware, security_at_rest_recovery_key, security_at_rest_reenroll};
+pub use at_rest_volume::security_at_rest_create_volume;
 pub use kiosk_seat::{kiosk_enroll, kiosk_seat_sync, kiosk_seat_token};

@@ -211,7 +211,7 @@ def test_the_known_bridges_are_classified_as_bridges() -> None:
     """Pinned by name, because these are the ones with a live incident behind
     them. Reclassifying one as a Gate silently re-arms R43."""
     bridges = set(_rust_bridge_keys())
-    for key in ("NOO_SELF_CALL_SHARED_SECRET",):
+    for key in ("NOO_CLUSTER_TOKEN_V1",):
         assert key in bridges, (
             f"{key} is a compatibility bridge, not a gate — a profile that "
             "sets it breaks a half-migrated fleet"

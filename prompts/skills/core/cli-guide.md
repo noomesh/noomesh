@@ -37,7 +37,7 @@ Controller (:8080)          ← gateway, database, scheduler live here
 - The **gateway routes work to worker nodes** — starting backends, pulling models,
   dispatching jobs. You never need to SSH into workers.
 - `noo models pull mistral` downloads to a **worker node**, not the controller.
-- `noo cluster up vllm` starts vLLM on a **worker node**, not locally.
+- `noo cluster place <node> vllm <model>` declares vLLM on a **worker node**, not locally.
 - Knowledge base, memory, and conversations live on the **controller** (PostgreSQL).
 
 Set `CONTROLLER_URL` if the gateway isn't on localhost, or pass `--gateway` / `-G`.
@@ -49,7 +49,7 @@ Set `CONTROLLER_URL` if the gateway isn't on localhost, or pass `--gateway` / `-
 | Quick commands, scripting, automation | **Best** | — |
 | Chat with the AI | `noo chat` | Chat tab (richer: voice, history, feedback) |
 | Check cluster health | `noo cluster status` | Cluster tab (node cards with load bars) |
-| Start/stop backends | `noo cluster up/down` | Backends tab (dropdowns, one-click) |
+| Start/stop backends | `noo cluster place` / `unplace` | Backends tab (dropdowns, one-click) |
 | GPU metrics & charts | — | **Observability tab (only here)** |
 | Browse models & cache | `noo models search/pull` | Backends tab (HF catalog dropdowns) |
 | Ingest documents | `noo rag ingest file.pdf` | RAG tab (drag-and-drop + URL input) |
@@ -92,10 +92,9 @@ noo inference agent "task"                # Agentic loop with tools
 ```
 noo cluster status                        # All nodes, GPUs, backends
 noo cluster provision <node>              # Provision an enrolled worker node
-noo cluster up vllm                       # Start backend (gateway picks node)
-noo cluster up vllm --node gpu-node-1          # Start on specific node
-noo cluster down vllm --node gpu-node-1        # Stop backend on a node
-noo cluster scale vllm --replicas 3       # Run across 3 nodes
+noo cluster place gpu-node-1 vllm auto    # Declare a backend on a node (the agent converges)
+noo cluster unplace gpu-node-1 vllm       # Remove the placement
+noo cluster down vllm --node gpu-node-1   # Stop backend on a node now
 noo cluster logs <node>                   # Fetch node logs via SSH
 ```
 

@@ -27,7 +27,9 @@ use crate::auth::{account_of, scoped_account, scoped_user, AuthActor, ClusterNod
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::measured::{put, put_into, Measured};
 use crate::state::AppState;
+use crate::redis_or_unavailable::redis_or_unavailable;
 use super::{logs_search, AppJson, AppError, AppResult};
 
 
@@ -183,9 +185,7 @@ async fn logs_status(State(state): State<Arc<AppState>>) -> AppJson {
         }
     }
 
-    // Was a literal `true` — `noo logs status` therefore printed
-    // "node registry: available" even with NATS down. The registry lives in
-    // the `mesh_nodes` KV bucket, so ask for the bucket instead of asserting.
+    // The registry lives in the `mesh_nodes` KV bucket; ask for the bucket.
     let node_registry_available = state.js.get_key_value("mesh_nodes").await.is_ok();
 
     Json(json!({
@@ -472,6 +472,14 @@ async fn logs_node_container(
 // Native handlers — Cache stats (Redis)
 // ═══════════════════════════════════════════════════════════════
 
+/// One integer off a Redis INFO line: null with a reason when it does not parse.
+fn info_int(val: &str) -> Measured<i64> {
+    match val.trim().parse::<i64>() {
+        Ok(n) => Measured::of(n),
+        Err(_) => Measured::unmeasured(format!("Redis INFO sent a non-numeric value {val:?}")),
+    }
+}
+
 /// Redis cache statistics — key counts, memory usage, uptime.
 ///
 /// Fetches Redis INFO and parses key metrics (memory, hit/miss ratio,
@@ -480,7 +488,13 @@ async fn logs_node_container(
 pub(crate) async fn cache_stats(State(state): State<Arc<AppState>>) -> AppJson {
     let redis = match state.redis.as_ref() {
         Some(r) => r,
-        None => return Json(json!({"enabled": false, "reason": "Redis not connected"})),
+        None => {
+            // A status, not a refusal: whether the cache is enabled is
+            // UNKNOWN here, which `enabled: false` would state as fact.
+            let mut body = json!({});
+            put_into(&mut body, "enabled", Measured::<bool>::unmeasured("Redis not connected, so the cache was not read"));
+            return Json(body);
+        }
     };
 
     let healthy = redis.is_healthy().await;
@@ -496,12 +510,12 @@ pub(crate) async fn cache_stats(State(state): State<Arc<AppState>>) -> AppJson {
             if let Some((key, val)) = line.split_once(':') {
                 match key {
                     "used_memory_human" => { stats.insert("used_memory_human".into(), json!(val)); }
-                    "used_memory" => { stats.insert("used_memory_bytes".into(), json!(val.parse::<i64>().unwrap_or(0))); }
-                    "keyspace_hits" => { stats.insert("keyspace_hits".into(), json!(val.parse::<i64>().unwrap_or(0))); }
-                    "keyspace_misses" => { stats.insert("keyspace_misses".into(), json!(val.parse::<i64>().unwrap_or(0))); }
-                    "connected_clients" => { stats.insert("connected_clients".into(), json!(val.parse::<i64>().unwrap_or(0))); }
-                    "total_connections_received" => { stats.insert("total_connections_received".into(), json!(val.parse::<i64>().unwrap_or(0))); }
-                    "uptime_in_seconds" => { stats.insert("uptime_seconds".into(), json!(val.parse::<i64>().unwrap_or(0))); }
+                    "used_memory" => put(&mut stats, "used_memory_bytes", info_int(val)),
+                    "keyspace_hits" => put(&mut stats, "keyspace_hits", info_int(val)),
+                    "keyspace_misses" => put(&mut stats, "keyspace_misses", info_int(val)),
+                    "connected_clients" => put(&mut stats, "connected_clients", info_int(val)),
+                    "total_connections_received" => put(&mut stats, "total_connections_received", info_int(val)),
+                    "uptime_in_seconds" => put(&mut stats, "uptime_seconds", info_int(val)),
                     "maxmemory_human" => { stats.insert("maxmemory_human".into(), json!(val)); }
                     _ => {}
                 }
@@ -902,17 +916,14 @@ async fn list_jobs(
     params.fleet = requester
         .as_ref()
         .is_some_and(|Extension(r)| r.scopes.iter().any(|s| s == crate::auth::KIOSK_SCOPE));
-    Ok(Json(list_jobs_for(state, params).await))
+    Ok(Json(list_jobs_for(state, params).await?))
 }
 
 /// The body of [`list_jobs`], callable without an extractor, so
 /// `routes/kiosk.rs` can project this route's own answer instead of reading
 /// Redis a second time.
-pub(super) async fn list_jobs_for(state: Arc<AppState>, params: ListJobsParams) -> Value {
-    let redis = match state.redis.as_ref() {
-        Some(r) => r,
-        None => return json!({"jobs": [], "count": 0, "error": "Redis not connected"}),
-    };
+pub(super) async fn list_jobs_for(state: Arc<AppState>, params: ListJobsParams) -> Result<Value, AppError> {
+    let redis = redis_or_unavailable(&state)?;
 
     let limit = params.limit.unwrap_or(50).min(500);
 
@@ -966,7 +977,7 @@ pub(super) async fn list_jobs_for(state: Arc<AppState>, params: ListJobsParams) 
     let jobs: Vec<Value> = jobs.into_iter().take(limit).collect();
     let count = jobs.len();
 
-    json!({"jobs": jobs, "count": count})
+    Ok(json!({"jobs": jobs, "count": count}))
 }
 
 /// A job hash as JSON, deserializing the payload field (JSON if it parses,
@@ -1012,14 +1023,7 @@ async fn job_history(
         cluster.as_ref().map(|Extension(c)| c),
     )
     .map_err(AppError::Forbidden)?;
-    let redis = match state.redis.as_ref() {
-        Some(r) => r,
-        None => {
-            return Ok(Json(
-                json!({"history": [], "count": 0, "error": "Redis not connected"}),
-            ))
-        }
-    };
+    let redis = redis_or_unavailable(&state)?;
 
     let limit = params.limit.unwrap_or(50).min(500);
 
@@ -1041,27 +1045,37 @@ async fn job_history(
     Ok(Json(json!({"history": history, "count": count})))
 }
 
+/// `GET /api/jobs/{job_id}` query. `vectors=1` (or `true`) asks for an
+/// `embed_batch` job's vectors along with the job; every other job ignores it.
+#[derive(Deserialize, Default)]
+struct GetJobParams {
+    vectors: Option<String>,
+}
+
 /// Get a single job by ID.
 ///
-/// GET /api/jobs/{job_id}
+/// GET /api/jobs/{job_id}[?vectors=1]
 ///
 /// Reads the job hash from Redis. Returns 404 if not found.
 /// Mirrors Python `JobScheduler.get_job()`.
+///
+/// For a completed `embed_batch` job, `?vectors=1` adds `"vectors"`: the
+/// batch's embeddings as `[[f32, ...], ...]`, decoded from the 15-minute side
+/// key. Once that key has expired the answer is `410 Gone` (resubmit; embedding
+/// is idempotent). A job that is not complete yet is returned without vectors.
 async fn get_job(
     State(state): State<Arc<AppState>>,
     requester: Option<Extension<RequesterCtx>>,
     cluster: Option<Extension<ClusterNode>>,
     Path(job_id): Path<String>,
-) -> AppResult {
+    Query(params): Query<GetJobParams>,
+) -> Result<axum::response::Response, AppError> {
     let scope = scoped_account(
         requester.as_ref().map(|Extension(r)| r),
         cluster.as_ref().map(|Extension(c)| c),
     )
     .map_err(AppError::Forbidden)?;
-    let redis = match state.redis.as_ref() {
-        Some(r) => r,
-        None => return Err(AppError::Internal("Redis not connected".into())),
-    };
+    let redis = redis_or_unavailable(&state)?;
 
     let key = format!("{JOB_KEY_PREFIX}{job_id}");
     match redis.hgetall(&key).await {
@@ -1086,7 +1100,18 @@ async fn get_job(
                     job.insert(k.clone(), json!(v));
                 }
             }
-            Ok(Json(Value::Object(job)))
+            if crate::embed_jobs::wants_vectors(params.vectors.as_deref())
+                && crate::embed_jobs::is_embed_job(&map)
+                && map.get("status").map(String::as_str) == Some("completed")
+            {
+                match crate::embed_jobs::read_vectors(redis, &job_id, &map).await {
+                    Ok(vectors) => {
+                        job.insert("vectors".to_string(), json!(vectors));
+                    }
+                    Err(e) => return Ok(e.to_response(&job_id)),
+                }
+            }
+            Ok(Json(Value::Object(job)).into_response())
         }
         None => Err(AppError::NotFound("Job not found".into())),
     }
@@ -1116,10 +1141,7 @@ async fn cancel_job(
         cluster.as_ref().map(|Extension(c)| c),
     )
     .map_err(AppError::Forbidden)?;
-    let redis = match state.redis.as_ref() {
-        Some(r) => r,
-        None => return Err(AppError::Internal("Redis not connected".into())),
-    };
+    let redis = redis_or_unavailable(&state)?;
 
     let key = format!("{JOB_KEY_PREFIX}{job_id}");
 
@@ -1269,10 +1291,7 @@ async fn reprioritize_job(
         cluster.as_ref().map(|Extension(c)| c),
     )
     .map_err(AppError::Forbidden)?;
-    let redis = match state.redis.as_ref() {
-        Some(r) => r,
-        None => return Err(AppError::Internal("Redis not connected".into())),
-    };
+    let redis = redis_or_unavailable(&state)?;
 
     let key = format!("{JOB_KEY_PREFIX}{job_id}");
 
@@ -1356,10 +1375,7 @@ async fn scheduler_submit_task(
         return Ok(resp);
     }
 
-    let redis = match state.redis.as_ref() {
-        Some(r) => r,
-        None => return Err(AppError::Internal("Redis not connected".into())),
-    };
+    let redis = redis_or_unavailable(&state)?;
     // The owner is the ACCOUNT (`account_of`), not the session label.
     let owner = actor.as_ref().map(|Extension(a)| account_of(a.0.as_str())).unwrap_or("");
 
@@ -1401,6 +1417,11 @@ async fn route_by_executor(
             }))))
         }
         Some(crate::job_types::Executor::Node) => Ok(None),
+        // A pulled type has its own route: it is created with its input
+        // already published to a work queue, which a bare submit cannot do.
+        Some(crate::job_types::Executor::Pull) => Err(AppError::BadRequest(format!(
+            "job type '{job_type}' is not submitted here; embedding batches go to POST /api/external/embeddings/jobs"
+        ))),
     }
 }
 
@@ -1465,28 +1486,6 @@ impl Default for JobOptions<'_> {
     }
 }
 
-/// How long a caller of `/api/jobs/submit` is told to wait when the gateway
-/// has no Redis client.
-pub(crate) const REDIS_RETRY_AFTER_SECS: u64 = 5;
-
-/// The refusal `/api/jobs/submit` answers while the gateway holds no Redis
-/// client: 503 + `Retry-After` + `{"error":"redis_reconnecting"}`, never a
-/// bare 500. The queue IS Redis, so nothing can be queued; the caller (the
-/// CLI's node poke during `noo upgrade --all`) retries on the code.
-///
-/// NOTE: today the client is made once, at boot (`state.rs`): a gateway that
-/// came up before Redis accepted connections keeps answering this until it
-/// is restarted. The code says "reconnecting" because that is what a caller
-/// should do about it (wait and retry), and because a reconnecting client is
-/// the fix this body is shaped for.
-pub(crate) fn redis_not_connected() -> AppError {
-    AppError::UnavailableRetry {
-        code: "redis_reconnecting",
-        detail: "Redis not connected: the job queue is unavailable until the gateway's Redis client connects".into(),
-        retry_after_secs: REDIS_RETRY_AFTER_SECS,
-    }
-}
-
 /// Submit a job to the scheduler queue (full form with backend/force_node).
 ///
 /// POST /api/jobs/submit
@@ -1546,9 +1545,7 @@ async fn scheduler_submit_job(
         priority = p;
         knobs = k;
         // AFTER validation: a refused request is not charged to the quota.
-        let Some(redis) = state.redis.as_ref() else {
-            return Err(redis_not_connected());
-        };
+        let redis = redis_or_unavailable(&state)?;
         match redis
             .check_named_limit("job-submit", account_of(actor_sub), USER_JOB_SUBMITS_PER_WINDOW, USER_JOB_SUBMIT_WINDOW_SECS)
             .await
@@ -1576,10 +1573,7 @@ async fn scheduler_submit_job(
         return Ok(resp);
     }
 
-    let redis = match state.redis.as_ref() {
-        Some(r) => r,
-        None => return Err(redis_not_connected()),
-    };
+    let redis = redis_or_unavailable(&state)?;
     // refuse a job that names a backend nobody is serving
     // instead of queuing it to die. A pinned job is the operator's call.
     if let Some(b) = body.backend.as_deref().filter(|b| !b.is_empty()) {
@@ -1794,9 +1788,20 @@ fn scheduler_running() -> (&'static str, Option<bool>, String) {
 pub(crate) async fn scheduler_status(
     State(state): State<Arc<AppState>>,
 ) -> AppJson {
-    let redis = match state.redis.as_ref() {
-        Some(r) => r,
-        None => return Json(json!({"error": "Redis not connected"})),
+    let (engine, running, running_detail) = scheduler_running();
+    let Some(redis) = state.redis.as_ref() else {
+        // A status with Redis as most of its rows: 200, and every row Redis
+        // would have supplied is a Measured null, not a 0 / false / [].
+        let why = "Redis is not connected, so the queue was not read";
+        let mut body = json!({ "engine": engine });
+        put_into(&mut body, "paused", Measured::<bool>::unmeasured(why));
+        put_into(&mut body, "queue_depth", Measured::<i64>::unmeasured(why));
+        put_into(&mut body, "active_jobs", Measured::<i64>::unmeasured(why));
+        put_into(&mut body, "drained_nodes", Measured::<Vec<String>>::unmeasured(why));
+        put_into(&mut body, "background_queue_depth", Measured::<usize>::unmeasured(why));
+        put_into(&mut body, "history_size", Measured::<i64>::unmeasured(why));
+        put_into(&mut body, "running", Measured::noted(running, running_detail));
+        return Json(body);
     };
 
     let queue_depth = redis.zcard(JOB_QUEUE_KEY).await;
@@ -1813,19 +1818,17 @@ pub(crate) async fn scheduler_status(
         .map(|v| v == "1")
         .unwrap_or(false);
 
-    let (engine, running, running_detail) = scheduler_running();
-
-    Json(json!({
+    let mut body = json!({
         "engine": engine,
-        "running": running,
-        "running_detail": running_detail,
         "paused": paused,
         "queue_depth": queue_depth,
         "active_jobs": active_jobs,
         "drained_nodes": drained_nodes,
         "background_queue_depth": bg_queue_depth,
         "history_size": history_size,
-    }))
+    });
+    put_into(&mut body, "running", Measured::noted(running, running_detail));
+    Json(body)
 }
 
 /// Pause the scheduler — no new jobs will be dispatched.
@@ -1836,16 +1839,13 @@ pub(crate) async fn scheduler_status(
 /// checks this key and skips dispatching when set.
 async fn scheduler_pause(
     State(state): State<Arc<AppState>>,
-) -> AppJson {
-    let redis = match state.redis.as_ref() {
-        Some(r) => r,
-        None => return Json(json!({"error": "Redis not connected"})),
-    };
+) -> AppResult {
+    let redis = redis_or_unavailable(&state)?;
 
     redis.set_string(SCHED_PAUSED_KEY, "1").await;
     tracing::info!("scheduler_paused");
 
-    Json(json!({"status": "paused"}))
+    Ok(Json(json!({"status": "paused"})))
 }
 
 /// Resume the scheduler — allow dispatching again.
@@ -1855,16 +1855,13 @@ async fn scheduler_pause(
 /// Deletes the Redis flag `noo:scheduler:paused`.
 async fn scheduler_resume(
     State(state): State<Arc<AppState>>,
-) -> AppJson {
-    let redis = match state.redis.as_ref() {
-        Some(r) => r,
-        None => return Json(json!({"error": "Redis not connected"})),
-    };
+) -> AppResult {
+    let redis = redis_or_unavailable(&state)?;
 
     redis.del_key(SCHED_PAUSED_KEY).await;
     tracing::info!("scheduler_resumed");
 
-    Json(json!({"status": "resumed"}))
+    Ok(Json(json!({"status": "resumed"})))
 }
 
 /// Drain a node — prevent new jobs from being dispatched to it.
@@ -1876,20 +1873,17 @@ async fn scheduler_resume(
 async fn scheduler_drain(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
-) -> AppJson {
-    let redis = match state.redis.as_ref() {
-        Some(r) => r,
-        None => return Json(json!({"error": "Redis not connected"})),
-    };
+) -> AppResult {
+    let redis = redis_or_unavailable(&state)?;
 
     if node_id.is_empty() {
-        return Json(json!({"error": "Missing node_id"}));
+        return Ok(Json(json!({"error": "Missing node_id"})));
     }
 
     redis.sadd(SCHED_DRAINED_KEY, &node_id).await;
     tracing::info!(node_id = %node_id, "node_drained");
 
-    Json(json!({"status": "drained", "node_id": node_id}))
+    Ok(Json(json!({"status": "drained", "node_id": node_id})))
 }
 
 /// Undrain a node — allow new jobs to be dispatched to it again.
@@ -1901,20 +1895,17 @@ async fn scheduler_drain(
 async fn scheduler_undrain(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
-) -> AppJson {
-    let redis = match state.redis.as_ref() {
-        Some(r) => r,
-        None => return Json(json!({"error": "Redis not connected"})),
-    };
+) -> AppResult {
+    let redis = redis_or_unavailable(&state)?;
 
     if node_id.is_empty() {
-        return Json(json!({"error": "Missing node_id"}));
+        return Ok(Json(json!({"error": "Missing node_id"})));
     }
 
     redis.srem(SCHED_DRAINED_KEY, &node_id).await;
     tracing::info!(node_id = %node_id, "node_undrained");
 
-    Json(json!({"status": "undrained", "node_id": node_id}))
+    Ok(Json(json!({"status": "undrained", "node_id": node_id})))
 }
 
 
@@ -4673,6 +4664,7 @@ async fn mesh_rebuild(
 #[cfg(test)]
 mod job_type_routing_tests {
     use super::*;
+    use crate::redis_or_unavailable::{redis_not_connected, REDIS_RETRY_AFTER_SECS};
     use crate::job_types::{self, Executor};
 
     #[test]

@@ -39,13 +39,9 @@ POSTURE_KEYS = (
     # (NOO_NATS_LEGACY_SHARED_CREDS, the shared-bus-user bridge, was retired
     # with the user itself — the design. Every process presents its own
     # NATS principal; there is no bridge to hold open.)
-    # the design bridge: while OPEN a shared-secret token still buys
-    # INFERENCE, and each acceptance warns naming the caller; closed, that
-    # caller must present its own noo_service_keys row. Mirrors posture.rs —
-    # the parity test pins them together. Unlike every other bridge here this
-    # one is open by DEFAULT, because accepting the shared secret is what
-    # every install does today.
-    "NOO_SELF_CALL_SHARED_SECRET",
+    # (NOO_SELF_CALL_SHARED_SECRET, the shared-secret-buys-inference bridge,
+    # was retired: the gateway refuses the inference surface to a shared
+    # secret outright. A stale row is an unknown key and is skipped.)
     # The v1 (replayable) cluster token bridge: open when unset, "0" refuses
     # it. Mirrors posture.rs; the parity test pins them together.
     "NOO_CLUSTER_TOKEN_V1",

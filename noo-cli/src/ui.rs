@@ -241,6 +241,8 @@ pub enum Glyph {
     Bullet,
     Section,
     Hint,
+    /// A risk the person has accepted on the record: not a pass, not a warning.
+    Accepted,
 }
 
 impl Glyph {
@@ -254,6 +256,7 @@ impl Glyph {
                 Glyph::Bullet => "•",
                 Glyph::Section => "◆",
                 Glyph::Hint => "▸",
+                Glyph::Accepted => "◇",
             }
         } else {
             match self {
@@ -264,6 +267,7 @@ impl Glyph {
                 Glyph::Bullet => "-",
                 Glyph::Section => "#",
                 Glyph::Hint => ">",
+                Glyph::Accepted => "~",
             }
         }
     }
@@ -278,6 +282,7 @@ pub fn glyph(g: Glyph) -> String {
         Glyph::Warn => warn(s),
         Glyph::Step | Glyph::Section | Glyph::Hint => brand(s),
         Glyph::Bullet => s.to_string(),
+        Glyph::Accepted => warn(s),
     }
 }
 
@@ -821,6 +826,31 @@ pub fn clear_line() {
     use std::io::Write as _;
     eprint!("\r{CLEAR_EOL}");
     let _ = std::io::stderr().flush();
+}
+
+/// Wipe a secret that was just revealed with [`value`] (the at-rest recovery
+/// key, i10a) off the terminal: clear the screen and, where the terminal
+/// honours it, its scrollback. Written where [`value`] wrote (the original
+/// stdout, even under `--quiet`), and only when that is a TTY: a pipe never
+/// gets the escape.
+pub fn clear_revealed_secret() {
+    use std::io::Write as _;
+    const SEQ: &str = "\x1b[H\x1b[2J\x1b[3J";
+    match VALUE_FD.get() {
+        Some(&fd) => {
+            // SAFETY: fd is a dup of our original stdout, kept open for the
+            // process lifetime (see `value`).
+            if unsafe { libc::isatty(fd) } == 1 {
+                let _ = unsafe { libc::write(fd, SEQ.as_ptr() as *const _, SEQ.len()) };
+            }
+        }
+        None => {
+            if unsafe { libc::isatty(1) } == 1 {
+                print!("{SEQ}");
+                let _ = std::io::stdout().flush();
+            }
+        }
+    }
 }
 
 // ── printers ────────────────────────────────────────────────────────────
@@ -1508,6 +1538,7 @@ mod tests {
         assert_eq!(glyph(Glyph::Warn), "!");
         assert_eq!(glyph(Glyph::Section), "#");
         assert_eq!(glyph(Glyph::Hint), ">");
+        assert_eq!(glyph(Glyph::Accepted), "~");
         assert_eq!(dash(), "-");
         assert_eq!(wordmark("0.0.0"), "");
     }

@@ -26,7 +26,7 @@ KEPT = [
     # dispatcher protocol, and the manager-global module.
     "src/noomesh/channels/gateway_client.py",
     "src/noomesh/channels/base.py",
-    "src/noomesh/channels/router.py",
+    "src/noomesh/channels/manager_ref.py",
     "src/noomesh/mcp/client.py",
 ]
 

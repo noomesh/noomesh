@@ -7,6 +7,7 @@
       "description": "Mark an activity terminal (completed or abandoned).",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Mark an activity terminal (completed or abandoned).",
         "properties": {
           "activity_id": {
@@ -67,6 +68,7 @@
       "description": "Create a long-running activity \u2014 a pursuit the agent tracks across runs.\n\nUse when you (or the user) want to track work that spans multiple\ndays/weeks and decomposes into many tasks. Examples:\n  - \"Research the field of agentic AI in 3D worlds\" (kind=research)\n  - \"Clean up duplicate pages in PageIndex\" (kind=knowledge_curation)\n  - \"Investigate why cluster_health keeps over-firing\" (kind=investigation)\n\nActivities differ from heartbeat tasks: tasks are single recurring\nactions; activities are *goals* that may schedule several tasks to\npursue them.\n\nValid kinds: research, knowledge_curation, investigation,\n             monitoring, user_pursuit, other.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Create a long-running activity \u2014 a pursuit the agent tracks across runs.\n\nUse when you (or the user) want to track work that spans multiple\ndays/weeks and decomposes into many tasks. Examples:\n  - \"Research the field of agentic AI in 3D worlds\" (kind=research)\n  - \"Clean up duplicate pages in PageIndex\" (kind=knowledge_curation)\n  - \"Investigate why cluster_health keeps over-firing\" (kind=investigation)\n\nActivities differ from heartbeat tasks: tasks are single recurring\nactions; activities are *goals* that may schedule several tasks to\npursue them.\n\nValid kinds: research, knowledge_curation, investigation,\n             monitoring, user_pursuit, other.",
         "properties": {
           "created_by": {
@@ -136,6 +138,7 @@
       "description": "List agent activities. Optional filters: status, kind.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List agent activities. Optional filters: status, kind.",
         "properties": {
           "kind": {
@@ -198,6 +201,7 @@
       "description": "Record progress on an activity. Appends a structured entry to\nthe activity's progress.entries array and bumps last_activity_at.\n\nEntry shape (free-form, but consistent shapes are easier to query):\n  { \"at\": \"<iso>\", \"kind\": \"milestone\"|\"finding\"|\"note\",\n    \"summary\": \"...\", \"details\": {...} }",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Record progress on an activity. Appends a structured entry to\nthe activity's progress.entries array and bumps last_activity_at.\n\nEntry shape (free-form, but consistent shapes are easier to query):\n  { \"at\": \"<iso>\", \"kind\": \"milestone\"|\"finding\"|\"note\",\n    \"summary\": \"...\", \"details\": {...} }",
         "properties": {
           "activity_id": {
@@ -248,6 +252,7 @@
       "description": "Acknowledge (mark read) a message addressed to you.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Acknowledge (mark read) a message addressed to you.",
         "properties": {
           "message_id": {
@@ -280,8 +285,22 @@
       "description": "Read your account's agent messages, newest first: everything addressed\nto any name under your account (every window and label you run), plus\nthe threads those names take part in. Narrow with to= (one name) or\nthread=. Read state is per reader: unread=true shows what THIS\ncredential has not yet acknowledged, whatever a sibling window acked.\nAcknowledge with noo_agent_ack. Operators may name another account.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Read your account's agent messages, newest first: everything addressed\nto any name under your account (every window and label you run), plus\nthe threads those names take part in. Narrow with to= (one name) or\nthread=. Read state is per reader: unread=true shows what THIS\ncredential has not yet acknowledged, whatever a sibling window acked.\nAcknowledge with noo_agent_ack. Operators may name another account.",
         "properties": {
+          "all": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Operators only: list every session's messages, not just yours.",
+            "title": "All"
+          },
           "limit": {
             "anyOf": [
               {
@@ -363,12 +382,48 @@
       "timeout_secs": 30
     },
     {
+      "aliases": {
+        "name_field": "name"
+      },
+      "auth": "cluster",
+      "body_field": "",
+      "description": "Give this session a name you choose, so other sessions can address you\nby it: name=\"general\" makes you <account>/<type>-general (type is your\nclient, e.g. claude). Returns the new name. A name is a mailbox: if\nanother live session of your account already has it, you share it\n(shared_with says how many).",
+      "had_custom_format": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "description": "Give this session a name you choose, so other sessions can address you\nby it: name=\"general\" makes you <account>/<type>-general (type is your\nclient, e.g. claude). Returns the new name. A name is a mailbox: if\nanother live session of your account already has it, you share it\n(shared_with says how many).",
+        "properties": {
+          "name": {
+            "description": "The session half of your name: 1-64 of A-Z a-z 0-9 _ -",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "NooAgentName",
+        "type": "object"
+      },
+      "method": "POST",
+      "name": "noo_agent_name",
+      "path": "/api/agents/name",
+      "risk_level": "low",
+      "tags": [
+        "agents",
+        "messaging",
+        "external"
+      ],
+      "timeout_secs": 30
+    },
+    {
       "aliases": {},
       "auth": "cluster",
       "body_field": "",
       "description": "Send a message to another agent on the mesh. Addressed by agent id\n(e.g. \"host3/claude-code-1\"), or \"thread\" to post into an existing thread,\nor \"*\" to broadcast (operators and internal services only). Recorded and\ndelivered over NATS; the sender is the caller's identity \u2014 user, node and\nharness are derived from the credential, never from this call.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Send a message to another agent on the mesh. Addressed by agent id\n(e.g. \"host3/claude-code-1\"), or \"thread\" to post into an existing thread,\nor \"*\" to broadcast (operators and internal services only). Recorded and\ndelivered over NATS; the sender is the caller's identity \u2014 user, node and\nharness are derived from the credential, never from this call.",
         "properties": {
           "agent": {
@@ -496,6 +551,7 @@
       "description": "Read one conversation thread between agents (all messages in it).",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Read one conversation thread between agents (all messages in it).",
         "properties": {
           "limit": {
@@ -538,9 +594,34 @@
       "aliases": {},
       "auth": "cluster",
       "body_field": "",
+      "description": "Your own agent name on this session \u2014 the address other sessions use to message you.",
+      "had_custom_format": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "description": "Your own agent name on this session \u2014 the address other sessions use to message you.",
+        "properties": {},
+        "title": "NooAgentWhoami",
+        "type": "object"
+      },
+      "method": "GET",
+      "name": "noo_agent_whoami",
+      "path": "/api/agents/whoami",
+      "risk_level": "low",
+      "tags": [
+        "agents",
+        "messaging",
+        "external"
+      ],
+      "timeout_secs": 30
+    },
+    {
+      "aliases": {},
+      "auth": "cluster",
+      "body_field": "",
       "description": "Run a prompt through the coordinator's agentic loop. The coordinator plans,\ncalls tools, and iterates until it has a complete answer. Returns the final\nresponse and a list of tool calls made during reasoning.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Run a prompt through the coordinator's agentic loop. The coordinator plans,\ncalls tools, and iterates until it has a complete answer. Returns the final\nresponse and a list of tool calls made during reasoning.",
         "properties": {
           "backend": {
@@ -619,6 +700,7 @@
       "description": "Start a multi-agent collaboration session. Agents with specified roles\nwork together on the task, coordinated by the orchestrator.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Start a multi-agent collaboration session. Agents with specified roles\nwork together on the task, coordinated by the orchestrator.",
         "properties": {
           "roles": {
@@ -679,6 +761,7 @@
       "description": "List the cluster's alerts: every Prometheus alerting rule with its\nstate (firing, pending, inactive), severity, summary, when it became\nactive and its `for` duration, firing first, plus Alertmanager's own\nview (active, silenced, inhibited alerts). Read-only; it cannot silence\nor acknowledge anything. If Alertmanager is unreachable the answer still\ncarries the Prometheus half and an `alertmanager.error`. Use for 'is\nanything alerting?' and 'what is firing and why?'.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List the cluster's alerts: every Prometheus alerting rule with its\nstate (firing, pending, inactive), severity, summary, when it became\nactive and its `for` duration, firing first, plus Alertmanager's own\nview (active, silenced, inhibited alerts). Read-only; it cannot silence\nor acknowledge anything. If Alertmanager is unreachable the answer still\ncarries the Prometheus half and an `alertmanager.error`. Use for 'is\nanything alerting?' and 'what is firing and why?'.",
         "properties": {
           "alertmanager": {
@@ -729,6 +812,7 @@
       "description": "List pending exec approval requests waiting for human review.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List pending exec approval requests waiting for human review.",
         "properties": {},
         "title": "PaiApprovalPending",
@@ -751,6 +835,7 @@
       "description": "Get approval queue statistics: pending, approved, denied counts.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Get approval queue statistics: pending, approved, denied counts.",
         "properties": {},
         "title": "PaiApprovalStats",
@@ -775,6 +860,7 @@
       "description": "Add a new monitoring location to the autonomy engine.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Add a new monitoring location to the autonomy engine.",
         "properties": {
           "check_interval": {
@@ -844,6 +930,7 @@
       "description": "View the autonomy audit log \u2014 recent actions taken by the engine.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "View the autonomy audit log \u2014 recent actions taken by the engine.",
         "properties": {
           "limit": {
@@ -880,6 +967,7 @@
       "description": "Disable the autonomy engine (stops all monitoring patrols).",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Disable the autonomy engine (stops all monitoring patrols).",
         "properties": {},
         "title": "PaiAutonomyDisable",
@@ -901,6 +989,7 @@
       "description": "Enable the autonomy engine (starts periodic monitoring patrols).",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Enable the autonomy engine (starts periodic monitoring patrols).",
         "properties": {},
         "title": "PaiAutonomyEnable",
@@ -922,6 +1011,7 @@
       "description": "Get autonomy engine status: enabled state, active locations, last patrol time.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Get autonomy engine status: enabled state, active locations, last patrol time.",
         "properties": {},
         "title": "PaiAutonomyStatus",
@@ -944,6 +1034,7 @@
       "description": "List configured channel adapters and their connection status.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List configured channel adapters and their connection status.",
         "properties": {},
         "title": "PaiChannelList",
@@ -966,6 +1057,7 @@
       "description": "List known recipients for a specific channel adapter.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List known recipients for a specific channel adapter.",
         "properties": {
           "channel": {
@@ -996,6 +1088,7 @@
       "description": "Read recent messages from a channel, optionally filtered by recipient.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Read recent messages from a channel, optionally filtered by recipient.",
         "properties": {
           "channel": {
@@ -1066,6 +1159,7 @@
       "description": "Send a message through an external channel (Google Chat, Telegram, WhatsApp).\nRequires the channel adapter to be configured and connected.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Send a message through an external channel (Google Chat, Telegram, WhatsApp).\nRequires the channel adapter to be configured and connected.",
         "properties": {
           "channel": {
@@ -1122,6 +1216,7 @@
       "description": "Probe SSH reachability of inventory + (optional) ad-hoc subnet, and\ncross-check against the cluster registry. Read-only \u2014 no enrollment, no\nstate changes. Use BEFORE proposing a node-add to see what's reachable\nand which hosts are already enrolled.\n\nReturns: trusted_hosts (from the inventory file), discovered_hosts\n(subnet scan that aren't in inventory), and cluster_registered\n(already-enrolled nodes). Discovery is read-only: nothing here enrolls\nanything, and every enrolment needs a person on the target machine.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Probe SSH reachability of inventory + (optional) ad-hoc subnet, and\ncross-check against the cluster registry. Read-only \u2014 no enrollment, no\nstate changes. Use BEFORE proposing a node-add to see what's reachable\nand which hosts are already enrolled.\n\nReturns: trusted_hosts (from the inventory file), discovered_hosts\n(subnet scan that aren't in inventory), and cluster_registered\n(already-enrolled nodes). Discovery is read-only: nothing here enrolls\nanything, and every enrolment needs a person on the target machine.",
         "properties": {
           "skip_unreachable": {
@@ -1164,6 +1259,7 @@
       "description": "List pending node-add proposals (or all proposals when status='all').\nUse to check what you've proposed and whether the user has decided on\nthem yet.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List pending node-add proposals (or all proposals when status='all').\nUse to check what you've proposed and whether the user has decided on\nthem yet.",
         "properties": {
           "limit": {
@@ -1206,6 +1302,7 @@
       "description": "Propose adding a node to the cluster. Creates a row in the\nproposals queue and notifies the user via dashboard / Google Chat /\nTelegram (depending on what's configured).\n\nUse this when you've found a host (via noo_cluster_discover, or you've\nbeen told about one) that's reachable and worth adding. The reason\nfield becomes the audit trail \u2014 explain WHY (\"user has a spare GPU\non 192.0.2.69 that would help with the inference backlog\"). The\nuser reviews and approves before anything is handed to them to run.\n\nApproved proposals resolve to bootstrap-token instructions a human runs\non the target machine \u2014 there is no unattended enrolment path, so a\nproposal is a request for attention, never an action.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Propose adding a node to the cluster. Creates a row in the\nproposals queue and notifies the user via dashboard / Google Chat /\nTelegram (depending on what's configured).\n\nUse this when you've found a host (via noo_cluster_discover, or you've\nbeen told about one) that's reachable and worth adding. The reason\nfield becomes the audit trail \u2014 explain WHY (\"user has a spare GPU\non 192.0.2.69 that would help with the inference backlog\"). The\nuser reviews and approves before anything is handed to them to run.\n\nApproved proposals resolve to bootstrap-token instructions a human runs\non the target machine \u2014 there is no unattended enrolment path, so a\nproposal is a request for attention, never an action.",
         "properties": {
           "host": {
@@ -1262,6 +1359,7 @@
       "description": "List all cluster nodes with hostname, IP, tier, GPU, status, and running backends.\nUse this to check which nodes are online and what models are loaded.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List all cluster nodes with hostname, IP, tier, GPU, status, and running backends.\nUse this to check which nodes are online and what models are loaded.",
         "properties": {},
         "title": "PaiClusterStatus",
@@ -1287,6 +1385,7 @@
       "description": "Submit a coding task to Claude Code (runs as async subprocess).\nReturns a task_id for tracking.\n\n`engine` must be \"claude\" (the default): the real Anthropic API, which\ncosts API $. The \"local\" engine was removed when PR #316 deleted the\ngateway's Anthropic-compat endpoint that it depended on.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Submit a coding task to Claude Code (runs as async subprocess).\nReturns a task_id for tracking.\n\n`engine` must be \"claude\" (the default): the real Anthropic API, which\ncosts API $. The \"local\" engine was removed when PR #316 deleted the\ngateway's Anthropic-compat endpoint that it depended on.",
         "properties": {
           "command": {
@@ -1375,6 +1474,7 @@
       "description": "Get runtime configuration. Returns full config if section is omitted,\nor a specific section (cluster, services, cache, terminal, etc.).",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Get runtime configuration. Returns full config if section is omitted,\nor a specific section (cluster, services, cache, terminal, etc.).",
         "properties": {
           "section": {
@@ -1403,6 +1503,7 @@
       "description": "Update runtime configuration for a specific section. Changes are persisted\nto noomesh.yaml.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Update runtime configuration for a specific section. Changes are persisted\nto noomesh.yaml.",
         "properties": {
           "section": {
@@ -1440,6 +1541,7 @@
       "description": "Manually trigger a consolidation cycle \u2014 slice the live KG and snapshot it.\n\n    Slice kinds:\n    - topic: params={entity_type, canonical_name, hops?}\n    - time_window: params={from, to}  (ISO-8601 datetime strings)\n    - user_attention: params={user_id, days?}\n    \n\nLong-running: this starts an operation and waits a few seconds. If it finished you get the result; if not you get a handle {op_id, status, poll} -- call noo_op_status with that op_id (wait up to 25 seconds per call) until status is succeeded or failed. noo_op_cancel stops the gateway-side wait (the worker run itself may continue).",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Manually trigger a consolidation cycle \u2014 slice the live KG and snapshot it.\n\nSlice kinds:\n- topic: params={entity_type, canonical_name, hops?}\n- time_window: params={from, to}  (ISO-8601 datetime strings)\n- user_attention: params={user_id, days?}",
         "properties": {
           "kind": {
@@ -1498,6 +1600,7 @@
       "description": "Retrieve recent conversation context from the coordinator. Returns a\nsummary of recent interactions, useful for maintaining continuity across\nsessions and channels.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Retrieve recent conversation context from the coordinator. Returns a\nsummary of recent interactions, useful for maintaining continuity across\nsessions and channels.",
         "properties": {
           "channel": {
@@ -1549,6 +1652,7 @@
       "description": "Pure-traversal answer over a snapshot DAG \u2014 zero LLM cost.\n\nUse when you need a deterministic prerequisite/structure answer like\n'what should I learn before X?' from a topic-scoped snapshot.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Pure-traversal answer over a snapshot DAG \u2014 zero LLM cost.\n\nUse when you need a deterministic prerequisite/structure answer like\n'what should I learn before X?' from a topic-scoped snapshot.",
         "properties": {
           "q": {
@@ -1588,6 +1692,7 @@
       "description": "Record ambient audio from a companion device microphone.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Record ambient audio from a companion device microphone.",
         "properties": {
           "duration_seconds": {
@@ -1617,6 +1722,7 @@
       "description": "Get battery status from a companion device.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Get battery status from a companion device.",
         "properties": {},
         "title": "PaiDeviceBattery",
@@ -1639,6 +1745,7 @@
       "description": "Capture a photo from a companion device camera. Returns image data\nand optionally an AI-generated description of the scene.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Capture a photo from a companion device camera. Returns image data\nand optionally an AI-generated description of the scene.",
         "properties": {
           "describe": {
@@ -1668,6 +1775,7 @@
       "description": "Read current clipboard contents from a companion device.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Read current clipboard contents from a companion device.",
         "properties": {},
         "title": "PaiDeviceClipboard",
@@ -1690,6 +1798,7 @@
       "description": "Get current GPS location from a companion device.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Get current GPS location from a companion device.",
         "properties": {},
         "title": "PaiDeviceLocation",
@@ -1712,6 +1821,7 @@
       "description": "Take a screenshot from a companion device. Returns image data\nand optionally an AI-generated description.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Take a screenshot from a companion device. Returns image data\nand optionally an AI-generated description.",
         "properties": {
           "describe": {
@@ -1741,6 +1851,7 @@
       "description": "Show one document so an operator can judge what it is and who may read it: title,\nsource_uri, created_at, page_count, the first ~1000 characters of text (`text_preview`),\nits audience (`roles`), where it came from (`provenance`: {by, via, at}, null = ingested\nbefore provenance was recorded) and `audience_history` (the last 20 retags: at, by, from,\nto). Operator/admin only; the doc_id comes from noo_docs_list.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Show one document so an operator can judge what it is and who may read it: title,\nsource_uri, created_at, page_count, the first ~1000 characters of text (`text_preview`),\nits audience (`roles`), where it came from (`provenance`: {by, via, at}, null = ingested\nbefore provenance was recorded) and `audience_history` (the last 20 retags: at, by, from,\nto). Operator/admin only; the doc_id comes from noo_docs_list.",
         "properties": {
           "doc_id": {
@@ -1772,6 +1883,7 @@
       "description": "List ingested documents, newest first: titles, doc IDs, source URIs, ingestion\ntimestamps. Paged with limit (default 200, max 2000) and offset. For an operator/admin\neach item also carries `roles` (its audience tags; null = untagged, readable by\nadmins only), and summary=true returns {docs, summary} where summary is\n{total, untagged, by_audience} counted over ALL documents, not just the page.\nOperator/admin items also carry `provenance` ({by, via, at} of the first ingest; null =\nunknown) and `audience_history_len`. Review filters (applied to the listing AND the\nsummary): untagged, audience (a tag; `user:*` = any personal tier), match (a glob on\nsource_uri, as noo_rag_retag takes) and q (title substring, case-insensitive).",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List ingested documents, newest first: titles, doc IDs, source URIs, ingestion\ntimestamps. Paged with limit (default 200, max 2000) and offset. For an operator/admin\neach item also carries `roles` (its audience tags; null = untagged, readable by\nadmins only), and summary=true returns {docs, summary} where summary is\n{total, untagged, by_audience} counted over ALL documents, not just the page.\nOperator/admin items also carry `provenance` ({by, via, at} of the first ingest; null =\nunknown) and `audience_history_len`. Review filters (applied to the listing AND the\nsummary): untagged, audience (a tag; `user:*` = any personal tier), match (a glob on\nsource_uri, as noo_rag_retag takes) and q (title substring, case-insensitive).",
         "properties": {
           "audience": {
@@ -1886,6 +1998,7 @@
       "description": "Classify a query's intent type and confidence. Returns one of:\ncausal (why/cause/effect), definitional (what is/define),\nprocedural (how to/steps), comparative (vs/difference),\nexploratory (general). Confidence 0.0-1.0 indicates classification ambiguity.\nUse this to understand how the graph system would approach a query.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Classify a query's intent type and confidence. Returns one of:\ncausal (why/cause/effect), definitional (what is/define),\nprocedural (how to/steps), comparative (vs/difference),\nexploratory (general). Confidence 0.0-1.0 indicates classification ambiguity.\nUse this to understand how the graph system would approach a query.",
         "properties": {
           "query": {
@@ -1918,6 +2031,7 @@
       "description": "Audit how knowledge-graph clusters mix audiences (read-only, admin only).\nFor every cluster: its members per audience tier (company, system, generated,\nadmin, each team:*, user:* as a count, untagged), whether it is single-tier\n(\"pure:<tier>\") or \"mixed\", and how much of it a {company, system} reader would\nsee. The summary counts clusters by mix, the clusters that reader sees whole,\npartly or not at all, and how many clustered entities come only from untagged\ndocuments; a caveat says when that makes the measurement premature. This is the\nmeasure-first step before deciding on per-audience clustering.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Audit how knowledge-graph clusters mix audiences (read-only, admin only).\nFor every cluster: its members per audience tier (company, system, generated,\nadmin, each team:*, user:* as a count, untagged), whether it is single-tier\n(\"pure:<tier>\") or \"mixed\", and how much of it a {company, system} reader would\nsee. The summary counts clusters by mix, the clusters that reader sees whole,\npartly or not at all, and how many clustered entities come only from untagged\ndocuments; a caveat says when that makes the measurement premature. This is the\nmeasure-first step before deciding on per-audience clustering.",
         "properties": {
           "limit": {
@@ -1954,6 +2068,7 @@
       "description": "Preview the junk entities already in the knowledge graph (single letters, math\n    symbols, bare numbers): counts, and the most-connected examples. This tool ONLY\n    PREVIEWS. It changes nothing, and apply=true is refused (403) over MCP: removing the\n    entities (they are staged first and restorable for 30 days) is done by a person\n    running `noo graph entity-cleanup --apply` at a terminal. Admin only.\n\nLong-running: this starts an operation and waits a few seconds. If it finished you get the result; if not you get a handle {op_id, status, poll} -- call noo_op_status with that op_id (wait up to 25 seconds per call) until status is succeeded or failed. noo_op_cancel stops the gateway-side wait (the worker run itself may continue).",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Preview the junk entities already in the knowledge graph (single letters, math\nsymbols, bare numbers): counts, and the most-connected examples. This tool ONLY\nPREVIEWS. It changes nothing, and apply=true is refused (403) over MCP: removing the\nentities (they are staged first and restorable for 30 days) is done by a person\nrunning `noo graph entity-cleanup --apply` at a terminal. Admin only.",
         "properties": {
           "apply": {
@@ -2009,6 +2124,7 @@
       "description": "Get full details of a knowledge graph entity by its UUID: name, type,\nall connected entities (edges), and which document pages mention it.\nRequires an entity_id from noo_graph_search_entities.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Get full details of a knowledge graph entity by its UUID: name, type,\nall connected entities (edges), and which document pages mention it.\nRequires an entity_id from noo_graph_search_entities.",
         "properties": {
           "entity_id": {
@@ -2041,6 +2157,7 @@
       "description": "Find the shortest reasoning path between two entities in the knowledge graph.\nUses BFS to find the chain of relationships connecting them (max 5 hops).\nReturns human-readable steps like: Python --[USED_IN]--> Data Science --[CAUSES]--> Job Growth.\nUse this to explain how two concepts are related.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Find the shortest reasoning path between two entities in the knowledge graph.\nUses BFS to find the chain of relationships connecting them (max 5 hops).\nReturns human-readable steps like: Python --[USED_IN]--> Data Science --[CAUSES]--> Job Growth.\nUse this to explain how two concepts are related.",
         "properties": {
           "dst_entity_id": {
@@ -2079,6 +2196,7 @@
       "description": "Trigger LLM-based semantic relation extraction for a specific page.\n    Reads the page text and extracts typed relationships (CAUSES, DEPENDS_ON,\n    LIMITED_BY, MEASURED_BY, etc.) between entities, creating new graph edges\n    that go beyond co-occurrence. Use after ingesting new documents to enrich\n    the graph with causal and dependency relationships.\n\nLong-running: this starts an operation and waits a few seconds. If it finished you get the result; if not you get a handle {op_id, status, poll} -- call noo_op_status with that op_id (wait up to 25 seconds per call) until status is succeeded or failed. noo_op_cancel stops the gateway-side wait (the worker run itself may continue).",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Trigger LLM-based semantic relation extraction for a specific page.\nReads the page text and extracts typed relationships (CAUSES, DEPENDS_ON,\nLIMITED_BY, MEASURED_BY, etc.) between entities, creating new graph edges\nthat go beyond co-occurrence. Use after ingesting new documents to enrich\nthe graph with causal and dependency relationships.",
         "properties": {
           "page_id": {
@@ -2110,6 +2228,7 @@
       "description": "Find seed entities and reasoning paths for a question.\n    This is the primary tool for graph-guided reasoning about a question.\n    Returns seed entities, hypotheses (chains of relationships), and candidate pages.\n\nLong-running: this starts an operation and waits a few seconds. If it finished you get the result; if not you get a handle {op_id, status, poll} -- call noo_op_status with that op_id (wait up to 25 seconds per call) until status is succeeded or failed. noo_op_cancel stops the gateway-side wait (the worker run itself may continue).",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Find seed entities and reasoning paths for a question.\nThis is the primary tool for graph-guided reasoning about a question.\nReturns seed entities, hypotheses (chains of relationships), and candidate pages.",
         "properties": {
           "max_hops": {
@@ -2187,6 +2306,7 @@
       "description": "Traverse the knowledge graph outward from an entity: find related entities\nwithin 1-3 hops. Returns connected entities and their relationship types\n(CAUSES, DEPENDS_ON, LIMITED_BY, RELATED_TO, etc.).\nOptionally filter by edge type to follow only specific relationships.\nFor intent-aware traversal, use noo_graph_traverse_with_intent instead.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Traverse the knowledge graph outward from an entity: find related entities\nwithin 1-3 hops. Returns connected entities and their relationship types\n(CAUSES, DEPENDS_ON, LIMITED_BY, RELATED_TO, etc.).\nOptionally filter by edge type to follow only specific relationships.\nFor intent-aware traversal, use noo_graph_traverse_with_intent instead.",
         "properties": {
           "entity_id": {
@@ -2245,6 +2365,7 @@
       "description": "Trigger on-demand graph clustering: groups related entities into\n    labelled clusters. Replaces previous clustering results.\n\nLong-running: this starts an operation and waits a few seconds. If it finished you get the result; if not you get a handle {op_id, status, poll} -- call noo_op_status with that op_id (wait up to 25 seconds per call) until status is succeeded or failed. noo_op_cancel stops the gateway-side wait (the worker run itself may continue).",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Trigger on-demand graph clustering: groups related entities into\nlabelled clusters. Replaces previous clustering results.",
         "properties": {
           "min_cluster_size": {
@@ -2294,6 +2415,7 @@
       "description": "Find knowledge clusters relevant to a query using vector search over cluster centroids.\nEach cluster is a labelled group of closely-related entities. Use this to discover which areas of the\nknowledge base are most relevant to a topic.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Find knowledge clusters relevant to a query using vector search over cluster centroids.\nEach cluster is a labelled group of closely-related entities. Use this to discover which areas of the\nknowledge base are most relevant to a topic.",
         "properties": {
           "query": {
@@ -2341,6 +2463,7 @@
       "description": "Search the knowledge graph for named entities (people, organizations, concepts,\ntechnologies, locations, events, products, standards, regulations).\nUses text matching with automatic semantic embedding fallback for broader coverage.\nReturns entity IDs, names, and types. Use the IDs with noo_graph_entity_detail,\nnoo_graph_neighbors, or noo_graph_traverse_with_intent for deeper exploration.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Search the knowledge graph for named entities (people, organizations, concepts,\ntechnologies, locations, events, products, standards, regulations).\nUses text matching with automatic semantic embedding fallback for broader coverage.\nReturns entity IDs, names, and types. Use the IDs with noo_graph_entity_detail,\nnoo_graph_neighbors, or noo_graph_traverse_with_intent for deeper exploration.",
         "properties": {
           "query": {
@@ -2386,6 +2509,7 @@
       "description": "Search entities by meaning using graph-aware vector embeddings.\nUnlike noo_graph_search_entities (text matching), this finds conceptually\nsimilar entities even when names don't match -- e.g. searching 'parallel computing'\ncan find 'MPI', 'OpenMP', 'threading'. Requires entity embeddings to be computed.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Search entities by meaning using graph-aware vector embeddings.\nUnlike noo_graph_search_entities (text matching), this finds conceptually\nsimilar entities even when names don't match -- e.g. searching 'parallel computing'\ncan find 'MPI', 'OpenMP', 'threading'. Requires entity embeddings to be computed.",
         "properties": {
           "query": {
@@ -2431,6 +2555,7 @@
       "description": "Get knowledge graph statistics: total entities, edges,\nentity types, and document coverage.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Get knowledge graph statistics: total entities, edges,\nentity types, and document coverage.",
         "properties": {},
         "title": "PaiGraphStats",
@@ -2454,6 +2579,7 @@
       "description": "Walk the graph from a single entity, preferring edges relevant to the stated\n    intent (for example 'causal' or 'definitional'). Unlike noo_graph_neighbors,\n    which treats every edge alike, this favours the edges that matter for the\n    intent. Returns scored entities with traversal paths.\n\nLong-running: this starts an operation and waits a few seconds. If it finished you get the result; if not you get a handle {op_id, status, poll} -- call noo_op_status with that op_id (wait up to 25 seconds per call) until status is succeeded or failed. noo_op_cancel stops the gateway-side wait (the worker run itself may continue).",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Walk the graph from a single entity, preferring edges relevant to the stated\nintent (for example 'causal' or 'definitional'). Unlike noo_graph_neighbors,\nwhich treats every edge alike, this favours the edges that matter for the\nintent. Returns scored entities with traversal paths.",
         "properties": {
           "entity_id": {
@@ -2507,6 +2633,7 @@
       "description": "Lower-level: create a heartbeat task with explicit action enum, cron, and config.\n\nPrefer `noo_schedule_task` for natural-language requests \u2014 it does the\ntranslation work and verifies the row landed. Use this only when you\nneed full control (custom action, hand-tuned cron, custom config block).\n\nA task that DELETES data (a retention or cleanup job, `memory_cleanup`,\n`graph_prune` or `entity_cleanup` with `apply`, ...) is not created or\nchanged by this call: it becomes a PROPOSAL for the operator, and a\nperson approves it (`noo heartbeat approve <proposal-id>`). The answer\nsays `proposal: true, task_created: false`. Enabling such a task is a\nproposal too; disabling or deleting one is allowed. Research, reports,\ndigests, previews and dry runs are created directly.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Lower-level: create a heartbeat task with explicit action enum, cron, and config.\n\nPrefer `noo_schedule_task` for natural-language requests \u2014 it does the\ntranslation work and verifies the row landed. Use this only when you\nneed full control (custom action, hand-tuned cron, custom config block).\n\nA task that DELETES data (a retention or cleanup job, `memory_cleanup`,\n`graph_prune` or `entity_cleanup` with `apply`, ...) is not created or\nchanged by this call: it becomes a PROPOSAL for the operator, and a\nperson approves it (`noo heartbeat approve <proposal-id>`). The answer\nsays `proposal: true, task_created: false`. Enabling such a task is a\nproposal too; disabling or deleting one is allowed. Research, reports,\ndigests, previews and dry runs are created directly.",
         "properties": {
           "action": {
@@ -2621,6 +2748,7 @@
       "description": "Delete a scheduled heartbeat task.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Delete a scheduled heartbeat task.",
         "properties": {
           "task_id": {
@@ -2654,6 +2782,7 @@
       "description": "Retrieve heartbeat task artifacts (generated reports, logs) by path.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Retrieve heartbeat task artifacts (generated reports, logs) by path.",
         "properties": {
           "path": {
@@ -2685,6 +2814,7 @@
       "description": "List available heartbeat actions (daily_briefing, cluster_health, etc.).",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List available heartbeat actions (daily_briefing, cluster_health, etc.).",
         "properties": {},
         "title": "PaiHeartbeatListActions",
@@ -2707,6 +2837,7 @@
       "description": "List all scheduled heartbeat tasks with their schedules and enabled state.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List all scheduled heartbeat tasks with their schedules and enabled state.",
         "properties": {},
         "title": "PaiHeartbeatListTasks",
@@ -2729,6 +2860,7 @@
       "description": "Manually trigger a heartbeat task to run immediately.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Manually trigger a heartbeat task to run immediately.",
         "properties": {
           "task_id": {
@@ -2760,6 +2892,7 @@
       "description": "Get heartbeat scheduler status: running state, task count, next run times.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Get heartbeat scheduler status: running state, task count, next run times.",
         "properties": {},
         "title": "PaiHeartbeatStatus",
@@ -2783,6 +2916,7 @@
       "description": "View execution history for heartbeat tasks.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "View execution history for heartbeat tasks.",
         "properties": {
           "limit": {
@@ -2832,6 +2966,7 @@
       "description": "Enable or disable a scheduled heartbeat task.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Enable or disable a scheduled heartbeat task.",
         "properties": {
           "enabled": {
@@ -2869,6 +3004,7 @@
       "description": "Run a prompt through the cluster inference pipeline. Automatically resolves\na backend (local-first, cloud fallback). Returns the model's response text.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Run a prompt through the cluster inference pipeline. Automatically resolves\na backend (local-first, cloud fallback). Returns the model's response text.",
         "properties": {
           "backend": {
@@ -2978,6 +3114,7 @@
       "description": "Cancel a pending or running job. A user-tier account can cancel only jobs its own\naccount submitted.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Cancel a pending or running job. A user-tier account can cancel only jobs its own\naccount submitted.",
         "properties": {
           "job_id": {
@@ -3010,6 +3147,7 @@
       "description": "Retrieve completed job history (most recent first).",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Retrieve completed job history (most recent first).",
         "properties": {
           "limit": {
@@ -3046,6 +3184,7 @@
       "description": "List all jobs in the scheduler queue (pending, running, completed).",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List all jobs in the scheduler queue (pending, running, completed).",
         "properties": {},
         "title": "PaiJobList",
@@ -3069,6 +3208,7 @@
       "description": "Change the priority of a pending job.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Change the priority of a pending job.",
         "properties": {
           "job_id": {
@@ -3106,6 +3246,7 @@
       "description": "Get the status of a specific job by ID.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Get the status of a specific job by ID.",
         "properties": {
           "job_id": {
@@ -3138,6 +3279,7 @@
       "description": "Submit a job to the distributed scheduler. Returns a job_id to track with\nnoo_job_status. Use force_node to pin the job to one specific node; leave it\nunset to let the scheduler place it on the least-loaded eligible node.\n\nA user-tier account (the user door) may submit type \"inference\" only, with an\nobject payload up to 64 KiB; force_node is refused, priority is capped at 5,\ntimeout_sec at 600, and submits are limited to 30 per hour per account.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Submit a job to the distributed scheduler. Returns a job_id to track with\nnoo_job_status. Use force_node to pin the job to one specific node; leave it\nunset to let the scheduler place it on the least-loaded eligible node.\n\nA user-tier account (the user door) may submit type \"inference\" only, with an\nobject payload up to 64 KiB; force_node is refused, priority is capped at 5,\ntimeout_sec at 600, and submits are limited to 30 per hour per account.",
         "properties": {
           "backend": {
@@ -3238,6 +3380,7 @@
       "description": "Recent warnings + errors across the fleet (or one node / container),\noldest first. From Loki when it is up (`level` error|warn over every\nshipped stream) or, when it is not, a scan of the PAI containers'\nrecent output through the node-agents \u2014 the answer says which. Use this\nfirst when diagnosing 'something just broke'.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Recent warnings + errors across the fleet (or one node / container),\noldest first. From Loki when it is up (`level` error|warn over every\nshipped stream) or, when it is not, a scan of the PAI containers'\nrecent output through the node-agents \u2014 the answer says which. Use this\nfirst when diagnosing 'something just broke'.",
         "properties": {
           "container": {
@@ -3357,6 +3500,7 @@
       "description": "Search the fleet's logs in Loki by node, name, source, level, time\nwindow and free text \u2014 'what happened on host3 at 14:02' is\nnode='host3', since='2026-09-28T14:00:00Z', until='2026-09-28T14:05:00Z';\n'every error in the last hour' is level='error', since='1h'. The\ngateway builds the LogQL from these fields; `text` is a plain substring\nfilter, not a regex and not LogQL. Loki-only: when Loki is down this\ntool fails with the reason rather than answering from a partial scan \u2014\nuse noo_logs_errors / noo_logs_tail for that.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Search the fleet's logs in Loki by node, name, source, level, time\nwindow and free text \u2014 'what happened on host3 at 14:02' is\nnode='host3', since='2026-09-28T14:00:00Z', until='2026-09-28T14:05:00Z';\n'every error in the last hour' is level='error', since='1h'. The\ngateway builds the LogQL from these fields; `text` is a plain substring\nfilter, not a regex and not LogQL. Loki-only: when Loki is down this\ntool fails with the reason rather than answering from a partial scan \u2014\nuse noo_logs_errors / noo_logs_tail for that.",
         "properties": {
           "container": {
@@ -3500,6 +3644,7 @@
       "description": "Tail the last N log lines of one container or host unit, oldest first.\nFrom Loki when it is up (any node, any retained history) or, when it is\nnot, that container's `docker logs` through its node-agent \u2014 the answer\nsays which. Use to inspect a service's recent activity without asking\nthe user to paste logs.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Tail the last N log lines of one container or host unit, oldest first.\nFrom Loki when it is up (any node, any retained history) or, when it is\nnot, that container's `docker logs` through its node-agent \u2014 the answer\nsays which. Use to inspect a service's recent activity without asking\nthe user to paste logs.",
         "properties": {
           "container": {
@@ -3622,6 +3767,7 @@
       "description": "Unified health check across conversation memory, PageIndex, knowledge graph,\nrecall memory. Returns A-F grade per subsystem.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Unified health check across conversation memory, PageIndex, knowledge graph,\nrecall memory. Returns A-F grade per subsystem.",
         "properties": {},
         "title": "PaiMemoryHealth",
@@ -3645,6 +3791,7 @@
       "description": "Search conversation memory for past interactions. Returns semantically\nsimilar conversations ranked by relevance. Use this for recalling previous\nchats, decisions, and context \u2014 NOT for document/knowledge base queries.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Search conversation memory for past interactions. Returns semantically\nsimilar conversations ranked by relevance. Use this for recalling previous\nchats, decisions, and context \u2014 NOT for document/knowledge base queries.",
         "properties": {
           "query": {
@@ -3683,6 +3830,7 @@
       "description": "Discover what Prometheus holds, so a query can be written. With no\n`label`, lists metric names; with `label` (for example 'job', 'instance',\n'node_id'), lists that label's values. `selector` narrows the lookup to\nmatching series (e.g. '{job=\"node\"}'), `prefix` keeps names starting with\nit (e.g. 'noo_'). Sorted, at most 500 returned; `truncated` says when\nmore exist.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Discover what Prometheus holds, so a query can be written. With no\n`label`, lists metric names; with `label` (for example 'job', 'instance',\n'node_id'), lists that label's values. `selector` narrows the lookup to\nmatching series (e.g. '{job=\"node\"}'), `prefix` keeps names starting with\nit (e.g. 'noo_'). Sorted, at most 500 returned; `truncated` says when\nmore exist.",
         "properties": {
           "label": {
@@ -3761,6 +3909,7 @@
       "description": "Run a PromQL query against the cluster's Prometheus \u2014 the same data\nGrafana shows. Examples: 'up' (what's scraped), 'node_load1' (load),\n'DCGM_FI_DEV_GPU_TEMP or nvidia_smi_temperature_gpu' (GPU temp),\n'rate(http_requests_total[5m])'. Use for 'why is X slow?' questions\nwhere instantaneous status isn't enough.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Run a PromQL query against the cluster's Prometheus \u2014 the same data\nGrafana shows. Examples: 'up' (what's scraped), 'node_load1' (load),\n'DCGM_FI_DEV_GPU_TEMP or nvidia_smi_temperature_gpu' (GPU temp),\n'rate(http_requests_total[5m])'. Use for 'why is X slow?' questions\nwhere instantaneous status isn't enough.",
         "properties": {
           "query": {
@@ -3806,6 +3955,7 @@
       "description": "Run a PromQL range query against the cluster's Prometheus \u2014 the\ntime series behind a Grafana panel. Give a PromQL `query`, a `start` and\n`end` (RFC3339 or unix seconds) and a `step` (seconds or '30s', '5m').\nRefused above 11000 points per series (widen `step`); at most 100 series\ncome back and `truncated` says when more matched. Example: query\n'node_load1', start '2026-01-01T00:00:00Z', end '2026-01-01T06:00:00Z',\nstep '5m'. Use for 'what happened over the last hours?' questions.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Run a PromQL range query against the cluster's Prometheus \u2014 the\ntime series behind a Grafana panel. Give a PromQL `query`, a `start` and\n`end` (RFC3339 or unix seconds) and a `step` (seconds or '30s', '5m').\nRefused above 11000 points per series (widen `step`); at most 100 series\ncome back and `truncated` says when more matched. Example: query\n'node_load1', start '2026-01-01T00:00:00Z', end '2026-01-01T06:00:00Z',\nstep '5m'. Use for 'what happened over the last hours?' questions.",
         "properties": {
           "end": {
@@ -3856,6 +4006,7 @@
       "description": "Mint a single-use enrollment token for adding a machine to the mesh and\nreturn the ONE supported paste: step 1 `install_command` (installs the noo\nCLI on the new machine), step 2 `enroll_command` (`noo enroll noo1.<blob>`,\nrun on the new machine as its user; the blob carries the controller URL,\nthe token, the cluster-CA pin and, with with_tailscale, a pre-authorized\ntag:worker Tailscale key), then step 3 `provision_command`\n(`noo cluster provision <node> --wait`, run on the controller). The token\nis single-use, expires, and is bound to node_name. If the Tailscale key\ncannot be minted the call fails; retry with with_tailscale=false when the\nmachine already reaches the controller. Use when someone asks to add a\nmachine to the cluster.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Mint a single-use enrollment token for adding a machine to the mesh and\nreturn the ONE supported paste: step 1 `install_command` (installs the noo\nCLI on the new machine), step 2 `enroll_command` (`noo enroll noo1.<blob>`,\nrun on the new machine as its user; the blob carries the controller URL,\nthe token, the cluster-CA pin and, with with_tailscale, a pre-authorized\ntag:worker Tailscale key), then step 3 `provision_command`\n(`noo cluster provision <node> --wait`, run on the controller). The token\nis single-use, expires, and is bound to node_name. If the Tailscale key\ncannot be minted the call fails; retry with with_tailscale=false when the\nmachine already reaches the controller. Use when someone asks to add a\nmachine to the cluster.",
         "properties": {
           "node_name": {
@@ -3907,6 +4058,7 @@
       "description": "DEPRECATED alias of noo_mint_bootstrap_token \u2014 same tool, old name.\nThe join-key lane it was named for is retired; this mints a bootstrap\ntoken for the pull rail exactly as noo_mint_bootstrap_token does. Kept for\none release so an external client calling the old name keeps working;\nmove to noo_mint_bootstrap_token.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "DEPRECATED alias of noo_mint_bootstrap_token \u2014 same tool, old name.\nThe join-key lane it was named for is retired; this mints a bootstrap\ntoken for the pull rail exactly as noo_mint_bootstrap_token does. Kept for\none release so an external client calling the old name keeps working;\nmove to noo_mint_bootstrap_token.",
         "properties": {
           "node_name": {
@@ -3958,6 +4110,7 @@
       "description": "List models currently cached on cluster nodes (downloaded and ready to load).",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List models currently cached on cluster nodes (downloaded and ready to load).",
         "properties": {},
         "title": "PaiModelsCached",
@@ -3980,6 +4133,7 @@
       "description": "Pull (download) a model to a cluster node so it is cached and ready for inference.\nIf node_id is omitted, the scheduler picks the best available node.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Pull (download) a model to a cluster node so it is cached and ready for inference.\nIf node_id is omitted, the scheduler picks the best available node.",
         "properties": {
           "backend": {
@@ -4037,6 +4191,7 @@
       "description": "Cancel an operation you started.\n\nStops the gateway-side wait and marks it cancelled. It does NOT stop a worker run that has\nalready begun: the answer says what the worker will do (`cancel.worker_stopped` is false).",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Cancel an operation you started.\n\nStops the gateway-side wait and marks it cancelled. It does NOT stop a worker run that has\nalready begun: the answer says what the worker will do (`cancel.worker_stopped` is false).",
         "properties": {
           "op_id": {
@@ -4068,6 +4223,7 @@
       "description": "List your operations, newest first (no results; fetch one with noo_op_status).",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List your operations, newest first (no results; fetch one with noo_op_status).",
         "properties": {
           "limit": {
@@ -4133,6 +4289,7 @@
       "description": "Start a long-running operation and get its id immediately; poll it with noo_op_status.\n\n`type` is one of: graph.recluster, graph.extract_relations, snapshots.consolidate,\ngraph.navigate, graph.traverse, rag.ingest, docs.ingest. `params` is exactly the body the\ntype's own tool takes (e.g. {\"query\": \"...\"} for graph.navigate). You are held to the same\npermissions as that tool. Answers at once with {op_id, status, poll, poll_interval_ms}; it\nnever waits for the result.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Start a long-running operation and get its id immediately; poll it with noo_op_status.\n\n`type` is one of: graph.recluster, graph.extract_relations, snapshots.consolidate,\ngraph.navigate, graph.traverse, rag.ingest, docs.ingest. `params` is exactly the body the\ntype's own tool takes (e.g. {\"query\": \"...\"} for graph.navigate). You are held to the same\npermissions as that tool. Answers at once with {op_id, status, poll, poll_interval_ms}; it\nnever waits for the result.",
         "properties": {
           "params": {
@@ -4177,6 +4334,7 @@
       "description": "Status, progress and (once finished) the result or error of an operation.\n\n`wait` (seconds, at most 25) holds the call until the operation finishes or the time is up, so\nyou can wait without polling in a loop. status is queued, running, succeeded, failed, cancelled\nor expired; a finished operation carries `result` (or `error`). Only the account that started an\noperation can read it: any other id is \"not found\".",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Status, progress and (once finished) the result or error of an operation.\n\n`wait` (seconds, at most 25) holds the call until the operation finishes or the time is up, so\nyou can wait without polling in a loop. status is queued, running, succeeded, failed, cancelled\nor expired; a finished operation carries `result` (or `error`). Only the account that started an\noperation can read it: any other id is \"not found\".",
         "properties": {
           "op_id": {
@@ -4228,6 +4386,7 @@
       "description": "Create a new prompt skill template. It is data until a person promotes it.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Create a new prompt skill template. It is data until a person promotes it.",
         "properties": {
           "content": {
@@ -4300,6 +4459,7 @@
       "description": "Propose (or with apply=true, write) an LLM-evolved prompt skill from an observation. A written skill is data until a person promotes it.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Propose (or with apply=true, write) an LLM-evolved prompt skill from an observation. A written skill is data until a person promotes it.",
         "properties": {
           "apply": {
@@ -4369,6 +4529,7 @@
       "description": "Get a specific prompt skill by name, including its full content.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Get a specific prompt skill by name, including its full content.",
         "properties": {
           "skill_name": {
@@ -4400,6 +4561,7 @@
       "description": "List available prompt skills (evolved and core templates).",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List available prompt skills (evolved and core templates).",
         "properties": {},
         "title": "PaiPromptSkillsList",
@@ -4422,6 +4584,7 @@
       "description": "Ingest documents (PDF/MD/HTML/TXT/JSON/CSV/XML/code) into PageIndex.\n    Splits into pages, embeds, and indexes for RAG search.\n\nLong-running: this starts an operation and waits a few seconds. If it finished you get the result; if not you get a handle {op_id, status, poll} -- call noo_op_status with that op_id (wait up to 25 seconds per call) until status is succeeded or failed. noo_op_cancel stops the gateway-side wait (the worker run itself may continue).",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Ingest documents (PDF/MD/HTML/TXT/JSON/CSV/XML/code) into PageIndex.\nSplits into pages, embeds, and indexes for RAG search.",
         "properties": {
           "roles": {
@@ -4501,6 +4664,7 @@
       "description": "Answer a question using the PageIndex knowledge base (ingested documents).\nUses vector search + knowledge graph to find relevant pages, then synthesizes\nan answer with [Source N] citations. Strategies: 'hybrid' (default, best quality),\n'lookup' (fast vector-only), 'graph_first' (entity-centric).\nUse this for factual questions about ingested content \u2014 NOT for conversation history.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Answer a question using the PageIndex knowledge base (ingested documents).\nUses vector search + knowledge graph to find relevant pages, then synthesizes\nan answer with [Source N] citations. Strategies: 'hybrid' (default, best quality),\n'lookup' (fast vector-only), 'graph_first' (entity-centric).\nUse this for factual questions about ingested content \u2014 NOT for conversation history.",
         "properties": {
           "question": {
@@ -4556,6 +4720,7 @@
       "description": "Change which audience documents belong to (an access-control change). DRY-RUN unless\napply=true: the dry-run lists each matched document with its current audience (`from`)\nand the new one (`to`), writes nothing. Select with `match` (a glob on source_uri) and/or\n`doc_ids`. Documents that already have an audience are only changed with relabel=true.\nA document always has an audience: roles must be non-empty (use ['admin'] to make one\nadmin-only). Every applied retag is recorded on each document (audience_history) and in\nthe security audit log. Operator/admin only.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Change which audience documents belong to (an access-control change). DRY-RUN unless\napply=true: the dry-run lists each matched document with its current audience (`from`)\nand the new one (`to`), writes nothing. Select with `match` (a glob on source_uri) and/or\n`doc_ids`. Documents that already have an audience are only changed with relabel=true.\nA document always has an audience: roles must be non-empty (use ['admin'] to make one\nadmin-only). Every applied retag is recorded on each document (audience_history) and in\nthe security audit log. Operator/admin only.",
         "properties": {
           "apply": {
@@ -4659,6 +4824,7 @@
       "description": "Check PageIndex health: embedder state, doc/page/entity counts, unembedded items.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Check PageIndex health: embedder state, doc/page/entity counts, unembedded items.",
         "properties": {},
         "title": "PaiRagStatus",
@@ -4681,6 +4847,7 @@
       "description": "Trigger recall memory archival. Compresses active memory records into\nMP4-encoded video frames for long-term storage.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Trigger recall memory archival. Compresses active memory records into\nMP4-encoded video frames for long-term storage.",
         "properties": {},
         "title": "PaiRecallArchive",
@@ -4703,6 +4870,7 @@
       "description": "Run recall memory lifecycle management. Evaluates prominence scores,\ndemotes low-prominence records, and consolidates storage.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Run recall memory lifecycle management. Evaluates prominence scores,\ndemotes low-prominence records, and consolidates storage.",
         "properties": {},
         "title": "PaiRecallLifecycle",
@@ -4725,6 +4893,7 @@
       "description": "Preview recall memory lifecycle actions without executing them. Shows\nwhich records would be demoted, consolidated, or archived in a dry run.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Preview recall memory lifecycle actions without executing them. Shows\nwhich records would be demoted, consolidated, or archived in a dry run.",
         "properties": {},
         "title": "PaiRecallLifecyclePreview",
@@ -4747,6 +4916,7 @@
       "description": "Get recall memory lifecycle statistics: prominence distribution,\ndemotion counts, storage metrics, last run timestamps.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Get recall memory lifecycle statistics: prominence distribution,\ndemotion counts, storage metrics, last run timestamps.",
         "properties": {},
         "title": "PaiRecallLifecycleStats",
@@ -4770,6 +4940,7 @@
       "description": "Retrieve the most prominent recall memory records. Prominence is a\ncomposite score based on recency, quality, access frequency, and\ndurability. Useful for understanding what the system considers most\nsalient.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Retrieve the most prominent recall memory records. Prominence is a\ncomposite score based on recency, quality, access frequency, and\ndurability. Useful for understanding what the system considers most\nsalient.",
         "properties": {
           "top_k": {
@@ -4799,6 +4970,7 @@
       "description": "Refresh recall memory FAISS indices. Rebuilds search indices from the\nunderlying MP4 video files to ensure search consistency.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Refresh recall memory FAISS indices. Rebuilds search indices from the\nunderlying MP4 video files to ensure search consistency.",
         "properties": {},
         "title": "PaiRecallRefresh",
@@ -4821,6 +4993,7 @@
       "description": "Search recall memory (System 1 compressed semantic recall). Returns\nrecords stored as QR-encoded MP4 frames, ranked by prominence and\nrelevance. Use for fast associative recall of past knowledge.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Search recall memory (System 1 compressed semantic recall). Returns\nrecords stored as QR-encoded MP4 frames, ranked by prominence and\nrelevance. Use for fast associative recall of past knowledge.",
         "properties": {
           "query": {
@@ -4858,6 +5031,7 @@
       "description": "Check recall memory subsystem health: index count, total records,\nstorage size, and lifecycle state.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Check recall memory subsystem health: index count, total records,\nstorage size, and lifecycle state.",
         "properties": {},
         "title": "PaiRecallStatus",
@@ -4881,6 +5055,7 @@
       "description": "Perform recall traversals across recall memory indices. Walks the\nknowledge graph to find related memories using semantic proximity and\nentity co-occurrence. Returns traversal paths and the strategy used.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Perform recall traversals across recall memory indices. Walks the\nknowledge graph to find related memories using semantic proximity and\nentity co-occurrence. Returns traversal paths and the strategy used.",
         "properties": {
           "intent": {
@@ -4932,6 +5107,7 @@
       "description": "List all recall memory index files with sizes and metadata.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List all recall memory index files with sizes and metadata.",
         "properties": {},
         "title": "PaiRecallVideos",
@@ -4954,6 +5130,7 @@
       "description": "Show Postgres replication health: this controller's role\n(primary/standby), connected standbys with replay lag, and replication\nslot WAL retention (a dead standby's slot silently retains WAL \u2014 watch\nretained_wal). Use to answer 'is the standby in sync / is failover safe?'",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Show Postgres replication health: this controller's role\n(primary/standby), connected standbys with replay lag, and replication\nslot WAL retention (a dead standby's slot silently retains WAL \u2014 watch\nretained_wal). Use to answer 'is the standby in sync / is failover safe?'",
         "properties": {},
         "title": "PaiReplicationStatus",
@@ -4982,6 +5159,7 @@
       "description": "CREATE a recurring scheduled task \u2014 does NOT run it immediately.\n\nUse for \"set up a recurring X\" / \"every day do Y\" / \"schedule Z weekly\".\nThe task is registered in the scheduler and fires at the cron time.\nTo ALSO run it once right now, pass run_immediately=true. To run an\nEXISTING task immediately, use noo_heartbeat_run_task instead.\n\nTakes plain English: human-readable `name`, what the task should\n`do`, and `when` to run it. Translates schedule phrases to cron and\nclassifies the action automatically. VERIFIES the row landed in the\nDB before returning success \u2014 refuses if the slugified id collides\nwith an existing task of a different name.\n\nExamples:\n    name=\"AI Agent Research\", do=\"deep research report on AI agents\", when=\"daily 8am\"\n    name=\"Weekly Cluster Check\", do=\"cluster health report\", when=\"every Monday 9am\"\n    name=\"Cost Watch\", do=\"cost report\", when=\"every 6 hours\", run_immediately=true\n\nSchedule phrases understood:\n  \"daily\", \"daily 8am\", \"weekly\", \"every Monday 9am\",\n  \"hourly\", \"every 6 hours\", \"every 15 minutes\",\n  or a 5-field cron expression like \"0 8 * * *\".\n\nA task that DELETES data (e.g. \"memory cleanup\") is not created: it\nbecomes a PROPOSAL for the operator to approve, and the answer says so\n(`proposal: true, task_created: false`). Research, reports and checks\nare created directly.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "CREATE a recurring scheduled task \u2014 does NOT run it immediately.\n\nUse for \"set up a recurring X\" / \"every day do Y\" / \"schedule Z weekly\".\nThe task is registered in the scheduler and fires at the cron time.\nTo ALSO run it once right now, pass run_immediately=true. To run an\nEXISTING task immediately, use noo_heartbeat_run_task instead.\n\nTakes plain English: human-readable `name`, what the task should\n`do`, and `when` to run it. Translates schedule phrases to cron and\nclassifies the action automatically. VERIFIES the row landed in the\nDB before returning success \u2014 refuses if the slugified id collides\nwith an existing task of a different name.\n\nExamples:\n    name=\"AI Agent Research\", do=\"deep research report on AI agents\", when=\"daily 8am\"\n    name=\"Weekly Cluster Check\", do=\"cluster health report\", when=\"every Monday 9am\"\n    name=\"Cost Watch\", do=\"cost report\", when=\"every 6 hours\", run_immediately=true\n\nSchedule phrases understood:\n  \"daily\", \"daily 8am\", \"weekly\", \"every Monday 9am\",\n  \"hourly\", \"every 6 hours\", \"every 15 minutes\",\n  or a 5-field cron expression like \"0 8 * * *\".\n\nA task that DELETES data (e.g. \"memory cleanup\") is not created: it\nbecomes a PROPOSAL for the operator to approve, and the answer says so\n(`proposal: true, task_created: false`). Research, reports and checks\nare created directly.",
         "properties": {
           "channel": {
@@ -5064,6 +5242,7 @@
       "description": "Drain a node \u2014 finish running jobs but accept no new ones.\nUse before maintenance or decommissioning a node.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Drain a node \u2014 finish running jobs but accept no new ones.\nUse before maintenance or decommissioning a node.",
         "properties": {
           "node_id": {
@@ -5095,6 +5274,7 @@
       "description": "Pause the scheduler \u2014 no new jobs will be dispatched until resumed.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Pause the scheduler \u2014 no new jobs will be dispatched until resumed.",
         "properties": {},
         "title": "PaiSchedulerPause",
@@ -5116,6 +5296,7 @@
       "description": "Resume a paused scheduler \u2014 job dispatching will restart.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Resume a paused scheduler \u2014 job dispatching will restart.",
         "properties": {},
         "title": "PaiSchedulerResume",
@@ -5137,6 +5318,7 @@
       "description": "Get scheduler status: running/paused state, queue depth, active jobs.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Get scheduler status: running/paused state, queue depth, active jobs.",
         "properties": {},
         "title": "PaiSchedulerStatus",
@@ -5160,6 +5342,7 @@
       "description": "Undrain a node \u2014 allow the scheduler to dispatch jobs to it again.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Undrain a node \u2014 allow the scheduler to dispatch jobs to it again.",
         "properties": {
           "node_id": {
@@ -5191,6 +5374,7 @@
       "description": "Compare two snapshots \u2014 what crystallized between consolidation cycles.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Compare two snapshots \u2014 what crystallized between consolidation cycles.",
         "properties": {
           "snapshot_a": {
@@ -5229,6 +5413,7 @@
       "description": "List recent snapshots, optionally filtered by kind or status.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List recent snapshots, optionally filtered by kind or status.",
         "properties": {
           "kind": {
@@ -5287,6 +5472,7 @@
       "description": "Advise what inference backend a node's HARDWARE can run \u2014 given a\ncapability manifest (os, gpu_api, vram_gb, \u2026), returns the recommended\nbackend + launch mode + reason, and what is NOT viable (e.g. vLLM needs\nan NVIDIA CUDA GPU; a Mac's Metal GPU can't be used from a container).\nRead-only guidance \u2014 use before proposing a model/backend for a node,\nor to answer 'what could this machine run?'. Does not change anything.\nPass node_id (and optionally with={backend, model, role, env}) to also get\n`fit`: whether that node's placements fit its memory, the same verdict\n`noo cluster fit` prints.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Advise what inference backend a node's HARDWARE can run \u2014 given a\ncapability manifest (os, gpu_api, vram_gb, \u2026), returns the recommended\nbackend + launch mode + reason, and what is NOT viable (e.g. vLLM needs\nan NVIDIA CUDA GPU; a Mac's Metal GPU can't be used from a container).\nRead-only guidance \u2014 use before proposing a model/backend for a node,\nor to answer 'what could this machine run?'. Does not change anything.\nPass node_id (and optionally with={backend, model, role, env}) to also get\n`fit`: whether that node's placements fit its memory, the same verdict\n`noo cluster fit` prints.",
         "properties": {
           "arch": {
@@ -5393,6 +5579,7 @@
       "description": "Search available PAI tools by keyword. Returns matching tool names and descriptions.\nUse this to discover which tools are available for a task.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Search available PAI tools by keyword. Returns matching tool names and descriptions.\nUse this to discover which tools are available for a task.",
         "properties": {
           "max_results": {
@@ -5437,6 +5624,7 @@
       "description": "List user-management proposals and their status (pending, approved,\ndenied, failed). Use to check whether a requested account change has\nbeen approved yet.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List user-management proposals and their status (pending, approved,\ndenied, failed). Use to check whether a requested account change has\nbeen approved yet.",
         "properties": {},
         "title": "PaiUserProposals",
@@ -5460,6 +5648,7 @@
       "description": "Request a user-account change (create user, change scopes,\ndisable/enable, grant KB roles) for HUMAN APPROVAL. Nothing happens\nuntil an operator approves in the dashboard. Never include a\npassword \u2014 one is generated at approval time. Use when someone asks\nto add a user, give someone access, or change what a user can see.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Request a user-account change (create user, change scopes,\ndisable/enable, grant KB roles) for HUMAN APPROVAL. Nothing happens\nuntil an operator approves in the dashboard. Never include a\npassword \u2014 one is generated at approval time. Use when someone asks\nto add a user, give someone access, or change what a user can see.",
         "properties": {
           "action": {
@@ -5515,6 +5704,7 @@
       "description": "Recall YOUR OWN saved graph threads: the knowledge-graph walks your past\nquestions followed, saved automatically when you are signed in (turn saving\noff per account with `noo walks settings --save off`). With a query, returns\nthe threads nearest it, re-checked against the graph today: a walk through\nsomething you can no longer read, an edge that was removed, a deleted\ndocument or a superseded fact is dropped, never served stale. Without a\nquery, your most recent threads. Only ever your own, verbatim; never\nanother user's.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Recall YOUR OWN saved graph threads: the knowledge-graph walks your past\nquestions followed, saved automatically when you are signed in (turn saving\noff per account with `noo walks settings --save off`). With a query, returns\nthe threads nearest it, re-checked against the graph today: a walk through\nsomething you can no longer read, an edge that was removed, a deleted\ndocument or a superseded fact is dropped, never served stale. Without a\nquery, your most recent threads. Only ever your own, verbatim; never\nanother user's.",
         "properties": {
           "query": {
@@ -5558,6 +5748,7 @@
       "description": "COUNTS of users' saved graph threads (by kind and status, per account, and\nhow many accounts turned saving off). Operator door only. Counts never\ninclude a question, a path or an entity name: reading what a user asked is\nthe Admin-only, audited view.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "COUNTS of users' saved graph threads (by kind and status, per account, and\nhow many accounts turned saving off). Operator door only. Counts never\ninclude a question, a path or an entity name: reading what a user asked is\nthe Admin-only, audited view.",
         "properties": {
           "user": {
@@ -5595,6 +5786,7 @@
       "description": "List available predefined workflows.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List available predefined workflows.",
         "properties": {},
         "title": "PaiWorkflowList",
@@ -5616,6 +5808,7 @@
       "description": "Run a predefined workflow by name with optional inputs.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Run a predefined workflow by name with optional inputs.",
         "properties": {
           "inputs": {
@@ -5660,6 +5853,7 @@
       "description": "List Docker container states + healthchecks for the whole noomesh stack.\nReturns container name, status (running/restarting/exited/created),\nhealth (healthy/unhealthy/starting), and uptime. Use to verify the\ncluster is up before debugging deeper.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List Docker container states + healthchecks for the whole noomesh stack.\nReturns container name, status (running/restarting/exited/created),\nhealth (healthy/unhealthy/starting), and uptime. Use to verify the\ncluster is up before debugging deeper.",
         "properties": {},
         "title": "PaiMeshStatus",

@@ -354,7 +354,7 @@ empty values and for the **published placeholders** (`changeme`, `admin`,
 the **audit key** (`NOO_AUDIT_HMAC_KEY` missing is CRITICAL: the gateway
 refuses to start without it); **mTLS enforcement** judged on its effective
 value (explicitly off, or no cluster CA, is HIGH); an explicit `NOO_CSP=0`/`off`
-(MEDIUM; CSP is opt-in); the env-only hatches `NOO_SELF_CALL_SHARED_SECRET`,
+(MEDIUM; CSP is opt-in); the env-only hatches
 `NOO_NATS_ALLOW_ANONYMOUS` and `NOO_ALLOW_LOCAL_PYTHON_EXEC` (HIGH each);
 the gateway's running **exec approval mode** when it is neither `strict` nor
 `approval` (HIGH; a not-yet-restarted `auto` row is MEDIUM);
@@ -463,6 +463,17 @@ the lock. The layout both locks are published in is in
 | `noo security tailnet policy` | `[--merge \| --push] [--yes]` | Compare live tailnet policy to declared; --merge adds what is missing, --push replaces |
 | `noo security audit verify` | — | Verify audit hashes, the chain, and its head against the exported head (operator-only) |
 | `noo security audit list` | `[--since <30m\|24h\|7d\|time>] [--event <type>] [--actor <name>] [-n <limit>] [--cursor <c>]` | List security audit rows, newest first, with source address (operator-only) |
+| `noo security at-rest status` | `[--json]` | Show TPM facts, how to enable one, and your recorded at-rest encryption decision |
+| `noo security at-rest opt-out` | — | Record that you accept unencrypted data at rest (audited; needs your own login) |
+| `noo security at-rest opt-in` | — | Withdraw the at-rest opt-out (audited; needs your own login) |
+| `noo security at-rest create-volume` | `[--size <GiB>] [--pcrs 7\|none\|auto] [--defer-recovery-key] [--dry-run]` | Create the TPM-unlocked encrypted state volume; shows its recovery key once |
+| `noo security at-rest seal` | `[--pcrs 7\|none\|auto] [--dry-run]` | Seal the age key to this TPM; unsealed into RAM at boot, plaintext kept until finalize |
+| `noo security at-rest finalize` | `[--dry-run] [-y\|--yes]` | Remove the plaintext age key once a reboot unsealed it and a fresh backup decrypts |
+| `noo security at-rest migrate` | `[--dry-run] [--rollback] [--yes] [--confirm-offbox <phrase>]` | Move this controller's state onto the encrypted volume: backup first, reversible |
+| `noo security at-rest wipe-plaintext` | `[--dry-run] [--hours <N>] [--confirm <phrase>]` | Delete the old plaintext state after a verified migration and a day of healthy running |
+| `noo security at-rest recovery-key` | `[--dry-run]` | Enroll a new recovery key, shown once; the old one is removed only after you confirm |
+| `noo security at-rest reenroll` | `[--pcrs 7\|none\|auto] [--dry-run]` | Re-enroll the TPM after a firmware or Secure Boot change and reseal the age key |
+| `noo security at-rest preflight-firmware` | `[--json]` | Before a BIOS or firmware update: check the recovery key and a fresh backup |
 | `noo security posture list` | — | List security posture gates: running vs desired value (operator-only) |
 | `noo security posture set` | `<key> <value>` | Set a posture gate; needs an operator cert (`pki issue-client`); restart to apply |
 | `noo security posture apply-profile` | `<profile> [--include-bridges]` | Apply a posture profile (needs an operator cert); leaves rollout bridges; restart to apply |
