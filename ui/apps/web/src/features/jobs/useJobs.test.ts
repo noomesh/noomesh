@@ -18,7 +18,7 @@ vi.mock('@metis/core', () => ({
   },
 }));
 
-import { useSchedulerStatus, type SchedulerStatus } from './useJobs';
+import { useSchedulerStatus, refusalMessage, type SchedulerStatus } from './useJobs';
 
 beforeEach(() => H.get.mockReset());
 
@@ -39,5 +39,27 @@ describe('useSchedulerStatus — unreported is null, never 0', () => {
     useSchedulerStatus();
     const d = await (H.lastQuery.current!.queryFn as () => Promise<SchedulerStatus>)();
     expect([d.queued, d.running, d.clients]).toEqual([0, 0, 0]);
+  });
+});
+
+describe('a Redis outage', () => {
+  it('shows the gateway sentence and the retry, not the machine code', () => {
+    const body = { error: 'redis_reconnecting', detail: 'Redis not connected: retry shortly', retry_after_secs: 5 };
+    expect(refusalMessage(body, 'Jobs API unavailable')).toBe('Redis not connected: retry shortly Retry in 5s.');
+  });
+
+  it('falls back when the body carries no detail', () => {
+    expect(refusalMessage({ error: 'x' }, 'Cancel failed')).toBe('Cancel failed');
+    expect(refusalMessage(undefined, 'Cancel failed')).toBe('Cancel failed');
+  });
+
+  it('a null paused flag stays null, never false', async () => {
+    H.get.mockImplementation((p: string) =>
+      Promise.resolve({ data: p === '/api/scheduler/status' ? { paused: null, queue_depth: null } : {} }),
+    );
+    useSchedulerStatus();
+    const d = await (H.lastQuery.current!.queryFn as () => Promise<SchedulerStatus>)();
+    expect(d.paused).toBeNull();
+    expect(d.queued).toBeNull();
   });
 });

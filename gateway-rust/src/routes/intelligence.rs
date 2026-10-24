@@ -2316,17 +2316,11 @@ async fn autonomy_toggle_location(
 
 /// Write the global autonomy flag; 503 when the write did not happen.
 async fn set_autonomy_flag(state: &AppState, value: &str) -> Result<(), AppError> {
-    match state.redis.as_ref() {
-        Some(redis) => {
-            if redis.set_string("noo:autonomy:enabled", value).await {
-                Ok(())
-            } else {
-                Err(AppError::Unavailable("the autonomy flag could not be written to Redis; nothing changed".into()))
-            }
-        }
-        None => Err(AppError::Unavailable(
-            "Redis is not configured, so the autonomy flag cannot be set; nothing changed".into(),
-        )),
+    let redis = crate::redis_or_unavailable::redis_or_unavailable(state)?;
+    if redis.set_string("noo:autonomy:enabled", value).await {
+        Ok(())
+    } else {
+        Err(AppError::Unavailable("the autonomy flag could not be written to Redis; nothing changed".into()))
     }
 }
 

@@ -4318,6 +4318,23 @@ fn jobs_list_error_body_is_not_no_jobs_found() {
     );
 }
 
+/// The gateway's one answer to a Redis outage is 503 `redis_reconnecting`
+/// (never a 200 with an `error` key). The CLI prints the `detail` sentence and
+/// the retry, and exits non-zero (5, a gateway refusal) — not the raw JSON.
+#[test]
+fn jobs_list_redis_reconnecting_prints_detail_and_retry() {
+    let body = r#"{"error":"redis_reconnecting","detail":"Redis not connected: this needs the gateway's Redis client, which is not connected yet — retry shortly","retry_after_secs":5}"#;
+    let mock = Mock::start(503, "Service Unavailable", "application/json", body, 1);
+    let out = run(&["--gateway", &gw(mock.port), "jobs", "list"], &[]);
+    let _ = mock.requests();
+    assert_eq!(out.status.code(), Some(5));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Redis not connected: this needs"), "stderr: {stderr}");
+    assert!(stderr.contains("retry in 5s"), "stderr: {stderr}");
+    assert!(!stderr.contains("redis_reconnecting"), "machine code leaked: {stderr}");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("no jobs"));
+}
+
 /// `jobs history` reads the `history` key the route actually sends (it has
 /// never sent `jobs`, so the table used to be empty no matter what Redis held).
 #[test]

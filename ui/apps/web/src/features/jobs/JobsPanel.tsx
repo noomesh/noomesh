@@ -46,7 +46,8 @@ export function JobsPanel() {
 
   const rows = (jobs.data ?? []).filter((j) => !filter || j.status === filter);
   const cancellingId = cancel.isPending ? cancel.variables : undefined;
-  const paused = sched.data?.paused ?? false;
+  const pausedState = sched.data?.paused ?? null;
+  const paused = pausedState === true;
 
   async function onCancel(j: Job) {
     const ok = await confirm({
@@ -156,7 +157,7 @@ export function JobsPanel() {
       {sched.data && (
         <StatTiles
           tiles={[
-            { label: 'Scheduler', value: paused ? 'Paused' : 'Running', hot: paused },
+            { label: 'Scheduler', value: pausedState === null ? 'Not reported' : paused ? 'Paused' : 'Running', hot: paused },
             { label: 'Queued', value: dash(sched.data.queued) },
             { label: 'Running', value: dash(sched.data.running) },
             { label: 'Clients', value: dash(sched.data.clients) },

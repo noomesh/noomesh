@@ -1056,7 +1056,7 @@ pub fn post_bytes(
             g.json,
             ExitCode::RemoteError,
             "remote_error",
-            &format!("gateway returned {status} for {path}: {text}"),
+            &remote_error_message(status, path, &text),
             None,
         ),
     }
@@ -1133,7 +1133,7 @@ pub fn post_json_binary(
                 g.json,
                 ExitCode::RemoteError,
                 "remote_error",
-                &format!("gateway returned {status} for {path}: {text}"),
+                &remote_error_message(status, path, &text),
                 None,
             )
         }
@@ -1143,6 +1143,23 @@ pub fn post_json_binary(
 /// Shared request path. Auth/transport failures exit the process with the
 /// typed code — handlers only ever see a successful JSON body. Thin wrapper
 /// over `request_status` that maps every remaining non-2xx to exit 5.
+/// The sentence for a non-2xx answer. A gateway refusal that carries a
+/// `detail` (the 503 `redis_reconnecting` shape: `{"error": <code>,
+/// "detail": <sentence>, "retry_after_secs": N}`) is shown as that sentence
+/// plus the retry hint, never as the raw JSON glued onto the status.
+pub(crate) fn remote_error_message(status: u16, path: &str, text: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(text).ok();
+    if let Some(detail) = parsed.as_ref().and_then(|v| v["detail"].as_str()) {
+        let retry = parsed
+            .as_ref()
+            .and_then(|v| v["retry_after_secs"].as_u64())
+            .map(|n| format!(" — retry in {n}s"))
+            .unwrap_or_default();
+        return format!("gateway returned {status} for {path}: {detail}{retry}");
+    }
+    format!("gateway returned {status} for {path}: {text}")
+}
+
 fn request(
     g: &Globals,
     method: &str,
@@ -1157,7 +1174,7 @@ fn request(
             g.json,
             ExitCode::RemoteError,
             "remote_error",
-            &format!("gateway returned {status} for {path}: {text}"),
+            &remote_error_message(status, path, &text),
             None,
         ),
     }

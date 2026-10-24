@@ -175,6 +175,7 @@ mod operator_auth;
 mod log_gate;
 mod loop_health;
 mod measured;
+mod redis_or_unavailable;
 mod ops;
 mod erasure_archive;
 mod agent_roles;
