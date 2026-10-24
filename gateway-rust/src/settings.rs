@@ -96,10 +96,7 @@ pub fn spawn_refresh(db: sqlx::PgPool) {
     tokio::spawn(async move {
         let mut failing: u64 = 0;
         loop {
-            match sqlx::query_as::<_, (String, String)>("SELECT key, value FROM noo_settings")
-                .fetch_all(&db)
-                .await
-            {
+            match crate::repo::settings::all(&db).await {
                 Ok(rows) => {
                     if failing > 0 {
                         tracing::info!(
