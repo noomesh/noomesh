@@ -74,7 +74,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Auth
-jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_crypto", "use_pem"] }
+# The aws-lc-rs backend, not rust_crypto: rust_crypto signs ES256 through
+# p256 -> elliptic-curve -> crypto-bigint 0.5, whose constant-time arithmetic
+# is not (RUSTSEC-2026-0387; the fix is crypto-bigint 0.7, which p256 0.13
+# cannot take). This gateway holds long-lived ES256 private keys (the JWT
+# signing key, jwks.rs; the Grafana SSO key, routes/monitoring.rs), so a
+# timing leak in signing is the case that matters. aws-lc-rs is already the
+# process's rustls provider (main.rs), so no new C dependency comes with it.
+# Both backends accept only PKCS#8 EC keys (jsonwebtoken's PEM layer), so
+# key handling is unchanged.
+jsonwebtoken = { version = "11.1", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 hmac = "0.13"
 sha2 = "0.11"
 bcrypt = "0.17"
