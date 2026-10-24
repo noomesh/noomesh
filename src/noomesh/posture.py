@@ -41,7 +41,8 @@ POSTURE_KEYS = (
     # NATS principal; there is no bridge to hold open.)
     # (NOO_SELF_CALL_SHARED_SECRET, the shared-secret-buys-inference bridge,
     # was retired: the gateway refuses the inference surface to a shared
-    # secret outright. A stale row is an unknown key and is skipped.)
+    # secret outright. A stale row is a retired inert key: the gateway deletes
+    # it at a closed value and warns while it is set on.)
     # The v1 (replayable) cluster token bridge: open when unset, "0" refuses
     # it. Mirrors posture.rs; the parity test pins them together.
     "NOO_CLUSTER_TOKEN_V1",
