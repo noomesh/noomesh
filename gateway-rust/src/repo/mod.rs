@@ -109,7 +109,7 @@ mod ratchet {
     ///
     /// ```text
     /// (cd gateway-rust/src && grep -rc 'sqlx::query' . --include=*.rs \
-    ///    | grep -v '^\./repo/' | grep -v ':0$' | sed 's|^\./||' | sort)
+    ///    | sed 's|^\./||' | grep -v '^repo/' | grep -v ':0$' | sort)
     /// ```
     ///
     /// and paste the `file:count` pairs below, but ONLY after lowering counts:
@@ -164,18 +164,6 @@ mod ratchet {
     ("placement_stuck.rs", 1),
     ("posture.rs", 2),
     ("preflight.rs", 4),
-    ("repo/agent_messages.rs", 11),
-    ("repo/audit.rs", 14),
-    ("repo/cluster.rs", 8),
-    ("repo/graph.rs", 4),
-    ("repo/heartbeat.rs", 14),
-    ("repo/kb_grants.rs", 12),
-    ("repo/mod.rs", 3),
-    ("repo/prompt_skill_proposals.rs", 9),
-    ("repo/prompt_skills.rs", 1),
-    ("repo/settings.rs", 4),
-    ("repo/tasks.rs", 21),
-    ("repo/users.rs", 25),
     ("research_pipeline.rs", 1),
     ("role_capability.rs", 1),
     ("role_provision.rs", 7),
