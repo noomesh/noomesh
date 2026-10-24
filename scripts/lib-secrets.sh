@@ -443,8 +443,10 @@ _secret_compose_files() {
 #   <name> <SOURCE_VAR> <owner uid>
 # SOURCE_VAR is the `x-noo-source:` extension on the same entry (compose
 # ignores `x-` keys). OWNER is the uid every service that takes the secret
-# runs as, read from the services' own `uid:` (so the compose file is the one
-# home of that fact): the single non-zero uid among them, or 0 when only
+# runs as, read from the services' own `x-noo-uid:` on the entry (so the
+# compose file is the one home of that fact; it is an extension key, not
+# compose's `uid:`, which is Swarm-only and which Compose v5 warns about on
+# every start): the single non-zero uid among them, or 0 when only
 # root containers take it. A container running as root reads a file owned by
 # 65532 through the default CAP_DAC_OVERRIDE (tests/test_secret_rundir.py
 # holds: no root consumer of a shared secret drops it). Two different
@@ -458,12 +460,12 @@ _secret_file_plan() {
         insec && /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ { cur = $1; sub(/:$/, "", cur); next }
         insec && cur != "" && /^[[:space:]]+file:/ && /NOO_SECRET_RUNDIR/ { order[++n] = cur; next }
         insec && cur != "" && /^[[:space:]]+x-noo-source:/ { v = $2; gsub(/["\047]/, "", v); src[cur] = v; next }
-        !insec && /source:[[:space:]]*[A-Za-z0-9_.-]+/ && /uid:/ {
+        !insec && /source:[[:space:]]*[A-Za-z0-9_.-]+/ && /x-noo-uid:/ {
             line = $0
             match(line, /source:[[:space:]]*[A-Za-z0-9_.-]+/)
             s = substr(line, RSTART, RLENGTH); sub(/^source:[[:space:]]*/, "", s)
-            match(line, /uid:[[:space:]]*"?[0-9]+/)
-            u = substr(line, RSTART, RLENGTH); sub(/^uid:[[:space:]]*"?/, "", u)
+            match(line, /x-noo-uid:[[:space:]]*"?[0-9]+/)
+            u = substr(line, RSTART, RLENGTH); sub(/^x-noo-uid:[[:space:]]*"?/, "", u)
             if (u != "0") { if (nz[s] == "") nz[s] = u; else if (nz[s] != u) conflict[s] = 1 }
         }
         END {

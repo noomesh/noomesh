@@ -11,7 +11,7 @@ every launcher, noo-hostd and the wizard's compose wrapper run first) writes
 them. What this holds:
 
   * one file per declared secret, mode 0400, handed to the uid its consumers
-    run as (the `uid:` on the service entries is the one declaration);
+    run as (the `x-noo-uid:` on the service entries is the one declaration);
   * the directory is 0700, ours, and on tmpfs: anything else is REFUSED with
     the reason and the remedy, and nothing is written;
   * an unset secret is an EMPTY file (the bind source must exist);
@@ -125,7 +125,7 @@ def _expected_owners() -> dict[str, str]:
     for svc in p["services"].values():
         for s in svc.get("secrets") or []:
             if isinstance(s, dict):
-                uids.setdefault(s["source"], set()).add(str(s["uid"]))
+                uids.setdefault(s["source"], set()).add(str(s["x-noo-uid"]))
     out = {}
     for name in p["secrets"]:
         nz = uids.get(name, set()) - {"0"}
@@ -144,7 +144,7 @@ def test_every_declared_secret_is_a_0400_file_handed_to_its_consumers_uid(box: B
     for name in want:
         mode = stat.S_IMODE((box.rundir / name).stat().st_mode)
         assert mode == 0o400, f"{name}: {oct(mode)}"
-    # The owner each file is handed to is what the services' own `uid:` says.
+    # The owner each file is handed to is what the services' own `x-noo-uid:` says.
     handed = {}
     for line in box.log.read_text().splitlines():
         uid, tmpname = line.split()
@@ -273,8 +273,8 @@ def test_two_different_nonroot_owners_for_one_secret_is_refused(tmp_path: Path) 
     b = Box(tmp_path, compose_files=())
     (tmp_path / "docker-compose.cluster.yml").write_text(
         "services:\n"
-        "  a:\n    secrets:\n      - { source: x, target: x, uid: \"65532\", gid: \"65532\", mode: 0400 }\n"
-        "  b:\n    secrets:\n      - { source: x, target: x, uid: \"70\", gid: \"70\", mode: 0400 }\n"
+        "  a:\n    secrets:\n      - { source: x, target: x, x-noo-uid: \"65532\" }\n"
+        "  b:\n    secrets:\n      - { source: x, target: x, x-noo-uid: \"70\" }\n"
         "secrets:\n  x:\n    file: ${NOO_SECRET_RUNDIR:-/nonexistent/u}/x\n    x-noo-source: X_SECRET\n"
     )
     try:
@@ -322,7 +322,7 @@ def test_root_consumers_of_a_shared_secret_keep_dac_override() -> None:
     for name, svc in p.items():
         for s in svc.get("secrets") or []:
             if isinstance(s, dict):
-                by_secret.setdefault(s["source"], {}).setdefault(str(s["uid"]), set()).add(name)
+                by_secret.setdefault(s["source"], {}).setdefault(str(s["x-noo-uid"]), set()).add(name)
     checked = 0
     for secret, per_uid in by_secret.items():
         if "0" in per_uid and set(per_uid) - {"0"}:
