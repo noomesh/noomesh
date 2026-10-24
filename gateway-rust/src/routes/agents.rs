@@ -43,6 +43,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/agents/presence", get(presence_list))
         // who am I on this session — the address others message.
         .route("/api/agents/whoami", get(whoami))
+        // name this session (`<account>/<type>-<name>`) so others can address it.
+        .route("/api/agents/name", post(agent_name))
         .route("/api/agents/keys/{agent}", get(keys_get).put(keys_put))
         .route("/api/agents/keys/review", get(keys_review))
         .route("/api/agent/run", post(agent_run))
@@ -1794,6 +1796,41 @@ async fn whoami(
         "harness": who.harness,
         "privileged": who.privileged,
     })))
+}
+
+#[derive(Deserialize)]
+struct NameReq {
+    /// The session half of the new name; the type half stays the client's.
+    name: String,
+}
+
+/// POST /api/agents/name — give THIS MCP session a name its person chose:
+/// `{"name": "general"}` turns `owner/claude-x7k2qa` into
+/// `owner/claude-general`, the address other sessions then use. Only a
+/// session can be renamed: a bare account, a node or a service token has
+/// no session label to change (400). A name another live session of the
+/// account already holds is joined, not refused — a name is a mailbox
+/// (`mcp_session::rename`) — and `shared_with` says how many were there.
+async fn agent_name(
+    State(state): State<Arc<AppState>>,
+    requester: Option<Extension<RequesterCtx>>,
+    cluster: Option<Extension<ClusterNode>>,
+    Json(req): Json<NameReq>,
+) -> AppResult {
+    let who = caller(&requester, &cluster);
+    let Some(sub) = who.sub.as_deref() else {
+        return Err(AppError::BadRequest(format!("'{}' is not an MCP session; only a session has a name to set", who.label)));
+    };
+    let Some((account, old)) = sub.split_once(crate::auth::CONNECTION_SEP) else {
+        return Err(AppError::BadRequest(format!(
+            "'{sub}' is the account itself, not a session — call this through an MCP door session"
+        )));
+    };
+    let (label, shared_with) = crate::mcp_session::rename(&state.db, account, old, &req.name)
+        .await
+        .map_err(AppError::BadRequest)?;
+    let name = format!("{account}{}{label}", crate::auth::CONNECTION_SEP);
+    Ok(Json(json!({ "name": name, "account": account, "previous": sub, "shared_with": shared_with })))
 }
 
 #[derive(Deserialize)]
