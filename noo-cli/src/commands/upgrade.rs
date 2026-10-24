@@ -843,7 +843,7 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
         ) } {
             // Nodes on the rail pull their images from the controller's
             // store; rolling them on top of a failed stage strands them.
-            ui::close_failed(&err, Some("noo cluster stage-images --lock"));
+            ui::close_failed(&err, Some("noo cluster sync-images --stage-only --lock"));
             rc = 1;
             failed_stage = "nodes";
         } else {
@@ -4172,7 +4172,7 @@ fn lock_stage_verdict(failed: &[String], rail_nodes: &[String], force: bool) -> 
         return LockStageVerdict::Clean;
     }
     let what = format!(
-        "{} image(s) of this release failed to stage on the artifact rail: {}. Retry: `noo cluster stage-images --lock`",
+        "{} image(s) of this release failed to stage on the artifact rail: {}. Retry: `noo cluster sync-images --stage-only --lock`",
         failed.len(),
         failed.join("; "),
     );
@@ -4526,7 +4526,7 @@ mod tests {
         // Every node on legacy (the default this release): warn, roll.
         match lock_stage_verdict(&f, &[], false) {
             LockStageVerdict::Warn(m) => {
-                assert!(m.contains("reg/a/llamacpp:v1") && m.contains("noo cluster stage-images --lock"), "{m}");
+                assert!(m.contains("reg/a/llamacpp:v1") && m.contains("noo cluster sync-images --stage-only --lock"), "{m}");
                 assert!(m.contains("no online node runs NOO_IMAGE_SOURCE=rail"), "{m}");
             }
             other => panic!("legacy fleet must warn, not refuse: {other:?}"),

@@ -23,6 +23,7 @@ Retired in 0.6.12 (each still answers with its successor instead of "unknown com
 | `noo cluster mint-join-key` | `noo cluster invite` |
 | `noo cluster assign` | `noo jobs run <prompt> --node <node>` |
 | `noo cluster add-companion`, `add-monitor` | `noo enroll` on the device; the agent registers itself on its first heartbeat |
+| `noo cluster stage-images [--lock] [-i IMG]… [--arch a,b] [--all-images]` | `noo cluster sync-images --stage-only` with the same flags (`sync-images` is now the one image verb: without `--stage-only` the named nodes then pull) |
 | `noo proactive history` | `noo proactive status` (nothing records proactive firings) |
 
 `noo cluster desired <node>` is an alias of `noo cluster show <node>`; `show` ends with the desired config and placements.
@@ -777,8 +778,7 @@ drain_started, drained_at}`.
 | `noo cluster bootstrap-token revoke` | `<id>` | Revoke a bootstrap token by id (idempotent) |
 | `noo cluster bootstrap-token` | — | Print bootstrap-token subcommand usage (create, list, revoke) |
 | `noo cluster set-primary` | `[--to <target>] --promoted [-y\|--yes]` | Move the primary-controller role; promote Postgres on the target first, then --promoted |
-| `noo cluster sync-images` | `[<node>...] [-i\|--image <img>]... [--images <a,b>] [--restart\|--no-restart] [--all]` | Stage images on the artifact rail for each node's arch, then have its agent pull them |
-| `noo cluster stage-images` | `[--lock] [-i\|--image <img>]... [--arch <a,b>] [--all-images]` | Pull images with the controller's login and stage them on the artifact rail per fleet arch |
+| `noo cluster sync-images` | `[<node>...] [-i\|--image <img>]... [--images <a,b>] [--restart\|--no-restart] [--all] [--stage-only] [--lock] [--arch <a,b>] [--all-images]` | Stage images on the artifact rail, then nodes pull them (--stage-only: stage, no pull) |
 | `noo cluster upgrade-agents` | `[<node>...] [-y\|--yes]` | Restage node agents serially in signed bundles over the pull rail; asks to confirm (-y) |
 | `noo cluster upgrade-hostd` | `<node>... [--skip-build] [-y\|--yes\|--force]` | Roll noo-hostd to the named nodes over the pull rail as a signed bundle |
 | `noo cluster upgrade-applier` | `<node>... [-y\|--yes\|--force]` | Ship the current noo-apply to nodes over the rail; asks for confirmation (-y) |
