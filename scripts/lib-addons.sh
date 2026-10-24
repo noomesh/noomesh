@@ -266,14 +266,24 @@ EOF
 # reads any more, naming what replaced it. A warning, not a refusal: these
 # keys are inert (compose no longer delivers them), so the stack is correct
 # either way — the operator just deserves to know the line does nothing.
+#
+# It looks in `.env` AND in the sops store (${NOO_SOPS_FILE:-secrets/env.sops}),
+# where load_secrets exports every key it holds. A sops dotenv file keeps key
+# NAMES in plaintext (`KEY=ENC[AES256_GCM,...]`; comments are encrypted whole
+# as `#ENC[...]`), so a name match needs no decryption: the store is grepped
+# for `^KEY=` and nothing else, never decrypted, and no value is printed.
 warn_retired_env_keys() {
-    [ -f ".env" ] || return 0
     _wr_list="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/retired-env-keys"
     [ -f "$_wr_list" ] || return 0
+    _wr_store="${NOO_SOPS_FILE:-secrets/env.sops}"
+    [ -f ".env" ] || [ -f "$_wr_store" ] || return 0
     while IFS='|' read -r _wr_key _wr_note; do
         case "$_wr_key" in ''|'#'*) continue ;; esac
-        if grep -qE "^[[:space:]]*${_wr_key}=" .env; then
+        if [ -f ".env" ] && grep -qE "^[[:space:]]*${_wr_key}=" .env; then
             echo "WARN: .env sets ${_wr_key}, which is RETIRED and ignored — ${_wr_note}. Run \`noo onboard --only env\` to remove it (it backs up .env first)." >&2
+        fi
+        if [ -f "$_wr_store" ] && grep -qE "^${_wr_key}=" "$_wr_store" 2>/dev/null; then
+            echo "WARN: ${_wr_store} holds ${_wr_key}, which is RETIRED and ignored — ${_wr_note}. Run \`noo security secrets remove ${_wr_key}\` to remove it (it keeps an encrypted backup)." >&2
         fi
     done < "$_wr_list"
     return 0

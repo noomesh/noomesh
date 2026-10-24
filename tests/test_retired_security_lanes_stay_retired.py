@@ -98,7 +98,7 @@ def test_the_launcher_warns_about_the_retired_allowlist() -> None:
     assert "warn_retired_env_keys()" in lib and "TELEGRAM_ALLOWED_USERS|" in keys
     assert "noo security user link" in keys, "the warning must name the replacement"
     assert "noo onboard --only env" in lib, "the warning must name the command that removes the line"
-    for script in ("noomesh-start.sh", "noomesh-rebuild.sh"):
+    for script in ("noomesh-start.sh", "noomesh-rebuild.sh", "noomesh-restart.sh"):
         text = (ROOT / "scripts" / script).read_text()
         assert re.search(r"^warn_retired_env_keys$", text, re.M), f"{script} never calls it"
 
@@ -117,3 +117,55 @@ def test_a_leftover_self_call_secret_in_dot_env_is_named_by_the_launcher(tmp_pat
     assert r.returncode == 0, r.stderr
     assert "NOO_SELF_CALL_SHARED_SECRET, which is RETIRED and ignored" in r.stderr, r.stderr
     assert "noo security service-key issue" in r.stderr, r.stderr
+
+
+def test_a_leftover_retired_key_in_the_sops_store_is_named_without_decrypting(tmp_path) -> None:
+    """load_secrets exports every key env.sops holds, so a retired key left in
+    the store is as inert as one in .env and deserves the same notice. A sops
+    dotenv file keeps NAMES in plaintext (values are ENC[...], comments are
+    encrypted whole), so the launcher matches names only: no sops on PATH, no
+    value printed, and an encrypted comment never matches."""
+    import subprocess
+
+    secret = "ENC[AES256_GCM,data:c2VjcmV0dmFsdWU=,iv:aXY=,tag:dGFn,type:str]"
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "secrets" / "env.sops").write_text(
+        "#ENC[AES256_GCM,data:Y29tbWVudA==,iv:aXY=,tag:dGFn,type:comment]\n"
+        f"POSTGRES_PASSWORD={secret}\n"
+        f"NOO_SELF_CALL_SHARED_SECRET={secret}\n"
+        "sops_version=3.9.0\n"
+    )
+    lib = ROOT / "scripts" / "lib-addons.sh"
+    r = subprocess.run(
+        ["bash", "-c", f'source "{lib}" && warn_retired_env_keys'],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+    )
+    assert r.returncode == 0, r.stderr
+    assert "secrets/env.sops holds NOO_SELF_CALL_SHARED_SECRET, which is RETIRED and ignored" in r.stderr, r.stderr
+    assert "noo security secrets remove NOO_SELF_CALL_SHARED_SECRET" in r.stderr, r.stderr
+    assert "ENC[" not in r.stderr and "c2VjcmV0" not in r.stderr, "a store value was printed"
+    assert r.stderr.count("WARN:") == 1, r.stderr  # only the retired key, never POSTGRES_PASSWORD
+    assert ".env sets" not in r.stderr, "no .env here: the .env half must not fire"
+
+    # The store's own path is honoured, as load_secrets honours it.
+    (tmp_path / "secrets" / "env.sops").rename(tmp_path / "other.sops")
+    r = subprocess.run(
+        ["bash", "-c", f'source "{lib}" && warn_retired_env_keys'],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "NOO_SOPS_FILE": "other.sops"},
+    )
+    assert "other.sops holds NOO_SELF_CALL_SHARED_SECRET" in r.stderr, r.stderr
+
+
+def test_the_gateway_retires_the_self_call_posture_row() -> None:
+    """A stale NOO_SELF_CALL_SHARED_SECRET posture row is a RETIRED_INERT_KEYS
+    entry: boot deletes it at a closed value and warns while it is set on
+    (posture.rs `only_a_retired_row_at_a_closed_value_is_cleared` is the
+    behavioural half; this pins the list without a cargo build)."""
+    src = (ROOT / "gateway-rust" / "src" / "posture.rs").read_text()
+    m = re.search(r"pub const RETIRED_INERT_KEYS: &\[&str\] = &\[(.*?)\];", src, re.S)
+    assert m, "RETIRED_INERT_KEYS not found in posture.rs"
+    keys = re.findall(r'"([A-Z0-9_]+)"', m.group(1))
+    assert "NOO_NATS_LEGACY_SHARED_CREDS" in keys, f"parse found {keys}"
+    assert "NOO_SELF_CALL_SHARED_SECRET" in keys, f"RETIRED_INERT_KEYS is {keys}"
