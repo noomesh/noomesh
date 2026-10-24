@@ -5515,12 +5515,52 @@ fn stop_watcher(ctx: &mut Ctx) {
     }
 }
 
-fn hostd_can_run_here(ctx: &mut Ctx) -> bool {
-    if ctx.non_interactive || !ctx.ui.inherit_stdio() || !super::prompt::stdin_is_tty() {
-        ctx.info("noo-hostd not installed here (needs sudo and a terminal). Later: noo onboard --only services");
-        return false;
+/// Whether this run may install noo-hostd. The binary goes to
+/// /usr/local/bin through sudo, so an interactive run can answer sudo's
+/// prompt; a non-interactive one (`--ci`, no terminal) can only when sudo
+/// is passwordless, which a cloud image's default user and a CI box have.
+/// Before i251 `--ci` always skipped, and on a host with systemd the
+/// launcher then refused to create the spool it treats as hostd's, so the
+/// documented non-interactive install never started the stack. Pure, so
+/// all three answers are pinned.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HostdInstall {
+    Interactive,
+    PasswordlessSudo,
+    Skip,
+}
+
+pub(crate) fn hostd_install_decision(interactive: bool, sudo_quiet: bool) -> HostdInstall {
+    if interactive {
+        HostdInstall::Interactive
+    } else if sudo_quiet {
+        HostdInstall::PasswordlessSudo
+    } else {
+        HostdInstall::Skip
     }
-    true
+}
+
+fn hostd_can_run_here(ctx: &mut Ctx) -> bool {
+    let interactive = !ctx.non_interactive && ctx.ui.inherit_stdio() && super::prompt::stdin_is_tty();
+    let sudo_quiet = !interactive
+        && Command::new("sudo")
+            .args(["-n", "true"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    match hostd_install_decision(interactive, sudo_quiet) {
+        HostdInstall::Interactive => true,
+        HostdInstall::PasswordlessSudo => {
+            ctx.info("noo-hostd: no terminal, but sudo needs no password here — installing it (controller mode, a user unit)");
+            true
+        }
+        HostdInstall::Skip => {
+            ctx.info("noo-hostd not installed here (needs sudo and a terminal). Later: noo onboard --only services");
+            false
+        }
+    }
 }
 
 /// Controller mode: a user unit on this install's spool.
@@ -7394,7 +7434,19 @@ pub fn provision_service_keys(ctx: &mut Ctx) {
 
 #[cfg(test)]
 mod hostd_tests {
-    use super::{hostd_install_args, looks_like_elf};
+    use super::{hostd_install_args, hostd_install_decision, looks_like_elf, HostdInstall};
+
+    /// i251: `--ci` on a host with systemd. A terminal is only needed for
+    /// sudo's password; with passwordless sudo the non-interactive run
+    /// installs hostd like the interactive one does. Without either it
+    /// skips, as before.
+    #[test]
+    fn ci_installs_hostd_when_sudo_needs_no_password() {
+        assert_eq!(hostd_install_decision(true, false), HostdInstall::Interactive);
+        assert_eq!(hostd_install_decision(true, true), HostdInstall::Interactive);
+        assert_eq!(hostd_install_decision(false, true), HostdInstall::PasswordlessSudo, "a cloud image's default user, a CI box, the film's box");
+        assert_eq!(hostd_install_decision(false, false), HostdInstall::Skip);
+    }
 
     #[test]
     fn controller_mode_names_the_root_and_worker_mode_does_not() {

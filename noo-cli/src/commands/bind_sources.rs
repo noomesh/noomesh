@@ -143,11 +143,13 @@ fn produce(source: &str, expects_file: bool, data_root: Option<&str>) -> String 
     if source.contains("/pki/") || source.ends_with("/pki") {
         return "noo onboard --only enrollment (mints the CA and the gateway leaf)".into();
     }
-    // The host executor's spool: noo-hostd creates it (a box with no
-    // systemd never installs hostd, so it is simply absent there).
+    // The host executor's spool. noo-hostd's unit is installed here, so the
+    // spool is its (it makes it as the same user); every other case
+    // (no systemd, or systemd but no hostd unit) has the launcher create it
+    // before this check runs, so reaching this means that failed.
     if basename(source) == ".noo-host-spool" {
         return format!(
-            "with systemd, noo-hostd owns this spool: noo onboard --only services installs it; without systemd every start (noo onboard, noo stack start, noo upgrade --stack) creates it as you, so reaching this means that failed: mkdir -p '{source}' (as you)"
+            "noo-hostd's unit is installed here and its spool is missing: noo onboard --only services reinstalls hostd, which recreates it (every start without hostd creates it as you, so if this names a box without hostd, that failed: mkdir -p '{source}' (as you))"
         );
     }
     // Onboard's storage step creates exactly [`directory_sources_under`]
@@ -406,14 +408,36 @@ pub fn systemd_present() -> bool {
     Path::new("/run/systemd/system").is_dir()
 }
 
-/// Without systemd there is no hostd to create the host executor's spool, and
-/// Docker would create the bind source root-owned. Create each MISSING
+/// noo-hostd's unit is installed on this host: controller mode writes a
+/// user unit, `--system` a system one (node-agent-go/internal/hostd/install.go).
+/// Only then is the controller spool hostd's to make.
+pub fn hostd_unit_present() -> bool {
+    let home = std::env::var("HOME").unwrap_or_default();
+    (!home.is_empty() && Path::new(&home).join(".config/systemd/user/noo-hostd.service").is_file())
+        || Path::new("/etc/systemd/system/noo-hostd.service").is_file()
+}
+
+/// Who makes the controller's host spool: hostd, when it is installed (its
+/// unit exists; it needs systemd to run), else the launcher. i251: with
+/// systemd present but hostd not installed (`noo onboard --ci` could not
+/// install it before, and still cannot without passwordless sudo) the old
+/// rule "systemd => hostd's" refused every start. The spool is the user's
+/// own directory either way — controller-mode hostd is a USER unit that
+/// runs as the same uid — so the launcher making it hands nothing to root;
+/// the root-consumed spool is the worker's, elsewhere, and not bind-mounted
+/// here. Pure, so the rule is pinned.
+pub fn hostd_owns_spool(systemd: bool, hostd_unit: bool) -> bool {
+    systemd && hostd_unit
+}
+
+/// When no hostd is installed to create the host executor's spool, Docker
+/// would create the bind source root-owned. Create each MISSING
 /// `.noo-host-spool` bind source here, as the invoking user, and return what
-/// was created. A no-op when systemd is present (hostd owns it) and for every
-/// other source (those keep their refusal).
-pub fn ensure_hostd_spool(cfg: &Value, services: &[String], no_deps: bool, systemd: bool) -> Vec<String> {
+/// was created. A no-op when hostd owns it ([`hostd_owns_spool`]) and for
+/// every other source (those keep their refusal).
+pub fn ensure_hostd_spool(cfg: &Value, services: &[String], no_deps: bool, hostd_owns: bool) -> Vec<String> {
     let mut made = Vec::new();
-    if systemd {
+    if hostd_owns {
         return made;
     }
     for svc in selected(cfg, services, no_deps) {
@@ -514,15 +538,15 @@ pub fn run(args: &[String]) -> Result<i32, ()> {
             return Ok(65);
         }
     };
-    let (code, text) = launch_check(&cfg, &services, no_deps, &skip, data_root.as_deref(), systemd_present());
+    let (code, text) = launch_check(&cfg, &services, no_deps, &skip, data_root.as_deref(), systemd_present(), hostd_unit_present());
     eprint!("{text}");
     Ok(code)
 }
 
 /// The launch check over a parsed config: exit code and what to print.
-/// Without systemd there is no hostd, so the host spool is created here
-/// first, as the user (i76c: the dist launcher reaches only this path, and
-/// a fresh onboard in dind refused on the spool until someone ran mkdir).
+/// When no hostd is installed to make the host spool (no systemd: i76c, the
+/// dist launcher in dind; systemd but no hostd unit: i251, `--ci` on a real
+/// box) it is created here first, as the user.
 fn launch_check(
     cfg: &Value,
     services: &[String],
@@ -530,10 +554,16 @@ fn launch_check(
     skip: &[String],
     data_root: Option<&str>,
     systemd: bool,
+    hostd_unit: bool,
 ) -> (i32, String) {
     let mut text = String::new();
-    for made in ensure_hostd_spool(cfg, services, no_deps, systemd) {
-        text.push_str(&format!("created the host executor spool {made} (no systemd, so no noo-hostd to own it)\n"));
+    let why = if systemd {
+        "noo-hostd is not installed here; host commands wait until: noo onboard --only services"
+    } else {
+        "no systemd, so no noo-hostd to own it"
+    };
+    for made in ensure_hostd_spool(cfg, services, no_deps, hostd_owns_spool(systemd, hostd_unit)) {
+        text.push_str(&format!("created the host executor spool {made} ({why})\n"));
     }
     for made in ensure_launcher_dirs(cfg, services, no_deps) {
         text.push_str(&format!("created {made} (the add-on declarations directory; the launcher fills it)\n"));
@@ -871,18 +901,39 @@ mod tests {
             {"type": "bind", "source": spool.to_string_lossy(), "target": "/spool", "bind": {}}
         ]}}});
         let root = d.to_string_lossy().to_string();
-        let (code, text) = launch_check(&cfg, &[], false, &[], Some(&root), false);
+        let (code, text) = launch_check(&cfg, &[], false, &[], Some(&root), false, false);
         assert_eq!(code, 0, "{text}");
         assert!(spool.is_dir());
-        assert!(text.contains("created the host executor spool"), "{text}");
+        assert!(text.contains("created the host executor spool") && text.contains("no systemd"), "{text}");
         // Present now: silent.
-        assert_eq!(launch_check(&cfg, &[], false, &[], Some(&root), false), (0, String::new()));
-        // With systemd it is hostd's: not created, refused, and the text
-        // says who owns it.
+        assert_eq!(launch_check(&cfg, &[], false, &[], Some(&root), false, false), (0, String::new()));
+        // With systemd AND hostd's unit installed it is hostd's: not
+        // created, refused, and the text says who owns it.
         std::fs::remove_dir(&spool).unwrap();
-        let (code, text) = launch_check(&cfg, &[], false, &[], Some(&root), true);
+        let (code, text) = launch_check(&cfg, &[], false, &[], Some(&root), true, true);
         assert_eq!(code, EXIT_REFUSED);
         assert!(!spool.exists());
-        assert!(text.contains("noo-hostd owns this spool"), "{text}");
+        assert!(text.contains("noo-hostd's unit is installed here"), "{text}");
+    }
+
+    /// i251: systemd present, hostd NOT installed (`noo onboard --ci` on a
+    /// real Ubuntu box before this change, or any --ci run without
+    /// passwordless sudo). The old rule refused every start; now the
+    /// launcher makes the spool, as it does without systemd, and says that
+    /// host commands wait for hostd.
+    #[test]
+    fn launch_check_creates_the_spool_with_systemd_when_hostd_is_not_installed() {
+        let d = scratch("launch-spool-nohostd");
+        let spool = d.join(".noo-host-spool");
+        let cfg = json!({"services": {"gateway": {"volumes": [
+            {"type": "bind", "source": spool.to_string_lossy(), "target": "/spool", "bind": {}}
+        ]}}});
+        let root = d.to_string_lossy().to_string();
+        assert!(!hostd_owns_spool(true, false) && hostd_owns_spool(true, true) && !hostd_owns_spool(false, true));
+        let (code, text) = launch_check(&cfg, &[], false, &[], Some(&root), true, false);
+        assert_eq!(code, 0, "{text}");
+        assert!(spool.is_dir(), "the spool is the user's directory; the launcher makes it when hostd is absent");
+        assert!(text.contains("noo-hostd is not installed here") && text.contains("noo onboard --only services"), "{text}");
+        assert_eq!(launch_check(&cfg, &[], false, &[], Some(&root), true, false), (0, String::new()), "idempotent");
     }
 }
