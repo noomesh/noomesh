@@ -2498,6 +2498,12 @@ pub const CONVERSATION_STATS_SCOPE: &str = "conversation_stats";
 /// the store, so evolve writes through these four rows. Core skills are
 /// refused by the handlers regardless of who holds the scope.
 pub const PROMPT_SKILLS_WRITE_SCOPE: &str = "prompt_skills:write";
+/// Speech-to-text for a SERVICE: the two transcribe routes. A person needs no
+/// scope (`/api/voice/` is on the chat/query surface); a service key does,
+/// and unlike every other control scope it is also accepted AS THE KEY, on
+/// exactly these two routes (`DIRECT_KEY_SCOPES`). trellion's audio ingest
+/// (`POST /api/voice/transcribe/detailed`) presents its own key.
+pub const VOICE_TRANSCRIBE_SCOPE: &str = "voice:transcribe";
 pub const CONTROL_SCOPE_ROUTES: &[(&str, &str, &str)] = &[
     (TEMPORAL_SCOPE, "POST", "/api/temporal/adaptations"),
     (HEARTBEAT_SCOPE, "POST", "/api/heartbeat/tasks/*/run"),
@@ -2510,7 +2516,60 @@ pub const CONTROL_SCOPE_ROUTES: &[(&str, &str, &str)] = &[
     (PROMPT_SKILLS_WRITE_SCOPE, "PUT", "/api/prompt-skills/*"),
     (PROMPT_SKILLS_WRITE_SCOPE, "POST", "/api/prompt-skills/*/retire"),
     (PROMPT_SKILLS_WRITE_SCOPE, "POST", "/api/prompt-skills/*/fitness"),
+    (VOICE_TRANSCRIBE_SCOPE, "POST", "/api/voice/transcribe"),
+    (VOICE_TRANSCRIBE_SCOPE, "POST", "/api/voice/transcribe/detailed"),
 ];
+
+/// The control scopes whose routes a service key may call DIRECTLY, with the
+/// key itself as the bearer. Every other control scope is exercised by an
+/// exchanged add-on token (the key is only accepted on the inference surface
+/// and the exchange doors), so this list is deliberately short and each word
+/// in it is a decision: the routes it opens come from the same
+/// `CONTROL_SCOPE_ROUTES` rows, and a key WITHOUT the word is refused with the
+/// inference surface's scope-refusal body. No "any service key" path exists.
+pub const DIRECT_KEY_SCOPES: &[&str] = &[VOICE_TRANSCRIBE_SCOPE];
+
+/// The scope a raw service key must hold for `method path`, if that route is a
+/// direct-key door. Pure, so the mapping is pinned without a database.
+pub fn direct_key_scope_for(path: &str, method: &axum::http::Method) -> Option<&'static str> {
+    CONTROL_SCOPE_ROUTES
+        .iter()
+        .find(|(s, m, p)| DIRECT_KEY_SCOPES.contains(s) && method.as_str() == *m && path_matches(p, path))
+        .map(|(s, _, _)| *s)
+}
+
+/// What a direct-key door decides about a resolved bearer.
+pub enum DirectKey {
+    /// Not a service key: fall through to the 401 every other bearer gets.
+    NotAKey,
+    /// A service key without the scope: 403, same body as the inference
+    /// surface's `service key lacks '<scope>' scope`.
+    Forbidden(Response),
+    /// A service key holding the scope.
+    Admit(Consumer),
+}
+
+/// Pure decision for a direct-key door (the lookup and quota stay in the
+/// middleware).
+pub fn direct_key_admission(found: Option<Consumer>, required: &str) -> DirectKey {
+    let Some(consumer) = found else { return DirectKey::NotAKey };
+    if !consumer.has_scope(required) {
+        tracing::warn!(consumer = %consumer.name, scope = %required, "service key refused: lacks the scope this route needs");
+        return DirectKey::Forbidden(direct_key_forbidden(required));
+    }
+    DirectKey::Admit(consumer)
+}
+
+fn direct_key_forbidden(scope: &str) -> Response {
+    use axum::response::IntoResponse;
+    (
+        StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({
+            "error": {"message": format!("service key lacks '{scope}' scope"), "type": "forbidden"}
+        })),
+    )
+        .into_response()
+}
 
 /// Control scopes that open READS. The table above is method + path for
 /// WRITES, and a read scope is a different promise, so it has its own table
@@ -3654,6 +3713,31 @@ pub async fn require_any_auth(
             return Ok(next.run(request).await);
         }
         return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    // Direct-key doors: the key itself, as the bearer, on the exact routes a
+    // control scope in `DIRECT_KEY_SCOPES` opens (today the two transcribe
+    // routes). Not a widening of the inference surface: only a key holding the
+    // route's scope gets in, a key without it gets the scope refusal, and a
+    // bearer that is no key falls through to the 401 below.
+    if let Some(required) = direct_key_scope_for(&path, request.method()) {
+        match direct_key_admission(service_keys::resolve(&state.db, &t).await, required) {
+            DirectKey::Forbidden(r) => return Ok(r),
+            DirectKey::Admit(consumer) => {
+                if let Some(limit) = consumer.rpm_limit {
+                    if let Some(redis) = state.redis.as_ref() {
+                        if let Ok(crate::cache::RateResult::Limited { retry_after }) =
+                            redis.check_consumer_quota(&consumer.name, limit).await
+                        {
+                            return Ok(consumer_quota_exceeded(&consumer.name, retry_after));
+                        }
+                    }
+                }
+                request.extensions_mut().insert(consumer);
+                return Ok(next.run(request).await);
+            }
+            DirectKey::NotAKey => {}
+        }
     }
 
     // Service credentials are SCOPED to the inference surface: an inference
@@ -6642,5 +6726,168 @@ mod v2_never_counts_as_v1_tests {
         let go = || crate::cluster_token_v2::verify_and_spend(None, SECRET, &t, "POST", "/api/cluster/nodes/host7/heartbeat", b"{\"a\":1}", NOW + 1);
         assert_eq!(go().await.as_deref(), Some("host7"));
         assert_eq!(go().await, None, "the replay is refused without Redis");
+    }
+}
+
+/// A service key calling the transcribe routes with its own key as the bearer
+/// (trellion's audio ingest, `POST /api/voice/transcribe/detailed`).
+///
+/// The middleware itself needs a database to resolve a key, so these drive the
+/// SAME decision functions it calls (`direct_key_scope_for`,
+/// `direct_key_admission`) from a router-level layer in front of a stub STT
+/// upstream, over real HTTP: the transport is real, the STT upstream is the
+/// stub. A structural test pins that `require_any_auth` is wired to them.
+#[cfg(test)]
+mod voice_direct_key_tests {
+    use super::*;
+    use axum::http::Method;
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::Router;
+    use std::sync::{Arc, Mutex};
+
+    fn key(scopes: &[&str]) -> Consumer {
+        Consumer {
+            name: "svc:trellion".into(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            rpm_limit: None,
+            user: None,
+            user_scopes: Vec::new(),
+            user_role: None,
+        }
+    }
+
+    const DETAILED: &str = "/api/voice/transcribe/detailed";
+    const PLAIN: &str = "/api/voice/transcribe";
+
+    #[test]
+    fn only_the_two_transcribe_posts_are_direct_key_doors() {
+        assert_eq!(direct_key_scope_for(DETAILED, &Method::POST), Some("voice:transcribe"));
+        assert_eq!(direct_key_scope_for(PLAIN, &Method::POST), Some("voice:transcribe"));
+        for (m, p) in [
+            (Method::GET, DETAILED),
+            (Method::POST, "/api/voice/synthesize"),
+            (Method::GET, "/api/voice/status"),
+            (Method::POST, "/api/voice/transcribe/other"),
+            (Method::POST, "/api/config/voice"),
+            (Method::POST, "/api/external/embeddings"),
+            (Method::POST, "/api/channels/send"),
+        ] {
+            assert_eq!(direct_key_scope_for(p, &m), None, "{m} {p} must not be a direct-key door");
+        }
+    }
+
+    #[test]
+    fn the_scope_is_in_the_issuable_vocabulary_and_never_a_default() {
+        assert!(is_control_scope(VOICE_TRANSCRIBE_SCOPE));
+        assert_eq!(DIRECT_KEY_SCOPES, &[VOICE_TRANSCRIBE_SCOPE]);
+        // Only the voice rows are direct-key doors: no other control scope leaks in.
+        for (s, m, p) in control_scope_rows() {
+            let door = direct_key_scope_for(&p.replace('*', "x"), &m.parse::<Method>().unwrap());
+            assert_eq!(door.is_some(), *s == VOICE_TRANSCRIBE_SCOPE, "{s} {m} {p}");
+        }
+    }
+
+    #[test]
+    fn the_decision_admits_the_scope_refuses_its_absence_and_ignores_non_keys() {
+        assert!(matches!(direct_key_admission(Some(key(&["chat", "voice:transcribe"])), "voice:transcribe"), DirectKey::Admit(_)));
+        for scopes in [&["chat", "embeddings", "metrics"][..], &[][..], &["voice"][..], &["voice:transcribe:x"][..]] {
+            assert!(
+                matches!(direct_key_admission(Some(key(scopes)), "voice:transcribe"), DirectKey::Forbidden(_)),
+                "{scopes:?} must be refused"
+            );
+        }
+        assert!(matches!(direct_key_admission(None, "voice:transcribe"), DirectKey::NotAKey));
+    }
+
+    /// Persons keep their access: the tier gate is untouched by the new scope.
+    #[test]
+    fn a_person_token_is_unchanged() {
+        let person = Claims {
+            sub: "alice".into(),
+            exp: 4102444800,
+            role: "user".into(),
+            scopes: vec!["read".into()],
+            harness: None,
+            conv: None,
+            act: None,
+            cnf: None,
+        };
+        for p in [DETAILED, PLAIN, "/api/voice/synthesize"] {
+            assert!(scope_allows(&person, &Method::POST, p), "a person still reaches POST {p}");
+        }
+        // and the new scope opens nothing outside the two routes
+        let holder = Claims { scopes: vec!["voice:transcribe".into()], ..person };
+        assert!(!control_scope_allows(&holder.scopes, &Method::POST, "/api/voice/synthesize"));
+        assert!(!control_scope_allows(&holder.scopes, &Method::POST, "/api/config/voice"));
+        assert!(!scope_allows(&holder, &Method::POST, "/api/cluster/nodes"));
+    }
+
+    #[test]
+    fn require_any_auth_routes_the_door_through_the_pure_decision() {
+        let src = include_str!("auth.rs");
+        let body = src.split("pub async fn require_any_auth(").nth(1).unwrap().split("\npub async fn ").next().unwrap();
+        let door = body.find("direct_key_scope_for(&path, request.method())").expect("the direct-key door");
+        let admission = body.find("direct_key_admission(service_keys::resolve(&state.db, &t).await, required)").expect("the decision");
+        let inference = body.find("    if is_inference_surface {\n        // Named per-consumer").expect("the inference block");
+        assert!(door < admission && admission < inference, "the door precedes the inference block");
+        // A non-key bearer must fall through (to the 401), not be admitted.
+        assert!(body[door..inference].contains("DirectKey::NotAKey => {}"));
+    }
+
+    /// Stub STT upstream + the real decision in a layer, over real HTTP.
+    async fn serve(found: Option<Consumer>) -> (String, Arc<Mutex<u32>>) {
+        let reached = Arc::new(Mutex::new(0u32));
+        let hits = reached.clone();
+        let found = Arc::new(found);
+        let upstream = move || {
+            let hits = hits.clone();
+            async move {
+                *hits.lock().unwrap() += 1;
+                axum::Json(serde_json::json!({"text": "hello", "segments": []}))
+            }
+        };
+        let gate = move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let found = found.clone();
+            async move {
+                let Some(required) = direct_key_scope_for(req.uri().path(), req.method()) else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                match direct_key_admission((*found).clone(), required) {
+                    DirectKey::Admit(_) => next.run(req).await,
+                    DirectKey::Forbidden(r) => r,
+                    DirectKey::NotAKey => StatusCode::UNAUTHORIZED.into_response(),
+                }
+            }
+        };
+        let app = Router::new()
+            .route(DETAILED, post(upstream))
+            .layer(axum::middleware::from_fn(gate));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://127.0.0.1:{}{DETAILED}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (url, reached)
+    }
+
+    #[tokio::test]
+    async fn a_key_with_the_scope_reaches_the_stt_upstream_and_one_without_does_not() {
+        let (url, reached) = serve(Some(key(&["chat", "voice:transcribe"]))).await;
+        let r = reqwest::Client::new().post(&url).send().await.unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::OK);
+        assert_eq!(r.json::<serde_json::Value>().await.unwrap()["text"], "hello");
+        assert_eq!(*reached.lock().unwrap(), 1, "the upstream must be reached");
+
+        let (url, reached) = serve(Some(key(&["chat", "embeddings", "metrics"]))).await;
+        let r = reqwest::Client::new().post(&url).send().await.unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::FORBIDDEN);
+        let body = r.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(body["error"]["type"], "forbidden");
+        assert_eq!(body["error"]["message"], "service key lacks 'voice:transcribe' scope");
+        assert_eq!(*reached.lock().unwrap(), 0, "a refused key must never reach the upstream");
+
+        let (url, reached) = serve(None).await;
+        let r = reqwest::Client::new().post(&url).send().await.unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(*reached.lock().unwrap(), 0);
     }
 }

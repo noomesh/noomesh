@@ -7660,11 +7660,14 @@ mod provision_tests {
         // Read from the overlay, not restated: the default IS the declaration.
         let declared = addon_decl("evolve").unwrap().scopes;
         assert_eq!(evolve[1..], declared.iter().map(|s| s.to_string()).collect::<Vec<_>>()[..]);
-        for c in ["svc:trellion", "svc:trellion-intel"] {
-            assert_eq!(provisioned_scopes(c, &[]),
-                vec!["addon".to_string(), "chat".to_string(), "embeddings".to_string(), "metrics".to_string()],
-                "{c}: inference plus metrics (phase C moves its counters onto the gateway)");
-        }
+        assert_eq!(provisioned_scopes("svc:trellion-intel", &[]),
+            vec!["addon".to_string(), "chat".to_string(), "embeddings".to_string(), "metrics".to_string()],
+            "trellion-intel: inference plus metrics (phase C moves its counters onto the gateway)");
+        // trellion also transcribes audio it ingests, through the gateway's STT routes.
+        assert_eq!(provisioned_scopes("svc:trellion", &[]),
+            vec!["addon".to_string(), "chat".to_string(), "embeddings".to_string(), "metrics".to_string(),
+                 "voice:transcribe".to_string()],
+            "trellion: inference, metrics, and the transcribe routes");
         // The core worker's default is a declared row, not a fallthrough.
         assert_eq!(provisioned_scopes("svc:worker", &[]),
             vec!["addon".to_string(), "chat".to_string(), "embeddings".to_string()]);
@@ -7696,8 +7699,8 @@ mod provision_tests {
         let key = serde_json::json!({ "scopes": ["addon", "chat", "embeddings"] });
         let r = provision_request("svc:trellion", &[], Some(&vocab), Some(&key));
         assert!(!r.overridden);
-        assert_eq!(r.declared, vec!["chat", "embeddings", "metrics"]);
-        assert_eq!(r.diff, Some((vec!["metrics".to_string()], vec![])));
+        assert_eq!(r.declared, vec!["chat", "embeddings", "metrics", "voice:transcribe"]);
+        assert_eq!(r.diff, Some((vec!["metrics".to_string(), "voice:transcribe".to_string()], vec![])));
 
         // An older gateway without the listing: no routes, no refusals —
         // the mint's own 400 speaks, as before.

@@ -756,7 +756,7 @@ on the gateway's own). Broadcast is refused; a thread needs a seat.
 | GET | `/api/channels/{channel}/recipients`, `/api/channels/{channel}/messages` | known recipients; recent inbound |
 | GET, POST, PUT, DELETE | `/api/channels/saved-recipients`, `…/{recipient_db_id}` | address book. Rows carry an `owner` (migration `071`); `owner: null` is the shared book — readable by everyone, writable by Operator+ only. A `user`-tier caller reads its own + shared and writes only its own (`404` otherwise) |
 | GET | `/api/alerts/clients` | connected alert WebSocket clients |
-| POST | `/api/voice/transcribe`, `/api/voice/transcribe/detailed`, `/api/voice/synthesize`; GET `/api/voice/voices`, `/api/voice/status` | STT / TTS through the configured providers |
+| POST | `/api/voice/transcribe`, `/api/voice/transcribe/detailed`, `/api/voice/synthesize`; GET `/api/voice/voices`, `/api/voice/status` | STT / TTS through the configured providers. The two transcribe routes also accept a service key presented directly, but only one holding the `voice:transcribe` scope (a key without it gets `403`, `service key lacks 'voice:transcribe' scope`); persons are unchanged |
 
 ## Users, security, settings (`routes/users.rs`, `routes/settings.rs`, `routes/admin.rs`)
 
