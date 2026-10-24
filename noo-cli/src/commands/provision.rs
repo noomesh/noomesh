@@ -1715,6 +1715,8 @@ fn await_apply(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, staged: &ProvSta
 fn report_provisioned(g: &Globals, a: &ProvisionArgs, id: &ProvIdentity, m: &ProvMachine) {
     let node = a.node.clone();
     let tier = id.tier.clone();
+    let ip = id.ip.as_str();
+    let user = id.user.as_str();
     let goarch = m.goarch.as_str();
     if g.json {
         println!("{}", serde_json::json!({
