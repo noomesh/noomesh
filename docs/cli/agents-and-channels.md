@@ -48,8 +48,8 @@ step exits 1. Inputs are `key=value` strings.
 ### Leave a message for an agent
 
 ```sh
-noo agents send research-1 "pick up the KB backup thread" --kind task --thread kb-backup
-noo agents inbox --agent research-1 --unread
+noo agents send alice/claude-research "pick up the KB backup thread" --kind task --thread kb-backup
+noo agents inbox --agent alice/claude-research --unread
 noo agents thread kb-backup
 noo agents messages --since 2026-09-01T00:00:00Z --threads
 ```
@@ -57,6 +57,10 @@ noo agents messages --since 2026-09-01T00:00:00Z --threads
 `send` publishes one envelope (`--kind message|task|result|ack|note`,
 `*` broadcasts) and prints `sent <from> → <to>  thread <id>` plus the
 message id; the gateway stamps your identity, node and harness on it.
+Address an agent by its full name: an MCP session is
+`<account>/<type>-<session>` (`alice/claude-research`, see
+[MCP for your client](../channels/mcp-your-client.md)); mail to a bare name
+outside the account reaches nobody.
 Delivery is the NATS subscription; `inbox` and `thread` are reviews of
 what the gateway recorded, newest first and oldest first respectively.
 Non-privileged callers see only their own traffic. When the model reads
