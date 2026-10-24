@@ -611,7 +611,10 @@ async fn relationships(
         }
         // Table might not exist yet — graceful degradation
         Err(e) if e.to_string().contains("does not exist") => {
-            Ok(Json(json!({"source_id": record_id, "relationships": [], "count": 0})))
+            let mut body = json!({"source_id": record_id, "relationships": []});
+            crate::measured::put_into(&mut body, "count", crate::measured::Measured::<usize>::unmeasured(
+                "cannot measure — the relationships table does not exist yet"));
+            Ok(Json(body))
         }
         Err(e) => Err(AppError::Internal(format!("Database error: {e}"))),
     }
