@@ -977,7 +977,7 @@ pub(super) async fn list_jobs_for(state: Arc<AppState>, params: ListJobsParams) 
     let jobs: Vec<Value> = jobs.into_iter().take(limit).collect();
     let count = jobs.len();
 
-    json!({"jobs": jobs, "count": count})
+    Ok(json!({"jobs": jobs, "count": count}))
 }
 
 /// A job hash as JSON, deserializing the payload field (JSON if it parses,
