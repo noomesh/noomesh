@@ -209,6 +209,11 @@ def test_the_box_boots_systemd_and_runs_docker_as_a_unit():
     assert "systemd systemd-sysv" in studio and "systemctl enable docker" in studio
     run = studio.split("docker run -d --name \"$BOX\"", 1)[1].split(">/dev/null", 1)[0]
     assert "--tmpfs /run --tmpfs /run/lock" in run and "--cgroupns=private" in run and '"$BOX_IMAGE"' in run
+    # Docker as a unit uses the containerd.io service, whose snapshots cannot sit
+    # on the box's overlay rootfs: a volume for /var/lib/containerd too (take 8)
+    assert '-v "$CONTAINERD_VOL":/var/lib/containerd' in run
+    down = studio.split("cmd_down() {", 1)[1].split("\n}\n", 1)[0]
+    assert '"$CONTAINERD_VOL"' in down, "down must remove the containerd volume with the image volume"
     assert "box_wait_booted" in studio and "systemctl is-system-running" in studio
     # a tmpfs systemd mounts on /tmp inside the box is invisible to `docker cp`,
     # which collects the recorder's logs from /tmp/demo: tmp.mount stays masked
