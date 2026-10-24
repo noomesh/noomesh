@@ -27,6 +27,16 @@ import re
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 PROVIDER = REPO / "gateway-rust/src/memory/provider.rs"
+# The subject STRINGS live in one place since i195 refactor 6 (TrellionClient);
+# the provider names them by constant. The parity below resolves the name.
+SUBJECTS_RS = REPO / "gateway-rust/src/trellion_client.rs"
+
+
+def _subject_consts() -> dict[str, str]:
+    text = SUBJECTS_RS.read_text(encoding="utf-8")
+    out = dict(re.findall(r'pub const ([A-Z_0-9]+): &str = "([^"]+)";', text))
+    assert "GRAPH_RECLUSTER" in out, "subject constants not found in trellion_client.rs"
+    return out
 KNOWLEDGE = REPO / "gateway-rust/src/routes/knowledge.rs"
 CLI_MAIN = REPO / "noo-cli/src/main.rs"
 CLI_USAGE = REPO / "noo-cli/src/usage.rs"
@@ -39,7 +49,8 @@ def test_the_gateway_and_the_worker_name_the_same_subject():
     """Rename either end and the other still compiles, still passes, still
     ships — and the route answers "worker timeout" forever."""
     rust = PROVIDER.read_text(encoding="utf-8")
-    assert f'const SUBJECT_GRAPH_RECLUSTER: &str = "{SUBJECT}";' in rust
+    assert "const SUBJECT_GRAPH_RECLUSTER: &str = subjects::GRAPH_RECLUSTER;" in rust
+    assert _subject_consts()["GRAPH_RECLUSTER"] == SUBJECT
 
     handlers = "\n".join(
         p.read_text(encoding="utf-8") for p in sorted(WORKERS.glob("*.py"))
@@ -172,13 +183,16 @@ def test_every_intel_graph_route_is_mounted_and_has_a_subject():
     because two of those three were never compared."""
     rust = KNOWLEDGE.read_text(encoding="utf-8")
     provider = PROVIDER.read_text(encoding="utf-8")
+    consts = _subject_consts()
     handlers = "\n".join(
         p.read_text(encoding="utf-8") for p in sorted(WORKERS.glob("*.py"))
     )
     for path, op in INTEL_ROUTES.items():
         assert f'.route("{path}"' in rust, f"{path} is not mounted"
-        assert f'("{op}", "worker.graph.{op}")' in provider, (
-            f"capability `{op}` has no subject in SUBJECT_GRAPH_INTEL"
+        m = re.search(rf'\("{op}", subjects::([A-Z_0-9]+)\)', provider)
+        assert m, f"capability `{op}` has no subject in SUBJECT_GRAPH_INTEL"
+        assert consts.get(m.group(1)) == f"worker.graph.{op}", (
+            f"capability `{op}` names {m.group(1)}, which is not worker.graph.{op}"
         )
         assert f'@worker_handler("worker.graph.{op}")' in handlers, (
             f"worker.graph.{op} has no handler — the route would time out"
