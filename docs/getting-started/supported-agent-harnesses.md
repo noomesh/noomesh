@@ -140,6 +140,12 @@ per call). Three things keep such a turn from being lost:
   it ends a call still running at the deadline. It then saves the answer so
   far, or a note that the model did not finish, while the turn's credential
   is still valid.
+- **A CLI that never reaches the model is killed early.** Every model call a
+  vendor CLI makes passes through the harness's wire translator. A CLI that
+  has made none for `NOO_HARNESS_STALL_SECS` (default 300 s; 120 s for a chat
+  turn) is killed as stalled and the loop fails with `stalled: no model call
+  for Ns`, instead of running to `NOO_HARNESS_TURN_TIMEOUT_SECS` loop after
+  loop. A slow model is not a stall: a call in flight counts as activity.
 - **Reasoning can be switched off per node.** Place the harness with
   `--env NOO_HARNESS_THINKING=off` and every model call on that node asks the
   model not to reason, for the `noo` loop and for a foreign kind's CLI

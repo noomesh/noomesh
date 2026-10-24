@@ -448,7 +448,7 @@ async fn cli_version(plan: &Plan, base: &Path) -> Option<String> {
     let env = build_env(&ctx, &ws, "http://127.0.0.1:9");
     let argv = vec![plan.cli.display().to_string(), "--version".to_string()];
     let jail = ws.jail_spec(&ctx, &ws.home);
-    let out = spawn_cli_as(&argv, &env, &ws.work, Duration::from_secs(10), &jail, run_as_ids(plan)).await;
+    let out = spawn_cli_as(&argv, &env, &ws.work, Duration::from_secs(10), &jail, run_as_ids(plan), None).await;
     ws.finish();
     let out = match out {
         Ok(o) => o,
@@ -496,7 +496,7 @@ async fn run_test(plan: &Plan, base: &Path, test: ProbeTest) -> Result<TestRepor
         // that passes unjailed would prove nothing about a real task.
         (ctx.jail_probe)().map_err(|r| anyhow!(r.note()))?;
         let jail = ws.jail_spec(ctx, cli_config.as_deref().unwrap_or(&ws.home));
-        spawn_cli_as(&argv, &env, &ws.work, ctx.timeout, &jail, run_as_ids(plan)).await
+        spawn_cli_as(&argv, &env, &ws.work, ctx.timeout, &jail, run_as_ids(plan), None).await
     }
     .await;
     let routes = translator.routes();
@@ -846,7 +846,7 @@ mod tests {
     }
 
     fn out(code: Option<i32>, stdout: &str, timed_out: bool) -> RunOutput {
-        RunOutput { code, stdout: stdout.into(), stderr: "err line".into(), timed_out, elapsed: Duration::from_secs(2) }
+        RunOutput { code, stdout: stdout.into(), stderr: "err line".into(), timed_out, stalled: None, elapsed: Duration::from_secs(2) }
     }
 
     fn hit(path: &str, status: u16) -> RouteHit {
