@@ -1335,7 +1335,10 @@ pub enum Resolution {
     Addon { rest: Vec<String> },
     /// Nothing we serve natively and no plugin claims it: a usage error
     /// (exit 2), never an exec of anything.
-    Unmatched,
+    /// Nothing matched. `rest` is the post-global-flag token stream, so the
+    /// unknown-command answer names the command words, never a `--gateway`
+    /// value typed ahead of them.
+    Unmatched { rest: Vec<String> },
 }
 
 /// Command words a plugin shim may never claim: every native group's first
@@ -1522,7 +1525,7 @@ pub fn resolve_with(
         }
     }
 
-    (globals, Resolution::Unmatched)
+    (globals, Resolution::Unmatched { rest })
 }
 
 /// Look up the handler for a matched native `prefix`. The registry-integrity
@@ -1564,7 +1567,7 @@ fn main() {
     // their own commands (commands/addon_cli.rs). Nothing offering the group
     // leaves it the unknown command it was, handled below.
     let addon_words: Option<Vec<String>> = match &resolution {
-        Resolution::Addon { rest } => Some(rest.clone()),
+        Resolution::Addon { rest } | Resolution::Unmatched { rest } => Some(rest.clone()),
         _ => None,
     };
     if let Resolution::Addon { rest } = &resolution {
@@ -1659,13 +1662,12 @@ fn main() {
             }
             // fall through to the unknown-command answer below.
         }
-        Resolution::Unmatched | Resolution::Addon { .. } => {
+        Resolution::Unmatched { .. } | Resolution::Addon { .. } => {
             // A top-level word the registry and the plugin path both
             // disown is an unknown command; a known group with a word it
             // does not own gets that group's subcommands. Nothing is ever
-            // exec'd. (An add-on lookup that found nothing names its words
-            // from the global-flag-stripped stream: a `--gateway <url>`
-            // value ahead of the command is not the command.)
+            // exec'd. Both carry the global-flag-stripped stream, so a
+            // `--gateway <url>` value ahead of the command is not the command.
             let words_src: &[String] = addon_words.as_deref().unwrap_or(&argv);
             let cmd_words: Vec<&str> = words_src
                 .iter()
@@ -2196,7 +2198,7 @@ const SOURCES: &[(&str, &str)] = &[
             "cluster add-node is retired — do not re-register it"
         );
         let (_, r) = resolve(&argv(&["cluster", "add-node", "x"]));
-        assert_eq!(r, Resolution::Unmatched);
+        assert!(matches!(r, Resolution::Unmatched { .. }));
     }
 
     #[test]
@@ -2227,7 +2229,7 @@ const SOURCES: &[(&str, &str)] = &[
         // Bare `voice` is not a registry entry: unmatched (main prints the
         // group's usage and exits 2).
         let (_, r) = resolve(&argv(&["voice"]));
-        assert_eq!(r, Resolution::Unmatched);
+        assert!(matches!(r, Resolution::Unmatched { .. }));
     }
 
     #[test]
@@ -2235,7 +2237,7 @@ const SOURCES: &[(&str, &str)] = &[
         // `cluster` alone is not a registry entry (every cluster command has a
         // second word), so it is not native — main prints the group help, exit 2.
         let (_, r) = resolve(&argv(&["cluster"]));
-        assert_eq!(r, Resolution::Unmatched);
+        assert!(matches!(r, Resolution::Unmatched { .. }));
     }
 
     #[test]
@@ -2350,7 +2352,7 @@ const SOURCES: &[(&str, &str)] = &[
         // A stray token ahead of the command words breaks the prefix match, so
         // the whole thing is unmatched (a usage error in main).
         let (_, r) = resolve(&argv(&["--bogus", "health"]));
-        assert_eq!(r, Resolution::Unmatched);
+        assert!(matches!(r, Resolution::Unmatched { .. }));
     }
 
     #[test]
@@ -2430,7 +2432,7 @@ const SOURCES: &[(&str, &str)] = &[
         // (the retired Python CLI's name) must stay unmatched even when a same-named shim exists.
         for word in ["cluster", "voice", "plugins", "mcp", "py"] {
             let (_, r) = resolve_with(&argv(&[word]), |_| true);
-            assert_eq!(r, Resolution::Unmatched, "`{word}` must not dispatch as a plugin");
+            assert!(matches!(r, Resolution::Unmatched { .. }), "`{word}` must not dispatch as a plugin");
         }
     }
 
@@ -2453,7 +2455,7 @@ const SOURCES: &[(&str, &str)] = &[
         // A leading unknown flag is not a plugin candidate (and help/version
         // are handled before the plugin step).
         let (_, r) = resolve_with(&argv(&["--bogus", "health"]), |_| true);
-        assert_eq!(r, Resolution::Unmatched);
+        assert!(matches!(r, Resolution::Unmatched { .. }));
     }
 
     #[test]
