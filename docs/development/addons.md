@@ -171,6 +171,20 @@ lock reads: "add-on `<name>` is enabled in noomesh.yaml but has no verified lock
 for this stack ... Run `noo addons upgrade <name>`". A lock verified for another
 stack is refused the same way, naming both stacks.
 
+When `noo stack start|restart` cannot verify an add-on's pin for the running
+stack (a lock for another stack, a bad signature, edited bundle files, an
+expired development key, its image not local), it leaves **that add-on** out of
+the start and starts the rest: it prints `REFUSED add-on <name>: <why>` with the
+remedy (`noo addons upgrade <name>`, or `noo addons disable <name>`), does not
+compose its overlay, hands the gateway none of its bundle declarations, stops a
+container left from an earlier start, and ends with "Services started WITHOUT
+add-on(s) <name>". The add-on is absent from `NOO_ADDONS_VERIFIED`, so its
+routes are refused (even from a `routes.json` an earlier start left in the
+routes volume), and it is named in `NOO_ADDONS_REFUSED`, so the systems broker
+runs no DDL for it. `noo addons list|show` read it as refused and the
+`add-on pins` row of `noo cluster verify --controller` fails naming it. A
+`stack.lock` that is missing or for another tag still refuses the whole start.
+
 Names are lowercase letters, digits, `-` and `_`, starting with a letter (at
 most 32). A name with `-` reads its upstream override from the variable with `_`
 (`pai-voice` reads `NOO_PAI_VOICE_URL`; the host stays `noo-pai-voice`) and may

@@ -493,6 +493,8 @@ if [ -n "${DIST_TAG:-}" ]; then
     # the add-on and `noo addons upgrade`, before anything is pulled or
     # recreated. The launcher never pulls an add-on. Off add-ons are not
     # looked at.
+    # An add-on whose pin does not verify for this tag is left out of the
+    # start (REFUSED, by name, with its remedy); the rest starts.
     DIST_MODE=1 require_addon_pins || exit 1
 else
     # A dev start: composed add-on overlays run the dev build's names.
@@ -957,6 +959,9 @@ require_compose_v2 || exit 1
     fi
     # Licensed add-ons switched off: stop the services their overlay adds.
     addons_stop_disabled
+    # Add-ons refused this start (require_addon_pins): a container left from
+    # an earlier start must not keep running.
+    addons_stop_refused
     if [ "${VOICE_STOP_ON_OFF:-}" = "1" ]; then
         docker compose $COMPOSE_FILES -f "$(addons_voice_overlay)" stop whisper piper 2>/dev/null || true
     fi
@@ -1038,7 +1043,13 @@ if [ -n "$OLLAMA_CTR" ]; then
     fi
 fi
 
-ui_close_done "Services started"
+if [ -n "${NOO_ADDONS_REFUSED:-}" ]; then
+    # Never a plain "started": the outcome names what did NOT start.
+    ui_close_warned "Services started WITHOUT add-on(s) ${NOO_ADDONS_REFUSED//,/, }: refused, NOT running"
+    addons_report_refused
+else
+    ui_close_done "Services started"
+fi
 ui_note "noo stack status shows the containers"
 
 # Wait for background model pull if it was started (max 10 minutes)
