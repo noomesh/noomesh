@@ -547,3 +547,51 @@ mod tests {
         assert_eq!(resolve_local(&id, "self:owner").unwrap_err(), Refusal::Unknown, "removed, not merely refused");
     }
 }
+
+/// The rename against a real Postgres. Opt-in like the other storage tests:
+/// `NOO_TEST_DSN` names a scratch database; without it the test says so and
+/// passes.
+#[cfg(test)]
+mod db_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_claimed_name_is_shared_kept_typed_and_survives_the_cache() {
+        let Some(dsn) = std::env::var("NOO_TEST_DSN").ok().filter(|v| !v.trim().is_empty()) else {
+            eprintln!("NOO_TEST_DSN unset — session rename not exercised");
+            return;
+        };
+        use std::str::FromStr as _;
+        let opts = sqlx::postgres::PgConnectOptions::from_str(&dsn).expect("dsn").options([("search_path", "mesh,public")]);
+        let admin = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(opts.clone()).await.expect("connect scratch db");
+        crate::mesh_migrate::apply_baseline(&admin).await.expect("baseline");
+        crate::mesh_migrate::apply(&admin).await.expect("migrations");
+        let db = sqlx::postgres::PgPoolOptions::new().max_connections(2).connect_with(opts).await.expect("connect scratch db");
+        // An account no other test uses, so reruns on one database never collide.
+        let acct = format!("rn{}", suffix());
+
+        let (id1, l1) = open(&db, &acct, "k:one", Some("claude-code")).await.expect("open 1");
+        let (id2, l2) = open(&db, &acct, "k:one", Some("claude-code")).await.expect("open 2");
+        let (_, l3) = open(&db, &acct, "k:one", Some("codex-mcp-client")).await.expect("open 3");
+        assert!(l1.starts_with("claude-") && l3.starts_with("codex-"), "{l1} {l3}");
+
+        // First claim: the name is free.
+        assert_eq!(rename(&db, &acct, &l1, "general").await.unwrap(), ("claude-general".to_string(), 0));
+        // Second claim of the same name joins it, and says so.
+        assert_eq!(rename(&db, &acct, &l2, "general").await.unwrap(), ("claude-general".to_string(), 1));
+        // Claiming the name you already hold is a no-op that still counts the others.
+        assert_eq!(rename(&db, &acct, "claude-general", "claude-general").await.unwrap().1, 1);
+        // The type is the session's own: codex claiming "general" is codex-general.
+        assert_eq!(rename(&db, &acct, &l3, "general").await.unwrap().0, "codex-general");
+
+        // The row is the record: a cold cache resolves to the new label.
+        registry().write().unwrap().remove(&id2);
+        assert_eq!(resolve(&db, &id2, "k:one").await.unwrap().label, "claude-general");
+        assert_eq!(resolve(&db, &id1, "k:one").await.unwrap().label, "claude-general");
+
+        // Refusals: an unknown session, a bad name, and another account's session.
+        assert!(rename(&db, &acct, "claude-nobody", "x").await.is_err());
+        assert!(rename(&db, &acct, "codex-general", "a/b").await.is_err());
+        assert!(rename(&db, "someone-else", "codex-general", "x").await.is_err());
+    }
+}
