@@ -68,9 +68,9 @@
 //! without `--jinja` cannot take a CLI's tool calls, so there is nothing to
 //! fall back to).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use axum::body::{Body, Bytes};
@@ -120,8 +120,44 @@ enum Wire {
     Ollama,
 }
 
+/// When the CLI last reached the model through this translator: a request
+/// arriving or a reply metered. The driver reads [`Activity::idle`] to tell
+/// a CLI that is working from one that is hung (i233): a vendor CLI prints
+/// nothing until it is done, so its stdout says nothing, but every model
+/// call passes here.
+pub struct Activity {
+    started: Instant,
+    last_ms: AtomicU64,
+}
+
+impl Activity {
+    pub fn new() -> Self {
+        Self { started: Instant::now(), last_ms: AtomicU64::new(0) }
+    }
+
+    /// Something happened on the wire just now.
+    pub fn touch(&self) {
+        let ms = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        self.last_ms.fetch_max(ms, Ordering::Relaxed);
+    }
+
+    /// How long since the last request or reply; since the translator
+    /// started when there has been none.
+    pub fn idle(&self) -> Duration {
+        let last = Duration::from_millis(self.last_ms.load(Ordering::Relaxed));
+        self.started.elapsed().saturating_sub(last)
+    }
+}
+
+impl Default for Activity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct Shared {
     upstream: ResolvedBackend,
+    activity: Arc<Activity>,
     wire: Wire,
     client: reqwest::Client,
     /// For streamed upstream replies: no total timeout, an idle bound.
@@ -140,6 +176,7 @@ impl Shared {
     /// Count one answered call. `usage` is (prompt, completion, total).
     fn meter(&self, model: Option<&str>, usage: Option<(u64, u64, u64)>) {
         let model = model.filter(|m| !m.is_empty()).unwrap_or(&self.upstream.model).to_string();
+        self.activity.touch();
         let mut u = self.usage.lock().unwrap_or_else(|p| p.into_inner());
         u.calls = u.calls.saturating_add(1);
         match usage {
@@ -219,6 +256,7 @@ impl Translator {
         };
         let shared = Arc::new(Shared {
             upstream,
+            activity: Arc::new(Activity::new()),
             wire,
             client: crate::tls::cluster_client(),
             stream_client: crate::tls::cluster_stream_client(),
@@ -251,6 +289,11 @@ impl Translator {
     /// e.g. "http://127.0.0.1:41234" — what the CLI's base-URL env gets.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// The wire's activity clock, for the driver's stall bound.
+    pub fn activity(&self) -> Arc<Activity> {
+        self.shared.activity.clone()
     }
 
     /// Snapshot of everything counted so far.
@@ -298,9 +341,10 @@ fn router(shared: Arc<Shared>) -> Router {
         .with_state(shared)
 }
 
-/// Records method, path and status when the probe asked for a log; a no-op
-/// pass-through otherwise.
+/// Marks the wire active on every request (the driver's stall clock), and
+/// records method, path and status when the probe asked for a log.
 async fn log_route(State(sh): State<Arc<Shared>>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    sh.activity.touch();
     let Some(log) = sh.route_log.as_ref() else {
         return next.run(req).await;
     };

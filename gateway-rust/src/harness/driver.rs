@@ -63,6 +63,12 @@ use crate::tasks::TaskRequest;
 /// dropped, so a chatty CLI cannot fill the harness's memory (the unit caps
 /// it at 1 GiB).
 pub const OUTPUT_CAP: usize = 256 * 1024;
+/// Default `NOO_HARNESS_STALL_SECS`: no model call for this long and the CLI
+/// is killed as stalled rather than left to its wall-clock limit.
+pub const DEFAULT_STALL_SECS: u64 = 300;
+/// A chat turn's stall bound: a person is waiting (i233, 15 minutes for an
+/// error on the console).
+pub const TURN_STALL: Duration = Duration::from_secs(120);
 /// The line a CLI ends with when the task's objective is achieved.
 pub const RESULT_MARK: &str = "NOO_RESULT:";
 /// The line a CLI ends with when the objective cannot be achieved.
@@ -173,6 +179,11 @@ pub struct DriverCtx {
     pub keep_workdir: bool,
     /// One invocation's wall-clock limit (`NOO_HARNESS_TURN_TIMEOUT_SECS`).
     pub timeout: Duration,
+    /// How long a CLI may go without reaching the model before it is killed
+    /// as stalled (`NOO_HARNESS_STALL_SECS`, default 300; a chat turn uses
+    /// the smaller of this and [`TURN_STALL`]). A hung vendor CLI used to
+    /// run to `timeout` three loops in a row (i233).
+    pub stall: Duration,
     /// The cluster CA, handed to the CLI as `NODE_EXTRA_CA_CERTS` so it can
     /// reach the user door over the cluster's TLS.
     pub ca_path: Option<String>,
@@ -201,6 +212,7 @@ impl DriverCtx {
         let set = |k: &str| get(k).filter(|v| !v.trim().is_empty());
         let workdir_root = set("NOO_HARNESS_WORKDIR").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("noo-harness"));
         let timeout = Duration::from_secs(set("NOO_HARNESS_TURN_TIMEOUT_SECS").and_then(|v| v.trim().parse().ok()).filter(|s| *s > 0).unwrap_or(900));
+        let stall = Duration::from_secs(set("NOO_HARNESS_STALL_SECS").and_then(|v| v.trim().parse().ok()).filter(|s| *s > 0).unwrap_or(DEFAULT_STALL_SECS));
         Ok(Self {
             node: node.to_string(),
             gateway: gateway.trim_end_matches('/').to_string(),
@@ -213,6 +225,7 @@ impl DriverCtx {
             workdir_root,
             keep_workdir: set("NOO_HARNESS_KEEP_WORKDIR").is_some_and(|v| v.trim() == "1"),
             timeout,
+            stall,
             ca_path: set("NOO_TLS_CA"),
             path: set("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into()),
             lang: set("LANG").unwrap_or_else(|| "C.UTF-8".into()),
@@ -763,18 +776,23 @@ pub struct RunOutput {
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
+    /// Killed because the CLI made no model call for this long (the stall
+    /// bound); `None` otherwise.
+    pub stalled: Option<Duration>,
     pub elapsed: Duration,
 }
 
 impl RunOutput {
     pub fn succeeded(&self) -> bool {
-        !self.timed_out && self.code == Some(0)
+        !self.timed_out && self.stalled.is_none() && self.code == Some(0)
     }
 
     /// Why the run failed, for a checkpoint note or a turn's error.
     pub fn failure(&self) -> String {
         let tail = tail_lines(&self.stderr, 8);
-        let what = if self.timed_out {
+        let what = if let Some(idle) = self.stalled {
+            format!("stalled: no model call for {}s, killed after {}s", idle.as_secs(), self.elapsed.as_secs())
+        } else if self.timed_out {
             format!("timed out after {}s", self.elapsed.as_secs())
         } else {
             match self.code {
@@ -807,7 +825,14 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R, cap: usize) -> V
 /// to [`OUTPUT_CAP`], in a process group of its own that is killed whole at
 /// `timeout`.
 pub async fn spawn_cli(argv: &[String], env: &BTreeMap<String, String>, cwd: &Path, timeout: Duration, jail: &crate::harness::jail::JailSpec) -> Result<RunOutput> {
-    spawn_cli_as(argv, env, cwd, timeout, jail, None).await
+    spawn_cli_as(argv, env, cwd, timeout, jail, None, None).await
+}
+
+/// The stall bound a run is watched with: the translator's activity clock
+/// and how long it may stand still. `None` = wall clock only (the probe).
+pub struct Stall {
+    pub activity: Arc<crate::harness::translator::Activity>,
+    pub bound: Duration,
 }
 
 /// Who a CLI runs as when it is not the harness's own uid: the child
@@ -824,7 +849,7 @@ pub struct RunAs {
 /// through here, and so both run the CLI inside the jail. Order in the
 /// child (std's `do_exec`): setgid/setuid first, then the `pre_exec` hook
 /// that applies the jail, then exec — so the jail binds the dropped user.
-pub async fn spawn_cli_as(argv: &[String], env: &BTreeMap<String, String>, cwd: &Path, timeout: Duration, jail: &crate::harness::jail::JailSpec, run_as: Option<RunAs>) -> Result<RunOutput> {
+pub async fn spawn_cli_as(argv: &[String], env: &BTreeMap<String, String>, cwd: &Path, timeout: Duration, jail: &crate::harness::jail::JailSpec, run_as: Option<RunAs>, stall: Option<Stall>) -> Result<RunOutput> {
     let (prog, args) = argv.split_first().ok_or_else(|| anyhow!("empty command"))?;
     if run_as.is_some_and(|r| r.uid == 0) {
         bail!("refusing to run a CLI as uid 0");
@@ -850,9 +875,28 @@ pub async fn spawn_cli_as(argv: &[String], env: &BTreeMap<String, String>, cwd: 
     let mut child = cmd.spawn().with_context(|| format!("starting {prog}"))?;
     let out = child.stdout.take().map(|s| tokio::spawn(read_capped(s, OUTPUT_CAP)));
     let err = child.stderr.take().map(|s| tokio::spawn(read_capped(s, OUTPUT_CAP)));
-    let (status, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(s) => (s.ok(), false),
-        Err(_) => {
+    // Wait with two clocks: the wall clock (`timeout`) and, for a run with a
+    // translator, the wire's activity clock (`stall`): a CLI that has made
+    // no model call for `stall.bound` is as dead as one past its deadline
+    // and is killed the same way, with the reason kept for the loop note.
+    let deadline = started + timeout;
+    let mut timed_out = false;
+    let mut stalled = None;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Err(_) => break None,
+            Ok(None) => {}
+        }
+        let now = Instant::now();
+        let idle = stall.as_ref().map(|s| s.activity.idle());
+        let stall_hit = matches!((&stall, idle), (Some(s), Some(i)) if i >= s.bound);
+        if now >= deadline || stall_hit {
+            if stall_hit && now < deadline {
+                stalled = idle;
+            } else {
+                timed_out = true;
+            }
             #[cfg(unix)]
             if let Some(pid) = child.id() {
                 // SAFETY: kill(2) on the process group this child leads.
@@ -861,8 +905,16 @@ pub async fn spawn_cli_as(argv: &[String], env: &BTreeMap<String, String>, cwd: 
                 }
             }
             let _ = child.start_kill();
-            (child.wait().await.ok(), true)
+            break child.wait().await.ok();
         }
+        let next = stall
+            .as_ref()
+            .zip(idle)
+            .map(|(s, i)| s.bound.saturating_sub(i))
+            .unwrap_or(Duration::MAX)
+            .min(deadline.saturating_duration_since(now))
+            .clamp(Duration::from_millis(50), Duration::from_millis(500));
+        tokio::time::sleep(next).await;
     };
     // A grandchild that left the group could hold a pipe open: bound the wait.
     let collect = |h: Option<tokio::task::JoinHandle<Vec<u8>>>| async move {
@@ -878,6 +930,7 @@ pub async fn spawn_cli_as(argv: &[String], env: &BTreeMap<String, String>, cwd: 
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         timed_out,
+        stalled,
         elapsed: started.elapsed(),
     })
 }
@@ -989,8 +1042,10 @@ async fn invoke<R: DriverRail>(ctx: &DriverCtx, rail: &R, ws: &Workspace, prompt
         let env = build_env(ctx, ws, translator.base_url());
         let argv = fill_command(&with_system_prompt(&ctx.launch.command, system_prompt.as_deref()), prompt, &mcp);
         let timeout = effective_timeout(ctx.timeout, key.expires_at, chrono::Utc::now());
-        tracing::info!(kind = %ctx.kind.kind, cli = %argv[0], prompt = variant.name(), task = task_id.unwrap_or(""), timeout_secs = timeout.as_secs(), "harness driver: running the CLI");
-        spawn_cli(&argv, &env, &ws.work, timeout, &ws.jail_spec(ctx, &mcp)).await
+        let bound = if task_id.is_some() { ctx.stall } else { ctx.stall.min(TURN_STALL) };
+        tracing::info!(kind = %ctx.kind.kind, cli = %argv[0], prompt = variant.name(), task = task_id.unwrap_or(""), timeout_secs = timeout.as_secs(), stall_secs = bound.as_secs(), "harness driver: running the CLI");
+        let stall = Stall { activity: translator.activity(), bound };
+        spawn_cli_as(&argv, &env, &ws.work, timeout, &ws.jail_spec(ctx, &mcp), None, Some(stall)).await
     }
     .await;
     let _ = std::fs::remove_file(ws.mcp_path());
@@ -1003,7 +1058,7 @@ async fn invoke<R: DriverRail>(ctx: &DriverCtx, rail: &R, ws: &Workspace, prompt
     rail.door_key_revoke(&key.key_id).await;
     translator.shutdown().await;
     if let Ok(o) = &run {
-        tracing::info!(kind = %ctx.kind.kind, task = task_id.unwrap_or(""), code = ?o.code, timed_out = o.timed_out, secs = o.elapsed.as_secs(), "harness driver: CLI finished");
+        tracing::info!(kind = %ctx.kind.kind, task = task_id.unwrap_or(""), code = ?o.code, timed_out = o.timed_out, stalled_after_secs = o.stalled.map(|d| d.as_secs()), secs = o.elapsed.as_secs(), "harness driver: CLI finished");
     }
     run.map(|o| (o, usage))
 }
@@ -1358,6 +1413,47 @@ mod tests {
         let last = c.checkpoints.last().unwrap();
         assert!(last.2 && last.1.as_deref().unwrap().contains("three consecutive"), "{last:?}");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A vendor CLI that never reaches the model (hung before its first call,
+    /// as Copilot and Claude Code were on mcmini, 2026-10-24) is killed at
+    /// the stall bound with the reason, not at the 900 s wall.
+    #[tokio::test]
+    async fn a_cli_that_never_calls_the_model_is_killed_at_the_stall_bound() {
+        let root = scratch("stall");
+        let k = kind(&["sh", "-c", "sleep 30; echo NOO_RESULT: too late"], &[], &[]);
+        let mut ctx = ctx_for(&k, &root, "60");
+        ctx.stall = Duration::from_secs(1);
+        let mut rail = FakeRail::new();
+        let started = Instant::now();
+        let state = run_task_on(&ctx, &mut rail, &task("t-stall", 1)).await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(15), "the stalled CLI was not killed: {:?}", started.elapsed());
+        assert_eq!(state, "failed");
+        let c = rail.calls.lock().unwrap();
+        let note = c.checkpoints[0].1.as_deref().unwrap();
+        assert!(note.contains("stalled: no model call for"), "{note}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The activity clock: idle counts from the translator's start until the
+    /// first touch, then from the last touch.
+    #[test]
+    fn the_activity_clock_resets_on_every_touch() {
+        let a = crate::harness::translator::Activity::new();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(a.idle() >= Duration::from_millis(30));
+        a.touch();
+        assert!(a.idle() < Duration::from_millis(30));
+    }
+
+    /// `stalled` is a failure of its own: not a success, and named first.
+    #[test]
+    fn a_stalled_run_is_not_a_success_and_says_so() {
+        let o = RunOutput { code: None, stdout: String::new(), stderr: "x".into(), timed_out: false, stalled: Some(Duration::from_secs(300)), elapsed: Duration::from_secs(301) };
+        assert!(!o.succeeded());
+        assert!(o.failure().starts_with("stalled: no model call for 300s"), "{}", o.failure());
+        let ok = RunOutput { code: Some(0), stdout: String::new(), stderr: String::new(), timed_out: false, stalled: None, elapsed: Duration::from_secs(1) };
+        assert!(ok.succeeded());
     }
 
     #[tokio::test]
@@ -1816,7 +1912,7 @@ mod tests {
     async fn a_cli_is_never_run_as_root() {
         let env: BTreeMap<String, String> = [("PATH".to_string(), "/usr/bin:/bin".to_string())].into_iter().collect();
         let jail = crate::harness::jail::JailSpec { workspace: PathBuf::from("/nonexistent-ws"), home: PathBuf::from("/nonexistent-home"), tmp: PathBuf::from("/nonexistent-tmp"), ca_file: None, extra_ro: Vec::new(), data_root: None };
-        let err = spawn_cli_as(&["true".to_string()], &env, Path::new("/"), Duration::from_secs(5), &jail, Some(RunAs { uid: 0, gid: 0 })).await.unwrap_err();
+        let err = spawn_cli_as(&["true".to_string()], &env, Path::new("/"), Duration::from_secs(5), &jail, Some(RunAs { uid: 0, gid: 0 }), None).await.unwrap_err();
         assert!(err.to_string().contains("uid 0"), "{err}");
     }
 
