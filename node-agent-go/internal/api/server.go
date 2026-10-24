@@ -81,7 +81,8 @@ type Server struct {
 	gpuHold    func(ctx context.Context, req gpuyield.HoldRequest) (gpuyield.Contention, error)
 	gpuRelease func(ctx context.Context, req gpuyield.ReleaseRequest) (gpuyield.Contention, error)
 	// diskReclaim reports the node's own disk-reclaim state for /health.
-	diskReclaim func() any
+	diskReclaim    func() any
+	reconcileNudge func()
 
 	// harnessPlacement reports the desired harness placement for
 	// GET /harness/placement. nil until the agent installs it.
@@ -170,6 +171,14 @@ func (s *Server) SetGPUHold(hold func(ctx context.Context, req gpuyield.HoldRequ
 // SetDiskReclaim installs the node disk-reclaim state provider.
 func (s *Server) SetDiskReclaim(f func() any) { s.diskReclaim = f }
 
+// SetReconcileNudge installs the reconciler's Nudge: `POST /reconcile` (the
+// `reconcile` control op) asks for a desired-state pass now instead of at
+// the next tick. The gateway sends it after a placement write, so a kind
+// change or a new placement lands in seconds rather than within
+// reconcile.defaultInterval (5 min; the harness compare on mcmini waited that
+// long per kind, 2026-10-24).
+func (s *Server) SetReconcileNudge(f func()) { s.reconcileNudge = f }
+
 // SetMCP installs the external-MCP supervisor.
 func (s *Server) SetMCP(m *mcpsrv.Supervisor) { s.mcp = m }
 
@@ -254,6 +263,7 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("POST /start", ctrlMW(http.HandlerFunc(s.handleStartBackend)))
 	s.mux.Handle("POST /stop", ctrlMW(http.HandlerFunc(s.handleStopBackend)))
 	s.mux.Handle("POST /restart", ctrlMW(http.HandlerFunc(s.handleRestart)))
+	s.mux.Handle("POST /reconcile", ctrlMW(http.HandlerFunc(s.handleReconcile)))
 	s.mux.Handle("POST /pull", ctrlMW(http.HandlerFunc(s.handlePull)))
 	s.mux.Handle("POST /clean", ctrlMW(http.HandlerFunc(s.handleClean)))
 	s.mux.Handle("GET /gpu", ctrlMW(http.HandlerFunc(s.handleGPUMetrics)))
