@@ -406,9 +406,7 @@ mod node_choice_tests {
 }
 
 pub async fn role_of(state: &AppState, user: &str) -> Option<Role> {
-    let role: Option<String> = sqlx::query_scalar("SELECT role FROM noo_users WHERE username = $1 AND NOT disabled")
-        .bind(user)
-        .fetch_optional(&state.db)
+    let role: Option<String> = crate::repo::users::enabled_role(&state.db, user)
         .await
         .ok()
         .flatten();

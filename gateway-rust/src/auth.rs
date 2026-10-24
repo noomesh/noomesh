@@ -1002,10 +1002,7 @@ pub async fn live_account_role(db: &sqlx::PgPool, subject: &str) -> Option<Role>
         }
     }
     let row: Result<Option<(bool, String)>, _> =
-        sqlx::query_as("SELECT COALESCE(disabled, false), role FROM noo_users WHERE username = $1")
-            .bind(subject)
-            .fetch_optional(db)
-            .await;
+        crate::repo::users::role_and_disabled(db, subject).await;
     let live = match row {
         Ok(Some((false, role))) => role.parse::<Role>().ok(),
         // Disabled, or no such account — fail closed.

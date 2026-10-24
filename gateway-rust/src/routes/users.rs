@@ -355,16 +355,9 @@ async fn user_set_password(
     require_may_manage(&state.db, &ctx, &username).await?;
     check_new_password(&body.password, username.trim())?;
     let hashed = hash_password(&body.password)?;
-    let result = sqlx::query(
-        "UPDATE noo_users SET hashed_password = $1, password_changed_at = NOW(), \
-         failed_login_count = 0, locked_until = NULL WHERE username = $2",
-    )
-    .bind(&hashed)
-    .bind(&username)
-    .execute(&state.db)
-    .await?;
+    let result = crate::repo::users::set_password(&state.db, &username, &hashed).await?;
 
-    if result.rows_affected() == 0 {
+    if result == 0 {
         return Err(AppError::NotFound(format!("user '{username}' not found")));
     }
     // A new password ends every session the old one opened.
@@ -1251,10 +1244,7 @@ pub(crate) async fn erase_account(
     // failure rolls the whole erasure back (nothing half-deleted, unsnapshotted).
     let run_id = uuid::Uuid::new_v4();
     let mut tx = db.begin().await?;
-    let owner: Option<uuid::Uuid> = sqlx::query_scalar("SELECT user_uuid FROM noo_users WHERE username = $1")
-        .bind(&username)
-        .fetch_optional(&mut *tx)
-        .await?;
+    let owner: Option<uuid::Uuid> = crate::repo::users::uuid_by_username(&mut *tx, &username).await?;
     if let Some(owner) = owner {
         // The lock every operation start takes: from here no start for this
         // account can commit until this transaction ends.
@@ -1360,11 +1350,7 @@ async fn orgs_list(
     .await?;
 
     // Member counts per org (small tables; one grouped scan).
-    let counts = sqlx::query_as::<_, (Option<String>, i64)>(
-        "SELECT org_id, COUNT(*) FROM noo_users GROUP BY org_id",
-    )
-    .fetch_all(&state.db)
-    .await?;
+    let counts = crate::repo::users::member_counts_by_org(&state.db).await?;
     let count_of = |id: &str| -> i64 {
         counts.iter().find(|(o, _)| o.as_deref() == Some(id)).map(|(_, n)| *n).unwrap_or(0)
     };
@@ -1503,12 +1489,8 @@ async fn user_link_create(
         ));
     }
     // The link points at a real account — reject before creating a dangling map.
-    let exists: Option<(String,)> =
-        sqlx::query_as("SELECT username FROM noo_users WHERE username = $1")
-            .bind(&username)
-            .fetch_optional(&state.db)
-            .await?;
-    if exists.is_none() {
+    let exists = crate::repo::users::exists(&state.db, &username).await?;
+    if !exists {
         return Err(AppError::NotFound(format!(
             "user '{username}' not found — create it first (noo security user create)"
         )));
@@ -2437,11 +2419,8 @@ async fn validate_operator_key_binding(
             crate::mcp_local::OPERATOR_SCOPE
         )));
     };
-    let row: Option<(String,)> = sqlx::query_as("SELECT role FROM noo_users WHERE username = $1")
-        .bind(u)
-        .fetch_optional(db)
-        .await?;
-    match row.as_ref().map(|(r,)| r.as_str()) {
+    let row: Option<String> = crate::repo::users::role_of(db, u).await?;
+    match row.as_deref() {
         Some("admin") => Ok(()),
         Some(role) => Err(AppError::BadRequest(format!(
             "user '{u}' has role '{role}'; an '{}' key needs an admin",
@@ -2529,15 +2508,11 @@ async fn validate_key_user(
     let Some(u) = user_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(());
     };
-    let row: Option<(bool,)> =
-        sqlx::query_as("SELECT disabled FROM noo_users WHERE username = $1")
-            .bind(u)
-            .fetch_optional(db)
-            .await?;
+    let row: Option<bool> = crate::repo::users::disabled_flag(db, u).await?;
     match row {
         None => Err(AppError::BadRequest(format!("user '{u}' not found"))),
-        Some((true,)) => Err(AppError::BadRequest(format!("user '{u}' is disabled"))),
-        Some((false,)) => Ok(()),
+        Some(true) => Err(AppError::BadRequest(format!("user '{u}' is disabled"))),
+        Some(false) => Ok(()),
     }
 }
 
@@ -3320,10 +3295,7 @@ async fn effective_tier(
     username: &str,
 ) -> Result<Option<crate::auth::Role>, AppError> {
     let row: Option<(String, Value)> =
-        sqlx::query_as("SELECT role, scopes FROM noo_users WHERE username = $1")
-            .bind(username.trim())
-            .fetch_optional(db)
-            .await?;
+        crate::repo::users::role_and_scopes(db, username.trim()).await?;
     Ok(row.map(|(role, scopes)| {
         // An unparseable role column must not silently read as `User` — that
         // is the low-protection answer. Anything we cannot parse is treated
@@ -3419,13 +3391,7 @@ fn require_may_grant_value(
 /// desynced row cannot make the fleet look like it has fewer admins than it
 /// does — which would be the direction that lets the guard be bypassed.
 async fn enabled_admin_count(db: &sqlx::PgPool) -> Result<i64, AppError> {
-    let (n,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM noo_users WHERE disabled = false \
-         AND (role = 'admin' OR scopes @> '[\"admin\"]'::jsonb)",
-    )
-    .fetch_one(db)
-    .await?;
-    Ok(n)
+    Ok(crate::repo::users::enabled_admin_count(db).await?)
 }
 
 /// The last-admin guard: refuse to disable, erase or demote the only enabled
@@ -3445,11 +3411,8 @@ async fn require_not_last_admin(
     if effective_tier(db, username).await? != Some(crate::auth::Role::Admin) {
         return Ok(());
     }
-    let disabled: Option<(bool,)> = sqlx::query_as("SELECT disabled FROM noo_users WHERE username = $1")
-        .bind(username)
-        .fetch_optional(db)
-        .await?;
-    if disabled.map(|(d,)| d).unwrap_or(true) {
+    let disabled: Option<bool> = crate::repo::users::disabled_flag(db, username).await?;
+    if disabled.unwrap_or(true) {
         // Already disabled, or gone: it is not one of the live admins, so
         // removing it cannot strand the surface.
         return Ok(());
@@ -4238,12 +4201,7 @@ async fn api_kb_teams_create(
     // org; default to `default` (single-org, or internal caller).
     let mut org_id: Option<String> = None;
     if by != "internal" {
-        let row: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT org_id FROM noo_users WHERE username = $1")
-                .bind(&by)
-                .fetch_optional(&state.db)
-                .await?;
-        org_id = row.and_then(|(o,)| o);
+        org_id = crate::repo::users::org_of(&state.db, &by).await?;
     }
     let org_id = org_id.unwrap_or_else(|| "default".to_string());
 
@@ -5788,7 +5746,7 @@ mod session_end_tests {
     fn every_account_changing_route_ends_the_sessions() {
         let src = include_str!("users.rs");
         for (sig, write) in [
-            ("async fn user_set_password(", "UPDATE noo_users SET hashed_password"),
+            ("async fn user_set_password(", "users::set_password("),
             ("async fn user_disable(", "set_disabled(&state.db"),
             ("async fn user_set_scopes(", "exec_user_set_scopes("),
             ("async fn user_set_role(", "users::set_role("),

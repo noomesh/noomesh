@@ -480,10 +480,7 @@ async fn token(
     // explicitly: minting a working token for an account someone has just
     // switched off is the exact failure this endpoint would be blamed for.
     let row: Option<(String, serde_json::Value, bool)> =
-        sqlx::query_as("SELECT role, scopes, COALESCE(disabled, false) FROM noo_users WHERE username = $1")
-            .bind(account)
-            .fetch_optional(&state.db)
-            .await?;
+        crate::repo::users::role_scopes_disabled(&state.db, account).await?;
     let Some((role_col, scopes_col, disabled)) = row else {
         return Err(AppError::NotFound(format!("account '{account}' not found")));
     };

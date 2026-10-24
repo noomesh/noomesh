@@ -278,9 +278,7 @@ pub fn origin_of(ctx: &Option<axum::Extension<RequesterCtx>>) -> Origin {
 pub async fn resolve_origin(db: &sqlx::PgPool, ctx: &Option<axum::Extension<RequesterCtx>>) -> Origin {
     match origin_of(ctx) {
         Origin::Person { account, role } => {
-            let human: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM noo_users WHERE username = $1 AND NOT disabled)")
-                .bind(&account)
-                .fetch_one(db)
+            let human: bool = crate::repo::users::is_enabled(db, &account)
                 .await
                 // Cannot tell: not a person.
                 .unwrap_or(false);

@@ -271,10 +271,7 @@ async fn grafana_session(
     // same as every other place a person accumulates.
     let account = crate::auth::account_of(&sub);
     let row: Option<(String, serde_json::Value, bool)> =
-        sqlx::query_as("SELECT role, scopes, COALESCE(disabled, false) FROM noo_users WHERE username = $1")
-            .bind(account)
-            .fetch_optional(&state.db)
-            .await?;
+        crate::repo::users::role_scopes_disabled(&state.db, account).await?;
     let (live, disabled) = match row {
         None => (None, false),
         Some((role_col, scopes_col, disabled)) => {
@@ -345,7 +342,7 @@ mod tests {
         let body = src.split("async fn grafana_session(").nth(1).expect("the handler exists");
         let body = body.split("#[cfg(test)]").next().unwrap();
         assert!(body.contains("grafana_session_role("), "the handler must call auth::grafana_session_role");
-        assert!(body.contains("FROM noo_users"), "the handler must re-read the account row");
+        assert!(body.contains("users::role_scopes_disabled("), "the handler must re-read the account row");
         assert!(body.contains("mint_grafana_jwt_with("), "the handler must mint through the pinned mint");
         assert!(
             !body.contains("r.role") && !body.contains(".role,") && !body.contains("ctx.role"),

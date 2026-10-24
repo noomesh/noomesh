@@ -672,12 +672,10 @@ async fn host_ticket_login(
         Some(mut u) => {
             // `lookup_user_db` folds a lockout into `disabled`; the ticket
             // honours `disabled` itself and nothing else.
-            let disabled: Option<(bool,)> = sqlx::query_as("SELECT disabled FROM noo_users WHERE username = $1")
-                .bind(username)
-                .fetch_optional(&state.db)
+            let disabled: Option<bool> = crate::repo::users::disabled_flag(&state.db, username)
                 .await
-                .unwrap_or(Some((true,)));
-            if disabled.map(|(d,)| d).unwrap_or(true) {
+                .unwrap_or(Some(true));
+            if disabled.unwrap_or(true) {
                 audit_auth(&state.db, crate::audit::AuditKind::AuthFailure, username, "account_disabled", ip).await;
                 return refused();
             }
@@ -1197,23 +1195,7 @@ async fn lookup_user_db(
     db: &sqlx::PgPool,
     username: &str,
 ) -> Result<Option<UserRecord>, sqlx::Error> {
-    let row = sqlx::query_as::<_, (
-        String,                                         // username
-        String,                                         // hashed_password
-        bool,                                           // disabled
-        serde_json::Value,                              // scopes (JSONB)
-        Option<i32>,                                    // failed_login_count
-        Option<chrono::DateTime<chrono::Utc>>,          // locked_until
-        String,                                         // role (migration 050)
-    )>(
-        "SELECT username, hashed_password, disabled, \
-                COALESCE(scopes, '[\"read\"]'::jsonb), \
-                COALESCE(failed_login_count, 0), locked_until, role \
-         FROM noo_users WHERE username = $1"
-    )
-    .bind(username)
-    .fetch_optional(db)
-    .await?;
+    let row = crate::repo::users::login_row(db, username).await?;
 
     let row = match row {
         Some(r) => r,
@@ -1277,13 +1259,7 @@ async fn admin_census(db: &sqlx::PgPool) -> AdminCensus {
     // says one exists. (A drifted row — admin scope, non-admin role — cannot
     // mint admin tokens, but counting it still only keeps the bootstrap door
     // shut, which is the safe direction.)
-    let exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM noo_users \
-         WHERE disabled = false \
-           AND (role = 'admin' OR scopes @> '[\"admin\"]'::jsonb))",
-    )
-    .fetch_one(db)
-    .await;
+    let exists = crate::repo::users::any_enabled_admin(db).await;
 
     match exists {
         Ok(true) => AdminCensus::AtLeastOne,
@@ -1417,20 +1393,7 @@ fn strike_outcome(recorded: &Result<(), sqlx::Error>) -> StrikeOutcome {
 async fn record_failed_login(db: &sqlx::PgPool, username: &str) -> Result<(), sqlx::Error> {
     // The threshold and the window are bound, not interpolated: sqlx 0.9
     // refuses a dynamic SQL string, and a literal with binds is what we want.
-    let r = sqlx::query(
-        "UPDATE noo_users SET failed_login_count = COALESCE(failed_login_count, 0) + 1, \
-         locked_until = CASE \
-           WHEN COALESCE(failed_login_count, 0) + 1 >= $2 THEN NOW() + make_interval(mins => $3) \
-           ELSE locked_until \
-         END \
-         WHERE username = $1",
-    )
-    .bind(username)
-    .bind(LOCKOUT_STRIKES)
-    .bind(LOCKOUT_MINUTES)
-    .execute(db)
-    .await
-    .map(|_| ());
+    let r = crate::repo::users::record_failed_login(db, username, LOCKOUT_STRIKES, LOCKOUT_MINUTES).await;
     if let Err(e) = &r {
         tracing::error!(username = %username, error = %e, "failed-login strike could not be recorded; refusing the attempt");
     }
@@ -1440,14 +1403,7 @@ async fn record_failed_login(db: &sqlx::PgPool, username: &str) -> Result<(), sq
 /// Reset failed login count on successful login. A failure is logged and the
 /// login continues: a stale counter is not a reason to deny a correct password.
 async fn record_successful_login(db: &sqlx::PgPool, username: &str) -> Result<(), sqlx::Error> {
-    let r = sqlx::query(
-        "UPDATE noo_users SET failed_login_count = 0, locked_until = NULL, \
-         last_login_at = NOW() WHERE username = $1"
-    )
-    .bind(username)
-    .execute(db)
-    .await
-    .map(|_| ());
+    let r = crate::repo::users::record_successful_login(db, username).await;
     if let Err(e) = &r {
         tracing::error!(username = %username, error = %e, "successful-login reset could not be recorded; continuing");
     }
