@@ -1727,12 +1727,7 @@ async fn settings_flags_list(
     // verify row answer "who turned names on" from this, not from a log.
     let mut db_meta: std::collections::HashMap<String, (Option<String>, Option<String>)> =
         std::collections::HashMap::new();
-    match sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
-        "SELECT key, value, updated_by, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') FROM noo_settings",
-    )
-        .fetch_all(&state.db)
-        .await
-    {
+    match crate::repo::settings::all_with_meta(&state.db).await {
         Ok(rows) => {
             for (k, v, by, at) in rows {
                 db_meta.insert(k.clone(), (by, at));
@@ -1866,18 +1861,7 @@ async fn settings_flags_set(
             Some(other) => other.to_string(),
             None => String::new(),
         };
-        sqlx::query(
-            "INSERT INTO noo_settings (key, value, category, updated_by, updated_at) \
-             VALUES ($1, $2, $3, $4, NOW()) \
-             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, \
-               updated_by = EXCLUDED.updated_by, updated_at = NOW()",
-        )
-        .bind(&key)
-        .bind(&raw)
-        .bind(sspec.category)
-        .bind(&by)
-        .execute(&state.db)
-        .await?;
+        crate::repo::settings::upsert(&state.db, &key, &raw, sspec.category, &by).await?;
         crate::audit::record(
             &state.db,
             AuditEvent::new(AuditKind::SettingFlagSet, &by, &format!("settings:string:{key}"))
@@ -1901,18 +1885,7 @@ async fn settings_flags_set(
     };
     let val = if on { "1" } else { "0" };
 
-    sqlx::query(
-        "INSERT INTO noo_settings (key, value, category, updated_by, updated_at) \
-         VALUES ($1, $2, $3, $4, NOW()) \
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, \
-           updated_by = EXCLUDED.updated_by, updated_at = NOW()",
-    )
-    .bind(&key)
-    .bind(val)
-    .bind(spec.category)
-    .bind(&by)
-    .execute(&state.db)
-    .await?;
+    crate::repo::settings::upsert(&state.db, &key, val, spec.category, &by).await?;
     // This gateway honours it on its next read; others within the 15 s
     // reload (`crate::settings::spawn_refresh`).
     crate::settings::set_override(&key, val);
@@ -3168,7 +3141,7 @@ mod tests {
         let src = include_str!("settings.rs");
         let set = &src[src.find("async fn settings_flags_set(").unwrap()..];
         let gate = set.find("needs_person(&key)").expect("the setter does not call needs_person");
-        let first_write = set.find("INSERT INTO noo_settings").unwrap();
+        let first_write = set.find("repo::settings::upsert(").unwrap();
         assert!(gate < first_write, "the person gate must come before the first write");
         assert!(set[gate..first_write].contains("AppError::Forbidden"), "a refused caller must get 403");
     }
