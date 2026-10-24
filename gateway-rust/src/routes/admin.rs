@@ -2619,7 +2619,7 @@ async fn approval_approve(
         .as_ref()
         .and_then(|b| b.get("approved_by"))
         .and_then(|v| v.as_str())
-        .unwrap_or(&requester);
+        .unwrap_or(requester);
 
     let now = chrono::Utc::now();
 
@@ -2674,7 +2674,7 @@ async fn approval_deny(
         .as_ref()
         .and_then(|b| b.get("denied_by"))
         .and_then(|v| v.as_str())
-        .unwrap_or(&requester);
+        .unwrap_or(requester);
 
     let now = chrono::Utc::now();
 
