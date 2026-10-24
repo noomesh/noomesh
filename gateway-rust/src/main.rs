@@ -91,6 +91,7 @@ mod model_presence;
 mod placement_fit;
 mod role_capability;
 mod backup_completion;
+mod backup_overdue;
 mod placement_stuck;
 mod self_node;
 mod node_name_claim;

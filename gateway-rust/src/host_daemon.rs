@@ -157,6 +157,32 @@ pub fn classify(hb: &Heartbeat, op: &str, now: chrono::DateTime<chrono::Utc>) ->
     DaemonStatus::Ready { version: hb.version.clone() }
 }
 
+/// The newest Postgres dump hostd saw in the backup directory
+/// (`backup.newest_ts` in its heartbeat). A second witness for "when was the
+/// last backup": it comes from the FILES, through a daemon that survives a
+/// dead database, so it still answers when the scheduler's own history cannot.
+/// `None` when there is no heartbeat, no such field (an older daemon), or no dump.
+pub fn newest_backup_from(raw: &[u8]) -> Option<chrono::DateTime<chrono::Utc>> {
+    #[derive(Deserialize)]
+    struct Beat {
+        backup: Option<Facts>,
+    }
+    #[derive(Deserialize)]
+    struct Facts {
+        #[serde(default)]
+        newest_ts: String,
+    }
+    let beat: Beat = serde_json::from_slice(raw).ok()?;
+    let ts = beat.backup?.newest_ts;
+    chrono::DateTime::parse_from_rfc3339(&ts).ok().map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// [`newest_backup_from`] over the spool's heartbeat file.
+pub async fn newest_backup() -> Option<chrono::DateTime<chrono::Utc>> {
+    let path = std::path::Path::new(&spool_dir()).join("hostd.heartbeat.json");
+    newest_backup_from(&tokio::fs::read(&path).await.ok()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,5 +288,14 @@ mod tests {
             assert!(r.contains("db-resync"), "{s:?} remediation does not name the op: {r}");
         }
         assert!(DaemonStatus::Ready { version: "v1".into() }.remediation("db-resync").is_empty());
+    }
+
+    #[test]
+    fn the_newest_backup_is_read_from_the_heartbeat_and_absent_on_older_daemons() {
+        let t = newest_backup_from(br#"{"pid":1,"backup":{"dir":"/b","newest_ts":"2026-10-23T07:31:00Z","count":2}}"#)
+            .expect("a heartbeat carrying backup facts");
+        assert_eq!(t.to_rfc3339(), "2026-10-23T07:31:00+00:00");
+        assert!(newest_backup_from(br#"{"pid":1}"#).is_none());
+        assert!(newest_backup_from(br#"{"pid":1,"backup":{"dir":"/b","count":0}}"#).is_none(), "no dump yet");
     }
 }

@@ -98,6 +98,59 @@ pub fn judge(
     elapsed: Duration,
     visible_size: &dyn Fn(&str) -> Option<u64>,
 ) -> Verdict {
+    let verdict = judge_dump(result, elapsed, visible_size);
+    // The off-site outcome is part of the run's text, success OR failure: a
+    // success line that cannot say whether anything left the machine hid, on
+    // 2026-10-24, a configured destination that was never copied to.
+    let Some(note) = offsite_note(result) else { return verdict };
+    match verdict {
+        Verdict::Succeeded { text } => Verdict::Succeeded { text: format!("{text}; off-site: {note}") },
+        Verdict::Failed { error } => Verdict::Failed { error: format!("{error} (off-site: {note})") },
+        v => v,
+    }
+}
+
+/// hostd's off-site outcome line (`offsite` in the result), if it sent one.
+pub fn offsite_note(result: Option<&Value>) -> Option<String> {
+    result?
+        .get("offsite")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+}
+
+/// The note the script prints while off-site has never been decided.
+pub const OFFSITE_UNDECIDED_PREFIX: &str = "not decided";
+pub const OFFSITE_ALERT_KIND: &str = "database_backup.offsite_undecided";
+/// At most one reminder a week.
+pub const OFFSITE_ALERT_COOLDOWN_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// The weekly nudge while off-site is undecided. `none` set on purpose says
+/// "declined" and never reaches this.
+pub fn offsite_undecided_alert(result: Option<&Value>, task_id: &str) -> Option<OperatorAlert> {
+    let res = result.filter(|r| r.get("status").and_then(Value::as_str) != Some("running"))?;
+    let note = offsite_note(Some(res))?;
+    if !note.starts_with(OFFSITE_UNDECIDED_PREFIX) {
+        return None;
+    }
+    Some(
+        OperatorAlert::new(
+            OFFSITE_ALERT_KIND,
+            task_id,
+            "⚠️ Every database backup is on this machine only — off-site storage has never been decided. \
+             The data and its backups share one machine.",
+        )
+        .detail(note)
+        .investigate("noo backups setup"),
+    )
+}
+
+fn judge_dump(
+    result: Option<&Value>,
+    elapsed: Duration,
+    visible_size: &dyn Fn(&str) -> Option<u64>,
+) -> Verdict {
     // A missing, half-written or still-`running` result is "not yet".
     let finished = result.filter(|r| r.get("status").and_then(Value::as_str) != Some("running"));
     let Some(res) = finished else {
@@ -276,6 +329,9 @@ pub async fn tick(state: &Arc<AppState>) -> anyhow::Result<()> {
             .await
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok());
+        if let Some(alert) = offsite_undecided_alert(result.as_ref(), &run.task_id) {
+            crate::operator_alert::send_operator_alert_with(state, alert, OFFSITE_ALERT_COOLDOWN_SECS).await;
+        }
         match settle(&state.db, &run, Utc::now(), result.as_ref(), &on_disk_size).await {
             Ok(Some(alert)) => {
                 tracing::warn!(run_id = %run.run_id, task_id = %run.task_id, "database_backup_failed");
@@ -401,6 +457,50 @@ mod tests {
         let r = json!({"ok": true, "artifact": "/b/pg.enc", "bytes": 5_000_000u64, "duration_ms": 6_000_000u64});
         let v = judge(Some(&r), mins(100), &cant_see);
         assert!(matches!(v, Verdict::Succeeded { .. }), "{v:?}");
+    }
+
+    #[test]
+    fn the_runs_text_states_the_offsite_outcome_on_success_and_failure() {
+        let ok = json!({"ok": true, "artifact": "/b/pg.enc", "bytes": 5_000_000u64, "duration_ms": 1000u64,
+                        "offsite": "copied 1 artifact(s) to dir:/mnt/x"});
+        match judge(Some(&ok), mins(2), &cant_see) {
+            Verdict::Succeeded { text } => assert!(text.ends_with("; off-site: copied 1 artifact(s) to dir:/mnt/x"), "{text}"),
+            v => panic!("{v:?}"),
+        }
+        let undecided = json!({"ok": true, "artifact": "/b/pg.enc", "bytes": 9u64, "duration_ms": 1u64,
+                               "offsite": "not decided (noo backups setup)"});
+        match judge(Some(&undecided), mins(2), &cant_see) {
+            Verdict::Succeeded { text } => assert!(text.contains("off-site: not decided"), "{text}"),
+            v => panic!("{v:?}"),
+        }
+        let bad = json!({"ok": false, "stderr": "offsite: FAILED", "offsite": "FAILED: /mnt/x missing"});
+        match judge(Some(&bad), mins(2), &cant_see) {
+            Verdict::Failed { error } => assert!(error.contains("off-site: FAILED: /mnt/x missing"), "{error}"),
+            v => panic!("{v:?}"),
+        }
+        // An older hostd sends no outcome: the text is unchanged.
+        let old = json!({"ok": true, "artifact": "/b/pg.enc", "bytes": 9u64, "duration_ms": 1u64});
+        match judge(Some(&old), mins(2), &cant_see) {
+            Verdict::Succeeded { text } => assert!(!text.contains("off-site")),
+            v => panic!("{v:?}"),
+        }
+    }
+
+    #[test]
+    fn only_an_undecided_offsite_nudges_and_none_set_on_purpose_stays_quiet() {
+        let undecided = json!({"ok": true, "offsite": "not decided (noo backups setup)"});
+        let a = offsite_undecided_alert(Some(&undecided), "database_backup").expect("undecided must nudge");
+        assert_eq!(a.kind, OFFSITE_ALERT_KIND);
+        assert_eq!(a.target, "database_backup", "cooldown is scoped per task");
+        assert_eq!(a.investigate.as_deref(), Some("noo backups setup"));
+        assert_eq!(OFFSITE_ALERT_COOLDOWN_SECS, 7 * 86_400);
+        for quiet in ["declined (recorded as accepted)", "copied 1 artifact(s) to dir:/x", "portable — nothing copied"] {
+            let r = json!({"ok": true, "offsite": quiet});
+            assert!(offsite_undecided_alert(Some(&r), "database_backup").is_none(), "{quiet}");
+        }
+        let running = json!({"status": "running", "offsite": "not decided"});
+        assert!(offsite_undecided_alert(Some(&running), "database_backup").is_none());
+        assert!(offsite_undecided_alert(None, "database_backup").is_none());
     }
 
     fn a_run() -> PendingRun {

@@ -86,6 +86,12 @@ async fn run_loop(state: Arc<AppState>) {
     // bounded grace expires.
     wait_for_cluster_warm(&state).await;
 
+    // A critical task (the database backup) whose newest success is older than
+    // its schedule allows is told to the operator NOW, before the first poll
+    // fires the catch-up: the scheduler cannot report its own outage while it
+    // is down, so the moment it is back is the earliest it can speak.
+    crate::backup_overdue::check(&state).await;
+
     let mut tick = interval(Duration::from_secs(POLL_INTERVAL_SECS));
     let mut reload_tick = interval(Duration::from_secs(RELOAD_CHECK_SECS));
     // Skip the first immediate tick on both timers — we want a full
@@ -98,6 +104,7 @@ async fn run_loop(state: Arc<AppState>) {
         tokio::select! {
             _ = tick.tick() => {
                 crate::loop_health::record_tick("heartbeat_scheduler", POLL_INTERVAL_SECS);
+                crate::backup_overdue::check(&state).await;
                 if let Err(e) = poll_and_dispatch(state.clone()).await {
                     tracing::warn!(error = %e, "heartbeat_loop_poll_error");
                 }

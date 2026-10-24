@@ -308,6 +308,16 @@ alongside it under a separate passphrase. The full procedure — what is
 backed up, where it should live, the restore drill, restoring onto a fresh
 machine, and `noo migrate export/import` — is
 [runbooks/backup-restore-secrets.md](runbooks/backup-restore-secrets.md).
+A backup that never ran is an alert too, not only one that ran and failed: when the
+newest success is older than the task's schedule plus two hours, the scheduler
+says so as soon as it is back (before the catch-up run), and again when a
+success lands. `noo backups status` and `noo cluster verify --controller` show
+the age of the last good backup (files and task history, and when they
+disagree), and whether the newest dump has left the machine
+(`NOO_BACKUP_OFFSITE`, recorded in `.env`, read by the backup script itself so a
+hostd-run backup sees it). Undecided off-site is a WARN and a weekly alert;
+`noo backups setup` decides it, and `none` is an accepted answer.
+
 Run the drill monthly:
 
 ```sh
