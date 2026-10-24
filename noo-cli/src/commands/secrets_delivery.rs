@@ -99,7 +99,6 @@ pub(crate) const ENV_ALLOWED: &[(&str, &str)] = &[
     ("GF_SERVER_CERT_KEY", "a PATH to the PEM, not the key"),
     ("NOO_GRAFANA_SSO_KEY", "a PATH to the PEM, not the key"),
     ("GF_SECURITY_ADMIN_PASSWORD", "a `$__file{/run/secrets/…}` pointer Grafana expands itself, not the password"),
-    ("NOO_SELF_CALL_SHARED_SECRET", "a posture bridge flag (\"0\" closes it), not a credential"),
     ("GPG_KEY", "an upstream image's public release-signing key fingerprint"),
     // The provider/channel keys (ANTHROPIC_API_KEY, TAVILY_API_KEY,
     // TELEGRAM_BOT_TOKEN, …) are NOT here any more: they are file-backed
@@ -1069,7 +1068,7 @@ mod tests {
                 h(
                     "noo-gateway",
                     "gateway",
-                    &["NOO_JWT_SECRET_FILE", "PGPASSFILE", "NOO_TLS_KEY", "TAVILY_API_KEY_FILE", "NOO_SELF_CALL_SHARED_SECRET"],
+                    &["NOO_JWT_SECRET_FILE", "PGPASSFILE", "NOO_TLS_KEY", "TAVILY_API_KEY_FILE"],
                 ),
                 h("noo-worker", "worker", &["TELEGRAM_BOT_TOKEN_FILE", "GOOGLE_CHAT_CREDENTIALS_JSON_FILE"]),
                 h("noo-grafana", "grafana", &["GF_SECURITY_ADMIN_PASSWORD", "GF_SERVER_CERT_KEY"]),

@@ -354,7 +354,7 @@ empty values and for the **published placeholders** (`changeme`, `admin`,
 the **audit key** (`NOO_AUDIT_HMAC_KEY` missing is CRITICAL: the gateway
 refuses to start without it); **mTLS enforcement** judged on its effective
 value (explicitly off, or no cluster CA, is HIGH); an explicit `NOO_CSP=0`/`off`
-(MEDIUM; CSP is opt-in); the env-only hatches `NOO_SELF_CALL_SHARED_SECRET`,
+(MEDIUM; CSP is opt-in); the env-only hatches
 `NOO_NATS_ALLOW_ANONYMOUS` and `NOO_ALLOW_LOCAL_PYTHON_EXEC` (HIGH each);
 the gateway's running **exec approval mode** when it is neither `strict` nor
 `approval` (HIGH; a not-yet-restarted `auto` row is MEDIUM);

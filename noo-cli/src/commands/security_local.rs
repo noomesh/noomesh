@@ -285,14 +285,9 @@ pub(crate) struct PostureInputs {
 
 /// An escape hatch that exists ONLY as an environment variable: no posture
 /// row governs it, and setting it removes a layer. (name, what it removes,
-/// remedy). `NOO_SELF_CALL_SHARED_SECRET` is also a posture bridge; the scan
-/// reads both the env and the gateway's running value.
+/// remedy). (`NOO_SELF_CALL_SHARED_SECRET` was one until the gateway deleted
+/// that bridge: a leftover value is inert and is not a hatch.)
 pub(crate) const ENV_HATCHES: &[(&str, &str, &str)] = &[
-    (
-        "NOO_SELF_CALL_SHARED_SECRET",
-        "a shared-secret token buys inference instead of a per-consumer key",
-        "unset it (and `noo security posture set NOO_SELF_CALL_SHARED_SECRET 0`), then `noo stack restart --force`",
-    ),
     (
         "NOO_NATS_ALLOW_ANONYMOUS",
         "bus clients may connect without a per-principal credential",
@@ -1120,8 +1115,8 @@ fn env_or_dotenv(root: &Path, key: &str) -> Option<String> {
 }
 
 /// Read `posture list`'s JSON for the two rows the scan judges.
-/// `(exec running, exec desired, shared-secret bridge running)`.
-pub(crate) fn posture_view(body: &serde_json::Value) -> (Option<String>, Option<String>, bool) {
+/// `(exec running, exec desired)`.
+pub(crate) fn posture_view(body: &serde_json::Value) -> (Option<String>, Option<String>) {
     let empty = Vec::new();
     let gates = body["posture"].as_array().unwrap_or(&empty);
     let row = |k: &str| gates.iter().find(|g| g["key"] == k);
@@ -1129,9 +1124,6 @@ pub(crate) fn posture_view(body: &serde_json::Value) -> (Option<String>, Option<
     (
         exec.and_then(|g| g["running"].as_str()).map(String::from),
         exec.and_then(|g| g["db_value"].as_str()).map(String::from),
-        row("NOO_SELF_CALL_SHARED_SECRET")
-            .and_then(|g| g["running"].as_str())
-            .is_some_and(flag_is_on),
     )
 }
 
@@ -1191,26 +1183,26 @@ fn install_findings(
     // (exit 3) before the scan could report the finding.
     let transport_refused = crate::http::resolve_trust(&gateway_url).err();
     let posture_body = if transport_refused.is_some() { None } else { get_posture(g) };
-    let (exec_running, exec_desired, self_call_running) = match &posture_body {
+    let (exec_running, exec_desired) = match &posture_body {
         Some(b) => {
-            checked.push("gateway posture (exec approval mode, shared-secret bridge)".into());
+            checked.push("gateway posture (exec approval mode)".into());
             posture_view(b)
         }
         None if transport_refused.is_some() => {
             not_checked.push(
-                "gateway posture (exec approval mode, shared-secret bridge): not asked, the gateway's transport \
+                "gateway posture (exec approval mode): not asked, the gateway's transport \
                  is refused (see Gateway Transport)"
                     .into(),
             );
-            (None, None, false)
+            (None, None)
         }
         None => {
             not_checked.push(
-                "gateway posture (exec approval mode, shared-secret bridge): the gateway did not answer or no \
+                "gateway posture (exec approval mode): the gateway did not answer or no \
                  operator login is stored — noo auth login, then re-run"
                     .into(),
             );
-            (None, None, false)
+            (None, None)
         }
     };
 
@@ -1230,15 +1222,11 @@ fn install_findings(
         None
     };
 
-    let mut hatches: Vec<String> = ENV_HATCHES
+    let hatches: Vec<String> = ENV_HATCHES
         .iter()
-        .filter(|(n, _, _)| *n != "NOO_SELF_CALL_SHARED_SECRET")
         .filter(|(n, _, _)| env_or_dotenv(root, n).is_some_and(|v| flag_is_on(&v)))
         .map(|(n, _, _)| n.to_string())
         .collect();
-    if env_or_dotenv(root, "NOO_SELF_CALL_SHARED_SECRET").is_some_and(|v| flag_is_on(&v)) || self_call_running {
-        hatches.insert(0, "NOO_SELF_CALL_SHARED_SECRET".to_string());
-    }
     let ca_usable = pki_dir().join("ca.crt").exists();
     let mtls_raw = env_or_dotenv(root, "NOO_MTLS_GATEWAY");
 
@@ -5595,7 +5583,7 @@ mod tests {
     #[test]
     fn env_only_hatches_are_high_and_name_the_remedy() {
         let f = posture_with(|p| p.env_hatches = ENV_HATCHES.iter().map(|(n, _, _)| n.to_string()).collect());
-        assert_eq!(f.iter().filter(|(s, c, _)| *s == "HIGH" && *c == "Escape Hatch").count(), 3, "{f:?}");
+        assert_eq!(f.iter().filter(|(s, c, _)| *s == "HIGH" && *c == "Escape Hatch").count(), 2, "{f:?}");
         for (n, _, fix) in ENV_HATCHES {
             assert!(f.iter().any(|(_, _, d)| d.contains(n) && d.contains(fix)), "{n}");
         }
@@ -5632,8 +5620,9 @@ mod tests {
             {"key": "NOO_EXEC_APPROVAL_MODE", "running": "strict", "db_value": "approval"},
             {"key": "NOO_SELF_CALL_SHARED_SECRET", "running": "1", "db_value": "1"},
         ]});
-        assert_eq!(posture_view(&body), (Some("strict".into()), Some("approval".into()), true));
-        assert_eq!(posture_view(&serde_json::json!({})), (None, None, false));
+        // A leftover row for the deleted bridge is inert: it is not read.
+        assert_eq!(posture_view(&body), (Some("strict".into()), Some("approval".into())));
+        assert_eq!(posture_view(&serde_json::json!({})), (None, None));
     }
 
     /// Which root, how it was chosen, and whether it is a node — the first
