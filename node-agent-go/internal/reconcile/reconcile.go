@@ -13,6 +13,13 @@
 //     restarts / stops backends through StartBackendSDK with placement
 //     overrides (model, image, port, tls, env, models_dir).
 //
+// One pass is a list of phases (reconcilePhases) sharing a tick: fetchDesired,
+// publishProfileAndEmbedTarget, settleEmptyState, convergeMcpServers,
+// ensureModelsDir, discoverNative, readFloatingRefs, planEffective,
+// sizeGpuYield, prefetch, convergePlacements (convergeHarness or
+// convergeContainer per placement), reportAndCleanup. A phase returns false
+// to end the pass early.
+//
 // Placements whose model FILE is absent are skipped with a loud log
 // (`reconcile.model_missing`) instead of starting a crash-looping
 // container — the exact 2026-07-03 host8 failure mode.
@@ -287,29 +294,97 @@ func (r *Reconciler) nudgeCh() chan struct{} {
 	return r.nudge
 }
 
+// tick is the state of one reconcile pass, built up phase by phase.
+type tick struct {
+	desired *desiredConfig
+	// modelsDir is the models dir this node agreed to mount: "" when the
+	// controller named none or this node refused it (ensureModelsDir).
+	modelsDir string
+	owner     string
+	// running: backend -> model of the containers up now. native: backends
+	// served by a process the operator runs (not ours to manage). specLabels:
+	// the spec hash stamped on each running container. floating: backends on
+	// an unpinned image ref.
+	running    map[string]string
+	native     map[string]string
+	specLabels map[string]string
+	floating   map[string]string
+	// effective: ONE placement per backend after multi-role merging.
+	effective []placement
+	// ollamaRows: every still-wanted ollama placement (all roles).
+	ollamaRows []placement
+}
+
+// phase is one step of a reconcile pass. It returns false to end the pass
+// early (the state it found makes the rest meaningless), true to go on.
+type phase struct {
+	name string
+	run  func(r *Reconciler, ctx context.Context, t *tick) bool
+}
+
+// reconcilePhases is the order of a pass: fetch desired state; publish what
+// the node advertises from it; stop early when nothing is desired; MCP
+// servers (before backends — a discovery report is small, a pull is not);
+// the models dir; what is running here; multi-role merge; the shared-GPU
+// yield's sizing; image prefetch; converge each placement; then reap what
+// was removed.
+var reconcilePhases = []phase{
+	{"fetchDesired", (*Reconciler).fetchDesired},
+	{"publishProfileAndEmbedTarget", (*Reconciler).publishProfileAndEmbedTarget},
+	{"settleEmptyState", (*Reconciler).settleEmptyState},
+	{"convergeMcpServers", (*Reconciler).convergeMcpServers},
+	{"ensureModelsDir", (*Reconciler).ensureModelsDir},
+	{"discoverNative", (*Reconciler).discoverNative},
+	{"readFloatingRefs", (*Reconciler).readFloatingRefs},
+	{"planEffective", (*Reconciler).planEffective},
+	{"sizeGpuYield", (*Reconciler).sizeGpuYield},
+	{"prefetch", (*Reconciler).prefetch},
+	{"convergePlacements", (*Reconciler).convergePlacements},
+	{"reportAndCleanup", (*Reconciler).reportAndCleanup},
+}
+
 // Once performs a single reconcile pass. Errors are logged, never fatal —
 // the next tick retries.
 func (r *Reconciler) Once(ctx context.Context) {
+	t := &tick{}
+	for _, ph := range reconcilePhases {
+		if !ph.run(r, ctx, t) {
+			return
+		}
+	}
+}
+
+func (r *Reconciler) fetchDesired(ctx context.Context, t *tick) bool {
 	desired, err := r.fetch(ctx)
 	if err != nil {
 		slog.Warn("reconcile.fetch_failed", "error", err)
-		return
+		return false
 	}
+	t.desired = desired
+	return true
+}
+
+func (r *Reconciler) publishProfileAndEmbedTarget(ctx context.Context, t *tick) bool {
 	// Before the empty-state return below: the profile is the node's, not a
 	// placement's (the inference proxy reads first_byte_secs from it).
-	applyHarnessProfile(desired.HarnessProfile)
-	addonwl.SetDeclared(desired.AddonWorkloads)
-	r.recordChatPlacement(desired.Placements)
+	applyHarnessProfile(t.desired.HarnessProfile)
+	addonwl.SetDeclared(t.desired.AddonWorkloads)
+	r.recordChatPlacement(t.desired.Placements)
 	// Before the empty-state return below: a node with nothing placed still
 	// has a disk to keep.
 	if r.onReclaimPolicy != nil {
-		r.onReclaimPolicy(desired.DiskReclaim)
+		r.onReclaimPolicy(t.desired.DiskReclaim)
 	}
 	// Publish the embed target as soon as desired state is known - before any
 	// early return, so removing the last embed placement (or every placement)
 	// stops the node advertising `embed`.
-	r.publishEmbedTarget(desired.Placements)
-	if desired.Node == nil && len(desired.Placements) == 0 && len(desired.MCPServers) == 0 {
+	r.publishEmbedTarget(t.desired.Placements)
+	return true
+}
+
+// settleEmptyState ends the pass when nothing is desired.
+func (r *Reconciler) settleEmptyState(ctx context.Context, t *tick) bool {
+	if t.desired.Node == nil && len(t.desired.Placements) == 0 && len(t.desired.MCPServers) == 0 {
 		slog.Debug("reconcile.no_desired_state")
 		// Nothing is placed: nothing is held, tuned, or in conflict.
 		modelpresence.Retain(map[string]bool{})
@@ -320,21 +395,27 @@ func (r *Reconciler) Once(ctx context.Context) {
 		if r.mcp != nil {
 			r.mcp.Apply(ctx, nil)
 		}
-		return
+		return false
 	}
 
+	return true
+}
+
+func (r *Reconciler) convergeMcpServers(ctx context.Context, t *tick) bool {
 	// External MCP servers: start/stop/rediscover.
 	// Before backends on purpose — a discovery report is small and the
 	// controller may be waiting on it; a backend pull can take minutes.
 	if r.mcp != nil {
-		r.mcp.Apply(ctx, desired.MCPServers)
+		r.mcp.Apply(ctx, t.desired.MCPServers)
 	}
 
-	modelsDir := ""
-	owner := ""
-	if desired.Node != nil {
-		modelsDir = desired.Node.ModelsDir
-		owner = desired.Node.SSHUser
+	return true
+}
+
+func (r *Reconciler) ensureModelsDir(ctx context.Context, t *tick) bool {
+	if t.desired.Node != nil {
+		t.modelsDir = t.desired.Node.ModelsDir
+		t.owner = t.desired.Node.SSHUser
 	}
 
 	// 1. Self-provision the models dir (root-owned parents are fine —
@@ -352,8 +433,8 @@ func (r *Reconciler) Once(ctx context.Context) {
 	// its OWN env-resolved /models source (MODELS_DIR / NOO_DATA_ROOT), and
 	// GGUF placements that need the directory are skipped with a reason the
 	// gateway is told about. Backends that do not need it still converge.
-	if modelsDir != "" {
-		if err := r.docker.EnsureHostDir(ctx, modelsDir, owner); err != nil {
+	if t.modelsDir != "" {
+		if err := r.docker.EnsureHostDir(ctx, t.modelsDir, t.owner); err != nil {
 			// Two very different failures reach here, and blaming the path
 			// for the second one sent an operator hunting a permissions
 			// problem that did not exist (host3, R50). A refused PATH is
@@ -362,26 +443,32 @@ func (r *Reconciler) Once(ctx context.Context) {
 			// The refusal names whichever it is, with its own fix.
 			if dockerpkg.IsHelperImageUnavailable(err) {
 				slog.Error("reconcile.helper_image_missing",
-					"dir", modelsDir, "error", err,
+					"dir", t.modelsDir, "error", err,
 					"effect", "no host operation can run on this node: no models dir, no weight preseed")
 				refusals.Record("helper_image", dockerpkg.HelperImageRef(),
 					dockerpkg.HelperImageFix(r.cfg.NodeID))
 			} else {
 				slog.Error("reconcile.models_dir_refused",
-					"dir", modelsDir, "owner", owner, "error", err,
+					"dir", t.modelsDir, "owner", t.owner, "error", err,
 					"effect", "this node will not mount the controller's models_dir; "+
 						"gguf placements that depend on it are skipped")
-				refusals.Record("models_dir", modelsDir, err.Error())
+				refusals.Record("models_dir", t.modelsDir, err.Error())
 			}
-			modelsDir = ""
+			t.modelsDir = ""
 		} else {
-			refusals.Clear("models_dir", modelsDir)
+			refusals.Clear("models_dir", t.modelsDir)
 			refusals.Clear("helper_image", dockerpkg.HelperImageRef())
 		}
 	}
 
+	return true
+}
+
+// discoverNative reads what is running on this node now, and what is served
+// by a process this agent does not own.
+func (r *Reconciler) discoverNative(ctx context.Context, t *tick) bool {
 	// 2. Converge placements.
-	running := r.docker.RunningBackends()
+	t.running = r.docker.RunningBackends()
 	// Backends served NATIVELY on this node (darwin: an ollama the operator
 	// runs for Metal access, which Docker on a Mac cannot reach). They are
 	// reported to the controller and routed to like any other backend, but
@@ -396,274 +483,308 @@ func (r *Reconciler) Once(ctx context.Context) {
 	// explicit, and it is logged rather than silent, because "the controller
 	// asked for this and the node did not do it" is exactly the kind of
 	// divergence that must never be inferred from an absence of output.
-	native := r.nativeBackends()
+	t.native = r.nativeBackends()
+	return true
+}
+
+// readFloatingRefs reads the drift signals: the spec hash stamped on each
+// container, and the backends still on a floating image ref.
+func (r *Reconciler) readFloatingRefs(ctx context.Context, t *tick) bool {
 	// Spec-drift signal: the fingerprint we stamped on each running
 	// backend's container (SpecHashLabel), so a changed placement env /
 	// image / port / tls (not just model) triggers a recreate.
-	specLabels := r.docker.BackendLabels(dockerpkg.SpecHashLabel)
+	t.specLabels = r.docker.BackendLabels(dockerpkg.SpecHashLabel)
 	// Backends still running on a floating ref (`:latest`, no tag) that an
 	// older agent created. The spec hash cannot see it — a placement with
 	// no image of its own hashes the same whichever ref the agent picked —
 	// so it is its own drift signal: recreated once from the pinned ref.
-	floating := r.docker.FloatingBackendImages()
+	t.floating = r.docker.FloatingBackendImages()
+	return true
+}
+
+func (r *Reconciler) planEffective(ctx context.Context, t *tick) bool {
 	// Multi-role placements: ONE effective placement per backend (a lone
 	// placement is passed through untouched; several running ollama rows
 	// merge into one daemon spec - see multirole.go).
-	r.recordHarnessPlacement(desired.Placements)
-	effective, envWarnings := effectivePlacements(desired.Placements)
+	r.recordHarnessPlacement(t.desired.Placements)
+	var envWarnings []string
+	t.effective, envWarnings = effectivePlacements(t.desired.Placements)
 	// The profile's ollama context default joins the ollama placement's env
 	// BEFORE its spec hash is taken, so a changed default recreates the
 	// container like any placement env edit.
-	effective = withProfileOllamaContext(effective, harnessprofile.Current())
+	t.effective = withProfileOllamaContext(t.effective, harnessprofile.Current())
 	r.surfaceEnvConflicts(envWarnings)
-	ollamaRows := runningOllama(desired.Placements)
+	t.ollamaRows = runningOllama(t.desired.Placements)
+	return true
+}
+
+func (r *Reconciler) sizeGpuYield(ctx context.Context, t *tick) bool {
 	// The shared-GPU yield sizes what the GPU backends need from these.
-	gpuyield.PublishPlacements(gpuPlacements(effective))
+	gpuyield.PublishPlacements(gpuPlacements(t.effective))
 	// The proxy's admission counts requests against these (occupancy).
-	occupancy.SetSlots(backendSlots(effective))
+	occupancy.SetSlots(backendSlots(t.effective))
+	return true
+}
+
+func (r *Reconciler) prefetch(ctx context.Context, t *tick) bool {
 	// Fetch the images this tick will start, concurrently, before the
-	// ordered start loop below (which then finds them local).
-	r.prefetchImages(ctx, effective, running, specLabels, floating, native)
-	for _, p := range effective {
+	// ordered start loop (which then finds them local).
+	r.prefetchImages(ctx, t.effective, t.running, t.specLabels, t.floating, t.native)
+	return true
+}
+
+func (r *Reconciler) convergePlacements(ctx context.Context, t *tick) bool {
+	for _, p := range t.effective {
 		if p.Backend == "harness" {
 			// Not a container: the host service, converged
 			// through hostsvc — placed = running — and reported from
 			// `is-active`, never from `docker ps`.
-			r.convergeHarness(ctx, p, desired.Placements)
+			r.convergeHarness(ctx, p, t.desired.Placements)
 			continue
 		}
-		switch p.DesiredState {
-		case "stopped":
-			if _, ok := native[p.Backend]; ok {
-				slog.Warn("reconcile.native_backend_not_stopped",
-					"backend", p.Backend,
-					"detail", "the controller asked for it to stop, but this node did not start it and will not stop a process it does not own")
-				continue
-			}
-			if _, ok := running[p.Backend]; ok {
-				slog.Info("reconcile.stopping_backend", "backend", p.Backend)
-				if err := r.docker.StopBackend(p.Backend); err != nil {
-					slog.Warn("reconcile.stop_failed", "backend", p.Backend, "error", err)
-				}
-			}
-		case "running":
-			if model, ok := native[p.Backend]; ok {
-				slog.Info("reconcile.native_backend_unmanaged",
-					"backend", p.Backend, "running_model", model,
-					"desired_model", p.Model,
-					"detail", "served natively on this host; the agent reports it but does not start, stop or converge it")
-				if p.Backend == "ollama" && r.native != nil {
-					// Not lifecycle: the server is the operator's, the
-					// MODEL is the placement's. Pull it over the same
-					// loopback API the probe uses.
-					// Every role's model, not just the primary.
-					r.ensureOllamaModels(r.cfg.NodeID, ollamaRows, r.native.HasModel, r.native.Pull)
-					// Advertise what the server holds, not only what it
-					// has loaded: an idle ollama has nothing loaded, and a
-					// heartbeat with no model is never routed to.
-					var held []string
-					for _, row := range ollamaRows {
-						hctx, hcancel := context.WithTimeout(context.Background(), 5*time.Second)
-						if has, err := r.native.HasModel(hctx, row.Model); err == nil && has {
-							held = append(held, row.Model)
-						}
-						hcancel()
-					}
-					r.native.SetHeldModels(held...)
-					// A launchd-managed ollama gets the placement env
-					// through its plist (OllamaGuard.Tuning): the merged
-					// env when several roles share the daemon, a lone
-					// placement's own allow-listed env otherwise. A native
-					// ollama is not a container, so this is the only way
-					// `--env OLLAMA_FLASH_ATTENTION=1` reaches it.
-					backendrt.SetOllamaTuning(nativeOllamaTuning(ollamaRows, harnessprofile.Current()))
-				}
-				continue
-			}
-			// Paused for other work on the GPU (internal/gpuyield): the
-			// container is stopped ON PURPOSE. Starting it here would fight
-			// the yield every tick; the yield resumes it itself.
-			if gpuHeld(p) {
-				slog.Info("reconcile.backend_paused",
-					"backend", p.Backend, "paused", gpuyield.PauseReason,
-					"detail", "GPU in use by other work; not starting until the GPU frees (or `noo cluster gpu release`)")
-				continue
-			}
-			curModel, isRunning := running[p.Backend]
-			desiredHash := specHash(p)
-			// Converged when running with the placement's model (compare
-			// basenames — detection may report a bare filename) AND the
-			// stamped spec hash matches the desired one.
-			if isRunning && modelMatches(curModel, p.Model) {
-				// Running as asked: an earlier start failure no longer
-				// applies.
-				refusals.Clear("backend_start", p.Backend)
-				if p.Backend == "ollama" {
-					// The container is up with OLLAMA_MODEL set; that says
-					// nothing about whether the weights are there. Pull the
-					// tag if the container lacks it (off-tick; see ollamaPulls).
-					r.ensureOllamaModels(r.cfg.NodeID, ollamaRows, r.docker.OllamaHasModel, r.docker.OllamaPull)
-				}
-				curHash, hasLabel := specLabels[p.Backend]
-				switch decideBackendDrift(hasLabel, curHash, desiredHash, r.driftRecreated[p.Backend], floating[p.Backend]) {
-				case driftConverged:
-					// Fully converged — clear any prior drift bookkeeping.
-					delete(r.driftRecreated, p.Backend)
-					continue
-				case driftStuck:
-					// Recreated once for this exact spec, yet the label still
-					// doesn't match — don't restart-loop; wait for the desired
-					// hash to change (a fresh edit) before trying again.
-					slog.Warn("reconcile.spec_drift_stuck",
-						"backend", p.Backend,
-						"hash", shortHash(desiredHash),
-						"note", "recreated once for this spec but label still absent/mismatched; not looping")
-					continue
-				case driftRecreate:
-					// Model matches but spec drifted (env/image/port/tls edit),
-					// the container predates the label, or it runs on a
-					// floating ref. Recreate to converge.
-					slog.Info("reconcile.spec_drift",
-						"backend", p.Backend,
-						"old_hash", shortHash(curHash),
-						"new_hash", shortHash(desiredHash),
-						"label_absent", !hasLabel,
-						"floating_image", floating[p.Backend])
-					r.driftRecreated[p.Backend] = desiredHash
-					// fall through to the shared start path (StartBackend
-					// removes the old container and recreates it labeled).
-				}
-			}
-
-			// Guard: a gguf-only engine given a NON-gguf model can never
-			// start. This is the case the check below misses, because it
-			// keys on the model ENDING in .gguf — so a HuggingFace repo id
-			// (which is what an operator naturally types, and what the TEI
-			// reranker legitimately takes) slips straight through to a
-			// permanent restart loop:
-			//
-			//   gguf_init_from_file: failed to open GGUF file
-			//     '/models/BAAI/bge-reranker-base'
-			//
-			// host8's reranker looped like this for hours. Fail loudly and
-			// leave the backend stopped rather than burning restarts.
-			if p.Model != "" && dockerpkg.ExpectsGGUFModel(p.Backend) &&
-				!strings.HasSuffix(p.Model, ".gguf") {
-				slog.Error("reconcile.model_not_gguf",
-					"backend", p.Backend, "model", p.Model,
-					"detail", "this engine loads a gguf FILE from the models dir, not a HuggingFace repo id",
-					"fix", "set the placement model to a .gguf filename (noo cluster place "+
-						r.cfg.NodeID+" "+p.Backend+" <file>.gguf), or set RERANK_ENGINE=tei for a repo id")
-				// Skipping the start is not enough. If the container already
-				// exists it carries a restart policy and Docker keeps cycling
-				// it independently of this loop — which is exactly what
-				// happened on host8: the guard logged correctly on every
-				// tick while noo-reranker went right on restarting. Detection
-				// without remediation just makes the loop legible.
-				// Unconditional. Gating this on RunningBackends() did not
-				// work: that lists RUNNING containers, and a crash-looping
-				// one flickers in and out of that view, so the check raced
-				// and the stop never fired — verified on host8, where
-				// model_not_gguf logged on every tick and
-				// stopping_misconfigured_backend logged zero times while the
-				// container kept restarting.
-				//
-				// Stopping a backend that is not there is harmless and
-				// already logged, so there is nothing to gain from asking
-				// first and a race to lose.
-				slog.Warn("reconcile.stopping_misconfigured_backend",
-					"backend", p.Backend,
-					"reason", "model is not a gguf file")
-				if err := r.docker.StopBackend(p.Backend); err != nil {
-					slog.Warn("reconcile.stop_failed",
-						"backend", p.Backend, "error", err)
-				}
-				continue
-			}
-
-			// Guard: don't start a gguf backend whose model file is
-			// missing — that's a guaranteed crash-loop. Surface it and
-			// let the operator ship the file (noo cluster
-			// sync-model-files) or Phase 2 auto-pull handle it.
-			if modelsDir == "" && strings.HasSuffix(p.Model, ".gguf") && desired.Node != nil &&
-				desired.Node.ModelsDir != "" {
-				// The controller named a models_dir and this node refused
-				// it (above). Starting anyway would mount the node's own
-				// default models dir under a placement that was written
-				// against a different one — a silently wrong model path.
-				slog.Error("reconcile.placement_refused",
-					"backend", p.Backend, "model", p.Model,
-					"reason", "this node refused the controller's models_dir; see reconcile.models_dir_refused")
-				refusals.Record("placement", p.Backend,
-					"this node refused the controller's models_dir "+desired.Node.ModelsDir+
-						", and this placement's model lives in it")
-				continue
-			}
-			if modelsDir != "" && strings.HasSuffix(p.Model, ".gguf") {
-				exists, err := r.docker.HostFileExists(ctx, modelsDir, p.Model)
-				if err != nil {
-					slog.Warn("reconcile.model_check_failed", "error", err)
-				} else if !exists {
-					slog.Error("reconcile.model_missing",
-						"backend", p.Backend, "model", p.Model,
-						"models_dir", modelsDir,
-						"fix", "noo cluster sync-model-files "+r.cfg.NodeID+" -m "+p.Model)
-					continue
-				}
-			}
-
-			extraEnv := buildPlacementEnv(p)
-			slog.Info("reconcile.starting_backend",
-				"backend", p.Backend, "model", p.Model,
-				"was_running", isRunning, "was_model", curModel)
-			overrides := dockerpkg.StartOverrides{
-				Image:       p.Image,
-				ModelsDir:   modelsDir,
-				ExtraEnv:    extraEnv,
-				SpecHash:    desiredHash,
-				Target:      p.Target,
-				MemoryLimit: p.MemoryLimitBytes,
-			}
-			if err := r.docker.StartBackend(p.Backend, p.Model, 0, overrides); err != nil {
-				slog.Error("reconcile.start_failed",
-					"backend", p.Backend, "error", err)
-				// A drift recreate that never happened must be retried:
-				// the stuck guard exists for a recreate that SUCCEEDED and
-				// still reads as drift, not for one the node refused
-				// (2026-09-29: a door check refused before touching the
-				// container — the old one keeps running plain, and the
-				// next tick must try again once the leaf has arrived).
-				delete(r.driftRecreated, p.Backend)
-				// A start that fails is a desired-state instruction this
-				// node could not honour, and until 2026-09-14 the only
-				// record of it was the log line above: `noo cluster desired`
-				// went on saying Running, `noo cluster status` simply
-				// omitted the backend, and the operator read half an hour
-				// of `unauthorized` pulls as "not reconciled yet"
-				// Record it with the error verbatim so the
-				// heartbeat carries it; cleared when the backend is next
-				// seen running (above) or starts (below).
-				refusals.Record("backend_start", p.Backend, err.Error())
-				continue
-			}
-			refusals.Clear("backend_start", p.Backend)
-		}
+		r.convergeContainer(ctx, t, p)
 	}
+	return true
+}
+
+// convergeContainer converges one non-harness placement: stop it, leave a
+// native backend alone, hold it for the GPU, or bring it to the placement.
+func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement) {
+	switch p.DesiredState {
+	case "stopped":
+		if _, ok := t.native[p.Backend]; ok {
+			slog.Warn("reconcile.native_backend_not_stopped",
+				"backend", p.Backend,
+				"detail", "the controller asked for it to stop, but this node did not start it and will not stop a process it does not own")
+			return
+		}
+		if _, ok := t.running[p.Backend]; ok {
+			slog.Info("reconcile.stopping_backend", "backend", p.Backend)
+			if err := r.docker.StopBackend(p.Backend); err != nil {
+				slog.Warn("reconcile.stop_failed", "backend", p.Backend, "error", err)
+			}
+		}
+	case "running":
+		if model, ok := t.native[p.Backend]; ok {
+			slog.Info("reconcile.native_backend_unmanaged",
+				"backend", p.Backend, "running_model", model,
+				"desired_model", p.Model,
+				"detail", "served natively on this host; the agent reports it but does not start, stop or converge it")
+			if p.Backend == "ollama" && r.native != nil {
+				// Not lifecycle: the server is the operator's, the
+				// MODEL is the placement's. Pull it over the same
+				// loopback API the probe uses.
+				// Every role's model, not just the primary.
+				r.ensureOllamaModels(r.cfg.NodeID, t.ollamaRows, r.native.HasModel, r.native.Pull)
+				// Advertise what the server holds, not only what it
+				// has loaded: an idle ollama has nothing loaded, and a
+				// heartbeat with no model is never routed to.
+				var held []string
+				for _, row := range t.ollamaRows {
+					hctx, hcancel := context.WithTimeout(context.Background(), 5*time.Second)
+					if has, err := r.native.HasModel(hctx, row.Model); err == nil && has {
+						held = append(held, row.Model)
+					}
+					hcancel()
+				}
+				r.native.SetHeldModels(held...)
+				// A launchd-managed ollama gets the placement env
+				// through its plist (OllamaGuard.Tuning): the merged
+				// env when several roles share the daemon, a lone
+				// placement's own allow-listed env otherwise. A native
+				// ollama is not a container, so this is the only way
+				// `--env OLLAMA_FLASH_ATTENTION=1` reaches it.
+				backendrt.SetOllamaTuning(nativeOllamaTuning(t.ollamaRows, harnessprofile.Current()))
+			}
+			return
+		}
+		// Paused for other work on the GPU (internal/gpuyield): the
+		// container is stopped ON PURPOSE. Starting it here would fight
+		// the yield every tick; the yield resumes it itself.
+		if gpuHeld(p) {
+			slog.Info("reconcile.backend_paused",
+				"backend", p.Backend, "paused", gpuyield.PauseReason,
+				"detail", "GPU in use by other work; not starting until the GPU frees (or `noo cluster gpu release`)")
+			return
+		}
+		curModel, isRunning := t.running[p.Backend]
+		desiredHash := specHash(p)
+		// Converged when running with the placement's model (compare
+		// basenames — detection may report a bare filename) AND the
+		// stamped spec hash matches the desired one.
+		if isRunning && modelMatches(curModel, p.Model) {
+			// Running as asked: an earlier start failure no longer
+			// applies.
+			refusals.Clear("backend_start", p.Backend)
+			if p.Backend == "ollama" {
+				// The container is up with OLLAMA_MODEL set; that says
+				// nothing about whether the weights are there. Pull the
+				// tag if the container lacks it (off-tick; see ollamaPulls).
+				r.ensureOllamaModels(r.cfg.NodeID, t.ollamaRows, r.docker.OllamaHasModel, r.docker.OllamaPull)
+			}
+			curHash, hasLabel := t.specLabels[p.Backend]
+			switch decideBackendDrift(hasLabel, curHash, desiredHash, r.driftRecreated[p.Backend], t.floating[p.Backend]) {
+			case driftConverged:
+				// Fully converged — clear any prior drift bookkeeping.
+				delete(r.driftRecreated, p.Backend)
+				return
+			case driftStuck:
+				// Recreated once for this exact spec, yet the label still
+				// doesn't match — don't restart-loop; wait for the desired
+				// hash to change (a fresh edit) before trying again.
+				slog.Warn("reconcile.spec_drift_stuck",
+					"backend", p.Backend,
+					"hash", shortHash(desiredHash),
+					"note", "recreated once for this spec but label still absent/mismatched; not looping")
+				return
+			case driftRecreate:
+				// Model matches but spec drifted (env/image/port/tls edit),
+				// the container predates the label, or it runs on a
+				// floating ref. Recreate to converge.
+				slog.Info("reconcile.spec_drift",
+					"backend", p.Backend,
+					"old_hash", shortHash(curHash),
+					"new_hash", shortHash(desiredHash),
+					"label_absent", !hasLabel,
+					"floating_image", t.floating[p.Backend])
+				r.driftRecreated[p.Backend] = desiredHash
+				// fall through to the shared start path (StartBackend
+				// removes the old container and recreates it labeled).
+			}
+		}
+
+		// Guard: a gguf-only engine given a NON-gguf model can never
+		// start. This is the case the check below misses, because it
+		// keys on the model ENDING in .gguf — so a HuggingFace repo id
+		// (which is what an operator naturally types, and what the TEI
+		// reranker legitimately takes) slips straight through to a
+		// permanent restart loop:
+		//
+		//   gguf_init_from_file: failed to open GGUF file
+		//     '/models/BAAI/bge-reranker-base'
+		//
+		// host8's reranker looped like this for hours. Fail loudly and
+		// leave the backend stopped rather than burning restarts.
+		if p.Model != "" && dockerpkg.ExpectsGGUFModel(p.Backend) &&
+			!strings.HasSuffix(p.Model, ".gguf") {
+			slog.Error("reconcile.model_not_gguf",
+				"backend", p.Backend, "model", p.Model,
+				"detail", "this engine loads a gguf FILE from the models dir, not a HuggingFace repo id",
+				"fix", "set the placement model to a .gguf filename (noo cluster place "+
+					r.cfg.NodeID+" "+p.Backend+" <file>.gguf), or set RERANK_ENGINE=tei for a repo id")
+			// Skipping the start is not enough. If the container already
+			// exists it carries a restart policy and Docker keeps cycling
+			// it independently of this loop — which is exactly what
+			// happened on host8: the guard logged correctly on every
+			// tick while noo-reranker went right on restarting. Detection
+			// without remediation just makes the loop legible.
+			// Unconditional. Gating this on RunningBackends() did not
+			// work: that lists RUNNING containers, and a crash-looping
+			// one flickers in and out of that view, so the check raced
+			// and the stop never fired — verified on host8, where
+			// model_not_gguf logged on every tick and
+			// stopping_misconfigured_backend logged zero times while the
+			// container kept restarting.
+			//
+			// Stopping a backend that is not there is harmless and
+			// already logged, so there is nothing to gain from asking
+			// first and a race to lose.
+			slog.Warn("reconcile.stopping_misconfigured_backend",
+				"backend", p.Backend,
+				"reason", "model is not a gguf file")
+			if err := r.docker.StopBackend(p.Backend); err != nil {
+				slog.Warn("reconcile.stop_failed",
+					"backend", p.Backend, "error", err)
+			}
+			return
+		}
+
+		// Guard: don't start a gguf backend whose model file is
+		// missing — that's a guaranteed crash-loop. Surface it and
+		// let the operator ship the file (noo cluster
+		// sync-model-files) or Phase 2 auto-pull handle it.
+		if t.modelsDir == "" && strings.HasSuffix(p.Model, ".gguf") && t.desired.Node != nil &&
+			t.desired.Node.ModelsDir != "" {
+			// The controller named a models_dir and this node refused
+			// it (above). Starting anyway would mount the node's own
+			// default models dir under a placement that was written
+			// against a different one — a silently wrong model path.
+			slog.Error("reconcile.placement_refused",
+				"backend", p.Backend, "model", p.Model,
+				"reason", "this node refused the controller's models_dir; see reconcile.models_dir_refused")
+			refusals.Record("placement", p.Backend,
+				"this node refused the controller's models_dir "+t.desired.Node.ModelsDir+
+					", and this placement's model lives in it")
+			return
+		}
+		if t.modelsDir != "" && strings.HasSuffix(p.Model, ".gguf") {
+			exists, err := r.docker.HostFileExists(ctx, t.modelsDir, p.Model)
+			if err != nil {
+				slog.Warn("reconcile.model_check_failed", "error", err)
+			} else if !exists {
+				slog.Error("reconcile.model_missing",
+					"backend", p.Backend, "model", p.Model,
+					"models_dir", t.modelsDir,
+					"fix", "noo cluster sync-model-files "+r.cfg.NodeID+" -m "+p.Model)
+				return
+			}
+		}
+
+		extraEnv := buildPlacementEnv(p)
+		slog.Info("reconcile.starting_backend",
+			"backend", p.Backend, "model", p.Model,
+			"was_running", isRunning, "was_model", curModel)
+		overrides := dockerpkg.StartOverrides{
+			Image:       p.Image,
+			ModelsDir:   t.modelsDir,
+			ExtraEnv:    extraEnv,
+			SpecHash:    desiredHash,
+			Target:      p.Target,
+			MemoryLimit: p.MemoryLimitBytes,
+		}
+		if err := r.docker.StartBackend(p.Backend, p.Model, 0, overrides); err != nil {
+			slog.Error("reconcile.start_failed",
+				"backend", p.Backend, "error", err)
+			// A drift recreate that never happened must be retried:
+			// the stuck guard exists for a recreate that SUCCEEDED and
+			// still reads as drift, not for one the node refused
+			// (2026-09-29: a door check refused before touching the
+			// container — the old one keeps running plain, and the
+			// next tick must try again once the leaf has arrived).
+			delete(r.driftRecreated, p.Backend)
+			// A start that fails is a desired-state instruction this
+			// node could not honour, and until 2026-09-14 the only
+			// record of it was the log line above: `noo cluster desired`
+			// went on saying Running, `noo cluster status` simply
+			// omitted the backend, and the operator read half an hour
+			// of `unauthorized` pulls as "not reconciled yet"
+			// Record it with the error verbatim so the
+			// heartbeat carries it; cleared when the backend is next
+			// seen running (above) or starts (below).
+			refusals.Record("backend_start", p.Backend, err.Error())
+			return
+		}
+		refusals.Clear("backend_start", p.Backend)
+	}
+}
+
+func (r *Reconciler) reportAndCleanup(ctx context.Context, t *tick) bool {
 	// A harness whose placement was REMOVED is never visited by the loop
 	// above, which only walks placements that exist. Stop it here.
-	r.reapUnplacedHarness(ctx, desired.Placements)
+	r.reapUnplacedHarness(ctx, t.desired.Placements)
 	// A placement that was removed or stopped must stop reporting a model
 	// presence; only still-wanted ollama placements keep one.
 	// Keys of every still-wanted ollama placement survive, including the
 	// "ollama#<role>" ones; the primary keeps "ollama".
 	keep := map[string]bool{}
-	if len(ollamaRows) > 0 {
-		primary := ollamaRows[0]
-		for _, p := range ollamaRows {
-			keep[presenceKey(p.Backend, p, primary, ollamaRows)] = true
+	if len(t.ollamaRows) > 0 {
+		primary := t.ollamaRows[0]
+		for _, p := range t.ollamaRows {
+			keep[presenceKey(p.Backend, p, primary, t.ollamaRows)] = true
 		}
 	}
 	modelpresence.Retain(keep)
+	return true
 }
 
 // gpuHeld: the shared-GPU yield has this backend paused (or is about to),
