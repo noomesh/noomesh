@@ -376,7 +376,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["upgrade"], "[--check] [--version <X.Y.Z>] [--stack] [--nodes] [--seats|--no-seats] [--all] [--tag <vX.Y.Z>] [--controller] [--allow-unsigned] [--force] [--skip-gateway-key-check] [--allow-downgrade] [--stage2] [--channel <public|rollback|custom>] [--release-repo <owner/repo>] [--image-prefix <registry/path>] [--base-registry <registry/path>] [--yes]", "Self-update noo, optionally stack, nodes and kiosk seats; --channel moves release channel"),
     (&["addons", "list"], "", "Show every add-on: declared, effective and whether the licence grants it"),
     (&["addons", "show"], "<name>", "Show one add-on's switch, pin, and the database and workloads its signed bundle declares"),
-    (&["addons", "enable"], "<name> [--force] [--lock <path|https-url>] [--provision-only]", "Pin an add-on's signed lock, mint its credentials and key, then declare it ON; --provision-only creates its schema and roles via the broker and starts nothing"),
+    (&["addons", "enable"], "<name> [--force] [--lock <path|https-url>] [--provision-only]", "Pin an add-on's signed lock, mint credentials, declare it ON (--provision-only: DB only)"),
     (&["addons", "trust-key"], "<name> <pubkey> [--registry <host/path>] [--dev] [--expires <dur>]", "Trust a third-party add-on's signing key; --dev --expires (max 30d): a temporary dev key"),
     (&["addons", "untrust-key"], "<name> [<pubkey>] [--dev]", "Stop trusting a third-party add-on's signing key; --dev removes its dev key(s)"),
     (&["addons", "set"], "<name> --delegate tasks|off", "Let an add-on act on a person's tasks (needs its manifest to declare it too)"),
