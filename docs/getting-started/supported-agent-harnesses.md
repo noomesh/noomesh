@@ -146,6 +146,9 @@ per call). Three things keep such a turn from being lost:
   turn) is killed as stalled and the loop fails with `stalled: no model call
   for Ns`, instead of running to `NOO_HARNESS_TURN_TIMEOUT_SECS` loop after
   loop. A slow model is not a stall: a call in flight counts as activity.
+  A chat turn whose CLI stalled before its first model call ran no tool, so
+  the gateway runs that turn itself and the console gets an answer instead
+  of an error.
 - **Reasoning can be switched off per node.** Place the harness with
   `--env NOO_HARNESS_THINKING=off` and every model call on that node asks the
   model not to reason, for the `noo` loop and for a foreign kind's CLI

@@ -273,7 +273,7 @@ turn (the dashboard socket, a channel).
 | Event | What the gateway does |
 |---|---|
 | `harness_result` | **last event of a successful turn**: `{"result": <CoordinatorResult>, "node": "<id>"}`. Kept, not forwarded; ends the relay. |
-| `error` | forwarded; ends the relay. The turn fails. |
+| `error` | forwarded; ends the relay. The turn fails. With `retry_safe: true` (the foreign-CLI driver killed the CLI as stalled before it made a single model call, so no tool ran) it is kept instead, and the gateway runs the turn itself. |
 | `done` | forwarded; the gateway then waits at most 10 more seconds for `harness_result`. |
 | anything else | forwarded |
 
@@ -286,7 +286,9 @@ Rules:
   `NOO_HARNESS_TURN_TIMEOUT_SECS` (default 900) is a lost turn.
 - **A lost turn is an error, never re-run.** Once a harness acked, its
   tools may already have executed, so the gateway does not run the turn
-  again itself.
+  again itself. The one exception is an `error` with `retry_safe: true`:
+  the driver's stall bound killed a vendor CLI that had made no model call,
+  so nothing ran, and the gateway runs the turn in process.
 - Tasks have no event stream: a task reports through `task_checkpoint`
   only, and holds one concurrency permit for its whole life.
 
