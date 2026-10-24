@@ -388,14 +388,31 @@ pub(crate) fn wire_key<'a>(spec: &'a ToolSpec, field: &'a str) -> &'a str {
 /// no-argument tools) or with `additionalProperties: true` is not checked;
 /// an alias wire key is accepted as well as the field name.
 pub(crate) fn unknown_args(spec: &ToolSpec, args: &Map<String, Value>) -> Option<String> {
-    let props = spec.input_schema.get("properties")?.as_object()?;
-    if props.is_empty() || spec.input_schema.get("additionalProperties") == Some(&Value::Bool(true)) {
+    let aliases: Vec<&str> = spec.aliases.values().map(String::as_str).collect();
+    unknown_keys(&spec.name, &spec.input_schema, &aliases, args)
+}
+
+/// The shared check behind [`unknown_args`] and the native task tools: the
+/// arguments the schema does not declare, as one refusal naming them and the
+/// accepted keys. A no-argument tool (no declared properties) accepts
+/// NOTHING, so a stray filter on it is refused rather than dropped; only an
+/// explicit `additionalProperties: true` opts out. `extra_ok` are wire keys
+/// accepted although undeclared (aliases).
+pub(crate) fn unknown_keys(
+    tool: &str,
+    schema: &Value,
+    extra_ok: &[&str],
+    args: &Map<String, Value>,
+) -> Option<String> {
+    if schema.get("additionalProperties") == Some(&Value::Bool(true)) {
         return None;
     }
+    let empty = Map::new();
+    let props = schema.get("properties").and_then(Value::as_object).unwrap_or(&empty);
     let bad: Vec<&str> = args
         .keys()
         .map(String::as_str)
-        .filter(|k| !props.contains_key(*k) && !spec.aliases.values().any(|v| v == k))
+        .filter(|k| !props.contains_key(*k) && !extra_ok.contains(k))
         .collect();
     if bad.is_empty() {
         return None;
@@ -403,11 +420,15 @@ pub(crate) fn unknown_args(spec: &ToolSpec, args: &Map<String, Value>) -> Option
     let mut expected: Vec<&str> = props.keys().map(String::as_str).collect();
     expected.sort_unstable();
     Some(format!(
-        "unknown argument{} {} for {}; expected one of: {}",
+        "unknown argument{} {} for {}; {}",
         if bad.len() > 1 { "s" } else { "" },
         bad.iter().map(|b| format!("'{b}'")).collect::<Vec<_>>().join(", "),
-        spec.name,
-        expected.join(", ")
+        tool,
+        if expected.is_empty() {
+            "this tool takes no arguments".to_string()
+        } else {
+            format!("expected one of: {}", expected.join(", "))
+        }
     ))
 }
 
@@ -439,6 +460,18 @@ pub(crate) fn build_path(
             }
             path = path.replace(&placeholder, &percent_encode_segment(&rendered));
             consumed.push(field.clone());
+        }
+    }
+    // A placeholder no argument filled would go out literally
+    // (`/api/config/{section}`) and fail with the braces in the message.
+    // Refuse it here, naming the argument the caller left out.
+    if let Some(open) = path.find('{') {
+        if let Some(len) = path[open..].find('}') {
+            return Err(format!(
+                "missing required argument '{}' for {}",
+                &path[open + 1..open + len],
+                spec.name
+            ));
         }
     }
     Ok((path, consumed))
@@ -1271,9 +1304,25 @@ mod body_field_tests {
         assert!(e.contains("unknown argument 'thread_id' for noo_agent_thread"), "{e}");
         assert!(e.contains("expected one of: limit, thread"), "{e}");
         assert!(unknown_args(&spec, &args(json!({"thread": "thr_x", "limit": 5}))).is_none());
-        // no declared properties (no-argument tools) is not checked
+        // a no-argument tool accepts nothing: a stray filter is refused too
         spec.input_schema = json!({"type": "object", "properties": {}});
+        let e = unknown_args(&spec, &args(json!({"anything": 1}))).expect("refused");
+        assert!(e.contains("takes no arguments"), "{e}");
+        assert!(unknown_args(&spec, &args(json!({}))).is_none());
+        // an explicit additionalProperties:true opts out
+        spec.input_schema = json!({"type": "object", "additionalProperties": true});
         assert!(unknown_args(&spec, &args(json!({"anything": 1}))).is_none());
+    }
+
+    #[test]
+    fn an_unfilled_path_placeholder_is_refused_naming_the_argument() {
+        let mut spec = spec_with("");
+        spec.name = "noo_config_get".into();
+        spec.path = "/api/config/{section}".into();
+        let e = build_path(&spec, &args(json!({}))).unwrap_err();
+        assert!(e.contains("missing required argument 'section'"), "{e}");
+        let (p, _) = build_path(&spec, &args(json!({"section": "heartbeat"}))).unwrap();
+        assert_eq!(p, "/api/config/heartbeat");
     }
 
     /// The opt-in must not change every other tool.

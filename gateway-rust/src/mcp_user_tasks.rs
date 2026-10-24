@@ -83,7 +83,7 @@ fn live(state: &str) -> bool {
 /// The `tools/list` entries, in the door's `{name, description, inputSchema}` shape.
 pub fn tool_list() -> Vec<Value> {
     let roles = crate::agent_roles::AgentRole::known_names().join(", ");
-    vec![
+    let mut tools = vec![
         json!({
             "name": DELEGATE,
             "description": format!(
@@ -188,7 +188,12 @@ pub fn tool_list() -> Vec<Value> {
                 "required": ["task_id"]
             }
         }),
-    ]
+    ];
+    // Advertise what `undeclared` enforces: only the declared arguments.
+    for t in &mut tools {
+        t["inputSchema"]["additionalProperties"] = json!(false);
+    }
+    tools
 }
 
 /// What the door's task tools read and write. The database in service; a
@@ -320,8 +325,21 @@ async fn named<S: TaskStore>(store: &S, user: &str, args: &Map<String, Value>) -
     owned(store, user, id).await
 }
 
+/// Refuse an argument the task tool's schema does not declare (i217): the
+/// same rule the manifest tools get from `mcp_external::unknown_args`. The
+/// handlers also read `reason` (for `done`) and `answer` (for `answer`) as
+/// fallbacks for `result` and `text`; those stay accepted.
+pub(crate) fn undeclared(name: &str, args: &Map<String, Value>) -> Option<String> {
+    let list = tool_list();
+    let schema = list.iter().find(|t| t["name"] == name)?.get("inputSchema")?;
+    crate::mcp_external::unknown_keys(name, schema, &["reason", "answer"], args)
+}
+
 /// Run one of the task tools for the door's caller (`user` is the key's bound account).
 pub async fn call(state: &Arc<AppState>, user: &str, name: &str, args: &Map<String, Value>) -> Result<Value, String> {
+    if let Some(e) = undeclared(name, args) {
+        return Err(e);
+    }
     let store = Db(&state.db);
     match name {
         DELEGATE => {
@@ -482,6 +500,7 @@ mod tests {
         for t in &list {
             assert!(!t["description"].as_str().unwrap().is_empty());
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
+            assert_eq!(t["inputSchema"]["additionalProperties"], json!(false), "{}", t["name"]);
         }
         let req = |n: &str| list.iter().find(|t| t["name"] == n).unwrap()["inputSchema"]["required"].clone();
         assert_eq!(req(DELEGATE), json!(["objective"]));
@@ -496,6 +515,14 @@ mod tests {
 
     /// The same names the loop uses, so a harness prompt reads the same on
     /// either side — and no manifest tool shadows them on the door.
+    #[test]
+    fn an_undeclared_task_argument_is_refused() {
+        let e = undeclared(DONE, &args(json!({"task_id": "t", "result": "r", "taskid": "x"}))).expect("refused");
+        assert!(e.contains("'taskid'") && e.contains("expected one of"), "{e}");
+        assert!(undeclared(DONE, &args(json!({"task_id": "t", "result": "r"}))).is_none());
+        assert!(undeclared(DONE, &args(json!({"task_id": "t", "reason": "r"}))).is_none());
+    }
+
     #[test]
     fn the_names_are_the_native_ones_and_not_in_the_manifest() {
         for n in TOOLS {
