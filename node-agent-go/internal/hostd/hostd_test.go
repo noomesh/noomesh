@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1017,6 +1018,56 @@ func TestBootRestoreStopsTheStackWhenTheDataRootIsNotOnItsFilesystem(t *testing.
 	}
 	if !strings.Contains(strings.Join(logs, "\n"), "BOOT-RESTORE attempt 1 failed (exit 3)") {
 		t.Fatalf("the refusal must fail the attempt with exit 3: %v", logs)
+	}
+
+	// 3. A Linux host without findmnt (util-linux not installed; the 0.6.11
+	// rehearsal's alpine dind): the filesystem cannot be checked, so the boot
+	// path refuses the same way, and says retrying will not help.
+	nofm := filepath.Join(root, "nofindmnt-bin")
+	must(os.MkdirAll(nofm, 0o755))
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if dir == bin {
+			continue
+		}
+		ents, _ := os.ReadDir(dir)
+		for _, ent := range ents {
+			dest := filepath.Join(nofm, ent.Name())
+			if ent.Name() == "findmnt" || ent.Name() == "uname" || ent.Name() == "docker" {
+				continue
+			}
+			if _, err := os.Lstat(dest); err == nil {
+				continue
+			}
+			_ = os.Symlink(filepath.Join(dir, ent.Name()), dest)
+		}
+	}
+	must(os.Symlink(filepath.Join(bin, "docker"), filepath.Join(nofm, "docker")))
+	must(os.WriteFile(filepath.Join(nofm, "uname"), []byte("#!/bin/sh\necho Linux\n"), 0o755))
+	t.Setenv("PATH", nofm)
+	if p, err := exec.LookPath("findmnt"); err == nil {
+		t.Fatalf("findmnt still on the test PATH: %s", p)
+	}
+	_ = os.Remove(dlog)
+	_ = os.Remove(filepath.Join(root, ".noo-data-root-refused"))
+	logs = nil
+	boot()
+	b, err = os.ReadFile(dlog)
+	must(err)
+	if !strings.HasPrefix(strings.TrimSpace(string(b)), "ps") || !strings.Contains(string(b), "stop noo-postgres") || strings.Contains(string(b), "start") {
+		t.Fatalf("without findmnt the boot path must stop the stack and start nothing:\n%s", b)
+	}
+	if _, err := os.Stat(reached); err == nil {
+		t.Fatal("secrets were written on a host that cannot check its data root")
+	}
+	why, err = os.ReadFile(filepath.Join(root, ".noo-data-root-refused"))
+	must(err)
+	for _, want := range []string{"findmnt is not installed", "util-linux", "Retrying will not help"} {
+		if !strings.Contains(string(why), want) {
+			t.Fatalf("the refusal reason lacks %q:\n%s", want, why)
+		}
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), "BOOT-RESTORE attempt 1 failed (exit 3)") {
+		t.Fatalf("no findmnt must fail the attempt with exit 3: %v", logs)
 	}
 }
 
