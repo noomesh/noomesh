@@ -271,8 +271,11 @@ class AgentMessenger:
 
     ``agent`` is the short id senders address (e.g. ``worker/ingest``);
     ``harness`` names the software. Keys live at
-    ``$NOO_DATA_ROOT/noo-data/agent-keys/<agent>.json`` unless ``key_path``
-    is given.
+    ``$NOO_DATA_DIR/agent-keys/<agent>.json`` (the in-container ``noo-data``
+    mount, ``/data`` by default) unless ``key_path`` is given. The HOST data
+    root (``NOO_DATA_ROOT``) is never used: it is not mounted in the stack's
+    containers, so keys written there would sit on the container's
+    ephemeral layer and be regenerated on every recreate.
     """
 
     def __init__(self, agent: str, harness: str = "noomesh-worker", key_path: Optional[Path] = None):
@@ -280,8 +283,17 @@ class AgentMessenger:
             raise ValueError(f"agent id {agent!r} is not valid: letters, digits, '-', '_' and single '/' separators")
         self.agent = agent
         self.harness = harness
-        root = Path(os.getenv("NOO_DATA_ROOT", "/var/lib/noo")) / "noo-data" / "agent-keys"
-        self.keys = AgentKeys.load_or_create(key_path or root / f"{subject_token(agent)}.json")
+        if key_path is None:
+            data_dir = Path(os.getenv("NOO_DATA_DIR", "/data"))
+            if not data_dir.is_dir():
+                # Visible, not a silent fallback to an ephemeral path: a key
+                # that is lost on restart breaks the registered identity.
+                raise RuntimeError(
+                    f"agent key directory root {data_dir} is not mounted; set NOO_DATA_DIR to the "
+                    "noo-data mount or pass key_path"
+                )
+            key_path = data_dir / "agent-keys" / f"{subject_token(agent)}.json"
+        self.keys = AgentKeys.load_or_create(key_path)
         self._review_sign: Optional[Ed25519PublicKey] = None
 
     # -- gateway path --
