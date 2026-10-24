@@ -663,7 +663,7 @@ impl ProvisionOps for Live<'_> {
         let dir = base.join(addon);
         let fix = "noo security pki status".to_string();
         let refuse = |why: String| Refusal { why, fix: fix.clone() };
-        private_dir(&base).map_err(&refuse)?;
+        private_dir(&base).map_err(refuse)?;
         match ram_backed(&base) {
             Ok(true) => {}
             Ok(false) => {
