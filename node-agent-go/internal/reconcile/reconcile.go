@@ -512,7 +512,7 @@ func (r *Reconciler) planEffective(ctx context.Context, t *tick) bool {
 	// The profile's ollama context default joins the ollama placement's env
 	// BEFORE its spec hash is taken, so a changed default recreates the
 	// container like any placement env edit.
-	t.effective = withProfileOllamaContext(t.effective, harnessprofile.Current())
+	t.effective = withProfileContext(t.effective, harnessprofile.Current())
 	r.surfaceEnvConflicts(envWarnings)
 	t.ollamaRows = runningOllama(t.desired.Placements)
 	return true

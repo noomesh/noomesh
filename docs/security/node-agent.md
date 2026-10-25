@@ -1010,9 +1010,14 @@ from before profiles. The agent applies four of its fields:
   agent restart (a request already in flight keeps the bound it started
   with). An unusable env value is not an override; the profile or the
   default applies.
-- **`ollama_context`** is the default `OLLAMA_CONTEXT_LENGTH` for this node's
-  ollama when the ollama placement's env does not set the key; a placement
-  that sets it is never touched. On Linux it joins the container env before
+- **`ollama_context`** is the default context window for this node's chat
+  engine when its placement does not decide one: `OLLAMA_CONTEXT_LENGTH` for
+  Ollama, `VLLM_MAX_MODEL_LEN` for vLLM (which otherwise runs at the image
+  default, 16384), `N_CTX` for llama.cpp (a placement that sets
+  `LLAMA_ARG_CTX_SIZE` has decided too; the window is shared across the
+  server's parallel slots). A placement that sets the key is never touched.
+  The name is historical (proposal i226 renames it); the value is one per
+  tier for every engine. On Linux it joins the container env before
   the spec hash is taken, so a changed default recreates the container like
   any placement env edit. On macOS it reaches a brew-managed ollama through
   the plist tuning, and the guard rewrites the key and boots the job out and
