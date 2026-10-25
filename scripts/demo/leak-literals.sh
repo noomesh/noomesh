@@ -27,11 +27,17 @@ extra="${2:-}"
 raw="$(mktemp)"
 trap 'rm -f "$raw"' EXIT
 cat > "$raw"
+# Output: <rule><TAB><literal>. The rule names what matched (ip, name, token,
+# tsnet, email, label), so a LEAK report can say what kind of value survived
+# without printing it. A `label` value shorter than 6 characters is dropped:
+# "Secrets: 9 present" is a count, and a one-digit "secret" is found in any
+# version string (take 11, 2026-10-25: "9" in "29.9.2"). The stand-ins the
+# masker writes (node-N, you, server) are never leaks, in any case.
 {
-  grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' "$raw" | awk -F. '$1<=255&&$2<=255&&$3<=255&&$4<=255&&$1!=127&&$1!=0&&$0!="255.255.255.255"&&!($1==192&&$2==0&&$3==2)&&!($1==198&&$2==51&&$3==100)'
-  grep -oiwE "host3|host8-ma|host8|host9|host6|host2|host5${host:+|$host}${extra:+|${extra//[ ,]/|}}|peerbox" "$raw"
-  grep -oE 'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{16,}|noo-ent1\.[A-Za-z0-9._-]+' "$raw"  # leak-ok: the masking regex for token shapes, not a token
-  grep -oE '[A-Za-z0-9.-]+\.ts\.net' "$raw"
-  grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]+' "$raw" | grep -viE '@(noomesh\.ai|example\.com)$' || true
-  grep -oiE '(pass(word|phrase)?|token|secret|api[_ -]?key|credential)s?( is)?[ ]*[:=][ ]*[^ ]+' "$raw" | sed -E 's/^[^:=]*[:=][ ]*//' | grep -v '^\*\{8\}' || true
-} | grep -vE '^(node-[0-9]+|you|server)?$' | sort -u || true
+  grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' "$raw" | awk -F. '$1<=255&&$2<=255&&$3<=255&&$4<=255&&$1!=127&&$1!=0&&$0!="255.255.255.255"&&!($1==192&&$2==0&&$3==2)&&!($1==198&&$2==51&&$3==100)' | sed 's/^/ip\t/'
+  grep -oiwE "host3|host8-ma|host8|host9|host6|host2|host5${host:+|$host}${extra:+|${extra//[ ,]/|}}|peerbox" "$raw" | sed 's/^/name\t/'
+  grep -oE 'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{16,}|noo-ent1\.[A-Za-z0-9._-]+' "$raw" | sed 's/^/token\t/'  # leak-ok: the masking regex for token shapes, not a token
+  grep -oE '[A-Za-z0-9.-]+\.ts\.net' "$raw" | sed 's/^/tsnet\t/'
+  grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]+' "$raw" | grep -viE '@(noomesh\.ai|example\.com)$' | sed 's/^/email\t/' || true
+  grep -oiE '(pass(word|phrase)?|token|secret|api[_ -]?key|credential)s?( is)?[ ]*[:=][ ]*[^ ]+' "$raw" | sed -E 's/^[^:=]*[:=][ ]*//' | grep -v '^\*\{8\}' | grep -E '^.{6,}$' | sed 's/^/label\t/' || true
+} | grep -viE $'\t(node-[0-9]+|you|server)?$' | sort -u || true

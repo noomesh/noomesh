@@ -128,12 +128,16 @@ leak_check() {
   if [ -n "$BOX" ]; then host="$(bx hostname | tr '[:upper:]' '[:lower:]')"; else host="$(hostname | tr '[:upper:]' '[:lower:]')"; fi
   # The literals come from scripts/demo/leak-literals.sh (one rule set, tested
   # on its own); each one found verbatim in the masked output is a leak.
-  while IFS= read -r lit; do
+  local tag report=""
+  while IFS=$'\t' read -r tag lit; do
     [ -n "$lit" ] || continue
-    if grep -qiF -- "$lit" "$masked"; then n=$((n + 1)); fi
+    if grep -qiF -- "$lit" "$masked"; then n=$((n + 1)); report="$report  - $tag (${#lit} chars)\n"; fi
   done < <("$ROOT/scripts/demo/leak-literals.sh" "$host" "${NOO_DEMO_MASK_NAMES:-}" < "$raw")
   if [ "$n" -gt 0 ]; then
-    echo "LEAK: $n sensitive value(s) from the raw output are still present in the masked output." >&2
+    # What kind and how long, never the value: enough to find the rule or the
+    # masker gap without the report itself leaking (takes 10 and 11 were
+    # deleted with no way to know what had matched).
+    printf 'LEAK: %s sensitive value(s) from the raw output are still present in the masked output:\n%b' "$n" "$report" >&2
     return 1
   fi
   echo "leak check: no raw sensitive value survives in the masked output"
@@ -181,7 +185,13 @@ finish() { # $1 base name (smoke|onboarding)
     die "film deleted: nothing was logged, so nothing could be checked. The commands did not run in the film shell."
   fi
   if [ "$lc" -ne 0 ]; then
-    # the "masked" log of a failed run may hold the very values that leaked: delete it too
+    # the "masked" log of a failed run may hold the very values that leaked: delete it too.
+    # NOO_DEMO_KEEP_ON_LEAK=1 (box mode only: a throwaway machine's output) keeps
+    # it as masked.LEAK.log for the operator to read, never the raw log, never the film.
+    if [ -n "$BOX" ] && [ "${NOO_DEMO_KEEP_ON_LEAK:-}" = 1 ]; then
+      mv -f "$MASKED" "$OUT_ABS/masked.LEAK.log" 2>/dev/null || true
+      echo "kept $OUT_ABS/masked.LEAK.log (NOO_DEMO_KEEP_ON_LEAK=1): the masked transcript of a take that leaked; read it, do not publish it" >&2
+    fi
     rm -f "$RAW" "$MASKED" "$OUT_ABS/$base.gif" "$OUT_ABS/$base.mp4" "$OUT_ABS/contact-sheet.png"
     die "film deleted: the masker missed something. Add the pattern to scripts/demo/mask.pl and a case to tests/test_demo_mask.py, then record again."
   fi
