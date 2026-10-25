@@ -126,19 +126,12 @@ leak_check() {
   local raw="$1" masked="$2" n=0 lit host
   [ -s "$raw" ] || { echo "leak check: no output was logged (nothing went through the masker; did the typed commands reach the shell?)" >&2; return 2; }
   if [ -n "$BOX" ]; then host="$(bx hostname | tr '[:upper:]' '[:lower:]')"; else host="$(hostname | tr '[:upper:]' '[:lower:]')"; fi
+  # The literals come from scripts/demo/leak-literals.sh (one rule set, tested
+  # on its own); each one found verbatim in the masked output is a leak.
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
     if grep -qiF -- "$lit" "$masked"; then n=$((n + 1)); fi
-  done < <(
-    {
-      grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' "$raw" | awk -F. '$1<=255&&$2<=255&&$3<=255&&$4<=255&&$1!=127&&$1!=0&&$0!="255.255.255.255"&&!($1==192&&$2==0&&$3==2)&&!($1==198&&$2==51&&$3==100)'
-      grep -oiwE "host3|host8-ma|host8|host8|host9|host6|host2|host5|${host}${NOO_DEMO_MASK_NAMES:+|${NOO_DEMO_MASK_NAMES//[ ,]/|}}|peerbox" "$raw"
-      grep -oE 'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{16,}|noo-ent1\.[A-Za-z0-9._-]+' "$raw"  # leak-ok: the masking regex for token shapes, not a token
-      grep -oE '[A-Za-z0-9.-]+\.ts\.net' "$raw"
-      grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]+' "$raw" | grep -viE '@(noomesh\.ai|example\.com)$' || true
-      grep -oiE '(pass(word|phrase)?|token|secret|api[_ -]?key)s?[: =]+[^ ]+' "$raw" | sed -E 's/^[^: =]*[: =]+//' | grep -v '^\*\{8\}' || true
-    } | grep -vE '^(node-[0-9]+|you|server)$' | sort -u
-  )
+  done < <("$ROOT/scripts/demo/leak-literals.sh" "$host" "${NOO_DEMO_MASK_NAMES:-}" < "$raw")
   if [ "$n" -gt 0 ]; then
     echo "LEAK: $n sensitive value(s) from the raw output are still present in the masked output." >&2
     return 1
