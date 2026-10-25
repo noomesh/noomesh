@@ -5,9 +5,10 @@ source drafts. It is available in both console editions to signed-in users.
 Several Google account drafts can belong to one Noomesh user, and each
 account can have several Drive and Gmail sources.
 
-For local installers preparing their own Google application, start with
+For the intended simple sign-in path and the advanced option of preparing
+your own Google application, start with
 [Connect external accounts on a local installation](../getting-started/integrations.md).
-It explains application ownership, test users and callback networking.
+It explains publisher/installer ownership, test users and callback networking.
 
 This release saves metadata only. Google sign-in, token storage, resource
 pickers, search and background synchronization are not implemented here.

@@ -1,30 +1,51 @@
 # Connect external accounts on a local installation
 
-For a self-managed installation, the person running Noomesh supplies the
-provider application credentials. Each user then signs in to their own
-accounts. One installer-managed Google application can serve several Google
-accounts, subject to its audience settings; each mailbox or folder does not
-need a separate cloud project.
+The simplest intended experience is: install Noomesh, choose **Connect
+Google**, sign in and approve access. The software publisher registers the
+application with Google; ordinary users do not need their own cloud project.
+Local installation does not by itself require installer-owned credentials.
 
-This guide uses installer-owned applications. A Noomesh-hosted connection
-service would be a separate feature. Google still provides its own sign-in
-and APIs, so connecting Gmail or Drive needs internet access even when
-Noomesh runs locally. Registering a Google application does not move your
-Noomesh installation into Google Cloud.
+Google's desktop flow can use a publisher-registered public client, PKCE,
+the system browser and a loopback callback on that computer. It does not
+require a Noomesh-hosted callback server. Tokens can be stored locally.
+[Google desktop authorization](https://developers.google.com/identity/protocols/oauth2/native-app)
+
+Noomesh can also run on a controller separate from the browser's computer.
+That needs its own supported callback arrangement: for example, a native
+helper on the browser's computer or a hosted connection service. A desktop
+loopback callback alone does not reach a different controller. A confidential
+web client's shared secret must not be bundled into distributed installers.
+[Google client-type policy](https://developers.google.com/identity/protocols/oauth2/policies)
+
+## Choose a setup model
+
+| Model | Who registers the provider application? | User experience |
+| --- | --- | --- |
+| Publisher-registered desktop connection | Noomesh publisher | Intended simple local-desktop flow: connect, sign in, approve |
+| Publisher-registered connection for a remote controller | Noomesh publisher | Requires a supported helper or connection service; its design must explain where credentials pass and are stored |
+| Installer-owned application | Person running the installation | Advanced option: register a provider application and configure its credentials before users connect |
+
+**All three authorization paths still need implementation in the current
+scaffold.** The Google project/client instructions below cover the advanced
+installer-owned option, not a prerequisite for every future Noomesh user.
+Google still provides sign-in and APIs, so Gmail/Drive connections need
+internet access. Application registration does not move Noomesh into Google
+Cloud.
 
 ## What works in the current build
 
 | Step | Availability |
 | --- | --- |
 | Save several Google account drafts and Drive/Gmail source drafts | Available in the Connections scaffold |
-| Create your own Google project and prepare its consent settings | Available in Google Cloud Console |
+| Optionally create your own Google project and prepare its consent settings | Available in Google Cloud Console |
 | Configure OAuth credentials in Noomesh or obtain its callback URL | Pending OAuth implementation |
 | Sign in, choose actual folders/labels, read or synchronize Google data | Pending OAuth and provider adapters |
 
 **The current Connections screen saves drafts only.** It has no OAuth
 callback or supported integration credential settings. Creating a Google
-project will not enable its disabled sign-in button. Complete the preparation
-below, then stop at the OAuth handoff until your Noomesh release supports it.
+project will not enable its disabled sign-in button. If you choose an
+installer-owned application, complete the preparation below, then stop at
+the OAuth handoff until your Noomesh release supports it.
 There are no integration environment-variable names or secret-import
 commands to run yet.
 
@@ -34,15 +55,20 @@ For the available UI, see [Google account and source drafts](../channels/google-
 
 | Person | One-time setup | Repeated when adding accounts |
 | --- | --- | --- |
-| Installer/operator | Provider project/application, allowed callback address, installation credentials | Usually none; update provider settings when the installation address or required access changes |
+| Software publisher, for the simple connection path | Register suitable provider clients, enable APIs and complete applicable verification | Maintain the application registration and supported authorization flow |
+| Installer/operator choosing their own application | Provider project/application, allowed callback address, installation credentials | Usually none; update provider settings when the installation address or required access changes |
 | Noomesh user | A login on this Noomesh installation | Select a provider, sign in, approve access and choose content |
-| Personal installer using their own accounts | Performs both roles | Add each Google account independently |
+| Personal installer choosing their own application | Performs installer and user setup | Add each Google account independently |
 
-Google's application registration identifies the installation's application.
+Google's application registration identifies the publisher's or installer's application.
 The user's OAuth grant authorizes access to that user's data. These are
 separate from the user's Noomesh login. [Google credential types](https://developers.google.com/workspace/guides/create-credentials)
 
-## Prepare a test installation
+## Advanced: prepare an installation with your own application
+
+The remaining setup steps use installer-owned credentials. One such Google
+application can serve several Google accounts when its audience allows it;
+each mailbox or folder does not need a separate cloud project.
 
 Use an isolated development instance with its own data root, database and
 credentials. Noomesh's [multiple-instance setup](multi-instance.md) covers
@@ -175,9 +201,9 @@ by an application. Current Noomesh draft removal only deletes draft metadata.
 
 ## Set up another provider
 
-For each provider supported by a future adapter, follow the same division
-of work: the installer configures the provider application or credential
-once, and users add their own account connections. Some providers use API
+For each provider supported by a future adapter, its guide should distinguish
+the publisher-configured connection path from any installer-owned option.
+Users then add their own account connections. Some providers use API
 tokens or service accounts rather than interactive OAuth, so their setup
 guide must identify the authentication type explicitly.
 
