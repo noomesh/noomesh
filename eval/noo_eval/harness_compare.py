@@ -55,6 +55,8 @@ from .scenario import CompareTask, HarnessCompareSpec, parse_check
 from .schema import HarnessCompare, KindRun, TaskRun
 
 TERMINAL = {"done", "failed", "stopped"}
+# A task that still holds (or waits for) a harness permit.
+LIVE = {"open", "running", "checkpointed", "waiting"}
 KIND_ENV = "NOO_HARNESS_KIND"
 RESULT_CHARS = 2000
 
@@ -209,6 +211,44 @@ class Comparer:
         except httpx.HTTPError:
             return False
 
+    def _objectives(self) -> set[str]:
+        """Every objective this scenario creates, plus the child objectives a
+        delegate task names in quotes (`Delegate a child task whose objective
+        is "Reply with the single word: pong"`): a child that never ran holds
+        a permit as surely as its parent."""
+        out: set[str] = set()
+        for ts in self.spec.task_sets:
+            for t in ts.tasks:
+                out.add(t.objective.strip())
+                out.update(q.strip() for q in re.findall(r'"([^"]{3,})"', t.objective))
+        return out
+
+    async def sweep_leftovers(self) -> list[str]:
+        """Stop every live task that an earlier run with this scenario left on
+        the node (its runner died, or gave up at its timeout before the stop
+        step existed). A live task holds a harness permit until something
+        finishes it, and a new harness re-takes every open task for its node,
+        so without this the first round measures the last run's leftovers
+        (mcmini, 2026-10-24, noomesh-internal i227). Returns the ids stopped."""
+        try:
+            r = await self.tasks.get("/api/tasks", params={"limit": 200})
+            r.raise_for_status()
+        except httpx.HTTPError as e:
+            self.log(f"[noo-eval] leftover sweep skipped: {type(e).__name__}: {e}")
+            return []
+        body = r.json()
+        items = body.get("tasks") if isinstance(body, dict) else body
+        mine = self._objectives()
+        swept: list[str] = []
+        for t in items or []:
+            if t.get("state") not in LIVE or (t.get("objective") or "").strip() not in mine:
+                continue
+            tid = t.get("id") or ""
+            if tid and await self._stop_task(tid):
+                swept.append(tid)
+                self.log(f"[noo-eval] stopped leftover task {tid[:8]} ({t.get('state')}, {str(t.get('objective'))[:40]!r})")
+        return swept
+
     async def place(self, kind: str) -> KindRun:
         kr = KindRun(kind=kind)
         node = self.spec.node
@@ -359,6 +399,8 @@ class Comparer:
         self.log(f"[noo-eval] harness-compare on {spec.node}: kinds {', '.join(spec.kinds)} "
                  f"(original: {self.out.original_kind or ('the auto policy' if auto else 'no harness placement')})")
         try:
+            if spec.sweep_leftovers:
+                self.out.swept = await self.sweep_leftovers()
             for kind in spec.kinds:
                 kr = await self.place(kind)
                 self.out.kind_runs.append(kr)

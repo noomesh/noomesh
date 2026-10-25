@@ -118,6 +118,9 @@ class HarnessCompare(BaseModel):
     kind_runs: list[KindRun] = Field(default_factory=list)
     runs: list[TaskRun] = Field(default_factory=list)
     token_method: str = ""
+    # Live tasks from an earlier run with this scenario's objectives, stopped
+    # before the first kind was placed (they would hold the harness's permits).
+    swept: list[str] = Field(default_factory=list)
 
 
 class RunResult(BaseModel):
