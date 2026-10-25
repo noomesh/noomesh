@@ -18,6 +18,8 @@ const H = vi.hoisted(() => ({
   addSource: vi.fn(),
   removeAccount: vi.fn(),
   refetch: vi.fn(),
+  connect: vi.fn(),
+  resources: [] as { id: string; name: string }[],
   failed: false,
 }));
 vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
@@ -30,6 +32,16 @@ vi.mock('./useConnections', () => ({
     isLoading: false,
     isError: H.failed,
     refetch: H.refetch,
+  }),
+  useGoogleConnect: () => ({
+    connect: H.connect,
+    pending: false,
+    cancel: vi.fn(),
+  }),
+  useConnectionResources: () => ({
+    items: H.resources,
+    isLoading: false,
+    isError: false,
   }),
   useConnectionActions: () => ({
     addAccount: { mutate: H.addAccount, isPending: false },
@@ -78,11 +90,55 @@ const data: ConnectionsData = {
 beforeEach(() => {
   H.data.current = data;
   H.failed = false;
+  H.resources = [];
   vi.clearAllMocks();
+  H.connect.mockResolvedValue(undefined);
 });
 afterEach(cleanup);
 
 describe('Connections drafts', () => {
+  it('saves real label selections under the connected account and respects partial consent', () => {
+    H.data.current = {
+      ...data,
+      accounts: data.accounts.map((account) =>
+        account.id === a
+          ? {
+              ...account,
+              status: 'connected',
+              email: 'verified@example.test',
+              granted_scopes: [
+                'https://www.googleapis.com/auth/gmail.readonly',
+              ],
+            }
+          : account,
+      ),
+    };
+    H.resources = [{ id: 'Label_42', name: 'Team mail' }];
+    render(<ConnectionsPanel />);
+    const work = within(screen.getByRole('article', { name: 'Work' }));
+    expect(work.getByText('Connected')).toBeTruthy();
+    expect(work.getByText('verified@example.test')).toBeTruthy();
+    fireEvent.click(work.getByRole('button', { name: 'Add source' }));
+    expect(
+      (work.getByRole('option', { name: 'Google Drive' }) as HTMLOptionElement)
+        .disabled,
+    ).toBe(true);
+    fireEvent.click(work.getByRole('checkbox', { name: 'Team mail' }));
+    fireEvent.click(work.getByRole('button', { name: 'Save source settings' }));
+    expect(H.addSource).toHaveBeenCalledWith(
+      expect.objectContaining({
+        account_id: a,
+        policy: {
+          kind: 'gmail',
+          exposure: 'selected_labels',
+          label_ids: ['Label_42'],
+          lookback_days: 30,
+        },
+      }),
+      expect.anything(),
+    );
+  });
+
   it('groups sources under their account and never claims a draft is connected', () => {
     render(<ConnectionsPanel />);
     expect(
@@ -106,7 +162,9 @@ describe('Connections drafts', () => {
 
   it('can prepare another account with an optional hint without asserting a Google identity', () => {
     render(<ConnectionsPanel />);
-    fireEvent.click(screen.getByRole('button', { name: 'Add Google account' }));
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Prepare account draft' }),
+    );
     fireEvent.change(screen.getByLabelText('Account name'), {
       target: { value: 'Another account' },
     });
@@ -128,7 +186,9 @@ describe('Connections drafts', () => {
     fireEvent.change(screen.getByLabelText('Service'), {
       target: { value: 'gmail' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Save source draft' }));
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Save source settings' }),
+    );
     expect(H.addSource.mock.calls[0][0]).toEqual({
       account_id: b,
       name: 'Gmail',
@@ -152,7 +212,9 @@ describe('Connections drafts', () => {
     fireEvent.change(screen.getByLabelText('Content to use'), {
       target: { value: 'drive' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Save source draft' }));
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Save source settings' }),
+    );
     expect(H.addSource.mock.calls[0][0].policy).toEqual({
       kind: 'google_drive',
       exposure: 'selected_drive',

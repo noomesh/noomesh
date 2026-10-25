@@ -2197,9 +2197,14 @@ CREATE TABLE noo_connection_sources (
 CREATE INDEX ix_connection_sources_owner ON noo_connection_sources(owner_uuid);
 CREATE INDEX ix_connection_sources_account ON noo_connection_sources(account_id, owner_uuid);
 "#,
+}, Migration {
+    revision: INTEGRATION_OAUTH_REVISION,
+    down_revision: Some(CONNECTIONS_REVISION),
+    sql: include_str!("integrations/schema.sql"),
 }];
 
 pub const CONNECTIONS_REVISION: &str = "103_connection_drafts";
+pub const INTEGRATION_OAUTH_REVISION: &str = "104_integration_oauth";
 
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A

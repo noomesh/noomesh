@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 PersonifAI LLC
 
-//! Owner-only connection drafts. No tokens, imports or provider calls.
+//! Private provider connections; OAuth exchange requires the signed-in owner.
 
 use super::{AppError, AppResult};
 use crate::{
@@ -11,7 +11,9 @@ use crate::{
     state::AppState,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
+    http::{header, HeaderMap},
+    response::{Html, IntoResponse},
     routing::{delete, get, post},
     Extension, Json, Router,
 };
@@ -26,6 +28,102 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/connections/accounts/{id}", delete(remove_account))
         .route("/api/connections/sources", post(create_source))
         .route("/api/connections/sources/{id}", delete(remove_source))
+        .route("/api/connections/oauth/start", post(oauth_start))
+        .route("/api/connections/oauth/complete", post(oauth_complete))
+        .route("/api/connections/oauth/cancel", post(oauth_cancel))
+        .route("/api/connections/oauth/callback", get(oauth_callback))
+        .route("/api/connections/accounts/{id}/resources", get(resources))
+}
+
+async fn owner_id(
+    state: &AppState,
+    ctx: &Option<Extension<RequesterCtx>>,
+) -> Result<Uuid, AppError> {
+    crate::repo::integrations::owner_uuid(&state.db, owner(ctx)?)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| AppError::Forbidden("A registered Noomesh account is required".into()))
+}
+
+async fn oauth_start(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<RequesterCtx>>,
+    headers: HeaderMap,
+    Json(request): Json<crate::integrations::oauth::Start>,
+) -> AppResult {
+    let owner = owner_id(&state, &ctx).await?;
+    Ok(Json(
+        crate::integrations::oauth::start(
+            &state.db,
+            &state.config.integrations,
+            owner,
+            request,
+            headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()),
+        )
+        .await?,
+    ))
+}
+
+async fn oauth_complete(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<RequesterCtx>>,
+    Json(request): Json<crate::integrations::oauth::Complete>,
+) -> AppResult {
+    let owner = owner_id(&state, &ctx).await?;
+    let id =
+        crate::integrations::oauth::complete(&state.db, &state.config.integrations, owner, request)
+            .await?;
+    Ok(Json(json!({"id":id,"status":"connected"})))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Cancel {
+    session_id: Uuid,
+}
+async fn oauth_cancel(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<RequesterCtx>>,
+    Json(request): Json<Cancel>,
+) -> AppResult {
+    crate::repo::integrations::cancel(&state.db, owner_id(&state, &ctx).await?, request.session_id)
+        .await
+        .map_err(db_error)?;
+    Ok(Json(json!({"cancelled":true})))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Resources {
+    service: String,
+    page: Option<String>,
+}
+async fn resources(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<RequesterCtx>>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<Resources>,
+) -> AppResult {
+    let owner = owner_id(&state, &ctx).await?;
+    Ok(Json(
+        crate::integrations::oauth::resources(
+            &state.db,
+            &state.config.integrations,
+            owner,
+            id,
+            &query.service,
+            query.page.as_deref(),
+        )
+        .await?,
+    ))
+}
+
+/// Inert public landing page: never exchanges codes, reads cookies or changes
+/// accounts. Only the authenticated opener can complete its one-time session.
+async fn oauth_callback() -> impl IntoResponse {
+    ([(header::CACHE_CONTROL,"no-store"), (header::REFERRER_POLICY,"no-referrer"),
+      (header::CONTENT_SECURITY_POLICY,"default-src 'none'; script-src 'sha256-gzPK3Me2OsEcw1T00/g7rvFClgDmVm5qwTeBSQcq92c='; base-uri 'none'; frame-ancestors 'none'")],
+      Html(include_str!("../integrations/callback.html")))
 }
 
 fn owner(ctx: &Option<Extension<RequesterCtx>>) -> Result<&str, AppError> {
@@ -50,11 +148,21 @@ async fn list(
     let owner = owner(&ctx)?;
     let accounts = repo::accounts(&state.db, owner).await.map_err(db_error)?;
     let sources = repo::sources(&state.db, owner).await.map_err(db_error)?;
+    let web = crate::integrations::oauth::ready(
+        &state.config.integrations,
+        "google",
+        crate::integrations::ClientKind::Web,
+    );
+    let desktop = crate::integrations::oauth::ready(
+        &state.config.integrations,
+        "google",
+        crate::integrations::ClientKind::Desktop,
+    );
     Ok(Json(json!({
         "accounts": accounts, "sources": sources,
         "providers": [{"id":"google", "name":"Google", "services":["google_drive","gmail"],
-            "authorization_available":false,
-            "authorization_detail":"Google sign-in is not available yet. Prepare your accounts and sources now; sign-in will be required before any Google data is accessed."}],
+            "authorization_available":web, "desktop_authorization_available":desktop,
+            "authorization_detail": if web { "Connect Google, approve Drive or Gmail, then choose what Noomesh should use. Content import is not enabled by this setup." } else if desktop { "Use `noo auth connect google` on the computer running your browser. Your installer can also enable browser sign-in for this console." } else { "Google sign-in needs installer configuration: an OAuth client ID and an integration encryption key. You can prepare account and source drafts now." }}],
     })))
 }
 
@@ -125,6 +233,41 @@ mod tests {
     use super::*;
     use crate::auth::Role;
 
+    #[tokio::test]
+    async fn public_callback_is_inert_no_store_and_its_exact_script_is_allowed() {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let response = oauth_callback().await.into_response();
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let policy = response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let bytes = axum::body::to_bytes(response.into_body(), 16384)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        let script = html
+            .split("<script>")
+            .nth(1)
+            .unwrap()
+            .split("</script>")
+            .next()
+            .unwrap();
+        let hash =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(script.as_bytes()));
+        assert!(policy.contains(&format!("'sha256-{hash}'")));
+        assert!(script.contains("history.replaceState"));
+        assert!(!script.contains("fetch("));
+        assert!(crate::auth::PUBLIC_PATHS_EXACT.contains(&"/api/connections/oauth/callback"));
+    }
+
     #[test]
     fn every_tier_is_pinned_to_its_own_account_and_internal_has_none() {
         assert!(owner(&None).is_err());
@@ -147,6 +290,22 @@ mod tests {
                 requester,
                 &axum::http::Method::POST,
                 "/api/connections/accounts"
+            ));
+            for path in [
+                "/api/connections/oauth/start",
+                "/api/connections/oauth/complete",
+                "/api/connections/oauth/cancel",
+            ] {
+                assert!(crate::auth::requester_allows(
+                    requester,
+                    &axum::http::Method::POST,
+                    path
+                ));
+            }
+            assert!(crate::auth::requester_allows(
+                requester,
+                &axum::http::Method::GET,
+                &format!("/api/connections/accounts/{}/resources", Uuid::new_v4())
             ));
         }
     }

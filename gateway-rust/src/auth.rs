@@ -2290,6 +2290,7 @@ pub fn is_handler_authenticated(path: &str) -> bool {
 /// `/`, so prefix-match would let everything through. Same for the
 /// dashboard shell URLs that don't have a trailing slash.
 pub const PUBLIC_PATHS_EXACT: &[&str] = &[
+    "/api/connections/oauth/callback",
     // The PUBLIC half of the API spec — the ~31 endpoints reachable without a
     // credential, derived from these very lists by
     // `scripts/gen-public-openapi.py`. An OAuth client reading
@@ -3047,7 +3048,7 @@ pub fn user_may_read(path: &str) -> bool {
     {
         return false;
     }
-    USER_READ_PATHS.contains(&path)
+    crate::connections::user_read_allowed(path) || USER_READ_PATHS.contains(&path)
         || USER_READ_PREFIXES.iter().any(|p| {
             // `/x/` prefixes match by starts_with; a bare `/x` entry matches
             // `/x` and `/x/...` only (a directory, not a stem).

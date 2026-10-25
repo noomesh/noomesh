@@ -10,7 +10,7 @@ use uuid::Uuid;
 pub async fn accounts(db: &sqlx::PgPool, owner: &str) -> Result<Vec<Value>, sqlx::Error> {
     sqlx::query_scalar::<_, Value>(
         r#"SELECT jsonb_build_object('id', a.id, 'provider', a.provider, 'label', a.label,
-            'email_hint', a.email_hint, 'status', a.status, 'created_at', a.created_at) AS account
+            'email_hint', a.email_hint, 'email', a.email, 'granted_scopes', a.granted_scopes, 'status', a.status, 'created_at', a.created_at) AS account
            FROM noo_connected_accounts a JOIN noo_users u ON u.user_uuid = a.owner_uuid
            WHERE u.username = $1 ORDER BY a.created_at, a.id"#,
     )
@@ -42,7 +42,7 @@ pub async fn create_account(
 pub async fn delete_account(db: &sqlx::PgPool, owner: &str, id: Uuid) -> Result<bool, sqlx::Error> {
     Ok(sqlx::query(
         "DELETE FROM noo_connected_accounts WHERE id = $1 AND owner_uuid = \
-         (SELECT user_uuid FROM noo_users WHERE username = $2) AND status = 'needs_auth'",
+         (SELECT user_uuid FROM noo_users WHERE username = $2)",
     )
     .bind(id)
     .bind(owner)
@@ -146,6 +146,10 @@ mod tests {
             .find(|m| m.revision == crate::mesh_migrate::CONNECTIONS_REVISION)
             .unwrap();
         sqlx::raw_sql(migration.sql).execute(&db).await.unwrap();
+        sqlx::raw_sql(include_str!("../integrations/schema.sql"))
+            .execute(&db)
+            .await
+            .unwrap();
         let draft = AccountDraft {
             label: "Work".into(),
             email_hint: Some("person@example.test".into()),
@@ -214,7 +218,10 @@ mod tests {
         assert!(rows.iter().all(|s| s["status"] == "draft"
             && s["visibility"] == "private"
             && s["access"] == "read_only"));
-        let first = rows.iter().find(|s| s["account_id"] == a.to_string()).unwrap();
+        let first = rows
+            .iter()
+            .find(|s| s["account_id"] == a.to_string())
+            .unwrap();
         let source_id = Uuid::parse_str(first["id"].as_str().unwrap()).unwrap();
         assert!(!delete_source(&db, "bob", source_id).await.unwrap());
         assert!(!delete_account(&db, "bob", a).await.unwrap());
@@ -237,7 +244,7 @@ mod tests {
                 .execute(&db)
                 .await
                 .is_err(),
-            "drafts cannot become connected without a future schema change"
+            "connected status requires a verified provider identity"
         );
         sqlx::query("DELETE FROM noo_users WHERE username = 'alice'")
             .execute(&db)

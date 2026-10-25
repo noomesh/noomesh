@@ -1049,8 +1049,14 @@ fn erase_targets(keep_account: bool, episodes_have_user_id: bool) -> Vec<EraseTa
         // the account, and also under `keep_account`: a wiped user starts from
         // the defaults.
         EraseTarget { label: "user_settings", table: "noo_user_settings", where_sql: "username = $1" },
-        // Also erased under keep-account; removing account drafts cascades
-        // their sources. No OAuth credentials exist in these tables.
+        // Erase pending grants even without an account target. Also under
+        // keep-account: no in-flight consent may restore a wiped connection.
+        EraseTarget {
+            label: "integration_oauth_sessions",
+            table: "noo_integration_oauth_sessions",
+            where_sql: "owner_uuid = (SELECT user_uuid FROM noo_users WHERE username = $1)",
+        },
+        // Account removal cascades source selections and encrypted credentials.
         EraseTarget {
             label: "connection_accounts",
             table: "noo_connected_accounts",
@@ -1270,6 +1276,10 @@ pub(crate) async fn erase_account(
                 retry_after_secs: wait,
             });
         }
+        // Serialize erasure with connection completion: a claimed OAuth
+        // session must still exist after taking this same user-row lock.
+        sqlx::query("SELECT user_uuid FROM noo_users WHERE user_uuid=$1 FOR UPDATE")
+            .bind(owner).fetch_one(&mut *tx).await?;
         // Read-side live operations are stopped here, before their rows go:
         // a detached task outlives its row.
         crate::ops::abort_live_for_account(db, &username)
@@ -4426,9 +4436,10 @@ mod tests {
     }
 
     #[test]
-    fn rtbf_lists_connection_drafts_even_when_keeping_the_login() {
+    fn rtbf_lists_connections_and_pending_grants_even_when_keeping_the_login() {
         for keep in [true, false] {
             let t = super::erase_targets(keep, true);
+            assert!(t.iter().any(|x| x.table == "noo_integration_oauth_sessions" && x.where_sql == "owner_uuid = (SELECT user_uuid FROM noo_users WHERE username = $1)"));
             let target = t.iter().find(|x| x.table == "noo_connected_accounts").expect("connection drafts must be erased");
             assert_eq!(target.where_sql, "owner_uuid = (SELECT user_uuid FROM noo_users WHERE username = $1)");
         }

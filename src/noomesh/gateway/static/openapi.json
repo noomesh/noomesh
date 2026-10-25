@@ -20526,8 +20526,8 @@
         "tags": [
           "Connections"
         ],
-        "summary": "List private connection drafts and provider readiness",
-        "description": "Private to the signed-in Noomesh account, including operators. Draft metadata only: no Google authorization, tokens, sync or imports.",
+        "summary": "List private connections and provider readiness",
+        "description": "List private account connections, granted Google scopes, source drafts, and installer OAuth readiness. Never returns credentials.",
         "responses": {
           "200": {
             "description": "Success",
@@ -20613,8 +20613,8 @@
         "tags": [
           "Connections"
         ],
-        "summary": "Remove an account draft and its source drafts",
-        "description": "Private to the signed-in Noomesh account, including operators. Draft metadata only: no Google authorization, tokens, sync or imports.",
+        "summary": "Remove an account and its local credentials and source drafts",
+        "description": "Delete an owned account, encrypted credentials and source drafts locally. Does not revoke Google grants or delete provider content.",
         "responses": {
           "200": {
             "description": "Success",
@@ -20748,6 +20748,250 @@
             "schema": {
               "type": "string",
               "format": "uuid"
+            }
+          }
+        ]
+      }
+    },
+    "/api/connections/oauth/start": {
+      "post": {
+        "operationId": "connection_oauth_start",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Start provider authorization",
+        "description": "Owner-only integration setup. Credentials are encrypted and never returned. Source setup does not start content ingestion.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionOAuthSession"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or expired authorization"
+          },
+          "401": {
+            "description": "Sign-in required"
+          },
+          "403": {
+            "description": "Signed-in owner required"
+          },
+          "404": {
+            "description": "Owned connection not found"
+          },
+          "409": {
+            "description": "Reconnect required"
+          },
+          "503": {
+            "description": "Provider or installer configuration unavailable"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionOAuthStart"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/connections/oauth/complete": {
+      "post": {
+        "operationId": "connection_oauth_complete",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Complete provider authorization",
+        "description": "Owner-only integration setup. Credentials are encrypted and never returned. Source setup does not start content ingestion.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionOAuthConnected"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or expired authorization"
+          },
+          "401": {
+            "description": "Sign-in required"
+          },
+          "403": {
+            "description": "Signed-in owner required"
+          },
+          "404": {
+            "description": "Owned connection not found"
+          },
+          "409": {
+            "description": "Reconnect required"
+          },
+          "503": {
+            "description": "Provider or installer configuration unavailable"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionOAuthComplete"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/connections/oauth/cancel": {
+      "post": {
+        "operationId": "connection_oauth_cancel",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Cancel provider authorization",
+        "description": "Owner-only integration setup. Credentials are encrypted and never returned. Source setup does not start content ingestion.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionOAuthCancelled"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or expired authorization"
+          },
+          "401": {
+            "description": "Sign-in required"
+          },
+          "403": {
+            "description": "Signed-in owner required"
+          },
+          "404": {
+            "description": "Owned connection not found"
+          },
+          "409": {
+            "description": "Reconnect required"
+          },
+          "503": {
+            "description": "Provider or installer configuration unavailable"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionOAuthCancel"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/connections/oauth/callback": {
+      "get": {
+        "operationId": "connection_oauth_callback",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Return authorization response to the originating Noomesh window",
+        "description": "Static landing page only; no credentials exchanged or database changes.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "No-store HTML return page",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/connections/accounts/{id}/resources": {
+      "get": {
+        "operationId": "connection_resources",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "List folders, shared drives, or Gmail labels",
+        "description": "Owner-only integration setup. Credentials are encrypted and never returned. Source setup does not start content ingestion.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionResources"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or expired authorization"
+          },
+          "401": {
+            "description": "Sign-in required"
+          },
+          "403": {
+            "description": "Signed-in owner required"
+          },
+          "404": {
+            "description": "Owned connection not found"
+          },
+          "409": {
+            "description": "Reconnect required"
+          },
+          "503": {
+            "description": "Provider or installer configuration unavailable"
+          }
+        },
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "in": "query",
+            "name": "service",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "folders",
+                "drives",
+                "gmail"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "string"
             }
           }
         ]
@@ -21020,12 +21264,25 @@
           "status": {
             "type": "string",
             "enum": [
-              "needs_auth"
+              "needs_auth",
+              "connected",
+              "reauth_required",
+              "disconnected"
             ]
           },
           "created_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "email": {
+            "type": "string",
+            "nullable": true
+          },
+          "granted_scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         },
         "required": [
@@ -21134,13 +21391,13 @@
             }
           },
           "authorization_available": {
-            "type": "boolean",
-            "enum": [
-              false
-            ]
+            "type": "boolean"
           },
           "authorization_detail": {
             "type": "string"
+          },
+          "desktop_authorization_available": {
+            "type": "boolean"
           }
         },
         "required": [
@@ -21212,6 +21469,182 @@
         "required": [
           "removed"
         ]
+      },
+      "ConnectionOAuthStart": {
+        "type": "object",
+        "properties": {
+          "provider": {
+            "type": "string",
+            "enum": [
+              "google"
+            ]
+          },
+          "services": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "google_drive",
+                "gmail"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 2,
+            "uniqueItems": true
+          },
+          "client_kind": {
+            "type": "string",
+            "enum": [
+              "web",
+              "desktop"
+            ]
+          },
+          "redirect_uri": {
+            "type": "string"
+          },
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "provider",
+          "services",
+          "client_kind"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionOAuthSession": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "completion_token": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "authorization_url": {
+            "type": "string"
+          },
+          "expires_in": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id",
+          "completion_token",
+          "state",
+          "authorization_url",
+          "expires_in"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionOAuthComplete": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "completion_token": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "completion_token",
+          "state",
+          "code"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionOAuthCancel": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionOAuthConnected": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "connected"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "status"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionOAuthCancelled": {
+        "type": "object",
+        "properties": {
+          "cancelled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "cancelled"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionResources": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "name"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "next_page_token": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "next_page_token"
+        ],
+        "additionalProperties": false
       }
     }
   }

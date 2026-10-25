@@ -683,6 +683,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     // inspect and drop a per-person credential instead of signing with the
     // shared cluster HMAC. `login` hits the gateway's existing
     // POST /auth/token; nothing gateway-side changed.
+    (&["auth", "connect"], commands::auth_connect),
     (&["auth", "login"], commands::auth_login),
     (&["auth", "status"], commands::auth_status),
     (&["auth", "logout"], commands::auth_logout),

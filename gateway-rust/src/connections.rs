@@ -95,7 +95,11 @@ pub fn user_write_allowed(method: &axum::http::Method, path: &str) -> bool {
     if *method == axum::http::Method::POST {
         return matches!(
             path,
-            "/api/connections/accounts" | "/api/connections/sources"
+            "/api/connections/accounts"
+                | "/api/connections/sources"
+                | "/api/connections/oauth/start"
+                | "/api/connections/oauth/complete"
+                | "/api/connections/oauth/cancel"
         );
     }
     if *method != axum::http::Method::DELETE {
@@ -287,4 +291,11 @@ mod tests {
             }
         }
     }
+}
+
+/// Only the owner-filtered resource listing, not arbitrary descendants.
+pub fn user_read_allowed(path: &str) -> bool {
+    path.strip_prefix("/api/connections/accounts/")
+        .and_then(|s| s.strip_suffix("/resources"))
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
 }

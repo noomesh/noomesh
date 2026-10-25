@@ -237,6 +237,8 @@ services:
       - { source: noo_tailscale_oauth_client_secret, target: noo_tailscale_oauth_client_secret, x-noo-uid: "65532" }
       - { source: noo_tailscale_api_key, target: noo_tailscale_api_key, x-noo-uid: "65532" }
       - { source: noo_agent_review_key, target: noo_agent_review_key, x-noo-uid: "65532" }
+      - { source: noo_integrations_key, target: noo_integrations_key, x-noo-uid: "65532" }
+      - { source: noo_google_oauth_client_secret, target: noo_google_oauth_client_secret, x-noo-uid: "65532" }
       - { source: noo_agent_signing_key, target: noo_agent_signing_key, x-noo-uid: "65532" }
       - { source: noo_jwt_signing_key, target: noo_jwt_signing_key, x-noo-uid: "65532" }
       - { source: noo_entitlement, target: noo_entitlement, x-noo-uid: "65532" }
@@ -507,6 +509,8 @@ services:
       # agent-to-agent body on the bus/in the table; operators review
       # through the gateway. Absent = plaintext (boot log says so).
       - NOO_AGENT_REVIEW_KEY_FILE=${NOO_AGENT_REVIEW_KEY:+/run/secrets/noo_agent_review_key}
+      - NOO_INTEGRATIONS_KEY_FILE=${NOO_INTEGRATIONS_KEY:+/run/secrets/noo_integrations_key}
+      - NOO_GOOGLE_OAUTH_CLIENT_SECRET_FILE=${NOO_GOOGLE_OAUTH_CLIENT_SECRET:+/run/secrets/noo_google_oauth_client_secret}
       # Optional second agent-messaging secret: when set,
       # signatures derive from THIS and NOO_AGENT_REVIEW_KEY becomes
       # decrypt-only, so a reviewer who can read history cannot forge it.
@@ -3400,6 +3404,13 @@ secrets:
   google_chat_credentials_json:
     file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/google_chat_credentials_json
     x-noo-source: NOO_FILECRED_GOOGLE_CHAT_B64
+
+  noo_integrations_key:
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_integrations_key
+    x-noo-source: NOO_INTEGRATIONS_KEY
+  noo_google_oauth_client_secret:
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_google_oauth_client_secret
+    x-noo-source: NOO_GOOGLE_OAUTH_CLIENT_SECRET
 
 configs:
   prometheus_config:

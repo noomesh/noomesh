@@ -10527,8 +10527,8 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List private connection drafts and provider readiness
-         * @description Private to the signed-in Noomesh account, including operators. Draft metadata only: no Google authorization, tokens, sync or imports.
+         * List private connections and provider readiness
+         * @description List private account connections, granted Google scopes, source drafts, and installer OAuth readiness. Never returns credentials.
          */
         get: operations["list_connection_drafts"];
         put?: never;
@@ -10570,8 +10570,8 @@ export interface paths {
         put?: never;
         post?: never;
         /**
-         * Remove an account draft and its source drafts
-         * @description Private to the signed-in Noomesh account, including operators. Draft metadata only: no Google authorization, tokens, sync or imports.
+         * Remove an account and its local credentials and source drafts
+         * @description Delete an owned account, encrypted credentials and source drafts locally. Does not revoke Google grants or delete provider content.
          */
         delete: operations["remove_connection_account_draft"];
         options?: never;
@@ -10614,6 +10614,106 @@ export interface paths {
          * @description Private to the signed-in Noomesh account, including operators. Draft metadata only: no Google authorization, tokens, sync or imports.
          */
         delete: operations["remove_connection_source_draft"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/connections/oauth/start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start provider authorization
+         * @description Owner-only integration setup. Credentials are encrypted and never returned. Source setup does not start content ingestion.
+         */
+        post: operations["connection_oauth_start"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/connections/oauth/complete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Complete provider authorization
+         * @description Owner-only integration setup. Credentials are encrypted and never returned. Source setup does not start content ingestion.
+         */
+        post: operations["connection_oauth_complete"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/connections/oauth/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel provider authorization
+         * @description Owner-only integration setup. Credentials are encrypted and never returned. Source setup does not start content ingestion.
+         */
+        post: operations["connection_oauth_cancel"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/connections/oauth/callback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Return authorization response to the originating Noomesh window
+         * @description Static landing page only; no credentials exchanged or database changes.
+         */
+        get: operations["connection_oauth_callback"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/connections/accounts/{id}/resources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List folders, shared drives, or Gmail labels
+         * @description Owner-only integration setup. Credentials are encrypted and never returned. Source setup does not start content ingestion.
+         */
+        get: operations["connection_resources"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -10710,9 +10810,11 @@ export interface components {
             label: string;
             email_hint: string | null;
             /** @enum {string} */
-            status: "needs_auth";
+            status: "needs_auth" | "connected" | "reauth_required" | "disconnected";
             /** Format: date-time */
             created_at: string;
+            email?: string | null;
+            granted_scopes?: string[];
         };
         ConnectionSourceDraft: {
             /** Format: uuid */
@@ -10741,9 +10843,9 @@ export interface components {
             id: "google";
             name: string;
             services: ("google_drive" | "gmail")[];
-            /** @enum {boolean} */
-            authorization_available: false;
+            authorization_available: boolean;
             authorization_detail: string;
+            desktop_authorization_available?: boolean;
         };
         ConnectionsResponse: {
             accounts: components["schemas"]["ConnectionAccount"][];
@@ -10759,6 +10861,51 @@ export interface components {
         ConnectionDraftRemoved: {
             /** @enum {boolean} */
             removed: true;
+        };
+        ConnectionOAuthStart: {
+            /** @enum {string} */
+            provider: "google";
+            services: ("google_drive" | "gmail")[];
+            /** @enum {string} */
+            client_kind: "web" | "desktop";
+            redirect_uri?: string;
+            /** Format: uuid */
+            account_id?: string;
+        };
+        ConnectionOAuthSession: {
+            /** Format: uuid */
+            session_id: string;
+            completion_token: string;
+            state: string;
+            authorization_url: string;
+            expires_in: number;
+        };
+        ConnectionOAuthComplete: {
+            /** Format: uuid */
+            session_id: string;
+            completion_token: string;
+            state: string;
+            code: string;
+        };
+        ConnectionOAuthCancel: {
+            /** Format: uuid */
+            session_id: string;
+        };
+        ConnectionOAuthConnected: {
+            /** Format: uuid */
+            id: string;
+            /** @enum {string} */
+            status: "connected";
+        };
+        ConnectionOAuthCancelled: {
+            cancelled: boolean;
+        };
+        ConnectionResources: {
+            items: {
+                id: string;
+                name: string;
+            }[];
+            next_page_token: string | null;
         };
     };
     responses: never;
@@ -24926,6 +25073,291 @@ export interface operations {
             };
             /** @description Connection storage unavailable */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    connection_oauth_start: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConnectionOAuthStart"];
+            };
+        };
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionOAuthSession"];
+                };
+            };
+            /** @description Invalid or expired authorization */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Sign-in required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Signed-in owner required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Owned connection not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Reconnect required */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Provider or installer configuration unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    connection_oauth_complete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConnectionOAuthComplete"];
+            };
+        };
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionOAuthConnected"];
+                };
+            };
+            /** @description Invalid or expired authorization */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Sign-in required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Signed-in owner required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Owned connection not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Reconnect required */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Provider or installer configuration unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    connection_oauth_cancel: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConnectionOAuthCancel"];
+            };
+        };
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionOAuthCancelled"];
+                };
+            };
+            /** @description Invalid or expired authorization */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Sign-in required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Signed-in owner required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Owned connection not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Reconnect required */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Provider or installer configuration unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    connection_oauth_callback: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description No-store HTML return page */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+        };
+    };
+    connection_resources: {
+        parameters: {
+            query: {
+                service: "folders" | "drives" | "gmail";
+                page?: string;
+            };
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionResources"];
+                };
+            };
+            /** @description Invalid or expired authorization */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Sign-in required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Signed-in owner required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Owned connection not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Reconnect required */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Provider or installer configuration unavailable */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

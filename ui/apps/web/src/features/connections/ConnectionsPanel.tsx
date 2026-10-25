@@ -10,6 +10,8 @@ import { useConfirm } from '@/components/ConfirmDialog';
 import {
   useConnections,
   useConnectionActions,
+  useGoogleConnect,
+  useConnectionResources,
   type Account,
   type Source,
   type SourcePolicy,
@@ -38,6 +40,12 @@ export function ConnectionsPanel() {
   const { addAccount, addSource, removeAccount, removeSource } =
     useConnectionActions();
   const confirm = useConfirm();
+  const google = useGoogleConnect();
+  const [services, setServices] = useState<('google_drive' | 'gmail')[]>([
+    'google_drive',
+    'gmail',
+  ]);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [showAccountForm, setShowAccountForm] = useState(false);
   const [accountLabel, setAccountLabel] = useState('');
   const [email, setEmail] = useState('');
@@ -46,7 +54,21 @@ export function ConnectionsPanel() {
   const [kind, setKind] = useState<'google_drive' | 'gmail'>('google_drive');
   const [exposure, setExposure] = useState('selected');
   const [lookback, setLookback] = useState(30);
+  const selectedAccount = query.data?.accounts.find(
+    (a) => a.id === sourceAccount,
+  );
+  const resourceType =
+    kind === 'gmail' ? 'gmail' : exposure === 'drive' ? 'drives' : 'folders';
+  const resources = useConnectionResources(
+    sourceAccount,
+    resourceType,
+    selectedAccount?.status === 'connected' && exposure !== 'all',
+  );
+  const webReady = query.data?.providers.find(
+    (p) => p.id === 'google',
+  )?.authorization_available;
   const busy =
+    google.pending ||
     addAccount.isPending ||
     addSource.isPending ||
     removeAccount.isPending ||
@@ -77,7 +99,7 @@ export function ConnectionsPanel() {
         ? {
             kind: 'gmail',
             exposure: exposure === 'all' ? 'mailbox' : 'selected_labels',
-            label_ids: [],
+            label_ids: selectedIds,
             lookback_days: lookback,
           }
         : {
@@ -88,7 +110,8 @@ export function ConnectionsPanel() {
                 : exposure === 'drive'
                   ? 'selected_drive'
                   : 'selected_folders',
-            folder_ids: [],
+            folder_ids: exposure === 'selected' ? selectedIds : [],
+            ...(exposure === 'drive' ? { drive_id: selectedIds[0] } : {}),
           };
     addSource.mutate(
       {
@@ -111,8 +134,9 @@ export function ConnectionsPanel() {
     if (
       await confirm({
         title: `Remove ${account.label}?`,
-        description: 'Removes this account draft and all of its source drafts.',
-        confirmText: 'Remove draft',
+        description:
+          'Removes this account, its local credentials and source settings. To revoke access at Google, use your Google account permissions.',
+        confirmText: 'Remove',
         destructive: true,
       })
     ) {
@@ -129,7 +153,7 @@ export function ConnectionsPanel() {
     if (
       await confirm({
         title: `Remove ${source.name}?`,
-        confirmText: 'Remove draft',
+        confirmText: 'Remove',
         destructive: true,
       })
     ) {
@@ -146,12 +170,12 @@ export function ConnectionsPanel() {
           disabled={!query.data || busy}
           onClick={() => setShowAccountForm(true)}
         >
-          Add Google account
+          Prepare account draft
         </Button>
       </div>
       <p className="connections-intro">
-        Keep work and personal accounts together here. Each account can have
-        several Drive and Gmail sources. Your drafts are private to you.
+        Connect your work and personal accounts. Each can have several Drive and
+        Gmail sources. Connections are private to your Noomesh account.
       </p>
       {query.isLoading && (
         <div className="state">Loading your connections…</div>
@@ -167,13 +191,53 @@ export function ConnectionsPanel() {
       {query.data && (
         <>
           <div className="connections-notice" role="status">
-            <strong>Prepare your connections</strong>
+            <strong>Set up Google</strong>
             <p>
               {query.data.providers.find((p) => p.id === 'google')
                 ?.authorization_detail ??
                 'Google sign-in is not available yet. Your saved drafts do not access Google data.'}
             </p>
           </div>
+          <div className="connections-actions">
+            {(['google_drive', 'gmail'] as const).map((service) => (
+              <label key={service}>
+                <input
+                  type="checkbox"
+                  checked={services.includes(service)}
+                  disabled={busy}
+                  onChange={(e) =>
+                    setServices((current) =>
+                      e.target.checked
+                        ? [...current, service]
+                        : current.filter((s) => s !== service),
+                    )
+                  }
+                />
+                {service === 'gmail' ? 'Gmail' : 'Google Drive'}
+              </label>
+            ))}
+            <Button
+              disabled={!webReady || busy || !services.length}
+              onClick={() =>
+                void google
+                  .connect(services)
+                  .then(() => toast.success('Google account connected'))
+                  .catch(report)
+              }
+            >
+              Connect Google
+            </Button>
+            {google.pending && (
+              <Button variant="outline" onClick={google.cancel}>
+                Cancel sign-in
+              </Button>
+            )}
+          </div>
+          <p className="connections-detail">
+            Google requests read access to the selected services. Source
+            selections below control what Noomesh will use; they do not narrow
+            Google's permissions. Content import is not started by this setup.
+          </p>
           {showAccountForm && (
             <form className="connections-form" onSubmit={saveAccount}>
               <h3>Add an account draft</h3>
@@ -198,8 +262,8 @@ export function ConnectionsPanel() {
                 />
               </label>
               <p className="connections-detail">
-                This is a reminder of which account to sign into. Google will
-                confirm the account when sign-in becomes available.
+                This is a sign-in hint. Google confirms the account when you
+                connect.
               </p>
               <div className="connections-actions">
                 <Button size="sm" disabled={busy || !accountLabel.trim()}>
@@ -219,8 +283,8 @@ export function ConnectionsPanel() {
           )}
           {query.data.accounts.length === 0 && !showAccountForm && (
             <div className="state">
-              Add your first Google account draft to prepare Drive or Gmail
-              sources.
+              Connect Google to add your first account, or prepare an account
+              draft.
             </div>
           )}
           <div className="connections-accounts">
@@ -233,20 +297,33 @@ export function ConnectionsPanel() {
                 <div className="connection-account-head">
                   <div>
                     <h3>{account.label}</h3>
-                    {account.email_hint && (
+                    {(account.email || account.email_hint) && (
                       <p className="connections-detail">
-                        {account.email_hint} · unverified
+                        {account.email || `${account.email_hint} · unverified`}
                       </p>
                     )}
                   </div>
-                  <StatusBadge tone="warn">Needs sign-in</StatusBadge>
+                  <StatusBadge
+                    tone={account.status === 'connected' ? 'good' : 'warn'}
+                  >
+                    {account.status === 'connected'
+                      ? 'Connected'
+                      : account.status === 'reauth_required'
+                        ? 'Reconnect required'
+                        : 'Needs sign-in'}
+                  </StatusBadge>
                 </div>
                 <div className="connections-actions">
                   <Button
                     size="sm"
                     variant="outline"
-                    disabled
-                    title="Google sign-in is not available yet"
+                    disabled={!webReady || busy || !services.length}
+                    onClick={() =>
+                      void google
+                        .connect(services, account.id)
+                        .then(() => toast.success('Google account connected'))
+                        .catch(report)
+                    }
                   >
                     Sign in with Google
                   </Button>
@@ -256,8 +333,16 @@ export function ConnectionsPanel() {
                     disabled={busy}
                     onClick={() => {
                       setSourceAccount(account.id);
+                      setSelectedIds([]);
                       setSourceName('');
-                      setKind('google_drive');
+                      setKind(
+                        account.status === 'connected' &&
+                          !account.granted_scopes?.includes(
+                            'https://www.googleapis.com/auth/drive.readonly',
+                          )
+                          ? 'gmail'
+                          : 'google_drive',
+                      );
                       setExposure('selected');
                       setLookback(30);
                     }}
@@ -270,7 +355,7 @@ export function ConnectionsPanel() {
                     disabled={busy}
                     onClick={() => deleteAccount(account)}
                   >
-                    Remove account draft
+                    Remove account
                   </Button>
                 </div>
                 <ul className="connection-sources">
@@ -313,10 +398,31 @@ export function ConnectionsPanel() {
                         onChange={(e) => {
                           setKind(e.target.value as typeof kind);
                           setExposure('selected');
+                          setSelectedIds([]);
                         }}
                       >
-                        <option value="google_drive">Google Drive</option>
-                        <option value="gmail">Gmail</option>
+                        <option
+                          value="google_drive"
+                          disabled={
+                            account.status === 'connected' &&
+                            !account.granted_scopes?.includes(
+                              'https://www.googleapis.com/auth/drive.readonly',
+                            )
+                          }
+                        >
+                          Google Drive
+                        </option>
+                        <option
+                          value="gmail"
+                          disabled={
+                            account.status === 'connected' &&
+                            !account.granted_scopes?.includes(
+                              'https://www.googleapis.com/auth/gmail.readonly',
+                            )
+                          }
+                        >
+                          Gmail
+                        </option>
                       </select>
                     </label>
                     <label>
@@ -335,7 +441,10 @@ export function ConnectionsPanel() {
                       <select
                         className="op-select"
                         value={exposure}
-                        onChange={(e) => setExposure(e.target.value)}
+                        onChange={(e) => {
+                          setExposure(e.target.value);
+                          setSelectedIds([]);
+                        }}
                       >
                         <option value="selected">
                           {kind === 'gmail'
@@ -352,6 +461,56 @@ export function ConnectionsPanel() {
                         </option>
                       </select>
                     </label>
+                    {exposure !== 'all' && account.status === 'connected' && (
+                      <div>
+                        {resources.isLoading && <p>Loading Google choices…</p>}
+                        {resources.isError && (
+                          <p role="alert">
+                            {resources.error?.message}{' '}
+                            <Button
+                              type="button"
+                              variant="outline"
+                              onClick={() => resources.refetch()}
+                            >
+                              Try again
+                            </Button>
+                          </p>
+                        )}
+                        {resources.items.map((item) => (
+                          <label key={item.id} className="connections-resource">
+                            <input
+                              type={exposure === 'drive' ? 'radio' : 'checkbox'}
+                              name="google-resource"
+                              checked={selectedIds.includes(item.id)}
+                              onChange={(e) =>
+                                setSelectedIds((current) =>
+                                  exposure === 'drive'
+                                    ? [item.id]
+                                    : e.target.checked
+                                      ? [...current, item.id]
+                                      : current.filter((id) => id !== item.id),
+                                )
+                              }
+                            />{' '}
+                            {item.name}
+                          </label>
+                        ))}
+                        {resources.data?.next_page_token && (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={resources.more}
+                          >
+                            Load more choices
+                          </Button>
+                        )}
+                        {!resources.isLoading &&
+                          !resources.isError &&
+                          resources.items.length === 0 && (
+                            <p>No choices found.</p>
+                          )}
+                      </div>
+                    )}
                     {kind === 'gmail' && (
                       <label>
                         Mail history
@@ -375,8 +534,16 @@ export function ConnectionsPanel() {
                       request broader account permissions during sign-in.
                     </p>
                     <div className="connections-actions">
-                      <Button size="sm" disabled={busy}>
-                        Save source draft
+                      <Button
+                        size="sm"
+                        disabled={
+                          busy ||
+                          (account.status === 'connected' &&
+                            exposure !== 'all' &&
+                            !selectedIds.length)
+                        }
+                      >
+                        Save source settings
                       </Button>
                       <Button
                         type="button"

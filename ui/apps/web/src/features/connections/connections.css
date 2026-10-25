@@ -81,3 +81,8 @@
     flex-wrap: wrap;
   }
 }
+
+.connections-resource {
+  display: block;
+  padding: 0.3rem 0;
+}

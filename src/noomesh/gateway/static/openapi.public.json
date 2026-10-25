@@ -1058,6 +1058,29 @@
           }
         }
       }
+    },
+    "/api/connections/oauth/callback": {
+      "get": {
+        "operationId": "connection_oauth_callback",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Return authorization response to the originating Noomesh window",
+        "description": "Static landing page only; no credentials exchanged or database changes.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "No-store HTML return page",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1326,12 +1349,25 @@
           "status": {
             "type": "string",
             "enum": [
-              "needs_auth"
+              "needs_auth",
+              "connected",
+              "reauth_required",
+              "disconnected"
             ]
           },
           "created_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "email": {
+            "type": "string",
+            "nullable": true
+          },
+          "granted_scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         },
         "required": [
@@ -1440,13 +1476,13 @@
             }
           },
           "authorization_available": {
-            "type": "boolean",
-            "enum": [
-              false
-            ]
+            "type": "boolean"
           },
           "authorization_detail": {
             "type": "string"
+          },
+          "desktop_authorization_available": {
+            "type": "boolean"
           }
         },
         "required": [
@@ -1518,6 +1554,182 @@
         "required": [
           "removed"
         ]
+      },
+      "ConnectionOAuthStart": {
+        "type": "object",
+        "properties": {
+          "provider": {
+            "type": "string",
+            "enum": [
+              "google"
+            ]
+          },
+          "services": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "google_drive",
+                "gmail"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 2,
+            "uniqueItems": true
+          },
+          "client_kind": {
+            "type": "string",
+            "enum": [
+              "web",
+              "desktop"
+            ]
+          },
+          "redirect_uri": {
+            "type": "string"
+          },
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "provider",
+          "services",
+          "client_kind"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionOAuthSession": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "completion_token": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "authorization_url": {
+            "type": "string"
+          },
+          "expires_in": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id",
+          "completion_token",
+          "state",
+          "authorization_url",
+          "expires_in"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionOAuthComplete": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "completion_token": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "completion_token",
+          "state",
+          "code"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionOAuthCancel": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionOAuthConnected": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "connected"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "status"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionOAuthCancelled": {
+        "type": "object",
+        "properties": {
+          "cancelled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "cancelled"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionResources": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "name"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "next_page_token": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "next_page_token"
+        ],
+        "additionalProperties": false
       }
     }
   }

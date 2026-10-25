@@ -1,0 +1,12 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Google connection</title><body><p id="status">Returning to Noomesh…</p><script>
+const params = new URLSearchParams(location.search);
+history.replaceState(null, '', location.pathname);
+if (params.get('state')) {
+  const channel = new BroadcastChannel('noomesh:oauth:' + params.get('state'));
+  channel.postMessage({type: 'noomesh:oauth-result', state: params.get('state'), code: params.get('code'), error: params.get('error')});
+  channel.close();
+  document.getElementById('status').textContent = 'Return to the Noomesh window to finish connecting.';
+} else {
+  document.getElementById('status').textContent = 'Return to Noomesh and click Connect again.';
+}
+</script></body></html>

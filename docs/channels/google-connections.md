@@ -1,74 +1,84 @@
-# Google account and source drafts
+# Google accounts and source setup
 
-The console's **Connections** screen prepares private Google account and
-source drafts. It is available in both console editions to signed-in users.
-Several Google account drafts can belong to one Noomesh user, and each
-account can have several Drive and Gmail sources.
+**Connections** is available in both console editions to signed-in users.
+Connect multiple Google accounts, verify their emails through Google, and save
+several Drive/Gmail source selections under each account. Installer and user
+instructions are in [Connect external accounts](../getting-started/integrations.md).
 
-For the intended simple sign-in path and the advanced option of preparing
-your own Google application, start with
-[Connect external accounts on a local installation](../getting-started/integrations.md).
-It explains publisher/installer ownership, test users and callback networking.
-
-This release saves metadata only. Google sign-in, token storage, resource
-pickers, search and background synchronization are not implemented here.
-Accounts show **Needs sign-in** and sources show **Draft**. Saving a draft
-does not grant Google access or import content. The existing installation-wide
-service-account Drive watcher is independent of these drafts.
-
-## Prepare a connection
-
-1. Open **Connections**, then **Add Google account**.
-2. Name the account (for example, Work or Personal). An optional email is
-   an unverified reminder of the account to use later.
-3. Choose **Add source** under that account and select Google Drive or Gmail.
-4. Choose the intended content: folders, one drive, or all accessible Drive
-   files; selected Gmail labels or the mailbox. Gmail defaults to the past
-   30 days. Save the source draft.
-
-Folder, drive and label selection happens through the future resource
-picker after sign-in; empty selections are valid drafts. All sources are
-private and read only. Removing an account draft also removes its source
-drafts. This is local metadata removal, not Google token revocation.
+Authorization, encrypted token storage, refresh and resource listing are
+implemented. Source selections remain drafts: ingestion, search and background
+sync for these connections are not implemented. The existing service-account
+Drive watcher remains independent. Account drafts are still available before
+an installer configures OAuth.
 
 ## API and ownership
 
 | Method | Path | Behavior |
 | --- | --- | --- |
-| GET | `/api/connections` | Own account/source drafts and provider readiness |
-| POST | `/api/connections/accounts` | Create a Google account draft from `label` and optional `email_hint` |
-| DELETE | `/api/connections/accounts/{id}` | Remove own account draft and its sources |
-| POST | `/api/connections/sources` | Create a source from `account_id`, `name`, and a typed `policy` |
+| GET | `/api/connections` | Own accounts, verified emails, actual granted scopes, source drafts and provider readiness; no credentials |
+| POST | `/api/connections/oauth/start` | Start owner-bound authorization for `provider`, `services`, `client_kind`, optional owned `account_id`; desktop requires loopback `redirect_uri` |
+| GET | `/api/connections/oauth/callback` | Public static no-store HTML returns the authorization response to the initiating console tab; no token exchange or account changes |
+| POST | `/api/connections/oauth/complete` | Authenticated exchange using `session_id`, `completion_token`, `state`, `code` |
+| POST | `/api/connections/oauth/cancel` | Cancel an owned `session_id` |
+| GET | `/api/connections/accounts/{id}/resources` | Own folders, shared drives, or Gmail labels using `service=folders\|drives\|gmail` and optional `page` |
+| POST | `/api/connections/accounts` | Prepare an account draft from `label` and optional unverified `email_hint` |
+| DELETE | `/api/connections/accounts/{id}` | Remove own account, local encrypted credentials, pending reconnects and source drafts; no provider revocation |
+| POST | `/api/connections/sources` | Save a source draft from `account_id`, `name`, typed `policy` |
 | DELETE | `/api/connections/sources/{id}` | Remove own source draft |
 
-The owner comes from the authenticated account, including for Operator and
-Admin callers. Cluster/service credentials with no signed-in account are
-refused. Another user's id receives the same 404 as a missing id. A composite
-foreign key prevents attaching a source to another user's account.
-Drafts are also removed during account erasure with `keep_account` enabled.
+Every API mutation takes its owner from the authenticated Noomesh account,
+including Operator/Admin. Internal/service credentials without a user are
+refused. Composite foreign keys enforce owner consistency. Cross-user ids
+have the same response as missing ids. Account erasure also removes credentials
+and pending authorization, including with `keep_account` enabled.
 
-The mesh migration adds `noo_connected_accounts` and
-`noo_connection_sources`; it does not alter existing watchers or credentials.
-Both tables restrict status to the draft state. No request accepts provider
-identity claims, granted scopes, credentials, activation, send or write access.
-The API and generated TypeScript types are documented in the OpenAPI contract.
+## Authorization lifecycle
 
-## OAuth integration boundary
+The generic integration engine owns expiring ten-minute sessions, PKCE S256,
+state, one-time consumption, identity deduplication and token encryption. Google
+supplies the reviewed endpoints/scopes and verified UserInfo identity. Immutable
+Google `sub`, scoped to the Noomesh owner and provider, identifies an account;
+email hints never establish identity. The same Google identity can be linked
+by separate Noomesh users without crossing their credential boundaries.
 
-The next implementation should verify Google's immutable account identity
-through an account-bound, expiring OAuth transaction; protect state and PKCE;
-store tokens in an encrypted credential store; and persist actual granted
-scopes separately from requested content policies. Reconnecting the same
-verified Google identity should reuse its account within that Noomesh owner.
-The same Google account linked by different Noomesh users needs independent
-ownership and access checks.
+Only hashes of state and the completion ticket are stored in session columns.
+The PKCE verifier and callback/client settings are encrypted. Session completion
+requires the same authenticated owner and a ticket that never travels to Google
+or through a URL. Atomic claiming prevents callback replay; final storage rechecks the claimed session under the same user-row lock as erasure. Cancellation or erasure during provider exchange prevents the grant from being saved. A mismatched
+owner, state or ticket cannot consume the legitimate session.
 
-Gmail labels and Drive folder filters describe what Noomesh may use. They do
-not imply that Google issued a token restricted to exactly those resources.
-The future consent flow must explain that distinction. Connected status,
-source activation and synchronization require a later migration and the
-corresponding verified OAuth and data-access implementations.
+The web callback uses a state-specific same-origin BroadcastChannel. It works
+with the console's isolated browser windows, contains no server credentials,
+and cannot perform account changes. The originating tab retains the completion
+ticket in memory and performs the authenticated exchange. Closing it requires
+starting again. The desktop helper instead listens on an ephemeral IPv4
+loopback port on the browser's computer and completes via the same API.
 
-Reference: [Google OAuth web-server flow](https://developers.google.com/identity/protocols/oauth2/web-server),
-[Drive scopes](https://developers.google.com/workspace/drive/api/guides/api-specific-auth),
-[Gmail scopes](https://developers.google.com/workspace/gmail/api/auth/scopes).
+Access/refresh tokens are ChaCha20-Poly1305 encrypted using a domain-separated
+key derived from `NOO_INTEGRATIONS_KEY`, with independent random nonces and
+owner/provider/account authenticated context. Encryption never falls back to
+plaintext. Refreshes serialize on the account/credential rows; rotated refresh
+tokens replace their predecessors atomically. `invalid_grant` marks an account
+`reauth_required`. Client changes require reconnection. Token values and raw
+provider errors are never API responses or application log messages.
+
+Google's actual granted scopes determine capabilities, including partial
+consent. Drive folder and Gmail label selections are use policies, not narrower
+Google authorization. The source table remains in draft state until a later
+implementation provides ingestion and activation.
+
+## Provider extension points
+
+`gateway-rust/src/integrations/provider.rs` registers reviewed endpoint and
+scope definitions; `oauth.rs` holds the reusable lifecycle and Google resource
+adapter; `crypto.rs` implements the vault. Storage is in
+`gateway-rust/src/repo/integrations.rs`. The mesh migration
+`104_integration_oauth` adds credentials, sessions, verified identity and
+account authorization status after the original source-draft migration.
+
+Add a provider definition and identity/resource adapter, then register its
+configuration and any provider-issued secret through the existing secret
+registry and file delivery. Do not accept arbitrary owner-supplied endpoint
+URLs. OAuth credentials stay separate from source policy and token material
+never enters the list contract. Contracts are maintained in the server/UI
+OpenAPI files and regenerated TypeScript types.

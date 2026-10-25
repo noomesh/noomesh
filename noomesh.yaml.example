@@ -454,3 +454,12 @@ kb:
 #     ddl_password_env: NOO_EVOLVE_DDL_PASSWORD
 #     # no enabled_when either: evolve is an add-on, `addons.evolve` decides
 # ─────────────────────────────────────────────────────────────────────
+
+# Publisher desktop client ID is public and may be embedded in release builds.
+# Override here for installer-owned Google projects. No client secrets in YAML.
+integrations:
+  providers:
+    google:
+      desktop_client_id: ""
+      web_client_id: ""
+      web_redirect_uri: "" # https://your-console/api/connections/oauth/callback
