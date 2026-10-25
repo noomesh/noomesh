@@ -394,6 +394,9 @@ one node, and reports a row per kind. A scenario with a `harness_compare:`
 block does it; `eval/scenarios/harness-compare-awolf.yaml` is the sample
 (three tasks: a one-word reply, a question that needs a mesh tool, and a
 two-step delegation, under `noo`, `copilot`, `claude-code` and `codex`).
+Before it places the first kind it stops any live task an earlier run left
+with one of its objectives (a dead runner's tasks hold the node's harness
+permits until something finishes them); `sweep_leftovers: false` keeps them.
 
 **It changes the node's harness placement while it runs.** For each kind it
 sets `NOO_HARNESS_KIND` on the node's `harness` placement (keeping the rest
