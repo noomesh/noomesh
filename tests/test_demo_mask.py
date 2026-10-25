@@ -92,3 +92,12 @@ def test_a_last_line_without_a_newline_is_still_masked():
 def test_the_fleet_names_are_masked_by_default():
     for name in ("host3", "host8", "host8", "host9", "host6", "host2", "host5", "host8-ma"):
         assert name not in mask(f"{name}\n"), name
+
+
+def test_a_count_after_a_secret_label_is_not_masked_but_a_value_is():
+    """"Secrets: 9 present" (take 11) is a count. A real value after the label
+    is still masked; a four-digit value is still masked (a PIN is a secret)."""
+    assert mask("  Secrets: 9 present\n") == "  Secrets: 9 present\n"
+    assert mask("  Secrets: 24 values\n") == "  Secrets: 24 values\n"
+    assert mask("Admin password: hunter2xyz\n") == "Admin password: ********\n"
+    assert mask("password: 1234\n") == "password: ********\n"

@@ -244,7 +244,17 @@ def test_the_box_has_a_user_session_and_the_take_can_pin_a_release():
 
 def leak_literals(text: str, host: str = "mybox", extra: str = "") -> set[str]:
     r = subprocess.run([BASH, str(DEMO / "leak-literals.sh"), host, extra], input=text, text=True, capture_output=True, check=True)
-    return {l for l in r.stdout.splitlines() if l}
+    out = {}
+    for line in r.stdout.splitlines():
+        if line:
+            tag, _, lit = line.partition("\t")
+            out[lit] = tag
+    return set(out)
+
+
+def leak_tags(text: str, host: str = "mybox") -> dict[str, str]:
+    r = subprocess.run([BASH, str(DEMO / "leak-literals.sh"), host, ""], input=text, text=True, capture_output=True, check=True)
+    return {l.partition("\t")[2]: l.partition("\t")[0] for l in r.stdout.splitlines() if l}
 
 
 @needs_bash
@@ -266,3 +276,20 @@ def test_the_leak_literals_are_the_maskers_shapes_not_sentences():
     assert leak_literals("127.0.0.1 192.0.2.7 you@example.com node-1 you server") == set()
     rec = (DEMO / "record-onboarding.sh").read_text()
     assert 'leak-literals.sh" "$host" "${NOO_DEMO_MASK_NAMES:-}" < "$raw"' in rec, "leak_check must read the one extractor"
+
+
+@needs_bash
+def test_take_eleven_s_false_leaks_and_the_report_names_kinds_not_values():
+    """Take 11 (2026-10-25): three "leaks", two of them "Secrets: 9 present"
+    (a count; and a one-digit secret is found in any version string) and
+    "Node-1" (the masker's own stand-in, capitalised in a cluster-verify
+    header). A label value shorter than 6 characters is not a secret, a
+    stand-in is never a leak whatever its case, and the LEAK report says
+    what kind and how long, never the value."""
+    assert leak_literals("  Secrets: 9 present") == set()
+    assert leak_literals("  Secrets: 24 values from secrets/env.sops") == set()
+    assert leak_literals("# Node Node-1\nNODE-1 is up\nYou and Server") == set()
+    assert leak_tags("password: hunter2xyz and 10.1.2.3 and host3") == {"hunter2xyz": "label", "10.1.2.3": "ip", "host3": "name"}
+    rec = (DEMO / "record-onboarding.sh").read_text()
+    assert "report=\"$report  - $tag (${#lit} chars)" in rec, "the LEAK report lists kind and length"
+    assert "NOO_DEMO_KEEP_ON_LEAK" in rec and 'masked.LEAK.log' in rec
