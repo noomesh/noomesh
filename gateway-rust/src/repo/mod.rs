@@ -81,6 +81,7 @@
 pub mod agent_messages;
 pub mod audit;
 pub mod cluster;
+pub mod connections;
 pub mod graph;
 pub mod heartbeat;
 pub mod kb_grants;

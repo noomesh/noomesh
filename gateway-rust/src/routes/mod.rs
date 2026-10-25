@@ -52,6 +52,7 @@ pub mod peers;
 pub(crate) mod settings;
 mod mcp_registry;
 mod snapshots;
+mod connections;
 mod temporal;
 mod ui;
 mod usage;
@@ -342,6 +343,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(walks::router())
         .merge(ops::router())
         .merge(settings::router())
+        .merge(connections::router())
         .merge(intelligence::router())
         .merge(admin::router())
         .merge(audit_read::router())

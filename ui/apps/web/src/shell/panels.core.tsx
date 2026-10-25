@@ -7,6 +7,7 @@ import { BackendsPanel } from '@/features/backends/BackendsPanel';
 import { TasksPanel } from '@/features/tasks/TasksPanel';
 import { MemoryPanel } from '@/features/memory/MemoryPanel';
 import { RagPanel } from '@/features/rag/RagPanel';
+import { ConnectionsPanel } from '@/features/connections/ConnectionsPanel';
 import { GraphPanel } from '@/features/graph/GraphPanel';
 import { ObservabilityPanel } from '@/features/observability/ObservabilityPanel';
 import { UsagePanel } from '@/features/usage/UsagePanel';
@@ -26,6 +27,7 @@ export const CORE_PANELS: Record<string, ComponentType> = {
   tasks: TasksPanel,
   memory: MemoryPanel,
   rag: RagPanel,
+  connections: ConnectionsPanel,
   graph: GraphPanel,
   observability: ObservabilityPanel,
   usage: UsagePanel,

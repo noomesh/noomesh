@@ -20519,6 +20519,239 @@
           }
         }
       }
+    },
+    "/api/connections": {
+      "get": {
+        "operationId": "list_connection_drafts",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "List private connection drafts and provider readiness",
+        "description": "Private to the signed-in Noomesh account, including operators. Draft metadata only: no Google authorization, tokens, sync or imports.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid draft"
+          },
+          "401": {
+            "description": "Sign-in required"
+          },
+          "403": {
+            "description": "A signed-in Noomesh account is required"
+          },
+          "404": {
+            "description": "Owned draft not found"
+          },
+          "500": {
+            "description": "Connection storage unavailable"
+          }
+        }
+      }
+    },
+    "/api/connections/accounts": {
+      "post": {
+        "operationId": "create_connection_account_draft",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Prepare another Google account",
+        "description": "Private to the signed-in Noomesh account, including operators. Draft metadata only: no Google authorization, tokens, sync or imports.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionDraftSaved"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid draft"
+          },
+          "401": {
+            "description": "Sign-in required"
+          },
+          "403": {
+            "description": "A signed-in Noomesh account is required"
+          },
+          "404": {
+            "description": "Owned draft not found"
+          },
+          "500": {
+            "description": "Connection storage unavailable"
+          },
+          "422": {
+            "description": "Malformed or unsupported draft fields"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionAccountDraft"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/connections/accounts/{id}": {
+      "delete": {
+        "operationId": "remove_connection_account_draft",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Remove an account draft and its source drafts",
+        "description": "Private to the signed-in Noomesh account, including operators. Draft metadata only: no Google authorization, tokens, sync or imports.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionDraftRemoved"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid draft"
+          },
+          "401": {
+            "description": "Sign-in required"
+          },
+          "403": {
+            "description": "A signed-in Noomesh account is required"
+          },
+          "404": {
+            "description": "Owned draft not found"
+          },
+          "500": {
+            "description": "Connection storage unavailable"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ]
+      }
+    },
+    "/api/connections/sources": {
+      "post": {
+        "operationId": "create_connection_source_draft",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Prepare a private read-only Drive or Gmail source",
+        "description": "Private to the signed-in Noomesh account, including operators. Draft metadata only: no Google authorization, tokens, sync or imports.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionDraftSaved"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid draft"
+          },
+          "401": {
+            "description": "Sign-in required"
+          },
+          "403": {
+            "description": "A signed-in Noomesh account is required"
+          },
+          "404": {
+            "description": "Owned draft not found"
+          },
+          "500": {
+            "description": "Connection storage unavailable"
+          },
+          "422": {
+            "description": "Malformed or unsupported draft fields"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionSourceDraft"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/connections/sources/{id}": {
+      "delete": {
+        "operationId": "remove_connection_source_draft",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Remove a source draft",
+        "description": "Private to the signed-in Noomesh account, including operators. Draft metadata only: no Google authorization, tokens, sync or imports.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionDraftRemoved"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid draft"
+          },
+          "401": {
+            "description": "Sign-in required"
+          },
+          "403": {
+            "description": "A signed-in Noomesh account is required"
+          },
+          "404": {
+            "description": "Owned draft not found"
+          },
+          "500": {
+            "description": "Connection storage unavailable"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -20648,6 +20881,337 @@
             "format": "date-time"
           }
         }
+      },
+      "ConnectionAccountDraft": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "email_hint": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 254
+          }
+        },
+        "required": [
+          "label"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionDrivePolicy": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "google_drive"
+            ]
+          },
+          "exposure": {
+            "type": "string",
+            "enum": [
+              "selected_folders",
+              "selected_drive",
+              "all_accessible"
+            ]
+          },
+          "folder_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            },
+            "maxItems": 100,
+            "uniqueItems": true
+          },
+          "drive_id": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "kind",
+          "exposure"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionGmailPolicy": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "gmail"
+            ]
+          },
+          "exposure": {
+            "type": "string",
+            "enum": [
+              "selected_labels",
+              "mailbox"
+            ]
+          },
+          "label_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            },
+            "maxItems": 100,
+            "uniqueItems": true
+          },
+          "lookback_days": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3650,
+            "default": 30
+          }
+        },
+        "required": [
+          "kind",
+          "exposure"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionSourcePolicy": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ConnectionDrivePolicy"
+          },
+          {
+            "$ref": "#/components/schemas/ConnectionGmailPolicy"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "kind",
+          "mapping": {
+            "google_drive": "#/components/schemas/ConnectionDrivePolicy",
+            "gmail": "#/components/schemas/ConnectionGmailPolicy"
+          }
+        }
+      },
+      "ConnectionAccount": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "provider": {
+            "type": "string",
+            "enum": [
+              "google"
+            ]
+          },
+          "label": {
+            "type": "string"
+          },
+          "email_hint": {
+            "type": "string",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "needs_auth"
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "provider",
+          "label",
+          "email_hint",
+          "status",
+          "created_at"
+        ]
+      },
+      "ConnectionSourceDraft": {
+        "type": "object",
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "policy": {
+            "$ref": "#/components/schemas/ConnectionSourcePolicy"
+          }
+        },
+        "required": [
+          "account_id",
+          "name",
+          "policy"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionSource": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/ConnectionSourcePolicy"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft"
+            ]
+          },
+          "visibility": {
+            "type": "string",
+            "enum": [
+              "private"
+            ]
+          },
+          "access": {
+            "type": "string",
+            "enum": [
+              "read_only"
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "account_id",
+          "name",
+          "policy",
+          "status",
+          "visibility",
+          "access",
+          "created_at"
+        ]
+      },
+      "ConnectionProvider": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "enum": [
+              "google"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "services": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "google_drive",
+                "gmail"
+              ]
+            }
+          },
+          "authorization_available": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "authorization_detail": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "services",
+          "authorization_available",
+          "authorization_detail"
+        ]
+      },
+      "ConnectionsResponse": {
+        "type": "object",
+        "properties": {
+          "accounts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConnectionAccount"
+            }
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConnectionSource"
+            }
+          },
+          "providers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConnectionProvider"
+            }
+          }
+        },
+        "required": [
+          "accounts",
+          "sources",
+          "providers"
+        ]
+      },
+      "ConnectionDraftSaved": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "needs_auth",
+              "draft"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "status"
+        ]
+      },
+      "ConnectionDraftRemoved": {
+        "type": "object",
+        "properties": {
+          "removed": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          }
+        },
+        "required": [
+          "removed"
+        ]
       }
     }
   }

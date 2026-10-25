@@ -2168,11 +2168,44 @@ ALTER TABLE noo_embedding_spaces
     // `migration_dsn`). Idempotent. Created in `public` on purpose: the
     // view is read by operators, not by the mesh schema.
     sql: "CREATE EXTENSION IF NOT EXISTS pg_stat_statements SCHEMA public",
+}, Migration {
+    revision: CONNECTIONS_REVISION,
+    down_revision: Some(PG_STAT_STATEMENTS_REVISION),
+    sql: r#"
+CREATE TABLE noo_connected_accounts (
+    id uuid PRIMARY KEY,
+    owner_uuid uuid NOT NULL REFERENCES noo_users(user_uuid) ON DELETE CASCADE,
+    provider text NOT NULL CHECK (provider = 'google'),
+    label text NOT NULL CHECK (length(btrim(label)) BETWEEN 1 AND 100),
+    email_hint text CHECK (length(email_hint) <= 254),
+    status text NOT NULL DEFAULT 'needs_auth' CHECK (status = 'needs_auth'),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (id, owner_uuid)
+);
+CREATE INDEX ix_connected_accounts_owner ON noo_connected_accounts(owner_uuid);
+CREATE TABLE noo_connection_sources (
+    id uuid PRIMARY KEY,
+    owner_uuid uuid NOT NULL REFERENCES noo_users(user_uuid) ON DELETE CASCADE,
+    account_id uuid NOT NULL,
+    name text NOT NULL CHECK (length(btrim(name)) BETWEEN 1 AND 100),
+    kind text NOT NULL CHECK (kind IN ('google_drive', 'gmail')),
+    policy jsonb NOT NULL CHECK (jsonb_typeof(policy) = 'object' AND policy->>'kind' IS NOT NULL AND policy->>'kind' = kind),
+    status text NOT NULL DEFAULT 'draft' CHECK (status = 'draft'),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    FOREIGN KEY (account_id, owner_uuid) REFERENCES noo_connected_accounts(id, owner_uuid) ON DELETE CASCADE
+);
+CREATE INDEX ix_connection_sources_owner ON noo_connection_sources(owner_uuid);
+CREATE INDEX ix_connection_sources_account ON noo_connection_sources(account_id, owner_uuid);
+"#,
 }];
+
+pub const CONNECTIONS_REVISION: &str = "103_connection_drafts";
+
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
 pub const PG_STAT_STATEMENTS_REVISION: &str = "103_pg_stat_statements";
+
 
 /// The embedding-space migration revision (i150). A constant so a renumber
 /// at rebase is one line.

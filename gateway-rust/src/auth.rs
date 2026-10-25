@@ -2865,6 +2865,11 @@ fn scope_allows_for(scopes: &[String], role: Role, method: &axum::http::Method, 
     if path == WALKS_SETTINGS_PATH {
         return true;
     }
+    // Account/source drafts only. Handlers pin ownership to the signed-in
+    // account, including for operators; arbitrary descendants stay closed.
+    if crate::connections::user_write_allowed(method, path) {
+        return true;
+    }
     // The asynchronous-operations API (`routes/ops.rs`). Open to every tier
     // because it decides for itself, per request: starting an op asks
     // `requester_allows` about the OPERATION'S OWN route (so a User gets
@@ -2960,6 +2965,7 @@ pub const USER_READ_PATHS: &[&str] = &[
     "/api/alerts/clients",
     "/api/approval/stats",
     "/api/channels/status",
+    "/api/connections",
     "/api/coordinator/context",
     "/api/memory/health",
     "/api/memory/status",

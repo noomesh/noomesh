@@ -1049,6 +1049,13 @@ fn erase_targets(keep_account: bool, episodes_have_user_id: bool) -> Vec<EraseTa
         // the account, and also under `keep_account`: a wiped user starts from
         // the defaults.
         EraseTarget { label: "user_settings", table: "noo_user_settings", where_sql: "username = $1" },
+        // Also erased under keep-account; removing account drafts cascades
+        // their sources. No OAuth credentials exist in these tables.
+        EraseTarget {
+            label: "connection_accounts",
+            table: "noo_connected_accounts",
+            where_sql: "owner_uuid = (SELECT user_uuid FROM noo_users WHERE username = $1)",
+        },
         // Asynchronous operations the user started (`ops.rs`): the params,
         // progress and RESULT of a navigate, an ingest, an extraction are the
         // user's own content, kept up to a day by default. Keyed by the
@@ -4415,6 +4422,15 @@ mod tests {
             let s = t.iter().find(|x| x.table == "noo_user_settings").expect("noo_user_settings must be an erase target");
             assert_eq!(s.where_sql, "username = $1");
             assert_eq!(s.label, "user_settings");
+        }
+    }
+
+    #[test]
+    fn rtbf_lists_connection_drafts_even_when_keeping_the_login() {
+        for keep in [true, false] {
+            let t = super::erase_targets(keep, true);
+            let target = t.iter().find(|x| x.table == "noo_connected_accounts").expect("connection drafts must be erased");
+            assert_eq!(target.where_sql, "owner_uuid = (SELECT user_uuid FROM noo_users WHERE username = $1)");
         }
     }
 

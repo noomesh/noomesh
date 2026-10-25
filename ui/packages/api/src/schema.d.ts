@@ -1741,7 +1741,7 @@ export interface paths {
         };
         /**
          * Get job
-         * @description [native] Returns details for a specific job.
+         * @description [native] Returns details for a specific job. For a completed `embed_batch` job, `?vectors=1` adds `vectors` (one float32 row per input) read from a 15-minute side key; once it has expired the answer is 410.
          */
         get: operations["get_job"];
         put?: never;
@@ -8627,6 +8627,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/agents/whoami": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * This session's own agent name
+         * @description The acting agent name of this session (the address other sessions use to message it), its account, the harness the credential arrived through, and whether it is privileged.
+         */
+        get: operations["agent_whoami"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agents/name": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Name this MCP session
+         * @description Give the calling MCP session a name its person chose: {"name": "general"} turns <account>/<type>-<random> into <account>/<type>-general, the address other sessions then use. The type half (the client, e.g. claude) is kept. Only a session can be renamed. A name another live session of the account already holds is shared (a name is a mailbox); shared_with counts the sessions already there. Mail already sent to the old name stays addressed to it.
+         */
+        post: operations["agent_name"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/docs/openapi": {
         parameters: {
             query?: never;
@@ -10399,6 +10439,186 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/cluster/nodes/{node_id}/tunnel-probe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get tunnel probe
+         * @description [native] GET /api/cluster/nodes/{node_id}/tunnel-probe
+         */
+        get: operations["tunnel_probe"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/node/tunnel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get tunnel
+         * @description [native] GET /api/node/tunnel: the node's upgrade. Admission: a node-actor cluster token (the auth layer put it in `ClusterNode`), on a connection whose mTLS leaf names the same node, with a certificate thumbprint to bind the hello to. Anything less is refused with the remedy. After the upgrade the node must still answer the gateway's signed challenge.
+         */
+        get: operations["upgrade"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/external/embeddings/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Embeddings job (external)
+         * @description [native] Submit a bulk embedding batch as a job. Workers claim it from a JetStream work queue (`path: pull`); when no node is pulling for the model the gateway embeds it itself (`path: push`). Poll `GET /api/external/embeddings/jobs/{job_id}?vectors=1` for the vectors, kept 15 minutes. At most 64 texts per job and the encoded result must fit the 600 KiB cap (413 names it). `space` wins over `model` when both are given; both follow the synchronous route's rules (`<space>@next` embeds with a migration's next model). Authenticated by a **service key** with the `embeddings` scope. The synchronous `POST /api/external/embeddings` is unchanged and never queues.
+         */
+        post: operations["embeddings_job_submit"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/external/embeddings/jobs/{job_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Embeddings job status (external)
+         * @description [native] One embedding job, as its submitter sees it (a job another consumer submitted is 404). With `vectors=1`, a completed job adds `vectors`: one row of float32 per input, in order. The vectors are kept 15 minutes after completion; after that the answer is 410 and the batch is resubmitted. The same job is readable at `GET /api/jobs/{job_id}` by a caller that reaches the scheduler routes.
+         */
+        get: operations["embeddings_job_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List private connection drafts and provider readiness
+         * @description Private to the signed-in Noomesh account, including operators. Draft metadata only: no Google authorization, tokens, sync or imports.
+         */
+        get: operations["list_connection_drafts"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/connections/accounts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Prepare another Google account
+         * @description Private to the signed-in Noomesh account, including operators. Draft metadata only: no Google authorization, tokens, sync or imports.
+         */
+        post: operations["create_connection_account_draft"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/connections/accounts/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove an account draft and its source drafts
+         * @description Private to the signed-in Noomesh account, including operators. Draft metadata only: no Google authorization, tokens, sync or imports.
+         */
+        delete: operations["remove_connection_account_draft"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/connections/sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Prepare a private read-only Drive or Gmail source
+         * @description Private to the signed-in Noomesh account, including operators. Draft metadata only: no Google authorization, tokens, sync or imports.
+         */
+        post: operations["create_connection_source_draft"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/connections/sources/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove a source draft
+         * @description Private to the signed-in Noomesh account, including operators. Draft metadata only: no Google authorization, tokens, sync or imports.
+         */
+        delete: operations["remove_connection_source_draft"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -10453,6 +10673,92 @@ export interface components {
             finished_at?: string | null;
             /** Format: date-time */
             expires_at?: string;
+        };
+        ConnectionAccountDraft: {
+            label: string;
+            email_hint?: string | null;
+        };
+        ConnectionDrivePolicy: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "google_drive";
+            /** @enum {string} */
+            exposure: "selected_folders" | "selected_drive" | "all_accessible";
+            folder_ids?: string[];
+            drive_id?: string | null;
+        };
+        ConnectionGmailPolicy: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "gmail";
+            /** @enum {string} */
+            exposure: "selected_labels" | "mailbox";
+            label_ids?: string[];
+            /** @default 30 */
+            lookback_days: number;
+        };
+        ConnectionSourcePolicy: components["schemas"]["ConnectionDrivePolicy"] | components["schemas"]["ConnectionGmailPolicy"];
+        ConnectionAccount: {
+            /** Format: uuid */
+            id: string;
+            /** @enum {string} */
+            provider: "google";
+            label: string;
+            email_hint: string | null;
+            /** @enum {string} */
+            status: "needs_auth";
+            /** Format: date-time */
+            created_at: string;
+        };
+        ConnectionSourceDraft: {
+            /** Format: uuid */
+            account_id: string;
+            name: string;
+            policy: components["schemas"]["ConnectionSourcePolicy"];
+        };
+        ConnectionSource: {
+            /** Format: uuid */
+            id: string;
+            /** Format: uuid */
+            account_id: string;
+            name: string;
+            policy: components["schemas"]["ConnectionSourcePolicy"];
+            /** @enum {string} */
+            status: "draft";
+            /** @enum {string} */
+            visibility: "private";
+            /** @enum {string} */
+            access: "read_only";
+            /** Format: date-time */
+            created_at: string;
+        };
+        ConnectionProvider: {
+            /** @enum {string} */
+            id: "google";
+            name: string;
+            services: ("google_drive" | "gmail")[];
+            /** @enum {boolean} */
+            authorization_available: false;
+            authorization_detail: string;
+        };
+        ConnectionsResponse: {
+            accounts: components["schemas"]["ConnectionAccount"][];
+            sources: components["schemas"]["ConnectionSource"][];
+            providers: components["schemas"]["ConnectionProvider"][];
+        };
+        ConnectionDraftSaved: {
+            /** Format: uuid */
+            id: string;
+            /** @enum {string} */
+            status: "needs_auth" | "draft";
+        };
+        ConnectionDraftRemoved: {
+            /** @enum {boolean} */
+            removed: true;
         };
     };
     responses: never;
@@ -12834,7 +13140,9 @@ export interface operations {
     };
     get_job: {
         parameters: {
-            query?: never;
+            query?: {
+                vectors?: "1" | "true";
+            };
             header?: never;
             path: {
                 job_id: string;
@@ -12845,6 +13153,13 @@ export interface operations {
         responses: {
             /** @description OK */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The job's vectors expired; resubmit the batch */
+            410: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -19394,7 +19709,10 @@ export interface operations {
     };
     messages_list: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Operators only: include every session's data, not just the caller's own. 403 for anyone else. */
+                all?: boolean;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -19494,7 +19812,10 @@ export interface operations {
     };
     threads_list: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Operators only: include every session's data, not just the caller's own. 403 for anyone else. */
+                all?: boolean;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -20796,6 +21117,8 @@ export interface operations {
             query?: {
                 /** @description Account to list. Defaults to the caller's own. */
                 owner?: string;
+                /** @description Operators only: include every session's data, not just the caller's own. 403 for anyone else. */
+                all?: boolean;
             };
             header?: never;
             path?: never;
@@ -20826,6 +21149,70 @@ export interface operations {
             };
             /** @description The caller may not list that account's presence. */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    agent_whoami: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        name?: string | null;
+                        account?: string | null;
+                        harness?: string;
+                        privileged?: boolean;
+                    };
+                };
+            };
+        };
+    };
+    agent_name: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description The session half of the new name: 1-64 of A-Z a-z 0-9 _ -. */
+                    name: string;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        name?: string;
+                        account?: string;
+                        previous?: string;
+                        shared_with?: number;
+                    };
+                };
+            };
+            /** @description Not an MCP session, or an invalid name. */
+            400: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -23977,6 +24364,568 @@ export interface operations {
             };
             /** @description The add-on is off */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    tunnel_probe: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    upgrade: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    embeddings_job_submit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    input: string | string[];
+                    /** @description Embedding space; the default space when absent. */
+                    space?: string;
+                    /** @description Alias as on the synchronous route; used when `space` is absent. */
+                    model?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        job_id?: string;
+                        /** @enum {string} */
+                        path?: "pull" | "push";
+                        model?: string;
+                    };
+                };
+            };
+            /** @description Bad input, or an unknown embedding space */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error?: {
+                            message?: string;
+                            type?: string;
+                            ref?: string;
+                        };
+                    };
+                };
+            };
+            /** @description The service key lacks the `embeddings` scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error?: {
+                            message?: string;
+                            type?: string;
+                            ref?: string;
+                        };
+                    };
+                };
+            };
+            /** @description `<space>@next` without a migration, or a migration that has not started */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error?: {
+                            message?: string;
+                            type?: string;
+                            ref?: string;
+                        };
+                    };
+                };
+            };
+            /** @description Over the batch cap; the message names the cap */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error?: {
+                            message?: string;
+                            type?: string;
+                            ref?: string;
+                        };
+                    };
+                };
+            };
+            /** @description The model's work queue is full; `Retry-After` says when to retry */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error?: {
+                            message?: string;
+                            type?: string;
+                            ref?: string;
+                        };
+                    };
+                };
+            };
+            /** @description No node serves the model, or the job store is down */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error?: {
+                            message?: string;
+                            type?: string;
+                            ref?: string;
+                        };
+                    };
+                };
+            };
+        };
+    };
+    embeddings_job_status: {
+        parameters: {
+            query?: {
+                vectors?: "1" | "true";
+            };
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        job_id?: string;
+                        /** @enum {string} */
+                        status?: "queued" | "running" | "completed" | "dead" | "cancelled";
+                        /** @enum {string} */
+                        path?: "pull" | "push";
+                        model?: string;
+                        space?: string;
+                        n?: number;
+                        dims?: number;
+                        node_id?: string;
+                        error?: string;
+                        status_detail?: string;
+                        created_at?: string;
+                        completed_at?: string;
+                        vectors?: number[][];
+                    };
+                };
+            };
+            /** @description The service key lacks the `embeddings` scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error?: {
+                            message?: string;
+                            type?: string;
+                            ref?: string;
+                        };
+                    };
+                };
+            };
+            /** @description No such job, or not this consumer's */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error?: {
+                            message?: string;
+                            type?: string;
+                            ref?: string;
+                        };
+                    };
+                };
+            };
+            /** @description The vectors expired; resubmit the batch */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The job store did not answer */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error?: {
+                            message?: string;
+                            type?: string;
+                            ref?: string;
+                        };
+                    };
+                };
+            };
+        };
+    };
+    list_connection_drafts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionsResponse"];
+                };
+            };
+            /** @description Invalid draft */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Sign-in required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description A signed-in Noomesh account is required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Owned draft not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Connection storage unavailable */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_connection_account_draft: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConnectionAccountDraft"];
+            };
+        };
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionDraftSaved"];
+                };
+            };
+            /** @description Invalid draft */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Sign-in required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description A signed-in Noomesh account is required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Owned draft not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Malformed or unsupported draft fields */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Connection storage unavailable */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    remove_connection_account_draft: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionDraftRemoved"];
+                };
+            };
+            /** @description Invalid draft */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Sign-in required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description A signed-in Noomesh account is required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Owned draft not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Connection storage unavailable */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_connection_source_draft: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConnectionSourceDraft"];
+            };
+        };
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionDraftSaved"];
+                };
+            };
+            /** @description Invalid draft */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Sign-in required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description A signed-in Noomesh account is required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Owned draft not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Malformed or unsupported draft fields */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Connection storage unavailable */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    remove_connection_source_draft: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionDraftRemoved"];
+                };
+            };
+            /** @description Invalid draft */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Sign-in required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description A signed-in Noomesh account is required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Owned draft not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Connection storage unavailable */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };

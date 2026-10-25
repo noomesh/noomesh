@@ -45,6 +45,7 @@ export const CORE_TABS: readonly string[] = [
   'addons', // add-on web UIs, each on its own origin; empty until one is enabled
   'memory', // conversations persist — the other thing cloud does not do privately
   'rag', // document ingest — the reason to have a graph at all
+  'connections', // private Google account and data-source drafts
   'graph', // the knowledge graph itself
   'observability', // GPU metrics
   'usage', // token accounting; nobody else self-hosted shows it

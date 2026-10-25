@@ -105,6 +105,7 @@ mod embed_jobs;
 mod embedding_client;
 mod embedding_spaces;
 mod google_auth;
+mod connections;
 mod host_daemon;
 mod mcp_external;
 mod mcp_local;
