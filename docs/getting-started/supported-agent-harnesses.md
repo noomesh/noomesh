@@ -184,7 +184,7 @@ the table, gets the tier 3 row.
 | `first_byte_secs` | 290 | 600 | 900 | 900 | how long the node's inference proxy waits for a model's first byte (a cold load plus the prompt's prefill) | node agent, live, no restart |
 | `stream_idle_secs` | 300 | 300 | 600 | 600 | how long a streamed answer may go silent before it counts as cut | harness |
 | `thinking` | `auto` | `off` | `off` | `off` | whether model calls reason: `on`, `off`, or `auto` (the caller decides) | harness |
-| `ollama_context` | 32768 | 32768 | 16384 | 8192 | the context length the node's ollama runs with when its placement sets no `OLLAMA_CONTEXT_LENGTH` | node agent |
+| `ollama_context` | 32768 | 32768 | 16384 | 8192 | the context window the node's chat engine runs with when its placement sets none: Ollama's `OLLAMA_CONTEXT_LENGTH`, vLLM's `VLLM_MAX_MODEL_LEN`, llama.cpp's `N_CTX` | node agent |
 | `claude_prompt` | `full` | `slim` | `slim` | `slim` | which Claude Code launch the harness uses: the full system prompt, or a slim one for small models | harness |
 | `foreign_kinds` | claude-code, codex, copilot | claude-code, codex, copilot | codex, copilot | none | the foreign harness kinds this node may run (`noo` is always allowed); the agent refuses a placement of any other kind | node agent |
 
