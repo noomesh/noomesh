@@ -240,3 +240,29 @@ def test_the_box_has_a_user_session_and_the_take_can_pin_a_release():
     assert 'INSTALL_SH="NOO_CLI_VERSION=$NOO_DEMO_CLI_VERSION sh"' in rec and "@INSTALL_SH@" in rec
     tape = (DEMO / "onboarding.tape.in").read_text()
     assert 'Type "curl -fsSL @INSTALL_URL@ | @INSTALL_SH@" Enter' in tape
+
+
+def leak_literals(text: str, host: str = "mybox", extra: str = "") -> set[str]:
+    r = subprocess.run([BASH, str(DEMO / "leak-literals.sh"), host, extra], input=text, text=True, capture_output=True, check=True)
+    return {l for l in r.stdout.splitlines() if l}
+
+
+@needs_bash
+def test_the_leak_literals_are_the_maskers_shapes_not_sentences():
+    """Take 10 (2026-10-25) was deleted because the leak check read
+    "sudo needs no password here" as `password <value>` and flagged "here".
+    The extractor now mirrors the masker: a secret has a `:` or `=` after
+    its label (optionally "is"); a sentence with the word in it does not."""
+    assert leak_literals("noo-hostd: no terminal, but sudo needs no password here — installing it") == set()
+    assert leak_literals("needs sudo and a terminal; the password prompt waits") == set()
+    assert leak_literals("Admin password: hunter2xyz\n") == {"hunter2xyz"}
+    assert leak_literals("NOO_API_KEY=abc123def") == {"abc123def"}
+    assert leak_literals("the token is: eyJhbGci.x.y") == {"eyJhbGci.x.y"}
+    assert leak_literals("the token is eyJhbGci.x.y") == set(), "no separator: the masker leaves it too, so flagging it only deletes good takes"
+    assert leak_literals("password: ********") == set(), "an already-masked value is not a leak"
+    # the other rules are unchanged: addresses, the fleet's names, token shapes, tailnet names, e-mail
+    got = leak_literals("agent at 10.1.2.3 and host3 and mybox, ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ, alice@mail.test, box.tail1234.ts.net", host="MyBox")
+    assert {"10.1.2.3", "host3", "mybox", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ", "alice@mail.test", "box.tail1234.ts.net"} <= got, got
+    assert leak_literals("127.0.0.1 192.0.2.7 you@example.com node-1 you server") == set()
+    rec = (DEMO / "record-onboarding.sh").read_text()
+    assert 'leak-literals.sh" "$host" "${NOO_DEMO_MASK_NAMES:-}" < "$raw"' in rec, "leak_check must read the one extractor"
