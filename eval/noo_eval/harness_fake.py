@@ -138,6 +138,14 @@ class FakeHarnessGateway:
                 return text
         return "done"
 
+    def leftover(self, objective: str, state: str = "running") -> str:
+        """Seed a task an earlier run left behind (the sweep's target)."""
+        tid = f"00000000-0000-4000-8000-{len(self.tasks) + 1:012d}"
+        self.tasks[tid] = {"id": tid, "objective": objective, "state": state, "loops": 0, "loop_budget": 4,
+                           "node": self.node, "result": None, "error": None, "created_at": self.clock.iso(),
+                           "updated_at": self.clock.iso(), "_kind": None, "_polls": 10**9}
+        return tid
+
     def _create(self, body: dict) -> dict:
         tid = f"00000000-0000-4000-8000-{len(self.tasks) + 1:012d}"
         kind = self.running_kind if self._kind() == self.running_kind else None
@@ -206,6 +214,17 @@ class FakeHarnessGateway:
                 return httpx.Response(200, json={"ok": True})
         if method == "POST" and path == "/api/tasks":
             return httpx.Response(200, json=self._create(body or {}))
+        if method == "GET" and path == "/api/tasks":
+            return httpx.Response(200, json={"tasks": [self._public(t) for t in self.tasks.values()]})
+        if method == "POST" and path.startswith("/api/tasks/") and path.endswith("/stop"):
+            t = self.tasks.get(path.split("/")[3])
+            if t is None:
+                return httpx.Response(404, json={"error": "task not found"})
+            stopped = t["state"] not in ("done", "failed", "stopped")
+            if stopped:
+                t["state"] = "stopped"
+            self.writes.append((method, path, None))
+            return httpx.Response(200, json={"stopped": stopped, "task_id": t["id"]})
         if method == "GET" and path.startswith("/api/tasks/"):
             got = self._poll(path.rsplit("/", 1)[-1])
             return httpx.Response(200, json=got) if got else httpx.Response(404, json={"error": "task not found"})

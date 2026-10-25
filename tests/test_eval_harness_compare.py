@@ -200,7 +200,8 @@ def test_a_task_that_outlives_its_timeout_fails_and_says_it_was_left_running():
     fake = FakeHarnessGateway(profiles=slow)
     hc = _run(_spec(kinds=["noo"], task_timeout_s=30), fake)
     r = hc.runs[0]
-    assert not r.passed and r.state.startswith("timeout") and "/stop" in r.note
+    assert not r.passed and r.state.startswith("timeout") and "(stopped)" in r.note
+    assert fake.tasks[r.task_id]["state"] == "stopped", "a timed-out task is stopped, not left to hold a permit"
 
 
 def test_kind_restricted_tasks_are_skipped_not_failed():
@@ -255,3 +256,40 @@ def test_the_fixture_run_writes_the_html_report_and_its_json_twin(tmp_path):
 def test_a_compare_scenario_without_a_gateway_or_fixture_is_refused():
     with pytest.raises(SystemExit, match="--fixture"):
         eval_run.main(["run", str(SAMPLE)])
+
+
+def test_leftovers_of_an_earlier_run_are_stopped_before_the_first_kind_is_placed():
+    """mcmini, 2026-10-24: a killed runner's tasks held both harness permits
+    for fifteen hours and the next run's tasks sat open behind them. The
+    sweep stops every live task with one of the scenario's objectives (the
+    delegate's quoted child objective included) and leaves the rest alone."""
+    fake = FakeHarnessGateway()
+    spec = _spec(kinds=["noo"])
+    objective = spec.task_sets[0].tasks[0].objective
+    mine_running = fake.leftover(objective, "running")
+    mine_open = fake.leftover(objective, "open")
+    mine_done = fake.leftover(objective, "done")
+    theirs = fake.leftover("Summarise the quarterly numbers", "running")
+    hc = _run(spec, fake)
+    assert set(hc.swept) == {mine_running, mine_open}
+    assert fake.tasks[mine_running]["state"] == "stopped" and fake.tasks[mine_open]["state"] == "stopped"
+    assert fake.tasks[mine_done]["state"] == "done" and fake.tasks[theirs]["state"] == "running"
+    # the sweep runs before the first placement write
+    first_stop = next(i for i, w in enumerate(fake.writes) if w[1].endswith("/stop"))
+    first_put = next(i for i, w in enumerate(fake.writes) if w[0] == "PUT")
+    assert first_stop < first_put
+
+
+def test_the_sweep_can_be_switched_off_and_quoted_child_objectives_count():
+    fake = FakeHarnessGateway()
+    spec = _spec(kinds=["noo"], sweep_leftovers=False)
+    kept = fake.leftover(spec.task_sets[0].tasks[0].objective, "open")
+    hc = _run(spec, fake)
+    assert hc.swept == [] and fake.tasks[kept]["state"] == "open"
+    # the delegate's quoted child objective is one of the scenario's objectives
+    spec2 = _spec(kinds=["noo"])
+    spec2.task_sets[0].tasks[0].objective = 'Delegate a child task whose objective is "Reply with the single word: pong", wait for it'
+    c = hcmp.Comparer.__new__(hcmp.Comparer)
+    c.spec = spec2
+    objs = c._objectives()
+    assert "Reply with the single word: pong" in objs and spec2.task_sets[0].tasks[0].objective in objs

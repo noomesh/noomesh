@@ -121,6 +121,7 @@ class HarnessCompareSpec(BaseModel):
     ready_timeout_s: float = 300.0   # give up on a kind whose harness never runs
     usage_settle_s: float = 3.0      # usage rows are written fire-and-forget
     require_dispatch: bool = True    # a task the controller ran in process fails
+    sweep_leftovers: bool = True     # stop live tasks of an earlier run with these objectives first
     task_token_env: Optional[str] = None
 
     @model_validator(mode="after")
