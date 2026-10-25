@@ -61,8 +61,24 @@ echo "DOCKER $args" >> "$LOGF"
 case "$args" in
   "compose version") echo "Docker Compose version v2.30.0" ;;
   "image inspect"*) for r in $FAKE_LOCAL; do [ "$r" = "$3" ] && exit 0; done; exit 1 ;;
-  "ps -q"*"com.docker.compose.service=noo-rhold"*) echo cid-rhold ;;
-  *"config --services"*) echo gateway; echo worker; echo ollama ;;
+  # A project's containers: $RUNNING lists the running services; `stop`
+  # takes a service off it, as the daemon would.
+  "ps -q"*"com.docker.compose.service="*)
+    svc="${args##*com.docker.compose.service=}"; svc="${svc%% *}"
+    grep -qx "$svc" "$RUNNING" 2>/dev/null && echo "cid-$svc" ;;
+  "ps --filter"*"status=running"*) cat "$RUNNING" 2>/dev/null ;;
+  "compose "*" stop "*)
+    # `docker compose ... stop <svc>...`: every name after `stop` stops.
+    seen=""; for a in "$@"; do [ -n "$seen" ] && { grep -vx "$a" "$RUNNING" > "$RUNNING.t"; mv "$RUNNING.t" "$RUNNING"; }
+      [ "$a" = stop ] && seen=1; done ;;
+  "stop "*)
+    for c in "${@:2}"; do grep -vx "${c#cid-}" "$RUNNING" > "$RUNNING.t"; mv "$RUNNING.t" "$RUNNING"; done ;;
+  *"config --services"*)
+    # Real compose rejects the project without the launcher's profile flags
+    # (ollama-embed-cpu depends on a profiled service): the rc.2 cause.
+    case "$args" in *--profile*) ;; *) [ -n "$FAKE_SERVICES_NEED_PROFILE" ] && {
+      echo 'service "ollama-embed-cpu" depends on undefined service "ollama-embed": invalid compose project' >&2; exit 15; } ;; esac
+    echo gateway; echo worker; echo ollama ;;
   *"config --format json"*)
     printf '{"services":{"gateway":{"image":"g"},"other-addon":{"image":"%s"},"noo-rhold":{"image":"%s"}}}' \
       "${NOO_ADDON_IMAGE_OTHER_ADDON:-unset}" "${NOO_ADDON_IMAGE_RHOLD:-unset}" ;;
@@ -105,7 +121,25 @@ def _lock(signed_tag: str = TAG) -> str:
     return f"# stack {signed_tag}\n# tag {TAG}\n{rows}"
 
 
-def _restart(tmp: Path, lock: str, pins: str = PINS) -> subprocess.CompletedProcess:
+# evolve's real shape (0.6.11-rc.2, R7.overlay-restart): its overlay EXTENDS
+# the core `gateway` service (the routes volume) beside its own service.
+EXTENDS_GATEWAY_OVERLAY = """services:
+  gateway:
+    volumes:
+      - rhold-routes:/opt/noo/addon-routes/rhold:ro
+  noo-rhold:
+    image: ${NOO_ADDON_IMAGE_RHOLD:-noo-addon-unpinned.invalid/rhold:x}
+    container_name: noo-rhold
+    volumes:
+      - rhold-routes:/routes
+volumes:
+  rhold-routes:
+"""
+RUNNING_BEFORE = "gateway\nworker\npostgres\nnoo-rhold\nother-addon\n"
+
+
+def _restart(tmp: Path, lock: str, pins: str = PINS, rhold_overlay: str = RHOLD_OVERLAY,
+             need_profile: bool = False) -> subprocess.CompletedProcess:
     work, bindir = tmp / "w", tmp / "bin"
     bindir.mkdir()
     shutil.copytree(ROOT / "scripts", work / "scripts")
@@ -116,13 +150,14 @@ def _restart(tmp: Path, lock: str, pins: str = PINS) -> subprocess.CompletedProc
         (bindir / name).chmod(0o755)
     (work / "stack.lock").write_text(lock)
     (work / "noomesh.yaml").write_text("compose_env: {}\naddons:\n  rhold: true\n  other_addon: true\n")
-    for name, text in (("rhold", RHOLD_OVERLAY), ("other_addon", OTHER_OVERLAY)):
+    for name, text in (("rhold", rhold_overlay), ("other_addon", OTHER_OVERLAY)):
         (work / "addons" / name).mkdir(parents=True)
         (work / "addons" / name / "docker-compose.yml").write_text(text)
         (work / "addons" / name / "system.json").write_text('{"schema": "%s"}\n' % name)
     # What an earlier start (rhold still verified then) handed the gateway.
     (work / ".noo-addon-systems" / "rhold").mkdir(parents=True)
     (work / ".noo-addon-systems" / "rhold" / "system.json").write_text('{"schema": "rhold"}\n')
+    (tmp / "running").write_text(RUNNING_BEFORE)
     (work / "secrets").mkdir()
     (work / "secrets" / "env.sops").write_text("x\n")
     (tmp / "data").mkdir(exist_ok=True)
@@ -138,6 +173,8 @@ def _restart(tmp: Path, lock: str, pins: str = PINS) -> subprocess.CompletedProc
         "NOOLOG": str(tmp / "noo-log"),
         "NOO_CLI_BIN": str(bindir / "noo"),
         "FAKE_PINS": pins,
+        "RUNNING": str(tmp / "running"),
+        "FAKE_SERVICES_NEED_PROFILE": "1" if need_profile else "",
         "FAKE_LOCAL": f"{OTHER_REF} {RHOLD_REF}",
         # Inherited values must never vouch for, or hide, an add-on.
         "NOO_ADDONS_VERIFIED": f"rhold=0.1.0@{TAG}",
@@ -181,7 +218,8 @@ def test_a_stale_addon_pin_leaves_that_addon_out_and_the_stack_restarts(tmp_path
     assert not (work / ".noo-addon-systems" / "rhold").exists(), "a refused add-on's system.json is not handed to the gateway"
     assert (work / ".noo-addon-systems" / "other_addon" / "system.json").is_file()
     # A container left from an earlier start is stopped, by compose's labels.
-    assert "DOCKER stop cid-rhold" in log, log
+    assert "DOCKER stop cid-noo-rhold" in log, log
+    assert "gateway" in _running(tmp_path), "the gateway is never stopped for a refused add-on"
 
 
 def test_with_no_refusal_the_outcome_is_a_plain_restart(tmp_path: Path) -> None:
@@ -209,6 +247,112 @@ def test_a_tampered_stack_lock_still_refuses_the_whole_restart(tmp_path: Path) -
 def test_the_start_launcher_stops_refused_addons_and_says_what_did_not_start() -> None:
     start = (ROOT / "scripts/noomesh-start.sh").read_text()
     up = start.index("noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d --force-recreate")
-    assert up < start.index("    addons_stop_refused\n"), "start stops a refused add-on's leftover container after `up`"
+    stop = start.index("    addons_stop_leftovers addons_stop_disabled addons_stop_refused || exit 1\n")
+    assert up < stop, "start stops a refused add-on's leftover container after `up`"
+    assert stop < start.index('ui_close_warned "Services started WITHOUT add-on(s)'), "and fails before any success line"
+    restart = (ROOT / "scripts/noomesh-restart.sh").read_text()
+    assert "    addons_stop_leftovers addons_stop_refused || exit 1\n" in restart
     assert 'ui_close_warned "Services started WITHOUT add-on(s)' in start
     assert "    addons_report_refused\n" in start
+
+
+def _running(tmp: Path) -> set[str]:
+    return set((tmp / "running").read_text().split())
+
+
+def test_a_refused_addon_that_extends_the_gateway_never_stops_the_gateway(tmp_path: Path) -> None:
+    # The rc.2 defect, exactly: evolve's bundle was tampered, it was refused,
+    # and addons_stop_refused stopped `gateway` because its overlay names it
+    # (the core service list came from a `config --services` that failed).
+    r = _restart(tmp_path, _lock(), rhold_overlay=EXTENDS_GATEWAY_OVERLAY, need_profile=True)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "Stopping gateway" not in out, out
+    running = _running(tmp_path)
+    assert "gateway" in running, f"the core gateway was stopped for a refused add-on: {running}"
+    assert {"worker", "postgres", "other-addon"} <= running, running
+    assert "noo-rhold" not in running, "the refused add-on's OWN container is stopped"
+    assert "Stopping noo-rhold: add-on rhold was refused this start" in r.stderr, out
+    assert "REFUSED add-on rhold:" in r.stderr, out
+    assert "Services restarted WITHOUT add-on(s) rhold: refused, NOT running" in out, out
+
+
+LIB_BODY = """
+set -u
+. {root}/scripts/lib-addons.sh
+COMPOSE_FILES="-f {root}/docker-compose.cluster.yml"
+stop_the_gateway() {{ docker stop cid-gateway >/dev/null; }}
+stop_its_own() {{ _ADDON_STOPPED="${{_ADDON_STOPPED}}noo-rhold "; docker stop cid-noo-rhold >/dev/null; }}
+addons_stop_leftovers {fn}; echo "rc=$?"
+"""
+
+
+def _guard(tmp: Path, fn: str) -> subprocess.CompletedProcess:
+    bindir = tmp / "bin"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "docker").write_text(FAKE_DOCKER)
+    (bindir / "docker").chmod(0o755)
+    (tmp / "running").write_text(RUNNING_BEFORE)
+    env = {"PATH": f"{bindir}:{os.environ['PATH']}", "HOME": str(tmp), "LOGF": str(tmp / "log"),
+           "RUNNING": str(tmp / "running"), "NOO_ADDON_MAP_OVERRIDE": "1", "NOO_ADDON_MAP": ""}
+    return subprocess.run(["bash", "-c", LIB_BODY.format(root=ROOT, fn=fn)], cwd=tmp, env=env,
+                          capture_output=True, text=True, timeout=60)
+
+
+def test_a_core_service_stopped_by_an_addon_stop_fails_loudly_and_names_it(tmp_path: Path) -> None:
+    # Defence in depth: whatever the cause, a stop that takes down a service
+    # it did not mean to stop is a failure, never "Services started".
+    r = _guard(tmp_path, "stop_the_gateway")
+    assert "rc=1" in r.stdout, (r.stdout, r.stderr)
+    assert "service(s) gateway stopped" in r.stderr and "NOT fully up" in r.stderr, r.stderr
+    r = _guard(tmp_path, "stop_its_own")
+    assert "rc=0" in r.stdout, (r.stdout, r.stderr)
+
+
+def test_own_services_are_read_from_the_files_without_running_compose(tmp_path: Path) -> None:
+    overlay = tmp_path / "overlay.yml"
+    overlay.write_text(EXTENDS_GATEWAY_OVERLAY + "  # trailing\n")
+    body = f"""
+. {ROOT}/scripts/lib-addons.sh
+COMPOSE_FILES="-f {ROOT}/docker-compose.cluster.yml"
+addon_own_services {overlay}
+"""
+    r = subprocess.run(["bash", "-c", body], cwd=tmp_path, capture_output=True, text=True,
+                       env={"PATH": "/usr/bin:/bin", "NOO_ADDON_MAP_OVERRIDE": "1", "NOO_ADDON_MAP": ""})
+    assert r.stdout.split() == ["noo-rhold"], (r.stdout, r.stderr)
+    # trellion's and voice's services are core too: an add-on extending them owns them not.
+    overlay.write_text("services:\n  trellion:\n    environment: [X=1]\n  whisper: {}\n  mine: {}\n")
+    r = subprocess.run(["bash", "-c", body], cwd=tmp_path, capture_output=True, text=True,
+                       env={"PATH": "/usr/bin:/bin", "NOO_ADDON_MAP_OVERRIDE": "1", "NOO_ADDON_MAP": ""})
+    assert r.stdout.split() == ["mine"], (r.stdout, r.stderr)
+
+
+def test_a_switched_off_addon_that_extends_the_gateway_never_stops_the_gateway(tmp_path: Path) -> None:
+    # The same helper serves addons_stop_disabled (0.6.10 on: `noo stack
+    # start` after `noo addons disable evolve`, evolve's bundle still on disk):
+    # its overlay names `gateway`, and only its OWN service may be stopped.
+    root = tmp_path / "root"
+    (root / "scripts").mkdir(parents=True)
+    shutil.copy(ROOT / "scripts" / "lib-addons.sh", root / "scripts" / "lib-addons.sh")
+    shutil.copy(ROOT / "docker-compose.cluster.yml", root / "docker-compose.cluster.yml")
+    (root / "addons" / "rhold").mkdir(parents=True)
+    (root / "addons" / "rhold" / "docker-compose.yml").write_text(EXTENDS_GATEWAY_OVERLAY)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "docker").write_text(FAKE_DOCKER)
+    (bindir / "docker").chmod(0o755)
+    (tmp_path / "running").write_text(RUNNING_BEFORE)
+    body = f"""
+. {root}/scripts/lib-addons.sh
+COMPOSE_FILES="-f {root}/docker-compose.cluster.yml"
+addons_stop_leftovers addons_stop_disabled; echo "rc=$?"
+"""
+    env = {"PATH": f"{bindir}:{os.environ['PATH']}", "HOME": str(tmp_path), "LOGF": str(tmp_path / "log"),
+           "RUNNING": str(tmp_path / "running"), "FAKE_SERVICES_NEED_PROFILE": "1",
+           "NOO_ADDON_MAP_OVERRIDE": "1", "NOO_ADDON_MAP": "rhold=0\n"}
+    r = subprocess.run(["bash", "-c", body], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
+    assert "rc=0" in r.stdout, (r.stdout, r.stderr)
+    stops = [l for l in (tmp_path / "log").read_text().splitlines() if " stop " in l]
+    assert stops and all(l.endswith(" stop noo-rhold") for l in stops), stops
+    running = _running(tmp_path)
+    assert "gateway" in running and "noo-rhold" not in running, running

@@ -273,6 +273,7 @@ case "$*" in
 esac
 exit 0
 """
+    (tmp_path / "base.yml").write_text("services:\n  gateway:\n    image: g\n")
     r = _run(tmp_path, body, MAP="other_addon=1\n", FAKE_PINS="refuse other_addon stale\\n", DOCKER=fake)
     assert r.returncode == 0, r.stderr
     log = (tmp_path / "docker.log").read_text()

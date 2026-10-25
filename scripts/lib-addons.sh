@@ -204,18 +204,54 @@ addon_overlay() {
     return 0
 }
 
-# addon_own_services OVERLAY — the services OVERLAY adds to the stack (its
-# `services:` keys that the composed base, $COMPOSE_FILES, does not already
-# define): what to stop when the add-on is switched off on a live stack.
-# Derived, so core names no add-on service.
-addon_own_services() {
-    _aos_base="$(docker compose $COMPOSE_FILES config --services 2>/dev/null || true)"
+# _compose_service_keys FILE... — the `services:` keys each compose file
+# defines, read from its TEXT (no compose run: a refused add-on's overlay is
+# never rendered, and `docker compose config` without the launcher's profile
+# flags rejects the whole project).
+_compose_service_keys() {
+    [ $# -gt 0 ] || return 0
     awk '/^services:[[:space:]]*$/ { s = 1; next }
-         s && /^[^[:space:]#]/ { s = 0 }
-         s && /^  [A-Za-z0-9][A-Za-z0-9_.-]*:/ { sub(/^  /, ""); sub(/:.*/, ""); print }' "$1" \
-        | while read -r _aos_s; do
-            printf '%s\n' "$_aos_base" | grep -qx "$_aos_s" || printf '%s\n' "$_aos_s"
-        done
+         /^[^[:space:]#]/ { s = 0 }
+         s && /^  [A-Za-z0-9][A-Za-z0-9_.-]*:/ { sub(/^  /, ""); sub(/:.*/, ""); print }' "$@" 2>/dev/null
+}
+
+# addon_core_services — every service a file of the stack WITHOUT the add-on
+# defines: each `-f` file in $COMPOSE_FILES (the core files and the add-on
+# overlays that are composed) plus every core compose file shipped at the
+# install root (docker-compose*.yml: base, dist, gpu-embed, trellion,
+# voice, override). Derived from the files, never a list.
+addon_core_services() {
+    _acs_here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    _acs_files=()
+    _acs_prev=""
+    for _acs_f in $COMPOSE_FILES; do
+        [ "$_acs_prev" = "-f" ] && [ -f "$_acs_f" ] && _acs_files+=("$_acs_f")
+        _acs_prev="$_acs_f"
+    done
+    for _acs_f in "$_acs_here"/docker-compose*.yml; do
+        [ -f "$_acs_f" ] && _acs_files+=("$_acs_f")
+    done
+    _compose_service_keys ${_acs_files[@]+"${_acs_files[@]}"} | sort -u
+}
+
+# addon_own_services OVERLAY — the services OVERLAY OWNS: its `services:`
+# keys that no core file defines (addon_core_services). An overlay that
+# EXTENDS a core service (evolve adds a volume to `gateway`) does not own it,
+# so stopping a switched-off or refused add-on never stops the gateway
+# (0.6.11-rc.2 rehearsal, R7: `config --services` failed without the profile
+# flags, the base read as empty, and the refused evolve's stop took the
+# gateway down). With no core service found at all, nothing is owned: the
+# launcher stops nothing rather than guess.
+addon_own_services() {
+    _aos_base="$(addon_core_services)"
+    if [ -z "$_aos_base" ]; then
+        echo "WARNING: could not read the core compose services; not stopping any service of $(basename "$(dirname "$1")")" >&2
+        return 0
+    fi
+    _compose_service_keys "$1" | sort -u | while read -r _aos_s; do
+        [ -n "$_aos_s" ] || continue
+        printf '%s\n' "$_aos_base" | grep -qxF "$_aos_s" || printf '%s\n' "$_aos_s"
+    done
     return 0
 }
 
@@ -326,6 +362,7 @@ addons_stop_disabled() {
         [ -n "$_asd_o" ] || continue
         _asd_s="$(addon_own_services "$_asd_o" | tr '\n' ' ')"
         [ -n "${_asd_s// /}" ] || continue
+        _ADDON_STOPPED="${_ADDON_STOPPED:- }${_asd_s} "
         # shellcheck disable=SC2086
         docker compose $COMPOSE_FILES -f "$_asd_o" stop $_asd_s 2>/dev/null || true
     done
@@ -348,10 +385,45 @@ addons_stop_refused() {
             _asr_ids="$(docker ps -q --filter "label=com.docker.compose.project=${_asr_proj}" \
                 --filter "label=com.docker.compose.service=${_asr_s}" 2>/dev/null)"
             [ -n "$_asr_ids" ] || continue
+            _ADDON_STOPPED="${_ADDON_STOPPED:- }${_asr_s} "
             echo "Stopping ${_asr_s}: add-on ${_asr_n} was refused this start and must not keep running" >&2
             # shellcheck disable=SC2086
             docker stop $_asr_ids >/dev/null 2>&1 || echo "WARNING: could not stop ${_asr_s} (add-on ${_asr_n}); stop it: docker stop ${_asr_ids}" >&2
         done
     done
     return 0
+}
+
+# _addons_running_services — the compose services of this project that are
+# running now, one per line.
+_addons_running_services() {
+    docker ps --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME:-noomesh}" \
+        --filter status=running --format '{{.Label "com.docker.compose.service"}}' 2>/dev/null | sort -u
+}
+
+# addons_stop_leftovers FN... — run the add-on stop functions
+# (addons_stop_disabled, addons_stop_refused), then prove they stopped
+# nothing else: every service that was running before and is not running
+# after must be one they meant to stop (an add-on's OWN service). Anything
+# else, a core service above all, is a failure: named, exit status 1, and
+# never a "Services started" line (defence in depth for the rc.2 defect).
+_ADDON_STOPPED=" "
+addons_stop_leftovers() {
+    local _before _after _lost="" _s _f
+    _ADDON_STOPPED=" "
+    _before="$(_addons_running_services)"
+    for _f in "$@"; do "$_f"; done
+    [ -n "$_before" ] || return 0
+    _after="$(_addons_running_services)"
+    for _s in $_before; do
+        printf '%s\n' "$_after" | grep -qxF "$_s" && continue
+        case "$_ADDON_STOPPED" in *" $_s "*) continue ;; esac
+        _lost="${_lost} ${_s}"
+    done
+    [ -z "$_lost" ] && return 0
+    {
+        echo "ERROR: service(s)${_lost} stopped while the launcher stopped leftover add-on containers: the stack is NOT fully up"
+        echo "       Fix:  noo stack restart --force   (an add-on stop must never take down a core service: report it)"
+    } >&2
+    return 1
 }
