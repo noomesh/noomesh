@@ -2324,13 +2324,13 @@ pub const PUBLIC_PATHS_EXACT: &[&str] = &[
     // Bootstrap-token enrollment. (`/bootstrap-node.sh`, the
     // retired pre-token lane, was listed here until 2026-09-27.) Public
     // because the enrolling host has no credential of ANY kind
-    // yet — no JWT, no cluster secret, no cert. `/bootstrap` is the inert
-    // enrollment script; `/api/cluster/bootstrap` authenticates FULLY on its
+    // yet — no JWT, no cluster secret, no cert. (`/bootstrap`, the shell
+    // enrollment script, was retired and is not listed.)
+    // `/api/cluster/bootstrap` authenticates FULLY on its
     // own inside the handler: the single-use token in the body (256 bits of
     // entropy, sha256-verified against noo_bootstrap_tokens, expiry + revoke
     // + optional CIDR checks, uniform 403 on any failure). Exact paths, not
     // prefixes: nothing else under /api/cluster/ is self-authenticating.
-    "/bootstrap",
     // Tailnet-native enrollment: public for the same
     // reason as /api/cluster/bootstrap — the caller has no credential yet.
     // It authenticates FULLY in-handler, and NOT via anything the caller
@@ -2348,10 +2348,9 @@ pub const PUBLIC_PATHS_EXACT: &[&str] = &[
     // else under /api/kiosk/ is self-authenticating. (/api/kiosk/token, the
     // retired KEY lane, is neither public nor routed.)
     "/api/kiosk/token/tailnet",
-    // The ROOT host-prep phase: an inert shell script like /bootstrap
-    // itself, fetched by bootstrap-enroll.sh and run under the operator's
-    // attended sudo. Serving it publicly discloses nothing the enroll script
-    // does not already disclose — both are in the repo.
+    // The ROOT host-prep phase: an inert shell script, fetched by
+    // `noo enroll` and run under the operator's attended sudo. Serving it
+    // publicly discloses nothing the repo does not.
     "/bootstrap/prep",
     "/bootstrap/apply",
     "/bootstrap/deenroll",

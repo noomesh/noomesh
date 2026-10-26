@@ -70,7 +70,7 @@ the gateway refuses JWTs rather than accepting the well-known default. The
 Public, no credential: `/auth/*`, `/api/auth/*`, `/assets/*`,
 `/.well-known/*`, `/`, `/dashboard`, `/kiosk`, `/kiosk.html`,
 `/favicon.ico`, `/docs`, and the enrollment endpoints a node
-uses before it has credentials: `/bootstrap`, `/bootstrap/prep`, `/apply`,
+uses before it has credentials: `/bootstrap/prep`, `/apply`,
 `/deenroll`, `/fetch`, `/ca.crt`, `/bootstrap/cli/*`, `GET
 /bootstrap/bundle/*`, `/api/cluster/bootstrap` and
 `/api/cluster/enroll-tailnet` (the last two are gated by a
@@ -441,7 +441,7 @@ receives flat JSON events, each with a `type`:
 | GET | `/api/cluster/replication-status` | Postgres replication view |
 | GET, POST | `/api/security/bootstrap-tokens`; POST `…/{id}/revoke` | bootstrap tokens for `noo enroll` |
 | POST | `/api/cluster/bootstrap`, `/api/cluster/enroll-tailnet` | the enrolling node's first calls |
-| GET | `/bootstrap`, `/bootstrap/prep`, `/bootstrap/apply`, `/bootstrap/deenroll`, `/bootstrap/fetch`, `/bootstrap/ca.crt` | the pull rail a node walks during enrollment |
+| GET | `/bootstrap/prep`, `/bootstrap/apply`, `/bootstrap/deenroll`, `/bootstrap/fetch`, `/bootstrap/ca.crt` | the pull rail a node walks during enrollment |
 | POST, GET | `/api/cluster/provision-bundle/{node}`, `…/status`; GET `/bootstrap/bundle/{node}`; POST `/bootstrap/bundle/{node}/applied` | signed provisioning bundles |
 | PUT, GET | `/api/cluster/cli-asset/{name}`, `/bootstrap/cli/{name}` | CLI binaries served to nodes |
 | GET | `/api/artifacts/manifest/{kind}/{name}` | artifact rail manifests (`gguf`, `modelfile`, `image`; `binary` is retired): `{size_bytes, sha256, data_path}`. The sha256 is cached by path, size and mtime; a file not yet hashed is hashed in the background, and a request that would wait more than ~8 s gets `202 {"status":"hashing","retry_after_secs"}` with `Retry-After` — ask again. `noo cluster sync-model-files` warms this before it queues the node jobs |

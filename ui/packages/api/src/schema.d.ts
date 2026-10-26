@@ -7234,26 +7234,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/bootstrap": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get bootstrap
-         * @description [native] GET /bootstrap — the enrollment script (public, because it runs before the host has any credential). The script itself does nothing without a valid TOKEN.
-         */
-        get: operations["serve_enroll_script"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/ws/agent": {
         parameters: {
             query?: never;
@@ -17899,7 +17879,6 @@ export interface operations {
                         node_name?: string | null;
                         role_hint?: string | null;
                         allowed_cidr?: string | null;
-                        bootstrap_sha256?: string | null;
                         /** @description Step 1, on the node: install the noo CLI. */
                         install_command: string;
                         /** @description Step 2, on the node as its user: `noo enroll noo1.<blob>`. */
@@ -18735,28 +18714,6 @@ export interface operations {
                 };
             };
         };
-        responses: {
-            /** @description OK */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
-                };
-            };
-        };
-    };
-    serve_enroll_script: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
         responses: {
             /** @description OK */
             200: {
