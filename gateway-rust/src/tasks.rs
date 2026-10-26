@@ -1312,7 +1312,8 @@ pub async fn list_stale(db: &sqlx::PgPool) -> Result<Vec<Task>> {
     Ok(rows.iter().map(row_to_task).filter(|t| t.stale).collect())
 }
 
-/// The stale-task sweep: every few minutes, name the live
+/// The stale-task sweep: every few minutes, offer queued tasks that have
+/// waited a whole window again ([`offer_waiting_again`]), and name the live
 /// tasks whose runner has gone quiet — to the log and to the operator
 /// alert funnel, once per task per cooldown. It never re-runs or fails
 /// them: a task's loops may have executed tools, and only the operator
@@ -1341,8 +1342,53 @@ pub fn spawn_stale_sweep(state: std::sync::Arc<AppState>) {
                 )
                 .await;
             }
+            offer_waiting_again(&state).await;
         }
     });
+}
+
+/// How long a queued task (`open`, assigned to a node whose harness said
+/// busy) waits before the gateway offers it again (i227 fix 2): at least a
+/// minute, `NOO_TASK_QUEUE_RECHECK_SECS` overrides, default ten minutes.
+pub fn queue_recheck_after(get: &dyn Fn(&str) -> Option<String>) -> std::time::Duration {
+    let secs = get("NOO_TASK_QUEUE_RECHECK_SECS").and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(600);
+    std::time::Duration::from_secs(secs.max(60))
+}
+
+/// Queued tasks that have waited longer than `older_than`, oldest first.
+/// A parked task (`budget_state`) waits for its owner, and an aggregation
+/// parent (`loop_budget` 0) runs nowhere: neither is offered.
+async fn list_waiting(db: &sqlx::PgPool, older_than: std::time::Duration) -> Result<Vec<Task>> {
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "{SELECT} WHERE t.state = 'open' AND t.node IS NOT NULL AND t.budget_state IS NULL AND t.loop_budget > 0 \
+         AND t.updated_at < now() - make_interval(secs => $1) ORDER BY t.created_at"
+    )))
+    .bind(older_than.as_secs_f64())
+    .fetch_all(db)
+    .await?;
+    Ok(rows.iter().map(row_to_task).collect())
+}
+
+/// i227 fix 2: offer every task that has waited a whole recheck window for
+/// a busy node again, through [`start`] and its rules: taken → running;
+/// still busy → stays queued, its wait starting over; no answer at all →
+/// the in-process fallback, said so in the record. A queued task used to be
+/// handed out only on that node's `harness.ready`, so a node whose harness
+/// never came back kept it `open` for good.
+async fn offer_waiting_again(state: &std::sync::Arc<AppState>) {
+    let waiting = match list_waiting(&state.db, queue_recheck_after(&|k| std::env::var(k).ok())).await {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(error = %e, "task_queue_recheck: query failed");
+            return;
+        }
+    };
+    for t in waiting {
+        match start(state, &t).await {
+            Ok(s) => tracing::info!(task = %t.id, was_queued_on = ?t.node, node = %s.node, dispatched = s.dispatched, queued = s.queued, "task_queue_recheck"),
+            Err(e) => tracing::warn!(task = %t.id, error = %e, "task_queue_recheck: offer failed"),
+        }
+    }
 }
 
 /// How to name the thing that was running a task, for an operator.
@@ -1442,6 +1488,28 @@ mod tests {
         let body = json!({"node": "mcmini", "slot_freed": true, "stalled": ["a", 7, "b"], "stall_secs": 2700});
         assert_eq!(stalled_from_ready(&body), (vec!["a".to_string(), "b".to_string()], 2700));
         assert_eq!(stalled_from_ready(&json!({"node": "mcmini"})), (Vec::new(), 0));
+    }
+
+    /// i227 fix 2: the recheck window, and the sweep offering a long-queued
+    /// task again through `start` — only open tasks on a node, never a parked
+    /// one or an aggregation parent.
+    #[test]
+    fn a_long_queued_task_is_offered_again() {
+        let env = |v: Option<&'static str>| move |k: &str| (k == "NOO_TASK_QUEUE_RECHECK_SECS").then_some(v).flatten().map(str::to_string);
+        assert_eq!(queue_recheck_after(&env(None)).as_secs(), 600);
+        assert_eq!(queue_recheck_after(&env(Some("900"))).as_secs(), 900);
+        assert_eq!(queue_recheck_after(&env(Some("5"))).as_secs(), 60, "at least a minute");
+        assert_eq!(queue_recheck_after(&env(Some("later"))).as_secs(), 600);
+
+        let src = include_str!("tasks.rs").split("mod tests {").next().unwrap();
+        let sweep = src.split("pub fn spawn_stale_sweep(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        assert!(sweep.contains("offer_waiting_again(&state).await;"), "the sweep offers queued tasks again");
+        let list = src.split("async fn list_waiting(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        for clause in ["t.state = 'open'", "t.node IS NOT NULL", "t.budget_state IS NULL", "t.loop_budget > 0", "t.updated_at < now() - make_interval(secs => $1)"] {
+            assert!(list.contains(clause), "{clause}");
+        }
+        let offer = src.split("async fn offer_waiting_again(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        assert!(offer.contains("start(state, &t).await"), "the offer goes through start's rules");
     }
 
     /// i171: the text a tool-less loop ends with is the task's result —
