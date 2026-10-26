@@ -4876,7 +4876,7 @@ export interface paths {
         put?: never;
         /**
          * Mint a Tailscale pre-auth join key
-         * @description [native] Rust (routes/cluster.rs). Tailscale control-plane mint; returns bootstrap one-liner. Operator surface.
+         * @description [native] Rust (routes/cluster.rs). Tailscale control-plane mint; returns the pre-auth key. Operator surface.
          */
         post: {
             parameters: {
