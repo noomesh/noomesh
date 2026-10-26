@@ -116,6 +116,52 @@ pub fn check_harness_secrets(get: &dyn Fn(&str) -> Option<String>) -> Result<(),
     if errs.is_empty() { Ok(()) } else { Err(errs.join("; ")) }
 }
 
+/// Default `NOO_HARNESS_DRAIN_SECS`: on SIGTERM the harness stops taking
+/// work and gives what it holds this long to finish before it exits. The
+/// node agent restarts the harness on a kind change (`convergeHarness`), and
+/// until this a restart killed every turn and task mid-flight; a drained
+/// restart hands the gateway finished work and re-takes nothing twice. The
+/// unit's `TimeoutStopSec` and the Mac plist's `ExitTimeOut` leave 30 s more
+/// than this bound (noomesh-internal i256).
+pub const DEFAULT_DRAIN_SECS: u64 = 120;
+
+/// The drain bound from the environment: whole seconds, 1..=3600, else the
+/// default.
+pub fn drain_bound(get: &dyn Fn(&str) -> Option<String>) -> Duration {
+    Duration::from_secs(
+        get("NOO_HARNESS_DRAIN_SECS").and_then(|v| v.trim().parse::<u64>().ok()).filter(|s| (1..=3600).contains(s)).unwrap_or(DEFAULT_DRAIN_SECS),
+    )
+}
+
+/// Resolves once the process is asked to stop (SIGTERM from the service
+/// manager, or Ctrl-C). Every loop that takes work selects on it.
+fn stop_signal() -> tokio::sync::watch::Receiver<bool> {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(error = %e, "harness: cannot listen for SIGTERM; a stop will not drain");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        tracing::info!("harness: stop requested; taking no new work");
+        let _ = tx.send(true);
+    });
+    rx
+}
+
 pub async fn run() -> Result<()> {
     // i119: the environment systemd loaded (bus password, agent bearer)
     // stays out of /proc/<pid>/environ for every other process of this uid
@@ -299,6 +345,8 @@ pub async fn run() -> Result<()> {
     let mut turns = nats.queue_subscribe(subject.clone(), "harness".to_string()).await?;
     let mut tasks = nats.queue_subscribe(crate::tasks::task_subject(&node), "harness".to_string()).await?;
     let limit = Arc::new(tokio::sync::Semaphore::new(max_turns.max(1)));
+    let drain = drain_bound(&|k| std::env::var(k).ok());
+    let mut stop = stop_signal();
     // The tasks this harness holds right now, by id: a hand-back of a task
     // that is already here (the gateway hands a node's unfinished tasks
     // back on every `harness.ready`) is acknowledged as taken and never
@@ -318,8 +366,13 @@ pub async fn run() -> Result<()> {
         let driver_t = driver.clone();
         let running_t = running.clone();
         let capacity = max_turns.max(1);
+        let mut stop_t = stop.clone();
         tokio::spawn(async move {
-            while let Some(msg) = tasks.next().await {
+            loop {
+                let msg = tokio::select! {
+                    _ = stop_t.changed() => break,
+                    m = tasks.next() => match m { Some(m) => m, None => break },
+                };
                 let req: crate::tasks::TaskRequest = match serde_json::from_slice(&msg.payload) {
                     Ok(r) => r,
                     Err(e) => {
@@ -391,7 +444,12 @@ pub async fn run() -> Result<()> {
     // Announce: the gateway hands back this node's checkpointed tasks.
     let _ = nats.publish(crate::tasks::ready_subject(&node), serde_json::to_vec(&json!({"node": node})).unwrap_or_default().into()).await;
 
-    while let Some(msg) = turns.next().await {
+    let mut stopping = false;
+    loop {
+        let msg = tokio::select! {
+            _ = stop.changed() => { stopping = true; break }
+            m = turns.next() => match m { Some(m) => m, None => break },
+        };
         let req: coordinator::TurnRequest = match serde_json::from_slice(&msg.payload) {
             Ok(r) => r,
             Err(e) => {
@@ -446,7 +504,25 @@ pub async fn run() -> Result<()> {
             }
         });
     }
-    Err(anyhow!("harness: the turn subscription ended"))
+    if !stopping {
+        return Err(anyhow!("harness: the turn subscription ended"));
+    }
+    // Drain: nothing new is taken (the subscriptions are dropped here and
+    // in the task loop), what is held may finish within the bound, then exit
+    // so the service manager's restart brings the new kind up.
+    drop(turns);
+    let capacity = max_turns.max(1) as u32;
+    let held = capacity.saturating_sub(limit.available_permits() as u32);
+    tracing::info!(held, bound_secs = drain.as_secs(), "harness: draining");
+    match tokio::time::timeout(drain, limit.clone().acquire_many_owned(capacity)).await {
+        Ok(Ok(_)) => tracing::info!("harness: drained; exiting"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "harness: drain wait failed; exiting"),
+        Err(_) => {
+            let still = capacity.saturating_sub(limit.available_permits() as u32);
+            tracing::warn!(still, bound_secs = drain.as_secs(), "harness: drain bound reached with work still running; exiting");
+        }
+    }
+    Ok(())
 }
 
 /// Which loop this harness runs, and where that came from.
@@ -667,6 +743,32 @@ async fn run_turn<S: TurnSink>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn the_drain_bound_is_whole_seconds_within_an_hour_else_the_default() {
+        let get = |v: Option<&str>| move |_: &str| v.map(str::to_string);
+        assert_eq!(drain_bound(&get(None)), Duration::from_secs(DEFAULT_DRAIN_SECS));
+        assert_eq!(drain_bound(&get(Some("45"))), Duration::from_secs(45));
+        for bad in ["0", "3601", "soon", ""] {
+            assert_eq!(drain_bound(&get(Some(bad))), Duration::from_secs(DEFAULT_DRAIN_SECS), "{bad:?}");
+        }
+    }
+
+    /// Both loops that take work select on the stop signal, and the drain
+    /// waits for every permit before run() returns Ok: a stop never kills a
+    /// turn or task that could have finished (i256).
+    #[test]
+    fn a_stop_drains_before_the_harness_exits() {
+        let code = include_str!("harness_main.rs");
+        let run = &code[code.find("pub async fn run()").unwrap()..code.find("/// Which loop this harness runs").unwrap()];
+        assert_eq!(run.matches("stop_t.changed()").count(), 1, "the task loop selects on the stop");
+        assert_eq!(run.matches("_ = stop.changed() => { stopping = true; break }").count(), 1, "the turn loop selects on the stop");
+        let drain_wait = run.find("acquire_many_owned(capacity)").expect("the drain waits for every permit");
+        assert!(run.find("harness: draining").unwrap() < drain_wait && drain_wait < run.rfind("Ok(())").unwrap());
+        assert!(run.find("the turn subscription ended").unwrap() < drain_wait, "a dead subscription is still an error, not a drain");
+    }
+
     /// noomesh-internal i176: at capacity the harness says busy (a reply,
     /// not silence); a task already here is acknowledged, not started
     /// twice; a finished task re-announces ready so the gateway hands the
@@ -687,7 +789,6 @@ mod tests {
         assert!(turns[..300].contains("\"busy\": true"), "a turn at capacity is answered busy too");
     }
 
-    use super::*;
 
     /// A stand-in node agent answering `/harness/placement` with `status`
     /// and `body`; returns its base URL.
