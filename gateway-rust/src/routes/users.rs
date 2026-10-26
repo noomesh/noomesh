@@ -28,7 +28,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::{AuthActor, RequesterCtx};
-use crate::authz::OperatorOrInternal;
+use crate::authz::{Operator, OperatorOrInternal};
 use crate::state::AppState;
 use super::{AppError, AppResult};
 
@@ -1872,12 +1872,11 @@ async fn user_revoke_roles(
 /// GET /api/security/user-proposals
 async fn proposals_list(
     State(state): State<Arc<AppState>>,
-    _op: OperatorOrInternal,
+    _op: Operator,
 ) -> AppResult {
-    // Mirrors the legacy listing's read gate, now the `OperatorOrInternal` extractor (the design step
-    // 4): the queue carries usernames, requested scopes and requesters, so a
-    // sub-operator account must not enumerate it. Cluster-HMAC (None) passes,
-    // as it does on the legacy listing.
+    // The `Operator` extractor (i241): the queue carries usernames, requested
+    // scopes and requesters, so a sub-operator account must not enumerate it,
+    // and neither may a call with no user context.
     let rows = proposal_rows(&state.db).await?;
 
     let proposals: Vec<Value> = rows
@@ -2237,7 +2236,7 @@ async fn proposal_decide(
 /// GET /api/security/service-keys — never returns raw keys or hashes.
 async fn service_keys_list(
     State(state): State<Arc<AppState>>,
-    _op: OperatorOrInternal,
+    _op: Operator,
 ) -> AppResult {
     let rows = sqlx::query_as::<_, (
         String,
@@ -3625,7 +3624,7 @@ async fn unknown_team_roles(
 /// [ported from workers/users.py::_users_list (worker.api.users) 2026-07-18]
 async fn api_users_list(
     State(state): State<Arc<AppState>>,
-    _op: OperatorOrInternal,
+    _op: Operator,
 ) -> AppResult {
     let rows = crate::repo::users::list_with_lock(&state.db).await?;
     let users: Vec<Value> = rows

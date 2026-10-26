@@ -46,7 +46,7 @@ use serde_json::{json, Value};
 use sqlx::Row;
 
 use crate::auth::AuthActor;
-use crate::authz::OperatorOrInternal;
+use crate::authz::Operator;
 use crate::routes::{AppError, AppResult};
 use crate::state::AppState;
 
@@ -206,7 +206,7 @@ pub fn validate_audience_shape(audience: &[String]) -> Result<Vec<String>, Strin
 // Operator-only, on reads too (a read-scope user must not enumerate the
 // servers, their env keys or their placements). Cluster-HMAC callers carry no
 // `RequesterCtx` and pass, as everywhere on `/api/security/*`: every handler
-// below takes `OperatorOrInternal` for that policy.
+// below takes `Operator` for that policy.
 
 fn actor_label(actor: &Option<Extension<AuthActor>>) -> String {
     actor.as_ref().map(|Extension(a)| a.0.clone()).unwrap_or_else(|| "cluster".into())
@@ -216,7 +216,7 @@ fn actor_label(actor: &Option<Extension<AuthActor>>) -> String {
 
 async fn servers_list(
     State(state): State<Arc<AppState>>,
-    _op: OperatorOrInternal,
+    _op: Operator,
 ) -> AppResult {
     let rows = sqlx::query(
         "SELECT s.id, s.transport, s.kind, s.enabled, s.audience, s.note, s.created_at, s.updated_at, \
@@ -287,7 +287,7 @@ async fn check_teams(db: &sqlx::PgPool, teams: &[String]) -> Result<(), AppError
 
 async fn server_create(
     State(state): State<Arc<AppState>>,
-    op: OperatorOrInternal,
+    op: Operator,
     actor: Option<Extension<AuthActor>>,
     Json(body): Json<CreateBody>,
 ) -> AppResult {
@@ -306,7 +306,7 @@ async fn server_create(
     let teams = validate_audience_shape(&body.audience).map_err(AppError::BadRequest)?;
     check_teams(&state.db, &teams).await?;
 
-    let owner = op.0.as_ref().map(|r| r.sub.clone());
+    let owner = Some(op.sub().to_string());
     let res = sqlx::query(
         "INSERT INTO noo_mcp_servers (id, transport, spec, kind, owner_uuid, audience, note, enabled) \
          VALUES ($1, $2, $3, $4, (SELECT user_uuid FROM noo_users WHERE username = $5), $6, $7, $8) \
@@ -336,7 +336,7 @@ async fn server_create(
 
 async fn server_get(
     State(state): State<Arc<AppState>>,
-    _op: OperatorOrInternal,
+    _op: Operator,
     Path(id): Path<String>,
 ) -> AppResult {
     let Some(r) = sqlx::query(
@@ -395,7 +395,7 @@ struct UpdateBody {
 
 async fn server_update(
     State(state): State<Arc<AppState>>,
-    _op: OperatorOrInternal,
+    _op: Operator,
     actor: Option<Extension<AuthActor>>,
     Path(id): Path<String>,
     Json(body): Json<UpdateBody>,
@@ -445,7 +445,7 @@ async fn server_update(
 
 async fn server_delete(
     State(state): State<Arc<AppState>>,
-    _op: OperatorOrInternal,
+    _op: Operator,
     actor: Option<Extension<AuthActor>>,
     Path(id): Path<String>,
 ) -> AppResult {
@@ -468,7 +468,7 @@ struct PlacementBody {
 
 async fn placement_put(
     State(state): State<Arc<AppState>>,
-    _op: OperatorOrInternal,
+    _op: Operator,
     actor: Option<Extension<AuthActor>>,
     Path((id, node)): Path<(String, String)>,
     body: Option<Json<PlacementBody>>,
@@ -519,7 +519,7 @@ async fn placement_put(
 
 async fn placement_delete(
     State(state): State<Arc<AppState>>,
-    _op: OperatorOrInternal,
+    _op: Operator,
     actor: Option<Extension<AuthActor>>,
     Path((id, node)): Path<(String, String)>,
 ) -> AppResult {

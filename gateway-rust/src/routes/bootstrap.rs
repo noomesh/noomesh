@@ -66,7 +66,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::RequesterCtx;
-use crate::authz::OperatorOrInternal;
+use crate::authz::{Operator, OperatorOrInternal};
 use crate::auth_refresh::{generate_bootstrap_token, hash_token, BOOTSTRAP_TOKEN_PREFIX};
 use crate::state::AppState;
 use super::{AppError, AppResult};
@@ -626,7 +626,7 @@ async fn bootstrap_token_create(
 /// GET /api/security/bootstrap-tokens — issuance metadata, NEVER hashes.
 async fn bootstrap_tokens_list(
     State(state): State<Arc<AppState>>,
-    _op: OperatorOrInternal,
+    _op: Operator,
 ) -> AppResult {
     let rows: Vec<(
         uuid::Uuid,

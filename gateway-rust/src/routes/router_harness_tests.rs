@@ -20,6 +20,13 @@
 //!   3. `Measured`: with no Redis client, the status routes answer 200 with the
 //!      unmeasurable fields `null` and a `<field>_detail` sentence, never a
 //!      literal `false` / `0` / `[]`.
+//!   4. `i241`: the routes the operator decided (2026-10-26) must name a real
+//!      user. A VALID cluster HMAC token (a node, no user context) is refused
+//!      403 on each of them; an operator login is admitted to every row but
+//!      the schema-changing one, which wants an admin. The bootstrap-token
+//!      POST/revoke rows are only checked for the refusal (they stay
+//!      `OperatorOrInternal` until an agent principal exists, and admitting
+//!      an operator would mint a token).
 //!
 //! What it proves it through: `build_router` (every layer: rate limit, auth,
 //! principal, security headers), `auth::require_any_auth` admitting a signed
@@ -164,6 +171,20 @@ fn token_for(sub: &str, role: Role) -> String {
         .expect("claims");
     crate::auth::sign_hs256(&claims, JWT_SECRET).expect("sign")
 }
+
+/// A valid v1 cluster HMAC token for `actor`, signed with `secret`: the form
+/// a node-agent presents. It carries no user.
+fn cluster_token(secret: &str, actor: &str) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_secs();
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key");
+    mac.update(format!("{actor}:{ts}").as_bytes());
+    format!("{actor}:{ts}:{}", hex::encode(mac.finalize().into_bytes()))
+}
+
+/// Not a secret: the fleet secret this process verifies the harness's node
+/// token against.
+const FLEET_SECRET: &str = "router-harness-fleet-secret-not-a-secret-0001";
 
 // ───────────────────────────── route enumeration ─────────────────────────────
 
@@ -384,6 +405,85 @@ async fn assert_viewer_refused(c: &Client, viewer: &str, routes: &[Guarded]) -> 
     failures
 }
 
+/// Followup i241: routes that used to admit a caller with no user context
+/// and now name a person. (method, path, extractor the scan must find).
+const I241_ROWS: &[(&str, &str, &str)] = &[
+    ("POST", "/api/db/migrations/apply", "Admin"),
+    ("GET", "/api/mcp/servers", "Operator"),
+    ("POST", "/api/mcp/servers", "Operator"),
+    ("GET", "/api/mcp/servers/{id}", "Operator"),
+    ("PUT", "/api/mcp/servers/{id}", "Operator"),
+    ("DELETE", "/api/mcp/servers/{id}", "Operator"),
+    ("PUT", "/api/mcp/servers/{id}/placements/{node}", "Operator"),
+    ("DELETE", "/api/mcp/servers/{id}/placements/{node}", "Operator"),
+    ("GET", "/api/security/bootstrap-tokens", "Operator"),
+    ("GET", "/api/cluster/seat-tokens", "Operator"),
+    ("GET", "/api/users", "Operator"),
+    ("GET", "/api/security/service-keys", "Operator"),
+    ("GET", "/api/security/user-proposals", "Operator"),
+    ("GET", "/api/security/audit/list", "Operator"),
+    ("GET", "/api/security/audit/verify", "Operator"),
+    // Kept: the chat-onboarding agent mints and revokes with no user of its
+    // own; no distinct agent principal exists to name instead (see the PR).
+    ("POST", "/api/security/bootstrap-tokens", "OperatorOrInternal"),
+    ("POST", "/api/security/bootstrap-tokens/{id}/revoke", "OperatorOrInternal"),
+];
+
+/// Contract 4. `node` is a valid cluster HMAC token (no user), `operator` and
+/// `admin` are logins.
+async fn assert_i241_rows(c: &Client, node: &str, operator: &str, admin: &str) -> Vec<String> {
+    let mut failures = Vec::new();
+    // Control: the node token verifies and is admitted to a node route. Without
+    // it, a token the gateway never accepted would "prove" every refusal below.
+    let ctl = c.call("GET", &format!("/api/cluster/nodes/{HARNESS_NODE}/desired-config"), Some(node)).await;
+    if ctl.status == 401 || ctl.status == 403 {
+        failures.push(format!(
+            "control: the node token should be admitted to its own desired-config, got {} — {:?}",
+            ctl.status, ctl.text
+        ));
+        return failures;
+    }
+    let (mut refused, mut admitted) = (0usize, 0usize);
+    for (method, path, extractor) in I241_ROWS {
+        let url = concrete(path);
+        // 1. No user: refused. 403 is the node allow-list (`node_route_allowed`)
+        //    or the extractor, whichever answers first; both are the contract.
+        let r = c.call(method, &url, Some(node)).await;
+        if r.status == 403 {
+            refused += 1;
+        } else {
+            failures.push(format!("i241: a node token (no user) on {method} {path} should be 403, got {} — {:?}", r.status, r.text));
+        }
+        // 2. A login of the right role gets past the lock. Not asserted for the
+        //    two bootstrap-token writes: an operator admitted there would mint
+        //    or revoke a real token.
+        if *extractor == "OperatorOrInternal" {
+            continue;
+        }
+        if *extractor == "Admin" {
+            let r = c.call(method, &url, Some(operator)).await;
+            if r.status != 403 {
+                failures.push(format!("i241: an operator on {method} {path} (Admin) should be 403, got {}", r.status));
+            }
+        }
+        let who = if *extractor == "Admin" { admin } else { operator };
+        let r = c.call(method, &url, Some(who)).await;
+        if r.status == 401 || r.status == 403 {
+            failures.push(format!("i241: {extractor} login on {method} {path} was refused: {} — {:?}", r.status, r.text));
+        } else {
+            admitted += 1;
+        }
+    }
+    eprintln!(
+        "router_harness: i241 — {} rows; node token refused 403 on {refused}; a login of the right role admitted on {admitted}",
+        I241_ROWS.len()
+    );
+    failures
+}
+
+/// The node id the harness's cluster token claims.
+const HARNESS_NODE: &str = "harness-node";
+
 /// Contract 2. The named Redis action routes answer 503 `redis_reconnecting`.
 async fn assert_redis_reconnecting(c: &Client, admin: &str) -> Vec<String> {
     let mut failures = Vec::new();
@@ -455,6 +555,7 @@ async fn the_real_router_holds_authz_redis_and_measured_contracts() {
     let Some(dsn) = dsn_or_skip() else { return };
 
     unsafe { std::env::set_var("NOO_JWT_SECRET", JWT_SECRET) };
+    unsafe { std::env::set_var("NOO_CLUSTER_SECRET", FLEET_SECRET) };
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     // The enumeration needs no database, so a scan that finds nothing fails
@@ -502,6 +603,8 @@ async fn the_real_router_holds_authz_redis_and_measured_contracts() {
 
     let viewer = token_for("harness-viewer", Role::User);
     let admin = token_for("harness-admin", Role::Admin);
+    let operator = token_for("harness-operator", Role::Operator);
+    let node = cluster_token(FLEET_SECRET, HARNESS_NODE);
 
     let mut failures: Vec<String> = Vec::new();
 
@@ -522,6 +625,7 @@ async fn the_real_router_holds_authz_redis_and_measured_contracts() {
         failures.extend(assert_viewer_refused(&c, &viewer, &routes).await);
         failures.extend(assert_redis_reconnecting(&c, &admin).await);
         failures.extend(assert_measured(&c, &admin).await);
+        failures.extend(assert_i241_rows(&c, &node, &operator, &admin).await);
     }
 
     server.abort();
@@ -543,10 +647,16 @@ fn the_route_scan_finds_the_guarded_routes() {
             .any(|r| r.method == "GET" && r.path == "/api/v1/walks/stats" && r.extractor == "Operator"),
         "GET /api/v1/walks/stats (Operator) must be enumerated"
     );
-    assert!(
-        routes.iter().any(|r| r.path == "/api/mcp/servers" && r.extractor == "OperatorOrInternal"),
-        "/api/mcp/servers (OperatorOrInternal) must be enumerated"
-    );
+    // i241: every row the operator tightened is found with the extractor it
+    // was given, and the two kept bootstrap-token writes are still the
+    // deliberate no-user policy. A drift either way fails here, with no database.
+    for (method, path, extractor) in I241_ROWS {
+        assert!(
+            routes.iter().any(|r| r.method == *method && r.path == *path && r.extractor == *extractor),
+            "{method} {path} must be guarded by `{extractor}` (followup i241); scan found {:?}",
+            routes.iter().filter(|r| r.method == *method && r.path == *path).map(|r| &r.extractor).collect::<Vec<_>>()
+        );
+    }
     assert!(
         routes.iter().any(|r| r.path == "/api/v1/admin/walks" && r.extractor == "Admin"),
         "/api/v1/admin/walks (Admin) must be enumerated"
