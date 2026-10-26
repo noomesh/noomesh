@@ -236,8 +236,8 @@ fn public_key(cert_pem: &str) -> Result<RsaPublicKey, ProofError> {
     let cert = Certificate::from_der(&der)
         .map_err(|e| ProofError::BadBirthCert(format!("DER: {e}")))?;
     let spki = cert
-        .tbs_certificate
-        .subject_public_key_info
+        .tbs_certificate()
+        .subject_public_key_info()
         .to_der()
         .map_err(|e| ProofError::BadBirthCert(format!("SPKI: {e}")))?;
     RsaPublicKey::from_public_key_der(&spki)
