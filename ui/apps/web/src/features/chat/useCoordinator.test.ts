@@ -194,6 +194,20 @@ describe('useCoordinator', () => {
     expect(last(result.current.messages).answering).toEqual({ node: 'awolf', kind: undefined });
   });
 
+  it('collects a vendor harness working text apart from the answer', () => {
+    const { result } = renderHook(() => useCoordinator());
+    fire('onOpen', {});
+    H.sock.readyState = 1;
+    act(() => result.current.send('q'));
+
+    fire('onMessage', { type: 'working', text: 'Let me check ' });
+    fire('onMessage', { type: 'working', text: 'the nodes.' });
+    fire('onMessage', { type: 'content', text: 'Three nodes.' });
+    const m = last(result.current.messages);
+    expect(m.working).toBe('Let me check the nodes.');
+    expect(m.text).toBe('Three nodes.');
+  });
+
   it('a failed tool_result carries the error as its detail', () => {
     const { result } = renderHook(() => useCoordinator());
     fire('onOpen', {});

@@ -55,6 +55,12 @@ export interface ChatTurn {
   text: string;
   /** Reasoning tokens only — tool calls live in `tools`, not in here. */
   thinking?: string;
+  /**
+   * What a node harness's vendor CLI is doing, from `working` frames: the
+   * model's text as the harness's translator sees it, planning included.
+   * Not the answer (that arrives as `content`). i278 phase D.
+   */
+  working?: string;
   /** How long reasoning ran, measured client-side from first thinking token. */
   thinkMs?: number;
   tools?: ToolRun[];
@@ -266,6 +272,9 @@ export function useCoordinator() {
             break;
           case 'harness_dispatched':
             if (f.node) patchLast(() => ({ answering: { node: f.node!, kind: f.kind || undefined } }));
+            break;
+          case 'working':
+            patchLast((l) => ({ working: (l.working ?? '') + (f.text ?? '') }));
             break;
           case 'thinking':
             if (thinkStart.current === null) thinkStart.current = Date.now();
