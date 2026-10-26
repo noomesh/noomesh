@@ -8468,7 +8468,10 @@ mod sudo_seam_tests {
         std::fs::write(
             &fake,
             format!(
-                "#!/bin/sh\necho \"$@\" >> '{}'\n[ \"$1\" = \"-n\" ] || {{ sleep 30; exit 99; }}\necho 'sudo: a password is required' >&2\nexit 1\n",
+                // printf, not echo: `echo "$@"` takes a leading `-n` as its own
+                // flag and drops it from the log (the first batch run read
+                // that as "no -n" and failed).
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n[ \"$1\" = \"-n\" ] || {{ sleep 30; exit 99; }}\necho 'sudo: a password is required' >&2\nexit 1\n",
                 log.display()
             ),
         )
