@@ -121,6 +121,23 @@ where
     .await
 }
 
+/// Tasks queued for a node's harness (`open`, on a node) longer than
+/// `older_than_secs`, oldest first (i227 fix 2). A parked task
+/// (`budget_state`) and an aggregation parent (`loop_budget` 0) are not.
+pub async fn waiting_ids<'e, E>(db: E, older_than_secs: f64) -> Result<Vec<Uuid>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar(
+        "SELECT id FROM noo_tasks \
+         WHERE state = 'open' AND node IS NOT NULL AND budget_state IS NULL AND loop_budget > 0 \
+         AND updated_at < now() - make_interval(secs => $1) ORDER BY created_at",
+    )
+    .bind(older_than_secs)
+    .fetch_all(db)
+    .await
+}
+
 /// Delete a task that never left `open`.
 pub async fn delete_if_open<'e, E>(db: E, id: Uuid) -> Result<(), sqlx::Error>
 where
