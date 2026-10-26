@@ -84,8 +84,11 @@ Sleep 3s
 
 Type "# Ask it something." Enter
 Sleep 1s
-# A question the first (small) model answers well. "what can you do on this
-# machine?" got "please provide an image or description of the machine" (take 7).
-Type `noo chat --message "Say hello, then tell me in two lines what noomesh is."` Enter
+# A question the first (small) model answers from what it knows. It has no
+# knowledge base yet, so it cannot know what noomesh is: "what can you do on
+# this machine?" got "please provide an image or description of the machine"
+# (take 7), "tell me what noomesh is" got "I do not have enough context to
+# define noomesh" (take 14a). A general question shows a local model answering.
+Type `noo chat --message "Say hello, then give me two short tips for keeping a home server healthy."` Enter
 Wait
 Sleep 5s

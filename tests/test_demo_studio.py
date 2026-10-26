@@ -195,7 +195,11 @@ def test_the_cut_script_and_the_tape_after_take_seven():
     typed = [a or b for a, b in re.findall(r"^Type `(noo [^`]*)` Enter$|^Type \"(noo [^\"]*)\" Enter$", tape, re.M)]
     assert "noo stack status" in typed and "noo cluster status" not in typed, typed
     assert not any("what can you do on this machine" in t for t in typed), "the prompt gemma4:e2b misread"
-    assert any(t.startswith("noo chat --message") and "noomesh" in t for t in typed), typed
+    chat = [t for t in typed if t.startswith("noo chat --message")]
+    assert len(chat) == 1, typed
+    # the first model has no knowledge base: a question about noomesh itself
+    # got "I do not have enough context to define noomesh" (take 14a)
+    assert "noomesh" not in chat[0].lower(), chat[0]
 
 
 def test_the_box_boots_systemd_and_runs_docker_as_a_unit():
