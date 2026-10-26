@@ -255,6 +255,7 @@ _pgpass_body() {
 #      NOO_<ID>_DDL_PASSWORD on`. A name source 1 already declared is skipped
 #      (noomesh.yaml wins, as in the gateway's broker).
 # Nothing downstream changes per source: not compose, not the gateway's lookup.
+command -v config_has_section >/dev/null 2>&1 || . "$(dirname "${BASH_SOURCE[0]}")/lib-config.sh"
 _declared_systems() {
     local nb="" rc=0 out="" d a id up seen=" " name
     if [ -f noomesh.yaml ]; then
@@ -274,7 +275,7 @@ _declared_systems() {
             out=""
             # Silent only when nothing is declared: a manifest this launcher could
             # not read is a system whose flag and passwords will not arrive.
-            if grep -qE '^systems:' noomesh.yaml; then
+            if config_has_section noomesh.yaml systems; then
                 echo "WARNING: could not list the declared systems (noo config launch-render systems: exit $rc; an older noo?)." >&2
                 echo "         A system no compose line names will not receive its flag or passwords; the gateway skips it and says so." >&2
             fi

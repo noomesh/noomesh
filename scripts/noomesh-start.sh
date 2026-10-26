@@ -252,10 +252,9 @@ if [ "$DIST" = true ]; then
     NEWEST_STACK="$(git tag -l 'stack-v*' 2>/dev/null | sort -V | tail -1)"
     NEWEST_STACK="${NEWEST_STACK#stack-}"
     if [ -n "$EXPLICIT_TAG" ] && [ -f "noomesh.yaml" ]; then
-        if grep -qE '^[[:space:]]*NOO_IMAGE_TAG:' noomesh.yaml; then
-            CUR_PIN="$(grep -E '^[[:space:]]*NOO_IMAGE_TAG:' noomesh.yaml | head -1 | awk '{print $2}')"
+        if CUR_PIN="$(config_compose_env_get noomesh.yaml NOO_IMAGE_TAG)"; then
             if [ "$CUR_PIN" != "$DIST_TAG" ]; then
-                config_sed_in_place noomesh.yaml "s|^([[:space:]]*NOO_IMAGE_TAG:).*|\1 ${DIST_TAG}|"
+                config_compose_env_set noomesh.yaml NOO_IMAGE_TAG "${DIST_TAG}"
                 ui_kv "Promoted" "noomesh.yaml NOO_IMAGE_TAG ${CUR_PIN:-unset} → ${DIST_TAG}"
             fi
         fi
