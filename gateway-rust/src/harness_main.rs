@@ -231,7 +231,7 @@ pub async fn run() -> Result<()> {
     match &profile {
         Some(p) => tracing::info!(
             tier = ?p.tier, first_byte_secs = ?p.first_byte_secs, stream_idle_secs = ?p.stream_idle_secs,
-            thinking = ?p.thinking, ollama_context = ?p.ollama_context, claude_prompt = ?p.claude_prompt,
+            thinking = ?p.thinking, context = ?p.context, claude_prompt = ?p.claude_prompt,
             foreign_kinds = ?p.foreign_kinds, "harness: profile from the node agent"
         ),
         None => tracing::info!("harness: no harness profile from the node agent; built-in defaults"),

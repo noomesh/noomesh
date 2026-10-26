@@ -189,7 +189,7 @@ the table, gets the tier 3 row.
 | `first_byte_secs` | 290 | 600 | 900 | 900 | how long the node's inference proxy waits for a model's first byte (a cold load plus the prompt's prefill) | node agent, live, no restart |
 | `stream_idle_secs` | 300 | 300 | 600 | 600 | how long a streamed answer may go silent before it counts as cut | harness |
 | `thinking` | `auto` | `off` | `off` | `off` | whether model calls reason: `on`, `off`, or `auto` (the caller decides) | harness |
-| `ollama_context` | 32768 | 32768 | 16384 | 8192 | the context window the node's chat engine runs with when its placement sets none: Ollama's `OLLAMA_CONTEXT_LENGTH`, vLLM's `VLLM_MAX_MODEL_LEN`, llama.cpp's `N_CTX` | node agent |
+| `context` | 32768 | 32768 | 16384 | 8192 | the context window the node's chat engine runs with when its placement sets none: Ollama's `OLLAMA_CONTEXT_LENGTH`, vLLM's `VLLM_MAX_MODEL_LEN`, llama.cpp's `N_CTX`. Named `ollama_context` until 0.6.13; the old name is still accepted for one release | node agent |
 | `claude_prompt` | `full` | `slim` | `slim` | `slim` | which Claude Code launch the harness uses: the full system prompt, or a slim one for small models | harness |
 | `foreign_kinds` | claude-code, codex, copilot | claude-code, codex, copilot | codex, copilot | none | the foreign harness kinds this node may run (`noo` is always allowed); the agent refuses a placement of any other kind | node agent |
 
@@ -222,7 +222,7 @@ noo cluster profile <node> --clear-all
 ```
 
 The gateway checks every value: `first_byte_secs` and `stream_idle_secs` are
-whole seconds from 1 to 7200, `ollama_context` is whole tokens from 1 to
+whole seconds from 1 to 7200, `context` is whole tokens from 1 to
 1048576, `thinking` is `on`, `off` or `auto`, `claude_prompt` is `full` or
 `slim`, and `foreign_kinds` names foreign kinds from
 `config/harness-kinds.json`. A value outside these rules is refused with the

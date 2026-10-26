@@ -3627,8 +3627,9 @@ async fn desired_config_get(
         "mcp_servers": mcp_json,
         // The resolved harness profile (config/harness-profiles.json):
         // `{tier, first_byte_secs, stream_idle_secs, thinking,
-        // ollama_context, claude_prompt, foreign_kinds, sources, bench}`.
-        // The agent applies first_byte_secs, ollama_context and
+        // context, ollama_context (the same value, for agents older than
+        // 0.6.13), claude_prompt, foreign_kinds, sources, bench}`.
+        // The agent applies first_byte_secs, context and
         // foreign_kinds, and hands the whole object to its harness.
         "harness_profile": harness_profile,
         // Every verified add-on bundle's declared workloads (i163 part B):
