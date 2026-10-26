@@ -293,3 +293,14 @@ def test_take_eleven_s_false_leaks_and_the_report_names_kinds_not_values():
     rec = (DEMO / "record-onboarding.sh").read_text()
     assert "report=\"$report  - $tag (${#lit} chars)" in rec, "the LEAK report lists kind and length"
     assert "NOO_DEMO_KEEP_ON_LEAK" in rec and 'masked.LEAK.log' in rec
+
+
+def test_every_recorder_knob_reaches_the_recorder_container():
+    """The recorder runs in its own container: a knob the studio does not pass
+    is silently off. Take 12 (2026-10-25) set NOO_DEMO_KEEP_ON_LEAK=1 and lost
+    the transcript anyway, because only three knobs were passed."""
+    studio = (DEMO / "studio.sh").read_text()
+    passed = re.search(r"for v in ((?:NOO_DEMO_[A-Z_]+ ?)+); do", studio).group(1).split()
+    rec = (DEMO / "record-onboarding.sh").read_text()
+    used = set(re.findall(r"NOO_DEMO_(?!BOX\b|SANDBOX\b|HOSTNAME\b|MASK\b)[A-Z_]+", rec))
+    assert used <= set(passed), f"recorder knobs the studio never passes: {sorted(used - set(passed))}"

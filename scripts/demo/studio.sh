@@ -47,7 +47,8 @@
 #   NOO_STUDIO_VHS_IMAGE    recorder image   (default ghcr.io/charmbracelet/vhs:latest)
 #   NOO_STUDIO_BASE_IMAGE   box base image (systemd + Docker go on top) (default ubuntu:24.04)
 #   NOO_STUDIO_CACHE_IMAGE  pull-through cache image             (default registry:3)
-#   NOO_DEMO_INSTALL_URL, NOO_DEMO_MASK_NAMES, NOO_DEMO_CLI_VERSION   passed through to the recorder
+#   NOO_DEMO_INSTALL_URL, NOO_DEMO_MASK_NAMES, NOO_DEMO_CLI_VERSION,
+#   NOO_DEMO_KEEP_ON_LEAK, NOO_DEMO_GIF_FPS/WIDTH/RANGE   passed through to the recorder
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -237,7 +238,7 @@ cmd_record() {
   # `docker exec` into the box); that socket is root on this host, and this
   # container is ours and short-lived. The host's docker CLI is mounted in.
   local passenv=() v
-  for v in NOO_DEMO_INSTALL_URL NOO_DEMO_MASK_NAMES NOO_DEMO_CLI_VERSION; do
+  for v in NOO_DEMO_INSTALL_URL NOO_DEMO_MASK_NAMES NOO_DEMO_CLI_VERSION NOO_DEMO_KEEP_ON_LEAK NOO_DEMO_GIF_FPS NOO_DEMO_GIF_WIDTH NOO_DEMO_GIF_RANGE; do
     [ -z "${!v:-}" ] || passenv+=(-e "$v=${!v}")
   done
   # The recorder is capped: vhs's render is the memory peak of a take, and an
