@@ -355,6 +355,21 @@ per token, which overstates rather than understates. A node whose context
 window is below a kind's floor cannot run that kind: its first request is
 refused (vLLM answers 400). The floors are what placement checks a node's window against.
 
+**Placement checks the floor.** `config/harness-kinds.json` declares each
+kind's floor as `min_context_tokens` (`min_context_tokens_slim` for Claude
+Code's slim launch). `noo cluster place <node> harness --kind <kind>` compares
+it with the node's chat window: the running chat placement's own key
+(`VLLM_MAX_MODEL_LEN`, `OLLAMA_CONTEXT_LENGTH`, or llama.cpp's `N_CTX` divided
+by its parallel slots), else the profile's `context`.
+
+- **Below the floor:** refused with the numbers, `noo` named as the kind that
+  fits, and the `noo cluster place … --env` line that raises the window.
+  `--force` places it anyway, with a warning.
+- **Below the floor × 1.25:** placed, with a `tight` warning.
+- **Floor not declared:** never refused. Codex and Claude Code's slim launch
+  are not measured yet. Copilot and Claude Code carry 16 385, the lower bound
+  vLLM reported on awolf on 2026-10-24, until the probe measures them.
+
 Other flags: `--cli <absolute path>` (default: the kind's `cli` on PATH),
 `--test reply|file|both` (default `both`), `--prompt full|slim` (Claude
 Code's full or slim launch; default: the node's profile in real mode, else
