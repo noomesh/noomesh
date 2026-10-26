@@ -60,6 +60,7 @@ use event::{UiEvent, WizardUi};
 /// full-access mode.
 pub(crate) const SECRETS: &[(&str, &str)] = &[
     ("jwt_secret", "NOO_JWT_SECRET"),
+    ("integrations_key", "NOO_INTEGRATIONS_KEY"),
     ("agent_review_key", "NOO_AGENT_REVIEW_KEY"),
     ("controller_secret", "NOO_CONTROLLER_SECRET"),
     ("cluster_secret", "NOO_CLUSTER_SECRET"),

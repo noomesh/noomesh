@@ -75,6 +75,40 @@ remove the publisher's obligations.
 
 ## Configure Noomesh once
 
+### Optional: check the project with the Google Cloud CLI
+
+Install the [Google Cloud CLI](https://docs.cloud.google.com/sdk/docs/install-sdk),
+then run these commands in your own terminal. Sign in with the Google account
+that manages the existing project:
+
+```bash
+gcloud auth login
+gcloud projects describe PROJECT_NUMBER --format='yaml(projectId,projectNumber,name,lifecycleState)'
+gcloud services list --enabled --project=PROJECT_ID
+```
+
+Replace `PROJECT_NUMBER` and use the returned `projectId` for `PROJECT_ID`.
+To enable the two APIs for this test project:
+
+```bash
+gcloud services enable drive.googleapis.com gmail.googleapis.com --project=PROJECT_ID
+```
+
+CLI sign-in authorizes project administration. Users still connect their own
+Google accounts through Noomesh's consent flow. Configure the Web/Desktop
+clients, test users and consent scopes in Google Auth platform as described
+above. The similarly named `gcloud iam oauth-clients` commands manage federated
+workforce/IAP clients; those are separate from this Google-account integration.
+[Workforce OAuth applications](https://docs.cloud.google.com/iam/docs/workforce-manage-oauth-app)
+
+Reusing a project lets you keep its existing application setup. Dedicated
+Noomesh test clients within that project keep callback and credential changes
+separate from PersonifAI or another application. If an old Web client secret
+is unavailable, create a separate test client instead of rotating an existing
+application's secret just to obtain a value for Noomesh.
+
+### Application settings and encrypted secrets
+
 In the installation's `noomesh.yaml`, set the clients you will use. IDs and
 callback URLs are public configuration; keep secrets out of YAML:
 
