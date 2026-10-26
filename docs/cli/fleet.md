@@ -728,6 +728,14 @@ drain_started, drained_at}`.
   `! yielded: vllm paused (foreign 11.2 GB, memory-accounting)`. Yielded and
   held are warnings, not failures, because the node is working as designed.
 - The console's node card shows "GPU in use by other work — vllm paused since …".
+- `noo cluster verify host3` has a `harness tasks` row: what the node's harness
+  holds, from the gateway's `tasks` summary on `/api/cluster/nodes`:
+  `2 running (oldest progress 5m ago), 1 queued (oldest waiting 45s)`, or
+  `none held`. A running task with no progress past the harness's stall bound
+  (`NOO_HARNESS_TASK_STALL_SECS`, 45 minutes by default) or a task queued past
+  30 minutes is a warning with `noo tasks list` as the remedy, never a failure:
+  the harness releases a stalled task itself, and a queue is capacity, not a
+  fault. Child tasks count; parked ones do not.
 
 ## Related guides
 

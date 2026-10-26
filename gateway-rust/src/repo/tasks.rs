@@ -98,6 +98,29 @@ where
     .await
 }
 
+/// Per node, the live tasks it holds (i227 fix 4): (node, running or
+/// checkpointed, open, seconds since the oldest running one's last
+/// progress, seconds the oldest open one has waited). Children count; a
+/// parked task (`budget_state`) and an aggregation parent (`loop_budget` 0)
+/// do not.
+pub async fn holds_by_node<'e, E>(db: E) -> Result<Vec<(String, i64, i64, Option<f64>, Option<f64>)>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        "SELECT node, \
+                COUNT(*) FILTER (WHERE state IN ('running','checkpointed')), \
+                COUNT(*) FILTER (WHERE state = 'open'), \
+                EXTRACT(EPOCH FROM now() - MIN(COALESCE(last_checkpoint, updated_at)) FILTER (WHERE state IN ('running','checkpointed')))::float8, \
+                EXTRACT(EPOCH FROM now() - MIN(updated_at) FILTER (WHERE state = 'open'))::float8 \
+         FROM noo_tasks \
+         WHERE node IS NOT NULL AND state IN ('open','running','checkpointed') AND budget_state IS NULL AND loop_budget > 0 \
+         GROUP BY node",
+    )
+    .fetch_all(db)
+    .await
+}
+
 /// Delete a task that never left `open`.
 pub async fn delete_if_open<'e, E>(db: E, id: Uuid) -> Result<(), sqlx::Error>
 where
