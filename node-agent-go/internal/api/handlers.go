@@ -372,9 +372,9 @@ func (s *Server) handleGPUMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := map[string]any{
-		"available":                  true,
-		"node_id":                    s.cfg.NodeID,
-		"gpu_model":                  s.gpu.DetectModel(),
+		"available": true,
+		"node_id":   s.cfg.NodeID,
+		"gpu_model": s.gpu.DetectModel(),
 	}
 	// A field the probe could not read is absent, never 0.
 	for k, v := range map[string]*float64{
