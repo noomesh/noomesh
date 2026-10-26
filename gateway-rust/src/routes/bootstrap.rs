@@ -18,8 +18,8 @@
 //!
 //! It also used to return `{user} ALL=(ALL) NOPASSWD:ALL` as a
 //! `sudoers_template`, described as "required for hands-off provision".
-//! It was not required: `bootstrap-enroll.sh` never read the field, and
-//! writes its own narrow grant instead (one binary, `noo-apply`, which
+//! It was not required: the enrollment script (since retired; `noo enroll`
+//! replaced it) never read the field, and wrote its own narrow grant instead (one binary, `noo-apply`, which
 //! validates CA signatures itself). Provisioning is pull-based:
 //! the same response's `next_step` says so. So the field bought
 //! nothing and handed any OTHER reader of this endpoint a recipe for
@@ -37,7 +37,7 @@
 //!     the design's design goal is onboarding a host from chat, so the
 //!     coordinator may mint. A minted token is inert until a human runs the
 //!     script on a machine the attacker would already need to control.
-//!   - `POST /api/cluster/bootstrap` and `GET /bootstrap` are PUBLIC
+//!   - `POST /api/cluster/bootstrap` and the `GET /bootstrap/*` script routes are PUBLIC
 //!     (`auth::PUBLIC_PATHS_EXACT`): an unenrolled host has no credential of
 //!     any kind. The
 //!     token in the body IS the authentication; it carries 256 bits of
@@ -81,7 +81,6 @@ pub fn router() -> Router<Arc<AppState>> {
         // ── Public enrollment surface (see module docs + PUBLIC_PATHS_EXACT) ──
         .route("/api/cluster/bootstrap", post(cluster_bootstrap))
         .route("/api/cluster/enroll-tailnet", post(enroll_tailnet))
-        .route("/bootstrap", get(serve_enroll_script))
         .route("/bootstrap/prep", get(serve_prep_script))
         .route("/bootstrap/apply", get(serve_apply_script))
         .route("/bootstrap/ca.crt", get(serve_cluster_ca))
@@ -579,18 +578,6 @@ async fn bootstrap_token_create(
     )
     .await;
 
-    // hash the EXACT script /bootstrap serves so the
-    // paste can verify it before executing — the CA pin (#80) rode the
-    // out-of-band paste, but the script CHECKING that pin arrived over
-    // unverified TLS; a substituted script simply ignores the pin. With
-    // the script hash in the paste too, both pins share the trusted
-    // channel and wholesale substitution dies.
-    let bootstrap_sha256 = crate::paths::resolve(crate::paths::BOOTSTRAP_ENROLL_SCRIPT_CANDIDATES)
-        .and_then(|p| std::fs::read(p).ok())
-        .map(|bytes| {
-            use sha2::{Digest, Sha256};
-            hex::encode(Sha256::digest(&bytes))
-        });
     Ok(Json(json!({
         "status": "ok",
         "id": id.to_string(),
@@ -599,7 +586,6 @@ async fn bootstrap_token_create(
         "node_name": node_name,
         "role_hint": role_hint,
         "allowed_cidr": allowed_cidr,
-        "bootstrap_sha256": bootstrap_sha256,
         // The ONE enrollment paste: install the CLI, then
         // `noo enroll`. The fetched-script `one_liner` that used to ride
         // here is retired; an older CLI falls back to composing
@@ -1188,28 +1174,9 @@ struct EnrollTailnetBody {
     birth_cert: Option<String>,
 }
 
-/// GET /bootstrap — the enrollment script (public, because it runs before
-/// the host has any credential). The script itself does nothing without a
-/// valid TOKEN.
-async fn serve_enroll_script() -> impl IntoResponse {
-    use crate::paths;
-    let Some(path) = paths::resolve(paths::BOOTSTRAP_ENROLL_SCRIPT_CANDIDATES) else {
-        return (StatusCode::NOT_FOUND, "bootstrap enrollment script not found").into_response();
-    };
-    match tokio::fs::read_to_string(&path).await {
-        Ok(content) => (
-            StatusCode::OK,
-            [("content-type", "text/x-shellscript")],
-            content,
-        )
-            .into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "bootstrap enrollment script not found").into_response(),
-    }
-}
-
 /// GET /bootstrap/prep — the ROOT host-prep phase, fetched by
-/// bootstrap-enroll.sh and run under the operator's one attended sudo.
-/// Public for the same reason as `/bootstrap`: it is an inert script from
+/// `noo enroll` and run under the operator's one attended sudo.
+/// Public because the enrolling host has no credential yet: it is an inert script from
 /// the repo; run by nobody but the operator, on a host that has no
 /// credential of any kind yet.
 async fn serve_deenroll_script() -> impl IntoResponse {

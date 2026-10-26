@@ -57,7 +57,7 @@
 //! # What this module deliberately does not do
 //!
 //! It does not mint, sign or validate certificate CHAINS. The birth cert is
-//! self-signed by construction (`bootstrap-enroll.sh` generates it with
+//! self-signed by construction (`noo enroll` generates it, as the retired `bootstrap-enroll.sh` did, with
 //! `openssl req -x509`), and its authority here is that the controller
 //! recorded THIS cert for THIS node at enrollment — not that some CA vouches
 //! for it. Verifying a chain would be a different, weaker claim.
@@ -297,7 +297,7 @@ mod tests {
     use rsa::RsaPrivateKey;
 
     // Two real birth keypairs, generated once with the same openssl invocation
-    // `bootstrap-enroll.sh` uses (RSA, self-signed, /CN=noo-birth-<host>) and
+    // `noo enroll` uses (RSA, self-signed, /CN=noo-birth-<host>) and
     // committed as fixtures. Minting a 4096-bit key per test run would add
     // seconds to every `cargo test`; the SHAPE is what is under test, and 2048
     // is the same shape.

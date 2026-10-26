@@ -3,7 +3,8 @@
 
 //! `noo enroll` — the binary is the enroller.
 //!
-//! Compiled port of scripts/bootstrap-enroll.sh plus the tailscale join the
+//! Compiled port of the shell enroller (scripts/bootstrap-enroll.sh, served
+//! at `GET /bootstrap`, retired) plus the tailscale join the
 //! unified paste used to inline. The operator's paste shrinks to
 //! `noo enroll noo1.<blob>`; every step the shell rail fetched over
 //! unverified TLS either moves into this binary (which arrived over an
@@ -18,8 +19,9 @@
 //!   6. root prep from EMBEDDED assets (PREP_TOOLS_DIR) — the CA anchor is
 //!      still fetched but hard-verified against the blob's pin
 //!
-//! The shell paste remains a fully supported fallback
-//! CLIs); prep-host.sh serves both lanes.
+//! The shell lane is gone (the script and `GET /bootstrap` are retired);
+//! prep-host.sh, still served at `/bootstrap/prep`, is the root prep this
+//! command runs.
 
 use std::io::Write as _;
 use std::path::Path;

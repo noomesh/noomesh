@@ -5030,7 +5030,7 @@ mod tests {
     }
 
     /// The full pull-lane crypto path: a birth keypair exactly as
-    /// bootstrap-enroll.sh generates it, encrypt exactly as provision does,
+    /// `noo enroll` generates it, encrypt exactly as provision does,
     /// decrypt exactly as noo-fetch does. Skips when openssl is absent.
     #[test]
     fn cms_round_trips_the_bundle() {
@@ -5041,7 +5041,7 @@ mod tests {
         let work = std::env::temp_dir().join(format!("noo-cms-rt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(&work).unwrap();
-        // Birth keypair, same invocation as bootstrap-enroll.sh.
+        // Birth keypair, same invocation as `noo enroll`.
         assert!(Command::new("openssl")
             .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-sha256", "-days", "1",
                    "-keyout"]).arg(work.join("birth.key"))

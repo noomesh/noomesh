@@ -132,9 +132,6 @@ SKIP_PARTS = {"target", "node_modules", ".git", "__pycache__", "tests"}
 
 # path -> why a hit there is legitimate. A stale entry fails, so the list cannot rot.
 ALLOWED = {
-    "scripts/bootstrap-enroll.sh": "the ONE unverified request of the shell enrollment lane: it fetches the "
-    "public CA certificate (/bootstrap/ca.crt), checks its sha256 against the paste's pin, and sends the token and "
-    "fetches the root prep script only under --cacert of that CA (tests/test_prep_tofu_is_pinned.py enforces both)",
     "docker/Dockerfile.sandbox": "HEALTHCHECK probe of localhost inside the per-call sandbox namespace; "
     "operator-deferred 2026-09-29 (tests/test_healthchecks_verify_tls.py)",
     "scripts/noomesh-sandbox.sh": "sandbox smoke helper probing https://localhost:8080/health in the "

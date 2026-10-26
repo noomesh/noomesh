@@ -264,8 +264,7 @@ COPY --from=builder /noo-gateway-built /usr/local/bin/noo-gateway
 # this container can execute them any more (no shell, and `Command::new`
 # appears nowhere in the binary). The ones that must be present are the
 # pull-rail node tooling paths.rs resolves and the gateway SERVES over HTTP:
-# bootstrap-enroll.sh (GET /bootstrap), prep-host.sh (/bootstrap/prep),
-# noo-apply.sh, noo-fetch.sh and deenroll-node-local.sh. The rest are run by
+# prep-host.sh (/bootstrap/prep), noo-apply.sh, noo-fetch.sh and deenroll-node-local.sh. The rest are run by
 # the HOST, outside this container.
 #
 # --chmod replaces the old `RUN chmod +x`, which is not available without a
