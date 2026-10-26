@@ -3636,9 +3636,7 @@ const STAGED_PKI_DIRS: [&str; 2] = ["/tmp/pki", "/app/pki"];
 /// HOST path the launcher exported, so it only wins when it
 /// actually holds a `ca.crt`; see `resolve_pki_dir_in`.
 fn pki_dir_candidates() -> Vec<String> {
-    std::env::var("NOO_PKI_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
+    crate::tls::pki_dir().map(|p| p.to_string_lossy().into_owned())
         .into_iter()
         .chain(STAGED_PKI_DIRS.iter().map(|s| s.to_string()))
         .collect()
