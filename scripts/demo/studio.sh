@@ -5,7 +5,7 @@
 # The film studio: shoot the onboarding film in a throwaway "stranger" box.
 #
 #   scripts/demo/studio.sh up                  # make the box (Ubuntu 24.04 + its own Docker)
-#   scripts/demo/studio.sh record [--smoke] [--speed N]   # film it; GIF + MP4 land in demo-out/
+#   scripts/demo/studio.sh record [--smoke] [--speed N] [--down-after]   # film it; GIF + MP4 land in demo-out/; --down-after removes the box when done
 #   scripts/demo/studio.sh shell               # look around inside the box
 #   scripts/demo/studio.sh status
 #   scripts/demo/studio.sh down                # delete the box and its Docker volume
@@ -227,6 +227,17 @@ cmd_up() {
 
 cmd_record() {
   need_docker
+  # --down-after: the box comes down when the recorder exits, pass or fail
+  # (the outputs are on the host in demo-out/, never in the box). For a take
+  # on a shared host: take 12 left its box up for 35 hours because the
+  # session that started it went idle. The cache container stays (it is
+  # small and not a dind); `cache down` is its own call.
+  local down_after=0 args=()
+  local a
+  for a in "$@"; do
+    case "$a" in --down-after) down_after=1 ;; *) args+=("$a") ;; esac
+  done
+  set -- "${args[@]}"
   box_exists || die "no box; run '$0 up' first"
   box_is_ours || die "container $BOX is not a film box (no label noo-demo-box=1); refusing to use it"
   box_running || die "the box is stopped; '$0 down' and '$0 up' for a fresh one"
@@ -254,6 +265,12 @@ cmd_record() {
       scripts/demo/record-onboarding.sh "$@"; rc=$?
       chown -R "'"$(id -u):$(id -g)"'" demo-out 2>/dev/null || true
       exit $rc' _ "$@"
+  local rc=$?
+  if [ "$down_after" -eq 1 ]; then
+    echo "record --down-after: taking the box down (recorder exit $rc)"
+    cmd_down
+  fi
+  return "$rc"
 }
 
 cmd_down() {

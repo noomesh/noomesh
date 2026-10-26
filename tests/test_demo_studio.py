@@ -304,3 +304,15 @@ def test_every_recorder_knob_reaches_the_recorder_container():
     rec = (DEMO / "record-onboarding.sh").read_text()
     used = set(re.findall(r"NOO_DEMO_(?!BOX\b|SANDBOX\b|HOSTNAME\b|MASK\b)[A-Z_]+", rec))
     assert used <= set(passed), f"recorder knobs the studio never passes: {sorted(used - set(passed))}"
+
+
+def test_record_down_after_removes_the_box_whatever_the_recorder_returned():
+    """Take 12's box stayed up for 35 hours on a shared host after the
+    session that started it went idle. `record --down-after` takes the box
+    down when the recorder exits, pass or fail, and still returns the
+    recorder's status; the flag never reaches the recorder."""
+    studio = (DEMO / "studio.sh").read_text()
+    body = studio.split("cmd_record() {", 1)[1].split("\n}\n", 1)[0]
+    assert "--down-after) down_after=1" in body and 'set -- "${args[@]}"' in body, "the flag is stripped before the recorder sees it"
+    assert "local rc=$?" in body and body.index("local rc=$?") < body.index("cmd_down") < body.index('return "$rc"')
+    assert "--down-after" in studio.split("record [--smoke]", 1)[1].split("\n", 1)[0], "the usage line names it"
