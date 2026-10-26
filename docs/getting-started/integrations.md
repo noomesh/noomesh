@@ -56,6 +56,14 @@ projects for testing and production.
 | Desktop helper | **Desktop app** | `desktop_client_id` |
 | Browser console | **Web application**; authorized redirect URI exactly `https://YOUR-CONSOLE/api/connections/oauth/callback` | `web_client_id`, `web_redirect_uri` and encrypted web client secret |
 
+For both Noomesh integration clients, select **Use this client for an
+AI-powered agent**. These clients are intended to authorize agent workflows
+that retrieve Google context on the user's behalf. The designation does not
+grant extra scopes or permissions. Google documents it as a creation-time
+setting; choose it before creating each client. Keep any future conventional
+Google login client separate from these integration clients.
+[Google client setup](https://developers.google.com/workspace/guides/create-credentials)
+
 Use the console's actual browser origin, including a non-default port. This
 implementation requires HTTPS for the web path. Google must accept that
 hostname; arbitrary LAN IPs and `.local` names are unsuitable for web clients.
