@@ -101,3 +101,12 @@ def test_a_count_after_a_secret_label_is_not_masked_but_a_value_is():
     assert mask("  Secrets: 24 values\n") == "  Secrets: 24 values\n"
     assert mask("Admin password: hunter2xyz\n") == "Admin password: ********\n"
     assert mask("password: 1234\n") == "password: ********\n"
+
+
+def test_an_environment_variable_name_after_a_secret_label_stays_on_screen():
+    """"secrets … moved to files under /etc/noo/agent-secrets: NOO_NODE_AGENT_TOKEN
+    NOO_CLUSTER_SECRET" (take 13): the names are the information; a value is still masked."""
+    line = "noo-apply: secrets in /etc/x moved to files under /etc/y: NOO_NODE_AGENT_TOKEN NOO_CLUSTER_SECRET\n"
+    assert mask(line) == line
+    assert mask("token: s3cr3t_value_here\n") == "token: ********\n"
+    assert mask("api key: ABCDEF1234567890\n") == "api key: ********\n"

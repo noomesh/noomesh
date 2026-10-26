@@ -39,5 +39,9 @@ cat > "$raw"
   grep -oE 'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{16,}|noo-ent1\.[A-Za-z0-9._-]+' "$raw" | sed 's/^/token\t/'  # leak-ok: the masking regex for token shapes, not a token
   grep -oE '[A-Za-z0-9.-]+\.ts\.net' "$raw" | sed 's/^/tsnet\t/'
   grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]+' "$raw" | grep -viE '@(noomesh\.ai|example\.com)$' | sed 's/^/email\t/' || true
-  grep -oiE '(pass(word|phrase)?|token|secret|api[_ -]?key|credential)s?( is)?[ ]*[:=][ ]*[^ ]+' "$raw" | sed -E 's/^[^:=]*[:=][ ]*//' | grep -v '^\*\{8\}' | grep -E '^.{6,}$' | sed 's/^/label\t/' || true
+  # A value that is an ENVIRONMENT VARIABLE NAME (upper case with underscores:
+  # "secrets … moved to files: NOO_NODE_AGENT_TOKEN") names a secret, it is not
+  # one; take 13 (2026-10-26) was deleted because that name, matched case-
+  # insensitively, is also in Compose's own warning text.
+  grep -oiE '(pass(word|phrase)?|token|secret|api[_ -]?key|credential)s?( is)?[ ]*[:=][ ]*[^ ]+' "$raw" | sed -E 's/^[^:=]*[:=][ ]*//' | grep -v '^\*\{8\}' | grep -E '^.{6,}$' | grep -vE '^[A-Z][A-Z0-9]*(_[A-Z0-9]+)+$' | sed 's/^/label\t/' || true
 } | grep -viE $'\t(node-[0-9]+|you|server)?$' | sort -u || true
