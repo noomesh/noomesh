@@ -64,6 +64,7 @@ mod authz;
 mod birth_proof;
 mod bus;
 mod bus_principal;
+mod harness_fit;
 mod harness_kinds;
 mod harness_profile;
 mod harness;

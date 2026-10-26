@@ -4049,6 +4049,45 @@ pub(crate) fn fit_specs(existing: &[StoredPlacement], replacing: Option<(&str, &
     specs
 }
 
+/// The fit of harness `kind` on `node_id` (i226 phase B): the node's
+/// running chat placements' smallest window against the kind's floor, with
+/// the profile (tier default and overrides) deciding the window where a
+/// placement sets none and whether Claude Code runs its slim launch. Also
+/// the chat placement to raise, `(backend, model)`.
+async fn harness_kind_fit(
+    state: &AppState,
+    node_id: &str,
+    kind: &crate::harness_kinds::HarnessKind,
+    existing: &[StoredPlacement],
+) -> (crate::harness_fit::Fit, Option<(String, String)>) {
+    let chats: Vec<&StoredPlacement> = existing
+        .iter()
+        .filter(|p| p.backend != "harness" && p.desired_state == "running" && p.role == "chat")
+        .collect();
+    let record: Value = match state.js.get_key_value("mesh_nodes").await {
+        Ok(kv) => match kv.get(node_id).await {
+            Ok(Some(e)) => serde_json::from_slice::<Value>(&e).unwrap_or_else(|_| json!({})),
+            _ => json!({}),
+        },
+        Err(_) => json!({}),
+    };
+    let tier = crate::node_tier::derive(&crate::node_tier::facts_from_capabilities(record.get("capabilities").unwrap_or(&json!({}))))
+        .tier()
+        .and_then(|t| u8::try_from(t).ok());
+    let overrides = crate::repo::cluster::node_harness_profile_overrides(&state.db, node_id).await.unwrap_or_else(|_| json!({}));
+    let profile = crate::harness_profile::resolve(tier, &overrides, None, None);
+    let window = crate::harness_fit::node_window(chats.iter().map(|p| (p.backend.as_str(), &p.env)), profile.context);
+    let floor = crate::harness_fit::kind_floor(kind, profile.claude_prompt == "slim");
+    // The placement whose window decided: the smallest one.
+    let chat = chats
+        .iter()
+        .filter_map(|p| crate::harness_fit::chat_window(&p.backend, &p.env, profile.context).map(|w| (w.0, p)))
+        .min_by_key(|(n, _)| *n)
+        // No model name, no `noo cluster place` line to suggest.
+        .and_then(|(_, p)| p.model.clone().filter(|m| !m.is_empty()).map(|m| (p.backend.clone(), m)));
+    (crate::harness_fit::judge(floor, window), chat)
+}
+
 async fn stored_placements(state: &AppState, node_id: &str) -> Result<Vec<StoredPlacement>, AppError> {
     let rows: Vec<(String, String, Option<String>, Value, String, Option<String>)> = sqlx::query_as(
         "SELECT backend, role, model, env, desired_state, target FROM noo_backend_placements WHERE node_id = $1 ORDER BY backend, role",
@@ -4304,6 +4343,25 @@ async fn placement_put(
                 }
             }
             fit_json = after.to_json();
+        }
+    }
+
+    // i226 phase B: does the harness kind fit the node's chat window? A
+    // kind whose first request is larger than the window fails on its first
+    // model call (every vendor kind on awolf's 16k vLLM, 2026-10-24); say so
+    // here, with the numbers and what fits.
+    if desired == "running" && backend == "harness" {
+        let kind = body.env.as_ref().and_then(|e| e.get("NOO_HARNESS_KIND")).and_then(|k| k.as_str()).unwrap_or("noo").to_string();
+        if let Some(row) = crate::harness_kinds::get(&kind) {
+            let existing = stored_placements(&state, &node_id).await?;
+            let (fit, chat) = harness_kind_fit(&state, &node_id, row, &existing).await;
+            if let Some(msg) = crate::harness_fit::message(&node_id, &kind, &fit, chat.as_ref().map(|(b, m)| (b.as_str(), m.as_str()))) {
+                match fit {
+                    crate::harness_fit::Fit::Short { .. } if !body.force => return Err(AppError::Conflict(msg)),
+                    crate::harness_fit::Fit::Short { .. } => fit_warnings.push(format!("forced past a window too small for the kind: {msg}")),
+                    _ => fit_warnings.push(msg),
+                }
+            }
         }
     }
 

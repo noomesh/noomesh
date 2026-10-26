@@ -50,6 +50,14 @@ pub struct HarnessKind {
     /// a manual install, or no CLI at all.
     #[serde(default)]
     pub distribution: Option<Distribution>,
+    /// The kind's prompt floor in tokens: its CLI's first request to the
+    /// model, before any work (i226 phase B; `harness probe` measures it).
+    /// `None` = not measured, so placement never refuses the kind for it.
+    #[serde(default)]
+    pub min_context_tokens: Option<u64>,
+    /// The same for `launch_slim`.
+    #[serde(default)]
+    pub min_context_tokens_slim: Option<u64>,
 }
 
 /// noomesh platform facts (`linux`/`macos`, `x86_64`/`aarch64`) → the
