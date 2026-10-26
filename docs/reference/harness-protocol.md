@@ -84,6 +84,7 @@ The node agent sets all of this from the placement.
 | `NOO_HARNESS_TURN_TIMEOUT_SECS` | a foreign CLI's wall-clock limit per invocation (default 900) |
 | `NOO_HARNESS_STALL_SECS` | how long a foreign CLI may go without reaching the model through the wire translator before it is killed as stalled, with the reason in the loop note (default 300; a chat turn uses the smaller of this and 120). A hung CLI no longer runs to the wall-clock limit three loops in a row |
 | `NOO_HARNESS_DRAIN_SECS` | on SIGTERM, how long the harness gives the turns and tasks it holds to finish before it exits (default 120, 1 to 3600). It takes no new work from the moment of the signal. The shipped unit's `TimeoutStopSec` and the Mac plist's `ExitTimeOut` are 150 |
+| `NOO_HARNESS_TASK_STALL_SECS` | a task the harness holds that makes no progress (no checkpoint since it was taken or since its last one) for this long is aborted, its slot freed, and reported on `harness.ready.<node>` as `{"stalled": [ids], "stall_secs": N}`; the gateway fails each one that is live on that node with `stalled: …` (default 2700, at least 600) |
 | `NOO_HARNESS_WORKDIR` | where the driver makes each task's workspace (default: the process temp dir, which the shipped unit makes private) |
 | `NOO_HARNESS_KEEP_WORKDIR` | `1` keeps a task's workspace after it ends, for debugging |
 
