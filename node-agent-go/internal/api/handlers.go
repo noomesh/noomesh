@@ -375,11 +375,18 @@ func (s *Server) handleGPUMetrics(w http.ResponseWriter, r *http.Request) {
 		"available":                  true,
 		"node_id":                    s.cfg.NodeID,
 		"gpu_model":                  s.gpu.DetectModel(),
+	}
+	// A field the probe could not read is absent, never 0.
+	for k, v := range map[string]*float64{
 		"gpu_utilization_percent":    metrics.GPUUtilizationPct,
 		"memory_utilization_percent": metrics.MemoryUtilizationPct,
 		"memory_used_mb":             metrics.MemoryUsedMB,
 		"memory_total_mb":            metrics.MemoryTotalMB,
 		"temperature_c":              metrics.TemperatureC,
+	} {
+		if v != nil {
+			resp[k] = *v
+		}
 	}
 	if metrics.PowerDrawW != nil {
 		resp["power_draw_w"] = *metrics.PowerDrawW
