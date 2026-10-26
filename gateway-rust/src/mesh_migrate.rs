@@ -2157,7 +2157,22 @@ ALTER TABLE noo_embedding_spaces
     ADD COLUMN IF NOT EXISTS migration_started_at timestamptz,
     ADD COLUMN IF NOT EXISTS migration_reported_at timestamptz
 "#,
+}, Migration {
+    revision: PG_STAT_STATEMENTS_REVISION,
+    down_revision: Some(EMBEDDING_SPACE_MIGRATION_REVISION),
+    // The compose already PRELOADS pg_stat_statements (postgres `command`),
+    // but nothing ever created the extension, so the view did not exist and
+    // a hot query could not be named. Installed here because this chain
+    // runs as the migration DSN's role (`noo`, the cluster superuser —
+    // `CREATE EXTENSION` of this untrusted extension needs one; see
+    // `migration_dsn`). Idempotent. Created in `public` on purpose: the
+    // view is read by operators, not by the mesh schema.
+    sql: "CREATE EXTENSION IF NOT EXISTS pg_stat_statements SCHEMA public",
 }];
+
+/// Creates the `pg_stat_statements` view the preloaded library feeds. A
+/// constant so a renumber at rebase is one line.
+pub const PG_STAT_STATEMENTS_REVISION: &str = "103_pg_stat_statements";
 
 /// The embedding-space migration revision (i150). A constant so a renumber
 /// at rebase is one line.
@@ -3057,15 +3072,26 @@ mod tests {
             .contains("(node_id, backend, role, (CASE WHEN role = 'embed' THEN model ELSE '' END))"));
     }
 
-    /// i150: the migration columns are the chain head, on the embed-placement revision, all nullable
+    /// The pg_stat_statements revision is the chain head, sits on 102, and is
+    /// idempotent DDL.
+    #[test]
+    fn pg_stat_statements_revision_is_the_head_and_idempotent() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == PG_STAT_STATEMENTS_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "103_pg_stat_statements");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(EMBEDDING_SPACE_MIGRATION_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(PG_STAT_STATEMENTS_REVISION), "the chain head");
+        assert!(m.sql.contains("CREATE EXTENSION IF NOT EXISTS pg_stat_statements"));
+    }
+
+    /// i150: the migration columns sit on the embed-placement revision, all nullable
     /// (no row changes), and `embedding_spaces::load` reads every one.
     #[test]
-    fn embedding_space_migration_revision_is_the_head_and_adds_nullable_columns() {
+    fn embedding_space_migration_revision_adds_nullable_columns() {
         let m = MIGRATIONS.iter().find(|m| m.revision == EMBEDDING_SPACE_MIGRATION_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "102_embedding_space_migration");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(EMBED_PLACEMENT_MODEL_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(EMBEDDING_SPACE_MIGRATION_REVISION), "the chain head");
         for col in [
             "next_model text", "next_dims integer", "migration_state text", "migration_progress jsonb",
             "migration_started_at timestamptz", "migration_reported_at timestamptz",
