@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlenv"
 )
 
 // Op is one host operation the gateway may request.
@@ -227,7 +229,7 @@ func opRecreate(ctx context.Context, e *Engine, name string, c *Command) (int, s
 // there is none, which callers treat as "cannot verify".
 func (e *Engine) clusterCAPath() string {
 	candidates := []string{
-		os.Getenv("NOO_TLS_CA"),
+		ctrlenv.TLSCA(),
 		"/etc/noo/pki/ca.crt",
 		filepath.Join(e.Root, "pki", "ca.crt"),
 	}

@@ -21,6 +21,7 @@ import (
 	"github.com/nats-io/nats.go"
 
 	nodeconfig "github.com/noomesh/noomesh/node-agent-go/internal/config"
+	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlenv"
 	"github.com/noomesh/noomesh/node-agent-go/internal/logship"
 )
 
@@ -752,7 +753,7 @@ func buildNATSTLS() (*tls.Config, error) {
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
 
 	// Load CA cert
-	caPath := os.Getenv("NOO_TLS_CA")
+	caPath := ctrlenv.TLSCA()
 	if caPath != "" {
 		caPEM, err := os.ReadFile(caPath)
 		if err != nil {
@@ -766,8 +767,8 @@ func buildNATSTLS() (*tls.Config, error) {
 	}
 
 	// Load client cert for mTLS
-	certPath := os.Getenv("NOO_TLS_CERT")
-	keyPath := os.Getenv("NOO_TLS_KEY")
+	certPath := ctrlenv.TLSCert()
+	keyPath := ctrlenv.TLSKey()
 	if certPath != "" && keyPath != "" {
 		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 		if err != nil {

@@ -104,7 +104,7 @@ func TestLiveDockerSmoke(t *testing.T) {
 
 	// Package-level logs helper — verifies the multiplex-header stripping
 	// still lines up with what the new client returns.
-	lines, err := c.ContainerLogs(name, 10, "")
+	lines, err := c.ContainerLogs(context.Background(), name, 10, "")
 	if err != nil {
 		t.Fatalf("ContainerLogs: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestLiveDockerSmoke(t *testing.T) {
 	}
 
 	// listContainers unwrap helper + typed Summary.State conversion.
-	infos, err := c.ListContainers()
+	infos, err := c.ListContainers(context.Background())
 	if err != nil {
 		t.Fatalf("ListContainers: %v", err)
 	}
@@ -132,5 +132,5 @@ func TestLiveDockerSmoke(t *testing.T) {
 
 	// Stats path: listContainers + ContainerStats against whatever is
 	// running on the host (must not error or panic; may be empty).
-	_ = c.AllContainerStats()
+	_ = c.AllContainerStats(context.Background())
 }

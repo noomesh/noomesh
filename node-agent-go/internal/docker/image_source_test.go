@@ -376,14 +376,14 @@ func TestStartPathsGoThroughEnsureImage(t *testing.T) {
 
 	t.Run("containers API", func(t *testing.T) {
 		asked := recordEnsure(t)
-		_, err := c.StartManagedContainer(ContainerStartRequest{Image: "noo-browser:latest", ContainerName: "noo-browser-abc", NetworkMode: "bridge"})
+		_, err := c.StartManagedContainer(context.Background(), ContainerStartRequest{Image: "noo-browser:latest", ContainerName: "noo-browser-abc", NetworkMode: "bridge"})
 		if !errors.Is(err, errSentinelEnsure) || len(*asked) != 1 || (*asked)[0] != "noo-browser:latest" {
 			t.Fatalf("err %v asked %v", err, *asked)
 		}
 	})
 	t.Run("skills", func(t *testing.T) {
 		asked := recordEnsure(t)
-		_, err := c.RunSkillContainer(SkillRunRequest{Image: "busybox", ContainerName: "noo-skill-1", NetworkMode: "none"})
+		_, err := c.RunSkillContainer(context.Background(), SkillRunRequest{Image: "busybox", ContainerName: "noo-skill-1", NetworkMode: "none"})
 		if !errors.Is(err, errSentinelEnsure) || len(*asked) != 1 {
 			t.Fatalf("err %v asked %v", err, *asked)
 		}
@@ -391,7 +391,7 @@ func TestStartPathsGoThroughEnsureImage(t *testing.T) {
 	t.Run("profile pull (client.go)", func(t *testing.T) {
 		asked := recordEnsure(t)
 		t.Setenv("VLLM_IMAGE", "")
-		err := c.PullProfile("ollama")
+		err := c.PullProfile(context.Background(), "ollama")
 		if !errors.Is(err, errSentinelEnsure) || len(*asked) != 1 || (*asked)[0] != "ollama/ollama:0.40.5" {
 			t.Fatalf("err %v asked %v", err, *asked)
 		}
@@ -416,7 +416,7 @@ func TestStartPathsGoThroughEnsureImage(t *testing.T) {
 		asked := recordEnsure(t)
 		t.Setenv("NOO_IMAGE_PREFIX", "ghcr.io/noomesh")
 		t.Setenv("NOO_IMAGE_TAG", "v0.2.103")
-		err := c.StartBackendSDK("ollama", "", 0, StartOverrides{Image: "ollama/ollama:0.40.5@sha256:" + strings.Repeat("a", 64)})
+		err := c.StartBackendSDK(context.Background(), "ollama", "", 0, StartOverrides{Image: "ollama/ollama:0.40.5@sha256:" + strings.Repeat("a", 64)})
 		if !errors.Is(err, errSentinelEnsure) || len(*asked) != 1 {
 			t.Fatalf("err %v asked %v", err, *asked)
 		}

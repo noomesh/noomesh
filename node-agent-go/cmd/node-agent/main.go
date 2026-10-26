@@ -29,6 +29,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/agent"
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
+	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlenv"
 	"github.com/noomesh/noomesh/node-agent-go/internal/preseed"
 )
 
@@ -107,9 +108,9 @@ func main() {
 		// pool — so an agent deployed without NOO_TLS_CA checks that the
 		// thing on its port presents exactly the certificate it serves,
 		// instead of accepting anything at all.
-		anchor, anchorFrom := os.Getenv("NOO_TLS_CA"), "NOO_TLS_CA"
+		anchor, anchorFrom := ctrlenv.TLSCA(), "NOO_TLS_CA"
 		if anchor == "" {
-			anchor, anchorFrom = os.Getenv("NOO_TLS_CERT"), "NOO_TLS_CERT (self-pinned)"
+			anchor, anchorFrom = ctrlenv.TLSCert(), "NOO_TLS_CERT (self-pinned)"
 		}
 		if anchor == "" {
 			fmt.Fprintln(os.Stderr, "healthcheck: neither NOO_TLS_CA nor NOO_TLS_CERT is set — nothing to verify the agent's TLS certificate against")
@@ -128,8 +129,8 @@ func main() {
 		tlsCfg.RootCAs = pool
 		// When mTLS is enabled the agent's own server cert doubles as its
 		// client cert — it satisfies its own CA, so it can talk to itself.
-		certPath := os.Getenv("NOO_TLS_CERT")
-		keyPath := os.Getenv("NOO_TLS_KEY")
+		certPath := ctrlenv.TLSCert()
+		keyPath := ctrlenv.TLSKey()
 		if certPath != "" && keyPath != "" {
 			if cert, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil {
 				tlsCfg.Certificates = []tls.Certificate{cert}

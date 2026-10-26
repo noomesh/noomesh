@@ -100,8 +100,8 @@ type Server struct {
 
 // nativeBackends is the set served natively on this host, backend -> model.
 // Empty on every platform without a native lane; never nil-panics.
-func (s *Server) nativeBackends() map[string]string {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+func (s *Server) nativeBackends(ctx context.Context) map[string]string {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	return s.native.Running(ctx)
 }

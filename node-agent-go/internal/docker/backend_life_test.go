@@ -4,6 +4,7 @@
 package docker
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -66,10 +67,10 @@ func TestContainerLifeWithoutAStartTimeIsNotReported(t *testing.T) {
 // A client with no daemon reports nothing (the heartbeat omits the key).
 func TestBackendContainersWithoutDockerIsNil(t *testing.T) {
 	var c *Client
-	if c.BackendContainers() != nil {
+	if c.BackendContainers(context.Background()) != nil {
 		t.Error("nil client must report nil")
 	}
-	if (&Client{}).BackendContainers() != nil {
+	if (&Client{}).BackendContainers(context.Background()) != nil {
 		t.Error("client without docker must report nil")
 	}
 }

@@ -60,8 +60,8 @@ func managedDataMounts(containers []container.Summary) map[string][]string {
 // ManagedDataMounts asks docker which host paths each running managed
 // backend container mounts. An empty map is "none running";
 // an error is "could not look".
-func (c *Client) ManagedDataMounts() (map[string][]string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func (c *Client) ManagedDataMounts(ctx context.Context) (map[string][]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	containers, err := c.listContainers(ctx, client.ContainerListOptions{})
 	if err != nil {

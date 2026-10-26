@@ -249,8 +249,8 @@ func (r *Reconciler) MCP() *mcpsrv.Supervisor { return r.mcp }
 
 // nativeBackends is the set this node serves outside Docker, backend -> model.
 // Empty (never nil-panicking) on every platform without a native lane.
-func (r *Reconciler) nativeBackends() map[string]string {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+func (r *Reconciler) nativeBackends(ctx context.Context) map[string]string {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	return r.native.Running(ctx)
 }
@@ -468,7 +468,7 @@ func (r *Reconciler) ensureModelsDir(ctx context.Context, t *tick) bool {
 // by a process this agent does not own.
 func (r *Reconciler) discoverNative(ctx context.Context, t *tick) bool {
 	// 2. Converge placements.
-	t.running = r.docker.RunningBackends()
+	t.running = r.docker.RunningBackends(ctx)
 	// Backends served NATIVELY on this node (darwin: an ollama the operator
 	// runs for Metal access, which Docker on a Mac cannot reach). They are
 	// reported to the controller and routed to like any other backend, but
@@ -483,7 +483,7 @@ func (r *Reconciler) discoverNative(ctx context.Context, t *tick) bool {
 	// explicit, and it is logged rather than silent, because "the controller
 	// asked for this and the node did not do it" is exactly the kind of
 	// divergence that must never be inferred from an absence of output.
-	t.native = r.nativeBackends()
+	t.native = r.nativeBackends(ctx)
 	return true
 }
 
@@ -493,12 +493,12 @@ func (r *Reconciler) readFloatingRefs(ctx context.Context, t *tick) bool {
 	// Spec-drift signal: the fingerprint we stamped on each running
 	// backend's container (SpecHashLabel), so a changed placement env /
 	// image / port / tls (not just model) triggers a recreate.
-	t.specLabels = r.docker.BackendLabels(dockerpkg.SpecHashLabel)
+	t.specLabels = r.docker.BackendLabels(ctx, dockerpkg.SpecHashLabel)
 	// Backends still running on a floating ref (`:latest`, no tag) that an
 	// older agent created. The spec hash cannot see it — a placement with
 	// no image of its own hashes the same whichever ref the agent picked —
 	// so it is its own drift signal: recreated once from the pinned ref.
-	t.floating = r.docker.FloatingBackendImages()
+	t.floating = r.docker.FloatingBackendImages(ctx)
 	return true
 }
 
@@ -560,7 +560,7 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 		}
 		if _, ok := t.running[p.Backend]; ok {
 			slog.Info("reconcile.stopping_backend", "backend", p.Backend)
-			if err := r.docker.StopBackend(p.Backend); err != nil {
+			if err := r.docker.StopBackend(ctx, p.Backend); err != nil {
 				slog.Warn("reconcile.stop_failed", "backend", p.Backend, "error", err)
 			}
 		}
@@ -575,13 +575,13 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 				// MODEL is the placement's. Pull it over the same
 				// loopback API the probe uses.
 				// Every role's model, not just the primary.
-				r.ensureOllamaModels(r.cfg.NodeID, t.ollamaRows, r.native.HasModel, r.native.Pull)
+				r.ensureOllamaModels(ctx, r.cfg.NodeID, t.ollamaRows, r.native.HasModel, r.native.Pull)
 				// Advertise what the server holds, not only what it
 				// has loaded: an idle ollama has nothing loaded, and a
 				// heartbeat with no model is never routed to.
 				var held []string
 				for _, row := range t.ollamaRows {
-					hctx, hcancel := context.WithTimeout(context.Background(), 5*time.Second)
+					hctx, hcancel := context.WithTimeout(ctx, 5*time.Second)
 					if has, err := r.native.HasModel(hctx, row.Model); err == nil && has {
 						held = append(held, row.Model)
 					}
@@ -620,7 +620,7 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 				// The container is up with OLLAMA_MODEL set; that says
 				// nothing about whether the weights are there. Pull the
 				// tag if the container lacks it (off-tick; see ollamaPulls).
-				r.ensureOllamaModels(r.cfg.NodeID, t.ollamaRows, r.docker.OllamaHasModel, r.docker.OllamaPull)
+				r.ensureOllamaModels(ctx, r.cfg.NodeID, t.ollamaRows, r.docker.OllamaHasModel, r.docker.OllamaPull)
 			}
 			curHash, hasLabel := t.specLabels[p.Backend]
 			switch decideBackendDrift(hasLabel, curHash, desiredHash, r.driftRecreated[p.Backend], t.floating[p.Backend]) {
@@ -692,7 +692,7 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			slog.Warn("reconcile.stopping_misconfigured_backend",
 				"backend", p.Backend,
 				"reason", "model is not a gguf file")
-			if err := r.docker.StopBackend(p.Backend); err != nil {
+			if err := r.docker.StopBackend(ctx, p.Backend); err != nil {
 				slog.Warn("reconcile.stop_failed",
 					"backend", p.Backend, "error", err)
 			}
@@ -742,7 +742,7 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			Target:      p.Target,
 			MemoryLimit: p.MemoryLimitBytes,
 		}
-		if err := r.docker.StartBackend(p.Backend, p.Model, 0, overrides); err != nil {
+		if err := r.docker.StartBackend(ctx, p.Backend, p.Model, 0, overrides); err != nil {
 			slog.Error("reconcile.start_failed",
 				"backend", p.Backend, "error", err)
 			// A drift recreate that never happened must be retried:
@@ -815,6 +815,7 @@ func gpuPlacements(ps []placement) []gpuyield.Placed {
 // loopback API). The bookkeeping is shared — a model is one pull however it
 // is served.
 func (r *Reconciler) ensureOllamaModel(
+	ctx context.Context,
 	node string,
 	key string,
 	p placement,
@@ -829,8 +830,8 @@ func (r *Reconciler) ensureOllamaModel(
 	if role == "" {
 		role = "chat"
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	hasIt, err := has(ctx, model)
+	hctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	hasIt, err := has(hctx, model)
 	cancel()
 	if err != nil {
 		// Could not ask: unknown, not absent.
@@ -845,7 +846,7 @@ func (r *Reconciler) ensureOllamaModel(
 	}
 	// The container is up and the model is not in it. Report that, whatever
 	// happens next: ACTUAL must not read Running for a node that 404s.
-	importOnly := r.resolveImportOnly(model)
+	importOnly := r.resolveImportOnly(ctx, model)
 	modelpresence.Set(key, modelpresence.Entry{Model: model, Role: role, Present: false, ImportOnly: importOnly})
 	if importOnly {
 		// Published through the controller's store (harrier), not the public
@@ -853,7 +854,7 @@ func (r *Reconciler) ensureOllamaModel(
 		// Import it from the store instead — the same fetch-verify-create
 		// `noo cluster import-model` runs. Until 2026-10-10 reconcile only
 		// logged the remedy every tick and left the placement stuck.
-		r.startOllamaImport(node, key, model, role)
+		r.startOllamaImport(ctx, node, key, model, role)
 		return
 	}
 	r.pullMu.Lock()
@@ -872,7 +873,9 @@ func (r *Reconciler) ensureOllamaModel(
 	slog.Info("reconcile.ollama_pull_start", "model", model,
 		"detail", "placement names a registry tag the container does not hold yet")
 	go func() {
-		out, err := pull(context.Background(), model)
+		// ctx is the Run context (agent lifetime), not the tick: the pull
+		// outlives the pass but still stops at shutdown.
+		out, err := pull(ctx, model)
 		r.pullMu.Lock()
 		defer r.pullMu.Unlock()
 		st.inFlight = false
@@ -893,12 +896,12 @@ func (r *Reconciler) ensureOllamaModel(
 // that could not be asked (timeout, transport) falls back to what an
 // earlier answer said, and otherwise to "not import-only" — the registry
 // pull this node did before the store existed.
-func (r *Reconciler) resolveImportOnly(model string) bool {
+func (r *Reconciler) resolveImportOnly(ctx context.Context, model string) bool {
 	if r.storeHas == nil {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	in, err := r.storeHas(ctx, model)
+	sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	in, err := r.storeHas(sctx, model)
 	cancel()
 	r.pullMu.Lock()
 	defer r.pullMu.Unlock()
@@ -926,7 +929,7 @@ func importRemedy(node, model, role string) string {
 // store, off the tick, with the same one-in-flight + backoff bookkeeping as
 // a registry pull. A failure is recorded as a placement_model refusal with
 // the reason and the manual remedy, and logged loudly every time it fails.
-func (r *Reconciler) startOllamaImport(node, key, model, role string) {
+func (r *Reconciler) startOllamaImport(ctx context.Context, node, key, model, role string) {
 	fix := importRemedy(node, model, role)
 	if r.importModel == nil {
 		slog.Error("reconcile.ollama_model_import_only_missing",
@@ -955,9 +958,11 @@ func (r *Reconciler) startOllamaImport(node, key, model, role string) {
 		// Bounded: the import's own fetch allows 60 min per file and the
 		// create 30 min; this caps the whole thing so a wedged import
 		// cannot hold the in-flight slot forever.
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
+		// ctx is the Run context, so the import outlives the pass but stops
+		// at shutdown.
+		ictx, cancel := context.WithTimeout(ctx, 2*time.Hour)
 		defer cancel()
-		out, err := r.importModel(ctx, model)
+		out, err := r.importModel(ictx, model)
 		r.pullMu.Lock()
 		defer r.pullMu.Unlock()
 		st.inFlight = false

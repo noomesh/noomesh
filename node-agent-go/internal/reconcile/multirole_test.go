@@ -132,7 +132,7 @@ func TestEnsureOllamaModels_BothRolesReported(t *testing.T) {
 	asked := map[string]bool{}
 	has := func(_ context.Context, m string) (bool, error) { asked[m] = true; return true, nil }
 	pull := func(context.Context, string) (string, error) { return "", nil }
-	keep := r.ensureOllamaModels("host6", []placement{embedHarrier(), chatGemma()}, has, pull)
+	keep := r.ensureOllamaModels(context.Background(), "host6", []placement{embedHarrier(), chatGemma()}, has, pull)
 	if !asked["gemma4:26b-a4b-it-qat"] || !asked["harrier"] {
 		t.Fatalf("ensure asked %v, want both models", asked)
 	}

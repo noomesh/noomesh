@@ -37,7 +37,7 @@ func harrierPlacement() placement {
 func TestImportOnlyModelMissing_ReportedNeverPulled(t *testing.T) {
 	r := presenceFixture(t, true)
 	pulled := make(chan string, 1)
-	r.ensureOllamaModel("host9", "ollama", harrierPlacement(),
+	r.ensureOllamaModel(context.Background(), "host9", "ollama", harrierPlacement(),
 		func(context.Context, string) (bool, error) { return false, nil },
 		func(_ context.Context, m string) (string, error) { pulled <- m; return "", nil })
 
@@ -63,7 +63,7 @@ func TestRegistryModelMissing_StillPulledAndReportedAbsent(t *testing.T) {
 	r := presenceFixture(t, false)
 	pulled := make(chan string, 1)
 	p := placement{Backend: "ollama", Model: "gemma3:1b", DesiredState: "running"}
-	r.ensureOllamaModel("host9", "ollama", p,
+	r.ensureOllamaModel(context.Background(), "host9", "ollama", p,
 		func(context.Context, string) (bool, error) { return false, nil },
 		func(_ context.Context, m string) (string, error) { pulled <- m; return "success", nil })
 	select {
@@ -83,7 +83,7 @@ func TestRegistryModelMissing_StillPulledAndReportedAbsent(t *testing.T) {
 func TestModelPresent_ReportedAndClearsRefusal(t *testing.T) {
 	r := presenceFixture(t, true)
 	refusals.Record("placement_model", "ollama", "stale")
-	r.ensureOllamaModel("host9", "ollama", harrierPlacement(),
+	r.ensureOllamaModel(context.Background(), "host9", "ollama", harrierPlacement(),
 		func(context.Context, string) (bool, error) { return true, nil },
 		func(context.Context, string) (string, error) { t.Fatal("pulled a present model"); return "", nil })
 	got := modelpresence.Report()["ollama"]
@@ -99,7 +99,7 @@ func TestModelPresent_ReportedAndClearsRefusal(t *testing.T) {
 func TestModelCheckFailure_IsUnknownNotAbsent(t *testing.T) {
 	r := presenceFixture(t, true)
 	modelpresence.Set("ollama", modelpresence.Entry{Model: "harrier", Present: false})
-	r.ensureOllamaModel("host9", "ollama", harrierPlacement(),
+	r.ensureOllamaModel(context.Background(), "host9", "ollama", harrierPlacement(),
 		func(context.Context, string) (bool, error) { return false, errors.New("noo-ollama is not running") },
 		func(context.Context, string) (string, error) { return "", nil })
 	if _, ok := modelpresence.Report()["ollama"]; ok {

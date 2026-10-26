@@ -278,6 +278,7 @@ func runningOllama(all []placement) []placement {
 // placement (all roles) under its presence key, and returns the set of keys
 // that are wanted (for modelpresence.Retain).
 func (r *Reconciler) ensureOllamaModels(
+	ctx context.Context,
 	node string,
 	ps []placement,
 	has func(context.Context, string) (bool, error),
@@ -292,7 +293,7 @@ func (r *Reconciler) ensureOllamaModels(
 	for _, p := range ordered {
 		key := presenceKey(p.Backend, p, primary, ordered)
 		keep[key] = true
-		r.ensureOllamaModel(node, key, p, has, pull)
+		r.ensureOllamaModel(ctx, node, key, p, has, pull)
 	}
 	return keep
 }
