@@ -288,7 +288,8 @@ def test_cleanup_runs_as_the_executor_then_sweeps(monkeypatch, tmp_path):
 
 
 def test_kill_everything_of_signals_only_that_uid(monkeypatch, tmp_path):
-    for pid, uid in (("100", 65605), ("101", 65532), ("102", 65605), ("notapid", 65605)):
+    # 101 is the server (sandbox-server, 65590): never one of the call's.
+    for pid, uid in (("100", 65605), ("101", 65590), ("102", 65605), ("notapid", 65605)):
         d = tmp_path / pid
         d.mkdir()
         (d / "status").write_text(f"Name:\tx\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
@@ -326,6 +327,10 @@ def test_health_reports_the_executor(monkeypatch):
     _with_executor(monkeypatch)
     h = sandbox.health()
     assert h["executor"] == {"uid": 65600, "slots": 64, "detail": "sandbox-exec (uids 65600-65663)"}
+    # The server's own uid, which `noo cluster verify` judges against the
+    # key's reader (sandbox-server, a uid no other service shares).
+    monkeypatch.setattr(sandbox.os, "getuid", lambda: 65590)
+    assert sandbox.health()["server"] == {"uid": 65590}
 
 
 # ── process mode, live ──────────────────────────────────────────────────
