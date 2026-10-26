@@ -41,7 +41,7 @@ type Options struct {
 	// (Certificates). It is cloned, never modified.
 	TLS *tls.Config
 	// Sign puts the cluster credential on the upgrade request.
-	Sign func(*http.Request)
+	Sign func(*http.Request) error
 	// Handler serves each stream in-process: the agent's mux.
 	Handler http.Handler
 	// Verifier checks the controller's signature on the challenge.
@@ -100,7 +100,7 @@ func New(opt Options) (*Client, error) {
 		opt.NotOfferedRetry = 10 * time.Minute
 	}
 	if opt.Sign == nil {
-		opt.Sign = func(*http.Request) {}
+		opt.Sign = func(*http.Request) error { return nil }
 	}
 	return &Client{opt: opt, leaf: leaf, wsURL: "wss://" + u.Host + strings.TrimRight(u.Path, "/") + Path}, nil
 }
@@ -218,7 +218,9 @@ func (c *Client) dial(ctx context.Context) (*websocket.Conn, *http.Response, err
 	if err != nil {
 		return nil, nil, err
 	}
-	c.opt.Sign(probe)
+	if err := c.opt.Sign(probe); err != nil {
+		return nil, nil, err
+	}
 	hdr := http.Header{}
 	for k, vs := range probe.Header {
 		for _, v := range vs {

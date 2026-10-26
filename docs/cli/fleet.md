@@ -239,13 +239,11 @@ says `fallback: true`. A name that is no node of this mesh is refused with
 keep the request on that node alone: a node serving no chat is then refused
 with 422, one that does not serve the model you named with 409, and nothing
 ever goes elsewhere. The `legacy lanes` row of
-`noo cluster verify --controller` includes `cluster_hmac_v1`: the callers (a
-node by name, from the gateway's counters and from each agent's heartbeat)
-still signing the old, replayable cluster token instead of the request-bound
-v2; it reads 0 once every node has upgraded, and only then is it safe to set
-`NOO_CLUSTER_TOKEN_V1=0` (see the node-agent security page; the next
-`noo cluster provision` / `noo upgrade --nodes` bundle then carries the closed gate to
-every node). `noo cluster
+`noo cluster verify --controller` shows `cluster_hmac_v1_refused`: the callers
+(a node by name, from the gateway's counters and from each agent's heartbeat)
+still signing the old, replayable cluster token, which is now always refused
+(see the node-agent security page); it warns while any count is non-zero and
+names the callers, and `noo upgrade --nodes` fixes them. `noo cluster
 verify --controller` has a `model classes` row for candidates that are neither
 running nor pulled where they are declared.
 

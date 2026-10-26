@@ -41,6 +41,8 @@ NOT_DELIVERED = {
     "NOO_GATEWAY_TLS_CHECK_HOSTNAME": "retired noo_gateway toggle: from_env refuses it",
     "NOO_GATEWAY_SHARED_SECRET_FALLBACK": "retired noo_gateway rung: from_env refuses it",
     "NOO_SELF_CALL_SHARED_SECRET": "retired bridge (#371): a shared secret never buys inference",
+    "NOO_CLUSTER_TOKEN_V1": "retired gate: a v1 cluster token is always refused",
+    "NOO_CLUSTER_TOKEN_SIGN": "retired agent pin: nodes sign v2 only",
 }
 
 
@@ -169,3 +171,19 @@ def test_the_gateway_retires_the_self_call_posture_row() -> None:
     keys = re.findall(r'"([A-Z0-9_]+)"', m.group(1))
     assert "NOO_NATS_LEGACY_SHARED_CREDS" in keys, f"parse found {keys}"
     assert "NOO_SELF_CALL_SHARED_SECRET" in keys, f"RETIRED_INERT_KEYS is {keys}"
+
+
+def test_the_gateway_retires_the_v1_cluster_token_posture_row() -> None:
+    """The live controller holds a stored NOO_CLUSTER_TOKEN_V1=0 row. After an
+    upgrade it must not break boot or `posture list`: it is a
+    RETIRED_INERT_KEYS entry (boot deletes it at a closed value, warns while
+    set on), exactly like the self-call bridge. Behavioural half:
+    posture.rs `the_v1_cluster_token_row_is_retired_inert_not_a_bridge`."""
+    src = (ROOT / "gateway-rust" / "src" / "posture.rs").read_text()
+    m = re.search(r"pub const RETIRED_INERT_KEYS: &\[&str\] = &\[(.*?)\];", src, re.S)
+    assert m, "RETIRED_INERT_KEYS not found in posture.rs"
+    keys = re.findall(r'"([A-Z0-9_]+)"', m.group(1))
+    assert len(keys) >= 3 and "NOO_CLUSTER_TOKEN_V1" in keys, f"RETIRED_INERT_KEYS is {keys}"
+    # ...and the key is no longer a catalog key (nothing reads it).
+    catalog = src.split("pub const POSTURE_CATALOG")[1].split("\n];")[0]
+    assert 'key: "NOO_CLUSTER_TOKEN_V1"' not in re.sub(r"//[^\n]*", "", catalog)

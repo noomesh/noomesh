@@ -1331,7 +1331,10 @@ func fetchArtifactManifest(ctx context.Context, kind, name string) *artifactMani
 	}
 	if secret := nodeconfig.Load().ClusterSecret; secret != "" {
 		nodeID := os.Getenv("NODE_ID")
-		auth.SetClusterAuth(req, nodeID, secret)
+		if err := auth.SetClusterAuth(req, nodeID, secret); err != nil {
+			slog.Warn("artifact manifest request not signed; not sent", "error", err)
+			return nil
+		}
 	}
 	transport, err := nodeconfig.Load().HTTPTransport()
 	if err != nil {

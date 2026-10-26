@@ -277,8 +277,7 @@ func (s *Server) registerRoutes() {
 	// enrollment — only meaningful on the controller's self-agent. Both are
 	// the controller's: whois answers "who is this tailnet IP" for any IP
 	// it is asked about, which a peer node holding the fleet secret must not
-	// be able to enumerate (it was leaf-or-token only, counted as the
-	// whois_non_controller lane until nothing but the controller used it).
+	// be able to enumerate (it was leaf-or-token only).
 	s.mux.Handle("GET /tailnet/whois", ctrlMW(http.HandlerFunc(s.handleTailnetWhois)))
 	s.mux.Handle("POST /tailnet/dialback", ctrlMW(http.HandlerFunc(s.handleTailnetDialback)))
 	s.mux.Handle("GET /metrics", metricsMW(http.HandlerFunc(s.handlePrometheusMetrics)))

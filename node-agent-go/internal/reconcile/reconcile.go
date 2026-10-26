@@ -1276,7 +1276,9 @@ func (r *Reconciler) fetch(ctx context.Context) (*desiredConfig, error) {
 		return nil, err
 	}
 	if r.cfg.ClusterSecret != "" {
-		auth.SetClusterAuth(req, r.cfg.NodeID, r.cfg.ClusterSecret)
+		if err := auth.SetClusterAuth(req, r.cfg.NodeID, r.cfg.ClusterSecret); err != nil {
+			return nil, err
+		}
 	}
 	resp, err := r.client.Do(req)
 	if err != nil {

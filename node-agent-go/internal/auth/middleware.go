@@ -252,11 +252,12 @@ func HasValidToken(cfg *config.Config, r *http.Request) bool {
 }
 
 // checkClusterToken is the one door for a bearer that might be a cluster
-// token, v1 or v2. A v2 token is verified against THIS request (method,
-// target, body) and its nonce is spent; a v1 token is accepted and counted
-// (LaneHMACv1) until NOO_CLUSTER_TOKEN_V1=0 closes it, when it is refused with
-// a reason that names the fix. refusal is non-empty only for an explained
-// refusal; an ordinary bad token is (false, "", "").
+// token. A v2 token is verified against THIS request (method, target, body)
+// and its nonce is spent. A v1-shaped token that verifies is ALWAYS refused
+// (counted as LaneHMACv1Refused) with a reason that names the fix; the v1
+// admission lane and its NOO_CLUSTER_TOKEN_V1 gate are deleted. refusal is
+// non-empty only for an explained refusal; an ordinary bad token is
+// (false, "", "").
 func checkClusterToken(token, secret string, r *http.Request) (bool, string, string) {
 	if IsV2Token(token) {
 		body, err := bufferBody(r)
@@ -269,20 +270,19 @@ func checkClusterToken(token, secret string, r *http.Request) (bool, string, str
 		ok, actor := verifyClusterTokenV2(token, secret, r, body)
 		return ok, actor, ""
 	}
+	// The HMAC is still checked so the counted caller is a real actor, never
+	// attacker-chosen text; nothing it proves is ever admitted.
 	ok, actor := verifyClusterToken(token, secret)
 	if !ok {
 		return false, "", ""
 	}
-	if !V1Allowed() {
-		noteHMACv1Refused(actor, r)
-		return false, "", "v1 cluster tokens are refused here (NOO_CLUSTER_TOKEN_V1=0); upgrade the calling node so it signs v2 (`noo update`), or set NOO_CLUSTER_TOKEN_V1=1 on this node while the fleet rolls"
-	}
-	noteHMACv1(actor, r)
-	return true, actor, ""
+	noteHMACv1Refused(actor, r)
+	return false, "", "v1 cluster tokens are refused; upgrade the calling node so it signs v2 (`noo upgrade --nodes` from the controller)"
 }
 
 // verifyClusterToken verifies a v1 HMAC cluster token (not request-bound;
-// see clustertoken_v2.go for the bound form).
+// see clustertoken_v2.go for the bound form) ONLY so a refusal can name a
+// real caller; a v1 token is never admitted.
 //
 // Token format: "<node_id>:<timestamp>:<hex_signature>"
 // The signature is HMAC-SHA256 over "node_id:timestamp" with the cluster secret.
@@ -323,18 +323,6 @@ func verifyClusterToken(token, secret string) (bool, string) {
 // route; the node refuses them even with a valid signature.
 func IsCLIActor(actor string) bool {
 	return actor == "cli" || strings.HasPrefix(actor, "cli-")
-}
-
-// CreateClusterToken generates an HMAC cluster token for outbound requests.
-//
-// Matches Python cluster_auth.create_cluster_token().
-func CreateClusterToken(nodeID, secret string) string {
-	ts := fmt.Sprintf("%d", time.Now().Unix())
-	message := fmt.Sprintf("%s:%s", nodeID, ts)
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write([]byte(message))
-	sig := hex.EncodeToString(mac.Sum(nil))
-	return fmt.Sprintf("%s:%s:%s", nodeID, ts, sig)
 }
 
 func parseTimestamp(s string) (time.Time, error) {

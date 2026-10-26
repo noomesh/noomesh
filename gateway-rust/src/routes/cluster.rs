@@ -364,7 +364,7 @@ async fn node_heartbeat(
     // `data root` row reads it. Replaced whole on every beat.
     carry_reported(&mut data, &body, "data_roots");
     // Legacy credential lanes the agent admitted since it started
-    // `{since_unix, static_token, whois_non_controller}`.
+    // `{since_unix, static_token, cluster_hmac_v1_refused}`.
     // `noo cluster verify --controller`'s `legacy lanes` row reads it.
     carry_reported(&mut data, &body, "legacy_lanes");
     // Whether the agent admits the gateway's leaf with no bearer. Written EVERY beat, false when absent: unlike the reports
@@ -6506,7 +6506,7 @@ mod heartbeat_carry_tests {
         assert!(body_of("async fn node_register_body(").contains("carry_reported(&mut data, &body, \"legacy_lanes\")"),
             "node_register_body does not carry legacy_lanes");
         let mut data = json!({"id": "host3"});
-        carry_reported(&mut data, &json!({"legacy_lanes": {"since_unix": 1_790_000_000, "static_token": 3, "whois_non_controller": 0}}), "legacy_lanes");
+        carry_reported(&mut data, &json!({"legacy_lanes": {"since_unix": 1_790_000_000, "static_token": 3, "cluster_hmac_v1_refused": 0}}), "legacy_lanes");
         assert_eq!(data["legacy_lanes"]["static_token"], 3);
     }
 

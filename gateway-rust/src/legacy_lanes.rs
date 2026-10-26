@@ -3,20 +3,22 @@
 
 //! Legacy credential lanes, OBSERVED.
 //!
-//! Two ways in are still ADMITTED, kept only for callers nobody has proven
+//! One way in is still ADMITTED, kept only for callers nobody has proven
 //! are gone; the rest of what this module counts is refusals and comparators:
 //!
 //! | lane | what happens |
 //! |---|---|
 //! | `node_token_no_cert` | ADMITTED: a fleet-secret HMAC resolving to `ClusterKind::Node` with no client certificate on the connection (mTLS not enforcing) |
-//! | `cluster_hmac_v1` | ADMITTED: a fleet-secret HMAC in the v1 wire form, which is not bound to its request (the v2 form is the comparator `cluster_hmac_v2`); refused once `NOO_CLUSTER_TOKEN_V1=0`, and then counted as `cluster_hmac_v1_refused` instead |
+//! | `cluster_hmac_v1_refused` | REFUSED: a fleet-secret HMAC in the v1 wire form (not bound to its request) answers `401 cluster_token_v1_refused`; the v2 form is the comparator `cluster_hmac_v2`. The v1 admission lane and its `NOO_CLUSTER_TOKEN_V1` gate are deleted |
 //! | `self_call_shared_secret_refused` | REFUSED: a fleet-secret HMAC on the inference surface (`/v1/*`, `/api/external/*`). The shared secret never buys inference; the `NOO_SELF_CALL_SHARED_SECRET` bridge that once could is deleted |
 //! | `cli_shared_secret_refused` | REFUSED: a controller-secret HMAC signed by an old `noo` CLI (`controller_door`) |
 //! | `controller_shared_secret_refused`, `fleet_secret_off_node_refused`, `fleet_token_no_cert_refused`, `addon_shared_secret_refused` | REFUSED: see `controller_hmac_refusal.rs` and `addon_hmac_refusal.rs` |
 //! | `node_token_with_cert`, `cluster_hmac_v2`, `addon_exchanged_token`, `operator_client_cert` | comparators: the good case of the lane they sit beside |
-//! | (node side) `static_token` / `whois_non_controller` | reported by each node agent on its heartbeat as `legacy_lanes` |
+//! | (node side) `static_token`, `cluster_hmac_v1_refused` | reported by each node agent on its heartbeat as `legacy_lanes` |
 //!
-//! Retired lanes, no longer counted: `self_call_shared_secret` (the
+//! Retired lanes, no longer counted: `cluster_hmac_v1` (v1 admissions: the
+//! `NOO_CLUSTER_TOKEN_V1` gate was closed fleet-wide 2026-10-26 and the lane
+//! deleted; only `cluster_hmac_v1_refused` remains, for one release), `self_call_shared_secret` (the
 //! `NOO_SELF_CALL_SHARED_SECRET` bridge: 0 uses live, and the fleet door
 //! refuses the inference surface before the bridge could be consulted) and
 //! `cluster_hmac_non_inference` (a shared-secret HMAC resolving to
@@ -69,17 +71,13 @@ pub const LANE_ADDON_EXCHANGED: &str = "addon_exchanged_token";
 /// token bound to it — the replacement for the CLI's `cli-posture` HMAC
 /// (now refused as `cli_shared_secret_refused`).
 pub const LANE_OPERATOR_CERT: &str = "operator_client_cert";
-/// A fleet-secret HMAC in the v1 wire form (`<actor>:<ts>:<hmac>`): signed
-/// over actor and time only, so a captured header replays on any route for
-/// five minutes. Admitted while `NOO_CLUSTER_TOKEN_V1` is open; every count
-/// is a caller that still has to upgrade to v2. Admissions only: when the
-/// gate is closed the token is counted as [`LANE_HMAC_V1_REFUSED`] instead.
-pub const LANE_HMAC_V1: &str = "cluster_hmac_v1";
-/// REFUSED, not admitted: a v1 cluster token after `NOO_CLUSTER_TOKEN_V1=0`
-/// closed the gate. Every count is a caller (by name) whose calls all fail
-/// until it signs v2.
+/// REFUSED, not admitted: a fleet-secret HMAC in the v1 wire form
+/// (`<actor>:<ts>:<hmac>`, signed over actor and time only, so a captured
+/// header replays on any route for five minutes). The v1 lane and its
+/// `NOO_CLUSTER_TOKEN_V1` gate are deleted; v1 is always refused. Every count
+/// is a caller (by name) whose calls all fail until it signs v2.
 pub const LANE_HMAC_V1_REFUSED: &str = "cluster_hmac_v1_refused";
-/// Comparator: the request-bound v2 form, the replacement for [`LANE_HMAC_V1`].
+/// Comparator: the request-bound v2 form, the only form admitted.
 pub const LANE_HMAC_V2: &str = "cluster_hmac_v2";
 /// REFUSED, not admitted: a controller-secret HMAC signed by the `noo` CLI
 /// (`operator_auth::is_cli_actor`). Every count is an old `noo` binary that
@@ -230,15 +228,7 @@ pub fn operator_cert_use(operator: &str, path: &str) -> LaneUse {
     }
 }
 
-/// A fleet-secret HMAC admitted in the v1 form.
-pub fn hmac_v1_use(actor: &str, path: &str) -> LaneUse {
-    LaneUse {
-        lane: LANE_HMAC_V1,
-        labels: vec![("caller", bounded_name("caller", actor)), ("route_class", route_class(path).into())],
-    }
-}
-
-/// A fleet-secret HMAC in the v1 form, refused because the gate is closed.
+/// A fleet-secret HMAC in the v1 form, refused.
 pub fn hmac_v1_refused_use(actor: &str, path: &str) -> LaneUse {
     LaneUse {
         lane: LANE_HMAC_V1_REFUSED,
@@ -315,7 +305,7 @@ pub fn log_due(key: &str, every: Duration) -> bool {
 pub const NODE_NO_CERT_LOG_EVERY: Duration = Duration::from_secs(3600);
 /// How often the inference-surface refusal WARN repeats per (door, caller).
 pub const SELF_CALL_REFUSED_LOG_EVERY: Duration = Duration::from_secs(600);
-/// How often the v1-token INFO repeats per caller.
+/// How often the v1-token refusal WARN repeats per caller.
 pub const HMAC_V1_LOG_EVERY: Duration = Duration::from_secs(3600);
 /// How often the v1 request detail (method, path, body-hash header, token
 /// age) repeats per caller: often enough to catch an intermittent sender.
@@ -356,14 +346,14 @@ pub async fn observe(metrics: &crate::metrics::MetricsState, uses: &[LaneUse], p
                     );
                 }
             }
-            LANE_HMAC_V1 => {
-                let key = format!("{LANE_HMAC_V1}|{}", u.label("caller"));
+            LANE_HMAC_V1_REFUSED => {
+                let key = format!("{LANE_HMAC_V1_REFUSED}|{}", u.label("caller"));
                 if log_due(&key, HMAC_V1_LOG_EVERY) {
-                    tracing::info!(
+                    tracing::warn!(
                         caller = u.label("caller"), route_class = u.label("route_class"), peer = %peer.describe(),
-                        "legacy lane: a v1 cluster token (not bound to its request) — that caller must upgrade \
-                         to sign v2 (once per caller per hour; the count is \
-                         noo_legacy_lane_uses_total{{lane=\"cluster_hmac_v1\"}})"
+                        "REFUSED: a v1 cluster token (not bound to its request) — that caller must upgrade \
+                         to sign v2 (`noo upgrade --nodes`) (once per caller per hour; the count is \
+                         noo_legacy_lane_uses_total{{lane=\"cluster_hmac_v1_refused\"}})"
                     );
                 }
             }
@@ -469,8 +459,8 @@ mod tests {
         assert!(!out.contains("cluster_hmac_non_inference") && !out.contains(r#"lane="self_call_shared_secret""#), "a refusal is not an admitted use: {out}");
     }
 
-    /// A v1 token refused at a closed gate is its own lane: the admitted
-    /// `cluster_hmac_v1` series does not move.
+    /// A refused v1 token is counted on its own lane; there is no admitted
+    /// `cluster_hmac_v1` series any more.
     #[tokio::test]
     async fn a_refused_v1_token_is_not_counted_as_admitted() {
         let out = rendered(&[hmac_v1_refused_use("pop-os", "/api/cluster/nodes/pop-os/heartbeat")]).await;

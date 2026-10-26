@@ -193,8 +193,11 @@ def test_no_profile_names_a_bridge_key() -> None:
     A bridge is closed by `--include-bridges`, which reads the safe value from
     the catalog — never by a profile.
     """
+    # The catalog holds no bridge since NOO_CLUSTER_TOKEN_V1 was deleted, so
+    # the set may be empty; the parse itself must not be (a parser that lost
+    # the whole table would pass this vacuously).
+    assert _rust_catalog(), "parsed no catalog entries — the classification is not doing anything"
     bridges = set(_rust_bridge_keys())
-    assert bridges, "parsed no bridge keys — the classification is not doing anything"
     profiles = _profile_keys()
     assert profiles, "parsed no profiles"
     for profile, keys in profiles.items():
@@ -207,19 +210,19 @@ def test_no_profile_names_a_bridge_key() -> None:
         )
 
 
-def test_the_known_bridges_are_classified_as_bridges() -> None:
-    """Pinned by name, because these are the ones with a live incident behind
-    them. Reclassifying one as a Gate silently re-arms R43."""
-    bridges = set(_rust_bridge_keys())
-    for key in ("NOO_CLUSTER_TOKEN_V1",):
-        assert key in bridges, (
-            f"{key} is a compatibility bridge, not a gate — a profile that "
-            "sets it breaks a half-migrated fleet"
-        )
-    # ...and the gates must stay gates, or `hardened` hardens nothing.
+def test_the_deleted_v1_cluster_token_gate_is_in_neither_runtime() -> None:
+    """NOO_CLUSTER_TOKEN_V1 was the last bridge. It is deleted (v1 cluster
+    tokens are always refused): not a catalog key in either runtime, listed as a
+    RETIRED_INERT_KEYS entry so a stored row is deleted at boot, and the
+    remaining catalog entries are all gates, so `hardened` still hardens."""
+    key = "NOO_CLUSTER_TOKEN_V1"
+    assert _rust_keys() and _python_keys(), "parsed nothing"
+    assert key not in _rust_keys() and key not in _python_keys()
+    inert = re.search(r"pub const RETIRED_INERT_KEYS: &\[&str\] = &\[(.*?)\];", RUST.read_text(), re.S)
+    assert inert and f'"{key}"' in inert.group(1), "RETIRED_INERT_KEYS must list the deleted gate"
     gates = set(_rust_gate_keys())
-    for key in ("NOO_EXEC_APPROVAL_MODE", "NOO_MCP_EXTERNAL_ENABLED"):
-        assert key in gates, f"{key} must be a gate so every profile sets it"
+    for k in ("NOO_EXEC_APPROVAL_MODE", "NOO_MCP_EXTERNAL_ENABLED"):
+        assert k in gates, f"{k} must be a gate so every profile sets it"
 
 
 def test_retired_bridges_are_in_neither_runtime() -> None:

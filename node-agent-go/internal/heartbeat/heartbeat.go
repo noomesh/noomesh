@@ -326,7 +326,10 @@ func (r *Reporter) Register(caps hardware.Capabilities, hostIP string) bool {
 		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
-	r.setAuthHeader(req)
+	if err := r.setAuthHeader(req); err != nil {
+		slog.Error("registration not sent: cannot sign", "error", err)
+		return false
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -462,7 +465,10 @@ func (r *Reporter) SendHeartbeat() {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	r.setAuthHeader(req)
+	if err := r.setAuthHeader(req); err != nil {
+		r.noteOutcome(clk, err)
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -550,10 +556,11 @@ func (r *Reporter) Run(ctx context.Context) {
 	}
 }
 
-func (r *Reporter) setAuthHeader(req *http.Request) {
+func (r *Reporter) setAuthHeader(req *http.Request) error {
 	if r.cfg.ClusterSecret != "" {
-		auth.SetClusterAuth(req, r.cfg.NodeID, r.cfg.ClusterSecret)
+		return auth.SetClusterAuth(req, r.cfg.NodeID, r.cfg.ClusterSecret)
 	}
+	return nil
 }
 
 // agentURL builds this agent's control-API URL for registration.

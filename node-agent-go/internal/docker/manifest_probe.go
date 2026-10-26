@@ -115,7 +115,9 @@ func lookupArtifactManifestWithin(ctx context.Context, kind, name string, timeou
 	}
 	if secret := nodeconfig.Load().ClusterSecret; secret != "" {
 		nodeID := os.Getenv("NODE_ID")
-		auth.SetClusterAuth(req, nodeID, secret)
+		if err := auth.SetClusterAuth(req, nodeID, secret); err != nil {
+			return nil, fmt.Errorf("sign manifest request: %w", err)
+		}
 	}
 	transport, err := nodeconfig.Load().HTTPTransport()
 	if err != nil {
