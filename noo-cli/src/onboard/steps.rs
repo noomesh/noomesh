@@ -3225,8 +3225,56 @@ fn ensure_pki(ctx: &mut Ctx) {
                 ctx.raw(&format!("    {}: {:04o} → {:04o} ({})", f.rel, f.before, f.after, f.reader.describe()));
             }
         }
-        for f in fixes.iter().filter(|f| f.needs.is_some()) {
-            ctx.warn(&format!("{} is not readable by its container uid ({}); run: {}", f.rel, f.reader.describe(), f.needs.as_deref().unwrap_or_default()));
+        // i266: a key this process could not hand to its container uid is
+        // 0644 (fail open) with the sudo line printed. A fresh `--ci` install
+        // on a box with no setfacl left 32 such keys readable by every local
+        // account, reported success, and only `cluster verify` said so.
+        // With sudo usable the grant is made here and verified; without it
+        // the run says so plainly and does not complete.
+        let outstanding: Vec<crate::pki::KeyFix> = fixes.iter().filter(|f| f.needs.is_some()).cloned().collect();
+        let interactive = !ctx.non_interactive && ctx.ui.inherit_stdio() && super::prompt::stdin_is_tty();
+        let sudo_usable = !outstanding.is_empty() && (interactive || passwordless_sudo());
+        match crate::pki::key_grant_plan(outstanding.len(), sudo_usable) {
+            crate::pki::KeyGrantPlan::Nothing => {}
+            crate::pki::KeyGrantPlan::Sudo => {
+                ctx.progress(&format!("Handing {} private key(s) to their container uid through sudo...", outstanding.len()));
+                let mut done = 0usize;
+                for f in &outstanding {
+                    let key = ctx.pki_dir.join(&f.rel);
+                    match f.reader {
+                        crate::pki::KeyReader::ContainerUid(uid) if f.needs.as_deref().is_some_and(|n| n.starts_with("sudo chgrp")) => {
+                            match crate::pki::grant_read_to_uid_via_sudo(&key, uid, !interactive) {
+                                Ok(()) => done += 1,
+                                Err(cmd) => ctx.warn(&format!("{} is not readable by its container uid ({}); run: {cmd}", f.rel, f.reader.describe())),
+                            }
+                        }
+                        _ => ctx.warn(&format!("{} ({}); run: {}", f.rel, f.reader.describe(), f.needs.as_deref().unwrap_or_default())),
+                    }
+                }
+                if done > 0 {
+                    ctx.success(&format!("{done} private key(s) handed to their container uid (0640, group = uid) through sudo"));
+                }
+                // Verified, not assumed: the audit the scan and `cluster verify` use.
+                let still: Vec<String> = ca
+                    .audit_key_modes()
+                    .into_iter()
+                    .filter(|i| outstanding.iter().any(|f| f.rel == i.rel) && matches!(i.kind, crate::pki::KeyIssueKind::Exposed | crate::pki::KeyIssueKind::Unreadable))
+                    .map(|i| i.rel)
+                    .collect();
+                if !still.is_empty() {
+                    let text = crate::pki::exposed_keys_failure(still.len());
+                    ctx.error(&text);
+                    ctx.state.hard_failures.push(text);
+                }
+            }
+            crate::pki::KeyGrantPlan::Loud => {
+                for f in &outstanding {
+                    ctx.warn(&format!("{} is not readable by its container uid ({}); run: {}", f.rel, f.reader.describe(), f.needs.as_deref().unwrap_or_default()));
+                }
+                let text = crate::pki::exposed_keys_failure(outstanding.len());
+                ctx.error(&text);
+                ctx.state.hard_failures.push(text);
+            }
         }
     }
 
@@ -5540,16 +5588,23 @@ pub(crate) fn hostd_install_decision(interactive: bool, sudo_quiet: bool) -> Hos
     }
 }
 
+/// `sudo -n true`: sudo works here without a prompt (a cloud image's
+/// default user, a CI box, the film's box). What a non-interactive run may
+/// elevate with: hostd's install (i251), the private-key grants (i266).
+pub(crate) fn passwordless_sudo() -> bool {
+    Command::new("sudo")
+        .args(["-n", "true"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 fn hostd_can_run_here(ctx: &mut Ctx) -> bool {
     let interactive = !ctx.non_interactive && ctx.ui.inherit_stdio() && super::prompt::stdin_is_tty();
-    let sudo_quiet = !interactive
-        && Command::new("sudo")
-            .args(["-n", "true"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+    let sudo_quiet = !interactive && passwordless_sudo();
     match hostd_install_decision(interactive, sudo_quiet) {
         HostdInstall::Interactive => true,
         HostdInstall::PasswordlessSudo => {
