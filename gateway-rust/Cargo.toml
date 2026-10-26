@@ -118,7 +118,7 @@ webpki-roots = "1"
 # the host via the watcher spool (`pai security pki rotate-all`), which
 # carries the backup → rotate → probe → auto-revert envelope. Do not reach
 # for a signing crate here without moving that decision first.
-x509-cert = { version = "0.2", default-features = false, features = ["pem"] }
+x509-cert = { version = "0.3", default-features = false, features = ["pem"] }
 
 # Birth-key proof of possession on the provisioning pull lane (birth_proof.rs).
 # VERIFICATION ONLY — this crate never mints or holds an RSA
