@@ -779,7 +779,9 @@ mod tests {
     fn a_busy_harness_says_so_and_never_runs_a_task_twice() {
         let src = include_str!("harness_main.rs").split("fn a_busy_harness_says_so_and_never_runs_a_task_twice").next().unwrap();
         let tasks = src.split("queue_subscribe(crate::tasks::task_subject(&node)").nth(1).unwrap();
-        let loop_body = tasks.split("while let Some(msg) = tasks.next().await").nth(1).unwrap();
+        // The task loop now selects on the stop signal (i256); its body
+        // starts after the select that yields `msg`.
+        let loop_body = tasks.split("m = tasks.next() => match m").nth(1).expect("the task loop takes from the subscription");
         let dedupe = loop_body.find("\"already\": true").expect("an already-running task is acknowledged as taken");
         let permit = loop_body.find("try_acquire_owned()").expect("the permit");
         assert!(dedupe < permit, "the dedupe runs before a permit is taken");
