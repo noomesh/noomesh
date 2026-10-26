@@ -285,7 +285,7 @@ turn (the dashboard socket, a channel).
 | Event | What the gateway does |
 |---|---|
 | `harness_result` | **last event of a successful turn**: `{"result": <CoordinatorResult>, "node": "<id>"}`. Kept, not forwarded; ends the relay. |
-| `error` | forwarded; ends the relay. The turn fails. With `retry_safe: true` (the foreign-CLI driver killed the CLI as stalled before it made a single model call, so no tool ran) it is kept instead, and the gateway runs the turn itself. |
+| `error` | forwarded; ends the relay. The turn fails. With `retry_safe: true` it is kept instead, and the gateway runs the turn itself. The foreign-CLI driver sets it when the CLI was killed as stalled before its first model call, or failed having asked the model only for tools that change nothing: the kind's `read_only_tools` (config/harness-kinds.json) and read-only noomesh tools. Any other tool it asked for makes the error name them and the turn is not re-run. |
 | `done` | forwarded; the gateway then waits at most 10 more seconds for `harness_result`. |
 | anything else | forwarded |
 
@@ -300,7 +300,8 @@ Rules:
   tools may already have executed, so the gateway does not run the turn
   again itself. The one exception is an `error` with `retry_safe: true`:
   the driver's stall bound killed a vendor CLI that had made no model call,
-  so nothing ran, and the gateway runs the turn in process.
+  or the CLI failed having asked only for read-only tools, so nothing it
+  did changed anything, and the gateway runs the turn in process.
 - Tasks have no event stream: a task reports through `task_checkpoint`
   only, and holds one concurrency permit for its whole life.
 

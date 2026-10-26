@@ -58,6 +58,11 @@ pub struct HarnessKind {
     /// The same for `launch_slim`.
     #[serde(default)]
     pub min_context_tokens_slim: Option<u64>,
+    /// The CLI's built-in tools that change nothing: a turn that failed
+    /// having called only these (and read-only noomesh tools) is safe for
+    /// the gateway to re-run (i233). Empty = none verified.
+    #[serde(default)]
+    pub read_only_tools: Vec<String>,
 }
 
 /// noomesh platform facts (`linux`/`macos`, `x86_64`/`aarch64`) → the
