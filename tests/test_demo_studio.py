@@ -36,18 +36,21 @@ def fill(s: str, tmp: Path) -> str:
     )
 
 
-def run_film_shell(tmp: Path, commands: list[str]) -> list[str]:
+FAKE_NOO = '#!/bin/sh\necho "noo says hi"\nfor a in "$@"; do [ "$a" != "--fail" ] || { echo "boom" >&2; exit 7; }; done\n'
+
+
+def run_film_shell(tmp: Path, commands: list[str], fake_noo: str = FAKE_NOO, env: dict | None = None) -> list[str]:
     """Type the tape's setup lines, then `commands`, into an interactive bash; return the exit log lines."""
     setup = [fill(s, tmp) for s in typed_lines("onboarding.tape.in") if s.startswith(("PROMPT_COMMAND=", "noo()", "sh()"))]
     assert len(setup) == 3, "the tape must define PROMPT_COMMAND, noo() and sh()"
     fake = tmp / "bin"
     fake.mkdir()
-    (fake / "noo").write_text('#!/bin/sh\necho "noo says hi"\nfor a in "$@"; do [ "$a" != "--fail" ] || { echo "boom" >&2; exit 7; }; done\n')
+    (fake / "noo").write_text(fake_noo)
     (fake / "noo").chmod(0o755)
     script = "\n".join(setup + commands + ["exit"]) + "\n"
     subprocess.run(
         [BASH, "--norc", "-i"], input=script, text=True, capture_output=True, check=False,
-        env={"PATH": f"{fake}:/usr/bin:/bin", "HOME": str(tmp), "TERM": "dumb"},
+        env={"PATH": f"{fake}:/usr/bin:/bin", "HOME": str(tmp), "TERM": "dumb", **(env or {})},
     )
     log = tmp / "exit.log"
     return log.read_text().splitlines() if log.exists() else []
@@ -59,6 +62,24 @@ def test_a_failing_step_leaves_a_non_zero_status_in_the_exit_log(tmp_path):
     flat = " ".join(lines).split()
     assert flat, "nothing was recorded"
     assert "7" in flat, f"the failing noo (exit 7) must be recorded, got {lines}"
+
+
+needs_script = pytest.mark.skipif(shutil.which("script") is None, reason="script(1) is not installed")
+
+
+@needs_bash
+@needs_script
+def test_noo_runs_on_a_terminal_of_the_film_size_so_compose_draws_its_bars(tmp_path):
+    # Behind the masking pipe noo (and the docker compose it starts) saw no
+    # terminal, so compose printed one line per layer update. The wrapper puts
+    # noo on its own pty, sized like the vhs window, with LF line ends.
+    probe = '#!/bin/sh\n[ -t 1 ] && echo "stdout-tty"\n[ -t 2 ] && echo "stderr-tty"\necho "size $(stty size)"\nexit 3\n'
+    lines = run_film_shell(tmp_path, ["noo"], fake_noo=probe, env={"LINES": "37", "COLUMNS": "111"})
+    assert "3" in " ".join(lines).split(), f"the wrapped noo's exit status must reach the exit log, got {lines}"
+    masked = (tmp_path / "masked.log").read_bytes()
+    assert b"stdout-tty" in masked and b"stderr-tty" in masked, masked
+    assert b"size 37 111" in masked, masked
+    assert b"\r" not in masked, f"the pty must not add CRs: {masked!r}"
 
 
 @needs_bash
