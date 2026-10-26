@@ -407,6 +407,7 @@ receives flat JSON events, each with a `type`:
 
 ```json
 {"type": "metadata", "conversation_id": "…", "model": "…", "backend": "…"}
+{"type": "harness_dispatched", "node": "…", "kind": "…"}
 {"type": "thinking", "text": "…"}
 {"type": "content", "text": "token"}
 {"type": "content_clear"}

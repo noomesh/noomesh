@@ -302,7 +302,15 @@ export function ChatPane({ panelHidden, onTogglePanel, onToggleChat, collapsed }
             </div>
           ) : (
             <div key={i} className="turn metis">
-              <div className="who">Noomesh</div>
+              <div className="who">
+                Noomesh
+                {m.answering && (
+                  <span className="answering">
+                    {m.streaming ? 'answering on' : 'on'} {m.answering.node}
+                    {m.answering.kind && ` · ${m.answering.kind}`}
+                  </span>
+                )}
+              </div>
               {m.thinking && (
                 <ThinkingBlock text={m.thinking} streaming={m.streaming} thinkMs={m.thinkMs} />
               )}

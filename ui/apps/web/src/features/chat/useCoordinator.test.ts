@@ -177,6 +177,23 @@ describe('useCoordinator', () => {
     ]);
   });
 
+  it('names the node and harness kind answering a dispatched turn', () => {
+    const { result } = renderHook(() => useCoordinator());
+    fire('onOpen', {});
+    H.sock.readyState = 1;
+    act(() => result.current.send('q'));
+    expect(last(result.current.messages).answering).toBeUndefined();
+
+    fire('onMessage', { type: 'harness_dispatched', node: 'mcmini', kind: 'copilot' });
+    expect(last(result.current.messages).answering).toEqual({ node: 'mcmini', kind: 'copilot' });
+
+    // A harness older than 0.6.13 names no kind: the node alone.
+    fire('onMessage', { type: 'done' });
+    act(() => result.current.send('q2'));
+    fire('onMessage', { type: 'harness_dispatched', node: 'awolf' });
+    expect(last(result.current.messages).answering).toEqual({ node: 'awolf', kind: undefined });
+  });
+
   it('a failed tool_result carries the error as its detail', () => {
     const { result } = renderHook(() => useCoordinator());
     fire('onOpen', {});
