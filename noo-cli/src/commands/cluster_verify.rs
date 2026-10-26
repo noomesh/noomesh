@@ -2698,11 +2698,26 @@ pub(crate) fn sandbox_listener_check(compose: Option<&str>, probe: Option<&Sandb
 /// the compose entrypoint, no setpriv). The row reads the body the live
 /// probe fetched over the gateway's leaf; a sandbox from before 0.6.10
 /// reports no `executor` at all, which is NOT CHECKED, not a pass.
+///
+/// The server's OWN uid (`server.uid`, 0.6.12) must be the uid its key is
+/// handed to (`pki::SANDBOX_SERVER_UID`), a uid no other service runs as:
+/// the kernel counts the container's `nproc: 256` per uid host-wide, and as
+/// `nonroot` (65532) the other services spent it, so every thread the
+/// server started failed and `/health` answered 500 (0.6.11, pop-os). A
+/// `/health` that answers 5xx is a FAIL, not "no body": the sandbox is up
+/// and refusing.
 pub(crate) fn sandbox_executor_check(probe: Option<&SandboxProbe>) -> Check {
     const ROW: &str = "sandbox executor";
     let Some(p) = probe else {
         return warn(ROW, "not probed live (gateway or sandbox container not running)", Some("noo stack status".into()));
     };
+    if p.health.is_none() && answered_5xx(&p.leaf) {
+        return fail(
+            ROW,
+            format!("the sandbox answered /health with an error ({}): it is up but cannot serve, so no code runs; its log says why", p.leaf),
+            "noo stack logs sandbox",
+        );
+    }
     let Some(h) = p.health.as_ref().filter(|h| h.is_object()) else {
         return warn(
             ROW,
@@ -2726,6 +2741,18 @@ pub(crate) fn sandbox_executor_check(probe: Option<&SandboxProbe>) -> Check {
             SANDBOX_REMEDY_RESTART,
         );
     };
+    if let Some(server) = h.get("server").and_then(|s| s.get("uid")).and_then(Value::as_u64) {
+        let want = u64::from(crate::pki::SANDBOX_SERVER_UID);
+        if server != want {
+            return fail(
+                ROW,
+                format!(
+                    "the sandbox server runs as uid {server}, not {want} (sandbox-server, the uid its key is handed to and no other service shares): its nproc limit is counted with every other process of uid {server}"
+                ),
+                "noo upgrade --stack",
+            );
+        }
+    }
     let iso = &h["isolation"];
     let mode = iso["mode"].as_str().unwrap_or("unknown");
     let active = iso["active"].as_str().unwrap_or("unknown");
@@ -2740,6 +2767,14 @@ pub(crate) fn sandbox_executor_check(probe: Option<&SandboxProbe>) -> Check {
         );
     }
     ok(ROW, format!("code runs as {detail}, uid {uid} first, never as the server; isolation {active}"))
+}
+
+/// `answered HTTP/1.1 500 …` (a probe dial's text): the server is up and
+/// answered with a server error.
+fn answered_5xx(dial: &str) -> bool {
+    dial.strip_prefix("answered HTTP/")
+        .and_then(|rest| rest.split_whitespace().nth(1))
+        .is_some_and(|code| code.len() == 3 && code.starts_with('5'))
 }
 
 /// Run on the gateway's own interpreter (its runtime image is DHI python,
@@ -7760,6 +7795,45 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
         assert!(c.detail.contains("sandbox listener row") && c.detail.contains("CERTIFICATE_VERIFY_FAILED"), "{}", c.detail);
         assert_eq!(sandbox_executor_check(None).verdict, Verdict::Warn);
+    }
+
+    /// 0.6.11 on pop-os: the server ran as `nonroot` (65532), the kernel
+    /// counted its `nproc: 256` with every other 65532 process on the host,
+    /// and `/health` answered 500 (`can't start new thread`). The row read
+    /// that as "no /health body", a warning. A 5xx is a FAIL; a server that
+    /// reports a uid other than its own (`SANDBOX_SERVER_UID`) is a FAIL; a
+    /// body with no `server` (a 0.6.10/0.6.11 image) is judged as before.
+    #[test]
+    fn the_sandbox_executor_row_judges_the_server_uid_and_a_5xx() {
+        assert_eq!(crate::pki::SANDBOX_SERVER_UID, 65590);
+        let bwrap = serde_json::json!({"mode": "bwrap", "active": "bwrap", "detail": "bwrap 0.9.0"});
+        let exec = serde_json::json!({"uid": 65600, "slots": 64, "detail": "sandbox-exec (uids 65600-65663)"});
+        let with_server = |uid: u64| {
+            let mut p = sandbox_health(exec.clone(), bwrap.clone());
+            p.health.as_mut().unwrap()["server"] = serde_json::json!({"uid": uid});
+            p
+        };
+        let c = sandbox_executor_check(Some(&with_server(65590)));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+
+        let c = sandbox_executor_check(Some(&with_server(65532)));
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("uid 65532, not 65590") && c.detail.contains("nproc"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo upgrade --stack"));
+
+        // no `server` key: an image from before 0.6.12, not judged on it
+        let c = sandbox_executor_check(Some(&sandbox_health(exec.clone(), bwrap.clone())));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+
+        // what pop-os printed: the leaf was answered, with a 500 and no JSON
+        let broken = sandbox_probe("refused: x", "answered HTTP/1.1 500 Internal Server Error", "refused: y");
+        let c = sandbox_executor_check(Some(&broken));
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("HTTP/1.1 500") && c.detail.contains("cannot serve"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo stack logs sandbox"));
+        assert!(answered_5xx("answered HTTP/1.1 503 Service Unavailable"));
+        assert!(!answered_5xx("answered HTTP/1.1 200 OK"));
+        assert!(!answered_5xx("refused: closed without an answer"));
     }
 
     /// The sandbox row: OK only when compose requires a client certificate

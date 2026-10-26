@@ -135,14 +135,14 @@ need.
 The sandbox is the one service that runs code it does not trust, so the code
 and the server are two different uids. The container starts as root only for
 its first instruction: `setpriv` keeps `CAP_SETUID`, `CAP_SETGID` and
-`CAP_KILL` as ambient capabilities and execs uvicorn as `nonroot`; no root
-process remains. Each `python_exec` call is then launched through `setpriv`
+`CAP_KILL` as ambient capabilities and execs uvicorn as `sandbox-server`
+(uid 65590); no root process remains. Each `python_exec` call is then launched through `setpriv`
 again into one of 64 executor uids (`sandbox-exec`, 65600 and up, one per
 concurrent call) with every capability cleared, in both isolation modes. What
 that buys, measured in the image on 2026-10-21:
 
 * the code cannot read the sandbox's own leaf key, which is `0640` and
-  nonroot's (`cat: Permission denied`), so it cannot present the sandbox's
+  sandbox-server's (`cat: Permission denied`), so it cannot present the sandbox's
   identity to anything on `noo-sandbox`;
 * it cannot signal the server or another call (`kill: Operation not
   permitted`), and `ptrace` across uids needs a capability it does not have;
@@ -160,6 +160,21 @@ the `cap_add` lines were inert and the code ran as the server. `/health`
 reports the executor under `executor`; a null uid means the image has no
 `sandbox-exec` user or the container was started without the launcher, and
 the code runs as the server's uid as it did before.
+
+The server's uid is its own: no other service runs as 65590. Docker without
+userns-remap counts `RLIMIT_NPROC` per real uid across the whole host, so the
+sandbox's `nproc: 256` bounds its own threads only while nothing else shares
+the uid. Through 0.6.11 the server ran as `nonroot` (65532) beside redis, the
+monitoring set, the voice doors, stunnel and the Python services; on a busy
+controller those held 256 threads between them, every thread the server
+tried to start failed (`can't start new thread`), and `/health` answered
+500. `/health` reports the server's uid under `server`, and `noo cluster
+verify --controller` fails the `sandbox executor` row when it is not 65590
+or when `/health` answers 5xx. An upgrade hands the existing sandbox key from
+65532 to 65590 in the same mode pass it runs before the launcher (`noo
+security pki fix-modes` on demand): by ACL or group as the operator, through
+`sudo -n` when that is all that can, and loudly, never quietly, when neither
+can.
 
 #### AppArmor on Ubuntu 24.04 and later
 

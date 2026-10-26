@@ -2655,15 +2655,19 @@ services:
     profiles: ["controller", "standalone"]
     # The container starts as root ONLY to hand the server three
     # capabilities: setpriv keeps CAP_SETUID, CAP_SETGID and CAP_KILL as
-    # ambient capabilities and execs uvicorn as `nonroot` (a name, not a
-    # number: Docker 27 resolves user strings by name). No root process
+    # ambient capabilities and execs uvicorn as `sandbox-server` (uid
+    # 65590, declared in docker/Dockerfile.sandbox; a name, not a number,
+    # like every user here). That uid is the server's alone: RLIMIT_NPROC
+    # is counted per uid host-wide, and as `nonroot` (65532, through
+    # 0.6.11) the `nproc: 256` below was spent by every other 65532
+    # service. No root process
     # remains. With those three the server runs every /exec call as an
     # executor uid (`sandbox-exec`, 64 uids from 65600, one per concurrent
     # call, declared in docker/Dockerfile.sandbox) with every capability
     # cleared, and can still kill a call that forks past its own limits.
     # The code therefore cannot read this container's leaf key (0640,
-    # nonroot's), signal the server or another call, or return to either
-    # uid. A non-root process keeps no effective capability, so without
+    # sandbox-server's), signal the server or another call, or return to
+    # either uid. A non-root process keeps no effective capability, so without
     # this launcher the two cap_add lines below were inert and the code
     # ran as the server. See src/noomesh/sandbox/app.py `executor`.
     user: root
@@ -2675,8 +2679,8 @@ services:
     init: true
     entrypoint: &sandbox-entrypoint
       - setpriv
-      - --reuid=nonroot
-      - --regid=nonroot
+      - --reuid=sandbox-server
+      - --regid=sandbox-server
       - --clear-groups
       - --inh-caps=+setuid,+setgid,+kill
       - --ambient-caps=+setuid,+setgid,+kill
@@ -2767,6 +2771,9 @@ services:
         reservations:
           cpus: '0.25'
           memory: 128M
+    # nproc counts every process and thread of the server's uid on the
+    # HOST, so it bounds this server only because sandbox-server is a uid
+    # no other service runs as (tests/test_sandbox_executor_user.py).
     ulimits: &sandbox-ulimits
       nproc: 256
       nofile:
