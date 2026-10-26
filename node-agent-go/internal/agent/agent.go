@@ -46,6 +46,12 @@ import (
 
 // Agent is the top-level node agent orchestrator.
 type Agent struct {
+	// runCtx is the context Run was started with (agent lifetime). The
+	// heartbeat, mesh and gossip providers are ctx-less seams (their
+	// signatures are pinned by the heartbeat payload golden test), so the
+	// docker calls behind them hang off this: shutdown cancels them. Set once
+	// at the top of Run, before any goroutine that reads it starts.
+	runCtx context.Context
 	cfg    *config.Config
 	docker *dockerpkg.Client
 	gpu    *hardware.GPUDetector
@@ -86,6 +92,16 @@ type Agent struct {
 //
 // Docker wins a key collision: a real container under that name is the thing
 // the reconciler manages and the spec hash describes.
+// lifeCtx is the agent-lifetime context for ctx-less provider callbacks.
+// Background only when Run has not started (unit tests that call a provider
+// directly).
+func (a *Agent) lifeCtx() context.Context {
+	if a.runCtx != nil {
+		return a.runCtx
+	}
+	return context.Background()
+}
+
 func (a *Agent) runningBackends() map[string]string {
 	out, _ := a.runningBackendsWithRuntime()
 	return out
@@ -107,12 +123,12 @@ func (a *Agent) runningBackends() map[string]string {
 // per-BACKEND fact on the same node, and a platform assumption would be
 // wrong again.
 func (a *Agent) runningBackendsWithRuntime() (map[string]string, map[string]string) {
-	out := a.docker.RunningBackends()
+	out := a.docker.RunningBackends(a.lifeCtx())
 	rt := make(map[string]string, len(out))
 	for b := range out {
 		rt[b] = "docker"
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(a.lifeCtx(), 3*time.Second)
 	defer cancel()
 	for b, m := range a.native.Running(ctx) {
 		if _, taken := out[b]; !taken {
@@ -211,7 +227,9 @@ func New(cfg *config.Config) (*Agent, error) {
 		func() map[string]string { return a.runningBackends() },
 		func() int { return 0 }, // updated after jobs executor is wired
 	)
-	hb.SetBackendContainers(backendContainersOf(docker, cfg.Tier))
+	if bc := backendContainersOf(docker, cfg.Tier); bc != nil {
+		hb.SetBackendContainers(func() map[string]any { return bc(a.lifeCtx()) })
+	}
 
 	// API server
 	server := api.NewServer(cfg, docker, gpu, coll)
@@ -248,8 +266,10 @@ func New(cfg *config.Config) (*Agent, error) {
 
 // Run starts all subsystems and blocks until interrupted.
 func (a *Agent) Run() error {
+	// Process root: Run is the top of the agent, there is no caller ctx.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	a.runCtx = ctx
 
 	// Handle OS signals for graceful shutdown. A signal cancels ctx at once,
 	// wherever Run is: everything before step 5 waits on ctx. A stop that
@@ -331,7 +351,7 @@ func (a *Agent) Run() error {
 		// the inference proxy uses to address it.
 		wd.SetServingProbe(func(ctx context.Context, container string) bool {
 			backend := strings.TrimPrefix(container, "noo-")
-			base := a.docker.BackendDialURL(backend)
+			base := a.docker.BackendDialURL(ctx, backend)
 			if base == "" {
 				return false
 			}
@@ -529,11 +549,11 @@ func (a *Agent) startMessaging(ctx context.Context) {
 	}
 	a.hb.SetBackendRuntimes(a.backendRuntimes)
 	a.hb.SetLoadedModels(func() map[string]string {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ctx, cancel := context.WithTimeout(a.lifeCtx(), 3*time.Second)
 		defer cancel()
 		return a.native.Loaded(ctx)
 	})
-	a.hb.SetDataMounts(a.docker.ManagedDataMounts)
+	a.hb.SetDataMounts(func() (map[string][]string, error) { return a.docker.ManagedDataMounts(a.lifeCtx()) })
 	a.hb.SetHostState(a.hostServices)
 	a.hb.SetModelBench(func() any {
 		// A nil *ModelBench must reach the heartbeat as a nil interface.
@@ -544,15 +564,15 @@ func (a *Agent) startMessaging(ctx context.Context) {
 	})
 	a.hb.SetHostdState(a.hostdStatus)
 	a.hb.SetBackendContainers(a.backendContainers)
-	a.hb.SetOllamaDoor(func() string { return a.docker.BackendDialURL("ollama") })
+	a.hb.SetOllamaDoor(func() string { return a.docker.BackendDialURL(a.lifeCtx(), "ollama") })
 	if a.native != nil {
 		a.hb.SetModelStats(func() []heartbeat.ModelStat {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			ctx, cancel := context.WithTimeout(a.lifeCtx(), 3*time.Second)
 			defer cancel()
 			return a.native.ModelStats(ctx)
 		})
 		a.hb.SetAdoptedModels(func() []string {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			ctx, cancel := context.WithTimeout(a.lifeCtx(), 3*time.Second)
 			defer cancel()
 			return a.native.Models(ctx)
 		})
@@ -594,7 +614,7 @@ func (a *Agent) startMessaging(ctx context.Context) {
 	interval := time.Duration(a.cfg.HeartbeatInterval) * time.Second
 	rtCaps := &hardware.RuntimeCapabilityDetector{
 		GetRunningBackends: a.runningBackends,
-		ListContainers:     a.docker.ContainerNames,
+		ListContainers:     func() []string { return a.docker.ContainerNames(a.lifeCtx()) },
 	}
 
 	a.gossip = messaging.NewGossipAnnouncer(
@@ -784,7 +804,7 @@ func (a *Agent) hostServices() map[string]any {
 	if a.harness == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(a.lifeCtx(), 8*time.Second)
 	defer cancel()
 	kind := ""
 	if a.harnessKind != nil {
@@ -876,7 +896,7 @@ func nativeOllamaGuard() *backendrt.OllamaGuard {
 // docker report stays nil, i.e. "not reported"). An orphan entry already under
 // "ollama" wins the key: it is a FAIL the operator must see first.
 func (a *Agent) backendContainers() map[string]any {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(a.lifeCtx(), 3*time.Second)
 	defer cancel()
 	adoptedRunning := a.native.Running(ctx)
 	var m map[string]any
@@ -885,7 +905,7 @@ func (a *Agent) backendContainers() map[string]any {
 		for b := range adoptedRunning {
 			adopted[b] = true
 		}
-		m = a.docker.BackendContainersBeside(adopted)
+		m = a.docker.BackendContainersBeside(a.lifeCtx(), adopted)
 	}
 	if a.ollama == nil {
 		occupancy.Annotate(m)
@@ -923,7 +943,7 @@ func (a *Agent) convergeOllama(ctx context.Context) {
 // backendContainersOf is the `backend_containers` provider:
 // nil for a tier-5 sensor proxy, whose container has no docker.sock by
 // design — the key is then omitted, not reported empty.
-func backendContainersOf(d *dockerpkg.Client, tier int) func() map[string]any {
+func backendContainersOf(d *dockerpkg.Client, tier int) func(context.Context) map[string]any {
 	if tier == 5 || d == nil {
 		return nil
 	}

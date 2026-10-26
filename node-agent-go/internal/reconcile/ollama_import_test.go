@@ -89,7 +89,7 @@ func absent(context.Context, string) (bool, error) { return false, nil }
 func TestImportOnlyModel_InStore_IsImportedNotPulled(t *testing.T) {
 	imp := newImportRecorder(nil)
 	r := importFixture(t, storeAnswers(true, nil), imp)
-	r.ensureOllamaModel("host8-ma", "ollama#embed", harrierPlacement(), absent, noPull(t))
+	r.ensureOllamaModel(context.Background(), "host8-ma", "ollama#embed", harrierPlacement(), absent, noPull(t))
 	imp.wait(t)
 
 	if imp.count() != 1 || imp.calls[0] != "harrier" {
@@ -115,7 +115,7 @@ func TestImportOnlyModel_InStore_IsImportedNotPulled(t *testing.T) {
 func TestImportOnlyModel_ImportFails_RefusalWithReasonAndBackoff(t *testing.T) {
 	imp := newImportRecorder(errors.New("fetch harrier-q8.gguf: sha256 mismatch"))
 	r := importFixture(t, storeAnswers(true, nil), imp)
-	r.ensureOllamaModel("host8-ma", "ollama#embed", harrierPlacement(), absent, noPull(t))
+	r.ensureOllamaModel(context.Background(), "host8-ma", "ollama#embed", harrierPlacement(), absent, noPull(t))
 	imp.wait(t)
 
 	rs := refusals.List()
@@ -129,7 +129,7 @@ func TestImportOnlyModel_ImportFails_RefusalWithReasonAndBackoff(t *testing.T) {
 	}
 
 	// Next tick, inside the backoff: no second import.
-	r.ensureOllamaModel("host8-ma", "ollama#embed", harrierPlacement(), absent, noPull(t))
+	r.ensureOllamaModel(context.Background(), "host8-ma", "ollama#embed", harrierPlacement(), absent, noPull(t))
 	time.Sleep(50 * time.Millisecond)
 	if imp.count() != 1 {
 		t.Fatalf("imports = %d, want 1 — a failed import must back off", imp.count())
@@ -139,7 +139,7 @@ func TestImportOnlyModel_ImportFails_RefusalWithReasonAndBackoff(t *testing.T) {
 	r.pullMu.Lock()
 	r.ollamaPulls["harrier"].lastFailed = time.Now().Add(-ollamaPullRetryAfter - time.Second)
 	r.pullMu.Unlock()
-	r.ensureOllamaModel("host8-ma", "ollama#embed", harrierPlacement(), absent, noPull(t))
+	r.ensureOllamaModel(context.Background(), "host8-ma", "ollama#embed", harrierPlacement(), absent, noPull(t))
 	imp.wait(t)
 	if imp.count() != 2 {
 		t.Fatalf("imports = %d, want 2 after the backoff", imp.count())
@@ -167,8 +167,8 @@ func TestImportOnlyModel_InFlightNotRestarted(t *testing.T) {
 			return "ok", nil
 		},
 	}
-	r.ensureOllamaModel("host8-ma", "ollama#embed", harrierPlacement(), absent, noPull(t))
-	r.ensureOllamaModel("host8-ma", "ollama#embed", harrierPlacement(), absent, noPull(t))
+	r.ensureOllamaModel(context.Background(), "host8-ma", "ollama#embed", harrierPlacement(), absent, noPull(t))
+	r.ensureOllamaModel(context.Background(), "host8-ma", "ollama#embed", harrierPlacement(), absent, noPull(t))
 	time.Sleep(50 * time.Millisecond)
 	close(release)
 	mu.Lock()
@@ -184,7 +184,7 @@ func TestNotInStore_PullsFromRegistryNeverImports(t *testing.T) {
 	imp := newImportRecorder(nil)
 	r := importFixture(t, storeAnswers(false, nil), imp)
 	pulled := make(chan string, 1)
-	r.ensureOllamaModel("host9", "ollama", placement{Backend: "ollama", Model: "gemma3:1b", DesiredState: "running"},
+	r.ensureOllamaModel(context.Background(), "host9", "ollama", placement{Backend: "ollama", Model: "gemma3:1b", DesiredState: "running"},
 		absent, func(_ context.Context, m string) (string, error) { pulled <- m; return "success", nil })
 	select {
 	case <-pulled:
@@ -205,14 +205,14 @@ func TestStoreCheckTimeout_RemembersImportOnly(t *testing.T) {
 	var answerErr error
 	r := importFixture(t, func(context.Context, string) (bool, error) { return answer, answerErr }, imp)
 
-	r.ensureOllamaModel("host8-ma", "ollama#embed", harrierPlacement(), absent, noPull(t))
+	r.ensureOllamaModel(context.Background(), "host8-ma", "ollama#embed", harrierPlacement(), absent, noPull(t))
 	imp.wait(t)
 
 	answer, answerErr = false, errors.New("manifest request timed out after 15s")
 	r.pullMu.Lock()
 	r.ollamaPulls["harrier"].lastFailed = time.Time{}
 	r.pullMu.Unlock()
-	r.ensureOllamaModel("host8-ma", "ollama#embed", harrierPlacement(), absent, noPull(t))
+	r.ensureOllamaModel(context.Background(), "host8-ma", "ollama#embed", harrierPlacement(), absent, noPull(t))
 	imp.wait(t)
 	if got := modelpresence.Report()["ollama#embed"]; !got.ImportOnly {
 		t.Fatalf("presence = %+v, want import_only remembered across a timed-out check", got)
@@ -229,7 +229,7 @@ func TestStagedRegistryTag_IsImportedNotPulled(t *testing.T) {
 	r := importFixture(t, storeAnswers(true, nil), imp)
 	p := harrierPlacement()
 	p.Model = "gemma4:12b"
-	r.ensureOllamaModel("host8-ma", "ollama#chat", p, absent, noPull(t))
+	r.ensureOllamaModel(context.Background(), "host8-ma", "ollama#chat", p, absent, noPull(t))
 	imp.wait(t)
 	if imp.count() != 1 || imp.calls[0] != "gemma4:12b" {
 		t.Fatalf("imports = %v, want exactly [gemma4:12b]", imp.calls)

@@ -109,7 +109,7 @@ func TestPrefetchRefIsTheStartRef(t *testing.T) {
 
 	asked := recordEnsure(t)
 	c := &Client{}
-	err := c.StartBackendSDK("vllm", "org/model", 1, StartOverrides{Image: override})
+	err := c.StartBackendSDK(context.Background(), "vllm", "org/model", 1, StartOverrides{Image: override})
 	if !errors.Is(err, errSentinelEnsure) || len(*asked) != 1 {
 		t.Fatalf("err %v asked %v", err, *asked)
 	}
@@ -148,7 +148,7 @@ func TestPlacedNodeRefusesAnHFCacheMiss(t *testing.T) {
 	ensureImageFn = func(context.Context, *Client, string) error { return nil }
 	t.Cleanup(func() { ensureImageFn = prev })
 	c := &Client{}
-	err := c.StartBackendSDK("vllm", "org/not-staged", 1, StartOverrides{Image: "vllm/vllm-openai:v0.25.0" + pinDigest})
+	err := c.StartBackendSDK(context.Background(), "vllm", "org/not-staged", 1, StartOverrides{Image: "vllm/vllm-openai:v0.25.0" + pinDigest})
 	var miss *ModelNotStagedError
 	if !errors.As(err, &miss) {
 		t.Fatalf("want ModelNotStagedError, got %v", err)

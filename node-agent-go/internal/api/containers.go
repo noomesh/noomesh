@@ -44,7 +44,7 @@ func (s *Server) handleCleanupImages(w http.ResponseWriter, r *http.Request) {
 	var req cleanupImagesReq
 	_ = json.NewDecoder(r.Body).Decode(&req) // empty body → full run
 
-	removed, err := s.docker.CleanupImages(req.DryRun)
+	removed, err := s.docker.CleanupImages(r.Context(), req.DryRun)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
 		return
@@ -66,7 +66,7 @@ func (s *Server) handleCleanupLogs(w http.ResponseWriter, r *http.Request) {
 	var req cleanupLogsReq
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
-	truncated, err := s.docker.CleanupLogs(req.DryRun, req.MaxSizeMB)
+	truncated, err := s.docker.CleanupLogs(r.Context(), req.DryRun, req.MaxSizeMB)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
 		return
@@ -103,7 +103,7 @@ func (s *Server) handleContainerStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.docker.StartManagedContainer(req)
+	result, err := s.docker.StartManagedContainer(r.Context(), req)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
 		return
@@ -132,7 +132,7 @@ func (s *Server) handleContainerStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.docker.StopManagedContainer(req.ContainerName); err != nil {
+	if err := s.docker.StopManagedContainer(r.Context(), req.ContainerName); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
 		return
 	}
@@ -159,7 +159,7 @@ func (s *Server) handleContainerProxy(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"detail": "Docker not available"})
 			return
 		}
-		resolve = s.docker.ProxyTarget
+		resolve = func(n string) (string, error) { return s.docker.ProxyTarget(r.Context(), n) }
 	}
 	name := r.PathValue("name")
 	if err := dockerpkg.ValidateManagedContainerName(name); err != nil {

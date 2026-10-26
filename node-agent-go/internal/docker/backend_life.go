@@ -74,18 +74,18 @@ func containerLife(st *container.State) map[string]any {
 // and rename-orphans excluded, as in RunningBackends). nil when docker
 // cannot be listed — the heartbeat then omits the key, which reads as "not
 // reported", never as "nothing is starting". `{}` is a real report.
-func (c *Client) BackendContainers() map[string]any {
-	return c.BackendContainersBeside(nil)
+func (c *Client) BackendContainers(ctx context.Context) map[string]any {
+	return c.BackendContainersBeside(ctx, nil)
 }
 
 // BackendContainersBeside is BackendContainers with the backend keys an
 // adopted lane serves: a docker container for such a key is flagged orphan
 // (see the file comment). adopted may be nil.
-func (c *Client) BackendContainersBeside(adopted map[string]bool) map[string]any {
+func (c *Client) BackendContainersBeside(ctx context.Context, adopted map[string]bool) map[string]any {
 	if c == nil || c.docker == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	containers, err := c.listContainers(ctx, client.ContainerListOptions{})
 	if err != nil {

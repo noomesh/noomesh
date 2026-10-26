@@ -4,6 +4,7 @@
 package docker
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -222,7 +223,7 @@ func TestBackendDialURL_FollowsTheContainersDeclaration(t *testing.T) {
 	t.Setenv("OLLAMA_URL", "")
 	// A nil client (tests, tier-5 sensors) answers the door.
 	var c *Client
-	if got := c.BackendDialURL("llamacpp"); got != "https://noo-stunnel-llamacpp:8085" {
+	if got := c.BackendDialURL(context.Background(), "llamacpp"); got != "https://noo-stunnel-llamacpp:8085" {
 		t.Fatalf("nil client: %q", got)
 	}
 	// The compose-alias form for a containerised agent stays.

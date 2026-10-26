@@ -25,6 +25,7 @@ import (
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
 	nodeconfig "github.com/noomesh/noomesh/node-agent-go/internal/config"
+	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlenv"
 )
 
 // ErrArtifactAbsent is the store's own answer that it does not hold the
@@ -102,10 +103,9 @@ func awaitManifest(ctx context.Context, budget time.Duration, ask func(context.C
 }
 
 func lookupArtifactManifestWithin(ctx context.Context, kind, name string, timeout time.Duration) (*artifactManifest, error) {
-	controller := strings.TrimRight(os.Getenv("CONTROLLER_URL"), "/")
-	if controller == "" {
-		return nil, fmt.Errorf("CONTROLLER_URL is not set — no controller to ask")
-	}
+	controller := strings.TrimRight(ctrlenv.ControllerURL(), "/")
+	// One resolver, one default: ctrlenv.ControllerURL() is never empty, the
+	// heartbeat and this lookup always agree on where the controller is.
 	reqURL := fmt.Sprintf("%s/api/artifacts/manifest/%s/%s", controller, kind, url.PathEscape(name))
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
