@@ -1010,7 +1010,7 @@ from before profiles. The agent applies four of its fields:
   agent restart (a request already in flight keeps the bound it started
   with). An unusable env value is not an override; the profile or the
   default applies.
-- **`ollama_context`** is the default context window for this node's chat
+- **`context`** (named `ollama_context` until 0.6.13) is the default context window for this node's chat
   engine when its placement does not decide one: `OLLAMA_CONTEXT_LENGTH` for
   Ollama, `VLLM_MAX_MODEL_LEN` for vLLM (which otherwise runs at the image
   default, 16384), `N_CTX` for llama.cpp (a placement that sets

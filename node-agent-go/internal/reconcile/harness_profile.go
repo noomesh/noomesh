@@ -12,7 +12,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/harnessprofile"
 )
 
-// ollamaContextKey is the placement env key the profile's ollama_context
+// ollamaContextKey is the placement env key the profile's context
 // defaults (placementEnvExact and backendrt.OllamaTuningKeys allow it).
 const ollamaContextKey = "OLLAMA_CONTEXT_LENGTH"
 
@@ -33,16 +33,16 @@ func applyHarnessProfile(raw json.RawMessage) {
 
 // profileOllamaContext is the value to default OLLAMA_CONTEXT_LENGTH to for
 // an ollama whose env is env, or "" when nothing is injected: no profile, no
-// ollama_context in it, or the placement already sets the key (the
+// context in it, or the placement already sets the key (the
 // placement's own value is never touched).
 func profileOllamaContext(env map[string]string, prof *harnessprofile.Profile) string {
-	if prof == nil || prof.OllamaContext <= 0 {
+	if prof == nil || prof.Context <= 0 {
 		return ""
 	}
 	if v, ok := env[ollamaContextKey]; ok && strings.TrimSpace(v) != "" {
 		return ""
 	}
-	return strconv.Itoa(prof.OllamaContext)
+	return strconv.Itoa(prof.Context)
 }
 
 // contextKeys is, per chat engine, the placement env key that sets its
@@ -70,7 +70,7 @@ var contextKeys = map[string]struct {
 // profile, no context in it, an engine without a window key, or a placement
 // that already decides the window (its own value is never touched).
 func profileContext(backend string, env map[string]string, prof *harnessprofile.Profile) (string, string) {
-	if prof == nil || prof.OllamaContext <= 0 {
+	if prof == nil || prof.Context <= 0 {
 		return "", ""
 	}
 	k, ok := contextKeys[backend]
@@ -82,7 +82,7 @@ func profileContext(backend string, env map[string]string, prof *harnessprofile.
 			return "", ""
 		}
 	}
-	return k.set, strconv.Itoa(prof.OllamaContext)
+	return k.set, strconv.Itoa(prof.Context)
 }
 
 // withProfileContext returns the effective placements with the profile's
@@ -183,7 +183,7 @@ func (r *Reconciler) recordChatPlacement(all []placement) {
 // backend runs with as far as the agent sets it, for GET /harness/placement
 // (`model_context`): the harness tells a foreign CLI its model's real window
 // (noomesh-internal i147). Today that is Ollama's OLLAMA_CONTEXT_LENGTH: the
-// placement's own value, else the profile's ollama_context default the agent
+// placement's own value, else the profile's context default the agent
 // injects. 0 = not known (another backend, or nothing sets it).
 func (r *Reconciler) ChatContextWindow(prof *harnessprofile.Profile) int {
 	r.harnessMu.RLock()

@@ -27,15 +27,19 @@ import (
 // exactly as the controller sent it, so GET /harness/placement passes it to
 // the harness without dropping a field this agent does not model.
 type Profile struct {
-	Tier           int               `json:"tier"`
-	FirstByteSecs  int               `json:"first_byte_secs"`
-	StreamIdleSecs int               `json:"stream_idle_secs"`
-	Thinking       string            `json:"thinking"`
-	OllamaContext  int               `json:"ollama_context"`
-	ClaudePrompt   string            `json:"claude_prompt"`
-	ForeignKinds   []string          `json:"foreign_kinds"`
-	Sources        map[string]string `json:"sources"`
-	Bench          json.RawMessage   `json:"bench"`
+	Tier           int    `json:"tier"`
+	FirstByteSecs  int    `json:"first_byte_secs"`
+	StreamIdleSecs int    `json:"stream_idle_secs"`
+	Thinking       string `json:"thinking"`
+	Context        int    `json:"context"`
+	// ContextAlias is `context` under its name until 0.6.13 (i226 decision
+	// 1): a controller older than 0.6.13 sends only this key. Parse folds it
+	// into Context; nothing else reads it.
+	ContextAlias int               `json:"ollama_context"`
+	ClaudePrompt string            `json:"claude_prompt"`
+	ForeignKinds []string          `json:"foreign_kinds"`
+	Sources      map[string]string `json:"sources"`
+	Bench        json.RawMessage   `json:"bench"`
 
 	Raw json.RawMessage `json:"-"`
 }
@@ -68,8 +72,11 @@ func Parse(raw json.RawMessage) (*Profile, error) {
 	if p.StreamIdleSecs < 0 {
 		p.StreamIdleSecs = 0
 	}
-	if p.OllamaContext < 0 {
-		p.OllamaContext = 0
+	if p.Context <= 0 {
+		p.Context = p.ContextAlias
+	}
+	if p.Context < 0 {
+		p.Context = 0
 	}
 	p.Raw = append(json.RawMessage(nil), raw...)
 	return &p, nil

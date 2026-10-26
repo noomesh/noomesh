@@ -118,7 +118,7 @@ func TestProfileOllamaContextJoinsTheSpecOnlyWhenThePlacementDoesNotSetIt(t *tes
 	// TestTheProfileContextReachesEveryChatEngineThatDoesNotSetItsOwn)
 	other := placement{Backend: "tei", Model: "m", DesiredState: "running"}
 
-	p32 := &harnessprofile.Profile{OllamaContext: 32768}
+	p32 := &harnessprofile.Profile{Context: 32768}
 	out := withProfileContext([]placement{bare, own, other}, p32)
 	if out[0].Env["OLLAMA_CONTEXT_LENGTH"] != "32768" || out[0].Env["OLLAMA_NUM_PARALLEL"] != "2" {
 		t.Errorf("default not injected: %v", out[0].Env)
@@ -141,9 +141,9 @@ func TestProfileOllamaContextJoinsTheSpecOnlyWhenThePlacementDoesNotSetIt(t *tes
 	if specHash(none[0]) != specHash(bare) {
 		t.Error("no profile must leave the spec hash as it was")
 	}
-	p16 := withProfileContext([]placement{bare}, &harnessprofile.Profile{OllamaContext: 16384})
+	p16 := withProfileContext([]placement{bare}, &harnessprofile.Profile{Context: 16384})
 	if specHash(p16[0]) == specHash(out[0]) || specHash(p16[0]) == specHash(bare) {
-		t.Error("a changed ollama_context must change the spec hash so the container is recreated")
+		t.Error("a changed profile context must change the spec hash so the container is recreated")
 	}
 	stopped := bare
 	stopped.DesiredState = "stopped"
@@ -157,7 +157,7 @@ func TestProfileOllamaContextJoinsTheSpecOnlyWhenThePlacementDoesNotSetIt(t *tes
 // placement does not decide the window itself (awolf ran vLLM at the image
 // default 16384 beside Ollama's 32768 at the same tier, 2026-10-24).
 func TestTheProfileContextReachesEveryChatEngineThatDoesNotSetItsOwn(t *testing.T) {
-	p32 := &harnessprofile.Profile{OllamaContext: 32768}
+	p32 := &harnessprofile.Profile{Context: 32768}
 	vllm := placement{Backend: "vllm", Model: "google/gemma-4-12B", DesiredState: "running", Env: map[string]string{"VLLM_MAX_NUM_SEQS": "8"}}
 	vllmOwn := placement{Backend: "vllm", Model: "m", DesiredState: "running", Env: map[string]string{"VLLM_MAX_MODEL_LEN": "8192"}}
 	secondary := placement{Backend: "vllm-secondary", Model: "m2", DesiredState: "running"}
@@ -196,7 +196,7 @@ func TestTheProfileContextReachesEveryChatEngineThatDoesNotSetItsOwn(t *testing.
 }
 
 func TestNativeOllamaTuningCarriesTheProfileContextToThePlist(t *testing.T) {
-	p32 := &harnessprofile.Profile{OllamaContext: 32768}
+	p32 := &harnessprofile.Profile{Context: 32768}
 	lone := []placement{{Backend: "ollama", Model: "gemma4:12b", DesiredState: "running"}}
 	if got := nativeOllamaTuning(lone, nil); got != nil {
 		t.Errorf("a lone placement with no profile keeps no tuning, as before: %v", got)
@@ -260,7 +260,7 @@ func TestChatPlacementOfPicksTheRunningChatEngine(t *testing.T) {
 // the chat ollama's own OLLAMA_CONTEXT_LENGTH, else the profile's default,
 // else 0; never a window for a chat backend that is not ollama.
 func TestChatContextWindowIsTheOllamaContextTheAgentSets(t *testing.T) {
-	prof := &harnessprofile.Profile{OllamaContext: 32768}
+	prof := &harnessprofile.Profile{Context: 32768}
 	chat := placement{Backend: "ollama", Model: "gemma4:12b", Role: "chat", DesiredState: "running"}
 	r := &Reconciler{}
 

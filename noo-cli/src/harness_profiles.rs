@@ -43,6 +43,15 @@ pub fn shipped() -> Table {
     parse(HARNESS_PROFILES_JSON).unwrap_or(Table { fields: Vec::new(), tiers: BTreeMap::new(), unknown_tier: String::new(), measured: Map::new() })
 }
 
+/// `context`'s name until 0.6.13 (i226 decision 1): accepted on `--set` and
+/// `--clear` for one release and read from a gateway that still sends it.
+pub const CONTEXT_ALIAS: &str = "ollama_context";
+
+/// The table's name for `key`: [`CONTEXT_ALIAS`] is `context`.
+pub fn canonical(key: &str) -> &str {
+    if key == CONTEXT_ALIAS { "context" } else { key }
+}
+
 impl Table {
     /// A tier row to read value types from: the unknown tier's, else any.
     fn exemplar(&self) -> Option<&Map<String, Value>> {
@@ -58,7 +67,7 @@ impl Table {
         let (key, raw) = kv
             .split_once('=')
             .ok_or_else(|| format!("'{kv}' is not key=value (fields: {})", self.fields.join(", ")))?;
-        let key = key.trim();
+        let key = canonical(key.trim());
         self.check_field(key)?;
         let raw = raw.trim();
         let kind = self.exemplar().and_then(|r| r.get(key)).cloned().unwrap_or(Value::Null);
@@ -85,6 +94,7 @@ impl Table {
 
     /// Is `key` one of the table's fields?
     pub fn check_field(&self, key: &str) -> Result<(), String> {
+        let key = canonical(key);
         if self.fields.iter().any(|f| f == key) {
             Ok(())
         } else {
@@ -100,7 +110,7 @@ mod tests {
     #[test]
     fn the_shipped_table_parses_with_six_fields_and_four_tiers() {
         let t = parse(HARNESS_PROFILES_JSON).expect("shipped table");
-        assert_eq!(t.fields, ["first_byte_secs", "stream_idle_secs", "thinking", "ollama_context", "claude_prompt", "foreign_kinds"]);
+        assert_eq!(t.fields, ["first_byte_secs", "stream_idle_secs", "thinking", "context", "claude_prompt", "foreign_kinds"]);
         assert_eq!(t.tiers.keys().cloned().collect::<Vec<_>>(), ["1", "2", "3", "4"]);
         assert!(t.tiers.contains_key(&t.unknown_tier));
     }
@@ -116,5 +126,9 @@ mod tests {
         assert!(t.parse_assignment("first_byte_secs").unwrap_err().contains("key=value"));
         assert!(t.parse_assignment("bogus=1").unwrap_err().contains("not a harness profile field"));
         assert!(t.parse_assignment("thinking=").unwrap_err().contains("--clear thinking"));
+        // The old name (i226 decision 1) is the new field.
+        assert_eq!(t.parse_assignment("context=65536").unwrap(), ("context".into(), json!(65536)));
+        assert_eq!(t.parse_assignment("ollama_context=65536").unwrap(), ("context".into(), json!(65536)));
+        assert!(t.check_field("ollama_context").is_ok());
     }
 }

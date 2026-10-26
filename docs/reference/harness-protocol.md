@@ -476,7 +476,8 @@ refused at start, and so is a file name that is not a plain name.
 `model_context` in the agent's `/harness/placement` answer is the context
 window the node's chat backend runs with. For Ollama it is what the agent
 sets: `OLLAMA_CONTEXT_LENGTH`, the placement's own value or else the
-profile's `ollama_context` default. For vLLM and llama.cpp the agent asks the
+profile's `context` default (`ollama_context` from a controller older than
+0.6.13). For vLLM and llama.cpp the agent asks the
 running backend (vLLM's `max_model_len` from `GET /v1/models`, llama-server's
 per-slot `n_ctx` from `GET /props`, which is `--ctx-size` divided across its
 parallel slots), bounded at 2 seconds. It is absent when the agent does not
