@@ -182,8 +182,8 @@ def _resolve_workspace_dir() -> str:
         ws = cfg.workspace.path
         if ws:
             return ws
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("heartbeat_workspace_path_unavailable", error=str(e))
     return "/tmp"
 
 
@@ -663,8 +663,9 @@ class HeartbeatActionExecutor:
                     f"**Knowledge Base**: {docs} docs, {pages} pages "
                     f"({unembedded} unembedded)"
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("heartbeat_summary_rag_error", error=str(e))
+            sections.append("**Knowledge Base**: unavailable")
 
         try:
             r = await client.get(f"{self.gateway_url}/api/cache/stats")
@@ -675,8 +676,9 @@ class HeartbeatActionExecutor:
                 total = hits + misses
                 rate = round((hits / total) * 100, 1) if total > 0 else 0
                 sections.append(f"**Cache**: {rate}% hit rate ({total} requests)")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("heartbeat_summary_cache_error", error=str(e))
+            sections.append("**Cache**: unavailable")
 
         try:
             r = await client.get(f"{self.gateway_url}/api/scheduler/status")
@@ -689,8 +691,9 @@ class HeartbeatActionExecutor:
                     sections.append("**Jobs**: not reported (queue unreadable)")
                 else:
                     sections.append(f"**Jobs**: {active} active, {depth} queued")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("heartbeat_summary_jobs_error", error=str(e))
+            sections.append("**Jobs**: unavailable")
 
         if not sections:
             return "Daily briefing: unable to collect system metrics."
@@ -734,8 +737,9 @@ class HeartbeatActionExecutor:
             if r.status_code == 200:
                 backends = r.json().get("backends", [])
                 lines.append(f"Active backends: {len(backends)}")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("heartbeat_cluster_backends_error", error=str(e))
+            lines.append("Active backends: unknown (lookup failed)")
 
         return "\n".join(lines)
 
@@ -899,6 +903,8 @@ class HeartbeatActionExecutor:
         checked = 0
         changed = 0
         reingested = 0
+        reingest_failed = 0
+        unreachable = 0
 
         client = self._get_http_client()
         for doc in url_docs:
@@ -924,15 +930,32 @@ class HeartbeatActionExecutor:
                         r = await settle(ingest_client, r, self.gateway_url)
                         if r.status_code == 200:
                             reingested += 1
-                    except Exception:
-                        pass
-            except Exception:
-                checked += 1
+                        else:
+                            reingest_failed += 1
+                            logger.warning("knowledge_refresh_reingest_status",
+                                           source=uri, status=r.status_code)
+                    except Exception as e:
+                        reingest_failed += 1
+                        logger.warning("knowledge_refresh_reingest_error",
+                                       source=uri, error=str(e))
+            except Exception as e:
+                unreachable += 1
+                logger.warning("knowledge_refresh_check_error",
+                               source=uri, error=str(e))
 
-        return (
+        summary = (
             f"Knowledge refresh: checked {checked} sources, "
             f"{changed} changed, {reingested} re-ingestion jobs submitted."
         )
+        if unreachable:
+            summary += f" {unreachable} source(s) unreachable."
+        if reingest_failed:
+            # "Not done" must not look like "done": fail the task so the run is
+            # recorded as an error rather than a green partial success.
+            raise RuntimeError(
+                f"{summary} reingest_failed={reingest_failed} of {changed} changed"
+            )
+        return summary
 
     async def _conversation_summarize(self, task: HeartbeatTask) -> str:
         """Find old conversations, summarize via LLM, store summary."""
@@ -1572,8 +1595,14 @@ class HeartbeatActionExecutor:
                     )
                     if active > 0:
                         return f"Skipped: {active} active session(s) — organic traversals being captured"
-            except Exception:
-                pass
+            except Exception as e:
+                # Fail closed: if we cannot tell whether a user is active, do not
+                # run a load-generating rehearsal on top of them.
+                logger.warning("thought_experiment_active_check_failed", error=str(e))
+                return (
+                    "Skipped: could not determine active sessions "
+                    f"({type(e).__name__}: {e}) — not running while activity is unknown"
+                )
 
         store = self._get_pageindex_store()
         if not store:
@@ -1614,8 +1643,8 @@ class HeartbeatActionExecutor:
         try:
             from .deps import services
             video_mem = getattr(services, "recall_memory", None)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("thought_experiment_recall_memory_unavailable", error=str(e))
 
         # 4. Run each query through the retrieval pipeline
         results: list[dict] = []
@@ -2088,6 +2117,7 @@ class HeartbeatActionExecutor:
 
         # Optionally ingest into KB
         ingested = 0
+        ingest_failed = 0
         if ingest and matched:
             client = self._get_http_client()
             for entry in matched:
@@ -2101,8 +2131,13 @@ class HeartbeatActionExecutor:
                         r = await settle(client, r, self.gateway_url)
                         if r.status_code == 200:
                             ingested += 1
-                    except Exception:
-                        pass
+                        else:
+                            ingest_failed += 1
+                            logger.warning("news_scan_ingest_status",
+                                           url=link, status=r.status_code)
+                    except Exception as e:
+                        ingest_failed += 1
+                        logger.warning("news_scan_ingest_error", url=link, error=str(e))
 
         # Optionally summarize
         summary_text = ""
@@ -2117,15 +2152,18 @@ class HeartbeatActionExecutor:
                     sender_name="Heartbeat",
                 )
                 summary_text = f" Summary: {result.response[:300]}"
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("news_scan_summary_error", error=str(e))
 
         titles_preview = "; ".join(f"'{e.get('title', '')[:50]}'" for e in matched[:3])
         ingest_note = f", {ingested} ingested" if ingest else ""
-        return (
+        scan_summary = (
             f"News scan: checked {len(feeds)} feeds, {len(all_entries)} total entries "
             f"({len(matched)} matched){ingest_note}: {titles_preview}{summary_text}"
         )
+        if ingest_failed:
+            raise RuntimeError(f"{scan_summary} ingest_failed={ingest_failed}")
+        return scan_summary
 
     @staticmethod
     def _parse_feed(xml_text: str) -> List[Dict[str, str]]:
@@ -2267,7 +2305,10 @@ class HeartbeatActionExecutor:
             return "Model cache warm: no models configured."
 
         # Check what's already cached
-        cached_set: set = set()
+        # None = unknown. An empty set would mean "nothing is cached" and make
+        # every model look uncached (re-pulling the lot), so a failed lookup is
+        # reported and the run is skipped instead.
+        cached_set: Optional[set] = None
         client = self._get_http_client()
         try:
             r = await client.get(f"{self.gateway_url}/api/models/cached")
@@ -2276,8 +2317,15 @@ class HeartbeatActionExecutor:
                 cached_set = {
                     (m.get("model"), m.get("node_id")) for m in cached_list
                 }
-        except Exception:
-            pass
+            else:
+                logger.warning("heartbeat_model_cache_lookup_status", status=r.status_code)
+        except Exception as e:
+            logger.warning("heartbeat_model_cache_lookup_error", error=str(e))
+        if cached_set is None:
+            return (
+                f"Model cache warm: not checked — cached-model lookup failed, "
+                f"skipping {len(models)} configured model(s) this run."
+            )
 
         already_cached = 0
         pulling = 0
@@ -2438,10 +2486,10 @@ class HeartbeatActionExecutor:
                         for child in p.rglob("*"):
                             try:
                                 total_bytes += child.stat().st_size
-                            except Exception:
-                                pass
-            except Exception:
-                pass
+                            except Exception as e:
+                                logger.debug("tmp_noo_child_stat_failed", path=str(child), error=str(e))
+            except Exception as e:
+                logger.debug("tmp_noo_stat_failed", path=str(p), error=str(e))
         size_str = _format_bytes(total_bytes)
         return f"tmp_noo_files: {found} stale (~{size_str})"
 
@@ -2519,8 +2567,9 @@ class HeartbeatActionExecutor:
                 total = hits + misses
                 rate = round((hits / total) * 100, 1) if total > 0 else 0
                 sections.append(f"Cache: {rate}% hit rate ({total} requests)")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("heartbeat_cost_cache_error", error=str(e))
+            sections.append("Cache: unavailable")
 
         # Cluster node uptime
         try:
@@ -2534,8 +2583,9 @@ class HeartbeatActionExecutor:
                 cost = gpu_hours * gpu_cost_per_hour
                 cost_str = f"${cost:.2f}" if gpu_cost_per_hour > 0 else "$0 (self-hosted)"
                 sections.append(f"Local GPU: ~{gpu_hours}h ({cost_str})")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("heartbeat_cost_gpu_error", error=str(e))
+            sections.append("Local GPU: unavailable")
 
         # Conversation token stats
         cs = self._get_conversation_store()
@@ -2552,8 +2602,9 @@ class HeartbeatActionExecutor:
                 sections.append(
                     f"Cloud API: ~${est_cost:.2f} ({total_tokens:,} tokens)"
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("heartbeat_cost_cloud_error", error=str(e))
+                sections.append("Cloud API: unavailable")
 
         if not sections:
             return "Cost report: unable to collect metrics."
@@ -2628,6 +2679,9 @@ class HeartbeatActionExecutor:
             "high_risk_tool_calls": 0,
             "path_traversal_attempts": 0,
         }
+        # Sources that could not be read. A source that errored contributes 0 to
+        # `findings`, which must not read as "clean".
+        unchecked: List[str] = []
 
         # Check rate limiter state (in-memory)
         try:
@@ -2637,8 +2691,9 @@ class HeartbeatActionExecutor:
                 stats = sm.get_violation_stats(period_hours=period_hours)
                 findings["rate_limit_violations"] = stats.get("violations", 0)
                 findings["path_traversal_attempts"] = stats.get("path_traversal", 0)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("security_audit_rate_limit_error", error=str(e))
+            unchecked.append("rate_limit_violations")
 
         # Check exec approval stats
         try:
@@ -2647,8 +2702,9 @@ class HeartbeatActionExecutor:
             if am and hasattr(am, "get_stats"):
                 stats = am.get_stats()
                 findings["high_risk_tool_calls"] = stats.get("denied", 0)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("security_audit_approval_stats_error", error=str(e))
+            unchecked.append("high_risk_tool_calls")
 
         # Try Loki if available
         try:
@@ -2673,13 +2729,20 @@ class HeartbeatActionExecutor:
                 data = r.json().get("data", {}).get("result", [])
                 auth_count = sum(len(s.get("values", [])) for s in data)
                 findings["auth_failures"] = auth_count
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("security_audit_loki_error", error=str(e))
+            unchecked.append("auth_failures")
 
         total = sum(findings.values())
         risk_level = "LOW" if total < alert_threshold else ("MEDIUM" if total < alert_threshold * 3 else "HIGH")
 
         detail = ", ".join(f"{k}: {v}" for k, v in findings.items())
+        if unchecked:
+            return (
+                f"Security audit ({period_hours}h): {detail}. NOT CHECKED: "
+                f"{', '.join(unchecked)} (source errored; counts above exclude them). "
+                f"Overall risk: {risk_level} (incomplete)"
+            )
         return f"Security audit ({period_hours}h): {detail}. Overall risk: {risk_level}"
 
     async def _cert_rotation_check(self, task: HeartbeatTask) -> str:
@@ -3146,8 +3209,10 @@ class HeartbeatActionExecutor:
                                 recipient=recipient,
                                 message=f"Background task completed:\n\n{result.response}",
                             )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("heartbeat_continue_tasks_notify_failed",
+                                       session_id=session_id, error=str(e))
+                        results.append(f"Session {session_id}: channel notification FAILED — {e}")
 
             except Exception as e:
                 results.append(f"Session {session_id}: ERROR — {e}")
@@ -3268,8 +3333,8 @@ class HeartbeatActionExecutor:
         if self._current_artifacts:
             try:
                 full_report = Path(self._current_artifacts[0]).read_text(encoding="utf-8")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("research_send_artifact_unreadable", error=str(e))
 
         if not full_report:
             # Fall back to generating a sendable summary

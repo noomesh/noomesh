@@ -340,15 +340,15 @@ class ExecApprovalManager:
             store = _get_conversation_store()
             if store is not None and getattr(store, "_engine", None) is not None:
                 candidates.append(store._engine)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("exec_approval_worker_engine_unavailable", error=str(e))
         try:  # HTTP lifespan process
             from ..db.engine import get_async_engine
             eng = get_async_engine()
             if eng is not None and eng not in candidates:
                 candidates.append(eng)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("exec_approval_lifespan_engine_unavailable", error=str(e))
 
         for eng in candidates:
             try:
@@ -567,8 +567,8 @@ class ExecApprovalManager:
         try:
             from .audit_log import audit
             audit("exec_approved", actor=approved_by, resource=tool_name, outcome="approved")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("exec_approval_audit_failed", event="exec_approved", error=str(e))
 
         await self._db_finalise(req)
         event = self._events.get(request_id)
@@ -597,8 +597,8 @@ class ExecApprovalManager:
         try:
             from .audit_log import audit
             audit("exec_denied", actor=denied_by, resource=tool_name, outcome="denied", reason=reason)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("exec_approval_audit_failed", event="exec_denied", error=str(e))
 
         await self._db_finalise(req)
         event = self._events.get(request_id)
