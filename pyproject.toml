@@ -119,7 +119,7 @@ dev = [
   "pytest>=9.1.1",
   "pytest-asyncio>=1.4.0",
   "pytest-cov>=4.1",
-  "ruff>=0.17.1",
+  "ruff>=0.17.2",
   "mypy>=1.8",
   "pre-commit>=3.6",
   "bandit[toml]>=1.7",
@@ -196,7 +196,7 @@ target-version = "py312"
 
 [tool.ruff.lint]
 # Declare the rule set EXPLICITLY. Ruff 0.16 expanded its *default* selection,
-# and because the dev extra is unpinned (`ruff>=0.17.1`) CI silently upgraded and
+# and because the dev extra is unpinned (`ruff>=0.17.2`) CI silently upgraded and
 # went from green to 4047 findings — none caused by a code change. With `select`
 # pinned here, lint is deterministic across ruff versions, so CI only breaks
 # when someone's code actually breaks it.
