@@ -5351,8 +5351,8 @@ mod tests {
     }
 
     // ── User-proposal validation (moved from tests/test_user_proposals.py in
-    // the 2026-08-08 reference sweep — the Python body is archived in
-    // legacy/python-workers-reference/users.py; this fn is the live one). ──
+    // the 2026-08-08 reference sweep — the Python body is gone from
+    // the tree; this fn is the live one). ──
 
     #[test]
     fn proposal_validation_rejects_bad_username() {
