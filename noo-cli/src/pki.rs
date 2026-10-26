@@ -1071,6 +1071,65 @@ pub fn grant_read_to_uid(path: &Path, uid: u32) -> Result<&'static str, String> 
     Err(sudo_grant_line(path, uid))
 }
 
+/// Hand `path` to `uid` through sudo: the `chgrp`/`chmod` this process could
+/// not make itself (not root, not in that gid, no `setfacl` on the host).
+/// `noninteractive` runs `sudo -n` with no stdin (a `--ci` run has no
+/// terminal for a prompt); otherwise sudo may ask. `Ok` only when the reader
+/// can read the file afterwards and nothing beyond it can; `Err` is the
+/// line the operator must run.
+pub fn grant_read_to_uid_via_sudo(path: &Path, uid: u32, noninteractive: bool) -> Result<(), String> {
+    let run = |args: &[&str]| -> bool {
+        let mut c = std::process::Command::new("sudo");
+        if noninteractive {
+            c.arg("-n").stdin(std::process::Stdio::null());
+        }
+        c.args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|st| st.success())
+            .unwrap_or(false)
+    };
+    let p = path.to_string_lossy().into_owned();
+    let gid = uid.to_string();
+    if run(&["chgrp", &gid, &p]) && run(&["chmod", "640", &p]) && readable_by_uid(path, uid) == Some(true) && !group_read_beyond(path, uid) {
+        Ok(())
+    } else {
+        Err(sudo_grant_line(path, uid))
+    }
+}
+
+/// What onboard does with the keys it could not hand to their container
+/// uid (i266). None outstanding: nothing. Otherwise the grant through sudo
+/// when sudo is usable (passwordless for `--ci`; a prompt interactively),
+/// else LOUD: until the printed lines run, every local account can read
+/// those private keys, and the run must not report success. Pure, so the
+/// three answers are pinned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyGrantPlan {
+    Nothing,
+    Sudo,
+    Loud,
+}
+
+pub fn key_grant_plan(outstanding: usize, sudo_usable: bool) -> KeyGrantPlan {
+    if outstanding == 0 {
+        KeyGrantPlan::Nothing
+    } else if sudo_usable {
+        KeyGrantPlan::Sudo
+    } else {
+        KeyGrantPlan::Loud
+    }
+}
+
+/// The one sentence a run ends with when private keys stay exposed: what,
+/// how many, who can read them, and the command that prints each fix.
+pub fn exposed_keys_failure(n: usize) -> String {
+    format!(
+        "pki: {n} private key(s) are readable by every local account on this host until the printed `sudo chgrp … && sudo chmod 640 …` lines run (noo security pki fix-modes prints them again)"
+    )
+}
+
 fn set_mode(path: &Path, mode: u32) -> bool {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).is_ok()
 }
@@ -3134,6 +3193,34 @@ mod key_mode_tests {
                 assert_eq!((f2.before, f2.after, f2.needs.is_some()), (0o640, 0o644, true), "{f2:?}");
             }
             other => panic!("granted-and-unreadable or ungranted-and-readable: {other:?}"),
+        }
+    }
+
+    /// i266: a fresh `--ci` install on a box with no `setfacl` and no gid
+    /// membership left 32 keys 0644 (fail open) and only PRINTED the sudo
+    /// lines, with passwordless sudo available. Outstanding grants go
+    /// through sudo when sudo is usable; without it the run is loud and
+    /// fails, never a quiet success.
+    #[test]
+    fn outstanding_key_grants_use_sudo_or_fail_loudly() {
+        assert_eq!(key_grant_plan(0, false), KeyGrantPlan::Nothing);
+        assert_eq!(key_grant_plan(0, true), KeyGrantPlan::Nothing);
+        assert_eq!(key_grant_plan(32, true), KeyGrantPlan::Sudo, "--ci with passwordless sudo: the grant, not a printout");
+        assert_eq!(key_grant_plan(32, false), KeyGrantPlan::Loud);
+        let text = exposed_keys_failure(32);
+        assert!(text.starts_with("pki: 32 private key(s) are readable by every local account"), "{text}");
+        assert!(text.contains("noo security pki fix-modes"), "{text}");
+        // the sudo path verifies, never assumes: a key nobody can chgrp is an Err with the line
+        let ca = ClusterCa::new(scratch());
+        ca.generate_ca("t", 3650).unwrap();
+        let (_, loki_key) = ca.issue_service_cert("loki", &[], &[], 90).unwrap();
+        if readable_by_uid(&loki_key, 65532) == Some(true) && mode_of(&loki_key) == 0o644 {
+            // this process could not hand it over (no root, no setfacl): the sudo path with
+            // no prompt either succeeds for real or returns the exact line
+            match grant_read_to_uid_via_sudo(&loki_key, 65532, true) {
+                Ok(()) => assert_eq!(mode_of(&loki_key), 0o640),
+                Err(line) => assert_eq!(line, format!("sudo chgrp 65532 {p} && sudo chmod 640 {p}", p = loki_key.display())),
+            }
         }
     }
 
