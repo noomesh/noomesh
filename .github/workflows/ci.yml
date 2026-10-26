@@ -1377,7 +1377,7 @@ jobs:
   # NO Python at all: the linux-gnu binary is built on the runner, then
   # executed inside a bare ubuntu:24.04 container (same glibc as
   # ubuntu-latest, no python3/python preinstalled) so nothing can silently
-  # fall back to the Python CLI.
+  # fall back to a Python install.
   standalone-smoke:
     runs-on: ubuntu-latest
     needs: [preflight, scope]

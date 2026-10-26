@@ -356,7 +356,7 @@ The agent does not read `noomesh.yaml`; `noo cluster provision` renders
 | `NOO_ALLOW_LOCAL_PYTHON_EXEC` | off | run `python_exec` in-process instead of the sandbox. Honoured only from a source checkout; **ignored (and logged) inside a container or under the launcher** (`/.dockerenv`, `/run/.containerenv`, `NOO_LAUNCHED=1`). `noo security scan` reports it set as HIGH |
 | `NOO_EGRESS_ALLOWLIST` | — | hosts tools may reach |
 | `NOO_PROACTIVE_ENABLED` | — | the proactive loop |
-| `NOO_DESIRED_MODELS`, `NOO_MODEL_VENDORS`, `NOO_MODEL_TASKS`, `NOO_MODEL_PUBLISHERS`, `NOO_MODEL_PUBLISHER_MODE`, `NOO_MODEL_FILTER_MODE` | — | model catalog filters |
+| `NOO_MODEL_VENDORS`, `NOO_MODEL_TASKS`, `NOO_MODEL_PUBLISHERS`, `NOO_MODEL_PUBLISHER_MODE`, `NOO_MODEL_FILTER_MODE` | — | model catalog filters |
 | `RESEARCH_MAP_MODEL`, `RESEARCH_REDUCE_MODEL` | — | research pipeline |
 | `RETRIEVAL_TRACKER_PATH`, `RETRIEVAL_BANDIT_PATH` | compose sets `/data/retrieval_tracker.json`, `/data/retrieval_bandit.json` | retrieval state persisted as JSON on the shared `noo-data` volume, written and read by add-on containers; `RETRIEVAL_TRACKER_FLUSH_*` and `RETRIEVAL_TRACKER_MAX_RECORDS` are add-on-only tuning |
 | `BROWSER_PORT`, `BROWSER_IDLE_TIMEOUT`, `BROWSER_MAX_SESSION`, `BROWSER_URL_ALLOWLIST`, `BROWSER_URL_BLOCKLIST`, `BROWSER_VIEWPORT_WIDTH`, `BROWSER_VIEWPORT_HEIGHT` | — | the browser tool |

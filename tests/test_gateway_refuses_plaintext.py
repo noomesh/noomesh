@@ -179,7 +179,6 @@ def test_the_scheme_sites_that_used_to_follow_the_env_are_unconditional() -> Non
         # operator_alert.rs left this list with its URL: it calls the channel
         # adapter in process the earlier change, so it builds no scheme.
         "src/noomesh/gateway/helpers.py": 'return f"https://127.0.0.1:{port}"',
-        "src/noomesh/cli_utils.py": 'return "https://localhost:8080"',
         # workers/graph.py left this list (i145): it calls the gateway through
         # llm_purposes, which builds the one https address.
         "src/noomesh/llm_purposes.py": 'or "https://gateway:8080"',

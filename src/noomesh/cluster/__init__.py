@@ -11,8 +11,4 @@
 # `cluster add-node` verb. Tier classification lives in the
 # Rust CLI and the gateway.
 
-from .cli import cluster_app
-
-__all__ = [
-    "cluster_app",
-]
+__all__: list[str] = []

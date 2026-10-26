@@ -5219,7 +5219,7 @@ pub(crate) async fn mint_tailscale_auth_key(
     let api_key = tailscale_bearer().await?;
     let tailnet = tailnet_api_name();
 
-    // Same payload as tailscale.py::_key_payload (Tailscale rejects
+    // Same payload as the retired Python tailscale module's _key_payload (Tailscale rejects
     // punctuation like ():/ in descriptions).
     let payload = json!({
         "capabilities": {"devices": {"create": {
@@ -5277,12 +5277,10 @@ pub(crate) async fn mint_tailscale_auth_key(
 /// The key is minted BY (and verified by) the Tailscale control plane —
 /// there is no local join-key verifier.
 ///
-/// DEPRECATED FIELDS (#114): `one_liner`/`script_url` compose the
-/// retired bootstrap-node.sh lane (stale mirror; superseded by proposal
-/// 30's three enrollment lanes). They stay byte-compatible with Python's
-/// `cluster/tailscale.py::_compose_result` ONLY until the Python cluster
-/// module retires — new consumers must use `auth_key` and the
-/// invite/bootstrap-token flows.
+/// The response is the key and its parameters only. The `one_liner` /
+/// `script_url` fields that composed the retired bootstrap-node.sh lane were
+/// dropped with the Python CLI, their last reader; use the invite /
+/// bootstrap-token flows to enroll a node.
 async fn mint_join_key(
     State(state): State<Arc<AppState>>,
     ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
@@ -5300,35 +5298,10 @@ async fn mint_join_key(
         .unwrap_or(60)
         .min(24 * 60);
     let reusable = body.get("reusable").and_then(|v| v.as_bool()).unwrap_or(false);
-    let ssh_user = body.get("ssh_user").and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
 
     let auth_key = mint_tailscale_auth_key(&tag, expiry_minutes, reusable)
         .await
         .map_err(AppError::Internal)?;
-
-    // tailscale.py::script_url(). The NGROK_DOMAIN arm composed
-    // `https://<domain>/bootstrap-node.sh`, a route this gateway stopped
-    // serving on 2026-09-27 — so it is gone rather than left to hand out a
-    // 404.
-    let script_url = {
-        let explicit = std::env::var("NOO_BOOTSTRAP_SCRIPT_URL").unwrap_or_default().trim().to_string();
-        if !explicit.is_empty() {
-            explicit
-        } else {
-            // noomesh/bootstrap is the PUBLIC home: the noomesh
-            // mirror this pointed at is private and stale — the URL 404'd,
-            // and a 404'd bootstrap script is a silent onboarding failure.
-            // main = released; the repo lives under the org rulesets
-            // (dev -> staging -> main), so what this serves is reviewed.
-            "https://raw.githubusercontent.com/noomesh/bootstrap/main/scripts/bootstrap-node.sh".to_string()
-        }
-    };
-    let mut args = format!("--auth-key {auth_key}");
-    if let Some(ref u) = ssh_user {
-        args.push_str(&format!(" --ssh-user {u}"));
-    }
 
     // Audit the mint. Python appended to the self-modify JSONL file
     // (workers/admin.py::_audit_log {action, tag, reusable, expiry_minutes,
@@ -5346,10 +5319,8 @@ async fn mint_join_key(
         "tag": tag,
         "expiry_minutes": expiry_minutes,
         "reusable": reusable,
-        "script_url": script_url,
-        "one_liner": format!("curl -fsSL {script_url} | sudo bash -s -- {args}"),
-        "next_step": "run the one_liner on the joining node; then \
-`noo cluster provision <node-name> --wait` on the controller",
+        "next_step": "enroll the node with `noo cluster invite` (or a bootstrap \
+token), then `noo cluster provision <node-name> --wait` on the controller",
     })))
 }
 

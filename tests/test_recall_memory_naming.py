@@ -30,7 +30,6 @@ SURFACES = [
     "gateway-rust/mcp-tools.json",
     "gateway-rust/mcp-tools-local.json",
     "src/noomesh/mcp/tool_defs",
-    "src/noomesh/recall_cli.py",
     "src/noomesh/gateway/static/openapi.json",
     "src/noomesh/gateway/static/openapi.public.json",
     "ui/apps/web/src",

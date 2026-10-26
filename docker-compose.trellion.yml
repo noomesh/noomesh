@@ -334,10 +334,8 @@ x-trellion-env: &trellion-env
   GOOGLE_API_KEY_FILE: '${GOOGLE_API_KEY:+/run/secrets/google_api_key}'
   CLOUD_DEFAULT_PROVIDER: '${CLOUD_DEFAULT_PROVIDER:-}'
   # ── Cluster / observability / misc ─────────────────────────────────
-  # NOO_TAILSCALE_API_KEY is not delivered: its only Python reader is
-  # cluster/tailscale.py, reached only from the `noomesh cluster
-  # mint-join-key` CLI (cluster/cli.py), which this container never runs.
-  # The gateway mints join keys (routes/cluster.rs) from its own file.
+  # NOO_TAILSCALE_API_KEY is not delivered: its only Python reader
+  # (cluster/tailscale.py, behind the Python CLI) is deleted. The gateway mints join keys (routes/cluster.rs) from its own file.
   NOO_TAILSCALE_TAILNET: '${NOO_TAILSCALE_TAILNET:-}'
   # The Tailscale OAuth client (NOO_TAILSCALE_OAUTH_CLIENT_ID/_SECRET, fu 50
   # item 4) is read by the gateway's routes/cluster.rs only — mint_join_key

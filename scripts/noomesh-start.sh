@@ -376,8 +376,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 if [ -f "$PROJECT_ROOT/pyproject.toml" ]; then
     # [trellion]: noo-trellion is an extra since an earlier change (it is
-    # not in the gateway image any more). The host venv backs `noo-py`, which
-    # still needs the memory subsystem for authoring and debug commands.
+    # not in the gateway image any more). The host venv is the editable
+    # install the Python tests and tooling use (there is no Python CLI).
     pip install -q -e "$PROJECT_ROOT[trellion]" 2>/dev/null || true
 fi
 

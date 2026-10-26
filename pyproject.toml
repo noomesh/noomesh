@@ -37,8 +37,6 @@ classifiers = [
 
 dependencies = [
   "typer>=0.12",
-  # Imported directly (cli_utils.py: click.get_current_context); typer pulls
-  # it in, but a direct import is declared, not borrowed.
   "click>=8.5.0",
   "rich>=15.0.0",
   "pydantic>=2.6",
@@ -132,10 +130,9 @@ all = [
 ]
 
 [project.scripts]
-# NOTE: the console script is `noo-py`, not `noo` — the `noo` name belongs to
-# the Rust front-door binary (noo-cli/, installed at ~/.local/bin/noo), which
-# passes unported commands through to `noo-py` automatically.
-noo-py = "noomesh.cli:app"
+# There is no Python CLI: `noo` is the Rust binary (noo-cli/, installed at
+# ~/.local/bin/noo) and the only command-line front door. The MCP servers
+# below are the only console scripts this package ships.
 noo-mcp-server = "noomesh.mcp.server:main"
 noo-mcp-filesystem = "noomesh.mcp.filesystem_server:main"
 noo-mcp-github = "noomesh.mcp.github_server:main"

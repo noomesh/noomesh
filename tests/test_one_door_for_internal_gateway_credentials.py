@@ -36,7 +36,6 @@ DOOR = SRC / "cluster" / "cluster_auth.py"
 # self-calls. Each is named here with its reason so the exemption is a
 # decision rather than a hole.
 EXEMPT = {
-    SRC / "cli_utils.py": "the operator's CLI, not an internal service",
     # Not a gateway call: it signs calls INTO the browser container, which
     # requires the cluster HMAC on every route. A
     # per-consumer gateway key would be the wrong credential. (Its node-agent

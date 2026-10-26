@@ -9076,7 +9076,7 @@
           "cluster"
         ],
         "summary": "Mint a Tailscale pre-auth join key",
-        "description": "[native] Rust (routes/cluster.rs). Tailscale control-plane mint; returns bootstrap one-liner. Operator surface.",
+        "description": "[native] Rust (routes/cluster.rs). Tailscale control-plane mint; returns the pre-auth key. Operator surface.",
         "responses": {
           "200": {
             "description": "OK",
@@ -9087,12 +9087,6 @@
                   "additionalProperties": true,
                   "properties": {
                     "auth_key": {
-                      "type": "string"
-                    },
-                    "one_liner": {
-                      "type": "string"
-                    },
-                    "script_url": {
                       "type": "string"
                     },
                     "next_step": {
