@@ -38,18 +38,43 @@ pub async fn create_account(
     .await
 }
 
-/// Also removes its draft sources via the composite foreign key.
+/// Disconnect is a barrier against provider replies already in flight.
+/// An unbound add-account session can resolve to the removed Google subject,
+/// so removing a verified account also cancels its owner's pending provider
+/// authorizations. Existing connections to other accounts remain intact.
 pub async fn delete_account(db: &sqlx::PgPool, owner: &str, id: Uuid) -> Result<bool, sqlx::Error> {
-    Ok(sqlx::query(
-        "DELETE FROM noo_connected_accounts WHERE id = $1 AND owner_uuid = \
-         (SELECT user_uuid FROM noo_users WHERE username = $2)",
-    )
-    .bind(id)
-    .bind(owner)
-    .execute(db)
-    .await?
-    .rows_affected()
-        != 0)
+    let mut tx = db.begin().await?;
+    let owner: Option<Uuid> =
+        sqlx::query_scalar("SELECT user_uuid FROM noo_users WHERE username=$1 FOR UPDATE")
+            .bind(owner)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(owner) = owner else {
+        return Ok(false);
+    };
+    let account: Option<(String,bool)> = sqlx::query_as("SELECT provider,provider_subject IS NOT NULL FROM noo_connected_accounts WHERE id=$1 AND owner_uuid=$2")
+        .bind(id).bind(owner).fetch_optional(&mut *tx).await?;
+    let Some((provider, verified)) = account else {
+        return Ok(false);
+    };
+    if verified {
+        sqlx::query("UPDATE noo_integration_pairings SET status='cancelled' WHERE owner_uuid=$1 AND provider=$2 AND status IN ('pending','authorizing')")
+            .bind(owner).bind(&provider).execute(&mut *tx).await?;
+        sqlx::query(
+            "DELETE FROM noo_integration_oauth_sessions WHERE owner_uuid=$1 AND provider=$2",
+        )
+        .bind(owner)
+        .bind(&provider)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("DELETE FROM noo_connected_accounts WHERE id=$1 AND owner_uuid=$2")
+        .bind(id)
+        .bind(owner)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 pub async fn sources(db: &sqlx::PgPool, owner: &str) -> Result<Vec<Value>, sqlx::Error> {
@@ -147,6 +172,10 @@ mod tests {
             .unwrap();
         sqlx::raw_sql(migration.sql).execute(&db).await.unwrap();
         sqlx::raw_sql(include_str!("../integrations/schema.sql"))
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../integrations/pairing.sql"))
             .execute(&db)
             .await
             .unwrap();

@@ -5,15 +5,17 @@
 
 use super::{AppError, AppResult};
 use crate::{
+    audit::{AuditEvent, AuditKind},
     auth::{account_of, RequesterCtx},
     connections::{AccountDraft, SourceDraft},
     repo::connections as repo,
     state::AppState,
 };
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{header, HeaderMap},
-    response::{Html, IntoResponse},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
     Extension, Json, Router,
 };
@@ -40,6 +42,19 @@ pub fn router() -> Router<Arc<AppState>> {
             get(pairing_status).delete(pairing_cancel),
         )
         .route("/api/connections/accounts/{id}/resources", get(resources))
+        .layer(middleware::from_fn(private_response_headers))
+}
+
+/// Pairing codes, OAuth tickets and personal metadata must not persist in
+/// browser/proxy HTTP caches, including responses produced by this router's
+/// handlers on error. The callback also keeps its stricter script policy.
+async fn private_response_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        "no-store".parse().expect("static header"),
+    );
+    response
 }
 
 async fn pairing_start(
@@ -47,15 +62,23 @@ async fn pairing_start(
     ctx: Option<Extension<RequesterCtx>>,
     Json(request): Json<crate::integrations::pairing::Start>,
 ) -> AppResult {
-    Ok(Json(
-        crate::integrations::pairing::start(
-            &state.db,
-            &state.config.integrations,
-            owner_id(&state, &ctx).await?,
-            request,
-        )
-        .await?,
-    ))
+    let result = crate::integrations::pairing::start(
+        &state.db,
+        &state.config.integrations,
+        owner_id(&state, &ctx).await?,
+        request,
+    )
+    .await?;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(
+            AuditKind::IntegrationPairingStarted,
+            owner(&ctx)?,
+            &format!("pairing/{}", result["id"].as_str().unwrap_or_default()),
+        ),
+    )
+    .await;
+    Ok(Json(result))
 }
 async fn pairing_lookup(
     State(state): State<Arc<AppState>>,
@@ -102,7 +125,17 @@ async fn pairing_cancel(
     ctx: Option<Extension<RequesterCtx>>,
     Path(id): Path<Uuid>,
 ) -> AppResult {
-    crate::integrations::pairing::cancel(&state.db, owner_id(&state, &ctx).await?, id).await?;
+    if crate::integrations::pairing::cancel(&state.db, owner_id(&state, &ctx).await?, id).await? {
+        crate::audit::record(
+            &state.db,
+            AuditEvent::new(
+                AuditKind::IntegrationAuthorizationCancelled,
+                owner(&ctx)?,
+                &format!("pairing/{id}"),
+            ),
+        )
+        .await;
+    }
     Ok(Json(json!({"cancelled":true})))
 }
 
@@ -144,6 +177,15 @@ async fn oauth_complete(
     let id =
         crate::integrations::oauth::complete(&state.db, &state.config.integrations, owner, request)
             .await?;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(
+            AuditKind::IntegrationConnected,
+            self::owner(&ctx)?,
+            &format!("account/{id}"),
+        ),
+    )
+    .await;
     Ok(Json(json!({"id":id,"status":"connected"})))
 }
 
@@ -157,9 +199,24 @@ async fn oauth_cancel(
     ctx: Option<Extension<RequesterCtx>>,
     Json(request): Json<Cancel>,
 ) -> AppResult {
-    crate::repo::integrations::cancel(&state.db, owner_id(&state, &ctx).await?, request.session_id)
-        .await
-        .map_err(db_error)?;
+    if crate::repo::integrations::cancel(
+        &state.db,
+        owner_id(&state, &ctx).await?,
+        request.session_id,
+    )
+    .await
+    .map_err(db_error)?
+    {
+        crate::audit::record(
+            &state.db,
+            AuditEvent::new(
+                AuditKind::IntegrationAuthorizationCancelled,
+                owner(&ctx)?,
+                &format!("oauth/{}", request.session_id),
+            ),
+        )
+        .await;
+    }
     Ok(Json(json!({"cancelled":true})))
 }
 
@@ -264,6 +321,15 @@ async fn remove_account(
     {
         return Err(AppError::NotFound("Account draft not found".into()));
     }
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(
+            AuditKind::IntegrationDisconnected,
+            owner(&ctx)?,
+            &format!("account/{id}"),
+        ),
+    )
+    .await;
     Ok(Json(json!({"removed":true})))
 }
 
@@ -303,6 +369,37 @@ async fn remove_source(
 mod tests {
     use super::*;
     use crate::auth::Role;
+
+    #[tokio::test]
+    async fn private_success_and_error_responses_are_not_cacheable() {
+        const OK_PATH: &str = "/test-success";
+        const ERROR_PATH: &str = "/test-error";
+        let app = Router::new()
+            .route(
+                OK_PATH,
+                get(|| async { Json(json!({"completion_token":"test-only-ticket"})) }),
+            )
+            .route(
+                ERROR_PATH,
+                get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+            )
+            .layer(middleware::from_fn(private_response_headers));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = crate::tls::client_builder().build().unwrap();
+        for path in [OK_PATH, ERROR_PATH] {
+            let response = client
+                .get(format!("http://{addr}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        }
+        server.abort();
+    }
 
     #[tokio::test]
     async fn public_callback_is_inert_no_store_and_its_exact_script_is_allowed() {

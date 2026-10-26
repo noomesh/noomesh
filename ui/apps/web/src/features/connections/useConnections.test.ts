@@ -5,6 +5,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const H = vi.hoisted(() => ({
   username: 'alice',
   get: vi.fn(),
+  mutations: [] as Record<string, unknown>[],
+  cancelQueries: vi.fn(),
+  removeQueries: vi.fn(),
+  invalidateQueries: vi.fn(),
   query: { current: null as null | Record<string, unknown> },
 }));
 vi.mock('@metis/core', () => ({
@@ -14,15 +18,28 @@ vi.mock('@metis/core', () => ({
     H.query.current = opts;
     return {};
   },
-  useMutation: () => ({}),
-  useQueryClient: () => ({}),
+  useMutation: (opts: Record<string, unknown>) => { H.mutations.push(opts); return opts; },
+  useQueryClient: () => ({ cancelQueries: H.cancelQueries, removeQueries: H.removeQueries, invalidateQueries: H.invalidateQueries }),
 }));
-import { useConnections } from './useConnections';
+import { useConnections, useConnectionActions } from './useConnections';
 beforeEach(() => {
   H.username = 'alice';
   H.get.mockReset();
+  H.mutations = [];
+  H.cancelQueries.mockReset().mockResolvedValue(undefined);
+  H.removeQueries.mockReset();
+  H.invalidateQueries.mockReset();
 });
 describe('private connection queries', () => {
+  it('disconnect removes cached resource names only for the current user and account', async () => {
+    useConnectionActions();
+    const removed = H.mutations[2].onSuccess as (_data: unknown, id: string) => Promise<void>;
+    await removed(undefined, 'account-a');
+    const filter = { queryKey: ['connection-resources', 'alice', 'account-a'] };
+    expect(H.cancelQueries).toHaveBeenCalledWith(filter);
+    expect(H.removeQueries).toHaveBeenCalledExactlyOnceWith(filter);
+    expect(H.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['connections', 'alice'] });
+  });
   it('uses a different cache for each Noomesh user and disables signed-out reads', () => {
     useConnections();
     expect(H.query.current?.queryKey).toEqual(['connections', 'alice']);

@@ -191,7 +191,7 @@ pub async fn status(db: &PgPool, owner: Uuid, id: Uuid) -> Result<Value, Error> 
     )
 }
 
-pub async fn cancel(db: &PgPool, owner: Uuid, id: Uuid) -> Result<(), Error> {
+pub async fn cancel(db: &PgPool, owner: Uuid, id: Uuid) -> Result<bool, Error> {
     let mut tx = db.begin().await?;
     sqlx::query("SELECT user_uuid FROM noo_users WHERE user_uuid=$1 FOR UPDATE")
         .bind(owner)
@@ -207,7 +207,7 @@ pub async fn cancel(db: &PgPool, owner: Uuid, id: Uuid) -> Result<(), Error> {
             .await?;
     }
     tx.commit().await?;
-    Ok(())
+    Ok(row.is_some())
 }
 
 #[cfg(test)]

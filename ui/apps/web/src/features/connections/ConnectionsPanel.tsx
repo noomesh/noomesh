@@ -135,7 +135,7 @@ export function ConnectionsPanel() {
       await confirm({
         title: `Remove ${account.label}?`,
         description:
-          'Removes this account, its local credentials and source settings. To revoke access at Google, use your Google account permissions.',
+          'Removes this account, its local credentials and source settings, and cancels pending Google sign-ins. Other connected accounts stay connected. To revoke access at Google, use your Google account permissions.',
         confirmText: 'Remove',
         destructive: true,
       })

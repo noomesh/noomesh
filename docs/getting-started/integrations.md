@@ -82,6 +82,32 @@ belongs only on the installation that owns its web registration. Do not bundle
 a publisher's confidential web secret in installers.
 [Google client-type policy](https://developers.google.com/identity/protocols/oauth2/policies)
 
+### Application credentials and account credentials
+
+| Item | Where it belongs |
+| --- | --- |
+| Desktop client ID and its issued Desktop credential | Public application registration; a publisher can bundle it with PKCE |
+| Web client ID | Installation configuration; the ID itself is public |
+| Web client secret | Encrypted installation secret store, delivered only to the gateway; never shared in customer binaries |
+| Google account access and refresh tokens | Encrypted database records owned by the signed-in Noomesh user; never bundled with software |
+| Pairing code and OAuth completion ticket | Short-lived setup state, never Google account credentials; HTTP responses use `Cache-Control: no-store` |
+
+Pairing changes where users approve access, not Google's authorization
+mechanism. Keep the Web client that issued the phone flow's grants. Keep a
+Desktop client while any installation or saved grant still uses it. Deleting
+an OAuth client invalidates its associated access/refresh tokens; moving to
+another client requires reconnecting the affected accounts.
+[Google client deletion](https://support.google.com/cloud/answer/15549257)
+
+The current read-only Drive and Gmail scopes are broad Google permissions;
+folder/label policies do not reduce those permissions at Google. Public
+customer use needs the appropriate Google app verification and assessment
+review. Personal development/testing is a separate use case. External apps
+in Google's Testing mode issue refresh tokens that expire after seven days
+for these scopes, so reconnecting periodically is expected during testing.
+[Scope verification](https://developers.google.com/identity/protocols/oauth2/production-readiness/restricted-scope-verification),
+[refresh-token expiry](https://developers.google.com/identity/protocols/oauth2#expiration)
+
 ## Prepare Google for a test installation
 
 Use an isolated Noomesh instance with its own database, data root and encrypted
@@ -205,6 +231,31 @@ Back up the encrypted store and database together. Losing or rotating
 `NOO_INTEGRATIONS_KEY` makes existing encrypted grants unreadable; reconnect
 every account unless its ciphertext has been migrated to the new key. There
 is no plaintext fallback. Provider outages leave saved credentials intact.
+
+### Move setup to another controller
+
+Deploy the reviewed gateway, CLI, UI and migrations through the normal stack
+release. Configure that controller's exact HTTPS callback in both Google and
+its `integrations.providers.google.web_redirect_uri`. An existing trusted
+HTTPS console address can use its normal port; the AWOLF test's extra port is
+not required on other hosts. Preserve callbacks still used by other installs.
+
+Import the installer-owned Web secret through that controller's encrypted
+secret workflow and generate its own integration encryption key. Use an
+existing real Noomesh user on both the execution CLI and approving phone.
+Run `noo auth connect google --pair` against this controller and verify that
+the displayed phone URL belongs to it. Reconnect each Google account there;
+do not copy the AWOLF test user's credentials or database rows into another
+installation. The private test app's credentials are not publisher defaults.
+
+Removing a verified account deletes local credentials and source settings and
+cancels older pending authorizations for that provider and Noomesh owner,
+including a Google response already in flight. Other connected accounts stay
+connected. Cached resource lists for the removed account are cleared from the
+UI. Removal does not revoke Google's application grant: manage that separately
+in Google account permissions when needed. Integration connection, removal,
+pairing-start and cancellation audits contain Noomesh identifiers and outcomes,
+without Google emails, tokens, codes, selected content or message bodies.
 
 ## Connect and choose content
 

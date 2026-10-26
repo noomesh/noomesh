@@ -123,6 +123,10 @@ pub(crate) enum AuditKind {
     AuthFailure, // also critical at some sites
     AuthLogout,
     AuthSuccess,
+    IntegrationAuthorizationCancelled,
+    IntegrationPairingStarted,
+    IntegrationDisconnected,
+    IntegrationConnected,
     BootstrapTokenCreate,
     BootstrapTokenDenied,
     BootstrapTokenRevoke,
@@ -249,6 +253,10 @@ impl AuditKind {
             Self::AuthFailure => "auth_failure",
             Self::AuthLogout => "auth_logout",
             Self::AuthSuccess => "auth_success",
+            Self::IntegrationAuthorizationCancelled => "integration_authorization_cancelled",
+            Self::IntegrationPairingStarted => "integration_pairing_started",
+            Self::IntegrationDisconnected => "integration_disconnected",
+            Self::IntegrationConnected => "integration_connected",
             Self::BootstrapTokenCreate => "bootstrap_token_create",
             Self::BootstrapTokenDenied => "bootstrap_token_denied",
             Self::BootstrapTokenRevoke => "bootstrap_token_revoke",
@@ -376,6 +384,10 @@ impl AuditKind {
             Self::AuthFailure => Severity::Warning,
             Self::AuthLogout => Severity::Info,
             Self::AuthSuccess => Severity::Info,
+            Self::IntegrationAuthorizationCancelled => Severity::Info,
+            Self::IntegrationPairingStarted => Severity::Info,
+            Self::IntegrationDisconnected => Severity::Info,
+            Self::IntegrationConnected => Severity::Info,
             Self::BootstrapTokenCreate => Severity::Warning,
             Self::BootstrapTokenDenied => Severity::Warning,
             Self::BootstrapTokenRevoke => Severity::Info,
@@ -500,6 +512,10 @@ impl AuditKind {
             "auth_failure" => Self::AuthFailure,
             "auth_logout" => Self::AuthLogout,
             "auth_success" => Self::AuthSuccess,
+            "integration_authorization_cancelled" => Self::IntegrationAuthorizationCancelled,
+            "integration_pairing_started" => Self::IntegrationPairingStarted,
+            "integration_disconnected" => Self::IntegrationDisconnected,
+            "integration_connected" => Self::IntegrationConnected,
             "bootstrap_token_create" => Self::BootstrapTokenCreate,
             "bootstrap_token_denied" => Self::BootstrapTokenDenied,
             "bootstrap_token_revoke" => Self::BootstrapTokenRevoke,
@@ -625,6 +641,10 @@ impl AuditKind {
             Self::AuthFailure,
             Self::AuthLogout,
             Self::AuthSuccess,
+            Self::IntegrationAuthorizationCancelled,
+            Self::IntegrationPairingStarted,
+            Self::IntegrationDisconnected,
+            Self::IntegrationConnected,
             Self::BootstrapTokenCreate,
             Self::BootstrapTokenDenied,
             Self::BootstrapTokenRevoke,
@@ -1132,6 +1152,10 @@ mod tests {
         "auth_failure",
         "auth_logout",
         "auth_success",
+        "integration_authorization_cancelled",
+        "integration_pairing_started",
+        "integration_disconnected",
+        "integration_connected",
         "bootstrap_token_create",
         "bootstrap_token_denied",
         "bootstrap_token_revoke",
@@ -1266,7 +1290,7 @@ mod tests {
         let mut want: Vec<String> = PINNED.iter().map(|s| s.to_string()).collect();
         want.sort();
         assert_eq!(got, want, "a kind was renamed, added or dropped: edit PINNED on purpose");
-        assert_eq!(PINNED.len(), 117);
+        assert_eq!(PINNED.len(), 121);
     }
 
     #[test]

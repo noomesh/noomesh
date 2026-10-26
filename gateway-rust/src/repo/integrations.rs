@@ -55,7 +55,7 @@ pub async fn take_session(
         .bind(id).bind(owner).bind(ticket).bind(state).fetch_optional(db).await
 }
 
-pub async fn cancel(db: &sqlx::PgPool, owner: Uuid, id: Uuid) -> Result<(), sqlx::Error> {
+pub async fn cancel(db: &sqlx::PgPool, owner: Uuid, id: Uuid) -> Result<bool, sqlx::Error> {
     let mut tx = db.begin().await?;
     sqlx::query("SELECT user_uuid FROM noo_users WHERE user_uuid=$1 FOR UPDATE")
         .bind(owner)
@@ -63,13 +63,14 @@ pub async fn cancel(db: &sqlx::PgPool, owner: Uuid, id: Uuid) -> Result<(), sqlx
         .await?;
     sqlx::query("UPDATE noo_integration_pairings SET status='cancelled' WHERE session_id=$1 AND owner_uuid=$2 AND status='authorizing'")
         .bind(id).bind(owner).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM noo_integration_oauth_sessions WHERE id=$1 AND owner_uuid=$2")
-        .bind(id)
-        .bind(owner)
-        .execute(&mut *tx)
-        .await?;
+    let removed =
+        sqlx::query("DELETE FROM noo_integration_oauth_sessions WHERE id=$1 AND owner_uuid=$2")
+            .bind(id)
+            .bind(owner)
+            .execute(&mut *tx)
+            .await?;
     tx.commit().await?;
-    Ok(())
+    Ok(removed.rows_affected() != 0)
 }
 
 /// Serializes identity deduplication within one Noomesh account. No provider
@@ -579,9 +580,66 @@ mod tests {
                 .await
                 .unwrap();
         }
+        // A Google response that was already in flight when the account was
+        // disconnected must not recreate its credentials. A new account-add
+        // session may resolve to the same Google subject, without target_id.
+        let in_flight = Uuid::new_v4();
+        session(
+            &db,
+            alice,
+            in_flight,
+            "google",
+            None,
+            "ticket",
+            "state",
+            &json!({}),
+        )
+        .await
+        .unwrap();
+        take_session(&db, alice, in_flight, "ticket", "state")
+            .await
+            .unwrap()
+            .unwrap();
+        let pending_pair = Uuid::new_v4();
+        sqlx::query("INSERT INTO noo_integration_pairings (id,owner_uuid,code_hash,provider,services,device_name,status,session_id,expires_at) VALUES ($1,$2,'disconnect-test-code','google',ARRAY['gmail'],'execution computer','authorizing',$3,now()+interval '10 minutes')")
+            .bind(pending_pair).bind(alice).bind(in_flight).execute(&db).await.unwrap();
+        let bobs_session = Uuid::new_v4();
+        session(
+            &db,
+            bob,
+            bobs_session,
+            "google",
+            None,
+            "ticket",
+            "state",
+            &json!({}),
+        )
+        .await
+        .unwrap();
         assert!(crate::repo::connections::delete_account(&db, "alice", a)
             .await
             .unwrap());
+        assert!(connect(&db, alice, "google", "subject-a", "a@example.test", None, &scopes, &vault, &credentials, in_flight).await.is_err(),
+            "disconnect must cancel in-flight Google grants, including unbound account-add sessions");
+        assert_eq!(
+            crate::integrations::pairing::status(&db, alice, pending_pair)
+                .await
+                .unwrap()["status"],
+            "cancelled"
+        );
+        assert!(take_session(&db, bob, bobs_session, "ticket", "state")
+            .await
+            .unwrap()
+            .is_some());
+        let mut tx = db.begin().await.unwrap();
+        assert!(
+            lock_credential(&mut tx, alice, other)
+                .await
+                .unwrap()
+                .is_some(),
+            "other connected accounts must keep their credentials"
+        );
+        tx.rollback().await.unwrap();
         let count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM noo_integration_credentials WHERE account_id=$1",
         )

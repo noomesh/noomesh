@@ -66,7 +66,12 @@ export function useConnectionActions() {
       });
       if (error) throw new Error('Unable to remove the account.');
     },
-    onSuccess: refresh,
+    onSuccess: async (_data, id: string) => {
+      const queryKey = ['connection-resources', user?.username, id];
+      await qc.cancelQueries({ queryKey });
+      qc.removeQueries({ queryKey });
+      await refresh();
+    },
   });
   const removeSource = useMutation({
     mutationFn: async (id: string) => {

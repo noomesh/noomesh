@@ -35,6 +35,14 @@ node_modules/
 docker-compose.override.yml
 
 # Data (mounted as volumes, not baked into image)
+# Installation credentials/config never belong in a build context, including
+# a local build against a remote daemon. Examples remain part of the source.
+.env
+.env.local
+.sops.yaml
+noomesh.yaml
+pki/
+secrets/
 .pki-placeholder/
 data/
 logs/
