@@ -5,6 +5,7 @@
 //! and permissions are reviewed code, not URLs supplied by a connection owner.
 pub mod crypto;
 pub mod oauth;
+pub mod pairing;
 pub mod provider;
 
 use serde::{Deserialize, Serialize};

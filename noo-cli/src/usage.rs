@@ -373,7 +373,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["mcp", "unplace"], "<id> <node>", "Remove an external MCP server's placement from a node"),
     (&["mcp", "import"], "[<file>] [--dry-run]", "Upsert external MCP servers and placements from a YAML data file"),
     (&["mcp", "export"], "[-f|--file <path>]", "Snapshot the external MCP server registry as an importable YAML data file"),
-    (&["auth", "connect"], "google [--drive] [--gmail]", "Connect Google through your browser; keep account tokens encrypted in Noomesh"),
+    (&["auth", "connect"], "google [--drive] [--gmail] [--pair]", "Connect Google in a browser; --pair displays a code to approve on your phone"),
     (&["auth", "login"], "[<username>] [-u <username>] [--password-stdin]", "Log in to the gateway and store a per-user access/refresh credential"),
     (&["auth", "status"], "", "Show which credential this CLI would use and whether the gateway accepts it"),
     (&["auth", "logout"], "", "Revoke the stored refresh token server-side and delete the local credential"),

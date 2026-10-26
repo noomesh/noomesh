@@ -32,7 +32,78 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/connections/oauth/complete", post(oauth_complete))
         .route("/api/connections/oauth/cancel", post(oauth_cancel))
         .route("/api/connections/oauth/callback", get(oauth_callback))
+        .route("/api/connections/pairing/start", post(pairing_start))
+        .route("/api/connections/pairing/lookup", post(pairing_lookup))
+        .route("/api/connections/pairing/approve", post(pairing_approve))
+        .route(
+            "/api/connections/pairing/{id}",
+            get(pairing_status).delete(pairing_cancel),
+        )
         .route("/api/connections/accounts/{id}/resources", get(resources))
+}
+
+async fn pairing_start(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<RequesterCtx>>,
+    Json(request): Json<crate::integrations::pairing::Start>,
+) -> AppResult {
+    Ok(Json(
+        crate::integrations::pairing::start(
+            &state.db,
+            &state.config.integrations,
+            owner_id(&state, &ctx).await?,
+            request,
+        )
+        .await?,
+    ))
+}
+async fn pairing_lookup(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<RequesterCtx>>,
+    Json(request): Json<crate::integrations::pairing::Code>,
+) -> AppResult {
+    Ok(Json(
+        crate::integrations::pairing::lookup(
+            &state.db,
+            owner_id(&state, &ctx).await?,
+            &request.code,
+        )
+        .await?,
+    ))
+}
+async fn pairing_approve(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<RequesterCtx>>,
+    headers: HeaderMap,
+    Json(request): Json<crate::integrations::pairing::Code>,
+) -> AppResult {
+    Ok(Json(
+        crate::integrations::pairing::approve(
+            &state.db,
+            &state.config.integrations,
+            owner_id(&state, &ctx).await?,
+            &request.code,
+            headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()),
+        )
+        .await?,
+    ))
+}
+async fn pairing_status(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<RequesterCtx>>,
+    Path(id): Path<Uuid>,
+) -> AppResult {
+    Ok(Json(
+        crate::integrations::pairing::status(&state.db, owner_id(&state, &ctx).await?, id).await?,
+    ))
+}
+async fn pairing_cancel(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<RequesterCtx>>,
+    Path(id): Path<Uuid>,
+) -> AppResult {
+    crate::integrations::pairing::cancel(&state.db, owner_id(&state, &ctx).await?, id).await?;
+    Ok(Json(json!({"cancelled":true})))
 }
 
 async fn owner_id(
@@ -122,7 +193,7 @@ async fn resources(
 /// accounts. Only the authenticated opener can complete its one-time session.
 async fn oauth_callback() -> impl IntoResponse {
     ([(header::CACHE_CONTROL,"no-store"), (header::REFERRER_POLICY,"no-referrer"),
-      (header::CONTENT_SECURITY_POLICY,"default-src 'none'; script-src 'sha256-gzPK3Me2OsEcw1T00/g7rvFClgDmVm5qwTeBSQcq92c='; base-uri 'none'; frame-ancestors 'none'")],
+      (header::CONTENT_SECURITY_POLICY,"default-src 'none'; script-src 'sha256-cU6HJtNo/BfDK1VP5yVrbp4G5vigGSrVQCKScM8G/nE='; base-uri 'none'; frame-ancestors 'none'")],
       Html(include_str!("../integrations/callback.html")))
 }
 
@@ -281,6 +352,11 @@ mod tests {
             }));
             assert_eq!(owner(&ctx).unwrap(), "alice");
             let requester = &ctx.as_ref().unwrap().0;
+            let pairing = format!("/api/connections/pairing/{}", Uuid::new_v4());
+            for method in [axum::http::Method::GET, axum::http::Method::DELETE] {
+                assert!(crate::auth::requester_allows(requester, &method, &pairing));
+            }
+            assert!(!crate::auth::PUBLIC_PATHS_EXACT.contains(&"/api/connections/pairing/lookup"));
             assert!(crate::auth::requester_allows(
                 requester,
                 &axum::http::Method::GET,
@@ -295,6 +371,9 @@ mod tests {
                 "/api/connections/oauth/start",
                 "/api/connections/oauth/complete",
                 "/api/connections/oauth/cancel",
+                "/api/connections/pairing/start",
+                "/api/connections/pairing/lookup",
+                "/api/connections/pairing/approve",
             ] {
                 assert!(crate::auth::requester_allows(
                     requester,

@@ -86,3 +86,10 @@
   display: block;
   padding: 0.3rem 0;
 }
+.pairing-page { width: min(100% - 2rem, 34rem); margin: 3rem auto; padding: 1rem; }
+.pairing-page h1, .pairing-page h2 { margin-bottom: 1rem; }
+.pairing-page p { margin: 1rem 0; }
+.pairing-page form { display: grid; gap: 1rem; }
+.pairing-page input { padding: .75rem; font-size: 1.4rem; letter-spacing: .12em; text-transform: uppercase; }
+.pairing-page button { padding: .75rem 1rem; border: 1px solid currentColor; border-radius: .4rem; cursor: pointer; }
+.pairing-actions { display: flex; gap: 1rem; flex-wrap: wrap; }

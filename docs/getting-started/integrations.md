@@ -25,6 +25,50 @@ It sends the authorization response to that gateway; access and refresh tokens
 are exchanged there and never returned to the CLI or browser.
 [Google desktop authorization](https://developers.google.com/identity/protocols/oauth2/native-app)
 
+### Approve from your phone with a pairing code
+
+On the execution computer, run:
+
+```bash
+noo auth connect google --pair
+# Or choose a service:
+noo auth connect google --gmail --pair
+```
+
+The CLI displays an HTTPS link and a code such as `ABCDE-FGHJK`, then waits.
+On your phone, open that link, sign in to **the same Noomesh account as the
+CLI**, enter the code, and review the device and requested services. Continue
+to Google, choose an account, and approve access. The phone returns to Noomesh
+and the waiting CLI reports success. Run the command again to add another
+Google account. The phone flow uses a full-page redirect, without pop-ups or
+installing a phone app. A QR code is not required.
+
+Codes expire after ten minutes and can start authorization only once. A code
+does not sign the phone in to Noomesh. Cancellation on the phone stops the
+waiting CLI; closing the CLI leaves a request that expires automatically.
+Requests are private to their Noomesh owner, including when an operator or
+administrator connects an account. A successful grant is saved together with
+the pairing result, so a cancelled or expired request cannot save credentials
+after Google responds. No Google tokens are sent to the execution CLI or phone.
+
+**Installer setup:** this mode needs a **Web application** OAuth client with
+the installation's exact HTTPS callback registered in Google, plus its secret
+and the integration encryption key. Use the existing
+`/api/connections/oauth/callback` callback. The link comes from that callback's
+origin and opens `/#/connect`; the phone must be able to reach it with a
+trusted certificate. For a Tailscale-only installation, the phone must join
+the same tailnet and its access policy must permit the console port.
+The existing Desktop-only registration is sufficient for the local-browser
+helper, but does not enable this browser-only phone flow. A publisher-operated
+authorization relay for arbitrary installer hostnames is not included.
+
+This is Noomesh's own pairing handoff around ordinary provider authorization.
+Google's TV/device-code flow does not support the Gmail or `drive.readonly`
+scopes used here. Other integration adapters can reuse the pairing endpoints,
+expiry, owner checks, phone return and CLI polling with their registered Web
+OAuth application; they must still implement provider identity and scopes.
+[Google device-flow scopes](https://developers.google.com/identity/protocols/oauth2/limited-input-device#allowedscopes)
+
 A publisher can bundle its registered Desktop client ID and Google-issued
 Desktop credential using `NOO_GOOGLE_DESKTOP_CLIENT_ID` and
 `NOO_GOOGLE_DESKTOP_CLIENT_SECRET` in the **gateway build environment**.

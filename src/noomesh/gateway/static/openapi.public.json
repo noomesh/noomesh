@@ -1730,6 +1730,142 @@
           "next_page_token"
         ],
         "additionalProperties": false
+      },
+      "ConnectionPairingStart": {
+        "type": "object",
+        "properties": {
+          "provider": {
+            "type": "string",
+            "enum": [
+              "google"
+            ]
+          },
+          "services": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "google_drive",
+                "gmail"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 2,
+            "uniqueItems": true
+          },
+          "device_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          }
+        },
+        "required": [
+          "provider",
+          "services",
+          "device_name"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionPairingCode": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "maxLength": 32
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionPairingSession": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "verification_uri": {
+            "type": "string"
+          },
+          "expires_in": {
+            "type": "integer"
+          },
+          "interval": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "verification_uri",
+          "expires_in",
+          "interval"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionPairingPreview": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "services": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "device_name": {
+            "type": "string"
+          },
+          "expires_in": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "provider",
+          "services",
+          "device_name",
+          "expires_in"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionPairingStatus": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "authorizing",
+              "connected",
+              "cancelled",
+              "expired"
+            ]
+          },
+          "account_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "status",
+          "account_id"
+        ],
+        "additionalProperties": false
       }
     }
   }

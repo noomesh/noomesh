@@ -2201,10 +2201,15 @@ CREATE INDEX ix_connection_sources_account ON noo_connection_sources(account_id,
     revision: INTEGRATION_OAUTH_REVISION,
     down_revision: Some(CONNECTIONS_REVISION),
     sql: include_str!("integrations/schema.sql"),
+}, Migration {
+    revision: INTEGRATION_PAIRING_REVISION,
+    down_revision: Some(INTEGRATION_OAUTH_REVISION),
+    sql: include_str!("integrations/pairing.sql"),
 }];
 
 pub const CONNECTIONS_REVISION: &str = "103_connection_drafts";
 pub const INTEGRATION_OAUTH_REVISION: &str = "104_integration_oauth";
+pub const INTEGRATION_PAIRING_REVISION: &str = "105_integration_pairing";
 
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A

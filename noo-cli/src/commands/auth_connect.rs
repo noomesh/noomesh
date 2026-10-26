@@ -168,12 +168,74 @@ fn run(g: &Globals, provider: &str, services: Vec<&str>) -> Result<Value, String
     result
 }
 
+fn run_pairing(g: &Globals, provider: &str, services: Vec<&str>) -> Result<Value, String> {
+    let device = std::env::var("COMPUTERNAME")
+        .ok()
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .unwrap_or_else(|| "execution computer".into());
+    let start = crate::http::post_json_try(
+        g,
+        "/api/connections/pairing/start",
+        &json!({"provider":provider,"services":services,"device_name":device.trim()}),
+        true,
+        30,
+    )?;
+    let id = start["id"].as_str().ok_or("Invalid pairing response")?;
+    let code = start["code"].as_str().ok_or("Invalid pairing response")?;
+    let uri = start["verification_uri"]
+        .as_str()
+        .filter(|u| u.starts_with("https://"))
+        .ok_or("Pairing needs an HTTPS phone link")?;
+    let expires = start["expires_in"].as_u64().unwrap_or(600).clamp(1, 600);
+    let interval = start["interval"].as_u64().unwrap_or(5).clamp(5, 30);
+    eprintln!("On your phone, open:\n{uri}\n\nPairing code: {code}\n\nSign in to the same Noomesh account as this CLI, enter the code, and approve access.\nWaiting up to {} minutes…", expires.div_ceil(60));
+    let path = format!("/api/connections/pairing/{id}");
+    let result = (|| {
+        let deadline = Instant::now() + Duration::from_secs(expires);
+        loop {
+            let response = crate::http::get_json_try(g, &path, true, 20)?;
+            match response["status"].as_str() {
+                Some("connected") => {
+                    let id = response["account_id"]
+                        .as_str()
+                        .ok_or("Invalid connection result")?;
+                    return Ok(json!({"id":id,"status":"connected"}));
+                }
+                Some("pending" | "authorizing") => {}
+                Some("cancelled") => return Err("Pairing cancelled. Start again when ready".into()),
+                Some("expired") => break,
+                _ => return Err("Unexpected pairing status".into()),
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(
+                Duration::from_secs(interval)
+                    .min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+        Err("Pairing expired. Run the connect command again for a new code".into())
+    })();
+    if result.is_err() {
+        let _ = crate::http::delete_json_try(g, &path, true, 15);
+    }
+    result
+}
+
 pub fn auth_connect(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if args.first().map(String::as_str) != Some("google") {
         return Err(Unhandled);
     }
     let mut services = Vec::new();
+    let mut pairing = false;
     for flag in &args[1..] {
+        if flag == "--pair" {
+            if pairing {
+                return Err(Unhandled);
+            }
+            pairing = true;
+            continue;
+        }
         let service = match flag.as_str() {
             "--drive" => "google_drive",
             "--gmail" => "gmail",
@@ -187,7 +249,11 @@ pub fn auth_connect(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if services.is_empty() {
         services.extend(["google_drive", "gmail"]);
     }
-    match run(g, "google", services) {
+    match if pairing {
+        run_pairing(g, "google", services)
+    } else {
+        run(g, "google", services)
+    } {
         Ok(value) => {
             if g.json {
                 println!("{value}");

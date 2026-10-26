@@ -73,6 +73,14 @@ implementation provides ingestion and activation.
 scope definitions; `oauth.rs` holds the reusable lifecycle and Google resource
 adapter; `crypto.rs` implements the vault. Storage is in
 `gateway-rust/src/repo/integrations.rs`. The mesh migration
+`105_integration_pairing` adds owner-bound, single-use CLI-to-phone handoffs.
+`noo auth connect google --pair` displays a ten-minute code and a phone URL.
+The same signed-in Noomesh owner reviews the device and services on the phone,
+then completes the existing Web OAuth flow. CLI polling receives only status
+and the connected account ID. Completion and credential storage commit
+together; cancellation and user erasure also remove pending grants. See the
+[phone setup guide](../getting-started/integrations.md#approve-from-your-phone-with-a-pairing-code).
+
 `104_integration_oauth` adds credentials, sessions, verified identity and
 account authorization status after the original source-draft migration.
 

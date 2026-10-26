@@ -517,7 +517,7 @@ the lock. The layout both locks are published in is in
 ### `noo auth` — Per-user CLI credentials
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo auth connect` | `google [--drive] [--gmail]` | Connect Google through your browser; keep account tokens encrypted in Noomesh |
+| `noo auth connect` | `google [--drive] [--gmail] [--pair]` | Connect Google in a browser; --pair displays a code to approve on your phone |
 | `noo auth login` | `[<username>] [-u <username>] [--password-stdin]` | Log in to the gateway and store a per-user access/refresh credential |
 | `noo auth status` | — | Show which credential this CLI would use and whether the gateway accepts it |
 | `noo auth logout` | — | Revoke the stored refresh token server-side and delete the local credential |

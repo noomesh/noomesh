@@ -20996,6 +20996,256 @@
           }
         ]
       }
+    },
+    "/api/connections/pairing/start": {
+      "post": {
+        "operationId": "connection_pairing_start",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Start a remote integration handoff",
+        "description": "Same signed-in Noomesh owner on terminal and phone. Codes expire after ten minutes and are single use. Google credentials remain encrypted on the gateway.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionPairingSession"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or expired authorization"
+          },
+          "401": {
+            "description": "Sign-in required"
+          },
+          "403": {
+            "description": "Signed-in owner required"
+          },
+          "404": {
+            "description": "Owned connection not found"
+          },
+          "409": {
+            "description": "Reconnect required"
+          },
+          "503": {
+            "description": "Provider or installer configuration unavailable"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionPairingStart"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/connections/pairing/lookup": {
+      "post": {
+        "operationId": "connection_pairing_lookup",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Lookup a remote integration handoff",
+        "description": "Same signed-in Noomesh owner on terminal and phone. Codes expire after ten minutes and are single use. Google credentials remain encrypted on the gateway.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionPairingPreview"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or expired authorization"
+          },
+          "401": {
+            "description": "Sign-in required"
+          },
+          "403": {
+            "description": "Signed-in owner required"
+          },
+          "404": {
+            "description": "Owned connection not found"
+          },
+          "409": {
+            "description": "Reconnect required"
+          },
+          "503": {
+            "description": "Provider or installer configuration unavailable"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionPairingCode"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/connections/pairing/approve": {
+      "post": {
+        "operationId": "connection_pairing_approve",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Approve a remote integration handoff",
+        "description": "Same signed-in Noomesh owner on terminal and phone. Codes expire after ten minutes and are single use. Google credentials remain encrypted on the gateway.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionOAuthSession"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or expired authorization"
+          },
+          "401": {
+            "description": "Sign-in required"
+          },
+          "403": {
+            "description": "Signed-in owner required"
+          },
+          "404": {
+            "description": "Owned connection not found"
+          },
+          "409": {
+            "description": "Reconnect required"
+          },
+          "503": {
+            "description": "Provider or installer configuration unavailable"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionPairingCode"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/connections/pairing/{id}": {
+      "get": {
+        "operationId": "connection_pairing_status",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Status an owned handoff",
+        "description": "Same signed-in Noomesh owner on terminal and phone. Codes expire after ten minutes and are single use. Google credentials remain encrypted on the gateway.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionPairingStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or expired authorization"
+          },
+          "401": {
+            "description": "Sign-in required"
+          },
+          "403": {
+            "description": "Signed-in owner required"
+          },
+          "404": {
+            "description": "Owned connection not found"
+          },
+          "409": {
+            "description": "Reconnect required"
+          },
+          "503": {
+            "description": "Provider or installer configuration unavailable"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ]
+      },
+      "delete": {
+        "operationId": "connection_pairing_cancel",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Cancel an owned handoff",
+        "description": "Same signed-in Noomesh owner on terminal and phone. Codes expire after ten minutes and are single use. Google credentials remain encrypted on the gateway.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionOAuthCancelled"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or expired authorization"
+          },
+          "401": {
+            "description": "Sign-in required"
+          },
+          "403": {
+            "description": "Signed-in owner required"
+          },
+          "404": {
+            "description": "Owned connection not found"
+          },
+          "409": {
+            "description": "Reconnect required"
+          },
+          "503": {
+            "description": "Provider or installer configuration unavailable"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -21643,6 +21893,142 @@
         "required": [
           "items",
           "next_page_token"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionPairingStart": {
+        "type": "object",
+        "properties": {
+          "provider": {
+            "type": "string",
+            "enum": [
+              "google"
+            ]
+          },
+          "services": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "google_drive",
+                "gmail"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 2,
+            "uniqueItems": true
+          },
+          "device_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          }
+        },
+        "required": [
+          "provider",
+          "services",
+          "device_name"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionPairingCode": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "maxLength": 32
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionPairingSession": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "verification_uri": {
+            "type": "string"
+          },
+          "expires_in": {
+            "type": "integer"
+          },
+          "interval": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "verification_uri",
+          "expires_in",
+          "interval"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionPairingPreview": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "services": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "device_name": {
+            "type": "string"
+          },
+          "expires_in": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "provider",
+          "services",
+          "device_name",
+          "expires_in"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionPairingStatus": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "authorizing",
+              "connected",
+              "cancelled",
+              "expired"
+            ]
+          },
+          "account_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "status",
+          "account_id"
         ],
         "additionalProperties": false
       }

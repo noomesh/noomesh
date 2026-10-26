@@ -1056,6 +1056,11 @@ fn erase_targets(keep_account: bool, episodes_have_user_id: bool) -> Vec<EraseTa
             table: "noo_integration_oauth_sessions",
             where_sql: "owner_uuid = (SELECT user_uuid FROM noo_users WHERE username = $1)",
         },
+        EraseTarget {
+            label: "integration_pairings",
+            table: "noo_integration_pairings",
+            where_sql: "owner_uuid = (SELECT user_uuid FROM noo_users WHERE username = $1)",
+        },
         // Account removal cascades source selections and encrypted credentials.
         EraseTarget {
             label: "connection_accounts",
@@ -4440,6 +4445,7 @@ mod tests {
         for keep in [true, false] {
             let t = super::erase_targets(keep, true);
             assert!(t.iter().any(|x| x.table == "noo_integration_oauth_sessions" && x.where_sql == "owner_uuid = (SELECT user_uuid FROM noo_users WHERE username = $1)"));
+            assert!(t.iter().any(|x| x.table == "noo_integration_pairings" && x.where_sql == "owner_uuid = (SELECT user_uuid FROM noo_users WHERE username = $1)"));
             let target = t.iter().find(|x| x.table == "noo_connected_accounts").expect("connection drafts must be erased");
             assert_eq!(target.where_sql, "owner_uuid = (SELECT user_uuid FROM noo_users WHERE username = $1)");
         }

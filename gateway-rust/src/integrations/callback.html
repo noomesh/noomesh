@@ -1,12 +1,22 @@
 <!doctype html><html lang="en"><meta charset="utf-8"><title>Google connection</title><body><p id="status">Returning to Noomesh…</p><script>
 const params = new URLSearchParams(location.search);
 history.replaceState(null, '', location.pathname);
-if (params.get('state')) {
+let handoff = false;
+try {
+  const pending = JSON.parse(sessionStorage.getItem('noomesh:pairing-oauth') || 'null');
+  const code = params.get('code');
+  if (pending && pending.expires_at > Date.now() && pending.state === params.get('state') && params.getAll('state').length === 1 && (params.has('error') || (code && code.length <= 8192 && params.getAll('code').length === 1))) {
+    sessionStorage.setItem('noomesh:pairing-result', JSON.stringify({state: pending.state, code: params.has('error') ? null : code, error: params.has('error')}));
+    handoff = true;
+    location.replace('/#/connect');
+  }
+} catch {}
+if (!handoff && params.get('state')) {
   const channel = new BroadcastChannel('noomesh:oauth:' + params.get('state'));
   channel.postMessage({type: 'noomesh:oauth-result', state: params.get('state'), code: params.get('code'), error: params.get('error')});
   channel.close();
   document.getElementById('status').textContent = 'Return to the Noomesh window to finish connecting.';
-} else {
+} else if (!handoff) {
   document.getElementById('status').textContent = 'Return to Noomesh and click Connect again.';
 }
 </script></body></html>

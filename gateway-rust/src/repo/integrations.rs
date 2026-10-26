@@ -56,11 +56,19 @@ pub async fn take_session(
 }
 
 pub async fn cancel(db: &sqlx::PgPool, owner: Uuid, id: Uuid) -> Result<(), sqlx::Error> {
+    let mut tx = db.begin().await?;
+    sqlx::query("SELECT user_uuid FROM noo_users WHERE user_uuid=$1 FOR UPDATE")
+        .bind(owner)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE noo_integration_pairings SET status='cancelled' WHERE session_id=$1 AND owner_uuid=$2 AND status='authorizing'")
+        .bind(id).bind(owner).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM noo_integration_oauth_sessions WHERE id=$1 AND owner_uuid=$2")
         .bind(id)
         .bind(owner)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -91,6 +99,16 @@ pub async fn connect(
     if pending.is_none() {
         return Err(Error::Invalid(
             "Sign-in expired or was cancelled. Connect again".into(),
+        ));
+    }
+    // Pairing cancellation/expiry must win even when Google responds while
+    // the execution terminal is cancelling. This shares the user-row lock
+    // with cancellation and erasure, and commits with credential storage.
+    let pairing: Option<(String, bool)> = sqlx::query_as("SELECT status, expires_at>now() FROM noo_integration_pairings WHERE session_id=$1 AND owner_uuid=$2 FOR UPDATE")
+        .bind(session_id).bind(owner).fetch_optional(&mut *tx).await?;
+    if pairing.is_some_and(|(status, valid)| status != "authorizing" || !valid) {
+        return Err(Error::Invalid(
+            "Pairing expired or was cancelled. Start again from the terminal".into(),
         ));
     }
     if let Some(target) = target {
@@ -133,6 +151,8 @@ pub async fn connect(
             .execute(&mut *tx)
             .await?;
     }
+    sqlx::query("UPDATE noo_integration_pairings SET status='connected',account_id=$3 WHERE session_id=$1 AND owner_uuid=$2 AND status='authorizing'")
+        .bind(session_id).bind(owner).bind(id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM noo_integration_oauth_sessions WHERE id=$1 AND owner_uuid=$2")
         .bind(session_id)
         .bind(owner)
@@ -243,6 +263,10 @@ mod tests {
             .unwrap();
         sqlx::raw_sql(migration.sql).execute(&db).await.unwrap();
         sqlx::raw_sql(include_str!("../integrations/schema.sql"))
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../integrations/pairing.sql"))
             .execute(&db)
             .await
             .unwrap();
@@ -443,6 +467,118 @@ mod tests {
         )
         .await
         .is_err());
+        // Pairing uses the existing encrypted grant lifecycle, with atomic
+        // completion and cancellation, and never crosses Noomesh owners.
+        for mode in ["success", "cancelled", "expired"] {
+            let pairing_id = Uuid::new_v4();
+            let session_id = Uuid::new_v4();
+            let code = hash("ABCDEFGHJK");
+            sqlx::query("INSERT INTO noo_integration_pairings (id,owner_uuid,code_hash,provider,services,device_name,expires_at) VALUES ($1,$2,$3,'google',ARRAY['gmail'],'execution computer',now()+interval '10 minutes')")
+                .bind(pairing_id).bind(alice).bind(&code).execute(&db).await.unwrap();
+            assert!(
+                crate::integrations::pairing::lookup(&db, bob, "ABCDE-FGHJK")
+                    .await
+                    .is_err()
+            );
+            assert!(crate::integrations::pairing::status(&db, bob, pairing_id)
+                .await
+                .is_err());
+            let preview = crate::integrations::pairing::lookup(&db, alice, "abcde fghjk")
+                .await
+                .unwrap();
+            assert_eq!(preview["device_name"], "execution computer");
+            let mut config = crate::integrations::IntegrationConfig::default();
+            config.providers.insert(
+                "google".into(),
+                crate::integrations::OAuthApps {
+                    web_redirect_uri: "https://noomesh.example/api/connections/oauth/callback"
+                        .into(),
+                    ..Default::default()
+                },
+            );
+            assert!(crate::integrations::pairing::approve(
+                &db,
+                &config,
+                alice,
+                "ABCDE-FGHJK",
+                Some("https://wrong.example")
+            )
+            .await
+            .is_err());
+            assert_eq!(
+                crate::integrations::pairing::status(&db, alice, pairing_id)
+                    .await
+                    .unwrap()["status"],
+                "pending"
+            );
+            session(
+                &db,
+                alice,
+                session_id,
+                "google",
+                None,
+                "ticket",
+                "state",
+                &json!({}),
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE noo_integration_pairings SET status='authorizing',session_id=$2 WHERE id=$1").bind(pairing_id).bind(session_id).execute(&db).await.unwrap();
+            take_session(&db, alice, session_id, "ticket", "state")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                crate::integrations::pairing::lookup(&db, alice, "ABCDE-FGHJK")
+                    .await
+                    .is_err()
+            );
+            crate::integrations::pairing::cancel(&db, bob, pairing_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                crate::integrations::pairing::status(&db, alice, pairing_id)
+                    .await
+                    .unwrap()["status"],
+                "authorizing"
+            );
+            if mode == "cancelled" {
+                crate::integrations::pairing::cancel(&db, alice, pairing_id)
+                    .await
+                    .unwrap();
+            } else if mode == "expired" {
+                sqlx::query("UPDATE noo_integration_pairings SET expires_at=now()-interval '1 second' WHERE id=$1").bind(pairing_id).execute(&db).await.unwrap();
+            }
+            let result = connect(
+                &db,
+                alice,
+                "google",
+                &format!("pair-{mode}"),
+                "paired@example.test",
+                None,
+                &scopes,
+                &vault,
+                &credentials,
+                session_id,
+            )
+            .await;
+            assert_eq!(result.is_ok(), mode == "success");
+            let status = crate::integrations::pairing::status(&db, alice, pairing_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                status["status"],
+                if mode == "success" { "connected" } else { mode }
+            );
+            if let Ok(account) = result {
+                assert_eq!(status["account_id"], account.to_string());
+            }
+            sqlx::query("DELETE FROM noo_integration_pairings WHERE id=$1")
+                .bind(pairing_id)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
         assert!(crate::repo::connections::delete_account(&db, "alice", a)
             .await
             .unwrap());
