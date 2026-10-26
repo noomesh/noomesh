@@ -149,6 +149,11 @@ per call). Three things keep such a turn from being lost:
   A chat turn whose CLI stalled before its first model call ran no tool, so
   the gateway runs that turn itself and the console gets an answer instead
   of an error.
+- **A kind change drains instead of dropping.** Changing a node's harness
+  kind restarts the harness; it now stops taking work on the stop signal
+  and gives what it holds `NOO_HARNESS_DRAIN_SECS` (default 120 s) to
+  finish before it exits, so a turn or task in flight is not lost to the
+  switch.
 - **Reasoning can be switched off per node.** Place the harness with
   `--env NOO_HARNESS_THINKING=off` and every model call on that node asks the
   model not to reason, for the `noo` loop and for a foreign kind's CLI

@@ -3761,6 +3761,7 @@ const DARWIN_HARNESS_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
   </array>
   <key>RunAtLoad</key><false/>
   <key>KeepAlive</key><true/>
+  <key>ExitTimeOut</key><integer>150</integer>
   <key>StandardOutPath</key><string>/tmp/noomesh-harness.log</string>
   <key>StandardErrorPath</key><string>/tmp/noomesh-harness.log</string>
 </dict></plist>
@@ -6077,5 +6078,16 @@ pub(crate) mod phase_src {
         let last = body("report_provisioned");
         let end = code.find(last).expect("last phase") + last.len();
         &code[start..end]
+    }
+}
+
+#[cfg(test)]
+mod darwin_harness_plist_tests {
+    /// launchd sends SIGKILL `ExitTimeOut` seconds after SIGTERM (default
+    /// 20): the harness drains for NOO_HARNESS_DRAIN_SECS (120) on a stop, so
+    /// the plist leaves it that plus 30 s, like the unit's TimeoutStopSec.
+    #[test]
+    fn the_harness_plist_leaves_time_to_drain() {
+        assert!(super::DARWIN_HARNESS_PLIST.contains("<key>ExitTimeOut</key><integer>150</integer>"));
     }
 }

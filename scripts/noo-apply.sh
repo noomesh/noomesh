@@ -430,7 +430,7 @@ env_payload_ok() {
 # the wrong section, a `StandardOutput=file:` that pid 1 opens as root, or a
 # line hidden behind a CR through; an exact match lets nothing through.
 AGENT_UNIT_SHA256="946dede0eb81ab164afb4d61e9000ffc38d550dc0424333ff792c4dc16bf02e4"
-HARNESS_UNIT_SHA256="0381295b535fd8084cc33667901dc3d02317cfe5307b95a02a2f404d470173d7"
+HARNESS_UNIT_SHA256="9c22724a7e290dd1040ad171c046194739434206727daed0cdf46797415cdd40"
 unit_payload_ok() {
     _f="$1"; _kind="$2"
     case "$_kind" in

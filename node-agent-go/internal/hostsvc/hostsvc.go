@@ -282,7 +282,10 @@ func lifecycleViaHostd(ctx context.Context, op string) error {
 	// Wait for the result: convergeHarness needs to know whether the start
 	// took, so it can record a refusal naming the reason rather than leave
 	// the controller to infer one from silence.
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	// A stop drains for up to the unit's TimeoutStopSec (150 s): wait longer
+	// than that, so a restart on a kind change is reported as it ends, not as
+	// a timeout while systemd is still waiting on the old harness.
+	ctx, cancel := context.WithTimeout(ctx, 180*time.Second)
 	defer cancel()
 	for {
 		res, rerr := hostd.ReadResult(hostd.WorkerSpoolDir, name)
@@ -297,7 +300,7 @@ func lifecycleViaHostd(ctx context.Context, op string) error {
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("%s: hostd did not answer within 60s (command %s still queued)", op, name)
+			return fmt.Errorf("%s: hostd did not answer within 180s (command %s still queued)", op, name)
 		case <-time.After(500 * time.Millisecond):
 		}
 	}

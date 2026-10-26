@@ -83,6 +83,7 @@ The node agent sets all of this from the placement.
 | `NOO_HARNESS_KIND` | the loop kind (a kind from `config/harness-kinds.json`). Not in the shipped env file: when unset, the reference harness asks its node agent, `GET /harness/placement` on the model endpoint's agent (`{"kind", "env", "desired_state", "placed"}`), and runs `noo` when the agent answers 404 or `placed: false`. Any other answer (unreachable, 401/403, 5xx, a body that does not parse) is asked again a few times, then the harness exits non-zero with `harness: cannot learn this node's harness kind from its agent: <cause>; refusing to guess` — it never guesses `noo` under a placement it could not read. The node agent reports the kind it started the harness with as `host_services.harness.kind` while it runs. It runs its own loop for `noo` and the foreign-CLI driver (section 9) for any other kind |
 | `NOO_HARNESS_TURN_TIMEOUT_SECS` | a foreign CLI's wall-clock limit per invocation (default 900) |
 | `NOO_HARNESS_STALL_SECS` | how long a foreign CLI may go without reaching the model through the wire translator before it is killed as stalled, with the reason in the loop note (default 300; a chat turn uses the smaller of this and 120). A hung CLI no longer runs to the wall-clock limit three loops in a row |
+| `NOO_HARNESS_DRAIN_SECS` | on SIGTERM, how long the harness gives the turns and tasks it holds to finish before it exits (default 120, 1 to 3600). It takes no new work from the moment of the signal. The shipped unit's `TimeoutStopSec` and the Mac plist's `ExitTimeOut` are 150 |
 | `NOO_HARNESS_WORKDIR` | where the driver makes each task's workspace (default: the process temp dir, which the shipped unit makes private) |
 | `NOO_HARNESS_KEEP_WORKDIR` | `1` keeps a task's workspace after it ends, for debugging |
 
@@ -133,6 +134,14 @@ checkpointed tasks on `harness.task.<node>`.
 
 Order at start: connect to the bus, subscribe `harness.run.<node>` and
 `harness.task.<node>`, then announce on `harness.ready.<node>`.
+
+**Stop.** On SIGTERM (a kind change restarts the harness; so does a
+roll) the harness drops both subscriptions, so a new turn gets no ack and
+the gateway runs it, and a new task stays queued for the node. What it
+holds runs on for up to `NOO_HARNESS_DRAIN_SECS`; then it exits, and the
+service manager's restart brings up the new kind, which announces ready
+and gets the node's queued tasks back. A task still running at the bound
+is killed with the process and comes back on the next ready, as before.
 
 ## 5. The rail: `POST /api/harness/call`
 

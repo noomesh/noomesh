@@ -22,6 +22,11 @@ Type=simple
 ExecStart=/usr/local/bin/noo-gateway harness
 Restart=always
 RestartSec=30
+# A stop drains: the harness takes no new work and gives what it holds
+# NOO_HARNESS_DRAIN_SECS (default 120) to finish; this is that plus 30 s.
+# A kind change restarts the harness (the agent's convergeHarness), and
+# before this every restart killed its turns and tasks mid-flight (i256).
+TimeoutStopSec=150
 # Root-owned, 600, read by pid 1 — the harness process never sees the file,
 # only the environment. The node's NATS pair and the paths to its PKI live
 # here, rendered by the controller like /etc/noo-node-agent.env.
