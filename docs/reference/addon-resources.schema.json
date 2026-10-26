@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://noomesh.ai/schemas/noo-addon-resources-1.json",
+  "title": "noo-addon-resources/1: an add-on's declared runtime inputs (resources.json)",
+  "description": "A file of the add-on's signed bundle, listed in the bundle lock like system.json. The CLI (noo-cli/src/addons/resources.rs) is the authority: this schema states the shape, and the rules a schema cannot state are listed in x-noo-rules. docs/development/addons.md, 'Declaring runtime inputs', explains each kind. A fixture that passes is tests/fixtures/addons/rhaddon/resources.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "uid", "resources"],
+  "properties": {
+    "format": { "const": "noo-addon-resources/1" },
+    "uid": {
+      "description": "The uid the add-on's services run as. Every mount directory (0700) and file (0400) is owned by it. 0 is refused.",
+      "type": "integer", "minimum": 1, "maximum": 4294967294
+    },
+    "mounts": {
+      "type": "array", "maxItems": 8,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["name", "env", "target"],
+        "properties": {
+          "name": { "$ref": "#/$defs/word" },
+          "env": { "$ref": "#/$defs/var", "description": "Receives the directory's host path; the overlay bind-mounts it read-only at target." },
+          "target": { "type": "string", "pattern": "^/[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$", "maxLength": 128, "description": "The container path. Not /, /proc, /sys or /dev. A db url names files by this path." }
+        }
+      }
+    },
+    "resources": {
+      "type": "array", "maxItems": 64,
+      "items": {
+        "type": "object",
+        "required": ["name", "kind", "deliver"],
+        "properties": {
+          "name": { "$ref": "#/$defs/word" },
+          "kind": { "enum": ["gateway", "tls_leaf", "addon_key", "shared_secret", "db", "network"] },
+          "optional": { "type": "boolean", "default": false, "description": "Skipped with a notice, not refused, when it cannot be produced at launch. Not allowed on db." },
+          "deliver": {
+            "oneOf": [
+              { "$ref": "#/$defs/target" },
+              { "type": "array", "minItems": 1, "maxItems": 4, "items": { "$ref": "#/$defs/target" } }
+            ]
+          }
+        },
+        "oneOf": [
+          { "additionalProperties": false, "properties": { "name": {}, "kind": { "const": "gateway" }, "part": { "enum": ["url", "ca", "public_origin"] }, "deliver": {}, "optional": {} }, "required": ["part"] },
+          { "additionalProperties": false, "properties": { "name": {}, "kind": { "const": "tls_leaf" }, "hostname": { "type": "string", "description": "noo-<addon> or noo-<addon>-<suffix> (the add-on name with _ as -), at most 63." }, "part": { "enum": ["cert", "key", "ca"] }, "deliver": {}, "optional": {} }, "required": ["hostname", "part"] },
+          { "additionalProperties": false, "properties": { "name": {}, "kind": { "const": "addon_key" }, "deliver": {}, "optional": {} } },
+          { "additionalProperties": false, "properties": { "name": {}, "kind": { "const": "shared_secret" }, "deliver": {}, "optional": {} } },
+          { "additionalProperties": false, "properties": { "name": {}, "kind": { "const": "db" }, "part": { "enum": ["url", "ca", "cert", "key", "passfile"] }, "deliver": {} }, "required": ["part"] },
+          { "additionalProperties": false, "properties": { "name": {}, "kind": { "const": "network" }, "network": { "enum": ["gateway", "db"] }, "deliver": {}, "optional": {} }, "required": ["network"] }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "word": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}$" },
+    "var": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$", "description": "Must start with the add-on's own prefix (<NAME>_, name upper-cased, - as _), never NOO_, COMPOSE_ or DOCKER_, and must not be a variable a core compose file reads." },
+    "target": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["env"], "properties": { "env": { "$ref": "#/$defs/var" } } },
+        { "type": "object", "additionalProperties": false, "required": ["file"], "properties": { "file": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}/[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*){0,3}$", "description": "<mount>/<path>, the mount declared in mounts." } } }
+      ]
+    }
+  },
+  "x-noo-rules": [
+    "Secret material is delivered as a file only: tls_leaf key, addon_key, shared_secret, db key, db passfile.",
+    "Names (resources, mounts), variables (across mounts and env deliveries) and file destinations are unique.",
+    "db parts and network db need the bundle to declare system.json; db is the runtime role only, each part at most once.",
+    "A db url names ca, cert, key and passfile, which must each be declared with a file delivery; when the url is delivered as a file, into the same mount.",
+    "addon_key needs the overlay's x-noo-addon block (key: NOO_SVC_KEY_*); noo addons enable mints the key.",
+    "shared_secret is 32 random bytes kept in the encrypted store as NOO_ADDON_SECRET_<ADDON>__<NAME>, minted by noo addons enable when absent, rotated only by noo addons rotate-secret <name> <resource>.",
+    "A required resource that cannot be produced at launch refuses the add-on (named, the rest of the stack starts); an optional one is skipped with a notice.",
+    "Core produces no identity or account file."
+  ]
+}

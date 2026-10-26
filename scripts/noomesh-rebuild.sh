@@ -309,6 +309,10 @@ COMPOSE_FILES="$(compose_file_args .)"
 # a rebuild is a dev start, so they get the dev build's names here
 # (lib-dist.sh require_addon_pins; DIST_MODE is never 1 in a rebuild).
 DIST_MODE=0 require_addon_pins || exit 1
+# Declared runtime inputs and held GPU/socket services (lib-dist.sh). A
+# refused add-on leaves the file list, so it is computed again.
+addon_resources_materialise || exit 1
+COMPOSE_FILES="$(compose_file_args .)"
 # The verified add-ons' bundle declarations, for the gateway (lib-dist.sh).
 addon_decls_materialise || exit 1
 
@@ -660,6 +664,7 @@ if [ "$START_STACK" = true ]; then
 
     echo "Recreating services: ${RECREATE_SERVICES}"
     # shellcheck disable=SC2086
+    addon_refuse_held ${RECREATE_SERVICES} || exit 1
     check_bind_sources ${RECREATE_SERVICES} || exit 1
     docker compose $COMPOSE_FILES $PROFILE_ARGS up -d --force-recreate ${RECREATE_SERVICES}
 
@@ -682,7 +687,7 @@ if [ "$START_STACK" = true ]; then
     # still honours a deliberate request for the containerised shape.
     echo "Ensuring all services are running..."
     check_bind_sources --skip node-agent || exit 1
-    docker compose $COMPOSE_FILES $PROFILE_ARGS up -d --scale node-agent=0
+    docker compose $COMPOSE_FILES $PROFILE_ARGS up -d --scale node-agent=0 $ADDON_HOLD_SCALE
 
     # Pre-pull Ollama inference model if Ollama is running
     if docker ps --format '{{.Names}}' | grep -q '^noo-ollama$'; then

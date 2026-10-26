@@ -12,6 +12,7 @@ pub mod pins;
 pub mod pop;
 pub mod provisioned;
 pub mod resolve;
+pub mod resources;
 pub mod trust;
 
 use std::path::Path;

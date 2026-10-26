@@ -596,6 +596,12 @@ fn decl_json(d: &Result<crate::addons::decls::Declared, String>) -> serde_json::
                 "name": w.name, "container": w.container, "gpu": w.gpu, "need_mb": w.need_mb,
                 "drain": {"route": w.drain_route, "timeout_secs": w.drain_timeout_secs},
             })).collect::<Vec<_>>(),
+            // Names, kinds and destinations only: never a value.
+            "resources": d.resources.as_ref().map(|r| json!({
+                "uid": r.uid,
+                "mounts": r.mounts.iter().map(|m| json!({"name": m.name, "env": m.env, "target": m.target})).collect::<Vec<_>>(),
+                "resources": crate::addons::resources::listing(r),
+            })),
         }),
     }
 }
@@ -729,6 +735,23 @@ pub fn addons_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                         &rows
                     )
                 );
+            }
+            println!("{}", ui::section("runtime inputs (names and paths; no value is printed)"));
+            match &d.resources {
+                None => println!("{}", ui::muted("  none declared")),
+                Some(res) => {
+                    let (rows, generation) = crate::commands::addon_resources::show_rows(key, res);
+                    let mounts: Vec<String> = res.mounts.iter().map(|m| format!("{} ({} -> {})", m.name, m.env, m.target)).collect();
+                    println!(
+                        "{}",
+                        ui::kv(&[
+                            ("uid", res.uid.to_string()),
+                            ("mounts", if mounts.is_empty() { ui::muted("none") } else { mounts.join(", ") }),
+                            ("last written", generation.unwrap_or_else(|| ui::muted("not yet: the next start writes it"))),
+                        ])
+                    );
+                    print!("{}", ui::table(&[ui::Col::left("name"), ui::Col::left("kind"), ui::Col::left("delivered to")], &rows));
+                }
             }
             0
         }

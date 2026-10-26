@@ -696,6 +696,8 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["addons", "upgrade"], commands::addons_upgrade),
     (&["addons", "verify"], commands::addons_verify),
     (&["addons", "launch-pins"], commands::addons_launch_pins),
+    (&["addons", "launch-resources"], commands::addons_launch_resources),
+    (&["addons", "rotate-secret"], commands::addons_rotate_secret),
     (&["addons", "trust-key"], commands::addons_trust_key),
     (&["addons", "untrust-key"], commands::addons_untrust_key),
     (&["addons", "set"], commands::addons_set),
@@ -739,6 +741,9 @@ const HIDDEN_NATIVE: &[&[&str]] = &[
     // The launcher's reader of the add-on pins (scripts/lib-dist.sh
     // require_addon_pins) — see `commands::addon_pins`.
     &["addons", "launch-pins"],
+    // The launcher's materialiser of add-on runtime inputs (lib-dist.sh
+    // addon_resources_materialise) — see `commands::addon_resources`.
+    &["addons", "launch-resources"],
     // Pure aliases and internal/retired verbs: still dispatched, not in help.
     &["approval", "pending"],
     &["autonomy", "locations"],

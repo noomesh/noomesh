@@ -3039,6 +3039,13 @@ pub fn mint_missing(keys: &[&str], target: &Path) -> Result<(Vec<String>, Option
     mint_where(keys, target, |store, k| !store.contains(k))
 }
 
+/// [`mint_missing`], but every key gets a NEW value whether or not it has
+/// one: an explicit rotation (`noo addons rotate-secret`). Same writer and
+/// round-trip proof; the previous store is kept as the backup it returns.
+pub fn mint_replace(keys: &[&str], target: &Path) -> Result<(Vec<String>, Option<PathBuf>), String> {
+    mint_where(keys, target, |_, _| true)
+}
+
 /// [`mint_missing`], but a BLANK value counts as missing too: for keys whose
 /// empty value is simply no key (the bus-principal keys
 /// L2), never for a credential an operator may have blanked on purpose.

@@ -2,7 +2,8 @@
 // Copyright 2026 PersonifAI LLC
 
 //! An add-on bundle's declarations beyond its overlay: `system.json` (its
-//! database system) and `workloads.json` (its managed workloads), i163 E/B.
+//! database system) and `workloads.json` (its managed workloads), i163 E/B,
+//! and `resources.json` (its runtime inputs, `super::resources`, i239 s10).
 //!
 //! Both are ordinary bundle files: listed by name and sha256 in the signed
 //! `noo-addon-lock/2` bundle, so the bundle signature covers them. This
@@ -246,6 +247,8 @@ pub fn parse_workloads(addon: &str, bytes: &[u8], routes_json: Option<&[u8]>) ->
 pub struct Declared {
     pub system: Option<System>,
     pub workloads: Vec<Workload>,
+    /// Its runtime inputs (`resources.json`, `super::resources`).
+    pub resources: Option<super::resources::Resources>,
 }
 
 /// Validate the declarations among a bundle's verified files (name to
@@ -257,14 +260,22 @@ pub fn check_bundle(addon: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<De
         .map(|b| parse_workloads(addon, b, files.get(ROUTES_FILE).map(Vec::as_slice)))
         .transpose()?
         .unwrap_or_default();
-    Ok(Declared { system, workloads })
+    let facts = super::resources::bundle_facts(addon, files);
+    let resources = files
+        .get(super::resources::RESOURCES_FILE)
+        .map(|b| super::resources::parse(addon, b, &facts))
+        .transpose()?;
+    Ok(Declared { system, workloads, resources })
 }
 
 /// The declarations materialised under `<root>/addons/<addon>/` (by
 /// `noo addons enable|upgrade`, verified against the signed lock then).
 /// Absent files declare nothing; an invalid one is an error.
 pub fn materialised(root: &Path, addon: &str) -> Result<Declared, String> {
-    let names: Vec<String> = [SYSTEM_FILE, WORKLOADS_FILE, ROUTES_FILE].iter().map(|s| s.to_string()).collect();
+    let names: Vec<String> = [SYSTEM_FILE, WORKLOADS_FILE, ROUTES_FILE, super::resources::RESOURCES_FILE, "docker-compose.yml"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let files = super::pins::materialised_files(root, addon, names.iter());
     check_bundle(addon, &files)
 }

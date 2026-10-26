@@ -255,7 +255,7 @@ pub(crate) struct Files {
     pub pgpass: Vec<(String, PathBuf)>,
 }
 
-fn write_private(dir: &Path, name: &str, bytes: &[u8], mode: u32) -> Result<PathBuf, String> {
+pub(crate) fn write_private(dir: &Path, name: &str, bytes: &[u8], mode: u32) -> Result<PathBuf, String> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let dest = dir.join(name);
     let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
@@ -275,7 +275,7 @@ fn write_private(dir: &Path, name: &str, bytes: &[u8], mode: u32) -> Result<Path
 }
 
 /// Create `dir` (and its parent) 0700 and refuse a symlink there.
-fn private_dir(dir: &Path) -> Result<(), String> {
+pub(crate) fn private_dir(dir: &Path) -> Result<(), String> {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(format!("{} is a symlink - refusing to put credentials behind it", dir.display()));
