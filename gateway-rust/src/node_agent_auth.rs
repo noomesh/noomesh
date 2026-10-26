@@ -149,8 +149,28 @@ pub(crate) fn header_for(url: &str) -> Option<(String, String)> {
     if leaf_only(url) {
         return None;
     }
-    bearer()
+    let b = bearer();
+    if b.is_none() {
+        // Not silent: no static token and the agent has not (yet) said
+        // `controller_leaf_only`, so it gets no bearer and relies on the
+        // gateway's leaf. A current agent admits that; a pre-0.6.0 agent
+        // refuses it and the node reads as unreachable.
+        if let Some(a) = authority(url) {
+            if crate::legacy_lanes::log_due(&format!("no_leaf_only|{a}"), NO_LEAF_ONLY_LOG_EVERY) {
+                tracing::warn!(
+                    agent = %a,
+                    "node agent at {a} has not reported controller_leaf_only and NOO_NODE_AGENT_TOKEN is unset: \
+                     sending no bearer (the gateway's client certificate is the credential). \
+                     Fix: upgrade the agent (`noo upgrade --nodes`) or set NOO_NODE_AGENT_TOKEN"
+                );
+            }
+        }
+    }
+    b
 }
+
+/// How often the missing-`controller_leaf_only` WARN repeats per agent.
+const NO_LEAF_ONLY_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(900);
 
 /// [`header_for`] for the controller's OWN agent, reached by
 /// `bootstrap::self_agent_base` (a configured URL that need not match the
@@ -166,21 +186,13 @@ pub(crate) fn header_for_self(url: &str) -> Option<(String, String)> {
     header_for(url)
 }
 
-/// The legacy bearer: `NOO_NODE_AGENT_TOKEN`, else an HMAC over the FLEET
-/// secret (never the controller secret, which no node can verify — see
+/// The legacy bearer: `NOO_NODE_AGENT_TOKEN` when set, else none. Never a
+/// minted HMAC (v1 is refused by every agent; see
 /// `routes::cluster::node_agent_bearer`). Private: a call site asks
 /// [`header_for`], which decides per agent.
 fn bearer() -> Option<(String, String)> {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    crate::routes::cluster::node_agent_bearer(
-        crate::config::secret_env::secret_opt("NOO_NODE_AGENT_TOKEN").as_deref(),
-        crate::config::secret_env::secret_opt("NOO_CLUSTER_SECRET").as_deref(),
-        ts,
-    )
-    .map(|b| ("Authorization".into(), b))
+    crate::routes::cluster::node_agent_bearer(crate::config::secret_env::secret_opt("NOO_NODE_AGENT_TOKEN").as_deref())
+        .map(|b| ("Authorization".into(), b))
 }
 
 // ── The harness and its own agent ─────────
@@ -321,6 +333,36 @@ mod tests {
             // An address the gateway has never heard of keeps the bearer.
             assert!(header_for("https://10.9.9.9:8081/gpu").is_some());
         });
+    }
+
+    /// With no static token an unflagged or unknown agent gets NO bearer (and
+    /// above all no minted v1 token), flagged or not.
+    #[test]
+    fn without_a_static_token_no_agent_gets_any_bearer() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        clear_for_test();
+        std::env::remove_var("NOO_NODE_AGENT_TOKEN");
+        std::env::set_var("NOO_CLUSTER_SECRET", "fleet-secret-for-test");
+        note("host6", &json!({"ip_address": "10.0.0.3"}));
+        assert_eq!(header_for("https://10.0.0.3:8081/gpu"), None, "unflagged, no token: no bearer");
+        assert_eq!(header_for("https://10.9.9.9:8081/gpu"), None, "unknown agent: no bearer");
+        assert_eq!(header_for_self("https://controller.tail:8081"), None);
+        std::env::remove_var("NOO_CLUSTER_SECRET");
+    }
+
+    /// No controller->agent credential path may call the v1 minter.
+    #[test]
+    fn no_agent_credential_path_mints_a_v1_token() {
+        let needle = ["mint_cluster", "_token("].concat();
+        for (name, src) in [
+            ("node_agent_auth.rs", include_str!("node_agent_auth.rs")),
+            ("node_link.rs", include_str!("node_link.rs")),
+            ("coordinator/backend.rs", include_str!("coordinator/backend.rs")),
+        ] {
+            assert!(src.len() > 1000, "{name} did not load");
+            let prod = src.split("#[cfg(test)]").next().unwrap();
+            assert!(!prod.contains(&needle), "{name} mints a v1 token for an agent");
+        }
     }
 
     #[test]
