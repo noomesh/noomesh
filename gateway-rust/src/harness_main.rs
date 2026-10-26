@@ -566,9 +566,10 @@ pub async fn run() -> Result<()> {
             // Our OWN node id on the subject — the grant is written against it.
             let sink = NatsTurnSink::new(nats.clone(), &node, &req.conversation_id);
             let outcome = match driver.as_deref() {
-                // Nothing streams mid-run: one `content` with the answer,
-                // then the result.
-                Some(ctx) => crate::harness::driver::run_turn(ctx, client, &req).await,
+                // A vendor CLI's answer is one `content` at the end, then the
+                // result; while it runs, the model's text streams as
+                // `working` (i278 phase D).
+                Some(ctx) => crate::harness::driver::run_turn(ctx, client, &req, &sink).await,
                 None => run_turn(&gateway, client, pinned, &sink, &req).await,
             };
             if let (Some(_), Ok(r), true) = (driver.as_deref(), &outcome, req.stream) {

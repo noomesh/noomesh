@@ -409,6 +409,7 @@ receives flat JSON events, each with a `type`:
 {"type": "metadata", "conversation_id": "…", "model": "…", "backend": "…"}
 {"type": "harness_dispatched", "node": "…", "kind": "…"}
 {"type": "thinking", "text": "…"}
+{"type": "working", "text": "…"}
 {"type": "content", "text": "token"}
 {"type": "content_clear"}
 {"type": "tool_call", "name": "web_search", "arguments": {}}
@@ -417,6 +418,13 @@ receives flat JSON events, each with a `type`:
 {"type": "done", "iterations": 3, "tool_calls": 2, "elapsed_seconds": 15.2}
 {"type": "keepalive"}
 ```
+
+`working` comes only from a turn a node harness runs on a vendor kind
+(Copilot, Claude Code, Codex): the model's text as the harness's translator
+relays it, reasoning and planning included, batched about every 300 ms and
+capped at 200 000 characters a turn. It is not the answer, which arrives as
+`content` when the CLI is done; the console shows it in a collapsed
+"Working" block.
 
 ## Cluster and nodes (`routes/cluster.rs`, `routes/bootstrap.rs`)
 

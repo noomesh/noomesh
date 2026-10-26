@@ -32,8 +32,11 @@
 //! the question goes over the rail (`task_ask`) and the task waits for the
 //! answer.
 //!
-//! Nothing streams mid-run in this cut: a turn gets one `content` event with
-//! the answer, then `harness_result` (sent by the caller).
+//! A turn gets one `content` event with the answer, then `harness_result`
+//! (sent by the caller). While the CLI runs, the model's text as the
+//! translator sees it streams as `working` events (i278 phase D): the
+//! console shows them in a collapsed block, like thinking. They are the
+//! model's words, the CLI's planning included, not the answer.
 //!
 //! A kind may carry a slim launch (`launch_slim`, Claude Code only): the
 //! driver runs it instead of `launch` while the node's harness profile says
@@ -54,6 +57,7 @@ use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
 
 use crate::coordinator::{CoordinatorResult, HarnessOp, RemoteRuntime, ResolvedBackend, TaskRuntime, TurnRequest, UsageStats};
+use crate::websocket::TurnSink;
 use crate::harness::profile::ClaudePrompt;
 use crate::harness::translator::{Translator, UsageTotals};
 use crate::harness_kinds::{HarnessKind, Launch};
@@ -1024,11 +1028,29 @@ pub fn task_prompt(req: &TaskRequest, loop_no: u32, last_note: Option<&str>, cla
 
 /// Translator up, door key minted, CLI run, usage reported, key revoked,
 /// translator down — in that order whatever the CLI did.
-async fn invoke<R: DriverRail>(ctx: &DriverCtx, rail: &R, ws: &Workspace, prompt: &str, task_id: Option<&str>) -> Result<(RunOutput, UsageTotals)> {
+async fn invoke<R: DriverRail>(
+    ctx: &DriverCtx,
+    rail: &R,
+    ws: &Workspace,
+    prompt: &str,
+    task_id: Option<&str>,
+    working: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+) -> Result<(RunOutput, UsageTotals)> {
     // full or slim, decided once for this run.
     let (variant, chosen) = ctx.run_ctx();
     let ctx: &DriverCtx = &chosen;
     let translator = Translator::start(ctx.pinned.clone()).await.context("starting the wire translator")?;
+    // The model's text as it streams, for a turn's working block (i278 D).
+    if let Some(out) = working {
+        let mut rx = translator.tap();
+        tokio::spawn(async move {
+            while let Some(t) = rx.recv().await {
+                if out.send(t).is_err() {
+                    break;
+                }
+            }
+        });
+    }
     let key = match rail.door_key().await {
         Ok(k) => k,
         Err(e) => {
@@ -1109,7 +1131,7 @@ async fn task_loops<R: DriverRail>(ctx: &DriverCtx, rail: &mut R, req: &TaskRequ
             task_prompt(req, loops + 1, last_note.as_deref(), check.clarification.as_ref()),
             check.context.as_deref(),
         );
-        let outcome = invoke(ctx, &*rail, ws, &prompt, Some(&req.task_id)).await;
+        let outcome = invoke(ctx, &*rail, ws, &prompt, Some(&req.task_id), None).await;
         loops += 1;
         let mut decided = false;
         let note = match &outcome {
@@ -1161,9 +1183,38 @@ async fn task_loops<R: DriverRail>(ctx: &DriverCtx, rail: &mut R, req: &TaskRequ
 // ── a turn ──────────────────────────────────────────────────────────────
 
 /// One turn on the driven CLI: its answer is the turn's response.
-pub async fn run_turn(ctx: &DriverCtx, client: reqwest::Client, req: &TurnRequest) -> Result<CoordinatorResult> {
+pub async fn run_turn<S: TurnSink>(ctx: &DriverCtx, client: reqwest::Client, req: &TurnRequest, sink: &S) -> Result<CoordinatorResult> {
     let rt = RemoteRuntime::connect(&ctx.gateway, &req.token, client).await?;
-    run_turn_on(ctx, &rt, req).await
+    run_turn_on(ctx, &rt, req, sink).await
+}
+
+/// How much of the model's text a turn forwards as `working` (i278 D):
+/// batched every [`WORKING_FLUSH`] or [`WORKING_BATCH_CHARS`], at most
+/// [`WORKING_MAX_CHARS`] in all, so a long run cannot flood the bus.
+const WORKING_FLUSH: Duration = Duration::from_millis(300);
+const WORKING_BATCH_CHARS: usize = 400;
+const WORKING_MAX_CHARS: usize = 200_000;
+
+/// Batches of the model's text: what to send now, given what is buffered,
+/// what has gone out and whether the clock ticked. Pure.
+fn working_batch(buf: &mut String, sent: &mut usize, tick: bool) -> Option<String> {
+    if buf.is_empty() || (!tick && buf.len() < WORKING_BATCH_CHARS) || *sent >= WORKING_MAX_CHARS {
+        if *sent >= WORKING_MAX_CHARS {
+            buf.clear();
+        }
+        return None;
+    }
+    let room = WORKING_MAX_CHARS - *sent;
+    let mut out = std::mem::take(buf);
+    if out.len() > room {
+        let mut cut = room;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+    }
+    *sent += out.len();
+    Some(out)
 }
 
 /// A turn whose CLI was killed as stalled before it made a single model
@@ -1181,7 +1232,7 @@ impl std::fmt::Display for NeverReachedTheModel {
 
 impl std::error::Error for NeverReachedTheModel {}
 
-pub(crate) async fn run_turn_on<R: DriverRail>(ctx: &DriverCtx, rail: &R, req: &TurnRequest) -> Result<CoordinatorResult> {
+pub(crate) async fn run_turn_on<R: DriverRail, S: TurnSink>(ctx: &DriverCtx, rail: &R, req: &TurnRequest, sink: &S) -> Result<CoordinatorResult> {
     if let Err(r) = (ctx.jail_probe)() {
         tracing::error!(event = "harness_jail_refused", reason = %r, "harness_jail_refused: {}", r.note());
         bail!("{}", r.note());
@@ -1192,7 +1243,38 @@ pub(crate) async fn run_turn_on<R: DriverRail>(ctx: &DriverCtx, rail: &R, req: &
         Some(role) => format!("{}\n\n{}", role.trim(), req.prompt),
         None => req.prompt.clone(),
     };
-    let outcome = invoke(ctx, rail, &ws, &prompt, None).await;
+    // A vendor CLI prints nothing until it is done; the model's text, seen
+    // by the translator, goes to the console as the harness working (i278
+    // phase D: a collapsed block, like thinking). The answer is still the
+    // CLI's output below.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let run = invoke(ctx, rail, &ws, &prompt, None, Some(tx));
+    tokio::pin!(run);
+    let mut buf = String::new();
+    let mut sent = 0usize;
+    let mut tick = tokio::time::interval(WORKING_FLUSH);
+    let outcome = loop {
+        tokio::select! {
+            out = &mut run => break out,
+            Some(t) = rx.recv() => {
+                buf.push_str(&t);
+                if let Some(b) = working_batch(&mut buf, &mut sent, false) {
+                    sink.send_event("working", json!({"text": b})).await;
+                }
+            }
+            _ = tick.tick() => {
+                if let Some(b) = working_batch(&mut buf, &mut sent, true) {
+                    sink.send_event("working", json!({"text": b})).await;
+                }
+            }
+        }
+    };
+    while let Ok(t) = rx.try_recv() {
+        buf.push_str(&t);
+    }
+    if let Some(b) = working_batch(&mut buf, &mut sent, true) {
+        sink.send_event("working", json!({"text": b})).await;
+    }
     ws.finish();
     let (o, usage) = outcome?;
     if !o.succeeded() {
@@ -1230,6 +1312,26 @@ mod tests {
     use std::sync::Mutex;
 
     const TURN_TOKEN: &str = "eyJturn.token.secret";
+
+    /// i278 phase D: the working text goes out in batches (a size or a
+    /// tick), never past the per-turn cap, cut on a char boundary.
+    #[test]
+    fn working_text_is_batched_and_capped() {
+        let (mut buf, mut sent) = (String::from("short"), 0usize);
+        assert_eq!(working_batch(&mut buf, &mut sent, false), None, "under the batch size, no tick: wait");
+        assert_eq!(working_batch(&mut buf, &mut sent, true).as_deref(), Some("short"));
+        assert!(buf.is_empty() && sent == 5);
+        assert_eq!(working_batch(&mut buf, &mut sent, true), None, "nothing buffered");
+        buf.push_str(&"x".repeat(WORKING_BATCH_CHARS));
+        assert_eq!(working_batch(&mut buf, &mut sent, false).map(|b| b.len()), Some(WORKING_BATCH_CHARS), "a full batch goes without a tick");
+        let mut sent = WORKING_MAX_CHARS - 2;
+        let mut buf = String::from("é€x");
+        assert_eq!(working_batch(&mut buf, &mut sent, true).as_deref(), Some("é"), "cut at the cap, on a char boundary");
+        assert_eq!(sent, WORKING_MAX_CHARS);
+        let mut buf = String::from("more");
+        assert_eq!(working_batch(&mut buf, &mut sent, true), None);
+        assert!(buf.is_empty(), "past the cap the text is dropped, not kept");
+    }
 
     fn kind(command: &[&str], lane: &[(&str, &str)], telemetry: &[(&str, &str)]) -> HarnessKind {
         serde_json::from_value(json!({
@@ -1475,7 +1577,7 @@ mod tests {
             stream: false,
             token: TURN_TOKEN.into(),
         };
-        let e = run_turn_on(&ctx, &rail, &req).await.unwrap_err();
+        let e = run_turn_on(&ctx, &rail, &req, &crate::websocket::NullSink).await.unwrap_err();
         assert!(e.downcast_ref::<NeverReachedTheModel>().is_some(), "{e}");
         assert!(e.to_string().contains("stalled: no model call"), "{e}");
         let _ = std::fs::remove_dir_all(root);
@@ -1624,7 +1726,7 @@ mod tests {
             stream: false,
             token: TURN_TOKEN.into(),
         };
-        let e = run_turn_on(&ctx, &rail, &turn).await.unwrap_err();
+        let e = run_turn_on(&ctx, &rail, &turn, &crate::websocket::NullSink).await.unwrap_err();
         assert!(e.to_string().contains("foreign CLIs never run unjailed"), "{e}");
         assert!(!marker.exists());
         assert_eq!(rail.calls.lock().unwrap().keys_minted, 0);
@@ -2095,7 +2197,7 @@ mod tests {
             stream: true,
             token: TURN_TOKEN.into(),
         };
-        let r = run_turn_on(&ctx, &rail, &req).await.unwrap();
+        let r = run_turn_on(&ctx, &rail, &req, &crate::websocket::NullSink).await.unwrap();
         assert_eq!(r.response, "the answer is 42");
         assert_eq!(r.node.as_deref(), Some("awolf"));
         let c = rail.calls.lock().unwrap();

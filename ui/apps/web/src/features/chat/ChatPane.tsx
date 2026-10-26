@@ -88,6 +88,41 @@ function ThinkingBlock({
   );
 }
 
+/**
+ * A node harness's vendor CLI at work: the model's text as it streams,
+ * collapsed by default (the operator's choice, i278) and opened by hand.
+ * It is the CLI's planning, not the answer.
+ */
+function WorkingBlock({ text, streaming }: { text: string; streaming?: boolean }) {
+  const [open, setOpen] = useState(false);
+  const bodyRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (open && streaming) bodyRef.current?.scrollTo({ top: bodyRef.current.scrollHeight });
+  }, [text, open, streaming]);
+
+  return (
+    <div className={cn('reason', 'working', streaming && 'live', open && 'open')}>
+      <button
+        type="button"
+        className="reason-head"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <svg className="chev" viewBox="0 0 20 20" aria-hidden="true">
+          <path d="M7.5 5l5 5-5 5" />
+        </svg>
+        <span className="reason-label">{streaming ? 'Working…' : 'Worked'}</span>
+      </button>
+      {open && (
+        <div className="reason-body" ref={bodyRef}>
+          {text}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** Tool runs as status chips; click to see the server's output. */
 function ToolChips({ tools }: { tools: ToolRun[] }) {
   const [shown, setShown] = useState<number | null>(null);
@@ -314,6 +349,7 @@ export function ChatPane({ panelHidden, onTogglePanel, onToggleChat, collapsed }
               {m.thinking && (
                 <ThinkingBlock text={m.thinking} streaming={m.streaming} thinkMs={m.thinkMs} />
               )}
+              {m.working && <WorkingBlock text={m.working} streaming={m.streaming} />}
               {!!m.tools?.length && <ToolChips tools={m.tools} />}
               {m.approvals?.map((a) => <ApprovalCard key={a.id} approval={a} />)}
               <div className={cn('m', m.error && 'err')}>

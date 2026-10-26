@@ -181,9 +181,23 @@ struct Shared {
     logged_dropped: AtomicBool,
     /// The probe's request log (`start_logged`); `None` in production.
     route_log: Option<Mutex<Vec<RouteHit>>>,
+    /// Where the model's text goes as it streams ([`Translator::tap`]): a
+    /// chat turn shows it as the harness working (i278 phase D).
+    tap: Mutex<Option<mpsc::UnboundedSender<String>>>,
 }
 
 impl Shared {
+    /// Hand the model's text to the tap, if one is set.
+    fn tap_send(&self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        let mut t = self.tap.lock().unwrap_or_else(|p| p.into_inner());
+        if t.as_ref().is_some_and(|tx| tx.send(text).is_err()) {
+            *t = None;
+        }
+    }
+
     /// Count one answered call. `usage` is (prompt, completion, total).
     fn meter(&self, model: Option<&str>, usage: Option<(u64, u64, u64)>) {
         let model = model.filter(|m| !m.is_empty()).unwrap_or(&self.upstream.model).to_string();
@@ -279,6 +293,7 @@ impl Translator {
             logged_no_usage: AtomicBool::new(false),
             logged_dropped: AtomicBool::new(false),
             route_log: log_routes.then(|| Mutex::new(Vec::new())),
+            tap: Mutex::new(None),
         });
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let addr = listener.local_addr()?;
@@ -302,6 +317,15 @@ impl Translator {
     /// e.g. "http://127.0.0.1:41234" — what the CLI's base-URL env gets.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// The model's text as it arrives (reasoning and answer, every call the
+    /// CLI makes), from now on. One tap per translator: a second call
+    /// replaces the first.
+    pub fn tap(&self) -> mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.shared.tap.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
+        rx
     }
 
     /// The wire's activity clock, for the driver's stall bound.
@@ -490,11 +514,23 @@ async fn complete(sh: &Arc<Shared>, mut body: Value) -> Result<Reply, (u16, Stri
         };
         let usage = v.get("usage").filter(|u| u.is_object()).map(anthropic_wire::usage_tokens);
         sh.meter(v.get("model").and_then(|m| m.as_str()), usage);
+        if let Some(m) = v.pointer("/choices/0/message") {
+            sh.tap_send(model_text(m));
+        }
         return Ok(Reply::Whole(v));
     }
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(pump(sh.clone(), resp, tx));
     Ok(Reply::Chunks(rx))
+}
+
+/// The text in an OpenAI message or chunk delta: reasoning (vLLM's
+/// `reasoning_content`, or `reasoning`) then content.
+fn model_text(m: &Value) -> String {
+    ["reasoning_content", "reasoning", "content"]
+        .iter()
+        .filter_map(|k| m.get(*k).and_then(Value::as_str))
+        .collect()
 }
 
 /// Read a streamed reply line by line, turn each line into OpenAI chunks,
@@ -555,6 +591,9 @@ async fn pump(sh: Arc<Shared>, resp: reqwest::Response, tx: mpsc::Sender<Result<
                 }
                 if model.is_none() {
                     model = v.get("model").and_then(|m| m.as_str()).map(str::to_string);
+                }
+                if let Some(d) = v.pointer("/choices/0/delta") {
+                    sh.tap_send(model_text(d));
                 }
                 if tx.send(Ok(v)).await.is_err() {
                     break 'read;
@@ -1035,6 +1074,25 @@ mod tests {
     /// The `data:` payloads of an OpenAI SSE body, `[DONE]` included.
     fn openai_frames(text: &str) -> Vec<String> {
         text.lines().filter_map(|l| l.strip_prefix("data: ")).map(str::to_string).collect()
+    }
+
+    #[tokio::test]
+    async fn the_tap_sees_the_models_text_as_it_streams() {
+        let m = mock().await;
+        let t = Translator::start(backend(&m.url, "openai")).await.unwrap();
+        let mut rx = t.tap();
+        let url = format!("{}/v1/chat/completions", t.base_url());
+        let c = client();
+        let resp = c.post(&url).json(&json!({"stream": true, "messages": [{"role": "user", "content": "hi"}]})).send().await.unwrap();
+        resp.text().await.unwrap();
+        c.post(&url).json(&json!({"messages": [{"role": "user", "content": "hi"}]})).send().await.unwrap().text().await.unwrap();
+        let mut seen = Vec::new();
+        while let Ok(x) = rx.try_recv() {
+            seen.push(x);
+        }
+        assert_eq!(seen, ["Hel", "lo", "hello"], "each streamed delta, then a whole reply's content");
+        assert_eq!(model_text(&json!({"reasoning_content": "think ", "content": "say"})), "think say");
+        t.shutdown().await;
     }
 
     #[tokio::test]
