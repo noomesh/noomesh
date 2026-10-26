@@ -55,6 +55,7 @@ OWNS = {
     "rust-gateway": "gateway",
     "noo-cli": "cli",
     "sqlx-drift": "sqlx",
+    "router-harness": "gateway",
     "ui": "ui",
     "llamacpp-image": "llamacpp",
 }
