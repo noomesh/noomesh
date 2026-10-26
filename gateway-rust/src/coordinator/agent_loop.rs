@@ -1125,6 +1125,59 @@ fn estimate_tool_tokens(tools: &[Value]) -> usize {
     total
 }
 
+/// What the first request of a turn is spent on, by part, in the loop's own
+/// token estimate (`estimate_tokens`, ~2.5 chars/token): the system message,
+/// the retrieved-data frame, earlier history, the person's prompt and the
+/// tool schemas, against the window it was fitted to. Logged as
+/// `request_size` on every turn, so a small window's budget is measured,
+/// not guessed (i278 phase A).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestSize {
+    system: usize,
+    data: usize,
+    history: usize,
+    prompt: usize,
+    tools: usize,
+    tool_tokens: usize,
+    total: usize,
+    window: usize,
+}
+
+fn request_size(messages: &[Value], tools: &[Value], data_frame: Option<&str>, window: usize) -> RequestSize {
+    let role = |m: &Value, r: &str| m.get("role").and_then(|x| x.as_str()) == Some(r);
+    let system: usize = estimate_tokens(&messages.iter().filter(|m| role(m, "system")).cloned().collect::<Vec<_>>());
+    let last_user = messages.iter().rposition(|m| role(m, "user"));
+    let user_toks = last_user.map(|i| estimate_tokens(std::slice::from_ref(&messages[i]))).unwrap_or(0);
+    let data = data_frame.map(|f| f.len() * 10 / 25).unwrap_or(0).min(user_toks);
+    let all = estimate_tokens(messages);
+    let tool_tokens = estimate_tool_tokens(tools);
+    RequestSize {
+        system,
+        data,
+        history: all.saturating_sub(system + user_toks),
+        prompt: user_toks - data,
+        tools: tools.len(),
+        tool_tokens,
+        total: all + tool_tokens,
+        window,
+    }
+}
+
+fn log_request_size(size: &RequestSize, path: &'static str) {
+    tracing::info!(
+        path,
+        system = size.system,
+        data = size.data,
+        history = size.history,
+        prompt = size.prompt,
+        tools = size.tools,
+        tool_tokens = size.tool_tokens,
+        total = size.total,
+        window = size.window,
+        "request_size"
+    );
+}
+
 /// Truncate messages to fit within the model's context window.
 /// Keeps system message + last N messages, drops oldest middle messages.
 /// Fit messages into the context window, returning dropped messages so
@@ -2017,6 +2070,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         post_dedup_chars = deduped.len(),
         "context_injected"
     );
+    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), "stream");
 
     // 5. Agentic loop
     let mut result = CoordinatorResult {
@@ -3173,6 +3227,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         post_dedup_chars = deduped.len(),
         "context_injected_nonstream"
     );
+    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), "nonstream");
 
     let mut result = CoordinatorResult {
         response: String::new(),
@@ -3975,5 +4030,44 @@ mod cloud_loop_tests {
         let (url, body) = build_llm_request(&v, &messages, None, false, false);
         assert_eq!(url, "https://noo-vllm:8000/v1/chat/completions");
         assert!(body.get("chat_template_kwargs").is_some());
+    }
+}
+
+#[cfg(test)]
+mod request_size_tests {
+    use super::*;
+
+    /// The parts add up to the request: the data frame is counted out of the
+    /// last user message, earlier turns are history, tools are separate
+    /// (i278 phase A).
+    #[test]
+    fn the_first_request_is_sized_by_part() {
+        let frame = "x".repeat(250);
+        let messages = vec![
+            json!({"role": "system", "content": "s".repeat(1000)}),
+            json!({"role": "user", "content": "earlier question"}),
+            json!({"role": "assistant", "content": "earlier answer"}),
+            json!({"role": "user", "content": format!("{frame}\n\nask")}),
+        ];
+        let tools = vec![json!({"type": "function", "function": {"name": "noo_cluster_status", "description": "status", "parameters": {"type": "object"}}})];
+        let s = request_size(&messages, &tools, Some(&frame), 12_288);
+        assert_eq!(s.system, 1000 * 10 / 25 + 4);
+        assert_eq!(s.data, 100);
+        assert_eq!(s.system + s.data + s.history + s.prompt, estimate_tokens(&messages));
+        assert_eq!(s.history, estimate_tokens(&messages[1..3]));
+        assert_eq!((s.tools, s.tool_tokens), (1, estimate_tool_tokens(&tools)));
+        assert_eq!(s.total, estimate_tokens(&messages) + s.tool_tokens);
+        assert_eq!(s.window, 12_288);
+        // No frame, no user message: nothing underflows.
+        let bare = request_size(&messages[..1], &[], None, 4096);
+        assert_eq!((bare.data, bare.prompt, bare.history), (0, 0, 0));
+    }
+
+    #[test]
+    fn both_loop_paths_log_the_request_size() {
+        let src = include_str!("agent_loop.rs").split("mod request_size_tests").next().unwrap();
+        for path in ["\"stream\");", "\"nonstream\");"] {
+            assert!(src.contains(&format!("log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), {path}")), "{path}");
+        }
     }
 }
