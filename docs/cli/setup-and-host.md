@@ -338,7 +338,7 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 | Command | Arguments | What it does |
 |---|---|---|
 | `noo addons list` | — | Show every add-on: declared, effective and whether the licence grants it |
-| `noo addons show` | `<name>` | Show one add-on's switch, pin, and the database and workloads its signed bundle declares |
+| `noo addons show` | `<name>` | Show one add-on's switch, pin, and the database, workloads and inputs its bundle declares |
 | `noo addons enable` | `<name> [--force] [--lock <path\|https-url>] [--provision-only]` | Pin an add-on's signed lock, mint credentials, declare it ON (--provision-only: DB only) |
 | `noo addons trust-key` | `<name> <pubkey> [--registry <host/path>] [--dev] [--expires <dur>]` | Trust a third-party add-on's signing key; --dev --expires (max 30d): a temporary dev key |
 | `noo addons untrust-key` | `<name> [<pubkey>] [--dev]` | Stop trusting a third-party add-on's signing key; --dev removes its dev key(s) |
@@ -347,6 +347,8 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 | `noo addons upgrade` | `[<name>...] [--check] [--allow-downgrade] [--lock <path\|https-url>]` | Re-resolve add-ons' signed locks for this stack, pull by digest and re-pin |
 | `noo addons verify` | — | Re-verify add-on locks offline and compare local and running images with the pins |
 | `noo addons launch-pins` | `[--root <dir>] <tag> [<name>...]` | Hidden: print verified add-on image pins for the launcher (internal) |
+| `noo addons launch-resources` | `--root <d> --tag <t> --project <p> --network <n> <name>...` | Hidden: write add-ons' declared runtime inputs for the launcher (internal) |
+| `noo addons rotate-secret` | `<name> <resource>` | Give an add-on's declared shared secret a new value; restart the add-on to apply |
 
 ### `noo kiosk` — The unattended display's host seat: cage + Chromium showing /kiosk.html
 | Command | Arguments | What it does |

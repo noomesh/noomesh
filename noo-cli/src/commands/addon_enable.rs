@@ -247,6 +247,30 @@ fn sops_path() -> PathBuf {
     crate::envfile::repo_root().join("secrets/env.sops")
 }
 
+/// Mint the `shared_secret` resources the add-on's materialised bundle
+/// declares (`resources.json`, `addons::resources`), when absent. Never
+/// rotates: that is `noo addons rotate-secret`. Names only are returned.
+fn mint_shared_secrets(addon: &str) -> Result<Vec<String>, Refusal> {
+    let root = crate::envfile::repo_root();
+    let Ok(crate::addons::decls::Declared { resources: Some(res), .. }) = crate::addons::decls::materialised(&root, addon) else {
+        return Ok(Vec::new());
+    };
+    let vars: Vec<String> = res
+        .resources
+        .iter()
+        .filter(|r| r.what == crate::addons::resources::What::SharedSecret)
+        .map(|r| crate::addons::resources::shared_secret_var(addon, &r.name))
+        .collect();
+    if vars.is_empty() {
+        return Ok(Vec::new());
+    }
+    let refs: Vec<&str> = vars.iter().map(String::as_str).collect();
+    secrets::mint_missing(&refs, &sops_path()).map(|(minted, _backup)| minted).map_err(|e| Refusal {
+        why: format!("could not mint {addon}'s shared secrets ({}): {e}. The switch was not flipped", vars.join(", ")),
+        fix: "noo security secrets audit   # the store must be writable; then re-run noo addons enable".to_string(),
+    })
+}
+
 /// The remedy for a step-0 refusal, by cause.
 pub(crate) fn pin_fix(addon: &str, r: &crate::addons::resolve::Refusal) -> String {
     use crate::addons::resolve::Refusal as R;
@@ -420,15 +444,16 @@ impl EnableOps for Live<'_> {
         // same); otherwise the system the add-on's signed bundle declares
         // (`system.json`, materialised by step 0 and validated there), whose
         // password variables are derived from the add-on name (i163 E).
+        let mut minted = mint_shared_secrets(addon)?;
         let (entry, from_bundle) = match manifest.get(addon) {
             Some(e) => (e.clone(), false),
             None => match bundle_system(&crate::envfile::repo_root(), addon)? {
                 Some(e) => (e, true),
-                None => return Ok(Vec::new()),
+                None => return Ok(minted),
             },
         };
         let entry = &entry;
-        systems::mint_credentials(entry, &sops_path()).map(|(minted, _backup)| minted).map_err(|e| Refusal {
+        let mut sys = systems::mint_credentials(entry, &sops_path()).map(|(minted, _backup)| minted).map_err(|e| Refusal {
             why: format!(
                 "could not mint {}'s credentials ({}): {e}. The switch was not flipped",
                 addon,
@@ -439,7 +464,9 @@ impl EnableOps for Live<'_> {
             } else {
                 format!("noo systems enable {addon}   # then: noo addons enable {addon}")
             },
-        })
+        })?;
+        minted.append(&mut sys);
+        Ok(minted)
     }
 
     fn issue_key(&mut self, addon: &str, plan: &KeyPlan) -> Result<(), Refusal> {

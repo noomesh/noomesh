@@ -664,6 +664,9 @@ impl ClusterCa {
                 KeyReader::ContainerUid(PG_LEAF_UID)
             }
             ["nodes", _, "node.key"] => KeyReader::Cli,
+            // An add-on's own leaf (`issue_addon_leaf`): read here only, then
+            // copied into the add-on's rundir by the launcher.
+            ["addons", _, f] if f.ends_with(".key") => KeyReader::Cli,
             // A node's backend door leaf: on THIS disk only the CLI reads
             // it (to pack the provision bundle). On the node it is read by
             // root in the door's container and installed 0600 by the
@@ -1873,6 +1876,26 @@ impl ClusterCa {
             &ips,
             days,
         )
+    }
+
+    /// Where an add-on's own leaf lives: `addons/<addon>/<stem>.crt|key`.
+    /// Only this CLI reads the key (0600, `key_reader`); the launcher copies
+    /// it into the add-on's tmpfs rundir, owned by the uid its bundle
+    /// declares (`addons::resources`). Never mounted from here, and never in
+    /// `public/`.
+    pub fn addon_leaf_paths(&self, addon: &str, stem: &str) -> (PathBuf, PathBuf) {
+        let d = self.dir.join("addons").join(addon);
+        (d.join(format!("{stem}.crt")), d.join(format!("{stem}.key")))
+    }
+
+    /// Issue (or re-issue) an add-on's leaf: a SERVICE leaf (`O=Mesh Cluster
+    /// Service`), so the gateway reads its CN as a named service with no
+    /// grant, never as a node id (`node_identity::identity_from_cert`).
+    /// `cn` and `dns` are the add-on's own names (`noo-<addon>[-<suffix>]`,
+    /// or its database role), checked by `addons::resources`.
+    pub fn issue_addon_leaf(&self, addon: &str, stem: &str, cn: &str, dns: &[String], days: i64) -> Result<(PathBuf, PathBuf), String> {
+        let (cert, key) = self.addon_leaf_paths(addon, stem);
+        self.issue_leaf(cn, "Mesh Cluster Service", &cert, &key, dns, &[], days)
     }
 
     /// A NODE's backend door leaf: the same profile as

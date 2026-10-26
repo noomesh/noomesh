@@ -14,8 +14,12 @@
 #
 # A name resolves, first match wins, to compose service(s):
 #   1. a compose service of that exact name           gateway   -> gateway
-#   2. `noo-<name>`: the status table's spelling      evolve    -> noo-evolve
-#   3. an add-on key from an overlay's x-noo-addon    trellion_intel -> the
+#   2. the key of a licensed add-on that is on: every service its overlay
+#      OWNS (lib-addons.sh addon_own_services; a core service it extends is
+#      never one), so `noo stack restart <add-on> --force` (re)starts that
+#      add-on's services and nothing else (i239 section 10)
+#   3. `noo-<name>`: the status table's spelling      evolve    -> noo-evolve
+#   4. an add-on key from an overlay's x-noo-addon    trellion_intel -> the
 #      services of its `containers:` list (a container noo-X is the service
 #      noo-X or X)
 # Anything else is refused, naming the valid services.
@@ -56,6 +60,20 @@ restart_resolve_name() {
     local _c _s _found=""
     if printf '%s\n' "$_valid" | grep -qx -- "$_name"; then
         printf '%s\n' "$_name"; return 0
+    fi
+    if declare -F addon_licensed_names >/dev/null 2>&1 \
+            && addon_licensed_names | grep -qxF -- "$_name" && addon_on "$_name" 0; then
+        _c="$(addon_overlay "$_name" 2>/dev/null)"
+        if [ -n "$_c" ]; then
+            # Its own overlay is composed, so it is one of the -f files
+            # addon_core_services reads: leave it out, or the add-on owns nothing.
+            for _s in $(COMPOSE_FILES="$(printf ' %s ' "${COMPOSE_FILES:-}" | sed "s# -f $_c # #g")" addon_own_services "$_c"); do
+                if printf '%s\n' "$_valid" | grep -qx -- "$_s"; then
+                    printf '%s\n' "$_s"; _found=1
+                fi
+            done
+            [ -n "$_found" ] && return 0
+        fi
     fi
     if printf '%s\n' "$_valid" | grep -qx -- "noo-$_name"; then
         printf '%s\n' "noo-$_name"; return 0
