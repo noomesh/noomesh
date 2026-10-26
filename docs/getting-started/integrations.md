@@ -5,6 +5,11 @@ or both, click **Connect Google**, sign in and approve access. Repeat for each
 Google account. Each Noomesh user owns their connections; work and personal
 accounts can each have several source selections.
 
+Source selections currently remain drafts: connecting does not ingest emails
+or Drive files. Future personal-account ingestion must retain the connecting
+Noomesh user's private permissions through storage and retrieval. The older
+shared Drive watcher is a separate integration with different audience rules.
+
 Google application registration is a one-time publisher or installer task.
 Ordinary users do not each need a Google Cloud project. A local installation
 still needs internet access to Google. Noomesh stores encrypted account tokens

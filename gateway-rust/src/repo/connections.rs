@@ -252,6 +252,18 @@ mod tests {
             .find(|s| s["account_id"] == a.to_string())
             .unwrap();
         let source_id = Uuid::parse_str(first["id"].as_str().unwrap()).unwrap();
+        // Personal sources must stay inert until ingestion preserves the
+        // authenticated owner's audience throughout the content pipeline.
+        let activation =
+            sqlx::query("UPDATE noo_connection_sources SET status='active' WHERE id=$1")
+                .bind(source_id)
+                .execute(&db)
+                .await
+                .expect_err("personal sources cannot activate before owner-scoped ingestion");
+        assert_eq!(
+            activation.as_database_error().unwrap().code().as_deref(),
+            Some("23514")
+        );
         assert!(!delete_source(&db, "bob", source_id).await.unwrap());
         assert!(!delete_account(&db, "bob", a).await.unwrap());
         assert!(delete_source(&db, "alice", source_id).await.unwrap());

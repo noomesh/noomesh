@@ -231,7 +231,7 @@ mod tests {
                 "accepted {field}"
             );
         }
-        for field in ["owner_uuid", "status", "access", "visibility"] {
+        for field in ["owner_uuid", "owner", "roles", "status", "access", "visibility"] {
             let mut body = json!({"account_id":Uuid::new_v4(),"name":"Mail","policy":{"kind":"gmail","exposure":"mailbox"}});
             body[field] = json!("forged");
             assert!(

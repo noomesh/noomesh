@@ -32,6 +32,37 @@ refused. Composite foreign keys enforce owner consistency. Cross-user ids
 have the same response as missing ids. Account erasure also removes credentials
 and pending authorization, including with `keep_account` enabled.
 
+## Personal ingestion release gate
+
+Content from these accounts must be private to the authenticated Noomesh owner
+by default. Google sharing permissions and the connection's folder/label
+selection do not grant access to other Noomesh users. API callers cannot supply
+an owner, roles or visibility for a source. The database currently permits only
+draft sources; connecting an account cannot activate content ingestion.
+
+Before adding activation or background sync, the ingestion adapter must carry
+verified owner authority through job submission, retries, document storage,
+chunks, embeddings, graph provenance, caches and retrieval. Workers must not
+substitute an unrestricted service principal or accept an owner from unsigned
+job metadata. Search, citations, graph queries and exports must enforce the
+same owner boundary, including for other application users with administrator
+or unrestricted KB roles. Host administrators remain trusted with the running
+controller and its encryption keys.
+
+Do not route these personal sources through the legacy shared Drive watcher
+unchanged: source-role rules can map `gdrive://` content to the company audience,
+and the existing KB permits unrestricted/admin reads. Global content-hash
+deduplication must also preserve independent owner audiences; identical files
+from different accounts must not reuse a row with another user's permissions
+or change that row's permissions.
+
+Activation requires end-to-end tests with two Noomesh users (including an
+administrator), distinct and identical Google content, background retries,
+search, citations, graph results and deletion. Tests must prove that another
+user cannot discover the content or its metadata. These are requirements for
+the future ingestion implementation, not guarantees supplied by the current
+shared KB pipeline.
+
 ## Authorization lifecycle
 
 The generic integration engine owns expiring ten-minute sessions, PKCE S256,
