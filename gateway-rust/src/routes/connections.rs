@@ -50,7 +50,7 @@ pub fn router() -> Router<Arc<AppState>> {
 /// Pairing codes, OAuth tickets and personal metadata must not persist in
 /// browser/proxy HTTP caches, including responses produced by this router's
 /// handlers on error. The callback also keeps its stricter script policy.
-async fn private_response_headers(request: Request, next: Next) -> Response {
+pub(crate) async fn private_response_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     response.headers_mut().insert(
         header::CACHE_CONTROL,
