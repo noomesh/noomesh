@@ -1009,7 +1009,38 @@ jobs:
       # several modules, and a filter that names modules silently under-runs
       # when the next one arrives. The ungated tests re-run in seconds on the
       # warm target, so this also proves they hold with a live database.
-      run: cargo test --bin noo-gateway -- --test-threads=1
+      #
+      # --skip router_harness_tests: that suite has its own step below, so it
+      # runs exactly once and its tally is visible.
+      run: cargo test --bin noo-gateway -- --test-threads=1 --skip router_harness_tests
+
+    # The router harness (followup i242): the REAL router on a throwaway
+    # database, asserting authz (a viewer is refused on every
+    # Operator/OperatorOrInternal/Admin route, enumerated from the source),
+    # `redis_reconnecting` and `Measured` with Redis absent. It lives in the
+    # gateway's test binary (the crate has no library target for an
+    # integration test to import), so this is the same compile the step above
+    # just paid for: seconds of build, then the migration chain on a scratch
+    # database and ~90 requests.
+    #
+    # NOO_ROUTER_HARNESS_REQUIRED=1: without the DSN the harness skips with a
+    # printed reason, and a skip looks exactly like a pass. Here a missing DSN
+    # fails the run, and the log must carry all three tallies, so a harness
+    # that matched no test (a rename) cannot go green either. pipefail: the
+    # grep must not mask cargo's exit code, and cargo's must not hide behind tee.
+    - name: Router harness (real router, real Postgres, no Redis, no NATS)
+      if: needs.scope.outputs.sqlx == 'true' && steps.trellion.outputs.public == 'true'
+      working-directory: gateway-rust
+      env:
+        NOO_BROKER_TEST_DSN: postgresql://noo:noo@localhost:5432/noomesh
+        NOO_ROUTER_HARNESS_REQUIRED: "1"
+        SQLX_OFFLINE: "true"
+      run: |
+        set -euo pipefail
+        cargo test --bin noo-gateway router_harness_tests -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/router-harness.log"
+        for tally in "router_harness: authz" "router_harness: redis_reconnecting" "router_harness: Measured"; do
+          grep -q "$tally" "$RUNNER_TEMP/router-harness.log" || { echo "::error::the router harness did not report '$tally' — it matched no test or skipped"; exit 1; }
+        done
 
 
     # Prune before saving: incremental dirs, the crate's own (test) binaries
