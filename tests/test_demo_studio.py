@@ -316,3 +316,13 @@ def test_record_down_after_removes_the_box_whatever_the_recorder_returned():
     assert "--down-after) down_after=1" in body and 'set -- "${args[@]}"' in body, "the flag is stripped before the recorder sees it"
     assert "local rc=$?" in body and body.index("local rc=$?") < body.index("cmd_down") < body.index('return "$rc"')
     assert "--down-after" in studio.split("record [--smoke]", 1)[1].split("\n", 1)[0], "the usage line names it"
+
+@needs_bash
+def test_an_environment_variable_name_after_a_secret_label_is_not_a_secret():
+    """Take 13 (2026-10-26): "noo-apply: secrets in … moved to files under …:
+    NOO_NODE_AGENT_TOKEN" gave a 20-char `label` literal, which (matched
+    case-insensitively) is also in Compose's own "secrets.noo_node_agent_token"
+    warning text in the masked output. A name is not a value."""
+    assert leak_literals("noo-apply: secrets in /etc/x moved to files under /etc/y: NOO_NODE_AGENT_TOKEN NOO_CLUSTER_SECRET") == set()
+    assert leak_literals("api key: ABCDEF1234567890") == {"ABCDEF1234567890"}, "all-caps without an underscore is still a value"
+    assert leak_literals("token: abc_DEF_ghi_jkl_mno") == {"abc_DEF_ghi_jkl_mno"}, "mixed case with underscores is still a value"
