@@ -214,7 +214,7 @@ pub async fn scan_folders_once(state: &AppState) -> ScanResult {
         // page extract + OCR fallback all re-open). Copying once into the
         // Docker volume isolates the ingester from the flaky mount.
         // Mirrors scan_drives_once's WORKING_DIR pattern (line ~495) and
-        // the original Python autonomy.py shutil.copyfile reference body.
+        // the original (retired) Python autonomy loop's shutil.copyfile body.
         // The original CIFS path stays as source_uri so dedup + provenance
         // queries continue to track the canonical location.
         // If we can't even copy the source, the file is genuinely

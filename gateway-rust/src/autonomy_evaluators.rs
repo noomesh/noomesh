@@ -18,9 +18,9 @@
 //! - **HARNESS-dispatch** — none today; could appear if a future location
 //!   needs the LLM to compute its condition.
 //!
-//! Reference Python implementation: `noomesh/cluster/autonomy.py` and
-//! `noomesh/cluster/default_locations.py` (preserved as the canonical
-//! spec — Python autonomy loop is dead in prod per the Tier 3 audit).
+//! The Python autonomy loop is gone from the tree; the default locations it
+//! ran are listed in `src/noomesh/cluster/default_locations.py`, and the
+//! evaluators below are the live spec.
 
 use std::collections::HashMap;
 
@@ -2114,8 +2114,7 @@ pub async fn eval_cert_auto_rotate(
 ///
 /// Returns 0 if the PKI directory is missing (gateway not yet onboarded).
 pub async fn count_certs_expiring_within(days_threshold: i64) -> usize {
-    let pki_dir = std::env::var("NOO_PKI_DIR")
-        .ok()
+    let pki_dir = crate::tls::pki_dir().map(|p| p.to_string_lossy().into_owned())
         .filter(|p| std::path::Path::new(p).join("ca.crt").exists())
         .or_else(|| {
             ["/tmp/pki", "/app/pki"]
@@ -3543,9 +3542,8 @@ pub async fn eval_kb_chunk_scale(state: &AppState) -> Result<bool, String> {
 
 // ─── Custom locations (operator-defined rules engine) ───────────────────
 //
-// Port of `worker.autonomy.evaluate_custom` (reference implementation:
-// `noomesh/workers/autonomy.py::_autonomy_evaluate_custom`, kept
-// unregistered). This was the design's sharpest anti-pattern: the Rust
+// Port of `worker.autonomy.evaluate_custom` (the Python side is
+// `src/noomesh/workers/autonomy.py`, which no longer has an evaluate_custom). This was the design's sharpest anti-pattern: the Rust
 // autonomy loop scheduled the location, hopped to Python over NATS, and
 // Python did an HTTP GET back out — the whole body is a threshold
 // comparison. Builtins keep their hand-written evaluators above; this

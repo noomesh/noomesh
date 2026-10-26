@@ -27,8 +27,8 @@ pub const STATIC_DIR: &str = "/app/static";
 /// The dashboard artifact, unpacked by the Dockerfile's
 /// `COPY --from=ui /dist /var/www`: `index.html` plus hashed `assets/`.
 /// This is the ONLY dashboard source. The vendored console and the
-/// NOO_UI_SOURCE selector that chose between them are retired to
-/// legacy/vendored-console/.
+/// NOO_UI_SOURCE selector that chose between them are retired and
+/// removed from the tree.
 pub const UI_WWW_DIR: &str = "/var/www";
 
 // PYTHON_SRC and PROMPT_SKILLS_DIR used to live here, pointing at /app/src.
