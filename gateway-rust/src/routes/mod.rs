@@ -73,6 +73,11 @@ mod websocket;
 #[cfg(test)]
 mod ownership_scoping_tests;
 
+/// The real router on a throwaway Postgres: authz, `redis_reconnecting` and
+/// `Measured`, asserted by request. DSN-gated like the module above.
+#[cfg(test)]
+mod router_harness_tests;
+
 use std::sync::Arc;
 use axum::{Router, Json, middleware as axum_mw};
 use axum::http::StatusCode;
