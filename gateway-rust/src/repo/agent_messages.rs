@@ -157,9 +157,13 @@ fn row_json(r: &sqlx::postgres::PgRow) -> Value {
     })
 }
 
-/// One exact name: what it sent or received, plus thread-addressed posts in
-/// threads it took part in.
-const AGENT_CLAUSE: &str = " AND (from_agent = $N OR to_agent = $N OR (to_agent = 'thread' AND thread_id IN \
+/// One exact name: what it sent or received, mail to its bare account (the
+/// fan-out rule `Caller::may_read` applies: mail to `owner` reaches every
+/// `owner/…` session), plus thread-addressed posts in threads it took part
+/// in. `split_part(name, '/', 1)` is the account (`auth::account_of`); for a
+/// bare account it is the name itself, already covered.
+const AGENT_CLAUSE: &str = " AND (from_agent = $N OR to_agent = $N OR to_agent = split_part($N, '/', 1) \
+    OR (to_agent = 'thread' AND thread_id IN \
     (SELECT thread_id FROM noo_agent_messages WHERE from_agent = $N OR to_agent = $N)))";
 
 /// An ACCOUNT's view: [`AGENT_CLAUSE`] widened from one name to the name
@@ -196,12 +200,9 @@ pub async fn list(db: &PgPool, f: &Filter<'_>) -> Result<Vec<Value>, sqlx::Error
         push(&mut sql, AGENT_CLAUSE, a);
     }
     if let Some(o) = f.owner {
-        if o.contains(crate::auth::CONNECTION_SEP) {
-            // A connection owns exactly itself — the same clause as `agent`.
-            push(&mut sql, AGENT_CLAUSE, o);
-        } else {
-            push(&mut sql, &owner_clause(), o);
-        }
+        // A connection owns exactly itself (the `agent` clause); an
+        // account owns its name and everything under it.
+        push(&mut sql, &owner_scope_clause(o), o);
     }
     if let Some(node) = f.node_prefix {
         // LIKE with the node name escaped (`_` and `%` are wildcards).
@@ -287,23 +288,37 @@ pub async fn mark_read(db: &PgPool, id: &str, reader: &str) -> Result<bool, sqlx
     Ok(true)
 }
 
-/// Threads: derived from the messages (no thread table). Newest activity
-/// first; `agent` scopes to threads the agent took part in.
-pub async fn threads(db: &PgPool, agent: Option<&str>, limit: i64) -> Result<Vec<Value>, sqlx::Error> {
-    use sqlx::Row;
-    let sql = if agent.is_some() {
-        "SELECT thread_id, COUNT(*) AS n, MIN(ts) AS started, MAX(ts) AS last, \
-                array_agg(DISTINCT from_agent) AS senders, array_agg(DISTINCT to_agent) AS recipients \
-         FROM noo_agent_messages WHERE from_agent = $1 OR to_agent = $1 \
-         GROUP BY thread_id ORDER BY MAX(ts) DESC LIMIT $2"
+/// The clause for "mail that is mine" given the name a caller holds: a
+/// connection (`account/label`) owns exactly itself, an account owns its
+/// name and everything under `<name>/`. One definition, used by [`list`]
+/// (`Filter::owner`) and [`threads`], so "mine" cannot drift between them.
+fn owner_scope_clause(owner: &str) -> String {
+    if owner.contains(crate::auth::CONNECTION_SEP) {
+        AGENT_CLAUSE.to_string()
     } else {
+        owner_clause()
+    }
+}
+
+/// Threads: derived from the messages (no thread table). Newest activity
+/// first. `agent` scopes to one exact name's view; `owner` to everything a
+/// caller holds ([`owner_scope_clause`]); neither lists every thread.
+pub async fn threads(db: &PgPool, agent: Option<&str>, owner: Option<&str>, limit: i64) -> Result<Vec<Value>, sqlx::Error> {
+    use sqlx::Row;
+    let scope = agent.or(owner);
+    let clause = match (agent, owner) {
+        (Some(_), _) => AGENT_CLAUSE.replace("$N", "$1"),
+        (None, Some(o)) => owner_scope_clause(o).replace("$N", "$1"),
+        (None, None) => " AND $1::text IS NULL".to_string(),
+    };
+    let sql = format!(
         "SELECT thread_id, COUNT(*) AS n, MIN(ts) AS started, MAX(ts) AS last, \
                 array_agg(DISTINCT from_agent) AS senders, array_agg(DISTINCT to_agent) AS recipients \
-         FROM noo_agent_messages WHERE $1::text IS NULL \
+         FROM noo_agent_messages WHERE 1=1{clause} \
          GROUP BY thread_id ORDER BY MAX(ts) DESC LIMIT $2"
-    };
-    let rows = sqlx::query(sql)
-        .bind(agent)
+    );
+    let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql))
+        .bind(scope)
         .bind(limit.clamp(1, 500))
         .fetch_all(db)
         .await?;
@@ -383,6 +398,26 @@ mod owner_tests {
     /// `to`, in the outer query and in the thread sub-select.
     fn terms(sql: &str) -> usize {
         sql.matches("starts_with(").count()
+    }
+
+    #[test]
+    fn thread_listing_reuses_the_one_definition_of_mine() {
+        assert_eq!(owner_scope_clause("bob"), owner_clause());
+        assert_eq!(owner_scope_clause("bob/laptop"), AGENT_CLAUSE);
+        let src = include_str!("agent_messages.rs");
+        let body = src.split("pub async fn threads(").nth(1).expect("threads fn");
+        assert!(body.contains("owner_scope_clause(o)"), "threads must reuse the owner clause");
+    }
+
+    /// A session lists what `may_read` lets it read: mail to its bare
+    /// account fans out to it. Without this a session's inbox hid mail its
+    /// own reader would accept.
+    #[test]
+    fn a_sessions_list_includes_mail_to_its_account() {
+        assert!(AGENT_CLAUSE.contains("to_agent = split_part($N, '/', 1)"), "{AGENT_CLAUSE}");
+        // the thread seat stays the exact name: account mail does not seat a session in a thread
+        let sub = AGENT_CLAUSE.split("SELECT thread_id").nth(1).unwrap();
+        assert!(!sub.contains("split_part"), "{sub}");
     }
 
     #[test]

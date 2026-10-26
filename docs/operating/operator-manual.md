@@ -211,6 +211,31 @@ gateway-signed binary swap is retired.
 Newest first. Anything here changes behaviour on an install that already
 works, so read it before you pull.
 
+#### A 0.6.9 Mac node and the 0.6.10 bundle (2026-10-23)
+
+A Mac node still on 0.6.9 cannot take a bundle staged by a 0.6.10 controller:
+its applier checks `agent-env` before it hands over to the CLI the bundle
+carries, and refuses the two keys 0.6.10 added
+(`REFUSED agent-env -- line N sets 'NODE_AGENT_BIND', which is not a key
+agent-env is rendered with`, exit 65). The node keeps its previous state, and
+`noo cluster verify` keeps saying `host agent v0.6.9`. From 0.6.11 the
+controller withholds `NODE_AGENT_BIND` and `NOO_CLUSTER_TOKEN_V1` from a Mac
+that reports a CLI older than 0.6.10 (or none), and the Mac applier installs
+the CLI a bundle carries before it judges any kind or env key; run
+`noo cluster provision <node>` once the node reports 0.6.10 to apply the two
+keys.
+
+If your controller is already on 0.6.10, update the daemon's copy of the CLI
+on the Mac by hand, then restage. `noo upgrade` in a shell updates only the
+shell's copy (`~/.local/bin/noo`); the applier is root's `/usr/local/bin/noo`:
+
+```sh
+noo upgrade                                                    # on the Mac: the shell's copy
+sudo install -m 755 -o root -g wheel ~/.local/bin/noo /usr/local/bin/noo
+/usr/local/bin/noo --version                                   # 0.6.10
+noo cluster provision <node> --wait                            # on the controller
+```
+
 #### Add-on flags moved out of `.env` (2026-09-04)
 
 **`noo stack start` refuses to run** while `.env` still contains
@@ -283,6 +308,16 @@ alongside it under a separate passphrase. The full procedure — what is
 backed up, where it should live, the restore drill, restoring onto a fresh
 machine, and `noo migrate export/import` — is
 [runbooks/backup-restore-secrets.md](runbooks/backup-restore-secrets.md).
+A backup that never ran is an alert too, not only one that ran and failed: when the
+newest success is older than the task's schedule plus two hours, the scheduler
+says so as soon as it is back (before the catch-up run), and again when a
+success lands. `noo backups status` and `noo cluster verify --controller` show
+the age of the last good backup (files and task history, and when they
+disagree), and whether the newest dump has left the machine
+(`NOO_BACKUP_OFFSITE`, recorded in `.env`, read by the backup script itself so a
+hostd-run backup sees it). Undecided off-site is a WARN and a weekly alert;
+`noo backups setup` decides it, and `none` is an accepted answer.
+
 Run the drill monthly:
 
 ```sh

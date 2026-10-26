@@ -14,10 +14,10 @@
 //! digest and `docker load`s it — it never holds a registry credential.
 //!
 //! What gets staged:
-//!   - `noo upgrade` (stack stage) and `noo cluster stage-images --lock`: every
+//!   - `noo upgrade` (stack stage) and `noo cluster sync-images --stage-only --lock`: every
 //!     node-bound image in the release-signed stack lock, pulled BY DIGEST,
 //!     for every architecture the fleet runs (amd64, arm64);
-//!   - `noo cluster sync-images` / `stage-images -i IMG`: any named image
+//!   - `noo cluster sync-images -i IMG` (and `--stage-only -i IMG`): any named image
 //!     (third-party ones too, so a node needs no internet registry at all).
 //!
 //! Multi-arch on one daemon. A foreign-architecture pull on Docker's classic
@@ -29,6 +29,10 @@
 //! uses — and saves BY IMAGE ID (the node tags the loaded image with the ref
 //! it asked for). On the containerd image store platforms coexist under one
 //! reference and `docker save --platform` exports just one.
+//!
+//! The verb is `noo cluster sync-images` (phase 1 here, phase 2 = nodes pull,
+//! in cluster_provision_subprocess.rs); `--stage-only` stops after phase 1.
+//! The old `stage-images` verb is a retired stub (commands/cluster.rs).
 //!
 //! Everything recorded goes into `staged-images.json` beside the tars; the
 //! gateway reads it (lock digest, release prefix/tag for place-time checks)
@@ -251,7 +255,7 @@ pub(crate) struct StagedRecord {
     /// The release-lock digest it was pulled by ("" when staged by name).
     #[serde(default)]
     pub lock_digest: String,
-    /// "lock" | "sync-images" | "stage-images" | "place".
+    /// "lock" | "sync-images" | "place".
     #[serde(default)]
     pub source: String,
     #[serde(default)]
@@ -920,7 +924,7 @@ pub(crate) struct StageRun {
 impl Drop for StageRun {
     fn drop(&mut self) {
         if let Some(h) = self.handle.take() {
-            ui::warned("node image staging was not joined by its caller — waiting for it to finish; its summary is not shown (re-run `noo cluster stage-images --lock` to see it)");
+            ui::warned("node image staging was not joined by its caller — waiting for it to finish; its summary is not shown (re-run `noo cluster sync-images --stage-only --lock` to see it)");
             let _ = h.join();
         }
     }
@@ -978,7 +982,7 @@ impl StageRun {
                 }
                 print_summary(g, &sum);
                 if !sum.failed.is_empty() && !g.json {
-                    ui::guide(&[("noo cluster stage-images --lock", "retries staging the release images for every fleet architecture")]);
+                    ui::guide(&[("noo cluster sync-images --stage-only --lock", "retries staging the release images for every fleet architecture")]);
                 }
             }
             Err(_) => {
@@ -992,74 +996,77 @@ impl StageRun {
                 let _ = write_index(&dir, &idx);
                 ui::warned("node image staging crashed (the roll itself is unaffected) — the nodes stage will refuse until it is retried");
                 if !g.json {
-                    ui::guide(&[("noo cluster stage-images --lock", "retries staging the release images for every fleet architecture")]);
+                    ui::guide(&[("noo cluster sync-images --stage-only --lock", "retries staging the release images for every fleet architecture")]);
                 }
             }
         }
     }
 }
 
-/// `noo cluster stage-images [--lock] [-i|--image IMG]... [--arch a,b] [--all-images]`
-pub fn cluster_stage_images(g: &Globals, args: &[String]) -> Result<i32, crate::Unhandled> {
-    use crate::Unhandled;
-    let mut images: Vec<String> = Vec::new();
-    let mut arches: Vec<String> = Vec::new();
-    let mut from_lock = false;
-    let mut all = false;
-    let mut it = args.iter();
-    while let Some(t) = it.next() {
-        match t.as_str() {
-            "--lock" => from_lock = true,
-            "--all-images" => all = true,
-            "-i" | "--image" => images.push(it.next().ok_or(Unhandled)?.clone()),
-            "--arch" => {
-                for a in it.next().ok_or(Unhandled)?.split(',') {
-                    arches.push(normalize_arch(a).ok_or(Unhandled)?.to_string());
-                }
-            }
-            _ => return Err(Unhandled),
-        }
-    }
-    if images.is_empty() {
-        from_lock = true;
-    }
-    if arches.is_empty() {
-        arches = fleet_arches_from_gateway(g);
-    }
+/// The controller's stack lock, its release tag and image prefix — what
+/// phase 1 stages from with `--lock`. Exits with a hint when the lock is
+/// missing (a controller that never ran `noo upgrade`).
+pub(crate) fn read_controller_lock(g: &Globals) -> (String, String, String) {
+    let root = crate::envfile::repo_root();
+    let lock = match std::fs::read_to_string(root.join("stack.lock")) {
+        Ok(l) => l,
+        Err(e) => crate::output::fail(g.json, crate::output::ExitCode::Generic, "no_stack_lock",
+            &format!("cannot read {}: {e}", root.join("stack.lock").display()),
+            Some("noo upgrade   # verifies and writes the release-signed lock, then stages")),
+    };
+    let tag = lock.lines().find_map(|l| l.strip_prefix("# tag ").map(|t| t.trim().to_string()))
+        .unwrap_or_else(|| crate::commands::provision::release_var("NOO_IMAGE_TAG"));
+    let prefix = crate::commands::provision::release_var("NOO_IMAGE_PREFIX");
+    let prefix = if prefix.is_empty() { crate::registry::IMAGE_NAMESPACE.to_string() } else { prefix };
+    (lock, prefix, tag)
+}
+
+/// The `<prefix>/<name>:<tag>` refs of the lock's node-bound release images —
+/// what a node pulls after `--lock` staged them (never `--all-images` rows).
+pub(crate) fn lock_node_refs(lock: &str, prefix: &str, tag: &str) -> Vec<String> {
+    let prefix = prefix.trim_end_matches('/');
+    parse_lock(lock).into_iter().filter(|r| stages_from_lock(&r.name, false)).map(|r| format!("{prefix}/{}:{tag}", r.name)).collect()
+}
+
+/// Phase 1 of `noo cluster sync-images`, shared with the verb's
+/// `--stage-only`: stage the lock's release images (`from_lock`, with
+/// `all` adding the controller-only ones) and/or the named `images`, for
+/// each of `arches`, on the artifact rail. Prints each step; the caller
+/// prints the summary. `source` is recorded in the staged index.
+pub(crate) fn stage_selection(g: &Globals, images: &[String], arches: &[String], from_lock: bool, all: bool, source: &str) -> Summary {
     let mut sum = Summary::default();
     if from_lock {
-        let root = crate::envfile::repo_root();
-        let lock = match std::fs::read_to_string(root.join("stack.lock")) {
-            Ok(l) => l,
-            Err(e) => crate::output::fail(g.json, crate::output::ExitCode::Generic, "no_stack_lock",
-                &format!("cannot read {}: {e}", root.join("stack.lock").display()),
-                Some("noo upgrade   # verifies and writes the release-signed lock, then stages")),
-        };
-        let tag = lock.lines().find_map(|l| l.strip_prefix("# tag ").map(|t| t.trim().to_string()))
-            .unwrap_or_else(|| crate::commands::provision::release_var("NOO_IMAGE_TAG"));
-        let prefix = crate::commands::provision::release_var("NOO_IMAGE_PREFIX");
-        let prefix = if prefix.is_empty() { crate::registry::IMAGE_NAMESPACE.to_string() } else { prefix };
-        sum = stage_lock(g, &lock, &prefix, &tag, &arches, all);
+        let (lock, prefix, tag) = read_controller_lock(g);
+        sum = stage_lock(g, &lock, &prefix, &tag, arches, all);
     }
-    for img in &images {
-        for arch in &arches {
+    for img in images {
+        for arch in arches {
             let label = format!("{img} ({arch})");
             if !g.json {
                 ui::step(&format!("staging {label}"));
             }
-            match stage_and_record(g, img, arch, "stage-images") {
+            match stage_and_record(g, img, arch, source) {
                 Ok(_) => sum.staged.push(label),
                 Err(e) if e.starts_with(NO_VARIANT) => sum.skipped.push(format!("{label}: not published for {arch}")),
                 Err(e) => sum.failed.push(format!("{label}: {e}")),
             }
         }
     }
+    sum
+}
+
+/// `noo cluster sync-images --stage-only`: phase 1 and stop. With no `-i`
+/// the lock is staged (`from_lock` is implied). Arches default to the fleet's.
+pub(crate) fn run_stage_only(g: &Globals, images: &[String], arches: &[String], from_lock: bool, all: bool) -> i32 {
+    let from_lock = from_lock || images.is_empty();
+    let arches = if arches.is_empty() { fleet_arches_from_gateway(g) } else { arches.to_vec() };
+    let sum = stage_selection(g, images, &arches, from_lock, all, "sync-images");
     if g.json {
         println!("{}", serde_json::json!({"staged": sum.staged, "skipped": sum.skipped, "failed": sum.failed}));
     } else {
         print_summary(g, &sum);
     }
-    Ok(if sum.failed.is_empty() { 0 } else { 1 })
+    if sum.failed.is_empty() { 0 } else { 1 }
 }
 
 /// The image a placement needs staged, when it can be named — the CLI twin

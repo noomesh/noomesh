@@ -189,8 +189,6 @@ GATEWAY_NOT_TIER1: dict[str, str] = {
     "NOO_TOKEN_EXPIRE_MINUTES": "a number",
     "NOO_STT_API_KEY_ENV": "the NAME of a variable, not a value",
     "NOO_TTS_API_KEY_ENV": "the NAME of a variable, not a value",
-    "NOO_SELF_CALL_SHARED_SECRET": "a posture bridge flag (\"0\" closes it) that posture "
-    "applies with set_var at boot — a _FILE for it would trip the both-set refusal",
 }
 
 # Same for the WORKER and the Python manifest.

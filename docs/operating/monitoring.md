@@ -141,6 +141,9 @@ native agent, never compose.
 | `nats_dlq_pending`, `nats_dlq_abandoned` | gauge | DB | messages awaiting the DLQ drain / given up on. **`abandoned > 0` needs eyes** |
 | `noo_auth_failures_5m`, `noo_exec_denials_5m` | gauge | DB (security audit) | the security alert rules read these |
 | `noo_cluster_nodes_total`, `…_online`, `…_busy`, `…_offline` | gauge | cluster collector | fleet size and health, the same counts `noo cluster status` prints |
+| `noo_embed_queue_pending`, `…_ack_pending`, `…_waiting` (label `model`) | gauge | JetStream consumer info | bulk embedding queue per model: batches waiting, batches a node holds unacknowledged, and open node fetches. `waiting` of 0 with `pending` growing means no node is pulling, and the gateway runs those jobs itself after 2 minutes. Omitted for a model whose consumer cannot be read |
+| `noo_embed_pull_jobs_total` (label `path`) | counter | gateway | embedding jobs by path: `pull` (a node claims it) or `push` (the gateway runs it, including a job flipped after a pull stalled) |
+| `noo_embed_pull_failures_total` (label `reason`) | counter | gateway | `flipped_to_push_run`: a pulled job stalled and the gateway took it over; `result_refused`: a node returned vectors for the wrong model, count or width, and the job was failed |
 | `noo_cluster_tier1_nodes`, `…_tier2_…`, `…_tier3_…` | gauge | cluster collector | worker-tier mix. Edge (4), companion (5) and monitor (6) nodes count in the total but have no series of their own |
 | `noo_cluster_vram_total_gb` | gauge | cluster collector | fleet VRAM |
 | `noo_node_load{node}`, `noo_node_tier{node}`, `noo_node_vram_gb{node}`, `noo_node_backends_running{node}` | gauge | cluster collector | per node. **A value that is not known is not emitted** — a node absent from gossip has an unknown load, and an absent series reads as "no data" where a `0` would read as "idle, send it work" |
@@ -174,17 +177,22 @@ in `gateway-rust/src/metrics.rs::collect_db_gauges`.
 
 ### Legacy credential lanes
 
-Four ways in are kept only until nothing uses them. The gateway counts
-each one it admits, and the replacements beside them, so the ratio is
-visible. Counting never refuses anything; the lane still works exactly as
-before. The one exception is `addon_shared_secret_refused`, a lane that
-was retired once the add-ons stopped sending it: it counts refusals, so a caller still on it
-has a name.
+Two ways in are still admitted only until nothing uses them
+(`node_token_no_cert`, `cluster_hmac_v1`). The gateway counts each one it
+admits, and the replacements beside them, so the ratio is visible. Counting
+never refuses anything; those lanes still work exactly as before. The
+`*_refused` lanes below are lanes that were retired: they count refusals,
+so a caller still on one has a name. Two admission lanes are gone entirely
+and are no longer counted: `self_call_shared_secret` (the
+`NOO_SELF_CALL_SHARED_SECRET` bridge, deleted) and
+`cluster_hmac_non_inference` (nothing can resolve a shared secret to
+`Internal` any more). Dashboards or alerts that still name them read zero
+forever; use `self_call_shared_secret_refused` and
+`addon_shared_secret_refused`.
 
 | `lane` | other labels | counted when |
 |---|---|---|
-| `self_call_shared_secret` | `door` (`controller` \| `cluster`), `caller` | a shared-secret HMAC buys inference (`/v1/*`, `/api/external/*`) — the `NOO_SELF_CALL_SHARED_SECRET` bridge |
-| `cluster_hmac_non_inference` | `kind` (`controller` \| `cluster`), `route_class`, `caller` | a shared-secret HMAC gets full (internal) access on any other route (an add-on never appears here: its HMAC is refused, next row) |
+| `self_call_shared_secret_refused` | `door` (`cluster`), `caller` | **refused**, not admitted: a fleet-secret HMAC on the inference surface (`/v1/*`, `/api/external/*`). The gateway answers 403; the caller must present its own service key (`noo security service-key issue <consumer>`). A controller-secret HMAC on the same surface is refused earlier by the controller door and counted as `controller_shared_secret_refused` |
 | `addon_shared_secret_refused` | `door` (`controller` \| `cluster`), `caller`, `route_class` | **refused**, not admitted: a shared-secret HMAC whose actor is an add-on's (`trellion`, `trellion-intel`, `evolve`). The gateway answers 403 naming `noo security service-key provision <add-on>`. A count is an add-on image from before the add-ons dropped their HMAC fallback, or one with no key — every gateway call it makes is failing |
 | `node_token_no_cert` | `node` (as the token claims it), `route_class` | a node token reaches a node route with no client certificate on the connection |
 | `node_token_with_cert` | `node` (from the certificate) | the same with the node's certificate — the good case |
@@ -199,8 +207,7 @@ signs with a shared secret (no `--break-glass`, no onboard `cli-onboard`),
 and the gateway refuses the controller-secret HMAC of any actor a CLI ever
 used, on every route, with a 403 naming `noo upgrade --all`. Those
 refusals are counted as `cli_shared_secret_refused`; `noo cluster verify
---controller` warns on any, naming the caller. `cluster_hmac_non_inference`
-therefore holds only the add-ons' HMAC fallback.
+--controller` warns on any, naming the caller.
 
 `route_class` is the path's first segment from a fixed list (`cluster`,
 `rag`, `graph`, `inference`, …; `other` past it), never the path itself.
@@ -218,18 +225,17 @@ reports them on every heartbeat as `legacy_lanes`
 (`{since_unix, static_token, whois_non_controller}`).
 
 The logs say who: a `node_token_no_cert` use logs a WARN once per node per
-hour; a `cluster_hmac_non_inference` use logs at DEBUG once per
-kind/route class/caller per ten minutes; the self-call bridge's existing
-per-use WARN names the peer (`ip=… leaf=…`). Nothing here reaches a
-channel.
+hour; a `self_call_shared_secret_refused` use logs a WARN once per
+door/caller per ten minutes, naming the peer (`ip=… leaf=…`). Nothing here
+reaches a channel.
 
 `noo cluster verify --controller` reads all of it as its `legacy lanes`
 row:
 
 | verdict | reads |
 |---|---|
-| OK | `0 uses — uses since gateway start <age> ago; nodes: shortest agent uptime <age>: self_call_shared_secret 0, … [comparators: node_token_with_cert N, addon_exchanged_token N, operator_client_cert N]`; a window under seven days adds `under 7 days, not yet retirement evidence` |
-| WARN | `in use: <lane>, … — …` with each lane's count and who used it (`self_call_shared_secret 12 (trellion 10, worker 2)`); or `/metrics` not readable; or a gateway without `noo_gateway_start_time_seconds` (older than the counters; `noo upgrade --stack`); or an online node that does not report `legacy_lanes` (`noo cluster provision <node> --wait`) |
+| OK | `0 uses — uses since gateway start <age> ago; nodes: shortest agent uptime <age>: node_token_no_cert 0, … [comparators: node_token_with_cert N, addon_exchanged_token N, operator_client_cert N]`; a window under seven days adds `under 7 days, not yet retirement evidence` |
+| WARN | `in use: <lane>, … — …` with each lane's count and who used it (`node_token_no_cert 12 (host3 10, host9 2)`); a refused self-call, controller-secret, fleet-off-node, CLI or v1 token is its own WARN naming the caller (`self_call_shared_secret_refused 5 (host9 5)`); or `/metrics` not readable; or a gateway without `noo_gateway_start_time_seconds` (older than the counters; `noo upgrade --stack`); or an online node that does not report `legacy_lanes` (`noo cluster provision <node> --wait`) |
 
 A lane is ready to retire after zero uses over at least seven days of
 uptime — gateway uptime for the gateway lanes, every node's agent uptime
@@ -312,7 +318,11 @@ the `monitoring web config` row
 (every mounted web-config is named by its command) and one `<name> at rest`
 row per data directory — loki, postgres, redis, nats, prometheus, grafana,
 noo-data, pki, age key — OK on a dm-crypt device, WARN otherwise: nothing
-here encrypts its own files, so disk encryption is the host's control.
+here encrypts its own files. The WARN's remedy states the plan (operator
+decision i10a, no full-disk LUKS): the data-root rows point at a LUKS2 volume
+unlocked by the machine's TPM, the `pki` and `age key` rows at keys sealed to
+the TPM. Both protect a stolen or lost drive, not root on the running machine,
+and neither is built yet.
 
 | Rule | Fires when |
 |---|---|
@@ -687,7 +697,9 @@ Loki's filesystem store writes chunks and its index under
 encryption for the filesystem object store (its encryption options exist
 for S3). In transit everything is mTLS (node-agent → gateway → Loki,
 Grafana → Loki). What protects the logs on disk is the host's disk
-encryption, which is the operator's control: `noo cluster verify
+encryption (planned, i10a: a LUKS2 volume for the data root, unlocked by the
+machine's TPM; it covers a stolen drive, not root on the running machine):
+`noo cluster verify
 --controller` reports `loki at rest` as OK only when the mount holding the
 data root sits on a dm-crypt device, WARNs when it does not, and says
 "could not determine" when it cannot tell — it never assumes. Access to

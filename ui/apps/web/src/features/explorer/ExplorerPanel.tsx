@@ -10,7 +10,7 @@ interface EpisodeKind {
   records: number;
 }
 interface RecallData {
-  started: boolean;
+  started: boolean | null;
   enabled: boolean | null;
   totalRecords: number | null;
   liveRecords: number | null;
@@ -27,7 +27,7 @@ function useRecallMemory() {
       const { data, error } = await client.GET('/api/v1/recall/status');
       if (error) throw new Error('Recall memory not available');
       return {
-        started: data?.started ?? false,
+        started: data?.started ?? null,
         enabled: data?.enabled ?? null,
         // null = the worker could not count; show a dash, not a zero.
         totalRecords: data?.total_records ?? null,
@@ -62,8 +62,8 @@ export function ExplorerPanel() {
             tiles={[
               {
                 label: 'Archiver',
-                value: !vm.data.started ? 'Off' : vm.data.enabled === false ? 'Disabled' : 'Running',
-                hot: !vm.data.started || vm.data.enabled === false,
+                value: vm.data.started == null ? 'Unknown' : !vm.data.started ? 'Off' : vm.data.enabled === false ? 'Disabled' : 'Running',
+                hot: vm.data.started === false || vm.data.enabled === false,
               },
               { label: 'Episodes', value: fmtCount(vm.data.totalRecords) },
               { label: 'Live', value: fmtCount(vm.data.liveRecords) },

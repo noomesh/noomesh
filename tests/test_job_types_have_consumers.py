@@ -118,7 +118,10 @@ def test_the_scans_find_the_producers_they_claim_to_scan():
     # A regex that silently matches nothing would pass every check below.
     gw, cli, py = _rust_gateway_producers(), _cli_producers(), _python_producers()
     assert {"inference", "background_graph"} <= set(gw), gw
-    assert {"inference", "model_file", "fetch_bundle"} <= set(cli), cli
+    # `noo jobs run|submit` build the type from a variable (default "inference"),
+    # which a textual scan cannot see; the literal CLI producer of "inference"
+    # was `cluster assign`, retired 2026-10-23 (i195 decision 1).
+    assert {"model_file", "fetch_bundle"} <= set(cli), cli
     assert "background_graph" in py, py
 
 

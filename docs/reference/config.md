@@ -685,7 +685,6 @@ Decide in this order:
    | `NOO_EXEC_APPROVAL_MODE` | `auto` \| `approval` \| `strict` tool-execution gating |
    | `NOO_NODE_AGENT_PRIVILEGED` | whether the node-agent **container** runs privileged (mirrored into `.env` for compose, and the container is recreated on change; `posture list` reports the container's actual state) — an opt-in compose profile the fleet does not deploy; every node runs the host binary as `noo-agent` in the `docker` group ([node-agent.md](../security/node-agent.md)) |
    | `NOO_MCP_EXTERNAL_ENABLED` | opens the user MCP door (`/mcp/user`) |
-   | `NOO_SELF_CALL_SHARED_SECRET` | a *bridge*, not a gate: closed by default (unset = closed); only `1` / `open` holds it open. While open, a shared-secret token still buys inference and every acceptance warns naming the caller; closed, callers must present their own `noo_service_keys` row. It does not retire `NOO_CONTROLLER_SECRET`, whose one remaining job is the gateway's boot guard |
 
    At boot the gateway (and the Python worker) read the table and set those
    keys in the process environment *before serving*, so the DB is
@@ -789,6 +788,8 @@ default, cached and refreshed every 15 s. The registry
 | `CLOUD_PROVIDERS_ENABLED` | features | off |
 | `NOO_EVOLVE_HOFSTADTER_ENABLED` | features | on (with the evolve add-on) |
 | `kiosk.graph_labels` | kiosk | off — **DB only** (see below) |
+| `at_rest.unencrypted_accepted` | security | off — **DB only, person only** (see below) |
+| `at_rest.recovery_key_acknowledged` | security | off — **DB only, person only** (see below) |
 | `NOO_HEARTBEAT_TZ` (string) | heartbeat | `America/New_York` |
 | `NOO_REPORTS_DRIVE_FOLDER_ID` (string) | heartbeat | empty (reports are sent inline) |
 | `NOO_OPS_WAIT_<TYPE>_SECS`, `NOO_OPS_RESULT_TTL_SECS` (strings) | ops | see [Asynchronous operations](#asynchronous-operations) |
@@ -814,6 +815,22 @@ The `NOO_AGENT_*` gates and `NOO_SELF_DEVELOP_AUTO_RESTART` are not in this
 registry. The add-on that owns them reads them from its own container
 environment; a row here would be a switch on another process's behaviour that
 this one cannot honour.
+
+`at_rest.unencrypted_accepted` records that a person has accepted this
+controller's data being stored unencrypted on disk (i10a). It has no env
+layer and can be set only by a person's own credential: the cluster
+credential and service keys get 403, so `updated_by` and `updated_at` (and
+the `setting_flag_set` audit event) always name who decided and when. While
+it is on, `noo cluster verify` shows the at-rest rows as accepted risk and
+still states that the data is not encrypted. Switch it with
+`noo security at-rest opt-out|opt-in|status`.
+
+`at_rest.recovery_key_acknowledged` records that a person was shown the
+encrypted state volume's recovery key (once, on a terminal, never stored) and
+confirmed storing it off the machine by retyping its first and last groups
+(i10a). Person-only and DB-only like the opt-out; `noo cluster verify` shows
+the `at-rest recovery key` row as a warning until it is set. Written by
+`noo security at-rest create-volume` and by `noo onboard`.
 
 `kiosk.graph_labels` decides whether `/api/kiosk/graph` sends the kiosk
 display entity names and relation types. It has **no env layer**: it is the

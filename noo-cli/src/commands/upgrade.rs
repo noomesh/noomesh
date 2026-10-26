@@ -161,11 +161,11 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             v if v.starts_with("--version=") => {
                 pin = Some(v["--version=".len()..].trim_start_matches("noo-cli-v").to_string());
             }
-            // Native-only command: bad args must print usage HERE. Returning
-            // Unhandled fell through to the Python CLI, which has no
+            // Native-only command: bad args must print usage HERE. (Returning
+            // Unhandled used to fall through to a Python CLI, which has no
             // `upgrade` at all — an operator on an older binary running a
-            // newer flag got "noo-py: No such command 'upgrade'" (live
-            // 2026-08-23 with 0.2.23 + --all).
+            // newer flag got "No such command 'upgrade'" (live 2026-08-23
+            // with 0.2.23 + --all).)
             // `noo upgrade --stack v0.2.8` — a bare stack version is the tag
             // (the operator typed exactly this on the first rail walk).
             v if v.starts_with('v') && v.len() > 1
@@ -843,7 +843,7 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
         ) } {
             // Nodes on the rail pull their images from the controller's
             // store; rolling them on top of a failed stage strands them.
-            ui::close_failed(&err, Some("noo cluster stage-images --lock"));
+            ui::close_failed(&err, Some("noo cluster sync-images --stage-only --lock"));
             rc = 1;
             failed_stage = "nodes";
         } else {
@@ -874,6 +874,14 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
         if let Some(t) = tag_override { resume.push_str(&format!(" --tag {t}")); }
         ui::close_failed(&format!("upgrade stopped at the {failed_stage} stage — fix the cause above, then resume"), Some(&resume));
         eprintln!("{}", ui::note("stages are idempotent — the CLI stays current, the stack re-pulls on the moved pin, nodes restage"));
+    }
+    // i10a: a hint, never an action. A controller whose state is not on an
+    // encrypted volume is told how to move it (or to record the opt-out);
+    // `upgrade` itself never migrates.
+    if rc == 0 && stack && !g.json {
+        if let Some(h) = crate::commands::at_rest_migrate::upgrade_hint() {
+            println!("{}", ui::note(&h));
+        }
     }
     Ok(rc)
 }
@@ -4172,7 +4180,7 @@ fn lock_stage_verdict(failed: &[String], rail_nodes: &[String], force: bool) -> 
         return LockStageVerdict::Clean;
     }
     let what = format!(
-        "{} image(s) of this release failed to stage on the artifact rail: {}. Retry: `noo cluster stage-images --lock`",
+        "{} image(s) of this release failed to stage on the artifact rail: {}. Retry: `noo cluster sync-images --stage-only --lock`",
         failed.len(),
         failed.join("; "),
     );
@@ -4526,7 +4534,7 @@ mod tests {
         // Every node on legacy (the default this release): warn, roll.
         match lock_stage_verdict(&f, &[], false) {
             LockStageVerdict::Warn(m) => {
-                assert!(m.contains("reg/a/llamacpp:v1") && m.contains("noo cluster stage-images --lock"), "{m}");
+                assert!(m.contains("reg/a/llamacpp:v1") && m.contains("noo cluster sync-images --stage-only --lock"), "{m}");
                 assert!(m.contains("no online node runs NOO_IMAGE_SOURCE=rail"), "{m}");
             }
             other => panic!("legacy fleet must warn, not refuse: {other:?}"),

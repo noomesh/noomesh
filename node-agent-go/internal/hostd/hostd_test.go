@@ -6,7 +6,9 @@ package hostd
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -20,6 +22,8 @@ import (
 type fakeRunner struct {
 	calls [][]string
 	dirs  []string
+	// envs records the extraEnv of each Run, parallel to calls.
+	envs [][]string
 	// rc maps a substring of the joined argv to the exit code to return, so a
 	// test can make one specific step fail.
 	rc map[string]int
@@ -30,7 +34,8 @@ type fakeRunner struct {
 	stderr map[string]string
 }
 
-func (f *fakeRunner) Run(_ context.Context, dir string, _ []string, name string, args ...string) (int, string) {
+func (f *fakeRunner) Run(_ context.Context, dir string, env []string, name string, args ...string) (int, string) {
+	f.envs = append(f.envs, env)
 	f.dirs = append(f.dirs, dir)
 	argv := append([]string{name}, args...)
 	f.calls = append(f.calls, argv)
@@ -598,6 +603,18 @@ func TestNothingExecsOutsideTheRunnerSeam(t *testing.T) {
 		"exec.go":    true, // the seam itself
 		"watch.go":   true, // runStreaming: the detached rebuild's log tee
 		"install.go": true, // systemctl/launchctl, an operator-invoked path
+		// at-rest create-volume (i10a PR-C): sudo by a person, never the
+		// spool; every binary it runs is a VolumeConfig field, and its tests
+		// set each to a fake.
+		"atrest_volume_linux.go": true,
+		// at-rest (i10a): sudo by a person, never the spool; every binary it
+		// runs is an AtRestConfig field, and its tests set each to a fake.
+		"atrest_linux.go": true,
+		// at-rest copy/wipe (i10a PR-D): same rules, rsync/fstrim are
+		// MigrateConfig fields and its tests set both to fakes.
+		"atrest_migrate_linux.go": true,
+		// recovery-key / reenroll (PR-E): the same shape, same fakes.
+		"atrest_recovery_linux.go": true,
 	}
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -867,6 +884,24 @@ func TestBootRestoreWritesFilesThenStartsOnlyBoundContainers(t *testing.T) {
 	}
 }
 
+// i10a: when the state lives on the encrypted volume and it did not open at
+// boot, the restore refuses before writing secrets or starting anything.
+func TestBootRestoreChecksTheStateVolumeBeforeStarting(t *testing.T) {
+	e, fr := testEngine(t)
+	e.BootRestore(context.Background())
+	got := strings.Join(fr.joined(), "\n")
+	check := strings.Index(got, "check_state_volume_open")
+	if !strings.Contains(got, "lib-state-volume.sh") || check < 0 {
+		t.Fatalf("boot-restore does not check the state volume:\n%s", got)
+	}
+	if !(strings.Index(got, "populated") < check && check < strings.Index(got, "load_secrets >/dev/null") && check < strings.Index(got, "docker start")) {
+		t.Fatalf("the volume check must come before the write and the start:\n%s", got)
+	}
+	if !strings.Contains(got, "exit 3") {
+		t.Fatalf("a closed volume must fail the attempt:\n%s", got)
+	}
+}
+
 func TestBootRestoreDoesNothingForAWorker(t *testing.T) {
 	e, fr := testEngine(t)
 	e.Mode = ModeWorker
@@ -881,4 +916,170 @@ func TestTheDaemonRunsBootRestoreAtStart(t *testing.T) {
 	if !strings.Contains(string(src), "RestoreOnBoot:  true") {
 		t.Fatal("noo-hostd main must enable RestoreOnBoot")
 	}
+}
+
+// The 2026-10-24 near miss, on the reboot path: dockerd restarted the stack
+// without a launcher while the data disk had not come back. BootRestore runs
+// the REAL guard (lib-data-root-mount.sh) against a fake mount table and a fake
+// docker: it stops postgres first, stops the rest, records why, and never
+// starts anything, secrets populated or not.
+func TestBootRestoreStopsTheStackWhenTheDataRootIsNotOnItsFilesystem(t *testing.T) {
+	root := t.TempDir()
+	scripts := filepath.Join(root, "scripts")
+	if err := os.MkdirAll(scripts, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lib, err := os.ReadFile("../../../scripts/lib-data-root-mount.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(os.WriteFile(filepath.Join(scripts, "lib-data-root-mount.sh"), lib, 0o644))
+	// A secrets lib that would write files and a marker if it were reached.
+	reached := filepath.Join(root, "secrets-reached")
+	must(os.WriteFile(filepath.Join(scripts, "lib-secrets.sh"),
+		[]byte("secret_rundir() { echo '"+root+"/rundir'; }\nload_secrets() { touch '"+reached+"'; }\n"), 0o644))
+
+	data := filepath.Join(root, "mnt", "noo")
+	must(os.MkdirAll(filepath.Join(data, "postgres"), 0o755))
+	must(os.WriteFile(filepath.Join(data, "postgres", "PG_VERSION"), []byte("16\n"), 0o644))
+
+	bin := filepath.Join(root, "bin")
+	must(os.MkdirAll(bin, 0o755))
+	dlog := filepath.Join(root, "docker.log")
+	must(os.WriteFile(filepath.Join(bin, "findmnt"), []byte("#!/bin/sh\nf=\nwhile [ $# -gt 0 ]; do [ \"$1\" = -o ] && f=$2; shift; done\neval \"printf '%s\\n' \\\"\\$FAKE_$f\\\"\"\n"), 0o755))
+	must(os.WriteFile(filepath.Join(bin, "docker"), []byte("#!/bin/sh\necho \"$@\" >> '"+dlog+"'\n[ \"$1\" = ps ] && printf '%s\\n' noo-redis noo-postgres noo-gateway\nexit 0\n"), 0o755))
+
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	t.Setenv("COMPOSE_LOCK_FILE", filepath.Join(root, "lock"))
+	t.Setenv("NOO_DATA_ROOT", data)
+	t.Setenv("FAKE_UUID", "aaaa-1111")
+	t.Setenv("FAKE_SOURCE", "/dev/nvme1n1p1")
+	t.Setenv("FAKE_TARGET", filepath.Join(root, "mnt"))
+	t.Setenv("FAKE_FSTYPE", "ext4")
+
+	var logs []string
+	e := &Engine{Root: root, Spool: filepath.Join(root, "spool"), Runner: ExecRunner{}, Logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }}
+	boot := func() {
+		// One attempt only: cancel as soon as the script returns, so the retry
+		// sleep does not run.
+		ctx, cancel := context.WithCancel(context.Background())
+		e.Runner = cancelAfterRun{ExecRunner{}, cancel}
+		e.BootRestore(ctx)
+	}
+
+	// 1. First boot on a good mount records the identity, and the restore goes on.
+	boot()
+	if _, err := os.Stat(filepath.Join(root, ".noo-data-root-id")); err != nil {
+		t.Fatalf("the identity was not recorded: %v (logs %v)", err, logs)
+	}
+	if _, err := os.Stat(reached); err != nil {
+		t.Fatalf("a healthy mount must not stop the secret restore: %v", err)
+	}
+	if b, _ := os.ReadFile(dlog); strings.Contains(string(b), "stop") {
+		t.Fatalf("a healthy mount stopped containers:\n%s", b)
+	}
+	must(os.Remove(reached))
+	_ = os.Remove(dlog)
+
+	// 2. The disk does not come back: a different filesystem under the root.
+	t.Setenv("FAKE_UUID", "rootfs-9999")
+	t.Setenv("FAKE_SOURCE", "/dev/sda2")
+	t.Setenv("FAKE_TARGET", "/")
+	logs = nil
+	boot()
+	b, err := os.ReadFile(dlog)
+	must(err)
+	calls := strings.Split(strings.TrimSpace(string(b)), "\n")
+	var stops []string
+	for _, c := range calls {
+		if strings.HasPrefix(c, "stop ") {
+			stops = append(stops, c)
+		}
+		if strings.HasPrefix(c, "start") || strings.HasPrefix(c, "run") || strings.Contains(c, "compose") || strings.HasPrefix(c, "up") {
+			t.Fatalf("the refused boot path started something: %q", c)
+		}
+	}
+	if len(stops) != 3 || stops[0] != "stop noo-postgres" {
+		t.Fatalf("postgres must be stopped first, then the rest; got %v", stops)
+	}
+	if _, err := os.Stat(reached); err == nil {
+		t.Fatal("secrets were written for a stack that must not start")
+	}
+	why, err := os.ReadFile(filepath.Join(root, ".noo-data-root-refused"))
+	must(err)
+	if !strings.Contains(string(why), "REFUSED") || !strings.Contains(string(why), "aaaa-1111") {
+		t.Fatalf("the reason was not recorded:\n%s", why)
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), "BOOT-RESTORE attempt 1 failed (exit 3)") {
+		t.Fatalf("the refusal must fail the attempt with exit 3: %v", logs)
+	}
+
+	// 3. A Linux host without findmnt (util-linux not installed; the 0.6.11
+	// rehearsal's alpine dind): the filesystem cannot be checked, so the boot
+	// path refuses the same way, and says retrying will not help.
+	nofm := filepath.Join(root, "nofindmnt-bin")
+	must(os.MkdirAll(nofm, 0o755))
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if dir == bin {
+			continue
+		}
+		ents, _ := os.ReadDir(dir)
+		for _, ent := range ents {
+			dest := filepath.Join(nofm, ent.Name())
+			if ent.Name() == "findmnt" || ent.Name() == "uname" || ent.Name() == "docker" {
+				continue
+			}
+			if _, err := os.Lstat(dest); err == nil {
+				continue
+			}
+			_ = os.Symlink(filepath.Join(dir, ent.Name()), dest)
+		}
+	}
+	must(os.Symlink(filepath.Join(bin, "docker"), filepath.Join(nofm, "docker")))
+	must(os.WriteFile(filepath.Join(nofm, "uname"), []byte("#!/bin/sh\necho Linux\n"), 0o755))
+	t.Setenv("PATH", nofm)
+	if p, err := exec.LookPath("findmnt"); err == nil {
+		t.Fatalf("findmnt still on the test PATH: %s", p)
+	}
+	_ = os.Remove(dlog)
+	_ = os.Remove(filepath.Join(root, ".noo-data-root-refused"))
+	logs = nil
+	boot()
+	b, err = os.ReadFile(dlog)
+	must(err)
+	if !strings.HasPrefix(strings.TrimSpace(string(b)), "ps") || !strings.Contains(string(b), "stop noo-postgres") || strings.Contains(string(b), "start") {
+		t.Fatalf("without findmnt the boot path must stop the stack and start nothing:\n%s", b)
+	}
+	if _, err := os.Stat(reached); err == nil {
+		t.Fatal("secrets were written on a host that cannot check its data root")
+	}
+	why, err = os.ReadFile(filepath.Join(root, ".noo-data-root-refused"))
+	must(err)
+	for _, want := range []string{"findmnt is not installed", "util-linux", "Retrying will not help"} {
+		if !strings.Contains(string(why), want) {
+			t.Fatalf("the refusal reason lacks %q:\n%s", want, why)
+		}
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), "BOOT-RESTORE attempt 1 failed (exit 3)") {
+		t.Fatalf("no findmnt must fail the attempt with exit 3: %v", logs)
+	}
+}
+
+// cancelAfterRun cancels the context once the script has run, so BootRestore's
+// retry loop stops after one attempt instead of sleeping.
+type cancelAfterRun struct {
+	ExecRunner
+	cancel context.CancelFunc
+}
+
+func (c cancelAfterRun) Run(ctx context.Context, dir string, env []string, name string, args ...string) (int, string) {
+	rc, se := c.ExecRunner.Run(ctx, dir, env, name, args...)
+	c.cancel()
+	return rc, se
 }

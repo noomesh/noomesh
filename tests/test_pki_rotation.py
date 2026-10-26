@@ -143,8 +143,8 @@ class TestClusterCA:
         assert len(results) == 0
 
 
-# remove_ca_trust unit tests moved with onboard/ca_trust.py to
-# legacy/python-onboard/ (2026-08-06); the live trust-store logic is native
+# remove_ca_trust unit tests went away with onboard/ca_trust.py
+# on 2026-08-06 (history in git log before that); the live trust-store logic is native
 # Rust with its own tests (noo-cli security_local.rs).
 
 

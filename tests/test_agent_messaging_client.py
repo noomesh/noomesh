@@ -115,3 +115,23 @@ def test_listener_accepts_only_signed_sealed_envelopes_addressed_to_it(tmp_path)
     assert not m.accept(forged, signer), "re-addressed copy fails the signature"
     # Plaintext mode (no controller key): shape only.
     assert m.accept({**env, "enc": "none", "sig": None}, None)
+
+
+def test_default_key_path_is_the_container_mount_not_the_host_data_root(tmp_path, monkeypatch):
+    """Container env: NOO_DATA_ROOT is a host path that does not exist here;
+    the noo-data mount (NOO_DATA_DIR) does."""
+    import pytest
+    host = tmp_path / "host-only"  # never created
+    mount = tmp_path / "data"
+    mount.mkdir()
+    monkeypatch.setenv("NOO_DATA_ROOT", str(host))
+    monkeypatch.setenv("NOO_DATA_DIR", str(mount))
+    m = AgentMessenger("worker/ingest")
+    files = list((mount / "agent-keys").glob("*.json"))
+    assert len(files) == 1, "keys must be persisted under the mount"
+    assert not host.exists(), "the host data-root path must never be touched"
+    assert AgentMessenger("worker/ingest").keys.public_record() == m.keys.public_record()
+    # Mount missing: a visible error, not a silent write to the container layer.
+    monkeypatch.setenv("NOO_DATA_DIR", str(tmp_path / "nomount"))
+    with pytest.raises(RuntimeError, match="not mounted"):
+        AgentMessenger("worker/ingest")

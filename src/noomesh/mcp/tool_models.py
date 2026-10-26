@@ -24,7 +24,7 @@ import logging
 import os
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 logger = logging.getLogger(__name__)
@@ -82,6 +82,13 @@ class ToolDef(BaseModel):
             question: str = Field(description="The question to answer")
             strategy: str = Field(default="hybrid", description="Search strategy")
     """
+
+    # An argument the tool does not declare is an error naming it, never a
+    # silent drop (i217): `noo_agent_thread(thread_id=...)` (the parameter is
+    # `thread`) ran with no thread filter and answered a broader question
+    # than the one asked. This is the single choke point for every tool, and
+    # it also puts `additionalProperties: false` in every advertised schema.
+    model_config = ConfigDict(extra="forbid")
 
     # -- Metadata (ClassVar = not part of input schema) --
     name: ClassVar[str]

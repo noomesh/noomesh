@@ -3,13 +3,13 @@
 
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
+import { dash, ratioOrNull } from '@/lib/num';
 import { meterLevel } from '@/lib/meter';
 import { StatTiles } from '@/components/StatTiles';
 import { StatusBadge, type Tone } from '@/components/StatusBadge';
 import { Button } from '@/components/ui/button';
 import { useMemory, useEmbedControl } from './useMemory';
 
-const num = (n: number) => n.toLocaleString();
 const workerTone = (s: string): Tone =>
   s === 'running' ? 'good' : s === 'error' ? 'bad' : 'neutral';
 
@@ -26,9 +26,8 @@ export function MemoryPanel() {
     });
   }
 
-  const coverage = mem.data && mem.data.storage.total > 0
-    ? Math.round((mem.data.storage.embedded / mem.data.storage.total) * 100)
-    : 0;
+  const ratio = mem.data ? ratioOrNull(mem.data.storage.embedded, mem.data.storage.total) : null;
+  const coverage = ratio === null ? null : Math.round(ratio * 100);
 
   return (
     <section className="panel">
@@ -57,12 +56,12 @@ export function MemoryPanel() {
 
       {mem.data && (
         <>
-          <h3 className="subhead">Storage · {coverage}% embedded</h3>
+          <h3 className="subhead">Storage · {dash(coverage, (n) => `${n}%`)} embedded</h3>
           <StatTiles
             tiles={[
-              { label: 'Records', value: num(mem.data.storage.total) },
-              { label: 'Embedded', value: num(mem.data.storage.embedded) },
-              { label: 'Unembedded', value: num(mem.data.storage.unembedded), hot: mem.data.storage.unembedded > 0 },
+              { label: 'Records', value: dash(mem.data.storage.total) },
+              { label: 'Embedded', value: dash(mem.data.storage.embedded) },
+              { label: 'Unembedded', value: dash(mem.data.storage.unembedded), hot: (mem.data.storage.unembedded ?? 0) > 0 },
               { label: 'Users', value: mem.data.storage.users },
             ]}
           />
@@ -70,34 +69,34 @@ export function MemoryPanel() {
           <h3 className="subhead">Conversations</h3>
           <StatTiles
             tiles={[
-              { label: 'Conversations', value: num(mem.data.conv.conversations) },
-              { label: 'Messages', value: num(mem.data.conv.messages) },
-              { label: 'Tool calls', value: num(mem.data.conv.toolCalls) },
-              { label: 'Avg msgs', value: mem.data.conv.avgMessages.toFixed(1) },
+              { label: 'Conversations', value: dash(mem.data.conv.conversations) },
+              { label: 'Messages', value: dash(mem.data.conv.messages) },
+              { label: 'Tool calls', value: dash(mem.data.conv.toolCalls) },
+              { label: 'Avg msgs', value: dash(mem.data.conv.avgMessages, (n) => n.toFixed(1)) },
             ]}
           />
 
           <h3 className="subhead">Tool usage</h3>
           {mem.data.tools.length ? (
             mem.data.tools.map((t) => {
-              const rate = Math.round(t.successRate * 100);
+              const rate = t.successRate === null ? null : Math.round(t.successRate * 100);
               return (
                 <div className="tool-row" key={t.name}>
                   <div className="tool-id">
                     <span className="tool-name">{t.name}</span>
-                    <span className="tool-calls">{num(t.calls)} calls</span>
+                    <span className="tool-calls">{dash(t.calls)} calls</span>
                   </div>
                   <div className="tool-right">
                     <span className="meter tool-meter">
-                      {rate}%
+                      {dash(rate, (n) => `${n}%`)}
                       <span className="track">
                         <span
-                          className={cn('fill', meterLevel(rate, 'high-good'))}
-                          style={{ width: `${Math.min(100, rate)}%` }}
+                          className={cn('fill', rate === null ? '' : meterLevel(rate, 'high-good'))}
+                          style={{ width: `${Math.min(100, rate ?? 0)}%` }}
                         />
                       </span>
                     </span>
-                    <span className="tool-avg">{t.avgMs ? `${Math.round(t.avgMs)}ms` : '—'}</span>
+                    <span className="tool-avg">{dash(t.avgMs, (n) => `${Math.round(n)}ms`)}</span>
                   </div>
                 </div>
               );

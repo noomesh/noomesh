@@ -99,6 +99,14 @@ pub(crate) const STORAGE_SUBDIRS: &[&str] = &[
     "models/voice/whisper", "models/voice/piper",
 ];
 
+/// The subset of [`STORAGE_SUBDIRS`] that is SENSITIVE STATE and so lives under
+/// `NOO_STATE_ROOT` (default: the data root) rather than `NOO_DATA_ROOT`
+/// (i10a). Mirrors the compose volumes bound under
+/// `${NOO_STATE_ROOT:-${NOO_DATA_ROOT}}`; models, hf-cache, ollama and images
+/// are not here and always stay under the data root.
+/// tests/test_state_root_groundwork.py holds this to the compose file.
+pub(crate) const STATE_SUBDIRS: &[&str] = &["noo-data", "redis", "nats", "prometheus", "grafana", "loki", "postgres"];
+
 /// The eleven step titles, in wizard order — the single source for both
 /// `run_all`'s banners and the TUI's step list. DEPENDENCY-ORDERED
 /// (finding #16, operator design 2026-08-20): Secrets (credential gen +
@@ -173,6 +181,14 @@ pub(crate) struct State {
     pub security_configured: bool,
     pub tls_enabled: bool,
     pub services_started: bool,
+    /// The person said no to encrypting at rest (i10a). Held here until the
+    /// gateway is up, then recorded by `steps::at_rest_record` (the setting
+    /// lives in the gateway's database).
+    pub at_rest_opt_out: bool,
+    /// The person retyped the state volume's recovery key in the storage
+    /// step (i10a PR-C). Recorded with `at_rest_record` once the gateway is
+    /// up (`at_rest.recovery_key_acknowledged`, person-only).
+    pub at_rest_recovery_ack: bool,
     pub model_pulled: String,
     pub backend_used: String,
     pub admin_username: String,
@@ -749,8 +765,9 @@ pub fn onboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 let home = standalone::default_home();
                 let _ = std::fs::create_dir_all(&home);
                 // Age key first, with the different-key guard.
-                let key_dst = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                    .join(".config/sops/age/keys.txt");
+                // A restore writes the plaintext home, never the sealed
+                // runtime file (that one belongs to noo-unseal.service).
+                let key_dst = crate::age_key::default_path();
                 let src_key = extracted.join("age/keys.txt");
                 if key_dst.exists()
                     && std::fs::read(&key_dst).ok() != std::fs::read(&src_key).ok()
@@ -1045,11 +1062,14 @@ fn confirm_data_plane_is_fresh(ctx: &mut Ctx) -> bool {
         v if v.is_empty() => crate::commands::data_root::DEFAULT_DATA_ROOT.to_string(),
         v => v,
     };
+    // The state set (postgres, redis, nats) lives under NOO_STATE_ROOT, which
+    // defaults to the data root (i10a).
+    let state_root = crate::commands::data_root::state_root_of(Some(ctx.read_env("NOO_STATE_ROOT").as_str()), &data_root);
     let pg_data = match ctx.read_env("NOO_PG_DATA") {
-        v if v.is_empty() => format!("{data_root}/postgres"),
+        v if v.is_empty() => format!("{state_root}/postgres"),
         v => v,
     };
-    let populated: Vec<String> = [pg_data, format!("{data_root}/redis"), format!("{data_root}/nats")]
+    let populated: Vec<String> = [pg_data, format!("{state_root}/redis"), format!("{state_root}/nats")]
         .into_iter()
         .filter(|d| {
             std::fs::read_dir(d)
@@ -1224,6 +1244,12 @@ fn run_all(ctx: &mut Ctx) {
         ctx.info("Skipped.");
     } else {
         steps::storage(ctx);
+        // A "yes" to encryption at rest whose volume could not be made
+        // stops here, before any service starts (i10a): never carry on
+        // unencrypted after the person said yes.
+        if ctx.state.interrupted {
+            return;
+        }
     }
     ctx.pause(6, TOTAL);
 
@@ -1237,6 +1263,9 @@ fn run_all(ctx: &mut Ctx) {
         // rides along here rather than becoming an eleventh step.
         steps::provision_service_keys(ctx);
         steps::security_posture(ctx);
+        // The at-rest decision from the storage step, now that there is a
+        // gateway to record it in.
+        steps::at_rest_record(ctx);
     }
     ctx.pause(7, TOTAL);
 
@@ -1717,5 +1746,73 @@ mod rerun_tests {
         let guard = &body[..body.find("let proceed = ctx").expect("interactive branch")];
         assert!(guard.contains("return verdict.exit_code();"), "the non-interactive re-run exits on the health verdict");
         assert!(!guard.contains("return 0;"), "no unconditional success in the non-interactive re-run");
+    }
+}
+
+/// i10a PR-A: the at-rest question is asked in the storage step, and its
+/// answer is recorded after the services start, next to the posture.
+#[cfg(test)]
+mod at_rest_tests {
+    use super::State;
+
+    #[test]
+    fn no_decision_is_recorded_until_someone_says_no() {
+        assert!(!State::default().at_rest_opt_out);
+    }
+
+    #[test]
+    fn the_answer_is_recorded_after_services_start_and_the_question_is_asked_in_storage() {
+        let m = include_str!("mod.rs");
+        let posture = m.find("steps::security_posture(ctx);").expect("posture call");
+        let record = m.find("steps::at_rest_record(ctx);").expect("the opt-out is never recorded");
+        assert!(record > posture, "the flag is written where posture is applied, after the gateway is up");
+        let steps = include_str!("steps.rs");
+        let storage = &steps[steps.find("pub fn storage(").unwrap()..];
+        let storage = &storage[..storage.find("\n}\n").unwrap()];
+        assert!(storage.contains("at_rest_choice(ctx, &chosen_root)"), "the storage step does not ask about encryption at rest");
+        // the wizard never writes the flag before the gateway exists
+        let choice = &steps[steps.find("fn at_rest_choice(").unwrap()..];
+        let choice = &choice[..choice.find("\n}\n").unwrap()];
+        assert!(!choice.contains("flags/set"), "at_rest_choice must only remember the answer");
+        assert!(choice.contains("state.at_rest_opt_out = true"));
+        assert!(choice.contains("at_rest_encrypt_fresh(ctx, data_root)"), "'yes' makes the encrypted volume");
+    }
+
+    /// i10a PR-C: a "yes" makes the volume BEFORE any state directory and
+    /// before any service: the choice is the first thing after the data root
+    /// exists, ahead of the state root, postgres' path and the directories;
+    /// the storage step runs before the services step; and a failed volume
+    /// stops the wizard there.
+    #[test]
+    fn a_yes_makes_the_volume_before_any_state_or_service() {
+        let steps = include_str!("steps.rs");
+        let storage = &steps[steps.find("pub fn storage(").unwrap()..];
+        let storage = &storage[..storage.find("\n}\n").unwrap()];
+        let at = |needle: &str| storage.find(needle).unwrap_or_else(|| panic!("storage() lacks {needle}"));
+        let choice = at("if !at_rest_choice(ctx, &chosen_root) {");
+        assert!(at("ensure_root_dir(ctx, Path::new(&chosen_root));") < choice, "the data root must exist first (the backing file lives in it)");
+        for later in ["state_root_path(ctx,", "ensure_pg_data_path(", "create_storage_dirs(ctx,", "verify_bind_mount("] {
+            assert!(choice < at(later), "{later} ran before the at-rest choice: state could be written in the clear");
+        }
+        assert!(storage[choice..].starts_with("if !at_rest_choice(ctx, &chosen_root) {\n        return;"), "a failed volume must stop the step");
+        let m = include_str!("mod.rs");
+        let run = &m[m.find("steps::storage(ctx);").unwrap()..];
+        let stop = run.find("if ctx.state.interrupted {").expect("run_all must stop after a failed volume");
+        assert!(stop < run.find("steps::services(ctx);").unwrap(), "the stop must come before the services start");
+        // the yes path is the trait-driven setup_fresh, and a failure is a hard failure
+        let enc = &steps[steps.find("fn at_rest_encrypt_fresh(").unwrap()..];
+        let enc = &enc[..enc.find("\n}\n").unwrap()];
+        assert!(enc.contains("vol::setup_fresh(&mut io, plan)"));
+        assert!(enc.contains("Err(e) => at_rest_stop(ctx, &e)"));
+        let stop_fn = &steps[steps.find("fn at_rest_stop(").unwrap()..];
+        assert!(stop_fn[..stop_fn.find("\n}\n").unwrap()].contains("ctx.state.interrupted = true"));
+        assert!(!State::default().at_rest_recovery_ack, "no acknowledgement until the person retypes the key");
+    }
+
+    #[test]
+    fn the_onboard_prompt_asks_the_operators_question() {
+        let c = crate::commands::at_rest::ONBOARD_PROMPT;
+        assert!(c.starts_with("Encrypt your data, keys and secrets on disk, unlocked only on this machine?"));
+        assert!(c.ends_with("(recommended)"));
     }
 }

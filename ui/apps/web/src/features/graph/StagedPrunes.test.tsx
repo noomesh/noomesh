@@ -103,4 +103,13 @@ describe('StagedPrunes', () => {
     expect(btn.disabled).toBe(true);
     expect(btn.title).toMatch(/operator role/);
   });
+
+  it('renders a dash, not 0, for counts the gateway did not send', () => {
+    H.staged.current = loaded([{ ...ROW, edgeCount: null, mentionCount: null }]);
+    (H.staged.current as { data: { entityTotal: number | null; edgeTotal: number | null } }).data.entityTotal = null;
+    (H.staged.current as { data: { entityTotal: number | null; edgeTotal: number | null } }).data.edgeTotal = null;
+    render(<StagedPrunes />);
+    expect(screen.getByText(/— edges · — mentions/)).toBeTruthy();
+    expect(screen.queryByText(/\b0 edges/)).toBeNull();
+  });
 });

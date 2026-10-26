@@ -733,7 +733,8 @@ async fn posture_set(
         }
     } else if crate::posture::RETIRED_INERT_KEYS.contains(&key) {
         // The same one write for a retired key that never became a
-        // RetiredBridge (`NOO_NATS_LEGACY_SHARED_CREDS`): closing a row still
+        // RetiredBridge (`NOO_NATS_LEGACY_SHARED_CREDS`,
+        // `NOO_SELF_CALL_SHARED_SECRET`): closing a row still
         // held open, so the next boot deletes it (`retired_rows_to_clear`).
         if value != "0" {
             return Err(AppError::BadRequest(format!(
@@ -2499,7 +2500,7 @@ fn validate_key_scopes_with(scopes: &[String], declared: &[String]) -> Result<()
     if !bad.is_empty() {
         return Err(AppError::BadRequest(format!(
             "unknown scope(s): {bad:?}. Allowed: {SERVICE_KEY_SCOPES:?}, the control scopes \
-             (temporal, heartbeat, activities, channels:send, metrics, config:<section>) \
+             (temporal, heartbeat, activities, channels:send, metrics, voice:transcribe, config:<section>) \
              (+ {OPERATOR_ONLY_KEY_SCOPES:?}, operator-issued only).{}",
             addon_scope_hint(declared)
         )));

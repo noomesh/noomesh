@@ -5034,7 +5034,9 @@ async fn probe_channel(channel: &str) -> Result<String, String> {
         "telegram" => {
             let token = crate::config::secret_env::secret_required("TELEGRAM_BOT_TOKEN")?;
             let url = format!("https://api.telegram.org/bot{token}/getMe");
-            let resp = reqwest::Client::new()
+            let resp = crate::tls::client_builder()
+                .build()
+                .map_err(|e| format!("http client: {}", crate::redact::scrub(&e.to_string())))?
                 .get(&url)
                 .timeout(std::time::Duration::from_secs(10))
                 .send()

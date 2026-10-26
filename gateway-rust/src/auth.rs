@@ -73,35 +73,6 @@ pub fn controller_secret() -> Option<String> {
     crate::config::secret_env::secret_opt("NOO_CONTROLLER_SECRET")
 }
 
-/// Is the bridge still open? `NOO_SELF_CALL_SHARED_SECRET`.
-///
-/// CLOSED BY DEFAULT. It was open by default while the
-/// controller's own services still had no keys of their own; every one does
-/// now (`service keys` verify row), the controller secret buys nothing at
-/// all, and the live controller counted 0 `self_call_shared_secret` uses
-/// over the seven days before this change. What is left on this lane is the
-/// fleet secret on the inference surface, which only a node holds. Only an
-/// explicit
-/// opening value holds it open (a posture row, which `noo cluster verify`
-/// reports with its age).
-pub fn self_call_bridge_open() -> bool {
-    // A posture BRIDGE flag ("0" closes it), not a credential — despite the
-    // name. Posture applies it with `set_var` at boot (posture.rs), so it is
-    // read as plain env and is NOT in `secret_env::FILE_BACKED_SECRETS`: a
-    // `_FILE` for it would make preflight refuse on NAME + NAME_FILE the
-    // moment posture set the flag.
-    shared_secret_buys_inference(&std::env::var("NOO_SELF_CALL_SHARED_SECRET").unwrap_or_default())
-}
-
-/// The decision, pure so it can be tested without an environment.
-///
-/// Only an explicit opening value opens the bridge. Unset, empty, a closing
-/// value and a typo all leave it CLOSED: a shared secret buying inference is
-/// the exception that has to be asked for, not the default.
-pub fn shared_secret_buys_inference(flag: &str) -> bool {
-    matches!(flag.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on" | "open")
-}
-
 /// A gateway with no controller secret does not serve.
 ///
 /// Without it every token signed with the fleet secret — the one every node
@@ -160,8 +131,10 @@ pub const NODE_ROUTES: &[(&str, &str)] = &[
     // embedding helper is `/api/embed` above, and the agent SERVES rerank to
     // the gateway rather than calling it — and the live controller counted
     // 0 fleet-secret admissions on the inference surface
-    // (`self_call_shared_secret`) for seven days. Left listed, a stolen
-    // fleet secret bought inference whenever the self-call bridge was open.
+    // (`self_call_shared_secret`, retired) for seven days. Left listed, a
+    // stolen fleet secret bought inference whenever the self-call bridge was
+    // open; the bridge is deleted and the fleet door refuses the inference
+    // surface outright (`self_call_shared_secret_refused`).
     ("POST", "/api/v1/rag/extract"),
     ("POST", "/api/v1/rag/build-edges"),
     ("POST", "/api/v1/graph/extract"),
@@ -177,6 +150,11 @@ pub const NODE_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/agents/threads"),
     ("GET", "/api/agents/keys/*"),
     ("PUT", "/api/agents/keys/*"),
+    // The node-held tunnel (i131 phase 2): a node opens it as ITSELF. The
+    // handler additionally requires the TLS client certificate to name the
+    // same node as this token's actor and a controller-verified challenge
+    // response (`tunnel.rs`).
+    ("GET", "/api/node/tunnel"),
 ];
 
 /// Is `method path` on the node allow-list for `actor`? `{self}` segments
@@ -2493,6 +2471,12 @@ pub const CONVERSATION_STATS_SCOPE: &str = "conversation_stats";
 /// the store, so evolve writes through these four rows. Core skills are
 /// refused by the handlers regardless of who holds the scope.
 pub const PROMPT_SKILLS_WRITE_SCOPE: &str = "prompt_skills:write";
+/// Speech-to-text for a SERVICE: the two transcribe routes. A person needs no
+/// scope (`/api/voice/` is on the chat/query surface); a service key does,
+/// and unlike every other control scope it is also accepted AS THE KEY, on
+/// exactly these two routes (`DIRECT_KEY_SCOPES`). trellion's audio ingest
+/// (`POST /api/voice/transcribe/detailed`) presents its own key.
+pub const VOICE_TRANSCRIBE_SCOPE: &str = "voice:transcribe";
 pub const CONTROL_SCOPE_ROUTES: &[(&str, &str, &str)] = &[
     (TEMPORAL_SCOPE, "POST", "/api/temporal/adaptations"),
     (HEARTBEAT_SCOPE, "POST", "/api/heartbeat/tasks/*/run"),
@@ -2505,7 +2489,60 @@ pub const CONTROL_SCOPE_ROUTES: &[(&str, &str, &str)] = &[
     (PROMPT_SKILLS_WRITE_SCOPE, "PUT", "/api/prompt-skills/*"),
     (PROMPT_SKILLS_WRITE_SCOPE, "POST", "/api/prompt-skills/*/retire"),
     (PROMPT_SKILLS_WRITE_SCOPE, "POST", "/api/prompt-skills/*/fitness"),
+    (VOICE_TRANSCRIBE_SCOPE, "POST", "/api/voice/transcribe"),
+    (VOICE_TRANSCRIBE_SCOPE, "POST", "/api/voice/transcribe/detailed"),
 ];
+
+/// The control scopes whose routes a service key may call DIRECTLY, with the
+/// key itself as the bearer. Every other control scope is exercised by an
+/// exchanged add-on token (the key is only accepted on the inference surface
+/// and the exchange doors), so this list is deliberately short and each word
+/// in it is a decision: the routes it opens come from the same
+/// `CONTROL_SCOPE_ROUTES` rows, and a key WITHOUT the word is refused with the
+/// inference surface's scope-refusal body. No "any service key" path exists.
+pub const DIRECT_KEY_SCOPES: &[&str] = &[VOICE_TRANSCRIBE_SCOPE];
+
+/// The scope a raw service key must hold for `method path`, if that route is a
+/// direct-key door. Pure, so the mapping is pinned without a database.
+pub fn direct_key_scope_for(path: &str, method: &axum::http::Method) -> Option<&'static str> {
+    CONTROL_SCOPE_ROUTES
+        .iter()
+        .find(|(s, m, p)| DIRECT_KEY_SCOPES.contains(s) && method.as_str() == *m && path_matches(p, path))
+        .map(|(s, _, _)| *s)
+}
+
+/// What a direct-key door decides about a resolved bearer.
+pub enum DirectKey {
+    /// Not a service key: fall through to the 401 every other bearer gets.
+    NotAKey,
+    /// A service key without the scope: 403, same body as the inference
+    /// surface's `service key lacks '<scope>' scope`.
+    Forbidden(Response),
+    /// A service key holding the scope.
+    Admit(Consumer),
+}
+
+/// Pure decision for a direct-key door (the lookup and quota stay in the
+/// middleware).
+pub fn direct_key_admission(found: Option<Consumer>, required: &str) -> DirectKey {
+    let Some(consumer) = found else { return DirectKey::NotAKey };
+    if !consumer.has_scope(required) {
+        tracing::warn!(consumer = %consumer.name, scope = %required, "service key refused: lacks the scope this route needs");
+        return DirectKey::Forbidden(direct_key_forbidden(required));
+    }
+    DirectKey::Admit(consumer)
+}
+
+fn direct_key_forbidden(scope: &str) -> Response {
+    use axum::response::IntoResponse;
+    (
+        StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({
+            "error": {"message": format!("service key lacks '{scope}' scope"), "type": "forbidden"}
+        })),
+    )
+        .into_response()
+}
 
 /// Control scopes that open READS. The table above is method + path for
 /// WRITES, and a read scope is a different promise, so it has its own table
@@ -2678,8 +2715,10 @@ pub fn is_ops_api(method: &axum::http::Method, path: &str) -> bool {
     }
 }
 
-/// Agent mail writes a User may make: `POST /api/agents/messages` (send) and
-/// `POST /api/agents/messages/{id}/ack`. Exact pairs, not a prefix: a prefix
+/// Agent mail writes a User may make: `POST /api/agents/messages` (send),
+/// `POST /api/agents/messages/{id}/ack`, and `POST /api/agents/name` (name
+/// the caller's own MCP session; the handler renames only the session the
+/// credential IS, so it cannot touch a sibling). Exact pairs, not a prefix: a prefix
 /// would also open `/collaborate`, `/trust`, `/trust/remove`, `PUT /keys/{agent}`,
 /// `/peer/*` and any route added later. The handlers (`routes/agents.rs`)
 /// enforce ownership for a non-privileged caller: `from` must be the caller's
@@ -2689,7 +2728,7 @@ pub fn is_agent_message_write(method: &axum::http::Method, path: &str) -> bool {
     if *method != axum::http::Method::POST {
         return false;
     }
-    if path == "/api/agents/messages" {
+    if path == "/api/agents/messages" || path == "/api/agents/name" {
         return true;
     }
     match path.strip_prefix("/api/agents/messages/").and_then(|r| r.strip_suffix("/ack")) {
@@ -2972,6 +3011,7 @@ pub const USER_READ_PREFIXES: &[&str] = &[
     "/api/agents/messages",
     "/api/agents/threads",
     "/api/agents/presence",
+    "/api/agents/whoami",
     "/api/agents/roles",
     "/api/agents/peer/",
     "/api/heartbeat/tasks/",
@@ -3439,7 +3479,8 @@ pub async fn require_any_auth(
                 request.extensions_mut().insert(Consumer::all(&claims.sub));
             }
             // an exchanged add-on token off the inference
-            // surface — the comparator for `cluster_hmac_non_inference`.
+            // surface — the comparator for the add-on HMAC fallback (refused
+            // as `addon_shared_secret_refused`).
             if let Some(u) = crate::legacy_lanes::addon_token_use(&claims.sub, &path) {
                 crate::legacy_lanes::observe(&state.metrics, &[u], &crate::legacy_lanes::PeerFacts::default()).await;
             }
@@ -3562,6 +3603,18 @@ pub async fn require_any_auth(
                 }
             }
         }
+        // The inference surface (`/v1/*`, `/api/external/*`) is not a node
+        // route and the shared secret never buys it: refused, counted, and
+        // told to present a service key of its own. This was the
+        // `NOO_SELF_CALL_SHARED_SECRET` bridge (closed by default, 0 uses
+        // live); it is deleted, not merely closed. The controller door
+        // refuses the same surface for every caller
+        // (`controller_hmac_refusal::refuse`) and counts it there.
+        if is_inference_surface {
+            let u = crate::legacy_lanes::self_call_refusal_use(&actor, crate::legacy_lanes::HmacDoor::Cluster);
+            crate::legacy_lanes::observe(&state.metrics, std::slice::from_ref(&u), &peer).await;
+            return Err(StatusCode::FORBIDDEN);
+        }
         // Strict: the fleet secret proves "a node", nothing more. There is no
         // other arm: a gateway without a controller secret refused to start
         // (`boot_refusal`), and the bridge that once made every fleet token
@@ -3571,31 +3624,6 @@ pub async fn require_any_auth(
             return Err(StatusCode::FORBIDDEN);
         }
         let kind = ClusterKind::Node;
-        if is_inference_surface {
-            // the shared secret is a BRIDGE here, not a
-            // standing credential. Open, it still buys inference and says so,
-            // naming the actor — "who is still on the shared secret" is the
-            // question that decides when this may close. Closed, the caller
-            // must present its own `noo_service_keys` row.
-            //
-            // BOTH shared-secret doors carry this. They are the same
-            // decision, and guarding one would leave the other open while
-            // reading as done.
-            if !self_call_bridge_open() {
-                tracing::warn!(
-                    actor = %actor, path = %path,
-                    "inference refused: NOO_SELF_CALL_SHARED_SECRET is closed and this caller \
-                     presented a shared secret, not a per-consumer service key"
-                );
-                return Err(StatusCode::FORBIDDEN);
-            }
-            tracing::warn!(
-                actor = %actor, path = %path, peer = %peer.describe(),
-                "inference bought with the SHARED secret — this caller holds no key of its own \
-                 (a transitional bridge; mint one with `noo security service-key issue <consumer>`)"
-            );
-            request.extensions_mut().insert(Consumer::all("cluster"));
-        }
         // count the lane(s) this admission used — including
         // whether a node token came with the node's certificate.
         let presented_node = request
@@ -3604,11 +3632,8 @@ pub async fn require_any_auth(
             .and_then(|p| p.as_ref())
             .map(|p| p.node.clone());
         let uses = crate::legacy_lanes::hmac_lane_uses(&crate::legacy_lanes::HmacAdmission {
-            door: crate::legacy_lanes::HmacDoor::Cluster,
             // The fleet secret only ever grants `Node` (the design retired
-            // the full-access arm), so this door never admits `Internal`.
-            internal: false,
-            inference: is_inference_surface,
+            // the full-access arm), and the inference surface is refused above.
             path: &path,
             actor: &actor,
             presented_node: presented_node.as_deref(),
@@ -3648,6 +3673,31 @@ pub async fn require_any_auth(
             return Ok(next.run(request).await);
         }
         return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    // Direct-key doors: the key itself, as the bearer, on the exact routes a
+    // control scope in `DIRECT_KEY_SCOPES` opens (today the two transcribe
+    // routes). Not a widening of the inference surface: only a key holding the
+    // route's scope gets in, a key without it gets the scope refusal, and a
+    // bearer that is no key falls through to the 401 below.
+    if let Some(required) = direct_key_scope_for(&path, request.method()) {
+        match direct_key_admission(service_keys::resolve(&state.db, &t).await, required) {
+            DirectKey::Forbidden(r) => return Ok(r),
+            DirectKey::Admit(consumer) => {
+                if let Some(limit) = consumer.rpm_limit {
+                    if let Some(redis) = state.redis.as_ref() {
+                        if let Ok(crate::cache::RateResult::Limited { retry_after }) =
+                            redis.check_consumer_quota(&consumer.name, limit).await
+                        {
+                            return Ok(consumer_quota_exceeded(&consumer.name, retry_after));
+                        }
+                    }
+                }
+                request.extensions_mut().insert(consumer);
+                return Ok(next.run(request).await);
+            }
+            DirectKey::NotAKey => {}
+        }
     }
 
     // Service credentials are SCOPED to the inference surface: an inference
@@ -4284,39 +4334,6 @@ mod tests {
         assert!(
             super::mint_agent_jwt_with("a/b", Role::User, "c", None, 60, None, weak, None).is_none()
         );
-    }
-
-    /// the bridge is CLOSED by default — unset, empty, the
-    /// closing values and typos alike. Before, unset meant open, so every
-    /// install let a shared-secret token buy inference without anyone
-    /// having decided that.
-    #[test]
-    fn the_bridge_is_closed_unless_explicitly_opened() {
-        for closed in ["", "  ", "0", "false", "no", "off", "closed", " CLOSED ", "flase", "2"] {
-            assert!(!super::shared_secret_buys_inference(closed), "{closed:?} must leave the bridge closed");
-        }
-        for open in ["1", "true", "on", "open", "yes", " Open "] {
-            assert!(super::shared_secret_buys_inference(open), "{open:?} must open the bridge");
-        }
-    }
-
-    /// the design gives this bridge a 60-day window. A bridge with no life
-    /// is what #204 existed to stop.
-    #[test]
-    fn the_shared_secret_bridge_has_a_life() {
-        let entry = crate::posture::POSTURE_CATALOG
-            .iter()
-            .find(|e| e.key == "NOO_SELF_CALL_SHARED_SECRET")
-            .expect("the shared-secret bridge must be in the posture catalog");
-        match entry.kind {
-            crate::posture::PostureKind::Bridge { closed, window_days } => {
-                assert_eq!(closed, "0", "the catalog's closing value must match the reader");
-                assert!(!super::shared_secret_buys_inference(closed),
-                    "the reader must actually treat the catalog's closing value as closed");
-                assert!(window_days > 0, "a bridge with no window has no life");
-            }
-            _ => panic!("the shared secret must be a Bridge, not a Gate — it is a migration"),
-        }
     }
 
     // ── cluster_token_subject: identity that was always on the wire ────────
@@ -5653,7 +5670,7 @@ mod tests {
     fn a_user_may_send_and_ack_agent_mail_and_nothing_beside_it() {
         use axum::http::Method;
         let user = claims(&["read"], "user");
-        for (m, p) in [(Method::POST, "/api/agents/messages"), (Method::POST, "/api/agents/messages/msg_1/ack")] {
+        for (m, p) in [(Method::POST, "/api/agents/messages"), (Method::POST, "/api/agents/messages/msg_1/ack"), (Method::POST, "/api/agents/name")] {
             assert!(scope_allows(&user, &m, p), "{m} {p}");
             assert!(requester_allows(&RequesterCtx { sub: "u".into(), scopes: vec!["read".into()], role: Role::User, harness: None, act: None }, &m, p));
         }
@@ -5670,6 +5687,9 @@ mod tests {
             (Method::PUT, "/api/agents/messages"),
             (Method::DELETE, "/api/agents/messages"),
             (Method::PUT, "/api/agents/messages/msg_1/ack"),
+            (Method::PUT, "/api/agents/name"),
+            (Method::POST, "/api/agents/name/x"),
+            (Method::POST, "/api/agents/names"),
         ] {
             assert!(!scope_allows(&user, &m, p), "{m} {p} must not be open to a User");
         }
@@ -6267,7 +6287,7 @@ mod old_cli_refusal_tests {
     /// The controller door is the ONLY door a CLI actor is refused at, and
     /// the door admits nothing at all: the CLI and add-on
     /// refusals come first (their remedies are more specific), then every
-    /// other caller is refused. No inference bridge, no lane count of an
+    /// other caller is refused. No inference admission, no lane count of an
     /// admission, no Internal classification is left inside it.
     #[test]
     fn the_controller_door_admits_nothing() {
@@ -6301,7 +6321,7 @@ mod old_cli_refusal_tests {
     /// Second review: the fleet door's out-of-place check (a controller
     /// service leaf, or a keyless compose peer) runs FIRST — after the add-on
     /// refusal, before the certificate/actor check, `node_route_allowed` and
-    /// the inference bridge — and returns its refusal.
+    /// the inference refusal — and returns its refusal.
     #[test]
     fn the_fleet_door_refuses_an_out_of_place_token_before_anything_else() {
         let src = include_str!("auth.rs");
@@ -6363,7 +6383,7 @@ mod old_cli_refusal_tests {
         let out = metrics.render().await;
         assert!(out.contains("controller_shared_secret_refused") && out.contains("cli_shared_secret_refused")
             && out.contains("addon_shared_secret_refused"), "{out}");
-        assert!(!out.contains("cluster_hmac_non_inference") && !out.contains("self_call_shared_secret"), "{out}");
+        assert!(!out.contains("cluster_hmac_non_inference") && !out.contains(r#"lane="self_call_shared_secret""#), "{out}");
     }
 }
 
@@ -6636,5 +6656,168 @@ mod v2_never_counts_as_v1_tests {
         let go = || crate::cluster_token_v2::verify_and_spend(None, SECRET, &t, "POST", "/api/cluster/nodes/host7/heartbeat", b"{\"a\":1}", NOW + 1);
         assert_eq!(go().await.as_deref(), Some("host7"));
         assert_eq!(go().await, None, "the replay is refused without Redis");
+    }
+}
+
+/// A service key calling the transcribe routes with its own key as the bearer
+/// (trellion's audio ingest, `POST /api/voice/transcribe/detailed`).
+///
+/// The middleware itself needs a database to resolve a key, so these drive the
+/// SAME decision functions it calls (`direct_key_scope_for`,
+/// `direct_key_admission`) from a router-level layer in front of a stub STT
+/// upstream, over real HTTP: the transport is real, the STT upstream is the
+/// stub. A structural test pins that `require_any_auth` is wired to them.
+#[cfg(test)]
+mod voice_direct_key_tests {
+    use super::*;
+    use axum::http::Method;
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::Router;
+    use std::sync::{Arc, Mutex};
+
+    fn key(scopes: &[&str]) -> Consumer {
+        Consumer {
+            name: "svc:trellion".into(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            rpm_limit: None,
+            user: None,
+            user_scopes: Vec::new(),
+            user_role: None,
+        }
+    }
+
+    const DETAILED: &str = "/api/voice/transcribe/detailed";
+    const PLAIN: &str = "/api/voice/transcribe";
+
+    #[test]
+    fn only_the_two_transcribe_posts_are_direct_key_doors() {
+        assert_eq!(direct_key_scope_for(DETAILED, &Method::POST), Some("voice:transcribe"));
+        assert_eq!(direct_key_scope_for(PLAIN, &Method::POST), Some("voice:transcribe"));
+        for (m, p) in [
+            (Method::GET, DETAILED),
+            (Method::POST, "/api/voice/synthesize"),
+            (Method::GET, "/api/voice/status"),
+            (Method::POST, "/api/voice/transcribe/other"),
+            (Method::POST, "/api/config/voice"),
+            (Method::POST, "/api/external/embeddings"),
+            (Method::POST, "/api/channels/send"),
+        ] {
+            assert_eq!(direct_key_scope_for(p, &m), None, "{m} {p} must not be a direct-key door");
+        }
+    }
+
+    #[test]
+    fn the_scope_is_in_the_issuable_vocabulary_and_never_a_default() {
+        assert!(is_control_scope(VOICE_TRANSCRIBE_SCOPE));
+        assert_eq!(DIRECT_KEY_SCOPES, &[VOICE_TRANSCRIBE_SCOPE]);
+        // Only the voice rows are direct-key doors: no other control scope leaks in.
+        for (s, m, p) in control_scope_rows() {
+            let door = direct_key_scope_for(&p.replace('*', "x"), &m.parse::<Method>().unwrap());
+            assert_eq!(door.is_some(), *s == VOICE_TRANSCRIBE_SCOPE, "{s} {m} {p}");
+        }
+    }
+
+    #[test]
+    fn the_decision_admits_the_scope_refuses_its_absence_and_ignores_non_keys() {
+        assert!(matches!(direct_key_admission(Some(key(&["chat", "voice:transcribe"])), "voice:transcribe"), DirectKey::Admit(_)));
+        for scopes in [&["chat", "embeddings", "metrics"][..], &[][..], &["voice"][..], &["voice:transcribe:x"][..]] {
+            assert!(
+                matches!(direct_key_admission(Some(key(scopes)), "voice:transcribe"), DirectKey::Forbidden(_)),
+                "{scopes:?} must be refused"
+            );
+        }
+        assert!(matches!(direct_key_admission(None, "voice:transcribe"), DirectKey::NotAKey));
+    }
+
+    /// Persons keep their access: the tier gate is untouched by the new scope.
+    #[test]
+    fn a_person_token_is_unchanged() {
+        let person = Claims {
+            sub: "alice".into(),
+            exp: 4102444800,
+            role: "user".into(),
+            scopes: vec!["read".into()],
+            harness: None,
+            conv: None,
+            act: None,
+            cnf: None,
+        };
+        for p in [DETAILED, PLAIN, "/api/voice/synthesize"] {
+            assert!(scope_allows(&person, &Method::POST, p), "a person still reaches POST {p}");
+        }
+        // and the new scope opens nothing outside the two routes
+        let holder = Claims { scopes: vec!["voice:transcribe".into()], ..person };
+        assert!(!control_scope_allows(&holder.scopes, &Method::POST, "/api/voice/synthesize"));
+        assert!(!control_scope_allows(&holder.scopes, &Method::POST, "/api/config/voice"));
+        assert!(!scope_allows(&holder, &Method::POST, "/api/cluster/nodes"));
+    }
+
+    #[test]
+    fn require_any_auth_routes_the_door_through_the_pure_decision() {
+        let src = include_str!("auth.rs");
+        let body = src.split("pub async fn require_any_auth(").nth(1).unwrap().split("\npub async fn ").next().unwrap();
+        let door = body.find("direct_key_scope_for(&path, request.method())").expect("the direct-key door");
+        let admission = body.find("direct_key_admission(service_keys::resolve(&state.db, &t).await, required)").expect("the decision");
+        let inference = body.find("    if is_inference_surface {\n        // Named per-consumer").expect("the inference block");
+        assert!(door < admission && admission < inference, "the door precedes the inference block");
+        // A non-key bearer must fall through (to the 401), not be admitted.
+        assert!(body[door..inference].contains("DirectKey::NotAKey => {}"));
+    }
+
+    /// Stub STT upstream + the real decision in a layer, over real HTTP.
+    async fn serve(found: Option<Consumer>) -> (String, Arc<Mutex<u32>>) {
+        let reached = Arc::new(Mutex::new(0u32));
+        let hits = reached.clone();
+        let found = Arc::new(found);
+        let upstream = move || {
+            let hits = hits.clone();
+            async move {
+                *hits.lock().unwrap() += 1;
+                axum::Json(serde_json::json!({"text": "hello", "segments": []}))
+            }
+        };
+        let gate = move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let found = found.clone();
+            async move {
+                let Some(required) = direct_key_scope_for(req.uri().path(), req.method()) else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                match direct_key_admission((*found).clone(), required) {
+                    DirectKey::Admit(_) => next.run(req).await,
+                    DirectKey::Forbidden(r) => r,
+                    DirectKey::NotAKey => StatusCode::UNAUTHORIZED.into_response(),
+                }
+            }
+        };
+        let app = Router::new()
+            .route(DETAILED, post(upstream))
+            .layer(axum::middleware::from_fn(gate));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://127.0.0.1:{}{DETAILED}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (url, reached)
+    }
+
+    #[tokio::test]
+    async fn a_key_with_the_scope_reaches_the_stt_upstream_and_one_without_does_not() {
+        let (url, reached) = serve(Some(key(&["chat", "voice:transcribe"]))).await;
+        let r = reqwest::Client::new().post(&url).send().await.unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::OK);
+        assert_eq!(r.json::<serde_json::Value>().await.unwrap()["text"], "hello");
+        assert_eq!(*reached.lock().unwrap(), 1, "the upstream must be reached");
+
+        let (url, reached) = serve(Some(key(&["chat", "embeddings", "metrics"]))).await;
+        let r = reqwest::Client::new().post(&url).send().await.unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::FORBIDDEN);
+        let body = r.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(body["error"]["type"], "forbidden");
+        assert_eq!(body["error"]["message"], "service key lacks 'voice:transcribe' scope");
+        assert_eq!(*reached.lock().unwrap(), 0, "a refused key must never reach the upstream");
+
+        let (url, reached) = serve(None).await;
+        let r = reqwest::Client::new().post(&url).send().await.unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(*reached.lock().unwrap(), 0);
     }
 }

@@ -18,6 +18,11 @@
 //!                                             response). TEI is an
 //!                                             optional/legacy wire format,
 //!                                             not the deployed default.
+//!   - POST /api/external/embeddings/jobs   → a bulk batch claimed by workers
+//!                                             (or run by the gateway when none
+//!                                             pull); 202 {job_id, path, model}
+//!   - GET  /api/external/embeddings/jobs/{id} → that job, and with ?vectors=1 its
+//!                                             vectors (the submitter's own jobs)
 //!   - POST /api/external/rerank            → mesh-routed reranker via
 //!                                             node-agent (hardened
 //!                                             llama.cpp is the current
@@ -43,6 +48,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::coordinator;
+use crate::measured::{put_into, put_keyed_into, Measured};
 use crate::service_keys::{record_external_request, Consumer};
 use crate::state::AppState;
 use crate::usage::UsageActor;
@@ -52,6 +58,8 @@ use super::raw_chat::{self, Outcome, RawChatError};
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/external/embeddings", post(embeddings))
+        .route("/api/external/embeddings/jobs", post(embeddings_job_submit))
+        .route("/api/external/embeddings/jobs/{job_id}", get(embeddings_job_status))
         .route("/api/external/embedding-spaces/{space}/migration", put(embedding_migration_report))
         .route("/api/external/rerank", post(rerank))
         .route("/api/external/classify", post(classify))
@@ -204,6 +212,128 @@ async fn embeddings(
             (StatusCode::OK, Json(resp)).into_response()
         }
         Err(e) => refuse(&state, &consumer.name, EP, Some("embedding"), None, Some(&api_format), started, e),
+    }
+}
+
+/// Submit a bulk embedding batch as a job (i179).
+///
+/// `POST /api/external/embeddings/jobs`, scope `embeddings`, the same auth as
+/// `POST /api/external/embeddings`. Body `{"input": ["text", ...], "space":
+/// "<optional; the default space>", "model": "<optional alias, as on the sync
+/// route>"}`; `space` wins when both are given. Answers `202 {"job_id",
+/// "path": "pull"|"push", "model"}`: `pull` when a node is claiming work for
+/// the model, `push` when the gateway runs the batch itself. Poll
+/// `GET /api/external/embeddings/jobs/{job_id}?vectors=1` (or
+/// `GET /api/jobs/{job_id}?vectors=1`) for the vectors, which are kept for
+/// 15 minutes. At most 64 texts per job, and the encoded result must fit the
+/// 600 KiB cap (413 names it); 429 + `Retry-After` when the model's queue is
+/// full; 503 when no embedder serves the model. The synchronous route is
+/// unchanged and never queues.
+async fn embeddings_job_submit(
+    State(state): State<Arc<AppState>>,
+    Extension(consumer): Extension<Consumer>,
+    Json(body): Json<Value>,
+) -> Response {
+    let started = Instant::now();
+    const EP: &str = "/api/external/embeddings/jobs";
+    if !consumer.has_scope("embeddings") {
+        return forbidden(&state, &consumer, EP, "embeddings", started);
+    }
+    let inputs = match crate::embed_jobs::parse_inputs(body.get("input")) {
+        Ok(v) => v,
+        Err(msg) => {
+            return refuse(&state, &consumer.name, EP, Some("embedding_job"), None, None, started, bad_request(&msg));
+        }
+    };
+    let requested = body
+        .get("space")
+        .and_then(Value::as_str)
+        .or_else(|| body.get("model").and_then(Value::as_str));
+    let owner = crate::embed_jobs::owner_for(consumer.user.as_deref(), &consumer.name);
+    let n = inputs.len();
+    match crate::embed_jobs::submit(&state, &owner, inputs, requested).await {
+        Ok(s) => {
+            audit(
+                &state, &consumer.name, EP, Some("embedding_job"), Some(&s.model),
+                None, Some(json!({"inputs": n, "path": s.path.as_str()})), 202, started, None,
+            );
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({"job_id": s.job_id, "path": s.path.as_str(), "model": s.model})),
+            )
+                .into_response()
+        }
+        Err(e) => refuse(&state, &consumer.name, EP, Some("embedding_job"), None, None, started, submit_error_to_ext(e)),
+    }
+}
+
+/// The refusal for a submit that did not go through.
+fn submit_error_to_ext(e: crate::embed_jobs::SubmitError) -> ExtFail {
+    use crate::embed_jobs::SubmitError;
+    match e {
+        SubmitError::BadRequest(m) => bad_request(&m),
+        SubmitError::Conflict(m) => conflict(m),
+        SubmitError::TooLarge(m) => ExtFail::request_refused(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", m),
+        SubmitError::Busy { retry_after_secs, detail } => {
+            let mut f = ExtFail::request_refused(
+                StatusCode::TOO_MANY_REQUESTS,
+                "queue_full",
+                "the embedding queue for this model is full; retry later",
+            );
+            f.detail = detail;
+            f.retry_after = Some(retry_after_secs);
+            f
+        }
+        SubmitError::Unavailable(d) => {
+            let mut f = upstream(StatusCode::SERVICE_UNAVAILABLE, d);
+            f.retry_after = Some(5);
+            f
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct EmbeddingJobQuery {
+    vectors: Option<String>,
+}
+
+/// One embedding job, as its submitter sees it.
+///
+/// `GET /api/external/embeddings/jobs/{job_id}[?vectors=1]`, scope
+/// `embeddings`. The same job `GET /api/jobs/{job_id}` returns, but reachable
+/// with a service key (the scheduler routes are not on the key surface). A
+/// job another consumer submitted is a 404. With `vectors=1` a completed job
+/// adds `"vectors"`: `[[f32, ...], ...]`, one row per input in order; the
+/// vectors are kept 15 minutes, then the answer is 410 and the batch is
+/// resubmitted.
+async fn embeddings_job_status(
+    State(state): State<Arc<AppState>>,
+    Extension(consumer): Extension<Consumer>,
+    Path(job_id): Path<String>,
+    Query(q): Query<EmbeddingJobQuery>,
+) -> Response {
+    use crate::embed_jobs::StatusError;
+    let started = Instant::now();
+    const EP: &str = "/api/external/embeddings/jobs/{job_id}";
+    if !consumer.has_scope("embeddings") {
+        return forbidden(&state, &consumer, EP, "embeddings", started);
+    }
+    let Some(redis) = state.redis.as_ref() else {
+        return refuse(&state, &consumer.name, EP, Some("embedding_job"), None, None, started, upstream(StatusCode::SERVICE_UNAVAILABLE, "the job store (Redis) is not connected"));
+    };
+    let owner = crate::embed_jobs::owner_for(consumer.user.as_deref(), &consumer.name);
+    let want = crate::embed_jobs::wants_vectors(q.vectors.as_deref());
+    match crate::embed_jobs::status_view(redis, &job_id, &owner, want).await {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(StatusError::Vectors(e)) => e.to_response(&job_id),
+        Err(StatusError::NotFound) => refuse(
+            &state, &consumer.name, EP, Some("embedding_job"), None, None, started,
+            ExtFail::request_refused(StatusCode::NOT_FOUND, "not_found", "no such embedding job"),
+        ),
+        Err(StatusError::Store(d)) => refuse(
+            &state, &consumer.name, EP, Some("embedding_job"), None, None, started,
+            upstream(StatusCode::SERVICE_UNAVAILABLE, d),
+        ),
     }
 }
 
@@ -1044,23 +1174,30 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Response {
         .unwrap_or(false);
     let emb_model = emb.model.clone();
 
-    // `"dimension": 768` was a literal while the model name came from env — a
-    // consumer pointed at a 1024-dim model would allocate wrong-width vectors
-    // and only find out on insert. EMBEDDING_DIM (env → services.embedding_dim)
-    // is the configured truth; embedding_client uses 0 as its "unknown / don't
-    // check" sentinel, which becomes null here rather than a guess.
-    let (emb_dimension, emb_dimension_detail) = if emb.dims > 0 {
-        (json!(emb.dims), Value::Null)
+    // EMBEDDING_DIM (env -> services.embedding_dim) is the configured width;
+    // embedding_client uses 0 as its "unknown / don't check" sentinel, which is
+    // null here rather than a guess.
+    let emb_dimension = if emb.dims > 0 {
+        Measured::of(emb.dims)
     } else {
-        (
-            Value::Null,
-            json!(
-                "unknown — EMBEDDING_DIM (services.embedding_dim) is not \
-                 configured, and the gateway does not probe the endpoint for \
-                 its width here. Previously reported as a hardcoded 768."
-            ),
+        Measured::unmeasured(
+            "unknown — EMBEDDING_DIM (services.embedding_dim) is not configured, \
+             and the gateway does not probe the endpoint for its width here.",
         )
     };
+    let mut embeddings = json!({
+        "openai_compatible": true,
+        "models": ["default", emb_model],
+        // i145: what a consumer may send as `model` — a space name (or its
+        // model's name). Vectors from different spaces never mix.
+        "spaces": crate::embedding_spaces::all()
+    });
+    put_into(&mut embeddings, "available", Measured::noted(Some(emb_ok), if emb_ok {
+        format!("{} responded to a health probe", emb.health_url())
+    } else {
+        format!("{} did not respond OK to a health probe", emb.health_url())
+    }));
+    put_keyed_into(&mut embeddings, "dimension", "dimension_detail", emb_dimension);
 
     // rerank is available iff some alive mesh node advertises the capability.
     // (The co-located NOO_RERANK_URL path is gone — see `rerank_target`.)
@@ -1073,21 +1210,7 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Response {
             "openai_compatible": true,
             "models": chat_models
         },
-        "embeddings": {
-            "available": emb_ok,
-            "available_detail": if emb_ok {
-                json!(format!("{} responded to a health probe", emb.health_url()))
-            } else {
-                json!(format!("{} did not respond OK to a health probe", emb.health_url()))
-            },
-            "openai_compatible": true,
-            "models": ["default", emb_model],
-            "dimension": emb_dimension,
-            "dimension_detail": emb_dimension_detail,
-            // i145: what a consumer may send as `model` — a space name (or its
-            // model's name). Vectors from different spaces never mix.
-            "spaces": crate::embedding_spaces::all()
-        },
+        "embeddings": embeddings,
         "rerank": {
             "available": rerank_ok,
             "models": rerank_models

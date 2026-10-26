@@ -7,7 +7,7 @@ Replaces direct imports of:
     from noomesh.gateway.settings_store import get_settings_store
 
 Consumers:
-    - channels/router.py × 3 sites
+    - (former channels/router.py sites; module deleted, history: git log before 2026-08-08)
 
 Why: settings storage location (currently ``/data/noo-settings.json``)
 is MESH infrastructure. HARNESS reads/writes user prefs without needing

@@ -2051,6 +2051,10 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
     // you would send work to.
     body.push_str(&cluster_gauges(&state).await);
 
+    // Bulk embedding queue depth per model (i179), straight from each
+    // model's consumer. A consumer that cannot be read is omitted.
+    body.push_str(&crate::embed_jobs::queue_gauges(&state).await);
+
     (StatusCode::OK, [("content-type", "text/plain; version=0.0.4")], body)
 }
 

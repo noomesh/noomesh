@@ -106,7 +106,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if auth.IsOwnHarnessLeafWithoutBearer(s.cfg, r) {
 		body[auth.OwnHarnessLeafOnlyField] = true
 	}
-	if !auth.IsBusController(r) && !auth.HasValidToken(s.cfg, r) && !auth.IsControllerLeafWithoutBearer(s.cfg, r) {
+	if !auth.IsBusController(r) && !auth.IsTunnelController(r) && !auth.HasValidToken(s.cfg, r) && !auth.IsControllerLeafWithoutBearer(s.cfg, r) {
 		writeJSON(w, http.StatusOK, body)
 		return
 	}

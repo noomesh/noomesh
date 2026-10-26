@@ -27,6 +27,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Sha256, Digest};
 
+use crate::measured::{put_into, put_keyed_into, Measured};
+use crate::redis_or_unavailable::redis_or_unavailable;
 use crate::state::AppState;
 use super::{AppError, AppJson, AppResult};
 use crate::node_link::NodeLink;
@@ -496,7 +498,7 @@ fn proactive_history_detail(e: &sqlx::Error) -> String {
          firings in process memory only, so this gateway cannot see them."
             .to_string()
     } else {
-        format!("unknown — cannot read noo_proactive_history: {e}")
+        crate::measured::not_measured_in("cannot read noo_proactive_history", e)
     }
 }
 
@@ -525,17 +527,8 @@ async fn proactive_status(
         })
         .unwrap_or(0);
 
-    // Check Redis for the Python agent's heartbeat.
-    //
-    // The old code collapsed "no Redis configured", "Redis unreachable" and
-    // "no heartbeat key" all into `running: false` — asserting the agent is
-    // stopped on missing evidence. The sibling autonomy status endpoint
-    // (intelligence.rs) defaults the SAME class of fact to `true` on missing
-    // evidence; the two lie in opposite directions. Both are now nullable
-    // with an explicit reason, so "we don't know" is representable.
-    //
-    // Note `Cache::get_string` returns Option<String> and cannot distinguish
-    // an absent key from a Redis error, so the detail names both.
+    // `Cache::get_string` returns Option<String> and cannot distinguish an
+    // absent key from a Redis error, so the detail names both.
     let (running, running_detail): (Option<bool>, String) = match state.redis.as_ref() {
         None => (
             None,
@@ -565,27 +558,19 @@ async fn proactive_status(
         },
     };
 
-    // history_entries was a literal 0 while the sibling /api/proactive/history
-    // route actually queries noo_proactive_history. Count it for real; the
-    // count is null (never 0) when the store cannot be read — see
-    // proactive_history_detail for why a missing table is NOT a truthful zero.
-    let (history_entries, history_detail) =
-        match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM noo_proactive_history")
-            .fetch_one(&state.db)
-            .await
-        {
-            Ok(n) => (Some(n), None),
-            Err(e) => (None, Some(proactive_history_detail(&e))),
-        };
+    // null (never 0) when the store cannot be read.
+    let history = match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM noo_proactive_history")
+        .fetch_one(&state.db)
+        .await
+    {
+        Ok(n) => Measured::of(n),
+        Err(e) => Measured::unmeasured(proactive_history_detail(&e)),
+    };
 
-    Ok(Json(json!({
-        "running": running,
-        "running_detail": running_detail,
-        "rules_total": rules_total,
-        "rules_enabled": rules_enabled,
-        "history_entries": history_entries,
-        "history_detail": history_detail,
-    })))
+    let mut body = json!({ "rules_total": rules_total, "rules_enabled": rules_enabled });
+    put_into(&mut body, "running", Measured::noted(running, running_detail));
+    put_keyed_into(&mut body, "history_entries", "history_detail", history);
+    Ok(Json(body))
 }
 
 /// GET /api/proactive/rules — list proactive rules from YAML config.
@@ -801,9 +786,10 @@ async fn proactive_create_rule(
         Ok(())
     })
     .await
-    .map_err(|(_, body)| {
-        AppError::Internal(
-            body.0.get("error").and_then(|e| e.as_str()).unwrap_or("write failed").to_string()
+    .map_err(|(status, body)| {
+        super::from_status(
+            status,
+            body.0.get("error").and_then(|e| e.as_str()).unwrap_or("write failed").to_string(),
         )
     })?;
 
@@ -844,11 +830,7 @@ async fn proactive_delete_rule(
     .await
     .map_err(|(status, body)| {
         let msg = body.0.get("error").and_then(|e| e.as_str()).unwrap_or("write failed").to_string();
-        if status == axum::http::StatusCode::NOT_FOUND {
-            AppError::NotFound(msg)
-        } else {
-            AppError::Internal(msg)
-        }
+        super::from_status(status, msg)
     })?;
 
     Ok(Json(json!({ "status": "deleted", "rule_id": rule_id })))
@@ -960,10 +942,9 @@ async fn tools_list(
         },
         "available_on_nodes_detail": "null — per-node tool placement is not \
             tracked by the gateway; this list is the loaded schema registry, \
-            not a placement map. Previously emitted as [], which read as \
-            'no node can run this tool'.",
+            not a placement map.",
         "is_base_tool_detail": "null unless the registry entry carries the \
-            flag itself; previously hardcoded true for every tool.",
+            flag itself.",
     }))
 }
 
@@ -1214,10 +1195,8 @@ async fn browser_status(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // Read active session count from Redis. Key name and value kept — but see
-    // the module comment: this counter's only writer is the Rust
-    // /sessions/start route, so it is a partial count, not "all live
-    // browsers". Callers were free to read it as the latter.
+    // Active session count from Redis. Its only writer is the Rust
+    // /sessions/start route, so it is a partial count, not "all live browsers".
     let (active_sessions, sessions_source) = if let Some(redis) = state.redis.as_ref() {
         match redis.get_string("noo:browser:session_count").await {
             Some(s) => match s.parse::<u32>() {
@@ -1225,9 +1204,8 @@ async fn browser_status(
                 Err(_) => (None, "unparseable"),
             },
             // Absent key and Redis error are indistinguishable through
-            // get_string; absent is the overwhelmingly common case for a
-            // counter only ever INCR'd by this gateway, so 0 is reported —
-            // but the detail below states the scope either way.
+            // get_string; absent is the common case for a counter only ever
+            // INCR'd by this gateway. The detail below states the scope.
             None => (Some(0), "redis-absent"),
         }
     } else {
@@ -1246,13 +1224,10 @@ async fn browser_status(
 
     // Check if Playwright binary exists (common install paths).
     //
-    // This probes the GATEWAY CONTAINER's filesystem. Browsers actually run in
-    // per-session containers on node-agents (see browser_start below, which
-    // POSTs noo-browser:latest to a node), so a fully working deployment
-    // reports playwright_installed=false and status="configured_not_installed"
-    // — the field asserted a fleet-wide fact from a local-only measurement.
-    // The measurement is kept (it is real for THIS process) but is now labelled
-    // for what it is; no remote probe is invented.
+    // This probes the GATEWAY CONTAINER's filesystem only. Browsers run in
+    // per-session containers on node-agents (see browser_start below), so a
+    // working deployment reports playwright_installed=false; the note on the
+    // field says so.
     let playwright_in_gateway_container = [
         "/usr/bin/playwright",
         "/usr/local/bin/playwright",
@@ -1268,22 +1243,18 @@ async fn browser_status(
         "not_configured"
     };
 
-    Ok(Json(json!({
-        "status": status,
-        "status_detail": "scoped to this gateway container only; \
-            \"configured_not_installed\" is expected and harmless in the normal \
-            deployment, where browsers run in noo-browser containers on \
-            node-agents rather than in the gateway.",
-        "browser_enabled": browser_enabled,
-        "playwright_installed": playwright_in_gateway_container,
-        "playwright_detail": "true/false for the GATEWAY CONTAINER's own \
-            filesystem (/usr/bin, /usr/local/bin, /app/node_modules/.bin). It \
-            says nothing about the node-agent containers that actually run \
-            browsers; remote availability is not probed.",
-        "active_sessions": active_sessions,
-        "active_sessions_detail": active_sessions_detail,
-        "engine": "rust",
-    })))
+    let mut body = json!({ "browser_enabled": browser_enabled, "engine": "rust" });
+    put_into(&mut body, "status", Measured::noted(Some(status),
+        "scoped to this gateway container only; \"configured_not_installed\" is \
+         expected and harmless in the normal deployment, where browsers run in \
+         noo-browser containers on node-agents rather than in the gateway."));
+    put_into(&mut body, "playwright_installed", Measured::noted(Some(playwright_in_gateway_container),
+        "true/false for the GATEWAY CONTAINER's own filesystem (/usr/bin, \
+         /usr/local/bin, /app/node_modules/.bin). It says nothing about the \
+         node-agent containers that actually run browsers; remote availability \
+         is not probed."));
+    put_into(&mut body, "active_sessions", Measured::noted(active_sessions, active_sessions_detail));
+    Ok(Json(body))
 }
 
 /// POST /api/tools/browser/sessions/start — start a new browser container.
@@ -1299,6 +1270,11 @@ async fn browser_start(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> AppResult {
+    // The session lives in Redis (stop/action/list find it there): a
+    // container started without it would be orphaned, so refuse BEFORE
+    // starting one.
+    let redis = redis_or_unavailable(&state)?;
+
     // Generate session ID (matches Python: uuid4().hex[:8])
     let session_id = uuid::Uuid::new_v4().to_string().replace('-', "")[..8].to_string();
     let container_name = format!("noo-browser-{session_id}");
@@ -1318,7 +1294,7 @@ async fn browser_start(
     // "unhealthy".
     let browser_key = crate::config::secret_env::secret_or_empty(BROWSER_KEY);
     if browser_key.is_empty() {
-        return Err(AppError::Internal(
+        return Err(AppError::Unavailable(
             "NOO_BROWSER_KEY is not set — the browser service refuses to run \
              unauthenticated, so there is nothing to start"
                 .into(),
@@ -1374,12 +1350,12 @@ async fn browser_start(
         .timeout(std::time::Duration::from_secs(60));
 
     let resp = req.send().await
-        .map_err(|e| AppError::Internal(format!("Failed to start browser container: {e}")))?;
+        .map_err(|e| AppError::Upstream(format!("Failed to start browser container: {e}")))?;
 
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
         let body_text = resp.text().await.unwrap_or_default();
-        return Err(AppError::Internal(
+        return Err(AppError::Upstream(
             format!("Node agent returned {status}: {body_text}")
         ));
     }
@@ -1427,7 +1403,7 @@ async fn browser_start(
     });
 
     // Store session in Redis for cross-process visibility
-    if let Some(redis) = state.redis.as_ref() {
+    {
         // Store individual session
         redis.set_string(
             &format!("noo:browser:session:{session_id}"),
@@ -1463,13 +1439,12 @@ async fn browser_stop(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> AppResult {
-    // Look up session from Redis
-    let session_data: Option<Value> = if let Some(redis) = state.redis.as_ref() {
-        redis.get_string(&format!("noo:browser:session:{session_id}")).await
-            .and_then(|s| serde_json::from_str(&s).ok())
-    } else {
-        None
-    };
+    // Look up session from Redis. Without it the container's node and name
+    // are unknown (a guess would stop the wrong thing), so refuse.
+    let redis = redis_or_unavailable(&state)?;
+    let session_data: Option<Value> = redis
+        .get_string(&format!("noo:browser:session:{session_id}")).await
+        .and_then(|s| serde_json::from_str(&s).ok());
 
     let container_name = session_data.as_ref()
         .and_then(|s| s.get("container_name"))
@@ -1502,7 +1477,7 @@ async fn browser_stop(
     }
 
     // Remove session from Redis
-    if let Some(redis) = state.redis.as_ref() {
+    {
         redis.del_key(&format!("noo:browser:session:{session_id}")).await;
 
         // Update session list (remove this session)
@@ -1528,20 +1503,15 @@ async fn browser_stop(
 /// GET /api/tools/browser/sessions — list active browser sessions.
 ///
 /// Reads session data from Redis (noo:browser:sessions key).
-/// Returns an empty list if Redis is unavailable or no sessions exist.
+/// 503 `redis_reconnecting` when Redis is unavailable: an empty list there
+/// would claim no sessions exist. An empty list means there are none.
 async fn browser_sessions(
     State(state): State<Arc<AppState>>,
 ) -> AppResult {
-    // Try to read sessions from Redis
-    let sessions: Vec<Value> = if let Some(redis) = state.redis.as_ref() {
-        match redis.get_string("noo:browser:sessions").await {
-            Some(data) => {
-                serde_json::from_str::<Vec<Value>>(&data).unwrap_or_default()
-            }
-            None => Vec::new(),
-        }
-    } else {
-        Vec::new()
+    let redis = redis_or_unavailable(&state)?;
+    let sessions: Vec<Value> = match redis.get_string("noo:browser:sessions").await {
+        Some(data) => serde_json::from_str::<Vec<Value>>(&data).unwrap_or_default(),
+        None => Vec::new(),
     };
 
     Ok(Json(json!({
@@ -1634,13 +1604,11 @@ async fn browser_action(
 
     // Look up the session's container URL.
     let session_key = format!("noo:browser:session:{session_id}");
-    let session_data: Option<Value> = match state.redis.as_ref() {
-        Some(redis) => redis
-            .get_string(&session_key)
-            .await
-            .and_then(|s| serde_json::from_str(&s).ok()),
-        None => None,
-    };
+    let redis = redis_or_unavailable(&state)?;
+    let session_data: Option<Value> = redis
+        .get_string(&session_key)
+        .await
+        .and_then(|s| serde_json::from_str(&s).ok());
     let Some(mut session_data) = session_data else {
         return Ok(Json(json!({"error": format!("No browser session: {session_id}")})));
     };

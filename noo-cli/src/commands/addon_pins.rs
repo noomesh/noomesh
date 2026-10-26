@@ -393,6 +393,19 @@ pub(crate) fn launch_lines(root: &Path, tag: &str, names: &[String], anchor: &dy
     out
 }
 
+/// Why the launcher would leave `addon` out of a start on `tag` (the
+/// `refuse` line `launch-pins` prints for it), or `None` when it would launch
+/// it. The same offline check the launcher runs; `addons list | show` report
+/// it, so a refused add-on reads as NOT running there too.
+pub(crate) fn launch_refusal(root: &Path, tag: &str, addon: &str) -> Option<String> {
+    refusal_in(&launch_lines(root, tag, &[addon.to_string()], &|a| resolve::installed_anchor(a)))
+}
+
+/// The reason in the first `refuse <addon> <why>` line, if any. Pure.
+pub(crate) fn refusal_in(lines: &[String]) -> Option<String> {
+    lines.iter().find_map(|l| l.strip_prefix("refuse ").and_then(|r| r.split_once(' ')).map(|(_, why)| why.to_string()))
+}
+
 /// The `NOO_ADDON_IMAGE_*` variables composed overlay texts read in an
 /// `image:` line — `scripts/lib-dist.sh` `addon_image_vars`, in Rust.
 pub(crate) fn overlay_image_vars(texts: &[String]) -> std::collections::BTreeSet<String> {
@@ -577,6 +590,24 @@ mod tests {
         let lines = launch_lines(&d, "v0.6.0", &names, &|_| Ok(anchor()));
         assert!(lines[0].starts_with("verified "), "{lines:?}");
         assert!(!lines.iter().any(|l| l.starts_with("decl ")), "{lines:?}");
+    }
+
+    #[test]
+    fn a_refusal_is_read_from_the_launch_lines_and_nothing_else_reads_as_one() {
+        let lines = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            refusal_in(&lines(&["refuse rhold rhold is pinned for stack v0.6.10, and this stack runs v0.6.11"])).as_deref(),
+            Some("rhold is pinned for stack v0.6.10, and this stack runs v0.6.11")
+        );
+        assert_eq!(refusal_in(&lines(&["verified rhold 0.1.0 v0.6.11", "pin rhold NOO_ADDON_IMAGE_RHOLD r@sha256:x"])), None);
+        assert_eq!(refusal_in(&[]), None);
+        // A lock that verified but names an image with no variable is refused after its verdict line.
+        assert!(refusal_in(&lines(&["verified a 1 v1", "refuse a its lock names image \"x\", which has no variable name"])).is_some());
+        // The stale-pin case, end to end through launch_lines.
+        let (root, _) = pinned_root("refusal-in");
+        let got = refusal_in(&launch_lines(&root, "v0.6.1", &["trellion_intel".to_string()], &|_| Ok(anchor())));
+        assert!(got.is_some_and(|w| w.contains("pinned for stack v0.6.0") && w.contains("v0.6.1")));
+        assert_eq!(refusal_in(&launch_lines(&root, "v0.6.0", &["trellion_intel".to_string()], &|_| Ok(anchor()))), None);
     }
 
     #[test]

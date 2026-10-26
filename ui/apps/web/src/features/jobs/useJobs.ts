@@ -2,16 +2,33 @@
 // Copyright 2026 PersonifAI LLC
 
 import { useQuery, useMutation, useQueryClient, useMetisClient } from '@metis/core';
+import { num } from '@/lib/num';
 import type { Job } from './types';
 
 const JOBS_KEY = ['scheduler', 'jobs'];
 const STATUS_KEY = ['scheduler', 'status'];
 
+/**
+ * The sentence for a refused request. The gateway answers a Redis outage with
+ * 503 {error: 'redis_reconnecting', detail: <sentence>, retry_after_secs}:
+ * show the detail (and the retry), never the machine code.
+ */
+export function refusalMessage(error: unknown, fallback: string): string {
+  const e = error as { detail?: unknown; retry_after_secs?: unknown } | null | undefined;
+  if (e && typeof e.detail === 'string' && e.detail) {
+    const retry = typeof e.retry_after_secs === 'number' ? ` Retry in ${e.retry_after_secs}s.` : '';
+    return `${e.detail}${retry}`;
+  }
+  return fallback;
+}
+
 export interface SchedulerStatus {
-  paused: boolean;
-  queued: number;
-  running: number;
-  clients: number;
+  // null = the gateway could not read the flag (Redis not connected).
+  paused: boolean | null;
+  // null = the gateway did not send it (renders a dash, never 0).
+  queued: number | null;
+  running: number | null;
+  clients: number | null;
   drainedNodes: string[];
 }
 
@@ -28,10 +45,10 @@ export function useSchedulerStatus() {
       ]);
       if (s.error || !s.data) throw new Error('Scheduler API unavailable');
       return {
-        paused: s.data.paused ?? false,
-        queued: s.data.queue_depth ?? 0,
-        running: s.data.active_jobs ?? 0,
-        clients: c.data?.connected_clients ?? 0,
+        paused: s.data.paused ?? null,
+        queued: num(s.data.queue_depth),
+        running: num(s.data.active_jobs),
+        clients: num(c.data?.connected_clients),
         drainedNodes: s.data.drained_nodes ?? [],
       };
     },
@@ -46,7 +63,11 @@ export function useJobs() {
     refetchInterval: 10_000,
     queryFn: async () => {
       const { data, error } = await client.GET('/api/jobs');
-      if (error) throw new Error('Jobs API unavailable');
+      if (error) throw new Error(refusalMessage(error, 'Jobs API unavailable'));
+      // The gateway answers 200 {jobs: [], count: null, error} when it cannot
+      // read the queue; that is an unknown queue, not an empty one.
+      const unreadable = (data as { error?: string } | undefined)?.error;
+      if (unreadable) throw new Error(unreadable);
       return (data?.jobs ?? []).map(
         (j): Job => ({
           id: j.job_id ?? '',
@@ -70,7 +91,7 @@ export function useCancelJob() {
       const { error } = await client.DELETE('/api/jobs/{job_id}', {
         params: { path: { job_id: jobId } },
       });
-      if (error) throw new Error('Cancel failed');
+      if (error) throw new Error(refusalMessage(error, 'Cancel failed'));
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: JOBS_KEY }),
   });
@@ -95,7 +116,7 @@ export function useSubmitJob() {
           ...(vars.forceNode ? { force_node: vars.forceNode } : {}),
         },
       });
-      if (error) throw new Error('Submit failed');
+      if (error) throw new Error(refusalMessage(error, 'Submit failed'));
       const d = data as { job_id?: string; error?: string };
       if (d?.error) throw new Error(d.error);
       return d?.job_id ?? '';
@@ -114,7 +135,7 @@ export function useDrainNode() {
       const { error } = vars.drain
         ? await client.POST('/api/scheduler/drain/{node_id}', opts)
         : await client.POST('/api/scheduler/undrain/{node_id}', opts);
-      if (error) throw new Error(vars.drain ? 'Drain failed' : 'Undrain failed');
+      if (error) throw new Error(refusalMessage(error, vars.drain ? 'Drain failed' : 'Undrain failed'));
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: STATUS_KEY }),
   });
@@ -129,7 +150,7 @@ export function useSchedulerPause() {
       const { error } = currentlyPaused
         ? await client.POST('/api/scheduler/resume', {})
         : await client.POST('/api/scheduler/pause', {});
-      if (error) throw new Error('Scheduler action failed');
+      if (error) throw new Error(refusalMessage(error, 'Scheduler action failed'));
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: STATUS_KEY }),
   });

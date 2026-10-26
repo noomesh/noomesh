@@ -320,7 +320,7 @@ mod node_completion_tests {
     fn the_verbs_the_old_hand_kept_list_missed_are_all_covered() {
         for v in [
             "desired", "show", "forget", "unplace", "set-config",
-            "add-companion", "add-monitor", "upgrade-hostd", "upgrade-applier",
+            "upgrade-hostd", "upgrade-applier",
             "restart-backends", "import-model", "clean", "logs",
         ] {
             assert!(verb_takes_a_node(v), "`cluster {v} <Tab>` offers no nodes");

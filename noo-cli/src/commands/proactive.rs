@@ -4,12 +4,14 @@
 //! `noo proactive …` — proactive agent loop (Rust gateway routes in
 //! `routes/ui.rs`).
 //!
-//! Ported: status, rules, history.
+//! Ported: status, rules. `history` is a retired stub (i195 D2): nothing
+//! records proactive firings; `status` carries the "history: not tracked" row.
 //! Left in Python: nothing else exists in the Python group (rule create /
 //! delete are dashboard/API surfaces, not CLI commands).
 
 use super::truncate;
 use crate::http::get_json;
+use crate::output::{fail, ExitCode};
 use crate::ui::{self, Col, Glyph};
 use crate::{Globals, Unhandled};
 
@@ -138,27 +140,19 @@ pub fn proactive_rules(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
-/// `noo proactive history [--limit N]` — GET /api/proactive/history?limit=.
-pub fn proactive_history(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut limit = 20u64;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--limit" | "-n" => limit = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?,
-            _ => return Err(Unhandled),
-        }
-    }
-    let _ = limit;
-    // Nothing writes a firing history: the table the route reads has no
-    // migration and no writer, and the proactive agent keeps firings in
-    // process memory only. Say so, without a request that can only fail.
-    let msg = "there is no proactive history store: rule firings are not recorded anywhere the gateway can read";
-    if g.json {
-        println!("{}", serde_json::json!({"entries": null, "error": msg}));
-    } else {
-        ui::failed(msg, Some("noo proactive status"));
-    }
-    Ok(crate::output::ExitCode::Generic as i32)
+/// `noo proactive history` — RETIRED (i195 D2). Nothing records proactive
+/// firings (the route's table has no migration and no writer; the agent keeps
+/// firings in process memory), so the verb could only report that. `status`
+/// already carries the "history: not tracked" row. (Kept in dispatch for one
+/// release so an old runbook gets this answer instead of "unknown command".)
+pub fn proactive_history(g: &Globals, _args: &[String]) -> Result<i32, Unhandled> {
+    fail(
+        g.json,
+        ExitCode::Generic,
+        "retired_command",
+        "history is retired: nothing records proactive firings, so there is no history to show",
+        Some("agent state and rule counts:  noo proactive status"),
+    );
 }
 
 #[cfg(test)]

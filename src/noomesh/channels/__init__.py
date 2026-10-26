@@ -12,14 +12,12 @@ post the task #23 sweep:
   consumers (proactive loop, coding notify, approval ping, autonomy
   notices) send: one authenticated POST to the gateway.
 - ``base.ChannelDispatcher`` — the protocol those consumers type against.
-- ``router.set_channel_manager`` / ``_channel_manager`` — the global the
+- ``manager_ref.set_channel_manager`` / ``get_channel_manager`` — the global the
   consumers resolve the client through.
 
 The Python adapters (google_chat, telegram), ChannelManager, the
 registry and the approvals bridge are gone from the tree. Their final
-versions live in git history under ``legacy/python-channels-reference/``
-at the parent of commit b97a4e02 (the commit that emptied ``legacy/``;
-see ``legacy/README.md`` for the recipe).
+versions live in git history, at the parent of commit b97a4e02 (the 2026-08-08 sweep).
 """
 
 from .base import (

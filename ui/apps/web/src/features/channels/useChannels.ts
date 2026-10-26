@@ -2,12 +2,17 @@
 // Copyright 2026 PersonifAI LLC
 
 import { useQuery, useMutation, useQueryClient, useMetisClient } from '@metis/core';
+import { num } from '@/lib/num';
 
 export interface Adapter {
   name: string;
-  received: number;
-  sent: number;
-  errors: number;
+  // null = the gateway did not send it (it sends `stats: null` + `stats_detail`
+  // when nothing counts channel traffic): a dash, never 0 (i195 E1).
+  received: number | null;
+  sent: number | null;
+  errors: number | null;
+  /** The gateway's own words for why the counters are absent, when it gave any. */
+  statsDetail: string | null;
 }
 export interface Recipient {
   id: string;
@@ -18,7 +23,7 @@ export interface Recipient {
   isDefault: boolean;
 }
 export interface ChannelsData {
-  summary: { adapters: number; activeConvos: number; queueMode: string };
+  summary: { adapters: number; activeConvos: number | null; queueMode: string };
   adapters: Adapter[];
   recipients: Recipient[];
 }
@@ -41,14 +46,19 @@ export function useChannels() {
       return {
         summary: {
           adapters: s.data?.channels_registered ?? Object.keys(chMap).length,
-          activeConvos: s.data?.active_conversations ?? 0,
+          activeConvos: num(s.data?.active_conversations),
           queueMode: s.data?.queue_mode ?? '—',
         },
         adapters: Object.entries(chMap).map(([name, v]) => ({
           name,
-          received: v?.stats?.received ?? 0,
-          sent: v?.stats?.sent ?? 0,
-          errors: v?.stats?.errors ?? 0,
+          received: num(v?.stats?.received),
+          sent: num(v?.stats?.sent),
+          errors: num(v?.stats?.errors),
+          // Not in the generated schema yet; the gateway sends it beside `stats: null`.
+          statsDetail: (() => {
+            const d = (v as { stats_detail?: unknown } | undefined)?.stats_detail;
+            return typeof d === 'string' && d ? d : null;
+          })(),
         })),
         recipients: (r.data?.recipients ?? []).map((x) => ({
           id: x.id ?? '',

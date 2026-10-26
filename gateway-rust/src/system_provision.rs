@@ -23,6 +23,13 @@
 //! surface — compromise the gateway, mint any role. A manifest is reviewable
 //! in git and has no runtime path.
 //!
+//! ON-DEMAND, WITHOUT AN API. `noo addons enable <name> --provision-only` needs
+//! one system's schema and roles NOW, without composing the add-on or
+//! restarting the gateway. It runs [`provision_system`] (the very function the
+//! boot reconcile calls) through `noo-gateway provision-system`, reachable only
+//! by `docker exec` into the container: no listener, no route, and the request
+//! is validated by `addon_decls` like a bundle. See `system_provision_cli`.
+//!
 //! WHY NOT `initdb`. Postgres init scripts run once, at cluster creation. They
 //! cannot serve the actual flow, which is *evolve gets activated later*.
 //!
@@ -174,11 +181,36 @@ fn password_from(
     Ok(delivered.get(var).filter(|p| !p.trim().is_empty()).cloned())
 }
 
+/// The add-ons the launcher refused this start: `name,name`, empty or unset
+/// when it refused none (lib-dist.sh require_addon_pins).
+pub const REFUSED_ENV: &str = "NOO_ADDONS_REFUSED";
+
+/// Is `name` one of the add-ons named in a [`REFUSED_ENV`] value? Pure. An
+/// entry that is not an add-on name never matches anything.
+pub(crate) fn refused_by_launcher(name: &str, raw: Option<&str>) -> bool {
+    raw.unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .any(|n| crate::addon_registry::name_ok(n) && n == name)
+}
+
 /// True when the operator has turned this system on.
 ///
 /// `None` means unconditional — trellion, which is mandatory since the
 /// container split and has no flag to check.
 fn intent_declared(name: &str, spec: &SystemConfig, delivered: &BTreeMap<String, String>) -> bool {
+    // An add-on the launcher REFUSED this start (its signed pin does not
+    // verify for this stack) was left out of the compose set: its system is
+    // not provisioned either, whatever the map or a flag says. The launcher
+    // names it in NOO_ADDONS_REFUSED (lib-dist.sh require_addon_pins).
+    if refused_by_launcher(name, std::env::var(REFUSED_ENV).ok().as_deref()) {
+        tracing::warn!(
+            system = name,
+            "add-on {name} was refused by the launcher this start (its pin does not verify for this \
+             stack), so its system is not provisioned. `noo addons upgrade {name}` re-pins it"
+        );
+        return false;
+    }
     // A system whose name matches a declared add-on follows the add-on. This
     // used to be `enabled_when: NOO_PRO_ENABLED` — a THIRD place the same
     // fact was written down (after the flag itself and the launcher), and the
@@ -498,6 +530,77 @@ async fn ensure_extensions(db: &PgPool, system: &str, spec: &SystemConfig) -> Re
     Ok(())
 }
 
+/// What provisioning one system did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Provisioned {
+    /// Login roles THIS call created (an existing role is never touched).
+    pub roles_created: Vec<String>,
+    /// Whether this call created the schema (an existing one is re-owned).
+    pub schema_created: bool,
+}
+
+/// How provisioning one system ended. A missing credential is an outcome, not
+/// an error: whether it stops the caller is the caller's decision (the boot
+/// reconcile stops only for a core system; the on-demand path always does).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    Provisioned(Provisioned),
+    MissingCredential { var: String, message: String },
+}
+
+/// Provision ONE system: validate its identifiers, check every credential a
+/// role this pass must create needs, then roles (DDL first), schema and
+/// extensions. The single implementation both the boot reconcile ([`reconcile`])
+/// and the on-demand path (`noo addons enable --provision-only`, via
+/// `noo-gateway provision-system`) run, so the two can never diverge. It does
+/// NOT consult the system's enable flag: intent is the caller's to decide.
+pub(crate) async fn provision_system(
+    db: &PgPool,
+    name: &str,
+    spec: &SystemConfig,
+    delivered: &BTreeMap<String, String>,
+) -> Result<Outcome, String> {
+    for ident in [&spec.role, &spec.ddl_role, &spec.schema] {
+        if !valid_identifier(ident) {
+            return Err(format!(
+                "system {name:?} declares {ident:?}, which is not a bare lowercase \
+                 SQL identifier. These names are interpolated into DDL."
+            ));
+        }
+    }
+
+    // Every credential this pass needs, checked BEFORE either role is
+    // created: a system whose runtime password is missing must not leave
+    // a half-made migration role behind (and a skipped system creates
+    // nothing at all). Only a role that does not exist yet needs one.
+    let roles = [(&spec.ddl_role, &spec.ddl_password_env), (&spec.role, &spec.password_env)];
+    let mut to_create: Vec<(&str, &str)> = Vec::new();
+    for (role, var) in roles {
+        if !role_exists(db, role).await.map_err(|e| e.to_string())? {
+            to_create.push((role.as_str(), var.as_str()));
+        }
+    }
+    match first_missing(name, &to_create, |k| std::env::var(k).ok(), delivered)? {
+        None => {}
+        Some(RoleError::MissingCredential { var, message }) => {
+            return Ok(Outcome::MissingCredential { var, message })
+        }
+        Some(RoleError::Other(e)) => return Err(e),
+    }
+
+    // The DDL role first: it owns the schema, so it has to exist before
+    // the schema can be created AUTHORIZATION it.
+    let mut roles_created = Vec::new();
+    for (role, var) in roles {
+        if ensure_role(db, name, role, var, delivered).await.map_err(RoleError::into_message)? {
+            roles_created.push(role.clone());
+        }
+    }
+    let schema_created = ensure_schema(db, name, spec).await?;
+    ensure_extensions(db, name, spec).await?;
+    Ok(Outcome::Provisioned(Provisioned { roles_created, schema_created }))
+}
+
 /// Reconcile every declared system. Idempotent; safe on every boot.
 ///
 /// Called from the migration path with the PRIVILEGED pool — a runtime role
@@ -590,32 +693,12 @@ pub async fn reconcile(
             continue;
         }
 
-        for ident in [&spec.role, &spec.ddl_role, &spec.schema] {
-            if !valid_identifier(ident) {
-                return Err(format!(
-                    "system {name:?} declares {ident:?}, which is not a bare lowercase \
-                     SQL identifier. These names are interpolated into DDL."
-                ));
-            }
-        }
-
-        // Every credential this pass needs, checked BEFORE either role is
-        // created: a system whose runtime password is missing must not leave
-        // a half-made migration role behind (and a skipped system creates
-        // nothing at all). Only a role that does not exist yet needs one.
-        let roles = [(&spec.ddl_role, &spec.ddl_password_env), (&spec.role, &spec.password_env)];
-        let mut to_create: Vec<(&str, &str)> = Vec::new();
-        for (role, var) in roles {
-            if !role_exists(db, role).await.map_err(|e| e.to_string())? {
-                to_create.push((role.as_str(), var.as_str()));
-            }
-        }
-        match first_missing(name, &to_create, |k| std::env::var(k).ok(), &delivered)? {
-            None => {}
-            Some(RoleError::MissingCredential { message, .. }) if missing_credential_is_fatal(name) => {
+        match provision_system(db, name, spec, &delivered).await? {
+            Outcome::Provisioned(_) => provisioned += 1,
+            Outcome::MissingCredential { message, .. } if missing_credential_is_fatal(name) => {
                 return Err(message)
             }
-            Some(RoleError::MissingCredential { var, message }) => {
+            Outcome::MissingCredential { var, message } => {
                 tracing::error!(
                     system = name,
                     variable = %var,
@@ -623,19 +706,8 @@ pub async fn reconcile(
                     "system NOT provisioned: a role password is missing — skipping this system, the gateway keeps booting"
                 );
                 unprovisioned.insert(name.clone(), format!("{var} is not set"));
-                continue;
             }
-            Some(RoleError::Other(e)) => return Err(e),
         }
-
-        // The DDL role first: it owns the schema, so it has to exist before
-        // the schema can be created AUTHORIZATION it.
-        for (role, var) in roles {
-            ensure_role(db, name, role, var, &delivered).await.map_err(RoleError::into_message)?;
-        }
-        ensure_schema(db, name, spec).await?;
-        ensure_extensions(db, name, spec).await?;
-        provisioned += 1;
     }
 
     tracing::info!(provisioned, skipped, unprovisioned = unprovisioned.len(), "systems reconciled");
@@ -656,6 +728,22 @@ mod tests {
             ddl_password_env: "NOO_EVOLVE_DDL_PASSWORD".into(),
             extensions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_system_of_an_addon_the_launcher_refused_is_never_provisioned() {
+        // The launcher left `refused_example` out of this start (its pin is
+        // for another stack): no DDL for it, though nothing else says off.
+        assert!(refused_by_launcher("refused_example", Some("other,refused_example")));
+        assert!(!refused_by_launcher("refused_example", Some("other")));
+        assert!(!refused_by_launcher("refused_example", None));
+        assert!(!refused_by_launcher("refused_example", Some("")));
+        assert!(!refused_by_launcher("Refused_Example", Some("Refused_Example")), "not an add-on name");
+        assert!(intent_declared("refused_example", &spec(None), &BTreeMap::new()));
+        std::env::set_var(REFUSED_ENV, "refused_example");
+        let refused = intent_declared("refused_example", &spec(None), &BTreeMap::new());
+        std::env::remove_var(REFUSED_ENV);
+        assert!(!refused, "a refused add-on's system must not be provisioned");
     }
 
     #[test]

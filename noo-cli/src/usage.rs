@@ -3,8 +3,7 @@
 
 //! Per-command usage: argument syntax + a one-line description for every
 //! native command in `main::NATIVE`. Rendered by `noo <words> --help` and by
-//! the "did not understand these arguments" hint before a Python
-//! fall-through. A test in `main.rs` pins this table to the registry 1:1,
+//! the "did not understand these arguments" usage error (exit 2). A test in `main.rs` pins this table to the registry 1:1,
 //! so adding a native command without a usage line fails the build's tests.
 //!
 //! Conventions: syntax lists the command's OWN arguments only (no `noo`, no
@@ -18,8 +17,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
         (&["cluster", "verify"], "[<node>...] [--controller] [--wait]", "Assert every invariant a node and the controller must meet; exit 1 with the remedy"),
         (&["cluster", "invite"], "", "Mint a tagged tailscale auth key and print the `noo enroll --via-tailnet <url>` line"),
         (&["cluster", "down"], "<backend> [--node <node>] [-y|--yes]", "Stop a backend on one node or all nodes; destructive, asks for confirmation (-y)"),
-        (&["cluster", "scale"], "<backend> -r|--replicas <n> [-m|--model <model>] [-y|--yes]", "Scale a backend to N replicas fleet-wide; scale-down asks for confirmation (-y)"),
-        (&["cluster", "desired"], "<node>", "Show the desired config and every placement (with its role) the node-agent converges to"),
+        (&["cluster", "desired"], "<node>", "Alias of show: the node in full, with its desired config and every placement"),
         (&["cluster", "proposals"], "[--status <s>] [--limit <n>]", "List the enrollment proposals agents filed, with each host in full"),
         (&["cluster", "show"], "<node>", "Show one node in full: hardware, agent version, tier drift, bus principal, roles"),
         (&["cluster", "forget"], "<node> [--purge-tailscale] [-y|--yes]", "Remove a dead node's row, KV entry and enrollments; --purge-tailscale drops its device"),
@@ -44,27 +42,18 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
         (&["cluster", "release"], "<reservation-id> [--force]", "Release a reservation: drain and stop the workload, give the GPU back (holder or --force)"),
         (&["cluster", "workloads"], "", "List the workloads the installed add-ons declare (container, GPU need, drain route)"),
         (&["cluster", "profile"], "<node> [--set <key=value>]... [--clear <key>]... [--clear-all] [--bench]", "Show a node's harness profile with each value's source; set overrides; bench its model"),
-        (&["cluster", "up"], "<backend> <model> [--node <node>] [--replicas <n>]", "Start a backend with a model via the imperative start route (prefer place)"),
         (&["cluster", "init-secret"], "", "Generate and print a fresh random cluster secret locally (no gateway call)"),
-        (&["cluster", "assign"], "<task> [--node <node>] [--backend <backend>] [--model <m>] [--priority low|medium|high|<n>] [--dry-run] [--async]", "Pin a task to the least-loaded node and run it; --dry-run prints the choice only"),
         (&["cluster", "set-config"], "<node> [--usage shared|dedicated|default] [--harness auto|manual|off] [--loop-budget <n>|default] [--data-root <path>] [--models-dir <path>] [--ip <ip>] [--tier <n>] [--gpu-model <model>] [--vram-gb <n>] [--min-battery <pct>] [--require-wifi <bool>] [--block-thermal <s,s>] [--policy-default] [--vendor-kinds <kind,kind>|none]", "Update a node's stored config row with only the given fields"),
         (&["cluster", "clear-cooldowns"], "", "Clear backend auto-start cooldown backoff on every node"),
-        (&["cluster", "add-companion"], "<node> [-p|--platform <p>] [--hostname <host>] [--ip <ip>] [-s|--sensors <a,b>] [-b|--backends <a,b>] [--battery <n>] [-n|--network <type>] [--npu-tops <n>] [--app-version <v>]", "Register a Tier-5 companion device with the gateway and send a first heartbeat"),
-        (&["cluster", "add-monitor"], "<node> [--hostname <host>] [--ip <ip>] [-s|--services <a,b>]", "Register a Tier-6 monitor node with the gateway and send an initial heartbeat"),
         (&["cluster", "teardown-node"], "<node> | --all [--purge-data] [--purge-tailscale] [--factory] [-y|--yes]", "Dismantle one node or --all via a signed teardown bundle, verify silence, then forget"),
         (&["cluster", "provision"], "<node> [<tier>] [--harness auto|manual|off] [--wait [<secs>]] [--stage-only] [--move-data]", "Stage a node's signed bundle; --wait blocks until enrolled, --stage-only skips the apply"),
         (&["cluster", "sync-model-files"], "[<node>...] [-m|--model <file>]... [--dry-run]", "Dispatch a job per node to pull GGUF weights from the controller store and verify them"),
-        (&["cluster", "auto-place"], "<model>... [-b|--backend <backend>] [--apply]", "Plan placement of a set of models across the fleet; --apply starts them"),
-        (&["cluster", "place-model"], "<model> [-b|--backend <backend>] [--node <node>] [--apply]", "Pick the best node for a model by capability and cache; --apply starts it there"),
-        (&["cluster", "reconcile-models"], "[<model>...] [-b|--backend <backend>] [--apply]", "Plan placement for desired models (args or NOO_DESIRED_MODELS) not yet running"),
-        (&["cluster", "mint-join-key"], "[--tag <tag>] [--expiry-minutes <n>] [--reusable]", "Mint a pre-authorized tagged Tailscale auth key (bootstrap-node lane is retired)"),
         (&["cluster", "bootstrap-token", "create"], "[--ttl <1h|30m|24h|secs>] [--role <role>] [--cidr <cidr>] [--node <name>] [--with-tailscale|--no-tailscale]", "Mint a single-use enrollment token and print the node enrollment one-liner"),
         (&["cluster", "bootstrap-token", "list"], "", "List bootstrap tokens with status, creator, expiry and redeeming IP"),
         (&["cluster", "bootstrap-token", "revoke"], "<id>", "Revoke a bootstrap token by id (idempotent)"),
         (&["cluster", "bootstrap-token"], "", "Print bootstrap-token subcommand usage (create, list, revoke)"),
         (&["cluster", "set-primary"], "[--to <target>] --promoted [-y|--yes]", "Move the primary-controller role; promote Postgres on the target first, then --promoted"),
-        (&["cluster", "sync-images"], "[<node>...] [-i|--image <img>]... [--images <a,b>] [--restart|--no-restart] [--all]", "Stage images on the artifact rail for each node's arch, then have its agent pull them"),
-        (&["cluster", "stage-images"], "[--lock] [-i|--image <img>]... [--arch <a,b>] [--all-images]", "Pull images with the controller's login and stage them on the artifact rail per fleet arch"),
+        (&["cluster", "sync-images"], "[<node>...] [-i|--image <img>]... [--images <a,b>] [--restart|--no-restart] [--all] [--stage-only] [--lock] [--arch <a,b>] [--all-images]", "Stage images on the artifact rail, then nodes pull them (--stage-only: stage, no pull)"),
         (&["cluster", "upgrade-agents"], "[<node>...] [-y|--yes]", "Restage node agents serially in signed bundles over the pull rail; asks to confirm (-y)"),
         (&["cluster", "upgrade-hostd"], "<node>... [--skip-build] [-y|--yes|--force]", "Roll noo-hostd to the named nodes over the pull rail as a signed bundle"),
         (&["cluster", "upgrade-applier"], "<node>... [-y|--yes|--force]", "Ship the current noo-apply to nodes over the rail; asks for confirmation (-y)"),
@@ -122,6 +111,17 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["security", "tailnet", "policy"], "[--merge | --push] [--yes]", "Compare live tailnet policy to declared; --merge adds what is missing, --push replaces"),
     (&["security", "audit", "verify"], "", "Verify audit hashes, the chain, and its head against the exported head (operator-only)"),
     (&["security", "audit", "list"], "[--since <30m|24h|7d|time>] [--event <type>] [--actor <name>] [-n <limit>] [--cursor <c>]", "List security audit rows, newest first, with source address (operator-only)"),
+    (&["security", "at-rest", "status"], "[--json]", "Show TPM facts, how to enable one, and your recorded at-rest encryption decision"),
+    (&["security", "at-rest", "opt-out"], "", "Record that you accept unencrypted data at rest (audited; needs your own login)"),
+    (&["security", "at-rest", "opt-in"], "", "Withdraw the at-rest opt-out (audited; needs your own login)"),
+    (&["security", "at-rest", "create-volume"], "[--size <GiB>] [--pcrs 7|none|auto] [--defer-recovery-key] [--dry-run]", "Create the TPM-unlocked encrypted state volume; shows its recovery key once"),
+    (&["security", "at-rest", "seal"], "[--pcrs 7|none|auto] [--dry-run]", "Seal the age key to this TPM; unsealed into RAM at boot, plaintext kept until finalize"),
+    (&["security", "at-rest", "finalize"], "[--dry-run] [-y|--yes]", "Remove the plaintext age key once a reboot unsealed it and a fresh backup decrypts"),
+    (&["security", "at-rest", "migrate"], "[--dry-run] [--rollback] [--yes] [--confirm-offbox <phrase>]", "Move this controller's state onto the encrypted volume: backup first, reversible"),
+    (&["security", "at-rest", "wipe-plaintext"], "[--dry-run] [--hours <N>] [--confirm <phrase>]", "Delete the old plaintext state after a verified migration and a day of healthy running"),
+    (&["security", "at-rest", "recovery-key"], "[--dry-run]", "Enroll a new recovery key, shown once; the old one is removed only after you confirm"),
+    (&["security", "at-rest", "reenroll"], "[--pcrs 7|none|auto] [--dry-run]", "Re-enroll the TPM after a firmware or Secure Boot change and reseal the age key"),
+    (&["security", "at-rest", "preflight-firmware"], "[--json]", "Before a BIOS or firmware update: check the recovery key and a fresh backup"),
     (&["security", "posture", "list"], "", "List security posture gates: running vs desired value (operator-only)"),
     (&["security", "posture", "set"], "<key> <value>", "Set a posture gate; needs an operator cert (`pki issue-client`); restart to apply"),
     (&["security", "posture", "apply-profile"], "<profile> [--include-bridges]", "Apply a posture profile (needs an operator cert); leaves rollout bridges; restart to apply"),
@@ -247,7 +247,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["config", "get"], "[<section>|cli]", "Print gateway runtime config, whole or one section; `cli` reads this machine's prefs"),
     (&["config", "set"], "<section> <updates-json>", "Update a gateway config section from JSON (no confirm); `cli` writes local prefs"),
     (&["config", "launch-render"], "compose-env | addons | override | systems [<file>]", "Hidden: render one noomesh.yaml section for the launcher scripts (internal)"),
-    (&["config", "launch-check"], "bind-sources [--data-root <dir>] [--no-deps] [--skip <service>]... [<service>...] | system-credentials [<noomesh.yaml>] | secrets-at-rest [<dir>]", "Hidden: pre-start refusals: bind sources, system credentials, plaintext secrets (internal)"),
+    (&["config", "launch-check"], "bind-sources [--data-root <dir>] [--no-deps] [--skip <service>]... [<service>...] | system-credentials [<noomesh.yaml>] | secrets-at-rest [<dir>] | state-root [<dir>]", "Hidden: pre-start refusals: bind sources, credentials, plaintext secrets, closed volume"),
     (&["logs", "errors"], "[-c <container>] [-m <min>] [-n <limit>] [--node <id>] [--name <n>] [--since <t>]", "List recent warning/error lines across the fleet (Loki, else a container scan)"),
     (&["logs", "tail"], "<container> | -c <container> | --name <n> [-l <lines>] [-n <node>] [--since <t>]", "Print the last N log lines of one container or unit, optionally on a given node"),
     (&["logs", "search"], "[<text>] [-n <node>] [--name <n>] [--level <l>] [--since <t>] [--until <t>] [-l <n>]", "Search the fleet's logs in Loki by node, name, level, time window and text"),
@@ -294,7 +294,6 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["autonomy", "disable"], "", "Disable the autonomy engine"),
     (&["proactive", "status"], "", "Show proactive agent state and rule counts"),
     (&["proactive", "rules"], "", "List configured proactive rules"),
-    (&["proactive", "history"], "[-n <limit>]", "Say plainly that no firing history is stored (nothing records proactive firings)"),
     (&["channels", "status"], "", "List configured channel adapters (traffic counters are not tracked)"),
     (&["channels", "export"], "[--output <file>]", "Export user links, team spaces and saved recipients as portable JSON"),
     (&["channels", "import"], "<file>", "Import channel state from an export file (idempotent; users must exist)"),
@@ -382,7 +381,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["upgrade"], "[--check] [--version <X.Y.Z>] [--stack] [--nodes] [--seats|--no-seats] [--all] [--tag <vX.Y.Z>] [--controller] [--allow-unsigned] [--force] [--skip-gateway-key-check] [--allow-downgrade] [--stage2] [--channel <public|rollback|custom>] [--release-repo <owner/repo>] [--image-prefix <registry/path>] [--base-registry <registry/path>] [--yes]", "Self-update noo, optionally stack, nodes and kiosk seats; --channel moves release channel"),
     (&["addons", "list"], "", "Show every add-on: declared, effective and whether the licence grants it"),
     (&["addons", "show"], "<name>", "Show one add-on's switch, pin, and the database and workloads its signed bundle declares"),
-    (&["addons", "enable"], "<name> [--force] [--lock <path|https-url>]", "Pin an add-on's signed lock, mint its credentials and key, then declare it ON"),
+    (&["addons", "enable"], "<name> [--force] [--lock <path|https-url>] [--provision-only]", "Pin an add-on's signed lock, mint credentials, declare it ON (--provision-only: DB only)"),
     (&["addons", "trust-key"], "<name> <pubkey> [--registry <host/path>] [--dev] [--expires <dur>]", "Trust a third-party add-on's signing key; --dev --expires (max 30d): a temporary dev key"),
     (&["addons", "untrust-key"], "<name> [<pubkey>] [--dev]", "Stop trusting a third-party add-on's signing key; --dev removes its dev key(s)"),
     (&["addons", "set"], "<name> --delegate tasks|off", "Let an add-on act on a person's tasks (needs its manifest to declare it too)"),
@@ -445,6 +444,53 @@ pub fn lookup(words: &[&str]) -> Option<(&'static str, &'static str)> {
         .map(|(_, s, d)| (*s, *d))
 }
 
+/// A native group (or nested group) followed by a word or flag it does not
+/// own. `path` is the deepest command path that parsed (`cluster class`),
+/// `unknown` the first token after it, `near` the nearest real next word:
+/// `--verify` is the subcommand `verify` typed as a flag; `verfy` is a typo.
+#[derive(Debug)]
+pub(crate) struct Misuse {
+    pub path: Vec<String>,
+    pub unknown: Option<String>,
+    pub near: Option<&'static str>,
+}
+
+/// `argv` (starting at the command word) names a native group but not a
+/// command under it. `None` when the first word is not a native group, or
+/// when a complete command row is followed by arguments (those are its
+/// arguments, not a verb).
+pub(crate) fn native_group_misuse(argv: &[String]) -> Option<Misuse> {
+    argv.first().filter(|w| is_native_group(w))?;
+    // Walk down while the next word extends a known command path.
+    let mut path: Vec<&str> = vec![argv[0].as_str()];
+    for tok in &argv[1..] {
+        if tok.starts_with('-') || is_command(&path) {
+            break;
+        }
+        if subcommands_under(&path).contains(&tok.as_str()) {
+            path.push(tok.as_str());
+        } else {
+            break;
+        }
+    }
+    if is_command(&path) && argv.len() > path.len() {
+        return None;
+    }
+    let subs = subcommands_under(&path);
+    let unknown = argv.get(path.len()).cloned();
+    let near = unknown.as_ref().and_then(|tok| {
+        let bare = tok.trim_start_matches('-');
+        if bare.is_empty() {
+            return None;
+        }
+        subs.iter()
+            .copied()
+            .find(|s| *s == bare)
+            .or_else(|| subs.iter().copied().find(|s| crate::edit_distance(s, bare) <= 2))
+    });
+    Some(Misuse { path: path.iter().map(|s| s.to_string()).collect(), unknown, near })
+}
+
 #[cfg(test)]
 mod tests {
     /// By design, `--break-glass` is gone. No usage line
@@ -472,5 +518,84 @@ mod tests {
         assert!(syntax.contains("[--vendor-kinds <kind,kind>|none]"), "{syntax}");
         let (syntax, _) = super::lookup(&["cluster", "vendor", "install"]).expect("vendor install");
         assert_eq!(syntax, "<node> <kind>...");
+    }
+
+    /// `noo security at-rest status|opt-out|opt-in` (i10a) are on the help
+    /// lines, with `--json` on status and the "your own login" requirement on
+    /// the two writers.
+    #[test]
+    fn at_rest_verbs_are_on_the_help_lines() {
+        let (syntax, desc) = super::lookup(&["security", "at-rest", "status"]).expect("at-rest status");
+        assert_eq!(syntax, "[--json]");
+        assert!(desc.contains("TPM"), "{desc}");
+        for verb in ["opt-out", "opt-in"] {
+            let (syntax, desc) = super::lookup(&["security", "at-rest", verb]).unwrap_or_else(|| panic!("at-rest {verb}"));
+            assert_eq!(syntax, "");
+            assert!(desc.contains("own login"), "{verb}: {desc}");
+        }
+        assert_eq!(
+            super::subcommands_under(&["security", "at-rest"]),
+            vec!["status", "opt-out", "opt-in", "create-volume", "seal", "finalize", "migrate", "wipe-plaintext", "recovery-key", "reenroll", "preflight-firmware"]
+        );
+        // i10a PR-C: the volume, with the deferral that is the only way to run it without a terminal.
+        let (syntax, desc) = super::lookup(&["security", "at-rest", "create-volume"]).expect("at-rest create-volume");
+        assert!(syntax.contains("--defer-recovery-key") && syntax.contains("--size <GiB>"), "{syntax}");
+        assert!(desc.contains("recovery key once"), "{desc}");
+        // i10a PR-D: the migration, and the separate verb that deletes.
+        let (syntax, desc) = super::lookup(&["security", "at-rest", "migrate"]).expect("at-rest migrate");
+        assert!(syntax.contains("--dry-run") && syntax.contains("--rollback"), "{syntax}");
+        assert!(desc.contains("backup first"), "{desc}");
+        let (syntax, desc) = super::lookup(&["security", "at-rest", "wipe-plaintext"]).expect("at-rest wipe-plaintext");
+        assert!(syntax.contains("--confirm") && syntax.contains("--hours"), "{syntax}");
+        assert!(desc.contains("Delete"), "{desc}");
+        // i10a PR-E: rotation, re-enrollment, firmware preflight.
+        let (_, d) = super::lookup(&["security", "at-rest", "recovery-key"]).expect("at-rest recovery-key");
+        assert!(d.contains("only after you confirm"), "{d}");
+        let (syntax, _) = super::lookup(&["security", "at-rest", "reenroll"]).expect("at-rest reenroll");
+        assert!(syntax.contains("--pcrs 7|none|auto"), "{syntax}");
+        assert!(super::lookup(&["security", "at-rest", "preflight-firmware"]).is_some());
+    }
+}
+
+#[cfg(test)]
+mod misuse_tests {
+    use super::*;
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_flag_typed_subcommand_is_matched_to_the_subcommand() {
+        let m = native_group_misuse(&argv(&["cluster", "--verify"])).expect("misuse");
+        assert_eq!(m.path, vec!["cluster"]);
+        assert_eq!(m.near, Some("verify"));
+    }
+
+    #[test]
+    fn a_typo_gets_the_nearest_subcommand_and_garbage_gets_none() {
+        let m = native_group_misuse(&argv(&["cluster", "verfy"])).expect("misuse");
+        assert_eq!(m.near, Some("verify"));
+        let m = native_group_misuse(&argv(&["cluster", "--zzzzzzzz"])).expect("misuse");
+        assert_eq!(m.near, None);
+        assert!(native_group_misuse(&argv(&["definitelynotacommand"])).is_none());
+    }
+
+    #[test]
+    fn the_unknown_token_is_the_one_after_the_deepest_parsed_level() {
+        let m = native_group_misuse(&argv(&["cluster", "bogus", "chat-default", "host3/vllm"])).expect("misuse");
+        assert_eq!(m.unknown.as_deref(), Some("bogus"));
+        // i136a: `class` parsed; `show` is the wrong word, not `class`.
+        let m = native_group_misuse(&argv(&["cluster", "class", "show", "chat-default"])).expect("misuse");
+        assert_eq!(m.path, vec!["cluster", "class"]);
+        assert_eq!(m.unknown.as_deref(), Some("show"));
+        let m = native_group_misuse(&argv(&["cluster", "class", "lst"])).expect("misuse");
+        assert_eq!(m.near, Some("list"));
+        // a complete nested command with arguments is not a misuse
+        assert!(native_group_misuse(&argv(&["cluster", "class", "set", "chat-default", "host3/vllm"])).is_none());
+        // `security keys list`: the verb is `service-key`
+        let m = native_group_misuse(&argv(&["security", "keys", "list"])).expect("misuse");
+        assert_eq!(m.unknown.as_deref(), Some("keys"));
+        assert!(subcommands_under(&["security"]).contains(&"service-key"));
     }
 }

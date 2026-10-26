@@ -95,7 +95,7 @@ pub trait WizardUi: Send + Sync {
     /// the TUI suspends the alternate screen, runs it, and resumes —
     /// which is what makes `noo onboard --tui` able to install/join
     /// Tailscale instead of dead-ending into manual instructions.
-    fn run_passthrough(&self, _argv: &[String]) -> Option<i32> {
+    fn run_inherited(&self, _argv: &[String]) -> Option<i32> {
         None
     }
 

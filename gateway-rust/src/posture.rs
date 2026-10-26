@@ -113,25 +113,17 @@ pub const POSTURE_CATALOG: &[PostureKey] = &[
     // no RequesterCtx deciding exec approvals) until it was retired: it is in
     // RETIRED_BRIDGES below, so a row or env value still holding it open
     // refuses boot instead of being silently ignored.
-    // While OPEN, a shared-secret token still buys INFERENCE,
-    // and every acceptance warns naming the caller — so "who has not been
-    // given a key of their own" is answerable before this closes. Closed,
-    // those callers are refused there and must present their own
-    // `noo_service_keys` row.
+    // `NOO_SELF_CALL_SHARED_SECRET` was a bridge here (a shared-secret HMAC
+    // buying inference) until it was retired: the fleet door refuses the
+    // inference surface unconditionally (`auth.rs`, counted as
+    // `self_call_shared_secret_refused`) and the controller door admits
+    // nothing. Nothing reads the flag any more. It is a RETIRED_INERT_KEYS
+    // entry: boot deletes a stale row at a closed value and warns about one
+    // still set open (it is not a retired-bridge boot refusal: there is
+    // nothing left to hold open).
     //
-    // Polarity: CLOSED by default (unset = closed), like
-    // every other bridge — every controller service holds its own key, and
-    // the live controller counted 0 uses of this lane for seven days. A row
-    // at "1" still holds it open, and is reported with its age.
-    //
-    // It does NOT retire NOO_CONTROLLER_SECRET, whose one remaining job is
-    // the gateway's boot guard (no controller secret, no start); the gateway
-    // refuses an HMAC signed with it from every caller.
-    PostureKey {
-        key: "NOO_SELF_CALL_SHARED_SECRET",
-        kind: PostureKind::Bridge { closed: "0", window_days: 60 },
-        why: "lets a shared-secret token still buy inference, instead of a per-consumer key",
-    },
+    // `NOO_CONTROLLER_SECRET` is not retired by this: its one remaining job
+    // is the gateway's boot guard (no controller secret, no start).
     // The v1 cluster token (HMAC over actor and time only) is a
     // replayable bearer; v2 binds the request. Every verifier accepts both
     // while the fleet rolls and counts v1 under the `cluster_hmac_v1` lane
@@ -280,7 +272,25 @@ pub fn retired_value_opens(key: &str, value: &str) -> bool {
 /// Retired posture keys that never became a [`RetiredBridge`] — their
 /// arm went with the thing they bridged to, so no value changes anything and
 /// no boot refusal guards them. `NOO_NATS_LEGACY_SHARED_CREDS`: the server no longer defines the shared bus user it opened.
-pub const RETIRED_INERT_KEYS: &[&str] = &["NOO_NATS_LEGACY_SHARED_CREDS"];
+/// `NOO_SELF_CALL_SHARED_SECRET`: the self-call bridge is deleted; a shared secret never buys inference.
+pub const RETIRED_INERT_KEYS: &[&str] = &["NOO_NATS_LEGACY_SHARED_CREDS", "NOO_SELF_CALL_SHARED_SECRET"];
+
+/// Does `value` read as ON for a [`RETIRED_INERT_KEYS`] row? Such a row is
+/// never deleted at boot (the operator believed something was open); it is
+/// reported instead, with the one write that closes it.
+fn inert_value_on(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
+/// The [`RETIRED_INERT_KEYS`] rows still set ON: boot keeps them and warns
+/// (`noo security posture set <key> 0`, then the next start deletes the
+/// row). Pure, so the choice is tested.
+pub fn retired_inert_rows_held_open(rows: &[(String, String)]) -> Vec<(String, String)> {
+    rows.iter()
+        .filter(|(k, v)| RETIRED_INERT_KEYS.contains(&k.as_str()) && inert_value_on(v))
+        .cloned()
+        .collect()
+}
 
 /// The posture rows boot DELETES: a retired key (a [`RetiredBridge`] or a
 /// [`RETIRED_INERT_KEYS`] entry) holding a value that does NOT open it. Such
@@ -295,8 +305,7 @@ pub fn retired_rows_to_clear(rows: &[(String, String)]) -> Vec<(String, String)>
             if retired_bridge(k).is_some() {
                 return !retired_value_opens(k, v);
             }
-            RETIRED_INERT_KEYS.contains(&k.as_str())
-                && !matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+            RETIRED_INERT_KEYS.contains(&k.as_str()) && !inert_value_on(v)
         })
         .cloned()
         .collect()
@@ -427,12 +436,6 @@ pub fn bridge_standing(
     if value == closed {
         return None;
     }
-    // The self-call bridge is judged with the GATEWAY's own reader: closed by default, open only on an explicit
-    // opening value. A row the gateway treats as closed — "", "no", a typo —
-    // is not reported as a standing open bridge.
-    if entry.key == "NOO_SELF_CALL_SHARED_SECRET" && !crate::auth::shared_secret_buys_inference(value) {
-        return None;
-    }
     // The v1-token bridge is judged with the gateway's own reader too: any
     // closing spelling ("false", "off", …) closes it.
     if entry.key == "NOO_CLUSTER_TOKEN_V1" && !crate::cluster_token_v2::v1_allowed_value(value) {
@@ -474,6 +477,11 @@ pub async fn apply_security_posture(db: &PgPool) {
         Ok(rows) => {
             let pairs: Vec<(String, String)> = rows.iter().map(|(k, v, ..)| (k.clone(), v.clone())).collect();
             clear_retired_rows(db, &pairs).await;
+            for (key, value) in retired_inert_rows_held_open(&pairs) {
+                tracing::warn!(key = %key, value = %value,
+                    "a RETIRED posture row is still set on: nothing reads it, so it changes nothing. \
+                     Close it with `noo security posture set {} 0`; the next gateway start deletes the row", key);
+            }
             let mut applied = 0u32;
             let mut open_bridges: Vec<BridgeStanding> = Vec::new();
             for (key, value, age_days, from_update) in rows {
@@ -669,16 +677,16 @@ mod tests {
     /// Boot deletes a retired key's row only at a value that does not open
     /// it; an OPEN retired bridge stays for the boot refusal to name, and a
     /// live gate is never touched.
-    /// Second review: `bridge_standing` reads the self-call bridge exactly as
+    /// Second review: `bridge_standing` reads the v1-token bridge exactly as
     /// the gateway does — a value the gateway treats as closed is no
     /// standing bridge, and an opening one is.
     #[test]
-    fn the_self_call_bridge_standing_uses_the_gateways_truthiness() {
-        for closed in ["0", "", "no", "off", "false", "flase"] {
-            assert!(bridge_standing("NOO_SELF_CALL_SHARED_SECRET", closed, 90, false).is_none(), "{closed:?}");
+    fn the_v1_bridge_standing_uses_the_gateways_truthiness() {
+        for closed in ["0", "false", "no", "off", "closed"] {
+            assert!(bridge_standing("NOO_CLUSTER_TOKEN_V1", closed, 90, false).is_none(), "{closed:?}");
         }
         for open in ["1", "open", "true", "yes", "on"] {
-            assert!(bridge_standing("NOO_SELF_CALL_SHARED_SECRET", open, 90, false).is_some(), "{open:?}");
+            assert!(bridge_standing("NOO_CLUSTER_TOKEN_V1", open, 90, false).is_some(), "{open:?}");
         }
     }
 
@@ -692,6 +700,7 @@ mod tests {
             row("NOO_BUS_PRINCIPAL", "optional"),
             row("NOO_BOOTSTRAP_ACCEPT_UNSIGNED_FETCH", "1"),
             row("NOO_SELF_CALL_SHARED_SECRET", "0"),
+            row("NOO_SELF_CALL_SHARED_SECRET", "1"),
             row("NOO_EXEC_APPROVAL_MODE", "approval"),
             row("NOO_APPROVAL_BREAK_GLASS", "0"),
             row("NOO_APPROVAL_BREAK_GLASS", "1"),
@@ -702,15 +711,21 @@ mod tests {
                 row("NOO_NATS_LEGACY_SHARED_CREDS", "0"),
                 row("NOO_CLUSTER_LEGACY_FULL_ACCESS", "0"),
                 row("NOO_BUS_PRINCIPAL", "required"),
+                row("NOO_SELF_CALL_SHARED_SECRET", "0"),
                 row("NOO_APPROVAL_BREAK_GLASS", "0"),
             ]
         );
+        // The retired self-call bridge (see #371) held on is reported, never
+        // silently deleted, and no other row is.
+        assert_eq!(retired_inert_rows_held_open(&rows), vec![row("NOO_SELF_CALL_SHARED_SECRET", "1")]);
         assert!(retired_rows_to_clear(&[row("NOO_NATS_LEGACY_SHARED_CREDS", "1")]).is_empty(),
             "a retired key held open is left for verify's FAIL, never silently deleted");
         let src = include_str!("posture.rs");
         let apply = &src[src.find("pub async fn apply_security_posture").unwrap()..];
         assert!(apply[..apply.find("let mut applied").unwrap()].contains("clear_retired_rows(db, &pairs).await"),
             "boot no longer clears inert retired rows");
+        assert!(apply[..apply.find("let mut applied").unwrap()].contains("retired_inert_rows_held_open(&pairs)"),
+            "boot no longer reports an inert retired row held on");
     }
     use serde_json::json;
 
@@ -761,7 +776,7 @@ mod tests {
     /// again and a half-migrated fleet loses a node.
     #[test]
     fn the_known_bridges_are_bridges() {
-        let key = "NOO_SELF_CALL_SHARED_SECRET";
+        let key = "NOO_CLUSTER_TOKEN_V1";
         assert_eq!(
             kind_of(key).map(|k| k.is_bridge()),
             Some(true),
@@ -929,7 +944,7 @@ mod bridge_life_tests {
     /// that matters.
     #[test]
     fn a_closed_bridge_has_no_standing() {
-        assert!(bridge_standing("NOO_SELF_CALL_SHARED_SECRET", "0", 9999, false).is_none());
+        assert!(bridge_standing("NOO_CLUSTER_TOKEN_V1", "0", 9999, false).is_none());
     }
 
     /// A retired bridge has no standing either: it is not in the catalog, so
@@ -955,20 +970,20 @@ mod bridge_life_tests {
 
     #[test]
     fn overdue_is_measured_against_the_keys_own_window() {
-        // NOO_SELF_CALL_SHARED_SECRET declares 60 days.
-        let b = bridge_standing("NOO_SELF_CALL_SHARED_SECRET", "1", 61, false).unwrap();
+        // NOO_CLUSTER_TOKEN_V1 declares 60 days.
+        let b = bridge_standing("NOO_CLUSTER_TOKEN_V1", "1", 61, false).unwrap();
         assert_eq!(b.window_days, 60);
         assert!(b.is_overdue());
         assert_eq!(b.overdue_days(), 1);
         // A single global deadline shorter than the key's own would have
         // called this one late.
-        let young = bridge_standing("NOO_SELF_CALL_SHARED_SECRET", "1", 31, false).unwrap();
+        let young = bridge_standing("NOO_CLUSTER_TOKEN_V1", "1", 31, false).unwrap();
         assert!(!young.is_overdue());
     }
 
     #[test]
     fn on_the_deadline_is_not_yet_overdue() {
-        let b = bridge_standing("NOO_SELF_CALL_SHARED_SECRET", "1", 60, false).unwrap();
+        let b = bridge_standing("NOO_CLUSTER_TOKEN_V1", "1", 60, false).unwrap();
         assert!(!b.is_overdue(), "the window is 60 days, not 59");
     }
 
@@ -997,7 +1012,7 @@ mod bridge_life_tests {
     /// evidence is the whole failure this work exists to stop.
     #[test]
     fn a_pre_migration_row_is_dated_but_says_so() {
-        let b = bridge_standing("NOO_SELF_CALL_SHARED_SECRET", "1", 200, true).unwrap();
+        let b = bridge_standing("NOO_CLUSTER_TOKEN_V1", "1", 200, true).unwrap();
         assert!(b.dated_from_update);
         assert!(b.is_overdue());
     }

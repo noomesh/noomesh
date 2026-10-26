@@ -89,7 +89,7 @@ def _bin(tmp_path: Path, name: str, text: str) -> None:
 
 
 def _run(tmp_path: Path, body: str, **env: str) -> subprocess.CompletedProcess:
-    _bin(tmp_path, "docker", FAKE_DOCKER)
+    _bin(tmp_path, "docker", env.pop("DOCKER", FAKE_DOCKER))
     _bin(tmp_path, "noo", FAKE_NOO)
     root = _root(tmp_path)
     script = f"""
@@ -174,10 +174,113 @@ def test_an_inherited_verdict_is_dropped_never_trusted(tmp_path):
     assert _verdict(r) == "none"
 
 
-def test_a_refusal_exports_no_verdict_and_stops_the_start(tmp_path):
-    r = _run(tmp_path, VERDICT, MAP="other_addon=1\n", FAKE_PINS="refuse other_addon its lock does not list v0.6.0\\n")
+REFUSED_STATE = (
+    'require_addon_pins; rc=$?; printf "VERIFIED=%s\\n" "${NOO_ADDONS_VERIFIED-<unset>}"; '
+    'printf "REFUSED=%s\\n" "${NOO_ADDONS_REFUSED-<unset>}"; '
+    'printf "OVERLAYS=%s\\n" "$(addon_compose_overlay_args)"; '
+    'addon_on other_addon 0 && echo OTHER_ON=1 || echo OTHER_ON=0; '
+    'printf "DECLS=%s\\n" "${_ADDON_DECLS[*]-}"; '
+    'env | grep "^NOO_ADDON_IMAGE_" | sort; exit $rc'
+)
+
+
+def _line(r: subprocess.CompletedProcess, key: str) -> str:
+    (line,) = [l for l in r.stdout.splitlines() if l.startswith(key + "=")]
+    return line.removeprefix(key + "=")
+
+
+def test_a_refused_addon_is_left_out_and_the_start_goes_on(tmp_path):
+    # 2026-10-24: one add-on whose pin does not verify for this stack no
+    # longer refuses the whole start. It is left out, by name, loudly.
+    r = _run(tmp_path, REFUSED_STATE, MAP="other_addon=1\n", FAKE_PINS="refuse other_addon its lock does not list v0.6.0\\n")
+    assert r.returncode == 0, r.stderr
+    assert "REFUSED add-on other_addon: its lock does not list v0.6.0" in r.stderr, r.stderr
+    assert "is NOT running" in r.stderr, "the outcome says it did not start"
+    assert _verdict(r) == "none", "a refused add-on is never in the gateway's verdict"
+    assert _line(r, "REFUSED") == "other_addon"
+    assert _line(r, "OTHER_ON") == "0", "a refused add-on is off for the rest of this start"
+    assert "other_addon" not in _line(r, "OVERLAYS"), "its overlay is not composed"
+    assert _exports(r) == {}
+
+
+def test_only_the_refused_addon_is_left_out_the_others_launch(tmp_path):
+    pins = (
+        "verified example_addon 1.0.0 v0.6.0\\n"
+        f"pin example_addon NOO_ADDON_IMAGE_EXAMPLE_ADDON {EXAMPLE_REF}\\n"
+        "decl example_addon system.json\\n"
+        "refuse other_addon other_addon is pinned for stack v0.5.9, and this stack runs v0.6.0\\n"
+    )
+    r = _run(tmp_path, REFUSED_STATE, FAKE_PINS=pins)
+    assert r.returncode == 0, r.stderr
+    assert "REFUSED add-on other_addon: other_addon is pinned for stack v0.5.9" in r.stderr, r.stderr
+    assert "Fix:  noo addons upgrade other_addon   (or turn it off: noo addons disable other_addon)" in r.stderr
+    assert _exports(r) == {"NOO_ADDON_IMAGE_EXAMPLE_ADDON": EXAMPLE_REF}
+    assert _verdict(r) == "example_addon=1.0.0@v0.6.0"
+    assert _line(r, "REFUSED") == "other_addon"
+    overlays = _line(r, "OVERLAYS")
+    assert "addons/example_addon/docker-compose.yml" in overlays and "other_addon" not in overlays, overlays
+    assert _line(r, "DECLS") == "example_addon system.json"
+
+
+def test_a_refusal_after_a_verdict_line_takes_the_addon_out_of_the_verdict(tmp_path):
+    # launch-pins prints `verified` first, then may refuse the same add-on
+    # (its lock names an image with no variable name).
+    pins = PINS_WITH_VERDICT + "dev other_addon 1793750400\\ndecl other_addon system.json\\n" \
+        + 'refuse other_addon its lock names image "x y", which has no variable name\\n'
+    r = _run(tmp_path, REFUSED_STATE + '; printf "DEV=%s\\n" "${NOO_ADDONS_DEV-<unset>}"', FAKE_PINS=pins)
+    assert r.returncode == 0, r.stderr
+    assert _verdict(r) == "example_addon=1.0.0@v0.6.0"
+    assert _exports(r) == {"NOO_ADDON_IMAGE_EXAMPLE_ADDON": EXAMPLE_REF}
+    assert _line(r, "DECLS") == ""
+
+
+def test_an_expired_dev_key_names_the_renewal(tmp_path):
+    why = ("other_addon's lock is signed only by a development key (abcd…) that expired 2026-10-01 00:00 UTC, "
+           "so it is refused like an unsigned one")
+    r = _run(tmp_path, REFUSED_STATE, MAP="other_addon=1\n", FAKE_PINS=f"refuse other_addon {why}\\n")
+    assert r.returncode == 0, r.stderr
+    assert "noo addons trust-key other_addon <pubkey> --dev --expires 14d" in r.stderr, r.stderr
+    assert "noo addons disable other_addon" in r.stderr
+
+
+def test_an_old_cli_with_a_refusal_still_refuses_the_whole_start(tmp_path):
+    # No `verified` lines: the gateway would get no verdict and load the
+    # built-in add-ons it already knew, a refused one included.
+    pins = f"pin example_addon NOO_ADDON_IMAGE_EXAMPLE_ADDON {EXAMPLE_REF}\\nrefuse other_addon stale\\n"
+    r = _run(tmp_path, VERDICT, FAKE_PINS=pins)
+    assert r.returncode == 1, r.stderr
+    assert "does not report verified" in r.stderr and "noo upgrade" in r.stderr
+
+
+def test_a_line_naming_something_that_is_not_an_addon_refuses_the_whole_start(tmp_path):
+    r = _run(tmp_path, VERDICT, MAP="other_addon=1\n", FAKE_PINS="refuse Other,addon nope\\n")
+    assert r.returncode == 1 and "not an add-on name" in r.stderr, r.stderr
+    r = _run(tmp_path, VERDICT, MAP="other_addon=1\n", FAKE_PINS="refuse ../x nope\\n")
     assert r.returncode == 1
-    assert _verdict(r) == "<unset>"
+
+
+def test_a_refused_addon_is_never_composed_to_be_stopped(tmp_path):
+    # addons_stop_disabled composes an OFF add-on's overlay to stop it; a
+    # REFUSED one is reached by compose's labels instead (addons_stop_refused).
+    body = ('require_addon_pins || exit 9; COMPOSE_FILES="-f base.yml"; addons_stop_disabled; '
+            'addons_stop_refused; exit 0')
+    fake = """#!/bin/sh
+echo "$*" >> "$FAKE_LOG"
+case "$*" in
+  "image inspect"*) exit 0 ;;
+  *"config --services"*) echo gateway ;;
+  "ps -q"*"com.docker.compose.service=other-addon"*) echo cid-other ;;
+esac
+exit 0
+"""
+    (tmp_path / "base.yml").write_text("services:\n  gateway:\n    image: g\n")
+    r = _run(tmp_path, body, MAP="other_addon=1\n", FAKE_PINS="refuse other_addon stale\\n", DOCKER=fake)
+    assert r.returncode == 0, r.stderr
+    log = (tmp_path / "docker.log").read_text()
+    assert "addons/other_addon/docker-compose.yml" not in log, log
+    assert "label=com.docker.compose.project=noomesh" in log, log
+    assert "stop cid-other" in log, log
+    assert "add-on other_addon was refused this start" in r.stderr
 
 
 def test_a_cli_that_cannot_report_leaves_the_verdict_unset_and_says_so(tmp_path):
@@ -256,18 +359,19 @@ def test_not_dist_mode_is_a_noop(tmp_path):
 def test_a_refused_pin_names_the_addon_the_reason_and_the_remedy(tmp_path):
     r = _run(tmp_path, SHOW, MAP="other_addon=1\n",
              FAKE_PINS="refuse other_addon other_addon's cached lock no longer verifies: Add-on lock signature invalid\\n")
-    assert r.returncode == 1
-    assert "REFUSING: the other_addon add-on is on and has no verified pin for v0.6.0" in r.stderr
+    assert r.returncode == 0, r.stderr
+    assert "REFUSED add-on other_addon: other_addon's cached lock no longer verifies" in r.stderr
     assert "cached lock no longer verifies" in r.stderr
     assert "noo addons upgrade other_addon" in r.stderr
     assert _exports(r) == {}
 
 
 def test_a_pinned_image_missing_locally_refuses_and_is_never_pulled(tmp_path):
-    r = _run(tmp_path, SHOW, FAKE_LOCAL=EXAMPLE_REF)
-    assert r.returncode == 1
-    assert "REFUSING: the other_addon add-on is on, and its pinned image is not on this host" in r.stderr
+    r = _run(tmp_path, SHOW, FAKE_LOCAL=EXAMPLE_REF, FAKE_PINS=PINS_WITH_VERDICT)
+    assert r.returncode == 0, r.stderr
+    assert "REFUSED add-on other_addon: its pinned image is not on this host" in r.stderr
     assert OTHER_REF in r.stderr and "noo addons upgrade other_addon" in r.stderr
+    assert _exports(r) == {"NOO_ADDON_IMAGE_EXAMPLE_ADDON": EXAMPLE_REF}, "the other add-on still launches"
     assert not (tmp_path / "docker.log").exists(), "the launcher must never pull an add-on"
 
 
@@ -279,7 +383,8 @@ def test_an_env_file_value_cannot_name_an_addon_image(tmp_path):
     assert _exports(r) == {}
     r = _run(tmp_path, SHOW, MAP="other_addon=1\n", NOO_ADDON_IMAGE_OTHER_ADDON="mine/other-addon:latest",
              FAKE_PINS="refuse other_addon other_addon has no pin in addons.lock\\n")
-    assert r.returncode == 1 and _exports(r) == {}
+    assert r.returncode == 0 and _exports(r) == {}
+    assert "REFUSED add-on other_addon" in r.stderr
 
 
 def test_a_failing_reader_refuses(tmp_path):
@@ -382,8 +487,9 @@ def test_a_lock_image_name_the_overlay_does_not_read_is_refused(tmp_path):
     # Refused, naming the variable.
     r = _run(tmp_path, SHOW, MAP="trellion=0\nother_addon=1\n",
              FAKE_PINS=f"pin other_addon NOO_ADDON_IMAGE_NOO_OTHER_ADDON {OTHER_REF}\\n")
-    assert r.returncode == 1, r.stderr
-    assert "runs ${NOO_ADDON_IMAGE_OTHER_ADDON}, and no verified pin supplies it" in r.stderr
+    assert r.returncode == 0, r.stderr
+    assert "REFUSED add-on other_addon: its overlay runs ${NOO_ADDON_IMAGE_OTHER_ADDON}, and no verified pin supplies it" in r.stderr
+    assert _exports(r) == {}, "a refused add-on's pins are never exported"
 
 
 def test_core_only_gates_exactly_what_is_composed(tmp_path):

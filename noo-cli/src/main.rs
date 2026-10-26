@@ -7,10 +7,10 @@
 //! [`NATIVE`] whose arguments it fully understands. An unknown command word
 //! then gets one git-style chance as a plugin — an executable `noo-<word>`
 //! shim on PATH or in the user plugins dir (see `commands/plugins.rs`) is
-//! exec()'d with the remaining argv. Everything else — unknown commands,
-//! unknown flags, `--help`, bare `noo` — is exec()'d through to the Python
-//! CLI (`noomesh.cli`), which remains the complete reference surface
-//! during the piece-by-piece port. Order: builtins → plugins → Python.
+//! exec()'d with the remaining argv. Everything else — an unknown command,
+//! or a native command whose arguments it does not understand — prints the
+//! relevant usage and exits 2. Nothing is ever exec()'d except a plugin shim.
+//! Order: builtins → plugins → unknown command.
 //! Porting a command = adding a registry entry + handler; no other
 //! coordination needed.
 //!
@@ -48,6 +48,7 @@
 #![allow(clippy::ptr_arg)]
 
 mod addon_decl_parse;
+mod age_key;
 mod addon_lock;
 mod addons;
 mod auth;
@@ -72,7 +73,6 @@ mod http;
 pub(crate) mod onboard;
 mod operator_cert;
 mod output;
-mod passthrough;
 mod pki;
 mod role;
 mod shell_completion;
@@ -86,8 +86,7 @@ mod vendor;
 use output::{fail, ExitCode};
 
 /// A handler returns `Err(Unhandled)` when it sees an argument it doesn't
-/// understand — the dispatcher then exec()s Python with the ORIGINAL argv,
-/// so partially-ported flag surfaces degrade gracefully instead of erroring.
+/// understand — the dispatcher prints that command's usage and exits 2.
 #[derive(Debug)]
 pub struct Unhandled;
 
@@ -328,7 +327,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     // Group stub AFTER the subactions: resolution is FIRST match in table
     // order, so the real entries win when their word is present and this
     // catches every near-miss — which previously fell through to the
-    // Python passthrough and died in irrelevant "set NOO_PY_CLI" advice
+    // an unrelated fall-through and died in irrelevant advice
     // (finding #89, live: `bootstrap-token --node host5` sans `create`).
     (&["cluster", "bootstrap-token"], commands::cluster_bootstrap_token_usage),
     (&["cluster", "set-primary"], commands::cluster_set_primary),
@@ -399,7 +398,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["test", "coverage"], commands::test_coverage),
     // NOTE: `debug query` was RETIRED 2026-09-03 (not ported): the
     // memory-trace it wanted is trellion's, and trellion has its own CLI.
-    // The gateway's /api/v1/debug/query (an admin SQL passthrough, never a
+    // The gateway's /api/v1/debug/query (an admin SQL pass-through, never a
     // trace) was removed 2026-09-27.
     // `onboard`: the setup wizard, native for zero-Python bootstrap —
     // including the browser frontend (`--web [--port N]`, embedded server +
@@ -488,9 +487,9 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["heartbeat", "remove"], commands::heartbeat_remove),
     // ── WP-C1: chat — native REPL/one-shot over the gateway's SSE streaming
     // path (POST /api/inference/stream, served natively by gateway-rust).
-    // The Python local-agent fallback surface (--no-use-cluster, --config,
-    // --base-url, --tool-mode) falls through to Python; gateway down → exit 3
-    // with a pointer to `noo stack start` / the Python fallback.
+    // Gateway down → exit 3 with a pointer to `noo stack start`. The old
+    // Python local-agent flags (--no-use-cluster, --config, --base-url,
+    // --tool-mode) are not understood: usage error, exit 2.
     (&["chat"], commands::chat),
     // ── WP-A3: security (HTTP surface) — users / teams / orgs / posture /
     // service-keys, all thin gateway calls (security_cli.py `_api`/`_team_api`).
@@ -527,6 +526,18 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["security", "org", "create"], commands::security_org_create),
     (&["security", "audit", "verify"], commands::security_audit_verify),
     (&["security", "audit", "list"], commands::security_audit_list),
+    (&["security", "at-rest", "status"], commands::security_at_rest_status),
+    (&["security", "at-rest", "opt-out"], commands::security_at_rest_opt_out),
+    (&["security", "at-rest", "opt-in"], commands::security_at_rest_opt_in),
+    (&["security", "at-rest", "create-volume"], commands::security_at_rest_create_volume),
+    // i10a PR-B: the age key sealed to the TPM (root half: noo-hostd at-rest).
+    (&["security", "at-rest", "seal"], commands::at_rest_seal),
+    (&["security", "at-rest", "finalize"], commands::at_rest_finalize),
+    (&["security", "at-rest", "migrate"], commands::security_at_rest_migrate),
+    (&["security", "at-rest", "wipe-plaintext"], commands::security_at_rest_wipe_plaintext),
+    (&["security", "at-rest", "recovery-key"], commands::security_at_rest_recovery_key),
+    (&["security", "at-rest", "reenroll"], commands::security_at_rest_reenroll),
+    (&["security", "at-rest", "preflight-firmware"], commands::security_at_rest_preflight_firmware),
     (&["security", "posture", "list"], commands::security_posture_list),
     (&["security", "tailnet", "policy"], commands::tailnet_policy),
     (&["security", "posture", "set"], commands::security_posture_set),
@@ -592,7 +603,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     // ── WP-B2: stack mgmt (distinct block — reconcile order freely).
     // `stack install-watcher` = retired stub (noo-hostd runs host commands);
     // `stack reset` spawns scripts/noomesh-reset.sh (destructive → agent-
-    // first confirm contract); `stack ollama` = docker-exec passthrough with
+    // first confirm contract); `stack ollama` = docker-exec pass-through with
     // inherited stdio; `models switch` rewrites noomesh.yaml/.env + compose-
     // recreates the backend; `cluster seed` applies/exports desired state.
     (&["stack", "install-watcher"], commands::mesh_install_watcher),
@@ -612,7 +623,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     // CLI's in-process faster-whisper/piper surface. `speak` synthesizes via
     // the gateway then plays through the first system player on PATH
     // (paplay/aplay/ffplay/afplay) — no audio libraries bundled.
-    // `transcribe --device` has no gateway field → Unhandled → Python.
+    // `transcribe --device` has no gateway field → Unhandled → usage error.
     (&["voice", "transcribe"], commands::voice_transcribe),
     (&["voice", "synthesize"], commands::voice_synthesize),
     (&["voice", "speak"], commands::voice_speak),
@@ -621,7 +632,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     // ── WP-PL: plugins — git-style `noo-<name>` executable shims. `plugins
     // list` enumerates them natively (LOCAL PATH + user-dir scan, no gateway);
     // dispatch of `noo <name> …` to a shim is the Resolution::Plugin fallback
-    // below (builtins → plugins → Python), not a registry entry. Python-
+    // below (builtins → plugins → unknown command), not a registry entry. Python-
     // package plugins (~/.noo/plugins, imported in-process) remain the Python
     // CLI's surface — see src/commands/plugins.rs.
     (&["plugins", "list"], commands::plugins_list),
@@ -660,7 +671,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     // ── WP-L: pro loop ── meta-cognitive self-improvement engine, thin HTTP
     // to the gateway's pro routes. The handler module is pro-only (compiled
     // in only when present — see commands/mod.rs); in OSS builds these
-    // handlers stub to Unhandled and the argv falls through to Python. The
+    // handlers stub to Unhandled (usage error, exit 2). The
     // engine itself is runtime-gated too: a gateway without the evolve add-on
     // renders a friendly "pro loop engine not enabled" (exit 5).
     // ── CLI per-user auth ── obtain,
@@ -700,7 +711,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["kiosk", "teardown"], commands::kiosk_teardown),
     // ── tui (RETIRED 2026-08-16) ── native so the answer needs no Python:
     // the web dashboard is the interactive UI; `noo chat` covers the
-    // terminal. Module archived at legacy/python-tui-reference/.
+    // terminal. Module was removed (history in git log before 2026-08-08).
     (&["tui"], commands::tui_retired),
 ];
 
@@ -768,6 +779,19 @@ const HIDDEN_NO_USAGE: &[&[&str]] = &[
     &["cluster", "exec"],
     &["cluster", "reconnect"],
     &["cluster", "sync-models"],
+    // Retired in 0.6.12 (i195 A7): phase 1 of sync-images, now `--stage-only`.
+    &["cluster", "stage-images"],
+    // Retired in 0.6.12 (i195 decision 1, D2): stubs that name the successor.
+    &["cluster", "up"],
+    &["cluster", "scale"],
+    &["cluster", "place-model"],
+    &["cluster", "auto-place"],
+    &["cluster", "reconcile-models"],
+    &["cluster", "mint-join-key"],
+    &["cluster", "assign"],
+    &["cluster", "add-companion"],
+    &["cluster", "add-monitor"],
+    &["proactive", "history"],
     &["stack", "install-watcher"],
     &["db", "stamp"],
     &["doctor", "backups"],
@@ -958,8 +982,8 @@ fn print_completions(shell: &str) -> i32 {
 
 /// Bare `noo --help`: the native banner, always. Every group Python's Typer
 /// tree listed is native now except `debug`, so the Rust side is the
-/// reference surface and Python's help (stale taglines, `noo-py` in the
-/// usage line) no longer represents the binary the user is holding.
+/// reference surface; the retired Python CLI's help no longer represents
+/// the binary the user is holding.
 /// Sections are editorial; a test pins every registry group to exactly one.
 const GROUP_SECTIONS: &[(&str, &[&str])] = &[
     ("Setup & host", &["whoami", "onboard", "enroll", "offboard", "upgrade", "doctor", "health", "migrate", "controller", "bundle", "systems", "addons", "kiosk", "backups"]),
@@ -969,13 +993,6 @@ const GROUP_SECTIONS: &[(&str, &[&str])] = &[
     ("Agents & channels", &["chat", "agents", "tasks", "workflow", "voice", "channels", "proactive", "approval", "mcp"]),
     ("Security", &["security", "auth"]),
 ];
-
-/// Top-level words the Python CLI still owns outright. Anything else that
-/// is not a registry group or a plugin is an unknown command and gets a
-/// native answer with suggestions instead of Python's "No such command".
-/// Empty since `debug` was retired 2026-09-03; kept so the next Python-only
-/// group (if one ever appears) has a declared home.
-const PYTHON_ONLY_GROUPS: &[&str] = &[];
 
 fn print_native_help(g: &Globals) {
     // The wordmark carries the tagline + version itself; the one-line
@@ -1050,17 +1067,7 @@ fn print_native_help(g: &Globals) {
         ])
     );
     println!();
-    if PYTHON_ONLY_GROUPS.is_empty() {
-        println!("{}", ui::muted("`noo <group> --help` lists each group's commands · `noo --version` · `noo completions <shell>`"));
-    } else {
-        println!(
-            "{}",
-            ui::muted(&format!(
-                "Python-only (dev venv): {}. `noo <group> --help` lists each group's commands.",
-                PYTHON_ONLY_GROUPS.join(", ")
-            ))
-        );
-    }
+    println!("{}", ui::muted("`noo <group> --help` lists each group's commands · `noo --version` · `noo completions <shell>`"));
 }
 
 fn group_desc(group: &str) -> &'static str {
@@ -1300,7 +1307,7 @@ pub struct Globals {
 
 /// The outcome of parsing an argv into a dispatch decision — the pure part of
 /// `main()`, factored out so it can be unit-tested without touching the
-/// process, the gateway, or Python. `main()` maps each variant to an action.
+/// process or the gateway. `main()` maps each variant to an action.
 #[derive(Debug, PartialEq)]
 pub enum Resolution {
     /// A native command matched. `prefix` is the exact registry entry (the
@@ -1310,13 +1317,12 @@ pub enum Resolution {
         prefix: &'static [&'static str],
         rest: Vec<String>,
     },
-    /// `--version` / `-V` — report our own version, no Python needed.
+    /// `--version` / `-V` — report our own version.
     Version,
     /// `completions <shell>` — emit a shell completion script. Native
     /// so it works with no Python present, and generated from the registry.
     Completions { shell: String, args: Vec<String> },
-    /// Bare `noo` or `--help`/`-h` — `main()` prints the native banner when no
-    /// Python is present, otherwise falls through to Python's rich help.
+    /// Bare `noo` or `--help`/`-h` — `main()` prints the native banner.
     Help,
     /// `--help`/`-h` after command words that match the native registry —
     /// rendered natively, ALWAYS (never Python): native commands must
@@ -1328,28 +1334,30 @@ pub enum Resolution {
     /// (PATH or the user plugins dir) — exec it with `args` (the ORIGINAL
     /// argv tokens after the command word, so a plugin sees its own flags
     /// verbatim; noo's global flags BEFORE the word are consumed by us).
-    /// Order is git-style: builtins → plugins → Python passthrough. A shim
-    /// can never shadow a known command word (native first words and the
-    /// PY_ONLY/DEV_ONLY-gated groups are reserved).
+    /// Order is git-style: builtins → plugins → unknown command. A shim
+    /// can never shadow a known command word (native first words are
+    /// reserved).
     Plugin { name: String, args: Vec<String> },
     /// A first word nothing built in owns and no plugin claims. An enabled
     /// add-on may bring a command group of that name: `main()` asks
     /// `commands::addon_cli`, and when no add-on has the group the word is an
-    /// unknown command, exactly as `Passthrough` would have treated it.
+    /// unknown command, exactly as `Unmatched` treats it.
     /// `rest` is the post-global-flag token stream.
     Addon { rest: Vec<String> },
-    /// Nothing we serve natively — exec the Python CLI with the original argv.
-    Passthrough,
+    /// Nothing we serve natively and no plugin claims it: a usage error
+    /// (exit 2), never an exec of anything.
+    /// Nothing matched. `rest` is the post-global-flag token stream, so the
+    /// unknown-command answer names the command words, never a `--gateway`
+    /// value typed ahead of them.
+    Unmatched { rest: Vec<String> },
 }
 
 /// Command words a plugin shim may never claim: every native group's first
-/// word, the Python-gated groups (PY_ONLY/DEV_ONLY first words — they carry
-/// their own standalone messages), and `py` (the Python CLI shim itself).
-/// This keeps the plugin fallback strictly ADDITIVE: it can only serve words
-/// the CLI would otherwise hand to Python as unknown.
+/// word, and `py` (the retired Python CLI's name; its console script
+/// in a dev venv is not a plugin). This keeps the plugin fallback strictly
+/// ADDITIVE: it can only serve words the CLI would otherwise call unknown.
 pub(crate) fn is_reserved_command_word(word: &str) -> bool {
     NATIVE.iter().any(|(words, _)| words.first() == Some(&word))
-        || passthrough::is_gated_first_word(word)
         || word == "py"
 }
 
@@ -1372,10 +1380,10 @@ fn subcommand_owns_timeout(rest: &[String]) -> bool {
 ///      [`Resolution::Native`] (first-match, not longest-match);
 ///   5. a non-reserved first word with a `noo-<word>` shim on the search
 ///      path → [`Resolution::Plugin`] (git order: builtins → plugins →
-///      Python);
+///      unknown command);
 ///   6. a non-reserved first word with no shim → [`Resolution::Addon`]
 ///      (an enabled add-on's command group, or an unknown command);
-///   7. otherwise [`Resolution::Passthrough`].
+///   7. otherwise [`Resolution::Unmatched`].
 ///
 /// `resolve` uses the real filesystem for step 5; [`resolve_with`] takes the
 /// shim-existence predicate as a parameter so the routing stays a pure,
@@ -1392,7 +1400,7 @@ pub fn resolve_with(
     // Pass 1: consume the global flags we own (they may appear anywhere);
     // everything else — command words, command flags, values — lands in
     // `rest` in order. Unknown tokens are NOT an error here: if they sit
-    // before the command words the registry match fails (→ Python), and
+    // before the command words the registry match fails (→ unknown command), and
     // after the command words the handler decides.
     let mut globals = Globals {
         json: false,
@@ -1436,7 +1444,7 @@ pub fn resolve_with(
             // Cross-instance targeting. Setting the env var (not a
             // Globals field) makes ONE resolution path serve everything —
             // envfile::instance(), the credential dir, container names,
-            // the port-offset default URL, and Python passthrough alike.
+            // and the port-offset default URL alike.
             "--instance" => {
                 if let Some(v) = iter.next() {
                     std::env::set_var("NOO_INSTANCE", v);
@@ -1460,8 +1468,7 @@ pub fn resolve_with(
         return (globals, Resolution::Version);
     }
 
-    // Bare `noo` / `noo --help` — `main()` decides between the native banner
-    // (no Python) and Python's rich help. No native command word is ever
+    // Bare `noo` / `noo --help` — `main()` prints the native banner. No native command word is ever
     // `--help`/`-h`, so skipping the registry match here is behaviour-neutral.
     let wants_help = argv.is_empty()
         || matches!(rest.first().map(String::as_str), Some("--help") | Some("-h"));
@@ -1473,8 +1480,8 @@ pub fn resolve_with(
     // native registry (as a group prefix or an exact command), help is served
     // natively — a standalone binary must describe its own commands, and a
     // broken venv must not turn `noo security pki issue --help` into a
-    // Python traceback (2026-08-16). Prefixes the registry doesn't know keep
-    // falling through to Python's rich Typer help.
+    // traceback (2026-08-16). Prefixes the registry doesn't know are
+    // unknown commands.
     if let Some(pos) = rest.iter().position(|t| t == "--help" || t == "-h") {
         let words = &rest[..pos];
         let known = !words.is_empty()
@@ -1529,7 +1536,7 @@ pub fn resolve_with(
         }
     }
 
-    (globals, Resolution::Passthrough)
+    (globals, Resolution::Unmatched { rest })
 }
 
 /// Look up the handler for a matched native `prefix`. The registry-integrity
@@ -1571,7 +1578,7 @@ fn main() {
     // their own commands (commands/addon_cli.rs). Nothing offering the group
     // leaves it the unknown command it was, handled below.
     let addon_words: Option<Vec<String>> = match &resolution {
-        Resolution::Addon { rest } => Some(rest.clone()),
+        Resolution::Addon { rest } | Resolution::Unmatched { rest } => Some(rest.clone()),
         _ => None,
     };
     if let Resolution::Addon { rest } = &resolution {
@@ -1600,10 +1607,8 @@ fn main() {
             println!("noo (noomesh CLI, alias: pai) {}", env!("CARGO_PKG_VERSION"));
             std::process::exit(0);
         }
-        // Bare `noo` / `noo --help` with no Python available: print a native
-        // banner listing the command groups this binary serves standalone,
-        // instead of failing. When Python IS present, fall through to its rich
-        // help (which also lists the passthrough commands).
+        // Bare `noo` / `noo --help`: print the native banner listing the
+        // command groups this binary serves.
         Resolution::Help => {
             print_native_help(&globals);
             std::process::exit(0);
@@ -1631,37 +1636,17 @@ fn main() {
                 }
                 Err(Unhandled) => {
                     // A native command that did not understand its
-                    // arguments is a USAGE error, full stop. It used to
-                    // fall through to the Python passthrough, which (with
-                    // PY_ONLY/DEV_ONLY empty) could only add a misleading
-                    // "no Python noo found" complaint after the usage line
-                    // (operator, 2026-09-03: `noo cluster place-model
-                    // host8 vllm …`). Print the usage, point at --help,
-                    // exit 2.
-                    let joined = prefix.join(" ");
-                    let (syntax, about) = usage::lookup(prefix).unwrap_or(("", ""));
-                    let usage_line = if syntax.is_empty() { format!("noo {joined}") } else { format!("noo {joined} {syntax}") };
-                    if globals.json {
-                        eprintln!(
-                            "{}",
-                            serde_json::json!({"error": format!("noo {joined} did not understand these arguments"), "code": "usage", "hint": usage_line})
-                        );
-                    } else {
-                        ui::failed(&format!("noo {joined} did not understand these arguments"), None);
-                        eprintln!("{}", ui::note(&format!("usage: {usage_line}")));
-                        if !about.is_empty() {
-                            eprintln!("{}", ui::note(about));
-                        }
-                        eprintln!("{}", ui::hint(&format!("noo {joined} --help")));
-                    }
-                    std::process::exit(output::ExitCode::Usage as i32);
+                    // arguments is a USAGE error, full stop: print the
+                    // usage, point at --help, exit 2 (nothing else is ever
+                    // exec'd).
+                    usage_error(globals.json, prefix);
                 }
             }
         }
         Resolution::Plugin { name, args } => {
             // Re-resolve name → path (resolve() only established existence).
-            // Vanished between resolve and here (unlikely race) → fall
-            // through to the Python passthrough like any unknown command.
+            // Vanished between resolve and here (unlikely race) → falls
+            // through to the unknown-command answer below.
             if let Some(path) = commands::plugins::find_plugin(&name) {
                 if globals.verbose {
                     eprintln!(
@@ -1686,17 +1671,14 @@ fn main() {
                     None,
                 );
             }
-            // fall through to the passthrough exec below.
+            // fall through to the unknown-command answer below.
         }
-        Resolution::Passthrough | Resolution::Addon { .. } => {
-            // A top-level word the registry, the plugin path AND the
-            // python-only list all disown is an unknown command. Answer it
-            // here with suggestions — Python's "No such command 'status'"
-            // was the only diagnostic before (2026-09-01), and on a
-            // python-less box it was "python_cli_not_found".
-            // (An add-on lookup that found nothing names its words from the
-            // global-flag-stripped stream: a `--gateway <url>` value ahead of
-            // the command is not the command.)
+        Resolution::Unmatched { .. } | Resolution::Addon { .. } => {
+            // A top-level word the registry and the plugin path both
+            // disown is an unknown command; a known group with a word it
+            // does not own gets that group's subcommands. Nothing is ever
+            // exec'd. Both carry the global-flag-stripped stream, so a
+            // `--gateway <url>` value ahead of the command is not the command.
             let words_src: &[String] = addon_words.as_deref().unwrap_or(&argv);
             let cmd_words: Vec<&str> = words_src
                 .iter()
@@ -1705,7 +1687,7 @@ fn main() {
                 .collect();
             if let Some(head) = cmd_words.first() {
                 let known_group = NATIVE.iter().any(|(entry, _)| entry.first() == Some(head));
-                if !known_group && !PYTHON_ONLY_GROUPS.contains(head) {
+                if !known_group {
                     let sugg = suggest(head);
                     let hint = if sugg.is_empty() {
                         "`noo --help` lists the command groups".to_string()
@@ -1720,68 +1702,93 @@ fn main() {
                         Some(&hint),
                     );
                 }
-                // Known group, unknown second word: Python may still own it
-                // (a handful of flags/variants do), so only hint, then
-                // fall through as before.
-                if known_group && cmd_words.len() >= 2 && !globals.json {
-                    let sub = cmd_words[1];
-                    let owned = NATIVE
-                        .iter()
-                        .any(|(entry, _)| entry.first() == Some(head) && entry.get(1) == Some(&sub));
-                    if !owned {
-                        let near: Vec<String> = NATIVE
-                            .iter()
-                            .filter(|(entry, _)| entry.first() == Some(head))
-                            .filter(|(entry, _)| entry.get(1).is_some_and(|w| w.starts_with(sub) || edit_distance(w, sub) <= 2))
-                            .map(|(entry, _)| format!("noo {}", entry.join(" ")))
-                            .take(4)
-                            .collect();
-                        if !near.is_empty() {
-                            eprintln!("noo: no native `{head} {sub}` — did you mean: {}", near.join(", "));
-                        }
-                    }
-                }
+                let start = words_src.iter().position(|t| t == head).unwrap_or(0);
+                unknown_under_group(globals.json, &words_src[start..]);
             }
         }
     }
 
-    // Not ours (or a native handler returned Unhandled, or Python-served help)
-    // — replace this process with the Python CLI. But a bare KNOWN GROUP on
-    // a box with no Python (standalone default) used to die with
-    // "python_cli_not_found" — the least helpful possible answer to `noo
-    // cluster` (finding #56). Render the native group help instead.
-    // Finding #56, third shape: a bare KNOWN GROUP on a python-less box
-    // gets the native group help as a PREFIX — then falls through so the
-    // passthrough's own tailored diagnosis (python-only vs developer-only
-    // vs unknown, each with its pinned wording and the exit-2
-    // python_cli_not_found contract) stays the authority. The first two
-    // shapes (early-exit 0, then early-exit 2 with a homemade note) each
-    // broke a different pinned contract; the help is additive, never a
-    // replacement.
-    if passthrough::python_cli_path().is_none() {
-        let cmd_words: Vec<String> = argv
-            .iter()
-            .filter(|t| !t.starts_with('-'))
-            .cloned()
-            .collect();
-        // An unknown subcommand/flag on a native group gets only the error
-        // (CLI_STYLE_GUIDE: an error is a `✗` line plus guidance); the full
-        // usage dump is for a bare group.
-        let misuse = passthrough::native_group_misuse(&argv).is_some() && argv.len() > 1;
-        if let Some(head) = cmd_words.first().filter(|_| !misuse) {
-            if NATIVE.iter().any(|(entry, _)| entry.first() == Some(&head.as_str())) {
-                print_native_help_for(&cmd_words);
-            }
-        }
-    }
-    if let Err(msg) = passthrough::exec_python(&argv) {
-        fail(
-            globals.json,
-            ExitCode::Usage,
-            "python_cli_not_found",
-            &msg,
-            Some(&passthrough::no_python_hint(&argv)),
+    // Reached only with no command word at all (a stray flag) or a plugin
+    // shim that vanished between resolve and exec. Same answer as any other
+    // unknown input: a usage error, exit 2, nothing exec'd.
+    let first = argv.first().map(String::as_str).unwrap_or("");
+    fail(
+        globals.json,
+        ExitCode::Usage,
+        "unknown_command",
+        &format!("unknown command `{first}`"),
+        Some("`noo --help` lists the command groups"),
+    );
+}
+
+/// A native command that did not understand its arguments: usage line,
+/// pointer at `--help`, exit 2 (`Err(Unhandled)` from a handler is the
+/// parser's "bad args" signal).
+fn usage_error(json: bool, prefix: &[&str]) -> ! {
+    let joined = prefix.join(" ");
+    let (syntax, about) = usage::lookup(prefix).unwrap_or(("", ""));
+    let usage_line = if syntax.is_empty() { format!("noo {joined}") } else { format!("noo {joined} {syntax}") };
+    if json {
+        eprintln!(
+            "{}",
+            serde_json::json!({"error": format!("noo {joined} did not understand these arguments"), "code": "usage", "hint": usage_line})
         );
+    } else {
+        ui::failed(&format!("noo {joined} did not understand these arguments"), None);
+        eprintln!("{}", ui::note(&format!("usage: {usage_line}")));
+        if !about.is_empty() {
+            eprintln!("{}", ui::note(about));
+        }
+        eprintln!("{}", ui::hint(&format!("noo {joined} --help")));
+    }
+    std::process::exit(output::ExitCode::Usage as i32);
+}
+
+/// `words` starts at a KNOWN native group word. Name the token that was
+/// wrong at the deepest level that parsed (`show` is not a subcommand of
+/// `noo cluster class`), list the real subcommands, exit 2.
+fn unknown_under_group(json: bool, words: &[String]) -> ! {
+    let Some(m) = usage::native_group_misuse(words) else {
+        fail(
+            json,
+            ExitCode::Usage,
+            "unknown_command",
+            &format!("unknown command `{}`", words.join(" ")),
+            Some("`noo --help` lists the command groups"),
+        );
+    };
+    let path: Vec<&str> = m.path.iter().map(String::as_str).collect();
+    let joined = path.join(" ");
+    let hint = match m.near {
+        Some(sub) => format!("did you mean `noo {joined} {sub}`?"),
+        None => format!("`noo {joined} --help` lists its subcommands"),
+    };
+    match m.unknown {
+        Some(tok) => {
+            let subs = usage::subcommands_under(&path);
+            fail(
+                json,
+                ExitCode::Usage,
+                "unknown_command",
+                &format!("unknown command `{tok}` under `noo {joined}` (subcommands: {})", subs.join(", ")),
+                Some(&hint),
+            )
+        }
+        // A complete command reached here only because something around it
+        // (a stray flag ahead of it) broke the parse.
+        None if usage::is_command(&path) => usage_error(json, &path),
+        None => {
+            if !json {
+                print_native_help_for(&m.path);
+            }
+            fail(
+                json,
+                ExitCode::Usage,
+                "unknown_command",
+                &format!("`noo {joined}` needs a subcommand"),
+                Some(&hint),
+            )
+        }
     }
 }
 
@@ -1960,7 +1967,7 @@ const SOURCES: &[(&str, &str)] = &[
     /// and not invent positional arguments it does not take. `noo cluster
     /// status` told the operator to run `noo cluster place-model <node>
     /// <backend> <model>`; the verb takes only a model, and the arity error
-    /// then fell through to "no Python CLI" (host8, 2026-09-03).
+    /// then died in an unrelated complaint (host8, 2026-09-03).
     #[test]
     fn hint_commands_name_real_verbs_with_real_arity() {
         let usage: std::collections::BTreeMap<Vec<&str>, usize> = usage::USAGE
@@ -2008,7 +2015,13 @@ const SOURCES: &[(&str, &str)] = &[
     #[test]
     fn retired_and_plumbing_cluster_verbs_are_hidden_and_issue_token_is_gone() {
         for w in [&["node", "fetch"][..], &["cluster", "clean-node"], &["cluster", "exec"],
-                  &["cluster", "reconnect"], &["cluster", "sync-models"]] {
+                  &["cluster", "reconnect"], &["cluster", "sync-models"],
+                  &["cluster", "up"], &["cluster", "scale"], &["cluster", "place-model"],
+                  &["cluster", "auto-place"], &["cluster", "reconcile-models"],
+                  &["cluster", "mint-join-key"], &["cluster", "assign"],
+                  &["cluster", "add-companion"], &["cluster", "add-monitor"],
+                  &["cluster", "stage-images"],
+                  &["proactive", "history"]] {
             assert!(NATIVE.iter().any(|(e, _)| e == &w), "{w:?} must still dispatch");
             assert!(is_hidden_native(w), "{w:?} must be out of customer help");
         }
@@ -2197,12 +2210,12 @@ const SOURCES: &[(&str, &str)] = &[
             "cluster add-node is retired — do not re-register it"
         );
         let (_, r) = resolve(&argv(&["cluster", "add-node", "x"]));
-        assert_eq!(r, Resolution::Passthrough);
+        assert!(matches!(r, Resolution::Unmatched { .. }));
     }
 
     #[test]
-    fn unported_command_passes_through() {
-        // No DEV_ONLY surface is left, so any unregistered word stands in.
+    fn an_unregistered_word_is_an_unknown_command() {
+        // Any unregistered word stands in.
         // (`db revision`/`debug` filled this role until 2026-09-03; `tui`
         // before 2026-08-16; `voice status` before WP-V.)
         let (_, r) = resolve(&argv(&["no-such-group"]));
@@ -2214,7 +2227,7 @@ const SOURCES: &[(&str, &str)] = &[
     #[test]
     fn voice_commands_resolve_native() {
         // WP-V: the voice group is native (thin HTTP to the gateway voice
-        // routes) — no longer PY_ONLY passthrough.
+        // routes).
         for words in [
             &["voice", "transcribe"][..],
             &["voice", "synthesize"][..],
@@ -2225,17 +2238,18 @@ const SOURCES: &[(&str, &str)] = &[
             let (_, r) = resolve(&argv(words));
             assert_eq!(native_prefix(&r), Some(words), "expected {words:?} native");
         }
-        // Bare `voice` (group help) still goes to Python.
+        // Bare `voice` is not a registry entry: unmatched (main prints the
+        // group's usage and exits 2).
         let (_, r) = resolve(&argv(&["voice"]));
-        assert_eq!(r, Resolution::Passthrough);
+        assert!(matches!(r, Resolution::Unmatched { .. }));
     }
 
     #[test]
-    fn bare_group_word_passes_through() {
+    fn bare_group_word_is_unmatched() {
         // `cluster` alone is not a registry entry (every cluster command has a
-        // second word), so it is not native — Python owns the group help.
+        // second word), so it is not native — main prints the group help, exit 2.
         let (_, r) = resolve(&argv(&["cluster"]));
-        assert_eq!(r, Resolution::Passthrough);
+        assert!(matches!(r, Resolution::Unmatched { .. }));
     }
 
     #[test]
@@ -2254,7 +2268,7 @@ const SOURCES: &[(&str, &str)] = &[
     #[test]
     fn help_after_native_words_is_native() {
         // A group prefix, an exact command, and an exact command with args
-        // all render native help — never Python (a broken venv must not turn
+        // all render native help — (a broken venv must not turn
         // `--help` into a traceback, 2026-08-16).
         for toks in [
             vec!["security", "--help"],
@@ -2286,7 +2300,7 @@ const SOURCES: &[(&str, &str)] = &[
     #[test]
     fn tui_is_native_and_retired() {
         // Retired 2026-08-16: answered natively (pointer message), never
-        // exec'd through to Python.
+        // treated as an unknown command.
         let (_, r) = resolve(&argv(&["tui"]));
         assert!(matches!(r, Resolution::Native { prefix, .. } if prefix == ["tui"]));
     }
@@ -2346,17 +2360,17 @@ const SOURCES: &[(&str, &str)] = &[
     }
 
     #[test]
-    fn unknown_flag_before_command_fails_match_and_passes_through() {
+    fn unknown_flag_before_command_fails_match_and_is_unmatched() {
         // A stray token ahead of the command words breaks the prefix match, so
-        // the whole thing goes to Python (which owns the full surface).
+        // the whole thing is unmatched (a usage error in main).
         let (_, r) = resolve(&argv(&["--bogus", "health"]));
-        assert_eq!(r, Resolution::Passthrough);
+        assert!(matches!(r, Resolution::Unmatched { .. }));
     }
 
     #[test]
     fn alias_prefixes_resolve_to_their_own_entry() {
         // `approval pending` is a distinct-words alias of `approval list`; it
-        // must resolve as its own native entry (not shadowed, not passthrough).
+        // must resolve as its own native entry (not shadowed).
         let (_, r) = resolve(&argv(&["approval", "pending"]));
         assert_eq!(native_prefix(&r), Some(&["approval", "pending"][..]));
     }
@@ -2392,7 +2406,7 @@ const SOURCES: &[(&str, &str)] = &[
     #[test]
     fn approval_decide_entries_resolve_native() {
         // WP-4a: the write side is native now — `approval approve/deny` must
-        // dispatch to the registry (thin HTTP to /decide), not passthrough.
+        // dispatch to the registry (thin HTTP to /decide).
         let (_, r) = resolve(&argv(&["approval", "approve", "req-1"]));
         assert_eq!(native_prefix(&r), Some(&["approval", "approve"][..]));
         let (_, r) = resolve(&argv(&["approval", "deny", "req-1", "--reason", "no"]));
@@ -2426,12 +2440,11 @@ const SOURCES: &[(&str, &str)] = &[
 
     #[test]
     fn reserved_words_are_never_plugins() {
-        // Native group first words (`cluster` bare = Python group help), the
-        // PY_ONLY/DEV_ONLY-gated groups, and `py` (the Python CLI shim) must
-        // pass through even when a same-named shim exists.
+        // Native group first words (`cluster` bare = group usage), and `py`
+        // (the retired Python CLI's name) must stay unmatched even when a same-named shim exists.
         for word in ["cluster", "voice", "plugins", "mcp", "py"] {
             let (_, r) = resolve_with(&argv(&[word]), |_| true);
-            assert_eq!(r, Resolution::Passthrough, "`{word}` must not dispatch as a plugin");
+            assert!(matches!(r, Resolution::Unmatched { .. }), "`{word}` must not dispatch as a plugin");
         }
     }
 
@@ -2454,20 +2467,20 @@ const SOURCES: &[(&str, &str)] = &[
         // A leading unknown flag is not a plugin candidate (and help/version
         // are handled before the plugin step).
         let (_, r) = resolve_with(&argv(&["--bogus", "health"]), |_| true);
-        assert_eq!(r, Resolution::Passthrough);
+        assert!(matches!(r, Resolution::Unmatched { .. }));
     }
 
     #[test]
     fn plugins_list_is_native() {
         // The `plugins list` registry entry (WP-PL) — must dispatch natively,
-        // not as a plugin and not to Python.
+        // not as a plugin.
         let (_, r) = resolve_with(&argv(&["plugins", "list"]), |_| true);
         assert_eq!(native_prefix(&r), Some(&["plugins", "list"][..]));
     }
 
     #[test]
     fn models_refresh_resolves_native() {
-        // WP-R: `models refresh` left PY_ONLY and went native — it must
+        // WP-R: `models refresh` is native — it must
         // dispatch to the registry entry, flags riding along in rest.
         let (_, r) = resolve(&argv(&["models", "refresh", "--backend", "vllm", "--llm"]));
         assert_eq!(native_prefix(&r), Some(&["models", "refresh"][..]));
@@ -2476,8 +2489,8 @@ const SOURCES: &[(&str, &str)] = &[
     #[test]
     fn mcp_entries_resolve_native() {
         // WP-M: `mcp tools` (hub-backed listing) and `mcp external-setup`
-        // (local token mint) are native; other `mcp …` argv still passes
-        // through to Python.
+        // (local token mint) are native; other `mcp …` argv is
+        // unmatched (usage error).
         let (_, r) = resolve(&argv(&["mcp", "tools"]));
         assert_eq!(native_prefix(&r), Some(&["mcp", "tools"][..]));
         let (_, r) = resolve(&argv(&["mcp", "external-setup", "--save"]));

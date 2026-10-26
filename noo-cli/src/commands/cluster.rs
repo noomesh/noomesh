@@ -7,11 +7,11 @@
 //!
 //! Every verb here is a gateway call, a local file operation, or a rail:
 //!
-//! * Inventory and state: status (`--watch`), show, fit, desired, place,
-//!   unplace, assign, set-config, seed, proposals, maintenance, forget,
-//!   clear-cooldowns, add-companion, add-monitor, init-secret (local, no
-//!   gateway call).
-//! * Backends: up, down, scale, restart-agent. The destructive ones use the
+//! * Inventory and state: status (`--watch`), show (with its alias
+//!   `desired`: the node in full, desired config and placements included),
+//!   fit, place, unplace, set-config, seed, proposals, maintenance, forget,
+//!   clear-cooldowns, init-secret (local, no gateway call).
+//! * Backends: down, restart-agent. The destructive ones use the
 //!   agent-first confirm contract in `commands::confirm_destructive`
 //!   (`--yes` skips; `--json` or a non-TTY never blocks on a prompt).
 //! * Node logs: `logs` reads the node-agent's log route through the gateway
@@ -19,7 +19,9 @@
 //! * Weights: `sync-model-files` queues a job on the dispatch rail that
 //!   fetches the files on the node itself.
 //! * Retired stubs that name their replacement instead of answering "unknown
-//!   command": exec, reconnect, clean-node, sync-models.
+//!   command": exec, reconnect, clean-node, sync-models, up, scale, assign,
+//!   add-companion, add-monitor, stage-images (i195 decision 1; stage-images is
+//!   `sync-images --stage-only`).
 //!
 //! Nothing in this crate reaches a node over SSH. The controller-to-node
 //! shell lane is retired; `tests/test_no_controller_ssh.py` is the full-tree
@@ -27,9 +29,10 @@
 //! only (no arbitrary exec). The `ssh_user` field survives only as inert
 //! node metadata, and `--ssh-user` is a named retired flag.
 //!
-//! The provisioning surface (auto-place, place-model, reconcile-models,
-//! sync-images, upgrade-agents, set-primary, mint-join-key, ship-model,
-//! clean) lives in `cluster_provision.rs`.
+//! The provisioning surface (sync-images, upgrade-agents, set-primary,
+//! ship-model, clean, invite, bootstrap-token) lives in
+//! `cluster_provision.rs`; its retired stubs (auto-place, place-model,
+//! reconcile-models, mint-join-key) live there too.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -229,7 +232,6 @@ fn cluster_status_once(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     ui::guide(&[
         ("noo cluster desired <node>", "the placements and config this node is meant to run"),
         ("noo cluster place <node> <backend> <model>", "assign a model to a node (desired state; the agent keeps it running)"),
-        ("noo cluster place-model <model> --apply", "let the scheduler pick the best node for a model"),
     ]);
     Ok(0)
 }
@@ -363,8 +365,6 @@ fn archive_node_pki(node: &str) -> Option<std::path::PathBuf> {
     std::fs::rename(&dir, &dest).ok().map(|()| dest)
 }
 
-/// `noo cluster desired NODE` — GET /api/cluster/nodes/{node}/desired-config.
-/// The DB-backed desired state the node-agent reconciles toward every 5 min.
 /// `noo cluster show <node>` — everything known about ONE node, in one place.
 ///
 /// `cluster status` is the fleet at a glance and cannot carry per-node depth;
@@ -378,6 +378,11 @@ fn archive_node_pki(node: &str) -> Option<std::path::PathBuf> {
 /// applied `exit 0` while installing the previous release's agent — and the
 /// only way to see it was to pipe `--json` and read `app_version` by eye.
 /// Agent version beside stack version is the first row here for that reason.
+///
+/// The last sections are the DB-backed desired state the node-agent reconciles
+/// toward every 5 min (GET /api/cluster/nodes/{node}/desired-config): config
+/// row and placements with ACTUAL beside DESIRED. `noo cluster desired` is an
+/// alias of this verb (i195 decision 1, A6).
 pub fn cluster_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let [node] = args else { return Err(Unhandled) };
     if node.starts_with('-') {
@@ -398,8 +403,15 @@ pub fn cluster_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ]);
         return Ok(1);
     };
+    // The desired config + placements (the former `cluster desired` view). A
+    // failed read leaves them off rather than failing the screen.
+    let desired = crate::http::get_json_try(g, &format!("/api/cluster/nodes/{}/desired-config", super::urlencode(node)), true, 10).ok();
     if g.json {
-        println!("{n}");
+        // Additive: the node row as before, plus the desired-config body
+        // under `desired` (null when it could not be read).
+        let mut out = n.clone();
+        out["desired"] = desired.clone().unwrap_or(serde_json::Value::Null);
+        println!("{out}");
         return Ok(0);
     }
 
@@ -535,15 +547,19 @@ pub fn cluster_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // The hardware each role runs on and the node's usage profile live in
     // the desired state; a failed read leaves them off rather than failing
     // the screen.
-    let desired = crate::http::get_json_try(g, &format!("/api/cluster/nodes/{}/desired-config", super::urlencode(node)), true, 10).ok();
-    if let Some(d) = desired.as_ref().filter(|d| d["node"].is_object()) {
-        println!("{}", ui::kv(&[("usage", usage_cell(&d["node"])), ("vendor CLIs", vendor_kinds_row(&d["node"]))]));
-    }
     println!("{}", ui::kv(&[("harness", harness_show_cell(n))]));
     print!("{}", role_capabilities_section_with(n, desired.as_ref().map(|d| &d["placements"])));
 
+    // ── desired state ───────────────────────────────────────────────────
+    match desired.as_ref() {
+        Some(d) => print_desired(node, d, n),
+        None => {
+            println!("{}", ui::section("Desired config"));
+            println!("{}", ui::muted("could not read the desired config from the gateway"));
+        }
+    }
+
     ui::guide(&[
-        (&format!("noo cluster desired {node}"), "the DB config row and placements this node converges to"),
         (&format!("noo cluster place {node} <backend> <model>"), "give it something to run"),
         (&format!("noo cluster logs {node}"), "the agent's own log"),
     ]);
@@ -673,24 +689,15 @@ pub(crate) fn role_capabilities_section_with(n: &serde_json::Value, placements: 
     out
 }
 
-pub fn cluster_desired(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let [node] = args else { return Err(Unhandled) };
-    if node.starts_with('-') {
-        return Err(Unhandled);
-    }
-    let body = get_json(
-        g,
-        &format!("/api/cluster/nodes/{}/desired-config", super::urlencode(node)),
-        true,
-        10,
-    );
-    if g.json {
-        println!("{body}");
-        return Ok(0);
-    }
+/// The desired-state half of `noo cluster show` (what `noo cluster desired`
+/// used to print on its own, i195 decision 1 A6: one implementation, `desired`
+/// is an alias): the DB config row and every placement, with the node's own
+/// ACTUAL beside the DESIRED. `body` is `/desired-config`, `node_live` the
+/// node's row from `/api/cluster/nodes`.
+fn print_desired(node: &str, body: &serde_json::Value, node_live: &serde_json::Value) {
     let n = &body["node"];
     let dash = ui::dash();
-    println!("{}", ui::header(node, Some("desired state")));
+    println!("{}", ui::section("Desired config"));
     if n.is_null() {
         println!("{}", ui::muted("no config row"));
         ui::guide(&[
@@ -754,10 +761,10 @@ pub fn cluster_desired(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
     let empty = Vec::new();
     let placements = body["placements"].as_array().unwrap_or(&empty);
-    println!("{}", ui::section("placements"));
+    println!("{}", ui::section("Placements"));
     if placements.is_empty() {
         println!("{}", ui::muted("no placements"));
-        return Ok(0);
+        return;
     }
     // ACTUAL beside DESIRED. `desired_state: running`
     // was read as "it is running" for half an hour while a harness failed
@@ -777,12 +784,6 @@ pub fn cluster_desired(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // its table, and a reader could reasonably conclude the node had
     // none. That happened on host3 (2026-09-21) and nearly cost a
     // needless re-placement of its vLLM backend.
-    let live = get_json(g, "/api/cluster/nodes", true, 10);
-    let node_live = live["nodes"]
-        .as_array()
-        .and_then(|ns| ns.iter().find(|n| n["id"].as_str() == Some(node.as_str())))
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
     let rows: Vec<Vec<String>> = placements
         .iter()
         .map(|p| {
@@ -805,7 +806,7 @@ pub fn cluster_desired(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 match role_state {
                     Some("missing") => ui::warn("model missing").to_string(),
                     Some("down") => ui::warn("not running").to_string(),
-                    _ => actual_cell(&node_live, backend, dash),
+                    _ => actual_cell(node_live, backend, dash),
                 },
             ]
         })
@@ -827,21 +828,28 @@ pub fn cluster_desired(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             &rows,
         )
     );
-    if let Some(r) = refusal_for(&node_live, "harness") {
+    if let Some(r) = refusal_for(node_live, "harness") {
         println!();
         ui::warned(&format!("harness: {r}"));
     }
     // Why a model is missing, with the command that fixes it.
     for p in placements {
         let backend = p["backend"].as_str().unwrap_or("?");
-        if backend_model_missing(&node_live, backend) {
-            if let Some(r) = refusal_for(&node_live, backend) {
+        if backend_model_missing(node_live, backend) {
+            if let Some(r) = refusal_for(node_live, backend) {
                 println!();
                 ui::warned(&format!("{backend}: {r}"));
             }
         }
     }
-    Ok(0)
+}
+
+
+/// `noo cluster desired <node>` — an alias of `noo cluster show <node>` (i195
+/// decision 1, A6). `show` carries the desired config and placements as its
+/// last sections, so the name stays and there is one implementation.
+pub fn cluster_desired(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    cluster_show(g, args)
 }
 
 /// Parsed `noo cluster proposals` surface.
@@ -1156,7 +1164,7 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 if let Err(se) = crate::commands::image_stage::stage_and_record(g, &img, &arch, "place") {
                     crate::output::fail(g.json, crate::output::ExitCode::Generic, "image_not_staged",
                         &format!("could not stage {img} for {arch}: {se}"),
-                        Some(&format!("noo cluster stage-images -i {img} --arch {arch}")));
+                        Some(&format!("noo cluster sync-images --stage-only -i {img} --arch {arch}")));
                 }
             }
             // Placed again after staging, or the refusal surfaces through the
@@ -2060,214 +2068,8 @@ pub fn cluster_down(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
     ui::guide(&[
         ("noo cluster status", "RUNNING column confirms the backend is gone from the node"),
-        (&format!("noo cluster up {backend} <model>"), "brings it back on the scheduler's pick"),
+        (&format!("noo cluster place <node> {backend} <model>"), "declares it again"),
     ]);
-    Ok(0)
-}
-
-/// `noo cluster scale BACKEND -r/--replicas N [-m/--model M] [-y/--yes]` —
-/// multi-step orchestration, faithful to the Python sequence:
-///   1. GET /api/cluster/nodes → count nodes whose `running_backends`
-///      (map or list) contains BACKEND.
-///   2. Scale UP:   POST /api/cluster/backends/start ×(N-current) with
-///      {backend, model}; warn + stop trying on the first failure.
-///      No confirm (matches Python — starting replicas isn't destructive).
-///   3. Scale DOWN: confirm ("scale down {backend} by {k} replica(s)?"),
-///      then POST /api/cluster/backends/stop per least-loaded node
-///      (sorted by the `load` field ascending); warn + continue per node.
-/// Exit code stays 0 on per-replica warnings (Python parity); `--json`
-/// emits a `{backend, current_replicas, target_replicas, started, stopped,
-/// errors}` summary (Python has no JSON mode here).
-pub fn cluster_scale(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut backend: Option<String> = None;
-    let mut replicas: Option<i64> = None;
-    let mut model = "default".to_string();
-    let mut yes = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "-r" | "--replicas" => {
-                replicas = Some(iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?)
-            }
-            "-m" | "--model" => model = iter.next().ok_or(Unhandled)?.clone(),
-            "-y" | "--yes" => yes = true,
-            t if t.starts_with('-') => return Err(Unhandled),
-            t if backend.is_none() => backend = Some(t.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let Some(backend) = backend else { return Err(Unhandled) };
-    // --replicas is required in Python; missing → let Python print the usage error.
-    let Some(replicas) = replicas else { return Err(Unhandled) };
-
-    let body = get_json(g, "/api/cluster/nodes", true, 10);
-    let empty = Vec::new();
-    let mut with_backend: Vec<&serde_json::Value> = body["nodes"]
-        .as_array()
-        .unwrap_or(&empty)
-        .iter()
-        .filter(|n| match &n["running_backends"] {
-            serde_json::Value::Object(m) => m.contains_key(&backend),
-            serde_json::Value::Array(a) => a.iter().any(|b| b.as_str() == Some(backend.as_str())),
-            _ => false,
-        })
-        .collect();
-    let current = with_backend.len() as i64;
-
-    if !g.json {
-        print!("{}", ui::kv(&[("current replicas", current.to_string()), ("target replicas", replicas.to_string())]));
-    }
-
-    let mut started: Vec<serde_json::Value> = Vec::new();
-    let mut stopped: Vec<serde_json::Value> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-
-    if replicas > current {
-        let to_start = replicas - current;
-        if !g.json {
-            ui::step(&format!("scaling up by {to_start}"));
-        }
-        let start_body = serde_json::json!({"backend": backend, "model": model});
-        for i in 0..to_start {
-            match post_json_try(g, "/api/cluster/backends/start", &start_body, true, 60) {
-                Ok(resp) => {
-                    if !g.json {
-                        println!("{}", ui::sub(&ui::status_line(Glyph::Ok, &format!(
-                            "started replica on {}",
-                            resp["node_hostname"].as_str().unwrap_or("?")
-                        ))));
-                    }
-                    started.push(resp);
-                }
-                Err(e) => {
-                    let msg = format!("could not start replica {}: {e}", i + 1);
-                    if !g.json {
-                        println!("{}", ui::sub(&ui::status_line(Glyph::Err, &msg)));
-                    }
-                    errors.push(msg);
-                    break; // Python parity: give up after the first failed start
-                }
-            }
-        }
-    } else if replicas < current {
-        let to_stop = (current - replicas) as usize;
-        super::confirm_destructive(
-            g,
-            yes,
-            "scale down",
-            &format!("{backend} by {to_stop} replica(s)"),
-        );
-        if !g.json {
-            ui::step(&format!("scaling down by {to_stop}"));
-        }
-        // Stop least-loaded nodes first (Python sorts by `load` ascending).
-        with_backend.sort_by(|a, b| {
-            let la = a["load"].as_f64().unwrap_or(0.0);
-            let lb = b["load"].as_f64().unwrap_or(0.0);
-            la.partial_cmp(&lb).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for n in with_backend.iter().take(to_stop) {
-            let id = n["id"].as_str().unwrap_or("?");
-            let stop_body = serde_json::json!({"backend": backend, "node_id": n["id"]});
-            match post_json_try(g, "/api/cluster/backends/stop", &stop_body, true, 60) {
-                Ok(resp) => {
-                    if !g.json {
-                        println!("{}", ui::sub(&ui::status_line(Glyph::Ok, &format!("stopped replica on {id}"))));
-                    }
-                    stopped.push(resp);
-                }
-                Err(e) => {
-                    let msg = format!("failed to stop on {id}: {e}");
-                    if !g.json {
-                        println!("{}", ui::sub(&ui::status_line(Glyph::Err, &msg)));
-                    }
-                    errors.push(msg);
-                }
-            }
-        }
-    } else if !g.json {
-        ui::done("already at target replica count");
-    }
-
-    if !g.json && replicas != current {
-        let reached = current + started.len() as i64 - stopped.len() as i64;
-        if errors.is_empty() {
-            ui::close_done(&format!("{backend} at {reached} replica(s)"));
-        } else {
-            ui::close_warned(&format!("{backend} at {reached} replica(s), target {replicas} — {} error(s)", errors.len()));
-        }
-        ui::guide(&[
-            ("noo cluster status", "RUNNING column shows where each replica landed"),
-            (&format!("noo cluster scale {backend} --replicas {replicas}"), "re-run to converge if any replica failed"),
-        ]);
-    }
-
-    if g.json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "backend": backend,
-                "current_replicas": current,
-                "target_replicas": replicas,
-                "started": started,
-                "stopped": stopped,
-                "errors": errors,
-            })
-        );
-    }
-    Ok(0)
-}
-
-/// `noo cluster up BACKEND MODEL [--node NODE] [--replicas N]` —
-/// POST /api/cluster/backends/start, once per replica (Python parity).
-/// NOTE: legacy imperative path — the desired-state reconciler
-/// (`noo cluster place`) is the preferred way to run persistent backends.
-pub fn cluster_up(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut positional: Vec<String> = Vec::new();
-    let mut node: Option<String> = None;
-    let mut replicas: u64 = 1;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--node" => node = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--replicas" => {
-                replicas = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?
-            }
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => positional.push(t.to_string()),
-        }
-    }
-    let [backend, model] = positional.as_slice() else { return Err(Unhandled) };
-    let mut body = serde_json::json!({"backend": backend, "model": model});
-    if let Some(nid) = &node {
-        body["node_id"] = serde_json::json!(nid);
-    }
-    let mut responses: Vec<serde_json::Value> = Vec::new();
-    for _ in 0..replicas.max(1) {
-        // Failure exits here with the typed code (5 on gateway error) —
-        // partial-success output for earlier replicas already printed.
-        let resp = post_json(g, "/api/cluster/backends/start", &body, true, 60);
-        if g.json {
-            responses.push(resp);
-            continue;
-        }
-        let mut label = resp["node_hostname"]
-            .as_str()
-            .or_else(|| resp["node_id"].as_str())
-            .unwrap_or("?")
-            .to_string();
-        if let Some(ip) = resp["ip_address"].as_str().filter(|s| !s.is_empty()) {
-            label = format!("{label} ({ip})");
-        }
-        ui::done(&format!("started {backend} ({model}) on {label}"));
-    }
-    if g.json {
-        if responses.len() == 1 {
-            println!("{}", responses[0]);
-        } else {
-            println!("{}", serde_json::Value::Array(responses));
-        }
-    }
     Ok(0)
 }
 
@@ -2365,221 +2167,6 @@ pub fn cluster_init_secret(g: &Globals, args: &[String]) -> Result<i32, Unhandle
         ("noo cluster push-secrets", "converges every worker onto the controller's value"),
     ]);
     Ok(0)
-}
-
-// ── assign (scheduler dispatch) ─────────────────────────────────────
-
-/// Map a priority word to the scheduler's numeric scale, or parse a number.
-///
-/// The queue is a Redis sorted set scored `-priority`, so HIGHER runs sooner
-/// (`scheduler_engine.rs:454`). The route's own default is 5.
-fn assign_priority(raw: &str) -> Option<i64> {
-    match raw {
-        "low" => Some(3),
-        "medium" | "normal" => Some(5),
-        "high" => Some(8),
-        n => n.parse::<i64>().ok(),
-    }
-}
-
-/// `noo cluster assign TASK [--node N] [--backend B] [--priority P]
-/// [--model M] [--dry-run] [--async]` — CHOOSE a node, then PIN the task to
-/// it.
-///
-/// The two halves are the point. Selection is local and deterministic: the
-/// least-loaded online node, after the `--node` / `--backend` filters.
-/// Execution then submits an `inference` job with `force_node` set to that
-/// same node, so the box named by `--dry-run` is the box that runs the work.
-///
-/// It used to POST `/api/chat/completions` — Python's endpoint, which this
-/// gateway has never served (it serves `/v1/chat/completions`), so every
-/// non-dry-run invocation was an honest 404. Repointing it at the chat route
-/// would not have been enough: the coordinator resolves its own backend, so
-/// the selected node would have been decoration. `/api/jobs/submit` takes
-/// `force_node` and the scheduler dispatches to exactly that node
-/// (`admin.rs:1391`, `scheduler_engine.rs`), which is what "assign" claims to
-/// do. Same rail as `noo jobs run --node`; assign is the version that picks
-/// the node for you.
-pub fn cluster_assign(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut task: Option<String> = None;
-    let mut node: Option<String> = None;
-    let mut backend: Option<String> = None;
-    let mut model: Option<String> = None;
-    let mut priority_raw = "medium".to_string();
-    let mut dry_run = false;
-    let mut async_mode = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--node" => node = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--backend" => backend = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--model" => model = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--priority" => priority_raw = iter.next().ok_or(Unhandled)?.clone(),
-            "--dry-run" => dry_run = true,
-            "--async" | "-a" => async_mode = true,
-            t if t.starts_with('-') => return Err(Unhandled),
-            t if task.is_none() => task = Some(t.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let Some(task) = task else { return Err(Unhandled) };
-    let Some(priority) = assign_priority(&priority_raw) else {
-        fail(
-            g.json,
-            ExitCode::Generic,
-            "bad_priority",
-            &format!("Unknown priority '{priority_raw}' — use low, medium, high, or a number"),
-            None,
-        );
-    };
-
-    // ── Select. Identical for dry-run and execute: the printed decision and
-    // the pinned node come from the same code path, never two that can drift.
-    let mut nodes = online_nodes(g);
-    if nodes.is_empty() {
-        fail(g.json, ExitCode::Generic, "no_nodes", "No online nodes available", None);
-    }
-    if let Some(want) = &node {
-        nodes.retain(|n| n["id"].as_str() == Some(want) || n["hostname"].as_str() == Some(want));
-        if nodes.is_empty() {
-            fail(
-                g.json,
-                ExitCode::Generic,
-                "node_not_found",
-                &format!("Node '{want}' not found or offline"),
-                None,
-            );
-        }
-    }
-    if let Some(b) = &backend {
-        let matching: Vec<serde_json::Value> = nodes
-            .iter()
-            .filter(|n| running_backends_contains(n, b))
-            .cloned()
-            .collect();
-        if !matching.is_empty() {
-            nodes = matching;
-        } else if !g.json {
-            ui::warned(&format!("no nodes currently running {b}"));
-        }
-    }
-    nodes.sort_by(|a, b| {
-        let la = a["load"].as_f64().unwrap_or(1.0);
-        let lb = b["load"].as_f64().unwrap_or(1.0);
-        la.partial_cmp(&lb).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let selected = nodes[0].clone();
-    let selected_id = selected["id"].as_str().unwrap_or_default().to_string();
-    if selected_id.is_empty() {
-        fail(
-            g.json,
-            ExitCode::Generic,
-            "node_without_id",
-            "Selected node has no id — cannot pin a job to it",
-            None,
-        );
-    }
-
-    if dry_run {
-        if g.json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "dry_run": true,
-                    "selected": selected,
-                    "backend": backend.clone().unwrap_or_else(|| "auto".into()),
-                    "priority": priority,
-                })
-            );
-            return Ok(0);
-        }
-        let running = match &selected["running_backends"] {
-            serde_json::Value::Object(m) => m.keys().cloned().collect::<Vec<_>>().join(", "),
-            serde_json::Value::Array(a) => {
-                a.iter().filter_map(|b| b.as_str()).collect::<Vec<_>>().join(", ")
-            }
-            _ => String::new(),
-        };
-        println!("{}", ui::header("routing decision", Some("dry run")));
-        print!(
-            "{}",
-            ui::kv(&[
-                ("node", selected_id.clone()),
-                ("tier", format!("tier {}", selected["tier"].as_i64().unwrap_or(3))),
-                ("gpu", selected["gpu_model"].as_str().unwrap_or("CPU").to_string()),
-                ("load", load_cell(&selected["load"])),
-                ("running backends", if running.is_empty() { ui::dash().to_string() } else { running }),
-                ("backend", backend.as_deref().unwrap_or("auto").to_string()),
-                ("priority", format!("{priority} ({priority_raw})")),
-            ])
-        );
-        ui::guide(&[(
-            "noo cluster assign <task> --priority <p>",
-            "runs it, pinned to the node named above",
-        )]);
-        return Ok(0);
-    }
-
-    // ── Execute. `force_node` is the whole reason this is a job and not a
-    // chat completion: the coordinator picks its own backend, the scheduler
-    // does not.
-    let timeout = g.timeout_secs.unwrap_or(300);
-    let mut payload = serde_json::json!({ "prompt": task });
-    if let Some(m) = &model {
-        payload["model"] = serde_json::json!(m);
-    }
-    let body = serde_json::json!({
-        "type": "inference",
-        "payload": payload,
-        "priority": priority,
-        "backend": backend,
-        "force_node": selected_id,
-        "timeout_sec": timeout,
-    });
-    // 30s is the SUBMIT timeout, not the job's: the route returns as soon as
-    // the job is queued. `timeout_sec` above is what the job itself gets.
-    let data = post_json(g, "/api/jobs/submit", &body, true, 30);
-    let Some(job_id) = data["job_id"].as_str().map(str::to_string) else {
-        fail(
-            g.json,
-            ExitCode::Generic,
-            "bad_response",
-            &format!("gateway returned no job_id: {data}"),
-            None,
-        );
-    };
-
-    if async_mode {
-        if g.json {
-            println!("{}", serde_json::json!({"job_id": job_id, "node": selected_id}));
-        } else {
-            ui::done(&format!("assigned to {selected_id}"));
-            ui::value(&job_id);
-            ui::guide(&[
-                (&format!("noo jobs status {job_id} --wait"), "block until it finishes and print the result"),
-                ("noo jobs list", "see it in the queue alongside everything else"),
-            ]);
-        }
-        return Ok(0);
-    }
-
-    if !g.json {
-        ui::step(&format!("job {job_id} assigned to {selected_id}, waiting for result"));
-    }
-    match super::jobs::poll_job(g, &job_id, timeout) {
-        Some(job) => Ok(super::jobs::report_terminal_job(g, &job)),
-        None => Ok(super::jobs::report_poll_timeout(g, &job_id, timeout)),
-    }
-}
-
-
-/// True when a node's `running_backends` (map or list) contains `backend`.
-fn running_backends_contains(n: &serde_json::Value, backend: &str) -> bool {
-    match &n["running_backends"] {
-        serde_json::Value::Object(m) => m.contains_key(backend),
-        serde_json::Value::Array(a) => a.iter().any(|b| b.as_str() == Some(backend)),
-        _ => false,
-    }
 }
 
 // ── set-config / clear-cooldowns ────────────────────────────────────
@@ -2800,165 +2387,103 @@ pub fn cluster_clear_cooldowns(g: &Globals, args: &[String]) -> Result<i32, Unha
     Ok(0)
 }
 
-// ── add-companion / add-monitor (self-register via gateway) ─────────
+// ── up / scale / assign / add-companion / add-monitor (RETIRED, i195) ─
 
-/// `noo cluster add-companion NODE_ID [--platform P] [--hostname H] [--ip A]
-/// [--sensors s,s] [--backends b,b] [--battery N] [--network T]
-/// [--npu-tops N] [--app-version V]` — register a Tier-5 companion device
-/// via POST /api/cluster/nodes/register, then send an initial heartbeat.
-pub fn cluster_add_companion(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut node_id: Option<String> = None;
-    let mut platform = "android".to_string();
-    let mut hostname: Option<String> = None;
-    let mut ip = "0.0.0.0".to_string();
-    let mut sensors = String::new();
-    let mut backends = "llamacpp".to_string();
-    let mut battery = 100.0_f64;
-    let mut network = "wifi".to_string();
-    let mut npu_tops = 0.0_f64;
-    let mut app_version = "cli-manual".to_string();
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        macro_rules! next {
-            () => {
-                iter.next().ok_or(Unhandled)?.clone()
-            };
-        }
-        match tok.as_str() {
-            "-p" | "--platform" => platform = next!(),
-            "--hostname" => hostname = Some(next!()),
-            "--ip" => ip = next!(),
-            "-s" | "--sensors" => sensors = next!(),
-            "-b" | "--backends" => backends = next!(),
-            "--battery" => battery = next!().parse().map_err(|_| Unhandled)?,
-            "-n" | "--network" => network = next!(),
-            "--npu-tops" => npu_tops = next!().parse().map_err(|_| Unhandled)?,
-            "--app-version" => app_version = next!(),
-            t if t.starts_with('-') => return Err(Unhandled),
-            t if node_id.is_none() => node_id = Some(t.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let Some(node_id) = node_id else { return Err(Unhandled) };
-    let hostname = hostname.unwrap_or_else(|| node_id.clone());
-    let sensor_list: Vec<String> =
-        sensors.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).map(String::from).collect();
-    let backend_list: Vec<String> =
-        backends.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).map(String::from).collect();
-
-    let payload = serde_json::json!({
-        "node_id": node_id,
-        "hostname": hostname,
-        "ip_address": ip,
-        "capabilities": {
-            "cpu_cores": 4,
-            "ram_gb": 4.0,
-            "gpu_model": serde_json::Value::Null,
-            "vram_gb": 0.0,
-            "is_arm": platform == "android" || platform == "ios",
-            "backends": backend_list,
-            "tools": [],
-            "tier": 5,
-            "npu_tops": npu_tops,
-            "platform": platform,
-            "app_version": app_version,
-            "sensors": sensor_list,
-            "power_budget_watts": 5.0,
-        },
-    });
-    let resp = post_json(g, "/api/cluster/nodes/register", &payload, true, 10);
-    // Initial heartbeat (best-effort — device shows online).
-    let hb = serde_json::json!({
-        "load": 0.0,
-        "running_backends": {},
-        "battery_pct": battery,
-        "is_charging": true,
-        "network_type": network,
-        "thermal_state": "nominal",
-        "active_sensors": sensor_list,
-    });
-    let _ = post_json_try(
-        g,
-        &format!("/api/cluster/nodes/{}/heartbeat", super::urlencode(&node_id)),
-        &hb,
-        true,
-        5,
+/// `noo cluster up` — RETIRED (i195 decision 1, A1). The imperative start
+/// route raced the desired-state reconciler; `place` declares the backend and
+/// the node-agent converges to it. (Kept in dispatch for one release so an old
+/// runbook gets this answer instead of "unknown command".)
+pub fn cluster_up(g: &Globals, _args: &[String]) -> Result<i32, Unhandled> {
+    fail(
+        g.json,
+        ExitCode::Generic,
+        "retired_command",
+        "up is retired: it started a backend imperatively, outside the desired state \
+         the node-agent converges to",
+        Some(
+            "declare a backend:  noo cluster place <node> <backend> <model>\n  \
+             stop one:           noo cluster unplace <node> <backend>",
+        ),
     );
-    if g.json {
-        println!("{resp}");
-        return Ok(0);
-    }
-    ui::done(&format!("companion device registered: {node_id} (platform={platform}, tier 5)"));
-    print!("{}", ui::kv(&[
-        ("  sensors", if sensor_list.is_empty() { ui::dash().to_string() } else { sensor_list.join(", ") }),
-        ("  backends", backend_list.join(", ")),
-    ]));
-    Ok(0)
 }
 
-/// `noo cluster add-monitor NODE_ID [--hostname H] [--ip A] [--services s,s]`
-/// — register a Tier-6 monitoring node via POST /api/cluster/nodes/register,
-/// then send an initial heartbeat.
-pub fn cluster_add_monitor(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut node_id: Option<String> = None;
-    let mut hostname: Option<String> = None;
-    let mut ip = "0.0.0.0".to_string();
-    let mut services = String::new();
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        macro_rules! next {
-            () => {
-                iter.next().ok_or(Unhandled)?.clone()
-            };
-        }
-        match tok.as_str() {
-            "--hostname" => hostname = Some(next!()),
-            "--ip" => ip = next!(),
-            "-s" | "--services" => services = next!(),
-            t if t.starts_with('-') => return Err(Unhandled),
-            t if node_id.is_none() => node_id = Some(t.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let Some(node_id) = node_id else { return Err(Unhandled) };
-    let hostname = hostname.unwrap_or_else(|| node_id.clone());
-    let service_list: Vec<String> =
-        services.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).map(String::from).collect();
-
-    let payload = serde_json::json!({
-        "node_id": node_id,
-        "hostname": hostname,
-        "ip_address": ip,
-        "capabilities": {
-            "cpu_cores": 4,
-            "ram_gb": 2.0,
-            "gpu_model": serde_json::Value::Null,
-            "vram_gb": 0.0,
-            "is_arm": true,
-            "backends": [],
-            "tools": service_list,
-            "tier": 6,
-        },
-    });
-    let resp = post_json(g, "/api/cluster/nodes/register", &payload, true, 10);
-    let hb = serde_json::json!({"load": 0.0, "running_backends": {}});
-    let _ = post_json_try(
-        g,
-        &format!("/api/cluster/nodes/{}/heartbeat", super::urlencode(&node_id)),
-        &hb,
-        true,
-        5,
+/// `noo cluster scale` — RETIRED (i195 decision 1, A1). Replica counts were
+/// the imperative start/stop loop; declare each placement instead.
+pub fn cluster_scale(g: &Globals, _args: &[String]) -> Result<i32, Unhandled> {
+    fail(
+        g.json,
+        ExitCode::Generic,
+        "retired_command",
+        "scale is retired: it started and stopped replicas imperatively, outside the \
+         desired state the node-agent converges to",
+        Some(
+            "one more replica:   noo cluster place <node> <backend> <model>\n  \
+             one fewer:          noo cluster unplace <node> <backend>",
+        ),
     );
-    if g.json {
-        println!("{resp}");
-        return Ok(0);
-    }
-    ui::done(&format!("monitor node registered: {node_id} (tier 6)"));
-    print!("{}", ui::kv(&[("  services", if service_list.is_empty() { ui::dash().to_string() } else { service_list.join(", ") })]));
-    Ok(0)
+}
+
+/// `noo cluster assign` — RETIRED (i195 decision 1, A4). It picked the
+/// least-loaded node and submitted a pinned job; `jobs run --node` is the same
+/// rail with the node named by you.
+pub fn cluster_assign(g: &Globals, _args: &[String]) -> Result<i32, Unhandled> {
+    fail(
+        g.json,
+        ExitCode::Generic,
+        "retired_command",
+        "assign is retired: it was `jobs run --node` with a load-based node pick",
+        Some(
+            "pin a job to a node:  noo jobs run <prompt> --node <node>\n  \
+             see load per node:   noo cluster status",
+        ),
+    );
+}
+
+/// `noo cluster add-companion` — RETIRED (i195 decision 1, A5). Tier-5
+/// devices join through the agent like every node and register themselves on
+/// the first heartbeat; a hand-registered row had no agent behind it.
+pub fn cluster_add_companion(g: &Globals, _args: &[String]) -> Result<i32, Unhandled> {
+    fail(
+        g.json,
+        ExitCode::Generic,
+        "retired_command",
+        "add-companion is retired: a companion device joins through the agent like \
+         every node, and registers itself on its first heartbeat",
+        Some("on the device:  noo enroll --url <controller-url> --token <token>"),
+    );
+}
+
+/// `noo cluster add-monitor` — RETIRED (i195 decision 1, A5); same reason and
+/// successor as `add-companion`.
+pub fn cluster_add_monitor(g: &Globals, _args: &[String]) -> Result<i32, Unhandled> {
+    fail(
+        g.json,
+        ExitCode::Generic,
+        "retired_command",
+        "add-monitor is retired: a monitor node joins through the agent like every \
+         node, and registers itself on its first heartbeat",
+        Some("on the device:  noo enroll --url <controller-url> --token <token>"),
+    );
 }
 
 // ── clean-node (RETIRED container-era verb) ─────────────────────────
+
+/// `noo cluster stage-images` — RETIRED (i195 A7). It was phase 1 of
+/// `sync-images` under its own name; `sync-images --stage-only` is the same
+/// operation with the same flags. Answers with the exact equivalent for one
+/// release, then goes. (`noo upgrade` stages through the shared function in
+/// image_stage.rs, not through this verb.)
+pub fn cluster_stage_images(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let rest = if args.is_empty() { "--lock".to_string() } else { args.join(" ") };
+    let hint = format!("noo cluster sync-images --stage-only {rest}");
+    fail(
+        g.json,
+        ExitCode::Generic,
+        "retired_command",
+        "cluster stage-images is retired: it is phase 1 of sync-images, now one verb with --stage-only",
+        Some(&hint),
+    );
+}
 
 /// `noo cluster clean-node` — RETIRED (fu72 #4). The old body root-SSHed
 /// docker greps that match NOTHING on a pull-architecture node (native
@@ -3024,7 +2549,7 @@ pub fn cluster_sync_models(g: &Globals, _args: &[String]) -> Result<i32, Unhandl
 
 /// `noo cluster exec` — RETIRED 2026-09-11.
 ///
-/// It only ever existed as a `noo-py` verb that ssh'd into the node and ran
+/// It only ever existed as a Python-CLI verb that ssh'd into the node and ran
 /// a shell command. There is no rail replacement and that is deliberate:
 /// the node-agent exposes named operations (`/start`, `/stop`, `/restart`,
 /// `/pull`, `/clean`, `/logs/*`, skills) and NO arbitrary-exec endpoint. An
@@ -3891,24 +3416,6 @@ mod seed_tests {
         assert!(y.get("tls").is_none(), "falsy tls omitted (Python `or None`)");
         assert!(y.get("env").is_none(), "empty env omitted (Python `or None`)");
     }
-
-    #[test]
-    fn assign_priority_words_map_to_the_schedulers_scale() {
-        // Higher runs sooner (the queue is scored `-priority`), so `high`
-        // must be ABOVE the route's default of 5 and `low` below it — a
-        // mapping that inverted these would quietly deprioritise the urgent
-        // work while still reporting success.
-        assert_eq!(assign_priority("low"), Some(3));
-        assert_eq!(assign_priority("medium"), Some(5));
-        assert_eq!(assign_priority("normal"), Some(5));
-        assert_eq!(assign_priority("high"), Some(8));
-        assert_eq!(assign_priority("7"), Some(7), "a bare number passes through");
-        // Unknown words are rejected rather than silently defaulted: a typo
-        // like `--priority hihg` must not run at normal priority pretending
-        // it was honoured.
-        assert_eq!(assign_priority("urgent"), None);
-        assert_eq!(assign_priority(""), None);
-    }
 }
 
 #[cfg(test)]
@@ -4008,7 +3515,8 @@ mod authenticated_fleet_reads_tests {
     fn no_fleet_read_goes_out_without_a_credential() {
         let src = include_str!("cluster.rs");
         let calls = src.matches("\"/api/cluster/nodes\"").count();
-        assert!(calls >= 8, "expected the fleet endpoint to be read here, found {calls}");
+        // Nine readers in 2026-09; i195 decision 1 retired two of them (2026-10-23).
+        assert!(calls >= 7, "expected the fleet endpoint to be read here, found {calls}");
         let unauthenticated: Vec<&str> = src
             .lines()
             .filter(|l| l.contains("\"/api/cluster/nodes\", false"))

@@ -3,7 +3,7 @@
 
 [package]
 name = "noo-cli"
-version = "0.6.10"
+version = "0.6.11"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "pai — Rust front-door CLI for Mesh. Native fast paths for agent-hot commands; everything else passes through to the Python CLI."
@@ -27,7 +27,7 @@ libc = "0.2"
 # `security pki` — X.509 issuance with ca.py profile fidelity (see src/pki.rs).
 # sha1 is REQUIRED for RFC 5280 method-1 key identifiers (python-cryptography
 # parity); rcgen itself only offers RFC 7093 SHA-2 key IDs.
-rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 x509-parser = "0.18"
 sha1 = "0.11"
 # "formatting" also serves `config export-effective`'s generated_at stamp.
@@ -52,7 +52,7 @@ webpki-root-certs = "1"
 # ratatui 0.30's crossterm feature links, so no duplicate-crate mismatch).
 ratatui = "0.30"
 crossterm = "0.29"
-rustyline = "18"
+rustyline = "19"
 
 # tests/recovery_rehearsal.rs serves a TLS mock gateway that asks for a
 # client certificate (the operator's). Same rustls + ring the

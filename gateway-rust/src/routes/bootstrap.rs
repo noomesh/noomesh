@@ -1061,13 +1061,13 @@ async fn enroll_tailnet(
         // i11a: the TLS cause lives in the source chain, not in Display.
         let chain = crate::addon_proxy::error_chain(&e);
         tracing::warn!(agent = %agent_base, error = %chain, "tailnet enroll: controller self-agent call failed");
-        AppError::Internal(format!(
+        AppError::Upstream(format!(
             "controller self-agent unreachable at {agent_base}: {chain} — is noo-node-agent running on the controller host, and does its cert name this host?"
         ))
     })?
     .json()
     .await
-    .map_err(|e| AppError::Internal(format!("self-agent whois: bad response: {e}")))?;
+    .map_err(|e| AppError::Upstream(format!("self-agent whois: bad response: {e}")))?;
     let required_tag = std::env::var("NOO_ENROLL_TAILNET_TAG")
         .ok()
         .filter(|t| !t.trim().is_empty())
@@ -1097,7 +1097,7 @@ async fn enroll_tailnet(
         .and_then(|n| n.split('.').next())
         .map(str::to_string)
         .filter(|n| !n.is_empty())
-        .ok_or_else(|| AppError::Internal("self-agent whois returned no name".into()))?;
+        .ok_or_else(|| AppError::Upstream("self-agent whois returned no name".into()))?;
 
     // 2. dialback: prove the caller OWNS the claimed address.
     let db_resp: Value = link
@@ -1109,10 +1109,10 @@ async fn enroll_tailnet(
         }))
         .send()
         .await
-        .map_err(|e| AppError::Internal(format!("self-agent dialback failed: {e}")))?
+        .map_err(|e| AppError::Upstream(format!("self-agent dialback failed: {e}")))?
         .json()
         .await
-        .map_err(|e| AppError::Internal(format!("self-agent dialback: bad response: {e}")))?;
+        .map_err(|e| AppError::Upstream(format!("self-agent dialback: bad response: {e}")))?;
     if db_resp["ok"].as_bool() != Some(true) {
         tracing::info!(ip = %body.tailnet_ip, reason = %db_resp["reason"],
             "tailnet enroll: dialback did not verify");

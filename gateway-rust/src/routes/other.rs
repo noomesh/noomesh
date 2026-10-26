@@ -24,6 +24,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 
+use crate::measured::{put_into, Measured};
 use crate::state::AppState;
 use super::{AppJson, AppError, AppResult};
 
@@ -123,13 +124,15 @@ async fn coordinator_context(
     });
 
     // Active sessions: count from Postgres
-    let session_count = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM noo_conversations \
-         WHERE started_at > NOW() - INTERVAL '24 hours'"
-    )
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
+    let session_count = Measured::from_result_in(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM noo_conversations \
+             WHERE started_at > NOW() - INTERVAL '24 hours'"
+        )
+        .fetch_one(&state.db)
+        .await,
+        "cannot count noo_conversations",
+    );
 
     // Redis cache status
     let redis_status = state.redis.state().as_str();
@@ -143,18 +146,19 @@ async fn coordinator_context(
         (strip_backend_topology(&backend_info), Vec::new())
     };
 
-    Ok(Json(json!({
+    let mut body = json!({
         "status": "running",
         "backend": backend_info,
         "coordinator_config": coordinator_config,
         "gossip_peers": peer_count,
         "peer_details": peer_summaries,
-        "active_sessions_24h": session_count,
         "redis": redis_status,
         "tool_schemas_loaded": tool_count,
         "runbooks_loaded": state.runbooks.len(),
         "engine": "rust",
-    })))
+    });
+    put_into(&mut body, "active_sessions_24h", session_count);
+    Ok(Json(body))
 }
 
 // ── MCP status (native Rust) ──────────────────────────────────────
@@ -316,10 +320,10 @@ async fn device_action(
         Ok(resp) => {
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
-            Err(AppError::Internal(format!("Device returned {status}: {text}")))
+            Err(AppError::Upstream(format!("Device returned {status}: {text}")))
         }
         Err(e) => {
-            Err(AppError::Internal(format!("Device unreachable: {e}")))
+            Err(AppError::Upstream(format!("Device unreachable: {e}")))
         }
     }
 }

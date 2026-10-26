@@ -113,7 +113,7 @@ async fn resolve_embedding_model(state: &Arc<AppState>) -> Option<String> {
 /// someone. History is untouched: this is a read-time fix, and rewriting
 /// prior attribution would be the destructive way to get the same number.
 async fn storage_stats(State(state): State<Arc<AppState>>) -> AppResult {
-    let row = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+    let (total, embedded, unembedded, unique_users) = sqlx::query_as::<_, (i64, i64, i64, i64)>(
         "SELECT COUNT(*) AS total, \
                 COUNT(embedding) AS embedded, \
                 (COUNT(*) - COUNT(embedding)) AS unembedded, \
@@ -123,32 +123,23 @@ async fn storage_stats(State(state): State<Arc<AppState>>) -> AppResult {
                           ON l.channel_user_id = c.user_id) AS unique_users \
          FROM noo_entries"
     )
-    .fetch_optional(&state.db)
+    // An aggregate always returns exactly one row.
+    .fetch_one(&state.db)
     .await?;
 
     let emb_model = resolve_embedding_model(&state).await;
 
-    match row {
-        Some((total, embedded, unembedded, unique_users)) => Ok(Json(json!({
-            "storage": "postgresql",
-            "total_records": total,
-            "embedded_records": embedded,
-            "unembedded_records": unembedded,
-            "unique_users": unique_users,
-            // Was a literal `true`. Now derived from the same resolution
-            // /api/memory/embed-status reports.
-            "embeddings_enabled": emb_model.is_some(),
-            "embedding_model": emb_model,
-            "ready_for_indexing": unembedded > 0,
-        }))),
-        None => Ok(Json(json!({
-            "storage": "postgresql",
-            "total_records": 0,
-            "embedded_records": 0,
-            "unembedded_records": 0,
-            "unique_users": 0,
-        }))),
-    }
+    Ok(Json(json!({
+        "storage": "postgresql",
+        "total_records": total,
+        "embedded_records": embedded,
+        "unembedded_records": unembedded,
+        "unique_users": unique_users,
+        // Derived from the same resolution /api/memory/embed-status reports.
+        "embeddings_enabled": emb_model.is_some(),
+        "embedding_model": emb_model,
+        "ready_for_indexing": unembedded > 0,
+    })))
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -401,7 +392,6 @@ async fn memory_status(State(state): State<Arc<AppState>>) -> AppResult {
                 "unique_users": users,
                 "oldest_record": oldest.map(|dt| dt.to_rfc3339()),
                 "newest_record": newest.map(|dt| dt.to_rfc3339()),
-                // Was a literal `true`; see resolve_embedding_model.
                 "embeddings_enabled": emb_model.is_some(),
                 "embedding_model": emb_model,
                 "ready_for_indexing": unembedded > 0,
@@ -621,7 +611,10 @@ async fn relationships(
         }
         // Table might not exist yet — graceful degradation
         Err(e) if e.to_string().contains("does not exist") => {
-            Ok(Json(json!({"source_id": record_id, "relationships": [], "count": 0})))
+            let mut body = json!({"source_id": record_id, "relationships": []});
+            crate::measured::put_into(&mut body, "count", crate::measured::Measured::<usize>::unmeasured(
+                "cannot measure — the relationships table does not exist yet"));
+            Ok(Json(body))
         }
         Err(e) => Err(AppError::Internal(format!("Database error: {e}"))),
     }
@@ -1330,9 +1323,8 @@ pub(crate) fn drain_step(reply: &Value) -> DrainStep {
 /// entries embedded for three weeks while search answered "no relevant
 /// context". The working path, `worker.memory.batch_index`, had no caller.
 async fn embed_start(State(state): State<Arc<AppState>>) -> AppResult {
-    let Some(redis) = state.redis.as_ref() else {
-        return Ok(Json(json!({"status": "error", "error": "Redis unavailable: the drain's start/stop flag has nowhere to live"})));
-    };
+    // The drain's start/stop flag lives in Redis: nowhere to put it, no start.
+    let redis = crate::redis_or_unavailable::redis_or_unavailable(&state)?;
     if redis.get_string(EMBED_STATE_KEY).await.as_deref() == Some("running") {
         return Ok(Json(json!({"status": "already_running"})));
     }
@@ -1368,13 +1360,10 @@ async fn embed_start(State(state): State<Arc<AppState>>) -> AppResult {
 /// POST /api/memory/embed/stop
 /// Set embedding worker state to "stopped" via Redis flag.
 async fn embed_stop(State(state): State<Arc<AppState>>) -> AppResult {
-    match state.redis.as_ref() {
-        Some(redis) => {
-            redis.set_string(EMBED_STATE_KEY, "stopped").await;
-            Ok(Json(json!({"status": "stopped"})))
-        }
-        None => Ok(Json(json!({"status": "stopped", "warning": "Redis unavailable, flag not persisted"}))),
-    }
+    // A stop that cannot write the flag has not stopped anything.
+    let redis = crate::redis_or_unavailable::redis_or_unavailable(&state)?;
+    redis.set_string(EMBED_STATE_KEY, "stopped").await;
+    Ok(Json(json!({"status": "stopped"})))
 }
 
 /// GET /api/memory/embed/status

@@ -3,12 +3,13 @@
 
 import { useQuery, useMetisClient } from '@metis/core';
 import { relTime } from '@/lib/format';
+import { num, sumOrNull } from '@/lib/num';
 import type { ClusterNode } from './types';
 import { readGpuContention } from './gpuContention';
 
 export interface ClusterView {
   nodes: ClusterNode[];
-  stats: { total: number; online: number; busy: number; offline: number; vramGb: number };
+  stats: { total: number; online: number; busy: number; offline: number; vramGb: number | null };
 }
 
 /** Live cluster state from GET /api/cluster/nodes, polled every 15s (as legacy). */
@@ -30,7 +31,7 @@ export function useClusterNodes() {
         id: n.id ?? '',
         hostname: n.hostname || n.id || '(unknown)',
         ip: n.ip || n.ip_address || '',
-        tier: n.tier ?? 0,
+        tier: num(n.tier),
         status: n.status ?? 'offline',
         gpu: n.gpu_model || undefined,
         vramTotal: n.vram_gb ?? undefined,
@@ -41,7 +42,8 @@ export function useClusterNodes() {
         gpuContention: readGpuContention(n),
       }));
 
-      const vramGb = nodes.reduce((s, n) => s + (n.vramTotal ?? 0), 0);
+      // Fleet VRAM is null if ANY node did not report its VRAM: a partial sum is a wrong number.
+      const vramGb = sumOrNull(...nodes.map((n) => n.vramTotal ?? null));
       const stats = data.stats;
       return {
         nodes,

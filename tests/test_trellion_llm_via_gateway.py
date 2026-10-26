@@ -47,9 +47,7 @@ def test_worker_llm_callers_send_a_purpose_to_the_gateway() -> None:
     assert "llm_model = llm_purposes.KNOWLEDGE" in pool and "llm_url = llm_purposes.gateway_url()" in pool
     graph = (ROOT / "src/noomesh/workers/graph.py").read_text()
     assert '"model": llm_purposes.GRAPH' in graph and '"llm_url": llm_purposes.gateway_url()' in graph
-    orch = (ROOT / "src/noomesh/agents/orchestrator.py").read_text()
-    assert "base_url=llm_purposes.gateway_url()" in orch
-    for src, name in ((pool, "worker_pool"), (graph, "graph"), (orch, "orchestrator")):
+    for src, name in ((pool, "worker_pool"), (graph, "graph")):
         assert 'getenv("PAGEINDEX_LLM' not in src and 'environ.get("PAGEINDEX_LLM' not in src, name
         assert "noo-vllm:8000" not in src and 'os.getenv("VLLM_MODEL"' not in src, name
     rs = (ROOT / "gateway-rust/src/coordinator/classes.rs").read_text()

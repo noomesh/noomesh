@@ -171,6 +171,20 @@ lock reads: "add-on `<name>` is enabled in noomesh.yaml but has no verified lock
 for this stack ... Run `noo addons upgrade <name>`". A lock verified for another
 stack is refused the same way, naming both stacks.
 
+When `noo stack start|restart` cannot verify an add-on's pin for the running
+stack (a lock for another stack, a bad signature, edited bundle files, an
+expired development key, its image not local), it leaves **that add-on** out of
+the start and starts the rest: it prints `REFUSED add-on <name>: <why>` with the
+remedy (`noo addons upgrade <name>`, or `noo addons disable <name>`), does not
+compose its overlay, hands the gateway none of its bundle declarations, stops a
+container left from an earlier start, and ends with "Services started WITHOUT
+add-on(s) <name>". The add-on is absent from `NOO_ADDONS_VERIFIED`, so its
+routes are refused (even from a `routes.json` an earlier start left in the
+routes volume), and it is named in `NOO_ADDONS_REFUSED`, so the systems broker
+runs no DDL for it. `noo addons list|show` read it as refused and the
+`add-on pins` row of `noo cluster verify --controller` fails naming it. A
+`stack.lock` that is missing or for another tag still refuses the whole start.
+
 Names are lowercase letters, digits, `-` and `_`, starting with a letter (at
 most 32). A name with `-` reads its upstream override from the variable with `_`
 (`pai-voice` reads `NOO_PAI_VOICE_URL`; the host stays `noo-pai-voice`) and may
@@ -1282,6 +1296,57 @@ in the gateway log. A missing password skips the system (ERROR in the log,
 Your data-owning service runs on the controller, on the private database
 network, and connects as `noo_<id>` (migrations as `noo_<id>_ddl`) to the
 `noomesh` database with the cluster CA. Nodes never connect to Postgres.
+
+### Provisioning the database without starting the add-on
+
+While you develop, you need your schema and roles before any service of yours
+may run (a connected-database acceptance test from a private runner, say).
+`--provision-only` does exactly that and nothing else:
+
+```bash
+noo addons trust-key your-addon <pubkey> --registry <root> --dev --expires 14d
+noo addons enable your-addon --lock ./lock.json --provision-only      # add --json for the receipt as JSON
+```
+
+It verifies the signed lock and bundle exactly as a plain `enable` does (it
+refuses `--force`, a development checkout that pins no stack tag, and a bundle
+without `system.json`), mints the two role passwords when absent, and has the
+gateway's own broker create the schema and the two roles for that one system.
+The broker is not reimplemented: `docker exec -i noo-gateway noo-gateway
+provision-system` runs the function the gateway runs at boot, over the system
+read from the verified bundle, with the passwords on stdin. Nothing is
+composed or started, no gateway key is issued, no NATS principal is rendered,
+and the gateway is not restarted.
+
+The add-on's switch (`addons.<name>`) is never written, so a later `noo stack
+restart --force` composes none of its services; the state is recorded beside
+the pins (`addon-provisioned/<name>.json`, names and a lock hash only) and
+`noo addons show`, `noo addons list` and `noo cluster verify` word it
+**provisioned (services not started)**. A plain `noo addons enable <name>`
+afterwards finds the credentials, roles and pin waiting and turns it fully on.
+Running the command again changes nothing that exists.
+
+The receipt (names and paths only; no value is ever printed) gives the
+database (`noomesh` on `postgres:5432`), the schema and both roles, the
+private Docker network to attach a runner to (the `noo-db` network of this
+stack), and the read-only credential files under
+`/run/noo/provision/<name>/` (`/dev/shm/noo-provision-<uid>/<name>/` when not
+root, or `$NOO_PROVISION_RUNDIR`; tmpfs only, gone at reboot, rewritten by a
+re-run): `ca.crt`, `client.crt` / `client.key` (the add-on's own service leaf),
+and one libpq `pgpass.<role>` per role. Run a runner as your own uid, on that
+network only, with nothing published:
+
+```bash
+docker run --rm -i --network <network> --user "$(id -u):$(id -g)" \
+  --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges \
+  -v /run/noo/provision/<name>:/run/noo-db:ro \
+  -e PGHOST=postgres -e PGPORT=5432 -e PGDATABASE=noomesh -e PGUSER=noo_<id> \
+  -e PGSSLMODE=verify-full -e PGSSLROOTCERT=/run/noo-db/ca.crt \
+  -e PGSSLCERT=/run/noo-db/client.crt -e PGSSLKEY=/run/noo-db/client.key \
+  -e PGPASSFILE=/run/noo-db/pgpass.noo_<id> <image> <command>
+```
+
+Use `PGUSER=noo_<id>_ddl` with `pgpass.noo_<id>_ddl` for migrations.
 
 ## Declaring workloads
 

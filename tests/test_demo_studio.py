@@ -142,3 +142,57 @@ def test_an_unknown_cache_command_fails_without_touching_docker():
     assert r.returncode == 1 and "unknown cache command" in r.stderr
     r = subprocess.run([BASH, str(DEMO / "studio.sh"), "--help"], capture_output=True, text=True)
     assert "studio.sh cache up" in r.stdout
+
+
+def test_the_studio_inspects_containers_only():
+    """`docker inspect NAME` also matches a volume of that name, and the cache
+    volume is called noo-demo-cache: a seeded volume made `cache up` refuse the
+    studio's own cache (2026-10-24). Every inspect names the type."""
+    studio = (DEMO / "studio.sh").read_text()
+    code = "\n".join(l for l in studio.splitlines() if not l.lstrip().startswith("#"))
+    inspects = re.findall(r"docker inspect\b[^\n]*", code)
+    assert inspects, "no docker inspect in studio.sh?"
+    bare = [i for i in inspects if "--type container" not in i]
+    assert not bare, bare
+
+
+def test_the_gif_is_made_from_the_mp4_streaming_and_the_recorder_is_capped():
+    """vhs's GIF render holds every frame for one palette: killed at 7 GB,
+    crashed a WSL2 host twice. The real tape outputs the MP4 only, the
+    recorder makes the GIF from it with a palette per frame (streaming), and
+    the recorder container has a memory cap. The smoke tape keeps both
+    outputs: it is seconds long and proves the vhs GIF path still works."""
+    tape = (DEMO / "onboarding.tape.in").read_text()
+    outputs = re.findall(r"^Output (\S+)$", tape, re.M)
+    assert outputs == ["demo-out/onboarding.mp4"], outputs
+    assert "Set WaitTimeout 60m" in tape, "a cold onboard pulled for 40 min; 30 m ran out twice"
+    rec = (DEMO / "record-onboarding.sh").read_text()
+    assert 'gif_from_mp4 "$OUT/onboarding.mp4" "$OUT/onboarding.gif"' in rec
+    body = rec.split("gif_from_mp4() {", 1)[1].split("\n}\n", 1)[0]
+    assert "palettegen=stats_mode=single" in body and "paletteuse=new=1" in body, body
+    assert "palettegen=stats_mode=diff" not in body and "palettegen[" not in body, "a global palette buffers every frame"
+    smoke = (DEMO / "smoke.tape.in").read_text()
+    assert re.findall(r"^Output (\S+)$", smoke, re.M) == ["demo-out/smoke.gif", "demo-out/smoke.mp4"]
+    studio = (DEMO / "studio.sh").read_text()
+    assert re.search(r'docker run --rm --name "\$REC" .*--memory "\$\{NOO_STUDIO_REC_MEM:-6g\}"', studio), "the recorder has no memory cap"
+    assert 'CACHE_IMAGE="${NOO_STUDIO_CACHE_IMAGE:-registry:3}"' in studio
+
+
+def test_the_cut_script_and_the_tape_after_take_seven():
+    """Take 7 (2026-10-24) taught three things the files now carry: a cut
+    script that speeds up and captions the network stretches instead of
+    refilming; a chat prompt the small first model answers; and
+    `noo stack status` in place of `noo cluster status`, which reads
+    "no nodes" in a box without systemd."""
+    cut = DEMO / "cut.sh"
+    assert cut.is_file() and cut.stat().st_mode & 0o111, "cut.sh must be executable"
+    text = cut.read_text()
+    assert "drawtext=textfile=" in text and "setpts=(PTS-STARTPTS)/$sp" in text and "concat=n=" in text
+    assert "SPDX-License-Identifier" in text
+    r = subprocess.run(["bash", str(cut)], capture_output=True, text=True)
+    assert r.returncode == 2 and "START END SPEED" in r.stderr, (r.returncode, r.stderr[:200])
+    tape = (DEMO / "onboarding.tape.in").read_text()
+    typed = [a or b for a, b in re.findall(r"^Type `(noo [^`]*)` Enter$|^Type \"(noo [^\"]*)\" Enter$", tape, re.M)]
+    assert "noo stack status" in typed and "noo cluster status" not in typed, typed
+    assert not any("what can you do on this machine" in t for t in typed), "the prompt gemma4:e2b misread"
+    assert any(t.startswith("noo chat --message") and "noomesh" in t for t in typed), typed

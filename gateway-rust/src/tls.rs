@@ -211,10 +211,33 @@ impl ClientTimeouts {
     }
 }
 
+/// The Mozilla root set as reqwest certificates, parsed once.
+fn bundled_roots() -> &'static [reqwest::Certificate] {
+    static ROOTS: OnceLock<Vec<reqwest::Certificate>> = OnceLock::new();
+    ROOTS.get_or_init(|| {
+        webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .filter_map(|c| reqwest::Certificate::from_der(c.as_ref()).ok())
+            .collect()
+    })
+}
+
+/// A `reqwest::Client::builder()` that trusts BOTH root stores: the system
+/// store (reqwest 0.13's default verifier is rustls-platform-verifier) and
+/// the bundled Mozilla roots, merged in with `tls_certs_merge`. reqwest 0.13
+/// has no bundled-roots feature, and the platform verifier alone refuses to
+/// build a client on an image with no CA bundle ("No CA certificates were
+/// loaded from the system"); the merged roots also make that case work.
+/// Every public-internet or system-trust client here starts from this. The
+/// cluster client does not: it trusts only the cluster CA.
+pub fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().tls_certs_merge(bundled_roots().iter().cloned())
+}
+
 /// A plain (system-trust, no client identity) client with `t`. For tests
 /// and the fallback when the cluster TLS material cannot be loaded.
 pub fn plain_client(t: ClientTimeouts) -> reqwest::Client {
-    t.apply(reqwest::Client::builder()).build().unwrap_or_default()
+    t.apply(client_builder()).build().unwrap_or_default()
 }
 
 /// Shared intra-cluster client: cluster CA + mTLS identity, one connection
@@ -296,11 +319,11 @@ pub fn loopback_client() -> reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
-            let mut b = reqwest::Client::builder()
+            let mut b = client_builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .connect_timeout(std::time::Duration::from_secs(5));
             match cluster_ca_certificate() {
-                Ok(Some(cert)) => b = b.add_root_certificate(cert),
+                Ok(Some(cert)) => b = b.tls_certs_merge([cert]),
                 Ok(None) => {}
                 Err(e) => tracing::warn!(
                     error = %e,
@@ -382,13 +405,13 @@ pub const FAILOVER_CONNECT_SECS: u64 = 5;
 fn build_https_client_with(timeouts: ClientTimeouts) -> Result<reqwest::Client> {
     match cluster_rustls_config()? {
         Some(cfg) => {
-            let builder = timeouts.apply(reqwest::Client::builder()).use_preconfigured_tls((*cfg).clone());
+            let builder = timeouts.apply(reqwest::Client::builder()).tls_backend_preconfigured((*cfg).clone());
             Ok(builder.build()?)
         }
         None => {
             // No custom TLS — use defaults
             tracing::info!("TLS: using system trust store (no cluster CA)");
-            Ok(timeouts.apply(reqwest::Client::builder()).build()?)
+            Ok(timeouts.apply(client_builder()).build()?)
         }
     }
 }
@@ -732,7 +755,7 @@ mod loopback_verification_tests {
     /// `NOO_TLS_CA` is process-global; `cargo test` runs these on threads.
     pub(super) static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn issue(ca_cn: &str, san: &str) -> (rcgen::CertifiedKey, rcgen::CertifiedKey) {
+    fn issue(ca_cn: &str, san: &str) -> (rcgen::CertifiedKey<rcgen::KeyPair>, rcgen::CertifiedKey<rcgen::KeyPair>) {
         let mut ca_params = rcgen::CertificateParams::new(vec![ca_cn.to_string()]).unwrap();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         // DISTINCT subject DNs. rcgen defaults every DN to "rcgen self signed
@@ -750,19 +773,19 @@ mod loopback_verification_tests {
         leaf_params.distinguished_name.push(rcgen::DnType::CommonName, san);
         let leaf_key = rcgen::KeyPair::generate().unwrap();
         let leaf_cert = leaf_params
-            .signed_by(&leaf_key, &ca_cert, &ca_key)
+            .signed_by(&leaf_key, &rcgen::Issuer::from_params(&ca_params, &ca_key))
             .unwrap();
         (
-            rcgen::CertifiedKey { cert: ca_cert, key_pair: ca_key },
-            rcgen::CertifiedKey { cert: leaf_cert, key_pair: leaf_key },
+            rcgen::CertifiedKey { cert: ca_cert, signing_key: ca_key },
+            rcgen::CertifiedKey { cert: leaf_cert, signing_key: leaf_key },
         )
     }
 
     /// A one-shot HTTPS listener presenting `leaf`. Returns its port.
-    async fn serve(leaf: &rcgen::CertifiedKey) -> u16 {
+    async fn serve(leaf: &rcgen::CertifiedKey<rcgen::KeyPair>) -> u16 {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
         let cert = CertificateDer::from(leaf.cert.der().to_vec());
-        let key = PrivateKeyDer::try_from(leaf.key_pair.serialize_der()).unwrap();
+        let key = PrivateKeyDer::try_from(leaf.signing_key.serialize_der()).unwrap();
         let cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert], key)

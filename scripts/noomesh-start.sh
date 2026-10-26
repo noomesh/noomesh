@@ -427,6 +427,9 @@ _data_root="${NOO_DATA_ROOT:-}"
 if [ -z "$_data_root" ] && [ -f ".env" ]; then
     _data_root="$(grep -E '^[[:space:]]*NOO_DATA_ROOT=' .env | tail -1 | cut -d= -f2- | tr -d ' \t\r"')"
 fi
+# The sensitive state set (redis, grafana, ...) lives under NOO_STATE_ROOT,
+# which defaults to the data root (i10a); the re-own below follows it.
+_state_root="$(noo_state_root)"
 if [ -z "$_data_root" ]; then
     ui_warned "NOO_DATA_ROOT is not set — compose will refuse to start"
     ui_note "pin one path: run 'noo onboard --only storage', or set NOO_DATA_ROOT in .env"
@@ -490,6 +493,8 @@ if [ -n "${DIST_TAG:-}" ]; then
     # the add-on and `noo addons upgrade`, before anything is pulled or
     # recreated. The launcher never pulls an add-on. Off add-ons are not
     # looked at.
+    # An add-on whose pin does not verify for this tag is left out of the
+    # start (REFUSED, by name, with its remedy); the rest starts.
     DIST_MODE=1 require_addon_pins || exit 1
 else
     # A dev start: composed add-on overlays run the dev build's names.
@@ -528,6 +533,14 @@ check_system_credentials || exit 1
 # A plaintext-.env install is refused before anything is pulled or
 # recreated; the message names the sops remedy.
 check_secrets_at_rest || exit 1
+# An install whose state lives on the encrypted volume (i10a) is refused
+# while that volume is not open: the services would start on an empty dir.
+source "$SCRIPT_DIR/lib-state-volume.sh"
+check_state_volume_open || exit 1
+# ...and a start whose data root is not on the filesystem it was recorded on
+# (a missing data disk must never let postgres initialise an empty database).
+source "$SCRIPT_DIR/lib-data-root-mount.sh"
+check_data_root_mount || exit 1
 
 # Parse arguments
 PROFILE=""
@@ -906,7 +919,7 @@ require_compose_v2 || exit 1
     reown_stop_service() { docker compose $COMPOSE_FILES $PROFILE_ARGS stop "$1" >/dev/null 2>&1; }
     if [ -n "$_data_root" ]; then
         # shellcheck disable=SC2046  # one service name per word
-        reown_nonroot_dirs "$_data_root" $(printf '%s\n' "$ACTIVE_SVCS" | grep -xE 'redis|grafana' || true) || exit 1
+        reown_nonroot_dirs "${_state_root:-$_data_root}" $(printf '%s\n' "$ACTIVE_SVCS" | grep -xE 'redis|grafana' || true) || exit 1
     fi
     # The voice add-on mounts the controller's staged models read-only
     # (<MODELS_DIR>/voice/{whisper,piper}, i105). `noo models pull` and
@@ -945,7 +958,10 @@ require_compose_v2 || exit 1
         docker compose $COMPOSE_FILES -f "$(addons_trellion_overlay)" stop trellion 2>/dev/null || true
     fi
     # Licensed add-ons switched off: stop the services their overlay adds.
-    addons_stop_disabled
+    # Add-ons refused this start (require_addon_pins): a container left from
+    # an earlier start must not keep running. Only services an add-on OWNS
+    # are stopped; a core service found stopped afterwards fails the start.
+    addons_stop_leftovers addons_stop_disabled addons_stop_refused || exit 1
     if [ "${VOICE_STOP_ON_OFF:-}" = "1" ]; then
         docker compose $COMPOSE_FILES -f "$(addons_voice_overlay)" stop whisper piper 2>/dev/null || true
     fi
@@ -983,7 +999,7 @@ else
     reown_stop_service() { docker compose $COMPOSE_FILES $PROFILE_ARGS stop "$1" >/dev/null 2>&1; }
     if [ -n "$_data_root" ]; then
         # shellcheck disable=SC2046
-        reown_nonroot_dirs "$_data_root" $(printf '%s\n' "${SERVICES[@]}" | grep -xE 'redis|grafana' || true) || exit 1
+        reown_nonroot_dirs "${_state_root:-$_data_root}" $(printf '%s\n' "${SERVICES[@]}" | grep -xE 'redis|grafana' || true) || exit 1
     fi
     if printf '%s\n' "${SERVICES[@]}" | grep -qxE 'whisper|piper'; then
         noo_voice_model_dirs
@@ -1027,7 +1043,13 @@ if [ -n "$OLLAMA_CTR" ]; then
     fi
 fi
 
-ui_close_done "Services started"
+if [ -n "${NOO_ADDONS_REFUSED:-}" ]; then
+    # Never a plain "started": the outcome names what did NOT start.
+    ui_close_warned "Services started WITHOUT add-on(s) ${NOO_ADDONS_REFUSED//,/, }: refused, NOT running"
+    addons_report_refused
+else
+    ui_close_done "Services started"
+fi
 ui_note "noo stack status shows the containers"
 
 # Wait for background model pull if it was started (max 10 minutes)

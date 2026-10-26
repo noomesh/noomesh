@@ -19,6 +19,7 @@ use axum::{
 };
 use serde_json::json;
 
+use crate::measured::{put_into, Measured};
 use crate::state::AppState;
 use crate::worker_client;
 use super::AppResult;
@@ -119,20 +120,22 @@ fn unwrap_status(mut v: serde_json::Value) -> Result<serde_json::Value, String> 
     Ok(v)
 }
 
-/// The dashboard-shaped answer when the status cannot be read.
+/// The dashboard-shaped answer when the status cannot be read: the counts are
+/// null with a `_detail` saying why, never 0 (the store may hold thousands).
 fn unreachable_status(error: &str) -> serde_json::Value {
-    json!({
-        "started": false,
-        "enabled": false,
+    let mut body = json!({
         "engine": "rust+offline",
-        "video_count": 0,
-        "total_records": 0,
-        "total_size_mb": 0.0,
         "videos": [],
         "lifecycle": {},
         "traversals": {},
         "error": error,
-    })
+    });
+    put_into(&mut body, "started", Measured::<bool>::unmeasured("worker unreachable"));
+    put_into(&mut body, "enabled", Measured::<bool>::unmeasured("worker unreachable"));
+    put_into(&mut body, "video_count", Measured::<u64>::unmeasured(error));
+    put_into(&mut body, "total_records", Measured::<u64>::unmeasured(error));
+    put_into(&mut body, "total_size_mb", Measured::<f64>::unmeasured(error));
+    body
 }
 
 #[cfg(test)]

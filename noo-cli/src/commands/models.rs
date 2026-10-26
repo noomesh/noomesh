@@ -584,11 +584,9 @@ pub fn models_info(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     show_gated_hint(&id, &gated);
     let first_backend = info["backends"][0].as_str().unwrap_or("unknown");
     let backend = if first_backend != "unknown" { first_backend } else { "vllm" };
-    let up = format!("noo cluster up {backend} {id}");
-    let place = format!("noo cluster place-model {id} --backend {backend}");
+    let place = format!("noo cluster place <node> {backend} {id}");
     let mut entries = vec![
-        (up.as_str(), "start it now on the scheduler's pick"),
-        (place.as_str(), "or pin it as desired state so it survives restarts"),
+        (place.as_str(), "declare it on a node; the agent keeps it running across restarts"),
     ];
     let pull = format!("noo models pull {id} --backend ollama");
     if backends_str(&info["backends"]).contains("ollama") {
@@ -787,7 +785,7 @@ pub fn models_recommended(g: &Globals, args: &[String]) -> Result<i32, Unhandled
                     fmt_downloads(m["downloads"].as_i64()),
                 ))
             );
-            println!("  {}", ui::cmd(&format!("noo cluster up {b} {id}")));
+            println!("  {}", ui::cmd(&format!("noo cluster place <node> {b} {id}")));
         }
     }
     let age = cat.cache_age_text("vllm");
@@ -918,7 +916,7 @@ pub fn models_huggingface(g: &Globals, args: &[String]) -> Result<i32, Unhandled
     println!("{}", ui::note(&format!("view on HuggingFace: https://huggingface.co/models?search={}", query.replace(' ', "%20"))));
     ui::guide(&[
         ("noo models info <model>", "tier, size, gating and the backends that can run one of these"),
-        ("noo cluster up <backend> <model>", "start it on the scheduler's pick"),
+        ("noo cluster place <node> <backend> <model>", "declare it on a node; the agent keeps it running"),
     ]);
     Ok(0)
 }

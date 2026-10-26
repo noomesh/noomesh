@@ -206,6 +206,13 @@ source "$SCRIPT_DIR/lib-bind-sources.sh"
 check_system_credentials || exit 1
 # ...and an install whose secrets sit in plaintext .env.
 check_secrets_at_rest || exit 1
+# ...and a start onto a closed encrypted state volume (i10a).
+source "$SCRIPT_DIR/lib-state-volume.sh"
+check_state_volume_open || exit 1
+# ...and a start whose data root is not on the filesystem it was recorded on
+# (a missing data disk must never let postgres initialise an empty database).
+source "$SCRIPT_DIR/lib-data-root-mount.sh"
+check_data_root_mount || exit 1
 
 if [ -f "$PROJECT_ROOT/pyproject.toml" ]; then
     ui_step "Syncing local Python dependencies"
@@ -660,8 +667,9 @@ if [ "$START_STACK" = true ]; then
     if [ "${TRELLION_STOP_ON_OFF:-}" = "1" ]; then
         docker compose $COMPOSE_FILES -f "$(addons_trellion_overlay)" stop trellion 2>/dev/null || true
     fi
-    # Licensed add-ons switched off: stop the services their overlay adds.
-    addons_stop_disabled
+    # Licensed add-ons switched off: stop the services their overlay OWNS;
+    # a core service found stopped afterwards fails the rebuild.
+    addons_stop_leftovers addons_stop_disabled || exit 1
     if [ "${VOICE_STOP_ON_OFF:-}" = "1" ]; then
         docker compose $COMPOSE_FILES -f "$(addons_voice_overlay)" stop whisper piper 2>/dev/null || true
     fi

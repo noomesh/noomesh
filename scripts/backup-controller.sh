@@ -58,15 +58,54 @@
 
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BACKUP_DIR="${NOO_BACKUP_DIR:-$HOME/noo-backups}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 RETAIN_DAYS="${NOO_BACKUP_RETAIN_DAYS:-7}"
+
+# NOO_BACKUP_OFFSITE lives in the checkout's .env (`noo backups setup` writes
+# it there, and `noo backups status` reads it from the same place). A backup
+# run by noo-hostd does NOT inherit .env — hostd loads the secret store and
+# noomesh.yaml, not plain .env values — so on 2026-10-24 a configured
+# destination read as unset here: "offsite: not configured", exit 0, the
+# heartbeat recorded success, and nothing ever left the machine. So the script
+# resolves it itself, the same way on every path (hostd, cron, a manual run):
+# an exported value wins, else the last assignment in $ROOT_DIR/.env.
+# A .env that exists but cannot be read is a FAILURE, not "unset": we cannot
+# tell whether the operator decided.
+OFFSITE_ENV_FILE="$ROOT_DIR/.env"
+if [ -z "${NOO_BACKUP_OFFSITE:-}" ] && [ -e "$OFFSITE_ENV_FILE" ]; then
+    if [ ! -r "$OFFSITE_ENV_FILE" ]; then
+        echo "  ERROR: cannot read $OFFSITE_ENV_FILE to resolve NOO_BACKUP_OFFSITE — REFUSING to run." >&2
+        echo "NOO_BACKUP_OFFSITE_RESULT=FAILED: cannot read $OFFSITE_ENV_FILE" >&2
+        exit 1
+    fi
+    _line="$(grep -E '^[[:space:]]*(export[[:space:]]+)?NOO_BACKUP_OFFSITE[[:space:]]*=' "$OFFSITE_ENV_FILE" | tail -n 1 || true)"
+    if [ -n "$_line" ]; then
+        _val="${_line#*=}"
+        _val="$(printf '%s' "$_val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e "s/^\"\(.*\)\"\$/\1/" -e "s/^'\(.*\)'\$/\1/")"
+        NOO_BACKUP_OFFSITE="$_val"
+        export NOO_BACKUP_OFFSITE
+    fi
+fi
 
 # ── Preflight: resolve BOTH passphrases before anything is written ────────
 # Fail-closed, and fail EARLY. Refusing after the dump is already on disk
 # would mean the very artefact we are refusing to write in plaintext has
 # already been written in plaintext.
 AGE_KEY_FILE="${SOPS_AGE_KEY_FILE:-$HOME/.config/sops/age/keys.txt}"
+
+# A key SEALED to the TPM (i10a; /etc/noo/at-rest.json says so) lives in RAM
+# once noo-unseal.service has run. Missing then means "did not unseal", not
+# "SOPS not in use" — and the age-key block below would SKIP it silently,
+# producing a run with no age-key backup that reports success. Refuse.
+AT_REST_MANIFEST="${NOO_AT_REST_MANIFEST:-/etc/noo/at-rest.json}"
+if [ ! -f "$AGE_KEY_FILE" ] && [ -r "$AT_REST_MANIFEST" ] \
+        && grep -Eq '"age_key_sealed"[[:space:]]*:[[:space:]]*true' "$AT_REST_MANIFEST"; then
+    echo "  ERROR: the age key is sealed to this machine's TPM and has not been unsealed (no $AGE_KEY_FILE) — REFUSING to run." >&2
+    echo "         A backup without the age key is one nobody can restore. Check: systemctl status noo-unseal.service" >&2
+    exit 1
+fi
 
 # Inline env wins over file.
 PASSPHRASE="${NOO_BACKUP_PASSPHRASE:-}"
@@ -312,10 +351,10 @@ fi
 # stopped working is the same as no copy, discovered at the worst moment.
 offsite_copy() {
     local dest="${NOO_BACKUP_OFFSITE:-}"
-    [ -n "$dest" ] || { echo "  offsite: not configured (noo backups setup)"; return 0; }
+    [ -n "$dest" ] || { OFFSITE_NOTE="not decided (noo backups setup)"; echo "  offsite: not configured (noo backups setup)"; return 0; }
     case "$dest" in
-        none)     echo "  offsite: declined — the risk is recorded as accepted"; return 0 ;;
-        portable) echo "  offsite: portable — run scripts/noo-backup-export.sh and carry it off"; return 0 ;;
+        none)     OFFSITE_NOTE="declined (recorded as accepted)"; echo "  offsite: declined — the risk is recorded as accepted"; return 0 ;;
+        portable) OFFSITE_NOTE="portable — nothing copied; run scripts/noo-backup-export.sh"; echo "  offsite: portable — run scripts/noo-backup-export.sh and carry it off"; return 0 ;;
     esac
 
     # Only what this run produced. Re-copying the whole directory every six
@@ -332,6 +371,7 @@ offsite_copy() {
     if [ -n "${AGE_FILE:-}" ] && [ -f "${AGE_FILE}" ]; then made+=("$AGE_FILE"); fi
     if [ -n "${ARCHIVE_FILE:-}" ] && [ -f "${ARCHIVE_FILE}" ]; then made+=("$ARCHIVE_FILE"); fi
     if [ ${#made[@]} -eq 0 ]; then
+        OFFSITE_NOTE="nothing new to copy to $dest"
         echo "  offsite: nothing new this run"
         return 0
     fi
@@ -347,7 +387,11 @@ offsite_copy() {
         dir:*)
             local target="${dest#dir:}"
             if [ ! -d "$target" ]; then
-                echo "  offsite: FAILED — $target is not a directory (unmounted?)" >&2
+                # NEVER create it here. A missing target is most often an
+                # unmounted share, and mkdir would land on the root disk and
+                # report "copied" for a backup that never left the machine.
+                OFFSITE_NOTE="FAILED: target missing — is it mounted? ($target)"
+                echo "  offsite: FAILED — $target is not a directory — is it mounted?" >&2
                 return 1
             fi
             cp -- "${made[@]}" "$target/" || rc=$?
@@ -360,12 +404,14 @@ offsite_copy() {
                 elif command -v rclone >/dev/null 2>&1; then
                     rclone copyto "$f" "$target/$(basename "$f")" || rc=$?
                 else
+                    OFFSITE_NOTE="FAILED: neither aws nor rclone is installed"
                     echo "  offsite: FAILED — neither aws nor rclone is installed" >&2
                     return 1
                 fi
             done
             ;;
         *)
+            OFFSITE_NOTE="FAILED: unknown destination '$dest'"
             echo "  offsite: FAILED — unknown destination '$dest'" >&2
             echo "           expected ssh:… dir:… s3:… portable none" >&2
             return 1
@@ -373,14 +419,27 @@ offsite_copy() {
     esac
 
     if [ "$rc" -ne 0 ]; then
+        OFFSITE_NOTE="FAILED: copy to $dest exited $rc (the local backup is intact)"
         echo "  offsite: FAILED to copy to $dest (exit $rc) — the LOCAL backup is intact" >&2
         return 1
     fi
+    OFFSITE_NOTE="copied ${#made[@]} artifact(s) to $dest"
     echo "  offsite: copied ${#made[@]} artifact(s) to $dest"
+    # Record WHICH dump last left the machine: `noo backups status` compares
+    # it with the newest dump, so "all backups on one machine" is a line the
+    # operator reads instead of a fact they have to go and discover.
+    if [ -n "${PG_FILE:-}" ] && [ -f "${PG_FILE}" ]; then
+        printf '%s %s\n' "$(date +%s)" "$(basename "$PG_FILE")" > "$BACKUP_DIR/.offsite-last" || true
+    fi
     return 0
 }
 
+OFFSITE_NOTE=""
 offsite_copy || OFFSITE_RC=$?
+# The outcome rides stderr (the one captured stream) so noo-hostd can put it in
+# the result and the heartbeat run's text states it: a success line must not be
+# able to hide that nothing left the machine.
+echo "NOO_BACKUP_OFFSITE_RESULT=${OFFSITE_NOTE:-unknown}" >&2
 if [ -n "${OFFSITE_RC:-}" ]; then
     echo "[$(date)] Backup written, but the offsite copy FAILED — see above." >&2
     exit "$OFFSITE_RC"

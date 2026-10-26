@@ -682,6 +682,37 @@ remove_secret_files() {
 # (tests/test_secrets_not_exported.py holds the two equal).
 _SECRETS_NOT_EXPORTED="NOO_IMAGE_TAG NOO_ADDON_REGISTRY_TOKEN NOO_ADDON_REGISTRY_USER"
 
+# ── The age key sealed to the TPM (i10a PR-B) ───────────────────────────────
+# `sudo noo-hostd at-rest seal-age-key` seals the age key with systemd-creds
+# and records it in /etc/noo/at-rest.json (no secrets in it). At boot the root
+# unit noo-unseal.service decrypts it into RAM at /run/noo/keys/age.txt;
+# `noo security at-rest finalize` then replaces ~/.config/sops/age/keys.txt
+# with a symlink to that file. So on a sealed box a MISSING key is not "sops
+# not in use": it is a unit that did not unseal, and the launch must stop
+# and say which unit — never fall through to a decrypt that fails vaguely.
+# NOO_AT_REST_MANIFEST relocates the manifest (tests).
+age_key_sealed() {
+    local m="${NOO_AT_REST_MANIFEST:-/etc/noo/at-rest.json}"
+    [ -r "$m" ] && grep -Eq '"age_key_sealed"[[:space:]]*:[[:space:]]*true' "$m"
+}
+
+# The key file sops will read: $SOPS_AGE_KEY_FILE, else the default. `-f`
+# follows a symlink, so a finalized keys.txt whose target is gone is absent.
+age_key_file() {
+    printf '%s' "${SOPS_AGE_KEY_FILE:-$HOME/.config/sops/age/keys.txt}"
+}
+
+# 0 when the key is usable or the box is not sealed; 1 (with the message)
+# when the manifest says sealed and no key file is there.
+require_unsealed_age_key() {
+    age_key_sealed || return 0
+    [ -n "${SOPS_AGE_KEY:-}" ] && return 0
+    [ -f "$(age_key_file)" ] && return 0
+    echo "ERROR: the age key is sealed to this machine's TPM and has not been unsealed: systemctl status noo-unseal.service" >&2
+    echo "       (expected the unsealed key at $(age_key_file); manifest ${NOO_AT_REST_MANIFEST:-/etc/noo/at-rest.json}). Failing closed." >&2
+    return 1
+}
+
 _load_secrets_sops() {
     local enc="${NOO_SOPS_FILE:-secrets/env.sops}"
     # noo-secrets-sops-init.sh installs sops/age to ~/.local/bin (deliberately,
@@ -706,6 +737,7 @@ _load_secrets_sops() {
         echo "       Run scripts/noo-secrets-sops-init.sh to create it from .env." >&2
         return 1
     fi
+    require_unsealed_age_key || return 1
     local decrypted
     # --input-type dotenv is REQUIRED: the file is named *.sops (not *.env), so
     # sops can't infer the format and would emit nothing (silent 0-value load →

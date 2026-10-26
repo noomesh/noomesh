@@ -5,6 +5,7 @@ import { useState } from 'react';
 import { toast } from 'sonner';
 import { useQuery, useMutation, useQueryClient, useMetisClient } from '@metis/core';
 import { relTime } from '@/lib/format';
+import { num, dash } from '@/lib/num';
 import { StatusBadge, type Tone } from '@/components/StatusBadge';
 import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ConfirmDialog';
@@ -48,7 +49,8 @@ interface DecisionsResult {
 interface AutonomyLoc {
   name: string;
   enabled: boolean;
-  interval: number;
+  // null = the gateway did not send it (renders a dash, never 0).
+  interval: number | null;
   lastCheck: string | null;
   /** RFC3339, or null for unknown. From the audit table, so it survives a
    *  restart — unlike lastCheck, which lives in the loop's memory. */
@@ -59,8 +61,8 @@ interface AutonomyLoc {
    *  operator uses to decide what is safe to turn on. */
   armed?: boolean;
   dryRun?: boolean;
-  conditions: number;
-  actions: number;
+  conditions: number | null;
+  actions: number | null;
   source: string;
 }
 
@@ -92,14 +94,14 @@ function useAutonomy() {
         locations: (data?.locations ?? []).map((l) => ({
           name: l.name ?? '?',
           enabled: l.enabled ?? true,
-          interval: l.interval ?? 0,
+          interval: num(l.interval),
           lastCheck: l.last_check ?? null,
           lastFired: l.last_fired ?? null,
           // Deliberately not `?? false` — absence is not a negative.
           armed: typeof l.armed === 'boolean' ? l.armed : undefined,
           dryRun: typeof l.dry_run === 'boolean' ? l.dry_run : undefined,
-          conditions: l.conditions ?? 0,
-          actions: l.actions ?? 0,
+          conditions: num(l.conditions),
+          actions: num(l.actions),
           source: l.source ?? 'config',
         })),
       };
@@ -204,7 +206,8 @@ const OUTCOMES: [Outcome, string][] = [
  *  lastFired is empty until something fires. A dash says "I cannot tell
  *  you"; "never" would be a claim. */
 const when = (iso: string | null) => (iso ? `${relTime(iso)} ago` : '—');
-const fmtInterval = (s: number) => (s >= 60 ? `${Math.round(s / 60)}m` : `${s}s`);
+const fmtInterval = (s: number | null) =>
+  dash(s, (n) => (n >= 60 ? `${Math.round(n / 60)}m` : `${n}s`));
 
 /**
  * What the agent does when nobody asked it to.
@@ -301,7 +304,7 @@ export function AutonomyPanel() {
                   {/* What it would actually do, which is the thing a new
                       operator wants before deciding whether to leave it on. */}
                   <span className="auto-interval">
-                    {l.conditions} cond · {l.actions} action{l.actions === 1 ? '' : 's'}
+                    {dash(l.conditions)} cond · {dash(l.actions)} action{l.actions === 1 ? '' : 's'}
                   </span>
                   {l.source === 'db' && <span className="auto-interval">custom</span>}
                   <span title={armedMeta(l).title}>

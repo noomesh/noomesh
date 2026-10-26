@@ -81,7 +81,7 @@ use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
-use rcgen::{Certificate, CertificateParams, CustomExtension, DnType, KeyPair, SerialNumber};
+use rcgen::{CertificateParams, CustomExtension, DnType, Issuer, KeyPair, SerialNumber};
 use sha1::{Digest as _, Sha1};
 use time::{Duration, OffsetDateTime};
 
@@ -1489,7 +1489,12 @@ impl ClusterCa {
     /// Load the on-disk CA for signing. The issuer's DN is re-encoded by
     /// rcgen from the parsed ca.crt — UTF8String attrs round-trip
     /// byte-identically (verified against webpki's exact-DER issuer match).
-    fn load_ca(&self) -> Result<(Certificate, KeyPair), String> {
+    ///
+    /// Returns the rcgen `Issuer` (DN + key-usages + key-id method parsed from
+    /// ca.crt, plus the CA key) and the CA's raw public key bits, which the
+    /// hand-built AuthorityKeyIdentifier needs (`Issuer` keeps its key
+    /// private).
+    fn load_ca(&self) -> Result<(Issuer<'static, KeyPair>, Vec<u8>), String> {
         if !self.ca_exists() {
             return Err(format!(
                 "No cluster CA at {} — run 'noo security pki init' first",
@@ -1501,12 +1506,10 @@ impl ClusterCa {
         let key_pem = std::fs::read_to_string(self.ca_key_path())
             .map_err(|e| format!("read ca.key: {e}"))?;
         let ca_key = KeyPair::from_pem(&key_pem).map_err(|e| format!("parse ca.key: {e}"))?;
-        let params = CertificateParams::from_ca_cert_pem(&ca_pem)
+        let ca_pub = ca_key.public_key_raw().to_vec();
+        let issuer = Issuer::from_ca_cert_pem(&ca_pem, ca_key)
             .map_err(|e| format!("parse ca.crt: {e}"))?;
-        let ca_cert = params
-            .self_signed(&ca_key)
-            .map_err(|e| format!("reconstruct CA: {e}"))?;
-        Ok((ca_cert, ca_key))
+        Ok((issuer, ca_pub))
     }
 
     // ── Leaf issuance ───────────────────────────────────────────────
@@ -1521,7 +1524,7 @@ impl ClusterCa {
         ip_sans: &[String],
         days: i64,
     ) -> Result<(PathBuf, PathBuf), String> {
-        let (ca_cert, ca_key) = self.load_ca()?;
+        let (ca_issuer, ca_pub) = self.load_ca()?;
         let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384)
             .map_err(|e| format!("keygen failed: {e}"))?;
 
@@ -1574,7 +1577,7 @@ impl ClusterCa {
             ext(
                 OID_AKI,
                 false,
-                der_tlv(0x30, &der_tlv(0x80, &sha1_of(ca_key.public_key_raw()))),
+                der_tlv(0x30, &der_tlv(0x80, &sha1_of(&ca_pub))),
             ),
         ];
         let now = OffsetDateTime::now_utc();
@@ -1583,7 +1586,7 @@ impl ClusterCa {
         params.serial_number = Some(random_serial());
 
         let cert = params
-            .signed_by(&key, &ca_cert, &ca_key)
+            .signed_by(&key, &ca_issuer)
             .map_err(|e| format!("sign failed: {e}"))?;
 
         // Certificates are public but not anyone's to rewrite: 0644 always,
@@ -1887,7 +1890,7 @@ impl ClusterCa {
     /// out of this type is what makes "the key never lands in the shared
     /// tree" a property of the code rather than of a path argument.
     pub fn issue_operator_leaf(&self, account: &str, days: i64) -> Result<(String, String), String> {
-        let (ca_cert, ca_key) = self.load_ca()?;
+        let (ca_issuer, ca_pub) = self.load_ca()?;
         let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384)
             .map_err(|e| format!("keygen failed: {e}"))?;
         let mut params = CertificateParams::default();
@@ -1904,7 +1907,7 @@ impl ClusterCa {
             ext(
                 OID_AKI,
                 false,
-                der_tlv(0x30, &der_tlv(0x80, &sha1_of(ca_key.public_key_raw()))),
+                der_tlv(0x30, &der_tlv(0x80, &sha1_of(&ca_pub))),
             ),
         ];
         let now = OffsetDateTime::now_utc();
@@ -1912,7 +1915,7 @@ impl ClusterCa {
         params.not_after = now + Duration::days(days);
         params.serial_number = Some(random_serial());
         let cert = params
-            .signed_by(&key, &ca_cert, &ca_key)
+            .signed_by(&key, &ca_issuer)
             .map_err(|e| format!("sign failed: {e}"))?;
         Ok((cert.pem(), key.serialize_pem()))
     }
@@ -2730,6 +2733,67 @@ mod key_mode_tests {
             assert!(owner_in_svc_list, "{}: the owner's directory is issued by onboard, so it exists", l.owner);
             assert!(!l.consumers.is_empty());
         }
+    }
+
+    /// The cert profile the cluster CA and every service leaf must keep,
+    /// pinned on the PARSED certificates so an rcgen upgrade (or any change
+    /// to how the issuer is loaded) cannot silently alter it: algorithm,
+    /// CA:TRUE pathlen:0 critical, key usages, leaf CA:FALSE, EKU, the
+    /// leaf's issuer DN byte-equal to the CA subject, AKI == CA SKI, serial
+    /// and validity window.
+    #[test]
+    fn ca_and_leaf_keep_their_pinned_profile() {
+        use x509_parser::extensions::ParsedExtension;
+        let ca = ClusterCa::new(scratch());
+        ca.generate_ca("t", 3650).unwrap();
+        let (crt, _key) = ca.issue_service_cert("worker", &[], &[], 90).unwrap();
+        let ca_data = std::fs::read(ca.ca_cert_path()).unwrap();
+        let leaf_data = std::fs::read(&crt).unwrap();
+        let (_, ca_pem) = x509_parser::pem::parse_x509_pem(&ca_data).unwrap();
+        let (_, leaf_pem) = x509_parser::pem::parse_x509_pem(&leaf_data).unwrap();
+        let ca_cert = ca_pem.parse_x509().unwrap();
+        let leaf = leaf_pem.parse_x509().unwrap();
+
+        // ECDSA P-384 / SHA-384 on both.
+        for c in [&ca_cert, &leaf] {
+            assert_eq!(c.signature_algorithm.algorithm.to_id_string(), "1.2.840.10045.4.3.3");
+            assert_eq!(c.public_key().algorithm.algorithm.to_id_string(), "1.2.840.10045.2.1");
+        }
+
+        // CA: BasicConstraints critical CA:TRUE pathlen 0; KU critical.
+        let bc = ca_cert.basic_constraints().unwrap().expect("CA basicConstraints");
+        assert!(bc.critical && bc.value.ca && bc.value.path_len_constraint == Some(0), "{bc:?}");
+        let ku = ca_cert.key_usage().unwrap().expect("CA keyUsage");
+        assert!(ku.critical && ku.value.key_cert_sign() && ku.value.crl_sign() && ku.value.digital_signature());
+        assert_eq!(ca_cert.subject().as_raw(), ca_cert.issuer().as_raw(), "CA is self-issued");
+
+        // Leaf: CA:FALSE critical, clientAuth+serverAuth, issued by the CA.
+        let lbc = leaf.basic_constraints().unwrap().expect("leaf basicConstraints");
+        assert!(lbc.critical && !lbc.value.ca, "{lbc:?}");
+        let eku = leaf.extended_key_usage().unwrap().expect("leaf EKU").value;
+        assert!(eku.client_auth && eku.server_auth && !eku.any && !eku.code_signing);
+        assert_eq!(leaf.issuer().as_raw(), ca_cert.subject().as_raw(), "issuer DN is the CA's subject, byte for byte");
+        assert_ne!(leaf.subject().as_raw(), leaf.issuer().as_raw());
+
+        // AKI on the leaf is the CA's SKI.
+        let ca_ski: Vec<u8> = ca_cert.iter_extensions().find_map(|e| match e.parsed_extension() {
+            ParsedExtension::SubjectKeyIdentifier(k) => Some(k.0.to_vec()),
+            _ => None,
+        }).expect("CA SKI");
+        let leaf_aki: Vec<u8> = leaf.iter_extensions().find_map(|e| match e.parsed_extension() {
+            ParsedExtension::AuthorityKeyIdentifier(a) => a.key_identifier.as_ref().map(|k| k.0.to_vec()),
+            _ => None,
+        }).expect("leaf AKI");
+        assert_eq!(leaf_aki, ca_ski);
+
+        // Serials are random and distinct; validity is the asked window
+        // (back-dated 5 minutes).
+        assert_ne!(ca_cert.raw_serial(), leaf.raw_serial());
+        let days = |c: &x509_parser::certificate::X509Certificate| {
+            (c.validity().not_after.timestamp() - c.validity().not_before.timestamp()) / 86_400
+        };
+        assert_eq!(days(&ca_cert), 3650);
+        assert_eq!(days(&leaf), 90);
     }
 
     /// Noo-worker (and worker-extra, through the

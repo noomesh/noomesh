@@ -9,7 +9,10 @@
 # Run it ONLY on a clean sandbox with a generic hostname: the film shows output.
 # See scripts/demo/README.md.
 
-Output demo-out/onboarding.gif
+# MP4 only. vhs renders a GIF with one global palette over every frame, which
+# holds the whole film in memory (killed at 7 GB; took a WSL2 host down twice,
+# 2026-10-23/24). The recorder makes onboarding.gif FROM this MP4 afterwards,
+# streaming, one palette per frame.
 Output demo-out/onboarding.mp4
 
 # (curl is checked by the recorder: on this machine, or inside the box in box mode)
@@ -26,9 +29,10 @@ Set Framerate 30
 Set TypingSpeed 38ms
 Set PlaybackSpeed @PLAYBACK_SPEED@
 # Wait for the prompt to come back (a line ending in "$"); installs and image
-# pulls are slow on a first run, so the ceiling is generous.
+# pulls are slow on a first run, so the ceiling is generous: a cold `noo onboard`
+# pulled the stack and the chat model for 40 min on one host (2026-10-23).
 Set WaitPattern /\$$/
-Set WaitTimeout 30m
+Set WaitTimeout 60m
 
 # Off camera: a neutral prompt, so no host or user name is shown.
 Hide
@@ -69,12 +73,18 @@ Sleep 2500ms
 Type "noo health" Enter
 Wait
 Sleep 2s
-Type "noo cluster status" Enter
+# `noo stack status`, not `noo cluster status`: in the standalone profile the
+# node agent is a host binary under systemd, and the studio's box has no
+# systemd, so the box never registers its own node ("no nodes", take 7). A real
+# install shows the node a minute after onboard; the film does not wait.
+Type "noo stack status" Enter
 Wait
 Sleep 3s
 
 Type "# Ask it something." Enter
 Sleep 1s
-Type `noo chat --message "in two lines, what can you do on this machine?"` Enter
+# A question the first (small) model answers well. "what can you do on this
+# machine?" got "please provide an image or description of the machine" (take 7).
+Type `noo chat --message "Say hello, then tell me in two lines what noomesh is."` Enter
 Wait
 Sleep 5s

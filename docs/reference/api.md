@@ -204,6 +204,8 @@ add-on service key with the `metrics` scope; at most 256 series per source,
 | POST, DELETE | `/api/cluster/embedding-spaces/{space}/migration` | operator: POST `{model}` starts re-embedding a space into another model (the gateway probes the model across its pool: 200 `filling`; 202 `pending` when no node serves it yet, and the gateway starts it once one does; 409 if one is running, the model belongs to a space, or its vector width differs from the space's); DELETE cancels while `pending` or `filling` (409 once `cutover`). `DELETE /api/cluster/embedding-spaces/{space}` is 409 while the space has any migration. The space listing and `capabilities.embeddings.spaces` carry `migration`: null or `{next_model, next_dims, state, progress, started_at, reported_at}` (`noo cluster embedding-space migrate`) |
 | POST | `/api/cluster/embedding-spaces/{space}/migration/complete` | operator: begin the cutover; 409 unless the migration is `filling` and trellion's report (about this next model, under 10 minutes old) shows every table done == total |
 | PUT | `/api/external/embedding-spaces/{space}/migration` | consumer key (scope `embeddings`): trellion's progress report `{next_model, tables: {<table>: {done, total, unsourced?}}, cutover_done}`; 409 with no migration, a `pending` one (not started: no node serves the model) or another next model; in `cutover`, `cutover_done: true` swaps the space to its next model in one UPDATE. Embeds with `model: "<space>@next"` on `/api/external/embeddings` use the next model (409 without a migration or while `pending`) |
+| POST | `/api/external/embeddings/jobs` | consumer key (scope `embeddings`): a bulk embedding batch as a job. `{input: [..], space?, model?}` (`space` wins; both mean what `model` means on `/api/external/embeddings`, so `<space>@next` works) answers `202 {job_id, path, model}`. `path: pull`: a node that serves the model claims the batch from the `WORK_EMBED` work queue when it has a free embed slot (one slot per node stays free for query-time embeds); `path: push`: no node is pulling, so the gateway embeds it itself, two batches at a time. At most 64 texts per job and the encoded result must fit 600 KiB (`413`, the message names the cap); `429` + `Retry-After` when the model's queue holds over 5000 batches; `503` when no node serves the model. A pull job nobody claims within 2 minutes, or whose worker goes quiet, is run by the gateway once, then failed. Opt-in: the synchronous route never queues. Vectors are kept 15 minutes |
+| GET | `/api/external/embeddings/jobs/{job_id}` | consumer key (scope `embeddings`): the caller's own embedding job (`404` for anyone else's); `?vectors=1` on a completed job adds `vectors` (one float32 row per input, in order). `410` once the 15 minutes are up: resubmit. The same job is readable at `GET /api/jobs/{job_id}?vectors=1` by a caller that reaches the scheduler routes |
 
 ### Model classes, failover and what the answer says
 
@@ -298,7 +300,13 @@ model fault. For a bounded structured answer:
   prefer the `reasoning` form, it is the portable one.
 - **Budget with thinking on**: allow for the reasoning (gemma4 spends
   60–100 tokens on a yes/no) plus the answer; read `usage` and the
-  `finish_reason`.
+  `finish_reason`. The gateway refuses the one combination that can only
+  come back empty: `response_format` set, thinking not turned off, and
+  `max_tokens` under 256 → `400` with error `type`
+  `budget_too_small_for_thinking` and both remedies in the message (turn
+  reasoning off, or raise `max_tokens`). A request without
+  `response_format`, without `max_tokens`, or with reasoning off in any of
+  the spellings above is not touched.
 - **`response_format`** (`json_object`, `json_schema`) is honoured as
   Ollama's `format`, but grammar-constrained decoding on a large-vocabulary
   model such as gemma4 runs at seconds per token on today's nodes. For a
@@ -451,7 +459,7 @@ receives flat JSON events, each with a `type`:
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/jobs/submit` (alias `/api/tasks/submit`) | `{job_type, payload, priority, backend, force_node, min_vram_gb, timeout_sec, max_retries, allow_queue_without_backend, expire_after_sec}`; a named `backend` that no healthy node is serving is refused 400 unless `force_node` or `allow_queue_without_backend` is set; job types: `inference`, `tool_exec`, `model_download`, `model_file`, `fetch_bundle`, `background_graph`, `background_cache` (node) and `test_run` (gateway) (`background_embed` is retired). **User tier** (also `noo_job_submit` on the user MCP door): `inference` only, an object payload up to 64 KiB, `force_node` / `min_vram_gb` / `allow_queue_without_backend` refused (`403`), `backend` one of `vllm`/`ollama`/`llamacpp`, priority capped at 5, `timeout_sec` at 600, `max_retries` at 2; 30 submits per hour per account (`429` with `Retry-After`). Every submit writes a `job_submit` audit row. `/api/tasks/submit` stays Operator+. A job still queued past `expire_after_sec`, or 24 h after submit, or of a type no node executes, is set `dead` by the scheduler janitor with an error starting `expired:`. A job pinned with `force_node` to a node that is not healthy waits without blocking the jobs behind it (`status_detail` says why) |
+| POST | `/api/jobs/submit` (alias `/api/tasks/submit`) | `{job_type, payload, priority, backend, force_node, min_vram_gb, timeout_sec, max_retries, allow_queue_without_backend, expire_after_sec}`; a named `backend` that no healthy node is serving is refused 400 unless `force_node` or `allow_queue_without_backend` is set; job types: `inference`, `tool_exec`, `model_download`, `model_file`, `fetch_bundle`, `background_graph`, `background_cache` (node) and `test_run` (gateway) (`background_embed` is retired; `embed_batch` is created only by `POST /api/external/embeddings/jobs` and is refused here). **User tier** (also `noo_job_submit` on the user MCP door): `inference` only, an object payload up to 64 KiB, `force_node` / `min_vram_gb` / `allow_queue_without_backend` refused (`403`), `backend` one of `vllm`/`ollama`/`llamacpp`, priority capped at 5, `timeout_sec` at 600, `max_retries` at 2; 30 submits per hour per account (`429` with `Retry-After`). Every submit writes a `job_submit` audit row. `/api/tasks/submit` stays Operator+. A job still queued past `expire_after_sec`, or 24 h after submit, or of a type no node executes, is set `dead` by the scheduler janitor with an error starting `expired:`. A job pinned with `force_node` to a node that is not healthy waits without blocking the jobs behind it (`status_detail` says why) |
 | GET | `/api/jobs`, `/api/jobs/history`, `/api/jobs/{job_id}` | queue, history, one job. Scoped by ACCOUNT (a job submitted from any session of `alice` is `alice`'s): a `user`-tier caller sees its own jobs plus unowned ones; Operator+ sees every job. An unreadable id is a `404` |
 | DELETE | `/api/jobs/{job_id}` | cancel. Open to the User tier for the caller's own account's jobs; Operator+ may cancel any job. Another account's job, or an unowned fleet job, is a `404` to a User. Writes a `job_cancel` audit row (`job_cancel_denied` on a refusal) |
 | POST | `/api/jobs/{job_id}/reprioritize` | change a queued job's priority. Operator+ only at the tier gate; the handler is also owner-scoped (`404` otherwise) |
@@ -748,7 +756,7 @@ on the gateway's own). Broadcast is refused; a thread needs a seat.
 | GET | `/api/channels/{channel}/recipients`, `/api/channels/{channel}/messages` | known recipients; recent inbound |
 | GET, POST, PUT, DELETE | `/api/channels/saved-recipients`, `…/{recipient_db_id}` | address book. Rows carry an `owner` (migration `071`); `owner: null` is the shared book — readable by everyone, writable by Operator+ only. A `user`-tier caller reads its own + shared and writes only its own (`404` otherwise) |
 | GET | `/api/alerts/clients` | connected alert WebSocket clients |
-| POST | `/api/voice/transcribe`, `/api/voice/transcribe/detailed`, `/api/voice/synthesize`; GET `/api/voice/voices`, `/api/voice/status` | STT / TTS through the configured providers |
+| POST | `/api/voice/transcribe`, `/api/voice/transcribe/detailed`, `/api/voice/synthesize`; GET `/api/voice/voices`, `/api/voice/status` | STT / TTS through the configured providers. The two transcribe routes also accept a service key presented directly, but only one holding the `voice:transcribe` scope (a key without it gets `403`, `service key lacks 'voice:transcribe' scope`); persons are unchanged |
 
 ## Users, security, settings (`routes/users.rs`, `routes/settings.rs`, `routes/admin.rs`)
 
@@ -846,13 +854,13 @@ A client with no loop of its own (a CLI harness, your own MCP client) reaches ta
 | Listener | Path | Auth | Purpose |
 |---|---|---|---|
 | `:8080` | `POST /mcp/operator` | an `mcp:operator` service key bound to an account that holds the admin role (re-checked on every call) — mandatory, and the only credential (the shared `NOO_MCP_TOKEN` was retired on 2026-09-30; the plain-HTTP `/mcp` listener on 3100 was removed in stack-v0.2.41) | the operator door: the full tool manifest (`gateway-rust/mcp-tools-local.json`, 124 tools, plus any add-on fragment named by `NOO_MCP_EXTRA_MANIFEST`), for a machine acting as the operator |
-| `:8080` | `POST /mcp/user` | a key that names a user (`POST /api/security/service-keys/self` mints your own; `noo mcp external-setup` prints the recipe); the call runs under that user's own JWT | the external door, opened by `NOO_MCP_EXTERNAL_ENABLED` (off: `404`); serves the curated user manifest (`gateway-rust/mcp-tools.json`, 32 tools) plus the seven task tools (below). The key needs the `mcp` scope and must be bound to a user (`403` otherwise) |
+| `:8080` | `POST /mcp/user` | a key that names a user (`POST /api/security/service-keys/self` mints your own; `noo mcp external-setup` prints the recipe); the call runs under that user's own JWT | the external door, opened by `NOO_MCP_EXTERNAL_ENABLED` (off: `404`); serves the curated user manifest (`gateway-rust/mcp-tools.json`, 34 tools) plus the seven task tools (below). The key needs the `mcp` scope and must be bound to a user (`403` otherwise) |
 
 Both speak streamable-HTTP JSON-RPC (`POST` only: `GET` and `DELETE` are
 `405`; a request body over 256 KiB is refused). Identity is re-resolved from
 the key on every call, so a revoked or narrowed key stops at once. They do
 **not** serve the same registry: the user door (`/mcp/user`) embeds
-`gateway-rust/mcp-tools.json` (32 tools), and the operator door
+`gateway-rust/mcp-tools.json` (34 tools), and the operator door
 (`/mcp/operator`) embeds `gateway-rust/mcp-tools-local.json` (124 tools) — a strict superset that
 also includes every tool in the user manifest. Both files are generated
 from `src/noomesh/mcp/tool_defs/` by `scripts/build-mcp-manifest.py` and

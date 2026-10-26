@@ -18,7 +18,7 @@ noo security secrets audit          # does the store agree with .env? (never pri
 |---|---|---|---|
 | **Secrets** | `secrets/env.sops` — dotenv text encrypted with [SOPS](https://github.com/getsops/sops) + [age](https://age-encryption.org) | passwords, API keys, tokens, passphrases, file-shaped credentials | `load_secrets` in the launcher (`scripts/lib-secrets.sh`), before compose runs |
 | **Config** | `noomesh.yaml` | everything else — nested sections read by the application (env → yaml → default), and a flat `compose_env:` map exported for compose interpolation and host scripts | `load_config` (`scripts/lib-config.sh`) |
-| **Posture** | `noo_security_posture` table | the allow-listed security gates (`NOO_EXEC_APPROVAL_MODE`, `NOO_NODE_AGENT_PRIVILEGED`, `NOO_MCP_EXTERNAL_ENABLED`, `NOO_SELF_CALL_SHARED_SECRET` — `POSTURE_KEYS`; retired keys (`NOO_CLUSTER_LEGACY_FULL_ACCESS`, `NOO_BOOTSTRAP_ACCEPT_UNSIGNED_FETCH`, `NOO_BUS_PRINCIPAL`, `NOO_APPROVAL_BREAK_GLASS`) refuse the boot while a row holds one open; `NOO_NATS_LEGACY_SHARED_CREDS` was retired with the shared bus user; `NOO_MULTI_USER` is gone, tenant isolation is unconditional) | `noo security posture set` / `apply-profile hardened` (which `noo onboard` applies), read once at gateway start |
+| **Posture** | `noo_security_posture` table | the allow-listed security gates (`NOO_EXEC_APPROVAL_MODE`, `NOO_NODE_AGENT_PRIVILEGED`, `NOO_MCP_EXTERNAL_ENABLED`, `NOO_CLUSTER_TOKEN_V1` — `POSTURE_KEYS`; `NOO_SELF_CALL_SHARED_SECRET` was retired (nothing reads it; boot deletes a stale row at a closed value and warns while one is set on); retired keys (`NOO_CLUSTER_LEGACY_FULL_ACCESS`, `NOO_BOOTSTRAP_ACCEPT_UNSIGNED_FETCH`, `NOO_BUS_PRINCIPAL`, `NOO_APPROVAL_BREAK_GLASS`) refuse the boot while a row holds one open; `NOO_NATS_LEGACY_SHARED_CREDS` was retired with the shared bus user; `NOO_MULTI_USER` is gone, tenant isolation is unconditional) | `noo security posture set` / `apply-profile hardened` (which `noo onboard` applies), read once at gateway start |
 | **Add-ons** | `noomesh.yaml` `addons:` | which add-ons this install runs | read by the launcher for compose overlays and by the gateway for routing — never `.env`, which `noo stack start` now refuses to start with the retired flags in it |
 | *(bootstrap)* | `.env` | the flags the launcher must read **before** the store or the DB can be opened: `NOO_SECRETS_BACKEND`, `NOO_INSTALL_MODE`, `NOO_INSTANCE`, `NOO_PORT_OFFSET` — plus compose-interpolated non-secrets the wizard writes there (channel allow-lists, model choices) | read directly by the launcher scripts |
 
@@ -439,8 +439,7 @@ since the shared bus user was retired: every user in its `users.conf` is a bcryp
 the shared `$NATS_USER` / `$NATS_PASSWORD` principal it used to expand (the
 reason it kept those two variables — removing them early took a
 controller's bus down on the v0.2.78 roll) is retired, together with the
-pair and its `NOO_NATS_LEGACY_SHARED_CREDS` bridge. `NOO_SELF_CALL_SHARED_SECRET` is a posture flag (`"0"` closes
-the bridge), not a credential. `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN`
+pair and its `NOO_NATS_LEGACY_SHARED_CREDS` bridge. `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN`
 stay environment by design: no noomesh container receives them — they go
 only to third-party model images (vLLM, TEI, the reranker, Whisper), which
 read them natively, and through the node agent to the backends it starts.
@@ -451,8 +450,7 @@ env` row: it reads the NAMES (never values — the docker template drops the
 value before it leaves the docker CLI) of every running stack container's
 environment and fails on any file-backed name (tier-1 or a provider/channel
 key), or any `*_PASSWORD`, `*_SECRET`, `*_TOKEN`, `*_KEY` name not on a
-reasoned allow-list (paths to PEM files, the Grafana pointer, the posture
-flag `NOO_SELF_CALL_SHARED_SECRET`, the model-hub token third-party images
+reasoned allow-list (paths to PEM files, the Grafana pointer, the model-hub token third-party images
 read).
 nats is a warning, not a failure, until it moves; a plain secret on an
 add-on or a containerised node-agent container is a failure like anywhere

@@ -11,7 +11,7 @@ Does not cover: the fleet of nodes (`noo cluster`), or moving a controller betwe
 - `noo config get`/`set` read and write the gateway's runtime config, which is `noomesh.yaml` on disk; `noo security posture set` (Security) is the separate allow-list of security gates in the database.
 - `noo heartbeat` is the **cron** scheduler for user-facing tasks (briefings, reports, reindexes); `noo autonomy` (Fleet) is the self-healing engine; `noo proactive` (Agents & channels) is the rule-triggered notifier.
 - `noo logs` reads container logs **through the gateway and node-agents** (and Loki, for `query`); `noo stack logs` reads `docker logs` on this host directly.
-- `noo plugins list` finds executable `noo-<name>` shims on `PATH` (git-style); bare `noo plugins` is the only word left that passes through to the Python CLI, for in-process Python-package plugins. `noo skills` (Fleet) runs sandboxed containers; `noo prompt-skills` (Memory & knowledge) are prompt templates.
+- `noo plugins list` finds executable `noo-<name>` shims on `PATH` (git-style); bare `noo plugins` prints its usage and exits 2. Nothing in `noo` hands off to a Python CLI: an unknown command or subcommand prints a usage error and exits 2, and Python-package plugins (`~/.noo/plugins`) are not served by this binary. `noo skills` (Fleet) runs sandboxed containers; `noo prompt-skills` (Memory & knowledge) are prompt templates.
 
 ## Recipes
 
@@ -235,7 +235,7 @@ skipped unless `--integration`. See [testing.md](../development/developer-guide.
 | `noo config get` | `[<section>\|cli]` | Print gateway runtime config, whole or one section; `cli` reads this machine's prefs |
 | `noo config set` | `<section> <updates-json>` | Update a gateway config section from JSON (no confirm); `cli` writes local prefs |
 | `noo config launch-render` | `compose-env \| addons \| override \| systems [<file>]` | Hidden: render one noomesh.yaml section for the launcher scripts (internal) |
-| `noo config launch-check` | `bind-sources [--data-root <dir>] [--no-deps] [--skip <service>]... [<service>...] \| system-credentials [<noomesh.yaml>] \| secrets-at-rest [<dir>]` | Hidden: pre-start refusals: bind sources, system credentials, plaintext secrets (internal) |
+| `noo config launch-check` | `bind-sources [--data-root <dir>] [--no-deps] [--skip <service>]... [<service>...] \| system-credentials [<noomesh.yaml>] \| secrets-at-rest [<dir>] \| state-root [<dir>]` | Hidden: pre-start refusals: bind sources, credentials, plaintext secrets, closed volume |
 | `noo config show` | `[--config <path>]` | Print noomesh.yaml: --config, $NOO_CONFIG, ./noomesh.yaml, ~/.config/mesh/config.yaml |
 | `noo config export-effective` | `[-o <file>]` | Export the effective runtime config (autonomy + KB rules/grants) as YAML |
 

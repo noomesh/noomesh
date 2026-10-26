@@ -668,7 +668,7 @@ class HeartbeatActionExecutor:
 
         try:
             r = await client.get(f"{self.gateway_url}/api/cache/stats")
-            if r.status_code == 200:
+            if r.status_code == 200 and r.json().get("enabled", True) is not None:
                 cache = r.json()
                 hits = cache.get("hits", 0)
                 misses = cache.get("misses", 0)
@@ -684,7 +684,11 @@ class HeartbeatActionExecutor:
                 sched = r.json()
                 depth = sched.get("queue_depth", 0)
                 active = sched.get("active_jobs", 0)
-                sections.append(f"**Jobs**: {active} active, {depth} queued")
+                if depth is None or active is None:
+                    # Redis not connected: the gateway reports null, not 0.
+                    sections.append("**Jobs**: not reported (queue unreadable)")
+                else:
+                    sections.append(f"**Jobs**: {active} active, {depth} queued")
         except Exception:
             pass
 
@@ -2508,7 +2512,7 @@ class HeartbeatActionExecutor:
         client = self._get_http_client()
         try:
             r = await client.get(f"{self.gateway_url}/api/cache/stats")
-            if r.status_code == 200:
+            if r.status_code == 200 and r.json().get("enabled", True) is not None:
                 cache = r.json()
                 hits = cache.get("hits", 0)
                 misses = cache.get("misses", 0)
@@ -2903,6 +2907,8 @@ class HeartbeatActionExecutor:
                 r = await client.get(f"{self.gateway_url}/api/scheduler/status")
                 if r.status_code == 200:
                     sched = r.json()
+                    if sched.get("queue_depth", 0) is None:
+                        return "- **Jobs**: not reported (the queue is unreadable: Redis not connected)"
                     return (
                         f"- **Queue Depth**: {sched.get('queue_depth', 0)}\n"
                         f"- **Active Jobs**: {sched.get('active_jobs', 0)}\n"

@@ -185,7 +185,7 @@ pub struct PlainUi;
 static LAST_PROGRESS: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 impl WizardUi for PlainUi {
-    fn run_passthrough(&self, argv: &[String]) -> Option<i32> {
+    fn run_inherited(&self, argv: &[String]) -> Option<i32> {
         let (cmd, args) = argv.split_first()?;
         std::process::Command::new(cmd)
             .args(args)

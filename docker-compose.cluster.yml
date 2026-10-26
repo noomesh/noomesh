@@ -265,6 +265,11 @@ services:
       - NOO_ADDON_UI_SESSION_MAX_SECS=${NOO_ADDON_UI_SESSION_MAX_SECS:-}
       - NOO_PORT_GATEWAY=${NOO_PORT_GATEWAY:-8080}
       - NOO_CONSOLE_ORIGIN=${NOO_CONSOLE_ORIGIN:-}
+      # The operator's brake on the node-held tunnel (docs/reference/env.md):
+      # `0`/`false`/`off` makes `GET /api/node/tunnel` answer 404 and sends
+      # every streaming and bulk node call over HTTPS :8081 again. The
+      # gateway only sees what this list names (test_tunnel_brake_reaches_the_gateway).
+      - NOO_NODE_TUNNEL=${NOO_NODE_TUNNEL:-}
       - DEV_MODE=${DEV_MODE:-}
       # The controller's OWN identity, and it must be stable across container
       # recreates. Without it `agent_messages::controller_node()` falls through
@@ -402,13 +407,6 @@ services:
       # NOO_NATS_LEGACY_SHARED_CREDS were retired by an earlier change — no
       # service is handed either; tests/test_nats_legacy_principal_env.py.)
       - NOO_NATS_ALLOW_ANONYMOUS=${NOO_NATS_ALLOW_ANONYMOUS:-}
-      # an earlier change. OPEN while unset — a shared-secret token still buys
-      # inference, and each acceptance warns naming the caller so "who has no
-      # key yet" is answerable before this closes. Delivered now, closed
-      # later: a posture key the running gateway does not know cannot be set
-      # (it 400s), so the env must reach the container a release ahead of the
-      # decision.
-      - NOO_SELF_CALL_SHARED_SECRET=${NOO_SELF_CALL_SHARED_SECRET:-}
       # CUTOVER: gateway connects as noo_app, a NON-SUPERUSER holding only
       # SELECT/INSERT/UPDATE/DELETE (migration 033). PGVECTOR_URL and
       # PAGEINDEX_DSN below deliberately stay `pai`: the entrypoint resolves
@@ -494,6 +492,10 @@ services:
       # the hand-off; the gateway then loads only the add-ons it already knew.
       - NOO_ADDONS_VERIFIED=${NOO_ADDONS_VERIFIED:-}
       - NOO_ADDONS_DEV=${NOO_ADDONS_DEV:-}
+      # The add-ons the launcher REFUSED this start (`name,name`; empty when
+      # none): left out of the compose set; the systems broker runs no DDL
+      # for a system of that name (gateway-rust/src/system_provision.rs).
+      - NOO_ADDONS_REFUSED=${NOO_ADDONS_REFUSED:-}
       - NOO_STACK_TAG=${NOO_IMAGE_TAG:-}
       # Agent-message review key: seals every
       # agent-to-agent body on the bus/in the table; operators review
@@ -798,7 +800,7 @@ services:
       # Image tars exported by `noo cluster sync-images` (prop 22 step 2) —
       # same one-directory/three-views contract as models above.
       - ${IMAGES_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/images}:/artifacts/images:ro
-      - claude-config:/root/.claude
+      - ${NOO_CLAUDE_CONFIG_VOLUME:-claude-config}:/root/.claude
       # PKI: a certificate-only view, never the PKI root.
       # This container runs as 65532 — the uid loki, prometheus,
       # alertmanager, node-exporter and llamacpp read their keys as — so a
@@ -1861,7 +1863,7 @@ services:
     image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-tei-gpu
     # SUPERSEDED on GPU nodes by the node-agent `embedding` backend
-    # (`noo cluster up embedding <model> --node <node>`). Gated to an
+    # (`noo cluster place <node> embedding <model>`). Gated to an
     # opt-in profile so normal embedding/gpu-tier2 startup can't duplicate
     # the GPU embedder. Use `--profile tei-compose` to run the compose path.
     profiles: ["tei-compose"]
@@ -1965,7 +1967,7 @@ services:
     image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-reranker
     # SUPERSEDED on GPU nodes by the node-agent `reranker` backend
-    # (`noo cluster up reranker <model> --node <node>`). Gated to opt-in
+    # (`noo cluster place <node> reranker <model>`). Gated to opt-in
     # so normal startup can't duplicate the GPU reranker. The mesh path
     # (gateway -> node-agent /rerank) does not use this service.
     profiles: ["tei-compose"]
@@ -2382,7 +2384,7 @@ services:
     ports:
       - "127.0.0.1:${NOO_PORT_ALERTMANAGER:-9093}:9093"  # localhost only — internal to the cluster network
     volumes:
-      - alertmanager-data:/alertmanager
+      - ${NOO_ALERTMANAGER_VOLUME:-alertmanager-data}:/alertmanager
       - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
       - ./monitoring/alertmanager/web-config.yml:/etc/alertmanager/web-config.yml:ro
       - ./monitoring/alertmanager/amtool-http.yml:/etc/alertmanager/amtool-http.yml:ro
@@ -2730,10 +2732,13 @@ services:
       # Ubuntu 24.04+ hosts restrict unprivileged user namespaces through
       # AppArmor and the docker-default profile also denies mount, so
       # Bubblewrap fails there with "No permissions to create new
-      # namespace" / "Can't mount proc". Set NOO_SANDBOX_APPARMOR=unconfined
-      # on such a host: the container is still under seccomp, cap_drop ALL,
-      # read-only rootfs and no-new-privileges. Ignored where AppArmor is
-      # absent (WSL2).
+      # namespace" / "Can't mount proc". On such a host install the shipped
+      # profile (docker/apparmor-noo-sandbox: docker-default plus the
+      # user-namespace and mount rules Bubblewrap needs, nothing else) into
+      # /etc/apparmor.d/noo-sandbox and set NOO_SANDBOX_APPARMOR=noo-sandbox;
+      # `unconfined` is the fallback where that profile cannot load, and
+      # the container is still under seccomp, cap_drop ALL, read-only
+      # rootfs and no-new-privileges. Ignored where AppArmor is absent (WSL2).
       - apparmor=${NOO_SANDBOX_APPARMOR:-docker-default}
     cap_drop: &sandbox-cap-drop
       - ALL
@@ -3050,25 +3055,29 @@ networks:
 
 volumes:
   # Heavy data volumes — bind-mounted to D: drive to avoid filling C:
-  # Override with NOO_DATA_ROOT env var if your D: mount path differs
+  # Override with NOO_DATA_ROOT env var if your D: mount path differs.
+  # The sensitive STATE set (noo-data, redis, nats, prometheus, grafana, loki,
+  # postgres) binds under NOO_STATE_ROOT, which defaults to NOO_DATA_ROOT (so
+  # nothing moves while it is unset). models / hf-cache / ollama / images
+  # always stay under NOO_DATA_ROOT. See i10a.
   noo-data:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/noo-data
+      device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/noo-data
   redis-data:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/redis
+      device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/redis
   nats-data:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/nats
+      device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/nats
   ollama-data:
     driver: local
     driver_opts:
@@ -3093,10 +3102,14 @@ volumes:
     driver_opts:
       type: none
       o: bind
-      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/prometheus
+      device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/prometheus
   alertmanager-data:
-    # Plain named volume (not a NOO_DATA_ROOT bind): alertmanager state
-    # (silences / notification log) is non-critical and this avoids requiring
+    # Plain named volume (not a NOO_DATA_ROOT bind). i10a: it joins the state
+    # set only via `noo security at-rest migrate`, which switches the service
+    # to alertmanager-data-state below (re-pointing this one would orphan
+    # existing silences).
+    # Alertmanager state (silences / notification log) is non-critical and
+    # this avoids requiring
     # the host dir to pre-exist before `up`.
     driver: local
   grafana-data:
@@ -3104,16 +3117,17 @@ volumes:
     driver_opts:
       type: none
       o: bind
-      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/grafana
+      device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/grafana
   loki-data:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/loki
+      device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/loki
   postgres-data:
     # PostgreSQL needs POSIX ownership/permissions (chmod/chown).
-    # On Linux/macOS NOO_PG_DATA == NOO_DATA_ROOT/postgres (same drive).
+    # On Linux/macOS NOO_PG_DATA == NOO_STATE_ROOT/postgres (NOO_STATE_ROOT
+    # defaults to NOO_DATA_ROOT, same drive); NOO_PG_DATA keeps precedence.
     # On WSL2 with NTFS data root, `noo onboard` redirects NOO_PG_DATA
     # to $HOME/noo/postgres on the ext4 root filesystem
     # (onboard/steps.rs `ensure_pg_data_path`).
@@ -3121,8 +3135,29 @@ volumes:
     driver_opts:
       type: none
       o: bind
-      device: ${NOO_PG_DATA:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/postgres}
+      device: ${NOO_PG_DATA:-${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/postgres}
   claude-config:
+  # i10a: claude-config and alertmanager-data are plain named volumes on /.
+  # They stay exactly that for every install that never migrates: re-pointing
+  # them would orphan existing data (a compose volume cannot switch type on
+  # an env var). `noo security at-rest migrate` copies their data into the
+  # state set and then points NOO_CLAUDE_CONFIG_VOLUME / NOO_ALERTMANAGER_VOLUME
+  # at the two bind volumes below; rollback restores .env and the old named
+  # volumes (never touched) are in use again. Compose creates only the
+  # volumes a started service uses, and a bind volume's device is checked
+  # when it is mounted, so the unused pair costs a non-migrated install nothing.
+  claude-config-state:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/claude-config
+  alertmanager-data-state:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/alertmanager-data
 
 # ── Tier-1 secrets, delivered as FILES (2026-09-29; RAM files 2026-10-19) ──
 # Every entry is sourced from a FILE the launcher writes on every start to a

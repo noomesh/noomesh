@@ -119,7 +119,7 @@ taglines and the handler doc comments):
 | Set up **this machine** as a controller | `noo onboard` | `noo enroll` — joins this machine to an **existing** controller as a worker |
 | Send one **prompt** and get an answer | `noo inference run` (one backend, no memory) or `noo inference agent` (the coordinator's tool loop) | `noo chat` — a streaming conversation that keeps its id across turns; `noo jobs run` — queued through the scheduler |
 | Run one task through several **agent roles** | `noo agents collaborate` | `noo workflow run` — a named multi-step template; `noo agents send` — the agent-to-agent message bus |
-| **Declare** that a node runs a backend with a model | `noo cluster place` (desired state; the node-agent converges) | `noo cluster up`/`down`/`scale` — the older imperative start/stop, forgotten on agent restart |
+| **Declare** that a node runs a backend with a model | `noo cluster place` (desired state; the node-agent converges) | `noo cluster down` — the older imperative stop, forgotten on agent restart (`up` and `scale` are retired) |
 | Schedule something **recurring** | `noo heartbeat` (cron, user-facing tasks) | `noo autonomy` — condition → action self-healing patrols; `noo proactive` — rule-triggered notifications |
 | Upgrade the **binary** or the **fleet's agents** | `noo upgrade` (`--stack`, `--nodes`) / `noo cluster upgrade-agents` | `noo stack rebuild` — rebuilds images from source on a checkout |
 | Change a **security gate** (multi-user, exec approval, external MCP) | `noo security posture set` (DB allow-list, restart to apply) | `noo config set` — every other `noomesh.yaml` key |
@@ -202,7 +202,7 @@ Scripts branch on the code, not on prose.
 
 ### Destructive confirmation (`commands::confirm_destructive`, `noo-cli/src/commands/mod.rs`)
 
-`stack clean`, `cluster down`, `cluster scale` (scale-down),
+`stack clean`, `cluster down`,
 `security pki rotate-all`, `security untrust-ca`, `security team delete`,
 `cluster teardown-node` and the other commands whose usage says
 "asks for confirmation (-y)" share one gate:

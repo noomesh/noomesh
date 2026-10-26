@@ -319,8 +319,8 @@ On a rail node the image never comes from a registry.
 | When | What | How |
 |---|---|---|
 | `noo upgrade` (stack stage, after the roll; a stage with failures warns loudly, and blocks the `--nodes` roll unless `--force` only while some online node runs `NOO_IMAGE_SOURCE=rail`) | every node-bound image in the release-signed `stack.lock` (not `gateway`, `worker`, `trellion*`, `postgres-pgvector`, `deps-*`) | pulled **by lock digest**, for every architecture in the fleet |
-| `noo cluster stage-images [--lock] [-i IMG]… [--arch a,b] [--all-images]` | the lock (default) and/or named images | same; `--all-images` stages the controller-only lock images too |
-| `noo cluster sync-images <node> -i IMG` | a named image, for that node's architecture | then asks the node's agent to pull it now |
+| `noo cluster sync-images --stage-only [--lock] [-i IMG]… [--arch a,b] [--all-images]` | the lock (default) and/or named images | same; `--all-images` stages the controller-only lock images too; stops after staging, no node pulls |
+| `noo cluster sync-images <node> -i IMG` (or `--lock <node>` for the lock's node-bound images) | a named image, for that node's architecture | then asks the node's agent to pull it now |
 | `noo cluster place …` refused with "not staged" | the placement's image | stages it, then places again |
 
 **Multi-arch.** Architectures come from the nodes' reported
@@ -422,8 +422,7 @@ file under its own `MODELS_DIR`/`HF_CACHE_DIR`. Success prints
 `model files synced` and the two commands to start using them:
 
 ```
-noo cluster up llamacpp <file> --node <node>
-noo cluster place-model <node> llamacpp <file>
+noo cluster place <node> llamacpp <file>
 ```
 
 ## Pre-cache models on a schedule

@@ -40,6 +40,27 @@
 # NOO_INSTANCE_UNSAFE_DATA_ROOT=1 is the forensics escape hatch (e.g.
 # stopping/removing a misconfigured instance's containers requires the
 # launchers to run). It exists to be typed deliberately, never defaulted.
+# noo_data_root / noo_state_root — the two roots, resolved the way the compose
+# file resolves them (environment first, then .env; the state root falls back
+# to the data root, exactly `${NOO_STATE_ROOT:-${NOO_DATA_ROOT}}`). The state
+# root holds the SENSITIVE state set (postgres, redis, nats, prometheus,
+# grafana, loki, noo-data); models / hf-cache / ollama / images always stay
+# under the data root. Unset NOO_STATE_ROOT == no change (i10a). Print nothing
+# when neither is set; callers decide whether that is fatal.
+_noo_env_value() {  # <KEY>: environment, else the last KEY= line in .env
+    local _v="${!1:-}"
+    if [ -z "$_v" ] && [ -f ".env" ]; then
+        _v="$(grep -E "^[[:space:]]*$1=" .env | tail -1 | cut -d= -f2- | tr -d ' \t\r"')"
+    fi
+    printf '%s' "$_v"
+}
+noo_data_root() { _noo_env_value NOO_DATA_ROOT; }
+noo_state_root() {
+    local _s
+    _s="$(_noo_env_value NOO_STATE_ROOT)"
+    if [ -n "$_s" ]; then printf '%s' "$_s"; else noo_data_root; fi
+}
+
 noo_instance_guard_data_root() {
     [ "${NOO_INSTANCE_UNSAFE_DATA_ROOT:-}" = "1" ] && return 0
     local root="${NOO_DATA_ROOT:-}"
@@ -48,8 +69,23 @@ noo_instance_guard_data_root() {
     fi
     root="${root:-/var/lib/noo}"  # the standard default (data-root policy)
     case "$root" in
-        *"/instances/${NOO_INSTANCE}"|*"/instances/${NOO_INSTANCE}/"*) return 0 ;;
+        *"/instances/${NOO_INSTANCE}"|*"/instances/${NOO_INSTANCE}/"*) ;;
+        *) _noo_instance_guard_fail "$root"; exit 1 ;;
     esac
+    # A separately-set state root holds postgres/redis/nats too (i10a): it must
+    # be instance-scoped as well, or two instances share one database.
+    local sroot
+    sroot="$(_noo_env_value NOO_STATE_ROOT)"
+    if [ -n "$sroot" ]; then
+        case "$sroot" in
+            *"/instances/${NOO_INSTANCE}"|*"/instances/${NOO_INSTANCE}/"*) ;;
+            *) _noo_instance_guard_fail "$sroot"; exit 1 ;;
+        esac
+    fi
+    return 0
+}
+_noo_instance_guard_fail() {
+    local root="$1"
     echo "FATAL: instance '${NOO_INSTANCE}' would use data root '${root}'," >&2
     echo "which is not instance-scoped (…/instances/${NOO_INSTANCE}). Every" >&2
     echo "stateful volume device-binds under that root, so this instance" >&2

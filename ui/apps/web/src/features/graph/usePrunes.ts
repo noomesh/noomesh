@@ -2,6 +2,7 @@
 // Copyright 2026 PersonifAI LLC
 
 import { useQuery, useMutation, useQueryClient, useMetisClient } from '@metis/core';
+import { num } from '@/lib/num';
 
 /**
  * The graph_prune staging area: entities and edges the prune task soft-deleted,
@@ -32,8 +33,9 @@ export interface StagedPrune {
   stagedAt: string;
   runId: string | null;
   /** Entities: edges + mentions captured in the snapshot. */
-  edgeCount?: number;
-  mentionCount?: number;
+  /** null = the gateway did not send it (renders a dash, never 0). */
+  edgeCount?: number | null;
+  mentionCount?: number | null;
   /** Edges: confidence at staging time. */
   confidence?: number | null;
   /** When the retention purge may delete the row (staged_at + window), ms epoch. */
@@ -43,8 +45,9 @@ export interface StagedPrune {
 export interface StagedPrunes {
   rows: StagedPrune[];
   /** Un-restored totals across the whole table, not just the returned page. */
-  entityTotal: number;
-  edgeTotal: number;
+  /** null = the gateway sent no counts map (renders a dash, never 0). */
+  entityTotal: number | null;
+  edgeTotal: number | null;
   /** Server note — present when the staging table does not exist yet. */
   note: string | null;
 }
@@ -71,8 +74,13 @@ export function daysLeft(purgeAt: number | null, now: number = Date.now()): numb
   return Math.max(0, Math.ceil((purgeAt - now) / DAY_MS));
 }
 
-const sum = (m: Record<string, number> | undefined) =>
-  Object.values(m ?? {}).reduce((a, n) => a + (Number(n) || 0), 0);
+/** Sum of a counts map; null when the map is absent. A non-numeric entry is skipped. */
+const sum = (m: Record<string, number> | undefined): number | null =>
+  m === undefined || m === null ? null : Object.values(m).reduce((a, n) => a + (num(n) ?? 0), 0);
+
+/** max(reported total, rows actually returned); null when no total was reported. */
+const floorTotal = (reported: number | null, shown: number): number | null =>
+  reported === null ? null : Math.max(reported, shown);
 
 export const STAGED_KEY = ['graph', 'prune', 'staged'];
 
@@ -103,8 +111,8 @@ export function useStagedPrunes() {
           reason: e.reason ?? '',
           stagedAt: e.staged_at ?? '',
           runId: e.run_id ?? null,
-          edgeCount: e.edge_count ?? 0,
-          mentionCount: e.mention_count ?? 0,
+          edgeCount: num(e.edge_count),
+          mentionCount: num(e.mention_count),
           purgeAt: purge(e.staged_at),
         }));
 
@@ -122,15 +130,16 @@ export function useStagedPrunes() {
           purgeAt: purge(e.staged_at),
         }));
 
-      // One list, newest first. Rows with an unreadable time sink to the end.
+      // One list, newest first. Rows with an unreadable time sink to the end
+      // (the `?? 0` is a sort key, not a displayed number).
       const rows = [...entities, ...edges].sort(
         (a, b) => (parsePgTime(b.stagedAt) ?? 0) - (parsePgTime(a.stagedAt) ?? 0),
       );
 
       return {
         rows,
-        entityTotal: Math.max(sum(data.counts), entities.length),
-        edgeTotal: Math.max(sum(data.edge_counts), edges.length),
+        entityTotal: floorTotal(sum(data.counts), entities.length),
+        edgeTotal: floorTotal(sum(data.edge_counts), edges.length),
         note: data.note ?? null,
       };
     },
@@ -141,8 +150,8 @@ export interface RestoreOutcome {
   status: string;
   /** Entities: the snapshot was grafted onto a re-extracted same name+type entity. */
   grafted: boolean;
-  edgesRestored: number;
-  edgesSkipped: number;
+  edgesRestored: number | null;
+  edgesSkipped: number | null;
 }
 
 /**
@@ -175,8 +184,8 @@ export function useRestorePrune() {
       return {
         status: r.status ?? 'restored',
         grafted: r.grafted_onto_existing ?? false,
-        edgesRestored: r.edges_restored ?? 0,
-        edgesSkipped: r.edges_skipped ?? 0,
+        edgesRestored: num(r.edges_restored),
+        edgesSkipped: num(r.edges_skipped),
       };
     },
     // Prefix ['graph'] covers the staged list AND the map: a restored entity

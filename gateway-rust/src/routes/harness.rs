@@ -350,24 +350,31 @@ async fn harness_call(
             crate::task_budget::ask(&state, &task, &question).await.map_err(AppError::from)?;
             json!({"asked": true})
         }
-        HarnessOp::TaskDone { task_id, result, failed } => {
+        HarnessOp::TaskDone { task_id, result, failed, text_answer } => {
             // The same ownership rule as the checkpoint: this token's
             // conversation, this token's person.
             let task = crate::tasks::get(&state.db, &task_id).await.map_err(|e| AppError::Internal(e.to_string()))?;
             let Some(task) = task.filter(|t| t.conversation_id == conv && t.owner.as_deref() == Some(user)) else {
                 return Err(AppError::Forbidden("harness rail: that task is not this turn's".into()).into());
             };
-            // The door's rule (`noo_task_done` from /mcp/user): no evidence
-            // gate — the CLI's tools ran on the node, outside the record —
-            // and the same unprefixed result, posted the same way.
-            let changed = crate::tasks::finish(&state.db, &task.id, !failed, &result, /* require_tool_use */ false)
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            if changed {
-                crate::tools::post_task_result(&state, &task, user, !failed, &result).await;
+            if text_answer {
+                // i171: a native loop on a node answered in text. Its tool
+                // calls ARE on record, so the native evidence mark applies.
+                let after = crate::tasks::finish_text(&state, &task.id, &result).await.map_err(|e| AppError::Internal(e.to_string()))?;
+                json!({"state": after, "changed": after != task.state})
+            } else {
+                // The door's rule (`noo_task_done` from /mcp/user): no evidence
+                // gate — the CLI's tools ran on the node, outside the record —
+                // and the same unprefixed result, posted the same way.
+                let changed = crate::tasks::finish(&state.db, &task.id, !failed, &result, /* require_tool_use */ false)
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                if changed {
+                    crate::tools::post_task_result(&state, &task, user, !failed, &result).await;
+                }
+                let after = crate::tasks::get(&state.db, &task.id).await.map_err(|e| AppError::Internal(e.to_string()))?.map(|t| t.state).unwrap_or_else(|| "failed".into());
+                json!({"state": after, "changed": changed})
             }
-            let after = crate::tasks::get(&state.db, &task.id).await.map_err(|e| AppError::Internal(e.to_string()))?.map(|t| t.state).unwrap_or_else(|| "failed".into());
-            json!({"state": after, "changed": changed})
         }
         HarnessOp::DoorKey => {
             // The person must still hold an active account: a disabled one

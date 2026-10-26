@@ -2,6 +2,7 @@
 // Copyright 2026 PersonifAI LLC
 
 import { cn } from '@/lib/utils';
+import { dash } from '@/lib/num';
 import type { ClusterNode } from '@/features/cluster/types';
 import { gpuContentionLine } from '@/features/cluster/gpuContention';
 
@@ -12,7 +13,7 @@ const fmt = (n: number | undefined, digits = 1) => (n == null ? '—' : n.toFixe
 export function NodeCard({ node }: { node: ClusterNode }) {
   const vram =
     node.vramUsed != null
-      ? `${fmt(node.vramUsed)} / ${node.vramTotal ?? 0} GB`
+      ? `${fmt(node.vramUsed)} / ${dash(node.vramTotal ?? null)} GB`
       : node.vramTotal
         ? `${node.vramTotal} GB`
         : '—';
@@ -20,7 +21,7 @@ export function NodeCard({ node }: { node: ClusterNode }) {
     node.cpuPct != null ? `${node.cpuPct}% · ${node.cpuCores ?? '?'}c` : `${node.cpuCores ?? '?'} cores`;
   const ram =
     node.ramUsed != null
-      ? `${fmt(node.ramUsed, 0)} / ${node.ramTotal ?? 0} GB`
+      ? `${fmt(node.ramUsed, 0)} / ${dash(node.ramTotal ?? null)} GB`
       : node.ramTotal
         ? `${node.ramTotal} GB`
         : '—';
@@ -35,7 +36,7 @@ export function NodeCard({ node }: { node: ClusterNode }) {
           <div className="ip">{node.ip || '—'}</div>
         </div>
         <div className="tags">
-          <span className="tier">T{node.tier}</span>
+          <span className="tier">T{dash(node.tier)}</span>
           <span className={cn('st', node.status)}>{node.status}</span>
         </div>
       </div>

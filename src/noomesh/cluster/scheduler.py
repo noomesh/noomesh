@@ -16,8 +16,8 @@ What remains in Python, and why:
   `reprioritize_job`, pause/resume, drain/undrain, `get_status`,
   `get_job_history`) — it writes the same Redis keys the Rust engine
   reads. (Its NATS worker callers were unregistered reference bodies and
-  were archived in `legacy/python-workers-reference/` by the 2026-08-08
-  sweep; the CLI/HTTP surface is Rust, `routes/jobs.rs`.)
+  were removed in the 2026-08-08
+  sweep (history in git log before that); the CLI/HTTP surface is Rust, `routes/jobs.rs`.)
 
 That is ALL. The background-producer loop (`run()` +
 `register_background_provider` + `cluster/background_providers.py`) was

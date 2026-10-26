@@ -862,7 +862,7 @@ fn verified_payloads(
     } else {
         base.join("pki")
     };
-    verify_bundle(stage, &anchors.join("ca.crt"), me)?;
+    verify_bundle(stage, &anchors.join("ca.crt"), me, SelfUpdate::Allowed)?;
     // Verified. Read every payload while the stage is still root's alone;
     // everything after this is decided and installed from these bytes.
     let payloads: Payloads = std::fs::read_dir(stage.join("files"))
@@ -2664,7 +2664,19 @@ fn verify_header(manifest: &str, node: &str) -> Result<(), String> {
 /// never anything read out of the bundle: in a re-targeting attack the
 /// bundle carries the victim's identity files too, so a check against the
 /// bundle's own contents would only agree with itself.
-fn verify_bundle(stage: &Path, ca: &Path, node: &str) -> Result<(), String> {
+/// Whether `verify_bundle` may install a bundled CLI over this one and ask
+/// for a re-exec. The daemon allows it; a test never does, because the
+/// install target is the real `/usr/local/bin/noo` of whatever runs the
+/// test (the batch container runs as root, and did install a fixture).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SelfUpdate {
+    Allowed,
+    /// Only tests pass this: every daemon path allows the self-update.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Never,
+}
+
+fn verify_bundle(stage: &Path, ca: &Path, node: &str, self_update: SelfUpdate) -> Result<(), String> {
     let manifest = stage.join("manifest");
     let sig = stage.join("manifest.sig");
     if !manifest.is_file() || !sig.is_file() {
@@ -2682,12 +2694,12 @@ fn verify_bundle(stage: &Path, ca: &Path, node: &str) -> Result<(), String> {
         return Err(format!("could not read the CA public key: {o}"));
     }
     std::fs::write(&ca_pub, format!("{o}\n")).map_err(|e| format!("stage: {e}"))?;
-    let r = verify_bundle_with(stage, ca, &ca_pub, node);
+    let r = verify_bundle_with(stage, ca, &ca_pub, node, self_update);
     let _ = std::fs::remove_dir_all(&keys);
     r
 }
 
-fn verify_bundle_with(stage: &Path, ca: &Path, ca_pub: &Path, node: &str) -> Result<(), String> {
+fn verify_bundle_with(stage: &Path, ca: &Path, ca_pub: &Path, node: &str, self_update: SelfUpdate) -> Result<(), String> {
     let manifest = stage.join("manifest");
     manifest_shape_ok(&std::fs::read(&manifest).map_err(|e| format!("manifest: {e}"))?)?;
     // The signing-key rule, noo-apply.sh §1 in Rust. Two arms:
@@ -2711,6 +2723,33 @@ fn verify_bundle_with(stage: &Path, ca: &Path, ca_pub: &Path, node: &str) -> Res
     record_verified(via, ca, &signing_pub);
     let text = std::fs::read_to_string(&manifest).map_err(|e| format!("manifest: {e}"))?;
     verify_header(&text, node)?;
+    // A bundle that carries a CLI other than the one reading it is judged by
+    // THAT CLI: install it and re-run this apply under it before a single
+    // kind or env key is validated. Refusing first was a deadlock twice over:
+    // host6 sat on noo-cli-v0.5.35 from the day `harness-binary` was added
+    // (2026-09-19), refusing on every tick the very bundle that would have
+    // taught it the kind; mcmini on noo-cli-v0.6.9 refused the 0.6.10 bundle
+    // outright (2026-10-23) because its agent-env named `NODE_AGENT_BIND`,
+    // a key its allow-list predated — and the unknown-kind trigger below
+    // never fired, since every KIND was known.
+    //
+    // The Linux applier has never had this problem: `noo-apply.sh` installs
+    // a bundled `applier` and re-execs on the SAME bundle before it validates
+    // anything (§1b, NOO_APPLY_REEXEC guards the loop). This is that, for the
+    // Mac's Rust applier.
+    //
+    // Safe at this point and not before: the manifest's SIGNATURE is already
+    // verified above, so the sha this checks against is the controller's
+    // own. Same discipline as the Linux lane — verify the payload against the
+    // signed manifest, floor-check it, install, then re-run and let the NEW
+    // binary decide. A same-bytes CLI, an unprivileged run, or the re-exec
+    // pass itself all fall through to the validation below; so does a test,
+    // which must never write the host's /usr/local/bin/noo.
+    if self_update == SelfUpdate::Allowed {
+        if let Some(rc) = self_update_and_reexec(&text, &stage.join("files"))? {
+            return Err(rc);
+        }
+    }
     let mut named = std::collections::HashSet::new();
     for line in text.lines() {
         if line.starts_with('#') {
@@ -2719,26 +2758,9 @@ fn verify_bundle_with(stage: &Path, ca: &Path, ca_pub: &Path, node: &str) -> Res
         let mut it = line.split_whitespace();
         let (Some(sum), Some(kind)) = (it.next(), it.next()) else { continue };
         if !KNOWN_KINDS.contains(&kind) {
-            // A kind this CLI does not know means the bundle is NEWER than
-            // the binary reading it — and the bundle is carrying the newer
-            // binary. Refusing here was a deadlock: host6 sat on
-            // noo-cli-v0.5.35 from the day `harness-binary` was added
-            // (2026-09-19), refusing on every tick the very bundle that
-            // would have taught it the kind.
-            //
-            // The Linux applier has never had this problem: `noo-apply.sh`
-            // installs a bundled `applier` and re-execs on the SAME bundle
-            // before it validates anything (NOO_APPLY_REEXEC guards the
-            // loop). This is that, for the Mac's Rust applier.
-            //
-            // Safe at this point and not before: the manifest's SIGNATURE
-            // is already verified above, so the sha this checks against is
-            // the controller's own. Same discipline as the Linux lane —
-            // verify the payload against the signed manifest, install, then
-            // re-run and let the NEW binary decide about the kinds.
-            if let Some(rc) = self_update_and_reexec(&text, &stage.join("files"))? {
-                return Err(rc);
-            }
+            // The self-update above already ran: reaching here means the
+            // bundle's CLI IS this binary (or there is none), so the kind is
+            // genuinely unknown to the newest CLI the controller has.
             return Err(format!("unknown kind '{kind}' — this CLI is older than the bundle; run `noo upgrade` (76)"));
         }
         let f = stage.join("files").join(kind);
@@ -3225,7 +3247,7 @@ mod tests {
     }
 
     fn verify(f: &Fixture) -> Result<(), String> {
-        verify_bundle(&f.dir.join("stage"), &f.dir.join("pki/ca.crt"), "host3")
+        verify_bundle(&f.dir.join("stage"), &f.dir.join("pki/ca.crt"), "host3", SelfUpdate::Never)
     }
 
     /// Countersign the staged manifest with `key` into `manifest.xsig.<n>`,
@@ -3637,6 +3659,33 @@ mod tests {
         let at = src.find("fn self_update_and_reexec(").unwrap();
         let f = &src[at..at + src[at..].find("\n}\n").unwrap()];
         assert!(f.find("apply_generation_of(&payload)").unwrap() < f.find("root_install(&payload").unwrap());
+    }
+
+    /// mcmini on noo-cli-v0.6.9 refused the 0.6.10 bundle with exit 65
+    /// (`NODE_AGENT_BIND` unknown to its env allow-list) and never reached the
+    /// CLI that bundle carried: the self-update only ran on an unknown KIND.
+    /// It now runs before any kind or env key is judged, as noo-apply.sh §1b.
+    #[test]
+    fn the_bundled_cli_is_installed_before_any_kind_or_env_key_is_judged() {
+        let src = include_str!("node_fetch.rs");
+        let at = src.find("fn verify_bundle_with(").unwrap();
+        let f = &src[at..at + src[at..].find("\n}\n").unwrap()];
+        let update = f.find("self_update_and_reexec(&text").unwrap();
+        assert!(update < f.find("KNOWN_KINDS.contains(&kind)").unwrap(), "self-update after the kind check");
+        assert_eq!(f.matches("self_update_and_reexec(").count(), 1, "one trigger, ahead of every check");
+        // and the env allow-list is judged only after verify_bundle returned
+        let apply = src.find("verify_bundle(stage, &anchors.join(\"ca.crt\"), me, SelfUpdate::Allowed)?;").unwrap();
+        assert!(apply < src[apply..].find("env_payloads_ok(&payloads)?;").unwrap() + apply);
+    }
+
+    /// Tests verify fixtures with `SelfUpdate::Never`: the batch container
+    /// runs as root, and run-212726 installed a fixture over its own
+    /// /usr/local/bin/noo before this knob existed.
+    #[test]
+    fn tests_never_install_the_fixture_cli() {
+        let src = include_str!("node_fetch.rs");
+        let at = src.find("fn verify(f: &Fixture)").unwrap();
+        assert!(src[at..at + 200].contains("SelfUpdate::Never"));
     }
 
     /// Review item 9: the root apply trusts a root-owned copy, taken once

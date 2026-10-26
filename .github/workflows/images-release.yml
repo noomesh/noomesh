@@ -158,6 +158,11 @@ jobs:
       # rc.N's commit): it re-tags rc.N's images, and still mints and signs
       # its own lock. The rules, and why each fails open to BUILD, are in the
       # script.
+      #
+      # An rc on a NEW tree is diffed against the highest lower rc and only
+      # the images whose declared inputs changed build
+      # (scripts/release-image-inputs.json); a change to this workflow or
+      # the other lane files rebuilds everything.
       - name: Plan — re-tag from the rc, or build
         id: plan
         env:
@@ -304,7 +309,7 @@ jobs:
           mkdir -p bases
           d="$(docker buildx imagetools inspect "$REGISTRY/$DHI_OWNER/deps-core:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')"
           echo "deps-core@$d" | tee bases/deps-core
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: bases-deps-core
           path: bases/deps-core
@@ -380,7 +385,7 @@ jobs:
           echo "source:trellion@${sha}" > digests/source-trellion
           echo "trellion source: ${sha}"
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: digest-source-trellion
           path: digests/source-trellion
@@ -485,7 +490,7 @@ jobs:
           mkdir -p bases
           d="$(docker buildx imagetools inspect "$REGISTRY/$DHI_OWNER/deps-base:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')"
           echo "deps-base@$d" | tee bases/deps-base
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: bases-deps-base
           path: bases/deps-base
@@ -795,7 +800,7 @@ jobs:
           mkdir -p digests
           d="$(docker buildx imagetools inspect "$REGISTRY/$OWNER/${{ matrix.image }}:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')"
           echo "${{ matrix.image }}@$d" | tee "digests/${{ matrix.image }}"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: digest-${{ matrix.image }}
           path: digests/${{ matrix.image }}

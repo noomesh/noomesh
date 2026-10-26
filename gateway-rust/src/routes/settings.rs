@@ -1543,6 +1543,32 @@ struct FlagSpec {
 /// `routes::kiosk::graph_labels_on`.
 pub(crate) const KIOSK_GRAPH_LABELS: &str = "kiosk.graph_labels";
 
+/// The recorded at-rest opt-out (i10a): the person has accepted that this
+/// controller's data is stored unencrypted on disk. `cluster verify` reads it
+/// to show the at-rest rows as "accepted risk" instead of warning on every
+/// run. Who and when are the row's `updated_by`/`updated_at` plus the audit
+/// event, so it is PERSON-ONLY (see [`PERSON_ONLY_FLAGS`]).
+pub(crate) const AT_REST_UNENCRYPTED_ACCEPTED: &str = "at_rest.unencrypted_accepted";
+
+/// The recorded acknowledgement of the encrypted state volume's recovery key
+/// (i10a PR-C): `noo security at-rest create-volume` (and onboard) shows the
+/// key once on a terminal, the person retypes part of it, and this records
+/// who confirmed storing it off the machine and when. Person-only for the
+/// same reason as [`AT_REST_UNENCRYPTED_ACCEPTED`].
+pub(crate) const AT_REST_RECOVERY_KEY_ACKNOWLEDGED: &str = "at_rest.recovery_key_acknowledged";
+
+/// Flags only a person's own credential may set. A flag whose whole value is
+/// "who decided this" must not be writable by the cluster-HMAC credential
+/// (recorded as `cluster-cli`) or a service key. Checked in
+/// `settings_flags_set` before any write.
+pub(crate) const PERSON_ONLY_FLAGS: &[&str] = &[AT_REST_UNENCRYPTED_ACCEPTED, AT_REST_RECOVERY_KEY_ACKNOWLEDGED];
+
+/// Whether `key` needs a person to set it: a flag in [`PERSON_ONLY_FLAGS`] or
+/// a setting that decides where results go.
+pub(crate) fn needs_person(key: &str) -> bool {
+    PERSON_ONLY_FLAGS.contains(&key) || crate::task_guard::EGRESS_TARGET_SETTINGS.contains(&key)
+}
+
 /// Mirror of `noomesh/settings.py::_FLAGS` (same order, same defaults).
 const FLAG_REGISTRY: &[FlagSpec] = &[
     // ── Autonomy ──
@@ -1590,6 +1616,29 @@ const FLAG_REGISTRY: &[FlagSpec] = &[
                Off: the display gets ids, types and degrees only. The page shows LABELS ON \
                while it is on. Applied on the next kiosk fetch (within ~15s), no restart. \
                CLI: noo kiosk labels on|off|status.",
+        db_only: true },
+    // ── At rest ──
+    //
+    // The recorded decision to leave this controller's data unencrypted on
+    // disk. DB-only and person-only: the row's `updated_by`/`updated_at` and
+    // the audit event say who accepted the risk and when, and an env var or a
+    // service credential could say neither.
+    FlagSpec { key: AT_REST_UNENCRYPTED_ACCEPTED, category: "security", default: false,
+        label: "Unencrypted data at rest accepted",
+        help: "Record that you accept this controller's data being stored unencrypted on \
+               disk (anyone with the drive can read it). `noo cluster verify` then shows the \
+               at-rest rows as accepted risk instead of warning. Set by a person only. \
+               CLI: noo security at-rest opt-out|opt-in|status.",
+        db_only: true },
+    // The person confirmed storing the state volume's recovery key off this
+    // machine (shown once, never stored). DB-only and person-only: who and
+    // when are the whole value.
+    FlagSpec { key: AT_REST_RECOVERY_KEY_ACKNOWLEDGED, category: "security", default: false,
+        label: "At-rest recovery key acknowledged",
+        help: "Recorded when a person confirms storing the encrypted state volume's \
+               recovery key off this machine (it is shown once and never stored). \
+               `noo cluster verify` warns until it is set. Set by a person only. \
+               CLI: noo security at-rest create-volume.",
         db_only: true },
 ];
 
@@ -1827,11 +1876,11 @@ async fn settings_flags_set(
     // Settings that decide where results go (the reports folder) are a person's: a door that could set
     // one would redirect every report, and the scheduled-task guard treats the configured target as
     // already registered.
-    if crate::task_guard::EGRESS_TARGET_SETTINGS.contains(&key.as_str())
+    if needs_person(&key)
         && !matches!(crate::task_guard::resolve_origin(&state.db, &ctx).await, crate::task_guard::Origin::Person { .. })
     {
         return Err(AppError::Forbidden(format!(
-            "{key} decides where results are delivered, so it is set by a person's own credential (an MCP door, agent or service identity cannot)"
+            "{key} records a person's decision (or decides where results are delivered), so it is set by a person's own credential (an MCP door, agent or service identity cannot)"
         )));
     }
     // Registered STRING settings share this endpoint: the raw text value is
@@ -3092,6 +3141,75 @@ mod tests {
         // An ordinary flag keeps its env layer.
         let cloud = super::FLAG_REGISTRY.iter().find(|f| f.key == "CLOUD_PROVIDERS_ENABLED").unwrap();
         assert_eq!(super::flag_resolution(cloud, None, Some("1")), (true, "env"));
+    }
+
+    // ── at_rest.unencrypted_accepted: registered, DB-only, person-only ──
+
+    /// Registered off and DB-only: an env var cannot stand in for a recorded
+    /// decision, and "never set" is "not accepted".
+    #[test]
+    fn at_rest_accepted_is_registered_off_and_db_only() {
+        let spec = super::FLAG_REGISTRY
+            .iter()
+            .find(|f| f.key == super::AT_REST_UNENCRYPTED_ACCEPTED)
+            .expect("at_rest.unencrypted_accepted is not in the flag registry");
+        assert_eq!(spec.key, "at_rest.unencrypted_accepted");
+        assert!(!spec.default, "accepting plaintext at rest must be a recorded choice, never the default");
+        assert!(spec.db_only);
+        assert_eq!(super::flag_resolution(spec, None, Some("1")), (false, "default"));
+        assert_eq!(super::flag_resolution(spec, Some("1"), None), (true, "db"));
+    }
+
+    /// The HMAC credential (no requester context) and a service key are not a
+    /// person, so `settings_flags_set` refuses them for this flag (403); a
+    /// person's own token passes the gate. Uses the same origin test the
+    /// handler does.
+    #[test]
+    fn only_a_person_may_record_the_at_rest_decision() {
+        use crate::auth::Role;
+        use crate::task_guard::{origin_of_requester, Origin};
+        let key = super::AT_REST_UNENCRYPTED_ACCEPTED;
+        assert!(super::needs_person(key));
+        assert!(super::needs_person("NOO_REPORTS_DRIVE_FOLDER_ID"), "the egress settings stay person-only");
+        assert!(!super::needs_person("CLOUD_PROVIDERS_ENABLED"), "an ordinary flag is not person-only");
+        // cluster HMAC: no requester context
+        assert!(!matches!(origin_of_requester(None), Origin::Person { .. }), "the HMAC caller was treated as a person");
+        // a service key, even with an Admin role
+        let mut svc = ctx(Role::Admin, &[]);
+        svc.sub = "key:trading".into();
+        assert!(!matches!(origin_of_requester(Some(&svc)), Origin::Person { .. }), "a service key was treated as a person");
+        // a person's own token
+        let mut alice = ctx(Role::Operator, &[]);
+        alice.sub = "alice".into();
+        assert!(matches!(origin_of_requester(Some(&alice)), Origin::Person { .. }));
+    }
+
+    /// i10a PR-C: the recovery-key acknowledgement is registered off,
+    /// DB-only, and person-only like the opt-out.
+    #[test]
+    fn the_recovery_key_acknowledgement_is_db_only_and_person_only() {
+        let spec = super::FLAG_REGISTRY
+            .iter()
+            .find(|f| f.key == super::AT_REST_RECOVERY_KEY_ACKNOWLEDGED)
+            .expect("at_rest.recovery_key_acknowledged is not in the flag registry");
+        assert_eq!(spec.key, "at_rest.recovery_key_acknowledged");
+        assert!(!spec.default, "an acknowledgement is recorded, never assumed");
+        assert!(spec.db_only);
+        assert_eq!(super::flag_resolution(spec, None, Some("1")), (false, "default"), "no env var stands in for it");
+        assert!(super::needs_person(super::AT_REST_RECOVERY_KEY_ACKNOWLEDGED));
+        assert!(super::needs_person(super::AT_REST_UNENCRYPTED_ACCEPTED), "the opt-out stays person-only");
+    }
+
+    /// The handler calls the person gate before any write (the string
+    /// registry branch, the first write path, comes after it).
+    #[test]
+    fn the_flag_setter_checks_the_person_gate_before_writing() {
+        let src = include_str!("settings.rs");
+        let set = &src[src.find("async fn settings_flags_set(").unwrap()..];
+        let gate = set.find("needs_person(&key)").expect("the setter does not call needs_person");
+        let first_write = set.find("INSERT INTO noo_settings").unwrap();
+        assert!(gate < first_write, "the person gate must come before the first write");
+        assert!(set[gate..first_write].contains("AppError::Forbidden"), "a refused caller must get 403");
     }
 }
 

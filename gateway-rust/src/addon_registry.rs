@@ -39,9 +39,12 @@
 //! The CLI verifies a lock (`noo addons enable | upgrade`: `addon_lock::verify`
 //! against the key in the installed entitlement, then `supports_stack`),
 //! pins it in `addons.lock`, and the LAUNCHER re-verifies it offline on every
-//! `noo stack start | restart` (`noo addons launch-pins`) and refuses to start
-//! a composed add-on without a good pin. The launcher then hands the gateway
-//! the result it just computed, in `NOO_ADDONS_VERIFIED`:
+//! `noo stack start | restart` (`noo addons launch-pins`) and leaves a
+//! composed add-on without a good pin out of the start (loudly: a `REFUSED
+//! add-on` line; the rest of the stack starts). The launcher then hands the
+//! gateway the result it just computed, in `NOO_ADDONS_VERIFIED`, which never
+//! names a refused add-on (so a routes.json it left in the routes volume on an
+//! earlier start is refused here, not served):
 //!
 //! | value | meaning |
 //! |---|---|
@@ -74,8 +77,9 @@
 //!
 //! An install that upgrades into this keeps its enabled add-ons on the first
 //! boot: the new launcher's `launch-pins` already verifies every composed
-//! licensed add-on (a pin that does not verify stopped the start before the
-//! gateway came up), so the verdict names them. A gateway started WITHOUT a
+//! licensed add-on (a pin that does not verify keeps that add-on out of the
+//! start and out of the verdict), so the verdict names exactly the add-ons
+//! that run. A gateway started WITHOUT a
 //! verdict (an older launcher on the first boot) keeps loading the compiled
 //! HTTP add-ons exactly as before and says so ([`Verification::LegacyLauncher`]);
 //! it never extends that grandfathering to a name the table does not know.
@@ -1245,6 +1249,26 @@ mod tests {
         plant(&dir, EX, &third_party(EX));
         let snap = run_decls(&dir, Some(&ex_system()), &[(EX, true)], &verified(&[(EX, "0.1.0", "v0.0.1")]));
         assert!(snap.declared_systems().is_empty());
+    }
+
+    #[test]
+    fn a_launcher_refused_addon_is_not_served_from_a_stale_manifest_or_system() {
+        // 2026-10-24: a stale pin no longer refuses the whole start; the
+        // launcher leaves the add-on out and hands the gateway a verdict that
+        // does not name it. Its routes.json and system.json from an earlier
+        // start are still on disk: neither may be served or provisioned.
+        let dir = scratch("launcher-refused");
+        plant(&dir, EX, &third_party(EX));
+        plant(&dir, "pai-voice", &third_party("pai-voice"));
+        let reported = verified(&[("pai-voice", "0.3.0", STACK)]);
+        let snap = run_decls(&dir, Some(&ex_system()), &[(EX, true), ("pai-voice", true)], &reported);
+        assert!(snap.get(EX).is_none(), "a refused add-on's stale manifest must never register routes");
+        assert!(snap.refusal(EX).is_some_and(|w| w.contains("no verified lock")), "{:?}", snap.refused);
+        assert!(snap.declared_systems().is_empty(), "nor provision its stale system.json");
+        assert!(snap.get("pai-voice").is_some(), "the other add-on still loads");
+        // `none` (every add-on refused) is the same answer.
+        let snap = run_decls(&dir, Some(&ex_system()), &[(EX, true)], &verified(&[]));
+        assert!(snap.get(EX).is_none() && snap.refusal(EX).is_some());
     }
 
     #[test]

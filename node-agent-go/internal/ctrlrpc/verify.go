@@ -161,3 +161,34 @@ func (v *Verifier) controllerCert(b64 string, now time.Time) (*x509.Certificate,
 	v.mu.Unlock()
 	return cert, nil
 }
+
+// VerifyDetached checks a signature made by the controller's leaf over msg:
+// the certificate (base64 DER) must chain to the cluster CA and carry the
+// controller organization, and sig (base64 ASN.1 DER ECDSA) must verify
+// against it under alg ("ES256" or "ES384"). It has no replay set: the caller
+// binds msg to a fresh nonce of its own. The tunnel handshake uses it to
+// prove that the gateway at the other end of a connection is the controller.
+func (v *Verifier) VerifyDetached(msg []byte, alg, sigB64, certB64 string) error {
+	now := v.now()
+	cert, err := v.controllerCert(certB64, now)
+	if err != nil {
+		return err
+	}
+	var algo x509.SignatureAlgorithm
+	switch alg {
+	case "ES256":
+		algo = x509.ECDSAWithSHA256
+	case "ES384":
+		algo = x509.ECDSAWithSHA384
+	default:
+		return refuse("unsupported signature algorithm %q", alg)
+	}
+	sig, err := base64.StdEncoding.DecodeString(sigB64)
+	if err != nil {
+		return refuse("signature is not base64")
+	}
+	if err := cert.CheckSignature(algo, msg, sig); err != nil {
+		return refuse("signature does not verify against the controller certificate")
+	}
+	return nil
+}

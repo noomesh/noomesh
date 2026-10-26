@@ -2643,7 +2643,7 @@ pub async fn apply(db: &PgPool) -> Result<(), String> {
 /// so both engines migrate as the SAME role. Diverging here would mean the
 /// two paths create tables with different owners, and the role migrations
 /// (033/034/038) assume one.
-fn migration_dsn() -> Option<String> {
+pub(crate) fn migration_dsn() -> Option<String> {
     for key in [
         "NOO_MIGRATIONS_DSN",
         "PAGEINDEX_DSN",

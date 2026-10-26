@@ -28,6 +28,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::{scoped_user, ClusterNode, RequesterCtx};
+use crate::measured::{put_into, Measured};
 use crate::state::AppState;
 use super::{AppResult, AppError};
 
@@ -484,53 +485,36 @@ async fn channels_status(State(_state): State<Arc<AppState>>) -> AppResult {
     let mut registered = 0u32;
 
     for &(name, keys) in CHANNEL_ENV_KEYS {
-        // What this actually measures: "at least one env var for this channel
-        // is set and non-empty". It was emitted as `registered: true`, which
-        // reads as "the adapter is live and the channel API accepted us" — a
-        // revoked or expired token still produced `registered: true`. The
-        // measurement is kept under the name that describes it (`configured`);
-        // `registered` stays in the payload for existing consumers but is now
-        // null, because no channel-API probe is performed here.
+        // `configured` = at least one env var for this channel is set and
+        // non-empty; `registered` is null because no channel-API probe is made.
         // Through `secret_env`: the credentials arrive as `/run/secrets`
         // files (`<NAME>_FILE`), so a plain env lookup would say "not
         // configured" for every channel that is.
         let configured = keys.iter().any(|k| crate::config::secret_env::secret_opt(k).is_some());
         if configured {
             registered += 1;
-            channels.insert(name.to_string(), json!({
-                "configured": true,
-                "registered": Value::Null,
-                "registered_detail": "unknown — this endpoint only checks that \
-                    the channel's credential env vars are non-empty. No call is \
-                    made to the channel API, so a revoked, expired or \
-                    misscoped token is indistinguishable from a working one.",
-                // Was {"received": 0, "sent": 0, "errors": 0} — hardcoded
-                // zeros that told every operator "0 errors, forever". Nothing
-                // in this process counts channel traffic.
-                "stats": Value::Null,
-                "stats_detail": "not tracked — per-channel received/sent/error \
-                    counters do not exist in the gateway; the previous zeros \
-                    were literals, not measurements.",
-            }));
+            let mut ch = json!({ "configured": true });
+            put_into(&mut ch, "registered", Measured::<bool>::unmeasured(
+                "unknown — this endpoint only checks that the channel's \
+                 credential env vars are non-empty. No call is made to the \
+                 channel API, so a revoked, expired or misscoped token is \
+                 indistinguishable from a working one."));
+            put_into(&mut ch, "stats", Measured::<Value>::unmeasured(
+                "not tracked — per-channel received/sent/error counters do \
+                 not exist in the gateway"));
+            channels.insert(name.to_string(), ch);
         }
     }
 
-    Ok(Json(json!({
-        // Renamed meaning is documented rather than the key: this counts
-        // channels whose credentials are configured, not channels confirmed
-        // registered with their provider.
-        "channels_registered": registered,
-        "channels_registered_detail": "count of channels with non-empty \
-            credential env vars; not a confirmation that any adapter is \
-            registered with its provider.",
-        "channels": channels,
-        // Was a literal 0. The gateway keeps no channel-conversation registry,
-        // so "0 active conversations" was an assertion it could not make.
-        "active_conversations": Value::Null,
-        "active_conversations_detail": "not tracked — the gateway holds no \
-            per-channel conversation registry; the previous 0 was a literal.",
-        "queue_mode": "native",
-    })))
+    // `channels_registered` counts channels whose credentials are configured,
+    // not channels confirmed registered with their provider.
+    let mut body = json!({ "channels": channels, "queue_mode": "native" });
+    put_into(&mut body, "channels_registered", Measured::noted(Some(registered),
+        "count of channels with non-empty credential env vars; not a \
+         confirmation that any adapter is registered with its provider."));
+    put_into(&mut body, "active_conversations", Measured::<u32>::unmeasured(
+        "not tracked — the gateway holds no per-channel conversation registry"));
+    Ok(Json(body))
 }
 
 #[derive(Deserialize)]
