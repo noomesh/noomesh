@@ -747,11 +747,13 @@ mod tests {
 
     #[test]
     fn the_drain_bound_is_whole_seconds_within_an_hour_else_the_default() {
-        let get = |v: Option<&str>| move |_: &str| v.map(str::to_string);
-        assert_eq!(drain_bound(&get(None)), Duration::from_secs(DEFAULT_DRAIN_SECS));
-        assert_eq!(drain_bound(&get(Some("45"))), Duration::from_secs(45));
+        fn with(v: Option<&'static str>) -> Duration {
+            drain_bound(&move |_: &str| v.map(str::to_string))
+        }
+        assert_eq!(with(None), Duration::from_secs(DEFAULT_DRAIN_SECS));
+        assert_eq!(with(Some("45")), Duration::from_secs(45));
         for bad in ["0", "3601", "soon", ""] {
-            assert_eq!(drain_bound(&get(Some(bad))), Duration::from_secs(DEFAULT_DRAIN_SECS), "{bad:?}");
+            assert_eq!(with(Some(bad)), Duration::from_secs(DEFAULT_DRAIN_SECS), "{bad:?}");
         }
     }
 
