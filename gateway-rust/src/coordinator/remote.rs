@@ -186,6 +186,7 @@ impl RemoteRuntime {
 
 impl super::runtime::TaskRuntime for RemoteRuntime {
     async fn checkpoint(&mut self, task_id: &str, loops: u32, note: Option<&str>, exhausted: bool) -> Result<String> {
+        crate::tasks::progress::touch(task_id);
         let v = self
             .call(HarnessOp::TaskCheckpoint { task_id: task_id.to_string(), loops, note: note.map(str::to_string), exhausted })
             .await?;

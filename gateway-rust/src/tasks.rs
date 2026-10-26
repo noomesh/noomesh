@@ -65,6 +65,54 @@ pub fn ready_subject(node: &str) -> String {
     format!("harness.ready.{}", node.replace(['.', '*', '>', ' '], "_"))
 }
 
+/// When each task this process runs last made progress (i227 fix 1): taken
+/// by the harness, or checkpointed. A task is detached from its creator, so
+/// it lives by its own progress; the harness's watchdog releases one that
+/// has made none for [`progress::stall_bound`].
+pub mod progress {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    /// The bound's env name and default: three task-loop timeouts (a vendor
+    /// CLI loop is bounded at 900 s), never under ten minutes.
+    pub const STALL_ENV: &str = "NOO_HARNESS_TASK_STALL_SECS";
+    pub const STALL_DEFAULT_SECS: u64 = 2700;
+    pub const STALL_MIN_SECS: u64 = 600;
+
+    fn clock() -> &'static Mutex<HashMap<String, Instant>> {
+        static CLOCK: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+        CLOCK.get_or_init(Mutex::default)
+    }
+
+    pub fn touch(task_id: &str) {
+        if let Ok(mut c) = clock().lock() {
+            c.insert(task_id.to_string(), Instant::now());
+        }
+    }
+
+    /// Time since the task last made progress; `None` for one never touched.
+    pub fn age(task_id: &str) -> Option<Duration> {
+        clock().lock().ok()?.get(task_id).map(Instant::elapsed)
+    }
+
+    pub fn forget(task_id: &str) {
+        if let Ok(mut c) = clock().lock() {
+            c.remove(task_id);
+        }
+    }
+
+    pub fn stall_bound(get: &dyn Fn(&str) -> Option<String>) -> Duration {
+        let secs = get(STALL_ENV).and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(STALL_DEFAULT_SECS);
+        Duration::from_secs(secs.max(STALL_MIN_SECS))
+    }
+
+    /// The result a stalled task fails with.
+    pub fn stalled_note(node: &str, secs: u64) -> String {
+        format!("stalled: no progress on {node} for {secs} s; the harness released its slot (i227)")
+    }
+}
+
 /// A task, as the API returns it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Task {
@@ -1197,6 +1245,14 @@ pub fn spawn_ready_watcher(state: std::sync::Arc<AppState>) {
         while let Some(msg) = sub.next().await {
             let Some(node) = msg.subject.strip_prefix("harness.ready.") else { continue };
             let node = node.to_string();
+            // i227 fix 1: the harness released these for making no progress.
+            // Fail them before the hand-back below, or they would be handed
+            // straight back to the node that gave up on them.
+            let body: serde_json::Value = serde_json::from_slice(&msg.payload).unwrap_or_default();
+            let (stalled, secs) = stalled_from_ready(&body);
+            for id in stalled {
+                fail_stalled(&state.db, &id, &msg.subject, secs).await;
+            }
             match list_unfinished_on(&state.db, &node).await {
                 Ok(tasks) if !tasks.is_empty() => {
                     tracing::info!(node = %node, count = tasks.len(), "task: harness ready; handing back its tasks");
@@ -1211,6 +1267,41 @@ pub fn spawn_ready_watcher(state: std::sync::Arc<AppState>) {
             }
         }
     });
+}
+
+/// The task ids a harness reported as stalled on `harness.ready`, and its
+/// bound in seconds (i227 fix 1). Anything else in the body is ignored.
+fn stalled_from_ready(body: &serde_json::Value) -> (Vec<String>, u64) {
+    let ids = body
+        .get("stalled")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+        .unwrap_or_default();
+    (ids, body.get("stall_secs").and_then(|v| v.as_u64()).unwrap_or(0))
+}
+
+/// Fail a task a node's harness released as stalled — only one that is
+/// live AND on the node whose subject the report came in on: a node can
+/// end its own work, never another node's.
+async fn fail_stalled(db: &sqlx::PgPool, id: &str, ready_subject_seen: &str, secs: u64) {
+    let task = match get(db, id).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(task = id, error = %e, "task: stalled report not applied");
+            return;
+        }
+    };
+    let Some(node) = task.node.as_deref() else { return };
+    if ready_subject(node) != ready_subject_seen || !matches!(task.state.as_str(), "open" | "running" | "checkpointed") {
+        tracing::warn!(task = id, subject = ready_subject_seen, node, state = %task.state, "task: stalled report from another node or for a finished task; ignored");
+        return;
+    }
+    match finish(db, id, false, &progress::stalled_note(node, secs), false).await {
+        Ok(true) => tracing::warn!(event = "task_stalled", task = id, node, stall_secs = secs, "task: failed; its harness made no progress"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(task = id, error = %e, "task: stalled task not failed"),
+    }
 }
 
 /// Every live task that has gone quiet (see [`is_stale`]), oldest first.
@@ -1327,6 +1418,31 @@ pub fn stale_alert(t: &Task, since: &str) -> crate::operator_alert::OperatorAler
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// i227 fix 1: the progress clock, the stall bound and the report a
+    /// harness sends on `harness.ready`.
+    #[test]
+    fn a_stalled_task_is_measured_bounded_and_reported() {
+        let id = "progress-clock-test-task";
+        assert_eq!(progress::age(id), None);
+        progress::touch(id);
+        assert!(progress::age(id).is_some_and(|a| a < std::time::Duration::from_secs(5)));
+        progress::forget(id);
+        assert_eq!(progress::age(id), None);
+
+        let env = |v: Option<&'static str>| move |k: &str| (k == progress::STALL_ENV).then_some(v).flatten().map(str::to_string);
+        assert_eq!(progress::stall_bound(&env(None)).as_secs(), 2700);
+        assert_eq!(progress::stall_bound(&env(Some("1200"))).as_secs(), 1200);
+        assert_eq!(progress::stall_bound(&env(Some("30"))).as_secs(), 600, "never under ten minutes");
+        assert_eq!(progress::stall_bound(&env(Some("soon"))).as_secs(), 2700);
+
+        let note = progress::stalled_note("mcmini", 2700);
+        assert!(note.starts_with("stalled:") && note.contains("mcmini") && note.contains("2700 s"), "{note}");
+
+        let body = json!({"node": "mcmini", "slot_freed": true, "stalled": ["a", 7, "b"], "stall_secs": 2700});
+        assert_eq!(stalled_from_ready(&body), (vec!["a".to_string(), "b".to_string()], 2700));
+        assert_eq!(stalled_from_ready(&json!({"node": "mcmini"})), (Vec::new(), 0));
+    }
 
     /// i171: the text a tool-less loop ends with is the task's result —
     /// only while the task is still the runner's to finish.
