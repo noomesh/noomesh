@@ -65,13 +65,24 @@ restart_resolve_name() {
             && addon_licensed_names | grep -qxF -- "$_name" && addon_on "$_name" 0; then
         _c="$(addon_overlay "$_name" 2>/dev/null)"
         if [ -n "$_c" ]; then
-            # Its own overlay is composed, so it is one of the -f files
-            # addon_core_services reads: leave it out, or the add-on owns nothing.
-            for _s in $(COMPOSE_FILES="$(printf ' %s ' "${COMPOSE_FILES:-}" | sed "s# -f $_c # #g")" addon_own_services "$_c"); do
-                if printf '%s\n' "$_valid" | grep -qx -- "$_s"; then
-                    printf '%s\n' "$_s"; _found=1
+            # The services its overlay OWNS: its `services:` keys that no
+            # other composed file defines (an extended core service is not
+            # its own). With no other file read, it owns nothing.
+            local _core="" _prev="" _f
+            for _f in "$@"; do
+                if [ "$_prev" = "-f" ] && [ "$_f" != "$_c" ] && [ -f "$_f" ]; then
+                    _core="${_core}$(_compose_service_keys "$_f")"$'\n'
                 fi
+                _prev="$_f"
             done
+            if [ -n "${_core//[[:space:]]/}" ]; then
+                for _s in $(_compose_service_keys "$_c" | sort -u); do
+                    printf '%s\n' "$_core" | grep -qxF -- "$_s" && continue
+                    if printf '%s\n' "$_valid" | grep -qx -- "$_s"; then
+                        printf '%s\n' "$_s"; _found=1
+                    fi
+                done
+            fi
             [ -n "$_found" ] && return 0
         fi
     fi

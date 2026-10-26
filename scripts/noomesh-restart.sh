@@ -324,12 +324,14 @@ else
     addon_refuse_held "${SERVICES[@]}" || exit 1
     # shellcheck disable=SC2086
     restart_resolve_all "$VALID_SVCS" $COMPOSE_FILES $PROFILE_ARGS -- "${SERVICES[@]}" || exit 1
-    SERVICES=()
+    SERVICES=("${RESOLVED_SERVICES[@]}")
+    _kept=()
     while IFS= read -r _s; do
-        [ -n "$_s" ] && SERVICES+=("$_s")
+        [ -n "$_s" ] && _kept+=("$_s")
     done <<EOF_HELD
-$(addon_drop_held "$(printf '%s\n' "${RESOLVED_SERVICES[@]}")")
+$(addon_drop_held "$(printf '%s\n' "${SERVICES[@]}")")
 EOF_HELD
+    SERVICES=(${_kept[@]+"${_kept[@]}"})
     if [ ${#SERVICES[@]} -eq 0 ]; then
         ui_close_failed "every service named is held (GPU, Docker socket or privileged): nothing to start"
         exit 1
