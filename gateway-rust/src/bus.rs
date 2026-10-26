@@ -25,7 +25,7 @@ pub async fn connect(
     inbox_prefix: &str,
     request_timeout: Duration,
 ) -> Result<async_nats::Client> {
-    let ca_path = std::env::var("NOO_TLS_CA").unwrap_or_default();
+    let ca_path = crate::tls::ca_path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let cert_path = std::env::var("NOO_TLS_CERT").unwrap_or_default();
     let key_path = std::env::var("NOO_TLS_KEY").unwrap_or_default();
 

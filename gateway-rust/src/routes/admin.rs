@@ -2192,7 +2192,7 @@ async fn security_violations(
 /// within the 40s poll, otherwise the rotation reports via the result
 /// file after this returns.
 async fn security_pki_rotate_expiring() -> AppJson {
-    if std::env::var("NOO_PKI_DIR").unwrap_or_default().is_empty() {
+    if crate::tls::pki_dir().is_none() {
         return Json(json!({"error": "NOO_PKI_DIR not configured"}));
     }
 
@@ -2254,8 +2254,7 @@ async fn security_pki_rotate_expiring() -> AppJson {
 /// not_after for each cert found. Matches the Python pki.manager
 /// get_status() response shape.
 async fn security_pki_status(_op: OperatorOrInternal) -> AppResult {
-    let pki_dir = std::env::var("NOO_PKI_DIR")
-        .ok()
+    let pki_dir = crate::tls::pki_dir().map(|p| p.to_string_lossy().into_owned())
         .filter(|p| std::path::Path::new(p).join("ca.crt").exists())
         .or_else(|| {
             // Check common Docker container paths (entrypoint.py copies to /tmp/pki)

@@ -357,7 +357,7 @@ fn compose_enroll_command(url: &str, token: &str, tsk: &str, ca_sha256: &str, no
 /// the fingerprint of the very file the node will fetch.
 pub(crate) fn cluster_ca_candidates() -> [String; 3] {
     [
-        std::env::var("NOO_TLS_CA").unwrap_or_default(),
+        crate::tls::ca_path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
         "/app/pki/ca.crt".to_string(),
         "pki/ca.crt".to_string(),
     ]

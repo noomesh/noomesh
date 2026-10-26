@@ -67,9 +67,7 @@ fn sso_key_path() -> std::path::PathBuf {
     if let Some(p) = std::env::var(GRAFANA_SSO_KEY_ENV).ok().filter(|s| !s.trim().is_empty()) {
         return std::path::PathBuf::from(p);
     }
-    let roots: Vec<String> = std::env::var("NOO_PKI_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
+    let roots: Vec<String> = crate::tls::pki_dir().map(|p| p.to_string_lossy().into_owned())
         .into_iter()
         .chain(["/tmp/pki".to_string(), "/app/pki".to_string()])
         .collect();

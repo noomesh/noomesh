@@ -610,7 +610,8 @@ pub(crate) async fn execute_spec(
         // No cluster CA configured — a public cert (tailscale serve) or
         // plain dev. Leave the system roots in place rather than weakening
         // anything.
-        if let Some(ca) = std::env::var("NOO_TLS_CA").ok().filter(|s| !s.is_empty()) {
+        if let Some(ca) = crate::tls::ca_path() {
+            let ca = ca.display().to_string();
             match std::fs::read(&ca) {
                 Ok(pem) => match crate::tls::certificate_from_pem(&pem) {
                     Ok(cert) => builder = builder.tls_certs_merge([cert]),

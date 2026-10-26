@@ -394,7 +394,7 @@ pub fn spawn_kv_bucket_watchdog(js: async_nats::jetstream::Context) {
 /// `startup_tasks::stage_pki` published them. A param already in the URL
 /// wins; nothing is ever removed or weakened.
 pub fn with_cluster_tls(url: String) -> String {
-    let ca = std::env::var("NOO_TLS_CA").unwrap_or_default();
+    let ca = crate::tls::ca_path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let mut cert = std::env::var("NOO_TLS_CERT").unwrap_or_default();
     let mut key = std::env::var("NOO_TLS_KEY").unwrap_or_default();
     // Postgres requires the client certificate's CN to BE the role being
