@@ -127,7 +127,7 @@ async fn scratch(dsn: &str) -> Scratch {
         .expect("connect scratch");
     unsafe { std::env::set_var("NOO_APP_DB_PASSWORD", "ephemeral-not-a-secret") };
     for ext in ["vector", "pg_trgm"] {
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE EXTENSION IF NOT EXISTS {ext}")))
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE EXTENSION IF NOT EXISTS {ext}")))
             .execute(&build)
             .await
             .expect("extension");
