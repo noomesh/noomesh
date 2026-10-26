@@ -33,11 +33,13 @@ Isolation modes (`NOO_SANDBOX_ISOLATION`):
 In both modes the code runs as an executor uid, never as this server. The
 image declares ``sandbox-exec`` (uid 65600, the first of 64) and compose
 starts the container as root under setpriv, which keeps only CAP_SETUID,
-CAP_SETGID and CAP_KILL as ambient capabilities and drops to ``nonroot``
-before uvicorn starts. Each call is launched through setpriv again, into
+CAP_SETGID and CAP_KILL as ambient capabilities and drops to
+``sandbox-server`` (65590, a uid no other service runs as, so the
+container's ``nproc`` limit counts this server's threads alone) before
+uvicorn starts. Each call is launched through setpriv again, into
 its own uid from that range with every capability cleared (`executor`,
 `drop_argv`), so the code cannot read the sandbox's own leaf key (0640,
-handed to nonroot), signal this server or another call, or come back to
+handed to sandbox-server), signal this server or another call, or come back to
 either uid; a timeout kills everything that uid owns, which is exactly
 that call. Without the user in the image or without the capabilities (a
 workstation, an older compose file) the code runs as the server's uid as
@@ -522,6 +524,9 @@ def health() -> dict:
         "isolation": {"mode": mode, "active": mode if usable else "none", "detail": detail},
         # The uid the code runs as — the server's own when `uid` is null.
         "executor": {"uid": base, "slots": EXECUTOR_SLOTS if base is not None else 0, "detail": exec_detail},
+        # The uid this server runs as: its leaf key's reader, and a uid no
+        # other service shares (`noo cluster verify` → `sandbox executor`).
+        "server": {"uid": os.getuid()},
         "checks": {},
     }
     try:

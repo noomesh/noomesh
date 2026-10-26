@@ -55,16 +55,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bubblewrap \
     && rm -rf /var/lib/apt/lists/*
 
+# The server user. uvicorn runs as `sandbox-server` (65590), a uid no other
+# service uses (noo-cli pki.rs SANDBOX_SERVER_UID). Docker without
+# userns-remap counts RLIMIT_NPROC per real uid across the whole host, so
+# the compose `nproc: 256` bounds this server's threads only while the uid
+# is its own: as `nonroot` (65532, through 0.6.11) it shared the count with
+# redis, the monitoring set, the voice doors, stunnel and the Python
+# services, and every thread it tried to start failed (`/health` 500,
+# `can't start new thread`). Its leaf key is handed to this uid (0640).
+#
 # The executor user. Every /exec call runs as one of 64 uids from 65600
 # (`sandbox-exec` is the first and the only one with a passwd entry; the
 # rest are numeric), never as the server: compose starts the container as
 # root under setpriv with CAP_SETUID/SETGID/KILL kept ambient, drops to
-# nonroot for uvicorn, and the server drops again per call with every
-# capability cleared (src/noomesh/sandbox/app.py `executor`). The leaf key
-# is nonroot's (0640), so the code cannot read it. No useradd in this
-# image: the passwd and group lines are written directly. No home, no
-# shell.
-RUN echo 'sandbox-exec:x:65600:65600:sandbox executor, first of 64 uids:/nonexistent:/usr/sbin/nologin' >> /etc/passwd \
+# sandbox-server for uvicorn, and the server drops again per call with
+# every capability cleared (src/noomesh/sandbox/app.py `executor`). The
+# leaf key is sandbox-server's (0640), so the code cannot read it. No
+# useradd in this image: the passwd and group lines are written directly.
+# No home, no shell.
+RUN echo 'sandbox-server:x:65590:65590:sandbox server (uvicorn), its own uid:/nonexistent:/usr/sbin/nologin' >> /etc/passwd \
+    && echo 'sandbox-server:x:65590:' >> /etc/group \
+    && echo 'sandbox-exec:x:65600:65600:sandbox executor, first of 64 uids:/nonexistent:/usr/sbin/nologin' >> /etc/passwd \
     && echo 'sandbox-exec:x:65600:' >> /etc/group
 
 # Real source overlays the stub from deps-core. The editable .pth file
@@ -88,7 +99,7 @@ COPY docker/entrypoint.py /opt/entrypoint.py
 RUN chmod +x /opt/entrypoint.py
 
 # Transfer ownership
-RUN chown -R nonroot:nonroot /app
+RUN chown -R sandbox-server:sandbox-server /app
 
 # Terminal welcome
 RUN echo '[ -n "$NOO_TERMINAL" ] && echo -e "\033[36m  Mesh Gateway Shell\033[0m\n  noo cluster status — cluster health\n  noo rag query \"...\" — knowledge base search\n"' >> /home/nonroot/.bashrc
@@ -96,7 +107,7 @@ RUN echo '[ -n "$NOO_TERMINAL" ] && echo -e "\033[36m  Mesh Gateway Shell\033[0m
 # Python entrypoint (works with or without shell)
 ENTRYPOINT ["python", "/opt/entrypoint.py"]
 
-USER nonroot
+USER sandbox-server
 
 EXPOSE 8080
 
