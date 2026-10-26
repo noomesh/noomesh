@@ -8,7 +8,7 @@
 //!   - `test run` — `python -m pytest [--ignore tests/integration] [-x] …`
 //!   - `test coverage` — the same with `--cov=noomesh`.
 //!
-//! Deliberately left in Python (fall through):
+//! Not ported (a usage error, exit 2 — the Python CLI is gone):
 //!   - `test gen-stub` — parses source ASTs and WRITES pytest skeleton files
 //!     (with an interactive overwrite confirm) — file authoring, not runnable
 //!     natively.

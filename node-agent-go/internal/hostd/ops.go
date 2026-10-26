@@ -424,16 +424,12 @@ func annotateBackup(r Result) Result {
 // same way db-resync finds it. It used to look ONLY under <root>/venv/bin
 // for the retired Python CLI — and a standalone controller (~/.noo) has no
 // venv, so every cert_auto_rotate and admin pki-rotate spool command there
-// exited 127 while the certificates kept ageing. The venv stays as a last
-// resort for a checkout that still has one.
+// exited 127 while the certificates kept ageing. The Python CLI is gone
+// (noo-py no longer exists), so there is no venv fallback.
 func opRotate(ctx context.Context, e *Engine, _ string, _ *Command) (int, string) {
 	bin, err := e.resolveCLI()
 	if err != nil {
-		legacy := filepath.Join(e.Root, "venv", "bin", "noo-py")
-		if !isExecutable(legacy) {
-			return 127, err.Error() + "; and no legacy " + legacy
-		}
-		bin = legacy
+		return 127, err.Error()
 	}
 	return e.Runner.Run(ctx, e.Root, nil, bin, "security", "pki", "rotate-all", "--force")
 }

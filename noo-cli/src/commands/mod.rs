@@ -3,7 +3,7 @@
 
 //! Native command handlers, one file per command group. Each handler:
 //! parse its own args (returning `Err(Unhandled)` on anything unrecognized
-//! so the Python CLI serves it), fetch, then `--json` prints the raw gateway
+//! which is a usage error, exit 2), fetch, then `--json` prints the raw gateway
 //! JSON, otherwise a compact human rendering. Data to stdout, diagnostics to
 //! stderr, exit code per the contract in output.rs.
 

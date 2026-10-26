@@ -186,7 +186,7 @@ fn hub_http_fail(g: &Globals, status: u16, body: &str, base: &str) -> ! {
 pub fn mcp_tools(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if !args.is_empty() {
         // Python's `--config PATH` (in-process server list) or anything else
-        // we don't understand → let the Python CLI serve it.
+        // we don't understand → usage error (exit 2).
         return Err(Unhandled);
     }
 

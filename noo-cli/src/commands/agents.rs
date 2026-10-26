@@ -5,8 +5,9 @@
 //! in `routes/agents.rs` and `routes/peers.rs`).
 //!
 //! Ported: list, collaborate, peer list, peer card, peer dispatch.
-//! Left in Python:
-//!   - `peer register`/`deregister` don't exist in the Python CLI (API-only).
+//! Not in the CLI:
+//!   - `peer register`/`deregister` are API-only; there is no `noo` verb (an
+//!     unknown verb is a usage error, exit 2).
 //!
 //! Note: the Python `agents *` commands DO send auth headers; the older
 //! read-only ports predate that fix — either side works now.
