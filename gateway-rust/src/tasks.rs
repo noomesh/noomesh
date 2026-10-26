@@ -1355,18 +1355,16 @@ pub fn queue_recheck_after(get: &dyn Fn(&str) -> Option<String>) -> std::time::D
     std::time::Duration::from_secs(secs.max(60))
 }
 
-/// Queued tasks that have waited longer than `older_than`, oldest first.
-/// A parked task (`budget_state`) waits for its owner, and an aggregation
-/// parent (`loop_budget` 0) runs nowhere: neither is offered.
+/// Queued tasks that have waited longer than `older_than`, oldest first
+/// (`repo::tasks::waiting_ids`: no parked task, no aggregation parent).
 async fn list_waiting(db: &sqlx::PgPool, older_than: std::time::Duration) -> Result<Vec<Task>> {
-    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "{SELECT} WHERE t.state = 'open' AND t.node IS NOT NULL AND t.budget_state IS NULL AND t.loop_budget > 0 \
-         AND t.updated_at < now() - make_interval(secs => $1) ORDER BY t.created_at"
-    )))
-    .bind(older_than.as_secs_f64())
-    .fetch_all(db)
-    .await?;
-    Ok(rows.iter().map(row_to_task).collect())
+    let mut out = Vec::new();
+    for id in crate::repo::tasks::waiting_ids(db, older_than.as_secs_f64()).await? {
+        if let Some(t) = get(db, &id.to_string()).await? {
+            out.push(t);
+        }
+    }
+    Ok(out)
 }
 
 /// i227 fix 2: offer every task that has waited a whole recheck window for
@@ -1504,8 +1502,9 @@ mod tests {
         let src = include_str!("tasks.rs").split("mod tests {").next().unwrap();
         let sweep = src.split("pub fn spawn_stale_sweep(").nth(1).unwrap().split("\n}\n").next().unwrap();
         assert!(sweep.contains("offer_waiting_again(&state).await;"), "the sweep offers queued tasks again");
-        let list = src.split("async fn list_waiting(").nth(1).unwrap().split("\n}\n").next().unwrap();
-        for clause in ["t.state = 'open'", "t.node IS NOT NULL", "t.budget_state IS NULL", "t.loop_budget > 0", "t.updated_at < now() - make_interval(secs => $1)"] {
+        let list = include_str!("repo/tasks.rs").split("pub async fn waiting_ids<").nth(1).unwrap().split("\n}\n").next().unwrap();
+        assert!(src.split("async fn list_waiting(").nth(1).unwrap().contains("crate::repo::tasks::waiting_ids(db, older_than.as_secs_f64())"));
+        for clause in ["state = 'open'", "node IS NOT NULL", "budget_state IS NULL", "loop_budget > 0", "updated_at < now() - make_interval(secs => $1)"] {
             assert!(list.contains(clause), "{clause}");
         }
         let offer = src.split("async fn offer_waiting_again(").nth(1).unwrap().split("\n}\n").next().unwrap();
