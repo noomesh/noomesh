@@ -1232,6 +1232,37 @@ impl std::fmt::Display for NeverReachedTheModel {
 
 impl std::error::Error for NeverReachedTheModel {}
 
+/// A turn whose CLI failed after calling the model, having asked only for
+/// tools that change nothing (i233, accepted 2026-10-26): the gateway may
+/// run it itself, as for [`NeverReachedTheModel`].
+#[derive(Debug)]
+pub struct RanOnlyReadTools(pub String);
+
+impl std::fmt::Display for RanOnlyReadTools {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RanOnlyReadTools {}
+
+/// The tools of `called` that may have changed something: neither one of
+/// the kind's `read_only_tools` nor a read-only noomesh tool
+/// (`task_guard::CEILING_ALLOWED`) under whatever MCP prefix the CLI gives
+/// it (`mcp__noomesh__noo_cluster_status`, `noomesh.noo_rag_query`). Pure.
+pub fn acting_tools(kind: &HarnessKind, called: &[String]) -> Vec<String> {
+    let bare = |n: &str| -> String {
+        let n = n.rsplit("__").next().unwrap_or(n);
+        let n = n.rsplit('.').next().unwrap_or(n);
+        n.rsplit('/').next().unwrap_or(n).to_string()
+    };
+    called
+        .iter()
+        .filter(|t| !kind.read_only_tools.iter().any(|r| r == *t) && !crate::task_guard::CEILING_ALLOWED.contains(&bare(t).as_str()))
+        .cloned()
+        .collect()
+}
+
 pub(crate) async fn run_turn_on<R: DriverRail, S: TurnSink>(ctx: &DriverCtx, rail: &R, req: &TurnRequest, sink: &S) -> Result<CoordinatorResult> {
     if let Err(r) = (ctx.jail_probe)() {
         tracing::error!(event = "harness_jail_refused", reason = %r, "harness_jail_refused: {}", r.note());
@@ -1285,7 +1316,17 @@ pub(crate) async fn run_turn_on<R: DriverRail, S: TurnSink>(ctx: &DriverCtx, rai
         if o.stalled.is_some() && usage.calls == 0 {
             return Err(anyhow::Error::new(NeverReachedTheModel(msg)));
         }
-        bail!("{msg}");
+        // After model calls: safe to re-run only if nothing it asked for
+        // could have acted. Otherwise say what it called.
+        let acting = acting_tools(&ctx.kind, &usage.tools_called);
+        if acting.is_empty() {
+            return Err(anyhow::Error::new(RanOnlyReadTools(if usage.tools_called.is_empty() {
+                format!("{msg} (it called no tool)")
+            } else {
+                format!("{msg} (it called only read-only tools: {})", usage.tools_called.join(", "))
+            })));
+        }
+        bail!("{msg}; it had called {}, so the turn is not re-run", acting.join(", "));
     }
     let response = o.stdout.trim().to_string();
     rail.save("user", &req.prompt).await;
@@ -1334,6 +1375,22 @@ mod tests {
         let mut buf = String::from("more");
         assert_eq!(working_batch(&mut buf, &mut sent, true), None);
         assert!(buf.is_empty(), "past the cap the text is dropped, not kept");
+    }
+
+    /// i233: a failed turn is re-run only if nothing it asked for could
+    /// have acted: the kind's read-only built-ins, or a read-only noomesh
+    /// tool under the CLI's MCP prefix.
+    #[test]
+    fn only_read_only_tools_make_a_failed_turn_safe_to_rerun() {
+        let claude = crate::harness_kinds::get("claude-code").unwrap();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(acting_tools(claude, &[]).is_empty());
+        assert!(acting_tools(claude, &s(&["Read", "Grep", "mcp__noomesh__noo_cluster_status"])).is_empty());
+        assert_eq!(acting_tools(claude, &s(&["Read", "Bash", "Write"])), s(&["Bash", "Write"]));
+        assert_eq!(acting_tools(claude, &s(&["mcp__noomesh__noo_job_submit"])), s(&["mcp__noomesh__noo_job_submit"]), "a noomesh tool that acts");
+        let codex = crate::harness_kinds::get("codex").unwrap();
+        assert!(acting_tools(codex, &s(&["noomesh.noo_rag_query"])).is_empty(), "codex's MCP spelling");
+        assert_eq!(acting_tools(codex, &s(&["shell"])), s(&["shell"]), "no built-in is verified read-only for codex");
     }
 
     fn kind(command: &[&str], lane: &[(&str, &str)], telemetry: &[(&str, &str)]) -> HarnessKind {

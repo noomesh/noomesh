@@ -584,7 +584,8 @@ pub async fn run() -> Result<()> {
                     // the gateway may run the turn itself (i233). Said on
                     // the event; an older gateway ignores the field and
                     // forwards the error as before.
-                    let retry_safe = e.downcast_ref::<crate::harness::driver::NeverReachedTheModel>().is_some();
+                    let retry_safe = e.downcast_ref::<crate::harness::driver::NeverReachedTheModel>().is_some()
+                        || e.downcast_ref::<crate::harness::driver::RanOnlyReadTools>().is_some();
                     tracing::error!(error = %e, conversation = %req.conversation_id, retry_safe, "harness: turn failed");
                     let _ = sink.send_event("error", json!({"text": format!("{e}"), "retry_safe": retry_safe})).await;
                 }

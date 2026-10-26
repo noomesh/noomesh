@@ -108,6 +108,10 @@ pub struct UsageTotals {
     /// The largest single call's prompt tokens.
     #[serde(default)]
     pub max_prompt_tokens: u64,
+    /// The tools the model asked the CLI to run, distinct, in first-seen
+    /// order: what a failed turn may have done (i233).
+    #[serde(default)]
+    pub tools_called: Vec<String>,
 }
 
 /// One request the translator answered, as `noo-gateway harness probe`
@@ -195,6 +199,17 @@ impl Shared {
         let mut t = self.tap.lock().unwrap_or_else(|p| p.into_inner());
         if t.as_ref().is_some_and(|tx| tx.send(text).is_err()) {
             *t = None;
+        }
+    }
+
+    /// Note the tools a message or chunk delta asks for.
+    fn note_tools(&self, m: &Value) {
+        let Some(calls) = m.get("tool_calls").and_then(Value::as_array) else { return };
+        let mut u = self.usage.lock().unwrap_or_else(|p| p.into_inner());
+        for name in calls.iter().filter_map(|c| c.pointer("/function/name").and_then(Value::as_str)).filter(|n| !n.is_empty()) {
+            if !u.tools_called.iter().any(|t| t == name) {
+                u.tools_called.push(name.to_string());
+            }
         }
     }
 
@@ -516,6 +531,7 @@ async fn complete(sh: &Arc<Shared>, mut body: Value) -> Result<Reply, (u16, Stri
         sh.meter(v.get("model").and_then(|m| m.as_str()), usage);
         if let Some(m) = v.pointer("/choices/0/message") {
             sh.tap_send(model_text(m));
+            sh.note_tools(m);
         }
         return Ok(Reply::Whole(v));
     }
@@ -594,6 +610,7 @@ async fn pump(sh: Arc<Shared>, resp: reqwest::Response, tx: mpsc::Sender<Result<
                 }
                 if let Some(d) = v.pointer("/choices/0/delta") {
                     sh.tap_send(model_text(d));
+                    sh.note_tools(d);
                 }
                 if tx.send(Ok(v)).await.is_err() {
                     break 'read;
@@ -1127,6 +1144,21 @@ mod tests {
         let u = t.usage();
         assert_eq!((u.calls, u.prompt_tokens, u.completion_tokens, u.total_tokens), (3, 30, 15, 45));
         assert_eq!(u.models, vec!["qwen-pinned".to_string()]);
+        t.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_tools_the_model_asked_for_are_recorded() {
+        let m = mock().await;
+        let t = Translator::start(backend(&m.url, "openai")).await.unwrap();
+        let url = format!("{}/v1/chat/completions", t.base_url());
+        let c = client();
+        let tools = json!([{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]);
+        let body = |stream: bool| json!({"stream": stream, "tools": tools, "messages": [{"role": "user", "content": "read a.txt"}]});
+        c.post(&url).json(&body(true)).send().await.unwrap().text().await.unwrap();
+        c.post(&url).json(&body(false)).send().await.unwrap().text().await.unwrap();
+        c.post(&url).json(&json!({"messages": [{"role": "user", "content": "hi"}]})).send().await.unwrap().text().await.unwrap();
+        assert_eq!(t.usage().tools_called, vec!["read_file".to_string()], "streamed and whole, once, and none for a plain reply");
         t.shutdown().await;
     }
 
