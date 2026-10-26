@@ -101,6 +101,13 @@ pub struct UsageTotals {
     pub calls: u32,
     /// The models the replies named, distinct, in first-seen order.
     pub models: Vec<String>,
+    /// The first metered call's prompt tokens: what the CLI sends before it
+    /// has done anything, its floor on this model (i226 phase B).
+    #[serde(default)]
+    pub first_prompt_tokens: Option<u64>,
+    /// The largest single call's prompt tokens.
+    #[serde(default)]
+    pub max_prompt_tokens: u64,
 }
 
 /// One request the translator answered, as `noo-gateway harness probe`
@@ -111,6 +118,10 @@ pub struct RouteHit {
     pub method: String,
     pub path: String,
     pub status: u16,
+    /// The request's `Content-Length`, when it sent one: in mock mode the
+    /// only measure of how much the CLI sent (the mock's usage is canned).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_bytes: Option<u64>,
 }
 
 /// The backend's wire, as far as the translator is concerned.
@@ -181,6 +192,8 @@ impl Shared {
         u.calls = u.calls.saturating_add(1);
         match usage {
             Some((p, c, t)) => {
+                u.first_prompt_tokens.get_or_insert(p);
+                u.max_prompt_tokens = u.max_prompt_tokens.max(p);
                 u.prompt_tokens += p;
                 u.completion_tokens += c;
                 u.total_tokens += if t == 0 { p + c } else { t };
@@ -349,8 +362,13 @@ async fn log_route(State(sh): State<Arc<Shared>>, req: axum::extract::Request, n
         return next.run(req).await;
     };
     let (method, path) = (req.method().to_string(), req.uri().path().to_string());
+    let request_bytes = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
     let resp = next.run(req).await;
-    log.lock().unwrap_or_else(|p| p.into_inner()).push(RouteHit { method, path, status: resp.status().as_u16() });
+    log.lock().unwrap_or_else(|p| p.into_inner()).push(RouteHit { method, path, status: resp.status().as_u16(), request_bytes });
     resp
 }
 

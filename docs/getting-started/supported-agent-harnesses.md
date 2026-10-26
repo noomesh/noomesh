@@ -346,6 +346,15 @@ noo-gateway harness probe --kind claude-code --cli /opt/claude/claude --mock-mod
 sudo noo-gateway harness probe --kind codex --run-as nobody --json
 ```
 
+Each test also reports the kind's **prompt floor**: the size of the CLI's
+first request to the model, before it has done any work (`first request:` in
+the text report, `prompt_floor` in `--json`). In real mode it is the model's
+own count of that call's prompt tokens. In mock mode the mock's usage is
+canned, so it is estimated from the request's size at about 2.5 characters
+per token, which overstates rather than understates. A node whose context
+window is below a kind's floor cannot run that kind: its first request is
+refused (vLLM answers 400). The floors are what placement checks a node's window against.
+
 Other flags: `--cli <absolute path>` (default: the kind's `cli` on PATH),
 `--test reply|file|both` (default `both`), `--prompt full|slim` (Claude
 Code's full or slim launch; default: the node's profile in real mode, else
