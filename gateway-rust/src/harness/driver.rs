@@ -1248,23 +1248,26 @@ pub(crate) async fn run_turn_on<R: DriverRail, S: TurnSink>(ctx: &DriverCtx, rai
     // phase D: a collapsed block, like thinking). The answer is still the
     // CLI's output below.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let run = invoke(ctx, rail, &ws, &prompt, None, Some(tx));
-    tokio::pin!(run);
     let mut buf = String::new();
     let mut sent = 0usize;
-    let mut tick = tokio::time::interval(WORKING_FLUSH);
-    let outcome = loop {
-        tokio::select! {
-            out = &mut run => break out,
-            Some(t) = rx.recv() => {
-                buf.push_str(&t);
-                if let Some(b) = working_batch(&mut buf, &mut sent, false) {
-                    sink.send_event("working", json!({"text": b})).await;
+    // Scoped: the run borrows `ws`, which `finish` below consumes.
+    let outcome = {
+        let run = invoke(ctx, rail, &ws, &prompt, None, Some(tx));
+        tokio::pin!(run);
+        let mut tick = tokio::time::interval(WORKING_FLUSH);
+        loop {
+            tokio::select! {
+                out = &mut run => break out,
+                Some(t) = rx.recv() => {
+                    buf.push_str(&t);
+                    if let Some(b) = working_batch(&mut buf, &mut sent, false) {
+                        sink.send_event("working", json!({"text": b})).await;
+                    }
                 }
-            }
-            _ = tick.tick() => {
-                if let Some(b) = working_batch(&mut buf, &mut sent, true) {
-                    sink.send_event("working", json!({"text": b})).await;
+                _ = tick.tick() => {
+                    if let Some(b) = working_batch(&mut buf, &mut sent, true) {
+                        sink.send_event("working", json!({"text": b})).await;
+                    }
                 }
             }
         }
