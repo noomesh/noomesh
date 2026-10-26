@@ -4,7 +4,7 @@
 //! `noo voice …` — thin HTTP to the gateway's voice routes (WP-V).
 //!
 //! The Python CLI runs faster-whisper / Piper IN-PROCESS (voice_cli.py),
-//! which is why `voice` sat in PY_ONLY. The Rust gateway now proxies those
+//! which is why `voice` once sat in the old Python-only list. The Rust gateway now proxies those
 //! services natively (gateway-rust routes/communication.rs):
 //!   POST /api/voice/transcribe           — multipart audio → whisper service
 //!   POST /api/voice/transcribe/detailed  — same, + segment timestamps
@@ -18,7 +18,7 @@
 //!     server-side voice inventory), not which pip packages are installed on
 //!     the local host — the local in-process backends died with the port.
 //!   - `transcribe --device` has no gateway equivalent → Err(Unhandled)
-//!     (falls through to the Python CLI where installed).
+//!     (a usage error, exit 2; the Python CLI is gone).
 //!   - `synthesize -o` is optional here (defaults to `speech` + the
 //!     content-type-derived extension); Python required it.
 //!   - `speak` plays via the first system player found on PATH
@@ -94,8 +94,8 @@ fn multipart_body(
 /// `noo voice transcribe FILE [--model M] [--language L] [--output/-o F]
 /// [--timestamps]` — multipart upload to /api/voice/transcribe (or
 /// …/detailed when segments are requested). `--device` never leaves the
-/// local host in Python and has no gateway field → Unhandled (Python serves
-/// it where installed).
+/// local host in Python and has no gateway field → Unhandled (usage
+/// error, exit 2).
 pub fn voice_transcribe(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut file: Option<PathBuf> = None;
     let mut model = "base".to_string();

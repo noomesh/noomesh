@@ -2,8 +2,8 @@
 // Copyright 2026 PersonifAI LLC
 
 //! Repo `.env` loading + gateway URL resolution.
-//! Mirrors `noomesh/cli_utils.py::ensure_repo_env` / `get_gateway_url` —
-//! keep the two in sync until the Python CLI retires.
+//! Mirrors `noomesh/cli_utils.py::ensure_repo_env` / `get_gateway_url` (deleted with
+//! the Python CLI; kept as provenance).
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

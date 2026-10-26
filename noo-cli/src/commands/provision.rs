@@ -450,7 +450,7 @@ fn parse_provision_args(g: &Globals, args: &[String]) -> ProvisionArgs {
                 });
             }
             // Native-only command: bad args must print usage here, never fall
-            // through to the Python CLI (which has no `provision`).
+            // through to another implementation.
             t if t.starts_with('-') => fail(g.json, ExitCode::Usage, "usage",
                 &format!("unknown flag: {t}"),
                 Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data]")),
