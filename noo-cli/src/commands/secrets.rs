@@ -1009,6 +1009,14 @@ pub const CORE_REGISTRY: &[SecretSpec] = &[
         required_when: Requirement::Optional,
     },
     SecretSpec {
+        key: "NOO_GOOGLE_DESKTOP_CLIENT_SECRET",
+        class: Class::ProviderIssued,
+        gen_bytes: 0,
+        consequence: "Google-issued Desktop client parameter for token exchange and refresh; public desktop clients still require PKCE. Pair with this Desktop client ID, never the Web client secret",
+        consumers: &["noo-gateway"],
+        required_when: Requirement::Optional,
+    },
+    SecretSpec {
         key: "NOO_GOOGLE_OAUTH_CLIENT_SECRET",
         class: Class::ProviderIssued,
         gen_bytes: 0,
@@ -6458,6 +6466,7 @@ mod tests {
                 // The other two cloud providers (rows added 2026-09-29; the
                 // keys were delivered and read long before).
                 "OPENAI_API_KEY",
+                "NOO_GOOGLE_DESKTOP_CLIENT_SECRET",
                 "NOO_GOOGLE_OAUTH_CLIENT_SECRET",
                 "GOOGLE_API_KEY",
                 // The controller's read token for the licensed add-on
@@ -6801,6 +6810,7 @@ mod tests {
             ("NATS_NODE_PASSWORD", "external-tool", "refused"),
             ("ANTHROPIC_API_KEY", "provider-issued", "manual"),
             ("OPENAI_API_KEY", "provider-issued", "manual"),
+            ("NOO_GOOGLE_DESKTOP_CLIENT_SECRET", "provider-issued", "manual"),
             ("NOO_GOOGLE_OAUTH_CLIENT_SECRET", "provider-issued", "manual"),
             ("GOOGLE_API_KEY", "provider-issued", "manual"),
             ("HF_TOKEN", "provider-issued", "manual"),

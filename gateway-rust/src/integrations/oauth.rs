@@ -76,30 +76,43 @@ fn now() -> i64 {
 fn client_secret(
     provider: &str,
     kind: ClientKind,
+    client_id: &str,
 ) -> Result<Option<zeroize::Zeroizing<String>>, Error> {
-    if kind == ClientKind::Desktop {
-        return Ok(None);
-    }
-    let name = match provider {
-        "google" => "NOO_GOOGLE_OAUTH_CLIENT_SECRET",
+    let name = match (provider, kind) {
+        ("google", ClientKind::Desktop) => "NOO_GOOGLE_DESKTOP_CLIENT_SECRET",
+        ("google", ClientKind::Web) => "NOO_GOOGLE_OAUTH_CLIENT_SECRET",
         _ => return Err(Error::Invalid("Unsupported provider".into())),
     };
-    crate::config::secret_env::secret(name)
-        .map_err(|_| Error::Unavailable("Cannot read the web OAuth client secret".into()))?
+    let configured = crate::config::secret_env::secret(name)
+        .map_err(|_| Error::Unavailable("Cannot read the OAuth client credential".into()))?;
+    // Google's desktop credential can be required by its token endpoint even
+    // though a distributed desktop app cannot keep it confidential. PKCE
+    // remains mandatory. A bundled credential must never accompany an
+    // installer-supplied ID belonging to a different OAuth application.
+    let bundled = if provider == "google"
+        && kind == ClientKind::Desktop
+        && client_id == option_env!("NOO_GOOGLE_DESKTOP_CLIENT_ID").unwrap_or("")
+    {
+        option_env!("NOO_GOOGLE_DESKTOP_CLIENT_SECRET").map(str::to_string)
+    } else {
+        None
+    };
+    configured
+        .or(bundled)
         .filter(|s| !s.trim().is_empty())
         .map(zeroize::Zeroizing::new)
         .map(Some)
         .ok_or_else(|| {
-            Error::Unavailable(
-                "Installer setup required: configure the web OAuth client secret".into(),
-            )
+            Error::Unavailable(format!(
+                "Installer setup required: configure {name} for this OAuth client"
+            ))
         })
 }
 
 pub fn ready(config: &IntegrationConfig, provider: &str, kind: ClientKind) -> bool {
     Vault::configured().is_ok()
         && !config.client_id(provider, kind).is_empty()
-        && client_secret(provider, kind).is_ok()
+        && client_secret(provider, kind, &config.client_id(provider, kind)).is_ok()
         && (kind == ClientKind::Desktop
             || provider::redirect(&config.app(provider), kind, None).is_ok())
 }
@@ -118,7 +131,7 @@ pub async fn start(
     if client_id.is_empty() {
         return Err(Error::Unavailable("Installer setup required: register a Google OAuth application and configure its public client ID".into()));
     }
-    let _secret = client_secret(p.id, request.client_kind)?;
+    let _secret = client_secret(p.id, request.client_kind, &client_id)?;
     let redirect_uri = provider::redirect(
         &config.app(p.id),
         request.client_kind,
@@ -215,7 +228,14 @@ pub async fn complete(
     if config.client_id(p.id, pending.client_kind) != pending.client_id {
         return Err(Error::Reauth);
     }
-    let (identity, credentials) = exchange(p, &pending, &request.code).await?;
+    let secret = client_secret(p.id, pending.client_kind, &pending.client_id)?;
+    let (identity, credentials) = exchange(
+        p,
+        &pending,
+        &request.code,
+        secret.as_deref().map(String::as_str),
+    )
+    .await?;
     let scopes = credentials.scopes.clone();
     repo::connect(
         db,
@@ -236,6 +256,7 @@ async fn exchange(
     p: &provider::Provider,
     pending: &Pending,
     code: &str,
+    secret: Option<&str>,
 ) -> Result<(provider::Identity, Credentials), Error> {
     let mut form = vec![
         ("grant_type", "authorization_code"),
@@ -244,9 +265,8 @@ async fn exchange(
         ("code_verifier", &pending.verifier),
         ("code", code),
     ];
-    let secret = client_secret(p.id, pending.client_kind)?;
-    if let Some(ref secret) = secret {
-        form.push(("client_secret", secret.as_str()));
+    if let Some(secret) = secret {
+        form.push(("client_secret", secret));
     }
     let client = provider::http_client();
     let response = client
@@ -330,7 +350,8 @@ async fn credential(
         tx.commit().await?;
         return Ok(c);
     }
-    match refresh(p, &mut c).await {
+    let secret = client_secret(p.id, c.client_kind, &c.client_id)?;
+    match refresh(p, &mut c, secret.as_deref().map(String::as_str)).await {
         Err(Error::Reauth) => {
             repo::reauth(&mut tx, owner, account).await?;
             tx.commit().await?;
@@ -350,15 +371,18 @@ async fn credential(
     Ok(c)
 }
 
-async fn refresh(p: &provider::Provider, c: &mut Credentials) -> Result<(), Error> {
+async fn refresh(
+    p: &provider::Provider,
+    c: &mut Credentials,
+    secret: Option<&str>,
+) -> Result<(), Error> {
     let mut form = vec![
         ("grant_type", "refresh_token"),
         ("client_id", c.client_id.as_str()),
         ("refresh_token", c.refresh_token.as_str()),
     ];
-    let secret = client_secret(p.id, c.client_kind)?;
-    if let Some(ref secret) = secret {
-        form.push(("client_secret", secret.as_str()));
+    if let Some(secret) = secret {
+        form.push(("client_secret", secret));
     }
     let response = provider::http_client()
         .post(p.token_url)
@@ -506,7 +530,10 @@ mod tests {
                     assert_eq!(form.get("grant_type").unwrap(), "authorization_code");
                     assert_eq!(form.get("code_verifier").unwrap(), "private-verifier");
                     assert_eq!(form.get("code").unwrap(), "single-code");
-                    assert!(!form.contains_key("client_secret"));
+                    assert_eq!(
+                        form.get("client_secret").unwrap(),
+                        "issued-desktop-credential"
+                    );
                     Json(
                         json!({"access_token":"only-server","refresh_token":if offline {Some("offline-server")} else {None},"expires_in":3600,"scope":scope,"token_type":"Bearer"}),
                     )
@@ -536,7 +563,13 @@ mod tests {
                 client_id: "public-client".into(),
                 redirect_uri: "http://127.0.0.1:3333/noomesh/oauth/callback".into(),
             };
-            let result = exchange(&p, &pending, "single-code").await;
+            let result = exchange(
+                &p,
+                &pending,
+                "single-code",
+                Some("issued-desktop-credential"),
+            )
+            .await;
             assert_eq!(result.is_ok(), succeeds);
             if let Ok((identity, credentials)) = result {
                 assert_eq!(identity.sub, "immutable-sub");
@@ -593,6 +626,10 @@ mod tests {
                     async move {
                         assert_eq!(form.get("refresh_token").unwrap(), "old-refresh");
                         assert_eq!(form.get("grant_type").unwrap(), "refresh_token");
+                        assert_eq!(
+                            form.get("client_secret").unwrap(),
+                            "issued-desktop-credential"
+                        );
                         (
                             if revoked {
                                 axum::http::StatusCode::BAD_REQUEST
@@ -622,7 +659,7 @@ mod tests {
                 client_kind: ClientKind::Desktop,
                 client_id: "public-client".into(),
             };
-            let result = refresh(&p, &mut c).await;
+            let result = refresh(&p, &mut c, Some("issued-desktop-credential")).await;
             if revoked {
                 assert!(matches!(result, Err(Error::Reauth)));
                 assert_eq!(c.access_token, "old-access");

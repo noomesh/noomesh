@@ -154,15 +154,29 @@ pub async fn json_response<T: serde::de::DeserializeOwned>(
     }
     if !response.status().is_success() {
         let value: serde_json::Value = serde_json::from_slice(&data).unwrap_or_default();
-        return Err(
-            if value.get("error").and_then(|e| e.as_str()) == Some("invalid_grant") {
-                Error::Reauth
-            } else {
-                Error::Unavailable(
-                    "Google could not complete the request; try connecting again".into(),
-                )
-            },
+        // Only fixed OAuth error categories may enter logs. Provider details
+        // can echo request material and must never be logged or returned.
+        let category = match value.get("error").and_then(|e| e.as_str()) {
+            Some("invalid_client") => "invalid_client",
+            Some("invalid_request") => "invalid_request",
+            Some("invalid_grant") => "invalid_grant",
+            Some("invalid_scope") => "invalid_scope",
+            Some("access_denied") => "access_denied",
+            Some("unauthorized_client") => "unauthorized_client",
+            _ => "unknown",
+        };
+        tracing::warn!(
+            status = response.status().as_u16(),
+            oauth_error = category,
+            "Google integration request rejected"
         );
+        return Err(if category == "invalid_grant" {
+            Error::Reauth
+        } else if matches!(category, "invalid_client" | "unauthorized_client") {
+            Error::Unavailable("Google rejected the configured OAuth client; check the installer client credentials".into())
+        } else {
+            Error::Unavailable("Google could not complete the request; try connecting again".into())
+        });
     }
     serde_json::from_slice(&data)
         .map_err(|_| Error::Unavailable("Provider returned an invalid response".into()))

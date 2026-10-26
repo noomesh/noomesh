@@ -25,11 +25,15 @@ It sends the authorization response to that gateway; access and refresh tokens
 are exchanged there and never returned to the CLI or browser.
 [Google desktop authorization](https://developers.google.com/identity/protocols/oauth2/native-app)
 
-A publisher can embed its public desktop client ID at compile time using
-`NOO_GOOGLE_DESKTOP_CLIENT_ID` in the **gateway build environment**. If unset,
-the installer supplies a client ID in YAML. This repository does not ship a
-registered production client ID. The desktop client is public and uses PKCE;
-there is no shared desktop client secret to distribute. A web client secret
+A publisher can bundle its registered Desktop client ID and Google-issued
+Desktop credential using `NOO_GOOGLE_DESKTOP_CLIENT_ID` and
+`NOO_GOOGLE_DESKTOP_CLIENT_SECRET` in the **gateway build environment**.
+Installers using their own client supply its ID in YAML and import its issued
+credential into the encrypted secret store. This repository does not ship
+registered production credentials. Desktop clients are public and use PKCE:
+the issued Desktop credential is a token-endpoint parameter, not proof that a
+distributed application can keep a secret. Google can require this parameter
+for both code exchange and refresh. A web client secret
 belongs only on the installation that owns its web registration. Do not bundle
 a publisher's confidential web secret in installers.
 [Google client-type policy](https://developers.google.com/identity/protocols/oauth2/policies)
@@ -129,9 +133,11 @@ integrations:
       web_redirect_uri: "https://YOUR-CONSOLE/api/connections/oauth/callback"
 ```
 
-Omit the unused client fields. Desktop-only setup needs no web callback or
-Google client secret. Changing this configuration requires restarting the
-gateway.
+Omit the unused client fields. Desktop-only setup needs no web callback.
+For an installer-owned Desktop client, import its issued `client_secret` as
+`NOO_GOOGLE_DESKTOP_CLIENT_SECRET` through the encrypted secret store. Keep it
+paired with the Desktop ID; the Web client has a separate credential.
+Changing this configuration requires restarting the gateway.
 
 `NOO_INTEGRATIONS_KEY` is a generated 32-byte installation encryption secret.
 New onboarding generates it through the existing encrypted secret registry.
@@ -141,6 +147,8 @@ For an existing installation, use the secrets reconfiguration flow:
 noo onboard --reconfigure --only secrets --secrets-backend sops
 ```
 
+For the Desktop path, import the Google-issued parameter through
+`noo security secrets rotate NOO_GOOGLE_DESKTOP_CLIENT_SECRET --set-from-stdin`.
 For the web path, import the Google-issued client secret through
 `noo security secrets rotate NOO_GOOGLE_OAUTH_CLIENT_SECRET --set-from-stdin`,
 using a secure stdin source. Follow [Noomesh secrets](../security/secrets.md)
