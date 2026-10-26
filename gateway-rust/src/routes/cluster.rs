@@ -1866,14 +1866,16 @@ fn parse_prometheus_labels(label_str: &str) -> std::collections::HashMap<String,
 
 /// The credential choice, with no environment in it so it can be tested.
 ///
-/// Note what is absent: the controller secret. It is not a parameter
-/// because it is not an option — a node cannot verify it.
-pub(crate) fn node_agent_bearer(static_token: Option<&str>, fleet_secret: Option<&str>, ts: u64) -> Option<String> {
-    if let Some(t) = static_token.filter(|t| !t.is_empty()) {
-        return Some(format!("Bearer {t}"));
-    }
-    let secret = fleet_secret.filter(|s| !s.is_empty())?;
-    Some(format!("Bearer {}", mint_cluster_token("gateway", secret, ts)?))
+/// The only bearer the gateway ever sends an agent is the static
+/// `NOO_NODE_AGENT_TOKEN`. There is NO minted fallback: the v1 cluster token
+/// (`mint_cluster_token`) is refused by every agent, and a v2 token is bound
+/// to a request that does not exist yet where this is called. An agent that
+/// has not reported `controller_leaf_only` and has no static token gets no
+/// bearer; the gateway's leaf authenticates the handshake, and
+/// `node_agent_auth::header_for` logs the decision. The fleet and controller
+/// secrets are not parameters because they are not options.
+pub(crate) fn node_agent_bearer(static_token: Option<&str>) -> Option<String> {
+    static_token.filter(|t| !t.is_empty()).map(|t| format!("Bearer {t}"))
 }
 
 #[cfg(test)]
@@ -1881,34 +1883,30 @@ mod node_agent_auth_tests {
     use super::*;
 
     #[test]
-    fn the_static_token_wins_when_set() {
-        assert_eq!(
-            node_agent_bearer(Some("abc"), Some("fleet"), 1),
-            Some("Bearer abc".into())
-        );
+    fn the_static_token_is_the_only_bearer() {
+        assert_eq!(node_agent_bearer(Some("abc")), Some("Bearer abc".into()));
     }
 
     #[test]
-    fn the_fallback_is_signed_with_the_fleet_secret() {
-        // The regression this guards: signing a node-bound call with the
-        // controller-local secret, which no node holds. Reproduce the
-        // token the node agent will verify and require it to match.
-        let got = node_agent_bearer(None, Some("fleet"), 42).expect("a bearer");
-        let want = mint_cluster_token("gateway", "fleet", 42).expect("a token");
-        assert_eq!(got, format!("Bearer {want}"));
-        assert_ne!(
-            got,
-            format!("Bearer {}", mint_cluster_token("gateway", "controller-local", 42).unwrap())
-        );
-    }
-
-    #[test]
-    fn no_credential_at_all_is_none_rather_than_an_empty_bearer() {
-        assert_eq!(node_agent_bearer(Some(""), Some(""), 1), None);
-        assert_eq!(node_agent_bearer(None, None, 1), None);
+    fn no_v1_token_is_ever_minted_for_an_agent() {
+        // Without a static token there is no bearer at all: not a v1
+        // `<actor>:<ts>:<hmac>`, not anything signed with a shared secret.
+        assert_eq!(node_agent_bearer(None), None);
+        assert_eq!(node_agent_bearer(Some("")), None);
+        // ...and the function cannot even be handed a secret to sign with.
+        let src = include_str!("cluster.rs");
+        let body = src.split("pub(crate) fn node_agent_bearer(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        assert!(!body.contains(&["mint_cluster", "_token"].concat()), "the fallback is back: {body}");
     }
 }
 
+/// INTERNAL ONLY. Never send the result to an agent or the gateway: v1 cluster
+/// tokens are refused everywhere (`cluster_token_v1_refused`). It exists for
+/// the v2-admission path's internal re-mint (`auth.rs`), the browser door's
+/// own-key bearer (`routes/ui.rs`) and tests. A controller->agent credential
+/// is `node_agent_auth::header_for`, which never calls this
+/// (`node_agent_auth::tests::no_agent_credential_path_mints_a_v1_token`).
+///
 /// Mint a cluster-HMAC time-bearer token: `<actor>:<ts>:<hmac64>` with the
 /// FULL 64-hex HMAC-SHA256 signature over `"actor:ts"`.
 ///

@@ -1990,7 +1990,7 @@ fn bearer_token(request: &Request) -> Option<String> {
 // friendlier-looking name would have silently opted out of all three.
 
 /// Verify an HMAC time-bearer token of the form `<actor>:<ts>:<hmac32>`,
-/// the same format produced by `routes::cluster::node_agent_bearer`.
+/// the same format produced by `routes::cluster::mint_cluster_token`.
 /// Rejects tokens older than `MAX_TOKEN_AGE_SECS` to bound replay window.
 ///
 /// This lets cluster-internal callers authenticate without a JWT —
