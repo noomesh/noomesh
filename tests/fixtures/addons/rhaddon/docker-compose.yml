@@ -17,7 +17,8 @@ services:
   noo-rhaddon:
     image: ${NOO_ADDON_IMAGE_RHADDON:-noo-addon-unpinned.invalid/rhaddon:x}
     container_name: noo-rhaddon
-    user: "1000:1000"
+    # No numeric `user:` (tests/test_compose_named_users.py): the image's own
+    # USER must be the uid resources.json declares (1000).
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
