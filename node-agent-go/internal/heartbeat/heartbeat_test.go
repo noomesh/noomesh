@@ -581,7 +581,7 @@ func TestReporter_HeartbeatCarriesLegacyLanes(t *testing.T) {
 		if !ok {
 			t.Fatalf("legacy_lanes missing or not a map: %#v", payload["legacy_lanes"])
 		}
-		for _, k := range []string{"since_unix", "static_token", "whois_non_controller"} {
+		for _, k := range []string{"since_unix", "static_token", "cluster_hmac_v1_refused"} {
 			if _, ok := ll[k].(float64); !ok {
 				t.Fatalf("legacy_lanes.%s missing or not a number: %#v", k, ll)
 			}

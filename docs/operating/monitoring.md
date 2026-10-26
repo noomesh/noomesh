@@ -177,18 +177,18 @@ in `gateway-rust/src/metrics.rs::collect_db_gauges`.
 
 ### Legacy credential lanes
 
-Two ways in are still admitted only until nothing uses them
-(`node_token_no_cert`, `cluster_hmac_v1`). The gateway counts each one it
-admits, and the replacements beside them, so the ratio is visible. Counting
-never refuses anything; those lanes still work exactly as before. The
-`*_refused` lanes below are lanes that were retired: they count refusals,
-so a caller still on one has a name. Two admission lanes are gone entirely
-and are no longer counted: `self_call_shared_secret` (the
-`NOO_SELF_CALL_SHARED_SECRET` bridge, deleted) and
-`cluster_hmac_non_inference` (nothing can resolve a shared secret to
-`Internal` any more). Dashboards or alerts that still name them read zero
-forever; use `self_call_shared_secret_refused` and
-`addon_shared_secret_refused`.
+One way in is still admitted only until nothing uses it
+(`node_token_no_cert`). The gateway counts each use, and the replacement
+beside it, so the ratio is visible. Counting never refuses anything; that lane
+still works exactly as before. The `*_refused` lanes below are lanes that
+were retired: they count refusals, so a caller still on one has a name. Three
+admission lanes are gone entirely and are no longer counted:
+`self_call_shared_secret` (the `NOO_SELF_CALL_SHARED_SECRET` bridge,
+deleted), `cluster_hmac_non_inference` (nothing can resolve a shared secret
+to `Internal` any more) and `cluster_hmac_v1` (v1 cluster tokens;
+the `NOO_CLUSTER_TOKEN_V1` gate is deleted). Dashboards or alerts that still
+name them read zero forever; use `self_call_shared_secret_refused`,
+`addon_shared_secret_refused` and `cluster_hmac_v1_refused`.
 
 | `lane` | other labels | counted when |
 |---|---|---|
@@ -198,8 +198,8 @@ forever; use `self_call_shared_secret_refused` and
 | `node_token_with_cert` | `node` (from the certificate) | the same with the node's certificate — the good case |
 | `addon_exchanged_token` | `caller`, `route_class` | an add-on on its own exchanged token — the good case |
 | `operator_client_cert` | `caller` (the operator's account), `route_class` | a posture write admitted on an operator client certificate and a token bound to it — the good case for the CLI's posture writes |
-| `cluster_hmac_v1` | `caller`, `route_class` | a fleet-secret HMAC admitted in the old v1 form (not bound to its request); `cluster_hmac_v2` (`caller`) is the good case |
-| `cluster_hmac_v1_refused` | `caller`, `route_class` | REFUSED, not admitted: a v1 cluster token after `NOO_CLUSTER_TOKEN_V1=0`. Every count is a caller whose calls all fail until it signs v2; each node agent reports its own under the same name in `legacy_lanes` |
+| `cluster_hmac_v2` | `caller` | a fleet-secret HMAC admitted in the request-bound v2 form — the good case |
+| `cluster_hmac_v1_refused` | `caller`, `route_class` | REFUSED, not admitted: a fleet-secret HMAC in the old v1 form (not bound to its request). The gateway answers `401 cluster_token_v1_refused` naming `noo upgrade --nodes`. Every count is a caller whose calls all fail until it signs v2; each node agent reports its own under the same name in `legacy_lanes` |
 | `cli_shared_secret_refused` | `caller` (`cli`, `cli-posture`, `cli-onboard`, `cli-break-glass`), `route_class` | REFUSED, not admitted: a `noo` binary signed a request with the controller secret. Every count is an old CLI that needs `noo upgrade --all` |
 
 The `noo` CLI is on none of the admitted lanes. The CLI never
@@ -216,13 +216,14 @@ refusals are counted as `cli_shared_secret_refused`; `noo cluster verify
 why `noo_gateway_start_time_seconds` sits beside them: a zero means
 something only with its window.
 
-Each node agent counts its own two lanes — `static_token` (a request
-admitted by the static `NOO_NODE_AGENT_TOKEN` rather than the HMAC token)
-and `whois_non_controller` (`GET /tailnet/whois` served to a caller whose
-certificate is not the controller's) — as
-`noo_node_legacy_lane_uses_total{node_id,lane}` on its `/metrics`, and
-reports them on every heartbeat as `legacy_lanes`
-(`{since_unix, static_token, whois_non_controller}`).
+Each node agent counts its own lanes — `static_token` (a request admitted by
+the static `NOO_NODE_AGENT_TOKEN` rather than the HMAC token) and
+`cluster_hmac_v1_refused` (a v1 cluster token the agent refused) — as
+`noo_node_legacy_lane_uses_total{node_id,lane}` on its `/metrics`, and reports
+them on every heartbeat as `legacy_lanes`
+(`{since_unix, static_token, cluster_hmac_v1_refused}`). `whois_non_controller`
+is no longer reported: `GET /tailnet/whois` is the controller's alone, so the
+lane was a constant 0 and a zero that cannot move is not evidence.
 
 The logs say who: a `node_token_no_cert` use logs a WARN once per node per
 hour; a `self_call_shared_secret_refused` use logs a WARN once per

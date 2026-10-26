@@ -87,8 +87,18 @@ func TestPayloadGolden_ZeroShapes(t *testing.T) {
 		t.Errorf("reconcile_refusals must be an EMPTY LIST, always sent: %#v", beat["reconcile_refusals"])
 	}
 	ll := beat["legacy_lanes"].(map[string]any)
-	if ll["static_token"] != float64(0) || ll["whois_non_controller"] != float64(0) {
+	// whois_non_controller (a constant 0 reported as a measurement since
+	// GET /tailnet/whois went behind ControllerOnly) and cluster_hmac_v1 (the
+	// deleted v1 admission lane) are GONE from the shape on purpose: a lane
+	// that cannot move is not evidence. cluster_hmac_v1_refused is the one
+	// v1 signal, kept for one release so a stale caller is visible.
+	if ll["static_token"] != float64(0) || ll["cluster_hmac_v1_refused"] != float64(0) {
 		t.Errorf("legacy_lanes zero shape changed: %#v", ll)
+	}
+	for _, gone := range []string{"whois_non_controller", "cluster_hmac_v1"} {
+		if _, ok := ll[gone]; ok {
+			t.Errorf("legacy_lanes still reports the deleted lane %q: %#v", gone, ll)
+		}
 	}
 	if _, ok := reg["reconcile_refusals"]; ok {
 		t.Errorf("registration must not carry reconcile_refusals")

@@ -10,7 +10,7 @@ bytes: one shared test vector in all three files, and the shell signer run for
 real and checked against an independent Python implementation of the spec.
 
 The properties (a replay is refused, a body/path/method change is refused, v1
-is still accepted until the gate closes) are asserted where the verifier
+is always refused) are asserted where the verifier
 lives: `cluster_token_v2.rs` tests and `clustertoken_v2_test.go`.
 """
 
@@ -88,29 +88,23 @@ def test_every_shell_token_has_a_fresh_nonce(tmp_path):
     assert a.split(":")[3] != b.split(":")[3], "a reused nonce is a replay the gateway would refuse"
 
 
-def test_the_shell_legacy_form_is_only_the_pin(tmp_path):
-    tok = _run_bearer(tmp_path, "v1", "POST", "/x", "{}")
-    node, ts, sig = tok.split(":")
-    assert node == "host2" and not tok.startswith("v2:")
-    assert sig == hmac.new(b"s3cret", f"host2:{ts}".encode(), hashlib.sha256).hexdigest()
+def test_the_shell_has_no_v1_signer_and_ignores_the_old_pin(tmp_path):
     src = FETCH.read_text()
+    fn = _node_bearer_fn()
+    assert "node_sign_form" not in src and "NOO_BEARER_FORM" not in src, "the v1 signing branch is deleted"
+    assert "-hex" in fn and "v2\\n" in fn, "node_bearer must still sign v2 (the guard must scan the signer)"
+    # A node whose env still carries the old pin (or the old gate line) signs v2.
+    env = tmp_path / "agent.env"
+    env.write_text("NOO_CLUSTER_SECRET=s3cret\nNOO_CLUSTER_TOKEN_SIGN=v1\nNOO_CLUSTER_TOKEN_V1=0\n")
+    script = fn.replace("/etc/noo-node-agent.env", str(env)) + "\nnode_bearer 'POST' '/x' '{}'\n"
+    out = subprocess.run(["sh", "-c", script], env={"NODE": "host2", "PATH": "/usr/bin:/bin"},
+                         capture_output=True, text=True, check=True).stdout
+    assert out.startswith("v2:host2:"), out
     body = re.search(r"^report_post\(\) \{\n(.*?)^\}", src, re.S | re.M).group(1)
     # No v1 retry after a 401: that retry was the controller's
     # cluster_hmac_v1 count of one per node per applied bundle.
-    assert "_form=v1" not in body and "continue" not in body, "report_post must not re-send a refused v2 report as v1"
-    assert '_form="$(node_sign_form)"' in body, "the form comes from the agent env pin, nothing else"
-
-
-def test_the_shell_signs_v1_only_when_the_agent_env_pins_it(tmp_path):
-    src = FETCH.read_text()
-    fn = re.search(r"^node_sign_form\(\) \{\n.*?^\}\n", src, re.S | re.M).group(0)
-    for content, want in [("", "v2"), ("NOO_CLUSTER_TOKEN_SIGN=v2\n", "v2"),
-                          ("NOO_CLUSTER_TOKEN_SIGN=v1\n", "v1"), ("NOO_CLUSTER_TOKEN_SIGN=\"v1\"\r\n", "v1")]:
-        env = tmp_path / "agent.env"
-        env.write_text(content)
-        out = subprocess.run(["/bin/sh", "-c", fn.replace("/etc/noo-node-agent.env", str(env)) + "node_sign_form\n"],
-                             capture_output=True, text=True, check=True).stdout.strip()
-        assert out == want, (content, out)
+    assert "continue" not in body, "report_post must not re-send a refused v2 report"
+    assert "node_bearer POST" in body
 
 
 def test_the_shell_report_mints_per_attempt_and_sends_the_body_hash():

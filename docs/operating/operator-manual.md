@@ -219,11 +219,12 @@ carries, and refuses the two keys 0.6.10 added
 (`REFUSED agent-env -- line N sets 'NODE_AGENT_BIND', which is not a key
 agent-env is rendered with`, exit 65). The node keeps its previous state, and
 `noo cluster verify` keeps saying `host agent v0.6.9`. From 0.6.11 the
-controller withholds `NODE_AGENT_BIND` and `NOO_CLUSTER_TOKEN_V1` from a Mac
+controller withholds `NODE_AGENT_BIND` from a Mac
 that reports a CLI older than 0.6.10 (or none), and the Mac applier installs
 the CLI a bundle carries before it judges any kind or env key; run
-`noo cluster provision <node>` once the node reports 0.6.10 to apply the two
-keys.
+`noo cluster provision <node>` once the node reports 0.6.10 to apply the
+key. (`NOO_CLUSTER_TOKEN_V1`, the second key 0.6.10 added, is retired and no
+longer rendered; an applier still accepts the line from an older controller.)
 
 If your controller is already on 0.6.10, update the daemon's copy of the CLI
 on the Mac by hand, then restage. `noo upgrade` in a shell updates only the

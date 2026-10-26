@@ -78,7 +78,7 @@ var (
 
 	secLegacyLanes = payloadSection{name: "legacyLanes", add: func(r *Reporter, p map[string]any) {
 		// Legacy credential lanes admitted since start: {since_unix,
-		// static_token, whois_non_controller}. Every lane is always present,
+		// static_token, cluster_hmac_v1_refused}. Every lane is always present,
 		// zeros included — absence reads as an agent too old to report, not
 		// as "0 uses".
 		p["legacy_lanes"] = auth.LegacyLaneSnapshot()

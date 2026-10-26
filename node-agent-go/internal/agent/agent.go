@@ -488,7 +488,7 @@ func (a *Agent) startTunnel(ctx context.Context) {
 		NodeID:        a.cfg.NodeID,
 		ControllerURL: a.cfg.ControllerURL,
 		TLS:           tr.TLSClientConfig,
-		Sign:          func(r *http.Request) { auth.SetClusterAuth(r, a.cfg.NodeID, a.cfg.ClusterSecret) },
+		Sign:          func(r *http.Request) error { return auth.SetClusterAuth(r, a.cfg.NodeID, a.cfg.ClusterSecret) },
 		Handler:       a.server.Handler(),
 		Verifier:      v,
 	})
@@ -740,10 +740,11 @@ func (a *Agent) startLogShip(ctx context.Context) {
 		NodeID:        a.cfg.NodeID,
 		ControllerURL: a.cfg.ControllerURL,
 		Client:        a.http,
-		Auth: func(req *http.Request) {
+		Auth: func(req *http.Request) error {
 			if a.cfg.ClusterSecret != "" {
-				auth.SetClusterAuth(req, a.cfg.NodeID, a.cfg.ClusterSecret)
+				return auth.SetClusterAuth(req, a.cfg.NodeID, a.cfg.ClusterSecret)
 			}
+			return nil
 		},
 		StateDir: a.cfg.StateDir,
 	})

@@ -920,17 +920,14 @@ fn build_env_vars(g: &Globals, a: &ProvisionArgs, site: &ProvSite, id: &ProvIden
     vars.insert("noo_ollama_gpu_count", String::new());
     vars.insert("node_agent_port", String::from("8081"));
     vars.insert("log_level", String::from("info"));
-    // Cluster trust: the bind override and the v1 cluster-token gate, both
-    // owned by the controller (see `cluster_trust_vars`).
-    let (agent_bind, v1_gate, trust_notes) = cluster_trust_vars(g).unwrap_or_else(|e| {
+    // Cluster trust: the bind override, owned by the controller (see
+    // `cluster_trust_bind`). The v1 cluster-token gate is deleted and no
+    // longer rendered: v1 is always refused.
+    let agent_bind = cluster_trust_bind().unwrap_or_else(|e| {
         fail(g.json, ExitCode::Generic, "node_agent_bind", &e,
             Some("set NODE_AGENT_BIND in the controller's .env / compose_env to `all`, an IP address, or a comma list of them (or unset it)"))
     });
-    for n in &trust_notes {
-        if !g.json && !ui::quiet() { println!("{}", ui::note(n)); }
-    }
     vars.insert("node_agent_bind", agent_bind);
-    vars.insert("noo_cluster_token_v1", v1_gate);
     if darwin {
         // Same env contract, darwin homes: everything under ~/noomesh (the
         // enroll binary installs there — no root paths, no systemd). $HOME
@@ -1012,8 +1009,8 @@ fn render_agent_env(g: &Globals, a: &ProvisionArgs, enr: &ProvEnrollment, m: &Pr
     let env_body = render_env_template(tmpl, vars).unwrap_or_else(|e| {
         fail(g.json, ExitCode::Generic, "render", &e, None)
     });
-    // A Mac whose CLI predates the two cluster-trust keys refuses an
-    // agent-env that names them (its applier validates every key up front),
+    // A Mac whose CLI predates the cluster-trust key refuses an
+    // agent-env that names it (its applier validates every key up front),
     // which would strand the very bundle that carries the newer CLI. Withheld
     // for that node, said, and the next restage carries them.
     if applier_knows_cluster_trust_keys(darwin, &node_app_version) {
@@ -1021,10 +1018,10 @@ fn render_agent_env(g: &Globals, a: &ProvisionArgs, enr: &ProvEnrollment, m: &Pr
     } else {
         if !g.json && !ui::quiet() {
             println!("{}", ui::note(&format!(
-                "NODE_AGENT_BIND / NOO_CLUSTER_TOKEN_V1 withheld from this bundle: {node} reports \
-                 {node_app_version}, whose applier predates them and would refuse the whole agent-env. \
+                "NODE_AGENT_BIND withheld from this bundle: {node} reports \
+                 {node_app_version}, whose applier predates it and would refuse the whole agent-env. \
                  The bundle carries the newer CLI; once {node} reports it, re-run \
-                 `noo cluster provision {node}` to apply the agent keys.")));
+                 `noo cluster provision {node}` to apply the agent key.")));
         }
         drop_env_keys(&env_body, CLUSTER_TRUST_ENV_KEYS)
     }
@@ -2888,12 +2885,8 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
     vars.insert("noo_ollama_gpu_count", String::new());
     vars.insert("node_agent_port", String::from("8081"));
     vars.insert("log_level", String::from("info"));
-    let (agent_bind, v1_gate, trust_notes) = cluster_trust_vars(g)?;
-    for n in &trust_notes {
-        if !g.json && !ui::quiet() { println!("{}", ui::note(n)); }
-    }
+    let agent_bind = cluster_trust_bind()?;
     vars.insert("node_agent_bind", agent_bind);
-    vars.insert("noo_cluster_token_v1", v1_gate);
     let env_body = render_env_template(&tmpl, &vars)?;
 
     // ── the controller's own NATS credential ──────────────
@@ -4174,9 +4167,11 @@ fn image_tag() -> String {
     release_var("NOO_IMAGE_TAG")
 }
 
-/// The two agent-env keys the controller owns for cluster trust: the bind
-/// override and the v1 cluster-token gate.
-pub(crate) const CLUSTER_TRUST_ENV_KEYS: &[&str] = &["NODE_AGENT_BIND", "NOO_CLUSTER_TOKEN_V1"];
+/// The agent-env key the controller owns for cluster trust: the bind
+/// override. (`NOO_CLUSTER_TOKEN_V1`, the v1 cluster-token gate, was the
+/// second; it is deleted and never rendered — a pre-0.6.10 Mac applier would
+/// refuse the line anyway.)
+pub(crate) const CLUSTER_TRUST_ENV_KEYS: &[&str] = &["NODE_AGENT_BIND"];
 
 /// The first CLI whose Mac applier accepts [`CLUSTER_TRUST_ENV_KEYS`] in an
 /// `agent-env` payload (node_fetch.rs `AGENT_ENV_KEYS`). A Linux node is
@@ -4243,50 +4238,11 @@ pub(crate) fn agent_bind_value(raw: &str) -> Result<String, String> {
     Ok(parts.join(","))
 }
 
-/// The v1 cluster-token gate to render, from the gateway's `posture list`
-/// body. `Some("0")` when the operator closed it (the desired DB row first,
-/// then the running value), `Some("1")` when a row says anything else, and
-/// `None` when the gateway lists no such gate (an older gateway): the agent's
-/// own default (accept, count) then stands. Pure, so the rule is testable.
-pub(crate) fn v1_gate_from_posture(body: &serde_json::Value) -> Option<&'static str> {
-    let row = body["posture"].as_array()?.iter().find(|r| r["key"] == "NOO_CLUSTER_TOKEN_V1")?;
-    let v = row["db_value"].as_str().or_else(|| row["running"].as_str())?;
-    Some(if matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off" | "closed") {
-        "0"
-    } else {
-        "1"
-    })
-}
-
-/// `(node_agent_bind, noo_cluster_token_v1, notes)` for the agent env.
-///
-/// `NODE_AGENT_BIND` is the controller's `.env` / environment value (a fleet
-/// setting, like NOO_IMAGE_TAG); an invalid one is an Err naming the fix.
-/// `NOO_CLUSTER_TOKEN_V1` is the controller's own posture, so `posture set
-/// NOO_CLUSTER_TOKEN_V1 0` reaches nodes with the next bundle. When the
-/// posture cannot be read the gate renders EMPTY (the node keeps its default:
-/// accepts and counts v1 — what every node did before this key was carried)
-/// and the notes say NOT CHECKED, never that it was open.
-pub(crate) fn cluster_trust_vars(g: &Globals) -> Result<(String, String, Vec<String>), String> {
-    let bind = agent_bind_value(&release_var("NODE_AGENT_BIND"))?;
-    let mut notes = Vec::new();
-    let gate = match crate::http::get_json_opt(g, "/api/security/posture", true, 5) {
-        Some(body) => match v1_gate_from_posture(&body) {
-            Some("0") => {
-                notes.push("NOO_CLUSTER_TOKEN_V1=0 (from the controller's posture): this node will refuse v1 cluster tokens".to_string());
-                "0".to_string()
-            }
-            Some(v) => v.to_string(),
-            None => String::new(),
-        },
-        None => {
-            notes.push("NOT CHECKED: the controller's NOO_CLUSTER_TOKEN_V1 posture could not be read, so this node's env \
-                leaves the gate unset (v1 accepted and counted). If you closed it, re-run once the gateway answers \
-                (`noo security posture list`).".to_string());
-            String::new()
-        }
-    };
-    Ok((bind, gate, notes))
+/// The `NODE_AGENT_BIND` to render for the agent env: the controller's `.env`
+/// / environment value (a fleet setting, like NOO_IMAGE_TAG); an invalid one
+/// is an Err naming the fix.
+pub(crate) fn cluster_trust_bind() -> Result<String, String> {
+    agent_bind_value(&release_var("NODE_AGENT_BIND"))
 }
 
 pub(crate) fn release_var(key: &str) -> String {
@@ -4309,29 +4265,21 @@ pub(crate) fn release_var(key: &str) -> String {
 #[cfg(test)]
 mod cluster_trust_tests {
     use super::*;
-    use serde_json::json;
 
+    /// The v1 gate is deleted: the real template must not carry the line,
+    /// and a bundle must not render it for any node.
     #[test]
-    fn the_v1_gate_follows_the_controllers_posture() {
-        let closed = json!({"posture": [{"key": "NOO_CLUSTER_TOKEN_V1", "db_value": "0", "running": null}]});
-        assert_eq!(v1_gate_from_posture(&closed), Some("0"));
-        // Desired beats running: `posture set ... 0` reaches nodes before the
-        // gateway restarts.
-        let pending = json!({"posture": [{"key": "NOO_CLUSTER_TOKEN_V1", "db_value": "off", "running": "1"}]});
-        assert_eq!(v1_gate_from_posture(&pending), Some("0"));
-        let open = json!({"posture": [{"key": "NOO_CLUSTER_TOKEN_V1", "db_value": "1", "running": null}]});
-        assert_eq!(v1_gate_from_posture(&open), Some("1"));
-        let running_only = json!({"posture": [{"key": "NOO_CLUSTER_TOKEN_V1", "db_value": null, "running": "false"}]});
-        assert_eq!(v1_gate_from_posture(&running_only), Some("0"));
-    }
-
-    #[test]
-    fn an_unset_gate_or_an_older_gateway_renders_nothing() {
-        let unset = json!({"posture": [{"key": "NOO_CLUSTER_TOKEN_V1", "db_value": null, "running": null}]});
-        assert_eq!(v1_gate_from_posture(&unset), None);
-        let old = json!({"posture": [{"key": "NOO_EXEC_APPROVAL_MODE", "db_value": "approval"}]});
-        assert_eq!(v1_gate_from_posture(&old), None);
-        assert_eq!(v1_gate_from_posture(&json!({})), None);
+    fn the_agent_env_no_longer_carries_the_v1_gate() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let path = root.join("node-agent-go/deploy/noo-node-agent.env.tmpl");
+        if !path.exists() {
+            eprintln!("crate-only build (no repo tree) -- template check skipped");
+            return;
+        }
+        let tmpl = std::fs::read_to_string(&path).unwrap();
+        assert!(tmpl.contains("NODE_AGENT_BIND="), "the guard must be scanning the real template");
+        let body = render_env_template(&tmpl, &super::tests::full_vars()).unwrap();
+        assert!(!body.contains("NOO_CLUSTER_TOKEN_V1="), "the retired v1 gate is still rendered:\n{body}");
     }
 
     #[test]
@@ -4424,7 +4372,7 @@ mod cluster_trust_tests {
 
     #[test]
     fn dropping_the_keys_leaves_the_rest_of_the_env_alone() {
-        let body = "NODE_ID=h\nNODE_AGENT_BIND=all\n# NODE_AGENT_BIND is a comment\nNOO_CLUSTER_TOKEN_V1=0\nLOG_LEVEL=info\n";
+        let body = "NODE_ID=h\nNODE_AGENT_BIND=all\n# NODE_AGENT_BIND is a comment\nLOG_LEVEL=info\n";
         assert_eq!(drop_env_keys(body, CLUSTER_TRUST_ENV_KEYS),
             "NODE_ID=h\n# NODE_AGENT_BIND is a comment\nLOG_LEVEL=info\n");
     }
@@ -4953,7 +4901,7 @@ mod tests {
                   // Fixed in passing rather than left to redden the next
                   // branch that touches this crate.
                   "noo_self_node","ollama_url",
-                  "node_agent_bind","noo_cluster_token_v1"] {
+                  "node_agent_bind"] {
             v.insert(k, format!("V_{k}"));
         }
         v

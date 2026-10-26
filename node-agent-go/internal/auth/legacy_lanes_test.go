@@ -42,7 +42,12 @@ func TestLegacyLane_StaticTokenIsCountedAndHMACIsNot(t *testing.T) {
 	}
 
 	before = laneCount(LaneStaticToken)
-	admitted(t, cfg, mintToken("gateway", "s3cret", time.Now().Unix(), false), ctrl)
+	nonce := make([]byte, 16)
+	tok, err := SignV2("GET", "/gpu", nil, "gateway", "s3cret", time.Now(), nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitted(t, cfg, tok, ctrl)
 	if got := laneCount(LaneStaticToken) - before; got != 0 {
 		t.Fatalf("an HMAC admission moved the static-token count by %d", got)
 	}
@@ -51,9 +56,14 @@ func TestLegacyLane_StaticTokenIsCountedAndHMACIsNot(t *testing.T) {
 // The heartbeat shape: every lane present (zeros included) plus the window.
 func TestLegacyLaneSnapshot_HasEveryLaneAndItsWindow(t *testing.T) {
 	s := LegacyLaneSnapshot()
-	for _, k := range []string{"since_unix", LaneStaticToken, LaneWhoisNonController, LaneHMACv1, LaneHMACv1Refused} {
+	for _, k := range []string{"since_unix", LaneStaticToken, LaneHMACv1Refused} {
 		if _, ok := s[k]; !ok {
 			t.Fatalf("legacy_lanes lacks %q: %v", k, s)
+		}
+	}
+	for _, gone := range []string{"whois_non_controller", "cluster_hmac_v1"} {
+		if _, ok := s[gone]; ok {
+			t.Fatalf("legacy_lanes still reports the deleted lane %q: %v", gone, s)
 		}
 	}
 	if since, _ := s["since_unix"].(int64); since <= 0 || since > time.Now().Unix() {

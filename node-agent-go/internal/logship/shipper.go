@@ -30,7 +30,7 @@ type Config struct {
 	// than the heartbeat's 10 s.
 	Client *http.Client
 	// Auth sets the bearer exactly as the heartbeat does.
-	Auth func(*http.Request)
+	Auth func(*http.Request) error
 	// StateDir is the agent's writable state dir; the spill ring lives
 	// under <StateDir>/logship.
 	StateDir string

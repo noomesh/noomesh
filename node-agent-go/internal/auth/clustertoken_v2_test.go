@@ -5,6 +5,7 @@ package auth
 
 import (
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,7 +36,9 @@ func signedReq(t *testing.T, method, uri, body string) *http.Request {
 	if err != nil {
 		t.Fatal(err)
 	}
-	SetClusterAuth(req, "host2", v2Secret)
+	if err := SetClusterAuth(req, "host2", v2Secret); err != nil {
+		t.Fatal(err)
+	}
 	if !IsV2Token(strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")) {
 		t.Fatalf("signer did not produce v2: %q", req.Header.Get("Authorization"))
 	}
@@ -140,39 +143,40 @@ func TestV2_StaleAndWrongSecretRefused(t *testing.T) {
 	}
 }
 
-func TestV1_AcceptedAndCountedUntilTheGateCloses(t *testing.T) {
+// v1 is always refused: there is no gate to reopen it, whatever the env says,
+// and every refusal is counted as a refusal (never an admission).
+func TestV1_AlwaysRefusedAndCounted(t *testing.T) {
 	resetNoncesForTest()
-	t.Setenv("NOO_CLUSTER_TOKEN_V1", "")
 	n := 0
 	h := v2Handler(t, &n)
-	before := laneHMACv1.Load()
+	for _, env := range []string{"", "0", "1"} {
+		t.Setenv("NOO_CLUSTER_TOKEN_V1", env) // retired: must change nothing
+		refusedBefore := laneHMACv1Refused.Load()
+		req := httptest.NewRequest("GET", "/x", nil)
+		req.Header.Set("Authorization", "Bearer "+mintToken("host2", v2Secret, time.Now().Unix(), false))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != 403 || n != 0 || !strings.Contains(rec.Body.String(), "signs v2") {
+			t.Fatalf("v1 (env=%q): code=%d served=%d body=%s", env, rec.Code, n, rec.Body.String())
+		}
+		if got := laneHMACv1Refused.Load() - refusedBefore; got != 1 {
+			t.Fatalf("env=%q: refused v1 counted %d times, want 1", env, got)
+		}
+	}
+	// A v1 token that does not verify is an ordinary bad token: not counted.
+	before := laneHMACv1Refused.Load()
 	req := httptest.NewRequest("GET", "/x", nil)
-	req.Header.Set("Authorization", "Bearer "+CreateClusterToken("host2", v2Secret))
+	req.Header.Set("Authorization", "Bearer "+mintToken("host2", "wrong-secret", time.Now().Unix(), false))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != 200 || n != 1 || laneHMACv1.Load() != before+1 {
-		t.Fatalf("v1 while open: code=%d served=%d counted=%d", rec.Code, n, laneHMACv1.Load()-before)
+	if rec.Code != 403 || laneHMACv1Refused.Load() != before {
+		t.Fatalf("forged v1: code=%d counted=%d", rec.Code, laneHMACv1Refused.Load()-before)
 	}
-
-	t.Setenv("NOO_CLUSTER_TOKEN_V1", "0")
-	admittedBefore, refusedBefore := laneHMACv1.Load(), laneHMACv1Refused.Load()
-	req = httptest.NewRequest("GET", "/x", nil)
-	req.Header.Set("Authorization", "Bearer "+CreateClusterToken("host2", v2Secret))
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != 403 || n != 1 || !strings.Contains(rec.Body.String(), "NOO_CLUSTER_TOKEN_V1") {
-		t.Fatalf("v1 after the gate closed: code=%d served=%d body=%s", rec.Code, n, rec.Body.String())
-	}
-	// A refusal is counted as a refusal, never as an admission.
-	if laneHMACv1.Load() != admittedBefore || laneHMACv1Refused.Load() != refusedBefore+1 {
-		t.Fatalf("refused v1 counted: admitted +%d, refused +%d (want +0, +1)",
-			laneHMACv1.Load()-admittedBefore, laneHMACv1Refused.Load()-refusedBefore)
-	}
-	// ...and v2 is untouched by the gate.
+	// ...and v2 is untouched.
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, signedReq(t, "GET", "/x", ""))
 	if rec.Code != 200 {
-		t.Fatalf("v2 with the gate closed: %d", rec.Code)
+		t.Fatalf("v2: %d", rec.Code)
 	}
 }
 
@@ -190,14 +194,42 @@ func TestV2_NonceSetIsBoundedAndFailsClosed(t *testing.T) {
 	}
 }
 
-func TestSetClusterAuth_FallsBackToV1WhenPinned(t *testing.T) {
-	t.Setenv("NOO_CLUSTER_TOKEN_SIGN", "v1")
+// There is no v1 signer: NOO_CLUSTER_TOKEN_SIGN=v1 (the old pin) changes
+// nothing, and a request that cannot be signed is an ERROR, not a v1 token.
+func TestSetClusterAuth_NoV1Fallback(t *testing.T) {
+	t.Setenv("NOO_CLUSTER_TOKEN_SIGN", "v1") // retired pin: ignored
 	req := httptest.NewRequest("GET", "/x", nil)
-	SetClusterAuth(req, "host2", v2Secret)
-	if IsV2Token(strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")) {
-		t.Fatal("pinned v1 signer sent v2")
+	if err := SetClusterAuth(req, "host2", v2Secret); err != nil {
+		t.Fatal(err)
+	}
+	if !IsV2Token(strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")) {
+		t.Fatal("the retired pin must not make the signer send anything but v2")
+	}
+
+	// A body that fails to read cannot be signed: error, and no Authorization.
+	bad := httptest.NewRequest("POST", "/x", io.NopCloser(errReader{}))
+	bad.GetBody = nil
+	err := SetClusterAuth(bad, "host2", v2Secret)
+	if !errors.Is(err, ErrNotSignable) {
+		t.Fatalf("unreadable body: err = %v, want ErrNotSignable", err)
+	}
+	if bad.Header.Get("Authorization") != "" {
+		t.Fatalf("an unsignable request must not carry a token: %q", bad.Header.Get("Authorization"))
+	}
+
+	// An actor that cannot be signed is an error too (was: silently v1).
+	if err := SetClusterAuth(httptest.NewRequest("GET", "/x", nil), "bad:actor", v2Secret); !errors.Is(err, ErrNotSignable) {
+		t.Fatalf("bad actor: err = %v", err)
+	}
+	// No secret configured: nothing to sign, nothing wrong.
+	if err := SetClusterAuth(httptest.NewRequest("GET", "/x", nil), "host2", ""); err != nil {
+		t.Fatalf("no secret: %v", err)
 	}
 }
+
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, errors.New("boom") }
 
 // A body with no GetBody (a pipe, a gzip writer, a caller's own reader) used
 // to go out on the v1 token. It is read, signed v2, and sent as the bytes
@@ -213,7 +245,9 @@ func TestSetClusterAuth_StreamBodyIsBufferedAndSignedV2(t *testing.T) {
 	if req.GetBody != nil {
 		t.Fatal("precondition: a pipe body has no GetBody")
 	}
-	SetClusterAuth(req, "host2", v2Secret)
+	if err := SetClusterAuth(req, "host2", v2Secret); err != nil {
+		t.Fatal(err)
+	}
 	tok := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
 	if !IsV2Token(tok) {
 		t.Fatalf("a stream body was not signed v2: %q", tok)
@@ -232,8 +266,8 @@ func TestSetClusterAuth_StreamBodyIsBufferedAndSignedV2(t *testing.T) {
 }
 
 // Every outbound call shape the agent makes (no body, bytes, strings, a
-// stream) signs v2 when nothing pins v1, so a 0.6.8 agent adds nothing to
-// the controller's cluster_hmac_v1 lane.
+// stream) signs v2, so a 0.6.8 agent adds nothing to
+// the controller's cluster_hmac_v1_refused lane.
 func TestSetClusterAuth_EveryBodyShapeSignsV2(t *testing.T) {
 	bodies := map[string]func() io.Reader{
 		"nil":     func() io.Reader { return nil },
@@ -250,7 +284,9 @@ func TestSetClusterAuth_EveryBodyShapeSignsV2(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		SetClusterAuth(req, "host2", v2Secret)
+		if err := SetClusterAuth(req, "host2", v2Secret); err != nil {
+			t.Fatal(err)
+		}
 		if tok := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer "); !IsV2Token(tok) {
 			t.Errorf("%s body: signed %q, want v2", name, tok)
 		}

@@ -2285,13 +2285,15 @@ fn root_exec_trustworthy(p: &Path) -> Result<(), String> {
 const AGENT_ENV_KEYS: &[&str] = &[
     "NODE_ID", "NODE_IP", "NODE_TIER", "GPU_MODEL", "CONTROLLER_URL", "NATS_URL",
     "NOO_NODE_AGENT_TOKEN", "NOO_CLUSTER_SECRET", "NOO_PKI_DIR", "NOO_TLS_CA", "NOO_TLS_CERT",
-    "NOO_TLS_KEY", "NOO_MTLS_NODES", "NODE_AGENT_BIND", "NOO_CLUSTER_TOKEN_V1", "OLLAMA_URL", "NOO_SELF_NODE", "NOO_DATA_ROOT",
+    "NOO_TLS_KEY", "NOO_MTLS_NODES", "NODE_AGENT_BIND", "OLLAMA_URL", "NOO_SELF_NODE", "NOO_DATA_ROOT",
     "HF_CACHE_DIR", "MODELS_DIR", "OLLAMA_DATA_DIR", "NOO_MODEL_CACHE_URL", "PATH",
     "NOO_FORCE_GPU", "NOO_OLLAMA_GPU_COUNT", "NOO_IMAGE_PREFIX", "NOO_IMAGE_TAG",
     "NODE_AGENT_PORT", "LOG_LEVEL", "DOCKER_HOST",
 ];
 /// Keys an older controller still renders: accepted, never acted on.
-const AGENT_ENV_INERT_KEYS: &[&str] = &["NOO_APPLY_ACCEPT_CA_SIGNED"];
+/// `NOO_CLUSTER_TOKEN_V1` (the deleted v1 cluster-token gate) is one: a bundle
+/// staged by a controller that predates its removal still carries the line.
+const AGENT_ENV_INERT_KEYS: &[&str] = &["NOO_APPLY_ACCEPT_CA_SIGNED", "NOO_CLUSTER_TOKEN_V1"];
 /// The keys `harness-env` is rendered with (`noo-harness.env.tmpl`).
 const HARNESS_ENV_KEYS: &[&str] = &[
     "NODE_ID", "NOO_GATEWAY_URL", "NATS_URL", "NATS_NODE_USER", "NATS_NODE_PASSWORD",
@@ -2999,13 +3001,13 @@ mod env_shape_tests {
             rest = &tail[end..];
         }
         out.push_str(rest);
-        // The two cluster-trust keys have a shape of their own (pinned below).
-        out.replace("NOO_CLUSTER_TOKEN_V1=value", "NOO_CLUSTER_TOKEN_V1=0")
-            .replace("NODE_AGENT_BIND=value", "NODE_AGENT_BIND=10.0.0.5")
+        // The cluster-trust key has a shape of its own (pinned below).
+        out.replace("NODE_AGENT_BIND=value", "NODE_AGENT_BIND=10.0.0.5")
     }
 
-    /// The Mac applier carries the bind and the v1 gate, pinned to the shapes
-    /// the controller renders (the shell applier is held to the same).
+    /// The Mac applier carries the bind, pinned to the shape the controller
+    /// renders (the shell applier is held to the same), and still ACCEPTS the
+    /// deleted v1 gate line from an older controller's bundle (inert).
     #[test]
     fn the_cluster_trust_keys_are_carried_and_shape_checked() {
         let agent = render("node-agent-go/deploy/noo-node-agent.env.tmpl");

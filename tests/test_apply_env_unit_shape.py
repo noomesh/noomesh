@@ -47,8 +47,7 @@ def render(tmpl: Path) -> str:
     text = re.sub(r"\{#.*?#\}", "", tmpl.read_text(), flags=re.S)
     text = re.sub(r"\{%.*?%\}", "", text, flags=re.S)
     text = re.sub(r"\{\{.*?\}\}", "value", text)
-    # The two cluster-trust keys have a shape of their own (the appliers pin it).
-    text = re.sub(r"^NOO_CLUSTER_TOKEN_V1=value$", "NOO_CLUSTER_TOKEN_V1=0", text, flags=re.M)
+    # The cluster-trust key has a shape of its own (the appliers pin it).
     return re.sub(r"^NODE_AGENT_BIND=value$", "NODE_AGENT_BIND=10.0.0.5", text, flags=re.M)
 
 
@@ -142,14 +141,20 @@ def test_an_env_payload_outside_its_shape_is_refused(tmp_path: Path, line: str, 
 
 # ── the cluster-trust keys: carried, and pinned to their shape ──────────────
 
-def test_the_agent_env_carries_the_bind_and_the_v1_gate():
-    """NODE_AGENT_BIND and NOO_CLUSTER_TOKEN_V1 are rendered, allow-listed in
-    both appliers, and the Rust applier's (Mac) list agrees. Before they were
-    carried, a hand-added line was rewritten away by the next apply."""
-    for key in ("NODE_AGENT_BIND", "NOO_CLUSTER_TOKEN_V1"):
-        assert key in template_keys(AGENT_TMPL), key
-        assert key in shell_list("AGENT_ENV_KEYS"), key
-        assert key in rust_list("AGENT_ENV_KEYS"), key
+def test_the_agent_env_carries_the_bind_and_no_longer_the_v1_gate():
+    """NODE_AGENT_BIND is rendered, allow-listed in both appliers, and the Rust
+    applier's (Mac) list agrees. NOO_CLUSTER_TOKEN_V1 (the deleted v1 cluster
+    token gate) is NOT rendered or allow-listed as a live key, but both
+    appliers still ACCEPT it as inert, so a bundle staged by an older
+    controller applies."""
+    assert "NODE_AGENT_BIND" in template_keys(AGENT_TMPL)
+    assert "NODE_AGENT_BIND" in shell_list("AGENT_ENV_KEYS")
+    assert "NODE_AGENT_BIND" in rust_list("AGENT_ENV_KEYS")
+    key = "NOO_CLUSTER_TOKEN_V1"
+    assert template_keys(AGENT_TMPL), "the template parse found no keys"
+    assert key not in template_keys(AGENT_TMPL)
+    assert key not in shell_list("AGENT_ENV_KEYS") and key not in rust_list("AGENT_ENV_KEYS")
+    assert key in shell_list("AGENT_ENV_INERT_KEYS") and key in rust_list("AGENT_ENV_INERT_KEYS")
 
 
 @pytest.mark.parametrize("line", [
@@ -252,7 +257,7 @@ def test_the_checks_run_before_anything_is_installed():
 # ── a pre-0.6.10 Mac applier must be sent an env it accepts ─────────────────
 
 PROVISION = (REPO / "noo-cli/src/commands/provision.rs").read_text()
-TRUST_KEYS = {"NODE_AGENT_BIND", "NOO_CLUSTER_TOKEN_V1"}
+TRUST_KEYS = {"NODE_AGENT_BIND"}
 # node_fetch.rs AGENT_ENV_KEYS + AGENT_ENV_INERT_KEYS at noo-cli-v0.6.9 (frozen).
 MAC_0_6_9_KEYS = {
     "NODE_ID", "NODE_IP", "NODE_TIER", "GPU_MODEL", "CONTROLLER_URL", "NATS_URL",
@@ -265,7 +270,7 @@ MAC_0_6_9_KEYS = {
 
 
 def test_withholding_the_trust_keys_leaves_exactly_what_the_0_6_9_applier_accepts():
-    """Rendered keys minus the two the provisioner withholds from an old Mac
+    """Rendered keys minus the one the provisioner withholds from an old Mac
     must all be keys the 0.6.9 applier knows; a new template key without a
     withholding rule (a floor in provision.rs) fails here, not on a Mac."""
     assert template_keys(AGENT_TMPL) - TRUST_KEYS <= MAC_0_6_9_KEYS
@@ -273,7 +278,7 @@ def test_withholding_the_trust_keys_leaves_exactly_what_the_0_6_9_applier_accept
 
 def test_the_provisioner_withholds_them_below_0_6_10_and_assumes_old_when_unknown():
     assert "CLUSTER_TRUST_KEYS_MAC_FLOOR: (u32, u32, u32) = (0, 6, 10);" in PROVISION
-    assert re.search(r'CLUSTER_TRUST_ENV_KEYS: &\[&str\] = &\["NODE_AGENT_BIND", "NOO_CLUSTER_TOKEN_V1"\]', PROVISION)
+    assert re.search(r'CLUSTER_TRUST_ENV_KEYS: &\[&str\] = &\["NODE_AGENT_BIND"\]', PROVISION)
     # unknown version on darwin is OLD (is_some_and), not capable (is_none_or).
     m = re.search(r"fn applier_knows_cluster_trust_keys.*?\n}\n", PROVISION, re.S)
     assert m and "is_some_and(|v| v >= CLUSTER_TRUST_KEYS_MAC_FLOOR)" in m.group(0)
