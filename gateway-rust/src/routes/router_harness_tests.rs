@@ -172,9 +172,10 @@ fn token_for(sub: &str, role: Role) -> String {
     crate::auth::sign_hs256(&claims, JWT_SECRET).expect("sign")
 }
 
-/// A valid v1 cluster HMAC token for `actor`, signed with `secret`: the form
-/// a node-agent presents. It carries no user.
-fn cluster_token(secret: &str, actor: &str) -> String {
+/// A valid v1-SHAPED cluster HMAC token for `actor`, signed with `secret`: the
+/// retired form. The gateway refuses it (`401 cluster_token_v1_refused`); the
+/// harness sends it only to prove that refusal. It carries no user.
+fn v1_cluster_token(secret: &str, actor: &str) -> String {
     use hmac::{Hmac, KeyInit, Mac};
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_secs();
     let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key");
@@ -343,6 +344,17 @@ impl Client {
     /// proxy), so the per-IP limiter's process-local fallback bucket, 120 a
     /// minute with no Redis, never throttles the sweep.
     async fn call(&self, method: &str, path: &str, bearer: Option<&str>) -> Reply {
+        self.send(method, path, bearer, None).await
+    }
+
+    /// A call as a current node agent makes it: a v2 cluster token for `actor`
+    /// bound to THIS method, path and body, with a fresh nonce (the gateway
+    /// refuses a replay), plus the body hash header.
+    async fn call_node(&self, method: &str, path: &str, actor: &str) -> Reply {
+        self.send(method, path, None, Some(actor)).await
+    }
+
+    async fn send(&self, method: &str, path: &str, bearer: Option<&str>, node_actor: Option<&str>) -> Reply {
         let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let url = format!("{}{}", self.base, path);
         let mut req = match method {
@@ -356,6 +368,17 @@ impl Client {
         req = req.header("x-forwarded-for", format!("198.51.{}.{}", (n / 250) % 250, n % 250 + 1));
         if let Some(t) = bearer {
             req = req.bearer_auth(t);
+        }
+        if let Some(actor) = node_actor {
+            // The harness sends `{}` as the body of POST/PUT/PATCH, nothing else.
+            let body: &[u8] = if matches!(method, "POST" | "PUT" | "PATCH") { b"{}" } else { b"" };
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock");
+            let nonce = format!("{:016x}{:016x}", now.as_nanos() as u64, n as u64);
+            let tok = crate::cluster_token_v2::sign(FLEET_SECRET, method, path, body, actor, now.as_secs(), &nonce)
+                .expect("v2 sign");
+            req = req
+                .bearer_auth(tok)
+                .header(crate::cluster_token_v2::BODY_SHA_HEADER, crate::cluster_token_v2::body_sha_hex(body));
         }
         let resp = req.send().await.unwrap_or_else(|e| panic!("{method} {path}: {e}"));
         let status = resp.status().as_u16();
@@ -429,13 +452,24 @@ const I241_ROWS: &[(&str, &str, &str)] = &[
     ("POST", "/api/security/bootstrap-tokens/{id}/revoke", "OperatorOrInternal"),
 ];
 
-/// Contract 4. `node` is a valid cluster HMAC token (no user), `operator` and
-/// `admin` are logins.
-async fn assert_i241_rows(c: &Client, node: &str, operator: &str, admin: &str) -> Vec<String> {
+/// Contract 4. The node is a v2 cluster HMAC caller (no user, signed per
+/// request by `call_node`), `operator` and `admin` are logins.
+async fn assert_i241_rows(c: &Client, operator: &str, admin: &str) -> Vec<String> {
     let mut failures = Vec::new();
     // Control: the node token verifies and is admitted to a node route. Without
     // it, a token the gateway never accepted would "prove" every refusal below.
-    let ctl = c.call("GET", &format!("/api/cluster/nodes/{HARNESS_NODE}/desired-config"), Some(node)).await;
+    let desired = format!("/api/cluster/nodes/{HARNESS_NODE}/desired-config");
+    // The retired v1 form is refused by the real router, with the fix in the
+    // body, on the very route the v2 control below is admitted to.
+    let v1 = c.call("GET", &desired, Some(&v1_cluster_token(FLEET_SECRET, HARNESS_NODE))).await;
+    if v1.status != 401 || !v1.text.contains("cluster_token_v1_refused") {
+        failures.push(format!(
+            "control: a v1 cluster token on desired-config should be 401 cluster_token_v1_refused, got {} — {:?}",
+            v1.status, v1.text
+        ));
+        return failures;
+    }
+    let ctl = c.call_node("GET", &desired, HARNESS_NODE).await;
     if ctl.status == 401 || ctl.status == 403 {
         failures.push(format!(
             "control: the node token should be admitted to its own desired-config, got {} — {:?}",
@@ -448,7 +482,7 @@ async fn assert_i241_rows(c: &Client, node: &str, operator: &str, admin: &str) -
         let url = concrete(path);
         // 1. No user: refused. 403 is the node allow-list (`node_route_allowed`)
         //    or the extractor, whichever answers first; both are the contract.
-        let r = c.call(method, &url, Some(node)).await;
+        let r = c.call_node(method, &url, HARNESS_NODE).await;
         if r.status == 403 {
             refused += 1;
         } else {
@@ -604,7 +638,6 @@ async fn the_real_router_holds_authz_redis_and_measured_contracts() {
     let viewer = token_for("harness-viewer", Role::User);
     let admin = token_for("harness-admin", Role::Admin);
     let operator = token_for("harness-operator", Role::Operator);
-    let node = cluster_token(FLEET_SECRET, HARNESS_NODE);
 
     let mut failures: Vec<String> = Vec::new();
 
@@ -625,7 +658,7 @@ async fn the_real_router_holds_authz_redis_and_measured_contracts() {
         failures.extend(assert_viewer_refused(&c, &viewer, &routes).await);
         failures.extend(assert_redis_reconnecting(&c, &admin).await);
         failures.extend(assert_measured(&c, &admin).await);
-        failures.extend(assert_i241_rows(&c, &node, &operator, &admin).await);
+        failures.extend(assert_i241_rows(&c, &operator, &admin).await);
     }
 
     server.abort();
