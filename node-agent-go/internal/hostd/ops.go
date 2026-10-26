@@ -78,6 +78,21 @@ func (e *Engine) logf(format string, args ...any) {
 	}
 }
 
+// writeResult records a command's result and, when the spool write fails,
+// says so: the caller polls the spool, so a lost result otherwise looks like
+// an op that never answers (a timeout) instead of the real cause (disk full,
+// permissions). One retry first; a persistent failure is logged loudly.
+func (e *Engine) writeResult(name string, r Result) {
+	err := WriteResult(e.Spool, name, r)
+	if err != nil {
+		time.Sleep(50 * time.Millisecond)
+		err = WriteResult(e.Spool, name, r)
+	}
+	if err != nil {
+		e.logf("ERROR %s: cannot write result (op=%s rc=%d status=%s): %v", name, r.Op, r.RC, r.Status, err)
+	}
+}
+
 // composeArgs builds the compose invocation, mirroring the launcher scripts.
 // The override file is included only when present — compose errors out on a
 // missing -f, which would turn "no override configured" (the normal case on a
@@ -197,7 +212,9 @@ func opRecreate(ctx context.Context, e *Engine, name string, c *Command) (int, s
 		"UNHEALTHY %s at %s\n  op=%s service=%s\n  rollback.sha=%s\n  rollback.files=%s\n"+
 			"  NOTE: auto-rollback intentionally NOT performed (host tree may hold uncommitted work).\n",
 		name, stamp(), c.Op, c.Service, sha, files)
-	_ = os.WriteFile(filepath.Join(e.Spool, "UNHEALTHY-"+name+".alert"), []byte(body), 0o644)
+	if err := os.WriteFile(filepath.Join(e.Spool, "UNHEALTHY-"+name+".alert"), []byte(body), 0o644); err != nil {
+		e.logf("ERROR %s: cannot write UNHEALTHY alert file (the operator will not see it in the spool): %v", name, err)
+	}
 
 	if rc == 0 {
 		rc = 1
@@ -519,7 +536,7 @@ func opStackRebuild(ctx context.Context, e *Engine, name string, c *Command) (in
 		return 1, fmt.Sprintf("cannot claim rebuild marker: %v", err)
 	}
 
-	_ = WriteResult(e.Spool, name, Result{
+	e.writeResult(name, Result{
 		OK: true, Op: c.Op, Service: c.Service, RC: 0,
 		Stderr: "detached; log=" + logPath, Status: "running",
 	})
@@ -529,13 +546,13 @@ func opStackRebuild(ctx context.Context, e *Engine, name string, c *Command) (in
 		defer os.Remove(marker)
 		rc := e.runRebuildScript(context.WithoutCancel(ctx), logPath, args)
 		if rc == 0 {
-			_ = WriteResult(e.Spool, name, Result{
+			e.writeResult(name, Result{
 				OK: true, Op: c.Op, Service: c.Service, Stderr: "log=" + logPath, Status: "done",
 			})
 			e.logf("OK   %s op=stack-rebuild rc=0 (detached job finished)", name)
 			return
 		}
-		_ = WriteResult(e.Spool, name, Result{
+		e.writeResult(name, Result{
 			OK: false, Op: c.Op, Service: c.Service, RC: rc,
 			Stderr: "rebuild failed; see " + logPath, Status: "failed",
 		})

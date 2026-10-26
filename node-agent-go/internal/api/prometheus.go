@@ -37,30 +37,40 @@ func (s *Server) handlePrometheusMetrics(w http.ResponseWriter, r *http.Request)
 			gpuModel = "unknown"
 		}
 
-		b.WriteString("# HELP noo_gpu_utilization_percent GPU utilization percentage\n")
-		b.WriteString("# TYPE noo_gpu_utilization_percent gauge\n")
-		fmt.Fprintf(&b, "noo_gpu_utilization_percent{node_id=%q,gpu=%q} %g\n",
-			nodeID, gpuModel, gpuMetrics.GPUUtilizationPct)
+		if gpuMetrics.GPUUtilizationPct != nil { // unknown is omitted, never exported as 0
+			b.WriteString("# HELP noo_gpu_utilization_percent GPU utilization percentage\n")
+			b.WriteString("# TYPE noo_gpu_utilization_percent gauge\n")
+			fmt.Fprintf(&b, "noo_gpu_utilization_percent{node_id=%q,gpu=%q} %g\n",
+				nodeID, gpuModel, *gpuMetrics.GPUUtilizationPct)
+		}
 
-		b.WriteString("# HELP noo_gpu_memory_utilization_percent GPU memory utilization percentage\n")
-		b.WriteString("# TYPE noo_gpu_memory_utilization_percent gauge\n")
-		fmt.Fprintf(&b, "noo_gpu_memory_utilization_percent{node_id=%q,gpu=%q} %g\n",
-			nodeID, gpuModel, gpuMetrics.MemoryUtilizationPct)
+		if gpuMetrics.MemoryUtilizationPct != nil { // unknown is omitted, never exported as 0
+			b.WriteString("# HELP noo_gpu_memory_utilization_percent GPU memory utilization percentage\n")
+			b.WriteString("# TYPE noo_gpu_memory_utilization_percent gauge\n")
+			fmt.Fprintf(&b, "noo_gpu_memory_utilization_percent{node_id=%q,gpu=%q} %g\n",
+				nodeID, gpuModel, *gpuMetrics.MemoryUtilizationPct)
+		}
 
-		b.WriteString("# HELP noo_gpu_memory_used_mb GPU memory used in MB\n")
-		b.WriteString("# TYPE noo_gpu_memory_used_mb gauge\n")
-		fmt.Fprintf(&b, "noo_gpu_memory_used_mb{node_id=%q,gpu=%q} %g\n",
-			nodeID, gpuModel, gpuMetrics.MemoryUsedMB)
+		if gpuMetrics.MemoryUsedMB != nil { // unknown is omitted, never exported as 0
+			b.WriteString("# HELP noo_gpu_memory_used_mb GPU memory used in MB\n")
+			b.WriteString("# TYPE noo_gpu_memory_used_mb gauge\n")
+			fmt.Fprintf(&b, "noo_gpu_memory_used_mb{node_id=%q,gpu=%q} %g\n",
+				nodeID, gpuModel, *gpuMetrics.MemoryUsedMB)
+		}
 
-		b.WriteString("# HELP noo_gpu_memory_total_mb GPU memory total in MB\n")
-		b.WriteString("# TYPE noo_gpu_memory_total_mb gauge\n")
-		fmt.Fprintf(&b, "noo_gpu_memory_total_mb{node_id=%q,gpu=%q} %g\n",
-			nodeID, gpuModel, gpuMetrics.MemoryTotalMB)
+		if gpuMetrics.MemoryTotalMB != nil { // unknown is omitted, never exported as 0
+			b.WriteString("# HELP noo_gpu_memory_total_mb GPU memory total in MB\n")
+			b.WriteString("# TYPE noo_gpu_memory_total_mb gauge\n")
+			fmt.Fprintf(&b, "noo_gpu_memory_total_mb{node_id=%q,gpu=%q} %g\n",
+				nodeID, gpuModel, *gpuMetrics.MemoryTotalMB)
+		}
 
-		b.WriteString("# HELP noo_gpu_temperature_celsius GPU temperature in Celsius\n")
-		b.WriteString("# TYPE noo_gpu_temperature_celsius gauge\n")
-		fmt.Fprintf(&b, "noo_gpu_temperature_celsius{node_id=%q,gpu=%q} %g\n",
-			nodeID, gpuModel, gpuMetrics.TemperatureC)
+		if gpuMetrics.TemperatureC != nil { // unknown is omitted, never exported as 0
+			b.WriteString("# HELP noo_gpu_temperature_celsius GPU temperature in Celsius\n")
+			b.WriteString("# TYPE noo_gpu_temperature_celsius gauge\n")
+			fmt.Fprintf(&b, "noo_gpu_temperature_celsius{node_id=%q,gpu=%q} %g\n",
+				nodeID, gpuModel, *gpuMetrics.TemperatureC)
+		}
 
 		if gpuMetrics.PowerDrawW != nil {
 			b.WriteString("# HELP noo_gpu_power_draw_watts GPU power draw in watts\n")
