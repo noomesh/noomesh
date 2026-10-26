@@ -3829,6 +3829,10 @@ async fn node_config_put(
     .map_err(|e| AppError::Internal(format!("node_config upsert: {e}")))?;
 
     tracing::info!(node = %node_id, "node_config_updated");
+    // Every column here is served by desired-config (harness policy,
+    // vendor kinds, profile overrides, usage, data root …), so a change
+    // reaches the node now rather than at its next tick (i256 fix 3).
+    nudge_reconcile(state.clone(), node_id.clone());
     Ok(Json(json!({"ok": true, "node_id": node_id})))
 }
 
@@ -6655,6 +6659,18 @@ mod heartbeat_carry_tests {
         assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/bench\", post(node_bench))"));
         assert_eq!(src.matches("carry_reported(&mut data, &body, \"model_bench\");").count(), 2, "heartbeat and registration");
         assert!(src.contains("\"harness_profile\": harness_profile,"), "desired-config carries the resolved profile");
+    }
+
+    /// Every desired-state writer nudges the node after it stores, or the
+    /// change lands at the next 5-minute tick (i256): placement put, delete
+    /// and the node-config upsert. Source pins, as above.
+    #[test]
+    fn desired_state_writers_nudge_the_node() {
+        let src = include_str!("cluster.rs").split("fn desired_state_writers_nudge_the_node").next().unwrap();
+        for f in ["async fn placement_put(", "async fn placement_delete(", "async fn node_config_put("] {
+            let h = src.split(f).nth(1).unwrap_or_else(|| panic!("{f}")).split("\nasync fn ").next().unwrap();
+            assert!(h.contains("nudge_reconcile(state.clone(), node_id.clone());"), "{f} must nudge");
+        }
     }
 
     /// `stunnel_image` rides the record from both
