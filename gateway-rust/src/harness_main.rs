@@ -467,7 +467,8 @@ pub async fn run() -> Result<()> {
             continue;
         };
         if let Some(reply) = msg.reply.clone() {
-            let _ = nats.publish(reply, serde_json::to_vec(&json!({"ack": true, "node": node})).unwrap_or_default().into()).await;
+            // `kind` lets the console say what is answering (i233 fix 3).
+            let _ = nats.publish(reply, serde_json::to_vec(&json!({"ack": true, "node": node, "kind": kind})).unwrap_or_default().into()).await;
         }
         let nats = nats.clone();
         let gateway = gateway.clone();

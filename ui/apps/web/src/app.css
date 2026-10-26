@@ -431,6 +431,11 @@ body {
   color: var(--dim);
   margin-bottom: 6px;
 }
+.turn .who .answering {
+  margin-left: 8px;
+  letter-spacing: 0.04em;
+  text-transform: none;
+}
 .turn.you .u {
   font-size: 14px;
   line-height: 1.5;

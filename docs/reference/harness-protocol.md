@@ -112,8 +112,10 @@ result), `token`.
 `loop_budget`, `max_iterations`, `token`, `role_prompt` (optional).
 
 **Ack.** Both arrive as NATS requests. A harness that takes the work
-replies on the request's reply subject with `{"ack": true, "node": "<id>"}`.
-The gateway waits 3 seconds. No ack, a reply that is not `ack: true`, or
+replies on the request's reply subject with `{"ack": true, "node": "<id>"}`;
+a turn's ack also names the harness `kind` (from 0.6.13), which the
+gateway passes to the console as a `harness_dispatched` event so the person
+sees which node and kind are answering. The gateway waits 3 seconds. No ack, a reply that is not `ack: true`, or
 no responder means the work was not taken, and the gateway runs it itself.
 
 **At capacity.** A harness at its `NOO_HARNESS_MAX_TURNS` limit replies
@@ -327,7 +329,8 @@ must not execute gated tools locally.
 3. Subscribe `harness.run.<node>` and `harness.task.<node>` in queue group
    `harness`, then publish `{"node": "<id>"}` on `harness.ready.<node>`.
 4. For each request: parse it; if at capacity, do nothing; otherwise reply
-   `{"ack": true, "node": "<id>"}` on the reply subject within 3 seconds.
+   `{"ack": true, "node": "<id>", "kind": "<kind>"}` on the reply subject
+   within 3 seconds (`kind` is optional; the console shows it).
 5. Use the request's `token` as the bearer on `POST /api/harness/call`
    and on nothing else. Take no conversation or user from anywhere but the
    request. For a task, replace the token with the one `task_checkpoint`
