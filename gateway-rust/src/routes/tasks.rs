@@ -7,7 +7,7 @@
 //!                                (Idempotency-Key: a retry within 24 h returns the same task, "idempotent_replay": true)
 //!   GET  /api/tasks?state=&limit=                                 → own tasks (operators: all)
 //!   GET  /api/tasks/{id}                                          → with its budget and the owner's allowance
-//!   POST /api/tasks/{id}/stop                                     → stopped at the next checkpoint
+//!   POST /api/tasks/{id}/stop                                     → stopped (a loop in flight ends at its checkpoint)
 //!   POST /api/tasks/stop         {via, user?}                     → stop the caller's own tasks created via `addon:<name>`
 //!   POST /api/tasks/{id}/resubmit {token_budget?}                 → more tokens; a parked task resumes
 //!   POST /api/tasks/{id}/ask      {question}                      → a question to the owner; parks at the boundary
@@ -319,7 +319,9 @@ async fn tasks_answer(State(state): State<Arc<AppState>>, ctx: Option<Extension<
     Ok(Json(json!({"task": after, "node": started.node, "dispatched": started.dispatched, "queued": started.queued, "why": started.why})))
 }
 
-/// Stop a task: it ends at its next checkpoint, and its loops' tool calls stand.
+/// Stop a task: it is `stopped` now; a loop already in flight (`was`
+/// running) ends at its next checkpoint, and its loops' tool calls stand.
+/// `was` lets the caller say which (i227 fix 3).
 async fn tasks_stop(State(state): State<Arc<AppState>>, ctx: Option<Extension<RequesterCtx>>, adt: Option<Extension<AddonDelegation>>, Path(id): Path<String>) -> AppResult {
     let task = owned(&state, &ctx, &adt, &id).await?;
     let stopped = crate::tasks::stop(&state.db, &task.id).await.map_err(|e| AppError::Internal(e.to_string()))?;
@@ -330,7 +332,7 @@ async fn tasks_stop(State(state): State<Arc<AppState>>, ctx: Option<Extension<Re
             .outcome(if stopped { crate::audit::Outcome::custom("stopped") } else { crate::audit::Outcome::custom("not_running") })
             .details(json!({"was": task.state})),
     ).await;
-    Ok(Json(json!({"stopped": stopped, "task_id": task.id})))
+    Ok(Json(json!({"stopped": stopped, "task_id": task.id, "was": task.state})))
 }
 
 #[derive(Deserialize)]
