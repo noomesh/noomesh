@@ -18,6 +18,8 @@ import {
 } from './useConnections';
 import './connections.css';
 
+const syncStatusNames = { draft: 'Draft', queued: 'Queued', syncing: 'Syncing', idle: 'Up to date', paused: 'Paused', error: 'Needs attention' };
+
 export function policyDescription(policy: SourcePolicy): string {
   if (policy.kind === 'gmail') {
     const selection =
@@ -37,7 +39,7 @@ export function policyDescription(policy: SourcePolicy): string {
 
 export function ConnectionsPanel() {
   const query = useConnections();
-  const { addAccount, addSource, removeAccount, removeSource } =
+  const { addAccount, addSource, removeAccount, removeSource, syncSource } =
     useConnectionActions();
   const confirm = useConfirm();
   const google = useGoogleConnect();
@@ -72,7 +74,7 @@ export function ConnectionsPanel() {
     addAccount.isPending ||
     addSource.isPending ||
     removeAccount.isPending ||
-    removeSource.isPending;
+    removeSource.isPending || syncSource.isPending;
   const report = (error: Error) => toast.error(error.message);
 
   function saveAccount(e: React.FormEvent) {
@@ -135,7 +137,7 @@ export function ConnectionsPanel() {
       await confirm({
         title: `Remove ${account.label}?`,
         description:
-          'Removes this account, its local credentials and source settings, and cancels pending Google sign-ins. Other connected accounts stay connected. To revoke access at Google, use your Google account permissions.',
+          'Removes this account, its local credentials, source settings and imported content, and cancels pending Google sign-ins and sync. Other connected accounts stay connected. To revoke access at Google, use your Google account permissions.',
         confirmText: 'Remove',
         destructive: true,
       })
@@ -153,6 +155,7 @@ export function ConnectionsPanel() {
     if (
       await confirm({
         title: `Remove ${source.name}?`,
+        description: 'Removes this source and its locally imported content. Google originals are unchanged.',
         confirmText: 'Remove',
         destructive: true,
       })
@@ -236,7 +239,9 @@ export function ConnectionsPanel() {
           <p className="connections-detail">
             Google requests read access to the selected services. Source
             selections below control what Noomesh will use; they do not narrow
-            Google's permissions. Content import is not started by this setup.
+            Google's permissions. Choose Start private sync on a saved source
+            to import Gmail plain-text bodies, text files and Google Docs.
+            Attachments and binary files are skipped.
           </p>
           {showAccountForm && (
             <form className="connections-form" onSubmit={saveAccount}>
@@ -372,9 +377,20 @@ export function ConnectionsPanel() {
                             · {policyDescription(source.policy)}
                           </p>
                           <p className="connections-detail">
-                            Draft · Private · Read only
+                            {syncStatusNames[source.sync_status ?? 'draft']} · Private · Read only
+                            {source.imported ? ` · ${source.imported} imported` : ''}
+                            {source.skipped ? ` · ${source.skipped} skipped` : ''}
                           </p>
+                          {source.sync_fault && <p className="connections-detail">{source.sync_fault === 'reauth' ? 'Reconnect Google, then restart sync.' : source.sync_fault === 'limit' ? 'Sync reached a limit. Choose fewer folders or a shorter mail lookback.' : 'Sync could not finish. Retry when Google is available.'}</p>}
                         </div>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={busy || account.status !== 'connected'}
+                          onClick={() => syncSource.mutate({ id: source.id, enabled: !source.sync_enabled || source.sync_status === 'error' }, { onError: report })}
+                        >
+                          {source.sync_enabled && source.sync_status !== 'error' ? 'Pause sync' : 'Start private sync'}
+                        </Button>
                         <Button
                           size="sm"
                           variant="ghost"

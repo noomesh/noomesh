@@ -3,10 +3,12 @@
 
 //! Shared authorization and encrypted credential lifecycle. Provider endpoints
 //! and permissions are reviewed code, not URLs supplied by a connection owner.
+pub mod content;
 pub mod crypto;
 pub mod oauth;
 pub mod pairing;
 pub mod provider;
+pub mod sync;
 
 use serde::{Deserialize, Serialize};
 
@@ -93,10 +95,6 @@ impl IntegrationConfig {
         let configured = app.client_id(kind);
         if !configured.is_empty() {
             configured.to_string()
-        } else if provider == "google" && kind == ClientKind::Desktop {
-            option_env!("NOO_GOOGLE_DESKTOP_CLIENT_ID")
-                .unwrap_or("")
-                .to_string()
         } else {
             String::new()
         }

@@ -10803,6 +10803,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/connections/sources/{id}/sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start or pause private source sync
+         * @description Owner comes only from authenticated Noomesh identity. Administrators cannot override it. Personal content stays outside shared KB roles, deduplication and graph services. Responses are not cached.
+         */
+        post: operations["sync_connection_source"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/connections/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Search only your own encrypted Google content
+         * @description Owner comes only from authenticated Noomesh identity. Administrators cannot override it. Personal content stays outside shared KB roles, deduplication and graph services. Responses are not cached.
+         */
+        post: operations["search_personal_connection_content"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -10921,6 +10961,13 @@ export interface components {
             access: "read_only";
             /** Format: date-time */
             created_at: string;
+            sync_enabled?: boolean;
+            /** @enum {string} */
+            sync_status?: "draft" | "queued" | "syncing" | "idle" | "paused" | "error";
+            /** @enum {string|null} */
+            sync_fault?: "provider" | "reauth" | "limit" | "storage" | null;
+            imported?: number;
+            skipped?: number;
         };
         ConnectionProvider: {
             /** @enum {string} */
@@ -11021,6 +11068,25 @@ export interface components {
             status: "pending" | "authorizing" | "connected" | "cancelled" | "expired";
             /** Format: uuid */
             account_id: string | null;
+        };
+        ConnectionSyncRequest: {
+            enabled: boolean;
+        };
+        ConnectionContentSearch: {
+            query: string;
+            limit?: number;
+        };
+        ConnectionPersonalEvidence: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                /** Format: uuid */
+                source_id: string;
+                title: string;
+                url: string;
+                text: string;
+            }[];
+            truncated: boolean;
         };
     };
     responses: never;
@@ -25798,6 +25864,156 @@ export interface operations {
                 content?: never;
             };
             /** @description Provider or installer configuration unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    sync_connection_source: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConnectionSyncRequest"];
+            };
+        };
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        enabled: boolean;
+                    };
+                };
+            };
+            /** @description Invalid selection or request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Sign-in required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Private user request required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Owned source not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Reconnect Google first */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Malformed or unsupported fields */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Vault or provider unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    search_personal_connection_content: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConnectionContentSearch"];
+            };
+        };
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionPersonalEvidence"];
+                };
+            };
+            /** @description Invalid selection or request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Sign-in required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Private user request required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Owned source not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Reconnect Google first */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Malformed or unsupported fields */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Vault or provider unavailable */
             503: {
                 headers: {
                     [name: string]: unknown;

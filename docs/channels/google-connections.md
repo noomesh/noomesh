@@ -5,11 +5,10 @@ Connect multiple Google accounts, verify their emails through Google, and save
 several Drive/Gmail source selections under each account. Installer and user
 instructions are in [Connect external accounts](../getting-started/integrations.md).
 
-Authorization, encrypted token storage, refresh and resource listing are
-implemented. Source selections remain drafts: ingestion, search and background
-sync for these connections are not implemented. The existing service-account
-Drive watcher remains independent. Account drafts are still available before
-an installer configures OAuth.
+Authorization, encrypted token storage, refresh, resource listing and private
+background sync are implemented. Saving a source does not start ingestion:
+choose **Start private sync** after selecting folders, a drive or Gmail labels.
+The existing installation-wide service-account Drive watcher remains independent.
 
 ## API and ownership
 
@@ -22,9 +21,11 @@ an installer configures OAuth.
 | POST | `/api/connections/oauth/cancel` | Cancel an owned `session_id` |
 | GET | `/api/connections/accounts/{id}/resources` | Own folders, shared drives, or Gmail labels using `service=folders\|drives\|gmail` and optional `page` |
 | POST | `/api/connections/accounts` | Prepare an account draft from `label` and optional unverified `email_hint` |
-| DELETE | `/api/connections/accounts/{id}` | Remove own account, local encrypted credentials, pending reconnects and source drafts; no provider revocation |
+| DELETE | `/api/connections/accounts/{id}` | Remove own account, local encrypted credentials, pending reconnects, sync jobs and imported content; no provider revocation |
 | POST | `/api/connections/sources` | Save a source draft from `account_id`, `name`, typed `policy` |
-| DELETE | `/api/connections/sources/{id}` | Remove own source draft |
+| DELETE | `/api/connections/sources/{id}` | Remove own source and imported content |
+| POST | `/api/connections/sources/{id}/sync` | Start or pause own private sync with `enabled` |
+| POST | `/api/connections/search` | Search own encrypted imported content with `query`, optional `limit` |
 
 Every API mutation takes its owner from the authenticated Noomesh account,
 including Operator/Admin. Internal/service credentials without a user are
@@ -32,36 +33,53 @@ refused. Composite foreign keys enforce owner consistency. Cross-user ids
 have the same response as missing ids. Account erasure also removes credentials
 and pending authorization, including with `keep_account` enabled.
 
-## Personal ingestion release gate
+## Personal ingestion and retrieval
 
-Content from these accounts must be private to the authenticated Noomesh owner
-by default. Google sharing permissions and the connection's folder/label
-selection do not grant access to other Noomesh users. API callers cannot supply
-an owner, roles or visibility for a source. The database currently permits only
-draft sources; connecting an account cannot activate content ingestion.
-
-Before adding activation or background sync, the ingestion adapter must carry
-verified owner authority through job submission, retries, document storage,
-chunks, embeddings, graph provenance, caches and retrieval. Workers must not
-substitute an unrestricted service principal or accept an owner from unsigned
-job metadata. Search, citations, graph queries and exports must enforce the
-same owner boundary, including for other application users with administrator
-or unrestricted KB roles. Host administrators remain trusted with the running
+The personal corpus lives in `noo_integration_documents`, separate from the
+shared KB's documents, chunks, embeddings, graph, retagging and caches. Titles,
+text, provider links and item IDs are encrypted using the integration vault with
+owner/source/item authenticated context. Sync cursors are encrypted with a
+separate purpose context. The shared worker does not receive these plaintext
+records or the vault key. Host administrators remain trusted with the running
 controller and its encryption keys.
 
-Do not route these personal sources through the legacy shared Drive watcher
-unchanged: source-role rules can map `gdrive://` content to the company audience,
-and the existing KB permits unrestricted/admin reads. Global content-hash
-deduplication must also preserve independent owner audiences; identical files
-from different accounts must not reuse a row with another user's permissions
-or change that row's permissions.
+The sync request accepts only `enabled`; its owner comes from the authenticated
+Noomesh account. Jobs persist that owner through a composite source foreign key.
+Each provider page and cursor commit together, after rechecking the user, source,
+account, lease and generation. Expired/replaced leases, pause, disconnect and
+erasure prevent a late page from restoring content. Failures retry with bounded
+backoff; five consecutive failures stop automatic retries until the user restarts
+sync. A completed scan removes items no longer present in the provider selection.
+Disconnect/source deletion cascade through jobs and stored personal documents.
 
-Activation requires end-to-end tests with two Noomesh users (including an
-administrator), distinct and identical Google content, background retries,
-search, citations, graph results and deletion. Tests must prove that another
-user cannot discover the content or its metadata. These are requirements for
-the future ingestion implementation, not guarantees supplied by the current
-shared KB pipeline.
+Identical content and provider IDs from different users/accounts remain independent:
+deduplication uses `(owner_uuid, source_id, item_key)`, never a global content hash.
+No caller can supply roles, owner, visibility or a job lease. Google sharing does
+not grant Noomesh access. Admin and unrestricted KB roles do not override the
+personal owner check. Internal/service identities and shared-room turns receive
+no personal evidence.
+
+Owner-only lexical search runs over a bounded decrypted window and returns
+snippets/citations. The normal KB query and coordinator context add those results
+after shared retrieval, without publishing them to shared workers or graph/walk
+stores. Query bodies cannot choose another owner. The personal corpus is excluded
+from shared listing/graph/export APIs because those tables never contain it.
+There is no personal result cache. Content returned to a user's conversation is
+part of that user's conversation history; removing a source does not rewrite
+past conversations or backups.
+
+Current limits: 1,000 documents per source, 32 KiB text per document, 1 MiB provider
+response, 20 items per page, 5,000 folders per traversal and a 1,000-document
+retrieval window per owner. Search reports `truncated` when that window caps.
+Sync repeats every 30 minutes. Initial import supports Gmail plain-text bodies
+and Drive text/plain, text/markdown, text/csv and Google Docs exports; attachments,
+HTML-only messages, binary formats and oversized items are skipped. Semantic
+embeddings, private graph extraction and binary parsers are not enabled for this
+corpus; they must preserve the same owner boundary before being introduced.
+
+PostgreSQL-backed cross-user tests run provider fixture parsing, encrypted
+commit, resume/replay, search, admin isolation, pause/disconnect/erasure and stale
+snapshot deletion. They also check that no shared KB table is needed by this path.
 
 ## Authorization lifecycle
 
@@ -95,8 +113,8 @@ provider errors are never API responses or application log messages.
 
 Google's actual granted scopes determine capabilities, including partial
 consent. Drive folder and Gmail label selections are use policies, not narrower
-Google authorization. The source table remains in draft state until a later
-implementation provides ingestion and activation.
+Google authorization. Draft metadata remains separate from the explicit
+`sync_enabled` control; the metadata status cannot activate a job.
 
 ## Provider extension points
 
@@ -121,3 +139,5 @@ registry and file delivery. Do not accept arbitrary owner-supplied endpoint
 URLs. OAuth credentials stay separate from source policy and token material
 never enters the list contract. Contracts are maintained in the server/UI
 OpenAPI files and regenerated TypeScript types.
+
+`106_integration_content` adds the separate encrypted personal corpus and durable owner-bound sync queue.

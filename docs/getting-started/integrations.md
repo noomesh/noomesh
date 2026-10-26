@@ -5,10 +5,10 @@ or both, click **Connect Google**, sign in and approve access. Repeat for each
 Google account. Each Noomesh user owns their connections; work and personal
 accounts can each have several source selections.
 
-Source selections currently remain drafts: connecting does not ingest emails
-or Drive files. Future personal-account ingestion must retain the connecting
-Noomesh user's private permissions through storage and retrieval. The older
-shared Drive watcher is a separate integration with different audience rules.
+Saving source settings does not start ingestion. Choose **Start private sync**
+after selecting folders, a drive or Gmail labels. Imported content stays private
+to the connecting Noomesh user, including from other application administrators.
+The older shared Drive watcher remains separate with different audience rules.
 
 Google application registration is a one-time publisher or installer task.
 Ordinary users do not each need a Google Cloud project. A local installation
@@ -74,42 +74,35 @@ expiry, owner checks, phone return and CLI polling with their registered Web
 OAuth application; they must still implement provider identity and scopes.
 [Google device-flow scopes](https://developers.google.com/identity/protocols/oauth2/limited-input-device#allowedscopes)
 
-A publisher can bundle its registered Desktop client ID and Google-issued
-Desktop credential using `NOO_GOOGLE_DESKTOP_CLIENT_ID` and
-`NOO_GOOGLE_DESKTOP_CLIENT_SECRET` in the **gateway build environment**.
-Installers using their own client supply its ID in YAML and import its issued
-credential into the encrypted secret store. This repository does not ship
-registered production credentials. Desktop clients are public and use PKCE:
-the issued Desktop credential is a token-endpoint parameter, not proof that a
-distributed application can keep a secret. Google can require this parameter
-for both code exchange and refresh. A web client secret
-belongs only on the installation that owns its web registration. Do not bundle
-a publisher's confidential web secret in installers.
-[Google client-type policy](https://developers.google.com/identity/protocols/oauth2/policies)
-
-### Application credentials and account credentials
+A publisher or installer can preconfigure a registered Desktop client ID in
+YAML and import its Google-issued credential through the encrypted secret store.
+These are runtime installation settings; gateway release binaries do not read
+OAuth registrations from the build environment. Desktop clients are public and
+use PKCE: the issued Desktop credential is a token-endpoint parameter, not proof
+that a distributed application can keep a secret. Google can require it for
+both code exchange and refresh. A Web client secret belongs only to the
+installation's gateway and must never ship in shared customer binaries.
 
 | Item | Where it belongs |
 | --- | --- |
-| Desktop client ID and its issued Desktop credential | Public application registration; a publisher can bundle it with PKCE |
-| Web client ID | Installation configuration; the ID itself is public |
-| Web client secret | Encrypted installation secret store, delivered only to the gateway; never shared in customer binaries |
-| Google account access and refresh tokens | Encrypted database records owned by the signed-in Noomesh user; never bundled with software |
-| Pairing code and OAuth completion ticket | Short-lived setup state, never Google account credentials; HTTP responses use `Cache-Control: no-store` |
+| Desktop client ID | Runtime installation configuration; public application registration |
+| Desktop issued credential | Encrypted installation secret store; Google token-endpoint parameter with PKCE |
+| Web client ID | Runtime installation configuration; public ID |
+| Web client secret | Encrypted installation secret store, delivered only to the gateway |
+| Google account access and refresh tokens | Encrypted database records owned by the signed-in Noomesh user |
+| Pairing code and completion ticket | Short-lived setup state; private responses disable caching |
 
 Pairing changes where users approve access, not Google's authorization
-mechanism. Keep the Web client that issued the phone flow's grants. Keep a
-Desktop client while any installation or saved grant still uses it. Deleting
-an OAuth client invalidates its associated access/refresh tokens; moving to
-another client requires reconnecting the affected accounts.
+mechanism. Keep clients while installations or saved grants still use them.
+Deleting an OAuth client invalidates its associated tokens; changing clients
+requires reconnecting accounts.
 [Google client deletion](https://support.google.com/cloud/answer/15549257)
 
-The current read-only Drive and Gmail scopes are broad Google permissions;
-folder/label policies do not reduce those permissions at Google. Public
-customer use needs the appropriate Google app verification and assessment
-review. Personal development/testing is a separate use case. External apps
-in Google's Testing mode issue refresh tokens that expire after seven days
-for these scopes, so reconnecting periodically is expected during testing.
+The read-only Drive and Gmail scopes are broad Google permissions; folder/label
+policies do not narrow them at Google. Public customer use needs the appropriate
+Google app verification and assessment review. External apps in Testing issue
+refresh tokens that expire after seven days for these scopes, so reconnecting
+periodically is expected in testing.
 [Scope verification](https://developers.google.com/identity/protocols/oauth2/production-readiness/restricted-scope-verification),
 [refresh-token expiry](https://developers.google.com/identity/protocols/oauth2#expiration)
 
@@ -285,13 +278,26 @@ without Google emails, tokens, codes, selected content or message bodies.
    button on an existing account requires that same Google identity. To change
    the allowed services, select the desired set before reconnecting.
 
-**This release completes authorization and source setup. It does not yet
-import messages/documents, index them for search, or run background sync for
-these new connections.** Source settings remain drafts. The existing
-installation-wide service-account Drive watcher is a separate feature.
+5. Choose **Start private sync** on a source. Noomesh imports supported text,
+   shows progress and skipped counts, and checks for changes every 30 minutes.
+   Choose **Pause sync** to stop future reads; imported content remains searchable
+   by you. Remove the source or account to delete its locally imported content.
+
+Search your imported material through the normal Noomesh KB query or chat.
+Personal source text is stored encrypted and retrieved only for your Noomesh
+account. It is excluded from shared-room context and shared knowledge graphs;
+Google file sharing does not share it with other Noomesh users. Removal does not
+rewrite prior conversation history or backups.
+
+The initial importer supports Gmail plain-text bodies and Drive text files
+(plain text, Markdown, CSV) and Google Docs. It skips attachments, HTML-only
+messages, binary files and responses over 1 MiB. It retains the first 32 KiB per
+document, supports up to 1,000 documents per source, and searches the most recent
+1,000 imported documents across your sources. Narrow folders/labels/lookback for
+larger accounts. Private semantic search and graph extraction are not enabled.
 
 Google grants the scopes you approve; partial approval is supported. Source
-folder/label selections constrain future Noomesh use, not the token's Google
+folder/label selections constrain Noomesh use, not the token's Google
 permissions. Gmail does not offer label-only OAuth grants. This adapter uses
 read scopes and does not send mail or modify Drive files.
 [Drive scopes](https://developers.google.com/workspace/drive/api/guides/api-specific-auth),
@@ -310,12 +316,13 @@ read scopes and does not send mail or modify Drive files.
 | Folder/label listing fails | Reconnect with the required service approved; check the corresponding Google API is enabled |
 | Installer changes client ID or encryption key | Reconnect affected accounts |
 
-**Remove account** deletes that account's local credentials and source drafts.
+**Remove account** deletes that account's local credentials, source settings,
+sync jobs and imported content.
 It does not revoke Google's application grant or delete anything at Google.
 For revocation, use [Google third-party connections](https://support.google.com/accounts/answer/13533235).
 Revocation may affect other connections using the same Google application and
-account. Imported content deletion will be a separate concern when ingestion
-is implemented.
+account. Source removal also deletes its local imported content. A response
+already in flight cannot restore content after removal.
 
 ## Adding another provider
 

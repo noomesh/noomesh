@@ -127,6 +127,7 @@ pub(crate) enum AuditKind {
     IntegrationPairingStarted,
     IntegrationDisconnected,
     IntegrationConnected,
+    IntegrationSyncChanged,
     BootstrapTokenCreate,
     BootstrapTokenDenied,
     BootstrapTokenRevoke,
@@ -257,6 +258,7 @@ impl AuditKind {
             Self::IntegrationPairingStarted => "integration_pairing_started",
             Self::IntegrationDisconnected => "integration_disconnected",
             Self::IntegrationConnected => "integration_connected",
+            Self::IntegrationSyncChanged => "integration_sync_changed",
             Self::BootstrapTokenCreate => "bootstrap_token_create",
             Self::BootstrapTokenDenied => "bootstrap_token_denied",
             Self::BootstrapTokenRevoke => "bootstrap_token_revoke",
@@ -388,6 +390,7 @@ impl AuditKind {
             Self::IntegrationPairingStarted => Severity::Info,
             Self::IntegrationDisconnected => Severity::Info,
             Self::IntegrationConnected => Severity::Info,
+            Self::IntegrationSyncChanged => Severity::Info,
             Self::BootstrapTokenCreate => Severity::Warning,
             Self::BootstrapTokenDenied => Severity::Warning,
             Self::BootstrapTokenRevoke => Severity::Info,
@@ -516,6 +519,7 @@ impl AuditKind {
             "integration_pairing_started" => Self::IntegrationPairingStarted,
             "integration_disconnected" => Self::IntegrationDisconnected,
             "integration_connected" => Self::IntegrationConnected,
+            "integration_sync_changed" => Self::IntegrationSyncChanged,
             "bootstrap_token_create" => Self::BootstrapTokenCreate,
             "bootstrap_token_denied" => Self::BootstrapTokenDenied,
             "bootstrap_token_revoke" => Self::BootstrapTokenRevoke,
@@ -645,6 +649,7 @@ impl AuditKind {
             Self::IntegrationPairingStarted,
             Self::IntegrationDisconnected,
             Self::IntegrationConnected,
+            Self::IntegrationSyncChanged,
             Self::BootstrapTokenCreate,
             Self::BootstrapTokenDenied,
             Self::BootstrapTokenRevoke,
@@ -1156,6 +1161,7 @@ mod tests {
         "integration_pairing_started",
         "integration_disconnected",
         "integration_connected",
+        "integration_sync_changed",
         "bootstrap_token_create",
         "bootstrap_token_denied",
         "bootstrap_token_revoke",
@@ -1290,7 +1296,7 @@ mod tests {
         let mut want: Vec<String> = PINNED.iter().map(|s| s.to_string()).collect();
         want.sort();
         assert_eq!(got, want, "a kind was renamed, added or dropped: edit PINNED on purpose");
-        assert_eq!(PINNED.len(), 121);
+        assert_eq!(PINNED.len(), 122);
     }
 
     #[test]

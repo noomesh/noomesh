@@ -30,6 +30,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/connections/accounts/{id}", delete(remove_account))
         .route("/api/connections/sources", post(create_source))
         .route("/api/connections/sources/{id}", delete(remove_source))
+        .route("/api/connections/sources/{id}/sync", post(sync_source))
+        .route("/api/connections/search", post(search_content))
         .route("/api/connections/oauth/start", post(oauth_start))
         .route("/api/connections/oauth/complete", post(oauth_complete))
         .route("/api/connections/oauth/cancel", post(oauth_cancel))
@@ -55,6 +57,75 @@ async fn private_response_headers(request: Request, next: Next) -> Response {
         "no-store".parse().expect("static header"),
     );
     response
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncSource {
+    enabled: bool,
+}
+
+async fn sync_source(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<RequesterCtx>>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<SyncSource>,
+) -> AppResult {
+    crate::integrations::crypto::Vault::configured()?;
+    crate::integrations::content::enable(
+        &state.db,
+        owner_id(&state, &ctx).await?,
+        id,
+        request.enabled,
+    )
+    .await?;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(
+            AuditKind::IntegrationSyncChanged,
+            owner(&ctx)?,
+            &format!(
+                "source/{id}/{}",
+                if request.enabled { "start" } else { "pause" }
+            ),
+        ),
+    )
+    .await;
+    Ok(Json(json!({"enabled":request.enabled})))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContentSearch {
+    query: String,
+    limit: Option<usize>,
+}
+
+async fn search_content(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<RequesterCtx>>,
+    Json(request): Json<ContentSearch>,
+) -> AppResult {
+    if request.query.len() > 2000 {
+        return Err(AppError::BadRequest("Search query is too long".into()));
+    }
+    let owner = owner_id(&state, &ctx).await?;
+    if crate::integrations::content::current_owner(&state.db).await? != Some(owner) {
+        return Err(AppError::Forbidden(
+            "Personal content requires a private user request".into(),
+        ));
+    }
+    let vault = crate::integrations::crypto::Vault::configured()?;
+    Ok(Json(
+        crate::integrations::content::search(
+            &state.db,
+            &vault,
+            owner,
+            &request.query,
+            request.limit.unwrap_or(5),
+        )
+        .await?,
+    ))
 }
 
 async fn pairing_start(
@@ -370,6 +441,26 @@ mod tests {
     use super::*;
     use crate::auth::Role;
 
+    #[test]
+    fn sync_and_search_bodies_cannot_assert_owner_or_permissions() {
+        for field in [
+            "owner",
+            "owner_uuid",
+            "user_id",
+            "roles",
+            "visibility",
+            "lease",
+            "generation",
+        ] {
+            let mut sync = json!({"enabled":true});
+            sync[field] = json!("forged");
+            assert!(serde_json::from_value::<SyncSource>(sync).is_err());
+            let mut search = json!({"query":"private canary"});
+            search[field] = json!("forged");
+            assert!(serde_json::from_value::<ContentSearch>(search).is_err());
+        }
+    }
+
     #[tokio::test]
     async fn private_success_and_error_responses_are_not_cacheable() {
         const OK_PATH: &str = "/test-success";
@@ -471,6 +562,7 @@ mod tests {
                 "/api/connections/pairing/start",
                 "/api/connections/pairing/lookup",
                 "/api/connections/pairing/approve",
+                "/api/connections/search",
             ] {
                 assert!(crate::auth::requester_allows(
                     requester,
@@ -478,6 +570,11 @@ mod tests {
                     path
                 ));
             }
+            assert!(crate::auth::requester_allows(
+                requester,
+                &axum::http::Method::POST,
+                &format!("/api/connections/sources/{}/sync", Uuid::new_v4())
+            ));
             assert!(crate::auth::requester_allows(
                 requester,
                 &axum::http::Method::GET,

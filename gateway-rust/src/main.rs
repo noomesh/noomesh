@@ -652,6 +652,7 @@ async fn main() -> Result<()> {
     // The signed audit chain head, recorded outside the database.
     audit_head_export::spawn(state.clone());
     ingest_loop::spawn(state.clone());
+    integrations::sync::spawn(state.clone());
     recall_archive_loop::spawn(state.clone());
 
     // Heartbeat scheduler — fires due tasks from noo_heartbeat_tasks every

@@ -24,6 +24,7 @@ export function useConnections() {
   return useQuery({
     queryKey: ['connections', user?.username],
     enabled: !!user,
+    refetchInterval: 10000,
     queryFn: async () => {
       const { data, error } = await client.GET('/api/connections');
       if (error || !data)
@@ -82,7 +83,16 @@ export function useConnectionActions() {
     },
     onSuccess: refresh,
   });
-  return { addAccount, addSource, removeAccount, removeSource };
+  const syncSource = useMutation({
+    mutationFn: async ({ id, enabled }: { id: string; enabled: boolean }) => {
+      const { error } = await client.POST('/api/connections/sources/{id}/sync', {
+        params: { path: { id } }, body: { enabled },
+      });
+      if (error) throw new Error('Unable to change sync. Check Google sign-in and choose folders, a drive or labels first.');
+    },
+    onSuccess: refresh,
+  });
+  return { addAccount, addSource, removeAccount, removeSource, syncSource };
 }
 
 /** The callback page has no credentials or mutation authority. A random

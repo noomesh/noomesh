@@ -1440,6 +1440,37 @@
           "created_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "sync_enabled": {
+            "type": "boolean"
+          },
+          "sync_status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "queued",
+              "syncing",
+              "idle",
+              "paused",
+              "error"
+            ]
+          },
+          "sync_fault": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "provider",
+              "reauth",
+              "limit",
+              "storage",
+              null
+            ]
+          },
+          "imported": {
+            "type": "integer"
+          },
+          "skipped": {
+            "type": "integer"
           }
         },
         "required": [
@@ -1866,6 +1897,80 @@
           "account_id"
         ],
         "additionalProperties": false
+      },
+      "ConnectionSyncRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ConnectionContentSearch": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "query"
+        ],
+        "properties": {
+          "query": {
+            "type": "string",
+            "maxLength": 2000
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 20
+          }
+        }
+      },
+      "ConnectionPersonalEvidence": {
+        "type": "object",
+        "required": [
+          "items",
+          "truncated"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "source_id",
+                "title",
+                "url",
+                "text"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "source_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        }
       }
     }
   }

@@ -76,7 +76,6 @@ fn now() -> i64 {
 fn client_secret(
     provider: &str,
     kind: ClientKind,
-    client_id: &str,
 ) -> Result<Option<zeroize::Zeroizing<String>>, Error> {
     let name = match (provider, kind) {
         ("google", ClientKind::Desktop) => "NOO_GOOGLE_DESKTOP_CLIENT_SECRET",
@@ -85,20 +84,10 @@ fn client_secret(
     };
     let configured = crate::config::secret_env::secret(name)
         .map_err(|_| Error::Unavailable("Cannot read the OAuth client credential".into()))?;
-    // Google's desktop credential can be required by its token endpoint even
-    // though a distributed desktop app cannot keep it confidential. PKCE
-    // remains mandatory. A bundled credential must never accompany an
-    // installer-supplied ID belonging to a different OAuth application.
-    let bundled = if provider == "google"
-        && kind == ClientKind::Desktop
-        && client_id == option_env!("NOO_GOOGLE_DESKTOP_CLIENT_ID").unwrap_or("")
-    {
-        option_env!("NOO_GOOGLE_DESKTOP_CLIENT_SECRET").map(str::to_string)
-    } else {
-        None
-    };
+    // Desktop clients are public and still use PKCE; Google's issued
+    // credential is supplied at runtime. No OAuth input is compiled into
+    // the reproducible gateway binary.
     configured
-        .or(bundled)
         .filter(|s| !s.trim().is_empty())
         .map(zeroize::Zeroizing::new)
         .map(Some)
@@ -112,7 +101,7 @@ fn client_secret(
 pub fn ready(config: &IntegrationConfig, provider: &str, kind: ClientKind) -> bool {
     Vault::configured().is_ok()
         && !config.client_id(provider, kind).is_empty()
-        && client_secret(provider, kind, &config.client_id(provider, kind)).is_ok()
+        && client_secret(provider, kind).is_ok()
         && (kind == ClientKind::Desktop
             || provider::redirect(&config.app(provider), kind, None).is_ok())
 }
@@ -131,7 +120,7 @@ pub async fn start(
     if client_id.is_empty() {
         return Err(Error::Unavailable("Installer setup required: register a Google OAuth application and configure its public client ID".into()));
     }
-    let _secret = client_secret(p.id, request.client_kind, &client_id)?;
+    let _secret = client_secret(p.id, request.client_kind)?;
     let redirect_uri = provider::redirect(
         &config.app(p.id),
         request.client_kind,
@@ -228,7 +217,7 @@ pub async fn complete(
     if config.client_id(p.id, pending.client_kind) != pending.client_id {
         return Err(Error::Reauth);
     }
-    let secret = client_secret(p.id, pending.client_kind, &pending.client_id)?;
+    let secret = client_secret(p.id, pending.client_kind)?;
     let (identity, credentials) = exchange(
         p,
         &pending,
@@ -329,7 +318,7 @@ async fn exchange(
 
 /// Serialize refreshes for one account so concurrent readers do not lose a
 /// rotated refresh token. Neither access nor refresh tokens leave this module.
-async fn credential(
+pub(super) async fn credential(
     db: &sqlx::PgPool,
     config: &IntegrationConfig,
     owner: Uuid,
@@ -350,7 +339,7 @@ async fn credential(
         tx.commit().await?;
         return Ok(c);
     }
-    let secret = client_secret(p.id, c.client_kind, &c.client_id)?;
+    let secret = client_secret(p.id, c.client_kind)?;
     match refresh(p, &mut c, secret.as_deref().map(String::as_str)).await {
         Err(Error::Reauth) => {
             repo::reauth(&mut tx, owner, account).await?;

@@ -21246,6 +21246,131 @@
           }
         ]
       }
+    },
+    "/api/connections/sources/{id}/sync": {
+      "post": {
+        "operationId": "sync_connection_source",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Start or pause private source sync",
+        "description": "Owner comes only from authenticated Noomesh identity. Administrators cannot override it. Personal content stays outside shared KB roles, deduplication and graph services. Responses are not cached.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionSyncRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "enabled"
+                  ],
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid selection or request"
+          },
+          "401": {
+            "description": "Sign-in required"
+          },
+          "403": {
+            "description": "Private user request required"
+          },
+          "404": {
+            "description": "Owned source not found"
+          },
+          "409": {
+            "description": "Reconnect Google first"
+          },
+          "422": {
+            "description": "Malformed or unsupported fields"
+          },
+          "503": {
+            "description": "Vault or provider unavailable"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ]
+      }
+    },
+    "/api/connections/search": {
+      "post": {
+        "operationId": "search_personal_connection_content",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Search only your own encrypted Google content",
+        "description": "Owner comes only from authenticated Noomesh identity. Administrators cannot override it. Personal content stays outside shared KB roles, deduplication and graph services. Responses are not cached.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionContentSearch"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionPersonalEvidence"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid selection or request"
+          },
+          "401": {
+            "description": "Sign-in required"
+          },
+          "403": {
+            "description": "Private user request required"
+          },
+          "404": {
+            "description": "Owned source not found"
+          },
+          "409": {
+            "description": "Reconnect Google first"
+          },
+          "422": {
+            "description": "Malformed or unsupported fields"
+          },
+          "503": {
+            "description": "Vault or provider unavailable"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -21605,6 +21730,37 @@
           "created_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "sync_enabled": {
+            "type": "boolean"
+          },
+          "sync_status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "queued",
+              "syncing",
+              "idle",
+              "paused",
+              "error"
+            ]
+          },
+          "sync_fault": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "provider",
+              "reauth",
+              "limit",
+              "storage",
+              null
+            ]
+          },
+          "imported": {
+            "type": "integer"
+          },
+          "skipped": {
+            "type": "integer"
           }
         },
         "required": [
@@ -22031,6 +22187,80 @@
           "account_id"
         ],
         "additionalProperties": false
+      },
+      "ConnectionSyncRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ConnectionContentSearch": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "query"
+        ],
+        "properties": {
+          "query": {
+            "type": "string",
+            "maxLength": 2000
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 20
+          }
+        }
+      },
+      "ConnectionPersonalEvidence": {
+        "type": "object",
+        "required": [
+          "items",
+          "truncated"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "source_id",
+                "title",
+                "url",
+                "text"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "source_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        }
       }
     }
   }

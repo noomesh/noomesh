@@ -17,6 +17,7 @@ const H = vi.hoisted(() => ({
   addAccount: vi.fn(),
   addSource: vi.fn(),
   removeAccount: vi.fn(),
+  syncSource: vi.fn(),
   refetch: vi.fn(),
   connect: vi.fn(),
   resources: [] as { id: string; name: string }[],
@@ -48,6 +49,7 @@ vi.mock('./useConnections', () => ({
     addSource: { mutate: H.addSource, isPending: false },
     removeAccount: { mutate: H.removeAccount, isPending: false },
     removeSource: { mutate: vi.fn(), isPending: false },
+    syncSource: { mutate: H.syncSource, isPending: false },
   }),
 }));
 
@@ -97,6 +99,20 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe('Connections drafts', () => {
+  it('starts sync only after the owner explicitly chooses it, and can pause', () => {
+    H.data.current = { ...data,
+      accounts: data.accounts.map(account => ({ ...account, status: 'connected' })),
+      sources: data.sources.map(source => ({ ...source, sync_enabled: false })),
+    };
+    const rendered = render(<ConnectionsPanel />);
+    expect(H.syncSource).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Start private sync' }));
+    expect(H.syncSource).toHaveBeenCalledWith({ id: 'source-a', enabled: true }, expect.any(Object));
+    H.data.current = { ...(H.data.current as ConnectionsData), sources: data.sources.map(source => ({ ...source, sync_enabled: true, sync_status: 'queued' })) };
+    rendered.rerender(<ConnectionsPanel />);
+    fireEvent.click(screen.getByRole('button', { name: 'Pause sync' }));
+    expect(H.syncSource).toHaveBeenLastCalledWith({ id: 'source-a', enabled: false }, expect.any(Object));
+  });
   it('saves real label selections under the connected account and respects partial consent', () => {
     H.data.current = {
       ...data,

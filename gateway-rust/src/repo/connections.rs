@@ -81,8 +81,11 @@ pub async fn sources(db: &sqlx::PgPool, owner: &str) -> Result<Vec<Value>, sqlx:
     sqlx::query_scalar::<_, Value>(
         r#"SELECT jsonb_build_object('id', s.id, 'account_id', s.account_id, 'name', s.name,
             'policy', s.policy, 'status', s.status, 'visibility', 'private',
-            'access', 'read_only', 'created_at', s.created_at) AS source
+            'access', 'read_only', 'created_at', s.created_at,
+            'sync_enabled',s.sync_enabled,'sync_status',COALESCE(j.status,'draft'),
+            'sync_fault',j.fault,'imported',COALESCE(j.imported,0),'skipped',COALESCE(j.skipped,0)) AS source
            FROM noo_connection_sources s JOIN noo_users u ON u.user_uuid = s.owner_uuid
+           LEFT JOIN noo_integration_sync j ON j.source_id=s.id AND j.owner_uuid=s.owner_uuid
            WHERE u.username = $1 ORDER BY s.created_at, s.id"#,
     )
     .bind(owner)
@@ -179,6 +182,10 @@ mod tests {
             .execute(&db)
             .await
             .unwrap();
+        sqlx::raw_sql(include_str!("../integrations/content.sql"))
+            .execute(&db)
+            .await
+            .unwrap();
         let draft = AccountDraft {
             label: "Work".into(),
             email_hint: Some("person@example.test".into()),
@@ -252,8 +259,8 @@ mod tests {
             .find(|s| s["account_id"] == a.to_string())
             .unwrap();
         let source_id = Uuid::parse_str(first["id"].as_str().unwrap()).unwrap();
-        // Personal sources must stay inert until ingestion preserves the
-        // authenticated owner's audience throughout the content pipeline.
+        // The metadata status cannot activate ingestion; only an explicit
+        // owner-bound sync request can create an enabled private job.
         let activation =
             sqlx::query("UPDATE noo_connection_sources SET status='active' WHERE id=$1")
                 .bind(source_id)

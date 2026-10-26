@@ -103,7 +103,11 @@ pub fn user_write_allowed(method: &axum::http::Method, path: &str) -> bool {
                 | "/api/connections/pairing/start"
                 | "/api/connections/pairing/lookup"
                 | "/api/connections/pairing/approve"
-        );
+                | "/api/connections/search"
+        ) || path
+            .strip_prefix("/api/connections/sources/")
+            .and_then(|s| s.strip_suffix("/sync"))
+            .is_some_and(|id| Uuid::parse_str(id).is_ok());
     }
     if *method != axum::http::Method::DELETE {
         return false;
@@ -121,6 +125,28 @@ pub fn user_write_allowed(method: &axum::http::Method, path: &str) -> bool {
 }
 
 impl SourcePolicy {
+    pub fn validate_for_sync(&self) -> Result<(), String> {
+        self.validate()?;
+        match self {
+            Self::GoogleDrive {
+                exposure: DriveExposure::SelectedFolders,
+                folder_ids,
+                ..
+            } if folder_ids.is_empty() => Err("Choose at least one folder".into()),
+            Self::GoogleDrive {
+                exposure: DriveExposure::SelectedDrive,
+                drive_id,
+                ..
+            } if drive_id.is_none() => Err("Choose a drive".into()),
+            Self::Gmail {
+                exposure: GmailExposure::SelectedLabels,
+                label_ids,
+                ..
+            } if label_ids.is_empty() => Err("Choose at least one label".into()),
+            _ => Ok(()),
+        }
+    }
+
     pub fn kind(&self) -> &'static str {
         match self {
             Self::GoogleDrive { .. } => "google_drive",
@@ -199,6 +225,16 @@ fn ids(values: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Only the owner-filtered resource listing, not arbitrary descendants.
+pub fn user_read_allowed(path: &str) -> bool {
+    path.strip_prefix("/api/connections/pairing/")
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+        || path
+            .strip_prefix("/api/connections/accounts/")
+            .and_then(|s| s.strip_suffix("/resources"))
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,7 +267,15 @@ mod tests {
                 "accepted {field}"
             );
         }
-        for field in ["owner_uuid", "owner", "roles", "status", "access", "visibility"] {
+        for field in [
+            "owner_uuid",
+            "owner",
+            "roles",
+            "status",
+            "access",
+            "visibility",
+            "sync_enabled",
+        ] {
             let mut body = json!({"account_id":Uuid::new_v4(),"name":"Mail","policy":{"kind":"gmail","exposure":"mailbox"}});
             body[field] = json!("forged");
             assert!(
@@ -298,14 +342,4 @@ mod tests {
             }
         }
     }
-}
-
-/// Only the owner-filtered resource listing, not arbitrary descendants.
-pub fn user_read_allowed(path: &str) -> bool {
-    path.strip_prefix("/api/connections/pairing/")
-        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
-        || path
-            .strip_prefix("/api/connections/accounts/")
-            .and_then(|s| s.strip_suffix("/resources"))
-            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
 }
