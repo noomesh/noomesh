@@ -421,7 +421,61 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
         (Some("off"), "running") => out.push(fail("harness", "policy off but the harness is running", format!("noo cluster unplace {id} harness"))),
         (Some(p), s) => out.push(ok("harness", format!("{} (policy {p})", if s.is_empty() { "-" } else { s }))),
     } }
+    out.extend(harness_tasks_check(n));
     out
+}
+
+/// The harness's default stall bound (`NOO_HARNESS_TASK_STALL_SECS`): past
+/// it a task with no progress is released by the harness (i227 fix 1).
+const TASK_STALL_SECS: i64 = 2700;
+/// A queued task older than this has been offered again at least twice
+/// (`NOO_TASK_QUEUE_RECHECK_SECS`, 600) and is still waiting.
+const QUEUED_LONG_SECS: i64 = 1800;
+
+fn compact_secs(s: i64) -> String {
+    match s {
+        s if s < 90 => format!("{s}s"),
+        s if s < 5400 => format!("{}m", s / 60),
+        s if s < 172_800 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
+}
+
+/// The `harness tasks` row (i227 fix 4): what the node's harness holds, from
+/// the gateway's `tasks` summary on the node record: running tasks with the
+/// age of the oldest one's last progress, and queued ones with the oldest
+/// wait. A wedge is a WARN, never a FAIL: the harness releases a stalled task
+/// itself, and a queue is capacity, not failure. No row from a gateway that
+/// does not report it.
+pub(crate) fn harness_tasks_check(n: &Value) -> Option<Check> {
+    const NAME: &str = "harness tasks";
+    let t = n.get("tasks").filter(|v| v.is_object())?;
+    let running = t["running"].as_i64().unwrap_or(0);
+    let queued = t["queued"].as_i64().unwrap_or(0);
+    if running == 0 && queued == 0 {
+        return Some(ok(NAME, "none held"));
+    }
+    let progress = t["oldest_progress_secs"].as_i64();
+    let waited = t["oldest_queued_secs"].as_i64();
+    let mut parts = vec![match progress {
+        Some(p) if running > 0 => format!("{running} running (oldest progress {} ago)", compact_secs(p)),
+        _ => format!("{running} running"),
+    }];
+    if queued > 0 {
+        parts.push(match waited {
+            Some(w) => format!("{queued} queued (oldest waiting {})", compact_secs(w)),
+            None => format!("{queued} queued"),
+        });
+    }
+    let detail = parts.join(", ");
+    let remedy = Some("noo tasks list".to_string());
+    if progress.is_some_and(|p| running > 0 && p > TASK_STALL_SECS) {
+        return Some(warn(NAME, format!("{detail} — past the {} stall bound; the harness releases a task with no progress", compact_secs(TASK_STALL_SECS)), remedy));
+    }
+    if waited.is_some_and(|w| queued > 0 && w > QUEUED_LONG_SECS) {
+        return Some(warn(NAME, format!("{detail} — queued past {}; the harness has had no free slot", compact_secs(QUEUED_LONG_SECS)), remedy));
+    }
+    Some(ok(NAME, detail))
 }
 
 /// The `gpu` row, from the node agent's `gpu_contention` heartbeat report
@@ -9732,6 +9786,47 @@ mod self_agent_lane_tests {
         let c = self_agent_lane_check("pop-os", &[], Some(&p), Some("rail"), false);
         assert_eq!(c.verdict, Verdict::Fail);
         assert_eq!(c.remedy.as_deref(), Some("noo upgrade --stack"));
+    }
+}
+
+#[cfg(test)]
+mod harness_tasks_tests {
+    use super::*;
+
+    fn node(tasks: Value) -> Value {
+        serde_json::json!({"id": "mcmini", "tasks": tasks})
+    }
+
+    #[test]
+    fn nothing_held_is_ok_and_no_summary_is_no_row() {
+        let c = harness_tasks_check(&node(serde_json::json!({"running": 0, "queued": 0}))).unwrap();
+        assert_eq!((c.verdict, c.name, c.detail.as_str()), (Verdict::Ok, "harness tasks", "none held"));
+        assert!(harness_tasks_check(&serde_json::json!({"id": "mcmini"})).is_none(), "an older gateway: no row");
+    }
+
+    #[test]
+    fn running_and_queued_are_counted_with_their_ages() {
+        let c = harness_tasks_check(&node(serde_json::json!({"running": 2, "queued": 1, "oldest_progress_secs": 300, "oldest_queued_secs": 45}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert_eq!(c.detail, "2 running (oldest progress 5m ago), 1 queued (oldest waiting 45s)");
+    }
+
+    /// The 2026-10-23 wedge: two tasks, no progress for fifteen hours.
+    #[test]
+    fn a_wedge_and_a_long_queue_are_warnings_never_failures() {
+        let c = harness_tasks_check(&node(serde_json::json!({"running": 2, "queued": 0, "oldest_progress_secs": 54_000}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("2 running (oldest progress 15h ago) — past the 45m stall bound"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo tasks list"));
+        let c = harness_tasks_check(&node(serde_json::json!({"running": 2, "queued": 3, "oldest_progress_secs": 60, "oldest_queued_secs": 3600}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("3 queued (oldest waiting 60m)") && c.detail.contains("queued past 30m"), "{}", c.detail);
+    }
+
+    #[test]
+    fn the_row_is_in_node_checks() {
+        let src = include_str!("cluster_verify.rs").split("mod harness_tasks_tests").next().unwrap();
+        assert!(src.contains("out.extend(harness_tasks_check(n));"));
     }
 }
 

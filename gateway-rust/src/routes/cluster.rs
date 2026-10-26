@@ -1071,6 +1071,7 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
         .into_iter()
         .filter_map(|(id, p)| p.map(|p| (id, p)))
         .collect();
+    let task_holds = node_task_holds(&state.db).await;
     // node_ids seen live in KV — used to suppress duplicate DB rows when
     // merging known-but-missing (offline) nodes below.
     let mut live_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1260,6 +1261,11 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
                             .get(&policy_key)
                             .cloned()
                             .unwrap_or_else(crate::coordinator::harness_default_policy));
+                        // What the node's harness holds (i227 fix 4): absent
+                        // only when the query failed, never defaulted.
+                        if let Some(holds) = task_holds.as_ref() {
+                            data["tasks"] = holds.get(&policy_key).cloned().unwrap_or_else(|| json!({"running": 0, "queued": 0}));
+                        }
 
                         // Companion telemetry fields (tier >= 4) — preserve from KV if present
                         // These are already in the KV data if heartbeat wrote them;
@@ -3641,6 +3647,31 @@ async fn desired_config_get(
         "disk_reclaim": crate::autonomy_evaluators::node_reclaim_policy(&state).await,
         "engine": "rust",
     })))
+}
+
+/// Per node, the live tasks it holds (i227 fix 4): `running` (running or
+/// checkpointed) with the age of the oldest one's last progress, and
+/// `queued` (open, waiting for the node's busy harness) with the oldest
+/// wait. Children count: they hold a harness permit like any task. Parked
+/// tasks and aggregation parents do not. `None` when the query fails, so
+/// the field is left out rather than reading as "nothing held".
+async fn node_task_holds(db: &sqlx::PgPool) -> Option<std::collections::HashMap<String, Value>> {
+    let rows = crate::repo::tasks::holds_by_node(db)
+        .await
+        .map_err(|e| tracing::warn!(error = %e, "cluster_nodes: task holds not read"))
+        .ok()?;
+    Some(rows.into_iter().map(|(node, running, queued, progress, waited)| (node, task_holds_json(running, queued, progress, waited))).collect())
+}
+
+fn task_holds_json(running: i64, queued: i64, oldest_progress_secs: Option<f64>, oldest_queued_secs: Option<f64>) -> Value {
+    let mut v = json!({"running": running, "queued": queued});
+    if let Some(p) = oldest_progress_secs {
+        v["oldest_progress_secs"] = json!(p.max(0.0) as i64);
+    }
+    if let Some(w) = oldest_queued_secs {
+        v["oldest_queued_secs"] = json!(w.max(0.0) as i64);
+    }
+    v
 }
 
 #[derive(Deserialize)]
