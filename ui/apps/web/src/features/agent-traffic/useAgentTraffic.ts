@@ -2,7 +2,7 @@
 // Copyright 2026 PersonifAI LLC
 
 import { useQuery } from '@metis/core';
-import { apiGet } from '@/lib/client';
+import { apiGet, apiErrorMessage } from '@/lib/client';
 
 export interface Thread {
   id: string;
@@ -101,9 +101,11 @@ export function renderBody(body: unknown): { text: string; isText: boolean; long
 }
 
 async function must<T>(path: string, what: string): Promise<T> {
-  const d = await apiGet<T>(path);
-  if (d === null) throw new Error(`${what} unavailable`);
-  return d;
+  try {
+    return await apiGet<T>(path);
+  } catch (e) {
+    throw new Error(apiErrorMessage(e, `${what} unavailable`));
+  }
 }
 
 /** Every thread on the system (operator widened view), newest activity first. */
