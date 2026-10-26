@@ -74,7 +74,7 @@ pub fn tasks_create(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     ui::guide(&[
         (&format!("noo tasks show {id}"), "state, loops, last note, result"),
         (&format!("noo agents thread {}", t["thread_id"].as_str().unwrap_or("?")), "its notes and result as they arrive"),
-        (&format!("noo tasks stop {id}"), "end it at the next checkpoint"),
+        (&format!("noo tasks stop {id}"), "stop it (a loop in flight finishes first)"),
     ]);
     Ok(0)
 }
@@ -289,12 +289,26 @@ pub fn tasks_stop(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         println!("{resp}");
         return Ok(0);
     }
-    if resp["stopped"].as_bool() == Some(true) {
-        ui::done(&format!("task {id} will stop at its next checkpoint"));
-    } else {
-        println!("{}", ui::status_line(Glyph::Warn, &format!("task {id} was not running")));
+    match stop_outcome(id, &resp) {
+        (true, line) => ui::done(&line),
+        (false, line) => println!("{}", ui::status_line(Glyph::Warn, &line)),
     }
     Ok(0)
+}
+
+/// What a stop did, from the gateway's answer (i227 fix 3): a task with a
+/// loop in flight (`was` running) is stopped and that loop ends at its next
+/// checkpoint; any other live task is stopped now. A gateway older than
+/// 0.6.13 sends no `was`, and the old wording stands. Pure.
+pub(crate) fn stop_outcome(id: &str, resp: &serde_json::Value) -> (bool, String) {
+    if resp["stopped"].as_bool() != Some(true) {
+        return (false, format!("task {id} was not running"));
+    }
+    match resp["was"].as_str() {
+        Some("running") => (true, format!("task {id} is stopped; the loop it is running ends at its next checkpoint")),
+        Some(was) => (true, format!("task {id} stopped now (it was {was}, with no loop in flight)")),
+        None => (true, format!("task {id} will stop at its next checkpoint")),
+    }
 }
 
 /// `noo tasks stop --via addon:<name> [--user <u>]`: revoke an add-on's
@@ -456,5 +470,22 @@ mod tools_line_tests {
     fn an_older_gateway_sends_no_field_and_renders_a_dash() {
         assert_eq!(tools_line(&serde_json::Value::Null), "-");
         assert_eq!(tools_line(&json!({})), "-");
+    }
+}
+
+#[cfg(test)]
+mod stop_outcome_tests {
+    use super::stop_outcome;
+    use serde_json::json;
+
+    /// i227 fix 3: say what the stop did, not "at its next checkpoint" for
+    /// every task.
+    #[test]
+    fn a_stop_says_whether_a_loop_was_in_flight() {
+        let r = |v: serde_json::Value| stop_outcome("t1", &v);
+        assert_eq!(r(json!({"stopped": true, "was": "running"})), (true, "task t1 is stopped; the loop it is running ends at its next checkpoint".into()));
+        assert_eq!(r(json!({"stopped": true, "was": "open"})), (true, "task t1 stopped now (it was open, with no loop in flight)".into()));
+        assert_eq!(r(json!({"stopped": true})), (true, "task t1 will stop at its next checkpoint".into()), "an older gateway");
+        assert_eq!(r(json!({"stopped": false, "was": "done"})), (false, "task t1 was not running".into()));
     }
 }
