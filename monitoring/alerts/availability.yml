@@ -34,3 +34,15 @@ groups:
         annotations:
           summary: "NATS dead-letter backlog growing ({{ $value }})"
           description: "nats_dlq_pending={{ $value }} for >10m — a consumer may be failing."
+
+      # Sustained disk writes wear consumer SSDs. A week of Postgres sort
+      # spills ran ~130 MB/s (60 TB/7d) on a 1 TB NVMe with nothing alerting.
+      - alert: DiskWriteSustainedHigh
+        expr: rate(node_disk_written_bytes_total[1h]) > 50e6
+        for: 2h
+        labels:
+          severity: warning
+          category: availability
+        annotations:
+          summary: "Sustained high disk writes on {{ $labels.device }} ({{ $labels.instance }}): {{ $value | humanize }}B/s"
+          description: "node_disk_written_bytes_total on {{ $labels.device }} has averaged >50 MB/s for 2h. Sustained writes wear consumer SSDs; check `docker stats` (block I/O) and Postgres temp files (`docker logs noo-postgres`, log_temp_files)."

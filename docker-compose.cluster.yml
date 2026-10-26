@@ -2873,6 +2873,9 @@ services:
       # below so the copy initdb writes into the data volume is never what
       # runs; tests/test_postgres_tls_only.py pins its content.
       - ./docker/postgres/pg_hba.conf:/etc/noo/pg_hba.conf:ro
+    # Docker's 64 MB /dev/shm default makes parallel hash/sort fail with
+    # "could not resize shared memory segment" once work_mem is raised.
+    shm_size: ${NOO_PG_SHM_SIZE:-1g}
     entrypoint: ["sh", "-c"]
     command:
       - |
@@ -2884,6 +2887,22 @@ services:
         # of exactly this gap).
         # Costs ~1-2% overhead and a fixed shared-memory allocation.
         ARGS="-c shared_preload_libraries=pg_stat_statements -c pg_stat_statements.track=top"
+        # Sizing. Stock defaults (work_mem 4MB, shared_buffers 128MB) made
+        # the controller spill sorts to temp files around the clock: ~130
+        # MB/s of writes for a week on a consumer NVMe, with no alert.
+        # Every value is env-overridable (docs: NOO_PG_*).
+        # work_mem is per sort/hash node per query, so keep it modest.
+        ARGS="$$ARGS -c work_mem=${NOO_PG_WORK_MEM:-32MB}"
+        ARGS="$$ARGS -c shared_buffers=${NOO_PG_SHARED_BUFFERS:-512MB}"
+        ARGS="$$ARGS -c maintenance_work_mem=${NOO_PG_MAINTENANCE_WORK_MEM:-256MB}"
+        # Planner hint only (no allocation): memory the OS cache can offer.
+        ARGS="$$ARGS -c effective_cache_size=${NOO_PG_EFFECTIVE_CACHE_SIZE:-2GB}"
+        # Log every temp file >= this size WITH its statement, so a spill is
+        # visible in `docker logs noo-postgres`. 0 logs all, -1 disables.
+        ARGS="$$ARGS -c log_temp_files=${NOO_PG_LOG_TEMP_FILES:-64MB}"
+        # Per-session cap on temp files: a runaway query errors instead of
+        # filling the disk. -1 removes the cap.
+        ARGS="$$ARGS -c temp_file_limit=${NOO_PG_TEMP_FILE_LIMIT:-4GB}"
         # TLS is not a switch. Until 2026-09-28 `ssl=on` hung on NOO_PG_TLS
         # being set AND the leaf existing, and an unset variable started a
         # plaintext server that the stock pg_hba then accepted every client
