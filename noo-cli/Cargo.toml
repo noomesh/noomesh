@@ -3,7 +3,7 @@
 
 [package]
 name = "noo-cli"
-version = "0.6.11"
+version = "0.6.13"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "pai — Rust front-door CLI for Mesh. The only command-line front door: every verb is native."
