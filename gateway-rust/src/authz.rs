@@ -135,6 +135,17 @@ impl<S: Send + Sync> FromRequestParts<S> for OperatorOrInternal {
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let ctx = ctx_of(parts);
         if operator_or_internal_ok(ctx.as_ref()) {
+            // i241: the None arm is the one a route may not need. Make every
+            // admission without a user subject findable, by one stable event
+            // name, so a route can be tightened on evidence.
+            if ctx.is_none() {
+                tracing::info!(
+                    target: "security",
+                    method = %parts.method,
+                    path = %parts.uri.path(),
+                    "authz_no_user_admitted"
+                );
+            }
             Ok(OperatorOrInternal(ctx))
         } else {
             Err(AppError::Forbidden("operator role required".into()))

@@ -63,7 +63,7 @@ use super::bootstrap::{
 };
 use super::{AppError, AppResult};
 use crate::auth::ClusterNode;
-use crate::authz::OperatorOrInternal;
+use crate::authz::{Operator, OperatorOrInternal};
 use crate::auth_refresh::{generate_seat_token, hash_token};
 use crate::birth_proof::Purpose;
 use crate::state::AppState;
@@ -236,10 +236,8 @@ async fn seat_token_create(
 /// GET /api/cluster/seat-tokens — issuance metadata, never hashes.
 async fn seat_tokens_list(
     State(state): State<Arc<AppState>>,
-    op: OperatorOrInternal,
-    cluster: Option<Extension<ClusterNode>>,
+    _op: Operator,
 ) -> AppResult {
-    let _ = seat_admin_guard(&op, &cluster)?;
     type Row = (uuid::Uuid, String, String, String, chrono::DateTime<chrono::Utc>,
                 chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, Option<String>, bool);
     let rows: Vec<Row> = sqlx::query_as(

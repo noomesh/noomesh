@@ -677,7 +677,7 @@ async fn security_audit_stats(
 /// answer lists row ids and says which keys this gateway holds.
 async fn security_audit_verify(
     State(state): State<Arc<AppState>>,
-    _op: OperatorOrInternal,
+    _op: Operator,
 ) -> AppResult {
     let report = crate::audit_integrity::verify_db(&state.db)
         .await
@@ -5338,14 +5338,12 @@ async fn db_migrations(State(state): State<Arc<AppState>>) -> AppResult {
 /// belong to their containers' entrypoints.
 async fn db_migrations_apply(
     State(state): State<Arc<AppState>>,
-    requester: Option<Extension<RequesterCtx>>,
+    _admin: crate::authz::Admin,
 ) -> AppResult {
     use crate::mesh_migrate;
-    if let Some(Extension(r)) = &requester {
-        if r.role < crate::auth::Role::Admin {
-            return Err(AppError::Forbidden("applying migrations needs the admin role".into()));
-        }
-    }
+    // i241: the `Admin` extractor refuses a call with no user context. Boot runs
+    // the runner in-process, not through this route; the CLI db command sends the
+    // operator's login.
     let before = mesh_migrate::current_revision(&state.db).await.ok().flatten();
     // The runner's future is not `Send` (it is written for the boot path,
     // which awaits it on the main task); an axum handler's future must be.

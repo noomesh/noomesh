@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{AppError, AppResult};
-use crate::authz::OperatorOrInternal;
+use crate::authz::Operator;
 use crate::state::AppState;
 
 /// Rows returned when `limit` is absent / the most a caller may ask for.
@@ -96,7 +96,7 @@ type Row = crate::repo::audit::ListRow;
 /// verify; `GET /api/security/audit/verify` does.
 async fn security_audit_list(
     State(state): State<Arc<AppState>>,
-    reader: OperatorOrInternal,
+    reader: Operator,
     Query(p): Query<ListParams>,
 ) -> AppResult {
     let now = Utc::now();
@@ -153,10 +153,7 @@ async fn security_audit_list(
         .collect();
 
     // Who read the log. Written after the read, so it never lists itself.
-    let (reader, act) = match &reader.0 {
-        Some(r) => (r.sub.clone(), r.act.as_ref().map(|a| json!(a))),
-        None => ("cluster".to_string(), None),
-    };
+    let (reader, act) = (reader.0.sub.clone(), reader.0.act.as_ref().map(|a| json!(a)));
     crate::audit::record(
         &state.db,
         AuditEvent::new(AuditKind::AuditLogRead, &reader, "noo_security_audit")
