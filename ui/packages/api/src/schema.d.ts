@@ -4905,8 +4905,6 @@ export interface paths {
                     content: {
                         "application/json": {
                             auth_key?: string;
-                            one_liner?: string;
-                            script_url?: string;
                             next_step?: string;
                         } & {
                             [key: string]: unknown;

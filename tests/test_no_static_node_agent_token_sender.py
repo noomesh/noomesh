@@ -49,7 +49,6 @@ ALLOWED: dict[str, str] = {
     "gateway-rust/src/node_agent_auth.rs": "kept: transitional per-agent bearer for agents that have not reported leaf-only",
     # Not senders.
     "src/noomesh/cluster/cluster_auth.py": "inbound: verifies a presented token; sends nothing",
-    "src/noomesh/security_cli.py": "posture audit: checks the secret is set; sends nothing",
     "noo-cli/src/commands/security_local.rs": "posture audit: checks the secret is set; sends nothing",
     "noo-cli/src/commands/provision.rs": "provisioning: writes the secret into a node's env; calls no agent",
 }

@@ -9,7 +9,7 @@ the setting mounted directories Docker creates EMPTY and downloaded its
 models again, silently. Now:
 
 - the node agent, the noo CLI and the Python CLI share ONE default value,
-  a neutral Linux path, and this test holds the three copies together;
+  a neutral Linux path, and this test holds the two copies together;
 - the compose file has NO fallback: it refuses to render without a root;
 - no shipped code path falls back to a machine-specific path.
 """
@@ -28,16 +28,13 @@ def _one(pattern: str, path: str) -> str:
     return found[0]
 
 
-def test_three_copies_of_the_default_agree_and_are_neutral():
+def test_both_copies_of_the_default_agree_and_are_neutral():
     assert "const DefaultDataRoot = StandardLinuxRoot" in (
         REPO / "node-agent-go/internal/dataroots/dataroots.go"
     ).read_text(), "the agent's default must be its policy's standard location"
     go = _one(r'const StandardLinuxRoot = "([^"]+)"', "node-agent-go/internal/dataroots/policy.go")
     rust = _one(r'pub\(crate\) const DEFAULT_DATA_ROOT: &str = "([^"]+)";', "noo-cli/src/commands/data_root.rs")
-    py = re.search(
-        r'^DEFAULT_DATA_ROOT = "([^"]+)"', (REPO / "src/noomesh/cluster/cli.py").read_text(), re.M
-    ).group(1)
-    assert go == rust == py == NEUTRAL, (go, rust, py)
+    assert go == rust == NEUTRAL, (go, rust)
 
 
 def test_compose_refuses_an_unset_root_instead_of_guessing():

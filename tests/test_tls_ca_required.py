@@ -96,23 +96,6 @@ def test_agent_messenger_client_verifies_against_the_given_ca(monkeypatch, tmp_p
     assert seen["verify"] == str(ca)
 
 
-def test_cli_http_verify_is_never_false_without_a_ca(no_ca, monkeypatch):
-    from noomesh import cli_utils
-
-    monkeypatch.setattr(cli_utils, "get_gateway_url", lambda: "https://localhost:8080")
-    assert cli_utils.cli_http_verify() is True
-
-
-def test_cli_http_verify_returns_the_ca_path(monkeypatch, tmp_path):
-    from noomesh import cli_utils
-
-    ca = tmp_path / "ca.crt"
-    ca.write_text("x")
-    monkeypatch.setenv("NOO_TLS_CA", str(ca))
-    monkeypatch.setattr(cli_utils, "get_gateway_url", lambda: "https://localhost:8080")
-    assert cli_utils.cli_http_verify() == str(ca)
-
-
 # ---- the grep guard -------------------------------------------------------
 
 FORBIDDEN = (
@@ -141,7 +124,6 @@ ALLOWED = {
     "throwaway sandbox before its CA is mounted; same deferral as Dockerfile.sandbox",
     "packages/noo-gateway-client/src/noo_gateway/settings.py": "the REFUSAL: raises on verify=False",
     # Source that only DISCUSSES the idiom in comments:
-    "src/noomesh/security_cli.py": "comment: never verify=False",
     "src/noomesh/cluster/model_catalog.py": "comment: NEVER verify=False",
     "src/noomesh/gateway/deps.py": "docstring recounting the removed check_hostname = False",
     "noo-cli/src/onboard/sh.rs": "comment quoting the old Python verify=False",

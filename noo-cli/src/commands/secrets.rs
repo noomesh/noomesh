@@ -1144,9 +1144,8 @@ pub const CORE_REGISTRY: &[SecretSpec] = &[
                       (typically 90d); `cluster invite` / `set-primary` start failing \
                       once it lapses, which looks like a network fault",
         // Gateway-only since an earlier release: the Python reader
-        // (cluster/tailscale.py) is reached only from the `noomesh cluster
-        // mint-join-key` CLI, which no container runs, so the trellion
-        // overlay stopped delivering it rather than move it to a file.
+        // (cluster/tailscale.py, behind the Python CLI) is deleted, so the
+        // trellion overlay no longer delivers it.
         consumers: &["noo-gateway"],
         required_when: Requirement::Optional,
     },

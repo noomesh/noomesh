@@ -16,8 +16,8 @@ The memory env runs FIRST so its tables exist by the time mesh's
 ``noo_temporal_edges.source_cycle_id`` to ``noo_hofstadter_loop_cycles.id``.
 
 This module is the single entry point for both gateway startup
-(``engine._run_migrations``) and manual CLI invocation
-(``db_cli upgrade`` / ``stamp`` / ``current`` / ``history``).
+(``engine._run_migrations``) and manual invocation
+(``noo db upgrade`` / ``stamp`` / ``current`` / ``history``).
 """
 from __future__ import annotations
 

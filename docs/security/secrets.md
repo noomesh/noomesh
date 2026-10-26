@@ -394,8 +394,8 @@ exactly one entry: its `NOO_GATEWAY_KEY_FILE` points at a file sourced from
 its **own** key (`NOO_SVC_KEY_TRELLION_INTEL`), never trellion's. Two values
 the trellion pair used to receive and never read are no longer delivered at
 all: `NOO_TRELLION_DB_PASSWORD` (role creation moved to the gateway's
-broker) and `NOO_TAILSCALE_API_KEY` (read only by a Python CLI command no
-container runs; the gateway mints join keys).
+broker) and `NOO_TAILSCALE_API_KEY` (its only Python reader, a CLI command, is
+gone; the gateway mints join keys).
 
 **The node agent.** The Go agent reads its three secrets —
 `NOO_NODE_AGENT_TOKEN`, `NOO_CLUSTER_SECRET` and `NATS_NODE_PASSWORD` — through the same
