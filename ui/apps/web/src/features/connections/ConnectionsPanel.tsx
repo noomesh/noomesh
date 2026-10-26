@@ -243,6 +243,10 @@ export function ConnectionsPanel() {
             to import Gmail plain-text bodies, text files and Google Docs.
             Attachments and binary files are skipped.
           </p>
+          <p className="connections-detail">
+            Search imported text with <code>noo rag query</code>. Automatic chat
+            use is disabled while chat history has broader operator access.
+          </p>
           {showAccountForm && (
             <form className="connections-form" onSubmit={saveAccount}>
               <h3>Add an account draft</h3>

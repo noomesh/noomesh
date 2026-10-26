@@ -4,6 +4,12 @@
 use serde_json::Value;
 use uuid::Uuid;
 
+pub async fn lock_owner(tx: &mut sqlx::Transaction<'_,sqlx::Postgres>,owner:Uuid)->Result<(),sqlx::Error> {
+    sqlx::query("SELECT user_uuid FROM noo_users WHERE user_uuid=$1 FOR UPDATE")
+        .bind(owner).fetch_one(&mut **tx).await?;
+    Ok(())
+}
+
 pub async fn owner_uuid(db: &sqlx::PgPool, owner: &str) -> Result<Option<Uuid>, sqlx::Error> {
     sqlx::query_scalar("SELECT user_uuid FROM noo_users WHERE username = $1")
         .bind(owner)

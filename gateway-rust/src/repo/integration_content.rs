@@ -3,7 +3,7 @@
 
 //! A separate, encrypted personal corpus. Shared KB roles, deduplication,
 //! administrator reads, graph builders and worker caches cannot reach it.
-use super::{
+use crate::integrations::{
     crypto::{hash, Vault},
     Error,
 };
@@ -200,6 +200,8 @@ pub fn requester_account(principal: &crate::bus_principal::Principal) -> Option<
     if principal.kind != crate::bus_principal::Kind::User
         || principal.scopes.iter().any(|s| s == "kb:shared-room")
         || crate::coordinator::in_shared_room()
+        || crate::mcp_bridge::current_conversation().is_some()
+        || !crate::routes::communication::turn_principal().conversation_id.is_empty()
     {
         return None;
     }

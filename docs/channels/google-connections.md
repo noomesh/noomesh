@@ -60,13 +60,21 @@ personal owner check. Internal/service identities and shared-room turns receive
 no personal evidence.
 
 Owner-only lexical search runs over a bounded decrypted window and returns
-snippets/citations. The normal KB query and coordinator context add those results
-after shared retrieval, without publishing them to shared workers or graph/walk
-stores. Query bodies cannot choose another owner. The personal corpus is excluded
-from shared listing/graph/export APIs because those tables never contain it.
-There is no personal result cache. Content returned to a user's conversation is
-part of that user's conversation history; removing a source does not rewrite
-past conversations or backups.
+snippets/citations. Standalone HTTP KB queries and context-free native queries
+add personal results on the gateway after shared retrieval, without publishing
+them to shared workers or graph/walk stores. Query bodies cannot choose another
+owner. There is no personal result cache.
+
+**Persisted Noomesh chat is excluded in this batch.** Existing transcript,
+conversation-memory and training-export permissions allow operators to read
+other users' histories. Source ownership alone would not protect excerpts copied
+there. Personal retrieval therefore refuses coordinator turns, conversation-bound
+tool calls and shared rooms, and the chat context loader does not inject this
+corpus. Private chat needs transcript/export isolation before activation. Users
+can search from the CLI/standalone API; manually copying results into a shared
+or operator-visible conversation follows that destination's existing permissions.
+The personal corpus is absent from shared graph/list/export tables. Source removal
+does not rewrite any manually copied text, past conversations or backups.
 
 Current limits: 1,000 documents per source, 32 KiB text per document, 1 MiB provider
 response, 20 items per page, 5,000 folders per traversal and a 1,000-document
@@ -121,7 +129,8 @@ Google authorization. Draft metadata remains separate from the explicit
 `gateway-rust/src/integrations/provider.rs` registers reviewed endpoint and
 scope definitions; `oauth.rs` holds the reusable lifecycle and Google resource
 adapter; `crypto.rs` implements the vault. Storage is in
-`gateway-rust/src/repo/integrations.rs`. The mesh migration
+`gateway-rust/src/repo/integrations.rs`; personal corpus/queue storage is in
+`repo/integration_content.rs` and pairing storage in `repo/integration_pairing.rs`. The mesh migration
 `105_integration_pairing` adds owner-bound, single-use CLI-to-phone handoffs.
 `noo auth connect google --pair` displays a ten-minute code and a phone URL.
 The same signed-in Noomesh owner reviews the device and services on the phone,

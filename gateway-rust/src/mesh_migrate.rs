@@ -3120,15 +3120,14 @@ mod tests {
             .contains("(node_id, backend, role, (CASE WHEN role = 'embed' THEN model ELSE '' END))"));
     }
 
-    /// The pg_stat_statements revision is the chain head, sits on 102, and is
+    /// The pg_stat_statements revision follows 102 and is
     /// idempotent DDL.
     #[test]
-    fn pg_stat_statements_revision_is_the_head_and_idempotent() {
+    fn pg_stat_statements_revision_is_ordered_and_idempotent() {
         let m = MIGRATIONS.iter().find(|m| m.revision == PG_STAT_STATEMENTS_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "103_pg_stat_statements");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(EMBEDDING_SPACE_MIGRATION_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(PG_STAT_STATEMENTS_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE EXTENSION IF NOT EXISTS pg_stat_statements"));
     }
 
@@ -3140,6 +3139,7 @@ mod tests {
         assert_eq!(m.revision, "102_embedding_space_migration");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(EMBED_PLACEMENT_MODEL_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(INTEGRATION_CONTENT_REVISION), "the chain head");
         for col in [
             "next_model text", "next_dims integer", "migration_state text", "migration_progress jsonb",
             "migration_started_at timestamptz", "migration_reported_at timestamptz",

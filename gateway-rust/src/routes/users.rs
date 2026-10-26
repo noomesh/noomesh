@@ -1283,8 +1283,7 @@ pub(crate) async fn erase_account(
         }
         // Serialize erasure with connection completion: a claimed OAuth
         // session must still exist after taking this same user-row lock.
-        sqlx::query("SELECT user_uuid FROM noo_users WHERE user_uuid=$1 FOR UPDATE")
-            .bind(owner).fetch_one(&mut *tx).await?;
+        crate::repo::integrations::lock_owner(&mut tx,owner).await?;
         // Read-side live operations are stopped here, before their rows go:
         // a detached task outlives its row.
         crate::ops::abort_live_for_account(db, &username)

@@ -33,7 +33,7 @@ struct Cursor {
 
 // Explicit transport boundary lets tests run the real traversal/parser without
 // real account data. Production endpoints cannot be reconfigured by users.
-pub(super) trait Api {
+pub(crate) trait Api {
     async fn get(
         &self,
         gmail: bool,
@@ -195,7 +195,7 @@ fn message(id: &str, value: &Value) -> Option<Document> {
     })
 }
 
-pub(super) async fn page(
+pub(crate) async fn page(
     api: &impl Api,
     policy: &SourcePolicy,
     previous: Option<Value>,

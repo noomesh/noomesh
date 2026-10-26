@@ -143,6 +143,21 @@ fn personal_authority_ignores_admin_grants_and_denies_internal_and_shared_rooms(
 }
 
 #[tokio::test]
+async fn personal_evidence_cannot_enter_persisted_chat_or_tool_histories() {
+    let principal=p("alice",true);
+    crate::mcp_bridge::CONVERSATION.scope(Some("persisted-conversation".into()),async {
+        assert_eq!(requester_account(&principal),None);
+    }).await;
+    let turn=crate::routes::communication::TurnPrincipal {
+        requester:"alice".into(),conversation_id:"persisted-turn".into(),..Default::default()
+    };
+    crate::routes::communication::with_turn_principal(turn,async {
+        assert_eq!(requester_account(&principal),None);
+    }).await;
+    assert_eq!(requester_account(&principal),Some("alice"));
+}
+
+#[tokio::test]
 async fn provider_ingest_search_and_identical_content_are_private_across_users_and_admins() {
     let Some(db) = Db::new().await else {
         return;

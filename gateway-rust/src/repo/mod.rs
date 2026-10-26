@@ -82,6 +82,8 @@ pub mod agent_messages;
 pub mod audit;
 pub mod cluster;
 pub mod connections;
+pub mod integration_content;
+pub mod integration_pairing;
 pub mod integrations;
 pub mod graph;
 pub mod heartbeat;

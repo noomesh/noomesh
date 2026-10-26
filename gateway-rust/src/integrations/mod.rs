@@ -3,10 +3,10 @@
 
 //! Shared authorization and encrypted credential lifecycle. Provider endpoints
 //! and permissions are reviewed code, not URLs supplied by a connection owner.
-pub mod content;
+pub use crate::repo::integration_content as content;
 pub mod crypto;
 pub mod oauth;
-pub mod pairing;
+pub use crate::repo::integration_pairing as pairing;
 pub mod provider;
 pub mod sync;
 

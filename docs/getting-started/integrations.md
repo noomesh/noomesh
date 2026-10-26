@@ -283,9 +283,15 @@ without Google emails, tokens, codes, selected content or message bodies.
    Choose **Pause sync** to stop future reads; imported content remains searchable
    by you. Remove the source or account to delete its locally imported content.
 
-Search your imported material through the normal Noomesh KB query or chat.
+Search your imported material through a standalone Noomesh KB query or the
+owner-only `/api/connections/search` API.
+For example: `noo rag query "apricot project notes"`. Use the same Noomesh
+login that connected the account.
 Personal source text is stored encrypted and retrieved only for your Noomesh
-account. It is excluded from shared-room context and shared knowledge graphs;
+account. Automatic use in persisted Noomesh chat and conversation-bound tools is
+disabled: existing transcript/export permissions allow operators to read other
+users' histories. Standalone search keeps Google content out of those histories.
+It is excluded from shared-room context and shared knowledge graphs;
 Google file sharing does not share it with other Noomesh users. Removal does not
 rewrite prior conversation history or backups.
 

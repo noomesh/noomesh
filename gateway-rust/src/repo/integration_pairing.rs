@@ -3,7 +3,7 @@
 
 //! Provider-independent handoff. A code locates a request only within the
 //! signed-in owner's account; it never authenticates a phone or an OAuth grant.
-use super::{crypto::hash, oauth, provider, ClientKind, Error, IntegrationConfig};
+use crate::integrations::{crypto::hash, oauth, provider, ClientKind, Error, IntegrationConfig};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
