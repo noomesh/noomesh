@@ -430,8 +430,30 @@ pub(crate) const NEEDS_A_HAND: &str = "only these need you: a key owned by anoth
 /// directory 0755, every certificate 0644. Says what changed in one line
 /// and, per key it could not repair, the exact `sudo` line. Never fails
 /// the roll.
+///
+/// A key this user could not hand to its container uid (no `setfacl`, not
+/// in that gid) was left 0644 so its service keeps starting. A roll that
+/// MOVES a reader makes one on every such box: 0.6.12 hands the sandbox key
+/// from 65532 to the sandbox server's own uid. So, as onboard does (i266),
+/// the grant goes through `sudo -n` when sudo needs no password (the rail's
+/// applier, a cloud image's user); otherwise the roll says LOUDLY that the
+/// keys are world-readable and names the command that prints each line. No
+/// password prompt in the middle of a roll.
 pub(crate) fn reconcile_key_modes(g: &Globals, ca: &ClusterCa) -> ModeRepair {
-    let repair = ModeRepair::run(ca);
+    let mut repair = ModeRepair::run(ca);
+    let pending = sudo_grant_pending(&repair.keys);
+    if !pending.is_empty() && crate::onboard::steps::passwordless_sudo() {
+        for i in pending {
+            let f = &mut repair.keys[i];
+            let crate::pki::KeyReader::ContainerUid(uid) = f.reader else { continue };
+            if crate::pki::grant_read_to_uid_via_sudo(&ca.dir.join(&f.rel), uid, true).is_ok() {
+                f.needs = None;
+                f.granted_via = "sudo";
+                f.after = 0o640;
+            }
+        }
+    }
+    let exposed = sudo_grant_pending(&repair.keys).into_iter().filter(|&i| repair.keys[i].after & 0o004 != 0).count();
     if g.json {
         return repair;
     }
@@ -446,7 +468,21 @@ pub(crate) fn reconcile_key_modes(g: &Globals, ca: &ClusterCa) -> ModeRepair {
     for f in repair.keys.iter().filter(|f| f.needs.is_some()) {
         ui::warned(&format!("{} ({}) needs a hand this process does not have — run: {}", f.rel, f.reader.describe(), f.needs.as_deref().unwrap_or_default()));
     }
+    if exposed > 0 {
+        ui::failed(&crate::pki::exposed_keys_failure(exposed), Some("noo security pki fix-modes --dry-run"));
+    }
     repair
+}
+
+/// The keys of one repair pass that only `sudo chgrp` can hand to their
+/// container uid (indices into `keys`): a uid-read key whose pending line
+/// is the grant. A foreign-owned key's `sudo chown` line is not one.
+pub(crate) fn sudo_grant_pending(keys: &[crate::pki::KeyFix]) -> Vec<usize> {
+    keys.iter()
+        .enumerate()
+        .filter(|(_, f)| matches!(f.reader, crate::pki::KeyReader::ContainerUid(_)) && f.needs.as_deref().is_some_and(|n| n.starts_with("sudo chgrp")))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// One pass of every mode this CLI owns.
@@ -1020,6 +1056,25 @@ mod reconcile_tests {
             "a key only the CLI or container root reads never needs sudo when the operator owns it");
         assert_eq!(ModeRepair::run(&ca).changed(), 0, "idempotent");
         let _ = std::fs::remove_dir_all(&ca.dir);
+    }
+
+    /// The upgrade's sudo pass picks exactly the uid-read keys whose pending
+    /// line is the `sudo chgrp` grant — the moved sandbox key on a box with
+    /// no setfacl — never a CLI key, never a `sudo chown` (foreign owner).
+    #[test]
+    fn the_upgrade_hands_only_chgrp_pending_keys_to_sudo() {
+        use crate::pki::{KeyFix, KeyReader};
+        let fix = |rel: &str, reader: KeyReader, needs: Option<&str>| KeyFix {
+            rel: rel.into(), reader, before: 0o640, after: 0o644, granted_via: "", needs: needs.map(str::to_string), reowned: false,
+        };
+        let keys = vec![
+            fix("services/sandbox/service.key", KeyReader::ContainerUid(crate::pki::SANDBOX_SERVER_UID),
+                Some("sudo chgrp 65590 /p/services/sandbox/service.key && sudo chmod 640 /p/services/sandbox/service.key")),
+            fix("services/loki/service.key", KeyReader::ContainerUid(65532), None),
+            fix("services/redis/service.key", KeyReader::ContainerUid(65532), Some("sudo chown 1000:65532 /p/k && sudo chmod 640 /p/k")),
+            fix("nodes/h/node.key", KeyReader::Cli, Some("sudo chown 1000:1000 /p/n")),
+        ];
+        assert_eq!(sudo_grant_pending(&keys), vec![0]);
     }
 
     /// Provision's half: only the named node's keys are touched.

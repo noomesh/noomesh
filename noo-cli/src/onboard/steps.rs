@@ -137,7 +137,7 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
             }
             if !apt_pkgs.is_empty() {
                 ctx.progress(&format!("Installing via apt: {} ...", apt_pkgs.join(" ")));
-                let ok = Command::new("sudo")
+                let ok = ctx_sudo(ctx)
                     .args(["sh", "-c",
                         &format!("apt-get update -q && apt-get install -y -q {}", apt_pkgs.join(" "))])
                     .status().map(|s| s.success()).unwrap_or(false);
@@ -152,12 +152,12 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
                 // Downloaded to a file, checked, digest printed, then run —
                 // never piped into a shell. See crate::vendor.
                 let docker_cmd = crate::vendor::install_script_cmd(crate::vendor::DOCKER_INSTALL_URL);
-                let ok = Command::new("sudo")
+                let ok = ctx_sudo(ctx)
                     .args(["sh", "-c", &docker_cmd])
                     .status().map(|s| s.success()).unwrap_or(false);
                 if ok {
                     let user = std::env::var("USER").unwrap_or_default();
-                    let _ = Command::new("sudo").args(["usermod", "-aG", "docker", &user]).status();
+                    let _ = ctx_sudo(ctx).args(["usermod", "-aG", "docker", &user]).status();
                     ctx.success("Docker installed; your user was added to the docker group");
                     // The running shell can't pick up new group membership —
                     // but `sg docker` reads /etc/group directly (usermod just
@@ -182,12 +182,13 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
                     let quoted: Vec<String> = std::iter::once(&exe).chain(argv.iter())
                         .map(|a| format!("'{}'", a.replace('\'', r"'\''")))
                         .collect();
+                    let relaunch_may_prompt = ctx_sudo_may_prompt(ctx);
                     let code = Command::new("sg")
                         .args(["docker", "-c", &quoted.join(" ")])
                         .status().ok().and_then(|s| s.code())
                         .or_else(|| {
                             ctx.info("(sg not available — relaunching via `sudo -g docker`)");
-                            Command::new("sudo")
+                            sudo_cmd(relaunch_may_prompt)
                                 .args(["-g", "docker", &exe])
                                 .args(&argv)
                                 .status().ok().and_then(|s| s.code())
@@ -316,7 +317,7 @@ apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nvidia-container-toolkit
 nvidia-ctk runtime configure --runtime=docker
 systemctl restart docker"#;
-            let ok = Command::new("sudo").args(["sh", "-c", script])
+            let ok = ctx_sudo(ctx).args(["sh", "-c", script])
                 .status().map(|st| st.success()).unwrap_or(false);
             if ok {
                 ctx.success("NVIDIA Container Toolkit installed; Docker restarted with the nvidia runtime");
@@ -2400,8 +2401,8 @@ fn gateway_port() -> String {
 /// on a node: every user on the box runs `noo`, and the URL is not a secret.
 /// Written via `sudo tee` because the wizard runs as the operator, and the
 /// same consent posture as the rest of its privileged steps applies.
-fn write_controller_url(url: &str) -> Result<(), String> {
-    let ok = Command::new("sudo")
+fn write_controller_url(url: &str, may_prompt: bool) -> Result<(), String> {
+    let ok = sudo_cmd(may_prompt)
         .args(["install", "-d", "-m", "755", "/etc/noo"])
         .status()
         .map(|s| s.success())
@@ -2414,7 +2415,7 @@ fn write_controller_url(url: &str) -> Result<(), String> {
     // and routing the value through a shell string invites a quoting bug in
     // the one place a quoting bug would write the wrong URL.
     use std::process::Stdio;
-    let mut child = Command::new("sudo")
+    let mut child = sudo_cmd(may_prompt)
         .args(["tee", ENROLLED_CONTROLLER_URL])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -2426,7 +2427,7 @@ fn write_controller_url(url: &str) -> Result<(), String> {
     }
     let ok = child.wait().map(|s| s.success()).unwrap_or(false);
     if ok {
-        let _ = Command::new("sudo")
+        let _ = sudo_cmd(may_prompt)
             .args(["chmod", "644", ENROLLED_CONTROLLER_URL])
             .status();
     }
@@ -3066,7 +3067,7 @@ fn ensure_pki(ctx: &mut Ctx) {
         // name the certificate carries come from one value and cannot drift.
         if !ctx.state.ts_dnsname.is_empty() {
             let url = format!("https://{}:{}", ctx.state.ts_dnsname, gateway_port());
-            match write_controller_url(&url) {
+            match write_controller_url(&url, ctx_sudo_may_prompt(ctx)) {
                 Ok(()) => ctx.success(&format!("Controller URL recorded: {url}")),
                 // Not fatal. The stack comes up either way; the cost is that
                 // `noo` on this box needs $CONTROLLER_URL until it is fixed,
@@ -3075,6 +3076,7 @@ fn ensure_pki(ctx: &mut Ctx) {
                     ctx.warn(&format!("could not write {ENROLLED_CONTROLLER_URL}: {e}"));
                     ctx.raw("    `noo` on this box will default to localhost, which this certificate does not name.");
                     ctx.raw(&format!("    Until fixed: export CONTROLLER_URL={url}"));
+                    sudo_refused(ctx, "controller URL", &format!("echo {url} | sudo tee {ENROLLED_CONTROLLER_URL}"));
                 }
             }
         }
@@ -3225,8 +3227,56 @@ fn ensure_pki(ctx: &mut Ctx) {
                 ctx.raw(&format!("    {}: {:04o} → {:04o} ({})", f.rel, f.before, f.after, f.reader.describe()));
             }
         }
-        for f in fixes.iter().filter(|f| f.needs.is_some()) {
-            ctx.warn(&format!("{} is not readable by its container uid ({}); run: {}", f.rel, f.reader.describe(), f.needs.as_deref().unwrap_or_default()));
+        // i266: a key this process could not hand to its container uid is
+        // 0644 (fail open) with the sudo line printed. A fresh `--ci` install
+        // on a box with no setfacl left 32 such keys readable by every local
+        // account, reported success, and only `cluster verify` said so.
+        // With sudo usable the grant is made here and verified; without it
+        // the run says so plainly and does not complete.
+        let outstanding: Vec<crate::pki::KeyFix> = fixes.iter().filter(|f| f.needs.is_some()).cloned().collect();
+        let interactive = !ctx.non_interactive && ctx.ui.inherit_stdio() && super::prompt::stdin_is_tty();
+        let sudo_usable = !outstanding.is_empty() && (interactive || passwordless_sudo());
+        match crate::pki::key_grant_plan(outstanding.len(), sudo_usable) {
+            crate::pki::KeyGrantPlan::Nothing => {}
+            crate::pki::KeyGrantPlan::Sudo => {
+                ctx.progress(&format!("Handing {} private key(s) to their container uid through sudo...", outstanding.len()));
+                let mut done = 0usize;
+                for f in &outstanding {
+                    let key = ctx.pki_dir.join(&f.rel);
+                    match f.reader {
+                        crate::pki::KeyReader::ContainerUid(uid) if f.needs.as_deref().is_some_and(|n| n.starts_with("sudo chgrp")) => {
+                            match crate::pki::grant_read_to_uid_via_sudo(&key, uid, !interactive) {
+                                Ok(()) => done += 1,
+                                Err(cmd) => ctx.warn(&format!("{} is not readable by its container uid ({}); run: {cmd}", f.rel, f.reader.describe())),
+                            }
+                        }
+                        _ => ctx.warn(&format!("{} ({}); run: {}", f.rel, f.reader.describe(), f.needs.as_deref().unwrap_or_default())),
+                    }
+                }
+                if done > 0 {
+                    ctx.success(&format!("{done} private key(s) handed to their container uid (0640, group = uid) through sudo"));
+                }
+                // Verified, not assumed: the audit the scan and `cluster verify` use.
+                let still: Vec<String> = ca
+                    .audit_key_modes()
+                    .into_iter()
+                    .filter(|i| outstanding.iter().any(|f| f.rel == i.rel) && matches!(i.kind, crate::pki::KeyIssueKind::Exposed | crate::pki::KeyIssueKind::Unreadable))
+                    .map(|i| i.rel)
+                    .collect();
+                if !still.is_empty() {
+                    let text = crate::pki::exposed_keys_failure(still.len());
+                    ctx.error(&text);
+                    ctx.state.hard_failures.push(text);
+                }
+            }
+            crate::pki::KeyGrantPlan::Loud => {
+                for f in &outstanding {
+                    ctx.warn(&format!("{} is not readable by its container uid ({}); run: {}", f.rel, f.reader.describe(), f.needs.as_deref().unwrap_or_default()));
+                }
+                let text = crate::pki::exposed_keys_failure(outstanding.len());
+                ctx.error(&text);
+                ctx.state.hard_failures.push(text);
+            }
         }
     }
 
@@ -3313,22 +3363,14 @@ fn install_ca_linux(ctx: &mut Ctx, ca_file: &Path) {
         return;
     }
     let dest = ca_dir.join("mesh-cluster-ca.crt");
-    let elevate = if Command::new("pkexec").arg("--version").output().is_ok()
-        && std::env::var("DISPLAY").is_ok()
-    {
-        "pkexec"
-    } else {
-        "sudo"
-    };
-    // Under the TUI, sudo can't prompt for a password on the raw-mode
-    // terminal — run it non-interactive and fall back to the manual hint.
-    let elevated = |ctx: &Ctx| {
-        let mut cmd = Command::new(elevate);
-        if elevate == "sudo" && !ctx.ui.inherit_stdio() {
-            cmd.arg("-n").stdin(std::process::Stdio::null());
-        }
-        cmd
-    };
+    // pkexec only for a person at a desktop who may be asked; everything
+    // else is the seam's sudo, `-n` unless a person can answer (i267: this
+    // is the call that hung take 14b at a password prompt under --ci).
+    let may_prompt = ctx_sudo_may_prompt(ctx);
+    let pkexec = may_prompt
+        && Command::new("pkexec").arg("--version").output().is_ok()
+        && std::env::var("DISPLAY").is_ok();
+    let elevated = |_: &Ctx| if pkexec { Command::new("pkexec") } else { sudo_cmd(may_prompt) };
     let cp = elevated(ctx)
         .args(["cp"])
         .arg(ca_file)
@@ -3358,6 +3400,11 @@ fn install_ca_linux(ctx: &mut Ctx, ca_file: &Path) {
             ca_file.display(),
             dest.display()
         ));
+        sudo_refused(
+            ctx,
+            "cluster CA trust",
+            &format!("sudo cp {} {} && sudo update-ca-certificates", ca_file.display(), dest.display()),
+        );
     }
 }
 
@@ -4146,14 +4193,11 @@ fn ensure_root_dir(ctx: &mut Ctx, root: &Path) {
             .filter(|s| !s.is_empty())
     };
     let (Some(uid), Some(gid)) = (id("-u"), id("-g")) else { return };
-    let mut cmd = Command::new("sudo");
-    if !ctx.ui.inherit_stdio() {
-        cmd.arg("-n").stdin(std::process::Stdio::null());
-    }
-    let ok = cmd.args(["install", "-d", "-o", &uid, "-g", &gid, "-m", "0755"]).arg(root)
+    let ok = ctx_sudo(ctx).args(["install", "-d", "-o", &uid, "-g", &gid, "-m", "0755"]).arg(root)
         .status().map(|s| s.success()).unwrap_or(false);
     if !ok {
         ctx.warn(&format!("could not create {} (sudo install -d failed); create it owned by you and re-run", root.display()));
+        sudo_refused(ctx, "data root", &format!("sudo install -d -o {uid} -g {gid} -m 0755 {}", root.display()));
     }
 }
 
@@ -4176,13 +4220,8 @@ fn create_storage_dirs(ctx: &mut Ctx, root: &Path) -> usize {
                 }
             }
             Err(_) => {
-                // retry with sudo (non-interactive under the TUI — a password
-                // prompt can't use the terminal there)
-                let mut cmd = Command::new("sudo");
-                if !ctx.ui.inherit_stdio() {
-                    cmd.arg("-n").stdin(std::process::Stdio::null());
-                }
-                let ok = cmd
+                // retry with sudo — `-n` unless a person can answer (i267)
+                let ok = ctx_sudo(ctx)
                     .args(["mkdir", "-p"])
                     .arg(target)
                     .status()
@@ -4199,6 +4238,7 @@ fn create_storage_dirs(ctx: &mut Ctx, root: &Path) -> usize {
     let detail = format!("{created} created, {existing} already exist, {failed} failed");
     if failed > 0 {
         ctx.warn(&format!("Storage directories ({detail}) under {}", root.display()));
+        sudo_refused(ctx, &format!("storage ({failed} director(ies) under {})", root.display()), &format!("sudo mkdir -p {}/<each missing directory>, then: noo onboard --only storage", root.display()));
     } else {
         ctx.success(&format!("Storage directories ({detail}) under {}", root.display()));
     }
@@ -4306,7 +4346,7 @@ fn maybe_relocate_docker(ctx: &mut Ctx, chosen_root: &str, _home: &str) {
         ctx.warn("Failed to write /etc/docker/daemon.json");
         return;
     }
-    let ok = Command::new("sudo").args(["systemctl", "restart", "docker"])
+    let ok = ctx_sudo(ctx).args(["systemctl", "restart", "docker"])
         .status().map(|s| s.success()).unwrap_or(false);
     if ok {
         ctx.success(&format!("Docker data-root set to {target} — Docker restarted"));
@@ -4342,7 +4382,7 @@ fn read_daemon_json() -> Result<String, String> {
     match std::fs::read_to_string(P) {
         Ok(s) => Ok(s),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(_) => Command::new("sudo").args(["-n", "cat", P]).output().ok()
+        Err(_) => sudo_cmd(false).args(["cat", P]).output().ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
             .ok_or_else(|| format!("{P} exists but could not be read (even via sudo -n)")),
@@ -4365,11 +4405,7 @@ fn merge_daemon_json(existing: &str, target: &str) -> Result<String, String> {
 }
 
 fn write_daemon_json(ctx: &Ctx, payload: &str) -> bool {
-    let mut cmd = Command::new("sudo");
-    if !ctx.ui.inherit_stdio() {
-        cmd.arg("-n"); // no password prompt on the TUI's raw-mode terminal
-    }
-    let mut child = match cmd
+    let mut child = match ctx_sudo(ctx)
         .args(["tee", "/etc/docker/daemon.json"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -5191,7 +5227,7 @@ fn ensure_self_agent(ctx: &mut Ctx) {
     };
     let identity_ok = crate::commands::provision::pull_units_missing(&node_id).is_empty();
     let interactive = !ctx.non_interactive && ctx.ui.inherit_stdio() && super::prompt::stdin_is_tty();
-    let sudo_quiet = Command::new("sudo").args(["-n", "true"])
+    let sudo_quiet = sudo_cmd(false).args(["true"])
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
         .status().map(|s| s.success()).unwrap_or(false);
     let controller = crate::role::detect().controller;
@@ -5488,7 +5524,7 @@ fn obtain_hostd_binary(ctx: &mut Ctx) -> Result<std::path::PathBuf, String> {
     }
     let staged = std::env::temp_dir().join(format!("noo-hostd-{}", std::process::id()));
     std::fs::write(&staged, &bytes).map_err(|e| format!("could not stage the binary: {e}"))?;
-    let ok = Command::new("sudo")
+    let ok = ctx_sudo(ctx)
         .args(["install", "-m", "755", "-o", "root", "-g", "root"])
         .arg(&staged)
         .arg(&target)
@@ -5540,16 +5576,80 @@ pub(crate) fn hostd_install_decision(interactive: bool, sudo_quiet: bool) -> Hos
     }
 }
 
+/// i267: may a sudo in this run ask for a password? Only when a person is
+/// at a terminal the wizard does not own. Never in a non-interactive run
+/// (`--ci`, scripted): on a CI box there is no one to answer, and in a
+/// terminal the prompt simply waits — take 14b of the onboarding film sat at
+/// "[sudo] password for you:" for an hour (0.6.12-rc.1; the same gate is in
+/// 0.6.10 and 0.6.11). Never under the full-screen UI either: its raw-mode
+/// terminal cannot take a password. Pure, so the table is pinned.
+pub(crate) fn sudo_may_prompt(non_interactive: bool, inherit_stdio: bool, stdin_tty: bool) -> bool {
+    !non_interactive && inherit_stdio && stdin_tty
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test points every onboard sudo at a fake (`sudo_seam_tests`).
+    static SUDO_BIN: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// THE `sudo` of the onboard steps: `sudo -n` with stdin closed unless
+/// `may_prompt` ([`sudo_may_prompt`]). Every onboard sudo is built here —
+/// pinned by `every_onboard_sudo_goes_through_the_seam` — so a new step
+/// cannot reintroduce a prompting call. A caller that pipes stdin (`tee`)
+/// sets it after; `-n` still forbids the prompt.
+pub(crate) fn sudo_cmd(may_prompt: bool) -> Command {
+    #[cfg(test)]
+    let prog = SUDO_BIN.with(|b| b.borrow().clone()).unwrap_or_else(|| "sudo".into());
+    #[cfg(not(test))]
+    let prog = std::path::PathBuf::from("sudo");
+    let mut c = Command::new(prog);
+    if !may_prompt {
+        c.arg("-n").stdin(std::process::Stdio::null());
+    }
+    c
+}
+
+/// [`sudo_may_prompt`] for this run.
+pub(crate) fn ctx_sudo_may_prompt(ctx: &Ctx) -> bool {
+    sudo_may_prompt(ctx.non_interactive, ctx.ui.inherit_stdio(), super::prompt::stdin_is_tty())
+}
+
+/// [`sudo_cmd`] for this run.
+pub(crate) fn ctx_sudo(ctx: &Ctx) -> Command {
+    sudo_cmd(ctx_sudo_may_prompt(ctx))
+}
+
+/// i267: a privileged action a non-interactive run could not take, because
+/// sudo needs a password and this run cannot ask. Loud: one plain line now,
+/// and a hard failure, so the closing block says "did NOT complete" with it
+/// and the run exits 1. An interactive run keeps its warning (the person
+/// at the terminal declined or failed the prompt and saw it).
+pub(crate) fn sudo_refused(ctx: &mut Ctx, what: &str, cmd: &str) {
+    if !ctx.non_interactive {
+        return;
+    }
+    let line = format!("{what}: sudo needs a password and this non-interactive run cannot ask — run: {cmd}");
+    ctx.error(&line);
+    ctx.state.hard_failures.push(line);
+}
+
+/// `sudo -n true`: sudo works here without a prompt (a cloud image's
+/// default user, a CI box, the film's box). What a non-interactive run may
+/// elevate with: hostd's install (i251), the private-key grants (i266).
+pub(crate) fn passwordless_sudo() -> bool {
+    sudo_cmd(false)
+        .arg("true")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 fn hostd_can_run_here(ctx: &mut Ctx) -> bool {
     let interactive = !ctx.non_interactive && ctx.ui.inherit_stdio() && super::prompt::stdin_is_tty();
-    let sudo_quiet = !interactive
-        && Command::new("sudo")
-            .args(["-n", "true"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+    let sudo_quiet = !interactive && passwordless_sudo();
     match hostd_install_decision(interactive, sudo_quiet) {
         HostdInstall::Interactive => true,
         HostdInstall::PasswordlessSudo => {
@@ -5622,7 +5722,7 @@ fn ensure_hostd_worker(ctx: &mut Ctx) {
         ctx.info(&format!("Skipped — later: sudo {HOSTD_BIN} install --mode worker"));
         return;
     }
-    let ok = Command::new("sudo").arg(&bin).args(hostd_install_args("worker", "")).status().map(|s| s.success()).unwrap_or(false);
+    let ok = ctx_sudo(ctx).arg(&bin).args(hostd_install_args("worker", "")).status().map(|s| s.success()).unwrap_or(false);
     if ok {
         ctx.success("noo-hostd (worker mode) installed — the agent's heartbeat will show it within a tick");
     } else {
@@ -7263,12 +7363,8 @@ fn make_tailnet_bind_survive_reboots(ctx: &mut Ctx) {
         return;
     }
     // Non-interactive runs never prompt for a password: `sudo -n` fails fast
-    // instead of hanging a CI or unattended install.
-    let mut cmd = Command::new("sudo");
-    if ctx.non_interactive {
-        cmd.arg("-n");
-    }
-    let ok = cmd
+    // instead of hanging a CI or unattended install (the seam, i267).
+    let ok = ctx_sudo(ctx)
         .args(["sh", "-c", &format!(
             "printf '%s\\n' 'net.ipv4.ip_nonlocal_bind=1' > {NONLOCAL_BIND_DROPIN} && sysctl -p {NONLOCAL_BIND_DROPIN} >/dev/null"
         )])
@@ -8309,5 +8405,98 @@ mod llm_preference_hint_tests {
         for none in ["", "default", "Default", "knowledge", " auto "] {
             assert_eq!(keep_llm_preference_hint(none), None, "{none:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod sudo_seam_tests {
+    use super::{ensure_root_dir, sudo_may_prompt, SUDO_BIN};
+    use crate::onboard::event::{PromptRequest, UiEvent, WizardUi};
+
+    /// `--ci` in a plain terminal: the wizard shares the terminal
+    /// (`inherit_stdio` true), so the old gate (`-n` only when it does not)
+    /// let sudo prompt and the run waited (take 14b, i267).
+    struct TerminalUi;
+    impl WizardUi for TerminalUi {
+        fn emit(&self, _: UiEvent) {}
+        fn prompt(&self, _: &PromptRequest) -> String {
+            String::new()
+        }
+        fn inherit_stdio(&self) -> bool {
+            true
+        }
+    }
+
+    /// Only a person at a terminal the wizard does not own is asked.
+    #[test]
+    fn sudo_prompts_only_for_a_person_at_a_terminal_and_never_in_ci() {
+        for ni in [false, true] {
+            for inherit in [false, true] {
+                for tty in [false, true] {
+                    assert_eq!(sudo_may_prompt(ni, inherit, tty), !ni && inherit && tty, "non_interactive={ni} inherit_stdio={inherit} tty={tty}");
+                }
+            }
+        }
+    }
+
+    /// Every onboard sudo is built by the seam: no raw sudo command and no
+    /// per-site `-n` decision left in this file (the old sites decided on
+    /// the UI, not on `--ci`, which is how 0.6.10–0.6.12-rc.1 prompted).
+    #[test]
+    fn every_onboard_sudo_goes_through_the_seam() {
+        let src = include_str!("steps.rs");
+        let raw = concat!("Command::new(", "\"sudo\")");
+        let elevate = concat!("Command::new(", "elevate)");
+        let ui_gate = concat!("if !ctx.ui.inherit_stdio() {\n", "        cmd.arg(\"-n\")");
+        assert_eq!(src.matches(raw).count(), 0, "a raw sudo command in onboard: build it with sudo_cmd / ctx_sudo");
+        assert_eq!(src.matches(elevate).count(), 0, "the CA trust install elevates through the seam");
+        assert!(!src.contains(ui_gate), "a per-site -n decided on the UI instead of the seam");
+    }
+
+    /// The real data-root step, `--ci`, the wizard sharing a terminal, and a
+    /// fake sudo that BLOCKS (sleeps 30 s) when called without `-n` and
+    /// refuses with "a password is required" when called with it. The step
+    /// must return at once, have called `sudo -n`, and record the refusal as
+    /// a hard failure (the run then exits 1). On the old code this call had
+    /// no `-n` and waited.
+    #[test]
+    fn ci_never_waits_on_a_sudo_prompt_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("noo-i267-sudo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("calls.log");
+        let fake = dir.join("sudo");
+        std::fs::write(
+            &fake,
+            format!(
+                // printf, not echo: `echo "$@"` takes a leading `-n` as its own
+                // flag and drops it from the log (the first batch run read
+                // that as "no -n" and failed).
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n[ \"$1\" = \"-n\" ] || {{ sleep 30; exit 99; }}\necho 'sudo: a password is required' >&2\nexit 1\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        SUDO_BIN.with(|b| *b.borrow_mut() = Some(fake.clone()));
+
+        let g = crate::Globals { json: false, verbose: false, gateway_override: None, timeout_secs: None, token: None, quiet: true };
+        let ui = TerminalUi;
+        let mut ctx = crate::onboard::build_ctx(&g, &ui, true, false, crate::onboard::Skip::default());
+        let started = std::time::Instant::now();
+        // /proc refuses mkdir even for root, so the step falls through to sudo.
+        ensure_root_dir(&mut ctx, std::path::Path::new("/proc/noo-i267-data-root"));
+        let took = started.elapsed();
+        SUDO_BIN.with(|b| *b.borrow_mut() = None);
+
+        assert!(took < std::time::Duration::from_secs(10), "the step waited {took:?}: a sudo without -n under --ci");
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(!calls.is_empty(), "the step never called sudo, so this test proves nothing");
+        assert!(calls.lines().all(|l| l.starts_with("-n ")), "every sudo under --ci carries -n: {calls}");
+        assert_eq!(ctx.state.hard_failures.len(), 1, "{:?}", ctx.state.hard_failures);
+        let f = &ctx.state.hard_failures[0];
+        assert!(f.starts_with("data root: sudo needs a password and this non-interactive run cannot ask — run: sudo install -d"), "{f}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

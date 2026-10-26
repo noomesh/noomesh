@@ -353,6 +353,18 @@ impl KeyReader {
     }
 }
 
+/// The uid the sandbox SERVER (uvicorn, not the code it runs) runs as, and
+/// so the reader of its leaf key. No other service runs as it. Without
+/// userns-remap the kernel counts RLIMIT_NPROC per real uid HOST-WIDE, and
+/// the sandbox's `nproc: 256` is a bound on its own threads only while the
+/// uid is its own: as `nonroot` (65532) it shared the count with redis, the
+/// monitoring set, the voice doors, stunnel and the Python services, and on
+/// a busy controller every thread it tried to start failed (`/health` 500,
+/// `can't start new thread`, 0.6.11). 65590: above 65535, so clear of the
+/// 16-bit ids, `nobody` (65534) and systemd's dynamic users (61184-65519);
+/// below the executor range (`sandbox-exec`, 65600-65663, i161).
+pub const SANDBOX_SERVER_UID: u32 = 65590;
+
 /// Who reads each service leaf's private key inside its container —
 /// the image's `USER`, verified 2026-09-28 by `docker image inspect`
 /// of the mirrored DHI images (`.github/workflows/mirror-images.yml`)
@@ -424,12 +436,13 @@ pub const SERVICE_KEY_READERS: &[(&str, KeyReader)] = &[
     // copy for libpq, so the 0640 group grant is never handed to libpq.
     // Long term this uid belongs in the add-on's own declaration, not here.
     ("evolve", KeyReader::ContainerUid(65532)),
-    // docker/Dockerfile.sandbox ends `USER nonroot`: 65532, measured with
-    // `docker run --rm --entrypoint id` on the published sandbox image.
-    // uvicorn reads the key itself (`--ssl-keyfile`). Mounted under /tls,
-    // which is not in the sandbox's bwrap RO_PATHS, so code run by /exec
-    // never sees it.
-    ("sandbox", KeyReader::ContainerUid(65532)),
+    // The sandbox server's OWN uid (`SANDBOX_SERVER_UID`): Dockerfile.sandbox
+    // declares `sandbox-server` and ends `USER sandbox-server`, and compose's
+    // setpriv launcher drops uvicorn to it. uvicorn reads the key itself
+    // (`--ssl-keyfile`). Mounted under /tls, which is not in the sandbox's
+    // bwrap RO_PATHS, so code run by /exec never sees it. Through 0.6.11 it
+    // was `nonroot` (65532), shared with every DHI-family service.
+    ("sandbox", KeyReader::ContainerUid(SANDBOX_SERVER_UID)),
     // The voice add-on's doors: docker/Dockerfile.whisper and
     // Dockerfile.piper end `USER nonroot` (uid/gid 65532, i105; through
     // v0.6.4 they had no USER line and ran as root). uvicorn reads the key
@@ -1038,6 +1051,13 @@ fn group_read_beyond(path: &Path, uid: u32) -> bool {
     access_of(path).map(|acc| beyond_reader(&extra_readers(&acc), uid)).unwrap_or(false)
 }
 
+/// Does the file carry a named `user:<id>` or `group:<id>` ACL entry?
+fn has_named_acl_entries(path: &Path) -> bool {
+    access_of(path)
+        .and_then(|a| a.acl)
+        .is_some_and(|t| t.lines().any(|l| (l.starts_with("user:") && !l.starts_with("user::")) || (l.starts_with("group:") && !l.starts_with("group::"))))
+}
+
 fn sudo_grant_line(path: &Path, uid: u32) -> String {
     format!("sudo chgrp {uid} {p} && sudo chmod 640 {p}", p = path.display())
 }
@@ -1046,29 +1066,104 @@ fn sudo_grant_line(path: &Path, uid: u32) -> String {
 /// group when the caller may `chgrp` (root, or a member of that gid),
 /// else a POSIX ACL entry on an owner-only file. `Ok` says which. `Err`
 /// is the exact `sudo` line; the file is left as it was.
+///
+/// A grant REPLACES whatever named ACL entries the key had: a reader that
+/// moved to another uid (the sandbox server, 65532 → 65590 in 0.6.12) must
+/// not keep its old `user:<old>:r--` beside the new one, or the old uid
+/// still reads the key and every later pass re-grants and stays exposed.
 pub fn grant_read_to_uid(path: &Path, uid: u32) -> Result<&'static str, String> {
     use std::os::unix::fs::MetadataExt as _;
     let before = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if before.gid() == uid || std::os::unix::fs::chown(path, None, Some(uid)).is_ok() {
-        return if set_mode(path, 0o640) { Ok("group") } else { Err(sudo_grant_line(path, uid)) };
+        // `setfacl -b` drops every named entry (a no-op on a file without
+        // one); the chmod after it sets the plain group bits.
+        if has_named_acl_entries(path) {
+            let _ = std::process::Command::new("setfacl").arg("-b").arg(path).output();
+        }
+        return if set_mode(path, 0o640) && readable_by_uid(path, uid) == Some(true) && !group_read_beyond(path, uid) {
+            Ok("group")
+        } else {
+            Err(sudo_grant_line(path, uid))
+        };
     }
     // Owner-only first so the owning group does not ride along under
-    // the ACL mask; setfacl then recomputes the mask from the entry.
+    // the ACL mask; `--set` then writes the WHOLE ACL — owner rw, group and
+    // other nothing, the reader r — so no earlier named entry survives, and
+    // setfacl recomputes the mask from it.
     let prior = before.permissions().mode() & 0o777;
     if !set_mode(path, 0o600) {
         return Err(sudo_grant_line(path, uid));
     }
     let ok = std::process::Command::new("setfacl")
-        .args(["-m", &format!("u:{uid}:r")])
+        .arg(format!("--set=u::rw-,g::---,o::---,u:{uid}:r--"))
         .arg(path)
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    if ok && readable_by_uid(path, uid) == Some(true) {
+    if ok && readable_by_uid(path, uid) == Some(true) && !group_read_beyond(path, uid) {
         return Ok("acl");
     }
     let _ = set_mode(path, prior);
     Err(sudo_grant_line(path, uid))
+}
+
+/// Hand `path` to `uid` through sudo: the `chgrp`/`chmod` this process could
+/// not make itself (not root, not in that gid, no `setfacl` on the host).
+/// `noninteractive` runs `sudo -n` with no stdin (a `--ci` run has no
+/// terminal for a prompt); otherwise sudo may ask. `Ok` only when the reader
+/// can read the file afterwards and nothing beyond it can; `Err` is the
+/// line the operator must run.
+pub fn grant_read_to_uid_via_sudo(path: &Path, uid: u32, noninteractive: bool) -> Result<(), String> {
+    let run = |args: &[&str]| -> bool {
+        let mut c = std::process::Command::new("sudo");
+        if noninteractive {
+            c.arg("-n").stdin(std::process::Stdio::null());
+        }
+        c.args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|st| st.success())
+            .unwrap_or(false)
+    };
+    let p = path.to_string_lossy().into_owned();
+    let gid = uid.to_string();
+    if run(&["chgrp", &gid, &p]) && run(&["chmod", "640", &p]) && readable_by_uid(path, uid) == Some(true) && !group_read_beyond(path, uid) {
+        Ok(())
+    } else {
+        Err(sudo_grant_line(path, uid))
+    }
+}
+
+/// What onboard does with the keys it could not hand to their container
+/// uid (i266). None outstanding: nothing. Otherwise the grant through sudo
+/// when sudo is usable (passwordless for `--ci`; a prompt interactively),
+/// else LOUD: until the printed lines run, every local account can read
+/// those private keys, and the run must not report success. Pure, so the
+/// three answers are pinned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyGrantPlan {
+    Nothing,
+    Sudo,
+    Loud,
+}
+
+pub fn key_grant_plan(outstanding: usize, sudo_usable: bool) -> KeyGrantPlan {
+    if outstanding == 0 {
+        KeyGrantPlan::Nothing
+    } else if sudo_usable {
+        KeyGrantPlan::Sudo
+    } else {
+        KeyGrantPlan::Loud
+    }
+}
+
+/// The one sentence a run ends with when private keys stay exposed: what,
+/// how many, who can read them, and the command that prints each fix.
+pub fn exposed_keys_failure(n: usize) -> String {
+    format!(
+        "pki: {n} private key(s) are readable by every local account on this host until the printed `sudo chgrp … && sudo chmod 640 …` lines run (noo security pki fix-modes prints them again)"
+    )
 }
 
 fn set_mode(path: &Path, mode: u32) -> bool {
@@ -2857,8 +2952,8 @@ mod key_mode_tests {
         for controller_name in ["gateway", "noo-controller", "Pop-Host", "pop.ts.net"] {
             assert!(!dns.contains(&controller_name.to_string()), "the sandbox claims {controller_name}: {dns:?}");
         }
-        assert_eq!(ca.key_reader(&key), KeyReader::ContainerUid(65532));
-        assert_eq!(readable_by_uid(&key, 65532), Some(true), "noo-sandbox (nonroot) can start");
+        assert_eq!(ca.key_reader(&key), KeyReader::ContainerUid(65590));
+        assert_eq!(readable_by_uid(&key, 65590), Some(true), "noo-sandbox (sandbox-server) can start");
     }
 
     /// The voice doors (mTLS doors phase 2): each its own SERVICE leaf,
@@ -2911,7 +3006,7 @@ mod key_mode_tests {
         assert_eq!(r("services/grafana/service.key"), KeyReader::ContainerUid(65532), "compose user: 65532 (i64)");
         assert_eq!(r("services/nats/service.key"), KeyReader::ContainerRoot);
         assert_eq!(r("services/loki/service.key"), KeyReader::ContainerUid(65532));
-        assert_eq!(r("services/sandbox/service.key"), KeyReader::ContainerUid(65532), "Dockerfile.sandbox USER nonroot");
+        assert_eq!(r("services/sandbox/service.key"), KeyReader::ContainerUid(65590), "Dockerfile.sandbox USER sandbox-server");
         assert_eq!(r("services/whisper/service.key"), KeyReader::ContainerUid(65532), "Dockerfile.whisper USER nonroot (i105)");
         assert_eq!(r("services/piper/service.key"), KeyReader::ContainerUid(65532), "Dockerfile.piper USER nonroot (i105)");
         assert_eq!(
@@ -3093,7 +3188,7 @@ mod key_mode_tests {
         assert!(!ca.audit_key_modes().iter().any(|i| i.rel == "nodes/host3/node.key"), "clean after the fix");
 
         let (again, dirs_again) = ca.fix_key_modes();
-        assert!(again.iter().all(|f| !f.changed() || f.reader == KeyReader::ContainerUid(65532)), "second pass is a no-op: {again:?}");
+        assert!(again.iter().all(|f| !f.changed() || matches!(f.reader, KeyReader::ContainerUid(_))), "second pass is a no-op: {again:?}");
         assert!(dirs_again.is_empty(), "{dirs_again:?}");
     }
 
@@ -3135,6 +3230,78 @@ mod key_mode_tests {
             }
             other => panic!("granted-and-unreadable or ungranted-and-readable: {other:?}"),
         }
+    }
+
+    /// i266: a fresh `--ci` install on a box with no `setfacl` and no gid
+    /// membership left 32 keys 0644 (fail open) and only PRINTED the sudo
+    /// lines, with passwordless sudo available. Outstanding grants go
+    /// through sudo when sudo is usable; without it the run is loud and
+    /// fails, never a quiet success.
+    #[test]
+    fn outstanding_key_grants_use_sudo_or_fail_loudly() {
+        assert_eq!(key_grant_plan(0, false), KeyGrantPlan::Nothing);
+        assert_eq!(key_grant_plan(0, true), KeyGrantPlan::Nothing);
+        assert_eq!(key_grant_plan(32, true), KeyGrantPlan::Sudo, "--ci with passwordless sudo: the grant, not a printout");
+        assert_eq!(key_grant_plan(32, false), KeyGrantPlan::Loud);
+        let text = exposed_keys_failure(32);
+        assert!(text.starts_with("pki: 32 private key(s) are readable by every local account"), "{text}");
+        assert!(text.contains("noo security pki fix-modes"), "{text}");
+        // the sudo path verifies, never assumes: a key nobody can chgrp is an Err with the line
+        let ca = ClusterCa::new(scratch());
+        ca.generate_ca("t", 3650).unwrap();
+        let (_, loki_key) = ca.issue_service_cert("loki", &[], &[], 90).unwrap();
+        if readable_by_uid(&loki_key, 65532) == Some(true) && mode_of(&loki_key) == 0o644 {
+            // this process could not hand it over (no root, no setfacl): the sudo path with
+            // no prompt either succeeds for real or returns the exact line
+            match grant_read_to_uid_via_sudo(&loki_key, 65532, true) {
+                Ok(()) => assert_eq!(mode_of(&loki_key), 0o640),
+                Err(line) => assert_eq!(line, format!("sudo chgrp 65532 {p} && sudo chmod 640 {p}", p = loki_key.display())),
+            }
+        }
+    }
+
+    /// 0.6.12 moved the sandbox server off `nonroot` (65532) to its own uid
+    /// (`SANDBOX_SERVER_UID`). An upgraded install's sandbox key still
+    /// carries the OLD hand-over, `user:65532:r--` (what `setfacl -m` left on
+    /// pop-os). The fix pass the upgrade runs must hand it to the new uid
+    /// AND take it from the old one: an added entry beside the stale one
+    /// leaves 65532 (redis, loki, the voice doors…) able to read the
+    /// sandbox's key, audited as exposed on every pass forever.
+    #[test]
+    fn a_moved_reader_is_regranted_and_the_old_uid_loses_the_key() {
+        assert_eq!(SANDBOX_SERVER_UID, 65590);
+        assert_eq!(
+            SERVICE_KEY_READERS.iter().find(|(n, _)| *n == "sandbox").map(|(_, r)| *r),
+            Some(KeyReader::ContainerUid(SANDBOX_SERVER_UID))
+        );
+        let ca = ClusterCa::new(scratch());
+        ca.generate_ca("t", 3650).unwrap();
+        let (_, key) = ca.issue_service_cert("sandbox", &[], &[], 90).unwrap();
+        let root = unsafe { libc::geteuid() } == 0;
+        let setfacl = |args: &[&str]| {
+            std::process::Command::new("setfacl").args(args).arg(&key).output().map(|o| o.status.success()).unwrap_or(false)
+        };
+        // Plant the 0.6.11 hand-over: owner-only plus a named entry for 65532.
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if root || !setfacl(&["-b"]) || !setfacl(&["-m", "u:65532:r"]) {
+            return; // no ACL tooling here (or root, which takes the chgrp route): the planted state cannot exist
+        }
+        assert_eq!(readable_by_uid(&key, 65532), Some(true), "the plant took");
+        assert_eq!(readable_by_uid(&key, 65590), Some(false));
+        let issue = ca.audit_key_modes().into_iter().find(|i| i.rel == "services/sandbox/service.key").expect("audited");
+        assert!(matches!(issue.kind, KeyIssueKind::Exposed), "the old uid reads it: {issue:?}");
+
+        let (fixes, _) = ca.fix_key_modes();
+        let f = fixes.iter().find(|f| f.rel == "services/sandbox/service.key").unwrap();
+        assert!(f.needs.is_none(), "{f:?}");
+        assert_eq!(f.granted_via, "acl");
+        assert_eq!(readable_by_uid(&key, 65590), Some(true), "the new server uid can start");
+        assert_eq!(readable_by_uid(&key, 65532), Some(false), "the old uid lost the key");
+        assert_eq!(mode_of(&key) & 0o004, 0, "never world-readable");
+        assert!(!ca.audit_key_modes().iter().any(|i| i.rel == f.rel), "clean after one pass");
+        let (again, _) = ca.fix_key_modes();
+        let f2 = again.iter().find(|f| f.rel == "services/sandbox/service.key").unwrap();
+        assert!(!f2.changed(), "the second pass leaves it alone: {f2:?}");
     }
 
     /// Re-issuing in place (what `rotate-all` does) keeps the tightened
