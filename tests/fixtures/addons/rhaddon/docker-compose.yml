@@ -3,7 +3,9 @@
 # arrived (healthy only when every file is there, readable by its own uid
 # and nothing else), and one service that asks for a GPU, which the
 # launcher must hold. Used by tests/test_addon_resources_launcher.py and the
-# 0.6.13 rehearsal; resources.json and system.json sit beside it.
+# 0.6.13 rehearsal; resources.json, system.json and routes.json (its route
+# manifest, which the launcher hands to the gateway: the overlay touches no
+# core service) sit beside it.
 x-noo-addon:
   addon: rhaddon
   consumer: svc:rhaddon

@@ -11,12 +11,27 @@
 //! ## The manifest ships with the add-on
 //!
 //! Add-ons are pieces that extend the core at runtime; the core carries none
-//! of their route names. An HTTP add-on ships its manifest in its own image,
-//! and its compose overlay delivers it READ-ONLY at
-//! `<ROUTES_DIR>/<addon>/routes.json` (a one-shot service from the add-on's
-//! image fills a volume the gateway mounts; a dev overlay bind-mounts the
-//! source file). The runtime registry ([`crate::addon_registry`]) reads it
-//! ONCE, when the router is built at startup, for every add-on the operator
+//! of their route names. An HTTP add-on ships its manifest as `routes.json`
+//! in its SIGNED BUNDLE, and core hands it to the gateway exactly like the
+//! bundle's `system.json` and `workloads.json`: on every `noo stack start |
+//! restart` the launcher (`scripts/lib-dist.sh` `addon_decls_materialise`)
+//! copies it, only for an add-on switched on whose lock it verified this
+//! start and only when that lock lists the file (dist; dev takes the file
+//! beside the add-on's overlay), to `<install root>/.noo-addon-routes/
+//! <addon>/routes.json`, which the gateway mounts read-only at
+//! [`BUNDLE_ROUTES_DIR`]. An add-on's overlay touches no core service for
+//! this: a third-party overlay may not extend the gateway or mount a core
+//! volume at all (`noo-cli/src/addons/guards.rs`).
+//!
+//! The older path stays for the add-ons the stack ships: their own overlay
+//! delivers the manifest READ-ONLY at `<ROUTES_DIR>/<addon>/routes.json` (a
+//! one-shot service from the add-on's image fills a volume the gateway
+//! mounts). The two cannot disagree: [`read_manifest_in`] reads the
+//! bundle-delivered file FIRST and looks under [`ROUTES_DIR`] only when there
+//! is none, so a file core wrote always wins for the same add-on.
+//!
+//! The runtime registry ([`crate::addon_registry`]) reads the manifest ONCE,
+//! when the router is built at startup, for every add-on the operator
 //! switched on (`addons.<name>: true`) whose launcher-verified lock lists
 //! this stack: a third-party add-on needs no row in `addons.rs`. A file is
 //! used, not a fetch from the add-on, so nothing at boot depends on the
@@ -154,7 +169,14 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
-/// Where the add-on overlays deliver manifests: `<ROUTES_DIR>/<addon>/routes.json`.
+/// Where the launcher delivers the `routes.json` of an add-on's signed
+/// bundle: `<BUNDLE_ROUTES_DIR>/<addon>/routes.json`, the read-only mount of
+/// `<install root>/.noo-addon-routes` (docker-compose.cluster.yml). Read
+/// before [`ROUTES_DIR`].
+pub const BUNDLE_ROUTES_DIR: &str = "/opt/noo/addon-bundle-routes";
+/// Where a shipped add-on's own overlay delivers its manifest (the older
+/// path): `<ROUTES_DIR>/<addon>/routes.json`. Read only when the launcher
+/// delivered none under [`BUNDLE_ROUTES_DIR`].
 pub const ROUTES_DIR: &str = "/opt/noo/addon-routes";
 /// The file name inside an add-on's directory.
 pub const ROUTES_FILE: &str = "routes.json";
@@ -859,15 +881,14 @@ pub struct Loaded {
     pub refused: BTreeMap<String, String>,
 }
 
-fn missing_reason(addon: &str, path: &FsPath) -> String {
+fn missing_reason(addon: &str, looked: &str) -> String {
     let c = container_of(addon);
     format!(
-        "add-on {addon:?} is enabled but its route manifest is missing ({}). The {addon} image \
-         ships it and its overlay delivers it read-only; an {addon} image from before manifests \
-         shipped with the add-on has none. Run the gateway and {c} from the same release \
-         (`noo stack start` composes the add-on's overlay and refreshes the manifest), or switch \
-         the add-on off with `noo addons disable {addon}`",
-        path.display()
+        "add-on {addon:?} is enabled but its route manifest is missing ({looked}). The {addon} \
+         bundle or image ships it and the launcher or its overlay delivers it read-only; an {addon} \
+         release from before manifests shipped with the add-on has none. Run the gateway and {c} \
+         from the same release (`noo stack start` hands the gateway the manifest again), or switch \
+         the add-on off with `noo addons disable {addon}`"
     )
 }
 
@@ -882,31 +903,47 @@ fn missing_reason(addon: &str, path: &FsPath) -> String {
 /// `addon` must already be a plain name ([`crate::addon_registry::name_ok`]);
 /// it is joined into a path.
 pub fn read_manifest(dir: &FsPath, addon: &str, required: bool) -> Result<Option<AddonManifest>, String> {
+    read_manifest_in(&[dir], addon, required)
+}
+
+/// [`read_manifest`] over several delivery directories, in order: the FIRST
+/// one that holds `<dir>/<addon>/routes.json` is read and the rest are not
+/// looked at, so an invalid file there refuses the add-on rather than
+/// falling through to another copy. The registry passes
+/// `[BUNDLE_ROUTES_DIR, ROUTES_DIR]`: the file core copied from the signed
+/// bundle wins over one an overlay delivered for the same add-on.
+pub fn read_manifest_in(dirs: &[&FsPath], addon: &str, required: bool) -> Result<Option<AddonManifest>, String> {
     if !crate::addon_registry::name_ok(addon) {
         return Err(format!(
             "add-on name {addon:?} is not valid ({}); its route manifest was not read",
             crate::addon_registry::NAME_RULE
         ));
     }
-    let path = dir.join(addon).join(ROUTES_FILE);
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return if required { Err(missing_reason(addon, &path)) } else { Ok(None) };
-        }
-        Err(e) => return Err(format!("add-on {addon:?}: cannot read its route manifest {}: {e}", path.display())),
-    };
-    serde_json::from_str::<AddonManifest>(&raw)
-        .map_err(|e| format!("not a valid manifest: {e}"))
-        .and_then(|m| validate(&m, addon).map(|()| m))
-        .map(Some)
-        .map_err(|why| {
-            format!(
-                "add-on {addon:?}: route manifest {} refused: {why}. None of its routes are \
-                 mounted; fix the manifest in the add-on's image",
-                path.display()
-            )
-        })
+    let paths: Vec<std::path::PathBuf> = dirs.iter().map(|d| d.join(addon).join(ROUTES_FILE)).collect();
+    for path in &paths {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("add-on {addon:?}: cannot read its route manifest {}: {e}", path.display())),
+        };
+        return serde_json::from_str::<AddonManifest>(&raw)
+            .map_err(|e| format!("not a valid manifest: {e}"))
+            .and_then(|m| validate(&m, addon).map(|()| m))
+            .map(Some)
+            .map_err(|why| {
+                format!(
+                    "add-on {addon:?}: route manifest {} refused: {why}. None of its routes are \
+                     mounted; fix the manifest the add-on ships",
+                    path.display()
+                )
+            });
+    }
+    if required {
+        let looked: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+        Err(missing_reason(addon, &looked.join(" or ")))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Read and validate the manifest of every compiled HTTP add-on whose switch
@@ -1932,6 +1969,31 @@ pub(crate) mod tests {
         plant(&dir, "evolve", &sample_json().to_string());
         assert_eq!(read_manifest(&dir, "evolve", true).unwrap().unwrap().addon, "evolve");
         assert!(read_manifest(&dir, "../evolve", false).unwrap_err().contains("not valid"));
+    }
+
+    /// The launcher's copy from the signed bundle wins over an overlay's for
+    /// the same add-on, an invalid one there is NOT skipped for the other,
+    /// and the older path still serves an add-on the launcher delivered
+    /// nothing for. Reverting `read_manifest_in` to one directory fails it.
+    #[test]
+    fn the_bundle_delivered_manifest_is_read_first_and_wins() {
+        let bundle = scratch("order-bundle");
+        let legacy = scratch("order-legacy");
+        let mut from_overlay = sample_json();
+        from_overlay["routes"][0]["path"] = json!("/api/from-overlay");
+        plant(&legacy, "evolve", &from_overlay.to_string());
+        let dirs = [bundle.as_path(), legacy.as_path()];
+        let m = read_manifest_in(&dirs, "evolve", true).unwrap().expect("the older path still serves it");
+        assert_eq!(m.routes[0].path, "/api/from-overlay");
+        plant(&bundle, "evolve", &sample_json().to_string());
+        let m = read_manifest_in(&dirs, "evolve", true).unwrap().expect("read");
+        assert_eq!(m.routes[0].path, sample_json()["routes"][0]["path"].as_str().unwrap(), "the bundle's copy wins");
+        assert_ne!(m.routes[0].path, "/api/from-overlay");
+        plant(&bundle, "evolve", "{\"version\": 1}");
+        let e = read_manifest_in(&dirs, "evolve", true).unwrap_err();
+        assert!(e.contains(&bundle.display().to_string()), "an invalid bundle copy refuses, naming it: {e}");
+        let e = read_manifest_in(&[scratch("order-none").as_path(), legacy.join("x").as_path()], "evolve", true).unwrap_err();
+        assert!(e.contains("missing") && e.contains(" or "), "both places are named: {e}");
     }
 
     // ── validation ───────────────────────────────────────────────────────

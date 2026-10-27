@@ -3,7 +3,9 @@
 
 //! An add-on bundle's declarations beyond its overlay: `system.json` (its
 //! database system) and `workloads.json` (its managed workloads), i163 E/B,
-//! and `resources.json` (its runtime inputs, `super::resources`, i239 s10).
+//! `routes.json` (its HTTP route manifest, handed to the gateway the same way
+//! since 0.6.13) and `resources.json` (its runtime inputs, `super::resources`,
+//! i239 s10).
 //!
 //! Both are ordinary bundle files: listed by name and sha256 in the signed
 //! `noo-addon-lock/2` bundle, so the bundle signature covers them. This
@@ -34,12 +36,14 @@ use serde_json::Value;
 
 pub const SYSTEM_FILE: &str = "system.json";
 pub const WORKLOADS_FILE: &str = "workloads.json";
-/// A route manifest a bundle may carry beside them (the image delivers the
-/// one the gateway mounts; when the bundle has one, drain routes are checked
-/// against it here too).
+/// A route manifest a bundle may carry beside them. When the signed lock
+/// lists it, the launcher hands it to the gateway like the other two
+/// (`<install root>/.noo-addon-routes/<addon>/routes.json`, which the gateway
+/// reads before any copy an overlay delivers); the gateway validates it.
+/// When the bundle has one, drain routes are checked against it here too.
 pub const ROUTES_FILE: &str = "routes.json";
 /// The declaration files the launcher copies for the gateway.
-pub const DECL_FILES: &[&str] = &[SYSTEM_FILE, WORKLOADS_FILE];
+pub const DECL_FILES: &[&str] = &[SYSTEM_FILE, WORKLOADS_FILE, ROUTES_FILE];
 
 pub const MAX_FILE_BYTES: usize = 64 * 1024;
 pub const MAX_WORKLOADS: usize = 16;

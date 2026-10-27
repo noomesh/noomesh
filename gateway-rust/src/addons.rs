@@ -36,7 +36,8 @@ pub struct Addon {
     /// feature. Empty for open add-ons.
     pub unlicensed_msg: &'static str,
     /// An HTTP add-on whose route manifest is REQUIRED: when the switch is
-    /// on and `addon_proxy::ROUTES_DIR/<name>/routes.json` is missing or
+    /// on and no `<name>/routes.json` was delivered (neither under
+    /// `addon_proxy::BUNDLE_ROUTES_DIR` nor `addon_proxy::ROUTES_DIR`) or it is
     /// invalid, the add-on's routes are refused, loudly (the diagnostic for
     /// an add-on image from before manifests shipped). `false` for NATS
     /// add-ons: nothing is required.
