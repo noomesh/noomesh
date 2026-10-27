@@ -4320,9 +4320,7 @@ mod cluster_trust_tests {
     /// Render the REAL template the way provision does for a node reporting
     /// `app_version`, and return the env that would be bundled.
     fn bundled_env(darwin: bool, app_version: &str) -> Option<String> {
-        let Some(path) = crate::test_support::repo_file_or_skip("node-agent-go/deploy/noo-node-agent.env.tmpl") else {
-            return None;
-        };
+        let path = crate::test_support::repo_file_or_skip("node-agent-go/deploy/noo-node-agent.env.tmpl")?;
         let tmpl = std::fs::read_to_string(&path).unwrap();
         let body = render_env_template(&tmpl, &super::tests::full_vars()).unwrap();
         Some(if applier_knows_cluster_trust_keys(darwin, app_version) {
