@@ -685,7 +685,7 @@ mod tests {
         let why = r.why("rhaddon");
         assert!(matches!(r, Refusal::Decl(_)) && why.contains("rhaddon") && why.contains("NOO_JWT_SECRET"), "{why}");
         assert!(docker.pulls.is_empty(), "nothing is pulled for a refused bundle: {:?}", docker.pulls);
-        assert!(crate::addons::pins::read(&root).unwrap().get("rhaddon").is_none(), "nothing is pinned");
+        assert!(!crate::addons::pins::read(&root).unwrap().contains_key("rhaddon"), "nothing is pinned");
         // 2. A third-party add-on named like a core service.
         let mut l = third_party_lock(&["v0.6.0"]);
         l.addon = "grafana".into();
