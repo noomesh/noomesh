@@ -7,6 +7,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sync/atomic"
 	"testing"
 
@@ -253,6 +254,28 @@ func TestChatPlacementOfPicksTheRunningChatEngine(t *testing.T) {
 	r.recordChatPlacement(nil)
 	if _, _, ok := r.ChatPlacement(); ok {
 		t.Error("cleared")
+	}
+}
+
+// Every running chat placement, not only the first: the controller's
+// harness fit takes the smallest window across them (i285).
+func TestChatModelsListsEveryRunningChatPlacement(t *testing.T) {
+	all := []placement{
+		{Backend: "vllm", Model: "org/gemma-4-12B", DesiredState: "running"},
+		{Backend: "reranker", Model: "bge.gguf", DesiredState: "running"},
+		{Backend: "ollama", Model: "harrier", Role: "embed", DesiredState: "running"},
+		{Backend: "llamacpp", Model: "small.gguf", Role: "chat", DesiredState: "running"},
+		{Backend: "ollama", Model: "old", DesiredState: "stopped"},
+	}
+	r := &Reconciler{}
+	r.recordChatPlacement(all)
+	want := []ChatModel{{"vllm", "org/gemma-4-12B"}, {"llamacpp", "small.gguf"}}
+	if got := r.ChatModels(); !reflect.DeepEqual(got, want) {
+		t.Errorf("ChatModels = %+v, want %+v", got, want)
+	}
+	r.recordChatPlacement(nil)
+	if got := r.ChatModels(); len(got) != 0 {
+		t.Errorf("cleared: %+v", got)
 	}
 }
 

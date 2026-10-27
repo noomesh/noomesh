@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync/atomic"
 	"testing"
 
@@ -36,6 +37,24 @@ func hfSnapshot(t *testing.T, hf, repo, rev, config string) {
 	}
 }
 
+// ceilingServer is a Server whose running chat placements are `targets`,
+// each {backend, model} served by srv under the model's name.
+func ceilingServer(srv *httptest.Server, targets ...[2]string) *Server {
+	s := &Server{}
+	s.ceilingTargets = func(context.Context) []benchTarget {
+		var out []benchTarget
+		for _, t := range targets {
+			out = append(out, benchTarget{
+				backend: t[0], model: t[1], served: t[1],
+				url:    srv.URL + "/" + t[0] + "/v1/chat/completions",
+				client: &http.Client{Transport: s.inferenceTransport("http", benchBudget)},
+			})
+		}
+		return out
+	}
+	return s
+}
+
 func TestChatModelStatsReadsVLLMsConfigOnce(t *testing.T) {
 	hf := t.TempDir()
 	hfSnapshot(t, hf, "org/gemma-4-12B", "abc123", `{"text_config":{"max_position_embeddings":262144}}`)
@@ -46,7 +65,7 @@ func TestChatModelStatsReadsVLLMsConfigOnce(t *testing.T) {
 		_, _ = w.Write([]byte(`{"data":[{"id":"m","root":"org/gemma-4-12B","max_model_len":16384}]}`))
 	}))
 	defer srv.Close()
-	s := windowServer("vllm", srv)
+	s := ceilingServer(srv, [2]string{"vllm", "m"})
 	s.hfCacheDir = func() string { return hf }
 	want := []modelstats.ModelStat{{Name: "m", Loaded: true, ContextLength: 262144}}
 	for i := 0; i < 3; i++ {
@@ -79,22 +98,55 @@ func TestChatModelStatsVLLMPathUnderTheMount(t *testing.T) {
 	}
 }
 
-func TestChatModelStatsLlamaServerAndUnknowns(t *testing.T) {
+func TestChatModelStatsReportsEveryChatPlacement(t *testing.T) {
+	hf := t.TempDir()
+	hfSnapshot(t, hf, "org/big", "r1", `{"max_position_embeddings":131072}`)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"data":[{"id":"m","meta":{"n_ctx_train":131072,"size":4200000000}}]}`))
+		switch r.URL.Path {
+		case "/vllm/v1/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"org/big","root":"org/big"}]}`))
+		case "/llamacpp/v1/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"small.gguf","meta":{"n_ctx_train":32768,"size":4200000000}}]}`))
+		default:
+			http.NotFound(w, r)
+		}
 	}))
 	defer srv.Close()
-	got := windowServer("llamacpp", srv).ChatModelStats(context.Background())
-	if want := (modelstats.ModelStat{Name: "m", Loaded: true, ContextLength: 131072, SizeBytes: 4200000000}); len(got) != 1 || got[0] != want {
-		t.Errorf("llama-server: %+v, want %+v", got, want)
+	// vLLM and llama-server side by side, and an ollama chat placement that
+	// reports through /api/show instead.
+	s := ceilingServer(srv, [2]string{"vllm", "org/big"}, [2]string{"llamacpp", "small.gguf"}, [2]string{"ollama", "gemma4:12b"})
+	s.hfCacheDir = func() string { return hf }
+	want := []modelstats.ModelStat{
+		{Name: "org/big", Loaded: true, ContextLength: 131072},
+		{Name: "small.gguf", Loaded: true, ContextLength: 32768, SizeBytes: 4200000000},
 	}
-	if got := windowServer("ollama", srv).ChatModelStats(context.Background()); got != nil {
-		t.Errorf("ollama reports through /api/show, not here: %+v", got)
+	if got := s.ChatModelStats(context.Background()); !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v\nwant %+v", got, want)
 	}
-	// vLLM with the repo missing from the cache: unknown, and asked again.
-	s := windowServer("vllm", srv)
+	if len(s.ceilings) != 2 {
+		t.Errorf("remembered %d, want 2", len(s.ceilings))
+	}
+	// The vLLM placement is removed: its ceiling is forgotten.
+	s2 := ceilingServer(srv, [2]string{"llamacpp", "small.gguf"})
+	s.ceilingTargets = s2.ceilingTargets
+	if got := s.ChatModelStats(context.Background()); len(got) != 1 || len(s.ceilings) != 1 {
+		t.Errorf("after the vLLM placement left: %+v, remembered %d", got, len(s.ceilings))
+	}
+}
+
+func TestChatModelStatsUnknowns(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"m"}]}`))
+	}))
+	defer srv.Close()
+	// vLLM with the repo missing from the cache, llama-server without meta:
+	// unknown, nothing remembered, asked again next beat.
+	s := ceilingServer(srv, [2]string{"vllm", "m"}, [2]string{"llamacpp", "m"})
 	s.hfCacheDir = t.TempDir
-	if got := s.ChatModelStats(context.Background()); got != nil {
-		t.Errorf("model not in the cache: %+v", got)
+	if got := s.ChatModelStats(context.Background()); got != nil || len(s.ceilings) != 0 {
+		t.Errorf("unknown ceilings: %+v, remembered %d", got, len(s.ceilings))
+	}
+	if got := (&Server{}).ChatModelStats(context.Background()); got != nil {
+		t.Errorf("no chat placements: %+v", got)
 	}
 }

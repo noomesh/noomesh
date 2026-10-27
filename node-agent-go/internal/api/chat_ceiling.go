@@ -15,38 +15,61 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/preseed"
 )
 
-// ChatModelStats is the heartbeat's `model_stats` entry for the model a vLLM
-// or llama-server chat backend serves, carrying the model's own context
-// ceiling, so the controller caps a harness window by the weights rather
-// than a table in core (noomesh-internal i285). An ollama's models report
-// theirs through /api/show (modelstats.Ceilings). Nil for any other backend
-// and while the ceiling is not known. Once found it is remembered for the
-// backend, model and served name, so the backend is asked once per model.
+// ChatModelStats is the heartbeat's `model_stats` entries for the models
+// the node's vLLM and llama-server chat placements serve, each with the
+// model's own context ceiling, so the controller caps a harness window by
+// the weights rather than a table in core (noomesh-internal i285). Every
+// running chat placement is read: the controller's fit takes the smallest
+// window across all of them. An ollama's models report theirs through
+// /api/show (modelstats.Ceilings). A ceiling once found is remembered for
+// the backend, model and served name, so each backend is asked once per
+// model; one not found yet is left out and asked again next beat.
 func (s *Server) ChatModelStats(ctx context.Context) []modelstats.ModelStat {
 	ctx, cancel := context.WithTimeout(ctx, chatWindowTimeout)
 	defer cancel()
-	resolve := s.resolveBenchTarget
-	if s.windowResolve != nil {
-		resolve = s.windowResolve
+	s.ceilingMu.Lock()
+	defer s.ceilingMu.Unlock()
+	known := map[string]modelstats.ModelStat{}
+	var out []modelstats.ModelStat
+	for _, t := range s.chatTargets(ctx) {
+		if t.backend != "vllm" && t.backend != "llamacpp" {
+			continue
+		}
+		key := t.backend + "\x00" + t.model + "\x00" + t.served
+		st, ok := s.ceilings[key]
+		if !ok {
+			if st = s.chatCeiling(ctx, t); st.ContextLength == 0 {
+				continue
+			}
+		}
+		known[key] = st
+		out = append(out, st)
 	}
-	t, err := resolve(ctx)
-	if err != nil || (t.backend != "vllm" && t.backend != "llamacpp") {
+	// Only the placements running now are remembered.
+	s.ceilings = known
+	return out
+}
+
+// chatTargets dials every running chat placement whose backend is up.
+func (s *Server) chatTargets(ctx context.Context) []benchTarget {
+	if s.ceilingTargets != nil {
+		return s.ceilingTargets(ctx)
+	}
+	if s.chatPlacements == nil {
 		return nil
 	}
-	key := t.backend + "\x00" + t.model + "\x00" + t.served
-	s.ceilingMu.Lock()
-	st, known := s.ceilingStat, s.ceilingKey == key
-	s.ceilingMu.Unlock()
-	if !known {
-		st = s.chatCeiling(ctx, t)
-		if st.ContextLength == 0 {
-			return nil
-		}
-		s.ceilingMu.Lock()
-		s.ceilingKey, s.ceilingStat = key, st
-		s.ceilingMu.Unlock()
+	cps := s.chatPlacements()
+	if len(cps) == 0 {
+		return nil
 	}
-	return []modelstats.ModelStat{st}
+	running, native := s.runningAndNative(ctx)
+	var out []benchTarget
+	for _, cp := range cps {
+		if t, err := s.chatTarget(ctx, cp, running, native); err == nil {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // chatCeiling reads the served model's ceiling. vLLM: max_position_embeddings
