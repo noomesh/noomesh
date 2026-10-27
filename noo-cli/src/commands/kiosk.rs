@@ -1586,7 +1586,7 @@ pub fn kiosk_invite(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
     println!();
     println!("{}", ui::section("on the display (paste in order; the auth key is shown once)"));
-    println!("  sudo tailscale up --auth-key={auth_key} --force-reauth");
+    println!("  sudo tailscale up --auth-key={auth_key} --force-reauth --ssh=false");
     match &url {
         Some(u) => println!("  noo kiosk setup --url {u} --view health"),
         None => println!("  noo kiosk setup --url https://<controller>.<tailnet>.ts.net --view health"),

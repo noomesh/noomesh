@@ -146,4 +146,12 @@
 		// `tag:controller:443` or `:8080` above can reach them already, with a
 		// service key on every request. Nothing to open.
 	],
+
+	// Tailscale SSH: no rules, so Tailscale refuses every Tailscale SSH
+	// connection even on a device that runs it. noomesh never uses it
+	// (`noo enroll` joins nodes with `--ssh=false`). This is NOT ordinary
+	// sshd: an admin's own SSH to port 22 rides the `autogroup:admin` acl
+	// above and is unaffected. Stated empty on purpose, so turning Tailscale
+	// SSH on is a visible edit here, not a missing section.
+	"ssh": [],
 }
