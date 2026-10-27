@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright 2026 PersonifAI LLC
+
 //! Test-only access to files that live OUTSIDE this crate.
 //!
 //! A source-reading guard compares this crate to a file in another language
