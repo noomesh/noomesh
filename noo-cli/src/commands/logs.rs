@@ -11,7 +11,22 @@
 use super::{term_width, truncate, urlencode};
 use crate::http::{get_json, post_json};
 use crate::ui::{self, Col};
+use crate::args::{ArgError, Args};
 use crate::{Globals, Unhandled};
+
+/// Set `body[key]` to the flag's value when it was given.
+fn put_str(body: &mut serde_json::Value, key: &str, v: Option<String>) {
+    if let Some(v) = v {
+        body[key] = v.into();
+    }
+}
+
+/// Set `body[key]` to the flag's number when it was given.
+fn put_num(body: &mut serde_json::Value, key: &str, v: Option<u64>) {
+    if let Some(v) = v {
+        body[key] = v.into();
+    }
+}
 
 /// The muted last line of every review verb: which backend answered.
 /// A node-agent scan is a partial view and must never read as the fleet
@@ -30,7 +45,7 @@ fn backend_footer(resp: &serde_json::Value) -> String {
 
 /// Parsed `noo logs errors` flags → the request body.
 #[derive(Debug, Default, PartialEq)]
-struct ErrorsArgs {
+pub(crate) struct ErrorsArgs {
     body: serde_json::Value,
 }
 
@@ -132,7 +147,7 @@ fn civil_from_days(z: i64) -> String {
 
 /// Parsed `noo logs tail` surface.
 #[derive(Debug, Default, PartialEq)]
-struct TailArgs {
+pub(crate) struct TailArgs {
     container: Option<String>,
     body: serde_json::Value,
 }
@@ -217,7 +232,7 @@ pub fn logs_tail(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
 /// Parsed `noo logs search` surface.
 #[derive(Debug, Default, PartialEq)]
-struct SearchArgs {
+pub(crate) struct SearchArgs {
     body: serde_json::Value,
 }
 
