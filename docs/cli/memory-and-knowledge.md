@@ -297,12 +297,12 @@ see [add-ons.md](../getting-started/add-ons.md).
 ### `noo rag` — PageIndex RAG commands
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo rag query` | `<question> [-s <strategy>] [-p <persona-id>]` | Ask the PageIndex RAG a question and print answer, verification and citations |
+| `noo rag query` | `<question> [-s\|--strategy <strategy>] [-p\|--persona <persona-id>]` | Ask the PageIndex RAG a question and print answer, verification and citations |
 | `noo rag status` | — | Show PageIndex RAG table counts and embedder state |
 | `noo rag docs` | `[--untagged] [--audience <role>] [--match <glob>] [--title <text>] [--limit <n>]` | List every document with audience, source and who ingested it; filterable |
 | `noo rag doc` | `<id>` | Show one document: audience, provenance, audience history and a text preview |
 | `noo rag ingest` | `<path>... [-t <title>] [-r] [--audience <role>[,<role>]]` | Ingest text files or a folder; audience defaults to you, share with team:<name> or company |
-| `noo rag scan` | `[-s folders\|drives\|all]` | Run one synchronous ingest scan of watched folders and/or drives |
+| `noo rag scan` | `[-s\|--source folders\|drives\|all]` | Run one synchronous ingest scan of watched folders and/or drives |
 | `noo rag deduplicate` | `[--dry-run] [-y]` | Delete duplicate (doc_id, page_no) pages, keeping the newest; confirms first |
 | `noo rag retag` | `(--match <glob> \| --doc-id <id>) --role <r>[,<r>] [--relabel] [--apply] [--limit <n>]` | Change which audience documents belong to; dry-run unless --apply |
 | `noo rag hold` | `(--title-prefix <p> \| --doc <id>...) [--reason <r>] [--apply]` | Keep documents but take them out of embedding and search; dry-run unless --apply |

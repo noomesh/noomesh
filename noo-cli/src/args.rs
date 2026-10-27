@@ -143,6 +143,16 @@ impl Args {
         }
     }
 
+    /// At most one positional (`what` names it in the error).
+    pub fn maybe_one(&mut self, what: &str) -> Result<Option<String>, ArgError> {
+        let mut p = self.positionals()?;
+        match p.len() {
+            0 => Ok(None),
+            1 => Ok(Some(p.remove(0))),
+            _ => Err(ArgError::new(format!("unexpected argument `{}` after {what}", p[1]))),
+        }
+    }
+
     /// Nothing may be left.
     pub fn finish(&mut self) -> Result<(), ArgError> {
         let p = self.positionals()?;
@@ -208,6 +218,14 @@ mod tests {
     }
 
     #[test]
+    fn maybe_one_wants_zero_or_one() {
+        assert_eq!(Args::new(&[]).maybe_one("<q>").unwrap(), None);
+        assert_eq!(Args::new(&s(&["a"])).maybe_one("<q>").unwrap().as_deref(), Some("a"));
+        assert!(Args::new(&s(&["a", "b"])).maybe_one("<q>").is_err());
+        assert!(Args::new(&s(&["--x"])).maybe_one("<q>").is_err());
+    }
+
+    #[test]
     fn an_arg_error_reaches_usage_error_through_unhandled() {
         fn f() -> Result<(), crate::Unhandled> {
             Err::<(), _>(ArgError::new("--node needs a value"))?;
@@ -237,7 +255,10 @@ mod tests {
     /// converting another verb.
     #[test]
     fn usage_flags_match_what_converted_parsers_ask_for() {
-        use crate::commands::{cluster_gpu, cluster_reserve, cluster_vendor, heartbeat, walks};
+        use crate::commands::{
+            autonomy, cluster_gpu, cluster_reserve, cluster_vendor, heartbeat, jobs, logs, memory, rag, recall, tasks,
+            walks,
+        };
         type Probe = fn(&mut Args);
         fn row<'a>(w: &'a [&'a str], p: Probe) -> (&'a [&'a str], Probe) {
             (w, p)
@@ -249,6 +270,32 @@ mod tests {
             row(&["cluster", "gpu", "hold"], |a| { let _ = cluster_gpu::parse_gpu_hold_with(a); }),
             row(&["cluster", "gpu", "release"], |a| { let _ = cluster_gpu::parse_gpu_release_with(a); }),
             row(&["cluster", "vendor", "stage"], |a| { let _ = cluster_vendor::parse_stage_with(a); }),
+            row(&["jobs", "list"], |a| { let _ = jobs::parse_list_with(a); }),
+            row(&["jobs", "run"], |a| { let _ = jobs::parse_run_with(a, 300); }),
+            row(&["jobs", "submit"], |a| { let _ = jobs::parse_submit_with(a); }),
+            row(&["jobs", "history"], |a| { let _ = jobs::parse_history_with(a); }),
+            row(&["tasks", "create"], |a| { let _ = tasks::parse_create_with(a); }),
+            row(&["tasks", "list"], |a| { let _ = tasks::parse_list_with(a); }),
+            row(&["tasks", "stop"], |a| { let _ = tasks::parse_stop_via_with(a); }),
+            row(&["tasks", "resubmit"], |a| { let _ = tasks::parse_resubmit_with(a); }),
+            row(&["rag", "query"], |a| { let _ = rag::parse_query_with(a); }),
+            row(&["rag", "docs"], |a| { let _ = rag::DocsArgs::parse_with(a); }),
+            row(&["rag", "scan"], |a| { let _ = rag::parse_scan_with(a); }),
+            row(&["memory", "search"], |a| { let _ = memory::parse_search_with(a); }),
+            row(&["memory", "conversations"], |a| { let _ = memory::parse_conversations_with(a); }),
+            row(&["memory", "tool-stats"], |a| { let _ = memory::parse_tool_stats_with(a); }),
+            row(&["logs", "errors"], |a| { let _ = logs::parse_errors_with(a); }),
+            row(&["logs", "tail"], |a| { let _ = logs::parse_tail_with(a); }),
+            row(&["logs", "search"], |a| { let _ = logs::parse_search_with(a); }),
+            row(&["logs", "containers"], |a| { let _ = logs::parse_containers_with(a); }),
+            row(&["logs", "query"], |a| { let _ = logs::parse_query_with(a); }),
+            row(&["autonomy", "audit"], |a| { let _ = autonomy::parse_audit_with(a); }),
+            row(&["autonomy", "decisions"], |a| { let _ = autonomy::parse_decisions_with(a); }),
+            row(&["walks", "settings"], |a| { let _ = walks::parse_settings_with(a); }),
+            row(&["walks", "stats"], |a| { let _ = walks::parse_stats_with(a); }),
+            row(&["walks", "view"], |a| { let _ = walks::parse_view_with(a); }),
+            row(&["recall", "search"], |a| { let _ = recall::parse_search_with(a); }),
+            row(&["recall", "prominent"], |a| { let _ = recall::parse_prominent_with(a); }),
         ];
         let mut bad = Vec::new();
         for (words, probe) in table {
