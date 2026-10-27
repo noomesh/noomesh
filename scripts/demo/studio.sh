@@ -5,7 +5,7 @@
 # The film studio: shoot the onboarding film in a throwaway "stranger" box.
 #
 #   scripts/demo/studio.sh up                  # make the box (Ubuntu 24.04 + its own Docker)
-#   scripts/demo/studio.sh record [--smoke] [--speed N]   # film it; GIF + MP4 land in demo-out/
+#   scripts/demo/studio.sh record [--smoke] [--speed N] [--down-after]   # film it; GIF + MP4 land in demo-out/; --down-after removes the box when done
 #   scripts/demo/studio.sh shell               # look around inside the box
 #   scripts/demo/studio.sh status
 #   scripts/demo/studio.sh down                # delete the box and its Docker volume
@@ -45,15 +45,22 @@
 #   NOO_STUDIO_CPUS         box CPU cap                          (default 4)
 #   NOO_STUDIO_REC_MEM      recorder memory cap                  (default 6g)
 #   NOO_STUDIO_VHS_IMAGE    recorder image   (default ghcr.io/charmbracelet/vhs:latest)
-#   NOO_STUDIO_BASE_IMAGE   box base image                       (default ubuntu:24.04)
+#   NOO_STUDIO_BASE_IMAGE   box base image (systemd + Docker go on top) (default ubuntu:24.04)
 #   NOO_STUDIO_CACHE_IMAGE  pull-through cache image             (default registry:3)
-#   NOO_DEMO_INSTALL_URL, NOO_DEMO_MASK_NAMES   passed through to the recorder
+#   NOO_DEMO_INSTALL_URL, NOO_DEMO_MASK_NAMES, NOO_DEMO_CLI_VERSION,
+#   NOO_DEMO_KEEP_ON_LEAK, NOO_DEMO_GIF_FPS/WIDTH/RANGE   passed through to the recorder
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BOX=noo-demo-box
 REC=noo-demo-recorder
 VOL=noo-demo-docker
+# containerd's own root: with Docker as a systemd unit, dockerd uses the
+# containerd.io service (not an embedded one under /var/lib/docker), and its
+# snapshots cannot live on the box's overlay rootfs (overlay on overlay: every
+# container create failed with "failed to mount /tmp/containerd-mount…",
+# take 8). A second volume, removed with the first.
+CONTAINERD_VOL=noo-demo-containerd
 MEM="${NOO_STUDIO_MEM:-10g}"
 CPUS="${NOO_STUDIO_CPUS:-4}"
 BASE_IMAGE="${NOO_STUDIO_BASE_IMAGE:-ubuntu:24.04}"
@@ -120,6 +127,52 @@ pull_anon() {
 }
 ensure_image() { docker image inspect "$1" >/dev/null 2>&1 || pull_anon "$1"; }
 
+# The box image: the base plus systemd as init, Docker from Docker's apt
+# repository, and the film's user. Built once on this host (cached by Docker's
+# build cache; `docker rmi` it to rebuild) so a new box boots in seconds. The
+# film starts from "Docker is installed"; it never shows this.
+BOX_IMAGE="noo-demo-box:base"
+build_box_image() {
+  docker build -q -t "$BOX_IMAGE" --build-arg "BASE=$BASE_IMAGE" -f - "$ROOT/scripts/demo" >/dev/null <<'DOCKERFILE' || die "could not build $BOX_IMAGE"
+ARG BASE=ubuntu:24.04
+FROM ${BASE}
+ENV DEBIAN_FRONTEND=noninteractive container=docker
+RUN apt-get update -qq \
+ && apt-get install -y -qq systemd systemd-sysv dbus ca-certificates curl gnupg perl sudo iproute2 >/dev/null \
+ && install -m 0755 -d /etc/apt/keyrings \
+ && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
+ && chmod a+r /etc/apt/keyrings/docker.asc \
+ && . /etc/os-release \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list \
+ && apt-get update -qq \
+ && apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin >/dev/null \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd -m -s /bin/bash you && usermod -aG docker you \
+ && echo 'you ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/you && chmod 440 /etc/sudoers.d/you \
+ && systemctl enable docker >/dev/null 2>&1 \
+ && systemctl mask getty@tty1.service tmp.mount >/dev/null 2>&1 \
+ && mkdir -p /var/lib/systemd/linger && touch /var/lib/systemd/linger/you
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
+DOCKERFILE
+}
+
+# box_wait_booted: systemd reports the box up and docker.service answers.
+box_wait_booted() {
+  local i
+  for i in $(seq 1 90); do
+    if docker exec "$BOX" systemctl is-system-running >/dev/null 2>&1 || [ "$(docker exec "$BOX" systemctl is-system-running 2>/dev/null)" = degraded ]; then
+      # logind lingers `you` (touched at build): the user manager must be up so
+      # `systemctl --user` works for the film's shell, as after a real login.
+      docker exec "$BOX" docker info >/dev/null 2>&1 \
+        && docker exec "$BOX" systemctl is-active "user@$(docker exec "$BOX" id -u you)" >/dev/null 2>&1 && return 0
+    fi
+    sleep 2
+  done
+  docker exec "$BOX" systemctl --failed --no-pager 2>&1 | head -20 >&2
+  return 1
+}
+
 cmd_up() {
   need_docker
   box_exists && die "$BOX already exists; '$0 down' first for a clean one"
@@ -128,7 +181,9 @@ cmd_up() {
   avail="$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo)"
   [ "$avail" -ge "$want" ] || die "only ${avail} MiB free and the box is capped at ${want} MiB; free memory or lower NOO_STUDIO_MEM (this machine may be serving inference)"
   ensure_image "$BASE_IMAGE"
+  build_box_image
   docker volume create "$VOL" >/dev/null
+  docker volume create "$CONTAINERD_VOL" >/dev/null
   # With the cache up, the box is born on the cache's network with ghcr.io
   # pointing at it; the CA is installed once Docker is in. Without it, the
   # box is exactly a stranger's machine on the default network.
@@ -138,46 +193,20 @@ cmd_up() {
     [ -n "$cache_ip" ] || die "the cache runs but has no address on network $CACHE_NET; '$0 cache down' and 'cache up'"
     via_cache=(--network "$CACHE_NET" --add-host "ghcr.io:$cache_ip")
   fi
+  # systemd is PID 1 (see build_box_image): /run and /run/lock are tmpfs as on
+  # a booted machine, the cgroup namespace is the box's own, and the stop
+  # signal is systemd's. /tmp stays on the rootfs: tmp.mount is masked in the
+  # image, because a tmpfs systemd mounts inside the box is invisible to
+  # `docker cp`, which the recorder uses to collect the logs from /tmp/demo. dockerd is then docker.service, not a hand-started
+  # daemon, and the host node agent and noo-hostd the film installs run as
+  # units, as they do on a real Ubuntu box.
   docker run -d --name "$BOX" --hostname node-1 --label noo-demo-box=1 \
     --privileged --cgroupns=private --memory "$MEM" --cpus "$CPUS" \
+    --tmpfs /run --tmpfs /run/lock -e container=docker \
     "${via_cache[@]}" \
-    -v "$VOL":/var/lib/docker "$BASE_IMAGE" sleep infinity >/dev/null
-  echo "box created; installing Docker inside it (a few minutes) ..."
-  # Provision as root. Docker's official apt repository; the film starts from "Docker is installed".
-  docker exec -i -u root "$BOX" bash -s <<'PROVISION' || { echo "provisioning failed; the box is left for inspection ('$0 down' removes it)" >&2; exit 1; }
-set -euo pipefail
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq ca-certificates curl gnupg perl sudo iproute2 >/dev/null
-install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-chmod a+r /etc/apt/keyrings/docker.asc
-. /etc/os-release
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list
-apt-get update -qq
-apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin >/dev/null
-# the user the film runs as: generic name, ordinary sudo, in the docker group
-id you >/dev/null 2>&1 || useradd -m -s /bin/bash you
-usermod -aG docker you
-echo 'you ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/you
-chmod 440 /etc/sudoers.d/you
-# Docker-in-Docker needs the container's cgroup tree split before dockerd starts.
-cat > /usr/local/bin/start-dockerd <<'EOS'
-#!/usr/bin/env bash
-set -euo pipefail
-if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
-  mkdir -p /sys/fs/cgroup/init
-  xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null || true
-  sed -e 's/ / +/g' -e 's/^/+/' < /sys/fs/cgroup/cgroup.controllers > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
-fi
-nohup dockerd > /var/log/dockerd.log 2>&1 &
-for _ in $(seq 1 60); do docker info >/dev/null 2>&1 && exit 0; sleep 1; done
-echo "dockerd did not come up; see /var/log/dockerd.log" >&2
-exit 1
-EOS
-chmod 755 /usr/local/bin/start-dockerd
-/usr/local/bin/start-dockerd
-PROVISION
+    -v "$VOL":/var/lib/docker -v "$CONTAINERD_VOL":/var/lib/containerd "$BOX_IMAGE" >/dev/null
+  echo "box created; booting systemd and Docker inside it ..."
+  box_wait_booted || { echo "the box did not boot; it is left for inspection ('$0 down' removes it)" >&2; exit 1; }
   if [ -n "$cache_ip" ]; then
     # Trust the cache's CA for ghcr.io: the system store (anything in the box
     # that fetches from ghcr.io over TLS) and Docker's per-registry store.
@@ -191,17 +220,28 @@ PROVISION
   # prove the stranger's view before declaring it ready
   docker exec -u you "$BOX" sh -c 'docker info >/dev/null 2>&1 || sg docker -c "docker info >/dev/null"' \
     || die "the box's own Docker does not answer for user 'you'"
-  echo "box ready: host $(docker exec "$BOX" hostname), user you, own Docker engine ($(docker exec "$BOX" docker --version))"
+  echo "box ready: host $(docker exec "$BOX" hostname), user you, systemd $(docker exec "$BOX" systemctl is-system-running 2>/dev/null || echo '?'), own Docker engine ($(docker exec "$BOX" docker --version))"
   [ -z "$cache_ip" ] || echo "ghcr.io in the box is the cache ($CACHE at $cache_ip); the first pull of each image fills it"
   echo "next: $0 record --smoke   (then, once the release is public: $0 record)"
 }
 
 cmd_record() {
   need_docker
+  # --down-after: the box comes down when the recorder exits, pass or fail
+  # (the outputs are on the host in demo-out/, never in the box). For a take
+  # on a shared host: take 12 left its box up for 35 hours because the
+  # session that started it went idle. The cache container stays (it is
+  # small and not a dind); `cache down` is its own call.
+  local down_after=0 args=()
+  local a
+  for a in "$@"; do
+    case "$a" in --down-after) down_after=1 ;; *) args+=("$a") ;; esac
+  done
+  set -- "${args[@]}"
   box_exists || die "no box; run '$0 up' first"
   box_is_ours || die "container $BOX is not a film box (no label noo-demo-box=1); refusing to use it"
   box_running || die "the box is stopped; '$0 down' and '$0 up' for a fresh one"
-  docker exec -u root "$BOX" sh -c 'docker info >/dev/null 2>&1' || docker exec -u root "$BOX" /usr/local/bin/start-dockerd
+  docker exec -u root "$BOX" sh -c 'docker info >/dev/null 2>&1' || docker exec -u root "$BOX" systemctl start docker
   ensure_image "$VHS_IMAGE"
   docker rm -f "$REC" >/dev/null 2>&1 || true
   mkdir -p "$ROOT/demo-out"
@@ -209,7 +249,7 @@ cmd_record() {
   # `docker exec` into the box); that socket is root on this host, and this
   # container is ours and short-lived. The host's docker CLI is mounted in.
   local passenv=() v
-  for v in NOO_DEMO_INSTALL_URL NOO_DEMO_MASK_NAMES; do
+  for v in NOO_DEMO_INSTALL_URL NOO_DEMO_MASK_NAMES NOO_DEMO_CLI_VERSION NOO_DEMO_KEEP_ON_LEAK NOO_DEMO_GIF_FPS NOO_DEMO_GIF_WIDTH NOO_DEMO_GIF_RANGE; do
     [ -z "${!v:-}" ] || passenv+=(-e "$v=${!v}")
   done
   # The recorder is capped: vhs's render is the memory peak of a take, and an
@@ -225,6 +265,12 @@ cmd_record() {
       scripts/demo/record-onboarding.sh "$@"; rc=$?
       chown -R "'"$(id -u):$(id -g)"'" demo-out 2>/dev/null || true
       exit $rc' _ "$@"
+  local rc=$?
+  if [ "$down_after" -eq 1 ]; then
+    echo "record --down-after: taking the box down (recorder exit $rc)"
+    cmd_down
+  fi
+  return "$rc"
 }
 
 cmd_down() {
@@ -236,6 +282,7 @@ cmd_down() {
     echo "removed $BOX"
   fi
   if docker volume inspect "$VOL" >/dev/null 2>&1; then docker volume rm "$VOL" >/dev/null && echo "removed volume $VOL"; fi
+  if docker volume inspect "$CONTAINERD_VOL" >/dev/null 2>&1; then docker volume rm "$CONTAINERD_VOL" >/dev/null && echo "removed volume $CONTAINERD_VOL"; fi
   echo "studio is down"
 }
 

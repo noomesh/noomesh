@@ -60,9 +60,11 @@
 #![allow(clippy::collapsible_match)]
 
 mod auth;
+mod authz;
 mod birth_proof;
 mod bus;
 mod bus_principal;
+mod harness_fit;
 mod harness_kinds;
 mod harness_profile;
 mod harness;
@@ -126,6 +128,7 @@ mod addon_registry;
 mod google_drive;
 mod agent_activities;
 mod agent_meta_loop;
+mod audit;
 mod audit_partition;
 mod agent_mail_archive;
 mod audit_integrity;
@@ -189,6 +192,7 @@ mod memory;
 mod mesh;
 mod metrics;
 mod middleware;
+mod model_capabilities;
 mod node_tier;
 mod operator_alert;
 mod posture;
@@ -213,6 +217,7 @@ mod usage;
 mod verify;
 mod websocket;
 mod worker_client;
+mod trellion_client;
 mod worker_delegation;
 mod ws_agent;
 mod ws_collab;

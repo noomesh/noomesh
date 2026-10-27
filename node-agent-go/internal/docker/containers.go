@@ -175,7 +175,7 @@ func ValidateContainerStartRequest(req *ContainerStartRequest) error {
 // StartManagedContainer creates and starts a generic PAI container from a
 // controller-supplied spec, replacing any existing container with the same
 // name. It returns the published host ports once the container is running.
-func (c *Client) StartManagedContainer(req ContainerStartRequest) (*ContainerStartResult, error) {
+func (c *Client) StartManagedContainer(ctx context.Context, req ContainerStartRequest) (*ContainerStartResult, error) {
 	// Re-validate at the door of the function that creates the container.
 	// The handler already did this; this path must not depend on that,
 	// because the day a second caller appears the checks would be gone.
@@ -183,7 +183,7 @@ func (c *Client) StartManagedContainer(req ContainerStartRequest) (*ContainerSta
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
 	// The image, over the artifact rail (image_source.go).
@@ -340,12 +340,12 @@ func managedRunUser() string {
 }
 
 // StopManagedContainer stops and removes a PAI container by name.
-func (c *Client) StopManagedContainer(name string) error {
+func (c *Client) StopManagedContainer(ctx context.Context, name string) error {
 	if err := ValidateManagedContainerName(name); err != nil {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 
 	timeout := 10
@@ -364,11 +364,11 @@ func (c *Client) StopManagedContainer(name string) error {
 // first published port is bound to. Only containers this agent started
 // through StartManagedContainer (label noo.generic=true) qualify, so the
 // proxy route cannot be pointed at a backend or any other container.
-func (c *Client) ProxyTarget(name string) (string, error) {
+func (c *Client) ProxyTarget(ctx context.Context, name string) (string, error) {
 	if err := ValidateManagedContainerName(name); err != nil {
 		return "", err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	ins, err := c.docker.ContainerInspect(ctx, name, client.ContainerInspectOptions{})
 	if err != nil {

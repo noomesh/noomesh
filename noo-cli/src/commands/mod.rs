@@ -3,7 +3,7 @@
 
 //! Native command handlers, one file per command group. Each handler:
 //! parse its own args (returning `Err(Unhandled)` on anything unrecognized
-//! so the Python CLI serves it), fetch, then `--json` prints the raw gateway
+//! which is a usage error, exit 2), fetch, then `--json` prints the raw gateway
 //! JSON, otherwise a compact human rendering. Data to stdout, diagnostics to
 //! stderr, exit code per the contract in output.rs.
 
@@ -16,6 +16,7 @@ pub mod channel;
 pub mod addon_enable;
 pub mod addon_provision;
 pub mod addon_pins;
+pub mod addon_resources;
 pub mod backups;
 pub mod agents;
 pub mod approval;
@@ -434,6 +435,7 @@ pub use entitlement_signer::*;
 pub use release_sign::*;
 pub use addon_lock_cmd::{security_addon_lock_sign, security_addon_lock_verify};
 pub use addon_pins::{addons_launch_pins, addons_upgrade, addons_verify};
+pub use addon_resources::{addons_launch_resources, addons_rotate_secret};
 pub use addons::{addons_disable, addons_enable, addons_list, addons_set, addons_show, addons_trust_key, addons_untrust_key};
 pub use backups::{backups_setup, backups_status};
 pub use kiosk::*;

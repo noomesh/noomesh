@@ -70,7 +70,7 @@ the gateway refuses JWTs rather than accepting the well-known default. The
 Public, no credential: `/auth/*`, `/api/auth/*`, `/assets/*`,
 `/.well-known/*`, `/`, `/dashboard`, `/kiosk`, `/kiosk.html`,
 `/favicon.ico`, `/docs`, and the enrollment endpoints a node
-uses before it has credentials: `/bootstrap`, `/bootstrap/prep`, `/apply`,
+uses before it has credentials: `/bootstrap/prep`, `/apply`,
 `/deenroll`, `/fetch`, `/ca.crt`, `/bootstrap/cli/*`, `GET
 /bootstrap/bundle/*`, `/api/cluster/bootstrap` and
 `/api/cluster/enroll-tailnet` (the last two are gated by a
@@ -407,7 +407,9 @@ receives flat JSON events, each with a `type`:
 
 ```json
 {"type": "metadata", "conversation_id": "…", "model": "…", "backend": "…"}
+{"type": "harness_dispatched", "node": "…", "kind": "…"}
 {"type": "thinking", "text": "…"}
+{"type": "working", "text": "…"}
 {"type": "content", "text": "token"}
 {"type": "content_clear"}
 {"type": "tool_call", "name": "web_search", "arguments": {}}
@@ -416,6 +418,13 @@ receives flat JSON events, each with a `type`:
 {"type": "done", "iterations": 3, "tool_calls": 2, "elapsed_seconds": 15.2}
 {"type": "keepalive"}
 ```
+
+`working` comes only from a turn a node harness runs on a vendor kind
+(Copilot, Claude Code, Codex): the model's text as the harness's translator
+relays it, reasoning and planning included, batched about every 300 ms and
+capped at 200 000 characters a turn. It is not the answer, which arrives as
+`content` when the CLI is done; the console shows it in a collapsed
+"Working" block.
 
 ## Cluster and nodes (`routes/cluster.rs`, `routes/bootstrap.rs`)
 
@@ -440,7 +449,7 @@ receives flat JSON events, each with a `type`:
 | GET | `/api/cluster/replication-status` | Postgres replication view |
 | GET, POST | `/api/security/bootstrap-tokens`; POST `…/{id}/revoke` | bootstrap tokens for `noo enroll` |
 | POST | `/api/cluster/bootstrap`, `/api/cluster/enroll-tailnet` | the enrolling node's first calls |
-| GET | `/bootstrap`, `/bootstrap/prep`, `/bootstrap/apply`, `/bootstrap/deenroll`, `/bootstrap/fetch`, `/bootstrap/ca.crt` | the pull rail a node walks during enrollment |
+| GET | `/bootstrap/prep`, `/bootstrap/apply`, `/bootstrap/deenroll`, `/bootstrap/fetch`, `/bootstrap/ca.crt` | the pull rail a node walks during enrollment |
 | POST, GET | `/api/cluster/provision-bundle/{node}`, `…/status`; GET `/bootstrap/bundle/{node}`; POST `/bootstrap/bundle/{node}/applied` | signed provisioning bundles |
 | PUT, GET | `/api/cluster/cli-asset/{name}`, `/bootstrap/cli/{name}` | CLI binaries served to nodes |
 | GET | `/api/artifacts/manifest/{kind}/{name}` | artifact rail manifests (`gguf`, `modelfile`, `image`; `binary` is retired): `{size_bytes, sha256, data_path}`. The sha256 is cached by path, size and mtime; a file not yet hashed is hashed in the background, and a request that would wait more than ~8 s gets `202 {"status":"hashing","retry_after_secs"}` with `Retry-After` — ask again. `noo cluster sync-model-files` warms this before it queues the node jobs |
@@ -828,7 +837,7 @@ agent-message thread.
 | POST | `/api/tasks` | `{objective, model?, loop_budget?, token_budget?}` — creates and starts a task for the caller (`noo tasks create`). `token_budget` caps the prompt + completion tokens its loops may spend; leave it out for no cap of its own. `Idempotency-Key` header: a retry within 24 h returns the same task with `idempotent_replay: true`. Optional `context`. Every task carries `created_via` (`addon:<name>` when an add-on created it through a delegated token, else null); that token sees only its own add-on's tasks for the person |
 | GET | `/api/tasks` | the caller's tasks; operators see everyone's, or one person's with `user=`; `state=`, `limit=` |
 | GET | `/api/tasks/{id}` | state, loops, last note, result, `token_budget`, `tokens_spent`, `remaining` (null = no cap), `budget_state` (`exhausted`, `awaiting_clarification` or null), the owner's `allowance` when one is set, and its children (sub-tasks a loop delegated with `noo_task_delegate`, or the roles a collaboration fanned out) |
-| POST | `/api/tasks/{id}/stop` | stopped at the next checkpoint; the loops' tool calls stand |
+| POST | `/api/tasks/{id}/stop` | `stopped` now; `was` is the state before, and a task that `was` running finishes the loop in flight at its next checkpoint. The loops' tool calls stand |
 | POST | `/api/tasks/stop` | `{via, user?}` — stops the caller's unfinished tasks created via `addon:<name>` (revoking an add-on's background work); `user` is operator-only and not allowed with an add-on's delegated token, which may name only its own `addon:<name>` (`noo tasks stop --via`) |
 | POST | `/api/tasks/{id}/context` | `{text, revision}` — context pushed into a task (`revision` >= 1, text at most 32 KiB), applied at the next loop. `200 {accepted: true, applies: "next_loop"}`; a retry of the same revision `200 {accepted: false, current_revision}`; `409` for a lower revision or a finished task; `413` when too large |
 | GET | `/api/tasks/{id}/events` | `after=<seq>`, `limit=` — `{events, earliest_seq, last_seq}` |

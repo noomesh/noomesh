@@ -245,15 +245,11 @@ pub async fn allowance_use(db: &sqlx::PgPool, username: &str) -> Result<Option<A
     Ok(Some(AllowanceSpend { period, limit, spent }))
 }
 
-/// The accounting UPDATE: one statement, atomic, returning the new total.
-pub const ADD_SPENT_SQL: &str =
-    "UPDATE noo_tasks SET tokens_spent = tokens_spent + $2, updated_at = now() WHERE id = $1 RETURNING tokens_spent";
-
 /// Add one loop's tokens to the task. Returns the new total, or `None` for
 /// an unknown task.
 pub async fn add_spent(db: &sqlx::PgPool, task_id: &str, tokens: i64) -> Result<Option<i64>> {
     let uuid = uuid::Uuid::parse_str(task_id)?;
-    Ok(sqlx::query_scalar::<_, i64>(ADD_SPENT_SQL).bind(uuid).bind(tokens.max(0)).fetch_optional(db).await?)
+    Ok(crate::repo::tasks::add_spent(db, uuid, tokens.max(0)).await?)
 }
 
 /// Account one loop: the usage row (with the task id, awaited so the next
@@ -265,25 +261,14 @@ pub async fn account(db: &sqlx::PgPool, u: &crate::usage::TaskUsage) -> Result<O
 
 async fn load_clarification(db: &sqlx::PgPool, task_id: &str) -> Result<Option<Clarification>> {
     let uuid = uuid::Uuid::parse_str(task_id)?;
-    let v: Option<serde_json::Value> = sqlx::query_scalar("SELECT clarification FROM noo_tasks WHERE id = $1")
-        .bind(uuid)
-        .fetch_optional(db)
-        .await?
-        .flatten();
+    let v: Option<serde_json::Value> = crate::repo::tasks::clarification(db, uuid).await?;
     Ok(v.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 /// Hand an answered clarification over, once.
 async fn take_clarification(db: &sqlx::PgPool, task_id: &str) -> Result<Option<Clarification>> {
     let uuid = uuid::Uuid::parse_str(task_id)?;
-    let v: Option<serde_json::Value> = sqlx::query_scalar(
-        "WITH old AS (SELECT id, clarification FROM noo_tasks WHERE id = $1 FOR UPDATE) \
-         UPDATE noo_tasks t SET clarification = NULL FROM old \
-         WHERE t.id = old.id AND old.clarification ? 'answer' RETURNING old.clarification",
-    )
-    .bind(uuid)
-    .fetch_optional(db)
-    .await?;
+    let v: Option<serde_json::Value> = crate::repo::tasks::take_answered_clarification(db, uuid).await?;
     Ok(v.and_then(|v| serde_json::from_value(v).ok()))
 }
 
@@ -291,17 +276,7 @@ async fn take_clarification(db: &sqlx::PgPool, task_id: &str) -> Result<Option<C
 /// recorded. Only an unparked live task parks.
 async fn park(db: &sqlx::PgPool, task_id: &str, budget_state: &str, note: &str) -> Result<bool> {
     let uuid = uuid::Uuid::parse_str(task_id)?;
-    let n = sqlx::query(
-        "UPDATE noo_tasks SET budget_state = $2, last_note = $3, last_checkpoint = now(), \
-         state = CASE WHEN state IN ('open','running') THEN 'checkpointed' ELSE state END, updated_at = now() \
-         WHERE id = $1 AND state IN ('open','running','checkpointed') AND budget_state IS NULL",
-    )
-    .bind(uuid)
-    .bind(budget_state)
-    .bind(note)
-    .execute(db)
-    .await?
-    .rows_affected();
+    let n = crate::repo::tasks::park(db, uuid, budget_state, note).await?;
     Ok(n > 0)
 }
 
@@ -472,27 +447,15 @@ pub async fn resubmit(state: &std::sync::Arc<AppState>, task: &Task, new_budget:
     let uuid = uuid::Uuid::parse_str(&task.id).map_err(internal)?;
     let started = match plan {
         ResubmitPlan::Adjust => {
-            sqlx::query("UPDATE noo_tasks SET token_budget = $2, updated_at = now() WHERE id = $1")
-                .bind(uuid)
-                .bind(new_budget)
-                .execute(&state.db)
-                .await
-                .map_err(internal)?;
+            crate::repo::tasks::set_token_budget(&state.db, uuid, new_budget).await.map_err(internal)?;
             None
         }
         ResubmitPlan::Resume => {
             // Compare-and-set on the parked state: two resubmits cannot
             // start two runners.
-            let n = sqlx::query(
-                "UPDATE noo_tasks SET token_budget = COALESCE($2, token_budget), budget_state = NULL, updated_at = now() \
-                 WHERE id = $1 AND budget_state = 'exhausted' AND state IN ('open','running','checkpointed')",
-            )
-            .bind(uuid)
-            .bind(new_budget)
-            .execute(&state.db)
-            .await
-            .map_err(internal)?
-            .rows_affected();
+            let n = crate::repo::tasks::resume_exhausted(&state.db, uuid, new_budget)
+                .await
+                .map_err(internal)?;
             if n == 0 {
                 return Err(Refusal::Conflict(format!("task {} changed under the resubmit; read it again", task.id)));
             }
@@ -517,16 +480,7 @@ pub async fn ask(state: &AppState, task: &Task, question: &str) -> Result<(), Re
         return Err(Refusal::Conflict(format!("task {} is already {}", task.id, task.budget_state.as_deref().unwrap_or(""))));
     }
     let uuid = uuid::Uuid::parse_str(&task.id).map_err(internal)?;
-    let n = sqlx::query(
-        "UPDATE noo_tasks SET clarification = jsonb_build_object('question', $2::text), last_note = $2, updated_at = now() \
-         WHERE id = $1 AND budget_state IS NULL AND state IN ('open','running','checkpointed')",
-    )
-    .bind(uuid)
-    .bind(&q)
-    .execute(&state.db)
-    .await
-    .map_err(internal)?
-    .rows_affected();
+    let n = crate::repo::tasks::set_question(&state.db, uuid, &q).await.map_err(internal)?;
     if n == 0 {
         return Err(Refusal::Conflict(format!("task {} changed under the question; read it again", task.id)));
     }
@@ -545,17 +499,7 @@ pub async fn answer(state: &std::sync::Arc<AppState>, task: &Task, text: &str) -
         return Err(Refusal::Conflict(format!("task {} is not waiting for an answer", task.id)));
     }
     let uuid = uuid::Uuid::parse_str(&task.id).map_err(internal)?;
-    let n = sqlx::query(
-        "UPDATE noo_tasks SET budget_state = NULL, \
-         clarification = jsonb_build_object('question', COALESCE(clarification->>'question', last_note, ''), 'answer', $2::text), \
-         updated_at = now() WHERE id = $1 AND budget_state = 'awaiting_clarification'",
-    )
-    .bind(uuid)
-    .bind(&a)
-    .execute(&state.db)
-    .await
-    .map_err(internal)?
-    .rows_affected();
+    let n = crate::repo::tasks::set_answer(&state.db, uuid, &a).await.map_err(internal)?;
     if n == 0 {
         return Err(Refusal::Conflict(format!("task {} is not waiting for an answer", task.id)));
     }
@@ -619,8 +563,8 @@ mod tests {
     /// The accounting UPDATE is one atomic statement that adds and returns.
     #[test]
     fn accounting_adds_atomically_and_returns_the_total() {
-        assert!(ADD_SPENT_SQL.contains("tokens_spent = tokens_spent + $2"));
-        assert!(ADD_SPENT_SQL.contains("RETURNING tokens_spent"));
+        assert!(crate::repo::tasks::ADD_SPENT_SQL.contains("tokens_spent = tokens_spent + $2"));
+        assert!(crate::repo::tasks::ADD_SPENT_SQL.contains("RETURNING tokens_spent"));
         assert_eq!(loop_tokens(120, 30), 150);
         assert_eq!(loop_tokens(0, 0), 0);
         assert_eq!(loop_tokens(u64::MAX, 1), i64::MAX);

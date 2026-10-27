@@ -43,9 +43,8 @@ POSTURE_KEYS = (
     # was retired: the gateway refuses the inference surface to a shared
     # secret outright. A stale row is a retired inert key: the gateway deletes
     # it at a closed value and warns while it is set on.)
-    # The v1 (replayable) cluster token bridge: open when unset, "0" refuses
-    # it. Mirrors posture.rs; the parity test pins them together.
-    "NOO_CLUSTER_TOKEN_V1",
+    # (NOO_CLUSTER_TOKEN_V1, the v1 cluster-token bridge, was deleted: v1 is
+    # always refused. A stored row is a retired inert key, like the one above.)
     # Retired bridges (NOO_CLUSTER_LEGACY_FULL_ACCESS,
     # NOO_BOOTSTRAP_ACCEPT_UNSIGNED_FETCH, NOO_BUS_PRINCIPAL, and the retired
     # approval gate NOO_APPROVAL_BREAK_GLASS) are not here:

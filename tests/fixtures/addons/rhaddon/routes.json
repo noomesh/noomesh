@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "addon": "rhaddon",
+  "base_url_env": "NOO_RHADDON_URL",
+  "base_url_default": "https://noo-rhaddon:8090",
+  "routes": [
+    {"name": "status", "method": "GET", "path": "/api/rhaddon/status", "min_role": "operator"},
+    {"name": "drain", "method": "POST", "path": "/drain", "internal": true}
+  ]
+}

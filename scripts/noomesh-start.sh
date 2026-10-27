@@ -252,10 +252,9 @@ if [ "$DIST" = true ]; then
     NEWEST_STACK="$(git tag -l 'stack-v*' 2>/dev/null | sort -V | tail -1)"
     NEWEST_STACK="${NEWEST_STACK#stack-}"
     if [ -n "$EXPLICIT_TAG" ] && [ -f "noomesh.yaml" ]; then
-        if grep -qE '^[[:space:]]*NOO_IMAGE_TAG:' noomesh.yaml; then
-            CUR_PIN="$(grep -E '^[[:space:]]*NOO_IMAGE_TAG:' noomesh.yaml | head -1 | awk '{print $2}')"
+        if CUR_PIN="$(config_compose_env_get noomesh.yaml NOO_IMAGE_TAG)"; then
             if [ "$CUR_PIN" != "$DIST_TAG" ]; then
-                config_sed_in_place noomesh.yaml "s|^([[:space:]]*NOO_IMAGE_TAG:).*|\1 ${DIST_TAG}|"
+                config_compose_env_set noomesh.yaml NOO_IMAGE_TAG "${DIST_TAG}"
                 ui_kv "Promoted" "noomesh.yaml NOO_IMAGE_TAG ${CUR_PIN:-unset} → ${DIST_TAG}"
             fi
         fi
@@ -376,8 +375,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 if [ -f "$PROJECT_ROOT/pyproject.toml" ]; then
     # [trellion]: noo-trellion is an extra since an earlier change (it is
-    # not in the gateway image any more). The host venv backs `noo-py`, which
-    # still needs the memory subsystem for authoring and debug commands.
+    # not in the gateway image any more). The host venv is the editable
+    # install the Python tests and tooling use (there is no Python CLI).
     pip install -q -e "$PROJECT_ROOT[trellion]" 2>/dev/null || true
 fi
 
@@ -500,6 +499,11 @@ else
     # A dev start: composed add-on overlays run the dev build's names.
     DIST_MODE=0 require_addon_pins || exit 1
 fi
+# Their declared runtime inputs (resources.json): written to tmpfs, handed
+# to the uid each bundle declares, exported; an add-on whose input cannot be
+# produced is refused by name, and GPU/Docker-socket services are held
+# (lib-dist.sh). Before the declarations, so a refused add-on declares nothing.
+addon_resources_materialise || exit 1
 # What the verified add-ons' signed bundles declare beyond their overlays
 # (system.json, workloads.json) goes to the gateway's read-only directories,
 # for exactly the add-ons the verdict above names (lib-dist.sh).
@@ -903,6 +907,9 @@ require_compose_v2 || exit 1
     if printf '%s\n' "$ACTIVE_SVCS" | grep -qx node-agent; then
         AGENT_SCALE="--scale node-agent=0"
     fi
+    # An add-on service that asks for a GPU, the Docker socket or privileged
+    # mode is never started (lib-dist.sh addon_resources_materialise).
+    ACTIVE_SVCS="$(addon_drop_held "$ACTIVE_SVCS")"
 
     # fu 46 phase 3: refuse the start BEFORE compose moves anything when a
     # foreign process/instance owns this instance's host ports — otherwise
@@ -942,7 +949,7 @@ require_compose_v2 || exit 1
     # An unkillable leftover container (lib-stuck-container.sh) must not
     # abort the whole `up`: everything else is started and the launcher
     # exits $NOO_EXIT_STACK_PARTIAL (75) after the guard below has run.
-    noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d --force-recreate $BUILD_FLAG $GPU_SCALE $AGENT_SCALE || _up_rc=$?
+    noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d --force-recreate $BUILD_FLAG $GPU_SCALE $AGENT_SCALE $ADDON_HOLD_SCALE || _up_rc=$?
     if [ "${_up_rc:-0}" -ne 0 ] && [ "${_up_rc:-0}" -ne "$NOO_EXIT_STACK_PARTIAL" ]; then exit "$_up_rc"; fi
     # $ACTIVE_SVCS (computed above) is the service set THIS invocation
     # manages — tell the guard so a stale, out-of-profile Created
@@ -1004,6 +1011,7 @@ else
     if printf '%s\n' "${SERVICES[@]}" | grep -qxE 'whisper|piper'; then
         noo_voice_model_dirs
     fi
+    addon_refuse_held "${SERVICES[@]}" || exit 1
     check_bind_sources "${SERVICES[@]}" || exit 1
     docker compose $COMPOSE_FILES $PROFILE_ARGS up -d "${SERVICES[@]}"
     NOO_CREATED_GUARD_SERVICES="${SERVICES[*]}" noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq "${SERVICES[@]}")

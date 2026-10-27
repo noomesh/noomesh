@@ -116,6 +116,74 @@ noo_bin() {
     return 1
 }
 
+# ── Reading and writing ONE scalar of noomesh.yaml from shell ────────────────
+#
+# Launcher scripts used to grep/awk noomesh.yaml in three places (a quoted
+# value, a trailing comment or a same-named nested key read wrong:
+# `NOO_IMAGE_TAG: "v0.6.7" # pin` came back as `"v0.6.7"`). They now go
+# through these functions; nothing else in scripts/ parses the file.
+#
+# READ  config_compose_env_get FILE KEY  — the value of compose_env.KEY, via
+#       the real YAML parser (`noo config launch-render compose-env`, the same
+#       renderer the launcher loads compose_env with), else python3+PyYAML.
+#       Prints the value; exit 1 when KEY is not in compose_env (or nothing
+#       could read the file), so "absent" and "empty" are distinct.
+# PROBE config_has_section FILE KEY      — exit 0 when FILE has a top-level
+#       KEY. Only for the path where no parser is available (an older `noo`
+#       that cannot render): a presence test, never a value read. It accepts
+#       `key:` / `key :` / `"key":` / `'key':` at column 0 and nothing else.
+# WRITE config_compose_env_set FILE KEY VALUE — rewrite compose_env.KEY in
+#       place, keeping the inode (see config_sed_in_place) and any trailing
+#       `# comment`. YAML subset: block-style `compose_env:` at column 0 whose
+#       entries are `  KEY: scalar` lines (the shape `noo` writes and
+#       noomesh.yaml.example documents; a flow-style `compose_env: {..}` is
+#       refused). A same-named key under another section is not touched.
+#       Exit 1 when the key is not in the block; the file is then unchanged.
+config_compose_env_get() {
+    local file="$1" key="$2" nb out
+    [ -f "$file" ] || return 1
+    if nb="$(noo_bin 2>/dev/null)"; then
+        out="$("$nb" config launch-render compose-env "$file" 2>/dev/null)" || out=""
+    elif command -v python3 >/dev/null 2>&1; then
+        out="$(python3 - "$file" <<'PYEOF' 2>/dev/null
+import sys, yaml
+env = (yaml.safe_load(open(sys.argv[1])) or {}).get("compose_env") or {}
+for k, v in env.items():
+    if isinstance(v, (dict, list)):
+        continue
+    print(f"{k}={'' if v is None else str(v).lower() if isinstance(v, bool) else v}")
+PYEOF
+)" || out=""
+    else
+        return 1
+    fi
+    printf '%s\n' "$out" | awk -v k="$key" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); found = 1; exit } END { exit !found }'
+}
+
+config_has_section() {
+    [ -f "$1" ] && grep -Eq "^[\"']?$2[\"']?[[:space:]]*:" "$1"
+}
+
+config_compose_env_set() {
+    local file="$1" key="$2" value="$3" tmp rc=0
+    [ -f "$file" ] || return 1
+    tmp="$(mktemp)" || return 1
+    awk -v k="$key" -v v="$value" '
+        /^compose_env[[:space:]]*:[[:space:]]*(#.*)?$/ { inblock = 1; print; next }
+        inblock && /^[^[:space:]#]/ { inblock = 0 }
+        inblock && match($0, "^[[:space:]]+" k "[[:space:]]*:") {
+            head = substr($0, 1, RLENGTH); rest = substr($0, RLENGTH + 1)
+            tail = ""
+            if (match(rest, /[[:space:]]+#.*$/)) tail = substr(rest, RSTART)
+            print head " " v tail; done = 1; next
+        }
+        { print }
+        END { exit !done }
+    ' "$file" > "$tmp" && cat "$tmp" > "$file" || rc=$?
+    rm -f "$tmp"
+    return "$rc"
+}
+
 load_config() {
     # Launcher sentinel (audit item 11): every sanctioned compose path
     # sources this before `up`, so the gateway can tell launcher recreates

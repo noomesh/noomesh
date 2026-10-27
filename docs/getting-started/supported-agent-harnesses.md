@@ -140,6 +140,20 @@ per call). Three things keep such a turn from being lost:
   it ends a call still running at the deadline. It then saves the answer so
   far, or a note that the model did not finish, while the turn's credential
   is still valid.
+- **A CLI that never reaches the model is killed early.** Every model call a
+  vendor CLI makes passes through the harness's wire translator. A CLI that
+  has made none for `NOO_HARNESS_STALL_SECS` (default 300 s; 120 s for a chat
+  turn) is killed as stalled and the loop fails with `stalled: no model call
+  for Ns`, instead of running to `NOO_HARNESS_TURN_TIMEOUT_SECS` loop after
+  loop. A slow model is not a stall: a call in flight counts as activity.
+  A chat turn whose CLI stalled before its first model call ran no tool, so
+  the gateway runs that turn itself and the console gets an answer instead
+  of an error.
+- **A kind change drains instead of dropping.** Changing a node's harness
+  kind restarts the harness; it now stops taking work on the stop signal
+  and gives what it holds `NOO_HARNESS_DRAIN_SECS` (default 120 s) to
+  finish before it exits, so a turn or task in flight is not lost to the
+  switch.
 - **Reasoning can be switched off per node.** Place the harness with
   `--env NOO_HARNESS_THINKING=off` and every model call on that node asks the
   model not to reason, for the `noo` loop and for a foreign kind's CLI
@@ -175,7 +189,7 @@ the table, gets the tier 3 row.
 | `first_byte_secs` | 290 | 600 | 900 | 900 | how long the node's inference proxy waits for a model's first byte (a cold load plus the prompt's prefill) | node agent, live, no restart |
 | `stream_idle_secs` | 300 | 300 | 600 | 600 | how long a streamed answer may go silent before it counts as cut | harness |
 | `thinking` | `auto` | `off` | `off` | `off` | whether model calls reason: `on`, `off`, or `auto` (the caller decides) | harness |
-| `ollama_context` | 32768 | 32768 | 16384 | 8192 | the context length the node's ollama runs with when its placement sets no `OLLAMA_CONTEXT_LENGTH` | node agent |
+| `context` | 32768 | 32768 | 16384 | 8192 | the context window the node's chat engine runs with when its placement sets none: Ollama's `OLLAMA_CONTEXT_LENGTH`, vLLM's `VLLM_MAX_MODEL_LEN`, llama.cpp's `N_CTX`. Named `ollama_context` until 0.6.13; the old name is still accepted for one release | node agent |
 | `claude_prompt` | `full` | `slim` | `slim` | `slim` | which Claude Code launch the harness uses: the full system prompt, or a slim one for small models | harness |
 | `foreign_kinds` | claude-code, codex, copilot | claude-code, codex, copilot | codex, copilot | none | the foreign harness kinds this node may run (`noo` is always allowed); the agent refuses a placement of any other kind | node agent |
 
@@ -208,7 +222,7 @@ noo cluster profile <node> --clear-all
 ```
 
 The gateway checks every value: `first_byte_secs` and `stream_idle_secs` are
-whole seconds from 1 to 7200, `ollama_context` is whole tokens from 1 to
+whole seconds from 1 to 7200, `context` is whole tokens from 1 to
 1048576, `thinking` is `on`, `off` or `auto`, `claude_prompt` is `full` or
 `slim`, and `foreign_kinds` names foreign kinds from
 `config/harness-kinds.json`. A value outside these rules is refused with the
@@ -332,6 +346,35 @@ noo-gateway harness probe --kind claude-code --cli /opt/claude/claude --mock-mod
 sudo noo-gateway harness probe --kind codex --run-as nobody --json
 ```
 
+Each test also reports the kind's **prompt floor**: the size of the CLI's
+first request to the model, before it has done any work (`first request:` in
+the text report, `prompt_floor` in `--json`). In real mode it is the model's
+own count of that call's prompt tokens. In mock mode the mock's usage is
+canned, so it is estimated from the request's size at about 2.5 characters
+per token, which overstates rather than understates. A node whose context
+window is below a kind's floor cannot run that kind: its first request is
+refused (vLLM answers 400). The floors are what placement checks a node's window against.
+
+**Placement checks the floor.** `config/harness-kinds.json` declares each
+kind's floor as `min_context_tokens` (`min_context_tokens_slim` for Claude
+Code's slim launch). `noo cluster place <node> harness --kind <kind>` compares
+it with the node's chat window: the running chat placement's own key
+(`VLLM_MAX_MODEL_LEN`, `OLLAMA_CONTEXT_LENGTH`, or llama.cpp's `N_CTX` divided
+by its parallel slots), else the profile's `context`. The window is capped
+by the model's own context ceiling: no engine setting gives a model more than
+it was built for, and a refusal the ceiling decides suggests a different model
+rather than a larger window. Until the node reports the ceiling of the model it
+serves, the ceiling comes from `config/model-capabilities.json`, a fallback
+table; a model it does not list has no ceiling.
+
+- **Below the floor:** refused with the numbers, `noo` named as the kind that
+  fits, and the `noo cluster place … --env` line that raises the window.
+  `--force` places it anyway, with a warning.
+- **Below the floor × 1.25:** placed, with a `tight` warning.
+- **Floor not declared:** never refused. Codex and Claude Code's slim launch
+  are not measured yet. Copilot and Claude Code carry 16 385, the lower bound
+  vLLM reported on awolf on 2026-10-24, until the probe measures them.
+
 Other flags: `--cli <absolute path>` (default: the kind's `cli` on PATH),
 `--test reply|file|both` (default `both`), `--prompt full|slim` (Claude
 Code's full or slim launch; default: the node's profile in real mode, else
@@ -385,6 +428,9 @@ one node, and reports a row per kind. A scenario with a `harness_compare:`
 block does it; `eval/scenarios/harness-compare-awolf.yaml` is the sample
 (three tasks: a one-word reply, a question that needs a mesh tool, and a
 two-step delegation, under `noo`, `copilot`, `claude-code` and `codex`).
+Before it places the first kind it stops any live task an earlier run left
+with one of its objectives (a dead runner's tasks hold the node's harness
+permits until something finishes them); `sweep_leftovers: false` keeps them.
 
 **It changes the node's harness placement while it runs.** For each kind it
 sets `NOO_HARNESS_KIND` on the node's `harness` placement (keeping the rest

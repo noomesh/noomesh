@@ -270,6 +270,287 @@ where
     Ok(r.rows_affected())
 }
 
+// ── Lookups by username ─────────────────────────────────────────────────
+//
+// Every read below is runtime-checked (`query_as` / `query_scalar`): these
+// statements moved here verbatim from their call sites, and a new `query!`
+// would need the `.sqlx` offline cache regenerated. Each returns the raw
+// `sqlx::Error` so the caller keeps its own fail-open / fail-closed choice
+// (several of them are security gates that must NOT default on error).
+
+/// The `login` row: `(username, hashed_password, disabled, scopes,
+/// failed_login_count, locked_until, role)`.
+pub type LoginRow = (
+    String,
+    String,
+    bool,
+    Value,
+    Option<i32>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    String,
+);
+
+/// The row the login path needs, `None` when there is no such account.
+/// `scopes` falls back to `["read"]` and `failed_login_count` to 0 in SQL.
+pub async fn login_row<'e, E>(db: E, username: &str) -> Result<Option<LoginRow>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as::<_, LoginRow>(
+        "SELECT username, hashed_password, disabled, \
+                COALESCE(scopes, '[\"read\"]'::jsonb), \
+                COALESCE(failed_login_count, 0), locked_until, role \
+         FROM noo_users WHERE username = $1",
+    )
+    .bind(username)
+    .fetch_optional(db)
+    .await
+}
+
+/// The account's `user_uuid` — the one spelling of "who owns this" that the
+/// rest of the schema keys on. `None` when there is no such account.
+pub async fn uuid_by_username<'e, E>(
+    db: E,
+    username: &str,
+) -> Result<Option<uuid::Uuid>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar("SELECT user_uuid FROM noo_users WHERE username = $1")
+        .bind(username)
+        .fetch_optional(db)
+        .await
+}
+
+/// Does the account exist (enabled or not)?
+pub async fn exists<'e, E>(db: E, username: &str) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT username FROM noo_users WHERE username = $1")
+            .bind(username)
+            .fetch_optional(db)
+            .await?;
+    Ok(row.is_some())
+}
+
+/// Is the account an ENABLED row? (`false` for disabled and for no such row.)
+pub async fn is_enabled<'e, E>(db: E, username: &str) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM noo_users WHERE username = $1 AND NOT disabled)",
+    )
+    .bind(username)
+    .fetch_one(db)
+    .await
+}
+
+/// The raw `role` column, whether or not the account is disabled.
+pub async fn role_of<'e, E>(db: E, username: &str) -> Result<Option<String>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar("SELECT role FROM noo_users WHERE username = $1")
+        .bind(username)
+        .fetch_optional(db)
+        .await
+}
+
+/// The raw `role` column of an ENABLED account; `None` for a disabled or
+/// missing one.
+pub async fn enabled_role<'e, E>(db: E, username: &str) -> Result<Option<String>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar("SELECT role FROM noo_users WHERE username = $1 AND NOT disabled")
+        .bind(username)
+        .fetch_optional(db)
+        .await
+}
+
+/// The `disabled` flag; `None` when there is no such account.
+pub async fn disabled_flag<'e, E>(db: E, username: &str) -> Result<Option<bool>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar("SELECT disabled FROM noo_users WHERE username = $1")
+        .bind(username)
+        .fetch_optional(db)
+        .await
+}
+
+/// `(disabled, role)`, `None` when there is no such account.
+pub async fn role_and_disabled<'e, E>(
+    db: E,
+    username: &str,
+) -> Result<Option<(bool, String)>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as("SELECT COALESCE(disabled, false), role FROM noo_users WHERE username = $1")
+        .bind(username)
+        .fetch_optional(db)
+        .await
+}
+
+/// `(role, scopes, disabled)`, `None` when there is no such account. The
+/// live-row read behind every token mint that must re-check the account.
+pub async fn role_scopes_disabled<'e, E>(
+    db: E,
+    username: &str,
+) -> Result<Option<(String, Value, bool)>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        "SELECT role, scopes, COALESCE(disabled, false) FROM noo_users WHERE username = $1",
+    )
+    .bind(username)
+    .fetch_optional(db)
+    .await
+}
+
+/// `(role, scopes)`, `None` when there is no such account.
+pub async fn role_and_scopes<'e, E>(
+    db: E,
+    username: &str,
+) -> Result<Option<(String, Value)>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as("SELECT role, scopes FROM noo_users WHERE username = $1")
+        .bind(username)
+        .fetch_optional(db)
+        .await
+}
+
+/// The account's `org_id`; `None` when there is no such account or the
+/// column is NULL (the two were never distinguished by a caller).
+pub async fn org_of<'e, E>(db: E, username: &str) -> Result<Option<String>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT org_id FROM noo_users WHERE username = $1")
+            .bind(username)
+            .fetch_optional(db)
+            .await?;
+    Ok(row.and_then(|(o,)| o))
+}
+
+/// Accounts per org, one grouped scan. The org is `None` for a NULL column.
+pub async fn member_counts_by_org<'e, E>(
+    db: E,
+) -> Result<Vec<(Option<String>, i64)>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as("SELECT org_id, COUNT(*) FROM noo_users GROUP BY org_id")
+        .fetch_all(db)
+        .await
+}
+
+/// Enabled accounts that are admin by EITHER the `role` column or the legacy
+/// `admin` scope — counted on both so a desynced row can never make the fleet
+/// look like it has fewer admins than it does.
+pub async fn enabled_admin_count<'e, E>(db: E) -> Result<i64, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM noo_users WHERE disabled = false \
+         AND (role = 'admin' OR scopes @> '[\"admin\"]'::jsonb)",
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(n)
+}
+
+/// Is there at least one enabled admin (by role OR legacy scope)? The
+/// bootstrap-admin gate: an `Err` must be treated as "yes, keep the door shut".
+pub async fn any_enabled_admin<'e, E>(db: E) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM noo_users \
+         WHERE disabled = false \
+           AND (role = 'admin' OR scopes @> '[\"admin\"]'::jsonb))",
+    )
+    .fetch_one(db)
+    .await
+}
+
+// ── Writes beyond create / scopes / role / disabled / org ───────────────
+
+/// Set a new password hash, stamp `password_changed_at`, and clear the
+/// lockout (so this is also the lockout bypass — callers gate it). Returns
+/// rows affected; `0` means no such user.
+pub async fn set_password<'e, E>(
+    db: E,
+    username: &str,
+    hashed_password: &str,
+) -> Result<u64, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let r = sqlx::query(
+        "UPDATE noo_users SET hashed_password = $1, password_changed_at = NOW(), \
+         failed_login_count = 0, locked_until = NULL WHERE username = $2",
+    )
+    .bind(hashed_password)
+    .bind(username)
+    .execute(db)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+/// Count a failed login and lock the account once `strikes` is reached, for
+/// `lockout_minutes`. The threshold and window are bound, not interpolated:
+/// sqlx refuses a dynamic SQL string.
+pub async fn record_failed_login<'e, E>(
+    db: E,
+    username: &str,
+    strikes: i32,
+    lockout_minutes: i32,
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query(
+        "UPDATE noo_users SET failed_login_count = COALESCE(failed_login_count, 0) + 1, \
+         locked_until = CASE \
+           WHEN COALESCE(failed_login_count, 0) + 1 >= $2 THEN NOW() + make_interval(mins => $3) \
+           ELSE locked_until \
+         END \
+         WHERE username = $1",
+    )
+    .bind(username)
+    .bind(strikes)
+    .bind(lockout_minutes)
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
+/// Reset the failure counter and lockout, stamp `last_login_at`.
+pub async fn record_successful_login<'e, E>(db: E, username: &str) -> Result<(), sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query(
+        "UPDATE noo_users SET failed_login_count = 0, locked_until = NULL, \
+         last_login_at = NOW() WHERE username = $1",
+    )
+    .bind(username)
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     /// The Rust fallback and the org seeded by migration

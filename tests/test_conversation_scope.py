@@ -4,7 +4,7 @@
 """Listing conversations is scoped, and the total must be scoped with it.
 
 `GET /api/conversations` was documented and never registered — the spec even
-carried a NOTE admitting it, and `src/noomesh/memory_cli.py:318` has been
+carried a NOTE admitting it, and the Python `memory_cli.py` (since deleted) was
 fetching it and getting a 404. So the fix is to register it, not to delete
 the path: users are meant to see their own conversations, which is what
 `scoped_user` already enforces.

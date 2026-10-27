@@ -1144,9 +1144,8 @@ pub const CORE_REGISTRY: &[SecretSpec] = &[
                       (typically 90d); `cluster invite` / `set-primary` start failing \
                       once it lapses, which looks like a network fault",
         // Gateway-only since an earlier release: the Python reader
-        // (cluster/tailscale.py) is reached only from the `noomesh cluster
-        // mint-join-key` CLI, which no container runs, so the trellion
-        // overlay stopped delivering it rather than move it to a file.
+        // (cluster/tailscale.py, behind the Python CLI) is deleted, so the
+        // trellion overlay no longer delivers it.
         consumers: &["noo-gateway"],
         required_when: Requirement::Optional,
     },
@@ -3038,6 +3037,13 @@ fn plan_json(plan: &[PlanItem], dry_run: bool) -> serde_json::Value {
 /// install with just the new ones.
 pub fn mint_missing(keys: &[&str], target: &Path) -> Result<(Vec<String>, Option<PathBuf>), String> {
     mint_where(keys, target, |store, k| !store.contains(k))
+}
+
+/// [`mint_missing`], but every key gets a NEW value whether or not it has
+/// one: an explicit rotation (`noo addons rotate-secret`). Same writer and
+/// round-trip proof; the previous store is kept as the backup it returns.
+pub fn mint_replace(keys: &[&str], target: &Path) -> Result<(Vec<String>, Option<PathBuf>), String> {
+    mint_where(keys, target, |_, _| true)
 }
 
 /// [`mint_missing`], but a BLANK value counts as missing too: for keys whose

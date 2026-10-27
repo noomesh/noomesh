@@ -54,7 +54,8 @@ def test_the_setter_refuses_non_persons_for_it():
     assert "AT_REST_UNENCRYPTED_ACCEPTED" in _person_only()
     setter = SETTINGS_RS[SETTINGS_RS.index("async fn settings_flags_set("):]
     gate = setter.index("needs_person(&key)")
-    assert gate < setter.index("INSERT INTO noo_settings")
+    # The write is the repo call now (i195 refactor 5); the SQL lives in repo/settings.rs.
+    assert gate < setter.index("repo::settings::upsert(")
     assert "Origin::Person" in setter[gate:gate + 200]
 
 

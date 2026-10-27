@@ -780,21 +780,7 @@ pub fn verify_all(rows: &[AuditRow], keys: &Keys) -> Report {
 
 // ── Database side ────────────────────────────────────────────────────────────
 
-type RowTuple = (
-    String,
-    chrono::DateTime<chrono::Utc>,
-    String,
-    String,
-    String,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-    Option<String>,
-);
+type RowTuple = crate::repo::audit::VerifyRow;
 
 fn to_row(t: RowTuple) -> AuditRow {
     AuditRow {
@@ -817,15 +803,11 @@ fn to_row(t: RowTuple) -> AuditRow {
 
 /// `details::text` is Postgres's jsonb rendering — the text the v2 writer
 /// hashed, because it asked Postgres for exactly that before signing.
-const SELECT_ROWS: &str = "SELECT id::text, \"timestamp\", event_type, severity, actor, resource, \
-     outcome, request_id, entry_hash, details::text, prev_hash, chain_seq, chain_hash \
-     FROM noo_security_audit";
+const SELECT_ROWS: &str = crate::repo::audit::SELECT_ROWS;
 
 /// Read the whole table and judge it with the keys this process holds.
 pub async fn verify_db(db: &sqlx::PgPool) -> Result<Report, sqlx::Error> {
-    let rows: Vec<RowTuple> = sqlx::query_as(sqlx::AssertSqlSafe(format!("{SELECT_ROWS} ORDER BY \"timestamp\" ASC, id ASC")))
-        .fetch_all(db)
-        .await?;
+    let rows: Vec<RowTuple> = crate::repo::audit::all_for_verify(db).await?;
     let rows: Vec<AuditRow> = rows.into_iter().map(to_row).collect();
     let keys = Keys { current: current_key(), retired: retired_key() };
     let mut report = verify_all(&rows, &keys);
@@ -884,12 +866,11 @@ pub(crate) async fn ensure_checkpoint_with(
 
     let Some(current) = current else { return CheckpointOutcome::KeyMissing };
     let fp = fingerprint(&current);
-    let present = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM noo_security_audit WHERE event_type = $1 AND resource LIKE $2",
+    let present = crate::repo::audit::count_event_resource_like(
+        db,
+        CHECKPOINT_EVENT,
+        &format!("audit-key:{fp};%"),
     )
-    .bind(CHECKPOINT_EVENT)
-    .bind(format!("audit-key:{fp};%"))
-    .fetch_one(db)
     .await;
     match present {
         Ok(n) if n > 0 => return CheckpointOutcome::AlreadyPresent,
@@ -949,7 +930,7 @@ pub(crate) async fn ensure_checkpoint_with(
         "after_row_id": last_retired.as_ref().map(|r| r.id.clone()),
     })
     .to_string();
-    let written = crate::routes::core::write_audit_row(
+    let written = crate::audit::write_audit_row(
         db,
         &signing_key,
         CHECKPOINT_EVENT,
@@ -1040,7 +1021,7 @@ pub(crate) async fn ensure_hash_v2_marker_with(
                  and prev_hash as well; a v1 row after this one fails verification",
     })
     .to_string();
-    let written = crate::routes::core::write_audit_row(
+    let written = crate::audit::write_audit_row(
         db,
         &current,
         HASH_V2_MARKER_EVENT,
@@ -1772,7 +1753,7 @@ mod tests {
                 let h = row_hash_with(&key, et, "info", "proof", "gateway", "ok", "");
                 let id = uuid::Uuid::new_v4().to_string();
                 assert!(
-                    crate::routes::core::insert_signed_audit_row(
+                    crate::audit::insert_signed_audit_row(
                         &db, &id, chrono::Utc::now(), et, "info", "proof", "gateway", "ok", "{}",
                         None, &h, None
                     )
@@ -1817,7 +1798,7 @@ mod tests {
             let nk = nk.clone();
             async move {
                 assert!(
-                    crate::routes::core::write_audit_row(
+                    crate::audit::write_audit_row(
                         &db, &nk, et, "info", "proof", "gateway", "ok", "{}", None
                     )
                     .await
@@ -1869,7 +1850,7 @@ mod tests {
         assert_eq!(m2, MarkerOutcome::AlreadyPresent);
         for et in ["admin_action", "auth_failure"] {
             assert!(
-                crate::routes::core::write_audit_row(
+                crate::audit::write_audit_row(
                     &db, &nk, et, "warning", "alice", "gateway", "denied",
                     r#"{"zeta":1,"source_ip":"10.0.0.7","a":[1.50,{"y":null,"x":"é"}]}"#, None,
                 )

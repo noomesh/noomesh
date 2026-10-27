@@ -76,7 +76,7 @@ pub fn read_not_after(path: &Path) -> Option<i64> {
     let cert = Certificate::from_pem(&bytes)
         .or_else(|_| Certificate::from_der(&bytes))
         .ok()?;
-    Some(cert.tbs_certificate.validity.not_after.to_unix_duration().as_secs() as i64)
+    Some(cert.tbs_certificate().validity().not_after.to_unix_duration().as_secs() as i64)
 }
 
 /// Recursively collect `*.crt` under `dir`, sorted — mirroring

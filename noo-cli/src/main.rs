@@ -51,11 +51,14 @@ mod addon_decl_parse;
 mod age_key;
 mod addon_lock;
 mod addons;
+mod args;
 mod auth;
 mod catalog;
 mod child_stdin;
 mod commands;
 mod credentials;
+#[cfg(test)]
+mod config_readers;
 mod entitlement;
 mod entitlement_terms;
 mod harness_kinds;
@@ -696,6 +699,8 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["addons", "upgrade"], commands::addons_upgrade),
     (&["addons", "verify"], commands::addons_verify),
     (&["addons", "launch-pins"], commands::addons_launch_pins),
+    (&["addons", "launch-resources"], commands::addons_launch_resources),
+    (&["addons", "rotate-secret"], commands::addons_rotate_secret),
     (&["addons", "trust-key"], commands::addons_trust_key),
     (&["addons", "untrust-key"], commands::addons_untrust_key),
     (&["addons", "set"], commands::addons_set),
@@ -739,6 +744,9 @@ const HIDDEN_NATIVE: &[&[&str]] = &[
     // The launcher's reader of the add-on pins (scripts/lib-dist.sh
     // require_addon_pins) — see `commands::addon_pins`.
     &["addons", "launch-pins"],
+    // The launcher's materialiser of add-on runtime inputs (lib-dist.sh
+    // addon_resources_materialise) — see `commands::addon_resources`.
+    &["addons", "launch-resources"],
     // Pure aliases and internal/retired verbs: still dispatched, not in help.
     &["approval", "pending"],
     &["autonomy", "locations"],
@@ -1727,14 +1735,19 @@ fn main() {
 fn usage_error(json: bool, prefix: &[&str]) -> ! {
     let joined = prefix.join(" ");
     let (syntax, about) = usage::lookup(prefix).unwrap_or(("", ""));
+    // The parser's own reason (`--node needs a value`), when it gave one.
+    let detail = args::take_message();
     let usage_line = if syntax.is_empty() { format!("noo {joined}") } else { format!("noo {joined} {syntax}") };
     if json {
         eprintln!(
             "{}",
-            serde_json::json!({"error": format!("noo {joined} did not understand these arguments"), "code": "usage", "hint": usage_line})
+            serde_json::json!({"error": format!("noo {joined} did not understand these arguments"), "code": "usage", "hint": usage_line, "detail": detail})
         );
     } else {
         ui::failed(&format!("noo {joined} did not understand these arguments"), None);
+        if let Some(d) = &detail {
+            eprintln!("{}", ui::note(d));
+        }
         eprintln!("{}", ui::note(&format!("usage: {usage_line}")));
         if !about.is_empty() {
             eprintln!("{}", ui::note(about));

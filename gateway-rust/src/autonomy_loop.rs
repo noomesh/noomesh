@@ -3,7 +3,7 @@
 
 //! Autonomy engine — periodic location evaluation loop.
 //!
-//! The Python `AutonomyEngine` (cluster/autonomy.py) defines 15 default
+//! The retired Python `AutonomyEngine` (no longer in the tree) defined 15 default
 //! "monitor locations" — condition+action pairs that fire periodically.
 //! That Python loop doesn't run in production (Rust gateway owns the port).
 //! This module restores the behavior for MESH-side locations.
@@ -603,8 +603,8 @@ pub(crate) fn default_locations() -> Vec<LocationDef> {
 }
 
 /// Evaluate one location and fire its action if conditions are met.
-/// Each `match` arm is a self-contained port from
-/// `cluster/autonomy.py::AutonomyEngine._evaluate_location`.
+/// Each `match` arm is a self-contained port of the retired Python
+/// `AutonomyEngine._evaluate_location` (no longer in the tree).
 async fn evaluate_location(state: Arc<AppState>, loc: LocationDef) {
     let result: Result<bool, String> = match loc.name.as_str() {
         // ── MESH-native (Rust SQL/Redis/NATS-KV) ───────────────────

@@ -80,6 +80,7 @@ MASK="${NOO_DEMO_MASK:-$ROOT/scripts/demo/mask.pl}"
 BOX="${NOO_DEMO_BOX:-}"
 T_RAW="$RAW"; T_MASKED="$MASKED"; T_EXIT="$EXIT_LOG"; T_MASK="$MASK"
 ENTER="true"
+INSTALL_SH="sh"   # the real film may pin a release here (NOO_DEMO_CLI_VERSION); the smoke tape has no install line
 BOXDIR=/tmp/demo
 bx() { docker exec -u you "$BOX" "$@"; }
 if [ -n "$BOX" ]; then
@@ -87,7 +88,12 @@ if [ -n "$BOX" ]; then
   [ "$(docker inspect -f '{{index .Config.Labels "noo-demo-box"}}' "$BOX" 2>/dev/null)" = "1" ] \
     || die "container '$BOX' is not a film box (no label noo-demo-box=1); make one with scripts/demo/studio.sh up"
   T_RAW="$BOXDIR/raw.log"; T_MASKED="$BOXDIR/masked.log"; T_EXIT="$BOXDIR/exit.log"; T_MASK="$BOXDIR/mask.pl"
-  ENTER="exec docker exec -it -u you -w /home/you -e TERM=xterm-256color $BOX bash --norc -i"
+  # The film shell gets what a login shell on a real box gets from pam_systemd:
+  # the user runtime dir and bus, so `systemctl --user` (noo-hostd's controller
+  # unit, installed by `noo onboard`) works. The box enables lingering for the
+  # user at boot (studio.sh), which starts that user manager.
+  BOX_UID="$(docker exec "$BOX" id -u you 2>/dev/null || echo 1000)"
+  ENTER="exec docker exec -it -u you -w /home/you -e TERM=xterm-256color -e XDG_RUNTIME_DIR=/run/user/$BOX_UID -e DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$BOX_UID/bus $BOX bash --norc -i"
 fi
 box_cleanup() { [ -z "$BOX" ] || docker exec -u root "$BOX" rm -rf "$BOXDIR" >/dev/null 2>&1 || true; }
 # Whatever happens, the raw log (it holds the real values) does not outlive the run.
@@ -111,7 +117,7 @@ fill() {
   sed -e "s|@INSTALL_URL@|${INSTALL_URL:-https://example.invalid/install.sh}|g" \
       -e "s|@PLAYBACK_SPEED@|${SPEED}|g" \
       -e "s|@RAW_LOG@|${T_RAW}|g" -e "s|@MASKED_LOG@|${T_MASKED}|g" -e "s|@MASK@|${T_MASK}|g" \
-      -e "s|@EXIT_LOG@|${T_EXIT}|g" -e "s|@ENTER@|${ENTER}|g" "$1" > "$2"
+      -e "s|@EXIT_LOG@|${T_EXIT}|g" -e "s|@ENTER@|${ENTER}|g" -e "s|@INSTALL_SH@|${INSTALL_SH}|g" "$1" > "$2"
 }
 
 # Every sensitive value found in the raw log must be absent from the masked log.
@@ -120,21 +126,18 @@ leak_check() {
   local raw="$1" masked="$2" n=0 lit host
   [ -s "$raw" ] || { echo "leak check: no output was logged (nothing went through the masker; did the typed commands reach the shell?)" >&2; return 2; }
   if [ -n "$BOX" ]; then host="$(bx hostname | tr '[:upper:]' '[:lower:]')"; else host="$(hostname | tr '[:upper:]' '[:lower:]')"; fi
-  while IFS= read -r lit; do
+  # The literals come from scripts/demo/leak-literals.sh (one rule set, tested
+  # on its own); each one found verbatim in the masked output is a leak.
+  local tag report=""
+  while IFS=$'\t' read -r tag lit; do
     [ -n "$lit" ] || continue
-    if grep -qiF -- "$lit" "$masked"; then n=$((n + 1)); fi
-  done < <(
-    {
-      grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' "$raw" | awk -F. '$1<=255&&$2<=255&&$3<=255&&$4<=255&&$1!=127&&$1!=0&&$0!="255.255.255.255"&&!($1==192&&$2==0&&$3==2)&&!($1==198&&$2==51&&$3==100)'
-      grep -oiwE "host3|host8-ma|host8|host8|host9|host6|host2|host5|${host}${NOO_DEMO_MASK_NAMES:+|${NOO_DEMO_MASK_NAMES//[ ,]/|}}|peerbox" "$raw"
-      grep -oE 'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{16,}|noo-ent1\.[A-Za-z0-9._-]+' "$raw"  # leak-ok: the masking regex for token shapes, not a token
-      grep -oE '[A-Za-z0-9.-]+\.ts\.net' "$raw"
-      grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]+' "$raw" | grep -viE '@(noomesh\.ai|example\.com)$' || true
-      grep -oiE '(pass(word|phrase)?|token|secret|api[_ -]?key)s?[: =]+[^ ]+' "$raw" | sed -E 's/^[^: =]*[: =]+//' | grep -v '^\*\{8\}' || true
-    } | grep -vE '^(node-[0-9]+|you|server)$' | sort -u
-  )
+    if grep -qiF -- "$lit" "$masked"; then n=$((n + 1)); report="$report  - $tag (${#lit} chars)\n"; fi
+  done < <("$ROOT/scripts/demo/leak-literals.sh" "$host" "${NOO_DEMO_MASK_NAMES:-}" < "$raw")
   if [ "$n" -gt 0 ]; then
-    echo "LEAK: $n sensitive value(s) from the raw output are still present in the masked output." >&2
+    # What kind and how long, never the value: enough to find the rule or the
+    # masker gap without the report itself leaking (takes 10 and 11 were
+    # deleted with no way to know what had matched).
+    printf 'LEAK: %s sensitive value(s) from the raw output are still present in the masked output:\n%b' "$n" "$report" >&2
     return 1
   fi
   echo "leak check: no raw sensitive value survives in the masked output"
@@ -182,7 +185,13 @@ finish() { # $1 base name (smoke|onboarding)
     die "film deleted: nothing was logged, so nothing could be checked. The commands did not run in the film shell."
   fi
   if [ "$lc" -ne 0 ]; then
-    # the "masked" log of a failed run may hold the very values that leaked: delete it too
+    # the "masked" log of a failed run may hold the very values that leaked: delete it too.
+    # NOO_DEMO_KEEP_ON_LEAK=1 (box mode only: a throwaway machine's output) keeps
+    # it as masked.LEAK.log for the operator to read, never the raw log, never the film.
+    if [ -n "$BOX" ] && [ "${NOO_DEMO_KEEP_ON_LEAK:-}" = 1 ]; then
+      mv -f "$MASKED" "$OUT_ABS/masked.LEAK.log" 2>/dev/null || true
+      echo "kept $OUT_ABS/masked.LEAK.log (NOO_DEMO_KEEP_ON_LEAK=1): the masked transcript of a take that leaked; read it, do not publish it" >&2
+    fi
     rm -f "$RAW" "$MASKED" "$OUT_ABS/$base.gif" "$OUT_ABS/$base.mp4" "$OUT_ABS/contact-sheet.png"
     die "film deleted: the masker missed something. Add the pattern to scripts/demo/mask.pl and a case to tests/test_demo_mask.py, then record again."
   fi
@@ -236,6 +245,11 @@ else
   repo="$(sed -n 's/^REPO="\${NOO_CLI_REPO:-\([^}]*\)}".*/\1/p' noo-cli/install.sh | head -1)"
   [ -n "$repo" ] || die "could not read the declared release repo from noo-cli/install.sh"
   INSTALL_URL="https://github.com/${repo}/releases/latest/download/install.sh"
+  # NOO_DEMO_CLI_VERSION=noo-cli-vX.Y.Z[-rc.N] pins the install (install.sh honours
+  # NOO_CLI_VERSION); the pin is typed on screen, so the film says what it installed.
+  if [ -n "${NOO_DEMO_CLI_VERSION:-}" ]; then
+    case "$NOO_DEMO_CLI_VERSION" in noo-cli-v[0-9]*) INSTALL_SH="NOO_CLI_VERSION=$NOO_DEMO_CLI_VERSION sh" ;; *) die "NOO_DEMO_CLI_VERSION must look like noo-cli-v0.6.11-rc.2 (got '$NOO_DEMO_CLI_VERSION')" ;; esac
+  fi
 fi
 echo "film will install from: $INSTALL_URL"
 # In box mode ask from inside the box: it is the stranger's view, and the recorder image has no curl.

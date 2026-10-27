@@ -85,7 +85,9 @@ my $ESC = qr/\e\[[0-9;?]*[A-Za-z]/;
 while (my $l = <STDIN>) {
     # "label: value" secrets, on the whole line so a colour code between the
     # label and the value cannot hide the value
-    $l =~ s/((?:pass(?:word|phrase)?|token|secret|api[_ -]?key|credential)s?\s*(?:is\s*)?[:=]\s*(?:$ESC)*)(?!\*{8})([^\s\e]+)/$1********/gi;
+    # (a value of one to three digits is a count, "Secrets: 9 present", not a secret;
+    #  an upper-case name with underscores, "secrets …: NOO_NODE_AGENT_TOKEN", names one)
+    $l =~ s/((?:pass(?:word|phrase)?|token|secret|api[_ -]?key|credential)s?\s*(?:is\s*)?[:=]\s*(?:$ESC)*)(?!\*{8})(?!\d{1,3}(?:[\s\e]|$))(?!(?-i)[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+(?:[\s\e]|$))([^\s\e]+)/$1********/gi;
     # everything else per stretch of text: a colour code ends a word, so a value
     # that follows one (ESC[1;32m10.0.0.1) is still masked
     my @p = split /($ESC)/, $l, -1;

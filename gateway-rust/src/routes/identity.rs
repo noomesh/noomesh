@@ -74,6 +74,7 @@
 //! login cheap; an exchanged token is minted on demand for an account
 //! somebody else controls, and has to be answerable to it.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 
 use axum::{
@@ -479,10 +480,7 @@ async fn token(
     // explicitly: minting a working token for an account someone has just
     // switched off is the exact failure this endpoint would be blamed for.
     let row: Option<(String, serde_json::Value, bool)> =
-        sqlx::query_as("SELECT role, scopes, COALESCE(disabled, false) FROM noo_users WHERE username = $1")
-            .bind(account)
-            .fetch_optional(&state.db)
-            .await?;
+        crate::repo::users::role_scopes_disabled(&state.db, account).await?;
     let Some((role_col, scopes_col, disabled)) = row else {
         return Err(AppError::NotFound(format!("account '{account}' not found")));
     };
@@ -543,21 +541,17 @@ async fn token(
     // One audit row per mint. This is where the delegation becomes a fact
     // an operator can read months later: who was minted for, by which key,
     // on whose authority.
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "identity_token_issue",
-        "info",
-        &format!("key:{}", consumer.name),
-        subject,
-        "ok",
-        json!({
+        AuditEvent::new(AuditKind::IdentityTokenIssue, &format!("key:{}", consumer.name), subject)
+            .details(json!({
             "issuer_user": issuer_user,
             "role": minted_role.as_str(),
             "expires_in": ttl,
             "cert_bound": thumbprint.is_some(),
             "kind": format!("{kind:?}").to_lowercase(),
             "account": account,
-        }),
+        })),
     )
     .await;
 

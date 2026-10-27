@@ -42,6 +42,7 @@
 //! inside, signed with the fleet signing key (`noo kiosk` seat staging) — the
 //! gateway never sees plaintext, exactly like a node bundle.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -57,11 +58,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::bootstrap::{
-    bootstrap_admin_guard, cluster_ca_candidates, cluster_ca_fingerprint_from, controller_url,
+    cluster_ca_candidates, cluster_ca_fingerprint_from, controller_url,
     enroll_url, valid_node_name, validate_ttl, BIRTH_PROOF_HEADER,
 };
 use super::{AppError, AppResult};
-use crate::auth::{ClusterNode, RequesterCtx};
+use crate::auth::ClusterNode;
+use crate::authz::{Operator, OperatorOrInternal};
 use crate::auth_refresh::{generate_seat_token, hash_token};
 use crate::birth_proof::Purpose;
 use crate::state::AppState;
@@ -105,12 +107,12 @@ pub fn router() -> Router<Arc<AppState>> {
 
 /// >= Operator, or the controller's own cluster HMAC — never a node.
 ///
-/// `bootstrap_admin_guard` already refuses a sub-operator JWT; the extra arm
+/// The `OperatorOrInternal` extractor already refuses a sub-operator JWT; the extra arm
 /// refuses a `Node`-kind cluster token even if the middleware's allow-list
 /// were ever to let one past. A node has no business minting, listing or
 /// staging seats.
 fn seat_admin_guard(
-    ctx: &Option<Extension<RequesterCtx>>,
+    op: &OperatorOrInternal,
     cluster: &Option<Extension<ClusterNode>>,
 ) -> Result<String, AppError> {
     if let Some(Extension(c)) = cluster {
@@ -118,7 +120,7 @@ fn seat_admin_guard(
             return Err(AppError::Forbidden(format!("node '{}' may not manage kiosk seats", c.0)));
         }
     }
-    bootstrap_admin_guard(ctx)
+    Ok(op.actor("cluster-cli"))
 }
 
 /// Does an enrolled NODE hold this name? A seat may not take it: the two
@@ -190,11 +192,11 @@ pub(crate) async fn mint_seat_token(
 /// the gateway does not hold it.
 async fn seat_token_create(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    op: OperatorOrInternal,
     cluster: Option<Extension<ClusterNode>>,
     Json(body): Json<CreateSeatTokenBody>,
 ) -> AppResult {
-    let by = seat_admin_guard(&ctx, &cluster)?;
+    let by = seat_admin_guard(&op, &cluster)?;
     let seat = body.seat_name.trim().to_string();
     if !valid_node_name(&seat) {
         return Err(AppError::BadRequest("seat_name must be <= 64 chars of [a-zA-Z0-9._-]".into()));
@@ -211,14 +213,10 @@ async fn seat_token_create(
     let gateway = enroll_url(&controller_url()).map_err(AppError::Unavailable)?;
     let ca_sha256 = cluster_ca_fingerprint_from(&cluster_ca_candidates()).map_err(AppError::Unavailable)?;
     let t = mint_seat_token(&state.db, &seat, ttl, &by).await?;
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "seat_token_create",
-        "warning",
-        &by,
-        &format!("seat-token:{}", t.id),
-        "ok",
-        json!({ "token_id": t.id.to_string(), "seat": seat, "ttl_seconds": ttl, "role": "seat" }),
+        AuditEvent::new(AuditKind::SeatTokenCreate, &by, &format!("seat-token:{}", t.id))
+            .details(json!({ "token_id": t.id.to_string(), "seat": seat, "ttl_seconds": ttl, "role": "seat" })),
     )
     .await;
     Ok(Json(json!({
@@ -238,10 +236,8 @@ async fn seat_token_create(
 /// GET /api/cluster/seat-tokens — issuance metadata, never hashes.
 async fn seat_tokens_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
-    cluster: Option<Extension<ClusterNode>>,
+    _op: Operator,
 ) -> AppResult {
-    let _ = seat_admin_guard(&ctx, &cluster)?;
     type Row = (uuid::Uuid, String, String, String, chrono::DateTime<chrono::Utc>,
                 chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, Option<String>, bool);
     let rows: Vec<Row> = sqlx::query_as(
@@ -286,10 +282,10 @@ fn token_status(revoked: bool, used: bool, expired: bool) -> &'static str {
 async fn seat_token_revoke(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    ctx: Option<Extension<RequesterCtx>>,
+    op: OperatorOrInternal,
     cluster: Option<Extension<ClusterNode>>,
 ) -> AppResult {
-    let by = seat_admin_guard(&ctx, &cluster)?;
+    let by = seat_admin_guard(&op, &cluster)?;
     let id: uuid::Uuid = id.parse().map_err(|_| AppError::BadRequest("invalid token id (expected a UUID)".into()))?;
     let updated = sqlx::query("UPDATE noo_seat_tokens SET revoked = true WHERE id = $1")
         .bind(id)
@@ -298,8 +294,11 @@ async fn seat_token_revoke(
     if updated.rows_affected() == 0 {
         return Err(AppError::NotFound(format!("seat token {id} not found")));
     }
-    crate::routes::core::audit_event(&state.db, "seat_token_revoke", "info", &by,
-        &format!("seat-token:{id}"), "ok", json!({ "token_id": id.to_string() })).await;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::SeatTokenRevoke, &by, &format!("seat-token:{id}"))
+            .details(json!({ "token_id": id.to_string() })),
+    ).await;
     Ok(Json(json!({ "status": "ok", "id": id.to_string(), "revoked": true })))
 }
 
@@ -465,8 +464,12 @@ async fn seat_enroll(
         let ip = ip.clone();
         async move {
             let resource = id.map(|i| format!("seat-token:{i}")).unwrap_or_else(|| "seat-token:unknown".into());
-            crate::routes::core::audit_event(&db, "seat_token_denied", "warning", "anonymous", &resource,
-                "denied", json!({ "reason": reason.as_str(), "ip": ip })).await;
+            crate::audit::record(
+                &db,
+                AuditEvent::new(AuditKind::SeatTokenDenied, "anonymous", &resource)
+                    .outcome(crate::audit::Outcome::Denied)
+                    .details(json!({ "reason": reason.as_str(), "ip": ip })),
+            ).await;
             AppError::Forbidden(DENIED_MSG.into())
         }
     };
@@ -494,8 +497,11 @@ async fn seat_enroll(
         Err((reason, id)) => return Err(deny(reason, id).await),
     };
     record_seat(&state.db, &seat, cert, facts, enroll_user, id).await?;
-    crate::routes::core::audit_event(&state.db, "seat_enrolled", "warning", "anonymous",
-        &format!("seat:{seat}"), "ok", json!({ "token_id": id.to_string(), "seat": seat, "ip": ip })).await;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::SeatEnrolled, "anonymous", &format!("seat:{seat}"))
+            .details(json!({ "token_id": id.to_string(), "seat": seat, "ip": ip })),
+    ).await;
     tracing::info!(seat = %seat, ip = %ip, "seat_enrolled");
     Ok(Json(json!({
         "status": "ok",
@@ -516,10 +522,10 @@ async fn seat_enroll(
 /// verify` read, and the ONLY place either learns a seat exists.
 async fn seats_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    op: OperatorOrInternal,
     cluster: Option<Extension<ClusterNode>>,
 ) -> AppResult {
-    let _ = seat_admin_guard(&ctx, &cluster)?;
+    let _ = seat_admin_guard(&op, &cluster)?;
     type Row = (String, String, Option<Value>, Option<String>, chrono::DateTime<chrono::Utc>,
                 Option<chrono::DateTime<chrono::Utc>>, Option<Value>, Option<String>,
                 Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>,
@@ -561,12 +567,12 @@ async fn seats_list(
 /// CLI. Upsert; the seat's sync timer collects it.
 async fn seat_bundle_put(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    op: OperatorOrInternal,
     cluster: Option<Extension<ClusterNode>>,
     Path(seat): Path<String>,
     body: Bytes,
 ) -> AppResult {
-    let by = seat_admin_guard(&ctx, &cluster)?;
+    let by = seat_admin_guard(&op, &cluster)?;
     if !valid_node_name(&seat) {
         return Err(AppError::BadRequest("invalid seat name".into()));
     }
@@ -585,8 +591,11 @@ async fn seat_bundle_put(
     if r.rows_affected() == 0 {
         return Err(AppError::NotFound(format!("no seat named '{seat}' is enrolled")));
     }
-    crate::routes::core::audit_event(&state.db, "seat_bundle_staged", "warning", &by,
-        &format!("seat-bundle:{seat}"), "ok", json!({ "seat": seat, "bytes": body.len() })).await;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::SeatBundleStaged, &by, &format!("seat-bundle:{seat}"))
+            .details(json!({ "seat": seat, "bytes": body.len() })),
+    ).await;
     Ok(Json(json!({ "status": "staged", "seat": seat, "bytes": body.len() })))
 }
 
@@ -595,11 +604,11 @@ async fn seat_bundle_put(
 /// CLI's combined wait judges both with one function.
 async fn seat_bundle_status(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    op: OperatorOrInternal,
     cluster: Option<Extension<ClusterNode>>,
     Path(seat): Path<String>,
 ) -> AppResult {
-    let _ = seat_admin_guard(&ctx, &cluster)?;
+    let _ = seat_admin_guard(&op, &cluster)?;
     if !valid_node_name(&seat) {
         return Err(AppError::BadRequest("invalid seat name".into()));
     }
@@ -764,9 +773,14 @@ async fn seat_apply_report(
     .bind(&msg)
     .execute(&state.db)
     .await?;
-    crate::routes::core::audit_event(&state.db, "seat_bundle_applied",
-        if rc == 0 { "info" } else { "warning" }, &format!("seat:{seat}"), &format!("seat-bundle:{seat}"),
-        if rc == 0 { "ok" } else { "failed" }, json!({ "seat": seat, "rc": rc, "sha": sha, "msg": msg })).await;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::SeatBundleApplied, &format!("seat:{seat}"), &format!("seat-bundle:{seat}"))
+            .outcome(if rc == 0 { crate::audit::Outcome::Ok } else { crate::audit::Outcome::custom("failed") })
+            .severity(if rc == 0 { crate::audit::Severity::Info } else { crate::audit::Severity::Warning })
+            .details(json!({ "seat": seat, "rc": rc, "sha": sha, "msg": msg })),
+    )
+    .await;
     Ok(Json(json!({ "recorded": true, "seat": seat, "rc": rc })))
 }
 

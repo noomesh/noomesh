@@ -65,6 +65,54 @@ pub fn ready_subject(node: &str) -> String {
     format!("harness.ready.{}", node.replace(['.', '*', '>', ' '], "_"))
 }
 
+/// When each task this process runs last made progress (i227 fix 1): taken
+/// by the harness, or checkpointed. A task is detached from its creator, so
+/// it lives by its own progress; the harness's watchdog releases one that
+/// has made none for [`progress::stall_bound`].
+pub mod progress {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    /// The bound's env name and default: three task-loop timeouts (a vendor
+    /// CLI loop is bounded at 900 s), never under ten minutes.
+    pub const STALL_ENV: &str = "NOO_HARNESS_TASK_STALL_SECS";
+    pub const STALL_DEFAULT_SECS: u64 = 2700;
+    pub const STALL_MIN_SECS: u64 = 600;
+
+    fn clock() -> &'static Mutex<HashMap<String, Instant>> {
+        static CLOCK: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+        CLOCK.get_or_init(Mutex::default)
+    }
+
+    pub fn touch(task_id: &str) {
+        if let Ok(mut c) = clock().lock() {
+            c.insert(task_id.to_string(), Instant::now());
+        }
+    }
+
+    /// Time since the task last made progress; `None` for one never touched.
+    pub fn age(task_id: &str) -> Option<Duration> {
+        clock().lock().ok()?.get(task_id).map(Instant::elapsed)
+    }
+
+    pub fn forget(task_id: &str) {
+        if let Ok(mut c) = clock().lock() {
+            c.remove(task_id);
+        }
+    }
+
+    pub fn stall_bound(get: &dyn Fn(&str) -> Option<String>) -> Duration {
+        let secs = get(STALL_ENV).and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(STALL_DEFAULT_SECS);
+        Duration::from_secs(secs.max(STALL_MIN_SECS))
+    }
+
+    /// The result a stalled task fails with.
+    pub fn stalled_note(node: &str, secs: u64) -> String {
+        format!("stalled: no progress on {node} for {secs} s; the harness released its slot (i227)")
+    }
+}
+
 /// A task, as the API returns it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Task {
@@ -274,24 +322,24 @@ pub async fn create_task(db: &sqlx::PgPool, new: NewTask<'_>) -> Result<Task> {
     };
     let parent_uuid = new.parent.and_then(|p| uuid::Uuid::parse_str(&p.id).ok());
     let channel = new.parent.map(|p| p.channel.as_str()).unwrap_or("task");
-    sqlx::query(
-        "INSERT INTO noo_tasks (id, objective, owner_uuid, state, conversation_id, thread_id, channel, model, loop_budget, parent_id, role, budget_default, token_budget, created_via) \
-         VALUES ($1, $2, (SELECT user_uuid FROM noo_users WHERE username = $3), 'open', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+    crate::repo::tasks::insert(
+        db,
+        &crate::repo::tasks::NewTaskRow {
+            id,
+            objective: new.objective,
+            owner: new.owner,
+            conversation_id: conversation,
+            thread_id: &thread,
+            channel,
+            model: new.model,
+            loop_budget: budget as i32,
+            parent_id: parent_uuid,
+            role: new.role,
+            budget_default,
+            token_budget: new.token_budget.filter(|b| *b > 0),
+            created_via: new.created_via,
+        },
     )
-    .bind(id)
-    .bind(new.objective)
-    .bind(new.owner)
-    .bind(conversation)
-    .bind(&thread)
-    .bind(channel)
-    .bind(new.model)
-    .bind(budget as i32)
-    .bind(parent_uuid)
-    .bind(new.role)
-    .bind(budget_default)
-    .bind(new.token_budget.filter(|b| *b > 0))
-    .bind(new.created_via)
-    .execute(db)
     .await?;
     // i143 D: the first event of an add-on's task (a no-op for any other).
     crate::task_events::emit_state(db, &id.to_string(), "open", None).await;
@@ -306,11 +354,7 @@ pub async fn apply_node_budget(db: &sqlx::PgPool, task: &Task, node: &str) -> Re
     }
     let Some(b) = node_loop_budget(db, node).await else { return Ok(task.loop_budget) };
     let uuid = uuid::Uuid::parse_str(&task.id)?;
-    sqlx::query("UPDATE noo_tasks SET loop_budget = $2, updated_at = now() WHERE id = $1 AND budget_default")
-        .bind(uuid)
-        .bind(b as i32)
-        .execute(db)
-        .await?;
+    crate::repo::tasks::set_loop_budget_if_default(db, uuid, b as i32).await?;
     Ok(b)
 }
 
@@ -434,15 +478,7 @@ pub async fn list_via(db: &sqlx::PgPool, owner: &str, via: &str, state: Option<&
 /// path (it records the `revoked` event), so it is honoured at the task's next
 /// checkpoint like any stop. Returns the ids it stopped.
 pub async fn stop_via(db: &sqlx::PgPool, owner: &str, via: &str) -> Result<Vec<String>> {
-    let live: Vec<uuid::Uuid> = sqlx::query_scalar(
-        "SELECT id FROM noo_tasks \
-         WHERE owner_uuid = (SELECT user_uuid FROM noo_users WHERE username = $1) AND created_via = $2 \
-         AND state IN ('open','running','checkpointed')",
-    )
-    .bind(owner)
-    .bind(via)
-    .fetch_all(db)
-    .await?;
+    let live: Vec<uuid::Uuid> = crate::repo::tasks::live_ids_via(db, owner, via).await?;
     let mut stopped = Vec::new();
     for id in live {
         let id = id.to_string();
@@ -503,7 +539,7 @@ pub async fn claim_idempotency(db: &sqlx::PgPool, owner: &str, via: &str, key: &
 /// Remove a task that lost an idempotency race before it was ever started.
 pub async fn discard_unstarted(db: &sqlx::PgPool, id: &str) -> Result<()> {
     let uuid = uuid::Uuid::parse_str(id)?;
-    sqlx::query("DELETE FROM noo_tasks WHERE id = $1 AND state = 'open'").bind(uuid).execute(db).await?;
+    crate::repo::tasks::delete_if_open(db, uuid).await?;
     Ok(())
 }
 
@@ -524,12 +560,7 @@ pub async fn for_conversation(db: &sqlx::PgPool, conversation_id: &str, owner: &
 
 async fn set_state(db: &sqlx::PgPool, id: &str, state: &str, node: Option<&str>) -> Result<()> {
     let uuid = uuid::Uuid::parse_str(id)?;
-    sqlx::query("UPDATE noo_tasks SET state = $2, node = COALESCE($3, node), updated_at = now() WHERE id = $1")
-        .bind(uuid)
-        .bind(state)
-        .bind(node)
-        .execute(db)
-        .await?;
+    crate::repo::tasks::set_state(db, uuid, state, node).await?;
     Ok(())
 }
 
@@ -691,17 +722,7 @@ async fn tools_used(db: &sqlx::PgPool, conversation_id: &str) -> i64 {
 /// use it without the two calling each other forever.
 async fn finish_row(db: &sqlx::PgPool, id: &str, ok: bool, text: &str) -> Result<bool> {
     let uuid = uuid::Uuid::parse_str(id)?;
-    let (state, col) = if ok { ("done", "result") } else { ("failed", "error") };
-    let n = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "UPDATE noo_tasks SET state = $2, {col} = $3, updated_at = now() \
-         WHERE id = $1 AND state IN ('open','running','checkpointed')"
-    )))
-    .bind(uuid)
-    .bind(state)
-    .bind(text)
-    .execute(db)
-    .await?
-    .rows_affected();
+    let n = crate::repo::tasks::finish(db, uuid, ok, text).await?;
     if n > 0 {
         // i143 D: `result` (the answer, or null on failure) then the final
         // `state`. Here, not in `finish`, so a parent settled by
@@ -723,19 +744,12 @@ pub async fn stop(db: &sqlx::PgPool, id: &str) -> Result<bool> {
 /// follows the revoked one.
 pub async fn stop_with(db: &sqlx::PgPool, id: &str, reason: &str) -> Result<bool> {
     let uuid = uuid::Uuid::parse_str(id)?;
-    let live: Option<String> = sqlx::query_scalar("SELECT state FROM noo_tasks WHERE id = $1 AND state IN ('open','running','checkpointed')")
-        .bind(uuid)
-        .fetch_optional(db)
-        .await?;
+    let live: Option<String> = crate::repo::tasks::live_state_of(db, uuid).await?;
     if live.is_none() {
         return Ok(false);
     }
     crate::task_events::emit_revoked(db, id, reason).await;
-    let n = sqlx::query("UPDATE noo_tasks SET state = 'stopped', updated_at = now() WHERE id = $1 AND state IN ('open','running','checkpointed')")
-        .bind(uuid)
-        .execute(db)
-        .await?
-        .rows_affected();
+    let n = crate::repo::tasks::stop_live(db, uuid).await?;
     if n > 0 {
         crate::task_events::emit_final_state(db, id, Some(reason)).await;
     }
@@ -752,15 +766,7 @@ pub async fn checkpoint(state: &AppState, id: &str, loops: u32, note: Option<&st
         finish(&state.db, id, false, &format!("loop budget of {} exhausted", task.loop_budget), true).await?;
     }
     let uuid = uuid::Uuid::parse_str(id)?;
-    sqlx::query(
-        "UPDATE noo_tasks SET loops = $2, last_checkpoint = now(), last_note = COALESCE($3, last_note), \
-         state = CASE WHEN state = 'running' THEN 'checkpointed' ELSE state END, updated_at = now() WHERE id = $1",
-    )
-    .bind(uuid)
-    .bind(loops as i32)
-    .bind(note)
-    .execute(&state.db)
-    .await?;
+    crate::repo::tasks::checkpoint(&state.db, uuid, loops as i32, note).await?;
     if let (Some(n), Some(owner)) = (note.filter(|n| !n.trim().is_empty()), task.owner.as_deref()) {
         let env = crate::agent_messages::Envelope::new(owner, "thread", "note", json!({"text": n, "task_id": id, "loop": loops}), Some(&task.thread_id), vec![])
             .with_from(crate::agent_messages::Identity::new(Some(owner), task.node.as_deref(), Some(owner), Some("task")));
@@ -856,7 +862,7 @@ pub async fn mark_queued(db: &sqlx::PgPool, id: &str, node: &str) -> Result<()> 
 /// runner takes it.
 pub async fn mark_running(db: &sqlx::PgPool, id: &str, node: Option<&str>) -> Result<()> {
     let before = match uuid::Uuid::parse_str(id) {
-        Ok(u) => sqlx::query_scalar::<_, String>("SELECT state FROM noo_tasks WHERE id = $1").bind(u).fetch_optional(db).await.ok().flatten(),
+        Ok(u) => crate::repo::tasks::state_of(db, u).await.ok().flatten(),
         Err(_) => None,
     };
     set_state(db, id, "running", node).await?;
@@ -1239,6 +1245,14 @@ pub fn spawn_ready_watcher(state: std::sync::Arc<AppState>) {
         while let Some(msg) = sub.next().await {
             let Some(node) = msg.subject.strip_prefix("harness.ready.") else { continue };
             let node = node.to_string();
+            // i227 fix 1: the harness released these for making no progress.
+            // Fail them before the hand-back below, or they would be handed
+            // straight back to the node that gave up on them.
+            let body: serde_json::Value = serde_json::from_slice(&msg.payload).unwrap_or_default();
+            let (stalled, secs) = stalled_from_ready(&body);
+            for id in stalled {
+                fail_stalled(&state.db, &id, &msg.subject, secs).await;
+            }
             match list_unfinished_on(&state.db, &node).await {
                 Ok(tasks) if !tasks.is_empty() => {
                     tracing::info!(node = %node, count = tasks.len(), "task: harness ready; handing back its tasks");
@@ -1255,6 +1269,41 @@ pub fn spawn_ready_watcher(state: std::sync::Arc<AppState>) {
     });
 }
 
+/// The task ids a harness reported as stalled on `harness.ready`, and its
+/// bound in seconds (i227 fix 1). Anything else in the body is ignored.
+fn stalled_from_ready(body: &serde_json::Value) -> (Vec<String>, u64) {
+    let ids = body
+        .get("stalled")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+        .unwrap_or_default();
+    (ids, body.get("stall_secs").and_then(|v| v.as_u64()).unwrap_or(0))
+}
+
+/// Fail a task a node's harness released as stalled — only one that is
+/// live AND on the node whose subject the report came in on: a node can
+/// end its own work, never another node's.
+async fn fail_stalled(db: &sqlx::PgPool, id: &str, ready_subject_seen: &str, secs: u64) {
+    let task = match get(db, id).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(task = id, error = %e, "task: stalled report not applied");
+            return;
+        }
+    };
+    let Some(node) = task.node.as_deref() else { return };
+    if ready_subject(node) != ready_subject_seen || !matches!(task.state.as_str(), "open" | "running" | "checkpointed") {
+        tracing::warn!(task = id, subject = ready_subject_seen, node, state = %task.state, "task: stalled report from another node or for a finished task; ignored");
+        return;
+    }
+    match finish(db, id, false, &progress::stalled_note(node, secs), false).await {
+        Ok(true) => tracing::warn!(event = "task_stalled", task = id, node, stall_secs = secs, "task: failed; its harness made no progress"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(task = id, error = %e, "task: stalled task not failed"),
+    }
+}
+
 /// Every live task that has gone quiet (see [`is_stale`]), oldest first.
 pub async fn list_stale(db: &sqlx::PgPool) -> Result<Vec<Task>> {
     let rows = sqlx::query(sqlx::AssertSqlSafe(format!("{SELECT} WHERE t.state IN ('running','checkpointed') AND t.loop_budget > 0 AND t.budget_state IS NULL ORDER BY t.updated_at")))
@@ -1263,7 +1312,8 @@ pub async fn list_stale(db: &sqlx::PgPool) -> Result<Vec<Task>> {
     Ok(rows.iter().map(row_to_task).filter(|t| t.stale).collect())
 }
 
-/// The stale-task sweep: every few minutes, name the live
+/// The stale-task sweep: every few minutes, offer queued tasks that have
+/// waited a whole window again ([`offer_waiting_again`]), and name the live
 /// tasks whose runner has gone quiet — to the log and to the operator
 /// alert funnel, once per task per cooldown. It never re-runs or fails
 /// them: a task's loops may have executed tools, and only the operator
@@ -1292,8 +1342,51 @@ pub fn spawn_stale_sweep(state: std::sync::Arc<AppState>) {
                 )
                 .await;
             }
+            offer_waiting_again(&state).await;
         }
     });
+}
+
+/// How long a queued task (`open`, assigned to a node whose harness said
+/// busy) waits before the gateway offers it again (i227 fix 2): at least a
+/// minute, `NOO_TASK_QUEUE_RECHECK_SECS` overrides, default ten minutes.
+pub fn queue_recheck_after(get: &dyn Fn(&str) -> Option<String>) -> std::time::Duration {
+    let secs = get("NOO_TASK_QUEUE_RECHECK_SECS").and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(600);
+    std::time::Duration::from_secs(secs.max(60))
+}
+
+/// Queued tasks that have waited longer than `older_than`, oldest first
+/// (`repo::tasks::waiting_ids`: no parked task, no aggregation parent).
+async fn list_waiting(db: &sqlx::PgPool, older_than: std::time::Duration) -> Result<Vec<Task>> {
+    let mut out = Vec::new();
+    for id in crate::repo::tasks::waiting_ids(db, older_than.as_secs_f64()).await? {
+        if let Some(t) = get(db, &id.to_string()).await? {
+            out.push(t);
+        }
+    }
+    Ok(out)
+}
+
+/// i227 fix 2: offer every task that has waited a whole recheck window for
+/// a busy node again, through [`start`] and its rules: taken → running;
+/// still busy → stays queued, its wait starting over; no answer at all →
+/// the in-process fallback, said so in the record. A queued task used to be
+/// handed out only on that node's `harness.ready`, so a node whose harness
+/// never came back kept it `open` for good.
+async fn offer_waiting_again(state: &std::sync::Arc<AppState>) {
+    let waiting = match list_waiting(&state.db, queue_recheck_after(&|k| std::env::var(k).ok())).await {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(error = %e, "task_queue_recheck: query failed");
+            return;
+        }
+    };
+    for t in waiting {
+        match start(state, &t).await {
+            Ok(s) => tracing::info!(task = %t.id, was_queued_on = ?t.node, node = %s.node, dispatched = s.dispatched, queued = s.queued, "task_queue_recheck"),
+            Err(e) => tracing::warn!(task = %t.id, error = %e, "task_queue_recheck: offer failed"),
+        }
+    }
 }
 
 /// How to name the thing that was running a task, for an operator.
@@ -1369,6 +1462,54 @@ pub fn stale_alert(t: &Task, since: &str) -> crate::operator_alert::OperatorAler
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// i227 fix 1: the progress clock, the stall bound and the report a
+    /// harness sends on `harness.ready`.
+    #[test]
+    fn a_stalled_task_is_measured_bounded_and_reported() {
+        let id = "progress-clock-test-task";
+        assert_eq!(progress::age(id), None);
+        progress::touch(id);
+        assert!(progress::age(id).is_some_and(|a| a < std::time::Duration::from_secs(5)));
+        progress::forget(id);
+        assert_eq!(progress::age(id), None);
+
+        let env = |v: Option<&'static str>| move |k: &str| (k == progress::STALL_ENV).then_some(v).flatten().map(str::to_string);
+        assert_eq!(progress::stall_bound(&env(None)).as_secs(), 2700);
+        assert_eq!(progress::stall_bound(&env(Some("1200"))).as_secs(), 1200);
+        assert_eq!(progress::stall_bound(&env(Some("30"))).as_secs(), 600, "never under ten minutes");
+        assert_eq!(progress::stall_bound(&env(Some("soon"))).as_secs(), 2700);
+
+        let note = progress::stalled_note("mcmini", 2700);
+        assert!(note.starts_with("stalled:") && note.contains("mcmini") && note.contains("2700 s"), "{note}");
+
+        let body = json!({"node": "mcmini", "slot_freed": true, "stalled": ["a", 7, "b"], "stall_secs": 2700});
+        assert_eq!(stalled_from_ready(&body), (vec!["a".to_string(), "b".to_string()], 2700));
+        assert_eq!(stalled_from_ready(&json!({"node": "mcmini"})), (Vec::new(), 0));
+    }
+
+    /// i227 fix 2: the recheck window, and the sweep offering a long-queued
+    /// task again through `start` — only open tasks on a node, never a parked
+    /// one or an aggregation parent.
+    #[test]
+    fn a_long_queued_task_is_offered_again() {
+        let env = |v: Option<&'static str>| move |k: &str| (k == "NOO_TASK_QUEUE_RECHECK_SECS").then_some(v).flatten().map(str::to_string);
+        assert_eq!(queue_recheck_after(&env(None)).as_secs(), 600);
+        assert_eq!(queue_recheck_after(&env(Some("900"))).as_secs(), 900);
+        assert_eq!(queue_recheck_after(&env(Some("5"))).as_secs(), 60, "at least a minute");
+        assert_eq!(queue_recheck_after(&env(Some("later"))).as_secs(), 600);
+
+        let src = include_str!("tasks.rs").split("mod tests {").next().unwrap();
+        let sweep = src.split("pub fn spawn_stale_sweep(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        assert!(sweep.contains("offer_waiting_again(&state).await;"), "the sweep offers queued tasks again");
+        let list = include_str!("repo/tasks.rs").split("pub async fn waiting_ids<").nth(1).unwrap().split("\n}\n").next().unwrap();
+        assert!(src.split("async fn list_waiting(").nth(1).unwrap().contains("crate::repo::tasks::waiting_ids(db, older_than.as_secs_f64())"));
+        for clause in ["state = 'open'", "node IS NOT NULL", "budget_state IS NULL", "loop_budget > 0", "updated_at < now() - make_interval(secs => $1)"] {
+            assert!(list.contains(clause), "{clause}");
+        }
+        let offer = src.split("async fn offer_waiting_again(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        assert!(offer.contains("start(state, &t).await"), "the offer goes through start's rules");
+    }
 
     /// i171: the text a tool-less loop ends with is the task's result —
     /// only while the task is still the runner's to finish.

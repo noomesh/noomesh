@@ -1,0 +1,25 @@
+{
+  "format": "noo-addon-resources/1",
+  "uid": 1000,
+  "mounts": [
+    {"name": "work", "env": "RHADDON_WORK_DIR", "target": "/run/rhaddon"},
+    {"name": "coord", "env": "RHADDON_COORD_DIR", "target": "/run/rhaddon-coord"}
+  ],
+  "resources": [
+    {"name": "gateway-url", "kind": "gateway", "part": "url", "deliver": [{"env": "RHADDON_GATEWAY_URL"}, {"env": "RHADDON_WORKER_GATEWAY_URL"}]},
+    {"name": "gateway-ca", "kind": "gateway", "part": "ca", "deliver": {"file": "work/ca.crt"}},
+    {"name": "origins", "kind": "gateway", "part": "public_origin", "deliver": {"env": "RHADDON_PUBLIC_ORIGINS"}},
+    {"name": "leaf-cert", "kind": "tls_leaf", "hostname": "noo-rhaddon", "part": "cert", "deliver": {"file": "work/leaf.crt"}},
+    {"name": "leaf-key", "kind": "tls_leaf", "hostname": "noo-rhaddon", "part": "key", "deliver": {"file": "work/leaf.key"}},
+    {"name": "leaf-ca", "kind": "tls_leaf", "hostname": "noo-rhaddon", "part": "ca", "deliver": {"file": "work/leaf-ca.crt"}},
+    {"name": "addon-key", "kind": "addon_key", "optional": true, "deliver": {"file": "work/addon-key"}},
+    {"name": "peer-key", "kind": "shared_secret", "deliver": [{"file": "work/peer-key"}, {"file": "coord/peer-key"}]},
+    {"name": "db-url", "kind": "db", "part": "url", "deliver": {"file": "coord/runtime-url"}},
+    {"name": "db-ca", "kind": "db", "part": "ca", "deliver": {"file": "coord/db/ca.crt"}},
+    {"name": "db-cert", "kind": "db", "part": "cert", "deliver": {"file": "coord/db/client.crt"}},
+    {"name": "db-key", "kind": "db", "part": "key", "deliver": {"file": "coord/db/client.key"}},
+    {"name": "db-pass", "kind": "db", "part": "passfile", "deliver": {"file": "coord/db/pgpass"}},
+    {"name": "db-net", "kind": "network", "network": "db", "deliver": {"env": "RHADDON_DB_NETWORK"}},
+    {"name": "gw-net", "kind": "network", "network": "gateway", "deliver": {"env": "RHADDON_GATEWAY_NETWORK"}}
+  ]
+}

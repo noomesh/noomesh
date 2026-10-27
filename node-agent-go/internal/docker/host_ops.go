@@ -115,7 +115,8 @@ func (c *Client) runHelperScript(ctx context.Context, binds []string, script str
 	if err != nil {
 		return -1, "", fmt.Errorf("helper create: %w", err)
 	}
-	defer c.docker.ContainerRemove(context.Background(), resp.ID,
+	// Removal must outlive a cancelled ctx, or a cancelled op leaks the helper.
+	defer c.docker.ContainerRemove(context.WithoutCancel(ctx), resp.ID,
 		client.ContainerRemoveOptions{Force: true})
 
 	if _, err := c.docker.ContainerStart(ctx, resp.ID, client.ContainerStartOptions{}); err != nil {

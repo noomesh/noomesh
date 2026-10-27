@@ -100,7 +100,7 @@ func newShipper(t *testing.T, srv *httptest.Server, node string, tune func(*Conf
 		NodeID:        node,
 		ControllerURL: srv.URL,
 		Client:        srv.Client(),
-		Auth:          func(r *http.Request) { r.Header.Set("Authorization", "Bearer test-token") },
+		Auth:          func(r *http.Request) error { r.Header.Set("Authorization", "Bearer test-token"); return nil },
 		StateDir:      t.TempDir(),
 		FlushEvery:    50 * time.Millisecond,
 		FlushLines:    1000,

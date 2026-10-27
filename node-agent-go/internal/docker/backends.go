@@ -29,6 +29,7 @@ import (
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
 	nodeconfig "github.com/noomesh/noomesh/node-agent-go/internal/config"
+	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlenv"
 	"github.com/noomesh/noomesh/node-agent-go/internal/dataroots"
 	"github.com/noomesh/noomesh/node-agent-go/internal/preseed"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
@@ -663,13 +664,13 @@ const SpecHashLabel = "noo.spec.hash"
 //
 // `overrides` lets the controller dictate image + parser
 // config; empty fields fall through to env-based resolution.
-func (c *Client) StartBackendSDK(backend, model string, gpuCount int, overrides StartOverrides) error {
+func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpuCount int, overrides StartOverrides) error {
 	spec, ok := backendSpecs[backend]
 	if !ok {
 		return fmt.Errorf("unknown backend: %s", backend)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
 
 	// ONE image choice (image_choice.go, shared with BackendImageRef):
@@ -1112,13 +1113,13 @@ func (c *Client) StartBackendSDK(backend, model string, gpuCount int, overrides 
 }
 
 // StopBackendSDK stops and removes a backend container using the Docker API.
-func (c *Client) StopBackendSDK(backend string) error {
+func (c *Client) StopBackendSDK(ctx context.Context, backend string) error {
 	spec, ok := backendSpecs[backend]
 	if !ok {
 		return fmt.Errorf("unknown backend: %s", backend)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	timeout := 10
@@ -1318,10 +1319,9 @@ type artifactManifest struct {
 // full manifest. Nil means "no manifest available" — same contract as
 // fetchArtifactDigest's empty string, for the same reasons (see above).
 func fetchArtifactManifest(ctx context.Context, kind, name string) *artifactManifest {
-	controller := strings.TrimRight(os.Getenv("CONTROLLER_URL"), "/")
-	if controller == "" {
-		return nil
-	}
+	controller := strings.TrimRight(ctrlenv.ControllerURL(), "/")
+	// One resolver, one default: ctrlenv.ControllerURL() is never empty, the
+	// heartbeat and this lookup always agree on where the controller is.
 	reqURL := fmt.Sprintf("%s/api/artifacts/manifest/%s/%s", controller, kind, url.PathEscape(name))
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -1331,7 +1331,10 @@ func fetchArtifactManifest(ctx context.Context, kind, name string) *artifactMani
 	}
 	if secret := nodeconfig.Load().ClusterSecret; secret != "" {
 		nodeID := os.Getenv("NODE_ID")
-		auth.SetClusterAuth(req, nodeID, secret)
+		if err := auth.SetClusterAuth(req, nodeID, secret); err != nil {
+			slog.Warn("artifact manifest request not signed; not sent", "error", err)
+			return nil
+		}
 	}
 	transport, err := nodeconfig.Load().HTTPTransport()
 	if err != nil {

@@ -16,6 +16,7 @@
 //! Attribution: mutations record the `AuthActor` (JWT sub) when present,
 //! else "cluster-cli".
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 use axum::{
     Router,
@@ -27,6 +28,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::{AuthActor, RequesterCtx};
+use crate::authz::{Operator, OperatorOrInternal};
 use crate::state::AppState;
 use super::{AppError, AppResult};
 
@@ -233,9 +235,8 @@ fn hash_password(pw: &str) -> Result<String, AppError> {
 /// legacy surface.
 async fn users_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     let rows = crate::repo::users::list_with_lock(&state.db).await?;
 
     let users: Vec<Value> = rows
@@ -310,14 +311,10 @@ async fn user_create(
         )));
     }
     tracing::info!(user = %body.username, by = %by, "user_created");
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "user_create",
-        "info",
-        &by,
-        body.username.trim(),
-        "ok",
-        json!({ "scopes": body.scopes }),
+        AuditEvent::new(AuditKind::UserCreate, &by, body.username.trim())
+            .details(json!({ "scopes": body.scopes })),
     )
     .await;
     Ok(Json(json!({
@@ -358,29 +355,17 @@ async fn user_set_password(
     require_may_manage(&state.db, &ctx, &username).await?;
     check_new_password(&body.password, username.trim())?;
     let hashed = hash_password(&body.password)?;
-    let result = sqlx::query(
-        "UPDATE noo_users SET hashed_password = $1, password_changed_at = NOW(), \
-         failed_login_count = 0, locked_until = NULL WHERE username = $2",
-    )
-    .bind(&hashed)
-    .bind(&username)
-    .execute(&state.db)
-    .await?;
+    let result = crate::repo::users::set_password(&state.db, &username, &hashed).await?;
 
-    if result.rows_affected() == 0 {
+    if result == 0 {
         return Err(AppError::NotFound(format!("user '{username}' not found")));
     }
     // A new password ends every session the old one opened.
     crate::session_floor::end_account_sessions(&state, &username, crate::session_floor::Reason::AccountChange).await;
     tracing::info!(user = %username, by = %by, "password_changed");
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "user_set_password",
-        "info",
-        &by,
-        username.trim(),
-        "ok",
-        json!({}),
+        AuditEvent::new(AuditKind::UserSetPassword, &by, username.trim()),
     )
     .await;
     Ok(Json(json!({ "status": "ok", "username": username })))
@@ -413,14 +398,10 @@ async fn user_disable(
     // the not-before floor that kills the access JWT, the service-key cache.
     crate::session_floor::end_account_sessions(&state, &username, crate::session_floor::Reason::AccountChange).await;
     tracing::info!(user = %username, by = %by, "user_disabled");
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "user_set_disabled",
-        "info",
-        &by,
-        username.trim(),
-        "ok",
-        json!({ "disabled": true }),
+        AuditEvent::new(AuditKind::UserSetDisabled, &by, username.trim())
+            .details(json!({ "disabled": true })),
     )
     .await;
     Ok(Json(json!({ "status": "ok", "username": username, "disabled": true })))
@@ -459,14 +440,10 @@ async fn user_set_scopes(
     let outcome = exec_user_set_scopes(&state.db, &username, Some(body.scopes), &by)
         .await
         .map_err(AppError::BadRequest)?;
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "user_set_scopes",
-        "info",
-        &by,
-        username.trim(),
-        "ok",
-        json!({ "scopes": outcome["scopes"] }),
+        AuditEvent::new(AuditKind::UserSetScopes, &by, username.trim())
+            .details(json!({ "scopes": outcome["scopes"] })),
     )
     .await;
     crate::session_floor::end_account_sessions(&state, username.trim(), crate::session_floor::Reason::AccountChange).await;
@@ -525,14 +502,10 @@ async fn user_set_role(
         return Err(AppError::NotFound(format!("user '{username}' not found")));
     }
     // Audited with the username and the new role, NOTHING else.
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "user_set_role",
-        "info",
-        &by,
-        &username,
-        "ok",
-        json!({ "role": role.as_str() }),
+        AuditEvent::new(AuditKind::UserSetRole, &by, &username)
+            .details(json!({ "role": role.as_str() })),
     )
     .await;
     crate::session_floor::end_account_sessions(&state, &username, crate::session_floor::Reason::AccountChange).await;
@@ -550,11 +523,10 @@ async fn user_set_role(
 /// it read-only.
 async fn posture_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
     // Which security gates are open is operator information: it tells a
     // prober whether the external MCP door is open.
-    users_admin_read_guard(&ctx)?;
     // Previously `.unwrap_or_default()`. On any DB failure every gate then
     // reported `db_value: null, source: "env", pending_restart: false` — i.e.
     // "the running process matches the desired posture, nothing pending". On a
@@ -752,14 +724,10 @@ async fn posture_set(
     // Tamper-evident audit sink (not the JSONL) — posture changes are high-value.
     // The actor names the operator when an operator certificate admitted the
     // write, and the shared-secret lane otherwise.
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "security_posture_set",
-        "warning",
-        &admission.audit_actor(),
-        key,
-        "ok",
-        json!({ "key": key, "value": value, "effect": "next restart" }),
+        AuditEvent::new(AuditKind::SecurityPostureSet, &admission.audit_actor(), key)
+            .details(json!({ "key": key, "value": value, "effect": "next restart" })),
     )
     .await;
     tracing::warn!(gate = %key, value = %value, "security_posture_set (restart to apply)");
@@ -926,14 +894,10 @@ async fn posture_apply_profile(
         .filter_map(|b| b["key"].as_str())
         .collect();
 
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "security_posture_profile",
-        "warning",
-        &admission.audit_actor(),
-        name,
-        "ok",
-        json!({
+        AuditEvent::new(AuditKind::SecurityPostureProfile, &admission.audit_actor(), name)
+            .details(json!({
             "profile": name,
             "gates": writes.len(),
             "changed": changed,
@@ -941,7 +905,7 @@ async fn posture_apply_profile(
             "bridges_left_alone": skipped.iter().filter_map(|b| b["key"].as_str()).collect::<Vec<_>>(),
             "bridges_open": bridges_open,
             "effect": "next restart",
-        }),
+        })),
     )
     .await;
     tracing::warn!(
@@ -1180,14 +1144,11 @@ async fn user_erase(
         Err(e @ AppError::RetryLater { .. }) => {
             // A refused erase is an event an operator should be able to see. No content.
             if let AppError::RetryLater { retry_after_secs, .. } = &e {
-                crate::routes::core::audit_event(
+                crate::audit::record(
                     &state.db,
-                    "user_erase_refused",
-                    "warning",
-                    &actor(&actor_ext),
-                    &username,
-                    "refused",
-                    json!({ "reason": "write operation in flight", "retry_after_secs": retry_after_secs, "keep_account": body.keep_account }),
+                    AuditEvent::new(AuditKind::UserEraseRefused, &actor(&actor_ext), &username)
+                        .outcome(crate::audit::Outcome::custom("refused"))
+                        .details(json!({ "reason": "write operation in flight", "retry_after_secs": retry_after_secs, "keep_account": body.keep_account })),
                 )
                 .await;
             }
@@ -1197,14 +1158,10 @@ async fn user_erase(
     };
     if !body.dry_run {
         let by = actor(&actor_ext);
-        crate::routes::core::audit_event(
+        crate::audit::record(
             &state.db,
-            "user_erase",
-            "warning",
-            &by,
-            &username,
-            "ok",
-            json!({ "run_id": out["run_id"], "keep_account": body.keep_account, "deleted": out["deleted"], "kb": out["kb"] }),
+            AuditEvent::new(AuditKind::UserErase, &by, &username)
+                .details(json!({ "run_id": out["run_id"], "keep_account": body.keep_account, "deleted": out["deleted"], "kb": out["kb"] })),
         )
         .await;
         tracing::warn!(user = %username, run_id = %out["run_id"], by = %by, keep_account = body.keep_account, "user_erased");
@@ -1288,10 +1245,7 @@ pub(crate) async fn erase_account(
     // failure rolls the whole erasure back (nothing half-deleted, unsnapshotted).
     let run_id = uuid::Uuid::new_v4();
     let mut tx = db.begin().await?;
-    let owner: Option<uuid::Uuid> = sqlx::query_scalar("SELECT user_uuid FROM noo_users WHERE username = $1")
-        .bind(&username)
-        .fetch_optional(&mut *tx)
-        .await?;
+    let owner: Option<uuid::Uuid> = crate::repo::users::uuid_by_username(&mut *tx, &username).await?;
     if let Some(owner) = owner {
         // The lock every operation start takes: from here no start for this
         // account can commit until this transaction ends.
@@ -1371,9 +1325,8 @@ pub(crate) async fn erase_account(
 /// no archived content. Admin read.
 async fn erasure_archive_status(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     Ok(Json(crate::erasure_archive::status(&state.db).await?))
 }
 
@@ -1384,9 +1337,8 @@ async fn erasure_archive_status(
 /// GET /api/security/orgs
 async fn orgs_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     let rows = sqlx::query_as::<_, (
         String,
         String,
@@ -1399,11 +1351,7 @@ async fn orgs_list(
     .await?;
 
     // Member counts per org (small tables; one grouped scan).
-    let counts = sqlx::query_as::<_, (Option<String>, i64)>(
-        "SELECT org_id, COUNT(*) FROM noo_users GROUP BY org_id",
-    )
-    .fetch_all(&state.db)
-    .await?;
+    let counts = crate::repo::users::member_counts_by_org(&state.db).await?;
     let count_of = |id: &str| -> i64 {
         counts.iter().find(|(o, _)| o.as_deref() == Some(id)).map(|(_, n)| *n).unwrap_or(0)
     };
@@ -1457,14 +1405,10 @@ async fn org_create(
         return Err(AppError::Conflict(format!("org '{id}' already exists")));
     }
     tracing::info!(org = %id, by = %actor(&actor_ext), "org_created");
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "org_create",
-        "info",
-        &actor(&actor_ext),
-        name,
-        "ok",
-        json!({ "org_id": id }),
+        AuditEvent::new(AuditKind::OrgCreate, &actor(&actor_ext), name)
+            .details(json!({ "org_id": id })),
     )
     .await;
     Ok(Json(json!({ "status": "ok", "id": id, "name": name })))
@@ -1505,14 +1449,10 @@ async fn user_set_org(
         return Err(AppError::NotFound(format!("user '{username}' not found")));
     }
     tracing::info!(user = %username, org = %org_id, by = %actor(&actor_ext), "user_org_set");
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "user_set_org",
-        "info",
-        &actor(&actor_ext),
-        username.trim(),
-        "ok",
-        json!({ "org_id": org_id }),
+        AuditEvent::new(AuditKind::UserSetOrg, &actor(&actor_ext), username.trim())
+            .details(json!({ "org_id": org_id })),
     )
     .await;
     Ok(Json(json!({ "status": "ok", "username": username, "org_id": org_id })))
@@ -1550,12 +1490,8 @@ async fn user_link_create(
         ));
     }
     // The link points at a real account — reject before creating a dangling map.
-    let exists: Option<(String,)> =
-        sqlx::query_as("SELECT username FROM noo_users WHERE username = $1")
-            .bind(&username)
-            .fetch_optional(&state.db)
-            .await?;
-    if exists.is_none() {
+    let exists = crate::repo::users::exists(&state.db, &username).await?;
+    if !exists {
         return Err(AppError::NotFound(format!(
             "user '{username}' not found — create it first (noo security user create)"
         )));
@@ -1578,14 +1514,10 @@ async fn user_link_create(
         user = %username, channel = %channel, channel_user_id = %channel_user_id,
         by = %actor(&actor_ext), "channel_link_created"
     );
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "user_channel_link",
-        "info",
-        &actor(&actor_ext),
-        username.trim(),
-        "ok",
-        json!({ "channel": channel, "channel_user_id": channel_user_id }),
+        AuditEvent::new(AuditKind::UserChannelLink, &actor(&actor_ext), username.trim())
+            .details(json!({ "channel": channel, "channel_user_id": channel_user_id })),
     )
     .await;
     Ok(Json(json!({
@@ -1599,12 +1531,11 @@ async fn user_link_create(
 /// GET /api/security/users/{username}/links — all channel links for a user.
 async fn user_links_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
     Path(username): Path<String>,
 ) -> AppResult {
     // A user's channel links are an impersonation primitive on the chat
     // surface — operators only.
-    users_admin_read_guard(&ctx)?;
     let rows = sqlx::query_as::<_, (
         String,
         String,
@@ -1683,14 +1614,10 @@ async fn channel_link_delete(
         channel = %channel, channel_user_id = %channel_user_id,
         by = %actor(&actor_ext), "channel_link_deleted"
     );
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "user_channel_unlink",
-        "info",
-        &actor(&actor_ext),
-        channel,
-        "ok",
-        json!({ "channel_user_id": channel_user_id }),
+        AuditEvent::new(AuditKind::UserChannelUnlink, &actor(&actor_ext), channel)
+            .details(json!({ "channel_user_id": channel_user_id })),
     )
     .await;
     Ok(Json(json!({ "status": "ok", "channel": channel, "channel_user_id": channel_user_id })))
@@ -1741,14 +1668,10 @@ async fn team_space_link(
     .await?;
     tracing::info!(team = %team, channel = %channel, space = %space_id,
         by = %actor(&actor_ext), "space_team_linked");
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "team_space_link",
-        "info",
-        &actor(&actor_ext),
-        team,
-        "ok",
-        json!({ "channel": channel, "space_id": space_id }),
+        AuditEvent::new(AuditKind::TeamSpaceLink, &actor(&actor_ext), team)
+            .details(json!({ "channel": channel, "space_id": space_id })),
     )
     .await;
     Ok(Json(json!({ "status": "ok", "team": team, "channel": channel, "space_id": space_id })))
@@ -1757,10 +1680,9 @@ async fn team_space_link(
 /// GET /api/security/teams/{team}/spaces — all spaces linked to a team.
 async fn team_spaces_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
     Path(team): Path<String>,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     let rows = sqlx::query_as::<_, (String, String, Option<chrono::DateTime<chrono::Utc>>)>(
         "SELECT channel, channel_space_id, created_at FROM noo_channel_team_links \
          WHERE team = $1 ORDER BY created_at DESC",
@@ -1800,14 +1722,10 @@ async fn team_space_unlink(
     }
     tracing::info!(channel = %channel, space = %space_id,
         by = %actor(&actor_ext), "space_team_unlinked");
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "team_space_unlink",
-        "info",
-        &actor(&actor_ext),
-        channel,
-        "ok",
-        json!({ "space_id": space_id }),
+        AuditEvent::new(AuditKind::TeamSpaceUnlink, &actor(&actor_ext), channel)
+            .details(json!({ "space_id": space_id })),
     )
     .await;
     Ok(Json(json!({ "status": "ok", "channel": channel, "space_id": space_id })))
@@ -1820,9 +1738,8 @@ async fn team_space_unlink(
 /// GET /api/security/role-grants
 async fn role_grants_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     let rows = crate::repo::kb_grants::list_grants_detailed(&state.db).await?;
 
     let grants: Vec<Value> = rows
@@ -1904,14 +1821,10 @@ async fn user_grant_roles(
     let by = actor(&actor_ext);
     crate::repo::kb_grants::upsert_roles(&state.db, &username, &json!(merged), &by).await?;
     tracing::info!(user = %username, roles = ?merged, by = %by, "kb_roles_granted");
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "kb_roles_grant",
-        "info",
-        &actor(&actor_ext),
-        username.trim(),
-        "ok",
-        json!({ "roles": merged }),
+        AuditEvent::new(AuditKind::KbRolesGrant, &actor(&actor_ext), username.trim())
+            .details(json!({ "roles": merged })),
     )
     .await;
     Ok(Json(json!({ "status": "ok", "username": username, "roles": merged })))
@@ -1943,14 +1856,10 @@ async fn user_revoke_roles(
         crate::repo::kb_grants::update_roles(&state.db, &username, &json!(remaining), &by).await?;
     }
     tracing::info!(user = %username, roles = ?remaining, by = %by, "kb_roles_revoked");
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "kb_roles_revoke",
-        "info",
-        &actor(&actor_ext),
-        username.trim(),
-        "ok",
-        json!({ "roles": remaining }),
+        AuditEvent::new(AuditKind::KbRolesRevoke, &actor(&actor_ext), username.trim())
+            .details(json!({ "roles": remaining })),
     )
     .await;
     Ok(Json(json!({ "status": "ok", "username": username, "roles": remaining })))
@@ -1963,13 +1872,11 @@ async fn user_revoke_roles(
 /// GET /api/security/user-proposals
 async fn proposals_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: Operator,
 ) -> AppResult {
-    // Mirrors the legacy listing's `users_admin_read_guard` (the design step
-    // 4): the queue carries usernames, requested scopes and requesters, so a
-    // sub-operator account must not enumerate it. Cluster-HMAC (None) passes,
-    // as it does on the legacy listing.
-    users_admin_read_guard(&ctx)?;
+    // The `Operator` extractor (i241): the queue carries usernames, requested
+    // scopes and requesters, so a sub-operator account must not enumerate it,
+    // and neither may a call with no user context.
     let rows = proposal_rows(&state.db).await?;
 
     let proposals: Vec<Value> = rows
@@ -2030,9 +1937,8 @@ pub(crate) async fn proposal_row(db: &sqlx::PgPool, id: i64) -> Result<Option<Pr
 async fn proposal_get(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     let row = proposal_row(&state.db, id).await?;
     let Some((id, action, payload, by, status, created, decided_by)) = row else {
         return Err(AppError::NotFound(format!("proposal {id} not found")));
@@ -2156,14 +2062,10 @@ async fn proposal_decide(
         // Audited after the commit, like kb_team_delete: the row records what
         // actually happened, so it must not exist for a decision that rolled
         // back.
-        crate::routes::core::audit_event(
+        crate::audit::record(
             &state.db,
-            "user_proposal_denied",
-            "info",
-            &by,
-            &subject,
-            "ok",
-            json!({ "proposal_id": id, "action": action, "reason": body.reason }),
+            AuditEvent::new(AuditKind::UserProposalDenied, &by, &subject)
+                .details(json!({ "proposal_id": id, "action": action, "reason": body.reason })),
         )
         .await;
         return Ok(Json(json!({ "status": "denied", "id": id })));
@@ -2290,14 +2192,10 @@ async fn proposal_decide(
             // trail would persist a live credential in the one table designed
             // to be kept, exported and read by people who were not the
             // requester.
-            crate::routes::core::audit_event(
+            crate::audit::record(
                 &state.db,
-                "user_proposal_approved",
-                "info",
-                &by,
-                &subject,
-                "ok",
-                json!({ "proposal_id": id, "action": action, "result": result }),
+                AuditEvent::new(AuditKind::UserProposalApproved, &by, &subject)
+                    .details(json!({ "proposal_id": id, "action": action, "result": result })),
             )
             .await;
             let mut resp = json!({
@@ -2319,14 +2217,11 @@ async fn proposal_decide(
             // attempted and did not succeed is exactly what an audit trail is
             // for — recording only the successes would make the record a
             // highlight reel.
-            crate::routes::core::audit_event(
+            crate::audit::record(
                 &state.db,
-                "user_proposal_failed",
-                "warning",
-                &by,
-                &subject,
-                "failed",
-                json!({ "proposal_id": id, "action": action, "error": e }),
+                AuditEvent::new(AuditKind::UserProposalFailed, &by, &subject)
+                    .outcome(crate::audit::Outcome::custom("failed"))
+                    .details(json!({ "proposal_id": id, "action": action, "error": e })),
             )
             .await;
             Err(AppError::BadRequest(format!("proposal {id} failed: {e}")))
@@ -2341,9 +2236,8 @@ async fn proposal_decide(
 /// GET /api/security/service-keys — never returns raw keys or hashes.
 async fn service_keys_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: Operator,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     let rows = sqlx::query_as::<_, (
         String,
         Value,
@@ -2403,8 +2297,7 @@ async fn service_keys_list(
 /// service-key provision` reads it to show the operator what an add-on's
 /// declared grant opens, and to refuse a word the issuer would reject BEFORE
 /// minting anything. Operator-gated like the listing beside it.
-async fn service_key_scopes(ctx: Option<Extension<RequesterCtx>>) -> AppResult {
-    users_admin_read_guard(&ctx)?;
+async fn service_key_scopes(_op: OperatorOrInternal) -> AppResult {
     Ok(Json(scope_vocabulary()))
 }
 
@@ -2526,11 +2419,8 @@ async fn validate_operator_key_binding(
             crate::mcp_local::OPERATOR_SCOPE
         )));
     };
-    let row: Option<(String,)> = sqlx::query_as("SELECT role FROM noo_users WHERE username = $1")
-        .bind(u)
-        .fetch_optional(db)
-        .await?;
-    match row.as_ref().map(|(r,)| r.as_str()) {
+    let row: Option<String> = crate::repo::users::role_of(db, u).await?;
+    match row.as_deref() {
         Some("admin") => Ok(()),
         Some(role) => Err(AppError::BadRequest(format!(
             "user '{u}' has role '{role}'; an '{}' key needs an admin",
@@ -2618,15 +2508,11 @@ async fn validate_key_user(
     let Some(u) = user_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(());
     };
-    let row: Option<(bool,)> =
-        sqlx::query_as("SELECT disabled FROM noo_users WHERE username = $1")
-            .bind(u)
-            .fetch_optional(db)
-            .await?;
+    let row: Option<bool> = crate::repo::users::disabled_flag(db, u).await?;
     match row {
         None => Err(AppError::BadRequest(format!("user '{u}' not found"))),
-        Some((true,)) => Err(AppError::BadRequest(format!("user '{u}' is disabled"))),
-        Some((false,)) => Ok(()),
+        Some(true) => Err(AppError::BadRequest(format!("user '{u}' is disabled"))),
+        Some(false) => Ok(()),
     }
 }
 
@@ -2666,14 +2552,10 @@ async fn service_key_issue(
         by = %actor(&actor_ext),
         "service_key_issued"
     );
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "service_key_issue",
-        "info",
-        &actor(&actor_ext),
-        &body.consumer,
-        "ok",
-        json!({ "scopes": body.scopes, "rpm_limit": body.rpm, "user_id": body.user_id }),
+        AuditEvent::new(AuditKind::ServiceKeyIssue, &actor(&actor_ext), &body.consumer)
+            .details(json!({ "scopes": body.scopes, "rpm_limit": body.rpm, "user_id": body.user_id })),
     )
     .await;
     Ok(Json(json!({
@@ -2795,14 +2677,10 @@ async fn service_key_self_issue(
     .await?;
 
     tracing::info!(consumer = %consumer, user = %username, replaced, "service_key_self_issued");
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "service_key_self_issue",
-        "info",
-        &username,
-        &consumer,
-        "ok",
-        json!({ "replaced_active": replaced, "rpm_limit": SELF_KEY_DEFAULT_RPM }),
+        AuditEvent::new(AuditKind::ServiceKeySelfIssue, &username, &consumer)
+            .details(json!({ "replaced_active": replaced, "rpm_limit": SELF_KEY_DEFAULT_RPM })),
     )
     .await;
 
@@ -2870,14 +2748,10 @@ async fn service_key_self_revoke(
     .await?
     .rows_affected();
     tracing::info!(consumer = %consumer, n = revoked, "service_key_self_revoked");
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "service_key_self_revoke",
-        "info",
-        &username,
-        &consumer,
-        "ok",
-        json!({ "revoked": revoked }),
+        AuditEvent::new(AuditKind::ServiceKeySelfRevoke, &username, &consumer)
+            .details(json!({ "revoked": revoked })),
     )
     .await;
     Ok(Json(json!({ "status": "ok", "consumer": consumer, "revoked": revoked })))
@@ -2998,14 +2872,10 @@ async fn service_key_retire(
     .rows_affected();
 
     tracing::info!(consumer = %consumer, by = %actor(&actor_ext), retired, "service_key_retired");
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "service_key_retire",
-        "info",
-        &actor(&actor_ext),
-        &consumer,
-        "ok",
-        json!({ "retired": retired }),
+        AuditEvent::new(AuditKind::ServiceKeyRetire, &actor(&actor_ext), &consumer)
+            .details(json!({ "retired": retired })),
     )
     .await;
     Ok(Json(json!({ "consumer": consumer, "retired": retired })))
@@ -3027,14 +2897,10 @@ async fn service_key_revoke(
     .execute(&state.db)
     .await?;
     tracing::info!(consumer = %consumer, n = result.rows_affected(), by = %actor(&actor_ext), "service_keys_revoked");
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "service_key_revoke",
-        "info",
-        &actor(&actor_ext),
-        &consumer,
-        "ok",
-        json!({ "revoked": result.rows_affected() }),
+        AuditEvent::new(AuditKind::ServiceKeyRevoke, &actor(&actor_ext), &consumer)
+            .details(json!({ "revoked": result.rows_affected() })),
     )
     .await;
     Ok(Json(json!({
@@ -3123,14 +2989,10 @@ async fn service_key_revoke_and_disable(
         consumer = %consumer, user = %username, revoked,
         by = %actor(&actor_ext), "service_key_revoked_and_account_disabled"
     );
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "service_key_revoke_and_disable",
-        "warning",
-        &actor(&actor_ext),
-        &consumer,
-        "ok",
-        json!({ "revoked": revoked, "user_id": username }),
+        AuditEvent::new(AuditKind::ServiceKeyRevokeAndDisable, &actor(&actor_ext), &consumer)
+            .details(json!({ "revoked": revoked, "user_id": username })),
     )
     .await;
     Ok(Json(json!({
@@ -3211,14 +3073,10 @@ async fn service_key_rotate(
         superseded,
         "service_key_rotated"
     );
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "service_key_rotate",
-        "info",
-        &actor(&actor_ext),
-        &consumer,
-        "ok",
-        json!({ "scopes": body.scopes, "rpm_limit": prev_rpm }),
+        AuditEvent::new(AuditKind::ServiceKeyRotate, &actor(&actor_ext), &consumer)
+            .details(json!({ "scopes": body.scopes, "rpm_limit": prev_rpm })),
     )
     .await;
     Ok(Json(json!({
@@ -3262,14 +3120,10 @@ async fn service_key_set_quota(
         )));
     }
     tracing::info!(consumer = %consumer, rpm = ?val, by = %actor(&actor_ext), "service_key_quota_set");
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "service_key_set_quota",
-        "info",
-        &actor(&actor_ext),
-        &consumer,
-        "ok",
-        json!({ "rpm_limit": val, "updated_keys": result.rows_affected() }),
+        AuditEvent::new(AuditKind::ServiceKeySetQuota, &actor(&actor_ext), &consumer)
+            .details(json!({ "rpm_limit": val, "updated_keys": result.rows_affected() })),
     )
     .await;
     Ok(Json(json!({
@@ -3441,10 +3295,7 @@ async fn effective_tier(
     username: &str,
 ) -> Result<Option<crate::auth::Role>, AppError> {
     let row: Option<(String, Value)> =
-        sqlx::query_as("SELECT role, scopes FROM noo_users WHERE username = $1")
-            .bind(username.trim())
-            .fetch_optional(db)
-            .await?;
+        crate::repo::users::role_and_scopes(db, username.trim()).await?;
     Ok(row.map(|(role, scopes)| {
         // An unparseable role column must not silently read as `User` — that
         // is the low-protection answer. Anything we cannot parse is treated
@@ -3540,13 +3391,7 @@ fn require_may_grant_value(
 /// desynced row cannot make the fleet look like it has fewer admins than it
 /// does — which would be the direction that lets the guard be bypassed.
 async fn enabled_admin_count(db: &sqlx::PgPool) -> Result<i64, AppError> {
-    let (n,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM noo_users WHERE disabled = false \
-         AND (role = 'admin' OR scopes @> '[\"admin\"]'::jsonb)",
-    )
-    .fetch_one(db)
-    .await?;
-    Ok(n)
+    Ok(crate::repo::users::enabled_admin_count(db).await?)
 }
 
 /// The last-admin guard: refuse to disable, erase or demote the only enabled
@@ -3566,11 +3411,8 @@ async fn require_not_last_admin(
     if effective_tier(db, username).await? != Some(crate::auth::Role::Admin) {
         return Ok(());
     }
-    let disabled: Option<(bool,)> = sqlx::query_as("SELECT disabled FROM noo_users WHERE username = $1")
-        .bind(username)
-        .fetch_optional(db)
-        .await?;
-    if disabled.map(|(d,)| d).unwrap_or(true) {
+    let disabled: Option<bool> = crate::repo::users::disabled_flag(db, username).await?;
+    if disabled.unwrap_or(true) {
         // Already disabled, or gone: it is not one of the live admins, so
         // removing it cannot strand the surface.
         return Ok(());
@@ -3582,21 +3424,6 @@ async fn require_not_last_admin(
         )));
     }
     Ok(())
-}
-
-/// Mirrors `_users_admin_error(body)` for reads: users admin is operator-only
-/// even on GETs (a read-scope user must not enumerate accounts); callers with
-/// no `RequesterCtx` are internal/cluster-HMAC and pass. An authenticated
-/// caller below Operator is `403` (the house convention, as `operator_guard`
-/// in mcp_registry.rs); a missing credential is `401` from the auth layer
-/// before this runs. It was `400`, which told a client its request was
-/// malformed rather than that it lacked the role.
-fn users_admin_read_guard(ctx: &Option<Extension<RequesterCtx>>) -> Result<(), AppError> {
-    match ctx {
-        None => Ok(()),
-        Some(Extension(r)) if is_operator(r) => Ok(()),
-        Some(_) => Err(AppError::Forbidden("operator role required".into())),
-    }
 }
 
 /// Mirrors `_users_admin_error(body, internal_ok=False)` for mutations:
@@ -3797,9 +3624,8 @@ async fn unknown_team_roles(
 /// [ported from workers/users.py::_users_list (worker.api.users) 2026-07-18]
 async fn api_users_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: Operator,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     let rows = crate::repo::users::list_with_lock(&state.db).await?;
     let users: Vec<Value> = rows
         .into_iter()
@@ -3836,14 +3662,10 @@ async fn api_users_disable(
     let outcome = exec_user_set_disabled(&state.db, &username, disabled, &by)
         .await
         .map_err(AppError::BadRequest)?;
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "user_set_disabled",
-        "info",
-        &by,
-        username.trim(),
-        "ok",
-        json!({ "disabled": outcome["disabled"] }),
+        AuditEvent::new(AuditKind::UserSetDisabled, &by, username.trim())
+            .details(json!({ "disabled": outcome["disabled"] })),
     )
     .await;
     if outcome["disabled"].as_bool() == Some(true) {
@@ -4082,14 +3904,11 @@ async fn api_users_propose(
         "by": requested_by, "result": "pending",
     }))
     .await;
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "user_proposal_filed",
-        "info",
-        &requested_by,
-        username.as_str().unwrap_or("?"),
-        "pending",
-        json!({ "proposal_id": pid, "proposal_action": action, "notified": notified }),
+        AuditEvent::new(AuditKind::UserProposalFiled, &requested_by, username.as_str().unwrap_or("?"))
+            .outcome(crate::audit::Outcome::custom("pending"))
+            .details(json!({ "proposal_id": pid, "proposal_action": action, "notified": notified })),
     )
     .await;
 
@@ -4106,9 +3925,8 @@ async fn api_users_propose(
 /// [ported from workers/users.py::_users_proposals_list (worker.api.users.proposals) 2026-07-18]
 async fn api_users_proposals(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     let rows = sqlx::query_as::<_, (
         i32,
         String,
@@ -4160,9 +3978,8 @@ async fn api_users_proposals(
 /// [ported from workers/kb.py::_kb_grants_list (worker.api.kb.grants) 2026-07-18]
 async fn api_kb_grants(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     // NOTE: pre-existing behaviour — a database error is swallowed into an
     // empty grant list rather than surfaced. Preserved deliberately so this
     // refactor changes nothing; it is the #247 silent-failure class and worth
@@ -4185,9 +4002,8 @@ async fn api_kb_grants(
 /// [ported from workers/kb.py::_kb_rules_list (worker.api.kb.rules) 2026-07-18]
 async fn api_kb_rules(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     let rows = sqlx::query_as::<_, (i32, i32, String, Value, bool)>(
         "SELECT id, priority, match, roles, enabled FROM noo_kb_source_rules \
          ORDER BY priority, id",
@@ -4299,14 +4115,10 @@ async fn api_kb_rule(
         .execute(&state.db)
         .await?;
     }
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "kb_rule_set",
-        "info",
-        &updated_by,
-        &match_,
-        "ok",
-        json!({ "roles": roles }),
+        AuditEvent::new(AuditKind::KbRuleSet, &updated_by, &match_)
+            .details(json!({ "roles": roles })),
     )
     .await;
     tracing::info!(rule = %match_, by = %updated_by, "kb_rule_set (mesh-ui surface)");
@@ -4389,12 +4201,7 @@ async fn api_kb_teams_create(
     // org; default to `default` (single-org, or internal caller).
     let mut org_id: Option<String> = None;
     if by != "internal" {
-        let row: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT org_id FROM noo_users WHERE username = $1")
-                .bind(&by)
-                .fetch_optional(&state.db)
-                .await?;
-        org_id = row.and_then(|(o,)| o);
+        org_id = crate::repo::users::org_of(&state.db, &by).await?;
     }
     let org_id = org_id.unwrap_or_else(|| "default".to_string());
 
@@ -4409,14 +4216,9 @@ async fn api_kb_teams_create(
     if inserted == 0 {
         return Err(AppError::BadRequest(format!("team '{name}' already exists")));
     }
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "kb_team_create",
-        "info",
-        &by,
-        &name,
-        "ok",
-        json!({}),
+        AuditEvent::new(AuditKind::KbTeamCreate, &by, &name),
     )
     .await;
     tracing::info!(team = %name, by = %by, "kb_team_create (mesh-ui surface)");
@@ -4517,14 +4319,10 @@ async fn team_delete_inner(
     if deleted_teams == 0 {
         return Err(AppError::BadRequest(format!("team '{name}' not found")));
     }
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "kb_team_delete",
-        "info",
-        &by,
-        &name,
-        "ok",
-        json!({ "forced": force, "members_stripped": members.len(), "docs_orphaned": doc_count }),
+        AuditEvent::new(AuditKind::KbTeamDelete, &by, &name)
+            .details(json!({ "forced": force, "members_stripped": members.len(), "docs_orphaned": doc_count })),
     )
     .await;
     tracing::info!(team = %name, forced = force, by = %by, "kb_team_delete (mesh-ui surface)");
@@ -4554,22 +4352,6 @@ mod tests {
     }
 
     use axum::response::IntoResponse;
-
-    /// `GET /api/security/erasure-archive` (and every users-admin read) answers an
-    /// authenticated caller below Operator `403`, not `400`; an Operator and
-    /// an internal (no-ctx) caller pass. 401 for no credential at all is the
-    /// auth layer's, before the handler runs.
-    #[test]
-    fn users_admin_read_guard_is_403_for_a_non_admin_and_open_to_operators() {
-        let status = |c| match super::users_admin_read_guard(&c) {
-            Ok(()) => axum::http::StatusCode::OK,
-            Err(e) => e.into_response().status(),
-        };
-        assert_eq!(status(role_ctx(crate::auth::Role::User)), axum::http::StatusCode::FORBIDDEN);
-        assert_eq!(status(role_ctx(crate::auth::Role::Operator)), axum::http::StatusCode::OK);
-        assert_eq!(status(role_ctx(crate::auth::Role::Admin)), axum::http::StatusCode::OK);
-        assert_eq!(status(None), axum::http::StatusCode::OK);
-    }
 
     /// The mutation guard refuses a non-admin the same way.
     fn declared() -> Vec<String> {
@@ -5427,13 +5209,13 @@ mod tests {
         // that the mutation produces a row, not where the call is written.
         let audited = |name: &str| -> bool {
             let Some(body) = body_of(name) else { return true };
-            if body.contains("audit_event") {
+            if body.contains("audit::record") {
                 return true;
             }
             body.lines().any(|l| {
                 l.split(|c: char| !(c.is_alphanumeric() || c == '_'))
                     .filter(|w| w.ends_with("_inner"))
-                    .any(|w| body_of(w).is_some_and(|b| b.contains("audit_event")))
+                    .any(|w| body_of(w).is_some_and(|b| b.contains("audit::record")))
             })
         };
 
@@ -5441,7 +5223,7 @@ mod tests {
 
         assert!(
             unaudited.is_empty(),
-            "these /api/security/* mutations write no audit_event row: {unaudited:?}\n\
+            "these /api/security/* mutations write no audit row: {unaudited:?}\n\
              The legacy surface audits its equivalents, so leaving these unaudited means \
              converging on /api/security/* REDUCES audit coverage — a security regression \
              wearing a refactor's clothes. See followups/32."
@@ -5526,12 +5308,13 @@ mod tests {
     #[test]
     fn security_users_list_is_read_guarded_like_the_legacy_surface() {
         use crate::auth::Role;
-        // Guard semantics (shared with the legacy handler, so they cannot drift).
-        assert!(users_admin_read_guard(&role_ctx(Role::User)).is_err());
-        assert!(users_admin_read_guard(&ctx(&["read"])).is_err());
-        assert!(users_admin_read_guard(&role_ctx(Role::Operator)).is_ok());
-        assert!(users_admin_read_guard(&role_ctx(Role::Admin)).is_ok());
-        assert!(users_admin_read_guard(&None).is_ok());
+        // Guard semantics: the `OperatorOrInternal` extractor (driven through a
+        // router in `authz::tests`); the same pure rule is asserted here.
+        assert!(!crate::authz::operator_or_internal_ok(role_ctx(Role::User).as_ref().map(|e| &e.0)));
+        assert!(!crate::authz::operator_or_internal_ok(ctx(&["read"]).as_ref().map(|e| &e.0)));
+        assert!(crate::authz::operator_or_internal_ok(role_ctx(Role::Operator).as_ref().map(|e| &e.0)));
+        assert!(crate::authz::operator_or_internal_ok(role_ctx(Role::Admin).as_ref().map(|e| &e.0)));
+        assert!(crate::authz::operator_or_internal_ok(None));
         // And the handler actually runs it (source check, like the other
         // surface-parity tests in this module).
         let src = include_str!("users.rs");
@@ -5541,8 +5324,8 @@ mod tests {
             .expect("users_list not found");
         let body = &body[..body.find("\n}\n").expect("no close for users_list")];
         assert!(
-            body.contains("users_admin_read_guard(&ctx)"),
-            "users_list must run the shared read guard"
+            body.contains("_op: OperatorOrInternal"),
+            "users_list must take the shared read extractor"
         );
     }
 
@@ -5567,8 +5350,8 @@ mod tests {
     }
 
     // ── User-proposal validation (moved from tests/test_user_proposals.py in
-    // the 2026-08-08 reference sweep — the Python body is archived in
-    // legacy/python-workers-reference/users.py; this fn is the live one). ──
+    // the 2026-08-08 reference sweep — the Python body is gone from
+    // the tree; this fn is the live one). ──
 
     #[test]
     fn proposal_validation_rejects_bad_username() {
@@ -5963,7 +5746,7 @@ mod session_end_tests {
     fn every_account_changing_route_ends_the_sessions() {
         let src = include_str!("users.rs");
         for (sig, write) in [
-            ("async fn user_set_password(", "UPDATE noo_users SET hashed_password"),
+            ("async fn user_set_password(", "users::set_password("),
             ("async fn user_disable(", "set_disabled(&state.db"),
             ("async fn user_set_scopes(", "exec_user_set_scopes("),
             ("async fn user_set_role(", "users::set_role("),

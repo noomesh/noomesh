@@ -406,20 +406,37 @@ mod node_choice_tests {
 }
 
 pub async fn role_of(state: &AppState, user: &str) -> Option<Role> {
-    let role: Option<String> = sqlx::query_scalar("SELECT role FROM noo_users WHERE username = $1 AND NOT disabled")
-        .bind(user)
-        .fetch_optional(&state.db)
+    let role: Option<String> = crate::repo::users::enabled_role(&state.db, user)
         .await
         .ok()
         .flatten();
     role.and_then(|r| r.parse().ok())
 }
 
+/// The kind a harness named in its ack. A harness older than 0.6.13
+/// names none, and the event then carries the node alone.
+fn ack_kind(body: &Value) -> Option<String> {
+    body.get("kind").and_then(|k| k.as_str()).map(str::trim).filter(|k| !k.is_empty()).map(str::to_string)
+}
+
+/// The `harness_dispatched` frame the console shows while the node runs
+/// the turn.
+fn dispatched_event(node: &str, kind: Option<&str>) -> Value {
+    match kind {
+        Some(k) => json!({"node": node, "kind": k}),
+        None => json!({"node": node}),
+    }
+}
+
 /// Try to run this turn on a node. `Ok(None)` = not dispatched (no
-/// harness for the model's node, no user, the brake, or nobody acked):
-/// the caller runs the turn in process. `Ok(Some(result))` = the node
-/// ran it. `Err` = the node took it and failed or timed out — the turn
-/// is NOT re-run here, because its tools may already have executed.
+/// harness for the model's node, no user, the brake, nobody acked, or the
+/// harness said its CLI never reached the model): the caller runs the turn
+/// in process. `Ok(Some(result))` = the node ran it. `Err` = the node took
+/// it and failed or timed out — the turn is NOT re-run here, because its
+/// tools may already have executed. The one exception is the `retry_safe`
+/// error (i233): a vendor CLI killed before its first model call ran no
+/// tool, so the gateway runs the turn itself and the person gets an
+/// answer instead of a 15-minute failure.
 #[allow(clippy::too_many_arguments)]
 pub async fn try_dispatch<S: TurnSink>(
     state: &AppState,
@@ -491,13 +508,14 @@ pub async fn try_dispatch<S: TurnSink>(
         state.nats.send_request(harness_run_subject(&node), node_request(&state.nats, &node, serde_json::to_vec(&req)?)),
     )
     .await;
-    match ack {
+    let kind = match ack {
         Ok(Ok(msg)) => {
             let body: Value = serde_json::from_slice(&msg.payload).unwrap_or(Value::Null);
             if body.get("ack").and_then(|a| a.as_bool()) != Some(true) {
                 tracing::warn!(node = %node, reply = %body, "harness dispatch: refused; running in process");
                 return Ok(None);
             }
+            ack_kind(&body)
         }
         Ok(Err(e)) => {
             tracing::info!(node = %node, error = %e, "harness dispatch: no responder; running in process");
@@ -507,8 +525,11 @@ pub async fn try_dispatch<S: TurnSink>(
             tracing::info!(node = %node, "harness dispatch: no ack within {:?}; running in process", ACK_TIMEOUT);
             return Ok(None);
         }
-    }
-    tracing::info!(node = %node, conversation = conversation_id, user, stream, "harness_dispatched");
+    };
+    tracing::info!(node = %node, kind = kind.as_deref().unwrap_or("?"), conversation = conversation_id, user, stream, "harness_dispatched");
+    // Say who is answering before the wait starts (i233 fix 3): a vendor
+    // CLI turn can run for minutes, and a silent wait reads as a hang.
+    sink.send_event("harness_dispatched", dispatched_event(&node, kind.as_deref())).await;
 
     // The turn's tools run on the rail, in another task, where this
     // task's approval task-locals are unset. Register where this turn came
@@ -525,6 +546,10 @@ pub async fn try_dispatch<S: TurnSink>(
     let kind = terminal.get("type").and_then(|t| t.as_str()).unwrap_or("");
     if kind != HARNESS_RESULT_EVENT {
         let msg = terminal.get("text").and_then(|t| t.as_str()).unwrap_or("harness error");
+        if crate::websocket::retry_safe(&terminal) {
+            tracing::warn!(node = %node, conversation = conversation_id, error = %msg, "harness dispatch: the node's CLI never reached its model; running the turn in process");
+            return Ok(None);
+        }
         return Err(anyhow!("harness on {node}: {msg}"));
     }
     let result: CoordinatorResult = serde_json::from_value(terminal.get("result").cloned().unwrap_or(json!(null)))
@@ -535,6 +560,23 @@ pub async fn try_dispatch<S: TurnSink>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The console names the node and kind answering (i233 fix 3). A
+    /// harness older than 0.6.13 acks without a kind: the event then names
+    /// the node alone rather than guessing.
+    #[test]
+    fn the_dispatched_event_names_node_and_kind_from_the_ack() {
+        let new = json!({"ack": true, "node": "mcmini", "kind": "copilot"});
+        assert_eq!(dispatched_event("mcmini", ack_kind(&new).as_deref()), json!({"node": "mcmini", "kind": "copilot"}));
+        for old in [json!({"ack": true, "node": "mcmini"}), json!({"ack": true, "node": "mcmini", "kind": " "})] {
+            assert_eq!(ack_kind(&old), None);
+            assert_eq!(dispatched_event("mcmini", None), json!({"node": "mcmini"}));
+        }
+        let src = include_str!("dispatch.rs").split("mod tests").next().unwrap();
+        assert!(src.contains("sink.send_event(\"harness_dispatched\", dispatched_event(&node, kind.as_deref())).await;"));
+        let harness = include_str!("../harness_main.rs");
+        assert!(harness.contains(r#"json!({"ack": true, "node": node, "kind": kind})"#), "the turn ack carries the kind");
+    }
 
     #[test]
     fn turn_requests_round_trip_and_subjects_are_safe() {

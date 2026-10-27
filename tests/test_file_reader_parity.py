@@ -483,7 +483,6 @@ GO_NOT_TIER1: dict[str, str] = {
 # ...and in the host agent's env template.
 GO_TMPL_NOT_TIER1: dict[str, str] = {
     "NOO_TLS_KEY": "a PATH to the PEM, not the key",
-    "NOO_CLUSTER_TOKEN_V1": "a posture switch (0 / 1 / empty), not a credential",
 }
 
 

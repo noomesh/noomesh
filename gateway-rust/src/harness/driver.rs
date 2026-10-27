@@ -32,8 +32,11 @@
 //! the question goes over the rail (`task_ask`) and the task waits for the
 //! answer.
 //!
-//! Nothing streams mid-run in this cut: a turn gets one `content` event with
-//! the answer, then `harness_result` (sent by the caller).
+//! A turn gets one `content` event with the answer, then `harness_result`
+//! (sent by the caller). While the CLI runs, the model's text as the
+//! translator sees it streams as `working` events (i278 phase D): the
+//! console shows them in a collapsed block, like thinking. They are the
+//! model's words, the CLI's planning included, not the answer.
 //!
 //! A kind may carry a slim launch (`launch_slim`, Claude Code only): the
 //! driver runs it instead of `launch` while the node's harness profile says
@@ -54,6 +57,7 @@ use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
 
 use crate::coordinator::{CoordinatorResult, HarnessOp, RemoteRuntime, ResolvedBackend, TaskRuntime, TurnRequest, UsageStats};
+use crate::websocket::TurnSink;
 use crate::harness::profile::ClaudePrompt;
 use crate::harness::translator::{Translator, UsageTotals};
 use crate::harness_kinds::{HarnessKind, Launch};
@@ -63,6 +67,12 @@ use crate::tasks::TaskRequest;
 /// dropped, so a chatty CLI cannot fill the harness's memory (the unit caps
 /// it at 1 GiB).
 pub const OUTPUT_CAP: usize = 256 * 1024;
+/// Default `NOO_HARNESS_STALL_SECS`: no model call for this long and the CLI
+/// is killed as stalled rather than left to its wall-clock limit.
+pub const DEFAULT_STALL_SECS: u64 = 300;
+/// A chat turn's stall bound: a person is waiting (i233, 15 minutes for an
+/// error on the console).
+pub const TURN_STALL: Duration = Duration::from_secs(120);
 /// The line a CLI ends with when the task's objective is achieved.
 pub const RESULT_MARK: &str = "NOO_RESULT:";
 /// The line a CLI ends with when the objective cannot be achieved.
@@ -173,6 +183,11 @@ pub struct DriverCtx {
     pub keep_workdir: bool,
     /// One invocation's wall-clock limit (`NOO_HARNESS_TURN_TIMEOUT_SECS`).
     pub timeout: Duration,
+    /// How long a CLI may go without reaching the model before it is killed
+    /// as stalled (`NOO_HARNESS_STALL_SECS`, default 300; a chat turn uses
+    /// the smaller of this and [`TURN_STALL`]). A hung vendor CLI used to
+    /// run to `timeout` three loops in a row (i233).
+    pub stall: Duration,
     /// The cluster CA, handed to the CLI as `NODE_EXTRA_CA_CERTS` so it can
     /// reach the user door over the cluster's TLS.
     pub ca_path: Option<String>,
@@ -201,6 +216,7 @@ impl DriverCtx {
         let set = |k: &str| get(k).filter(|v| !v.trim().is_empty());
         let workdir_root = set("NOO_HARNESS_WORKDIR").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("noo-harness"));
         let timeout = Duration::from_secs(set("NOO_HARNESS_TURN_TIMEOUT_SECS").and_then(|v| v.trim().parse().ok()).filter(|s| *s > 0).unwrap_or(900));
+        let stall = Duration::from_secs(set("NOO_HARNESS_STALL_SECS").and_then(|v| v.trim().parse().ok()).filter(|s| *s > 0).unwrap_or(DEFAULT_STALL_SECS));
         Ok(Self {
             node: node.to_string(),
             gateway: gateway.trim_end_matches('/').to_string(),
@@ -213,6 +229,7 @@ impl DriverCtx {
             workdir_root,
             keep_workdir: set("NOO_HARNESS_KEEP_WORKDIR").is_some_and(|v| v.trim() == "1"),
             timeout,
+            stall,
             ca_path: set("NOO_TLS_CA"),
             path: set("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into()),
             lang: set("LANG").unwrap_or_else(|| "C.UTF-8".into()),
@@ -763,18 +780,23 @@ pub struct RunOutput {
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
+    /// Killed because the CLI made no model call for this long (the stall
+    /// bound); `None` otherwise.
+    pub stalled: Option<Duration>,
     pub elapsed: Duration,
 }
 
 impl RunOutput {
     pub fn succeeded(&self) -> bool {
-        !self.timed_out && self.code == Some(0)
+        !self.timed_out && self.stalled.is_none() && self.code == Some(0)
     }
 
     /// Why the run failed, for a checkpoint note or a turn's error.
     pub fn failure(&self) -> String {
         let tail = tail_lines(&self.stderr, 8);
-        let what = if self.timed_out {
+        let what = if let Some(idle) = self.stalled {
+            format!("stalled: no model call for {}s, killed after {}s", idle.as_secs(), self.elapsed.as_secs())
+        } else if self.timed_out {
             format!("timed out after {}s", self.elapsed.as_secs())
         } else {
             match self.code {
@@ -807,7 +829,14 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R, cap: usize) -> V
 /// to [`OUTPUT_CAP`], in a process group of its own that is killed whole at
 /// `timeout`.
 pub async fn spawn_cli(argv: &[String], env: &BTreeMap<String, String>, cwd: &Path, timeout: Duration, jail: &crate::harness::jail::JailSpec) -> Result<RunOutput> {
-    spawn_cli_as(argv, env, cwd, timeout, jail, None).await
+    spawn_cli_as(argv, env, cwd, timeout, jail, None, None).await
+}
+
+/// The stall bound a run is watched with: the translator's activity clock
+/// and how long it may stand still. `None` = wall clock only (the probe).
+pub struct Stall {
+    pub activity: Arc<crate::harness::translator::Activity>,
+    pub bound: Duration,
 }
 
 /// Who a CLI runs as when it is not the harness's own uid: the child
@@ -824,7 +853,7 @@ pub struct RunAs {
 /// through here, and so both run the CLI inside the jail. Order in the
 /// child (std's `do_exec`): setgid/setuid first, then the `pre_exec` hook
 /// that applies the jail, then exec — so the jail binds the dropped user.
-pub async fn spawn_cli_as(argv: &[String], env: &BTreeMap<String, String>, cwd: &Path, timeout: Duration, jail: &crate::harness::jail::JailSpec, run_as: Option<RunAs>) -> Result<RunOutput> {
+pub async fn spawn_cli_as(argv: &[String], env: &BTreeMap<String, String>, cwd: &Path, timeout: Duration, jail: &crate::harness::jail::JailSpec, run_as: Option<RunAs>, stall: Option<Stall>) -> Result<RunOutput> {
     let (prog, args) = argv.split_first().ok_or_else(|| anyhow!("empty command"))?;
     if run_as.is_some_and(|r| r.uid == 0) {
         bail!("refusing to run a CLI as uid 0");
@@ -850,9 +879,28 @@ pub async fn spawn_cli_as(argv: &[String], env: &BTreeMap<String, String>, cwd: 
     let mut child = cmd.spawn().with_context(|| format!("starting {prog}"))?;
     let out = child.stdout.take().map(|s| tokio::spawn(read_capped(s, OUTPUT_CAP)));
     let err = child.stderr.take().map(|s| tokio::spawn(read_capped(s, OUTPUT_CAP)));
-    let (status, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(s) => (s.ok(), false),
-        Err(_) => {
+    // Wait with two clocks: the wall clock (`timeout`) and, for a run with a
+    // translator, the wire's activity clock (`stall`): a CLI that has made
+    // no model call for `stall.bound` is as dead as one past its deadline
+    // and is killed the same way, with the reason kept for the loop note.
+    let deadline = started + timeout;
+    let mut timed_out = false;
+    let mut stalled = None;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Err(_) => break None,
+            Ok(None) => {}
+        }
+        let now = Instant::now();
+        let idle = stall.as_ref().map(|s| s.activity.idle());
+        let stall_hit = matches!((&stall, idle), (Some(s), Some(i)) if i >= s.bound);
+        if now >= deadline || stall_hit {
+            if stall_hit && now < deadline {
+                stalled = idle;
+            } else {
+                timed_out = true;
+            }
             #[cfg(unix)]
             if let Some(pid) = child.id() {
                 // SAFETY: kill(2) on the process group this child leads.
@@ -861,8 +909,16 @@ pub async fn spawn_cli_as(argv: &[String], env: &BTreeMap<String, String>, cwd: 
                 }
             }
             let _ = child.start_kill();
-            (child.wait().await.ok(), true)
+            break child.wait().await.ok();
         }
+        let next = stall
+            .as_ref()
+            .zip(idle)
+            .map(|(s, i)| s.bound.saturating_sub(i))
+            .unwrap_or(Duration::MAX)
+            .min(deadline.saturating_duration_since(now))
+            .clamp(Duration::from_millis(50), Duration::from_millis(500));
+        tokio::time::sleep(next).await;
     };
     // A grandchild that left the group could hold a pipe open: bound the wait.
     let collect = |h: Option<tokio::task::JoinHandle<Vec<u8>>>| async move {
@@ -878,6 +934,7 @@ pub async fn spawn_cli_as(argv: &[String], env: &BTreeMap<String, String>, cwd: 
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         timed_out,
+        stalled,
         elapsed: started.elapsed(),
     })
 }
@@ -971,11 +1028,29 @@ pub fn task_prompt(req: &TaskRequest, loop_no: u32, last_note: Option<&str>, cla
 
 /// Translator up, door key minted, CLI run, usage reported, key revoked,
 /// translator down — in that order whatever the CLI did.
-async fn invoke<R: DriverRail>(ctx: &DriverCtx, rail: &R, ws: &Workspace, prompt: &str, task_id: Option<&str>) -> Result<(RunOutput, UsageTotals)> {
+async fn invoke<R: DriverRail>(
+    ctx: &DriverCtx,
+    rail: &R,
+    ws: &Workspace,
+    prompt: &str,
+    task_id: Option<&str>,
+    working: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+) -> Result<(RunOutput, UsageTotals)> {
     // full or slim, decided once for this run.
     let (variant, chosen) = ctx.run_ctx();
     let ctx: &DriverCtx = &chosen;
     let translator = Translator::start(ctx.pinned.clone()).await.context("starting the wire translator")?;
+    // The model's text as it streams, for a turn's working block (i278 D).
+    if let Some(out) = working {
+        let mut rx = translator.tap();
+        tokio::spawn(async move {
+            while let Some(t) = rx.recv().await {
+                if out.send(t).is_err() {
+                    break;
+                }
+            }
+        });
+    }
     let key = match rail.door_key().await {
         Ok(k) => k,
         Err(e) => {
@@ -989,8 +1064,10 @@ async fn invoke<R: DriverRail>(ctx: &DriverCtx, rail: &R, ws: &Workspace, prompt
         let env = build_env(ctx, ws, translator.base_url());
         let argv = fill_command(&with_system_prompt(&ctx.launch.command, system_prompt.as_deref()), prompt, &mcp);
         let timeout = effective_timeout(ctx.timeout, key.expires_at, chrono::Utc::now());
-        tracing::info!(kind = %ctx.kind.kind, cli = %argv[0], prompt = variant.name(), task = task_id.unwrap_or(""), timeout_secs = timeout.as_secs(), "harness driver: running the CLI");
-        spawn_cli(&argv, &env, &ws.work, timeout, &ws.jail_spec(ctx, &mcp)).await
+        let bound = if task_id.is_some() { ctx.stall } else { ctx.stall.min(TURN_STALL) };
+        tracing::info!(kind = %ctx.kind.kind, cli = %argv[0], prompt = variant.name(), task = task_id.unwrap_or(""), timeout_secs = timeout.as_secs(), stall_secs = bound.as_secs(), "harness driver: running the CLI");
+        let stall = Stall { activity: translator.activity(), bound };
+        spawn_cli_as(&argv, &env, &ws.work, timeout, &ws.jail_spec(ctx, &mcp), None, Some(stall)).await
     }
     .await;
     let _ = std::fs::remove_file(ws.mcp_path());
@@ -1003,7 +1080,7 @@ async fn invoke<R: DriverRail>(ctx: &DriverCtx, rail: &R, ws: &Workspace, prompt
     rail.door_key_revoke(&key.key_id).await;
     translator.shutdown().await;
     if let Ok(o) = &run {
-        tracing::info!(kind = %ctx.kind.kind, task = task_id.unwrap_or(""), code = ?o.code, timed_out = o.timed_out, secs = o.elapsed.as_secs(), "harness driver: CLI finished");
+        tracing::info!(kind = %ctx.kind.kind, task = task_id.unwrap_or(""), code = ?o.code, timed_out = o.timed_out, stalled_after_secs = o.stalled.map(|d| d.as_secs()), secs = o.elapsed.as_secs(), "harness driver: CLI finished");
     }
     run.map(|o| (o, usage))
 }
@@ -1054,7 +1131,7 @@ async fn task_loops<R: DriverRail>(ctx: &DriverCtx, rail: &mut R, req: &TaskRequ
             task_prompt(req, loops + 1, last_note.as_deref(), check.clarification.as_ref()),
             check.context.as_deref(),
         );
-        let outcome = invoke(ctx, &*rail, ws, &prompt, Some(&req.task_id)).await;
+        let outcome = invoke(ctx, &*rail, ws, &prompt, Some(&req.task_id), None).await;
         loops += 1;
         let mut decided = false;
         let note = match &outcome {
@@ -1106,12 +1183,87 @@ async fn task_loops<R: DriverRail>(ctx: &DriverCtx, rail: &mut R, req: &TaskRequ
 // ── a turn ──────────────────────────────────────────────────────────────
 
 /// One turn on the driven CLI: its answer is the turn's response.
-pub async fn run_turn(ctx: &DriverCtx, client: reqwest::Client, req: &TurnRequest) -> Result<CoordinatorResult> {
+pub async fn run_turn<S: TurnSink>(ctx: &DriverCtx, client: reqwest::Client, req: &TurnRequest, sink: &S) -> Result<CoordinatorResult> {
     let rt = RemoteRuntime::connect(&ctx.gateway, &req.token, client).await?;
-    run_turn_on(ctx, &rt, req).await
+    run_turn_on(ctx, &rt, req, sink).await
 }
 
-pub(crate) async fn run_turn_on<R: DriverRail>(ctx: &DriverCtx, rail: &R, req: &TurnRequest) -> Result<CoordinatorResult> {
+/// How much of the model's text a turn forwards as `working` (i278 D):
+/// batched every [`WORKING_FLUSH`] or [`WORKING_BATCH_CHARS`], at most
+/// [`WORKING_MAX_CHARS`] in all, so a long run cannot flood the bus.
+const WORKING_FLUSH: Duration = Duration::from_millis(300);
+const WORKING_BATCH_CHARS: usize = 400;
+const WORKING_MAX_CHARS: usize = 200_000;
+
+/// Batches of the model's text: what to send now, given what is buffered,
+/// what has gone out and whether the clock ticked. Pure.
+fn working_batch(buf: &mut String, sent: &mut usize, tick: bool) -> Option<String> {
+    if buf.is_empty() || (!tick && buf.len() < WORKING_BATCH_CHARS) || *sent >= WORKING_MAX_CHARS {
+        if *sent >= WORKING_MAX_CHARS {
+            buf.clear();
+        }
+        return None;
+    }
+    let room = WORKING_MAX_CHARS - *sent;
+    let mut out = std::mem::take(buf);
+    if out.len() > room {
+        let mut cut = room;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+    }
+    *sent += out.len();
+    Some(out)
+}
+
+/// A turn whose CLI was killed as stalled before it made a single model
+/// call. No model call means no tool ran, so the turn did nothing on the
+/// node and the gateway may run it itself (i233 fix 1). Any other failure
+/// is not safe to re-run: the CLI may have acted.
+#[derive(Debug)]
+pub struct NeverReachedTheModel(pub String);
+
+impl std::fmt::Display for NeverReachedTheModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NeverReachedTheModel {}
+
+/// A turn whose CLI failed after calling the model, having asked only for
+/// tools that change nothing (i233, accepted 2026-10-26): the gateway may
+/// run it itself, as for [`NeverReachedTheModel`].
+#[derive(Debug)]
+pub struct RanOnlyReadTools(pub String);
+
+impl std::fmt::Display for RanOnlyReadTools {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RanOnlyReadTools {}
+
+/// The tools of `called` that may have changed something: neither one of
+/// the kind's `read_only_tools` nor a read-only noomesh tool
+/// (`task_guard::CEILING_ALLOWED`) under whatever MCP prefix the CLI gives
+/// it (`mcp__noomesh__noo_cluster_status`, `noomesh.noo_rag_query`). Pure.
+pub fn acting_tools(kind: &HarnessKind, called: &[String]) -> Vec<String> {
+    let bare = |n: &str| -> String {
+        let n = n.rsplit("__").next().unwrap_or(n);
+        let n = n.rsplit('.').next().unwrap_or(n);
+        n.rsplit('/').next().unwrap_or(n).to_string()
+    };
+    called
+        .iter()
+        .filter(|t| !kind.read_only_tools.iter().any(|r| r == *t) && !crate::task_guard::CEILING_ALLOWED.contains(&bare(t).as_str()))
+        .cloned()
+        .collect()
+}
+
+pub(crate) async fn run_turn_on<R: DriverRail, S: TurnSink>(ctx: &DriverCtx, rail: &R, req: &TurnRequest, sink: &S) -> Result<CoordinatorResult> {
     if let Err(r) = (ctx.jail_probe)() {
         tracing::error!(event = "harness_jail_refused", reason = %r, "harness_jail_refused: {}", r.note());
         bail!("{}", r.note());
@@ -1122,11 +1274,59 @@ pub(crate) async fn run_turn_on<R: DriverRail>(ctx: &DriverCtx, rail: &R, req: &
         Some(role) => format!("{}\n\n{}", role.trim(), req.prompt),
         None => req.prompt.clone(),
     };
-    let outcome = invoke(ctx, rail, &ws, &prompt, None).await;
+    // A vendor CLI prints nothing until it is done; the model's text, seen
+    // by the translator, goes to the console as the harness working (i278
+    // phase D: a collapsed block, like thinking). The answer is still the
+    // CLI's output below.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let mut buf = String::new();
+    let mut sent = 0usize;
+    // Scoped: the run borrows `ws`, which `finish` below consumes.
+    let outcome = {
+        let run = invoke(ctx, rail, &ws, &prompt, None, Some(tx));
+        tokio::pin!(run);
+        let mut tick = tokio::time::interval(WORKING_FLUSH);
+        loop {
+            tokio::select! {
+                out = &mut run => break out,
+                Some(t) = rx.recv() => {
+                    buf.push_str(&t);
+                    if let Some(b) = working_batch(&mut buf, &mut sent, false) {
+                        sink.send_event("working", json!({"text": b})).await;
+                    }
+                }
+                _ = tick.tick() => {
+                    if let Some(b) = working_batch(&mut buf, &mut sent, true) {
+                        sink.send_event("working", json!({"text": b})).await;
+                    }
+                }
+            }
+        }
+    };
+    while let Ok(t) = rx.try_recv() {
+        buf.push_str(&t);
+    }
+    if let Some(b) = working_batch(&mut buf, &mut sent, true) {
+        sink.send_event("working", json!({"text": b})).await;
+    }
     ws.finish();
     let (o, usage) = outcome?;
     if !o.succeeded() {
-        bail!("{} CLI: {}", ctx.kind.kind, o.failure());
+        let msg = format!("{} CLI: {}", ctx.kind.kind, o.failure());
+        if o.stalled.is_some() && usage.calls == 0 {
+            return Err(anyhow::Error::new(NeverReachedTheModel(msg)));
+        }
+        // After model calls: safe to re-run only if nothing it asked for
+        // could have acted. Otherwise say what it called.
+        let acting = acting_tools(&ctx.kind, &usage.tools_called);
+        if acting.is_empty() {
+            return Err(anyhow::Error::new(RanOnlyReadTools(if usage.tools_called.is_empty() {
+                format!("{msg} (it called no tool)")
+            } else {
+                format!("{msg} (it called only read-only tools: {})", usage.tools_called.join(", "))
+            })));
+        }
+        bail!("{msg}; it had called {}, so the turn is not re-run", acting.join(", "));
     }
     let response = o.stdout.trim().to_string();
     rail.save("user", &req.prompt).await;
@@ -1156,6 +1356,42 @@ mod tests {
     use std::sync::Mutex;
 
     const TURN_TOKEN: &str = "eyJturn.token.secret";
+
+    /// i278 phase D: the working text goes out in batches (a size or a
+    /// tick), never past the per-turn cap, cut on a char boundary.
+    #[test]
+    fn working_text_is_batched_and_capped() {
+        let (mut buf, mut sent) = (String::from("short"), 0usize);
+        assert_eq!(working_batch(&mut buf, &mut sent, false), None, "under the batch size, no tick: wait");
+        assert_eq!(working_batch(&mut buf, &mut sent, true).as_deref(), Some("short"));
+        assert!(buf.is_empty() && sent == 5);
+        assert_eq!(working_batch(&mut buf, &mut sent, true), None, "nothing buffered");
+        buf.push_str(&"x".repeat(WORKING_BATCH_CHARS));
+        assert_eq!(working_batch(&mut buf, &mut sent, false).map(|b| b.len()), Some(WORKING_BATCH_CHARS), "a full batch goes without a tick");
+        let mut sent = WORKING_MAX_CHARS - 2;
+        let mut buf = String::from("é€x");
+        assert_eq!(working_batch(&mut buf, &mut sent, true).as_deref(), Some("é"), "cut at the cap, on a char boundary");
+        assert_eq!(sent, WORKING_MAX_CHARS);
+        let mut buf = String::from("more");
+        assert_eq!(working_batch(&mut buf, &mut sent, true), None);
+        assert!(buf.is_empty(), "past the cap the text is dropped, not kept");
+    }
+
+    /// i233: a failed turn is re-run only if nothing it asked for could
+    /// have acted: the kind's read-only built-ins, or a read-only noomesh
+    /// tool under the CLI's MCP prefix.
+    #[test]
+    fn only_read_only_tools_make_a_failed_turn_safe_to_rerun() {
+        let claude = crate::harness_kinds::get("claude-code").unwrap();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(acting_tools(claude, &[]).is_empty());
+        assert!(acting_tools(claude, &s(&["Read", "Grep", "mcp__noomesh__noo_cluster_status"])).is_empty());
+        assert_eq!(acting_tools(claude, &s(&["Read", "Bash", "Write"])), s(&["Bash", "Write"]));
+        assert_eq!(acting_tools(claude, &s(&["mcp__noomesh__noo_job_submit"])), s(&["mcp__noomesh__noo_job_submit"]), "a noomesh tool that acts");
+        let codex = crate::harness_kinds::get("codex").unwrap();
+        assert!(acting_tools(codex, &s(&["noomesh.noo_rag_query"])).is_empty(), "codex's MCP spelling");
+        assert_eq!(acting_tools(codex, &s(&["shell"])), s(&["shell"]), "no built-in is verified read-only for codex");
+    }
 
     fn kind(command: &[&str], lane: &[(&str, &str)], telemetry: &[(&str, &str)]) -> HarnessKind {
         serde_json::from_value(json!({
@@ -1360,6 +1596,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A vendor CLI that never reaches the model (hung before its first call,
+    /// as Copilot and Claude Code were on mcmini, 2026-10-24) is killed at
+    /// the stall bound with the reason, not at the 900 s wall.
+    #[tokio::test]
+    async fn a_cli_that_never_calls_the_model_is_killed_at_the_stall_bound() {
+        let root = scratch("stall");
+        let k = kind(&["sh", "-c", "sleep 30; echo NOO_RESULT: too late"], &[], &[]);
+        let mut ctx = ctx_for(&k, &root, "60");
+        ctx.stall = Duration::from_secs(1);
+        let mut rail = FakeRail::new();
+        let started = Instant::now();
+        let state = run_task_on(&ctx, &mut rail, &task("t-stall", 1)).await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(15), "the stalled CLI was not killed: {:?}", started.elapsed());
+        assert_eq!(state, "failed");
+        let c = rail.calls.lock().unwrap();
+        let note = c.checkpoints[0].1.as_deref().unwrap();
+        assert!(note.contains("stalled: no model call for"), "{note}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A turn whose CLI stalls before any model call is the one failure the
+    /// gateway may re-run itself: typed so harness_main can say so.
+    #[tokio::test]
+    async fn a_turn_stalled_before_any_model_call_is_retry_safe() {
+        let root = scratch("turn-stall");
+        let k = kind(&["sh", "-c", "sleep 30"], &[], &[]);
+        let mut ctx = ctx_for(&k, &root, "60");
+        ctx.stall = Duration::from_secs(1);
+        let rail = FakeRail::new();
+        let req = TurnRequest {
+            conversation_id: "c-stall".into(),
+            prompt: "hi".into(),
+            channel: "dashboard".into(),
+            max_iterations: 5,
+            model: None,
+            user: "alice".into(),
+            enable_thinking: false,
+            role_prompt: None,
+            stream: false,
+            token: TURN_TOKEN.into(),
+        };
+        let e = run_turn_on(&ctx, &rail, &req, &crate::websocket::NullSink).await.unwrap_err();
+        assert!(e.downcast_ref::<NeverReachedTheModel>().is_some(), "{e}");
+        assert!(e.to_string().contains("stalled: no model call"), "{e}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The activity clock: idle counts from the translator's start until the
+    /// first touch, then from the last touch.
+    #[test]
+    fn the_activity_clock_resets_on_every_touch() {
+        let a = crate::harness::translator::Activity::new();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(a.idle() >= Duration::from_millis(30));
+        a.touch();
+        assert!(a.idle() < Duration::from_millis(30));
+    }
+
+    /// `stalled` is a failure of its own: not a success, and named first.
+    #[test]
+    fn a_stalled_run_is_not_a_success_and_says_so() {
+        let o = RunOutput { code: None, stdout: String::new(), stderr: "x".into(), timed_out: false, stalled: Some(Duration::from_secs(300)), elapsed: Duration::from_secs(301) };
+        assert!(!o.succeeded());
+        assert!(o.failure().starts_with("stalled: no model call for 300s"), "{}", o.failure());
+        let ok = RunOutput { code: Some(0), stdout: String::new(), stderr: String::new(), timed_out: false, stalled: None, elapsed: Duration::from_secs(1) };
+        assert!(ok.succeeded());
+    }
+
     #[tokio::test]
     async fn a_cli_past_its_deadline_is_killed() {
         let root = scratch("slow");
@@ -1482,7 +1786,7 @@ mod tests {
             stream: false,
             token: TURN_TOKEN.into(),
         };
-        let e = run_turn_on(&ctx, &rail, &turn).await.unwrap_err();
+        let e = run_turn_on(&ctx, &rail, &turn, &crate::websocket::NullSink).await.unwrap_err();
         assert!(e.to_string().contains("foreign CLIs never run unjailed"), "{e}");
         assert!(!marker.exists());
         assert_eq!(rail.calls.lock().unwrap().keys_minted, 0);
@@ -1816,7 +2120,7 @@ mod tests {
     async fn a_cli_is_never_run_as_root() {
         let env: BTreeMap<String, String> = [("PATH".to_string(), "/usr/bin:/bin".to_string())].into_iter().collect();
         let jail = crate::harness::jail::JailSpec { workspace: PathBuf::from("/nonexistent-ws"), home: PathBuf::from("/nonexistent-home"), tmp: PathBuf::from("/nonexistent-tmp"), ca_file: None, extra_ro: Vec::new(), data_root: None };
-        let err = spawn_cli_as(&["true".to_string()], &env, Path::new("/"), Duration::from_secs(5), &jail, Some(RunAs { uid: 0, gid: 0 })).await.unwrap_err();
+        let err = spawn_cli_as(&["true".to_string()], &env, Path::new("/"), Duration::from_secs(5), &jail, Some(RunAs { uid: 0, gid: 0 }), None).await.unwrap_err();
         assert!(err.to_string().contains("uid 0"), "{err}");
     }
 
@@ -1953,7 +2257,7 @@ mod tests {
             stream: true,
             token: TURN_TOKEN.into(),
         };
-        let r = run_turn_on(&ctx, &rail, &req).await.unwrap();
+        let r = run_turn_on(&ctx, &rail, &req, &crate::websocket::NullSink).await.unwrap();
         assert_eq!(r.response, "the answer is 42");
         assert_eq!(r.node.as_deref(), Some("awolf"));
         let c = rail.calls.lock().unwrap();

@@ -25,8 +25,10 @@ package backendrt
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelstats"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -514,7 +516,14 @@ func (n *Native) Pull(ctx context.Context, name string) (string, error) {
 		Error  string `json:"error"`
 	}
 	dec := json.NewDecoder(resp.Body)
-	_ = dec.Decode(&out)
+	if derr := dec.Decode(&out); derr != nil && !errors.Is(derr, io.EOF) {
+		// An unreadable body is the only evidence the status/error below are
+		// incomplete: a 2xx with a torn stream must not read as a clean pull.
+		slog.Warn("ollama pull: response body unreadable", "model", name, "http_status", resp.StatusCode, "error", derr)
+		if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+			return out.Status, fmt.Errorf("ollama pull %s: response unreadable: %w", name, derr)
+		}
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 || out.Error != "" {
 		msg := out.Error
 		if msg == "" {

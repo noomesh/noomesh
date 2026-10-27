@@ -248,7 +248,7 @@ _addon_composed_names() {
 # anything is pulled or recreated.
 _ADDON_PINS=()
 # The `decl <addon> <file>` lines launch-pins printed (a declaration file the
-# verified lock lists: system.json, workloads.json), for
+# verified lock lists: system.json, workloads.json, routes.json), for
 # addon_decls_materialise below. An older noo prints none: nothing is handed
 # to the gateway, which then provisions no bundle system (the safe side).
 _ADDON_DECLS=()
@@ -381,9 +381,9 @@ require_addon_pins() {
                 _pinlines+=("${_addon} ${_var} ${_ref}") ;;
             decl)
                 # `decl <addon> <file>`: a declaration file its verified lock
-                # lists. Only the two names the gateway reads are kept.
+                # lists. Only the names the gateway reads are kept.
                 case "$_rest" in
-                    system.json|workloads.json) _decls+=("${_addon} ${_rest}") ;;
+                    system.json|workloads.json|routes.json) _decls+=("${_addon} ${_rest}") ;;
                 esac ;;
             refuse)
                 _addon_refuse "$_addon" "${_rest:-no verified pin for ${_tag}}" ;;
@@ -935,13 +935,20 @@ compose_active_services() {
 
 # addon_decls_materialise — hand the gateway what each add-on's signed bundle
 # declares beyond its overlay (noomesh-internal i163 E/B): `system.json` (its
-# database system) and `workloads.json` (its managed workloads), copied into
+# database system), `workloads.json` (its managed workloads) and `routes.json`
+# (its HTTP route manifest, 0.6.13), copied into
 #   <install root>/.noo-addon-systems/<addon>/system.json
 #   <install root>/.noo-addon-workloads/<addon>/workloads.json
+#   <install root>/.noo-addon-routes/<addon>/routes.json
 # which docker-compose.cluster.yml mounts read-only into the gateway at
-# /opt/noo/addon-systems and /opt/noo/addon-workloads (gateway-rust/src/
-# addon_decls.rs validates them again and reads them only for an add-on its
-# registry registers).
+# /opt/noo/addon-systems, /opt/noo/addon-workloads and
+# /opt/noo/addon-bundle-routes (gateway-rust/src/addon_decls.rs and
+# addon_proxy.rs validate them again and read them only for an add-on its
+# registry registers). This is how an add-on publishes routes without
+# touching a core service: a third-party overlay may not extend the gateway
+# or mount a core volume (noo-cli/src/addons/guards.rs). The gateway reads a
+# routes.json here BEFORE the older per-add-on volume a shipped add-on's own
+# overlay mounts under /opt/noo/addon-routes, so the signed copy wins.
 #
 # ONLY for add-ons switched on AND verified this start, from the verdict
 # require_addon_pins just computed (call it right after, never before):
@@ -953,7 +960,8 @@ compose_active_services() {
 #         development checkout, else its bundle);
 #   anything else (an older noo, `none`, unset) copies nothing.
 # Every other add-on's directory is removed, so a switched-off or unverified
-# add-on stops declaring on this start. The two directories keep their inode
+# add-on stops declaring (and loses its routes) on this start. The three
+# directories keep their inode
 # (contents replaced, never the directory), so a gateway bind stays valid.
 #
 # lib-secrets.sh `_declared_systems` reads the systems directory: it is the
@@ -964,11 +972,12 @@ compose_active_services() {
 #
 # Fails (return 1) only when the directories cannot be written.
 addon_decls_materialise() {
-    local _root="${PROJECT_ROOT:-$_DIST_LIB_ROOT}" _sys _wl _before _after _plan="" _pair _a _f _src _n _d _keep=" "
+    local _root="${PROJECT_ROOT:-$_DIST_LIB_ROOT}" _sys _wl _rt _before _after _plan="" _pair _a _f _src _n _d _keep=" "
     _sys="$_root/.noo-addon-systems"
     _wl="$_root/.noo-addon-workloads"
-    if ! mkdir -p "$_sys" "$_wl" || ! chmod 0755 "$_sys" "$_wl"; then
-        echo "REFUSING: could not create the add-on declaration directories under $_root (.noo-addon-systems, .noo-addon-workloads)." >&2
+    _rt="$_root/.noo-addon-routes"
+    if ! mkdir -p "$_sys" "$_wl" "$_rt" || ! chmod 0755 "$_sys" "$_wl" "$_rt"; then
+        echo "REFUSING: could not create the add-on declaration directories under $_root (.noo-addon-systems, .noo-addon-workloads, .noo-addon-routes)." >&2
         return 1
     fi
     _before="$(cd "$_sys" && ls -1 2>/dev/null | sort | tr '\n' ' ')"
@@ -979,7 +988,7 @@ addon_decls_materialise() {
                 _src="$(addon_overlay "$_n" 2>/dev/null)"
                 [ -n "$_src" ] || continue
                 _d="$(dirname "$_src")"
-                for _f in system.json workloads.json; do
+                for _f in system.json workloads.json routes.json; do
                     [ -f "$_d/$_f" ] && _plan="${_plan}${_n} ${_f} ${_d}/${_f}"$'\n'
                 done
             done ;;
@@ -997,7 +1006,7 @@ addon_decls_materialise() {
         [ -n "$_a" ] || continue
         case "$_a" in [a-z]*) : ;; *) continue ;; esac
         case "$_a" in *[!a-z0-9_-]*) continue ;; esac
-        case "$_f" in system.json) _d="$_sys/$_a" ;; workloads.json) _d="$_wl/$_a" ;; *) continue ;; esac
+        case "$_f" in system.json) _d="$_sys/$_a" ;; workloads.json) _d="$_wl/$_a" ;; routes.json) _d="$_rt/$_a" ;; *) continue ;; esac
         [ -f "$_src" ] && [ ! -L "$_src" ] || continue
         case "$_keep" in *" $_f:$_a "*) : ;; *)
             rm -rf "${_d:?}" && mkdir -p "$_d" && chmod 0755 "$_d" || return 1 ;;
@@ -1011,10 +1020,10 @@ addon_decls_materialise() {
 $_plan
 PLAN
     # Drop every add-on directory not copied above.
-    for _d in "$_sys"/* "$_wl"/*; do
+    for _d in "$_sys"/* "$_wl"/* "$_rt"/*; do
         [ -e "$_d" ] || continue
         _n="$(basename "$_d")"
-        case "$_d" in "$_sys"/*) _f=system.json ;; *) _f=workloads.json ;; esac
+        case "$_d" in "$_sys"/*) _f=system.json ;; "$_wl"/*) _f=workloads.json ;; *) _f=routes.json ;; esac
         case "$_keep" in *" $_f:$_n "*) : ;; *) rm -rf "${_d:?}" ;; esac
     done
     _after="$(cd "$_sys" && ls -1 2>/dev/null | sort | tr '\n' ' ')"
@@ -1023,4 +1032,256 @@ PLAN
         derive_file_secrets && write_secret_files || return 1
     fi
     return 0
+}
+
+# ── Add-on runtime inputs (noomesh-internal i239 section 10) ────────────────
+#
+# addon_resources_materialise — every add-on that is on is checked by the CLI
+# (its overlay may take only its own secrets, and a third-party add-on may not
+# hold a core name: noo-cli/src/addons/guards.rs), and what each add-on's
+# signed bundle declares in
+# `resources.json` (a gateway URL, a TLS leaf, its outbound key, a shared
+# secret, its database URL and files, network names), produced by
+# `noo addons launch-resources` and handed over here. Call it right after
+# require_addon_pins and BEFORE addon_decls_materialise: an add-on refused
+# here must not have its declarations handed to the gateway either.
+#
+# Core names no add-on and no add-on variable. The CLI writes the files, on
+# tmpfs, into <rundir>/<addon>/<generation>/<mount>/ (0400 files under 0700
+# directories; NOO_ADDON_RUNDIR, else /run/noo/addons as root, else
+# /dev/shm/noo-addons-<uid>), and prints the protocol documented in
+# noo-cli/src/commands/addon_resources.rs. This function then:
+#   - hands each fresh mount directory to the uid the bundle declares (the
+#     secret-file chown helper, _secret_chown_files, when that uid is not
+#     ours) and marks the generation complete; a generation that is already
+#     complete is reused untouched, so a running add-on keeps its files;
+#   - removes older generations;
+#   - exports the add-on's variables: mount directories (host paths its
+#     overlay bind-mounts read-only) and the non-secret values;
+#   - REFUSES the add-on (_addon_refuse: left out of this start, by name;
+#     the rest starts) when a resource cannot be produced, naming it;
+#   - records the HELD services: a third-party add-on's service that asks
+#     for a GPU, the Docker socket or `privileged` is never started
+#     (ADDON_HOLD_SCALE, `--scale <service>=0`, on every launcher `up`).
+#
+# No value is printed: a secret part cannot be declared with an environment
+# delivery (the CLI refuses the bundle), and files are never echoed.
+ADDON_HOLD_SCALE=""
+# "<addon> <service> <why>" per held service.
+_ADDON_HELD=()
+
+# _addon_unverify <addon> — take a refused add-on out of the verdict the
+# gateway's registry reads (require_addon_pins exported it before this ran).
+_addon_unverify() {
+    local _d _out=""
+    case "${NOO_ADDONS_VERIFIED:-}" in
+        dev|''|none) : ;;
+        *)
+            for _d in $(printf '%s' "$NOO_ADDONS_VERIFIED" | tr ',' ' '); do
+                case "$_d" in "$1="*) ;; *) _out="${_out:+${_out},}${_d}" ;; esac
+            done
+            export NOO_ADDONS_VERIFIED="${_out:-none}" ;;
+    esac
+    if [ -n "${NOO_ADDONS_DEV:-}" ]; then
+        _out=""
+        for _d in $(printf '%s' "$NOO_ADDONS_DEV" | tr ',' ' '); do
+            case "$_d" in "$1="*) ;; *) _out="${_out:+${_out},}${_d}" ;; esac
+        done
+        if [ -n "$_out" ]; then export NOO_ADDONS_DEV="$_out"; else unset NOO_ADDONS_DEV; fi
+    fi
+    export NOO_ADDONS_REFUSED="$_NOO_ADDONS_REFUSED"
+}
+
+# _addon_hand_tree <dir> <uid> — chown <dir> and everything under it to
+# <uid>, through the secret helper (_secret_chown_files: chown as root, else
+# a throwaway container with CAP_CHOWN only). Its manifest sits in <dir>'s
+# parent (ours) and holds the uid and paths, never a value.
+_addon_hand_tree() {
+    local _dir="$1" _uid="$2" _parent _m _rc=0
+    # Everything in it already belongs to <uid>: nothing to hand over. (Run
+    # as us, find cannot enter a directory of another uid, and says so.)
+    if [ -z "$(find "$_dir" ! -uid "$_uid" -print -quit 2>&1)" ]; then return 0; fi
+    declare -F _secret_chown_files >/dev/null 2>&1 || return 1
+    _parent="$(dirname "$_dir")"
+    _m=".chown.$$"
+    ( cd "$_parent" && find "$(basename "$_dir")" -print | while IFS= read -r _f; do printf '%s %s\n' "$_uid" "$_f"; done ) > "${_parent:?}/${_m:?}" || return 1
+    chmod 0644 "${_parent:?}/${_m:?}" 2>/dev/null || true
+    _secret_chown_files "$_parent" "$_m" || _rc=1
+    rm -f -- "${_parent:?}/${_m:?}"
+    return "$_rc"
+}
+
+addon_resources_materialise() {
+    local _n _o _args=() _nb _out _rc=0 _kind _addon _rest _var _val _uid _path _h _prefix _bad
+    local _envs=() _owns=() _gens=() _stales=() _p _tagargs=()
+    ADDON_HOLD_SCALE=""
+    _ADDON_HELD=()
+    for _n in $(addon_licensed_names); do
+        addon_on "$_n" 0 || continue
+        case "${NOO_ADDONS_VERIFIED:-}" in
+            dev)
+                _o="$(addon_overlay "$_n" 2>/dev/null)"
+                [ -n "$_o" ] || continue
+                _args+=("${_n}=${_o}") ;;
+            ''|none) continue ;;
+            *)
+                case ",${NOO_ADDONS_VERIFIED}," in *",${_n}="*) _args+=("$_n") ;; *) continue ;; esac ;;
+        esac
+    done
+    [ ${#_args[@]} -gt 0 ] || return 0
+    _nb="$(_addon_noo 2>/dev/null)" || _nb=""
+    [ -n "${DIST_TAG:-${NOO_IMAGE_TAG:-}}" ] && _tagargs=(--tag "${DIST_TAG:-${NOO_IMAGE_TAG:-}}")
+    if [ -z "$_nb" ]; then
+        _rc=127
+        _out="no noo CLI found"
+    else
+        _out="$("$_nb" addons launch-resources --root "${PROJECT_ROOT:-$_DIST_LIB_ROOT}" ${_tagargs[@]+"${_tagargs[@]}"} \
+            --project "${COMPOSE_PROJECT_NAME:-noomesh}" --network "${NOO_CLUSTER_NETWORK:-noo-cluster}" "${_args[@]}" 2>&1)" || _rc=$?
+    fi
+    if [ "$_rc" != 0 ]; then
+        # launch-resources is also where every add-on's overlay is checked
+        # against its own secrets (noo-cli addons/guards.rs): without it no
+        # add-on was checked, so none starts. Fail closed, by name; core starts.
+        for _n in ${_args[@]+"${_args[@]}"}; do
+            _n="${_n%%=*}"
+            _addon_refuse "$_n" "its overlay's secrets and runtime inputs could not be checked (noo addons launch-resources failed: $(printf '%s' "$_out" | tail -1))"
+            _addon_unverify "$_n"
+        done
+        echo "WARNING: noo addons launch-resources failed, so no add-on was checked and none was started. Fix: noo upgrade" >&2
+        return 0
+    fi
+    while read -r _kind _addon _rest; do
+        case "$_kind" in hold|env|mount|own|gen|stale|refuse|notice) : ;; *) continue ;; esac
+        case "$_addon" in
+            [a-z]*) case "$_addon" in *[!a-z0-9_-]*) _addon="" ;; esac ;;
+            *) _addon="" ;;
+        esac
+        if [ -z "$_addon" ]; then
+            echo "REFUSING: noo addons launch-resources sent a line for something that is not an add-on name: ${_kind} …" >&2
+            return 1
+        fi
+        case "$_kind" in
+            refuse)
+                _addon_refuse "$_addon" "${_rest:-its runtime inputs could not be produced}"
+                _addon_unverify "$_addon" ;;
+            notice)
+                # An optional input that could not be produced: skipped, said.
+                echo "NOTE: add-on ${_addon}: ${_rest}" >&2 ;;
+            hold)
+                case "${_rest%% *}" in
+                    [A-Za-z0-9]*) case "${_rest%% *}" in *[!A-Za-z0-9_.-]*) continue ;; esac ;;
+                    *) continue ;;
+                esac
+                _ADDON_HELD+=("$_addon $_rest") ;;
+            env|mount)
+                _var="${_rest%% *}"
+                _val="${_rest#* }"
+                [ "$_val" = "$_rest" ] && _val=""
+                _prefix="$(printf '%s' "$_addon" | tr 'a-z-' 'A-Z_')_"
+                _bad=""
+                case "$_var" in ''|*[!A-Z0-9_]*|[!A-Z]*) _bad=1 ;; esac
+                case "$_var" in NOO_*|COMPOSE_*|DOCKER_*) _bad=1 ;; esac
+                case "$_var" in "$_prefix"?*) : ;; *) _bad=1 ;; esac
+                if [ -n "$_bad" ]; then
+                    _addon_refuse "$_addon" "noo addons launch-resources named variable '${_var}', which is not one of its own (${_prefix}*)"
+                    _addon_unverify "$_addon"
+                    continue
+                fi
+                _envs+=("${_addon}"$'\t'"${_var}"$'\t'"${_val}") ;;
+            own)
+                _uid="${_rest%% *}"
+                _path="${_rest#* }"
+                case "$_uid" in
+                    ''|0|*[!0-9]*)
+                        _addon_refuse "$_addon" "noo addons launch-resources asked to hand its inputs to uid '${_uid}'"
+                        _addon_unverify "$_addon"
+                        continue ;;
+                esac
+                _owns+=("$_addon $_uid $_path") ;;
+            gen) _gens+=("$_addon $_rest") ;;
+            stale) _stales+=("$_addon $_rest") ;;
+        esac
+    done <<RES
+$_out
+RES
+    # Hand each fresh mount directory to the add-on's uid.
+    for _p in ${_owns[@]+"${_owns[@]}"}; do
+        _addon="${_p%% *}"; _p="${_p#* }"; _uid="${_p%% *}"; _path="${_p#* }"
+        case ",${_NOO_ADDONS_REFUSED}," in *",${_addon},"*) continue ;; esac
+        case "$_path" in
+            /?*) : ;;
+            *) _addon_refuse "$_addon" "its runtime inputs were written to a path that is not absolute"; _addon_unverify "$_addon"; continue ;;
+        esac
+        if ! _addon_hand_tree "$_path" "$_uid"; then
+            _addon_refuse "$_addon" "its runtime inputs could not be handed to uid ${_uid} (${_path})"
+            _addon_unverify "$_addon"
+        fi
+    done
+    for _p in ${_gens[@]+"${_gens[@]}"}; do
+        _addon="${_p%% *}"; _path="${_p#* }"
+        case ",${_NOO_ADDONS_REFUSED}," in *",${_addon},"*) continue ;; esac
+        if ! : > "${_path:?}/.complete"; then
+            _addon_refuse "$_addon" "its runtime inputs could not be marked complete (${_path})"
+            _addon_unverify "$_addon"
+        fi
+    done
+    # Older generations: hand them back to us, then remove them. Not fatal.
+    for _p in ${_stales[@]+"${_stales[@]}"}; do
+        _path="${_p#* }"
+        case "$_path" in /?*/g-?*) : ;; *) continue ;; esac
+        _addon_hand_tree "$_path" "$(id -u)" >/dev/null 2>&1 || true
+        rm -rf -- "${_path:?}" 2>/dev/null || echo "WARNING: could not remove an older add-on input generation: ${_path}" >&2
+    done
+    for _p in ${_envs[@]+"${_envs[@]}"}; do
+        _addon="${_p%%$'\t'*}"; _p="${_p#*$'\t'}"; _var="${_p%%$'\t'*}"; _val="${_p#*$'\t'}"
+        case ",${_NOO_ADDONS_REFUSED}," in *",${_addon},"*) continue ;; esac
+        export "${_var}=${_val}"
+    done
+    for _h in ${_ADDON_HELD[@]+"${_ADDON_HELD[@]}"}; do
+        _addon="${_h%% *}"; _p="${_h#* }"
+        case ",${_NOO_ADDONS_REFUSED}," in *",${_addon},"*) continue ;; esac
+        ADDON_HOLD_SCALE="${ADDON_HOLD_SCALE} --scale ${_p%% *}=0"
+        echo "HELD: add-on ${_addon} service ${_p%% *} is not started: it ${_p#* } (an add-on gets no GPU, Docker socket or privileged mode)" >&2
+    done
+    ADDON_HOLD_SCALE="${ADDON_HOLD_SCALE# }"
+    return 0
+}
+
+# addon_held_services — the services held this start, one per line.
+addon_held_services() {
+    local _h _p
+    for _h in ${_ADDON_HELD[@]+"${_ADDON_HELD[@]}"}; do
+        case ",${_NOO_ADDONS_REFUSED}," in *",${_h%% *},"*) continue ;; esac
+        _p="${_h#* }"
+        printf '%s\n' "${_p%% *}"
+    done
+    return 0
+}
+
+# addon_drop_held <services, newline separated> — the same list without the
+# held services.
+addon_drop_held() {
+    local _held _s
+    _held="$(addon_held_services)"
+    printf '%s\n' "$1" | while IFS= read -r _s; do
+        [ -n "$_s" ] || continue
+        printf '%s\n' "$_held" | grep -qxF -- "$_s" || printf '%s\n' "$_s"
+    done
+    return 0
+}
+
+# addon_refuse_held <name>... — exit status 1, naming each, when a service
+# the operator named is held (exactly, or as noo-<name>).
+addon_refuse_held() {
+    local _n _held _bad=""
+    _held="$(addon_held_services)"
+    [ -n "$_held" ] || return 0
+    for _n in "$@"; do
+        if printf '%s\n' "$_held" | grep -qxF -- "$_n" || printf '%s\n' "$_held" | grep -qxF -- "noo-$_n"; then
+            _bad="${_bad} ${_n}"
+        fi
+    done
+    [ -z "$_bad" ] && return 0
+    echo "REFUSING:${_bad}: an add-on service that asks for a GPU, the Docker socket or privileged mode is never started (add-ons have no GPU reservation path yet)" >&2
+    return 1
 }

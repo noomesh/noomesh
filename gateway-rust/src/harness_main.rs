@@ -116,6 +116,123 @@ pub fn check_harness_secrets(get: &dyn Fn(&str) -> Option<String>) -> Result<(),
     if errs.is_empty() { Ok(()) } else { Err(errs.join("; ")) }
 }
 
+/// Default `NOO_HARNESS_DRAIN_SECS`: on SIGTERM the harness stops taking
+/// work and gives what it holds this long to finish before it exits. The
+/// node agent restarts the harness on a kind change (`convergeHarness`), and
+/// until this a restart killed every turn and task mid-flight; a drained
+/// restart hands the gateway finished work and re-takes nothing twice. The
+/// unit's `TimeoutStopSec` and the Mac plist's `ExitTimeOut` leave 30 s more
+/// than this bound (noomesh-internal i256).
+pub const DEFAULT_DRAIN_SECS: u64 = 120;
+
+/// The tasks in `running` whose last progress is older than `bound`, and
+/// the handles left for tasks no longer running (a task that finished
+/// before its handle was stored).
+fn stalled_tasks(
+    running: &std::collections::HashSet<String>,
+    handles: &std::collections::HashMap<String, tokio::task::AbortHandle>,
+    age: &dyn Fn(&str) -> Option<Duration>,
+    bound: Duration,
+) -> (Vec<String>, Vec<String>) {
+    let mut stalled: Vec<String> = running.iter().filter(|id| age(id.as_str()).is_some_and(|a| a > bound)).cloned().collect();
+    stalled.sort();
+    let mut orphans: Vec<String> = handles.keys().filter(|id| !running.contains(*id)).cloned().collect();
+    orphans.sort();
+    (stalled, orphans)
+}
+
+/// i227 fix 1: a task that has made no progress (no checkpoint since it was
+/// taken or since its last one) for the stall bound is ended here: its run
+/// is aborted (the permit drops with it, and with it the CLI child and the
+/// translator), it leaves the running set, and the node tells the gateway
+/// on `harness.ready.<node>` with `stalled`, which fails it with the reason.
+/// Without this a wedged task held its permit until an operator stopped it
+/// (two dead tasks held mcmini's both permits for fifteen hours).
+fn spawn_stall_watchdog(
+    nats: async_nats::Client,
+    node: String,
+    running: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    handles: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let bound = crate::tasks::progress::stall_bound(&|k| std::env::var(k).ok());
+    tracing::info!(stall_secs = bound.as_secs(), "harness: task stall bound");
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                _ = stop.changed() => break,
+                _ = tick.tick() => {}
+            }
+            let (stalled, orphans) = {
+                let (Ok(r), Ok(h)) = (running.lock(), handles.lock()) else { continue };
+                stalled_tasks(&r, &h, &crate::tasks::progress::age, bound)
+            };
+            if let Ok(mut h) = handles.lock() {
+                for id in &orphans {
+                    h.remove(id);
+                }
+            }
+            if stalled.is_empty() {
+                continue;
+            }
+            for id in &stalled {
+                if let Some(h) = handles.lock().ok().and_then(|mut h| h.remove(id)) {
+                    h.abort();
+                }
+                if let Ok(mut r) = running.lock() {
+                    r.remove(id);
+                }
+                crate::tasks::progress::forget(id);
+                tracing::error!(event = "harness_task_stalled", task = %id, stall_secs = bound.as_secs(), "harness: task made no progress; released");
+            }
+            let _ = nats
+                .publish(
+                    crate::tasks::ready_subject(&node),
+                    serde_json::to_vec(&json!({"node": node, "slot_freed": true, "stalled": stalled, "stall_secs": bound.as_secs()})).unwrap_or_default().into(),
+                )
+                .await;
+        }
+    });
+}
+
+/// The drain bound from the environment: whole seconds, 1..=3600, else the
+/// default.
+pub fn drain_bound(get: &dyn Fn(&str) -> Option<String>) -> Duration {
+    Duration::from_secs(
+        get("NOO_HARNESS_DRAIN_SECS").and_then(|v| v.trim().parse::<u64>().ok()).filter(|s| (1..=3600).contains(s)).unwrap_or(DEFAULT_DRAIN_SECS),
+    )
+}
+
+/// Resolves once the process is asked to stop (SIGTERM from the service
+/// manager, or Ctrl-C). Every loop that takes work selects on it.
+fn stop_signal() -> tokio::sync::watch::Receiver<bool> {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(error = %e, "harness: cannot listen for SIGTERM; a stop will not drain");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        tracing::info!("harness: stop requested; taking no new work");
+        let _ = tx.send(true);
+    });
+    rx
+}
+
 pub async fn run() -> Result<()> {
     // i119: the environment systemd loaded (bus password, agent bearer)
     // stays out of /proc/<pid>/environ for every other process of this uid
@@ -185,7 +302,7 @@ pub async fn run() -> Result<()> {
     match &profile {
         Some(p) => tracing::info!(
             tier = ?p.tier, first_byte_secs = ?p.first_byte_secs, stream_idle_secs = ?p.stream_idle_secs,
-            thinking = ?p.thinking, ollama_context = ?p.ollama_context, claude_prompt = ?p.claude_prompt,
+            thinking = ?p.thinking, context = ?p.context, claude_prompt = ?p.claude_prompt,
             foreign_kinds = ?p.foreign_kinds, "harness: profile from the node agent"
         ),
         None => tracing::info!("harness: no harness profile from the node agent; built-in defaults"),
@@ -299,12 +416,17 @@ pub async fn run() -> Result<()> {
     let mut turns = nats.queue_subscribe(subject.clone(), "harness".to_string()).await?;
     let mut tasks = nats.queue_subscribe(crate::tasks::task_subject(&node), "harness".to_string()).await?;
     let limit = Arc::new(tokio::sync::Semaphore::new(max_turns.max(1)));
+    let drain = drain_bound(&|k| std::env::var(k).ok());
+    let mut stop = stop_signal();
     // The tasks this harness holds right now, by id: a hand-back of a task
     // that is already here (the gateway hands a node's unfinished tasks
     // back on every `harness.ready`) is acknowledged as taken and never
     // started a second time, so it can neither run twice nor hold a second
     // permit (noomesh-internal i176).
     let running: Arc<std::sync::Mutex<std::collections::HashSet<String>>> = Arc::default();
+    // How to end each running task when it stalls (i227 fix 1).
+    let handles: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>> = Arc::default();
+    spawn_stall_watchdog(nats.clone(), node.clone(), running.clone(), handles.clone(), stop.clone());
 
     // Tasks: the same slot, many loops. A task holds
     // one concurrency permit for its whole life.
@@ -317,9 +439,15 @@ pub async fn run() -> Result<()> {
         let node_t = node.clone();
         let driver_t = driver.clone();
         let running_t = running.clone();
+        let handles_t = handles.clone();
         let capacity = max_turns.max(1);
+        let mut stop_t = stop.clone();
         tokio::spawn(async move {
-            while let Some(msg) = tasks.next().await {
+            loop {
+                let msg = tokio::select! {
+                    _ = stop_t.changed() => break,
+                    m = tasks.next() => match m { Some(m) => m, None => break },
+                };
                 let req: crate::tasks::TaskRequest = match serde_json::from_slice(&msg.payload) {
                     Ok(r) => r,
                     Err(e) => {
@@ -348,6 +476,7 @@ pub async fn run() -> Result<()> {
                 if let Ok(mut r) = running_t.lock() {
                     r.insert(req.task_id.clone());
                 }
+                crate::tasks::progress::touch(&req.task_id);
                 let in_hand = running_t.lock().map(|r| r.len()).unwrap_or(0);
                 tracing::info!(task = %req.task_id, running = in_hand, capacity, "harness: task taken");
                 if let Some(reply) = msg.reply.clone() {
@@ -360,7 +489,9 @@ pub async fn run() -> Result<()> {
                 let running_done = running_t.clone();
                 let nats_done = nats_t.clone();
                 let node_done = node_t.clone();
-                tokio::spawn(async move {
+                let handles_done = handles_t.clone();
+                let task_id = req.task_id.clone();
+                let job = tokio::spawn(async move {
                     let _permit = permit;
                     let outcome = async {
                         // One CLI invocation per loop, same checkpoints.
@@ -378,6 +509,10 @@ pub async fn run() -> Result<()> {
                     if let Ok(mut r) = running_done.lock() {
                         r.remove(&req.task_id);
                     }
+                    if let Ok(mut h) = handles_done.lock() {
+                        h.remove(&req.task_id);
+                    }
+                    crate::tasks::progress::forget(&req.task_id);
                     drop(_permit);
                     // A slot freed: the gateway hands this node's queued
                     // tasks back on the same subject a start announces on.
@@ -385,13 +520,21 @@ pub async fn run() -> Result<()> {
                         .publish(crate::tasks::ready_subject(&node_done), serde_json::to_vec(&json!({"node": node_done, "slot_freed": true})).unwrap_or_default().into())
                         .await;
                 });
+                if let Ok(mut h) = handles_t.lock() {
+                    h.insert(task_id, job.abort_handle());
+                }
             }
         });
     }
     // Announce: the gateway hands back this node's checkpointed tasks.
     let _ = nats.publish(crate::tasks::ready_subject(&node), serde_json::to_vec(&json!({"node": node})).unwrap_or_default().into()).await;
 
-    while let Some(msg) = turns.next().await {
+    let mut stopping = false;
+    loop {
+        let msg = tokio::select! {
+            _ = stop.changed() => { stopping = true; break }
+            m = turns.next() => match m { Some(m) => m, None => break },
+        };
         let req: coordinator::TurnRequest = match serde_json::from_slice(&msg.payload) {
             Ok(r) => r,
             Err(e) => {
@@ -409,7 +552,8 @@ pub async fn run() -> Result<()> {
             continue;
         };
         if let Some(reply) = msg.reply.clone() {
-            let _ = nats.publish(reply, serde_json::to_vec(&json!({"ack": true, "node": node})).unwrap_or_default().into()).await;
+            // `kind` lets the console say what is answering (i233 fix 3).
+            let _ = nats.publish(reply, serde_json::to_vec(&json!({"ack": true, "node": node, "kind": kind})).unwrap_or_default().into()).await;
         }
         let nats = nats.clone();
         let gateway = gateway.clone();
@@ -422,9 +566,10 @@ pub async fn run() -> Result<()> {
             // Our OWN node id on the subject — the grant is written against it.
             let sink = NatsTurnSink::new(nats.clone(), &node, &req.conversation_id);
             let outcome = match driver.as_deref() {
-                // Nothing streams mid-run: one `content` with the answer,
-                // then the result.
-                Some(ctx) => crate::harness::driver::run_turn(ctx, client, &req).await,
+                // A vendor CLI's answer is one `content` at the end, then the
+                // result; while it runs, the model's text streams as
+                // `working` (i278 phase D).
+                Some(ctx) => crate::harness::driver::run_turn(ctx, client, &req, &sink).await,
                 None => run_turn(&gateway, client, pinned, &sink, &req).await,
             };
             if let (Some(_), Ok(r), true) = (driver.as_deref(), &outcome, req.stream) {
@@ -435,13 +580,37 @@ pub async fn run() -> Result<()> {
                     let _ = sink.send_event(HARNESS_RESULT_EVENT, json!({"result": result, "node": node})).await;
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, conversation = %req.conversation_id, "harness: turn failed");
-                    let _ = sink.send_event("error", json!(format!("{e}"))).await;
+                    // A CLI killed before its first model call ran no tool:
+                    // the gateway may run the turn itself (i233). Said on
+                    // the event; an older gateway ignores the field and
+                    // forwards the error as before.
+                    let retry_safe = e.downcast_ref::<crate::harness::driver::NeverReachedTheModel>().is_some()
+                        || e.downcast_ref::<crate::harness::driver::RanOnlyReadTools>().is_some();
+                    tracing::error!(error = %e, conversation = %req.conversation_id, retry_safe, "harness: turn failed");
+                    let _ = sink.send_event("error", json!({"text": format!("{e}"), "retry_safe": retry_safe})).await;
                 }
             }
         });
     }
-    Err(anyhow!("harness: the turn subscription ended"))
+    if !stopping {
+        return Err(anyhow!("harness: the turn subscription ended"));
+    }
+    // Drain: nothing new is taken (the subscriptions are dropped here and
+    // in the task loop), what is held may finish within the bound, then exit
+    // so the service manager's restart brings the new kind up.
+    drop(turns);
+    let capacity = max_turns.max(1) as u32;
+    let held = capacity.saturating_sub(limit.available_permits() as u32);
+    tracing::info!(held, bound_secs = drain.as_secs(), "harness: draining");
+    match tokio::time::timeout(drain, limit.clone().acquire_many_owned(capacity)).await {
+        Ok(Ok(_)) => tracing::info!("harness: drained; exiting"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "harness: drain wait failed; exiting"),
+        Err(_) => {
+            let still = capacity.saturating_sub(limit.available_permits() as u32);
+            tracing::warn!(still, bound_secs = drain.as_secs(), "harness: drain bound reached with work still running; exiting");
+        }
+    }
+    Ok(())
 }
 
 /// Which loop this harness runs, and where that came from.
@@ -662,6 +831,70 @@ async fn run_turn<S: TurnSink>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// i227 fix 1: only a running task past the bound is stalled; a task
+    /// never touched is not (its clock starts when it is taken), and a
+    /// handle left for a finished task is an orphan to drop.
+    #[tokio::test]
+    async fn the_watchdog_picks_stalled_tasks_and_orphan_handles() {
+        let running: std::collections::HashSet<String> = ["fresh", "stuck", "untouched"].iter().map(|s| s.to_string()).collect();
+        let mut handles = std::collections::HashMap::new();
+        for id in ["fresh", "stuck", "gone"] {
+            handles.insert(id.to_string(), tokio::spawn(async {}).abort_handle());
+        }
+        let age = |id: &str| match id {
+            "fresh" => Some(Duration::from_secs(60)),
+            "stuck" => Some(Duration::from_secs(3000)),
+            _ => None,
+        };
+        let (stalled, orphans) = stalled_tasks(&running, &handles, &age, Duration::from_secs(2700));
+        assert_eq!(stalled, vec!["stuck".to_string()]);
+        assert_eq!(orphans, vec!["gone".to_string()]);
+    }
+
+    /// The watchdog runs, the clock starts at take and moves at every
+    /// checkpoint, and both are forgotten when the task ends.
+    #[test]
+    fn the_progress_clock_is_wired_into_take_checkpoint_and_end() {
+        let src = include_str!("harness_main.rs").split("mod tests {").next().unwrap();
+        assert!(src.contains("spawn_stall_watchdog(nats.clone(), node.clone(), running.clone(), handles.clone(), stop.clone());"));
+        assert!(src.contains("crate::tasks::progress::touch(&req.task_id);"));
+        assert!(src.contains("crate::tasks::progress::forget(&req.task_id);"));
+        assert!(src.contains("h.insert(task_id, job.abort_handle());"));
+        let remote = include_str!("coordinator/remote.rs");
+        let ck = remote.split("async fn checkpoint(&mut self, task_id: &str").nth(1).unwrap().split("\n    }\n").next().unwrap();
+        assert!(ck.contains("crate::tasks::progress::touch(task_id);"), "every checkpoint is progress");
+        let tasks = include_str!("tasks.rs");
+        assert!(tasks.contains("fail_stalled(&state.db, &id, &msg.subject, secs).await;"), "the gateway fails what the harness released");
+    }
+
+    #[test]
+    fn the_drain_bound_is_whole_seconds_within_an_hour_else_the_default() {
+        fn with(v: Option<&'static str>) -> Duration {
+            drain_bound(&move |_: &str| v.map(str::to_string))
+        }
+        assert_eq!(with(None), Duration::from_secs(DEFAULT_DRAIN_SECS));
+        assert_eq!(with(Some("45")), Duration::from_secs(45));
+        for bad in ["0", "3601", "soon", ""] {
+            assert_eq!(with(Some(bad)), Duration::from_secs(DEFAULT_DRAIN_SECS), "{bad:?}");
+        }
+    }
+
+    /// Both loops that take work select on the stop signal, and the drain
+    /// waits for every permit before run() returns Ok: a stop never kills a
+    /// turn or task that could have finished (i256).
+    #[test]
+    fn a_stop_drains_before_the_harness_exits() {
+        let code = include_str!("harness_main.rs");
+        let run = &code[code.find("pub async fn run()").unwrap()..code.find("/// Which loop this harness runs").unwrap()];
+        assert_eq!(run.matches("stop_t.changed()").count(), 1, "the task loop selects on the stop");
+        assert_eq!(run.matches("_ = stop.changed() => { stopping = true; break }").count(), 1, "the turn loop selects on the stop");
+        let drain_wait = run.find("acquire_many_owned(capacity)").expect("the drain waits for every permit");
+        assert!(run.find("harness: draining").unwrap() < drain_wait && drain_wait < run.rfind("Ok(())").unwrap());
+        assert!(run.find("the turn subscription ended").unwrap() < drain_wait, "a dead subscription is still an error, not a drain");
+    }
+
     /// noomesh-internal i176: at capacity the harness says busy (a reply,
     /// not silence); a task already here is acknowledged, not started
     /// twice; a finished task re-announces ready so the gateway hands the
@@ -670,7 +903,9 @@ mod tests {
     fn a_busy_harness_says_so_and_never_runs_a_task_twice() {
         let src = include_str!("harness_main.rs").split("fn a_busy_harness_says_so_and_never_runs_a_task_twice").next().unwrap();
         let tasks = src.split("queue_subscribe(crate::tasks::task_subject(&node)").nth(1).unwrap();
-        let loop_body = tasks.split("while let Some(msg) = tasks.next().await").nth(1).unwrap();
+        // The task loop now selects on the stop signal (i256); its body
+        // starts after the select that yields `msg`.
+        let loop_body = tasks.split("m = tasks.next() => match m").nth(1).expect("the task loop takes from the subscription");
         let dedupe = loop_body.find("\"already\": true").expect("an already-running task is acknowledged as taken");
         let permit = loop_body.find("try_acquire_owned()").expect("the permit");
         assert!(dedupe < permit, "the dedupe runs before a permit is taken");
@@ -682,7 +917,6 @@ mod tests {
         assert!(turns[..300].contains("\"busy\": true"), "a turn at capacity is answered busy too");
     }
 
-    use super::*;
 
     /// A stand-in node agent answering `/harness/placement` with `status`
     /// and `body`; returns its base URL.

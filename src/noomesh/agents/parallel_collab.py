@@ -39,7 +39,7 @@ class _CollabConversationTracker:
             from .._providers import default_conversation_store
             self._store = default_conversation_store().store()
         except Exception:
-            pass
+            _logger.debug("collab_tracker.store_unavailable", exc_info=True)
 
     async def on_start(self, collab_id: str, task: str, roles: list[str]) -> None:
         if not self._store:
@@ -450,6 +450,7 @@ class ParallelCollaboration:
                 if nats_client and not nats_client.is_connected:
                     nats_client = None
             except Exception:
+                _logger.debug("collab.nats_unavailable", exc_info=True)
                 nats_client = None
 
         nats_subject = f"agent.collab.{collab_id}.{role}"
@@ -462,7 +463,7 @@ class ParallelCollaboration:
             try:
                 await nats_client.js.publish(subject, json.dumps(data).encode())
             except Exception:
-                pass
+                _logger.warning("collab.ctrl_done_publish_failed", collab_id=collab_id, exc_info=True)
 
         for iteration in range(1, self.MAX_ITERATIONS + 1):
             if done_event.is_set():
@@ -590,7 +591,7 @@ class ParallelCollaboration:
                         }).encode()
                         await nats_client.js.publish(nats_subject, payload)
                     except Exception:
-                        pass
+                        _logger.debug("collab.nats_done_publish_failed", role=role, exc_info=True)
                 return AgentResult(
                     role=role,
                     output=output,
@@ -699,6 +700,7 @@ class ParallelCollaboration:
                 if nats_client and not nats_client.is_connected:
                     nats_client = None
             except Exception:
+                _logger.debug("collab.nats_unavailable", exc_info=True)
                 nats_client = None
 
         ctrl_subject = f"agent.collab.{collab_id}.ctrl"
@@ -809,6 +811,6 @@ class ParallelCollaboration:
                     "ts": time.time(),
                 }).encode())
             except Exception:
-                pass
+                _logger.warning("collab.ctrl_done_publish_failed", collab_id=collab_id, exc_info=True)
 
         return results

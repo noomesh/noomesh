@@ -32,6 +32,19 @@
 //!   7. ONE CA-signed bundle (env+unit+binary+certs), CMS-encrypted to the
 //!      node's birth cert and STAGED at the gateway for the node's fetch timer
 //!      to collect. No shell on the node, no sudo, no inbound connection.
+//!
+//! `cluster_provision` is a literal ordered list of phases; read it for the
+//! order. In order: `parse_provision_args`, `begin_provision` (lane),
+//! `wait_for_enrollment` (1), `load_enrollment` (2), `resolve_identity`,
+//! `resolve_machine`, `ensure_node_certs` + door leaves (3), `load_credentials`
+//! (4), `obtain_binary` (5), `read_env_template` / `build_env_vars` /
+//! `check_data_root` / `render_agent_env` (6), `read_bundle_material`,
+//! `prepare_bundle_workspace`, `base_bundle_files`, the `attach_*` phases
+//! (applier+fetcher, hostd, CLI, harness, vendor CLIs, backend door leaves,
+//! NATS credential; `drop_binaries_the_node_already_runs`), `sign_bundle` (7),
+//! `stage_applier_first`, `stage_bundle`, `report_staged_only` (--stage-only),
+//! `await_apply`, `report_provisioned`. The source-reading tests read the list
+//! for ORDER and the owning phase for CONTENT (`phase_src` at the bottom).
 
 use crate::output::{fail, ExitCode};
 use crate::{Globals, Unhandled};
@@ -262,7 +275,133 @@ fn declared_data_root(g: &Globals, node: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// `noo cluster provision <node>` as a LITERAL, ORDERED list of phases. Read
+/// this function for the order; each phase owns its behaviour, messages and
+/// exit codes (all unchanged from when this was one 1150-line body).
+///
+/// The invariants the order encodes (the source-reading tests read THIS body
+/// for order and the one phase that owns a behaviour for content):
+///
+/// 1. The rail verb never runs the first-install (sudo) lane: its only sudo
+///    is the self node's identity step, inside `begin_provision`.
+/// 2. The self node is built from THIS machine (`load_enrollment`), checked
+///    against the gateway's view of it, and only then is anything staged
+///    (`stage_bundle`). Nothing is staged that the gateway could not verify.
+/// 3. hostd is attached for EVERY node before, and outside, the self-node CLI
+///    branch (`attach_hostd` precedes `attach_cli`).
+/// 4. No bundle leaves without this node's own NATS pair: the credential is
+///    attached (`attach_nats_credential`) before the bundle is signed
+///    (`sign_bundle`), which itself requires the pair before it signs.
+/// 5. A refusal (`no_birth_cert`, `data_root_conflict`, `agent_binary`, ...)
+///    happens before the bundle is built; once files are being attached, every
+///    failure scrubs the scratch dir first.
+/// 6. `--stage-only` returns right after the poke; otherwise `await_apply`
+///    judges the node's own apply report, and a self-node success runs
+///    `after_self_applied`, which no other path may reimplement.
 pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let a = parse_provision_args(g, args);
+
+    // Who and where: the lane, the enrollment, the identity, the machine.
+    let site = begin_provision(g, &a);
+    wait_for_enrollment(g, &a, &site);
+    let enrollment = load_enrollment(g, &a, &site);
+    let id = resolve_identity(g, &a, &site, &enrollment);
+    let machine = resolve_machine(g, &a, &enrollment);
+
+    // The node's PKI, and the agent it will run.
+    let pki = ensure_node_certs(g, &a, &site, &id);
+    ensure_door_leaves(g, &crate::pki::ClusterCa::new(pki.clone()), &a.node);
+    let creds = load_credentials(g, &site);
+    let binary = obtain_binary(g, &site, &machine);
+    let tmpl = read_env_template(g, &site);
+    let vars = build_env_vars(g, &a, &site, &id, &machine, creds);
+    check_data_root(g, &a, &enrollment, &machine, &vars);
+    let env_body = render_agent_env(g, &a, &enrollment, &machine, &tmpl, &vars);
+
+    // The bundle: every file the node will apply, then one signature.
+    let material = read_bundle_material(g, &a, &site, &pki);
+    let (ca, work) = prepare_bundle_workspace(g, &a, &pki);
+    let mut files = base_bundle_files(&id, &machine, env_body, binary, material);
+    attach_applier_and_fetcher(&machine, &mut files);
+    attach_hostd(g, &site, &enrollment, &machine, &mut files);
+    attach_cli(&a, &site, &enrollment, &id, &machine, &mut files);
+    attach_harness(g, &a, &site, &enrollment, &id, &machine, &vars, &mut files);
+    attach_vendor_clis(g, &a, &site, &enrollment, &machine, &work, &mut files);
+    drop_binaries_the_node_already_runs(g, &a, &machine, &mut files);
+    attach_door_leaves(g, &a, &enrollment, &machine, &ca, &work, &mut files);
+    attach_nats_credential(g, &a, &site, &work, &mut files);
+    let bundle = sign_bundle(g, &a, &ca, &files, &work);
+
+    // Stage it at the gateway, then judge what the node reports.
+    let legacy = stage_applier_first(g, &a, &machine, &ca);
+    let staged = stage_bundle(g, &a, &enrollment, &machine, &bundle, &work, legacy);
+    if a.stage_only {
+        report_staged_only(g, &a, &staged);
+        return Ok(0);
+    }
+    await_apply(g, &a, &machine, &staged);
+    report_provisioned(g, &a, &id, &machine);
+    Ok(0)
+}
+
+/// What `noo cluster provision` was asked for (argv, parsed once).
+struct ProvisionArgs {
+    node: String,
+    tier: Option<String>,
+    wait: Option<u64>,
+    local: bool,
+    harness: Option<String>,
+    move_data: bool,
+    stage_only: bool,
+}
+
+/// Where this provision runs: the install root, and whether the node being
+/// provisioned is this controller's own.
+struct ProvSite {
+    root: std::path::PathBuf,
+    is_self: bool,
+}
+
+/// What the gateway knows about the node: its enrollment record, its live
+/// record and the app version it reports.
+struct ProvEnrollment {
+    record: Option<Redemption>,
+    live_node: Option<serde_json::Value>,
+    node_app_version: String,
+}
+
+/// The node's address, account and tier, resolved from its enrollment.
+struct ProvIdentity {
+    ip: String,
+    user: String,
+    tier: String,
+}
+
+/// The node's machine facts that decide what the bundle contains.
+struct ProvMachine {
+    birth_cert: Option<String>,
+    goarch: String,
+    data_root: String,
+    darwin: bool,
+}
+
+/// The certificate material the bundle carries (read from the local PKI).
+struct BundleMaterial {
+    unit: Vec<u8>,
+    ca_crt: Vec<u8>,
+    node_crt: Vec<u8>,
+    node_key: Vec<u8>,
+}
+
+/// A bundle staged at the gateway: what the apply wait judges against.
+struct ProvStaged {
+    sha: String,
+    poked: bool,
+    legacy: bool,
+}
+
+/// Parse `noo cluster provision <node> [tier] [flags]`. Native-only: bad args print usage here.
+fn parse_provision_args(g: &Globals, args: &[String]) -> ProvisionArgs {
     let mut node: Option<String> = None;
     let mut tier: Option<String> = None;
     let mut wait: Option<u64> = None;
@@ -311,7 +450,7 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
                 });
             }
             // Native-only command: bad args must print usage here, never fall
-            // through to the Python CLI (which has no `provision`).
+            // through to another implementation.
             t if t.starts_with('-') => fail(g.json, ExitCode::Usage, "usage",
                 &format!("unknown flag: {t}"),
                 Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data]")),
@@ -326,21 +465,27 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
         fail(g.json, ExitCode::Usage, "usage", "node name required",
             Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data]"));
     };
+    ProvisionArgs { node, tier, wait, local, harness, move_data, stage_only }
+}
 
+/// Print the node header and settle which lane the node rides.
+/// i67: the controller's own node rides the rail, exactly like a remote
+/// node, whenever its pull units exist; without them it is refused (never
+/// a sudo fallback) and `noo onboard` does the one first install.
+///
+/// i11a still holds, by construction: the self node is never resolved
+/// from an enrollment record (one under its name may belong to another
+/// machine that announced the same name). Its address, account, facts
+/// and birth cert come from THIS machine (self_node_redemption), and the
+/// birth cert is recorded at the gateway by the self-node route.
+fn begin_provision(g: &Globals, a: &ProvisionArgs) -> ProvSite {
+    let node = a.node.clone();
+    let local = a.local;
     if !g.json && !ui::quiet() {
         println!("{}", ui::item(&node));
     }
     let root = crate::envfile::repo_root();
 
-    // i67: the controller's own node rides the rail, exactly like a remote
-    // node, whenever its pull units exist; without them it is refused (never
-    // a sudo fallback) and `noo onboard` does the one first install.
-    //
-    // i11a still holds, by construction: the self node is never resolved
-    // from an enrollment record (one under its name may belong to another
-    // machine that announced the same name). Its address, account, facts
-    // and birth cert come from THIS machine (self_node_redemption), and the
-    // birth cert is recorded at the gateway by the self-node route.
     let is_self = crate::role::is_self_node(&node) && crate::role::detect().controller.is_some();
     if local && !is_self {
         fail(g.json, ExitCode::Usage, "usage",
@@ -362,8 +507,14 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             SelfLane::Refuse(why) => fail(g.json, ExitCode::Generic, "self_node_units", &why, Some(SELF_RAIL_REMEDY)),
         }
     }
+    ProvSite { root, is_self }
+}
 
-    // ── 1. --wait for the enrollment to land ────────────────────────────────
+/// Step 1: --wait for the enrollment to land (skipped for the controller's own node).
+fn wait_for_enrollment(g: &Globals, a: &ProvisionArgs, site: &ProvSite) {
+    let node = a.node.clone();
+    let wait = a.wait;
+    let is_self = site.is_self;
     if let Some(secs) = wait.filter(|_| !is_self) {
         // One live line (guide §5 "Waiting is one line"); off a TTY a
         // heartbeat per minute (finding #73: a silent multi-minute wait
@@ -390,9 +541,16 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
         // Prep runs AFTER redemption; the gate must exist before we probe it.
         std::thread::sleep(std::time::Duration::from_secs(20));
     }
+}
 
-    // ── 2. The enrollment record (pull lane needs it even for inventoried
-    //       nodes: birth cert + facts live there) ────────────────────────────
+/// Step 2: the enrollment record, the self node's birth cert check, and the node's live record.
+/// What the node says it is running: the controller must not stage kinds
+/// this version's applier cannot parse (applier_knows_harness_kinds).
+/// The node's live record, fetched once: its running version here, and
+/// its live-derived tier below.
+fn load_enrollment(g: &Globals, a: &ProvisionArgs, site: &ProvSite) -> ProvEnrollment {
+    let node = a.node.clone();
+    let is_self = site.is_self;
     let record = if is_self {
         match self_node_redemption(&node) {
             Ok(r) => Some(r),
@@ -426,12 +584,21 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     // its live-derived tier below.
     let live_node = live_node_record(g, &node);
     let node_app_version = live_app_version(live_node.as_ref());
+    ProvEnrollment { record, live_node, node_app_version }
+}
 
-    // ── Facts: the enrollment record (the gateway registry) is the only
-    //    source. The ansible inventory this verb used to consult and append
-    //    to went with the playbook tree (3695e129); on a standalone
-    //    controller it never existed and the first provision after the
-    //    2026-09-07 walk died on "Cannot read ansible/inventory/hosts".
+/// Resolve the node's address, account and tier from its enrollment record, and record them on its registry row.
+///    source. The ansible inventory this verb used to consult and append
+///    to went with the playbook tree (3695e129); on a standalone
+///    controller it never existed and the first provision after the
+///    2026-09-07 walk died on "Cannot read ansible/inventory/hosts".
+fn resolve_identity(g: &Globals, a: &ProvisionArgs, site: &ProvSite, enr: &ProvEnrollment) -> ProvIdentity {
+    let node = a.node.clone();
+    let harness = a.harness.clone();
+    let is_self = site.is_self;
+    let record = &enr.record;
+    let live_node = &enr.live_node;
+    let tier = a.tier.clone();
     let (ip, user, tier) = {
         nstep(&format!("resolving {node} from its enrollment record"));
         let Some(rec) = record.as_ref() else {
@@ -447,16 +614,16 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
         let t = match tier {
             Some(t) => t,
             None => {
-                // Enrollment facts first (no contact); SSH probe only on the
+                // ProvEnrollment facts first (no contact); SSH probe only on the
                 // gate lane where facts are absent (pre-pull enrollments).
-                // Enrollment facts, or nothing. The SSH probe that used to
+                // ProvEnrollment facts, or nothing. The SSH probe that used to
                 // stand in for a missing record is gone with the gate lane;
                 // a node with no facts must be re-enrolled, and guessing a
                 // tier here would place work on hardware we cannot see.
                 // The LIVE derivation first. A re-provision is not a birth: the
                 // node has been heartbeating, and the gateway's canonical
                 // ladder (node_tier.rs) has already judged its current
-                // hardware. Enrollment facts are a snapshot from the day it
+                // hardware. ProvEnrollment facts are a snapshot from the day it
                 // joined — host3 enrolled 2026-09-09 with gpu_present:false
                 // (WSL2, GPU not yet visible), so every `upgrade --nodes`
                 // re-derived tier 3 (CPU) for a 16 GB GPU box and wrote it back
@@ -488,9 +655,14 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
         } }
         (ip, user, t)
     };
+    ProvIdentity { ip, user, tier }
+}
 
-    // ── Transport decision + machine facts ───────────────────────────────────
-    // Pull (default): everything comes from the ENROLLMENT record — no
+/// Transport decision + machine facts: the birth cert, arch, data root and OS of the node.
+fn resolve_machine(g: &Globals, a: &ProvisionArgs, enr: &ProvEnrollment) -> ProvMachine {
+    let node = a.node.clone();
+    let record = &enr.record;
+    let live_node = &enr.live_node;
     let birth_cert = record.as_ref().and_then(|r| r.birth_cert.clone());
     // No gate lane. A node with no birth cert cannot collect a staged
     // bundle, and the SSH probe that used to substitute for the record is
@@ -566,20 +738,26 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     // every linux path below is untouched.
     let node_os = enrolled_os(record.as_ref());
     let darwin = node_os == "macos";
+    ProvMachine { birth_cert, goarch: goarch.to_string(), data_root, darwin }
+}
 
-    // ── 3. certs ─────────────────────────────────────────────────────────────
-    //
-    // Issue when ABSENT, and re-issue when the existing cert no longer
-    // covers the node's current address. Absence alone was the old test,
-    // which meant a node that had ever been issued a cert kept it — stale
-    // SANs and all — through every restage. Live consequence (2026-09-04):
-    // a node's cert named an address it no longer had, the gateway
-    // rejected the handshake by name, and every inference to it failed
-    // while the node itself reported healthy.
-    //
-    // This matters more the moment the certificate becomes the node's
-    // identity: the same drift stops being "one node's inference is down"
-    // and becomes "one node cannot authenticate at all".
+/// Step 3: the node's cert in the local PKI (issued when absent or when it no longer covers the address). Returns the PKI dir.
+///
+/// Issue when ABSENT, and re-issue when the existing cert no longer
+/// covers the node's current address. Absence alone was the old test,
+/// which meant a node that had ever been issued a cert kept it — stale
+/// SANs and all — through every restage. Live consequence (2026-09-04):
+/// a node's cert named an address it no longer had, the gateway
+/// rejected the handshake by name, and every inference to it failed
+/// while the node itself reported healthy.
+///
+/// This matters more the moment the certificate becomes the node's
+/// identity: the same drift stops being "one node's inference is down"
+/// and becomes "one node cannot authenticate at all".
+fn ensure_node_certs(g: &Globals, a: &ProvisionArgs, site: &ProvSite, id: &ProvIdentity) -> std::path::PathBuf {
+    let node = a.node.clone();
+    let is_self = site.is_self;
+    let ip = id.ip.clone();
     let pki = crate::pki::pki_dir();
     let node_crt = pki.join("nodes").join(&node).join("node.crt");
     let node_key = pki.join("nodes").join(&node).join("node.key");
@@ -628,27 +806,24 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
                 &format!("could not issue a cert for {node}"), None),
         }
     }
+    pki
+}
 
-    // ── 3b. the node's backend door leaves ──────────────
-    // Every backend the agent starts serves through a door that requires a
-    // client certificate, and each door serves with its own leaf under
-    // $NOO_PKI_DIR/services/<x>/. One per door service, node-scoped on this
-    // disk (nodes/<node>/services/<x>/), for the FIXED set rather than
-    // today's placements: a backend placed next week must not be refused
-    // until someone remembers to re-provision. Issued when absent, and
-    // re-issued when the SANs miss a door, it is inside the renewal
-    // window, or a CA rotation left it signed by the previous CA — so a
-    // plain re-provision (or `noo upgrade --nodes`) is the renewal.
-    ensure_door_leaves(g, &crate::pki::ClusterCa::new(pki.clone()), &node);
-
-    // ── 4. credentials (sops -d, in memory) ──────────────────────────────────
-    let creds = sops_credentials(&root).unwrap_or_else(|e| {
+/// Step 4: credentials from the secret store (sops -d, in memory only).
+fn load_credentials(g: &Globals, site: &ProvSite) -> Creds {
+    let root = site.root.clone();
+    sops_credentials(&root).unwrap_or_else(|e| {
         fail(g.json, ExitCode::Generic, "secrets", &e, None)
-    });
+    })
+}
 
-    // ── 5. agent binary for the node's arch ─────────────────────────────────
+/// Step 5: the agent binary for the node's arch.
+fn obtain_binary(g: &Globals, site: &ProvSite, m: &ProvMachine) -> Vec<u8> {
+    let root = site.root.clone();
+    let goarch = m.goarch.as_str();
+    let darwin = m.darwin;
     nstep(&format!("obtaining noo-node-agent ({goarch})"));
-    let binary = if darwin {
+    if darwin {
         // No darwin binary rides any container image — source build only
         // (build-cross darwin/<arch> is proven to emit valid Mach-O).
         obtain_agent_binary_darwin(g, &root, goarch).unwrap_or_else(|e| {
@@ -660,14 +835,26 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             fail(g.json, ExitCode::Generic, "agent_binary", &e,
                 Some("is docker logged in to the image registry, and NOO_IMAGE_TAG set (noomesh.yaml compose_env / .env)?"));
         })
-    };
+    }
+}
 
-    // ── 6. render the env from the real template ─────────────────────────────
+/// Step 6a: the real ansible env template (single source of truth).
+fn read_env_template(g: &Globals, site: &ProvSite) -> String {
+    let root = site.root.clone();
     let tmpl_path = root.join("node-agent-go/deploy/noo-node-agent.env.tmpl");
-    let tmpl = std::fs::read_to_string(&tmpl_path).unwrap_or_else(|e| {
+    std::fs::read_to_string(&tmpl_path).unwrap_or_else(|e| {
         fail(g.json, ExitCode::Generic, "template",
             &format!("cannot read {} ({e})", tmpl_path.display()), None)
-    });
+    })
+}
+
+/// Step 6b: every var the node env template names.
+fn build_env_vars(g: &Globals, a: &ProvisionArgs, site: &ProvSite, id: &ProvIdentity, m: &ProvMachine, creds: Creds) -> BTreeMap<&'static str, String> {
+    let node = a.node.clone();
+    let root = site.root.clone();
+    let tier = id.tier.clone();
+    let data_root = m.data_root.clone();
+    let darwin = m.darwin;
     let mut vars: BTreeMap<&str, String> = BTreeMap::new();
     vars.insert("na_node_id", node.clone());
     vars.insert("node_ip", String::new()); // parity with the play (default '')
@@ -733,17 +920,14 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     vars.insert("noo_ollama_gpu_count", String::new());
     vars.insert("node_agent_port", String::from("8081"));
     vars.insert("log_level", String::from("info"));
-    // Cluster trust: the bind override and the v1 cluster-token gate, both
-    // owned by the controller (see `cluster_trust_vars`).
-    let (agent_bind, v1_gate, trust_notes) = cluster_trust_vars(g).unwrap_or_else(|e| {
+    // Cluster trust: the bind override, owned by the controller (see
+    // `cluster_trust_bind`). The v1 cluster-token gate is deleted and no
+    // longer rendered: v1 is always refused.
+    let agent_bind = cluster_trust_bind().unwrap_or_else(|e| {
         fail(g.json, ExitCode::Generic, "node_agent_bind", &e,
             Some("set NODE_AGENT_BIND in the controller's .env / compose_env to `all`, an IP address, or a comma list of them (or unset it)"))
     });
-    for n in &trust_notes {
-        if !g.json && !ui::quiet() { println!("{}", ui::note(n)); }
-    }
     vars.insert("node_agent_bind", agent_bind);
-    vars.insert("noo_cluster_token_v1", v1_gate);
     if darwin {
         // Same env contract, darwin homes: everything under ~/noomesh (the
         // enroll binary installs there — no root paths, no systemd). $HOME
@@ -771,9 +955,18 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
         vars.insert("ollama_data_dir", q(format!("{droot}/ollama")));
         vars.insert("noo_data_root", q(droot));
     }
-    // ── data root: what this bundle renders vs what the node runs on
-    //    Refuse BEFORE anything is staged. A Mac's roots
-    //    carry `$HOME` and are not comparable, so it is not checked.
+    vars
+}
+
+/// Step 6c: data root, what this bundle renders vs what the node runs on.
+/// ── data root: what this bundle renders vs what the node runs on
+///    Refuse BEFORE anything is staged. A Mac's roots
+///    carry `$HOME` and are not comparable, so it is not checked.
+fn check_data_root(g: &Globals, a: &ProvisionArgs, enr: &ProvEnrollment, m: &ProvMachine, vars: &BTreeMap<&str, String>) {
+    let node = a.node.clone();
+    let move_data = a.move_data;
+    let live_node = &enr.live_node;
+    let darwin = m.darwin;
     if !darwin {
         let rendered = super::data_root::Rendered {
             noo_data_root: vars["noo_data_root"].clone(),
@@ -806,27 +999,39 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             }
         }
     }
-    let env_body = render_env_template(&tmpl, &vars).unwrap_or_else(|e| {
+}
+
+/// Step 6d: render the env, withholding keys a Mac applier predating them would refuse.
+fn render_agent_env(g: &Globals, a: &ProvisionArgs, enr: &ProvEnrollment, m: &ProvMachine, tmpl: &str, vars: &BTreeMap<&str, String>) -> String {
+    let node = a.node.clone();
+    let node_app_version = enr.node_app_version.clone();
+    let darwin = m.darwin;
+    let env_body = render_env_template(tmpl, vars).unwrap_or_else(|e| {
         fail(g.json, ExitCode::Generic, "render", &e, None)
     });
-    // A Mac whose CLI predates the two cluster-trust keys refuses an
-    // agent-env that names them (its applier validates every key up front),
+    // A Mac whose CLI predates the cluster-trust key refuses an
+    // agent-env that names it (its applier validates every key up front),
     // which would strand the very bundle that carries the newer CLI. Withheld
     // for that node, said, and the next restage carries them.
-    let env_body = if applier_knows_cluster_trust_keys(darwin, &node_app_version) {
+    if applier_knows_cluster_trust_keys(darwin, &node_app_version) {
         env_body
     } else {
         if !g.json && !ui::quiet() {
             println!("{}", ui::note(&format!(
-                "NODE_AGENT_BIND / NOO_CLUSTER_TOKEN_V1 withheld from this bundle: {node} reports \
-                 {node_app_version}, whose applier predates them and would refuse the whole agent-env. \
+                "NODE_AGENT_BIND withheld from this bundle: {node} reports \
+                 {node_app_version}, whose applier predates it and would refuse the whole agent-env. \
                  The bundle carries the newer CLI; once {node} reports it, re-run \
-                 `noo cluster provision {node}` to apply the agent keys.")));
+                 `noo cluster provision {node}` to apply the agent key.")));
         }
         drop_env_keys(&env_body, CLUSTER_TRUST_ENV_KEYS)
-    };
+    }
+}
 
-    // ── unit + certs bytes ───────────────────────────────────────────────────
+/// The unit file and the certificate material the bundle carries.
+fn read_bundle_material(g: &Globals, a: &ProvisionArgs, site: &ProvSite, pki: &Path) -> BundleMaterial {
+    let node = a.node.clone();
+    let root = site.root.clone();
+    let pki = pki.to_path_buf();
     let unit = std::fs::read(root.join("node-agent-go/deploy/noo-node-agent.service"))
         .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "unit",
             &format!("cannot read the agent unit file ({e})"), None));
@@ -837,8 +1042,13 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     let ca_crt = read_pki("ca.crt");
     let node_crt = read_pki(&format!("nodes/{node}/node.crt"));
     let node_key = read_pki(&format!("nodes/{node}/node.key"));
+    BundleMaterial { unit, ca_crt, node_crt, node_key }
+}
 
-    // ── 7. one signed bundle, staged for the node to collect ────────────────
+/// Step 7: the CA, the signing key delivered first when the node has not adopted it, and a scratch dir.
+fn prepare_bundle_workspace(g: &Globals, a: &ProvisionArgs, pki: &Path) -> (crate::pki::ClusterCa, std::path::PathBuf) {
+    let node = a.node.clone();
+    let pki = pki.to_path_buf();
     let ca = crate::pki::ClusterCa::new(pki.clone());
     // The CA signs nothing but the signing key itself, so a
     // node that has not adopted it gets the key ALONE first (a CA-signed
@@ -850,7 +1060,15 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     }
     let work = std::env::temp_dir().join(format!("noo-provision-{node}-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&work);
-    let files: Vec<(&str, Vec<u8>)> = if darwin {
+    (ca, work)
+}
+
+/// The files every bundle carries: env, unit/plist, agent binary, CA and node cert pair.
+fn base_bundle_files(id: &ProvIdentity, m: &ProvMachine, env_body: String, binary: Vec<u8>, mat: BundleMaterial) -> Vec<(&'static str, Vec<u8>)> {
+    let user = id.user.clone();
+    let darwin = m.darwin;
+    let BundleMaterial { unit, ca_crt, node_crt, node_key } = mat;
+    if darwin {
         vec![
             ("agent-env", env_body.into_bytes()),
             ("agent-plist", DARWIN_AGENT_PLIST.replace("__USER__", &user).into_bytes()),
@@ -869,45 +1087,46 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             ("node.crt", node_crt),
             ("node.key", node_key),
         ]
-    };
-    // The applier and the fetcher ride every Linux bundle (2026-09-03): a
-    // new kind is otherwise refused by the old applier already on the node
-    // (exit 76), and the fetcher is what reports apply outcomes back. The
-    // applier self-updates FIRST (noo-apply §1b) and re-runs the bundle.
-    let mut files = files;
+    }
+}
+
+/// The applier and the fetcher ride every Linux bundle.
+/// The applier and the fetcher ride every Linux bundle (2026-09-03): a
+/// new kind is otherwise refused by the old applier already on the node
+/// (exit 76), and the fetcher is what reports apply outcomes back. The
+/// applier self-updates FIRST (noo-apply §1b) and re-runs the bundle.
+fn attach_applier_and_fetcher(m: &ProvMachine, files: &mut Vec<(&'static str, Vec<u8>)>) {
+    let darwin = m.darwin;
     if !darwin {
         let apply = super::enroll::asset_apply();
         let fetch = super::enroll::asset_fetch();
         if !apply.is_empty() { files.push(("applier", apply.as_bytes().to_vec())); }
         if !fetch.is_empty() { files.push(("fetcher", fetch.as_bytes().to_vec())); }
     }
-    // The CLI rides the rail too: when the controller's cache
-    // holds the release asset for this node's platform, the bundle carries
-    // it as `cli-binary` (+ `cli-user`, the account that owns ~/.local/bin).
-    // `noo upgrade --nodes` fills the cache; a node never needs GitHub.
-    //
-    // Except for the controller's own node: that box's CLI is the one
-    // running `noo upgrade`, managed by its CLI stage, and a bundle that
-    // installs over it replaces the binary mid-run (2026-09-11: every node
-    // after host8 in `--nodes` failed to spawn). Same rail, one file fewer.
-    let self_node = crate::role::is_self_node(&node);
+}
+
+/// hostd rides the rail on EVERY node, the controller's own included (it must not sit inside the self-node CLI branch).
+/// hostd rides the rail on EVERY node, the controller's own included.
+/// It used to sit inside the self-node branch below, which exists for the
+/// CLI alone; hostd was swept in with it, so the controller's worker-mode
+/// hostd had no upgrade path at all and host8 stayed on 0.5.58 through
+/// two releases (2026-09-28). The applier installs it the same way on
+/// every node, with a fresh-heartbeat check and an automatic revert.
+///
+/// The helper the harness lifecycle needs, staged like the harness
+/// itself. Without it the agent has nothing to ask
+/// the agent cannot sudo, so hostd does the start), and a node with
+/// a harness placement and no hostd fails every reconcile tick —
+/// which is what every Linux node did on 2026-09-19, because the
+/// rail never carried this kind. Absent from an older release is a
+/// note, not a failure: the applier simply installs no helper.
+fn attach_hostd(g: &Globals, site: &ProvSite, enr: &ProvEnrollment, m: &ProvMachine, files: &mut Vec<(&'static str, Vec<u8>)>) {
+    let root = site.root.clone();
+    let record = &enr.record;
+    let darwin = m.darwin;
     let f = record.as_ref().and_then(|r| r.facts.clone()).unwrap_or_else(|| serde_json::json!({}));
     let os = f.get("os").and_then(|v| v.as_str()).unwrap_or(if darwin { "macos" } else { "linux" });
     let arch = f.get("arch").and_then(|v| v.as_str()).unwrap_or("x86_64");
-    // hostd rides the rail on EVERY node, the controller's own included.
-    // It used to sit inside the self-node branch below, which exists for the
-    // CLI alone; hostd was swept in with it, so the controller's worker-mode
-    // hostd had no upgrade path at all and host8 stayed on 0.5.58 through
-    // two releases (2026-09-28). The applier installs it the same way on
-    // every node, with a fresh-heartbeat check and an automatic revert.
-    //
-    // The helper the harness lifecycle needs, staged like the harness
-    // itself. Without it the agent has nothing to ask
-    // the agent cannot sudo, so hostd does the start), and a node with
-    // a harness placement and no hostd fails every reconcile tick —
-    // which is what every Linux node did on 2026-09-19, because the
-    // rail never carried this kind. Absent from an older release is a
-    // note, not a failure: the applier simply installs no helper.
     if let Some(asset) = hostd_asset_for(os, arch) {
         match cached_release_asset(g, &root, &asset) {
             Ok(bytes) => {
@@ -921,6 +1140,28 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             )),
         }
     }
+}
+
+/// The CLI rides the rail too (not for the controller's own node).
+/// The CLI rides the rail too: when the controller's cache
+/// holds the release asset for this node's platform, the bundle carries
+/// it as `cli-binary` (+ `cli-user`, the account that owns ~/.local/bin).
+/// `noo upgrade --nodes` fills the cache; a node never needs GitHub.
+///
+/// Except for the controller's own node: that box's CLI is the one
+/// running `noo upgrade`, managed by its CLI stage, and a bundle that
+/// installs over it replaces the binary mid-run (2026-09-11: every node
+/// after host8 in `--nodes` failed to spawn). Same rail, one file fewer.
+fn attach_cli(a: &ProvisionArgs, site: &ProvSite, enr: &ProvEnrollment, id: &ProvIdentity, m: &ProvMachine, files: &mut Vec<(&'static str, Vec<u8>)>) {
+    let node = a.node.clone();
+    let root = site.root.clone();
+    let record = &enr.record;
+    let user = id.user.clone();
+    let darwin = m.darwin;
+    let self_node = crate::role::is_self_node(&node);
+    let f = record.as_ref().and_then(|r| r.facts.clone()).unwrap_or_else(|| serde_json::json!({}));
+    let os = f.get("os").and_then(|v| v.as_str()).unwrap_or(if darwin { "macos" } else { "linux" });
+    let arch = f.get("arch").and_then(|v| v.as_str()).unwrap_or("x86_64");
     if self_node {
         nnote("this is the controller's own node — the bundle carries no CLI (noo upgrade manages it)");
     } else {
@@ -935,12 +1176,22 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             }
         }
     }
-    // ── the harness ────────────────────────────────────────────
-    // The gateway binary for this platform, from the controller's release
-    // asset cache (`noo upgrade --nodes` fills it), plus its env and unit.
-    // A cache without the asset means this release has no harness for the
-    // platform yet — said, not silently skipped. The controller's own node
-    // gets none: its gateway IS the harness, in process.
+}
+
+/// The harness: the gateway binary for this platform, its env and unit.
+/// The gateway binary for this platform, from the controller's release
+/// asset cache (`noo upgrade --nodes` fills it), plus its env and unit.
+/// A cache without the asset means this release has no harness for the
+/// platform yet — said, not silently skipped. The controller's own node
+/// gets none: its gateway IS the harness, in process.
+fn attach_harness(g: &Globals, a: &ProvisionArgs, site: &ProvSite, enr: &ProvEnrollment, id: &ProvIdentity, m: &ProvMachine, vars: &BTreeMap<&str, String>, files: &mut Vec<(&'static str, Vec<u8>)>) {
+    let node = a.node.clone();
+    let root = site.root.clone();
+    let record = &enr.record;
+    let node_app_version = enr.node_app_version.clone();
+    let user = id.user.clone();
+    let darwin = m.darwin;
+    let self_node = crate::role::is_self_node(&node);
     if self_node {
         nnote("this is the controller's own node — no harness in the bundle (the gateway runs turns in process)");
     } else {
@@ -982,7 +1233,7 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
                         // The harness's own copy of the node pair (i119):
                         // the applier installs it root:noo-harness 0640 on
                         // Linux; a Mac runs both as one user, same files.
-                        let (hcert, hkey) = harness_tls_paths(darwin, &vars);
+                        let (hcert, hkey) = harness_tls_paths(darwin, vars);
                         hvars.insert("harness_tls_cert", hcert);
                         hvars.insert("harness_tls_key", hkey);
                         let henv = render_env_template(&htmpl, &hvars)
@@ -1005,17 +1256,27 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             None => nnote(&format!("no harness in this bundle: no gateway asset for {os}/{arch}")),
         }
     }
-    // ── the vendor CLIs the node carries (i83 E1e) ────────────────────
-    // A harness kind that runs a vendor CLI (Copilot CLI, Claude Code,
-    // Codex) needs it on the node's PATH, and the node never fetches it:
-    // `noo cluster vendor stage <kind>` fetched and verified it on this
-    // controller, and the bundle carries it. The kinds: the harness
-    // placement's NOO_HARNESS_KIND (read from the same desired-config the
-    // node agent converges to) and the node's `vendor_kinds`
-    // (`noo cluster vendor install`), so a node can switch kinds without a
-    // restage. Not staged = the restage is refused: a restage never
-    // downloads, and a node placed on a CLI it does not have would only be
-    // refused by its agent.
+}
+
+/// The vendor CLIs the node carries (i83 E1e).
+/// A harness kind that runs a vendor CLI (Copilot CLI, Claude Code,
+/// Codex) needs it on the node's PATH, and the node never fetches it:
+/// `noo cluster vendor stage <kind>` fetched and verified it on this
+/// controller, and the bundle carries it. The kinds: the harness
+/// placement's NOO_HARNESS_KIND (read from the same desired-config the
+/// node agent converges to) and the node's `vendor_kinds`
+/// (`noo cluster vendor install`), so a node can switch kinds without a
+/// restage. Not staged = the restage is refused: a restage never
+/// downloads, and a node placed on a CLI it does not have would only be
+/// refused by its agent.
+fn attach_vendor_clis(g: &Globals, a: &ProvisionArgs, site: &ProvSite, enr: &ProvEnrollment, m: &ProvMachine, work: &Path, files: &mut Vec<(&'static str, Vec<u8>)>) {
+    let node = a.node.clone();
+    let root = site.root.clone();
+    let record = &enr.record;
+    let node_app_version = enr.node_app_version.clone();
+    let darwin = m.darwin;
+    let work = work.to_path_buf();
+    let self_node = crate::role::is_self_node(&node);
     if self_node {
         // The controller's gateway runs turns in process; no node harness here.
     } else if !super::cluster_vendor::applier_knows_vendor_kinds(darwin, &node_app_version) {
@@ -1084,22 +1345,34 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             }
         }
     }
-    // A binary the node's own last report proves it already runs is not
-    // carried again (bandwidth only: the applier skips identical bytes anyway).
-    // The proof is the node's `binary-sha:` statement; see `node_runs_asset`.
-    // The status read is one GET; unreachable or unparseable = carry everything.
-    {
-        let last = crate::http::get_json_opt(g, &format!("/api/cluster/provision-bundle/{node}/status"), true, 10);
-        for note in drop_proven_binaries(&mut files, last.as_ref(), darwin, self_node) {
-            nnote(&note);
-        }
+}
+
+/// Do not carry a binary the node's own last report proves it already runs.
+/// A binary the node's own last report proves it already runs is not
+/// carried again (bandwidth only: the applier skips identical bytes anyway).
+/// The proof is the node's `binary-sha:` statement; see `node_runs_asset`.
+/// The status read is one GET; unreachable or unparseable = carry everything.
+fn drop_binaries_the_node_already_runs(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, files: &mut Vec<(&'static str, Vec<u8>)>) {
+    let node = a.node.clone();
+    let darwin = m.darwin;
+    let self_node = crate::role::is_self_node(&node);
+    let last = crate::http::get_json_opt(g, &format!("/api/cluster/provision-bundle/{node}/status"), true, 10);
+    for note in drop_proven_binaries(files, last.as_ref(), darwin, self_node) {
+        nnote(&note);
     }
-    // ── the backend door leaves issued in 3b ──────────────────────────────
-    // Same rail, same signature. A Mac whose applier predates the kinds
-    // would refuse the WHOLE bundle on them (it has no self-updating shell
-    // applier), so it gets them on the restage after its CLI moves.
+}
+
+/// The backend door leaves issued in step 3b, on the same rail and signature.
+/// Same rail, same signature. A Mac whose applier predates the kinds
+/// would refuse the WHOLE bundle on them (it has no self-updating shell
+/// applier), so it gets them on the restage after its CLI moves.
+fn attach_door_leaves(g: &Globals, a: &ProvisionArgs, enr: &ProvEnrollment, m: &ProvMachine, ca: &crate::pki::ClusterCa, work: &Path, files: &mut Vec<(&'static str, Vec<u8>)>) {
+    let node = a.node.clone();
+    let node_app_version = enr.node_app_version.clone();
+    let darwin = m.darwin;
+    let work = work.to_path_buf();
     if super::node_leaves::applier_knows_leaf_kinds(darwin, &node_app_version) {
-        match super::node_leaves::leaf_payloads(&ca, &node) {
+        match super::node_leaves::leaf_payloads(ca, &node) {
             Ok((leaves, skipped)) => {
                 let n = leaves.len() / 2;
                 files.extend(leaves);
@@ -1116,290 +1389,332 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
         nnote(&super::node_leaves::withheld_leaves_note(&node, &node_app_version,
             super::node_leaves::upgrade_restages_leaves()));
     }
-    // ── the node's own NATS credential ────────────────────────
-    // Rides the provision bundle the way node.crt does: same rail, same CA
-    // signature, same applier. Both lanes: the Linux applier merges it into
-    // /etc/noo-node-agent.env; the darwin applier merges it into
-    // ~/noomesh/agent.env the way it merges fleet-secrets. Until 2026-09-12
-    // darwin was skipped ("no env to merge into"), so every Mac kept the
-    // shared `noo` user — and the moment the gateway's nats_isolation
-    // preflight went critical, one Mac on the legacy user kept the whole
-    // controller from starting.
-    //
-    // The server side is re-rendered BEFORE the bundle is staged, and that
-    // order is safe here in a way it is not for a rotation: this node is
-    // being BORN, so adding its user invalidates nothing anyone is
-    // presenting. Every other node's user is re-rendered from the password
-    // the store already holds, so nothing else changes either.
-    //
-    // The credential is REQUIRED: since an earlier release retired the shared
-    // NATS_USER there is nothing else a node may present, so a bundle
-    // without its own pair would provision an agent that refuses to connect.
-    // The server-side render stays best-effort — a controller whose gateway
-    // is down still stages the bundle, and the node retries auth until
-    // `noo cluster nats-users render` accepts its user.
-    {
-        match super::nats_users::node_credential_payload(&root, &node) {
-            Ok(payload) => {
-                files.push(("nats-creds", payload));
-                match super::nats_users::render_all(g, std::slice::from_ref(&node)) {
-                    Ok(out) => {
-                        let reloaded = super::nats_users::hup_nats();
-                        nnote(&format!(
-                            "bundle carries this node's own NATS credential; {} users rendered{}",
-                            out.users,
-                            if reloaded { " and noo-nats reloaded" } else { " (reload noo-nats: docker kill -s HUP noo-nats)" }));
-                    }
-                    Err(e) => nnote(&format!(
-                        "node credential minted but users.conf did not re-render ({e}) — the agent \
-                         retries auth until `noo cluster nats-users render` (then \
-                         `docker kill -s HUP noo-nats`) accepts node-{node}")),
+}
+
+/// The node's own NATS credential.
+/// Rides the provision bundle the way node.crt does: same rail, same CA
+/// signature, same applier. Both lanes: the Linux applier merges it into
+/// /etc/noo-node-agent.env; the darwin applier merges it into
+/// ~/noomesh/agent.env the way it merges fleet-secrets. Until 2026-09-12
+/// darwin was skipped ("no env to merge into"), so every Mac kept the
+/// shared `noo` user — and the moment the gateway's nats_isolation
+/// preflight went critical, one Mac on the legacy user kept the whole
+/// controller from starting.
+///
+/// The server side is re-rendered BEFORE the bundle is staged, and that
+/// order is safe here in a way it is not for a rotation: this node is
+/// being BORN, so adding its user invalidates nothing anyone is
+/// presenting. Every other node's user is re-rendered from the password
+/// the store already holds, so nothing else changes either.
+///
+/// The credential is REQUIRED: since an earlier release retired the shared
+/// NATS_USER there is nothing else a node may present, so a bundle
+/// without its own pair would provision an agent that refuses to connect.
+/// The server-side render stays best-effort — a controller whose gateway
+/// is down still stages the bundle, and the node retries auth until
+/// `noo cluster nats-users render` accepts its user.
+fn attach_nats_credential(g: &Globals, a: &ProvisionArgs, site: &ProvSite, work: &Path, files: &mut Vec<(&'static str, Vec<u8>)>) {
+    let node = a.node.clone();
+    let root = site.root.clone();
+    let work = work.to_path_buf();
+    match super::nats_users::node_credential_payload(&root, &node) {
+        Ok(payload) => {
+            files.push(("nats-creds", payload));
+            match super::nats_users::render_all(g, std::slice::from_ref(&node)) {
+                Ok(out) => {
+                    let reloaded = super::nats_users::hup_nats();
+                    nnote(&format!(
+                        "bundle carries this node's own NATS credential; {} users rendered{}",
+                        out.users,
+                        if reloaded { " and noo-nats reloaded" } else { " (reload noo-nats: docker kill -s HUP noo-nats)" }));
                 }
-            }
-            Err(e) => {
-                scrub(&work);
-                fail(g.json, ExitCode::Generic, "nats_credential",
-                    &format!("could not mint {node}'s own NATS credential ({e}) — a node has no \
-                              other bus credential (the shared NATS_USER is retired), so nothing \
-                              was staged"),
-                    Some("check the secret store (`noo security secrets audit`), then re-run \
-                          `noo cluster provision <node>`"));
+                Err(e) => nnote(&format!(
+                    "node credential minted but users.conf did not re-render ({e}) — the agent \
+                     retries auth until `noo cluster nats-users render` (then \
+                     `docker kill -s HUP noo-nats`) accepts node-{node}")),
             }
         }
+        Err(e) => {
+            scrub(&work);
+            fail(g.json, ExitCode::Generic, "nats_credential",
+                &format!("could not mint {node}'s own NATS credential ({e}) — a node has no \
+                          other bus credential (the shared NATS_USER is retired), so nothing \
+                          was staged"),
+                Some("check the secret store (`noo security secrets audit`), then re-run \
+                      `noo cluster provision <node>`"));
+        }
     }
+}
 
-    // i44 on the rail: no bundle leaves without this node's own pair —
-    // the controller's own node included.
-    if let Err(e) = require_nats_creds(&node, &files) {
+/// Sign the bundle. i44 on the rail: no bundle leaves without this node's own NATS pair, the controller's own node included.
+/// i44 on the rail: no bundle leaves without this node's own pair —
+/// the controller's own node included.
+fn sign_bundle(g: &Globals, a: &ProvisionArgs, ca: &crate::pki::ClusterCa, files: &[(&str, Vec<u8>)], work: &Path) -> std::path::PathBuf {
+    let node = a.node.clone();
+    let work = work.to_path_buf();
+    if let Err(e) = require_nats_creds(&node, files) {
         scrub(&work);
         fail(g.json, ExitCode::Generic, "nats_credential", &e, None);
     }
-    let bundle = match super::security_local::build_signed_bundle(&ca, &node, &files, &work) {
+    match super::security_local::build_signed_bundle(ca, &node, files, &work) {
         Ok(b) => b,
         Err(e) => { scrub(&work);
             fail(g.json, ExitCode::Generic, "bundle_failed", &e, None); }
-    };
+    }
+}
 
-    {
-        // ── PULL (the only lane): encrypt to the birth cert, stage
-        //    at the gateway, the node's noo-fetch timer collects it. The
-        //    gateway (and rail) only ever hold CIPHERTEXT; content
-        //    authenticity stays the CA signature noo-apply verifies. ─────────
-        let cert = birth_cert.as_deref().expect("pull lane requires a birth cert");
-        // A node that has never reported an apply outcome runs the legacy
-        // fetcher/applier pair (pre-2026-09-03): its applier refuses every
-        // kind it does not know, and its fetcher cannot report. Stage an
-        // applier-only bundle first — the one kind every applier accepts —
-        // so the full bundle below is applied by the new applier.
-        let legacy = node_never_reported_apply(g, &node);
-        if legacy && !darwin {
-            let apply = super::enroll::asset_apply();
-            if !apply.is_empty() {
-                nstep(&format!("{node} has never reported an apply — staging the applier alone first"));
-                let w2 = std::env::temp_dir().join(format!("noo-provision-applier-{node}-{}", std::process::id()));
-                let _ = std::fs::create_dir_all(&w2);
-                let pre: Vec<(&str, Vec<u8>)> = vec![("applier", apply.as_bytes().to_vec())];
-                let b2 = match super::security_local::build_signed_bundle(&ca, &node, &pre, &w2) {
-                    Ok(b) => b,
-                    Err(e) => { scrub(&w2); fail(g.json, ExitCode::Generic, "bundle_failed", &e, None); }
-                };
-                let blob2 = match encrypt_bundle_cms(&b2, cert, &w2) {
-                    Ok(b) => b,
-                    Err(e) => { scrub(&w2); fail(g.json, ExitCode::Generic, "encrypt_failed", &e, None); }
-                };
-                scrub(&w2);
-                let applier_sha = sha256_hex(&blob2);
-                if let Err(e) = post_bytes(g, &format!("/api/cluster/provision-bundle/{node}"), &blob2) {
-                    fail(g.json, ExitCode::Generic, "stage_failed", &e, None);
-                }
-                poke_fetch(g, &node);
-                let staged2 = wait_bundle_fetched(g, &node, 600);
-                if !staged2 {
-                    fail_guided(g, ExitCode::Generic, "not_fetched",
-                        &format!("{node}: the applier bundle was staged but never fetched"),
-                        "on the node: `systemctl status noo-fetch.timer` and `journalctl -u noo-fetch -n 20`",
-                        &[("systemctl status noo-fetch.timer", "on the node — is the poll timer running at all"),
-                          ("journalctl -u noo-fetch -n 20", "on the node — TLS and connectivity errors live here"),
-                          (&format!("noo cluster provision {node} --wait"), "re-stage once the poll reaches the controller")]);
-                }
-                // The new applier reports its own apply (that is the point of
-                // the handshake), so wait for THAT report instead of a fixed
-                // 30 s guess. A node whose report never arrives (a fetcher
-                // that cannot report, a gateway that lost the POST) is not
-                // stuck: after the cap we proceed exactly as the old fixed
-                // sleep did, and say so.
-                nstep(&format!("{node} fetched the applier — waiting for it to report the install before the full bundle"));
-                match wait_applier_reported(g, &node, &applier_sha, APPLIER_REPORT_CAP_SECS, APPLIER_REPORT_POLL_SECS) {
-                    Some(0) => nstep(&format!("{node} installed the applier (reported exit 0)")),
-                    Some(rc) => warn_line(&format!(
-                        "{node}: the applier-only bundle reported exit {rc} — staging the full bundle anyway; it will likely be refused the same way")),
-                    None => warn_line(&format!(
-                        "{node}: no apply report for the applier within {APPLIER_REPORT_CAP_SECS}s — proceeding with the full bundle without confirmation")),
-                }
+/// A node that has never reported an apply runs the legacy fetcher/applier pair: stage an applier-only bundle first, the one kind every applier accepts. Returns whether the node is legacy.
+/// A node that has never reported an apply outcome runs the legacy
+/// fetcher/applier pair (pre-2026-09-03): its applier refuses every
+/// kind it does not know, and its fetcher cannot report. Stage an
+/// applier-only bundle first — the one kind every applier accepts —
+/// so the full bundle below is applied by the new applier.
+fn stage_applier_first(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, ca: &crate::pki::ClusterCa) -> bool {
+    let node = a.node.clone();
+    let darwin = m.darwin;
+    let birth_cert = m.birth_cert.clone();
+    let cert = birth_cert.as_deref().expect("pull lane requires a birth cert");
+    let legacy = node_never_reported_apply(g, &node);
+    if legacy && !darwin {
+        let apply = super::enroll::asset_apply();
+        if !apply.is_empty() {
+            nstep(&format!("{node} has never reported an apply — staging the applier alone first"));
+            let w2 = std::env::temp_dir().join(format!("noo-provision-applier-{node}-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&w2);
+            let pre: Vec<(&str, Vec<u8>)> = vec![("applier", apply.as_bytes().to_vec())];
+            let b2 = match super::security_local::build_signed_bundle(ca, &node, &pre, &w2) {
+                Ok(b) => b,
+                Err(e) => { scrub(&w2); fail(g.json, ExitCode::Generic, "bundle_failed", &e, None); }
+            };
+            let blob2 = match encrypt_bundle_cms(&b2, cert, &w2) {
+                Ok(b) => b,
+                Err(e) => { scrub(&w2); fail(g.json, ExitCode::Generic, "encrypt_failed", &e, None); }
+            };
+            scrub(&w2);
+            let applier_sha = sha256_hex(&blob2);
+            if let Err(e) = post_bytes(g, &format!("/api/cluster/provision-bundle/{node}"), &blob2) {
+                fail(g.json, ExitCode::Generic, "stage_failed", &e, None);
             }
-        }
-        // Compress BEFORE encrypting (AES output does not compress) — but only
-        // for a node whose fetcher reads gzip (bundle_gzip_gate).
-        let (to_encrypt, gzip_note) = match bundle_gzip_gate(&node_app_version) {
-            Err(why) => {
-                nstep(&format!("bundle not compressed: {why}"));
-                (bundle.clone(), None)
+            poke_fetch(g, &node);
+            let staged2 = wait_bundle_fetched(g, &node, 600);
+            if !staged2 {
+                fail_guided(g, ExitCode::Generic, "not_fetched",
+                    &format!("{node}: the applier bundle was staged but never fetched"),
+                    "on the node: `systemctl status noo-fetch.timer` and `journalctl -u noo-fetch -n 20`",
+                    &[("systemctl status noo-fetch.timer", "on the node — is the poll timer running at all"),
+                      ("journalctl -u noo-fetch -n 20", "on the node — TLS and connectivity errors live here"),
+                      (&format!("noo cluster provision {node} --wait"), "re-stage once the poll reaches the controller")]);
             }
-            Ok(()) => match gzip_bundle(&bundle, &work) {
-                Ok(gz) => {
-                    let from = std::fs::metadata(&bundle).map(|m| m.len() as usize).unwrap_or(0);
-                    (gz, Some(format!(", gzip from {}", human_bytes(from))))
-                }
-                Err(e) => {
-                    warn_line(&format!("bundle not compressed: {e} — staging it uncompressed"));
-                    (bundle.clone(), None)
-                }
-            },
-        };
-        nstep(&format!("encrypting the bundle to {node}'s birth cert"));
-        let blob = match encrypt_bundle_cms(&to_encrypt, cert, &work) {
-            Ok(b) => b,
-            Err(e) => { scrub(&work);
-                fail(g.json, ExitCode::Generic, "encrypt_failed", &e,
-                    Some("is openssl installed on the controller?")); }
-        };
-        scrub(&work);
-        nstep(&format!("staging the encrypted bundle at the gateway ({}{})", human_bytes(blob.len()), gzip_note.as_deref().unwrap_or("")));
-        if let Err(e) = post_bytes(g, &format!("/api/cluster/provision-bundle/{node}"), &blob) {
-            fail(g.json, ExitCode::Generic, "stage_failed", &e, None);
-        }
-        let poked = poke_fetch(g, &node);
-        let staged_sha = sha256_hex(&blob);
-        if stage_only {
-            // Everything up to and including the poke is done; the caller
-            // (`noo upgrade --nodes`) waits for the apply, for every node at
-            // once. Nothing here has judged the node: "staged" is printed
-            // as exactly that, and the verdict is the caller's, from the
-            // node's own report.
-            nstep(&format!("{node} staged (sha {}) — not waiting for the apply (--stage-only)", &staged_sha[..12]));
-            if g.json {
-                println!("{}", serde_json::json!({
-                    "status": "staged", "node": node, "staged_sha": staged_sha, "poked": poked,
-                }));
-            }
-            return Ok(0);
-        }
-
-        // Verification (2026-09-03): the node's fetcher REPORTS the applier's
-        // exit code (POST /bootstrap/bundle/{node}/applied) and the status
-        // route surfaces it. "Agent registered" is no longer success — it
-        // was true while HOST3's applier refused the bundle with 76. A
-        // legacy node (old fetcher, cannot report) is judged the old way
-        // and said so.
-        let mut poll = ui::Poll::start_under(&if poked {
-            format!("staged — waiting for {node} to pull, apply and report (poked over the bus; its 5-min timer is the fallback)")
-        } else {
-            format!("staged — waiting for {node} to pull, apply and report (up to 10 min; an idle node polls about every 5)")
-        });
-        let started = std::time::Instant::now();
-        let deadline = started + std::time::Duration::from_secs(600);
-        let mut seen_fetch = false;
-        let mut outcome: Option<(i64, String)> = None;
-        while std::time::Instant::now() < deadline {
-            poll.tick(started.elapsed().as_secs());
-            if let Some(st) = crate::http::get_json_opt(
-                g, &format!("/api/cluster/provision-bundle/{node}/status"), true, 10)
-            {
-                match judge_bundle_status(&st, &staged_sha) {
-                    BundleVerdict::Applied { rc, msg } => {
-                        outcome = Some((rc, msg));
-                        break;
-                    }
-                    BundleVerdict::Fetched if !seen_fetch => {
-                        seen_fetch = true;
-                        poll = ui::Poll::start_under(&format!("{node} fetched the bundle — waiting for decrypt + apply"));
-                    }
-                    BundleVerdict::Fetched | BundleVerdict::Nothing => {}
-                }
-            }
-            if legacy_fallback_due(legacy, seen_fetch, started.elapsed().as_secs()) && node_is_online(g, &node) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_secs(10));
-        }
-        drop(poll);
-        let reprovision = format!("noo cluster provision {node}");
-        match outcome {
-            Some((0, ref msg)) => {
-                nstep(&format!("{node} reported: applied (exit 0)"));
-                // One function for every caller (this verb and the combined
-                // wait of `noo upgrade --nodes`), so the post-apply steps
-                // cannot drift between them. The controller's own node has
-                // extra steps; every other node gets the common ones.
-                if self_node {
-                    after_self_applied(g, &node, msg);
-                } else {
-                    after_remote_applied(g, &node, msg);
-                }
-            }
-            Some((rc, msg)) => {
-                let tail: String = msg.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
-                ui::capture("applier output", tail.trim());
-                fail_guided(g, ExitCode::Generic, "apply_failed",
-                    &format!("{node}: the applier refused the bundle (exit {rc})"),
-                    "the node kept its previous state; fix the cause and re-run `noo cluster provision <node>`",
-                    &[(&reprovision, "the node kept its previous state — fix the cause above, then re-stage"),
-                      (if darwin { "sudo /usr/local/bin/noo node fetch --user $(id -un)" } else { "journalctl -u noo-fetch -n 20" },
-                       "on the node — the applier's own log, if the tail above is not enough")]);
-            }
-            None if legacy && seen_fetch => {
-                println!("{}", ui::sub(&ui::status_line(Glyph::Warn,
-                    &format!("{node}: applied without confirmation — this node's fetcher predates apply reports; the next restage confirms"))));
-            }
-            None => {
-                let (code, msg, hint, guide): (&str, String, &str, Vec<(&str, &str)>) = if seen_fetch {
-                    ("not_reported_after_fetch",
-                     format!("{node}: fetched the bundle but reported no apply outcome"),
-                     if darwin {
-                         "on the Mac: `sudo launchctl print system/net.noomesh.fetch | grep -E 'state|last exit'` \
-                          and `sudo /usr/local/bin/noo node fetch --user $(id -un)` for the apply error"
-                     } else {
-                         "on the node: `journalctl -u noo-fetch -n 20` (apply result) then \
-                          `journalctl -u noo-node-agent -n 30`"
-                     },
-                     if darwin {
-                         vec![("sudo launchctl print system/net.noomesh.fetch | grep -E 'state|last exit'", "on the Mac — the poller's state and last exit code"),
-                              ("sudo /usr/local/bin/noo node fetch --user $(id -un)", "on the Mac — runs one poll by hand and shows the apply error"),
-                              (reprovision.as_str(), "re-stage once the apply error is fixed")]
-                     } else {
-                         vec![("journalctl -u noo-fetch -n 20", "on the node — the apply result"),
-                              ("journalctl -u noo-node-agent -n 30", "on the node — the agent's view after the apply"),
-                              (reprovision.as_str(), "re-stage once the apply error is fixed")]
-                     })
-                } else {
-                    ("not_fetched",
-                     format!("{node}: bundle staged but the node never fetched it"),
-                     if darwin {
-                         "the Mac's poller is not reaching the controller — on the Mac: \
-                          `sudo launchctl print system/net.noomesh.fetch | grep -E 'state|last exit'`, \
-                          then run one poll by hand to see the error: \
-                          `sudo /usr/local/bin/noo node fetch --user $(id -un)` \
-                          (needs ~/noomesh/pki/ca.crt — an older enroll never wrote it: re-run `noo enroll`)"
-                     } else {
-                         "the node's poll is not reaching the controller — on the node: \
-                          `systemctl status noo-fetch.timer` and `journalctl -u noo-fetch -n 20` \
-                          (TLS/connectivity errors live there)"
-                     },
-                     if darwin {
-                         vec![("sudo launchctl print system/net.noomesh.fetch | grep -E 'state|last exit'", "on the Mac — is the poller loaded, and what did it last exit with"),
-                              ("sudo /usr/local/bin/noo node fetch --user $(id -un)", "on the Mac — one poll by hand shows the connectivity or TLS error (needs ~/noomesh/pki/ca.crt; an older enroll never wrote it — re-run noo enroll)"),
-                              (reprovision.as_str(), "re-stage once the poll reaches the controller")]
-                     } else {
-                         vec![("systemctl status noo-fetch.timer", "on the node — the poll is not reaching the controller; is the timer active"),
-                              ("journalctl -u noo-fetch -n 20", "on the node — TLS and connectivity errors live here"),
-                              (reprovision.as_str(), "re-stage once the poll reaches the controller")]
-                     })
-                };
-                fail_guided(g, ExitCode::Generic, code, &msg, hint, &guide);
+            // The new applier reports its own apply (that is the point of
+            // the handshake), so wait for THAT report instead of a fixed
+            // 30 s guess. A node whose report never arrives (a fetcher
+            // that cannot report, a gateway that lost the POST) is not
+            // stuck: after the cap we proceed exactly as the old fixed
+            // sleep did, and say so.
+            nstep(&format!("{node} fetched the applier — waiting for it to report the install before the full bundle"));
+            match wait_applier_reported(g, &node, &applier_sha, APPLIER_REPORT_CAP_SECS, APPLIER_REPORT_POLL_SECS) {
+                Some(0) => nstep(&format!("{node} installed the applier (reported exit 0)")),
+                Some(rc) => warn_line(&format!(
+                    "{node}: the applier-only bundle reported exit {rc} — staging the full bundle anyway; it will likely be refused the same way")),
+                None => warn_line(&format!(
+                    "{node}: no apply report for the applier within {APPLIER_REPORT_CAP_SECS}s — proceeding with the full bundle without confirmation")),
             }
         }
     }
+    legacy
+}
 
+/// Compress (when the node reads gzip), encrypt to the birth cert, stage at the gateway and poke the node.
+fn stage_bundle(g: &Globals, a: &ProvisionArgs, enr: &ProvEnrollment, m: &ProvMachine, bundle: &Path, work: &Path, legacy: bool) -> ProvStaged {
+    let node = a.node.clone();
+    let node_app_version = enr.node_app_version.clone();
+    let birth_cert = m.birth_cert.clone();
+    let work = work.to_path_buf();
+    let bundle = bundle.to_path_buf();
+    let cert = birth_cert.as_deref().expect("pull lane requires a birth cert");
+    // Compress BEFORE encrypting (AES output does not compress) — but only
+    // for a node whose fetcher reads gzip (bundle_gzip_gate).
+    let (to_encrypt, gzip_note) = match bundle_gzip_gate(&node_app_version) {
+        Err(why) => {
+            nstep(&format!("bundle not compressed: {why}"));
+            (bundle.clone(), None)
+        }
+        Ok(()) => match gzip_bundle(&bundle, &work) {
+            Ok(gz) => {
+                let from = std::fs::metadata(&bundle).map(|m| m.len() as usize).unwrap_or(0);
+                (gz, Some(format!(", gzip from {}", human_bytes(from))))
+            }
+            Err(e) => {
+                warn_line(&format!("bundle not compressed: {e} — staging it uncompressed"));
+                (bundle.clone(), None)
+            }
+        },
+    };
+    nstep(&format!("encrypting the bundle to {node}'s birth cert"));
+    let blob = match encrypt_bundle_cms(&to_encrypt, cert, &work) {
+        Ok(b) => b,
+        Err(e) => { scrub(&work);
+            fail(g.json, ExitCode::Generic, "encrypt_failed", &e,
+                Some("is openssl installed on the controller?")); }
+    };
+    scrub(&work);
+    nstep(&format!("staging the encrypted bundle at the gateway ({}{})", human_bytes(blob.len()), gzip_note.as_deref().unwrap_or("")));
+    if let Err(e) = post_bytes(g, &format!("/api/cluster/provision-bundle/{node}"), &blob) {
+        fail(g.json, ExitCode::Generic, "stage_failed", &e, None);
+    }
+    let poked = poke_fetch(g, &node);
+    let staged_sha = sha256_hex(&blob);
+    ProvStaged { sha: staged_sha, poked, legacy }
+}
+
+/// --stage-only: report the staged bundle and stop. Nothing here has judged the node.
+/// Everything up to and including the poke is done; the caller
+/// (`noo upgrade --nodes`) waits for the apply, for every node at
+/// once. Nothing here has judged the node: "staged" is printed
+/// as exactly that, and the verdict is the caller's, from the
+/// node's own report.
+fn report_staged_only(g: &Globals, a: &ProvisionArgs, staged: &ProvStaged) {
+    let node = a.node.clone();
+    let staged_sha = staged.sha.clone();
+    let poked = staged.poked;
+        nstep(&format!("{node} staged (sha {}) — not waiting for the apply (--stage-only)", &staged_sha[..12]));
+        if g.json {
+            println!("{}", serde_json::json!({
+                "status": "staged", "node": node, "staged_sha": staged_sha, "poked": poked,
+            }));
+        }
+}
+
+/// Wait for the node to pull, apply and REPORT, and judge the report ("Agent registered" is not success).
+/// Verification (2026-09-03): the node's fetcher REPORTS the applier's
+/// exit code (POST /bootstrap/bundle/{node}/applied) and the status
+/// route surfaces it. "Agent registered" is no longer success — it
+/// was true while HOST3's applier refused the bundle with 76. A
+/// legacy node (old fetcher, cannot report) is judged the old way
+/// and said so.
+fn await_apply(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, staged: &ProvStaged) {
+    let node = a.node.clone();
+    let darwin = m.darwin;
+    let self_node = crate::role::is_self_node(&node);
+    let staged_sha = staged.sha.clone();
+    let poked = staged.poked;
+    let legacy = staged.legacy;
+    let mut poll = ui::Poll::start_under(&if poked {
+        format!("staged — waiting for {node} to pull, apply and report (poked over the bus; its 5-min timer is the fallback)")
+    } else {
+        format!("staged — waiting for {node} to pull, apply and report (up to 10 min; an idle node polls about every 5)")
+    });
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(600);
+    let mut seen_fetch = false;
+    let mut outcome: Option<(i64, String)> = None;
+    while std::time::Instant::now() < deadline {
+        poll.tick(started.elapsed().as_secs());
+        if let Some(st) = crate::http::get_json_opt(
+            g, &format!("/api/cluster/provision-bundle/{node}/status"), true, 10)
+        {
+            match judge_bundle_status(&st, &staged_sha) {
+                BundleVerdict::Applied { rc, msg } => {
+                    outcome = Some((rc, msg));
+                    break;
+                }
+                BundleVerdict::Fetched if !seen_fetch => {
+                    seen_fetch = true;
+                    poll = ui::Poll::start_under(&format!("{node} fetched the bundle — waiting for decrypt + apply"));
+                }
+                BundleVerdict::Fetched | BundleVerdict::Nothing => {}
+            }
+        }
+        if legacy_fallback_due(legacy, seen_fetch, started.elapsed().as_secs()) && node_is_online(g, &node) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(10));
+    }
+    drop(poll);
+    let reprovision = format!("noo cluster provision {node}");
+    match outcome {
+        Some((0, ref msg)) => {
+            nstep(&format!("{node} reported: applied (exit 0)"));
+            // One function for every caller (this verb and the combined
+            // wait of `noo upgrade --nodes`), so the post-apply steps
+            // cannot drift between them. The controller's own node has
+            // extra steps; every other node gets the common ones.
+            if self_node {
+                after_self_applied(g, &node, msg);
+            } else {
+                after_remote_applied(g, &node, msg);
+            }
+        }
+        Some((rc, msg)) => {
+            let tail: String = msg.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
+            ui::capture("applier output", tail.trim());
+            fail_guided(g, ExitCode::Generic, "apply_failed",
+                &format!("{node}: the applier refused the bundle (exit {rc})"),
+                "the node kept its previous state; fix the cause and re-run `noo cluster provision <node>`",
+                &[(&reprovision, "the node kept its previous state — fix the cause above, then re-stage"),
+                  (if darwin { "sudo /usr/local/bin/noo node fetch --user $(id -un)" } else { "journalctl -u noo-fetch -n 20" },
+                   "on the node — the applier's own log, if the tail above is not enough")]);
+        }
+        None if legacy && seen_fetch => {
+            println!("{}", ui::sub(&ui::status_line(Glyph::Warn,
+                &format!("{node}: applied without confirmation — this node's fetcher predates apply reports; the next restage confirms"))));
+        }
+        None => {
+            let (code, msg, hint, guide): (&str, String, &str, Vec<(&str, &str)>) = if seen_fetch {
+                ("not_reported_after_fetch",
+                 format!("{node}: fetched the bundle but reported no apply outcome"),
+                 if darwin {
+                     "on the Mac: `sudo launchctl print system/net.noomesh.fetch | grep -E 'state|last exit'` \
+                      and `sudo /usr/local/bin/noo node fetch --user $(id -un)` for the apply error"
+                 } else {
+                     "on the node: `journalctl -u noo-fetch -n 20` (apply result) then \
+                      `journalctl -u noo-node-agent -n 30`"
+                 },
+                 if darwin {
+                     vec![("sudo launchctl print system/net.noomesh.fetch | grep -E 'state|last exit'", "on the Mac — the poller's state and last exit code"),
+                          ("sudo /usr/local/bin/noo node fetch --user $(id -un)", "on the Mac — runs one poll by hand and shows the apply error"),
+                          (reprovision.as_str(), "re-stage once the apply error is fixed")]
+                 } else {
+                     vec![("journalctl -u noo-fetch -n 20", "on the node — the apply result"),
+                          ("journalctl -u noo-node-agent -n 30", "on the node — the agent's view after the apply"),
+                          (reprovision.as_str(), "re-stage once the apply error is fixed")]
+                 })
+            } else {
+                ("not_fetched",
+                 format!("{node}: bundle staged but the node never fetched it"),
+                 if darwin {
+                     "the Mac's poller is not reaching the controller — on the Mac: \
+                      `sudo launchctl print system/net.noomesh.fetch | grep -E 'state|last exit'`, \
+                      then run one poll by hand to see the error: \
+                      `sudo /usr/local/bin/noo node fetch --user $(id -un)` \
+                      (needs ~/noomesh/pki/ca.crt — an older enroll never wrote it: re-run `noo enroll`)"
+                 } else {
+                     "the node's poll is not reaching the controller — on the node: \
+                      `systemctl status noo-fetch.timer` and `journalctl -u noo-fetch -n 20` \
+                      (TLS/connectivity errors live there)"
+                 },
+                 if darwin {
+                     vec![("sudo launchctl print system/net.noomesh.fetch | grep -E 'state|last exit'", "on the Mac — is the poller loaded, and what did it last exit with"),
+                          ("sudo /usr/local/bin/noo node fetch --user $(id -un)", "on the Mac — one poll by hand shows the connectivity or TLS error (needs ~/noomesh/pki/ca.crt; an older enroll never wrote it — re-run noo enroll)"),
+                          (reprovision.as_str(), "re-stage once the poll reaches the controller")]
+                 } else {
+                     vec![("systemctl status noo-fetch.timer", "on the node — the poll is not reaching the controller; is the timer active"),
+                          ("journalctl -u noo-fetch -n 20", "on the node — TLS and connectivity errors live here"),
+                          (reprovision.as_str(), "re-stage once the poll reaches the controller")]
+                 })
+            };
+            fail_guided(g, ExitCode::Generic, code, &msg, hint, &guide);
+        }
+    }
+}
+
+/// The closing line (and the JSON record) of a provisioned node.
+fn report_provisioned(g: &Globals, a: &ProvisionArgs, id: &ProvIdentity, m: &ProvMachine) {
+    let node = a.node.clone();
+    let tier = id.tier.clone();
+    let ip = id.ip.as_str();
+    let user = id.user.as_str();
+    let goarch = m.goarch.as_str();
     if g.json {
         println!("{}", serde_json::json!({
             "status":"provisioned","node":node,"ip":ip,"user":user,
@@ -1415,8 +1730,8 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             (&format!("noo cluster logs {node}"), "if it does not register, the agent log names the cause"),
         ]);
     }
-    Ok(0)
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2570,12 +2885,8 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
     vars.insert("noo_ollama_gpu_count", String::new());
     vars.insert("node_agent_port", String::from("8081"));
     vars.insert("log_level", String::from("info"));
-    let (agent_bind, v1_gate, trust_notes) = cluster_trust_vars(g)?;
-    for n in &trust_notes {
-        if !g.json && !ui::quiet() { println!("{}", ui::note(n)); }
-    }
+    let agent_bind = cluster_trust_bind()?;
     vars.insert("node_agent_bind", agent_bind);
-    vars.insert("noo_cluster_token_v1", v1_gate);
     let env_body = render_env_template(&tmpl, &vars)?;
 
     // ── the controller's own NATS credential ──────────────
@@ -3443,6 +3754,7 @@ const DARWIN_HARNESS_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
   </array>
   <key>RunAtLoad</key><false/>
   <key>KeepAlive</key><true/>
+  <key>ExitTimeOut</key><integer>150</integer>
   <key>StandardOutPath</key><string>/tmp/noomesh-harness.log</string>
   <key>StandardErrorPath</key><string>/tmp/noomesh-harness.log</string>
 </dict></plist>
@@ -3855,9 +4167,11 @@ fn image_tag() -> String {
     release_var("NOO_IMAGE_TAG")
 }
 
-/// The two agent-env keys the controller owns for cluster trust: the bind
-/// override and the v1 cluster-token gate.
-pub(crate) const CLUSTER_TRUST_ENV_KEYS: &[&str] = &["NODE_AGENT_BIND", "NOO_CLUSTER_TOKEN_V1"];
+/// The agent-env key the controller owns for cluster trust: the bind
+/// override. (`NOO_CLUSTER_TOKEN_V1`, the v1 cluster-token gate, was the
+/// second; it is deleted and never rendered — a pre-0.6.10 Mac applier would
+/// refuse the line anyway.)
+pub(crate) const CLUSTER_TRUST_ENV_KEYS: &[&str] = &["NODE_AGENT_BIND"];
 
 /// The first CLI whose Mac applier accepts [`CLUSTER_TRUST_ENV_KEYS`] in an
 /// `agent-env` payload (node_fetch.rs `AGENT_ENV_KEYS`). A Linux node is
@@ -3924,50 +4238,11 @@ pub(crate) fn agent_bind_value(raw: &str) -> Result<String, String> {
     Ok(parts.join(","))
 }
 
-/// The v1 cluster-token gate to render, from the gateway's `posture list`
-/// body. `Some("0")` when the operator closed it (the desired DB row first,
-/// then the running value), `Some("1")` when a row says anything else, and
-/// `None` when the gateway lists no such gate (an older gateway): the agent's
-/// own default (accept, count) then stands. Pure, so the rule is testable.
-pub(crate) fn v1_gate_from_posture(body: &serde_json::Value) -> Option<&'static str> {
-    let row = body["posture"].as_array()?.iter().find(|r| r["key"] == "NOO_CLUSTER_TOKEN_V1")?;
-    let v = row["db_value"].as_str().or_else(|| row["running"].as_str())?;
-    Some(if matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off" | "closed") {
-        "0"
-    } else {
-        "1"
-    })
-}
-
-/// `(node_agent_bind, noo_cluster_token_v1, notes)` for the agent env.
-///
-/// `NODE_AGENT_BIND` is the controller's `.env` / environment value (a fleet
-/// setting, like NOO_IMAGE_TAG); an invalid one is an Err naming the fix.
-/// `NOO_CLUSTER_TOKEN_V1` is the controller's own posture, so `posture set
-/// NOO_CLUSTER_TOKEN_V1 0` reaches nodes with the next bundle. When the
-/// posture cannot be read the gate renders EMPTY (the node keeps its default:
-/// accepts and counts v1 — what every node did before this key was carried)
-/// and the notes say NOT CHECKED, never that it was open.
-pub(crate) fn cluster_trust_vars(g: &Globals) -> Result<(String, String, Vec<String>), String> {
-    let bind = agent_bind_value(&release_var("NODE_AGENT_BIND"))?;
-    let mut notes = Vec::new();
-    let gate = match crate::http::get_json_opt(g, "/api/security/posture", true, 5) {
-        Some(body) => match v1_gate_from_posture(&body) {
-            Some("0") => {
-                notes.push("NOO_CLUSTER_TOKEN_V1=0 (from the controller's posture): this node will refuse v1 cluster tokens".to_string());
-                "0".to_string()
-            }
-            Some(v) => v.to_string(),
-            None => String::new(),
-        },
-        None => {
-            notes.push("NOT CHECKED: the controller's NOO_CLUSTER_TOKEN_V1 posture could not be read, so this node's env \
-                leaves the gate unset (v1 accepted and counted). If you closed it, re-run once the gateway answers \
-                (`noo security posture list`).".to_string());
-            String::new()
-        }
-    };
-    Ok((bind, gate, notes))
+/// The `NODE_AGENT_BIND` to render for the agent env: the controller's `.env`
+/// / environment value (a fleet setting, like NOO_IMAGE_TAG); an invalid one
+/// is an Err naming the fix.
+pub(crate) fn cluster_trust_bind() -> Result<String, String> {
+    agent_bind_value(&release_var("NODE_AGENT_BIND"))
 }
 
 pub(crate) fn release_var(key: &str) -> String {
@@ -3990,29 +4265,21 @@ pub(crate) fn release_var(key: &str) -> String {
 #[cfg(test)]
 mod cluster_trust_tests {
     use super::*;
-    use serde_json::json;
 
+    /// The v1 gate is deleted: the real template must not carry the line,
+    /// and a bundle must not render it for any node.
     #[test]
-    fn the_v1_gate_follows_the_controllers_posture() {
-        let closed = json!({"posture": [{"key": "NOO_CLUSTER_TOKEN_V1", "db_value": "0", "running": null}]});
-        assert_eq!(v1_gate_from_posture(&closed), Some("0"));
-        // Desired beats running: `posture set ... 0` reaches nodes before the
-        // gateway restarts.
-        let pending = json!({"posture": [{"key": "NOO_CLUSTER_TOKEN_V1", "db_value": "off", "running": "1"}]});
-        assert_eq!(v1_gate_from_posture(&pending), Some("0"));
-        let open = json!({"posture": [{"key": "NOO_CLUSTER_TOKEN_V1", "db_value": "1", "running": null}]});
-        assert_eq!(v1_gate_from_posture(&open), Some("1"));
-        let running_only = json!({"posture": [{"key": "NOO_CLUSTER_TOKEN_V1", "db_value": null, "running": "false"}]});
-        assert_eq!(v1_gate_from_posture(&running_only), Some("0"));
-    }
-
-    #[test]
-    fn an_unset_gate_or_an_older_gateway_renders_nothing() {
-        let unset = json!({"posture": [{"key": "NOO_CLUSTER_TOKEN_V1", "db_value": null, "running": null}]});
-        assert_eq!(v1_gate_from_posture(&unset), None);
-        let old = json!({"posture": [{"key": "NOO_EXEC_APPROVAL_MODE", "db_value": "approval"}]});
-        assert_eq!(v1_gate_from_posture(&old), None);
-        assert_eq!(v1_gate_from_posture(&json!({})), None);
+    fn the_agent_env_no_longer_carries_the_v1_gate() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let path = root.join("node-agent-go/deploy/noo-node-agent.env.tmpl");
+        if !path.exists() {
+            eprintln!("crate-only build (no repo tree) -- template check skipped");
+            return;
+        }
+        let tmpl = std::fs::read_to_string(&path).unwrap();
+        assert!(tmpl.contains("NODE_AGENT_BIND="), "the guard must be scanning the real template");
+        let body = render_env_template(&tmpl, &super::tests::full_vars()).unwrap();
+        assert!(!body.contains("NOO_CLUSTER_TOKEN_V1="), "the retired v1 gate is still rendered:\n{body}");
     }
 
     #[test]
@@ -4105,7 +4372,7 @@ mod cluster_trust_tests {
 
     #[test]
     fn dropping_the_keys_leaves_the_rest_of_the_env_alone() {
-        let body = "NODE_ID=h\nNODE_AGENT_BIND=all\n# NODE_AGENT_BIND is a comment\nNOO_CLUSTER_TOKEN_V1=0\nLOG_LEVEL=info\n";
+        let body = "NODE_ID=h\nNODE_AGENT_BIND=all\n# NODE_AGENT_BIND is a comment\nLOG_LEVEL=info\n";
         assert_eq!(drop_env_keys(body, CLUSTER_TRUST_ENV_KEYS),
             "NODE_ID=h\n# NODE_AGENT_BIND is a comment\nLOG_LEVEL=info\n");
     }
@@ -4634,7 +4901,7 @@ mod tests {
                   // Fixed in passing rather than left to redden the next
                   // branch that touches this crate.
                   "noo_self_node","ollama_url",
-                  "node_agent_bind","noo_cluster_token_v1"] {
+                  "node_agent_bind"] {
             v.insert(k, format!("V_{k}"));
         }
         v
@@ -4711,7 +4978,7 @@ mod tests {
     }
 
     /// The full pull-lane crypto path: a birth keypair exactly as
-    /// bootstrap-enroll.sh generates it, encrypt exactly as provision does,
+    /// `noo enroll` generates it, encrypt exactly as provision does,
     /// decrypt exactly as noo-fetch does. Skips when openssl is absent.
     #[test]
     fn cms_round_trips_the_bundle() {
@@ -4722,7 +4989,7 @@ mod tests {
         let work = std::env::temp_dir().join(format!("noo-cms-rt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(&work).unwrap();
-        // Birth keypair, same invocation as bootstrap-enroll.sh.
+        // Birth keypair, same invocation as `noo enroll`.
         assert!(Command::new("openssl")
             .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-sha256", "-days", "1",
                    "-keyout"]).arg(work.join("birth.key"))
@@ -4941,11 +5208,14 @@ mod controller_hostd_tests {
     /// upgrade path until someone noticed host8 two releases behind.
     #[test]
     fn hostd_is_staged_for_every_node_including_the_controllers_own() {
-        let src = include_str!("provision.rs");
-        let code = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
-        let hostd = code.find(r#"files.push(("hostd-binary""#).expect("hostd is staged");
-        let self_branch = code.find("the bundle carries no CLI").expect("the self-node CLI branch");
-        assert!(hostd < self_branch, "hostd staging must precede, not sit inside, the self-node CLI branch");
+        // ORDER: the phase list. CONTENT: the phase that owns hostd.
+        let list = super::phase_src::list();
+        assert!(list.find("attach_hostd(").expect("hostd is a phase") < list.find("attach_cli(").expect("the CLI is a phase"),
+            "hostd staging must precede, not sit inside, the self-node CLI branch");
+        let hostd = super::phase_src::body("attach_hostd");
+        assert!(hostd.contains(r#"files.push(("hostd-binary""#), "the hostd phase stages hostd");
+        assert!(!hostd.contains("self_node"), "hostd is staged for every node, so its phase has no self-node branch");
+        assert!(super::phase_src::body("attach_cli").contains("the bundle carries no CLI"), "the self-node CLI branch");
     }
 }
 
@@ -5165,20 +5435,27 @@ mod self_node_rail_tests {
     fn the_rail_verb_has_no_sudo_lane_and_builds_the_self_node_locally() {
         let whole = include_str!("provision.rs");
         let src = whole.split("#[cfg(test)]").next().unwrap();
-        let start = src.find("pub fn cluster_provision(").unwrap();
-        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        // The rail verb is the phase list plus every phase it runs.
+        let body = phase_src::verb();
         assert!(!body.contains("provision_local("), "the rail verb must not call the first-install lane");
         assert!(!body.contains(r#"Command::new("sudo")"#), "the rail verb runs no sudo itself");
-        assert!(body.contains("SelfLane::CreateIdentity => {") && body.contains("ensure_self_identity(&node)"));
-        let local = body.find("self_node_redemption(&node)").expect("self node built locally");
-        let view = body.find("judge_gateway_self_view(").expect("the gateway's view checked");
-        let stage = body.find("/api/cluster/provision-bundle/{node}\"), &blob)").expect("the stage");
-        assert!(local < view && view < stage, "local facts, then the gateway's view, then the stage");
+        assert!(phase_src::body("begin_provision").contains("SelfLane::CreateIdentity => {")
+            && phase_src::body("begin_provision").contains("ensure_self_identity(&node)"));
+        // Local facts, then the gateway's view (one phase), then the stage (a later phase).
+        let enrol = phase_src::body("load_enrollment");
+        let local = enrol.find("self_node_redemption(&node)").expect("self node built locally");
+        let view = enrol.find("judge_gateway_self_view(").expect("the gateway's view checked");
+        assert!(local < view, "local facts, then the gateway's view");
+        let list = phase_src::list();
+        assert!(list.find("load_enrollment(").expect("the enrollment phase") < list.find("stage_bundle(").expect("the stage phase"),
+            "the gateway's view of the self node is checked before anything is staged");
+        assert!(phase_src::body("stage_bundle").contains("/api/cluster/provision-bundle/{node}\"), &blob)"), "the stage");
         // The lane record lives in `after_applied`, reached from the applied
         // arm only through `after_self_applied`.
         assert!(!body.contains("write_self_lane("), "the lane is recorded by after_self_applied, not inline");
-        let applied = body.find("reported: applied (exit 0)").expect("the applied arm");
-        let call = body.find("after_self_applied(g, &node, msg)").expect("the self node's post-apply steps");
+        let apply = phase_src::body("await_apply");
+        let applied = apply.find("reported: applied (exit 0)").expect("the applied arm");
+        let call = apply.find("after_self_applied(g, &node, msg)").expect("the self node's post-apply steps");
         assert!(applied < call, "the self steps run only after the node reported exit 0");
         let aa = &src[src.find("fn after_applied(").unwrap()..];
         let aa = &aa[..aa.find("\n}\n").unwrap()];
@@ -5205,11 +5482,14 @@ mod self_node_rail_tests {
             let other: Vec<(&str, Vec<u8>)> = vec![("nats-creds", nc("someone-else"))];
             assert!(require_nats_creds(node, &other).is_err(), "{node}");
         }
-        let whole = include_str!("provision.rs");
-        let src = whole.split("#[cfg(test)]").next().unwrap();
-        let body = &src[src.find("pub fn cluster_provision(").unwrap()..];
-        let guard = body.find("require_nats_creds(&node, &files)").expect("the guard");
-        let sign = body.find("build_signed_bundle(&ca, &node, &files, &work)").expect("the signature");
+        // The credential is attached, then the signing phase requires the pair
+        // before it signs.
+        let list = phase_src::list();
+        assert!(list.find("attach_nats_credential(").expect("the credential phase") < list.find("sign_bundle(").expect("the signing phase"),
+            "the credential is attached before the bundle is signed");
+        let body = phase_src::body("sign_bundle");
+        let guard = body.find("require_nats_creds(&node, files)").expect("the guard");
+        let sign = body.find("build_signed_bundle(ca, &node, files, &work)").expect("the signature");
         assert!(guard < sign, "the pair is required before the bundle is signed");
     }
 
@@ -5627,8 +5907,7 @@ mod upgrade_stages_every_node_before_waiting_tests {
         let prov = prov.split("#[cfg(test)]").next().unwrap();
         let up = include_str!("upgrade.rs");
         let up = up.split("#[cfg(test)]").next().unwrap();
-        let verb = &prov[prov.find("pub fn cluster_provision(").unwrap()..];
-        let verb = &verb[..verb.find("\n}\n").unwrap()];
+        let verb = super::phase_src::body("await_apply");
         assert!(verb.contains("after_self_applied(g, &node, msg)"), "the single-node verb");
         let settle = &up[up.find("fn settle_end(").unwrap()..];
         let settle = &settle[..settle.find("\n}\n").unwrap()];
@@ -5715,5 +5994,48 @@ mod mac_runner_env_tests {
             assert!(got.lines().any(|l| l == "NODE_ID=host6"));
         }
         let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+/// Test support: the non-test source of this file, sliced so a test asserts
+/// the ORDER of the phase list (`list`) or the CONTENT of the one phase that
+/// owns a behaviour (`body`), or reads the whole verb (`verb`).
+#[cfg(test)]
+pub(crate) mod phase_src {
+    fn code() -> &'static str {
+        include_str!("provision.rs").split("#[cfg(test)]").next().expect("non-test source")
+    }
+
+    /// `fn <name>(` through the first column-0 closing brace.
+    pub(crate) fn body(name: &str) -> &'static str {
+        let code = code();
+        let start = code.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("fn {name} not found in provision.rs"));
+        let rest = &code[start..];
+        &rest[..rest.find("\n}\n").unwrap_or_else(|| panic!("end of fn {name}"))]
+    }
+
+    /// The ordered phase list of `noo cluster provision`.
+    pub(crate) fn list() -> &'static str {
+        body("cluster_provision")
+    }
+
+    /// The whole rail verb: the phase list through the last phase it runs.
+    pub(crate) fn verb() -> &'static str {
+        let code = code();
+        let start = code.find("pub fn cluster_provision(").expect("cluster_provision");
+        let last = body("report_provisioned");
+        let end = code.find(last).expect("last phase") + last.len();
+        &code[start..end]
+    }
+}
+
+#[cfg(test)]
+mod darwin_harness_plist_tests {
+    /// launchd sends SIGKILL `ExitTimeOut` seconds after SIGTERM (default
+    /// 20): the harness drains for NOO_HARNESS_DRAIN_SECS (120) on a stop, so
+    /// the plist leaves it that plus 30 s, like the unit's TimeoutStopSec.
+    #[test]
+    fn the_harness_plist_leaves_time_to_drain() {
+        assert!(super::DARWIN_HARNESS_PLIST.contains("<key>ExitTimeOut</key><integer>150</integer>"));
     }
 }

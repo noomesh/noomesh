@@ -87,7 +87,7 @@ async fn coordinator_context(
     // (internal hostnames the egress floor otherwise hides). Operators see
     // them; a `User` account (and the user-door `noo_conversation_context`
     // tool that calls this route as one) gets the status without them.
-    let operator = super::operator_read_guard(&requester).is_ok();
+    let operator = crate::authz::operator_or_internal_ok(requester.as_ref().map(|e| &e.0));
     // Attempt backend resolution (non-blocking, reports current state)
     let backend_info = match crate::coordinator::resolve_backend(&state).await {
         Ok(b) => json!({

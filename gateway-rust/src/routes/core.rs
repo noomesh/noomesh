@@ -463,7 +463,7 @@ async fn auth_token(
             // the same wall-clock time as a known one. Without this the
             // endpoint answers "does this account exist?" for free.
             let _ = bcrypt::verify(&creds.password, decoy_hash());
-            audit_auth(&state.db, "auth_failure", &creds.username, "user_not_found", ip.as_deref()).await;
+            audit_auth(&state.db, crate::audit::AuditKind::AuthFailure, &creds.username, "user_not_found", ip.as_deref()).await;
             return (StatusCode::UNAUTHORIZED,
                 Json(json!({
                     "detail": "Incorrect username or password",
@@ -473,7 +473,7 @@ async fn auth_token(
 
     // Check disabled / locked
     if user.disabled {
-        audit_auth(&state.db, "auth_failure", &creds.username, "account_locked", ip.as_deref()).await;
+        audit_auth(&state.db, crate::audit::AuditKind::AuthFailure, &creds.username, "account_locked", ip.as_deref()).await;
         return (StatusCode::UNAUTHORIZED,
             Json(json!({"detail": "Incorrect username or password"}))).into_response();
     }
@@ -488,7 +488,7 @@ async fn auth_token(
             user = %creds.username,
             "bootstrap_admin_login_locked_too_many_failures"
         );
-        audit_auth(&state.db, "auth_failure", &creds.username, "account_locked", ip.as_deref()).await;
+        audit_auth(&state.db, crate::audit::AuditKind::AuthFailure, &creds.username, "account_locked", ip.as_deref()).await;
         return (StatusCode::TOO_MANY_REQUESTS,
             Json(json!({"detail": "Too many login attempts — try again shortly"}))).into_response();
     }
@@ -511,7 +511,7 @@ async fn auth_token(
     };
 
     if !password_ok {
-        audit_auth(&state.db, "auth_failure", &creds.username, "bad_password", ip.as_deref()).await;
+        audit_auth(&state.db, crate::audit::AuditKind::AuthFailure, &creds.username, "bad_password", ip.as_deref()).await;
         // `record_failed_login` is an UPDATE on `noo_users`, so it is a
         // no-op for the env bootstrap admin — that identity had NO failure
         // counting and NO lockout of any kind while no row existed. Count its
@@ -540,7 +540,7 @@ async fn auth_token(
     }
 
     // Success — issue JWT (access) + refresh cookie.
-    audit_auth(&state.db, "auth_success", &creds.username, "ok", ip.as_deref()).await;
+    audit_auth(&state.db, crate::audit::AuditKind::AuthSuccess, &creds.username, "ok", ip.as_deref()).await;
     let _ = record_successful_login(&state.db, &creds.username).await; // logged inside
 
     // Bootstrap self-close: the first successful env-admin login materialises
@@ -651,7 +651,7 @@ async fn host_ticket_login(
     let purpose = match spend_host_ticket(&state.db, ticket, username).await {
         Ok(Some(p)) => p,
         Ok(None) => {
-            audit_auth(&state.db, "auth_failure", username, "host_ticket_refused", ip).await;
+            audit_auth(&state.db, crate::audit::AuditKind::AuthFailure, username, "host_ticket_refused", ip).await;
             return refused();
         }
         Err(e) => {
@@ -672,13 +672,11 @@ async fn host_ticket_login(
         Some(mut u) => {
             // `lookup_user_db` folds a lockout into `disabled`; the ticket
             // honours `disabled` itself and nothing else.
-            let disabled: Option<(bool,)> = sqlx::query_as("SELECT disabled FROM noo_users WHERE username = $1")
-                .bind(username)
-                .fetch_optional(&state.db)
+            let disabled: Option<bool> = crate::repo::users::disabled_flag(&state.db, username)
                 .await
-                .unwrap_or(Some((true,)));
-            if disabled.map(|(d,)| d).unwrap_or(true) {
-                audit_auth(&state.db, "auth_failure", username, "account_disabled", ip).await;
+                .unwrap_or(Some(true));
+            if disabled.unwrap_or(true) {
+                audit_auth(&state.db, crate::audit::AuditKind::AuthFailure, username, "account_disabled", ip).await;
                 return refused();
             }
             u.disabled = false;
@@ -687,14 +685,14 @@ async fn host_ticket_login(
         None => match lookup_user_bootstrap_env(&state.db, username).await {
             Some(u) => (u, true),
             None => {
-                audit_auth(&state.db, "auth_failure", username, "user_not_found", ip).await;
+                audit_auth(&state.db, crate::audit::AuditKind::AuthFailure, username, "user_not_found", ip).await;
                 return refused();
             }
         },
     };
     let outcome = format!("host_ticket:{purpose}");
     tracing::warn!(user = %username, purpose = %purpose, "login with a one-time HOST ticket (minted on the controller)");
-    audit_auth(&state.db, "auth_success", username, &outcome, ip).await;
+    audit_auth(&state.db, crate::audit::AuditKind::AuthSuccess, username, &outcome, ip).await;
     let _ = record_successful_login(&state.db, username).await; // logged inside
     if used_bootstrap {
         seed_bootstrap_admin(&state.db, &user).await;
@@ -1024,7 +1022,7 @@ async fn spent_token(
         "refresh_token_replay_detected_revoking_all_chains"
     );
     let _ = auth_refresh::revoke_all_for_user(db, user_id).await;
-    audit_auth(db, "auth_failure", user_id, "refresh_replay", ip).await;
+    audit_auth(db, crate::audit::AuditKind::AuthFailure, user_id, "refresh_replay", ip).await;
     Rotation::Replay
 }
 
@@ -1046,7 +1044,7 @@ async fn auth_logout_handler(
         let raw = c.value().to_string();
         if let Ok(Some(rec)) = auth_refresh::lookup_token(&state.db, &raw).await {
             let _ = auth_refresh::revoke_token(&state.db, &rec.id).await;
-            audit_auth(&state.db, "auth_logout", &rec.user_id, "ok", None).await;
+            audit_auth(&state.db, crate::audit::AuditKind::AuthLogout, &rec.user_id, "ok", None).await;
             account = Some(rec.user_id);
         }
     }
@@ -1059,7 +1057,7 @@ async fn auth_logout_handler(
                 .and_then(|v| v.strip_prefix("Bearer "))
                 .map(|t| verify_token(t, &secret))
             {
-                audit_auth(&state.db, "auth_logout", crate::auth::account_of(&claims.sub), "ok", None).await;
+                audit_auth(&state.db, crate::audit::AuditKind::AuthLogout, crate::auth::account_of(&claims.sub), "ok", None).await;
                 account = Some(crate::auth::account_of(&claims.sub).to_string());
             }
         }
@@ -1197,23 +1195,7 @@ async fn lookup_user_db(
     db: &sqlx::PgPool,
     username: &str,
 ) -> Result<Option<UserRecord>, sqlx::Error> {
-    let row = sqlx::query_as::<_, (
-        String,                                         // username
-        String,                                         // hashed_password
-        bool,                                           // disabled
-        serde_json::Value,                              // scopes (JSONB)
-        Option<i32>,                                    // failed_login_count
-        Option<chrono::DateTime<chrono::Utc>>,          // locked_until
-        String,                                         // role (migration 050)
-    )>(
-        "SELECT username, hashed_password, disabled, \
-                COALESCE(scopes, '[\"read\"]'::jsonb), \
-                COALESCE(failed_login_count, 0), locked_until, role \
-         FROM noo_users WHERE username = $1"
-    )
-    .bind(username)
-    .fetch_optional(db)
-    .await?;
+    let row = crate::repo::users::login_row(db, username).await?;
 
     let row = match row {
         Some(r) => r,
@@ -1277,13 +1259,7 @@ async fn admin_census(db: &sqlx::PgPool) -> AdminCensus {
     // says one exists. (A drifted row — admin scope, non-admin role — cannot
     // mint admin tokens, but counting it still only keeps the bootstrap door
     // shut, which is the safe direction.)
-    let exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM noo_users \
-         WHERE disabled = false \
-           AND (role = 'admin' OR scopes @> '[\"admin\"]'::jsonb))",
-    )
-    .fetch_one(db)
-    .await;
+    let exists = crate::repo::users::any_enabled_admin(db).await;
 
     match exists {
         Ok(true) => AdminCensus::AtLeastOne,
@@ -1417,20 +1393,7 @@ fn strike_outcome(recorded: &Result<(), sqlx::Error>) -> StrikeOutcome {
 async fn record_failed_login(db: &sqlx::PgPool, username: &str) -> Result<(), sqlx::Error> {
     // The threshold and the window are bound, not interpolated: sqlx 0.9
     // refuses a dynamic SQL string, and a literal with binds is what we want.
-    let r = sqlx::query(
-        "UPDATE noo_users SET failed_login_count = COALESCE(failed_login_count, 0) + 1, \
-         locked_until = CASE \
-           WHEN COALESCE(failed_login_count, 0) + 1 >= $2 THEN NOW() + make_interval(mins => $3) \
-           ELSE locked_until \
-         END \
-         WHERE username = $1",
-    )
-    .bind(username)
-    .bind(LOCKOUT_STRIKES)
-    .bind(LOCKOUT_MINUTES)
-    .execute(db)
-    .await
-    .map(|_| ());
+    let r = crate::repo::users::record_failed_login(db, username, LOCKOUT_STRIKES, LOCKOUT_MINUTES).await;
     if let Err(e) = &r {
         tracing::error!(username = %username, error = %e, "failed-login strike could not be recorded; refusing the attempt");
     }
@@ -1440,38 +1403,23 @@ async fn record_failed_login(db: &sqlx::PgPool, username: &str) -> Result<(), sq
 /// Reset failed login count on successful login. A failure is logged and the
 /// login continues: a stale counter is not a reason to deny a correct password.
 async fn record_successful_login(db: &sqlx::PgPool, username: &str) -> Result<(), sqlx::Error> {
-    let r = sqlx::query(
-        "UPDATE noo_users SET failed_login_count = 0, locked_until = NULL, \
-         last_login_at = NOW() WHERE username = $1"
-    )
-    .bind(username)
-    .execute(db)
-    .await
-    .map(|_| ());
+    let r = crate::repo::users::record_successful_login(db, username).await;
     if let Err(e) = &r {
         tracing::error!(username = %username, error = %e, "successful-login reset could not be recorded; continuing");
     }
     r
 }
 
-/// Severity for an auth audit event. Previously every row was hardcoded
-/// `'info'`, so failed logins / replay attempts were indistinguishable from
-/// success and could not drive threshold alerting.
-fn audit_severity(event_type: &str, outcome: &str) -> &'static str {
-    match (event_type, outcome) {
-        ("auth_failure", "refresh_replay") => "critical",
-        ("auth_failure", _) => "warning",
-        _ => "info",
-    }
-}
-
-/// General best-effort security-audit insert for privileged actions
-/// (config changes, deletions). Never blocks/fails the caller's request.
-/// `details` is serialized to the `details` jsonb column. (H-L1)
-///
-/// The row also records `source_ip` (the request's caller, same trusted-proxy
-/// rule as the login rows) and `conversation_id` (inside an agent turn) when
-/// known and not already in `details` — see `audit_context`.
+/// Deprecated string-typed entry points, kept for ONE release as thin shims
+/// over [`crate::audit`] (the one writer): the strings are mapped onto
+/// [`crate::audit::AuditKind`] (an unknown event type becomes
+/// `AuditKind::Other`, which keeps the raw string, so an add-on or a missed
+/// site still writes its row). A severity string that is not one of
+/// `info|warning|error|critical` falls back to the kind's default.
+/// Nothing in the gateway calls these any more; `#[deprecated]` makes the
+/// compiler say so if one comes back.
+#[deprecated(note = "use crate::audit::record(AuditEvent::new(AuditKind::..))")]
+#[allow(dead_code)]
 pub(crate) async fn audit_event(
     db: &sqlx::PgPool,
     event_type: &str,
@@ -1481,17 +1429,12 @@ pub(crate) async fn audit_event(
     outcome: &str,
     details: serde_json::Value,
 ) {
-    audit_insert(
-        db, event_type, severity, actor, resource, outcome,
-        &crate::audit_context::with_origin(details).to_string(),
-    )
-    .await;
+    crate::audit::record(db, shim_event(event_type, severity, actor, resource, outcome, details)).await;
 }
 
-/// [`audit_event`] for a read that must NOT happen unaudited (the admin
-/// walks view): the same signed row through the same writer, but it says
-/// whether the row landed, and the caller refuses to serve when it did not.
-/// Everything else stays best-effort through [`audit_event`].
+/// Deprecated shim for [`crate::audit::record_required`]; see [`audit_event`].
+#[deprecated(note = "use crate::audit::record_required(AuditEvent::new(AuditKind::..))")]
+#[allow(dead_code)]
 pub(crate) async fn audit_event_required(
     db: &sqlx::PgPool,
     event_type: &str,
@@ -1501,281 +1444,27 @@ pub(crate) async fn audit_event_required(
     outcome: &str,
     details: serde_json::Value,
 ) -> bool {
-    let Some(key) = crate::audit_integrity::current_key() else {
-        tracing::error!(
-            event_type, actor,
-            "audit_write_refused_no_key: NOO_AUDIT_HMAC_KEY is not set; a view that requires an \
-             audit row was refused"
-        );
-        return false;
-    };
-    write_audit_row(
-        db, &key, event_type, severity, actor, resource, outcome,
-        &crate::audit_context::with_origin(details).to_string(), None,
-    )
-    .await
+    crate::audit::record_required(db, shim_event(event_type, severity, actor, resource, outcome, details)).await
 }
 
-/// The ONE writer for `noo_security_audit`, with the missing-partition heal.
-///
-/// `noo_security_audit` is RANGE-partitioned by month, and an insert with no
-/// partition for its timestamp fails outright — Postgres does not create one.
-/// Both call sites used to be `let _ = sqlx::query(...)`, so that failure was
-/// discarded without a word.
-///
-/// That is how the audit log died silently on every fresh install.
-/// `audit_partition::ensure_current_and_next` runs at startup and asked for
-/// `public.noo_ensure_audit_partition`, but a fresh install puts the whole
-/// mesh schema in `mesh`, so the function was not found, the error was
-/// swallowed as a startup `warn`, no partition was ever created — and then
-/// every audit write here was swallowed too. Two layers of silence over a
-/// security log, and the only visible symptom was an empty table.
-///
-/// So this function does three things the old one did not:
-///   - heals a missing partition and retries ONCE, the same shape
-///     `usage::record` already uses for `noo_token_usage` (which got this
-///     right, unqualified call and all);
-///   - covers the month boundary, not just startup: a gateway up for two
-///     months would otherwise walk off the end of the partitions its own
-///     startup created;
-///   - logs a LOST audit row at `error!`. It stays best-effort — an audit
-///     write must never fail the caller's request — but "best-effort" is not
-///     "unobservable".
-async fn audit_insert(
-    db: &sqlx::PgPool,
+#[allow(dead_code)]
+fn shim_event(
     event_type: &str,
     severity: &str,
     actor: &str,
     resource: &str,
     outcome: &str,
-    details: &str,
-) {
-    // Signed with `NOO_AUDIT_HMAC_KEY` and NOTHING else: without it the row
-    // is refused. The derivation from `NOO_JWT_SECRET` (and its public
-    // "audit-integrity-fallback" literal) survives only as a VERIFY-ONLY key
-    // for rows written before the checkpoint (`audit_integrity`).
-    let Some(key) = crate::audit_integrity::current_key() else {
-        // Refused, loudly, every time: a row signed with anything but the
-        // audit key is a row whoever holds that other key could have forged.
-        tracing::error!(
-            event_type, actor,
-            "audit_write_refused_no_key: NOO_AUDIT_HMAC_KEY is not set, so this security audit \
-             row was NOT recorded — run `noo upgrade --stack`, which mints it when absent and \
-             recreates the stack"
-        );
-        crate::audit_spool::note_lost();
-        return;
-    };
-    // The database being away (a Postgres restart during a roll) is not a
-    // reason to lose the row: it waits in `audit_spool` and is written as
-    // soon as the database answers, stamped with when it happened.
-    if write_audit_row_outcome(db, &key, event_type, severity, actor, resource, outcome, details, None).await
-        == crate::audit_spool::Outcome::Transient
-    {
-        let held = crate::audit_spool::enqueue(crate::audit_spool::Pending::Security {
-            event_type: event_type.to_string(),
-            severity: severity.to_string(),
-            actor: actor.to_string(),
-            resource: resource.to_string(),
-            outcome: outcome.to_string(),
-            details: crate::audit_spool::stamp_queued_at(details),
-        });
-        if held {
-            tracing::warn!(event_type, actor, "audit_write_queued: the database is away; this security audit row is held and will be written when it answers");
-        } else {
-            tracing::error!(event_type, actor, "audit_write_lost: the database is away and the audit queue is full; this security audit row was NOT recorded");
-        }
+    details: serde_json::Value,
+) -> crate::audit::AuditEvent {
+    let ev = crate::audit::AuditEvent::new(crate::audit::AuditKind::from_wire(event_type), actor, resource)
+        .outcome(outcome)
+        .details(details);
+    match crate::audit::Severity::from_wire(severity) {
+        Some(s) => ev.severity(s),
+        None => ev,
     }
 }
 
-/// Sign one row with hash v2 under `key` and insert it. Returns whether the
-/// row landed. Shared by [`audit_insert`] and the boot rows
-/// (`audit_integrity::ensure_checkpoint`, which signs its one row with a
-/// different key, and `ensure_hash_v2_marker`).
-///
-/// Every column v2 covers is fixed before signing, and bound explicitly —
-/// none is left to a column default. `audit_chain::insert_in_tx` does it, under
-/// the chain lock, so the row is linked after the newest one:
-///   - `id`: a v4 uuid, as Postgres renders `uuid::text`;
-///   - `timestamp`: now (never earlier than the previous row's), truncated to
-///     MICROseconds, the precision `timestamptz` stores — the hashed value is
-///     the stored value;
-///   - `details`: Postgres's own jsonb text for the value (`$1::jsonb::text`),
-///     which is what `details::text` reads back; jsonb re-orders keys and
-///     re-spaces, so hashing our serde text would not survive the store.
-///   - `request_id`: NULL (the gateway has none).
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn write_audit_row(
-    db: &sqlx::PgPool,
-    key: &[u8],
-    event_type: &str,
-    severity: &str,
-    actor: &str,
-    resource: &str,
-    outcome: &str,
-    details: &str,
-    prev_hash: Option<&str>,
-) -> bool {
-    // Not queued: these callers act on the answer now (a required view
-    // refuses, a boot row is retried at the next boot).
-    match write_audit_row_outcome(db, key, event_type, severity, actor, resource, outcome, details, prev_hash).await {
-        crate::audit_spool::Outcome::Landed => true,
-        crate::audit_spool::Outcome::Transient => {
-            tracing::error!(event_type, actor, "audit_write_lost: the database is away; this security audit row was NOT recorded");
-            crate::audit_spool::note_lost();
-            false
-        }
-        crate::audit_spool::Outcome::Lost => false,
-    }
-}
-
-/// [`write_audit_row`], saying WHY a row did not land: `Transient` (the
-/// database is away; the caller may hold the row for `audit_spool`) or
-/// `Lost` (it would fail again). Only `Lost` logs `audit_write_lost` here; a
-/// `Transient` row is the caller's to queue or report.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn write_audit_row_outcome(
-    db: &sqlx::PgPool,
-    key: &[u8],
-    event_type: &str,
-    severity: &str,
-    actor: &str,
-    resource: &str,
-    outcome: &str,
-    details: &str,
-    prev_hash: Option<&str>,
-) -> crate::audit_spool::Outcome {
-    use crate::audit_spool::{is_transient, Outcome};
-    let details = match sqlx::query_scalar::<_, String>("SELECT $1::jsonb::text")
-        .bind(details)
-        .fetch_one(db)
-        .await
-    {
-        Ok(d) => d,
-        Err(e) if is_transient(&e) => return Outcome::Transient,
-        Err(e) => {
-            tracing::error!(
-                event_type, actor, error = %e,
-                "audit_write_lost: a security audit row was NOT recorded (its details are not jsonb)"
-            );
-            crate::audit_spool::note_lost();
-            return Outcome::Lost;
-        }
-    };
-    // The chain is always linked under the CURRENT audit key, even for the one
-    // row (the key hand-over) whose own hash is signed under the retired one.
-    let chain_key = crate::audit_integrity::current_key();
-    let row = crate::audit_chain::NewRow {
-        event_type,
-        severity,
-        actor,
-        resource,
-        outcome,
-        details: &details,
-        prev_hash,
-    };
-    // The id, the time and both hashes are fixed INSIDE the chain lock
-    // (`audit_chain::insert_in_tx`), so a row's time is never earlier than its
-    // predecessor's. A missing monthly partition is healed once, as before.
-    for attempt in 0..2 {
-        match crate::audit_chain::write_row(db, key, chain_key.as_deref(), &row).await {
-            Ok(_) => return Outcome::Landed,
-            Err(e) if attempt == 0 && is_missing_partition(&e) => {
-                crate::audit_partition::ensure_for_heal(db).await;
-            }
-            Err(e) if is_transient(&e) => return Outcome::Transient,
-            Err(e) => {
-                tracing::error!(
-                    event_type, actor, error = %e,
-                    "audit_write_lost: a security audit row was NOT recorded"
-                );
-                crate::audit_spool::note_lost();
-                return Outcome::Lost;
-            }
-        }
-    }
-    crate::audit_spool::note_lost();
-    Outcome::Lost
-}
-
-/// Now, as `timestamptz` will store it: whole microseconds.
-pub(crate) fn stored_now() -> chrono::DateTime<chrono::Utc> {
-    let us = chrono::Utc::now().timestamp_micros();
-    chrono::DateTime::from_timestamp_micros(us).expect("now is in range")
-}
-
-/// Insert one fully-formed, already-signed row, healing a missing partition
-/// once. Returns whether the row landed. Unchained. Production signs and links
-/// through [`write_audit_row`]; this is the test harness's way to plant a row of
-/// any shape (v1 hashes, rows from a writer that predates the chain).
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn insert_signed_audit_row(
-    db: &sqlx::PgPool,
-    id: &str,
-    ts: chrono::DateTime<chrono::Utc>,
-    event_type: &str,
-    severity: &str,
-    actor: &str,
-    resource: &str,
-    outcome: &str,
-    details: &str,
-    request_id: Option<&str>,
-    entry_hash: &str,
-    prev_hash: Option<&str>,
-) -> bool {
-    let run = || {
-        sqlx::query(
-            "INSERT INTO noo_security_audit \
-               (id, \"timestamp\", event_type, severity, actor, resource, outcome, details, \
-                request_id, entry_hash, prev_hash) \
-             VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11)",
-        )
-        .bind(id)
-        .bind(ts)
-        .bind(event_type)
-        .bind(severity)
-        .bind(actor)
-        .bind(resource)
-        .bind(outcome)
-        .bind(details)
-        .bind(request_id)
-        .bind(entry_hash)
-        .bind(prev_hash)
-        .execute(db)
-    };
-
-    match run().await {
-        Ok(_) => true,
-        Err(e) if is_missing_partition(&e) => {
-            crate::audit_partition::ensure_for_heal(db).await;
-            if let Err(e2) = run().await {
-                tracing::error!(
-                    event_type, actor, error = %e2,
-                    "audit_write_lost_after_partition_heal: a security audit row was NOT recorded"
-                );
-                return false;
-            }
-            true
-        }
-        Err(e) => {
-            tracing::error!(
-                event_type, actor, error = %e,
-                "audit_write_lost: a security audit row was NOT recorded"
-            );
-            false
-        }
-    }
-}
-
-/// Does this error mean "no monthly partition for that timestamp"?
-///
-/// Matched on the message because Postgres reports it as check_violation
-/// (23514), the same SQLSTATE as an ordinary CHECK failure — which is not a
-/// thing to heal by creating a partition.
-pub(crate) fn is_missing_partition(e: &sqlx::Error) -> bool {
-    e.to_string().contains("no partition of relation")
-}
 
 /// Best-effort security audit log. `source_ip` is recorded in `details` so a
 /// failed-login spike can be attributed to an origin (the `failed_auth_spike`
@@ -1783,17 +1472,20 @@ pub(crate) fn is_missing_partition(e: &sqlx::Error) -> bool {
 /// noo_security_audit for source IPs" — previously there were none).
 async fn audit_auth(
     db: &sqlx::PgPool,
-    event_type: &str,
+    kind: crate::audit::AuditKind,
     actor: &str,
     outcome: &str,
     source_ip: Option<&str>,
 ) {
-    // Same table, same columns, same heal — through the one writer. These
-    // were two hand-rolled copies of the same INSERT, and only one of them
-    // would have been fixed by a reader who found the bug in the other.
-    let severity = audit_severity(event_type, outcome);
-    let details = serde_json::json!({ "source_ip": source_ip }).to_string();
-    audit_insert(db, event_type, severity, actor, "gateway", outcome, &details).await;
+    // Same table, same columns, same heal — through the one writer. The
+    // severity comes from the kind and the outcome (`AuditEvent::resolved_severity`).
+    crate::audit::record_as_given(
+        db,
+        crate::audit::AuditEvent::new(kind, actor, "gateway")
+            .outcome(outcome)
+            .details(serde_json::json!({ "source_ip": source_ip })),
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -1817,7 +1509,7 @@ mod audit_hash_tests {
         // A process holding the login secret (and a file pointer to it) but
         // no audit key: the writer's key source must find NO key — not one
         // derived from NOO_JWT_SECRET, not the public "audit-integrity-fallback"
-        // literal. `audit_insert` refuses the row when it finds none.
+        // literal. `crate::audit` refuses the row when it finds none.
         let lookup = |name: &str| match name {
             "NOO_JWT_SECRET" => Some("a-login-secret".to_string()),
             _ => None,
@@ -1829,13 +1521,6 @@ mod audit_hash_tests {
         );
         let with = |name: &str| (name == "NOO_AUDIT_HMAC_KEY").then(|| "k".to_string());
         assert_eq!(crate::audit_integrity::key_from(&with), Some(b"k".to_vec()));
-    }
-
-    #[test]
-    fn the_writer_stamps_whole_microseconds() {
-        // The hashed time is the stored time: timestamptz keeps microseconds.
-        let t = super::stored_now();
-        assert_eq!(t.timestamp_subsec_nanos() % 1_000, 0);
     }
 }
 
@@ -2190,16 +1875,6 @@ mod tests {
     fn degraded_still_reaches_a_stranger() {
         let b = health_body("degraded", 0, deps_fixture(), json!({}), false);
         assert_eq!(b["status"], "degraded");
-    }
-
-    #[test]
-    fn auth_failures_are_warning_replay_is_critical_success_is_info() {
-        assert_eq!(audit_severity("auth_failure", "user_not_found"), "warning");
-        assert_eq!(audit_severity("auth_failure", "account_locked"), "warning");
-        assert_eq!(audit_severity("auth_failure", "bad_password"), "warning");
-        assert_eq!(audit_severity("auth_failure", "refresh_replay"), "critical");
-        assert_eq!(audit_severity("auth_success", "ok"), "info");
-        assert_eq!(audit_severity("auth_logout", "ok"), "info");
     }
 
     // ── Bootstrap admin gate ──────────────────────────────────

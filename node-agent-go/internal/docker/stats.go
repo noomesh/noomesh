@@ -31,8 +31,8 @@ type ContainerStats struct {
 
 // AllContainerStats collects resource stats for all running containers.
 // Stats are fetched concurrently since each Docker stats call blocks ~1-2s.
-func (c *Client) AllContainerStats() []ContainerStats {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func (c *Client) AllContainerStats(ctx context.Context) []ContainerStats {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	opts := client.ContainerListOptions{}

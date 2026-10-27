@@ -19,6 +19,7 @@
 
 use serde_json::Value;
 
+use crate::args::{ArgError, Args};
 use crate::http::request_status;
 use crate::output::{fail, ExitCode};
 use crate::ui;
@@ -43,47 +44,35 @@ pub(crate) enum GpuArgs {
     },
 }
 
-pub(crate) fn parse_gpu_hold(args: &[String]) -> Result<GpuArgs, ()> {
-    let [node, rest @ ..] = args else { return Err(()) };
-    if node.starts_with('-') {
-        return Err(());
-    }
-    let (mut reason, mut operation, mut immediate, mut timeout, mut force) = (None, None, false, None, false);
-    let mut it = rest.iter();
-    while let Some(tok) = it.next() {
-        match tok.as_str() {
-            "--reason" => reason = Some(it.next().ok_or(())?.trim().to_string()).filter(|r| !r.is_empty()),
-            "--operation" => operation = Some(it.next().ok_or(())?.trim().to_string()).filter(|r| !r.is_empty()),
-            "--timeout" => timeout = Some(it.next().ok_or(())?.trim().parse::<u64>().map_err(|_| ())?),
-            "--immediate" => immediate = true,
-            "--force" => force = true,
-            _ => return Err(()),
-        }
-    }
-    Ok(GpuArgs::Hold { node: node.clone(), reason, operation, immediate, timeout, force })
+pub(crate) fn parse_gpu_hold(args: &[String]) -> Result<GpuArgs, ArgError> {
+    parse_gpu_hold_with(&mut Args::new(args))
 }
 
-pub(crate) fn parse_gpu_release(args: &[String]) -> Result<GpuArgs, ()> {
-    let [node, rest @ ..] = args else { return Err(()) };
-    if node.starts_with('-') {
-        return Err(());
-    }
-    let (mut operation, mut generation, mut force, mut resume_now) = (None, None, false, false);
-    let mut it = rest.iter();
-    while let Some(tok) = it.next() {
-        match tok.as_str() {
-            "--operation" => operation = Some(it.next().ok_or(())?.trim().to_string()).filter(|r| !r.is_empty()),
-            "--generation" => generation = Some(it.next().ok_or(())?.trim().parse::<u64>().map_err(|_| ())?),
-            "--force" => force = true,
-            "--now" => resume_now = true,
-            _ => return Err(()),
-        }
-    }
+pub(crate) fn parse_gpu_hold_with(a: &mut Args) -> Result<GpuArgs, ArgError> {
+    let reason = a.value(&["--reason"])?.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let operation = a.value(&["--operation"])?.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let timeout = a.number::<u64>(&["--timeout"])?;
+    let immediate = a.flag(&["--immediate"]);
+    let force = a.flag(&["--force"]);
+    let node = a.one("<node>")?;
+    Ok(GpuArgs::Hold { node, reason, operation, immediate, timeout, force })
+}
+
+pub(crate) fn parse_gpu_release(args: &[String]) -> Result<GpuArgs, ArgError> {
+    parse_gpu_release_with(&mut Args::new(args))
+}
+
+pub(crate) fn parse_gpu_release_with(a: &mut Args) -> Result<GpuArgs, ArgError> {
+    let operation = a.value(&["--operation"])?.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let generation = a.number::<u64>(&["--generation"])?;
+    let force = a.flag(&["--force"]);
+    let resume_now = a.flag(&["--now"]);
+    let node = a.one("<node>")?;
     // The ids come as a pair: one without the other releases nothing.
     if operation.is_some() != generation.is_some() {
-        return Err(());
+        return Err(ArgError::new("--operation and --generation come as a pair"));
     }
-    Ok(GpuArgs::Release { node: node.clone(), operation, generation, force, resume_now })
+    Ok(GpuArgs::Release { node, operation, generation, force, resume_now })
 }
 
 /// A fresh operation id for a hold the operator did not name: a random
@@ -103,7 +92,7 @@ fn new_operation_id() -> String {
 
 /// `noo cluster gpu hold <node> [--reason <text>] [--operation <id>] [--timeout <s>] [--immediate] [--force]`
 pub fn cluster_gpu_hold(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let Ok(GpuArgs::Hold { node, reason, operation, immediate, timeout, force }) = parse_gpu_hold(args) else {
+    let GpuArgs::Hold { node, reason, operation, immediate, timeout, force } = parse_gpu_hold(args)? else {
         return Err(Unhandled);
     };
     let operation = operation.unwrap_or_else(new_operation_id);
@@ -145,7 +134,7 @@ pub fn cluster_gpu_hold(g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
 
 /// `noo cluster gpu release <node> [--operation <id> --generation <n>] [--force] [--now]`
 pub fn cluster_gpu_release(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let Ok(GpuArgs::Release { node, operation, generation, force, resume_now }) = parse_gpu_release(args) else {
+    let GpuArgs::Release { node, operation, generation, force, resume_now } = parse_gpu_release(args)? else {
         return Err(Unhandled);
     };
     let mut body = serde_json::json!({"force": force || operation.is_none()});

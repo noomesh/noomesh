@@ -46,9 +46,16 @@ Type "export PATH=$HOME/.local/bin:$PATH" Enter
 # Everything noo and the installer print goes through the masker (node names,
 # IPs, tailnet names, e-mails, home paths, tokens become generic stand-ins) and
 # is logged raw and masked so the recorder can prove nothing leaked. Colour is
-# forced because a pipe would otherwise turn it off.
+# forced because a pipe would otherwise turn it off. noo runs on its own pty
+# (script(1)) in front of that pipe, so it and the docker compose it starts see
+# a terminal, as they would for a real user: compose draws its in-place pull
+# bars instead of one line per layer update. `stty -onlcr` keeps that pty from
+# adding a CR to every line, so the masker and both logs see plain \n lines (the
+# vhs terminal adds the CR on display). Its stdin is /dev/null (script would
+# otherwise forward keystrokes, and in a piped shell swallow the next
+# commands), so the pty takes the window size from bash's LINES/COLUMNS.
 Type `export NOO_DEMO_HOSTNAME="$(hostname)"` Enter
-Type `noo() { command noo --color always "$@" 2>&1 | tee -a "@RAW_LOG@" | "@MASK@" | tee -a "@MASKED_LOG@"; return ${PIPESTATUS[0]}; }` Enter
+Type `noo() { script -qfec "stty -onlcr rows ${LINES:-40} cols ${COLUMNS:-120}; $(printf '%q ' command noo --color always "$@")" /dev/null </dev/null 2>&1 | tee -a "@RAW_LOG@" | "@MASK@" | tee -a "@MASKED_LOG@"; return ${PIPESTATUS[0]}; }` Enter
 Type `sh() { command sh "$@" 2>&1 | tee -a "@RAW_LOG@" | "@MASK@" | tee -a "@MASKED_LOG@"; return ${PIPESTATUS[0]}; }` Enter
 Type "clear" Enter
 Show
@@ -57,7 +64,9 @@ Sleep 800ms
 Type "# A fresh Ubuntu box. No checkout, no registry login." Enter
 Sleep 1500ms
 
-Type "curl -fsSL @INSTALL_URL@ | sh" Enter
+# @INSTALL_SH@ is `sh`, or `NOO_CLI_VERSION=<tag> sh` when NOO_DEMO_CLI_VERSION
+# pins the take to one release (an rc under test): the pin is on screen.
+Type "curl -fsSL @INSTALL_URL@ | @INSTALL_SH@" Enter
 Wait
 Sleep 1s
 Type "noo --version" Enter
@@ -73,18 +82,20 @@ Sleep 2500ms
 Type "noo health" Enter
 Wait
 Sleep 2s
-# `noo stack status`, not `noo cluster status`: in the standalone profile the
-# node agent is a host binary under systemd, and the studio's box has no
-# systemd, so the box never registers its own node ("no nodes", take 7). A real
-# install shows the node a minute after onboard; the film does not wait.
+# `noo stack status`, not `noo cluster status`: the node registers about a
+# minute after onboard (the host agent's first heartbeat) and the film does not
+# wait for it. (Before the box had systemd it never registered: "no nodes", take 7.)
 Type "noo stack status" Enter
 Wait
 Sleep 3s
 
 Type "# Ask it something." Enter
 Sleep 1s
-# A question the first (small) model answers well. "what can you do on this
-# machine?" got "please provide an image or description of the machine" (take 7).
-Type `noo chat --message "Say hello, then tell me in two lines what noomesh is."` Enter
+# A question the first (small) model answers from what it knows. It has no
+# knowledge base yet, so it cannot know what noomesh is: "what can you do on
+# this machine?" got "please provide an image or description of the machine"
+# (take 7), "tell me what noomesh is" got "I do not have enough context to
+# define noomesh" (take 14a). A general question shows a local model answering.
+Type `noo chat --message "Say hello, then give me two short tips for keeping a home server healthy."` Enter
 Wait
 Sleep 5s

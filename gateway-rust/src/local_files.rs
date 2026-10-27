@@ -165,17 +165,16 @@ const DENIED_PREFIXES: &[&str] = &[
 /// somewhere other than `/tls` is covered without editing the constant.
 pub fn denied_roots() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = DENIED_PREFIXES.iter().map(PathBuf::from).collect();
-    if let Ok(dir) = std::env::var("NOO_PKI_DIR") {
-        if !dir.trim().is_empty() {
-            out.push(PathBuf::from(dir.trim()));
-        }
+    if let Some(dir) = crate::tls::pki_dir() {
+        out.push(dir);
     }
-    for var in ["NOO_TLS_CA", "NOO_TLS_KEY", "NOO_TLS_CERT"] {
-        if let Ok(file) = std::env::var(var) {
-            if let Some(parent) = Path::new(file.trim()).parent() {
-                if !parent.as_os_str().is_empty() && parent != Path::new("/") {
-                    out.push(parent.to_path_buf());
-                }
+    let key_cert = ["NOO_TLS_KEY", "NOO_TLS_CERT"]
+        .iter()
+        .filter_map(|v| std::env::var(v).ok().map(|f| PathBuf::from(f.trim())));
+    for file in crate::tls::ca_path().into_iter().chain(key_cert) {
+        if let Some(parent) = file.parent() {
+            if !parent.as_os_str().is_empty() && parent != Path::new("/") {
+                out.push(parent.to_path_buf());
             }
         }
     }

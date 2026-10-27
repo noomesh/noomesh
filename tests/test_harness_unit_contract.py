@@ -63,6 +63,7 @@ def test_service_section_is_what_the_applier_demands() -> None:
     assert svc.get("EnvironmentFile") == ["-/etc/noo-harness.env"]
     assert svc.get("ExecStart") == ["/usr/local/bin/noo-gateway harness"]
     assert svc.get("MemoryMax") and svc.get("CPUQuota"), "the container's caps must carry over"
+    assert svc.get("TimeoutStopSec") == ["150"], "a stop drains for NOO_HARNESS_DRAIN_SECS (120) plus 30 s (i256)"
 
 
 def test_applier_refusals_match_the_unit() -> None:

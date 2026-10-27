@@ -440,7 +440,7 @@ type SkillRunResult struct {
 // RunSkillContainer pulls (if needed), creates, starts, waits for, and collects
 // output from a skill container. This is a synchronous call — it blocks until
 // the container exits or the timeout fires.
-func (c *Client) RunSkillContainer(req SkillRunRequest) (*SkillRunResult, error) {
+func (c *Client) RunSkillContainer(ctx context.Context, req SkillRunRequest) (*SkillRunResult, error) {
 	timeout := req.Timeout
 	if timeout <= 0 {
 		timeout = 60
@@ -467,7 +467,7 @@ func (c *Client) RunSkillContainer(req SkillRunRequest) (*SkillRunResult, error)
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout+30)*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeout+30)*time.Second)
 	defer cancel()
 
 	// The image, over the artifact rail (image_source.go).
@@ -619,7 +619,7 @@ func (c *Client) RunSkillContainer(req SkillRunRequest) (*SkillRunResult, error)
 		if err != nil {
 			// Timeout or other error — kill the container
 			slog.Warn("skill: container wait error, killing", "container", req.ContainerName, "error", err)
-			killCtx, killCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			killCtx, killCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 			defer killCancel()
 			_, _ = c.docker.ContainerKill(killCtx, containerID, client.ContainerKillOptions{Signal: "SIGKILL"})
 			exitCode = -1
@@ -627,7 +627,7 @@ func (c *Client) RunSkillContainer(req SkillRunRequest) (*SkillRunResult, error)
 	case <-waitCtx.Done():
 		// Timeout
 		slog.Warn("skill: container timed out", "container", req.ContainerName, "timeout", timeout)
-		killCtx, killCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		killCtx, killCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer killCancel()
 		_, _ = c.docker.ContainerKill(killCtx, containerID, client.ContainerKillOptions{Signal: "SIGKILL"})
 		exitCode = -1
@@ -637,7 +637,7 @@ func (c *Client) RunSkillContainer(req SkillRunRequest) (*SkillRunResult, error)
 	stdout, stderr := c.collectContainerOutput(ctx, containerID)
 
 	// Remove the container (cleanup)
-	removeCtx, removeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	removeCtx, removeCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer removeCancel()
 	_, _ = c.docker.ContainerRemove(removeCtx, containerID, client.ContainerRemoveOptions{Force: true})
 

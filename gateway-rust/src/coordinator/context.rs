@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
 use crate::state::AppState;
-use crate::worker_client;
+use crate::trellion_client::{subjects, TrellionClient};
 
 #[allow(unused_imports)]
 use super::*;
@@ -137,10 +137,9 @@ pub(super) async fn fetch_rag_context(
     // KB retrieval to that user's audience (own + shared tiers) instead of
     // injecting the whole corpus into every system prompt. None = single-user
     // behaviour (or fail-closed when no scope resolves, decided worker-side).
-    let result = worker_client::request_with_timeout(
-        nats,
-        "worker.rag.context",
-        &json!({"question": query, "top_k": 5, "user_id": user_id, "shared_room": super::in_shared_room()}),
+    let result = TrellionClient::new(nats).call_raw_with_timeout(
+        subjects::RAG_CONTEXT,
+        json!({"question": query, "top_k": 5, "user_id": user_id, "shared_room": super::in_shared_room()}),
         Duration::from_secs(10),
     ).await.ok()?;
 
@@ -199,10 +198,9 @@ pub(super) async fn fetch_memory_context(
 ) -> Option<String> {
     // H-D1: pass the authenticated user_id so the worker scopes memory search
     // to this user's entries (plus shared rows) instead of every user's data.
-    let result = worker_client::request_with_timeout(
-        nats,
-        "worker.memory.search",
-        &json!({"query": query, "top_k": 5, "user_id": user_id}),
+    let result = TrellionClient::new(nats).call_raw_with_timeout(
+        subjects::MEMORY_SEARCH,
+        json!({"query": query, "top_k": 5, "user_id": user_id}),
         Duration::from_secs(5),
     ).await.ok()?;
 
@@ -369,10 +367,9 @@ pub(super) async fn fetch_cross_channel_context(
     user_id: Option<&str>,
 ) -> Option<String> {
     // H-D1: scope cross-channel activity to the requesting user.
-    let result = worker_client::request_with_timeout(
-        nats,
-        "worker.memory.cross_channel",
-        &json!({
+    let result = TrellionClient::new(nats).call_raw_with_timeout(
+        subjects::MEMORY_CROSS_CHANNEL,
+        json!({
             "query": query,
             "exclude_channel": current_channel,
             "top_k": 3,
@@ -499,10 +496,9 @@ pub(super) fn split_skills_by_origin(text: Option<&str>) -> (Option<String>, Opt
 /// Fetch recall memory (System 1 compressed recall) for context.
 /// Provides summaries of past conversations relevant to the current query.
 pub(super) async fn fetch_video_context(nats: &async_nats::Client, query: &str) -> Option<String> {
-    let result = worker_client::request_with_timeout(
-        nats,
-        "worker.recall.packs",
-        &json!({"query": query, "top_k": 3}),
+    let result = TrellionClient::new(nats).call_raw_with_timeout(
+        subjects::RECALL_PACKS,
+        json!({"query": query, "top_k": 3}),
         Duration::from_secs(5),
     ).await.ok()?;
 

@@ -840,17 +840,28 @@ async fn self_test_jailed(
     let mut unproved = Vec::new();
     let me = std::process::id();
     // Positive control, OUTSIDE the jail: the same read must work, or the
-    // jailed failure proves nothing.
-    let unjailed = tokio::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg(read_env_of(sibling))
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .await
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains(canary))
-        .unwrap_or(false);
+    // jailed failure proves nothing. The spawn returns once the sibling's
+    // exec has replaced its memory but before the kernel records where its
+    // environment lives, so for a moment /proc/<pid>/environ reads empty
+    // (seen under a loaded test run): wait for the canary, about half a second,
+    // before the jailed read is judged against it.
+    let mut unjailed = false;
+    for _ in 0..25 {
+        unjailed = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(read_env_of(sibling))
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(canary))
+            .unwrap_or(false);
+        if unjailed {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     let mut spec = JailSpec { workspace: work.to_path_buf(), home: home.to_path_buf(), tmp: tmp.to_path_buf(), ..Default::default() };
     widen(&mut spec, secret);
     let mut script = String::from("echo \"@@read:$(cat in.txt 2>/dev/null)\"\n");

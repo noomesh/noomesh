@@ -11,8 +11,8 @@ The pin is what turns blind trust-on-first-use into a verified handoff.
 
 Until 2026-09-29 `noo cluster provision` for the controller's OWN node
 called prep-host with `PREP_INSECURE=1` and no pin (so prep refused, or —
-on an older prep — fetched blind), and `scripts/bootstrap-enroll.sh`
-printed `curl -fsSk …/bootstrap/deenroll` and `curl -fsSL …/prep | sudo
+on an older prep — fetched blind), and the since-retired
+`scripts/bootstrap-enroll.sh` printed `curl -fsSk …/bootstrap/deenroll` and `curl -fsSL …/prep | sudo
 bash` as advice: an operator following it would fetch a root-executed
 script with no pin at all.
 
@@ -26,7 +26,7 @@ What this pins:
      shell block (the GUARD_WINDOW lines above it name the pin variable)
      AND fetches nothing but `/bootstrap/ca.crt`, the public certificate
      the pin then verifies. A pin in the block is not enough: the old
-     bootstrap-enroll.sh named the pin variable and then sent the
+     bootstrap-enroll.sh (retired) named the pin variable and then sent the
      single-use token and fetched the root prep script over `-k`. Anything
      that carries a token or runs as root is fetched with `--cacert` of the
      verified CA. A `-k` aimed at the host's own loopback (`localhost`,
@@ -48,8 +48,8 @@ INSECURE_CURL = re.compile(r"\bcurl\b[^|\n]*?(\s-(?:[a-zA-Z]*k[a-zA-Z]*)\b|--ins
 INSECURE_OPTS = re.compile(r'(?:CURL_OPTS|PREP_CURL)="-[a-zA-Z]*k[a-zA-Z]*"')
 LOOPBACK = re.compile(r"https?://(localhost|127\.0\.0\.1|\[::1\])[:/]")
 # The pin check and the -k it licenses sit in the same shell block; the
-# widest such block in the tree (bootstrap-enroll.sh's NOO_BOOTSTRAP_INSECURE
-# arm) is 14 lines.
+# widest such block in the tree (the retired bootstrap-enroll.sh's
+# NOO_BOOTSTRAP_INSECURE arm) was 14 lines.
 GUARD_WINDOW = 16
 CA_TARGET = re.compile(r"/bootstrap/ca\.crt\b")
 OPTS_VAR = re.compile(r'^\s*(?:export\s+)?([A-Z_]+)="-[a-zA-Z]*k[a-zA-Z]*"')
@@ -158,27 +158,16 @@ def test_noo_cli_never_sends_prep_insecure_without_the_pin():
     assert not problems, "\n".join(problems)
 
 
-def test_bootstrap_enroll_only_fetches_the_ca_unverified():
-    """The shell lane, read directly: with NOO_BOOTSTRAP_INSECURE=1 the CA is
-    fetched on -k, checked against the pin, and the token POST and the root
-    prep script go out under --cacert of THAT CA."""
-    src = (ROOT / "scripts" / "bootstrap-enroll.sh").read_text()
-    code = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
-    assert 'CURL_OPTS="-fsSk"' not in code, "CURL_OPTS is -k again: the token POST and the prep fetch would be unverified"
-    ks = [l.strip() for l in code.splitlines() if INSECURE_CURL.search(l)]
-    assert len(ks) == 1 and "/bootstrap/ca.crt" in ks[0], ks
-    assert '--cacert $BOOT_CA' in code and 'BOOT_FP" != "$NOO_CA_SHA256"' in code
-    # the pin check sits between the -k fetch and the line that switches to --cacert
-    assert code.index(ks[0]) < code.index('BOOT_FP" != "$NOO_CA_SHA256"') < code.index('CURL_OPTS="-fsS --cacert $BOOT_CA"')
-
-
-def test_the_two_enroll_sites_are_looked_at():
+def test_the_enroll_sites_are_looked_at():
     """The parse found the sites this guard was written for (a guard that
-    passes on an empty match set guards nothing)."""
-    enroll = (ROOT / "scripts" / "bootstrap-enroll.sh").read_text()
+    passes on an empty match set guards nothing). The shell enroller
+    (bootstrap-enroll.sh) is retired; `noo enroll` / `noo cluster provision`
+    and prep-host.sh are the sites."""
+    assert not (ROOT / "scripts" / "bootstrap-enroll.sh").exists(), "the retired shell enroller is back"
     prep = (ROOT / "scripts" / "prep-host.sh").read_text()
-    assert "bootstrap/deenroll" in enroll and "--cacert" in enroll
-    assert "bootstrap/prep" in enroll
+    assert any(p.name == "prep-host.sh" for p in SCRIPTS), "the script scan no longer reaches prep-host.sh"
+    enroll_rs = (ROOT / "noo-cli/src/commands/enroll.rs").read_text()
+    assert "/bootstrap/prep" in enroll_rs and "ca_agent(" in enroll_rs
     assert 'PREP_CURL="-fsSk"' in prep and "PREP_CA_SHA256 is required" in prep
     prov = (ROOT / "noo-cli/src/commands/provision.rs").read_text()
     assert '"PREP_INSECURE=1"' in prov and "PREP_CA_SHA256=" in prov

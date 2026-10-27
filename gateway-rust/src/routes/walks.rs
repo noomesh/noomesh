@@ -17,6 +17,9 @@
 //! | `GET /api/v1/walks/stats` | Operator and above | COUNTS only |
 //! | `GET /api/v1/admin/walks?user=` | Admin only | a user's threads, and writes ONE `noo_security_audit` row per view |
 //!
+//! The two role-gated routes take the `authz::Operator` / `authz::Admin`
+//! extractors; a credential with no account (cluster HMAC) is refused by both.
+//!
 //! Recall is delegated to trellion-intel's `recall_walks` through the same
 //! helper every Intelligent-tier graph route uses (`knowledge::intel_graph`):
 //! the caller's audience is resolved by `scope::resolve`, any client-supplied
@@ -29,6 +32,7 @@
 //! is a separate act). The setting lives in `noo_user_settings` and is erased
 //! with the account (`users.rs::erase_targets`).
 
+use crate::audit::{AuditEvent, AuditKind, Outcome, Severity};
 use std::sync::Arc;
 
 use axum::{
@@ -41,7 +45,8 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 
 use super::{delegation, knowledge, AppError, AppResult};
-use crate::auth::{account_of, RequesterCtx, Role};
+use crate::auth::{account_of, RequesterCtx};
+use crate::authz::{Admin, Operator};
 use crate::state::AppState;
 
 /// `noo_user_settings.key` of the per-account switch. The worker reads the
@@ -73,18 +78,20 @@ pub fn router() -> Router<Arc<AppState>> {
 pub(crate) struct Caller {
     /// The bare ACCOUNT (`alice`, never the connection `alice/laptop`).
     pub account: String,
-    pub role: Role,
     /// Who caused the call, when the credential is a delegation.
     pub act: Option<String>,
 }
 
 impl Caller {
-    fn of(ctx: &Option<axum::Extension<RequesterCtx>>) -> Option<Caller> {
-        ctx.as_ref().map(|axum::Extension(c)| Caller {
+    fn from_ctx(c: &RequesterCtx) -> Caller {
+        Caller {
             account: account_of(&c.sub).to_string(),
-            role: c.role,
             act: c.act.as_ref().map(|a| a.sub.clone()),
-        })
+        }
+    }
+
+    fn of(ctx: &Option<axum::Extension<RequesterCtx>>) -> Option<Caller> {
+        ctx.as_ref().map(|axum::Extension(c)| Caller::from_ctx(c))
     }
 }
 
@@ -94,29 +101,6 @@ fn signed_in(ctx: &Option<axum::Extension<RequesterCtx>>) -> Result<Caller, AppE
     Caller::of(ctx).ok_or_else(|| {
         AppError::Forbidden("saved walks belong to a signed-in account; this credential has none".into())
     })
-}
-
-/// Counts: Operator and above.
-pub(crate) fn require_counts(caller: Option<&Caller>) -> Result<&Caller, AppError> {
-    match caller {
-        Some(c) if c.role >= Role::Operator => Ok(c),
-        _ => Err(AppError::Forbidden(
-            "walk counts require the Operator role or above".into(),
-        )),
-    }
-}
-
-/// A user's threads, verbatim: Admin ONLY. An operator is refused (they have
-/// the counts); so is every other credential, including cluster-HMAC (no ctx).
-pub(crate) fn require_admin(caller: Option<&Caller>) -> Result<&Caller, AppError> {
-    match caller {
-        Some(c) if c.role >= Role::Admin => Ok(c),
-        _ => Err(AppError::Forbidden(
-            "viewing a user's saved threads requires the Admin role, and every view is audited; \
-             operators get counts at /api/v1/walks/stats"
-                .into(),
-        )),
-    }
 }
 
 // ───────────────────────────── recall (own) ─────────────────────────────
@@ -268,17 +252,15 @@ struct StatsQuery {
 /// feature, nothing of what anyone asked. Content is the audited admin view.
 async fn walks_stats(
     State(state): State<Arc<AppState>>,
-    ctx: Option<axum::Extension<RequesterCtx>>,
+    _op: Operator,
     Query(q): Query<StatsQuery>,
 ) -> AppResult {
-    let caller = Caller::of(&ctx);
-    require_counts(caller.as_ref())?;
     Ok(Json(stats_core(&state.db, q.user.as_deref().map(str::trim).filter(|s| !s.is_empty())).await?))
 }
 
 // ───────────────────────────── the audited admin view ─────────────────────────────
 
-/// The `noo_security_audit` row for one admin view: `(event_type, severity,
+/// The `noo_security_audit` row for one admin view: `(kind, severity,
 /// resource, outcome, details)`. Pure so a test pins what is recorded: who
 /// looked at whose threads, how many came back, and the delegation if any.
 pub(crate) fn admin_view_audit_row(
@@ -286,14 +268,14 @@ pub(crate) fn admin_view_audit_row(
     user: &str,
     limit: i64,
     returned: usize,
-) -> (&'static str, &'static str, String, &'static str, Value) {
+) -> (AuditKind, Severity, String, Outcome, Value) {
     (
-        "walks_admin_view",
+        AuditKind::WalksAdminView,
         // A named admin reading another person's questions is exactly what an
         // audit log exists to make visible.
-        "warning",
+        Severity::Warning,
         format!("walks:{user}"),
-        "success",
+        Outcome::custom("success"),
         json!({
             "viewer": caller.account,
             "viewed_user": user,
@@ -306,15 +288,15 @@ pub(crate) fn admin_view_audit_row(
 }
 
 /// Read `user`'s threads for an admin, then write the audit row. The role gate
-/// comes FIRST and the audit row is written whether or not there is anything
-/// to show: the view happened.
+/// is the `Admin` extractor on the route, so this is only reachable past it;
+/// the audit row is written whether or not there is anything to show: the view
+/// happened.
 pub(crate) async fn admin_view_core(
     db: &PgPool,
-    caller: Option<&Caller>,
+    caller: &Caller,
     user: &str,
     limit: i64,
 ) -> Result<Value, AppError> {
-    let caller = require_admin(caller)?;
     let user = user.trim();
     if user.is_empty() {
         return Err(AppError::BadRequest("`user` (an account name) is required".into()));
@@ -341,13 +323,21 @@ pub(crate) async fn admin_view_core(
             })
         })
         .collect();
-    let (event, severity, resource, outcome, details) =
+    let (kind, severity, resource, outcome, details) =
         admin_view_audit_row(caller, user, limit, threads.len());
     // The operator's rule: an admin may read a user's threads only AUDITED.
     // So the row must land BEFORE the content leaves; if it cannot (no audit
     // key, the partition heal failed, the database refused), the view is
     // refused rather than served unaudited.
-    if !super::core::audit_event_required(db, event, severity, &caller.account, &resource, outcome, details).await {
+    if !crate::audit::record_required(
+        db,
+        AuditEvent::new(kind, &caller.account, &resource)
+            .outcome(outcome)
+            .severity(severity)
+            .details(details),
+    )
+    .await
+    {
         return Err(AppError::Unavailable(
             "the security audit log could not record this view, so it was not served; \
              check the gateway log for audit_write_* and retry"
@@ -371,12 +361,12 @@ struct AdminQuery {
 /// `GET /api/v1/walks/stats`.
 async fn admin_walks(
     State(state): State<Arc<AppState>>,
-    ctx: Option<axum::Extension<RequesterCtx>>,
+    admin: Admin,
     Query(q): Query<AdminQuery>,
 ) -> AppResult {
-    let caller = Caller::of(&ctx);
+    let caller = Caller::from_ctx(&admin.0);
     Ok(Json(
-        admin_view_core(&state.db, caller.as_ref(), q.user.as_deref().unwrap_or(""), q.limit.unwrap_or(50)).await?,
+        admin_view_core(&state.db, &caller, q.user.as_deref().unwrap_or(""), q.limit.unwrap_or(50)).await?,
     ))
 }
 
@@ -386,35 +376,19 @@ mod tests {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
-    fn caller(role: Role) -> Caller {
-        Caller { account: "root".into(), role, act: None }
-    }
-
-    fn status_of<T>(r: Result<T, AppError>) -> Option<StatusCode> {
-        r.err().map(|e| e.into_response().status())
-    }
-
-    /// Admin sees threads; an operator sees counts; a user sees neither; a
-    /// credential with no account (cluster HMAC) sees neither.
-    #[test]
-    fn the_admin_view_is_admin_only_and_counts_start_at_operator() {
-        assert!(require_admin(Some(&caller(Role::Admin))).is_ok());
-        for r in [Role::Operator, Role::User] {
-            assert_eq!(status_of(require_admin(Some(&caller(r)))), Some(StatusCode::FORBIDDEN), "{r:?}");
-        }
-        assert_eq!(status_of(require_admin(None)), Some(StatusCode::FORBIDDEN));
-        assert!(require_counts(Some(&caller(Role::Admin))).is_ok());
-        assert!(require_counts(Some(&caller(Role::Operator))).is_ok());
-        assert_eq!(status_of(require_counts(Some(&caller(Role::User)))), Some(StatusCode::FORBIDDEN));
-        assert_eq!(status_of(require_counts(None)), Some(StatusCode::FORBIDDEN));
+    fn caller() -> Caller {
+        Caller { account: "root".into(), act: None }
     }
 
     #[test]
     fn the_audit_row_names_who_viewed_whose_and_how_many() {
-        let mut c = caller(Role::Admin);
+        let mut c = caller();
         c.act = Some("agent-7".into());
         let (event, severity, resource, outcome, d) = admin_view_audit_row(&c, "alice", 50, 3);
-        assert_eq!((event, severity, resource.as_str(), outcome), ("walks_admin_view", "warning", "walks:alice", "success"));
+        assert_eq!(
+            (event, severity, resource.as_str(), outcome),
+            (AuditKind::WalksAdminView, Severity::Warning, "walks:alice", Outcome::custom("success"))
+        );
         assert_eq!(d["viewer"], "root");
         assert_eq!(d["viewed_user"], "alice");
         assert_eq!(d["returned"], 3);
@@ -533,10 +507,10 @@ mod tests {
         thread(&db, Some("alice"), "thread", "ALICE-SECOND").await;
         thread(&db, Some("bob"), "thread", "BOB-QUESTION").await;
         thread(&db, None, "simulated", "a rehearsal").await;
-        let admin = caller(Role::Admin);
+        let admin = caller();
 
         assert_eq!(view_rows(&db).await, 0);
-        let v = admin_view_core(&db, Some(&admin), "alice", 50).await.expect("admin may view");
+        let v = admin_view_core(&db, &admin, "alice", 50).await.expect("admin may view");
         assert_eq!(v["count"], 2);
         let blob = v.to_string();
         assert!(blob.contains("ALICE-PRIVATE-QUESTION") && blob.contains("ALICE-SECOND"));
@@ -551,18 +525,15 @@ mod tests {
         assert!(!details.to_string().contains("ALICE-PRIVATE-QUESTION"), "the audit row records the view, not the content");
 
         // A second view is a second row, even when there is nothing to show.
-        let empty = admin_view_core(&db, Some(&admin), "nobody", 50).await.unwrap();
+        let empty = admin_view_core(&db, &admin, "nobody", 50).await.unwrap();
         assert_eq!(empty["count"], 0);
         assert_eq!(view_rows(&db).await, 2);
 
-        // Refused callers read nothing and leave no `walks_admin_view` row.
-        for who in [Some(caller(Role::Operator)), Some(caller(Role::User)), None] {
-            let err = admin_view_core(&db, who.as_ref(), "alice", 50).await.expect_err("must be refused");
-            assert_eq!(err.into_response().status(), StatusCode::FORBIDDEN);
-        }
-        assert_eq!(view_rows(&db).await, 2, "a refusal is not a view");
+        // Refusing a caller below Admin is the `Admin` extractor's job
+        // (`authz::tests` drives it through a router); the core is only
+        // reachable past it.
         // ...and a missing user is a 400, before any read or audit row.
-        let err = admin_view_core(&db, Some(&admin), "  ", 50).await.expect_err("user required");
+        let err = admin_view_core(&db, &admin, "  ", 50).await.expect_err("user required");
         assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
         assert_eq!(view_rows(&db).await, 2);
     }
@@ -574,8 +545,8 @@ mod tests {
         thread(&db, Some("alice"), "thread", "ALICE-PRIVATE-QUESTION").await;
         // The audit table is gone: the row cannot land, so the view must not be served.
         sqlx::raw_sql("DROP TABLE noo_security_audit CASCADE").execute(&db).await.expect("drop audit table");
-        let admin = caller(Role::Admin);
-        let err = admin_view_core(&db, Some(&admin), "alice", 50)
+        let admin = caller();
+        let err = admin_view_core(&db, &admin, "alice", 50)
             .await
             .expect_err("an unaudited admin view must be refused");
         let msg = format!("{err:?}");
@@ -615,7 +586,5 @@ mod tests {
         // narrowed to one account
         let one = stats_core(&db, Some("bob")).await.unwrap();
         assert_eq!(one["per_user"].as_array().unwrap().len(), 1);
-        // and a counts caller who is not Operator is refused before the query
-        assert!(require_counts(Some(&caller(Role::User))).is_err());
     }
 }

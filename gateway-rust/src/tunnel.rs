@@ -1135,10 +1135,9 @@ where
 async fn tunnel_probe(
     State(state): State<Arc<AppState>>,
     caller: Option<Extension<crate::auth::ClusterNode>>,
-    requester: Option<Extension<crate::auth::RequesterCtx>>,
+    _op: crate::authz::OperatorOrInternal,
     Path(node_id): Path<String>,
 ) -> AppResult {
-    crate::routes::operator_read_guard(&requester)?;
     if caller.is_some() {
         return Err(AppError::Forbidden("a node may not probe the controller's control paths".into()));
     }

@@ -36,18 +36,21 @@ def fill(s: str, tmp: Path) -> str:
     )
 
 
-def run_film_shell(tmp: Path, commands: list[str]) -> list[str]:
+FAKE_NOO = '#!/bin/sh\necho "noo says hi"\nfor a in "$@"; do [ "$a" != "--fail" ] || { echo "boom" >&2; exit 7; }; done\n'
+
+
+def run_film_shell(tmp: Path, commands: list[str], fake_noo: str = FAKE_NOO, env: dict | None = None) -> list[str]:
     """Type the tape's setup lines, then `commands`, into an interactive bash; return the exit log lines."""
     setup = [fill(s, tmp) for s in typed_lines("onboarding.tape.in") if s.startswith(("PROMPT_COMMAND=", "noo()", "sh()"))]
     assert len(setup) == 3, "the tape must define PROMPT_COMMAND, noo() and sh()"
     fake = tmp / "bin"
     fake.mkdir()
-    (fake / "noo").write_text('#!/bin/sh\necho "noo says hi"\nfor a in "$@"; do [ "$a" != "--fail" ] || { echo "boom" >&2; exit 7; }; done\n')
+    (fake / "noo").write_text(fake_noo)
     (fake / "noo").chmod(0o755)
     script = "\n".join(setup + commands + ["exit"]) + "\n"
     subprocess.run(
         [BASH, "--norc", "-i"], input=script, text=True, capture_output=True, check=False,
-        env={"PATH": f"{fake}:/usr/bin:/bin", "HOME": str(tmp), "TERM": "dumb"},
+        env={"PATH": f"{fake}:/usr/bin:/bin", "HOME": str(tmp), "TERM": "dumb", **(env or {})},
     )
     log = tmp / "exit.log"
     return log.read_text().splitlines() if log.exists() else []
@@ -59,6 +62,24 @@ def test_a_failing_step_leaves_a_non_zero_status_in_the_exit_log(tmp_path):
     flat = " ".join(lines).split()
     assert flat, "nothing was recorded"
     assert "7" in flat, f"the failing noo (exit 7) must be recorded, got {lines}"
+
+
+needs_script = pytest.mark.skipif(shutil.which("script") is None, reason="script(1) is not installed")
+
+
+@needs_bash
+@needs_script
+def test_noo_runs_on_a_terminal_of_the_film_size_so_compose_draws_its_bars(tmp_path):
+    # Behind the masking pipe noo (and the docker compose it starts) saw no
+    # terminal, so compose printed one line per layer update. The wrapper puts
+    # noo on its own pty, sized like the vhs window, with LF line ends.
+    probe = '#!/bin/sh\n[ -t 1 ] && echo "stdout-tty"\n[ -t 2 ] && echo "stderr-tty"\necho "size $(stty size)"\nexit 3\n'
+    lines = run_film_shell(tmp_path, ["noo"], fake_noo=probe, env={"LINES": "37", "COLUMNS": "111"})
+    assert "3" in " ".join(lines).split(), f"the wrapped noo's exit status must reach the exit log, got {lines}"
+    masked = (tmp_path / "masked.log").read_bytes()
+    assert b"stdout-tty" in masked and b"stderr-tty" in masked, masked
+    assert b"size 37 111" in masked, masked
+    assert b"\r" not in masked, f"the pty must not add CRs: {masked!r}"
 
 
 @needs_bash
@@ -195,4 +216,138 @@ def test_the_cut_script_and_the_tape_after_take_seven():
     typed = [a or b for a, b in re.findall(r"^Type `(noo [^`]*)` Enter$|^Type \"(noo [^\"]*)\" Enter$", tape, re.M)]
     assert "noo stack status" in typed and "noo cluster status" not in typed, typed
     assert not any("what can you do on this machine" in t for t in typed), "the prompt gemma4:e2b misread"
-    assert any(t.startswith("noo chat --message") and "noomesh" in t for t in typed), typed
+    chat = [t for t in typed if t.startswith("noo chat --message")]
+    assert len(chat) == 1, typed
+    # the first model has no knowledge base: a question about noomesh itself
+    # got "I do not have enough context to define noomesh" (take 14a)
+    assert "noomesh" not in chat[0].lower(), chat[0]
+
+
+def test_the_box_boots_systemd_and_runs_docker_as_a_unit():
+    """Take 7 (2026-10-24): a box with `sleep infinity` as PID 1 never ran the
+    host node agent or noo-hostd (both are systemd units on a real install),
+    so the node never registered and the prep step printed "Failed to connect
+    to bus" on camera. The box is now built with systemd as init."""
+    studio = (DEMO / "studio.sh").read_text()
+    assert "sleep infinity" not in studio and "start-dockerd" not in studio
+    assert 'CMD ["/sbin/init"]' in studio and "STOPSIGNAL SIGRTMIN+3" in studio
+    assert "systemd systemd-sysv" in studio and "systemctl enable docker" in studio
+    run = studio.split("docker run -d --name \"$BOX\"", 1)[1].split(">/dev/null", 1)[0]
+    assert "--tmpfs /run --tmpfs /run/lock" in run and "--cgroupns=private" in run and '"$BOX_IMAGE"' in run
+    # Docker as a unit uses the containerd.io service, whose snapshots cannot sit
+    # on the box's overlay rootfs: a volume for /var/lib/containerd too (take 8)
+    assert '-v "$CONTAINERD_VOL":/var/lib/containerd' in run
+    down = studio.split("cmd_down() {", 1)[1].split("\n}\n", 1)[0]
+    assert '"$CONTAINERD_VOL"' in down, "down must remove the containerd volume with the image volume"
+    assert "box_wait_booted" in studio and "systemctl is-system-running" in studio
+    # a tmpfs systemd mounts on /tmp inside the box is invisible to `docker cp`,
+    # which collects the recorder's logs from /tmp/demo: tmp.mount stays masked
+    assert "tmp.mount" in studio.split("systemctl mask", 1)[1].split("\n", 1)[0]
+    assert "--tmpfs /tmp" not in studio
+    # the recorder's fallback starts the unit, not a hand-rolled daemon
+    assert "systemctl start docker" in studio
+    assert "useradd -m -s /bin/bash you" in studio and "usermod -aG docker you" in studio
+
+
+def test_the_box_has_a_user_session_and_the_take_can_pin_a_release():
+    """After #400, `noo onboard --ci` installs noo-hostd as a USER unit when
+    sudo is passwordless. A `docker exec` shell has no user manager, so the box
+    lingers `you` at boot (logind on, not masked) and the film shell carries
+    XDG_RUNTIME_DIR and the session bus, as pam_systemd gives a real login.
+    NOO_DEMO_CLI_VERSION pins the install on screen (an rc under test)."""
+    studio = (DEMO / "studio.sh").read_text()
+    assert "systemd-logind" not in studio.split("systemctl mask", 1)[1].split("\n", 1)[0], "logind must run: linger needs it"
+    assert "/var/lib/systemd/linger/you" in studio
+    assert 'systemctl is-active "user@' in studio
+    assert "NOO_DEMO_CLI_VERSION" in studio
+    rec = (DEMO / "record-onboarding.sh").read_text()
+    assert "-e XDG_RUNTIME_DIR=/run/user/$BOX_UID -e DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$BOX_UID/bus" in rec
+    assert 'INSTALL_SH="NOO_CLI_VERSION=$NOO_DEMO_CLI_VERSION sh"' in rec and "@INSTALL_SH@" in rec
+    tape = (DEMO / "onboarding.tape.in").read_text()
+    assert 'Type "curl -fsSL @INSTALL_URL@ | @INSTALL_SH@" Enter' in tape
+
+
+def leak_literals(text: str, host: str = "mybox", extra: str = "") -> set[str]:
+    r = subprocess.run([BASH, str(DEMO / "leak-literals.sh"), host, extra], input=text, text=True, capture_output=True, check=True)
+    out = {}
+    for line in r.stdout.splitlines():
+        if line:
+            tag, _, lit = line.partition("\t")
+            out[lit] = tag
+    return set(out)
+
+
+def leak_tags(text: str, host: str = "mybox") -> dict[str, str]:
+    r = subprocess.run([BASH, str(DEMO / "leak-literals.sh"), host, ""], input=text, text=True, capture_output=True, check=True)
+    return {l.partition("\t")[2]: l.partition("\t")[0] for l in r.stdout.splitlines() if l}
+
+
+@needs_bash
+def test_the_leak_literals_are_the_maskers_shapes_not_sentences():
+    """Take 10 (2026-10-25) was deleted because the leak check read
+    "sudo needs no password here" as `password <value>` and flagged "here".
+    The extractor now mirrors the masker: a secret has a `:` or `=` after
+    its label (optionally "is"); a sentence with the word in it does not."""
+    assert leak_literals("noo-hostd: no terminal, but sudo needs no password here — installing it") == set()
+    assert leak_literals("needs sudo and a terminal; the password prompt waits") == set()
+    assert leak_literals("Admin password: hunter2xyz\n") == {"hunter2xyz"}
+    assert leak_literals("NOO_API_KEY=abc123def") == {"abc123def"}
+    assert leak_literals("the token is: eyJhbGci.x.y") == {"eyJhbGci.x.y"}
+    assert leak_literals("the token is eyJhbGci.x.y") == set(), "no separator: the masker leaves it too, so flagging it only deletes good takes"
+    assert leak_literals("password: ********") == set(), "an already-masked value is not a leak"
+    # the other rules are unchanged: addresses, the fleet's names, token shapes, tailnet names, e-mail
+    got = leak_literals("agent at 10.1.2.3 and host3 and mybox, ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ, alice@mail.test, box.tail1234.ts.net", host="MyBox")
+    assert {"10.1.2.3", "host3", "mybox", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ", "alice@mail.test", "box.tail1234.ts.net"} <= got, got
+    assert leak_literals("127.0.0.1 192.0.2.7 you@example.com node-1 you server") == set()
+    rec = (DEMO / "record-onboarding.sh").read_text()
+    assert 'leak-literals.sh" "$host" "${NOO_DEMO_MASK_NAMES:-}" < "$raw"' in rec, "leak_check must read the one extractor"
+
+
+@needs_bash
+def test_take_eleven_s_false_leaks_and_the_report_names_kinds_not_values():
+    """Take 11 (2026-10-25): three "leaks", two of them "Secrets: 9 present"
+    (a count; and a one-digit secret is found in any version string) and
+    "Node-1" (the masker's own stand-in, capitalised in a cluster-verify
+    header). A label value shorter than 6 characters is not a secret, a
+    stand-in is never a leak whatever its case, and the LEAK report says
+    what kind and how long, never the value."""
+    assert leak_literals("  Secrets: 9 present") == set()
+    assert leak_literals("  Secrets: 24 values from secrets/env.sops") == set()
+    assert leak_literals("# Node Node-1\nNODE-1 is up\nYou and Server") == set()
+    assert leak_tags("password: hunter2xyz and 10.1.2.3 and host3") == {"hunter2xyz": "label", "10.1.2.3": "ip", "host3": "name"}
+    rec = (DEMO / "record-onboarding.sh").read_text()
+    assert "report=\"$report  - $tag (${#lit} chars)" in rec, "the LEAK report lists kind and length"
+    assert "NOO_DEMO_KEEP_ON_LEAK" in rec and 'masked.LEAK.log' in rec
+
+
+def test_every_recorder_knob_reaches_the_recorder_container():
+    """The recorder runs in its own container: a knob the studio does not pass
+    is silently off. Take 12 (2026-10-25) set NOO_DEMO_KEEP_ON_LEAK=1 and lost
+    the transcript anyway, because only three knobs were passed."""
+    studio = (DEMO / "studio.sh").read_text()
+    passed = re.search(r"for v in ((?:NOO_DEMO_[A-Z_]+ ?)+); do", studio).group(1).split()
+    rec = (DEMO / "record-onboarding.sh").read_text()
+    used = set(re.findall(r"NOO_DEMO_(?!BOX\b|SANDBOX\b|HOSTNAME\b|MASK\b)[A-Z_]+", rec))
+    assert used <= set(passed), f"recorder knobs the studio never passes: {sorted(used - set(passed))}"
+
+
+def test_record_down_after_removes_the_box_whatever_the_recorder_returned():
+    """Take 12's box stayed up for 35 hours on a shared host after the
+    session that started it went idle. `record --down-after` takes the box
+    down when the recorder exits, pass or fail, and still returns the
+    recorder's status; the flag never reaches the recorder."""
+    studio = (DEMO / "studio.sh").read_text()
+    body = studio.split("cmd_record() {", 1)[1].split("\n}\n", 1)[0]
+    assert "--down-after) down_after=1" in body and 'set -- "${args[@]}"' in body, "the flag is stripped before the recorder sees it"
+    assert "local rc=$?" in body and body.index("local rc=$?") < body.index("cmd_down") < body.index('return "$rc"')
+    assert "--down-after" in studio.split("record [--smoke]", 1)[1].split("\n", 1)[0], "the usage line names it"
+
+@needs_bash
+def test_an_environment_variable_name_after_a_secret_label_is_not_a_secret():
+    """Take 13 (2026-10-26): "noo-apply: secrets in … moved to files under …:
+    NOO_NODE_AGENT_TOKEN" gave a 20-char `label` literal, which (matched
+    case-insensitively) is also in Compose's own "secrets.noo_node_agent_token"
+    warning text in the masked output. A name is not a value."""
+    assert leak_literals("noo-apply: secrets in /etc/x moved to files under /etc/y: NOO_NODE_AGENT_TOKEN NOO_CLUSTER_SECRET") == set()
+    assert leak_literals("api key: ABCDEF1234567890") == {"ABCDEF1234567890"}, "all-caps without an underscore is still a value"
+    assert leak_literals("token: abc_DEF_ghi_jkl_mno") == {"abc_DEF_ghi_jkl_mno"}, "mixed case with underscores is still a value"

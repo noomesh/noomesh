@@ -21,7 +21,7 @@ use serde_json::json;
 
 use crate::measured::{put_into, Measured};
 use crate::state::AppState;
-use crate::worker_client;
+use crate::trellion_client::{subjects, TrellionClient};
 use super::AppResult;
 use super::delegation::{delegate_get, delegate_post};
 
@@ -37,26 +37,26 @@ pub fn router() -> Router<Arc<AppState>> {
         // `worker.recall.*` NATS subject (Trellion's VideoMemoryManager
         // owns storage layout + lifecycle policy).
         .route("/api/v1/recall/status",            get(recall_status))
-        .route("/api/v1/recall/search",            post(delegate_post("worker.recall.search")))
-        .route("/api/v1/recall/archive",           post(delegate_post("worker.recall.archive")))
-        .route("/api/v1/recall/videos",            get(delegate_get("worker.recall.videos")))
-        .route("/api/v1/recall/archive-status",    get(delegate_get("worker.recall.archive_status")))
-        .route("/api/v1/recall/lifecycle",         post(delegate_post("worker.recall.lifecycle")))
-        .route("/api/v1/recall/lifecycle-stats",   get(delegate_get("worker.recall.lifecycle_stats")))
-        .route("/api/v1/recall/refresh",           post(delegate_post("worker.recall.refresh")))
-        .route("/api/v1/recall/lifecycle-preview", get(delegate_get("worker.recall.lifecycle_preview")))
-        .route("/api/v1/recall/prominent",         get(delegate_get("worker.recall.prominent")))
+        .route("/api/v1/recall/search",            post(delegate_post(subjects::RECALL_SEARCH)))
+        .route("/api/v1/recall/archive",           post(delegate_post(subjects::RECALL_ARCHIVE)))
+        .route("/api/v1/recall/videos",            get(delegate_get(subjects::RECALL_VIDEOS)))
+        .route("/api/v1/recall/archive-status",    get(delegate_get(subjects::RECALL_ARCHIVE_STATUS)))
+        .route("/api/v1/recall/lifecycle",         post(delegate_post(subjects::RECALL_LIFECYCLE)))
+        .route("/api/v1/recall/lifecycle-stats",   get(delegate_get(subjects::RECALL_LIFECYCLE_STATS)))
+        .route("/api/v1/recall/refresh",           post(delegate_post(subjects::RECALL_REFRESH)))
+        .route("/api/v1/recall/lifecycle-preview", get(delegate_get(subjects::RECALL_LIFECYCLE_PREVIEW)))
+        .route("/api/v1/recall/prominent",         get(delegate_get(subjects::RECALL_PROMINENT)))
         // Deprecated aliases — removed in the release after 0.6.0.
         .route("/api/v1/video-memory/status",            get(recall_status))
-        .route("/api/v1/video-memory/search",            post(delegate_post("worker.recall.search")))
-        .route("/api/v1/video-memory/archive",           post(delegate_post("worker.recall.archive")))
-        .route("/api/v1/video-memory/videos",            get(delegate_get("worker.recall.videos")))
-        .route("/api/v1/video-memory/archive-status",    get(delegate_get("worker.recall.archive_status")))
-        .route("/api/v1/video-memory/lifecycle",         post(delegate_post("worker.recall.lifecycle")))
-        .route("/api/v1/video-memory/lifecycle-stats",   get(delegate_get("worker.recall.lifecycle_stats")))
-        .route("/api/v1/video-memory/refresh",           post(delegate_post("worker.recall.refresh")))
-        .route("/api/v1/video-memory/lifecycle-preview", get(delegate_get("worker.recall.lifecycle_preview")))
-        .route("/api/v1/video-memory/prominent",         get(delegate_get("worker.recall.prominent")))
+        .route("/api/v1/video-memory/search",            post(delegate_post(subjects::RECALL_SEARCH)))
+        .route("/api/v1/video-memory/archive",           post(delegate_post(subjects::RECALL_ARCHIVE)))
+        .route("/api/v1/video-memory/videos",            get(delegate_get(subjects::RECALL_VIDEOS)))
+        .route("/api/v1/video-memory/archive-status",    get(delegate_get(subjects::RECALL_ARCHIVE_STATUS)))
+        .route("/api/v1/video-memory/lifecycle",         post(delegate_post(subjects::RECALL_LIFECYCLE)))
+        .route("/api/v1/video-memory/lifecycle-stats",   get(delegate_get(subjects::RECALL_LIFECYCLE_STATS)))
+        .route("/api/v1/video-memory/refresh",           post(delegate_post(subjects::RECALL_REFRESH)))
+        .route("/api/v1/video-memory/lifecycle-preview", get(delegate_get(subjects::RECALL_LIFECYCLE_PREVIEW)))
+        .route("/api/v1/video-memory/prominent",         get(delegate_get(subjects::RECALL_PROMINENT)))
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -75,7 +75,7 @@ pub fn router() -> Router<Arc<AppState>> {
 async fn recall_status(
     State(state): State<Arc<AppState>>,
 ) -> AppResult {
-    let resp = worker_client::request(&state.nats, "worker.recall.status", &json!({})).await;
+    let resp = TrellionClient::new(&state.nats).call_raw(subjects::RECALL_STATUS, json!({})).await;
 
     match resp {
         Ok(v) => {

@@ -68,9 +68,9 @@
 //! without `--jinja` cannot take a CLI's tool calls, so there is nothing to
 //! fall back to).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use axum::body::{Body, Bytes};
@@ -101,6 +101,17 @@ pub struct UsageTotals {
     pub calls: u32,
     /// The models the replies named, distinct, in first-seen order.
     pub models: Vec<String>,
+    /// The first metered call's prompt tokens: what the CLI sends before it
+    /// has done anything, its floor on this model (i226 phase B).
+    #[serde(default)]
+    pub first_prompt_tokens: Option<u64>,
+    /// The largest single call's prompt tokens.
+    #[serde(default)]
+    pub max_prompt_tokens: u64,
+    /// The tools the model asked the CLI to run, distinct, in first-seen
+    /// order: what a failed turn may have done (i233).
+    #[serde(default)]
+    pub tools_called: Vec<String>,
 }
 
 /// One request the translator answered, as `noo-gateway harness probe`
@@ -111,6 +122,10 @@ pub struct RouteHit {
     pub method: String,
     pub path: String,
     pub status: u16,
+    /// The request's `Content-Length`, when it sent one: in mock mode the
+    /// only measure of how much the CLI sent (the mock's usage is canned).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_bytes: Option<u64>,
 }
 
 /// The backend's wire, as far as the translator is concerned.
@@ -120,8 +135,44 @@ enum Wire {
     Ollama,
 }
 
+/// When the CLI last reached the model through this translator: a request
+/// arriving or a reply metered. The driver reads [`Activity::idle`] to tell
+/// a CLI that is working from one that is hung (i233): a vendor CLI prints
+/// nothing until it is done, so its stdout says nothing, but every model
+/// call passes here.
+pub struct Activity {
+    started: Instant,
+    last_ms: AtomicU64,
+}
+
+impl Activity {
+    pub fn new() -> Self {
+        Self { started: Instant::now(), last_ms: AtomicU64::new(0) }
+    }
+
+    /// Something happened on the wire just now.
+    pub fn touch(&self) {
+        let ms = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        self.last_ms.fetch_max(ms, Ordering::Relaxed);
+    }
+
+    /// How long since the last request or reply; since the translator
+    /// started when there has been none.
+    pub fn idle(&self) -> Duration {
+        let last = Duration::from_millis(self.last_ms.load(Ordering::Relaxed));
+        self.started.elapsed().saturating_sub(last)
+    }
+}
+
+impl Default for Activity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct Shared {
     upstream: ResolvedBackend,
+    activity: Arc<Activity>,
     wire: Wire,
     client: reqwest::Client,
     /// For streamed upstream replies: no total timeout, an idle bound.
@@ -134,16 +185,44 @@ struct Shared {
     logged_dropped: AtomicBool,
     /// The probe's request log (`start_logged`); `None` in production.
     route_log: Option<Mutex<Vec<RouteHit>>>,
+    /// Where the model's text goes as it streams ([`Translator::tap`]): a
+    /// chat turn shows it as the harness working (i278 phase D).
+    tap: Mutex<Option<mpsc::UnboundedSender<String>>>,
 }
 
 impl Shared {
+    /// Hand the model's text to the tap, if one is set.
+    fn tap_send(&self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        let mut t = self.tap.lock().unwrap_or_else(|p| p.into_inner());
+        if t.as_ref().is_some_and(|tx| tx.send(text).is_err()) {
+            *t = None;
+        }
+    }
+
+    /// Note the tools a message or chunk delta asks for.
+    fn note_tools(&self, m: &Value) {
+        let Some(calls) = m.get("tool_calls").and_then(Value::as_array) else { return };
+        let mut u = self.usage.lock().unwrap_or_else(|p| p.into_inner());
+        for name in calls.iter().filter_map(|c| c.pointer("/function/name").and_then(Value::as_str)).filter(|n| !n.is_empty()) {
+            if !u.tools_called.iter().any(|t| t == name) {
+                u.tools_called.push(name.to_string());
+            }
+        }
+    }
+
     /// Count one answered call. `usage` is (prompt, completion, total).
     fn meter(&self, model: Option<&str>, usage: Option<(u64, u64, u64)>) {
         let model = model.filter(|m| !m.is_empty()).unwrap_or(&self.upstream.model).to_string();
+        self.activity.touch();
         let mut u = self.usage.lock().unwrap_or_else(|p| p.into_inner());
         u.calls = u.calls.saturating_add(1);
         match usage {
             Some((p, c, t)) => {
+                u.first_prompt_tokens.get_or_insert(p);
+                u.max_prompt_tokens = u.max_prompt_tokens.max(p);
                 u.prompt_tokens += p;
                 u.completion_tokens += c;
                 u.total_tokens += if t == 0 { p + c } else { t };
@@ -219,6 +298,7 @@ impl Translator {
         };
         let shared = Arc::new(Shared {
             upstream,
+            activity: Arc::new(Activity::new()),
             wire,
             client: crate::tls::cluster_client(),
             stream_client: crate::tls::cluster_stream_client(),
@@ -228,6 +308,7 @@ impl Translator {
             logged_no_usage: AtomicBool::new(false),
             logged_dropped: AtomicBool::new(false),
             route_log: log_routes.then(|| Mutex::new(Vec::new())),
+            tap: Mutex::new(None),
         });
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let addr = listener.local_addr()?;
@@ -251,6 +332,20 @@ impl Translator {
     /// e.g. "http://127.0.0.1:41234" — what the CLI's base-URL env gets.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// The model's text as it arrives (reasoning and answer, every call the
+    /// CLI makes), from now on. One tap per translator: a second call
+    /// replaces the first.
+    pub fn tap(&self) -> mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.shared.tap.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
+        rx
+    }
+
+    /// The wire's activity clock, for the driver's stall bound.
+    pub fn activity(&self) -> Arc<Activity> {
+        self.shared.activity.clone()
     }
 
     /// Snapshot of everything counted so far.
@@ -298,15 +393,21 @@ fn router(shared: Arc<Shared>) -> Router {
         .with_state(shared)
 }
 
-/// Records method, path and status when the probe asked for a log; a no-op
-/// pass-through otherwise.
+/// Marks the wire active on every request (the driver's stall clock), and
+/// records method, path and status when the probe asked for a log.
 async fn log_route(State(sh): State<Arc<Shared>>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    sh.activity.touch();
     let Some(log) = sh.route_log.as_ref() else {
         return next.run(req).await;
     };
     let (method, path) = (req.method().to_string(), req.uri().path().to_string());
+    let request_bytes = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
     let resp = next.run(req).await;
-    log.lock().unwrap_or_else(|p| p.into_inner()).push(RouteHit { method, path, status: resp.status().as_u16() });
+    log.lock().unwrap_or_else(|p| p.into_inner()).push(RouteHit { method, path, status: resp.status().as_u16(), request_bytes });
     resp
 }
 
@@ -428,11 +529,24 @@ async fn complete(sh: &Arc<Shared>, mut body: Value) -> Result<Reply, (u16, Stri
         };
         let usage = v.get("usage").filter(|u| u.is_object()).map(anthropic_wire::usage_tokens);
         sh.meter(v.get("model").and_then(|m| m.as_str()), usage);
+        if let Some(m) = v.pointer("/choices/0/message") {
+            sh.tap_send(model_text(m));
+            sh.note_tools(m);
+        }
         return Ok(Reply::Whole(v));
     }
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(pump(sh.clone(), resp, tx));
     Ok(Reply::Chunks(rx))
+}
+
+/// The text in an OpenAI message or chunk delta: reasoning (vLLM's
+/// `reasoning_content`, or `reasoning`) then content.
+fn model_text(m: &Value) -> String {
+    ["reasoning_content", "reasoning", "content"]
+        .iter()
+        .filter_map(|k| m.get(*k).and_then(Value::as_str))
+        .collect()
 }
 
 /// Read a streamed reply line by line, turn each line into OpenAI chunks,
@@ -493,6 +607,10 @@ async fn pump(sh: Arc<Shared>, resp: reqwest::Response, tx: mpsc::Sender<Result<
                 }
                 if model.is_none() {
                     model = v.get("model").and_then(|m| m.as_str()).map(str::to_string);
+                }
+                if let Some(d) = v.pointer("/choices/0/delta") {
+                    sh.tap_send(model_text(d));
+                    sh.note_tools(d);
                 }
                 if tx.send(Ok(v)).await.is_err() {
                     break 'read;
@@ -976,6 +1094,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_tap_sees_the_models_text_as_it_streams() {
+        let m = mock().await;
+        let t = Translator::start(backend(&m.url, "openai")).await.unwrap();
+        let mut rx = t.tap();
+        let url = format!("{}/v1/chat/completions", t.base_url());
+        let c = client();
+        let resp = c.post(&url).json(&json!({"stream": true, "messages": [{"role": "user", "content": "hi"}]})).send().await.unwrap();
+        resp.text().await.unwrap();
+        c.post(&url).json(&json!({"messages": [{"role": "user", "content": "hi"}]})).send().await.unwrap().text().await.unwrap();
+        let mut seen = Vec::new();
+        while let Ok(x) = rx.try_recv() {
+            seen.push(x);
+        }
+        assert_eq!(seen, ["Hel", "lo", "hello"], "each streamed delta, then a whole reply's content");
+        assert_eq!(model_text(&json!({"reasoning_content": "think ", "content": "say"})), "think say");
+        t.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn chat_completions_pass_through_with_the_pinned_model_and_are_metered() {
         let m = mock().await;
         let t = Translator::start(backend(&m.url, "openai")).await.unwrap();
@@ -1007,6 +1144,21 @@ mod tests {
         let u = t.usage();
         assert_eq!((u.calls, u.prompt_tokens, u.completion_tokens, u.total_tokens), (3, 30, 15, 45));
         assert_eq!(u.models, vec!["qwen-pinned".to_string()]);
+        t.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_tools_the_model_asked_for_are_recorded() {
+        let m = mock().await;
+        let t = Translator::start(backend(&m.url, "openai")).await.unwrap();
+        let url = format!("{}/v1/chat/completions", t.base_url());
+        let c = client();
+        let tools = json!([{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]);
+        let body = |stream: bool| json!({"stream": stream, "tools": tools, "messages": [{"role": "user", "content": "read a.txt"}]});
+        c.post(&url).json(&body(true)).send().await.unwrap().text().await.unwrap();
+        c.post(&url).json(&body(false)).send().await.unwrap().text().await.unwrap();
+        c.post(&url).json(&json!({"messages": [{"role": "user", "content": "hi"}]})).send().await.unwrap().text().await.unwrap();
+        assert_eq!(t.usage().tools_called, vec!["read_file".to_string()], "streamed and whole, once, and none for a plain reply");
         t.shutdown().await;
     }
 

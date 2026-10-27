@@ -211,51 +211,57 @@ services:
     # value, so an optional secret that is unset stays unset.
     # tests/test_compose_secret_files.py (G1/G2) pins both halves.
     secrets:
-      - { source: noo_jwt_secret, target: noo_jwt_secret, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_cluster_secret, target: noo_cluster_secret, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_controller_secret, target: noo_controller_secret, uid: "65532", gid: "65532", mode: 0400 }
+      # x-noo-uid: the uid this service runs as, which is the uid the launcher
+      # hands the secret FILE to on the host (scripts/lib-secrets.sh, 0400; the
+      # compose file is the one home of that fact). Not compose's own
+      # uid/gid/mode: those apply in Swarm only, and Compose v5 says so on
+      # every start, three lines per secret per service (960 lines in one
+      # `noo onboard`, 2026-10-24). They never set a mode here; the host file does.
+      - { source: noo_jwt_secret, target: noo_jwt_secret, x-noo-uid: "65532" }
+      - { source: noo_cluster_secret, target: noo_cluster_secret, x-noo-uid: "65532" }
+      - { source: noo_controller_secret, target: noo_controller_secret, x-noo-uid: "65532" }
       # The browser container's door key: the gateway signs
       # its browser-route calls with it and hands it to the browser
       # containers it starts on nodes.
-      - { source: noo_browser_key, target: noo_browser_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_browser_key, target: noo_browser_key, x-noo-uid: "65532" }
       # Every bus-principal audience key: the gateway is
       # the one signer, so it holds all three; each verifier below holds
       # only its own (gateway-rust/src/bus_principal.rs AUDIENCES).
-      - { source: noo_bus_key_worker, target: noo_bus_key_worker, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_bus_key_trellion, target: noo_bus_key_trellion, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_bus_key_trellion_intel, target: noo_bus_key_trellion_intel, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_node_agent_token, target: noo_node_agent_token, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_admin_password, target: noo_admin_password, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_audit_hmac_key, target: noo_audit_hmac_key, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: redis_password, target: redis_password, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_tailscale_oauth_client_secret, target: noo_tailscale_oauth_client_secret, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_tailscale_api_key, target: noo_tailscale_api_key, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_agent_review_key, target: noo_agent_review_key, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_agent_signing_key, target: noo_agent_signing_key, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_jwt_signing_key, target: noo_jwt_signing_key, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_entitlement, target: noo_entitlement, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_app_db_password, target: noo_app_db_password, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_evolve_db_password, target: noo_evolve_db_password, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_evolve_ddl_password, target: noo_evolve_ddl_password, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_trellion_db_password, target: noo_trellion_db_password, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_trellion_ddl_password, target: noo_trellion_ddl_password, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_bus_key_worker, target: noo_bus_key_worker, x-noo-uid: "65532" }
+      - { source: noo_bus_key_trellion, target: noo_bus_key_trellion, x-noo-uid: "65532" }
+      - { source: noo_bus_key_trellion_intel, target: noo_bus_key_trellion_intel, x-noo-uid: "65532" }
+      - { source: noo_node_agent_token, target: noo_node_agent_token, x-noo-uid: "65532" }
+      - { source: noo_admin_password, target: noo_admin_password, x-noo-uid: "65532" }
+      - { source: noo_audit_hmac_key, target: noo_audit_hmac_key, x-noo-uid: "65532" }
+      - { source: redis_password, target: redis_password, x-noo-uid: "65532" }
+      - { source: noo_tailscale_oauth_client_secret, target: noo_tailscale_oauth_client_secret, x-noo-uid: "65532" }
+      - { source: noo_tailscale_api_key, target: noo_tailscale_api_key, x-noo-uid: "65532" }
+      - { source: noo_agent_review_key, target: noo_agent_review_key, x-noo-uid: "65532" }
+      - { source: noo_agent_signing_key, target: noo_agent_signing_key, x-noo-uid: "65532" }
+      - { source: noo_jwt_signing_key, target: noo_jwt_signing_key, x-noo-uid: "65532" }
+      - { source: noo_entitlement, target: noo_entitlement, x-noo-uid: "65532" }
+      - { source: noo_app_db_password, target: noo_app_db_password, x-noo-uid: "65532" }
+      - { source: noo_evolve_db_password, target: noo_evolve_db_password, x-noo-uid: "65532" }
+      - { source: noo_evolve_ddl_password, target: noo_evolve_ddl_password, x-noo-uid: "65532" }
+      - { source: noo_trellion_db_password, target: noo_trellion_db_password, x-noo-uid: "65532" }
+      - { source: noo_trellion_ddl_password, target: noo_trellion_ddl_password, x-noo-uid: "65532" }
       # Every declared system's flag and role passwords that no line here
       # names (a system core does not know): ONE KEY=VALUE file the launcher
       # builds from the declared systems (lib-secrets.sh _systems_secrets_body).
-      - { source: noo_systems_secrets, target: noo_systems_secrets, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: nats_gateway_password, target: nats_gateway_password, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: pgpass_gateway, target: pgpass, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_systems_secrets, target: noo_systems_secrets, x-noo-uid: "65532" }
+      - { source: nats_gateway_password, target: nats_gateway_password, x-noo-uid: "65532" }
+      - { source: pgpass_gateway, target: pgpass, x-noo-uid: "65532" }
       # Tier-2 provider and channel credentials — the
       # same delivery; `secret_env` reads each through its `<NAME>_FILE`.
-      - { source: anthropic_api_key, target: anthropic_api_key, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: openai_api_key, target: openai_api_key, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: google_api_key, target: google_api_key, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: tavily_api_key, target: tavily_api_key, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: brave_search_api_key, target: brave_search_api_key, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: telegram_bot_token, target: telegram_bot_token, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: whatsapp_token, target: whatsapp_token, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: google_chat_bearer_token, target: google_chat_bearer_token, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: google_chat_credentials_json, target: google_chat_credentials_json, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: anthropic_api_key, target: anthropic_api_key, x-noo-uid: "65532" }
+      - { source: openai_api_key, target: openai_api_key, x-noo-uid: "65532" }
+      - { source: google_api_key, target: google_api_key, x-noo-uid: "65532" }
+      - { source: tavily_api_key, target: tavily_api_key, x-noo-uid: "65532" }
+      - { source: brave_search_api_key, target: brave_search_api_key, x-noo-uid: "65532" }
+      - { source: telegram_bot_token, target: telegram_bot_token, x-noo-uid: "65532" }
+      - { source: whatsapp_token, target: whatsapp_token, x-noo-uid: "65532" }
+      - { source: google_chat_bearer_token, target: google_chat_bearer_token, x-noo-uid: "65532" }
+      - { source: google_chat_credentials_json, target: google_chat_credentials_json, x-noo-uid: "65532" }
     environment:
       # Add-on UI origin ports (see `ports:` above) and, optionally, the
       # console origin(s) allowed to frame an add-on UI (CSP frame-ancestors);
@@ -839,15 +845,21 @@ services:
       # (see node-agent-go/internal/hostd). The gateway drops JSON command
       # files here; the host daemon performs all docker/compose operations.
       - ./.noo-host-spool:/var/run/noo-spool:rw
-      # Add-on bundle declarations (i163 E/B): `<addon>/system.json` and
-      # `<addon>/workloads.json` from each add-on's SIGNED bundle, copied by
-      # the launcher (lib-addons.sh addon_decls_materialise) only for add-ons
-      # switched on whose lock it verified this start. Read-only, like the
-      # route manifests; gateway-rust/src/addon_decls.rs validates them again.
-      # The launcher (and `noo config launch-check bind-sources`) creates
-      # both directories as the operator, never Docker's root.
+      # Add-on bundle declarations (i163 E/B): `<addon>/system.json`,
+      # `<addon>/workloads.json` and `<addon>/routes.json` from each add-on's
+      # SIGNED bundle, copied by the launcher (lib-dist.sh
+      # addon_decls_materialise) only for add-ons switched on whose lock it
+      # verified this start, and only the files that lock lists. Read-only;
+      # gateway-rust/src/addon_decls.rs and addon_proxy.rs validate them
+      # again. The route manifests land beside, not under, the older
+      # /opt/noo/addon-routes, where a shipped add-on's own overlay may still
+      # mount a volume per add-on; the gateway reads this directory first, so
+      # the signed copy wins. The launcher (and `noo config launch-check
+      # bind-sources`) creates the directories as the operator, never
+      # Docker's root.
       - ./.noo-addon-systems:/opt/noo/addon-systems:ro
       - ./.noo-addon-workloads:/opt/noo/addon-workloads:ro
+      - ./.noo-addon-routes:/opt/noo/addon-bundle-routes:ro
       # REMOVED 2026-09-11: `.:/app/project:ro` put the WHOLE checkout —
       # secrets/, pki/, .env — inside this container. Nothing read it:
       # the image WORKDIR is /app, no source references /app/project, and
@@ -933,27 +945,27 @@ services:
     # image's `nonroot`; `noomesh.secret_env` reads each through its
     # `<NAME>_FILE` pointer below. Anchored so worker-extra gets the same set.
     secrets: &worker-secrets
-      - { source: redis_password, target: redis_password, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: nats_worker_password, target: nats_worker_password, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: redis_password, target: redis_password, x-noo-uid: "65532" }
+      - { source: nats_worker_password, target: nats_worker_password, x-noo-uid: "65532" }
       # NOT noo_cluster_secret: the fleet secret is a node's
       # credential. The browser door, its one use here, has its own key.
-      - { source: noo_browser_key, target: noo_browser_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_browser_key, target: noo_browser_key, x-noo-uid: "65532" }
       # NOT noo_controller_secret: the worker verifies bus
       # principals with its OWN key, below, and signs nothing with it.
-      - { source: noo_bus_key_worker, target: noo_bus_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_bus_key_worker, target: noo_bus_key, x-noo-uid: "65532" }
       # NOT noo_jwt_secret: the worker acts as a user with
       # the per-dispatch token the gateway mints (worker_delegation.rs) and
       # holds no login signing secret. tests/test_jwt_secret_gateway_only.py.
-      - { source: noo_audit_hmac_key, target: noo_audit_hmac_key, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_svc_key_worker, target: noo_gateway_key, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: pgpass_worker, target: pgpass, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_audit_hmac_key, target: noo_audit_hmac_key, x-noo-uid: "65532" }
+      - { source: noo_svc_key_worker, target: noo_gateway_key, x-noo-uid: "65532" }
+      - { source: pgpass_worker, target: pgpass, x-noo-uid: "65532" }
       # Channel credentials. The worker reads them only to
       # answer "is this channel configured?" (channels/gateway_client.py);
       # sends go through the gateway.
-      - { source: telegram_bot_token, target: telegram_bot_token, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: whatsapp_token, target: whatsapp_token, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: google_chat_bearer_token, target: google_chat_bearer_token, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: google_chat_credentials_json, target: google_chat_credentials_json, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: telegram_bot_token, target: telegram_bot_token, x-noo-uid: "65532" }
+      - { source: whatsapp_token, target: whatsapp_token, x-noo-uid: "65532" }
+      - { source: google_chat_bearer_token, target: google_chat_bearer_token, x-noo-uid: "65532" }
+      - { source: google_chat_credentials_json, target: google_chat_credentials_json, x-noo-uid: "65532" }
     # Same hardening as the gateway (anchored: worker-extra gets it too):
     # no capability, no privilege gain, READ-ONLY root filesystem (i132).
     # uid 65532, listens on 8090. Measured with `docker diff noo-worker`: the
@@ -1161,7 +1173,7 @@ services:
     # 0600 config from it. Empty store value → no file and no pointer → the
     # entrypoint refuses, exactly as an empty env did.
     secrets:
-      - { source: redis_password, target: redis_password, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: redis_password, target: redis_password, x-noo-uid: "65532" }
     environment:
       - REDIS_PASSWORD_FILE=${REDIS_PASSWORD:+/run/secrets/redis_password}
       - NOO_REDIS_TLS=${NOO_REDIS_TLS:-}
@@ -2044,9 +2056,9 @@ services:
     profiles: ["node-agent-compose"]
     secrets: &node-agent-secrets
       # The image runs as root (USER 0); 0400 root.
-      - { source: noo_node_agent_token, target: noo_node_agent_token, uid: "0", gid: "0", mode: 0400 }
-      - { source: noo_cluster_secret, target: noo_cluster_secret, uid: "0", gid: "0", mode: 0400 }
-      - { source: nats_node_password, target: nats_node_password, uid: "0", gid: "0", mode: 0400 }
+      - { source: noo_node_agent_token, target: noo_node_agent_token, x-noo-uid: "0" }
+      - { source: noo_cluster_secret, target: noo_cluster_secret, x-noo-uid: "0" }
+      - { source: nats_node_password, target: nats_node_password, x-noo-uid: "0" }
     ports:
       - "${NOO_BIND_ADDR:-0.0.0.0}:${NOO_PORT_NODE_AGENT:-8081}:8081"  # Control API (H-N5 — confine to tailnet via NOO_BIND_ADDR)
     environment:
@@ -2429,7 +2441,7 @@ services:
     # `grafana` is uid 65532 (tests/test_compose_named_users.py).
     user: grafana
     secrets:
-      - { source: grafana_admin_password, target: grafana_admin_password, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: grafana_admin_password, target: grafana_admin_password, x-noo-uid: "65532" }
     ports:
       # §3f R28. NOT NOO_BIND_ADDR, whose default is 0.0.0.0: Grafana is the
       # one service here with its own user database and its own login, and
@@ -2578,7 +2590,7 @@ services:
     # uid 0: the Playwright base image has no USER line, so the server runs
     # as root.
     secrets:
-      - { source: noo_browser_key, target: noo_browser_key, uid: "0", gid: "0", mode: 0400 }
+      - { source: noo_browser_key, target: noo_browser_key, x-noo-uid: "0" }
     environment:
       # Vendor telemetry off (docs/security/telemetry.md): huggingface_hub and
       # the libraries built on it honour these.
@@ -2845,7 +2857,7 @@ services:
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-postgres
     profiles: ["controller", "standalone"]
     secrets:
-      - { source: postgres_password, target: postgres_password, uid: "70", gid: "70", mode: 0400 }
+      - { source: postgres_password, target: postgres_password, x-noo-uid: "70" }
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-noomesh}
       POSTGRES_USER: ${POSTGRES_USER:-noo}
@@ -2867,6 +2879,9 @@ services:
       # below so the copy initdb writes into the data volume is never what
       # runs; tests/test_postgres_tls_only.py pins its content.
       - ./docker/postgres/pg_hba.conf:/etc/noo/pg_hba.conf:ro
+    # Docker's 64 MB /dev/shm default makes parallel hash/sort fail with
+    # "could not resize shared memory segment" once work_mem is raised.
+    shm_size: ${NOO_PG_SHM_SIZE:-1g}
     entrypoint: ["sh", "-c"]
     command:
       - |
@@ -2878,6 +2893,22 @@ services:
         # of exactly this gap).
         # Costs ~1-2% overhead and a fixed shared-memory allocation.
         ARGS="-c shared_preload_libraries=pg_stat_statements -c pg_stat_statements.track=top"
+        # Sizing. Stock defaults (work_mem 4MB, shared_buffers 128MB) made
+        # the controller spill sorts to temp files around the clock: ~130
+        # MB/s of writes for a week on a consumer NVMe, with no alert.
+        # Every value is env-overridable (docs: NOO_PG_*).
+        # work_mem is per sort/hash node per query, so keep it modest.
+        ARGS="$$ARGS -c work_mem=${NOO_PG_WORK_MEM:-32MB}"
+        ARGS="$$ARGS -c shared_buffers=${NOO_PG_SHARED_BUFFERS:-512MB}"
+        ARGS="$$ARGS -c maintenance_work_mem=${NOO_PG_MAINTENANCE_WORK_MEM:-256MB}"
+        # Planner hint only (no allocation): memory the OS cache can offer.
+        ARGS="$$ARGS -c effective_cache_size=${NOO_PG_EFFECTIVE_CACHE_SIZE:-2GB}"
+        # Log every temp file >= this size WITH its statement, so a spill is
+        # visible in `docker logs noo-postgres`. 0 logs all, -1 disables.
+        ARGS="$$ARGS -c log_temp_files=${NOO_PG_LOG_TEMP_FILES:-64MB}"
+        # Per-session cap on temp files: a runaway query errors instead of
+        # filling the disk. -1 removes the cap.
+        ARGS="$$ARGS -c temp_file_limit=${NOO_PG_TEMP_FILE_LIMIT:-4GB}"
         # TLS is not a switch. Until 2026-09-28 `ssl=on` hung on NOO_PG_TLS
         # being set AND the leaf existing, and an unset variable started a
         # plaintext server that the stock pg_hba then accepted every client

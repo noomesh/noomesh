@@ -116,6 +116,8 @@ func (a *AttachedContainer) Close() error {
 	if a.c == nil || a.ID == "" {
 		return nil
 	}
+	// Close takes no ctx (io.Closer shape) and must run after the caller's ctx
+	// is already cancelled, so this teardown is deliberately rooted.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	_, _ = a.c.docker.ContainerRemove(ctx, a.ID, client.ContainerRemoveOptions{Force: true})

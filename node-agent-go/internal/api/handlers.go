@@ -141,7 +141,7 @@ func (s *Server) handleStartBackend(w http.ResponseWriter, r *http.Request) {
 	//
 	// A backend served NATIVELY here is not ours to start. Reporting it and
 	// managing it are different claims, and this agent only makes the first.
-	if model, isNative := s.nativeBackends()[req.Backend]; isNative {
+	if model, isNative := s.nativeBackends(r.Context())[req.Backend]; isNative {
 		writeJSON(w, http.StatusNotImplemented, map[string]string{
 			"error":   "backend_runtime_unmanaged",
 			"backend": req.Backend,
@@ -214,7 +214,7 @@ func (s *Server) handleStartBackend(w http.ResponseWriter, r *http.Request) {
 	// the outcome is only logged, as before.
 	rep := ctrlrpc.ReporterFrom(r.Context())
 	go func() {
-		if err := s.docker.StartBackend(req.Backend, req.Model, gpuCount, overrides); err != nil {
+		if err := s.docker.StartBackend(r.Context(), req.Backend, req.Model, gpuCount, overrides); err != nil {
 			slog.Error("backend start failed", "backend", req.Backend, "error", err)
 			rep.Done(http.StatusInternalServerError, map[string]string{"status": "failed", "backend": req.Backend, "detail": err.Error()})
 		} else {
@@ -252,7 +252,7 @@ func (s *Server) handleStopBackend(w http.ResponseWriter, r *http.Request) {
 	// call reaches Docker, fails to find a container, and answers 500 with a
 	// daemon error — which reads as a broken node rather than the true
 	// answer, which is that the backend is not this agent's to stop.
-	if _, isNative := s.nativeBackends()[req.Backend]; isNative {
+	if _, isNative := s.nativeBackends(r.Context())[req.Backend]; isNative {
 		writeJSON(w, http.StatusNotImplemented, map[string]string{
 			"error":   "backend_runtime_unmanaged",
 			"backend": req.Backend,
@@ -269,7 +269,7 @@ func (s *Server) handleStopBackend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.docker.StopBackend(req.Backend); err != nil {
+	if err := s.docker.StopBackend(r.Context(), req.Backend); err != nil {
 		slog.Error("failed to stop backend", "backend", req.Backend, "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
 		return
@@ -293,6 +293,20 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
+// handleReconcile: POST /reconcile. Asks the reconciler for a pass now;
+// 202 when the nudge was taken (passes coalesce, so a repeat is harmless),
+// 503 before the reconciler is wired. It never waits for the pass: the
+// caller watches the node's reported state, as it does after a tick.
+func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
+	if s.reconcileNudge == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"detail": "reconciler not wired yet"})
+		return
+	}
+	s.reconcileNudge()
+	slog.Info("reconcile.nudged", "by", "controller")
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "nudged"})
+}
+
 func (s *Server) handleClean(w http.ResponseWriter, r *http.Request) {
 	if s.docker == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"detail": "Docker not available"})
@@ -304,14 +318,14 @@ func (s *Server) handleClean(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("clean requested", "remove_folder", req.RemoveFolder, "deep", req.Deep)
 
-	containersStopped, err := s.docker.StopAllPAIContainers()
+	containersStopped, err := s.docker.StopAllPAIContainers(r.Context())
 	if err != nil {
 		slog.Error("clean: stop containers failed", "error", err)
 	}
 
 	imagesRemoved := 0
 	if req.Deep {
-		imagesRemoved, err = s.docker.RemoveStackImages()
+		imagesRemoved, err = s.docker.RemoveStackImages(r.Context())
 		if err != nil {
 			slog.Error("clean: remove images failed", "error", err)
 		}
@@ -358,14 +372,21 @@ func (s *Server) handleGPUMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := map[string]any{
-		"available":                  true,
-		"node_id":                    s.cfg.NodeID,
-		"gpu_model":                  s.gpu.DetectModel(),
+		"available": true,
+		"node_id":   s.cfg.NodeID,
+		"gpu_model": s.gpu.DetectModel(),
+	}
+	// A field the probe could not read is absent, never 0.
+	for k, v := range map[string]*float64{
 		"gpu_utilization_percent":    metrics.GPUUtilizationPct,
 		"memory_utilization_percent": metrics.MemoryUtilizationPct,
 		"memory_used_mb":             metrics.MemoryUsedMB,
 		"memory_total_mb":            metrics.MemoryTotalMB,
 		"temperature_c":              metrics.TemperatureC,
+	} {
+		if v != nil {
+			resp[k] = *v
+		}
 	}
 	if metrics.PowerDrawW != nil {
 		resp["power_draw_w"] = *metrics.PowerDrawW
@@ -384,7 +405,7 @@ func (s *Server) handleListLogContainers(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusOK, []any{})
 		return
 	}
-	containers, err := s.docker.ListContainers()
+	containers, err := s.docker.ListContainers(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
 		return
@@ -457,7 +478,7 @@ func (s *Server) handleContainerLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	since := r.URL.Query().Get("since")
 
-	lines, err := s.docker.ContainerLogs(containerName, tail, since)
+	lines, err := s.docker.ContainerLogs(r.Context(), containerName, tail, since)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
 		return
@@ -474,7 +495,7 @@ func (s *Server) handleContainerStats(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, []any{})
 		return
 	}
-	stats := s.docker.AllContainerStats()
+	stats := s.docker.AllContainerStats(r.Context())
 	writeJSON(w, http.StatusOK, stats)
 }
 
@@ -514,7 +535,7 @@ func (s *Server) handleSkillRun(w http.ResponseWriter, r *http.Request) {
 		"files", len(req.Files),
 	)
 
-	result, err := s.docker.RunSkillContainer(req)
+	result, err := s.docker.RunSkillContainer(r.Context(), req)
 	if err != nil {
 		slog.Error("skill run failed", "container", req.ContainerName, "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{

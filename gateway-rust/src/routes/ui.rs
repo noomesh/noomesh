@@ -56,7 +56,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/docs/runbooks/{name}", get(runbook_get))
         // `/bootstrap-node.sh` (the pre-token enrollment lane, #114) is
         // gone: removed 2026-09-27 with the script. Enrollment is the pull
-        // rail — `noo cluster bootstrap-token create`, then `/bootstrap`.
+        // rail — `noo cluster bootstrap-token create`, then `noo enroll`.
 
         // ── Uploads: Native Rust (multipart → disk, ported from NATS 2026-03-31) ──
         .route("/upload", post(upload_file))

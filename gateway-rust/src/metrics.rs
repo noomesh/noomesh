@@ -370,18 +370,20 @@ pub async fn collect_db_gauges(db: &sqlx::PgPool) -> DbGauges {
         .await,
         conversations_total: scalar_count(db, "SELECT COUNT(*) FROM noo_conversations").await,
         entries_total: scalar_count(db, "SELECT COUNT(*) FROM noo_entries").await,
-        auth_failures_5m: scalar_count(
-            db,
-            "SELECT COUNT(*) FROM noo_security_audit \
-             WHERE event_type = 'auth_failure' AND timestamp > NOW() - INTERVAL '5 minutes'",
-        )
-        .await,
-        exec_denials_5m: scalar_count(
-            db,
-            "SELECT COUNT(*) FROM noo_security_audit \
-             WHERE event_type = 'exec_denied' AND timestamp > NOW() - INTERVAL '5 minutes'",
-        )
-        .await,
+        auth_failures_5m: audit_count_5m(db, "auth_failure").await,
+        exec_denials_5m: audit_count_5m(db, "exec_denied").await,
+    }
+}
+
+/// Audit rows of `event_type` in the last five minutes; `None` when the
+/// database cannot answer (same as [`scalar_count`]).
+async fn audit_count_5m(db: &sqlx::PgPool, event_type: &str) -> Option<i64> {
+    match crate::repo::audit::count_last_5m(db, event_type).await {
+        Ok(n) => Some(n),
+        Err(e) => {
+            tracing::debug!(event_type, error = %e, "metrics_db_scalar_failed");
+            None
+        }
     }
 }
 

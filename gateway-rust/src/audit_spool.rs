@@ -165,7 +165,7 @@ async fn write(db: &sqlx::PgPool, row: &Pending) -> Outcome {
     match row {
         Pending::Security { event_type, severity, actor, resource, outcome, details } => {
             let Some(key) = crate::audit_integrity::current_key() else { return Outcome::Lost };
-            crate::routes::core::write_audit_row_outcome(
+            crate::audit::write_audit_row_outcome(
                 db, &key, event_type, severity, actor, resource, outcome, details, None,
             )
             .await

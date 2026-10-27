@@ -631,7 +631,6 @@
   "/api/workflows/run",
   "/auth/logout",
   "/auth/refresh",
-  "/bootstrap",
   "/bootstrap/apply",
   "/bootstrap/bundle/{node}",
   "/bootstrap/bundle/{node}/applied",

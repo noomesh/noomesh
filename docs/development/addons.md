@@ -27,7 +27,7 @@ pretending otherwise would make both worse.
 | Layer | Where | What it decides |
 |---|---|---|
 | Declaration | `gateway-rust/src/addons.rs` — one `Addon` row (the add-ons that shipped with the stack); a third-party HTTP add-on is declared by the operator (`addons.<name>: true`) and registered at runtime | Is it supposed to be here? What flag, which polarity, which entitlement, what does a refusal say? |
-| Transport (HTTP) | your repo's route manifest, delivered to `/opt/noo/addon-routes/<name>/routes.json` | Which paths the gateway proxies to it (validated and mounted at startup) |
+| Transport (HTTP) | your repo's route manifest, shipped as `routes.json` in your signed bundle; the launcher hands it to the gateway | Which paths the gateway proxies to it (validated and mounted at startup) |
 | Transport (NATS) | a subject prefix, matched in `worker_client.rs` | Which subjects it answers |
 
 Pick HTTP if your add-on serves an API. Pick NATS if it answers worker
@@ -42,15 +42,16 @@ because everything else is something only you can keep true.
 | # | Artifact | Where | Why it is yours |
 |---|---|---|---|
 | 1 | The service | your `src/`, serving the declared paths + `/health` | — |
-| 2 | Route manifest | in your package and image (the example below: `src/example_addon/example-addon.routes.json`) | the gateway mounts your HTTP surface from it at runtime; the core names none of your routes |
+| 2 | Route manifest | in your repo (the example below: `src/example_addon/example-addon.routes.json`) | the gateway mounts your HTTP surface from it at runtime; the core names none of your routes |
 | 3 | Contract test | `tests/test_gateway_route_contract.py` | the gateway cannot tell whether you serve what your manifest declares; only you can |
-| 4 | Manifest delivery | a one-shot service in your overlay that writes the manifest into a volume the gateway mounts read-only (dev: bind-mount the file) | the manifest the gateway reads must be the one in the image beside it |
+| 4 | Manifest delivery | `routes.json` in your signed bundle (dev: beside your overlay); the launcher copies it for the gateway, your overlay touches no core service | the manifest the gateway reads must be the one you signed with the image it describes |
 | 5 | CI that runs 3 | a workflow | an unrun check is documentation |
 | 6 | MCP tool fragment | `mcp-tools-<addon>.json`, named by `NOO_MCP_EXTRA_MANIFEST` | optional — only if your add-on should appear as MCP tools |
 | 7 | Compose overlay | `docker-compose.<addon>.yml` with an explicit env allowlist | the launcher composes it when `addons.<name>` is declared on in `noomesh.yaml` |
 | 8 | Gateway client | e.g. `gateway_client.py` | everything in the gateway's domain routes back over HTTP, and only you know which calls you make |
 | 9 | Database declaration | `system.json` in your signed bundle | optional: your schema and roles, provisioned by the gateway (see [Declaring a database](#declaring-a-database)) |
 | 10 | Workload declaration | `workloads.json` in your signed bundle | optional: containers noomesh may start, stop and drain for you (see [Declaring workloads](#declaring-workloads)) |
+| 11 | Runtime inputs | `resources.json` in your signed bundle | optional: the gateway URL, TLS leaf, keys, secrets, database files and networks your services need (see [Declaring runtime inputs](#declaring-runtime-inputs)) |
 
 ## A minimal worked example: `example-addon`
 
@@ -86,10 +87,10 @@ example-addon/
    ```
 
 3. **The contract test** is the one in step 4, pointed at that file.
-4. **Manifest delivery**: the overlay runs a one-shot service from the
-   add-on's own image that copies the manifest into a named volume; the
-   gateway mounts that volume read-only at
-   `/opt/noo/addon-routes/example-addon` and waits for the one-shot to finish.
+4. **Manifest delivery**: the release signs the manifest into the bundle as
+   `routes.json`; on every start the launcher copies it to
+   `.noo-addon-routes/example-addon/routes.json`, which the gateway mounts
+   read-only. The overlay never touches the `gateway` service.
 5. **CI** runs the contract test on every push.
 6. **MCP fragment** (optional): `mcp-tools-example-addon.json`, named by
    `NOO_MCP_EXTRA_MANIFEST`, exposes `status` as a tool.
@@ -147,10 +148,11 @@ that is the reason this table exists rather than a scattering of env reads.
 
 ## Step 2a — declare your routes (HTTP add-ons)
 
-Write your manifest in your own repo and ship it in your image. The gateway
-reads it at startup from `/opt/noo/addon-routes/<name>/routes.json` when your
-switch is on (`gateway-rust/src/addon_registry.rs`, `addon_proxy.rs`); you touch
-no gateway code.
+Write your manifest in your own repo and sign it into your bundle as
+`routes.json`. The gateway reads it at startup from
+`/opt/noo/addon-bundle-routes/<name>/routes.json` when your switch is on
+(`gateway-rust/src/addon_registry.rs`, `addon_proxy.rs`); you touch no gateway
+code and no gateway service.
 
 ### Registration
 
@@ -158,7 +160,7 @@ The gateway keeps a **runtime registry** of HTTP add-ons, built at startup. An
 add-on is registered when all three hold:
 
 1. the operator switched it on: `addons.<name>: true` in `noomesh.yaml`;
-2. its image delivered a manifest the gateway accepted (below);
+2. a manifest was delivered for it (below) and the gateway accepted it;
 3. the launcher vouches for its signed lock: `noo addons enable|upgrade` verified
    the lock against the add-on's key in the installed entitlement and checked
    that it lists this stack (`supports_stack`), and `noo stack start|restart`
@@ -179,8 +181,8 @@ remedy (`noo addons upgrade <name>`, or `noo addons disable <name>`), does not
 compose its overlay, hands the gateway none of its bundle declarations, stops a
 container left from an earlier start, and ends with "Services started WITHOUT
 add-on(s) <name>". The add-on is absent from `NOO_ADDONS_VERIFIED`, so its
-routes are refused (even from a `routes.json` an earlier start left in the
-routes volume), and it is named in `NOO_ADDONS_REFUSED`, so the systems broker
+routes are refused (and the launcher removes the `routes.json` an earlier
+start handed over), and it is named in `NOO_ADDONS_REFUSED`, so the systems broker
 runs no DDL for it. `noo addons list|show` read it as refused and the
 `add-on pins` row of `noo cluster verify --controller` fails naming it. A
 `stack.lock` that is missing or for another tag still refuses the whole start.
@@ -330,12 +332,39 @@ that carries them (unknown keys fail the whole manifest), so ship them with a
 
 ### Delivering it
 
-Your overlay hands the file to the gateway read-only: a one-shot service from
-the add-on's own image writes the manifest into a named volume, the gateway
-mounts that volume at `/opt/noo/addon-routes/<name>` (`:ro`) and waits for the
-one-shot to complete.
+Core hands the file to the gateway, exactly as it hands over `system.json` and
+`workloads.json`: list `routes.json` in your signed bundle (`--file
+routes.json=<your manifest>` when you sign, see "Shipping it" under
+[Declaring workloads](#declaring-workloads)). On every `noo stack start |
+restart` the launcher (`scripts/lib-dist.sh` `addon_decls_materialise`) copies
+it to `.noo-addon-routes/<name>/routes.json` in the install root, which the
+gateway mounts read-only at `/opt/noo/addon-bundle-routes`:
+
+- only while your add-on is switched on and its signed lock verified this
+  start;
+- only when that lock lists `routes.json` (and the copy matches its signed
+  hash): a `routes.json` left unsigned beside the bundle is never copied;
+- a switched-off, refused or unverified add-on loses its routes on that start
+  (its directory is removed; the mounted directory itself is never replaced).
+
+In a development checkout (nothing is signed), put `routes.json` beside your
+`docker-compose.<name>.yml`; a dev start copies it from there.
+
+Your overlay does not touch the `gateway` service. A third-party overlay may
+not: extending a core service, mounting a core volume or binding a host path
+is refused (`noo-cli/src/addons/guards.rs`).
+
 A file, not a fetch: nothing at boot depends on the network or on the add-on
-being up first, and an image upgrade rewrites the file.
+being up first, and an upgrade that brings a new bundle rewrites the file.
+
+**The older path.** Add-ons the stack ships may still deliver the manifest
+from their own overlay: a one-shot service from the add-on's image fills a
+named volume that the gateway mounts at `/opt/noo/addon-routes/<name>` (`:ro`).
+The gateway reads `/opt/noo/addon-bundle-routes/<name>/routes.json` first and
+looks under `/opt/noo/addon-routes/<name>/` only when the launcher delivered
+nothing, so when both exist for one add-on the signed copy wins. The two
+directories are separate mounts, never nested, so a volume an overlay mounts
+cannot cover the file core wrote.
 
 ### What the gateway checks
 
@@ -1332,7 +1361,8 @@ private Docker network to attach a runner to (the `noo-db` network of this
 stack), and the read-only credential files under
 `/run/noo/provision/<name>/` (`/dev/shm/noo-provision-<uid>/<name>/` when not
 root, or `$NOO_PROVISION_RUNDIR`; tmpfs only, gone at reboot, rewritten by a
-re-run): `ca.crt`, `client.crt` / `client.key` (the add-on's own service leaf),
+re-run): `ca.crt`, `client.crt` / `client.key` (the add-on's own client leaf,
+`pki/addons/<name>/db-client`, `CN=addon:<name>/db-client`),
 and one libpq `pgpass.<role>` per role. Run a runner as your own uid, on that
 network only, with nothing published:
 
@@ -1400,15 +1430,168 @@ workloads in `desired-config` (`addon_workloads`) and act on nothing else.
 noo security addon-lock sign --out addon-bundle.json … \
   --file docker-compose.yml=docker-compose.example-addon.yml \
   --file system.json=deploy/system.json \
-  --file workloads.json=deploy/workloads.json
+  --file workloads.json=deploy/workloads.json \
+  --file routes.json=src/example_addon/example-addon.routes.json
 ```
 
 and push each as an `application/vnd.noomesh.addon-file.v1` layer next to the
 overlay. A CLI from before these files materialises them and ignores them; a
 gateway from before them never reads them. Ship them with a `supports_stack`
-that starts at the release that reads them. In a development checkout, put
-`system.json` and `workloads.json` beside your `docker-compose.<name>.yml`; a
-dev start copies them from there.
+that starts at the release that reads them (`routes.json` is handed over from
+0.6.13). In a development checkout, put `system.json`, `workloads.json` and
+`routes.json` beside your `docker-compose.<name>.yml`; a dev start copies them
+from there.
 
 `noo addons show <name>` prints what an add-on's bundle declares; `noo addons
 list` lists the add-ons that declare anything.
+
+## Declaring runtime inputs
+
+Your services need things only the stack can produce: the gateway's URL and
+CA, a TLS leaf for your own hostname, your outbound add-on key, a secret your
+services share, your database URL with its TLS files and passfile, and the
+networks to join. Core never names your add-on or your variables. It
+produces a small set of **generic resource kinds**. Your signed bundle
+declares which ones you want and where each one goes, in a file named
+`resources.json`, listed in `files` like `system.json`.
+
+The format is versioned: `noo-addon-resources/1`. The schema is
+[`docs/reference/addon-resources.schema.json`](../reference/addon-resources.schema.json),
+and a fixture that passes it, for your contract tests, is
+`tests/fixtures/addons/rhaddon/resources.json` (`rhaddon` is a fictional
+add-on; its overlay and `system.json` sit beside it).
+
+```json
+{
+  "format": "noo-addon-resources/1",
+  "uid": 1000,
+  "mounts": [
+    {"name": "work", "env": "RHADDON_WORK_DIR", "target": "/run/rhaddon"}
+  ],
+  "resources": [
+    {"name": "gateway-url", "kind": "gateway", "part": "url", "deliver": {"env": "RHADDON_GATEWAY_URL"}},
+    {"name": "gateway-ca", "kind": "gateway", "part": "ca", "deliver": {"file": "work/ca.crt"}},
+    {"name": "leaf-key", "kind": "tls_leaf", "hostname": "noo-rhaddon", "part": "key", "deliver": {"file": "work/leaf.key"}},
+    {"name": "addon-key", "kind": "addon_key", "optional": true, "deliver": {"file": "work/addon-key"}},
+    {"name": "peer-key", "kind": "shared_secret", "deliver": {"file": "work/peer-key"}}
+  ]
+}
+```
+
+| Kind | Parts | What you get |
+|---|---|---|
+| `gateway` | `url`, `ca`, `public_origin` | `https://gateway:8080` (on the cluster network); the cluster CA, so a client of yours can trust the gateway; the browser origin(s) allowed to reach you (`NOO_CONSOLE_ORIGIN`, else this host on 443 and on the gateway port) |
+| `tls_leaf` | `cert`, `key`, `ca` (with `hostname`) | a leaf from the fleet PKI for `noo-<addon>` or `noo-<addon>-<suffix>` (your name with `_` as `-`) as its DNS name. It is a service leaf (`O=Mesh Cluster Service`): it names a service, never a node. Its CN is `addon:<addon>/<hostname>`, which no core grant names, so it can never stand for a core service. Re-issued when it has 30 days or fewer left |
+| `addon_key` | none | your outbound gateway key (`x-noo-addon` `key:` in your overlay), minted by `noo addons enable` |
+| `shared_secret` | none | 32 random bytes, minted into the encrypted store by `noo addons enable` as `NOO_ADDON_SECRET_<ADDON>__<NAME>`. It is never rotated silently: `noo addons rotate-secret <name> <resource>` rotates it, and `noo stack restart <name> --force` hands the new value over |
+| `db` | `url`, `ca`, `cert`, `key`, `passfile` | the **runtime** role only (`noo_<id>`, never the migration role). Needs `system.json`. The URL is `postgresql://noo_<id>@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=…&sslcert=…&sslkey=…&passfile=…`, and its query names the container paths of the other four parts, computed from the mount `target`s |
+| `network` | `network`: `gateway` or `db` | the Docker network's name; `db` needs `system.json` |
+
+**Delivery.** `{"env": "VAR"}` or `{"file": "<mount>/<path>"}`, or a list
+of up to four. A mount's `env` receives the host path of a directory that
+your overlay bind-mounts **read-only** at its `target`:
+
+```yaml
+    volumes:
+      - ${RHADDON_WORK_DIR:-/nonexistent/rhaddon-work-unset}:/run/rhaddon:ro
+```
+
+**Required or optional.** A resource is required unless it says
+`"optional": true`. When a required one cannot be produced (its secret is not
+minted, there is no CA, there is no console origin), the launcher refuses
+your add-on, names the resource, and starts the rest of the stack. When an
+optional one cannot be produced, the launcher skips it with a `NOTE:` line.
+`db` parts are produced together and cannot be optional.
+
+**What is refused** at `noo addons enable | upgrade | verify`, before
+anything is pinned:
+
+- a `format` other than `noo-addon-resources/1`;
+- an unknown kind or part, or an unknown field;
+- uid 0, or no `uid`;
+- a file outside your declared mounts, or a path that climbs out of one;
+- a variable that does not start with your own prefix (`RHADDON_` for
+  `rhaddon`), or that starts with `NOO_`, `COMPOSE_` or `DOCKER_`;
+- secret material (a key, the add-on key, a shared secret, the passfile)
+  delivered by `env`. Secrets are files only;
+- a `tls_leaf` hostname that is not yours;
+- `db` or `network: db` without `system.json`;
+- `addon_key` without an `x-noo-addon` key;
+- duplicate names, variables or destinations.
+
+At launch, the launcher also refuses a variable that a core compose file
+reads.
+
+**Your overlay takes only your own secrets.** A top-level secret in your
+overlay (`x-noo-source:` or `environment:`), a secret your services list, and
+a variable your overlay interpolates (`$VAR`, `${VAR…}`) may be a secret only
+when it is one of yours, each name derived from your add-on's name (`<ID>` is
+the name upper-cased, `-` as `_`):
+
+| Variable | What |
+|---|---|
+| `NOO_SVC_KEY_<ID>` | your gateway key (`x-noo-addon` `key:` must be exactly this) |
+| `NOO_BUS_KEY_<ID>` | your bus-principal key |
+| `NOO_<ID>_DB_PASSWORD`, `NOO_<ID>_DDL_PASSWORD`, `NOO_PGPASS_<ID>` | your database roles' passwords, and the pgpass body built from them |
+| `NATS_<ID>_PASSWORD` | your NATS principal, when `x-noo-addon` `nats_principal:` names your add-on |
+| `NOO_ADDON_SECRET_<ID>__<NAME>` | each `shared_secret` your `resources.json` declares |
+
+Anything else core or another add-on holds (`NOO_JWT_SECRET`, another add-on's
+key, a secret core declares) is refused, naming your add-on and the variable,
+at `noo addons enable | upgrade | verify` (before anything is pinned or
+pulled) and again at every launch (your add-on is left out of that start; the
+rest starts). A secret's `file:` must be `${NOO_SECRET_RUNDIR…}/<its name>`:
+the launcher writes it, and no host file is read. A third-party add-on also
+may not `extends:` a service of another compose file (it would inherit that
+service's secrets) or define a service named like a core one.
+
+**Your services reach the host only through your own mounts** (third-party
+add-ons). A service may mount named volumes your overlay declares (plain:
+no `external`, `name`, `driver` or `driver_opts`, and never a volume core
+declares), the mount directories your `resources.json` declares (the source
+is exactly `${<MOUNT_ENV>}`, `${<MOUNT_ENV>:?…}` or a default under
+`/nonexistent/`), anonymous volumes and `tmpfs`. Refused, naming your add-on,
+the service and the mount, at `noo addons enable | upgrade | verify`,
+`upgrade --check` and every launch: any other bind mount, short or long form,
+literal or interpolated (`${NOO_PKI_DIR}`, `/`, `~`, the Docker socket);
+`env_file`, `volumes_from`, `devices`, `cap_add`, `cgroup_parent`; `pid`,
+`ipc`, `network_mode`, `userns_mode`, `uts` or `cgroup` set to `host`,
+`service:…` or `container:…`; a `security_opt` that is `unconfined` or
+disables labels; a `configs:` entry read from a file or the environment. A
+GPU reservation and `privileged` are not refused: the launcher holds those
+services (never starts them).
+
+**Your name is yours.** A third-party add-on whose name, or a name derived
+from it, is core's is refused at `noo addons enable | upgrade`: a core service
+or container (`gateway`, `prometheus`, `noo-gateway`…), a certificate core
+issues, a database role (`noo_<id>`, `noo_<id>_ddl`) or a variable core
+already reads. Ship under another name.
+
+**Where the files are, and who owns them.** The CLI writes them to tmpfs,
+under `/run/noo/addons/<name>/` (as root) or `/dev/shm/noo-addons-<uid>/<name>/`
+(or `$NOO_ADDON_RUNDIR`), in a generation directory named by a digest of the
+content. Each mount directory is 0700 and each file is 0400, all owned by
+your `uid`. Nothing is world-readable. A launch whose inputs did not change
+reuses the generation, so your running containers keep their files. A
+change (a rotation, a renewed leaf) writes a new generation, and the next
+start of your services mounts it.
+
+**What is printed.** `noo addons show <name>` and the receipt
+(`<rundir>/<name>/receipt.json`) list names, kinds, destinations and paths,
+never values. The launcher prints no value.
+
+**Starting only your services.** Once `addons.<name>` is on, `noo stack
+restart <name> --force` recreates exactly the services your overlay owns
+(never a core service it extends), with `--no-deps`, after materialising
+your inputs. Nothing else is restarted.
+
+**What a third-party add-on never gets.** A service of a third-party add-on
+that asks for a GPU (`gpus`, `runtime: nvidia`, a device reservation, an
+NVIDIA or DRI device), mounts the Docker socket, or is `privileged` is
+**held**. The launcher never starts it (`--scale <service>=0`), prints a
+`HELD:` line, and refuses it by name if you ask for it. Your other services
+start. There is no GPU reservation path for add-on services yet.
+
+**What core does not produce.** Core produces no identity or account file. Noomesh is the
+only RBAC authority. Read the caller from the gateway's forwarded identity
+([Step 3b](#step-3b--know-who-called-you)).

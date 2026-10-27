@@ -139,7 +139,7 @@ func (e *Engine) processCommand(ctx context.Context, path string) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		e.logf("REJECT %s: cannot read claimed command: %v", name, err)
-		_ = WriteResult(e.Spool, name, Result{Op: "unknown", RC: 1, Stderr: "unreadable"})
+		e.writeResult(name, Result{Op: "unknown", RC: 1, Stderr: "unreadable"})
 		return
 	}
 
@@ -151,25 +151,25 @@ func (e *Engine) processCommand(ctx context.Context, path string) {
 		// investigation the wrong way. Reading and parsing are separate steps
 		// above so the two now report differently.
 		e.logf("REJECT %s: not valid JSON", name)
-		_ = WriteResult(e.Spool, name, Result{Op: "unknown", RC: 1, Stderr: "invalid json"})
+		e.writeResult(name, Result{Op: "unknown", RC: 1, Stderr: "invalid json"})
 		return
 	}
 
 	op, known := LookupOpFor(e.Mode, cmd.Op)
 	if !known {
 		e.logf("REJECT %s: invalid op %q", name, cmd.Op)
-		_ = WriteResult(e.Spool, name, Result{Op: cmd.Op, Service: cmd.Service, RC: 1, Stderr: "invalid op"})
+		e.writeResult(name, Result{Op: cmd.Op, Service: cmd.Service, RC: 1, Stderr: "invalid op"})
 		return
 	}
 	if err := ValidateService(cmd.Service); err != nil {
 		e.logf("REJECT %s: invalid service %q", name, cmd.Service)
-		_ = WriteResult(e.Spool, name, Result{Op: cmd.Op, Service: cmd.Service, RC: 1, Stderr: "invalid service"})
+		e.writeResult(name, Result{Op: cmd.Op, Service: cmd.Service, RC: 1, Stderr: "invalid service"})
 		return
 	}
 	if cmd.Rollback != nil && cmd.Rollback.SHA != "" {
 		if err := ValidateSHA(cmd.Rollback.SHA); err != nil {
 			e.logf("REJECT %s: invalid rollback sha %q", name, cmd.Rollback.SHA)
-			_ = WriteResult(e.Spool, name, Result{Op: cmd.Op, Service: cmd.Service, RC: 1, Stderr: "invalid rollback sha"})
+			e.writeResult(name, Result{Op: cmd.Op, Service: cmd.Service, RC: 1, Stderr: "invalid rollback sha"})
 			return
 		}
 	}
@@ -195,7 +195,7 @@ func (e *Engine) processCommand(ctx context.Context, path string) {
 	if cmd.Op == "backup" {
 		res = annotateBackup(res)
 	}
-	_ = WriteResult(e.Spool, name, res)
+	e.writeResult(name, res)
 }
 
 func truncateLog(s string) string {

@@ -191,21 +191,27 @@ type declaredTLS struct {
 // changes when a container is (re)created. Nil when the daemon could not
 // be listed — the caller then dials the door an agent-started backend is
 // created with (TLS), never a guessed plaintext one.
-func (c *Client) DeclaredTLS() *declaredTLS {
+func (c *Client) DeclaredTLS(ctx context.Context) *declaredTLS {
 	c.declMu.Lock()
 	defer c.declMu.Unlock()
 	if c.declRead && time.Now().Before(c.declExpires) {
 		return c.decl
 	}
-	c.decl = c.readDeclaredTLS()
+	d := c.readDeclaredTLS(ctx)
+	if ctx.Err() != nil {
+		// The caller went away mid-read: the nil is its cancellation, not
+		// the daemon's answer, so it must not be cached for the next caller.
+		return d
+	}
+	c.decl = d
 	c.declRead = true
 	c.declExpires = time.Now().Add(10 * time.Second)
 	return c.decl
 }
 
-func (c *Client) readDeclaredTLS() *declaredTLS {
+func (c *Client) readDeclaredTLS(ctx context.Context) *declaredTLS {
 	d := &declaredTLS{tls: map[string]bool{}, sidecars: map[string]bool{}, known: map[string]bool{}}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	containers, err := c.listContainers(ctx, client.ContainerListOptions{})
 	if err != nil {
@@ -279,11 +285,11 @@ func commandDeclaresClientCert(entrypoint, cmd []string) bool {
 // agent-started backend is created with. The caller's transport must
 // present the node leaf for any https door (config.HTTPTransport does; the
 // inference proxy's httpsTransport does since 2026-09-28).
-func (c *Client) BackendDialURL(backend string) string {
+func (c *Client) BackendDialURL(ctx context.Context, backend string) string {
 	if c == nil {
 		return backendDialURL(backend, nil)
 	}
-	return backendDialURL(backend, c.DeclaredTLS())
+	return backendDialURL(backend, c.DeclaredTLS(ctx))
 }
 
 // backendDialURL is the pure decision behind BackendDialURL.
@@ -361,6 +367,7 @@ type Client struct {
 // pingDocker is a short, bounded reachability probe. Kept separate so tests can
 // exercise NewClient's decision without a daemon.
 var pingDocker = func(dc *client.Client) error {
+	// Process startup (NewClient): there is no caller ctx yet; bounded at 5s.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, err := dc.Ping(ctx, client.PingOptions{})
@@ -493,19 +500,19 @@ func (c *Client) listImages(ctx context.Context, opts client.ImageListOptions) (
 // precedence over the worker's local .env / spec defaults. Empty/zero
 // fields fall through to the existing env-based resolution, preserving
 // backwards compat for callers that don't supply overrides.
-func (c *Client) StartBackend(backend, model string, gpuCount int, overrides StartOverrides) error {
-	return c.StartBackendSDK(backend, model, gpuCount, overrides)
+func (c *Client) StartBackend(ctx context.Context, backend, model string, gpuCount int, overrides StartOverrides) error {
+	return c.StartBackendSDK(ctx, backend, model, gpuCount, overrides)
 }
 
 // StopBackend stops and removes a backend container using the Docker API.
-func (c *Client) StopBackend(backend string) error {
-	return c.StopBackendSDK(backend)
+func (c *Client) StopBackend(ctx context.Context, backend string) error {
+	return c.StopBackendSDK(ctx, backend)
 }
 
 // RunningBackends returns a map of backend_type -> model for all currently
 // running PAI backend containers.
-func (c *Client) RunningBackends() map[string]string {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func (c *Client) RunningBackends(ctx context.Context) map[string]string {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	containers, err := c.listContainers(ctx, client.ContainerListOptions{})
@@ -547,7 +554,7 @@ func (c *Client) RunningBackends() map[string]string {
 		case "ollama":
 			model := envMap["OLLAMA_MODEL"]
 			if model == "" {
-				model = c.queryOllamaModel()
+				model = c.queryOllamaModel(ctx)
 			}
 			if model == "" {
 				model = "ollama"
@@ -645,8 +652,8 @@ func backendKeyFromName(name string) string {
 // the map with an empty value) — the reconciler treats that as spec drift
 // once, to adopt the label. Reads labels straight off the container-list
 // summary (no per-container inspect).
-func (c *Client) BackendLabels(label string) map[string]string {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func (c *Client) BackendLabels(ctx context.Context, label string) map[string]string {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	out := map[string]string{}
@@ -673,8 +680,8 @@ func (c *Client) BackendLabels(label string) map[string]string {
 // `image_floating` judgement (imageFacts). A current agent refuses to create
 // such a container, so one running is a leftover from an older agent; the
 // reconciler recreates it from the pinned ref once, like a spec drift.
-func (c *Client) FloatingBackendImages() map[string]string {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func (c *Client) FloatingBackendImages(ctx context.Context) map[string]string {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	out := map[string]string{}
@@ -698,8 +705,8 @@ func (c *Client) FloatingBackendImages() map[string]string {
 }
 
 // ContainerNames returns the names of all running containers.
-func (c *Client) ContainerNames() []string {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+func (c *Client) ContainerNames(ctx context.Context) []string {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	containers, err := c.listContainers(ctx, client.ContainerListOptions{})
@@ -724,8 +731,8 @@ type ContainerInfo struct {
 }
 
 // ListContainers returns info about all containers (including stopped).
-func (c *Client) ListContainers() ([]ContainerInfo, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func (c *Client) ListContainers(ctx context.Context) ([]ContainerInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	containers, err := c.listContainers(ctx, client.ContainerListOptions{All: true})
@@ -753,8 +760,8 @@ func (c *Client) ListContainers() ([]ContainerInfo, error) {
 // an unbounded buffer.
 const logReadBudget = 8 << 20 // 8 MiB
 
-func (c *Client) ContainerLogs(containerName string, tail int, since string) ([]string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func (c *Client) ContainerLogs(ctx context.Context, containerName string, tail int, since string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	if tail > 2000 {
@@ -843,8 +850,8 @@ func logLinesFromStream(r io.Reader, tty bool, tail int) ([]string, error) {
 
 // StopAllPAIContainers stops and removes all PAI containers except the node-agent itself.
 // Returns the count of containers stopped.
-func (c *Client) StopAllPAIContainers() (int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+func (c *Client) StopAllPAIContainers(ctx context.Context) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
 	containers, err := c.listContainers(ctx, client.ContainerListOptions{All: true})
@@ -899,8 +906,8 @@ func IsStackImageTag(tag string) bool {
 //
 // Only reached for a DEEP clean: the images are the expensive half to get
 // back (a multi-GB pull or a rebuild), so removing them is opt-in.
-func (c *Client) RemoveStackImages() (int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+func (c *Client) RemoveStackImages(ctx context.Context) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 
 	images, err := c.listImages(ctx, client.ImageListOptions{})
@@ -923,13 +930,13 @@ func (c *Client) RemoveStackImages() (int, error) {
 
 // PullProfile pulls the Docker image for a backend.
 // The profile name maps to a backend spec whose image we pull.
-func (c *Client) PullProfile(profile string) error {
+func (c *Client) PullProfile(ctx context.Context, profile string) error {
 	spec, ok := backendSpecs[profile]
 	if !ok {
 		return fmt.Errorf("unknown profile: %s", profile)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
 	// Over the artifact rail like every other start path (image_source.go);
@@ -972,11 +979,11 @@ func firstNonEmpty(ss ...string) string {
 	return ""
 }
 
-func (c *Client) queryOllamaModel() string {
+func (c *Client) queryOllamaModel(ctx context.Context) string {
 	if c.httpClient == nil {
 		return ""
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
 	url := fmt.Sprintf("%s://ollama:11434/api/ps", c.scheme)

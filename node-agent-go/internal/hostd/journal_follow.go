@@ -171,7 +171,7 @@ func opJournalFollow(ctx context.Context, e *Engine, name string, c *Command) (i
 		e.journalMu.Unlock()
 		// Detached ops own their result; say "already running" as a
 		// finished result so the caller's poll completes.
-		_ = WriteResult(e.Spool, name, Result{
+		e.writeResult(name, Result{
 			OK: true, Op: c.Op, Service: c.Service, RC: 0,
 			Stderr: "journal follower already running", Status: "done",
 		})
@@ -185,7 +185,7 @@ func opJournalFollow(ctx context.Context, e *Engine, name string, c *Command) (i
 	e.journal = f
 	e.journalMu.Unlock()
 
-	_ = WriteResult(e.Spool, name, Result{
+	e.writeResult(name, Result{
 		OK: true, Op: c.Op, Service: c.Service, RC: 0,
 		Stderr: "detached; file=" + f.state.File, Status: "running",
 	})

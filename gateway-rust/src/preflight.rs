@@ -399,17 +399,7 @@ async fn check_embedding_dims(state: &Arc<AppState>) -> CheckResult {
     }
 
     // Record what the store is embedded with (best-effort).
-    let _ = sqlx::query(
-        "INSERT INTO noo_settings (key, value, category, updated_by) \
-         VALUES ('embedding_model', $1, 'memory', 'preflight'), \
-                ('embedding_dims', $2, 'memory', 'preflight') \
-         ON CONFLICT (key) DO UPDATE \
-         SET value = EXCLUDED.value, updated_by = 'preflight', updated_at = NOW()",
-    )
-    .bind(&endpoint.model)
-    .bind(served_dims.to_string())
-    .execute(&state.db)
-    .await;
+    let _ = crate::repo::settings::record_embedding(&state.db, &endpoint.model, &served_dims.to_string()).await;
 
     ok(
         "embedding_dims",

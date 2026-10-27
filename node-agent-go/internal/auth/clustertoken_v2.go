@@ -12,9 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,24 +52,6 @@ var errBodyTooLarge = errors.New("body too large to verify")
 // clock is replaced in tests.
 var clock = time.Now
 
-// V1Allowed reports whether the legacy v1 token is still accepted.
-// NOO_CLUSTER_TOKEN_V1=0 closes it (the posture gate, set once every caller
-// signs v2). Unset or anything else keeps the rollout default: accepted and
-// counted.
-func V1Allowed() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("NOO_CLUSTER_TOKEN_V1"))) {
-	case "0", "false", "no", "off", "closed":
-		return false
-	}
-	return true
-}
-
-// SignV1Only pins signers to the v1 wire form (NOO_CLUSTER_TOKEN_SIGN=v1).
-// Only for a node rolled BEFORE its controller: an old gateway cannot read v2.
-func SignV1Only() bool {
-	return strings.EqualFold(strings.TrimSpace(os.Getenv("NOO_CLUSTER_TOKEN_SIGN")), "v1")
-}
-
 func v2Message(method, requestURI, bodySHA, actor, ts, nonce string) string {
 	return strings.Join([]string{"v2", strings.ToUpper(method), requestURI, bodySHA, actor, ts, nonce}, "\n")
 }
@@ -97,35 +77,42 @@ func SignV2(method, requestURI string, body []byte, actor, secret string, at tim
 	return fmt.Sprintf("v2:%s:%s:%s:%s", actor, ts, n, sig), nil
 }
 
+// ErrNotSignable is wrapped by SetClusterAuth when a request cannot carry a
+// v2 cluster token. There is no v1 fallback: the controller refuses the old
+// form, so a request sent anyway would only be a guaranteed 401.
+var ErrNotSignable = errors.New("cluster token: request not signable as v2")
+
 // SetClusterAuth sets the Authorization header on an outbound request to the
-// controller: a v2 token bound to this request's method, target and body. The
-// v1 token goes out only when v1 is pinned (NOO_CLUSTER_TOKEN_SIGN=v1) or the
-// request cannot be signed at all (the body fails to read, no randomness). A
-// body with no GetBody (a stream) is read here, bounded, and put back as
-// bytes so it can be hashed. Call it AFTER the body is attached.
-func SetClusterAuth(req *http.Request, nodeID, secret string) {
+// controller: a v2 token bound to this request's method, target and body. It
+// returns an error (wrapping ErrNotSignable) when the request cannot be
+// signed — the body fails to read or exceeds what a verifier accepts, or no
+// randomness is available — and leaves the request unauthenticated; the
+// caller must not send it. A body with no GetBody (a stream) is read here,
+// bounded, and put back as bytes so it can be hashed. Call it AFTER the body
+// is attached.
+func SetClusterAuth(req *http.Request, nodeID, secret string) error {
 	if secret == "" {
-		return
+		return nil
 	}
-	if !SignV1Only() {
-		body, ok := signableBody(req)
-		if ok {
-			nonce := make([]byte, 16)
-			if _, err := rand.Read(nonce); err == nil {
-				if tok, err := SignV2(req.Method, req.URL.RequestURI(), body, nodeID, secret, clock(), nonce); err == nil {
-					req.Header.Set("Authorization", "Bearer "+tok)
-					// The gateway's rate limiter runs before it reads the body, so
-					// it checks the signature against this hash; its auth layer
-					// hashes the real body and never trusts the header.
-					sum := sha256.Sum256(body)
-					req.Header.Set(BodySHAHeader, hex.EncodeToString(sum[:]))
-					return
-				}
-			}
-		}
-		slog.Warn("cluster token: request not signable as v2, sending v1", "method", req.Method, "path", req.URL.Path)
+	body, ok := signableBody(req)
+	if !ok {
+		return fmt.Errorf("%w: body unreadable or larger than %d bytes (%s %s)", ErrNotSignable, maxSignedBody, req.Method, req.URL.Path)
 	}
-	req.Header.Set("Authorization", "Bearer "+CreateClusterToken(nodeID, secret))
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		return fmt.Errorf("%w: %v", ErrNotSignable, err)
+	}
+	tok, err := SignV2(req.Method, req.URL.RequestURI(), body, nodeID, secret, clock(), nonce)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrNotSignable, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	// The gateway's rate limiter runs before it reads the body, so it checks
+	// the signature against this hash; its auth layer hashes the real body
+	// and never trusts the header.
+	sum := sha256.Sum256(body)
+	req.Header.Set(BodySHAHeader, hex.EncodeToString(sum[:]))
+	return nil
 }
 
 // signableBody returns the bytes a v2 token is signed over. A body that can

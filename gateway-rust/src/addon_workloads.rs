@@ -18,8 +18,8 @@
 //! [`declared`] is the seam. It reads [`WORKLOADS_DIR`]`/<addon>/workloads.json`
 //! for every REGISTERED add-on: the launcher materialises that file from the
 //! add-on's SIGNED bundle (noomesh/noomesh#288, `addon_decls`), so the
-//! signature covers it; the add-on's own image volume
-//! (`addon_proxy::ROUTES_DIR`) is never read for this. [`validate`] is the
+//! signature covers it; no route-manifest directory
+//! (`addon_proxy::BUNDLE_ROUTES_DIR`, `addon_proxy::ROUTES_DIR`) is read for this. [`validate`] is the
 //! one gateway home of the spec rules (the CLI refuses the same at enable
 //! time, so nothing valid is refused here). [`set_declared`] replaces the
 //! read (tests, or a verdict that carries the declarations). The node agent

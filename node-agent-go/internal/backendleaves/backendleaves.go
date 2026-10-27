@@ -31,6 +31,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlenv"
 )
 
 // Services are the door services a node can hold a leaf for — the
@@ -74,7 +76,7 @@ var defaultReader = NewReader()
 
 // Report is the heartbeat's `backend_leaves` for this process's
 // $NOO_PKI_DIR, through the package's shared cache.
-func Report() map[string]Leaf { return defaultReader.Report(os.Getenv("NOO_PKI_DIR")) }
+func Report() map[string]Leaf { return defaultReader.Report(ctrlenv.PKIDir()) }
 
 // Report returns the leaves held under pkiDir. Never nil: an unset pkiDir
 // or one with no services/ tree yields an empty map, which is a report

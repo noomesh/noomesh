@@ -8,6 +8,7 @@
 //!   agent roles (hardcoded definitions)
 //! NATS delegation: multi-agent collaboration, workflow execution, persona chat
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 use axum::{
     Router,
@@ -2059,13 +2060,11 @@ async fn messages_send(
         // propagated rather than swallowed for that reason: a database
         // that cannot answer "does this recipient exist" must surface as
         // a 500, not as "no such recipient".
-        let known: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM noo_users WHERE username = $1) \
-             OR EXISTS (SELECT 1 FROM noo_node_config WHERE node_id = $1)",
-        )
-        .bind(to_account)
-        .fetch_one(&state.db)
-        .await?;
+        let known: bool = crate::repo::users::exists(&state.db, to_account).await?
+            || sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM noo_node_config WHERE node_id = $1)")
+                .bind(to_account)
+                .fetch_one(&state.db)
+                .await?;
         if !known {
             // Previously accepted and stored. A message to a name nobody
             // holds sat in the table forever and the sender was told
@@ -2481,14 +2480,10 @@ async fn keys_put(
         .await
         .map_err(AppError::BadRequest)?;
     if who.privileged {
-        crate::routes::core::audit_event(
+        crate::audit::record(
             &state.db,
-            "agent_key_registered",
-            "info",
-            &who.label,
-            &agent,
-            "ok",
-            json!({ "agent": agent, "by": who.label, "privileged": true }),
+            AuditEvent::new(AuditKind::AgentKeyRegistered, &who.label, &agent)
+                .details(json!({ "agent": agent, "by": who.label, "privileged": true })),
         )
         .await;
     }

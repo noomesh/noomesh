@@ -192,12 +192,22 @@ pub enum RelayStep {
     KeepAndStop,
 }
 
-pub fn relay_step(kind: &str) -> RelayStep {
+pub fn relay_step(kind: &str, event: &Value) -> RelayStep {
     match kind {
         HARNESS_RESULT_EVENT => RelayStep::KeepAndStop,
+        // A harness that says the turn never reached its model is asking
+        // the gateway to run it instead: kept, so the socket sees the
+        // answer, not a failure followed by an answer (i233).
+        "error" if retry_safe(event) => RelayStep::KeepAndStop,
         "error" => RelayStep::ForwardAndStop,
         _ => RelayStep::Forward,
     }
+}
+
+/// `retry_safe: true` on a harness `error` event: the CLI was killed before
+/// its first model call, so no tool ran and the gateway may run the turn.
+pub fn retry_safe(event: &Value) -> bool {
+    event.get("retry_safe").and_then(Value::as_bool) == Some(true)
 }
 
 /// How long to keep listening for the `harness_result` after `done` has
@@ -225,7 +235,7 @@ pub async fn relay_turn<S: TurnSink>(
         };
         let Ok(event) = serde_json::from_slice::<Value>(&msg.payload) else { continue };
         let kind = event.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
-        let step = relay_step(&kind);
+        let step = relay_step(&kind, &event);
         if step != RelayStep::KeepAndStop {
             // Re-shape without the discriminator so `shape_event` adds it
             // back exactly once, whatever the transport did to key order.
@@ -437,11 +447,13 @@ mod relay_tests {
 
     #[test]
     fn relay_forwards_everything_but_the_result_and_stops_on_it_or_error() {
-        assert_eq!(relay_step("content"), RelayStep::Forward);
-        assert_eq!(relay_step("done"), RelayStep::Forward);
-        assert_eq!(relay_step("tool_call"), RelayStep::Forward);
-        assert_eq!(relay_step("error"), RelayStep::ForwardAndStop);
-        assert_eq!(relay_step(HARNESS_RESULT_EVENT), RelayStep::KeepAndStop);
+        assert_eq!(relay_step("content", &json!({})), RelayStep::Forward);
+        assert_eq!(relay_step("done", &json!({})), RelayStep::Forward);
+        assert_eq!(relay_step("tool_call", &json!({})), RelayStep::Forward);
+        assert_eq!(relay_step("error", &json!({"text": "boom"})), RelayStep::ForwardAndStop);
+        assert_eq!(relay_step("error", &json!({"text": "stalled", "retry_safe": true})), RelayStep::KeepAndStop, "a retry-safe error is kept for the gateway to run the turn");
+        assert_eq!(relay_step("error", &json!({"text": "x", "retry_safe": false})), RelayStep::ForwardAndStop);
+        assert_eq!(relay_step(HARNESS_RESULT_EVENT, &json!({})), RelayStep::KeepAndStop);
     }
 
     #[test]

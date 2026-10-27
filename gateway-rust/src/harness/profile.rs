@@ -21,13 +21,13 @@
 //! - `claude_prompt` → which Claude Code launch variant the driver uses
 //!   (`launch` or `launch_slim`, [`ClaudePrompt`]).
 //!
-//! `first_byte_secs`, `ollama_context` and `foreign_kinds` are the node
+//! `first_byte_secs`, `context` and `foreign_kinds` are the node
 //! agent's; they are parsed so a report can show them, not applied here.
 //!
 //! Beside `profile`, the placement answer may carry `model_context`: the
 //! context window the node's chat backend runs with, as far as the agent
 //! sets it (Ollama's `OLLAMA_CONTEXT_LENGTH`, the placement's own or the
-//! profile's `ollama_context` default). The driver tells a CLI that takes
+//! profile's `context` default). The driver tells a CLI that takes
 //! one (`launch.context_window_env`) that window ([`resolve_context_window`]).
 
 use serde_json::Value;
@@ -68,7 +68,7 @@ impl ClaudePrompt {
 }
 
 /// The resolved profile's fields the harness reads (contract §4).
-/// `tier`, `first_byte_secs`, `ollama_context` and `foreign_kinds` are the
+/// `tier`, `first_byte_secs`, `context` and `foreign_kinds` are the
 /// node agent's to apply; the harness only logs them.
 #[derive(Clone, Debug, Default, PartialEq)]
 #[allow(dead_code)]
@@ -77,7 +77,7 @@ pub struct HarnessProfile {
     pub first_byte_secs: Option<u64>,
     pub stream_idle_secs: Option<u64>,
     pub thinking: Option<ThinkingMode>,
-    pub ollama_context: Option<u64>,
+    pub context: Option<u64>,
     pub claude_prompt: Option<ClaudePrompt>,
     pub foreign_kinds: Option<Vec<String>>,
 }
@@ -112,8 +112,13 @@ impl HarnessProfile {
             first_byte_secs: bounded(p.get("first_byte_secs"), MAX_PROFILE_SECS),
             stream_idle_secs: bounded(p.get("stream_idle_secs"), MAX_PROFILE_SECS),
             thinking: thinking(p.get("thinking")),
-            // A context length is tokens, not seconds: no 7200 ceiling.
-            ollama_context: p.get("ollama_context").and_then(Value::as_u64).filter(|n| *n > 0),
+            // A context length is tokens, not seconds: no 7200 ceiling. An
+            // agent older than 0.6.13 names it `ollama_context` (i226).
+            context: p
+                .get("context")
+                .or_else(|| p.get(crate::harness_profile::CONTEXT_ALIAS))
+                .and_then(Value::as_u64)
+                .filter(|n| *n > 0),
             claude_prompt: p.get("claude_prompt").and_then(Value::as_str).and_then(ClaudePrompt::parse),
             foreign_kinds: p.get("foreign_kinds").and_then(Value::as_array).map(|a| {
                 a.iter().filter_map(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
@@ -198,6 +203,13 @@ mod tests {
                 "bench": null
             }
         });
+        // `body` is an agent older than 0.6.13 (`ollama_context`); a newer
+        // one sends `context`, and both read the same (i226 decision 1).
+        let mut newer = body.clone();
+        let prof = newer["profile"].as_object_mut().unwrap();
+        prof.remove("ollama_context");
+        prof.insert("context".into(), json!(32768));
+        assert_eq!(HarnessProfile::from_placement(&newer), HarnessProfile::from_placement(&body));
         let p = HarnessProfile::from_placement(&body).expect("a profile");
         assert_eq!(
             p,
@@ -206,7 +218,7 @@ mod tests {
                 first_byte_secs: Some(600),
                 stream_idle_secs: Some(300),
                 thinking: Some(ThinkingMode::Off),
-                ollama_context: Some(32768),
+                context: Some(32768),
                 claude_prompt: Some(ClaudePrompt::Slim),
                 foreign_kinds: Some(vec!["claude-code".into(), "codex".into(), "copilot".into()]),
             }

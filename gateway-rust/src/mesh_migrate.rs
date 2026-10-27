@@ -6,11 +6,17 @@
 //! This runner now owns the mesh migration chain for everything authored
 //! after the frozen Alembic baseline ([`BASELINE_REVISION`], `046_...`): it reads the existing
 //! Alembic state, computes what it would apply, and is provable against
-//! `noo db current`. As of this writing [`MIGRATIONS`] holds 44 entries
-//! starting at `047_audit_drop_partition_fn` with the chain head at
-//! `090_service_key_expiry`. `migrations/` at the crate root holds ONLY the
-//! baseline (`0001_baseline.sql`); every later revision lives in this file,
-//! not as a `.sql` file there. A schema change now means appending a
+//! `noo db current`. [`MIGRATIONS`] holds every revision after the baseline,
+//! in order; the first one's `down_revision` is [`BASELINE_REVISION`] and the
+//! chain head is the LAST entry (`noo db history` prints the chain and marks
+//! the head; the release script `scripts/mesh-migration-head.sh` reads the
+//! same last entry for the signed stack lock). `migrations/` at the crate
+//! root holds ONLY the baseline (`0001_baseline.sql`); every later revision
+//! lives in this file, not as a `.sql` file there. Both claims are pinned by
+//! tests (`migrations_dir_holds_only_the_baseline`,
+//! `the_real_chain_is_a_straight_line_from_empty`,
+//! `the_release_script_reads_the_real_chain_head`), so this header cannot go
+//! stale unnoticed. A schema change means appending a
 //! `Migration { revision, down_revision, sql }` entry to [`MIGRATIONS`],
 //! not a new Python/Alembic revision.
 //!
@@ -2151,7 +2157,22 @@ ALTER TABLE noo_embedding_spaces
     ADD COLUMN IF NOT EXISTS migration_started_at timestamptz,
     ADD COLUMN IF NOT EXISTS migration_reported_at timestamptz
 "#,
+}, Migration {
+    revision: PG_STAT_STATEMENTS_REVISION,
+    down_revision: Some(EMBEDDING_SPACE_MIGRATION_REVISION),
+    // The compose already PRELOADS pg_stat_statements (postgres `command`),
+    // but nothing ever created the extension, so the view did not exist and
+    // a hot query could not be named. Installed here because this chain
+    // runs as the migration DSN's role (`noo`, the cluster superuser —
+    // `CREATE EXTENSION` of this untrusted extension needs one; see
+    // `migration_dsn`). Idempotent. Created in `public` on purpose: the
+    // view is read by operators, not by the mesh schema.
+    sql: "CREATE EXTENSION IF NOT EXISTS pg_stat_statements SCHEMA public",
 }];
+
+/// Creates the `pg_stat_statements` view the preloaded library feeds. A
+/// constant so a renumber at rebase is one line.
+pub const PG_STAT_STATEMENTS_REVISION: &str = "103_pg_stat_statements";
 
 /// The embedding-space migration revision (i150). A constant so a renumber
 /// at rebase is one line.
@@ -3051,15 +3072,26 @@ mod tests {
             .contains("(node_id, backend, role, (CASE WHEN role = 'embed' THEN model ELSE '' END))"));
     }
 
-    /// i150: the migration columns are the chain head, on the embed-placement revision, all nullable
+    /// The pg_stat_statements revision is the chain head, sits on 102, and is
+    /// idempotent DDL.
+    #[test]
+    fn pg_stat_statements_revision_is_the_head_and_idempotent() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == PG_STAT_STATEMENTS_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "103_pg_stat_statements");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(EMBEDDING_SPACE_MIGRATION_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(PG_STAT_STATEMENTS_REVISION), "the chain head");
+        assert!(m.sql.contains("CREATE EXTENSION IF NOT EXISTS pg_stat_statements"));
+    }
+
+    /// i150: the migration columns sit on the embed-placement revision, all nullable
     /// (no row changes), and `embedding_spaces::load` reads every one.
     #[test]
-    fn embedding_space_migration_revision_is_the_head_and_adds_nullable_columns() {
+    fn embedding_space_migration_revision_adds_nullable_columns() {
         let m = MIGRATIONS.iter().find(|m| m.revision == EMBEDDING_SPACE_MIGRATION_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "102_embedding_space_migration");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(EMBED_PLACEMENT_MODEL_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(EMBEDDING_SPACE_MIGRATION_REVISION), "the chain head");
         for col in [
             "next_model text", "next_dims integer", "migration_state text", "migration_progress jsonb",
             "migration_started_at timestamptz", "migration_reported_at timestamptz",
@@ -3160,6 +3192,29 @@ mod tests {
         let grant = body.find("crate::system_provision::run(db)").expect("system_provision");
         let enforce = body.find("enforce_audit_append_only(db)").expect("enforce");
         assert!(enforce > grant, "the revoke must run after every blanket GRANT");
+    }
+
+    /// The module header says `migrations/` holds ONLY the baseline and the
+    /// chain head is the last entry; hold it to that.
+    #[test]
+    fn migrations_dir_holds_only_the_baseline() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("migrations/ exists")
+            .map(|e| e.expect("dir entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["0001_baseline.sql".to_string()], "later revisions belong in MIGRATIONS, not as files");
+    }
+
+    #[test]
+    fn the_planned_head_is_the_last_entry() {
+        let planned = plan(None, MIGRATIONS).expect("valid chain");
+        assert_eq!(
+            planned.last().map(|m| m.revision),
+            MIGRATIONS.last().map(|m| m.revision),
+            "the chain head is the last MIGRATIONS entry; an out-of-order append breaks the header's claim"
+        );
     }
 
     /// Post-cut-over revisions only. Anything up to BASELINE_REVISION is the

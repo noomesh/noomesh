@@ -80,17 +80,35 @@ pub(crate) fn parse_profile_args(args: &[String]) -> Result<ProfileArgs, ()> {
 /// `--clear` keys, plus `--set` assignments (typed by the table). Pure.
 pub(crate) fn merged_overrides(table: &Table, before: &Value, a: &ProfileArgs) -> Result<Value, String> {
     let mut m: Map<String, Value> = if a.clear_all { Map::new() } else { before.as_object().cloned().unwrap_or_default() };
+    // A row stored before the rename may carry `ollama_context`: clearing or
+    // setting `context` by either name replaces both (i226 decision 1).
+    let forget = |m: &mut Map<String, Value>, k: &str| {
+        m.remove(k);
+        if k == "context" {
+            m.remove(crate::harness_profiles::CONTEXT_ALIAS);
+        }
+    };
     for k in &a.clear {
         for k in k.split(',').map(str::trim).filter(|k| !k.is_empty()) {
             table.check_field(k)?;
-            m.remove(k);
+            forget(&mut m, crate::harness_profiles::canonical(k));
         }
     }
     for kv in &a.set {
         let (k, v) = table.parse_assignment(kv)?;
+        forget(&mut m, &k);
         m.insert(k, v);
     }
     Ok(Value::Object(m))
+}
+
+/// `profile[field]`, or for `context` the old key a gateway older than 0.6.13
+/// sends instead.
+fn field_of<'a>(profile: &'a Value, field: &str) -> &'a Value {
+    match &profile[field] {
+        Value::Null if field == "context" => &profile[crate::harness_profiles::CONTEXT_ALIAS],
+        v => v,
+    }
 }
 
 /// A profile value as one cell.
@@ -109,7 +127,7 @@ fn cell(v: &Value) -> String {
 pub(crate) fn source_cell(table: &Table, profile: &Value, field: &str) -> String {
     let tier = profile["tier"].as_u64().map(|t| t.to_string()).unwrap_or_else(|| "?".into());
     let default = table.tiers.get(&tier).and_then(|r| r.get(field)).map(cell);
-    match profile["sources"][field].as_str() {
+    match field_of(&profile["sources"], field).as_str() {
         Some("override") => match default {
             Some(d) => format!("override (tier {tier}: {d})"),
             None => "override".to_string(),
@@ -177,7 +195,7 @@ fn print_profile(table: &Table, node: &str, profile: &Value) {
     let rows: Vec<Vec<String>> = table
         .fields
         .iter()
-        .map(|f| vec![f.clone(), cell(&profile[f.as_str()]), source_cell(table, profile, f)])
+        .map(|f| vec![f.clone(), cell(field_of(profile, f)), source_cell(table, profile, f)])
         .collect();
     print!("{}", ui::table(&[Col::left("field"), Col::left("value"), Col::left("source")], &rows));
     println!("{}", ui::section("Bench"));
@@ -378,6 +396,13 @@ mod tests {
         assert_eq!(merged_overrides(&t, &Value::Null, &args(&["foreign_kinds=none"], &[], false)).unwrap(), json!({"foreign_kinds": []}));
         // The agent's refusal names exactly this form.
         assert_eq!(merged_overrides(&t, &Value::Null, &args(&["foreign_kinds=codex,copilot"], &[], false)).unwrap(), json!({"foreign_kinds": ["codex", "copilot"]}));
+        // `before` is a row stored before the rename: either name clears it,
+        // and setting `context` replaces it (i226 decision 1).
+        for name in ["context", "ollama_context"] {
+            assert_eq!(merged_overrides(&t, &before, &args(&[], &[name], false)).unwrap(), json!({"thinking": "on"}), "{name}");
+        }
+        assert_eq!(merged_overrides(&t, &before, &args(&["context=8192"], &[], false)).unwrap(), json!({"thinking": "on", "context": 8192}));
+        assert_eq!(merged_overrides(&t, &before, &args(&["ollama_context=8192"], &[], false)).unwrap(), json!({"thinking": "on", "context": 8192}));
         assert!(merged_overrides(&t, &before, &args(&[], &["bogus"], false)).is_err());
         assert!(merged_overrides(&t, &before, &args(&["bogus=1"], &[], false)).is_err());
     }
@@ -397,7 +422,13 @@ mod tests {
         let p = profile();
         assert_eq!(source_cell(&t, &p, "first_byte_secs"), "measured from gemma4:12b at 2026-10-19T17:00:00Z");
         assert_eq!(source_cell(&t, &p, "thinking"), "override (tier 2: off)");
-        assert_eq!(source_cell(&t, &p, "ollama_context"), "tier 2");
+        // `profile()` is a gateway older than 0.6.13: `context` reads its
+        // old key; a newer gateway's `context` reads directly.
+        assert_eq!(source_cell(&t, &p, "context"), "tier 2");
+        assert_eq!(cell(field_of(&p, "context")), "32768");
+        let newer = json!({"tier": 2, "context": 16384, "sources": {"context": "override"}});
+        assert_eq!(source_cell(&t, &newer, "context"), "override (tier 2: 32768)");
+        assert_eq!(cell(field_of(&newer, "context")), "16384");
         assert_eq!(cell(&p["foreign_kinds"]), "claude-code, codex, copilot");
         assert_eq!(cell(&json!([])), "none");
         assert_eq!(bench_applies(&p), "yes: first_byte_secs follows it");

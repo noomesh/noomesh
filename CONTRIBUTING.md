@@ -40,8 +40,9 @@ The ML tier (`docker/Dockerfile.deps-base`) is locked the same way, in
 `scripts/regen-ml-lock.sh` (it resolves trellion's dependencies too, so run it
 against the trellion checkout the release builds).
 
-The editable install provides the Python CLI as `noo-py`; the `noo`
-binary passes the few non-native commands through to it.
+There is no Python CLI: `noo` is the Rust binary (`noo-cli/`) and the only
+command-line front door. The editable install ships the `noo-mcp-*` servers,
+not a `noo-py`.
 
 **Rust (`gateway-rust/`, `noo-cli/`):** there is no host toolchain
 requirement — `scripts/cargo-docker.sh` runs cargo in a container with the

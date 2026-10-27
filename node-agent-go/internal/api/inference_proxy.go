@@ -424,12 +424,12 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 	_ = r.Body.Close()
 
 	headerHint := r.Header.Get("X-Noo-Backend")
-	running := s.docker.RunningBackends()
+	running := s.docker.RunningBackends(r.Context())
 	// Backends served natively on this host (darwin/Metal) are reachable and
 	// must be selectable. Docker's map wins a key collision: if something is
 	// genuinely running in a container under that name, that is what the
 	// reconciler manages and what the spec hash describes.
-	native := s.nativeBackends()
+	native := s.nativeBackends(r.Context())
 	for b, m := range native {
 		if _, taken := running[b]; !taken {
 			running[b] = m
@@ -466,7 +466,7 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 			"backend", backendType, "keys", dropped)
 	}
 
-	targetURL, scheme := s.inferenceTarget(backendType, port, native)
+	targetURL, scheme := s.inferenceTarget(r.Context(), backendType, port, native)
 	target, err := url.Parse(targetURL)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "bad_backend_url", err.Error())
@@ -546,7 +546,7 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 // inferenceTarget is where the proxy dials a local backend and with which
 // transport scheme. The bench (POST /bench) dials the chat backend through
 // this same resolution, so it measures the path a real request takes.
-func (s *Server) inferenceTarget(backendType string, port int, native map[string]string) (targetURL, scheme string) {
+func (s *Server) inferenceTarget(ctx context.Context, backendType string, port int, native map[string]string) (targetURL, scheme string) {
 	// Where to dial. A NATIVE backend is on loopback, not on the docker
 	// network — `noo-ollama` does not resolve on a Mac, and this hardcoded
 	// name is the one line that stood between a running native ollama and a
@@ -561,7 +561,7 @@ func (s *Server) inferenceTarget(backendType string, port int, native map[string
 	// and its llama.cpp is dialled at the stunnel sidecar when that runs.
 	targetURL = fmt.Sprintf("%s://noo-%s:%d", backendScheme(backendType), backendType, port)
 	if s.docker != nil {
-		targetURL = s.docker.BackendDialURL(backendType)
+		targetURL = s.docker.BackendDialURL(ctx, backendType)
 	}
 	scheme = "http"
 	if strings.HasPrefix(targetURL, "https://") {
@@ -735,7 +735,7 @@ func resolveBackendFirstByteTimeout(raw string) time.Duration {
 // The cached last-working target (if fresh) is moved to the front.
 //
 // `door` is the reranker's dial URL from the running containers'
-// declaration (dockerpkg.BackendDialURL("reranker")): the noo-stunnel-
+// declaration (dockerpkg.BackendDialURL(r.Context(), "reranker")): the noo-stunnel-
 // reranker sidecar (agent-run or compose) on :443 whatever the engine, or
 // — for a pre-door container — the plain noo-reranker. A sidecar hides the
 // engine, so both wire shapes are attempted at it, exactly as for a custom
@@ -878,7 +878,7 @@ func (s *Server) handleRerankProxy(w http.ResponseWriter, r *http.Request) {
 	// proxying. Gives a precise 503 rather than a connection error when the
 	// gateway's capability view is ahead of reality (just stopped, etc.).
 	hasReranker := false
-	for _, name := range s.docker.ContainerNames() {
+	for _, name := range s.docker.ContainerNames(r.Context()) {
 		if strings.Contains(name, "rerank") {
 			hasReranker = true
 			break
@@ -891,7 +891,7 @@ func (s *Server) handleRerankProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var lastErr string
-	for _, cand := range localRerankTargets(s.docker.BackendDialURL("reranker")) {
+	for _, cand := range localRerankTargets(s.docker.BackendDialURL(r.Context(), "reranker")) {
 		payload, path, berr := buildRerankRequest(cand.engine, body)
 		if berr != nil {
 			// Body is malformed regardless of engine — reject once.
@@ -948,7 +948,7 @@ func (s *Server) handleRerankProxy(w http.ResponseWriter, r *http.Request) {
 // sidecar with a client certificate, or a pre-door container plain until
 // the reconciler recreates it). Override with NOO_LOCAL_EMBED_URL if the
 // embedder is exposed under a different service name/port.
-func (s *Server) localEmbedURL(t embedtarget.Target) string {
+func (s *Server) localEmbedURL(ctx context.Context, t embedtarget.Target) string {
 	if u := strings.TrimSpace(os.Getenv("NOO_LOCAL_EMBED_URL")); u != "" {
 		return strings.TrimRight(u, "/")
 	}
@@ -960,7 +960,7 @@ func (s *Server) localEmbedURL(t embedtarget.Target) string {
 	// names cannot disambiguate this (ollama serves chat on some nodes and
 	// embeddings on others), so role is the only sound signal.
 	if t.Backend != "" {
-		return strings.TrimRight(s.docker.BackendDialURL(t.Backend), "/")
+		return strings.TrimRight(s.docker.BackendDialURL(ctx, t.Backend), "/")
 	}
 	if u := strings.TrimSpace(t.BaseURL); u != "" {
 		return strings.TrimRight(u, "/")
@@ -970,7 +970,7 @@ func (s *Server) localEmbedURL(t embedtarget.Target) string {
 	// historical default and the container the embedding backend spec
 	// pins, so this preserves prior behaviour rather than failing closed —
 	// at its door, never its plain port.
-	return strings.TrimRight(s.docker.BackendDialURL("embedding"), "/")
+	return strings.TrimRight(s.docker.BackendDialURL(ctx, "embedding"), "/")
 }
 
 // nativeEmbedURL is the endpoint of the declared embedder when that backend
@@ -978,12 +978,12 @@ func (s *Server) localEmbedURL(t embedtarget.Target) string {
 // placement is declared yet). The scheme is the endpoint's own: plaintext
 // loopback ollama, or the self-node's https door (backendClient picks the
 // transport from it).
-func (s *Server) nativeEmbedURL(t embedtarget.Target) (string, bool) {
+func (s *Server) nativeEmbedURL(ctx context.Context, t embedtarget.Target) (string, bool) {
 	backend := t.Backend
 	if backend == "" || s.native == nil {
 		return "", false
 	}
-	if _, running := s.nativeBackends()[backend]; !running {
+	if _, running := s.nativeBackends(ctx)[backend]; !running {
 		return "", false
 	}
 	base, ok := s.native.Endpoint(backend)
@@ -996,11 +996,11 @@ func (s *Server) nativeEmbedURL(t embedtarget.Target) (string, bool) {
 // dockerContainerNames is the container list for the embed guard, skipped for
 // a native embedder (a Mac has no Docker; the client exists but answers
 // nothing) and safe when no Docker client was built.
-func (s *Server) dockerContainerNames(native bool) []string {
+func (s *Server) dockerContainerNames(ctx context.Context, native bool) []string {
 	if native || s.docker == nil {
 		return nil
 	}
-	return s.docker.ContainerNames()
+	return s.docker.ContainerNames(ctx)
 }
 
 // backendClient is an http.Client for one backend door: the node-leaf
@@ -1066,9 +1066,9 @@ func (s *Server) embedProxyBody(w http.ResponseWriter, r *http.Request, body []b
 	// whose embed placement was live answered 503 no_local_embedder while
 	// ollama served the model fine.
 	tgt := embedTargetFor(body)
-	base, native := s.nativeEmbedURL(tgt)
+	base, native := s.nativeEmbedURL(r.Context(), tgt)
 	if !native {
-		base = s.localEmbedURL(tgt)
+		base = s.localEmbedURL(r.Context(), tgt)
 	}
 
 	// Guard: precise 503 when no embedding container is here (stale gossip).
@@ -1078,7 +1078,7 @@ func (s *Server) embedProxyBody(w http.ResponseWriter, r *http.Request, body []b
 	// declared embedder-less despite being the declared embedder.
 	wantContainer := embedContainerFromURL(base)
 	hasEmbedder := native
-	for _, name := range s.dockerContainerNames(native) {
+	for _, name := range s.dockerContainerNames(r.Context(), native) {
 		if name == wantContainer ||
 			strings.Contains(name, "tei") || strings.Contains(name, "embed") {
 			hasEmbedder = true
@@ -1222,7 +1222,7 @@ func (s *Server) embedProxyBody(w http.ResponseWriter, r *http.Request, body []b
 // so existing OpenAI clients (LangChain, LlamaIndex, etc.) work
 // unchanged when pointed at node-agent.
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
-	running := s.docker.RunningBackends()
+	running := s.docker.RunningBackends(r.Context())
 	type modelEntry struct {
 		ID      string `json:"id"`
 		Object  string `json:"object"`

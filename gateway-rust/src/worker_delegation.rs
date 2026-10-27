@@ -508,6 +508,11 @@ asyncio.run(main())
             axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await
         });
 
+        // Logged refusal, not a panic: the bus is TLS-only, so no CA, no proof.
+        let Some(ca) = crate::tls::ca_path() else {
+            eprintln!("proof refused: NOO_TLS_CA is unset; the bus is TLS-only and the worker needs the cluster CA");
+            return;
+        };
         let mut child = tokio::process::Command::new("python3")
             .arg("-c")
             .arg(WORKER)
@@ -516,7 +521,7 @@ asyncio.run(main())
             .env("HOME", std::env::var("HOME").unwrap_or_default())
             .env("NOO_PROOF_SRC", std::env::var("NOO_PROOF_SRC").expect("NOO_PROOF_SRC"))
             .env("NATS_URL", std::env::var("NATS_URL").expect("NATS_URL"))
-            .env("NOO_TLS_CA", std::env::var("NOO_TLS_CA").expect("NOO_TLS_CA: the bus is TLS-only"))
+            .env("NOO_TLS_CA", ca)
             // The worker's OWN bus key and audience —
             // never the controller secret.
             .env("NOO_BUS_KEY", std::env::var("NOO_BUS_KEY_WORKER").expect("NOO_BUS_KEY_WORKER"))

@@ -10,6 +10,7 @@
 //! reference).
 
 use super::{confirm_destructive, truncate};
+use crate::args::{ArgError, Args};
 use crate::http::{delete_json, get_json, post_json, put_json};
 use crate::ui::{self, Col, Glyph};
 use crate::{Globals, Unhandled};
@@ -338,33 +339,23 @@ pub(crate) struct HistoryArgs {
 /// disagree is a contradiction, not two filters). `--run` takes a run-id
 /// prefix of at least 8 characters and filters client-side (the gateway's
 /// /api/heartbeat/history has no run_id filter of its own).
-pub(crate) fn parse_history_args(args: &[String]) -> Result<HistoryArgs, ()> {
-    let mut limit = 20u64;
-    let mut task_id: Option<String> = None;
-    let mut run_prefix: Option<String> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--limit" | "-n" => limit = iter.next().and_then(|v| v.parse().ok()).ok_or(())?,
-            "--task-id" => {
-                let v = iter.next().ok_or(())?.clone();
-                match &task_id {
-                    Some(existing) if existing != &v => return Err(()),
-                    _ => task_id = Some(v),
-                }
+pub(crate) fn parse_history_args(args: &[String]) -> Result<HistoryArgs, ArgError> {
+    parse_history_with(&mut Args::new(args))
+}
+
+pub(crate) fn parse_history_with(a: &mut Args) -> Result<HistoryArgs, ArgError> {
+    let limit = a.number::<u64>(&["--limit", "-n"])?.unwrap_or(20);
+    let mut task_id = a.value(&["--task-id"])?;
+    let run_prefix = a.value(&["--run"])?;
+    if run_prefix.as_ref().is_some_and(|v| v.chars().count() < 8) {
+        return Err(ArgError::new("--run needs a run id of at least 8 characters"));
+    }
+    for t in a.positionals()? {
+        match &task_id {
+            Some(existing) if existing != &t => {
+                return Err(ArgError::new(format!("task id `{t}` contradicts `{existing}`")));
             }
-            "--run" => {
-                let v = iter.next().ok_or(())?.clone();
-                if v.chars().count() < 8 {
-                    return Err(());
-                }
-                run_prefix = Some(v);
-            }
-            t if t.starts_with('-') => return Err(()),
-            t => match &task_id {
-                Some(existing) if existing != t => return Err(()),
-                _ => task_id = Some(t.to_string()),
-            },
+            _ => task_id = Some(t),
         }
     }
     Ok(HistoryArgs { task_id, run_prefix, limit })
@@ -374,7 +365,7 @@ pub(crate) fn parse_history_args(args: &[String]) -> Result<HistoryArgs, ()> {
 /// [--limit <n>]` — GET /api/heartbeat/history.
 pub fn heartbeat_history(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     crate::ui::auto_page(); // long output: $PAGER on a TTY (no-op otherwise)
-    let parsed = parse_history_args(args).map_err(|_| Unhandled)?;
+    let parsed = parse_history_args(args)?;
     let mut path = format!("/api/heartbeat/history?limit={}", parsed.limit);
     if let Some(t) = &parsed.task_id {
         path.push_str(&format!("&task_id={}", super::urlencode(t)));

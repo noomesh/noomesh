@@ -322,7 +322,7 @@ jobs:
       with:
         version: v5.0.2
 
-    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
       with:
         python-version-file: .python-version
     - name: Cache pip packages
@@ -693,7 +693,7 @@ jobs:
         node-version: 22
         cache: npm
         cache-dependency-path: ui/package-lock.json
-    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
       with:
         python-version-file: .python-version
 
@@ -778,7 +778,7 @@ jobs:
       with:
         persist-credentials: false
 
-    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
       if: needs.scope.outputs.sqlx == 'true'
       with:
         # Read from the same `.python-version` as every other job.
@@ -1009,8 +1009,10 @@ jobs:
       # several modules, and a filter that names modules silently under-runs
       # when the next one arrives. The ungated tests re-run in seconds on the
       # warm target, so this also proves they hold with a live database.
-      run: cargo test --bin noo-gateway -- --test-threads=1
-
+      #
+      # --skip router_harness_tests: that suite has its own job
+      # (router-harness), so it runs exactly once and its tally is visible.
+      run: cargo test --bin noo-gateway -- --test-threads=1 --skip router_harness_tests
 
     # Prune before saving: incremental dirs, the crate's own (test) binaries
     # and top-level outputs go; dependency artifacts stay. A target still over
@@ -1032,6 +1034,125 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           ~/.cargo/bin
+          gateway-rust/target
+        key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  # ── The router harness (followup i242) ────────────────────────────────────
+  #
+  # The REAL router on a throwaway database, asserting authz (a viewer is
+  # refused on every Operator/OperatorOrInternal/Admin route, enumerated from
+  # the source), `redis_reconnecting` and `Measured` with Redis absent. A job of
+  # its own because it first lived as a step of sqlx-drift, whose steps are all
+  # gated on `scope.outputs.sqlx` + the trellion switch (migrations/.sqlx
+  # changes only): on a gateway-only PR every step was skipped, and a skipped
+  # job reads as a pass. This one is gated on the same output as rust-gateway,
+  # `gateway`, so it runs whenever the gateway crate is built. Like
+  # rust-gateway it is deferred on a PR into dev (label `full-ci` to run it
+  # there) and always runs in the merge queue.
+  #
+  # Host toolchain, not scripts/cargo-docker.sh: the test must reach the
+  # Postgres SERVICE on localhost:5432, and the container wrapper neither joins
+  # the host network nor passes the DSN through. sqlx-drift does the same.
+  #
+  # NOO_ROUTER_HARNESS_REQUIRED=1: without the DSN the harness skips with a
+  # printed reason, and a skip looks exactly like a pass. Here a missing DSN
+  # fails the run, and the log must carry all three tallies, so a harness that
+  # matched no test (a rename) cannot go green either.
+  router-harness:
+    runs-on: ubuntu-latest
+    needs: [preflight, scope]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' }}
+    services:
+      postgres:
+        # pgvector, not plain postgres: the migrations create `vector` columns.
+        # pg18 to match the controller image. Not cosmetic: the baseline check
+        # compares pg_dump output, which differs between major versions, so an
+        # older service would fail the check on the version rather than on
+        # drift. Bump with docker/Dockerfile.postgres. Pulled from the GHCR
+        # mirror, not Docker Hub, so a Hub outage cannot hang the job.
+        image: ${{ vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false' && 'pgvector/pgvector:pg18' || format('ghcr.io/{0}/pgvector:pg18', github.repository_owner) }}
+        # One expression for the whole mapping: an empty string is falsy in
+        # GitHub expressions (so `cond && '' || x` always yields x) and the
+        # runner rejects '' or null inside `credentials`. So it is the GHCR
+        # login object when the mirror is on, and {} (no login, the token is
+        # never offered to Docker Hub) when HUB_MIRROR_OFF is set.
+        credentials: ${{ fromJSON(!(vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false') && format('{{"username":"{0}","password":"{1}"}}', github.actor, secrets.GITHUB_TOKEN) || '{}') }}
+        env:
+          POSTGRES_USER: noo
+          POSTGRES_PASSWORD: noo
+          POSTGRES_DB: noomesh
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://noo:noo@localhost:5432/noomesh
+      # The role-creating migrations refuse to invent a password ("a predictable
+      # password on a login role is worse than a failed migration"), so each
+      # needs one here. A literal, not a secret: this Postgres is a throwaway
+      # service container on an ephemeral runner, and a secret would imply a
+      # confidentiality it does not have. List them with:
+      NOO_APP_DB_PASSWORD: ci-ephemeral-not-a-secret
+      #   grep -rl _DB_PASSWORD src/noomesh/db/migrations/versions/
+      NOO_EVOLVE_DB_PASSWORD: ci-ephemeral-not-a-secret
+      NOO_TRELLION_DB_PASSWORD: ci-ephemeral-not-a-secret
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Refuse HUB_MIRROR_OFF on a public repository
+      if: github.repository == 'noomesh/noomesh' && vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false'
+      run: |
+        echo "::error::HUB_MIRROR_OFF is set on a public repository: Docker Hub pulls are rate limited. Populate the GHCR mirrors and delete the variable."
+        exit 1
+    - name: Rust toolchain id (cache key)
+      id: rustc
+      if: needs.scope.outputs.gateway == 'true'
+      working-directory: gateway-rust
+      run: echo "id=$(rustc -V | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+    - name: Restore cargo cache
+      id: cargo-cache
+      if: needs.scope.outputs.gateway == 'true'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          gateway-rust/target
+        key: ${{ runner.os }}-cargo-routerharness-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('gateway-rust/Cargo.lock') }}-${{ hashFiles('gateway-rust/src/**', 'gateway-rust/.sqlx/**', 'gateway-rust/Cargo.toml', 'gateway-rust/build.rs') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-routerharness-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('gateway-rust/Cargo.lock') }}-
+          ${{ runner.os }}-cargo-routerharness-rustc${{ steps.rustc.outputs.id }}-
+
+    - name: Router harness (real router, real Postgres, no Redis, no NATS)
+      if: needs.scope.outputs.gateway == 'true'
+      working-directory: gateway-rust
+      env:
+        NOO_BROKER_TEST_DSN: postgresql://noo:noo@localhost:5432/noomesh
+        NOO_ROUTER_HARNESS_REQUIRED: "1"
+        SQLX_OFFLINE: "true"
+      run: |
+        set -euo pipefail
+        cargo test --locked --bin noo-gateway router_harness_tests -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/router-harness.log"
+        for tally in "router_harness: authz" "router_harness: redis_reconnecting" "router_harness: Measured"; do
+          grep -q "$tally" "$RUNNER_TEMP/router-harness.log" || { echo "::error::the router harness did not report '$tally' — it matched no test or skipped"; exit 1; }
+        done
+
+    - name: Prune cargo target before the cache save
+      if: needs.scope.outputs.gateway == 'true' && github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') && steps.cargo-cache.outputs.cache-hit != 'true'
+      continue-on-error: true
+      working-directory: ${{ github.workspace }}
+      run: scripts/ci-prune-cargo-target.sh gateway-rust 4
+
+    - name: Save cargo cache (dev pushes only)
+      if: needs.scope.outputs.gateway == 'true' && github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') && steps.cargo-cache.outputs.cache-hit != 'true'
+      continue-on-error: true
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
           gateway-rust/target
         key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
@@ -1256,7 +1377,7 @@ jobs:
   # NO Python at all: the linux-gnu binary is built on the runner, then
   # executed inside a bare ubuntu:24.04 container (same glibc as
   # ubuntu-latest, no python3/python preinstalled) so nothing can silently
-  # fall back to the Python CLI.
+  # fall back to a Python install.
   standalone-smoke:
     runs-on: ubuntu-latest
     needs: [preflight, scope]

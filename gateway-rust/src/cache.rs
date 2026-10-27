@@ -235,7 +235,7 @@ impl RedisCache {
 
         // Configure mTLS when cluster PKI is available
         // Redis is configured with --tls-auth-clients yes, so we must present client certs
-        let ca_path = std::env::var("NOO_TLS_CA").unwrap_or_default();
+        let ca_path = crate::tls::ca_path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
         let cert_path = std::env::var("NOO_TLS_CERT").unwrap_or_default();
         let key_path = std::env::var("NOO_TLS_KEY").unwrap_or_default();
 
