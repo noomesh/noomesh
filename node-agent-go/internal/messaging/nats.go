@@ -748,13 +748,39 @@ func (c *Client) WaitForConnection(ctx context.Context, timeout time.Duration) b
 	}
 }
 
-// buildNATSTLS creates a TLS config for NATS from PAI environment variables.
+// buildNATSTLS creates a TLS config for NATS from the node's cluster PKI
+// paths (read through ctrlenv).
+//
+// The NATS server runs `verify: true`, so a client without a certificate is
+// refused at the handshake. A CA with no client certificate therefore never
+// produced a working connection, only an agent looping on "nats not yet
+// connected" with the cause buried; it is refused here, naming the missing
+// variable. The agent itself cannot reach this state (config refuses to start
+// without all three), so this guards the transport against drifting from that
+// rule.
+//
+// With NOO_TLS_CA unset the config carries no RootCAs (system roots) and a
+// client certificate only when both cert and key are set; a lone cert or key
+// is an error.
 func buildNATSTLS() (*tls.Config, error) {
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
 
-	// Load CA cert
 	caPath := ctrlenv.TLSCA()
+	certPath := ctrlenv.TLSCert()
+	keyPath := ctrlenv.TLSKey()
+
 	if caPath != "" {
+		var missing []string
+		if certPath == "" {
+			missing = append(missing, "NOO_TLS_CERT")
+		}
+		if keyPath == "" {
+			missing = append(missing, "NOO_TLS_KEY")
+		}
+		if len(missing) > 0 {
+			return nil, fmt.Errorf("NOO_TLS_CA is set but %s not set: the NATS server requires a client certificate, so a CA-only connection would be refused (`noo cluster provision <node>` delivers the node certificate)",
+				strings.Join(missing, ", "))
+		}
 		caPEM, err := os.ReadFile(caPath)
 		if err != nil {
 			return nil, fmt.Errorf("reading NATS CA: %w", err)
@@ -766,10 +792,14 @@ func buildNATSTLS() (*tls.Config, error) {
 		tlsCfg.RootCAs = pool
 	}
 
-	// Load client cert for mTLS
-	certPath := ctrlenv.TLSCert()
-	keyPath := ctrlenv.TLSKey()
-	if certPath != "" && keyPath != "" {
+	if (certPath == "") != (keyPath == "") {
+		missing := "NOO_TLS_CERT"
+		if certPath != "" {
+			missing = "NOO_TLS_KEY"
+		}
+		return nil, fmt.Errorf("%s not set: a NATS client certificate needs both NOO_TLS_CERT and NOO_TLS_KEY", missing)
+	}
+	if certPath != "" {
 		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 		if err != nil {
 			return nil, fmt.Errorf("loading NATS client cert: %w", err)
