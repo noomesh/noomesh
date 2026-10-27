@@ -147,11 +147,12 @@
 		// service key on every request. Nothing to open.
 	],
 
-	// Tailscale SSH: no rules, so Tailscale refuses every Tailscale SSH
-	// connection even on a device that runs it. noomesh never uses it
-	// (`noo enroll` joins nodes with `--ssh=false`). This is NOT ordinary
-	// sshd: an admin's own SSH to port 22 rides the `autogroup:admin` acl
-	// above and is unaffected. Stated empty on purpose, so turning Tailscale
-	// SSH on is a visible edit here, not a missing section.
-	"ssh": [],
+	// Tailscale SSH: this file grants none, and has no `ssh` section on
+	// purpose. The tailnet merge is additive and leaves a tailnet's own
+	// `ssh` rules alone, so an empty list here would remove nothing; it
+	// refuses any `ssh` section instead. noomesh never uses Tailscale SSH:
+	// `noo enroll` joins nodes with `--ssh=false`, and `noo cluster verify`
+	// warns on a mesh device that runs it. To refuse it tailnet-wide, delete
+	// the `ssh` rules in the admin console. This is NOT ordinary sshd: an
+	// admin's own SSH to port 22 rides the `autogroup:admin` acl above.
 }
