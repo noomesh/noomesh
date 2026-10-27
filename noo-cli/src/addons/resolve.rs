@@ -25,7 +25,7 @@
 //!      `<root>/addons/<addon>/` (a lock without files removes that directory).
 //!
 //! Steps 1-6 decide; nothing is written until all of them pass. The offline
-//! twin ([`offline_check`]) re-runs 1, 3, 4 and the pin comparison from the
+//! twin ([`offline_check_files`]) re-runs 1, 3, 4 and the pin comparison from the
 //! cache, and holds the materialised files to the cached lock, for `noo
 //! addons verify` and the launcher.
 
@@ -414,13 +414,15 @@ pub fn record(
     Ok(pin)
 }
 
-/// The offline check: the cached lock still verifies against `anchor`,
-/// lists `tag`, and is exactly what the pin says. Returns the pin.
+/// [`offline_check_files`] without the file list; the tests' shorthand.
+#[cfg(test)]
 pub fn offline_check(root: &Path, addon: &str, tag: &str, anchor: &TrustAnchor) -> Result<Pin, String> {
     offline_check_files(root, addon, tag, anchor).map(|(pin, _)| pin)
 }
 
-/// [`offline_check`], also returning the file names the verified lock lists
+/// The offline check: the cached lock still verifies against `anchor`,
+/// lists `tag`, and is exactly what the pin says. Returns the pin and
+/// the file names the verified lock lists
 /// (each verified against its materialised copy). The launcher copies a
 /// declaration file (`decls::DECL_FILES`) only when it is listed here, so an
 /// unsigned file left beside the bundle never reaches the gateway.

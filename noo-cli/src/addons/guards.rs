@@ -131,7 +131,7 @@ fn untag(v: &Value) -> &Value {
     }
 }
 
-fn mapping<'a>(v: Option<&'a Value>) -> Option<&'a serde_yaml::Mapping> {
+fn mapping(v: Option<&Value>) -> Option<&serde_yaml::Mapping> {
     v.map(untag).and_then(Value::as_mapping)
 }
 
