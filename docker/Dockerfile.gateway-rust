@@ -130,6 +130,9 @@ COPY config/harness-kinds.json /config/harness-kinds.json
 # The harness profile defaults per tier (src/harness_profile.rs include_str!s
 # it as ../../config/harness-profiles.json).
 COPY config/harness-profiles.json /config/harness-profiles.json
+# The model capabilities table (src/model_capabilities.rs include_str!s it as
+# ../../config/model-capabilities.json).
+COPY config/model-capabilities.json /config/model-capabilities.json
 # The provisioned Grafana dashboards: src/routes/grafana_ds.rs include_str!s
 # each one as ../../../configs/grafana/dashboards/… and builds the read-only
 # tier's query allow-list from them. One line per file;

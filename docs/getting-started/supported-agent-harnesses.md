@@ -360,7 +360,11 @@ kind's floor as `min_context_tokens` (`min_context_tokens_slim` for Claude
 Code's slim launch). `noo cluster place <node> harness --kind <kind>` compares
 it with the node's chat window: the running chat placement's own key
 (`VLLM_MAX_MODEL_LEN`, `OLLAMA_CONTEXT_LENGTH`, or llama.cpp's `N_CTX` divided
-by its parallel slots), else the profile's `context`.
+by its parallel slots), else the profile's `context`. The window is capped
+by the model's own context ceiling when `config/model-capabilities.json`
+declares one: no engine setting gives a model more than it was built for, and
+a refusal the ceiling decides suggests a different model rather than a larger
+window. A model the table does not declare has no ceiling.
 
 - **Below the floor:** refused with the numbers, `noo` named as the kind that
   fits, and the `noo cluster place … --env` line that raises the window.

@@ -1,0 +1,14 @@
+{
+  "_comment": "Model capabilities, declared once (i226 decision 3). Each row's `match` globs are tried against the placement's model id, lower-cased, with any registry or org prefix up to the last '/' removed; the first row that matches wins. A model with no row is unknown: no ceiling is assumed, so nothing is refused for it. `max_context` is the model's own context ceiling in tokens; `evidence` says where the number was read.",
+  "models": [
+    {
+      "family": "gemma-4-12b",
+      "match": [
+        "gemma-4-12b*",
+        "gemma4:12b*"
+      ],
+      "max_context": 262144,
+      "evidence": "text_config.max_position_embeddings of google/gemma-4-12B-it-qat-w4a16-ct and gemma4.context_length of Ollama gemma4:12b, both 262144, read on awolf 2026-10-27"
+    }
+  ]
+}
