@@ -2308,6 +2308,57 @@ pub(crate) fn docker_userns_check(daemon_json: Result<Option<String>, String>) -
     )
 }
 
+/// The controller's own `tailscale status --json`, or why it could not be read.
+fn read_tailscale_status() -> Result<Value, String> {
+    let out = std::process::Command::new(crate::commands::enroll::ts_bin())
+        .args(["status", "--json"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
+}
+
+/// The "tailscale ssh" row. noomesh never uses Tailscale SSH (the
+/// controller reaches nodes over mTLS; `noo enroll` joins with
+/// `--ssh=false`), and its port forwarding has had root-level flaws, so a
+/// mesh device (tag:worker / tag:controller / tag:kiosk) that advertises
+/// it is a WARN naming the box. Read from the controller's own tailnet
+/// view: a device running Tailscale SSH publishes SSH host keys to its
+/// peers. Ordinary sshd is not this row's business.
+pub(crate) fn tailscale_ssh_check(status: Result<Value, String>) -> Check {
+    const NAME: &str = "tailscale ssh";
+    let status = match status {
+        Ok(s) => s,
+        Err(e) => return warn(NAME, format!("could not read `tailscale status --json` here ({e}), so Tailscale SSH on mesh devices is not proven off"), None),
+    };
+    let mesh = |d: &Value| {
+        d["Tags"].as_array().is_some_and(|t| {
+            t.iter().any(|x| matches!(x.as_str(), Some("tag:worker" | "tag:controller" | "tag:kiosk")))
+        })
+    };
+    let runs_ssh = |d: &Value| d["sshHostKeys"].as_array().is_some_and(|k| !k.is_empty());
+    let mut devices: Vec<&Value> = vec![&status["Self"]];
+    if let Some(peers) = status["Peer"].as_object() {
+        devices.extend(peers.values());
+    }
+    let mut on: Vec<String> = devices
+        .into_iter()
+        .filter(|d| mesh(d) && runs_ssh(d))
+        .map(|d| d["HostName"].as_str().unwrap_or("?").to_string())
+        .collect();
+    on.sort();
+    if on.is_empty() {
+        return ok(NAME, "no mesh device advertises Tailscale SSH");
+    }
+    warn(
+        NAME,
+        format!("Tailscale SSH is on for {} — noomesh never uses it, and its port forwarding has had unpatched root-level flaws", on.join(", ")),
+        Some("on each named box: sudo tailscale set --ssh=false".into()),
+    )
+}
+
 /// Everything the gateway may mount from the PKI dir: the
 /// CA certificate, its own leaf, the Grafana SSO pair it signs with, and
 /// the certificate-only view of `nodes/` and `services/`. Of these only
@@ -5516,6 +5567,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .collect();
         checks.push(pki_key_modes_check(&key_issues, &grant_lines, sso.list_keys().len()));
         checks.push(docker_userns_check(read_daemon_json()));
+        checks.push(tailscale_ssh_check(read_tailscale_status()));
         let gw_mounts = std::fs::read_to_string(crate::envfile::repo_root().join("docker-compose.cluster.yml"))
             .ok()
             .and_then(|c| gateway_pki_mounts(&c));
@@ -7655,6 +7707,30 @@ mod tests {
     /// A remapping daemon is a FAIL naming the
     /// setting; no file, or the key absent or empty, is OK; unreadable or
     /// garbled is a WARN that says it could not tell.
+    /// A mesh device advertising SSH host keys is a WARN naming it; an
+    /// untagged device (a phone, a laptop) is not the mesh's business; an
+    /// unreadable status says it could not tell.
+    #[test]
+    fn the_tailscale_ssh_row_names_mesh_devices_that_run_it() {
+        let st = serde_json::json!({
+            "Self": {"HostName": "pop-os", "Tags": ["tag:controller"]},
+            "Peer": {
+                "a": {"HostName": "aserve", "Tags": ["tag:worker"], "sshHostKeys": ["ssh-ed25519 AAAA"]},
+                "b": {"HostName": "laptop", "sshHostKeys": ["ssh-ed25519 BBBB"]},
+                "c": {"HostName": "robopi", "Tags": ["tag:worker"], "sshHostKeys": []}
+            }
+        });
+        let c = tailscale_ssh_check(Ok(st));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("aserve") && !c.detail.contains("laptop") && !c.detail.contains("robopi"), "{}", c.detail);
+        assert!(c.remedy.unwrap().contains("tailscale set --ssh=false"));
+        let quiet = serde_json::json!({"Self": {"HostName": "pop-os", "Tags": ["tag:controller"]}, "Peer": {}});
+        assert_eq!(tailscale_ssh_check(Ok(quiet)).verdict, Verdict::Ok);
+        let self_on = serde_json::json!({"Self": {"HostName": "pop-os", "Tags": ["tag:controller"], "sshHostKeys": ["k"]}});
+        assert!(tailscale_ssh_check(Ok(self_on)).detail.contains("pop-os"));
+        assert_eq!(tailscale_ssh_check(Err("not running".into())).verdict, Verdict::Warn);
+    }
+
     #[test]
     fn the_docker_userns_row_fails_a_remapping_daemon() {
         let c = docker_userns_check(Ok(Some(r#"{"data-root":"/data/docker","userns-remap":"default"}"#.into())));

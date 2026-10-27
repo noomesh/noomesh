@@ -1305,6 +1305,8 @@ pub fn tailscale(ctx: &mut Ctx) -> bool {
         if controller_tag {
             argv.push("--advertise-tags=tag:controller".into());
         }
+        // noomesh never uses Tailscale SSH; the box joins with it off.
+        argv.push("--ssh=false".into());
         let up_cmd = argv.join(" ");
         if ctx.asker.confirm(
             &format!(

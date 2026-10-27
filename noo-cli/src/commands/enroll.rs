@@ -673,7 +673,9 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 ui::step("Joining the tailnet (one sudo) ...");
             }
             let mut up = Command::new("sudo");
-            up.args([ts_bin(), "up", &format!("--auth-key={tsk}"), "--advertise-tags=tag:worker"]);
+            // `--ssh=false`: noomesh never uses Tailscale SSH (the controller
+            // reaches nodes over mTLS), so a node joins with it explicitly off.
+            up.args([ts_bin(), "up", &format!("--auth-key={tsk}"), "--advertise-tags=tag:worker", "--ssh=false"]);
             if let Some(h) = &hostname_arg {
                 up.arg(h);
             }
@@ -691,7 +693,7 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     .and_then(|s| s.split('"').nth(1))
                     .map(str::to_string);
                 let mut retry = Command::new("sudo");
-                retry.args([ts_bin(), "up", "--reset", &format!("--auth-key={tsk}"), "--advertise-tags=tag:worker"]);
+                retry.args([ts_bin(), "up", "--reset", &format!("--auth-key={tsk}"), "--advertise-tags=tag:worker", "--ssh=false"]);
                 if let Some(h) = &prev_host {
                     if !h.is_empty() {
                         retry.arg(format!("--hostname={h}"));
@@ -1330,7 +1332,7 @@ fn tailscale_logs_off() {
 }
 
 /// tailscale binary path: brew installs outside the default non-login PATH.
-fn ts_bin() -> &'static str {
+pub(crate) fn ts_bin() -> &'static str {
     if std::path::Path::new("/opt/homebrew/bin/tailscale").exists() {
         "/opt/homebrew/bin/tailscale"
     } else {
