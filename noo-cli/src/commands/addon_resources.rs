@@ -41,6 +41,7 @@ use crate::{Globals, Unhandled};
 
 const LAUNCH_USAGE: &str = "noo addons launch-resources --root <d> --tag <t> --project <p> --network <n> <name>...";
 
+#[derive(Debug)]
 struct LaunchArgs {
     root: PathBuf,
     tag: String,
