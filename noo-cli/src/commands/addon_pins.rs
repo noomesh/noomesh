@@ -149,6 +149,10 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     };
                     let route = client.route(&anchor).map_err(resolve::Refusal::Route)?;
                     addons::resolve_lock(client, &anchor, &want, supplied)
+                        .and_then(|(v, f)| {
+                            addons::guards::guard_install(&root, addon, &f.files).map_err(resolve::Refusal::Decl)?;
+                            Ok((v, f))
+                        })
                         .and_then(|(v, f)| resolve::require_bundle(&v, &tag).map(|()| (v, f)))
                         .map(|(v, f)| (pins::Pin::from_verified(&v, &tag, &f.lock, route.pulled_from()), 0usize, client.describe(&route)))
                 })
@@ -245,13 +249,20 @@ pub(crate) fn verify_one(
             return v;
         }
     };
-    let pin = match resolve::offline_check(root, addon, tag, &anchor) {
+    let (pin, listed) = match resolve::offline_check_files(root, addon, tag, &anchor) {
         Ok(p) => p,
         Err(e) => {
             v.problem = Some(e);
             return v;
         }
     };
+    // The materialised bundle (each file just verified against the lock)
+    // passes the add-on guards it passed when it was pinned (`guards`).
+    let files = crate::addons::pins::materialised_files(root, addon, listed.iter());
+    if let Err(e) = crate::addons::guards::guard_install(root, addon, &files) {
+        v.problem = Some(e);
+        return v;
+    }
     for (name, r) in &pin.local_images() {
         let pinned_id = if docker.image_present(r) {
             match docker.image_id(r) {
@@ -550,7 +561,34 @@ mod tests {
         let d = std::env::temp_dir().join(format!("noo-addon-pins-cmd-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
+        // An install has core compose files; the add-on guards read them.
+        std::fs::write(d.join("docker-compose.cluster.yml"), CORE_COMPOSE).unwrap();
         d
+    }
+
+    const CORE_COMPOSE: &str = "services:\n  gateway:\n    image: g\nsecrets:\n  noo_jwt_secret:\n    file: ${NOO_SECRET_RUNDIR:-/x}/noo_jwt_secret\n    x-noo-source: NOO_JWT_SECRET\n";
+
+    /// A bundle that verified and was pinned, then fails the add-on guards
+    /// (an overlay sourcing core's JWT secret): `noo addons verify` says so,
+    /// naming the add-on and the variable. Reverting the guard call in
+    /// `verify_one` passes the verdict.
+    #[test]
+    fn verify_refuses_a_pinned_overlay_that_takes_a_core_secret() {
+        let d = scratch("guard");
+        let overlay = format!("{OVERLAY}secrets:\n  stolen:\n    file: ${{NOO_SECRET_RUNDIR:-/x}}/stolen\n    x-noo-source: NOO_JWT_SECRET\n");
+        let f = crate::addons::resolve::tests::signed_bundle_with(&lock("1.2.0", &["v0.6.0"], None), &overlay);
+        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let v = resolve::check(&f, &anchor(), &want).unwrap();
+        resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0", None).unwrap();
+        let reference = v.lock.images["trellion-intel"].clone();
+        let mut docker = FakeDocker { local: vec![reference.clone()], ids: vec![(reference, "sha256:x".into())], ..Default::default() };
+        let verdict = verify_one(&d, "trellion_intel", "v0.6.0", Ok(anchor()), &mut docker, &[]);
+        let problem = verdict.problem.expect("the guard refuses it");
+        assert!(problem.contains("trellion_intel") && problem.contains("NOO_JWT_SECRET"), "{problem}");
+        // The same root with the add-on's own overlay passes: the refusal is the guard's.
+        let (ok_root, r) = pinned_root("guard-ok");
+        let mut docker = FakeDocker { local: vec![r.clone()], ids: vec![(r, "sha256:x".into())], ..Default::default() };
+        assert!(verify_one(&ok_root, "trellion_intel", "v0.6.0", Ok(anchor()), &mut docker, &[]).problem.is_none());
     }
 
     fn pinned_root(tag: &str) -> (std::path::PathBuf, String) {

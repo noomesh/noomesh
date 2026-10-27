@@ -24,7 +24,12 @@
 //! | `gen <addon> <path>` | the fresh generation: mark it complete once handed over |
 //! | `stale <addon> <path>` | an older generation: remove it |
 //! | `notice <addon> <text>` | an OPTIONAL resource could not be produced and was skipped |
-//! | `refuse <addon> <why>` | leave the add-on out of this start, naming the resource |
+//! | `refuse <addon> <why>` | leave the add-on out of this start, naming the resource or the secret |
+//!
+//! Every add-on on is checked here (`addons::guards`), with or without a
+//! `resources.json`: its overlay may source, reference or interpolate only
+//! its own secrets, and a third-party add-on may not hold a core name. A
+//! refusal is a `refuse` line, so the launcher leaves it out of the start.
 //!
 //! No line carries a secret: a secret part cannot be declared with an
 //! environment delivery (`resources::parse`), and files are written here, on
@@ -34,7 +39,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use crate::addons::{decls, pins, resolve, resources};
+use crate::addons::{decls, guards, pins, resolve, resources};
 use crate::output::{fail, ExitCode};
 use crate::ui;
 use crate::{Globals, Unhandled};
@@ -159,6 +164,12 @@ fn launch_one(a: &LaunchArgs, addon: &str, dev: Option<&Path>, store: &mut Optio
         Ok(f) => f,
         Err(e) => return vec![refuse(e)],
     };
+    // What its overlay takes from core (only its own secrets) and, for a
+    // third-party add-on, its name: checked again here, on the files this
+    // start composes, before any of its inputs is produced.
+    if let Err(e) = guards::guard_install(&a.root, addon, &files) {
+        return vec![refuse(e)];
+    }
     if resolve::third_party(addon) {
         let overlay = files.get("docker-compose.yml").map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
         match resources::holds(&overlay) {
@@ -313,6 +324,33 @@ pub(crate) fn show_rows(addon: &str, res: &resources::Resources) -> (Vec<Vec<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The launch-time half of the secrets guard, on a development overlay
+    /// (the `<name>=<overlay>` form reads the files beside it): an overlay
+    /// that sources core's JWT secret is a `refuse` line naming the add-on
+    /// and the variable, and nothing else is printed for it. Reverting the
+    /// `guards::guard_install` call in `launch_one` prints no refusal.
+    #[test]
+    fn launch_refuses_an_overlay_that_sources_a_core_secret() {
+        let d = std::env::temp_dir().join(format!("noo-launch-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("addons/rhaddon")).unwrap();
+        std::fs::write(
+            d.join("docker-compose.cluster.yml"),
+            "services:\n  gateway:\n    image: g\nsecrets:\n  noo_jwt_secret:\n    file: ${NOO_SECRET_RUNDIR:-/x}/noo_jwt_secret\n    x-noo-source: NOO_JWT_SECRET\n",
+        )
+        .unwrap();
+        let overlay = d.join("addons/rhaddon/docker-compose.yml");
+        let a = LaunchArgs { root: d.clone(), tag: String::new(), project: "noomesh".into(), cluster_network: "noo-cluster".into(), addons: vec![] };
+        std::fs::write(&overlay, "services:\n  noo-rhaddon:\n    image: x\n    environment:\n      K: ${NOO_JWT_SECRET}\n").unwrap();
+        let lines = launch_one(&a, "rhaddon", Some(overlay.as_path()), &mut None);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("refuse rhaddon ") && lines[0].contains("NOO_JWT_SECRET"), "{lines:?}");
+        // Its own: no refusal (no resources.json, so nothing else is printed).
+        std::fs::write(&overlay, "services:\n  noo-rhaddon:\n    image: ${NOO_ADDON_IMAGE_RHADDON:-x}\n").unwrap();
+        assert!(launch_one(&a, "rhaddon", Some(overlay.as_path()), &mut None).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn launch_args_parse_names_and_dev_overlays() {

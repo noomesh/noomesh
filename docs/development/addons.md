@@ -1333,7 +1333,8 @@ private Docker network to attach a runner to (the `noo-db` network of this
 stack), and the read-only credential files under
 `/run/noo/provision/<name>/` (`/dev/shm/noo-provision-<uid>/<name>/` when not
 root, or `$NOO_PROVISION_RUNDIR`; tmpfs only, gone at reboot, rewritten by a
-re-run): `ca.crt`, `client.crt` / `client.key` (the add-on's own service leaf),
+re-run): `ca.crt`, `client.crt` / `client.key` (the add-on's own client leaf,
+`pki/addons/<name>/db-client`, `CN=addon:<name>/db-client`),
 and one libpq `pgpass.<role>` per role. Run a runner as your own uid, on that
 network only, with nothing published:
 
@@ -1450,7 +1451,7 @@ add-on; its overlay and `system.json` sit beside it).
 | Kind | Parts | What you get |
 |---|---|---|
 | `gateway` | `url`, `ca`, `public_origin` | `https://gateway:8080` (on the cluster network); the cluster CA, so a client of yours can trust the gateway; the browser origin(s) allowed to reach you (`NOO_CONSOLE_ORIGIN`, else this host on 443 and on the gateway port) |
-| `tls_leaf` | `cert`, `key`, `ca` (with `hostname`) | a leaf from the fleet PKI for `noo-<addon>` or `noo-<addon>-<suffix>` (your name with `_` as `-`). It is a service leaf (`O=Mesh Cluster Service`): it names a service, never a node. Re-issued when it has 30 days or fewer left |
+| `tls_leaf` | `cert`, `key`, `ca` (with `hostname`) | a leaf from the fleet PKI for `noo-<addon>` or `noo-<addon>-<suffix>` (your name with `_` as `-`) as its DNS name. It is a service leaf (`O=Mesh Cluster Service`): it names a service, never a node. Its CN is `addon:<addon>/<hostname>`, which no core grant names, so it can never stand for a core service. Re-issued when it has 30 days or fewer left |
 | `addon_key` | none | your outbound gateway key (`x-noo-addon` `key:` in your overlay), minted by `noo addons enable` |
 | `shared_secret` | none | 32 random bytes, minted into the encrypted store by `noo addons enable` as `NOO_ADDON_SECRET_<ADDON>__<NAME>`. It is never rotated silently: `noo addons rotate-secret <name> <resource>` rotates it, and `noo stack restart <name> --force` hands the new value over |
 | `db` | `url`, `ca`, `cert`, `key`, `passfile` | the **runtime** role only (`noo_<id>`, never the migration role). Needs `system.json`. The URL is `postgresql://noo_<id>@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=…&sslcert=…&sslkey=…&passfile=…`, and its query names the container paths of the other four parts, computed from the mount `target`s |
@@ -1490,6 +1491,35 @@ anything is pinned:
 
 At launch, the launcher also refuses a variable that a core compose file
 reads.
+
+**Your overlay takes only your own secrets.** A top-level secret in your
+overlay (`x-noo-source:` or `environment:`), a secret your services list, and
+a variable your overlay interpolates (`$VAR`, `${VAR…}`) may be a secret only
+when it is one of yours, each name derived from your add-on's name (`<ID>` is
+the name upper-cased, `-` as `_`):
+
+| Variable | What |
+|---|---|
+| `NOO_SVC_KEY_<ID>` | your gateway key (`x-noo-addon` `key:` must be exactly this) |
+| `NOO_BUS_KEY_<ID>` | your bus-principal key |
+| `NOO_<ID>_DB_PASSWORD`, `NOO_<ID>_DDL_PASSWORD`, `NOO_PGPASS_<ID>` | your database roles' passwords, and the pgpass body built from them |
+| `NATS_<ID>_PASSWORD` | your NATS principal, when `x-noo-addon` `nats_principal:` names your add-on |
+| `NOO_ADDON_SECRET_<ID>__<NAME>` | each `shared_secret` your `resources.json` declares |
+
+Anything else core or another add-on holds (`NOO_JWT_SECRET`, another add-on's
+key, a secret core declares) is refused, naming your add-on and the variable,
+at `noo addons enable | upgrade | verify` (before anything is pinned or
+pulled) and again at every launch (your add-on is left out of that start; the
+rest starts). A secret's `file:` must be `${NOO_SECRET_RUNDIR…}/<its name>`:
+the launcher writes it, and no host file is read. A third-party add-on also
+may not `extends:` a service of another compose file (it would inherit that
+service's secrets) or define a service named like a core one.
+
+**Your name is yours.** A third-party add-on whose name, or a name derived
+from it, is core's is refused at `noo addons enable | upgrade`: a core service
+or container (`gateway`, `prometheus`, `noo-gateway`…), a certificate core
+issues, a database role (`noo_<id>`, `noo_<id>_ddl`) or a variable core
+already reads. Ship under another name.
 
 **Where the files are, and who owns them.** The CLI writes them to tmpfs,
 under `/run/noo/addons/<name>/` (as root) or `/dev/shm/noo-addons-<uid>/<name>/`

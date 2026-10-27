@@ -242,9 +242,24 @@ def test_an_optional_input_is_skipped_with_a_note(tmp_path: Path) -> None:
 def test_a_cli_without_the_reader_refuses_an_addon_that_declares_inputs(tmp_path: Path) -> None:
     r = _run(tmp_path, FAKE_RES_FAIL="1", body='echo "R=${NOO_ADDONS_REFUSED:-}"')
     assert r.returncode == 0, r.stderr
-    assert "REFUSED add-on rhaddon: its runtime inputs could not be produced" in r.stderr
+    assert "REFUSED add-on rhaddon: its overlay's secrets and runtime inputs could not be checked" in r.stderr
     assert "R=rhaddon" in r.stdout
-    assert "no add-on service was checked" in r.stderr
+    assert "no add-on was checked and none was started" in r.stderr
+
+
+def test_a_failed_check_refuses_an_addon_that_declares_no_inputs_too(tmp_path: Path) -> None:
+    """launch-resources is where every add-on's overlay is checked against its
+    own secrets (noo-cli addons/guards.rs). When it fails, an add-on with no
+    resources.json was not checked either, so it does not start. Before
+    0.6.13 only an add-on that declared inputs was refused here."""
+    root = _root(tmp_path)
+    (root / "addons" / "rhaddon" / "resources.json").unlink()
+    assert not (root / "addons" / "rhaddon" / "resources.json").exists()
+    r = _run(tmp_path, FAKE_RES_FAIL="1", body='echo "R=${NOO_ADDONS_REFUSED:-}"; echo "V=$NOO_ADDONS_VERIFIED"; addon_on rhaddon 0 || echo RHADDON-OFF')
+    assert r.returncode == 0, r.stderr
+    assert "REFUSED add-on rhaddon: its overlay's secrets and runtime inputs could not be checked" in r.stderr
+    assert "R=rhaddon" in r.stdout and "V=none" in r.stdout, r.stdout
+    assert "RHADDON-OFF" in r.stdout, "its overlay is no longer composed"
 
 
 def test_a_dev_start_names_the_overlay_it_composes(tmp_path: Path) -> None:

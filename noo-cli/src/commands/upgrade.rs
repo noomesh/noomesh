@@ -33,7 +33,8 @@
 //!      `preflight_service_keys`, `refuse_unlocked_dist_roll`,
 //!      `addon_preflight` — still nothing moves.
 //!   4. mint what the release needs: `mint_audit_key`, `mint_bus_keys`,
-//!      `mint_system_credentials`, `issue_pg_role_leaves`, `warn_door_node_id`.
+//!      `mint_system_credentials`, `issue_pg_role_leaves`,
+//!      `retire_legacy_addon_leaves`, `warn_door_node_id`.
 //!   5. prepare and pin: `migrate_retired_yaml_gates`,
 //!      `rerender_nats_users_for_roll`, `refresh_deploy_slice`, `move_pin`.
 //!   6. launcher inputs: service certs, grafana door, gateway PKI view, voice
@@ -1075,6 +1076,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     mint_bus_keys(g, &roll);
     mint_system_credentials(g, &roll);
     issue_pg_role_leaves(g);
+    retire_legacy_addon_leaves(g);
     warn_door_node_id(g, &roll);
 
     // Prepare the install, then move the pin.
@@ -1483,6 +1485,30 @@ fn issue_pg_role_leaves(g: &Globals) {
                     leaf.role, leaf.cert_rel(),
                     if failures.len() > 1 { format!(" ({} more leaf(s) failed too)", failures.len() - 1) } else { String::new() }),
                 Some("noo security pki fix-modes   # then re-run: noo upgrade --stack"));
+        }
+    }
+}
+
+/// Add-on client leaves (0.6.13). `noo addons enable --provision-only`
+///    used to issue `pki/services/<addon>` with `CN=<addon>`, the namespace
+///    core's service grants are keyed on, and with a key the reader table
+///    did not name (so 0644). Every add-on this box knows (a materialised
+///    bundle under `addons/`, or a provisioned marker) whose old leaf is still
+///    there gets its `pki/addons/<addon>/db-client` leaf (`CN=addon:<addon>/
+///    db-client`, key 0600), the runner's files refreshed, and the old leaf
+///    removed. Never fatal: the old leaf holds no grant (its name is no core
+///    service), so this is hygiene the roll reports, not a gate.
+fn retire_legacy_addon_leaves(g: &Globals) {
+    let root = crate::envfile::repo_root();
+    let mut names: std::collections::BTreeSet<String> = crate::addons::provisioned::read_all(&root).into_keys().collect();
+    if let Ok(rd) = std::fs::read_dir(root.join("addons")) {
+        names.extend(rd.flatten().filter(|e| e.path().is_dir()).filter_map(|e| e.file_name().to_str().map(str::to_string)));
+    }
+    for addon in names.iter().filter(|n| crate::addons::trust::name_ok(n)) {
+        match super::addon_provision::retire_legacy_leaf_here(addon) {
+            Some(Ok(said)) if !g.json => ui::done(&said),
+            Some(Err(e)) if !g.json => ui::warned(&format!("{e} — then: noo addons enable {addon} --provision-only")),
+            _ => {}
         }
     }
 }
@@ -6103,6 +6129,20 @@ mod pg_leaf_tests {
         let phase = super::phase_src::body("issue_pg_role_leaves");
         assert!(phase.contains("reconcile_pg_leaves(&crate::pki::ClusterCa::new("), "the phase issues the role leaves");
         assert!(phase.contains("pg_role_leaf_failed"), "a missing leaf is a refusal, not a warning");
+    }
+}
+
+#[cfg(test)]
+mod legacy_addon_leaf_tests {
+    /// The roll retires every pre-0.6.13 add-on leaf it can find, before the
+    /// pin moves, through the one helper `noo addons enable` uses too.
+    #[test]
+    fn the_roll_retires_legacy_addon_leaves_before_the_pin_moves() {
+        let list = super::phase_src::list();
+        let at = |n: &str| list.find(n).unwrap_or_else(|| panic!("{n} not in the phase list"));
+        assert!(at("retire_legacy_addon_leaves(") < at("move_pin("));
+        let phase = super::phase_src::body("retire_legacy_addon_leaves");
+        assert!(phase.contains("retire_legacy_leaf_here(") && phase.contains("provisioned::read_all("), "{phase}");
     }
 }
 

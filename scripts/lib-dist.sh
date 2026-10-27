@@ -1027,7 +1027,10 @@ PLAN
 
 # ── Add-on runtime inputs (noomesh-internal i239 section 10) ────────────────
 #
-# addon_resources_materialise — what each add-on's signed bundle declares in
+# addon_resources_materialise — every add-on that is on is checked by the CLI
+# (its overlay may take only its own secrets, and a third-party add-on may not
+# hold a core name: noo-cli/src/addons/guards.rs), and what each add-on's
+# signed bundle declares in
 # `resources.json` (a gateway URL, a TLS leaf, its outbound key, a shared
 # secret, its database URL and files, network names), produced by
 # `noo addons launch-resources` and handed over here. Call it right after
@@ -1080,13 +1083,6 @@ _addon_unverify() {
     export NOO_ADDONS_REFUSED="$_NOO_ADDONS_REFUSED"
 }
 
-# _addon_has_resources <addon> — does its bundle (or dev checkout) declare any?
-_addon_has_resources() {
-    local _o
-    _o="$(addon_overlay "$1" 2>/dev/null)"
-    [ -n "$_o" ] && [ -f "$(dirname "$_o")/resources.json" ]
-}
-
 # _addon_hand_tree <dir> <uid> — chown <dir> and everything under it to
 # <uid>, through the secret helper (_secret_chown_files: chown as root, else
 # a throwaway container with CAP_CHOWN only). Its manifest sits in <dir>'s
@@ -1107,7 +1103,7 @@ _addon_hand_tree() {
 }
 
 addon_resources_materialise() {
-    local _n _o _args=() _with=() _nb _out _rc=0 _kind _addon _rest _var _val _uid _path _h _prefix _bad
+    local _n _o _args=() _nb _out _rc=0 _kind _addon _rest _var _val _uid _path _h _prefix _bad
     local _envs=() _owns=() _gens=() _stales=() _p _tagargs=()
     ADDON_HOLD_SCALE=""
     _ADDON_HELD=()
@@ -1122,7 +1118,6 @@ addon_resources_materialise() {
             *)
                 case ",${NOO_ADDONS_VERIFIED}," in *",${_n}="*) _args+=("$_n") ;; *) continue ;; esac ;;
         esac
-        _addon_has_resources "$_n" && _with+=("$_n")
     done
     [ ${#_args[@]} -gt 0 ] || return 0
     _nb="$(_addon_noo 2>/dev/null)" || _nb=""
@@ -1135,13 +1130,15 @@ addon_resources_materialise() {
             --project "${COMPOSE_PROJECT_NAME:-noomesh}" --network "${NOO_CLUSTER_NETWORK:-noo-cluster}" "${_args[@]}" 2>&1)" || _rc=$?
     fi
     if [ "$_rc" != 0 ]; then
-        # An add-on that declares inputs cannot run without them: refused.
-        # One that declares none still starts; that its holds went unchecked is said.
-        for _n in ${_with[@]+"${_with[@]}"}; do
-            _addon_refuse "$_n" "its runtime inputs could not be produced (noo addons launch-resources failed: $(printf '%s' "$_out" | tail -1))"
+        # launch-resources is also where every add-on's overlay is checked
+        # against its own secrets (noo-cli addons/guards.rs): without it no
+        # add-on was checked, so none starts. Fail closed, by name; core starts.
+        for _n in ${_args[@]+"${_args[@]}"}; do
+            _n="${_n%%=*}"
+            _addon_refuse "$_n" "its overlay's secrets and runtime inputs could not be checked (noo addons launch-resources failed: $(printf '%s' "$_out" | tail -1))"
             _addon_unverify "$_n"
         done
-        echo "WARNING: noo addons launch-resources failed, so no add-on service was checked for GPU or Docker-socket requests. Fix: noo upgrade" >&2
+        echo "WARNING: noo addons launch-resources failed, so no add-on was checked and none was started. Fix: noo upgrade" >&2
         return 0
     fi
     while read -r _kind _addon _rest; do

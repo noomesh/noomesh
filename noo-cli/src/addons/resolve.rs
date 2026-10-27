@@ -878,9 +878,14 @@ pub(crate) mod tests {
 
     /// A signed BUNDLE of `l` (format 2) carrying [`OVERLAY`].
     pub(crate) fn signed_bundle(l: &AddonLock) -> Fetched {
+        signed_bundle_with(l, OVERLAY)
+    }
+
+    /// A signed BUNDLE of `l` (format 2) carrying `overlay`.
+    pub(crate) fn signed_bundle_with(l: &AddonLock, overlay: &str) -> Fetched {
         let mut l = l.clone();
         l.format = addon_lock::FORMAT_V2.into();
-        let files = BTreeMap::from([(addon_lock::OVERLAY_FILE.to_string(), OVERLAY.as_bytes().to_vec())]);
+        let files = BTreeMap::from([(addon_lock::OVERLAY_FILE.to_string(), overlay.as_bytes().to_vec())]);
         l.files = files.iter().map(|(n, b)| (n.clone(), addon_lock::sha256_ref(b))).collect();
         let (bytes, sig) = addon_lock::sign(&l, &seed()).unwrap();
         Fetched { lock: bytes, sig, files }
