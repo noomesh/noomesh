@@ -470,18 +470,31 @@ fn runtime_row(label: &str, text: &str, addon: &str) -> Option<RuntimeRow> {
 }
 
 /// [`runtime_addon_rows`] for the install at `root`: each licensed add-on
-/// (`ADDON_ROWS`) that no embedded overlay declares, from its trusted
-/// overlay. Duplicates of an embedded key, consumer or add-on are dropped.
+/// (`ADDON_ROWS`) that no embedded overlay declares, then each third-party
+/// add-on with a pin (`addons.lock`), from its trusted overlay. Duplicates of
+/// an embedded key, consumer or add-on, and a core key, are dropped.
+///
+/// The third-party ones matter as much as the licensed ones: `noo addons
+/// enable` plans and issues the gateway key from this table, so an add-on
+/// missing here is enabled with no `NOO_SVC_KEY_<ID>`, and the launcher then
+/// refuses its `addon_key` resource (the 0.6.13-rc.2 rehearsal, rhres). Its
+/// declaration was checked at enable (`addons::guards`: the key is the one
+/// derived from its name), and is read only while it matches the signed lock.
 pub(crate) fn runtime_addon_rows_at(root: &std::path::Path) -> Vec<RuntimeRow> {
+    let licensed = crate::commands::addons::ADDON_ROWS.iter().filter(|r| r.licensed.is_some()).map(|r| r.key.to_string());
+    let third_party: Vec<String> = crate::addons::pins::read(root)
+        .map(|p| p.into_keys().filter(|a| crate::addons::resolve::third_party(a)).collect())
+        .unwrap_or_default();
     let mut out: Vec<RuntimeRow> = Vec::new();
-    for row in crate::commands::addons::ADDON_ROWS.iter().filter(|r| r.licensed.is_some()) {
-        if ADDON_DECLS.iter().any(|d| d.addon == row.key) {
+    for addon in licensed.chain(third_party) {
+        if ADDON_DECLS.iter().any(|d| d.addon == addon) {
             continue;
         }
-        let Some((label, text)) = trusted_addon_overlay(root, row.key) else { continue };
-        let Some((d, spec)) = runtime_row(&label, &text, row.key) else { continue };
+        let Some((label, text)) = trusted_addon_overlay(root, &addon) else { continue };
+        let Some((d, spec)) = runtime_row(&label, &text, &addon) else { continue };
         let clash = ADDON_DECLS.iter().chain(out.iter().map(|(d, _)| *d))
-            .any(|o| o.key == d.key || o.consumer == d.consumer);
+            .any(|o| o.key == d.key || o.consumer == d.consumer)
+            || CORE_REGISTRY.iter().any(|c| c.key == d.key);
         if clash {
             eprintln!("warning: {label} declares a key or consumer another add-on already declares; ignored");
             continue;
@@ -7554,6 +7567,67 @@ mod provision_tests {
         std::fs::remove_dir_all(pins::addon_dir(&d, "trellion_intel")).unwrap();
         std::fs::write(d.join("docker-compose.evolve.yml"), TEST_BUNDLED_DECLS[1].1).unwrap();
         assert!(trusted_addon_overlay(&d, "evolve").is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A third-party add-on (no `ADDON_ROWS` row) whose verified bundle
+    /// declares `x-noo-addon` + resources.json (addon_key, shared_secret) +
+    /// system.json: after its lock is pinned, the table `noo addons enable`
+    /// plans and issues the gateway key from declares that key, the same
+    /// variable the launcher's `addon_key` resource reads, and the bundle's
+    /// shared secret is readable for the enable's mint. The 0.6.13-rc.2
+    /// rehearsal (rhres): the table read only licensed rows, the enable
+    /// planned `NotDeclared` and issued no key, and the launcher refused
+    /// `addon-key: NOO_SVC_KEY_RHRES is not in the encrypted store`.
+    #[test]
+    fn a_pinned_third_party_bundle_declares_its_gateway_key() {
+        use crate::addons::{decls, resolve};
+        let addon = "rhaddon";
+        assert!(resolve::third_party(addon), "the fixture must be an add-on the CLI does not ship");
+        let d = std::env::temp_dir().join(format!("noo-runtime-decls-3p-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(".env"), "NOO_IMAGE_TAG=v0.6.0\n").unwrap();
+        let files = std::collections::BTreeMap::from([
+            ("docker-compose.yml".to_string(), include_bytes!("../../../tests/fixtures/addons/rhaddon/docker-compose.yml").to_vec()),
+            ("resources.json".to_string(), include_bytes!("../../../tests/fixtures/addons/rhaddon/resources.json").to_vec()),
+            ("system.json".to_string(), include_bytes!("../../../tests/fixtures/addons/rhaddon/system.json").to_vec()),
+        ]);
+        let mut l = resolve::tests::lock("0.1.0", &["v0.6.0"], None);
+        l.format = crate::addon_lock::FORMAT_V2.into();
+        l.addon = addon.into();
+        l.files = files.iter().map(|(n, b)| (n.clone(), crate::addon_lock::sha256_ref(b))).collect();
+        let (bytes, sig) = crate::addon_lock::sign(&l, &resolve::tests::seed()).unwrap();
+        let f = crate::addons::lock_fetch::Fetched { lock: bytes, sig, files: files.clone() };
+        let want = resolve::Want { addon, stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let v = resolve::check(&f, &resolve::tests::anchor(), &want).unwrap();
+        resolve::record(&d, addon, &v, &f, "v0.6.0", None).unwrap();
+
+        let rows = runtime_addon_rows_at(&d);
+        let row = rows.iter().find(|(r, _)| r.addon == addon).unwrap_or_else(|| {
+            panic!("a pinned third-party add-on declares no key: {:?}", rows.iter().map(|r| r.0.addon).collect::<Vec<_>>())
+        });
+        assert_eq!(row.0.key, "NOO_SVC_KEY_RHADDON");
+        assert_eq!(row.0.consumer, "svc:rhaddon");
+        assert_eq!(row.0.containers, ["noo-rhaddon"]);
+        assert_eq!(row.0.scopes, ["metrics"], "the grant is the bundle's, not a default");
+        assert_eq!(row.1.key, "NOO_SVC_KEY_RHADDON", "a registry row, so audit and rotate know the key");
+
+        // The launcher reads the same variable for the `addon_key` resource.
+        let facts = crate::addons::resources::bundle_facts(addon, &files);
+        assert_eq!(facts.addon_key_var.as_deref(), Some(row.0.key));
+        // And the enable's shared-secret mint finds the declaration where the
+        // pin materialised it.
+        let declared = decls::materialised(&d, addon).expect("the materialised bundle validates");
+        let secrets: Vec<String> = declared
+            .resources
+            .expect("resources.json is materialised")
+            .resources
+            .iter()
+            .filter(|r| r.what == crate::addons::resources::What::SharedSecret)
+            .map(|r| crate::addons::resources::shared_secret_var(addon, &r.name))
+            .collect();
+        assert_eq!(secrets, ["NOO_ADDON_SECRET_RHADDON__PEER_KEY"]);
         let _ = std::fs::remove_dir_all(&d);
     }
 
