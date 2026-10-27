@@ -21,8 +21,6 @@
 //! runs each parser on empty input and compares the flags it asked about
 //! with the flags `usage.rs` documents for that verb.
 
-use std::sync::Mutex;
-
 /// A user-facing reason an argument list was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArgError(pub String);
@@ -45,20 +43,23 @@ impl From<String> for ArgError {
     }
 }
 
-static LAST: Mutex<Option<String>> = Mutex::new(None);
+// Per thread: the CLI runs one command on the main thread, and parallel
+// tests must not read each other's message.
+thread_local! {
+    static LAST: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
 
 impl From<ArgError> for crate::Unhandled {
     fn from(e: ArgError) -> Self {
-        if let Ok(mut g) = LAST.lock() {
-            *g = Some(e.0);
-        }
+        LAST.with(|m| *m.borrow_mut() = Some(e.0));
         crate::Unhandled
     }
 }
 
-/// The message of the last `ArgError` turned into `Unhandled`, once.
+/// The message of the last `ArgError` turned into `Unhandled` on this
+/// thread, once.
 pub fn take_message() -> Option<String> {
-    LAST.lock().ok().and_then(|mut g| g.take())
+    LAST.with(|m| m.borrow_mut().take())
 }
 
 /// Tokens still to be consumed, plus the flags the parser asked about.
