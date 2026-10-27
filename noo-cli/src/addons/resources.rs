@@ -836,6 +836,10 @@ pub fn listing(res: &Resources) -> Vec<Value> {
 /// Docker socket or `privileged`. The launcher scales those to zero for a
 /// third-party add-on and `noo stack restart <name>` refuses them by name:
 /// a GPU needs a reservation path core does not have for add-ons yet.
+/// Since 0.6.13 a third-party overlay that bind-mounts the Docker socket, or
+/// asks for `devices:`, is REFUSED before this runs (`guards::check_runtime`,
+/// no host bind mounts); what is left to hold is a GPU reservation (`gpus`,
+/// `runtime: nvidia`, `deploy…devices`) and `privileged`.
 pub fn holds(overlay: &str) -> Result<Vec<(String, String)>, String> {
     let doc: serde_yaml::Value = serde_yaml::from_str(overlay).map_err(|e| format!("the overlay is not valid YAML ({e})"))?;
     let mut out = Vec::new();

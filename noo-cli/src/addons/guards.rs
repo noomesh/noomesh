@@ -46,6 +46,16 @@
 //! ships use both today (trellion-intel extends trellion; evolve adds a
 //! volume to the gateway), so for them those two stay as they were.
 //!
+//! A third-party add-on's services also reach the host only through what is
+//! its own ([`check_runtime`]): named volumes its overlay declares and the
+//! mount directories its `resources.json` declares. Any other bind mount,
+//! `env_file`, `volumes_from`, a core volume, devices, host namespaces,
+//! added capabilities, unconfined profiles and host `configs:` are refused
+//! (operator 2026-10-27). The shipped add-ons bind the PKI and are unchanged.
+//! The first-party `extends` inheritance (trellion-intel inherits trellion's
+//! pgpass) is allowed by decision (operator 2026-10-27); intel gets its own
+//! database role later.
+//!
 //! ## Names
 //!
 //! [`name_collision`] refuses a third-party add-on whose name, or any name
@@ -110,6 +120,8 @@ pub struct Core {
     pub services: BTreeSet<String>,
     /// Core's database roles (the Postgres role leaves).
     pub roles: BTreeSet<String>,
+    /// The top-level volumes core's compose files declare (its data).
+    pub volumes: BTreeSet<String>,
 }
 
 fn untag(v: &Value) -> &Value {
@@ -143,6 +155,9 @@ impl Core {
                         c.secrets.insert(name.to_string(), var);
                     }
                 }
+            }
+            if let Some(m) = mapping(doc.get("volumes")) {
+                c.volumes.extend(m.keys().filter_map(Value::as_str).map(str::to_string));
             }
             if let Some(m) = mapping(doc.get("services")) {
                 for (k, v) in m {
@@ -209,6 +224,8 @@ pub struct Checked {
     pub referenced: usize,
     /// Variables it interpolates (`$VAR`, `${VAR…}`).
     pub interpolated: usize,
+    /// Volume entries its services declare (third-party only: [`check_runtime`]).
+    pub mounts: usize,
 }
 
 /// Every variable compose would interpolate in `s`: `$NAME` and `${NAME…}`,
@@ -409,19 +426,191 @@ pub fn check_bundle_files(addon: &str, files: &BTreeMap<String, Vec<u8>>, third_
     }
     let Some(bytes) = files.get("docker-compose.yml") else { return Ok(Checked::default()) };
     let text = std::str::from_utf8(bytes).map_err(|_| format!("add-on {addon}: its overlay is not UTF-8"))?;
-    let shared: Vec<String> = match files.get(super::resources::RESOURCES_FILE) {
+    let (shared, mount_envs): (Vec<String>, Vec<String>) = match files.get(super::resources::RESOURCES_FILE) {
         Some(b) => {
             let facts = super::resources::bundle_facts(addon, files);
-            super::resources::parse(addon, b, &facts)?
-                .resources
-                .iter()
-                .filter(|r| r.what == super::resources::What::SharedSecret)
-                .map(|r| r.name.clone())
-                .collect()
+            let res = super::resources::parse(addon, b, &facts)?;
+            (
+                res.resources.iter().filter(|r| r.what == super::resources::What::SharedSecret).map(|r| r.name.clone()).collect(),
+                res.mounts.iter().map(|m| m.env.clone()).collect(),
+            )
         }
-        None => Vec::new(),
+        None => (Vec::new(), Vec::new()),
     };
-    check_overlay(addon, text, &shared, third_party, core)
+    let mut checked = check_overlay(addon, text, &shared, third_party, core)?;
+    if third_party {
+        checked.mounts = check_runtime(addon, text, &mount_envs, core)?;
+    }
+    Ok(checked)
+}
+
+/// Is `src` exactly one of the add-on's declared mount variables
+/// (`${VAR}`, `${VAR:?…}`, `${VAR?…}`, or a default under `/nonexistent/`):
+/// the tmpfs generation directory the launcher hands over, and nothing else
+/// even when the variable is unset?
+fn declared_mount_source(src: &str, mount_envs: &[String]) -> bool {
+    let Some(inner) = src.strip_prefix("${").and_then(|r| r.strip_suffix('}')) else { return false };
+    let name: String = inner.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+    if !mount_envs.iter().any(|m| *m == name) {
+        return false;
+    }
+    let rest = &inner[name.len()..];
+    if rest.contains('$') || rest.contains('{') || rest.contains('}') {
+        return false;
+    }
+    rest.is_empty()
+        || rest.starts_with(":?")
+        || rest.starts_with('?')
+        || rest.strip_prefix(":-").or_else(|| rest.strip_prefix('-')).is_some_and(|d| d.starts_with("/nonexistent/"))
+}
+
+/// Is this compose key set to something (a non-empty list, or any scalar)?
+fn set_nonempty(v: Option<&Value>) -> bool {
+    match v.map(untag) {
+        None | Some(Value::Null) => false,
+        Some(Value::Sequence(s)) => !s.is_empty(),
+        Some(_) => true,
+    }
+}
+
+/// Split a short-form volume (`src:dst[:mode]`) at the colons that are not
+/// inside a `${…}`.
+fn split_volume(v: &str) -> Vec<String> {
+    let (mut out, mut cur, mut depth) = (Vec::new(), String::new(), 0usize);
+    let b: Vec<char> = v.chars().collect();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == '$' && b.get(i + 1) == Some(&'{') {
+            depth += 1;
+            cur.push_str("${");
+            i += 2;
+            continue;
+        }
+        if c == '}' && depth > 0 {
+            depth -= 1;
+        }
+        if c == ':' && depth == 0 {
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+        i += 1;
+    }
+    out.push(cur);
+    out
+}
+
+/// What a third-party add-on's services may reach on the host: named volumes
+/// of its own, and the mount directories its `resources.json` declares.
+/// Nothing else: no bind mount of a host path (short or long form, literal or
+/// interpolated), no `env_file`, no `volumes_from`, no core volume, no
+/// device, no host namespace, no added capability, no unconfined profile,
+/// no cgroup parent, no host `configs:` file. Returns the number of mounts
+/// it read. A GPU reservation and `privileged` stay HELD (the launcher never
+/// starts them, `resources::holds`); a Docker socket mount, a bind mount,
+/// is refused here first.
+pub fn check_runtime(addon: &str, text: &str, mount_envs: &[String], core: &Core) -> Result<usize, String> {
+    let doc: Value = serde_yaml::from_str(text).map_err(|e| format!("add-on {addon}: its overlay is not valid YAML ({e})"))?;
+    let mut own_volumes: BTreeSet<String> = BTreeSet::new();
+    if let Some(m) = mapping(doc.get("volumes")) {
+        for (k, v) in m {
+            let name = k.as_str().unwrap_or_default();
+            if core.volumes.contains(name) {
+                return Err(format!("add-on {addon}: its overlay declares volume `{name}`, which is core's; an add-on never attaches core's data"));
+            }
+            let v = untag(v);
+            if let Some(key) = ["external", "name", "driver", "driver_opts"].into_iter().find(|k| v.get(*k).is_some()) {
+                return Err(format!(
+                    "add-on {addon}: its volume `{name}` sets `{key}`; an add-on's named volumes are plain volumes of its own (no external, renamed or driver-backed volume)"
+                ));
+            }
+            own_volumes.insert(name.to_string());
+        }
+    }
+    if let Some(m) = mapping(doc.get("configs")) {
+        for (k, v) in m {
+            let name = k.as_str().unwrap_or_default();
+            if let Some(key) = ["file", "environment", "external"].into_iter().find(|key| untag(v).get(*key).is_some()) {
+                return Err(format!("add-on {addon}: its config `{name}` is read from `{key}`; an add-on's config may only be inline `content`"));
+            }
+        }
+    }
+    let mut mounts = 0;
+    let Some(services) = mapping(doc.get("services")) else { return Ok(0) };
+    for (k, svc) in services {
+        let svc_name = k.as_str().unwrap_or_default();
+        let svc = untag(svc);
+        let refuse = |what: String| format!("add-on {addon}: its service `{svc_name}` {what}; a third-party add-on gets no host access beyond its own volumes and declared mounts");
+        let named = |src: &str| -> Result<(), String> {
+            if core.volumes.contains(src) {
+                return Err(refuse(format!("mounts core's volume `{src}`")));
+            }
+            if !own_volumes.contains(src) {
+                return Err(refuse(format!("mounts volume `{src}`, which its overlay does not declare")));
+            }
+            Ok(())
+        };
+        for key in ["env_file", "volumes_from", "cgroup_parent"] {
+            if svc.get(key).is_some() {
+                return Err(refuse(format!("sets `{key}`")));
+            }
+        }
+        if set_nonempty(svc.get("devices")) {
+            return Err(refuse("asks for host devices (`devices:`)".to_string()));
+        }
+        if set_nonempty(svc.get("cap_add")) {
+            return Err(refuse("adds capabilities (`cap_add:`)".to_string()));
+        }
+        for key in ["pid", "ipc", "network_mode", "userns_mode", "uts", "cgroup"] {
+            if let Some(v) = svc.get(key).and_then(Value::as_str) {
+                let v = v.trim();
+                if v == "host" || v.starts_with("service:") || v.starts_with("container:") || (key == "ipc" && v == "shareable") {
+                    return Err(refuse(format!("sets `{key}: {v}`")));
+                }
+            }
+        }
+        if let Some(opts) = svc.get("security_opt").and_then(Value::as_sequence) {
+            for o in opts.iter().filter_map(Value::as_str) {
+                let l = o.to_ascii_lowercase().replace('=', ":");
+                if l.contains("unconfined") || l.starts_with("label:disable") || l.starts_with("label:type:") {
+                    return Err(refuse(format!("loosens its confinement (`security_opt: {o}`)")));
+                }
+            }
+        }
+        let Some(vols) = svc.get("volumes").map(untag).and_then(Value::as_sequence) else { continue };
+        for vol in vols {
+            mounts += 1;
+            let vol = untag(vol);
+            if let Some(short) = vol.as_str() {
+                let parts = split_volume(short);
+                if parts.len() < 2 {
+                    continue; // an anonymous volume: a container path only
+                }
+                let src = parts[0].trim();
+                if declared_mount_source(src, mount_envs) {
+                    continue;
+                }
+                let bind = src.contains('/') || src.starts_with('.') || src.starts_with('~') || src.contains('$') || src.is_empty();
+                if bind {
+                    return Err(refuse(format!("bind-mounts the host path `{src}`")));
+                }
+                named(src)?;
+                continue;
+            }
+            let ty = vol.get("type").and_then(Value::as_str).unwrap_or_default();
+            let src = vol.get("source").and_then(Value::as_str).unwrap_or_default().trim();
+            match ty {
+                "bind" if declared_mount_source(src, mount_envs) => {}
+                "bind" => return Err(refuse(format!("bind-mounts the host path `{src}`"))),
+                "volume" if src.is_empty() => {}
+                "volume" => named(src)?,
+                "tmpfs" => {}
+                other => return Err(refuse(format!("mounts a `{other}` volume, which an add-on may not use"))),
+            }
+        }
+    }
+    Ok(mounts)
 }
 
 /// [`check_bundle_files`] against the install at `root` ([`Core::of_install`]),
@@ -456,7 +645,7 @@ mod tests {
     #[test]
     fn an_overlay_that_takes_only_its_own_passes_and_every_part_was_read() {
         let c = check_overlay("rhaddon", OWN, &peer(), true, &core()).unwrap();
-        assert_eq!(c, Checked { declared: 3, referenced: 3, interpolated: 5 }, "the parse must find what it checks");
+        assert_eq!(c, Checked { declared: 3, referenced: 3, interpolated: 5, mounts: 0 }, "the parse must find what it checks");
     }
 
     /// The gap: an overlay sourcing a core secret. Each form is refused,
@@ -539,7 +728,7 @@ mod tests {
         let mut c2 = c.clone();
         c2.compose_vars.insert("NOO_SVC_KEY_MAILER".into());
         assert!(name_collision("mailer", &c2).unwrap().contains("NOO_SVC_KEY_MAILER"));
-        for free in ["pai-voice", "mailer", "noomail"] {
+        for free in ["rh-addon-two", "mailer", "noomail"] {
             assert_eq!(name_collision(free, &c), None, "{free}");
         }
         // Through the bundle check: refused before the overlay is even read,
@@ -548,6 +737,105 @@ mod tests {
         let e = check_bundle_files("grafana", &files, true, &c).unwrap_err();
         assert!(e.contains("grafana") && e.contains("core service") && e.contains("Nothing was changed"), "{e}");
         assert!(check_bundle_files("grafana", &files, false, &c).is_ok());
+    }
+
+    fn plain_core() -> Core {
+        Core::from_texts(&["services:\n  gateway:\n    image: g\nvolumes:\n  pgdata:\n  noo-models:\n".to_string()]).unwrap().with_tables()
+    }
+
+    const RUNTIME_OK: &str = "volumes:\n  rh-cache:\nservices:\n  noo-rhaddon:\n    image: x\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    volumes:\n      - ${RHADDON_WORK_DIR:-/nonexistent/rh-work}:/run/rhaddon:ro\n      - rh-cache:/cache\n      - /tmp/anonymous\n      - { type: bind, source: \"${RHADDON_COORD_DIR:?declared}\", target: /run/coord, read_only: true }\n      - { type: volume, source: rh-cache, target: /cache2 }\n      - { type: tmpfs, target: /scratch }\n";
+
+    fn mounts() -> Vec<String> {
+        vec!["RHADDON_WORK_DIR".to_string(), "RHADDON_COORD_DIR".to_string()]
+    }
+
+    /// The mount gap, third-party only: every way a service could reach the
+    /// host is refused, naming the add-on, the service and the mount.
+    /// Reverting `check_runtime` (or its call in `check_bundle_files`)
+    /// passes every case.
+    #[test]
+    fn a_third_party_service_reaches_the_host_only_through_its_own_mounts() {
+        let c = plain_core();
+        assert_eq!(check_runtime("rhaddon", RUNTIME_OK, &mounts(), &c).unwrap(), 6, "every volume entry was read");
+        let vol = |line: &str| RUNTIME_OK.replace("      - /tmp/anonymous\n", &format!("      - {line}\n"));
+        let svc = |line: &str| RUNTIME_OK.replace("    cap_drop: [ALL]\n", &format!("    cap_drop: [ALL]\n    {line}\n"));
+        let cases: Vec<(String, &str)> = vec![
+            (vol("${NOO_PKI_DIR:-./.pki}:/pki:ro"), "bind-mounts the host path `${NOO_PKI_DIR:-./.pki}`"),
+            (vol("${NOO_DATA_ROOT}/x:/data"), "bind-mounts the host path `${NOO_DATA_ROOT}/x`"),
+            (vol("/:/host"), "bind-mounts the host path `/`"),
+            (vol("/var/run/docker.sock:/var/run/docker.sock"), "bind-mounts the host path `/var/run/docker.sock`"),
+            (vol("~/.ssh:/k"), "bind-mounts the host path `~/.ssh`"),
+            (vol("./secrets:/s"), "bind-mounts the host path `./secrets`"),
+            (vol("${RHADDON_WORK_DIR:-/home/op}:/w"), "bind-mounts the host path `${RHADDON_WORK_DIR:-/home/op}`"),
+            (vol("${RHADDON_UNDECLARED}:/w"), "bind-mounts the host path `${RHADDON_UNDECLARED}`"),
+            (vol("{ type: bind, source: /etc, target: /etc }"), "bind-mounts the host path `/etc`"),
+            (vol("pgdata:/var/lib/postgresql/data"), "mounts core's volume `pgdata`"),
+            (vol("{ type: volume, source: noo-models, target: /m }"), "mounts core's volume `noo-models`"),
+            (vol("other:/o"), "mounts volume `other`, which its overlay does not declare"),
+            (vol("{ type: npipe, source: x, target: /x }"), "mounts a `npipe` volume"),
+            (svc("env_file: ../../.env"), "sets `env_file`"),
+            (svc("volumes_from: [noo-gateway]"), "sets `volumes_from`"),
+            (svc("cgroup_parent: /"), "sets `cgroup_parent`"),
+            (svc("devices: [/dev/sda]"), "asks for host devices"),
+            (svc("pid: host"), "sets `pid: host`"),
+            (svc("network_mode: host"), "sets `network_mode: host`"),
+            (svc("network_mode: service:gateway"), "sets `network_mode: service:gateway`"),
+            (svc("network_mode: container:noo-postgres"), "sets `network_mode: container:noo-postgres`"),
+            (svc("ipc: host"), "sets `ipc: host`"),
+            (svc("userns_mode: host"), "sets `userns_mode: host`"),
+            (svc("cap_add: [SYS_ADMIN]"), "adds capabilities"),
+            (RUNTIME_OK.replace("[no-new-privileges:true]", "[no-new-privileges:true, seccomp:unconfined]"), "loosens its confinement"),
+            (RUNTIME_OK.replace("[no-new-privileges:true]", "[no-new-privileges:true, apparmor=unconfined]"), "loosens its confinement"),
+            (RUNTIME_OK.replace("  rh-cache:\n", "  rh-cache:\n    external: true\n    name: noomesh_pgdata\n"), "sets `external`"),
+            (RUNTIME_OK.replace("  rh-cache:\n", "  rh-cache:\n    driver_opts: { type: none, o: bind, device: / }\n"), "sets `driver_opts`"),
+            (RUNTIME_OK.replace("volumes:\n  rh-cache:\n", "volumes:\n  rh-cache:\n  pgdata:\n"), "declares volume `pgdata`, which is core's"),
+            (format!("{RUNTIME_OK}configs:\n  c:\n    file: /etc/shadow\n"), "is read from `file`"),
+        ];
+        assert_eq!(cases.len(), 30);
+        for (text, needle) in cases {
+            assert_ne!(text, RUNTIME_OK, "the case did not change the overlay: {needle}");
+            let e = check_runtime("rhaddon", &text, &mounts(), &c).unwrap_err();
+            assert!(e.starts_with("add-on rhaddon: its ") && e.contains(needle), "{e:?} should name {needle:?}");
+            // Through the bundle check, for a third-party add-on only.
+            let files = BTreeMap::from([("docker-compose.yml".to_string(), text.clone().into_bytes())]);
+            assert!(check_bundle_files("rhaddon", &files, true, &c).is_err(), "{needle}");
+            assert!(check_bundle_files("rhaddon", &files, false, &c).is_ok(), "first-party is unchanged: {needle}");
+        }
+        // A service-level error names the service.
+        let e = check_runtime("rhaddon", &svc("pid: host"), &mounts(), &c).unwrap_err();
+        assert!(e.contains("service `noo-rhaddon`"), "{e}");
+    }
+
+    /// The fixture add-on as its bundle ships it (overlay, resources.json,
+    /// system.json) passes as a third-party add-on: its mounts are the ones
+    /// its resources.json declares.
+    #[test]
+    fn the_fixture_bundle_passes_as_third_party() {
+        let files = BTreeMap::from([
+            ("docker-compose.yml".to_string(), include_bytes!("../../../tests/fixtures/addons/rhaddon/docker-compose.yml").to_vec()),
+            ("resources.json".to_string(), include_bytes!("../../../tests/fixtures/addons/rhaddon/resources.json").to_vec()),
+            ("system.json".to_string(), include_bytes!("../../../tests/fixtures/addons/rhaddon/system.json").to_vec()),
+        ]);
+        let c = check_bundle_files("rhaddon", &files, true, &plain_core()).unwrap();
+        assert_eq!(c.mounts, 2, "both declared mounts were read");
+        // Without its resources.json the same overlay binds host paths.
+        let mut bare = files.clone();
+        bare.remove("resources.json");
+        assert!(check_bundle_files("rhaddon", &bare, true, &plain_core()).unwrap_err().contains("bind-mounts the host path `${RHADDON_WORK_DIR"));
+    }
+
+    /// The shipped add-ons stay as they are (first-party: intel binds its PKI
+    /// leaf directory, evolve attaches a volume to the gateway); the same
+    /// shapes as a third-party add-on are refused.
+    #[test]
+    fn the_shipped_mount_shapes_pass_first_party_only() {
+        let intel = "services:\n  trellion-intel:\n    image: x\n    volumes:\n      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/trellion-intel:/app/pki/leaf:ro\n";
+        let evolve = "volumes:\n  evolve-routes-65532:\nservices:\n  noo-evolve:\n    image: x\n    volumes:\n      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro\n      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/evolve:/tls/services/evolve:ro\n";
+        for (addon, text) in [("trellion_intel", intel), ("evolve", evolve)] {
+            let files = BTreeMap::from([("docker-compose.yml".to_string(), text.as_bytes().to_vec())]);
+            assert!(check_bundle_files(addon, &files, false, &plain_core()).is_ok(), "{addon}");
+            assert!(check_runtime(addon, text, &[], &plain_core()).unwrap_err().contains("NOO_PKI_DIR"), "{addon}");
+        }
     }
 
     #[test]
