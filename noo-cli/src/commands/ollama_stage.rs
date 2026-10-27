@@ -47,6 +47,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::models_fetch::{agent, get_following, human, io, prewarm_digest, sha256_file, writable_store, FetchErr};
+use crate::args::{ArgError, Args};
 use crate::output::{fail, ExitCode};
 use crate::ui;
 use crate::{Globals, Unhandled};
@@ -114,25 +115,20 @@ impl OllamaRef {
 }
 
 /// `ollama:<ref> [--force]`.
-pub(crate) fn parse_stage_args(args: &[String]) -> Result<(OllamaRef, bool), String> {
+pub(crate) fn parse_stage_args(args: &[String]) -> Result<(OllamaRef, bool), ArgError> {
+    let mut a = Args::new(args);
+    let force = a.flag(&["--force"]);
     let mut reference: Option<OllamaRef> = None;
-    let mut force = false;
-    for t in args {
-        match t.as_str() {
-            "--force" => force = true,
-            s if s.starts_with('-') => return Err(format!("unknown flag {s}")),
-            s => {
-                let Some(rest) = s.strip_prefix("ollama:") else {
-                    return Err(format!("'{s}': an ollama model is given as ollama:<tag> (e.g. ollama:gemma4:12b)"));
-                };
-                if reference.is_some() {
-                    return Err("expected exactly one ollama:<tag> argument".into());
-                }
-                reference = Some(parse_ref(rest)?);
-            }
+    for s in a.positionals()? {
+        let Some(rest) = s.strip_prefix("ollama:") else {
+            return Err(ArgError::new(format!("'{s}': an ollama model is given as ollama:<tag> (e.g. ollama:gemma4:12b)")));
+        };
+        if reference.is_some() {
+            return Err(ArgError::new("expected exactly one ollama:<tag> argument"));
         }
+        reference = Some(parse_ref(rest)?);
     }
-    reference.map(|r| (r, force)).ok_or_else(|| "expected ollama:<tag>".into())
+    reference.map(|r| (r, force)).ok_or_else(|| ArgError::new("expected ollama:<tag>"))
 }
 
 // ── The registry ────────────────────────────────────────────────────────
@@ -583,7 +579,7 @@ pub(crate) fn stage(
 pub fn models_fetch_ollama(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let (r, force) = match parse_stage_args(args) {
         Ok(v) => v,
-        Err(e) => fail(g.json, ExitCode::Usage, "bad_args", &e, Some("give the model as ollama:<tag>, e.g. ollama:gemma4:12b")),
+        Err(e) => fail(g.json, ExitCode::Usage, "bad_args", &e.to_string(), Some("give the model as ollama:<tag>, e.g. ollama:gemma4:12b")),
     };
     let (store, dir) = writable_store(g, "noo models fetch ollama:<tag>");
     let base = registry_base();

@@ -14,6 +14,7 @@
 
 use serde_json::Value;
 
+use crate::args::{ArgError, Args};
 use crate::http::{get_json, request_status};
 use crate::output::{fail, ExitCode};
 use crate::ui::{self, Col};
@@ -27,22 +28,19 @@ pub(crate) struct ReserveArgs {
     pub timeout: Option<u64>,
 }
 
-pub(crate) fn parse_reserve(args: &[String]) -> Result<ReserveArgs, ()> {
-    let [workload, rest @ ..] = args else { return Err(()) };
-    if workload.starts_with('-') || !workload.contains('/') {
-        return Err(());
+pub(crate) fn parse_reserve(args: &[String]) -> Result<ReserveArgs, ArgError> {
+    parse_reserve_with(&mut Args::new(args))
+}
+
+pub(crate) fn parse_reserve_with(a: &mut Args) -> Result<ReserveArgs, ArgError> {
+    let node = a.value(&["--node"])?.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let hand_over = a.value(&["--hand-over"])?.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let timeout = a.number::<u64>(&["--timeout"])?;
+    let workload = a.one("<addon>/<workload>")?;
+    if !workload.contains('/') {
+        return Err(ArgError::new(format!("`{workload}` is not <addon>/<workload>")));
     }
-    let (mut node, mut hand_over, mut timeout) = (None, None, None);
-    let mut it = rest.iter();
-    while let Some(tok) = it.next() {
-        match tok.as_str() {
-            "--node" => node = Some(it.next().ok_or(())?.trim().to_string()).filter(|s| !s.is_empty()),
-            "--hand-over" => hand_over = Some(it.next().ok_or(())?.trim().to_string()).filter(|s| !s.is_empty()),
-            "--timeout" => timeout = Some(it.next().ok_or(())?.trim().parse::<u64>().map_err(|_| ())?),
-            _ => return Err(()),
-        }
-    }
-    Ok(ReserveArgs { workload: workload.clone(), node, hand_over, timeout })
+    Ok(ReserveArgs { workload, node, hand_over, timeout })
 }
 
 pub(crate) fn parse_release(args: &[String]) -> Result<(String, bool), ()> {
@@ -59,7 +57,7 @@ pub(crate) fn parse_release(args: &[String]) -> Result<(String, bool), ()> {
 
 /// `noo cluster reserve <addon>/<workload> [--node <node>] [--hand-over <reservation-id>] [--timeout <secs>]`
 pub fn cluster_reserve(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let Ok(a) = parse_reserve(args) else { return Err(Unhandled) };
+    let a = parse_reserve(args)?;
     let timeout = a.timeout.unwrap_or(120).clamp(1, 900);
     let mut body = serde_json::json!({"workload": a.workload, "timeout_secs": timeout});
     if let Some(n) = &a.node {

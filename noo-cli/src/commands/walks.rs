@@ -21,6 +21,7 @@
 use serde_json::Value;
 
 use super::{truncate, urlencode};
+use crate::args::{ArgError, Args};
 use crate::http::{get_json, put_json};
 use crate::ui::{self, Col, Glyph};
 use crate::{Globals, Unhandled};
@@ -32,18 +33,16 @@ pub(crate) struct ListArgs {
     pub top_k: u32,
 }
 
-/// Parse `[--q <text>] [--top-k <n>]`. Anything else is not ours (`Unhandled`).
-pub(crate) fn parse_list(args: &[String]) -> Result<ListArgs, Unhandled> {
-    let mut query = None;
-    let mut top_k = 5u32;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--q" | "-q" | "--query" => query = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--top-k" | "-k" => top_k = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?,
-            _ => return Err(Unhandled),
-        }
-    }
+/// Parse `[--q <text>] [--top-k <n>]` (aliases `-q`, `--query`, `-k`).
+/// Anything else is refused with the reason.
+pub(crate) fn parse_list(args: &[String]) -> Result<ListArgs, ArgError> {
+    parse_list_with(&mut Args::new(args))
+}
+
+pub(crate) fn parse_list_with(a: &mut Args) -> Result<ListArgs, ArgError> {
+    let query = a.value(&["--q", "-q", "--query"])?;
+    let top_k = a.number::<u32>(&["--top-k", "-k"])?.unwrap_or(5);
+    a.finish()?;
     Ok(ListArgs { query, top_k })
 }
 
