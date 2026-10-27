@@ -348,7 +348,7 @@ pub fn mcp_external_setup(g: &Globals, args: &[String]) -> Result<i32, Unhandled
         }
     }
     let gw_url = gateway
-        .or_else(|| std::env::var("NOO_GATEWAY_URL").ok().filter(|v| !v.is_empty()))
+        .or_else(|| crate::envfile::gateway_url_from_env().map(|(u, _)| u))
         .unwrap_or_else(|| "https://mesh.local:8080".into());
     let door = format!("{gw_url}/mcp/user");
 

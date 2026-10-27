@@ -56,6 +56,8 @@ mod catalog;
 mod child_stdin;
 mod commands;
 mod credentials;
+#[cfg(test)]
+mod config_readers;
 mod entitlement;
 mod entitlement_terms;
 mod harness_kinds;
