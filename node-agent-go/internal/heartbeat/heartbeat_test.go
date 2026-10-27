@@ -946,3 +946,18 @@ func TestControlTransportsAdvertiseTheTunnelOnlyWhileItIsUp(t *testing.T) {
 		t.Fatal("the HTTPS listener is always offered")
 	}
 }
+
+// A vLLM or llama-server node has no ollama: its chat model's entry is the
+// whole `model_stats`, and on a node with both the entry is merged in.
+func TestModelStatsMergesTheChatModel(t *testing.T) {
+	chat := []ModelStat{{Name: "org/gemma-4-12B", Loaded: true, ContextLength: 262144}}
+	r := &Reporter{}
+	r.SetChatModelStats(func() []ModelStat { return chat })
+	if got := r.modelStats(); len(got) != 1 || got[0] != chat[0] {
+		t.Errorf("no ollama: %+v", got)
+	}
+	r.SetModelStats(func() []ModelStat { return []ModelStat{{Name: "harrier:latest", SizeBytes: 1}} })
+	if got := r.modelStats(); len(got) != 2 || got[0].Name != "harrier:latest" || got[1] != chat[0] {
+		t.Errorf("with an ollama lane: %+v", got)
+	}
+}

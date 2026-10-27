@@ -4071,6 +4071,17 @@ async fn harness_kind_fit(
         },
         Err(_) => json!({}),
     };
+    for m in chats.iter().filter_map(|p| p.model.as_deref()) {
+        if let Some((reported, table)) = crate::harness_fit::ceiling_disagreement(&record, m) {
+            tracing::warn!(
+                node = node_id,
+                model = m,
+                reported,
+                table,
+                "harness fit: the node reports another context ceiling than config/model-capabilities.json; using the node's"
+            );
+        }
+    }
     let tier = crate::node_tier::derive(&crate::node_tier::facts_from_capabilities(record.get("capabilities").unwrap_or(&json!({}))))
         .tier()
         .and_then(|t| u8::try_from(t).ok());
