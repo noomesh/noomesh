@@ -369,10 +369,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     // ── HTTP add-ons: routes from the manifest each add-on SHIPS ──
     // Read once, here, for every add-on whose switch is on, from
-    // `addon_proxy::ROUTES_DIR/<addon>/routes.json` (delivered read-only by
-    // the add-on's overlay), validated, and merged last so a collision with
-    // any core route above refuses the add-on instead of replacing a core
-    // handler. Off → nothing mounted. On with a missing/invalid manifest →
+    // `<addon>/routes.json` (the launcher's read-only copy from the add-on's
+    // signed bundle under `addon_proxy::BUNDLE_ROUTES_DIR`, else what a
+    // shipped add-on's overlay delivers under `addon_proxy::ROUTES_DIR`),
+    // validated, and merged last so a collision with any core route above
+    // refuses the add-on instead of replacing a core handler. Off → nothing mounted. On with a missing/invalid manifest →
     // nothing mounted, `/health` says `unhealthy`, the log says why. The
     // core names no add-on route.
     let router = crate::addon_proxy::mount(router);

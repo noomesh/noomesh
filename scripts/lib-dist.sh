@@ -248,7 +248,7 @@ _addon_composed_names() {
 # anything is pulled or recreated.
 _ADDON_PINS=()
 # The `decl <addon> <file>` lines launch-pins printed (a declaration file the
-# verified lock lists: system.json, workloads.json), for
+# verified lock lists: system.json, workloads.json, routes.json), for
 # addon_decls_materialise below. An older noo prints none: nothing is handed
 # to the gateway, which then provisions no bundle system (the safe side).
 _ADDON_DECLS=()
@@ -381,9 +381,9 @@ require_addon_pins() {
                 _pinlines+=("${_addon} ${_var} ${_ref}") ;;
             decl)
                 # `decl <addon> <file>`: a declaration file its verified lock
-                # lists. Only the two names the gateway reads are kept.
+                # lists. Only the names the gateway reads are kept.
                 case "$_rest" in
-                    system.json|workloads.json) _decls+=("${_addon} ${_rest}") ;;
+                    system.json|workloads.json|routes.json) _decls+=("${_addon} ${_rest}") ;;
                 esac ;;
             refuse)
                 _addon_refuse "$_addon" "${_rest:-no verified pin for ${_tag}}" ;;
@@ -935,13 +935,20 @@ compose_active_services() {
 
 # addon_decls_materialise — hand the gateway what each add-on's signed bundle
 # declares beyond its overlay (noomesh-internal i163 E/B): `system.json` (its
-# database system) and `workloads.json` (its managed workloads), copied into
+# database system), `workloads.json` (its managed workloads) and `routes.json`
+# (its HTTP route manifest, 0.6.13), copied into
 #   <install root>/.noo-addon-systems/<addon>/system.json
 #   <install root>/.noo-addon-workloads/<addon>/workloads.json
+#   <install root>/.noo-addon-routes/<addon>/routes.json
 # which docker-compose.cluster.yml mounts read-only into the gateway at
-# /opt/noo/addon-systems and /opt/noo/addon-workloads (gateway-rust/src/
-# addon_decls.rs validates them again and reads them only for an add-on its
-# registry registers).
+# /opt/noo/addon-systems, /opt/noo/addon-workloads and
+# /opt/noo/addon-bundle-routes (gateway-rust/src/addon_decls.rs and
+# addon_proxy.rs validate them again and read them only for an add-on its
+# registry registers). This is how an add-on publishes routes without
+# touching a core service: a third-party overlay may not extend the gateway
+# or mount a core volume (noo-cli/src/addons/guards.rs). The gateway reads a
+# routes.json here BEFORE the older per-add-on volume a shipped add-on's own
+# overlay mounts under /opt/noo/addon-routes, so the signed copy wins.
 #
 # ONLY for add-ons switched on AND verified this start, from the verdict
 # require_addon_pins just computed (call it right after, never before):
@@ -953,7 +960,8 @@ compose_active_services() {
 #         development checkout, else its bundle);
 #   anything else (an older noo, `none`, unset) copies nothing.
 # Every other add-on's directory is removed, so a switched-off or unverified
-# add-on stops declaring on this start. The two directories keep their inode
+# add-on stops declaring (and loses its routes) on this start. The three
+# directories keep their inode
 # (contents replaced, never the directory), so a gateway bind stays valid.
 #
 # lib-secrets.sh `_declared_systems` reads the systems directory: it is the
@@ -964,11 +972,12 @@ compose_active_services() {
 #
 # Fails (return 1) only when the directories cannot be written.
 addon_decls_materialise() {
-    local _root="${PROJECT_ROOT:-$_DIST_LIB_ROOT}" _sys _wl _before _after _plan="" _pair _a _f _src _n _d _keep=" "
+    local _root="${PROJECT_ROOT:-$_DIST_LIB_ROOT}" _sys _wl _rt _before _after _plan="" _pair _a _f _src _n _d _keep=" "
     _sys="$_root/.noo-addon-systems"
     _wl="$_root/.noo-addon-workloads"
-    if ! mkdir -p "$_sys" "$_wl" || ! chmod 0755 "$_sys" "$_wl"; then
-        echo "REFUSING: could not create the add-on declaration directories under $_root (.noo-addon-systems, .noo-addon-workloads)." >&2
+    _rt="$_root/.noo-addon-routes"
+    if ! mkdir -p "$_sys" "$_wl" "$_rt" || ! chmod 0755 "$_sys" "$_wl" "$_rt"; then
+        echo "REFUSING: could not create the add-on declaration directories under $_root (.noo-addon-systems, .noo-addon-workloads, .noo-addon-routes)." >&2
         return 1
     fi
     _before="$(cd "$_sys" && ls -1 2>/dev/null | sort | tr '\n' ' ')"
@@ -979,7 +988,7 @@ addon_decls_materialise() {
                 _src="$(addon_overlay "$_n" 2>/dev/null)"
                 [ -n "$_src" ] || continue
                 _d="$(dirname "$_src")"
-                for _f in system.json workloads.json; do
+                for _f in system.json workloads.json routes.json; do
                     [ -f "$_d/$_f" ] && _plan="${_plan}${_n} ${_f} ${_d}/${_f}"$'\n'
                 done
             done ;;
@@ -997,7 +1006,7 @@ addon_decls_materialise() {
         [ -n "$_a" ] || continue
         case "$_a" in [a-z]*) : ;; *) continue ;; esac
         case "$_a" in *[!a-z0-9_-]*) continue ;; esac
-        case "$_f" in system.json) _d="$_sys/$_a" ;; workloads.json) _d="$_wl/$_a" ;; *) continue ;; esac
+        case "$_f" in system.json) _d="$_sys/$_a" ;; workloads.json) _d="$_wl/$_a" ;; routes.json) _d="$_rt/$_a" ;; *) continue ;; esac
         [ -f "$_src" ] && [ ! -L "$_src" ] || continue
         case "$_keep" in *" $_f:$_a "*) : ;; *)
             rm -rf "${_d:?}" && mkdir -p "$_d" && chmod 0755 "$_d" || return 1 ;;
@@ -1011,10 +1020,10 @@ addon_decls_materialise() {
 $_plan
 PLAN
     # Drop every add-on directory not copied above.
-    for _d in "$_sys"/* "$_wl"/*; do
+    for _d in "$_sys"/* "$_wl"/* "$_rt"/*; do
         [ -e "$_d" ] || continue
         _n="$(basename "$_d")"
-        case "$_d" in "$_sys"/*) _f=system.json ;; *) _f=workloads.json ;; esac
+        case "$_d" in "$_sys"/*) _f=system.json ;; "$_wl"/*) _f=workloads.json ;; *) _f=routes.json ;; esac
         case "$_keep" in *" $_f:$_n "*) : ;; *) rm -rf "${_d:?}" ;; esac
     done
     _after="$(cd "$_sys" && ls -1 2>/dev/null | sort | tr '\n' ' ')"

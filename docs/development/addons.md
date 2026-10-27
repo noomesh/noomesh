@@ -27,7 +27,7 @@ pretending otherwise would make both worse.
 | Layer | Where | What it decides |
 |---|---|---|
 | Declaration | `gateway-rust/src/addons.rs` — one `Addon` row (the add-ons that shipped with the stack); a third-party HTTP add-on is declared by the operator (`addons.<name>: true`) and registered at runtime | Is it supposed to be here? What flag, which polarity, which entitlement, what does a refusal say? |
-| Transport (HTTP) | your repo's route manifest, delivered to `/opt/noo/addon-routes/<name>/routes.json` | Which paths the gateway proxies to it (validated and mounted at startup) |
+| Transport (HTTP) | your repo's route manifest, shipped as `routes.json` in your signed bundle; the launcher hands it to the gateway | Which paths the gateway proxies to it (validated and mounted at startup) |
 | Transport (NATS) | a subject prefix, matched in `worker_client.rs` | Which subjects it answers |
 
 Pick HTTP if your add-on serves an API. Pick NATS if it answers worker
@@ -42,9 +42,9 @@ because everything else is something only you can keep true.
 | # | Artifact | Where | Why it is yours |
 |---|---|---|---|
 | 1 | The service | your `src/`, serving the declared paths + `/health` | — |
-| 2 | Route manifest | in your package and image (the example below: `src/example_addon/example-addon.routes.json`) | the gateway mounts your HTTP surface from it at runtime; the core names none of your routes |
+| 2 | Route manifest | in your repo (the example below: `src/example_addon/example-addon.routes.json`) | the gateway mounts your HTTP surface from it at runtime; the core names none of your routes |
 | 3 | Contract test | `tests/test_gateway_route_contract.py` | the gateway cannot tell whether you serve what your manifest declares; only you can |
-| 4 | Manifest delivery | a one-shot service in your overlay that writes the manifest into a volume the gateway mounts read-only (dev: bind-mount the file) | the manifest the gateway reads must be the one in the image beside it |
+| 4 | Manifest delivery | `routes.json` in your signed bundle (dev: beside your overlay); the launcher copies it for the gateway, your overlay touches no core service | the manifest the gateway reads must be the one you signed with the image it describes |
 | 5 | CI that runs 3 | a workflow | an unrun check is documentation |
 | 6 | MCP tool fragment | `mcp-tools-<addon>.json`, named by `NOO_MCP_EXTRA_MANIFEST` | optional — only if your add-on should appear as MCP tools |
 | 7 | Compose overlay | `docker-compose.<addon>.yml` with an explicit env allowlist | the launcher composes it when `addons.<name>` is declared on in `noomesh.yaml` |
@@ -87,10 +87,10 @@ example-addon/
    ```
 
 3. **The contract test** is the one in step 4, pointed at that file.
-4. **Manifest delivery**: the overlay runs a one-shot service from the
-   add-on's own image that copies the manifest into a named volume; the
-   gateway mounts that volume read-only at
-   `/opt/noo/addon-routes/example-addon` and waits for the one-shot to finish.
+4. **Manifest delivery**: the release signs the manifest into the bundle as
+   `routes.json`; on every start the launcher copies it to
+   `.noo-addon-routes/example-addon/routes.json`, which the gateway mounts
+   read-only. The overlay never touches the `gateway` service.
 5. **CI** runs the contract test on every push.
 6. **MCP fragment** (optional): `mcp-tools-example-addon.json`, named by
    `NOO_MCP_EXTRA_MANIFEST`, exposes `status` as a tool.
@@ -148,10 +148,11 @@ that is the reason this table exists rather than a scattering of env reads.
 
 ## Step 2a — declare your routes (HTTP add-ons)
 
-Write your manifest in your own repo and ship it in your image. The gateway
-reads it at startup from `/opt/noo/addon-routes/<name>/routes.json` when your
-switch is on (`gateway-rust/src/addon_registry.rs`, `addon_proxy.rs`); you touch
-no gateway code.
+Write your manifest in your own repo and sign it into your bundle as
+`routes.json`. The gateway reads it at startup from
+`/opt/noo/addon-bundle-routes/<name>/routes.json` when your switch is on
+(`gateway-rust/src/addon_registry.rs`, `addon_proxy.rs`); you touch no gateway
+code and no gateway service.
 
 ### Registration
 
@@ -159,7 +160,7 @@ The gateway keeps a **runtime registry** of HTTP add-ons, built at startup. An
 add-on is registered when all three hold:
 
 1. the operator switched it on: `addons.<name>: true` in `noomesh.yaml`;
-2. its image delivered a manifest the gateway accepted (below);
+2. a manifest was delivered for it (below) and the gateway accepted it;
 3. the launcher vouches for its signed lock: `noo addons enable|upgrade` verified
    the lock against the add-on's key in the installed entitlement and checked
    that it lists this stack (`supports_stack`), and `noo stack start|restart`
@@ -180,8 +181,8 @@ remedy (`noo addons upgrade <name>`, or `noo addons disable <name>`), does not
 compose its overlay, hands the gateway none of its bundle declarations, stops a
 container left from an earlier start, and ends with "Services started WITHOUT
 add-on(s) <name>". The add-on is absent from `NOO_ADDONS_VERIFIED`, so its
-routes are refused (even from a `routes.json` an earlier start left in the
-routes volume), and it is named in `NOO_ADDONS_REFUSED`, so the systems broker
+routes are refused (and the launcher removes the `routes.json` an earlier
+start handed over), and it is named in `NOO_ADDONS_REFUSED`, so the systems broker
 runs no DDL for it. `noo addons list|show` read it as refused and the
 `add-on pins` row of `noo cluster verify --controller` fails naming it. A
 `stack.lock` that is missing or for another tag still refuses the whole start.
@@ -331,12 +332,39 @@ that carries them (unknown keys fail the whole manifest), so ship them with a
 
 ### Delivering it
 
-Your overlay hands the file to the gateway read-only: a one-shot service from
-the add-on's own image writes the manifest into a named volume, the gateway
-mounts that volume at `/opt/noo/addon-routes/<name>` (`:ro`) and waits for the
-one-shot to complete.
+Core hands the file to the gateway, exactly as it hands over `system.json` and
+`workloads.json`: list `routes.json` in your signed bundle (`--file
+routes.json=<your manifest>` when you sign, see "Shipping it" under
+[Declaring workloads](#declaring-workloads)). On every `noo stack start |
+restart` the launcher (`scripts/lib-dist.sh` `addon_decls_materialise`) copies
+it to `.noo-addon-routes/<name>/routes.json` in the install root, which the
+gateway mounts read-only at `/opt/noo/addon-bundle-routes`:
+
+- only while your add-on is switched on and its signed lock verified this
+  start;
+- only when that lock lists `routes.json` (and the copy matches its signed
+  hash): a `routes.json` left unsigned beside the bundle is never copied;
+- a switched-off, refused or unverified add-on loses its routes on that start
+  (its directory is removed; the mounted directory itself is never replaced).
+
+In a development checkout (nothing is signed), put `routes.json` beside your
+`docker-compose.<name>.yml`; a dev start copies it from there.
+
+Your overlay does not touch the `gateway` service. A third-party overlay may
+not: extending a core service, mounting a core volume or binding a host path
+is refused (`noo-cli/src/addons/guards.rs`).
+
 A file, not a fetch: nothing at boot depends on the network or on the add-on
-being up first, and an image upgrade rewrites the file.
+being up first, and an upgrade that brings a new bundle rewrites the file.
+
+**The older path.** Add-ons the stack ships may still deliver the manifest
+from their own overlay: a one-shot service from the add-on's image fills a
+named volume that the gateway mounts at `/opt/noo/addon-routes/<name>` (`:ro`).
+The gateway reads `/opt/noo/addon-bundle-routes/<name>/routes.json` first and
+looks under `/opt/noo/addon-routes/<name>/` only when the launcher delivered
+nothing, so when both exist for one add-on the signed copy wins. The two
+directories are separate mounts, never nested, so a volume an overlay mounts
+cannot cover the file core wrote.
 
 ### What the gateway checks
 
@@ -1402,15 +1430,17 @@ workloads in `desired-config` (`addon_workloads`) and act on nothing else.
 noo security addon-lock sign --out addon-bundle.json … \
   --file docker-compose.yml=docker-compose.example-addon.yml \
   --file system.json=deploy/system.json \
-  --file workloads.json=deploy/workloads.json
+  --file workloads.json=deploy/workloads.json \
+  --file routes.json=src/example_addon/example-addon.routes.json
 ```
 
 and push each as an `application/vnd.noomesh.addon-file.v1` layer next to the
 overlay. A CLI from before these files materialises them and ignores them; a
 gateway from before them never reads them. Ship them with a `supports_stack`
-that starts at the release that reads them. In a development checkout, put
-`system.json` and `workloads.json` beside your `docker-compose.<name>.yml`; a
-dev start copies them from there.
+that starts at the release that reads them (`routes.json` is handed over from
+0.6.13). In a development checkout, put `system.json`, `workloads.json` and
+`routes.json` beside your `docker-compose.<name>.yml`; a dev start copies them
+from there.
 
 `noo addons show <name>` prints what an add-on's bundle declares; `noo addons
 list` lists the add-ons that declare anything.
