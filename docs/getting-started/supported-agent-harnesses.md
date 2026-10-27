@@ -363,9 +363,10 @@ it with the node's chat window: the running chat placement's own key
 by its parallel slots), else the profile's `context`. The window is capped
 by the model's own context ceiling: no engine setting gives a model more than
 it was built for, and a refusal the ceiling decides suggests a different model
-rather than a larger window. Until the node reports the ceiling of the model it
-serves, the ceiling comes from `config/model-capabilities.json`, a fallback
-table; a model it does not list has no ceiling.
+rather than a larger window. A node reports the ceiling of each model its
+Ollama holds, read from the weights; for other engines, and for older agents,
+it comes from `config/model-capabilities.json`, a fallback table. A model
+neither declares has no ceiling.
 
 - **Below the floor:** refused with the numbers, `noo` named as the kind that
   fits, and the `noo cluster place … --env` line that raises the window.

@@ -4076,12 +4076,12 @@ async fn harness_kind_fit(
         .and_then(|t| u8::try_from(t).ok());
     let overrides = crate::repo::cluster::node_harness_profile_overrides(&state.db, node_id).await.unwrap_or_else(|_| json!({}));
     let profile = crate::harness_profile::resolve(tier, &overrides, None, None);
-    let window = crate::harness_fit::node_window(chats.iter().map(|p| (p.backend.as_str(), &p.env, p.model.as_deref())), profile.context);
+    let window = crate::harness_fit::node_window(chats.iter().map(|p| (p.backend.as_str(), &p.env, p.model.as_deref())), &record, profile.context);
     let floor = crate::harness_fit::kind_floor(kind, profile.claude_prompt == "slim");
     // The placement whose window decided: the smallest one.
     let chat = chats
         .iter()
-        .filter_map(|p| crate::harness_fit::chat_window(&p.backend, &p.env, p.model.as_deref(), profile.context).map(|w| (w.tokens, p)))
+        .filter_map(|p| crate::harness_fit::chat_window(&p.backend, &p.env, p.model.as_deref(), &record, profile.context).map(|w| (w.tokens, p)))
         .min_by_key(|(n, _)| *n)
         // No model name, no `noo cluster place` line to suggest.
         .and_then(|(_, p)| p.model.clone().filter(|m| !m.is_empty()).map(|m| (p.backend.clone(), m)));

@@ -8,9 +8,11 @@
 //! context than it was built for.
 //!
 //! The table is the FALLBACK. The weights declare the ceiling (GGUF
-//! `<arch>.context_length`, HF `max_position_embeddings`), so the node
-//! should report it for the model it serves, and that report should win;
-//! the node agent does not report it yet (noomesh-internal i285).
+//! `<arch>.context_length`, HF `max_position_embeddings`), and the node
+//! reports it for the models its Ollama holds (heartbeat
+//! `model_stats[].context_length`, noomesh-internal i285);
+//! [`crate::harness_fit`] prefers that report. vLLM and llama.cpp
+//! placements, and older agents, still fall back to this table.
 //!
 //! A model with no row is unknown and has no ceiling: a guess never
 //! refuses a placement. A number goes in the table only with the place it
