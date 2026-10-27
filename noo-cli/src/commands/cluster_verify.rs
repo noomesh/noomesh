@@ -4274,7 +4274,7 @@ pub(crate) fn leaf_only_check(fleet: &[Value], static_token: Option<bool>) -> Op
     Some(warn(NAME,
         format!("{} {} not reported controller_leaf_only and {basis}: the gateway sends no bearer, the agent answers 401, and the node reads as unreachable",
             silent.join(", "), if silent.len() == 1 { "has" } else { "have" }),
-        Some(format!("noo upgrade --nodes   # or noo cluster provision {first} --wait; or set NOO_NODE_AGENT_TOKEN"))))
+        Some(format!("noo upgrade --nodes   # or noo cluster provision {first} --wait"))))
 }
 
 /// Does the gateway's environment carry a static agent bearer? `None` when
@@ -4312,7 +4312,7 @@ mod leaf_only_tests {
             assert_eq!(c.verdict, Verdict::Warn);
             assert!(c.detail.contains("host4") && !c.detail.contains("host3 "), "{}", c.detail);
             let r = c.remedy.unwrap();
-            assert!(r.contains("noo upgrade --nodes") && r.contains("noo cluster provision host4") && r.contains("NOO_NODE_AGENT_TOKEN"), "{r}");
+            assert!(r.contains("noo upgrade --nodes") && r.contains("noo cluster provision host4") && !r.contains("set NOO_NODE_AGENT_TOKEN"), "{r}");
         }
         let absent = [json!({"id": "host5", "status": "online"})];
         assert_eq!(leaf_only_check(&absent, Some(false)).unwrap().verdict, Verdict::Warn);
