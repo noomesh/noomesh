@@ -280,6 +280,13 @@ async fn park(db: &sqlx::PgPool, task_id: &str, budget_state: &str, note: &str) 
     Ok(n > 0)
 }
 
+/// A loop starts: `checkpointed` -> `running` for an unparked task between
+/// loops. True when the state changed.
+async fn start_loop(db: &sqlx::PgPool, task_id: &str) -> Result<bool> {
+    let uuid = uuid::Uuid::parse_str(task_id)?;
+    Ok(crate::repo::tasks::start_loop(db, uuid).await? > 0)
+}
+
 /// Post a line to the task's thread, from its owner, as the task.
 async fn post(state: &AppState, task: &Task, kind: &str, body: serde_json::Value) {
     let Some(owner) = task.owner.as_deref() else { return };
@@ -340,12 +347,24 @@ pub async fn check(state: &AppState, task_id: &str) -> Result<BudgetCheck> {
                     None
                 }
             };
+            // The loop starts: a task between loops is `running` again, so a
+            // stop or a GET while it runs reads a loop in flight (every
+            // checkpoint sets `checkpointed`; nothing used to set it back).
+            let mut now = task.state.clone();
+            match start_loop(db, task_id).await {
+                Ok(true) => {
+                    crate::task_events::emit_state(db, task_id, "running", None).await;
+                    now = "running".to_string();
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!(task = task_id, error = %e, "task_budget: loop start not recorded"),
+            }
             Ok(BudgetCheck {
                 proceed: true,
                 reason: None,
                 remaining_task: remaining_task(spend),
                 remaining_allowance: allowance.as_ref().map(AllowanceSpend::remaining),
-                state: task.state.clone(),
+                state: now,
                 clarification: handed,
                 context,
             })
@@ -644,5 +663,22 @@ mod tests {
         assert!(!ask_body.contains("park("), "ask must not park the task mid-turn");
         let check_body = &src[src.find("pub async fn check(").unwrap()..src.find("pub enum Refusal").unwrap()];
         assert_eq!(check_body.matches("park(db, task_id, ").count(), 2, "check parks for a question and for a spent budget");
+    }
+
+    /// A loop that starts makes the task `running` again: only the proceed
+    /// arm calls `start_loop`, after every stop arm, and reports the new
+    /// state. Otherwise a task stays `checkpointed` from its first loop on
+    /// and a stop says "no loop in flight" while one runs (rc.2 rehearsal).
+    #[test]
+    fn a_starting_loop_sets_running() {
+        let src = include_str!("task_budget.rs");
+        let check_body = &src[src.find("pub async fn check(").unwrap()..src.find("pub enum Refusal").unwrap()];
+        assert_eq!(check_body.matches("start_loop(db, task_id)").count(), 1, "one loop start, in the proceed arm");
+        let proceed = &check_body[check_body.find("Verdict::Proceed =>").unwrap()..];
+        assert!(proceed.contains("start_loop(db, task_id)"), "the loop start is in the proceed arm");
+        assert!(proceed.contains("state: now,"), "the check reports the state after the loop start");
+        let repo = include_str!("repo/tasks.rs");
+        let sql = &repo[repo.find("pub async fn start_loop<").unwrap()..repo.find("pub async fn checkpoint<").unwrap()];
+        assert!(sql.contains("state = 'running'") && sql.contains("state = 'checkpointed' AND budget_state IS NULL"), "only an unparked task between loops starts one");
     }
 }
