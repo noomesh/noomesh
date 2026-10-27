@@ -606,7 +606,8 @@ pub trait Sources {
     fn ca(&mut self) -> Result<Vec<u8>, String>;
     /// `(cert, key)` PEM of the leaf for `hostname`, issued when absent or close to expiry.
     fn leaf(&mut self, addon: &str, hostname: &str) -> Result<(Vec<u8>, Vec<u8>), String>;
-    /// `(cert, key)` PEM of the add-on's database client leaf (CN = the runtime role).
+    /// `(cert, key)` PEM of the add-on's database client leaf
+    /// ([`db_client_leaf`]: `CN=addon:<addon>/db-client`).
     fn db_leaf(&mut self, addon: &str, role: &str) -> Result<(Vec<u8>, Vec<u8>), String>;
     /// A value of the encrypted store; `None` when absent or blank.
     fn secret(&mut self, var: &str) -> Option<String>;
@@ -906,17 +907,88 @@ fn cert_cn(cert: &Path) -> Option<String> {
     Some(cn)
 }
 
-fn leaf_pair(ca: &crate::pki::ClusterCa, addon: &str, stem: &str, cn: &str, dns: &[String]) -> Result<(Vec<u8>, Vec<u8>), String> {
+/// `(cert, key)` PEM of `addon`'s leaf `stem`, issued when absent, close to
+/// expiry, or carrying any CN but [`crate::pki::addon_leaf_cn`] (a leaf
+/// issued before 0.6.13 is re-issued under the add-on namespace here).
+fn leaf_pair(ca: &crate::pki::ClusterCa, addon: &str, stem: &str, dns: &[String]) -> Result<(Vec<u8>, Vec<u8>), String> {
     if !ca.ca_exists() {
         return Err("this controller has no cluster CA to issue the leaf from (`noo security pki init`)".into());
     }
     let (cert, key) = ca.addon_leaf_paths(addon, stem);
-    let fresh = days_left(&cert).is_some_and(|d| d > LEAF_RENEW_DAYS) && key.is_file();
+    let fresh = days_left(&cert).is_some_and(|d| d > LEAF_RENEW_DAYS)
+        && key.is_file()
+        && cert_cn(&cert).as_deref() == Some(crate::pki::addon_leaf_cn(addon, stem).as_str());
     if !fresh {
-        ca.issue_addon_leaf(addon, stem, cn, dns, crate::pki::DEFAULT_DAYS)?;
+        ca.issue_addon_leaf(addon, stem, dns, crate::pki::DEFAULT_DAYS)?;
     }
     let read = |p: &Path| std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
     Ok((read(&cert)?, read(&key)?))
+}
+
+/// The leaf stem of an add-on's database client certificate:
+/// `pki/addons/<addon>/db-client.crt|key`, `CN=addon:<addon>/db-client`.
+pub const DB_CLIENT_STEM: &str = "db-client";
+
+/// `(cert, key)` PEM of `addon`'s database client leaf: the one leaf both the
+/// launcher's `db` resource and `noo addons enable --provision-only` hand
+/// out. Its only DNS SAN is `pg-<addon>-<role>`, which no door pins on, so
+/// it can never pass a hostname check either. Postgres takes it under the
+/// `verify-ca` line every add-on role uses (any cluster-CA leaf plus the
+/// role's password), so the CN is free to say whose it is.
+pub fn db_client_leaf(ca: &crate::pki::ClusterCa, addon: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let (role, _) = db_runtime(addon);
+    let san = format!("pg-{}-{}", addon.replace('_', "-"), role.replace('_', "-"));
+    leaf_pair(ca, addon, DB_CLIENT_STEM, &[san])
+}
+
+/// The leaf `noo addons enable --provision-only` issued before 0.6.13:
+/// `pki/services/<addon>/service.{crt,key}`, `CN=<addon>`, a key the reader
+/// table did not name (so 0644). Retired by [`retire_legacy_leaf`].
+pub fn legacy_leaf_dir(ca: &crate::pki::ClusterCa, addon: &str) -> Option<PathBuf> {
+    // A leaf core issues (onboard's SVC_LIST, the reader table) is core's,
+    // whatever add-on shares its name: never touched here.
+    if crate::pki::SERVICE_KEY_READERS.iter().any(|(svc, _)| *svc == addon) {
+        return None;
+    }
+    let dir = ca.dir.join("services").join(addon);
+    let cert = dir.join("service.crt");
+    if !cert.is_file() && !dir.join("service.key").exists() {
+        return None;
+    }
+    // Only the shape provision-only wrote: CN = the bare add-on name. A leaf
+    // an operator issued by hand under another CN is not ours to remove.
+    match cert_cn(&cert) {
+        Some(cn) if cn == addon => Some(dir),
+        None if !cert.exists() => Some(dir),
+        _ => None,
+    }
+}
+
+/// Re-issue `addon`'s database client leaf under the add-on namespace and
+/// retire the pre-0.6.13 `services/<addon>/` leaf: the new leaf is issued
+/// FIRST, `provision_dir` (the runner's credential directory, when it has
+/// one) gets the new pair, and only then is the old directory removed and
+/// the gateway's certificate view re-synced. `Ok(None)` when there is
+/// nothing to retire. The old certificate stays cryptographically valid
+/// until it expires (the cluster CA keeps no revocation list); it holds no
+/// grant (`CN=<addon>` is no core service: `noo addons enable` refuses an
+/// add-on named like one).
+pub fn retire_legacy_leaf(ca: &crate::pki::ClusterCa, addon: &str, provision_dir: Option<&Path>) -> Result<Option<String>, String> {
+    let Some(old) = legacy_leaf_dir(ca, addon) else { return Ok(None) };
+    let (cert, key) = db_client_leaf(ca, addon)?;
+    if let Some(dir) = provision_dir.filter(|d| d.join(crate::commands::addon_provision::CERT_FILE).is_file()) {
+        use crate::commands::addon_provision::{write_private, CERT_FILE, KEY_FILE};
+        write_private(dir, CERT_FILE, &cert, 0o444)?;
+        write_private(dir, KEY_FILE, &key, 0o400)?;
+    }
+    std::fs::remove_dir_all(&old).map_err(|e| {
+        format!("{} could not be removed ({e}); its new leaf is issued, remove the old one by hand: rm -r {}", old.display(), old.display())
+    })?;
+    let _ = ca.sync_public_view();
+    Ok(Some(format!(
+        "{addon}: its client certificate is now {} (pki/addons/{addon}/{DB_CLIENT_STEM}.crt); the old pki/services/{addon}/ leaf (CN={addon}) is retired",
+        crate::pki::addon_leaf_cn(addon, DB_CLIENT_STEM)
+    )))
 }
 
 impl Sources for LiveSources<'_> {
@@ -925,14 +997,11 @@ impl Sources for LiveSources<'_> {
     }
 
     fn leaf(&mut self, addon: &str, hostname: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
-        leaf_pair(self.ca, addon, hostname, hostname, &[hostname.to_string()])
+        leaf_pair(self.ca, addon, hostname, &[hostname.to_string()])
     }
 
-    fn db_leaf(&mut self, addon: &str, role: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
-        // One DNS SAN that no door pins on (the role leaves' `pg-<owner>-<role>`
-        // convention), so this client leaf can never pass a hostname pin.
-        let san = format!("pg-{}-{}", addon.replace('_', "-"), role.replace('_', "-"));
-        leaf_pair(self.ca, addon, "db-client", role, &[san])
+    fn db_leaf(&mut self, addon: &str, _role: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
+        db_client_leaf(self.ca, addon)
     }
 
     fn secret(&mut self, var: &str) -> Option<String> {
@@ -1146,6 +1215,45 @@ mod tests {
     fn core_vars_are_read_from_core_compose_text() {
         let v = core_compose_vars(&["  x: ${NOO_JWT_SECRET:-}\n  y: ${RHADDON_LEAKED}\n".to_string()]);
         assert!(v.contains("NOO_JWT_SECRET") && v.contains("RHADDON_LEAKED"));
+    }
+
+    /// The migration of an add-on provisioned before 0.6.13: its
+    /// `services/<addon>` leaf (CN = the bare name, key 0644) is replaced by
+    /// the namespaced client leaf, the runner's files get the new pair, and
+    /// the old directory is gone. Core's own leaves are never touched.
+    #[test]
+    fn a_pre_0613_provision_leaf_is_reissued_under_the_namespace_and_retired() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("noo-res-retire-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = crate::pki::ClusterCa::new(dir.join("pki"));
+        ca.generate_ca("t", 3650).unwrap();
+        // What --provision-only wrote before: CN=rhaddon, no reader row.
+        ca.issue_service_cert("rhaddon", &[], &[], 30).unwrap();
+        let legacy = ca.dir.join("services").join("rhaddon");
+        assert_eq!(cert_cn(&legacy.join("service.crt")).as_deref(), Some("rhaddon"), "the fixture is the legacy shape");
+        assert_eq!(std::fs::metadata(legacy.join("service.key")).unwrap().permissions().mode() & 0o777, 0o644, "the legacy key mode");
+        let prov = dir.join("provision").join("rhaddon");
+        std::fs::create_dir_all(&prov).unwrap();
+        std::fs::write(prov.join("client.crt"), b"OLD-CERT").unwrap();
+        std::fs::write(prov.join("client.key"), b"OLD-KEY").unwrap();
+
+        let said = retire_legacy_leaf(&ca, "rhaddon", Some(&prov)).unwrap().expect("a legacy leaf was retired");
+        assert!(said.contains("addon:rhaddon/db-client") && said.contains("retired"), "{said}");
+        assert!(!legacy.exists(), "the old leaf directory is removed");
+        let (crt, key) = ca.addon_leaf_paths("rhaddon", DB_CLIENT_STEM);
+        assert_eq!(cert_cn(&crt).as_deref(), Some("addon:rhaddon/db-client"));
+        assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(prov.join("client.crt")).unwrap(), std::fs::read(&crt).unwrap(), "the runner gets the new leaf");
+        assert_eq!(std::fs::metadata(prov.join("client.key")).unwrap().permissions().mode() & 0o777, 0o400);
+        // Idempotent: nothing left to retire.
+        assert!(retire_legacy_leaf(&ca, "rhaddon", None).unwrap().is_none());
+        // A leaf core issues is core's, whatever add-on shares its name.
+        ca.issue_service_cert("evolve", &[], &[], 30).unwrap();
+        assert!(retire_legacy_leaf(&ca, "evolve", None).unwrap().is_none());
+        assert!(ca.dir.join("services/evolve/service.crt").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

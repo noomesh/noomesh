@@ -891,6 +891,14 @@ fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
                 let p = e.config.clone();
                 // Fully on now: it is no longer merely "provisioned".
                 let _ = crate::addons::provisioned::clear(&crate::envfile::repo_root(), name);
+                // Provisioned before 0.6.13: its old client leaf
+                // (`services/<name>`, CN = its name) is re-issued under the
+                // add-on namespace and retired.
+                match crate::commands::addon_provision::retire_legacy_leaf_here(name) {
+                    Some(Ok(said)) if !g.json => ui::done(&said),
+                    Some(Err(e)) if !g.json => ui::warned(&e),
+                    _ => {}
+                }
                 enabled_report = Some(e);
                 // Its own NATS principal, when its overlay declares one (i70
                 // residue): mint + render + HUP. Best-effort — without it the

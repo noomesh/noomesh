@@ -649,12 +649,53 @@ mod tests {
         let client = Client::new(None);
         let root = std::env::temp_dir().join(format!("noo-trust-prep-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("docker-compose.cluster.yml"), "services:\n  gateway:\n    image: g\n").unwrap();
         let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &client };
         let mut docker = FakeDocker::default();
         let p = addons::prepare_from(&ctx, "pai-voice", &anchor(), Some(f), &mut docker).expect("prepared");
         assert_eq!(p.pulled, 1);
         assert!(p.via.contains("anonymous"), "the vendor token is never sent to an operator-named registry: {}", p.via);
         assert!(docker.pulls.iter().all(|(_, _, had_cred)| !had_cred), "{:?}", docker.pulls);
+    }
+
+    /// The pin path (`noo addons enable | upgrade`) refuses a signed
+    /// third-party bundle whose overlay takes a core secret, or whose name is
+    /// core's, BEFORE an image is pulled or a pin written. Reverting the
+    /// `guards::guard_install` call in `prepare_from` makes both prepare.
+    #[test]
+    fn prepare_from_refuses_a_core_secret_or_a_core_name_before_anything_is_pulled() {
+        use crate::addons::{self, lock_fetch::Client};
+        let client = Client::new(None);
+        let root = std::env::temp_dir().join(format!("noo-trust-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("docker-compose.cluster.yml"),
+            "services:\n  gateway:\n    image: g\nsecrets:\n  noo_jwt_secret:\n    file: ${NOO_SECRET_RUNDIR:-/x}/noo_jwt_secret\n    x-noo-source: NOO_JWT_SECRET\n",
+        )
+        .unwrap();
+        let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &client };
+        // 1. Its service takes core's JWT secret by name.
+        let overlay = "services:\n  noo-rhaddon:\n    image: x\n    secrets: [noo_jwt_secret]\n";
+        let mut l = third_party_lock(&["v0.6.0"]);
+        l.addon = "rhaddon".into();
+        let f = crate::addons::resolve::tests::signed_bundle_with(&l, overlay);
+        let mut docker = FakeDocker::default();
+        let r = addons::prepare_from(&ctx, "rhaddon", &anchor(), Some(f), &mut docker).expect_err("refused");
+        let why = r.why("rhaddon");
+        assert!(matches!(r, Refusal::Decl(_)) && why.contains("rhaddon") && why.contains("NOO_JWT_SECRET"), "{why}");
+        assert!(docker.pulls.is_empty(), "nothing is pulled for a refused bundle: {:?}", docker.pulls);
+        assert!(crate::addons::pins::read(&root).unwrap().get("rhaddon").is_none(), "nothing is pinned");
+        // 2. A third-party add-on named like a core service.
+        let mut l = third_party_lock(&["v0.6.0"]);
+        l.addon = "grafana".into();
+        let f = crate::addons::resolve::tests::signed_bundle_with(&l, "services: {}\n");
+        let mut docker = FakeDocker::default();
+        let r = addons::prepare_from(&ctx, "grafana", &anchor(), Some(f), &mut docker).expect_err("refused");
+        let why = r.why("grafana");
+        assert!(why.contains("`grafana` is a core service"), "{why}");
+        assert!(docker.pulls.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
