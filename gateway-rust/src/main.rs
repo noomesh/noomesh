@@ -192,6 +192,7 @@ mod memory;
 mod mesh;
 mod metrics;
 mod middleware;
+mod model_capabilities;
 mod node_tier;
 mod operator_alert;
 mod posture;

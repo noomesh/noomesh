@@ -94,6 +94,7 @@
         "tests/fixtures/own_image_cases.json",
         "config/harness-kinds.json",
         "config/harness-profiles.json",
+        "config/model-capabilities.json",
         "config/tools.json",
         "configs/grafana/dashboards/cluster-overview.json",
         "scripts/**",
