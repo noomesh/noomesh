@@ -18,8 +18,9 @@
 //! file READS one of those process variables (`std::env::var`, `var_os`, or
 //! the crate's own `env_var` / `read_env` / `env_or_dotenv` helpers). Writing
 //! a variable (`set_var`, `remove_var`), listing its name in a table, and
-//! parsing it out of an env file are not reads of the process environment
-//! and are left alone.
+//! parsing it out of an env file (including the method form
+//! `ctx.read_env(..)`, which reads the install's `.env`) are not reads of the
+//! process environment and are left alone.
 
 use std::path::{Path, PathBuf};
 
@@ -53,7 +54,6 @@ fn code_only(src: &str) -> String {
             continue;
         }
         out.extend(line.chars().filter(|c| !c.is_whitespace()));
-        out.push('\n');
     }
     out
 }
@@ -69,8 +69,9 @@ fn reads_var(code: &str, name: &str) -> bool {
         while let Some(i) = code[from..].find(&needle) {
             let at = from + i;
             let before = &code[..at];
-            // `set_var(` / `remove_var(` contain `var(` but write.
-            if !(before.ends_with("set_") || before.ends_with("remove_")) {
+            // `set_var(` / `remove_var(` contain `var(` but write; a method
+            // call (`ctx.read_env(`) reads an env FILE, not the process.
+            if !(before.ends_with("set_") || before.ends_with("remove_") || before.ends_with('.')) {
                 return true;
             }
             from = at + needle.len();
@@ -115,6 +116,7 @@ fn scanner_sees_reads_and_ignores_writes() {
     assert!(!reads_var(&c, "NOO_Z"));
     assert!(!reads_var(&c, "NOO_W"));
     assert!(reads_var(&code_only("let v = env_var(\"NOO_X\");"), "NOO_X"));
+    assert!(!reads_var(&code_only("let v = ctx.read_env(\"NOO_X\");"), "NOO_X"));
 }
 
 #[test]
