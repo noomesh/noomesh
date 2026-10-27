@@ -1515,6 +1515,22 @@ the launcher writes it, and no host file is read. A third-party add-on also
 may not `extends:` a service of another compose file (it would inherit that
 service's secrets) or define a service named like a core one.
 
+**Your services reach the host only through your own mounts** (third-party
+add-ons). A service may mount named volumes your overlay declares (plain:
+no `external`, `name`, `driver` or `driver_opts`, and never a volume core
+declares), the mount directories your `resources.json` declares (the source
+is exactly `${<MOUNT_ENV>}`, `${<MOUNT_ENV>:?…}` or a default under
+`/nonexistent/`), anonymous volumes and `tmpfs`. Refused, naming your add-on,
+the service and the mount, at `noo addons enable | upgrade | verify`,
+`upgrade --check` and every launch: any other bind mount, short or long form,
+literal or interpolated (`${NOO_PKI_DIR}`, `/`, `~`, the Docker socket);
+`env_file`, `volumes_from`, `devices`, `cap_add`, `cgroup_parent`; `pid`,
+`ipc`, `network_mode`, `userns_mode`, `uts` or `cgroup` set to `host`,
+`service:…` or `container:…`; a `security_opt` that is `unconfined` or
+disables labels; a `configs:` entry read from a file or the environment. A
+GPU reservation and `privileged` are not refused: the launcher holds those
+services (never starts them).
+
 **Your name is yours.** A third-party add-on whose name, or a name derived
 from it, is core's is refused at `noo addons enable | upgrade`: a core service
 or container (`gateway`, `prometheus`, `noo-gateway`…), a certificate core
