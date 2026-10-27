@@ -451,7 +451,7 @@ pub fn check_bundle_files(addon: &str, files: &BTreeMap<String, Vec<u8>>, third_
 fn declared_mount_source(src: &str, mount_envs: &[String]) -> bool {
     let Some(inner) = src.strip_prefix("${").and_then(|r| r.strip_suffix('}')) else { return false };
     let name: String = inner.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
-    if !mount_envs.iter().any(|m| *m == name) {
+    if !mount_envs.contains(&name) {
         return false;
     }
     let rest = &inner[name.len()..];
