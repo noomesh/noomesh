@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 PersonifAI LLC
 
-//! What a model can do, declared ONCE in `config/model-capabilities.json`
-//! and embedded here at compile time (i226 decision 3, phase C). Today a
-//! row carries the model's own context ceiling, which caps the window
-//! [`crate::harness_fit`] judges a harness kind against: no engine setting
-//! gives a model more context than it was built for.
+//! What a model can do, from `config/model-capabilities.json`, embedded
+//! here at compile time (i226 decision 3, phase C). Today a row carries the
+//! model's own context ceiling, which caps the window [`crate::harness_fit`]
+//! judges a harness kind against: no engine setting gives a model more
+//! context than it was built for.
+//!
+//! The table is the FALLBACK. The weights declare the ceiling (GGUF
+//! `<arch>.context_length`, HF `max_position_embeddings`), so the node
+//! should report it for the model it serves, and that report should win;
+//! the node agent does not report it yet (noomesh-internal i285).
 //!
 //! A model with no row is unknown and has no ceiling: a guess never
 //! refuses a placement. A number goes in the table only with the place it
