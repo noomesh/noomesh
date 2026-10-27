@@ -57,6 +57,9 @@ type Reporter struct {
 	// getModelStats is the adopted lane's measured per-model sizes; the
 	// container lane is read through ollamaDoor when it returns nothing.
 	getModelStats func() []ModelStat
+	// ceilings remembers each dockerised-ollama model's context ceiling
+	// (/api/show), so it is asked once per model, not per beat.
+	ceilings modelstats.Ceilings
 	// adoptedModels lists what the agent's adopted ollama lane holds
 	// (backendrt.Native.Models), dialled with the transport the lane's base
 	// needs. nil = no lane on this host, and the plaintext loopback probe
@@ -225,7 +228,20 @@ func (r *Reporter) modelStats() []ModelStat {
 	if tags == nil {
 		return nil
 	}
-	return modelstats.Parse(tags, get("/api/ps"))
+	stats := modelstats.Parse(tags, get("/api/ps"))
+	r.ceilings.Fill(stats, func(name string) ([]byte, error) {
+		body, _ := json.Marshal(map[string]string{"model": name})
+		resp, err := client.Post(base+"/api/show", "application/json", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("/api/show %s: HTTP %d", name, resp.StatusCode)
+		}
+		return io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	})
+	return stats
 }
 
 // SetAdoptedModels installs the adopted-lane inventory (the self-node's

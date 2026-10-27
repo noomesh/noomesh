@@ -339,3 +339,29 @@ func TestAnEmbedderLoadedAndNothingHeldIsNotTheBackendsModel(t *testing.T) {
 		t.Errorf("Loaded still reports what is in memory: %v", l)
 	}
 }
+
+// i285: the adopted lane reports each model's own context ceiling, read
+// with a POST /api/show {"model": name}.
+func TestModelStatsCarryTheContextCeiling(t *testing.T) {
+	n := stub(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tags":
+			_, _ = w.Write([]byte(`{"models":[{"name":"ceiling-test:12b","size":7000000000,"digest":"i285"}]}`))
+		case "/api/show":
+			var body struct {
+				Model string `json:"model"`
+			}
+			if r.Method != http.MethodPost || json.NewDecoder(r.Body).Decode(&body) != nil || body.Model != "ceiling-test:12b" {
+				http.Error(w, "bad show", http.StatusBadRequest)
+				return
+			}
+			_, _ = w.Write([]byte(`{"model_info":{"general.architecture":"gemma4","gemma4.context_length":262144}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	got := n.ModelStats(context.Background())
+	if len(got) != 1 || got[0].ContextLength != 262144 {
+		t.Fatalf("ModelStats = %+v, want the ceiling 262144", got)
+	}
+}
