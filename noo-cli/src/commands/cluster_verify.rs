@@ -4228,6 +4228,113 @@ mod companions_tests {
     }
 }
 
+/// The `agent credential` row: with no bearer in the gateway's environment
+/// (`NOO_NODE_AGENT_TOKEN` unset) the ONLY credential the gateway presents to
+/// a node agent is its client certificate, which an agent admits only once it
+/// has reported `controller_leaf_only`. One that has not answers 401 and reads
+/// as plain "unreachable", with the cause only in the gateway log.
+///
+/// The record's `controller_leaf_only` is written on every beat, so `true` is
+/// the agent's word; `false` or absent is "has not said" (an older agent, or no
+/// beat since the field existed), never "refuses". `static_token` is whether
+/// the gateway has a bearer to fall back on: `None` when the secret store
+/// could not be read, which the row says instead of guessing. Only nodes that
+/// are up are judged — an offline one (a node in `noo cluster maintenance`) is
+/// reported by the `online` row. `None` when no node is up.
+pub(crate) fn leaf_only_check(fleet: &[Value], static_token: Option<bool>) -> Option<Check> {
+    const NAME: &str = "agent credential";
+    let mut reporting = 0usize;
+    let mut silent = Vec::new();
+    for n in fleet {
+        let Some(id) = n["id"].as_str() else { continue };
+        if !matches!(n["status"].as_str(), Some("online") | Some("busy")) {
+            continue;
+        }
+        if n["controller_leaf_only"].as_bool() == Some(true) {
+            reporting += 1;
+        } else {
+            silent.push(id.to_string());
+        }
+    }
+    if reporting == 0 && silent.is_empty() {
+        return None;
+    }
+    if silent.is_empty() {
+        return Some(ok(NAME, format!("{reporting} node agent(s) report controller_leaf_only: the gateway's client certificate is their credential")));
+    }
+    if static_token == Some(true) {
+        return Some(ok(NAME, format!(
+            "{} have not reported controller_leaf_only; the gateway sends them NOO_NODE_AGENT_TOKEN", silent.join(", "))));
+    }
+    let basis = match static_token {
+        Some(_) => "NOO_NODE_AGENT_TOKEN is unset",
+        None => "the secret store could not be read, so NOO_NODE_AGENT_TOKEN may be unset",
+    };
+    let first = &silent[0];
+    Some(warn(NAME,
+        format!("{} {} not reported controller_leaf_only and {basis}: the gateway sends no bearer, the agent answers 401, and the node reads as unreachable",
+            silent.join(", "), if silent.len() == 1 { "has" } else { "have" }),
+        Some(format!("noo upgrade --nodes   # or noo cluster provision {first} --wait; or set NOO_NODE_AGENT_TOKEN"))))
+}
+
+/// Does the gateway's environment carry a static agent bearer? `None` when
+/// the secret store is there and could not be read.
+fn static_agent_token_configured() -> Option<bool> {
+    if !std::env::var("NOO_NODE_AGENT_TOKEN").unwrap_or_default().trim().is_empty() {
+        return Some(true);
+    }
+    match crate::envfile::secret_store_state() {
+        crate::envfile::StoreState::Unreadable(_) => None,
+        _ => Some(false),
+    }
+}
+
+#[cfg(test)]
+mod leaf_only_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn node(id: &str, status: &str, leaf: Value) -> Value {
+        json!({"id": id, "status": status, "controller_leaf_only": leaf})
+    }
+
+    #[test]
+    fn all_reporting_is_ok() {
+        let f = [node("host3", "online", json!(true)), node("host4", "online", json!(true))];
+        assert_eq!(leaf_only_check(&f, Some(false)).unwrap().verdict, Verdict::Ok);
+    }
+
+    #[test]
+    fn one_unreported_warns_naming_it_with_a_real_fix() {
+        for silent in [json!(false), Value::Null] {
+            let f = [node("host3", "online", json!(true)), node("host4", "online", silent)];
+            let c = leaf_only_check(&f, Some(false)).unwrap();
+            assert_eq!(c.verdict, Verdict::Warn);
+            assert!(c.detail.contains("host4") && !c.detail.contains("host3 "), "{}", c.detail);
+            let r = c.remedy.unwrap();
+            assert!(r.contains("noo upgrade --nodes") && r.contains("noo cluster provision host4") && r.contains("NOO_NODE_AGENT_TOKEN"), "{r}");
+        }
+        let absent = [json!({"id": "host5", "status": "online"})];
+        assert_eq!(leaf_only_check(&absent, Some(false)).unwrap().verdict, Verdict::Warn);
+    }
+
+    #[test]
+    fn an_offline_node_is_not_judged() {
+        let f = [node("host3", "online", json!(true)), node("host4", "offline", json!(false))];
+        assert_eq!(leaf_only_check(&f, Some(false)).unwrap().verdict, Verdict::Ok);
+        assert!(leaf_only_check(&[node("host4", "offline", json!(false))], Some(false)).is_none());
+    }
+
+    #[test]
+    fn a_static_token_covers_it_and_an_unreadable_store_is_said() {
+        let f = [node("host4", "online", json!(false))];
+        assert_eq!(leaf_only_check(&f, Some(true)).unwrap().verdict, Verdict::Ok);
+        let c = leaf_only_check(&f, None).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("could not be read"), "{}", c.detail);
+    }
+}
+
 /// The route the "logs access" row probes: the raw LogQL door, the one a
 /// User-tier login could read until 2026-09-28. Its directory is the prefix
 /// under which every log READ lives on the gateway and which
@@ -5618,6 +5725,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .map(str::to_string)
             .collect();
         checks.extend(companions_check(&fleet));
+        checks.extend(leaf_only_check(&fleet, static_agent_token_configured()));
         let ca = crate::pki::ClusterCa::new(crate::pki::pki_dir());
         let expected_ca = std::fs::read(ca.ca_cert_path()).ok()
             .and_then(|p| crate::commands::node_fetch::cert_der_sha256(&p).ok());
