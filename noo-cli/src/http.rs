@@ -175,6 +175,15 @@ fn enrolled_anchor(
     Ok(Trust::Enrolled)
 }
 
+/// The ONE reader of `$NOO_TLS_CA`: the trimmed path, `None` when unset or
+/// blank. The source-scan test `config_readers_have_one_owner` in
+/// `src/config_readers.rs` fails on any other file that reads it.
+pub fn tls_ca_env() -> Option<PathBuf> {
+    let v = std::env::var("NOO_TLS_CA").unwrap_or_default();
+    let v = v.trim();
+    if v.is_empty() { None } else { Some(PathBuf::from(v)) }
+}
+
 /// Resolve the trust anchor for `base_url`, or say why there is none.
 ///
 /// Order — the first rung that answers wins:
@@ -272,9 +281,7 @@ fn resolve_trust_with(base_url: &str, enrolled: Option<String>) -> Result<Trust,
         return enrolled_anchor(cluster_ca_candidates(), base);
     }
 
-    let ca_path = std::env::var("NOO_TLS_CA").unwrap_or_default();
-    if !ca_path.trim().is_empty() {
-        let p = PathBuf::from(ca_path.trim());
+    if let Some(p) = tls_ca_env() {
         let pem = std::fs::read(&p).map_err(|e| {
             format!(
                 "$NOO_TLS_CA points at {} but it cannot be read: {e}. Fix the path or unset \

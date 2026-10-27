@@ -104,6 +104,16 @@ impl Credentials {
     }
 }
 
+/// The ONE reader of `$NOO_CLUSTER_SECRET` in this process, trimmed (empty
+/// when unset). Its only caller is the local security scan, which judges the
+/// value (unset / published placeholder) and never sends it anywhere: the CLI
+/// authenticates with a per-user JWT, and the node-agent refuses a CLI-actor
+/// HMAC (`docs/security/node-agent.md`). The other places the literal appears
+/// are key lists and the env.sops dump `provision` writes into a node bundle.
+pub fn cluster_secret_from_env() -> String {
+    std::env::var("NOO_CLUSTER_SECRET").unwrap_or_default().trim().to_string()
+}
+
 /// Current unix time in seconds.
 pub fn now_secs() -> u64 {
     crate::host_exec::now_unix().max(0) as u64
