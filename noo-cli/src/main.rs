@@ -51,6 +51,7 @@ mod addon_decl_parse;
 mod age_key;
 mod addon_lock;
 mod addons;
+mod args;
 mod auth;
 mod catalog;
 mod child_stdin;
@@ -1734,14 +1735,19 @@ fn main() {
 fn usage_error(json: bool, prefix: &[&str]) -> ! {
     let joined = prefix.join(" ");
     let (syntax, about) = usage::lookup(prefix).unwrap_or(("", ""));
+    // The parser's own reason (`--node needs a value`), when it gave one.
+    let detail = args::take_message();
     let usage_line = if syntax.is_empty() { format!("noo {joined}") } else { format!("noo {joined} {syntax}") };
     if json {
         eprintln!(
             "{}",
-            serde_json::json!({"error": format!("noo {joined} did not understand these arguments"), "code": "usage", "hint": usage_line})
+            serde_json::json!({"error": format!("noo {joined} did not understand these arguments"), "code": "usage", "hint": usage_line, "detail": detail})
         );
     } else {
         ui::failed(&format!("noo {joined} did not understand these arguments"), None);
+        if let Some(d) = &detail {
+            eprintln!("{}", ui::note(d));
+        }
         eprintln!("{}", ui::note(&format!("usage: {usage_line}")));
         if !about.is_empty() {
             eprintln!("{}", ui::note(about));
