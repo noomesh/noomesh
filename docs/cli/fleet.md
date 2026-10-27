@@ -854,7 +854,7 @@ drain_started, drained_at}`.
 |---|---|---|
 | `noo autonomy status` | — | Show autonomy engine state and its configured locations |
 | `noo autonomy locations` | — | Hidden: same as autonomy status |
-| `noo autonomy audit` | `[-n <limit>]` | List recent autonomy audit entries (default 20) |
+| `noo autonomy audit` | `[-n\|--limit <n>]` | List recent autonomy audit entries (default 20) |
 | `noo autonomy decisions` | `[-n\|--limit <n>] [-l\|--location <name>]` | What the disarmed autonomy locations would have done — the evidence for arming one |
 | `noo autonomy enable` | — | Enable the autonomy engine |
 | `noo autonomy disable` | — | Disable the autonomy engine |

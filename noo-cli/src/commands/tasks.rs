@@ -12,29 +12,40 @@
 //! agent-message thread (`noo agents thread <id>`).
 
 use super::truncate;
+use crate::args::{ArgError, Args};
 use crate::http::{get_json, post_json};
 use crate::ui::{self, Col, Glyph};
 use crate::{Globals, Unhandled};
 
-pub fn tasks_create(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut objective: Vec<String> = Vec::new();
-    let mut model: Option<String> = None;
-    let mut budget: Option<u64> = None;
-    let mut token_budget: Option<u64> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--model" | "-m" => model = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--budget" | "-b" => budget = Some(iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?),
-            "--token-budget" | "-t" => token_budget = Some(iter.next().and_then(|v| v.parse().ok()).filter(|n| *n > 0).ok_or(Unhandled)?),
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => objective.push(t.to_string()),
-        }
+/// A `--token-budget` value: a positive number.
+fn token_budget_with(a: &mut Args) -> Result<Option<u64>, ArgError> {
+    match a.number::<u64>(&["--token-budget", "-t"])? {
+        Some(0) => Err(ArgError::new("--token-budget must be more than 0")),
+        other => Ok(other),
     }
-    let objective = objective.join(" ");
+}
+
+pub(crate) struct CreateArgs {
+    pub objective: String,
+    pub model: Option<String>,
+    pub budget: Option<u64>,
+    pub token_budget: Option<u64>,
+}
+
+pub(crate) fn parse_create_with(a: &mut Args) -> Result<CreateArgs, ArgError> {
+    let model = a.value(&["--model", "-m"])?;
+    let budget = a.number::<u64>(&["--budget", "-b"])?;
+    let token_budget = token_budget_with(a)?;
+    // The objective is every word left, joined (it need not be quoted).
+    let objective = a.positionals()?.join(" ");
     if objective.trim().is_empty() {
-        return Err(Unhandled);
+        return Err(ArgError::new("missing <objective>"));
     }
+    Ok(CreateArgs { objective, model, budget, token_budget })
+}
+
+pub fn tasks_create(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let CreateArgs { objective, model, budget, token_budget } = parse_create_with(&mut Args::new(args))?;
     let mut body = serde_json::json!({ "objective": objective });
     if let Some(m) = &model {
         body["model"] = serde_json::json!(m);
@@ -94,19 +105,16 @@ pub(crate) fn where_it_ran(node: &str, dispatched: Option<bool>) -> String {
     }
 }
 
+pub(crate) fn parse_list_with(a: &mut Args) -> Result<(u64, Option<String>, Option<String>), ArgError> {
+    let limit = a.number::<u64>(&["--limit", "-n"])?.unwrap_or(50);
+    let state = a.value(&["--state", "-s"])?;
+    let user = a.value(&["--user", "-u"])?;
+    a.finish()?;
+    Ok((limit, state, user))
+}
+
 pub fn tasks_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut limit = 50u64;
-    let mut state: Option<String> = None;
-    let mut user: Option<String> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--limit" | "-n" => limit = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?,
-            "--state" | "-s" => state = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--user" | "-u" => user = Some(iter.next().ok_or(Unhandled)?.clone()),
-            _ => return Err(Unhandled),
-        }
-    }
+    let (limit, state, user) = parse_list_with(&mut Args::new(args))?;
     let mut path = format!("/api/tasks?limit={limit}");
     if let Some(s) = &state {
         path.push_str(&format!("&state={}", super::urlencode(s)));
@@ -311,21 +319,21 @@ pub(crate) fn stop_outcome(id: &str, resp: &serde_json::Value) -> (bool, String)
     }
 }
 
+pub(crate) fn parse_stop_via_with(a: &mut Args) -> Result<(String, Option<String>), ArgError> {
+    let via = a.value(&["--via"])?;
+    let user = a.value(&["--user", "-u"])?;
+    a.finish()?;
+    let via = via
+        .filter(|v| v.strip_prefix("addon:").is_some_and(|n| !n.is_empty()))
+        .ok_or_else(|| ArgError::new("--via needs addon:<name>"))?;
+    Ok((via, user))
+}
+
 /// `noo tasks stop --via addon:<name> [--user <u>]`: revoke an add-on's
 /// background work. Stops your unfinished tasks that add-on started; an
 /// operator names another person with `--user`.
 fn tasks_stop_via(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut via: Option<String> = None;
-    let mut user: Option<String> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--via" => via = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--user" | "-u" => user = Some(iter.next().ok_or(Unhandled)?.clone()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let via = via.filter(|v| v.strip_prefix("addon:").is_some_and(|n| !n.is_empty())).ok_or(Unhandled)?;
+    let (via, user) = parse_stop_via_with(&mut Args::new(args))?;
     let mut body = serde_json::json!({ "via": via });
     if let Some(u) = &user {
         body["user"] = serde_json::json!(u);
@@ -348,19 +356,14 @@ fn tasks_stop_via(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+pub(crate) fn parse_resubmit_with(a: &mut Args) -> Result<(String, Option<u64>), ArgError> {
+    let token_budget = token_budget_with(a)?;
+    let id = a.one("<id>")?;
+    Ok((id, token_budget))
+}
+
 pub fn tasks_resubmit(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut id: Option<String> = None;
-    let mut token_budget: Option<u64> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--token-budget" | "-t" => token_budget = Some(iter.next().and_then(|v| v.parse().ok()).filter(|n| *n > 0).ok_or(Unhandled)?),
-            t if t.starts_with('-') => return Err(Unhandled),
-            t if id.is_none() => id = Some(t.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let id = id.ok_or(Unhandled)?;
+    let (id, token_budget) = parse_resubmit_with(&mut Args::new(args))?;
     let mut body = serde_json::json!({});
     if let Some(t) = token_budget {
         body["token_budget"] = serde_json::json!(t);
@@ -487,5 +490,36 @@ mod stop_outcome_tests {
         assert_eq!(r(json!({"stopped": true, "was": "open"})), (true, "task t1 stopped now (it was open, with no loop in flight)".into()));
         assert_eq!(r(json!({"stopped": true})), (true, "task t1 will stop at its next checkpoint".into()), "an older gateway");
         assert_eq!(r(json!({"stopped": false, "was": "done"})), (false, "task t1 was not running".into()));
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    fn a(v: &[&str]) -> Args {
+        Args::new(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn create_joins_the_objective_and_refuses_a_zero_token_budget() {
+        let c = parse_create_with(&mut a(&["fix", "the", "-t", "500", "build", "-m", "gemma"])).unwrap();
+        assert_eq!(c.objective, "fix the build");
+        assert_eq!((c.token_budget, c.model.as_deref(), c.budget), (Some(500), Some("gemma"), None));
+        assert!(parse_create_with(&mut a(&["x", "--token-budget", "0"])).is_err());
+        assert!(parse_create_with(&mut a(&["--bogus", "x"])).is_err());
+        assert!(parse_create_with(&mut a(&[])).is_err());
+    }
+
+    #[test]
+    fn stop_via_wants_an_addon_name_and_resubmit_one_id() {
+        assert_eq!(
+            parse_stop_via_with(&mut a(&["--via", "addon:voice", "-u", "bob"])).unwrap(),
+            ("addon:voice".to_string(), Some("bob".to_string()))
+        );
+        assert!(parse_stop_via_with(&mut a(&["--via", "addon:"])).is_err());
+        assert!(parse_stop_via_with(&mut a(&[])).is_err());
+        assert_eq!(parse_resubmit_with(&mut a(&["t1", "-t", "9"])).unwrap(), ("t1".to_string(), Some(9)));
+        assert!(parse_resubmit_with(&mut a(&["t1", "t2"])).is_err());
     }
 }
