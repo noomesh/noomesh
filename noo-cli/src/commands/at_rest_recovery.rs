@@ -609,7 +609,7 @@ mod tests {
         assert!(s.contains("sudo cryptsetup open /var/lib/noo/state.luks2 noo-state"), "{s}");
         assert!(s.contains("sudo mount /var/lib/noo/state") && s.contains("noo security at-rest reenroll") && s.contains("noo stack start"), "{s}");
         assert!(s.contains(RUNBOOK));
-        assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(RUNBOOK).is_file(), "the runbook named must exist");
+        assert!(crate::test_support::repo_root().join(RUNBOOK).is_file(), "the runbook named must exist");
     }
 
     #[test]

@@ -2044,7 +2044,7 @@ mod tests {
         assert!(list_after(pubsec, "allow:").contains(&"node.host9.evt.>"), "{b}");
         assert!(list_after(pubsec, "allow:").contains(&"_INBOX_gw.node.host9.>"), "{b}");
         assert!(list_after(pubsec, "deny:").contains(&"node.*.rpc.>"), "{b}");
-        let go = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../node-agent-go/internal/ctrlrpc/service_test.go"))
+        let go = std::fs::read_to_string(crate::test_support::repo_file("node-agent-go/internal/ctrlrpc/service_test.go"))
             .expect("the Go service test is part of this tree");
         for needle in ["\"node.\"+id+\".rpc.>\"", "\"node.\"+id+\".evt.>\"", "\"_INBOX_gw.node.\" + id + \".>\"", "\"node.*.rpc.>\""] {
             assert!(go.contains(needle), "service_test.go no longer grants {needle}");

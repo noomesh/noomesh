@@ -1385,8 +1385,7 @@ compose_env:
     /// allowed for any add-on the gateway does not need to name.
     #[test]
     fn every_gateway_addon_is_offered_here() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let path = repo.join("gateway-rust/src/addons.rs");
+        let path = crate::test_support::repo_file("gateway-rust/src/addons.rs");
         assert!(
             !path.ends_with("noo-cli/src/commands/addons.rs"),
             "the mirror guard is reading its own file — it must read the GATEWAY's table"

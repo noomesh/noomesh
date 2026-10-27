@@ -4270,12 +4270,9 @@ mod cluster_trust_tests {
     /// and a bundle must not render it for any node.
     #[test]
     fn the_agent_env_no_longer_carries_the_v1_gate() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let path = root.join("node-agent-go/deploy/noo-node-agent.env.tmpl");
-        if !path.exists() {
-            eprintln!("crate-only build (no repo tree) -- template check skipped");
+        let Some(path) = crate::test_support::repo_file_or_skip("node-agent-go/deploy/noo-node-agent.env.tmpl") else {
             return;
-        }
+        };
         let tmpl = std::fs::read_to_string(&path).unwrap();
         assert!(tmpl.contains("NODE_AGENT_BIND="), "the guard must be scanning the real template");
         let body = render_env_template(&tmpl, &super::tests::full_vars()).unwrap();
@@ -4323,12 +4320,9 @@ mod cluster_trust_tests {
     /// Render the REAL template the way provision does for a node reporting
     /// `app_version`, and return the env that would be bundled.
     fn bundled_env(darwin: bool, app_version: &str) -> Option<String> {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let path = root.join("node-agent-go/deploy/noo-node-agent.env.tmpl");
-        if !path.exists() {
-            eprintln!("crate-only build (no repo tree) -- agent-env compat check skipped");
+        let Some(path) = crate::test_support::repo_file_or_skip("node-agent-go/deploy/noo-node-agent.env.tmpl") else {
             return None;
-        }
+        };
         let tmpl = std::fs::read_to_string(&path).unwrap();
         let body = render_env_template(&tmpl, &super::tests::full_vars()).unwrap();
         Some(if applier_knows_cluster_trust_keys(darwin, app_version) {
@@ -4879,7 +4873,7 @@ mod tests {
             assert!(!src.contains(&format!("vars.insert(\"{key}\"")), "{key} is rendered again");
         }
         let tmpl = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../node-agent-go/deploy/noo-node-agent.env.tmpl"),
+            crate::test_support::repo_file("node-agent-go/deploy/noo-node-agent.env.tmpl"),
         ).expect("node env template");
         for line in tmpl.lines().filter(|l| !l.trim_start().starts_with('#')) {
             assert!(!line.contains("_TLS=") || line.starts_with("NOO_TLS_"), "template carries a TLS switch: {line}");
@@ -4912,7 +4906,6 @@ mod tests {
     /// default anywhere, because this renderer never evaluates one.
     #[test]
     fn real_harness_template_renders_with_provision_vars() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         // The EMBEDDED template — the one a bundle actually carries — not
         // the file on disk. Reading the disk copy here would have passed on
         // every machine while the staged bundle failed on a controller
@@ -4922,7 +4915,6 @@ mod tests {
             eprintln!("crate-only build (no embedded assets) — harness template drift check skipped");
             return;
         }
-        let _ = root;
         let mut v = full_vars();
         v.insert("noo_harness_model_url", "V_model_url".into());
         v.insert("noo_harness_max_turns", "V_max_turns".into());
@@ -4949,14 +4941,11 @@ mod tests {
     /// supplies — this is the drift guard between the j2 and the Rust caller.
     #[test]
     fn real_template_renders_with_provision_vars() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let path = root.join("node-agent-go/deploy/noo-node-agent.env.tmpl");
-        if !path.exists() {
-            // Crate-only CI build — the full-checkout guard is
-            // tests/test_provision_template_vars.py in the python `test` job.
-            eprintln!("crate-only build (no repo tree) — template drift check skipped");
+        // Outside the harness only: the full-checkout guard is also
+        // tests/test_provision_template_vars.py in the python `test` job.
+        let Some(path) = crate::test_support::repo_file_or_skip("node-agent-go/deploy/noo-node-agent.env.tmpl") else {
             return;
-        }
+        };
         let tmpl = std::fs::read_to_string(&path).unwrap();
         let out = render_env_template(&tmpl, &full_vars()).unwrap();
         assert!(out.contains("NODE_ID=V_na_node_id"));
@@ -5056,8 +5045,7 @@ mod tests {
     /// that is right for the stack it runs.
     #[test]
     fn self_node_ollama_url_follows_the_declared_door() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let shipped = std::fs::read_to_string(repo.join("docker-compose.cluster.yml")).expect("shipped compose");
+        let shipped = std::fs::read_to_string(crate::test_support::repo_file("docker-compose.cluster.yml")).expect("shipped compose");
         let root = std::env::temp_dir().join(format!("noo-ollama-url-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
@@ -5093,8 +5081,7 @@ mod tests {
     /// controller's node ends with its secrets in files like a rail node.
     #[test]
     fn local_install_runs_the_applier_secret_file_block() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let applier = std::fs::read_to_string(repo.join("scripts/noo-apply.sh")).expect("shipped applier");
+        let applier = std::fs::read_to_string(crate::test_support::repo_file("scripts/noo-apply.sh")).expect("shipped applier");
         let block = agent_secret_files_block(&applier).expect("markers in noo-apply.sh");
         assert!(block.contains("agent_secret_files() {") && block.contains("AGENT_SECRET_KEYS="), "{block}");
         assert!(!block.contains("# END agent_secret_files"));

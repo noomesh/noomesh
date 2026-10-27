@@ -821,8 +821,7 @@ mod recreate_set_tests {
     /// (tests/test_monitoring_profile_parity.py); this test is about the
     /// exclusion list above, and needs only the names.
     fn compose_services_with_profile(profile: &str) -> Vec<String> {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let path = repo.join("docker-compose.cluster.yml");
+        let path = crate::test_support::repo_file("docker-compose.cluster.yml");
         let body = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
         let mut current = String::new();
@@ -886,8 +885,7 @@ mod addon_compose_tests {
     /// `include_str!`: the file is outside this crate, and a crate-only build
     /// (`cargo install`) must not fail to compile over a test fixture.
     fn shell_helper() -> String {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let path = repo.join("scripts/lib-addons.sh");
+        let path = crate::test_support::repo_file("scripts/lib-addons.sh");
         let body = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("lib-addons.sh unreadable at {}: {e}", path.display()));
         let start = body
@@ -1014,11 +1012,10 @@ mod compose_files_tests {
     }
 
     fn scratch(evolve: bool) -> Scratch {
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let t = tmpdir(if evolve { "evolve" } else { "plain" });
         std::fs::create_dir(t.path().join("scripts")).unwrap();
         for lib in ["lib-compose.sh", "lib-addons.sh", "lib-dist.sh"] {
-            std::fs::copy(repo.join("scripts").join(lib), t.path().join("scripts").join(lib))
+            std::fs::copy(crate::test_support::repo_file(&format!("scripts/{lib}")), t.path().join("scripts").join(lib))
                 .unwrap_or_else(|e| panic!("{lib}: {e}"));
         }
         for f in [

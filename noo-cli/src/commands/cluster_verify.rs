@@ -8044,7 +8044,7 @@ mod tests {
     /// parses into the struct the row reads.
     #[test]
     fn the_shipped_compose_passes_the_sandbox_row_and_the_probe_output_parses() {
-        let compose = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docker-compose.cluster.yml")).unwrap();
+        let compose = std::fs::read_to_string(crate::test_support::repo_file("docker-compose.cluster.yml")).unwrap();
         let good = sandbox_probe("refused: x", "answered HTTP/1.1 200 OK", "refused: y");
         let c = sandbox_listener_check(Some(&compose), Some(&good));
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
@@ -8130,7 +8130,7 @@ mod tests {
     /// file on the running controller), and the probe output parses.
     #[test]
     fn the_shipped_voice_overlay_passes_the_row_and_the_probe_output_parses() {
-        let overlay = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docker-compose.voice.yml")).unwrap();
+        let overlay = std::fs::read_to_string(crate::test_support::repo_file("docker-compose.voice.yml")).unwrap();
         let door = sandbox_probe("refused: x", "answered HTTP/1.1 200 OK", "refused: y");
         let good = VoiceProbe { whisper: door.clone(), piper: door.clone() };
         let c = voice_listeners_check(true, Some(&overlay), Some(&good));
@@ -8190,10 +8190,10 @@ mod tests {
     /// config is not in it.
     #[test]
     fn the_shipped_nats_config_and_compose_pass_the_tls_row() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let cfg = std::fs::read_to_string(repo.join("monitoring/nats/nats-tls.conf")).expect("shipped nats config");
-        let compose = std::fs::read_to_string(repo.join("docker-compose.cluster.yml")).expect("shipped compose");
-        let plain = repo.join("monitoring/nats/nats.conf").is_file();
+        let cfg = std::fs::read_to_string(crate::test_support::repo_file("monitoring/nats/nats-tls.conf")).expect("shipped nats config");
+        let compose = std::fs::read_to_string(crate::test_support::repo_file("docker-compose.cluster.yml")).expect("shipped compose");
+        // Optional by design: a stack without the plaintext listener has no nats.conf.
+        let plain = crate::test_support::repo_root().join("monitoring/nats/nats.conf").is_file();
         let c = nats_tls_check(Some(&cfg), Some(&compose), plain, None);
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
     }
@@ -8220,9 +8220,8 @@ mod tests {
 
     #[test]
     fn the_shipped_loki_config_and_compose_pass_the_listener_row() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let cfg = std::fs::read_to_string(repo.join("monitoring/loki/loki-config-tls.yml")).expect("shipped loki config");
-        let compose = std::fs::read_to_string(repo.join("docker-compose.cluster.yml")).expect("shipped compose");
+        let cfg = std::fs::read_to_string(crate::test_support::repo_file("monitoring/loki/loki-config-tls.yml")).expect("shipped loki config");
+        let compose = std::fs::read_to_string(crate::test_support::repo_file("docker-compose.cluster.yml")).expect("shipped compose");
         let c = loki_listener_check(Some(&cfg), Some(&compose));
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
     }
@@ -8274,8 +8273,8 @@ mod tests {
     /// parse is not vacuous: every backend in COMPOSE_BACKENDS is present.
     #[test]
     fn the_shipped_compose_and_stunnel_confs_pass_the_backend_tls_row() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let compose = std::fs::read_to_string(repo.join("docker-compose.cluster.yml")).expect("shipped compose");
+        let repo = crate::test_support::repo_root();
+        let compose = std::fs::read_to_string(crate::test_support::repo_file("docker-compose.cluster.yml")).expect("shipped compose");
         for (svc, _) in COMPOSE_BACKENDS {
             assert!(compose_service_block(&compose, svc).is_some(), "{svc} is not in the shipped compose file — drop the row or restore the service");
         }
@@ -8497,8 +8496,8 @@ mod tests {
     /// without `verify = 2` each fail the row; the OK text names the door.
     #[test]
     fn the_backend_tls_row_allows_only_a_loopback_mtls_door() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let compose = std::fs::read_to_string(repo.join("docker-compose.cluster.yml")).expect("shipped compose");
+        let repo = crate::test_support::repo_root();
+        let compose = std::fs::read_to_string(crate::test_support::repo_file("docker-compose.cluster.yml")).expect("shipped compose");
         let shipped_conf = |name: &str| std::fs::read_to_string(repo.join("docker").join(format!("stunnel-{name}.conf"))).ok();
         let c = backend_listener_check(Some(&compose), &shipped_conf);
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
@@ -8545,8 +8544,7 @@ mod tests {
     /// file is the declaration, the others must follow it.
     #[test]
     fn the_vllm_self_probe_and_compose_agree_on_the_leaf_paths() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let compose = std::fs::read_to_string(repo.join("docker-compose.cluster.yml")).expect("shipped compose");
+        let compose = std::fs::read_to_string(crate::test_support::repo_file("docker-compose.cluster.yml")).expect("shipped compose");
         let vllm = compose_service_block(&compose, "vllm").expect("vllm service");
         for needle in ["/app/pki/ca.crt", "/app/pki/services/vllm/service.crt", "/app/pki/services/vllm/service.key"] {
             assert!(vllm.contains(needle), "compose vllm lacks {needle}");
@@ -9363,8 +9361,8 @@ mod tests {
     /// The shipped Postgres policy, and each way it could be weakened.
     #[test]
     fn postgres_hba_row_accepts_the_shipped_file_and_refuses_each_weakening() {
-        let hba = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../docker/postgres/pg_hba.conf")).unwrap();
-        let compose = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../docker-compose.cluster.yml")).unwrap();
+        let hba = std::fs::read_to_string(crate::test_support::repo_file("docker/postgres/pg_hba.conf")).unwrap();
+        let compose = std::fs::read_to_string(crate::test_support::repo_file("docker-compose.cluster.yml")).unwrap();
         assert_eq!(postgres_hba_check(Some(&hba), Some(&compose)).verdict, Verdict::Ok);
         // planted: a plaintext-capable accept line (what initdb writes)
         let bad = format!("{hba}\nhost all all 127.0.0.1/32 trust\n");
@@ -9395,7 +9393,7 @@ mod tests {
     /// fails naming the role.
     #[test]
     fn postgres_role_identity_row_needs_both_the_leaf_and_the_rule() {
-        let hba = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../docker/postgres/pg_hba.conf")).unwrap();
+        let hba = std::fs::read_to_string(crate::test_support::repo_file("docker/postgres/pg_hba.conf")).unwrap();
         let dir = std::env::temp_dir().join(format!("noo-pg-identity-row-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let ca = crate::pki::ClusterCa::new(dir.clone());

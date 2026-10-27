@@ -1916,15 +1916,11 @@ mod tests {
     /// path the display can reach that the gateway never meant it to.**
     /// The proxy refuses off-list paths locally AND the gateway refuses
     /// them again; that is defence in depth only while the lists match.
-    fn repo_root() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
-    }
-
     /// One of the gateway's `&[&str]` allow-lists, by name. Panics rather
     /// than returning empty: a guard that cannot find its subject must
     /// fail, never quietly pass.
     fn gateway_list(name: &str) -> Vec<String> {
-        let auth = std::fs::read_to_string(repo_root().join("gateway-rust/src/auth.rs"))
+        let auth = std::fs::read_to_string(crate::test_support::repo_file("gateway-rust/src/auth.rs"))
             .expect("gateway auth.rs unreadable");
         let start = auth
             .find(&format!("pub const {name}: &[&str] = &["))
@@ -1946,9 +1942,7 @@ mod tests {
     /// compared them. This does.
     #[test]
     fn every_source_the_page_fetches_is_allowed() {
-        let hook = repo_root().join("ui/apps/web/src/kiosk/useKiosk.ts");
-        let Ok(src) = std::fs::read_to_string(&hook) else {
-            eprintln!("skipped: {} not in this checkout", hook.display());
+        let Some(src) = crate::test_support::repo_read_or_skip("ui/apps/web/src/kiosk/useKiosk.ts") else {
             return;
         };
         let mut paths: Vec<String> = src
@@ -1994,9 +1988,7 @@ mod tests {
     /// different switch entirely.
     #[test]
     fn the_stream_events_both_sides_agree_on() {
-        let store = repo_root().join("ui/apps/web/src/kiosk/store.ts");
-        let Ok(page_src) = std::fs::read_to_string(&store) else {
-            eprintln!("skipped: {} not in this checkout", store.display());
+        let Some(page_src) = crate::test_support::repo_read_or_skip("ui/apps/web/src/kiosk/store.ts") else {
             return;
         };
         // The page: names it switches on.
@@ -2009,7 +2001,7 @@ mod tests {
             .collect();
 
         // The gateway: names it puts on the wire.
-        let gw_src = std::fs::read_to_string(repo_root().join("gateway-rust/src/routes/kiosk.rs"))
+        let gw_src = std::fs::read_to_string(crate::test_support::repo_file("gateway-rust/src/routes/kiosk.rs"))
             .expect("gateway kiosk.rs unreadable");
         // Two shapes reach the wire: sent directly, or pushed onto the
         // sampler's batch as ("<name>", payload). Both count; scraping only
@@ -2508,8 +2500,7 @@ mod tests {
     /// recognisably it — otherwise every assertion built on it passes
     /// vacuously the day the file moves or is emptied.
     fn declared_acl() -> (std::path::PathBuf, String) {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let path = repo.join("config/tailscale-acl.hujson");
+        let path = crate::test_support::repo_file("config/tailscale-acl.hujson");
         let acl = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("declared tailnet policy unreadable at {}: {e}", path.display()));
         assert!(
@@ -2558,8 +2549,7 @@ mod tests {
     /// itself forever while the shipped policy drifted.
     #[test]
     fn the_declared_acl_carries_the_kiosk_grant() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let path = repo.join("config/tailscale-acl.hujson");
+        let path = crate::test_support::repo_file("config/tailscale-acl.hujson");
         let acl = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("declared tailnet policy unreadable at {}: {e}", path.display()));
 
@@ -2671,15 +2661,10 @@ mod tests {
     /// can ask for.
     #[test]
     fn every_page_parameter_can_be_set_from_the_seat() {
-        let main_tsx = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("ui/apps/web/src/kiosk/main.tsx");
-        let Ok(src) = std::fs::read_to_string(&main_tsx) else {
-            // The bundle is a subtree; in a checkout without it there is
-            // nothing to compare against. Skipping silently is how a
-            // guard stops guarding, so say so.
-            eprintln!("skipped: {} not in this checkout", main_tsx.display());
+        // The bundle is a subtree; outside the harness, a checkout without
+        // it has nothing to compare against (a standard skip message). Under
+        // the harness a missing bundle is a failure.
+        let Some(src) = crate::test_support::repo_read_or_skip("ui/apps/web/src/kiosk/main.tsx") else {
             return;
         };
         let params: Vec<String> = src
@@ -3110,7 +3095,7 @@ mod tests {
     #[test]
     fn labels_takes_exactly_on_off_or_status_and_writes_the_registered_key() {
         assert_eq!(LABELS_SETTING, "kiosk.graph_labels");
-        let gw = std::fs::read_to_string(repo_root().join("gateway-rust/src/routes/settings.rs"))
+        let gw = std::fs::read_to_string(crate::test_support::repo_file("gateway-rust/src/routes/settings.rs"))
             .expect("gateway settings.rs unreadable");
         assert!(
             gw.contains(&format!("KIOSK_GRAPH_LABELS: &str = \"{LABELS_SETTING}\"")),

@@ -6321,9 +6321,9 @@ mod tests {
     /// not a skip: a guard that skips is decoration.
     #[test]
     fn every_gateway_secret_is_delivered_by_compose() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docker-compose.cluster.yml");
-        let compose = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("this guard needs {path}: {e}"));
+        let path = crate::test_support::repo_file("docker-compose.cluster.yml");
+        let compose = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("this guard needs {}: {e}", path.display()));
         let start = compose
             .find("\n  gateway:\n")
             .expect("docker-compose.cluster.yml must declare a `gateway:` service");

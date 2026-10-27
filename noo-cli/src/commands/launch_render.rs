@@ -551,7 +551,7 @@ mod golden {
     const SYNTAX_ERROR_CASES: &[&str] = &["yaml_syntax_error"];
 
     fn fixtures_dir() -> PathBuf {
-        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/launch_render"))
+        crate::test_support::repo_file("tests/fixtures/launch_render")
     }
 
     fn cases() -> Vec<PathBuf> {
