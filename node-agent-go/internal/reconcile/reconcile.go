@@ -146,6 +146,8 @@ type Reconciler struct {
 	// chatDesired is the last desired chat placement (POST /bench benches
 	// it). Guarded by harnessMu.
 	chatDesired *placement
+	// chatModels is every running chat placement (ChatModels).
+	chatModels []ChatModel
 	// chatOllamaEnv is the env of the ollama daemon serving chat (the
 	// chat row's, merged with the other running ollama roles as the
 	// daemon gets it), nil when chat is not on ollama; for

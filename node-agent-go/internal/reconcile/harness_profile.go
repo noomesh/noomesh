@@ -6,6 +6,7 @@ package reconcile
 import (
 	"encoding/json"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -156,11 +157,40 @@ func chatPlacementOf(all []placement) (placement, bool) {
 	return placement{}, false
 }
 
+// ChatModel is one running chat placement's backend and model.
+type ChatModel struct{ Backend, Model string }
+
+// chatModelsOf is every RUNNING chat placement on a chat engine, in desired
+// order: chatPlacementOf's first and the ones after it.
+func chatModelsOf(all []placement) []ChatModel {
+	var out []ChatModel
+	for _, p := range all {
+		if p.Backend == "harness" || p.DesiredState != "running" || (p.Role != "" && p.Role != "chat") {
+			continue
+		}
+		if slices.Contains(harnessKinds["noo"], p.Backend) {
+			out = append(out, ChatModel{p.Backend, p.Model})
+		}
+	}
+	return out
+}
+
+// ChatModels is every running chat placement's backend and model: the
+// controller's harness fit takes the smallest window across all of them,
+// so each one's context ceiling is reported (i285).
+func (r *Reconciler) ChatModels() []ChatModel {
+	r.harnessMu.RLock()
+	defer r.harnessMu.RUnlock()
+	return slices.Clone(r.chatModels)
+}
+
 // recordChatPlacement remembers the desired chat placement for ChatPlacement.
 func (r *Reconciler) recordChatPlacement(all []placement) {
 	p, ok := chatPlacementOf(all)
+	models := chatModelsOf(all)
 	r.harnessMu.Lock()
 	defer r.harnessMu.Unlock()
+	r.chatModels = models
 	if !ok {
 		r.chatDesired = nil
 		r.chatOllamaEnv = nil
