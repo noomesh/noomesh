@@ -277,7 +277,7 @@ var backendSpecs = map[string]BackendSpec{
 			"HF_HUB_DISABLE_TELEMETRY": "1",
 		},
 		Volumes: []VolumeMount{
-			{Source: hfCacheSource, Target: "/root/.cache/huggingface"},
+			{Source: hfCacheSource, Target: HFCacheTarget},
 			// Exactly what the entrypoint serves with: --ssl-ca-certs
 			// /app/pki/ca.crt and the vllm leaf. Optional so that a missing
 			// source is reported by buildMounts rather than failing the

@@ -565,6 +565,7 @@ func (a *Agent) startMessaging(ctx context.Context) {
 	a.hb.SetHostdState(a.hostdStatus)
 	a.hb.SetBackendContainers(a.backendContainers)
 	a.hb.SetOllamaDoor(func() string { return a.docker.BackendDialURL(a.lifeCtx(), "ollama") })
+	a.hb.SetChatModelStats(func() []heartbeat.ModelStat { return a.server.ChatModelStats(a.lifeCtx()) })
 	if a.native != nil {
 		a.hb.SetModelStats(func() []heartbeat.ModelStat {
 			ctx, cancel := context.WithTimeout(a.lifeCtx(), 3*time.Second)

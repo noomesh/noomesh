@@ -136,3 +136,49 @@ func TestContextLengthIsOmittedWhileUnknown(t *testing.T) {
 }
 
 var errTest = errors.New("test: show failed")
+
+func TestHFConfigContextLengthReadsTextConfigFirst(t *testing.T) {
+	cases := map[string]int64{
+		// Gemma 4 (trimmed): the language model's window is in text_config.
+		`{"architectures":["Gemma4ForConditionalGeneration"],"text_config":{"max_position_embeddings":262144},"vision_config":{"max_position_embeddings":4096}}`: 262144,
+		`{"max_position_embeddings":40960}`:                                                       40960,
+		`{"max_position_embeddings":32768,"rope_scaling":{"type":"yarn","factor":4.0}}`:           0,
+		`{"text_config":{"max_position_embeddings":8192,"rope_scaling":{"rope_type":"default"}}}`: 8192,
+		`{"rope_scaling":null,"max_position_embeddings":4096}`:                                    4096,
+		`{}`:       0,
+		`not json`: 0,
+		``:         0,
+	}
+	for body, want := range cases {
+		if got := HFConfigContextLength([]byte(body)); got != want {
+			t.Errorf("%s: %d, want %d", body, got, want)
+		}
+	}
+}
+
+func TestLlamaTrainContextPicksTheServedModel(t *testing.T) {
+	body := []byte(`{"object":"list","data":[
+ {"id":"other.gguf","meta":{"n_ctx_train":4096,"size":100}},
+ {"id":"gemma-4-12b-it-Q4_K_M.gguf","object":"model","meta":{"vocab_type":1,"n_vocab":262144,"n_ctx_train":262144,"n_embd":3840,"n_params":11766034688,"size":7300000000}}]}`)
+	if c, s := LlamaTrainContext(body, "gemma-4-12b-it-Q4_K_M.gguf"); c != 262144 || s != 7300000000 {
+		t.Errorf("served: ctx %d size %d", c, s)
+	}
+	if c, _ := LlamaTrainContext(body, "unknown"); c != 4096 {
+		t.Errorf("no match falls back to the first entry: ctx %d", c)
+	}
+	if c, s := LlamaTrainContext([]byte(`{"data":[]}`), "x"); c != 0 || s != 0 {
+		t.Errorf("empty list: %d %d", c, s)
+	}
+}
+
+func TestMergeFillsAndAppends(t *testing.T) {
+	stats := []ModelStat{{Name: "b", SizeBytes: 5}, {Name: "a", ContextLength: 100}}
+	got := Merge(stats, []ModelStat{{Name: "a", ContextLength: 999}, {Name: "b", ContextLength: 200}, {Name: "c", ContextLength: 300, Loaded: true}})
+	want := []ModelStat{{Name: "a", ContextLength: 100}, {Name: "b", SizeBytes: 5, ContextLength: 200}, {Name: "c", ContextLength: 300, Loaded: true}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v\nwant %+v", got, want)
+	}
+	if got := Merge(nil, nil); got != nil {
+		t.Errorf("nothing merged into nothing: %+v", got)
+	}
+}

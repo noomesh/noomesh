@@ -45,24 +45,34 @@ func (s *Server) liveChatContext(ctx context.Context) int {
 	default:
 		return 0
 	}
-	base := strings.TrimSuffix(t.url, "/v1/chat/completions")
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
-	if err != nil {
-		return 0
-	}
-	resp, err := t.client.Do(req)
-	if err != nil {
-		return 0
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return 0
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
+	body := backendGet(ctx, t, path)
+	if body == nil {
 		return 0
 	}
 	return parse(body, t.served)
+}
+
+// backendGet is GET `path` on the chat backend t dials; nil unless it
+// answers 200 within the context.
+func backendGet(ctx context.Context, t benchTarget, path string) []byte {
+	base := strings.TrimSuffix(t.url, "/v1/chat/completions")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil
+	}
+	return body
 }
 
 // vllmMaxModelLen is max_model_len from vLLM's /v1/models: the served

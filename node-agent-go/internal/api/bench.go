@@ -19,6 +19,7 @@ import (
 	"time"
 
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
+	"github.com/noomesh/noomesh/node-agent-go/internal/modelstats"
 )
 
 // POST /bench measures this node's running CHAT model: how long it takes to
@@ -359,4 +360,11 @@ type benchState struct {
 	windowResolve func(context.Context) (benchTarget, error)
 	// benchNow overrides time.Now (tests).
 	benchNow func() time.Time
+	// ceilingKey and ceilingStat remember the chat model's ceiling once
+	// found (ChatModelStats), keyed by backend, model and served name.
+	ceilingMu   sync.Mutex
+	ceilingKey  string
+	ceilingStat modelstats.ModelStat
+	// hfCacheDir overrides dockerpkg.HFCacheHost (tests).
+	hfCacheDir func() string
 }

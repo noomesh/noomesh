@@ -93,6 +93,15 @@ pub fn reported_ceiling(node: &Value, model: &str) -> Option<u64> {
         .filter(|n| *n > 0)
 }
 
+/// The node's reported ceiling for `model` and the fallback table's, when
+/// both exist and differ (i285): the table is stale, or the node runs another
+/// build of the model. The report wins either way; this is for the log.
+pub fn ceiling_disagreement(node: &Value, model: &str) -> Option<(u64, u64)> {
+    let reported = reported_ceiling(node, model)?;
+    let table = crate::model_capabilities::max_context(model)?;
+    (reported != table).then_some((reported, table))
+}
+
 /// The model's own context ceiling and where it came from: the node's report
 /// first, else the fallback table (`config/model-capabilities.json`).
 fn model_ceiling(node: &Value, model: &str) -> Option<(u64, String)> {
@@ -269,6 +278,19 @@ mod tests {
         assert_eq!((win.tokens, win.model_ceiling), (40960, true), "not in the table, reported by the node");
         let fit = judge(Some(16385), chat_window("ollama", &big, Some("tiny"), &node, 0));
         assert!(matches!(fit, Fit::Short { window: 2048, model_ceiling: true, .. }), "{fit:?}");
+    }
+
+    #[test]
+    fn a_report_that_differs_from_the_table_is_named() {
+        let node = json!({"model_stats": [
+            {"name": "gemma4:12b", "context_length": 131072},
+            {"name": "gemma4:12b-it-qat", "context_length": 262144},
+            {"name": "qwen3:8b", "context_length": 40960},
+        ]});
+        assert_eq!(ceiling_disagreement(&node, "gemma4:12b"), Some((131072, 262144)));
+        assert_eq!(ceiling_disagreement(&node, "gemma4:12b-it-qat"), None, "they agree");
+        assert_eq!(ceiling_disagreement(&node, "qwen3:8b"), None, "not in the table");
+        assert_eq!(ceiling_disagreement(&Value::Null, "gemma4:12b"), None, "not reported");
     }
 
     #[test]

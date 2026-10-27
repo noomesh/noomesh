@@ -6,11 +6,14 @@
 // check for multi-role placements judges real bytes, not a guess from the tag.
 // [Ceilings] adds each model's own context ceiling from /api/show, so the
 // controller caps a harness window by what the weights declare rather than a
-// table in core (noomesh-internal i285).
+// table in core (noomesh-internal i285). A vLLM or llama-server chat
+// backend adds one entry for the model it serves ([HFConfigContextLength],
+// [LlamaTrainContext]), merged in by [Merge].
 package modelstats
 
 import (
 	"encoding/json"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -23,8 +26,9 @@ import (
 //
 // size_bytes is the weights (/api/tags size); resident_bytes and vram_bytes
 // are /api/ps size and size_vram, and are 0 unless loaded. context_length is
-// the model's own context ceiling (/api/show `<arch>.context_length`),
-// omitted while not known.
+// the model's own context ceiling (/api/show `<arch>.context_length`; for a
+// vLLM or llama-server chat model, its config.json or GGUF), omitted while
+// not known.
 type ModelStat struct {
 	Name          string `json:"name"`
 	SizeBytes     int64  `json:"size_bytes"`
@@ -158,4 +162,80 @@ func (c *Ceilings) Fill(stats []ModelStat, show func(name string) ([]byte, error
 		}
 		stats[i].ContextLength = n
 	}
+}
+
+// HFConfigContextLength is the model's own context ceiling from a
+// HuggingFace config.json: max_position_embeddings, read from text_config
+// first (multimodal models such as Gemma 4 nest the language model there),
+// else the top level. 0 when the config does not say, or when a
+// rope_scaling factor above 1 stretches the window: vLLM then serves more
+// than max_position_embeddings, and a ceiling read too low would refuse a
+// kind the model holds.
+func HFConfigContextLength(body []byte) int64 {
+	type level struct {
+		MaxPositionEmbeddings int64 `json:"max_position_embeddings"`
+		RopeScaling           *struct {
+			Factor float64 `json:"factor"`
+		} `json:"rope_scaling"`
+	}
+	var v struct {
+		level
+		TextConfig *level `json:"text_config"`
+	}
+	if len(body) == 0 || json.Unmarshal(body, &v) != nil {
+		return 0
+	}
+	for _, l := range []*level{v.TextConfig, &v.level} {
+		if l == nil || l.MaxPositionEmbeddings <= 0 {
+			continue
+		}
+		if l.RopeScaling != nil && l.RopeScaling.Factor > 1 {
+			return 0
+		}
+		return l.MaxPositionEmbeddings
+	}
+	return 0
+}
+
+// LlamaTrainContext is the context the GGUF was trained for and its size in
+// bytes, from llama-server's GET /v1/models (`meta.n_ctx_train`,
+// `meta.size`): the entry whose id is `served`, else the first. Zeros when
+// the body does not say.
+func LlamaTrainContext(body []byte, served string) (ctx, size int64) {
+	var v struct {
+		Data []struct {
+			ID   string `json:"id"`
+			Meta struct {
+				NCtxTrain int64 `json:"n_ctx_train"`
+				Size      int64 `json:"size"`
+			} `json:"meta"`
+		} `json:"data"`
+	}
+	if len(body) == 0 || json.Unmarshal(body, &v) != nil || len(v.Data) == 0 {
+		return 0, 0
+	}
+	m := v.Data[0]
+	for _, d := range v.Data {
+		if d.ID == served {
+			m = d
+			break
+		}
+	}
+	return max(m.Meta.NCtxTrain, 0), max(m.Meta.Size, 0)
+}
+
+// Merge adds `more` to `stats`: a name already listed gains a context_length
+// it lacks, a new name is appended. Sorted by name.
+func Merge(stats, more []ModelStat) []ModelStat {
+	for _, m := range more {
+		i := slices.IndexFunc(stats, func(s ModelStat) bool { return s.Name == m.Name })
+		switch {
+		case i < 0:
+			stats = append(stats, m)
+		case stats[i].ContextLength == 0:
+			stats[i].ContextLength = m.ContextLength
+		}
+	}
+	sort.Slice(stats, func(i, j int) bool { return stats[i].Name < stats[j].Name })
+	return stats
 }

@@ -363,10 +363,14 @@ it with the node's chat window: the running chat placement's own key
 by its parallel slots), else the profile's `context`. The window is capped
 by the model's own context ceiling: no engine setting gives a model more than
 it was built for, and a refusal the ceiling decides suggests a different model
-rather than a larger window. A node reports the ceiling of each model its
-Ollama holds, read from the weights; for other engines, and for older agents,
-it comes from `config/model-capabilities.json`, a fallback table. A model
-neither declares has no ceiling.
+rather than a larger window. A node reports the ceiling, read from the
+weights: for each model its Ollama holds, for the model its vLLM serves
+(`max_position_embeddings` in the model's `config.json` in the node's HF
+cache), and for the GGUF its llama-server serves (`n_ctx_train`). For older
+agents it comes from `config/model-capabilities.json`, a fallback table; when
+a node's report and the table disagree, the report wins and the gateway logs
+both numbers. A model neither declares has no ceiling. A vLLM model whose
+`rope_scaling` stretches its window reports none, rather than a ceiling too low.
 
 - **Below the floor:** refused with the numbers, `noo` named as the kind that
   fits, and the `noo cluster place … --env` line that raises the window.
