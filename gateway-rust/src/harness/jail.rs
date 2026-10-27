@@ -747,6 +747,46 @@ fn shell_quote(p: &Path) -> Result<String, Refusal> {
 /// The shell line that prints process `pid`'s environment, as an attacker
 /// in the jail would read it: `/proc/<pid>/environ` on Linux; on macOS `ps
 /// -E`, which reads `sysctl(KERN_PROCARGS2)`.
+/// The positive control's one read of the sibling's environment, outside the
+/// jail: `Ok` when the canary is in it, else what was seen.
+#[cfg(target_os = "linux")]
+async fn read_sibling_env(sibling: u32, canary: &str) -> Result<(), String> {
+    let path = format!("/proc/{sibling}/environ");
+    match std::fs::read(&path) {
+        Ok(b) if String::from_utf8_lossy(&b).contains(canary) => Ok(()),
+        Ok(b) => Err(format!("{path}: {} bytes, no canary; sibling {}", b.len(), proc_state(sibling))),
+        Err(e) => Err(format!("{path}: {e}; sibling {}", proc_state(sibling))),
+    }
+}
+
+/// The same read where there is no /proc: `ps -E` in a shell.
+#[cfg(not(target_os = "linux"))]
+async fn read_sibling_env(sibling: u32, canary: &str) -> Result<(), String> {
+    match tokio::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(read_env_of(sibling))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+    {
+        Ok(o) if String::from_utf8_lossy(&o.stdout).contains(canary) => Ok(()),
+        Ok(o) => Err(format!("{}: exit {:?}, no canary", read_env_of(sibling), o.status.code())),
+        Err(e) => Err(format!("{}: {e}", read_env_of(sibling))),
+    }
+}
+
+/// A process's state letter from /proc/<pid>/stat (`S`, `R`, `Z` for a
+/// zombie), or `gone`.
+#[cfg(target_os = "linux")]
+fn proc_state(pid: u32) -> String {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(s) => s.rsplit_once(") ").and_then(|(_, rest)| rest.split_whitespace().next()).map_or("state unknown".into(), |st| format!("state {st}")),
+        Err(_) => "gone".into(),
+    }
+}
+
 fn read_env_of(pid: u32) -> String {
     if cfg!(target_os = "macos") {
         format!("/bin/ps -E -ww -o command= -p {pid}")
@@ -842,22 +882,16 @@ async fn self_test_jailed(
     // Positive control, OUTSIDE the jail: the same read must work, or the
     // jailed failure proves nothing. The spawn returns once the sibling's
     // exec has replaced its memory but before the kernel records where its
-    // environment lives, so for a moment /proc/<pid>/environ reads empty
-    // (seen under a loaded test run): wait for the canary, about half a second,
-    // before the jailed read is judged against it.
-    let mut unjailed = false;
+    // environment lives, so for a moment /proc/<pid>/environ reads empty:
+    // wait for the canary, about half a second, before the jailed read is
+    // judged against it. On Linux this process reads the file itself, so a
+    // shell that fails to start under load cannot pass for an unreadable
+    // sibling (seen twice in a loaded batch run, 2026-10-27); whatever still
+    // fails is named in the report.
+    let mut unjailed = Err(String::new());
     for _ in 0..25 {
-        unjailed = tokio::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(read_env_of(sibling))
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .await
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains(canary))
-            .unwrap_or(false);
-        if unjailed {
+        unjailed = read_sibling_env(sibling, canary).await;
+        if unjailed.is_ok() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -921,10 +955,9 @@ async fn self_test_jailed(
     if s.contains(canary) {
         return leak(format!("a sibling process's environment (pid {sibling}) was readable inside the jail"));
     }
-    if unjailed {
-        proved.push("sibling environment unreadable".into());
-    } else {
-        unproved.push("sibling environment: unreadable even outside the jail, so the jailed failure proves nothing here".into());
+    match unjailed {
+        Ok(()) => proved.push("sibling environment unreadable".into()),
+        Err(why) => unproved.push(format!("sibling environment: unreadable even outside the jail ({why}), so the jailed failure proves nothing here")),
     }
     let Some(s) = section(&text, "parent") else { return leak("the parent-environment check did not report".into()) };
     if let Some(m) = parent_markers().into_iter().find(|m| s.contains(m.as_str())) {
@@ -1214,6 +1247,31 @@ mod tests {
     mod linux {
         use super::super::*;
         use std::io::Read;
+
+        /// The positive control reads the sibling's environment in this
+        /// process, and says what it saw when that fails.
+        #[tokio::test]
+        async fn the_positive_control_reads_a_siblings_environment_and_names_a_failure() {
+            let canary = format!("NOO-CONTROL-TEST-{}", uuid::Uuid::new_v4().simple());
+            let mut child = std::process::Command::new("/bin/sleep").arg("30").env_clear().env("C", &canary).spawn().unwrap();
+            let pid = child.id();
+            let mut got = Err(String::new());
+            for _ in 0..25 {
+                got = read_sibling_env(pid, &canary).await;
+                if got.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(got, Ok(()));
+            assert!(proc_state(pid).starts_with("state "), "{}", proc_state(pid));
+            let why = read_sibling_env(pid, "NOT-THERE").await.unwrap_err();
+            assert!(why.contains("bytes, no canary; sibling state "), "{why}");
+            let _ = child.kill();
+            let _ = child.wait();
+            let why = read_sibling_env(pid, &canary).await.unwrap_err();
+            assert!(why.ends_with("sibling gone"), "a reaped sibling is named: {why}");
+        }
 
         fn scratch(tag: &str) -> PathBuf {
             let p = std::env::temp_dir().join(format!("noo-jail-test-{tag}-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
