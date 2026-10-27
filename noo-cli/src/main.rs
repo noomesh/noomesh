@@ -81,6 +81,8 @@ mod role;
 mod shell_completion;
 #[cfg(test)]
 mod test_exec;
+#[cfg(test)]
+mod test_support;
 mod tailnet_serve;
 mod ui;
 mod usage;

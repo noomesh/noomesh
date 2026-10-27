@@ -2256,7 +2256,7 @@ exit 0
             vec!["-aHAXS", "--numeric-ids", "--checksum", "--dry-run", "--delete", "--itemize-changes", "/a/", "/v/a/"]
         );
         // The Go side builds the same flags.
-        let go = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../node-agent-go/internal/hostd/atrest_migrate_linux.go")).expect("hostd copy verb source");
+        let go = std::fs::read_to_string(crate::test_support::repo_file("node-agent-go/internal/hostd/atrest_migrate_linux.go")).expect("hostd copy verb source");
         assert!(go.contains(r#"[]string{"-aHAXS", "--numeric-ids"}"#), "hostd copy changed its rsync flags");
         assert!(go.contains(r#""--checksum", "--dry-run", "--delete", "--itemize-changes""#));
         for name in STATE_COPIES.iter().chain(["claude-config", "alertmanager-data", "pki"].iter()) {
