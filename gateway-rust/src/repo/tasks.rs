@@ -225,6 +225,23 @@ where
         .rows_affected())
 }
 
+/// A loop starts on an unparked task between loops: `checkpointed` ->
+/// `running`, so `running` means a loop is in flight and `checkpointed`
+/// means none is. Returns rows affected (`0` = it was not between loops).
+pub async fn start_loop<'e, E>(db: E, id: Uuid) -> Result<u64, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    Ok(sqlx::query(
+        "UPDATE noo_tasks SET state = 'running', updated_at = now() \
+         WHERE id = $1 AND state = 'checkpointed' AND budget_state IS NULL",
+    )
+    .bind(id)
+    .execute(db)
+    .await?
+    .rows_affected())
+}
+
 /// Record a checkpoint: loops so far, the note (kept when `None`), and
 /// `running` -> `checkpointed`.
 pub async fn checkpoint<'e, E>(db: E, id: Uuid, loops: i32, note: Option<&str>) -> Result<(), sqlx::Error>
