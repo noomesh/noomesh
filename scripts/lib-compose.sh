@@ -80,8 +80,11 @@ _compose_gpu_visible() {
 # The overlay is then NOT requested (_compose_gpu_visible is false), so the
 # embedder starts on CPU and the core never waits on a device that cannot
 # answer. Silent otherwise. Launchers call it once, after the file list.
+# NOO_GPU_LOST=1 tells lib-stuck-container.sh the cause is already said, so a
+# GPU backend held on the same start names itself without repeating it.
 compose_gpu_notice() {
     [ "$(_compose_gpu_state)" = lost ] || return 0
+    NOO_GPU_LOST=1; export NOO_GPU_LOST
     echo "  the NVIDIA driver lost the GPU (nvidia-smi cannot read it): the embedder starts on CPU; reboot to get the GPU back" >&2
 }
 

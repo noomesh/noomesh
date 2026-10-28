@@ -281,3 +281,16 @@ def test_both_launchers_print_the_notice_after_the_file_list():
         body = (SCRIPTS / name).read_text()
         i = body.index('COMPOSE_FILES="$(compose_file_args .)"')
         assert "compose_gpu_notice" in body[i : i + 120], name
+
+
+def test_a_lost_gpu_is_said_once_and_a_held_backend_points_at_it(tmp_path):
+    """#524 + the hold (bb45dcf5) on one start: the notice says the cause and
+    the reboot; a GPU backend held afterwards names itself and refers back."""
+    r = _probe(tmp_path, smi=SMI_LOST, fn='compose_gpu_notice; echo "NOO_GPU_LOST=$NOO_GPU_LOST"')
+    assert "NOO_GPU_LOST=1" in r.stdout, r.stdout
+    r = _probe(tmp_path, smi=SMI_OK, fn='compose_gpu_notice; echo "NOO_GPU_LOST=${NOO_GPU_LOST:-}"')
+    assert r.stdout.strip() == "NOO_GPU_LOST=", r.stdout
+    body = (SCRIPTS / "lib-stuck-container.sh").read_text()
+    i = body.index('if [ "${NOO_GPU_LOST:-}" = 1 ]; then')
+    line = next(l for l in body[i:].splitlines() if "ui_failed" in l)
+    assert "lost, above" in line and "reboot" not in line, line

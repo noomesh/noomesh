@@ -119,7 +119,12 @@ noo_compose_up_isolating_stuck() {
             case " $isolated " in *" $svc "*) continue ;; esac
             if [ "$gpu" = 1 ]; then
                 why="$(docker inspect -f '{{.State.Error}}' "$id" 2>/dev/null | grep -oE "($_NOO_GPU_START_ERROR)[^;:]*" | head -1)"
-                ui_failed "${name:-$id} ($svc) is held: the GPU did not answer when it started (${why:-GPU device error}); a reboot of this host usually clears it. Starting everything else."
+                if [ "${NOO_GPU_LOST:-}" = 1 ]; then
+                    # compose_gpu_notice already named the lost GPU and the reboot.
+                    ui_failed "${name:-$id} ($svc) is held: it needs the GPU (lost, above). Starting everything else."
+                else
+                    ui_failed "${name:-$id} ($svc) is held: the GPU did not answer when it started (${why:-GPU device error}); a reboot of this host usually clears it. Starting everything else."
+                fi
             else
                 ui_failed "${name:-$id} ($svc) is stuck: its process will not exit (kill -9 and docker restart cannot clear it); a reboot of this host clears it. Starting everything else."
             fi
