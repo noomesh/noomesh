@@ -75,8 +75,22 @@ fi
 load_secrets >/dev/null || { echo "boot-restore: could not write the secret files (reason above)" >&2; exit 1; }
 d="$(secret_rundir)"
 root="$(cd "$(dirname "$_noo_lib")/.." && pwd)"
-proj="$(sed -n 's/^name:[[:space:]]*//p' "$root/docker-compose.cluster.yml" 2>/dev/null | head -1)"
-proj="${proj:-noomesh}"
+# The compose project the launcher used: COMPOSE_PROJECT_NAME if set, else the
+# instance's (lib-instance.sh noo_instance_env: NOO_INSTANCE in .env gives
+# noo-<instance>), else the cluster file's name:, else noomesh. If the instance
+# cannot be resolved (its data-root guard refused), no core service is started:
+# guessing the default project would start another instance's containers.
+proj="${COMPOSE_PROJECT_NAME:-}"
+if [ -z "$proj" ] && [ -f "$(dirname "$_noo_lib")/lib-instance.sh" ]; then
+  if ! proj="$(cd "$root" && . "$(dirname "$_noo_lib")/lib-instance.sh" && noo_instance_env >/dev/null 2>&1 && echo "${COMPOSE_PROJECT_NAME:-}")"; then
+    proj=""; noproj=1
+    echo "boot-restore: could not resolve this instance's compose project; only the secret-binding containers are started" >&2
+  fi
+fi
+if [ -z "$proj" ] && [ -z "${noproj:-}" ]; then
+  proj="$(sed -n 's/^name:[[:space:]]*//p' "$root/docker-compose.cluster.yml" 2>/dev/null | head -1)"
+  proj="${proj:-noomesh}"
+fi
 # The controller core set, derived from the compose files (the same way
 # lib-addons.sh addon_core_services derives its set, never a list): every
 # service whose profiles include "controller". The agent-managed backends and
@@ -96,7 +110,7 @@ for id in $(docker ps -aq --filter status=created --filter status=exited); do
     meta="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{index .Config.Labels "noo.managed-by"}}|{{.HostConfig.RestartPolicy.Name}}' "$id" 2>/dev/null)"
     p="$(echo "$meta" | cut -d'|' -f1)"; svc="$(echo "$meta" | cut -d'|' -f2)"
     mby="$(echo "$meta" | cut -d'|' -f3)"; rp="$(echo "$meta" | cut -d'|' -f4)"
-    if [ "$p" = "$proj" ] && [ -z "$mby" ] && [ -n "$svc" ] && [ "$rp" != "no" ] && [ -n "$rp" ]; then
+    if [ -n "$proj" ] && [ "$p" = "$proj" ] && [ -z "$mby" ] && [ -n "$svc" ] && [ "$rp" != "no" ] && [ -n "$rp" ]; then
       case "$core" in *" $svc "*) want=1 ;; esac
     fi
   fi
@@ -127,7 +141,11 @@ func (e *Engine) BootRestore(ctx context.Context) {
 	// i10a: the script also sources lib-state-volume.sh beside lib-secrets.sh:
 	// a reboot whose TPM unlock failed leaves the state volume closed, and
 	// starting the stack then would run it on an empty directory.
-	script := fmt.Sprintf(bootRestoreScript, shellQuote(filepath.Join(e.Root, "scripts", "lib-secrets.sh")))
+	//
+	// `exec 1>&2` first: the Runner keeps only stderr, and the script's stdout
+	// (`started N container(s)`, `populated; nothing to do`) is what says what
+	// it did, so it must reach the log too (i301 a).
+	script := "exec 1>&2\n" + fmt.Sprintf(bootRestoreScript, shellQuote(filepath.Join(e.Root, "scripts", "lib-secrets.sh")))
 	for attempt := 1; attempt <= 12; attempt++ {
 		unlock, err := acquireComposeLock(ctx)
 		if err != nil {

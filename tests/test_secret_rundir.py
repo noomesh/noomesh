@@ -378,7 +378,7 @@ def _boot_script() -> str:
 
 
 def _boot_run(
-    box: Box, populated: bool, fail_start: str = ""
+    box: Box, populated: bool, fail_start: str = "", env: dict[str, str] | None = None
 ) -> tuple[subprocess.CompletedProcess, list[str]]:
     """Run the hostd boot-restore script for real, with a fake docker that has
     six stopped containers:
@@ -388,6 +388,8 @@ def _boot_run(
       ddd  compose project noomesh, service llamacpp (not a controller-profile service)
       eee  compose project noomesh, service model-cache, restart "no" (a one-shot)
       fff  compose project noomesh, service loki, but labelled noo.managed-by (agent-managed)
+      ggg  compose project noo-lab (the `lab` instance), service nats
+      hhh  compose project other, service nats
     `docker start` marks a container running unless its id is in fail_start."""
     log = box.tmp / "docker.log"
     state = box.tmp / "running"
@@ -397,7 +399,7 @@ def _boot_run(
         "#!/bin/sh\n"
         'echo "$@" >> "$DOCKER_LOG"\n'
         'case "$1" in\n'
-        "  ps) printf 'aaa\\nbbb\\nccc\\nddd\\neee\\nfff\\n' ;;\n"
+        "  ps) printf 'aaa\\nbbb\\nccc\\nddd\\neee\\nfff\\nggg\\nhhh\\n' ;;\n"
         '  start) [ "$2" = "$DOCKER_FAIL_START" ] && exit 1; touch "$DOCKER_STATE/$2" ;;\n'
         "  inspect) case \"$3\" in\n"
         '    *Mounts*) case "$4" in aaa) echo "$NOO_SECRET_RUNDIR/noo_jwt_secret" ;; *) echo /srv/other ;; esac ;;\n'
@@ -406,6 +408,8 @@ def _boot_run(
         "      ddd) echo 'noomesh|llamacpp||unless-stopped' ;;\n"
         "      eee) echo 'noomesh|model-cache||no' ;;\n"
         "      fff) echo 'noomesh|loki|node-agent-go|unless-stopped' ;;\n"
+        "      ggg) echo 'noo-lab|nats||unless-stopped' ;;\n"
+        "      hhh) echo 'other|nats||unless-stopped' ;;\n"
         "      *) echo '|||' ;; esac ;;\n"
         '    *Running*) [ -e "$DOCKER_STATE/$4" ] && echo true || echo false ;;\n'
         '    *Name*) echo "/noo-$4|exited 0 2026-10-28T15:08:23.1Z" ;;\n'
@@ -418,7 +422,7 @@ def _boot_run(
         (box.rundir / "x").write_text("1")
     r = box.run(
         f"bash -c {__import__('shlex').quote(_boot_script())}",
-        extra={"DOCKER_LOG": str(log), "DOCKER_STATE": str(state), "DOCKER_FAIL_START": fail_start},
+        extra={"DOCKER_LOG": str(log), "DOCKER_STATE": str(state), "DOCKER_FAIL_START": fail_start, **(env or {})},
     )
     return r, (log.read_text().splitlines() if log.exists() else [])
 
@@ -443,6 +447,57 @@ def test_boot_restore_starts_a_stopped_core_service_that_binds_no_secret(box: Bo
     r, calls = _boot_run(box, populated=False)
     assert "start ccc" in calls, calls
     assert not any(c.startswith(("run", "create", "pull", "compose")) for c in calls), calls
+
+
+def _starts(calls: list[str]) -> list[str]:
+    return [c for c in calls if c.startswith("start")]
+
+
+# Each negative case below sits beside the positive one in the same run, so the
+# test fails on code that starts no core service at all (dev before i301 a).
+
+@needs_shm
+def test_boot_restore_leaves_another_projects_core_services_alone(box: Box) -> None:
+    r, calls = _boot_run(box, populated=False)
+    assert r.returncode == 0, r.stderr
+    assert "start ccc" in calls, calls
+    assert "start ggg" not in calls and "start hhh" not in calls, "another project's nats was started"
+
+
+@needs_shm
+def test_boot_restore_never_starts_a_one_shot_or_an_agent_managed_container(box: Box) -> None:
+    r, calls = _boot_run(box, populated=False)
+    assert "start ccc" in calls, calls
+    assert "start eee" not in calls, "a restart: no one-shot was started"
+    assert "start fff" not in calls, "an agent-managed container was started"
+
+
+@needs_shm
+def test_boot_restore_follows_compose_project_name(box: Box) -> None:
+    r, calls = _boot_run(box, populated=False, env={"COMPOSE_PROJECT_NAME": "other"})
+    assert r.returncode == 0, r.stderr
+    assert _starts(calls) == ["start aaa", "start hhh"], calls
+
+
+@needs_shm
+def test_boot_restore_follows_the_named_instance_project(box: Box) -> None:
+    root = box.tmp / "srv" / "instances" / "lab"
+    root.mkdir(parents=True)
+    r, calls = _boot_run(box, populated=False, env={"NOO_INSTANCE": "lab", "NOO_DATA_ROOT": str(root)})
+    assert r.returncode == 0, r.stderr
+    assert _starts(calls) == ["start aaa", "start ggg"], calls
+
+
+@needs_shm
+def test_boot_restore_starts_no_core_service_when_the_instance_cannot_be_resolved(box: Box) -> None:
+    # A named instance on a data root that is not instance-scoped:
+    # lib-instance.sh's guard refuses, so the project is unknown, and guessing
+    # `noomesh` would start the default instance's containers.
+    shared = box.tmp / "srv"
+    shared.mkdir()
+    r, calls = _boot_run(box, populated=False, env={"NOO_INSTANCE": "lab", "NOO_DATA_ROOT": str(shared)})
+    assert _starts(calls) == ["start aaa"], calls
+    assert "could not resolve this instance's compose project" in r.stderr, r.stderr
 
 
 @needs_shm
