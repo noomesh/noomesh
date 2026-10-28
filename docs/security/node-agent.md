@@ -554,6 +554,20 @@ before generation 3) is the same `backend_door` row until the reconciler
 recreates it, which the generation bump does once, on the first pass after
 the agent rolls.
 
+**The door admits named callers only** (door generation 4). A cluster-CA
+certificate is necessary, not sufficient: each agent-run door carries
+`checkHost` lines for this node's own agent leaf (its first DNS SAN, the
+node id, read from `NOO_TLS_CERT`, never from `NODE_ID`) and for the
+controller's service callers (`gateway`, `worker`, `trellion`,
+`trellion-intel`, `evolve`), the same list as the compose doors
+(`docker/stunnel-<x>.conf`). Those service leaves exist only on the
+controller, so on any other node only its own agent opens its doors; another
+node's leaf, an add-on's or a backend's is refused at the handshake. An agent
+whose leaf cannot be read, or names a SAN every node leaf carries
+(`localhost`, `node-agent`) first, does not start the door. vLLM is its own
+TLS listener (`--ssl-cert-reqs 2`) and cannot pin by name: it still admits
+any cluster-CA leaf.
+
 **What a node must hold.** Each door serves with a service leaf under
 `$NOO_PKI_DIR/services/<x>/service.{crt,key}` (`vllm`, `llamacpp`,
 `ollama`, `tei`, `reranker`) that **names the door** in its SANs
