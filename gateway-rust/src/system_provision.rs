@@ -551,76 +551,29 @@ async fn ensure_extensions(db: &PgPool, system: &str, spec: &SystemConfig) -> Re
 
 /// The NOLOGIN group role whose members may read the caller-verify view.
 /// Reserved as an add-on id (`addon_decls::RESERVED_IDS` has
-/// `caller_verifiers`), so no bundle's derived runtime role can be it.
-pub(crate) const CALLER_VERIFIERS: &str = "noo_caller_verifiers";
+/// `caller_verifiers`), so no bundle's derived runtime role can be it. The
+/// SQL lives in `repo::caller_verifiers`; the policy is here.
+pub(crate) const CALLER_VERIFIERS: &str = crate::repo::caller_verifiers::GROUP;
 
 /// The view the group may read, created by mesh revision 077.
-const CALLER_VIEW: &str = "noo_addon_caller_keys";
+const CALLER_VIEW: &str = crate::repo::caller_verifiers::VIEW;
 
-/// The schema holding the caller view: `mesh` on a cluster install, `public`
-/// on a legacy one, `None` when 077 found no `noo_service_keys` to view.
-/// Looked up in the catalogue, not through `to_regclass`: this pool's
-/// search_path is not the migration's.
-async fn caller_view_schema(db: &PgPool) -> Result<Option<String>, String> {
-    sqlx::query_scalar::<_, String>(
-        "SELECT n.nspname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE c.relname = $1 AND c.relkind = 'v' AND n.nspname IN ('mesh', 'public') \
-         ORDER BY n.nspname = 'mesh' DESC LIMIT 1",
-    )
-    .bind(CALLER_VIEW)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| e.to_string())
-}
-
-/// The roles that are members of [`CALLER_VERIFIERS`] now. Empty when the
-/// group does not exist (an install where nothing ever declared it).
-async fn caller_verifier_members(db: &PgPool) -> Result<Vec<String>, String> {
-    sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT m.rolname::text FROM pg_auth_members am \
-         JOIN pg_roles g ON g.oid = am.roleid JOIN pg_roles m ON m.oid = am.member \
-         WHERE g.rolname = $1 ORDER BY 1",
-    )
-    .bind(CALLER_VERIFIERS)
-    .fetch_all(db)
-    .await
-    .map_err(|e| e.to_string())
-}
-
-/// `name` as a quoted SQL identifier, for a role name read back from the
-/// catalogue (never from config: those are checked by [`valid_identifier`]).
-fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-/// Create the group if absent (no login, no escalation) and (re)grant it the
-/// view. Idempotent; the grants follow a view a later revision recreates.
+/// Create the group if absent and (re)grant it the view. Idempotent; the
+/// grants follow a view a later revision recreates.
 async fn ensure_caller_verifier_group(db: &PgPool) -> Result<(), String> {
-    if !role_exists(db, CALLER_VERIFIERS).await.map_err(|e| e.to_string())? {
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "CREATE ROLE {CALLER_VERIFIERS} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS"
-        )))
-        .execute(db)
-        .await
-        .map_err(|e| format!("CREATE ROLE {CALLER_VERIFIERS} failed: {e}"))?;
+    use crate::repo::caller_verifiers as cv;
+    if cv::ensure_group(db).await.map_err(|e| format!("CREATE ROLE {CALLER_VERIFIERS} failed: {e}"))? {
         tracing::info!(role = CALLER_VERIFIERS, "caller-verifier group role created");
     }
-    let Some(schema) = caller_view_schema(db).await? else {
+    let Some(schema) = cv::view_schema(db).await.map_err(|e| e.to_string())? else {
         // No view to grant (077 found no noo_service_keys). Membership still
         // records the declaration; the grant follows on the boot that has it.
         tracing::warn!(view = CALLER_VIEW, "caller-verify view not found; the group holds no SELECT yet");
         return Ok(());
     };
-    for stmt in [
-        format!("GRANT USAGE ON SCHEMA {} TO {CALLER_VERIFIERS}", quote_ident(&schema)),
-        format!("GRANT SELECT ON {}.{CALLER_VIEW} TO {CALLER_VERIFIERS}", quote_ident(&schema)),
-    ] {
-        sqlx::query(sqlx::AssertSqlSafe(&*stmt))
-            .execute(db)
-            .await
-            .map_err(|e| format!("{stmt} failed: {e}"))?;
-    }
-    Ok(())
+    cv::grant_view(db, &schema)
+        .await
+        .map_err(|e| format!("granting {CALLER_VERIFIERS} the view {schema}.{CALLER_VIEW} failed: {e}"))
 }
 
 /// Make `role` (a system's RUNTIME role, never its DDL role) a member of
@@ -628,12 +581,12 @@ async fn ensure_caller_verifier_group(db: &PgPool) -> Result<(), String> {
 /// every provisioned system, so removing `verify_callers` from a bundle
 /// revokes on the next reconcile even while the add-on stays on.
 pub(crate) async fn sync_caller_verifier(db: &PgPool, system: &str, role: &str, want: bool) -> Result<(), String> {
-    let member = caller_verifier_members(db).await?.iter().any(|m| m == role);
+    use crate::repo::caller_verifiers as cv;
+    let member = cv::members(db).await.map_err(|e| e.to_string())?.iter().any(|m| m == role);
     if want {
         ensure_caller_verifier_group(db).await?;
         if !member {
-            sqlx::query(sqlx::AssertSqlSafe(format!("GRANT {CALLER_VERIFIERS} TO {}", quote_ident(role))))
-                .execute(db)
+            cv::add_member(db, role)
                 .await
                 .map_err(|e| format!("GRANT {CALLER_VERIFIERS} TO {role} failed: {e}"))?;
             tracing::info!(system, role, "runtime role may now read {CALLER_VIEW} (verify_callers)");
@@ -646,10 +599,8 @@ pub(crate) async fn sync_caller_verifier(db: &PgPool, system: &str, role: &str, 
 }
 
 async fn revoke_caller_verifier(db: &PgPool, role: &str) -> Result<(), String> {
-    sqlx::query(sqlx::AssertSqlSafe(format!("REVOKE {CALLER_VERIFIERS} FROM {}", quote_ident(role))))
-        .execute(db)
+    crate::repo::caller_verifiers::remove_member(db, role)
         .await
-        .map(|_| ())
         .map_err(|e| format!("REVOKE {CALLER_VERIFIERS} FROM {role} failed: {e}"))
 }
 
@@ -659,7 +610,7 @@ async fn revoke_caller_verifier(db: &PgPool, role: &str) -> Result<(), String> {
 /// `keep`, so it loses the view on this boot. Returns the roles revoked.
 async fn sweep_caller_verifiers(db: &PgPool, keep: &BTreeSet<String>) -> Result<Vec<String>, String> {
     let mut revoked = Vec::new();
-    for m in caller_verifier_members(db).await? {
+    for m in crate::repo::caller_verifiers::members(db).await.map_err(|e| e.to_string())? {
         if !keep.contains(&m) {
             revoke_caller_verifier(db, &m).await?;
             tracing::info!(role = %m, "no registered add-on declares verify_callers for this role: {CALLER_VIEW} access revoked");
@@ -1570,25 +1521,15 @@ mod tests {
             "brokertest_ddl_rhaddonplain",
             "brokertest_direct_rhaddon",
         ] {
-            let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP ROLE IF EXISTS {role}"))).execute(admin).await;
+            crate::repo::caller_verifiers::drop_role(admin, role).await;
         }
     }
 
     /// Can `role` read the caller view? Asked twice: the catalogue, and an
-    /// actual SELECT as that role on ONE connection (SET ROLE is connection
-    /// state). They must agree, or the test is not testing the grant.
+    /// actual SELECT as that role. They must agree, or the test is not
+    /// testing the grant.
     async fn reads_caller_view(db: &PgPool, role: &str) -> bool {
-        let by_catalogue: bool = sqlx::query_scalar("SELECT has_table_privilege($1, 'public.noo_addon_caller_keys', 'SELECT')")
-            .bind(role)
-            .fetch_one(db)
-            .await
-            .expect("has_table_privilege");
-        let mut conn = db.acquire().await.expect("acquire");
-        sqlx::query(sqlx::AssertSqlSafe(format!("SET ROLE {role}"))).execute(&mut *conn).await.expect("set role");
-        let got: Result<Vec<String>, _> = sqlx::query_scalar("SELECT consumer FROM public.noo_addon_caller_keys")
-            .fetch_all(&mut *conn)
-            .await;
-        sqlx::query("RESET ROLE").execute(&mut *conn).await.expect("reset role");
+        let (by_catalogue, got) = crate::repo::caller_verifiers::probe_read(db, "public", role).await;
         if let Ok(rows) = &got {
             assert_eq!(rows.len(), 1, "the view must show caller rows only: {rows:?}");
             assert_eq!(rows[0], "addon-caller:gateway");
