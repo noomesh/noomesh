@@ -10361,7 +10361,7 @@ mod digest_tests {
     /// of them a warning), a failing sandbox row and a warning.
     fn controller() -> Vec<Check> {
         let mut v: Vec<Check> = ["posture", "service keys", "pki key modes", "postgres tls", "gateway redis", "nats bus"]
-            .iter().map(|n| ok(*n, "ok")).collect();
+            .iter().map(|n| ok(n, "ok")).collect();
         for n in AT_REST_DIR_ROWS {
             v.push(if n == "postgres at rest" {
                 warn(n, PLAIN, Some("move the data root onto a LUKS2 volume".into()))
