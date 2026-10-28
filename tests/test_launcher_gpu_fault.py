@@ -210,3 +210,69 @@ def test_the_cpu_embedder_does_not_wait_on_the_gpu_embedder():
     svcs = _services()
     assert "ollama-embed" not in _hard_deps(svcs["ollama-embed-cpu"])
     assert not _needs_gpu(svcs["ollama-embed-cpu"])
+
+
+# ── the pre-check: the overlay is not requested of a GPU that cannot answer ──
+
+def _probe(tmp_path, smi=None, lspci=None, fn="_compose_gpu_state"):
+    """Run a lib-compose.sh function with fake nvidia-smi / lspci first on PATH."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    for name, body in (("nvidia-smi", smi), ("lspci", lspci)):
+        if body is not None:
+            f = bindir / name
+            f.write_text("#!/bin/bash\n" + body + "\n")
+            f.chmod(0o755)
+    # A PATH holding only the fakes and the basic tools, so the host's own
+    # nvidia-smi can never answer for the test.
+    tools = tmp_path / "tools"
+    tools.mkdir(exist_ok=True)
+    for t in ("grep", "cat", "dirname", "sed", "tr", "head", "printf", "echo"):
+        src = subprocess.run(["bash", "-c", f"command -v {t}"], capture_output=True, text=True).stdout.strip()
+        if src.startswith("/") and not (tools / t).is_symlink():
+            (tools / t).symlink_to(src)
+    env = {"PATH": f"{bindir}:{tools}", "HOME": str(tmp_path)}
+    r = subprocess.run(
+        ["/bin/bash", "-c", f". {SCRIPTS}/lib-compose.sh && {fn}"],
+        capture_output=True, text=True, env=env, cwd=str(tmp_path),
+    )
+    return r
+
+
+SMI_OK = 'case "$*" in -L) echo "GPU 0: RTX 3060";; *) echo 6144;; esac'
+SMI_LOST = 'echo "Unable to determine the device handle for GPU0: Unknown Error" >&2; exit 255'
+SMI_LISTS_BUT_NO_HANDLE = 'case "$*" in -L) echo "GPU 0: RTX 3060";; *) echo "Unknown Error" >&2; exit 255;; esac'
+LSPCI_NVIDIA = 'echo "01:00.0 VGA compatible controller: NVIDIA Corporation GA106M [GeForce RTX 3060 Mobile]"'
+
+
+def test_a_working_gpu_is_ok_and_prints_no_notice(tmp_path):
+    assert _probe(tmp_path, smi=SMI_OK).stdout.strip() == "ok"
+    r = _probe(tmp_path, smi=SMI_OK, fn="compose_gpu_notice")
+    assert r.stdout == "" and r.stderr == ""
+
+
+def test_a_driver_that_lost_the_gpu_is_lost_and_the_notice_names_cause_and_choice(tmp_path):
+    for smi in (SMI_LOST, SMI_LISTS_BUT_NO_HANDLE):
+        assert _probe(tmp_path, smi=smi).stdout.strip() == "lost", smi
+    r = _probe(tmp_path, smi=SMI_LOST, fn="compose_gpu_notice")
+    assert "the NVIDIA driver lost the GPU: reboot, or NOO_COMPOSE_GPU=0 noo stack restart to run the embedder on CPU" in r.stderr, r.stderr
+    assert len(r.stderr.strip().splitlines()) == 1
+
+
+def test_a_card_on_the_bus_with_no_nvidia_smi_is_lost_and_no_card_is_none(tmp_path):
+    assert _probe(tmp_path, lspci=LSPCI_NVIDIA).stdout.strip() == "lost"
+    assert _probe(tmp_path, lspci="echo '00:02.0 VGA compatible controller: Intel'").stdout.strip() == "none"
+    r = _probe(tmp_path, fn="compose_gpu_notice")
+    assert r.stderr == "", "a CPU-only box is not a fault"
+
+
+def test_the_overlay_is_requested_only_of_a_gpu_that_answers(tmp_path):
+    for smi, want in ((SMI_OK, 0), (SMI_LOST, 1), (SMI_LISTS_BUT_NO_HANDLE, 1)):
+        assert _probe(tmp_path, smi=smi, fn="_compose_gpu_visible").returncode == want, smi
+
+
+def test_both_launchers_print_the_notice_after_the_file_list():
+    for name in ("noomesh-start.sh", "noomesh-restart.sh"):
+        body = (SCRIPTS / name).read_text()
+        i = body.index('COMPOSE_FILES="$(compose_file_args .)"')
+        assert "compose_gpu_notice" in body[i : i + 120], name
