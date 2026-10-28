@@ -3289,22 +3289,22 @@ mod key_mode_tests {
     fn fix_key_modes_tightens_a_0644_key_with_no_reader_row() {
         let ca = ClusterCa::new(scratch());
         ca.generate_ca("t", 3650).unwrap();
-        let (_, key) = ca.issue_service_cert("pai-voice", &[], &[], 90).unwrap();
+        let (_, key) = ca.issue_service_cert("rhaddon", &[], &[], 90).unwrap();
         assert_eq!(ca.key_reader(&key), KeyReader::Unknown);
         assert_eq!(mode_of(&key), 0o600, "issued owner-only");
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         let issues = ca.audit_key_modes();
-        let planted: Vec<&KeyIssue> = issues.iter().filter(|i| i.rel == "services/pai-voice/service.key").collect();
+        let planted: Vec<&KeyIssue> = issues.iter().filter(|i| i.rel == "services/rhaddon/service.key").collect();
         assert_eq!(planted.len(), 1, "the planted key must be found: {issues:?}");
         assert_eq!((planted[0].kind, planted[0].mode), (KeyIssueKind::UnknownReader, 0o644));
 
         let (fixes, _) = ca.fix_key_modes();
-        let f = fixes.iter().find(|f| f.rel == "services/pai-voice/service.key").expect("a fix row for the planted key");
+        let f = fixes.iter().find(|f| f.rel == "services/rhaddon/service.key").expect("a fix row for the planted key");
         assert_eq!((f.before, f.after), (0o644, 0o600));
         assert!(f.needs.is_none(), "{f:?}");
         assert_eq!(mode_of(&key), 0o600);
-        assert!(!ca.audit_key_modes().iter().any(|i| i.rel == "services/pai-voice/service.key"), "clean after the fix");
+        assert!(!ca.audit_key_modes().iter().any(|i| i.rel == "services/rhaddon/service.key"), "clean after the fix");
     }
 
     /// A uid-read key: either this process could hand it over (group or
