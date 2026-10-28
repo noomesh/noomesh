@@ -38,6 +38,7 @@ use std::process::Command;
 mod image_family;
 mod warmup;
 pub(crate) mod restart_loops;
+mod gpu_held;
 
 /// One invariant, judged.
 #[derive(Debug, Clone, PartialEq)]
@@ -5708,6 +5709,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // A container docker keeps restarting reads "Up" between restarts;
         // judge RestartCount + recency instead (0.6.4 redis AOF, 2026-10-16).
         checks.push(restart_loops::restart_loops_row());
+        // A GPU service the launcher held because the GPU did not answer at
+        // start (i277e): the core runs without it, this row keeps it named.
+        checks.push(gpu_held::gpu_held_row());
         // A gateway that cannot reach a crash-looping redis is redis's
         // problem: point the `gateway redis` remedy at redis, not a gateway
         // restart (0.6.5-rc.1 rehearsal).

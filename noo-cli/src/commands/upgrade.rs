@@ -1884,12 +1884,21 @@ fn keyless_in_store_of(required: &[(String, String)], set: &dyn Fn(&str) -> bool
 const LAUNCHER_EXIT_STACK_PARTIAL: i32 = 75;
 
 /// The failure line for [`LAUNCHER_EXIT_STACK_PARTIAL`]. `report` is the
-/// launcher's `NOO_STUCK_REPORT` file: service name, container id, per line.
+/// launcher's `NOO_STUCK_REPORT` file: service name, container id, per line;
+/// the id line of a service held because the GPU did not answer ends in
+/// " gpu" (i277e).
 fn stuck_stack_message(report: &str, tag: &str) -> String {
-    let mut svcs: Vec<&str> = report.lines().step_by(2).map(str::trim).filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&str> = report.lines().map(str::trim).collect();
+    let mut svcs: Vec<&str> = lines.iter().step_by(2).copied().filter(|l| !l.is_empty()).collect();
     svcs.dedup();
+    let gpu = lines.iter().skip(1).step_by(2).any(|l| l.ends_with(" gpu"));
     let which = if svcs.is_empty() { "one service".to_string() } else { svcs.join(", ") };
-    format!("stack up except {which}; its container will not exit, so reboot this host to clear it, then `noo upgrade --stack` \
+    let why = if gpu {
+        "the GPU did not answer when it started (a GPU driver fault)"
+    } else {
+        "its container will not exit"
+    };
+    format!("stack up except {which}; {why}, so reboot this host to clear it, then `noo upgrade --stack` \
              (the pin IS moved to {tag})")
 }
 
@@ -5927,6 +5936,10 @@ mod keyless_tests {
         let m = stuck_stack_message("ollama-embed\nc5bba1c9\n", "v0.6.7");
         assert!(m.starts_with("stack up except ollama-embed;") && m.contains("reboot") && m.contains("`noo upgrade --stack`"), "{m}");
         assert!(stuck_stack_message("", "v0.6.7").starts_with("stack up except one service;"));
+        // i277e: a service held because the GPU did not answer says so.
+        let g = stuck_stack_message("ollama-embed\nc5bba1c9 gpu\n", "v0.6.14");
+        assert!(g.starts_with("stack up except ollama-embed; the GPU did not answer") && g.contains("reboot"), "{g}");
+        assert!(!m.contains("GPU"), "{m}");
         let body = super::phase_src::body("launch_stack");
         let retry = body.find("launcher failed").unwrap();
         assert!(body[..retry].rfind("LAUNCHER_EXIT_STACK_PARTIAL").is_some_and(|i| retry - i < 300), "no retry for 75");
