@@ -199,11 +199,17 @@ verify = 2
 %s`, service, service, acceptHost, acceptPort, doorLoopback, connectPort, service, service, pins.String())
 }
 
-// stunnelImageCandidates lists the images to try, in order, for the sidecar.
-func stunnelImageCandidates() []string {
+// stunnelImageCandidates lists the images to try, in order, for a
+// backend's sidecar. A pinned door (door_images.go) has no fallback after
+// its pin: falling back would move the door off the image it is pinned to,
+// so a pin that is not staged fails the start, naming the image.
+func stunnelImageCandidates(backend string) []string {
 	var out []string
 	if v := strings.TrimSpace(os.Getenv(StunnelImageEnv)); v != "" {
 		out = append(out, v)
+	}
+	if ref := pinnedDoorFetchRef(backend); ref != "" {
+		return append(out, ref)
 	}
 	prefix, tag := os.Getenv("NOO_IMAGE_PREFIX"), os.Getenv("NOO_IMAGE_TAG")
 	if prefix != "" && tag != "" {
@@ -217,9 +223,9 @@ func stunnelImageCandidates() []string {
 
 // ensureSidecarImage returns the first sidecar image that is present
 // locally or can be pulled, trying stunnelImageCandidates in order.
-func (c *Client) ensureSidecarImage(ctx context.Context) (string, error) {
+func (c *Client) ensureSidecarImage(ctx context.Context, backend string) (string, error) {
 	var errs []string
-	for _, img := range stunnelImageCandidates() {
+	for _, img := range stunnelImageCandidates(backend) {
 		// Local-or-rail for the published stunnel image; the alpine
 		// fallback is a public third-party image, so it may come from its
 		// registry only under NOO_IMAGE_REGISTRY_FALLBACK (image_source.go).
@@ -351,9 +357,11 @@ func (c *Client) removeSidecar(ctx context.Context, backend string) {
 
 // ReleaseSidecarImage is the door sidecar image this node runs for backend
 // when that image is pinned by this node's own configuration: STUNNEL_IMAGE,
+// else the backend's door pin (door_images.go: vLLM's, by tag AND digest,
+// so the hash moves when the pin does and never on a release roll alone),
 // else its release ref NOO_IMAGE_PREFIX/stunnel:NOO_IMAGE_TAG. "" for a
-// backend with no sidecar, and for a node with neither (the compose-built
-// name and the alpine fallback do not move with a release).
+// backend with no sidecar, and for a node with none of these (the
+// compose-built name and the alpine fallback do not move with a release).
 //
 // The reconciler folds it into the spec hash (reconcile.specHash): the
 // sidecar is recreated with its backend, and until 2026-10-28 nothing in the
@@ -365,6 +373,9 @@ func ReleaseSidecarImage(backend string) string {
 	}
 	if v := strings.TrimSpace(os.Getenv(StunnelImageEnv)); v != "" {
 		return v
+	}
+	if ref := pinnedDoorRef(backend); ref != "" {
+		return ref
 	}
 	prefix, tag := os.Getenv("NOO_IMAGE_PREFIX"), os.Getenv("NOO_IMAGE_TAG")
 	if prefix == "" || tag == "" {

@@ -570,10 +570,20 @@ the same sidecar. The compose stack's vLLMs on the controller still serve
 TLS themselves and admit any cluster-CA leaf until their own door lands.
 
 A door's image moves with the node's release (`ReleaseSidecarImage`, folded
-into the spec hash), so a release roll recreates each fronted backend once.
-For vLLM that is one model load per roll: replacing the door alone would
-leave the engine in a dead namespace, which the reconciler then restarts
-anyway.
+into the spec hash), so a release roll recreates each fronted backend once,
+except a **pinned door**. The stunnel image is rebuilt every release, so its
+digest moves even when nothing in it changed, and for vLLM a recreate is a
+model load. vLLM's door therefore runs a pinned image of its own:
+`config/door-images.json` names a published release's stunnel tag and digest
+(the node agent embeds a byte-equal copy). The spec hash carries the pin, so
+vLLM is recreated when the pin moves and never on a release roll alone. The
+controller stages the pin on the rail with every release (`noo upgrade`,
+`noo cluster sync-images`; source `door-pin`, which release retention never
+prunes). A rail node fetches it by its tag, verified against the
+controller's manifest, and any other node by its digest. A pin that is not
+staged fails the start, naming the image: there is no fallback, which would
+move the door off its pin. To move the door, set the file to a newer
+release's `stunnel@sha256:…` lock row; that costs one vLLM reload.
 
 **What a node must hold.** Each door serves with a service leaf under
 `$NOO_PKI_DIR/services/<x>/service.{crt,key}` (`vllm`, `llamacpp`,

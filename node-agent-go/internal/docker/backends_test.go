@@ -564,12 +564,12 @@ func TestSidecarSpec(t *testing.T) {
 	t.Setenv(StunnelImageEnv, "")
 	t.Setenv("NOO_IMAGE_PREFIX", "ghcr.io/x/noomesh")
 	t.Setenv("NOO_IMAGE_TAG", "v9")
-	got := strings.Join(stunnelImageCandidates(), ",")
+	got := strings.Join(stunnelImageCandidates("llamacpp"), ",")
 	if got != "ghcr.io/x/noomesh/stunnel:v9,noomesh/stunnel:latest,"+stunnelFallbackImage {
 		t.Errorf("image candidates: %s", got)
 	}
 	t.Setenv(StunnelImageEnv, "my/stunnel:1")
-	if c := stunnelImageCandidates(); c[0] != "my/stunnel:1" {
+	if c := stunnelImageCandidates("llamacpp"); c[0] != "my/stunnel:1" {
 		t.Errorf("override must come first: %v", c)
 	}
 	// The sidecar script installs stunnel only when the image lacks it.

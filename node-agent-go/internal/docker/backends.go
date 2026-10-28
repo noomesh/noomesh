@@ -914,7 +914,7 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 	// have cost the running backend first.
 	var sidecarImage string
 	if SidecarFor(backend) != "" {
-		img, err := c.ensureSidecarImage(ctx)
+		img, err := c.ensureSidecarImage(ctx, backend)
 		if err != nil {
 			return fmt.Errorf("sidecar image for %s: %w", backend, err)
 		}

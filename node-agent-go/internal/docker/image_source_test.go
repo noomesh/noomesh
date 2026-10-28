@@ -401,13 +401,13 @@ func TestStartPathsGoThroughEnsureImage(t *testing.T) {
 		t.Setenv(StunnelImageEnv, "")
 		t.Setenv("NOO_IMAGE_PREFIX", "ghcr.io/noomesh")
 		t.Setenv("NOO_IMAGE_TAG", "v0.2.103")
-		_, err := c.ensureSidecarImage(context.Background())
+		_, err := c.ensureSidecarImage(context.Background(), "llamacpp")
 		if err == nil {
 			t.Fatal("every candidate refused: want an error")
 		}
 		// Every candidate was asked of the rail helper, in order, and the
 		// error carries each refusal.
-		want := stunnelImageCandidates()
+		want := stunnelImageCandidates("llamacpp")
 		if strings.Join(*asked, ",") != strings.Join(want, ",") {
 			t.Fatalf("asked %v, want %v", *asked, want)
 		}
