@@ -5275,19 +5275,26 @@ const SEAT_WARN_REMEDY_ROWS: [&str; 3] = ["seat layout", "display binaries", "di
 fn remedies_to_print<'a>(title: &str, checks: &'a [Check]) -> Vec<(&'a str, Vec<&'a str>)> {
     // An identical remedy is printed once, with every row it covers (the
     // v0.2.97 roll printed one LUKS remedy nine times, once per `* at rest`).
+    // FAIL remedies lead: the first one printed is the next command to run,
+    // and a warning's (a LUKS move) must not stand in front of a failure's.
     let seat_section = title.starts_with("seat ");
-    let mut out: Vec<(&str, Vec<&str>)> = Vec::new();
+    let mut out: Vec<(&str, Vec<&str>, bool)> = Vec::new();
     for c in checks.iter()
         .filter(|c| c.verdict == Verdict::Fail || (c.verdict == Verdict::Warn && (title == "controller" || c.name == "gpu"
             || (seat_section && SEAT_WARN_REMEDY_ROWS.contains(&c.name)))))
     {
         let Some(r) = c.remedy.as_deref() else { continue };
-        match out.iter_mut().find(|(x, _)| *x == r) {
-            Some((_, names)) => names.push(c.name),
-            None => out.push((r, vec![c.name])),
+        let fails = c.verdict == Verdict::Fail;
+        match out.iter_mut().find(|(x, _, _)| *x == r) {
+            Some((_, names, f)) => {
+                names.push(c.name);
+                *f |= fails;
+            }
+            None => out.push((r, vec![c.name], fails)),
         }
     }
-    out
+    out.sort_by_key(|(_, _, fails)| !*fails);
+    out.into_iter().map(|(r, names, _)| (r, names)).collect()
 }
 
 /// The `at_rest_dirs` rows. In the default output they print as one
@@ -6315,7 +6322,8 @@ mod tests {
             fail("x", "bad", "noo health"),
         ];
         let c = remedies_to_print("controller", &rows);
-        assert_eq!(c, vec![("noo security service-key provision evolve", vec!["service-key grants"]), ("noo health", vec!["x"])]);
+        // The FAIL remedy leads, ahead of the WARN listed before it.
+        assert_eq!(c, vec![("noo health", vec!["x"]), ("noo security service-key provision evolve", vec!["service-key grants"])]);
         assert_eq!(remedies_to_print("node a", &rows), vec![("noo health", vec!["x"])]);
     }
 
