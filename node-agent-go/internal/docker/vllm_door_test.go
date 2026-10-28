@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -154,6 +156,66 @@ func TestTheVLLMDoorTakesTheEngineName(t *testing.T) {
 	for _, needle := range []string{"accept = noo-stunnel-vllm:8000", "connect = 127.0.0.1:8000", "cert = /tls/services/vllm/service.crt", "verify = 2", "checkHost = awolf"} {
 		if !strings.Contains(conf, needle) {
 			t.Errorf("vllm door conf lacks %q:\n%s", needle, conf)
+		}
+	}
+}
+
+// The pinned door runs its pin, not the release: the ref a node fetches
+// and the one folded into the spec hash stay put across a release roll and
+// move with the pin. A pinned door has no fallback image.
+func TestThePinnedDoorFollowsItsPinNotTheRelease(t *testing.T) {
+	t.Setenv(StunnelImageEnv, "")
+	t.Setenv("NOO_IMAGE_SOURCE", "")
+	t.Setenv("NOO_IMAGE_PREFIX", "ghcr.io/noomesh")
+	t.Setenv("NOO_IMAGE_TAG", "v0.6.13")
+	pinned := ReleaseSidecarImage("vllm")
+	if !strings.HasPrefix(pinned, "ghcr.io/noomesh/stunnel:") || !digestRe.MatchString(pinned) {
+		t.Fatalf("vLLM's door image %q is not a digest-locked stunnel ref", pinned)
+	}
+	t.Setenv("NOO_IMAGE_TAG", "v0.6.14")
+	if ReleaseSidecarImage("vllm") != pinned {
+		t.Fatalf("a release roll moved vLLM's door: %q -> %q", pinned, ReleaseSidecarImage("vllm"))
+	}
+	if got := ReleaseSidecarImage("llamacpp"); got != "ghcr.io/noomesh/stunnel:v0.6.14" {
+		t.Fatalf("llama.cpp's door still follows the release: %q", got)
+	}
+	if got := stunnelImageCandidates("vllm"); len(got) != 1 || got[0] != pinned {
+		t.Fatalf("a pinned door has its pin and no fallback: %v", got)
+	}
+	// A rail node fetches the tag ref the controller staged; the rail's
+	// manifest verifies the tar.
+	t.Setenv("NOO_IMAGE_SOURCE", "rail")
+	if got, want := stunnelImageCandidates("vllm"), strings.SplitN(pinned, "@", 2)[0]; len(got) != 1 || got[0] != want {
+		t.Fatalf("rail node fetches %v, want [%s]", got, want)
+	}
+	// Moving the pin moves the image.
+	prev := doorPins
+	t.Cleanup(func() { doorPins = prev })
+	doorPins = map[string]doorImagePin{"vllm": {Image: "stunnel", Tag: "v0.6.20", Digest: "sha256:" + strings.Repeat("ab", 32)}}
+	if moved := ReleaseSidecarImage("vllm"); moved == pinned || !strings.Contains(moved, ":v0.6.20@sha256:abab") {
+		t.Fatalf("a new pin must change vLLM's door image: %q", moved)
+	}
+}
+
+// The embedded pin file is the shipped one, and a malformed pin is refused.
+func TestDoorPinsAreTheShippedFile(t *testing.T) {
+	shipped, err := os.ReadFile(filepath.Join("..", "..", "..", "config", "door-images.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(shipped) != string(doorImagesJSON) {
+		t.Fatal("node-agent-go/internal/docker/door_images.json differs from config/door-images.json: copy the shipped file over the embedded one")
+	}
+	if _, ok := doorPins["vllm"]; !ok || len(doorPins) != 1 {
+		t.Fatalf("pins %v: want vLLM's door only", doorPins)
+	}
+	for _, bad := range []string{
+		`{"doors":{"vllm":{"image":"stunnel","tag":"v1","digest":"sha256:abc"}}}`,
+		`{"doors":{"vllm":{"image":"ghcr.io/x/stunnel","tag":"v1","digest":"sha256:` + strings.Repeat("0", 64) + `"}}}`,
+		`{"doors":{"airllm":{"image":"stunnel","tag":"v1","digest":"sha256:` + strings.Repeat("0", 64) + `"}}}`,
+	} {
+		if _, err := parseDoorPins([]byte(bad)); err == nil {
+			t.Errorf("accepted %s", bad)
 		}
 	}
 }

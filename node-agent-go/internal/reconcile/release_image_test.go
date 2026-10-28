@@ -72,19 +72,38 @@ func TestSpecHash_NoChurnWhereNothingFollowsTheRelease(t *testing.T) {
 	}
 }
 
-// vLLM sits behind noo-stunnel-vllm since door generation 5, so its door
-// follows the release like every other: a roll recreates it once (a model
-// load). Not churn: leaving the door on the previous release's stunnel is
-// the awolf bug above, and replacing the door alone would strand the engine
-// in a dead namespace, which HealStrandedEngines then restarts anyway.
-func TestSpecHash_VLLMsDoorFollowsTheRelease(t *testing.T) {
+// vLLM's door is PINNED (docker door_images.json, operator 2026-10-28): a
+// release roll alone leaves its spec hash, so vLLM is not reloaded per roll.
+// The stunnel image is rebuilt every release, so following the release would
+// recreate vLLM on every roll for a door that did not change.
+func TestSpecHash_AReleaseRollAloneLeavesVLLM(t *testing.T) {
 	t.Setenv("STUNNEL_IMAGE", "")
 	vllm := basePlacement()
-	rollTo(t, "v0.6.12")
-	before := specHash(vllm)
 	rollTo(t, "v0.6.13")
+	before := specHash(vllm)
+	rollTo(t, "v0.6.14")
+	if specHash(vllm) != before {
+		t.Fatal("a release-tag change alone recreated vLLM; its door is pinned and did not change")
+	}
+}
+
+// A change to vLLM's door image does move the hash: here the registry the
+// pin resolves against (a different image), and an operator's STUNNEL_IMAGE.
+// The pin's own tag and digest are covered in the docker package
+// (TestThePinnedDoorFollowsItsPinNotTheRelease).
+func TestSpecHash_ADoorImageChangeRecreatesVLLM(t *testing.T) {
+	t.Setenv("STUNNEL_IMAGE", "")
+	vllm := basePlacement()
+	rollTo(t, "v0.6.13")
+	before := specHash(vllm)
+	t.Setenv("NOO_IMAGE_PREFIX", "reg.example/mirror")
 	if specHash(vllm) == before {
-		t.Fatal("vLLM's door image moved with the release but the hash did not")
+		t.Fatal("vLLM's door image changed (another registry) but the hash did not")
+	}
+	t.Setenv("NOO_IMAGE_PREFIX", "ghcr.io/noomesh")
+	t.Setenv("STUNNEL_IMAGE", "reg.example/acme/stunnel:v9")
+	if specHash(vllm) == before {
+		t.Fatal("an operator's STUNNEL_IMAGE changed vLLM's door but the hash did not")
 	}
 }
 
