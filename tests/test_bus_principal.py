@@ -49,6 +49,8 @@ def _sign(
     nonce: str = "",
     keys: "dict[str, str] | None" = None,
     legacy_secret: "str | None" = None,
+    act=None,
+    harness=None,
 ) -> str:
     iat = time.time() if iat is None else iat
     claims = {
@@ -61,6 +63,10 @@ def _sign(
         "exp": int(iat) + ttl,
         "nonce": nonce or f"n{time.time_ns()}",
     }
+    if act is not None:
+        claims["act"] = act
+    if harness is not None:
+        claims["harness"] = harness
     body = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
     if legacy_secret is not None:
         # The pre-702 format: one bare MAC under the shared controller secret.
@@ -76,6 +82,23 @@ def _own(token: str) -> "tuple[str, str]":
     """(body, the worker's MAC)."""
     body, _, sigs = token.partition(".")
     return body, dict(e.split("=", 1) for e in sigs.split(","))["worker"]
+
+
+def test_verified_delegation_survives_worker_requester_conversion():
+    actor = {"sub": "key:fixture-agent", "iss_user": "alice"}
+    p = bp.verify_token(_sign(act=actor, harness="mcp-external:fixture-agent"), "worker.rag.query")
+    assert p.act == actor
+    assert p.harness == "mcp-external:fixture-agent"
+    assert p.as_requester()["act"] == actor
+    assert p.as_requester()["harness"] == p.harness
+
+
+@pytest.mark.parametrize("fields", [{"act": True}, {"act": "agent"}, {"act": {"sub": 7}},
+                                    {"act": {"sub": "agent", "iss_user": 7}}, {"harness": []}])
+def test_malformed_delegation_cannot_turn_into_an_ordinary_user(fields):
+    with pytest.raises(bp.PrincipalError) as exc:
+        bp.verify_token(_sign(**fields), "worker.rag.query")
+    assert exc.value.reason == "malformed"
 
 
 class FakeMsg:

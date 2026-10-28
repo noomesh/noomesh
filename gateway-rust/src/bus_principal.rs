@@ -120,12 +120,15 @@ pub struct Principal {
     pub kind: Kind,
     pub role: String,
     pub scopes: Vec<String>,
+    /// Credential-bound delegation survives HTTP, detached work and replay.
+    pub act: Option<crate::auth::Actor>,
+    pub harness: Option<String>,
 }
 
 impl Principal {
     /// A named human (or a token minted for one).
     pub fn user(sub: impl Into<String>, role: crate::auth::Role, scopes: Vec<String>) -> Self {
-        Self { sub: sub.into(), kind: Kind::User, role: role.as_str().into(), scopes }
+        Self { sub: sub.into(), kind: Kind::User, role: role.as_str().into(), scopes, act: None, harness: None }
     }
 
     /// A loop or service acting on its own account. `actor` is bare — the
@@ -141,6 +144,8 @@ impl Principal {
             // closed rather than open.
             role: crate::auth::Role::User.as_str().into(),
             scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
+            act: None,
+            harness: None,
         }
     }
 
@@ -150,6 +155,8 @@ impl Principal {
             kind: Kind::Internal,
             role: crate::auth::Role::User.as_str().into(),
             scopes: Vec::new(),
+            act: None,
+            harness: None,
         }
     }
 }
@@ -162,6 +169,10 @@ struct Claims<'a> {
     kind: Kind,
     role: &'a str,
     scopes: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    act: Option<&'a crate::auth::Actor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    harness: Option<&'a str>,
     /// The NATS subject this principal is valid for. Binds the token to the
     /// request so it cannot be lifted onto a different handler.
     subj: &'a str,
@@ -424,6 +435,8 @@ pub fn sign_at(
         kind: principal.kind,
         role: &principal.role,
         scopes: &principal.scopes,
+        act: principal.act.as_ref(),
+        harness: principal.harness.as_deref(),
         subj: subject,
         iat: now,
         exp: now + TTL_SECS,
@@ -540,7 +553,10 @@ pub async fn principal_layer(
 /// does not cross `tokio::spawn`, so a detached run that forgot would publish
 /// as [`UNATTRIBUTED`] and the worker would answer for nobody in particular.
 pub fn for_requester(ctx: &crate::auth::RequesterCtx) -> Principal {
-    Principal::user(ctx.sub.clone(), ctx.role, ctx.scopes.clone())
+    let mut principal = Principal::user(ctx.sub.clone(), ctx.role, ctx.scopes.clone());
+    principal.act = ctx.act.clone();
+    principal.harness = ctx.harness.clone();
+    principal
 }
 
 /// Whether `p` is one of the controller's own internal services: what the auth
@@ -572,11 +588,12 @@ pub fn from_extensions(ext: &axum::http::Extensions) -> Option<Principal> {
         // A key issued with `--user` is that person on the bus too, or the
         // whole point of binding it would stop at the HTTP door.
         return Some(match &consumer.user {
-            Some(user) => Principal::user(
-                user.clone(),
-                crate::auth::Role::from_scopes(&consumer.scopes),
-                consumer.scopes.clone(),
-            ),
+            Some(user) => {
+                let mut principal = Principal::user(user.clone(),
+                    crate::auth::Role::from_scopes(&consumer.scopes), consumer.scopes.clone());
+                principal.harness = Some(format!("service-key:{}", consumer.name));
+                principal
+            },
             None => Principal::internal(
                 &format!("key:{}", consumer.name),
                 INTERNAL_SERVICE_SCOPES,
@@ -603,6 +620,8 @@ pub fn embed_for_dlq(payload: &serde_json::Value, principal: &Principal) -> serd
                 "kind": principal.kind.as_str(),
                 "role": principal.role,
                 "scopes": principal.scopes,
+                "act": principal.act,
+                "harness": principal.harness,
             }),
         );
     }
@@ -637,7 +656,15 @@ pub fn extract_from_dlq(payload: &serde_json::Value) -> (serde_json::Value, Prin
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
         .unwrap_or_default();
-    (out, Principal { sub, kind, role, scopes })
+    let act = match serde_json::from_value(raw.get("act").cloned().unwrap_or(serde_json::Value::Null)) {
+        Ok(act) => act,
+        Err(_) => return (out, Principal::internal("dlq-drain", &[])),
+    };
+    let harness = match serde_json::from_value(raw.get("harness").cloned().unwrap_or(serde_json::Value::Null)) {
+        Ok(harness) => harness,
+        Err(_) => return (out, Principal::internal("dlq-drain", &[])),
+    };
+    (out, Principal { sub, kind, role, scopes, act, harness })
 }
 
 /// What a controller-signed service may do on the bus. `read`/`write` and no
@@ -829,6 +856,29 @@ mod publish_sites {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegation_provenance_survives_signing_and_replay() {
+        let ctx = crate::auth::RequesterCtx {
+            sub: "alice/agent".into(), role: crate::auth::Role::Admin, scopes: vec!["admin".into()],
+            act: Some(crate::auth::Actor { sub: "key:fixture-agent".into(), iss_user: Some("alice".into()), task: None }),
+            harness: Some("mcp-external:fixture-agent".into()),
+        };
+        let principal = for_requester(&ctx);
+        let token = sign_at(&principal, "worker.rag.query", &[("worker", "fixture-bus-key")], 100, "nonce".into()).unwrap();
+        let body = token.split('.').next().unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(body).unwrap()).unwrap();
+        assert_eq!(claims["act"]["sub"], "key:fixture-agent");
+        assert_eq!(claims["harness"], "mcp-external:fixture-agent");
+        let stored = embed_for_dlq(&serde_json::json!({"question":"fixture"}), &principal);
+        let (_, restored) = extract_from_dlq(&stored);
+        assert_eq!(restored, principal);
+        assert!(crate::integrations::content::requester_account(&restored).is_none());
+        let mut malformed = stored;
+        malformed[DLQ_KEY]["act"] = serde_json::json!(false);
+        assert!(crate::integrations::content::requester_account(&extract_from_dlq(&malformed).1).is_none());
+    }
 
     const KEYS: &[(&str, &str)] = &[("worker", "worker-bus-key"), ("trellion", "trellion-bus-key")];
 

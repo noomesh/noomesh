@@ -215,6 +215,10 @@ For an existing installation, use the secrets reconfiguration flow:
 noo onboard --reconfigure --only secrets --secrets-backend sops
 ```
 
+`noo upgrade --stack` also generates a missing integration key in `env.sops`
+before deploying the new gateway. It preserves any existing key and refuses a
+blank key or unreadable encrypted store rather than replacing it.
+
 For the Desktop path, import the Google-issued parameter through
 `noo security secrets rotate NOO_GOOGLE_DESKTOP_CLIENT_SECRET --set-from-stdin`.
 For the web path, import the Google-issued client secret through
@@ -322,8 +326,13 @@ without Google emails, tokens, codes, selected content or message bodies.
 
 Search your imported material through a standalone Noomesh KB query or the
 owner-only `/api/connections/search` API.
-For example: `noo rag query "apricot project notes"`. Use the same Noomesh
-login that connected the account.
+For example: `noo rag query "apricot project notes" --personal`. Use the same
+human Noomesh login that connected the account. Without `--personal`, a KB
+query searches the shared corpus only. The HTTP equivalent is the literal
+boolean `include_personal: true` on `/api/v1/rag/query`.
+Delegated agent/MCP/harness credentials cannot read personal evidence even
+when they request it. The owner-only search API is an explicit personal read
+and applies the same human-credential restriction.
 Personal source text is stored encrypted and retrieved only for your Noomesh
 account. Automatic use in persisted Noomesh chat and conversation-bound tools is
 disabled: existing transcript/export permissions allow operators to read other
@@ -331,6 +340,12 @@ users' histories. Standalone search keeps Google content out of those histories.
 It is excluded from shared-room context and shared knowledge graphs;
 Google file sharing does not share it with other Noomesh users. Removal does not
 rewrite prior conversation history or backups.
+
+If a private row cannot decrypt, search skips that row and reports
+`unavailable: true`. An opted-in KB query reports
+`personal_sources_unavailable: true` while preserving its shared results.
+The CLI prints a notice for this condition. A broken stored cursor or source
+policy stops only that source with a storage fault; other users' sync continues.
 
 The initial importer supports Gmail plain-text bodies and Drive text files
 (plain text, Markdown, CSV) and Google Docs. It skips attachments, HTML-only

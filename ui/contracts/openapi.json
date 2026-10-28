@@ -2373,11 +2373,38 @@
           "knowledge"
         ],
         "summary": "RAG query",
-        "description": "[delegated] Queries the knowledge base via RAG (via NATS worker.rag.query).",
+        "description": "[delegated] Queries the knowledge base via RAG (via NATS worker.rag.query). Personal Google content is excluded by default. A human login may explicitly set include_personal=true; credentials carrying act or harness are refused private evidence. Shared retrieval remains available if private storage fails, with personal_sources_unavailable=true in an opted-in response.",
         "operationId": "rag_query",
         "responses": {
           "200": {
             "description": "OK"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "question": {
+                    "type": "string"
+                  },
+                  "query": {
+                    "type": "string"
+                  },
+                  "strategy": {
+                    "type": "string"
+                  },
+                  "include_personal": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Explicitly include owned personal Google evidence; human credentials only."
+                  }
+                },
+                "additionalProperties": true
+              }
+            }
           }
         }
       }

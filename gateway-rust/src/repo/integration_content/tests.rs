@@ -135,6 +135,66 @@ fn p(name: &str, admin: bool) -> Principal {
     )
 }
 
+#[tokio::test]
+async fn unreadable_documents_do_not_hide_healthy_owner_results() {
+    let Some(db) = Db::new().await else { return; };
+    let v = vault();
+    let owner = db.user("alice").await;
+    let source = db.source(owner, true).await;
+    enable(&db.pool, owner, source, true).await.unwrap();
+    let job = claim(&db.pool, &v).await.unwrap().unwrap();
+    let docs: Vec<Document> = ["good", "corrupt"].into_iter().map(|id| Document {
+        external_id: id.into(), title: "Private apricot".into(),
+        text: "Private apricot evidence".into(), url: "https://mail.google.com/".into(),
+    }).collect();
+    commit(&db.pool, &v, &job, &docs, None, 0).await.unwrap();
+    sqlx::query("UPDATE noo_integration_documents SET sealed='{}' WHERE item_key=$1")
+        .bind(hash("corrupt")).execute(&db.pool).await.unwrap();
+    let result = search(&db.pool, &v, owner, "apricot", 20).await
+        .expect("one unreadable row must not take down the owner's whole search");
+    assert_eq!(result["items"].as_array().unwrap().len(), 1);
+    assert_eq!(result["unavailable"], true);
+    let wrong = Vault::from_secret(&"different-fixture-key".repeat(3)).unwrap();
+    let result = search(&db.pool, &wrong, owner, "apricot", 20).await.unwrap();
+    assert!(result["items"].as_array().unwrap().is_empty());
+    assert_eq!(result["unavailable"], true);
+    db.finish().await;
+}
+
+#[tokio::test]
+async fn poisoned_jobs_are_isolated_and_other_users_continue_syncing() {
+    let Some(db) = Db::new().await else { return; };
+    let v = vault();
+    let alice = db.user("alice").await;
+    let bob = db.user("bob").await;
+    let bad_cursor = db.source(alice, true).await;
+    let bad_policy = db.source(alice, false).await;
+    let good = db.source(bob, true).await;
+    for (who, source) in [(alice, bad_cursor), (alice, bad_policy), (bob, good)] {
+        enable(&db.pool, who, source, true).await.unwrap();
+    }
+    sqlx::query("UPDATE noo_integration_sync SET cursor_sealed='{}',next_run=now()-interval '2 hours' WHERE source_id=$1")
+        .bind(bad_cursor).execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE noo_connection_sources SET policy=$2 WHERE id=$1")
+        .bind(bad_policy).bind(json!({"kind":"google_drive","exposure":"invalid"})).execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE noo_integration_sync SET next_run=now()-interval '1 hour' WHERE source_id=$1")
+        .bind(bad_policy).execute(&db.pool).await.unwrap();
+    let job = claim(&db.pool, &v).await.expect("a poison cursor must not block the queue").unwrap();
+    assert_eq!((job.owner, job.source), (bob, good));
+    let errors: i64 = sqlx::query_scalar("SELECT count(*) FROM noo_integration_sync WHERE owner_uuid=$1 AND status='error' AND fault='storage' AND lease IS NULL")
+        .bind(alice).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(errors, 2);
+    assert!(claim(&db.pool, &v).await.unwrap().is_none());
+    let page = sync::page(&FixtureApi, &job.policy, None).await.unwrap();
+    assert!(commit(&db.pool, &v, &job, &page.docs, None, 0).await.unwrap());
+    assert_eq!(search(&db.pool, &v, bob, "apricot", 20).await.unwrap()["items"].as_array().unwrap().len(), 1);
+    // The owner can explicitly restart after fixing storage; no auto-retry
+    // reads the poison again, and start discards the old encrypted cursor.
+    enable(&db.pool, alice, bad_cursor, true).await.unwrap();
+    assert_eq!(claim(&db.pool, &v).await.unwrap().unwrap().source, bad_cursor);
+    db.finish().await;
+}
+
 #[test]
 fn personal_authority_ignores_admin_grants_and_denies_internal_and_shared_rooms() {
     assert_eq!(requester_account(&p("alice/laptop", true)), Some("alice"));

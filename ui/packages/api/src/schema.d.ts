@@ -1059,7 +1059,7 @@ export interface paths {
         put?: never;
         /**
          * RAG query
-         * @description [delegated] Queries the knowledge base via RAG (via NATS worker.rag.query).
+         * @description [delegated] Queries the knowledge base via RAG (via NATS worker.rag.query). Personal Google content is excluded by default. A human login may explicitly set include_personal=true; credentials carrying act or harness are refused private evidence. Shared retrieval remains available if private storage fails, with personal_sources_unavailable=true in an opted-in response.
          */
         post: operations["rag_query"];
         delete?: never;
@@ -12592,7 +12592,22 @@ export interface operations {
             path?: never;
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody: {
+            content: {
+                "application/json": {
+                    question?: string;
+                    query?: string;
+                    strategy?: string;
+                    /**
+                     * @description Explicitly include owned personal Google evidence; human credentials only.
+                     * @default false
+                     */
+                    include_personal?: boolean;
+                } & {
+                    [key: string]: unknown;
+                };
+            };
+        };
         responses: {
             /** @description OK */
             200: {

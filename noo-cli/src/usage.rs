@@ -255,7 +255,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["approval", "pending"], "", "Hidden: same as approval list"),
     (&["approval", "stats"], "", "Show approval-queue counts (total/approved/denied/pending/timed out/expired)"),
     (&["approval", "status"], "", "Show the exec-approval system status as JSON"),
-    (&["rag", "query"], "<question> [-s|--strategy <strategy>] [-p|--persona <persona-id>]", "Ask the PageIndex RAG a question and print answer, verification and citations"),
+    (&["rag", "query"], "<question> [-s|--strategy <strategy>] [-p|--persona <persona-id>] [--personal]", "Ask the KB; --personal explicitly includes your Google sources for a human login"),
     (&["rag", "status"], "", "Show PageIndex RAG table counts and embedder state"),
     (&["rag", "docs"], "[--untagged] [--audience <role>] [--match <glob>] [--title <text>] [--limit <n>]", "List every document with audience, source and who ingested it; filterable"),
     (&["rag", "doc"], "<id>", "Show one document: audience, provenance, audience history and a text preview"),

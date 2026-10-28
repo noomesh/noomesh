@@ -56,14 +56,27 @@ Identical content and provider IDs from different users/accounts remain independ
 deduplication uses `(owner_uuid, source_id, item_key)`, never a global content hash.
 No caller can supply roles, owner, visibility or a job lease. Google sharing does
 not grant Noomesh access. Admin and unrestricted KB roles do not override the
-personal owner check. Internal/service identities and shared-room turns receive
-no personal evidence.
+personal owner check. Internal/service identities, delegated MCP/agent/harness
+credentials and shared-room turns receive no personal evidence. Credential
+`act` and `harness` provenance survives HTTP-to-principal conversion, signed
+bus messages and deferred replay; request bodies cannot remove those markers.
 
 Owner-only lexical search runs over a bounded decrypted window and returns
-snippets/citations. Standalone HTTP KB queries and context-free native queries
-add personal results on the gateway after shared retrieval, without publishing
-them to shared workers or graph/walk stores. Query bodies cannot choose another
-owner. There is no personal result cache.
+snippets/citations. Shared KB queries exclude personal content by default.
+A human standalone HTTP request can explicitly set `include_personal: true`
+(`noo rag query "question" --personal`) to add personal results on the gateway
+after shared retrieval. Native model tools never opt in, and credential-bound
+`act` or `harness` markers refuse private reads even on explicit opt-in.
+Query bodies cannot choose another owner. Personal excerpts never reach shared
+workers or graph/walk stores, and there is no personal result cache.
+
+Unreadable private documents are skipped with `unavailable: true`. A private
+failure never takes down shared retrieval: opted-in responses carry
+`personal_sources_unavailable: true` and keep shared answers/citations.
+Corrupt cursors or stored policies are marked `error`/`storage` under the claimed
+row lock and committed individually before the queue moves on to healthy users.
+An explicit owner restart resets a stopped job after the underlying problem is
+corrected. Vault errors, row contents and policies are not logged or returned.
 
 **Persisted Noomesh chat is excluded in this batch.** Existing transcript,
 conversation-memory and training-export permissions allow operators to read
@@ -189,6 +202,7 @@ gateway runs, so losing the DSN fails those integration checks.
 | Pause and concurrency | Lease expiry/replacement, duplicate pages, competing workers, late writes after pause/disconnect |
 | Disconnect and erasure | Production account/source removal cascades and user erasure prevent content or pending grants being restored |
 | Private search | Only the authenticated user sees snippets; service principals, shared rooms, disabled users and persisted conversation/tool contexts receive no personal evidence |
+| Agent and failure boundaries | Actual MCP-minted JWTs cannot read private sources; opt-in is boolean and human-only; corrupt rows degrade search and poisoned jobs cannot block another owner |
 | Response protection | Callback CSP and no-store headers, strict request shapes, owner resolution for User/Operator/Admin |
 | Migration compatibility | Existing `103_pg_stat_statements` preserved; new migrations `104_connection_drafts` through `107_integration_content` follow it |
 

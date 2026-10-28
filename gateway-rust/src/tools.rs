@@ -1093,8 +1093,8 @@ fn err_result(call: &ToolCall, error: String) -> ToolResult {
     }
 }
 
-/// `noo_rag_query` uses the same owner-scoped memory facade as HTTP queries.
-/// Shared RAG stays on the ML plane; personal evidence stays on the gateway.
+/// `noo_rag_query` uses the shared memory facade. Model tools never forward
+/// the human-only personal opt-in; explicit HTTP/CLI reads own that choice.
 async fn native_rag_query(state: &AppState, call: &ToolCall, args: &Value) -> ToolResult {
     let question = match arg_str(args, &["question", "query"]) {
         Some(q) => q,

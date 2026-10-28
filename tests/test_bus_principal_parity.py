@@ -60,7 +60,7 @@ def test_the_claim_names_match() -> None:
     """
     rust = set(_rust_claim_fields())
     assert rust, "parsed no claim fields"
-    verified = {"sub", "kind", "role", "scopes", "subj", "iat", "exp", "nonce"}
+    verified = {"sub", "kind", "role", "scopes", "act", "harness", "subj", "iat", "exp", "nonce"}
     assert rust == verified, (
         "the signed claim set drifted from what the verifier reads.\n"
         f"  only in bus_principal.rs: {sorted(rust - verified) or 'none'}\n"

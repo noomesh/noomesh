@@ -86,32 +86,43 @@ pub async fn enable(db: &PgPool, owner: Uuid, source: Uuid, enabled: bool) -> Re
 }
 
 pub async fn claim(db: &PgPool, vault: &Vault) -> Result<Option<Job>, Error> {
-    let mut tx = db.begin().await?;
-    let row: Option<(Uuid, Uuid, Uuid, Value, Option<Uuid>, Option<Value>)> = sqlx::query_as(
-        "SELECT j.source_id,j.owner_uuid,s.account_id,s.policy,j.generation,j.cursor_sealed FROM noo_integration_sync j JOIN noo_connection_sources s ON s.id=j.source_id AND s.owner_uuid=j.owner_uuid JOIN noo_connected_accounts a ON a.id=s.account_id AND a.owner_uuid=s.owner_uuid JOIN noo_users u ON u.user_uuid=j.owner_uuid WHERE s.sync_enabled AND a.status='connected' AND NOT u.disabled AND j.next_run<=now() AND (j.lease IS NULL OR j.lease_until<now()) AND j.status<>'error' ORDER BY j.next_run FOR UPDATE OF j SKIP LOCKED LIMIT 1")
-        .fetch_optional(&mut *tx).await?;
-    let Some((source, owner, account, policy, generation, cursor)) = row else {
-        return Ok(None);
-    };
-    let lease = Uuid::new_v4();
-    let generation = generation.unwrap_or_else(Uuid::new_v4);
-    let cursor = cursor
-        .map(|v| vault.open::<Value>(&v, &cursor_context(owner, source)))
-        .transpose()?;
-    let policy = serde_json::from_value(policy)
-        .map_err(|_| Error::Invalid("Invalid stored policy".into()))?;
-    sqlx::query("UPDATE noo_integration_sync SET lease=$2,lease_until=now()+interval '5 minutes',imported=CASE WHEN generation IS NULL THEN 0 ELSE imported END,skipped=CASE WHEN generation IS NULL THEN 0 ELSE skipped END,generation=$3,status='syncing' WHERE source_id=$1")
-        .bind(source).bind(lease).bind(generation).execute(&mut *tx).await?;
-    tx.commit().await?;
-    Ok(Some(Job {
-        source,
-        owner,
-        account,
-        policy,
-        generation,
-        lease,
-        cursor,
-    }))
+    // Bound work per poll, committing poisoned rows individually so a bad
+    // owner's storage never holds locks or stalls healthy users behind it.
+    for _ in 0..32 {
+        let mut tx = db.begin().await?;
+        let row: Option<(Uuid, Uuid, Uuid, Value, Option<Uuid>, Option<Value>)> = sqlx::query_as(
+            "SELECT j.source_id,j.owner_uuid,s.account_id,s.policy,j.generation,j.cursor_sealed FROM noo_integration_sync j JOIN noo_connection_sources s ON s.id=j.source_id AND s.owner_uuid=j.owner_uuid JOIN noo_connected_accounts a ON a.id=s.account_id AND a.owner_uuid=s.owner_uuid JOIN noo_users u ON u.user_uuid=j.owner_uuid WHERE s.sync_enabled AND a.status='connected' AND NOT u.disabled AND j.next_run<=now() AND (j.lease IS NULL OR j.lease_until<now()) AND j.status<>'error' ORDER BY j.next_run FOR UPDATE OF j SKIP LOCKED LIMIT 1")
+            .fetch_optional(&mut *tx).await?;
+        let Some((source, owner, account, policy, generation, cursor)) = row else {
+            return Ok(None);
+        };
+        let lease = Uuid::new_v4();
+        let generation = generation.unwrap_or_else(Uuid::new_v4);
+        let cursor = cursor
+            .map(|v| vault.open::<Value>(&v, &cursor_context(owner, source)))
+            .transpose();
+        let policy = serde_json::from_value::<crate::connections::SourcePolicy>(policy)
+            .ok().filter(|p| p.validate_for_sync().is_ok());
+        let (Ok(cursor), Some(policy)) = (cursor, policy) else {
+            sqlx::query("UPDATE noo_integration_sync SET status='error',fault='storage',lease=NULL,lease_until=NULL,attempts=attempts+1 WHERE source_id=$1 AND owner_uuid=$2")
+                .bind(source).bind(owner).execute(&mut *tx).await?;
+            tx.commit().await?;
+            continue;
+        };
+        sqlx::query("UPDATE noo_integration_sync SET lease=$2,lease_until=now()+interval '5 minutes',imported=CASE WHEN generation IS NULL THEN 0 ELSE imported END,skipped=CASE WHEN generation IS NULL THEN 0 ELSE skipped END,generation=$3,status='syncing' WHERE source_id=$1")
+            .bind(source).bind(lease).bind(generation).execute(&mut *tx).await?;
+        tx.commit().await?;
+        return Ok(Some(Job {
+            source,
+            owner,
+            account,
+            policy,
+            generation,
+            lease,
+            cursor,
+        }));
+    }
+    Ok(None)
 }
 
 /// Commit one provider page atomically with its cursor. A retry replaces only
@@ -198,6 +209,8 @@ pub async fn fail(db: &PgPool, job: &Job, error: &Error) -> Result<(), Error> {
 /// No role or caller-supplied owner override exists, including for admins.
 pub fn requester_account(principal: &crate::bus_principal::Principal) -> Option<&str> {
     if principal.kind != crate::bus_principal::Kind::User
+        || principal.act.is_some()
+        || principal.harness.is_some()
         || principal.scopes.iter().any(|s| s == "kb:shared-room")
         || crate::coordinator::in_shared_room()
         || crate::mcp_bridge::current_conversation().is_some()
@@ -235,8 +248,12 @@ pub async fn search(
         .bind(owner).fetch_all(db).await?;
     let truncated = rows.len() > 1000;
     let mut hits = Vec::new();
+    let mut unavailable = false;
     for (id, source, item, sealed) in rows.into_iter().take(1000) {
-        let doc: Document = vault.open(&sealed, &context(owner, source, &item))?;
+        let doc: Document = match vault.open(&sealed, &context(owner, source, &item)) {
+            Ok(doc) => doc,
+            Err(_) => { unavailable = true; continue; }
+        };
         let lower = format!("{}\n{}", doc.title, doc.text).to_lowercase();
         let score = terms.iter().filter(|t| lower.contains(t.as_str())).count();
         if score > 0 {
@@ -257,7 +274,7 @@ pub async fn search(
     }
     hits.sort_by_key(|a| std::cmp::Reverse(a.0));
     Ok(
-        json!({"items":hits.into_iter().take(limit.min(20)).map(|(_,v)|v).collect::<Vec<_>>(),"truncated":truncated}),
+        json!({"items":hits.into_iter().take(limit.min(20)).map(|(_,v)|v).collect::<Vec<_>>(),"truncated":truncated,"unavailable":unavailable}),
     )
 }
 
