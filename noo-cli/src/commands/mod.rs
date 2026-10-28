@@ -436,7 +436,7 @@ pub use release_sign::*;
 pub use addon_lock_cmd::{security_addon_lock_sign, security_addon_lock_verify};
 pub use addon_pins::{addons_launch_pins, addons_upgrade, addons_verify};
 pub use addon_resources::{addons_launch_resources, addons_rotate_secret};
-pub use addons::{addons_disable, addons_enable, addons_list, addons_set, addons_show, addons_trust_key, addons_untrust_key};
+pub use addons::{addons_check, addons_disable, addons_enable, addons_list, addons_set, addons_show, addons_trust_key, addons_untrust_key};
 pub use backups::{backups_setup, backups_status};
 pub use kiosk::*;
 pub use at_rest::{security_at_rest_opt_in, security_at_rest_opt_out, security_at_rest_status};

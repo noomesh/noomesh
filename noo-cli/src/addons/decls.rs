@@ -44,6 +44,9 @@ pub const WORKLOADS_FILE: &str = "workloads.json";
 pub const ROUTES_FILE: &str = "routes.json";
 /// The declaration files the launcher copies for the gateway.
 pub const DECL_FILES: &[&str] = &[SYSTEM_FILE, WORKLOADS_FILE, ROUTES_FILE];
+/// The bundle files the checks read: the declarations, `resources.json` and
+/// the overlay. [`materialised`] and `noo addons check` read the same names.
+pub const CHECKED_FILES: &[&str] = &[SYSTEM_FILE, WORKLOADS_FILE, ROUTES_FILE, super::resources::RESOURCES_FILE, "docker-compose.yml"];
 
 pub const MAX_FILE_BYTES: usize = 64 * 1024;
 pub const MAX_WORKLOADS: usize = 16;
@@ -276,10 +279,7 @@ pub fn check_bundle(addon: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<De
 /// `noo addons enable|upgrade`, verified against the signed lock then).
 /// Absent files declare nothing; an invalid one is an error.
 pub fn materialised(root: &Path, addon: &str) -> Result<Declared, String> {
-    let names: Vec<String> = [SYSTEM_FILE, WORKLOADS_FILE, ROUTES_FILE, super::resources::RESOURCES_FILE, "docker-compose.yml"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let names: Vec<String> = CHECKED_FILES.iter().map(|s| s.to_string()).collect();
     let files = super::pins::materialised_files(root, addon, names.iter());
     check_bundle(addon, &files)
 }
