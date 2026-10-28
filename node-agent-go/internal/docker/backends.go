@@ -110,24 +110,18 @@ case "$VLLM_MODEL" in
 esac
 
 # Build args
-ARGS="--model $VLLM_MODEL $QUANT_ARG --gpu-memory-utilization $GPU_MEMORY_UTILIZATION --max-model-len $VLLM_MAX_MODEL_LEN --tensor-parallel-size $TENSOR_PARALLEL_SIZE $MAX_SEQS_ARG --enable-auto-tool-choice --tool-call-parser $VLLM_TOOL_PARSER --host 0.0.0.0 --port 8000"
+ARGS="--model $VLLM_MODEL $QUANT_ARG --gpu-memory-utilization $GPU_MEMORY_UTILIZATION --max-model-len $VLLM_MAX_MODEL_LEN --tensor-parallel-size $TENSOR_PARALLEL_SIZE $MAX_SEQS_ARG --enable-auto-tool-choice --tool-call-parser $VLLM_TOOL_PARSER --host 127.0.0.1 --port 8000"
 if [ -n "$VLLM_REASONING_PARSER" ]; then
   ARGS="$ARGS --reasoning-parser $VLLM_REASONING_PARSER"
 fi
-# TLS is not a switch. The listener presents the vllm service leaf, verifies
-# every caller against the cluster CA and REQUIRES a client certificate
-# (--ssl-cert-reqs 2 = ssl.CERT_REQUIRED): the agent's inference proxy, job
-# executor and GPU probe present the node leaf. Until 2026-09-29 this ran only
-# under NOO_VLLM_TLS and even then asked for no client cert, so any container
-# on the bridge could read every prompt. No leaf = no listener: refuse to
-# start rather than serve plaintext (exit 78 = EX_CONFIG). The agent checks
-# the leaf BEFORE creating this container (backendDoorCheck), so this arm is
-# the second line, not the first.
-if [ ! -f /app/pki/services/vllm/service.crt ] || [ ! -f /app/pki/services/vllm/service.key ]; then
-  echo "vllm: no services/vllm leaf under NOO_PKI_DIR — refusing to serve plaintext" >&2
-  exit 78
-fi
-ARGS="$ARGS --ssl-certfile /app/pki/services/vllm/service.crt --ssl-keyfile /app/pki/services/vllm/service.key --ssl-ca-certs /app/pki/ca.crt --ssl-cert-reqs 2"
+# Plain on 127.0.0.1 ON PURPOSE: this container runs inside its door's
+# network namespace (noo-stunnel-vllm, door generation 5), and the door is
+# the only thing that reaches loopback there. The door presents the vllm
+# leaf, requires a cluster-CA client certificate and admits named callers
+# only (sidecar.go). Until generation 5 vLLM served TLS itself, which
+# admitted ANY cluster-CA leaf: it has no checkHost. (Do not name its
+# client-cert flag in this script: the agent reads that flag off a running
+# command as "this vLLM is its own door", commandDeclaresClientCert.)
 
 # Resilient launch: retry with lower max-num-seqs on failure
 echo "Starting vLLM: $ARGS"
@@ -286,27 +280,16 @@ var backendSpecs = map[string]BackendSpec{
 		},
 		Volumes: []VolumeMount{
 			{Source: hfCacheSource, Target: HFCacheTarget},
-			// Exactly what the entrypoint serves with: --ssl-ca-certs
-			// /app/pki/ca.crt and the vllm leaf. Optional so that a missing
-			// source is reported by buildMounts rather than failing the
-			// bind inside Docker — and then REFUSED by backendDoorCheck
-			// before the running container is touched: a provisioned node
-			// holds ca.crt + node.{crt,key} only (its bundle carries no
-			// services/ tree), and without the leaf vllm is never started,
-			// plain or otherwise.
-			{Source: pkiCACertSource, Target: pkiCACertTarget, ReadOnly: true, Optional: true},
-			{Source: pkiServiceLeafSource("vllm"), Target: pkiServiceLeafTarget("vllm"), ReadOnly: true, Optional: true},
+			// No PKI: the engine serves plain inside its door's namespace,
+			// and the door (noo-stunnel-vllm) holds the vllm leaf.
 		},
 		GPUCount:   "${GPU_COUNT:-1}",
 		Network:    "noo-cluster",
 		Entrypoint: []string{"sh", "-c"},
 		Command:    []string{vllmEntrypointScript},
-		// Self-check with the container's OWN leaf: the listener requires
-		// a client certificate and this image carries python3, not curl.
-		// Presenting the service's cert to itself proves the mTLS listener
-		// is up; it grants nothing (the container already holds that key).
-		// `localhost` is in every service leaf's SANs. Same probe as the
-		// compose vllm service.
+		// The plain listener on loopback (the image carries python3, not
+		// curl). Loopback is the door's namespace, which this container
+		// shares, so the probe reaches the engine and nothing else does.
 		HealthcheckCmd: vllmHealthcheckCmd,
 	},
 	"llamacpp": {
@@ -1069,11 +1052,12 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 		}
 	}
 
-	// vLLM is its own door (--ssl-cert-reqs 2): on macOS publish that
-	// listener on host loopback so the host-mode dialer can reach it
-	// (LoopbackDoorPublish). A sidecar-fronted backend's raw port is never
-	// published — its door is the sidecar's (startSidecar), and a container
-	// in another's namespace cannot publish anyway.
+	// A backend that is its own door (none the agent starts today; vLLM
+	// was until door generation 5): on macOS publish that listener on host
+	// loopback so the host-mode dialer can reach it (LoopbackDoorPublish).
+	// A sidecar-fronted backend's raw port is never published — its door is
+	// the sidecar's (startSidecar), and a container in another's namespace
+	// cannot publish anyway.
 	if door, ok := backendDoors[backend]; ok && door.Sidecar == "" && LoopbackDoorPublish() {
 		applyLoopbackDoor(containerCfg, hostCfg, door.Port)
 	}
@@ -1579,10 +1563,7 @@ func backendDoorCheck(backend string, mounts []mount.Mount) error {
 		return nil
 	}
 	svc := doorLeafService(backend)
-	dialHost := "noo-" + backend
-	if door.Sidecar != "" {
-		dialHost = StunnelContainerPrefix + door.Sidecar
-	}
+	dialHost := doorDialHost(backend)
 	fix := "re-run `noo cluster provision <this node>` on the controller (or `noo upgrade --nodes`): " +
 		"the provision bundle carries this node's backend door leaves (svc-" + svc + ".crt/.key, SAN " +
 		dialHost + ") and noo-apply installs them under $NOO_PKI_DIR/services/" + svc + "/"
@@ -1613,7 +1594,7 @@ func backendDoorCheck(backend string, mounts []mount.Mount) error {
 		}
 	}
 	if door.Sidecar == "" {
-		// vLLM reads the leaf from its own mounts; the mount must be there.
+		// A native door reads the leaf from its own mounts; the mount must be there.
 		seen := 0
 		for _, m := range mounts {
 			if m.Target == pkiServiceLeafTarget(svc) || m.Target == pkiCACertTarget {
@@ -1621,7 +1602,7 @@ func backendDoorCheck(backend string, mounts []mount.Mount) error {
 			}
 		}
 		if seen != 2 {
-			return refuse("the vllm leaf or the cluster CA is not among the container's mounts " +
+			return refuse("the " + svc + " leaf or the cluster CA is not among the container's mounts " +
 				"(buildMounts skipped it — see backend.mount_skipped above); the listener would " +
 				"refuse to start (exit 78). Fix: " + fix)
 		}
@@ -1659,10 +1640,9 @@ func leafDNSNames(path string) ([]string, error) {
 	return cert.DNSNames, nil
 }
 
-// vllmHealthcheckCmd probes vLLM's mTLS listener with the container's own
-// leaf (CMD-SHELL; python3 because the vllm image carries no curl). Mirrors
-// the compose vllm service's healthcheck byte for byte in intent.
-const vllmHealthcheckCmd = `python3 -c "import ssl,urllib.request; ctx=ssl.create_default_context(cafile='/app/pki/ca.crt'); ctx.load_cert_chain('/app/pki/services/vllm/service.crt','/app/pki/services/vllm/service.key'); urllib.request.urlopen('https://localhost:8000/health',context=ctx,timeout=5)" || exit 1`
+// vllmHealthcheckCmd probes vLLM's plain loopback listener (CMD-SHELL;
+// python3 because the vllm image carries no curl).
+const vllmHealthcheckCmd = `python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=5)" || exit 1`
 
 // ensureNetwork creates a Docker bridge network if it doesn't already exist.
 // Worker nodes don't have docker-compose creating networks, so the agent does it.

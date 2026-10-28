@@ -21,8 +21,8 @@ import (
 )
 
 // The stunnel sidecar: the client-certificate door for every agent-started
-// backend that cannot terminate TLS itself (llama.cpp, ollama, TEI, the
-// reranker). One shape, reused per backend, the same shape the compose
+// backend (llama.cpp, ollama, TEI, the reranker, and vLLM since door
+// generation 5 — its own TLS listener could not pin callers by name). One shape, reused per backend, the same shape the compose
 // stack runs on the controller (docker/Dockerfile.stunnel +
 // docker/stunnel-<x>.conf, `verify = 2`): the sidecar presents the
 // backend's service leaf, verifies every caller against the cluster CA,
@@ -34,7 +34,7 @@ import (
 // (privateDoorEnv); the sidecar accepts on its own bridge address (its
 // hostname) and connects to 127.0.0.1. No other container on the bridge
 // and no host process can reach the plain port: the sidecar is the only
-// door, as vLLM's own TLS listener is. Until generation 3 the backend sat
+// door. Until generation 3 the backend sat
 // on the bridge beside its sidecar and any peer could dial it plain.
 //
 // One namespace has one owner. The sidecar owns it, because stunnel is
@@ -64,7 +64,10 @@ import (
 //	   node's own agent leaf + the controller's service callers), not any
 //	   cluster-CA leaf (i301, internal#300). No node ran 3 (dev only), so a
 //	   0.6.13 node still recreates each fronted backend once.
-const BackendDoorGeneration = 4
+//	5  2026-10-28: vLLM behind noo-stunnel-vllm too (alias noo-vllm, so the
+//	   URL and the leaf are unchanged), plain on 127.0.0.1 inside it: its own
+//	   listener admitted any cluster-CA leaf. No node ran 4 either.
+const BackendDoorGeneration = 5
 
 // doorCallers are the leaf names a backend door admits besides this node's
 // own agent: the same list as the compose doors (docker/stunnel-<x>.conf,
@@ -255,7 +258,8 @@ func sidecarConnectPort(backend string, spec BackendSpec, envOverrides map[strin
 }
 
 // startSidecar creates and starts noo-stunnel-<svc> for a backend, on the
-// backend's network, BEFORE the backend (which joins its namespace), with the same privilege floor as the backends
+// backend's network (under the door's Alias too, when it has one), BEFORE
+// the backend (which joins its namespace), with the same privilege floor as the backends
 // (no-new-privileges, CapDrop ALL) plus what stunnel-as-root actually
 // needs: DAC_OVERRIDE to read the 0600 leaf key on the bind mount, and
 // NET_BIND_SERVICE only for a door below 1024 (the TEI/reranker doors on
@@ -314,7 +318,14 @@ func (c *Client) startSidecar(ctx context.Context, backend, image, networkName s
 	}
 	netCfg := &network.NetworkingConfig{}
 	if networkName != "" {
-		netCfg.EndpointsConfig = map[string]*network.EndpointSettings{networkName: {}}
+		ep := &network.EndpointSettings{}
+		// The name callers already dial (vLLM: noo-vllm). The engine of
+		// that name joins no network, so docker DNS answers the alias with
+		// the door's address and nothing else.
+		if door.Alias != "" {
+			ep.Aliases = []string{door.Alias}
+		}
+		netCfg.EndpointsConfig = map[string]*network.EndpointSettings{networkName: ep}
 	}
 	resp, err := c.docker.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Config: cfg, HostConfig: hostCfg, NetworkingConfig: netCfg, Name: name,
@@ -325,7 +336,7 @@ func (c *Client) startSidecar(ctx context.Context, backend, image, networkName s
 	if _, err := c.docker.ContainerStart(ctx, resp.ID, client.ContainerStartOptions{}); err != nil {
 		return fmt.Errorf("start %s: %w", name, err)
 	}
-	slog.Info("backend door started", "backend", backend, "sidecar", name, "image", image,
+	slog.Info("backend door started", "backend", backend, "sidecar", name, "image", image, "dial", doorDialHost(backend),
 		"accept", fmt.Sprintf("%s:%d", name, door.Port), "connect", fmt.Sprintf("%s:%d", doorLoopback, connectPort))
 	return nil
 }

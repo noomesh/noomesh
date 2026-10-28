@@ -98,21 +98,29 @@ const StunnelLlamacppContainer = "noo-stunnel-llamacpp"
 // either.
 const StunnelContainerPrefix = "noo-stunnel-"
 
-// VLLMClientCertFlag is what every vLLM in the cluster runs with
+// VLLMClientCertFlag is what a vLLM serving its own door runs with
 // (`--ssl-cert-reqs 2`, ssl.CERT_REQUIRED): the listener is TLS and refuses
 // a caller without a cluster-CA client certificate. Its presence in a
 // container's command is the container declaring "dial me over TLS, with
-// your leaf"; a vLLM created before 2026-09-29 by an older agent lacks it
-// and is dialled plain until the reconciler recreates it (backends.go
-// backendDoorGeneration).
+// your leaf". The compose stack's vLLMs still do; an agent-started vLLM
+// does from door generation 2 to 4 and sits behind noo-stunnel-vllm from
+// generation 5 (sidecar.go). One created before 2026-09-29 lacks both and
+// is dialled plain until the reconciler recreates it.
 const VLLMClientCertFlag = "--ssl-cert-reqs"
 
 // backendDoor is how a caller reaches one backend on the docker bridge.
 type backendDoor struct {
-	// Sidecar is the stunnel service name (`noo-stunnel-<Sidecar>`) when
-	// the backend cannot terminate TLS itself; "" when it serves natively
-	// (vLLM) or, for airllm, serves plaintext by named exception.
+	// Sidecar is the stunnel service name (`noo-stunnel-<Sidecar>`) and the
+	// service leaf the door serves with; "" when the backend serves TLS
+	// natively (the compose stack's vllm-secondary until its own door) or,
+	// for airllm, plaintext by named exception.
 	Sidecar string
+	// Alias is the name callers dial the door by when it is not the
+	// sidecar's own: the sidecar joins the bridge under it. vLLM's door
+	// keeps `https://noo-vllm:8000` — the name its leaf carries on every
+	// node and every caller already dials — so the door moved in front of
+	// the engine with no leaf reissued and no URL changed.
+	Alias string
 	// Port the door listens on. For a sidecar it is the port compose's
 	// stunnel-<x>.conf accepts on, so the same URL reaches a compose door
 	// and an agent-run one.
@@ -129,7 +137,7 @@ type backendDoor struct {
 // tests/test_node_backends_require_client_certs.py. A backend absent here
 // is dialled plain on BackendPorts (airllm; nothing else).
 var backendDoors = map[string]backendDoor{
-	"vllm":           {Port: 8000, PlainPort: 8000},
+	"vllm":           {Sidecar: "vllm", Alias: "noo-vllm", Port: 8000, PlainPort: 8000},
 	"vllm-secondary": {Port: 8000, PlainPort: 8000},
 	"llamacpp":       {Sidecar: "llamacpp", Port: 8085, PlainPort: 8085},
 	"ollama":         {Sidecar: "ollama", Port: 11434, PlainPort: 11434},
@@ -154,6 +162,20 @@ func SidecarContainerFor(backend string) string {
 
 // DoorPort returns the port a backend's door listens on (0 = no door).
 func DoorPort(backend string) int { return backendDoors[backend].Port }
+
+// doorDialHost is the name a caller dials a backend's door by, and so the
+// name its leaf must carry: the door's alias, else its sidecar's container
+// name, else the backend's own (a native listener).
+func doorDialHost(backend string) string {
+	door := backendDoors[backend]
+	switch {
+	case door.Alias != "":
+		return door.Alias
+	case door.Sidecar != "":
+		return StunnelContainerPrefix + door.Sidecar
+	}
+	return "noo-" + backend
+}
 
 // sidecarBackend maps a running sidecar container name back to the backend
 // key it fronts ("" for a name that is not a known sidecar). The compose
@@ -432,7 +454,7 @@ func backendDialURL(backend string, d *declaredTLS) string {
 	if d != nil {
 		switch {
 		case d.sidecars[backend]:
-			return fmt.Sprintf("https://%s%s:%d", StunnelContainerPrefix, door.Sidecar, door.Port)
+			return fmt.Sprintf("https://%s:%d", doorDialHost(backend), door.Port)
 		case d.tls[backend]:
 			return fmt.Sprintf("https://noo-%s:%d", backend, door.Port)
 		case d.known[backend]:
@@ -444,10 +466,7 @@ func backendDialURL(backend string, d *declaredTLS) string {
 			return fmt.Sprintf("http://%s:%d", name, door.PlainPort)
 		}
 	}
-	if door.Sidecar != "" {
-		return fmt.Sprintf("https://%s%s:%d", StunnelContainerPrefix, door.Sidecar, door.Port)
-	}
-	return fmt.Sprintf("https://noo-%s:%d", backend, door.Port)
+	return fmt.Sprintf("https://%s:%d", doorDialHost(backend), door.Port)
 }
 
 // ProfileMap maps backend names to docker-compose profiles.

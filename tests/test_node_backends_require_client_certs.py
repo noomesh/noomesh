@@ -14,11 +14,13 @@ and llama.cpp / ollama / TEI / the reranker served plaintext on the bridge.
 
 What this pins, from the Go source (`node-agent-go/internal/docker/`):
 
-  1. the agent-started vLLM script passes `--ssl-cert-reqs 2`, has no
-     `NOO_VLLM_TLS` switch, and exits rather than serving plain;
-  2. every other backend compose fronts is in the agent's door table
+  1. the agent-started vLLM serves plain on 127.0.0.1 only, inside its
+     door's namespace (door generation 5): no TLS of its own, no
+     `NOO_VLLM_TLS` switch, no PKI mounted;
+  2. every backend compose fronts is in the agent's door table
      (`backendDoors`) WITH a sidecar, the sidecar conf template says
-     `verify = 2`, and the door ports match compose's accept ports;
+     `verify = 2`, and the door ports match compose's (vLLM's: the port its
+     compose listener serves on, under the name noo-vllm);
   3. the node set equals the compose set (mapped by service name) minus
      the same named plaintext exceptions — a backend added to one side is
      caught on the other;
@@ -108,17 +110,17 @@ def _compose_node_set() -> set[str]:
     return out
 
 
-def test_the_agent_started_vllm_requires_a_client_certificate():
+def test_the_agent_started_vllm_serves_only_inside_its_door():
     script = _go_script("vllmEntrypointScript", BACKENDS_GO.read_text())
-    assert "--ssl-cert-reqs 2" in script, "the node vLLM listener admits a caller with no client certificate"
-    assert "NOO_VLLM_TLS" not in script, "the node vLLM gates TLS on NOO_VLLM_TLS — the listener must have no plaintext switch"
-    assert "--ssl-certfile /app/pki/services/vllm/service.crt" in script
-    assert re.search(r"exit 78", script), "a missing leaf must exit, not serve plain"
+    assert "--host 127.0.0.1 --port 8000" in script and "0.0.0.0" not in script, "the node vLLM must bind loopback only: its door connects there"
+    assert "--ssl-" not in script, "the node vLLM serves TLS again; its door holds the leaf"
+    assert "NOO_VLLM_TLS" not in script
     spec = re.search(r'"vllm": \{(.*?)\n\t\},', BACKENDS_GO.read_text(), re.S).group(1)
     assert '"NOO_VLLM_TLS"' not in spec, "the vllm spec still passes NOO_VLLM_TLS into the container"
+    assert "pkiServiceLeafSource" not in spec and "pkiCACertSource" not in spec, "the engine holds no leaf; its door does"
     assert "HealthcheckCmd: vllmHealthcheckCmd" in spec
     hc = re.search(r"const vllmHealthcheckCmd = `(.*?)`", BACKENDS_GO.read_text(), re.S).group(1)
-    assert "load_cert_chain('/app/pki/services/vllm/service.crt'" in hc, "the healthcheck must present the container's own leaf"
+    assert "http://127.0.0.1:8000/health" in hc, "the healthcheck probes the plain loopback listener"
 
 
 def test_every_fronted_backend_has_a_sidecar_door_with_verify_2():
@@ -127,15 +129,21 @@ def test_every_fronted_backend_has_a_sidecar_door_with_verify_2():
     assert re.search(r"^verify = 2$", conf, re.M), "the sidecar conf template does not set verify = 2"
     assert "CAfile = /tls/ca.crt" in conf and "cert = /tls/services/%s/service.crt" in conf
     fronted = {k: v for k, v in doors.items() if v["sidecar"]}
-    assert set(fronted) == {"llamacpp", "ollama", "embedding", "reranker"}, fronted
+    assert set(fronted) == {"vllm", "llamacpp", "ollama", "embedding", "reranker"}, fronted
     # Door ports are compose's stunnel accept ports, so one URL reaches either.
     for key, d in fronted.items():
         svc = d["sidecar"]
+        if key == "vllm":
+            # Dialled as noo-vllm (the door's alias): compose's vLLM serves
+            # its own listener on that name and port.
+            assert 'Alias: "noo-vllm"' in CLIENT_GO.read_text()
+            continue
         c = (ROOT / "docker" / f"stunnel-{svc}.conf").read_text()
         accept = re.search(r"^\s*accept\s*=\s*[\w.-]+:(\d+)", c, re.M)
         assert accept, f"docker/stunnel-{svc}.conf has no accept line"
         assert int(accept.group(1)) == d["port"], f"{key}: node door port {d['port']} != compose stunnel-{svc} accept {accept.group(1)}"
-    assert doors["vllm"]["sidecar"] == "" and doors["vllm"]["port"] == 8000
+    assert doors["vllm"]["sidecar"] == "vllm" and doors["vllm"]["port"] == 8000
+    assert doors["vllm-secondary"]["sidecar"] == "", "vllm-secondary is compose-only and still its own door"
 
 
 def test_the_node_door_set_is_the_compose_door_set():
