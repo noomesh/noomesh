@@ -884,6 +884,34 @@ func TestBootRestoreWritesFilesThenStartsOnlyBoundContainers(t *testing.T) {
 	}
 }
 
+// i301 a: the script's own account of what is still down must reach the log.
+// A success with a warning on stderr logs both; exit 4 (done, but a core
+// service is still down) logs a WARN and is not retried.
+func TestBootRestoreLogsWhatIsStillDown(t *testing.T) {
+	const down = "boot-restore: started 8; still down: noo-nats (exited 0 15:08)"
+	var logs []string
+	e, fr := testEngine(t)
+	e.Logf = func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
+	fr.stderr = map[string]string{"bash -c": down}
+	e.BootRestore(context.Background())
+	if got := strings.Join(logs, "\n"); !strings.Contains(got, "boot-restore: done") || !strings.Contains(got, down) {
+		t.Fatalf("the success log lacks the still-down line: %v", logs)
+	}
+
+	logs = nil
+	e, fr = testEngine(t)
+	e.Logf = func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
+	fr.rc = map[string]int{"bash -c": 4}
+	e.BootRestore(context.Background())
+	got := strings.Join(logs, "\n")
+	if !strings.Contains(got, "BOOT-RESTORE WARN") || !strings.Contains(got, "boom: bash -c") {
+		t.Fatalf("exit 4 must log a WARN carrying the script's line: %v", logs)
+	}
+	if len(fr.calls) != 1 {
+		t.Fatalf("exit 4 must not be retried (the files now exist): %d runs", len(fr.calls))
+	}
+}
+
 // i10a: when the state lives on the encrypted volume and it did not open at
 // boot, the restore refuses before writing secrets or starting anything.
 func TestBootRestoreChecksTheStateVolumeBeforeStarting(t *testing.T) {
