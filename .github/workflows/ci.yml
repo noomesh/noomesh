@@ -1350,7 +1350,7 @@ jobs:
               | sed -n 's|.*Executable unittests src/main.rs (\(.*\))|\1|p')"
         [ -n "$unit_tests" ] && [ -x "$unit_tests" ] || { echo "::error::could not locate upgrade test binary"; exit 1; }
         upgrade_test=commands::upgrade::integration_key_tests::integration_upgrade_key_round_trips_without_rotation_or_plaintext
-        "$unit_tests" --list | rg "^${upgrade_test}: test$"
+        "$unit_tests" --list | grep -Fx -- "${upgrade_test}: test"
         NOO_REQUIRE_SOPS=1 "$unit_tests" "$upgrade_test" --exact --test-threads=1
 
     - name: Build release binary
