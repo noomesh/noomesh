@@ -50,6 +50,18 @@
 noo_created_guard() {
     local wait_secs="${NOO_CREATED_GUARD_WAIT:-18}"
     local ids=("$@")
+    # A service the `up` held by name (lib-stuck-container.sh: stuck, or the
+    # GPU did not answer) is left as it is: starting it again is the very
+    # failure that held it.
+    if [ -n "${NOO_ISOLATED_SERVICES:-}" ]; then
+        local kept=() _id _svc
+        for _id in "${ids[@]}"; do
+            _svc=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.service" }}' "$_id" 2>/dev/null)
+            case " $NOO_ISOLATED_SERVICES " in *" $_svc "*) [ -n "$_svc" ] && continue ;; esac
+            kept+=("$_id")
+        done
+        ids=(${kept[@]+"${kept[@]}"})
+    fi
     [ ${#ids[@]} -eq 0 ] && return 0
 
     local deadline=$((SECONDS + wait_secs))

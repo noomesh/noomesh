@@ -1763,9 +1763,11 @@ services:
     # its own, listening on 127.0.0.1, reachable only through stunnel-ollama-embed-cpu.
     network_mode: "service:stunnel-ollama-embed-cpu"
     restart: unless-stopped
+    # NOT on ollama-embed (i277e): this is the embedder that stays up when
+    # the GPU one cannot start (a GPU fault holds ollama-embed by name, see
+    # scripts/lib-stuck-container.sh), so it must not wait on it.
     depends_on:
       - stunnel-ollama-embed-cpu
-      - ollama-embed
 
   # mTLS door for ollama-embed-cpu: the same shape as stunnel-ollama-embed
   # below, with its own leaf (`ollama-embed-cpu`, issued by `noo upgrade
