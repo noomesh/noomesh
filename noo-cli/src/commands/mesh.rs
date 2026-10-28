@@ -586,9 +586,9 @@ pub fn mesh_start(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 ///
 /// NOTE: Python's `stop -v` means --volumes, but the Rust front door consumes
 /// a bare `-v` as the global --verbose flag before handlers run. To avoid
-/// silently dropping a volume-removal request we fall through to Python
-/// whenever a literal `-v` was on the command line — Python's semantics are
-/// the reference.
+/// silently dropping a volume-removal request we refuse a literal `-v` on the
+/// command line with a usage error (use `--volumes`); the old Python
+/// semantics were the reference.
 pub fn mesh_stop(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     refuse_short_v(g, "stop");
     let (mut volumes, mut yes) = (false, false);
@@ -607,8 +607,8 @@ pub fn mesh_stop(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 }
 
 /// The front door eats a bare `-v` as the global `--verbose`, so a handler
-/// cannot tell `stack stop -v` (Python's `--volumes`) from verbose. Falling
-/// through to Python would delete volumes with no confirmation, so a `-v`
+/// cannot tell `stack stop -v` (Python's `--volumes`) from verbose. Treating
+/// it as verbose would silently drop the volume removal, so a `-v`
 /// AFTER the verb is refused here: use `--volumes`.
 fn short_v_after(argv: &[String], verb: &str) -> bool {
     argv.iter().position(|a| a == verb).is_some_and(|i| argv[i + 1..].iter().any(|a| a == "-v"))
@@ -722,8 +722,8 @@ fn confirm_stop_volumes(g: &Globals, yes: bool) {
 ///
 /// NOTE: Python's `-v` short flag means --volumes here but the front door
 /// consumes a bare `-v` as the global --verbose before handlers run — a
-/// literal `-v` on the command line falls through to Python (same pattern
-/// as `stack stop`). The `--volumes` long form is native.
+/// literal `-v` on the command line is refused with a usage error (same
+/// pattern as `stack stop`). The `--volumes` long form is native.
 pub fn mesh_clean(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     refuse_short_v(g, "clean");
     let (mut volumes, mut images, mut all, mut deep) = (false, false, false, false);
@@ -1133,9 +1133,9 @@ pub fn mesh_reset(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 /// NOTE: bare tokens that collide with our global flags (`-v`, `--verbose`,
 /// `--json`, `--gateway`/`-G`, `--timeout`) are consumed by the front door
 /// before handlers run and could be MEANT for ollama (`ollama show -v`), so
-/// their presence anywhere on the raw command line falls through to Python
-/// (same pattern as `stack stop`). Other dash tokens fall through too —
-/// Python's typer surface owns the error message for unknown options.
+/// their presence anywhere on the raw command line is a usage error (same
+/// pattern as `stack stop`). Other dash tokens are refused too — there is no
+/// Python typer surface behind them any more.
 pub fn mesh_ollama(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     const GLOBALS: &[&str] = &["-v", "--verbose", "--json", "--gateway", "-G", "--timeout"];
     if std::env::args().any(|a| GLOBALS.contains(&a.as_str())) {

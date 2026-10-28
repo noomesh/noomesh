@@ -102,10 +102,7 @@ func TestMiddleware_ValidHMACToken(t *testing.T) {
 		w.WriteHeader(200)
 	}))
 
-	token := CreateClusterToken("node-1", secret)
-
-	req := httptest.NewRequest("GET", "/start", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
+	req := v2TestReq(t, "GET", "/start", "node-1", secret)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
@@ -159,9 +156,7 @@ func TestMiddleware_StaticTokenFallsThruToHMAC(t *testing.T) {
 	}))
 
 	// Use HMAC token (not the static one) — should still work via fallthrough
-	token := CreateClusterToken("node-2", secret)
-	req := httptest.NewRequest("GET", "/start", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
+	req := v2TestReq(t, "GET", "/start", "node-2", secret)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
@@ -177,7 +172,7 @@ func TestCreateClusterToken_Roundtrip(t *testing.T) {
 	secret := "test-secret-key"
 	nodeID := "gpu-worker-1"
 
-	token := CreateClusterToken(nodeID, secret)
+	token := mintToken(nodeID, secret, time.Now().Unix(), false)
 	valid, parsedNode := verifyClusterToken(token, secret)
 
 	if !valid {
@@ -189,7 +184,7 @@ func TestCreateClusterToken_Roundtrip(t *testing.T) {
 }
 
 func TestVerifyClusterToken_WrongSecret(t *testing.T) {
-	token := CreateClusterToken("node-1", "correct-secret")
+	token := mintToken("node-1", "correct-secret", time.Now().Unix(), false)
 	valid, _ := verifyClusterToken(token, "wrong-secret")
 
 	if valid {
@@ -211,6 +206,19 @@ func TestVerifyClusterToken_MalformedToken(t *testing.T) {
 			t.Errorf("malformed token %q should be invalid", tc)
 		}
 	}
+}
+
+// v2TestReq builds an inbound request carrying a v2 cluster token for actor.
+func v2TestReq(t *testing.T, method, uri, actor, secret string) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(method, "http://node"+uri, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SetClusterAuth(req, actor, secret); err != nil {
+		t.Fatal(err)
+	}
+	return req
 }
 
 // mintToken builds "<actor>:<ts>:<sig>" the way the Rust gateway
@@ -268,8 +276,7 @@ func TestMiddleware_RefusesCLIActors(t *testing.T) {
 	}))
 	for _, actor := range []string{"cli", "cli-break-glass", "cli-onboard", "cli-posture"} {
 		called = false
-		req := httptest.NewRequest("GET", "/gpu", nil)
-		req.Header.Set("Authorization", "Bearer "+CreateClusterToken(actor, secret))
+		req := v2TestReq(t, "GET", "/gpu", actor, secret)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusForbidden || called {
@@ -278,8 +285,7 @@ func TestMiddleware_RefusesCLIActors(t *testing.T) {
 	}
 	for _, actor := range []string{"gateway", "node-1", "client", "clinic"} {
 		called = false
-		req := httptest.NewRequest("GET", "/gpu", nil)
-		req.Header.Set("Authorization", "Bearer "+CreateClusterToken(actor, secret))
+		req := v2TestReq(t, "GET", "/gpu", actor, secret)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		if rec.Code != 200 || !called {

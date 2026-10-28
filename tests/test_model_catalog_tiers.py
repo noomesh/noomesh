@@ -37,32 +37,3 @@ def test_model_class_shrinks_with_weaker_tier():
     assert MC.model_class_for(3) == 3
     assert MC.model_class_for(4) == 3          # edge → smallest class
     assert MC.model_class_for(5) == 3
-
-
-def test_recommend_injects_cached_uncataloged_model(monkeypatch):
-    """A cache-resident GGUF the HF catalog doesn't surface must still appear —
-    ranked first — so `--auto` picks the LAN-preseedable model."""
-    import json as _json
-    from typer.testing import CliRunner
-    from noomesh.cli import app
-    from noomesh.cluster import models_cli
-
-    # Catalog knows only popular Llama GGUFs; host9's local gemma is NOT here.
-    monkeypatch.setattr(
-        models_cli._catalog, "fetch_models",
-        lambda backend, tier=None, limit=20, refresh=False: [
-            {"id": "bartowski/Llama-3.2-1B-Instruct-GGUF", "downloads": 500000},
-        ] if backend == "llamacpp" else [],
-    )
-    # But it's cached on the cluster (running on host9).
-    monkeypatch.setattr(
-        models_cli, "_cached_models",
-        lambda: [{"name": "gemma-4-E2B-it-Q4_K_M.gguf", "backend": "llamacpp", "size": "3 GB"}],
-    )
-
-    r = CliRunner().invoke(app, ["--json", "models", "recommended", "--tier", "4", "--arch", "aarch64"])
-    assert r.exit_code == 0, r.output
-    data = _json.loads(r.stdout.strip())
-    llama = data["backends"]["llamacpp"]
-    assert llama[0]["id"] == "gemma-4-E2B-it-Q4_K_M.gguf", f"cached model not first: {llama}"
-    assert llama[0]["cached"] is True

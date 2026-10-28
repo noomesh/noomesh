@@ -1078,9 +1078,9 @@ mod tests {
     #[test]
     fn the_stack_roll_repairs_the_door_before_launching() {
         let src = include_str!("upgrade.rs");
-        let body = src.split("fn upgrade_stack(").nth(1).expect("upgrade_stack exists");
-        let call = body.find("\n    reconcile_grafana_door(g, &root);").expect("upgrade_stack must call reconcile_grafana_door");
-        let launch = body.find(".arg(root.join(\"scripts/noomesh-start.sh\"))").expect("the launcher");
+        let list = crate::commands::upgrade::phase_src::list();
+        let call = list.find("\n    reconcile_grafana_door(g, &roll.root);").expect("upgrade_stack must call reconcile_grafana_door");
+        let launch = list.find("launch_stack(").expect("the launcher phase");
         assert!(call < launch, "the door must be written before the launcher recreates the stack");
         let f = src.split("fn reconcile_grafana_door(").nth(1).expect("reconcile_grafana_door exists");
         let f = f.split("\n}\n").next().unwrap();

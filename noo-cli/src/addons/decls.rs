@@ -2,7 +2,10 @@
 // Copyright 2026 PersonifAI LLC
 
 //! An add-on bundle's declarations beyond its overlay: `system.json` (its
-//! database system) and `workloads.json` (its managed workloads), i163 E/B.
+//! database system) and `workloads.json` (its managed workloads), i163 E/B,
+//! `routes.json` (its HTTP route manifest, handed to the gateway the same way
+//! since 0.6.13) and `resources.json` (its runtime inputs, `super::resources`,
+//! i239 s10).
 //!
 //! Both are ordinary bundle files: listed by name and sha256 in the signed
 //! `noo-addon-lock/2` bundle, so the bundle signature covers them. This
@@ -33,12 +36,14 @@ use serde_json::Value;
 
 pub const SYSTEM_FILE: &str = "system.json";
 pub const WORKLOADS_FILE: &str = "workloads.json";
-/// A route manifest a bundle may carry beside them (the image delivers the
-/// one the gateway mounts; when the bundle has one, drain routes are checked
-/// against it here too).
+/// A route manifest a bundle may carry beside them. When the signed lock
+/// lists it, the launcher hands it to the gateway like the other two
+/// (`<install root>/.noo-addon-routes/<addon>/routes.json`, which the gateway
+/// reads before any copy an overlay delivers); the gateway validates it.
+/// When the bundle has one, drain routes are checked against it here too.
 pub const ROUTES_FILE: &str = "routes.json";
 /// The declaration files the launcher copies for the gateway.
-pub const DECL_FILES: &[&str] = &[SYSTEM_FILE, WORKLOADS_FILE];
+pub const DECL_FILES: &[&str] = &[SYSTEM_FILE, WORKLOADS_FILE, ROUTES_FILE];
 
 pub const MAX_FILE_BYTES: usize = 64 * 1024;
 pub const MAX_WORKLOADS: usize = 16;
@@ -246,6 +251,8 @@ pub fn parse_workloads(addon: &str, bytes: &[u8], routes_json: Option<&[u8]>) ->
 pub struct Declared {
     pub system: Option<System>,
     pub workloads: Vec<Workload>,
+    /// Its runtime inputs (`resources.json`, `super::resources`).
+    pub resources: Option<super::resources::Resources>,
 }
 
 /// Validate the declarations among a bundle's verified files (name to
@@ -257,14 +264,22 @@ pub fn check_bundle(addon: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<De
         .map(|b| parse_workloads(addon, b, files.get(ROUTES_FILE).map(Vec::as_slice)))
         .transpose()?
         .unwrap_or_default();
-    Ok(Declared { system, workloads })
+    let facts = super::resources::bundle_facts(addon, files);
+    let resources = files
+        .get(super::resources::RESOURCES_FILE)
+        .map(|b| super::resources::parse(addon, b, &facts))
+        .transpose()?;
+    Ok(Declared { system, workloads, resources })
 }
 
 /// The declarations materialised under `<root>/addons/<addon>/` (by
 /// `noo addons enable|upgrade`, verified against the signed lock then).
 /// Absent files declare nothing; an invalid one is an error.
 pub fn materialised(root: &Path, addon: &str) -> Result<Declared, String> {
-    let names: Vec<String> = [SYSTEM_FILE, WORKLOADS_FILE, ROUTES_FILE].iter().map(|s| s.to_string()).collect();
+    let names: Vec<String> = [SYSTEM_FILE, WORKLOADS_FILE, ROUTES_FILE, super::resources::RESOURCES_FILE, "docker-compose.yml"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let files = super::pins::materialised_files(root, addon, names.iter());
     check_bundle(addon, &files)
 }

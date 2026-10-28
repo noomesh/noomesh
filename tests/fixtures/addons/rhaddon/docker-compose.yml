@@ -1,0 +1,58 @@
+# The fixture add-on `rhaddon` (fictional): the overlay its signed bundle
+# would carry. One CPU service that proves its declared runtime inputs
+# arrived (healthy only when every file is there, readable by its own uid
+# and nothing else), and one service that asks for a GPU, which the
+# launcher must hold. Used by tests/test_addon_resources_launcher.py and the
+# 0.6.13 rehearsal; resources.json, system.json and routes.json (its route
+# manifest, which the launcher hands to the gateway: the overlay touches no
+# core service) sit beside it.
+x-noo-addon:
+  addon: rhaddon
+  consumer: svc:rhaddon
+  key: NOO_SVC_KEY_RHADDON
+  containers: [noo-rhaddon]
+  scopes: [metrics]
+  why: >-
+    the fixture add-on posts nothing; the key proves addon_key delivery.
+
+services:
+  noo-rhaddon:
+    image: ${NOO_ADDON_IMAGE_RHADDON:-noo-addon-unpinned.invalid/rhaddon:x}
+    container_name: noo-rhaddon
+    # No numeric `user:` (tests/test_compose_named_users.py): the image's own
+    # USER must be the uid resources.json declares (1000).
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      RHADDON_GATEWAY_URL: ${RHADDON_GATEWAY_URL:-}
+      RHADDON_PUBLIC_ORIGINS: ${RHADDON_PUBLIC_ORIGINS:-}
+    volumes:
+      - ${RHADDON_WORK_DIR:-/nonexistent/rhaddon-work-unset}:/run/rhaddon:ro
+      - ${RHADDON_COORD_DIR:-/nonexistent/rhaddon-coord-unset}:/run/rhaddon-coord:ro
+    command: ["sh", "-c", "exec sleep 2147483647"]
+    healthcheck:
+      test: ["CMD-SHELL", "for f in /run/rhaddon/ca.crt /run/rhaddon/leaf.crt /run/rhaddon/leaf.key /run/rhaddon/peer-key /run/rhaddon-coord/peer-key /run/rhaddon-coord/runtime-url /run/rhaddon-coord/db/pgpass /run/rhaddon-coord/db/client.key; do test -r $$f && test -s $$f || exit 1; done; grep -q 'sslmode=verify-full' /run/rhaddon-coord/runtime-url && test \"$$RHADDON_GATEWAY_URL\" = https://gateway:8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks: [rhaddon-gateway, rhaddon-db]
+  noo-rhaddon-gpu:
+    image: ${NOO_ADDON_IMAGE_RHADDON:-noo-addon-unpinned.invalid/rhaddon:x}
+    container_name: noo-rhaddon-gpu
+    command: ["sh", "-c", "exec sleep 2147483647"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+networks:
+  rhaddon-gateway:
+    external: true
+    name: ${RHADDON_GATEWAY_NETWORK:-noo-addon-network-unset}
+  rhaddon-db:
+    external: true
+    name: ${RHADDON_DB_NETWORK:-noo-addon-network-unset}

@@ -4,6 +4,10 @@
 import { useQuery } from '@metis/core';
 import { apiGet } from '@/lib/client';
 
+// Unknown stays grey: a failed read (403, 503, network) is `undefined`, the
+// same as a field the gateway did not send. It is never read as "0 nodes".
+const orUnknown = <T>(p: Promise<T>): Promise<T | undefined> => p.catch(() => undefined);
+
 // Slate-harmonized dot colors.
 const ON = '#5aa66e'; // green
 const OFF = '#5b6472'; // grey / unknown
@@ -30,16 +34,16 @@ export function useBrainStatus() {
     refetchInterval: 15_000,
     queryFn: async () => {
       const [cluster, viol, health] = await Promise.all([
-        apiGet<ClusterStatus>('/api/cluster/status'),
-        apiGet<{ risk_level?: string }>('/api/security/violations'),
-        apiGet<{ addons?: Record<string, string> }>('/health'),
+        orUnknown(apiGet<ClusterStatus>('/api/cluster/status')),
+        orUnknown(apiGet<{ risk_level?: string }>('/api/security/violations')),
+        orUnknown(apiGet<{ addons?: Record<string, string> }>('/health')),
       ]);
-      const nodes = cluster?.nodes ?? [];
+      const nodes = cluster?.nodes;
       const evolve = health?.addons?.evolve;
       const lane = (on: string) => (evolve === 'enabled' ? on : evolve === 'unhealthy' ? BAD : OFF);
       const dots: Record<string, string> = {
-        'brain-sd-autonomy': nodes.length ? ON : OFF,
-        'brain-sd-backend': nodes.some((n) => (n.running_backends ?? []).length > 0) ? ON : OFF,
+        'brain-sd-autonomy': nodes === undefined ? OFF : nodes.length ? ON : OFF,
+        'brain-sd-backend': nodes === undefined ? OFF : nodes.some((n) => (n.running_backends ?? []).length > 0) ? ON : OFF,
         'brain-sd-security': !viol?.risk_level
           ? OFF
           : viol.risk_level === 'HIGH'

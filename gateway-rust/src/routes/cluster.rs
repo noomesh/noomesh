@@ -3,6 +3,7 @@
 
 //! Cluster routes — node management, backends, GPU metrics.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 use axum::{
     Router,
@@ -363,7 +364,7 @@ async fn node_heartbeat(
     // `data root` row reads it. Replaced whole on every beat.
     carry_reported(&mut data, &body, "data_roots");
     // Legacy credential lanes the agent admitted since it started
-    // `{since_unix, static_token, whois_non_controller}`.
+    // `{since_unix, static_token, cluster_hmac_v1_refused}`.
     // `noo cluster verify --controller`'s `legacy lanes` row reads it.
     carry_reported(&mut data, &body, "legacy_lanes");
     // Whether the agent admits the gateway's leaf with no bearer. Written EVERY beat, false when absent: unlike the reports
@@ -798,12 +799,12 @@ async fn node_forget(
             "no node named '{node_id}' in the registry, its config, its placements, its enrollments or the mesh — nothing to forget"
         )));
     }
-    crate::routes::core::audit_event(
-        &state.db, "node_forgotten", "warning", "gateway",
-        &format!("node:{node_id}"), "ok",
-        json!({ "node": node_id, "db_rows": deleted, "config_rows": config_rows,
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::NodeForgotten, "gateway", &format!("node:{node_id}"))
+            .details(json!({ "node": node_id, "db_rows": deleted, "config_rows": config_rows,
                 "placements": placements, "kv_purged": kv_purged,
-                "enrollments_revoked": enrollments_revoked }),
+                "enrollments_revoked": enrollments_revoked })),
     ).await;
     Ok(Json(json!({
         "status": "forgotten", "node": node_id,
@@ -1070,6 +1071,7 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
         .into_iter()
         .filter_map(|(id, p)| p.map(|p| (id, p)))
         .collect();
+    let task_holds = node_task_holds(&state.db).await;
     // node_ids seen live in KV — used to suppress duplicate DB rows when
     // merging known-but-missing (offline) nodes below.
     let mut live_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1259,6 +1261,11 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
                             .get(&policy_key)
                             .cloned()
                             .unwrap_or_else(crate::coordinator::harness_default_policy));
+                        // What the node's harness holds (i227 fix 4): absent
+                        // only when the query failed, never defaulted.
+                        if let Some(holds) = task_holds.as_ref() {
+                            data["tasks"] = holds.get(&policy_key).cloned().unwrap_or_else(|| json!({"running": 0, "queued": 0}));
+                        }
 
                         // Companion telemetry fields (tier >= 4) — preserve from KV if present
                         // These are already in the KV data if heartbeat wrote them;
@@ -1865,14 +1872,16 @@ fn parse_prometheus_labels(label_str: &str) -> std::collections::HashMap<String,
 
 /// The credential choice, with no environment in it so it can be tested.
 ///
-/// Note what is absent: the controller secret. It is not a parameter
-/// because it is not an option — a node cannot verify it.
-pub(crate) fn node_agent_bearer(static_token: Option<&str>, fleet_secret: Option<&str>, ts: u64) -> Option<String> {
-    if let Some(t) = static_token.filter(|t| !t.is_empty()) {
-        return Some(format!("Bearer {t}"));
-    }
-    let secret = fleet_secret.filter(|s| !s.is_empty())?;
-    Some(format!("Bearer {}", mint_cluster_token("gateway", secret, ts)?))
+/// The only bearer the gateway ever sends an agent is the static
+/// `NOO_NODE_AGENT_TOKEN`. There is NO minted fallback: the v1 cluster token
+/// (`mint_cluster_token`) is refused by every agent, and a v2 token is bound
+/// to a request that does not exist yet where this is called. An agent that
+/// has not reported `controller_leaf_only` and has no static token gets no
+/// bearer; the gateway's leaf authenticates the handshake, and
+/// `node_agent_auth::header_for` logs the decision. The fleet and controller
+/// secrets are not parameters because they are not options.
+pub(crate) fn node_agent_bearer(static_token: Option<&str>) -> Option<String> {
+    static_token.filter(|t| !t.is_empty()).map(|t| format!("Bearer {t}"))
 }
 
 #[cfg(test)]
@@ -1880,34 +1889,30 @@ mod node_agent_auth_tests {
     use super::*;
 
     #[test]
-    fn the_static_token_wins_when_set() {
-        assert_eq!(
-            node_agent_bearer(Some("abc"), Some("fleet"), 1),
-            Some("Bearer abc".into())
-        );
+    fn the_static_token_is_the_only_bearer() {
+        assert_eq!(node_agent_bearer(Some("abc")), Some("Bearer abc".into()));
     }
 
     #[test]
-    fn the_fallback_is_signed_with_the_fleet_secret() {
-        // The regression this guards: signing a node-bound call with the
-        // controller-local secret, which no node holds. Reproduce the
-        // token the node agent will verify and require it to match.
-        let got = node_agent_bearer(None, Some("fleet"), 42).expect("a bearer");
-        let want = mint_cluster_token("gateway", "fleet", 42).expect("a token");
-        assert_eq!(got, format!("Bearer {want}"));
-        assert_ne!(
-            got,
-            format!("Bearer {}", mint_cluster_token("gateway", "controller-local", 42).unwrap())
-        );
-    }
-
-    #[test]
-    fn no_credential_at_all_is_none_rather_than_an_empty_bearer() {
-        assert_eq!(node_agent_bearer(Some(""), Some(""), 1), None);
-        assert_eq!(node_agent_bearer(None, None, 1), None);
+    fn no_v1_token_is_ever_minted_for_an_agent() {
+        // Without a static token there is no bearer at all: not a v1
+        // `<actor>:<ts>:<hmac>`, not anything signed with a shared secret.
+        assert_eq!(node_agent_bearer(None), None);
+        assert_eq!(node_agent_bearer(Some("")), None);
+        // ...and the function cannot even be handed a secret to sign with.
+        let src = include_str!("cluster.rs");
+        let body = src.split("pub(crate) fn node_agent_bearer(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        assert!(!body.contains(&["mint_cluster", "_token"].concat()), "the fallback is back: {body}");
     }
 }
 
+/// INTERNAL ONLY. Never send the result to an agent or the gateway: v1 cluster
+/// tokens are refused everywhere (`cluster_token_v1_refused`). It exists for
+/// the v2-admission path's internal re-mint (`auth.rs`), the browser door's
+/// own-key bearer (`routes/ui.rs`) and tests. A controller->agent credential
+/// is `node_agent_auth::header_for`, which never calls this
+/// (`node_agent_auth::tests::no_agent_credential_path_mints_a_v1_token`).
+///
 /// Mint a cluster-HMAC time-bearer token: `<actor>:<ts>:<hmac64>` with the
 /// FULL 64-hex HMAC-SHA256 signature over `"actor:ts"`.
 ///
@@ -1994,10 +1999,9 @@ pub(crate) async fn restart_agent_via_rail(
 async fn control_probe(
     State(state): State<Arc<AppState>>,
     caller: Option<axum::Extension<crate::auth::ClusterNode>>,
-    requester: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    _op: crate::authz::OperatorOrInternal,
     Path(node_id): Path<String>,
 ) -> AppResult {
-    super::operator_read_guard(&requester)?;
     if caller.is_some() {
         return Err(AppError::Forbidden("a node may not probe the controller's control paths".into()));
     }
@@ -2150,11 +2154,11 @@ async fn clean_node(
 /// - One hold or release runs on a node at a time (409 `transition_in_progress`).
 async fn gpu_hold(
     State(state): State<Arc<AppState>>,
-    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    operator: crate::authz::Operator,
     Path(node_id): Path<String>,
     body: Option<Json<Value>>,
 ) -> AppResult {
-    let actor = gpu_hold_actor(&ctx)?;
+    let actor = operator.sub().to_string();
     let b = body.map(|Json(b)| b).unwrap_or_else(|| json!({}));
     let text = |k: &str, max: usize| -> String {
         b.get(k).and_then(Value::as_str).unwrap_or("").trim().chars().take(max).collect()
@@ -2198,11 +2202,11 @@ async fn gpu_hold(
 /// `operation_id` is a legacy release** (an older CLI): a force, audited so.
 async fn gpu_release(
     State(state): State<Arc<AppState>>,
-    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    operator: crate::authz::Operator,
     Path(node_id): Path<String>,
     body: Option<Json<Value>>,
 ) -> AppResult {
-    let actor = gpu_hold_actor(&ctx)?;
+    let actor = operator.sub().to_string();
     let b = body.map(|Json(b)| b).unwrap_or_else(|| json!({}));
     let operation_id: String = b.get("operation_id").and_then(Value::as_str).unwrap_or("").trim().chars().take(64).collect();
     let legacy = operation_id.is_empty();
@@ -2220,14 +2224,6 @@ async fn gpu_release(
 /// request says otherwise; the cap keeps a typo from parking a node.
 pub(crate) const GPU_DRAIN_TIMEOUT_DEFAULT_SECS: u64 = 120;
 pub(crate) const GPU_DRAIN_TIMEOUT_MAX_SECS: u64 = 900;
-
-/// The operator gate for the GPU hold routes: role Operator or above.
-pub(crate) fn gpu_hold_actor(ctx: &Option<axum::Extension<crate::auth::RequesterCtx>>) -> Result<String, AppError> {
-    match ctx {
-        Some(axum::Extension(r)) if r.role >= crate::auth::Role::Operator => Ok(r.sub.clone()),
-        _ => Err(AppError::Forbidden("operator role required to hold or release a node's GPU".into())),
-    }
-}
 
 /// The per-node transition lock: one hold or release in flight per node at
 /// a time, across every caller of this gateway (the agent refuses a second
@@ -2380,11 +2376,16 @@ pub(crate) async fn gpu_hold_op(
     tracing::info!(node_id = %node_id, op, ok, actor = %actor, force = payload["force"].as_bool().unwrap_or(false),
         legacy = payload["legacy"].as_bool().unwrap_or(false), operation_id = %payload["operation_id"].as_str().unwrap_or(""), "node_gpu_hold");
     let lease = result.as_ref().ok().and_then(|v| v.pointer("/gpu_contention/lease").cloned()).unwrap_or(Value::Null);
-    crate::routes::core::audit_event(
-        &state.db, &format!("node_gpu_{op}"), "info", &actor,
-        &format!("node:{node_id}"), if ok { "ok" } else { "error" },
-        json!({"node": node_id, "op": op, "request": payload, "lease": lease,
-               "force": payload["force"], "legacy": payload["legacy"]}),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(
+            if op == "hold" { AuditKind::NodeGpuHold } else { AuditKind::NodeGpuRelease },
+            &actor,
+            &format!("node:{node_id}"),
+        )
+        .outcome(if ok { crate::audit::Outcome::Ok } else { crate::audit::Outcome::Error })
+        .details(json!({"node": node_id, "op": op, "request": payload, "lease": lease,
+               "force": payload["force"], "legacy": payload["legacy"]})),
     ).await;
     let mut out = result?;
     out["node"] = json!(node_id);
@@ -2406,14 +2407,11 @@ const NODE_BENCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(9
 /// POST /api/cluster/nodes/{node_id}/bench
 async fn node_bench(
     State(state): State<Arc<AppState>>,
-    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    operator: crate::authz::Operator,
     Path(node_id): Path<String>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let actor = match ctx {
-        Some(axum::Extension(ref r)) if r.role >= crate::auth::Role::Operator => r.sub.clone(),
-        _ => return AppError::Forbidden("operator role required to bench a node".into()).into_response(),
-    };
+    let actor = operator.sub().to_string();
     let link = match crate::node_link::NodeLink::for_node(&state, &node_id).await {
         Ok(l) => l,
         Err(e) => return e.into_response(),
@@ -2468,10 +2466,11 @@ async fn node_bench(
     }
     let secs = started.elapsed().as_secs_f64();
     tracing::info!(node_id = %node_id, ok, actor = %actor, secs, "node_bench");
-    crate::routes::core::audit_event(
-        &state.db, "node_bench", "info", &actor,
-        &format!("node:{node_id}"), if ok { "ok" } else { "error" },
-        json!({"node": node_id, "secs": secs, "result": detail}),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::NodeBench, &actor, &format!("node:{node_id}"))
+            .outcome(if ok { crate::audit::Outcome::Ok } else { crate::audit::Outcome::Error })
+            .details(json!({"node": node_id, "secs": secs, "result": detail})),
     ).await;
     response
 }
@@ -3445,14 +3444,14 @@ pub(crate) async fn models_pull(
 async fn desired_config_get(
     State(state): State<Arc<AppState>>,
     caller: Option<axum::Extension<crate::auth::ClusterNode>>,
-    requester: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    _op: crate::authz::OperatorOrInternal,
     Path(node_id): Path<String>,
 ) -> AppResult {
     // A JWT caller below Operator is refused (a `read` account used to pass:
     // the tier gate let every GET through and this handler assumed any
     // non-node caller was an operator). A node carries ClusterNode and no
-    // RequesterCtx, so this does not touch the node path below.
-    super::operator_read_guard(&requester)?;
+    // RequesterCtx, so this does not touch the node path below. The refusal is
+    // the `OperatorOrInternal` extractor in the signature.
     // A node may read its OWN config and no other. the design
     //
     // Before this, the handler took node_id from the PATH and returned that
@@ -3632,8 +3631,9 @@ async fn desired_config_get(
         "mcp_servers": mcp_json,
         // The resolved harness profile (config/harness-profiles.json):
         // `{tier, first_byte_secs, stream_idle_secs, thinking,
-        // ollama_context, claude_prompt, foreign_kinds, sources, bench}`.
-        // The agent applies first_byte_secs, ollama_context and
+        // context, ollama_context (the same value, for agents older than
+        // 0.6.13), claude_prompt, foreign_kinds, sources, bench}`.
+        // The agent applies first_byte_secs, context and
         // foreign_kinds, and hands the whole object to its harness.
         "harness_profile": harness_profile,
         // Every verified add-on bundle's declared workloads (i163 part B):
@@ -3645,6 +3645,31 @@ async fn desired_config_get(
         "disk_reclaim": crate::autonomy_evaluators::node_reclaim_policy(&state).await,
         "engine": "rust",
     })))
+}
+
+/// Per node, the live tasks it holds (i227 fix 4): `running` (running or
+/// checkpointed) with the age of the oldest one's last progress, and
+/// `queued` (open, waiting for the node's busy harness) with the oldest
+/// wait. Children count: they hold a harness permit like any task. Parked
+/// tasks and aggregation parents do not. `None` when the query fails, so
+/// the field is left out rather than reading as "nothing held".
+async fn node_task_holds(db: &sqlx::PgPool) -> Option<std::collections::HashMap<String, Value>> {
+    let rows = crate::repo::tasks::holds_by_node(db)
+        .await
+        .map_err(|e| tracing::warn!(error = %e, "cluster_nodes: task holds not read"))
+        .ok()?;
+    Some(rows.into_iter().map(|(node, running, queued, progress, waited)| (node, task_holds_json(running, queued, progress, waited))).collect())
+}
+
+fn task_holds_json(running: i64, queued: i64, oldest_progress_secs: Option<f64>, oldest_queued_secs: Option<f64>) -> Value {
+    let mut v = json!({"running": running, "queued": queued});
+    if let Some(p) = oldest_progress_secs {
+        v["oldest_progress_secs"] = json!(p.max(0.0) as i64);
+    }
+    if let Some(w) = oldest_queued_secs {
+        v["oldest_queued_secs"] = json!(w.max(0.0) as i64);
+    }
+    v
 }
 
 #[derive(Deserialize)]
@@ -3834,6 +3859,10 @@ async fn node_config_put(
     .map_err(|e| AppError::Internal(format!("node_config upsert: {e}")))?;
 
     tracing::info!(node = %node_id, "node_config_updated");
+    // Every column here is served by desired-config (harness policy,
+    // vendor kinds, profile overrides, usage, data root …), so a change
+    // reaches the node now rather than at its next tick (i256 fix 3).
+    nudge_reconcile(state.clone(), node_id.clone());
     Ok(Json(json!({"ok": true, "node_id": node_id})))
 }
 
@@ -4020,6 +4049,45 @@ pub(crate) fn fit_specs(existing: &[StoredPlacement], replacing: Option<(&str, &
     specs
 }
 
+/// The fit of harness `kind` on `node_id` (i226 phase B): the node's
+/// running chat placements' smallest window against the kind's floor, with
+/// the profile (tier default and overrides) deciding the window where a
+/// placement sets none and whether Claude Code runs its slim launch. Also
+/// the chat placement to raise, `(backend, model)`.
+async fn harness_kind_fit(
+    state: &AppState,
+    node_id: &str,
+    kind: &crate::harness_kinds::HarnessKind,
+    existing: &[StoredPlacement],
+) -> (crate::harness_fit::Fit, Option<(String, String)>) {
+    let chats: Vec<&StoredPlacement> = existing
+        .iter()
+        .filter(|p| p.backend != "harness" && p.desired_state == "running" && p.role == "chat")
+        .collect();
+    let record: Value = match state.js.get_key_value("mesh_nodes").await {
+        Ok(kv) => match kv.get(node_id).await {
+            Ok(Some(e)) => serde_json::from_slice::<Value>(&e).unwrap_or_else(|_| json!({})),
+            _ => json!({}),
+        },
+        Err(_) => json!({}),
+    };
+    let tier = crate::node_tier::derive(&crate::node_tier::facts_from_capabilities(record.get("capabilities").unwrap_or(&json!({}))))
+        .tier()
+        .and_then(|t| u8::try_from(t).ok());
+    let overrides = crate::repo::cluster::node_harness_profile_overrides(&state.db, node_id).await.unwrap_or_else(|_| json!({}));
+    let profile = crate::harness_profile::resolve(tier, &overrides, None, None);
+    let window = crate::harness_fit::node_window(chats.iter().map(|p| (p.backend.as_str(), &p.env, p.model.as_deref())), profile.context);
+    let floor = crate::harness_fit::kind_floor(kind, profile.claude_prompt == "slim");
+    // The placement whose window decided: the smallest one.
+    let chat = chats
+        .iter()
+        .filter_map(|p| crate::harness_fit::chat_window(&p.backend, &p.env, p.model.as_deref(), profile.context).map(|w| (w.tokens, p)))
+        .min_by_key(|(n, _)| *n)
+        // No model name, no `noo cluster place` line to suggest.
+        .and_then(|(_, p)| p.model.clone().filter(|m| !m.is_empty()).map(|m| (p.backend.clone(), m)));
+    (crate::harness_fit::judge(floor, window), chat)
+}
+
 async fn stored_placements(state: &AppState, node_id: &str) -> Result<Vec<StoredPlacement>, AppError> {
     let rows: Vec<(String, String, Option<String>, Value, String, Option<String>)> = sqlx::query_as(
         "SELECT backend, role, model, env, desired_state, target FROM noo_backend_placements WHERE node_id = $1 ORDER BY backend, role",
@@ -4149,6 +4217,30 @@ async fn placement_staging_refusal(state: &AppState, node_id: &str, backend: &st
 /// Before a running model placement is written the memory-fit check runs
 /// ([`crate::placement_fit`]): does-not-fit is a 409 naming the budget, each
 /// model and the shortfall, unless `force`; tight succeeds with a warning.
+/// Ask the node to reconcile now rather than at its next 5-minute tick
+/// (`POST /reconcile`, the `reconcile` control op; the agent coalesces
+/// nudges). Fire-and-forget: the placement is stored either way and the
+/// tick is the fallback, so a node that is off the bus, older than the op
+/// (404) or unreachable costs a log line and nothing else. Without this a
+/// harness kind change landed up to 5 min after `noo cluster place`
+/// (both awolf and mcmini, harness compare 2026-10-24).
+fn nudge_reconcile(state: Arc<AppState>, node_id: String) {
+    tokio::spawn(async move {
+        let link = match crate::node_link::NodeLink::for_node(&state, &node_id).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::info!(node = %node_id, error = %e, "reconcile_nudge_skipped");
+                return;
+            }
+        };
+        match link.request(reqwest::Method::POST, "/reconcile").send().await {
+            Ok(r) if r.status().is_success() => tracing::info!(node = %node_id, "reconcile_nudged"),
+            Ok(r) => tracing::info!(node = %node_id, status = r.status().as_u16(), "reconcile_nudge_declined"),
+            Err(e) => tracing::info!(node = %node_id, error = %e, "reconcile_nudge_failed"),
+        }
+    });
+}
+
 async fn placement_put(
     State(state): State<Arc<AppState>>,
     Path((node_id, backend)): Path<(String, String)>,
@@ -4254,6 +4346,25 @@ async fn placement_put(
         }
     }
 
+    // i226 phase B: does the harness kind fit the node's chat window? A
+    // kind whose first request is larger than the window fails on its first
+    // model call (every vendor kind on awolf's 16k vLLM, 2026-10-24); say so
+    // here, with the numbers and what fits.
+    if desired == "running" && backend == "harness" {
+        let kind = body.env.as_ref().and_then(|e| e.get("NOO_HARNESS_KIND")).and_then(|k| k.as_str()).unwrap_or("noo").to_string();
+        if let Some(row) = crate::harness_kinds::get(&kind) {
+            let existing = stored_placements(&state, &node_id).await?;
+            let (fit, chat) = harness_kind_fit(&state, &node_id, row, &existing).await;
+            if let Some(msg) = crate::harness_fit::message(&node_id, &kind, &fit, chat.as_ref().map(|(b, m)| (b.as_str(), m.as_str()))) {
+                match fit {
+                    crate::harness_fit::Fit::Short { .. } if !body.force => return Err(AppError::Conflict(msg)),
+                    crate::harness_fit::Fit::Short { .. } => fit_warnings.push(format!("forced past a window too small for the kind: {msg}")),
+                    _ => fit_warnings.push(msg),
+                }
+            }
+        }
+    }
+
     // Is the image this placement needs staged on the controller's artifact
     // rail? A node pulls images only from there (it holds no registry
     // credential), so an unstaged image is a placement that cannot start —
@@ -4318,6 +4429,7 @@ async fn placement_put(
     crate::role_capability::invalidate();
 
     tracing::info!(node = %node_id, backend = %backend, role = %role, desired = %desired, "placement_updated");
+    nudge_reconcile(state.clone(), node_id.clone());
     Ok(Json(json!({
         "ok": true, "node_id": node_id, "backend": backend, "role": role,
         "fit": fit_json, "warnings": fit_warnings,
@@ -4392,6 +4504,7 @@ async fn placement_delete(
     .map_err(|e| AppError::Internal(format!("placement delete: {e}")))?;
     crate::role_capability::invalidate();
 
+    nudge_reconcile(state.clone(), node_id.clone());
     Ok(Json(json!({"ok": true, "deleted": res.rows_affected()})))
 }
 
@@ -4668,15 +4781,15 @@ async fn model_class_put(
     tracing::info!(class = %declared.name, candidates = declared.candidates.len(), aliases = aliases.len(), unknown_nodes = ?unknown_nodes, "model_class_declared");
     // A class write changes routing for every consumer: audited like a
     // placement change or a node forget.
-    crate::routes::core::audit_event(
-        &state.db, "model_class_declared", "info", "gateway",
-        &format!("class:{}", declared.name), "ok",
-        json!({
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::ModelClassDeclared, "gateway", &format!("class:{}", declared.name))
+            .details(json!({
             "class": declared.name,
             "candidates": declared.candidates.iter().map(|c| json!({"node": c.node_id, "backend": c.backend, "model": c.model, "degraded": c.degraded})).collect::<Vec<_>>(),
             "aliases": aliases,
             "unknown_nodes": unknown_nodes,
-        }),
+        })),
     ).await;
     let mut out = json!({"ok": true, "class": declared.name, "candidates": declared.candidates.len(), "aliases": aliases});
     if let Some(note) = unknown_nodes_note(&unknown_nodes) {
@@ -4724,10 +4837,10 @@ async fn model_class_delete(
         return Err(AppError::NotFound(format!("no declared class '{class}'")));
     }
     tracing::info!(class = %class, "model_class_removed");
-    crate::routes::core::audit_event(
-        &state.db, "model_class_removed", "info", "gateway",
-        &format!("class:{class}"), "ok",
-        json!({"class": class, "deleted": n}),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::ModelClassRemoved, "gateway", &format!("class:{class}"))
+            .details(json!({"class": class, "deleted": n})),
     ).await;
     Ok(Json(json!({"ok": true, "class": class, "deleted": n})))
 }
@@ -4762,9 +4875,10 @@ async fn model_alias_put(
         .map_err(|e| AppError::Internal(format!("model alias write: {e}")))?;
     let served = table.class(&class).is_some();
     tracing::info!(alias = %alias, class = %class, served, "model_alias_declared");
-    crate::routes::core::audit_event(
-        &state.db, "model_alias_declared", "info", "gateway",
-        &format!("alias:{alias}"), "ok", json!({"alias": alias, "class": class, "served": served}),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::ModelAliasDeclared, "gateway", &format!("alias:{alias}"))
+            .details(json!({"alias": alias, "class": class, "served": served})),
     ).await;
     let mut out = json!({"ok": true, "alias": alias, "class": class, "served": served});
     if !served {
@@ -4787,9 +4901,10 @@ async fn model_alias_delete(
         return Err(AppError::NotFound(format!("no declared alias '{alias}'")));
     }
     tracing::info!(alias = %alias, "model_alias_removed");
-    crate::routes::core::audit_event(
-        &state.db, "model_alias_removed", "info", "gateway",
-        &format!("alias:{alias}"), "ok", json!({"alias": alias}),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::ModelAliasRemoved, "gateway", &format!("alias:{alias}"))
+            .details(json!({"alias": alias})),
     ).await;
     Ok(Json(json!({"ok": true, "alias": alias})))
 }
@@ -4933,10 +5048,10 @@ async fn embedding_space_put(
         es::set_cache(all);
     }
     tracing::info!(space = %rec.space, model = %rec.model, dims = ?rec.dims, created = existing.is_none(), "embedding_space_declared");
-    crate::routes::core::audit_event(
-        &state.db, "embedding_space_declared", "info", "gateway",
-        &format!("embedding_space:{}", rec.space), "ok",
-        json!({"space": rec.space, "model": rec.model, "dims": rec.dims, "created": existing.is_none()}),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::EmbeddingSpaceDeclared, "gateway", &format!("embedding_space:{}", rec.space))
+            .details(json!({"space": rec.space, "model": rec.model, "dims": rec.dims, "created": existing.is_none()})),
     ).await;
     Ok(Json(json!({"ok": true, "space": rec.space, "model": rec.model, "dims": rec.dims, "created": existing.is_none()})))
 }
@@ -4969,9 +5084,10 @@ async fn embedding_space_delete(
         es::set_cache(all);
     }
     tracing::info!(space = %space, "embedding_space_removed");
-    crate::routes::core::audit_event(
-        &state.db, "embedding_space_removed", "info", "gateway",
-        &format!("embedding_space:{space}"), "ok", json!({"space": space}),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::EmbeddingSpaceRemoved, "gateway", &format!("embedding_space:{space}"))
+            .details(json!({"space": space})),
     ).await;
     Ok(Json(json!({"ok": true, "space": space})))
 }
@@ -5023,9 +5139,10 @@ async fn embedding_space_migration_start(
     refresh_embedding_spaces(&state).await;
     let st = if next_dims.is_some() { es::MIGRATION_FILLING } else { es::MIGRATION_PENDING };
     tracing::info!(space = %space, next_model = %model, next_dims = ?next_dims, state = st, "embedding_migration_started");
-    crate::routes::core::audit_event(
-        &state.db, "embedding_migration_started", "info", "gateway",
-        &format!("embedding_space:{space}"), "ok", json!({"space": space, "next_model": model, "next_dims": next_dims, "state": st}),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::EmbeddingMigrationStarted, "gateway", &format!("embedding_space:{space}"))
+            .details(json!({"space": space, "next_model": model, "next_dims": next_dims, "state": st})),
     ).await;
     if next_dims.is_some() {
         return Ok((axum::http::StatusCode::OK, Json(json!({"ok": true, "space": space, "next_model": model, "next_dims": next_dims, "state": st}))));
@@ -5065,9 +5182,10 @@ async fn embedding_space_migration_complete(
     }
     refresh_embedding_spaces(&state).await;
     tracing::info!(space = %space, next_model = %next, "embedding_migration_cutover");
-    crate::routes::core::audit_event(
-        &state.db, "embedding_migration_cutover", "info", "gateway",
-        &format!("embedding_space:{space}"), "ok", json!({"space": space, "next_model": next}),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::EmbeddingMigrationCutover, "gateway", &format!("embedding_space:{space}"))
+            .details(json!({"space": space, "next_model": next})),
     ).await;
     Ok(Json(json!({"ok": true, "space": space, "next_model": next, "state": es::MIGRATION_CUTOVER})))
 }
@@ -5095,9 +5213,10 @@ async fn embedding_space_migration_cancel(
     }
     refresh_embedding_spaces(&state).await;
     tracing::info!(space = %space, "embedding_migration_cancelled");
-    crate::routes::core::audit_event(
-        &state.db, "embedding_migration_cancelled", "info", "gateway",
-        &format!("embedding_space:{space}"), "ok", json!({"space": space}),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::EmbeddingMigrationCancelled, "gateway", &format!("embedding_space:{space}"))
+            .details(json!({"space": space})),
     ).await;
     Ok(Json(json!({"ok": true, "space": space})))
 }
@@ -5188,7 +5307,7 @@ pub(crate) async fn mint_tailscale_auth_key(
     let api_key = tailscale_bearer().await?;
     let tailnet = tailnet_api_name();
 
-    // Same payload as tailscale.py::_key_payload (Tailscale rejects
+    // Same payload as the retired Python tailscale module's _key_payload (Tailscale rejects
     // punctuation like ():/ in descriptions).
     let payload = json!({
         "capabilities": {"devices": {"create": {
@@ -5246,12 +5365,10 @@ pub(crate) async fn mint_tailscale_auth_key(
 /// The key is minted BY (and verified by) the Tailscale control plane —
 /// there is no local join-key verifier.
 ///
-/// DEPRECATED FIELDS (#114): `one_liner`/`script_url` compose the
-/// retired bootstrap-node.sh lane (stale mirror; superseded by proposal
-/// 30's three enrollment lanes). They stay byte-compatible with Python's
-/// `cluster/tailscale.py::_compose_result` ONLY until the Python cluster
-/// module retires — new consumers must use `auth_key` and the
-/// invite/bootstrap-token flows.
+/// The response is the key and its parameters only. The `one_liner` /
+/// `script_url` fields that composed the retired bootstrap-node.sh lane were
+/// dropped with the Python CLI, their last reader; use the invite /
+/// bootstrap-token flows to enroll a node.
 async fn mint_join_key(
     State(state): State<Arc<AppState>>,
     ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
@@ -5269,49 +5386,20 @@ async fn mint_join_key(
         .unwrap_or(60)
         .min(24 * 60);
     let reusable = body.get("reusable").and_then(|v| v.as_bool()).unwrap_or(false);
-    let ssh_user = body.get("ssh_user").and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
 
     let auth_key = mint_tailscale_auth_key(&tag, expiry_minutes, reusable)
         .await
         .map_err(AppError::Internal)?;
-
-    // tailscale.py::script_url(). The NGROK_DOMAIN arm composed
-    // `https://<domain>/bootstrap-node.sh`, a route this gateway stopped
-    // serving on 2026-09-27 — so it is gone rather than left to hand out a
-    // 404.
-    let script_url = {
-        let explicit = std::env::var("NOO_BOOTSTRAP_SCRIPT_URL").unwrap_or_default().trim().to_string();
-        if !explicit.is_empty() {
-            explicit
-        } else {
-            // noomesh/bootstrap is the PUBLIC home: the noomesh
-            // mirror this pointed at is private and stale — the URL 404'd,
-            // and a 404'd bootstrap script is a silent onboarding failure.
-            // main = released; the repo lives under the org rulesets
-            // (dev -> staging -> main), so what this serves is reviewed.
-            "https://raw.githubusercontent.com/noomesh/bootstrap/main/scripts/bootstrap-node.sh".to_string()
-        }
-    };
-    let mut args = format!("--auth-key {auth_key}");
-    if let Some(ref u) = ssh_user {
-        args.push_str(&format!(" --ssh-user {u}"));
-    }
 
     // Audit the mint. Python appended to the self-modify JSONL file
     // (workers/admin.py::_audit_log {action, tag, reusable, expiry_minutes,
     // result}); the Rust-side convention is the noo_security_audit table.
     let actor = ctx.as_ref().map(|axum::Extension(r)| r.sub.clone())
         .unwrap_or_else(|| "gateway".into());
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "mint_join_key",
-        "warning",
-        &actor,
-        "cluster:tailscale",
-        "ok",
-        json!({"tag": tag, "reusable": reusable, "expiry_minutes": expiry_minutes}),
+        AuditEvent::new(AuditKind::MintJoinKey, &actor, "cluster:tailscale")
+            .details(json!({"tag": tag, "reusable": reusable, "expiry_minutes": expiry_minutes})),
     ).await;
 
     Ok(Json(json!({
@@ -5319,10 +5407,8 @@ async fn mint_join_key(
         "tag": tag,
         "expiry_minutes": expiry_minutes,
         "reusable": reusable,
-        "script_url": script_url,
-        "one_liner": format!("curl -fsSL {script_url} | sudo bash -s -- {args}"),
-        "next_step": "run the one_liner on the joining node; then \
-`noo cluster provision <node-name> --wait` on the controller",
+        "next_step": "enroll the node with `noo cluster invite` (or a bootstrap \
+token), then `noo cluster provision <node-name> --wait` on the controller",
     })))
 }
 
@@ -5499,14 +5585,10 @@ async fn delete_tailscale_device(
 
     let actor = ctx.as_ref().map(|axum::Extension(r)| r.sub.clone())
         .unwrap_or_else(|| "gateway".into());
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "delete_tailscale_device",
-        "warning",
-        &actor,
-        "cluster:tailscale",
-        "ok",
-        json!({"device_id": dev_id, "device_name": dev_name, "ip": ip, "hostname": hostname}),
+        AuditEvent::new(AuditKind::DeleteTailscaleDevice, &actor, "cluster:tailscale")
+            .details(json!({"device_id": dev_id, "device_name": dev_name, "ip": ip, "hostname": hostname})),
     ).await;
 
     Ok(Json(json!({
@@ -6512,7 +6594,7 @@ mod heartbeat_carry_tests {
         assert!(body_of("async fn node_register_body(").contains("carry_reported(&mut data, &body, \"legacy_lanes\")"),
             "node_register_body does not carry legacy_lanes");
         let mut data = json!({"id": "host3"});
-        carry_reported(&mut data, &json!({"legacy_lanes": {"since_unix": 1_790_000_000, "static_token": 3, "whois_non_controller": 0}}), "legacy_lanes");
+        carry_reported(&mut data, &json!({"legacy_lanes": {"since_unix": 1_790_000_000, "static_token": 3, "cluster_hmac_v1_refused": 0}}), "legacy_lanes");
         assert_eq!(data["legacy_lanes"]["static_token"], 3);
     }
 
@@ -6575,21 +6657,19 @@ mod heartbeat_carry_tests {
     /// The GPU hold routes are operator-only, and both are audited.
     #[test]
     fn gpu_hold_is_operator_only_and_audited() {
-        assert!(gpu_hold_actor(&None).is_err(), "no requester: refused");
         // The code above the tests only: this test's own literals would
         // otherwise satisfy every `contains` below.
         let src = include_str!("cluster.rs").split("fn gpu_hold_is_operator_only_and_audited").next().unwrap();
         for name in ["async fn gpu_hold(", "async fn gpu_release("] {
             let h = src.split(name).nth(1).expect(name).split("\nasync fn ").next().unwrap();
-            let gate = h.find("gpu_hold_actor(&ctx)?").expect("the operator gate");
-            let body = h.find("body.map(").expect("the body read");
-            assert!(gate < body, "{name}: the operator gate must run before the body is read");
+            // The extractor runs before the handler body, so the body can never be read first.
+            assert!(h.contains("operator: crate::authz::Operator"), "{name}: the operator gate");
             assert!(h.contains("\"legacy\": legacy"), "{name}: a legacy call is audited as such");
         }
         let op = src.split("async fn gpu_hold_op(").nth(1).expect("gpu_hold_op")
             .split("\nasync fn ").next().unwrap();
         assert!(op.contains("GpuTransition::take(node_id)?"), "one transition per node at a time");
-        assert!(op.contains("audit_event("), "hold/release must be audited");
+        assert!(op.contains("audit::record("), "hold/release must be audited");
         assert!(op.contains("\"force\": payload[\"force\"]"), "the audit row says whether it was a force");
         let drain = op.find("set_node_draining(node_id, true)").expect("drain mark");
         let lanes = op.find("set_lanes_paused(node_id, &drain_lanes)").expect("GPU-lane mark");
@@ -6631,13 +6711,25 @@ mod heartbeat_carry_tests {
         assert_eq!(NODE_BENCH_TIMEOUT, std::time::Duration::from_secs(900));
         let src = include_str!("cluster.rs").split("fn node_bench_is_operator_only_audited_and_generous").next().unwrap();
         let h = src.split("async fn node_bench(").nth(1).expect("node_bench").split("\nasync fn ").next().unwrap();
-        assert!(h.contains("r.role >= crate::auth::Role::Operator"), "the operator gate");
+        assert!(h.contains("operator: crate::authz::Operator"), "the operator gate");
         assert!(h.contains(".request(reqwest::Method::POST, \"/bench\")"));
         assert!(h.contains(".timeout(NODE_BENCH_TIMEOUT)"));
-        assert!(h.contains("audit_event("), "a bench must be audited");
+        assert!(h.contains("audit::record("), "a bench must be audited");
         assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/bench\", post(node_bench))"));
         assert_eq!(src.matches("carry_reported(&mut data, &body, \"model_bench\");").count(), 2, "heartbeat and registration");
         assert!(src.contains("\"harness_profile\": harness_profile,"), "desired-config carries the resolved profile");
+    }
+
+    /// Every desired-state writer nudges the node after it stores, or the
+    /// change lands at the next 5-minute tick (i256): placement put, delete
+    /// and the node-config upsert. Source pins, as above.
+    #[test]
+    fn desired_state_writers_nudge_the_node() {
+        let src = include_str!("cluster.rs").split("fn desired_state_writers_nudge_the_node").next().unwrap();
+        for f in ["async fn placement_put(", "async fn placement_delete(", "async fn node_config_put("] {
+            let h = src.split(f).nth(1).unwrap_or_else(|| panic!("{f}")).split("\nasync fn ").next().unwrap();
+            assert!(h.contains("nudge_reconcile(state.clone(), node_id.clone());"), "{f} must nudge");
+        }
     }
 
     /// `stunnel_image` rides the record from both
@@ -7310,13 +7402,13 @@ mod model_class_tests {
         let put = src.split("async fn model_class_put(").nth(1).unwrap().split("\n}\n").next().unwrap();
         let del = src.split("async fn model_class_delete(").nth(1).unwrap().split("\n}\n").next().unwrap();
         let get = src.split("async fn model_classes_get(").nth(1).unwrap().split("\n}\n").next().unwrap();
-        assert!(put.contains("audit_event(") && put.contains("\"model_class_declared\""), "PUT audits");
+        assert!(put.contains("audit::record(") && put.contains("AuditKind::ModelClassDeclared"), "PUT audits");
         assert!(put.contains("\"unknown_nodes\": unknown_nodes"), "the audit row names the unknown nodes");
-        assert!(del.contains("audit_event(") && del.contains("\"model_class_removed\""), "DELETE audits");
-        assert!(!get.contains("audit_event("), "GET is a read");
+        assert!(del.contains("audit::record(") && del.contains("AuditKind::ModelClassRemoved"), "DELETE audits");
+        assert!(!get.contains("audit::record("), "GET is a read");
         // The audit happens after the write succeeded, never before.
-        assert!(put.find("save_class(").unwrap() < put.find("audit_event(").unwrap());
-        assert!(del.find("delete_class(").unwrap() < del.find("audit_event(").unwrap());
+        assert!(put.find("save_class(").unwrap() < put.find("audit::record(").unwrap());
+        assert!(del.find("delete_class(").unwrap() < del.find("audit::record(").unwrap());
     }
 
     /// An alias is one class's: class B may not silently re-point A's alias.

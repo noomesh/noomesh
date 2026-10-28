@@ -27,7 +27,7 @@ COMPOSE_FILES = ["docker-compose.cluster.yml", "docker-compose.dist.yml"]
 NOT_SHIPPED_PREFIXES = ("docker/Dockerfile", "docker/sandbox", "docker/tools")
 GENERATED = {".env", "noomesh.yaml", "secrets", "pki", ".noo-host-spool", "docker-compose.override.yml", "stack.lock",
              # the launcher fills these with add-on bundle declarations (i163)
-             ".noo-addon-systems", ".noo-addon-workloads"}
+             ".noo-addon-systems", ".noo-addon-workloads", ".noo-addon-routes"}
 
 
 def slice_lists() -> tuple[set[str], list[str]]:

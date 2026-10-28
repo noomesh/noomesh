@@ -7,11 +7,13 @@
 //! `noo upgrade --stack` and the launcher's reader.
 
 pub mod decls;
+pub mod guards;
 pub mod lock_fetch;
 pub mod pins;
 pub mod pop;
 pub mod provisioned;
 pub mod resolve;
+pub mod resources;
 pub mod trust;
 
 use std::path::Path;
@@ -141,6 +143,9 @@ pub fn prepare_from(
     };
     let route = ctx.client.route(&anchor).map_err(Refusal::Route)?;
     let (verified, fetched) = resolve_lock(ctx.client, &anchor, &want, supplied)?;
+    // What the overlay takes from core, and (third-party) its name: refused
+    // here, before an image is pulled or a pin written (`guards`).
+    guards::guard_install(ctx.root, addon, &fetched.files).map_err(Refusal::Decl)?;
     resolve::require_bundle(&verified, ctx.tag)?;
     let mut cred = || -> Result<Option<Credential>, String> {
         ctx.client.docker_credential(&route).map_err(|e| format!("{}: {}", route.host(), e.summary()))

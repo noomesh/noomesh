@@ -83,4 +83,4 @@ def test_redis_and_grafana_run_as_the_images_name_for_their_reader_uid() -> None
         secrets = spec.get("secrets") or []
         assert secrets, f"{svc} has no secrets: the getent path this guards is not exercised"
         for s in secrets:
-            assert str(s.get("uid")) == str(uid), (svc, s)
+            assert str(s.get("x-noo-uid")) == str(uid), (svc, s)

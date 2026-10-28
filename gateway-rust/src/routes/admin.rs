@@ -13,6 +13,7 @@
 //!              exec-approval status (env/config), approval CRUD (SQL)
 //! NATS delegation: PKI rotate-expiring (needs Python PKI manager)
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 use axum::{
     Router,
@@ -31,6 +32,7 @@ use crate::measured::{put, put_into, Measured};
 use crate::state::AppState;
 use crate::redis_or_unavailable::redis_or_unavailable;
 use super::{logs_search, AppJson, AppError, AppResult};
+use crate::authz::{Operator, OperatorOrInternal};
 
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -567,10 +569,9 @@ struct AuditStatsParams {
 /// Mirrors the Python `security_audit_history()` endpoint.
 async fn security_audit_history(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
     Query(params): Query<AuditHistoryParams>,
 ) -> AppResult {
-    super::operator_read_guard(&ctx)?;
     let limit = params.limit.unwrap_or(20).min(200);
 
     let rows = sqlx::query_as::<_, (
@@ -630,22 +631,13 @@ async fn security_audit_history(
 /// version uses the right column.
 async fn security_audit_stats(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
     Query(params): Query<AuditStatsParams>,
 ) -> AppResult {
-    super::operator_read_guard(&ctx)?;
     let minutes = params.minutes.unwrap_or(5).clamp(1, 1440);
     let interval = format!("{minutes} minutes");
 
-    let rows = sqlx::query_as::<_, (String, i64)>(
-        "SELECT event_type, COUNT(*) AS cnt \
-         FROM noo_security_audit \
-         WHERE timestamp > NOW() - $1::interval \
-         GROUP BY event_type",
-    )
-    .bind(&interval)
-    .fetch_all(&state.db)
-    .await?;
+    let rows = crate::repo::audit::counts_by_type_within(&state.db, &interval).await?;
 
     let mut events_5m = serde_json::Map::new();
     let mut auth_failures = 0i64;
@@ -685,15 +677,8 @@ async fn security_audit_stats(
 /// answer lists row ids and says which keys this gateway holds.
 async fn security_audit_verify(
     State(state): State<Arc<AppState>>,
-    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    _op: Operator,
 ) -> AppResult {
-    if let Some(axum::Extension(r)) = &ctx {
-        if r.role < crate::auth::Role::Operator {
-            return Err(AppError::Forbidden(
-                "audit verification is operator-only (Operator role or above)".into(),
-            ));
-        }
-    }
     let report = crate::audit_integrity::verify_db(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("cannot read noo_security_audit: {e}")))?;
@@ -1177,14 +1162,11 @@ async fn cancel_job(
     // leaves readable but a User must not be able to kill.
     if !job_mutable_by(owner, scope.as_deref()) {
         tracing::warn!(%job_id, %caller, %owner, "job_cancel_denied_not_owner");
-        crate::routes::core::audit_event(
+        crate::audit::record(
             &state.db,
-            "job_cancel_denied",
-            "warning",
-            caller,
-            &job_id,
-            "denied_not_owner",
-            json!({"account": account_of(caller), "owner": owner}),
+            AuditEvent::new(AuditKind::JobCancelDenied, caller, &job_id)
+                .outcome(crate::audit::Outcome::custom("denied_not_owner"))
+                .details(json!({"account": account_of(caller), "owner": owner})),
         )
         .await;
         // 404, matching `get_job`: a caller who cannot see the job must not
@@ -1244,19 +1226,16 @@ async fn cancel_job(
     tracing::info!(job_id = %job_id, "job_cancelled");
     // Same rule as submit: the row attributes a person's cancel, not a cluster poke.
     if actor.is_some() {
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "job_cancel",
-        "info",
-        caller,
-        &job_id,
-        "cancelled",
-        json!({
+        AuditEvent::new(AuditKind::JobCancel, caller, &job_id)
+            .outcome(crate::audit::Outcome::custom("cancelled"))
+            .details(json!({
             "account": account_of(caller),
             "owner": owner,
             "prior_status": current_status,
             "node_id": node_id,
-        }),
+        })),
     )
     .await;
     }
@@ -1507,7 +1486,7 @@ async fn scheduler_submit_job(
     let owner = actor.as_ref().map(|Extension(a)| account_of(a.0.as_str())).unwrap_or("");
     // No requester = cluster-HMAC caller: internal, privileged, as before.
     let restricted = requester.as_ref().is_some_and(|Extension(r)| r.role < crate::auth::Role::Operator);
-    let audit = |outcome: &'static str, severity: &'static str, extra: Value| {
+    let audit = |outcome: &'static str, severity: crate::audit::Severity, extra: Value| {
         let db = state.db.clone();
         let sub = actor_sub.to_string();
         let account = account_of(actor_sub).to_string();
@@ -1524,7 +1503,14 @@ async fn scheduler_submit_job(
                 for (k, v) in e { o.insert(k.clone(), v.clone()); }
             }
             let resource = d.get("job_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            crate::routes::core::audit_event(&db, "job_submit", severity, &sub, &resource, outcome, d).await;
+            crate::audit::record(
+                &db,
+                AuditEvent::new(AuditKind::JobSubmit, &sub, &resource)
+                    .outcome(outcome)
+                    .severity(severity)
+                    .details(d),
+            )
+            .await;
         }
     };
 
@@ -1538,7 +1524,7 @@ async fn scheduler_submit_job(
             body.min_vram_gb,
             body.allow_queue_without_backend,
         ) {
-            audit("rejected", "warning", json!({"reason": e.to_string(), "priority": priority})).await;
+            audit("rejected", crate::audit::Severity::Warning, json!({"reason": e.to_string(), "priority": priority})).await;
             return Err(e);
         }
         let (p, k) = clamp_user_job_knobs(priority, knobs.0, knobs.1, knobs.2);
@@ -1552,7 +1538,7 @@ async fn scheduler_submit_job(
         {
             Ok(crate::cache::RateResult::Allowed { .. }) => {}
             Ok(crate::cache::RateResult::Limited { retry_after }) => {
-                audit("rate_limited", "warning", json!({"retry_after_secs": retry_after, "priority": priority})).await;
+                audit("rate_limited", crate::audit::Severity::Warning, json!({"retry_after_secs": retry_after, "priority": priority})).await;
                 return Err(AppError::TooManyRequests {
                     msg: format!(
                         "job submit limit reached: {USER_JOB_SUBMITS_PER_WINDOW} jobs per hour per account"
@@ -1569,7 +1555,7 @@ async fn scheduler_submit_job(
     }
 
     if let Some(resp) = route_by_executor(&state, job_type, &payload).await? {
-        audit("gateway_local", "info", json!({"priority": priority})).await;
+        audit("gateway_local", crate::audit::Severity::Info, json!({"priority": priority})).await;
         return Ok(resp);
     }
 
@@ -1602,7 +1588,7 @@ async fn scheduler_submit_job(
 
     match submit_job_to_redis(redis, job_type, &payload, priority, opts).await {
         Some(job_id) => {
-            audit("queued", "info", json!({"job_id": job_id, "priority": priority, "backend": body.backend, "force_node": body.force_node})).await;
+            audit("queued", crate::audit::Severity::Info, json!({"job_id": job_id, "priority": priority, "backend": body.backend, "force_node": body.force_node})).await;
             Ok(Json(json!({"job_id": job_id, "status": "queued"})))
         }
         None => Err(AppError::Internal("Failed to submit job to Redis".into())),
@@ -2138,10 +2124,9 @@ struct ViolationParams {
 /// Matches Python response: {violations: {...}, risk_level, period_hours}.
 async fn security_violations(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
     Query(params): Query<ViolationParams>,
 ) -> AppResult {
-    super::operator_read_guard(&ctx)?;
     let period_hours = params.period_hours.unwrap_or(24);
 
     // Try to read violation counters from Redis (matching Python SecurityManager keys)
@@ -2207,7 +2192,7 @@ async fn security_violations(
 /// within the 40s poll, otherwise the rotation reports via the result
 /// file after this returns.
 async fn security_pki_rotate_expiring() -> AppJson {
-    if std::env::var("NOO_PKI_DIR").unwrap_or_default().is_empty() {
+    if crate::tls::pki_dir().is_none() {
         return Json(json!({"error": "NOO_PKI_DIR not configured"}));
     }
 
@@ -2268,10 +2253,8 @@ async fn security_pki_rotate_expiring() -> AppJson {
 /// ~/.config/mesh/pki). Reports existence, subject, issuer, and
 /// not_after for each cert found. Matches the Python pki.manager
 /// get_status() response shape.
-async fn security_pki_status(ctx: Option<Extension<RequesterCtx>>) -> AppResult {
-    super::operator_read_guard(&ctx)?;
-    let pki_dir = std::env::var("NOO_PKI_DIR")
-        .ok()
+async fn security_pki_status(_op: OperatorOrInternal) -> AppResult {
+    let pki_dir = crate::tls::pki_dir().map(|p| p.to_string_lossy().into_owned())
         .filter(|p| std::path::Path::new(p).join("ca.crt").exists())
         .or_else(|| {
             // Check common Docker container paths (entrypoint.py copies to /tmp/pki)
@@ -2583,24 +2566,6 @@ async fn approval_pending(
     }
 }
 
-/// Approvals are operator-only: RequesterCtx is attached exclusively on
-/// JWT auth, so cluster-HMAC callers cannot use these dashboard routes.
-/// The CLI decides via POST /api/approval/{id}/decide, which since phase 3
-/// applies the same rule — a named operator, not the shared cluster HMAC.
-/// See `decide_actor`.
-fn require_operator(
-    ctx: &Option<axum::Extension<crate::auth::RequesterCtx>>,
-) -> Result<String, AppError> {
-    match ctx {
-        Some(axum::Extension(r)) if r.role >= crate::auth::Role::Operator => {
-            Ok(r.sub.clone())
-        }
-        _ => Err(AppError::Forbidden(
-            "approval decisions require a logged-in operator (Operator role or above)".into(),
-        )),
-    }
-}
-
 /// An approval decision is a human's. The gate exists so a person decides every
 /// high-risk action; a model that could decide its own pending request would make
 /// the gate decoration. So the decision routes accept only a PERSON's credential
@@ -2637,16 +2602,17 @@ fn decider_refusal(origin: &crate::task_guard::Origin) -> Result<(), AppError> {
 async fn approval_approve(
     State(state): State<Arc<AppState>>,
     Path(request_id): Path<String>,
+    operator: Operator,
     ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
     body: Option<Json<Value>>,
 ) -> AppResult {
-    let requester = require_operator(&ctx)?;
+    let requester = operator.sub();
     require_human_decider(&state.db, &ctx).await?;
     let approved_by = body
         .as_ref()
         .and_then(|b| b.get("approved_by"))
         .and_then(|v| v.as_str())
-        .unwrap_or(&requester);
+        .unwrap_or(requester);
 
     let now = chrono::Utc::now();
 
@@ -2686,10 +2652,11 @@ async fn approval_approve(
 async fn approval_deny(
     State(state): State<Arc<AppState>>,
     Path(request_id): Path<String>,
+    operator: Operator,
     ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
     body: Option<Json<Value>>,
 ) -> AppResult {
-    let requester = require_operator(&ctx)?;
+    let requester = operator.sub();
     require_human_decider(&state.db, &ctx).await?;
     let reason = body
         .as_ref()
@@ -2700,7 +2667,7 @@ async fn approval_deny(
         .as_ref()
         .and_then(|b| b.get("denied_by"))
         .and_then(|v| v.as_str())
-        .unwrap_or(&requester);
+        .unwrap_or(requester);
 
     let now = chrono::Utc::now();
 
@@ -2778,7 +2745,7 @@ fn parse_decision(body: &Value) -> Result<(&'static str, Option<String>), AppErr
 /// - JWT with an operator scope (`admin`/`write`) → that subject. (A
 ///   read-scope JWT is refused here even though `require_any_auth`'s RBAC
 ///   already blocks non-operator POSTs — defense in depth, mirrors
-///   `require_operator` on the sibling /approve|/deny routes.)
+///   the `Operator` extractor on the sibling /approve|/deny routes.)
 /// - No `RequesterCtx` (shared-secret HMAC, service key) → **403**, always.
 ///   The `NOO_APPROVAL_BREAK_GLASS` posture gate that once let such a caller
 ///   decide as `cli-operator:break-glass` is RETIRED
@@ -2878,17 +2845,14 @@ async fn approval_decide(
     tx.commit().await?;
 
     // Tamper-evident audit sink, same pattern as the sibling mutating routes.
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "approval_decision",
-        "info",
-        &resolved_by,
-        &request_id,
-        new_status,
-        json!({
+        AuditEvent::new(AuditKind::ApprovalDecision, &resolved_by, &request_id)
+            .outcome(crate::audit::Outcome::from(new_status))
+            .details(json!({
             "tool_name": tool_name,
             "reason": reason,
-        }),
+        })),
     )
     .await;
     tracing::info!(
@@ -3054,14 +3018,11 @@ async fn mesh_stack_rebuild(
         .as_ref()
         .map(|e| e.0.sub.clone())
         .unwrap_or_else(|| "cluster-cli".to_string());
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "stack_rebuild",
-        "warning",
-        &actor,
-        "mesh:stack",
-        if spool_path.is_some() { "queued_spool" } else { "spool_write_failed" },
-        json!({ "args": &args, "spool_command": &spool_path }),
+        AuditEvent::new(AuditKind::StackRebuild, &actor, "mesh:stack")
+            .outcome(if spool_path.is_some() { crate::audit::Outcome::custom("queued_spool") } else { crate::audit::Outcome::custom("spool_write_failed") })
+            .details(json!({ "args": &args, "spool_command": &spool_path })),
     )
     .await;
 
@@ -4510,14 +4471,11 @@ async fn mesh_restart(
     }))
     .await;
     let actor = if admin.is_empty() { "admin".to_string() } else { admin };
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "mesh_restart",
-        "warning",
-        &actor,
-        &service,
-        result,
-        json!({ "reason": reason, "provider": provider, "spool_command": &spool_path }),
+        AuditEvent::new(AuditKind::MeshRestart, &actor, &service)
+            .outcome(crate::audit::Outcome::from(result))
+            .details(json!({ "reason": reason, "provider": provider, "spool_command": &spool_path })),
     )
     .await;
 
@@ -4627,14 +4585,11 @@ async fn mesh_rebuild(
     }))
     .await;
     let actor = if admin.is_empty() { "admin".to_string() } else { admin };
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "mesh_rebuild",
-        "warning",
-        &actor,
-        &service,
-        result,
-        json!({ "reason": reason, "provider": provider, "spool_command": &spool_path }),
+        AuditEvent::new(AuditKind::MeshRebuild, &actor, &service)
+            .outcome(crate::audit::Outcome::from(result))
+            .details(json!({ "reason": reason, "provider": provider, "spool_command": &spool_path })),
     )
     .await;
 
@@ -5383,14 +5338,12 @@ async fn db_migrations(State(state): State<Arc<AppState>>) -> AppResult {
 /// belong to their containers' entrypoints.
 async fn db_migrations_apply(
     State(state): State<Arc<AppState>>,
-    requester: Option<Extension<RequesterCtx>>,
+    _admin: crate::authz::Admin,
 ) -> AppResult {
     use crate::mesh_migrate;
-    if let Some(Extension(r)) = &requester {
-        if r.role < crate::auth::Role::Admin {
-            return Err(AppError::Forbidden("applying migrations needs the admin role".into()));
-        }
-    }
+    // i241: the `Admin` extractor refuses a call with no user context. Boot runs
+    // the runner in-process, not through this route; the CLI db command sends the
+    // operator's login.
     let before = mesh_migrate::current_revision(&state.db).await.ok().flatten();
     // The runner's future is not `Send` (it is written for the boot path,
     // which awaits it on the main task); an axum handler's future must be.

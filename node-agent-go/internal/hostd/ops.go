@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlenv"
 )
 
 // Op is one host operation the gateway may request.
@@ -75,6 +77,21 @@ type Engine struct {
 func (e *Engine) logf(format string, args ...any) {
 	if e.Logf != nil {
 		e.Logf(format, args...)
+	}
+}
+
+// writeResult records a command's result and, when the spool write fails,
+// says so: the caller polls the spool, so a lost result otherwise looks like
+// an op that never answers (a timeout) instead of the real cause (disk full,
+// permissions). One retry first; a persistent failure is logged loudly.
+func (e *Engine) writeResult(name string, r Result) {
+	err := WriteResult(e.Spool, name, r)
+	if err != nil {
+		time.Sleep(50 * time.Millisecond)
+		err = WriteResult(e.Spool, name, r)
+	}
+	if err != nil {
+		e.logf("ERROR %s: cannot write result (op=%s rc=%d status=%s): %v", name, r.Op, r.RC, r.Status, err)
 	}
 }
 
@@ -197,7 +214,9 @@ func opRecreate(ctx context.Context, e *Engine, name string, c *Command) (int, s
 		"UNHEALTHY %s at %s\n  op=%s service=%s\n  rollback.sha=%s\n  rollback.files=%s\n"+
 			"  NOTE: auto-rollback intentionally NOT performed (host tree may hold uncommitted work).\n",
 		name, stamp(), c.Op, c.Service, sha, files)
-	_ = os.WriteFile(filepath.Join(e.Spool, "UNHEALTHY-"+name+".alert"), []byte(body), 0o644)
+	if err := os.WriteFile(filepath.Join(e.Spool, "UNHEALTHY-"+name+".alert"), []byte(body), 0o644); err != nil {
+		e.logf("ERROR %s: cannot write UNHEALTHY alert file (the operator will not see it in the spool): %v", name, err)
+	}
 
 	if rc == 0 {
 		rc = 1
@@ -210,7 +229,7 @@ func opRecreate(ctx context.Context, e *Engine, name string, c *Command) (int, s
 // there is none, which callers treat as "cannot verify".
 func (e *Engine) clusterCAPath() string {
 	candidates := []string{
-		os.Getenv("NOO_TLS_CA"),
+		ctrlenv.TLSCA(),
 		"/etc/noo/pki/ca.crt",
 		filepath.Join(e.Root, "pki", "ca.crt"),
 	}
@@ -407,16 +426,12 @@ func annotateBackup(r Result) Result {
 // same way db-resync finds it. It used to look ONLY under <root>/venv/bin
 // for the retired Python CLI — and a standalone controller (~/.noo) has no
 // venv, so every cert_auto_rotate and admin pki-rotate spool command there
-// exited 127 while the certificates kept ageing. The venv stays as a last
-// resort for a checkout that still has one.
+// exited 127 while the certificates kept ageing. The Python CLI is gone
+// (noo-py no longer exists), so there is no venv fallback.
 func opRotate(ctx context.Context, e *Engine, _ string, _ *Command) (int, string) {
 	bin, err := e.resolveCLI()
 	if err != nil {
-		legacy := filepath.Join(e.Root, "venv", "bin", "noo-py")
-		if !isExecutable(legacy) {
-			return 127, err.Error() + "; and no legacy " + legacy
-		}
-		bin = legacy
+		return 127, err.Error()
 	}
 	return e.Runner.Run(ctx, e.Root, nil, bin, "security", "pki", "rotate-all", "--force")
 }
@@ -519,7 +534,7 @@ func opStackRebuild(ctx context.Context, e *Engine, name string, c *Command) (in
 		return 1, fmt.Sprintf("cannot claim rebuild marker: %v", err)
 	}
 
-	_ = WriteResult(e.Spool, name, Result{
+	e.writeResult(name, Result{
 		OK: true, Op: c.Op, Service: c.Service, RC: 0,
 		Stderr: "detached; log=" + logPath, Status: "running",
 	})
@@ -529,13 +544,13 @@ func opStackRebuild(ctx context.Context, e *Engine, name string, c *Command) (in
 		defer os.Remove(marker)
 		rc := e.runRebuildScript(context.WithoutCancel(ctx), logPath, args)
 		if rc == 0 {
-			_ = WriteResult(e.Spool, name, Result{
+			e.writeResult(name, Result{
 				OK: true, Op: c.Op, Service: c.Service, Stderr: "log=" + logPath, Status: "done",
 			})
 			e.logf("OK   %s op=stack-rebuild rc=0 (detached job finished)", name)
 			return
 		}
-		_ = WriteResult(e.Spool, name, Result{
+		e.writeResult(name, Result{
 			OK: false, Op: c.Op, Service: c.Service, RC: rc,
 			Stderr: "rebuild failed; see " + logPath, Status: "failed",
 		})

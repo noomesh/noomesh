@@ -5795,7 +5795,7 @@ fn hydrate_process_env(ctx: &Ctx) {
     }
     // The URL that VERIFIES: the gateway cert carries the tailnet name +
     // IP as SANs; localhost may not be among them. Prefer the ts.net name.
-    if std::env::var("NOO_GATEWAY_URL").map(|v| v.is_empty()).unwrap_or(true)
+    if crate::envfile::gateway_url_var_is_blank()
         && !ctx.state.ts_dnsname.is_empty()
     {
         std::env::set_var(

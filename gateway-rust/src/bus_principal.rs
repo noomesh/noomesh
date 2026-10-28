@@ -332,12 +332,7 @@ pub async fn account_principal(db: &sqlx::PgPool, username: &str) -> Option<Prin
             }
         }
     }
-    let row: Result<Option<(String, serde_json::Value, bool)>, _> = sqlx::query_as(
-        "SELECT role, scopes, COALESCE(disabled, false) FROM noo_users WHERE username = $1",
-    )
-    .bind(username)
-    .fetch_optional(db)
-    .await;
+    let row: Result<Option<(String, serde_json::Value, bool)>, _> = crate::repo::users::role_scopes_disabled(db, username).await;
     let resolved = match row {
         Ok(Some((role, scopes, disabled))) => principal_from_row(username, &role, &scopes, disabled),
         Ok(None) => None,

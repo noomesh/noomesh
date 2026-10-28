@@ -9,7 +9,7 @@ an earlier change retired controller→node SSH. Every lane moved to a rail over
 ollama models), and CA-signed bundles the node collects (provisioning,
 certs, teardown, fleet secrets). The last holdouts — the `cluster-executor`
 sidecar, `noo cluster set-primary`'s Postgres promotion, and eleven
-`noo-py cluster` verbs — went on 2026-09-11 (§3f R24).
+Python `cluster` verbs — went on 2026-09-11 (§3f R24).
 
 This is a source check, not a behaviour one, and that is the point: the
 lane comes back by someone writing `Command::new("ssh")`, and no
@@ -19,7 +19,7 @@ TWO FAILURES OF THE PREVIOUS VERSION OF THIS FILE, both worth stating
 because they are the reason it is shaped like this now:
 
   1. It scoped itself to `noo-cli/src` and SAID SO, filing the rest as
-     an earlier change. `src/noomesh/cluster/cli.py` kept seven `_ssh_pai` call
+     an earlier change. the Python `cluster/cli.py` (deleted since) kept seven `_ssh_pai` call
      sites — and a dozen more raw `subprocess.run(["ssh", ...])` ones the
      followup's count had missed — reachable as `noo-py cluster …` the
      whole time. A documented gap is still a gap.
@@ -121,10 +121,10 @@ def test_the_rust_crates_spawn_no_ssh_or_scp() -> None:
 def test_the_python_package_spawns_no_ssh_or_scp() -> None:
     offenders = _scan(PY_TREE, ".py", (PY_SPAWN, PY_LIB))
     assert not offenders, (
-        "`noo-py` does not reach into nodes either. Found:\n  "
+        "The Python package does not reach into nodes either. Found:\n  "
         + "\n  ".join(offenders)
         + "\n\nThe Rust front door owns every one of these verbs on a rail; "
-        "the Python twins were deleted 2026-09-11."
+        "the Python twins were deleted 2026-09-11 and the Python CLI itself went 2026-10-26."
     )
 
 

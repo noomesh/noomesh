@@ -9076,7 +9076,7 @@
           "cluster"
         ],
         "summary": "Mint a Tailscale pre-auth join key",
-        "description": "[native] Rust (routes/cluster.rs). Tailscale control-plane mint; returns bootstrap one-liner. Operator surface.",
+        "description": "[native] Rust (routes/cluster.rs). Tailscale control-plane mint; returns the pre-auth key. Operator surface.",
         "responses": {
           "200": {
             "description": "OK",
@@ -9087,12 +9087,6 @@
                   "additionalProperties": true,
                   "properties": {
                     "auth_key": {
-                      "type": "string"
-                    },
-                    "one_liner": {
-                      "type": "string"
-                    },
-                    "script_url": {
                       "type": "string"
                     },
                     "next_step": {
@@ -12124,10 +12118,6 @@
                       "type": "string",
                       "nullable": true
                     },
-                    "bootstrap_sha256": {
-                      "type": "string",
-                      "nullable": true
-                    },
                     "install_command": {
                       "type": "string",
                       "description": "Step 1, on the node: install the noo CLI."
@@ -13283,29 +13273,6 @@
             }
           }
         },
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": true
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/bootstrap": {
-      "get": {
-        "tags": [
-          "other"
-        ],
-        "summary": "Get bootstrap",
-        "description": "[native] GET /bootstrap \u2014 the enrollment script (public, because it runs before the host has any credential). The script itself does nothing without a valid TOKEN.",
-        "operationId": "serve_enroll_script",
         "responses": {
           "200": {
             "description": "OK",

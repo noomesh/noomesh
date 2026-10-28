@@ -97,6 +97,26 @@ pub const OPERATOR_CN_PREFIX: &str = "operator:";
 pub const OPERATOR_DAYS: i64 = 30;
 pub const DEFAULT_DAYS: i64 = 90;
 
+/// The CN prefix of EVERY add-on leaf: `CN=addon:<addon>/<stem>`
+/// ([`addon_leaf_cn`]). Add-on leaves stay service leaves (`O=Mesh Cluster
+/// Service`): a gateway reads any other organization that is not the
+/// operator's as a NODE (`gateway-rust/src/node_identity.rs`
+/// `identity_from_cert`), so a new organization would have made an add-on
+/// a node. What keeps an add-on from holding a core grant is the CN: every
+/// grant a service leaf can carry is keyed on an exact core service CN
+/// (`prometheus` → `/metrics`, `grafana` → `/api/grafana-ds/*`, the
+/// gateway's `SERVICE_RATE_CONSUMERS`, the node agent's `MetricsScraperCN`),
+/// none of which contains `:`. Before 0.6.13 the provision-only leaf was
+/// `CN=<addon>`, so an add-on named `prometheus` or `grafana` would have
+/// held that service's grant.
+pub const ADDON_CN_PREFIX: &str = "addon:";
+
+/// The CN of `addon`'s leaf `stem` (`addon:rhaddon/db-client`,
+/// `addon:rhaddon/noo-rhaddon`). Derived here only: no caller passes a CN.
+pub fn addon_leaf_cn(addon: &str, stem: &str) -> String {
+    format!("{ADDON_CN_PREFIX}{addon}/{stem}")
+}
+
 /// $NOO_PKI_DIR, else ~/.config/mesh/pki — same resolution as the Python
 /// CLI (`os.getenv("NOO_PKI_DIR", "~/.config/mesh/pki")`); the repo .env is
 /// already loaded by `ensure_repo_env` before handlers run.
@@ -664,6 +684,9 @@ impl ClusterCa {
                 KeyReader::ContainerUid(PG_LEAF_UID)
             }
             ["nodes", _, "node.key"] => KeyReader::Cli,
+            // An add-on's own leaf (`issue_addon_leaf`): read here only, then
+            // copied into the add-on's rundir by the launcher.
+            ["addons", _, f] if f.ends_with(".key") => KeyReader::Cli,
             // A node's backend door leaf: on THIS disk only the CLI reads
             // it (to pack the provision bundle). On the node it is read by
             // root in the door's container and installed 0600 by the
@@ -1875,6 +1898,36 @@ impl ClusterCa {
         )
     }
 
+    /// Where an add-on's own leaf lives: `addons/<addon>/<stem>.crt|key`.
+    /// Only this CLI reads the key (0600, `key_reader`); the launcher copies
+    /// it into the add-on's tmpfs rundir, owned by the uid its bundle
+    /// declares (`addons::resources`). Never mounted from here, and never in
+    /// `public/`.
+    pub fn addon_leaf_paths(&self, addon: &str, stem: &str) -> (PathBuf, PathBuf) {
+        let d = self.dir.join("addons").join(addon);
+        (d.join(format!("{stem}.crt")), d.join(format!("{stem}.key")))
+    }
+
+    /// Issue (or re-issue) an add-on's leaf: a SERVICE leaf (`O=Mesh Cluster
+    /// Service`), so the gateway reads it as a named service, never as a node
+    /// id (`node_identity::identity_from_cert`), with `CN=addon:<addon>/<stem>`
+    /// ([`addon_leaf_cn`]), which no core grant names. The CN is derived
+    /// here, never passed in. `dns` are the add-on's own names
+    /// (`noo-<addon>[-<suffix>]`, or `pg-<addon>-<role>`), checked by
+    /// `addons::resources`. The key is 0600 for this CLI only (`key_reader`):
+    /// the launcher and `--provision-only` copy it, 0400, to tmpfs.
+    pub fn issue_addon_leaf(&self, addon: &str, stem: &str, dns: &[String], days: i64) -> Result<(PathBuf, PathBuf), String> {
+        let stem_ok = !stem.is_empty()
+            && stem.len() <= 64
+            && stem.as_bytes()[0].is_ascii_lowercase()
+            && stem.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-');
+        if !crate::addons::trust::name_ok(addon) || !stem_ok {
+            return Err(format!("`{addon}`/`{stem}` is not an add-on leaf name"));
+        }
+        let (cert, key) = self.addon_leaf_paths(addon, stem);
+        self.issue_leaf(&addon_leaf_cn(addon, stem), "Mesh Cluster Service", &cert, &key, dns, &[], days)
+    }
+
     /// A NODE's backend door leaf: the same profile as
     /// [`issue_service_cert`] — CN=<service>, O=Mesh Cluster Service,
     /// `<service>` + `localhost` + `hostnames` as DNS SANs, `127.0.0.1` —
@@ -2646,6 +2699,46 @@ mod key_mode_tests {
             .join(format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// An add-on leaf can never carry a core service's identity: every grant
+    /// a service leaf can hold is keyed on an exact core CN, and an add-on's
+    /// CN is `addon:<name>/<stem>` whatever the add-on is called. Its key is
+    /// the CLI's alone (0600). Reverting `issue_addon_leaf` to `CN=<addon>`
+    /// (the provision-only leaf before 0.6.13) fails the first assertion for
+    /// `prometheus`; dropping the `addons/*/*.key` reader row fails the mode.
+    #[test]
+    fn an_addon_leaf_is_namespaced_and_its_key_is_the_clis_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let ca = ClusterCa::new(scratch());
+        ca.generate_ca("t", 3650).unwrap();
+        let mut checked = 0;
+        for addon in ["prometheus", "grafana", "worker", "rhaddon"] {
+            let (crt, key) = ca.issue_addon_leaf(addon, "db-client", &[format!("pg-{addon}-x")], 30).unwrap();
+            assert_eq!(crt, ca.dir.join("addons").join(addon).join("db-client.crt"));
+            let data = std::fs::read(&crt).unwrap();
+            let (_, pem) = x509_parser::pem::parse_x509_pem(&data).unwrap();
+            let cert = pem.parse_x509().unwrap();
+            let cn = cert.subject().iter_common_name().next().and_then(|a| a.as_str().ok()).unwrap().to_string();
+            let orgs: Vec<&str> = cert.subject().iter_organization().filter_map(|a| a.as_str().ok()).collect();
+            assert_eq!(cn, format!("addon:{addon}/db-client"), "an add-on leaf named {addon} must not read as core's {addon}");
+            assert_eq!(orgs, vec!["Mesh Cluster Service"], "any other organization is read as a NODE by the gateway");
+            assert_eq!(ca.key_reader(&key), KeyReader::Cli);
+            assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600, "{addon}: never the legacy 0644");
+            checked += 1;
+        }
+        assert_eq!(checked, 4);
+        assert!(ca.issue_addon_leaf("Bad", "db-client", &[], 30).is_err());
+        assert!(ca.issue_addon_leaf("ok", "../x", &[], 30).is_err());
+        assert!(ca.issue_addon_leaf("ok", "", &[], 30).is_err());
+        // No core leaf name can carry the prefix, so no grant keyed on one matches it.
+        assert!(!SERVICE_KEY_READERS.is_empty() && !PG_LEAVES.is_empty());
+        for (svc, _) in SERVICE_KEY_READERS {
+            assert!(!svc.starts_with(ADDON_CN_PREFIX) && !svc.contains(':'), "{svc}");
+        }
+        for leaf in PG_LEAVES {
+            assert!(!leaf.role.contains(':') && !leaf.owner.contains(':'), "{leaf:?}");
+        }
     }
 
     fn mode_of(p: &Path) -> u32 {

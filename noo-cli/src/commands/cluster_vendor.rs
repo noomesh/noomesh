@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::args::{ArgError, Args};
 use crate::harness_kinds::{self, artifact_url, Format, Pinned, Table, Unpack};
 use crate::output::{fail, ExitCode};
 use crate::release_fetch::{self, FetchClass, FetchError};
@@ -389,7 +390,7 @@ pub(crate) fn pick_platforms(
 }
 
 #[derive(Debug, Default, PartialEq)]
-struct StageArgs {
+pub(crate) struct StageArgs {
     kind: Option<String>,
     all: bool,
     fleet: bool,
@@ -429,30 +430,31 @@ pub(crate) fn needed_targets(
     out
 }
 
-fn parse_stage_args(args: &[String]) -> Result<StageArgs, Unhandled> {
-    let mut a = StageArgs::default();
-    let mut it = args.iter();
-    while let Some(t) = it.next() {
-        match t.as_str() {
-            "--all" => a.all = true,
-            "--fleet" => a.fleet = true,
-            "--os" => a.os = Some(it.next().ok_or(Unhandled)?.clone()),
-            "--arch" => a.arch = Some(it.next().ok_or(Unhandled)?.clone()),
-            x if x.starts_with('-') => return Err(Unhandled),
-            x if a.kind.is_none() => a.kind = Some(x.to_string()),
-            _ => return Err(Unhandled),
-        }
+fn parse_stage_args(args: &[String]) -> Result<StageArgs, ArgError> {
+    parse_stage_with(&mut Args::new(args))
+}
+
+pub(crate) fn parse_stage_with(args: &mut Args) -> Result<StageArgs, ArgError> {
+    let all = args.flag(&["--all"]);
+    let fleet = args.flag(&["--fleet"]);
+    let os = args.value(&["--os"])?;
+    let arch = args.value(&["--arch"])?;
+    let mut kinds = args.positionals()?;
+    if kinds.len() > 1 {
+        return Err(ArgError::new(format!("unexpected argument `{}` after <kind>", kinds[1])));
     }
+    let a = StageArgs { kind: kinds.pop(), all, fleet, os, arch };
     if a.all && a.kind.is_some() {
-        return Err(Unhandled); // <kind> or --all, not both
+        return Err(ArgError::new("give a <kind> or --all, not both"));
     }
     if a.fleet && a.kind.is_none() {
-        return Err(Unhandled); // `--all` is every kind fleet-wide
+        return Err(ArgError::new("--fleet goes with a <kind> (--all is every kind fleet-wide)"));
     }
-    if a.os.as_deref().is_some_and(|o| !harness_kinds::OSES.contains(&o))
-        || a.arch.as_deref().is_some_and(|x| !harness_kinds::ARCHES.contains(&x))
-    {
-        return Err(Unhandled);
+    if let Some(o) = a.os.as_deref().filter(|o| !harness_kinds::OSES.contains(o)) {
+        return Err(ArgError::new(format!("--os `{o}` is not one of {}", harness_kinds::OSES.join(", "))));
+    }
+    if let Some(x) = a.arch.as_deref().filter(|x| !harness_kinds::ARCHES.contains(x)) {
+        return Err(ArgError::new(format!("--arch `{x}` is not one of {}", harness_kinds::ARCHES.join(", "))));
     }
     Ok(a)
 }

@@ -18,10 +18,10 @@
 //! (`node-agent-go/internal/auth/clustertoken_v2.go`) and `scripts/noo-fetch.sh`
 //! sign the same message; the shared test vector pins all three.
 //!
-//! Rollout: every verifier accepts v1 AND v2 (v1 is counted under the
-//! `cluster_hmac_v1` legacy lane); signers send v2. Once `noo cluster verify`
-//! shows no v1 callers, the posture bridge `NOO_CLUSTER_TOKEN_V1=0` refuses
-//! v1 ([`v1_allowed`]).
+//! v2 is the only admitted form. A v1 token (`<actor>:<ts>:<hmac>`) is refused
+//! in `auth::require_any_auth` (`401 cluster_token_v1_refused`, counted as
+//! `cluster_hmac_v1_refused`); the `NOO_CLUSTER_TOKEN_V1` gate that once
+//! admitted it is deleted.
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
@@ -118,16 +118,6 @@ pub fn verify_signature<'a>(
     // `verify_slice` compares in constant time.
     mac.verify_slice(&sig).ok()?;
     Some((p.actor, p.nonce))
-}
-
-/// Is the legacy v1 token still accepted? Unset (the rollout default) and
-/// anything but an explicit closing value: yes.
-pub fn v1_allowed() -> bool {
-    v1_allowed_value(&std::env::var("NOO_CLUSTER_TOKEN_V1").unwrap_or_default())
-}
-
-pub fn v1_allowed_value(v: &str) -> bool {
-    !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off" | "closed")
 }
 
 /// Nonce -> expiry, bounded. The process-local half of the replay memory.
@@ -299,15 +289,5 @@ mod tests {
         let n = "ffeeddccbbaa99887766554433221100";
         assert!(claim(None, "hostx", n, 5000).await);
         assert!(!claim(None, "hostx", n, 5001).await, "replay refused with no Redis at all");
-    }
-
-    #[test]
-    fn the_v1_gate_closes_only_on_an_explicit_value() {
-        for open in ["", "1", "true", "open", "anything", " "] {
-            assert!(v1_allowed_value(open), "{open:?}");
-        }
-        for closed in ["0", "false", "NO", "off", " closed "] {
-            assert!(!v1_allowed_value(closed), "{closed:?}");
-        }
     }
 }

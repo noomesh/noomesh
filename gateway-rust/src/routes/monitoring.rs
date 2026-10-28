@@ -34,6 +34,7 @@
 //! install that issues it AFTER the gateway came up should not have to
 //! restart to make the button work. One small file read per click.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 
 use axum::{extract::State, routing::post, Extension, Json, Router};
@@ -66,9 +67,7 @@ fn sso_key_path() -> std::path::PathBuf {
     if let Some(p) = std::env::var(GRAFANA_SSO_KEY_ENV).ok().filter(|s| !s.trim().is_empty()) {
         return std::path::PathBuf::from(p);
     }
-    let roots: Vec<String> = std::env::var("NOO_PKI_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
+    let roots: Vec<String> = crate::tls::pki_dir().map(|p| p.to_string_lossy().into_owned())
         .into_iter()
         .chain(["/tmp/pki".to_string(), "/app/pki".to_string()])
         .collect();
@@ -270,10 +269,7 @@ async fn grafana_session(
     // same as every other place a person accumulates.
     let account = crate::auth::account_of(&sub);
     let row: Option<(String, serde_json::Value, bool)> =
-        sqlx::query_as("SELECT role, scopes, COALESCE(disabled, false) FROM noo_users WHERE username = $1")
-            .bind(account)
-            .fetch_optional(&state.db)
-            .await?;
+        crate::repo::users::role_scopes_disabled(&state.db, account).await?;
     let (live, disabled) = match row {
         None => (None, false),
         Some((role_col, scopes_col, disabled)) => {
@@ -314,14 +310,10 @@ async fn grafana_session(
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(ttl as i64);
 
     tracing::info!(account, role = role.as_str(), grafana_role, ttl, "grafana_session_issued");
-    super::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "grafana_session_issued",
-        "info",
-        account,
-        "grafana",
-        "ok",
-        json!({ "role": role.as_str(), "grafana_role": grafana_role, "jti": jti, "expires_in": ttl }),
+        AuditEvent::new(AuditKind::GrafanaSessionIssued, account, "grafana")
+            .details(json!({ "role": role.as_str(), "grafana_role": grafana_role, "jti": jti, "expires_in": ttl })),
     )
     .await;
 
@@ -348,7 +340,7 @@ mod tests {
         let body = src.split("async fn grafana_session(").nth(1).expect("the handler exists");
         let body = body.split("#[cfg(test)]").next().unwrap();
         assert!(body.contains("grafana_session_role("), "the handler must call auth::grafana_session_role");
-        assert!(body.contains("FROM noo_users"), "the handler must re-read the account row");
+        assert!(body.contains("users::role_scopes_disabled("), "the handler must re-read the account row");
         assert!(body.contains("mint_grafana_jwt_with("), "the handler must mint through the pinned mint");
         assert!(
             !body.contains("r.role") && !body.contains(".role,") && !body.contains("ctx.role"),

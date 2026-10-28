@@ -1232,7 +1232,7 @@ fn install_findings(
 
     let inputs = ScanInputs {
         jwt_secret: env_var("NOO_JWT_SECRET"),
-        cluster_secret: env_var("NOO_CLUSTER_SECRET"),
+        cluster_secret: crate::credentials::cluster_secret_from_env(),
         redis_password: env_var("REDIS_PASSWORD"),
         node_agent_token: env_var("NOO_NODE_AGENT_TOKEN"),
         env_mode,

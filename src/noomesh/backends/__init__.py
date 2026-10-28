@@ -22,7 +22,6 @@ lives here, once, as open ``BackendProfile`` records:
   derive their port maps from :func:`port_map`.
 - ``cluster.backend_manager`` derives health paths and the GPU-headroom /
   inference-count sets from the profiles.
-- ``cluster.cli`` derives its backend tab-completion list.
 - ``factory.build_llm_client`` picks the client class from ``api_format``
   ("openai" → ``OpenAICompatClient``, anything else → ``OllamaClient``).
 

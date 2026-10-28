@@ -1414,28 +1414,79 @@ class AppConfig(BaseModel):
         return self
 
 
+def _install_root() -> Optional[Path]:
+    """The INSTALL root the Rust CLI ranks between cwd and ``~/.config``:
+    ``$NOO_REPO_ROOT``, else the standalone state home (``$NOO_HOME`` or
+    ``~/.noo``) when it carries the ``.noo-standalone`` marker. Mirrors
+    ``envfile::repo_root_static`` minus its cwd-checkout rung (cwd is already
+    searched first)."""
+    declared = os.getenv("NOO_REPO_ROOT")
+    if declared:
+        return Path(declared)
+    home = os.getenv("NOO_HOME", "").strip()
+    state = Path(home) if home else Path.home() / ".noo"
+    return state if (state / ".noo-standalone").exists() else None
+
+
+def config_search_candidates() -> list[Path]:
+    """Where noomesh.yaml is looked for when nothing names it, in order.
+
+    ONE order for every Python reader, kept identical to the Rust side so the
+    two cannot find different files:
+
+    - ``noo`` (``commands/config.rs::config_search_candidates``):
+      ``./noomesh.yaml`` -> ``<install root>/noomesh.yaml`` ->
+      ``~/.config/mesh/config.yaml``
+    - the Rust gateway (``paths::CONFIG_YAML_CANDIDATES``):
+      ``/app/noomesh.yaml`` -> ``./noomesh.yaml`` (container: ``/app`` IS the
+      working directory, so this is the same file as the cwd rung).
+
+    Explicit selection (an argument, ``$NOO_CONFIG``, ``$NOO_CONFIG_PATH`` the
+    gateway's name for it) is handled by :func:`resolve_config_path`.
+    """
+    out: list[Path] = []
+    root = _install_root()
+    for p in (
+        Path.cwd() / "noomesh.yaml",
+        Path("/app/noomesh.yaml"),
+        (root / "noomesh.yaml") if root else None,
+        _default_config_path(),
+    ):
+        if p is not None and p not in out:
+            out.append(p)
+    return out
+
+
 def resolve_config_path(config_path: Optional[str | Path]) -> Optional[Path]:
+    """The config file to use: argument > ``$NOO_CONFIG`` >
+    ``$NOO_CONFIG_PATH`` > first existing :func:`config_search_candidates`
+    entry. This is the only place that decides which noomesh.yaml is read."""
     if config_path:
         return Path(config_path)
 
-    env_path = os.getenv("NOO_CONFIG")
-    if env_path:
-        return Path(env_path)
+    for var in ("NOO_CONFIG", "NOO_CONFIG_PATH"):
+        env_path = os.getenv(var)
+        if env_path:
+            return Path(env_path)
 
     # noomesh.yaml is the ONLY config file. A legacy
     # fallback config file was retired: it had drifted from the real config,
     # and a fallback that silently supplies stale values is worse than no
     # config at all.
-    for name in ("noomesh.yaml",):
-        cwd_path = Path.cwd() / name
-        if cwd_path.exists():
-            return cwd_path
-
-    default_path = _default_config_path()
-    if default_path.exists():
-        return default_path
+    for candidate in config_search_candidates():
+        if candidate.exists():
+            return candidate
 
     return None
+
+
+def read_config_yaml(config_path: Optional[str | Path] = None) -> dict:
+    """The raw (unvalidated) noomesh.yaml mapping, ``{}`` when no file is
+    found. For readers that need one key and must not pull in the whole
+    :class:`AppConfig` validation. Every Python reader goes through here or
+    :func:`load_config`; ``tests/test_config_has_one_reader.py`` enforces it."""
+    path = resolve_config_path(config_path)
+    return _load_yaml(path) if path else {}
 
 
 def _load_yaml(path: Path) -> dict:

@@ -162,20 +162,11 @@ fi
 #
 # The report is on the NODE RAIL: it WRITES apply state and
 # is audited as this node, so it is signed with NOO_CLUSTER_SECRET — the same
-# `<node>:<ts>:<hmac>` bearer the agent uses everywhere else. The secret is
+# request-bound v2 bearer the agent uses everywhere else. The secret is
 # delivered BY a bundle (into /etc/noo-node-agent.env), so it is absent on the
 # very first applier-only pass and after a failed first apply; in that case the
 # report is skipped with a note rather than sent unauthenticated. `provision
 # --wait` gates the applier phase on fetched_at, not on this report.
-# The bearer form this node signs: `v1` only when the agent env pins it
-# (NOO_CLUSTER_TOKEN_SIGN=v1, for a node rolled before its controller),
-# `v2` otherwise. Same stripping as node_bearer.
-node_sign_form() {
-    _f="$(sed -n 's/^NOO_CLUSTER_TOKEN_SIGN=//p' /etc/noo-node-agent.env 2>/dev/null | tail -1 \
-        | tr -d '\015' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//")"
-    case "$_f" in v1|V1) echo v1 ;; *) echo v2 ;; esac
-}
-
 node_bearer() {
     _env=/etc/noo-node-agent.env
     [ -r "$_env" ] || return 1
@@ -195,16 +186,6 @@ node_bearer() {
     fi
     [ -n "$_sec" ] || return 1
     _ts="$(date +%s)"
-    if [ "${NOO_BEARER_FORM:-v2}" = v1 ]; then
-        # The legacy form: HMAC over "<node>:<ts>" only. Kept for a controller
-        # that predates v2 (retry after a 401), never the first attempt.
-        _sig="$(printf '%s:%s' "$NODE" "$_ts" \
-            | openssl dgst -sha256 -hmac "$_sec" -hex 2>/dev/null \
-            | sed 's/.*= *//')"
-        [ -n "$_sig" ] || return 1
-        printf '%s:%s:%s' "$NODE" "$_ts" "$_sig"
-        return 0
-    fi
     # v2 binds the request: METHOD, path, sha256(body), node, time and a
     # 128-bit nonce the gateway spends once. $1 method, $2 path, $3 body.
     _bsha="$(printf '%s' "$3" | openssl dgst -sha256 -hex 2>/dev/null | sed 's/.*= *//')"
@@ -327,19 +308,16 @@ report_post() {
     _errf="${TMP:-/tmp}/report.err"
     _path="/bootstrap/bundle/$NODE/applied"
     _body="{\"sha\":\"$SUM\",\"rc\":$_r,\"msg\":\"$_m\"}"
-    # v2 always, unless this node pins the old form for a controller that
-    # predates v2 (NOO_CLUSTER_TOKEN_SIGN=v1 in the agent env, the same pin
-    # the agent itself honours). There is no v1 retry after a 401: a v2
-    # refusal is reported as the 401 it is, never re-sent on the replayable
-    # form (that retry was the only v1 this script ever sent).
-    _form="$(node_sign_form)"
+    # v2 always. There is no v1 form left to sign: the controller refuses it.
+    # A stale NOO_CLUSTER_TOKEN_SIGN=v1 line in the agent env is ignored. A
+    # v2 refusal is reported as the 401 it is, never re-sent.
     # Substitute the bearer placeholder with a token for THIS request.
     _n=$#; _i=0
     while [ "$_i" -lt "$_n" ]; do
         _a="$1"; shift
         case "$_a" in
             "authorization: Bearer @NODE_BEARER@")
-                _a="authorization: Bearer $(NOO_BEARER_FORM=$_form node_bearer POST "$_path" "$_body")" ;;
+                _a="authorization: Bearer $(node_bearer POST "$_path" "$_body")" ;;
         esac
         set -- "$@" "$_a"
         _i=$((_i + 1))

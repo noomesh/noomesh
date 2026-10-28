@@ -255,6 +255,7 @@ _pgpass_body() {
 #      NOO_<ID>_DDL_PASSWORD on`. A name source 1 already declared is skipped
 #      (noomesh.yaml wins, as in the gateway's broker).
 # Nothing downstream changes per source: not compose, not the gateway's lookup.
+command -v config_has_section >/dev/null 2>&1 || . "$(dirname "${BASH_SOURCE[0]}")/lib-config.sh"
 _declared_systems() {
     local nb="" rc=0 out="" d a id up seen=" " name
     if [ -f noomesh.yaml ]; then
@@ -274,7 +275,7 @@ _declared_systems() {
             out=""
             # Silent only when nothing is declared: a manifest this launcher could
             # not read is a system whose flag and passwords will not arrive.
-            if grep -qE '^systems:' noomesh.yaml; then
+            if config_has_section noomesh.yaml systems; then
                 echo "WARNING: could not list the declared systems (noo config launch-render systems: exit $rc; an older noo?)." >&2
                 echo "         A system no compose line names will not receive its flag or passwords; the gateway skips it and says so." >&2
             fi
@@ -443,9 +444,15 @@ _secret_compose_files() {
 #   <name> <SOURCE_VAR> <owner uid>
 # SOURCE_VAR is the `x-noo-source:` extension on the same entry (compose
 # ignores `x-` keys). OWNER is the uid every service that takes the secret
-# runs as, read from the services' own `uid:` (so the compose file is the one
-# home of that fact): the single non-zero uid among them, or 0 when only
-# root containers take it. A container running as root reads a file owned by
+# runs as, read from the services' own `x-noo-uid:` on the entry (so the
+# compose file is the one home of that fact; it is an extension key, not
+# compose's `uid:`, which is Swarm-only and which Compose v5 warns about on
+# every start): the single non-zero uid among them, or 0 when only
+# root containers take it. An entry with no x-noo-uid falls back to its
+# Swarm-era `uid:` key: add-on bundles signed before 0.6.13 (trellion-intel
+# v0.1.4) still write it, and without the fallback their key file stays
+# root-owned and the add-on crash-loops (rc.2 rehearsal). x-noo-uid wins
+# when both are present. A container running as root reads a file owned by
 # 65532 through the default CAP_DAC_OVERRIDE (tests/test_secret_rundir.py
 # holds: no root consumer of a shared secret drops it). Two different
 # non-zero uids cannot be served by one file and print CONFLICT as the owner;
@@ -458,12 +465,18 @@ _secret_file_plan() {
         insec && /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ { cur = $1; sub(/:$/, "", cur); next }
         insec && cur != "" && /^[[:space:]]+file:/ && /NOO_SECRET_RUNDIR/ { order[++n] = cur; next }
         insec && cur != "" && /^[[:space:]]+x-noo-source:/ { v = $2; gsub(/["\047]/, "", v); src[cur] = v; next }
-        !insec && /source:[[:space:]]*[A-Za-z0-9_.-]+/ && /uid:/ {
+        !insec && /source:[[:space:]]*[A-Za-z0-9_.-]+/ && (/x-noo-uid:/ || /[{,[:space:]]uid:[[:space:]]*"?[0-9]/) {
             line = $0
             match(line, /source:[[:space:]]*[A-Za-z0-9_.-]+/)
             s = substr(line, RSTART, RLENGTH); sub(/^source:[[:space:]]*/, "", s)
-            match(line, /uid:[[:space:]]*"?[0-9]+/)
-            u = substr(line, RSTART, RLENGTH); sub(/^uid:[[:space:]]*"?/, "", u)
+            if (match(line, /x-noo-uid:[[:space:]]*"?[0-9]+/)) {
+                u = substr(line, RSTART, RLENGTH); sub(/^x-noo-uid:[[:space:]]*"?/, "", u)
+            } else {
+                # An add-on bundle signed before 0.6.13 still declares the Swarm-era
+                # `uid:` (see the header). Its file must still reach that uid.
+                match(line, /[{,[:space:]]uid:[[:space:]]*"?[0-9]+/)
+                u = substr(line, RSTART + 1, RLENGTH - 1); sub(/^uid:[[:space:]]*"?/, "", u)
+            }
             if (u != "0") { if (nz[s] == "") nz[s] = u; else if (nz[s] != u) conflict[s] = 1 }
         }
         END {

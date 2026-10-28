@@ -316,6 +316,9 @@ func (e *Executor) handleDispatch(data []byte) {
 	})
 
 	// Execute in background
+	// Root of the job's own lifetime: the NATS handler that delivers it returns
+	// immediately, so there is no caller ctx to inherit. Cancelling the job
+	// (e.active[...]) cancels everything below, docker calls included.
 	ctx, cancel := context.WithCancel(context.Background())
 	e.mu.Lock()
 	e.active[job.JobID] = cancel
@@ -420,7 +423,7 @@ func (e *Executor) executeInference(ctx context.Context, payload map[string]any,
 	prompt, _ := payload["prompt"].(string)
 	model, _ := payload["model"].(string)
 
-	backends := e.docker.RunningBackends()
+	backends := e.docker.RunningBackends(ctx)
 	if backend == "" {
 		for _, b := range []string{"vllm", "llamacpp", "ollama"} {
 			if _, ok := backends[b]; ok {
@@ -444,7 +447,7 @@ func (e *Executor) executeInference(ctx context.Context, payload map[string]any,
 	// falls back to localhost for bare-metal edge deployment. The running
 	// containers' declaration (TLS + client cert, llama.cpp's sidecar) wins
 	// over the env flag; e.http presents the node leaf.
-	baseURL := e.docker.BackendDialURL(backend)
+	baseURL := e.docker.BackendDialURL(ctx, backend)
 
 	var reqBody []byte
 	var url string
@@ -524,7 +527,7 @@ func (e *Executor) executeModelDownload(ctx context.Context, payload map[string]
 	if profile == "" {
 		return nil, fmt.Errorf("no profile specified")
 	}
-	if err := e.docker.PullProfile(profile); err != nil {
+	if err := e.docker.PullProfile(ctx, profile); err != nil {
 		return nil, err
 	}
 	return map[string]string{"status": "downloaded", "profile": profile}, nil

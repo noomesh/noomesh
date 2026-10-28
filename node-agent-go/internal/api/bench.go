@@ -156,9 +156,9 @@ func (s *Server) resolveBenchTarget(ctx context.Context) (benchTarget, error) {
 	}
 	running := map[string]string{}
 	if s.docker != nil {
-		running = s.docker.RunningBackends()
+		running = s.docker.RunningBackends(ctx)
 	}
-	native := s.nativeBackends()
+	native := s.nativeBackends(ctx)
 	for b, m := range native {
 		if _, taken := running[b]; !taken {
 			running[b] = m
@@ -169,7 +169,7 @@ func (s *Server) resolveBenchTarget(ctx context.Context) (benchTarget, error) {
 		return benchTarget{}, fmt.Errorf("%w: the chat placement's backend %s is not running", errNoChatBackend, cp.Backend)
 	}
 	port := dockerpkg.BackendPorts[cp.Backend]
-	base, scheme := s.inferenceTarget(cp.Backend, port, native)
+	base, scheme := s.inferenceTarget(ctx, cp.Backend, port, native)
 	if served == "" {
 		served = cp.Model
 	}

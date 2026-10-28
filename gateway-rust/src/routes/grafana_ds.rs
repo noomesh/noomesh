@@ -353,9 +353,7 @@ async fn live_tier(db: &sqlx::PgPool, login: &str) -> Result<Role, String> {
         Some((t, at)) if at.elapsed() < TIER_TTL => t,
         _ => {
             let row: Option<(String, Value, bool)> =
-                sqlx::query_as("SELECT role, scopes, COALESCE(disabled, false) FROM noo_users WHERE username = $1")
-                    .bind(&account)
-                    .fetch_optional(db)
+                crate::repo::users::role_scopes_disabled(db, &account)
                     .await
                     .map_err(|e| {
                         tracing::warn!(account = %account, error = %e, "grafana_ds_tier_lookup_failed");

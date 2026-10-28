@@ -2,8 +2,8 @@
 // Copyright 2026 PersonifAI LLC
 
 //! Repo `.env` loading + gateway URL resolution.
-//! Mirrors `noomesh/cli_utils.py::ensure_repo_env` / `get_gateway_url` —
-//! keep the two in sync until the Python CLI retires.
+//! Mirrors `noomesh/cli_utils.py::ensure_repo_env` / `get_gateway_url` (deleted with
+//! the Python CLI; kept as provenance).
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -604,18 +604,39 @@ pub fn gateway_url(override_url: &Option<String>) -> String {
     gateway_url_source(override_url).0
 }
 
+/// The ONE reader of `CONTROLLER_URL` / `NOO_GATEWAY_URL` (in that order):
+/// the trimmed value and the variable that supplied it. Empty values and
+/// docker-internal `://gateway:` hosts are skipped. Every command reaches
+/// these variables through here or [`gateway_url`] — the source-scan test
+/// `config_readers_have_one_owner` in `src/config_readers.rs` fails on any
+/// other file that reads them.
+pub fn gateway_url_from_env() -> Option<(String, &'static str)> {
+    for var in ["CONTROLLER_URL", "NOO_GATEWAY_URL"] {
+        if let Ok(u) = std::env::var(var) {
+            let u = u.trim();
+            if !u.is_empty() && !u.contains("://gateway:") {
+                return Some((u.trim_end_matches('/').to_string(), var));
+            }
+        }
+    }
+    None
+}
+
+/// True when `NOO_GATEWAY_URL` itself is unset or blank in this process
+/// (the onboarding wizard's "may I default it?" check; `CONTROLLER_URL` is
+/// deliberately not consulted — it is the wizard's own variable to set).
+pub fn gateway_url_var_is_blank() -> bool {
+    std::env::var("NOO_GATEWAY_URL").map(|v| v.trim().is_empty()).unwrap_or(true)
+}
+
 /// [`gateway_url`] plus the rung that answered. See [`GatewaySource`].
 pub fn gateway_url_source(override_url: &Option<String>) -> (String, GatewaySource) {
     if let Some(u) = override_url {
         return (u.trim_end_matches('/').to_string(), GatewaySource::Override);
     }
     ensure_repo_env();
-    for var in ["CONTROLLER_URL", "NOO_GATEWAY_URL"] {
-        if let Ok(u) = std::env::var(var) {
-            if !u.is_empty() && !u.contains("://gateway:") {
-                return (u.trim_end_matches('/').to_string(), GatewaySource::Env(var));
-            }
-        }
+    if let Some((u, var)) = gateway_url_from_env() {
+        return (u, GatewaySource::Env(var));
     }
     // Enrolled worker: prep-host records the controller this box enrolled
     // through at /etc/noo/controller-url (644). Without this, a worker's

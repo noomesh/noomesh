@@ -34,9 +34,9 @@ use crate::state::AppState;
 /// Errors are logged, not fatal: a partition failure must not stop the
 /// gateway booting. But the old comment here promised that "the next audit
 /// insert will fail loudly if a partition is genuinely missing", and that
-/// was never true — `audit_event` discarded its result, so the insert
+/// was never true — `audit_event` (now `audit::record`) discarded its result, so the insert
 /// failed in total silence. The loudness now lives where it belongs, in
-/// `routes::core::audit_insert`, which logs a lost audit row at `error!`
+/// `audit::audit_insert`, which logs a lost audit row at `error!`
 /// and heals the partition itself. This hook is the fast path, not the
 /// guarantee.
 pub async fn ensure_current_and_next(state: &AppState) -> usize {

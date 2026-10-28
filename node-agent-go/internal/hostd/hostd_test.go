@@ -651,7 +651,7 @@ func TestTheHeartbeatFileIsNotMistakenForACommand(t *testing.T) {
 }
 
 // A standalone controller has no <root>/venv: the rotate op must run the
-// native noo binary, not exit 127 looking for the retired Python CLI.
+// native noo binary, not exit 127 looking for a venv CLI.
 func TestRotateRunsTheNativeCLIWhenThereIsNoVenv(t *testing.T) {
 	root := t.TempDir()
 	cli := filepath.Join(t.TempDir(), "noo")
@@ -675,7 +675,7 @@ func TestRotateSaysWhatItLookedForWhenNoCLIExists(t *testing.T) {
 	t.Setenv("NOO_CLI_BIN", filepath.Join(t.TempDir(), "absent"))
 	e := &Engine{Root: t.TempDir(), Runner: &fakeRunner{}}
 	rc, out := opRotate(context.Background(), e, "", &Command{})
-	if rc != 127 || !strings.Contains(out, "NOO_CLI_BIN") || !strings.Contains(out, "venv") {
+	if rc != 127 || !strings.Contains(out, "NOO_CLI_BIN") {
 		t.Fatalf("rc=%d out=%q, want 127 naming what was tried", rc, out)
 	}
 }

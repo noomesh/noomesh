@@ -33,6 +33,7 @@
 //! - **Owner is a uuid**, resolved from the caller's name at insert;
 //!   never a name column.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 
 use axum::{
@@ -44,7 +45,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
 
-use crate::auth::{AuthActor, RequesterCtx, Role};
+use crate::auth::AuthActor;
+use crate::authz::Operator;
 use crate::routes::{AppError, AppResult};
 use crate::state::AppState;
 
@@ -201,16 +203,10 @@ pub fn validate_audience_shape(audience: &[String]) -> Result<Vec<String>, Strin
 
 // ───────────────────────────── auth helpers ─────────────────────────────
 
-/// Operator-only, on reads too (a read-scope user must not enumerate the
-/// servers, their env keys or their placements). Cluster-HMAC callers carry
-/// no `RequesterCtx` and pass, as everywhere on `/api/security/*`.
-fn operator_guard(ctx: &Option<Extension<RequesterCtx>>) -> Result<(), AppError> {
-    match ctx {
-        None => Ok(()),
-        Some(Extension(r)) if r.role >= Role::Operator => Ok(()),
-        Some(_) => Err(AppError::Forbidden("operator role required".into())),
-    }
-}
+// Operator-only, on reads too (a read-scope user must not enumerate the
+// servers, their env keys or their placements). Cluster-HMAC callers carry no
+// `RequesterCtx` and pass, as everywhere on `/api/security/*`: every handler
+// below takes `Operator` for that policy.
 
 fn actor_label(actor: &Option<Extension<AuthActor>>) -> String {
     actor.as_ref().map(|Extension(a)| a.0.clone()).unwrap_or_else(|| "cluster".into())
@@ -220,9 +216,8 @@ fn actor_label(actor: &Option<Extension<AuthActor>>) -> String {
 
 async fn servers_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: Operator,
 ) -> AppResult {
-    operator_guard(&ctx)?;
     let rows = sqlx::query(
         "SELECT s.id, s.transport, s.kind, s.enabled, s.audience, s.note, s.created_at, s.updated_at, \
                 u.username AS owner, \
@@ -292,11 +287,10 @@ async fn check_teams(db: &sqlx::PgPool, teams: &[String]) -> Result<(), AppError
 
 async fn server_create(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    op: Operator,
     actor: Option<Extension<AuthActor>>,
     Json(body): Json<CreateBody>,
 ) -> AppResult {
-    operator_guard(&ctx)?;
     if !valid_server_id(&body.id) {
         return Err(AppError::BadRequest(
             "id must match [a-z0-9][a-z0-9_-]{0,63} — it becomes the tool-name prefix mcp_<id>_<tool>".into(),
@@ -312,7 +306,7 @@ async fn server_create(
     let teams = validate_audience_shape(&body.audience).map_err(AppError::BadRequest)?;
     check_teams(&state.db, &teams).await?;
 
-    let owner = ctx.as_ref().map(|Extension(r)| r.sub.clone());
+    let owner = Some(op.sub().to_string());
     let res = sqlx::query(
         "INSERT INTO noo_mcp_servers (id, transport, spec, kind, owner_uuid, audience, note, enabled) \
          VALUES ($1, $2, $3, $4, (SELECT user_uuid FROM noo_users WHERE username = $5), $6, $7, $8) \
@@ -331,9 +325,10 @@ async fn server_create(
     if res.rows_affected() == 0 {
         return Err(AppError::BadRequest(format!("server '{}' already exists — `noo mcp server show {}` or update it", body.id, body.id)));
     }
-    crate::routes::core::audit_event(
-        &state.db, "mcp_server_register", "info", &actor_label(&actor), &body.id, "ok",
-        json!({ "transport": body.transport, "kind": body.kind, "audience": body.audience }),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::McpServerRegister, &actor_label(&actor), &body.id)
+            .details(json!({ "transport": body.transport, "kind": body.kind, "audience": body.audience })),
     )
     .await;
     Ok(Json(json!({ "status": "ok", "id": body.id, "note": "registered; place it on a node with `noo mcp place <id> <node>` — tools are discovered when phase B lands" })))
@@ -341,10 +336,9 @@ async fn server_create(
 
 async fn server_get(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: Operator,
     Path(id): Path<String>,
 ) -> AppResult {
-    operator_guard(&ctx)?;
     let Some(r) = sqlx::query(
         "SELECT s.id, s.transport, s.spec, s.kind, s.enabled, s.audience, s.note, s.created_at, s.updated_at, u.username AS owner \
          FROM noo_mcp_servers s LEFT JOIN noo_users u ON u.user_uuid = s.owner_uuid WHERE s.id = $1",
@@ -401,12 +395,11 @@ struct UpdateBody {
 
 async fn server_update(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: Operator,
     actor: Option<Extension<AuthActor>>,
     Path(id): Path<String>,
     Json(body): Json<UpdateBody>,
 ) -> AppResult {
-    operator_guard(&ctx)?;
     let Some(transport): Option<String> = sqlx::query_scalar("SELECT transport FROM noo_mcp_servers WHERE id = $1")
         .bind(&id)
         .fetch_optional(&state.db)
@@ -441,9 +434,10 @@ async fn server_update(
     .bind(body.enabled)
     .execute(&state.db)
     .await?;
-    crate::routes::core::audit_event(
-        &state.db, "mcp_server_update", "info", &actor_label(&actor), &id, "ok",
-        json!({ "spec": body.spec.is_some(), "kind": body.kind, "audience": body.audience, "enabled": body.enabled }),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::McpServerUpdate, &actor_label(&actor), &id)
+            .details(json!({ "spec": body.spec.is_some(), "kind": body.kind, "audience": body.audience, "enabled": body.enabled })),
     )
     .await;
     Ok(Json(json!({ "status": "ok", "id": id })))
@@ -451,16 +445,18 @@ async fn server_update(
 
 async fn server_delete(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: Operator,
     actor: Option<Extension<AuthActor>>,
     Path(id): Path<String>,
 ) -> AppResult {
-    operator_guard(&ctx)?;
     let res = sqlx::query("DELETE FROM noo_mcp_servers WHERE id = $1").bind(&id).execute(&state.db).await?;
     if res.rows_affected() == 0 {
         return Err(AppError::NotFound(format!("no MCP server '{id}'")));
     }
-    crate::routes::core::audit_event(&state.db, "mcp_server_remove", "info", &actor_label(&actor), &id, "ok", json!({})).await;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::McpServerRemove, &actor_label(&actor), &id),
+    ).await;
     Ok(Json(json!({ "status": "ok", "id": id, "removed": true })))
 }
 
@@ -472,12 +468,11 @@ struct PlacementBody {
 
 async fn placement_put(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: Operator,
     actor: Option<Extension<AuthActor>>,
     Path((id, node)): Path<(String, String)>,
     body: Option<Json<PlacementBody>>,
 ) -> AppResult {
-    operator_guard(&ctx)?;
     let desired = body.and_then(|Json(b)| b.desired_state).unwrap_or_else(|| "running".into());
     if !DESIRED_STATES.contains(&desired.as_str()) {
         return Err(AppError::BadRequest(format!("desired_state must be one of {DESIRED_STATES:?}")));
@@ -512,9 +507,10 @@ async fn placement_put(
     .bind(&desired)
     .execute(&state.db)
     .await?;
-    crate::routes::core::audit_event(
-        &state.db, "mcp_server_place", "info", &actor_label(&actor), &id, "ok",
-        json!({ "node": node, "desired_state": desired }),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::McpServerPlace, &actor_label(&actor), &id)
+            .details(json!({ "node": node, "desired_state": desired })),
     )
     .await;
     Ok(Json(json!({ "status": "ok", "id": id, "node": node, "desired_state": desired,
@@ -523,11 +519,10 @@ async fn placement_put(
 
 async fn placement_delete(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: Operator,
     actor: Option<Extension<AuthActor>>,
     Path((id, node)): Path<(String, String)>,
 ) -> AppResult {
-    operator_guard(&ctx)?;
     let res = sqlx::query("DELETE FROM noo_mcp_server_placements WHERE server_id = $1 AND node_id = $2")
         .bind(&id)
         .bind(&node)
@@ -536,7 +531,11 @@ async fn placement_delete(
     if res.rows_affected() == 0 {
         return Err(AppError::NotFound(format!("'{id}' is not placed on '{node}'")));
     }
-    crate::routes::core::audit_event(&state.db, "mcp_server_unplace", "info", &actor_label(&actor), &id, "ok", json!({ "node": node })).await;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::McpServerUnplace, &actor_label(&actor), &id)
+            .details(json!({ "node": node })),
+    ).await;
     Ok(Json(json!({ "status": "ok", "id": id, "node": node, "removed": true })))
 }
 

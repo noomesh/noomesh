@@ -12,6 +12,7 @@
 //! Bootstrap-tier gates (TLS, secrets — needed *before* the DB is reachable)
 //! are NOT here; those stay in the secrets backend.
 
+use crate::audit::{AuditEvent, AuditKind};
 use sqlx::PgPool;
 
 /// What a posture key IS — and therefore whether a vetted profile may set it.
@@ -124,18 +125,15 @@ pub const POSTURE_CATALOG: &[PostureKey] = &[
     //
     // `NOO_CONTROLLER_SECRET` is not retired by this: its one remaining job
     // is the gateway's boot guard (no controller secret, no start).
-    // The v1 cluster token (HMAC over actor and time only) is a
-    // replayable bearer; v2 binds the request. Every verifier accepts both
-    // while the fleet rolls and counts v1 under the `cluster_hmac_v1` lane
-    // (`noo cluster verify` names the callers). "0" refuses v1 at the gateway
-    // door and, mirrored to the agent env, at each node. Unlike the other
-    // bridges this one is OPEN when unset, because every install's nodes sign
-    // v1 until they upgrade; it is closed deliberately, once, after the roll.
-    PostureKey {
-        key: "NOO_CLUSTER_TOKEN_V1",
-        kind: PostureKind::Bridge { closed: "0", window_days: 60 },
-        why: "keeps accepting the old replayable cluster token from nodes that have not upgraded",
-    },
+    // `NOO_CLUSTER_TOKEN_V1` was the last bridge here (the replayable v1
+    // cluster token, open by default while the fleet rolled to v2). The
+    // operator closed it live 2026-10-26 and it is deleted: v1 is always
+    // refused (`auth.rs`, `401 cluster_token_v1_refused`, counted as
+    // `cluster_hmac_v1_refused`). Nothing reads the flag any more. It is a
+    // RETIRED_INERT_KEYS entry: a stored row (the live controller holds `0`)
+    // is deleted at boot, and one still set on is kept and warned about.
+    // The catalog now holds gates only; the Bridge machinery stays for the
+    // next compatibility bridge.
     // `NOO_NATS_LEGACY_SHARED_CREDS` was a bridge here (the one R43 was about)
     // retired the shared bus user it bridged to: the server
     // no longer defines that user, so there is nothing left to hold open.
@@ -273,7 +271,8 @@ pub fn retired_value_opens(key: &str, value: &str) -> bool {
 /// arm went with the thing they bridged to, so no value changes anything and
 /// no boot refusal guards them. `NOO_NATS_LEGACY_SHARED_CREDS`: the server no longer defines the shared bus user it opened.
 /// `NOO_SELF_CALL_SHARED_SECRET`: the self-call bridge is deleted; a shared secret never buys inference.
-pub const RETIRED_INERT_KEYS: &[&str] = &["NOO_NATS_LEGACY_SHARED_CREDS", "NOO_SELF_CALL_SHARED_SECRET"];
+/// `NOO_CLUSTER_TOKEN_V1`: the v1 cluster-token gate is deleted; v1 is always refused (a stored `0` is deleted at boot).
+pub const RETIRED_INERT_KEYS: &[&str] = &["NOO_NATS_LEGACY_SHARED_CREDS", "NOO_SELF_CALL_SHARED_SECRET", "NOO_CLUSTER_TOKEN_V1"];
 
 /// Does `value` read as ON for a [`RETIRED_INERT_KEYS`] row? Such a row is
 /// never deleted at boot (the operator believed something was open); it is
@@ -322,14 +321,10 @@ async fn clear_retired_rows(db: &PgPool, rows: &[(String, String)]) {
             .await;
         match deleted {
             Ok(r) if r.rows_affected() > 0 => {
-                crate::routes::core::audit_event(
+                crate::audit::record(
                     db,
-                    "security_posture_retired_row_removed",
-                    "info",
-                    "gateway-boot",
-                    &key,
-                    "ok",
-                    serde_json::json!({ "key": key, "value": value, "why": "retired key at a closed value — inert" }),
+                    AuditEvent::new(AuditKind::SecurityPostureRetiredRowRemoved, "gateway-boot", &key)
+                        .details(serde_json::json!({ "key": key, "value": value, "why": "retired key at a closed value — inert" })),
                 )
                 .await;
                 tracing::info!(key = %key, value = %value,
@@ -429,16 +424,21 @@ pub fn bridge_standing(
     open_days: i64,
     dated_from_update: bool,
 ) -> Option<BridgeStanding> {
-    let entry = entry_of(key)?;
+    standing_of(entry_of(key)?, value, open_days, dated_from_update)
+}
+
+/// [`bridge_standing`] for an entry already in hand (so a test can judge a
+/// synthetic bridge now that the catalog holds none).
+fn standing_of(
+    entry: &PostureKey,
+    value: &str,
+    open_days: i64,
+    dated_from_update: bool,
+) -> Option<BridgeStanding> {
     let PostureKind::Bridge { closed, window_days } = entry.kind else {
         return None;
     };
     if value == closed {
-        return None;
-    }
-    // The v1-token bridge is judged with the gateway's own reader too: any
-    // closing spelling ("false", "off", …) closes it.
-    if entry.key == "NOO_CLUSTER_TOKEN_V1" && !crate::cluster_token_v2::v1_allowed_value(value) {
         return None;
     }
     Some(BridgeStanding {
@@ -677,17 +677,22 @@ mod tests {
     /// Boot deletes a retired key's row only at a value that does not open
     /// it; an OPEN retired bridge stays for the boot refusal to name, and a
     /// live gate is never touched.
-    /// Second review: `bridge_standing` reads the v1-token bridge exactly as
-    /// the gateway does — a value the gateway treats as closed is no
-    /// standing bridge, and an opening one is.
+    /// The v1 cluster-token gate is deleted: its stored row is a retired
+    /// inert key, never a standing bridge, whatever it holds.
     #[test]
-    fn the_v1_bridge_standing_uses_the_gateways_truthiness() {
-        for closed in ["0", "false", "no", "off", "closed"] {
-            assert!(bridge_standing("NOO_CLUSTER_TOKEN_V1", closed, 90, false).is_none(), "{closed:?}");
+    fn the_v1_cluster_token_row_is_retired_inert_not_a_bridge() {
+        assert!(RETIRED_INERT_KEYS.contains(&"NOO_CLUSTER_TOKEN_V1"));
+        assert!(entry_of("NOO_CLUSTER_TOKEN_V1").is_none(), "no catalog entry: nothing reads the flag");
+        assert!(!is_posture_key("NOO_CLUSTER_TOKEN_V1"), "boot must not push the stored row into the process env");
+        for v in ["0", "1", "off", "open"] {
+            assert!(bridge_standing("NOO_CLUSTER_TOKEN_V1", v, 90, false).is_none(), "{v:?}");
         }
-        for open in ["1", "open", "true", "yes", "on"] {
-            assert!(bridge_standing("NOO_CLUSTER_TOKEN_V1", open, 90, false).is_some(), "{open:?}");
-        }
+        // The live controller's stored row (`0`) is deleted at boot; a row
+        // still `1` is kept and reported, like the self-call bridge (#371).
+        let row = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let rows = vec![row("NOO_CLUSTER_TOKEN_V1", "0"), row("NOO_CLUSTER_TOKEN_V1", "1")];
+        assert_eq!(retired_rows_to_clear(&rows), vec![row("NOO_CLUSTER_TOKEN_V1", "0")]);
+        assert_eq!(retired_inert_rows_held_open(&rows), vec![row("NOO_CLUSTER_TOKEN_V1", "1")]);
     }
 
     #[test]
@@ -763,7 +768,8 @@ mod tests {
     #[test]
     fn the_catalog_has_both_kinds() {
         assert!(gate_keys().count() > 0, "no gate keys");
-        assert!(bridge_keys().count() > 0, "no bridge keys — nothing is protected");
+        // The catalog holds no bridge since NOO_CLUSTER_TOKEN_V1 was deleted;
+        // the machinery is tested on a synthetic one below.
         assert_eq!(
             gate_keys().count() + bridge_keys().count(),
             POSTURE_CATALOG.len(),
@@ -771,36 +777,16 @@ mod tests {
         );
     }
 
-    /// The key R43 was actually about. Pinned by name: if someone reclassifies
-    /// it as a Gate, `apply-profile hardened` starts closing the bus bridge
-    /// again and a half-migrated fleet loses a node.
+    /// The gates are gates, or `hardened` stops hardening anything. (The key
+    /// R43 was about, `NOO_CLUSTER_TOKEN_V1`, is deleted: the catalog holds
+    /// no bridge today; a bridge added later is covered by the synthetic-bridge
+    /// tests in `bridge_life_tests`.)
     #[test]
-    fn the_known_bridges_are_bridges() {
-        let key = "NOO_CLUSTER_TOKEN_V1";
-        assert_eq!(
-            kind_of(key).map(|k| k.is_bridge()),
-            Some(true),
-            "{key} must be a Bridge — a profile closing it breaks a rollout"
-        );
-        // ...and the gates are gates, or `hardened` stops hardening anything.
-        for key in ["NOO_EXEC_APPROVAL_MODE", "NOO_MCP_EXTERNAL_ENABLED"] {
+    fn the_known_gates_are_gates() {
+        for key in ["NOO_EXEC_APPROVAL_MODE", "NOO_MCP_EXTERNAL_ENABLED", "NOO_NODE_AGENT_PRIVILEGED"] {
             assert_eq!(kind_of(key), Some(PostureKind::Gate), "{key} must be a Gate");
         }
-    }
-
-    /// Every bridge names the value that closes it, and it is not empty —
-    /// `--include-bridges` writes that value, so a blank one would write an
-    /// empty row and the gate accessor would read "unset".
-    #[test]
-    fn every_bridge_names_a_closing_value() {
-        for k in bridge_keys() {
-            match k.kind {
-                PostureKind::Bridge { closed, .. } => {
-                    assert!(!closed.trim().is_empty(), "{} has no closing value", k.key)
-                }
-                PostureKind::Gate => unreachable!("bridge_keys yielded a gate"),
-            }
-        }
+        assert!(kind_of("NOO_CLUSTER_TOKEN_V1").is_none(), "the deleted v1 gate is not a catalog key");
     }
 
     #[test]
@@ -938,19 +924,57 @@ mod tests {
 mod bridge_life_tests {
     use super::*;
 
+    /// A synthetic bridge: the catalog holds none since `NOO_CLUSTER_TOKEN_V1`
+    /// was deleted, and the machinery must keep working for the next one.
+    const SYNTH: PostureKey = PostureKey {
+        key: "NOO_SYNTHETIC_BRIDGE",
+        kind: PostureKind::Bridge { closed: "0", window_days: 60 },
+        why: "test bridge",
+    };
+
+    /// Problems with a bridge declaration: no closing value, or no usable window.
+    fn bridge_problems(keys: &[PostureKey]) -> Vec<String> {
+        let mut out = Vec::new();
+        for k in keys {
+            if let PostureKind::Bridge { closed, window_days } = k.kind {
+                if closed.trim().is_empty() {
+                    out.push(format!("{} has no closing value", k.key));
+                }
+                if window_days <= 0 {
+                    out.push(format!("{} declares a {window_days}-day window", k.key));
+                }
+            }
+        }
+        out
+    }
+
+    /// The bridge declaration check really scans: a bad bridge is caught, so
+    /// the (currently empty) real-catalog pass below means something.
+    #[test]
+    fn the_bridge_declaration_check_scans_something() {
+        let bad = [
+            PostureKey { key: "A", kind: PostureKind::Bridge { closed: " ", window_days: 5 }, why: "" },
+            PostureKey { key: "B", kind: PostureKind::Bridge { closed: "0", window_days: 0 }, why: "" },
+        ];
+        assert_eq!(bridge_problems(&bad).len(), 2);
+        assert!(bridge_problems(&[SYNTH]).is_empty());
+        let real: Vec<PostureKey> = bridge_keys().map(|k| PostureKey { key: k.key, kind: k.kind, why: k.why }).collect();
+        assert!(bridge_problems(&real).is_empty(), "{:?}", bridge_problems(&real));
+    }
+
     /// A bridge sitting at its closed value is not something the operator
-    /// owes an account of. Reporting it would put a line in every boot log
-    /// that is always there, which is how people learn to read past the line
-    /// that matters.
+    /// owes an account of.
     #[test]
     fn a_closed_bridge_has_no_standing() {
-        assert!(bridge_standing("NOO_CLUSTER_TOKEN_V1", "0", 9999, false).is_none());
+        assert!(standing_of(&SYNTH, "0", 9999, false).is_none());
+        assert!(standing_of(&SYNTH, "1", 9999, false).is_some());
     }
 
     /// A retired bridge has no standing either: it is not in the catalog, so
     /// `report_open_bridges` never names it — the retired-bridge refusal does.
     #[test]
     fn a_retired_bridge_has_no_standing() {
+        assert!(!RETIRED_BRIDGES.is_empty(), "no retired bridges to check");
         for b in RETIRED_BRIDGES {
             assert!(bridge_standing(b.key, "1", 9999, false).is_none(), "{}", b.key);
             assert!(bridge_standing(b.key, "optional", 9999, false).is_none(), "{}", b.key);
@@ -970,49 +994,25 @@ mod bridge_life_tests {
 
     #[test]
     fn overdue_is_measured_against_the_keys_own_window() {
-        // NOO_CLUSTER_TOKEN_V1 declares 60 days.
-        let b = bridge_standing("NOO_CLUSTER_TOKEN_V1", "1", 61, false).unwrap();
+        let b = standing_of(&SYNTH, "1", 61, false).unwrap();
         assert_eq!(b.window_days, 60);
         assert!(b.is_overdue());
         assert_eq!(b.overdue_days(), 1);
-        // A single global deadline shorter than the key's own would have
-        // called this one late.
-        let young = bridge_standing("NOO_CLUSTER_TOKEN_V1", "1", 31, false).unwrap();
+        let young = standing_of(&SYNTH, "1", 31, false).unwrap();
         assert!(!young.is_overdue());
     }
 
     #[test]
     fn on_the_deadline_is_not_yet_overdue() {
-        let b = bridge_standing("NOO_CLUSTER_TOKEN_V1", "1", 60, false).unwrap();
+        let b = standing_of(&SYNTH, "1", 60, false).unwrap();
         assert!(!b.is_overdue(), "the window is 60 days, not 59");
     }
 
-    /// Every bridge must declare a window, and it must be a real one. A zero
-    /// would make the bridge overdue the moment it opened; a missing one
-    /// cannot happen by construction, which is the point of putting it on the
-    /// key rather than in a runbook.
-    #[test]
-    fn every_bridge_declares_a_usable_window() {
-        for k in bridge_keys() {
-            match k.kind {
-                PostureKind::Bridge { window_days, .. } => assert!(
-                    window_days > 0,
-                    "{} declares a {}-day window",
-                    k.key,
-                    window_days
-                ),
-                PostureKind::Gate => unreachable!("bridge_keys yielded a gate"),
-            }
-        }
-    }
-
     /// An age derived from `updated_at` is still an age, and must still be
-    /// reportable — but it has to be MARKED, because the row could have been
-    /// touched long after it opened. Silently presenting inference as
-    /// evidence is the whole failure this work exists to stop.
+    /// reportable — but it has to be MARKED.
     #[test]
     fn a_pre_migration_row_is_dated_but_says_so() {
-        let b = bridge_standing("NOO_CLUSTER_TOKEN_V1", "1", 200, true).unwrap();
+        let b = standing_of(&SYNTH, "1", 200, true).unwrap();
         assert!(b.dated_from_update);
         assert!(b.is_overdue());
     }

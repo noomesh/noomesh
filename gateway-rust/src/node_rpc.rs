@@ -101,6 +101,9 @@ pub fn control_op(method: &Method, path: &str) -> Option<ControlOp> {
         ("POST", "/start") => simple("start", false, false),
         ("POST", "/stop") => simple("stop", false, false),
         ("POST", "/restart") => simple("restart", false, false),
+        // A nudge is harmless to repeat (passes coalesce), so it may fall
+        // back to HTTPS like a read.
+        ("POST", "/reconcile") => simple("reconcile", true, false),
         ("POST", "/clean") => simple("clean", false, false),
         ("POST", "/pull") => simple("pull", false, true),
         ("POST", "/api/skills/run") => simple("skills.run", false, true),
@@ -591,6 +594,7 @@ mod tests {
             ("POST", "/start", "start", "", false, false),
             ("POST", "/stop", "stop", "", false, false),
             ("POST", "/restart", "restart", "", false, false),
+            ("POST", "/reconcile", "reconcile", "", true, false),
             ("POST", "/clean", "clean", "", false, false),
             ("POST", "/pull", "pull", "", false, true),
             ("POST", "/api/skills/run", "skills.run", "", false, true),

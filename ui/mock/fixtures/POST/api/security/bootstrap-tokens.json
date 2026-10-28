@@ -6,7 +6,6 @@
   "node_name": "example-node",
   "role_hint": null,
   "allowed_cidr": null,
-  "bootstrap_sha256": null,
   "install_command": "command -v noo >/dev/null || curl -fsSL https://raw.githubusercontent.com/noomesh/noomesh/main/noo-cli/install.sh | sh",
   "enroll_command": "noo enroll noo1.EXAMPLE-NOT-A-REAL-BLOB",
   "provision_command": "noo cluster provision example-node --wait",

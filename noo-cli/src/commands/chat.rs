@@ -20,10 +20,10 @@
 //!   - error envelope:              {"error": …}
 //! Lines may or may not carry a `data: ` prefix; `[DONE]` ends a turn.
 //!
-//! NOT ported (falls through to Python, plan §2): the in-process local-agent
-//! fallback — `--no-use-cluster`, `--config`, `--base-url`, `--tool-mode`.
-//! When the gateway is unreachable this command exits 3 with a pointer to
-//! `noo stack start` / the Python CLI's fallback instead of building a local
+//! NOT ported (a usage error, exit 2 — the Python CLI is gone): the
+//! in-process local-agent fallback — `--no-use-cluster`, `--config`,
+//! `--base-url`, `--tool-mode`. When the gateway is unreachable this command
+//! exits 3 with a pointer to `noo stack start` instead of building a local
 //! agent.
 //!
 //! Native additions over the Python surface (agent-first contract):
@@ -48,7 +48,7 @@ struct ChatArgs {
 }
 
 /// Parse the token stream after `chat`. `--use-cluster` is the Python
-/// default and thus a no-op; every local-fallback flag falls through.
+/// default and thus a no-op; every local-fallback flag is a usage error.
 fn parse_args(args: &[String]) -> Result<ChatArgs, Unhandled> {
     let mut out = ChatArgs::default();
     let mut iter = args.iter();
@@ -58,7 +58,7 @@ fn parse_args(args: &[String]) -> Result<ChatArgs, Unhandled> {
             "--message" => out.message = Some(iter.next().ok_or(Unhandled)?.clone()),
             "--use-cluster" => {} // typer bool default — accepted, no-op
             // --no-use-cluster / --config / --base-url / --tool-mode and any
-            // positional belong to the Python local-agent surface.
+            // positional belonged to the retired Python local-agent surface (now a usage error).
             _ => return Err(Unhandled),
         }
     }
@@ -234,8 +234,8 @@ pub fn chat(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
 
     // Health probe — Python parity: 2s timeout, ANY failure means the
-    // cluster path is unavailable. The Python CLI would now build a local
-    // in-process agent; that fallback is not ported (plan §2).
+    // cluster path is unavailable. The retired Python CLI built a local
+    // in-process agent here; that fallback is not ported (plan §2).
     let base = crate::envfile::gateway_url(&g.gateway_override);
     if get_json_opt(g, "/health", false, 2).is_none() {
         fail(
@@ -361,8 +361,8 @@ mod tests {
 
     #[test]
     fn local_fallback_surface_falls_through() {
-        // Everything owned by the Python in-process agent path must degrade
-        // to Python, not error.
+        // Everything owned by the retired Python in-process agent path is
+        // refused as a usage error (there is no Python CLI to serve it).
         for flags in [
             &["--no-use-cluster"][..],
             &["--config", "x.yaml"],

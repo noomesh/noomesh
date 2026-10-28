@@ -160,14 +160,11 @@ pub async fn chat_decider(
              {channel_user_id}` and grant that account the operator role."
         ));
     };
-    let role: Option<String> = sqlx::query_scalar("SELECT role FROM noo_users WHERE username = $1")
-        .bind(&username)
-        .fetch_optional(db)
+    let role: Option<String> = crate::repo::users::role_of(db, &username)
         .await
         // Tier 2 (crate::egress): the database error is logged under a
         // reference; the chat gets the general sentence and that reference.
-        .map_err(|e| crate::egress::error_reply("check your account", &e))?
-        .flatten();
+        .map_err(|e| crate::egress::error_reply("check your account", &e))?;
     let role: crate::auth::Role = role
         .as_deref()
         .unwrap_or("user")
@@ -249,7 +246,7 @@ pub fn parse_exec_decision(action_id: &str) -> Option<(&'static str, String)> {
 /// user-facing ack. Card clicks are operator actions by construction —
 /// the card is only ever posted to NOO_APPROVAL_GCHAT_SPACE, the
 /// operator's own space (same trust model as decide_cluster_proposal,
-/// where the HTTP-surface require_operator gate does not apply because
+/// where the HTTP-surface Operator extractor does not apply because
 /// chat identity IS the operator's). The blocked tool call polls the same
 /// row and proceeds/refuses on the flip.
 pub async fn decide_exec_approval(

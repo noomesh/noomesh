@@ -306,6 +306,36 @@ fn chown_tree(path: &Path, u: &RunAsUser) -> Result<()> {
 
 // ── the report ──────────────────────────────────────────────────────────
 
+/// A kind's prompt floor as one probe test measured it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PromptFloor {
+    pub tokens: u64,
+    /// `model`: the upstream's own count of the first call's prompt (real
+    /// mode). `estimate`: the first model request's bytes at the loop's
+    /// ~2.5 chars per token (mock mode: the mock's usage is canned), which
+    /// overstates rather than understates.
+    pub source: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_bytes: Option<u64>,
+}
+
+/// Is `path` a request to the model (not a token count or a model list)?
+fn model_route(path: &str) -> bool {
+    ["/chat/completions", "/v1/messages", "/responses", "/api/chat"].iter().any(|s| path.ends_with(s))
+}
+
+/// The floor from what one test saw: the model's count in real mode, else
+/// an estimate from the first model request's size.
+pub fn prompt_floor(real: bool, usage: &UsageTotals, routes: &[RouteHit]) -> Option<PromptFloor> {
+    if real {
+        if let Some(t) = usage.first_prompt_tokens.filter(|t| *t > 0) {
+            return Some(PromptFloor { tokens: t, source: "model", request_bytes: None });
+        }
+    }
+    let bytes = routes.iter().filter(|h| h.method == "POST" && model_route(&h.path)).find_map(|h| h.request_bytes)?;
+    Some(PromptFloor { tokens: bytes * 10 / 25, source: "estimate", request_bytes: Some(bytes) })
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TestReport {
     pub test: ProbeTest,
@@ -317,6 +347,10 @@ pub struct TestReport {
     pub verdict: Option<String>,
     pub routes: Vec<RouteHit>,
     pub usage: UsageTotals,
+    /// The CLI's first request to the model, in tokens: the kind's prompt
+    /// floor on this node (i226 phase B). `None` when nothing reached the
+    /// model.
+    pub prompt_floor: Option<PromptFloor>,
     pub mock: Option<Vec<MockCall>>,
     pub stdout_tail: String,
     pub stderr_tail: String,
@@ -448,7 +482,7 @@ async fn cli_version(plan: &Plan, base: &Path) -> Option<String> {
     let env = build_env(&ctx, &ws, "http://127.0.0.1:9");
     let argv = vec![plan.cli.display().to_string(), "--version".to_string()];
     let jail = ws.jail_spec(&ctx, &ws.home);
-    let out = spawn_cli_as(&argv, &env, &ws.work, Duration::from_secs(10), &jail, run_as_ids(plan)).await;
+    let out = spawn_cli_as(&argv, &env, &ws.work, Duration::from_secs(10), &jail, run_as_ids(plan), None).await;
     ws.finish();
     let out = match out {
         Ok(o) => o,
@@ -496,11 +530,12 @@ async fn run_test(plan: &Plan, base: &Path, test: ProbeTest) -> Result<TestRepor
         // that passes unjailed would prove nothing about a real task.
         (ctx.jail_probe)().map_err(|r| anyhow!(r.note()))?;
         let jail = ws.jail_spec(ctx, cli_config.as_deref().unwrap_or(&ws.home));
-        spawn_cli_as(&argv, &env, &ws.work, ctx.timeout, &jail, run_as_ids(plan)).await
+        spawn_cli_as(&argv, &env, &ws.work, ctx.timeout, &jail, run_as_ids(plan), None).await
     }
     .await;
     let routes = translator.routes();
     let usage = translator.usage();
+    let floor = prompt_floor(plan.upstream.is_some(), &usage, &routes);
     translator.shutdown().await;
     let mock_calls = match mock {
         Some(m) => {
@@ -526,6 +561,7 @@ async fn run_test(plan: &Plan, base: &Path, test: ProbeTest) -> Result<TestRepor
                 verdict: verdict_text(&driver::verdict(&out.stdout)),
                 routes,
                 usage,
+                prompt_floor: floor,
                 mock: mock_calls,
                 stdout_tail: driver::tail_lines(&out.stdout, 20),
                 stderr_tail: driver::tail_lines(&out.stderr, 20),
@@ -542,6 +578,7 @@ async fn run_test(plan: &Plan, base: &Path, test: ProbeTest) -> Result<TestRepor
             verdict: None,
             routes,
             usage,
+            prompt_floor: floor,
             mock: mock_calls,
             stdout_tail: String::new(),
             stderr_tail: String::new(),
@@ -622,6 +659,12 @@ fn print_human(r: &Report) {
         let routes: Vec<String> = t.routes.iter().map(|h| format!("{} {} {}", h.method, h.path, h.status)).collect();
         println!("      routes: {}", if routes.is_empty() { "none".into() } else { routes.join(", ") });
         println!("      usage: {} calls, {} prompt + {} completion tokens", t.usage.calls, t.usage.prompt_tokens, t.usage.completion_tokens);
+        if let Some(f) = &t.prompt_floor {
+            match f.request_bytes {
+                Some(b) => println!("      first request: ~{} prompt tokens (estimated from {b} bytes; the kind's floor)", f.tokens),
+                None => println!("      first request: {} prompt tokens (the model's count; the kind's floor)", f.tokens),
+            }
+        }
         if let Some(calls) = &t.mock {
             for c in calls.iter().filter(|c| c.chosen.is_some()) {
                 let ch = c.chosen.as_ref().expect("filtered");
@@ -846,11 +889,29 @@ mod tests {
     }
 
     fn out(code: Option<i32>, stdout: &str, timed_out: bool) -> RunOutput {
-        RunOutput { code, stdout: stdout.into(), stderr: "err line".into(), timed_out, elapsed: Duration::from_secs(2) }
+        RunOutput { code, stdout: stdout.into(), stderr: "err line".into(), timed_out, stalled: None, elapsed: Duration::from_secs(2) }
     }
 
     fn hit(path: &str, status: u16) -> RouteHit {
-        RouteHit { method: "POST".into(), path: path.into(), status }
+        RouteHit { method: "POST".into(), path: path.into(), status, request_bytes: None }
+    }
+
+    /// i226 phase B: a kind's floor is the model's own count of the first
+    /// call in real mode; in mock mode, the first model request's size.
+    #[test]
+    fn the_prompt_floor_is_the_first_model_request() {
+        let sized = |path: &str, bytes: u64| RouteHit { method: "POST".into(), path: path.into(), status: 200, request_bytes: Some(bytes) };
+        let routes = vec![sized("/v1/messages/count_tokens", 999), sized("/v1/messages", 41_000), sized("/v1/messages", 60_000)];
+        let counted = UsageTotals { calls: 2, prompt_tokens: 30_000, first_prompt_tokens: Some(16_412), max_prompt_tokens: 16_900, ..Default::default() };
+        assert_eq!(prompt_floor(true, &counted, &routes), Some(PromptFloor { tokens: 16_412, source: "model", request_bytes: None }));
+        // Mock mode: the canned usage says nothing; the first model request
+        // (not the token count) is 41 000 bytes, ~16 400 tokens.
+        assert_eq!(prompt_floor(false, &counted, &routes), Some(PromptFloor { tokens: 16_400, source: "estimate", request_bytes: Some(41_000) }));
+        // Real mode with no usage falls back to the size too.
+        assert_eq!(prompt_floor(true, &UsageTotals::default(), &routes).map(|f| f.source), Some("estimate"));
+        assert_eq!(prompt_floor(false, &UsageTotals::default(), &[hit("/v1/chat/completions", 200)]), None, "no size, no floor");
+        assert!(["/v1/chat/completions", "/v1/messages", "/v1/responses", "/api/chat"].iter().all(|p| model_route(p)));
+        assert!(!model_route("/v1/models") && !model_route("/v1/messages/count_tokens"));
     }
 
     #[test]

@@ -239,13 +239,11 @@ says `fallback: true`. A name that is no node of this mesh is refused with
 keep the request on that node alone: a node serving no chat is then refused
 with 422, one that does not serve the model you named with 409, and nothing
 ever goes elsewhere. The `legacy lanes` row of
-`noo cluster verify --controller` includes `cluster_hmac_v1`: the callers (a
-node by name, from the gateway's counters and from each agent's heartbeat)
-still signing the old, replayable cluster token instead of the request-bound
-v2; it reads 0 once every node has upgraded, and only then is it safe to set
-`NOO_CLUSTER_TOKEN_V1=0` (see the node-agent security page; the next
-`noo cluster provision` / `noo upgrade --nodes` bundle then carries the closed gate to
-every node). `noo cluster
+`noo cluster verify --controller` shows `cluster_hmac_v1_refused`: the callers
+(a node by name, from the gateway's counters and from each agent's heartbeat)
+still signing the old, replayable cluster token, which is now always refused
+(see the node-agent security page); it warns while any count is non-zero and
+names the callers, and `noo upgrade --nodes` fixes them. `noo cluster
 verify --controller` has a `model classes` row for candidates that are neither
 running nor pulled where they are declared.
 
@@ -313,7 +311,8 @@ that follows its chat backend.
 
 `place` writes a placement to the node's desired config
 (`gpu-2: ollama → qwen2.5:7b-instruct (running) — agent reconciles within
-5 min`); `--stopped` records it without starting, `--port`/`--tls`/`--image`
+5 min`; the gateway also nudges the agent at once, so a reachable node
+converges within seconds and 5 min is the fallback); `--stopped` records it without starting, `--port`/`--tls`/`--image`
 pin the container. `desired` shows the node's config row (ip, tier, ssh
 user, data root, models dir, GPU override) and its placements
 (`backend | model | port | tls | desired`). `unplace` removes the record
@@ -727,6 +726,14 @@ drain_started, drained_at}`.
   `! yielded: vllm paused (foreign 11.2 GB, memory-accounting)`. Yielded and
   held are warnings, not failures, because the node is working as designed.
 - The console's node card shows "GPU in use by other work — vllm paused since …".
+- `noo cluster verify host3` has a `harness tasks` row: what the node's harness
+  holds, from the gateway's `tasks` summary on `/api/cluster/nodes`:
+  `2 running (oldest progress 5m ago), 1 queued (oldest waiting 45s)`, or
+  `none held`. A running task with no progress past the harness's stall bound
+  (`NOO_HARNESS_TASK_STALL_SECS`, 45 minutes by default) or a task queued past
+  30 minutes is a warning with `noo tasks list` as the remedy, never a failure:
+  the harness releases a stalled task itself, and a queue is capacity, not a
+  fault. Child tasks count; parked ones do not.
 
 ## Related guides
 

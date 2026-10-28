@@ -356,7 +356,7 @@ func TestConvergeWithoutAPlistRecordsThePlacementEnvLimit(t *testing.T) {
 	}
 }
 
-// The harness profile's ollama_context reaches a brew-managed ollama as
+// The harness profile's context reaches a brew-managed ollama as
 // OLLAMA_CONTEXT_LENGTH tuning (reconcile.nativeOllamaTuning). A CHANGED
 // value (a new tier default or override) converges like any placement env
 // edit: the plist key is replaced and the job is booted out and back once.

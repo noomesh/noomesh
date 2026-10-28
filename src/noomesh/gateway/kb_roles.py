@@ -34,7 +34,6 @@ provenance.
 """
 from __future__ import annotations
 
-import os
 import time
 from fnmatch import fnmatch
 from typing import Any, Optional
@@ -43,7 +42,6 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
-_CONFIG_CANDIDATES = ("/app/noomesh.yaml", "noomesh.yaml")
 _CACHE_TTL_SECS = 30.0
 
 _cache: dict[str, Any] = {"loaded_at": 0.0, "rules": [], "default_roles": []}
@@ -58,24 +56,19 @@ def _load_kb_config() -> None:
     _cache["loaded_at"] = now
     rules: list[tuple[str, list[str]]] = []
     default_roles: list[str] = []
-    for path in _CONFIG_CANDIDATES:
-        if not os.path.isfile(path):
-            continue
-        try:
-            import yaml
-            with open(path) as fh:
-                cfg = yaml.safe_load(fh) or {}
-        except Exception as e:  # noqa: BLE001 — config problems must not break ingest
-            log.warning("kb_roles.config_unreadable", path=path, error=str(e))
-            return
-        kb = cfg.get("kb") or {}
-        for rule in kb.get("source_roles") or []:
-            match = str(rule.get("match") or "").strip()
-            roles = [str(r) for r in (rule.get("roles") or []) if str(r).strip()]
-            if match and roles:
-                rules.append((match, roles))
-        default_roles = [str(r) for r in (kb.get("default_roles") or []) if str(r).strip()]
-        break
+    try:
+        from ..config import read_config_yaml
+        cfg = read_config_yaml()
+    except Exception as e:  # noqa: BLE001 — config problems must not break ingest
+        log.warning("kb_roles.config_unreadable", error=str(e))
+        return
+    kb = cfg.get("kb") or {}
+    for rule in kb.get("source_roles") or []:
+        match = str(rule.get("match") or "").strip()
+        roles = [str(r) for r in (rule.get("roles") or []) if str(r).strip()]
+        if match and roles:
+            rules.append((match, roles))
+    default_roles = [str(r) for r in (kb.get("default_roles") or []) if str(r).strip()]
     _cache["rules"] = rules
     _cache["default_roles"] = default_roles
 

@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,11 +17,11 @@ import (
 
 // GPUMetrics holds real-time GPU telemetry.
 type GPUMetrics struct {
-	GPUUtilizationPct    float64  `json:"gpu_utilization_percent"`
-	MemoryUtilizationPct float64  `json:"memory_utilization_percent"`
-	MemoryUsedMB         float64  `json:"memory_used_mb"`
-	MemoryTotalMB        float64  `json:"memory_total_mb"`
-	TemperatureC         float64  `json:"temperature_c"`
+	GPUUtilizationPct    *float64 `json:"gpu_utilization_percent,omitempty"`
+	MemoryUtilizationPct *float64 `json:"memory_utilization_percent,omitempty"`
+	MemoryUsedMB         *float64 `json:"memory_used_mb,omitempty"`
+	MemoryTotalMB        *float64 `json:"memory_total_mb,omitempty"`
+	TemperatureC         *float64 `json:"temperature_c,omitempty"`
 	PowerDrawW           *float64 `json:"power_draw_w,omitempty"`
 }
 
@@ -207,11 +208,14 @@ func (g *GPUDetector) metricsFromSMI() *GPUMetrics {
 	}
 
 	m := &GPUMetrics{}
-	m.GPUUtilizationPct, _ = strconv.ParseFloat(strings.TrimSpace(values[0]), 64)
-	m.MemoryUtilizationPct, _ = strconv.ParseFloat(strings.TrimSpace(values[1]), 64)
-	m.MemoryUsedMB, _ = strconv.ParseFloat(strings.TrimSpace(values[2]), 64)
-	m.MemoryTotalMB, _ = strconv.ParseFloat(strings.TrimSpace(values[3]), 64)
-	m.TemperatureC, _ = strconv.ParseFloat(strings.TrimSpace(values[4]), 64)
+	// A field nvidia-smi cannot report ("[N/A]", "N/A", garbage) is unknown
+	// (nil), never 0: a card with no temperature sensor must not read as
+	// cold and idle to the placement/yield logic.
+	m.GPUUtilizationPct = smiFloat("utilization.gpu", values[0])
+	m.MemoryUtilizationPct = smiFloat("utilization.memory", values[1])
+	m.MemoryUsedMB = smiFloat("memory.used", values[2])
+	m.MemoryTotalMB = smiFloat("memory.total", values[3])
+	m.TemperatureC = smiFloat("temperature.gpu", values[4])
 
 	powerStr := strings.TrimSpace(values[5])
 	if powerStr != "[N/A]" {
@@ -221,6 +225,20 @@ func (g *GPUDetector) metricsFromSMI() *GPUMetrics {
 	}
 
 	return m
+}
+
+// smiFloat parses one nvidia-smi CSV field. Anything that is not a number is
+// logged and returned as nil (unknown); only a parsed value is reported.
+func smiFloat(field, raw string) *float64 {
+	raw = strings.TrimSpace(raw)
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		if raw != "[N/A]" && raw != "N/A" {
+			slog.Warn("gpu: nvidia-smi field is not a number; reporting unknown", "field", field, "value", raw, "error", err)
+		}
+		return nil
+	}
+	return &v
 }
 
 func (g *GPUDetector) metricsFromExporter() *GPUMetrics {
@@ -268,17 +286,22 @@ func (g *GPUDetector) metricsFromExporter() *GPUMetrics {
 		found = true
 		switch {
 		case strings.Contains(metricName, "temperature_celsius"):
-			m.TemperatureC = val
+			t := val
+			m.TemperatureC = &t
 		case strings.Contains(metricName, "power_draw_watts"):
 			m.PowerDrawW = &val
 		case strings.Contains(metricName, "memory_used_bytes"):
-			m.MemoryUsedMB = val / (1024 * 1024)
+			u := val / (1024 * 1024)
+			m.MemoryUsedMB = &u
 		case strings.Contains(metricName, "memory_total_bytes"):
-			m.MemoryTotalMB = val / (1024 * 1024)
+			u := val / (1024 * 1024)
+			m.MemoryTotalMB = &u
 		case strings.Contains(metricName, "utilization_gpu_ratio"):
-			m.GPUUtilizationPct = val * 100
+			u := val * 100
+			m.GPUUtilizationPct = &u
 		case strings.Contains(metricName, "utilization_memory_ratio"):
-			m.MemoryUtilizationPct = val * 100
+			u := val * 100
+			m.MemoryUtilizationPct = &u
 		}
 	}
 

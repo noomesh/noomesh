@@ -55,14 +55,18 @@
 //! | file | what | mode |
 //! |---|---|---|
 //! | `ca.crt` | the cluster CA | 0444 |
-//! | `client.crt` / `client.key` | the add-on's own service leaf (`services/<addon>`) | 0444 / 0400 |
+//! | `client.crt` / `client.key` | the add-on's own client leaf (`pki/addons/<addon>/db-client`, `CN=addon:<addon>/db-client`) | 0444 / 0400 |
 //! | `pgpass.<runtime role>` / `pgpass.<ddl role>` | one libpq pgpass line each | 0400 |
 //!
 //! The runner runs as the operator's uid (`--user "$(id -u):$(id -g)"`), which
 //! is also what libpq's key rule wants: a key owned by anyone but root must be
 //! 0600 or tighter, and libpq does not check the owner is the caller. The
 //! add-on roles' `pg_hba` line is `verify-ca` (any cluster-CA leaf plus the
-//! password), so the add-on's own leaf is the right client identity. Values
+//! password), so the add-on's own leaf is the right client identity. Its CN
+//! is namespaced (`crate::pki::ADDON_CN_PREFIX`): before 0.6.13 it was the
+//! bare add-on name under `services/`, the namespace core's grants are keyed
+//! on, and an add-on provisioned then is re-issued and its old leaf retired
+//! here (`resources::retire_legacy_leaf`). Values
 //! are written to these files and to the broker's stdin and nowhere else;
 //! nothing here prints, logs or returns one.
 
@@ -230,6 +234,25 @@ pub(crate) fn provision_rundir(env_override: Option<&str>, euid: u32) -> PathBuf
     }
 }
 
+/// Re-issue `addon`'s client leaf under the add-on namespace and retire its
+/// pre-0.6.13 `services/<addon>` leaf, on this box's PKI, refreshing the
+/// runner's files when `--provision-only` wrote them
+/// (`addons::resources::retire_legacy_leaf`). Run by `noo addons enable` and
+/// `noo upgrade --stack`. Returns what the operator is told; never fails the
+/// caller (the old leaf holds no grant: it is hygiene, not a gate).
+pub(crate) fn retire_legacy_leaf_here(addon: &str) -> Option<Result<String, String>> {
+    let ca = crate::pki::ClusterCa::new(crate::pki::pki_dir());
+    crate::addons::resources::legacy_leaf_dir(&ca, addon)?;
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    let prov = provision_rundir(std::env::var("NOO_PROVISION_RUNDIR").ok().as_deref(), euid).join(addon);
+    match crate::addons::resources::retire_legacy_leaf(&ca, addon, Some(&prov)) {
+        Ok(Some(said)) => Some(Ok(said)),
+        Ok(None) => None,
+        Err(e) => Some(Err(format!("{addon}: its pre-0.6.13 client certificate could not be retired: {e}"))),
+    }
+}
+
 /// One pgpass line for `role`, the password escaped the way libpq reads it
 /// (`\` and `:` escaped; scripts/lib-secrets.sh `_pgpass_body libpq`).
 pub(crate) fn pgpass_line(role: &str, password: &str) -> String {
@@ -255,7 +278,7 @@ pub(crate) struct Files {
     pub pgpass: Vec<(String, PathBuf)>,
 }
 
-fn write_private(dir: &Path, name: &str, bytes: &[u8], mode: u32) -> Result<PathBuf, String> {
+pub(crate) fn write_private(dir: &Path, name: &str, bytes: &[u8], mode: u32) -> Result<PathBuf, String> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let dest = dir.join(name);
     let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
@@ -275,7 +298,7 @@ fn write_private(dir: &Path, name: &str, bytes: &[u8], mode: u32) -> Result<Path
 }
 
 /// Create `dir` (and its parent) 0700 and refuse a symlink there.
-fn private_dir(dir: &Path) -> Result<(), String> {
+pub(crate) fn private_dir(dir: &Path) -> Result<(), String> {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(format!("{} is a symlink - refusing to put credentials behind it", dir.display()));
@@ -678,19 +701,29 @@ impl ProvisionOps for Live<'_> {
         if !ca.ca_exists() {
             return Err(Refusal { why: "this box has no cluster CA to issue the add-on's client certificate from".into(), fix: "noo security pki init".into() });
         }
-        let svc = crate::pki::pki_dir().join("services").join(addon);
-        if !svc.join("service.crt").is_file() || !svc.join("service.key").is_file() {
-            ca.issue_service_cert(addon, &[], &[], crate::pki::DEFAULT_DAYS)
-                .map_err(|e| Refusal { why: format!("could not issue {addon}'s client certificate: {e}"), fix: format!("noo security pki issue-service {addon}") })?;
-        }
+        // The add-on's own client leaf (`CN=addon:<addon>/db-client`, key
+        // 0600 for this CLI), the one the launcher's `db` resource hands out
+        // too. Never `services/<addon>`: that namespace is core's, and its
+        // CN is what the gateway's grants are keyed on.
+        let (cert, key) = crate::addons::resources::db_client_leaf(&ca, addon)
+            .map_err(|e| Refusal { why: format!("could not issue {addon}'s client certificate: {e}"), fix: "noo security pki status".into() })?;
         let read = |p: PathBuf| {
             std::fs::read(&p).map_err(|e| Refusal {
                 why: format!("{}: {e}", p.display()),
                 fix: "noo security pki fix-modes".into(),
             })
         };
-        let pki = Pki { ca: read(ca.ca_cert_path())?, cert: read(svc.join("service.crt"))?, key: read(svc.join("service.key"))? };
-        write_credential_files(&dir, sys, secrets, addon, &pki).map_err(refuse)
+        let pki = Pki { ca: read(ca.ca_cert_path())?, cert, key };
+        let files = write_credential_files(&dir, sys, secrets, addon, &pki).map_err(refuse)?;
+        // An add-on provisioned before 0.6.13 still has the old leaf
+        // (`services/<addon>`, CN = its bare name): retired now that the new
+        // one is in place and in the runner's files.
+        match crate::addons::resources::retire_legacy_leaf(&ca, addon, None) {
+            Ok(Some(said)) if !self.g.json => crate::ui::done(&said),
+            Ok(_) => {}
+            Err(e) => crate::ui::warned(&format!("{addon}: {e}")),
+        }
+        Ok(files)
     }
 
     fn mark(&mut self, addon: &str, sys: &System, version: &str) -> Result<(), Refusal> {

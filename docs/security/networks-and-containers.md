@@ -237,7 +237,7 @@ defaults are `/data` and `/tmp`. Verify a roll with:
 
 ```sh
 docker inspect -f '{{.Name}} {{.HostConfig.ReadonlyRootfs}}' noo-gateway noo-worker noo-trellion
-docker diff noo-gateway noo-worker noo-trellion    # only mount points (A /opt/noo/addon-routes, /root/.claude): no files
+docker diff noo-gateway noo-worker noo-trellion    # only mount points (A /opt/noo/addon-routes, /opt/noo/addon-bundle-routes, /root/.claude): no files
 ```
 
 `NOO_NODE_AGENT_PRIVILEGED` defaults to `false` for the opt-in

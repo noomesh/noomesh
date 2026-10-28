@@ -2835,15 +2835,7 @@ async fn action_security_audit(
     // durable source — the Python version's "in-memory SecurityManager
     // stats" path is lost on restart, so DB-grouped query is strictly
     // better here.
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT event_type, COUNT(*)::bigint \
-         FROM noo_security_audit \
-         WHERE timestamp > NOW() - ($1::int * INTERVAL '1 hour') \
-         GROUP BY event_type \
-         ORDER BY 2 DESC",
-    )
-    .bind(period_hours as i32)
-    .fetch_all(&state.db)
+    let rows: Vec<(String, i64)> = crate::repo::audit::counts_by_type_hours(&state.db, period_hours as i32)
     .await
     .map_err(|e| format!("noo_security_audit query failed: {e}"))?;
 
@@ -3184,18 +3176,10 @@ async fn action_agent_self_check(
     .unwrap_or_default();
 
     // ── Section 5: security event spikes ──────────────────────────────
-    let security_spikes: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT event_type, COUNT(*)::bigint \
-         FROM noo_security_audit \
-         WHERE timestamp > NOW() - INTERVAL '1 hour' \
-         GROUP BY event_type \
-         HAVING COUNT(*) > $1::bigint \
-         ORDER BY 2 DESC",
-    )
-    .bind(security_spike_threshold)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+    let security_spikes: Vec<(String, i64)> =
+        crate::repo::audit::spikes_last_hour(&state.db, security_spike_threshold)
+            .await
+            .unwrap_or_default();
 
     // ── Section 6: active activities (Phase 3 meta-loop) ──────────────
     // Flag stalled activities (no progress in stuck_threshold_minutes
@@ -3652,9 +3636,7 @@ const STAGED_PKI_DIRS: [&str; 2] = ["/tmp/pki", "/app/pki"];
 /// HOST path the launcher exported, so it only wins when it
 /// actually holds a `ca.crt`; see `resolve_pki_dir_in`.
 fn pki_dir_candidates() -> Vec<String> {
-    std::env::var("NOO_PKI_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
+    crate::tls::pki_dir().map(|p| p.to_string_lossy().into_owned())
         .into_iter()
         .chain(STAGED_PKI_DIRS.iter().map(|s| s.to_string()))
         .collect()

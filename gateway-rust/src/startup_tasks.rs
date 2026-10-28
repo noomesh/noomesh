@@ -342,7 +342,7 @@ pub fn run_all() {
 
     // CA bundle — only the child Python (Alembic) still needs this; Rust TLS
     // uses NOO_TLS_CA directly.
-    let ca = std::env::var("NOO_TLS_CA").ok().map(PathBuf::from);
+    let ca = crate::tls::ca_path();
     let system_bundle = ["/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem"]
         .iter()
         .map(Path::new)

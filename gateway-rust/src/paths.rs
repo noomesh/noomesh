@@ -27,8 +27,8 @@ pub const STATIC_DIR: &str = "/app/static";
 /// The dashboard artifact, unpacked by the Dockerfile's
 /// `COPY --from=ui /dist /var/www`: `index.html` plus hashed `assets/`.
 /// This is the ONLY dashboard source. The vendored console and the
-/// NOO_UI_SOURCE selector that chose between them are retired to
-/// legacy/vendored-console/.
+/// NOO_UI_SOURCE selector that chose between them are retired and
+/// removed from the tree.
 pub const UI_WWW_DIR: &str = "/var/www";
 
 // PYTHON_SRC and PROMPT_SKILLS_DIR used to live here, pointing at /app/src.
@@ -39,15 +39,13 @@ pub const UI_WWW_DIR: &str = "/var/www";
 // Prompt-skill templates are owned by noo-trellion, which does carry the
 // Python tree.
 
-/// Bootstrap-token enrollment script, served publicly at
-/// GET /bootstrap so `noo cluster bootstrap-token create` one-liners work
-/// against the gateway itself. (The pre-token `/bootstrap-node.sh` it once
-/// sat beside was removed 2026-09-27.)
-pub const BOOTSTRAP_ENROLL_SCRIPT_CANDIDATES: &[&str] =
-    &["/app/scripts/bootstrap-enroll.sh", "scripts/bootstrap-enroll.sh"];
+// The shell enrollment script (`GET /bootstrap`, scripts/bootstrap-enroll.sh)
+// and its `/bootstrap-node.sh` predecessor are retired: enrollment is
+// `noo enroll`. Nothing here names them; a path constant for a file that does
+// not ship is worse than none.
 
 /// The ROOT host-prep phase, served at GET /bootstrap/prep and
-/// sudo-run by bootstrap-enroll.sh during the operator's one attended
+/// sudo-run by `noo enroll` (and staged by `noo cluster provision`) during the operator's one attended
 /// escalation — so machine prep happens at birth and no standing grant
 /// broader than the revive verb is ever needed afterwards.
 pub const BOOTSTRAP_PREP_SCRIPT_CANDIDATES: &[&str] =

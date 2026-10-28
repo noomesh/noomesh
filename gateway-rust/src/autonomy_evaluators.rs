@@ -18,9 +18,9 @@
 //! - **HARNESS-dispatch** — none today; could appear if a future location
 //!   needs the LLM to compute its condition.
 //!
-//! Reference Python implementation: `noomesh/cluster/autonomy.py` and
-//! `noomesh/cluster/default_locations.py` (preserved as the canonical
-//! spec — Python autonomy loop is dead in prod per the Tier 3 audit).
+//! The Python autonomy loop is gone from the tree; the default locations it
+//! ran are listed in `src/noomesh/cluster/default_locations.py`, and the
+//! evaluators below are the live spec.
 
 use std::collections::HashMap;
 
@@ -1010,14 +1010,9 @@ async fn queue_disk_reclaim(state: &AppState, watermark: f64, dry_run: bool, cac
 /// 5 minutes. Reads from `noo_security_audit` (event_type='auth_failure').
 pub async fn eval_failed_auth_spike(state: &AppState) -> Result<bool, String> {
     const THRESHOLD: i64 = 10;
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM noo_security_audit \
-         WHERE event_type = 'auth_failure' \
-           AND timestamp > NOW() - INTERVAL '5 minutes'"
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
+    let count: i64 = crate::repo::audit::count_last_5m(&state.db, "auth_failure")
+        .await
+        .map_err(|e| e.to_string())?;
     if count > THRESHOLD {
         tracing::warn!(auth_failures_5m = count, "autonomy.failed_auth_spike.alert");
         crate::operator_alert::send_operator_alert_with(
@@ -2119,8 +2114,7 @@ pub async fn eval_cert_auto_rotate(
 ///
 /// Returns 0 if the PKI directory is missing (gateway not yet onboarded).
 pub async fn count_certs_expiring_within(days_threshold: i64) -> usize {
-    let pki_dir = std::env::var("NOO_PKI_DIR")
-        .ok()
+    let pki_dir = crate::tls::pki_dir().map(|p| p.to_string_lossy().into_owned())
         .filter(|p| std::path::Path::new(p).join("ca.crt").exists())
         .or_else(|| {
             ["/tmp/pki", "/app/pki"]
@@ -3548,9 +3542,8 @@ pub async fn eval_kb_chunk_scale(state: &AppState) -> Result<bool, String> {
 
 // ─── Custom locations (operator-defined rules engine) ───────────────────
 //
-// Port of `worker.autonomy.evaluate_custom` (reference implementation:
-// `noomesh/workers/autonomy.py::_autonomy_evaluate_custom`, kept
-// unregistered). This was the design's sharpest anti-pattern: the Rust
+// Port of `worker.autonomy.evaluate_custom` (the Python side is
+// `src/noomesh/workers/autonomy.py`, which no longer has an evaluate_custom). This was the design's sharpest anti-pattern: the Rust
 // autonomy loop scheduled the location, hopped to Python over NATS, and
 // Python did an HTTP GET back out — the whole body is a threshold
 // comparison. Builtins keep their hand-written evaluators above; this

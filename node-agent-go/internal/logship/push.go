@@ -50,14 +50,14 @@ var errRouteAbsent = errors.New("the controller has no log ingest route yet (HTT
 type pusher struct {
 	client *http.Client
 	url    string
-	auth   func(*http.Request)
+	auth   func(*http.Request) error
 }
 
 // newPusher builds the push URL from the controller URL and REFUSES a
 // plaintext scheme. The transport carries the node's client certificate;
 // over http:// it would carry nothing and the cluster token would cross
 // the wire in the clear.
-func newPusher(controllerURL, nodeID string, client *http.Client, auth func(*http.Request)) (*pusher, error) {
+func newPusher(controllerURL, nodeID string, client *http.Client, auth func(*http.Request) error) (*pusher, error) {
 	u := strings.TrimRight(strings.TrimSpace(controllerURL), "/")
 	if !strings.HasPrefix(strings.ToLower(u), "https://") {
 		return nil, fmt.Errorf("log shipping refuses a plaintext controller URL %q — logs and the cluster token travel over TLS only", controllerURL)
@@ -84,7 +84,9 @@ func (p *pusher) send(ctx context.Context, gz []byte) pushResult {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Content-Encoding", "gzip")
 	if p.auth != nil {
-		p.auth(req)
+		if err := p.auth(req); err != nil {
+			return pushResult{outcome: outcomeRetry, err: err, reason: "sign request: " + err.Error()}
+		}
 	}
 	resp, err := p.client.Do(req)
 	if err != nil {

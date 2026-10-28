@@ -394,7 +394,7 @@ pub fn spawn_kv_bucket_watchdog(js: async_nats::jetstream::Context) {
 /// `startup_tasks::stage_pki` published them. A param already in the URL
 /// wins; nothing is ever removed or weakened.
 pub fn with_cluster_tls(url: String) -> String {
-    let ca = std::env::var("NOO_TLS_CA").unwrap_or_default();
+    let ca = crate::tls::ca_path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let mut cert = std::env::var("NOO_TLS_CERT").unwrap_or_default();
     let mut key = std::env::var("NOO_TLS_KEY").unwrap_or_default();
     // Postgres requires the client certificate's CN to BE the role being
@@ -560,6 +560,22 @@ impl AppState {
             RedisSlot::connect(&redis_url, crate::cache::REDIS_BOOT_BUDGET).await
         };
 
+        Self::assemble(config, db, nats, nats_cred_source, js, redis).await
+    }
+
+    /// Everything `new` does AFTER the three connections are open: the gossip
+    /// handle, the caches read from disk, the registries. One body, so the
+    /// router harness (`routes::router_harness_tests`), which hands in an
+    /// unconnected NATS client and an empty Redis slot, cannot drift from the
+    /// state production builds.
+    async fn assemble(
+        config: &AppConfig,
+        db: sqlx::PgPool,
+        nats: async_nats::Client,
+        nats_cred_source: Option<&'static str>,
+        js: async_nats::jetstream::Context,
+        redis: RedisSlot,
+    ) -> Result<Self> {
         // Gossip mesh
         let node_id = std::env::var("NODE_ID").unwrap_or_else(|_| "gateway".into());
         let gossip = GossipMesh::new(nats.clone(), node_id);
@@ -616,6 +632,22 @@ impl AppState {
             metrics: Arc::new(crate::metrics::MetricsState::new()),
             self_handle: std::sync::OnceLock::new(),
         })
+    }
+
+    /// A state for the router harness: the REAL Postgres pool and the real
+    /// assembly, but NO NATS server (an unconnected client that keeps
+    /// retrying, so every request to the bus fails fast) and NO Redis (an
+    /// empty slot, which is exactly the condition `redis_or_unavailable` and
+    /// `Measured` answer for). Test-only.
+    #[cfg(test)]
+    pub(crate) async fn for_router_harness(config: &AppConfig, db: sqlx::PgPool) -> Result<Self> {
+        let nats = async_nats::ConnectOptions::new()
+            .retry_on_initial_connect()
+            .request_timeout(Some(std::time::Duration::from_secs(1)))
+            .connect("nats://127.0.0.1:1")
+            .await?;
+        let js = async_nats::jetstream::new(nats.clone());
+        Self::assemble(config, db, nats, None, js, RedisSlot::default()).await
     }
 }
 

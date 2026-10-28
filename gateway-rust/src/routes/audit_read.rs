@@ -12,6 +12,7 @@
 //! Its own module, away from `routes/admin.rs`, so the audit stats and verify
 //! routes there can be changed without touching this one.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 
 use axum::{extract::{Query, State}, routing::get, Json, Router};
@@ -20,7 +21,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{AppError, AppResult};
-use crate::auth::{RequesterCtx, Role};
+use crate::authz::Operator;
 use crate::state::AppState;
 
 /// Rows returned when `limit` is absent / the most a caller may ask for.
@@ -81,19 +82,7 @@ pub(crate) fn decode_cursor(raw: &str) -> Result<(DateTime<Utc>, String), String
     Ok((ts, id.to_string()))
 }
 
-type Row = (
-    String,
-    DateTime<Utc>,
-    String,
-    String,
-    String,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-    Option<String>,
-);
+type Row = crate::repo::audit::ListRow;
 
 /// GET /api/security/audit/list
 ///
@@ -107,16 +96,9 @@ type Row = (
 /// verify; `GET /api/security/audit/verify` does.
 async fn security_audit_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<axum::Extension<RequesterCtx>>,
+    reader: Operator,
     Query(p): Query<ListParams>,
 ) -> AppResult {
-    if let Some(axum::Extension(r)) = &ctx {
-        if r.role < Role::Operator {
-            return Err(AppError::Forbidden(
-                "reading the security audit log is operator-only (Operator role or above)".into(),
-            ));
-        }
-    }
     let now = Utc::now();
     let since = p
         .since
@@ -136,25 +118,15 @@ async fn security_audit_list(
     let event_type = p.event_type.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let actor = p.actor.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
-    let rows: Vec<Row> = sqlx::query_as(
-        "SELECT id::text, \"timestamp\", event_type, severity, actor, resource, outcome, \
-                request_id, details::text, chain_seq, entry_hash \
-           FROM noo_security_audit \
-          WHERE ($1::timestamptz IS NULL OR \"timestamp\" >= $1) \
-            AND ($2::text IS NULL OR event_type = $2) \
-            AND ($3::text IS NULL OR actor = $3) \
-            AND ($4::timestamptz IS NULL OR (\"timestamp\", id) < ($4::timestamptz, $5::uuid)) \
-          ORDER BY \"timestamp\" DESC, id DESC \
-          LIMIT $6",
-    )
-    .bind(since)
-    .bind(event_type)
-    .bind(actor)
-    .bind(cursor.as_ref().map(|c| c.0))
-    .bind(cursor.as_ref().map(|c| c.1.as_str()))
     // One extra row says whether another page exists.
-    .bind(limit + 1)
-    .fetch_all(&state.db)
+    let rows: Vec<Row> = crate::repo::audit::list(
+        &state.db,
+        since,
+        event_type,
+        actor,
+        cursor.as_ref().map(|c| (c.0, c.1.as_str())),
+        limit + 1,
+    )
     .await
     .map_err(|e| AppError::Internal(format!("cannot read noo_security_audit: {e}")))?;
 
@@ -181,18 +153,12 @@ async fn security_audit_list(
         .collect();
 
     // Who read the log. Written after the read, so it never lists itself.
-    let (reader, act) = match &ctx {
-        Some(axum::Extension(r)) => (r.sub.clone(), r.act.as_ref().map(|a| json!(a))),
-        None => ("cluster".to_string(), None),
-    };
-    super::core::audit_event(
+    let (reader, act) = (reader.0.sub.clone(), reader.0.act.as_ref().map(|a| json!(a)));
+    crate::audit::record(
         &state.db,
-        "audit_log_read",
-        "info",
-        &reader,
-        "noo_security_audit",
-        "success",
-        json!({
+        AuditEvent::new(AuditKind::AuditLogRead, &reader, "noo_security_audit")
+            .outcome(crate::audit::Outcome::custom("success"))
+            .details(json!({
             "since": since.map(|t| t.to_rfc3339()),
             "event_type": event_type,
             "actor": actor,
@@ -200,7 +166,7 @@ async fn security_audit_list(
             "paged": cursor.is_some(),
             "returned": events.len(),
             "act": act,
-        }),
+        })),
     )
     .await;
 

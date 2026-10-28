@@ -26,6 +26,7 @@
 //! This module also answers "does this staged row belong to an erased user?"
 //! for the graph-prune restore routes ([`user_is_erased`]).
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -116,14 +117,10 @@ async fn tick(state: Arc<AppState>) -> anyhow::Result<()> {
         Ok(n) => {
             tracing::info!(purged = n, retention_days = RETENTION_DAYS, "erasure_archive_purged");
             // The count only: what was purged is somebody's erased data.
-            crate::routes::core::audit_event(
+            crate::audit::record(
                 &state.db,
-                "erasure_archive_purge",
-                "info",
-                "system:erasure_purge",
-                "noo_user_erasure_staging",
-                "ok",
-                json!({ "rows_purged": n, "retention_days": RETENTION_DAYS }),
+                AuditEvent::new(AuditKind::ErasureArchivePurge, "system:erasure_purge", "noo_user_erasure_staging")
+                    .details(json!({ "rows_purged": n, "retention_days": RETENTION_DAYS })),
             )
             .await;
             Ok(())

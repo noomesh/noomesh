@@ -45,8 +45,9 @@ def _template_vars() -> set[str]:
 def _provision_maps() -> dict[str, set[str]]:
     """Every var map in provision.rs, keyed by the function that builds it.
 
-    Two functions render the template — the pull rail (`cluster_provision`)
-    and the self-agent lane (`provision_local`) — each with its own map, and
+    Two functions render the template — the pull rail (`build_env_vars`, the
+    map phase of `cluster_provision`) and the self-agent lane
+    (`provision_local`) — each with its own map, and
     the renderer's guard checks the one in use. A var supplied by only one
     of them passed a union-based test and refused every node on a live
     `noo upgrade --nodes` (2026-09-11), so each map is held to the template
@@ -69,8 +70,12 @@ def _provision_supplied() -> set[str]:
 
 
 def test_every_renderer_map_supplies_every_template_var() -> None:
-    maps = _provision_maps()
-    assert len(maps) >= 2, f"expected the pull-rail and local maps, found {sorted(maps)}"
+    all_maps = _provision_maps()
+    # The renderers of the AGENT template. (`attach_harness` only adds the
+    # harness extras on top of `build_env_vars`; it is held to the harness
+    # template below.)
+    maps = {fn: v for fn, v in all_maps.items() if fn in ("build_env_vars", "provision_local_in")}
+    assert len(maps) >= 2, f"expected the pull-rail and local maps, found {sorted(all_maps)}"
     template = _template_vars()
     for fn, supplied in maps.items():
         missing = template - supplied
@@ -111,8 +116,9 @@ def test_template_and_renderer_use_only_the_supported_subset() -> None:
 # A second template, rendered by the pull rail only (the controller's own
 # node gets no harness: its gateway runs turns in process). Same renderer,
 # same rule: no defaults, every var supplied — and the map that supplies it
-# is `hvars`, built inside cluster_provision from `vars` plus the harness
-# extras, which the `vars.insert(` scan above already picks up.
+# is `hvars`, built inside `attach_harness` (a phase of cluster_provision) from
+# the pull rail's `vars` (`build_env_vars`) plus the harness extras, which the
+# `vars.insert(` scan above already picks up.
 HARNESS_TEMPLATE = REPO / "node-agent-go/deploy/noo-harness.env.tmpl"
 
 
@@ -136,10 +142,12 @@ def test_harness_template_has_no_defaults() -> None:
 
 def test_pull_rail_supplies_every_harness_template_var() -> None:
     maps = _provision_maps()
-    assert "cluster_provision" in maps, sorted(maps)
-    missing = _harness_template_vars() - maps["cluster_provision"]
+    assert "build_env_vars" in maps and "attach_harness" in maps, sorted(maps)
+    # hvars = the pull rail's vars + the harness extras.
+    supplied = maps["build_env_vars"] | maps["attach_harness"]
+    missing = _harness_template_vars() - supplied
     assert not missing, (
-        f"provision.rs::cluster_provision renders the harness template without {sorted(missing)}"
+        f"provision.rs::attach_harness renders the harness template without {sorted(missing)}"
     )
 
 

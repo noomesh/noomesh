@@ -18,8 +18,8 @@
 //!
 //! It also used to return `{user} ALL=(ALL) NOPASSWD:ALL` as a
 //! `sudoers_template`, described as "required for hands-off provision".
-//! It was not required: `bootstrap-enroll.sh` never read the field, and
-//! writes its own narrow grant instead (one binary, `noo-apply`, which
+//! It was not required: the enrollment script (since retired; `noo enroll`
+//! replaced it) never read the field, and wrote its own narrow grant instead (one binary, `noo-apply`, which
 //! validates CA signatures itself). Provisioning is pull-based:
 //! the same response's `next_step` says so. So the field bought
 //! nothing and handed any OTHER reader of this endpoint a recipe for
@@ -37,7 +37,7 @@
 //!     the design's design goal is onboarding a host from chat, so the
 //!     coordinator may mint. A minted token is inert until a human runs the
 //!     script on a machine the attacker would already need to control.
-//!   - `POST /api/cluster/bootstrap` and `GET /bootstrap` are PUBLIC
+//!   - `POST /api/cluster/bootstrap` and the `GET /bootstrap/*` script routes are PUBLIC
 //!     (`auth::PUBLIC_PATHS_EXACT`): an unenrolled host has no credential of
 //!     any kind. The
 //!     token in the body IS the authentication; it carries 256 bits of
@@ -49,6 +49,7 @@
 //! wrong-CIDR. The distinction is recorded internally in the
 //! `bootstrap_token_denied` audit row, never in the response.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -65,6 +66,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::RequesterCtx;
+use crate::authz::{Operator, OperatorOrInternal};
 use crate::auth_refresh::{generate_bootstrap_token, hash_token, BOOTSTRAP_TOKEN_PREFIX};
 use crate::state::AppState;
 use super::{AppError, AppResult};
@@ -79,7 +81,6 @@ pub fn router() -> Router<Arc<AppState>> {
         // ── Public enrollment surface (see module docs + PUBLIC_PATHS_EXACT) ──
         .route("/api/cluster/bootstrap", post(cluster_bootstrap))
         .route("/api/cluster/enroll-tailnet", post(enroll_tailnet))
-        .route("/bootstrap", get(serve_enroll_script))
         .route("/bootstrap/prep", get(serve_prep_script))
         .route("/bootstrap/apply", get(serve_apply_script))
         .route("/bootstrap/ca.crt", get(serve_cluster_ca))
@@ -146,25 +147,6 @@ pub(crate) const MAX_RAIL_BODY: usize = 768 * 1024 * 1024;
 /// caller — an attacker probing tokens learns nothing about WHY one failed
 /// (in particular, not that a guessed value corresponds to a real token).
 const DENIED_MSG: &str = "bootstrap token rejected";
-
-/// >= Operator or cluster-HMAC. Mirrors the sibling enrollment surface
-/// > (`mint_join_key` accepts internal callers; `users_admin_read_guard` admits
-/// > `None`): the shared cluster secret is the host operator CLI / the
-/// > coordinator agent, and the design explicitly wants chat-driven
-/// > onboarding. Sub-operator JWTs are refused even on GET — `scope_allows`
-/// > admits every GET, so without this a read-tier account could enumerate
-/// > token issuance metadata.
-pub(crate) fn bootstrap_admin_guard(
-    ctx: &Option<Extension<RequesterCtx>>,
-) -> Result<String, AppError> {
-    match ctx {
-        None => Ok("cluster-cli".to_string()),
-        Some(Extension(r)) if r.role >= crate::auth::Role::Operator => Ok(r.sub.clone()),
-        Some(_) => Err(AppError::Forbidden(
-            "operator role required for bootstrap-token management".into(),
-        )),
-    }
-}
 
 /// TTL validation: default 1h, hard max 24h ("short-lived
 /// (default 1h, max 24h) — narrow attack window"). Out-of-range values are
@@ -374,7 +356,7 @@ fn compose_enroll_command(url: &str, token: &str, tsk: &str, ca_sha256: &str, no
 /// the fingerprint of the very file the node will fetch.
 pub(crate) fn cluster_ca_candidates() -> [String; 3] {
     [
-        std::env::var("NOO_TLS_CA").unwrap_or_default(),
+        crate::tls::ca_path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
         "/app/pki/ca.crt".to_string(),
         "pki/ca.crt".to_string(),
     ]
@@ -469,10 +451,10 @@ struct CreateTokenBody {
 /// logs. Losing the response means minting a new token, by design.
 async fn bootstrap_token_create(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    op: OperatorOrInternal,
     body: Option<Json<Value>>,
 ) -> AppResult {
-    let by = bootstrap_admin_guard(&ctx)?;
+    let by = op.actor("cluster-cli");
     // An absent body means "all defaults" (mint_join_key precedent), but a
     // PRESENT body that doesn't deserialize is a 400 — `Option<Json<T>>`
     // would silently swallow `{"ttl_seconds": "1h"}` into the defaults, and
@@ -583,35 +565,19 @@ async fn bootstrap_token_create(
     // Audit the ID, never the raw token or its hash: the raw value is a live
     // credential and the hash is the verifier — an audit reader needs
     // neither to answer "who minted what, when".
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "bootstrap_token_create",
-        "warning",
-        &by,
-        &format!("bootstrap-token:{id}"),
-        "ok",
-        json!({
+        AuditEvent::new(AuditKind::BootstrapTokenCreate, &by, &format!("bootstrap-token:{id}"))
+            .details(json!({
             "token_id": id.to_string(),
             "ttl_seconds": ttl,
             "role_hint": role_hint,
             "allowed_cidr": allowed_cidr,
             "tailnet_key": !tsk.is_empty(),
-        }),
+        })),
     )
     .await;
 
-    // hash the EXACT script /bootstrap serves so the
-    // paste can verify it before executing — the CA pin (#80) rode the
-    // out-of-band paste, but the script CHECKING that pin arrived over
-    // unverified TLS; a substituted script simply ignores the pin. With
-    // the script hash in the paste too, both pins share the trusted
-    // channel and wholesale substitution dies.
-    let bootstrap_sha256 = crate::paths::resolve(crate::paths::BOOTSTRAP_ENROLL_SCRIPT_CANDIDATES)
-        .and_then(|p| std::fs::read(p).ok())
-        .map(|bytes| {
-            use sha2::{Digest, Sha256};
-            hex::encode(Sha256::digest(&bytes))
-        });
     Ok(Json(json!({
         "status": "ok",
         "id": id.to_string(),
@@ -620,7 +586,6 @@ async fn bootstrap_token_create(
         "node_name": node_name,
         "role_hint": role_hint,
         "allowed_cidr": allowed_cidr,
-        "bootstrap_sha256": bootstrap_sha256,
         // The ONE enrollment paste: install the CLI, then
         // `noo enroll`. The fetched-script `one_liner` that used to ride
         // here is retired; an older CLI falls back to composing
@@ -647,9 +612,8 @@ async fn bootstrap_token_create(
 /// GET /api/security/bootstrap-tokens — issuance metadata, NEVER hashes.
 async fn bootstrap_tokens_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: Operator,
 ) -> AppResult {
-    let _ = bootstrap_admin_guard(&ctx)?;
     let rows: Vec<(
         uuid::Uuid,
         String,
@@ -716,9 +680,9 @@ async fn bootstrap_tokens_list(
 async fn bootstrap_token_revoke(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    ctx: Option<Extension<RequesterCtx>>,
+    op: OperatorOrInternal,
 ) -> AppResult {
-    let by = bootstrap_admin_guard(&ctx)?;
+    let by = op.actor("cluster-cli");
     let id: uuid::Uuid = id
         .parse()
         .map_err(|_| AppError::BadRequest("invalid token id (expected a UUID)".into()))?;
@@ -731,14 +695,10 @@ async fn bootstrap_token_revoke(
         return Err(AppError::NotFound(format!("bootstrap token {id} not found")));
     }
 
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "bootstrap_token_revoke",
-        "info",
-        &by,
-        &format!("bootstrap-token:{id}"),
-        "ok",
-        json!({ "token_id": id.to_string() }),
+        AuditEvent::new(AuditKind::BootstrapTokenRevoke, &by, &format!("bootstrap-token:{id}"))
+            .details(json!({ "token_id": id.to_string() })),
     )
     .await;
     Ok(Json(json!({ "status": "ok", "id": id.to_string(), "revoked": true })))
@@ -837,14 +797,11 @@ async fn cluster_bootstrap(
             let resource = token_id
                 .map(|id| format!("bootstrap-token:{id}"))
                 .unwrap_or_else(|| "bootstrap-token:unknown".to_string());
-            crate::routes::core::audit_event(
+            crate::audit::record(
                 &db,
-                "bootstrap_token_denied",
-                "warning",
-                "anonymous",
-                &resource,
-                "denied",
-                json!({ "reason": reason.as_str(), "ip": ip }),
+                AuditEvent::new(AuditKind::BootstrapTokenDenied, "anonymous", &resource)
+                    .outcome(crate::audit::Outcome::Denied)
+                    .details(json!({ "reason": reason.as_str(), "ip": ip })),
             )
             .await;
             AppError::Forbidden(DENIED_MSG.into())
@@ -969,14 +926,10 @@ async fn cluster_bootstrap(
         .execute(&state.db)
         .await?;
 
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "bootstrap_token_used",
-        "warning",
-        "anonymous",
-        &format!("bootstrap-token:{id}"),
-        "ok",
-        json!({ "token_id": id.to_string(), "ip": peer_ip.to_string(), "role_hint": role_hint }),
+        AuditEvent::new(AuditKind::BootstrapTokenUsed, "anonymous", &format!("bootstrap-token:{id}"))
+            .details(json!({ "token_id": id.to_string(), "ip": peer_ip.to_string(), "role_hint": role_hint })),
     )
     .await;
     tracing::info!(token_id = %id, ip = %peer_ip, "bootstrap_token_used");
@@ -1080,9 +1033,11 @@ async fn enroll_tailnet(
         let db = state.db.clone();
         let ip = body.tailnet_ip.clone();
         async move {
-            crate::routes::core::audit_event(
-                &db, "tailnet_enroll_denied", "warning", "anonymous",
-                &format!("tailnet-enroll:{ip}"), "denied", json!({ "reason": reason }),
+            crate::audit::record(
+                &db,
+                AuditEvent::new(AuditKind::TailnetEnrollDenied, "anonymous", &format!("tailnet-enroll:{ip}"))
+                    .outcome(crate::audit::Outcome::Denied)
+                    .details(json!({ "reason": reason })),
             ).await;
             AppError::Forbidden("tailnet enrollment denied".into())
         }
@@ -1162,13 +1117,13 @@ async fn enroll_tailnet(
         .execute(&state.db)
         .await?;
 
-    crate::routes::core::audit_event(
-        &state.db, "tailnet_enroll_admitted", "warning", "anonymous",
-        &format!("bootstrap-token:{}", row.0), "ok",
-        json!({
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::TailnetEnrollAdmitted, "anonymous", &format!("bootstrap-token:{}", row.0))
+            .details(json!({
             "node_name": node_name, "tailnet_ip": body.tailnet_ip,
             "tag": required_tag, "peer": peer.ip().to_string(),
-        }),
+        })),
     )
     .await;
     tracing::info!(node = %node_name, ip = %body.tailnet_ip, "tailnet_enroll_admitted");
@@ -1192,13 +1147,14 @@ async fn name_conflict_audit(
     holder: &crate::node_name_claim::NameHolder,
     lane: &str,
 ) {
-    crate::routes::core::audit_event(
-        db, "enroll_name_conflict", "warning", "anonymous",
-        &format!("node:{name}"), "denied",
-        json!({
+    crate::audit::record(
+        db,
+        AuditEvent::new(AuditKind::EnrollNameConflict, "anonymous", &format!("node:{name}"))
+            .outcome(crate::audit::Outcome::Denied)
+            .details(json!({
             "node_name": name, "claimant": addr, "lane": lane,
             "held_by": holder.addrs, "controller": holder.controller,
-        }),
+        })),
     )
     .await;
     tracing::warn!(node = %name, claimant = %addr, held_by = ?holder.addrs, controller = holder.controller, lane,
@@ -1218,28 +1174,9 @@ struct EnrollTailnetBody {
     birth_cert: Option<String>,
 }
 
-/// GET /bootstrap — the enrollment script (public, because it runs before
-/// the host has any credential). The script itself does nothing without a
-/// valid TOKEN.
-async fn serve_enroll_script() -> impl IntoResponse {
-    use crate::paths;
-    let Some(path) = paths::resolve(paths::BOOTSTRAP_ENROLL_SCRIPT_CANDIDATES) else {
-        return (StatusCode::NOT_FOUND, "bootstrap enrollment script not found").into_response();
-    };
-    match tokio::fs::read_to_string(&path).await {
-        Ok(content) => (
-            StatusCode::OK,
-            [("content-type", "text/x-shellscript")],
-            content,
-        )
-            .into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "bootstrap enrollment script not found").into_response(),
-    }
-}
-
 /// GET /bootstrap/prep — the ROOT host-prep phase, fetched by
-/// bootstrap-enroll.sh and run under the operator's one attended sudo.
-/// Public for the same reason as `/bootstrap`: it is an inert script from
+/// `noo enroll` and run under the operator's one attended sudo.
+/// Public because the enrolling host has no credential yet: it is an inert script from
 /// the repo; run by nobody but the operator, on a host that has no
 /// credential of any kind yet.
 async fn serve_deenroll_script() -> impl IntoResponse {
@@ -1308,14 +1245,10 @@ async fn cli_asset_put(
     .await?;
     let actor = ctx.as_ref().map(|Extension(r)| r.sub.clone())
         .unwrap_or_else(|| "gateway".into());
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "cli_asset_uploaded",
-        "warning",
-        &actor,
-        &format!("cli-asset:{name}"),
-        "ok",
-        json!({ "name": name, "version": version, "bytes": body.len() }),
+        AuditEvent::new(AuditKind::CliAssetUploaded, &actor, &format!("cli-asset:{name}"))
+            .details(json!({ "name": name, "version": version, "bytes": body.len() })),
     )
     .await;
     Ok(Json(json!({"ok": true, "name": name, "sha256": actual, "version": version, "bytes": body.len()})))
@@ -1389,14 +1322,10 @@ async fn provision_bundle_put(
     .await?;
     let actor = ctx.as_ref().map(|Extension(r)| r.sub.clone())
         .unwrap_or_else(|| "gateway".into());
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "provision_bundle_staged",
-        "warning",
-        &actor,
-        &format!("provision-bundle:{node}"),
-        "ok",
-        json!({ "node": node, "bytes": body.len() }),
+        AuditEvent::new(AuditKind::ProvisionBundleStaged, &actor, &format!("provision-bundle:{node}"))
+            .details(json!({ "node": node, "bytes": body.len() })),
     )
     .await;
     Ok(Json(json!({ "status": "staged", "node": node, "bytes": body.len() })))
@@ -1497,8 +1426,7 @@ fn read_self_birth_cert() -> Option<String> {
 /// receipts and apply reports against (i67). Read-only: the cert is a host
 /// file, and nothing here can change it. `noo cluster provision <self>`
 /// compares the fingerprint with `/etc/noo/birth.crt` before staging.
-async fn self_node_identity(ctx: Option<Extension<RequesterCtx>>) -> AppResult {
-    let _ = bootstrap_admin_guard(&ctx)?;
+async fn self_node_identity(_op: OperatorOrInternal) -> AppResult {
     let self_id = crate::self_node::self_node_id();
     let cert = self_id.as_deref()
         .and_then(|id| self_birth_cert(id, Some(id), read_self_birth_cert).flatten());
@@ -1629,15 +1557,13 @@ async fn bundle_apply_report(
     .bind(&msg)
     .execute(&state.db)
     .await?;
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "bundle_apply_reported",
-        if rc == 0 { "info" } else { "warning" },
-        &format!("node:{node}"),
-        &format!("provision-bundle:{node}"),
-        if rc == 0 { "ok" } else { "failed" },
-        json!({ "node": node, "rc": rc, "sha": sha, "msg": msg,
-                "proved_by": proved_by }),
+        AuditEvent::new(AuditKind::BundleApplyReported, &format!("node:{node}"), &format!("provision-bundle:{node}"))
+            .outcome(if rc == 0 { crate::audit::Outcome::Ok } else { crate::audit::Outcome::custom("failed") })
+            .severity(if rc == 0 { crate::audit::Severity::Info } else { crate::audit::Severity::Warning })
+            .details(json!({ "node": node, "rc": rc, "sha": sha, "msg": msg,
+                "proved_by": proved_by })),
     )
     .await;
     Ok(Json(json!({ "recorded": true, "node": node, "rc": rc, "signed": birth_signed })))
@@ -2019,17 +1945,16 @@ mod tests {
     }
 
     // ── Guards ──────────────────────────────────────────────────
+    //
+    // The operator-or-cluster-HMAC gate is the `OperatorOrInternal` extractor
+    // (`authz::tests` drives it through a router); the actor name a call with
+    // no user context is recorded under is pinned here.
 
     #[test]
-    fn guard_admits_operator_and_cluster_hmac_refuses_user() {
+    fn a_call_with_no_user_is_recorded_as_the_cluster_cli() {
         use crate::auth::Role;
-        assert_eq!(bootstrap_admin_guard(&None).unwrap(), "cluster-cli");
-        assert_eq!(bootstrap_admin_guard(&role_ctx(Role::Operator)).unwrap(), "tester");
-        assert_eq!(bootstrap_admin_guard(&role_ctx(Role::Admin)).unwrap(), "tester");
-        assert!(matches!(
-            bootstrap_admin_guard(&role_ctx(Role::User)),
-            Err(AppError::Forbidden(_))
-        ));
+        assert_eq!(OperatorOrInternal(None).actor("cluster-cli"), "cluster-cli");
+        assert_eq!(OperatorOrInternal(role_ctx(Role::Operator).map(|e| e.0)).actor("cluster-cli"), "tester");
     }
 
     // ── Source assertions (no DB harness exists — repo convention) ──
@@ -2085,7 +2010,7 @@ mod tests {
     /// returning the one uniform message. Assert the uniform constant is the
     /// ONLY Forbidden body in the redemption handler, and that the reason
     /// enum never leaks into a response ("reason" appears only next to
-    /// audit_event calls).
+    /// audit::record calls).
     #[test]
     fn redemption_failures_are_uniform() {
         let src = include_str!("bootstrap.rs");
@@ -2121,7 +2046,7 @@ mod tests {
         assert!(!create.contains(".bind(&raw)"), "the raw token must never be bound to SQL");
         // The audit call's arguments (everything up to its `.await`) must not
         // carry the raw token or the hash.
-        let audit_start = create.find("audit_event").unwrap();
+        let audit_start = create.find("audit::record").unwrap();
         let after = &create[audit_start..];
         let audit_call = &after[..after.find(".await").expect("audit call is awaited")];
         assert!(!audit_call.contains("raw"), "audit details must not include the raw token");
@@ -2162,7 +2087,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} not found"));
             let body = &src[start..src[start..].find("\n}\n").unwrap_or(src.len() - start) + start];
             assert!(
-                body.contains("audit_event"),
+                body.contains("audit::record"),
                 "mutating bootstrap route handler {name} writes no audit row"
             );
         }

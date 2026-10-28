@@ -91,31 +91,29 @@ heartbeat, log shipping, desired-config, manifests, the apply report) and the
 agent verifies v2 from the peers and the controller that call it. A body over
 64 MiB (gateway) or 32 MiB (agent) is refused instead of admitted unbound.
 
-The old form is still accepted while the fleet rolls, and **every use is
-counted** under the `cluster_hmac_v1` lane (`noo cluster verify
---controller`, row `legacy lanes`, names the callers; `cluster_hmac_v2` is the
-comparator). Roll the controller first (it must understand v2 before a node
-sends it), then the nodes. Once the row shows no v1 callers, close the door
-on the gateway with the posture bridge `NOO_CLUSTER_TOKEN_V1`:
+**The old form is gone.** The v1 token (`<actor>:<time>:<hmac>`) is refused
+everywhere: the gateway and every node agent answer it `401
+cluster_token_v1_refused` (the agent: `403`) with the fix in the body, and
+count it as a refusal under `cluster_hmac_v1_refused` (gateway and agents
+alike), so a caller still signing it is visible by name for one release: `noo
+cluster verify --controller`, row `legacy lanes`, warns and names it. There is
+no switch to re-admit it. The `NOO_CLUSTER_TOKEN_V1` posture gate, the v1
+admission lane (`cluster_hmac_v1`) and the signer pin
+`NOO_CLUSTER_TOKEN_SIGN=v1` were deleted once the fleet had run on v2 alone
+(the gate was closed live on 2026-10-26; the last v1 admission fleet-wide was
+2026-10-20). A node agent that cannot sign a request as v2 (an unreadable or
+oversize body) fails that call with an error instead of sending a v1 token that
+would only be refused. Roll the controller first (it must understand v2
+before a node sends it), then the nodes; `noo upgrade --nodes` rolls the
+nodes.
 
-```
-noo security posture set NOO_CLUSTER_TOKEN_V1 0
-```
-
-(on a release that introduces the key, add `NOO_CLUSTER_TOKEN_V1` to
-`compose_env:` first and set it after the roll; a gate cannot be set before
-the release that defines it). A v1 token is then answered `401
-cluster_token_v1_refused` with the fix in the body, and counted as a refusal,
-not a use: under `cluster_hmac_v1_refused` (gateway and agents alike), so
-`cluster_hmac_v1` stays admissions only and the `legacy lanes` row names a
-refused caller in a warning of its own. A node agent honours the
-same switch from its own environment (`NOO_CLUSTER_TOKEN_V1=0`), and
-`noo cluster provision` renders it from the controller's posture, so after
-`posture set` the next bundle (`noo upgrade --nodes`, or `noo cluster provision
-<node>`) closes the door on each node too; the agents keep counting v1 callers
-until then. The provision output says `NOT CHECKED` when it could not read the
-posture. A node rolled
-*before* its controller can pin the old form with `NOO_CLUSTER_TOKEN_SIGN=v1`.
+An upgrading box that still holds a `NOO_CLUSTER_TOKEN_V1` posture row is not
+broken by it: the key is retired and inert, `posture list` shows it under
+`retired`, the gateway deletes a closed row at the next start and warns while
+one is set on (`noo security posture set NOO_CLUSTER_TOKEN_V1 0` closes it). A
+leftover `NOO_CLUSTER_TOKEN_V1=` or `NOO_CLUSTER_TOKEN_SIGN=` line in a node's
+env or in `.env` is ignored; the next bundle rewrites the node's file without
+it.
 
 One claimed name is refused outright: an HMAC whose actor is the `noo` CLI
 (`cli`, or `cli-` followed by a purpose) gets a `403` on every route, valid
@@ -209,9 +207,10 @@ disk layout and free space — is behind the bearer.
 Small controller-to-node control calls no longer need the node's inbound
 `:8081` listener. A node that holds an outbound NATS connection answers them
 as NATS request/reply on `node.<id>.rpc.<op>` (followup i131, phase 1). The
-ops: `health`, `gpu`, `stats`, `models`, `start`, `stop`, `restart`, `clean`,
-`cleanup` (`images` | `logs`), `logs` (a container tail, or the container
-list), `pull`, `skills.run`, `mcp.call`, `mcp.servers`. Each runs **the same
+ops: `health`, `gpu`, `stats`, `models`, `start`, `stop`, `restart`, `reconcile`
+(a desired-state pass now; the gateway sends it after every placement write),
+`clean`, `cleanup` (`images` | `logs`), `logs` (a container tail, or the
+container list), `pull`, `skills.run`, `mcp.call`, `mcp.servers`. Each runs **the same
 handler the HTTPS route runs** (`internal/api/rpc.go` builds the request the
 route would have received and calls that handler), so status, headers and
 body are the HTTPS answer; `TestEveryOpAnswersWhatItsHTTPSRouteAnswers` pins
@@ -261,7 +260,7 @@ guards.
 | New node, controller NATS file from before this change (the subscription is denied) | The node detects the refusal (it flushes after subscribing and reads the server's async permission error), logs it with the remedy, does **not** advertise `nats_rpc`, and retries every minute; control stays on HTTPS |
 | A grant dropped later, or a reply/event publish denied | Any permission violation naming this node's subjects withdraws `nats_rpc` at the next heartbeat |
 | Gateway's bus is down | Routing, not a retry: nothing was sent, so the call goes over HTTPS |
-| Bus call fails (no responders, timeout) on `health`, `gpu`, `stats`, `models`, `logs`, `mcp.servers` | One fall-back read over HTTPS, logged and counted (`control_calls.fallbacks`) |
+| Bus call fails (no responders, timeout) on `health`, `gpu`, `stats`, `models`, `logs`, `mcp.servers`, `reconcile` | One fall-back read over HTTPS, logged and counted (`control_calls.fallbacks`) |
 | Bus call fails on `start`, `stop`, `restart`, `clean`, `cleanup`, `pull`, `skills.run`, `mcp.call` | The node is reported unreachable, as the HTTPS path reports it. **Never retried over HTTPS**: the node may have run it |
 
 `NOO_CONTROL_OVER_BUS=0` on the gateway sends everything over HTTPS again.
@@ -1009,9 +1008,14 @@ from before profiles. The agent applies four of its fields:
   agent restart (a request already in flight keeps the bound it started
   with). An unusable env value is not an override; the profile or the
   default applies.
-- **`ollama_context`** is the default `OLLAMA_CONTEXT_LENGTH` for this node's
-  ollama when the ollama placement's env does not set the key; a placement
-  that sets it is never touched. On Linux it joins the container env before
+- **`context`** (named `ollama_context` until 0.6.13) is the default context window for this node's chat
+  engine when its placement does not decide one: `OLLAMA_CONTEXT_LENGTH` for
+  Ollama, `VLLM_MAX_MODEL_LEN` for vLLM (which otherwise runs at the image
+  default, 16384), `N_CTX` for llama.cpp (a placement that sets
+  `LLAMA_ARG_CTX_SIZE` has decided too; the window is shared across the
+  server's parallel slots). A placement that sets the key is never touched.
+  The name is historical (proposal i226 renames it); the value is one per
+  tier for every engine. On Linux it joins the container env before
   the spec hash is taken, so a changed default recreates the container like
   any placement env edit. On macOS it reaches a brew-managed ollama through
   the plist tuning, and the guard rewrites the key and boots the job out and

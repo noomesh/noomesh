@@ -24,7 +24,7 @@ from importlib.util import find_spec
 from typing import Any
 
 # Availability probe without importing — sqlalchemy+alembic cost ~250ms and
-# the CLI imports this package on every invocation (db_cli mount).
+# importers pay for it on every import, so it is a probe, not an import.
 DB_AVAILABLE = (
     find_spec("sqlalchemy") is not None and find_spec("alembic") is not None
 )

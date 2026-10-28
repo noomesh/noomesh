@@ -19,6 +19,7 @@
 //! research) and is treated as operator-tier, the same as everywhere else
 //! a cluster caller has no person behind it.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::str::FromStr;
 
 use serde_json::{json, Value};
@@ -142,9 +143,7 @@ fn audience_of(v: &Value) -> Vec<String> {
 /// A person's role and knowledge-base roles, for the audience rule.
 async fn identity(state: &AppState, user: Option<&str>) -> (Option<Role>, Vec<String>) {
     let Some(u) = user else { return (None, Vec::new()) };
-    let role: Option<String> = sqlx::query_scalar("SELECT role FROM noo_users WHERE username = $1 AND NOT disabled")
-        .bind(u)
-        .fetch_optional(&state.db)
+    let role: Option<String> = crate::repo::users::enabled_role(&state.db, u)
         .await
         .ok()
         .flatten();
@@ -315,14 +314,11 @@ async fn record(state: &AppState, server: &str, tool: &str, user: Option<&str>, 
     {
         tracing::warn!(error = %e, "mcp_call_record_failed");
     }
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "mcp_external_call",
-        "info",
-        user.unwrap_or("internal"),
-        &full_name(server, tool),
-        if ok { "ok" } else { "error" },
-        json!({ "server": server, "tool": tool, "ms": ms }),
+        AuditEvent::new(AuditKind::McpExternalCall, user.unwrap_or("internal"), &full_name(server, tool))
+            .outcome(if ok { crate::audit::Outcome::Ok } else { crate::audit::Outcome::Error })
+            .details(json!({ "server": server, "tool": tool, "ms": ms })),
     )
     .await;
 }

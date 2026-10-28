@@ -16,6 +16,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlenv"
 )
 
 // Config holds all node-agent configuration derived from environment variables.
@@ -128,14 +130,14 @@ func Load() *Config {
 		GPUModel:          os.Getenv("GPU_MODEL"),
 		SelfNode:          envBool("NOO_SELF_NODE"),
 		VRAMGB:            envFloat("VRAM_GB", 0.0),
-		ControllerURL:     envOr("CONTROLLER_URL", "https://gateway:8080"),
+		ControllerURL:     ctrlenv.ControllerURL(),
 		HeartbeatInterval: envInt("HEARTBEAT_INTERVAL", 30),
 		NATSURL:           envOr("NATS_URL", "tls://nats:4222"),
 		NodeAgentToken:    secretOrEmpty("NOO_NODE_AGENT_TOKEN"),
 		ClusterSecret:     secretOrEmpty("NOO_CLUSTER_SECRET"),
-		TLSCA:             os.Getenv("NOO_TLS_CA"),
-		TLSCert:           os.Getenv("NOO_TLS_CERT"),
-		TLSKey:            os.Getenv("NOO_TLS_KEY"),
+		TLSCA:             ctrlenv.TLSCA(),
+		TLSCert:           ctrlenv.TLSCert(),
+		TLSKey:            ctrlenv.TLSKey(),
 		NodeIP:            os.Getenv("NODE_IP"),
 		ComposeProject:    envOr("NOO_COMPOSE_PROJECT", "pai-assistant"),
 		LogShip:           !envOff("NOO_LOG_SHIP"),

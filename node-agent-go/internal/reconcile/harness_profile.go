@@ -12,7 +12,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/harnessprofile"
 )
 
-// ollamaContextKey is the placement env key the profile's ollama_context
+// ollamaContextKey is the placement env key the profile's context
 // defaults (placementEnvExact and backendrt.OllamaTuningKeys allow it).
 const ollamaContextKey = "OLLAMA_CONTEXT_LENGTH"
 
@@ -33,31 +33,71 @@ func applyHarnessProfile(raw json.RawMessage) {
 
 // profileOllamaContext is the value to default OLLAMA_CONTEXT_LENGTH to for
 // an ollama whose env is env, or "" when nothing is injected: no profile, no
-// ollama_context in it, or the placement already sets the key (the
+// context in it, or the placement already sets the key (the
 // placement's own value is never touched).
 func profileOllamaContext(env map[string]string, prof *harnessprofile.Profile) string {
-	if prof == nil || prof.OllamaContext <= 0 {
+	if prof == nil || prof.Context <= 0 {
 		return ""
 	}
 	if v, ok := env[ollamaContextKey]; ok && strings.TrimSpace(v) != "" {
 		return ""
 	}
-	return strconv.Itoa(prof.OllamaContext)
+	return strconv.Itoa(prof.Context)
 }
 
-// withProfileOllamaContext returns the effective placements with the
-// profile's ollama context default added to each RUNNING ollama placement
-// whose env does not set it. The env map is copied, never mutated: the
-// placement rows are the controller's. Applied before specHash, so the
-// default is part of the container's spec and a change recreates it.
-func withProfileOllamaContext(ps []placement, prof *harnessprofile.Profile) []placement {
+// contextKeys is, per chat engine, the placement env key that sets its
+// context window and every key whose presence means the placement already
+// decided it (so the profile default stays out). One profile value, rendered
+// per engine: until 2026-10-24 only Ollama read it, and a vLLM node ran at
+// the image default (16384) while the same tier's Ollama ran at 32768, which
+// no vendor CLI's prompt fit (noomesh-internal i225, proposal i226 phase A).
+var contextKeys = map[string]struct {
+	set    string
+	decide []string
+}{
+	"ollama":         {ollamaContextKey, []string{ollamaContextKey}},
+	"vllm":           {"VLLM_MAX_MODEL_LEN", []string{"VLLM_MAX_MODEL_LEN"}},
+	"vllm-secondary": {"VLLM_MAX_MODEL_LEN", []string{"VLLM_MAX_MODEL_LEN"}},
+	// llama-server takes --ctx-size from N_CTX (the noo image) or
+	// LLAMA_ARG_CTX_SIZE (upstream image, mirrored from N_CTX); either one
+	// set by the placement is its decision. Note the window is shared across
+	// the server's parallel slots.
+	"llamacpp": {"N_CTX", []string{"N_CTX", "LLAMA_ARG_CTX_SIZE"}},
+}
+
+// profileContext is the (key, value) the profile's context default adds to a
+// placement of backend with env, or ("", "") when nothing is injected: no
+// profile, no context in it, an engine without a window key, or a placement
+// that already decides the window (its own value is never touched).
+func profileContext(backend string, env map[string]string, prof *harnessprofile.Profile) (string, string) {
+	if prof == nil || prof.Context <= 0 {
+		return "", ""
+	}
+	k, ok := contextKeys[backend]
+	if !ok {
+		return "", ""
+	}
+	for _, d := range k.decide {
+		if v, set := env[d]; set && strings.TrimSpace(v) != "" {
+			return "", ""
+		}
+	}
+	return k.set, strconv.Itoa(prof.Context)
+}
+
+// withProfileContext returns the effective placements with the profile's
+// context default added to each RUNNING chat-engine placement whose env does
+// not decide its window ([`contextKeys`]). The env map is copied, never
+// mutated: the placement rows are the controller's. Applied before specHash,
+// so the default is part of the container's spec and a change recreates it.
+func withProfileContext(ps []placement, prof *harnessprofile.Profile) []placement {
 	out := make([]placement, len(ps))
 	copy(out, ps)
 	for i, p := range out {
-		if p.Backend != "ollama" || p.DesiredState != "running" {
+		if p.DesiredState != "running" {
 			continue
 		}
-		v := profileOllamaContext(p.Env, prof)
+		key, v := profileContext(p.Backend, p.Env, prof)
 		if v == "" {
 			continue
 		}
@@ -65,7 +105,7 @@ func withProfileOllamaContext(ps []placement, prof *harnessprofile.Profile) []pl
 		for k, val := range p.Env {
 			env[k] = val
 		}
-		env[ollamaContextKey] = v
+		env[key] = v
 		out[i].Env = env
 	}
 	return out
@@ -143,7 +183,7 @@ func (r *Reconciler) recordChatPlacement(all []placement) {
 // backend runs with as far as the agent sets it, for GET /harness/placement
 // (`model_context`): the harness tells a foreign CLI its model's real window
 // (noomesh-internal i147). Today that is Ollama's OLLAMA_CONTEXT_LENGTH: the
-// placement's own value, else the profile's ollama_context default the agent
+// placement's own value, else the profile's context default the agent
 // injects. 0 = not known (another backend, or nothing sets it).
 func (r *Reconciler) ChatContextWindow(prof *harnessprofile.Profile) int {
 	r.harnessMu.RLock()

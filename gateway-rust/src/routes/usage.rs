@@ -42,6 +42,7 @@
 //! `?group=user` and get every account's name and token volume, because the
 //! tier gate admits every `GET` regardless of role.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 
 use axum::{
@@ -253,7 +254,11 @@ async fn allowance_put(
     if n == 0 {
         return Err(AppError::NotFound(format!("no account named '{username}'")));
     }
-    crate::routes::core::audit_event(&state.db, "token_allowance_set", "info", &by.sub, &username, "ok", json!({"period": period, "tokens": req.tokens})).await;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::TokenAllowanceSet, &by.sub, &username)
+            .details(json!({"period": period, "tokens": req.tokens})),
+    ).await;
     let a = crate::task_budget::allowance_use(&state.db, &username).await.map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Json(json!({
         "user": username,
@@ -269,7 +274,11 @@ async fn allowance_delete(State(state): State<Arc<AppState>>, requester: Option<
         .execute(&state.db)
         .await?
         .rows_affected();
-    crate::routes::core::audit_event(&state.db, "token_allowance_removed", "info", &by.sub, &username, if n > 0 { "ok" } else { "none" }, json!({})).await;
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::TokenAllowanceRemoved, &by.sub, &username)
+            .outcome(if n > 0 { crate::audit::Outcome::Ok } else { crate::audit::Outcome::custom("none") }),
+    ).await;
     Ok(Json(json!({"user": username, "removed": n > 0})))
 }
 

@@ -430,10 +430,7 @@ pub enum Started {
 /// The owner's `user_uuid`, from the requester's ACCOUNT (never the
 /// connection name).
 pub async fn owner_uuid(db: &PgPool, requester: &RequesterCtx) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar("SELECT user_uuid FROM noo_users WHERE username = $1")
-        .bind(account_of(&requester.sub))
-        .fetch_optional(db)
-        .await
+    crate::repo::users::uuid_by_username(db, account_of(&requester.sub)).await
 }
 
 /// The advisory-lock key an account's op starts and erase share.

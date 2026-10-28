@@ -19,7 +19,7 @@
 //!   Dashboard ←→ Gateway             (HTTPS, browser trusts cluster CA)
 
 use anyhow::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Env var overriding how long a gateway → cluster HTTP call may take.
@@ -335,6 +335,33 @@ pub fn loopback_client() -> reqwest::Client {
         .clone()
 }
 
+/// Env var naming the cluster CA file.
+pub const CA_ENV: &str = "NOO_TLS_CA";
+/// Env var naming the PKI directory.
+pub const PKI_DIR_ENV: &str = "NOO_PKI_DIR";
+
+/// THE reader of `NOO_TLS_CA`. One documented unset behaviour: `None` when
+/// the variable is unset, empty or whitespace. A set value is returned
+/// trimmed and unchecked (it may not exist; the caller decides whether that
+/// matters). Callers choose the consequence; only startup (`main.rs` /
+/// `startup_tasks.rs`) may refuse to boot, and its message must name
+/// `NOO_TLS_CA`. A source-scan test pins that no other file reads the var.
+pub fn ca_path() -> Option<PathBuf> {
+    env_path(CA_ENV)
+}
+
+/// THE reader of `NOO_PKI_DIR`; same contract as [`ca_path`] (`None` when
+/// unset or blank, otherwise trimmed and unchecked).
+pub fn pki_dir() -> Option<PathBuf> {
+    env_path(PKI_DIR_ENV)
+}
+
+fn env_path(var: &str) -> Option<PathBuf> {
+    let v = std::env::var(var).ok()?;
+    let v = v.trim();
+    (!v.is_empty()).then(|| PathBuf::from(v))
+}
+
 /// The cluster CA as a reqwest root, if `NOO_TLS_CA` names a readable PEM.
 ///
 /// `Ok(None)` means no anchor was configured — a public cert (tailscale
@@ -342,7 +369,7 @@ pub fn loopback_client() -> reqwest::Client {
 /// `Err` means one WAS configured and could not be used, which is a
 /// misconfiguration the caller should say out loud rather than paper over.
 pub fn cluster_ca_certificate() -> Result<Option<reqwest::Certificate>> {
-    let Some(path) = std::env::var("NOO_TLS_CA").ok().filter(|s| !s.trim().is_empty()) else {
+    let Some(path) = ca_path().map(|p| p.to_string_lossy().into_owned()) else {
         return Ok(None);
     };
     let pem = std::fs::read(&path)
@@ -421,7 +448,7 @@ fn build_https_client_with(timeouts: ClientTimeouts) -> Result<reqwest::Client> 
 /// here and by the reserved-workload WebSocket relay. `None` when neither is
 /// configured (the system trust store applies).
 pub fn cluster_rustls_config() -> Result<Option<std::sync::Arc<rustls::ClientConfig>>> {
-    let ca_path = std::env::var("NOO_TLS_CA").unwrap_or_default();
+    let ca_path = ca_path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let cert_path = std::env::var("NOO_TLS_CERT").unwrap_or_default();
     let key_path = std::env::var("NOO_TLS_KEY").unwrap_or_default();
 
@@ -612,9 +639,7 @@ pub fn mtls_mode_of(raw: Option<&str>, ca_usable: bool) -> MtlsMode {
 }
 
 fn ca_file_usable() -> bool {
-    let ca = std::env::var("NOO_TLS_CA").unwrap_or_default();
-    let ca = ca.trim();
-    !ca.is_empty() && Path::new(ca).is_file()
+    ca_path().is_some_and(|ca| ca.is_file())
 }
 
 /// The mode the environment says right now.
@@ -695,7 +720,7 @@ pub async fn load_rustls_config() -> Result<axum_server::tls_rustls::RustlsConfi
     // certificate connects as before, and a client that presents one must
     // present a valid one signed by the cluster CA — which is what makes
     // a verified certificate usable as an identity.
-    let ca_path = std::env::var("NOO_TLS_CA").unwrap_or_default();
+    let ca_path = ca_path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     if ca_path.is_empty() || !Path::new(&ca_path).exists() {
         anyhow::bail!(
             "NOO_MTLS_GATEWAY is explicitly on but NOO_TLS_CA is unset or missing ({ca_path:?}) — \
@@ -1167,5 +1192,61 @@ mod mtls_mode_tests {
         std::env::remove_var("NOO_TLS_CA");
         assert!(!mtls_enabled(), "no CA at all: nothing to enforce against");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod one_ca_reader {
+    //! Ratchet to zero: `NOO_TLS_CA` is READ in exactly one place, `ca_path()`
+    //! above. Every other file asks tls.rs and decides what `None` means. Writers
+    //! (`set_var` when staging PKI) and injected env lookups are not reads.
+
+    fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).expect("read src dir") {
+            let p = e.expect("dir entry").path();
+            if p.is_dir() {
+                rs_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    #[test]
+    fn no_file_outside_tls_rs_reads_noo_tls_ca() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&src, &mut files);
+        assert!(files.len() > 50, "the scan found {} files; the walk is broken", files.len());
+        let reader = concat!("var(\"NOO_TLS", "_CA\")");
+        let mut offenders = Vec::new();
+        for f in files {
+            if f.file_name().is_some_and(|n| n == "tls.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&f).expect("read source");
+            for (i, line) in text.lines().enumerate() {
+                if line.contains(reader) {
+                    offenders.push(format!("{}:{}", f.display(), i + 1));
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "NOO_TLS_CA must be read through tls::ca_path(): {offenders:?}");
+    }
+
+    #[test]
+    fn ca_path_unset_blank_and_set() {
+        let _g = super::loopback_verification_tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("NOO_TLS_CA").ok();
+        std::env::remove_var("NOO_TLS_CA");
+        assert_eq!(super::ca_path(), None);
+        std::env::set_var("NOO_TLS_CA", "   ");
+        assert_eq!(super::ca_path(), None);
+        std::env::set_var("NOO_TLS_CA", " /x/ca.crt ");
+        assert_eq!(super::ca_path(), Some(std::path::PathBuf::from("/x/ca.crt")));
+        match prev {
+            Some(v) => std::env::set_var("NOO_TLS_CA", v),
+            None => std::env::remove_var("NOO_TLS_CA"),
+        }
     }
 }

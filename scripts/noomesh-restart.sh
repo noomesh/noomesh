@@ -95,6 +95,9 @@ restart_require_lock() {
 # lib-dist.sh require_addon_pins); restart never pulls one either. An add-on
 # whose pin does not verify is left out (REFUSED, by name); the rest restarts.
 require_addon_pins || exit 1
+# Their declared runtime inputs (resources.json) and held GPU/socket
+# services (lib-dist.sh); an add-on whose input cannot be produced is refused.
+addon_resources_materialise || exit 1
 # The verified add-ons' bundle declarations, for the gateway (lib-dist.sh).
 addon_decls_materialise || exit 1
 
@@ -279,10 +282,12 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
             AGENT_SCALE="--scale node-agent=0"
             ACTIVE_SVCS="$(printf '%s\n' "$ACTIVE_SVCS" | grep -vx node-agent)"
         fi
+        # Held add-on services (GPU, Docker socket, privileged) never start.
+        ACTIVE_SVCS="$(addon_drop_held "$ACTIVE_SVCS")"
         restart_require_lock || exit 1
         # shellcheck disable=SC2086
         check_bind_sources --no-deps $ACTIVE_SVCS || exit 1
-        noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d --no-build --force-recreate $GPU_SCALE $AGENT_SCALE || _up_rc=$?
+        noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d --no-build --force-recreate $GPU_SCALE $AGENT_SCALE $ADDON_HOLD_SCALE || _up_rc=$?
         if [ "${_up_rc:-0}" -ne 0 ] && [ "${_up_rc:-0}" -ne "$NOO_EXIT_STACK_PARTIAL" ]; then exit "$_up_rc"; fi
         # The guard only heals services this invocation manages; a Created
         # container outside that set (a stale leftover, or the scaled-out
@@ -313,9 +318,24 @@ else
         compose_report_error "$_rc"
         exit 1
     fi
+    # A service named outright that asks for a GPU, the Docker socket or
+    # privileged mode is refused; one reached through its add-on's key is
+    # left out, said, and the add-on's other services start.
+    addon_refuse_held "${SERVICES[@]}" || exit 1
     # shellcheck disable=SC2086
     restart_resolve_all "$VALID_SVCS" $COMPOSE_FILES $PROFILE_ARGS -- "${SERVICES[@]}" || exit 1
     SERVICES=("${RESOLVED_SERVICES[@]}")
+    _kept=()
+    while IFS= read -r _s; do
+        [ -n "$_s" ] && _kept+=("$_s")
+    done <<EOF_HELD
+$(addon_drop_held "$(printf '%s\n' "${SERVICES[@]}")")
+EOF_HELD
+    SERVICES=(${_kept[@]+"${_kept[@]}"})
+    if [ ${#SERVICES[@]} -eq 0 ]; then
+        ui_close_failed "every service named is held (GPU, Docker socket or privileged): nothing to start"
+        exit 1
+    fi
     if printf '%s\n' "${SERVICES[@]}" | grep -qx gateway; then
         noo_prepare_gateway_data_dirs
     fi

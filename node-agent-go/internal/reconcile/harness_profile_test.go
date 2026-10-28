@@ -114,10 +114,12 @@ func TestHarnessKindRefusalProfiledRunsAfterTheExistingChecks(t *testing.T) {
 func TestProfileOllamaContextJoinsTheSpecOnlyWhenThePlacementDoesNotSetIt(t *testing.T) {
 	bare := placement{Backend: "ollama", Model: "gemma4:12b", DesiredState: "running", Env: map[string]string{"OLLAMA_NUM_PARALLEL": "2"}}
 	own := placement{Backend: "ollama", Model: "gemma4:12b", DesiredState: "running", Env: map[string]string{"OLLAMA_CONTEXT_LENGTH": "8192"}}
-	other := placement{Backend: "vllm", Model: "m", DesiredState: "running"}
+	// an engine with no window key stays untouched (vLLM now gets one: see
+	// TestTheProfileContextReachesEveryChatEngineThatDoesNotSetItsOwn)
+	other := placement{Backend: "tei", Model: "m", DesiredState: "running"}
 
-	p32 := &harnessprofile.Profile{OllamaContext: 32768}
-	out := withProfileOllamaContext([]placement{bare, own, other}, p32)
+	p32 := &harnessprofile.Profile{Context: 32768}
+	out := withProfileContext([]placement{bare, own, other}, p32)
 	if out[0].Env["OLLAMA_CONTEXT_LENGTH"] != "32768" || out[0].Env["OLLAMA_NUM_PARALLEL"] != "2" {
 		t.Errorf("default not injected: %v", out[0].Env)
 	}
@@ -135,23 +137,66 @@ func TestProfileOllamaContextJoinsTheSpecOnlyWhenThePlacementDoesNotSetIt(t *tes
 	}
 
 	// No profile: today's spec. A changed default: a new spec (recreate).
-	none := withProfileOllamaContext([]placement{bare}, nil)
+	none := withProfileContext([]placement{bare}, nil)
 	if specHash(none[0]) != specHash(bare) {
 		t.Error("no profile must leave the spec hash as it was")
 	}
-	p16 := withProfileOllamaContext([]placement{bare}, &harnessprofile.Profile{OllamaContext: 16384})
+	p16 := withProfileContext([]placement{bare}, &harnessprofile.Profile{Context: 16384})
 	if specHash(p16[0]) == specHash(out[0]) || specHash(p16[0]) == specHash(bare) {
-		t.Error("a changed ollama_context must change the spec hash so the container is recreated")
+		t.Error("a changed profile context must change the spec hash so the container is recreated")
 	}
 	stopped := bare
 	stopped.DesiredState = "stopped"
-	if s := withProfileOllamaContext([]placement{stopped}, p32); s[0].Env["OLLAMA_CONTEXT_LENGTH"] != "" {
+	if s := withProfileContext([]placement{stopped}, p32); s[0].Env["OLLAMA_CONTEXT_LENGTH"] != "" {
 		t.Error("a stopped placement is not tuned")
 	}
 }
 
+// One profile value, every chat engine: vLLM gets VLLM_MAX_MODEL_LEN and
+// llama.cpp N_CTX from the same default Ollama always got, when the
+// placement does not decide the window itself (awolf ran vLLM at the image
+// default 16384 beside Ollama's 32768 at the same tier, 2026-10-24).
+func TestTheProfileContextReachesEveryChatEngineThatDoesNotSetItsOwn(t *testing.T) {
+	p32 := &harnessprofile.Profile{Context: 32768}
+	vllm := placement{Backend: "vllm", Model: "google/gemma-4-12B", DesiredState: "running", Env: map[string]string{"VLLM_MAX_NUM_SEQS": "8"}}
+	vllmOwn := placement{Backend: "vllm", Model: "m", DesiredState: "running", Env: map[string]string{"VLLM_MAX_MODEL_LEN": "8192"}}
+	secondary := placement{Backend: "vllm-secondary", Model: "m2", DesiredState: "running"}
+	llama := placement{Backend: "llamacpp", Model: "x.gguf", DesiredState: "running"}
+	llamaArg := placement{Backend: "llamacpp", Model: "y.gguf", DesiredState: "running", Env: map[string]string{"LLAMA_ARG_CTX_SIZE": "4096"}}
+	embed := placement{Backend: "tei", Model: "e", DesiredState: "running"}
+	out := withProfileContext([]placement{vllm, vllmOwn, secondary, llama, llamaArg, embed}, p32)
+	if out[0].Env["VLLM_MAX_MODEL_LEN"] != "32768" || out[0].Env["VLLM_MAX_NUM_SEQS"] != "8" {
+		t.Errorf("vllm: %v", out[0].Env)
+	}
+	if out[1].Env["VLLM_MAX_MODEL_LEN"] != "8192" || specHash(out[1]) != specHash(vllmOwn) {
+		t.Errorf("a vllm placement that sets the window is left alone: %v", out[1].Env)
+	}
+	if out[2].Env["VLLM_MAX_MODEL_LEN"] != "32768" {
+		t.Errorf("vllm-secondary: %v", out[2].Env)
+	}
+	if out[3].Env["N_CTX"] != "32768" {
+		t.Errorf("llamacpp: %v", out[3].Env)
+	}
+	if _, set := out[4].Env["N_CTX"]; set || specHash(out[4]) != specHash(llamaArg) {
+		t.Errorf("a llama.cpp placement with LLAMA_ARG_CTX_SIZE decided its window: %v", out[4].Env)
+	}
+	if len(out[5].Env) != 0 {
+		t.Errorf("an engine without a window key is untouched: %v", out[5].Env)
+	}
+	if _, mutated := vllm.Env["VLLM_MAX_MODEL_LEN"]; mutated {
+		t.Error("the controller's placement env must not be mutated")
+	}
+	// the default must survive the env allow-list on its way to the container
+	if got := buildPlacementEnv(out[0]); got["VLLM_MAX_MODEL_LEN"] != "32768" {
+		t.Errorf("VLLM_MAX_MODEL_LEN must reach the container env: %v", got)
+	}
+	if got := buildPlacementEnv(out[3]); got["N_CTX"] != "32768" {
+		t.Errorf("N_CTX must reach the container env: %v", got)
+	}
+}
+
 func TestNativeOllamaTuningCarriesTheProfileContextToThePlist(t *testing.T) {
-	p32 := &harnessprofile.Profile{OllamaContext: 32768}
+	p32 := &harnessprofile.Profile{Context: 32768}
 	lone := []placement{{Backend: "ollama", Model: "gemma4:12b", DesiredState: "running"}}
 	if got := nativeOllamaTuning(lone, nil); got != nil {
 		t.Errorf("a lone placement with no profile keeps no tuning, as before: %v", got)
@@ -215,7 +260,7 @@ func TestChatPlacementOfPicksTheRunningChatEngine(t *testing.T) {
 // the chat ollama's own OLLAMA_CONTEXT_LENGTH, else the profile's default,
 // else 0; never a window for a chat backend that is not ollama.
 func TestChatContextWindowIsTheOllamaContextTheAgentSets(t *testing.T) {
-	prof := &harnessprofile.Profile{OllamaContext: 32768}
+	prof := &harnessprofile.Profile{Context: 32768}
 	chat := placement{Backend: "ollama", Model: "gemma4:12b", Role: "chat", DesiredState: "running"}
 	r := &Reconciler{}
 

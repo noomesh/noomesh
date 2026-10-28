@@ -25,7 +25,7 @@
 //!      `<root>/addons/<addon>/` (a lock without files removes that directory).
 //!
 //! Steps 1-6 decide; nothing is written until all of them pass. The offline
-//! twin ([`offline_check`]) re-runs 1, 3, 4 and the pin comparison from the
+//! twin ([`offline_check_files`]) re-runs 1, 3, 4 and the pin comparison from the
 //! cache, and holds the materialised files to the cached lock, for `noo
 //! addons verify` and the launcher.
 
@@ -414,13 +414,15 @@ pub fn record(
     Ok(pin)
 }
 
-/// The offline check: the cached lock still verifies against `anchor`,
-/// lists `tag`, and is exactly what the pin says. Returns the pin.
+/// [`offline_check_files`] without the file list; the tests' shorthand.
+#[cfg(test)]
 pub fn offline_check(root: &Path, addon: &str, tag: &str, anchor: &TrustAnchor) -> Result<Pin, String> {
     offline_check_files(root, addon, tag, anchor).map(|(pin, _)| pin)
 }
 
-/// [`offline_check`], also returning the file names the verified lock lists
+/// The offline check: the cached lock still verifies against `anchor`,
+/// lists `tag`, and is exactly what the pin says. Returns the pin and
+/// the file names the verified lock lists
 /// (each verified against its materialised copy). The launcher copies a
 /// declaration file (`decls::DECL_FILES`) only when it is listed here, so an
 /// unsigned file left beside the bundle never reaches the gateway.
@@ -846,6 +848,9 @@ pub(crate) mod tests {
     pub(crate) const EXAMPLE_SYSTEM: &str =
         r#"{"schema":"example_addon","role":"noo_example_addon","ddl_role":"noo_example_addon_ddl","extensions":["pg_trgm"]}"#;
     pub(crate) const EXAMPLE_WORKLOADS: &str = r#"{"workloads":[{"name":"worker","container":"noo-example-addon-worker","gpu":true,"need_mb":4096,"drain":{"route":"drain","timeout_secs":60}}]}"#;
+    /// A route manifest whose `drain` route is internal, as
+    /// [`EXAMPLE_WORKLOADS`] needs.
+    pub(crate) const EXAMPLE_ROUTES: &str = r#"{"version":1,"addon":"example-addon","base_url_env":"NOO_EXAMPLE_ADDON_URL","base_url_default":"https://noo-example-addon:8090","routes":[{"name":"drain","method":"POST","path":"/drain","internal":true},{"name":"status","method":"GET","path":"/api/example-addon/status"}]}"#;
 
     #[test]
     fn a_bundle_with_valid_declarations_passes_and_a_bad_one_is_refused_before_any_pin() {
@@ -878,9 +883,14 @@ pub(crate) mod tests {
 
     /// A signed BUNDLE of `l` (format 2) carrying [`OVERLAY`].
     pub(crate) fn signed_bundle(l: &AddonLock) -> Fetched {
+        signed_bundle_with(l, OVERLAY)
+    }
+
+    /// A signed BUNDLE of `l` (format 2) carrying `overlay`.
+    pub(crate) fn signed_bundle_with(l: &AddonLock, overlay: &str) -> Fetched {
         let mut l = l.clone();
         l.format = addon_lock::FORMAT_V2.into();
-        let files = BTreeMap::from([(addon_lock::OVERLAY_FILE.to_string(), OVERLAY.as_bytes().to_vec())]);
+        let files = BTreeMap::from([(addon_lock::OVERLAY_FILE.to_string(), overlay.as_bytes().to_vec())]);
         l.files = files.iter().map(|(n, b)| (n.clone(), addon_lock::sha256_ref(b))).collect();
         let (bytes, sig) = addon_lock::sign(&l, &seed()).unwrap();
         Fetched { lock: bytes, sig, files }

@@ -460,12 +460,13 @@ pub fn ensure_hostd_spool(cfg: &Value, services: &[String], no_deps: bool, hostd
 }
 
 /// Bind sources the LAUNCHER owns and fills: the add-on bundle declaration
-/// directories the gateway mounts read-only (i163 E/B: `lib-addons.sh`
-/// `addon_decls_materialise` copies `<addon>/system.json` and
-/// `<addon>/workloads.json` into them). Empty is their normal state, so a
-/// missing one is created here, as the invoking user, rather than refused
-/// (Docker would create it root-owned and the launcher could not fill it).
-pub const LAUNCHER_DIRS: &[&str] = &[".noo-addon-systems", ".noo-addon-workloads"];
+/// directories the gateway mounts read-only (i163 E/B: `lib-dist.sh`
+/// `addon_decls_materialise` copies `<addon>/system.json`,
+/// `<addon>/workloads.json` and `<addon>/routes.json` into them). Empty is
+/// their normal state, so a missing one is created here, as the invoking
+/// user, rather than refused (Docker would create it root-owned and the
+/// launcher could not fill it).
+pub const LAUNCHER_DIRS: &[&str] = &[".noo-addon-systems", ".noo-addon-workloads", ".noo-addon-routes"];
 
 /// Create each MISSING bind source named in [`LAUNCHER_DIRS`] for the
 /// selected services, as the invoking user; return what was created.

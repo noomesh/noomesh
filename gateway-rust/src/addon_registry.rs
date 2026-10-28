@@ -16,9 +16,13 @@
 //!
 //! 1. the operator switched it on: `addons.<name>: true` in `noomesh.yaml`
 //!    (a compiled row keeps its own polarity and licence check);
-//! 2. its image delivered a route manifest at
-//!    `<ROUTES_DIR>/<name>/routes.json` ([`crate::addon_proxy::read_manifest`]),
-//!    which [`crate::addon_proxy::validate`] accepted;
+//! 2. a route manifest was delivered for it, which
+//!    [`crate::addon_proxy::validate`] accepted: the `routes.json` of its
+//!    signed bundle, which the launcher copies to
+//!    `<BUNDLE_ROUTES_DIR>/<name>/routes.json` only for an add-on switched on
+//!    and verified this start, else (a shipped add-on whose overlay delivers
+//!    it itself) `<ROUTES_DIR>/<name>/routes.json`; the bundle's copy wins
+//!    ([`crate::addon_proxy::read_manifest_in`]);
 //! 3. the launcher vouches for it: it holds a verified signed lock that lists
 //!    this stack ([`Reported`], below).
 //!
@@ -484,7 +488,11 @@ impl Snapshot {
 
 /// Everything [`build`] reads, so every outcome is testable without a global.
 pub struct Inputs<'a> {
-    /// Where manifests are delivered: `<dir>/<name>/routes.json`.
+    /// Where the launcher delivers a signed bundle's manifest:
+    /// `<bundle_dir>/<name>/routes.json`. Read first.
+    pub bundle_dir: &'a FsPath,
+    /// Where a shipped add-on's overlay delivers its manifest:
+    /// `<dir>/<name>/routes.json`. Read only when `bundle_dir` has none.
     pub dir: &'a FsPath,
     /// Where the launcher delivers `system.json`: `<dir>/<name>/system.json`.
     pub systems_dir: &'a FsPath,
@@ -531,13 +539,15 @@ pub fn build(inp: &Inputs, table_on: &dyn Fn(&str) -> bool) -> Snapshot {
             continue; // off: registers nothing, refuses nothing
         }
         let required = row.is_some_and(|a| a.routes_manifest);
-        let manifest = match crate::addon_proxy::read_manifest(inp.dir, name, required) {
+        let manifest = match crate::addon_proxy::read_manifest_in(&[inp.bundle_dir, inp.dir], name, required) {
             Ok(Some(m)) => m,
             Ok(None) => {
                 snap.notes.push(format!(
-                    "addons.{name} is on in noomesh.yaml, but its image delivered no route manifest \
-                     ({}/{name}/routes.json), so no routes are registered for it. If it is not an \
-                     HTTP add-on this is expected; otherwise check that its overlay is composed",
+                    "addons.{name} is on in noomesh.yaml, but no route manifest was delivered for it \
+                     ({}/{name}/routes.json or {}/{name}/routes.json), so no routes are registered \
+                     for it. If it is not an HTTP add-on this is expected; otherwise check that its \
+                     signed bundle lists routes.json",
+                    inp.bundle_dir.display(),
                     inp.dir.display()
                 ));
                 continue;
@@ -650,6 +660,7 @@ pub fn reload() -> Arc<Snapshot> {
     let building = Building::enter();
     let snap = build(
         &Inputs {
+            bundle_dir: FsPath::new(crate::addon_proxy::BUNDLE_ROUTES_DIR),
             dir: FsPath::new(crate::addon_proxy::ROUTES_DIR),
             systems_dir: FsPath::new(crate::addon_decls::SYSTEMS_DIR),
             declared: &cfg.addons,
@@ -808,6 +819,7 @@ mod tests {
     ) -> Snapshot {
         build(
             &Inputs {
+                bundle_dir: &dir.join(".no-bundle-routes"),
                 dir,
                 systems_dir: &dir.join(".no-systems"),
                 declared: &declared(decl),
@@ -852,6 +864,57 @@ mod tests {
         assert_eq!(e.upstream(), "https://noo-pai-voice:8090");
         assert_eq!(e.verification(), &Verification::Launcher { version: "0.3.0".into(), stack: STACK.into() });
         assert_eq!(snap.all().len(), 1);
+    }
+
+    /// The launcher's handover (0.6.13): a third-party add-on
+    /// whose manifest only the launcher delivered (from its signed bundle,
+    /// into the bundle directory) is registered with its routes, and the
+    /// bundle's copy wins over one under the older overlay path.
+    #[test]
+    fn a_manifest_the_launcher_delivered_from_the_signed_bundle_registers_the_addon() {
+        let dir = scratch("bundle-routes");
+        let bundle = dir.join("bundle");
+        plant(&bundle, "rhaddon", &third_party("rhaddon"));
+        let mut stale = third_party("rhaddon");
+        stale["routes"][0]["path"] = json!("/api/stale-overlay-copy");
+        plant(&dir, "rhaddon", &stale);
+        let snap = build(
+            &Inputs {
+                bundle_dir: &bundle,
+                dir: &dir,
+                systems_dir: &dir.join(".no-systems"),
+                declared: &declared(&[("rhaddon", true)]),
+                delegation: &delegation(&[]),
+                reported: &verified(&[("rhaddon", "0.1.0", STACK)]),
+                gateway_stack: Some(STACK),
+                dev: &Ok(BTreeMap::new()),
+                now: NOW,
+            },
+            &|_| false,
+        );
+        assert!(snap.refused.is_empty(), "{:?}", snap.refused);
+        let e = snap.get("rhaddon").expect("registered from the bundle's manifest");
+        assert_eq!(e.upstream(), "https://noo-rhaddon:8090");
+        let paths: Vec<&str> = e.manifest().routes.iter().map(|r| r.path.as_str()).collect();
+        assert!(!paths.is_empty(), "the manifest's routes were read");
+        assert!(!paths.contains(&"/api/stale-overlay-copy"), "the bundle's copy wins: {paths:?}");
+        // Not verified this start: the launcher's copy registers nothing.
+        let snap = build(
+            &Inputs {
+                bundle_dir: &bundle,
+                dir: &dir,
+                systems_dir: &dir.join(".no-systems"),
+                declared: &declared(&[("rhaddon", true)]),
+                delegation: &delegation(&[]),
+                reported: &verified(&[]),
+                gateway_stack: Some(STACK),
+                dev: &Ok(BTreeMap::new()),
+                now: NOW,
+            },
+            &|_| false,
+        );
+        assert!(snap.get("rhaddon").is_none());
+        assert!(snap.refused.contains_key("rhaddon"));
     }
 
     #[test]
@@ -1196,6 +1259,7 @@ mod tests {
         }
         build(
             &Inputs {
+                bundle_dir: &dir.join(".no-bundle-routes"),
                 dir,
                 systems_dir: &sys,
                 declared: &declared(decl),

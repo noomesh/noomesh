@@ -34,6 +34,7 @@
 //! Dispatch, path templating and the JSON-RPC surface are shared with the
 //! external door — WHO calls is each door's decision, HOW is not.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::{Arc, LazyLock};
 
 use axum::{
@@ -443,14 +444,10 @@ async fn dispatch(
 
             let actor = caller.actor();
             tracing::info!(tool = %name, %actor, era = env.era.as_str(), "mcp_local_tool_call");
-            crate::routes::core::audit_event(
+            crate::audit::record(
                 &state.db,
-                "mcp_tool_call",
-                "info",
-                &actor,
-                name,
-                "ok",
-                json!({ "door": "operator", "actor": actor, "tool": name, "era": env.era.as_str() }),
+                AuditEvent::new(AuditKind::McpToolCall, &actor, name)
+                    .details(json!({ "door": "operator", "actor": actor, "tool": name, "era": env.era.as_str() })),
             )
             .await;
 

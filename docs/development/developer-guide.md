@@ -24,7 +24,7 @@ gateway-rust/            Rust — the gateway (src/main.rs, src/routes/ one file
 node-agent-go/           Go — noo-node-agent and noo-hostd (cmd/, internal/, deploy/ templates, Makefile)
 src/noomesh/             Python — the worker package: workers/ (NATS handlers), mcp/tool_defs/ (tool
                          definitions), memory/, cluster/ (placement + job CRUD), channels/ (outbound only),
-                         config.py, settings.py, posture.py, the reference *_cli.py modules
+                         config.py, settings.py, posture.py, and the MCP servers (mcp/)
 scripts/                 host-side shell: noomesh-start.sh and the lib-*.sh it sources, cargo-docker.sh,
                          prep-host.sh / noo-apply.sh / noo-fetch.sh (the node pull rail), setup-dev.sh, docs-check.py,
                          gen-cli-docs.py, build-mcp-manifest.py, wsl-vhdx-compact.ps1
@@ -82,10 +82,9 @@ python3 -m pytest -q         # post-install smoke test (unit suite)
 To run the checks by hand instead, before you push:
 `pre-commit run --from-ref origin/dev --to-ref HEAD`.
 
-The editable install also leaves a legacy Python CLI on your venv's PATH as
-`noo-py`. The `noo` you operate with is the Rust binary, and it never runs
-that script: an unknown command or subcommand prints a usage error and
-exits 2 rather than falling through to Python. Install the Rust binary from the release
+There is no Python CLI: the `noo` you operate with is the Rust binary, the only
+command-line front door, and an unknown command or subcommand prints a usage
+error and exits 2. Install the Rust binary from the release
 one-liner in the [README](../../README.md#quick-start) or build it from
 `noo-cli/` (below).
 

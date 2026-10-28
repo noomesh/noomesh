@@ -312,12 +312,7 @@ pub fn plan(db_seq: i64, db_hash: &str, last: Option<&SignedHead>, now: chrono::
 }
 
 async fn db_head(db: &sqlx::PgPool) -> Result<Option<(i64, String)>, sqlx::Error> {
-    sqlx::query_as::<_, (i64, String)>(
-        "SELECT chain_seq, chain_hash FROM noo_security_audit \
-         WHERE chain_seq IS NOT NULL AND chain_hash IS NOT NULL ORDER BY chain_seq DESC LIMIT 1",
-    )
-    .fetch_optional(db)
-    .await
+    crate::repo::audit::chain_head(db).await
 }
 
 pub fn spawn(state: std::sync::Arc<AppState>) {

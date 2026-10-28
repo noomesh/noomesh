@@ -55,6 +55,12 @@ export interface ChatTurn {
   text: string;
   /** Reasoning tokens only — tool calls live in `tools`, not in here. */
   thinking?: string;
+  /**
+   * What a node harness's vendor CLI is doing, from `working` frames: the
+   * model's text as the harness's translator sees it, planning included.
+   * Not the answer (that arrives as `content`). i278 phase D.
+   */
+  working?: string;
   /** How long reasoning ran, measured client-side from first thinking token. */
   thinkMs?: number;
   tools?: ToolRun[];
@@ -62,6 +68,12 @@ export interface ChatTurn {
   streaming?: boolean;
   error?: boolean;
   stats?: TurnStats;
+  /**
+   * The node harness running this turn, from `harness_dispatched`. Absent
+   * when the gateway answers itself. A vendor CLI turn can take minutes; the
+   * console names who is answering so the wait is not silent (i233).
+   */
+  answering?: { node: string; kind?: string };
 }
 
 export type ChatStatus = 'connecting' | 'live' | 'closed' | 'auth';
@@ -82,6 +94,9 @@ interface CoordFrame {
   tool?: string;
   model?: string;
   backend?: string;
+  // `harness_dispatched` — the node running the turn and its harness kind.
+  node?: string;
+  kind?: string;
   // `tool_call` — the call's parameters, as an object or a JSON string.
   arguments?: unknown;
   // `approval_request` / `approval_outcome`.
@@ -254,6 +269,12 @@ export function useCoordinator() {
           case 'metadata':
             if (f.conversation_id) convId.current = f.conversation_id;
             if (f.model || f.backend) setServing({ model: f.model, backend: f.backend });
+            break;
+          case 'harness_dispatched':
+            if (f.node) patchLast(() => ({ answering: { node: f.node!, kind: f.kind || undefined } }));
+            break;
+          case 'working':
+            patchLast((l) => ({ working: (l.working ?? '') + (f.text ?? '') }));
             break;
           case 'thinking':
             if (thinkStart.current === null) thinkStart.current = Date.now();

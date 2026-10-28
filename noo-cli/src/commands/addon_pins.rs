@@ -23,9 +23,11 @@
 //!   `dev` lines skips them: it reads only the kinds it knows.
 //!
 //! `launch-pins` also prints one `decl <addon> <file>` line per bundle
-//! declaration file (`system.json`, `workloads.json`) a verified lock lists
-//! (i163 E/B). The launcher copies only those to the gateway (`lib-dist.sh`
-//! `addon_decls_materialise`); an older launcher ignores the kind.
+//! declaration file (`system.json`, `workloads.json`, `routes.json`) a
+//! verified lock lists (i163 E/B; `routes.json` since 0.6.13). The launcher
+//! copies only those to the gateway (`lib-dist.sh`
+//! `addon_decls_materialise`); an older launcher ignores the kind, and one
+//! from before 0.6.13 ignores the `routes.json` name.
 //!
 //! Nothing here restarts anything: a new pin takes effect on the operator's
 //! next `noo stack restart --force`.
@@ -149,6 +151,10 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     };
                     let route = client.route(&anchor).map_err(resolve::Refusal::Route)?;
                     addons::resolve_lock(client, &anchor, &want, supplied)
+                        .and_then(|(v, f)| {
+                            addons::guards::guard_install(&root, addon, &f.files).map_err(resolve::Refusal::Decl)?;
+                            Ok((v, f))
+                        })
                         .and_then(|(v, f)| resolve::require_bundle(&v, &tag).map(|()| (v, f)))
                         .map(|(v, f)| (pins::Pin::from_verified(&v, &tag, &f.lock, route.pulled_from()), 0usize, client.describe(&route)))
                 })
@@ -245,13 +251,20 @@ pub(crate) fn verify_one(
             return v;
         }
     };
-    let pin = match resolve::offline_check(root, addon, tag, &anchor) {
+    let (pin, listed) = match resolve::offline_check_files(root, addon, tag, &anchor) {
         Ok(p) => p,
         Err(e) => {
             v.problem = Some(e);
             return v;
         }
     };
+    // The materialised bundle (each file just verified against the lock)
+    // passes the add-on guards it passed when it was pinned (`guards`).
+    let files = crate::addons::pins::materialised_files(root, addon, listed.iter());
+    if let Err(e) = crate::addons::guards::guard_install(root, addon, &files) {
+        v.problem = Some(e);
+        return v;
+    }
     for (name, r) in &pin.local_images() {
         let pinned_id = if docker.image_present(r) {
             match docker.image_id(r) {
@@ -550,7 +563,34 @@ mod tests {
         let d = std::env::temp_dir().join(format!("noo-addon-pins-cmd-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
+        // An install has core compose files; the add-on guards read them.
+        std::fs::write(d.join("docker-compose.cluster.yml"), CORE_COMPOSE).unwrap();
         d
+    }
+
+    const CORE_COMPOSE: &str = "services:\n  gateway:\n    image: g\nsecrets:\n  noo_jwt_secret:\n    file: ${NOO_SECRET_RUNDIR:-/x}/noo_jwt_secret\n    x-noo-source: NOO_JWT_SECRET\n";
+
+    /// A bundle that verified and was pinned, then fails the add-on guards
+    /// (an overlay sourcing core's JWT secret): `noo addons verify` says so,
+    /// naming the add-on and the variable. Reverting the guard call in
+    /// `verify_one` passes the verdict.
+    #[test]
+    fn verify_refuses_a_pinned_overlay_that_takes_a_core_secret() {
+        let d = scratch("guard");
+        let overlay = format!("{OVERLAY}secrets:\n  stolen:\n    file: ${{NOO_SECRET_RUNDIR:-/x}}/stolen\n    x-noo-source: NOO_JWT_SECRET\n");
+        let f = crate::addons::resolve::tests::signed_bundle_with(&lock("1.2.0", &["v0.6.0"], None), &overlay);
+        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let v = resolve::check(&f, &anchor(), &want).unwrap();
+        resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0", None).unwrap();
+        let reference = v.lock.images["trellion-intel"].clone();
+        let mut docker = FakeDocker { local: vec![reference.clone()], ids: vec![(reference, "sha256:x".into())], ..Default::default() };
+        let verdict = verify_one(&d, "trellion_intel", "v0.6.0", Ok(anchor()), &mut docker, &[]);
+        let problem = verdict.problem.expect("the guard refuses it");
+        assert!(problem.contains("trellion_intel") && problem.contains("NOO_JWT_SECRET"), "{problem}");
+        // The same root with the add-on's own overlay passes: the refusal is the guard's.
+        let (ok_root, r) = pinned_root("guard-ok");
+        let mut docker = FakeDocker { local: vec![r.clone()], ids: vec![(r, "sha256:x".into())], ..Default::default() };
+        assert!(verify_one(&ok_root, "trellion_intel", "v0.6.0", Ok(anchor()), &mut docker, &[]).problem.is_none());
     }
 
     fn pinned_root(tag: &str) -> (std::path::PathBuf, String) {
@@ -565,11 +605,15 @@ mod tests {
 
     #[test]
     fn launch_lines_name_only_the_declaration_files_the_verified_lock_lists() {
-        use crate::addons::resolve::tests::{signed_example_bundle, EXAMPLE_SYSTEM, EXAMPLE_WORKLOADS};
+        use crate::addons::resolve::tests::{signed_example_bundle, EXAMPLE_ROUTES, EXAMPLE_SYSTEM, EXAMPLE_WORKLOADS};
         let d = scratch("decl-lines");
         let f = signed_example_bundle(
             &lock("1.0.0", &["v0.6.0"], None),
-            &[("system.json", EXAMPLE_SYSTEM.as_bytes()), ("workloads.json", EXAMPLE_WORKLOADS.as_bytes())],
+            &[
+                ("system.json", EXAMPLE_SYSTEM.as_bytes()),
+                ("workloads.json", EXAMPLE_WORKLOADS.as_bytes()),
+                ("routes.json", EXAMPLE_ROUTES.as_bytes()),
+            ],
         );
         let want = resolve::Want { addon: "example-addon", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
         let v = resolve::check(&f, &anchor(), &want).unwrap();
@@ -578,15 +622,20 @@ mod tests {
         let lines = launch_lines(&d, "v0.6.0", &names, &|_| Ok(anchor()));
         assert_eq!(lines[0], "verified example-addon 1.0.0 v0.6.0", "{lines:?}");
         let decls: Vec<&String> = lines.iter().filter(|l| l.starts_with("decl ")).collect();
-        assert_eq!(decls, ["decl example-addon system.json", "decl example-addon workloads.json"], "{lines:?}");
+        assert_eq!(
+            decls,
+            ["decl example-addon system.json", "decl example-addon workloads.json", "decl example-addon routes.json"],
+            "{lines:?}"
+        );
 
-        // A bundle that lists only its overlay: an unsigned system.json left
-        // beside it is never named.
+        // A bundle that lists only its overlay: an unsigned system.json or
+        // routes.json left beside it is never named.
         let d = scratch("decl-unsigned");
         let f = signed_example_bundle(&lock("1.0.0", &["v0.6.0"], None), &[]);
         let v = resolve::check(&f, &anchor(), &want).unwrap();
         resolve::record(&d, "example-addon", &v, &f, "v0.6.0", None).unwrap();
         std::fs::write(crate::addons::pins::addon_dir(&d, "example-addon").join("system.json"), EXAMPLE_SYSTEM).unwrap();
+        std::fs::write(crate::addons::pins::addon_dir(&d, "example-addon").join("routes.json"), EXAMPLE_ROUTES).unwrap();
         let lines = launch_lines(&d, "v0.6.0", &names, &|_| Ok(anchor()));
         assert!(lines[0].starts_with("verified "), "{lines:?}");
         assert!(!lines.iter().any(|l| l.starts_with("decl ")), "{lines:?}");

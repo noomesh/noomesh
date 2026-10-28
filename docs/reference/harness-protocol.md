@@ -82,6 +82,9 @@ The node agent sets all of this from the placement.
 | `NOO_HARNESS_MAX_TURNS` | concurrent turns and tasks (default 8) |
 | `NOO_HARNESS_KIND` | the loop kind (a kind from `config/harness-kinds.json`). Not in the shipped env file: when unset, the reference harness asks its node agent, `GET /harness/placement` on the model endpoint's agent (`{"kind", "env", "desired_state", "placed"}`), and runs `noo` when the agent answers 404 or `placed: false`. Any other answer (unreachable, 401/403, 5xx, a body that does not parse) is asked again a few times, then the harness exits non-zero with `harness: cannot learn this node's harness kind from its agent: <cause>; refusing to guess` — it never guesses `noo` under a placement it could not read. The node agent reports the kind it started the harness with as `host_services.harness.kind` while it runs. It runs its own loop for `noo` and the foreign-CLI driver (section 9) for any other kind |
 | `NOO_HARNESS_TURN_TIMEOUT_SECS` | a foreign CLI's wall-clock limit per invocation (default 900) |
+| `NOO_HARNESS_STALL_SECS` | how long a foreign CLI may go without reaching the model through the wire translator before it is killed as stalled, with the reason in the loop note (default 300; a chat turn uses the smaller of this and 120). A hung CLI no longer runs to the wall-clock limit three loops in a row |
+| `NOO_HARNESS_DRAIN_SECS` | on SIGTERM, how long the harness gives the turns and tasks it holds to finish before it exits (default 120, 1 to 3600). It takes no new work from the moment of the signal. The shipped unit's `TimeoutStopSec` and the Mac plist's `ExitTimeOut` are 150 |
+| `NOO_HARNESS_TASK_STALL_SECS` | a task the harness holds that makes no progress (no checkpoint since it was taken or since its last one) for this long is aborted, its slot freed, and reported on `harness.ready.<node>` as `{"stalled": [ids], "stall_secs": N}`; the gateway fails each one that is live on that node with `stalled: …` (default 2700, at least 600) |
 | `NOO_HARNESS_WORKDIR` | where the driver makes each task's workspace (default: the process temp dir, which the shipped unit makes private) |
 | `NOO_HARNESS_KEEP_WORKDIR` | `1` keeps a task's workspace after it ends, for debugging |
 
@@ -110,8 +113,10 @@ result), `token`.
 `loop_budget`, `max_iterations`, `token`, `role_prompt` (optional).
 
 **Ack.** Both arrive as NATS requests. A harness that takes the work
-replies on the request's reply subject with `{"ack": true, "node": "<id>"}`.
-The gateway waits 3 seconds. No ack, a reply that is not `ack: true`, or
+replies on the request's reply subject with `{"ack": true, "node": "<id>"}`;
+a turn's ack also names the harness `kind` (from 0.6.13), which the
+gateway passes to the console as a `harness_dispatched` event so the person
+sees which node and kind are answering. The gateway waits 3 seconds. No ack, a reply that is not `ack: true`, or
 no responder means the work was not taken, and the gateway runs it itself.
 
 **At capacity.** A harness at its `NOO_HARNESS_MAX_TURNS` limit replies
@@ -132,6 +137,14 @@ checkpointed tasks on `harness.task.<node>`.
 
 Order at start: connect to the bus, subscribe `harness.run.<node>` and
 `harness.task.<node>`, then announce on `harness.ready.<node>`.
+
+**Stop.** On SIGTERM (a kind change restarts the harness; so does a
+roll) the harness drops both subscriptions, so a new turn gets no ack and
+the gateway runs it, and a new task stays queued for the node. What it
+holds runs on for up to `NOO_HARNESS_DRAIN_SECS`; then it exits, and the
+service manager's restart brings up the new kind, which announces ready
+and gets the node's queued tasks back. A task still running at the bound
+is killed with the process and comes back on the next ready, as before.
 
 ## 5. The rail: `POST /api/harness/call`
 
@@ -272,7 +285,7 @@ turn (the dashboard socket, a channel).
 | Event | What the gateway does |
 |---|---|
 | `harness_result` | **last event of a successful turn**: `{"result": <CoordinatorResult>, "node": "<id>"}`. Kept, not forwarded; ends the relay. |
-| `error` | forwarded; ends the relay. The turn fails. |
+| `error` | forwarded; ends the relay. The turn fails. With `retry_safe: true` it is kept instead, and the gateway runs the turn itself. The foreign-CLI driver sets it when the CLI was killed as stalled before its first model call, or failed having asked the model only for tools that change nothing: the kind's `read_only_tools` (config/harness-kinds.json) and read-only noomesh tools. Any other tool it asked for makes the error name them and the turn is not re-run. |
 | `done` | forwarded; the gateway then waits at most 10 more seconds for `harness_result`. |
 | anything else | forwarded |
 
@@ -285,7 +298,10 @@ Rules:
   `NOO_HARNESS_TURN_TIMEOUT_SECS` (default 900) is a lost turn.
 - **A lost turn is an error, never re-run.** Once a harness acked, its
   tools may already have executed, so the gateway does not run the turn
-  again itself.
+  again itself. The one exception is an `error` with `retry_safe: true`:
+  the driver's stall bound killed a vendor CLI that had made no model call,
+  or the CLI failed having asked only for read-only tools, so nothing it
+  did changed anything, and the gateway runs the turn in process.
 - Tasks have no event stream: a task reports through `task_checkpoint`
   only, and holds one concurrency permit for its whole life.
 
@@ -315,7 +331,8 @@ must not execute gated tools locally.
 3. Subscribe `harness.run.<node>` and `harness.task.<node>` in queue group
    `harness`, then publish `{"node": "<id>"}` on `harness.ready.<node>`.
 4. For each request: parse it; if at capacity, do nothing; otherwise reply
-   `{"ack": true, "node": "<id>"}` on the reply subject within 3 seconds.
+   `{"ack": true, "node": "<id>", "kind": "<kind>"}` on the reply subject
+   within 3 seconds (`kind` is optional; the console shows it).
 5. Use the request's `token` as the bearer on `POST /api/harness/call`
    and on nothing else. Take no conversation or user from anywhere but the
    request. For a task, replace the token with the one `task_checkpoint`
@@ -461,7 +478,8 @@ refused at start, and so is a file name that is not a plain name.
 `model_context` in the agent's `/harness/placement` answer is the context
 window the node's chat backend runs with. For Ollama it is what the agent
 sets: `OLLAMA_CONTEXT_LENGTH`, the placement's own value or else the
-profile's `ollama_context` default. For vLLM and llama.cpp the agent asks the
+profile's `context` default (`ollama_context` from a controller older than
+0.6.13). For vLLM and llama.cpp the agent asks the
 running backend (vLLM's `max_model_len` from `GET /v1/models`, llama-server's
 per-slot `n_ctx` from `GET /props`, which is `--ctx-size` divided across its
 parallel slots), bounded at 2 seconds. It is absent when the agent does not

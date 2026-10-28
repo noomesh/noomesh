@@ -21,8 +21,8 @@ import (
 // node would just re-pull.
 //
 // Returns the number of dangling images found (dry run) or removed.
-func (c *Client) CleanupImages(dryRun bool) (int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+func (c *Client) CleanupImages(ctx context.Context, dryRun bool) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 
 	images, err := c.listImages(ctx, client.ImageListOptions{
@@ -57,13 +57,13 @@ func (c *Client) CleanupImages(dryRun bool) (int, error) {
 // count is then a lower bound, never an error.
 //
 // Returns the number of oversized log files found (dry run) or truncated.
-func (c *Client) CleanupLogs(dryRun bool, maxSizeMB int) (int, error) {
+func (c *Client) CleanupLogs(ctx context.Context, dryRun bool, maxSizeMB int) (int, error) {
 	if maxSizeMB <= 0 {
 		maxSizeMB = 50
 	}
 	maxBytes := int64(maxSizeMB) * 1024 * 1024
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 
 	containers, err := c.listContainers(ctx, client.ContainerListOptions{All: true})

@@ -130,6 +130,7 @@ node-agent-go/bin/
 # runtime state, rebuilt on every start.
 /.noo-addon-systems/
 /.noo-addon-workloads/
+/.noo-addon-routes/
 
 # Local per-developer git-hooks directory (not shared across team)
 config/tailscale-acl.backup.*

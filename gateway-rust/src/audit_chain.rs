@@ -180,15 +180,10 @@ pub(crate) struct NewRow<'a> {
     pub prev_hash: Option<&'a str>,
 }
 
-type Tail = (i64, String, DateTime<Utc>);
+type Tail = crate::repo::audit::ChainTail;
 
 async fn fetch_tail(conn: &mut sqlx::PgConnection) -> Result<Option<Tail>, sqlx::Error> {
-    sqlx::query_as::<_, Tail>(
-        "SELECT chain_seq, chain_hash, \"timestamp\" FROM noo_security_audit \
-         WHERE chain_seq IS NOT NULL ORDER BY chain_seq DESC LIMIT 1",
-    )
-    .fetch_optional(conn)
-    .await
+    crate::repo::audit::chain_tail(conn).await
 }
 
 async fn take_lock(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
@@ -211,7 +206,7 @@ pub(crate) async fn insert_in_tx(
     genesis: bool,
 ) -> Result<Option<i64>, sqlx::Error> {
     let tail = fetch_tail(&mut *tx).await?;
-    let now = crate::routes::core::stored_now();
+    let now = crate::audit::stored_now();
     // Never earlier than the predecessor: keeps a partition's seq range contiguous.
     let ts = match &tail {
         Some((_, _, t)) if *t > now => *t,
@@ -240,25 +235,24 @@ pub(crate) async fn insert_in_tx(
         (Some(k), None) if genesis => Some((1, chain_hash(k, 1, "", &entry_hash))),
         _ => None,
     };
-    sqlx::query(
-        "INSERT INTO noo_security_audit \
-           (id, \"timestamp\", event_type, severity, actor, resource, outcome, details, \
-            request_id, entry_hash, prev_hash, chain_seq, chain_hash) \
-         VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8::jsonb, NULL, $9, $10, $11, $12)",
+    crate::repo::audit::insert(
+        &mut **tx,
+        &crate::repo::audit::InsertRow {
+            id: &id,
+            ts,
+            event_type: row.event_type,
+            severity: row.severity,
+            actor: row.actor,
+            resource: row.resource,
+            outcome: row.outcome,
+            details: row.details,
+            request_id: None,
+            entry_hash: &entry_hash,
+            prev_hash: row.prev_hash,
+            chain_seq: link.as_ref().map(|l| l.0),
+            chain_hash: link.as_ref().map(|l| l.1.as_str()),
+        },
     )
-    .bind(&id)
-    .bind(ts)
-    .bind(row.event_type)
-    .bind(row.severity)
-    .bind(row.actor)
-    .bind(row.resource)
-    .bind(row.outcome)
-    .bind(row.details)
-    .bind(&entry_hash)
-    .bind(row.prev_hash)
-    .bind(link.as_ref().map(|l| l.0))
-    .bind(link.as_ref().map(|l| l.1.as_str()))
-    .execute(&mut **tx)
     .await?;
     Ok(link.map(|l| l.0))
 }
@@ -303,38 +297,20 @@ pub(crate) async fn record_retention_checkpoint(db: &sqlx::PgPool, year: i32, mo
 
     let mut tx = db.begin().await.map_err(|x| e("begin", x))?;
     take_lock(&mut tx).await.map_err(|x| e("lock", x))?;
-    let span: (Option<i64>, Option<i64>) = sqlx::query_as(
-        "SELECT min(chain_seq), max(chain_seq) FROM noo_security_audit \
-         WHERE \"timestamp\" >= $1 AND \"timestamp\" < $2 AND chain_seq IS NOT NULL",
-    )
-    .bind(start)
-    .bind(end)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|x| e("range", x))?;
+    let span: (Option<i64>, Option<i64>) = crate::repo::audit::chain_span(&mut *tx, start, end)
+        .await
+        .map_err(|x| e("range", x))?;
     let (Some(lo), Some(hi)) = span else { return Ok(false) };
-    let last: Option<String> = sqlx::query_scalar(
-        "SELECT chain_hash FROM noo_security_audit WHERE chain_seq = $1 \
-         AND \"timestamp\" >= $2 AND \"timestamp\" < $3",
-    )
-    .bind(hi)
-    .bind(start)
-    .bind(end)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|x| e("last row", x))?
-    .flatten();
+    let last: Option<String> = crate::repo::audit::chain_hash_at(&mut *tx, hi, start, end)
+        .await
+        .map_err(|x| e("last row", x))?
+        .flatten();
     let last = last.ok_or_else(|| format!("retention checkpoint {year}-{month:02}: row seq {hi} has no chain_hash"))?;
     let resource = Retention { from: lo, through: hi, chain: last }.resource();
-    let have: Option<i32> = sqlx::query_scalar(
-        "SELECT 1 FROM noo_security_audit WHERE event_type = $1 AND resource = $2 LIMIT 1",
-    )
-    .bind(RETENTION_EVENT)
-    .bind(&resource)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|x| e("existing", x))?;
-    if have.is_some() {
+    let have = crate::repo::audit::has_event_resource(&mut *tx, RETENTION_EVENT, &resource)
+        .await
+        .map_err(|x| e("existing", x))?;
+    if have {
         return Ok(true);
     }
     let details = serde_json::json!({
@@ -407,7 +383,7 @@ pub(crate) async fn ensure_genesis_with(db: &sqlx::PgPool, key: Option<Vec<u8>>)
     for attempt in 0..2 {
         match try_genesis(db, &key).await {
             Ok(o) => return o,
-            Err(e) if attempt == 0 && crate::routes::core::is_missing_partition(&e) => {
+            Err(e) if attempt == 0 && crate::audit::is_missing_partition(&e) => {
                 crate::audit_partition::ensure_for_heal(db).await;
             }
             Err(e) => return GenesisOutcome::Failed(e.to_string()),
@@ -423,11 +399,8 @@ async fn try_genesis(db: &sqlx::PgPool, key: &[u8]) -> Result<GenesisOutcome, sq
     if fetch_tail(&mut tx).await?.is_some() {
         return Ok(GenesisOutcome::AlreadyPresent);
     }
-    let legacy: Vec<(String, DateTime<Utc>, Option<String>)> = sqlx::query_as(
-        "SELECT id::text, \"timestamp\", entry_hash FROM noo_security_audit WHERE chain_seq IS NULL",
-    )
-    .fetch_all(&mut *tx)
-    .await?;
+    let legacy: Vec<(String, DateTime<Utc>, Option<String>)> =
+        crate::repo::audit::unchained(&mut *tx).await?;
     let digest_rows: Vec<(i64, String, Option<String>)> =
         legacy.into_iter().map(|(id, t, h)| (t.timestamp_micros(), id, h)).collect();
     let genesis = Genesis {

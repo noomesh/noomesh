@@ -198,3 +198,16 @@ where
     .await?;
     Ok(row.map(|r| (r.gpu_model, r.vram_gb)))
 }
+
+/// A node's stored harness profile overrides (`noo_node_config.harness_profile`),
+/// `{}` when the node has no row.
+pub async fn node_harness_profile_overrides<'e, E>(db: E, node_id: &str) -> Result<serde_json::Value, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let v: Option<serde_json::Value> = sqlx::query_scalar("SELECT harness_profile FROM noo_node_config WHERE node_id = $1")
+        .bind(node_id)
+        .fetch_optional(db)
+        .await?;
+    Ok(v.unwrap_or_else(|| serde_json::json!({})))
+}

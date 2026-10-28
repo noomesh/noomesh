@@ -3,7 +3,8 @@
 
 //! The harness profile: per node, how long its inference proxy waits for a
 //! first byte, how long a stream may idle, the harness's thinking default,
-//! its ollama context, which Claude Code launch variant it uses, and which
+//! its context window (`context`, rendered into whichever engine the node
+//! runs), which Claude Code launch variant it uses, and which
 //! foreign harness kinds it may run.
 //!
 //! Declared ONCE per node TIER in `config/harness-profiles.json`, embedded
@@ -42,15 +43,22 @@ pub const FIELDS: [&str; 6] = [
     "first_byte_secs",
     "stream_idle_secs",
     "thinking",
-    "ollama_context",
+    "context",
     "claude_prompt",
     "foreign_kinds",
 ];
 
 /// The bound on the two `*_secs` overrides (two hours).
 pub const MAX_SECS: u64 = 7200;
-/// The bound on an `ollama_context` override (tokens).
-pub const MAX_OLLAMA_CONTEXT: u64 = 1_048_576;
+/// The bound on a `context` override (tokens).
+pub const MAX_CONTEXT: u64 = 1_048_576;
+
+/// `context`'s name until 0.6.13 (i226 decision 1). Accepted for one
+/// release: as an override key (stored as `context`), in a stored row
+/// written before the rename, and sent beside `context` in desired-config
+/// for node agents older than 0.6.13, which read only this key. Remove once
+/// every node runs 0.6.13.
+pub const CONTEXT_ALIAS: &str = "ollama_context";
 
 /// One tier's defaults.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -58,7 +66,8 @@ pub struct TierDefaults {
     pub first_byte_secs: u64,
     pub stream_idle_secs: u64,
     pub thinking: String,
-    pub ollama_context: u64,
+    #[serde(alias = "ollama_context")]
+    pub context: u64,
     pub claude_prompt: String,
     pub foreign_kinds: Vec<String>,
 }
@@ -121,7 +130,11 @@ pub struct ResolvedProfile {
     pub first_byte_secs: u64,
     pub stream_idle_secs: u64,
     pub thinking: String,
-    pub ollama_context: u64,
+    pub context: u64,
+    /// `context` again under [`CONTEXT_ALIAS`], for node agents older than
+    /// 0.6.13. Always equal to `context`.
+    #[serde(rename = "ollama_context")]
+    pub context_alias: u64,
     pub claude_prompt: String,
     pub foreign_kinds: Vec<String>,
     /// Per field: `override` | `measured` | `tier`.
@@ -147,9 +160,9 @@ fn check_secs(field: &str, v: &Value) -> Result<Value, String> {
 fn check_field(field: &str, v: &Value) -> Result<Value, String> {
     match field {
         "first_byte_secs" | "stream_idle_secs" => check_secs(field, v),
-        "ollama_context" => match v.as_u64() {
-            Some(n) if (1..=MAX_OLLAMA_CONTEXT).contains(&n) => Ok(json!(n)),
-            _ => Err(format!("ollama_context must be a whole number of tokens, 1..={MAX_OLLAMA_CONTEXT}")),
+        "context" | CONTEXT_ALIAS => match v.as_u64() {
+            Some(n) if (1..=MAX_CONTEXT).contains(&n) => Ok(json!(n)),
+            _ => Err(format!("context must be a whole number of tokens, 1..={MAX_CONTEXT}")),
         },
         "thinking" => match v.as_str().map(str::trim) {
             Some(s @ ("on" | "off" | "auto")) => Ok(json!(s)),
@@ -182,7 +195,8 @@ fn check_field(field: &str, v: &Value) -> Result<Value, String> {
 
 /// Judge a per-node overrides object: any subset of [`FIELDS`] with valid
 /// values. `null` is no overrides (`{}`). The result is normalised (trimmed
-/// words, foreign kinds deduplicated in name order).
+/// words, foreign kinds deduplicated in name order, [`CONTEXT_ALIAS`]
+/// stored as `context`; `context` wins when both are given).
 pub fn validate_overrides(v: &Value) -> Result<Value, String> {
     if v.is_null() {
         return Ok(json!({}));
@@ -190,7 +204,14 @@ pub fn validate_overrides(v: &Value) -> Result<Value, String> {
     let obj = v.as_object().ok_or("harness_profile must be an object of profile fields (or null to clear)")?;
     let mut out = Map::new();
     for (k, val) in obj {
-        out.insert(k.clone(), check_field(k, val)?);
+        let checked = check_field(k, val)?;
+        if k == CONTEXT_ALIAS {
+            if !obj.contains_key("context") {
+                out.insert("context".into(), checked);
+            }
+        } else {
+            out.insert(k.clone(), checked);
+        }
     }
     Ok(Value::Object(out))
 }
@@ -275,7 +296,8 @@ pub(crate) fn resolve_with(
         first_byte_secs: first_byte,
         stream_idle_secs: d.stream_idle_secs,
         thinking: d.thinking.clone(),
-        ollama_context: d.ollama_context,
+        context: d.context,
+        context_alias: d.context,
         claude_prompt: d.claude_prompt.clone(),
         foreign_kinds: d.foreign_kinds.clone(),
         sources: BTreeMap::new(),
@@ -290,10 +312,12 @@ pub(crate) fn resolve_with(
         out.thinking = v;
         sources.insert("thinking".into(), "override".into());
     }
-    if let Some(v) = ov("ollama_context").and_then(|v| v.as_u64()) {
-        out.ollama_context = v;
-        sources.insert("ollama_context".into(), "override".into());
+    // A row stored before the rename carries the old key.
+    if let Some(v) = ov("context").or_else(|| ov(CONTEXT_ALIAS)).and_then(|v| v.as_u64()) {
+        out.context = v;
+        sources.insert("context".into(), "override".into());
     }
+    out.context_alias = out.context;
     if let Some(v) = ov("claude_prompt").and_then(|v| v.as_str().map(str::to_string)) {
         out.claude_prompt = v;
         sources.insert("claude_prompt".into(), "override".into());
@@ -413,8 +437,8 @@ mod tests {
             let d = &table().tiers[&n.to_string()];
             assert_eq!(r.tier, n);
             assert_eq!(
-                (r.first_byte_secs, r.stream_idle_secs, r.thinking.as_str(), r.ollama_context, r.claude_prompt.as_str(), &r.foreign_kinds),
-                (d.first_byte_secs, d.stream_idle_secs, d.thinking.as_str(), d.ollama_context, d.claude_prompt.as_str(), &d.foreign_kinds)
+                (r.first_byte_secs, r.stream_idle_secs, r.thinking.as_str(), r.context, r.claude_prompt.as_str(), &r.foreign_kinds),
+                (d.first_byte_secs, d.stream_idle_secs, d.thinking.as_str(), d.context, d.claude_prompt.as_str(), &d.foreign_kinds)
             );
             assert!(r.sources.values().all(|s| s == "tier"), "{:?}", r.sources);
             assert_eq!(r.sources.len(), FIELDS.len());
@@ -436,22 +460,25 @@ mod tests {
 
     #[test]
     fn an_override_beats_the_tier_default_field_by_field() {
-        let r = resolve(Some(2), &json!({"thinking": "on", "ollama_context": 65536}), None, None);
+        let r = resolve(Some(2), &json!({"thinking": "on", "context": 65536}), None, None);
         assert_eq!(r.thinking, "on");
-        assert_eq!(r.ollama_context, 65536);
+        assert_eq!((r.context, r.context_alias), (65536, 65536));
         assert_eq!(r.sources["thinking"], "override");
-        assert_eq!(r.sources["ollama_context"], "override");
+        assert_eq!(r.sources["context"], "override");
+        // A row stored before the rename (i226 decision 1) still applies.
+        let old = resolve(Some(2), &json!({"ollama_context": 65536}), None, None);
+        assert_eq!((old.context, old.context_alias, old.sources["context"].as_str()), (65536, 65536, "override"));
         assert_eq!(r.first_byte_secs, 600, "an untouched field keeps its tier default");
         assert_eq!(r.sources["first_byte_secs"], "tier");
         let all = resolve(
             Some(4),
-            &json!({"first_byte_secs": 100, "stream_idle_secs": 120, "thinking": "auto", "ollama_context": 4096,
+            &json!({"first_byte_secs": 100, "stream_idle_secs": 120, "thinking": "auto", "context": 4096,
                     "claude_prompt": "full", "foreign_kinds": ["copilot"]}),
             None,
             None,
         );
         assert_eq!(
-            (all.first_byte_secs, all.stream_idle_secs, all.thinking.as_str(), all.ollama_context, all.claude_prompt.as_str()),
+            (all.first_byte_secs, all.stream_idle_secs, all.thinking.as_str(), all.context, all.claude_prompt.as_str()),
             (100, 120, "auto", 4096, "full")
         );
         assert_eq!(all.foreign_kinds, ["copilot"]);
@@ -514,8 +541,8 @@ mod tests {
         let r = resolve(Some(2), &json!({}), Some(&b), Some("gemma4:12b"));
         let plain = resolve(Some(2), &json!({}), None, None);
         assert_eq!(
-            (r.stream_idle_secs, &r.thinking, r.ollama_context, &r.claude_prompt, &r.foreign_kinds),
-            (plain.stream_idle_secs, &plain.thinking, plain.ollama_context, &plain.claude_prompt, &plain.foreign_kinds)
+            (r.stream_idle_secs, &r.thinking, r.context, &r.claude_prompt, &r.foreign_kinds),
+            (plain.stream_idle_secs, &plain.thinking, plain.context, &plain.claude_prompt, &plain.foreign_kinds)
         );
         for f in FIELDS.iter().filter(|f| **f != "first_byte_secs") {
             assert_eq!(r.sources[*f], "tier", "{f}");
@@ -574,7 +601,10 @@ mod tests {
         );
         assert_eq!(validate_overrides(&json!({"first_byte_secs": 7200})).unwrap(), json!({"first_byte_secs": 7200}));
         assert_eq!(validate_overrides(&json!({"stream_idle_secs": 1})).unwrap(), json!({"stream_idle_secs": 1}));
-        assert_eq!(validate_overrides(&json!({"ollama_context": 131072})).unwrap(), json!({"ollama_context": 131072}));
+        assert_eq!(validate_overrides(&json!({"context": 131072})).unwrap(), json!({"context": 131072}));
+        // The old name is stored under the new one; the new one wins.
+        assert_eq!(validate_overrides(&json!({"ollama_context": 131072})).unwrap(), json!({"context": 131072}));
+        assert_eq!(validate_overrides(&json!({"ollama_context": 4096, "context": 8192})).unwrap(), json!({"context": 8192}));
         assert_eq!(validate_overrides(&json!({"foreign_kinds": []})).unwrap(), json!({"foreign_kinds": []}));
         assert_eq!(validate_overrides(&json!({"claude_prompt": "slim"})).unwrap(), json!({"claude_prompt": "slim"}));
     }
@@ -588,7 +618,8 @@ mod tests {
         assert!(e(json!({"stream_idle_secs": -5})).contains("stream_idle_secs"));
         assert!(e(json!({"stream_idle_secs": 2.5})).contains("whole number"));
         assert!(e(json!({"first_byte_secs": "300"})).contains("first_byte_secs"));
-        assert!(e(json!({"ollama_context": 0})).contains("ollama_context"));
+        assert!(e(json!({"context": 0})).contains("context must be"));
+        assert!(e(json!({"ollama_context": 0})).contains("context must be"));
         assert!(e(json!({"thinking": "yes"})).contains("on, off or auto"));
         assert!(e(json!({"claude_prompt": "tiny"})).contains("full or slim"));
         assert!(e(json!({"foreign_kinds": ["noo"]})).contains("not a foreign harness kind"));
@@ -603,7 +634,7 @@ mod tests {
         let r = resolve(Some(2), &json!({"thinking": "off"}), Some(&b), Some("gemma4:12b"));
         let v = serde_json::to_value(&r).unwrap();
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        let mut want = vec!["tier", "sources", "bench"];
+        let mut want = vec!["tier", "sources", "bench", CONTEXT_ALIAS];
         want.extend(FIELDS);
         let mut have = keys.clone();
         have.sort();
@@ -612,7 +643,9 @@ mod tests {
         assert_eq!(v["tier"], 2);
         assert_eq!(v["first_byte_secs"], 600);
         assert_eq!(v["sources"], json!({"first_byte_secs": "measured", "stream_idle_secs": "tier", "thinking": "override",
-            "ollama_context": "tier", "claude_prompt": "tier", "foreign_kinds": "tier"}));
+            "context": "tier", "claude_prompt": "tier", "foreign_kinds": "tier"}));
+        // Older node agents read only the old key: both are sent, equal.
+        assert_eq!((v["context"].as_u64(), v[CONTEXT_ALIAS].as_u64()), (Some(32768), Some(32768)));
         assert_eq!(v["bench"]["model"], "gemma4:12b");
         assert_eq!(v["bench"]["prefill_tps"], 210.5);
         assert_eq!(v["foreign_kinds"], json!(["claude-code", "codex", "copilot"]));

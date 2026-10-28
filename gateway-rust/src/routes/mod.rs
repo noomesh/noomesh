@@ -6,6 +6,10 @@
 //! Each API group lives in its own submodule.
 //! This module merges them into the final application Router.
 //!
+//! Who may call a handler (Operator / Admin / OperatorOrInternal) is decided by
+//! the extractors in `crate::authz`, named in the handler's signature; this
+//! module holds no permission checks of its own.
+//!
 //! The full API surface is the OpenAPI spec,
 //! src/noomesh/gateway/static/openapi.json (checked against this router by
 //! scripts/check-openapi-drift.py).
@@ -68,6 +72,11 @@ mod websocket;
 /// `NOO_BROKER_TEST_DSN`, which CI sets.
 #[cfg(test)]
 mod ownership_scoping_tests;
+
+/// The real router on a throwaway Postgres: authz, `redis_reconnecting` and
+/// `Measured`, asserted by request. DSN-gated like the module above.
+#[cfg(test)]
+mod router_harness_tests;
 
 use std::sync::Arc;
 use axum::{Router, Json, middleware as axum_mw};
@@ -238,23 +247,6 @@ impl From<sqlx::Error> for AppError {
 /// Result type alias for handlers that return JSON on success or AppError on failure.
 pub type AppResult = Result<Json<Value>, AppError>;
 
-/// Second lock behind the tier gate for GET handlers that return
-/// installation-wide data (audit views, config, fleet desired-config, PKI).
-/// `auth::USER_READ_PATHS` already keeps a `User`-tier token off these
-/// paths; this check holds if a path is ever added to that list by mistake or
-/// the handler is mounted somewhere else. `None` is a caller with no
-/// requester context (an internal call that passed the auth layer), the same
-/// reading `users_admin_read_guard` makes.
-pub(crate) fn operator_read_guard(
-    ctx: &Option<axum::Extension<crate::auth::RequesterCtx>>,
-) -> Result<(), AppError> {
-    match ctx {
-        None => Ok(()),
-        Some(axum::Extension(r)) if r.role >= crate::auth::Role::Operator => Ok(()),
-        Some(_) => Err(AppError::Forbidden("operator role required".into())),
-    }
-}
-
 /// Refuse a whole router when the trellion add-on is absent.
 ///
 /// Applied by `temporal` (6 routes) and `knowledge` (16). Both reach
@@ -377,10 +369,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     // ── HTTP add-ons: routes from the manifest each add-on SHIPS ──
     // Read once, here, for every add-on whose switch is on, from
-    // `addon_proxy::ROUTES_DIR/<addon>/routes.json` (delivered read-only by
-    // the add-on's overlay), validated, and merged last so a collision with
-    // any core route above refuses the add-on instead of replacing a core
-    // handler. Off → nothing mounted. On with a missing/invalid manifest →
+    // `<addon>/routes.json` (the launcher's read-only copy from the add-on's
+    // signed bundle under `addon_proxy::BUNDLE_ROUTES_DIR`, else what a
+    // shipped add-on's overlay delivers under `addon_proxy::ROUTES_DIR`),
+    // validated, and merged last so a collision with any core route above
+    // refuses the add-on instead of replacing a core handler. Off → nothing mounted. On with a missing/invalid manifest →
     // nothing mounted, `/health` says `unhealthy`, the log says why. The
     // core names no add-on route.
     let router = crate::addon_proxy::mount(router);
@@ -442,72 +435,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(crate::middleware::panic_response))
 
         .with_state(state)
-}
-
-/// The second lock behind the tier gate: GET handlers that return
-/// installation-wide data refuse a `User` account themselves.
-#[cfg(test)]
-mod operator_read_guard_tests {
-    use super::operator_read_guard;
-    use crate::auth::{RequesterCtx, Role};
-    use axum::{http::StatusCode, response::IntoResponse, Extension};
-
-    fn ctx(role: Role) -> Option<Extension<RequesterCtx>> {
-        Some(Extension(RequesterCtx {
-            sub: "alice".into(),
-            scopes: vec!["read".into()],
-            role,
-            harness: None,
-            act: None,
-        }))
-    }
-
-    #[test]
-    fn a_user_is_forbidden_and_operators_admins_and_internal_callers_pass() {
-        let code = |c| match operator_read_guard(&c) {
-            Ok(()) => StatusCode::OK,
-            Err(e) => e.into_response().status(),
-        };
-        assert_eq!(code(ctx(Role::User)), StatusCode::FORBIDDEN);
-        assert_eq!(code(ctx(Role::Operator)), StatusCode::OK);
-        assert_eq!(code(ctx(Role::Admin)), StatusCode::OK);
-        assert_eq!(code(None), StatusCode::OK);
-    }
-
-    /// Each handler the audit named calls the guard BEFORE it reads anything.
-    #[test]
-    fn every_installation_wide_read_calls_the_guard_first() {
-        let admin = include_str!("admin.rs");
-        let cluster = include_str!("cluster.rs");
-        let settings = include_str!("settings.rs");
-        let other = include_str!("other.rs");
-        let cases: [(&str, &str, &str); 11] = [
-            (admin, "async fn security_audit_history(", "operator_read_guard(&ctx)"),
-            (admin, "async fn security_audit_stats(", "operator_read_guard(&ctx)"),
-            (admin, "async fn security_violations(", "operator_read_guard(&ctx)"),
-            (admin, "async fn security_pki_status(", "operator_read_guard(&ctx)"),
-            (cluster, "async fn desired_config_get(", "operator_read_guard(&requester)"),
-            (settings, "async fn config_get(", "operator_read_guard(&requester)"),
-            (settings, "async fn config_get_section(", "operator_read_guard(&requester)"),
-            (settings, "async fn settings_get(", "operator_read_guard(&requester)"),
-            (settings, "async fn settings_export(", "operator_read_guard(&requester)"),
-            (settings, "async fn settings_flags_list(", "operator_read_guard(&requester)"),
-            (other, "async fn coordinator_context(", "operator_read_guard(&requester)"),
-        ];
-        for (src, sig, call) in cases {
-            let start = src.find(sig).unwrap_or_else(|| panic!("{sig} not found"));
-            let rest = &src[start..];
-            let end = rest[sig.len()..].find("\nasync fn ").map(|i| i + sig.len()).unwrap_or(rest.len());
-            let body = &rest[..end];
-            let at = body.find(call).unwrap_or_else(|| panic!("{sig} does not call {call}"));
-            let first_read = ["state.db", "state.config_yaml", ".fetch_", "read_to_string", "state.redis", "resolve_backend"]
-                .iter()
-                .filter_map(|m| body.find(m))
-                .min()
-                .unwrap_or(usize::MAX);
-            assert!(at < first_read, "{sig}: the guard must come before the first read");
-        }
-    }
 }
 
 #[cfg(test)]
