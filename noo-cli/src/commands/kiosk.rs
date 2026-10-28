@@ -1182,18 +1182,26 @@ pub fn kiosk_reload(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         return Ok(0);
     }
     ui::done("reloaded");
-    let line = match (&before, &after) {
+    println!("{}", ui::note(&reload_line(before.as_deref(), after.as_deref())));
+    Ok(0)
+}
+
+/// The note after `noo kiosk reload`: the console's build before and after,
+/// as `noo-kiosk-cdp build` stated them. A console that stated a build
+/// before the reload is a stamped one, so silence after it is a slow page,
+/// not a pre-stamp console (i301 b).
+fn reload_line(before: Option<&str>, after: Option<&str>) -> String {
+    match (before, after) {
         (Some(b), Some(a)) if b == a => format!("console build {a} (unchanged)"),
-        (_, Some(a)) => match &before {
-            Some(b) => format!("console build {b} -> {a}"),
-            None => format!("console build {a}"),
-        },
+        (Some(b), Some(a)) => format!("console build {b} -> {a}"),
+        (None, Some(a)) => format!("console build {a}"),
+        (Some(b), None) => format!(
+            "the console did not state its build within 5 s of the reload (it was {b}); check with `noo kiosk status`"
+        ),
         // Pre-stamp consoles say nothing, and so should this rather than
         // implying the reload failed.
-        (_, None) => "console build not stated (a console from before stack-v0.2.59)".to_string(),
-    };
-    println!("{}", ui::note(&line));
-    Ok(0)
+        (None, None) => "console build not stated (a console from before stack-v0.2.59)".to_string(),
+    }
 }
 
 /// No seat here: no unit on disk, nothing published, no browser, no proxy
@@ -3157,5 +3165,23 @@ mod seat_absent_tests {
         assert!(!seat_absent(false, true, false, false));
         assert!(!seat_absent(false, false, true, false));
         assert!(!seat_absent(false, false, false, true));
+    }
+}
+
+#[cfg(test)]
+mod reload_line_tests {
+    use super::reload_line;
+
+    /// A console that stated a build before the reload is stamped: silence
+    /// after it is a slow page, never "a console from before stack-v0.2.59".
+    #[test]
+    fn a_slow_stamped_console_is_not_called_pre_stamp() {
+        let l = reload_line(Some("stack-v0.6.13"), None);
+        assert!(!l.contains("before stack-v0.2.59"), "{l}");
+        assert!(l.contains("stack-v0.6.13") && l.contains("noo kiosk status"), "{l}");
+        assert!(reload_line(None, None).contains("before stack-v0.2.59"));
+        assert_eq!(reload_line(Some("stack-v0.6.13"), Some("stack-v0.6.13")), "console build stack-v0.6.13 (unchanged)");
+        assert_eq!(reload_line(Some("stack-v0.6.12"), Some("stack-v0.6.13")), "console build stack-v0.6.12 -> stack-v0.6.13");
+        assert_eq!(reload_line(None, Some("stack-v0.6.13")), "console build stack-v0.6.13");
     }
 }
