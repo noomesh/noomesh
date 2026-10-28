@@ -33,6 +33,7 @@ import noomesh.sandbox.app as sandbox  # noqa: E402
 @pytest.fixture(autouse=True)
 def _fresh_probe(monkeypatch):
     monkeypatch.setattr(sandbox, "_probe_result", None)
+    monkeypatch.setattr(sandbox, "_self_test", {})
     monkeypatch.delenv("NOO_SANDBOX_ISOLATION", raising=False)
     # RLIMIT_NPROC counts every task of the uid; a developer's uid on a
     # workstation is far past the container default, so fork() would
@@ -145,6 +146,67 @@ def test_bwrap_argv_sets_only_the_scrubbed_environment(tmp_path):
     env = {argv[i + 1]: argv[i + 2] for i, a in enumerate(argv) if a == "--setenv"}
     assert env == sandbox.child_env("/work")
     assert env["HOME"] == "/work"
+
+
+def test_bwrap_argv_mounts_no_proc(tmp_path):
+    # Docker's masked /proc paths are locked inside the call's user
+    # namespace, so the kernel refuses a fresh procfs there
+    # (mount_too_revealing): `--proc /proc` made every call fail in a
+    # container (pop-os, 0.6.13). And no bind of the container's /proc,
+    # which would show the code this server and the other calls.
+    argv = sandbox.bwrap_argv(str(tmp_path))
+    assert "--proc" not in argv
+    binds = [argv[i + 2] for i, a in enumerate(argv) if a in ("--bind", "--ro-bind", "--dev-bind")]
+    assert "/proc" not in binds and not any(b.startswith("/proc/") for b in binds), binds
+
+
+def test_launch_argv_hands_the_interpreter_its_program(tmp_path):
+    argv = sandbox.launch_argv("bwrap", str(tmp_path), sandbox.rlimits(5), None, program=("-c", "pass", "7"))
+    assert argv[-5:] == [sys.executable, "-I", "-c", "pass", "7"]
+    assert sandbox.launch_argv("process", str(tmp_path), sandbox.rlimits(5), None)[-3:] == [sys.executable, "-I", "-"]
+
+
+GOOD_FACTS = {"pid": 2, "uid": 65600, "interfaces": ["lo"], "server_visible": False, "proc": False, "tls_visible": False, "cwd": "/work"}
+
+
+def test_self_test_passes_only_a_jail_that_isolates():
+    assert sandbox.judge_self_test(GOOD_FACTS, 7, 65600) == []
+    # A server pid the jail cannot tell from its own is not held against it.
+    assert sandbox.judge_self_test({**GOOD_FACTS, "server_visible": None}, 2, 65600) == []
+    # Without an executor uid (a workstation) the uid is not judged.
+    assert sandbox.judge_self_test({**GOOD_FACTS, "uid": 1000}, 7, None) == []
+    cases = {
+        "pid": ({"pid": 4711}, "PID namespace"),
+        "net": ({"interfaces": ["eth0", "lo"]}, "network interfaces"),
+        "server": ({"server_visible": True}, "this server's process"),
+        "key": ({"tls_visible": True}, "/tls"),
+        "uid": ({"uid": 65590}, "executor uid 65600"),
+        "cwd": ({"cwd": "/"}, "scratch dir"),
+    }
+    for name, (change, words) in cases.items():
+        bad = sandbox.judge_self_test({**GOOD_FACTS, **change}, 7, 65600)
+        assert len(bad) == 1 and words in bad[0], (name, bad)
+    assert len(sandbox.judge_self_test({}, 7, 65600)) >= 3
+
+
+def test_a_failed_self_test_makes_bwrap_unusable_and_says_why(monkeypatch):
+    def probe():
+        sandbox._self_test = {**GOOD_FACTS, "interfaces": ["eth0", "lo"], "passed": False, "failures": ["net"]}
+        return False, "the isolation self-test failed: the code sees network interfaces ['eth0', 'lo'], not loopback alone"
+    monkeypatch.setattr(sandbox, "_run_bwrap_probe", probe)
+    body = sandbox.exec_code(sandbox.ExecRequest(code="print('PWNED')"))
+    assert "PWNED" not in body["output"] and "self-test failed" in body["output"]
+    h = sandbox.health()
+    assert h["status"] == "unhealthy"
+    assert h["isolation"]["self_test"]["passed"] is False
+
+
+def test_a_missing_proc_path_is_explained_under_the_traceback():
+    err = "FileNotFoundError: [Errno 2] No such file or directory: '/proc/self/status'"
+    assert sandbox._NO_PROC_RE.search(err)
+    assert sandbox._NO_PROC_RE.search("No such file or directory: '/dev/fd/3'")
+    assert not sandbox._NO_PROC_RE.search("No such file or directory: '/work/data.csv'")
+    assert not sandbox._NO_PROC_RE.search("No such file or directory: '/processed.txt'")
 
 
 def test_child_env_never_carries_the_servers_environment(monkeypatch, tmp_path):
@@ -451,6 +513,39 @@ def test_probe_result_is_cached_until_refreshed(monkeypatch):
 
 
 # ── bwrap, where it exists ──────────────────────────────────────────────
+
+
+def _proc_is_masked() -> bool:
+    """Is a path under /proc covered by its own mount here, as Docker's
+    masks are in every container? (CI makes one: a private mount namespace
+    with /dev/null bound over /proc/kcore, then the tests as the runner.)"""
+    try:
+        with open("/proc/self/mountinfo") as f:
+            return any(line.split()[4].startswith("/proc/") for line in f)
+    except OSError:
+        return False
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap not installed here")
+def test_bwrap_live_runs_and_proves_its_isolation_under_dockers_proc_masks(scrubbed_python):
+    # The pop-os failure (0.6.13): in a container, a fresh procfs is refused
+    # inside the call's user namespace, so the probe failed and every call was
+    # refused. NOO_SANDBOX_TEST_PROC_MASK=1 (the CI step that builds the masks)
+    # makes this a hard test rather than one that skips.
+    required = os.environ.get("NOO_SANDBOX_TEST_PROC_MASK") == "1"
+    if required:
+        assert _proc_is_masked(), "NOO_SANDBOX_TEST_PROC_MASK=1 but no path under /proc is masked here"
+    ok, detail = sandbox.bwrap_available(refresh=True)
+    if not ok and not required:
+        pytest.skip(f"bwrap present but cannot run here: {detail}")
+    assert ok, f"bwrap cannot run{' under masked /proc' if _proc_is_masked() else ''}: {detail}"
+    st = sandbox.health()["isolation"]["self_test"]
+    assert st["passed"] and st["failures"] == [], st
+    assert st["interfaces"] == ["lo"] and st["pid"] <= 3 and not st["proc"], st
+    result = sandbox.run_code("print(sum(range(10)))", 10, "bwrap")
+    assert result["exit_code"] == 0 and "45" in result["output"], result
+    missing = sandbox.run_code("open('/proc/self/status').read()", 10, "bwrap")
+    assert missing["exit_code"] != 0 and "there is no /proc inside the sandbox" in missing["output"], missing
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap not installed here")

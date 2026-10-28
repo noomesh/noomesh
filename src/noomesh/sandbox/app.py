@@ -18,7 +18,11 @@ Isolation modes (`NOO_SANDBOX_ISOLATION`):
   code sees a read-only copy of the system directories, a private /tmp,
   its scratch directory at /work, and no network interface at all. It
   cannot see this server's process, other calls, or the container's
-  filesystem. Requires the container to be started with
+  filesystem. It has no /proc either (`bwrap_argv` says why), so
+  /proc/self/*, /dev/fd and /dev/stdin do not resolve; a call that reads
+  one gets a note saying so (`_NO_PROC_NOTE`). Before the first call the
+  probe runs a self-test inside the jail and the mode is usable only if
+  that proves the isolation (`judge_self_test`). Requires the container to be started with
   docker/seccomp-sandbox.json (both launchers do that); if the kernel or
   the container's security profile refuses user namespaces, `/exec`
   REFUSES to run code and `/health` reports unhealthy rather than
@@ -57,6 +61,7 @@ import math
 import os
 import pwd
 import queue
+import re
 import resource
 import secrets
 import shutil
@@ -283,17 +288,29 @@ def with_rlimits(limits: dict[int, tuple[int, int]], scratch: str, argv: list[st
     return [sys.executable, "-I", "-c", _LIMIT_SHIM, encoded, scratch, *argv]
 
 
-def bwrap_argv(scratch: str, ro_paths: tuple[str, ...] = RO_PATHS) -> list[str]:
+def bwrap_argv(scratch: str, ro_paths: tuple[str, ...] = RO_PATHS, program: tuple[str, ...] = ("-",)) -> list[str]:
     """The Bubblewrap command line for one call. `--unshare-all` gives the
     code its own user, PID, IPC, UTS, cgroup AND network namespaces —
-    no interface but loopback, whatever the container is attached to."""
+    no interface but loopback, whatever the container is attached to.
+
+    No /proc. Docker masks paths under the container's /proc (/proc/kcore,
+    /proc/keys, ... with /dev/null; /proc/sys, /proc/irq, ... read-only),
+    and inside the call's new user namespace those mounts are locked. The
+    kernel then refuses a fresh procfs (mount_too_revealing: no procfs in
+    this mount namespace is fully visible), so `--proc /proc` failed with
+    "Can't mount proc on /proc: Operation not permitted" in every Docker
+    container whose security profile let Bubblewrap get that far (pop-os,
+    0.6.13). Binding the container's /proc instead would show the code
+    this server and every other call. Lifting the masks
+    (systempaths=unconfined) would loosen the container for the server
+    too. So the code gets no /proc: it keeps every namespace and sees less
+    than before."""
     argv = [
         shutil.which("bwrap") or "bwrap",
         "--unshare-all",
         "--die-with-parent",
         "--new-session",
         "--clearenv",
-        "--proc", "/proc",
         "--dev", "/dev",
         "--tmpfs", "/tmp",
         "--bind", scratch, "/work",
@@ -304,12 +321,14 @@ def bwrap_argv(scratch: str, ro_paths: tuple[str, ...] = RO_PATHS) -> list[str]:
             argv += ["--ro-bind", path, path]
     for key, value in child_env("/work").items():
         argv += ["--setenv", key, value]
-    argv += ["--", sys.executable, "-I", "-"]
+    # `program`: the interpreter's arguments after -I — the snippet from
+    # stdin for a call, the self-test for the probe.
+    argv += ["--", sys.executable, "-I", *program]
     return argv
 
 
-def process_argv() -> list[str]:
-    return [sys.executable, "-I", "-"]
+def process_argv(program: tuple[str, ...] = ("-",)) -> list[str]:
+    return [sys.executable, "-I", *program]
 
 
 def launch_argv(
@@ -317,11 +336,12 @@ def launch_argv(
     scratch: str,
     limits: dict[int, tuple[int, int]],
     exec_user: Optional[tuple[int, int]],
+    program: tuple[str, ...] = ("-",),
 ) -> list[str]:
     """The whole command line for one call: become the executor (when
     there is one), make the scratch dir and apply the limits, then
     Bubblewrap or the bare interpreter."""
-    inner = bwrap_argv(scratch) if mode == "bwrap" else process_argv()
+    inner = bwrap_argv(scratch, program=program) if mode == "bwrap" else process_argv(program)
     return drop_argv(exec_user) + with_rlimits(limits, scratch, inner)
 
 
@@ -388,19 +408,73 @@ def kill_everything_of(uid: int, proc_root: str = "/proc") -> int:
 
 _probe_lock = threading.Lock()
 _probe_result: Optional[tuple[bool, str]] = None
+# What the last probe's self-test saw inside the jail (`/health` shows it).
+_self_test: dict = {}
+
+# Run inside the jail by the probe. It reports what the code can reach;
+# `judge_self_test` decides, outside, whether that is isolation. A jail
+# that merely starts is not enough: the facts are the proof.
+_SELF_TEST = """
+import json, os, socket, sys
+server = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+def visible(pid):
+    if pid <= 3:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+print("SELFTEST " + json.dumps({
+    "pid": os.getpid(),
+    "uid": os.getuid(),
+    "interfaces": sorted(n for _, n in socket.if_nameindex()),
+    "server_visible": visible(server),
+    "proc": os.path.exists("/proc/self"),
+    "tls_visible": os.path.exists("/tls"),
+    "cwd": os.getcwd(),
+}))
+"""
+
+
+def judge_self_test(facts: dict, server_pid: int, exec_uid: Optional[int]) -> list[str]:
+    """What the self-test's facts fail to prove, as sentences; empty when
+    the jail isolates the call. `server_visible` is None when the server's
+    pid is too small to tell apart from the jail's own (it is not then a
+    failure: the PID check above already proves the namespace)."""
+    bad = []
+    if not isinstance(facts.get("pid"), int) or facts["pid"] > 3:
+        bad.append(f"the code is pid {facts.get('pid')}, not in a PID namespace of its own")
+    if facts.get("interfaces") != ["lo"]:
+        bad.append(f"the code sees network interfaces {facts.get('interfaces')}, not loopback alone")
+    if facts.get("server_visible"):
+        bad.append(f"the code can see this server's process (pid {server_pid})")
+    if facts.get("tls_visible"):
+        bad.append("the code can see /tls, where the sandbox's own key is")
+    if exec_uid is not None and facts.get("uid") != exec_uid:
+        bad.append(f"the code runs as uid {facts.get('uid')}, not its executor uid {exec_uid}")
+    if facts.get("cwd") != "/work":
+        bad.append(f"the code starts in {facts.get('cwd')}, not its scratch dir /work")
+    return bad
 
 
 def _run_bwrap_probe() -> tuple[bool, str]:
+    global _self_test
+    _self_test = {}
     if shutil.which("bwrap") is None:
         return False, "bwrap is not installed in the sandbox image"
     # The real command line, executor drop included: a probe that ran as
     # the server would prove a path no call takes.
     with executor_slot() as exec_user:
         scratch = _scratch_path()
+        # The server's pid is the self-test's one argument.
+        argv = launch_argv("bwrap", scratch, rlimits(10), exec_user, program=("-c", _SELF_TEST, str(os.getpid())))
         try:
             proc = subprocess.run(
-                launch_argv("bwrap", scratch, rlimits(10), exec_user),
-                input=b"import os; print('ok', os.getpid())",
+                argv,
+                input=b"",
                 capture_output=True,
                 timeout=15,
                 env=child_env(scratch),
@@ -409,10 +483,20 @@ def _run_bwrap_probe() -> tuple[bool, str]:
             return False, f"bwrap probe failed to run: {exc}"
         finally:
             cleanup(scratch, exec_user)
-    if proc.returncode == 0 and proc.stdout.startswith(b"ok"):
-        return True, "bwrap"
-    detail = (proc.stderr or proc.stdout).decode(errors="replace").strip().splitlines()
-    return False, (detail[-1] if detail else f"bwrap exited {proc.returncode}")
+    lines = proc.stdout.decode(errors="replace").splitlines()
+    report = next((ln[len("SELFTEST "):] for ln in lines if ln.startswith("SELFTEST ")), None)
+    if proc.returncode != 0 or report is None:
+        detail = (proc.stderr or proc.stdout).decode(errors="replace").strip().splitlines()
+        return False, (detail[-1] if detail else f"bwrap exited {proc.returncode}")
+    try:
+        facts = json.loads(report)
+    except ValueError:
+        return False, f"the isolation self-test printed something unreadable: {report[:120]}"
+    failures = judge_self_test(facts, os.getpid(), exec_user[0] if exec_user is not None else None)
+    _self_test = {**facts, "passed": not failures, "failures": failures}
+    if failures:
+        return False, "the isolation self-test failed: " + "; ".join(failures)
+    return True, "bwrap"
 
 
 def bwrap_available(refresh: bool = False) -> tuple[bool, str]:
@@ -450,6 +534,17 @@ def _truncate(data: bytes, limit: Optional[int] = None) -> str:
     if len(data) <= limit:
         return data.decode(errors="replace")
     return data[:limit].decode(errors="replace") + f"\n… [truncated: {len(data) - limit} more bytes]"
+
+
+# A snippet (or a library it imports) that reads /proc/self/status,
+# /proc/meminfo, /proc/cpuinfo, /dev/fd/N or /dev/stdin fails with a plain
+# FileNotFoundError naming the path. Said once, under the traceback, so it
+# reads as the sandbox's design and not as a broken sandbox.
+_NO_PROC_RE = re.compile(r"No such file or directory: '/(?:proc|dev/(?:fd|stdin|stdout|stderr))\b")
+_NO_PROC_NOTE = (
+    "sandbox: there is no /proc inside the sandbox (so no /proc/self, /proc/meminfo, /proc/cpuinfo, "
+    "/dev/fd or /dev/stdin); use os.cpu_count(), os.sched_getaffinity(0) or the resource module instead"
+)
 
 
 def run_code(code: str, timeout: float, mode: str) -> dict:
@@ -493,6 +588,8 @@ def run_code(code: str, timeout: float, mode: str) -> dict:
     if timed_out:
         sections.append(f"Error: Python execution timed out after {timeout:.1f}s.")
     out, err = _truncate(stdout).strip(), _truncate(stderr).strip()
+    if mode == "bwrap" and _NO_PROC_RE.search(err):
+        err += "\n" + _NO_PROC_NOTE
     if out:
         sections.append("[stdout]\n" + out)
     if err:
@@ -546,6 +643,9 @@ def health() -> dict:
         status["status"] = "unhealthy"
         status["checks"]["python"] = f"unhealthy: {e}"
     status["checks"]["isolation"] = "healthy" if usable else f"unhealthy: {detail}"
+    if mode == "bwrap" and _self_test:
+        # What the jail looked like from inside, and the verdict on it.
+        status["isolation"]["self_test"] = dict(_self_test)
     return status
 
 

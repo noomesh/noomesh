@@ -2778,7 +2778,9 @@ services:
       # Ubuntu 24.04+ hosts restrict unprivileged user namespaces through
       # AppArmor and the docker-default profile also denies mount, so
       # Bubblewrap fails there with "No permissions to create new
-      # namespace" / "Can't mount proc". On such a host install the shipped
+      # namespace" / "Failed to make / slave". (Its "Can't mount proc" was
+      # never AppArmor: Docker's /proc masks, which the jail now avoids by
+      # mounting no /proc; see app.py bwrap_argv.) On such a host install the shipped
       # profile (docker/apparmor-noo-sandbox: docker-default plus the
       # user-namespace and mount rules Bubblewrap needs, nothing else) into
       # /etc/apparmor.d/noo-sandbox and set NOO_SANDBOX_APPARMOR=noo-sandbox;
@@ -2833,8 +2835,13 @@ services:
       # that would refuse every call shows up here, not in a tool error.
       # Over the door itself: the CA verifies the server (hostname
       # `localhost` is in the leaf) and the container's own leaf is the
-      # client certificate the listener requires.
-      test: ["CMD", "python", "-c", "import ssl,sys,urllib.request; c=ssl.create_default_context(cafile='/tls/ca.crt'); c.load_cert_chain('/tls/services/sandbox/service.crt','/tls/services/sandbox/service.key'); sys.exit(0 if urllib.request.urlopen('https://localhost:9000/health',context=c,timeout=3).status==200 else 1)"]
+      # client certificate the listener requires. As sandbox-server, the
+      # key's reader (0640, group sandbox-server): docker runs the check as
+      # the container's user, root, which holds no CAP_DAC_OVERRIDE here, so
+      # as root it could not open the key and the container was reported
+      # unhealthy even with a healthy server (i277c). setpriv needs only the
+      # CAP_SETUID/CAP_SETGID the container already has, and drops them.
+      test: ["CMD", "setpriv", "--reuid=sandbox-server", "--regid=sandbox-server", "--clear-groups", "--inh-caps=-all", "--", "python", "-c", "import ssl,sys,urllib.request; c=ssl.create_default_context(cafile='/tls/ca.crt'); c.load_cert_chain('/tls/services/sandbox/service.crt','/tls/services/sandbox/service.key'); sys.exit(0 if urllib.request.urlopen('https://localhost:9000/health',context=c,timeout=3).status==200 else 1)"]
       interval: 15s
       timeout: 5s
       retries: 3
