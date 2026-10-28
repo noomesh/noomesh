@@ -2226,8 +2226,8 @@ fn grafana_mounts_sso_pub() -> Option<bool> {
 /// take back: every re-issue and mode repair of it fails until the printed
 /// `sudo chown` runs. A uid-read key its container cannot read is a WARN
 /// carrying the sudo line (the CLI cannot `chgrp` to a group it is not
-/// in, and there is no `setfacl`), and a leaf with no reader row is a
-/// WARN naming the table. Issuance, `noo upgrade --stack`, provision and
+/// in, and there is no `setfacl`), and a key with no reader row that is
+/// readable beyond its owner is a WARN that `fix-modes` closes (i277a). Issuance, `noo upgrade --stack`, provision and
 /// onboard set every mode they can, so a FAIL here that needs no sudo
 /// line means one of them has not run since the key changed.
 pub(crate) fn pki_key_modes_check(issues: &[crate::pki::KeyIssue], grant_lines: &[String], total_keys: usize) -> Check {
@@ -2267,21 +2267,13 @@ pub(crate) fn pki_key_modes_check(issues: &[crate::pki::KeyIssue], grant_lines: 
     if !unknown.is_empty() {
         return warn(
             "pki key modes",
-            format!("no reader entry for {} (left 0644)", unknown.join(", ")),
-            // A leaf with no reader entry is a third-party add-on's: its only
-            // consumers are the provision copies, so owner-only is safe.
-            Some(unknown_reader_remedy(&issues.iter().filter(|i| i.kind == K::UnknownReader).map(|i| i.rel.clone()).collect::<Vec<_>>())),
+            format!("no reader entry, readable beyond the owner: {}", unknown.join(", ")),
+            // A key with no reader entry is a third-party add-on's: its only
+            // consumers are the provision copies, so fix-modes makes it 0600.
+            Some("noo security pki fix-modes".to_string()),
         );
     }
     ok("pki key modes", format!("{total_keys} private key(s), each readable only by its reader"))
-}
-
-/// The command that closes a "no reader entry" row: tighten each key to
-/// owner-only (the operator was told to `chmod 600` by hand, i277a).
-fn unknown_reader_remedy(rels: &[String]) -> String {
-    let dir = crate::pki::pki_dir();
-    let paths: Vec<String> = rels.iter().map(|r| dir.join(r).display().to_string()).collect();
-    format!("chmod 600 {}", paths.join(" "))
 }
 
 /// `/etc/docker/daemon.json`: `Ok(None)` when there is none.
@@ -7863,8 +7855,8 @@ mod tests {
         let c = pki_key_modes_check(&[unknown], &[], 5);
         assert_eq!(c.verdict, Verdict::Warn);
         let r = c.remedy.unwrap();
-        assert!(r.starts_with("chmod 600 ") && r.ends_with("services/mystery/service.key"), "{r}");
-        assert!(!r.contains("noo-cli/src") && !r.contains("SERVICE_KEY_READERS"), "{r}");
+        assert_eq!(r, "noo security pki fix-modes", "fix-modes makes a no-reader key 0600 (i277a)");
+        assert!(c.detail.contains("services/mystery/service.key 0644"), "{}", c.detail);
         // Exposure outranks an unreadable key: the fix for both is the same verb,
         // and the sudo line rides along when the verb alone cannot finish it.
         let c = pki_key_modes_check(&[exposed, KeyIssue { rel: "x".into(), mode: 0o640, reader: KeyReader::ContainerUid(70), kind: KeyIssueKind::Unreadable }], std::slice::from_ref(&line), 5);

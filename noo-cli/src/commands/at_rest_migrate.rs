@@ -1506,8 +1506,7 @@ mod tests {
         fn script(&self, name: &str, body: &str) {
             let p = self.bin.join(name);
             let b = body.replace("@CTL@", &self.ctl.display().to_string()).replace("@BAK@", &self.bak.display().to_string());
-            std::fs::write(&p, format!("#!/bin/sh\n{b}")).unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_exec::write_exec(&p, format!("#!/bin/sh\n{b}"), 0o755);
         }
 
         fn ctx(&self) -> Ctx<'static> {

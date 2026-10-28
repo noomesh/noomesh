@@ -8467,7 +8467,7 @@ mod sudo_seam_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("calls.log");
         let fake = dir.join("sudo");
-        std::fs::write(
+        crate::test_exec::write_exec(
             &fake,
             format!(
                 // printf, not echo: `echo "$@"` takes a leading `-n` as its own
@@ -8476,10 +8476,8 @@ mod sudo_seam_tests {
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n[ \"$1\" = \"-n\" ] || {{ sleep 30; exit 99; }}\necho 'sudo: a password is required' >&2\nexit 1\n",
                 log.display()
             ),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            0o755,
+        );
         SUDO_BIN.with(|b| *b.borrow_mut() = Some(fake.clone()));
 
         let g = crate::Globals { json: false, verbose: false, gateway_override: None, timeout_secs: None, token: None, quiet: true };

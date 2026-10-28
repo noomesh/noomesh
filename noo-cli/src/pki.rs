@@ -334,9 +334,12 @@ impl ClusterCa {
 //     we never tighten a key we cannot re-grant, because that turns a
 //     scan finding into a service that will not start.
 //
-// A service the table does not name keeps the legacy 0644; the scan
-// reports it as "no reader entry" so the table grows rather than a
-// guess breaking an unknown consumer.
+// A key the table does not name is owner-only (0600), like the CLI's
+// own: the only leaves that reach it are a third-party add-on's
+// (`services/<addon>/`, provision-only before 0.6.13), whose consumers
+// read 0400 copies under /dev/shm, never the file here. It used to be
+// left 0644, which made such a key readable by every local account
+// (i277a); `fix-modes` now tightens one an older install left so.
 
 /// Which process reads a private key, and therefore its mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -349,7 +352,7 @@ pub enum KeyReader {
     /// A container process with this fixed uid (gid == uid on every
     /// image in the table): 0640, handed to that uid.
     ContainerUid(u32),
-    /// Not in the table: legacy 0644, reported by the scan.
+    /// Not in the table: 0600, as if only this CLI read it (i277a).
     Unknown,
 }
 
@@ -357,9 +360,8 @@ impl KeyReader {
     /// The mode a key with this reader is written with.
     pub fn mode(self) -> u32 {
         match self {
-            KeyReader::Cli | KeyReader::ContainerRoot => 0o600,
+            KeyReader::Cli | KeyReader::ContainerRoot | KeyReader::Unknown => 0o600,
             KeyReader::ContainerUid(_) => 0o640,
-            KeyReader::Unknown => 0o644,
         }
     }
 
@@ -654,7 +656,8 @@ pub enum KeyIssueKind {
     Exposed,
     /// The reader (a container uid) cannot read it.
     Unreadable,
-    /// A service leaf the reader table does not name, still 0644.
+    /// A key the reader table does not name, readable beyond its owner
+    /// (an install before i277a left such keys 0644); `fix-modes` makes it 0600.
     UnknownReader,
     /// Its mode is right, but it is owned by a uid other than the PKI
     /// dir's owner, and this CLI could not take it back (unreadable to
@@ -733,8 +736,7 @@ impl ClusterCa {
             fix.after = 0o600;
         }
         match reader {
-            KeyReader::Unknown => {}
-            KeyReader::Cli | KeyReader::ContainerRoot => {
+            KeyReader::Cli | KeyReader::ContainerRoot | KeyReader::Unknown => {
                 if fix.after != reader.mode() && set_mode(key, reader.mode()) {
                     fix.after = reader.mode();
                 }
@@ -903,8 +905,7 @@ pub(crate) fn owner_fix_line(key: &Path, reader: KeyReader, uid: u32, gid: u32) 
     let p = key.display();
     match reader {
         KeyReader::ContainerUid(r) => format!("sudo chown {uid}:{r} {p} && sudo chmod 640 {p}"),
-        KeyReader::Cli | KeyReader::ContainerRoot => format!("sudo chown {uid}:{gid} {p} && sudo chmod 600 {p}"),
-        KeyReader::Unknown => format!("sudo chown {uid}:{gid} {p}"),
+        KeyReader::Cli | KeyReader::ContainerRoot | KeyReader::Unknown => format!("sudo chown {uid}:{gid} {p} && sudo chmod 600 {p}"),
     }
 }
 
@@ -1719,11 +1720,6 @@ impl ClusterCa {
         // `fix-modes`, the scan, `cluster verify`) say what still needs a
         // hand the operator has and this process does not.
         write_key_file(key_path, key.serialize_pem().as_bytes())?;
-        if self.key_reader(key_path) == KeyReader::Unknown {
-            // No reader row: the legacy 0644 until the table names one, so
-            // an unlisted consumer still starts; the scan reports it.
-            set_mode(key_path, KeyReader::Unknown.mode());
-        }
         let _ = self.apply_key_mode(key_path);
         // The gateway reads certificates through `public/`:
         // every issue and every rotation re-syncs it, or the
@@ -3125,11 +3121,11 @@ mod key_mode_tests {
         assert_eq!(KeyReader::Cli.mode(), 0o600);
         assert_eq!(KeyReader::ContainerRoot.mode(), 0o600);
         assert_eq!(KeyReader::ContainerUid(70).mode(), 0o640);
-        assert_eq!(KeyReader::Unknown.mode(), 0o644);
+        assert_eq!(KeyReader::Unknown.mode(), 0o600, "no reader row is owner-only, never world-readable (i277a)");
     }
 
     /// Issuance writes the reader's mode: a node key and a root-read
-    /// service key are owner-only; an unknown service keeps 0644. (A
+    /// service key are owner-only, and so is an unknown service's (i277a). (A
     /// uid-read key's final bits depend on whether this process may hand
     /// it over — `fix_key_modes_tightens_a_planted_0644_key` covers that.)
     #[test]
@@ -3142,7 +3138,7 @@ mod key_mode_tests {
         let (_, nats_key) = ca.issue_service_cert("nats", &[], &[], 90).unwrap();
         assert_eq!(mode_of(&nats_key), 0o600, "nats runs as root in its container");
         let (_, odd_key) = ca.issue_service_cert("not-a-thing", &[], &[], 90).unwrap();
-        assert_eq!(mode_of(&odd_key), 0o644, "no reader row: left readable, reported by the scan");
+        assert_eq!(mode_of(&odd_key), 0o600, "no reader row: owner-only, never 0644 (i277a)");
         // The gateway key (uid 65532): handed over and not world-readable,
         // or — when this process cannot hand it over — left readable with
         // the sudo line pending. In both states the gateway can read it.
@@ -3283,6 +3279,32 @@ mod key_mode_tests {
         let (again, dirs_again) = ca.fix_key_modes();
         assert!(again.iter().all(|f| !f.changed() || matches!(f.reader, KeyReader::ContainerUid(_))), "second pass is a no-op: {again:?}");
         assert!(dirs_again.is_empty(), "{dirs_again:?}");
+    }
+
+    /// i277a, the pop-os shape: a third-party add-on's leaf
+    /// (`services/<addon>/service.key`, no reader row) that an older
+    /// install left 0644. The scan finds it, `fix-modes` makes it 0600, and
+    /// the next scan is clean.
+    #[test]
+    fn fix_key_modes_tightens_a_0644_key_with_no_reader_row() {
+        let ca = ClusterCa::new(scratch());
+        ca.generate_ca("t", 3650).unwrap();
+        let (_, key) = ca.issue_service_cert("pai-voice", &[], &[], 90).unwrap();
+        assert_eq!(ca.key_reader(&key), KeyReader::Unknown);
+        assert_eq!(mode_of(&key), 0o600, "issued owner-only");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let issues = ca.audit_key_modes();
+        let planted: Vec<&KeyIssue> = issues.iter().filter(|i| i.rel == "services/pai-voice/service.key").collect();
+        assert_eq!(planted.len(), 1, "the planted key must be found: {issues:?}");
+        assert_eq!((planted[0].kind, planted[0].mode), (KeyIssueKind::UnknownReader, 0o644));
+
+        let (fixes, _) = ca.fix_key_modes();
+        let f = fixes.iter().find(|f| f.rel == "services/pai-voice/service.key").expect("a fix row for the planted key");
+        assert_eq!((f.before, f.after), (0o644, 0o600));
+        assert!(f.needs.is_none(), "{f:?}");
+        assert_eq!(mode_of(&key), 0o600);
+        assert!(!ca.audit_key_modes().iter().any(|i| i.rel == "services/pai-voice/service.key"), "clean after the fix");
     }
 
     /// A uid-read key: either this process could hand it over (group or

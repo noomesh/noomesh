@@ -535,9 +535,9 @@ mod tests {
             self
         }
         fn tool(&self, rel: &str) -> &Self {
-            use std::os::unix::fs::PermissionsExt as _;
-            self.file(rel, b"#!/bin/sh\n");
-            fs::set_permissions(self.0.join(rel), fs::Permissions::from_mode(0o755)).unwrap();
+            let p = self.0.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            crate::test_exec::write_exec(&p, b"#!/bin/sh\n", 0o755);
             self
         }
         fn tpm(&self, version: &str, with_rm: bool) -> &Self {

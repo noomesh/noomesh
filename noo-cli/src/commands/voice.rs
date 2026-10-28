@@ -592,12 +592,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             for n in names {
                 let p = dir.join(n);
-                std::fs::write(&p, "#!/bin/sh\n").unwrap();
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-                }
+                crate::test_exec::write_exec(&p, "#!/bin/sh\n", 0o755);
             }
             FakeBin(dir)
         }
