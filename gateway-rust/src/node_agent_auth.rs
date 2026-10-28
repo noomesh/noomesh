@@ -100,6 +100,12 @@ pub(crate) fn note(node_id: &str, record: &Value) {
     let self_node = record.get("self_node").and_then(Value::as_bool) == Some(true);
     let Ok(mut map) = LEAF_ONLY.write() else { return };
     map.remove(node_id);
+    if self_node {
+        // The self node's own report is authoritative from its first beat:
+        // what the startup probe learned before it is dropped either way.
+        map.remove(SELF_PROBE_KEY);
+        SELF_BEAT_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     for agent in map.values_mut() {
         agent.authorities.retain(|a| !authorities.contains(a));
     }
@@ -133,6 +139,12 @@ pub(crate) async fn seed(state: &crate::state::AppState) {
     match tokio::time::timeout(std::time::Duration::from_secs(5), work).await {
         Ok(n) => tracing::info!(nodes = n, "node_agent_leaf_only_seeded"),
         Err(_) => tracing::warn!("node_agent_leaf_only_seed_timed_out — bearer sent until each node beats"),
+    }
+    // The KV is empty after the bus was down longer than its TTL (a reboot,
+    // a stack upgrade): ask the controller's own agent directly, so the
+    // first self-agent call (a kiosk mint's whois) does not carry the bearer.
+    if let Ok(base) = crate::routes::self_agent_base() {
+        learn_self_agent(crate::tls::cluster_client(), base, SELF_PROBE_TRIES, SELF_PROBE_GAP).await;
     }
 }
 
@@ -174,16 +186,109 @@ const NO_LEAF_ONLY_LOG_EVERY: std::time::Duration = std::time::Duration::from_se
 
 /// [`header_for`] for the controller's OWN agent, reached by
 /// `bootstrap::self_agent_base` (a configured URL that need not match the
-/// address on its record): leaf-only also when the self node reported it.
+/// address on its record): leaf-only also when the self node reported it,
+/// or, before its first beat, when the startup probe found it admits the leaf.
 pub(crate) fn header_for_self(url: &str) -> Option<(String, String)> {
-    let self_flagged = LEAF_ONLY
-        .read()
-        .map(|m| m.values().any(|a| a.self_node))
-        .unwrap_or(false);
-    if self_flagged {
+    if self_flagged() {
         return None;
     }
     header_for(url)
+}
+
+/// The self agent admits the leaf alone: its node reported it, or (before
+/// its first beat) the startup probe found it does.
+fn self_flagged() -> bool {
+    LEAF_ONLY.read().map(|m| m.values().any(|a| a.self_node)).unwrap_or(false)
+}
+
+// ── The controller's own agent, before its first heartbeat ─────────
+//
+// `header_for_self` used to know the self agent only from its heartbeat.
+// The `mesh_nodes` KV has a 120 s TTL, so after the bus was down longer than
+// that (a reboot, a stack upgrade that recreates NATS) `seed` finds nothing,
+// and every self-agent call before that agent's first beat carried
+// `NOO_NODE_AGENT_TOKEN`. On pop-os 2026-10-28 the kiosk seat's keyless mint
+// (`/api/kiosk/token/tailnet` → `GET /tailnet/whois`) landed 17 s after the
+// gateway started and before the beat: the agent's `static_token` lane
+// counted it, the only static-token use left in the fleet.
+//
+// So at startup the gateway asks its own agent's `/health` with its leaf and
+// NO bearer. The agent answers the node detail (`node_id`) without a bearer
+// only to a caller it admits by the controller's leaf
+// (`auth.IsControllerLeafWithoutBearer`, the predicate `ControllerLeafOrToken`
+// admits on), so a detailed answer IS the capability. A bare answer (an agent
+// that does not verify client certificates) keeps the bearer; no answer
+// leaves it too, and the probe is retried until the agent answers or beats.
+
+/// Map key for what the startup probe learned. Not a node id (node ids never
+/// start with a NUL); [`note`] for the self node replaces it.
+const SELF_PROBE_KEY: &str = "\u{0}self-agent-probe";
+const SELF_PROBE_TRIES: u32 = 30;
+/// The self node has beaten since this gateway started: the probe is moot.
+static SELF_BEAT_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn self_beat_seen() -> bool {
+    SELF_BEAT_SEEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+const SELF_PROBE_GAP: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Did the self agent's `/health`, asked with no bearer, answer with the node
+/// detail? It does only for a caller it admitted by the controller's leaf.
+pub(crate) fn self_agent_admits_leaf(health: &Value) -> bool {
+    health.get("node_id").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty())
+}
+
+/// Record the startup probe's answer. Ignored once the self node has beaten:
+/// its report is the authority.
+fn note_self_probe(admitted: bool) {
+    let Ok(mut map) = LEAF_ONLY.write() else { return };
+    if self_beat_seen() {
+        return;
+    }
+    map.remove(SELF_PROBE_KEY);
+    if admitted {
+        map.insert(SELF_PROBE_KEY.to_string(), Agent { authorities: Vec::new(), self_node: true });
+    }
+}
+
+/// Ask the self agent at `base` once (its `/health`, no bearer, the
+/// gateway's leaf on `client`). `None`: no answer.
+pub(crate) async fn probe_self_agent(client: &reqwest::Client, base: &str) -> Option<bool> {
+    let mut u = reqwest::Url::parse(base.trim()).ok()?;
+    u.set_path("/health");
+    u.set_query(None);
+    let resp = client.get(u).timeout(std::time::Duration::from_secs(3)).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    Some(self_agent_admits_leaf(&resp.json::<Value>().await.ok()?))
+}
+
+/// Learn the self agent's credential before its first beat. The first try is
+/// awaited (startup, before the router serves); while the agent does not
+/// answer, the rest run in the background every `gap`, stopping at the first
+/// answer or once its heartbeat has said.
+pub(crate) async fn learn_self_agent(client: reqwest::Client, base: String, tries: u32, gap: std::time::Duration) {
+    if self_beat_seen() {
+        return;
+    }
+    if let Some(admitted) = probe_self_agent(&client, &base).await {
+        note_self_probe(admitted);
+        tracing::info!(agent = %base, leaf_only = admitted, "self agent credential learned before its first heartbeat");
+        return;
+    }
+    tokio::spawn(async move {
+        for _ in 1..tries {
+            tokio::time::sleep(gap).await;
+            if self_beat_seen() {
+                return;
+            }
+            if let Some(admitted) = probe_self_agent(&client, &base).await {
+                note_self_probe(admitted);
+                tracing::info!(agent = %base, leaf_only = admitted, "self agent credential learned before its first heartbeat");
+                return;
+            }
+        }
+    });
 }
 
 /// The legacy bearer: `NOO_NODE_AGENT_TOKEN` when set, else none. Never a
@@ -300,6 +405,7 @@ pub(crate) fn clear_for_test() {
     if let Ok(mut m) = LEAF_ONLY.write() {
         m.clear();
     }
+    SELF_BEAT_SEEN.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -413,6 +519,127 @@ mod tests {
             note("host8", &json!({"ip_address": "100.64.0.1", "self_node": true, CAPABILITY: true}));
             assert!(header_for_self("https://controller.tail:8081").is_none());
         });
+    }
+
+    // ── the self agent before its first beat ─────────────────────────
+
+    /// A stand-in controller self agent. `/health` answers the node detail
+    /// to a caller with no bearer only when `admits_leaf` (what a current
+    /// agent does for the controller's leaf), the bare liveness shape
+    /// otherwise; `/tailnet/whois` records the Authorization header each call
+    /// carried (`None` = none), which is what the agent's `static_token`
+    /// lane counts.
+    async fn fake_self_agent(admits_leaf: bool) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>) {
+        use axum::routing::get;
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>> = Default::default();
+        let seen_c = seen.clone();
+        let app = axum::Router::new()
+            .route(
+                "/health",
+                get(move |h: axum::http::HeaderMap| async move {
+                    let mut body = json!({"status": "healthy", "version": "0.6.13"});
+                    if admits_leaf && h.get("authorization").is_none() {
+                        body["node_id"] = json!("pop-os");
+                    }
+                    axum::Json(body)
+                }),
+            )
+            .route(
+                "/tailnet/whois",
+                get(move |h: axum::http::HeaderMap| async move {
+                    let auth = h.get("authorization").and_then(|v| v.to_str().ok()).map(str::to_string);
+                    seen_c.lock().unwrap().push(auth);
+                    axum::Json(json!({"name": "homeserver"}))
+                }),
+            );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (url, seen)
+    }
+
+    /// The kiosk mint's whois, as `routes::kiosk` sends it.
+    async fn self_whois(base: &str) {
+        crate::node_link::NodeLink::self_agent_at(base.to_string())
+            .request(reqwest::Method::GET, "/tailnet/whois?ip=100.111.73.72")
+            .into_http()
+            .send()
+            .await
+            .unwrap();
+    }
+
+    /// The pop-os 2026-10-28 case: the gateway starts with an empty
+    /// `mesh_nodes` KV (the bus was down past its TTL), and the first call to
+    /// its own agent comes before that agent's first heartbeat. The startup
+    /// step must already have learned that the agent admits the leaf, so the
+    /// call carries no bearer and the agent's `static_token` lane stays 0.
+    #[test]
+    fn the_first_self_agent_call_after_a_restart_with_an_empty_kv_carries_no_bearer() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        clear_for_test();
+        with_token(|| {
+            rt().block_on(async {
+                let (agent, seen) = fake_self_agent(true).await;
+                // Startup: the KV seed found nothing (cleared above), then
+                // the self-agent step.
+                learn_self_agent(reqwest::Client::new(), agent.clone(), 1, std::time::Duration::ZERO).await;
+                self_whois(&agent).await;
+                assert_eq!(
+                    seen.lock().unwrap().as_slice(),
+                    &[None],
+                    "a self agent that admits the controller's leaf must get no bearer before its first beat"
+                );
+            });
+        });
+    }
+
+    /// An agent that answers only the bare liveness shape (it does not verify
+    /// client certificates) keeps the bearer, and so does one that never
+    /// answers.
+    #[test]
+    fn a_self_agent_that_does_not_admit_the_leaf_or_does_not_answer_keeps_the_bearer() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        clear_for_test();
+        with_token(|| {
+            rt().block_on(async {
+                let (agent, seen) = fake_self_agent(false).await;
+                learn_self_agent(reqwest::Client::new(), agent.clone(), 1, std::time::Duration::ZERO).await;
+                self_whois(&agent).await;
+                assert_eq!(seen.lock().unwrap().as_slice(), &[Some("Bearer static-test-token".to_string())]);
+
+                clear_for_test();
+                learn_self_agent(reqwest::Client::new(), "http://127.0.0.1:9".into(), 1, std::time::Duration::ZERO).await;
+                assert!(header_for_self("http://127.0.0.1:9").is_some(), "no answer: the bearer stays");
+            });
+        });
+    }
+
+    /// The self node's first beat is the authority over what the probe
+    /// learned: a beat that does not report the capability brings the
+    /// bearer back, and a late probe answer does not override a beat.
+    #[test]
+    fn the_self_nodes_beat_replaces_the_probe() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        clear_for_test();
+        with_token(|| {
+            note_self_probe(true);
+            assert!(header_for_self("https://controller.tail:8081").is_none());
+            note("pop-os", &json!({"ip_address": "100.72.99.2", "self_node": true}));
+            assert!(header_for_self("https://controller.tail:8081").is_some(), "the beat said no: bearer");
+            note_self_probe(true);
+            assert!(header_for_self("https://controller.tail:8081").is_some(), "a late probe never overrides a beat");
+            note("pop-os", &json!({"ip_address": "100.72.99.2", "self_node": true, CAPABILITY: true}));
+            note_self_probe(false);
+            assert!(header_for_self("https://controller.tail:8081").is_none(), "nor the other way");
+        });
+    }
+
+    #[test]
+    fn the_leaf_capability_is_read_only_from_a_node_id_in_the_answer() {
+        assert!(self_agent_admits_leaf(&json!({"status": "healthy", "node_id": "pop-os"})));
+        for v in [json!({"status": "healthy", "version": "0.6.13"}), json!({"node_id": ""}), json!({"node_id": 1}), json!({})] {
+            assert!(!self_agent_admits_leaf(&v), "{v}");
+        }
     }
 
     // ── the harness and its own agent ────────────────────────────────
