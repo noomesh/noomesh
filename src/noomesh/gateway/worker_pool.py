@@ -235,6 +235,17 @@ def _audit_principal_refusal(subject: str, exc: Exception) -> None:
         pass
 
 
+def error_text(e: BaseException) -> str:
+    """What a handler's failure says: its message, or else its type.
+
+    ``str(e)`` is empty for a bare ``assert`` and many library errors, and a
+    blank error reached the operator as ``Worker error on worker.rag.query: ``
+    (0.6.13-rc.2/rc.3 rehearsal). A non-empty message is kept exactly: the
+    gateway and clients match on some of them.
+    """
+    return str(e) if str(e).strip() else type(e).__name__
+
+
 def error_reply(e: Exception) -> dict:
     """The bus reply for a handler that raised.
 
@@ -242,7 +253,7 @@ def error_reply(e: Exception) -> dict:
     message text) so the gateway can answer a 4xx rather than a 503. An old
     gateway ignores the extra key; an old worker never sends it.
     """
-    response = {"success": False, "error": str(e)}
+    response = {"success": False, "error": error_text(e)}
     kind = getattr(e, "error_kind", None)
     if isinstance(kind, str):
         response["error_kind"] = kind
@@ -298,7 +309,9 @@ async def _handle_request(msg) -> None:
             result = await handler(request)
         response = {"success": True, "data": result}
     except Exception as e:
-        log.warning("worker.handler_error", subject=subject, error=str(e))
+        # With the traceback: the reply carries only the text, so this line
+        # is the one place that says where it failed.
+        log.warning("worker.handler_error", subject=subject, error=error_text(e), exc_info=True)
         response = error_reply(e)
 
     if msg.reply:
