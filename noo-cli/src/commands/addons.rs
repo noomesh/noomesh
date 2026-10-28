@@ -1043,12 +1043,15 @@ pub fn addons_check(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     json!({
                         "addon": name, "dir": dir, "ok": true, "third_party": third_party, "core": "embedded",
                         "checked": {"secrets_declared": c.declared, "secret_references": c.referenced, "interpolations": c.interpolated, "mounts": c.mounts},
+                        "not_checked": crate::addons::check::NOT_CHECKED,
                     })
                 );
             } else {
-                ui::done(&format!("{name}: the bundle in {dir} passes the checks `noo addons enable` runs on its files"));
+                ui::done(&format!("{name}: the bundle in {dir} passes enable's guard and resources checks"));
                 let who = if third_party { "third-party" } else { "first-party" };
-                println!("{}", ui::note(&format!("checked as {who}, against the compose files embedded in this noo; no signature, trust key or image was checked")));
+                println!("{}", ui::note(&format!("checked as {who}, against the compose files embedded in this noo")));
+                // A pass here is not "enable will accept it": say what can still refuse it.
+                println!("{}", ui::note(&format!("not checked here: {}", crate::addons::check::NOT_CHECKED.join(", "))));
             }
             Ok(0)
         }
