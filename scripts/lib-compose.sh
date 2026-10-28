@@ -44,13 +44,46 @@ fi
 [ -n "${_NOO_LIB_ADDONS_LOADED:-}" ] || . "$_lib_compose_dir/lib-addons.sh"
 [ -n "${_NOO_LIB_DIST_LOADED:-}" ]   || . "$_lib_compose_dir/lib-dist.sh"
 
+# What the NVIDIA GPU is doing: "ok" (answers a real query), "lost" (the box
+# has a card or a driver, and the driver cannot read it: i277e, Xid 79/154,
+# "GPU has fallen off the bus"), or "none" (no NVIDIA anything). `nvidia-smi
+# -L` alone is not enough: it can list the card while the device-handle call
+# the container runtime makes fails. NOO_COMPOSE_GPU=1|0 overrides (tests,
+# headless boxes); 0 reads "none", the operator's choice of CPU.
+_compose_gpu_state() {
+    case "${NOO_COMPOSE_GPU:-}" in
+        1) echo ok; return 0 ;;
+        0) echo none; return 0 ;;
+    esac
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        if nvidia-smi -L >/dev/null 2>&1 \
+            && nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | grep -qE '^[[:space:]]*[0-9]+'; then
+            echo ok
+        else
+            echo lost
+        fi
+        return 0
+    fi
+    # No nvidia-smi at all: a card on the bus still means the driver is gone.
+    if command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -qiE '(vga|3d|display).*nvidia'; then
+        echo lost
+    else
+        echo none
+    fi
+}
+
 # A GPU the base can hand to ollama-embed? Probe, unless told.
 _compose_gpu_visible() {
-    case "${NOO_COMPOSE_GPU:-}" in
-        1) return 0 ;;
-        0) return 1 ;;
-    esac
-    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1
+    [ "$(_compose_gpu_state)" = ok ]
+}
+
+# One line when the driver lost the GPU, naming the cause and the choice.
+# The overlay is then NOT requested (_compose_gpu_visible is false), so the
+# embedder starts on CPU and the core never waits on a device that cannot
+# answer. Silent otherwise. Launchers call it once, after the file list.
+compose_gpu_notice() {
+    [ "$(_compose_gpu_state)" = lost ] || return 0
+    echo "  the NVIDIA driver lost the GPU: reboot, or NOO_COMPOSE_GPU=0 noo stack restart to run the embedder on CPU (starting it on CPU now; reboot to get the GPU back)" >&2
 }
 
 compose_file_list() {

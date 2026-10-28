@@ -192,6 +192,7 @@ fi
 . "$_LIBDIR/lib-compose.sh"
 . "$_LIBDIR/lib-restart.sh"
 COMPOSE_FILES="$(compose_file_args .)"
+compose_gpu_notice
 
 # Standalone: the single ollama-embed serves chat too (gateway static
 # fallback, stack-v0.2.5). An install whose .env predates that (0.3.31
