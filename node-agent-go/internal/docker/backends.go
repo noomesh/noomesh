@@ -166,6 +166,14 @@ type BackendSpec struct {
 	MemoryLimit   int64   // bytes, 0 = unlimited
 	CPULimit      float64 // cores, 0 = unlimited
 
+	// ReadOnlyRoot runs the container on a read-only root filesystem with a
+	// tmpfs /tmp (rootFloor). Set only for an image whose write set was
+	// measured empty outside its mounts (`docker diff` on a running
+	// container): llama-server (awolf, 2026-10-28, a day of serving: no
+	// write). vLLM, ollama and TEI write caches into their image paths and
+	// are not set until measured with a writable cache mount (i301).
+	ReadOnlyRoot bool
+
 	// DisableHealthcheck turns the image's baked-in HEALTHCHECK off. The
 	// harness runs from the gateway image, whose probe hits
 	// the gateway's own port — a port the harness never opens.
@@ -308,6 +316,8 @@ var backendSpecs = map[string]BackendSpec{
 		// pull the multi-arch upstream image.
 		Image:         envOr("LLAMACPP_IMAGE", llamacppDefaultImage()),
 		ContainerName: "noo-llamacpp",
+		// llama-server writes nothing outside /models (read-only too).
+		ReadOnlyRoot: true,
 		Env: map[string]string{
 			"MODEL_PATH": "${LLAMACPP_MODEL:-/models/llama-7b-Q5_K_M.gguf}",
 			// "auto" sentinel — buildEnvList resolves it to "999" (offload
@@ -517,6 +527,7 @@ func rerankerSpecLlamacpp() BackendSpec {
 	return BackendSpec{
 		Image:         envOr("RERANK_IMAGE", llamacppDefaultImage()),
 		ContainerName: "noo-reranker",
+		ReadOnlyRoot:  true, // llama-server, as the llamacpp backend
 		Env: map[string]string{
 			"MODEL_PATH": "/models/${RERANK_MODEL:-bge-reranker-v2-m3-Q8_0.gguf}",
 			// Both default images (hardened x86 + upstream ghcr :server) are
@@ -1019,6 +1030,7 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 		CapDrop:       []string{"ALL"},
 		CapAdd:        backendCaps(),
 	}
+	rootFloor(hostCfg, spec.ReadOnlyRoot)
 
 	// Resource limits
 	if spec.MemoryLimit > 0 {
@@ -1679,6 +1691,25 @@ func parseGPUCount(s string) int {
 	n := 1
 	fmt.Sscanf(s, "%d", &n)
 	return n
+}
+
+// rootTmpfs is the scratch a read-only-root container gets: /tmp only,
+// bounded, never executable.
+var rootTmpfs = map[string]string{"/tmp": "rw,noexec,nosuid,nodev,size=64m"}
+
+// rootFloor puts a container on a read-only root filesystem with a tmpfs
+// /tmp when readOnly is set (BackendSpec.ReadOnlyRoot, the door sidecars):
+// whatever runs in it cannot rewrite its own binaries or plant a file the
+// next start would read.
+func rootFloor(hostCfg *container.HostConfig, readOnly bool) {
+	if !readOnly {
+		return
+	}
+	hostCfg.ReadonlyRootfs = true
+	hostCfg.Tmpfs = map[string]string{}
+	for k, v := range rootTmpfs {
+		hostCfg.Tmpfs[k] = v
+	}
 }
 
 // backendCapsDefault is the capability set every backend container keeps

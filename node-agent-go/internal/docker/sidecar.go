@@ -304,6 +304,9 @@ func (c *Client) startSidecar(ctx context.Context, backend, image, networkName s
 		CapDrop:       []string{"ALL"},
 		CapAdd:        caps,
 	}
+	// Read-only root: the door writes only its conf, to the /tmp tmpfs.
+	// Not on the alpine fallback, whose entrypoint installs stunnel first.
+	rootFloor(hostCfg, image != stunnelFallbackImage)
 	// macOS: the door (this sidecar's accept port) on host loopback only —
 	// the agent cannot route to a Docker Desktop bridge IP (LoopbackDoorPublish).
 	if LoopbackDoorPublish() {

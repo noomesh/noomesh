@@ -505,6 +505,11 @@ Every container the agent creates on a controller's instruction runs with:
   works through device cgroups and bind-mounted driver libraries.
 - skills and managed containers additionally run as a non-root user with a
   process cap.
+- a read-only root filesystem with a tmpfs `/tmp` for llama.cpp, the
+  llama.cpp reranker and every door sidecar (except on the `alpine` fallback
+  image): their write set outside their mounts is empty. vLLM, Ollama and TEI
+  keep a writable root until theirs is moved to a cache mount
+  ([networks and containers](networks-and-containers.md#container-hardening)).
 
 `NOO_BACKEND_CAP_ADD` (node-local) widens the backend set for an image that
 genuinely needs more; `NOO_CONTAINER_RUN_USER` and
