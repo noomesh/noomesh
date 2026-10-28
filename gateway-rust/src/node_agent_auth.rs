@@ -416,6 +416,12 @@ mod tests {
     // One lock: the map is process-global and cargo runs tests in threads.
     use super::TEST_SERIAL as SERIAL;
 
+    // The stand-in NODE AGENT's whois path. It is the agent's route, not the
+    // gateway's: a const keeps scripts/check-openapi-drift.py (which reads
+    // `.route("…")` literals under gateway-rust/src) from listing it as an
+    // undocumented gateway route.
+    const AGENT_WHOIS: &str = "/tailnet/whois";
+
     fn with_token<R>(f: impl FnOnce() -> R) -> R {
         // The bearer reads the environment; give it a value to send. No
         // other test reads or writes this variable.
@@ -545,7 +551,7 @@ mod tests {
                 }),
             )
             .route(
-                "/tailnet/whois",
+                AGENT_WHOIS,
                 get(move |h: axum::http::HeaderMap| async move {
                     let auth = h.get("authorization").and_then(|v| v.to_str().ok()).map(str::to_string);
                     seen_c.lock().unwrap().push(auth);
