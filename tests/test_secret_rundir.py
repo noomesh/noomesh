@@ -463,3 +463,33 @@ def test_the_intel_overlay_in_its_repo_uses_file_secrets() -> None:
         pytest.skip("the trellion-intel checkout is not beside this one")
     plan = subprocess.run(["bash", "-c", f". {LIB}; _secret_form_conflicts {p}"], capture_output=True, text=True).stdout
     assert plan == "", plan
+
+
+def _plan(compose: Path) -> dict[str, str]:
+    out = subprocess.run(
+        ["bash", "-c", f". {LIB} >/dev/null 2>&1; _secret_file_plan {compose}"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    rows = {line.split()[0]: line.split()[2] for line in out.splitlines() if line.strip()}
+    assert rows, f"the plan read no secret from {compose}: {out!r}"
+    return rows
+
+
+def test_a_signed_addon_bundles_swarm_uid_still_owns_its_file(tmp_path: Path) -> None:
+    # trellion-intel v0.1.4 (signed for 0.6.13-rc.2) still writes the
+    # Swarm-era `uid:` on its gateway key; reading only x-noo-uid (#387) left
+    # that file root-owned 0400 and intel crash-looped on every start.
+    c = tmp_path / "docker-compose.addon.yml"
+    c.write_text(
+        "services:\n"
+        "  addon:\n    secrets:\n"
+        '      - { source: k, target: noo_gateway_key, uid: "65532", gid: "65532", mode: 0400 }\n'
+        "  both:\n    secrets:\n"
+        '      - { source: y, target: y, x-noo-uid: "70", uid: "65532" }\n'
+        "secrets:\n"
+        "  k:\n    file: ${NOO_SECRET_RUNDIR:-/nonexistent/u}/k\n    x-noo-source: K\n"
+        "  y:\n    file: ${NOO_SECRET_RUNDIR:-/nonexistent/u}/y\n    x-noo-source: Y\n"
+    )
+    plan = _plan(c)
+    assert plan["k"] == "65532", plan
+    assert plan["y"] == "70", "x-noo-uid wins over a Swarm uid on the same entry"
