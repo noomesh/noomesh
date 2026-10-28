@@ -562,7 +562,7 @@ pub fn pki_fix_modes(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .map(|i| vec![ui::glyph_cell(Glyph::Warn), i.rel.clone(), format!("{:04o}", i.mode), i.reader.describe(), format!("Would {}", match i.kind {
                 crate::pki::KeyIssueKind::Exposed => "tighten",
                 crate::pki::KeyIssueKind::Unreadable => "hand to its reader",
-                crate::pki::KeyIssueKind::UnknownReader => "leave (no reader entry)",
+                crate::pki::KeyIssueKind::UnknownReader => "tighten to 0600 (no reader entry)",
                 crate::pki::KeyIssueKind::WrongOwner => "leave (owned by another uid; needs the sudo line)",
             })])
             .collect();

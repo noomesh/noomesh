@@ -2674,7 +2674,6 @@ mod tests {
     struct FakeRoot { root: PathBuf, work: PathBuf, log: PathBuf, cfg: SeatConfig }
     impl FakeRoot {
         fn new(tag: &str) -> FakeRoot {
-            use std::os::unix::fs::PermissionsExt as _;
             let root = std::env::temp_dir().join(format!("noo-seat-root-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             for d in ["etc/systemd/system", "usr/local/bin", "home/alex", "_shims", "_work"] {
@@ -2683,8 +2682,7 @@ mod tests {
             let real_install = ["/usr/bin/install", "/bin/install"].into_iter().find(|p| Path::new(p).exists()).expect("coreutils install");
             let shim = |n: &str, body: String| {
                 let p = root.join("_shims").join(n);
-                std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
-                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+                crate::test_exec::write_exec(&p, format!("#!/bin/sh\n{body}"), 0o755);
             };
             shim("install", format!(r#"o=-; g=-; m=-; d=no; last=
 n=$#
