@@ -1545,11 +1545,11 @@ services:
     profiles: ["llamacpp", "cpu"]
     # No host port, and no TLS of its own: llama-server has no TLS listener
     # in either image, so every caller reaches it through stunnel-llamacpp
-    # below (mTLS, client cert required) at noo-stunnel-llamacpp:8085. Its
-    # own :8085 stays reachable on the shared noo-cluster network until the
-    # backends get a private network — the sidecar is the
-    # door every client is pointed at; the private network makes it the
-    # only one. Use `docker exec` for debugging.
+    # below (mTLS, client cert required) at noo-stunnel-llamacpp:8085. It
+    # runs in the sidecar's network namespace and listens on 127.0.0.1 only
+    # (door generation 3, F-ii): no other container and no host process can
+    # reach its plain :8085, so the sidecar is the only door. Use
+    # `docker exec` for debugging.
     #
     # Mounts nothing from the PKI directory: it reads nothing there (#506
     # said the same of the agent-started one), and the leaf it used to hold
@@ -1562,7 +1562,7 @@ services:
       # Pin the cluster contract port — overrides any stale ENV baked into
       # an old image (a host8 build listened on 8080 and broke all routed
       # inference to the node while its healthcheck stayed green).
-      - HOST=0.0.0.0
+      - HOST=127.0.0.1
       - PORT=${LLAMACPP_PORT:-8085}
     volumes:
       - ${MODELS_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/models}:/models:ro
@@ -1576,9 +1576,12 @@ services:
         limits:
           cpus: '4'
           memory: 8G
-    networks:
-      - noo-cluster
+    # In its door's network namespace (door generation 3): no network of
+    # its own, listening on 127.0.0.1, reachable only through stunnel-llamacpp.
+    network_mode: "service:stunnel-llamacpp"
     restart: unless-stopped
+    depends_on:
+      - stunnel-llamacpp
 
   # stunnel mTLS sidecar for llama.cpp (same shape as stunnel-ollama).
   # Accepts on :8085 — the port every client already dials for llamacpp —
@@ -1596,6 +1599,9 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-llamacpp
+    # The name its stunnel.conf accepts on (its bridge address, not
+    # 0.0.0.0): llamacpp listens on 127.0.0.1 in this namespace.
+    hostname: noo-stunnel-llamacpp
     user: nonroot
     entrypoint: *stunnel-self-pin
     environment:
@@ -1608,8 +1614,6 @@ services:
     networks:
       - noo-cluster
     restart: unless-stopped
-    depends_on:
-      - llamacpp
 
   # AirLLM backend
   airllm:
@@ -1667,7 +1671,7 @@ services:
       # Ollama sends no telemetry; this stops it handing a prompt to ollama.com
       # (cloud models, web search). docs/security/telemetry.md
       - OLLAMA_NO_CLOUD=1
-      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_HOST=127.0.0.1
       # Default empty (was qwen3:8b — non-US). Ollama starts without auto-pulling
       # a model; models are placed explicitly (noo cluster place / ship-model),
       # so the fleet stays US-vendor (model governance).
@@ -1681,9 +1685,12 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    networks:
-      - noo-cluster
+    # In its door's network namespace (door generation 3): no network of
+    # its own, listening on 127.0.0.1, reachable only through stunnel-ollama.
+    network_mode: "service:stunnel-ollama"
     restart: unless-stopped
+    depends_on:
+      - stunnel-ollama
 
   # Ollama for the standalone profile: the single ollama that serves the
   # embedder (harrier) AND chat on a one-box install (controller profiles
@@ -1698,15 +1705,14 @@ services:
     # below — mTLS, client certificate required: the containers (gateway,
     # worker, trellion's embedder) at https://noo-stunnel-ollama-embed:11434
     # (onboard's topology env, the launchers' default), and the HOST
-    # node-agent at the sidecar's loopback publish. Its own
-    # :11434 stays reachable on the shared noo-cluster network beside the
-    # sidecar until the backends get a private network (an earlier change
-    # F-ii), same caveat as llamacpp above.
+    # node-agent at the sidecar's loopback publish. Its own plain :11434 is on
+    # 127.0.0.1 inside the sidecar's namespace, reachable by nothing else
+    # (door generation 3, as llamacpp above).
     environment:
       # Ollama sends no telemetry; this stops it handing a prompt to ollama.com
       # (cloud models, web search). docs/security/telemetry.md
       - OLLAMA_NO_CLOUD=1
-      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_HOST=127.0.0.1
       # Concurrent requests per loaded model (declared, documented in
       # docs/reference/env.md). Embed requests carry options.num_ctx=1024
       # (gateway embedding_client.rs EMBED_NUM_CTX), so 4 slots cost ~4K
@@ -1716,9 +1722,12 @@ services:
       - OLLAMA_NUM_PARALLEL=${OLLAMA_EMBED_NUM_PARALLEL:-4}
     volumes:
       - ollama-embed-data:/root/.ollama
-    networks:
-      - noo-cluster
+    # In its door's network namespace (door generation 3): no network of
+    # its own, listening on 127.0.0.1, reachable only through stunnel-ollama-embed.
+    network_mode: "service:stunnel-ollama-embed"
     restart: unless-stopped
+    depends_on:
+      - stunnel-ollama-embed
 
   # OPTIONAL CPU-only embedder beside ollama-embed (profile `embed-cpu`,
   # off unless enabled). A second ollama with NO GPU device request and
@@ -1736,11 +1745,11 @@ services:
     image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama-embed-cpu
     profiles: ["embed-cpu"]
-    # Publishes nothing; only stunnel-ollama-embed-cpu reaches it (the
-    # same shared-network caveat as ollama-embed above).
+    # Publishes nothing; only stunnel-ollama-embed-cpu reaches it (it lives
+    # in that sidecar's namespace on 127.0.0.1, as ollama-embed above).
     environment:
       - OLLAMA_NO_CLOUD=1
-      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_HOST=127.0.0.1
       # Hide every GPU: this instance is CPU-only by declaration.
       - CUDA_VISIBLE_DEVICES=-1
       - NVIDIA_VISIBLE_DEVICES=none
@@ -1750,10 +1759,12 @@ services:
       - OLLAMA_KEEP_ALIVE=-1
     volumes:
       - ollama-embed-data:/root/.ollama
-    networks:
-      - noo-cluster
+    # In its door's network namespace (door generation 3): no network of
+    # its own, listening on 127.0.0.1, reachable only through stunnel-ollama-embed-cpu.
+    network_mode: "service:stunnel-ollama-embed-cpu"
     restart: unless-stopped
     depends_on:
+      - stunnel-ollama-embed-cpu
       - ollama-embed
 
   # mTLS door for ollama-embed-cpu: the same shape as stunnel-ollama-embed
@@ -1768,6 +1779,9 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-ollama-embed-cpu
+    # The name its stunnel.conf accepts on (its bridge address, not
+    # 0.0.0.0): ollama-embed-cpu listens on 127.0.0.1 in this namespace.
+    hostname: noo-stunnel-ollama-embed-cpu
     user: nonroot
     entrypoint: *stunnel-self-pin
     environment:
@@ -1778,7 +1792,7 @@ services:
       - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
       - ${NOO_PKI_DIR:-./.pki-placeholder}/services/ollama-embed-cpu:/tls/services/ollama-embed-cpu:ro
     healthcheck:
-      test: ["CMD-SHELL", "printf 'GET /api/version HTTP/1.0\r\nHost: localhost\r\n\r\n' | openssl s_client -quiet -verify_return_error -verify_hostname localhost -connect 127.0.0.1:11434 -CAfile /tls/ca.crt -cert /tls/services/ollama-embed-cpu/service.crt -key /tls/services/ollama-embed-cpu/service.key 2>/dev/null | grep -q 'HTTP/1.[01] 200' || exit 1"]
+      test: ["CMD-SHELL", "printf 'GET /api/version HTTP/1.0\r\nHost: localhost\r\n\r\n' | openssl s_client -quiet -verify_return_error -verify_hostname localhost -connect noo-stunnel-ollama-embed-cpu:11434 -CAfile /tls/ca.crt -cert /tls/services/ollama-embed-cpu/service.crt -key /tls/services/ollama-embed-cpu/service.key 2>/dev/null | grep -q 'HTTP/1.[01] 200' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -1786,8 +1800,6 @@ services:
     networks:
       - noo-cluster
     restart: unless-stopped
-    depends_on:
-      - ollama-embed-cpu
 
   # stunnel mTLS sidecar for ollama-embed (same shape as stunnel-llamacpp).
   # Accepts on :11434 — Ollama's own port — presents the `ollama-embed`
@@ -1821,6 +1833,9 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-ollama-embed
+    # The name its stunnel.conf accepts on (its bridge address, not
+    # 0.0.0.0): ollama-embed listens on 127.0.0.1 in this namespace.
+    hostname: noo-stunnel-ollama-embed
     user: nonroot
     entrypoint: *stunnel-self-pin
     environment:
@@ -1831,7 +1846,7 @@ services:
       - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
       - ${NOO_PKI_DIR:-./.pki-placeholder}/services/ollama-embed:/tls/services/ollama-embed:ro
     healthcheck:
-      test: ["CMD-SHELL", "printf 'GET /api/version HTTP/1.0\r\nHost: localhost\r\n\r\n' | openssl s_client -quiet -verify_return_error -verify_hostname localhost -connect 127.0.0.1:11434 -CAfile /tls/ca.crt -cert /tls/services/ollama-embed/service.crt -key /tls/services/ollama-embed/service.key 2>/dev/null | grep -q 'HTTP/1.[01] 200' || exit 1"]
+      test: ["CMD-SHELL", "printf 'GET /api/version HTTP/1.0\r\nHost: localhost\r\n\r\n' | openssl s_client -quiet -verify_return_error -verify_hostname localhost -connect noo-stunnel-ollama-embed:11434 -CAfile /tls/ca.crt -cert /tls/services/ollama-embed/service.crt -key /tls/services/ollama-embed/service.key 2>/dev/null | grep -q 'HTTP/1.[01] 200' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -1841,8 +1856,6 @@ services:
     networks:
       - noo-cluster
     restart: unless-stopped
-    depends_on:
-      - ollama-embed
 
   # Text Embeddings Inference — CPU (controller)
   # Runs on controller so embeddings work out of the box without a GPU.
@@ -1861,11 +1874,15 @@ services:
       - DO_NOT_TRACK=1
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - MODEL_ID=${TEI_MODEL:-BAAI/bge-base-en-v1.5}
+      - HOSTNAME=127.0.0.1
     volumes:
       - hf-cache:/data
-    networks:
-      - noo-cluster
+    # In its door's network namespace (door generation 3): no network of
+    # its own, listening on 127.0.0.1, reachable only through stunnel-tei.
+    network_mode: "service:stunnel-tei"
     restart: unless-stopped
+    depends_on:
+      - stunnel-tei
     command: ["--model-id", "${TEI_MODEL:-BAAI/bge-base-en-v1.5}"]
 
   # Text Embeddings Inference — GPU (worker nodes)
@@ -1887,6 +1904,7 @@ services:
       - DO_NOT_TRACK=1
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - MODEL_ID=${TEI_MODEL:-BAAI/bge-base-en-v1.5}
+      - HOSTNAME=127.0.0.1
     volumes:
       - hf-cache:/data
     deploy:
@@ -1896,11 +1914,13 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    networks:
-      - noo-cluster
+    # In its door's network namespace (door generation 3): no network of
+    # its own, listening on 127.0.0.1, reachable only through stunnel-tei-gpu.
+    network_mode: "service:stunnel-tei-gpu"
     restart: unless-stopped
+    depends_on:
+      - stunnel-tei-gpu
     command: ["--model-id", "${TEI_MODEL:-BAAI/bge-base-en-v1.5}", "--dtype", "float16"]
-
   stunnel-ollama:
     logging: *default-logging
     build:
@@ -1909,6 +1929,9 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-ollama
+    # The name its stunnel.conf accepts on (its bridge address, not
+    # 0.0.0.0): ollama listens on 127.0.0.1 in this namespace.
+    hostname: noo-stunnel-ollama
     user: nonroot
     entrypoint: *stunnel-self-pin
     environment:
@@ -1921,8 +1944,6 @@ services:
     networks:
       - noo-cluster
     restart: unless-stopped
-    depends_on:
-      - ollama
 
   # stunnel mTLS sidecar for TEI CPU (controller)
   stunnel-tei:
@@ -1933,6 +1954,9 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-tei
+    # The name its stunnel.conf accepts on (its bridge address, not
+    # 0.0.0.0): tei listens on 127.0.0.1 in this namespace.
+    hostname: noo-stunnel-tei
     user: nonroot
     profiles: ["tei-compose"]  # opt-in only (paired with noo-tei)
     volumes:
@@ -1942,8 +1966,6 @@ services:
     networks:
       - noo-cluster
     restart: unless-stopped
-    depends_on:
-      - tei
 
   # stunnel mTLS sidecar for TEI GPU (worker nodes)
   stunnel-tei-gpu:
@@ -1954,6 +1976,9 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-tei-gpu
+    # The name its stunnel.conf accepts on (its bridge address, not
+    # 0.0.0.0): tei-gpu listens on 127.0.0.1 in this namespace.
+    hostname: noo-stunnel-tei-gpu
     user: nonroot
     # Gated with tei-gpu — see above. Only needed for the compose path.
     profiles: ["tei-compose"]
@@ -1964,8 +1989,6 @@ services:
     networks:
       - noo-cluster
     restart: unless-stopped
-    depends_on:
-      - tei-gpu
 
   # Reranker — TEI serving a cross-encoder reranker model (GPU).
   # Same image family as `tei`; a reranker MODEL_ID makes TEI expose POST
@@ -1991,6 +2014,7 @@ services:
       - DO_NOT_TRACK=1
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - MODEL_ID=${RERANK_MODEL:-BAAI/bge-reranker-base}
+      - HOSTNAME=127.0.0.1
     volumes:
       - hf-cache:/data
     deploy:
@@ -2000,9 +2024,12 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    networks:
-      - noo-cluster
+    # In its door's network namespace (door generation 3): no network of
+    # its own, listening on 127.0.0.1, reachable only through stunnel-reranker.
+    network_mode: "service:stunnel-reranker"
     restart: unless-stopped
+    depends_on:
+      - stunnel-reranker
     command: ["--model-id", "${RERANK_MODEL:-BAAI/bge-reranker-base}", "--dtype", "float16"]
 
   # stunnel mTLS sidecar for the reranker (mirrors stunnel-tei-gpu)
@@ -2014,6 +2041,9 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-reranker
+    # The name its stunnel.conf accepts on (its bridge address, not
+    # 0.0.0.0): reranker listens on 127.0.0.1 in this namespace.
+    hostname: noo-stunnel-reranker
     user: nonroot
     # Gated with reranker — see above. Only needed for the compose path.
     profiles: ["tei-compose"]
@@ -2024,8 +2054,6 @@ services:
     networks:
       - noo-cluster
     restart: unless-stopped
-    depends_on:
-      - reranker
 
   # Node agent (runs on all nodes)
   node-agent:

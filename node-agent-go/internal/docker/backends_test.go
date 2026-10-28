@@ -516,9 +516,9 @@ func TestVLLMEntrypointRequiresAClientCertificate(t *testing.T) {
 // container's own port; the image order tries a built stunnel before the
 // alpine fallback; no host port is ever published.
 func TestSidecarSpec(t *testing.T) {
-	conf := stunnelConf("llamacpp", 8085, "noo-llamacpp", 8085)
+	conf := stunnelConf("llamacpp", "noo-stunnel-llamacpp", 8085, 8085)
 	for _, needle := range []string{
-		"verify = 2", "accept = 0.0.0.0:8085", "connect = noo-llamacpp:8085",
+		"verify = 2", "accept = noo-stunnel-llamacpp:8085", "connect = 127.0.0.1:8085",
 		"cert = /tls/services/llamacpp/service.crt", "key = /tls/services/llamacpp/service.key",
 		"CAfile = /tls/ca.crt", "foreground = yes",
 	} {
@@ -593,6 +593,90 @@ func TestSidecarSpec(t *testing.T) {
 	}
 	if src, err := os.ReadFile("sidecar.go"); err == nil && strings.Contains(string(src), "PortBindings") {
 		t.Error("sidecar.go publishes a host port")
+	}
+}
+
+// Door generation 3 (followup 1234 F-ii): the sidecar is the ONLY door.
+// The fronted engine runs in its sidecar's network namespace on loopback;
+// the sidecar accepts on its own bridge address, never 0.0.0.0 (which would
+// also take 127.0.0.1:<port> from an engine on the same port), and connects
+// to loopback. Each failure here reopens a plaintext port to the bridge.
+func TestTheSidecarIsTheOnlyDoor(t *testing.T) {
+	if BackendDoorGeneration < 3 {
+		t.Fatalf("BackendDoorGeneration = %d: placed backends would keep the bridge shape", BackendDoorGeneration)
+	}
+	for _, b := range []string{"llamacpp", "ollama", "embedding", "reranker"} {
+		if got, want := DoorNetworkMode(b), "container:"+SidecarContainerFor(b); got != want {
+			t.Errorf("%s network mode %q, want %q", b, got, want)
+		}
+		conf := stunnelConf(SidecarFor(b), SidecarContainerFor(b), DoorPort(b), 1234)
+		if strings.Contains(conf, "0.0.0.0") || !strings.Contains(conf, "accept = "+SidecarContainerFor(b)+":") ||
+			!strings.Contains(conf, "connect = 127.0.0.1:1234") {
+			t.Errorf("%s conf:\n%s", b, conf)
+		}
+	}
+	if DoorNetworkMode("vllm") != "" || DoorNetworkMode("airllm") != "" {
+		t.Error("only a fronted backend joins a sidecar's namespace")
+	}
+	// Every engine's bind knob, pinned to loopback with the connect port.
+	env := privateDoorEnv(11434)
+	for k, want := range map[string]string{
+		"HOST": "127.0.0.1", "LLAMA_ARG_HOST": "127.0.0.1", "LLAMA_ARG_PORT": "11434",
+		"OLLAMA_HOST": "127.0.0.1:11434", "HOSTNAME": "127.0.0.1",
+	} {
+		if env[k] != want {
+			t.Errorf("privateDoorEnv[%s] = %q, want %q", k, env[k], want)
+		}
+	}
+
+	src, err := os.ReadFile("backends.go")
+	if err != nil {
+		t.Skip("source not readable from the test dir")
+	}
+	body := string(src)
+	start := strings.Index(body, "func (c *Client) StartBackendSDK(")
+	end := strings.Index(body, "func (c *Client) StopBackendSDK(")
+	if start < 0 || end < start {
+		t.Fatal("StartBackendSDK not found")
+	}
+	fn := body[start:end]
+	// The loopback env goes on after the placement's ExtraEnv, so no
+	// placement can put the engine back on the bridge.
+	if i, j := strings.Index(fn, "overrides.ExtraEnv"), strings.Index(fn, "privateDoorEnv("); i < 0 || j < i {
+		t.Error("privateDoorEnv must be applied after the placement's ExtraEnv")
+	}
+	// The namespace owner exists before the engine is created in it.
+	if i, j := strings.Index(fn, "c.startSidecar("), strings.Index(fn, "c.docker.ContainerCreate("); i < 0 || j < i {
+		t.Error("the sidecar must start before the engine container is created")
+	}
+	if !strings.Contains(fn, "hostCfg.NetworkMode = container.NetworkMode(mode)") {
+		t.Error("the engine must be created in DoorNetworkMode")
+	}
+	if strings.Contains(body, `"0.0.0.0"`) {
+		t.Error("a backend spec binds 0.0.0.0; fronted engines listen on doorLoopback")
+	}
+}
+
+// judgeEngineDoor: the generation-3 rows for a fronted engine.
+func TestJudgeEngineDoor(t *testing.T) {
+	sidecars := map[string]string{"abc123def4567890": "noo-stunnel-llamacpp"}
+	early, late := "2026-10-28T10:00:00.000000001Z", "2026-10-28T10:05:00Z"
+	for _, tc := range []struct {
+		name, mode, eng, sc string
+		want                engineDoorShape
+	}{
+		{"bridge (pre-generation-3)", "noo-cluster", early, late, engineOnBridge},
+		{"default bridge", "", "", "", engineOnBridge},
+		{"in its door, by id", "container:abc123def4567890", late, early, engineInDoor},
+		{"in its door, by name", "container:noo-stunnel-llamacpp", late, early, engineInDoor},
+		{"in its door, short id", "container:abc123def456", late, early, engineInDoor},
+		{"start times unknown", "container:abc123def4567890", "", "", engineInDoor},
+		{"sidecar restarted after the engine", "container:abc123def4567890", early, late, engineStranded},
+		{"namespace owner gone", "container:ffffffffffff", late, early, engineStranded},
+	} {
+		if got, _ := judgeEngineDoor(tc.mode, sidecars, tc.eng, tc.sc); got != tc.want {
+			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

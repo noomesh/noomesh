@@ -328,8 +328,8 @@ type phase struct {
 // the node advertises from it; stop early when nothing is desired; MCP
 // servers (before backends — a discovery report is small, a pull is not);
 // the models dir; what is running here; multi-role merge; the shared-GPU
-// yield's sizing; image prefetch; converge each placement; then reap what
-// was removed.
+// yield's sizing; image prefetch; converge each placement; restart an
+// engine its door's restart left stranded; then reap what was removed.
 var reconcilePhases = []phase{
 	{"fetchDesired", (*Reconciler).fetchDesired},
 	{"publishProfileAndEmbedTarget", (*Reconciler).publishProfileAndEmbedTarget},
@@ -342,6 +342,7 @@ var reconcilePhases = []phase{
 	{"sizeGpuYield", (*Reconciler).sizeGpuYield},
 	{"prefetch", (*Reconciler).prefetch},
 	{"convergePlacements", (*Reconciler).convergePlacements},
+	{"healDoorNamespaces", (*Reconciler).healDoorNamespaces},
 	{"reportAndCleanup", (*Reconciler).reportAndCleanup},
 }
 
@@ -768,6 +769,17 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 		}
 		refusals.Clear("backend_start", p.Backend)
 	}
+}
+
+// healDoorNamespaces restarts a fronted engine whose stunnel sidecar
+// restarted after it (docker.HealStrandedEngines): the engine lives in the
+// sidecar's network namespace (door generation 3), and a sidecar restart
+// leaves it in the old one, alive and unreachable.
+func (r *Reconciler) healDoorNamespaces(ctx context.Context, t *tick) bool {
+	if r.docker != nil {
+		r.docker.HealStrandedEngines(ctx)
+	}
+	return true
 }
 
 func (r *Reconciler) reportAndCleanup(ctx context.Context, t *tick) bool {

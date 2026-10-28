@@ -18,6 +18,9 @@ profile on, plus `docker/stunnel-*.conf`):
      with `--ssl-cert-reqs 2` (ssl.CERT_REQUIRED) and no plaintext switch,
      everything else by a `stunnel-<x>` service whose conf says
      `verify = 2` — or it is in PLAINTEXT_EXCEPTIONS with a reason;
+  1a. (door generation 3) the fronted backend runs in its sidecar's
+     network namespace, bound to 127.0.0.1; the sidecar accepts on its own
+     hostname and connects to loopback — so it is the ONLY door;
   2. no backend publishes a host port, and no sidecar does either — except
      the mTLS doors in SIDECAR_LOOPBACK_DOORS (stunnel-ollama-embed on
      loopback, for the controller's own host agent — an earlier change), which
@@ -156,9 +159,23 @@ def test_every_backend_door_requires_a_client_certificate(services):
                 f"docker/{front}.conf does not set verify = 2: the sidecar admits a caller with no client certificate"
             )
             conf = _stunnel_conf(front)
-            assert re.search(rf"^\s*connect\s*=\s*{re.escape(name)}:\d+\s*$", conf, re.M), (
-                f"docker/{front}.conf does not forward to {name}"
+            # Door generation 3 (F-ii): the backend lives in the sidecar's
+            # network namespace on loopback, so the sidecar is the ONLY door.
+            assert re.search(r"^\s*connect\s*=\s*127\.0\.0\.1:\d+\s*$", conf, re.M), (
+                f"docker/{front}.conf does not forward to the backend on loopback"
             )
+            assert svc.get("network_mode") == f"service:{front}", (
+                f"{name} is not in {front}'s network namespace (network_mode: service:{front}): "
+                "its plain port is reachable by every container on its network"
+            )
+            assert not svc.get("networks") and not svc.get("ports"), f"{name} joins a network or publishes a port of its own"
+            hostname = sidecar.get("hostname")
+            assert hostname and re.search(rf"^\s*accept\s*=\s*{re.escape(hostname)}:\d+\s*$", conf, re.M), (
+                f"docker/{front}.conf must accept on the sidecar's hostname ({hostname!r}, its bridge address), "
+                "never 0.0.0.0, which would also take the backend's loopback port"
+            )
+            assert "0.0.0.0" not in str(svc.get("environment")), f"{name} binds 0.0.0.0"
+            assert "127.0.0.1" in str(svc.get("environment")), f"{name} does not bind its listener to 127.0.0.1"
     assert checked >= 6, f"only {checked} backend doors checked — the parse is not looking at the file it was written for"
 
 
