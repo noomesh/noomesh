@@ -377,35 +377,79 @@ def _boot_script() -> str:
     return m.group(1).replace("%s", f"'{LIB}'")
 
 
-def _boot_run(box: Box, populated: bool) -> tuple[subprocess.CompletedProcess, list[str]]:
+def _boot_run(
+    box: Box, populated: bool, fail_start: str = ""
+) -> tuple[subprocess.CompletedProcess, list[str]]:
     """Run the hostd boot-restore script for real, with a fake docker that has
-    two stopped containers: one binding a secret file, one not."""
+    six stopped containers:
+      aaa  binds a secret file (a gateway-like container)
+      bbb  binds nothing and carries no compose labels
+      ccc  compose project noomesh, service nats, restart unless-stopped, binds no secret
+      ddd  compose project noomesh, service llamacpp (not a controller-profile service)
+      eee  compose project noomesh, service model-cache, restart "no" (a one-shot)
+      fff  compose project noomesh, service loki, but labelled noo.managed-by (agent-managed)
+    `docker start` marks a container running unless its id is in fail_start."""
     log = box.tmp / "docker.log"
+    state = box.tmp / "running"
+    state.mkdir(exist_ok=True)
     docker = box.bin / "docker"
     docker.write_text(
         "#!/bin/sh\n"
         'echo "$@" >> "$DOCKER_LOG"\n'
         'case "$1" in\n'
-        "  ps) printf 'aaa\\nbbb\\n' ;;\n"
-        '  inspect) case "$4" in aaa) echo "$NOO_SECRET_RUNDIR/noo_jwt_secret" ;; *) echo /srv/other ;; esac ;;\n'
+        "  ps) printf 'aaa\\nbbb\\nccc\\nddd\\neee\\nfff\\n' ;;\n"
+        '  start) [ "$2" = "$DOCKER_FAIL_START" ] && exit 1; touch "$DOCKER_STATE/$2" ;;\n'
+        "  inspect) case \"$3\" in\n"
+        '    *Mounts*) case "$4" in aaa) echo "$NOO_SECRET_RUNDIR/noo_jwt_secret" ;; *) echo /srv/other ;; esac ;;\n'
+        '    *Labels*) case "$4" in\n'
+        "      ccc) echo 'noomesh|nats||unless-stopped' ;;\n"
+        "      ddd) echo 'noomesh|llamacpp||unless-stopped' ;;\n"
+        "      eee) echo 'noomesh|model-cache||no' ;;\n"
+        "      fff) echo 'noomesh|loki|node-agent-go|unless-stopped' ;;\n"
+        "      *) echo '|||' ;; esac ;;\n"
+        '    *Running*) [ -e "$DOCKER_STATE/$4" ] && echo true || echo false ;;\n'
+        '    *Name*) echo "/noo-$4|exited 0 2026-10-28T15:08:23.1Z" ;;\n'
+        "  esac ;;\n"
         "esac\n"
     )
     docker.chmod(docker.stat().st_mode | stat.S_IEXEC)
     if populated:
         box.rundir.mkdir(mode=0o700)
         (box.rundir / "x").write_text("1")
-    r = box.run(f"bash -c {__import__('shlex').quote(_boot_script())}", extra={"DOCKER_LOG": str(log)})
+    r = box.run(
+        f"bash -c {__import__('shlex').quote(_boot_script())}",
+        extra={"DOCKER_LOG": str(log), "DOCKER_STATE": str(state), "DOCKER_FAIL_START": fail_start},
+    )
     return r, (log.read_text().splitlines() if log.exists() else [])
 
 
 @needs_shm
-def test_boot_restore_rewrites_the_files_then_starts_only_the_containers_that_bind_them(box: Box) -> None:
+def test_boot_restore_rewrites_the_files_then_starts_the_secret_binders_and_the_core_set_only(box: Box) -> None:
     r, calls = _boot_run(box, populated=False)
     assert r.returncode == 0, r.stderr
     assert (box.rundir / "noo_jwt_secret").is_file(), "files must exist before any container is started"
     starts = [c for c in calls if c.startswith("start")]
-    assert starts == ["start aaa"], calls
-    assert "started 1 container" in r.stdout
+    # bbb (no labels), ddd (not a controller-profile service), eee (restart: no)
+    # and fff (agent-managed) are never touched
+    assert starts == ["start aaa", "start ccc"], calls
+    assert "started 2 container" in r.stdout
+    assert "still down" not in r.stderr
+
+
+@needs_shm
+def test_boot_restore_starts_a_stopped_core_service_that_binds_no_secret(box: Box) -> None:
+    """2026-10-28: dockerd skipped noo-nats after a clean reboot, boot-restore
+    never looked at it (no secret mount), and the whole controller stayed down."""
+    r, calls = _boot_run(box, populated=False)
+    assert "start ccc" in calls, calls
+    assert not any(c.startswith(("run", "create", "pull", "compose")) for c in calls), calls
+
+
+@needs_shm
+def test_boot_restore_names_what_is_still_down(box: Box) -> None:
+    r, _ = _boot_run(box, populated=False, fail_start="ccc")
+    assert r.returncode == 4, (r.returncode, r.stderr)
+    assert "boot-restore: started 1; still down: noo-ccc (exited 0 15:08)" in r.stderr, r.stderr
 
 
 @needs_shm
