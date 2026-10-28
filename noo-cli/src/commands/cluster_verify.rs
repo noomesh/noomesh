@@ -5333,14 +5333,18 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // and from `provision --wait`, and must never exit the process from
         // inside them. An unreachable gateway is a failing invariant here,
         // not a fatal error.
-        if wait {
+        // `--wait` right after `noo stack start` meets a gateway that is not
+        // listening yet: wait, bounded, for it to answer before reading.
+        let waited_for_gateway = if wait { crate::http::wait_for_gateway_answer(g).err() } else { None };
+        if wait && waited_for_gateway.is_none() {
             warmup::wait_for_node_warmup(g, &nodes);
         }
         let Some(body) = get_json_opt(g, "/api/cluster/nodes", true, 10) else {
             if g.json {
                 println!("{}", serde_json::json!({ "ok": false, "error": "gateway unreachable" }));
             } else {
-                println!("{}", ui::status_line(Glyph::Err, "the gateway did not answer /api/cluster/nodes — nothing can be verified"));
+                let after = waited_for_gateway.map(|s| format!(" after waiting {s}s")).unwrap_or_default();
+                println!("{}", ui::status_line(Glyph::Err, &format!("the gateway did not answer /api/cluster/nodes{after} — nothing can be verified")));
                 ui::guide(&[("noo health", "is the controller up"), ("noo stack status", "which container is not")]);
             }
             return Ok(1);

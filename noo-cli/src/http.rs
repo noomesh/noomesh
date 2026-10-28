@@ -629,6 +629,58 @@ pub fn get_raw_opt(
     Some((status, text))
 }
 
+/// How long a caller that needs the gateway right after `noo stack start`
+/// waits for it to answer at all, and how often it asks.
+pub(crate) const GATEWAY_ANSWER_BUDGET_SECS: u64 = 60;
+pub(crate) const GATEWAY_ANSWER_POLL_SECS: u64 = 2;
+
+/// Ask `probe` until it says yes, sleeping `interval` between asks, giving up
+/// once `now()` (time since the wait began) reaches `budget`. The probe, the
+/// clock and the sleep are injected so a test never sleeps for real.
+pub(crate) fn poll_until(
+    budget: Duration,
+    interval: Duration,
+    mut probe: impl FnMut() -> bool,
+    mut now: impl FnMut() -> Duration,
+    mut sleep: impl FnMut(Duration),
+) -> bool {
+    loop {
+        if probe() {
+            return true;
+        }
+        if now() >= budget {
+            return false;
+        }
+        sleep(interval);
+    }
+}
+
+/// Wait, bounded, for the gateway to ANSWER `/health`. Any HTTP response
+/// counts (a 503 means it is up and says so; the caller's own check reads the
+/// detail); a refused connection or a failed send means "not up yet", the
+/// state right after `noo stack start`. `Err(secs waited)` on timeout.
+pub(crate) fn wait_for_gateway_answer(g: &Globals) -> Result<(), u64> {
+    let start = std::time::Instant::now();
+    let mut told = false;
+    let up = poll_until(
+        Duration::from_secs(GATEWAY_ANSWER_BUDGET_SECS),
+        Duration::from_secs(GATEWAY_ANSWER_POLL_SECS),
+        || {
+            let answered = get_raw_opt(g, "/health", false, 3).is_some();
+            if !answered && !told && !g.json {
+                told = true;
+                println!("{}", crate::ui::note(&format!(
+                    "the gateway is not answering yet — waiting up to {GATEWAY_ANSWER_BUDGET_SECS}s"
+                )));
+            }
+            answered
+        },
+        || start.elapsed(),
+        std::thread::sleep,
+    );
+    if up { Ok(()) } else { Err(start.elapsed().as_secs()) }
+}
+
 /// Poll-tolerant GET (`jobs run` / `jobs status --wait`): transport failures
 /// exit 3 like `get_json` (parity with Python `_poll_job`, which `http_fail`s
 /// on connection errors); non-2xx statuses return `None` so the poll loop
@@ -2074,5 +2126,46 @@ mod nothing_answered_tests {
         })
         .expect("a status line is an answer, not a transport error");
         assert_eq!(status, 503);
+    }
+}
+
+#[cfg(test)]
+mod gateway_answer_wait_tests {
+    use super::poll_until;
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    /// A fake clock: each sleep advances it, so nothing sleeps for real.
+    fn run(fail_first: u32, budget_secs: u64) -> (bool, u32) {
+        let asked = Cell::new(0u32);
+        let clock = Cell::new(Duration::ZERO);
+        let up = poll_until(
+            Duration::from_secs(budget_secs),
+            Duration::from_secs(2),
+            || {
+                asked.set(asked.get() + 1);
+                asked.get() > fail_first
+            },
+            || clock.get(),
+            |d| clock.set(clock.get() + d),
+        );
+        (up, asked.get())
+    }
+
+    #[test]
+    fn a_gateway_that_comes_up_after_refusing_a_few_times_is_waited_for() {
+        // Refused five times (10 s of the 60 s budget), then it answers.
+        assert_eq!(run(5, 60), (true, 6));
+    }
+
+    #[test]
+    fn a_gateway_that_answers_at_once_costs_one_ask() {
+        assert_eq!(run(0, 60), (true, 1));
+    }
+
+    #[test]
+    fn a_gateway_that_never_answers_times_out_after_the_budget() {
+        // 60 s budget at 2 s per poll: asks at t=0,2,...,60.
+        assert_eq!(run(u32::MAX, 60), (false, 31));
     }
 }
