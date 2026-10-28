@@ -38,6 +38,7 @@ pub(crate) mod env;
 pub(crate) mod event;
 pub(crate) mod google_chat;
 pub(crate) mod prompt;
+mod sandbox_apparmor;
 pub(crate) mod sh;
 pub(crate) mod standalone;
 pub(crate) mod steps;

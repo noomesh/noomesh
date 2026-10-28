@@ -206,9 +206,13 @@ such a host every call fails ("No permissions to create new namespace",
 "Failed to make / slave") and `/health` reports the isolation as unusable. The
 stack ships `docker/apparmor-noo-sandbox`: `docker-default` verbatim, with
 `userns,`, `mount,` and `pivot_root,` in place of `deny mount,` and nothing
-else loosened (pinned by `tests/test_sandbox_apparmor_profile.py`). The
-operator installs it once into `/etc/apparmor.d/noo-sandbox` and sets
-`NOO_SANDBOX_APPARMOR=noo-sandbox`; the mounts a call makes stay inside its
+else loosened (pinned by `tests/test_sandbox_apparmor_profile.py`). On a
+host whose active LSM is AppArmor (`/sys/kernel/security/lsm`, not the
+distribution name), `noo onboard`'s services step installs it into
+`/etc/apparmor.d/noo-sandbox`, loads it and sets
+`NOO_SANDBOX_APPARMOR=noo-sandbox`, and fails the run loudly with both
+commands when sudo cannot; on SELinux and LSM-less hosts it installs
+nothing; the mounts a call makes stay inside its
 own user namespace, since the container holds no `CAP_SYS_ADMIN`.
 `unconfined` remains only for a parser older than 4.0, which cannot load
 the `userns,` rule. The `sandbox executor` row of `noo cluster verify`

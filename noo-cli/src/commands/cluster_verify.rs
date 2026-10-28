@@ -2899,7 +2899,7 @@ fn sandbox_isolation_remedy(why: &str) -> &'static str {
     } else if why.contains("self-test failed") {
         "noo stack logs sandbox   # the self-test names what the jail could reach; the jail must not be loosened to pass it"
     } else {
-        "on a host whose AppArmor blocks bwrap (Ubuntu 24.04+): sudo install -m 0644 docker/apparmor-noo-sandbox /etc/apparmor.d/noo-sandbox && sudo apparmor_parser -r /etc/apparmor.d/noo-sandbox, then NOO_SANDBOX_APPARMOR=noo-sandbox in .env (docs/reference/env.md) and: noo stack restart --force sandbox"
+        "on an AppArmor host (Ubuntu 24.04+, Debian, SUSE): noo onboard --only services (installs and loads the profile, with sudo), or by hand: sudo install -m 0644 docker/apparmor-noo-sandbox /etc/apparmor.d/noo-sandbox && sudo apparmor_parser -r /etc/apparmor.d/noo-sandbox, then NOO_SANDBOX_APPARMOR=noo-sandbox in .env (docs/reference/env.md) and: noo stack restart --force sandbox"
     }
 }
 
