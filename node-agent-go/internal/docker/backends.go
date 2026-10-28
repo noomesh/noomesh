@@ -322,16 +322,16 @@ var backendSpecs = map[string]BackendSpec{
 			// and never sources docker/inject-ca.sh. Its door is the
 			// noo-stunnel-llamacpp sidecar the agent runs beside it
 			// (sidecarSpec: the llamacpp leaf, `verify = 2`); the container
-			// itself listens plain on the bridge, reachable only by peers
-			// on that bridge (a private network per backend is followup
-			// 1234 F-ii). TLS to the gateway is the agent's inference proxy
+			// runs in that sidecar's namespace and listens on 127.0.0.1
+			// only (privateDoorEnv overrides HOST below, door generation
+			// 3). TLS to the gateway is the agent's inference proxy
 			// (:8081, the node leaf).
 			// Pin the cluster contract port explicitly. BackendPorts (and
 			// every consumer: jobs executor, inference proxy) expects
 			// llamacpp on 8085; a stale image whose baked-in ENV PORT
 			// differs (host8 shipped one listening on 8080) otherwise
 			// silently breaks all routed inference on the node.
-			"HOST": "0.0.0.0",
+			"HOST": doorLoopback,
 			"PORT": "${LLAMACPP_PORT:-8085}",
 			// Native tool calls on /v1/chat/completions need llama-server's
 			// `--jinja`. The hardened x86 image passes the flag in its CMD;
@@ -371,7 +371,7 @@ var backendSpecs = map[string]BackendSpec{
 		Image:         "${OLLAMA_IMAGE:-ollama/ollama:0.40.5}",
 		ContainerName: "noo-ollama",
 		Env: map[string]string{
-			"OLLAMA_HOST":  "0.0.0.0",
+			"OLLAMA_HOST":  doorLoopback,
 			"OLLAMA_MODEL": "${OLLAMA_MODEL:-qwen3:8b}",
 			// Ollama sends no usage telemetry, but it can hand a prompt to
 			// ollama.com: a `*-cloud` model is inferred remotely, and the
@@ -524,7 +524,7 @@ func rerankerSpecLlamacpp() BackendSpec {
 			"N_GPU_LAYERS": "0",
 			"N_CTX":        "${RERANK_N_CTX:-8192}",
 			"N_THREADS":    "${RERANK_THREADS:-4}",
-			"HOST":         "0.0.0.0",
+			"HOST":         doorLoopback,
 			"PORT":         "${RERANK_PORT:-8085}",
 		},
 		Volumes: []VolumeMount{
@@ -746,7 +746,7 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 			// container came up in model-less router mode on :8080.
 			envOverrides["LLAMA_ARG_MODEL"] = mp
 		}
-		envOverrides["LLAMA_ARG_HOST"] = "0.0.0.0"
+		envOverrides["LLAMA_ARG_HOST"] = doorLoopback
 		envOverrides["LLAMA_ARG_PORT"] = resolveEnv("${LLAMACPP_PORT:-8085}")
 		// llamacpp doesn't use GPU_MEMORY_UTILIZATION — its sizing is
 		// driven by N_GPU_LAYERS / N_CTX, both kept worker-local in env.
@@ -871,6 +871,15 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 		mirrorLlamaArgs(envOverrides)
 		spec.CPULimit = llamacppCPULimit(spec.CPULimit, envOverrides["N_THREADS"], runtime.NumCPU())
 		spec.MemoryLimit = llamacppMemoryLimit(spec.MemoryLimit, overrides.MemoryLimit)
+	}
+
+	// A fronted backend listens on loopback inside its door's namespace
+	// (sidecar.go, door generation 3). After every override above, so no
+	// placement env puts it back on the bridge.
+	if SidecarFor(backend) != "" {
+		for k, v := range privateDoorEnv(sidecarConnectPort(backend, spec, envOverrides)) {
+			envOverrides[k] = v
+		}
 	}
 
 	// Build environment list
@@ -1051,21 +1060,30 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 	// vLLM is its own door (--ssl-cert-reqs 2): on macOS publish that
 	// listener on host loopback so the host-mode dialer can reach it
 	// (LoopbackDoorPublish). A sidecar-fronted backend's raw port is never
-	// published — its door is the sidecar's (startSidecar).
+	// published — its door is the sidecar's (startSidecar), and a container
+	// in another's namespace cannot publish anyway.
 	if door, ok := backendDoors[backend]; ok && door.Sidecar == "" && LoopbackDoorPublish() {
 		applyLoopbackDoor(containerCfg, hostCfg, door.Port)
 	}
 
-	// Network config — ensure network exists on this node
+	// Network config — ensure network exists on this node. A fronted
+	// backend joins no network of its own: it lives in its sidecar's
+	// namespace (DoorNetworkMode), and the sidecar is on the bridge.
 	networkCfg := &network.NetworkingConfig{}
+	sidecarNetwork := ""
 	if spec.Network != "" {
 		if err := c.ensureNetwork(ctx, spec.Network); err != nil {
 			slog.Warn("could not create network, using default", "network", spec.Network, "error", err)
+		} else if sidecarImage != "" {
+			sidecarNetwork = spec.Network
 		} else {
 			networkCfg.EndpointsConfig = map[string]*network.EndpointSettings{
 				spec.Network: {},
 			}
 		}
+	}
+	if mode := DoorNetworkMode(backend); mode != "" {
+		hostCfg.NetworkMode = container.NetworkMode(mode)
 	}
 
 	// Remove the existing container only now, after every check above has
@@ -1078,6 +1096,20 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 	_, _ = c.docker.ContainerRemove(ctx, spec.ContainerName, client.ContainerRemoveOptions{Force: true})
 	c.removeSidecar(ctx, backend)
 
+	// The door first. A backend that cannot terminate TLS itself runs
+	// inside its stunnel sidecar's namespace, so the sidecar must exist
+	// before the backend is created; if it cannot start, the backend is
+	// never created and the start fails loudly (the reconciler records it;
+	// `cluster verify` shows the row).
+	if sidecarImage != "" {
+		port := sidecarConnectPort(backend, spec, envOverrides)
+		if err := c.startSidecar(ctx, backend, sidecarImage, sidecarNetwork, port); err != nil {
+			c.removeSidecar(ctx, backend)
+			return fmt.Errorf("start %s door (%s): %w — %s not started rather than left without its door",
+				backend, SidecarContainerFor(backend), err, spec.ContainerName)
+		}
+	}
+
 	// Create and start
 	resp, err := c.docker.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Config:           containerCfg,
@@ -1086,25 +1118,12 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 		Name:             spec.ContainerName,
 	})
 	if err != nil {
+		c.removeSidecar(ctx, backend)
 		return fmt.Errorf("create container %s: %w", spec.ContainerName, err)
 	}
 
 	if _, err := c.docker.ContainerStart(ctx, resp.ID, client.ContainerStartOptions{}); err != nil {
 		return fmt.Errorf("start container %s: %w", spec.ContainerName, err)
-	}
-
-	// The door. A backend that cannot terminate TLS itself gets its stunnel
-	// sidecar now; if the sidecar cannot start, the backend does not stay
-	// up plain behind a missing door — it is torn down and the start fails
-	// loudly (the reconciler records it; `cluster verify` shows the row).
-	if sidecarImage != "" {
-		port := sidecarConnectPort(backend, spec, envOverrides)
-		if err := c.startSidecar(ctx, backend, sidecarImage, spec.Network, spec.ContainerName, port); err != nil {
-			_, _ = c.docker.ContainerStop(ctx, spec.ContainerName, client.ContainerStopOptions{})
-			_, _ = c.docker.ContainerRemove(ctx, spec.ContainerName, client.ContainerRemoveOptions{Force: true})
-			return fmt.Errorf("start %s door (%s): %w — %s torn down rather than left serving plaintext",
-				backend, SidecarContainerFor(backend), err, spec.ContainerName)
-		}
 	}
 
 	slog.Info("backend started via SDK", "backend", backend, "model", model, "container", spec.ContainerName,

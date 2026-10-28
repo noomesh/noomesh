@@ -132,7 +132,7 @@ def test_every_fronted_backend_has_a_sidecar_door_with_verify_2():
     for key, d in fronted.items():
         svc = d["sidecar"]
         c = (ROOT / "docker" / f"stunnel-{svc}.conf").read_text()
-        accept = re.search(r"^\s*accept\s*=\s*[\d.]+:(\d+)", c, re.M)
+        accept = re.search(r"^\s*accept\s*=\s*[\w.-]+:(\d+)", c, re.M)
         assert accept, f"docker/stunnel-{svc}.conf has no accept line"
         assert int(accept.group(1)) == d["port"], f"{key}: node door port {d['port']} != compose stunnel-{svc} accept {accept.group(1)}"
     assert doors["vllm"]["sidecar"] == "" and doors["vllm"]["port"] == 8000

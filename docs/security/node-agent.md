@@ -537,11 +537,22 @@ sidecar should read from); `no-new-privileges`, `CapDrop ALL` plus
 `DAC_OVERRIDE` to read the leaf key, and `NET_BIND_SERVICE` only for a
 door below 1024. The agent runs it as root (`User: "0"`) whatever the image's
 `USER` says: the published image runs the controller's doors as uid 65532, but
-a node's leaf is a root-owned `0600` file. The sidecar forwards plaintext to the backend container
-on the bridge; the backend's raw port stays reachable to OTHER containers
-on that bridge until each backend gets a private network (a deferred step
-the operator is exploring) — the sidecar is the door every client is
-pointed at, the private network makes it the only one.
+a node's leaf is a root-owned `0600` file.
+
+**The sidecar is the only door** (door generation 3). The backend container
+has no network of its own: it runs in its sidecar's network namespace
+(`NetworkMode: container:noo-stunnel-<x>`; compose `network_mode:
+service:stunnel-<x>`) and listens on `127.0.0.1` only. The sidecar accepts
+on its own bridge address (its hostname, never `0.0.0.0`) and forwards
+plaintext to `127.0.0.1:<port>` inside the namespace. No other container on
+the bridge and no host process can reach the backend's plain port; until
+generation 3 any bridge peer could. The sidecar owns the namespace: an engine
+that restarts rejoins it, and an engine stranded by a sidecar restart (left
+in the old namespace) is a `backend_door` row and is restarted on the next
+reconcile pass. A backend still on the bridge beside its sidecar (created
+before generation 3) is the same `backend_door` row until the reconciler
+recreates it, which the generation bump does once, on the first pass after
+the agent rolls.
 
 **What a node must hold.** Each door serves with a service leaf under
 `$NOO_PKI_DIR/services/<x>/service.{crt,key}` (`vllm`, `llamacpp`,
