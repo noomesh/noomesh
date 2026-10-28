@@ -1607,13 +1607,29 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
     // (lib-stuck-container.sh), see LAUNCHER_EXIT_STACK_PARTIAL.
     let stuck_report = std::env::temp_dir().join(format!("noo-launch-stuck-{}", std::process::id()));
     let _ = std::fs::remove_file(&stuck_report);
-    let launch = || std::process::Command::new("bash")
-        .arg(root.join("scripts/noomesh-start.sh")).arg("--dist")
-        .env("NOO_IMAGE_TAG", tag)
-        .env("NOO_STUCK_REPORT", &stuck_report)
-        .env("NOO_CLI_BIN", &cli_bin)
-        .current_dir(root)
-        .status();
+    let build_launch = || {
+        let mut c = std::process::Command::new("bash");
+        c.arg(root.join("scripts/noomesh-start.sh")).arg("--dist")
+            .env("NOO_IMAGE_TAG", tag)
+            .env("NOO_STUCK_REPORT", &stuck_report)
+            .env("NOO_CLI_BIN", &cli_bin)
+            .current_dir(root);
+        c
+    };
+    // Default: the launcher's per-container compose lines collapse into one
+    // summary line (errors pass through verbatim). --verbose and --json keep
+    // the live stream.
+    let launch = || -> std::io::Result<std::process::ExitStatus> {
+        let mut c = build_launch();
+        if g.verbose || g.json {
+            return c.status();
+        }
+        let (status, tally) = crate::onboard::sh::run_summarised(c)?;
+        if let Some(s) = tally.summary() {
+            if status.success() && tally.failed() == 0 { ui::done(&s); } else { ui::failed(&s, None); }
+        }
+        Ok(status)
+    };
     let mut status = launch();
     // One automatic retry: the first rail walk died on a GHCR blob timeout
     // over IPv6 (host8, 2026-09-03) — a transient the second attempt sails
