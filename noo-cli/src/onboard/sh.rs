@@ -535,6 +535,8 @@ impl ComposeTally {
 
 /// Pure form of the summariser: the one-line summary (empty when the
 /// transcript had no container lines) and every line to show verbatim.
+/// The live path feeds `ComposeTally` line by line; this is its test seam.
+#[cfg(test)]
 pub fn summarise_compose(lines: &[&str]) -> (String, Vec<String>) {
     let mut tally = ComposeTally::default();
     let mut pass = Vec::new();
