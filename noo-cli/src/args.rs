@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn usage_flags_match_what_converted_parsers_ask_for() {
         use crate::commands::{
-            autonomy, cluster_gpu, cluster_reserve, cluster_vendor, heartbeat, jobs, logs, memory, rag, recall, tasks,
+            addons, autonomy, cluster_gpu, cluster_reserve, cluster_vendor, heartbeat, jobs, logs, memory, rag, recall, tasks,
             walks,
         };
         type Probe = fn(&mut Args);
@@ -264,6 +264,7 @@ mod tests {
             (w, p)
         }
         let table = [
+            row(&["addons", "check"], |a| { let _ = addons::parse_check_with(a); }),
             row(&["heartbeat", "history"], |a| { let _ = heartbeat::parse_history_with(a); }),
             row(&["walks"], |a| { let _ = walks::parse_list_with(a); }),
             row(&["cluster", "reserve"], |a| { let _ = cluster_reserve::parse_reserve_with(a); }),

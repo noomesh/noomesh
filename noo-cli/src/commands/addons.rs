@@ -1012,6 +1012,48 @@ pub fn addons_granted_by(features: &[String]) -> Vec<&'static AddonRow> {
         .collect()
 }
 
+/// `<bundle-dir> [--name <addon>]`.
+pub(crate) fn parse_check_with(a: &mut crate::args::Args) -> Result<(String, Option<String>), crate::args::ArgError> {
+    let name = a.value(&["--name"])?;
+    Ok((a.one("<bundle-dir>")?, name))
+}
+
+/// `noo addons check <bundle-dir> [--name <addon>]`: the checks enable runs
+/// on a bundle's files (`addons::check`), on a directory. Installs nothing,
+/// asks no network; the core is the one embedded in this binary.
+pub fn addons_check(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let (dir, name) = parse_check_with(&mut crate::args::Args::new(args))?;
+    let path = std::path::Path::new(&dir);
+    let name = match name {
+        Some(n) if crate::addons::trust::name_ok(&n) => n,
+        Some(n) => fail(g.json, ExitCode::Usage, "bad_name", &format!("`{n}` is not an add-on name (lowercase letters, digits, `-`, `_`)"), None),
+        None => match crate::addons::check::name_of_dir(path) {
+            Ok(n) => n,
+            Err(e) => fail(g.json, ExitCode::Usage, "bad_name", &e, Some(&format!("noo addons check {dir} --name <addon>"))),
+        },
+    };
+    let third_party = crate::addons::resolve::third_party(&name);
+    match crate::addons::check::check_dir(path, &name) {
+        Ok(c) => {
+            if g.json {
+                println!(
+                    "{}",
+                    json!({
+                        "addon": name, "dir": dir, "ok": true, "third_party": third_party, "core": "embedded",
+                        "checked": {"secrets_declared": c.declared, "secret_references": c.referenced, "interpolations": c.interpolated, "mounts": c.mounts},
+                    })
+                );
+            } else {
+                ui::done(&format!("{name}: the bundle in {dir} passes the checks `noo addons enable` runs on its files"));
+                let who = if third_party { "third-party" } else { "first-party" };
+                println!("{}", ui::note(&format!("checked as {who}, against the compose files embedded in this noo; no signature, trust key or image was checked")));
+            }
+            Ok(0)
+        }
+        Err(why) => fail(g.json, ExitCode::Generic, "bundle_refused", &why, Some(&format!("noo addons check {dir}"))),
+    }
+}
+
 // ── third-party trust and delegation ───────────────────────────────────
 
 /// Edit noomesh.yaml TEXT through `f` and write it back only if it still

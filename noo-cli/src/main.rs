@@ -697,6 +697,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["addons", "list"], commands::addons_list),
     (&["addons", "show"], commands::addons_show),
     (&["addons", "enable"], commands::addons_enable),
+    (&["addons", "check"], commands::addons_check),
     (&["addons", "disable"], commands::addons_disable),
     (&["addons", "upgrade"], commands::addons_upgrade),
     (&["addons", "verify"], commands::addons_verify),
