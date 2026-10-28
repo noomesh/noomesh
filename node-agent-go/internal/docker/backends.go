@@ -1801,6 +1801,42 @@ func ContainerNameFor(backend string) string {
 	return backendSpecs[backend].ContainerName
 }
 
+// ReleaseBackendImage is the image this node derives for backend from its
+// OWN release (NOO_IMAGE_PREFIX/<name>:NOO_IMAGE_TAG) when the placement names
+// no image: the hardened llama-server for llamacpp and for the llama.cpp
+// reranker engine. "" when the backend's default is not release-derived (an
+// upstream pin such as vLLM's or TEI's, which the controller sends in the
+// placement from the signed stack lock), when an override names an image
+// that is not this release's, or on a node with no release pin.
+//
+// The controller never sends these images (routes/cluster.rs
+// backend_image_ref: "the node derives its own release ref"), so the
+// placement's Image is empty and the spec hash did not change when the node
+// rolled: awolf ran noo-llamacpp on v0.6.12 after the 0.6.13 roll, with
+// llamacpp:v0.6.13 staged on the rail. reconcile.specHash folds this in.
+func ReleaseBackendImage(backend string) string {
+	prefix, tag := os.Getenv("NOO_IMAGE_PREFIX"), os.Getenv("NOO_IMAGE_TAG")
+	if prefix == "" || tag == "" {
+		return ""
+	}
+	var img string
+	switch backend {
+	case "llamacpp":
+		img = envOr("LLAMACPP_IMAGE", llamacppDefaultImage())
+	case "reranker":
+		if strings.EqualFold(strings.TrimSpace(os.Getenv("RERANK_ENGINE")), "tei") {
+			return ""
+		}
+		img = envOr("RERANK_IMAGE", llamacppDefaultImage())
+	default:
+		return ""
+	}
+	if strings.HasPrefix(img, prefix+"/") && strings.HasSuffix(img, ":"+tag) {
+		return img
+	}
+	return ""
+}
+
 func llamacppDefaultImage() string {
 	// runtime.GOARCH is the architecture the binary is built for, which
 	// matches the host since node-agent runs natively (not under emulation).
