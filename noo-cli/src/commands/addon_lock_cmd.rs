@@ -338,7 +338,10 @@ mod tests {
         let v = addon_lock::verify(&bytes, &sig, &anchor, "pai-voice").expect("verifies, as dev-signed");
         assert!(v.dev_expires_at.is_some(), "the release verb refuses exactly this");
         // Passing the dev key as a release key is refused before any verification.
-        assert!(addon_lock::refuse_dev_in_release(&[pk(&dev_seed)], &dev).is_err());
+        // ... and the refusal names no date: the never-expiring hold is not
+        // an expiry to show ("expires 292277026596-12-04" before).
+        let e = addon_lock::refuse_dev_in_release(&[pk(&dev_seed)], &dev).unwrap_err();
+        assert!(e.contains("development key") && !e.contains("expires") && !e.contains("292277026596"), "{e}");
         // A lock signed by the release key passes as a release lock.
         let (bytes, sig) = addon_lock::sign(&lock(), &"ab".repeat(32)).unwrap();
         let v = addon_lock::verify(&bytes, &sig, &anchor, "pai-voice").unwrap();
