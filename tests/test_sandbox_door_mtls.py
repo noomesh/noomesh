@@ -94,6 +94,22 @@ def test_the_healthcheck_dials_the_door_with_ca_and_client_cert(name):
     assert "http://" not in test
 
 
+@pytest.mark.parametrize("name", SANDBOXES)
+def test_the_healthcheck_runs_as_the_keys_reader_not_root(name):
+    # i277c: the check runs as the container's user (root, cap_drop ALL, no
+    # CAP_DAC_OVERRIDE) and the key is 0640 to sandbox-server, so as root it
+    # could not load the client certificate and the container was unhealthy
+    # with a healthy server.
+    svc = _raw_services()[name]
+    test = svc["healthcheck"]["test"]
+    assert svc.get("user") == "root", "the check's uid follows the container's user"
+    assert test[:2] == ["CMD", "setpriv"], test[:3]
+    assert "--reuid=sandbox-server" in test and "--regid=sandbox-server" in test and "--clear-groups" in test
+    assert test[test.index("--") + 1] == "python", test
+    # The capabilities it uses to switch are the container's own: nothing added for it.
+    assert {"SETUID", "SETGID"} <= set(svc.get("cap_add", []))
+
+
 def test_every_caller_defaults_to_https():
     services = full_projection()["services"]
     seen = 0

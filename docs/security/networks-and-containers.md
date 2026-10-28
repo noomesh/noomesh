@@ -182,7 +182,7 @@ Docker's `docker-default` profile denies every mount in a container, and on
 hosts that restrict unprivileged user namespaces through AppArmor it denies
 the user namespace too. Bubblewrap needs both, so under `docker-default` on
 such a host every call fails ("No permissions to create new namespace",
-"Can't mount proc") and `/health` reports the isolation as unusable. The
+"Failed to make / slave") and `/health` reports the isolation as unusable. The
 stack ships `docker/apparmor-noo-sandbox`: `docker-default` verbatim, with
 `userns,`, `mount,` and `pivot_root,` in place of `deny mount,` and nothing
 else loosened (pinned by `tests/test_sandbox_apparmor_profile.py`). The
@@ -193,6 +193,35 @@ own user namespace, since the container holds no `CAP_SYS_ADMIN`.
 the `userns,` rule. The `sandbox executor` row of `noo cluster verify`
 fails, with that install as its remedy, whenever the sandbox reports that
 its isolation cannot run.
+
+#### No /proc inside the per-call jail
+
+Docker masks paths under every container's `/proc` (`/proc/kcore`,
+`/proc/keys` and others with `/dev/null`; `/proc/sys`, `/proc/irq` and
+others read-only). Inside a call's new user namespace those mounts are
+locked, and the kernel then refuses a fresh procfs (no procfs in the mount
+namespace is fully visible). Through 0.6.13 the jail asked for one
+(`--proc /proc`), so with the AppArmor profile in place every call still
+failed, with "Can't mount proc on /proc: Operation not permitted" (pop-os,
+2026-10-26). The jail now mounts no `/proc` at all and keeps every
+namespace. The other ways out were each worse:
+
+- binding the container's `/proc` shows the code this server and the other
+  calls;
+- `systempaths=unconfined` lifts the masks for the server too;
+- no capability helps, because the refusal does not depend on one.
+
+Code in the jail therefore has no `/proc/self/*`, `/proc/meminfo`,
+`/proc/cpuinfo`, `/dev/fd` or `/dev/stdin`. Reading one fails with a plain
+`FileNotFoundError` naming the path, and the sandbox adds one line under
+the traceback saying there is no `/proc`. `os.cpu_count()`,
+`os.sched_getaffinity(0)` and the `resource` module still answer.
+
+Before the first call the sandbox runs a self-test inside the jail. It
+checks that the code is in its own PID namespace, sees loopback alone,
+cannot see the server's process or `/tls`, runs as its executor uid and
+starts in `/work`. `/health` reports the facts under
+`isolation.self_test`, and the mode is usable only when they pass.
 
 ### Read-only root filesystem
 

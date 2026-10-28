@@ -443,6 +443,26 @@ jobs:
         if [ "$TRELLION_PUBLIC" != "true" ]; then args+=("${needs_trellion[@]}"); fi
         pytest tests/ -v --cov=noomesh --cov-report=xml "${args[@]}"
 
+    # The sandbox jail as it runs in a container (pop-os, 0.6.13): Docker
+    # masks paths under every container's /proc, the kernel then refuses a
+    # fresh procfs inside the call's user namespace, and a jail that asked
+    # for one refused every call. A hosted runner's /proc has no masks, so
+    # the live test above passed anyway. Here one mask is made the way Docker
+    # makes them (/dev/null bound over /proc/kcore, in a private mount
+    # namespace), and the live test runs under it as the runner, required
+    # rather than skippable (NOO_SANDBOX_TEST_PROC_MASK=1).
+    - name: Sandbox jail under Docker's /proc masks
+      timeout-minutes: 5
+      run: |
+        if ! sudo -n true 2>/dev/null || ! command -v bwrap >/dev/null; then
+          echo "::warning::no passwordless sudo or no bubblewrap on this runner: the masked-/proc sandbox test cannot run"
+          exit 0
+        fi
+        sudo -n -E env "PATH=$PATH" NOO_SANDBOX_TEST_PROC_MASK=1 \
+          unshare -m --propagation private sh -c \
+          'mount --bind /dev/null /proc/kcore && exec setpriv --reuid="$1" --regid="$2" --clear-groups -- "$3" -m pytest -q -p no:cacheprovider tests/test_sandbox_exec_isolation.py -k "proc_masks"' \
+          sh "$(id -u)" "$(id -g)" "$(command -v python)"
+
     # Coverage goes to a BUILD ARTIFACT, not to a third-party uploader: visible
     # per run, no token, and no network call that can take a green run down.
     - name: Upload coverage artifact

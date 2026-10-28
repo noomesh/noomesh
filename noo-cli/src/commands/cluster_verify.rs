@@ -2862,16 +2862,34 @@ pub(crate) fn sandbox_executor_check(probe: Option<&SandboxProbe>) -> Check {
     let mode = iso["mode"].as_str().unwrap_or("unknown");
     let active = iso["active"].as_str().unwrap_or("unknown");
     if active == "none" {
+        let why = iso["detail"].as_str().unwrap_or("no detail");
         return fail(
             ROW,
             format!(
-                "the executor uid is in place ({detail}) but the configured {mode} isolation cannot run ({}) — the sandbox refuses calls until it can",
-                iso["detail"].as_str().unwrap_or("no detail")
+                "the executor uid is in place ({detail}) but the configured {mode} isolation cannot run ({why}) — the sandbox refuses calls until it can"
             ),
-            "on a host whose AppArmor blocks bwrap (Ubuntu 24.04+): sudo install -m 0644 docker/apparmor-noo-sandbox /etc/apparmor.d/noo-sandbox && sudo apparmor_parser -r /etc/apparmor.d/noo-sandbox, then NOO_SANDBOX_APPARMOR=noo-sandbox in .env (docs/reference/env.md) and: noo stack restart --force sandbox",
+            sandbox_isolation_remedy(why),
         );
     }
-    ok(ROW, format!("code runs as {detail}, uid {uid} first, never as the server; isolation {active}"))
+    // A sandbox from 0.6.14 proves its jail before the first call; older
+    // images report no self-test, which is not held against them.
+    let proven = if iso["self_test"]["passed"].as_bool() == Some(true) { " (self-test passed)" } else { "" };
+    ok(ROW, format!("code runs as {detail}, uid {uid} first, never as the server; isolation {active}{proven}"))
+}
+
+/// The remedy for an isolation the sandbox cannot run, by its reason.
+/// "Can't mount proc" was never AppArmor: it is Docker's /proc masks, which
+/// the 0.6.14 jail avoids by mounting no /proc, so the cure is the image. A
+/// failed self-test names what the jail could reach in the sandbox's log.
+/// Anything else on a 24.04+ host is the AppArmor profile.
+fn sandbox_isolation_remedy(why: &str) -> &'static str {
+    if why.contains("Can't mount proc") {
+        "noo upgrade --stack   # the sandbox image from 0.6.14 mounts no /proc in its jail (Docker's /proc masks refuse one); no host change"
+    } else if why.contains("self-test failed") {
+        "noo stack logs sandbox   # the self-test names what the jail could reach; the jail must not be loosened to pass it"
+    } else {
+        "on a host whose AppArmor blocks bwrap (Ubuntu 24.04+): sudo install -m 0644 docker/apparmor-noo-sandbox /etc/apparmor.d/noo-sandbox && sudo apparmor_parser -r /etc/apparmor.d/noo-sandbox, then NOO_SANDBOX_APPARMOR=noo-sandbox in .env (docs/reference/env.md) and: noo stack restart --force sandbox"
+    }
 }
 
 /// `answered HTTP/1.1 500 …` (a probe dial's text): the server is up and
@@ -8029,6 +8047,45 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
         assert!(c.detail.contains("sandbox listener row") && c.detail.contains("CERTIFICATE_VERIFY_FAILED"), "{}", c.detail);
         assert_eq!(sandbox_executor_check(None).verdict, Verdict::Warn);
+    }
+
+    /// 0.6.13 on pop-os: with the AppArmor profile loaded the jail still
+    /// failed, "Can't mount proc", which is Docker's /proc masks and not
+    /// AppArmor. The row sent the operator to install a profile already
+    /// installed. Each reason gets its own remedy, and a passed self-test
+    /// shows on the OK row.
+    #[test]
+    fn the_sandbox_executor_row_names_the_remedy_for_each_reason() {
+        let exec = serde_json::json!({"uid": 65600, "slots": 64, "detail": "sandbox-exec (uids 65600-65663)"});
+        let refused = |why: &str| {
+            let c = sandbox_executor_check(Some(&sandbox_health(
+                exec.clone(),
+                serde_json::json!({"mode": "bwrap", "active": "none", "detail": why}),
+            )));
+            assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+            assert!(c.detail.contains(why), "{}", c.detail);
+            c.remedy.unwrap_or_default()
+        };
+        let r = refused("bwrap: Can't mount proc on /proc: Operation not permitted");
+        assert!(r.starts_with("noo upgrade --stack") && !r.contains("apparmor"), "{r}");
+        let r = refused("the isolation self-test failed: the code can see /tls, where the sandbox's own key is");
+        assert!(r.starts_with("noo stack logs sandbox") && !r.contains("apparmor"), "{r}");
+        for why in ["bwrap: Failed to make / slave: Permission denied", "bwrap: No permissions to create new namespace"] {
+            let r = refused(why);
+            assert!(r.contains("/etc/apparmor.d/noo-sandbox") && r.contains("NOO_SANDBOX_APPARMOR=noo-sandbox"), "{r}");
+        }
+
+        let proven = sandbox_health(
+            exec.clone(),
+            serde_json::json!({"mode": "bwrap", "active": "bwrap", "detail": "bwrap", "self_test": {"passed": true, "failures": []}}),
+        );
+        let c = sandbox_executor_check(Some(&proven));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.ends_with("isolation bwrap (self-test passed)"), "{}", c.detail);
+        let older = sandbox_health(exec.clone(), serde_json::json!({"mode": "bwrap", "active": "bwrap", "detail": "bwrap"}));
+        let c = sandbox_executor_check(Some(&older));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.ends_with("isolation bwrap"), "{}", c.detail);
     }
 
     /// 0.6.11 on pop-os: the server ran as `nonroot` (65532), the kernel
