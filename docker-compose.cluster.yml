@@ -1256,6 +1256,12 @@ services:
     logging: *default-logging
     image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-vllm
+    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
+    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
+    # these images share; the GPU needs none (device requests, not caps).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     # Placement-managed since 2026-07-11: the node-agent's desired-state
     # reconciler owns noo-vllm (noo cluster place <node> vllm <model>).
     # This service is a manual/bootstrap fallback only — NOT in the
@@ -1417,6 +1423,12 @@ services:
     logging: *default-logging
     image: ${VLLM2_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-vllm-secondary
+    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
+    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
+    # these images share; the GPU needs none (device requests, not caps).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     profiles: ["vllm-secondary"]
     environment:
       # Vendor telemetry off (docs/security/telemetry.md): vLLM posts usage
@@ -1537,6 +1549,15 @@ services:
     image: ${LLAMACPP_IMAGE:-${NOO_IMAGE_PREFIX:-noomesh}/llamacpp:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_LLAMACPP:-}}
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-llamacpp
+    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
+    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
+    # these images share; the GPU needs none (device requests, not caps).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    # llama-server writes nothing outside /models (docker diff, awolf 2026-10-28).
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=64m"]
     # NOT in gpu-tier2: the launcher auto-adds that profile on any 4-10 GB
     # box, and with no LLAMACPP_MODEL configured MODEL_PATH points at a GGUF
     # that does not exist → llama-server restart-loops (host8 fresh
@@ -1599,6 +1620,12 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-llamacpp
+    # Door floor (i301): non-root, no capability, read-only root; the
+    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
     # The name its stunnel.conf accepts on (its bridge address, not
     # 0.0.0.0): llamacpp listens on 127.0.0.1 in this namespace.
     hostname: noo-stunnel-llamacpp
@@ -1624,6 +1651,12 @@ services:
     image: noomesh/airllm:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-airllm
+    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
+    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
+    # these images share; the GPU needs none (device requests, not caps).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     profiles: ["airllm"]
     # No external port — gateway reaches AirLLM via Docker network
     environment:
@@ -1665,6 +1698,12 @@ services:
     # noo-cli image_stage.rs THIRD_PARTY_LOCK_ROWS).
     image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama
+    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
+    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
+    # these images share; the GPU needs none (device requests, not caps).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     profiles: ["ollama", "gpu-tier2"]
     # No external port — gateway reaches Ollama via Docker network (noo-cluster)
     environment:
@@ -1700,6 +1739,12 @@ services:
     # H-N4: parameterized so it can be pinned to a verified version/digest.
     image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama-embed
+    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
+    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
+    # these images share; the GPU needs none (device requests, not caps).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     profiles: ["standalone"]
     # Publishes NOTHING. Every caller goes through stunnel-ollama-embed
     # below — mTLS, client certificate required: the containers (gateway,
@@ -1744,6 +1789,12 @@ services:
     logging: *default-logging
     image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama-embed-cpu
+    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
+    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
+    # these images share; the GPU needs none (device requests, not caps).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     profiles: ["embed-cpu"]
     # Publishes nothing; only stunnel-ollama-embed-cpu reaches it (it lives
     # in that sidecar's namespace on 127.0.0.1, as ollama-embed above).
@@ -1781,6 +1832,12 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-ollama-embed-cpu
+    # Door floor (i301): non-root, no capability, read-only root; the
+    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
     # The name its stunnel.conf accepts on (its bridge address, not
     # 0.0.0.0): ollama-embed-cpu listens on 127.0.0.1 in this namespace.
     hostname: noo-stunnel-ollama-embed-cpu
@@ -1835,6 +1892,12 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-ollama-embed
+    # Door floor (i301): non-root, no capability, read-only root; the
+    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
     # The name its stunnel.conf accepts on (its bridge address, not
     # 0.0.0.0): ollama-embed listens on 127.0.0.1 in this namespace.
     hostname: noo-stunnel-ollama-embed
@@ -1867,6 +1930,12 @@ services:
     logging: *default-logging
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.6${NOO_IMAGE_DIGEST_TEI_CPU:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-tei
+    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
+    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
+    # these images share; the GPU needs none (device requests, not caps).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     profiles: ["tei-compose"]  # opt-in only (default: rerank=LLM fallback, embed=Ollama/node-agent)
     # No external port — gateway reaches TEI via Docker network
     environment:
@@ -1893,6 +1962,12 @@ services:
     logging: *default-logging
     image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-tei-gpu
+    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
+    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
+    # these images share; the GPU needs none (device requests, not caps).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     # SUPERSEDED on GPU nodes by the node-agent `embedding` backend
     # (`noo cluster place <node> embedding <model>`). Gated to an
     # opt-in profile so normal embedding/gpu-tier2 startup can't duplicate
@@ -1931,6 +2006,12 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-ollama
+    # Door floor (i301): non-root, no capability, read-only root; the
+    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
     # The name its stunnel.conf accepts on (its bridge address, not
     # 0.0.0.0): ollama listens on 127.0.0.1 in this namespace.
     hostname: noo-stunnel-ollama
@@ -1956,6 +2037,12 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-tei
+    # Door floor (i301): non-root, no capability, read-only root; the
+    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
     # The name its stunnel.conf accepts on (its bridge address, not
     # 0.0.0.0): tei listens on 127.0.0.1 in this namespace.
     hostname: noo-stunnel-tei
@@ -1978,6 +2065,12 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-tei-gpu
+    # Door floor (i301): non-root, no capability, read-only root; the
+    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
     # The name its stunnel.conf accepts on (its bridge address, not
     # 0.0.0.0): tei-gpu listens on 127.0.0.1 in this namespace.
     hostname: noo-stunnel-tei-gpu
@@ -2003,6 +2096,12 @@ services:
     logging: *default-logging
     image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-reranker
+    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
+    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
+    # these images share; the GPU needs none (device requests, not caps).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     # SUPERSEDED on GPU nodes by the node-agent `reranker` backend
     # (`noo cluster place <node> reranker <model>`). Gated to opt-in
     # so normal startup can't duplicate the GPU reranker. The mesh path
@@ -2043,6 +2142,12 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-reranker
+    # Door floor (i301): non-root, no capability, read-only root; the
+    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
     # The name its stunnel.conf accepts on (its bridge address, not
     # 0.0.0.0): reranker listens on 127.0.0.1 in this namespace.
     hostname: noo-stunnel-reranker

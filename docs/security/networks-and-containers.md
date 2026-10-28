@@ -125,6 +125,27 @@ agent sets `User: "0"` on them explicitly.
 | `gateway` | ALL | yes | yes (tmpfs `/tmp` 512m, `/home/nonroot` 64m) |
 | `worker`, `worker-extra` | ALL | yes | yes (tmpfs `/tmp` 256m, `/home/nonroot` 64m) |
 | `trellion` | ALL | yes | yes (tmpfs `/tmp` 1g, `/home/nonroot` 256m) |
+| `stunnel-*` (the seven backend doors) | ALL | yes | yes (tmpfs `/tmp` 16m; non-root) |
+| `llamacpp` | ALL, plus the agent's backend set (below) | yes | yes (tmpfs `/tmp` 64m; non-root in the image) |
+| `vllm`, `vllm-secondary`, `ollama`, `ollama-embed`, `ollama-embed-cpu`, `tei`, `tei-gpu`, `reranker`, `airllm` | ALL, plus `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETGID`, `SETUID` (the node agent's backend set) | yes | no (below) |
+
+**Backends that keep a writable root, and why** (measured with `docker diff`
+on running containers, awolf, 2026-10-28):
+
+- `vllm`: runs as root and writes `/tmp` (torch inductor, cutlass), `/root/.nv`
+  (CUDA compute cache), `/root/.triton` (kernel cache) and `/etc/ld.so.cache`
+  (the GPU runtime at start). Read-only needs those as tmpfs or a cache
+  volume, and a test that the NVIDIA runtime still starts on a read-only
+  root; non-root needs the Hugging Face cache owned by that user.
+- `ollama` (all three): writes its model store under `/root/.ollama` (a
+  volume) as root; non-root needs the volume re-owned and `HOME` moved.
+- `tei`, `tei-gpu`, the TEI `reranker`: write the model cache under `/data` as
+  root; same re-own as Ollama.
+- `airllm`: a local build, not measured.
+- The node agent's own doors run as root (not the image's non-root user) to
+  read the node's root-owned `0600` service key with `DAC_OVERRIDE`; they are
+  read-only except on the `alpine` fallback image, which installs stunnel at
+  start.
 
 The gateway, the worker and trellion run as an unprivileged user, bind ports
 above 1024 and use no capability, so dropping all of them removes nothing they

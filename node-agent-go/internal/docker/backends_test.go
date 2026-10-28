@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
@@ -861,5 +862,44 @@ func TestDoorSelfNameReadsTheAgentLeaf(t *testing.T) {
 	}
 	if _, err := checkDoorPin("a\nverify = 0"); err == nil {
 		t.Error("a name that breaks its conf line must be refused")
+	}
+}
+
+// The backend privilege floor (i301, internal#300): beside no-new-privileges
+// and CapDrop ALL, an image whose write set was measured empty runs on a
+// read-only root with a tmpfs /tmp. llama-server (llamacpp and the reranker)
+// and every door sidecar on the published stunnel image take it; the alpine
+// fallback door cannot (its entrypoint runs `apk add`).
+func TestReadOnlyRootFloor(t *testing.T) {
+	if !backendSpecs["llamacpp"].ReadOnlyRoot || !rerankerSpecLlamacpp().ReadOnlyRoot {
+		t.Error("llama-server writes nothing outside its read-only /models: llamacpp and the reranker take a read-only root")
+	}
+	for _, b := range []string{"vllm", "ollama", "embedding"} {
+		if backendSpecs[b].ReadOnlyRoot {
+			t.Errorf("%s writes caches into its image paths; a read-only root needs its write set measured first", b)
+		}
+	}
+	h := &container.HostConfig{}
+	rootFloor(h, true)
+	if !h.ReadonlyRootfs || h.Tmpfs["/tmp"] == "" || !strings.Contains(h.Tmpfs["/tmp"], "noexec") {
+		t.Errorf("rootFloor(true) = ro %v tmpfs %v", h.ReadonlyRootfs, h.Tmpfs)
+	}
+	h = &container.HostConfig{}
+	rootFloor(h, false)
+	if h.ReadonlyRootfs || h.Tmpfs != nil {
+		t.Errorf("rootFloor(false) changed the config: ro %v tmpfs %v", h.ReadonlyRootfs, h.Tmpfs)
+	}
+	// Both create paths apply it.
+	for file, call := range map[string]string{
+		"backends.go": "rootFloor(hostCfg, spec.ReadOnlyRoot)",
+		"sidecar.go":  "rootFloor(hostCfg, image != stunnelFallbackImage)",
+	} {
+		src, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(src), call) {
+			t.Errorf("%s does not call %s", file, call)
+		}
 	}
 }
