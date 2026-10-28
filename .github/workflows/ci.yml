@@ -994,6 +994,7 @@ jobs:
       working-directory: gateway-rust
       env:
         NOO_BROKER_TEST_DSN: postgresql://noo:noo@localhost:5432/noomesh
+        NOO_REQUIRE_GOOGLE_REHEARSAL: "1"
         # The model-class storage round trip (coordinator/classes.rs db_tests)
         # is gated the same way and asserts the head revision against this
         # same catalogue.
@@ -1130,6 +1131,7 @@ jobs:
       working-directory: gateway-rust
       env:
         NOO_BROKER_TEST_DSN: postgresql://noo:noo@localhost:5432/noomesh
+        NOO_REQUIRE_GOOGLE_REHEARSAL: "1"
         NOO_ROUTER_HARNESS_REQUIRED: "1"
         SQLX_OFFLINE: "true"
       run: |

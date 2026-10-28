@@ -131,7 +131,7 @@ scope definitions; `oauth.rs` holds the reusable lifecycle and Google resource
 adapter; `crypto.rs` implements the vault. Storage is in
 `gateway-rust/src/repo/integrations.rs`; personal corpus/queue storage is in
 `repo/integration_content.rs` and pairing storage in `repo/integration_pairing.rs`. The mesh migration
-`105_integration_pairing` adds owner-bound, single-use CLI-to-phone handoffs.
+`106_integration_pairing` adds owner-bound, single-use CLI-to-phone handoffs.
 `noo auth connect google --pair` displays a ten-minute code and a phone URL.
 The same signed-in Noomesh owner reviews the device and services on the phone,
 then completes the existing Web OAuth flow. CLI polling receives only status
@@ -139,7 +139,7 @@ and the connected account ID. Completion and credential storage commit
 together; cancellation and user erasure also remove pending grants. See the
 [phone setup guide](../getting-started/integrations.md#approve-from-your-phone-with-a-pairing-code).
 
-`104_integration_oauth` adds credentials, sessions, verified identity and
+`105_integration_oauth` adds credentials, sessions, verified identity and
 account authorization status after the original source-draft migration.
 
 Add a provider definition and identity/resource adapter, then register its
@@ -149,4 +149,59 @@ URLs. OAuth credentials stay separate from source policy and token material
 never enters the list contract. Contracts are maintained in the server/UI
 OpenAPI files and regenerated TypeScript types.
 
-`106_integration_content` adds the separate encrypted personal corpus and durable owner-bound sync queue.
+`107_integration_content` adds the separate encrypted personal corpus and durable owner-bound sync queue.
+
+## Release rehearsal without Google credentials
+
+Build the gateway libtest executable from the reviewed worktree using
+`scripts/cargo-docker.sh test --locked --no-run --bin noo-gateway`. Cargo prints
+the executable under `gateway-rust/target/debug/deps/noo_gateway-…`. Then run:
+
+```bash
+python3 scripts/test-google-integrations-rehearsal.py \
+  --gateway-tests gateway-rust/target/debug/deps/noo_gateway-REPLACE-WITH-BUILT-HASH
+```
+
+The runner requires Python 3.10+ and Docker. It uses locally available
+`pgvector/pgvector:pg18` and `rust:1-bookworm` images; use `--postgres-image` and
+`--runner-image` for the release runner's reviewed mirrors. It never pulls an
+image implicitly. The JSON result identifies the checkout, dirty state, binary
+hash, actual image IDs and passing test counts. Rebuild after changing source;
+the binary hash is evidence of the tested artifact, not a freshness guarantee.
+
+PostgreSQL runs on a new internal Docker network, without published ports or
+host storage. Its fixture-only trust authentication is confined to that network.
+The test runner receives a synthetic database DSN, a read-only test executable
+and no installation config, TLS keys, Google registrations or secret store.
+The runner removes only the database/network it created. It contacts no Google
+endpoint; OAuth and provider responses are deterministic fixtures, with HTTP
+stubs on loopback where needed. No real mailbox or Drive content is fetched.
+
+The rehearsal first proves that a missing test DSN fails rather than silently
+skipping. Each suite must execute its minimum test count, without failures or
+ignored tests. CI also sets `NOO_REQUIRE_GOOGLE_REHEARSAL=1` for its real-database
+gateway runs, so losing the DSN fails those integration checks.
+
+| Boundary | Rehearsal coverage |
+| --- | --- |
+| Multiple users/accounts | Both Gmail and Drive, identical provider IDs/content, independent accounts/sources, cross-user and administrator refusals |
+| OAuth and pairing | PKCE, verified identity, partial consent, refresh, state/ticket replay, expiry, wrong owner/origin and cancellation during completion |
+| Pause and concurrency | Lease expiry/replacement, duplicate pages, competing workers, late writes after pause/disconnect |
+| Disconnect and erasure | Production account/source removal cascades and user erasure prevent content or pending grants being restored |
+| Private search | Only the authenticated user sees snippets; service principals, shared rooms, disabled users and persisted conversation/tool contexts receive no personal evidence |
+| Response protection | Callback CSP and no-store headers, strict request shapes, owner resolution for User/Operator/Admin |
+| Migration compatibility | Existing `103_pg_stat_statements` preserved; new migrations `104_connection_drafts` through `107_integration_content` follow it |
+
+This is the component rehearsal. General still owns the review, combined
+0.6.14 batch build and signed-stack rehearsal. Record the tested head and
+results in the PR/release handoff. The controller's required secret names,
+conditions and file destinations are in the
+[runtime secret inventory](../getting-started/integrations.md#controller-runtime-secret-inventory).
+
+After the roll, the operator separately verifies the exact registered HTTPS
+callback and reachable phone console, provisions secrets through `env.sops`,
+and tests a real Noomesh user with `noo auth connect google --pair`. Choose a
+small Drive folder and Gmail label, explicitly start sync, verify owner search,
+then verify a second user/admin cannot retrieve the first user's data. Pause,
+disconnect and confirm imported content disappears on removal. Automated
+fixtures do not substitute for this real-content and two-user acceptance.

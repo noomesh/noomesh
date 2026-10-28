@@ -2211,10 +2211,10 @@ CREATE INDEX ix_connection_sources_account ON noo_connection_sources(account_id,
     sql: include_str!("integrations/content.sql"),
 }];
 
-pub const CONNECTIONS_REVISION: &str = "103_connection_drafts";
-pub const INTEGRATION_OAUTH_REVISION: &str = "104_integration_oauth";
-pub const INTEGRATION_PAIRING_REVISION: &str = "105_integration_pairing";
-pub const INTEGRATION_CONTENT_REVISION: &str = "106_integration_content";
+pub const CONNECTIONS_REVISION: &str = "104_connection_drafts";
+pub const INTEGRATION_OAUTH_REVISION: &str = "105_integration_oauth";
+pub const INTEGRATION_PAIRING_REVISION: &str = "106_integration_pairing";
+pub const INTEGRATION_CONTENT_REVISION: &str = "107_integration_content";
 
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A

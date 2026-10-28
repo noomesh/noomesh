@@ -239,7 +239,14 @@ mod tests {
 
     #[tokio::test]
     async fn integration_sessions_and_credentials_are_owner_bound_and_single_use() {
-        let Ok(dsn) = std::env::var("NOO_BROKER_TEST_DSN") else {
+        let dsn = std::env::var("NOO_BROKER_TEST_DSN")
+            .ok()
+            .filter(|s| !s.is_empty());
+        assert!(
+            std::env::var_os("NOO_REQUIRE_GOOGLE_REHEARSAL").is_none() || dsn.is_some(),
+            "Google rehearsal requires NOO_BROKER_TEST_DSN; refusing a skipped database test"
+        );
+        let Some(dsn) = dsn else {
             return;
         };
         let admin = sqlx::PgPool::connect(&dsn).await.unwrap();

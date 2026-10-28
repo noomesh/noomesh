@@ -139,10 +139,14 @@ mod tests {
     /// CI supplies a scratch database, as for the broker's other SQL tests.
     #[tokio::test]
     async fn connections_keep_multiple_accounts_and_sources_private() {
-        let Some(dsn) = std::env::var("NOO_BROKER_TEST_DSN")
+        let dsn = std::env::var("NOO_BROKER_TEST_DSN")
             .ok()
-            .filter(|s| !s.is_empty())
-        else {
+            .filter(|s| !s.is_empty());
+        assert!(
+            std::env::var_os("NOO_REQUIRE_GOOGLE_REHEARSAL").is_none() || dsn.is_some(),
+            "Google rehearsal requires NOO_BROKER_TEST_DSN; refusing a skipped database test"
+        );
+        let Some(dsn) = dsn else {
             return;
         };
         let admin = sqlx::PgPool::connect(&dsn).await.unwrap();

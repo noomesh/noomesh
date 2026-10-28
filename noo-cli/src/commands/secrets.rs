@@ -739,7 +739,7 @@ pub const CORE_REGISTRY: &[SecretSpec] = &[
         key: "NOO_INTEGRATIONS_KEY",
         class: Class::ControllerLocal,
         gen_bytes: 32,
-        consequence: "encrypts connected-account tokens and pending OAuth sessions; rotating without migration requires every connected account to sign in again",
+        consequence: "encrypts connected-account tokens, pending OAuth sessions, private documents and sync cursors; rotating without migration requires every connected account to sign in again and personal content to be re-imported",
         consumers: &["noo-gateway"],
         required_when: Requirement::Always,
     },

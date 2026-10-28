@@ -40,7 +40,12 @@ impl Db {
     async fn new() -> Option<Self> {
         let dsn = std::env::var("NOO_BROKER_TEST_DSN")
             .ok()
-            .filter(|s| !s.is_empty())?;
+            .filter(|s| !s.is_empty());
+        assert!(
+            std::env::var_os("NOO_REQUIRE_GOOGLE_REHEARSAL").is_none() || dsn.is_some(),
+            "Google rehearsal requires NOO_BROKER_TEST_DSN; refusing a skipped database test"
+        );
+        let dsn = dsn?;
         let admin = PgPool::connect(&dsn).await.unwrap();
         let schema = format!("personal_{}", Uuid::new_v4().simple());
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
