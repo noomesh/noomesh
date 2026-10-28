@@ -516,7 +516,7 @@ func TestVLLMEntrypointRequiresAClientCertificate(t *testing.T) {
 // container's own port; the image order tries a built stunnel before the
 // alpine fallback; no host port is ever published.
 func TestSidecarSpec(t *testing.T) {
-	conf := stunnelConf("llamacpp", "noo-stunnel-llamacpp", 8085, 8085)
+	conf := stunnelConf("llamacpp", "noo-stunnel-llamacpp", 8085, 8085, "awolf")
 	for _, needle := range []string{
 		"verify = 2", "accept = noo-stunnel-llamacpp:8085", "connect = 127.0.0.1:8085",
 		"cert = /tls/services/llamacpp/service.crt", "key = /tls/services/llamacpp/service.key",
@@ -609,7 +609,7 @@ func TestTheSidecarIsTheOnlyDoor(t *testing.T) {
 		if got, want := DoorNetworkMode(b), "container:"+SidecarContainerFor(b); got != want {
 			t.Errorf("%s network mode %q, want %q", b, got, want)
 		}
-		conf := stunnelConf(SidecarFor(b), SidecarContainerFor(b), DoorPort(b), 1234)
+		conf := stunnelConf(SidecarFor(b), SidecarContainerFor(b), DoorPort(b), 1234, "awolf")
 		if strings.Contains(conf, "0.0.0.0") || !strings.Contains(conf, "accept = "+SidecarContainerFor(b)+":") ||
 			!strings.Contains(conf, "connect = 127.0.0.1:1234") {
 			t.Errorf("%s conf:\n%s", b, conf)
@@ -793,5 +793,73 @@ func TestSidecarRunsAsRootWhateverTheImageUserSays(t *testing.T) {
 	cfg := body[i : i+strings.Index(body[i:], "}\n")]
 	if !strings.Contains(cfg, "User:") || !strings.Contains(cfg, "sidecarUser") {
 		t.Errorf("startSidecar does not set User: sidecarUser on the door's container config:\n%s", cfg)
+	}
+}
+
+// A backend door admits its callers by name, not any cluster-CA leaf
+// (i301, internal#300): this node's own agent leaf (its node id, the leaf's
+// first DNS SAN) and the controller's service callers, as the compose doors
+// do. A conf without checkHost lets another node's leaf, an add-on's or a
+// backend's open the door.
+func TestTheDoorAdmitsNamedCallersOnly(t *testing.T) {
+	if BackendDoorGeneration < 4 {
+		t.Fatalf("BackendDoorGeneration = %d: a door started unpinned would never be recreated", BackendDoorGeneration)
+	}
+	for _, b := range []string{"llamacpp", "ollama", "embedding", "reranker"} {
+		conf := stunnelConf(SidecarFor(b), SidecarContainerFor(b), DoorPort(b), 1234, "awolf")
+		var pins []string
+		for _, l := range strings.Split(conf, "\n") {
+			if v, ok := strings.CutPrefix(l, "checkHost = "); ok {
+				pins = append(pins, v)
+			}
+		}
+		want := []string{"awolf", "gateway", "worker", "trellion", "trellion-intel", "evolve"}
+		if strings.Join(pins, ",") != strings.Join(want, ",") {
+			t.Errorf("%s pins %v, want %v:\n%s", b, pins, want, conf)
+		}
+		if !strings.Contains(conf, "verify = 2") {
+			t.Errorf("%s: no client certificate required:\n%s", b, conf)
+		}
+	}
+	// The compose doors admit the same service callers (the controller's
+	// own agent is appended there by the stunnel-self-pin entrypoint).
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "docker", "stunnel-llamacpp.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range doorCallers {
+		if !strings.Contains(string(raw), "checkHost = "+n+"\n") {
+			t.Errorf("docker/stunnel-llamacpp.conf does not admit %q, the agent's doors do", n)
+		}
+	}
+}
+
+// The self pin is read from the leaf the agent presents: its first DNS SAN.
+// A leaf that names a shared SAN first, or no leaf at all, is refused: the
+// door is not started open.
+func TestDoorSelfNameReadsTheAgentLeaf(t *testing.T) {
+	dir := t.TempDir()
+	write := func(sans []string) string {
+		crt, _ := selfSignedLeaf(t, sans)
+		p := filepath.Join(dir, sans[0]+".crt")
+		if err := os.WriteFile(p, crt, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	t.Setenv("NOO_TLS_CERT", write([]string{"robopi", "localhost", "node-agent"}))
+	if got, err := doorSelfName(); err != nil || got != "robopi" {
+		t.Fatalf("doorSelfName() = %q, %v; want robopi", got, err)
+	}
+	t.Setenv("NOO_TLS_CERT", write([]string{"localhost", "node-agent"}))
+	if _, err := doorSelfName(); err == nil {
+		t.Error("a leaf naming localhost first must not become the pin (every node leaf carries it)")
+	}
+	t.Setenv("NOO_TLS_CERT", "")
+	if _, err := doorSelfName(); err == nil {
+		t.Error("no leaf: the door must refuse, not start unpinned")
+	}
+	if _, err := checkDoorPin("a\nverify = 0"); err == nil {
+		t.Error("a name that breaks its conf line must be refused")
 	}
 }
