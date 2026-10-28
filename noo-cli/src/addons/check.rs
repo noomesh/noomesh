@@ -30,6 +30,18 @@ use super::guards::{self, Checked, Core};
 use super::resolve::Refusal;
 use super::{decls, trust};
 
+/// What can still refuse a bundle this passes. Printed on every pass (and in
+/// `--json` as `not_checked`), so exit 0 means "passes enable's guard and
+/// resources checks" and nothing more. routes.json is listed rather than
+/// half-validated: the gateway's validator is the one definition of it.
+pub const NOT_CHECKED: &[&str] = &[
+    "routes.json content (the gateway validates it on load)",
+    "the lock's signature and file hashes",
+    "the trust key",
+    "the stack's base-image row",
+    "the image pull",
+];
+
 /// The bundle's checked files (name to bytes) from `dir`. A symlink or a
 /// directory under a checked name is not read (as `pins::materialised_files`).
 /// A directory with none of them is an error: there would be nothing to check.
@@ -111,6 +123,18 @@ mod tests {
 
     fn clean(d: &Path) {
         let _ = std::fs::remove_dir_all(d.parent().unwrap());
+    }
+
+    /// A pass must not imply more than was checked: every refusal source
+    /// this verb cannot see is named.
+    #[test]
+    fn a_pass_names_what_it_did_not_check() {
+        let all = NOT_CHECKED.join(" ");
+        for must in ["routes.json", "signature", "trust key", "base-image", "pull"] {
+            assert!(all.contains(must), "{must} missing from {all}");
+        }
+        let usage = crate::usage::USAGE.iter().find(|(w, _, _)| *w == ["addons", "check"]).expect("usage row");
+        assert!(usage.2.contains("not routes.json") && usage.2.contains("signature"), "{}", usage.2);
     }
 
     #[test]

@@ -382,7 +382,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["addons", "list"], "", "Show every add-on: declared, effective and whether the licence grants it"),
     (&["addons", "show"], "<name>", "Show one add-on's switch, pin, and the database, workloads and inputs its bundle declares"),
     (&["addons", "enable"], "<name> [--force] [--lock <path|https-url>] [--provision-only]", "Pin an add-on's signed lock, mint credentials, declare it ON (--provision-only: DB only)"),
-    (&["addons", "check"], "<bundle-dir> [--name <addon>]", "Run the checks enable runs on a bundle directory (overlay, resources, system, workloads); installs nothing"),
+    (&["addons", "check"], "<bundle-dir> [--name <addon>]", "Run enable's guard and resources checks on a bundle dir; not routes.json, signature, trust key or image"),
     (&["addons", "trust-key"], "<name> <pubkey> [--registry <host/path>] [--dev] [--expires <dur>]", "Trust a third-party add-on's signing key; --dev --expires (max 30d): a temporary dev key"),
     (&["addons", "untrust-key"], "<name> [<pubkey>] [--dev]", "Stop trusting a third-party add-on's signing key; --dev removes its dev key(s)"),
     (&["addons", "set"], "<name> --delegate tasks|off", "Let an add-on act on a person's tasks (needs its manifest to declare it too)"),
