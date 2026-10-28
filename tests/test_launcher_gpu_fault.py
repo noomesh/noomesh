@@ -242,32 +242,37 @@ def _probe(tmp_path, smi=None, lspci=None, fn="_compose_gpu_state"):
 SMI_OK = 'case "$*" in -L) echo "GPU 0: RTX 3060";; *) echo 6144;; esac'
 SMI_LOST = 'echo "Unable to determine the device handle for GPU0: Unknown Error" >&2; exit 255'
 SMI_LISTS_BUT_NO_HANDLE = 'case "$*" in -L) echo "GPU 0: RTX 3060";; *) echo "Unknown Error" >&2; exit 255;; esac'
+# A unified-memory GPU (GB10, Jetson): memory.total is "[N/A]", the index answers.
+SMI_UNIFIED = 'case "$*" in -L) echo "GPU 0: NVIDIA GB10";; *query-gpu=index*) echo 0;; *) echo "[N/A]";; esac'
 LSPCI_NVIDIA = 'echo "01:00.0 VGA compatible controller: NVIDIA Corporation GA106M [GeForce RTX 3060 Mobile]"'
 
 
 def test_a_working_gpu_is_ok_and_prints_no_notice(tmp_path):
-    assert _probe(tmp_path, smi=SMI_OK).stdout.strip() == "ok"
-    r = _probe(tmp_path, smi=SMI_OK, fn="compose_gpu_notice")
-    assert r.stdout == "" and r.stderr == ""
+    for smi in (SMI_OK, SMI_UNIFIED):
+        assert _probe(tmp_path, smi=smi).stdout.strip() == "ok", smi
+        r = _probe(tmp_path, smi=smi, fn="compose_gpu_notice")
+        assert r.stdout == "" and r.stderr == "", smi
 
 
 def test_a_driver_that_lost_the_gpu_is_lost_and_the_notice_names_cause_and_choice(tmp_path):
     for smi in (SMI_LOST, SMI_LISTS_BUT_NO_HANDLE):
         assert _probe(tmp_path, smi=smi).stdout.strip() == "lost", smi
     r = _probe(tmp_path, smi=SMI_LOST, fn="compose_gpu_notice")
-    assert "the NVIDIA driver lost the GPU: reboot, or NOO_COMPOSE_GPU=0 noo stack restart to run the embedder on CPU" in r.stderr, r.stderr
+    assert "the NVIDIA driver lost the GPU (nvidia-smi cannot read it): the embedder starts on CPU; reboot to get the GPU back" in r.stderr, r.stderr
     assert len(r.stderr.strip().splitlines()) == 1
 
 
-def test_a_card_on_the_bus_with_no_nvidia_smi_is_lost_and_no_card_is_none(tmp_path):
-    assert _probe(tmp_path, lspci=LSPCI_NVIDIA).stdout.strip() == "lost"
-    assert _probe(tmp_path, lspci="echo '00:02.0 VGA compatible controller: Intel'").stdout.strip() == "none"
-    r = _probe(tmp_path, fn="compose_gpu_notice")
-    assert r.stderr == "", "a CPU-only box is not a fault"
+def test_no_nvidia_driver_is_none_with_or_without_a_card(tmp_path):
+    # A card with no driver installed is a box set up without the NVIDIA
+    # stack: no fault to name on every start.
+    for lspci in (LSPCI_NVIDIA, "echo '00:02.0 VGA compatible controller: Intel'"):
+        assert _probe(tmp_path, lspci=lspci).stdout.strip() == "none", lspci
+        r = _probe(tmp_path, lspci=lspci, fn="compose_gpu_notice")
+        assert r.stderr == "", "no driver is not a fault"
 
 
 def test_the_overlay_is_requested_only_of_a_gpu_that_answers(tmp_path):
-    for smi, want in ((SMI_OK, 0), (SMI_LOST, 1), (SMI_LISTS_BUT_NO_HANDLE, 1)):
+    for smi, want in ((SMI_OK, 0), (SMI_UNIFIED, 0), (SMI_LOST, 1), (SMI_LISTS_BUT_NO_HANDLE, 1)):
         assert _probe(tmp_path, smi=smi, fn="_compose_gpu_visible").returncode == want, smi
 
 
