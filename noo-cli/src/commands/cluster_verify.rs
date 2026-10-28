@@ -2267,10 +2267,20 @@ pub(crate) fn pki_key_modes_check(issues: &[crate::pki::KeyIssue], grant_lines: 
         return warn(
             "pki key modes",
             format!("no reader entry for {} (left 0644)", unknown.join(", ")),
-            Some("add the container uid to SERVICE_KEY_READERS in noo-cli/src/pki.rs".into()),
+            // A leaf with no reader entry is a third-party add-on's: its only
+            // consumers are the provision copies, so owner-only is safe.
+            Some(unknown_reader_remedy(&issues.iter().filter(|i| i.kind == K::UnknownReader).map(|i| i.rel.clone()).collect::<Vec<_>>())),
         );
     }
     ok("pki key modes", format!("{total_keys} private key(s), each readable only by its reader"))
+}
+
+/// The command that closes a "no reader entry" row: tighten each key to
+/// owner-only (the operator was told to `chmod 600` by hand, i277a).
+fn unknown_reader_remedy(rels: &[String]) -> String {
+    let dir = crate::pki::pki_dir();
+    let paths: Vec<String> = rels.iter().map(|r| dir.join(r).display().to_string()).collect();
+    format!("chmod 600 {}", paths.join(" "))
 }
 
 /// `/etc/docker/daemon.json`: `Ok(None)` when there is none.
@@ -5280,28 +5290,183 @@ fn remedies_to_print<'a>(title: &str, checks: &'a [Check]) -> Vec<(&'a str, Vec<
     out
 }
 
-fn render(title: &str, checks: &[Check]) -> bool {
-    println!("{}", ui::section(title));
-    let rows: Vec<Vec<String>> = checks.iter().map(|c| {
-        let (glyph, detail) = match c.verdict {
-            Verdict::Ok => (Glyph::Ok, ui::muted(&c.detail)),
-            Verdict::Warn => (Glyph::Warn, ui::warn(&c.detail)),
-            Verdict::Fail => (Glyph::Err, ui::err(&c.detail)),
-            Verdict::Starting => (Glyph::Warn, ui::warn(&c.detail)),
-            // Plain text: the row states what is exposed and must be read, not dimmed.
-            Verdict::Accepted => (Glyph::Accepted, c.detail.clone()),
-        };
-        vec![ui::glyph_cell(glyph), c.name.to_string(), detail]
-    }).collect();
-    print!("{}", ui::table(&[Col::left(""), Col::left("invariant"), Col::left("state")], &rows));
+/// The `at_rest_dirs` rows. In the default output they print as one
+/// "data at rest" row that names only the ones that are not clean (the
+/// 0.6.12 roll printed nine near-identical rows).
+const AT_REST_DIR_ROWS: [&str; 9] = [
+    "loki at rest", "postgres at rest", "redis at rest", "nats at rest", "prometheus at rest",
+    "grafana at rest", "noo-data at rest", "pki at rest", "age key at rest",
+];
+
+/// How many rows of a section hold, warn, fail or are accepted. A
+/// `Starting` row counts as a warning: it prints with the same glyph.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Counts {
+    ok: usize,
+    warn: usize,
+    fail: usize,
+    accepted: usize,
+}
+
+/// What one section prints: its counts and the rows to show.
+#[derive(Debug, PartialEq)]
+struct Digest {
+    counts: Counts,
+    rows: Vec<Check>,
+}
+
+fn severity(v: Verdict) -> u8 {
+    match v {
+        Verdict::Ok => 0,
+        Verdict::Accepted => 1,
+        Verdict::Warn => 2,
+        Verdict::Starting => 3,
+        Verdict::Fail => 4,
+    }
+}
+
+/// The rows a section prints. Verbose: every row, as ever. Default: only
+/// the rows that are not a plain pass, with the `* at rest` rows folded
+/// into one "data at rest" row that names the ones that need reading.
+///
+/// An Accepted row stays in the default output: it is a recorded opt-out
+/// that leaves data in the clear (the at-rest opt-out) or backups on this
+/// disk only (a declined offsite copy), it is not a pass, and the
+/// reader should see it every run.
+fn digest(checks: &[Check], verbose: bool) -> Digest {
+    let mut counts = Counts::default();
+    for c in checks {
+        match c.verdict {
+            Verdict::Ok => counts.ok += 1,
+            Verdict::Warn | Verdict::Starting => counts.warn += 1,
+            Verdict::Fail => counts.fail += 1,
+            Verdict::Accepted => counts.accepted += 1,
+        }
+    }
+    if verbose {
+        return Digest { counts, rows: checks.to_vec() };
+    }
+    let mut rows: Vec<Check> = Vec::new();
+    let mut at_rest: Vec<&Check> = Vec::new();
+    let mut slot = 0;
+    for c in checks.iter().filter(|c| c.verdict != Verdict::Ok) {
+        if AT_REST_DIR_ROWS.contains(&c.name) {
+            if at_rest.is_empty() {
+                slot = rows.len();
+            }
+            at_rest.push(c);
+        } else {
+            rows.push(c.clone());
+        }
+    }
+    if let Some(worst) = at_rest.iter().copied().max_by_key(|c| severity(c.verdict)) {
+        let names: Vec<&str> = at_rest.iter().map(|c| c.name.trim_end_matches(" at rest")).collect();
+        let more = if at_rest.len() > 1 { "; --verbose lists each" } else { "" };
+        rows.insert(slot, Check {
+            name: "data at rest",
+            verdict: worst.verdict,
+            detail: format!("{} — {}{more}", names.join(", "), worst.detail),
+            remedy: worst.remedy.clone(),
+        });
+    }
+    Digest { counts, rows }
+}
+
+/// `✓ node host3  ✓ 13  ! 1  ✗ 1`: the section's glyph (its worst row),
+/// its name, and the counts; zero counts stay out except the passes.
+fn summary_line(title: &str, c: &Counts) -> String {
+    let lead = if c.fail > 0 { Glyph::Err } else if c.warn > 0 { Glyph::Warn } else if c.accepted > 0 { Glyph::Accepted } else { Glyph::Ok };
+    let mut parts = vec![format!("{} {}", ui::glyph(Glyph::Ok), c.ok)];
+    for (n, g) in [(c.warn, Glyph::Warn), (c.fail, Glyph::Err), (c.accepted, Glyph::Accepted)] {
+        if n > 0 {
+            parts.push(format!("{} {n}", ui::glyph(g)));
+        }
+    }
+    format!("{} {}  {}", ui::glyph(lead), ui::emph(title), parts.join("  "))
+}
+
+/// What the default output has seen across its sections, for the one
+/// closing verdict line.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Tally {
+    /// Failing rows, named `row` (controller) or `row (node x)`.
+    problems: Vec<String>,
+    /// Rows still starting.
+    starting: Vec<String>,
+    /// Warnings and accepted rows.
+    notes: usize,
+    /// ` — 3 node(s) on stack-v0.6.13`, or empty.
+    context: String,
+}
+
+impl Tally {
+    fn add(&mut self, title: &str, checks: &[Check]) {
+        let label = |name: &str| if title == "controller" { name.to_string() } else { format!("{name} ({title})") };
+        for c in digest(checks, false).rows {
+            let bucket = match c.verdict {
+                Verdict::Fail => &mut self.problems,
+                Verdict::Starting => &mut self.starting,
+                _ => {
+                    self.notes += 1;
+                    continue;
+                }
+            };
+            let l = label(c.name);
+            if !bucket.contains(&l) {
+                bucket.push(l);
+            }
+        }
+    }
+}
+
+/// The one closing line of the default output, and its glyph.
+fn verdict_line(t: &Tally) -> (Glyph, String) {
+    if !t.problems.is_empty() {
+        let n = t.problems.len();
+        return (Glyph::Err, format!("{n} {} you: {}", if n == 1 { "problem needs" } else { "problems need" }, t.problems.join(", ")));
+    }
+    if !t.starting.is_empty() {
+        return (Glyph::Warn, format!("still starting: {} — re-run in a minute, or `noo cluster verify --wait`", t.starting.join(", ")));
+    }
+    let seen = match t.notes {
+        0 => String::new(),
+        n => format!("; {n} row(s) above to read"),
+    };
+    (Glyph::Ok, format!("fleet healthy{}{seen}", t.context))
+}
+
+fn render(title: &str, checks: &[Check], verbose: bool) -> bool {
+    let d = digest(checks, verbose);
+    if verbose {
+        println!("{}", ui::section(title));
+    } else {
+        println!("{}", summary_line(title, &d.counts));
+    }
+    if !d.rows.is_empty() {
+        let rows: Vec<Vec<String>> = d.rows.iter().map(|c| {
+            let (glyph, detail) = match c.verdict {
+                Verdict::Ok => (Glyph::Ok, ui::muted(&c.detail)),
+                Verdict::Warn => (Glyph::Warn, ui::warn(&c.detail)),
+                Verdict::Fail => (Glyph::Err, ui::err(&c.detail)),
+                Verdict::Starting => (Glyph::Warn, ui::warn(&c.detail)),
+                // Plain text: the row states what is exposed and must be read, not dimmed.
+                Verdict::Accepted => (Glyph::Accepted, c.detail.clone()),
+            };
+            vec![ui::glyph_cell(glyph), c.name.to_string(), detail]
+        }).collect();
+        print!("{}", ui::table(&[Col::left(""), Col::left("invariant"), Col::left("state")], &rows));
+    }
     let failed: Vec<&Check> = checks.iter().filter(|c| c.verdict == Verdict::Fail).collect();
     // FAIL remedies always; WARN remedies too in the controller section (the
     // v0.2.95 roll: `service-key grants` warned with a remedy nobody saw).
+    // Judged on every row, not the digest's: a grouped row keeps its remedy.
     let grouped = remedies_to_print(title, checks);
     let whys: Vec<String> = grouped.iter().map(|(_, names)| names.join(", ")).collect();
     let entries: Vec<(&str, &str)> = grouped.iter().zip(&whys).map(|((r, _), w)| (*r, w.as_str())).collect();
     ui::guide(&entries);
-    println!();
+    if verbose || !d.rows.is_empty() {
+        println!();
+    }
     failed.is_empty()
 }
 
@@ -5327,6 +5492,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut all_ok = true;
     let mut any_starting = false;
     let mut json_out = serde_json::Map::new();
+    let mut tally = Tally::default();
 
     if want_nodes || nodes.is_empty() {
         // Best-effort read: this verb is also run from `onboard`'s last step
@@ -5363,6 +5529,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let now = now_unix();
         if !g.json {
             println!("{}", ui::header("cluster verify", Some(&format!("{} node(s) · controller {tag}", selected.len()))));
+            tally.context = format!(" — {} node(s) on {tag}", selected.len());
         }
         let mut node_json = Vec::new();
         for n in selected {
@@ -5374,7 +5541,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             if g.json {
                 node_json.push(serde_json::json!({ "node": id, "ok": node_ok, "checks": checks_json(&checks) }));
             } else {
-                render(&format!("node {id}"), &checks);
+                let title = format!("node {id}");
+                render(&title, &checks, g.verbose);
+                tally.add(&title, &checks);
             }
         }
         json_out.insert("nodes".into(), Value::Array(node_json));
@@ -5405,7 +5574,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 if g.json {
                     seat_json.push(serde_json::json!({ "seat": name, "ok": seat_ok, "checks": checks_json(&checks) }));
                 } else {
-                    render(&format!("seat {name}"), &checks);
+                    let title = format!("seat {name}");
+                    render(&title, &checks, g.verbose);
+                    tally.add(&title, &checks);
                 }
             }
             json_out.insert("seats".into(), Value::Array(seat_json));
@@ -5807,7 +5978,8 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             if !want_nodes {
                 println!("{}", ui::header("cluster verify", Some("controller")));
             }
-            render("controller", &checks);
+            render("controller", &checks, g.verbose);
+            tally.add("controller", &checks);
         }
     }
 
@@ -5815,6 +5987,11 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         json_out.insert("ok".into(), Value::Bool(all_ok));
         json_out.insert("starting".into(), Value::Bool(any_starting));
         println!("{}", Value::Object(json_out));
+    } else if !g.verbose {
+        // The digest closes on one verdict, then the way to every row.
+        let (glyph, line) = verdict_line(&tally);
+        println!("{}", ui::status_line(glyph, &line));
+        ui::guide(&[("noo cluster verify --verbose", "every row, the passing ones too")]);
     } else if all_ok {
         println!("{}", ui::status_line(Glyph::Ok, "every invariant holds"));
     } else if any_starting {
@@ -5878,7 +6055,7 @@ pub(crate) fn verify_node_after_apply(g: &Globals, node: &str) -> bool {
     let checks = node_checks(&with_harness_wanted(g, &n), &controller_stack_tag(), env!("CARGO_PKG_VERSION"), now_unix(), signing_adopted_for(node));
     // A `starting` row is not a pass: the caller's note
     // says the invariant does not hold YET, and `cluster verify` re-checks.
-    render(&format!("verify {node}"), &checks) && !checks.iter().any(|c| c.verdict == Verdict::Starting)
+    render(&format!("verify {node}"), &checks, g.verbose) && !checks.iter().any(|c| c.verdict == Verdict::Starting)
 }
 
 /// Two and a half heartbeat intervals: one missed beat is not a verdict.
@@ -7655,7 +7832,9 @@ mod tests {
         let unknown = KeyIssue { rel: "services/mystery/service.key".into(), mode: 0o644, reader: KeyReader::Unknown, kind: KeyIssueKind::UnknownReader };
         let c = pki_key_modes_check(&[unknown], &[], 5);
         assert_eq!(c.verdict, Verdict::Warn);
-        assert!(c.remedy.unwrap().contains("SERVICE_KEY_READERS"));
+        let r = c.remedy.unwrap();
+        assert!(r.starts_with("chmod 600 ") && r.ends_with("services/mystery/service.key"), "{r}");
+        assert!(!r.contains("noo-cli/src") && !r.contains("SERVICE_KEY_READERS"), "{r}");
         // Exposure outranks an unreadable key: the fix for both is the same verb,
         // and the sudo line rides along when the verb alone cannot finish it.
         let c = pki_key_modes_check(&[exposed, KeyIssue { rel: "x".into(), mode: 0o640, reader: KeyReader::ContainerUid(70), kind: KeyIssueKind::Unreadable }], std::slice::from_ref(&line), 5);
@@ -8759,7 +8938,8 @@ mod tests {
         assert_ne!(ui::glyph(Glyph::Accepted), ui::glyph(Glyph::Warn));
         assert_ne!(ui::glyph(Glyph::Accepted), ui::glyph(Glyph::Ok));
         // render() is the one place a row becomes a glyph; it must not drop Accepted into a failure.
-        assert!(render("controller", &rows));
+        assert!(render("controller", &rows, true));
+        assert!(render("controller", &rows, false));
     }
 
     #[test]
@@ -10166,5 +10346,145 @@ mod backup_rows_tests {
         assert_eq!(c.remedy.as_deref(), Some("noo backups setup"));
         assert!(c.detail.contains("every backup is on this machine"));
         assert_eq!(offsite_backup_check(&Ok(Some(Destination::Declined)), &Offsite::NoDump).verdict, Verdict::Accepted);
+    }
+}
+
+/// The default `cluster verify` output is a digest (i277d): counts, only the
+/// rows that are not a plain pass, one verdict. `--verbose` is the full table.
+#[cfg(test)]
+mod digest_tests {
+    use super::*;
+
+    const PLAIN: &str = "plaintext, in the clear on that disk";
+
+    /// A realistic controller section: lots of passes, nine at-rest rows (one
+    /// of them a warning), a failing sandbox row and a warning.
+    fn controller() -> Vec<Check> {
+        let mut v: Vec<Check> = ["posture", "service keys", "pki key modes", "postgres tls", "gateway redis", "nats bus"]
+            .iter().map(|n| ok(*n, "ok")).collect();
+        for n in AT_REST_DIR_ROWS {
+            v.push(if n == "postgres at rest" {
+                warn(n, PLAIN, Some("move the data root onto a LUKS2 volume".into()))
+            } else {
+                ok(n, "on a dm-crypt device")
+            });
+        }
+        v.push(fail("sandbox", "bwrap cannot mount /proc", "noo sandbox doctor"));
+        v.push(warn("backup age", "newest dump is 3 days old", None));
+        v
+    }
+
+    #[test]
+    fn many_passes_and_one_fail_digest_to_the_counts_and_the_problem_rows() {
+        let checks = controller();
+        let d = digest(&checks, false);
+        assert_eq!(d.counts, Counts { ok: 14, warn: 2, fail: 1, accepted: 0 });
+        assert!(d.rows.iter().all(|c| c.verdict != Verdict::Ok), "a passing row reached the digest: {:?}", d.rows);
+        let names: Vec<&str> = d.rows.iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["data at rest", "sandbox", "backup age"]);
+        // The remedy still prints, from the full list of checks.
+        assert_eq!(remedies_to_print("controller", &checks)[0].0, "noo sandbox doctor");
+        let line = summary_line("controller", &d.counts);
+        assert!(line.contains("controller") && line.contains("14") && line.contains('1'), "{line}");
+    }
+
+    #[test]
+    fn at_rest_rows_group_into_one_row_naming_only_the_failing_dir() {
+        let d = digest(&controller(), false);
+        let rows: Vec<&Check> = d.rows.iter().filter(|c| c.name.contains("at rest")).collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "data at rest");
+        assert_eq!(rows[0].verdict, Verdict::Warn);
+        assert!(rows[0].detail.starts_with("postgres — "), "{}", rows[0].detail);
+        assert!(!rows[0].detail.contains("loki") && !rows[0].detail.contains("redis"), "{}", rows[0].detail);
+        // Two not-clean dirs are both named; the worse verdict leads.
+        let mut checks = controller();
+        checks.push(fail("age key at rest", "world-readable", "chmod 600 key"));
+        let d = digest(&checks, false);
+        let g = d.rows.iter().find(|c| c.name == "data at rest").unwrap();
+        assert_eq!(g.verdict, Verdict::Fail);
+        assert!(g.detail.starts_with("postgres, age key — "), "{}", g.detail);
+    }
+
+    #[test]
+    fn an_all_green_section_is_one_line_and_the_verdict_is_healthy() {
+        let checks: Vec<Check> = (0..12).map(|_| ok("bus", "ok")).collect();
+        let d = digest(&checks, false);
+        assert!(d.rows.is_empty());
+        assert_eq!(d.counts, Counts { ok: 12, ..Counts::default() });
+        assert_eq!(summary_line("node host3", &d.counts).lines().count(), 1);
+        let mut t = Tally { context: " — 2 node(s) on v0.6.13".into(), ..Tally::default() };
+        t.add("node host3", &checks);
+        t.add("controller", &checks);
+        let (g, line) = verdict_line(&t);
+        assert_eq!(g, Glyph::Ok);
+        assert_eq!(line, "fleet healthy — 2 node(s) on v0.6.13");
+    }
+
+    #[test]
+    fn the_verdict_names_the_problems_and_what_is_still_starting() {
+        let mut t = Tally::default();
+        t.add("controller", &controller());
+        let (g, line) = verdict_line(&t);
+        assert_eq!(g, Glyph::Err);
+        assert_eq!(line, "1 problem needs you: sandbox");
+        let mut t = Tally::default();
+        t.add("node a", &[fail("bus", "x", "noo fix"), ok("gpu", "ok")]);
+        t.add("node b", &[fail("bus", "x", "noo fix")]);
+        assert_eq!(verdict_line(&t).1, "2 problems need you: bus (node a), bus (node b)");
+        let mut t = Tally::default();
+        t.add("controller", &[Check { name: "loki", verdict: Verdict::Starting, detail: "starting".into(), remedy: None }]);
+        assert_eq!(verdict_line(&t).0, Glyph::Warn);
+        // A warning alone is healthy, with the count.
+        let mut t = Tally::default();
+        t.add("controller", &[warn("backup age", "old", None)]);
+        assert_eq!(verdict_line(&t).1, "fleet healthy; 1 row(s) above to read");
+    }
+
+    #[test]
+    fn an_accepted_row_stays_in_the_digest_and_is_counted_apart() {
+        let checks = vec![ok("a", "ok"), accepted("postgres at rest", "accepted risk"), accepted("loki at rest", "accepted risk")];
+        let d = digest(&checks, false);
+        assert_eq!(d.counts, Counts { ok: 1, warn: 0, fail: 0, accepted: 2 });
+        assert_eq!(d.rows.len(), 1);
+        assert_eq!(d.rows[0].verdict, Verdict::Accepted);
+    }
+
+    #[test]
+    fn verbose_keeps_every_row_in_order() {
+        let checks = controller();
+        let d = digest(&checks, true);
+        assert_eq!(d.rows, checks);
+        assert_eq!(d.counts, digest(&checks, false).counts);
+    }
+
+    #[test]
+    fn the_digest_leaves_the_exit_meaning_alone() {
+        // render's bool is "no FAIL row", verbose or not.
+        assert!(!render("controller", &controller(), false));
+        assert!(!render("controller", &controller(), true));
+        assert!(render("controller", &[ok("a", "ok"), warn("b", "w", None)], false));
+    }
+
+    #[test]
+    fn the_digest_group_list_covers_every_at_rest_dir_row() {
+        let env = |_: &str| -> Option<String> { None };
+        for r in at_rest_dirs(&env) {
+            assert!(AT_REST_DIR_ROWS.contains(&r.name), "{} would print as its own row", r.name);
+        }
+        assert_eq!(at_rest_dirs(&env).len(), AT_REST_DIR_ROWS.len());
+    }
+
+    /// i277d rule 4: a remedy is a command the operator can run.
+    #[test]
+    fn no_remedy_asks_for_a_source_edit() {
+        let unknown = crate::pki::KeyIssue {
+            rel: "services/mystery/service.key".into(), mode: 0o644,
+            reader: crate::pki::KeyReader::Unknown, kind: crate::pki::KeyIssueKind::UnknownReader,
+        };
+        let c = pki_key_modes_check(&[unknown], &[], 5);
+        let r = c.remedy.unwrap();
+        assert!(r.starts_with("chmod 600 "), "{r}");
+        assert!(!r.contains("noo-cli/src") && !r.contains("edit "), "{r}");
     }
 }
