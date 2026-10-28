@@ -1673,6 +1673,19 @@ pub(crate) mod agent_messaging {
         if matches!(to.as_str(), "*" | "broadcast") {
             return err_result(call, "broadcast is operator-only; address one agent or a thread".into());
         }
+        // A name nobody reads is refused, never "sent" (i277g). A loop is
+        // never an operator, so the names a refusal suggests are its own
+        // account's.
+        if let Err(e) = crate::agent_recipient::thread_needs_an_id(&to, arg_str(args, THREAD_KEYS).as_deref()) {
+            return err_result(call, e);
+        }
+        let checked = crate::agent_recipient::check(&state.db, &to, Some(crate::auth::account_of(&me.user))).await;
+        let warning = match checked {
+            Ok(crate::agent_recipient::Recipient::Known) => None,
+            Ok(crate::agent_recipient::Recipient::Unheld(candidates)) => Some(crate::agent_recipient::unheld_warning(&to, &candidates)),
+            Ok(crate::agent_recipient::Recipient::Unknown(candidates)) => return err_result(call, crate::agent_recipient::refusal(&to, &candidates)),
+            Err(e) => return err_result(call, format!("could not check the recipient '{to}', so nothing was sent: {e}")),
+        };
         let body = match (args.get("body").filter(|b| b.is_object()), arg_str(args, &["text", "message"])) {
             (Some(b), _) => b.clone(),
             (None, Some(t)) => json!({ "text": t }),
@@ -1698,7 +1711,11 @@ pub(crate) mod agent_messaging {
         match crate::agent_messages::publish(&state.js, &env).await {
             Ok(sent) => ok_result(
                 call,
-                json!({"sent": true, "id": env.id, "thread_id": env.thread_id, "to": env.to, "kind": env.kind, "signed": sent.sig.is_some()}).to_string(),
+                json!({
+                    "sent": true, "id": env.id, "thread_id": env.thread_id, "to": env.to, "kind": env.kind, "signed": sent.sig.is_some(),
+                    "warning": warning,
+                })
+                .to_string(),
             ),
             Err(e) => err_result(call, format!("send failed: {e}")),
         }

@@ -218,10 +218,15 @@ class PaiWorkflowList(ToolDef):
 @register
 class NooAgentSend(ToolDef):
     """Send a message to another agent on the mesh. Addressed by agent id
-    (e.g. "host3/claude-code-1"), or "thread" to post into an existing thread,
-    or "*" to broadcast (operators and internal services only). Recorded and
-    delivered over NATS; the sender is the caller's identity — user, node and
-    harness are derived from the credential, never from this call."""
+    (e.g. "host3/claude-code-1"), or "thread" to post into an existing thread
+    (needs thread_id), or "*" to broadcast (operators and internal services
+    only). A to that names no inbox (e.g. a bare "general" for
+    "rbpai/claude-general") is refused with the closest registered names, and
+    nothing is sent. A name under a real account that no session holds is
+    delivered, with a warning naming what you may have meant.
+    Recorded and delivered over NATS; the sender is the caller's identity —
+    user, node and harness are derived from the credential, never from this
+    call."""
 
     name: ClassVar[str] = "noo_agent_send"
     description: ClassVar[str] = __doc__
@@ -230,7 +235,10 @@ class NooAgentSend(ToolDef):
     tags: ClassVar[List[str]] = ["agents", "messaging", "external"]
     risk_level: ClassVar[RiskLevel] = RiskLevel.LOW
 
-    to: str = Field(description='Recipient agent id, "thread" (needs thread_id) or "*" for broadcast')
+    to: str = Field(
+        description='Recipient agent id (<account>/<type>-<session>; noo_agent_whoami shows yours), '
+        '"thread" (needs thread_id) or "*" for broadcast'
+    )
     text: Optional[str] = Field(default=None, description="Plain-text body (use body for structured JSON)")
     body: Optional[Dict[str, Any]] = Field(default=None, description="Structured JSON body (overrides text)")
     kind: Optional[str] = Field(default=None, description="message | task | result | ack | note (default message)")

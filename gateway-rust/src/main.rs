@@ -153,6 +153,7 @@ mod research_pipeline;
 mod heartbeat_reconcile;
 mod agent_crypto;
 mod agent_messages;
+mod agent_recipient;
 mod mesh_migrate;
 mod entitlement;
 mod jwks;

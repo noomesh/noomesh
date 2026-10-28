@@ -420,11 +420,11 @@
       "aliases": {},
       "auth": "cluster",
       "body_field": "",
-      "description": "Send a message to another agent on the mesh. Addressed by agent id\n(e.g. \"host3/claude-code-1\"), or \"thread\" to post into an existing thread,\nor \"*\" to broadcast (operators and internal services only). Recorded and\ndelivered over NATS; the sender is the caller's identity \u2014 user, node and\nharness are derived from the credential, never from this call.",
+      "description": "Send a message to another agent on the mesh. Addressed by agent id\n(e.g. \"host3/claude-code-1\"), or \"thread\" to post into an existing thread\n(needs thread_id), or \"*\" to broadcast (operators and internal services\nonly). A to that names no inbox (e.g. a bare \"general\" for\n\"rbpai/claude-general\") is refused with the closest registered names, and\nnothing is sent. A name under a real account that no session holds is\ndelivered, with a warning naming what you may have meant.\nRecorded and delivered over NATS; the sender is the caller's identity \u2014\nuser, node and harness are derived from the credential, never from this\ncall.",
       "had_custom_format": false,
       "input_schema": {
         "additionalProperties": false,
-        "description": "Send a message to another agent on the mesh. Addressed by agent id\n(e.g. \"host3/claude-code-1\"), or \"thread\" to post into an existing thread,\nor \"*\" to broadcast (operators and internal services only). Recorded and\ndelivered over NATS; the sender is the caller's identity \u2014 user, node and\nharness are derived from the credential, never from this call.",
+        "description": "Send a message to another agent on the mesh. Addressed by agent id\n(e.g. \"host3/claude-code-1\"), or \"thread\" to post into an existing thread\n(needs thread_id), or \"*\" to broadcast (operators and internal services\nonly). A to that names no inbox (e.g. a bare \"general\" for\n\"rbpai/claude-general\") is refused with the closest registered names, and\nnothing is sent. A name under a real account that no session holds is\ndelivered, with a warning naming what you may have meant.\nRecorded and delivered over NATS; the sender is the caller's identity \u2014\nuser, node and harness are derived from the credential, never from this\ncall.",
         "properties": {
           "agent": {
             "anyOf": [
@@ -522,7 +522,7 @@
             "title": "Thread Id"
           },
           "to": {
-            "description": "Recipient agent id, \"thread\" (needs thread_id) or \"*\" for broadcast",
+            "description": "Recipient agent id (<account>/<type>-<session>; noo_agent_whoami shows yours), \"thread\" (needs thread_id) or \"*\" for broadcast",
             "title": "To",
             "type": "string"
           }
