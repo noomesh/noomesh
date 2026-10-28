@@ -4704,6 +4704,11 @@ pub fn services(ctx: &mut Ctx) {
     // self-agent, further down.
     ensure_hostd_controller(ctx);
 
+    // The sandbox's AppArmor profile, before anything starts the stack: on
+    // an AppArmor host Docker's default profile stops Bubblewrap and the
+    // sandbox refuses every call (i263b).
+    super::sandbox_apparmor::ensure(ctx);
+
     // ── --from-archive: restore the carried database FIRST ──────────────
     // Ordering is the whole trick (learned live, 2026-09-01): the dump
     // carries schema + migration stamps, so it must land in an EMPTY
@@ -8446,7 +8451,7 @@ mod sudo_seam_tests {
     /// the UI, not on `--ci`, which is how 0.6.10–0.6.12-rc.1 prompted).
     #[test]
     fn every_onboard_sudo_goes_through_the_seam() {
-        let src = include_str!("steps.rs");
+        let src = concat!(include_str!("steps.rs"), include_str!("sandbox_apparmor.rs"));
         let raw = concat!("Command::new(", "\"sudo\")");
         let elevate = concat!("Command::new(", "elevate)");
         let ui_gate = concat!("if !ctx.ui.inherit_stdio() {\n", "        cmd.arg(\"-n\")");
