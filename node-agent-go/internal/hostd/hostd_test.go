@@ -897,6 +897,12 @@ func TestBootRestoreLogsWhatIsStillDown(t *testing.T) {
 	if got := strings.Join(logs, "\n"); !strings.Contains(got, "boot-restore: done") || !strings.Contains(got, down) {
 		t.Fatalf("the success log lacks the still-down line: %v", logs)
 	}
+	// The Runner keeps only stderr: the script's stdout (`started N
+	// container(s)`) reaches the log only because the script runs with
+	// stdout sent to stderr.
+	if got := strings.Join(fr.joined(), "\n"); !strings.Contains(got, "bash -c exec 1>&2\n_noo_lib=") {
+		t.Fatalf("boot-restore must send its stdout to the log:\n%s", got)
+	}
 
 	logs = nil
 	e, fr = testEngine(t)
