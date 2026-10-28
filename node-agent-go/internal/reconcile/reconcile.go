@@ -1200,6 +1200,22 @@ func specHash(p placement) string {
 	if p.Target != "" {
 		fmt.Fprintf(h, "target=%s\n", p.Target)
 	}
+	// The images the node derives from its OWN release, which the
+	// placement does not carry: the release-built backend image (only when
+	// the placement names none) and the door sidecar's. A stack roll moves
+	// NOO_IMAGE_TAG and nothing else, so without these a backend kept the
+	// previous release's image until something unrelated recreated it
+	// (awolf 2026-10-28: noo-llamacpp and noo-stunnel-llamacpp on v0.6.12
+	// after the 0.6.13 roll). Folded in only when set, so a node with no
+	// release pin, and a backend on an upstream image, keep their hash.
+	if p.Image == "" {
+		if img := dockerpkg.ReleaseBackendImage(p.Backend); img != "" {
+			fmt.Fprintf(h, "releaseimage=%s\n", img)
+		}
+	}
+	if img := dockerpkg.ReleaseSidecarImage(p.Backend); img != "" {
+		fmt.Fprintf(h, "sidecarimage=%s\n", img)
+	}
 	// Likewise the derived memory limit: a new limit needs a new container.
 	if p.MemoryLimitBytes > 0 {
 		fmt.Fprintf(h, "memlimit=%d\n", p.MemoryLimitBytes)

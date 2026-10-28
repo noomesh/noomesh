@@ -279,3 +279,27 @@ func (c *Client) removeSidecar(ctx context.Context, backend string) {
 	_, _ = c.docker.ContainerStop(ctx, name, client.ContainerStopOptions{Timeout: &timeout})
 	_, _ = c.docker.ContainerRemove(ctx, name, client.ContainerRemoveOptions{Force: true})
 }
+
+// ReleaseSidecarImage is the door sidecar image this node runs for backend
+// when that image is pinned by this node's own configuration: STUNNEL_IMAGE,
+// else its release ref NOO_IMAGE_PREFIX/stunnel:NOO_IMAGE_TAG. "" for a
+// backend with no sidecar, and for a node with neither (the compose-built
+// name and the alpine fallback do not move with a release).
+//
+// The reconciler folds it into the spec hash (reconcile.specHash): the
+// sidecar is recreated with its backend, and until 2026-10-28 nothing in the
+// hash moved when only the node's release did, so a stack roll left
+// noo-stunnel-llamacpp on the previous release's image.
+func ReleaseSidecarImage(backend string) string {
+	if SidecarContainerFor(backend) == "" {
+		return ""
+	}
+	if v := strings.TrimSpace(os.Getenv(StunnelImageEnv)); v != "" {
+		return v
+	}
+	prefix, tag := os.Getenv("NOO_IMAGE_PREFIX"), os.Getenv("NOO_IMAGE_TAG")
+	if prefix == "" || tag == "" {
+		return ""
+	}
+	return prefix + "/stunnel:" + tag
+}
