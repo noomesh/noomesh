@@ -150,6 +150,13 @@ pub struct SystemConfig {
     /// Declaring them here is what lets that chain drop to its DDL role.
     #[serde(default)]
     pub extensions: Vec<String>,
+    /// The runtime role may read `noo_addon_caller_keys` (the add-on caller
+    /// verify view). Set ONLY from an add-on's signed `system.json`
+    /// (`verify_callers`), never from `noomesh.yaml`: `serde(skip)`, so a
+    /// `systems:` entry cannot grant itself sight of the caller keys through
+    /// a config write.
+    #[serde(skip)]
+    pub verify_callers: bool,
 }
 
 /// Writable directory where agents save reports, artifacts, and logs.

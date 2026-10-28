@@ -62,7 +62,7 @@
 //!
 //! Tables keep living in `public` until phase B′ moves them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sqlx::PgPool;
 
@@ -530,6 +530,145 @@ async fn ensure_extensions(db: &PgPool, system: &str, spec: &SystemConfig) -> Re
     Ok(())
 }
 
+// ── the caller-verify grant: declared, never named ──────────────────────
+//
+// An add-on that checks the bearer the gateway presents (`addon_auth`,
+// consumers `addon-caller:*`) reads the `noo_addon_caller_keys` view
+// (mesh revision 077). 077 granted it to a hard-coded role list, which core
+// cannot extend without naming an add-on. Now the add-on DECLARES it in its
+// signed `system.json` (`verify_callers: true`) and the broker grants it to
+// that add-on's runtime role.
+//
+// The grant is a membership in ONE group role, [`CALLER_VERIFIERS`], which
+// alone holds USAGE on the view's schema and SELECT on the view. Why not a
+// direct GRANT per add-on: revocation has to find "every role the broker
+// granted this to" on a later boot, when the add-on that asked may be off,
+// unverified or gone from the map entirely. A direct grant is
+// indistinguishable from one a migration made (077's `noo_evolve`), so a
+// sweep over the view's ACL would either miss the broker's own grants or take
+// 077's. The group's member list IS the broker's grant list: the reconcile
+// revokes every member it did not grant this pass, and touches nothing else.
+
+/// The NOLOGIN group role whose members may read the caller-verify view.
+/// Reserved as an add-on id (`addon_decls::RESERVED_IDS` has
+/// `caller_verifiers`), so no bundle's derived runtime role can be it.
+pub(crate) const CALLER_VERIFIERS: &str = "noo_caller_verifiers";
+
+/// The view the group may read, created by mesh revision 077.
+const CALLER_VIEW: &str = "noo_addon_caller_keys";
+
+/// The schema holding the caller view: `mesh` on a cluster install, `public`
+/// on a legacy one, `None` when 077 found no `noo_service_keys` to view.
+/// Looked up in the catalogue, not through `to_regclass`: this pool's
+/// search_path is not the migration's.
+async fn caller_view_schema(db: &PgPool) -> Result<Option<String>, String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT n.nspname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relname = $1 AND c.relkind = 'v' AND n.nspname IN ('mesh', 'public') \
+         ORDER BY n.nspname = 'mesh' DESC LIMIT 1",
+    )
+    .bind(CALLER_VIEW)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// The roles that are members of [`CALLER_VERIFIERS`] now. Empty when the
+/// group does not exist (an install where nothing ever declared it).
+async fn caller_verifier_members(db: &PgPool) -> Result<Vec<String>, String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT m.rolname::text FROM pg_auth_members am \
+         JOIN pg_roles g ON g.oid = am.roleid JOIN pg_roles m ON m.oid = am.member \
+         WHERE g.rolname = $1 ORDER BY 1",
+    )
+    .bind(CALLER_VERIFIERS)
+    .fetch_all(db)
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// `name` as a quoted SQL identifier, for a role name read back from the
+/// catalogue (never from config: those are checked by [`valid_identifier`]).
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Create the group if absent (no login, no escalation) and (re)grant it the
+/// view. Idempotent; the grants follow a view a later revision recreates.
+async fn ensure_caller_verifier_group(db: &PgPool) -> Result<(), String> {
+    if !role_exists(db, CALLER_VERIFIERS).await.map_err(|e| e.to_string())? {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE ROLE {CALLER_VERIFIERS} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS"
+        )))
+        .execute(db)
+        .await
+        .map_err(|e| format!("CREATE ROLE {CALLER_VERIFIERS} failed: {e}"))?;
+        tracing::info!(role = CALLER_VERIFIERS, "caller-verifier group role created");
+    }
+    let Some(schema) = caller_view_schema(db).await? else {
+        // No view to grant (077 found no noo_service_keys). Membership still
+        // records the declaration; the grant follows on the boot that has it.
+        tracing::warn!(view = CALLER_VIEW, "caller-verify view not found; the group holds no SELECT yet");
+        return Ok(());
+    };
+    for stmt in [
+        format!("GRANT USAGE ON SCHEMA {} TO {CALLER_VERIFIERS}", quote_ident(&schema)),
+        format!("GRANT SELECT ON {}.{CALLER_VIEW} TO {CALLER_VERIFIERS}", quote_ident(&schema)),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(&*stmt))
+            .execute(db)
+            .await
+            .map_err(|e| format!("{stmt} failed: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Make `role` (a system's RUNTIME role, never its DDL role) a member of
+/// [`CALLER_VERIFIERS`] when `want`, and not one when it does not. Called for
+/// every provisioned system, so removing `verify_callers` from a bundle
+/// revokes on the next reconcile even while the add-on stays on.
+pub(crate) async fn sync_caller_verifier(db: &PgPool, system: &str, role: &str, want: bool) -> Result<(), String> {
+    let member = caller_verifier_members(db).await?.iter().any(|m| m == role);
+    if want {
+        ensure_caller_verifier_group(db).await?;
+        if !member {
+            sqlx::query(sqlx::AssertSqlSafe(format!("GRANT {CALLER_VERIFIERS} TO {}", quote_ident(role))))
+                .execute(db)
+                .await
+                .map_err(|e| format!("GRANT {CALLER_VERIFIERS} TO {role} failed: {e}"))?;
+            tracing::info!(system, role, "runtime role may now read {CALLER_VIEW} (verify_callers)");
+        }
+    } else if member {
+        revoke_caller_verifier(db, role).await?;
+        tracing::info!(system, role, "verify_callers no longer declared: {CALLER_VIEW} access revoked");
+    }
+    Ok(())
+}
+
+async fn revoke_caller_verifier(db: &PgPool, role: &str) -> Result<(), String> {
+    sqlx::query(sqlx::AssertSqlSafe(format!("REVOKE {CALLER_VERIFIERS} FROM {}", quote_ident(role))))
+        .execute(db)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("REVOKE {CALLER_VERIFIERS} FROM {role} failed: {e}"))
+}
+
+/// Revoke the group from every member not in `keep`: the runtime roles this
+/// reconcile provisioned with `verify_callers`. An add-on switched off,
+/// refused by the launcher, unregistered or missing a credential is not in
+/// `keep`, so it loses the view on this boot. Returns the roles revoked.
+async fn sweep_caller_verifiers(db: &PgPool, keep: &BTreeSet<String>) -> Result<Vec<String>, String> {
+    let mut revoked = Vec::new();
+    for m in caller_verifier_members(db).await? {
+        if !keep.contains(&m) {
+            revoke_caller_verifier(db, &m).await?;
+            tracing::info!(role = %m, "no registered add-on declares verify_callers for this role: {CALLER_VIEW} access revoked");
+            revoked.push(m);
+        }
+    }
+    Ok(revoked)
+}
+
 /// What provisioning one system did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Provisioned {
@@ -598,6 +737,8 @@ pub(crate) async fn provision_system(
     }
     let schema_created = ensure_schema(db, name, spec).await?;
     ensure_extensions(db, name, spec).await?;
+    // The RUNTIME role only: `spec.role`, never `spec.ddl_role`.
+    sync_caller_verifier(db, name, &spec.role, spec.verify_callers).await?;
     Ok(Outcome::Provisioned(Provisioned { roles_created, schema_created }))
 }
 
@@ -662,10 +803,16 @@ pub async fn reconcile(
     systems: &BTreeMap<String, SystemConfig>,
 ) -> Result<BTreeMap<String, String>, String> {
     if systems.is_empty() {
+        // Nothing declared, so nothing may keep the caller view: the last
+        // add-on switched off still loses it on this boot.
+        sweep_caller_verifiers(db, &BTreeSet::new()).await?;
         return Ok(BTreeMap::new());
     }
 
     let delivered = delivered();
+    // Runtime roles provisioned this pass that declare verify_callers. Every
+    // other member of the group is revoked after the loop.
+    let mut verifiers = BTreeSet::new();
     let mut provisioned = 0usize;
     let mut skipped = 0usize;
     let mut unprovisioned = BTreeMap::new();
@@ -694,7 +841,12 @@ pub async fn reconcile(
         }
 
         match provision_system(db, name, spec, &delivered).await? {
-            Outcome::Provisioned(_) => provisioned += 1,
+            Outcome::Provisioned(_) => {
+                provisioned += 1;
+                if spec.verify_callers {
+                    verifiers.insert(spec.role.clone());
+                }
+            }
             Outcome::MissingCredential { message, .. } if missing_credential_is_fatal(name) => {
                 return Err(message)
             }
@@ -709,6 +861,8 @@ pub async fn reconcile(
             }
         }
     }
+
+    sweep_caller_verifiers(db, &verifiers).await?;
 
     tracing::info!(provisioned, skipped, unprovisioned = unprovisioned.len(), "systems reconciled");
     Ok(unprovisioned)
@@ -727,6 +881,7 @@ mod tests {
             password_env: "NOO_EVOLVE_DB_PASSWORD".into(),
             ddl_password_env: "NOO_EVOLVE_DDL_PASSWORD".into(),
             extensions: Vec::new(),
+            verify_callers: false,
         }
     }
 
@@ -860,6 +1015,7 @@ mod tests {
             password_env: format!("NOO_{}_DB_PASSWORD", id.to_ascii_uppercase()),
             ddl_password_env: format!("NOO_{}_DDL_PASSWORD", id.to_ascii_uppercase()),
             extensions: vec!["pg_trgm".into()],
+            verify_callers: false,
         };
         let manifest = BTreeMap::from([("evolve".to_string(), spec(None))]);
         let bundle = BTreeMap::from([("example_addon".to_string(), bundle_spec("example_addon"))]);
@@ -990,6 +1146,7 @@ mod tests {
                 password_env: format!("BROKERTEST_PW_{tag}"),
                 ddl_password_env: format!("BROKERTEST_DDLPW_{tag}"),
                 extensions: Vec::new(),
+                verify_callers: false,
             },
         );
         m
@@ -1370,5 +1527,133 @@ mod tests {
         cleanup(&db, tag).await;
         std::env::remove_var("BROKERTEST_HALFCRED_FLAG");
         std::env::remove_var("BROKERTEST_DDLPW_halfcred");
+    }
+
+    // ── verify_callers: the declared grant of the caller-verify view ─────
+    //
+    // Against a SCRATCH database (dropped at the end), built with mesh
+    // revision 077's own text so the view is the real one. Roles are
+    // cluster-global, so they carry the brokertest_ prefix and are dropped.
+
+    async fn caller_scratch(admin: &PgPool) -> PgPool {
+        caller_cleanup(admin).await;
+        sqlx::raw_sql("CREATE DATABASE caller_grant_test").execute(admin).await.expect("create scratch db");
+        let dsn = dsn().expect("dsn");
+        let (head, _) = dsn.rsplit_once('/').expect("dsn has a path");
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&format!("{head}/caller_grant_test"))
+            .await
+            .expect("connect scratch");
+        sqlx::raw_sql(
+            "CREATE TABLE noo_service_keys (consumer text NOT NULL, key_hash text NOT NULL UNIQUE, \
+             active boolean NOT NULL DEFAULT true, created_at timestamptz NOT NULL DEFAULT now()); \
+             INSERT INTO noo_service_keys (consumer, key_hash) VALUES ('addon-caller:gateway', 'h-caller'), ('svc:worker', 'h-other')",
+        )
+        .execute(&db)
+        .await
+        .expect("seed noo_service_keys");
+        let rev = crate::mesh_migrate::MIGRATIONS
+            .iter()
+            .find(|m| m.revision == "077_addon_caller_verify_view")
+            .expect("revision 077 is in the chain");
+        sqlx::raw_sql(rev.sql).execute(&db).await.expect("apply 077");
+        db
+    }
+
+    async fn caller_cleanup(admin: &PgPool) {
+        let _ = sqlx::raw_sql("DROP DATABASE IF EXISTS caller_grant_test (FORCE)").execute(admin).await;
+        for role in [
+            "brokertest_role_rhaddon",
+            "brokertest_ddl_rhaddon",
+            "brokertest_role_rhaddonplain",
+            "brokertest_ddl_rhaddonplain",
+            "brokertest_direct_rhaddon",
+        ] {
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP ROLE IF EXISTS {role}"))).execute(admin).await;
+        }
+    }
+
+    /// Can `role` read the caller view? Asked twice: the catalogue, and an
+    /// actual SELECT as that role on ONE connection (SET ROLE is connection
+    /// state). They must agree, or the test is not testing the grant.
+    async fn reads_caller_view(db: &PgPool, role: &str) -> bool {
+        let by_catalogue: bool = sqlx::query_scalar("SELECT has_table_privilege($1, 'public.noo_addon_caller_keys', 'SELECT')")
+            .bind(role)
+            .fetch_one(db)
+            .await
+            .expect("has_table_privilege");
+        let mut conn = db.acquire().await.expect("acquire");
+        sqlx::query(sqlx::AssertSqlSafe(format!("SET ROLE {role}"))).execute(&mut *conn).await.expect("set role");
+        let got: Result<Vec<String>, _> = sqlx::query_scalar("SELECT consumer FROM public.noo_addon_caller_keys")
+            .fetch_all(&mut *conn)
+            .await;
+        sqlx::query("RESET ROLE").execute(&mut *conn).await.expect("reset role");
+        if let Ok(rows) = &got {
+            assert_eq!(rows.len(), 1, "the view must show caller rows only: {rows:?}");
+            assert_eq!(rows[0], "addon-caller:gateway");
+        }
+        assert_eq!(by_catalogue, got.is_ok(), "{role}: catalogue and SELECT disagree ({got:?})");
+        by_catalogue
+    }
+
+    #[tokio::test]
+    async fn verify_callers_grants_the_runtime_role_the_caller_view_and_revokes_it() {
+        let Some(dsn) = dsn() else { return };
+        let admin = pool(&dsn).await;
+        let db = caller_scratch(&admin).await;
+        for v in ["BROKERTEST_PW_rhaddon", "BROKERTEST_DDLPW_rhaddon", "BROKERTEST_PW_rhaddonplain", "BROKERTEST_DDLPW_rhaddonplain"] {
+            std::env::set_var(v, "ephemeral-not-a-secret");
+        }
+        // A role holding the view by a DIRECT grant, the way 077 grants it
+        // to a role it names: the broker's sweep must never take that.
+        sqlx::raw_sql(
+            "CREATE ROLE brokertest_direct_rhaddon NOLOGIN; \
+             GRANT USAGE ON SCHEMA public TO brokertest_direct_rhaddon; \
+             GRANT SELECT ON public.noo_addon_caller_keys TO brokertest_direct_rhaddon",
+        )
+        .execute(&db)
+        .await
+        .expect("direct grant");
+
+        let both = |declared: bool| {
+            let mut m = manifest("rhaddon", None);
+            m.values_mut().next().unwrap().verify_callers = declared;
+            m.extend(manifest("rhaddonplain", None));
+            m
+        };
+
+        // Declared: the runtime role reads the view; its DDL role and an
+        // undeclared add-on's runtime role do not.
+        reconcile(&db, &both(true)).await.expect("reconcile");
+        assert!(reads_caller_view(&db, "brokertest_role_rhaddon").await, "a declared add-on's runtime role must read the caller view");
+        assert!(!reads_caller_view(&db, "brokertest_ddl_rhaddon").await, "the DDL role must never get the caller view");
+        assert!(!reads_caller_view(&db, "brokertest_role_rhaddonplain").await, "an undeclared add-on must not read the caller view");
+        // Idempotent.
+        reconcile(&db, &both(true)).await.expect("second reconcile");
+        assert!(reads_caller_view(&db, "brokertest_role_rhaddon").await);
+
+        // The declaration removed, the add-on still on: revoked.
+        reconcile(&db, &both(false)).await.expect("reconcile without the declaration");
+        assert!(!reads_caller_view(&db, "brokertest_role_rhaddon").await, "removing verify_callers must revoke the grant");
+
+        // Declared again, then the add-on off / unregistered (gone from the
+        // map; the empty map is the last one switched off): revoked.
+        reconcile(&db, &both(true)).await.expect("reconcile");
+        assert!(reads_caller_view(&db, "brokertest_role_rhaddon").await);
+        reconcile(&db, &manifest("rhaddonplain", None)).await.expect("reconcile with the add-on gone");
+        assert!(!reads_caller_view(&db, "brokertest_role_rhaddon").await, "an add-on no longer registered must lose the grant");
+        reconcile(&db, &both(true)).await.expect("reconcile");
+        reconcile(&db, &BTreeMap::new()).await.expect("reconcile with nothing declared");
+        assert!(!reads_caller_view(&db, "brokertest_role_rhaddon").await, "the last add-on switched off must lose the grant too");
+
+        // The direct grant survived every sweep.
+        assert!(reads_caller_view(&db, "brokertest_direct_rhaddon").await, "the sweep took a grant the broker never made");
+
+        db.close().await;
+        caller_cleanup(&admin).await;
+        for v in ["BROKERTEST_PW_rhaddon", "BROKERTEST_DDLPW_rhaddon", "BROKERTEST_PW_rhaddonplain", "BROKERTEST_DDLPW_rhaddonplain"] {
+            std::env::remove_var(v);
+        }
     }
 }

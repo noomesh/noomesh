@@ -591,6 +591,7 @@ fn decl_json(d: &Result<crate::addons::decls::Declared, String>) -> serde_json::
         Ok(d) => json!({
             "system": d.system.as_ref().map(|s| json!({
                 "schema": s.schema, "role": s.role, "ddl_role": s.ddl_role, "extensions": s.extensions,
+                "verify_callers": s.verify_callers,
             })),
             "workloads": d.workloads.iter().map(|w| json!({
                 "name": w.name, "container": w.container, "gpu": w.gpu, "need_mb": w.need_mb,

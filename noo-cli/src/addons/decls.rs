@@ -23,7 +23,9 @@
 //! - `system.json` = `{schema, role, ddl_role, extensions?}` with `<id>` =
 //!   the add-on name, `-` as `_`: schema `<id>`, role `noo_<id>`, ddl_role
 //!   `noo_<id>_ddl`; extensions from [`ALLOWED_EXTENSIONS`]. Passwords are
-//!   derived, never declared: [`password_envs`].
+//!   derived, never declared: [`password_envs`]. `verify_callers` (optional
+//!   boolean, absent = false): the add-on verifies the gateway's caller key,
+//!   so the broker lets its runtime role read `noo_addon_caller_keys`.
 //! - `workloads.json` = `{"workloads": [{name, container, gpu, need_mb,
 //!   drain: {route, timeout_secs}}]}`; container `noo-<addon>-<suffix>`;
 //!   need_mb 1..=262144; drain.route an `internal` route of `routes.json`
@@ -66,6 +68,8 @@ pub const ALLOWED_EXTENSIONS: &[&str] = &[
 pub const RESERVED_IDS: &[&str] = &[
     "app", "worker", "gateway", "admin", "readonly", "replication", "backup", "monitor",
     "public", "mesh", "noo", "information_schema",
+    // `noo_caller_verifiers` is the broker's group role for `verify_callers`.
+    "caller_verifiers",
 ];
 
 /// A validated `system.json`.
@@ -75,6 +79,8 @@ pub struct System {
     pub role: String,
     pub ddl_role: String,
     pub extensions: Vec<String>,
+    /// The add-on verifies the gateway's caller key (`verify_callers`).
+    pub verify_callers: bool,
 }
 
 /// A validated workload. Same fields as the gateway's `addon_decls::Workload`.
@@ -122,7 +128,7 @@ pub fn parse_system(addon: &str, bytes: &[u8]) -> Result<System, String> {
         return Err(format!("{what} is larger than {MAX_FILE_BYTES} bytes"));
     }
     let v: Value = serde_json::from_slice(bytes).map_err(|e| format!("{what} is not JSON: {e}"))?;
-    let m = obj(&v, &what, &["schema", "role", "ddl_role", "extensions"])?;
+    let m = obj(&v, &what, &["schema", "role", "ddl_role", "extensions", "verify_callers"])?;
     let id = system_id(addon);
     if RESERVED_IDS.contains(&id.as_str()) || id.starts_with("pg_") {
         return Err(format!("add-on {addon} may not declare a database: its schema and roles would be core's ({id})"));
@@ -138,6 +144,11 @@ pub fn parse_system(addon: &str, bytes: &[u8]) -> Result<System, String> {
                 .map(|x| x.as_str().map(str::to_string).ok_or_else(|| format!("{what}: `extensions` must be strings")))
                 .collect::<Result<_, _>>()?,
             Some(_) => return Err(format!("{what}: `extensions` must be an array of strings")),
+        },
+        verify_callers: match m.get("verify_callers") {
+            None => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err(format!("{what}: `verify_callers` must be true or false")),
         },
     };
     for (field, got, want) in [
@@ -357,6 +368,24 @@ mod tests {
             name: "worker".into(), container: "noo-example-addon-worker".into(), gpu: true, need_mb: 11264,
             drain_route: "drain".into(), drain_timeout_secs: 120,
         });
+    }
+
+    #[test]
+    fn verify_callers_is_parsed_and_absent_means_false() {
+        assert!(!parse_system(ADDON, system().to_string().as_bytes()).unwrap().verify_callers);
+        let mut v = system();
+        v["verify_callers"] = json!(true);
+        assert!(parse_system(ADDON, v.to_string().as_bytes()).expect("declared field accepted").verify_callers);
+        v["verify_callers"] = json!(false);
+        assert!(!parse_system(ADDON, v.to_string().as_bytes()).unwrap().verify_callers);
+        v["verify_callers"] = json!("yes");
+        assert!(parse_system(ADDON, v.to_string().as_bytes()).unwrap_err().contains("`verify_callers` must be true or false"));
+        // The fixture bundle core's tests use declares it the same way.
+        let v = json!({"schema": "rhaddon", "role": "noo_rhaddon", "ddl_role": "noo_rhaddon_ddl", "verify_callers": true});
+        assert!(parse_system("rhaddon", v.to_string().as_bytes()).unwrap().verify_callers);
+        // The broker's group role can never be an add-on's runtime role.
+        let v = json!({"schema": "caller_verifiers", "role": "noo_caller_verifiers", "ddl_role": "noo_caller_verifiers_ddl"});
+        assert!(parse_system("caller-verifiers", v.to_string().as_bytes()).unwrap_err().contains("may not declare a database"));
     }
 
     #[test]
