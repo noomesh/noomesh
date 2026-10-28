@@ -715,14 +715,34 @@ fn gate_from(probe: Result<Available, Refusal>, verdict: Option<&Result<SelfTest
     }
 }
 
-const SELF_TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+/// A hung jail still fails, but a refusal closes the gate for the life of
+/// the process, so a busy host must not trip it: 5 s did, twice, in a
+/// loaded batch run (2026-10-28). Its normal run is well under a second.
+const SELF_TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The self-test step under way, so a timeout can say where it stopped.
+struct Step(std::sync::Mutex<&'static str>);
+
+impl Step {
+    fn new(s: &'static str) -> Self {
+        Self(std::sync::Mutex::new(s))
+    }
+    fn set(&self, s: &'static str) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = s;
+    }
+    fn now(&self) -> &'static str {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
 
 /// One run of the self-test, uncached. `widen` may change the jail before
 /// it is built — only the tests use it, to prove a wrong jail is caught.
 pub async fn run_self_test(plan: &SelfTestPlan, widen: &dyn Fn(&mut JailSpec, &Path)) -> Result<SelfTestReport, Refusal> {
     let started = std::time::Instant::now();
     let mechanism = probe()?;
-    let out = tokio::time::timeout(SELF_TEST_BUDGET, self_test_inner(plan, widen)).await;
+    // The step under way, named when the budget runs out.
+    let step = Step::new("set up its scratch tree");
+    let out = tokio::time::timeout(SELF_TEST_BUDGET, self_test_inner(plan, widen, &step)).await;
     let _ = std::fs::remove_dir_all(&plan.scratch);
     // Only the planted file and the directory made for it.
     let _ = std::fs::remove_dir_all(&plan.plant_dir);
@@ -731,7 +751,7 @@ pub async fn run_self_test(plan: &SelfTestPlan, widen: &dyn Fn(&mut JailSpec, &P
     }
     let (proved, unproved) = match out {
         Ok(r) => r?,
-        Err(_) => return Err(Refusal::new(format!("jail self-test did not finish in {}s", SELF_TEST_BUDGET.as_secs()))),
+        Err(_) => return Err(Refusal::new(format!("jail self-test did not finish in {}s (still trying to {})", SELF_TEST_BUDGET.as_secs(), step.now()))),
     };
     Ok(SelfTestReport { os: std::env::consts::OS, mechanism, elapsed: started.elapsed(), proved, unproved })
 }
@@ -813,7 +833,11 @@ fn parent_markers() -> Vec<String> {
         .collect()
 }
 
-async fn self_test_inner(plan: &SelfTestPlan, widen: &dyn Fn(&mut JailSpec, &Path)) -> Result<(Vec<String>, Vec<String>), Refusal> {
+async fn self_test_inner(
+    plan: &SelfTestPlan,
+    widen: &dyn Fn(&mut JailSpec, &Path),
+    step: &Step,
+) -> Result<(Vec<String>, Vec<String>), Refusal> {
     let io = |what: &str, e: std::io::Error| Refusal::new(format!("jail self-test could not {what}: {e}"));
     let (work, home, tmp) = (plan.scratch.join("work"), plan.scratch.join("home"), plan.scratch.join("tmp"));
     for d in [&work, &home, &tmp] {
@@ -848,6 +872,7 @@ async fn self_test_inner(plan: &SelfTestPlan, widen: &dyn Fn(&mut JailSpec, &Pat
     // a canary in its environment — what a co-resident agent or another
     // task's process looks like to the jailed CLI.
     let canary = format!("NOO-SELFTEST-CANARY-{tag}");
+    step.set("start the canary process");
     let mut sibling = std::process::Command::new("/bin/sleep")
         .arg("30")
         .env_clear()
@@ -857,7 +882,7 @@ async fn self_test_inner(plan: &SelfTestPlan, widen: &dyn Fn(&mut JailSpec, &Pat
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| io("start the canary process", e))?;
-    let out = self_test_jailed(plan, widen, &work, &home, &tmp, &secret, &secret_value, sibling.id(), &canary, &home_value).await;
+    let out = self_test_jailed(plan, widen, step, &work, &home, &tmp, &secret, &secret_value, sibling.id(), &canary, &home_value).await;
     let _ = sibling.kill();
     let _ = sibling.wait();
     out
@@ -867,6 +892,7 @@ async fn self_test_inner(plan: &SelfTestPlan, widen: &dyn Fn(&mut JailSpec, &Pat
 async fn self_test_jailed(
     plan: &SelfTestPlan,
     widen: &dyn Fn(&mut JailSpec, &Path),
+    step: &Step,
     work: &Path,
     home: &Path,
     tmp: &Path,
@@ -888,6 +914,7 @@ async fn self_test_jailed(
     // shell that fails to start under load cannot pass for an unreadable
     // sibling (seen twice in a loaded batch run, 2026-10-27); whatever still
     // fails is named in the report.
+    step.set("read the canary's environment outside the jail");
     let mut unjailed = Err(String::new());
     for _ in 0..25 {
         unjailed = read_sibling_env(sibling, canary).await;
@@ -916,6 +943,7 @@ async fn self_test_jailed(
             "echo @@hide{i}-begin; {{ if [ -d {q} ]; then ls -A {q}; cat {q}/* {q}/*/*; else cat {q}; fi; }} 2>/dev/null | head -c 64; echo; echo @@hide{i}-end\n"
         ));
     }
+    step.set("run the jailed shell");
     let mut cmd = command(Path::new("/bin/sh"), &spec)?;
     let out = cmd
         .arg("-c")
@@ -1374,7 +1402,7 @@ mod tests {
             let r = run_self_test(&plan, &|_, _| {}).await.unwrap_or_else(|e| panic!("self-test refused on this host: {e}"));
             eprintln!("harness jail self-test: {r} in {:?}\n  proved: {:?}\n  unproved: {:?}", r.elapsed, r.proved, r.unproved);
             assert_eq!(r.os, "linux");
-            assert!(r.elapsed < std::time::Duration::from_secs(2), "{:?}", r.elapsed);
+            assert!(r.elapsed < SELF_TEST_BUDGET, "{:?}", r.elapsed);
             for want in ["workspace readable", "workspace writable", "planted secret", "sibling environment unreadable", "harness environment unreadable"] {
                 assert!(r.proved.iter().any(|p| p.starts_with(want)), "{want} not proved: {r:?}");
             }
@@ -1402,13 +1430,12 @@ mod tests {
             // A plan that hides a path the jail grants: named too.
             let mut plan = SelfTestPlan::for_this_host(&std::env::temp_dir().join("noo-harness")).unwrap();
             plan.must_hide = vec![PathBuf::from("/etc/passwd"), PathBuf::from("/usr/bin")];
-            let started = std::time::Instant::now();
             let e = run_self_test(&plan, &|_, _| {}).await.unwrap_err();
             assert_eq!(e.0, "jail self-test failed: /etc/passwd was readable inside the jail");
+            // Named, not timed out: a leaking tree is not read whole.
             plan.must_hide = vec![PathBuf::from("/usr/bin")];
             let e = run_self_test(&plan, &|_, _| {}).await.unwrap_err();
             assert_eq!(e.0, "jail self-test failed: /usr/bin was readable inside the jail");
-            assert!(started.elapsed() < std::time::Duration::from_secs(4), "a leaking tree is not read whole: {:?}", started.elapsed());
             assert!(!plan.scratch.exists() && !plan.plant_dir.exists());
         }
     }
