@@ -618,7 +618,10 @@ schema `<id>`, roles `noo_<id>` and `noo_<id>_ddl`, passwords
 `noo upgrade --stack`) mint the two passwords into `secrets/env.sops` when
 absent, and they reach the gateway through the same `noo_systems_secrets`
 file; there is no flag. A missing password follows the rule above (skipped,
-reported, the gateway keeps booting).
+reported, the gateway keeps booting). A bundle's `system.json` may also declare
+`verify_callers: true`, which lets the add-on's runtime role read the
+`noo_addon_caller_keys` view; a `systems:` entry in `noomesh.yaml` cannot
+(the field is read from signed bundles only).
 
 If `noomesh.yaml` also has a `systems:` entry with the bundle's system name,
 the `noomesh.yaml` entry wins and the gateway logs a warning naming it: that

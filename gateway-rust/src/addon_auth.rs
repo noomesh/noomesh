@@ -47,9 +47,11 @@
 //! The add-on's DB role cannot read `noo_service_keys` — `034_evolve_role`
 //! grants ownership of five tables and nothing else. Mesh revision
 //! `077_addon_caller_verify_view` adds a view over the add-on-caller rows
-//! alone and grants SELECT on it, so an add-on verifies offline against the
-//! shared Postgres without gaining sight of any other consumer's key. The
-//! contract is written up in `docs/development/addons.md`.
+//! alone, so an add-on verifies offline against the shared Postgres without
+//! gaining sight of any other consumer's key. An add-on gets SELECT on it by
+//! declaring `verify_callers` in its signed `system.json`
+//! (`system_provision::sync_caller_verifier`). The contract is written up in
+//! `docs/development/addons.md`.
 //!
 //! ## The `noo-ak-` prefix
 //!

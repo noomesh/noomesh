@@ -102,6 +102,7 @@ pub(crate) fn report(p: &Prepared, outcome: &Outcome) -> serde_json::Value {
             "role": p.spec.role,
             "ddl_role": p.spec.ddl_role,
             "extensions": p.spec.extensions,
+            "verify_callers": p.spec.verify_callers,
             "roles_created": done.roles_created,
             "schema_created": done.schema_created,
         }),
@@ -209,6 +210,20 @@ mod tests {
         assert_eq!(p.spec.ddl_password_env, "NOO_PAI_VOICE_DDL_PASSWORD");
         assert_eq!(p.delivered.get("NOO_PAI_VOICE_DB_PASSWORD").map(String::as_str), Some(PW));
         assert!(p.spec.enabled_when.is_none());
+    }
+
+    #[test]
+    fn a_declared_verify_callers_reaches_the_broker_and_the_report() {
+        let req = |sys: serde_json::Value| serde_json::json!({"addon": "rhaddon", "system": sys}).to_string();
+        let base = serde_json::json!({"schema": "rhaddon", "role": "noo_rhaddon", "ddl_role": "noo_rhaddon_ddl"});
+        let Ok(p) = prepare(&req(base.clone())) else { panic!("valid") };
+        assert!(!p.spec.verify_callers, "absent means false");
+        let mut on = base;
+        on["verify_callers"] = serde_json::json!(true);
+        let Ok(p) = prepare(&req(on)) else { panic!("valid") };
+        assert!(p.spec.verify_callers);
+        let done = Outcome::Provisioned(Provisioned { roles_created: vec![], schema_created: false });
+        assert_eq!(report(&p, &done)["verify_callers"], serde_json::json!(true));
     }
 
     /// The gateway's own rules, not the caller's: a request cannot name a core

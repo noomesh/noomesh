@@ -155,15 +155,21 @@ pub(crate) struct BrokerReport {
 }
 
 /// The broker request for `sys`: exactly one system and its two passwords.
+/// `verify_callers` is sent only when declared: the broker refuses an unknown
+/// field, so a gateway from before it still accepts every other bundle.
 pub(crate) fn broker_request(addon: &str, sys: &System, secrets: &BTreeMap<String, String>) -> String {
+    let mut system = json!({
+        "schema": sys.schema,
+        "role": sys.role,
+        "ddl_role": sys.ddl_role,
+        "extensions": sys.extensions,
+    });
+    if sys.verify_callers {
+        system["verify_callers"] = json!(true);
+    }
     json!({
         "addon": addon,
-        "system": {
-            "schema": sys.schema,
-            "role": sys.role,
-            "ddl_role": sys.ddl_role,
-            "extensions": sys.extensions,
-        },
+        "system": system,
         "secrets": secrets,
     })
     .to_string()
@@ -790,12 +796,24 @@ mod tests {
     use super::*;
     use crate::commands::addon_enable::tests::{scratch, CONFIG};
 
+    #[test]
+    fn the_broker_request_carries_verify_callers_only_when_declared() {
+        let mut sys = System {
+            schema: "rhaddon".into(), role: "noo_rhaddon".into(), ddl_role: "noo_rhaddon_ddl".into(), extensions: vec![], verify_callers: false,
+        };
+        let v: serde_json::Value = serde_json::from_str(&broker_request("rhaddon", &sys, &BTreeMap::new())).unwrap();
+        assert!(v["system"].get("verify_callers").is_none(), "an undeclared field must not reach an older gateway: {v}");
+        sys.verify_callers = true;
+        let v: serde_json::Value = serde_json::from_str(&broker_request("rhaddon", &sys, &BTreeMap::new())).unwrap();
+        assert_eq!(v["system"]["verify_callers"], serde_json::json!(true));
+    }
+
     const ADDON: &str = "pai-voice";
     const V_DB: &str = "THROWAWAY-runtime-pw-aaaa1111";
     const V_DDL: &str = "THROWAWAY-ddl:pw\\bbbb2222";
 
     fn sys() -> System {
-        System { schema: "pai_voice".into(), role: "noo_pai_voice".into(), ddl_role: "noo_pai_voice_ddl".into(), extensions: vec![] }
+        System { schema: "pai_voice".into(), role: "noo_pai_voice".into(), ddl_role: "noo_pai_voice_ddl".into(), extensions: vec![], verify_callers: false }
     }
 
     fn secrets() -> BTreeMap<String, String> {
