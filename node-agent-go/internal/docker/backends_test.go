@@ -304,9 +304,9 @@ func pkiMountsOf(t *testing.T, backend, dir string) map[string]string {
 // the agent's specs still bind-mounted the WHOLE directory into the
 // backends it starts on nodes, so a worker's vllm/llamacpp/reranker held
 // that node's nodes/<id>/node.key. This pins the narrowing per backend and
-// per PKI-dir shape. A backend's PKI is only what it serves with: vllm's
-// own leaf (+ ca.crt for --ssl-ca-certs) and nothing for llama-server,
-// which has no TLS listener.
+// per PKI-dir shape. A backend's PKI is only what it serves with, and no
+// engine the agent starts serves TLS: every door is a sidecar (vLLM's since
+// door generation 5), which mounts the leaf itself.
 func TestPKIMounts_NarrowedPerBackend(t *testing.T) {
 	controller := writePKIDir(t, "controller")
 	worker := writePKIDir(t, "worker")
@@ -317,8 +317,8 @@ func TestPKIMounts_NarrowedPerBackend(t *testing.T) {
 		dir     string
 		want    map[string]string // target -> source relative to dir
 	}{
-		{"vllm", controller, map[string]string{"/app/pki/ca.crt": "ca.crt", "/app/pki/services/vllm": "services/vllm"}},
-		{"vllm", worker, map[string]string{"/app/pki/ca.crt": "ca.crt"}},
+		{"vllm", controller, map[string]string{}},
+		{"vllm", worker, map[string]string{}},
 		{"vllm", missing, map[string]string{}},
 		{"llamacpp", controller, map[string]string{}},
 		{"llamacpp", worker, map[string]string{}},
@@ -468,10 +468,7 @@ func TestBackendDoorCheck(t *testing.T) {
 	t.Setenv("NOO_PKI_DIR", wrongSAN)
 	for _, b := range fronted {
 		err := backendDoorCheck(b, mountsFor(b))
-		want := "noo-" + b
-		if sc := SidecarFor(b); sc != "" {
-			want = StunnelContainerPrefix + sc
-		}
+		want := doorDialHost(b)
 		if err == nil || !strings.Contains(err.Error(), "does not name "+want) {
 			t.Errorf("%s: a leaf without the %s SAN must be refused: %v", b, want, err)
 		}
@@ -484,30 +481,34 @@ func TestBackendDoorCheck(t *testing.T) {
 	}
 }
 
-// The agent-started vLLM serves TLS with a REQUIRED client certificate,
-// unconditionally: the flag is in the script, the old NOO_VLLM_TLS gate is
-// not, and a missing leaf exits rather than serving plain.
-func TestVLLMEntrypointRequiresAClientCertificate(t *testing.T) {
+// The agent-started vLLM sits behind its door (door generation 5): the
+// engine listens plain on 127.0.0.1 inside noo-stunnel-vllm's namespace,
+// and the door keeps the name every caller dials (noo-vllm) as its bridge
+// alias, so neither the URL nor the leaf moves.
+func TestVLLMServesPlainInsideItsDoor(t *testing.T) {
 	code := ""
 	for _, l := range strings.Split(vllmEntrypointScript, "\n") {
 		if !strings.HasPrefix(strings.TrimSpace(l), "#") {
 			code += l + "\n"
 		}
 	}
-	if !strings.Contains(code, "--ssl-cert-reqs 2") {
-		t.Error("vllmEntrypointScript does not pass --ssl-cert-reqs 2: the listener would admit a caller with no client certificate")
+	if !strings.Contains(code, "--host 127.0.0.1 --port 8000") || strings.Contains(code, "0.0.0.0") {
+		t.Error("vllmEntrypointScript must bind 127.0.0.1:8000 only: its door connects to loopback")
 	}
-	if strings.Contains(code, "NOO_VLLM_TLS") {
-		t.Error("vllmEntrypointScript gates TLS on NOO_VLLM_TLS again — the listener must have no plaintext switch")
-	}
-	if !strings.Contains(code, "exit 78") {
-		t.Error("vllmEntrypointScript must refuse to start without its leaf, not serve plain")
+	if strings.Contains(code, "--ssl-") || strings.Contains(code, "NOO_VLLM_TLS") {
+		t.Error("vllmEntrypointScript serves TLS again: the door holds the leaf and connects plain")
 	}
 	if _, ok := backendSpecs["vllm"].Env["NOO_VLLM_TLS"]; ok {
 		t.Error("the vllm spec still passes NOO_VLLM_TLS into the container")
 	}
-	if !strings.Contains(backendSpecs["vllm"].HealthcheckCmd, "load_cert_chain('/app/pki/services/vllm/service.crt'") {
-		t.Error("the vllm healthcheck must present the container's own leaf (the listener requires one)")
+	if hc := backendSpecs["vllm"].HealthcheckCmd; !strings.Contains(hc, "http://127.0.0.1:8000/health") {
+		t.Errorf("the vllm healthcheck must probe the plain loopback listener: %s", hc)
+	}
+	if got := DoorNetworkMode("vllm"); got != "container:noo-stunnel-vllm" {
+		t.Errorf("vllm network mode %q, want its door's namespace", got)
+	}
+	if doorDialHost("vllm") != "noo-vllm" || doorLeafService("vllm") != "vllm" {
+		t.Errorf("vllm's door is dialled as %q with leaf %q: the URL and the leaf must not move", doorDialHost("vllm"), doorLeafService("vllm"))
 	}
 }
 
@@ -527,13 +528,13 @@ func TestSidecarSpec(t *testing.T) {
 		}
 	}
 	// Every fronted backend has a sidecar name, a door port and a leaf.
-	for _, b := range []string{"llamacpp", "ollama", "embedding", "reranker"} {
+	for _, b := range []string{"vllm", "llamacpp", "ollama", "embedding", "reranker"} {
 		if SidecarFor(b) == "" || SidecarContainerFor(b) != StunnelContainerPrefix+SidecarFor(b) || DoorPort(b) == 0 {
 			t.Errorf("%s: sidecar %q container %q port %d", b, SidecarFor(b), SidecarContainerFor(b), DoorPort(b))
 		}
 	}
-	if SidecarFor("vllm") != "" || SidecarFor("airllm") != "" {
-		t.Error("vllm serves natively and airllm is plain by exception; neither gets a sidecar")
+	if SidecarFor("airllm") != "" {
+		t.Error("airllm is plain by exception; it gets no sidecar")
 	}
 	// Door ports are the compose sidecars' accept ports, so one URL reaches
 	// a compose door and an agent-run one.
@@ -605,7 +606,7 @@ func TestTheSidecarIsTheOnlyDoor(t *testing.T) {
 	if BackendDoorGeneration < 3 {
 		t.Fatalf("BackendDoorGeneration = %d: placed backends would keep the bridge shape", BackendDoorGeneration)
 	}
-	for _, b := range []string{"llamacpp", "ollama", "embedding", "reranker"} {
+	for _, b := range []string{"vllm", "llamacpp", "ollama", "embedding", "reranker"} {
 		if got, want := DoorNetworkMode(b), "container:"+SidecarContainerFor(b); got != want {
 			t.Errorf("%s network mode %q, want %q", b, got, want)
 		}
@@ -615,7 +616,7 @@ func TestTheSidecarIsTheOnlyDoor(t *testing.T) {
 			t.Errorf("%s conf:\n%s", b, conf)
 		}
 	}
-	if DoorNetworkMode("vllm") != "" || DoorNetworkMode("airllm") != "" {
+	if DoorNetworkMode("airllm") != "" {
 		t.Error("only a fronted backend joins a sidecar's namespace")
 	}
 	// Every engine's bind knob, pinned to loopback with the connect port.

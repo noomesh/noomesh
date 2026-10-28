@@ -202,6 +202,7 @@ func TestBackendDialURL_FollowsTheContainersDeclaration(t *testing.T) {
 		{"vllm declares the flag", "vllm", decl([]string{"vllm"}, nil, nil), "https://noo-vllm:8000"},
 		{"secondary declares the flag", "vllm-secondary", decl([]string{"vllm-secondary"}, nil, nil), "https://noo-vllm-secondary:8000"},
 		{"sidecar running: dial it", "llamacpp", decl(nil, []string{"llamacpp"}, nil), "https://noo-stunnel-llamacpp:8085"},
+		{"vllm's door running: dialled by its alias", "vllm", decl(nil, []string{"vllm"}, nil), "https://noo-vllm:8000"},
 		{"tei sidecar running (compose or agent)", "embedding", decl(nil, []string{"embedding"}, nil), "https://noo-stunnel-tei:443"},
 		{"ollama sidecar running", "ollama", decl(nil, []string{"ollama"}, nil), "https://noo-stunnel-ollama:11434"},
 		{"pre-door vllm: plain, what runs", "vllm", decl(nil, nil, []string{"vllm"}), "http://noo-vllm:8000"},
@@ -236,14 +237,15 @@ func TestBackendDialURL_FollowsTheContainersDeclaration(t *testing.T) {
 }
 
 // The compose vLLM's command is one `sh -c` script; the flag sits inside a
-// single argument. The agent-started vLLM's script names the flag nowhere.
+// single argument. The agent-started vLLM serves plain behind its door
+// (door generation 5), so its script must not declare the flag.
 func TestCommandDeclaresClientCert(t *testing.T) {
 	compose := []string{"\nARGS=\"--model x --host 0.0.0.0 --port 8000\"\nARGS=\"$ARGS --ssl-certfile /app/pki/services/vllm/service.crt --ssl-cert-reqs 2\"\npython3 -m vllm.entrypoints.openai.api_server $ARGS\n"}
 	if !commandDeclaresClientCert([]string{"sh", "-c"}, compose) {
 		t.Fatal("the compose vLLM command declares a client-cert listener")
 	}
-	if !commandDeclaresClientCert([]string{"sh", "-c"}, []string{vllmEntrypointScript}) {
-		t.Fatal("the agent-started vLLM script must declare the client-cert listener (it passes --ssl-cert-reqs 2)")
+	if commandDeclaresClientCert([]string{"sh", "-c"}, []string{vllmEntrypointScript}) {
+		t.Fatal("the agent-started vLLM script declares a client-cert listener; its door is noo-stunnel-vllm")
 	}
 	if commandDeclaresClientCert(nil, nil) {
 		t.Fatal("empty command")
@@ -254,7 +256,7 @@ func TestCommandDeclaresClientCert(t *testing.T) {
 // as the backend it fronts, it set the model to "" and could make a running
 // llama.cpp vanish from RunningBackends (whichever came last won).
 func TestBackendKeyFromName_IgnoresStunnelSidecars(t *testing.T) {
-	for _, name := range []string{"noo-stunnel-llamacpp", "noo-stunnel-ollama", "noo-stunnel-tei", "noo-stunnel-reranker"} {
+	for _, name := range []string{"noo-stunnel-llamacpp", "noo-stunnel-ollama", "noo-stunnel-tei", "noo-stunnel-reranker", "noo-stunnel-vllm"} {
 		if got := backendKeyFromName(name); got != "" {
 			t.Fatalf("%s classified as backend %q", name, got)
 		}

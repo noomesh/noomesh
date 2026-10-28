@@ -47,16 +47,16 @@ func TestSpecHash_TheDoorSidecarFollowsTheRelease(t *testing.T) {
 	}
 }
 
-// What must NOT churn: a backend with no sidecar on an image the controller
-// pins (vLLM), and any backend on a node with no release pin.
+// What must NOT churn: a backend with no door on an image the placement
+// pins (airllm), and any backend on a node with no release pin.
 func TestSpecHash_NoChurnWhereNothingFollowsTheRelease(t *testing.T) {
-	vllm := basePlacement()
-	vllm.Image = ""
+	t.Setenv("STUNNEL_IMAGE", "")
+	airllm := placement{Backend: "airllm", Model: "m", Image: "reg.example/acme/airllm:v1", Port: 8000}
 	rollTo(t, "v0.6.12")
-	before := specHash(vllm)
+	before := specHash(airllm)
 	rollTo(t, "v0.6.13")
-	if specHash(vllm) != before {
-		t.Fatal("vLLM's image comes from the placement; a node roll alone must not recreate it")
+	if specHash(airllm) != before {
+		t.Fatal("airllm's image comes from the placement and it has no door; a node roll alone must not recreate it")
 	}
 
 	t.Setenv("NOO_IMAGE_PREFIX", "")
@@ -69,6 +69,22 @@ func TestSpecHash_NoChurnWhereNothingFollowsTheRelease(t *testing.T) {
 		if specHash(llama) != h {
 			t.Fatal("unstable hash with no release pin")
 		}
+	}
+}
+
+// vLLM sits behind noo-stunnel-vllm since door generation 5, so its door
+// follows the release like every other: a roll recreates it once (a model
+// load). Not churn: leaving the door on the previous release's stunnel is
+// the awolf bug above, and replacing the door alone would strand the engine
+// in a dead namespace, which HealStrandedEngines then restarts anyway.
+func TestSpecHash_VLLMsDoorFollowsTheRelease(t *testing.T) {
+	t.Setenv("STUNNEL_IMAGE", "")
+	vllm := basePlacement()
+	rollTo(t, "v0.6.12")
+	before := specHash(vllm)
+	rollTo(t, "v0.6.13")
+	if specHash(vllm) == before {
+		t.Fatal("vLLM's door image moved with the release but the hash did not")
 	}
 }
 

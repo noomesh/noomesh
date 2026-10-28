@@ -521,7 +521,7 @@ The backend's own port is never published on the host.
 
 | Backend | Door | What requires the certificate |
 |---|---|---|
-| vLLM | `https://noo-vllm:8000` | the server itself: `--ssl-certfile/--ssl-keyfile` (`services/vllm`), `--ssl-ca-certs ca.crt`, **`--ssl-cert-reqs 2`**. Unconditional — `NOO_VLLM_TLS` no longer gates it; a missing leaf exits (78), never serves plain. The healthcheck presents the container's own leaf |
+| vLLM | `https://noo-vllm:8000` | the `noo-stunnel-vllm` sidecar (`verify = 2`, the `vllm` leaf), which joins the bridge under the alias `noo-vllm`: the name every caller already dials and the vllm leaf already carries (door generation 5). The engine serves plain on `127.0.0.1:8000` inside the door's namespace and mounts no PKI; its healthcheck probes that loopback listener. Until generation 5 vLLM served TLS itself (`--ssl-cert-reqs 2`), which admitted any cluster-CA leaf |
 | llama.cpp | `https://noo-stunnel-llamacpp:8085` | a stunnel sidecar the agent runs beside it (`verify = 2`, the `llamacpp` leaf); llama-server has no TLS listener |
 | Ollama | `https://noo-stunnel-ollama:11434` | the same sidecar shape, the `ollama` leaf |
 | TEI (`embedding`) | `https://noo-stunnel-tei:443` | the same, the `tei` leaf — `:443` is what compose's `stunnel-tei.conf` accepts on, so one URL reaches either |
@@ -564,9 +564,16 @@ controller's service callers (`gateway`, `worker`, `trellion`,
 controller, so on any other node only its own agent opens its doors; another
 node's leaf, an add-on's or a backend's is refused at the handshake. An agent
 whose leaf cannot be read, or names a SAN every node leaf carries
-(`localhost`, `node-agent`) first, does not start the door. vLLM is its own
-TLS listener (`--ssl-cert-reqs 2`) and cannot pin by name: it still admits
-any cluster-CA leaf.
+(`localhost`, `node-agent`) first, does not start the door. vLLM's own TLS
+listener could not pin by name, so since door generation 5 it sits behind
+the same sidecar. The compose stack's vLLMs on the controller still serve
+TLS themselves and admit any cluster-CA leaf until their own door lands.
+
+A door's image moves with the node's release (`ReleaseSidecarImage`, folded
+into the spec hash), so a release roll recreates each fronted backend once.
+For vLLM that is one model load per roll: replacing the door alone would
+leave the engine in a dead namespace, which the reconciler then restarts
+anyway.
 
 **What a node must hold.** Each door serves with a service leaf under
 `$NOO_PKI_DIR/services/<x>/service.{crt,key}` (`vllm`, `llamacpp`,
@@ -703,14 +710,18 @@ the host. Every door dial goes through the host-mode dialer
 (`internal/containerdial`), which swaps the container name for an address
 the host can reach **at socket level** — the URL, and with it TLS SNI and
 hostname verification, stay on the door's name (`noo-vllm`,
-`noo-stunnel-<x>`), which is the SAN the door leaf carries. The CA the
+`noo-stunnel-<x>`), which is the SAN the door leaf carries. `noo-vllm` is
+the engine's container name and the door's bridge alias: the engine has no
+address of its own, so the dialer follows its `container:` network mode one
+hop to the door (`ContainerDialAddr`), the same address docker DNS gives a
+containerised caller. The CA the
 proxy verifies doors with is the agent's `NOO_TLS_CA` (the container path
 `/app/pki/ca.crt` only for a containerised agent).
 
 | Host | Address the dialer uses | Published on the host |
 |---|---|---|
 | Linux | the door container's bridge IP, on the door port | **nothing** |
-| macOS (Docker Desktop) | `127.0.0.1:<ephemeral>` — the door's loopback publish, read back from `docker inspect` | the **door only** (vLLM's own listener, or the `noo-stunnel-<x>` sidecar's accept port) on `127.0.0.1`; never the raw port of a sidecar-fronted backend, never `0.0.0.0` |
+| macOS (Docker Desktop) | `127.0.0.1:<ephemeral>` — the door's loopback publish, read back from `docker inspect` | the **door only** (the `noo-stunnel-<x>` sidecar's accept port) on `127.0.0.1`; never the raw port of a sidecar-fronted backend, never `0.0.0.0` |
 
 Docker Desktop runs containers in a VM whose bridge IPs the Mac cannot
 route to, so there the door is published on loopback (a macOS-only line
