@@ -1015,7 +1015,9 @@ pub fn addons_granted_by(features: &[String]) -> Vec<&'static AddonRow> {
 /// `<bundle-dir> [--name <addon>]`.
 pub(crate) fn parse_check_with(a: &mut crate::args::Args) -> Result<(String, Option<String>), crate::args::ArgError> {
     let name = a.value(&["--name"])?;
-    Ok((a.one("<bundle-dir>")?, name))
+    let dir = a.one("<bundle-dir>")?;
+    a.finish()?;
+    Ok((dir, name))
 }
 
 /// `noo addons check <bundle-dir> [--name <addon>]`: the checks enable runs
