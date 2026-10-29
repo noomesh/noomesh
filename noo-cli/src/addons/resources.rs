@@ -1236,6 +1236,8 @@ mod tests {
         // What --provision-only wrote before: CN=rhaddon, no reader row.
         ca.issue_service_cert("rhaddon", &[], &[], 30).unwrap();
         let legacy = ca.dir.join("services").join("rhaddon");
+        // Issuance now writes a no-reader key 0600; before 0.6.13 it was 0644.
+        std::fs::set_permissions(legacy.join("service.key"), std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(cert_cn(&legacy.join("service.crt")).as_deref(), Some("rhaddon"), "the fixture is the legacy shape");
         assert_eq!(std::fs::metadata(legacy.join("service.key")).unwrap().permissions().mode() & 0o777, 0o644, "the legacy key mode");
         let prov = dir.join("provision").join("rhaddon");
