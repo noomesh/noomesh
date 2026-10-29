@@ -5,6 +5,15 @@ use super::*;
 use crate::bus_principal::{Kind, Principal};
 use crate::integrations::sync::{self, Api};
 
+
+async fn commit(db: &PgPool, v: &Vault, job: &Job, docs: &[Document], cursor: Option<&Value>, skipped: usize) -> Result<bool, Error> {
+    let mut retained: std::collections::BTreeSet<String> = job.cursor.as_ref()
+        .and_then(|c| c.get("retained")).cloned()
+        .and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+    retained.extend(docs.iter().map(|d| hash(&d.external_id)));
+    super::commit(db, v, job, &sync::Page { docs: docs.to_vec(), cursor: cursor.cloned(), skipped, retained }).await
+}
+
 struct FixtureApi;
 impl Api for FixtureApi {
     async fn get(
@@ -22,10 +31,10 @@ impl Api for FixtureApi {
                 json!({"messages":[{"id":"sameitem"}]})
             } else {
                 use base64::Engine;
-                json!({"payload":{"mimeType":"text/plain","headers":[{"name":"Subject","value":"Private Gmail apricot"}],"body":{"data":base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("Shared bytes, private canary apricot")}}})
+                json!({"internalDate":"1700000000000","historyId":"v1","payload":{"mimeType":"text/plain","headers":[{"name":"Subject","value":"Private Gmail apricot"}],"body":{"data":base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("Shared bytes, private canary apricot")}}})
             }
         } else {
-            json!({"files":[{"id":"sameitem","name":"Private Drive apricot","mimeType":"text/plain"}]})
+            json!({"files":[{"id":"sameitem","name":"Private Drive apricot","mimeType":"text/plain","version":"v1"}]})
         };
         Ok(Some(serde_json::to_vec(&value).unwrap()))
     }
@@ -67,7 +76,7 @@ impl Db {
             .connect(&dsn)
             .await
             .unwrap();
-        sqlx::raw_sql("CREATE TABLE noo_users (user_uuid uuid PRIMARY KEY,username text UNIQUE NOT NULL,disabled boolean NOT NULL DEFAULT false)").execute(&pool).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE noo_users (user_uuid uuid PRIMARY KEY,username text UNIQUE NOT NULL,disabled boolean NOT NULL DEFAULT false,role text NOT NULL DEFAULT 'user')").execute(&pool).await.unwrap();
         for revision in [
             crate::mesh_migrate::CONNECTIONS_REVISION,
             crate::mesh_migrate::INTEGRATION_OAUTH_REVISION,
@@ -135,6 +144,178 @@ fn p(name: &str, admin: bool) -> Principal {
     )
 }
 
+struct SnapshotApi {
+    count: usize,
+    revision: &'static str,
+    body_reads: std::sync::atomic::AtomicUsize,
+}
+impl SnapshotApi {
+    fn new(count: usize, revision: &'static str) -> Self {
+        Self { count, revision, body_reads: std::sync::atomic::AtomicUsize::new(0) }
+    }
+}
+impl Api for SnapshotApi {
+    async fn get(&self, gmail: bool, path: &[&str], query: &[(String,String)], raw: bool) -> Result<Option<Vec<u8>>, Error> {
+        let metadata = query.iter().any(|(k,v)| k == "format" && v == "metadata");
+        let result = if path.len() == 1 {
+            let start: usize = query.iter().find(|(k,_)| k == "pageToken").map(|(_,v)| v.parse().unwrap()).unwrap_or(0);
+            let end = (start+20).min(self.count);
+            // Deliberately oldest first: the implementation cannot rely on an
+            // undocumented Gmail list ordering to select the newest window.
+            let rows: Vec<_> = (start..end).map(|n| if gmail { json!({"id":format!("msg{n:04}")}) }
+                else { json!({"id":format!("msg{n:04}"),"name":format!("File {n}"),"mimeType":"text/plain","version":self.revision}) }).collect();
+            let mut list = if gmail { json!({"messages":rows}) } else { json!({"files":rows}) };
+            if end < self.count { list["nextPageToken"] = json!(end.to_string()); }
+            list
+        } else if metadata {
+            let n: usize = path[1].strip_prefix("msg").unwrap().parse().unwrap();
+            json!({"internalDate":(1_700_000_000_000u64+n as u64*1000).to_string(),"historyId":self.revision})
+        } else {
+            self.body_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if raw { return Ok(Some(format!("Private apricot {}", self.revision).into_bytes())); }
+            use base64::Engine;
+            json!({"payload":{"mimeType":"text/plain","headers":[{"name":"Subject","value":"Private apricot"}],"body":{"data":base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("Private apricot {}",self.revision))}}})
+        };
+        Ok(Some(serde_json::to_vec(&result).unwrap()))
+    }
+}
+
+async fn run_snapshot(db: &Db, v: &Vault, owner: Uuid, source: Uuid, api: &SnapshotApi) -> Vec<String> {
+    enable(&db.pool, owner, source, true).await.unwrap();
+    let mut order = Vec::new();
+    for _ in 0..200 {
+        let job = claim(&db.pool, v).await.unwrap().expect("scan has another page");
+        assert_eq!((job.owner,job.source), (owner,source));
+        let known = if job.cursor.is_none() { versions(&db.pool, v, &job).await.unwrap() } else { BTreeMap::new() };
+        let page = sync::page(api, &job.policy, job.cursor.clone(), known).await.unwrap();
+        order.extend(page.docs.iter().map(|d| d.external_id.clone()));
+        assert!(super::commit(&db.pool, v, &job, &page).await.unwrap());
+        if page.cursor.is_none() { return order; }
+    }
+    panic!("snapshot did not complete");
+}
+
+#[tokio::test]
+async fn unchanged_gmail_and_drive_snapshots_write_zero_document_rows() {
+    let Some(db) = Db::new().await else { return; };
+    let v = vault();
+    let owner = db.user("alice").await;
+    for gmail in [true, false] {
+        let source = db.source(owner,gmail).await;
+        let api = SnapshotApi::new(3,"v1");
+        assert_eq!(run_snapshot(&db,&v,owner,source,&api).await.len(),3);
+        let before: Vec<(Uuid,String,String,Value)> = sqlx::query_as("SELECT id,xmin::text,updated_at::text,sealed FROM noo_integration_documents WHERE source_id=$1 ORDER BY id")
+            .bind(source).fetch_all(&db.pool).await.unwrap();
+        let bodies = api.body_reads.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(run_snapshot(&db,&v,owner,source,&api).await.is_empty());
+        let after: Vec<(Uuid,String,String,Value)> = sqlx::query_as("SELECT id,xmin::text,updated_at::text,sealed FROM noo_integration_documents WHERE source_id=$1 ORDER BY id")
+            .bind(source).fetch_all(&db.pool).await.unwrap();
+        assert_eq!(before,after,"unchanged rows must retain row version, timestamp and ciphertext");
+        assert_eq!(api.body_reads.load(std::sync::atomic::Ordering::SeqCst),bodies,"unchanged bodies must not be downloaded");
+        // A revision change imports new bytes; deleted items are pruned.
+        let changed = SnapshotApi::new(2,"v2");
+        assert_eq!(run_snapshot(&db,&v,owner,source,&changed).await.len(),2);
+        let rows: Vec<(String,Value)> = sqlx::query_as("SELECT item_key,sealed FROM noo_integration_documents WHERE source_id=$1")
+            .bind(source).fetch_all(&db.pool).await.unwrap();
+        assert_eq!(rows.len(),2);
+        for (item,sealed) in rows { assert_eq!(v.open::<Document>(&sealed,&context(owner,source,&item)).unwrap().version,"v2"); }
+    }
+    db.finish().await;
+}
+
+#[tokio::test]
+async fn mailbox_1001_messages_completes_newest_first_and_prunes_stale_rows() {
+    let Some(db) = Db::new().await else { return; };
+    let v = vault();
+    let owner = db.user("alice").await;
+    let bob = db.user("bob").await;
+    let other_source = db.source(bob,true).await;
+    run_snapshot(&db,&v,bob,other_source,&SnapshotApi::new(1,"v1")).await;
+    let other_before: (String,Value) = sqlx::query_as("SELECT xmin::text,sealed FROM noo_integration_documents WHERE source_id=$1")
+        .bind(other_source).fetch_one(&db.pool).await.unwrap();
+    let source = db.source(owner,true).await;
+    enable(&db.pool,owner,source,true).await.unwrap();
+    let job = claim(&db.pool,&v).await.unwrap().unwrap();
+    let docs: Vec<_> = ["msg0000","deleted"].into_iter().map(|id| Document {
+        external_id:id.into(),title:"stale".into(),text:"old".into(),url:"https://mail.google.com/".into(),version:"v1".into(),
+    }).collect();
+    commit(&db.pool,&v,&job,&docs,None,0).await.unwrap();
+    let api = SnapshotApi::new(1001,"v1");
+    let order = run_snapshot(&db,&v,owner,source,&api).await;
+    assert_eq!(order.len(),1000);
+    assert_eq!(order.first().unwrap(),"msg1000");
+    assert_eq!(order.last().unwrap(),"msg0001");
+    let (status,imported,no_cursor):(String,i32,bool) = sqlx::query_as("SELECT status,imported,cursor_sealed IS NULL FROM noo_integration_sync WHERE source_id=$1")
+        .bind(source).fetch_one(&db.pool).await.unwrap();
+    assert_eq!((status.as_str(),imported,no_cursor),("idle",1000,true));
+    let keys: Vec<String> = sqlx::query_scalar("SELECT item_key FROM noo_integration_documents WHERE source_id=$1")
+        .bind(source).fetch_all(&db.pool).await.unwrap();
+    assert_eq!(keys.len(),1000);
+    assert!(!keys.contains(&hash("msg0000")) && !keys.contains(&hash("deleted")));
+    let other_after: (String,Value) = sqlx::query_as("SELECT xmin::text,sealed FROM noo_integration_documents WHERE source_id=$1")
+        .bind(other_source).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(other_before,other_after,"pruning Alice's identical provider ID must not touch Bob's row");
+    db.finish().await;
+}
+
+#[tokio::test]
+async fn real_auth_middleware_preserves_each_door_delegation_marker() {
+    use axum::{middleware, routing::post, Json, Router};
+    use base64::Engine;
+    let Some(db) = Db::new().await else { return; };
+    struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) { for (key,value) in &self.0 { match value {
+            Some(v) => std::env::set_var(key,v), None => std::env::remove_var(key),
+        } } }
+    }
+    let _restore = RestoreEnv(["NOO_JWT_SECRET","NOO_JWT_SECRET_FILE"].into_iter()
+        .map(|k| (k,std::env::var_os(k))).collect());
+    const SECRET: &str = "fixture-middleware-google-private-authority-not-a-secret";
+    std::env::set_var("NOO_JWT_SECRET",SECRET);
+    std::env::remove_var("NOO_JWT_SECRET_FILE");
+    let name = format!("door-{}",Uuid::new_v4().simple());
+    db.user(&name).await;
+    let state = std::sync::Arc::new(crate::state::AppState::for_router_harness(
+        &crate::config::AppConfig::default(),db.pool.clone()).await.unwrap());
+    // This probe changes only the handler. Both middleware layers are the
+    // production functions, in production order. No hand-built RequesterCtx.
+    let app = Router::new().route("/api/connections/search",post(|| async {
+        let principal = crate::bus_principal::current();
+        Json(json!({"allowed":requester_account(&principal).is_some(),
+            "actor":principal.act.is_some(),"harness":principal.harness.is_some()}))
+    }))
+        .layer(middleware::from_fn(crate::bus_principal::principal_layer))
+        .layer(middleware::from_fn_with_state(state.clone(),crate::auth::require_any_auth));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener,app).await.unwrap() });
+    let http = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(10)).build().unwrap();
+    let door = crate::mcp_external::mint_caller_jwt(&name,crate::auth::Role::User,&[],&format!("self:{name}"),None).unwrap();
+    crate::auth::verify_token(&door,SECRET).unwrap();
+    // Claims is the handler projection; it intentionally omits iss/aud/iat.
+    // Preserve the actual minted wire claims when signing marker variants.
+    let claims: Value = serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(door.split('.').nth(1).unwrap()).unwrap()).unwrap();
+    for (actor,harness) in [(true,true),(true,false),(false,true),(false,false)] {
+        let mut test_claims = if actor || harness { claims.clone() } else {
+            crate::auth::scoped_claims(&name,"user",["read"],600,SECRET).unwrap()
+        };
+        if !actor { test_claims["act"] = Value::Null; }
+        if !harness { test_claims["harness"] = Value::Null; }
+        let token = crate::auth::sign_hs256(&test_claims,SECRET).unwrap();
+        assert!(crate::auth::verify_token(&token,SECRET).is_ok(),"fixture must retain valid issuer/audience/expiry");
+        let response = http.post(format!("http://{addr}/api/connections/search"))
+            .bearer_auth(token).send().await.unwrap();
+        assert_eq!(response.status(),axum::http::StatusCode::OK,"the real middleware must admit this credential to the probe");
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body,json!({"allowed":!actor && !harness,"actor":actor,"harness":harness}));
+    }
+    server.abort();
+    drop(state);
+    db.finish().await;
+}
+
 #[tokio::test]
 async fn unreadable_documents_do_not_hide_healthy_owner_results() {
     let Some(db) = Db::new().await else { return; };
@@ -145,7 +326,7 @@ async fn unreadable_documents_do_not_hide_healthy_owner_results() {
     let job = claim(&db.pool, &v).await.unwrap().unwrap();
     let docs: Vec<Document> = ["good", "corrupt"].into_iter().map(|id| Document {
         external_id: id.into(), title: "Private apricot".into(),
-        text: "Private apricot evidence".into(), url: "https://mail.google.com/".into(),
+        text: "Private apricot evidence".into(), url: "https://mail.google.com/".into(), version: String::new(),
     }).collect();
     commit(&db.pool, &v, &job, &docs, None, 0).await.unwrap();
     sqlx::query("UPDATE noo_integration_documents SET sealed='{}' WHERE item_key=$1")
@@ -185,7 +366,7 @@ async fn poisoned_jobs_are_isolated_and_other_users_continue_syncing() {
         .bind(alice).fetch_one(&db.pool).await.unwrap();
     assert_eq!(errors, 2);
     assert!(claim(&db.pool, &v).await.unwrap().is_none());
-    let page = sync::page(&FixtureApi, &job.policy, None).await.unwrap();
+    let page = sync::page(&FixtureApi, &job.policy, None, BTreeMap::new()).await.unwrap();
     assert!(commit(&db.pool, &v, &job, &page.docs, None, 0).await.unwrap());
     assert_eq!(search(&db.pool, &v, bob, "apricot", 20).await.unwrap()["items"].as_array().unwrap().len(), 1);
     // The owner can explicitly restart after fixing storage; no auto-retry
@@ -240,7 +421,7 @@ async fn provider_ingest_search_and_identical_content_are_private_across_users_a
         enable(&db.pool, owner, source, true).await.unwrap();
         let job = claim(&db.pool, &v).await.unwrap().unwrap();
         assert_eq!(job.owner, owner);
-        let page = sync::page(&FixtureApi, &job.policy, None).await.unwrap();
+        let page = sync::page(&FixtureApi, &job.policy, None, BTreeMap::new()).await.unwrap();
         assert!(commit(&db.pool, &v, &job, &page.docs, None, 0)
             .await
             .unwrap());
@@ -339,7 +520,7 @@ async fn retries_leases_pause_disconnect_and_erasure_cannot_restore_private_data
     let source = db.source(alice, true).await;
     enable(&db.pool, alice, source, true).await.unwrap();
     let job = claim(&db.pool, &v).await.unwrap().unwrap();
-    let page = sync::page(&FixtureApi, &job.policy, None).await.unwrap();
+    let page = sync::page(&FixtureApi, &job.policy, None, BTreeMap::new()).await.unwrap();
     let cursor = json!({"page":"private-cursor-canary"});
     assert!(commit(&db.pool, &v, &job, &page.docs, Some(&cursor), 0)
         .await
@@ -438,7 +619,7 @@ async fn snapshot_deletion_disabled_users_and_aad_fail_closed() {
     let source = db.source(owner, true).await;
     enable(&db.pool, owner, source, true).await.unwrap();
     let job = claim(&db.pool, &v).await.unwrap().unwrap();
-    let page = sync::page(&FixtureApi, &job.policy, None).await.unwrap();
+    let page = sync::page(&FixtureApi, &job.policy, None, BTreeMap::new()).await.unwrap();
     commit(&db.pool, &v, &job, &page.docs, None, 0)
         .await
         .unwrap();
@@ -494,7 +675,7 @@ async fn concurrent_workers_and_disconnect_serialize_without_cross_owner_effects
     let b = b.unwrap();
     assert_eq!(usize::from(a.is_some()) + usize::from(b.is_some()), 1);
     let job = a.or(b).unwrap();
-    let page = sync::page(&FixtureApi, &job.policy, None).await.unwrap();
+    let page = sync::page(&FixtureApi, &job.policy, None, BTreeMap::new()).await.unwrap();
     let (stored, removed) = tokio::join!(
         commit(&db.pool, &v, &job, &page.docs, None, 0),
         crate::repo::connections::delete_account(&db.pool, "alice", job.account)
@@ -560,12 +741,12 @@ async fn invalid_page_rolls_back_earlier_items_and_cross_owner_rows_fail_the_fk(
     let source = db.source(owner, true).await;
     enable(&db.pool, owner, source, true).await.unwrap();
     let job = claim(&db.pool, &v).await.unwrap().unwrap();
-    let mut page = sync::page(&FixtureApi, &job.policy, None).await.unwrap();
+    let mut page = sync::page(&FixtureApi, &job.policy, None, BTreeMap::new()).await.unwrap();
     page.docs.push(Document {
         external_id: "invalid".into(),
         title: "too big".into(),
         text: "x".repeat(MAX_TEXT + 1),
-        url: "https://example.invalid".into(),
+        url: "https://example.invalid".into(), version: String::new(),
     });
     assert!(matches!(
         commit(&db.pool, &v, &job, &page.docs, None, 0).await,

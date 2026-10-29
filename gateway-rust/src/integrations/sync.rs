@@ -12,16 +12,21 @@ use crate::connections::{DriveExposure, GmailExposure, SourcePolicy};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct Page {
     pub docs: Vec<Document>,
     pub cursor: Option<Value>,
     pub skipped: usize,
+    /// Hashed IDs observed in this scan, including unchanged documents. Kept
+    /// in the encrypted cursor instead of rewriting every document's generation.
+    pub retained: BTreeSet<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct Cursor {
     page: Option<String>,
     folders: VecDeque<String>,
@@ -29,6 +34,17 @@ struct Cursor {
     visited: BTreeSet<String>,
     label: usize,
     before: i64,
+    known: BTreeMap<String, String>,
+    retained: BTreeSet<String>,
+    candidates: BTreeMap<String, MailRef>,
+    fetching: bool,
+    offset: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MailRef {
+    date: i64,
+    version: String,
 }
 
 // Explicit transport boundary lets tests run the real traversal/parser without
@@ -57,7 +73,7 @@ fn url(gmail: bool, path: &[&str], query: &[(String, String)]) -> Result<reqwest
         let mut segments = url.path_segments_mut().expect("HTTP URL");
         segments.pop_if_empty();
         for part in path {
-            if part.is_empty()
+            if part.is_empty() || part.len() > 1024
                 || !part
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
@@ -138,6 +154,14 @@ fn truncate(s: &str, max: usize) -> String {
     s[..end].to_string()
 }
 
+fn revision(value: &Value) -> Result<String, Error> {
+    let value = value.as_str().unwrap_or("");
+    if value.len() > 256 {
+        return Err(Error::Unavailable("Invalid Google resource revision".into()));
+    }
+    Ok(value.to_string())
+}
+
 /// Plain text only. Attachments and HTML never enter a browser renderer or a
 /// file parser; multipart messages select text/plain rather than duplicating
 /// the HTML alternative. Header values are bounded plain text too.
@@ -192,6 +216,7 @@ fn message(id: &str, value: &Value) -> Option<Document> {
         title: truncate(header("Subject"), 1024),
         text,
         url: format!("https://mail.google.com/mail/u/0/#all/{id}"),
+        version: String::new(),
     })
 }
 
@@ -199,6 +224,7 @@ pub(crate) async fn page(
     api: &impl Api,
     policy: &SourcePolicy,
     previous: Option<Value>,
+    known: BTreeMap<String, String>,
 ) -> Result<Page, Error> {
     policy.validate_for_sync().map_err(Error::Invalid)?;
     let initial = previous.is_none();
@@ -207,6 +233,14 @@ pub(crate) async fn page(
         .transpose()
         .map_err(|_| Error::Invalid("Invalid sync cursor".into()))?
         .unwrap_or_default();
+    if initial { c.known = known; }
+    if c.retained.len() > content::MAX_DOCUMENTS as usize
+        || c.candidates.len() > content::MAX_DOCUMENTS as usize
+        || c.known.len() > 2 * content::MAX_DOCUMENTS as usize
+        || c.offset > content::MAX_DOCUMENTS as usize
+    {
+        return Err(Error::Invalid("Invalid sync inventory".into()));
+    }
     let mut docs = Vec::new();
     let mut skipped = 0;
     match policy {
@@ -219,58 +253,91 @@ pub(crate) async fn page(
                 c.before = chrono::Utc::now().timestamp() + 1;
             }
             let after = c.before - i64::from(*lookback_days) * 86400;
-            let mut query = vec![
-                ("maxResults".into(), "20".into()),
-                ("q".into(), format!("after:{after} before:{}", c.before)),
-            ];
-            if *exposure == GmailExposure::SelectedLabels {
-                let label = label_ids
-                    .get(c.label)
-                    .ok_or_else(|| Error::Invalid("Invalid label cursor".into()))?;
-                query.push(("labelIds".into(), label.clone()));
-            }
-            if let Some(token) = &c.page {
-                query.push(("pageToken".into(), token.clone()));
-            }
-            let list = get_json(api, true, &["messages"], query)
-                .await?
-                .ok_or_else(|| Error::Unavailable("Google mailbox is unavailable".into()))?;
-            let rows = list["messages"].as_array();
-            if rows.is_some_and(|rows| rows.len() > 20) {
-                return Err(Error::Unavailable(
-                    "Google exceeded the sync page limit".into(),
-                ));
-            }
-            for row in rows.into_iter().flatten() {
-                let id = row["id"]
-                    .as_str()
-                    .ok_or_else(|| Error::Unavailable("Invalid Gmail item".into()))?;
-                if let Some(value) = get_json(
-                    api,
-                    true,
-                    &["messages", id],
-                    vec![("format".into(), "full".into())],
-                )
-                .await?
-                {
-                    if let Some(doc) = message(id, &value) {
-                        docs.push(doc);
+            if !c.fetching {
+                let mut query = vec![
+                    ("maxResults".into(), "20".into()),
+                    ("q".into(), format!("after:{after} before:{}", c.before)),
+                ];
+                if *exposure == GmailExposure::SelectedLabels {
+                    let label = label_ids
+                        .get(c.label)
+                        .ok_or_else(|| Error::Invalid("Invalid label cursor".into()))?;
+                    query.push(("labelIds".into(), label.clone()));
+                }
+                if let Some(token) = &c.page {
+                    query.push(("pageToken".into(), token.clone()));
+                }
+                let list = get_json(api, true, &["messages"], query)
+                    .await?
+                    .ok_or_else(|| Error::Unavailable("Google mailbox is unavailable".into()))?;
+                let rows = list["messages"].as_array();
+                if rows.is_some_and(|rows| rows.len() > 20) {
+                    return Err(Error::Unavailable(
+                        "Google exceeded the sync page limit".into(),
+                    ));
+                }
+                for row in rows.into_iter().flatten() {
+                    let id = row["id"]
+                        .as_str()
+                        .ok_or_else(|| Error::Unavailable("Invalid Gmail item".into()))?;
+                    if let Some(value) = get_json(
+                        api,
+                        true,
+                        &["messages", id],
+                        vec![("format".into(), "metadata".into()),
+                             ("fields".into(), "internalDate,historyId".into())],
+                    )
+                    .await?
+                    {
+                        let date = value["internalDate"].as_str().and_then(|s| s.parse().ok())
+                            .ok_or_else(|| Error::Unavailable("Invalid Gmail date".into()))?;
+                        let version = revision(&value["historyId"])?;
+                        c.candidates.insert(id.to_string(), MailRef { date, version });
                     } else {
                         skipped += 1;
                     }
-                } else {
-                    skipped += 1;
                 }
+                c.page = list["nextPageToken"].as_str().map(str::to_string);
+                if c.page.is_none() {
+                    c.label += 1;
+                }
+                let more = c.page.is_some()
+                    || (*exposure == GmailExposure::SelectedLabels && c.label < label_ids.len());
+                // Gmail list has no contractual sort option. Select the newest
+                // bounded set from metadata across every page and selected label,
+                // then fetch bodies. No body for an out-of-window item is imported.
+                let mut newest: Vec<_> = c.candidates.iter().map(|(id, m)| (m.date, id.clone())).collect();
+                newest.sort_by(|a,b| b.cmp(a));
+                for (_, id) in newest.into_iter().skip(content::MAX_DOCUMENTS as usize) {
+                    c.candidates.remove(&id);
+                }
+                if more {
+                    return Ok(Page { docs, skipped, retained: c.retained.clone(), cursor: Some(json!(c)) });
+                }
+                c.fetching = true;
             }
-            c.page = list["nextPageToken"].as_str().map(str::to_string);
-            if c.page.is_none() {
-                c.label += 1;
+            let mut newest: Vec<_> = c.candidates.iter().collect();
+            newest.sort_by(|(a_id,a),(b_id,b)| (b.date,b_id).cmp(&(a.date,a_id)));
+            for (id, metadata) in newest.iter().skip(c.offset).take(20) {
+                let key = super::crypto::hash(id);
+                if !metadata.version.is_empty() && c.known.get(&key) == Some(&metadata.version) {
+                    c.retained.insert(key);
+                    continue;
+                }
+                if let Some(value) = get_json(api, true, &["messages", id], vec![("format".into(), "full".into())]).await? {
+                    if let Some(mut doc) = message(id, &value) {
+                        doc.version = metadata.version.clone();
+                        c.retained.insert(key);
+                        docs.push(doc);
+                    } else { skipped += 1; }
+                } else { skipped += 1; }
             }
-            let more = c.page.is_some()
-                || (*exposure == GmailExposure::SelectedLabels && c.label < label_ids.len());
+            c.offset += 20;
+            let more = c.offset < newest.len();
             Ok(Page {
                 docs,
                 skipped,
+                retained: c.retained.clone(),
                 cursor: if more { Some(json!(c)) } else { None },
             })
         }
@@ -294,6 +361,7 @@ pub(crate) async fn page(
                     return Ok(Page {
                         docs,
                         skipped,
+                        retained: c.retained.clone(),
                         cursor: None,
                     });
                 }
@@ -315,8 +383,9 @@ pub(crate) async fn page(
                 ("pageSize".into(), "20".into()),
                 (
                     "fields".into(),
-                    "nextPageToken,incompleteSearch,files(id,name,mimeType)".into(),
+                    "nextPageToken,incompleteSearch,files(id,name,mimeType,version)".into(),
                 ),
+                ("orderBy".into(), "modifiedTime desc".into()),
                 ("supportsAllDrives".into(), "true".into()),
                 ("includeItemsFromAllDrives".into(), "true".into()),
             ];
@@ -342,6 +411,7 @@ pub(crate) async fn page(
                 ));
             }
             for row in rows.into_iter().flatten() {
+                if c.retained.len() >= content::MAX_DOCUMENTS as usize { break; }
                 let id = row["id"]
                     .as_str()
                     .ok_or_else(|| Error::Unavailable("Invalid Drive item".into()))?;
@@ -355,6 +425,12 @@ pub(crate) async fn page(
                             ));
                         }
                     }
+                    continue;
+                }
+                let key = super::crypto::hash(id);
+                let version = revision(&row["version"])?;
+                if !version.is_empty() && c.known.get(&key) == Some(&version) {
+                    c.retained.insert(key);
                     continue;
                 }
                 let bytes = if mime == "application/vnd.google-apps.document" {
@@ -388,7 +464,9 @@ pub(crate) async fn page(
                         title: truncate(row["name"].as_str().unwrap_or("Untitled"), 1024),
                         text: truncate(text, content::MAX_TEXT),
                         url: format!("https://drive.google.com/file/d/{id}/view"),
+                        version,
                     });
+                    c.retained.insert(key);
                 } else {
                     skipped += 1;
                 }
@@ -397,10 +475,12 @@ pub(crate) async fn page(
             if c.page.is_none() {
                 c.active = None;
             }
-            let more = c.page.is_some() || (folders && !c.folders.is_empty());
+            let more = c.retained.len() < content::MAX_DOCUMENTS as usize
+                && (c.page.is_some() || (folders && !c.folders.is_empty()));
             Ok(Page {
                 docs,
                 skipped,
+                retained: c.retained.clone(),
                 cursor: if more { Some(json!(c)) } else { None },
             })
         }
@@ -431,9 +511,12 @@ pub fn spawn(state: Arc<crate::state::AppState>) {
                             let api = Google {
                                 token: &credentials.access_token,
                             };
+                            let known = if job.cursor.is_none() {
+                                content::versions(&state.db, &vault, &job).await?
+                            } else { BTreeMap::new() };
                             let page = tokio::time::timeout(
                                 std::time::Duration::from_secs(240),
-                                page(&api, &job.policy, job.cursor.clone()),
+                                page(&api, &job.policy, job.cursor.clone(), known),
                             )
                             .await
                             .map_err(|_| {
@@ -443,9 +526,7 @@ pub fn spawn(state: Arc<crate::state::AppState>) {
                                 &state.db,
                                 &vault,
                                 &job,
-                                &page.docs,
-                                page.cursor.as_ref(),
-                                page.skipped,
+                                &page,
                             )
                             .await?;
                             Ok::<(), Error>(())
@@ -557,10 +638,10 @@ mod tests {
             json!({"kind":"google_drive","exposure":"selected_folders","folder_ids":["root"]}),
         )
         .unwrap();
-        let first = page(&api, &policy, None).await.unwrap();
+        let first = page(&api, &policy, None, BTreeMap::new()).await.unwrap();
         assert!(first.docs.is_empty());
         assert_eq!(first.skipped, 1);
-        let next = page(&api, &policy, first.cursor).await.unwrap();
+        let next = page(&api, &policy, first.cursor, BTreeMap::new()).await.unwrap();
         assert_eq!(next.docs.len(), 1);
         assert!(next.cursor.is_none());
         let calls = api.calls.lock().unwrap();
@@ -576,9 +657,9 @@ mod tests {
     async fn label_selection_is_a_union_with_stable_lookback_across_pages() {
         let api = fixture();
         let policy=serde_json::from_value(json!({"kind":"gmail","exposure":"selected_labels","label_ids":["INBOX","LabelWork"],"lookback_days":7})).unwrap();
-        let first = page(&api, &policy, None).await.unwrap();
+        let first = page(&api, &policy, None, BTreeMap::new()).await.unwrap();
         assert!(first.cursor.is_some());
-        let second = page(&api, &policy, first.cursor).await.unwrap();
+        let second = page(&api, &policy, first.cursor, BTreeMap::new()).await.unwrap();
         assert!(second.cursor.is_none());
         let calls = api.calls.lock().unwrap();
         assert!(calls[0].2.contains(&("labelIds".into(), "INBOX".into())));
@@ -599,7 +680,7 @@ mod tests {
             json!({"kind":"google_drive","exposure":"selected_drive"}),
         ] {
             let policy = serde_json::from_value(value).unwrap();
-            assert!(page(&fixture(), &policy, None).await.is_err());
+            assert!(page(&fixture(), &policy, None, BTreeMap::new()).await.is_err());
         }
     }
 }

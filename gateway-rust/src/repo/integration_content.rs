@@ -10,17 +10,21 @@ use crate::integrations::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 pub const MAX_TEXT: usize = 32 * 1024;
 pub const MAX_DOCUMENTS: i64 = 1000;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Document {
     pub external_id: String,
     pub title: String,
     pub text: String,
     pub url: String,
+    /// Provider revision, encrypted with the document; never a shared index.
+    #[serde(default)]
+    pub version: String,
 }
 
 impl Drop for Document {
@@ -30,6 +34,7 @@ impl Drop for Document {
         self.title.zeroize();
         self.text.zeroize();
         self.url.zeroize();
+        self.version.zeroize();
     }
 }
 
@@ -107,6 +112,7 @@ pub async fn claim(db: &PgPool, vault: &Vault) -> Result<Option<Job>, Error> {
             sqlx::query("UPDATE noo_integration_sync SET status='error',fault='storage',lease=NULL,lease_until=NULL,attempts=attempts+1 WHERE source_id=$1 AND owner_uuid=$2")
                 .bind(source).bind(owner).execute(&mut *tx).await?;
             tx.commit().await?;
+            tracing::warn!("private sync source quarantined: unreadable cursor or policy");
             continue;
         };
         sqlx::query("UPDATE noo_integration_sync SET lease=$2,lease_until=now()+interval '5 minutes',imported=CASE WHEN generation IS NULL THEN 0 ELSE imported END,skipped=CASE WHEN generation IS NULL THEN 0 ELSE skipped END,generation=$3,status='syncing' WHERE source_id=$1")
@@ -132,10 +138,14 @@ pub async fn commit(
     db: &PgPool,
     vault: &Vault,
     job: &Job,
-    docs: &[Document],
-    cursor: Option<&Value>,
-    skipped: usize,
+    page: &crate::integrations::sync::Page,
 ) -> Result<bool, Error> {
+    let docs = &page.docs;
+    let cursor = page.cursor.as_ref();
+    let skipped = page.skipped;
+    if page.retained.len() > MAX_DOCUMENTS as usize {
+        return Err(Error::Invalid("Personal scan exceeded its limit".into()));
+    }
     let mut tx = db.begin().await?;
     // Same lock ordering as disconnect and user erasure.
     let owner: Option<Uuid> = sqlx::query_scalar(
@@ -164,26 +174,44 @@ pub async fn commit(
             || doc.title.len() > 1024
             || doc.external_id.len() > 1024
             || doc.url.len() > 4096
+            || doc.version.len() > 256
         {
             return Err(Error::Invalid(
                 "Personal document exceeded its limit".into(),
             ));
         }
         let item = hash(&doc.external_id);
+        if !page.retained.contains(&item) {
+            return Err(Error::Invalid("Personal scan omitted an imported item".into()));
+        }
+        // Old providers/fixtures without a revision still avoid encryption and
+        // writes when the visible document is identical. A changed revision
+        // must persist, otherwise it would download again on every scan.
+        let existing: Option<Value> = sqlx::query_scalar("SELECT sealed FROM noo_integration_documents WHERE owner_uuid=$1 AND source_id=$2 AND item_key=$3")
+            .bind(job.owner).bind(job.source).bind(&item).fetch_optional(&mut *tx).await?;
+        if let Some(existing) = existing {
+            if let Ok(old) = vault.open::<Document>(&existing, &context(job.owner, job.source, &item)) {
+                if old.version == doc.version && old.title == doc.title && old.text == doc.text && old.url == doc.url {
+                    continue;
+                }
+            }
+        }
         let sealed = vault.seal(doc, &context(job.owner, job.source, &item))?;
         sqlx::query("INSERT INTO noo_integration_documents (id,owner_uuid,source_id,item_key,generation,sealed) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (owner_uuid,source_id,item_key) DO UPDATE SET generation=EXCLUDED.generation,sealed=EXCLUDED.sealed,updated_at=now()")
             .bind(Uuid::new_v4()).bind(job.owner).bind(job.source).bind(item).bind(job.generation).bind(sealed).execute(&mut *tx).await?;
     }
-    let (count,total): (i64,i64) = sqlx::query_as("SELECT count(*) FILTER (WHERE generation=$3),count(*) FROM noo_integration_documents WHERE owner_uuid=$1 AND source_id=$2")
-        .bind(job.owner).bind(job.source).bind(job.generation).fetch_one(&mut *tx).await?;
-    if count > MAX_DOCUMENTS || total > 2 * MAX_DOCUMENTS {
+    let count = page.retained.len() as i64;
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM noo_integration_documents WHERE owner_uuid=$1 AND source_id=$2")
+        .bind(job.owner).bind(job.source).fetch_one(&mut *tx).await?;
+    if total > 2 * MAX_DOCUMENTS {
         return Err(Error::Invalid(
             "Source limit reached; choose fewer folders or a shorter Gmail lookback".into(),
         ));
     }
     if cursor.is_none() {
-        sqlx::query("DELETE FROM noo_integration_documents WHERE owner_uuid=$1 AND source_id=$2 AND generation<>$3")
-            .bind(job.owner).bind(job.source).bind(job.generation).execute(&mut *tx).await?;
+        let retained: Vec<_> = page.retained.iter().cloned().collect();
+        sqlx::query("DELETE FROM noo_integration_documents WHERE owner_uuid=$1 AND source_id=$2 AND NOT (item_key=ANY($3))")
+            .bind(job.owner).bind(job.source).bind(retained).execute(&mut *tx).await?;
     }
     let cursor = cursor
         .map(|v| vault.seal(v, &cursor_context(job.owner, job.source)))
@@ -194,6 +222,24 @@ pub async fn commit(
     Ok(true)
 }
 
+/// Load only this source owner's encrypted revision inventory at the beginning
+/// of a scan. Subsequent pages carry it in the authenticated encrypted cursor.
+pub async fn versions(db: &PgPool, vault: &Vault, job: &Job) -> Result<BTreeMap<String, String>, Error> {
+    let rows: Vec<(String, Value)> = sqlx::query_as("SELECT item_key,sealed FROM noo_integration_documents WHERE owner_uuid=$1 AND source_id=$2 LIMIT 2000")
+        .bind(job.owner).bind(job.source).fetch_all(db).await?;
+    let mut known = BTreeMap::new();
+    let mut unreadable = false;
+    for (item, sealed) in rows {
+        match vault.open::<Document>(&sealed, &context(job.owner, job.source, &item)) {
+            Ok(doc) if !doc.version.is_empty() => { known.insert(item, doc.version.clone()); }
+            Ok(_) => {}
+            Err(_) => { unreadable = true; }
+        }
+    }
+    if unreadable { tracing::warn!("private sync inventory contains unreadable documents; refetching"); }
+    Ok(known)
+}
+
 pub async fn fail(db: &PgPool, job: &Job, error: &Error) -> Result<(), Error> {
     let fault = match error {
         Error::Reauth => "reauth",
@@ -201,8 +247,9 @@ pub async fn fail(db: &PgPool, job: &Job, error: &Error) -> Result<(), Error> {
         Error::Storage(_) => "storage",
         _ => "provider",
     };
-    sqlx::query("UPDATE noo_integration_sync SET lease=NULL,lease_until=NULL,attempts=attempts+1,fault=$4,status=CASE WHEN attempts>=4 OR $4 IN ('reauth','limit') THEN 'error' ELSE 'queued' END,next_run=now()+interval '1 minute' * power(2,least(attempts,4)) WHERE source_id=$1 AND owner_uuid=$2 AND lease=$3")
+    let result = sqlx::query("UPDATE noo_integration_sync SET lease=NULL,lease_until=NULL,attempts=attempts+1,fault=$4,status=CASE WHEN attempts>=4 OR $4 IN ('reauth','limit') THEN 'error' ELSE 'queued' END,next_run=now()+interval '1 minute' * power(2,least(attempts,4)) WHERE source_id=$1 AND owner_uuid=$2 AND lease=$3")
         .bind(job.source).bind(job.owner).bind(job.lease).bind(fault).execute(db).await?;
+    if result.rows_affected() > 0 { tracing::warn!(fault, "private sync failed; retry policy applied"); }
     Ok(())
 }
 
@@ -273,6 +320,7 @@ pub async fn search(
         }
     }
     hits.sort_by_key(|a| std::cmp::Reverse(a.0));
+    if unavailable { tracing::warn!("private search skipped unreadable documents"); }
     Ok(
         json!({"items":hits.into_iter().take(limit.min(20)).map(|(_,v)|v).collect::<Vec<_>>(),"truncated":truncated,"unavailable":unavailable}),
     )

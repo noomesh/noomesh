@@ -67,6 +67,10 @@ A human standalone HTTP request can explicitly set `include_personal: true`
 (`noo rag query "question" --personal`) to add personal results on the gateway
 after shared retrieval. Native model tools never opt in, and credential-bound
 `act` or `harness` markers refuse private reads even on explicit opt-in.
+Here, "human" means an ordinary login credential such as `noo auth login`;
+it is not proof that a person is at the keyboard. A local process holding
+that credential has the user's authority. Keep login credentials private;
+give agents their own delegated credentials, which cannot opt in.
 Query bodies cannot choose another owner. Personal excerpts never reach shared
 workers or graph/walk stores, and there is no personal result cache.
 
@@ -77,6 +81,12 @@ Corrupt cursors or stored policies are marked `error`/`storage` under the claime
 row lock and committed individually before the queue moves on to healthy users.
 An explicit owner restart resets a stopped job after the underlying problem is
 corrected. Vault errors, row contents and policies are not logged or returned.
+Fixed warning categories record private-read failures and quarantined jobs
+without owner IDs, source IDs, titles, content, tokens or provider errors.
+Do not rotate `NOO_INTEGRATIONS_KEY` in place: the wrong key makes stored
+credentials, documents and cursors unreadable, and affected sources stop.
+Restore the original key and have each owner restart their stopped sources.
+If the key is lost, reconnect and re-import; there is no automatic key rotation.
 
 **Persisted Noomesh chat is excluded in this batch.** Existing transcript,
 conversation-memory and training-export permissions allow operators to read
@@ -92,7 +102,18 @@ does not rewrite any manually copied text, past conversations or backups.
 Current limits: 1,000 documents per source, 32 KiB text per document, 1 MiB provider
 response, 20 items per page, 5,000 folders per traversal and a 1,000-document
 retrieval window per owner. Search reports `truncated` when that window caps.
-Sync repeats every 30 minutes. Initial import supports Gmail plain-text bodies
+Sync checks metadata every 30 minutes. Gmail `historyId` and Drive file `version`
+revisions skip unchanged bodies and keep document ciphertext, row versions and
+timestamps untouched. This is a bounded metadata rescan, not Gmail history/Drive
+changes-stream sync. The encrypted cursor carries the revision inventory and
+seen-item set; completion prunes items no longer in the selected snapshot without
+rewriting unchanged document rows. Gmail selects the newest 1,000 messages by
+`internalDate` across all pages and selected labels before fetching bodies; larger
+mailboxes complete successfully with that window. Drive caps at 1,000 supported
+documents in traversal order, with each listing ordered by modification time.
+Provider revision semantics: [Gmail messages](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages)
+and [Drive files](https://developers.google.com/workspace/drive/api/reference/rest/v3/files).
+Initial import supports Gmail plain-text bodies
 and Drive text/plain, text/markdown, text/csv and Google Docs exports; attachments,
 HTML-only messages, binary formats and oversized items are skipped. Semantic
 embeddings, private graph extraction and binary parsers are not enabled for this
@@ -202,7 +223,8 @@ gateway runs, so losing the DSN fails those integration checks.
 | Pause and concurrency | Lease expiry/replacement, duplicate pages, competing workers, late writes after pause/disconnect |
 | Disconnect and erasure | Production account/source removal cascades and user erasure prevent content or pending grants being restored |
 | Private search | Only the authenticated user sees snippets; service principals, shared rooms, disabled users and persisted conversation/tool contexts receive no personal evidence |
-| Agent and failure boundaries | Actual MCP-minted JWTs cannot read private sources; opt-in is boolean and human-only; corrupt rows degrade search and poisoned jobs cannot block another owner |
+| Agent and failure boundaries | Actual MCP-minted JWTs through real auth/principal middleware cannot read private sources with either delegation marker; opt-in is boolean and human-only; corrupt rows degrade search and poisoned jobs cannot block another owner |
+| Snapshot bounds and pruning | Unchanged Gmail/Drive scans download no bodies and preserve row versions/timestamps/ciphertext; 1,001 Gmail messages complete newest-first, prune stale rows and leave another owner's identical message untouched |
 | Response protection | Callback CSP and no-store headers, strict request shapes, owner resolution for User/Operator/Admin |
 | Migration compatibility | Existing `103_pg_stat_statements` preserved; new migrations `104_connection_drafts` through `107_integration_content` follow it |
 

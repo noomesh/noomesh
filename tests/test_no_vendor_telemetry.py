@@ -41,6 +41,30 @@ BACKENDS_GO = ROOT / "node-agent-go/internal/docker/backends.go"
 TELEMETRY_GO = ROOT / "node-agent-go/internal/docker/telemetry.go"
 DOC = ROOT / "docs/security/telemetry.md"
 
+
+def test_google_integration_hosts_have_outbound_inventory_rows():
+    """Every HTTPS host literal in the production Google adapter has a row.
+
+    Read production sections, not test fixtures. Assert the baseline as well
+    so moving/removing a source cannot accidentally turn this into zero checks.
+    """
+    from urllib.parse import urlsplit
+
+    hosts = set()
+    for path in (ROOT / "gateway-rust/src/integrations").glob("*.rs"):
+        source = path.read_text()
+        source = source.split("#[cfg(test)]", 1)[0]
+        hosts.update(urlsplit(url).hostname for url in re.findall(r'https://[^"\s]+', source))
+    required = {"accounts.google.com", "oauth2.googleapis.com", "openidconnect.googleapis.com",
+                "gmail.googleapis.com", "www.googleapis.com"}
+    assert required <= hosts
+    outbound = DOC.read_text().split("## Outbound traffic that is not telemetry", 1)[1]
+    rows = [line for line in outbound.splitlines() if line.startswith("|")]
+    for host in hosts:
+        matching = [row for row in rows if f"`{host}`" in row]
+        assert len(matching) == 1, f"Google host {host} needs exactly one outbound inventory row"
+        assert "To keep it off," in matching[0], f"{host} needs an explicit off switch"
+
 # The switches, by the software that reads them. Values are exact.
 TELEMETRY_SWITCHES: dict[str, dict[str, str]] = {
     # vllm/usage/usage_lib.py is_usage_stats_enabled + huggingface_hub

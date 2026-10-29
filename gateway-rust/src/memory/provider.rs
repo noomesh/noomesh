@@ -250,7 +250,10 @@ async fn kb_reply_with_personal(
     let refused = requested && crate::integrations::content::requester_account(
         &crate::bus_principal::current()).is_none();
     let evidence = if requested && !refused {
-        personal.await.unwrap_or_else(|_| json!({"items":[],"unavailable":true}))
+        personal.await.unwrap_or_else(|_| {
+            tracing::warn!("private retrieval unavailable; preserving shared results");
+            json!({"items":[],"unavailable":true})
+        })
     } else {
         json!({"items":[]})
     };
