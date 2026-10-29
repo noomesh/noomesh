@@ -213,6 +213,43 @@ def test_dist_covers_all_first_party_controller_services() -> None:
 
 
 
+def test_every_stunnel_door_has_a_dist_override() -> None:
+    """A dist install ships no Dockerfile.stunnel, so every service built from
+    it needs an image-only dist override, or `--dist` dies with "failed to read
+    dockerfile: Dockerfile.stunnel" (rc.1: stunnel-vllm, stunnel-llamacpp)."""
+    base = _load(BASE_COMPOSE)["services"]
+    dist = _load(DIST_COMPOSE)["services"]
+    doors = [
+        n
+        for n, svc in base.items()
+        if isinstance(svc, dict) and isinstance(svc.get("build"), dict) and svc["build"].get("dockerfile") == "Dockerfile.stunnel"
+    ]
+    assert doors, "no Dockerfile.stunnel services found in the base compose; the guard is parsing nothing"
+    missing = sorted(d for d in doors if d not in dist)
+    assert not missing, f"Dockerfile.stunnel services with no docker-compose.dist.yml override: {missing}"
+    for d in doors:
+        assert dist[d].get("pull_policy") == "missing", f"{d}: dist override must set pull_policy: missing"
+        assert "/stunnel:" in dist[d].get("image", ""), f"{d}: dist override must use the published stunnel image"
+        assert "entrypoint" not in dist[d], f"{d}: dist override must not replace the compose self-pin entrypoint"
+
+
+def test_service_network_mode_targets_have_dist_overrides() -> None:
+    """An engine in `network_mode: service:<x>` cannot start without <x>. If <x>
+    builds from source, <x> must be pulled on a dist install."""
+    base = _load(BASE_COMPOSE)["services"]
+    dist = _load(DIST_COMPOSE)["services"]
+    missing = []
+    for name, svc in base.items():
+        nm = svc.get("network_mode") if isinstance(svc, dict) else None
+        if not (isinstance(nm, str) and nm.startswith("service:")):
+            continue
+        target = nm.split(":", 1)[1]
+        tsvc = base.get(target) or {}
+        if tsvc.get("build") and target not in dist:
+            missing.append(f"{name} -> {target}")
+    assert not missing, f"network_mode targets that build from source with no dist override: {missing}"
+
+
 def test_release_matrix_entries_are_well_formed() -> None:
     """Each matrix entry needs the fields the build step interpolates."""
     wf = _load(RELEASE_WORKFLOW)
