@@ -408,8 +408,10 @@ pub const SERVICE_KEY_READERS: &[(&str, KeyReader)] = &[
     // docker/Dockerfile.postgres ends `USER postgres` (alpine uid 70) and the
     // compose entrypoint `cp`s the key to /tmp as that uid.
     ("postgres", KeyReader::ContainerUid(70)),
-    // vllm/vllm-openai: root.
-    ("vllm", KeyReader::ContainerRoot),
+    // Read by the compose doors stunnel-vllm and stunnel-vllm-secondary
+    // (uid 65532, as below); the vllm/vllm-openai engine behind them holds
+    // no key since its compose services moved behind doors.
+    ("vllm", KeyReader::ContainerUid(65532)),
     // docker/Dockerfile.llamacpp: USER nonroot on a DHI base.
     ("llamacpp", KeyReader::ContainerUid(65532)),
     // Read by the stunnel sidecar (docker/Dockerfile.stunnel ends `USER

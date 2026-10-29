@@ -122,6 +122,8 @@ SERVICE_CLASS: dict[str, str] = {
     "grafana": "config",  # branch fix/grafana-bookmark-and-no-phone-home
     # TLS sidecars
     "stunnel-llamacpp": "none",
+    "stunnel-vllm": "none",
+    "stunnel-vllm-secondary": "none",
     "stunnel-ollama": "none",
     "stunnel-ollama-embed": "none",
     "stunnel-ollama-embed-cpu": "none",

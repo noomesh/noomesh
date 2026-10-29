@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCK = ROOT / "docker"
 
 STATIC_ONLY = {"tei", "tei-gpu", "reranker"}
-SELF_PINNED = {"ollama", "ollama-embed", "ollama-embed-cpu", "llamacpp"}
+SELF_PINNED = {"ollama", "ollama-embed", "ollama-embed-cpu", "llamacpp", "vllm", "vllm-secondary"}
 # The leaves that dial the doors (SAN names, from noo-cli/src/pki.rs).
 CALLERS = {"gateway", "worker", "trellion", "trellion-intel", "evolve"}
 # Names every cluster leaf carries; pinning on one would pin nothing.

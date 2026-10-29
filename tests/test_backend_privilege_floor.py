@@ -50,7 +50,7 @@ def test_the_agent_floor_is_the_same_set():
 
 
 def test_every_door_is_non_root_capless_and_read_only():
-    assert len(DOORS) == 7, DOORS
+    assert len(DOORS) == 9, DOORS
     bad = []
     for name in DOORS:
         s = _floor(name)

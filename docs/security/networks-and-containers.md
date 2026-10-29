@@ -91,16 +91,22 @@ root-equivalent on the host already.
 
 ## Backend doors
 
-Each inference backend that has no TLS listener of its own sits behind a
-stunnel sidecar that requires a client certificate from the cluster CA
+Every inference backend sits behind a stunnel sidecar that requires a client certificate from the cluster CA
 (`verify = 2`) and pins the peer by the DNS name in its leaf (`checkHost`):
 only the gateway, worker, trellion, trellion-intel and evolve leaves pass the
 handshake, so a node's or a monitoring container's certificate is refused.
+The backend runs in its door's network namespace and listens on 127.0.0.1
+only, so the door is the only way in. vLLM (`vllm`, `vllm-secondary`) served
+TLS itself until it moved behind `stunnel-vllm` / `stunnel-vllm-secondary`,
+as the node agent's vLLM did in door generation 5: each door joins
+`noo-cluster` under the engine's names (`vllm`, `noo-vllm`), so every caller's
+URL stays `https://noo-vllm:8000`. That own listener admitted any cluster-CA
+leaf.
 
-The ollama, ollama-embed, ollama-embed-cpu and llamacpp doors are also dialled
+The ollama, ollama-embed, ollama-embed-cpu, llamacpp and both vLLM doors are also dialled
 by the controller's own node-agent with its **node** certificate, whose only
 distinguishing name is the controller's node id. stunnel cannot match
-organisation, and a static file cannot list the id, so those four doors append
+organisation, and a static file cannot list the id, so those doors append
 `checkHost = $NODE_ID` at start (the `stunnel-self-pin` entrypoint in
 `docker-compose.cluster.yml`). If `NODE_ID` is unset, `auto` or not a plain
 node name the door **refuses to start** (exit 78) and says to set it in `.env`;
@@ -125,7 +131,7 @@ agent sets `User: "0"` on them explicitly.
 | `gateway` | ALL | yes | yes (tmpfs `/tmp` 512m, `/home/nonroot` 64m) |
 | `worker`, `worker-extra` | ALL | yes | yes (tmpfs `/tmp` 256m, `/home/nonroot` 64m) |
 | `trellion` | ALL | yes | yes (tmpfs `/tmp` 1g, `/home/nonroot` 256m) |
-| `stunnel-*` (the seven backend doors) | ALL | yes | yes (tmpfs `/tmp` 16m; non-root) |
+| `stunnel-*` (the nine backend doors) | ALL | yes | yes (tmpfs `/tmp` 16m; non-root) |
 | `llamacpp` | ALL, plus the agent's backend set (below) | yes | yes (tmpfs `/tmp` 64m; non-root in the image) |
 | `vllm`, `vllm-secondary`, `ollama`, `ollama-embed`, `ollama-embed-cpu`, `tei`, `tei-gpu`, `reranker`, `airllm` | ALL, plus `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETGID`, `SETUID` (the node agent's backend set) | yes | no (below) |
 

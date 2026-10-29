@@ -1297,8 +1297,6 @@ services:
       - VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER:-0}
     volumes:
       - ${HF_CACHE_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/hf-cache}:/root/.cache/huggingface
-      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/app/pki/ca.crt:ro
-      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/vllm:/app/pki/services/vllm:ro
     deploy:
       resources:
         reservations:
@@ -1306,17 +1304,17 @@ services:
             - driver: nvidia
               count: ${GPU_COUNT:-1}
               capabilities: [gpu]
-    networks:
-      - noo-cluster
+    # In its door's network namespace (door generation 5, as the agent runs
+    # it): no network of its own, listening on 127.0.0.1, reachable only
+    # through stunnel-vllm, which joins noo-cluster under this service's names.
+    network_mode: "service:stunnel-vllm"
+    depends_on:
+      - stunnel-vllm
     restart: unless-stopped
-    # Self-check with the container's OWN leaf: the listener requires a client
-    # certificate and this image carries python3, not curl. Presenting the
-    # service's own cert to itself proves the mTLS listener is up, which is
-    # what a healthcheck is for; it grants nothing (the container already
-    # holds that key). CA-verified, hostname `localhost` is in every service
-    # leaf's SANs. start_period covers a cold model load.
+    # Plain HTTP on loopback inside the namespace; the image carries python3,
+    # not curl. start_period covers a cold model load.
     healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import ssl,urllib.request; ctx=ssl.create_default_context(cafile='/app/pki/ca.crt'); ctx.load_cert_chain('/app/pki/services/vllm/service.crt','/app/pki/services/vllm/service.key'); urllib.request.urlopen('https://localhost:8000/health',context=ctx,timeout=5)\" || exit 1"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=5)\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -1377,23 +1375,14 @@ services:
         esac
 
         # Build base args
-        ARGS="--model $$VLLM_MODEL $$QUANT_ARG --gpu-memory-utilization $$GPU_MEMORY_UTILIZATION --max-model-len $$VLLM_MAX_MODEL_LEN --tensor-parallel-size $$TENSOR_PARALLEL_SIZE $$MAX_SEQS_ARG --enable-auto-tool-choice --tool-call-parser $$VLLM_TOOL_PARSER --host 0.0.0.0 --port 8000"
+        ARGS="--model $$VLLM_MODEL $$QUANT_ARG --gpu-memory-utilization $$GPU_MEMORY_UTILIZATION --max-model-len $$VLLM_MAX_MODEL_LEN --tensor-parallel-size $$TENSOR_PARALLEL_SIZE $$MAX_SEQS_ARG --enable-auto-tool-choice --tool-call-parser $$VLLM_TOOL_PARSER --host 127.0.0.1 --port 8000"
         if [ -n "$$VLLM_REASONING_PARSER" ]; then
           ARGS="$$ARGS --reasoning-parser $$VLLM_REASONING_PARSER"
         fi
-        # TLS is not a switch. The listener presents the `vllm` service leaf,
-        # verifies every caller against the cluster CA and REQUIRES a client
-        # certificate (--ssl-cert-reqs 2 = ssl.CERT_REQUIRED): the gateway
-        # presents its leaf, the controller's own agent its node leaf. Until
-        # 2026-09-28 this ran only when NOO_VLLM_TLS was set, and even then
-        # asked for no client cert, so any process on the compose network
-        # could read every prompt. No leaf = no listener: refuse to start
-        # rather than serve plaintext (exit 78 = EX_CONFIG).
-        if [ ! -f /app/pki/services/vllm/service.crt ] || [ ! -f /app/pki/services/vllm/service.key ]; then
-          echo "vllm: no services/vllm leaf under NOO_PKI_DIR — refusing to serve plaintext. Fix: noo security pki issue-service vllm" >&2
-          exit 78
-        fi
-        ARGS="$$ARGS --ssl-certfile /app/pki/services/vllm/service.crt --ssl-keyfile /app/pki/services/vllm/service.key --ssl-ca-certs /app/pki/ca.crt --ssl-cert-reqs 2"
+        # No TLS here: the engine listens on loopback in its door's namespace
+        # and the door (stunnel, verify = 2, callers pinned by name) is the
+        # only way in. The door holds the `vllm` leaf; this container holds
+        # no key at all.
 
         # Resilient launch: if vLLM crashes with max_num_seqs or OOM errors,
         # retry with progressively lower limits instead of crash-looping.
@@ -1447,9 +1436,6 @@ services:
       - VLLM_TOOL_PARSER=${VLLM2_TOOL_PARSER:-auto}
     volumes:
       - ${HF_CACHE_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/hf-cache}:/root/.cache/huggingface
-      # shares the primary's leaf (same SANs, same entrypoint paths)
-      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/app/pki/ca.crt:ro
-      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/vllm:/app/pki/services/vllm:ro
     deploy:
       resources:
         reservations:
@@ -1457,17 +1443,17 @@ services:
             - driver: nvidia
               count: ${GPU_COUNT:-1}
               capabilities: [gpu]
-    networks:
-      - noo-cluster
+    # In its door's network namespace (door generation 5, as the agent runs
+    # it): no network of its own, listening on 127.0.0.1, reachable only
+    # through stunnel-vllm-secondary, which joins noo-cluster under this service's names.
+    network_mode: "service:stunnel-vllm-secondary"
+    depends_on:
+      - stunnel-vllm-secondary
     restart: unless-stopped
-    # Self-check with the container's OWN leaf: the listener requires a client
-    # certificate and this image carries python3, not curl. Presenting the
-    # service's own cert to itself proves the mTLS listener is up, which is
-    # what a healthcheck is for; it grants nothing (the container already
-    # holds that key). CA-verified, hostname `localhost` is in every service
-    # leaf's SANs. start_period covers a cold model load.
+    # Plain HTTP on loopback inside the namespace; the image carries python3,
+    # not curl. start_period covers a cold model load.
     healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import ssl,urllib.request; ctx=ssl.create_default_context(cafile='/app/pki/ca.crt'); ctx.load_cert_chain('/app/pki/services/vllm/service.crt','/app/pki/services/vllm/service.key'); urllib.request.urlopen('https://localhost:8000/health',context=ctx,timeout=5)\" || exit 1"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=5)\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -1512,24 +1498,91 @@ services:
           *DeepSeek-R1*|*deepseek*) REASON_ARG="--reasoning-parser deepseek_r1" ;;
         esac
 
-        ARGS="--model $$VLLM_MODEL $$QUANT_ARG --gpu-memory-utilization $$GPU_MEMORY_UTILIZATION --max-model-len $$VLLM_MAX_MODEL_LEN --enable-auto-tool-choice --tool-call-parser $$VLLM_TOOL_PARSER $$REASON_ARG --host 0.0.0.0 --port 8000"
+        ARGS="--model $$VLLM_MODEL $$QUANT_ARG --gpu-memory-utilization $$GPU_MEMORY_UTILIZATION --max-model-len $$VLLM_MAX_MODEL_LEN --enable-auto-tool-choice --tool-call-parser $$VLLM_TOOL_PARSER $$REASON_ARG --host 127.0.0.1 --port 8000"
 
-        # TLS is not a switch. The listener presents the `vllm` service leaf,
-        # verifies every caller against the cluster CA and REQUIRES a client
-        # certificate (--ssl-cert-reqs 2 = ssl.CERT_REQUIRED): the gateway
-        # presents its leaf, the controller's own agent its node leaf. Until
-        # 2026-09-28 this ran only when NOO_VLLM_TLS was set, and even then
-        # asked for no client cert, so any process on the compose network
-        # could read every prompt. No leaf = no listener: refuse to start
-        # rather than serve plaintext (exit 78 = EX_CONFIG).
-        if [ ! -f /app/pki/services/vllm/service.crt ] || [ ! -f /app/pki/services/vllm/service.key ]; then
-          echo "vllm: no services/vllm leaf under NOO_PKI_DIR — refusing to serve plaintext. Fix: noo security pki issue-service vllm" >&2
-          exit 78
-        fi
-        ARGS="$$ARGS --ssl-certfile /app/pki/services/vllm/service.crt --ssl-keyfile /app/pki/services/vllm/service.key --ssl-ca-certs /app/pki/ca.crt --ssl-cert-reqs 2"
+        # No TLS here: the engine listens on loopback in its door's namespace
+        # and the door (stunnel, verify = 2, callers pinned by name) is the
+        # only way in. The door holds the `vllm` leaf; this container holds
+        # no key at all.
 
         echo "Starting secondary vLLM: $$VLLM_MODEL (GPU util: $$GPU_MEMORY_UTILIZATION, parser: $$VLLM_TOOL_PARSER)"
         python3 -m vllm.entrypoints.openai.api_server $$ARGS
+
+  # stunnel mTLS door for vllm (same shape as stunnel-llamacpp; the agent's
+  # noo-stunnel-vllm, #522). Accepts on :8000, presents the `vllm` leaf,
+  # requires a cluster-CA client certificate from a pinned caller and
+  # forwards plain HTTP to 127.0.0.1:8000. Same profile as the engine.
+  stunnel-vllm:
+    logging: *default-logging
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.stunnel
+    image: noomesh/stunnel:latest
+    pull_policy: build
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-vllm
+    # Door floor (i301): non-root, no capability, read-only root; the
+    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
+    # The name its stunnel.conf accepts on (its bridge address, not
+    # 0.0.0.0): vllm listens on 127.0.0.1 in this namespace.
+    hostname: noo-stunnel-vllm
+    user: nonroot
+    entrypoint: *stunnel-self-pin
+    environment:
+      - NOO_STUNNEL_SELF_NODE=${NODE_ID:-}
+    profiles: ["vllm"]
+    volumes:
+      - ./docker/stunnel-vllm.conf:/etc/stunnel/stunnel.conf:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/vllm:/tls/services/vllm:ro
+    networks:
+      noo-cluster:
+        # Callers keep dialling the engine's names (https://noo-vllm:8000,
+        # the `vllm` service name); the vllm leaf already carries them.
+        aliases:
+          - vllm
+          - ${NOO_CONTAINER_PREFIX:-noo}-vllm
+    restart: unless-stopped
+
+  # stunnel mTLS door for vllm-secondary: the primary's shape, its own name.
+  # Shares the primary's leaf (it carries noo-vllm-secondary).
+  stunnel-vllm-secondary:
+    logging: *default-logging
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.stunnel
+    image: noomesh/stunnel:latest
+    pull_policy: build
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-vllm-secondary
+    # Door floor (i301): non-root, no capability, read-only root; the
+    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
+    # The name its stunnel.conf accepts on (its bridge address, not
+    # 0.0.0.0): vllm-secondary listens on 127.0.0.1 in this namespace.
+    hostname: noo-stunnel-vllm-secondary
+    user: nonroot
+    entrypoint: *stunnel-self-pin
+    environment:
+      - NOO_STUNNEL_SELF_NODE=${NODE_ID:-}
+    profiles: ["vllm-secondary"]
+    volumes:
+      - ./docker/stunnel-vllm-secondary.conf:/etc/stunnel/stunnel.conf:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/vllm:/tls/services/vllm:ro
+    networks:
+      noo-cluster:
+        # Callers keep dialling the engine's names (https://noo-vllm-secondary:8000,
+        # the `vllm-secondary` service name); the vllm leaf already carries them.
+        aliases:
+          - vllm-secondary
+          - ${NOO_CONTAINER_PREFIX:-noo}-vllm-secondary
+    restart: unless-stopped
 
   # llama.cpp backend
   llamacpp:

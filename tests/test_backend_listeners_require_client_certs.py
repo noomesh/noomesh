@@ -14,10 +14,10 @@ Ollama, TEI and the reranker were already behind stunnel sidecars with
 What this pins, from the shipped files (the compose projection with every
 profile on, plus `docker/stunnel-*.conf`):
 
-  1. every service in BACKEND_SERVICES is fronted: vLLM by its own listener
-     with `--ssl-cert-reqs 2` (ssl.CERT_REQUIRED) and no plaintext switch,
-     everything else by a `stunnel-<x>` service whose conf says
-     `verify = 2` — or it is in PLAINTEXT_EXCEPTIONS with a reason;
+  1. every service in BACKEND_SERVICES is fronted by a `stunnel-<x>`
+     service whose conf says `verify = 2` — or it is in PLAINTEXT_EXCEPTIONS
+     with a reason. vLLM terminated its own TLS (`--ssl-cert-reqs 2`) until
+     its compose services moved behind doors like the agent's (#522);
   1a. (door generation 3) the fronted backend runs in its sidecar's
      network namespace, bound to 127.0.0.1; the sidecar accepts on its own
      hostname and connects to loopback — so it is the ONLY door;
@@ -54,8 +54,8 @@ COMPOSE = ROOT / "docker-compose.cluster.yml"
 # vllm/llama/ollama/tei image, or a `noo-<x>` name in BACKEND_HINTS) and is
 # not listed here fails test 4.
 BACKEND_SERVICES = {
-    "vllm": "native",
-    "vllm-secondary": "native",
+    "vllm": "stunnel-vllm",
+    "vllm-secondary": "stunnel-vllm-secondary",
     "llamacpp": "stunnel-llamacpp",
     "ollama": "stunnel-ollama",
     "ollama-embed": "stunnel-ollama-embed",
@@ -137,45 +137,38 @@ def test_every_backend_door_requires_a_client_certificate(services):
         if name in PLAINTEXT_EXCEPTIONS:
             continue
         checked += 1
-        if front == "native":
-            cmd = _command_text(svc)
-            assert "--ssl-cert-reqs 2" in cmd, (
-                f"{name} does not run with --ssl-cert-reqs 2: its TLS listener admits a caller "
-                "with no client certificate"
-            )
-            assert "NOO_VLLM_TLS" not in cmd, (
-                f"{name} gates TLS on NOO_VLLM_TLS again — the listener must have no plaintext switch"
-            )
-            assert "--ssl-certfile /app/pki/services/vllm/service.crt" in cmd, f"{name} serves with the wrong leaf"
-        else:
-            sidecar = services.get(front)
-            assert sidecar is not None, f"{name} is fronted by {front}, which is not in the compose file"
-            assert set(sidecar.get("profiles") or []) == set(svc.get("profiles") or []), (
-                f"{front} and {name} carry different profiles — one could run without the other"
-            )
-            conf_mounts = [m for m in _mounts(sidecar) if "/etc/stunnel/stunnel.conf" in m]
-            assert conf_mounts, f"{front} mounts no stunnel.conf"
-            assert _conf_requires_client_cert(_stunnel_conf(front)), (
-                f"docker/{front}.conf does not set verify = 2: the sidecar admits a caller with no client certificate"
-            )
-            conf = _stunnel_conf(front)
-            # Door generation 3 (F-ii): the backend lives in the sidecar's
-            # network namespace on loopback, so the sidecar is the ONLY door.
-            assert re.search(r"^\s*connect\s*=\s*127\.0\.0\.1:\d+\s*$", conf, re.M), (
-                f"docker/{front}.conf does not forward to the backend on loopback"
-            )
-            assert svc.get("network_mode") == f"service:{front}", (
-                f"{name} is not in {front}'s network namespace (network_mode: service:{front}): "
-                "its plain port is reachable by every container on its network"
-            )
-            assert not svc.get("networks") and not svc.get("ports"), f"{name} joins a network or publishes a port of its own"
-            hostname = sidecar.get("hostname")
-            assert hostname and re.search(rf"^\s*accept\s*=\s*{re.escape(hostname)}:\d+\s*$", conf, re.M), (
-                f"docker/{front}.conf must accept on the sidecar's hostname ({hostname!r}, its bridge address), "
-                "never 0.0.0.0, which would also take the backend's loopback port"
-            )
-            assert "0.0.0.0" not in str(svc.get("environment")), f"{name} binds 0.0.0.0"
-            assert "127.0.0.1" in str(svc.get("environment")), f"{name} does not bind its listener to 127.0.0.1"
+        assert front != "native", f"{name} has no door in front of it: every backend is fronted or a named exception"
+        sidecar = services.get(front)
+        assert sidecar is not None, f"{name} is fronted by {front}, which is not in the compose file"
+        assert set(sidecar.get("profiles") or []) == set(svc.get("profiles") or []), (
+            f"{front} and {name} carry different profiles — one could run without the other"
+        )
+        conf_mounts = [m for m in _mounts(sidecar) if "/etc/stunnel/stunnel.conf" in m]
+        assert conf_mounts, f"{front} mounts no stunnel.conf"
+        assert _conf_requires_client_cert(_stunnel_conf(front)), (
+            f"docker/{front}.conf does not set verify = 2: the sidecar admits a caller with no client certificate"
+        )
+        conf = _stunnel_conf(front)
+        # Door generation 3 (F-ii): the backend lives in the sidecar's
+        # network namespace on loopback, so the sidecar is the ONLY door.
+        assert re.search(r"^\s*connect\s*=\s*127\.0\.0\.1:\d+\s*$", conf, re.M), (
+            f"docker/{front}.conf does not forward to the backend on loopback"
+        )
+        assert svc.get("network_mode") == f"service:{front}", (
+            f"{name} is not in {front}'s network namespace (network_mode: service:{front}): "
+            "its plain port is reachable by every container on its network"
+        )
+        assert not svc.get("networks") and not svc.get("ports"), f"{name} joins a network or publishes a port of its own"
+        hostname = sidecar.get("hostname")
+        assert hostname and re.search(rf"^\s*accept\s*=\s*{re.escape(hostname)}:\d+\s*$", conf, re.M), (
+            f"docker/{front}.conf must accept on the sidecar's hostname ({hostname!r}, its bridge address), "
+            "never 0.0.0.0, which would also take the backend's loopback port"
+        )
+        # The bind is an env var (llama.cpp, Ollama, TEI) or, for vLLM, the
+        # command line it builds.
+        bind = f"{svc.get('environment')} {_command_text(svc)}"
+        assert "0.0.0.0" not in bind, f"{name} binds 0.0.0.0"
+        assert "127.0.0.1" in bind, f"{name} does not bind its listener to 127.0.0.1"
     assert checked >= 6, f"only {checked} backend doors checked — the parse is not looking at the file it was written for"
 
 
