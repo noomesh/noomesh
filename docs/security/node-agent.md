@@ -505,6 +505,11 @@ Every container the agent creates on a controller's instruction runs with:
   works through device cgroups and bind-mounted driver libraries.
 - skills and managed containers additionally run as a non-root user with a
   process cap.
+- a read-only root filesystem with a tmpfs `/tmp` for llama.cpp, the
+  llama.cpp reranker and every door sidecar (except on the `alpine` fallback
+  image): their write set outside their mounts is empty. vLLM, Ollama and TEI
+  keep a writable root until theirs is moved to a cache mount
+  ([networks and containers](networks-and-containers.md#container-hardening)).
 
 `NOO_BACKEND_CAP_ADD` (node-local) widens the backend set for an image that
 genuinely needs more; `NOO_CONTAINER_RUN_USER` and
@@ -521,7 +526,7 @@ The backend's own port is never published on the host.
 
 | Backend | Door | What requires the certificate |
 |---|---|---|
-| vLLM | `https://noo-vllm:8000` | the server itself: `--ssl-certfile/--ssl-keyfile` (`services/vllm`), `--ssl-ca-certs ca.crt`, **`--ssl-cert-reqs 2`**. Unconditional — `NOO_VLLM_TLS` no longer gates it; a missing leaf exits (78), never serves plain. The healthcheck presents the container's own leaf |
+| vLLM | `https://noo-vllm:8000` | the `noo-stunnel-vllm` sidecar (`verify = 2`, the `vllm` leaf), which joins the bridge under the alias `noo-vllm`: the name every caller already dials and the vllm leaf already carries (door generation 5). The engine serves plain on `127.0.0.1:8000` inside the door's namespace and mounts no PKI; its healthcheck probes that loopback listener. Until generation 5 vLLM served TLS itself (`--ssl-cert-reqs 2`), which admitted any cluster-CA leaf |
 | llama.cpp | `https://noo-stunnel-llamacpp:8085` | a stunnel sidecar the agent runs beside it (`verify = 2`, the `llamacpp` leaf); llama-server has no TLS listener |
 | Ollama | `https://noo-stunnel-ollama:11434` | the same sidecar shape, the `ollama` leaf |
 | TEI (`embedding`) | `https://noo-stunnel-tei:443` | the same, the `tei` leaf — `:443` is what compose's `stunnel-tei.conf` accepts on, so one URL reaches either |
@@ -537,11 +542,53 @@ sidecar should read from); `no-new-privileges`, `CapDrop ALL` plus
 `DAC_OVERRIDE` to read the leaf key, and `NET_BIND_SERVICE` only for a
 door below 1024. The agent runs it as root (`User: "0"`) whatever the image's
 `USER` says: the published image runs the controller's doors as uid 65532, but
-a node's leaf is a root-owned `0600` file. The sidecar forwards plaintext to the backend container
-on the bridge; the backend's raw port stays reachable to OTHER containers
-on that bridge until each backend gets a private network (a deferred step
-the operator is exploring) — the sidecar is the door every client is
-pointed at, the private network makes it the only one.
+a node's leaf is a root-owned `0600` file.
+
+**The sidecar is the only door** (door generation 3). The backend container
+has no network of its own: it runs in its sidecar's network namespace
+(`NetworkMode: container:noo-stunnel-<x>`; compose `network_mode:
+service:stunnel-<x>`) and listens on `127.0.0.1` only. The sidecar accepts
+on its own bridge address (its hostname, never `0.0.0.0`) and forwards
+plaintext to `127.0.0.1:<port>` inside the namespace. No other container on
+the bridge and no host process can reach the backend's plain port; until
+generation 3 any bridge peer could. The sidecar owns the namespace: an engine
+that restarts rejoins it, and an engine stranded by a sidecar restart (left
+in the old namespace) is a `backend_door` row and is restarted on the next
+reconcile pass. A backend still on the bridge beside its sidecar (created
+before generation 3) is the same `backend_door` row until the reconciler
+recreates it, which the generation bump does once, on the first pass after
+the agent rolls.
+
+**The door admits named callers only** (door generation 4). A cluster-CA
+certificate is necessary, not sufficient: each agent-run door carries
+`checkHost` lines for this node's own agent leaf (its first DNS SAN, the
+node id, read from `NOO_TLS_CERT`, never from `NODE_ID`) and for the
+controller's service callers (`gateway`, `worker`, `trellion`,
+`trellion-intel`, `evolve`), the same list as the compose doors
+(`docker/stunnel-<x>.conf`). Those service leaves exist only on the
+controller, so on any other node only its own agent opens its doors; another
+node's leaf, an add-on's or a backend's is refused at the handshake. An agent
+whose leaf cannot be read, or names a SAN every node leaf carries
+(`localhost`, `node-agent`) first, does not start the door. vLLM's own TLS
+listener could not pin by name, so since door generation 5 it sits behind
+the same sidecar. The compose stack's vLLMs on the controller still serve
+TLS themselves and admit any cluster-CA leaf until their own door lands.
+
+A door's image moves with the node's release (`ReleaseSidecarImage`, folded
+into the spec hash), so a release roll recreates each fronted backend once,
+except a **pinned door**. The stunnel image is rebuilt every release, so its
+digest moves even when nothing in it changed, and for vLLM a recreate is a
+model load. vLLM's door therefore runs a pinned image of its own:
+`config/door-images.json` names a published release's stunnel tag and digest
+(the node agent embeds a byte-equal copy). The spec hash carries the pin, so
+vLLM is recreated when the pin moves and never on a release roll alone. The
+controller stages the pin on the rail with every release (`noo upgrade`,
+`noo cluster sync-images`; source `door-pin`, which release retention never
+prunes). A rail node fetches it by its tag, verified against the
+controller's manifest, and any other node by its digest. A pin that is not
+staged fails the start, naming the image: there is no fallback, which would
+move the door off its pin. To move the door, set the file to a newer
+release's `stunnel@sha256:…` lock row; that costs one vLLM reload.
 
 **What a node must hold.** Each door serves with a service leaf under
 `$NOO_PKI_DIR/services/<x>/service.{crt,key}` (`vllm`, `llamacpp`,
@@ -678,14 +725,18 @@ the host. Every door dial goes through the host-mode dialer
 (`internal/containerdial`), which swaps the container name for an address
 the host can reach **at socket level** — the URL, and with it TLS SNI and
 hostname verification, stay on the door's name (`noo-vllm`,
-`noo-stunnel-<x>`), which is the SAN the door leaf carries. The CA the
+`noo-stunnel-<x>`), which is the SAN the door leaf carries. `noo-vllm` is
+the engine's container name and the door's bridge alias: the engine has no
+address of its own, so the dialer follows its `container:` network mode one
+hop to the door (`ContainerDialAddr`), the same address docker DNS gives a
+containerised caller. The CA the
 proxy verifies doors with is the agent's `NOO_TLS_CA` (the container path
 `/app/pki/ca.crt` only for a containerised agent).
 
 | Host | Address the dialer uses | Published on the host |
 |---|---|---|
 | Linux | the door container's bridge IP, on the door port | **nothing** |
-| macOS (Docker Desktop) | `127.0.0.1:<ephemeral>` — the door's loopback publish, read back from `docker inspect` | the **door only** (vLLM's own listener, or the `noo-stunnel-<x>` sidecar's accept port) on `127.0.0.1`; never the raw port of a sidecar-fronted backend, never `0.0.0.0` |
+| macOS (Docker Desktop) | `127.0.0.1:<ephemeral>` — the door's loopback publish, read back from `docker inspect` | the **door only** (the `noo-stunnel-<x>` sidecar's accept port) on `127.0.0.1`; never the raw port of a sidecar-fronted backend, never `0.0.0.0` |
 
 Docker Desktop runs containers in a VM whose bridge IPs the Mac cannot
 route to, so there the door is published on loopback (a macOS-only line

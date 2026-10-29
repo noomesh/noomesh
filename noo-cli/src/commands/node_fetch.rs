@@ -2980,8 +2980,7 @@ mod env_shape_tests {
     use super::{env_payload_ok, shell_inert_value, AGENT_ENV_INERT_KEYS, AGENT_ENV_KEYS, HARNESS_ENV_KEYS};
 
     fn render(tmpl: &str) -> String {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let text = std::fs::read_to_string(root.join(tmpl)).unwrap();
+        let text = std::fs::read_to_string(crate::test_support::repo_file(tmpl)).unwrap();
         let mut out = String::new();
         let mut rest = text.as_str();
         // Strip {# #} and {% %}, replace {{ }} with a plain value.
@@ -3743,23 +3742,13 @@ mod tests {
     /// The harness now mounts the repo root and sets `NOO_CARGO_DOCKER=1`.
     /// Under it, an unreadable `scripts/` is a HARNESS REGRESSION and this
     /// PANICS. Outside it (a bare `cargo test` from an unpacked crate with
-    /// no repo around it) the skip is still legitimate.
+    /// no repo around it) the skip is still legitimate. The rule itself now
+    /// lives in `test_support` (one place, every test in the crate).
     fn scripts_dir() -> Option<std::path::PathBuf> {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts");
         // Assert the directory is READABLE before any test asserts on its
         // contents — the check that would have caught 97b itself.
-        if root.join("noo-apply.sh").is_file() {
-            return Some(root);
-        }
-        assert!(
-            std::env::var_os("NOO_CARGO_DOCKER").is_none(),
-            "scripts/ is not reachable at {} even though NOO_CARGO_DOCKER=1 — the container \
-             harness stopped mounting the repo root, and every cross-language contract test \
-             in this module is silently inert",
-            root.display()
-        );
-        eprintln!("scripts/ not beside the crate and not under the container harness — skipping");
-        None
+        let apply = crate::test_support::repo_file_or_skip("scripts/noo-apply.sh")?;
+        Some(apply.parent().expect("scripts/noo-apply.sh has a parent").to_path_buf())
     }
 
     // The three producers must write the same header, or a bundle from one

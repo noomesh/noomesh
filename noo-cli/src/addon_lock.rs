@@ -541,15 +541,17 @@ pub fn verify_at(
 /// keys a release is about to be verified or published against, `dev` every
 /// development key this install knows. A key in both is refused: a release
 /// that trusted it would ship a lock nobody but one developer can sign for.
+/// The refusal names no expiry: an expired development key is still not a
+/// release key, and the release verb holds every one as never-expiring
+/// (`release_dev_set`), so a date here would be meaningless.
 pub fn refuse_dev_in_release(release_keys: &[String], dev: &[DevKey]) -> Result<(), String> {
     for k in release_keys {
         let k = k.trim().to_ascii_lowercase();
-        if let Some(d) = dev.iter().find(|d| d.key == k) {
+        if dev.iter().any(|d| d.key == k) {
             return Err(format!(
-                "key {}… is a development key on this install (expires {}); a release is never verified \
+                "key {}… is a development key on this install; a release is never verified \
                  against a development key. Sign the lock with the add-on's release key",
-                &k[..12.min(k.len())],
-                utc_minute(d.expires_at)
+                &k[..12.min(k.len())]
             ));
         }
     }
@@ -947,7 +949,7 @@ mod tests {
         let dev = vec![DevKey { key: pk(&"cd".repeat(32)), expires_at: NOW + 3600 }];
         assert!(refuse_dev_in_release(&[pk(&seed())], &dev).is_ok());
         let e = refuse_dev_in_release(&[pk(&seed()), pk(&"cd".repeat(32)).to_uppercase()], &dev).unwrap_err();
-        assert!(e.contains("development key") && e.contains(&utc_minute(NOW + 3600)), "{e}");
+        assert!(e.contains("development key") && !e.contains("expires"), "{e}");
     }
 
     #[test]

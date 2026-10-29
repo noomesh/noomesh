@@ -1939,6 +1939,55 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
     out
 }
 
+/// True when the seat's last heartbeat was sent before the apply finished:
+/// it still reports the old CLI, or the old applied sha. The seat's closing
+/// heartbeat comes from the OLD applier process, and the next one follows a
+/// sync tick (60s) later, so right after an apply the record can be stale.
+fn heartbeat_predates_apply(seat: &Value, controller_cli: &str) -> bool {
+    let hb = &seat["heartbeat"];
+    hb["cli_version"].as_str() != Some(controller_cli) || hb["last_applied_sha"] != seat["sha256"]
+}
+
+/// `seat_checks` for a seat whose apply just reported exit 0. Judges the seat
+/// only on evidence newer than the apply: when the last heartbeat predates it,
+/// the CLI and display verdicts must not be read off that heartbeat (it names
+/// the version the seat HAD). The apply's own report line stands in, and the
+/// row says plainly that no heartbeat has arrived since.
+pub(crate) fn seat_checks_after_apply(seat: &Value, controller_cli: &str, controller_tag: &str, now: i64) -> Vec<super::cluster_verify::Check> {
+    use super::cluster_verify::Verdict;
+    let mut out = seat_checks(seat, controller_cli, controller_tag, now);
+    if !heartbeat_predates_apply(seat, controller_cli) { return out; }
+    let msg = seat["apply_msg"].as_str().unwrap_or("");
+    let installed = matches!(report_word(msg, "cli"), Some("updated" | "unchanged"));
+    for c in out.iter_mut() {
+        let name: &str = c.name;
+        match name {
+            "seat cli" if c.verdict == Verdict::Fail || c.verdict == Verdict::Warn => {
+                *c = if installed {
+                    check("seat cli", Verdict::Warn, format!(
+                        "no heartbeat since the apply; the apply reported cli={} (the last heartbeat, from before it, said {})",
+                        report_word(msg, "cli").unwrap_or("?"),
+                        seat["heartbeat"]["cli_version"].as_str().filter(|v| !v.is_empty()).unwrap_or("nothing")),
+                        Some("noo cluster verify".into()))
+                } else {
+                    check("seat cli", Verdict::Fail, "no heartbeat since the apply, and the apply report does not state the CLI".into(),
+                        Some("noo upgrade --seats".into()))
+                };
+            }
+            "display" if c.verdict == Verdict::Fail => {
+                let reported = report_word(msg, "console").unwrap_or("");
+                if !reported.is_empty() && reported != "-" && norm_tag(reported) == norm_tag(controller_tag) {
+                    *c = check("display", Verdict::Warn, format!(
+                        "no heartbeat since the apply; the apply reported console {reported} = controller"),
+                        Some("noo cluster verify".into()));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// The seats stage of `noo upgrade` (after the nodes, or alone with
 /// `--seats`): stage every enrolled seat, wait for all of them together with
 /// the nodes' combined wait, then one verify block per seat. No enrolled
@@ -1979,10 +2028,12 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
         for (n, end) in ends {
             let ok_apply = matches!(end, super::provision::ApplyEnd::Applied { rc: 0, .. });
             // The closing heartbeat follows the apply report by a second or
-            // two; give it a moment so the block judges the new state.
+            // two, and the heartbeat that shows the new CLI one sync tick (60s)
+            // after that; wait for it, bounded. If it never comes the block
+            // says so (`seat_checks_after_apply`) instead of naming the old CLI.
             let mut st = crate::http::get_json_opt(g, &format!("/api/cluster/seats/{n}/status"), true, 10);
             if ok_apply {
-                for _ in 0..12 {
+                for _ in 0..30 {
                     let fresh = st.as_ref().is_some_and(|s| s["heartbeat"]["cli_version"].as_str() == Some(env!("CARGO_PKG_VERSION"))
                         && s["heartbeat"]["last_applied_sha"] == s["sha256"]);
                     if fresh { break; }
@@ -1991,7 +2042,8 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
                 }
             }
             let st = st.unwrap_or(Value::Null);
-            let checks = seat_checks(&st, env!("CARGO_PKG_VERSION"), &tag, now_unix());
+            let checks = if ok_apply { seat_checks_after_apply(&st, env!("CARGO_PKG_VERSION"), &tag, now_unix()) }
+                else { seat_checks(&st, env!("CARGO_PKG_VERSION"), &tag, now_unix()) };
             let seat_ok = ok_apply && checks.iter().all(|c| c.verdict != super::cluster_verify::Verdict::Fail);
             if !seat_ok { failed.push(n.clone()); }
             if g.json {
@@ -2274,6 +2326,37 @@ mod tests {
         assert!(seat_checks(&good, "0.6.5", "stack-v0.6.5", now + 600).iter().any(|c| c.name == "seat online" && c.verdict == Verdict::Fail));
         assert!(seat_checks(&good, "0.6.5", "v0.6.6", now).iter().any(|c| c.name == "display" && c.verdict == Verdict::Fail));
         assert_eq!(report_word(good["apply_msg"].as_str().unwrap(), "display"), Some("reloaded"));
+    }
+
+    #[test]
+    fn a_seat_is_not_judged_on_a_heartbeat_older_than_its_apply() {
+        use super::super::cluster_verify::Verdict;
+        let seen = "2025-10-09T08:53:10Z";
+        let now = super::super::cluster_verify::parse_rfc3339_unix(seen).unwrap() + 10;
+        // The apply landed 0.6.13; the last heartbeat predates it (old CLI,
+        // old applied sha, old console build).
+        let mut seat = json!({"seat_name": "lobby", "last_seen": seen,
+            "heartbeat": {"cli_version": "0.6.12", "last_applied_sha": "old", "user_cli_current": true, "kiosk_serve": "active",
+                          "console_build": "stack-v0.6.12", "kiosk": {"user": "alex"}},
+            "sha256": "new", "applied_sha": "new", "apply_rc": 0,
+            "apply_msg": "seat-apply cli=updated scripts=0 units=0 serve=unchanged display=reloaded console=stack-v0.6.13"});
+        // Today's judge reads the stale heartbeat as the seat's version.
+        assert!(seat_checks(&seat, "0.6.13", "stack-v0.6.13", now).iter().any(|c| c.name == "seat cli" && c.verdict == Verdict::Fail));
+        let c = seat_checks_after_apply(&seat, "0.6.13", "stack-v0.6.13", now);
+        assert!(c.iter().all(|c| c.verdict != Verdict::Fail), "{c:?}");
+        let cli = c.iter().find(|c| c.name == "seat cli").unwrap();
+        assert_eq!(cli.verdict, Verdict::Warn);
+        assert!(cli.detail.contains("no heartbeat since the apply"), "{}", cli.detail);
+        assert!(cli.detail.contains("cli=updated"), "{}", cli.detail);
+        // Without any statement of the CLI in the apply report, it still fails.
+        let mut mute = seat.clone();
+        mute["apply_msg"] = json!("");
+        assert!(seat_checks_after_apply(&mute, "0.6.13", "stack-v0.6.13", now).iter().any(|c| c.name == "seat cli" && c.verdict == Verdict::Fail));
+        // A newer heartbeat settles it: judged as before, a plain Ok.
+        seat["heartbeat"] = json!({"cli_version": "0.6.13", "last_applied_sha": "new", "user_cli_current": true, "kiosk_serve": "active",
+                                   "console_build": "stack-v0.6.13", "kiosk": {"user": "alex"}});
+        let c = seat_checks_after_apply(&seat, "0.6.13", "stack-v0.6.13", now);
+        assert!(c.iter().all(|c| c.verdict == Verdict::Ok), "{c:?}");
     }
 
     #[test]
@@ -2591,7 +2674,6 @@ mod tests {
     struct FakeRoot { root: PathBuf, work: PathBuf, log: PathBuf, cfg: SeatConfig }
     impl FakeRoot {
         fn new(tag: &str) -> FakeRoot {
-            use std::os::unix::fs::PermissionsExt as _;
             let root = std::env::temp_dir().join(format!("noo-seat-root-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             for d in ["etc/systemd/system", "usr/local/bin", "home/alex", "_shims", "_work"] {
@@ -2600,8 +2682,7 @@ mod tests {
             let real_install = ["/usr/bin/install", "/bin/install"].into_iter().find(|p| Path::new(p).exists()).expect("coreutils install");
             let shim = |n: &str, body: String| {
                 let p = root.join("_shims").join(n);
-                std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
-                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+                crate::test_exec::write_exec(&p, format!("#!/bin/sh\n{body}"), 0o755);
             };
             shim("install", format!(r#"o=-; g=-; m=-; d=no; last=
 n=$#

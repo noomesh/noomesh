@@ -374,6 +374,13 @@ func (a *Agent) Run() error {
 		b, m, ok := rec.ChatPlacement()
 		return api.ChatPlacement{Backend: b, Model: m}, ok
 	})
+	a.server.SetChatPlacements(func() []api.ChatPlacement {
+		var out []api.ChatPlacement
+		for _, m := range rec.ChatModels() {
+			out = append(out, api.ChatPlacement{Backend: m.Backend, Model: m.Model})
+		}
+		return out
+	})
 	a.server.SetHarnessPlacement(func() api.HarnessPlacement {
 		kind, env, ds, placed := rec.HarnessPlacementView()
 		hp := api.HarnessPlacement{Kind: kind, Env: env, DesiredState: ds, Placed: placed}
@@ -565,6 +572,7 @@ func (a *Agent) startMessaging(ctx context.Context) {
 	a.hb.SetHostdState(a.hostdStatus)
 	a.hb.SetBackendContainers(a.backendContainers)
 	a.hb.SetOllamaDoor(func() string { return a.docker.BackendDialURL(a.lifeCtx(), "ollama") })
+	a.hb.SetChatModelStats(func() []heartbeat.ModelStat { return a.server.ChatModelStats(a.lifeCtx()) })
 	if a.native != nil {
 		a.hb.SetModelStats(func() []heartbeat.ModelStat {
 			ctx, cancel := context.WithTimeout(a.lifeCtx(), 3*time.Second)

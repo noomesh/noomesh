@@ -16,6 +16,7 @@
 //! flag and is parsed locally.
 
 use super::confirm_destructive;
+use crate::args::{ArgError, Args};
 use crate::http::{delete_json, get_json, get_json_poll, post_json, request_status};
 use crate::output::{fail, ExitCode};
 use crate::ui::{self, Col, Glyph};
@@ -62,19 +63,16 @@ pub fn jobs_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(crate::ui::watch_loop(secs, || jobs_list_once(g, &rest).unwrap_or(2)))
 }
 
+pub(crate) fn parse_list_with(a: &mut Args) -> Result<(u64, Option<String>, Option<String>), ArgError> {
+    let limit = a.number::<u64>(&["--limit", "-n"])?.unwrap_or(20);
+    let status = a.value(&["--status", "-s"])?;
+    let node = a.value(&["--node"])?;
+    a.finish()?;
+    Ok((limit, status, node))
+}
+
 fn jobs_list_once(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut limit = 20u64;
-    let mut status: Option<String> = None;
-    let mut node: Option<String> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--limit" | "-n" => limit = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?,
-            "--status" | "-s" => status = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--node" => node = Some(iter.next().ok_or(Unhandled)?.clone()),
-            _ => return Err(Unhandled),
-        }
-    }
+    let (limit, status, node) = parse_list_with(&mut Args::new(args))?;
     let mut path = format!("/api/jobs?limit={limit}");
     if let Some(s) = &status {
         path.push_str(&format!("&status={s}"));
@@ -231,38 +229,35 @@ pub(crate) fn report_poll_timeout(g: &Globals, job_id: &str, timeout: u64) -> i3
     1
 }
 
+pub(crate) struct RunArgs {
+    pub prompt: String,
+    pub async_mode: bool,
+    pub priority: i64,
+    pub backend: Option<String>,
+    pub node: Option<String>,
+    pub timeout: u64,
+    pub job_type: String,
+}
+
+/// `default_timeout` is the global `--timeout` (or 300); `-t` overrides it.
+pub(crate) fn parse_run_with(a: &mut Args, default_timeout: u64) -> Result<RunArgs, ArgError> {
+    let async_mode = a.flag(&["--async", "-a"]);
+    let priority = a.number::<i64>(&["--priority", "-p"])?.unwrap_or(5);
+    let backend = a.value(&["--backend", "-b"])?;
+    let node = a.value(&["--node", "-n"])?;
+    // `--timeout` was consumed by the global parser; `-t` is the same flag.
+    let timeout = a.number::<u64>(&["-t"])?.unwrap_or(default_timeout);
+    let job_type = a.value(&["--type"])?.unwrap_or_else(|| "inference".to_string());
+    let prompt = a.one("<prompt>")?;
+    Ok(RunArgs { prompt, async_mode, priority, backend, node, timeout, job_type })
+}
+
 /// `noo jobs run PROMPT [--async/-a] [--priority/-p N] [--backend/-b B]
 /// [--node/-n ID] [--timeout/-t SECS] [--type TYPE]` —
 /// POST /api/jobs/submit, then poll to completion (unless `--async`).
 pub fn jobs_run(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut prompt: Option<String> = None;
-    let mut async_mode = false;
-    let mut priority = 5i64;
-    let mut backend: Option<String> = None;
-    let mut node: Option<String> = None;
-    // `--timeout` was consumed by the global parser; `-t` is the same flag.
-    let mut timeout = g.timeout_secs.unwrap_or(300);
-    let mut job_type = "inference".to_string();
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--async" | "-a" => async_mode = true,
-            "--priority" | "-p" => {
-                priority = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?
-            }
-            "--backend" | "-b" => backend = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--node" | "-n" => node = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "-t" => timeout = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?,
-            "--type" => job_type = iter.next().ok_or(Unhandled)?.clone(),
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => {
-                if prompt.replace(t.to_string()).is_some() {
-                    return Err(Unhandled);
-                }
-            }
-        }
-    }
-    let Some(prompt) = prompt else { return Err(Unhandled) };
+    let RunArgs { prompt, async_mode, priority, backend, node, timeout, job_type } =
+        parse_run_with(&mut Args::new(args), g.timeout_secs.unwrap_or(300))?;
     // Python sends backend/force_node as null when unset — same body here.
     let body = serde_json::json!({
         "type": job_type,
@@ -353,26 +348,20 @@ pub fn jobs_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+pub(crate) fn parse_submit_with(a: &mut Args) -> Result<(String, i64, Option<String>, Option<String>), ArgError> {
+    let job_type = a.value(&["--type", "-t"])?.unwrap_or_else(|| "inference".to_string());
+    let priority = a.number::<i64>(&["--priority", "-p"])?.unwrap_or(5);
+    let backend = a.value(&["--backend", "-b"])?;
+    let payload = a.value(&["--payload"])?;
+    a.finish()?;
+    Ok((job_type, priority, backend, payload))
+}
+
 /// `noo jobs submit [--type/-t T] [--priority/-p N] [--backend/-b B]
 /// [--timeout SECS] [--payload JSON]` — POST /api/jobs/submit.
 pub fn jobs_submit(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut job_type = "inference".to_string();
-    let mut priority = 5i64;
-    let mut backend: Option<String> = None;
+    let (job_type, priority, backend, payload) = parse_submit_with(&mut Args::new(args))?;
     let timeout = g.timeout_secs.unwrap_or(300); // `--timeout` is global-parsed
-    let mut payload: Option<String> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--type" | "-t" => job_type = iter.next().ok_or(Unhandled)?.clone(),
-            "--priority" | "-p" => {
-                priority = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?
-            }
-            "--backend" | "-b" => backend = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--payload" => payload = Some(iter.next().ok_or(Unhandled)?.clone()),
-            _ => return Err(Unhandled),
-        }
-    }
     let parsed_payload = match &payload {
         None => None,
         Some(raw) => match serde_json::from_str::<serde_json::Value>(raw) {
@@ -429,17 +418,16 @@ pub fn jobs_submit(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+pub(crate) fn parse_history_with(a: &mut Args) -> Result<u64, ArgError> {
+    let limit = a.number::<u64>(&["--limit", "-n"])?.unwrap_or(20);
+    a.finish()?;
+    Ok(limit)
+}
+
 /// `noo jobs history [--limit/-n N]` — GET /api/jobs/history.
 pub fn jobs_history(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     crate::ui::auto_page(); // long output: $PAGER on a TTY (no-op otherwise)
-    let mut limit = 20u64;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--limit" | "-n" => limit = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?,
-            _ => return Err(Unhandled),
-        }
-    }
+    let limit = parse_history_with(&mut Args::new(args))?;
     let body = get_json(g, &format!("/api/jobs/history?limit={limit}"), true, 10);
     if g.json {
         println!("{body}");
@@ -690,4 +678,30 @@ fn drain_action(g: &Globals, args: &[String], action: &str) -> Result<i32, Unhan
         ]);
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    fn a(v: &[&str]) -> Args {
+        Args::new(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn run_takes_one_prompt_and_t_overrides_the_default_timeout() {
+        let r = parse_run_with(&mut a(&["hello", "-a", "-p", "9", "-t", "30", "--type", "x"]), 300).unwrap();
+        assert_eq!((r.prompt.as_str(), r.async_mode, r.priority, r.timeout, r.job_type.as_str()), ("hello", true, 9, 30, "x"));
+        assert_eq!(parse_run_with(&mut a(&["hi"]), 300).unwrap().timeout, 300);
+        assert!(parse_run_with(&mut a(&["a", "b"]), 300).is_err());
+        assert!(parse_run_with(&mut a(&[]), 300).is_err());
+        assert!(parse_run_with(&mut a(&["hi", "-p", "high"]), 300).is_err());
+    }
+
+    #[test]
+    fn list_and_history_refuse_unknown_arguments() {
+        assert_eq!(parse_list_with(&mut a(&["-n", "5", "-s", "queued"])).unwrap(), (5, Some("queued".to_string()), None));
+        assert!(parse_list_with(&mut a(&["--wat"])).is_err());
+        assert!(parse_history_with(&mut a(&["extra"])).is_err());
+    }
 }

@@ -808,9 +808,25 @@ SELECT consumer FROM noo_addon_caller_keys WHERE key_hash = $1
 ```
 
 `noo_addon_caller_keys` exposes the consumer, the hash and the creation time
-for add-on-caller rows alone, and mesh migration `077_addon_caller_verify_view` grants
-SELECT on it to each add-on role. Hash what you were presented, look it up,
+for add-on-caller rows alone. Hash what you were presented, look it up,
 and refuse the request when there is no row.
+
+**Declare it to read it.** Put `"verify_callers": true` in your bundle's
+`system.json` ([Declaring a database](#declaring-a-database)). While your
+add-on is registered (switched on, its signed lock verified this start, its
+declarations valid), the gateway's systems broker makes your runtime role
+`noo_<id>` a member of the group role `noo_caller_verifiers`, which holds
+`USAGE` on the view's schema (`mesh` on a cluster install) and `SELECT` on
+the view, and nothing else. Your migration role `noo_<id>_ddl` never gets it.
+The grant follows the declaration on every gateway start: remove the field,
+switch the add-on off, or let its lock fail to verify, and the next start
+revokes it. Without the field your role cannot read the view, and every
+lookup fails with `permission denied`. The field needs a 0.6.14 or later
+gateway and CLI; an older one refuses a `system.json` carrying it, so
+declare it in a bundle whose lock supports 0.6.14 and later only. (Mesh
+revision `077_addon_caller_verify_view` also grants the view directly to one
+role it names, from before the declaration existed; that grant is left as
+it is.)
 
 Cache the lookup briefly if you like; the gateway caches its own key
 resolution for 60 seconds. Do not cache the ABSENCE of a row for long —
@@ -1283,7 +1299,8 @@ default privileges, and the extensions.
   "schema": "example_addon",
   "role": "noo_example_addon",
   "ddl_role": "noo_example_addon_ddl",
-  "extensions": ["pg_trgm"]
+  "extensions": ["pg_trgm"],
+  "verify_callers": true
 }
 ```
 
@@ -1293,6 +1310,7 @@ default privileges, and the extensions.
 | `role` | exactly `noo_<id>`: the runtime role (DML, no `CREATE`) |
 | `ddl_role` | exactly `noo_<id>_ddl`: owns the schema; run your migrations as it |
 | `extensions` | optional; each one of `vector`, `pg_trgm`, `pgcrypto`, `citext`, `btree_gin`, `btree_gist`, `hstore`, `unaccent`, `fuzzystrmatch` (the broker installs them as superuser, so the list is closed) |
+| `verify_callers` | optional boolean, default `false`. `true` says your add-on verifies the bearer the gateway presents (see [Verifying the bearer](#verifying-the-bearer)): the broker lets your **runtime** role `noo_<id>` read the `noo_addon_caller_keys` view. The migration role never gets it |
 
 Any other value, any other field, or an add-on whose `<id>` would be a core
 name (`app`, `worker`, `gateway`, `admin`, `public`, `mesh`, `noo`, … or a

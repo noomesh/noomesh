@@ -21,6 +21,7 @@
 //! version only sends user_id when --user is given.
 
 use super::{truncate, urlencode};
+use crate::args::{ArgError, Args};
 use crate::http::{get_json, get_json_opt, post_json};
 use crate::ui::{self, Col};
 use crate::{Globals, Unhandled};
@@ -30,24 +31,16 @@ use crate::{Globals, Unhandled};
 const WATCH_POLL_SECS: u64 = 1;
 const WATCH_RETRY_SECS: u64 = 2;
 
+pub(crate) fn parse_search_with(a: &mut Args) -> Result<(String, Option<String>), ArgError> {
+    let user = a.value(&["--user", "-u"])?;
+    let query = a.one("<query>")?;
+    Ok((query, user))
+}
+
 /// `noo memory search QUERY [--user/-u USER]` —
 /// GET /api/memory/search?query=…[&user_id=…] (pgvector similarity).
 pub fn memory_search(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut query: Option<String> = None;
-    let mut user: Option<String> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--user" | "-u" => user = Some(iter.next().ok_or(Unhandled)?.clone()),
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => {
-                if query.replace(t.to_string()).is_some() {
-                    return Err(Unhandled);
-                }
-            }
-        }
-    }
-    let Some(q) = query else { return Err(Unhandled) };
+    let (q, user) = parse_search_with(&mut Args::new(args))?;
     let mut path = format!("/api/memory/search?query={}", urlencode(&q));
     if let Some(u) = &user {
         path.push_str(&format!("&user_id={}", urlencode(u)));
@@ -162,24 +155,20 @@ pub fn memory_health(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+/// `--channel/-c` is deliberately not asked for: it stays an unknown flag.
+pub(crate) fn parse_conversations_with(a: &mut Args) -> Result<(Option<String>, u64), ArgError> {
+    let user = a.value(&["--user", "-u"])?;
+    let limit = a.number::<u64>(&["--limit", "-n"])?.unwrap_or(20);
+    a.finish()?;
+    Ok((user, limit))
+}
+
 /// `noo memory conversations [--user/-u U] [--limit/-n N]` —
 /// GET /api/conversations/with-preview (the Rust gateway's conversation
 /// list route; the Python CLI's bare GET /api/conversations doesn't exist
 /// there). `--channel/-c` → Python: the endpoint has no channel filter.
 pub fn memory_conversations(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut user: Option<String> = None;
-    let mut limit = 20u64;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--user" | "-u" => user = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--limit" | "-n" => limit = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?,
-            // No channel column on the with-preview route — Python's
-            // /api/conversations surface is the reference for this filter.
-            "--channel" | "-c" => return Err(Unhandled),
-            _ => return Err(Unhandled),
-        }
-    }
+    let (user, limit) = parse_conversations_with(&mut Args::new(args))?;
     let mut path = format!("/api/conversations/with-preview?limit={limit}");
     if let Some(u) = &user {
         path.push_str(&format!("&user_id={}", urlencode(u)));
@@ -222,16 +211,15 @@ pub fn memory_conversations(g: &Globals, args: &[String]) -> Result<i32, Unhandl
     Ok(0)
 }
 
+pub(crate) fn parse_tool_stats_with(a: &mut Args) -> Result<u64, ArgError> {
+    let days = a.number::<u64>(&["--days", "-d"])?.unwrap_or(30);
+    a.finish()?;
+    Ok(days)
+}
+
 /// `noo memory tool-stats [--days/-d N]` — GET /api/conversations/stats/tools.
 pub fn memory_tool_stats(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut days = 30u64;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--days" | "-d" => days = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?,
-            _ => return Err(Unhandled),
-        }
-    }
+    let days = parse_tool_stats_with(&mut Args::new(args))?;
     let body = get_json(g, &format!("/api/conversations/stats/tools?days={days}"), true, 10);
     if g.json {
         println!("{body}");

@@ -207,10 +207,30 @@ impl Core {
             let p = root.join(n);
             texts.push(std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?);
         }
-        if texts.is_empty() {
-            return Err(format!("no core compose file (docker-compose*.yml) under {}, so an add-on's secrets cannot be checked", root.display()));
+        Core::of_compose_texts(&texts, &format!("under {}", root.display()))
+    }
+
+    /// The core this binary ships: the `docker-compose*.yml` files baked in
+    /// by build.rs (the deploy slice an install is made of), plus
+    /// [`Core::with_tables`]. Needs no install. A crate-only build embeds
+    /// none, and that is an error, not an empty core.
+    pub fn embedded() -> Result<Core, String> {
+        let mut texts = Vec::new();
+        for (rel, bytes, _) in crate::onboard::standalone::STANDALONE_ASSETS {
+            if !rel.contains('/') && rel.starts_with("docker-compose") && rel.ends_with(".yml") {
+                texts.push(String::from_utf8(bytes.to_vec()).map_err(|_| format!("the embedded core file {rel} is not UTF-8"))?);
+            }
         }
-        Ok(Core::from_texts(&texts)?.with_tables())
+        Core::of_compose_texts(&texts, "embedded in this build")
+    }
+
+    /// The one tail both readers share: no text at all is an error (`where_`
+    /// says where none was found), else the parse plus the tables.
+    fn of_compose_texts(texts: &[String], where_: &str) -> Result<Core, String> {
+        if texts.is_empty() {
+            return Err(format!("no core compose file (docker-compose*.yml) {where_}, so an add-on's secrets cannot be checked"));
+        }
+        Ok(Core::from_texts(texts)?.with_tables())
     }
 }
 

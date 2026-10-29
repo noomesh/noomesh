@@ -98,21 +98,29 @@ const StunnelLlamacppContainer = "noo-stunnel-llamacpp"
 // either.
 const StunnelContainerPrefix = "noo-stunnel-"
 
-// VLLMClientCertFlag is what every vLLM in the cluster runs with
+// VLLMClientCertFlag is what a vLLM serving its own door runs with
 // (`--ssl-cert-reqs 2`, ssl.CERT_REQUIRED): the listener is TLS and refuses
 // a caller without a cluster-CA client certificate. Its presence in a
 // container's command is the container declaring "dial me over TLS, with
-// your leaf"; a vLLM created before 2026-09-29 by an older agent lacks it
-// and is dialled plain until the reconciler recreates it (backends.go
-// backendDoorGeneration).
+// your leaf". The compose stack's vLLMs still do; an agent-started vLLM
+// does from door generation 2 to 4 and sits behind noo-stunnel-vllm from
+// generation 5 (sidecar.go). One created before 2026-09-29 lacks both and
+// is dialled plain until the reconciler recreates it.
 const VLLMClientCertFlag = "--ssl-cert-reqs"
 
 // backendDoor is how a caller reaches one backend on the docker bridge.
 type backendDoor struct {
-	// Sidecar is the stunnel service name (`noo-stunnel-<Sidecar>`) when
-	// the backend cannot terminate TLS itself; "" when it serves natively
-	// (vLLM) or, for airllm, serves plaintext by named exception.
+	// Sidecar is the stunnel service name (`noo-stunnel-<Sidecar>`) and the
+	// service leaf the door serves with; "" when the backend serves TLS
+	// natively (the compose stack's vllm-secondary until its own door) or,
+	// for airllm, plaintext by named exception.
 	Sidecar string
+	// Alias is the name callers dial the door by when it is not the
+	// sidecar's own: the sidecar joins the bridge under it. vLLM's door
+	// keeps `https://noo-vllm:8000` — the name its leaf carries on every
+	// node and every caller already dials — so the door moved in front of
+	// the engine with no leaf reissued and no URL changed.
+	Alias string
 	// Port the door listens on. For a sidecar it is the port compose's
 	// stunnel-<x>.conf accepts on, so the same URL reaches a compose door
 	// and an agent-run one.
@@ -129,7 +137,7 @@ type backendDoor struct {
 // tests/test_node_backends_require_client_certs.py. A backend absent here
 // is dialled plain on BackendPorts (airllm; nothing else).
 var backendDoors = map[string]backendDoor{
-	"vllm":           {Port: 8000, PlainPort: 8000},
+	"vllm":           {Sidecar: "vllm", Alias: "noo-vllm", Port: 8000, PlainPort: 8000},
 	"vllm-secondary": {Port: 8000, PlainPort: 8000},
 	"llamacpp":       {Sidecar: "llamacpp", Port: 8085, PlainPort: 8085},
 	"ollama":         {Sidecar: "ollama", Port: 11434, PlainPort: 11434},
@@ -154,6 +162,20 @@ func SidecarContainerFor(backend string) string {
 
 // DoorPort returns the port a backend's door listens on (0 = no door).
 func DoorPort(backend string) int { return backendDoors[backend].Port }
+
+// doorDialHost is the name a caller dials a backend's door by, and so the
+// name its leaf must carry: the door's alias, else its sidecar's container
+// name, else the backend's own (a native listener).
+func doorDialHost(backend string) string {
+	door := backendDoors[backend]
+	switch {
+	case door.Alias != "":
+		return door.Alias
+	case door.Sidecar != "":
+		return StunnelContainerPrefix + door.Sidecar
+	}
+	return "noo-" + backend
+}
 
 // sidecarBackend maps a running sidecar container name back to the backend
 // key it fronts ("" for a name that is not a known sidecar). The compose
@@ -184,6 +206,47 @@ type declaredTLS struct {
 	tls      map[string]bool // backend key -> the listener requires TLS (+ client cert)
 	sidecars map[string]bool // backend key -> its noo-stunnel-<x> is running
 	known    map[string]bool // backend key -> a container for it is running
+	// stranded: backend key -> engine container ID, for a fronted engine
+	// whose sidecar restarted after it (sidecar.go): it sits in the old
+	// namespace, unreachable, until HealStrandedEngines restarts it.
+	stranded map[string]string
+}
+
+// engineDoorShape is how a fronted engine sits relative to its door.
+type engineDoorShape int
+
+const (
+	engineInDoor   engineDoorShape = iota // in its sidecar's namespace, started after it
+	engineOnBridge                        // its own network: any bridge peer dials it plain
+	engineStranded                        // in the namespace of a sidecar that restarted since
+)
+
+// judgeEngineDoor is the pure decision behind the generation-3 rows:
+// netMode is the engine's HostConfig.NetworkMode, sidecarIDs the running
+// sidecars' ID -> name, startedAt the inspected start times (RFC 3339)
+// of the engine and of the sidecar it names, "" when unknown.
+func judgeEngineDoor(netMode string, sidecarIDs map[string]string, engineStarted, sidecarStarted string) (engineDoorShape, string) {
+	ref, ok := strings.CutPrefix(netMode, "container:")
+	if !ok {
+		return engineOnBridge, ""
+	}
+	sidecarID := ""
+	for id, name := range sidecarIDs {
+		if id == ref || name == ref || (len(ref) >= 12 && strings.HasPrefix(id, ref)) {
+			sidecarID = id
+		}
+	}
+	if sidecarID == "" {
+		// The namespace owner is gone or is not a door: nothing reaches
+		// the engine through a sidecar, which is the stranded case.
+		return engineStranded, ""
+	}
+	e, errE := time.Parse(time.RFC3339Nano, engineStarted)
+	sc, errS := time.Parse(time.RFC3339Nano, sidecarStarted)
+	if errE == nil && errS == nil && sc.After(e) {
+		return engineStranded, sidecarID
+	}
+	return engineInDoor, sidecarID
 }
 
 // DeclaredTLS reads the declaration off the running containers. Cached for
@@ -210,13 +273,15 @@ func (c *Client) DeclaredTLS(ctx context.Context) *declaredTLS {
 }
 
 func (c *Client) readDeclaredTLS(ctx context.Context) *declaredTLS {
-	d := &declaredTLS{tls: map[string]bool{}, sidecars: map[string]bool{}, known: map[string]bool{}}
+	d := &declaredTLS{tls: map[string]bool{}, sidecars: map[string]bool{}, known: map[string]bool{}, stranded: map[string]string{}}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	containers, err := c.listContainers(ctx, client.ContainerListOptions{})
 	if err != nil {
 		return nil
 	}
+	sidecarIDs := map[string]string{} // running sidecar ID -> name
+	engines := map[string]container.Summary{}
 	for _, ctr := range containers {
 		if len(ctr.Names) == 0 {
 			continue
@@ -224,6 +289,7 @@ func (c *Client) readDeclaredTLS(ctx context.Context) *declaredTLS {
 		name := strings.TrimPrefix(ctr.Names[0], "/")
 		if b := sidecarBackend(name); b != "" {
 			d.sidecars[b] = true
+			sidecarIDs[ctr.ID] = name
 			continue
 		}
 		key := backendKeyFromName(name)
@@ -231,6 +297,9 @@ func (c *Client) readDeclaredTLS(ctx context.Context) *declaredTLS {
 			continue
 		}
 		d.known[key] = true
+		if SidecarFor(key) != "" {
+			engines[key] = ctr
+		}
 		if key != "vllm" && key != "vllm-secondary" {
 			continue
 		}
@@ -246,6 +315,10 @@ func (c *Client) readDeclaredTLS(ctx context.Context) *declaredTLS {
 	// (backendDoors) and declares none. Loud on the node's heartbeat and
 	// in `noo cluster verify`, cleared the moment the door appears.
 	for key := range backendDoors {
+		if d.known[key] && d.sidecars[key] && SidecarFor(key) != "" {
+			c.judgeFrontedEngine(ctx, d, key, engines[key], sidecarIDs)
+			continue
+		}
 		if !d.known[key] || d.tls[key] || d.sidecars[key] {
 			refusals.Clear("backend_door", key)
 			continue
@@ -258,6 +331,77 @@ func (c *Client) readDeclaredTLS(ctx context.Context) *declaredTLS {
 				" leaf under $NOO_PKI_DIR (backend_start/backend_tls rows say if it is missing)")
 	}
 	return d
+}
+
+// judgeFrontedEngine records (or clears) the backend_door row for an
+// engine whose sidecar runs: door generation 3 wants it inside the
+// sidecar's namespace on loopback (sidecar.go). An engine on the bridge
+// beside its door predates generation 3 and is reachable plain by every
+// bridge peer until the reconciler recreates it; a stranded one answers
+// nobody until HealStrandedEngines restarts it.
+func (c *Client) judgeFrontedEngine(ctx context.Context, d *declaredTLS, key string, eng container.Summary, sidecarIDs map[string]string) {
+	started := func(id string) string {
+		res, err := c.docker.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
+		if err != nil || res.Container.State == nil {
+			return ""
+		}
+		return res.Container.State.StartedAt
+	}
+	netMode := eng.HostConfig.NetworkMode
+	engStarted, scStarted := "", ""
+	if ref, ok := strings.CutPrefix(netMode, "container:"); ok {
+		engStarted = started(eng.ID)
+		scStarted = started(ref)
+	}
+	shape, _ := judgeEngineDoor(netMode, sidecarIDs, engStarted, scStarted)
+	name := ContainerNameFor(key)
+	switch shape {
+	case engineOnBridge:
+		refusals.Record("backend_door", key,
+			"the running "+name+" listens on the docker bridge beside "+SidecarContainerFor(key)+
+				": every container on the bridge (and host processes) can call it PLAINTEXT, without a certificate. "+
+				"It predates door generation 3 (the backend inside its door's network, on 127.0.0.1); "+
+				"the reconciler recreates it on its next pass")
+	case engineStranded:
+		d.stranded[key] = eng.ID
+		refusals.Record("backend_door", key,
+			"the running "+name+" is cut off: "+SidecarContainerFor(key)+" restarted after it, and "+name+
+				" still sits in the old network namespace, so its door reaches nothing. "+
+				"The reconciler restarts "+name+" on its next pass")
+	default:
+		refusals.Clear("backend_door", key)
+	}
+}
+
+// HealStrandedEngines restarts every fronted engine left in a dead
+// namespace by a sidecar restart (sidecar.go). An engine restart rejoins
+// the sidecar's current namespace; it costs a model load, which is what
+// the engine needs anyway to be reachable again. Returns the restarted
+// container names.
+func (c *Client) HealStrandedEngines(ctx context.Context) []string {
+	if c == nil || c.docker == nil {
+		return nil
+	}
+	c.declMu.Lock()
+	d := c.readDeclaredTLS(ctx)
+	c.declRead = false // the restarts below change the answer
+	c.declMu.Unlock()
+	if d == nil {
+		return nil
+	}
+	var out []string
+	for key, id := range d.stranded {
+		name := ContainerNameFor(key)
+		timeout := 10
+		if _, err := c.docker.ContainerRestart(ctx, id, client.ContainerRestartOptions{Timeout: &timeout}); err != nil {
+			slog.Warn("door: could not restart a stranded backend", "backend", key, "container", name, "error", err)
+			continue
+		}
+		slog.Warn("door: restarted a backend stranded by its sidecar's restart", "backend", key, "container", name,
+			"sidecar", SidecarContainerFor(key))
+		out = append(out, name)
+	}
+	return out
 }
 
 // doorLeafService names the service leaf a backend's door serves with:
@@ -310,7 +454,7 @@ func backendDialURL(backend string, d *declaredTLS) string {
 	if d != nil {
 		switch {
 		case d.sidecars[backend]:
-			return fmt.Sprintf("https://%s%s:%d", StunnelContainerPrefix, door.Sidecar, door.Port)
+			return fmt.Sprintf("https://%s:%d", doorDialHost(backend), door.Port)
 		case d.tls[backend]:
 			return fmt.Sprintf("https://noo-%s:%d", backend, door.Port)
 		case d.known[backend]:
@@ -322,10 +466,7 @@ func backendDialURL(backend string, d *declaredTLS) string {
 			return fmt.Sprintf("http://%s:%d", name, door.PlainPort)
 		}
 	}
-	if door.Sidecar != "" {
-		return fmt.Sprintf("https://%s%s:%d", StunnelContainerPrefix, door.Sidecar, door.Port)
-	}
-	return fmt.Sprintf("https://noo-%s:%d", backend, door.Port)
+	return fmt.Sprintf("https://%s:%d", doorDialHost(backend), door.Port)
 }
 
 // ProfileMap maps backend names to docker-compose profiles.

@@ -18,31 +18,23 @@
 //! use a watched folder for those.
 
 use super::{truncate, urlencode};
+use crate::args::{ArgError, Args};
 use crate::http::{get_json, post_json};
 use crate::output::{fail, ExitCode};
 use crate::ui::{self, Col, Glyph};
 use crate::{Globals, Unhandled};
 
+pub(crate) fn parse_query_with(a: &mut Args) -> Result<(String, String, Option<String>), ArgError> {
+    let strategy = a.value(&["--strategy", "-s"])?.unwrap_or_else(|| "hybrid".to_string());
+    let persona = a.value(&["--persona", "-p"])?;
+    let question = a.one("<question>")?;
+    Ok((question, strategy, persona))
+}
+
 /// `noo rag query QUESTION [--strategy/-s S] [--persona/-p ID]` —
 /// POST /api/v1/rag/query {"question", "strategy", ["persona_id"]}.
 pub fn rag_query(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut question: Option<String> = None;
-    let mut strategy = "hybrid".to_string();
-    let mut persona: Option<String> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--strategy" | "-s" => strategy = iter.next().ok_or(Unhandled)?.clone(),
-            "--persona" | "-p" => persona = Some(iter.next().ok_or(Unhandled)?.clone()),
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => {
-                if question.replace(t.to_string()).is_some() {
-                    return Err(Unhandled);
-                }
-            }
-        }
-    }
-    let Some(q) = question else { return Err(Unhandled) };
+    let (q, strategy, persona) = parse_query_with(&mut Args::new(args))?;
     let mut body = serde_json::json!({ "question": q, "strategy": strategy });
     if let Some(p) = &persona {
         body["persona_id"] = p.as_str().into();
@@ -196,7 +188,7 @@ fn status_rows(body: &serde_json::Value) -> Vec<(&'static str, String)> {
 
 /// What `noo rag docs` was asked for.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct DocsArgs {
+pub(crate) struct DocsArgs {
     untagged: bool,
     audience: Option<String>,
     source_glob: Option<String>,
@@ -206,22 +198,21 @@ struct DocsArgs {
 }
 
 impl DocsArgs {
-    fn parse(args: &[String]) -> Result<DocsArgs, Unhandled> {
-        let mut out = DocsArgs::default();
-        let mut iter = args.iter();
-        while let Some(tok) = iter.next() {
-            match tok.as_str() {
-                "--untagged" => out.untagged = true,
-                "--audience" => out.audience = Some(iter.next().ok_or(Unhandled)?.clone()),
-                "--match" => out.source_glob = Some(iter.next().ok_or(Unhandled)?.clone()),
-                "--title" => out.title = Some(iter.next().ok_or(Unhandled)?.clone()),
-                "--limit" => {
-                    out.limit = Some(iter.next().and_then(|v| v.parse().ok()).filter(|n| *n > 0).ok_or(Unhandled)?)
-                }
-                _ => return Err(Unhandled),
-            }
-        }
-        Ok(out)
+    fn parse(args: &[String]) -> Result<DocsArgs, ArgError> {
+        Self::parse_with(&mut Args::new(args))
+    }
+
+    pub(crate) fn parse_with(a: &mut Args) -> Result<DocsArgs, ArgError> {
+        let untagged = a.flag(&["--untagged"]);
+        let audience = a.value(&["--audience"])?;
+        let source_glob = a.value(&["--match"])?;
+        let title = a.value(&["--title"])?;
+        let limit = match a.number::<usize>(&["--limit"])? {
+            Some(0) => return Err(ArgError::new("--limit must be more than 0")),
+            other => other,
+        };
+        a.finish()?;
+        Ok(DocsArgs { untagged, audience, source_glob, title, limit })
     }
 
     fn filtered(&self) -> bool {
@@ -794,20 +785,19 @@ pub fn rag_ingest(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(if skipped.is_empty() { 0 } else { 1 })
 }
 
+pub(crate) fn parse_scan_with(a: &mut Args) -> Result<String, ArgError> {
+    let source = a.value(&["--source", "-s"])?.unwrap_or_else(|| "all".to_string());
+    a.finish()?;
+    Ok(source)
+}
+
 /// `noo rag scan [--source/-s folders|drives|all]` —
 /// POST /api/v1/ingest/scan?source=… (native Rust route). Synchronous: each
 /// scan cycle (download + ingest) completes before it returns, so a big
 /// batch can take a while — Python parity 300s timeout. Idempotent
 /// (source_uri dedup + content-hash backstop).
 pub fn rag_scan(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut source = "all".to_string();
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--source" | "-s" => source = iter.next().ok_or(Unhandled)?.clone(),
-            _ => return Err(Unhandled),
-        }
-    }
+    let source = parse_scan_with(&mut Args::new(args))?;
     if !matches!(source.as_str(), "folders" | "drives" | "all") {
         // Python parity: validation error, exit 1.
         fail(

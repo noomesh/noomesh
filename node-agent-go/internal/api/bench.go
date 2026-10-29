@@ -19,6 +19,7 @@ import (
 	"time"
 
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
+	"github.com/noomesh/noomesh/node-agent-go/internal/modelstats"
 )
 
 // POST /bench measures this node's running CHAT model: how long it takes to
@@ -68,6 +69,10 @@ var (
 	errNoChatBackend = errors.New("no chat backend")
 	errBenchBusy     = errors.New("a bench is already running on this node")
 )
+
+// SetChatPlacements installs the provider of every running chat placement
+// (ChatModelStats).
+func (s *Server) SetChatPlacements(f func() []ChatPlacement) { s.chatPlacements = f }
 
 // SetChatPlacement installs the provider of the node's desired chat
 // placement (the reconciler's last desired-config). nil = none, and
@@ -154,16 +159,28 @@ func (s *Server) resolveBenchTarget(ctx context.Context) (benchTarget, error) {
 	if !ok {
 		return benchTarget{}, fmt.Errorf("%w: this node has no running chat placement", errNoChatBackend)
 	}
-	running := map[string]string{}
+	running, native := s.runningAndNative(ctx)
+	return s.chatTarget(ctx, cp, running, native)
+}
+
+// runningAndNative is every running backend (docker, then native ones docker
+// does not run) with its served model, and the native ones alone.
+func (s *Server) runningAndNative(ctx context.Context) (running, native map[string]string) {
+	running = map[string]string{}
 	if s.docker != nil {
 		running = s.docker.RunningBackends(ctx)
 	}
-	native := s.nativeBackends(ctx)
+	native = s.nativeBackends(ctx)
 	for b, m := range native {
 		if _, taken := running[b]; !taken {
 			running[b] = m
 		}
 	}
+	return running, native
+}
+
+// chatTarget dials placement cp's backend, which must be running.
+func (s *Server) chatTarget(ctx context.Context, cp ChatPlacement, running, native map[string]string) (benchTarget, error) {
 	served, up := running[cp.Backend]
 	if !up {
 		return benchTarget{}, fmt.Errorf("%w: the chat placement's backend %s is not running", errNoChatBackend, cp.Backend)
@@ -359,4 +376,14 @@ type benchState struct {
 	windowResolve func(context.Context) (benchTarget, error)
 	// benchNow overrides time.Now (tests).
 	benchNow func() time.Time
+	// chatPlacements reports every running chat placement (reconciler).
+	chatPlacements func() []ChatPlacement
+	// ceilings remembers each chat model's ceiling once found
+	// (ChatModelStats), keyed by backend, model and served name.
+	ceilingMu sync.Mutex
+	ceilings  map[string]modelstats.ModelStat
+	// ceilingTargets overrides the chat targets ChatModelStats reads (tests).
+	ceilingTargets func(context.Context) []benchTarget
+	// hfCacheDir overrides dockerpkg.HFCacheHost (tests).
+	hfCacheDir func() string
 }

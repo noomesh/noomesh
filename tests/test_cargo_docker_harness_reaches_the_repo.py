@@ -81,18 +81,22 @@ def test_the_repo_reaching_tests_panic_under_the_harness_instead_of_skipping():
         "node_fetch.rs no longer routes repo reads through a single helper; the "
         "skip arms are back to being copy-pasted and silent"
     )
-    assert 'std::env::var_os("NOO_CARGO_DOCKER").is_none()' in FETCH, (
-        "scripts_dir() no longer fails loudly under the container harness"
+    assert 'repo_file_or_skip("scripts/noo-apply.sh")' in FETCH, (
+        "scripts_dir() no longer asserts scripts/noo-apply.sh is readable through "
+        "the shared test_support rule"
     )
-    # "assert the file the test claims to read is readable, before asserting
-    # on its contents" — the check that would have caught 97b itself.
-    assert 'root.join("noo-apply.sh").is_file()' in FETCH
+    # The panic-under-harness rule lives in exactly one place now.
+    support = (REPO / "noo-cli/src/test_support.rs").read_text()
+    assert 'pub const HARNESS_VAR: &str = "NOO_CARGO_DOCKER"' in support
+    assert "if harness {" in support and "Err(format!(" in support, (
+        "test_support::lookup no longer fails when the harness variable is set"
+    )
 
-    # No test in this module may still carry a silent skip arm.
+    # No test in this module may still carry a silent skip arm of its own.
     silent = re.findall(r'eprintln!\("scripts/ not beside the crate[^"]*skipping"\)', FETCH)
-    assert len(silent) == 1, (
-        f"{len(silent)} silent skip arms in node_fetch.rs; exactly one belongs, "
-        "inside scripts_dir(), guarded by the NOO_CARGO_DOCKER assertion"
+    assert not silent, (
+        f"{len(silent)} silent skip arms in node_fetch.rs; skips go through "
+        "test_support::repo_file_or_skip, which panics under the harness"
     )
 
 

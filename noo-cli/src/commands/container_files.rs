@@ -301,14 +301,13 @@ pub(crate) mod tests {
     /// fallback must not call it missing.
     #[test]
     fn the_diff_fallback_counts_a_bind_mounted_secret_as_present() {
-        use std::os::unix::fs::PermissionsExt;
         let bin = scratch("mounts").join("docker");
-        std::fs::write(
+        // i277j: a plain write + chmod raced a sibling test's fork (ETXTBSY).
+        crate::test_exec::write_exec(
             &bin,
             "#!/bin/sh\ncase \"$1\" in diff) echo 'A /tmp/x';; inspect) echo /run/secrets/redis_password;; *) exit 1;; esac\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            0o755,
+        );
         let got = probe_via_diff(
             bin.to_str().unwrap(),
             &want("noo-redis", &["/run/secrets/redis_password", "/run/secrets/other"]),

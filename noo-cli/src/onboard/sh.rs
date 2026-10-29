@@ -402,7 +402,13 @@ pub fn run_compose_streamed(ctx: &Ctx, args: &[&str]) -> i32 {
     let mut cmd = compose_command(ctx, &full);
     cmd.current_dir(&ctx.repo_root).stdin(Stdio::null());
     launcher_env(ctx, &mut cmd);
-    stream_status(ctx, cmd)
+    // Only `up` prints the per-container churn worth collapsing; pull and
+    // build progress stays live.
+    if args.contains(&"up") {
+        stream_status_summarised(ctx, cmd)
+    } else {
+        stream_status(ctx, cmd)
+    }
 }
 
 /// Spawn a long-running command whose output the user should see live.
@@ -437,6 +443,190 @@ pub fn stream_status(ctx: &Ctx, mut cmd: Command) -> i32 {
         }
     });
     child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1)
+}
+
+/// Where one container ended up, by compose's last progress word for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContainerEnd {
+    Started,
+    Gone,
+    Failed,
+    Unfinished,
+}
+
+/// Running tally of a `docker compose up/restart` transcript: the final state
+/// of every container, and which lines are NOT per-container progress.
+#[derive(Default, Debug)]
+pub struct ComposeTally {
+    containers: std::collections::BTreeMap<String, ContainerEnd>,
+}
+
+impl ComposeTally {
+    /// Feed one output line. Returns true when the line must reach the
+    /// operator verbatim: anything that is not a recognised progress line,
+    /// and any line (progress or not) that mentions an error, a failure or
+    /// an unhealthy container. Recognised progress is counted and absorbed.
+    pub fn feed(&mut self, line: &str) -> bool {
+        let t = line.trim().trim_start_matches(['✔', '✘', '⠿', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '⠋']).trim();
+        if t.is_empty() {
+            return false;
+        }
+        let lower = t.to_ascii_lowercase();
+        let loud = ["error", "failed", "unhealthy", "warn"].iter().any(|k| lower.contains(k));
+        let mut words = t.split_whitespace();
+        let progress = match words.next() {
+            Some("Container") => {
+                if let Some(name) = words.next() {
+                    let state = words.collect::<Vec<_>>().join(" ").to_ascii_lowercase();
+                    let end = match state.as_str() {
+                        "started" | "healthy" | "running" | "recreated" | "created" | "restarted" => ContainerEnd::Started,
+                        "stopped" | "removed" | "killed" => ContainerEnd::Gone,
+                        s if s.contains("error") || s.contains("fail") || s.contains("unhealthy") || s.contains("exited") => {
+                            ContainerEnd::Failed
+                        }
+                        _ => ContainerEnd::Unfinished,
+                    };
+                    self.containers.insert(name.to_string(), end);
+                    true
+                } else {
+                    false
+                }
+            }
+            // Network/Volume/Image lines and the legacy "[+] Running 3/3" header.
+            Some("Network") | Some("Volume") | Some("Image") => words.next().is_some(),
+            Some("[+]") => true,
+            _ => false,
+        };
+        !progress || loud
+    }
+
+    /// Containers whose last state was a failure.
+    pub fn failed(&self) -> usize {
+        self.count(ContainerEnd::Failed)
+    }
+
+    fn count(&self, end: ContainerEnd) -> usize {
+        self.containers.values().filter(|e| **e == end).count()
+    }
+
+    /// `25 containers: 25 started, 0 failed`; None when no container line was seen.
+    pub fn summary(&self) -> Option<String> {
+        let total = self.containers.len();
+        if total == 0 {
+            return None;
+        }
+        let mut s = format!(
+            "{total} container{}: {} started, {} failed",
+            if total == 1 { "" } else { "s" },
+            self.count(ContainerEnd::Started),
+            self.failed()
+        );
+        let gone = self.count(ContainerEnd::Gone);
+        if gone > 0 {
+            s.push_str(&format!(", {gone} removed"));
+        }
+        let open = self.count(ContainerEnd::Unfinished);
+        if open > 0 {
+            s.push_str(&format!(", {open} unfinished"));
+        }
+        Some(s)
+    }
+}
+
+/// Pure form of the summariser: the one-line summary (empty when the
+/// transcript had no container lines) and every line to show verbatim.
+/// The live path feeds `ComposeTally` line by line; this is its test seam.
+#[cfg(test)]
+pub fn summarise_compose(lines: &[&str]) -> (String, Vec<String>) {
+    let mut tally = ComposeTally::default();
+    let mut pass = Vec::new();
+    for l in lines {
+        if tally.feed(l) {
+            pass.push((*l).to_string());
+        }
+    }
+    (tally.summary().unwrap_or_default(), pass)
+}
+
+/// Run `cmd` with its output piped: passthrough lines are printed live on the
+/// stream they came from, progress lines are only counted. A muted line every
+/// 30 s of silence says it is alive. Returns the exit status and the tally.
+pub fn run_summarised(mut cmd: Command) -> std::io::Result<(std::process::ExitStatus, ComposeTally)> {
+    use std::io::BufRead as _;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+    let mut readers = Vec::new();
+    if let Some(p) = child.stdout.take() {
+        let tx = tx.clone();
+        readers.push(std::thread::spawn(move || {
+            for l in std::io::BufReader::new(p).split(b'\n').map_while(Result::ok) {
+                if tx.send((false, String::from_utf8_lossy(&l).into_owned())).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+    if let Some(p) = child.stderr.take() {
+        let tx = tx.clone();
+        readers.push(std::thread::spawn(move || {
+            for l in std::io::BufReader::new(p).split(b'\n').map_while(Result::ok) {
+                if tx.send((true, String::from_utf8_lossy(&l).into_owned())).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+    drop(tx);
+    let mut tally = ComposeTally::default();
+    loop {
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok((is_err, line)) => {
+                if tally.feed(&line) {
+                    if is_err {
+                        eprintln!("{line}");
+                    } else {
+                        println!("{line}");
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                println!("  {}", crate::ui::muted("still working (pulling or starting containers; --verbose shows each line)"));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    for r in readers {
+        let _ = r.join();
+    }
+    let status = child.wait()?;
+    Ok((status, tally))
+}
+
+/// [`stream_status`] for a compose-driving command: on the plain console,
+/// and without `--verbose`, the per-container lines collapse into one
+/// summary line. The TUI and `--verbose` keep the live stream unchanged.
+pub fn stream_status_summarised(ctx: &Ctx, cmd: Command) -> i32 {
+    if !ctx.ui.inherit_stdio() || ctx.g.verbose {
+        return stream_status(ctx, cmd);
+    }
+    match run_summarised(cmd) {
+        Ok((status, tally)) => {
+            let code = status.code().unwrap_or(1);
+            if let Some(s) = tally.summary() {
+                if tally.failed() > 0 || code != 0 {
+                    ctx.error(&s);
+                } else {
+                    ctx.success(&s);
+                }
+            }
+            code
+        }
+        Err(e) => {
+            eprintln!("failed to spawn command: {e}");
+            1
+        }
+    }
 }
 
 fn box_read(r: impl std::io::Read + Send + 'static) -> Box<dyn std::io::Read + Send> {
@@ -550,7 +740,7 @@ pub fn run_script_streamed(ctx: &Ctx, script: &str, args: &[&str]) -> i32 {
     if let Ok(exe) = std::env::current_exe() {
         cmd.env("NOO_CLI_BIN", exe);
     }
-    stream_status(ctx, cmd)
+    stream_status_summarised(ctx, cmd)
 }
 
 pub fn docker_image_exists(image: &str) -> bool {
@@ -821,8 +1011,7 @@ mod recreate_set_tests {
     /// (tests/test_monitoring_profile_parity.py); this test is about the
     /// exclusion list above, and needs only the names.
     fn compose_services_with_profile(profile: &str) -> Vec<String> {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let path = repo.join("docker-compose.cluster.yml");
+        let path = crate::test_support::repo_file("docker-compose.cluster.yml");
         let body = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
         let mut current = String::new();
@@ -886,8 +1075,7 @@ mod addon_compose_tests {
     /// `include_str!`: the file is outside this crate, and a crate-only build
     /// (`cargo install`) must not fail to compile over a test fixture.
     fn shell_helper() -> String {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let path = repo.join("scripts/lib-addons.sh");
+        let path = crate::test_support::repo_file("scripts/lib-addons.sh");
         let body = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("lib-addons.sh unreadable at {}: {e}", path.display()));
         let start = body
@@ -1014,11 +1202,10 @@ mod compose_files_tests {
     }
 
     fn scratch(evolve: bool) -> Scratch {
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let t = tmpdir(if evolve { "evolve" } else { "plain" });
         std::fs::create_dir(t.path().join("scripts")).unwrap();
         for lib in ["lib-compose.sh", "lib-addons.sh", "lib-dist.sh"] {
-            std::fs::copy(repo.join("scripts").join(lib), t.path().join("scripts").join(lib))
+            std::fs::copy(crate::test_support::repo_file(&format!("scripts/{lib}")), t.path().join("scripts").join(lib))
                 .unwrap_or_else(|e| panic!("{lib}: {e}"));
         }
         for f in [
@@ -1250,5 +1437,76 @@ mod file_secret_env_tests {
             }
             assert!(srcs.iter().any(|s| s == var), "{var} is derived but no compose secret uses it");
         }
+    }
+}
+
+#[cfg(test)]
+mod compose_summary_tests {
+    use super::*;
+
+    /// A realistic `docker compose up -d --force-recreate` transcript (plain
+    /// progress, as compose prints when stdout is not a terminal).
+    const HAPPY: &str = " Network noomesh_default  Creating
+ Network noomesh_default  Created
+ Volume noomesh_noo-data  Creating
+ Volume noomesh_noo-data  Created
+ Container noo-postgres  Recreate
+ Container noo-postgres  Recreated
+ Container noo-nats  Recreate
+ Container noo-nats  Recreated
+ Container noo-postgres  Starting
+ Container noo-postgres  Started
+ Container noo-nats  Starting
+ Container noo-nats  Started
+ Container noo-gateway  Waiting
+ Container noo-postgres  Waiting
+ Container noo-postgres  Healthy
+ Container noo-nats  Healthy
+ Container noo-gateway  Recreated
+ Container noo-gateway  Starting
+ Container noo-gateway  Started
+ Container noo-gateway  Healthy";
+
+    fn lines(t: &str) -> Vec<&str> {
+        t.lines().collect()
+    }
+
+    #[test]
+    fn a_clean_transcript_is_one_summary_line_and_no_passthrough() {
+        let (summary, pass) = summarise_compose(&lines(HAPPY));
+        assert_eq!(summary, "3 containers: 3 started, 0 failed");
+        assert!(pass.is_empty(), "progress must be absorbed: {pass:?}");
+    }
+
+    #[test]
+    fn an_error_and_an_unhealthy_container_are_counted_and_passed_through() {
+        let t = format!(
+            "{HAPPY}\n Container noo-redis  Starting\nError response from daemon: driver failed programming external connectivity on endpoint noo-redis\n Container noo-redis  Error\ndependency failed to start: container noo-redis is unhealthy"
+        );
+        let (summary, pass) = summarise_compose(&lines(&t));
+        assert_eq!(summary, "4 containers: 3 started, 1 failed");
+        assert_eq!(
+            pass,
+            vec![
+                "Error response from daemon: driver failed programming external connectivity on endpoint noo-redis".to_string(),
+                " Container noo-redis  Error".to_string(),
+                "dependency failed to start: container noo-redis is unhealthy".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_lines_are_passed_through_not_dropped() {
+        let t = "==> pulling images\n Container noo-nats  Started\nsome new compose message we have never seen\n";
+        let (summary, pass) = summarise_compose(&lines(t));
+        assert_eq!(summary, "1 container: 1 started, 0 failed");
+        assert_eq!(pass, vec!["==> pulling images".to_string(), "some new compose message we have never seen".to_string()]);
+    }
+
+    #[test]
+    fn a_transcript_with_no_container_lines_has_no_summary() {
+        let (summary, pass) = summarise_compose(&["hello"]);
+        assert_eq!(summary, "");
+        assert_eq!(pass, vec!["hello".to_string()]);
     }
 }

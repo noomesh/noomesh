@@ -217,7 +217,7 @@ if a[:3] == ["buildx", "imagetools", "create"]:
             open(cnt, "w").write(str(n + 1))
             sys.stderr.write("ERROR: 429 Too Many Requests\nRetry-After: 1\n"); sys.exit(1)
     dst, src = a[a.index("--tag") + 1], a[-1]
-    state[dst] = state[src.split("@")[0]] if "@" in src and src.split("@")[0] in state else state[src]
+    state[dst] = state[src] if src in state else state[src.split("@")[0]]
     json.dump(state, open(state_path, "w"))
     sys.exit(0)
 sys.exit(2)
@@ -330,6 +330,45 @@ def test_a_pinned_row_must_resolve_to_its_digest(registry) -> None:
     assert rc == 1 and "not the pinned digest" in out
 
 
+ALP_PIN = f"library/alpine:3.22@{D1}"
+ALP_FLOAT = "library/alpine:3.22"
+
+
+def test_a_pinned_and_a_floating_row_of_one_tag_get_distinct_mirror_tags() -> None:
+    hm = _mod()
+    pinned, floating = hm.mirror_ref(PREFIX, ALP_PIN), hm.mirror_ref(PREFIX, ALP_FLOAT)
+    assert floating == f"{PREFIX}/library/alpine:3.22"
+    assert pinned == f"{PREFIX}/library/alpine:3.22-sha256-{'a' * 12}"
+    # What a Dockerfile pulls is unchanged: the digest decides.
+    assert hm.use_ref(PREFIX, ALP_PIN) == f"{PREFIX}/library/alpine:3.22@{D1}"
+
+
+def test_sync_does_not_read_a_floated_tag_as_the_pinned_rows_downgrade(registry) -> None:
+    # i277i: Hub's floating 3.22 moved to 3.22.7 and the float copied it onto
+    # the mirror tag; the pinned 3.22.6 row then refused every run.
+    images = {
+        f"docker.io/{ALP_PIN}": _img(D1, "2026-09-18T00:00:00Z", "3.22.6"),
+        f"docker.io/{ALP_FLOAT}": _img(D2, "2026-10-23T00:00:00Z", "3.22.7"),
+        f"{PREFIX}/{ALP_FLOAT}": _img(D2, "2026-10-23T00:00:00Z", "3.22.7"),
+    }
+    rc, out, state, _ = registry(images, "sync", inventory=[ALP_PIN, ALP_FLOAT])
+    assert rc == 0, out
+    assert "DOWNGRADE?" not in out
+    assert state[f"{PREFIX}/library/alpine:3.22-sha256-{'a' * 12}"]["digest"] == D1
+    assert state[f"{PREFIX}/{ALP_FLOAT}"]["digest"] == D2
+
+
+def test_a_pinned_row_counts_as_present_by_its_digest_not_its_mirror_tag(registry) -> None:
+    # The registry resolves `<tag>@<digest>` by the digest, which is what the
+    # Dockerfile pulls; a mirror that holds the digest needs no Hub fallback
+    # even before sync has written the digest-keyed tag.
+    pin = next(r for r in _rows() if r.startswith("library/alpine:") and "@" in r)
+    tag_and_digest = pin.split(":", 1)[1]
+    rc, out, _, _ = registry({f"{PREFIX}/library/alpine:{tag_and_digest}": _img("sha256:" + "c" * 64, "x")},
+                             "ref", pin)
+    assert rc == 0 and out.strip() == f"{PREFIX}/library/alpine:{tag_and_digest}", out
+
+
 def test_prefix_is_the_mirror_when_everything_is_there(registry) -> None:
     rc, out, _, _ = registry({DST: _img(D1, "x")}, "prefix", "library/rust:1-bookworm")
     assert rc == 0 and out.strip() == PREFIX
@@ -359,7 +398,7 @@ def test_hub_mirror_variable_moves_the_prefix(registry) -> None:
 def test_dockerfile_mode_reads_the_froms(registry) -> None:
     whisper = ROOT / "docker/Dockerfile.whisper"
     row = _mod().dockerfile_rows(whisper)[0]
-    mirror = f"{PREFIX}/{row.split('@')[0]}"
+    mirror = f"{PREFIX}/{row}"   # a pinned FROM is looked up by its digest, as it is pulled
     rc, out, _, _ = registry({mirror: _img(D1, "x")}, "dockerfile", str(whisper))
     assert rc == 0 and out.strip() == PREFIX
     rc, out, _, _ = registry({}, "dockerfile", str(whisper))

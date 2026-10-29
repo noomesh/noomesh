@@ -6,9 +6,10 @@
 # that restrict unprivileged user namespaces through AppArmor, the user
 # namespace too. Bubblewrap needs both: each `python_exec` call runs under
 # `bwrap --unshare-all`, which creates a user namespace and, inside it,
-# mounts a private /proc, /dev and tmpfs and pivots into them. Without this
+# mounts a private /dev and tmpfs and pivots into them (no /proc since
+# 0.6.14: Docker's /proc masks forbid one, see app.py bwrap_argv). Without this
 # profile the sandbox on such a host fails every call with "No permissions
-# to create new namespace" or "Can't mount proc", and the documented escape
+# to create new namespace" or "Failed to make / slave", and the documented escape
 # hatch is `NOO_SANDBOX_APPARMOR=unconfined`, which gives up the whole
 # profile to regain two rules.
 #

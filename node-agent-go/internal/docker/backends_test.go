@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
@@ -304,9 +305,9 @@ func pkiMountsOf(t *testing.T, backend, dir string) map[string]string {
 // the agent's specs still bind-mounted the WHOLE directory into the
 // backends it starts on nodes, so a worker's vllm/llamacpp/reranker held
 // that node's nodes/<id>/node.key. This pins the narrowing per backend and
-// per PKI-dir shape. A backend's PKI is only what it serves with: vllm's
-// own leaf (+ ca.crt for --ssl-ca-certs) and nothing for llama-server,
-// which has no TLS listener.
+// per PKI-dir shape. A backend's PKI is only what it serves with, and no
+// engine the agent starts serves TLS: every door is a sidecar (vLLM's since
+// door generation 5), which mounts the leaf itself.
 func TestPKIMounts_NarrowedPerBackend(t *testing.T) {
 	controller := writePKIDir(t, "controller")
 	worker := writePKIDir(t, "worker")
@@ -317,8 +318,8 @@ func TestPKIMounts_NarrowedPerBackend(t *testing.T) {
 		dir     string
 		want    map[string]string // target -> source relative to dir
 	}{
-		{"vllm", controller, map[string]string{"/app/pki/ca.crt": "ca.crt", "/app/pki/services/vllm": "services/vllm"}},
-		{"vllm", worker, map[string]string{"/app/pki/ca.crt": "ca.crt"}},
+		{"vllm", controller, map[string]string{}},
+		{"vllm", worker, map[string]string{}},
 		{"vllm", missing, map[string]string{}},
 		{"llamacpp", controller, map[string]string{}},
 		{"llamacpp", worker, map[string]string{}},
@@ -468,10 +469,7 @@ func TestBackendDoorCheck(t *testing.T) {
 	t.Setenv("NOO_PKI_DIR", wrongSAN)
 	for _, b := range fronted {
 		err := backendDoorCheck(b, mountsFor(b))
-		want := "noo-" + b
-		if sc := SidecarFor(b); sc != "" {
-			want = StunnelContainerPrefix + sc
-		}
+		want := doorDialHost(b)
 		if err == nil || !strings.Contains(err.Error(), "does not name "+want) {
 			t.Errorf("%s: a leaf without the %s SAN must be refused: %v", b, want, err)
 		}
@@ -484,30 +482,34 @@ func TestBackendDoorCheck(t *testing.T) {
 	}
 }
 
-// The agent-started vLLM serves TLS with a REQUIRED client certificate,
-// unconditionally: the flag is in the script, the old NOO_VLLM_TLS gate is
-// not, and a missing leaf exits rather than serving plain.
-func TestVLLMEntrypointRequiresAClientCertificate(t *testing.T) {
+// The agent-started vLLM sits behind its door (door generation 5): the
+// engine listens plain on 127.0.0.1 inside noo-stunnel-vllm's namespace,
+// and the door keeps the name every caller dials (noo-vllm) as its bridge
+// alias, so neither the URL nor the leaf moves.
+func TestVLLMServesPlainInsideItsDoor(t *testing.T) {
 	code := ""
 	for _, l := range strings.Split(vllmEntrypointScript, "\n") {
 		if !strings.HasPrefix(strings.TrimSpace(l), "#") {
 			code += l + "\n"
 		}
 	}
-	if !strings.Contains(code, "--ssl-cert-reqs 2") {
-		t.Error("vllmEntrypointScript does not pass --ssl-cert-reqs 2: the listener would admit a caller with no client certificate")
+	if !strings.Contains(code, "--host 127.0.0.1 --port 8000") || strings.Contains(code, "0.0.0.0") {
+		t.Error("vllmEntrypointScript must bind 127.0.0.1:8000 only: its door connects to loopback")
 	}
-	if strings.Contains(code, "NOO_VLLM_TLS") {
-		t.Error("vllmEntrypointScript gates TLS on NOO_VLLM_TLS again — the listener must have no plaintext switch")
-	}
-	if !strings.Contains(code, "exit 78") {
-		t.Error("vllmEntrypointScript must refuse to start without its leaf, not serve plain")
+	if strings.Contains(code, "--ssl-") || strings.Contains(code, "NOO_VLLM_TLS") {
+		t.Error("vllmEntrypointScript serves TLS again: the door holds the leaf and connects plain")
 	}
 	if _, ok := backendSpecs["vllm"].Env["NOO_VLLM_TLS"]; ok {
 		t.Error("the vllm spec still passes NOO_VLLM_TLS into the container")
 	}
-	if !strings.Contains(backendSpecs["vllm"].HealthcheckCmd, "load_cert_chain('/app/pki/services/vllm/service.crt'") {
-		t.Error("the vllm healthcheck must present the container's own leaf (the listener requires one)")
+	if hc := backendSpecs["vllm"].HealthcheckCmd; !strings.Contains(hc, "http://127.0.0.1:8000/health") {
+		t.Errorf("the vllm healthcheck must probe the plain loopback listener: %s", hc)
+	}
+	if got := DoorNetworkMode("vllm"); got != "container:noo-stunnel-vllm" {
+		t.Errorf("vllm network mode %q, want its door's namespace", got)
+	}
+	if doorDialHost("vllm") != "noo-vllm" || doorLeafService("vllm") != "vllm" {
+		t.Errorf("vllm's door is dialled as %q with leaf %q: the URL and the leaf must not move", doorDialHost("vllm"), doorLeafService("vllm"))
 	}
 }
 
@@ -516,9 +518,9 @@ func TestVLLMEntrypointRequiresAClientCertificate(t *testing.T) {
 // container's own port; the image order tries a built stunnel before the
 // alpine fallback; no host port is ever published.
 func TestSidecarSpec(t *testing.T) {
-	conf := stunnelConf("llamacpp", 8085, "noo-llamacpp", 8085)
+	conf := stunnelConf("llamacpp", "noo-stunnel-llamacpp", 8085, 8085, "awolf")
 	for _, needle := range []string{
-		"verify = 2", "accept = 0.0.0.0:8085", "connect = noo-llamacpp:8085",
+		"verify = 2", "accept = noo-stunnel-llamacpp:8085", "connect = 127.0.0.1:8085",
 		"cert = /tls/services/llamacpp/service.crt", "key = /tls/services/llamacpp/service.key",
 		"CAfile = /tls/ca.crt", "foreground = yes",
 	} {
@@ -527,13 +529,13 @@ func TestSidecarSpec(t *testing.T) {
 		}
 	}
 	// Every fronted backend has a sidecar name, a door port and a leaf.
-	for _, b := range []string{"llamacpp", "ollama", "embedding", "reranker"} {
+	for _, b := range []string{"vllm", "llamacpp", "ollama", "embedding", "reranker"} {
 		if SidecarFor(b) == "" || SidecarContainerFor(b) != StunnelContainerPrefix+SidecarFor(b) || DoorPort(b) == 0 {
 			t.Errorf("%s: sidecar %q container %q port %d", b, SidecarFor(b), SidecarContainerFor(b), DoorPort(b))
 		}
 	}
-	if SidecarFor("vllm") != "" || SidecarFor("airllm") != "" {
-		t.Error("vllm serves natively and airllm is plain by exception; neither gets a sidecar")
+	if SidecarFor("airllm") != "" {
+		t.Error("airllm is plain by exception; it gets no sidecar")
 	}
 	// Door ports are the compose sidecars' accept ports, so one URL reaches
 	// a compose door and an agent-run one.
@@ -563,12 +565,12 @@ func TestSidecarSpec(t *testing.T) {
 	t.Setenv(StunnelImageEnv, "")
 	t.Setenv("NOO_IMAGE_PREFIX", "ghcr.io/x/noomesh")
 	t.Setenv("NOO_IMAGE_TAG", "v9")
-	got := strings.Join(stunnelImageCandidates(), ",")
+	got := strings.Join(stunnelImageCandidates("llamacpp"), ",")
 	if got != "ghcr.io/x/noomesh/stunnel:v9,noomesh/stunnel:latest,"+stunnelFallbackImage {
 		t.Errorf("image candidates: %s", got)
 	}
 	t.Setenv(StunnelImageEnv, "my/stunnel:1")
-	if c := stunnelImageCandidates(); c[0] != "my/stunnel:1" {
+	if c := stunnelImageCandidates("llamacpp"); c[0] != "my/stunnel:1" {
 		t.Errorf("override must come first: %v", c)
 	}
 	// The sidecar script installs stunnel only when the image lacks it.
@@ -593,6 +595,90 @@ func TestSidecarSpec(t *testing.T) {
 	}
 	if src, err := os.ReadFile("sidecar.go"); err == nil && strings.Contains(string(src), "PortBindings") {
 		t.Error("sidecar.go publishes a host port")
+	}
+}
+
+// Door generation 3 (followup 1234 F-ii): the sidecar is the ONLY door.
+// The fronted engine runs in its sidecar's network namespace on loopback;
+// the sidecar accepts on its own bridge address, never 0.0.0.0 (which would
+// also take 127.0.0.1:<port> from an engine on the same port), and connects
+// to loopback. Each failure here reopens a plaintext port to the bridge.
+func TestTheSidecarIsTheOnlyDoor(t *testing.T) {
+	if BackendDoorGeneration < 3 {
+		t.Fatalf("BackendDoorGeneration = %d: placed backends would keep the bridge shape", BackendDoorGeneration)
+	}
+	for _, b := range []string{"vllm", "llamacpp", "ollama", "embedding", "reranker"} {
+		if got, want := DoorNetworkMode(b), "container:"+SidecarContainerFor(b); got != want {
+			t.Errorf("%s network mode %q, want %q", b, got, want)
+		}
+		conf := stunnelConf(SidecarFor(b), SidecarContainerFor(b), DoorPort(b), 1234, "awolf")
+		if strings.Contains(conf, "0.0.0.0") || !strings.Contains(conf, "accept = "+SidecarContainerFor(b)+":") ||
+			!strings.Contains(conf, "connect = 127.0.0.1:1234") {
+			t.Errorf("%s conf:\n%s", b, conf)
+		}
+	}
+	if DoorNetworkMode("airllm") != "" {
+		t.Error("only a fronted backend joins a sidecar's namespace")
+	}
+	// Every engine's bind knob, pinned to loopback with the connect port.
+	env := privateDoorEnv(11434)
+	for k, want := range map[string]string{
+		"HOST": "127.0.0.1", "LLAMA_ARG_HOST": "127.0.0.1", "LLAMA_ARG_PORT": "11434",
+		"OLLAMA_HOST": "127.0.0.1:11434", "HOSTNAME": "127.0.0.1",
+	} {
+		if env[k] != want {
+			t.Errorf("privateDoorEnv[%s] = %q, want %q", k, env[k], want)
+		}
+	}
+
+	src, err := os.ReadFile("backends.go")
+	if err != nil {
+		t.Skip("source not readable from the test dir")
+	}
+	body := string(src)
+	start := strings.Index(body, "func (c *Client) StartBackendSDK(")
+	end := strings.Index(body, "func (c *Client) StopBackendSDK(")
+	if start < 0 || end < start {
+		t.Fatal("StartBackendSDK not found")
+	}
+	fn := body[start:end]
+	// The loopback env goes on after the placement's ExtraEnv, so no
+	// placement can put the engine back on the bridge.
+	if i, j := strings.Index(fn, "overrides.ExtraEnv"), strings.Index(fn, "privateDoorEnv("); i < 0 || j < i {
+		t.Error("privateDoorEnv must be applied after the placement's ExtraEnv")
+	}
+	// The namespace owner exists before the engine is created in it.
+	if i, j := strings.Index(fn, "c.startSidecar("), strings.Index(fn, "c.docker.ContainerCreate("); i < 0 || j < i {
+		t.Error("the sidecar must start before the engine container is created")
+	}
+	if !strings.Contains(fn, "hostCfg.NetworkMode = container.NetworkMode(mode)") {
+		t.Error("the engine must be created in DoorNetworkMode")
+	}
+	if strings.Contains(body, `"0.0.0.0"`) {
+		t.Error("a backend spec binds 0.0.0.0; fronted engines listen on doorLoopback")
+	}
+}
+
+// judgeEngineDoor: the generation-3 rows for a fronted engine.
+func TestJudgeEngineDoor(t *testing.T) {
+	sidecars := map[string]string{"abc123def4567890": "noo-stunnel-llamacpp"}
+	early, late := "2026-10-28T10:00:00.000000001Z", "2026-10-28T10:05:00Z"
+	for _, tc := range []struct {
+		name, mode, eng, sc string
+		want                engineDoorShape
+	}{
+		{"bridge (pre-generation-3)", "noo-cluster", early, late, engineOnBridge},
+		{"default bridge", "", "", "", engineOnBridge},
+		{"in its door, by id", "container:abc123def4567890", late, early, engineInDoor},
+		{"in its door, by name", "container:noo-stunnel-llamacpp", late, early, engineInDoor},
+		{"in its door, short id", "container:abc123def456", late, early, engineInDoor},
+		{"start times unknown", "container:abc123def4567890", "", "", engineInDoor},
+		{"sidecar restarted after the engine", "container:abc123def4567890", early, late, engineStranded},
+		{"namespace owner gone", "container:ffffffffffff", late, early, engineStranded},
+	} {
+		if got, _ := judgeEngineDoor(tc.mode, sidecars, tc.eng, tc.sc); got != tc.want {
+			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 
@@ -709,5 +795,112 @@ func TestSidecarRunsAsRootWhateverTheImageUserSays(t *testing.T) {
 	cfg := body[i : i+strings.Index(body[i:], "}\n")]
 	if !strings.Contains(cfg, "User:") || !strings.Contains(cfg, "sidecarUser") {
 		t.Errorf("startSidecar does not set User: sidecarUser on the door's container config:\n%s", cfg)
+	}
+}
+
+// A backend door admits its callers by name, not any cluster-CA leaf
+// (i301, internal#300): this node's own agent leaf (its node id, the leaf's
+// first DNS SAN) and the controller's service callers, as the compose doors
+// do. A conf without checkHost lets another node's leaf, an add-on's or a
+// backend's open the door.
+func TestTheDoorAdmitsNamedCallersOnly(t *testing.T) {
+	if BackendDoorGeneration < 4 {
+		t.Fatalf("BackendDoorGeneration = %d: a door started unpinned would never be recreated", BackendDoorGeneration)
+	}
+	for _, b := range []string{"llamacpp", "ollama", "embedding", "reranker"} {
+		conf := stunnelConf(SidecarFor(b), SidecarContainerFor(b), DoorPort(b), 1234, "awolf")
+		var pins []string
+		for _, l := range strings.Split(conf, "\n") {
+			if v, ok := strings.CutPrefix(l, "checkHost = "); ok {
+				pins = append(pins, v)
+			}
+		}
+		want := []string{"awolf", "gateway", "worker", "trellion", "trellion-intel", "evolve"}
+		if strings.Join(pins, ",") != strings.Join(want, ",") {
+			t.Errorf("%s pins %v, want %v:\n%s", b, pins, want, conf)
+		}
+		if !strings.Contains(conf, "verify = 2") {
+			t.Errorf("%s: no client certificate required:\n%s", b, conf)
+		}
+	}
+	// The compose doors admit the same service callers (the controller's
+	// own agent is appended there by the stunnel-self-pin entrypoint).
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "docker", "stunnel-llamacpp.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range doorCallers {
+		if !strings.Contains(string(raw), "checkHost = "+n+"\n") {
+			t.Errorf("docker/stunnel-llamacpp.conf does not admit %q, the agent's doors do", n)
+		}
+	}
+}
+
+// The self pin is read from the leaf the agent presents: its first DNS SAN.
+// A leaf that names a shared SAN first, or no leaf at all, is refused: the
+// door is not started open.
+func TestDoorSelfNameReadsTheAgentLeaf(t *testing.T) {
+	dir := t.TempDir()
+	write := func(sans []string) string {
+		crt, _ := selfSignedLeaf(t, sans)
+		p := filepath.Join(dir, sans[0]+".crt")
+		if err := os.WriteFile(p, crt, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	t.Setenv("NOO_TLS_CERT", write([]string{"robopi", "localhost", "node-agent"}))
+	if got, err := doorSelfName(); err != nil || got != "robopi" {
+		t.Fatalf("doorSelfName() = %q, %v; want robopi", got, err)
+	}
+	t.Setenv("NOO_TLS_CERT", write([]string{"localhost", "node-agent"}))
+	if _, err := doorSelfName(); err == nil {
+		t.Error("a leaf naming localhost first must not become the pin (every node leaf carries it)")
+	}
+	t.Setenv("NOO_TLS_CERT", "")
+	if _, err := doorSelfName(); err == nil {
+		t.Error("no leaf: the door must refuse, not start unpinned")
+	}
+	if _, err := checkDoorPin("a\nverify = 0"); err == nil {
+		t.Error("a name that breaks its conf line must be refused")
+	}
+}
+
+// The backend privilege floor (i301, internal#300): beside no-new-privileges
+// and CapDrop ALL, an image whose write set was measured empty runs on a
+// read-only root with a tmpfs /tmp. llama-server (llamacpp and the reranker)
+// and every door sidecar on the published stunnel image take it; the alpine
+// fallback door cannot (its entrypoint runs `apk add`).
+func TestReadOnlyRootFloor(t *testing.T) {
+	if !backendSpecs["llamacpp"].ReadOnlyRoot || !rerankerSpecLlamacpp().ReadOnlyRoot {
+		t.Error("llama-server writes nothing outside its read-only /models: llamacpp and the reranker take a read-only root")
+	}
+	for _, b := range []string{"vllm", "ollama", "embedding"} {
+		if backendSpecs[b].ReadOnlyRoot {
+			t.Errorf("%s writes caches into its image paths; a read-only root needs its write set measured first", b)
+		}
+	}
+	h := &container.HostConfig{}
+	rootFloor(h, true)
+	if !h.ReadonlyRootfs || h.Tmpfs["/tmp"] == "" || !strings.Contains(h.Tmpfs["/tmp"], "noexec") {
+		t.Errorf("rootFloor(true) = ro %v tmpfs %v", h.ReadonlyRootfs, h.Tmpfs)
+	}
+	h = &container.HostConfig{}
+	rootFloor(h, false)
+	if h.ReadonlyRootfs || h.Tmpfs != nil {
+		t.Errorf("rootFloor(false) changed the config: ro %v tmpfs %v", h.ReadonlyRootfs, h.Tmpfs)
+	}
+	// Both create paths apply it.
+	for file, call := range map[string]string{
+		"backends.go": "rootFloor(hostCfg, spec.ReadOnlyRoot)",
+		"sidecar.go":  "rootFloor(hostCfg, image != stunnelFallbackImage)",
+	} {
+		src, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(src), call) {
+			t.Errorf("%s does not call %s", file, call)
+		}
 	}
 }

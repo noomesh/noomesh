@@ -146,6 +146,8 @@ type Reconciler struct {
 	// chatDesired is the last desired chat placement (POST /bench benches
 	// it). Guarded by harnessMu.
 	chatDesired *placement
+	// chatModels is every running chat placement (ChatModels).
+	chatModels []ChatModel
 	// chatOllamaEnv is the env of the ollama daemon serving chat (the
 	// chat row's, merged with the other running ollama roles as the
 	// daemon gets it), nil when chat is not on ollama; for
@@ -326,8 +328,8 @@ type phase struct {
 // the node advertises from it; stop early when nothing is desired; MCP
 // servers (before backends — a discovery report is small, a pull is not);
 // the models dir; what is running here; multi-role merge; the shared-GPU
-// yield's sizing; image prefetch; converge each placement; then reap what
-// was removed.
+// yield's sizing; image prefetch; converge each placement; restart an
+// engine its door's restart left stranded; then reap what was removed.
 var reconcilePhases = []phase{
 	{"fetchDesired", (*Reconciler).fetchDesired},
 	{"publishProfileAndEmbedTarget", (*Reconciler).publishProfileAndEmbedTarget},
@@ -340,6 +342,7 @@ var reconcilePhases = []phase{
 	{"sizeGpuYield", (*Reconciler).sizeGpuYield},
 	{"prefetch", (*Reconciler).prefetch},
 	{"convergePlacements", (*Reconciler).convergePlacements},
+	{"healDoorNamespaces", (*Reconciler).healDoorNamespaces},
 	{"reportAndCleanup", (*Reconciler).reportAndCleanup},
 }
 
@@ -768,6 +771,17 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 	}
 }
 
+// healDoorNamespaces restarts a fronted engine whose stunnel sidecar
+// restarted after it (docker.HealStrandedEngines): the engine lives in the
+// sidecar's network namespace (door generation 3), and a sidecar restart
+// leaves it in the old one, alive and unreachable.
+func (r *Reconciler) healDoorNamespaces(ctx context.Context, t *tick) bool {
+	if r.docker != nil {
+		r.docker.HealStrandedEngines(ctx)
+	}
+	return true
+}
+
 func (r *Reconciler) reportAndCleanup(ctx context.Context, t *tick) bool {
 	// A harness whose placement was REMOVED is never visited by the loop
 	// above, which only walks placements that exist. Stop it here.
@@ -1185,6 +1199,22 @@ func specHash(p placement) string {
 	// from before targets existed keeps the hash it had.
 	if p.Target != "" {
 		fmt.Fprintf(h, "target=%s\n", p.Target)
+	}
+	// The images the node derives from its OWN release, which the
+	// placement does not carry: the release-built backend image (only when
+	// the placement names none) and the door sidecar's. A stack roll moves
+	// NOO_IMAGE_TAG and nothing else, so without these a backend kept the
+	// previous release's image until something unrelated recreated it
+	// (awolf 2026-10-28: noo-llamacpp and noo-stunnel-llamacpp on v0.6.12
+	// after the 0.6.13 roll). Folded in only when set, so a node with no
+	// release pin, and a backend on an upstream image, keep their hash.
+	if p.Image == "" {
+		if img := dockerpkg.ReleaseBackendImage(p.Backend); img != "" {
+			fmt.Fprintf(h, "releaseimage=%s\n", img)
+		}
+	}
+	if img := dockerpkg.ReleaseSidecarImage(p.Backend); img != "" {
+		fmt.Fprintf(h, "sidecarimage=%s\n", img)
 	}
 	// Likewise the derived memory limit: a new limit needs a new container.
 	if p.MemoryLimitBytes > 0 {

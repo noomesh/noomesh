@@ -11,7 +11,22 @@
 use super::{term_width, truncate, urlencode};
 use crate::http::{get_json, post_json};
 use crate::ui::{self, Col};
+use crate::args::{ArgError, Args};
 use crate::{Globals, Unhandled};
+
+/// Set `body[key]` to the flag's value when it was given.
+fn put_str(body: &mut serde_json::Value, key: &str, v: Option<String>) {
+    if let Some(v) = v {
+        body[key] = v.into();
+    }
+}
+
+/// Set `body[key]` to the flag's number when it was given.
+fn put_num(body: &mut serde_json::Value, key: &str, v: Option<u64>) {
+    if let Some(v) = v {
+        body[key] = v.into();
+    }
+}
 
 /// The muted last line of every review verb: which backend answered.
 /// A node-agent scan is a partial view and must never read as the fleet
@@ -30,34 +45,25 @@ fn backend_footer(resp: &serde_json::Value) -> String {
 
 /// Parsed `noo logs errors` flags → the request body.
 #[derive(Debug, Default, PartialEq)]
-struct ErrorsArgs {
+pub(crate) struct ErrorsArgs {
     body: serde_json::Value,
 }
 
-fn parse_errors_args(args: &[String]) -> Result<ErrorsArgs, Unhandled> {
+fn parse_errors_args(args: &[String]) -> Result<ErrorsArgs, ArgError> {
+    parse_errors_with(&mut Args::new(args))
+}
+
+pub(crate) fn parse_errors_with(a: &mut Args) -> Result<ErrorsArgs, ArgError> {
     let mut body = serde_json::json!({});
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--container" | "-c" => {
-                body["container"] = iter.next().ok_or(Unhandled)?.as_str().into()
-            }
-            "--minutes" | "-m" => {
-                body["minutes"] =
-                    iter.next().and_then(|v| v.parse::<u64>().ok()).ok_or(Unhandled)?.into()
-            }
-            "--limit" | "-n" => {
-                body["limit"] =
-                    iter.next().and_then(|v| v.parse::<u64>().ok()).ok_or(Unhandled)?.into()
-            }
-            "--node" => body["node"] = iter.next().ok_or(Unhandled)?.as_str().into(),
-            "--name" => body["name"] = iter.next().ok_or(Unhandled)?.as_str().into(),
-            "--source" => body["source"] = iter.next().ok_or(Unhandled)?.as_str().into(),
-            "--since" => body["since"] = iter.next().ok_or(Unhandled)?.as_str().into(),
-            "--until" => body["until"] = iter.next().ok_or(Unhandled)?.as_str().into(),
-            _ => return Err(Unhandled),
-        }
-    }
+    put_str(&mut body, "container", a.value(&["--container", "-c"])?);
+    put_num(&mut body, "minutes", a.number::<u64>(&["--minutes", "-m"])?);
+    put_num(&mut body, "limit", a.number::<u64>(&["--limit", "-n"])?);
+    put_str(&mut body, "node", a.value(&["--node"])?);
+    put_str(&mut body, "name", a.value(&["--name"])?);
+    put_str(&mut body, "source", a.value(&["--source"])?);
+    put_str(&mut body, "since", a.value(&["--since"])?);
+    put_str(&mut body, "until", a.value(&["--until"])?);
+    a.finish()?;
     Ok(ErrorsArgs { body })
 }
 
@@ -141,40 +147,34 @@ fn civil_from_days(z: i64) -> String {
 
 /// Parsed `noo logs tail` surface.
 #[derive(Debug, Default, PartialEq)]
-struct TailArgs {
+pub(crate) struct TailArgs {
     container: Option<String>,
     body: serde_json::Value,
 }
 
-fn parse_tail_args(args: &[String]) -> Result<TailArgs, Unhandled> {
-    let mut container: Option<String> = None;
+fn parse_tail_args(args: &[String]) -> Result<TailArgs, ArgError> {
+    parse_tail_with(&mut Args::new(args))
+}
+
+pub(crate) fn parse_tail_with(a: &mut Args) -> Result<TailArgs, ArgError> {
     let mut body = serde_json::json!({});
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--container" | "-c" => container = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--lines" | "--limit" | "-l" => {
-                body["lines"] =
-                    iter.next().and_then(|v| v.parse::<u64>().ok()).ok_or(Unhandled)?.into()
-            }
-            // `-n` = node, matching the Python `noo logs tail` surface.
-            "--node" | "-n" => body["node"] = iter.next().ok_or(Unhandled)?.as_str().into(),
-            "--name" => body["name"] = iter.next().ok_or(Unhandled)?.as_str().into(),
-            "--source" => body["source"] = iter.next().ok_or(Unhandled)?.as_str().into(),
-            "--since" => body["since"] = iter.next().ok_or(Unhandled)?.as_str().into(),
-            "--until" => body["until"] = iter.next().ok_or(Unhandled)?.as_str().into(),
-            "--grep" => body["grep"] = iter.next().ok_or(Unhandled)?.as_str().into(),
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => {
-                if container.replace(t.to_string()).is_some() {
-                    return Err(Unhandled); // two positionals — not our surface
-                }
-            }
-        }
+    let flag_container = a.value(&["--container", "-c"])?;
+    put_num(&mut body, "lines", a.number::<u64>(&["--lines", "--limit", "-l"])?);
+    // `-n` = node, matching the Python `noo logs tail` surface.
+    put_str(&mut body, "node", a.value(&["--node", "-n"])?);
+    put_str(&mut body, "name", a.value(&["--name"])?);
+    put_str(&mut body, "source", a.value(&["--source"])?);
+    put_str(&mut body, "since", a.value(&["--since"])?);
+    put_str(&mut body, "until", a.value(&["--until"])?);
+    put_str(&mut body, "grep", a.value(&["--grep"])?);
+    let positional = a.maybe_one("<container>")?;
+    if flag_container.is_some() && positional.is_some() {
+        return Err(ArgError::new("name the container once: either <container> or --container"));
     }
+    let container = flag_container.or(positional);
     // A container or a `--name` label: without either it is a usage error.
     if container.is_none() && body.get("name").is_none() {
-        return Err(Unhandled);
+        return Err(ArgError::new("name a container (or --name <label>)"));
     }
     Ok(TailArgs { container, body })
 }
@@ -232,41 +232,31 @@ pub fn logs_tail(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
 /// Parsed `noo logs search` surface.
 #[derive(Debug, Default, PartialEq)]
-struct SearchArgs {
+pub(crate) struct SearchArgs {
     body: serde_json::Value,
 }
 
-fn parse_search_args(args: &[String]) -> Result<SearchArgs, Unhandled> {
-    let mut text: Option<String> = None;
+fn parse_search_args(args: &[String]) -> Result<SearchArgs, ArgError> {
+    parse_search_with(&mut Args::new(args))
+}
+
+pub(crate) fn parse_search_with(a: &mut Args) -> Result<SearchArgs, ArgError> {
     let mut body = serde_json::json!({});
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--node" | "-n" => body["node"] = iter.next().ok_or(Unhandled)?.as_str().into(),
-            "--name" => body["name"] = iter.next().ok_or(Unhandled)?.as_str().into(),
-            "--container" | "-c" => {
-                body["container"] = iter.next().ok_or(Unhandled)?.as_str().into()
-            }
-            "--source" => body["source"] = iter.next().ok_or(Unhandled)?.as_str().into(),
-            "--level" => body["level"] = iter.next().ok_or(Unhandled)?.as_str().into(),
-            "--since" => body["since"] = iter.next().ok_or(Unhandled)?.as_str().into(),
-            "--until" => body["until"] = iter.next().ok_or(Unhandled)?.as_str().into(),
-            "--limit" | "-l" => {
-                body["limit"] =
-                    iter.next().and_then(|v| v.parse::<u64>().ok()).ok_or(Unhandled)?.into()
-            }
-            // Oldest first is the natural read of "what happened"; `--newest` flips it.
-            "--newest" => body["direction"] = "backward".into(),
-            "--query" | "-q" => body["query"] = iter.next().ok_or(Unhandled)?.as_str().into(),
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => {
-                if text.replace(t.to_string()).is_some() {
-                    return Err(Unhandled); // two positionals — quote the phrase
-                }
-            }
-        }
+    put_str(&mut body, "node", a.value(&["--node", "-n"])?);
+    put_str(&mut body, "name", a.value(&["--name"])?);
+    put_str(&mut body, "container", a.value(&["--container", "-c"])?);
+    put_str(&mut body, "source", a.value(&["--source"])?);
+    put_str(&mut body, "level", a.value(&["--level"])?);
+    put_str(&mut body, "since", a.value(&["--since"])?);
+    put_str(&mut body, "until", a.value(&["--until"])?);
+    put_num(&mut body, "limit", a.number::<u64>(&["--limit", "-l"])?);
+    // Oldest first is the natural read of "what happened"; `--newest` flips it.
+    if a.flag(&["--newest"]) {
+        body["direction"] = "backward".into();
     }
-    if let Some(t) = text {
+    put_str(&mut body, "query", a.value(&["--query", "-q"])?);
+    // Two positionals is an error — quote the phrase.
+    if let Some(t) = a.maybe_one("<text> (quote the phrase)")? {
         body["text"] = t.into();
     }
     if body.get("direction").is_none() {
@@ -320,18 +310,17 @@ pub fn logs_search(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+pub(crate) fn parse_containers_with(a: &mut Args) -> Result<Option<String>, ArgError> {
+    let node = a.value(&["--node", "-n"])?;
+    a.finish()?;
+    Ok(node)
+}
+
 /// `noo logs containers [--node/-n ID]` — GET /api/logs/containers.
 /// Lists Docker containers across the cluster (gateway fans out to every
 /// node-agent's /logs/containers; Python parity: 15s timeout).
 pub fn logs_containers(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut node: Option<String> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--node" | "-n" => node = Some(iter.next().ok_or(Unhandled)?.clone()),
-            _ => return Err(Unhandled),
-        }
-    }
+    let node = parse_containers_with(&mut Args::new(args))?;
     let mut path = String::from("/api/logs/containers");
     if let Some(n) = &node {
         path.push_str(&format!("?node_id={}", urlencode(n)));
@@ -370,27 +359,17 @@ pub fn logs_containers(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+pub(crate) fn parse_query_with(a: &mut Args) -> Result<(String, u64), ArgError> {
+    let limit = a.number::<u64>(&["--limit", "-l"])?.unwrap_or(100);
+    let logql = a.one("<logql>")?;
+    Ok((logql, limit))
+}
+
 /// `noo logs query LOGQL [--limit/-l N]` — GET /api/logs/query (raw LogQL,
 /// proxied to Loki's query_range; Python parity: 30s timeout). Human output
 /// prints each stream's label set then its log lines, like the Python CLI.
 pub fn logs_query(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut logql: Option<String> = None;
-    let mut limit = 100u64;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--limit" | "-l" => {
-                limit = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?
-            }
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => {
-                if logql.replace(t.to_string()).is_some() {
-                    return Err(Unhandled); // two positionals — not our surface
-                }
-            }
-        }
-    }
-    let Some(q) = logql else { return Err(Unhandled) };
+    let (q, limit) = parse_query_with(&mut Args::new(args))?;
     let body = get_json(
         g,
         &format!("/api/logs/query?query={}&limit={limit}", urlencode(&q)),

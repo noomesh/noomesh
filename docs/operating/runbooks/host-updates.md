@@ -121,3 +121,18 @@ from the node itself.
 4. The stack restarts on its own. `noo cluster verify` confirms every node
    reconnected; `docker ps -a` shows any backend left in `Created` by a boot
    without the GPU driver (safe to remove).
+
+## If the GPU does not answer when the stack starts
+
+A GPU fault at container start (the CDI error `error getting device handle
+for index '0': Unknown Error`, an `nvidia-container-cli` or NVML error) holds
+only the services that need the GPU. The launcher names each one ("… is
+held: the GPU did not answer when it started"), starts everything else (the
+gateway, the database, monitoring, the embed doors) and exits 75, which
+`noo upgrade --stack` reports as "stack up except <service>". The CPU
+embedder (profile `embed-cpu`, when enabled) takes the embeddings
+meanwhile; the gateway already treats it as a peer endpoint.
+
+`noo cluster verify --controller` keeps the hold visible in its
+`GPU services` row. A GPU driver fault clears with a reboot of the host;
+then `noo stack start` starts the held services.
