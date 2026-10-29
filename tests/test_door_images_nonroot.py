@@ -37,6 +37,8 @@ DOORS = {
     "stunnel-tei": "tei",
     "stunnel-tei-gpu": "tei",
     "stunnel-reranker": "reranker",
+    "stunnel-vllm": "vllm",
+    "stunnel-vllm-secondary": "vllm",
     "nvidia-exporter": "nvidia-exporter",
 }
 DOCKERFILES = {
@@ -89,12 +91,13 @@ def test_the_key_table_hands_the_key_to_that_uid(leaf):
 
 
 def test_no_first_party_image_in_the_table_still_reads_its_key_as_root_here():
-    """The root rows left are third-party images (nats, vllm, nginx);
+    """The root rows left are third-party images (nats, nginx); vllm's
+    key is read by its door now, not the engine;
     none of the doors or exporters this repo builds may be one. evolve runs
     as nonroot (65532) since evolve v0.1.4, so its key reader is that uid."""
     roots = {k for k, v in _readers().items() if v == "KeyReader::ContainerRoot"}
     assert not (roots & set(DOORS.values())), sorted(roots & set(DOORS.values()))
-    assert roots == {"nats", "vllm", "model-cache"}, sorted(roots)
+    assert roots == {"nats", "model-cache"}, sorted(roots)
     assert _readers().get("evolve") == "KeyReader::ContainerUid(65532)", _readers().get("evolve")
 
 

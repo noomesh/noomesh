@@ -3091,14 +3091,13 @@ fn voice_live_probe() -> Option<VoiceProbe> {
     serde_json::from_str(text.lines().last()?.trim()).ok()
 }
 
-/// How each compose-run inference backend on the controller is fronted.
-/// `Native`: the server itself terminates TLS and must run with
-/// `--ssl-cert-reqs 2` (vLLM). `Stunnel(name)`: the server has no TLS
-/// listener and every caller dials `stunnel-<name>` (conf
-/// `docker/stunnel-<name>.conf`, `verify = 2`).
+/// How each compose-run inference backend on the controller is fronted:
+/// `Stunnel(name)`, the server has no TLS listener and every caller reaches
+/// it through `stunnel-<name>` (conf `docker/stunnel-<name>.conf`,
+/// `verify = 2`). vLLM terminated its own TLS until its compose services
+/// moved behind doors too (after #522 did it for the agent's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BackendFront {
-    Native,
     Stunnel(&'static str),
 }
 
@@ -3108,8 +3107,8 @@ pub(crate) enum BackendFront {
 /// list against the file; a row here whose service is absent is skipped
 /// (profiles differ per install, the file does not).
 pub(crate) const COMPOSE_BACKENDS: &[(&str, BackendFront)] = &[
-    ("vllm", BackendFront::Native),
-    ("vllm-secondary", BackendFront::Native),
+    ("vllm", BackendFront::Stunnel("vllm")),
+    ("vllm-secondary", BackendFront::Stunnel("vllm-secondary")),
     ("llamacpp", BackendFront::Stunnel("llamacpp")),
     ("ollama", BackendFront::Stunnel("ollama")),
     ("tei", BackendFront::Stunnel("tei")),
@@ -3150,8 +3149,8 @@ pub(crate) fn compose_publishes(compose: &str, sidecar: &str, bind: &str) -> boo
 
 /// The "backend tls" row: every compose inference backend present in the
 /// shipped compose file requires a client certificate at the door a caller
-/// reaches — vLLM's own listener (`--ssl-cert-reqs 2`), or a stunnel
-/// sidecar with `verify = 2` — and no backend publishes a host port. A
+/// reaches — a stunnel sidecar with `verify = 2` — and no backend publishes
+/// a host port. A
 /// sidecar may publish its door on loopback only (stunnel-ollama-embed, for
 /// the controller's own host agent). Read from the
 /// files the stack runs from (`~/.noo` on a standalone controller).
@@ -3176,11 +3175,6 @@ pub(crate) fn backend_listener_check(compose: Option<&str>, stunnel_conf: &dyn F
             problems.push(format!("{svc} publishes a host port"));
         }
         match front {
-            BackendFront::Native => {
-                if !block.contains("--ssl-cert-reqs 2") {
-                    problems.push(format!("{svc} does not run with --ssl-cert-reqs 2 — its listener would admit a caller with no client certificate"));
-                }
-            }
             BackendFront::Stunnel(name) => {
                 let sidecar = format!("stunnel-{name}");
                 match compose_service_block(compose, &sidecar) {
@@ -5795,7 +5789,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // ... and load models the controller staged, offline (i105).
         checks.push(image_family::voice_models_row(voice_on));
         // Every compose inference backend requires a client certificate at
-        // its door (vLLM --ssl-cert-reqs 2, stunnel verify = 2).
+        // its door (a stunnel sidecar, verify = 2).
         checks.push(backend_listener_check(compose.as_deref(), &|name| {
             std::fs::read_to_string(root.join("docker").join(format!("stunnel-{name}.conf"))).ok()
         }));
@@ -8546,14 +8540,14 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
     }
 
-    const BACKENDS_OK: &str = "services:\n  gateway:\n    ports:\n      - \"8080:8080\"\n  vllm:\n    image: v\n    command:\n      - |\n        ARGS=\"$$ARGS --ssl-certfile /app/pki/services/vllm/service.crt --ssl-cert-reqs 2\"\n  llamacpp:\n    image: l\n  stunnel-llamacpp:\n    image: s\n    volumes:\n      - ./docker/stunnel-llamacpp.conf:/etc/stunnel/stunnel.conf:ro\n  grafana:\n    ports:\n      - \"3000:3000\"\n";
+    const BACKENDS_OK: &str = "services:\n  gateway:\n    ports:\n      - \"8080:8080\"\n  vllm:\n    image: v\n  stunnel-vllm:\n    image: s\n    volumes:\n      - ./docker/stunnel-vllm.conf:/etc/stunnel/stunnel.conf:ro\n  llamacpp:\n    image: l\n  stunnel-llamacpp:\n    image: s\n    volumes:\n      - ./docker/stunnel-llamacpp.conf:/etc/stunnel/stunnel.conf:ro\n  grafana:\n    ports:\n      - \"3000:3000\"\n";
 
     fn conf_verify2(_: &str) -> Option<String> {
         Some("[x]\naccept = 0.0.0.0:8085\nverify = 2\n".into())
     }
 
     /// Each way a backend door can admit a caller without a certificate is
-    /// named: the vLLM flag missing, the sidecar missing, its conf without
+    /// named: the sidecar missing (vLLM's or llama.cpp's), its conf without
     /// verify = 2, and a published port on either.
     #[test]
     fn the_backend_tls_row_names_each_way_a_door_opens_without_a_cert() {
@@ -8563,10 +8557,12 @@ mod tests {
         assert!(ok_row.detail.contains("airllm"), "the exception is named: {}", ok_row.detail);
         assert!(!ok_row.detail.contains("ollama-embed"), "no loopback allowance named for an absent service: {}", ok_row.detail);
 
-        let no_flag = BACKENDS_OK.replace(" --ssl-cert-reqs 2", "");
-        let c = backend_listener_check(Some(&no_flag), &conf_verify2);
+        // vLLM's own TLS listener is no longer a door: without its sidecar
+        // the row fails however the engine is started.
+        let no_door = BACKENDS_OK.replace("  stunnel-vllm:\n    image: s\n    volumes:\n      - ./docker/stunnel-vllm.conf:/etc/stunnel/stunnel.conf:ro\n", "");
+        let c = backend_listener_check(Some(&no_door), &conf_verify2);
         assert_eq!(c.verdict, Verdict::Fail);
-        assert!(c.detail.contains("vllm does not run with --ssl-cert-reqs 2"), "{}", c.detail);
+        assert!(c.detail.contains("vllm has no stunnel-vllm service"), "{}", c.detail);
 
         let no_sidecar = BACKENDS_OK.replace("  stunnel-llamacpp:\n    image: s\n    volumes:\n      - ./docker/stunnel-llamacpp.conf:/etc/stunnel/stunnel.conf:ro\n", "");
         let c = backend_listener_check(Some(&no_sidecar), &conf_verify2);
@@ -8859,20 +8855,24 @@ mod tests {
         assert!(c.detail.contains("docker/stunnel-ollama-embed.conf does not set verify = 2"), "{}", c.detail);
     }
 
-    /// The compose healthcheck, onboard's readiness probe and the row's
-    /// flag all name the same leaf paths and the same flag: the compose
-    /// file is the declaration, the others must follow it.
+    /// The compose healthcheck and onboard's readiness probe both ask the
+    /// engine on loopback in plain HTTP: the engine holds no leaf and
+    /// serves no TLS (its door does), so a probe presenting a certificate
+    /// to https://localhost would never answer.
     #[test]
-    fn the_vllm_self_probe_and_compose_agree_on_the_leaf_paths() {
+    fn the_vllm_self_probe_and_compose_agree_the_engine_is_plain_on_loopback() {
         let compose = std::fs::read_to_string(crate::test_support::repo_file("docker-compose.cluster.yml")).expect("shipped compose");
-        let vllm = compose_service_block(&compose, "vllm").expect("vllm service");
-        for needle in ["/app/pki/ca.crt", "/app/pki/services/vllm/service.crt", "/app/pki/services/vllm/service.key"] {
-            assert!(vllm.contains(needle), "compose vllm lacks {needle}");
-            assert!(crate::onboard::steps::VLLM_SELF_PROBE.contains(needle), "onboard's probe lacks {needle}");
+        for svc in ["vllm", "vllm-secondary"] {
+            let block = compose_service_block(&compose, svc).expect("vllm service");
+            assert!(block.contains("http://127.0.0.1:8000/health"), "compose {svc}'s healthcheck is not plain loopback");
+            assert!(block.contains("--host 127.0.0.1 --port 8000"), "compose {svc} does not bind loopback");
+            for gone in ["/app/pki", "--ssl-", "load_cert_chain", "NOO_VLLM_TLS"] {
+                assert!(!block.contains(gone), "compose {svc} still carries {gone}");
+            }
+            assert!(block.contains(&format!("network_mode: \"service:stunnel-{svc}\"")), "compose {svc} is not in its door's namespace");
         }
-        assert!(vllm.contains("load_cert_chain"), "the compose healthcheck does not present the leaf");
-        assert!(crate::onboard::steps::VLLM_SELF_PROBE.contains("load_cert_chain"));
-        assert!(!vllm.contains("NOO_VLLM_TLS"), "the compose vllm listener must have no plaintext switch");
+        let probe = crate::onboard::steps::VLLM_SELF_PROBE;
+        assert!(probe.contains("http://127.0.0.1:8000/") && !probe.contains("ssl"), "onboard's probe: {probe}");
     }
 
     #[test]

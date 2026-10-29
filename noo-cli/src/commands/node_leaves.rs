@@ -4,8 +4,8 @@
 //! A node's backend door leaves, on the rail.
 //!
 //! Every backend the node agent starts serves through a door that requires
-//! a cluster-CA client certificate: vLLM's own listener (`--ssl-cert-reqs
-//! 2`), a `noo-stunnel-<x>` sidecar in front of everything else. Each door
+//! a cluster-CA client certificate: a `noo-stunnel-<x>` sidecar (vLLM's
+//! too since door generation 5, under the alias `noo-vllm`). Each door
 //! serves with a service leaf at `$NOO_PKI_DIR/services/<x>/service.{crt,key}`
 //! whose SANs name the host the agent dials it by, and the agent refuses to
 //! start a backend whose leaf is missing or does not name its door

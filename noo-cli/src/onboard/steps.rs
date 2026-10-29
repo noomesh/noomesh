@@ -6445,10 +6445,9 @@ fn pull_ollama(ctx: &mut Ctx, model: &str) {
 /// succeed — a guaranteed 900 s hang ending in "not yet ready". Ask inside
 /// the container instead; the vLLM image carries python3, not curl.
 ///
-/// The listener is always TLS and requires a client certificate
-/// (`--ssl-cert-reqs 2`), so the probe presents the container's OWN leaf —
-/// a self-check with material the container already holds, verified
-/// against the CA (`localhost` is in every service leaf's SANs).
+/// The engine serves plain HTTP on 127.0.0.1 inside its door's network
+/// namespace (`stunnel-vllm` holds the leaf and requires a client
+/// certificate), so the probe asks it there, from inside.
 fn wait_for_vllm(ctx: &Ctx, timeout_secs: u64) -> bool {
     if ctx.dry_run {
         return true;
@@ -6467,10 +6466,9 @@ fn wait_for_vllm(ctx: &Ctx, timeout_secs: u64) -> bool {
 }
 
 /// The in-container vLLM readiness probe, shared with the compose
-/// healthcheck and `scripts/noomesh-rebuild.sh` in shape: CA-verified,
-/// the service's own leaf presented. Pinned by a test against the compose
-/// file so the three cannot drift apart on the paths.
-pub(crate) const VLLM_SELF_PROBE: &str = "import ssl,urllib.request; ctx=ssl.create_default_context(cafile='/app/pki/ca.crt'); ctx.load_cert_chain('/app/pki/services/vllm/service.crt','/app/pki/services/vllm/service.key'); urllib.request.urlopen('https://localhost:8000/v1/models',context=ctx,timeout=5)";
+/// healthcheck and `scripts/noomesh-rebuild.sh` in shape: plain HTTP on
+/// loopback. Pinned by a test against the compose file.
+pub(crate) const VLLM_SELF_PROBE: &str = "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/models',timeout=5)";
 
 fn start_vllm(ctx: &mut Ctx, model: &str) {
     ctx.update_env("VLLM_MODEL", model);
