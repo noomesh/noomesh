@@ -82,18 +82,24 @@ fn candidates(to: &str, registered: &[String]) -> Vec<String> {
         None => (None, lower.clone()),
     };
     let mut out: Vec<String> = Vec::new();
-    let mut add = |n: &String| {
+    let add = |out: &mut Vec<String>, n: &String| {
         if out.len() < MAX_CANDIDATES && !out.contains(n) && n.to_ascii_lowercase() != lower {
             out.push(n.clone());
         }
     };
-    registered.iter().filter(|n| n.to_ascii_lowercase().starts_with(&lower)).for_each(&mut add);
+    for n in registered.iter().filter(|n| n.to_ascii_lowercase().starts_with(&lower)) {
+        add(&mut out, n);
+    }
     if !part.is_empty() {
-        registered.iter().filter(|n| n.to_ascii_lowercase().contains(&part)).for_each(&mut add);
+        for n in registered.iter().filter(|n| n.to_ascii_lowercase().contains(&part)) {
+            add(&mut out, n);
+        }
     }
     if out.is_empty() {
         if let Some(a) = account {
-            registered.iter().filter(|n| crate::auth::account_of(n).eq_ignore_ascii_case(&a)).for_each(&mut add);
+            for n in registered.iter().filter(|n| crate::auth::account_of(n).eq_ignore_ascii_case(&a)) {
+                add(&mut out, n);
+            }
         }
     }
     out
