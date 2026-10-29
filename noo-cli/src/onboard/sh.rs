@@ -479,7 +479,12 @@ impl ComposeTally {
                 if let Some(name) = words.next() {
                     let state = words.collect::<Vec<_>>().join(" ").to_ascii_lowercase();
                     let end = match state.as_str() {
-                        "started" | "healthy" | "running" | "recreated" | "created" | "restarted" => ContainerEnd::Started,
+                        // Compose prints a bare `Exited` with no exit code, so a one-shot that
+                        // finished cleanly (noo-evolve-routes) looks the same as a crash. Count
+                        // it done: an `up` whose container really died still surfaces through
+                        // compose's own exit status and its loud error/unhealthy lines. Only
+                        // an `Exited` that carries a code (`Exited (1)`) is a failure below.
+                        "started" | "exited" | "healthy" | "running" | "recreated" | "created" | "restarted" => ContainerEnd::Started,
                         "stopped" | "removed" | "killed" => ContainerEnd::Gone,
                         s if s.contains("error") || s.contains("fail") || s.contains("unhealthy") || s.contains("exited") => {
                             ContainerEnd::Failed
@@ -521,6 +526,10 @@ impl ComposeTally {
             self.count(ContainerEnd::Started),
             self.failed()
         );
+        let names: Vec<&str> = self.containers.iter().filter(|(_, e)| **e == ContainerEnd::Failed).map(|(n, _)| n.as_str()).collect();
+        if !names.is_empty() {
+            s.push_str(&format!(" ({})", names.join(", ")));
+        }
         let gone = self.count(ContainerEnd::Gone);
         if gone > 0 {
             s.push_str(&format!(", {gone} removed"));
@@ -1484,7 +1493,7 @@ mod compose_summary_tests {
             "{HAPPY}\n Container noo-redis  Starting\nError response from daemon: driver failed programming external connectivity on endpoint noo-redis\n Container noo-redis  Error\ndependency failed to start: container noo-redis is unhealthy"
         );
         let (summary, pass) = summarise_compose(&lines(&t));
-        assert_eq!(summary, "4 containers: 3 started, 1 failed");
+        assert_eq!(summary, "4 containers: 3 started, 1 failed (noo-redis)");
         assert_eq!(
             pass,
             vec![
@@ -1493,6 +1502,23 @@ mod compose_summary_tests {
                 "dependency failed to start: container noo-redis is unhealthy".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn a_one_shot_that_exited_cleanly_is_not_a_failure() {
+        let t = format!("{HAPPY}\n Container noo-evolve-routes  Starting\n Container noo-evolve-routes  Exited");
+        let (summary, pass) = summarise_compose(&lines(&t));
+        assert_eq!(summary, "4 containers: 4 started, 0 failed");
+        assert!(pass.is_empty(), "progress must be absorbed: {pass:?}");
+    }
+
+    #[test]
+    fn a_real_failure_is_counted_and_named_beside_a_clean_one_shot() {
+        let t = format!(
+            "{HAPPY}\n Container noo-evolve-routes  Exited\n Container noo-worker  Exited (1)\n Container noo-redis  Error"
+        );
+        let (summary, _pass) = summarise_compose(&lines(&t));
+        assert_eq!(summary, "6 containers: 4 started, 2 failed (noo-redis, noo-worker)");
     }
 
     #[test]
