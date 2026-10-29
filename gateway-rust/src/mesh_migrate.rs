@@ -2209,12 +2209,17 @@ CREATE INDEX ix_connection_sources_account ON noo_connection_sources(account_id,
     revision: INTEGRATION_CONTENT_REVISION,
     down_revision: Some(INTEGRATION_PAIRING_REVISION),
     sql: include_str!("integrations/content.sql"),
+}, Migration {
+    revision: INTEGRATION_PACING_REVISION,
+    down_revision: Some(INTEGRATION_CONTENT_REVISION),
+    sql: "ALTER TABLE noo_integration_sync ADD COLUMN last_gmail_scan timestamptz, ADD COLUMN last_gmail_page timestamptz; CREATE INDEX integration_sync_owner_pacing ON noo_integration_sync(owner_uuid)",
 }];
 
 pub const CONNECTIONS_REVISION: &str = "104_connection_drafts";
 pub const INTEGRATION_OAUTH_REVISION: &str = "105_integration_oauth";
 pub const INTEGRATION_PAIRING_REVISION: &str = "106_integration_pairing";
 pub const INTEGRATION_CONTENT_REVISION: &str = "107_integration_content";
+pub const INTEGRATION_PACING_REVISION: &str = "108_integration_pacing";
 
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
@@ -3139,7 +3144,7 @@ mod tests {
         assert_eq!(m.revision, "102_embedding_space_migration");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(EMBED_PLACEMENT_MODEL_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(INTEGRATION_CONTENT_REVISION), "the chain head");
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(INTEGRATION_PACING_REVISION), "the chain head");
         for col in [
             "next_model text", "next_dims integer", "migration_state text", "migration_progress jsonb",
             "migration_started_at timestamptz", "migration_reported_at timestamptz",

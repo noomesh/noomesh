@@ -102,14 +102,22 @@ does not rewrite any manually copied text, past conversations or backups.
 Current limits: 1,000 documents per source, 32 KiB text per document, 1 MiB provider
 response, 20 items per page, 5,000 folders per traversal and a 1,000-document
 retrieval window per owner. Search reports `truncated` when that window caps.
-Sync checks metadata every 30 minutes. Gmail `historyId` and Drive file `version`
+Drive checks metadata every 30 minutes; an idle Gmail source waits six hours
+between scans. Gmail scan starts for one Noomesh user are at least one minute
+apart across all their sources and gateway instances, including manual restarts;
+their Gmail pages are also started at least one second apart per user.
+Gmail `historyId` and Drive file `version`
 revisions skip unchanged bodies and keep document ciphertext, row versions and
 timestamps untouched. This is a bounded metadata rescan, not Gmail history/Drive
 changes-stream sync. The encrypted cursor carries the revision inventory and
 seen-item set; completion prunes items no longer in the selected snapshot without
-rewriting unchanged document rows. Gmail selects the newest 1,000 messages by
-`internalDate` across all pages and selected labels before fetching bodies; larger
-mailboxes complete successfully with that window. Drive caps at 1,000 supported
+rewriting unchanged document rows. Gmail examines at most 100 list pages and
+2,000 message metadata records per scan, dividing pages across selected labels.
+It selects up to 1,000 newest messages by `internalDate` among the examined
+items. Google does not guarantee list order, so this is a best-effort window,
+not necessarily the newest across the entire mailbox. At completion, items
+outside the selected window are deleted from Noomesh; nothing is deleted at Google.
+Drive caps at 1,000 supported
 documents in traversal order, with each listing ordered by modification time.
 Provider revision semantics: [Gmail messages](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages)
 and [Drive files](https://developers.google.com/workspace/drive/api/reference/rest/v3/files).
@@ -183,7 +191,7 @@ URLs. OAuth credentials stay separate from source policy and token material
 never enters the list contract. Contracts are maintained in the server/UI
 OpenAPI files and regenerated TypeScript types.
 
-`107_integration_content` adds the separate encrypted personal corpus and durable owner-bound sync queue.
+`107_integration_content` adds the separate encrypted personal corpus and durable owner-bound sync queue. `108_integration_pacing` adds the per-user Gmail scan-start interval.
 
 ## Release rehearsal without Google credentials
 
@@ -226,7 +234,7 @@ gateway runs, so losing the DSN fails those integration checks.
 | Agent and failure boundaries | Actual MCP-minted JWTs through real auth/principal middleware cannot read private sources with either delegation marker; opt-in is boolean and human-only; corrupt rows degrade search and poisoned jobs cannot block another owner |
 | Snapshot bounds and pruning | Unchanged Gmail/Drive scans download no bodies and preserve row versions/timestamps/ciphertext; 1,001 Gmail messages complete newest-first, prune stale rows and leave another owner's identical message untouched |
 | Response protection | Callback CSP and no-store headers, strict request shapes, owner resolution for User/Operator/Admin |
-| Migration compatibility | Existing `103_pg_stat_statements` preserved; new migrations `104_connection_drafts` through `107_integration_content` follow it |
+| Migration compatibility | Existing `103_pg_stat_statements` preserved; new migrations `104_connection_drafts` through `108_integration_pacing` follow it |
 
 This is the component rehearsal. General still owns the review, combined
 0.6.14 batch build and signed-stack rehearsal. Record the tested head and

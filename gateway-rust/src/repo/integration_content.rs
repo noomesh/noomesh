@@ -101,6 +101,7 @@ pub async fn claim(db: &PgPool, vault: &Vault) -> Result<Option<Job>, Error> {
         let Some((source, owner, account, policy, generation, cursor)) = row else {
             return Ok(None);
         };
+        let starting = generation.is_none();
         let lease = Uuid::new_v4();
         let generation = generation.unwrap_or_else(Uuid::new_v4);
         let cursor = cursor
@@ -115,8 +116,27 @@ pub async fn claim(db: &PgPool, vault: &Vault) -> Result<Option<Job>, Error> {
             tracing::warn!("private sync source quarantined: unreadable cursor or policy");
             continue;
         };
-        sqlx::query("UPDATE noo_integration_sync SET lease=$2,lease_until=now()+interval '5 minutes',imported=CASE WHEN generation IS NULL THEN 0 ELSE imported END,skipped=CASE WHEN generation IS NULL THEN 0 ELSE skipped END,generation=$3,status='syncing' WHERE source_id=$1")
-            .bind(source).bind(lease).bind(generation).execute(&mut *tx).await?;
+        let gmail = matches!(policy, crate::connections::SourcePolicy::Gmail { .. });
+        if gmail {
+            // Serialize claims for this owner without locking other job rows.
+            // The transaction lock releases automatically on commit/rollback.
+            let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended('noomesh/google-owner/' || $1::uuid::text, 0))")
+                .bind(owner).fetch_one(&mut *tx).await?;
+            let due: Option<chrono::DateTime<chrono::Utc>> = if locked {
+                sqlx::query_scalar("SELECT due FROM (SELECT GREATEST(max(last_gmail_page)+interval '1 second',CASE WHEN $2 THEN max(last_gmail_scan)+interval '1 minute' ELSE NULL END) AS due FROM noo_integration_sync WHERE owner_uuid=$1) AS pacing WHERE due>now()")
+                    .bind(owner).bind(starting).fetch_optional(&mut *tx).await?
+            } else {
+                Some(sqlx::query_scalar("SELECT now()+interval '1 second'").fetch_one(&mut *tx).await?)
+            };
+            if let Some(due) = due {
+                sqlx::query("UPDATE noo_integration_sync SET next_run=$3 WHERE source_id=$1 AND owner_uuid=$2")
+                    .bind(source).bind(owner).bind(due).execute(&mut *tx).await?;
+                tx.commit().await?;
+                continue;
+            }
+        }
+        sqlx::query("UPDATE noo_integration_sync SET lease=$2,lease_until=now()+interval '5 minutes',imported=CASE WHEN generation IS NULL THEN 0 ELSE imported END,skipped=CASE WHEN generation IS NULL THEN 0 ELSE skipped END,generation=$3,status='syncing',last_gmail_page=CASE WHEN $4 THEN now() ELSE last_gmail_page END,last_gmail_scan=CASE WHEN $4 AND $5 THEN now() ELSE last_gmail_scan END WHERE source_id=$1")
+            .bind(source).bind(lease).bind(generation).bind(gmail).bind(starting).execute(&mut *tx).await?;
         tx.commit().await?;
         return Ok(Some(Job {
             source,
@@ -216,8 +236,8 @@ pub async fn commit(
     let cursor = cursor
         .map(|v| vault.seal(v, &cursor_context(job.owner, job.source)))
         .transpose()?;
-    sqlx::query("UPDATE noo_integration_sync SET lease=NULL,lease_until=NULL,cursor_sealed=$2,generation=CASE WHEN $2 IS NULL THEN NULL ELSE generation END,status=CASE WHEN $2 IS NULL THEN 'idle' ELSE 'queued' END,next_run=CASE WHEN $2 IS NULL THEN now()+interval '30 minutes' ELSE now() END,attempts=0,fault=NULL,imported=CASE WHEN $2 IS NULL THEN $3 ELSE imported+$4 END,skipped=skipped+$5 WHERE source_id=$1")
-        .bind(job.source).bind(cursor).bind(count as i32).bind(docs.len() as i32).bind(skipped as i32).execute(&mut *tx).await?;
+    sqlx::query("UPDATE noo_integration_sync SET lease=NULL,lease_until=NULL,cursor_sealed=$2,generation=CASE WHEN $2 IS NULL THEN NULL ELSE generation END,status=CASE WHEN $2 IS NULL THEN 'idle' ELSE 'queued' END,next_run=CASE WHEN $2 IS NULL THEN now()+CASE WHEN $6 THEN interval '6 hours' ELSE interval '30 minutes' END ELSE now() END,attempts=0,fault=NULL,imported=CASE WHEN $2 IS NULL THEN $3 ELSE imported+$4 END,skipped=skipped+$5 WHERE source_id=$1")
+        .bind(job.source).bind(cursor).bind(count as i32).bind(docs.len() as i32).bind(skipped as i32).bind(matches!(job.policy, crate::connections::SourcePolicy::Gmail { .. })).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(true)
 }

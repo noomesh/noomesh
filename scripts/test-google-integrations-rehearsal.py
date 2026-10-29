@@ -25,7 +25,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 # Minimum counts fail closed if a renamed filter would under-run the rehearsal.
 SUITES = {
-    "repo::integration_content::": 13,
+    "repo::integration_content::": 18,
     "memory::provider::tests::personal_rag_": 3,
     "mcp_external::tests::door_minted_jwts_never_qualify_for_personal_evidence": 1,
     "bus_principal::tests::delegation_provenance_survives_signing_and_replay": 1,

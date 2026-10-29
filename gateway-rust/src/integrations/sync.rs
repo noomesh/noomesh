@@ -39,7 +39,12 @@ struct Cursor {
     candidates: BTreeMap<String, MailRef>,
     fetching: bool,
     offset: usize,
+    label_pages: usize,
 }
+
+/// At most 100 Gmail list pages (2,000 metadata reads) per scan, divided
+/// across selected labels. The provider does not guarantee a list order.
+const GMAIL_MAX_PAGES: usize = 100;
 
 #[derive(Serialize, Deserialize)]
 struct MailRef {
@@ -280,6 +285,9 @@ pub(crate) async fn page(
                     let id = row["id"]
                         .as_str()
                         .ok_or_else(|| Error::Unavailable("Invalid Gmail item".into()))?;
+                    if id.is_empty() || id.len() > 1024 {
+                        return Err(Error::Unavailable("Invalid Gmail item".into()));
+                    }
                     if let Some(value) = get_json(
                         api,
                         true,
@@ -298,14 +306,19 @@ pub(crate) async fn page(
                     }
                 }
                 c.page = list["nextPageToken"].as_str().map(str::to_string);
+                c.label_pages += 1;
+                let labels = if *exposure == GmailExposure::SelectedLabels { label_ids.len() } else { 1 };
+                if c.label_pages >= (GMAIL_MAX_PAGES / labels).max(1) {
+                    c.page = None;
+                }
                 if c.page.is_none() {
                     c.label += 1;
+                    c.label_pages = 0;
                 }
                 let more = c.page.is_some()
                     || (*exposure == GmailExposure::SelectedLabels && c.label < label_ids.len());
-                // Gmail list has no contractual sort option. Select the newest
-                // bounded set from metadata across every page and selected label,
-                // then fetch bodies. No body for an out-of-window item is imported.
+                // Pick the newest 1,000 among the bounded pages examined.
+                // List order is not guaranteed; this is a best-effort window.
                 let mut newest: Vec<_> = c.candidates.iter().map(|(id, m)| (m.date, id.clone())).collect();
                 newest.sort_by(|a,b| b.cmp(a));
                 for (_, id) in newest.into_iter().skip(content::MAX_DOCUMENTS as usize) {

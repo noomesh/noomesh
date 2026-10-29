@@ -5,6 +5,21 @@ use super::*;
 use crate::bus_principal::{Kind, Principal};
 use crate::integrations::sync::{self, Api};
 
+// Most tests exercise other boundaries; simulate the passage of the owner
+// cooldown on explicit starts. The pacing test below calls super::enable.
+async fn enable(db: &PgPool, owner: Uuid, source: Uuid, enabled: bool) -> Result<(), Error> {
+    let result = super::enable(db, owner, source, enabled).await;
+    if enabled && result.is_ok() {
+        sqlx::query("UPDATE noo_integration_sync SET last_gmail_scan=now()-interval '2 minutes' WHERE owner_uuid=$1")
+            .bind(owner).execute(db).await?;
+    }
+    result
+}
+
+async fn claim(db: &PgPool, vault: &Vault) -> Result<Option<Job>, Error> {
+    sqlx::query("UPDATE noo_integration_sync SET last_gmail_page=now()-interval '2 seconds'").execute(db).await?;
+    super::claim(db, vault).await
+}
 
 async fn commit(db: &PgPool, v: &Vault, job: &Job, docs: &[Document], cursor: Option<&Value>, skipped: usize) -> Result<bool, Error> {
     let mut retained: std::collections::BTreeSet<String> = job.cursor.as_ref()
@@ -82,6 +97,7 @@ impl Db {
             crate::mesh_migrate::INTEGRATION_OAUTH_REVISION,
             crate::mesh_migrate::INTEGRATION_PAIRING_REVISION,
             crate::mesh_migrate::INTEGRATION_CONTENT_REVISION,
+            crate::mesh_migrate::INTEGRATION_PACING_REVISION,
         ] {
             let m = crate::mesh_migrate::MIGRATIONS
                 .iter()
@@ -148,16 +164,19 @@ struct SnapshotApi {
     count: usize,
     revision: &'static str,
     body_reads: std::sync::atomic::AtomicUsize,
+    lists: std::sync::atomic::AtomicUsize,
+    metadata_reads: std::sync::atomic::AtomicUsize,
 }
 impl SnapshotApi {
     fn new(count: usize, revision: &'static str) -> Self {
-        Self { count, revision, body_reads: std::sync::atomic::AtomicUsize::new(0) }
+        Self { count, revision, body_reads: std::sync::atomic::AtomicUsize::new(0), lists: std::sync::atomic::AtomicUsize::new(0), metadata_reads: std::sync::atomic::AtomicUsize::new(0) }
     }
 }
 impl Api for SnapshotApi {
     async fn get(&self, gmail: bool, path: &[&str], query: &[(String,String)], raw: bool) -> Result<Option<Vec<u8>>, Error> {
         let metadata = query.iter().any(|(k,v)| k == "format" && v == "metadata");
         let result = if path.len() == 1 {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let start: usize = query.iter().find(|(k,_)| k == "pageToken").map(|(_,v)| v.parse().unwrap()).unwrap_or(0);
             let end = (start+20).min(self.count);
             // Deliberately oldest first: the implementation cannot rely on an
@@ -168,6 +187,7 @@ impl Api for SnapshotApi {
             if end < self.count { list["nextPageToken"] = json!(end.to_string()); }
             list
         } else if metadata {
+            self.metadata_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let n: usize = path[1].strip_prefix("msg").unwrap().parse().unwrap();
             json!({"internalDate":(1_700_000_000_000u64+n as u64*1000).to_string(),"historyId":self.revision})
         } else {
@@ -178,6 +198,105 @@ impl Api for SnapshotApi {
         };
         Ok(Some(serde_json::to_vec(&result).unwrap()))
     }
+}
+
+#[tokio::test]
+async fn huge_mailbox_is_bounded_on_each_unchanged_scan() {
+    let Some(db) = Db::new().await else { return; };
+    let v = vault();
+    let owner = db.user("bounded").await;
+    let source = db.source(owner,true).await;
+    let api = SnapshotApi::new(200_000,"v1");
+    run_snapshot(&db,&v,owner,source,&api).await;
+    let idle_delay: bool = sqlx::query_scalar("SELECT status='idle' AND next_run>now()+interval '5 hours 59 minutes' FROM noo_integration_sync WHERE source_id=$1")
+        .bind(source).fetch_one(&db.pool).await.unwrap();
+    assert!(idle_delay);
+    let lists = api.lists.load(std::sync::atomic::Ordering::SeqCst);
+    let metadata = api.metadata_reads.load(std::sync::atomic::Ordering::SeqCst);
+    let bodies = api.body_reads.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!((lists,metadata,bodies),(100,2000,1000));
+    run_snapshot(&db,&v,owner,source,&api).await;
+    assert_eq!(api.lists.load(std::sync::atomic::Ordering::SeqCst)-lists,100);
+    assert_eq!(api.metadata_reads.load(std::sync::atomic::Ordering::SeqCst)-metadata,2000);
+    assert_eq!(api.body_reads.load(std::sync::atomic::Ordering::SeqCst),bodies);
+    db.finish().await;
+}
+
+#[tokio::test]
+async fn gmail_page_budget_is_shared_across_selected_labels() {
+    let api = SnapshotApi::new(200_000,"v1");
+    let policy = serde_json::from_value(json!({"kind":"gmail","exposure":"selected_labels","label_ids":["INBOX","LabelWork"],"lookback_days":30})).unwrap();
+    let mut cursor = None;
+    for _ in 0..200 {
+        let page = sync::page(&api,&policy,cursor,BTreeMap::new()).await.unwrap();
+        cursor = page.cursor;
+        if cursor.is_none() { break; }
+    }
+    assert!(cursor.is_none(),"the selected-label scan must complete");
+    assert_eq!(api.lists.load(std::sync::atomic::Ordering::SeqCst),100);
+    assert_eq!(api.metadata_reads.load(std::sync::atomic::Ordering::SeqCst),2000);
+}
+
+#[tokio::test]
+async fn gmail_start_pacing_is_per_owner_and_shared_between_sources() {
+    let Some(db) = Db::new().await else { return; };
+    let v = vault();
+    let alice = db.user("pace-alice").await;
+    let bob = db.user("pace-bob").await;
+    let a = db.source(alice,true).await;
+    let b = db.source(alice,true).await;
+    let c = db.source(bob,true).await;
+    super::enable(&db.pool,alice,a,true).await.unwrap();
+    assert_eq!(super::claim(&db.pool,&v).await.unwrap().unwrap().source,a);
+    super::enable(&db.pool,alice,b,true).await.unwrap();
+    super::enable(&db.pool,bob,c,true).await.unwrap();
+    assert_eq!(super::claim(&db.pool,&v).await.unwrap().unwrap().source,c);
+    assert!(super::claim(&db.pool,&v).await.unwrap().is_none());
+    let delayed: bool = sqlx::query_scalar("SELECT next_run>now() FROM noo_integration_sync WHERE source_id=$1")
+        .bind(b).fetch_one(&db.pool).await.unwrap();
+    assert!(delayed);
+    sqlx::query("UPDATE noo_integration_sync SET last_gmail_scan=now()-interval '2 minutes',last_gmail_page=now()-interval '2 seconds' WHERE owner_uuid=$1")
+        .bind(alice).execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE noo_integration_sync SET next_run=now() WHERE source_id=$1").bind(b).execute(&db.pool).await.unwrap();
+    assert_eq!(super::claim(&db.pool,&v).await.unwrap().unwrap().source,b);
+    db.finish().await;
+}
+
+#[tokio::test]
+async fn concurrent_gmail_claims_share_the_owner_pacing_row() {
+    let Some(db) = Db::new().await else { return; };
+    let v = vault();
+    let owner = db.user("pace-race").await;
+    let a = db.source(owner,true).await;
+    let b = db.source(owner,true).await;
+    super::enable(&db.pool,owner,a,true).await.unwrap();
+    super::enable(&db.pool,owner,b,true).await.unwrap();
+    let (one,two) = tokio::join!(super::claim(&db.pool,&v),super::claim(&db.pool,&v));
+    let jobs = [one.unwrap(),two.unwrap()];
+    assert_eq!(jobs.iter().filter(|job| job.is_some()).count(),1);
+    let delayed: i64 = sqlx::query_scalar("SELECT count(*) FROM noo_integration_sync WHERE owner_uuid=$1 AND lease IS NULL AND next_run>now()")
+        .bind(owner).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(delayed,1);
+    db.finish().await;
+}
+
+#[tokio::test]
+async fn gmail_continuation_pages_are_paced_per_owner() {
+    let Some(db) = Db::new().await else { return; };
+    let v = vault();
+    let owner = db.user("page-pace").await;
+    let source = db.source(owner,true).await;
+    super::enable(&db.pool,owner,source,true).await.unwrap();
+    let job = super::claim(&db.pool,&v).await.unwrap().unwrap();
+    let page = sync::Page { docs: Vec::new(), retained: Default::default(), cursor: Some(json!({"page":"next"})), skipped: 0 };
+    assert!(super::commit(&db.pool,&v,&job,&page).await.unwrap());
+    assert!(super::claim(&db.pool,&v).await.unwrap().is_none());
+    let delayed: bool = sqlx::query_scalar("SELECT next_run>now() FROM noo_integration_sync WHERE source_id=$1").bind(source).fetch_one(&db.pool).await.unwrap();
+    assert!(delayed);
+    sqlx::query("UPDATE noo_integration_sync SET last_gmail_page=now()-interval '2 seconds' WHERE owner_uuid=$1").bind(owner).execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE noo_integration_sync SET next_run=now() WHERE source_id=$1").bind(source).execute(&db.pool).await.unwrap();
+    assert!(super::claim(&db.pool,&v).await.unwrap().is_some());
+    db.finish().await;
 }
 
 async fn run_snapshot(db: &Db, v: &Vault, owner: Uuid, source: Uuid, api: &SnapshotApi) -> Vec<String> {

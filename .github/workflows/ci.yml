@@ -1500,7 +1500,7 @@ jobs:
       run: |
         set -eux
         docker run --rm -v "${PWD}/noo-cli/target/release/noo":/usr/local/bin/noo:ro \
-          ubuntu:24.04 bash -euxc '
+          public.ecr.aws/ubuntu/ubuntu:24.04 bash -euxc '
             # The whole point: prove there is no Python to fall back to.
             ! command -v python3
             ! command -v python
@@ -1527,7 +1527,7 @@ jobs:
       run: |
         set -eux
         docker run --rm -v "${PWD}/noo-cli/target/release/noo":/usr/local/bin/noo:ro \
-          ubuntu:24.04 bash -euxc '
+          public.ecr.aws/ubuntu/ubuntu:24.04 bash -euxc '
             # 3. A bare group: usage error, exit 2.
             set +e
             out="$(noo plugins 2>&1)"
