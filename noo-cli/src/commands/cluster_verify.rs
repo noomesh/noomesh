@@ -10545,7 +10545,8 @@ mod digest_tests {
         };
         let c = pki_key_modes_check(&[unknown], &[], 5);
         let r = c.remedy.unwrap();
-        assert!(r.starts_with("chmod 600 "), "{r}");
+        // fix-modes tightens a key with no reader row to 0600 (i277a).
+        assert_eq!(r, "noo security pki fix-modes", "{r}");
         assert!(!r.contains("noo-cli/src") && !r.contains("edit "), "{r}");
     }
 }
