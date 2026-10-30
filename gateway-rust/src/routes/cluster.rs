@@ -387,7 +387,6 @@ async fn node_heartbeat(
     // WARNs on anything not from the rail.
     carry_reported(&mut data, &body, "image_sources");
     carry_reported(&mut data, &body, "image_source_mode");
-    carry_reported(&mut data, &body, "image_source_mode_source");
     // Per running backend container: start time + health.
     // `backend doors` reads a door miss on a container still warming up as
     // `starting` only from this; an agent that omits it changes nothing.
@@ -939,7 +938,6 @@ async fn node_register_body(
     carry_reported(&mut data, &body, "stunnel_image");
     carry_reported(&mut data, &body, "image_sources");
     carry_reported(&mut data, &body, "image_source_mode");
-    carry_reported(&mut data, &body, "image_source_mode_source");
     carry_reported(&mut data, &body, "backend_containers");
     carry_reported(&mut data, &body, "gpu_contention");
     carry_reported(&mut data, &body, "model_presence");
@@ -4199,7 +4197,7 @@ fn with_size_hint(node: &mut Value, model: Option<&str>, size: Option<u64>) {
 
 /// The not-staged refusal for a placement, or None (staged, nothing the
 /// gateway can name, no store mounted, or the node's arch unknown).
-/// The bool is whether the node reports image_source_mode=rail (the agent default: refuse) or not
+/// The bool is whether the node runs NOO_IMAGE_SOURCE=rail (refuse) or not
 /// (warn only).
 async fn placement_staging_refusal(state: &AppState, node_id: &str, backend: &str, body_image: Option<&str>) -> Option<(String, bool)> {
     use crate::routes::artifacts as art;

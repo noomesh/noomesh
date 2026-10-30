@@ -18,12 +18,9 @@ const pinDigest = "@sha256:0123456789abcdef0123456789abcdef0123456789abcdef01234
 
 func clearImageEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"NOO_IMAGE_SOURCE", "NOO_IMAGE_PREFIX", "NOO_IMAGE_TAG", "VLLM_IMAGE", "OLLAMA_IMAGE", "NOO_MODEL_CACHE_URL", preseed.OllamaRegistryPullEnv} {
+	for _, k := range []string{"NOO_IMAGE_PREFIX", "NOO_IMAGE_TAG", "VLLM_IMAGE", "OLLAMA_IMAGE", "NOO_MODEL_CACHE_URL", preseed.OllamaRegistryPullEnv} {
 		t.Setenv(k, "")
 	}
-	// Rail is the default; these cases model a registry node, which is an
-	// explicit opt-out. Rail cases set NOO_IMAGE_SOURCE=rail themselves.
-	t.Setenv("NOO_IMAGE_SOURCE", "legacy")
 }
 
 // The floating defaults are gone: nothing in the specs resolves to :latest
@@ -50,47 +47,17 @@ func TestChooseBackendImagePolicy(t *testing.T) {
 			}
 		}
 	})
-	t.Run("digest ref accepted and kept on a registry node", func(t *testing.T) {
+	t.Run("every node strips the digest and forbids the registry", func(t *testing.T) {
 		clearImageEnv(t)
-		t.Setenv("NOO_IMAGE_PREFIX", "ghcr.io/noomesh")
-		ch, err := chooseBackendImage("vllm", spec, pinned)
-		if err != nil || ch.Ref != pinned || ch.RailOnly {
-			t.Fatalf("got %+v, %v", ch, err)
-		}
-	})
-	t.Run("rail node strips the digest and forbids the registry", func(t *testing.T) {
-		clearImageEnv(t)
-		t.Setenv("NOO_IMAGE_SOURCE", "rail")
 		ch, err := chooseBackendImage("vllm", spec, pinned)
 		if err != nil || ch.Ref != "vllm/vllm-openai:v0.25.0" || !ch.RailOnly {
 			t.Fatalf("got %+v, %v", ch, err)
 		}
 	})
-	t.Run("old controller: a digest-less default is refused on a dist registry node", func(t *testing.T) {
+	t.Run("old controller: a node may run its default only from the rail", func(t *testing.T) {
 		clearImageEnv(t)
-		t.Setenv("NOO_IMAGE_PREFIX", "ghcr.io/noomesh")
-		_, err := chooseBackendImage("vllm", spec, "")
-		if err == nil || !strings.Contains(err.Error(), "digest") || !strings.Contains(err.Error(), "noo upgrade --stack") {
-			t.Fatalf("want an explained digest refusal, got %v", err)
-		}
-	})
-	t.Run("old controller: a rail node may run its default only from the rail", func(t *testing.T) {
-		clearImageEnv(t)
-		t.Setenv("NOO_IMAGE_SOURCE", "rail")
 		ch, err := chooseBackendImage("vllm", spec, "")
 		if err != nil || !ch.RailOnly || ch.Ref != "vllm/vllm-openai:v0.25.0" {
-			t.Fatalf("got %+v, %v", ch, err)
-		}
-	})
-	t.Run("a placed digest-less ref is refused even off the rail", func(t *testing.T) {
-		clearImageEnv(t)
-		if _, err := chooseBackendImage("vllm", spec, "vllm/vllm-openai:v0.25.0"); err == nil {
-			t.Fatal("want a refusal")
-		}
-	})
-	t.Run("a hand-run dev node keeps its versioned default", func(t *testing.T) {
-		clearImageEnv(t)
-		if ch, err := chooseBackendImage("vllm", spec, ""); err != nil || ch.RailOnly {
 			t.Fatalf("got %+v, %v", ch, err)
 		}
 	})
@@ -106,7 +73,6 @@ func TestChooseBackendImagePolicy(t *testing.T) {
 // ONE function: the prefetch ref IS the ref the start path asks for.
 func TestPrefetchRefIsTheStartRef(t *testing.T) {
 	clearImageEnv(t)
-	t.Setenv("NOO_IMAGE_SOURCE", "rail")
 	override := "vllm/vllm-openai:v0.25.0" + pinDigest
 	pre := BackendImageRef("vllm", override)
 
@@ -127,7 +93,6 @@ func TestPrefetchRefIsTheStartRef(t *testing.T) {
 
 func TestRailOnlyContextBlocksTheRegistryFallback(t *testing.T) {
 	clearImageEnv(t)
-	t.Setenv("NOO_IMAGE_SOURCE", "rail")
 	prevL, prevR := imageLocalID, imageRegistryPull
 	imageLocalID = func(context.Context, *Client, string) (string, bool) { return "", false }
 	pulled := false

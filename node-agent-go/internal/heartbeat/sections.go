@@ -95,11 +95,9 @@ var (
 		if is := imagesource.Report(); is != nil {
 			p["image_sources"] = is
 		}
-		// rail | legacy — NOO_IMAGE_SOURCE; rail is the default.
-		p["image_source_mode"] = imagesource.Mode()
-		// env | default — whether the mode was chosen or is the built-in
-		// default, so the controller can tell explicit legacy from not-rolled.
-		p["image_source_mode_source"] = imagesource.ModeSource()
+		// Always "rail": the rail is the only image source. Kept so an older
+		// controller or CLI that reads the key still sees a rail node.
+		p["image_source_mode"] = "rail"
 	}}
 
 	secBackendContainers = payloadSection{name: "backendContainers", stage: "backend_containers", add: func(r *Reporter, p map[string]any) {
