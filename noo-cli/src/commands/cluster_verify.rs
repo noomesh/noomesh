@@ -2327,15 +2327,44 @@ pub(crate) fn undeclared_containers_check(
     Some(warn(NAME, detail, Some(format!("docker rm -f {}", names.join(" ")))))
 }
 
-/// The live `undeclared containers` row, from the same scan as
-/// `noo doctor orphans`.
-fn undeclared_containers_row() -> Option<Check> {
+/// The `retired services` row: a container of a service the repo retired
+/// (`config/retired-services.txt`) is still running. FAIL, not the WARN of an
+/// undeclared one: the retired list exists for the services that were removed
+/// because they were unsafe (#98's sidecar ran as root with `~/.ssh` mounted).
+/// None when none run; a WARN naming why when the list could not be read.
+pub(crate) fn retired_services_check(
+    running: &[(crate::commands::doctor::ComposeContainer, crate::commands::doctor::RetiredService)],
+    list_why: Option<&str>,
+) -> Option<Check> {
+    const NAME: &str = "retired services";
+    if running.is_empty() {
+        return list_why.map(|w| warn(
+            NAME,
+            format!("could not read config/retired-services.txt ({w}) — nothing was compared, not a pass"),
+            Some("noo doctor orphans".into()),
+        ));
+    }
+    let detail = running
+        .iter()
+        .map(|(c, r)| format!("{} running: {}", c.name, r.sentence()))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let names: Vec<&str> = running.iter().map(|(c, _)| c.name.as_str()).collect();
+    Some(fail(NAME, detail, format!("docker rm -f {}", names.join(" "))))
+}
+
+/// The live rows from one scan, the same as `noo doctor orphans`: the WARN
+/// `undeclared containers` row and the FAIL `retired services` row.
+fn undeclared_containers_rows() -> Vec<Check> {
     use crate::commands::doctor::{docker_daemon_up, scan_orphans};
     if !docker_daemon_up() {
-        return undeclared_containers_check(false, &[], &[]);
+        return undeclared_containers_check(false, &[], &[]).into_iter().collect();
     }
     let scan = scan_orphans();
-    undeclared_containers_check(true, &scan.found, &scan.unreadable)
+    let mut rows: Vec<Check> = Vec::new();
+    rows.extend(retired_services_check(&scan.retired, scan.retired_why.as_deref()));
+    rows.extend(undeclared_containers_check(true, &scan.found, &scan.unreadable));
+    rows
 }
 
 /// The "docker userns" row. A daemon with
@@ -5962,7 +5991,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(crate::commands::secrets_delivery::secrets_not_in_env_row());
         // A container compose still runs although no compose file of this
         // install declares it (186b: noo-cluster-executor ran two days).
-        checks.extend(undeclared_containers_row());
+        checks.extend(undeclared_containers_rows());
         // No secret is shared between holders any more — the
         // controller secret reaches the gateway alone, and each bus verifier
         // holds its own key.
@@ -7995,6 +8024,25 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.contains("noo-cluster-executor") && c.detail.contains("noo-foo"));
         assert_eq!(c.remedy.as_deref(), Some("docker rm -f noo-cluster-executor noo-foo"));
+    }
+
+    #[test]
+    fn a_running_retired_service_fails_with_its_retirement_line_and_remedy() {
+        use crate::commands::doctor::{parse_ps_row, parse_retired_services};
+        let c = parse_ps_row("noo-cluster-executor\tnoomesh\tcluster-executor\t/o/a.yml\t/o\timg:1\tUp 2 days").unwrap();
+        let r = parse_retired_services("cluster-executor  2026-09-11  #98\n").remove(0);
+        let row = retired_services_check(&[(c, r)], None).expect("a row");
+        assert_eq!(row.verdict, Verdict::Fail);
+        assert!(row.detail.contains("service cluster-executor was retired on 2026-09-11 (#98)"), "{}", row.detail);
+        assert_eq!(row.remedy.as_deref(), Some("docker rm -f noo-cluster-executor"));
+    }
+
+    #[test]
+    fn the_retired_row_is_absent_when_none_run_and_warns_when_the_list_is_unread() {
+        assert!(retired_services_check(&[], None).is_none());
+        let w = retired_services_check(&[], Some("no such file")).expect("a row");
+        assert_eq!(w.verdict, Verdict::Warn);
+        assert!(w.detail.contains("no such file") && w.detail.contains("not a pass"));
     }
 
     #[test]

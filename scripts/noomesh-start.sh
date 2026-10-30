@@ -943,6 +943,9 @@ require_compose_v2 || exit 1
     # exporter; the agent is scaled out below the same way.
     _bind_skip=""
     [ -n "$AGENT_SCALE" ] && _bind_skip="--skip node-agent"
+    # Retired services (config/retired-services.txt): remove a stale container of
+    # one BEFORE the up, one line each; nothing else is removed (186b step 4).
+    compose_remove_retired .
     # shellcheck disable=SC2086
     check_bind_sources --no-deps $_bind_skip $ACTIVE_SVCS || exit 1
     # Start all services with profile(s)
