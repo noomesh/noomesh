@@ -465,6 +465,71 @@ pub(crate) fn orphans_of<'a>(
     running.iter().filter(|c| !declared.contains(&c.service)).collect()
 }
 
+/// One line of `config/retired-services.txt`: a compose service the repo
+/// removed on purpose and says must stay gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetiredService {
+    pub service: String,
+    pub date: String,
+    pub pr: String,
+}
+
+impl RetiredService {
+    /// `service <svc> was retired on <date> (<PR>)`, the sentence the launcher
+    /// prints when it removes one.
+    pub(crate) fn sentence(&self) -> String {
+        format!("service {} was retired on {} ({})", self.service, self.date, self.pr)
+    }
+}
+
+/// Parse the retired-services list: `<service>  <YYYY-MM-DD>  <PR>` per line,
+/// whole-line `#` comments and blank lines ignored (the PR column starts with
+/// `#` too, so a comment is only a line that BEGINS with one). A missing date
+/// or PR reads as empty rather than hiding the entry.
+pub(crate) fn parse_retired_services(text: &str) -> Vec<RetiredService> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let service = it.next()?.to_string();
+            let date = it.next().unwrap_or("").to_string();
+            let pr = it.collect::<Vec<_>>().join(" ");
+            Some(RetiredService { service, date, pr })
+        })
+        .collect()
+}
+
+/// The list as this install has it: `config/retired-services.txt` under the
+/// install root (the file the launcher reads), else the copy embedded in this
+/// binary. Err when neither can be read, so a caller never reads "nothing
+/// retired" from a list it never saw.
+pub(crate) fn retired_services() -> Result<Vec<RetiredService>, String> {
+    let path = crate::envfile::repo_root().join("config/retired-services.txt");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => crate::onboard::standalone::STANDALONE_ASSETS
+            .iter()
+            .find(|(rel, _, _)| *rel == "config/retired-services.txt")
+            .and_then(|(_, bytes, _)| std::str::from_utf8(bytes).ok().map(str::to_string))
+            .ok_or_else(|| format!("{} is unreadable ({e}) and this binary embeds no copy", path.display()))?,
+    };
+    Ok(parse_retired_services(&text))
+}
+
+/// The running containers whose service is on the retired list, paired with
+/// their entry. Needs no compose projection: a retired service is wrong
+/// whatever the files say.
+pub(crate) fn retired_of(
+    running: &[ComposeContainer],
+    list: &[RetiredService],
+) -> Vec<(ComposeContainer, RetiredService)> {
+    running
+        .iter()
+        .filter_map(|c| list.iter().find(|r| r.service == c.service).map(|r| (c.clone(), r.clone())))
+        .collect()
+}
+
 // ═══════════════════════════════════════════════════════════════
 // `noo doctor secrets`
 // ═══════════════════════════════════════════════════════════════
@@ -631,12 +696,18 @@ pub fn doctor_orphans(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             Some("sudo systemctl start docker — then re-run noo doctor orphans"));
     }
 
-    let OrphanScan { by_project, found, unreadable } = scan_orphans();
+    let OrphanScan { by_project, found, retired, retired_why, unreadable } = scan_orphans();
 
     if g.json {
         println!("{}", serde_json::json!({
-            "status": if !unreadable.is_empty() { "unreadable" }
+            "status": if !retired.is_empty() { "retired_running" }
+                      else if !unreadable.is_empty() || retired_why.is_some() { "unreadable" }
                       else if found.is_empty() { "clean" } else { "orphans" },
+            "retired": retired.iter().map(|(c, r)| serde_json::json!({
+                "container": c.name, "service": c.service, "project": c.project,
+                "retired_on": r.date, "pr": r.pr,
+            })).collect::<Vec<_>>(),
+            "retired_list_unreadable": retired_why,
             "projects": by_project.keys().collect::<Vec<_>>(),
             "orphans": found.iter().map(|c| serde_json::json!({
                 "container": c.name, "service": c.service,
@@ -646,7 +717,7 @@ pub fn doctor_orphans(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 .map(|(p, w)| serde_json::json!({"project": p, "why": w}))
                 .collect::<Vec<_>>(),
         }));
-        return Ok(if found.is_empty() && unreadable.is_empty() { 0 } else { 1 });
+        return Ok(if found.is_empty() && retired.is_empty() && unreadable.is_empty() && retired_why.is_none() { 0 } else { 1 });
     }
 
     println!("{}", ui::header("compose orphans", None));
@@ -658,8 +729,24 @@ pub fn doctor_orphans(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ("projects", by_project.keys().cloned().collect::<Vec<_>>().join(", ")),
         ("compose services running", by_project.values().map(Vec::len).sum::<usize>().to_string()),
         ("orphans", found.len().to_string()),
+        ("retired services running", retired.len().to_string()),
     ]));
     println!();
+
+    if let Some(why) = &retired_why {
+        println!("{}", ui::status_line(Glyph::Err,
+            &format!("could not read config/retired-services.txt: {why}")));
+        println!("{}", ui::note("this is NOT a report of no retired services — the list was not compared"));
+    }
+    for (c, r) in &retired {
+        println!("{}", ui::status_line(Glyph::Err, &format!(
+            "{} is running although {}", c.name, r.sentence())));
+        println!("    {}", ui::cmd(&format!("docker rm -f {}", c.name)));
+    }
+    if !retired.is_empty() {
+        println!("{}", ui::note("a retired service stays gone: the repo removed it on purpose, and the next start removes it too"));
+        println!();
+    }
 
     for (project, why) in &unreadable {
         println!("{}", ui::status_line(Glyph::Err,
@@ -668,6 +755,9 @@ pub fn doctor_orphans(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
 
     if found.is_empty() && unreadable.is_empty() {
+        if !retired.is_empty() || retired_why.is_some() {
+            return Ok(1);
+        }
         println!("{}", ui::status_line(Glyph::Ok, "every running compose container is still declared"));
         return Ok(0);
     }
@@ -705,7 +795,12 @@ pub(crate) fn docker_daemon_up() -> bool {
 /// What one pass over the running compose containers found.
 pub(crate) struct OrphanScan {
     pub by_project: std::collections::BTreeMap<String, Vec<ComposeContainer>>,
+    /// Undeclared containers that are NOT retired services (those are in `retired`).
     pub found: Vec<ComposeContainer>,
+    /// Running containers of a service on config/retired-services.txt: FAIL, not WARN.
+    pub retired: Vec<(ComposeContainer, RetiredService)>,
+    /// Why the retired list could not be read, when it could not. NOT "none retired".
+    pub retired_why: Option<String>,
     /// Projects whose projection could not be computed, with why. NOT clean.
     pub unreadable: Vec<(String, String)>,
 }
@@ -733,20 +828,29 @@ pub(crate) fn scan_orphans() -> OrphanScan {
     }
     by_project.retain(|_, v| is_ours(v));
 
+    let (list, retired_why) = match retired_services() {
+        Ok(l) => (l, None),
+        Err(w) => (Vec::new(), Some(w)),
+    };
     let mut found: Vec<ComposeContainer> = Vec::new();
+    let mut retired: Vec<(ComposeContainer, RetiredService)> = Vec::new();
     let mut unreadable: Vec<(String, String)> = Vec::new();
     for (project, containers) in &by_project {
+        retired.extend(retired_of(containers, &list));
         match declared_services(project, containers) {
-            Ok(declared) => {
-                found.extend(orphans_of(containers, &declared).into_iter().cloned())
-            }
+            Ok(declared) => found.extend(
+                orphans_of(containers, &declared)
+                    .into_iter()
+                    .filter(|c| !list.iter().any(|r| r.service == c.service))
+                    .cloned(),
+            ),
             // A project whose projection we could not compute is NOT a project
             // with no orphans. R45's lesson: "0 found" from a lookup that never
             // happened is a clean bill of health for a fleet nobody looked at.
             Err(why) => unreadable.push((project.clone(), why)),
         }
     }
-    OrphanScan { by_project, found, unreadable }
+    OrphanScan { by_project, found, retired, retired_why, unreadable }
 }
 
 /// The compose files whose union decides what is "declared" for a project.
@@ -942,6 +1046,37 @@ mod orphan_tests {
     #[test]
     fn no_labels_and_no_install_list_declares_nothing() {
         assert!(declared_files(&["", " "], &[], &|_| true).is_empty());
+    }
+
+    #[test]
+    fn the_retired_list_parses_comments_and_columns() {
+        let got = parse_retired_services(
+            "# header\n\ncluster-executor  2026-09-11  #98\nfoo 2026-01-02 #1\n  \nbare\n");
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], RetiredService {
+            service: "cluster-executor".into(), date: "2026-09-11".into(), pr: "#98".into() });
+        assert_eq!(got[2].service, "bare");
+        assert_eq!(got[2].date, "");
+    }
+
+    #[test]
+    fn the_shipped_retired_list_names_cluster_executor() {
+        let got = parse_retired_services(include_str!("../../../config/retired-services.txt"));
+        assert!(got.iter().any(|r| r.service == "cluster-executor" && r.date == "2026-09-11"), "{got:?}");
+    }
+
+    #[test]
+    fn a_running_retired_service_is_found_and_only_that() {
+        let running = vec![
+            parse_ps_row(&row("noo-gateway", "noomesh", "gateway")).unwrap(),
+            parse_ps_row(&row("noo-cluster-executor", "noomesh", "cluster-executor")).unwrap(),
+        ];
+        let list = parse_retired_services("cluster-executor  2026-09-11  #98\n");
+        let got = retired_of(&running, &list);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0.name, "noo-cluster-executor");
+        assert_eq!(got[0].1.sentence(), "service cluster-executor was retired on 2026-09-11 (#98)");
+        assert!(retired_of(&running, &[]).is_empty());
     }
 
     #[test]

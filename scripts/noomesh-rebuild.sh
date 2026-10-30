@@ -665,6 +665,9 @@ if [ "$START_STACK" = true ]; then
     echo "Recreating services: ${RECREATE_SERVICES}"
     # shellcheck disable=SC2086
     addon_refuse_held ${RECREATE_SERVICES} || exit 1
+    # Retired services (config/retired-services.txt): remove a stale container of
+    # one BEFORE the up, one line each; nothing else is removed (186b step 4).
+    compose_remove_retired .
     check_bind_sources ${RECREATE_SERVICES} || exit 1
     docker compose $COMPOSE_FILES $PROFILE_ARGS up -d --force-recreate ${RECREATE_SERVICES}
 
