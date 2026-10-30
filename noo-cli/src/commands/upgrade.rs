@@ -1625,7 +1625,7 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
             return c.status();
         }
         let (status, tally) = crate::onboard::sh::run_summarised(c)?;
-        if let Some(s) = tally.summary() {
+        for s in [tally.pull_summary(), tally.summary()].into_iter().flatten() {
             if status.success() && tally.failed() == 0 { ui::done(&s); } else { ui::failed(&s, None); }
         }
         Ok(status)
