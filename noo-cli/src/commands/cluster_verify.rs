@@ -497,7 +497,20 @@ pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
     let method = gc["method"].as_str().unwrap_or("?");
     let state = gc["state"].as_str().unwrap_or("?");
     if method == "not-measured" && state != "held" && state != "yielded" && state != "draining" {
-        return Some(ok("gpu", "not measured (no NVIDIA GPU, or unified memory) — the node never yields"));
+        // Why it is not measured (an agent that predates the key sends none).
+        return Some(match gc["unmeasured"].as_str() {
+            Some("driver-lost") => {
+                let detail = gc["unmeasured_detail"].as_str().filter(|d| !d.is_empty()).unwrap_or("no detail");
+                fail("gpu",
+                    format!("the NVIDIA driver lost the GPU (nvidia-smi: {detail}) — GPU backends cannot start"),
+                    format!("reboot {id}; the kernel log names the fault: journalctl -k | grep -i xid"))
+            }
+            Some("probe-timeout") => warn("gpu",
+                "nvidia-smi did not answer in time (GPU saturated or driver slow) — not measured", None),
+            Some("no-nvidia") => ok("gpu", "no NVIDIA GPU — the node never yields"),
+            Some("unified-memory") => ok("gpu", "unified memory — the node never yields"),
+            _ => ok("gpu", "not measured (no NVIDIA GPU, or unified memory) — the node never yields"),
+        });
     }
     let mut off = if gc["policy"].as_str() == Some("off") { " (yield off)".to_string() } else { String::new() };
     // Why: noomesh's own GPU use, and memory nobody could be blamed for, are
@@ -10439,6 +10452,36 @@ mod gpu_contention_tests {
         assert_eq!(c.verdict, Verdict::Ok);
         assert!(c.detail.starts_with("not measured"));
         assert!(gpu_contention_check(&serde_json::json!({"id": "host9"})).is_none());
+    }
+
+    #[test]
+    fn not_measured_names_its_cause() {
+        let row = |extra: serde_json::Value| {
+            let mut gc = serde_json::json!({"state": "free", "method": "not-measured"});
+            for (k, v) in extra.as_object().unwrap() {
+                gc[k] = v.clone();
+            }
+            gpu_contention_check(&node(gc)).unwrap()
+        };
+        let lost = row(serde_json::json!({"unmeasured": "driver-lost", "unmeasured_detail": "Unable to determine the device handle"}));
+        assert_eq!(lost.verdict, Verdict::Fail);
+        assert_eq!(lost.detail, "the NVIDIA driver lost the GPU (nvidia-smi: Unable to determine the device handle) — GPU backends cannot start");
+        assert!(lost.remedy.as_deref().unwrap().contains("journalctl -k | grep -i xid"));
+        let bare = row(serde_json::json!({"unmeasured": "driver-lost"}));
+        assert_eq!(bare.verdict, Verdict::Fail);
+        assert!(bare.detail.contains("nvidia-smi: no detail"));
+        let slow = row(serde_json::json!({"unmeasured": "probe-timeout"}));
+        assert_eq!(slow.verdict, Verdict::Warn);
+        assert!(slow.remedy.is_none());
+        let none = row(serde_json::json!({"unmeasured": "no-nvidia"}));
+        assert_eq!((none.verdict, none.detail.as_str()), (Verdict::Ok, "no NVIDIA GPU — the node never yields"));
+        let mac = row(serde_json::json!({"unmeasured": "unified-memory"}));
+        assert_eq!((mac.verdict, mac.detail.as_str()), (Verdict::Ok, "unified memory — the node never yields"));
+        let old = row(serde_json::json!({}));
+        assert_eq!(old.detail, "not measured (no NVIDIA GPU, or unified memory) — the node never yields");
+        // A hold outranks the cause: the held row keeps its own text.
+        let held = gpu_contention_check(&node(serde_json::json!({"state": "held", "method": "not-measured", "unmeasured": "driver-lost"}))).unwrap();
+        assert_ne!(held.verdict, Verdict::Fail);
     }
 
     #[test]
