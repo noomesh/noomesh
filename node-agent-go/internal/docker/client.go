@@ -1084,11 +1084,7 @@ func (c *Client) PullProfile(ctx context.Context, profile string) error {
 	// the profile's image may carry ${VAR:-default}, which a pull of the
 	// raw string never resolved.
 	img := resolveEnv(spec.Image)
-	fallback := ""
-	if ours, up := hardenedDefault(profile); ours != "" && ours == img {
-		fallback = up
-	}
-	if _, err := ensureImageWithFallback(ctx, c, profile, img, fallback, false); err != nil {
+	if err := ensureImageFn(ctx, c, img); err != nil {
 		return fmt.Errorf("pull %s: %w", img, err)
 	}
 	return nil

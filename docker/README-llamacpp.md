@@ -12,9 +12,9 @@ The release workflow (`.github/workflows/images-release.yml`) builds this
 Dockerfile for `linux/amd64,linux/arm64` and publishes it as
 `ghcr.io/noomesh/llamacpp:<stack-tag>`, a normal row in the signed stack lock.
 `docker-compose.dist.yml`, the node agent's default and `noo stack` staging
-all pull that image, on ARM nodes too (noomesh-internal i323). The upstream
-multi-arch image `ghcr.io/ggml-org/llama.cpp:server` is only the agent's
-fallback when ours is not staged and not pullable on a node.
+all pull that image, on ARM nodes too (noomesh-internal i323). There is no
+upstream fallback: a node with this image neither local nor staged for its arch
+refuses the start and names the restage command.
 
 ## Building it yourself
 
