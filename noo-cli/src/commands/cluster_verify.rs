@@ -129,8 +129,8 @@ pub(crate) fn self_agent_lane_check(
 /// - it advertises it and the round trip failed: FAIL. The node says it
 ///   listens and nothing answers, which is the shape of a silently denied
 ///   publish (NATS refuses those without telling the sender).
-/// - it advertises it but no probe result reached us (an older gateway, or
-///   the probe call failed): NOT CHECKED.
+/// - it advertises it but no probe result reached us (none yet, or the
+///   probe call failed): NOT CHECKED, saying so (not blaming the gateway).
 pub(crate) fn control_bus_row(id: &str, n: &Value) -> Check {
     const NAME: &str = "control over bus";
     let advertised = n["control_transports"]["nats_rpc"].as_bool();
@@ -146,7 +146,7 @@ pub(crate) fn control_bus_row(id: &str, n: &Value) -> Check {
                 (Some(true), Some(true)) => ok(NAME, format!("health round trip over NATS in {} ms", p["rtt_ms"].as_u64().unwrap_or(0))),
                 (Some(true), _) => fail(NAME, p["detail"].as_str().unwrap_or("the round trip failed").to_string(),
                     format!("noo cluster nats-users render   # re-render the grants; then noo cluster restart-agent {id}")),
-                _ => warn(NAME, format!("NOT CHECKED — {}", p["detail"].as_str().unwrap_or("the gateway did not run the round-trip probe (older gateway)")),
+                _ => warn(NAME, format!("NOT CHECKED — {}", p["detail"].as_str().unwrap_or("no round-trip probe result has reached the verifier yet (the gateway has not reported one for this node)")),
                     None),
             }
         }
@@ -163,8 +163,8 @@ pub(crate) fn control_bus_row(id: &str, n: &Value) -> Check {
 /// - it advertises it and the round trip failed (including "the gateway holds
 ///   no live tunnel for it"): FAIL. The node says it is connected and the
 ///   gateway cannot use it.
-/// - it advertises it but no probe result reached us (an older gateway, or
-///   the probe call failed): NOT CHECKED.
+/// - it advertises it but no probe result reached us (none yet, or the
+///   probe call failed): NOT CHECKED, saying so (not blaming the gateway).
 pub(crate) fn tunnel_row(id: &str, n: &Value) -> Check {
     const NAME: &str = "streaming over tunnel";
     let advertised = n["control_transports"]["tunnel"].as_bool();
@@ -188,7 +188,7 @@ pub(crate) fn tunnel_row(id: &str, n: &Value) -> Check {
                 }
                 (Some(true), _) => fail(NAME, p["detail"].as_str().unwrap_or("the stream round trip failed").to_string(),
                     format!("noo cluster logs {id}   # 'node tunnel' lines; the node reconnects on its own, and `NOO_AGENT_TUNNEL=off` or `NOO_NODE_TUNNEL=0` turns the tunnel off on purpose")),
-                _ => warn(NAME, format!("NOT CHECKED — {}", p["detail"].as_str().unwrap_or("the gateway did not run the tunnel probe (older gateway)")),
+                _ => warn(NAME, format!("NOT CHECKED — {}", p["detail"].as_str().unwrap_or("no tunnel probe result has reached the verifier yet (the gateway has not reported one for this node)")),
                     None),
             }
         }
@@ -382,6 +382,9 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     // 7. Inbound: the controller can reach the agent.
     match n["inbound"].as_str() {
         Some("ok") => out.push(ok("inbound", "agent reachable from the controller")),
+        // `unknown` is the gateway saying it had no address to dial: nothing
+        // was checked, so it is not a failed check (i276).
+        Some("unknown") => out.push(warn("inbound", "NOT CHECKED — the controller has no address on record to dial this node, so reachability was not tested", Some(format!("noo cluster show {id}   # the address the node registered with")))),
         Some(other) => out.push(fail("inbound", format!("inbound {other}"), format!("noo cluster show {id}   # bind address and tailnet grant"))),
         None => out.push(warn("inbound", "not yet checked", None)),
     }
@@ -6820,6 +6823,39 @@ mod tests {
         let c = host_checks("host2", &Value::Null, true);
         assert_eq!(verdict(&c, "next boot"), Verdict::Warn);
         assert!(host_checks("host2", &Value::Null, false).is_empty(), "a dead hostd already fails its own row");
+    }
+
+    // ── i276: what a fresh one-box install must not FAIL on ───────────
+
+    /// `unknown` = the gateway had no address to dial: nothing was checked.
+    /// A warning that says so; only a check that actually failed FAILs.
+    #[test]
+    fn inbound_unknown_is_a_warning_naming_that_nothing_was_checked_and_failed_still_fails() {
+        let now = 1_800_000_000;
+        let mut n = healthy(now);
+        n["inbound"] = serde_json::json!("unknown");
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        let r = c.iter().find(|c| c.name == "inbound").unwrap();
+        assert_eq!(r.verdict, Verdict::Warn, "{}", r.detail);
+        assert!(r.detail.contains("NOT CHECKED") && r.detail.contains("no address"), "{}", r.detail);
+        n["inbound"] = serde_json::json!("failed");
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "inbound"), Verdict::Fail);
+    }
+
+    /// An advertised transport with no probe result yet is "no result", not
+    /// "older gateway": the gateway's version is not what is missing.
+    #[test]
+    fn a_missing_probe_result_does_not_blame_the_gateway_version() {
+        let now = 1_800_000_000;
+        let n = with_transports(now, serde_json::json!({"https_listener": true, "nats_rpc": true, "tunnel": true}));
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        for row in ["control over bus", "streaming over tunnel"] {
+            let r = c.iter().find(|c| c.name == row).unwrap();
+            assert_eq!(r.verdict, Verdict::Warn, "{row}");
+            assert!(r.detail.starts_with("NOT CHECKED") && r.detail.contains("no ") && r.detail.contains("probe result"), "{row}: {}", r.detail);
+            assert!(!r.detail.contains("older gateway"), "{row}: {}", r.detail);
+        }
     }
 
     // ── control over bus (i131 phase 1) ───────────────────────────────
