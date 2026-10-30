@@ -692,8 +692,9 @@ pub(crate) fn config_section_guard(
 /// the exec-approval gate entirely.
 ///
 /// Deliberately narrower than the section guard: ADDING a read-only folder is
-/// ordinary ingestion config and stays open to any authenticated caller. Only
-/// granting `writable` is an admin decision.
+/// ordinary ingestion config and stays open to any person (see
+/// `user_dirs_person_refusal` for who counts). Only granting `writable` is an
+/// admin decision.
 fn writable_folder_guard(
     writable: bool,
     role: Option<crate::auth::Role>,
@@ -709,6 +710,29 @@ fn writable_folder_guard(
          have an admin set the flag."
             .to_string()
     })
+}
+
+/// Who may add or remove a watched folder at all (i94a).
+///
+/// A read-only folder still joins `FilePolicy::allowed`, so it widens what the
+/// file tools may read and list. A person adding their own documents is the
+/// feature; an agent doing it is the R8 hazard through a second door. So the
+/// caller must be a person: no cluster credential (the worker's controller-HMAC
+/// callback), and none of the credentials `task_guard` calls an agent (a
+/// harness or delegated token, an MCP-door key, a service identity, an account
+/// that is not an enabled user). Any person's role passes; `writable` is
+/// `writable_folder_guard`'s separate admin rule.
+fn user_dirs_person_refusal(origin: &crate::task_guard::Origin, cluster_caller: bool) -> Option<String> {
+    let via = match (cluster_caller, origin) {
+        (true, _) => "a cluster credential",
+        (false, crate::task_guard::Origin::Person { .. }) => return None,
+        (false, crate::task_guard::Origin::Agent { via, .. }) => via.as_str(),
+    };
+    Some(format!(
+        "a watched folder widens what the file tools may read, so it is added or \
+         removed by a person, not by an agent: this credential is {via}. Log in \
+         (noo auth login) and retry with your own credential."
+    ))
 }
 
 /// PUT /api/config/{section} — Update a single config section and save.
@@ -1377,6 +1401,10 @@ async fn user_dirs_add(
     cluster: Option<Extension<crate::auth::ClusterNode>>,
     Json(body): Json<AddFolderBody>,
 ) -> impl IntoResponse {
+    let origin = crate::task_guard::resolve_origin(&state.db, &requester).await;
+    if let Some(reason) = user_dirs_person_refusal(&origin, cluster.is_some()) {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": reason }))).into_response();
+    }
     if let Some(reason) = writable_folder_guard(
         body.writable.unwrap_or(false),
         requester.as_ref().map(|r| r.0.role),
@@ -1447,8 +1475,14 @@ struct RemoveFolderBody {
 /// DELETE /api/v1/settings/user-dirs — Remove a folder entry by host path.
 async fn user_dirs_remove(
     State(state): State<Arc<AppState>>,
+    requester: Option<Extension<crate::auth::RequesterCtx>>,
+    cluster: Option<Extension<crate::auth::ClusterNode>>,
     Json(body): Json<RemoveFolderBody>,
 ) -> impl IntoResponse {
+    let origin = crate::task_guard::resolve_origin(&state.db, &requester).await;
+    if let Some(reason) = user_dirs_person_refusal(&origin, cluster.is_some()) {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": reason }))).into_response();
+    }
     let host = body.host.clone();
     if let Err((status, err_body)) = mutate_config(&state, move |doc| {
         let mut folders = get_folders(doc);
@@ -2851,6 +2885,55 @@ mod tests {
             );
         }
         assert!(writable_folder_guard(true, Some(Role::Admin), false).is_none());
+    }
+
+    /// i94a: a read-only folder widens what the file tools may read, so only a
+    /// person adds or removes one. Every agent-shaped credential and every
+    /// cluster caller is refused; a person of any role passes.
+    #[test]
+    fn a_watched_folder_is_added_or_removed_by_a_person() {
+        use crate::task_guard::{origin_of_requester, Origin};
+        let ctx = |sub: &str, harness: Option<&str>, act: bool| crate::auth::RequesterCtx {
+            sub: sub.into(),
+            scopes: vec!["read".into(), "write".into()],
+            role: Role::User,
+            harness: harness.map(String::from),
+            act: act.then(|| crate::auth::Actor { sub: "svc:worker".into(), iss_user: None, task: Some("t1".into()) }),
+        };
+        for c in [
+            ctx("alice", Some("worker:t1"), false),
+            ctx("alice", Some("mcp-external:codex"), false),
+            ctx("alice", None, true),
+            ctx("svc:evolve", None, false),
+            ctx("worker:w1", None, false),
+        ] {
+            let o = origin_of_requester(Some(&c));
+            let r = user_dirs_person_refusal(&o, false).unwrap_or_else(|| panic!("{} must be refused", c.sub));
+            assert!(r.contains("by a person") && r.contains("noo auth login"), "{r}");
+        }
+        assert!(user_dirs_person_refusal(&origin_of_requester(None), false).is_some(), "no credential");
+        for role in [Role::User, Role::Operator, Role::Admin] {
+            let person = Origin::Person { account: "alice".into(), role };
+            assert!(user_dirs_person_refusal(&person, false).is_none(), "a {} person", role.as_str());
+            let r = user_dirs_person_refusal(&person, true).expect("a cluster caller is never a person");
+            assert!(r.contains("a cluster credential"), "{r}");
+        }
+    }
+
+    /// The wiring the pure rule cannot see: both mutating handlers resolve the
+    /// origin and refuse before they touch the config.
+    #[test]
+    fn both_user_dirs_mutations_check_the_person_before_writing() {
+        let src = include_str!("settings.rs");
+        let code = &src[..src.find("#[cfg(test)]").unwrap()];
+        for sig in ["async fn user_dirs_add(", "async fn user_dirs_remove("] {
+            let body = &code[code.find(sig).expect(sig)..];
+            let body = &body[..body.find("\n}\n").unwrap()];
+            let gate = body.find("user_dirs_person_refusal(&origin, cluster.is_some())").unwrap_or_else(|| panic!("{sig} has no person gate"));
+            let write = body.find("mutate_config(").expect(sig);
+            assert!(body.contains("resolve_origin(&state.db, &requester)"), "{sig}");
+            assert!(gate < write, "{sig}: the person gate must come before the write");
+        }
     }
 
     #[test]
