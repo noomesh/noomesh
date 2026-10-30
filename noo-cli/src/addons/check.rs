@@ -224,7 +224,9 @@ mod tests {
     fn a_bad_routes_json_gets_the_gateways_refusal() {
         let d = fixture_dir("routes", "rhaddon");
         let good: serde_json::Value = serde_json::from_slice(&std::fs::read(d.join("routes.json")).unwrap()).unwrap();
-        let cases: [(&str, fn(&mut serde_json::Value), &str); 4] = [
+        // What the case is, how it spoils the manifest, the refusal it earns.
+        type Case = (&'static str, fn(&mut serde_json::Value), &'static str);
+        let cases: [Case; 4] = [
             ("unknown role", |m: &mut serde_json::Value| m["routes"][0]["min_role"] = "owner".into(), "min_role \"owner\" is not a role"),
             ("wrong addon", |m: &mut serde_json::Value| m["addon"] = "other".into(), "it names add-on \"other\", but was delivered for \"rhaddon\""),
             ("duplicate route", |m: &mut serde_json::Value| {
