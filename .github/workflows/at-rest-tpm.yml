@@ -46,7 +46,7 @@ jobs:
           persist-credentials: false
 
       # The Go toolchain the agent builds with (same pin as ci.yml's go job).
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff   # v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v7.0.0
         with:
           go-version-file: node-agent-go/go.mod
           cache-dependency-path: node-agent-go/go.sum
