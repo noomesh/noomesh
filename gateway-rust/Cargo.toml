@@ -9,6 +9,8 @@ license = "AGPL-3.0-only"
 description = "Mesh Gateway — Rust implementation"
 
 [dependencies]
+# The add-on route manifest and its rules, shared with noo-cli (i302).
+addon-manifest = { path = "../crates/addon-manifest" }
 # Web framework
 axum = { version = "0.8", features = ["ws", "json", "multipart"] }
 axum-extra = { version = "0.12", features = ["cookie"] }

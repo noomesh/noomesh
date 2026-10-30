@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# The add-on route manifest (`routes.json`): its types and every rule the
+# gateway refuses a manifest on. One definition, compiled into the gateway
+# (which loads manifests) and noo-cli (`noo addons check`, which an add-on
+# author runs in CI), so the two cannot disagree (noomesh-internal i302).
+#
+# A path dependency of both crates, not a workspace member: neither crate is
+# in a workspace. Its dependencies are ones both Cargo.lock files already
+# hold, at the same versions.
+
+[package]
+name = "addon-manifest"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+publish = false
+description = "The noomesh add-on route manifest and its validation rules"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"

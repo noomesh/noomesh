@@ -130,19 +130,10 @@ pub const STACK_ENV: &str = "NOO_STACK_TAG";
 /// The add-ons only a development key vouches for, with its expiry (i163 A).
 pub const DEV_ENV: &str = "NOO_ADDONS_DEV";
 
-/// What an add-on name may be (it is joined into a path and an env var).
-pub const NAME_RULE: &str =
-    "lowercase letters, digits, `-` and `_`, starting with a letter, at most 32 characters";
-
-/// Is `s` a name an add-on may have? Checked before the name is joined into a
-/// path, so a config key can never walk out of the manifest directory.
-pub fn name_ok(s: &str) -> bool {
-    let b = s.as_bytes();
-    !b.is_empty()
-        && b.len() <= 32
-        && b[0].is_ascii_lowercase()
-        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
-}
+// What an add-on name may be (it is joined into a path and an env var), and
+// the check made before a name is joined into a path: a manifest rule
+// (`addon-manifest`, shared with `noo addons check`), named here as before.
+pub use addon_manifest::{addon_name_ok as name_ok, ADDON_NAME_RULE as NAME_RULE};
 
 // ── The launcher's verdict ───────────────────────────────────────────────
 
