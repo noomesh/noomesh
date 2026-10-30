@@ -117,7 +117,7 @@ taglines and the handler doc comments):
 | Run a **containerized skill** (manifests under `skills/builtins/` and `~/.noo/skills`) | `noo skills` | `noo prompt-skills` — prompt skill **templates** served by the gateway |
 | Add your own **command** to `noo` | `noo plugins` — an executable `noo-<name>` shim on `PATH` or in `~/.config/mesh/plugins/bin/`, git-style | `noo skills` / `noo prompt-skills` — those run inside the mesh, not in your shell |
 | Set up **this machine** as a controller | `noo onboard` | `noo enroll` — joins this machine to an **existing** controller as a worker |
-| Send one **prompt** and get an answer | `noo inference run` (one backend, no memory) or `noo inference agent` (the coordinator's tool loop) | `noo chat` — a streaming conversation that keeps its id across turns; `noo jobs run` — queued through the scheduler |
+| Send one **prompt** and get an answer | `noo inference run` (one prompt; add `--raw` to skip mesh context) or `noo inference agent` (the coordinator's tool loop) | `noo chat` — a streaming conversation that keeps its id across turns; `noo jobs run` — queued through the scheduler |
 | Run one task through several **agent roles** | `noo agents collaborate` | `noo workflow run` — a named multi-step template; `noo agents send` — the agent-to-agent message bus |
 | **Declare** that a node runs a backend with a model | `noo cluster place` (desired state; the node-agent converges) | `noo cluster down` — the older imperative stop, forgotten on agent restart (`up` and `scale` are retired) |
 | Schedule something **recurring** | `noo heartbeat` (cron, user-facing tasks) | `noo autonomy` — condition → action self-healing patrols; `noo proactive` — rule-triggered notifications |
