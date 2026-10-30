@@ -520,7 +520,20 @@ pub(crate) fn build_ctx<'a>(
     dry_run: bool,
     skip: Skip,
 ) -> Ctx<'a> {
-    let repo_root = crate::envfile::repo_root();
+    build_ctx_at(g, ui, non_interactive, dry_run, skip, crate::envfile::repo_root())
+}
+
+/// [`build_ctx`] rooted at `repo_root` instead of the resolved one: a test
+/// hands the wizard a hermetic root without setting `NOO_REPO_ROOT` for the
+/// whole test process (noomesh-internal 309).
+pub(crate) fn build_ctx_at<'a>(
+    g: &'a Globals,
+    ui: &'a dyn WizardUi,
+    non_interactive: bool,
+    dry_run: bool,
+    skip: Skip,
+    repo_root: std::path::PathBuf,
+) -> Ctx<'a> {
     Ctx {
         g,
         non_interactive,
