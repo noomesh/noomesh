@@ -26,3 +26,4 @@ PAGEINDEX_LLM_MODEL|which model serves trellion is a preference in the DB: noo c
 NOO_TRELLION_LLM_URL|trellion's LLM calls go to the gateway address (NOO_TRELLION_GATEWAY_URL), as the knowledge purpose (i145)
 NOO_SELF_CALL_SHARED_SECRET|the self-call bridge is deleted: a shared secret never buys inference (the gateway refuses it on /v1/* and /api/external/*), and every caller presents its own key: noo security service-key issue <consumer>
 NOO_CLUSTER_TOKEN_V1|the v1 cluster-token gate is deleted: a v1 token (the old replayable form) is always refused, and nodes sign v2 only. Nothing reads the line; the stored posture row is deleted at the next gateway start
+NOO_CONTROLLER_SSH_PUBKEY|the controller serves no SSH key: enrollment pins none, and the noo-gate lane it was for is retired (nodes collect CA-signed bundles over the pull rail)
