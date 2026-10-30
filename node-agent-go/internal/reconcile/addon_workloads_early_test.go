@@ -18,7 +18,7 @@ func TestAddonWorkloadsDeclaredBeforeFirstTick(t *testing.T) {
 	t.Cleanup(func() { addonwl.SetDeclared(nil) })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"addon_workloads":[{"addon":"pai-voice","name":"voice-worker","container":"pai-voice-worker","gpu":true}]}`))
+		_, _ = w.Write([]byte(`{"addon_workloads":[{"addon":"rhaddon","name":"rhworker","container":"rhaddon-rhworker","gpu":true}]}`))
 	}))
 	defer srv.Close()
 	r := &Reconciler{cfg: &config.Config{ControllerURL: srv.URL, NodeID: "awolf"}, client: srv.Client()}
@@ -27,8 +27,8 @@ func TestAddonWorkloadsDeclaredBeforeFirstTick(t *testing.T) {
 	go r.Run(ctx)
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if d, ok := addonwl.Lookup("pai-voice", "voice-worker"); ok {
-			if d.Container != "pai-voice-worker" {
+		if d, ok := addonwl.Lookup("rhaddon", "rhworker"); ok {
+			if d.Container != "rhaddon-rhworker" {
 				t.Fatalf("container = %q", d.Container)
 			}
 			return
