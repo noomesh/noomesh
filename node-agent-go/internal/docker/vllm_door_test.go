@@ -165,7 +165,7 @@ func TestTheVLLMDoorTakesTheEngineName(t *testing.T) {
 // move with the pin. A pinned door has no fallback image.
 func TestThePinnedDoorFollowsItsPinNotTheRelease(t *testing.T) {
 	t.Setenv(StunnelImageEnv, "")
-	t.Setenv("NOO_IMAGE_SOURCE", "")
+	t.Setenv("NOO_IMAGE_SOURCE", "legacy")
 	t.Setenv("NOO_IMAGE_PREFIX", "ghcr.io/noomesh")
 	t.Setenv("NOO_IMAGE_TAG", "v0.6.13")
 	pinned := ReleaseSidecarImage("vllm")

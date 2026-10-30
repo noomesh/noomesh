@@ -81,11 +81,11 @@ import (
 //
 // # The rollout switch
 //
-// NOO_IMAGE_SOURCE=rail|legacy (node env). `legacy` — the DEFAULT for the
-// first release that ships this — is the pre-rail behaviour: a local image
-// is used, an absent one is pulled from its registry. Provenance is still
-// reported, so `noo cluster verify` shows what the rail WOULD change. The
-// operator turns `rail` on one node at a time for the live dry-run.
+// NOO_IMAGE_SOURCE=legacy (node env) is the per-node escape hatch from the
+// DEFAULT, `rail`. `legacy` is the pre-rail behaviour: a local image is
+// used, an absent one is pulled from its registry. Provenance is still
+// reported, so `noo cluster verify` shows what the rail would change. Unset,
+// empty or unrecognised means rail.
 //
 // The ONLY registry pull in the agent is registryPull below; a guard test
 // (TestNoRegistryPullOutsideTheFallback) fails on any other.
@@ -315,7 +315,7 @@ func (c *Client) resolveLegacy(ctx context.Context, ref string) (string, string,
 	if id, ok := imageLocalID(ctx, c, ref); ok {
 		return imagesource.Local, id, nil
 	}
-	slog.Info("pulling image (legacy image source)", "image", ref, "switch", imagesource.ModeEnv+"=rail takes it from the controller's artifact rail")
+	slog.Info("pulling image (legacy image source)", "image", ref, "switch", "remove "+imagesource.ModeEnv+"=legacy to take it from the controller's artifact rail")
 	if err := imageRegistryPull(ctx, c, ref); err != nil {
 		return "", "", fmt.Errorf("pull image %s: %w", ref, err)
 	}

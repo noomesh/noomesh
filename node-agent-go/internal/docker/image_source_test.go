@@ -241,15 +241,15 @@ func TestTransportFailureRunsTheLocalCopyAndBacksOff(t *testing.T) {
 	}
 }
 
-// NOO_IMAGE_SOURCE=legacy (the default this release): the pre-rail
+// NOO_IMAGE_SOURCE=legacy (the explicit escape hatch): the pre-rail
 // behaviour — local if present, else the registry — with provenance still
 // reported. The rail and the controller are never asked.
 func TestLegacyModeIsThePreRailBehaviour(t *testing.T) {
 	f := &fakeImageRail{local: map[string]string{"ollama/ollama:latest": "sha256:o"}, staged: stagedAt(ownRef, "sha256:new")}
 	f.install(t)
-	t.Setenv(imagesource.ModeEnv, "")
+	t.Setenv(imagesource.ModeEnv, "legacy")
 	if imagesource.Mode() != imagesource.ModeLegacy {
-		t.Fatal("unset must mean legacy for this release")
+		t.Fatal("NOO_IMAGE_SOURCE=legacy must mean legacy")
 	}
 	c := &Client{}
 	if err := c.EnsureImage(context.Background(), ownRef); err != nil {

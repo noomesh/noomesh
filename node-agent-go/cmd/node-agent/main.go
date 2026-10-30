@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"github.com/noomesh/noomesh/node-agent-go/internal/api"
 	"github.com/noomesh/noomesh/node-agent-go/internal/dataroots"
+	"github.com/noomesh/noomesh/node-agent-go/internal/imagesource"
 	"github.com/noomesh/noomesh/node-agent-go/internal/logring"
 	"log/slog"
 	"net/http"
@@ -168,6 +169,7 @@ func main() {
 		slog.NewJSONHandler(api.OwnLog, &slog.HandlerOptions{Level: logLevel()}),
 	)
 	slog.SetDefault(slog.New(handler))
+	imagesource.LogMode()
 
 	// A retired certificate-organization override is a refusal, not a
 	// silently ignored knob: an operator who set one believes it widens or
