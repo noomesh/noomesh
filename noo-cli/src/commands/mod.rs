@@ -21,6 +21,8 @@ pub mod backups;
 pub mod agents;
 pub mod approval;
 pub mod auth;
+pub mod auth_connect;
+pub use auth_connect::auth_connect;
 pub mod autonomy;
 pub mod channels;
 pub mod chat;

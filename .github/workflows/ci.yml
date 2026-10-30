@@ -1020,6 +1020,7 @@ jobs:
       working-directory: gateway-rust
       env:
         NOO_BROKER_TEST_DSN: postgresql://noo:noo@localhost:5432/noomesh
+        NOO_REQUIRE_GOOGLE_REHEARSAL: "1"
         # The model-class storage round trip (coordinator/classes.rs db_tests)
         # is gated the same way and asserts the head revision against this
         # same catalogue.
@@ -1156,6 +1157,7 @@ jobs:
       working-directory: gateway-rust
       env:
         NOO_BROKER_TEST_DSN: postgresql://noo:noo@localhost:5432/noomesh
+        NOO_REQUIRE_GOOGLE_REHEARSAL: "1"
         NOO_ROUTER_HARNESS_REQUIRED: "1"
         SQLX_OFFLINE: "true"
       run: |
@@ -1367,6 +1369,15 @@ jobs:
               | sed -n 's|.*Executable tests/secrets_store.rs (\(.*\))|\1|p')"
         [ -n "$t" ] && [ -x "$t" ] || { echo "::error::could not locate the secrets_store test binary ($t)"; exit 1; }
         NOO_REQUIRE_SOPS=1 NOO_TEST_BIN="$PWD/target/debug/noo" "$t" --test-threads=4
+        # The upgrade's new key must be minted in a real encrypted store,
+        # preserve an existing key and refuse a broken store. The build
+        # container has no sops, so execute this unit on the equipped runner.
+        unit_tests="$(cd .. && CARGO_DOCKER_CRATE="$PWD/noo-cli" scripts/cargo-docker.sh test --locked --no-run --color never --bin noo 2>&1 \
+              | sed -n 's|.*Executable unittests src/main.rs (\(.*\))|\1|p')"
+        [ -n "$unit_tests" ] && [ -x "$unit_tests" ] || { echo "::error::could not locate upgrade test binary"; exit 1; }
+        upgrade_test=commands::upgrade::integration_key_tests::integration_upgrade_key_round_trips_without_rotation_or_plaintext
+        "$unit_tests" --list | grep -Fx -- "${upgrade_test}: test"
+        NOO_REQUIRE_SOPS=1 "$unit_tests" "$upgrade_test" --exact --test-threads=1
 
     - name: Build release binary
       if: needs.scope.outputs.cli == 'true'
@@ -1515,7 +1526,7 @@ jobs:
       run: |
         set -eux
         docker run --rm -v "${PWD}/noo-cli/target/release/noo":/usr/local/bin/noo:ro \
-          ubuntu:24.04 bash -euxc '
+          public.ecr.aws/ubuntu/ubuntu:24.04 bash -euxc '
             # The whole point: prove there is no Python to fall back to.
             ! command -v python3
             ! command -v python
@@ -1542,7 +1553,7 @@ jobs:
       run: |
         set -eux
         docker run --rm -v "${PWD}/noo-cli/target/release/noo":/usr/local/bin/noo:ro \
-          ubuntu:24.04 bash -euxc '
+          public.ecr.aws/ubuntu/ubuntu:24.04 bash -euxc '
             # 3. A bare group: usage error, exit 2.
             set +e
             out="$(noo plugins 2>&1)"

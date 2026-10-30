@@ -736,6 +736,14 @@ pub const CORE_REGISTRY: &[SecretSpec] = &[
         required_when: Requirement::Always,
     },
     SecretSpec {
+        key: "NOO_INTEGRATIONS_KEY",
+        class: Class::ControllerLocal,
+        gen_bytes: 32,
+        consequence: "encrypts connected-account tokens, pending OAuth sessions, private documents and sync cursors; rotating without migration requires every connected account to sign in again and personal content to be re-imported",
+        consumers: &["noo-gateway"],
+        required_when: Requirement::Always,
+    },
+    SecretSpec {
         key: "NOO_AGENT_REVIEW_KEY",
         class: Class::ControllerLocal,
         gen_bytes: 32,
@@ -998,6 +1006,22 @@ pub const CORE_REGISTRY: &[SecretSpec] = &[
             "noo-trellion",
             "noo-trellion-intel",
         ],
+        required_when: Requirement::Optional,
+    },
+    SecretSpec {
+        key: "NOO_GOOGLE_DESKTOP_CLIENT_SECRET",
+        class: Class::ProviderIssued,
+        gen_bytes: 0,
+        consequence: "Google-issued Desktop client parameter for token exchange and refresh; public desktop clients still require PKCE. Pair with this Desktop client ID, never the Web client secret",
+        consumers: &["noo-gateway"],
+        required_when: Requirement::Optional,
+    },
+    SecretSpec {
+        key: "NOO_GOOGLE_OAUTH_CLIENT_SECRET",
+        class: Class::ProviderIssued,
+        gen_bytes: 0,
+        consequence: "Google web OAuth application secret; only needed for browser console connections. Reconnect after changing OAuth applications",
+        consumers: &["noo-gateway"],
         required_when: Requirement::Optional,
     },
     SecretSpec {
@@ -6442,6 +6466,8 @@ mod tests {
                 // The other two cloud providers (rows added 2026-09-29; the
                 // keys were delivered and read long before).
                 "OPENAI_API_KEY",
+                "NOO_GOOGLE_DESKTOP_CLIENT_SECRET",
+                "NOO_GOOGLE_OAUTH_CLIENT_SECRET",
                 "GOOGLE_API_KEY",
                 // The controller's read token for the licensed add-on
                 // packages (i33); only an install running one needs it.
@@ -6762,6 +6788,7 @@ mod tests {
             ("NOO_TRELLION_DB_PASSWORD", "db-password", "auto"),
             ("REDIS_PASSWORD", "shared-service", "auto"),
             ("NOO_JWT_SECRET", "controller-local", "auto"),
+            ("NOO_INTEGRATIONS_KEY", "controller-local", "auto"),
             ("NOO_AGENT_REVIEW_KEY", "controller-local", "auto"),
             ("NOO_CONTROLLER_SECRET", "controller-local", "auto"),
             ("NOO_BUS_KEY_WORKER", "controller-local", "auto"),
@@ -6783,6 +6810,8 @@ mod tests {
             ("NATS_NODE_PASSWORD", "external-tool", "refused"),
             ("ANTHROPIC_API_KEY", "provider-issued", "manual"),
             ("OPENAI_API_KEY", "provider-issued", "manual"),
+            ("NOO_GOOGLE_DESKTOP_CLIENT_SECRET", "provider-issued", "manual"),
+            ("NOO_GOOGLE_OAUTH_CLIENT_SECRET", "provider-issued", "manual"),
             ("GOOGLE_API_KEY", "provider-issued", "manual"),
             ("HF_TOKEN", "provider-issued", "manual"),
             ("TELEGRAM_BOT_TOKEN", "provider-issued", "manual"),
@@ -6825,6 +6854,7 @@ mod tests {
                 "NOO_TRELLION_DB_PASSWORD",
                 "REDIS_PASSWORD",
                 "NOO_JWT_SECRET",
+                "NOO_INTEGRATIONS_KEY",
                 "NOO_AGENT_REVIEW_KEY",
                 "NOO_CONTROLLER_SECRET",
                 // The per-audience bus keys. Generated

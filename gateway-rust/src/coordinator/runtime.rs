@@ -270,6 +270,8 @@ impl HarnessRuntime for InProcessRuntime<'_> {
     }
 
     async fn rag_context(&self, prompt: &str, user_id: Option<&str>) -> Option<String> {
+        // Personal Google content must not enter transcripts whose existing
+        // operator/export permissions are broader than the corpus owner.
         super::context::fetch_rag_context(&self.state.nats, prompt, user_id).await
     }
 

@@ -2168,11 +2168,64 @@ ALTER TABLE noo_embedding_spaces
     // `migration_dsn`). Idempotent. Created in `public` on purpose: the
     // view is read by operators, not by the mesh schema.
     sql: "CREATE EXTENSION IF NOT EXISTS pg_stat_statements SCHEMA public",
+}, Migration {
+    revision: CONNECTIONS_REVISION,
+    down_revision: Some(PG_STAT_STATEMENTS_REVISION),
+    sql: r#"
+CREATE TABLE noo_connected_accounts (
+    id uuid PRIMARY KEY,
+    owner_uuid uuid NOT NULL REFERENCES noo_users(user_uuid) ON DELETE CASCADE,
+    provider text NOT NULL CHECK (provider = 'google'),
+    label text NOT NULL CHECK (length(btrim(label)) BETWEEN 1 AND 100),
+    email_hint text CHECK (length(email_hint) <= 254),
+    status text NOT NULL DEFAULT 'needs_auth' CHECK (status = 'needs_auth'),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (id, owner_uuid)
+);
+CREATE INDEX ix_connected_accounts_owner ON noo_connected_accounts(owner_uuid);
+CREATE TABLE noo_connection_sources (
+    id uuid PRIMARY KEY,
+    owner_uuid uuid NOT NULL REFERENCES noo_users(user_uuid) ON DELETE CASCADE,
+    account_id uuid NOT NULL,
+    name text NOT NULL CHECK (length(btrim(name)) BETWEEN 1 AND 100),
+    kind text NOT NULL CHECK (kind IN ('google_drive', 'gmail')),
+    policy jsonb NOT NULL CHECK (jsonb_typeof(policy) = 'object' AND policy->>'kind' IS NOT NULL AND policy->>'kind' = kind),
+    status text NOT NULL DEFAULT 'draft' CHECK (status = 'draft'),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    FOREIGN KEY (account_id, owner_uuid) REFERENCES noo_connected_accounts(id, owner_uuid) ON DELETE CASCADE
+);
+CREATE INDEX ix_connection_sources_owner ON noo_connection_sources(owner_uuid);
+CREATE INDEX ix_connection_sources_account ON noo_connection_sources(account_id, owner_uuid);
+"#,
+}, Migration {
+    revision: INTEGRATION_OAUTH_REVISION,
+    down_revision: Some(CONNECTIONS_REVISION),
+    sql: include_str!("integrations/schema.sql"),
+}, Migration {
+    revision: INTEGRATION_PAIRING_REVISION,
+    down_revision: Some(INTEGRATION_OAUTH_REVISION),
+    sql: include_str!("integrations/pairing.sql"),
+}, Migration {
+    revision: INTEGRATION_CONTENT_REVISION,
+    down_revision: Some(INTEGRATION_PAIRING_REVISION),
+    sql: include_str!("integrations/content.sql"),
+}, Migration {
+    revision: INTEGRATION_PACING_REVISION,
+    down_revision: Some(INTEGRATION_CONTENT_REVISION),
+    sql: "ALTER TABLE noo_integration_sync ADD COLUMN last_gmail_scan timestamptz, ADD COLUMN last_gmail_page timestamptz; CREATE INDEX integration_sync_owner_pacing ON noo_integration_sync(owner_uuid)",
 }];
+
+pub const CONNECTIONS_REVISION: &str = "104_connection_drafts";
+pub const INTEGRATION_OAUTH_REVISION: &str = "105_integration_oauth";
+pub const INTEGRATION_PAIRING_REVISION: &str = "106_integration_pairing";
+pub const INTEGRATION_CONTENT_REVISION: &str = "107_integration_content";
+pub const INTEGRATION_PACING_REVISION: &str = "108_integration_pacing";
+
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
 pub const PG_STAT_STATEMENTS_REVISION: &str = "103_pg_stat_statements";
+
 
 /// The embedding-space migration revision (i150). A constant so a renumber
 /// at rebase is one line.
@@ -3072,15 +3125,14 @@ mod tests {
             .contains("(node_id, backend, role, (CASE WHEN role = 'embed' THEN model ELSE '' END))"));
     }
 
-    /// The pg_stat_statements revision is the chain head, sits on 102, and is
+    /// The pg_stat_statements revision follows 102 and is
     /// idempotent DDL.
     #[test]
-    fn pg_stat_statements_revision_is_the_head_and_idempotent() {
+    fn pg_stat_statements_revision_is_ordered_and_idempotent() {
         let m = MIGRATIONS.iter().find(|m| m.revision == PG_STAT_STATEMENTS_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "103_pg_stat_statements");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(EMBEDDING_SPACE_MIGRATION_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(PG_STAT_STATEMENTS_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE EXTENSION IF NOT EXISTS pg_stat_statements"));
     }
 
@@ -3092,6 +3144,7 @@ mod tests {
         assert_eq!(m.revision, "102_embedding_space_migration");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(EMBED_PLACEMENT_MODEL_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(INTEGRATION_PACING_REVISION), "the chain head");
         for col in [
             "next_model text", "next_dims integer", "migration_state text", "migration_progress jsonb",
             "migration_started_at timestamptz", "migration_reported_at timestamptz",

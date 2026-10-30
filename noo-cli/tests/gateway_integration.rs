@@ -226,6 +226,25 @@ fn gw(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+#[test]
+fn rag_query_includes_personal_sources_only_with_explicit_cli_opt_in() {
+    for personal in [false, true] {
+        let mock = Mock::start(200, "OK", "application/json", r#"{"answer":"Shared answer","citations":[]}"#, 1);
+        let url = gw(mock.port);
+        let mut argv = vec!["--gateway", &url, "--json", "rag", "query", "apricot"];
+        if personal { argv.push("--personal"); }
+        let out = run(&argv, &[]);
+        assert!(out.status.success(), "query failed: {}", String::from_utf8_lossy(&out.stderr));
+        let requests = mock.requests();
+        let request = requests.first().expect("one request");
+        assert!(request.starts_with("POST /api/v1/rag/query"));
+        let body: serde_json::Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["question"], "apricot");
+        if personal { assert_eq!(body["include_personal"], true); }
+        else { assert!(body.get("include_personal").is_none()); }
+    }
+}
+
 /// The per-command case helper: mock one gateway route (`method` + `path` →
 /// `status` + JSON `body`), run the binary with `args`, assert the exit code
 /// AND that the request actually hit the route, then return stdout for

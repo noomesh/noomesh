@@ -63,6 +63,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub watched_drives: WatchedDrivesConfig,
     #[serde(default)]
+    pub integrations: crate::integrations::IntegrationConfig,
+    #[serde(default)]
     pub services: ServicesConfig,
     #[serde(default)]
     pub worker: WorkerConfig,

@@ -2290,6 +2290,7 @@ pub fn is_handler_authenticated(path: &str) -> bool {
 /// `/`, so prefix-match would let everything through. Same for the
 /// dashboard shell URLs that don't have a trailing slash.
 pub const PUBLIC_PATHS_EXACT: &[&str] = &[
+    "/api/connections/oauth/callback",
     // The PUBLIC half of the API spec — the ~31 endpoints reachable without a
     // credential, derived from these very lists by
     // `scripts/gen-public-openapi.py`. An OAuth client reading
@@ -2865,6 +2866,11 @@ fn scope_allows_for(scopes: &[String], role: Role, method: &axum::http::Method, 
     if path == WALKS_SETTINGS_PATH {
         return true;
     }
+    // Account/source drafts only. Handlers pin ownership to the signed-in
+    // account, including for operators; arbitrary descendants stay closed.
+    if crate::connections::user_write_allowed(method, path) {
+        return true;
+    }
     // The asynchronous-operations API (`routes/ops.rs`). Open to every tier
     // because it decides for itself, per request: starting an op asks
     // `requester_allows` about the OPERATION'S OWN route (so a User gets
@@ -2960,6 +2966,7 @@ pub const USER_READ_PATHS: &[&str] = &[
     "/api/alerts/clients",
     "/api/approval/stats",
     "/api/channels/status",
+    "/api/connections",
     "/api/coordinator/context",
     "/api/memory/health",
     "/api/memory/status",
@@ -3041,7 +3048,7 @@ pub fn user_may_read(path: &str) -> bool {
     {
         return false;
     }
-    USER_READ_PATHS.contains(&path)
+    crate::connections::user_read_allowed(path) || USER_READ_PATHS.contains(&path)
         || USER_READ_PREFIXES.iter().any(|p| {
             // `/x/` prefixes match by starts_with; a bare `/x` entry matches
             // `/x` and `/x/...` only (a directory, not a stem).

@@ -1093,9 +1093,8 @@ fn err_result(call: &ToolCall, error: String) -> ToolResult {
     }
 }
 
-/// `noo_rag_query` — publish straight to `worker.rag.query` (the same
-/// trellion handler `POST /api/v1/rag/query` delegates to). The Python tool
-/// shim added nothing but the HTTP hop; RAG itself stays on the ML plane.
+/// `noo_rag_query` uses the shared memory facade. Model tools never forward
+/// the human-only personal opt-in; explicit HTTP/CLI reads own that choice.
 async fn native_rag_query(state: &AppState, call: &ToolCall, args: &Value) -> ToolResult {
     let question = match arg_str(args, &["question", "query"]) {
         Some(q) => q,
@@ -1109,7 +1108,7 @@ async fn native_rag_query(state: &AppState, call: &ToolCall, args: &Value) -> To
         request["roles"] = roles.clone();
     }
 
-    match crate::trellion_client::TrellionClient::new(&state.nats).call_raw_with_timeout(crate::trellion_client::subjects::RAG_QUERY, request, tool_timeout()).await {
+    match state.memory().kb_query_with_timeout(&request, tool_timeout()).await {
         Ok(response) => {
             let data = response.get("data").cloned().unwrap_or(response);
             if let Some(e) = data.get("error").and_then(|e| e.as_str()) {

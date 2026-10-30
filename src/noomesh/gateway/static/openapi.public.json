@@ -1058,6 +1058,29 @@
           }
         }
       }
+    },
+    "/api/connections/oauth/callback": {
+      "get": {
+        "operationId": "connection_oauth_callback",
+        "tags": [
+          "Connections"
+        ],
+        "summary": "Return authorization response to the originating Noomesh window",
+        "description": "Static landing page only; no credentials exchanged or database changes.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "No-store HTML return page",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1185,6 +1208,767 @@
           "expires_at": {
             "type": "string",
             "format": "date-time"
+          }
+        }
+      },
+      "ConnectionAccountDraft": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "email_hint": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 254
+          }
+        },
+        "required": [
+          "label"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionDrivePolicy": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "google_drive"
+            ]
+          },
+          "exposure": {
+            "type": "string",
+            "enum": [
+              "selected_folders",
+              "selected_drive",
+              "all_accessible"
+            ]
+          },
+          "folder_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            },
+            "maxItems": 100,
+            "uniqueItems": true
+          },
+          "drive_id": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "kind",
+          "exposure"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionGmailPolicy": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "gmail"
+            ]
+          },
+          "exposure": {
+            "type": "string",
+            "enum": [
+              "selected_labels",
+              "mailbox"
+            ]
+          },
+          "label_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            },
+            "maxItems": 100,
+            "uniqueItems": true
+          },
+          "lookback_days": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3650,
+            "default": 30
+          }
+        },
+        "required": [
+          "kind",
+          "exposure"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionSourcePolicy": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ConnectionDrivePolicy"
+          },
+          {
+            "$ref": "#/components/schemas/ConnectionGmailPolicy"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "kind",
+          "mapping": {
+            "google_drive": "#/components/schemas/ConnectionDrivePolicy",
+            "gmail": "#/components/schemas/ConnectionGmailPolicy"
+          }
+        }
+      },
+      "ConnectionAccount": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "provider": {
+            "type": "string",
+            "enum": [
+              "google"
+            ]
+          },
+          "label": {
+            "type": "string"
+          },
+          "email_hint": {
+            "type": "string",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "needs_auth",
+              "connected",
+              "reauth_required",
+              "disconnected"
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "email": {
+            "type": "string",
+            "nullable": true
+          },
+          "granted_scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "provider",
+          "label",
+          "email_hint",
+          "status",
+          "created_at"
+        ]
+      },
+      "ConnectionSourceDraft": {
+        "type": "object",
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "policy": {
+            "$ref": "#/components/schemas/ConnectionSourcePolicy"
+          }
+        },
+        "required": [
+          "account_id",
+          "name",
+          "policy"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionSource": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/ConnectionSourcePolicy"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft"
+            ]
+          },
+          "visibility": {
+            "type": "string",
+            "enum": [
+              "private"
+            ]
+          },
+          "access": {
+            "type": "string",
+            "enum": [
+              "read_only"
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "sync_enabled": {
+            "type": "boolean"
+          },
+          "sync_status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "queued",
+              "syncing",
+              "idle",
+              "paused",
+              "error"
+            ]
+          },
+          "sync_fault": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "provider",
+              "reauth",
+              "limit",
+              "storage",
+              null
+            ]
+          },
+          "imported": {
+            "type": "integer"
+          },
+          "skipped": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "account_id",
+          "name",
+          "policy",
+          "status",
+          "visibility",
+          "access",
+          "created_at"
+        ]
+      },
+      "ConnectionProvider": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "enum": [
+              "google"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "services": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "google_drive",
+                "gmail"
+              ]
+            }
+          },
+          "authorization_available": {
+            "type": "boolean"
+          },
+          "authorization_detail": {
+            "type": "string"
+          },
+          "desktop_authorization_available": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "services",
+          "authorization_available",
+          "authorization_detail"
+        ]
+      },
+      "ConnectionsResponse": {
+        "type": "object",
+        "properties": {
+          "accounts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConnectionAccount"
+            }
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConnectionSource"
+            }
+          },
+          "providers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConnectionProvider"
+            }
+          }
+        },
+        "required": [
+          "accounts",
+          "sources",
+          "providers"
+        ]
+      },
+      "ConnectionDraftSaved": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "needs_auth",
+              "draft"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "status"
+        ]
+      },
+      "ConnectionDraftRemoved": {
+        "type": "object",
+        "properties": {
+          "removed": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          }
+        },
+        "required": [
+          "removed"
+        ]
+      },
+      "ConnectionOAuthStart": {
+        "type": "object",
+        "properties": {
+          "provider": {
+            "type": "string",
+            "enum": [
+              "google"
+            ]
+          },
+          "services": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "google_drive",
+                "gmail"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 2,
+            "uniqueItems": true
+          },
+          "client_kind": {
+            "type": "string",
+            "enum": [
+              "web",
+              "desktop"
+            ]
+          },
+          "redirect_uri": {
+            "type": "string"
+          },
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "provider",
+          "services",
+          "client_kind"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionOAuthSession": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "completion_token": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "authorization_url": {
+            "type": "string"
+          },
+          "expires_in": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id",
+          "completion_token",
+          "state",
+          "authorization_url",
+          "expires_in"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionOAuthComplete": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "completion_token": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "completion_token",
+          "state",
+          "code"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionOAuthCancel": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionOAuthConnected": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "connected"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "status"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionOAuthCancelled": {
+        "type": "object",
+        "properties": {
+          "cancelled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "cancelled"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionResources": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "name"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "next_page_token": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "next_page_token"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionPairingStart": {
+        "type": "object",
+        "properties": {
+          "provider": {
+            "type": "string",
+            "enum": [
+              "google"
+            ]
+          },
+          "services": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "google_drive",
+                "gmail"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 2,
+            "uniqueItems": true
+          },
+          "device_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          }
+        },
+        "required": [
+          "provider",
+          "services",
+          "device_name"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionPairingCode": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "maxLength": 32
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionPairingSession": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "verification_uri": {
+            "type": "string"
+          },
+          "expires_in": {
+            "type": "integer"
+          },
+          "interval": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "verification_uri",
+          "expires_in",
+          "interval"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionPairingPreview": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "services": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "device_name": {
+            "type": "string"
+          },
+          "expires_in": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "provider",
+          "services",
+          "device_name",
+          "expires_in"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionPairingStatus": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "authorizing",
+              "connected",
+              "cancelled",
+              "expired"
+            ]
+          },
+          "account_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "status",
+          "account_id"
+        ],
+        "additionalProperties": false
+      },
+      "ConnectionSyncRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ConnectionContentSearch": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "query"
+        ],
+        "properties": {
+          "query": {
+            "type": "string",
+            "maxLength": 2000
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 20
+          }
+        }
+      },
+      "ConnectionPersonalEvidence": {
+        "type": "object",
+        "required": [
+          "items",
+          "truncated"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "source_id",
+                "title",
+                "url",
+                "text"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "source_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "truncated": {
+            "type": "boolean"
           }
         }
       }

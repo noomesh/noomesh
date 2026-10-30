@@ -32,7 +32,7 @@
 //!   3. `preflight_db_compat` (the target must run on the DB it will meet),
 //!      `preflight_service_keys`, `refuse_unlocked_dist_roll`,
 //!      `addon_preflight` — still nothing moves.
-//!   4. mint what the release needs: `mint_audit_key`, `mint_bus_keys`,
+//!   4. mint what the release needs: `mint_audit_key`, `mint_integration_key`, `mint_bus_keys`,
 //!      `mint_system_credentials`, `issue_pg_role_leaves`,
 //!      `retire_legacy_addon_leaves`, `warn_door_node_id`.
 //!   5. prepare and pin: `migrate_retired_yaml_gates`,
@@ -1073,6 +1073,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
 
     // Mint what this release needs, before anything moves.
     mint_audit_key(g, &roll);
+    mint_integration_key(g, &roll);
     mint_bus_keys(g, &roll);
     mint_system_credentials(g, &roll);
     issue_pg_role_leaves(g);
@@ -1405,6 +1406,23 @@ fn mint_audit_key(g: &Globals, roll: &Roll) {
                 &format!("could not mint NOO_AUDIT_HMAC_KEY into the encrypted store: {e} — nothing was changed"),
                 Some("noo security secrets audit   # then re-run: noo upgrade --stack"));
         }
+    }
+}
+
+/// Provision the private-corpus encryption key before the new gateway starts.
+/// Existing keys protect user data and must never be replaced during a roll.
+fn mint_integration_key(g: &Globals, roll: &Roll) {
+    match reconcile_integration_key(&roll.root) {
+        Ok(AuditKeyStage::AlreadyPresent) => {}
+        Ok(AuditKeyStage::Minted) => if !g.json {
+            ui::done("minted NOO_INTEGRATIONS_KEY into the encrypted store (private connected-account data)");
+        },
+        Err(AuditKeyRefusal::NoStore) => fail(g.json, ExitCode::Generic, "integration_key_no_store",
+            "No encrypted secrets/env.sops store for NOO_INTEGRATIONS_KEY; the key is never written to plaintext .env",
+            Some("noo onboard --reconfigure --only secrets --secrets-backend sops   # then re-run: noo upgrade --stack")),
+        Err(AuditKeyRefusal::Store(e)) => fail(g.json, ExitCode::Generic, "integration_key_mint_failed",
+            &format!("could not provision NOO_INTEGRATIONS_KEY in the encrypted store: {e}"),
+            Some("noo security secrets audit   # then re-run: noo upgrade --stack")),
     }
 }
 
@@ -1786,6 +1804,10 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
 /// install and by [`reconcile_audit_key`] on an upgraded one.
 pub(crate) const AUDIT_KEY: &str = "NOO_AUDIT_HMAC_KEY";
 
+#[cfg(all(test, unix))]
+#[path = "upgrade_integration_key_tests.rs"]
+mod integration_key_tests;
+
 /// What the stage did — the one line it prints. Never carries the value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AuditKeyStage {
@@ -1835,6 +1857,28 @@ fn reconcile_audit_key(root: &std::path::Path) -> Result<AuditKeyStage, AuditKey
         || crate::commands::secrets::mint_missing(&[AUDIT_KEY], &sops).map(|_| ()),
     )
     .map_err(AuditKeyRefusal::Store)
+}
+
+fn reconcile_integration_key(root: &std::path::Path) -> Result<AuditKeyStage, AuditKeyRefusal> {
+    let path = root.join("secrets/env.sops");
+    if !path.is_file() {
+        return Err(AuditKeyRefusal::NoStore);
+    }
+    const KEY: &str = "NOO_INTEGRATIONS_KEY";
+    let store = crate::commands::secrets::SecretStore::load_sops(&path)
+        .map_err(AuditKeyRefusal::Store)?;
+    match store.state(KEY) {
+        crate::commands::secrets::State::Set => Ok(AuditKeyStage::AlreadyPresent),
+        // A blank existing key is a broken configuration, not permission to
+        // rotate away the key that might protect existing ciphertext.
+        crate::commands::secrets::State::Blank => Err(AuditKeyRefusal::Store(
+            "NOO_INTEGRATIONS_KEY is blank; restore the original encryption key before upgrading".into())),
+        crate::commands::secrets::State::Missing => {
+            crate::commands::secrets::mint_missing(&[KEY], &path)
+                .map_err(AuditKeyRefusal::Store)?;
+            Ok(AuditKeyStage::Minted)
+        }
+    }
 }
 
 /// Before `noo stack start|restart|rebuild` hands the stack to the launcher:
@@ -5094,6 +5138,16 @@ mod tests {
             assert!(mint < at(later), "the audit key must be minted before `{later}`");
         }
         assert!(super::phase_src::body("mint_audit_key").contains("reconcile_audit_key(root)"), "the phase mints the audit key");
+    }
+
+    #[test]
+    fn integration_key_provisioning_precedes_the_new_gateway_and_pin() {
+        let list = super::phase_src::list();
+        let mint = list.find("mint_integration_key(")
+            .expect("an upgrade must provision the new required integration key");
+        for later in ["refresh_deploy_slice(", "move_pin(", "launch_stack("] {
+            assert!(mint < list.find(later).unwrap(), "key provisioning must precede {later}");
+        }
     }
 
     #[test]

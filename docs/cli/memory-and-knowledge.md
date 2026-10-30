@@ -297,7 +297,7 @@ see [add-ons.md](../getting-started/add-ons.md).
 ### `noo rag` — PageIndex RAG commands
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo rag query` | `<question> [-s\|--strategy <strategy>] [-p\|--persona <persona-id>]` | Ask the PageIndex RAG a question and print answer, verification and citations |
+| `noo rag query` | `<question> [-s\|--strategy <strategy>] [-p\|--persona <persona-id>] [--personal]` | Ask the KB; --personal explicitly includes your Google sources for a human login |
 | `noo rag status` | — | Show PageIndex RAG table counts and embedder state |
 | `noo rag docs` | `[--untagged] [--audience <role>] [--match <glob>] [--title <text>] [--limit <n>]` | List every document with audience, source and who ingested it; filterable |
 | `noo rag doc` | `<id>` | Show one document: audience, provenance, audience history and a text preview |
