@@ -179,11 +179,10 @@ pub const BUNDLE_ROUTES_DIR: &str = "/opt/noo/addon-bundle-routes";
 pub const ROUTES_DIR: &str = "/opt/noo/addon-routes";
 // The manifest's types and every rule that refuses one live in the
 // `addon-manifest` crate, shared with `noo addons check` (noomesh-internal
-// i302); re-exported here so gateway code names them as before.
-pub use addon_manifest::{
-    is_write_method, ws_prefix, AddonManifest, RouteSpec, TaskEventsSpec, UiSpec, CALLED_BY_NAME,
-    DELEGATE_TASKS, HTTP_METHODS, METHOD_WS, RESERVED_PREFIXES, ROUTES_FILE,
-};
+// i302). The ones gateway code names through this module are re-exported
+// here; the gateway is a binary, so an unused `pub use` fails clippy, and
+// anything else is named as `addon_manifest::…` where it is used.
+pub use addon_manifest::{AddonManifest, RouteSpec, TaskEventsSpec, UiSpec, DELEGATE_TASKS, METHOD_WS, ROUTES_FILE};
 pub(crate) use addon_manifest::container_of;
 use addon_manifest::{pattern_matches, ManifestRole};
 
