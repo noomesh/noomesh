@@ -952,6 +952,9 @@ require_compose_v2 || exit 1
     # exits $NOO_EXIT_STACK_PARTIAL (75) after the guard below has run.
     noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d --force-recreate $BUILD_FLAG $GPU_SCALE $AGENT_SCALE $ADDON_HOLD_SCALE || _up_rc=$?
     if [ "${_up_rc:-0}" -ne 0 ] && [ "${_up_rc:-0}" -ne "$NOO_EXIT_STACK_PARTIAL" ]; then exit "$_up_rc"; fi
+    # Report, never reap: a container no compose file of this install declares
+    # (186b). Exit status unchanged; `--remove-orphans` is not passed to any `up`.
+    compose_report_undeclared .
     # $ACTIVE_SVCS (computed above) is the service set THIS invocation
     # manages — tell the guard so a stale, out-of-profile Created
     # container (e.g. noo-ollama left by an earlier `noo models switch`

@@ -625,50 +625,13 @@ pub fn doctor_orphans(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         return Err(Unhandled);
     }
 
-    let daemon_ok = Command::new("docker")
-        .args(["version", "--format", "{{.Server.Version}}"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !daemon_ok {
+    if !docker_daemon_up() {
         fail(g.json, ExitCode::Generic, "daemon_down",
             "the docker daemon is not answering",
             Some("sudo systemctl start docker — then re-run noo doctor orphans"));
     }
 
-    let fmt = concat!(
-        r#"{{.Names}}	{{.Label "com.docker.compose.project"}}	"#,
-        r#"{{.Label "com.docker.compose.service"}}	"#,
-        r#"{{.Label "com.docker.compose.project.config_files"}}	"#,
-        r#"{{.Label "com.docker.compose.project.working_dir"}}	"#,
-        r#"{{.Image}}	{{.Status}}"#,
-    );
-    let running: Vec<ComposeContainer> = docker_lines(&["ps", "--format", fmt])
-        .iter()
-        .filter_map(|l| parse_ps_row(l))
-        .collect();
-
-    let mut by_project: std::collections::BTreeMap<String, Vec<ComposeContainer>> =
-        std::collections::BTreeMap::new();
-    for c in running {
-        by_project.entry(c.project.clone()).or_default().push(c);
-    }
-    by_project.retain(|_, v| is_ours(v));
-
-    let mut found: Vec<ComposeContainer> = Vec::new();
-    let mut unreadable: Vec<(String, String)> = Vec::new();
-
-    for (project, containers) in &by_project {
-        match declared_services(project, containers) {
-            Ok(declared) => {
-                found.extend(orphans_of(containers, &declared).into_iter().cloned())
-            }
-            // A project whose projection we could not compute is NOT a project
-            // with no orphans. R45's lesson: "0 found" from a lookup that never
-            // happened is a clean bill of health for a fleet nobody looked at.
-            Err(why) => unreadable.push((project.clone(), why)),
-        }
-    }
+    let OrphanScan { by_project, found, unreadable } = scan_orphans();
 
     if g.json {
         println!("{}", serde_json::json!({
@@ -730,39 +693,137 @@ pub fn doctor_orphans(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(1)
 }
 
+/// Is the docker daemon answering?
+pub(crate) fn docker_daemon_up() -> bool {
+    Command::new("docker")
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// What one pass over the running compose containers found.
+pub(crate) struct OrphanScan {
+    pub by_project: std::collections::BTreeMap<String, Vec<ComposeContainer>>,
+    pub found: Vec<ComposeContainer>,
+    /// Projects whose projection could not be computed, with why. NOT clean.
+    pub unreadable: Vec<(String, String)>,
+}
+
+/// The one computation behind `noo doctor orphans` and the `undeclared
+/// containers` row of `noo cluster verify --controller`. Assumes the daemon
+/// answers (callers check [`docker_daemon_up`] first and say so their way).
+pub(crate) fn scan_orphans() -> OrphanScan {
+    let fmt = concat!(
+        r#"{{.Names}}	{{.Label "com.docker.compose.project"}}	"#,
+        r#"{{.Label "com.docker.compose.service"}}	"#,
+        r#"{{.Label "com.docker.compose.project.config_files"}}	"#,
+        r#"{{.Label "com.docker.compose.project.working_dir"}}	"#,
+        r#"{{.Image}}	{{.Status}}"#,
+    );
+    let running: Vec<ComposeContainer> = docker_lines(&["ps", "--format", fmt])
+        .iter()
+        .filter_map(|l| parse_ps_row(l))
+        .collect();
+
+    let mut by_project: std::collections::BTreeMap<String, Vec<ComposeContainer>> =
+        std::collections::BTreeMap::new();
+    for c in running {
+        by_project.entry(c.project.clone()).or_default().push(c);
+    }
+    by_project.retain(|_, v| is_ours(v));
+
+    let mut found: Vec<ComposeContainer> = Vec::new();
+    let mut unreadable: Vec<(String, String)> = Vec::new();
+    for (project, containers) in &by_project {
+        match declared_services(project, containers) {
+            Ok(declared) => {
+                found.extend(orphans_of(containers, &declared).into_iter().cloned())
+            }
+            // A project whose projection we could not compute is NOT a project
+            // with no orphans. R45's lesson: "0 found" from a lookup that never
+            // happened is a clean bill of health for a fleet nobody looked at.
+            Err(why) => unreadable.push((project.clone(), why)),
+        }
+    }
+    OrphanScan { by_project, found, unreadable }
+}
+
+/// The compose files whose union decides what is "declared" for a project.
+///
+/// `labels` is each container's `com.docker.compose.project.config_files`
+/// value; `install` is this install's own list (`compose_file_list`). The
+/// result is: the install's files in their order, then every label file that
+/// `exists` and is not already there. Containers created by different `up`s
+/// carry different lists (an add-on's own `up` names its overlay, the core's
+/// does not), and the old "first container with a label" rule made the verdict
+/// depend on `docker ps` order. Distinct label lists are therefore sorted
+/// (longest first, then text) before they contribute, so the answer is the
+/// same for any container order.
+pub(crate) fn declared_files(
+    labels: &[&str],
+    install: &[String],
+    exists: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut lists: Vec<Vec<String>> = labels
+        .iter()
+        .map(|l| l.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>())
+        .filter(|v| !v.is_empty())
+        .collect();
+    lists.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    lists.dedup();
+    let mut out: Vec<String> = Vec::new();
+    for f in install.iter().chain(lists.iter().flatten()) {
+        if !out.contains(f) && (install.contains(f) || exists(f)) {
+            out.push(f.clone());
+        }
+    }
+    out
+}
+
 /// Every service the project's compose files declare, across EVERY profile.
 ///
 /// Two flags carry the whole correctness argument. `--project-directory` makes
 /// relative paths and `.env` resolve the way they did at `up` time, and the
 /// `--profile` fan-out (from `config --profiles`) is what stops a
-/// profile-gated service reading as undeclared.
+/// profile-gated service reading as undeclared. The files are the union
+/// [`declared_files`] describes, never one container's label alone.
 fn declared_services(
     project: &str,
     containers: &[ComposeContainer],
 ) -> Result<std::collections::BTreeSet<String>, String> {
-    let c = containers
-        .iter()
-        .find(|c| !c.config_files.is_empty())
-        .ok_or_else(|| "no container carries a config_files label".to_string())?;
-    let files: Vec<&str> = c.config_files.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let labels: Vec<&str> = containers.iter().map(|c| c.config_files.as_str()).collect();
+    // The install's own list belongs to the install's project: when
+    // COMPOSE_PROJECT_NAME names another one, do not blend it in.
+    let install: Vec<String> = match std::env::var("COMPOSE_PROJECT_NAME") {
+        Ok(p) if !p.is_empty() && p != project => Vec::new(),
+        _ => crate::onboard::sh::install_compose_files(&crate::envfile::repo_root())
+            .into_iter()
+            .filter(|f| std::path::Path::new(f).is_file())
+            .collect(),
+    };
+    let files = declared_files(&labels, &install, &|f| std::path::Path::new(f).is_file());
     if files.is_empty() {
-        return Err("the config_files label is empty".into());
+        return Err("no compose file of this project is on this box (the config_files labels name none that exist)".into());
     }
-    for f in &files {
-        if !std::path::Path::new(f).is_file() {
-            return Err(format!("compose file {f} is gone from this box"));
-        }
-    }
+    // Deterministic whichever container docker listed first.
+    let working_dir = containers
+        .iter()
+        .map(|c| c.working_dir.as_str())
+        .filter(|w| !w.is_empty())
+        .min()
+        .unwrap_or("")
+        .to_string();
 
     let base = |extra: &[&str]| -> Vec<String> {
         let mut a: Vec<String> = vec!["compose".into(), "--project-name".into(), project.into()];
-        if !c.working_dir.is_empty() {
+        if !working_dir.is_empty() {
             a.push("--project-directory".into());
-            a.push(c.working_dir.clone());
+            a.push(working_dir.clone());
         }
         for f in &files {
             a.push("-f".into());
-            a.push((*f).to_string());
+            a.push(f.clone());
         }
         a.extend(extra.iter().map(|s| (*s).to_string()));
         a
@@ -853,6 +914,34 @@ mod orphan_tests {
             orphans_of(&running, &declared).is_empty(),
             "a profile-gated service is declared even when its profile is off"
         );
+    }
+
+    /// The orphan verdict must not depend on which container docker lists
+    /// first. An add-on's own `up` stamps its overlay on ITS containers; the
+    /// old code read the first labelled container only. Fails on that code:
+    /// the overlay file was in or out of the set by order alone.
+    #[test]
+    fn declared_files_do_not_depend_on_container_order() {
+        let core = "/o/base.yml,/o/override.yml";
+        let addon = "/o/base.yml,/o/override.yml,/o/addon.yml";
+        let exists = |_: &str| true;
+        let a = declared_files(&[core, addon], &[], &exists);
+        let b = declared_files(&[addon, core], &[], &exists);
+        assert_eq!(a, b);
+        assert_eq!(a, vec!["/o/base.yml", "/o/override.yml", "/o/addon.yml"]);
+    }
+
+    #[test]
+    fn declared_files_union_the_install_list_and_skip_gone_label_files() {
+        let install = vec!["/o/base.yml".to_string(), "/o/gpu.yml".to_string()];
+        let exists = |f: &str| f != "/o/gone.yml";
+        let got = declared_files(&["/o/base.yml,/o/gone.yml,/o/addon.yml", ""], &install, &exists);
+        assert_eq!(got, vec!["/o/base.yml", "/o/gpu.yml", "/o/addon.yml"]);
+    }
+
+    #[test]
+    fn no_labels_and_no_install_list_declares_nothing() {
+        assert!(declared_files(&["", " "], &[], &|_| true).is_empty());
     }
 
     #[test]

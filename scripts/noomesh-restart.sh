@@ -290,6 +290,9 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
         check_bind_sources --no-deps $ACTIVE_SVCS || exit 1
         noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d --no-build --force-recreate $GPU_SCALE $AGENT_SCALE $ADDON_HOLD_SCALE || _up_rc=$?
         if [ "${_up_rc:-0}" -ne 0 ] && [ "${_up_rc:-0}" -ne "$NOO_EXIT_STACK_PARTIAL" ]; then exit "$_up_rc"; fi
+        # Report, never reap: a container no compose file of this install declares
+        # (186b). Exit status unchanged; `--remove-orphans` is not passed to any `up`.
+        compose_report_undeclared .
         # The guard only heals services this invocation manages; a Created
         # container outside that set (a stale leftover, or the scaled-out
         # exporter) is removed, not started.

@@ -688,6 +688,9 @@ if [ "$START_STACK" = true ]; then
     echo "Ensuring all services are running..."
     check_bind_sources --skip node-agent || exit 1
     docker compose $COMPOSE_FILES $PROFILE_ARGS up -d --scale node-agent=0 $ADDON_HOLD_SCALE
+    # Report, never reap: a container no compose file of this install declares
+    # (186b). Exit status unchanged; `--remove-orphans` is not passed to any `up`.
+    compose_report_undeclared .
 
     # Pre-pull Ollama inference model if Ollama is running
     if docker ps --format '{{.Names}}' | grep -q '^noo-ollama$'; then

@@ -119,6 +119,47 @@ compose_file_args() {
     printf '%s' "${_cfa# }"
 }
 
+# ── Report (never reap) containers no compose file of this install declares ─
+#
+# `up` does not stop a container whose service was deleted from the compose
+# files (noo-cluster-executor ran two days after #98), and `up --remove-orphans`
+# is NEVER the answer: compose computes orphans against the services and
+# profiles of THAT invocation, and every call shape we have hands it a partial
+# picture (targeted services, profile set, add-on overlays that come and go).
+# So after a whole-stack `up` the launcher only SAYS what is left over:
+#
+#   ! <name> is not declared by any compose file of this install: docker rm -f <name>
+#
+# Declared = a service in $COMPOSE_FILES evaluated with --profile '*' (every
+# profile counts). Project = COMPOSE_PROJECT_NAME, else the cluster file's
+# name:, else noomesh (the pattern bootRestoreScript uses). Containers with
+# no com.docker.compose.service label (agent-managed backends) are never
+# candidates. Exit status is unchanged: this always returns 0, and when it
+# cannot compare it says so rather than reading as clean.
+compose_report_undeclared() {
+    _cru_proj="${COMPOSE_PROJECT_NAME:-}"
+    if [ -z "$_cru_proj" ]; then
+        _cru_proj="$(sed -n 's/^name:[[:space:]]*//p' "${1:-.}/docker-compose.cluster.yml" 2>/dev/null | head -n1)"
+        _cru_proj="${_cru_proj:-noomesh}"
+    fi
+    # shellcheck disable=SC2086
+    if ! _cru_decl="$(docker compose $COMPOSE_FILES --profile '*' config --services 2>/dev/null)" || [ -z "$_cru_decl" ]; then
+        echo "! could not read the compose services of this install, so running containers were NOT compared with them (not a pass): noo doctor orphans" >&2
+        return 0
+    fi
+    if ! _cru_run="$(docker ps --filter "label=com.docker.compose.project=$_cru_proj" \
+            --format '{{.Label "com.docker.compose.service"}} {{.Names}}' 2>/dev/null)"; then
+        echo "! could not list the running containers of project $_cru_proj, so they were NOT compared with the compose files (not a pass): noo doctor orphans" >&2
+        return 0
+    fi
+    printf '%s\n' "$_cru_run" | while read -r _cru_svc _cru_name; do
+        [ -n "$_cru_svc" ] && [ -n "$_cru_name" ] || continue
+        printf '%s\n' "$_cru_decl" | grep -qxF -- "$_cru_svc" && continue
+        echo "! $_cru_name is not declared by any compose file of this install: docker rm -f $_cru_name" >&2
+    done
+    return 0
+}
+
 # ── Compose v2 is a prerequisite, and a pull failure says WHY ─────────────
 #
 # Ubuntu's `docker.io` ships WITHOUT the compose v2 plugin (separate
