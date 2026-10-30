@@ -1331,19 +1331,35 @@ fn layout_word() -> &'static str {
     if unsafe { libc::geteuid() } == 0 { "legacy-root" } else { "user" }
 }
 
-/// The heartbeat body. What `noo upgrade` and `noo cluster verify` judge.
-fn heartbeat_body(cfg: &SeatConfig, state: &SeatState) -> Value {
-    heartbeat_body_for(cfg, state, layout_word())
+/// The heartbeat body (`heartbeat_body_with`) is what `noo upgrade` and
+/// `noo cluster verify` judge; this one reports the running version.
+#[cfg(test)]
+fn heartbeat_body_for(cfg: &SeatConfig, state: &SeatState, layout: &str) -> Value {
+    heartbeat_body_with(cfg, state, layout, env!("CARGO_PKG_VERSION"))
 }
 
-fn heartbeat_body_for(cfg: &SeatConfig, state: &SeatState, layout: &str) -> Value {
+/// The version the closing heartbeat of an apply reports. The process that
+/// ran the apply is the OLD CLI, so `running` is stale once the apply
+/// installed (or found current) the bundle's CLI: the bundle's meta states
+/// the version that is now installed. Failed apply, or meta without a
+/// non-empty `cli_version` (an older controller): the running version.
+/// Never executes the new binary to ask.
+fn closing_cli_version(running: &str, outcome_ok: bool, meta: Option<&Value>) -> String {
+    meta.filter(|_| outcome_ok)
+        .and_then(|m| m["cli_version"].as_str())
+        .filter(|v| !v.is_empty())
+        .unwrap_or(running)
+        .to_string()
+}
+
+fn heartbeat_body_with(cfg: &SeatConfig, state: &SeatState, layout: &str, cli_version: &str) -> Value {
     let applier_sha = std::fs::read(cfg.applier_path()).or_else(|_| std::fs::read(LEGACY_APPLIER_BIN)).ok().map(|b| sha256_hex(&b));
     let user_sha = std::fs::read(cfg.cli_path()).ok().map(|b| sha256_hex(&b));
     let console = sh_out(Command::new(format!("{KIOSK_BIN}/noo-kiosk-cdp")).arg("build"))
         .filter(|b| !b.is_empty() && b != "null");
     let kiosk_env = std::fs::read_to_string(super::kiosk::ENV_FILE).ok().map(|t| read_kiosk_env(&t)).unwrap_or_default();
     json!({
-        "cli_version": env!("CARGO_PKG_VERSION"),
+        "cli_version": cli_version,
         "layout": layout,
         "user_cli_current": applier_sha.is_some() && applier_sha == user_sha,
         "kiosk_serve": unit_state("kiosk-serve.service"),
@@ -1483,6 +1499,9 @@ pub(crate) struct ApplyOutcome {
     pub console: String,
     /// The kiosk scripts were not applied: the shared dir does not exist yet.
     pub kiosk_deferred: bool,
+    /// The bundle's `seat-meta` (Null when absent): states the CLI version
+    /// the bundle installed, for the closing heartbeat.
+    pub meta: Value,
 }
 
 impl ApplyOutcome {
@@ -1571,6 +1590,7 @@ fn apply_blob(blob: &[u8], cfg: &SeatConfig, state: &mut SeatState) -> Result<Ap
             display: "unchanged",
             console: console.clone(),
             kiosk_deferred,
+            meta,
         };
         if changed.iter().any(|k| k == "kiosk-serve" || k == "unit-kiosk-serve") && unit_exists("kiosk-serve.service") {
             o.serve = if Command::new("systemctl").args(["restart", "kiosk-serve.service"]).status().map(|s| s.success()).unwrap_or(false) {
@@ -1644,8 +1664,8 @@ pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
             Err(e) => Err(e.to_string()),
         }
     };
-    let heartbeat = |state: &SeatState| {
-        let body = heartbeat_body(&cfg, state).to_string().into_bytes();
+    let heartbeat_as = |state: &SeatState, cli_version: &str| {
+        let body = heartbeat_body_with(&cfg, state, layout_word(), cli_version).to_string().into_bytes();
         let sha = sha256_hex(&body);
         match post_signed(&format!("/bootstrap/seat/{seat}/heartbeat"), "heartbeat", &sha, body) {
             Ok(200) => {}
@@ -1653,6 +1673,7 @@ pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
             Err(e) => say(&format!("heartbeat: {e}")),
         }
     };
+    let heartbeat = |state: &SeatState| heartbeat_as(state, env!("CARGO_PKG_VERSION"));
     // An old seat's root timer runs the new binary here after a rail update:
     // it only reports (a heartbeat carrying layout=legacy-root and the running
     // version, sent HERE: this branch returns before the one below) and
@@ -1696,7 +1717,9 @@ pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
         return Ok(0);
     }
     let _ = post_signed(&format!("/bootstrap/seat/{seat}/fetched"), "fetch", &sha, json!({"sha": sha}).to_string().into_bytes());
-    let (rc, msg) = match apply_blob(&blob, &cfg, &mut state) {
+    let applied = apply_blob(&blob, &cfg, &mut state);
+    let closing = closing_cli_version(env!("CARGO_PKG_VERSION"), applied.is_ok(), applied.as_ref().ok().map(|o| &o.meta));
+    let (rc, msg) = match applied {
         Ok(o) => (0, o.line()),
         Err(e) => (65, if e.starts_with("apply failed") { e } else { format!("apply failed: {e}") }),
     };
@@ -1716,7 +1739,7 @@ pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
         Ok(st) => say(&format!("apply report answered HTTP {st}")),
         Err(e) => say(&format!("apply report: {e}")),
     }
-    heartbeat(&state);
+    heartbeat_as(&state, &closing);
     Ok(if rc == 0 { 0 } else { 1 })
 }
 
@@ -2101,6 +2124,25 @@ mod tests {
         assert_eq!(b["cli_version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(b["last_applied_sha"], "abc");
         assert_eq!(heartbeat_body_for(&cfg(), &st, "user")["layout"], "user");
+    }
+
+    #[test]
+    fn the_closing_beat_reports_the_installed_cli_version() {
+        let meta = json!({"cli_version": "0.6.15", "console_build": "stack-v0.6.15"});
+        assert_eq!(closing_cli_version("0.6.14", true, Some(&meta)), "0.6.15");
+        assert_eq!(closing_cli_version("0.6.14", false, Some(&meta)), "0.6.14");
+        assert_eq!(closing_cli_version("0.6.14", true, Some(&json!({"console_build": "x"}))), "0.6.14");
+        assert_eq!(closing_cli_version("0.6.14", true, Some(&json!({"cli_version": ""}))), "0.6.14");
+        assert_eq!(closing_cli_version("0.6.14", true, Some(&Value::Null)), "0.6.14");
+        assert_eq!(closing_cli_version("0.6.14", true, None), "0.6.14");
+    }
+
+    #[test]
+    fn the_heartbeat_body_carries_the_closing_version_override() {
+        let st = SeatState::default();
+        let b = heartbeat_body_with(&cfg(), &st, "user", "0.6.15");
+        assert_eq!(b["cli_version"], "0.6.15");
+        assert_eq!(b["layout"], "user");
     }
 
     #[test]
