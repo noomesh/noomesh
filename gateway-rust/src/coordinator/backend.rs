@@ -1400,8 +1400,10 @@ mod tests {
         assert!(!crate::coordinator::classes::node_health("host8", &quarantined, now).0);
         let src = include_str!("backend.rs");
         // The resolver's body only: up to its closing brace, not this test.
+        // (`\u{7d}` is a closing brace: a bare one in a string here unbalances the brace
+        // count tests/test_gateway_refuses_plaintext.py strips test modules by.)
         let body = src.split("pub(crate) async fn resolve_backend_and_node(").nth(1).expect("resolver");
-        let body = body.split("\n}\n").next().expect("resolver body");
+        let body = body.split("\n\u{7d}\n").next().expect("resolver body");
         assert!(body.contains("classes::node_health(&key, &data, now)"), "the KV scan must apply the shared health rule");
         assert!(body.contains("order_candidates(&mut candidates"), "and sort by it");
     }
