@@ -1331,13 +1331,6 @@ fn layout_word() -> &'static str {
     if unsafe { libc::geteuid() } == 0 { "legacy-root" } else { "user" }
 }
 
-/// The heartbeat body (`heartbeat_body_with`) is what `noo upgrade` and
-/// `noo cluster verify` judge; this one reports the running version.
-#[cfg(test)]
-fn heartbeat_body_for(cfg: &SeatConfig, state: &SeatState, layout: &str) -> Value {
-    heartbeat_body_with(cfg, state, layout, env!("CARGO_PKG_VERSION"))
-}
-
 /// The version the closing heartbeat of an apply reports. The process that
 /// ran the apply is the OLD CLI, so `running` is stale once the apply
 /// installed (or found current) the bundle's CLI: the bundle's meta states
@@ -1352,6 +1345,7 @@ fn closing_cli_version(running: &str, outcome_ok: bool, meta: Option<&Value>) ->
         .to_string()
 }
 
+/// The heartbeat body: what `noo upgrade` and `noo cluster verify` judge.
 fn heartbeat_body_with(cfg: &SeatConfig, state: &SeatState, layout: &str, cli_version: &str) -> Value {
     let applier_sha = std::fs::read(cfg.applier_path()).or_else(|_| std::fs::read(LEGACY_APPLIER_BIN)).ok().map(|b| sha256_hex(&b));
     let user_sha = std::fs::read(cfg.cli_path()).ok().map(|b| sha256_hex(&b));
@@ -2124,6 +2118,11 @@ mod tests {
         assert_eq!(b["cli_version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(b["last_applied_sha"], "abc");
         assert_eq!(heartbeat_body_for(&cfg(), &st, "user")["layout"], "user");
+    }
+
+    /// The body as the running binary reports it (no closing override).
+    fn heartbeat_body_for(cfg: &SeatConfig, state: &SeatState, layout: &str) -> Value {
+        heartbeat_body_with(cfg, state, layout, env!("CARGO_PKG_VERSION"))
     }
 
     #[test]
