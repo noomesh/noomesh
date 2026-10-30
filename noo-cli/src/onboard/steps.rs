@@ -6029,7 +6029,8 @@ pub fn first_model(ctx: &mut Ctx) {
 
     // Already-configured + cached?
     let existing_vllm = ctx.read_env("VLLM_MODEL");
-    if !existing_vllm.is_empty() && hf_model_cached(ctx, &existing_vllm) {
+    let standalone_box = ctx.repo_root.join(".noo-standalone").exists();
+    if vllm_shortcut_applies(&existing_vllm, standalone_box) && hf_model_cached(ctx, &existing_vllm) {
         ctx.info(&format!("Model already downloaded: {existing_vllm}"));
         let keep = ctx.non_interactive || ctx.asker.confirm(&format!("Use cached model {existing_vllm}?"), true);
         if keep {
@@ -6219,6 +6220,7 @@ pub fn first_model(ctx: &mut Ctx) {
         start_vllm(ctx, &model_name);
     } else {
         pull_ollama(ctx, &model_name);
+        verify_first_model(ctx);
         // No PAGEINDEX_LLM_MODEL here any more. It was written on standalone
         // when trellion dialled ollama directly and needed an exact name
         // (2026-09-07); trellion now asks the gateway (2026-09-09), where
@@ -6226,6 +6228,188 @@ pub fn first_model(ctx: &mut Ctx) {
         // onboarding pinned every RAG answer to the one model chosen at
         // install (2026-10-17). The model still lands in the yaml as the
         // local backend's placement hint (`update_yaml_config`).
+    }
+}
+
+/// Does a leftover `VLLM_MODEL` short-circuit the model step into "use the
+/// cached vLLM model"? Never on a standalone box: vLLM is not offered there
+/// (the embed Ollama holds the GPU), and a `.env` or HF cache kept from an
+/// earlier install must not make the step skip the Ollama pull and leave the
+/// vLLM repo id as the default chat model (i263a, take 12).
+fn vllm_shortcut_applies(existing_vllm: &str, standalone: bool) -> bool {
+    !existing_vllm.is_empty() && !standalone
+}
+
+/// A chat request body small enough to be a probe: the raw model call
+/// (`context: false`, no coordinator, no conversation row), a few tokens.
+/// `model` None asks for the default, the path a user's first `noo chat` takes.
+fn chat_probe_body(model: Option<&str>) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "prompt": "Reply with one short word.",
+        "context": false,
+        "max_tokens": 64,
+        "channel": "cli",
+    });
+    if let Some(m) = model {
+        body["model"] = serde_json::json!(m);
+    }
+    body
+}
+
+/// Did the gateway's answer to a probe come from a model? `POST
+/// /api/inference` answers `{"success":true,"data":{"response":…}}`. An
+/// empty response is still an answer (a thinking model can spend 64 tokens
+/// on reasoning); only a refusal or an error is not.
+fn chat_probe_answered(doc: &serde_json::Value) -> Result<(), String> {
+    if doc["success"].as_bool() == Some(true) {
+        return Ok(());
+    }
+    Err(doc["error"].as_str().unwrap_or("the gateway returned no answer").to_string())
+}
+
+/// A probe the wizard cannot make is not a model that cannot answer: no
+/// stored login, or a credential the route refuses. Everything else
+/// (timeout, 404 not served, 5xx, unreachable) is the install's fault.
+fn probe_error_is_unverifiable(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    ["401", "403", "unauthorized", "forbidden", "not logged in", "log in", "login"]
+        .iter()
+        .any(|k| e.contains(k))
+}
+
+/// The pair of facts a first-model success must rest on: the configured
+/// default chat model IS the one just pulled, or the sentence saying why not.
+/// `read` is [`yamlcfg::configured_default`]'s answer.
+fn default_model_mismatch(read: &Result<(String, String), String>, model: &str) -> Option<String> {
+    match read {
+        Ok((backend, m)) if backend == "ollama" && m == model => None,
+        Ok((backend, m)) => Some(format!(
+            "the default chat model is {backend}/{m}, not the {model} just pulled — chat would send {m} to the only Ollama. \
+             Fix: noo models switch {model} --backend ollama"
+        )),
+        Err(why) => Some(format!(
+            "the default chat model could not be recorded ({why}). Fix: noo models switch {model} --backend ollama"
+        )),
+    }
+}
+
+/// One probe, retried while the mesh has not yet heard the new model from
+/// its node (a controller with a node agent learns of a fresh pull at the
+/// next heartbeat; the gateway answers "not served by any node" until then).
+/// Bounded: 5 tries, 10 s apart. Any other error returns at once.
+fn chat_probe(ctx: &Ctx, model: Option<&str>) -> Result<(), String> {
+    let body = chat_probe_body(model);
+    let mut last = String::new();
+    for attempt in 0..5 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        }
+        match crate::http::post_json_try(ctx.g, "/api/inference", &body, true, 180)
+            .and_then(|doc| chat_probe_answered(&doc))
+        {
+            Ok(()) => return Ok(()),
+            Err(e) if model.is_some() && e.contains("is not served by any node") && attempt < 4 => last = e,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last)
+}
+
+/// After the pull: the model step does not report success until the default
+/// chat model is the pulled model and a chat request for it is answered.
+/// Before this the failure surfaced only at the later chat step, as a
+/// 300 s stream timeout with the wrong model name (i263a).
+fn verify_first_model(ctx: &mut Ctx) {
+    let model = ctx.state.model_pulled.clone();
+    if ctx.dry_run || model.is_empty() || ctx.state.backend_used != "ollama" {
+        return;
+    }
+    if let Some(why) = default_model_mismatch(&yamlcfg::configured_default(ctx), &model) {
+        let line = format!("model: {why}");
+        ctx.error(&line);
+        ctx.state.hard_failures.push(line);
+        return;
+    }
+    ctx.progress(&format!("Checking that chat answers with {model} (one short request)..."));
+    // 180 s: the first request loads the model into memory.
+    match chat_probe(ctx, Some(&model)) {
+        Ok(()) => {}
+        Err(e) if probe_error_is_unverifiable(&e) => {
+            ctx.warn(&format!("Could not check chat for {model} ({e}). Check it: noo chat --model {model} --message hi"));
+            return;
+        }
+        Err(e) => {
+            let line = format!(
+                "model: {model} was pulled but a chat request for it failed: {e}. Check: noo cluster verify; noo chat --model {model} --message hi"
+            );
+            ctx.error(&line);
+            ctx.state.hard_failures.push(line);
+            return;
+        }
+    }
+    ctx.success(&format!("Chat answers with {model}"));
+    // The default (no model named) is what `noo chat` sends. The gateway
+    // reads noomesh.yaml when it starts, so a gateway that was already up
+    // keeps the old default until its next restart: say so, do not fail.
+    if let Err(e) = chat_probe(ctx, None) {
+        ctx.warn(&format!(
+            "Chat with {model} named works, but the gateway's current default does not ({e}). \
+             It reads the default at start: noo stack restart gateway"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod first_model_probe_tests {
+    use super::{chat_probe_answered, chat_probe_body, default_model_mismatch, probe_error_is_unverifiable, vllm_shortcut_applies};
+
+    #[test]
+    fn a_leftover_vllm_model_does_not_short_circuit_a_standalone_install() {
+        assert!(!vllm_shortcut_applies("Qwen/Qwen3-8B-AWQ", true));
+        assert!(vllm_shortcut_applies("Qwen/Qwen3-8B-AWQ", false));
+        assert!(!vllm_shortcut_applies("", false));
+    }
+
+    #[test]
+    fn the_default_must_be_the_pulled_ollama_model() {
+        let ok = Ok(("ollama".to_string(), "gemma4:e2b".to_string()));
+        assert_eq!(default_model_mismatch(&ok, "gemma4:e2b"), None);
+        let stale = Ok(("vllm".to_string(), "Qwen/Qwen3-8B-AWQ".to_string()));
+        let why = default_model_mismatch(&stale, "gemma4:e2b").expect("a vllm default is not the pulled model");
+        assert!(why.contains("vllm/Qwen/Qwen3-8B-AWQ") && why.contains("noo models switch gemma4:e2b --backend ollama"), "{why}");
+        let missing = Err("noomesh.yaml does not exist".to_string());
+        assert!(default_model_mismatch(&missing, "gemma4:e2b").unwrap().contains("could not be recorded"));
+    }
+
+    #[test]
+    fn the_probe_is_a_bounded_raw_call_and_pins_only_when_asked() {
+        let pinned = chat_probe_body(Some("gemma4:e2b"));
+        assert_eq!(pinned["model"], "gemma4:e2b");
+        assert_eq!(pinned["context"], false);
+        assert!(pinned["max_tokens"].as_u64().is_some_and(|n| n <= 128));
+        assert!(chat_probe_body(None).get("model").is_none(), "the default path names no model");
+    }
+
+    #[test]
+    fn only_a_successful_answer_passes_the_probe() {
+        assert!(chat_probe_answered(&serde_json::json!({"success": true, "data": {"response": ""}})).is_ok());
+        let e = chat_probe_answered(&serde_json::json!({"success": false, "error": "model 'x' is not served by any node"})).unwrap_err();
+        assert!(e.contains("not served"));
+        assert!(chat_probe_answered(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn a_refused_login_is_unverifiable_but_a_timeout_or_404_is_a_failure() {
+        assert!(probe_error_is_unverifiable("HTTP 401: Unauthorized"));
+        assert!(!probe_error_is_unverifiable("the gateway is up but this answer took longer than 180s"));
+        assert!(!probe_error_is_unverifiable("model 'x' is not served by any node; the only chat backend is the Ollama"));
+    }
+
+    #[test]
+    fn the_model_step_verifies_after_the_pull() {
+        let src = include_str!("steps.rs");
+        let pull = src.find("        pull_ollama(ctx, &model_name);\n        verify_first_model(ctx);").expect("verify follows the pull");
+        assert!(pull > 0);
     }
 }
 
