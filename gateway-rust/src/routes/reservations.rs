@@ -822,7 +822,7 @@ mod tests {
 
     #[test]
     fn a_not_declared_start_is_a_retryable_503_and_other_failures_stay_internal() {
-        match start_failure("pai-voice/voice-worker", "awolf", "not_declared (404): no such workload") {
+        match start_failure("rhaddon/rhworker", "awolf", "not_declared (404): no such workload") {
             AppError::UnavailableRetry { code, detail, retry_after_secs } => {
                 assert_eq!(code, "node_workloads_not_loaded");
                 assert!(detail.contains("has not loaded its workload declarations yet; retry"), "{detail}");
