@@ -762,7 +762,7 @@ pub async fn load_rustls_config() -> Result<axum_server::tls_rustls::RustlsConfi
 }
 
 #[cfg(test)]
-mod loopback_verification_tests {
+pub(crate) mod loopback_verification_tests {
     //! the gateway's own self-calls must VERIFY.
     //!
     //! These stand up a real TLS listener with a real certificate and make a
@@ -780,7 +780,7 @@ mod loopback_verification_tests {
     /// `NOO_TLS_CA` is process-global; `cargo test` runs these on threads.
     pub(super) static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn issue(ca_cn: &str, san: &str) -> (rcgen::CertifiedKey<rcgen::KeyPair>, rcgen::CertifiedKey<rcgen::KeyPair>) {
+    pub(crate) fn issue(ca_cn: &str, san: &str) -> (rcgen::CertifiedKey<rcgen::KeyPair>, rcgen::CertifiedKey<rcgen::KeyPair>) {
         let mut ca_params = rcgen::CertificateParams::new(vec![ca_cn.to_string()]).unwrap();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         // DISTINCT subject DNs. rcgen defaults every DN to "rcgen self signed
@@ -807,7 +807,7 @@ mod loopback_verification_tests {
     }
 
     /// A one-shot HTTPS listener presenting `leaf`. Returns its port.
-    async fn serve(leaf: &rcgen::CertifiedKey<rcgen::KeyPair>) -> u16 {
+    pub(crate) async fn serve(leaf: &rcgen::CertifiedKey<rcgen::KeyPair>) -> u16 {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
         let cert = CertificateDer::from(leaf.cert.der().to_vec());
         let key = PrivateKeyDer::try_from(leaf.signing_key.serialize_der()).unwrap();
