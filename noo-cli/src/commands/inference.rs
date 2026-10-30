@@ -7,10 +7,19 @@ use crate::http::post_json;
 use crate::ui;
 use crate::{Globals, Unhandled};
 
-/// `noo inference run <prompt> [-m MODEL] [-b BACKEND] [--node ID
-///  [--strict-node]] [--max-tokens N] [--temperature F]`
-/// POST /api/inference — same contract as the Python inference_cli command.
-pub fn inference_run(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+/// Why `inference run` arguments were not turned into a request.
+#[derive(Debug, PartialEq)]
+enum RunArgsError {
+    /// Not this command's surface — fall through to the generic usage error.
+    Unhandled,
+    /// A flag the gateway would silently drop; refused with a message.
+    Unsupported(&'static str),
+}
+
+/// Parse `inference run` arguments into `(request body, --user)`. Pure: no
+/// request is made here, so a refused flag provably sends nothing.
+fn build_run_request(args: &[String]) -> Result<(serde_json::Value, Option<String>), RunArgsError> {
+    use RunArgsError::Unhandled;
     let mut prompt: Option<String> = None;
     let mut user: Option<String> = None;
     let mut body = serde_json::json!({ "max_tokens": 512, "temperature": 0.7 });
@@ -18,10 +27,18 @@ pub fn inference_run(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     while let Some(tok) = iter.next() {
         match tok.as_str() {
             "--model" | "-m" => body["model"] = iter.next().ok_or(Unhandled)?.as_str().into(),
-            "--backend" | "-b" => body["backend"] = iter.next().ok_or(Unhandled)?.as_str().into(),
+            // The gateway's InferenceRequest has no `backend` field, so the
+            // old flag was silently dropped. Refuse it until it is honoured.
+            "--backend" | "-b" => {
+                return Err(RunArgsError::Unsupported(
+                    "`inference run` does not support -b/--backend yet: the gateway ignores it",
+                ))
+            }
             "--user" | "-u" => user = Some(iter.next().ok_or(Unhandled)?.to_string()),
             "--node" | "-n" => body["node"] = iter.next().ok_or(Unhandled)?.as_str().into(),
             "--strict-node" => body["node_strict"] = true.into(),
+            // Skip RAG, memory, skills and tool schemas: a plain model call.
+            "--raw" => body["context"] = false.into(),
             "--max-tokens" => {
                 body["max_tokens"] =
                     iter.next().and_then(|v| v.parse::<u64>().ok()).ok_or(Unhandled)?.into()
@@ -40,6 +57,25 @@ pub fn inference_run(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
     let Some(p) = prompt else { return Err(Unhandled) };
     body["prompt"] = p.into();
+    Ok((body, user))
+}
+
+/// `noo inference run <prompt> [-m MODEL] [--node ID [--strict-node]]
+///  [--raw] [--max-tokens N] [--temperature F]`
+/// POST /api/inference. Without `--raw` the gateway runs the full pipeline
+/// (RAG, memory, skills, tool schemas); `--raw` sends `context: false`.
+pub fn inference_run(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let (mut body, user) = match build_run_request(args) {
+        Ok(v) => v,
+        Err(RunArgsError::Unhandled) => return Err(Unhandled),
+        Err(RunArgsError::Unsupported(msg)) => crate::output::fail(
+            g.json,
+            crate::output::ExitCode::Usage,
+            "unsupported_flag",
+            msg,
+            Some("noo inference run <prompt> -n <node>"),
+        ),
+    };
 
     // Bind an operator identity so memory/KB context resolves a scope
     // instead of failing closed on a multi-account install.
@@ -126,4 +162,39 @@ pub fn inference_agent(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ("noo inference run <prompt>", "the same model without the tool loop, for comparison"),
     ]);
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn a(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn raw_sends_context_false() {
+        let (body, _) = build_run_request(&a(&["hi", "--raw"])).unwrap();
+        assert_eq!(body["context"], serde_json::json!(false));
+        assert_eq!(body["prompt"], "hi");
+    }
+
+    #[test]
+    fn without_raw_the_body_has_no_context_key() {
+        let (body, _) = build_run_request(&a(&["hi", "-n", "awolf"])).unwrap();
+        assert!(body.get("context").is_none(), "{body}");
+        assert_eq!(body["node"], "awolf");
+        assert_eq!(body["max_tokens"], 512);
+    }
+
+    #[test]
+    fn backend_flag_is_refused_before_any_request() {
+        for flag in ["-b", "--backend"] {
+            let err = build_run_request(&a(&["hi", flag, "vllm"])).unwrap_err();
+            match err {
+                RunArgsError::Unsupported(m) => assert!(m.contains("not support"), "{m}"),
+                other => panic!("expected Unsupported, got {other:?}"),
+            }
+        }
+    }
 }
