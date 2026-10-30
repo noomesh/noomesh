@@ -15,20 +15,25 @@
 #
 # Durable update path: bump OLLAMA_VERSION and BOTH sha256 values together
 # (from the release's `sha256sum.txt`), and keep the version equal to the one
-# docker-compose.cluster.yml names for the upstream `ollama-upstream` lock row
-# and node-agent-go/internal/docker/backends.go names as the fallback
-# (tests/test_hardened_images_i323.py compares the three).
+# node-agent-go/internal/docker/backends.go names as the upstream fallback
+# (tests/test_hardened_images_i323.py compares them).
 #
 # GPU: the amd64 tarball carries ollama's own GPU runners under lib/ollama
 # (CUDA); they are kept, so a GPU node needs only the nvidia container runtime
 # it has today (the agent requests the device; the driver libraries are
 # injected at run time). Nothing GPU-related is baked in here.
 #
-# Runs as ROOT, deliberately, like the upstream image: the agent mounts the
-# model store at /root/.ollama, and every node already holds models there
-# owned by root; a non-root user would not be able to read them. The agent's
-# backend floor (cap_drop ALL + the chown/setuid set, no-new-privileges)
-# applies to this container exactly as it did to the upstream one.
+# Runs as NON-ROOT: uid/gid 65532 (`nonroot`, the repo's usual uid; the
+# privilege-floor work of #517 listed Ollama as needing "the volume re-owned and
+# HOME moved", which is exactly this). HOME is /home/nonroot, so ollama's
+# default store, ~/.ollama, is /home/nonroot/.ollama: the node agent and the
+# compose services mount the SAME host directory/volume the models already
+# live in at that path (it was /root/.ollama), so no models move and
+# OLLAMA_MODELS stays at its default (<store>/models). A store written by the
+# old root image is root-owned and is re-owned once to 65532 by the agent
+# (ensureOllamaStoreOwned) and the launcher (lib-reown.sh) before this image
+# first starts. GPU needs no root: the NVIDIA container runtime injects the
+# device nodes and driver libraries.
 
 # Base-image registry: dhi.io by default, our ghcr mirror in the release
 # workflow (--build-arg DHI_REGISTRY=...), as in Dockerfile.llamacpp.
@@ -73,16 +78,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=fetch /out/bin/ /usr/bin/
 COPY --from=fetch /out/lib/ollama/ /usr/lib/ollama/
 
-# The same runtime contract as upstream ollama/ollama, so the agent's spec
-# (OLLAMA_HOST, OLLAMA_NO_CLOUD, GPU device request, /root/.ollama volume) is
-# unchanged.
-ENV PATH="/usr/bin:${PATH}" \
+# The DHI -dev base ships `nonroot` (65532); create it only if this base lacks it.
+RUN set -eu; \
+    getent group 65532 >/dev/null || groupadd --gid 65532 nonroot; \
+    getent passwd 65532 >/dev/null || useradd --uid 65532 --gid 65532 --home-dir /home/nonroot --shell /usr/sbin/nologin nonroot; \
+    mkdir -p /home/nonroot/.ollama; \
+    chown -R 65532:65532 /home/nonroot
+
+# The same runtime contract as upstream ollama/ollama (OLLAMA_HOST, ports, GPU
+# env), with the store under HOME instead of /root.
+ENV HOME=/home/nonroot \
+    PATH="/usr/bin:${PATH}" \
     OLLAMA_HOST=0.0.0.0:11434 \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     NVIDIA_VISIBLE_DEVICES=all \
     LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64
 EXPOSE 11434
-VOLUME ["/root/.ollama"]
+USER 65532:65532
 
 # Reset the base image's `uv` entrypoint.
 ENTRYPOINT ["/usr/bin/ollama"]

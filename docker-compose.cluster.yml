@@ -1775,7 +1775,7 @@ services:
       # so the fleet stays US-vendor (model governance).
       - OLLAMA_MODEL=${OLLAMA_MODEL:-}
     volumes:
-      - ${OLLAMA_DATA_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/ollama}:/root/.ollama
+      - ${OLLAMA_DATA_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/ollama}:/home/nonroot/.ollama
     deploy:
       resources:
         reservations:
@@ -1825,7 +1825,7 @@ services:
       # OLLAMA_EMBED_NUM_PARALLEL=1 on a box whose chat model is tight on VRAM.
       - OLLAMA_NUM_PARALLEL=${OLLAMA_EMBED_NUM_PARALLEL:-4}
     volumes:
-      - ollama-embed-data:/root/.ollama
+      - ollama-embed-data:/home/nonroot/.ollama
     # In its door's network namespace (door generation 3): no network of
     # its own, listening on 127.0.0.1, reachable only through stunnel-ollama-embed.
     network_mode: "service:stunnel-ollama-embed"
@@ -1868,7 +1868,7 @@ services:
       # the CPU this exists to use.
       - OLLAMA_KEEP_ALIVE=-1
     volumes:
-      - ollama-embed-data:/root/.ollama
+      - ollama-embed-data:/home/nonroot/.ollama
     # In its door's network namespace (door generation 3): no network of
     # its own, listening on 127.0.0.1, reachable only through stunnel-ollama-embed-cpu.
     network_mode: "service:stunnel-ollama-embed-cpu"
