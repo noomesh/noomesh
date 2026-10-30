@@ -659,7 +659,7 @@ pub(crate) fn hardened_images_check(n: &Value) -> Option<Check> {
     Some(fail(
         "hardened images",
         format!("drift: upstream image(s) running where a hardened build of ours exists (a node never falls back to upstream on its own): {}", list.join(", ")),
-        format!("noo cluster sync-images {id} -i {first_ours}   # stage ours, then restart the backend (`noo cluster up`); unset LLAMACPP_IMAGE / OLLAMA_IMAGE if an override pins upstream"),
+        format!("noo cluster sync-images {id} -i {first_ours}   # stage ours; the node's reconciler then recreates the backend on it; unset LLAMACPP_IMAGE / OLLAMA_IMAGE if an override pins upstream"),
     ))
 }
 
