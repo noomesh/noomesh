@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"runtime"
+	"strings"
 
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
@@ -40,12 +41,43 @@ import (
 // A publish on a non-loopback address is never dialled: the agent reaches a
 // door on this host only, and a 0.0.0.0 publish is a bug to surface, not a
 // route to use.
+//
+// A container in another's network namespace (NetworkMode `container:X`)
+// has no address of its own: the name is answered by the namespace owner's.
+// That is how `noo-vllm` reaches its door (door generation 5): the engine
+// keeps the name, the door noo-stunnel-vllm owns the namespace and carries
+// noo-vllm as its bridge alias, so a host dial and a docker-DNS dial land
+// on the same door. One hop: an owner that is itself in another's
+// namespace is refused, not followed.
 func (c *Client) ContainerDialAddr(ctx context.Context, name, port string) (string, error) {
 	res, err := c.docker.ContainerInspect(ctx, name, client.ContainerInspectOptions{})
 	if err != nil {
 		return "", fmt.Errorf("inspect %s: %w", name, err)
 	}
-	return dialAddrFrom(name, port, res.Container.NetworkSettings, runtime.GOOS)
+	ns := res.Container.NetworkSettings
+	if owner := namespaceOwner(res.Container.HostConfig); owner != "" {
+		o, err := c.docker.ContainerInspect(ctx, owner, client.ContainerInspectOptions{})
+		if err != nil {
+			return "", fmt.Errorf("%s shares the network of %s: inspect %s: %w", name, owner, owner, err)
+		}
+		if namespaceOwner(o.Container.HostConfig) != "" {
+			return "", fmt.Errorf("%s shares the network of %s, which shares another's: not followed", name, owner)
+		}
+		ns = o.Container.NetworkSettings
+	}
+	return dialAddrFrom(name, port, ns, runtime.GOOS)
+}
+
+// namespaceOwner is X for a container created with NetworkMode
+// `container:X` (docker stores the owner's ID), "" otherwise.
+func namespaceOwner(h *container.HostConfig) string {
+	if h == nil {
+		return ""
+	}
+	if owner, ok := strings.CutPrefix(string(h.NetworkMode), "container:"); ok {
+		return owner
+	}
+	return ""
 }
 
 // dialAddrFrom is the pure decision behind ContainerDialAddr.

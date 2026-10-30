@@ -44,13 +44,48 @@ fi
 [ -n "${_NOO_LIB_ADDONS_LOADED:-}" ] || . "$_lib_compose_dir/lib-addons.sh"
 [ -n "${_NOO_LIB_DIST_LOADED:-}" ]   || . "$_lib_compose_dir/lib-dist.sh"
 
+# What the NVIDIA GPU is doing: "ok" (answers a per-device query), "lost"
+# (the driver is installed and cannot read the card: i277e, Xid 79/154, "GPU
+# has fallen off the bus"), or "none" (no NVIDIA driver). `nvidia-smi -L` alone
+# is not enough: it can list the card while the device-handle call the
+# container runtime makes fails. The query asks only for the index, which every
+# GPU answers: memory.total is "[N/A]" on a unified-memory GPU (GB10, Jetson),
+# and that GPU is not lost. A card with no driver installed is "none": a box
+# set up without the NVIDIA stack, not a fault. NOO_COMPOSE_GPU=1|0 overrides
+# (tests, headless boxes); 0 reads "none", the operator's choice of CPU.
+_compose_gpu_state() {
+    case "${NOO_COMPOSE_GPU:-}" in
+        1) echo ok; return 0 ;;
+        0) echo none; return 0 ;;
+    esac
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        if nvidia-smi -L >/dev/null 2>&1 \
+            && _noo_gpu_q="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>&1)" \
+            && ! printf '%s\n' "$_noo_gpu_q" | grep -qiE 'unknown error|unable to determine'; then
+            echo ok
+        else
+            echo lost
+        fi
+        return 0
+    fi
+    echo none
+}
+
 # A GPU the base can hand to ollama-embed? Probe, unless told.
 _compose_gpu_visible() {
-    case "${NOO_COMPOSE_GPU:-}" in
-        1) return 0 ;;
-        0) return 1 ;;
-    esac
-    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1
+    [ "$(_compose_gpu_state)" = ok ]
+}
+
+# One line when the driver lost the GPU, naming the cause and the choice.
+# The overlay is then NOT requested (_compose_gpu_visible is false), so the
+# embedder starts on CPU and the core never waits on a device that cannot
+# answer. Silent otherwise. Launchers call it once, after the file list.
+# NOO_GPU_LOST=1 tells lib-stuck-container.sh the cause is already said, so a
+# GPU backend held on the same start names itself without repeating it.
+compose_gpu_notice() {
+    [ "$(_compose_gpu_state)" = lost ] || return 0
+    NOO_GPU_LOST=1; export NOO_GPU_LOST
+    echo "  the NVIDIA driver lost the GPU (nvidia-smi cannot read it): the embedder starts on CPU; reboot to get the GPU back" >&2
 }
 
 compose_file_list() {

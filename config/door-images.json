@@ -1,0 +1,10 @@
+{
+  "about": "Backend doors whose image is PINNED instead of following the node's release. A door here is recreated (with its engine) only when its pin changes, never on a release roll alone. The controller stages each pin on the artifact rail (noo-cli image_stage.rs, source door-pin, never pruned by release retention); the node agent runs it (node-agent-go/internal/docker/door_images.json, byte-equal copy). To move a door: set image/tag/digest to a published release's stunnel row (stack-vX.Y.Z.lock `stunnel@sha256:...`).",
+  "doors": {
+    "vllm": {
+      "image": "stunnel",
+      "tag": "v0.6.13",
+      "digest": "sha256:8a3e44b7e3a1aef61a0852c444a01df319b506bf87083fef93c21367e6bffa2b"
+    }
+  }
+}

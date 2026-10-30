@@ -719,11 +719,11 @@ if [ "$START_STACK" = true ]; then
         ui_step "Waiting for vLLM to load the model (2–5 min)"
         VLLM_DEADLINE=$((SECONDS + 600))  # 10 min max (includes potential model download)
         VLLM_READY=false
-        # The listener is always TLS and requires a client certificate
-        # (--ssl-cert-reqs 2); the image carries python3, not curl — the
-        # old `curl -sfk` could never have answered. Probe from inside with
-        # the container's own leaf, CA-verified (a self-check, nothing granted).
-        VLLM_PROBE="import ssl,urllib.request; ctx=ssl.create_default_context(cafile='/app/pki/ca.crt'); ctx.load_cert_chain('/app/pki/services/vllm/service.crt','/app/pki/services/vllm/service.key'); urllib.request.urlopen('https://localhost:8000/health',context=ctx,timeout=5)"
+        # The engine serves plain HTTP on 127.0.0.1 inside its door's network
+        # namespace (the door, noo-stunnel-vllm, holds the leaf), whether
+        # compose or the agent started it; the image carries python3, not
+        # curl. Probe from inside.
+        VLLM_PROBE="import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=5)"
 
         while [ $SECONDS -lt $VLLM_DEADLINE ]; do
             # Check container is still running (not crash-looping)
@@ -752,7 +752,7 @@ if [ "$START_STACK" = true ]; then
             # Warm up with a short inference request so first real chat isn't slow
             ui_done "vLLM healthy — warming up"
             VLLM_MODEL="${VLLM_MODEL:-$(grep '^VLLM_MODEL=' .env 2>/dev/null | cut -d= -f2)}"
-            VLLM_WARM="import ssl,json,urllib.request; ctx=ssl.create_default_context(cafile='/app/pki/ca.crt'); ctx.load_cert_chain('/app/pki/services/vllm/service.crt','/app/pki/services/vllm/service.key'); body=json.dumps({'model':'${VLLM_MODEL}','messages':[{'role':'user','content':'hi'}],'max_tokens':1}).encode(); urllib.request.urlopen(urllib.request.Request('https://localhost:8000/v1/chat/completions',data=body,headers={'Content-Type':'application/json'}),context=ctx,timeout=120)"
+            VLLM_WARM="import json,urllib.request; body=json.dumps({'model':'${VLLM_MODEL}','messages':[{'role':'user','content':'hi'}],'max_tokens':1}).encode(); urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8000/v1/chat/completions',data=body,headers={'Content-Type':'application/json'}),timeout=120)"
             docker exec noo-vllm python3 -c "$VLLM_WARM" \
                 >/dev/null 2>&1 && \
                 ui_done "vLLM warm and ready" || \

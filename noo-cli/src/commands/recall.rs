@@ -13,6 +13,7 @@
 //! versions are the working surface.
 
 use super::truncate;
+use crate::args::{ArgError, Args};
 use crate::http::{get_json, post_json};
 use crate::ui::{self, Col, Glyph};
 use crate::{Globals, Unhandled};
@@ -108,24 +109,16 @@ pub fn recall_videos(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+pub(crate) fn parse_search_with(a: &mut Args) -> Result<(String, u64), ArgError> {
+    let top_k = a.number::<u64>(&["--top-k", "-k"])?.unwrap_or(5);
+    let query = a.one("<query>")?;
+    Ok((query, top_k))
+}
+
 /// `noo recall search QUERY [--top-k K]` — POST /api/v1/recall/search
 /// (worker-delegated; Python parity: 30s timeout).
 pub fn recall_search(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut query: Option<String> = None;
-    let mut top_k = 5u64;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--top-k" | "-k" => top_k = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?,
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => {
-                if query.replace(t.to_string()).is_some() {
-                    return Err(Unhandled);
-                }
-            }
-        }
-    }
-    let Some(query) = query else { return Err(Unhandled) };
+    let (query, top_k) = parse_search_with(&mut Args::new(args))?;
     let body = post_json(
         g,
         "/api/v1/recall/search",
@@ -171,16 +164,15 @@ pub fn recall_search(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+pub(crate) fn parse_prominent_with(a: &mut Args) -> Result<u64, ArgError> {
+    let top_k = a.number::<u64>(&["--top-k", "-k"])?.unwrap_or(20);
+    a.finish()?;
+    Ok(top_k)
+}
+
 /// `noo recall prominent [--top-k K]` — GET /api/v1/recall/prominent.
 pub fn recall_prominent(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut top_k = 20u64;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--top-k" | "-k" => top_k = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?,
-            _ => return Err(Unhandled),
-        }
-    }
+    let top_k = parse_prominent_with(&mut Args::new(args))?;
     let body = get_json(g, &format!("/api/v1/recall/prominent?top_k={top_k}"), true, 10);
     if g.json {
         println!("{body}");

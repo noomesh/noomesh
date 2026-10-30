@@ -29,7 +29,8 @@
 //!
 //! ```json
 //! { "schema": "example_addon", "role": "noo_example_addon",
-//!   "ddl_role": "noo_example_addon_ddl", "extensions": ["pg_trgm"] }
+//!   "ddl_role": "noo_example_addon_ddl", "extensions": ["pg_trgm"],
+//!   "verify_callers": true }
 //! ```
 //!
 //! The names are not free: with `<id>` = the add-on name with `-` as `_`,
@@ -42,6 +43,14 @@
 //! delivered through the ONE systems-secrets file
 //! (`system_provision::SYSTEMS_SECRETS`). `extensions` are limited to
 //! [`ALLOWED_EXTENSIONS`]: the broker installs them as superuser.
+//!
+//! `verify_callers` (optional, default `false`) says the add-on checks the
+//! bearer the gateway presents on every proxied call (`addon_auth`,
+//! `addon-caller:` consumers). The broker then grants its RUNTIME role, and
+//! only that role, read access to the `noo_addon_caller_keys` view, and takes
+//! it back on the reconcile after the declaration goes away or the add-on is
+//! no longer registered (`system_provision::sync_caller_verifier`). Omitted,
+//! it is `false` and the file means exactly what it meant before the field.
 //!
 //! ## `workloads.json` is not parsed here
 //!
@@ -94,6 +103,8 @@ pub const ALLOWED_EXTENSIONS: &[&str] = &[
 pub const RESERVED_IDS: &[&str] = &[
     "app", "worker", "gateway", "admin", "readonly", "replication", "backup", "monitor",
     "public", "mesh", "noo", "information_schema",
+    // `noo_caller_verifiers` is the broker's group role for `verify_callers`.
+    "caller_verifiers",
 ];
 
 /// `system.json` as delivered.
@@ -105,6 +116,11 @@ pub struct AddonSystem {
     pub ddl_role: String,
     #[serde(default)]
     pub extensions: Vec<String>,
+    /// The add-on verifies the gateway's caller key, so its runtime role may
+    /// read `noo_addon_caller_keys`. Absent = `false`; never serialised when
+    /// false, so a file without it round-trips byte-for-byte in shape.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verify_callers: bool,
 }
 
 /// The add-on's database id: its name with `-` as `_` (`example-addon` →
@@ -186,6 +202,7 @@ pub fn to_system_config(addon: &str, s: &AddonSystem) -> SystemConfig {
         password_env,
         ddl_password_env,
         extensions: s.extensions.clone(),
+        verify_callers: s.verify_callers,
     }
 }
 
@@ -243,6 +260,34 @@ mod tests {
         assert_eq!(c.ddl_password_env, "NOO_EXAMPLE_ADDON_DDL_PASSWORD");
         assert_eq!(c.enabled_when, None, "the registry is the gate, never a flag");
         assert_eq!(c.extensions, vec!["pg_trgm".to_string()]);
+    }
+
+    #[test]
+    fn verify_callers_is_parsed_and_absent_means_false() {
+        // Absent: the shape every bundle shipped before the field, unchanged.
+        let s = parse_system(ADDON, &system_json().to_string()).unwrap();
+        assert!(!s.verify_callers);
+        assert!(!to_system_config(ADDON, &s).verify_callers);
+        assert!(!serde_json::to_value(&s).unwrap().as_object().unwrap().contains_key("verify_callers"));
+
+        let mut v = system_json();
+        v["verify_callers"] = json!(true);
+        let s = parse_system(ADDON, &v.to_string()).expect("the declared field is accepted");
+        assert!(s.verify_callers);
+        assert!(to_system_config(ADDON, &s).verify_callers, "the broker must see the declaration");
+
+        v["verify_callers"] = json!(false);
+        assert!(!parse_system(ADDON, &v.to_string()).unwrap().verify_callers);
+        v["verify_callers"] = json!("yes");
+        assert!(parse_system(ADDON, &v.to_string()).is_err(), "a boolean, never a truthy string");
+    }
+
+    #[test]
+    fn the_broker_group_role_cannot_be_an_addon_runtime_role() {
+        let v = json!({"schema": "caller_verifiers", "role": "noo_caller_verifiers", "ddl_role": "noo_caller_verifiers_ddl"});
+        let e = parse_system("caller-verifiers", &v.to_string()).expect_err("reserved");
+        assert!(e.contains("may not declare a database"), "{e}");
+        assert_eq!(format!("noo_{}", system_id("caller-verifiers")), crate::system_provision::CALLER_VERIFIERS);
     }
 
     #[test]

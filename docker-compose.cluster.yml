@@ -1256,6 +1256,12 @@ services:
     logging: *default-logging
     image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-vllm
+    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
+    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
+    # these images share; the GPU needs none (device requests, not caps).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     # Placement-managed since 2026-07-11: the node-agent's desired-state
     # reconciler owns noo-vllm (noo cluster place <node> vllm <model>).
     # This service is a manual/bootstrap fallback only — NOT in the
@@ -1291,8 +1297,6 @@ services:
       - VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER:-0}
     volumes:
       - ${HF_CACHE_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/hf-cache}:/root/.cache/huggingface
-      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/app/pki/ca.crt:ro
-      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/vllm:/app/pki/services/vllm:ro
     deploy:
       resources:
         reservations:
@@ -1300,17 +1304,17 @@ services:
             - driver: nvidia
               count: ${GPU_COUNT:-1}
               capabilities: [gpu]
-    networks:
-      - noo-cluster
+    # In its door's network namespace (door generation 5, as the agent runs
+    # it): no network of its own, listening on 127.0.0.1, reachable only
+    # through stunnel-vllm, which joins noo-cluster under this service's names.
+    network_mode: "service:stunnel-vllm"
+    depends_on:
+      - stunnel-vllm
     restart: unless-stopped
-    # Self-check with the container's OWN leaf: the listener requires a client
-    # certificate and this image carries python3, not curl. Presenting the
-    # service's own cert to itself proves the mTLS listener is up, which is
-    # what a healthcheck is for; it grants nothing (the container already
-    # holds that key). CA-verified, hostname `localhost` is in every service
-    # leaf's SANs. start_period covers a cold model load.
+    # Plain HTTP on loopback inside the namespace; the image carries python3,
+    # not curl. start_period covers a cold model load.
     healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import ssl,urllib.request; ctx=ssl.create_default_context(cafile='/app/pki/ca.crt'); ctx.load_cert_chain('/app/pki/services/vllm/service.crt','/app/pki/services/vllm/service.key'); urllib.request.urlopen('https://localhost:8000/health',context=ctx,timeout=5)\" || exit 1"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=5)\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -1371,23 +1375,14 @@ services:
         esac
 
         # Build base args
-        ARGS="--model $$VLLM_MODEL $$QUANT_ARG --gpu-memory-utilization $$GPU_MEMORY_UTILIZATION --max-model-len $$VLLM_MAX_MODEL_LEN --tensor-parallel-size $$TENSOR_PARALLEL_SIZE $$MAX_SEQS_ARG --enable-auto-tool-choice --tool-call-parser $$VLLM_TOOL_PARSER --host 0.0.0.0 --port 8000"
+        ARGS="--model $$VLLM_MODEL $$QUANT_ARG --gpu-memory-utilization $$GPU_MEMORY_UTILIZATION --max-model-len $$VLLM_MAX_MODEL_LEN --tensor-parallel-size $$TENSOR_PARALLEL_SIZE $$MAX_SEQS_ARG --enable-auto-tool-choice --tool-call-parser $$VLLM_TOOL_PARSER --host 127.0.0.1 --port 8000"
         if [ -n "$$VLLM_REASONING_PARSER" ]; then
           ARGS="$$ARGS --reasoning-parser $$VLLM_REASONING_PARSER"
         fi
-        # TLS is not a switch. The listener presents the `vllm` service leaf,
-        # verifies every caller against the cluster CA and REQUIRES a client
-        # certificate (--ssl-cert-reqs 2 = ssl.CERT_REQUIRED): the gateway
-        # presents its leaf, the controller's own agent its node leaf. Until
-        # 2026-09-28 this ran only when NOO_VLLM_TLS was set, and even then
-        # asked for no client cert, so any process on the compose network
-        # could read every prompt. No leaf = no listener: refuse to start
-        # rather than serve plaintext (exit 78 = EX_CONFIG).
-        if [ ! -f /app/pki/services/vllm/service.crt ] || [ ! -f /app/pki/services/vllm/service.key ]; then
-          echo "vllm: no services/vllm leaf under NOO_PKI_DIR — refusing to serve plaintext. Fix: noo security pki issue-service vllm" >&2
-          exit 78
-        fi
-        ARGS="$$ARGS --ssl-certfile /app/pki/services/vllm/service.crt --ssl-keyfile /app/pki/services/vllm/service.key --ssl-ca-certs /app/pki/ca.crt --ssl-cert-reqs 2"
+        # No TLS here: the engine listens on loopback in its door's namespace
+        # and the door (stunnel, verify = 2, callers pinned by name) is the
+        # only way in. The door holds the `vllm` leaf; this container holds
+        # no key at all.
 
         # Resilient launch: if vLLM crashes with max_num_seqs or OOM errors,
         # retry with progressively lower limits instead of crash-looping.
@@ -1417,6 +1412,12 @@ services:
     logging: *default-logging
     image: ${VLLM2_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-vllm-secondary
+    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
+    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
+    # these images share; the GPU needs none (device requests, not caps).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     profiles: ["vllm-secondary"]
     environment:
       # Vendor telemetry off (docs/security/telemetry.md): vLLM posts usage
@@ -1435,9 +1436,6 @@ services:
       - VLLM_TOOL_PARSER=${VLLM2_TOOL_PARSER:-auto}
     volumes:
       - ${HF_CACHE_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/hf-cache}:/root/.cache/huggingface
-      # shares the primary's leaf (same SANs, same entrypoint paths)
-      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/app/pki/ca.crt:ro
-      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/vllm:/app/pki/services/vllm:ro
     deploy:
       resources:
         reservations:
@@ -1445,17 +1443,17 @@ services:
             - driver: nvidia
               count: ${GPU_COUNT:-1}
               capabilities: [gpu]
-    networks:
-      - noo-cluster
+    # In its door's network namespace (door generation 5, as the agent runs
+    # it): no network of its own, listening on 127.0.0.1, reachable only
+    # through stunnel-vllm-secondary, which joins noo-cluster under this service's names.
+    network_mode: "service:stunnel-vllm-secondary"
+    depends_on:
+      - stunnel-vllm-secondary
     restart: unless-stopped
-    # Self-check with the container's OWN leaf: the listener requires a client
-    # certificate and this image carries python3, not curl. Presenting the
-    # service's own cert to itself proves the mTLS listener is up, which is
-    # what a healthcheck is for; it grants nothing (the container already
-    # holds that key). CA-verified, hostname `localhost` is in every service
-    # leaf's SANs. start_period covers a cold model load.
+    # Plain HTTP on loopback inside the namespace; the image carries python3,
+    # not curl. start_period covers a cold model load.
     healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import ssl,urllib.request; ctx=ssl.create_default_context(cafile='/app/pki/ca.crt'); ctx.load_cert_chain('/app/pki/services/vllm/service.crt','/app/pki/services/vllm/service.key'); urllib.request.urlopen('https://localhost:8000/health',context=ctx,timeout=5)\" || exit 1"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=5)\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -1500,24 +1498,91 @@ services:
           *DeepSeek-R1*|*deepseek*) REASON_ARG="--reasoning-parser deepseek_r1" ;;
         esac
 
-        ARGS="--model $$VLLM_MODEL $$QUANT_ARG --gpu-memory-utilization $$GPU_MEMORY_UTILIZATION --max-model-len $$VLLM_MAX_MODEL_LEN --enable-auto-tool-choice --tool-call-parser $$VLLM_TOOL_PARSER $$REASON_ARG --host 0.0.0.0 --port 8000"
+        ARGS="--model $$VLLM_MODEL $$QUANT_ARG --gpu-memory-utilization $$GPU_MEMORY_UTILIZATION --max-model-len $$VLLM_MAX_MODEL_LEN --enable-auto-tool-choice --tool-call-parser $$VLLM_TOOL_PARSER $$REASON_ARG --host 127.0.0.1 --port 8000"
 
-        # TLS is not a switch. The listener presents the `vllm` service leaf,
-        # verifies every caller against the cluster CA and REQUIRES a client
-        # certificate (--ssl-cert-reqs 2 = ssl.CERT_REQUIRED): the gateway
-        # presents its leaf, the controller's own agent its node leaf. Until
-        # 2026-09-28 this ran only when NOO_VLLM_TLS was set, and even then
-        # asked for no client cert, so any process on the compose network
-        # could read every prompt. No leaf = no listener: refuse to start
-        # rather than serve plaintext (exit 78 = EX_CONFIG).
-        if [ ! -f /app/pki/services/vllm/service.crt ] || [ ! -f /app/pki/services/vllm/service.key ]; then
-          echo "vllm: no services/vllm leaf under NOO_PKI_DIR — refusing to serve plaintext. Fix: noo security pki issue-service vllm" >&2
-          exit 78
-        fi
-        ARGS="$$ARGS --ssl-certfile /app/pki/services/vllm/service.crt --ssl-keyfile /app/pki/services/vllm/service.key --ssl-ca-certs /app/pki/ca.crt --ssl-cert-reqs 2"
+        # No TLS here: the engine listens on loopback in its door's namespace
+        # and the door (stunnel, verify = 2, callers pinned by name) is the
+        # only way in. The door holds the `vllm` leaf; this container holds
+        # no key at all.
 
         echo "Starting secondary vLLM: $$VLLM_MODEL (GPU util: $$GPU_MEMORY_UTILIZATION, parser: $$VLLM_TOOL_PARSER)"
         python3 -m vllm.entrypoints.openai.api_server $$ARGS
+
+  # stunnel mTLS door for vllm (same shape as stunnel-llamacpp; the agent's
+  # noo-stunnel-vllm, #522). Accepts on :8000, presents the `vllm` leaf,
+  # requires a cluster-CA client certificate from a pinned caller and
+  # forwards plain HTTP to 127.0.0.1:8000. Same profile as the engine.
+  stunnel-vllm:
+    logging: *default-logging
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.stunnel
+    image: noomesh/stunnel:latest
+    pull_policy: build
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-vllm
+    # Door floor (i301): non-root, no capability, read-only root; the
+    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
+    # The name its stunnel.conf accepts on (its bridge address, not
+    # 0.0.0.0): vllm listens on 127.0.0.1 in this namespace.
+    hostname: noo-stunnel-vllm
+    user: nonroot
+    entrypoint: *stunnel-self-pin
+    environment:
+      - NOO_STUNNEL_SELF_NODE=${NODE_ID:-}
+    profiles: ["vllm"]
+    volumes:
+      - ./docker/stunnel-vllm.conf:/etc/stunnel/stunnel.conf:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/vllm:/tls/services/vllm:ro
+    networks:
+      noo-cluster:
+        # Callers keep dialling the engine's names (https://noo-vllm:8000,
+        # the `vllm` service name); the vllm leaf already carries them.
+        aliases:
+          - vllm
+          - ${NOO_CONTAINER_PREFIX:-noo}-vllm
+    restart: unless-stopped
+
+  # stunnel mTLS door for vllm-secondary: the primary's shape, its own name.
+  # Shares the primary's leaf (it carries noo-vllm-secondary).
+  stunnel-vllm-secondary:
+    logging: *default-logging
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.stunnel
+    image: noomesh/stunnel:latest
+    pull_policy: build
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-vllm-secondary
+    # Door floor (i301): non-root, no capability, read-only root; the
+    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
+    # The name its stunnel.conf accepts on (its bridge address, not
+    # 0.0.0.0): vllm-secondary listens on 127.0.0.1 in this namespace.
+    hostname: noo-stunnel-vllm-secondary
+    user: nonroot
+    entrypoint: *stunnel-self-pin
+    environment:
+      - NOO_STUNNEL_SELF_NODE=${NODE_ID:-}
+    profiles: ["vllm-secondary"]
+    volumes:
+      - ./docker/stunnel-vllm-secondary.conf:/etc/stunnel/stunnel.conf:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/vllm:/tls/services/vllm:ro
+    networks:
+      noo-cluster:
+        # Callers keep dialling the engine's names (https://noo-vllm-secondary:8000,
+        # the `vllm-secondary` service name); the vllm leaf already carries them.
+        aliases:
+          - vllm-secondary
+          - ${NOO_CONTAINER_PREFIX:-noo}-vllm-secondary
+    restart: unless-stopped
 
   # llama.cpp backend
   llamacpp:
@@ -1537,6 +1602,15 @@ services:
     image: ${LLAMACPP_IMAGE:-${NOO_IMAGE_PREFIX:-noomesh}/llamacpp:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_LLAMACPP:-}}
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-llamacpp
+    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
+    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
+    # these images share; the GPU needs none (device requests, not caps).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    # llama-server writes nothing outside /models (docker diff, awolf 2026-10-28).
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=64m"]
     # NOT in gpu-tier2: the launcher auto-adds that profile on any 4-10 GB
     # box, and with no LLAMACPP_MODEL configured MODEL_PATH points at a GGUF
     # that does not exist → llama-server restart-loops (host8 fresh
@@ -1545,11 +1619,11 @@ services:
     profiles: ["llamacpp", "cpu"]
     # No host port, and no TLS of its own: llama-server has no TLS listener
     # in either image, so every caller reaches it through stunnel-llamacpp
-    # below (mTLS, client cert required) at noo-stunnel-llamacpp:8085. Its
-    # own :8085 stays reachable on the shared noo-cluster network until the
-    # backends get a private network — the sidecar is the
-    # door every client is pointed at; the private network makes it the
-    # only one. Use `docker exec` for debugging.
+    # below (mTLS, client cert required) at noo-stunnel-llamacpp:8085. It
+    # runs in the sidecar's network namespace and listens on 127.0.0.1 only
+    # (door generation 3, F-ii): no other container and no host process can
+    # reach its plain :8085, so the sidecar is the only door. Use
+    # `docker exec` for debugging.
     #
     # Mounts nothing from the PKI directory: it reads nothing there (#506
     # said the same of the agent-started one), and the leaf it used to hold
@@ -1562,7 +1636,7 @@ services:
       # Pin the cluster contract port — overrides any stale ENV baked into
       # an old image (a host8 build listened on 8080 and broke all routed
       # inference to the node while its healthcheck stayed green).
-      - HOST=0.0.0.0
+      - HOST=127.0.0.1
       - PORT=${LLAMACPP_PORT:-8085}
     volumes:
       - ${MODELS_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/models}:/models:ro
@@ -1576,9 +1650,12 @@ services:
         limits:
           cpus: '4'
           memory: 8G
-    networks:
-      - noo-cluster
+    # In its door's network namespace (door generation 3): no network of
+    # its own, listening on 127.0.0.1, reachable only through stunnel-llamacpp.
+    network_mode: "service:stunnel-llamacpp"
     restart: unless-stopped
+    depends_on:
+      - stunnel-llamacpp
 
   # stunnel mTLS sidecar for llama.cpp (same shape as stunnel-ollama).
   # Accepts on :8085 — the port every client already dials for llamacpp —
@@ -1596,6 +1673,15 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-llamacpp
+    # Door floor (i301): non-root, no capability, read-only root; the
+    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
+    # The name its stunnel.conf accepts on (its bridge address, not
+    # 0.0.0.0): llamacpp listens on 127.0.0.1 in this namespace.
+    hostname: noo-stunnel-llamacpp
     user: nonroot
     entrypoint: *stunnel-self-pin
     environment:
@@ -1608,8 +1694,6 @@ services:
     networks:
       - noo-cluster
     restart: unless-stopped
-    depends_on:
-      - llamacpp
 
   # AirLLM backend
   airllm:
@@ -1620,6 +1704,12 @@ services:
     image: noomesh/airllm:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-airllm
+    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
+    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
+    # these images share; the GPU needs none (device requests, not caps).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     profiles: ["airllm"]
     # No external port — gateway reaches AirLLM via Docker network
     environment:
@@ -1661,13 +1751,19 @@ services:
     # noo-cli image_stage.rs THIRD_PARTY_LOCK_ROWS).
     image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama
+    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
+    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
+    # these images share; the GPU needs none (device requests, not caps).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     profiles: ["ollama", "gpu-tier2"]
     # No external port — gateway reaches Ollama via Docker network (noo-cluster)
     environment:
       # Ollama sends no telemetry; this stops it handing a prompt to ollama.com
       # (cloud models, web search). docs/security/telemetry.md
       - OLLAMA_NO_CLOUD=1
-      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_HOST=127.0.0.1
       # Default empty (was qwen3:8b — non-US). Ollama starts without auto-pulling
       # a model; models are placed explicitly (noo cluster place / ship-model),
       # so the fleet stays US-vendor (model governance).
@@ -1681,9 +1777,12 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    networks:
-      - noo-cluster
+    # In its door's network namespace (door generation 3): no network of
+    # its own, listening on 127.0.0.1, reachable only through stunnel-ollama.
+    network_mode: "service:stunnel-ollama"
     restart: unless-stopped
+    depends_on:
+      - stunnel-ollama
 
   # Ollama for the standalone profile: the single ollama that serves the
   # embedder (harrier) AND chat on a one-box install (controller profiles
@@ -1693,20 +1792,25 @@ services:
     # H-N4: parameterized so it can be pinned to a verified version/digest.
     image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama-embed
+    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
+    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
+    # these images share; the GPU needs none (device requests, not caps).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     profiles: ["standalone"]
     # Publishes NOTHING. Every caller goes through stunnel-ollama-embed
     # below — mTLS, client certificate required: the containers (gateway,
     # worker, trellion's embedder) at https://noo-stunnel-ollama-embed:11434
     # (onboard's topology env, the launchers' default), and the HOST
-    # node-agent at the sidecar's loopback publish. Its own
-    # :11434 stays reachable on the shared noo-cluster network beside the
-    # sidecar until the backends get a private network (an earlier change
-    # F-ii), same caveat as llamacpp above.
+    # node-agent at the sidecar's loopback publish. Its own plain :11434 is on
+    # 127.0.0.1 inside the sidecar's namespace, reachable by nothing else
+    # (door generation 3, as llamacpp above).
     environment:
       # Ollama sends no telemetry; this stops it handing a prompt to ollama.com
       # (cloud models, web search). docs/security/telemetry.md
       - OLLAMA_NO_CLOUD=1
-      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_HOST=127.0.0.1
       # Concurrent requests per loaded model (declared, documented in
       # docs/reference/env.md). Embed requests carry options.num_ctx=1024
       # (gateway embedding_client.rs EMBED_NUM_CTX), so 4 slots cost ~4K
@@ -1716,9 +1820,12 @@ services:
       - OLLAMA_NUM_PARALLEL=${OLLAMA_EMBED_NUM_PARALLEL:-4}
     volumes:
       - ollama-embed-data:/root/.ollama
-    networks:
-      - noo-cluster
+    # In its door's network namespace (door generation 3): no network of
+    # its own, listening on 127.0.0.1, reachable only through stunnel-ollama-embed.
+    network_mode: "service:stunnel-ollama-embed"
     restart: unless-stopped
+    depends_on:
+      - stunnel-ollama-embed
 
   # OPTIONAL CPU-only embedder beside ollama-embed (profile `embed-cpu`,
   # off unless enabled). A second ollama with NO GPU device request and
@@ -1735,12 +1842,18 @@ services:
     logging: *default-logging
     image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama-embed-cpu
+    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
+    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
+    # these images share; the GPU needs none (device requests, not caps).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     profiles: ["embed-cpu"]
-    # Publishes nothing; only stunnel-ollama-embed-cpu reaches it (the
-    # same shared-network caveat as ollama-embed above).
+    # Publishes nothing; only stunnel-ollama-embed-cpu reaches it (it lives
+    # in that sidecar's namespace on 127.0.0.1, as ollama-embed above).
     environment:
       - OLLAMA_NO_CLOUD=1
-      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_HOST=127.0.0.1
       # Hide every GPU: this instance is CPU-only by declaration.
       - CUDA_VISIBLE_DEVICES=-1
       - NVIDIA_VISIBLE_DEVICES=none
@@ -1750,11 +1863,15 @@ services:
       - OLLAMA_KEEP_ALIVE=-1
     volumes:
       - ollama-embed-data:/root/.ollama
-    networks:
-      - noo-cluster
+    # In its door's network namespace (door generation 3): no network of
+    # its own, listening on 127.0.0.1, reachable only through stunnel-ollama-embed-cpu.
+    network_mode: "service:stunnel-ollama-embed-cpu"
     restart: unless-stopped
+    # NOT on ollama-embed (i277e): this is the embedder that stays up when
+    # the GPU one cannot start (a GPU fault holds ollama-embed by name, see
+    # scripts/lib-stuck-container.sh), so it must not wait on it.
     depends_on:
-      - ollama-embed
+      - stunnel-ollama-embed-cpu
 
   # mTLS door for ollama-embed-cpu: the same shape as stunnel-ollama-embed
   # below, with its own leaf (`ollama-embed-cpu`, issued by `noo upgrade
@@ -1768,6 +1885,15 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-ollama-embed-cpu
+    # Door floor (i301): non-root, no capability, read-only root; the
+    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
+    # The name its stunnel.conf accepts on (its bridge address, not
+    # 0.0.0.0): ollama-embed-cpu listens on 127.0.0.1 in this namespace.
+    hostname: noo-stunnel-ollama-embed-cpu
     user: nonroot
     entrypoint: *stunnel-self-pin
     environment:
@@ -1778,7 +1904,7 @@ services:
       - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
       - ${NOO_PKI_DIR:-./.pki-placeholder}/services/ollama-embed-cpu:/tls/services/ollama-embed-cpu:ro
     healthcheck:
-      test: ["CMD-SHELL", "printf 'GET /api/version HTTP/1.0\r\nHost: localhost\r\n\r\n' | openssl s_client -quiet -verify_return_error -verify_hostname localhost -connect 127.0.0.1:11434 -CAfile /tls/ca.crt -cert /tls/services/ollama-embed-cpu/service.crt -key /tls/services/ollama-embed-cpu/service.key 2>/dev/null | grep -q 'HTTP/1.[01] 200' || exit 1"]
+      test: ["CMD-SHELL", "printf 'GET /api/version HTTP/1.0\r\nHost: localhost\r\n\r\n' | openssl s_client -quiet -verify_return_error -verify_hostname localhost -connect noo-stunnel-ollama-embed-cpu:11434 -CAfile /tls/ca.crt -cert /tls/services/ollama-embed-cpu/service.crt -key /tls/services/ollama-embed-cpu/service.key 2>/dev/null | grep -q 'HTTP/1.[01] 200' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -1786,8 +1912,6 @@ services:
     networks:
       - noo-cluster
     restart: unless-stopped
-    depends_on:
-      - ollama-embed-cpu
 
   # stunnel mTLS sidecar for ollama-embed (same shape as stunnel-llamacpp).
   # Accepts on :11434 — Ollama's own port — presents the `ollama-embed`
@@ -1821,6 +1945,15 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-ollama-embed
+    # Door floor (i301): non-root, no capability, read-only root; the
+    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
+    # The name its stunnel.conf accepts on (its bridge address, not
+    # 0.0.0.0): ollama-embed listens on 127.0.0.1 in this namespace.
+    hostname: noo-stunnel-ollama-embed
     user: nonroot
     entrypoint: *stunnel-self-pin
     environment:
@@ -1831,7 +1964,7 @@ services:
       - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
       - ${NOO_PKI_DIR:-./.pki-placeholder}/services/ollama-embed:/tls/services/ollama-embed:ro
     healthcheck:
-      test: ["CMD-SHELL", "printf 'GET /api/version HTTP/1.0\r\nHost: localhost\r\n\r\n' | openssl s_client -quiet -verify_return_error -verify_hostname localhost -connect 127.0.0.1:11434 -CAfile /tls/ca.crt -cert /tls/services/ollama-embed/service.crt -key /tls/services/ollama-embed/service.key 2>/dev/null | grep -q 'HTTP/1.[01] 200' || exit 1"]
+      test: ["CMD-SHELL", "printf 'GET /api/version HTTP/1.0\r\nHost: localhost\r\n\r\n' | openssl s_client -quiet -verify_return_error -verify_hostname localhost -connect noo-stunnel-ollama-embed:11434 -CAfile /tls/ca.crt -cert /tls/services/ollama-embed/service.crt -key /tls/services/ollama-embed/service.key 2>/dev/null | grep -q 'HTTP/1.[01] 200' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -1841,8 +1974,6 @@ services:
     networks:
       - noo-cluster
     restart: unless-stopped
-    depends_on:
-      - ollama-embed
 
   # Text Embeddings Inference — CPU (controller)
   # Runs on controller so embeddings work out of the box without a GPU.
@@ -1852,6 +1983,12 @@ services:
     logging: *default-logging
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.6${NOO_IMAGE_DIGEST_TEI_CPU:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-tei
+    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
+    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
+    # these images share; the GPU needs none (device requests, not caps).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     profiles: ["tei-compose"]  # opt-in only (default: rerank=LLM fallback, embed=Ollama/node-agent)
     # No external port — gateway reaches TEI via Docker network
     environment:
@@ -1861,11 +1998,15 @@ services:
       - DO_NOT_TRACK=1
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - MODEL_ID=${TEI_MODEL:-BAAI/bge-base-en-v1.5}
+      - HOSTNAME=127.0.0.1
     volumes:
       - hf-cache:/data
-    networks:
-      - noo-cluster
+    # In its door's network namespace (door generation 3): no network of
+    # its own, listening on 127.0.0.1, reachable only through stunnel-tei.
+    network_mode: "service:stunnel-tei"
     restart: unless-stopped
+    depends_on:
+      - stunnel-tei
     command: ["--model-id", "${TEI_MODEL:-BAAI/bge-base-en-v1.5}"]
 
   # Text Embeddings Inference — GPU (worker nodes)
@@ -1874,6 +2015,12 @@ services:
     logging: *default-logging
     image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-tei-gpu
+    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
+    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
+    # these images share; the GPU needs none (device requests, not caps).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     # SUPERSEDED on GPU nodes by the node-agent `embedding` backend
     # (`noo cluster place <node> embedding <model>`). Gated to an
     # opt-in profile so normal embedding/gpu-tier2 startup can't duplicate
@@ -1887,6 +2034,7 @@ services:
       - DO_NOT_TRACK=1
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - MODEL_ID=${TEI_MODEL:-BAAI/bge-base-en-v1.5}
+      - HOSTNAME=127.0.0.1
     volumes:
       - hf-cache:/data
     deploy:
@@ -1896,11 +2044,13 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    networks:
-      - noo-cluster
+    # In its door's network namespace (door generation 3): no network of
+    # its own, listening on 127.0.0.1, reachable only through stunnel-tei-gpu.
+    network_mode: "service:stunnel-tei-gpu"
     restart: unless-stopped
+    depends_on:
+      - stunnel-tei-gpu
     command: ["--model-id", "${TEI_MODEL:-BAAI/bge-base-en-v1.5}", "--dtype", "float16"]
-
   stunnel-ollama:
     logging: *default-logging
     build:
@@ -1909,6 +2059,15 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-ollama
+    # Door floor (i301): non-root, no capability, read-only root; the
+    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
+    # The name its stunnel.conf accepts on (its bridge address, not
+    # 0.0.0.0): ollama listens on 127.0.0.1 in this namespace.
+    hostname: noo-stunnel-ollama
     user: nonroot
     entrypoint: *stunnel-self-pin
     environment:
@@ -1921,8 +2080,6 @@ services:
     networks:
       - noo-cluster
     restart: unless-stopped
-    depends_on:
-      - ollama
 
   # stunnel mTLS sidecar for TEI CPU (controller)
   stunnel-tei:
@@ -1933,6 +2090,15 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-tei
+    # Door floor (i301): non-root, no capability, read-only root; the
+    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
+    # The name its stunnel.conf accepts on (its bridge address, not
+    # 0.0.0.0): tei listens on 127.0.0.1 in this namespace.
+    hostname: noo-stunnel-tei
     user: nonroot
     profiles: ["tei-compose"]  # opt-in only (paired with noo-tei)
     volumes:
@@ -1942,8 +2108,6 @@ services:
     networks:
       - noo-cluster
     restart: unless-stopped
-    depends_on:
-      - tei
 
   # stunnel mTLS sidecar for TEI GPU (worker nodes)
   stunnel-tei-gpu:
@@ -1954,6 +2118,15 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-tei-gpu
+    # Door floor (i301): non-root, no capability, read-only root; the
+    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
+    # The name its stunnel.conf accepts on (its bridge address, not
+    # 0.0.0.0): tei-gpu listens on 127.0.0.1 in this namespace.
+    hostname: noo-stunnel-tei-gpu
     user: nonroot
     # Gated with tei-gpu — see above. Only needed for the compose path.
     profiles: ["tei-compose"]
@@ -1964,8 +2137,6 @@ services:
     networks:
       - noo-cluster
     restart: unless-stopped
-    depends_on:
-      - tei-gpu
 
   # Reranker — TEI serving a cross-encoder reranker model (GPU).
   # Same image family as `tei`; a reranker MODEL_ID makes TEI expose POST
@@ -1978,6 +2149,12 @@ services:
     logging: *default-logging
     image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-reranker
+    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
+    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
+    # these images share; the GPU needs none (device requests, not caps).
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     # SUPERSEDED on GPU nodes by the node-agent `reranker` backend
     # (`noo cluster place <node> reranker <model>`). Gated to opt-in
     # so normal startup can't duplicate the GPU reranker. The mesh path
@@ -1991,6 +2168,7 @@ services:
       - DO_NOT_TRACK=1
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - MODEL_ID=${RERANK_MODEL:-BAAI/bge-reranker-base}
+      - HOSTNAME=127.0.0.1
     volumes:
       - hf-cache:/data
     deploy:
@@ -2000,9 +2178,12 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    networks:
-      - noo-cluster
+    # In its door's network namespace (door generation 3): no network of
+    # its own, listening on 127.0.0.1, reachable only through stunnel-reranker.
+    network_mode: "service:stunnel-reranker"
     restart: unless-stopped
+    depends_on:
+      - stunnel-reranker
     command: ["--model-id", "${RERANK_MODEL:-BAAI/bge-reranker-base}", "--dtype", "float16"]
 
   # stunnel mTLS sidecar for the reranker (mirrors stunnel-tei-gpu)
@@ -2014,6 +2195,15 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-reranker
+    # Door floor (i301): non-root, no capability, read-only root; the
+    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
+    # The name its stunnel.conf accepts on (its bridge address, not
+    # 0.0.0.0): reranker listens on 127.0.0.1 in this namespace.
+    hostname: noo-stunnel-reranker
     user: nonroot
     # Gated with reranker — see above. Only needed for the compose path.
     profiles: ["tei-compose"]
@@ -2024,8 +2214,6 @@ services:
     networks:
       - noo-cluster
     restart: unless-stopped
-    depends_on:
-      - reranker
 
   # Node agent (runs on all nodes)
   node-agent:
@@ -2748,7 +2936,9 @@ services:
       # Ubuntu 24.04+ hosts restrict unprivileged user namespaces through
       # AppArmor and the docker-default profile also denies mount, so
       # Bubblewrap fails there with "No permissions to create new
-      # namespace" / "Can't mount proc". On such a host install the shipped
+      # namespace" / "Failed to make / slave". (Its "Can't mount proc" was
+      # never AppArmor: Docker's /proc masks, which the jail now avoids by
+      # mounting no /proc; see app.py bwrap_argv.) On such a host install the shipped
       # profile (docker/apparmor-noo-sandbox: docker-default plus the
       # user-namespace and mount rules Bubblewrap needs, nothing else) into
       # /etc/apparmor.d/noo-sandbox and set NOO_SANDBOX_APPARMOR=noo-sandbox;
@@ -2803,8 +2993,13 @@ services:
       # that would refuse every call shows up here, not in a tool error.
       # Over the door itself: the CA verifies the server (hostname
       # `localhost` is in the leaf) and the container's own leaf is the
-      # client certificate the listener requires.
-      test: ["CMD", "python", "-c", "import ssl,sys,urllib.request; c=ssl.create_default_context(cafile='/tls/ca.crt'); c.load_cert_chain('/tls/services/sandbox/service.crt','/tls/services/sandbox/service.key'); sys.exit(0 if urllib.request.urlopen('https://localhost:9000/health',context=c,timeout=3).status==200 else 1)"]
+      # client certificate the listener requires. As sandbox-server, the
+      # key's reader (0640, group sandbox-server): docker runs the check as
+      # the container's user, root, which holds no CAP_DAC_OVERRIDE here, so
+      # as root it could not open the key and the container was reported
+      # unhealthy even with a healthy server (i277c). setpriv needs only the
+      # CAP_SETUID/CAP_SETGID the container already has, and drops them.
+      test: ["CMD", "setpriv", "--reuid=sandbox-server", "--regid=sandbox-server", "--clear-groups", "--inh-caps=-all", "--", "python", "-c", "import ssl,sys,urllib.request; c=ssl.create_default_context(cafile='/tls/ca.crt'); c.load_cert_chain('/tls/services/sandbox/service.crt','/tls/services/sandbox/service.key'); sys.exit(0 if urllib.request.urlopen('https://localhost:9000/health',context=c,timeout=3).status==200 else 1)"]
       interval: 15s
       timeout: 5s
       retries: 3

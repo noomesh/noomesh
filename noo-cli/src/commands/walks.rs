@@ -176,16 +176,18 @@ pub fn walks_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+pub(crate) fn parse_settings_with(a: &mut Args) -> Result<Option<bool>, ArgError> {
+    let want = match a.value(&["--save"])? {
+        None => None,
+        Some(v) => Some(parse_switch(&v).ok_or_else(|| ArgError::new(format!("--save needs on or off, got `{v}`")))?),
+    };
+    a.finish()?;
+    Ok(want)
+}
+
 /// `noo walks settings [--save on|off]` — GET/PUT /api/v1/walks/settings.
 pub fn walks_settings(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut want: Option<bool> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--save" => want = Some(parse_switch(iter.next().ok_or(Unhandled)?).ok_or(Unhandled)?),
-            _ => return Err(Unhandled),
-        }
-    }
+    let want = parse_settings_with(&mut Args::new(args))?;
     match want {
         None => {
             let body = get_json(g, "/api/v1/walks/settings", true, 10);
@@ -231,16 +233,15 @@ pub fn walks_settings(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
 }
 
+pub(crate) fn parse_stats_with(a: &mut Args) -> Result<Option<String>, ArgError> {
+    let user = a.value(&["--user", "-u"])?;
+    a.finish()?;
+    Ok(user)
+}
+
 /// `noo walks stats [--user <account>]` — GET /api/v1/walks/stats (operator and above): COUNTS only.
 pub fn walks_stats(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut user: Option<String> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--user" | "-u" => user = Some(iter.next().ok_or(Unhandled)?.clone()),
-            _ => return Err(Unhandled),
-        }
-    }
+    let user = parse_stats_with(&mut Args::new(args))?;
     let path = match &user {
         Some(u) => format!("/api/v1/walks/stats?user={}", urlencode(u)),
         None => "/api/v1/walks/stats".to_string(),
@@ -288,23 +289,15 @@ pub fn walks_stats(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+pub(crate) fn parse_view_with(a: &mut Args) -> Result<(String, u32), ArgError> {
+    let limit = a.number::<u32>(&["--limit", "-n"])?.unwrap_or(50);
+    let user = a.one("<account>")?;
+    Ok((user, limit))
+}
+
 /// `noo walks view <account> [--limit <n>]` — GET /api/v1/admin/walks (admin only; AUDITED).
 pub fn walks_view(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut user: Option<String> = None;
-    let mut limit = 50u32;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--limit" | "-n" => limit = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?,
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => {
-                if user.replace(t.to_string()).is_some() {
-                    return Err(Unhandled);
-                }
-            }
-        }
-    }
-    let Some(user) = user else { return Err(Unhandled) };
+    let (user, limit) = parse_view_with(&mut Args::new(args))?;
     let body = get_json(g, &format!("/api/v1/admin/walks?user={}&limit={limit}", urlencode(&user)), true, 30);
     if g.json {
         println!("{body}");

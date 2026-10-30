@@ -23,6 +23,7 @@
 package backendrt
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -146,8 +147,18 @@ func (n *Native) ModelStats(ctx context.Context) []modelstats.ModelStat {
 		return nil
 	}
 	ps, _ := n.get(ctx, n.ollamaBase+"/api/ps")
-	return modelstats.Parse(tags, ps)
+	stats := modelstats.Parse(tags, ps)
+	laneCeilings.Fill(stats, func(name string) ([]byte, error) {
+		body, _ := json.Marshal(map[string]string{"model": name})
+		return n.send(ctx, http.MethodPost, n.ollamaBase+"/api/show", body)
+	})
+	return stats
 }
+
+// laneCeilings remembers each adopted-lane model's context ceiling
+// (/api/show) across beats; a lane's Native may be rebuilt, the models'
+// digests do not change.
+var laneCeilings modelstats.Ceilings
 
 // Runtime is the label this lane's backends carry in `backend_runtimes`
 // and the API's `runtime` field; "" for no lane.
@@ -404,12 +415,24 @@ func (n *Native) loadedModel(ctx context.Context, base string) string {
 }
 
 func (n *Native) get(ctx context.Context, url string) ([]byte, error) {
+	return n.send(ctx, http.MethodGet, url, nil)
+}
+
+// send is get with a method and an optional JSON body.
+func (n *Native) send(ctx context.Context, method, url string, body []byte) ([]byte, error) {
 	if n.clientErr != nil {
 		return nil, n.clientErr
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	var rd io.Reader
+	if body != nil {
+		rd = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, rd)
 	if err != nil {
 		return nil, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := n.client.Do(req)
 	if err != nil {

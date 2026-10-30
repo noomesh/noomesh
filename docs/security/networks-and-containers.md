@@ -91,16 +91,22 @@ root-equivalent on the host already.
 
 ## Backend doors
 
-Each inference backend that has no TLS listener of its own sits behind a
-stunnel sidecar that requires a client certificate from the cluster CA
+Every inference backend sits behind a stunnel sidecar that requires a client certificate from the cluster CA
 (`verify = 2`) and pins the peer by the DNS name in its leaf (`checkHost`):
 only the gateway, worker, trellion, trellion-intel and evolve leaves pass the
 handshake, so a node's or a monitoring container's certificate is refused.
+The backend runs in its door's network namespace and listens on 127.0.0.1
+only, so the door is the only way in. vLLM (`vllm`, `vllm-secondary`) served
+TLS itself until it moved behind `stunnel-vllm` / `stunnel-vllm-secondary`,
+as the node agent's vLLM did in door generation 5: each door joins
+`noo-cluster` under the engine's names (`vllm`, `noo-vllm`), so every caller's
+URL stays `https://noo-vllm:8000`. That own listener admitted any cluster-CA
+leaf.
 
-The ollama, ollama-embed, ollama-embed-cpu and llamacpp doors are also dialled
+The ollama, ollama-embed, ollama-embed-cpu, llamacpp and both vLLM doors are also dialled
 by the controller's own node-agent with its **node** certificate, whose only
 distinguishing name is the controller's node id. stunnel cannot match
-organisation, and a static file cannot list the id, so those four doors append
+organisation, and a static file cannot list the id, so those doors append
 `checkHost = $NODE_ID` at start (the `stunnel-self-pin` entrypoint in
 `docker-compose.cluster.yml`). If `NODE_ID` is unset, `auto` or not a plain
 node name the door **refuses to start** (exit 78) and says to set it in `.env`;
@@ -125,6 +131,27 @@ agent sets `User: "0"` on them explicitly.
 | `gateway` | ALL | yes | yes (tmpfs `/tmp` 512m, `/home/nonroot` 64m) |
 | `worker`, `worker-extra` | ALL | yes | yes (tmpfs `/tmp` 256m, `/home/nonroot` 64m) |
 | `trellion` | ALL | yes | yes (tmpfs `/tmp` 1g, `/home/nonroot` 256m) |
+| `stunnel-*` (the nine backend doors) | ALL | yes | yes (tmpfs `/tmp` 16m; non-root) |
+| `llamacpp` | ALL, plus the agent's backend set (below) | yes | yes (tmpfs `/tmp` 64m; non-root in the image) |
+| `vllm`, `vllm-secondary`, `ollama`, `ollama-embed`, `ollama-embed-cpu`, `tei`, `tei-gpu`, `reranker`, `airllm` | ALL, plus `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETGID`, `SETUID` (the node agent's backend set) | yes | no (below) |
+
+**Backends that keep a writable root, and why** (measured with `docker diff`
+on running containers, awolf, 2026-10-28):
+
+- `vllm`: runs as root and writes `/tmp` (torch inductor, cutlass), `/root/.nv`
+  (CUDA compute cache), `/root/.triton` (kernel cache) and `/etc/ld.so.cache`
+  (the GPU runtime at start). Read-only needs those as tmpfs or a cache
+  volume, and a test that the NVIDIA runtime still starts on a read-only
+  root; non-root needs the Hugging Face cache owned by that user.
+- `ollama` (all three): writes its model store under `/root/.ollama` (a
+  volume) as root; non-root needs the volume re-owned and `HOME` moved.
+- `tei`, `tei-gpu`, the TEI `reranker`: write the model cache under `/data` as
+  root; same re-own as Ollama.
+- `airllm`: a local build, not measured.
+- The node agent's own doors run as root (not the image's non-root user) to
+  read the node's root-owned `0600` service key with `DAC_OVERRIDE`; they are
+  read-only except on the `alpine` fallback image, which installs stunnel at
+  start.
 
 The gateway, the worker and trellion run as an unprivileged user, bind ports
 above 1024 and use no capability, so dropping all of them removes nothing they
@@ -182,17 +209,50 @@ Docker's `docker-default` profile denies every mount in a container, and on
 hosts that restrict unprivileged user namespaces through AppArmor it denies
 the user namespace too. Bubblewrap needs both, so under `docker-default` on
 such a host every call fails ("No permissions to create new namespace",
-"Can't mount proc") and `/health` reports the isolation as unusable. The
+"Failed to make / slave") and `/health` reports the isolation as unusable. The
 stack ships `docker/apparmor-noo-sandbox`: `docker-default` verbatim, with
 `userns,`, `mount,` and `pivot_root,` in place of `deny mount,` and nothing
-else loosened (pinned by `tests/test_sandbox_apparmor_profile.py`). The
-operator installs it once into `/etc/apparmor.d/noo-sandbox` and sets
-`NOO_SANDBOX_APPARMOR=noo-sandbox`; the mounts a call makes stay inside its
+else loosened (pinned by `tests/test_sandbox_apparmor_profile.py`). On a
+host whose active LSM is AppArmor (`/sys/kernel/security/lsm`, not the
+distribution name), `noo onboard`'s services step installs it into
+`/etc/apparmor.d/noo-sandbox`, loads it and sets
+`NOO_SANDBOX_APPARMOR=noo-sandbox`, and fails the run loudly with both
+commands when sudo cannot; on SELinux and LSM-less hosts it installs
+nothing; the mounts a call makes stay inside its
 own user namespace, since the container holds no `CAP_SYS_ADMIN`.
 `unconfined` remains only for a parser older than 4.0, which cannot load
 the `userns,` rule. The `sandbox executor` row of `noo cluster verify`
 fails, with that install as its remedy, whenever the sandbox reports that
 its isolation cannot run.
+
+#### No /proc inside the per-call jail
+
+Docker masks paths under every container's `/proc` (`/proc/kcore`,
+`/proc/keys` and others with `/dev/null`; `/proc/sys`, `/proc/irq` and
+others read-only). Inside a call's new user namespace those mounts are
+locked, and the kernel then refuses a fresh procfs (no procfs in the mount
+namespace is fully visible). Through 0.6.13 the jail asked for one
+(`--proc /proc`), so with the AppArmor profile in place every call still
+failed, with "Can't mount proc on /proc: Operation not permitted" (pop-os,
+2026-10-26). The jail now mounts no `/proc` at all and keeps every
+namespace. The other ways out were each worse:
+
+- binding the container's `/proc` shows the code this server and the other
+  calls;
+- `systempaths=unconfined` lifts the masks for the server too;
+- no capability helps, because the refusal does not depend on one.
+
+Code in the jail therefore has no `/proc/self/*`, `/proc/meminfo`,
+`/proc/cpuinfo`, `/dev/fd` or `/dev/stdin`. Reading one fails with a plain
+`FileNotFoundError` naming the path, and the sandbox adds one line under
+the traceback saying there is no `/proc`. `os.cpu_count()`,
+`os.sched_getaffinity(0)` and the `resource` module still answer.
+
+Before the first call the sandbox runs a self-test inside the jail. It
+checks that the code is in its own PID namespace, sees loopback alone,
+cannot see the server's process or `/tls`, runs as its executor uid and
+starts in `/work`. `/health` reports the facts under
+`isolation.self_test`, and the mode is usable only when they pass.
 
 ### Read-only root filesystem
 

@@ -1481,7 +1481,7 @@ sudo apt install cage python3
 wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
 sudo apt install ./google-chrome-stable_current_amd64.deb
 
-sudo tailscale up --auth-key=<key from invite> --force-reauth
+sudo tailscale up --auth-key=<key from invite> --force-reauth --ssh=false
 noo upgrade                                  # needs noo-cli >= 0.5.31
 noo kiosk setup --mode <dedicated|shared> --url https://<controller>.<tailnet>.ts.net --view health
 noo kiosk status

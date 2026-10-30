@@ -79,7 +79,9 @@
 //! query in; never raise one.
 
 pub mod agent_messages;
+pub mod agent_recipients;
 pub mod audit;
+pub mod caller_verifiers;
 pub mod cluster;
 pub mod graph;
 pub mod heartbeat;
@@ -168,7 +170,7 @@ mod ratchet {
     ("role_capability.rs", 1),
     ("role_provision.rs", 7),
     ("routes/admin.rs", 10),
-    ("routes/agents.rs", 6),
+    ("routes/agents.rs", 5),
     ("routes/bootstrap.rs", 17),
     ("routes/cluster.rs", 39),
     ("routes/communication.rs", 11),

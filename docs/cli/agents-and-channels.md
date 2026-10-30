@@ -241,7 +241,7 @@ or have the person log in and run `noo security service-key self`
 | Command | Arguments | What it does |
 |---|---|---|
 | `noo tasks create` | `<objective> [--model <m>] [--budget <loops>] [-t\|--token-budget <tokens>]` | Give the agent an objective to loop on until done (needs `noo auth login`) |
-| `noo tasks list` | `[--state <s>] [--user <u>] [-n <limit>]` | List tasks: yours, or everyone's as an operator |
+| `noo tasks list` | `[--state <s>] [--user <u>] [-n\|--limit <n>]` | List tasks: yours, or everyone's as an operator |
 | `noo tasks show` | `<id>` | One task: state, loops, last note, result |
 | `noo tasks stop` | `<id> \| --via addon:<name> [--user <u>]` | Stop a task, or revoke an add-on's background work with --via (--user: operators) |
 | `noo tasks resubmit` | `<id> [-t\|--token-budget <tokens>]` | Give a task more tokens; one stopped out of tokens resumes from its checkpoint |

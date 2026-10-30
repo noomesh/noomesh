@@ -4,7 +4,10 @@
 package modelstats
 
 import (
+	"encoding/json"
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -28,17 +31,17 @@ func TestParse(t *testing.T) {
 		want     []ModelStat
 	}{
 		{"tags and ps merged", tagsBody, psBody, []ModelStat{
-			{Name: "gemma4:26b-a4b-it-qat", SizeBytes: 15800000000},
-			{Name: "harrier:latest", SizeBytes: 1200000000, ResidentBytes: 1900000000, VRAMBytes: 1900000000, Loaded: true},
+			{Name: "gemma4:26b-a4b-it-qat", SizeBytes: 15800000000, digest: "abc"},
+			{Name: "harrier:latest", SizeBytes: 1200000000, digest: "def", ResidentBytes: 1900000000, VRAMBytes: 1900000000, Loaded: true},
 			{Name: "orphan:1b", ResidentBytes: 900000000, Loaded: true},
 		}},
 		{"nothing loaded", tagsBody, `{"models":[]}`, []ModelStat{
-			{Name: "gemma4:26b-a4b-it-qat", SizeBytes: 15800000000},
-			{Name: "harrier:latest", SizeBytes: 1200000000},
+			{Name: "gemma4:26b-a4b-it-qat", SizeBytes: 15800000000, digest: "abc"},
+			{Name: "harrier:latest", SizeBytes: 1200000000, digest: "def"},
 		}},
 		{"ps unreachable", tagsBody, ``, []ModelStat{
-			{Name: "gemma4:26b-a4b-it-qat", SizeBytes: 15800000000},
-			{Name: "harrier:latest", SizeBytes: 1200000000},
+			{Name: "gemma4:26b-a4b-it-qat", SizeBytes: 15800000000, digest: "abc"},
+			{Name: "harrier:latest", SizeBytes: 1200000000, digest: "def"},
 		}},
 		{"garbage", `x`, `y`, nil},
 	}
@@ -47,5 +50,135 @@ func TestParse(t *testing.T) {
 		if !reflect.DeepEqual(got, c.want) {
 			t.Errorf("%s: got %+v want %+v", c.name, got, c.want)
 		}
+	}
+}
+
+// An /api/show body (trimmed): model_info mirrors the GGUF's keys under the
+// architecture's prefix. 262144 is gemma4:12b's, read from its GGUF on awolf.
+const showBody = `{"modelfile":"…","details":{"family":"gemma4"},"model_info":{
+ "general.architecture":"gemma4","gemma4.block_count":48,"gemma4.context_length":262144,
+ "gemma4.attention.head_count_kv":[8,8]}}`
+
+func TestShowContextLengthReadsTheArchitecturesKey(t *testing.T) {
+	if got := ShowContextLength([]byte(showBody)); got != 262144 {
+		t.Fatalf("ShowContextLength = %d, want 262144", got)
+	}
+	for _, b := range []string{``, `{}`, `{"model_info":{"gemma4.context_length":8192}}`, `{"model_info":{"general.architecture":"llama"}}`, `not json`} {
+		if got := ShowContextLength([]byte(b)); got != 0 {
+			t.Errorf("ShowContextLength(%q) = %d, want 0", b, got)
+		}
+	}
+}
+
+// i285: each model's ceiling is asked once per digest, at most showBudget
+// new models per beat, and a failed call is asked again next beat.
+func TestCeilingsAskOncePerModelWithinTheBudget(t *testing.T) {
+	var c Ceilings
+	asked := map[string]int{}
+	fail := map[string]bool{"harrier:latest": true}
+	show := func(name string) ([]byte, error) {
+		asked[name]++
+		if fail[name] {
+			return nil, errTest
+		}
+		return []byte(showBody), nil
+	}
+	stats := Parse([]byte(tagsBody), nil)
+	c.Fill(stats, show)
+	if stats[0].Name != "gemma4:26b-a4b-it-qat" || stats[0].ContextLength != 262144 {
+		t.Fatalf("first beat: %+v", stats[0])
+	}
+	if stats[1].ContextLength != 0 {
+		t.Fatalf("a failed show leaves it unknown: %+v", stats[1])
+	}
+	fail["harrier:latest"] = false
+	stats = Parse([]byte(tagsBody), nil)
+	c.Fill(stats, show)
+	if asked["gemma4:26b-a4b-it-qat"] != 1 || asked["harrier:latest"] != 2 {
+		t.Fatalf("asked %v: once for a known model, again after a failure", asked)
+	}
+	if stats[0].ContextLength != 262144 || stats[1].ContextLength != 262144 {
+		t.Fatalf("second beat: %+v", stats)
+	}
+
+	many := make([]ModelStat, showBudget+3)
+	for i := range many {
+		many[i] = ModelStat{Name: string(rune('a' + i)), digest: "d"}
+	}
+	before := len(asked)
+	c.Fill(many, show)
+	if got := len(asked) - before; got != showBudget {
+		t.Fatalf("asked %d new models in one beat, want %d", got, showBudget)
+	}
+}
+
+func TestCeilingsKeyOnTheDigest(t *testing.T) {
+	var c Ceilings
+	n := 0
+	show := func(string) ([]byte, error) { n++; return []byte(showBody), nil }
+	c.Fill([]ModelStat{{Name: "m:1", digest: "a"}}, show)
+	c.Fill([]ModelStat{{Name: "m:1", digest: "a"}}, show)
+	c.Fill([]ModelStat{{Name: "m:1", digest: "b"}}, show)
+	if n != 2 {
+		t.Fatalf("show called %d times, want 2: a re-pulled tag is asked again", n)
+	}
+}
+
+func TestContextLengthIsOmittedWhileUnknown(t *testing.T) {
+	b, _ := json.Marshal(ModelStat{Name: "m"})
+	if strings.Contains(string(b), "context_length") || strings.Contains(string(b), "digest") {
+		t.Fatalf("wire: %s", b)
+	}
+	b, _ = json.Marshal(ModelStat{Name: "m", ContextLength: 8192})
+	if !strings.Contains(string(b), `"context_length":8192`) {
+		t.Fatalf("wire: %s", b)
+	}
+}
+
+var errTest = errors.New("test: show failed")
+
+func TestHFConfigContextLengthReadsTextConfigFirst(t *testing.T) {
+	cases := map[string]int64{
+		// Gemma 4 (trimmed): the language model's window is in text_config.
+		`{"architectures":["Gemma4ForConditionalGeneration"],"text_config":{"max_position_embeddings":262144},"vision_config":{"max_position_embeddings":4096}}`: 262144,
+		`{"max_position_embeddings":40960}`:                                                       40960,
+		`{"max_position_embeddings":32768,"rope_scaling":{"type":"yarn","factor":4.0}}`:           0,
+		`{"text_config":{"max_position_embeddings":8192,"rope_scaling":{"rope_type":"default"}}}`: 8192,
+		`{"rope_scaling":null,"max_position_embeddings":4096}`:                                    4096,
+		`{}`:       0,
+		`not json`: 0,
+		``:         0,
+	}
+	for body, want := range cases {
+		if got := HFConfigContextLength([]byte(body)); got != want {
+			t.Errorf("%s: %d, want %d", body, got, want)
+		}
+	}
+}
+
+func TestLlamaTrainContextPicksTheServedModel(t *testing.T) {
+	body := []byte(`{"object":"list","data":[
+ {"id":"other.gguf","meta":{"n_ctx_train":4096,"size":100}},
+ {"id":"gemma-4-12b-it-Q4_K_M.gguf","object":"model","meta":{"vocab_type":1,"n_vocab":262144,"n_ctx_train":262144,"n_embd":3840,"n_params":11766034688,"size":7300000000}}]}`)
+	if c, s := LlamaTrainContext(body, "gemma-4-12b-it-Q4_K_M.gguf"); c != 262144 || s != 7300000000 {
+		t.Errorf("served: ctx %d size %d", c, s)
+	}
+	if c, _ := LlamaTrainContext(body, "unknown"); c != 4096 {
+		t.Errorf("no match falls back to the first entry: ctx %d", c)
+	}
+	if c, s := LlamaTrainContext([]byte(`{"data":[]}`), "x"); c != 0 || s != 0 {
+		t.Errorf("empty list: %d %d", c, s)
+	}
+}
+
+func TestMergeFillsAndAppends(t *testing.T) {
+	stats := []ModelStat{{Name: "b", SizeBytes: 5}, {Name: "a", ContextLength: 100}}
+	got := Merge(stats, []ModelStat{{Name: "a", ContextLength: 999}, {Name: "b", ContextLength: 200}, {Name: "c", ContextLength: 300, Loaded: true}})
+	want := []ModelStat{{Name: "a", ContextLength: 100}, {Name: "b", SizeBytes: 5, ContextLength: 200}, {Name: "c", ContextLength: 300, Loaded: true}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v\nwant %+v", got, want)
+	}
+	if got := Merge(nil, nil); got != nil {
+		t.Errorf("nothing merged into nothing: %+v", got)
 	}
 }

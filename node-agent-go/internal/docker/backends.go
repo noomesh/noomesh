@@ -110,24 +110,18 @@ case "$VLLM_MODEL" in
 esac
 
 # Build args
-ARGS="--model $VLLM_MODEL $QUANT_ARG --gpu-memory-utilization $GPU_MEMORY_UTILIZATION --max-model-len $VLLM_MAX_MODEL_LEN --tensor-parallel-size $TENSOR_PARALLEL_SIZE $MAX_SEQS_ARG --enable-auto-tool-choice --tool-call-parser $VLLM_TOOL_PARSER --host 0.0.0.0 --port 8000"
+ARGS="--model $VLLM_MODEL $QUANT_ARG --gpu-memory-utilization $GPU_MEMORY_UTILIZATION --max-model-len $VLLM_MAX_MODEL_LEN --tensor-parallel-size $TENSOR_PARALLEL_SIZE $MAX_SEQS_ARG --enable-auto-tool-choice --tool-call-parser $VLLM_TOOL_PARSER --host 127.0.0.1 --port 8000"
 if [ -n "$VLLM_REASONING_PARSER" ]; then
   ARGS="$ARGS --reasoning-parser $VLLM_REASONING_PARSER"
 fi
-# TLS is not a switch. The listener presents the vllm service leaf, verifies
-# every caller against the cluster CA and REQUIRES a client certificate
-# (--ssl-cert-reqs 2 = ssl.CERT_REQUIRED): the agent's inference proxy, job
-# executor and GPU probe present the node leaf. Until 2026-09-29 this ran only
-# under NOO_VLLM_TLS and even then asked for no client cert, so any container
-# on the bridge could read every prompt. No leaf = no listener: refuse to
-# start rather than serve plaintext (exit 78 = EX_CONFIG). The agent checks
-# the leaf BEFORE creating this container (backendDoorCheck), so this arm is
-# the second line, not the first.
-if [ ! -f /app/pki/services/vllm/service.crt ] || [ ! -f /app/pki/services/vllm/service.key ]; then
-  echo "vllm: no services/vllm leaf under NOO_PKI_DIR — refusing to serve plaintext" >&2
-  exit 78
-fi
-ARGS="$ARGS --ssl-certfile /app/pki/services/vllm/service.crt --ssl-keyfile /app/pki/services/vllm/service.key --ssl-ca-certs /app/pki/ca.crt --ssl-cert-reqs 2"
+# Plain on 127.0.0.1 ON PURPOSE: this container runs inside its door's
+# network namespace (noo-stunnel-vllm, door generation 5), and the door is
+# the only thing that reaches loopback there. The door presents the vllm
+# leaf, requires a cluster-CA client certificate and admits named callers
+# only (sidecar.go). Until generation 5 vLLM served TLS itself, which
+# admitted ANY cluster-CA leaf: it has no checkHost. (Do not name its
+# client-cert flag in this script: the agent reads that flag off a running
+# command as "this vLLM is its own door", commandDeclaresClientCert.)
 
 # Resilient launch: retry with lower max-num-seqs on failure
 echo "Starting vLLM: $ARGS"
@@ -165,6 +159,14 @@ type BackendSpec struct {
 	Entrypoint    []string
 	MemoryLimit   int64   // bytes, 0 = unlimited
 	CPULimit      float64 // cores, 0 = unlimited
+
+	// ReadOnlyRoot runs the container on a read-only root filesystem with a
+	// tmpfs /tmp (rootFloor). Set only for an image whose write set was
+	// measured empty outside its mounts (`docker diff` on a running
+	// container): llama-server (awolf, 2026-10-28, a day of serving: no
+	// write). vLLM, ollama and TEI write caches into their image paths and
+	// are not set until measured with a writable cache mount (i301).
+	ReadOnlyRoot bool
 
 	// DisableHealthcheck turns the image's baked-in HEALTHCHECK off. The
 	// harness runs from the gateway image, whose probe hits
@@ -277,28 +279,17 @@ var backendSpecs = map[string]BackendSpec{
 			"HF_HUB_DISABLE_TELEMETRY": "1",
 		},
 		Volumes: []VolumeMount{
-			{Source: hfCacheSource, Target: "/root/.cache/huggingface"},
-			// Exactly what the entrypoint serves with: --ssl-ca-certs
-			// /app/pki/ca.crt and the vllm leaf. Optional so that a missing
-			// source is reported by buildMounts rather than failing the
-			// bind inside Docker — and then REFUSED by backendDoorCheck
-			// before the running container is touched: a provisioned node
-			// holds ca.crt + node.{crt,key} only (its bundle carries no
-			// services/ tree), and without the leaf vllm is never started,
-			// plain or otherwise.
-			{Source: pkiCACertSource, Target: pkiCACertTarget, ReadOnly: true, Optional: true},
-			{Source: pkiServiceLeafSource("vllm"), Target: pkiServiceLeafTarget("vllm"), ReadOnly: true, Optional: true},
+			{Source: hfCacheSource, Target: HFCacheTarget},
+			// No PKI: the engine serves plain inside its door's namespace,
+			// and the door (noo-stunnel-vllm) holds the vllm leaf.
 		},
 		GPUCount:   "${GPU_COUNT:-1}",
 		Network:    "noo-cluster",
 		Entrypoint: []string{"sh", "-c"},
 		Command:    []string{vllmEntrypointScript},
-		// Self-check with the container's OWN leaf: the listener requires
-		// a client certificate and this image carries python3, not curl.
-		// Presenting the service's cert to itself proves the mTLS listener
-		// is up; it grants nothing (the container already holds that key).
-		// `localhost` is in every service leaf's SANs. Same probe as the
-		// compose vllm service.
+		// The plain listener on loopback (the image carries python3, not
+		// curl). Loopback is the door's namespace, which this container
+		// shares, so the probe reaches the engine and nothing else does.
 		HealthcheckCmd: vllmHealthcheckCmd,
 	},
 	"llamacpp": {
@@ -308,6 +299,8 @@ var backendSpecs = map[string]BackendSpec{
 		// pull the multi-arch upstream image.
 		Image:         envOr("LLAMACPP_IMAGE", llamacppDefaultImage()),
 		ContainerName: "noo-llamacpp",
+		// llama-server writes nothing outside /models (read-only too).
+		ReadOnlyRoot: true,
 		Env: map[string]string{
 			"MODEL_PATH": "${LLAMACPP_MODEL:-/models/llama-7b-Q5_K_M.gguf}",
 			// "auto" sentinel — buildEnvList resolves it to "999" (offload
@@ -322,16 +315,16 @@ var backendSpecs = map[string]BackendSpec{
 			// and never sources docker/inject-ca.sh. Its door is the
 			// noo-stunnel-llamacpp sidecar the agent runs beside it
 			// (sidecarSpec: the llamacpp leaf, `verify = 2`); the container
-			// itself listens plain on the bridge, reachable only by peers
-			// on that bridge (a private network per backend is followup
-			// 1234 F-ii). TLS to the gateway is the agent's inference proxy
+			// runs in that sidecar's namespace and listens on 127.0.0.1
+			// only (privateDoorEnv overrides HOST below, door generation
+			// 3). TLS to the gateway is the agent's inference proxy
 			// (:8081, the node leaf).
 			// Pin the cluster contract port explicitly. BackendPorts (and
 			// every consumer: jobs executor, inference proxy) expects
 			// llamacpp on 8085; a stale image whose baked-in ENV PORT
 			// differs (host8 shipped one listening on 8080) otherwise
 			// silently breaks all routed inference on the node.
-			"HOST": "0.0.0.0",
+			"HOST": doorLoopback,
 			"PORT": "${LLAMACPP_PORT:-8085}",
 			// Native tool calls on /v1/chat/completions need llama-server's
 			// `--jinja`. The hardened x86 image passes the flag in its CMD;
@@ -371,7 +364,7 @@ var backendSpecs = map[string]BackendSpec{
 		Image:         "${OLLAMA_IMAGE:-ollama/ollama:0.40.5}",
 		ContainerName: "noo-ollama",
 		Env: map[string]string{
-			"OLLAMA_HOST":  "0.0.0.0",
+			"OLLAMA_HOST":  doorLoopback,
 			"OLLAMA_MODEL": "${OLLAMA_MODEL:-qwen3:8b}",
 			// Ollama sends no usage telemetry, but it can hand a prompt to
 			// ollama.com: a `*-cloud` model is inferred remotely, and the
@@ -517,6 +510,7 @@ func rerankerSpecLlamacpp() BackendSpec {
 	return BackendSpec{
 		Image:         envOr("RERANK_IMAGE", llamacppDefaultImage()),
 		ContainerName: "noo-reranker",
+		ReadOnlyRoot:  true, // llama-server, as the llamacpp backend
 		Env: map[string]string{
 			"MODEL_PATH": "/models/${RERANK_MODEL:-bge-reranker-v2-m3-Q8_0.gguf}",
 			// Both default images (hardened x86 + upstream ghcr :server) are
@@ -524,7 +518,7 @@ func rerankerSpecLlamacpp() BackendSpec {
 			"N_GPU_LAYERS": "0",
 			"N_CTX":        "${RERANK_N_CTX:-8192}",
 			"N_THREADS":    "${RERANK_THREADS:-4}",
-			"HOST":         "0.0.0.0",
+			"HOST":         doorLoopback,
 			"PORT":         "${RERANK_PORT:-8085}",
 		},
 		Volumes: []VolumeMount{
@@ -746,7 +740,7 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 			// container came up in model-less router mode on :8080.
 			envOverrides["LLAMA_ARG_MODEL"] = mp
 		}
-		envOverrides["LLAMA_ARG_HOST"] = "0.0.0.0"
+		envOverrides["LLAMA_ARG_HOST"] = doorLoopback
 		envOverrides["LLAMA_ARG_PORT"] = resolveEnv("${LLAMACPP_PORT:-8085}")
 		// llamacpp doesn't use GPU_MEMORY_UTILIZATION — its sizing is
 		// driven by N_GPU_LAYERS / N_CTX, both kept worker-local in env.
@@ -873,6 +867,15 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 		spec.MemoryLimit = llamacppMemoryLimit(spec.MemoryLimit, overrides.MemoryLimit)
 	}
 
+	// A fronted backend listens on loopback inside its door's namespace
+	// (sidecar.go, door generation 3). After every override above, so no
+	// placement env puts it back on the bridge.
+	if SidecarFor(backend) != "" {
+		for k, v := range privateDoorEnv(sidecarConnectPort(backend, spec, envOverrides)) {
+			envOverrides[k] = v
+		}
+	}
+
 	// Build environment list
 	env := buildEnvList(spec.Env, envOverrides)
 
@@ -922,7 +925,7 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 	// have cost the running backend first.
 	var sidecarImage string
 	if SidecarFor(backend) != "" {
-		img, err := c.ensureSidecarImage(ctx)
+		img, err := c.ensureSidecarImage(ctx, backend)
 		if err != nil {
 			return fmt.Errorf("sidecar image for %s: %w", backend, err)
 		}
@@ -1010,6 +1013,7 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 		CapDrop:       []string{"ALL"},
 		CapAdd:        backendCaps(),
 	}
+	rootFloor(hostCfg, spec.ReadOnlyRoot)
 
 	// Resource limits
 	if spec.MemoryLimit > 0 {
@@ -1048,24 +1052,34 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 		}
 	}
 
-	// vLLM is its own door (--ssl-cert-reqs 2): on macOS publish that
-	// listener on host loopback so the host-mode dialer can reach it
-	// (LoopbackDoorPublish). A sidecar-fronted backend's raw port is never
-	// published — its door is the sidecar's (startSidecar).
+	// A backend that is its own door (none the agent starts today; vLLM
+	// was until door generation 5): on macOS publish that listener on host
+	// loopback so the host-mode dialer can reach it (LoopbackDoorPublish).
+	// A sidecar-fronted backend's raw port is never published — its door is
+	// the sidecar's (startSidecar), and a container in another's namespace
+	// cannot publish anyway.
 	if door, ok := backendDoors[backend]; ok && door.Sidecar == "" && LoopbackDoorPublish() {
 		applyLoopbackDoor(containerCfg, hostCfg, door.Port)
 	}
 
-	// Network config — ensure network exists on this node
+	// Network config — ensure network exists on this node. A fronted
+	// backend joins no network of its own: it lives in its sidecar's
+	// namespace (DoorNetworkMode), and the sidecar is on the bridge.
 	networkCfg := &network.NetworkingConfig{}
+	sidecarNetwork := ""
 	if spec.Network != "" {
 		if err := c.ensureNetwork(ctx, spec.Network); err != nil {
 			slog.Warn("could not create network, using default", "network", spec.Network, "error", err)
+		} else if sidecarImage != "" {
+			sidecarNetwork = spec.Network
 		} else {
 			networkCfg.EndpointsConfig = map[string]*network.EndpointSettings{
 				spec.Network: {},
 			}
 		}
+	}
+	if mode := DoorNetworkMode(backend); mode != "" {
+		hostCfg.NetworkMode = container.NetworkMode(mode)
 	}
 
 	// Remove the existing container only now, after every check above has
@@ -1078,6 +1092,20 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 	_, _ = c.docker.ContainerRemove(ctx, spec.ContainerName, client.ContainerRemoveOptions{Force: true})
 	c.removeSidecar(ctx, backend)
 
+	// The door first. A backend that cannot terminate TLS itself runs
+	// inside its stunnel sidecar's namespace, so the sidecar must exist
+	// before the backend is created; if it cannot start, the backend is
+	// never created and the start fails loudly (the reconciler records it;
+	// `cluster verify` shows the row).
+	if sidecarImage != "" {
+		port := sidecarConnectPort(backend, spec, envOverrides)
+		if err := c.startSidecar(ctx, backend, sidecarImage, sidecarNetwork, port); err != nil {
+			c.removeSidecar(ctx, backend)
+			return fmt.Errorf("start %s door (%s): %w — %s not started rather than left without its door",
+				backend, SidecarContainerFor(backend), err, spec.ContainerName)
+		}
+	}
+
 	// Create and start
 	resp, err := c.docker.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Config:           containerCfg,
@@ -1086,25 +1114,12 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 		Name:             spec.ContainerName,
 	})
 	if err != nil {
+		c.removeSidecar(ctx, backend)
 		return fmt.Errorf("create container %s: %w", spec.ContainerName, err)
 	}
 
 	if _, err := c.docker.ContainerStart(ctx, resp.ID, client.ContainerStartOptions{}); err != nil {
 		return fmt.Errorf("start container %s: %w", spec.ContainerName, err)
-	}
-
-	// The door. A backend that cannot terminate TLS itself gets its stunnel
-	// sidecar now; if the sidecar cannot start, the backend does not stay
-	// up plain behind a missing door — it is torn down and the start fails
-	// loudly (the reconciler records it; `cluster verify` shows the row).
-	if sidecarImage != "" {
-		port := sidecarConnectPort(backend, spec, envOverrides)
-		if err := c.startSidecar(ctx, backend, sidecarImage, spec.Network, spec.ContainerName, port); err != nil {
-			_, _ = c.docker.ContainerStop(ctx, spec.ContainerName, client.ContainerStopOptions{})
-			_, _ = c.docker.ContainerRemove(ctx, spec.ContainerName, client.ContainerRemoveOptions{Force: true})
-			return fmt.Errorf("start %s door (%s): %w — %s torn down rather than left serving plaintext",
-				backend, SidecarContainerFor(backend), err, spec.ContainerName)
-		}
 	}
 
 	slog.Info("backend started via SDK", "backend", backend, "model", model, "container", spec.ContainerName,
@@ -1548,10 +1563,7 @@ func backendDoorCheck(backend string, mounts []mount.Mount) error {
 		return nil
 	}
 	svc := doorLeafService(backend)
-	dialHost := "noo-" + backend
-	if door.Sidecar != "" {
-		dialHost = StunnelContainerPrefix + door.Sidecar
-	}
+	dialHost := doorDialHost(backend)
 	fix := "re-run `noo cluster provision <this node>` on the controller (or `noo upgrade --nodes`): " +
 		"the provision bundle carries this node's backend door leaves (svc-" + svc + ".crt/.key, SAN " +
 		dialHost + ") and noo-apply installs them under $NOO_PKI_DIR/services/" + svc + "/"
@@ -1582,7 +1594,7 @@ func backendDoorCheck(backend string, mounts []mount.Mount) error {
 		}
 	}
 	if door.Sidecar == "" {
-		// vLLM reads the leaf from its own mounts; the mount must be there.
+		// A native door reads the leaf from its own mounts; the mount must be there.
 		seen := 0
 		for _, m := range mounts {
 			if m.Target == pkiServiceLeafTarget(svc) || m.Target == pkiCACertTarget {
@@ -1590,7 +1602,7 @@ func backendDoorCheck(backend string, mounts []mount.Mount) error {
 			}
 		}
 		if seen != 2 {
-			return refuse("the vllm leaf or the cluster CA is not among the container's mounts " +
+			return refuse("the " + svc + " leaf or the cluster CA is not among the container's mounts " +
 				"(buildMounts skipped it — see backend.mount_skipped above); the listener would " +
 				"refuse to start (exit 78). Fix: " + fix)
 		}
@@ -1628,10 +1640,9 @@ func leafDNSNames(path string) ([]string, error) {
 	return cert.DNSNames, nil
 }
 
-// vllmHealthcheckCmd probes vLLM's mTLS listener with the container's own
-// leaf (CMD-SHELL; python3 because the vllm image carries no curl). Mirrors
-// the compose vllm service's healthcheck byte for byte in intent.
-const vllmHealthcheckCmd = `python3 -c "import ssl,urllib.request; ctx=ssl.create_default_context(cafile='/app/pki/ca.crt'); ctx.load_cert_chain('/app/pki/services/vllm/service.crt','/app/pki/services/vllm/service.key'); urllib.request.urlopen('https://localhost:8000/health',context=ctx,timeout=5)" || exit 1`
+// vllmHealthcheckCmd probes vLLM's plain loopback listener (CMD-SHELL;
+// python3 because the vllm image carries no curl).
+const vllmHealthcheckCmd = `python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=5)" || exit 1`
 
 // ensureNetwork creates a Docker bridge network if it doesn't already exist.
 // Worker nodes don't have docker-compose creating networks, so the agent does it.
@@ -1660,6 +1671,25 @@ func parseGPUCount(s string) int {
 	n := 1
 	fmt.Sscanf(s, "%d", &n)
 	return n
+}
+
+// rootTmpfs is the scratch a read-only-root container gets: /tmp only,
+// bounded, never executable.
+var rootTmpfs = map[string]string{"/tmp": "rw,noexec,nosuid,nodev,size=64m"}
+
+// rootFloor puts a container on a read-only root filesystem with a tmpfs
+// /tmp when readOnly is set (BackendSpec.ReadOnlyRoot, the door sidecars):
+// whatever runs in it cannot rewrite its own binaries or plant a file the
+// next start would read.
+func rootFloor(hostCfg *container.HostConfig, readOnly bool) {
+	if !readOnly {
+		return
+	}
+	hostCfg.ReadonlyRootfs = true
+	hostCfg.Tmpfs = map[string]string{}
+	for k, v := range rootTmpfs {
+		hostCfg.Tmpfs[k] = v
+	}
 }
 
 // backendCapsDefault is the capability set every backend container keeps
@@ -1780,6 +1810,42 @@ func runtimesIncludeNvidia[V any](runtimes map[string]V) bool {
 // backend the agent does not know.
 func ContainerNameFor(backend string) string {
 	return backendSpecs[backend].ContainerName
+}
+
+// ReleaseBackendImage is the image this node derives for backend from its
+// OWN release (NOO_IMAGE_PREFIX/<name>:NOO_IMAGE_TAG) when the placement names
+// no image: the hardened llama-server for llamacpp and for the llama.cpp
+// reranker engine. "" when the backend's default is not release-derived (an
+// upstream pin such as vLLM's or TEI's, which the controller sends in the
+// placement from the signed stack lock), when an override names an image
+// that is not this release's, or on a node with no release pin.
+//
+// The controller never sends these images (routes/cluster.rs
+// backend_image_ref: "the node derives its own release ref"), so the
+// placement's Image is empty and the spec hash did not change when the node
+// rolled: awolf ran noo-llamacpp on v0.6.12 after the 0.6.13 roll, with
+// llamacpp:v0.6.13 staged on the rail. reconcile.specHash folds this in.
+func ReleaseBackendImage(backend string) string {
+	prefix, tag := os.Getenv("NOO_IMAGE_PREFIX"), os.Getenv("NOO_IMAGE_TAG")
+	if prefix == "" || tag == "" {
+		return ""
+	}
+	var img string
+	switch backend {
+	case "llamacpp":
+		img = envOr("LLAMACPP_IMAGE", llamacppDefaultImage())
+	case "reranker":
+		if strings.EqualFold(strings.TrimSpace(os.Getenv("RERANK_ENGINE")), "tei") {
+			return ""
+		}
+		img = envOr("RERANK_IMAGE", llamacppDefaultImage())
+	default:
+		return ""
+	}
+	if strings.HasPrefix(img, prefix+"/") && strings.HasSuffix(img, ":"+tag) {
+		return img
+	}
+	return ""
 }
 
 func llamacppDefaultImage() string {

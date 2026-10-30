@@ -714,7 +714,7 @@ pub(crate) fn scan_findings(i: &ScanInputs) -> Vec<Finding> {
             "MEDIUM",
             "PKI Key Reader",
             format!(
-                "no reader entry for {} (left 0644) — add the container's uid to SERVICE_KEY_READERS in noo-cli/src/pki.rs, or remove the leaf",
+                "no reader entry for {}, readable beyond its owner — run 'noo security pki fix-modes' (a key with no reader entry is owner-only)",
                 i.pki_unknown_reader_keys.join(", ")
             ),
         ));
@@ -5338,7 +5338,8 @@ mod tests {
         let f = scan_findings(&i);
         assert_eq!(f.len(), 1, "{f:?}");
         assert_eq!((f[0].0, f[0].1), ("MEDIUM", "PKI Key Reader"));
-        assert!(f[0].2.contains("SERVICE_KEY_READERS") && f[0].2.contains("services/mystery/service.key"), "{}", f[0].2);
+        assert!(f[0].2.contains("pki fix-modes") && f[0].2.contains("services/mystery/service.key"), "{}", f[0].2);
+        assert!(!f[0].2.contains("SERVICE_KEY_READERS") && !f[0].2.contains("noo-cli/src"), "an operator remedy, not a source edit: {}", f[0].2);
 
     }
 

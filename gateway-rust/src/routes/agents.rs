@@ -2051,39 +2051,29 @@ async fn messages_send(
     // agent" and "you may not address it" are different answers and a
     // sender can act on the first. It also means the trust lookup only
     // runs for a recipient that could receive.
-    if !who.privileged {
-        let to_account = crate::auth::account_of(&req.to);
-        // `noo_node_config`, not a guessed `noo_nodes` — the first draft
-        // of this query named a table that does not exist, and paired
-        // with `unwrap_or(false)` it would have refused EVERY message
-        // while looking like a working trust check. The error is
-        // propagated rather than swallowed for that reason: a database
-        // that cannot answer "does this recipient exist" must surface as
-        // a 500, not as "no such recipient".
-        let known: bool = crate::repo::users::exists(&state.db, to_account).await?
-            || sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM noo_node_config WHERE node_id = $1)")
-                .bind(to_account)
-                .fetch_one(&state.db)
-                .await?;
-        if !known {
-            // Previously accepted and stored. A message to a name nobody
-            // holds sat in the table forever and the sender was told
-            // "sent" — the silent-success shape this repo has spent a
-            // week removing.
-            return Err(AppError::NotFound(format!(
-                "no such recipient '{}' — '{to_account}' is not an account or a node",
-                req.to
-            )));
+    //
+    // Existence is checked for EVERY caller (i277g). It used to be the
+    // account part only, and only for an unprivileged caller, so an
+    // operator session's handoff to a bare `general` was stored where
+    // nobody reads and answered `"sent": true`. A database that cannot
+    // answer is a 500, never "no such recipient" (nor "sent").
+    crate::agent_recipient::thread_needs_an_id(&req.to, req.thread_id.as_deref()).map_err(AppError::BadRequest)?;
+    let scope = if who.privileged { None } else { who.account() };
+    let warning = match crate::agent_recipient::check(&state.db, &req.to, scope.as_deref()).await? {
+        crate::agent_recipient::Recipient::Known => None,
+        crate::agent_recipient::Recipient::Unheld(candidates) => Some(crate::agent_recipient::unheld_warning(&req.to, &candidates)),
+        crate::agent_recipient::Recipient::Unknown(candidates) => {
+            return Err(AppError::NotFound(crate::agent_recipient::refusal(&req.to, &candidates)));
         }
-        if !same_owner(&from, &req.to)
-            && !crate::repo::agent_messages::is_trusted(&state.db, &req.to, &from).await?
-        {
-            return Err(AppError::Forbidden(format!(
-                "'{from}' may not address '{}' — an agent accepts identities its own owner \
-                 holds, and others only by a trust entry",
-                req.to
-            )));
-        }
+    };
+    let to = req.to.clone();
+    // A thread post is authorised by the seat checked above, not by one
+    // agent's trust list (there is no agent named "thread").
+    if !who.privileged && to != "thread" && !same_owner(&from, &to) && !crate::repo::agent_messages::is_trusted(&state.db, &to, &from).await? {
+        return Err(AppError::Forbidden(format!(
+            "'{from}' may not address '{to}' — an agent accepts identities its own owner \
+             holds, and others only by a trust entry"
+        )));
     }
 
     // Phase D. An author signature is verified against the key the agent
@@ -2102,7 +2092,7 @@ async fn messages_send(
             };
             let input = crate::agent_crypto::author_signing_input(
                 &from,
-                &req.to,
+                &to,
                 req.kind.as_deref().unwrap_or("message"),
                 req.thread_id.as_deref().unwrap_or(""),
                 &body,
@@ -2133,7 +2123,7 @@ async fn messages_send(
     .with_claimed_harness(req.harness.as_deref());
     let env = crate::agent_messages::Envelope::new(
         &from,
-        &req.to,
+        &to,
         req.kind.as_deref().unwrap_or("message"),
         body,
         req.thread_id.as_deref(),
@@ -2155,6 +2145,9 @@ async fn messages_send(
         // What a compromised controller could not have produced. A
         // receiver that cares about authorship reads THIS.
         "author_signed": author_signed,
+        // Set when no session or key holds `to` (i277g): delivered, but
+        // the sender is told it may be a typo, and what it may have meant.
+        "warning": warning,
     })))
 }
 

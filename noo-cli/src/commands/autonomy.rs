@@ -9,6 +9,7 @@
 //! Left in Python: nothing — the whole group is ported.
 
 use super::truncate;
+use crate::args::{ArgError, Args};
 use crate::http::{get_json, post_json};
 use crate::ui::{self, Col, Glyph};
 use crate::{Globals, Unhandled};
@@ -166,16 +167,15 @@ pub fn autonomy_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+pub(crate) fn parse_audit_with(a: &mut Args) -> Result<u64, ArgError> {
+    let limit = a.number::<u64>(&["--limit", "-n"])?.unwrap_or(20);
+    a.finish()?;
+    Ok(limit)
+}
+
 /// `noo autonomy audit [--limit N]` — GET /api/autonomy/audit?limit=.
 pub fn autonomy_audit(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut limit = 20u64;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--limit" | "-n" => limit = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?,
-            _ => return Err(Unhandled),
-        }
-    }
+    let limit = parse_audit_with(&mut Args::new(args))?;
     let body = get_json(g, &format!("/api/autonomy/audit?limit={limit}"), true, 10);
     if g.json {
         println!("{body}");
@@ -300,6 +300,13 @@ fn toggle_took_effect(resp: &serde_json::Value, enable: bool) -> bool {
     resp["status"].as_str() == Some(if enable { "enabled" } else { "disabled" })
 }
 
+pub(crate) fn parse_decisions_with(a: &mut Args) -> Result<(u64, Option<String>), ArgError> {
+    let limit = a.number::<u64>(&["--limit", "-n"])?.unwrap_or(20);
+    let location = a.value(&["--location", "-l"])?;
+    a.finish()?;
+    Ok((limit, location))
+}
+
 /// `noo autonomy decisions [--limit N] [--location NAME]` — what the
 /// DISARMED locations would have done.
 ///
@@ -309,16 +316,7 @@ fn toggle_took_effect(resp: &serde_json::Value, enable: bool) -> bool {
 /// `backend_availability` does not even alert when disarmed — so the
 /// feature is otherwise entirely silent.
 pub fn autonomy_decisions(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut limit = 20u64;
-    let mut location: Option<String> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--limit" | "-n" => limit = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?,
-            "--location" | "-l" => location = Some(iter.next().ok_or(Unhandled)?.clone()),
-            _ => return Err(Unhandled),
-        }
-    }
+    let (limit, location) = parse_decisions_with(&mut Args::new(args))?;
     let mut path = format!("/api/autonomy/decisions?limit={limit}");
     if let Some(l) = &location {
         path.push_str(&format!("&location={}", super::urlencode(l)));

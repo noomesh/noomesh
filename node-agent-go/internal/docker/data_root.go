@@ -31,3 +31,10 @@ func dataRootHint(source string) string {
 	return "; NOO_DATA_ROOT is unset on this node, so the default " + dataroots.DefaultDataRoot +
 		" was used — set the node's data root with `noo cluster set-config <node> --data-root <path>`"
 }
+
+// HFCacheTarget is where vLLM (and the HF-loading backends) see the node's
+// HF cache: a model path vLLM reports under it is HFCacheHost() on the host.
+const HFCacheTarget = "/root/.cache/huggingface"
+
+// HFCacheHost is the host directory mounted at HFCacheTarget.
+func HFCacheHost() string { return resolveEnv(hfCacheSource) }

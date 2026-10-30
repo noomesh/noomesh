@@ -443,6 +443,32 @@ jobs:
         if [ "$TRELLION_PUBLIC" != "true" ]; then args+=("${needs_trellion[@]}"); fi
         pytest tests/ -v --cov=noomesh --cov-report=xml "${args[@]}"
 
+    # The sandbox jail as it runs in a container (pop-os, 0.6.13): Docker
+    # masks paths under every container's /proc, the kernel then refuses a
+    # fresh procfs inside the call's user namespace, and a jail that asked
+    # for one refused every call. A hosted runner's /proc has no masks, so
+    # the live test above passed anyway. Here one mask is made the way Docker
+    # makes them (/dev/null bound over /proc/kcore, in a private mount
+    # namespace), and the live test runs under it as the runner, required
+    # rather than skippable (NOO_SANDBOX_TEST_PROC_MASK=1).
+    - name: Sandbox jail under Docker's /proc masks
+      timeout-minutes: 5
+      run: |
+        # A hosted runner has both (the bubblewrap step above installs it).
+        # Missing either is a FAIL, never a skip: a step that turns green
+        # without running would be a test that passes without checking.
+        sudo -n true || { echo "::error::no passwordless sudo: the masked-/proc sandbox test cannot run on this runner"; exit 1; }
+        command -v bwrap >/dev/null || { echo "::error::bubblewrap is not installed: the masked-/proc sandbox test cannot run"; exit 1; }
+        log="$RUNNER_TEMP/sandbox-proc-masks.log"
+        set -o pipefail
+        sudo -n -E env "PATH=$PATH" NOO_SANDBOX_TEST_PROC_MASK=1 \
+          unshare -m --propagation private sh -c \
+          'mount --bind /dev/null /proc/kcore && exec setpriv --reuid="$1" --regid="$2" --clear-groups -- "$3" -m pytest -rA -p no:cacheprovider tests/test_sandbox_exec_isolation.py -k "proc_masks"' \
+          sh "$(id -u)" "$(id -g)" "$(command -v python)" 2>&1 | tee "$log"
+        # Proof it ran and passed, not merely exited 0.
+        grep -E '^PASSED tests/test_sandbox_exec_isolation.py::test_bwrap_live_runs_and_proves_its_isolation_under_dockers_proc_masks' "$log" \
+          || { echo "::error::the masked-/proc sandbox test did not report PASSED"; exit 1; }
+
     # Coverage goes to a BUILD ARTIFACT, not to a third-party uploader: visible
     # per run, no token, and no network call that can take a green run down.
     - name: Upload coverage artifact

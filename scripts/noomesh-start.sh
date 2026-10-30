@@ -737,6 +737,7 @@ docker run --rm -v \"\$PWD/noomesh.yaml\":/f alpine sh -c 'chgrp 65532 /f && chm
 # override, add-on overlays, then dist last so pinned image refs win.
 . "$(dirname "$0")/lib-compose.sh"
 COMPOSE_FILES="$(compose_file_args .)"
+compose_gpu_notice
 # Every add-on service compose renders must run exactly its verified pin,
 # whether or not this start pulls (empty render = refusal). Dist only.
 if [ -n "${DIST_TAG:-}" ]; then

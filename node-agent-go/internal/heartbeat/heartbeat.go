@@ -57,6 +57,11 @@ type Reporter struct {
 	// getModelStats is the adopted lane's measured per-model sizes; the
 	// container lane is read through ollamaDoor when it returns nothing.
 	getModelStats func() []ModelStat
+	// ceilings remembers each dockerised-ollama model's context ceiling
+	// (/api/show), so it is asked once per model, not per beat.
+	ceilings modelstats.Ceilings
+	// getChatModelStats is the vLLM / llama-server chat model's entry.
+	getChatModelStats func() []ModelStat
 	// adoptedModels lists what the agent's adopted ollama lane holds
 	// (backendrt.Native.Models), dialled with the transport the lane's base
 	// needs. nil = no lane on this host, and the plaintext loopback probe
@@ -189,10 +194,23 @@ type ModelStat = modelstats.ModelStat
 // SetModelStats installs the adopted-lane model-stats source (`model_stats`).
 func (r *Reporter) SetModelStats(f func() []ModelStat) { r.getModelStats = f }
 
-// modelStats is the measured truth for the controller's memory-fit check:
-// the adopted lane's, else the dockerised ollama's door (same transport as
-// availableModels). Nil when neither answers.
+// SetChatModelStats installs the chat backend's model-stats source: the
+// model a vLLM or llama-server serves, with its context ceiling (i285).
+func (r *Reporter) SetChatModelStats(f func() []ModelStat) { r.getChatModelStats = f }
+
+// modelStats is the measured truth for the controller's memory-fit check
+// (ollamaModelStats), with the vLLM or llama-server chat model merged in.
 func (r *Reporter) modelStats() []ModelStat {
+	stats := r.ollamaModelStats()
+	if r.getChatModelStats != nil {
+		stats = modelstats.Merge(stats, r.getChatModelStats())
+	}
+	return stats
+}
+
+// ollamaModelStats: the adopted lane's, else the dockerised ollama's door
+// (same transport as availableModels). Nil when neither answers.
+func (r *Reporter) ollamaModelStats() []ModelStat {
 	if r.getModelStats != nil {
 		if st := r.getModelStats(); len(st) > 0 {
 			return st
@@ -225,7 +243,20 @@ func (r *Reporter) modelStats() []ModelStat {
 	if tags == nil {
 		return nil
 	}
-	return modelstats.Parse(tags, get("/api/ps"))
+	stats := modelstats.Parse(tags, get("/api/ps"))
+	r.ceilings.Fill(stats, func(name string) ([]byte, error) {
+		body, _ := json.Marshal(map[string]string{"model": name})
+		resp, err := client.Post(base+"/api/show", "application/json", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("/api/show %s: HTTP %d", name, resp.StatusCode)
+		}
+		return io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	})
+	return stats
 }
 
 // SetAdoptedModels installs the adopted-lane inventory (the self-node's

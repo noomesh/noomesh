@@ -287,3 +287,24 @@ def test_a_container_reaches_only_its_own_role_leaf_keys():
         for other, theirs in owners.items():
             if other != owner:
                 assert not (theirs & reached), f"{owner}'s mount reaches {other}'s role-leaf keys: {sorted(theirs & reached)}"
+
+
+def test_every_mounted_service_leaf_has_a_reader_row():
+    """i277a: a key with no `SERVICE_KEY_READERS` row is written 0600 (owner
+    only), which is right for a third-party add-on's leaf (its consumers read
+    provision copies) and wrong for a leaf a container reads in place: that
+    container would fail its TLS start. So every `services/<leaf>` a compose
+    file mounts must have a row, and a new core leaf cannot ship without one."""
+    src = (ROOT / "noo-cli" / "src" / "pki.rs").read_text()
+    table = src.split("pub const SERVICE_KEY_READERS", 1)[1].split("];", 1)[0]
+    rows = set(re.findall(r'\("([a-z0-9-]+)",\s*KeyReader::', table))
+    mounted: dict[str, set[str]] = {}
+    for path in COMPOSE_FILES:
+        for name, svc in (untag(load_raw(path)).get("services") or {}).items():
+            for rel in pki_mounts_of(svc):
+                if _SERVICE_LEAF.match(rel):
+                    mounted.setdefault(rel.split("/", 1)[1], set()).add(f"{path.name}:{name}")
+    # Not vacuous: the stack mounts well over a dozen service leaves.
+    assert len(mounted) >= 15, sorted(mounted)
+    missing = {leaf: sorted(by) for leaf, by in mounted.items() if leaf not in rows}
+    assert not missing, f"mounted service leaves with no SERVICE_KEY_READERS row (they would be written 0600): {missing}"

@@ -1607,13 +1607,29 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
     // (lib-stuck-container.sh), see LAUNCHER_EXIT_STACK_PARTIAL.
     let stuck_report = std::env::temp_dir().join(format!("noo-launch-stuck-{}", std::process::id()));
     let _ = std::fs::remove_file(&stuck_report);
-    let launch = || std::process::Command::new("bash")
-        .arg(root.join("scripts/noomesh-start.sh")).arg("--dist")
-        .env("NOO_IMAGE_TAG", tag)
-        .env("NOO_STUCK_REPORT", &stuck_report)
-        .env("NOO_CLI_BIN", &cli_bin)
-        .current_dir(root)
-        .status();
+    let build_launch = || {
+        let mut c = std::process::Command::new("bash");
+        c.arg(root.join("scripts/noomesh-start.sh")).arg("--dist")
+            .env("NOO_IMAGE_TAG", tag)
+            .env("NOO_STUCK_REPORT", &stuck_report)
+            .env("NOO_CLI_BIN", &cli_bin)
+            .current_dir(root);
+        c
+    };
+    // Default: the launcher's per-container compose lines collapse into one
+    // summary line (errors pass through verbatim). --verbose and --json keep
+    // the live stream.
+    let launch = || -> std::io::Result<std::process::ExitStatus> {
+        let mut c = build_launch();
+        if g.verbose || g.json {
+            return c.status();
+        }
+        let (status, tally) = crate::onboard::sh::run_summarised(c)?;
+        if let Some(s) = tally.summary() {
+            if status.success() && tally.failed() == 0 { ui::done(&s); } else { ui::failed(&s, None); }
+        }
+        Ok(status)
+    };
     let mut status = launch();
     // One automatic retry: the first rail walk died on a GHCR blob timeout
     // over IPv6 (host8, 2026-09-03) — a transient the second attempt sails
@@ -1884,12 +1900,21 @@ fn keyless_in_store_of(required: &[(String, String)], set: &dyn Fn(&str) -> bool
 const LAUNCHER_EXIT_STACK_PARTIAL: i32 = 75;
 
 /// The failure line for [`LAUNCHER_EXIT_STACK_PARTIAL`]. `report` is the
-/// launcher's `NOO_STUCK_REPORT` file: service name, container id, per line.
+/// launcher's `NOO_STUCK_REPORT` file: service name, container id, per line;
+/// the id line of a service held because the GPU did not answer ends in
+/// " gpu" (i277e).
 fn stuck_stack_message(report: &str, tag: &str) -> String {
-    let mut svcs: Vec<&str> = report.lines().step_by(2).map(str::trim).filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&str> = report.lines().map(str::trim).collect();
+    let mut svcs: Vec<&str> = lines.iter().step_by(2).copied().filter(|l| !l.is_empty()).collect();
     svcs.dedup();
+    let gpu = lines.iter().skip(1).step_by(2).any(|l| l.ends_with(" gpu"));
     let which = if svcs.is_empty() { "one service".to_string() } else { svcs.join(", ") };
-    format!("stack up except {which}; its container will not exit, so reboot this host to clear it, then `noo upgrade --stack` \
+    let why = if gpu {
+        "the GPU did not answer when it started (a GPU driver fault)"
+    } else {
+        "its container will not exit"
+    };
+    format!("stack up except {which}; {why}, so reboot this host to clear it, then `noo upgrade --stack` \
              (the pin IS moved to {tag})")
 }
 
@@ -5927,6 +5952,10 @@ mod keyless_tests {
         let m = stuck_stack_message("ollama-embed\nc5bba1c9\n", "v0.6.7");
         assert!(m.starts_with("stack up except ollama-embed;") && m.contains("reboot") && m.contains("`noo upgrade --stack`"), "{m}");
         assert!(stuck_stack_message("", "v0.6.7").starts_with("stack up except one service;"));
+        // i277e: a service held because the GPU did not answer says so.
+        let g = stuck_stack_message("ollama-embed\nc5bba1c9 gpu\n", "v0.6.14");
+        assert!(g.starts_with("stack up except ollama-embed; the GPU did not answer") && g.contains("reboot"), "{g}");
+        assert!(!m.contains("GPU"), "{m}");
         let body = super::phase_src::body("launch_stack");
         let retry = body.find("launcher failed").unwrap();
         assert!(body[..retry].rfind("LAUNCHER_EXIT_STACK_PARTIAL").is_some_and(|i| retry - i < 300), "no retry for 75");

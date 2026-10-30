@@ -6,6 +6,7 @@
 //! `commands::addon_pins`; this is the machinery they share with
 //! `noo upgrade --stack` and the launcher's reader.
 
+pub mod check;
 pub mod decls;
 pub mod guards;
 pub mod lock_fetch;

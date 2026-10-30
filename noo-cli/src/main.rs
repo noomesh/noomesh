@@ -81,6 +81,8 @@ mod role;
 mod shell_completion;
 #[cfg(test)]
 mod test_exec;
+#[cfg(test)]
+mod test_support;
 mod tailnet_serve;
 mod ui;
 mod usage;
@@ -695,6 +697,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["addons", "list"], commands::addons_list),
     (&["addons", "show"], commands::addons_show),
     (&["addons", "enable"], commands::addons_enable),
+    (&["addons", "check"], commands::addons_check),
     (&["addons", "disable"], commands::addons_disable),
     (&["addons", "upgrade"], commands::addons_upgrade),
     (&["addons", "verify"], commands::addons_verify),

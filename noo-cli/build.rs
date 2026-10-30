@@ -155,6 +155,8 @@ const STANDALONE_FILES: &[&str] = &[
     "docker/stunnel-ollama-embed-cpu.conf",
     "docker/stunnel-reranker.conf",
     "docker/stunnel-tei-gpu.conf",
+    "docker/stunnel-vllm.conf",
+    "docker/stunnel-vllm-secondary.conf",
     "docker/stunnel-tei.conf",
     // The sandbox's seccomp profile (security_opt, derived by
     // scripts/derive-sandbox-seccomp.py). Docker opens it on the HOST at

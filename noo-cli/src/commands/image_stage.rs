@@ -73,6 +73,41 @@ pub(crate) const THIRD_PARTY_LOCK_ROWS: &[&str] = &[
     "ollama", "nats", "nginx", "redis", "loki", "prometheus", "alertmanager", "grafana", "node-exporter", "tei", "tei-cpu", "vllm",
 ];
 
+/// Backend doors pinned to their own image instead of the release
+/// (config/door-images.json; the node agent embeds a byte-equal copy). Each
+/// pin is staged on every lock stage under source [`DOOR_PIN_SOURCE`], which
+/// release retention never prunes, so a node can fetch it after the
+/// controller has rolled past the release it came from.
+pub(crate) const DOOR_IMAGES_JSON: &str = include_str!("../../../config/door-images.json");
+/// The staged-index source of a door pin.
+pub(crate) const DOOR_PIN_SOURCE: &str = "door-pin";
+
+/// `(<prefix>/<image>:<tag>, sha256:…, <tag>)` for each pinned door, in a
+/// stable order. Malformed rows are skipped (the agent refuses to start on
+/// one, and the shipped file is pinned by tests).
+pub(crate) fn door_pin_refs(prefix: &str) -> Vec<(String, String, String)> {
+    let prefix = prefix.trim_end_matches('/');
+    let v: serde_json::Value = serde_json::from_str(DOOR_IMAGES_JSON).unwrap_or_default();
+    let mut out: Vec<(String, String, String)> = v["doors"]
+        .as_object()
+        .map(|doors| {
+            doors
+                .values()
+                .filter_map(|d| {
+                    let (img, tag, dig) = (d["image"].as_str()?, d["tag"].as_str()?, d["digest"].as_str()?);
+                    let hex = dig.strip_prefix("sha256:")?;
+                    let plain = |x: &str| !x.is_empty() && !x.contains(['/', ':', '@', ' ']);
+                    (plain(img) && plain(tag) && hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+                        .then(|| (format!("{prefix}/{img}:{tag}"), dig.to_string(), tag.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Error prefix for "this image is not published for that architecture" —
 /// a skip, not a failure (llama.cpp on ARM uses the upstream image).
 pub(crate) const NO_VARIANT: &str = "no variant for";
@@ -255,7 +290,7 @@ pub(crate) struct StagedRecord {
     /// The release-lock digest it was pulled by ("" when staged by name).
     #[serde(default)]
     pub lock_digest: String,
-    /// "lock" | "sync-images" | "place".
+    /// "lock" | "door-pin" | "sync-images" | "place".
     #[serde(default)]
     pub source: String,
     #[serde(default)]
@@ -767,14 +802,14 @@ enum Staged {
 }
 
 /// Every arch of ONE lock image, in order, on the calling thread.
-fn stage_lock_image(g: &Globals, image: &str, digest: &str, tag: &str, arches: &[String], release: &Release) -> Vec<Staged> {
+fn stage_lock_image(g: &Globals, image: &str, digest: &str, tag: &str, source: &str, arches: &[String], release: &Release) -> Vec<Staged> {
     let mut out = Vec::new();
     for arch in arches {
         let label = format!("{image} ({arch})");
         if !g.json {
             emit(Line::Step(format!("staging {label}")));
         }
-        out.push(match stage_image(g, image, arch, Some(digest), "lock") {
+        out.push(match stage_image(g, image, arch, Some(digest), source) {
             Ok(mut rec) => {
                 rec.release_tag = tag.to_string();
                 let tar = rec.tar.clone();
@@ -812,15 +847,21 @@ pub(crate) fn stage_lock(g: &Globals, lock: &str, prefix: &str, tag: &str, arche
     let mut sum = Summary::default();
     let dir = images_store_dir();
     let release = Release { prefix: prefix.to_string(), tag: tag.to_string() };
-    let rows: Vec<(String, String)> = parse_lock(lock)
+    // The lock's rows, then each pinned door under its own tag. A lock row
+    // that IS a pin's ref (staging the pin's own release) is staged once,
+    // as the pin, so retention never prunes it.
+    let pins = door_pin_refs(prefix);
+    let mut rows: Vec<(String, String, String, &str)> = parse_lock(lock)
         .into_iter()
         .filter(|r| stages_from_lock(&r.name, all))
-        .map(|r| (format!("{prefix}/{}:{tag}", r.name), r.digest))
+        .map(|r| (format!("{prefix}/{}:{tag}", r.name), r.digest, tag.to_string(), "lock"))
+        .filter(|(image, ..)| !pins.iter().any(|(p, ..)| p == image))
         .collect();
+    rows.extend(pins.into_iter().map(|(image, digest, pin_tag)| (image, digest, pin_tag, DOOR_PIN_SOURCE)));
     let workers = stage_parallelism().min(rows.len());
     if workers <= 1 {
-        for (image, digest) in &rows {
-            for r in stage_lock_image(g, image, digest, tag, arches, &release) {
+        for (image, digest, rel_tag, source) in &rows {
+            for r in stage_lock_image(g, image, digest, rel_tag, source, arches, &release) {
                 sum.absorb(r);
             }
         }
@@ -838,9 +879,9 @@ pub(crate) fn stage_lock(g: &Globals, lock: &str, prefix: &str, tag: &str, arche
                     }
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let Some((image, digest)) = rows.get(i) else { break };
+                        let Some((image, digest, rel_tag, source)) = rows.get(i) else { break };
                         JOB_LOG.with(|l| *l.borrow_mut() = Some(Vec::new()));
-                        let res = stage_lock_image(g, image, digest, tag, arches, &release);
+                        let res = stage_lock_image(g, image, digest, rel_tag, source, arches, &release);
                         let lines = JOB_LOG.with(|l| l.borrow_mut().take()).unwrap_or_default();
                         done.lock().unwrap_or_else(|e| e.into_inner())[i] = Some((lines, res));
                     }
@@ -1021,11 +1062,18 @@ pub(crate) fn read_controller_lock(g: &Globals) -> (String, String, String) {
     (lock, prefix, tag)
 }
 
-/// The `<prefix>/<name>:<tag>` refs of the lock's node-bound release images —
-/// what a node pulls after `--lock` staged them (never `--all-images` rows).
+/// The `<prefix>/<name>:<tag>` refs of the lock's node-bound release images,
+/// and each pinned door's ref — what a node pulls after `--lock` staged them
+/// (never `--all-images` rows).
 pub(crate) fn lock_node_refs(lock: &str, prefix: &str, tag: &str) -> Vec<String> {
     let prefix = prefix.trim_end_matches('/');
-    parse_lock(lock).into_iter().filter(|r| stages_from_lock(&r.name, false)).map(|r| format!("{prefix}/{}:{tag}", r.name)).collect()
+    let mut refs: Vec<String> = parse_lock(lock).into_iter().filter(|r| stages_from_lock(&r.name, false)).map(|r| format!("{prefix}/{}:{tag}", r.name)).collect();
+    for (image, ..) in door_pin_refs(prefix) {
+        if !refs.contains(&image) {
+            refs.push(image);
+        }
+    }
+    refs
 }
 
 /// Phase 1 of `noo cluster sync-images`, shared with the verb's
@@ -1208,9 +1256,39 @@ mod tests {
         let mut manual = rec("ollama/ollama:latest", "amd64", "", 1);
         manual.source = "sync-images".into();
         upsert(&mut idx, manual);
+        // A pinned door from an old release is not a release row.
+        let mut pin = rec("p/stunnel:v0", "amd64", "v0", 1);
+        pin.source = DOOR_PIN_SOURCE.into();
+        upsert(&mut idx, pin);
         let mut p = lock_tags_to_prune(&idx, "v4");
         p.sort();
-        assert_eq!(p, ["v1", "v2"], "v4 current, v3 kept for rollback; a by-name stage is never pruned");
+        assert_eq!(p, ["v1", "v2"], "v4 current, v3 kept for rollback; a by-name stage and a door pin are never pruned");
+    }
+
+    /// vLLM's door is pinned to its own stunnel image (config/door-images.json,
+    /// the file the node agent embeds): every lock stage stages it under its
+    /// own tag, and a node is told to pull it, whatever release is current.
+    #[test]
+    fn the_pinned_door_is_staged_with_every_release() {
+        let pins = door_pin_refs("reg.example/acme/");
+        assert_eq!(pins.len(), 1, "{pins:?}");
+        let (image, digest, tag) = &pins[0];
+        assert_eq!(image, &format!("reg.example/acme/stunnel:{tag}"));
+        assert!(tag.starts_with('v') && digest.len() == "sha256:".len() + 64, "{pins:?}");
+        // Another release's lock: its own stunnel row AND the pin.
+        let lock = format!("# tag v9.9.9
+stunnel@{D}
+llamacpp@{D}
+gateway@{D}
+");
+        let refs = lock_node_refs(&lock, "reg.example/acme", "v9.9.9");
+        assert_eq!(refs, ["reg.example/acme/stunnel:v9.9.9", "reg.example/acme/llamacpp:v9.9.9", image.as_str()]);
+        // The pin's own release: one ref, not two.
+        let refs = lock_node_refs(&lock, "reg.example/acme", tag);
+        assert_eq!(refs.iter().filter(|r| *r == image).count(), 1, "{refs:?}");
+        // The digest staged is the file's, as written.
+        let v: serde_json::Value = serde_json::from_str(DOOR_IMAGES_JSON).unwrap();
+        assert!(v["doors"]["vllm"]["digest"].as_str().is_some_and(|d| d == digest.as_str()));
     }
 
     #[test]
@@ -1584,9 +1662,12 @@ mod tests {
         SHARED_FAKE.with(|s| *s.borrow_mut() = None);
 
         let img = |n: &str, a: &str| format!("reg.example/acme/{n}:v1 ({a})");
+        // The pinned door (config/door-images.json) is staged after the lock rows, under its own tag.
+        let (pin, pin_digest, pin_tag) = door_pin_refs("reg.example/acme").remove(0);
+        let pinned = |a: &str| format!("{pin} ({a})");
         assert_eq!(
             sum.staged,
-            vec![img("aaa", "amd64"), img("aaa", "arm64"), img("ccc", "amd64"), img("ccc", "arm64"), img("ddd", "amd64"), img("ddd", "arm64")],
+            vec![img("aaa", "amd64"), img("aaa", "arm64"), img("ccc", "amd64"), img("ccc", "arm64"), img("ddd", "amd64"), img("ddd", "arm64"), pinned("amd64"), pinned("arm64")],
             "lock order, whatever order the workers finished in; summary: {sum:?}"
         );
         assert_eq!(sum.failed.len(), 2, "bbb fails for both arches (its export fails): {sum:?}");
@@ -1610,7 +1691,10 @@ mod tests {
             assert!(first_save < arm_pull, "arches in order for {n}");
         }
         let idx = read_index(&dir);
-        assert_eq!(idx.images.len(), 6, "no lost update in the staged index: {:?}", idx.images.iter().map(|r| (&r.image, &r.arch)).collect::<Vec<_>>());
+        assert_eq!(idx.images.len(), 8, "no lost update in the staged index: {:?}", idx.images.iter().map(|r| (&r.image, &r.arch)).collect::<Vec<_>>());
+        for r in idx.images.iter().filter(|r| r.image == pin) {
+            assert_eq!((r.source.as_str(), r.release_tag.as_str(), r.lock_digest.as_str()), (DOOR_PIN_SOURCE, pin_tag.as_str(), pin_digest.as_str()), "{r:?}");
+        }
         assert_eq!(idx.lock_stage.as_ref().map(|l| l.failed.len()), Some(2));
         let _ = std::fs::remove_dir_all(&dir);
     }

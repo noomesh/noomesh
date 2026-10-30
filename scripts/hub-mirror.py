@@ -10,7 +10,10 @@ standalone-smoke jobs failed repeatedly on "toomanyrequests". The
 inventory is `.github/hub-mirror.txt` (one Hub path per row; official images
 under `library/`). An image `<path>:<tag>` is mirrored to
 `<prefix>/<path>:<tag>`, so mirror and Hub differ by ONE prefix: the mirror
-(`$HUB_MIRROR`, default `ghcr.io/<owner>/mirror`) or `docker.io`.
+(`$HUB_MIRROR`, default `ghcr.io/<owner>/mirror`) or `docker.io`. A pinned row
+`<path>:<tag>@<digest>` is stored under `<tag>-sha256-<12 hex>` (see
+mirror_ref) and pulled as `<prefix>/<path>:<tag>@<digest>`, which resolves by
+the digest, so consumers still differ from Hub by the prefix alone.
 
   sync      (mirror-hub-images.yml, weekly + dispatch) For each row: read the
             source's index digest, newest `created` and version annotation,
@@ -101,7 +104,15 @@ def split(row: str) -> tuple[str, str, str]:
 
 
 def mirror_ref(prefix: str, row: str) -> str:
-    path, tag, _ = split(row)
+    """The mirror tag sync writes. A digest-pinned row gets its own tag,
+    `<tag>-sha256-<12 hex>`: the bare `<tag>` belongs to a floating row of the
+    same image (alpine:3.22 is both, i277i), and sharing it made the pinned row
+    read the float's newer content as a downgrade on every run. The tag also
+    keeps the pinned manifest tagged, so nothing that prunes untagged versions
+    can take it."""
+    path, tag, digest = split(row)
+    if digest:
+        tag = f"{tag}-sha256-{digest.removeprefix('sha256:')[:12]}"
     return f"{prefix.rstrip('/')}/{path}:{tag}"
 
 
@@ -248,8 +259,10 @@ def dockerfile_rows(path: Path) -> list[str]:
 
 
 def present(prefix: str, row: str) -> bool:
+    """Whether a consumer's pull would find the row: by digest for a pinned row
+    (the registry resolves `<tag>@<digest>` by the digest alone)."""
     try:
-        return describe(mirror_ref(prefix, row)) is not None
+        return describe(use_ref(prefix, row)) is not None
     except (MirrorError, subprocess.TimeoutExpired, OSError):
         return False
 

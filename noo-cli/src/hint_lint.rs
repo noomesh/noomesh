@@ -407,7 +407,7 @@ const GATEWAY_ALLOWED: &[(&str, &str, &str)] = &[(
 )];
 
 fn gateway_src_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("gateway-rust").join("src")
+    crate::test_support::repo_file("gateway-rust/src")
 }
 
 /// Blank comment-only lines and every top-level `#[cfg(test)]` item, which

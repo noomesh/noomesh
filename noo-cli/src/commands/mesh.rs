@@ -491,6 +491,10 @@ pub(crate) fn front_addon_uis(g: &Globals) {
     if crate::role::detect().controller.is_none() {
         return;
     }
+    // Called seconds after a start/restart/roll: the gateway may not be
+    // listening yet. Wait, bounded, for it to answer; a timeout falls through
+    // to the same "not checked" note below.
+    let _ = crate::http::wait_for_gateway_answer(g);
     let listing = match crate::http::get_json_try(g, "/api/addons/ui", true, 15) {
         Ok(v) => v,
         Err(e) => {

@@ -222,11 +222,11 @@ skipped unless `--integration`. See [testing.md](../development/developer-guide.
 ### `noo logs` — Log aggregation
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo logs errors` | `[-c <container>] [-m <min>] [-n <limit>] [--node <id>] [--name <n>] [--since <t>]` | List recent warning/error lines across the fleet (Loki, else a container scan) |
-| `noo logs tail` | `<container> \| -c <container> \| --name <n> [-l <lines>] [-n <node>] [--since <t>]` | Print the last N log lines of one container or unit, optionally on a given node |
-| `noo logs search` | `[<text>] [-n <node>] [--name <n>] [--level <l>] [--since <t>] [--until <t>] [-l <n>]` | Search the fleet's logs in Loki by node, name, level, time window and text |
-| `noo logs containers` | `[-n <node-id>]` | List Docker containers across cluster nodes via the node-agents |
-| `noo logs query` | `<logql> [-l <limit>]` | Run a raw LogQL query against Loki and print streams and lines |
+| `noo logs errors` | `[-c\|--container <container>] [-m\|--minutes <min>] [-n\|--limit <limit>] [--node <id>] [--name <n>] [--source <s>] [--since <t>] [--until <t>]` | List recent warning/error lines across the fleet (Loki, else a container scan) |
+| `noo logs tail` | `<container> \| -c\|--container <container> \| --name <n> [-l\|--lines <lines>] [-n\|--node <node>] [--source <s>] [--since <t>] [--until <t>] [--grep <regex>]` | Print the last N log lines of one container or unit, optionally on a given node |
+| `noo logs search` | `[<text>] [-n\|--node <node>] [--name <n>] [-c\|--container <c>] [--source <s>] [--level <l>] [--since <t>] [--until <t>] [-l\|--limit <n>] [--newest] [-q\|--query <logql>]` | Search the fleet's logs in Loki by node, name, level, time window and text |
+| `noo logs containers` | `[-n\|--node <node-id>]` | List Docker containers across cluster nodes via the node-agents |
+| `noo logs query` | `<logql> [-l\|--limit <limit>]` | Run a raw LogQL query against Loki and print streams and lines |
 | `noo logs status` | — | Report Loki connectivity and node-registry availability |
 
 ### `noo config` — Runtime configuration

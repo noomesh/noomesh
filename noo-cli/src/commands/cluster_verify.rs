@@ -38,6 +38,7 @@ use std::process::Command;
 mod image_family;
 mod warmup;
 pub(crate) mod restart_loops;
+mod gpu_held;
 
 /// One invariant, judged.
 #[derive(Debug, Clone, PartialEq)]
@@ -2225,8 +2226,8 @@ fn grafana_mounts_sso_pub() -> Option<bool> {
 /// take back: every re-issue and mode repair of it fails until the printed
 /// `sudo chown` runs. A uid-read key its container cannot read is a WARN
 /// carrying the sudo line (the CLI cannot `chgrp` to a group it is not
-/// in, and there is no `setfacl`), and a leaf with no reader row is a
-/// WARN naming the table. Issuance, `noo upgrade --stack`, provision and
+/// in, and there is no `setfacl`), and a key with no reader row that is
+/// readable beyond its owner is a WARN that `fix-modes` closes (i277a). Issuance, `noo upgrade --stack`, provision and
 /// onboard set every mode they can, so a FAIL here that needs no sudo
 /// line means one of them has not run since the key changed.
 pub(crate) fn pki_key_modes_check(issues: &[crate::pki::KeyIssue], grant_lines: &[String], total_keys: usize) -> Check {
@@ -2266,8 +2267,10 @@ pub(crate) fn pki_key_modes_check(issues: &[crate::pki::KeyIssue], grant_lines: 
     if !unknown.is_empty() {
         return warn(
             "pki key modes",
-            format!("no reader entry for {} (left 0644)", unknown.join(", ")),
-            Some("add the container uid to SERVICE_KEY_READERS in noo-cli/src/pki.rs".into()),
+            format!("no reader entry, readable beyond the owner: {}", unknown.join(", ")),
+            // A key with no reader entry is a third-party add-on's: its only
+            // consumers are the provision copies, so fix-modes makes it 0600.
+            Some("noo security pki fix-modes".to_string()),
         );
     }
     ok("pki key modes", format!("{total_keys} private key(s), each readable only by its reader"))
@@ -2305,6 +2308,57 @@ pub(crate) fn docker_userns_check(daemon_json: Result<Option<String>, String>) -
         "docker userns",
         format!("/etc/docker/daemon.json sets userns-remap=\"{remap}\": container root is remapped, so every 0600 service key a root-in-container service reads is unreadable to it and its TLS start fails"),
         "remove \"userns-remap\" from /etc/docker/daemon.json, then: sudo systemctl restart docker",
+    )
+}
+
+/// The controller's own `tailscale status --json`, or why it could not be read.
+fn read_tailscale_status() -> Result<Value, String> {
+    let out = std::process::Command::new(crate::commands::enroll::ts_bin())
+        .args(["status", "--json"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
+}
+
+/// The "tailscale ssh" row. noomesh never uses Tailscale SSH (the
+/// controller reaches nodes over mTLS; `noo enroll` joins with
+/// `--ssh=false`), and its port forwarding has had root-level flaws, so a
+/// mesh device (tag:worker / tag:controller / tag:kiosk) that advertises
+/// it is a WARN naming the box. Read from the controller's own tailnet
+/// view: a device running Tailscale SSH publishes SSH host keys to its
+/// peers. Ordinary sshd is not this row's business.
+pub(crate) fn tailscale_ssh_check(status: Result<Value, String>) -> Check {
+    const NAME: &str = "tailscale ssh";
+    let status = match status {
+        Ok(s) => s,
+        Err(e) => return warn(NAME, format!("could not read `tailscale status --json` here ({e}), so Tailscale SSH on mesh devices is not proven off"), None),
+    };
+    let mesh = |d: &Value| {
+        d["Tags"].as_array().is_some_and(|t| {
+            t.iter().any(|x| matches!(x.as_str(), Some("tag:worker" | "tag:controller" | "tag:kiosk")))
+        })
+    };
+    let runs_ssh = |d: &Value| d["sshHostKeys"].as_array().is_some_and(|k| !k.is_empty());
+    let mut devices: Vec<&Value> = vec![&status["Self"]];
+    if let Some(peers) = status["Peer"].as_object() {
+        devices.extend(peers.values());
+    }
+    let mut on: Vec<String> = devices
+        .into_iter()
+        .filter(|d| mesh(d) && runs_ssh(d))
+        .map(|d| d["HostName"].as_str().unwrap_or("?").to_string())
+        .collect();
+    on.sort();
+    if on.is_empty() {
+        return ok(NAME, "no mesh device advertises Tailscale SSH");
+    }
+    warn(
+        NAME,
+        format!("Tailscale SSH is on for {} — noomesh never uses it, and its port forwarding has had unpatched root-level flaws", on.join(", ")),
+        Some("on each named box: sudo tailscale set --ssh=false".into()),
     )
 }
 
@@ -2811,16 +2865,34 @@ pub(crate) fn sandbox_executor_check(probe: Option<&SandboxProbe>) -> Check {
     let mode = iso["mode"].as_str().unwrap_or("unknown");
     let active = iso["active"].as_str().unwrap_or("unknown");
     if active == "none" {
+        let why = iso["detail"].as_str().unwrap_or("no detail");
         return fail(
             ROW,
             format!(
-                "the executor uid is in place ({detail}) but the configured {mode} isolation cannot run ({}) — the sandbox refuses calls until it can",
-                iso["detail"].as_str().unwrap_or("no detail")
+                "the executor uid is in place ({detail}) but the configured {mode} isolation cannot run ({why}) — the sandbox refuses calls until it can"
             ),
-            "on a host whose AppArmor blocks bwrap (Ubuntu 24.04+): sudo install -m 0644 docker/apparmor-noo-sandbox /etc/apparmor.d/noo-sandbox && sudo apparmor_parser -r /etc/apparmor.d/noo-sandbox, then NOO_SANDBOX_APPARMOR=noo-sandbox in .env (docs/reference/env.md) and: noo stack restart --force sandbox",
+            sandbox_isolation_remedy(why),
         );
     }
-    ok(ROW, format!("code runs as {detail}, uid {uid} first, never as the server; isolation {active}"))
+    // A sandbox from 0.6.14 proves its jail before the first call; older
+    // images report no self-test, which is not held against them.
+    let proven = if iso["self_test"]["passed"].as_bool() == Some(true) { " (self-test passed)" } else { "" };
+    ok(ROW, format!("code runs as {detail}, uid {uid} first, never as the server; isolation {active}{proven}"))
+}
+
+/// The remedy for an isolation the sandbox cannot run, by its reason.
+/// "Can't mount proc" was never AppArmor: it is Docker's /proc masks, which
+/// the 0.6.14 jail avoids by mounting no /proc, so the cure is the image. A
+/// failed self-test names what the jail could reach in the sandbox's log.
+/// Anything else on a 24.04+ host is the AppArmor profile.
+fn sandbox_isolation_remedy(why: &str) -> &'static str {
+    if why.contains("Can't mount proc") {
+        "noo upgrade --stack   # the sandbox image from 0.6.14 mounts no /proc in its jail (Docker's /proc masks refuse one); no host change"
+    } else if why.contains("self-test failed") {
+        "noo stack logs sandbox   # the self-test names what the jail could reach; the jail must not be loosened to pass it"
+    } else {
+        "on an AppArmor host (Ubuntu 24.04+, Debian, SUSE): noo onboard --only services (installs and loads the profile, with sudo), or by hand: sudo install -m 0644 docker/apparmor-noo-sandbox /etc/apparmor.d/noo-sandbox && sudo apparmor_parser -r /etc/apparmor.d/noo-sandbox, then NOO_SANDBOX_APPARMOR=noo-sandbox in .env (docs/reference/env.md) and: noo stack restart --force sandbox"
+    }
 }
 
 /// `answered HTTP/1.1 500 …` (a probe dial's text): the server is up and
@@ -3019,14 +3091,13 @@ fn voice_live_probe() -> Option<VoiceProbe> {
     serde_json::from_str(text.lines().last()?.trim()).ok()
 }
 
-/// How each compose-run inference backend on the controller is fronted.
-/// `Native`: the server itself terminates TLS and must run with
-/// `--ssl-cert-reqs 2` (vLLM). `Stunnel(name)`: the server has no TLS
-/// listener and every caller dials `stunnel-<name>` (conf
-/// `docker/stunnel-<name>.conf`, `verify = 2`).
+/// How each compose-run inference backend on the controller is fronted:
+/// `Stunnel(name)`, the server has no TLS listener and every caller reaches
+/// it through `stunnel-<name>` (conf `docker/stunnel-<name>.conf`,
+/// `verify = 2`). vLLM terminated its own TLS until its compose services
+/// moved behind doors too (after #522 did it for the agent's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BackendFront {
-    Native,
     Stunnel(&'static str),
 }
 
@@ -3036,8 +3107,8 @@ pub(crate) enum BackendFront {
 /// list against the file; a row here whose service is absent is skipped
 /// (profiles differ per install, the file does not).
 pub(crate) const COMPOSE_BACKENDS: &[(&str, BackendFront)] = &[
-    ("vllm", BackendFront::Native),
-    ("vllm-secondary", BackendFront::Native),
+    ("vllm", BackendFront::Stunnel("vllm")),
+    ("vllm-secondary", BackendFront::Stunnel("vllm-secondary")),
     ("llamacpp", BackendFront::Stunnel("llamacpp")),
     ("ollama", BackendFront::Stunnel("ollama")),
     ("tei", BackendFront::Stunnel("tei")),
@@ -3078,8 +3149,8 @@ pub(crate) fn compose_publishes(compose: &str, sidecar: &str, bind: &str) -> boo
 
 /// The "backend tls" row: every compose inference backend present in the
 /// shipped compose file requires a client certificate at the door a caller
-/// reaches — vLLM's own listener (`--ssl-cert-reqs 2`), or a stunnel
-/// sidecar with `verify = 2` — and no backend publishes a host port. A
+/// reaches — a stunnel sidecar with `verify = 2` — and no backend publishes
+/// a host port. A
 /// sidecar may publish its door on loopback only (stunnel-ollama-embed, for
 /// the controller's own host agent). Read from the
 /// files the stack runs from (`~/.noo` on a standalone controller).
@@ -3104,11 +3175,6 @@ pub(crate) fn backend_listener_check(compose: Option<&str>, stunnel_conf: &dyn F
             problems.push(format!("{svc} publishes a host port"));
         }
         match front {
-            BackendFront::Native => {
-                if !block.contains("--ssl-cert-reqs 2") {
-                    problems.push(format!("{svc} does not run with --ssl-cert-reqs 2 — its listener would admit a caller with no client certificate"));
-                }
-            }
             BackendFront::Stunnel(name) => {
                 let sidecar = format!("stunnel-{name}");
                 match compose_service_block(compose, &sidecar) {
@@ -5214,43 +5280,205 @@ const SEAT_WARN_REMEDY_ROWS: [&str; 3] = ["seat layout", "display binaries", "di
 fn remedies_to_print<'a>(title: &str, checks: &'a [Check]) -> Vec<(&'a str, Vec<&'a str>)> {
     // An identical remedy is printed once, with every row it covers (the
     // v0.2.97 roll printed one LUKS remedy nine times, once per `* at rest`).
+    // FAIL remedies lead: the first one printed is the next command to run,
+    // and a warning's (a LUKS move) must not stand in front of a failure's.
     let seat_section = title.starts_with("seat ");
-    let mut out: Vec<(&str, Vec<&str>)> = Vec::new();
+    let mut out: Vec<(&str, Vec<&str>, bool)> = Vec::new();
     for c in checks.iter()
         .filter(|c| c.verdict == Verdict::Fail || (c.verdict == Verdict::Warn && (title == "controller" || c.name == "gpu"
             || (seat_section && SEAT_WARN_REMEDY_ROWS.contains(&c.name)))))
     {
         let Some(r) = c.remedy.as_deref() else { continue };
-        match out.iter_mut().find(|(x, _)| *x == r) {
-            Some((_, names)) => names.push(c.name),
-            None => out.push((r, vec![c.name])),
+        let fails = c.verdict == Verdict::Fail;
+        match out.iter_mut().find(|(x, _, _)| *x == r) {
+            Some((_, names, f)) => {
+                names.push(c.name);
+                *f |= fails;
+            }
+            None => out.push((r, vec![c.name], fails)),
         }
     }
-    out
+    out.sort_by_key(|(_, _, fails)| !*fails);
+    out.into_iter().map(|(r, names, _)| (r, names)).collect()
 }
 
-fn render(title: &str, checks: &[Check]) -> bool {
-    println!("{}", ui::section(title));
-    let rows: Vec<Vec<String>> = checks.iter().map(|c| {
-        let (glyph, detail) = match c.verdict {
-            Verdict::Ok => (Glyph::Ok, ui::muted(&c.detail)),
-            Verdict::Warn => (Glyph::Warn, ui::warn(&c.detail)),
-            Verdict::Fail => (Glyph::Err, ui::err(&c.detail)),
-            Verdict::Starting => (Glyph::Warn, ui::warn(&c.detail)),
-            // Plain text: the row states what is exposed and must be read, not dimmed.
-            Verdict::Accepted => (Glyph::Accepted, c.detail.clone()),
-        };
-        vec![ui::glyph_cell(glyph), c.name.to_string(), detail]
-    }).collect();
-    print!("{}", ui::table(&[Col::left(""), Col::left("invariant"), Col::left("state")], &rows));
+/// The `at_rest_dirs` rows. In the default output they print as one
+/// "data at rest" row that names only the ones that are not clean (the
+/// 0.6.12 roll printed nine near-identical rows).
+const AT_REST_DIR_ROWS: [&str; 9] = [
+    "loki at rest", "postgres at rest", "redis at rest", "nats at rest", "prometheus at rest",
+    "grafana at rest", "noo-data at rest", "pki at rest", "age key at rest",
+];
+
+/// How many rows of a section hold, warn, fail or are accepted. A
+/// `Starting` row counts as a warning: it prints with the same glyph.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Counts {
+    ok: usize,
+    warn: usize,
+    fail: usize,
+    accepted: usize,
+}
+
+/// What one section prints: its counts and the rows to show.
+#[derive(Debug, PartialEq)]
+struct Digest {
+    counts: Counts,
+    rows: Vec<Check>,
+}
+
+fn severity(v: Verdict) -> u8 {
+    match v {
+        Verdict::Ok => 0,
+        Verdict::Accepted => 1,
+        Verdict::Warn => 2,
+        Verdict::Starting => 3,
+        Verdict::Fail => 4,
+    }
+}
+
+/// The rows a section prints. Verbose: every row, as ever. Default: only
+/// the rows that are not a plain pass, with the `* at rest` rows folded
+/// into one "data at rest" row that names the ones that need reading.
+///
+/// An Accepted row stays in the default output: it is a recorded opt-out
+/// that leaves data in the clear (the at-rest opt-out) or backups on this
+/// disk only (a declined offsite copy), it is not a pass, and the
+/// reader should see it every run.
+fn digest(checks: &[Check], verbose: bool) -> Digest {
+    let mut counts = Counts::default();
+    for c in checks {
+        match c.verdict {
+            Verdict::Ok => counts.ok += 1,
+            Verdict::Warn | Verdict::Starting => counts.warn += 1,
+            Verdict::Fail => counts.fail += 1,
+            Verdict::Accepted => counts.accepted += 1,
+        }
+    }
+    if verbose {
+        return Digest { counts, rows: checks.to_vec() };
+    }
+    let mut rows: Vec<Check> = Vec::new();
+    let mut at_rest: Vec<&Check> = Vec::new();
+    let mut slot = 0;
+    for c in checks.iter().filter(|c| c.verdict != Verdict::Ok) {
+        if AT_REST_DIR_ROWS.contains(&c.name) {
+            if at_rest.is_empty() {
+                slot = rows.len();
+            }
+            at_rest.push(c);
+        } else {
+            rows.push(c.clone());
+        }
+    }
+    if let Some(worst) = at_rest.iter().copied().max_by_key(|c| severity(c.verdict)) {
+        let names: Vec<&str> = at_rest.iter().map(|c| c.name.trim_end_matches(" at rest")).collect();
+        let more = if at_rest.len() > 1 { "; --verbose lists each" } else { "" };
+        rows.insert(slot, Check {
+            name: "data at rest",
+            verdict: worst.verdict,
+            detail: format!("{} — {}{more}", names.join(", "), worst.detail),
+            remedy: worst.remedy.clone(),
+        });
+    }
+    Digest { counts, rows }
+}
+
+/// `✓ node host3  ✓ 13  ! 1  ✗ 1`: the section's glyph (its worst row),
+/// its name, and the counts; zero counts stay out except the passes.
+fn summary_line(title: &str, c: &Counts) -> String {
+    let lead = if c.fail > 0 { Glyph::Err } else if c.warn > 0 { Glyph::Warn } else if c.accepted > 0 { Glyph::Accepted } else { Glyph::Ok };
+    let mut parts = vec![format!("{} {}", ui::glyph(Glyph::Ok), c.ok)];
+    for (n, g) in [(c.warn, Glyph::Warn), (c.fail, Glyph::Err), (c.accepted, Glyph::Accepted)] {
+        if n > 0 {
+            parts.push(format!("{} {n}", ui::glyph(g)));
+        }
+    }
+    format!("{} {}  {}", ui::glyph(lead), ui::emph(title), parts.join("  "))
+}
+
+/// What the default output has seen across its sections, for the one
+/// closing verdict line.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Tally {
+    /// Failing rows, named `row` (controller) or `row (node x)`.
+    problems: Vec<String>,
+    /// Rows still starting.
+    starting: Vec<String>,
+    /// Warnings and accepted rows.
+    notes: usize,
+    /// ` — 3 node(s) on stack-v0.6.13`, or empty.
+    context: String,
+}
+
+impl Tally {
+    fn add(&mut self, title: &str, checks: &[Check]) {
+        let label = |name: &str| if title == "controller" { name.to_string() } else { format!("{name} ({title})") };
+        for c in digest(checks, false).rows {
+            let bucket = match c.verdict {
+                Verdict::Fail => &mut self.problems,
+                Verdict::Starting => &mut self.starting,
+                _ => {
+                    self.notes += 1;
+                    continue;
+                }
+            };
+            let l = label(c.name);
+            if !bucket.contains(&l) {
+                bucket.push(l);
+            }
+        }
+    }
+}
+
+/// The one closing line of the default output, and its glyph.
+fn verdict_line(t: &Tally) -> (Glyph, String) {
+    if !t.problems.is_empty() {
+        let n = t.problems.len();
+        return (Glyph::Err, format!("{n} {} you: {}", if n == 1 { "problem needs" } else { "problems need" }, t.problems.join(", ")));
+    }
+    if !t.starting.is_empty() {
+        return (Glyph::Warn, format!("still starting: {} — re-run in a minute, or `noo cluster verify --wait`", t.starting.join(", ")));
+    }
+    let seen = match t.notes {
+        0 => String::new(),
+        n => format!("; {n} row(s) above to read"),
+    };
+    (Glyph::Ok, format!("fleet healthy{}{seen}", t.context))
+}
+
+fn render(title: &str, checks: &[Check], verbose: bool) -> bool {
+    let d = digest(checks, verbose);
+    if verbose {
+        println!("{}", ui::section(title));
+    } else {
+        println!("{}", summary_line(title, &d.counts));
+    }
+    if !d.rows.is_empty() {
+        let rows: Vec<Vec<String>> = d.rows.iter().map(|c| {
+            let (glyph, detail) = match c.verdict {
+                Verdict::Ok => (Glyph::Ok, ui::muted(&c.detail)),
+                Verdict::Warn => (Glyph::Warn, ui::warn(&c.detail)),
+                Verdict::Fail => (Glyph::Err, ui::err(&c.detail)),
+                Verdict::Starting => (Glyph::Warn, ui::warn(&c.detail)),
+                // Plain text: the row states what is exposed and must be read, not dimmed.
+                Verdict::Accepted => (Glyph::Accepted, c.detail.clone()),
+            };
+            vec![ui::glyph_cell(glyph), c.name.to_string(), detail]
+        }).collect();
+        print!("{}", ui::table(&[Col::left(""), Col::left("invariant"), Col::left("state")], &rows));
+    }
     let failed: Vec<&Check> = checks.iter().filter(|c| c.verdict == Verdict::Fail).collect();
     // FAIL remedies always; WARN remedies too in the controller section (the
     // v0.2.95 roll: `service-key grants` warned with a remedy nobody saw).
+    // Judged on every row, not the digest's: a grouped row keeps its remedy.
     let grouped = remedies_to_print(title, checks);
     let whys: Vec<String> = grouped.iter().map(|(_, names)| names.join(", ")).collect();
     let entries: Vec<(&str, &str)> = grouped.iter().zip(&whys).map(|((r, _), w)| (*r, w.as_str())).collect();
     ui::guide(&entries);
-    println!();
+    if verbose || !d.rows.is_empty() {
+        println!();
+    }
     failed.is_empty()
 }
 
@@ -5276,20 +5504,25 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut all_ok = true;
     let mut any_starting = false;
     let mut json_out = serde_json::Map::new();
+    let mut tally = Tally::default();
 
     if want_nodes || nodes.is_empty() {
         // Best-effort read: this verb is also run from `onboard`'s last step
         // and from `provision --wait`, and must never exit the process from
         // inside them. An unreachable gateway is a failing invariant here,
         // not a fatal error.
-        if wait {
+        // `--wait` right after `noo stack start` meets a gateway that is not
+        // listening yet: wait, bounded, for it to answer before reading.
+        let waited_for_gateway = if wait { crate::http::wait_for_gateway_answer(g).err() } else { None };
+        if wait && waited_for_gateway.is_none() {
             warmup::wait_for_node_warmup(g, &nodes);
         }
         let Some(body) = get_json_opt(g, "/api/cluster/nodes", true, 10) else {
             if g.json {
                 println!("{}", serde_json::json!({ "ok": false, "error": "gateway unreachable" }));
             } else {
-                println!("{}", ui::status_line(Glyph::Err, "the gateway did not answer /api/cluster/nodes — nothing can be verified"));
+                let after = waited_for_gateway.map(|s| format!(" after waiting {s}s")).unwrap_or_default();
+                println!("{}", ui::status_line(Glyph::Err, &format!("the gateway did not answer /api/cluster/nodes{after} — nothing can be verified")));
                 ui::guide(&[("noo health", "is the controller up"), ("noo stack status", "which container is not")]);
             }
             return Ok(1);
@@ -5308,6 +5541,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let now = now_unix();
         if !g.json {
             println!("{}", ui::header("cluster verify", Some(&format!("{} node(s) · controller {tag}", selected.len()))));
+            tally.context = format!(" — {} node(s) on {tag}", selected.len());
         }
         let mut node_json = Vec::new();
         for n in selected {
@@ -5319,7 +5553,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             if g.json {
                 node_json.push(serde_json::json!({ "node": id, "ok": node_ok, "checks": checks_json(&checks) }));
             } else {
-                render(&format!("node {id}"), &checks);
+                let title = format!("node {id}");
+                render(&title, &checks, g.verbose);
+                tally.add(&title, &checks);
             }
         }
         json_out.insert("nodes".into(), Value::Array(node_json));
@@ -5350,7 +5586,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 if g.json {
                     seat_json.push(serde_json::json!({ "seat": name, "ok": seat_ok, "checks": checks_json(&checks) }));
                 } else {
-                    render(&format!("seat {name}"), &checks);
+                    let title = format!("seat {name}");
+                    render(&title, &checks, g.verbose);
+                    tally.add(&title, &checks);
                 }
             }
             json_out.insert("seats".into(), Value::Array(seat_json));
@@ -5516,6 +5754,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .collect();
         checks.push(pki_key_modes_check(&key_issues, &grant_lines, sso.list_keys().len()));
         checks.push(docker_userns_check(read_daemon_json()));
+        checks.push(tailscale_ssh_check(read_tailscale_status()));
         let gw_mounts = std::fs::read_to_string(crate::envfile::repo_root().join("docker-compose.cluster.yml"))
             .ok()
             .and_then(|c| gateway_pki_mounts(&c));
@@ -5550,7 +5789,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // ... and load models the controller staged, offline (i105).
         checks.push(image_family::voice_models_row(voice_on));
         // Every compose inference backend requires a client certificate at
-        // its door (vLLM --ssl-cert-reqs 2, stunnel verify = 2).
+        // its door (a stunnel sidecar, verify = 2).
         checks.push(backend_listener_check(compose.as_deref(), &|name| {
             std::fs::read_to_string(root.join("docker").join(format!("stunnel-{name}.conf"))).ok()
         }));
@@ -5652,6 +5891,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // A container docker keeps restarting reads "Up" between restarts;
         // judge RestartCount + recency instead (0.6.4 redis AOF, 2026-10-16).
         checks.push(restart_loops::restart_loops_row());
+        // A GPU service the launcher held because the GPU did not answer at
+        // start (i277e): the core runs without it, this row keeps it named.
+        checks.push(gpu_held::gpu_held_row());
         // A gateway that cannot reach a crash-looping redis is redis's
         // problem: point the `gateway redis` remedy at redis, not a gateway
         // restart (0.6.5-rc.1 rehearsal).
@@ -5751,7 +5993,8 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             if !want_nodes {
                 println!("{}", ui::header("cluster verify", Some("controller")));
             }
-            render("controller", &checks);
+            render("controller", &checks, g.verbose);
+            tally.add("controller", &checks);
         }
     }
 
@@ -5759,6 +6002,11 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         json_out.insert("ok".into(), Value::Bool(all_ok));
         json_out.insert("starting".into(), Value::Bool(any_starting));
         println!("{}", Value::Object(json_out));
+    } else if !g.verbose {
+        // The digest closes on one verdict, then the way to every row.
+        let (glyph, line) = verdict_line(&tally);
+        println!("{}", ui::status_line(glyph, &line));
+        ui::guide(&[("noo cluster verify --verbose", "every row, the passing ones too")]);
     } else if all_ok {
         println!("{}", ui::status_line(Glyph::Ok, "every invariant holds"));
     } else if any_starting {
@@ -5822,7 +6070,7 @@ pub(crate) fn verify_node_after_apply(g: &Globals, node: &str) -> bool {
     let checks = node_checks(&with_harness_wanted(g, &n), &controller_stack_tag(), env!("CARGO_PKG_VERSION"), now_unix(), signing_adopted_for(node));
     // A `starting` row is not a pass: the caller's note
     // says the invariant does not hold YET, and `cluster verify` re-checks.
-    render(&format!("verify {node}"), &checks) && !checks.iter().any(|c| c.verdict == Verdict::Starting)
+    render(&format!("verify {node}"), &checks, g.verbose) && !checks.iter().any(|c| c.verdict == Verdict::Starting)
 }
 
 /// Two and a half heartbeat intervals: one missed beat is not a verdict.
@@ -6082,7 +6330,8 @@ mod tests {
             fail("x", "bad", "noo health"),
         ];
         let c = remedies_to_print("controller", &rows);
-        assert_eq!(c, vec![("noo security service-key provision evolve", vec!["service-key grants"]), ("noo health", vec!["x"])]);
+        // The FAIL remedy leads, ahead of the WARN listed before it.
+        assert_eq!(c, vec![("noo health", vec!["x"]), ("noo security service-key provision evolve", vec!["service-key grants"])]);
         assert_eq!(remedies_to_print("node a", &rows), vec![("noo health", vec!["x"])]);
     }
 
@@ -7599,7 +7848,9 @@ mod tests {
         let unknown = KeyIssue { rel: "services/mystery/service.key".into(), mode: 0o644, reader: KeyReader::Unknown, kind: KeyIssueKind::UnknownReader };
         let c = pki_key_modes_check(&[unknown], &[], 5);
         assert_eq!(c.verdict, Verdict::Warn);
-        assert!(c.remedy.unwrap().contains("SERVICE_KEY_READERS"));
+        let r = c.remedy.unwrap();
+        assert_eq!(r, "noo security pki fix-modes", "fix-modes makes a no-reader key 0600 (i277a)");
+        assert!(c.detail.contains("services/mystery/service.key 0644"), "{}", c.detail);
         // Exposure outranks an unreadable key: the fix for both is the same verb,
         // and the sudo line rides along when the verb alone cannot finish it.
         let c = pki_key_modes_check(&[exposed, KeyIssue { rel: "x".into(), mode: 0o640, reader: KeyReader::ContainerUid(70), kind: KeyIssueKind::Unreadable }], std::slice::from_ref(&line), 5);
@@ -7655,6 +7906,30 @@ mod tests {
     /// A remapping daemon is a FAIL naming the
     /// setting; no file, or the key absent or empty, is OK; unreadable or
     /// garbled is a WARN that says it could not tell.
+    /// A mesh device advertising SSH host keys is a WARN naming it; an
+    /// untagged device (a phone, a laptop) is not the mesh's business; an
+    /// unreadable status says it could not tell.
+    #[test]
+    fn the_tailscale_ssh_row_names_mesh_devices_that_run_it() {
+        let st = serde_json::json!({
+            "Self": {"HostName": "pop-os", "Tags": ["tag:controller"]},
+            "Peer": {
+                "a": {"HostName": "aserve", "Tags": ["tag:worker"], "sshHostKeys": ["ssh-ed25519 AAAA"]},
+                "b": {"HostName": "laptop", "sshHostKeys": ["ssh-ed25519 BBBB"]},
+                "c": {"HostName": "robopi", "Tags": ["tag:worker"], "sshHostKeys": []}
+            }
+        });
+        let c = tailscale_ssh_check(Ok(st));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("aserve") && !c.detail.contains("laptop") && !c.detail.contains("robopi"), "{}", c.detail);
+        assert!(c.remedy.unwrap().contains("tailscale set --ssh=false"));
+        let quiet = serde_json::json!({"Self": {"HostName": "pop-os", "Tags": ["tag:controller"]}, "Peer": {}});
+        assert_eq!(tailscale_ssh_check(Ok(quiet)).verdict, Verdict::Ok);
+        let self_on = serde_json::json!({"Self": {"HostName": "pop-os", "Tags": ["tag:controller"], "sshHostKeys": ["k"]}});
+        assert!(tailscale_ssh_check(Ok(self_on)).detail.contains("pop-os"));
+        assert_eq!(tailscale_ssh_check(Err("not running".into())).verdict, Verdict::Warn);
+    }
+
     #[test]
     fn the_docker_userns_row_fails_a_remapping_daemon() {
         let c = docker_userns_check(Ok(Some(r#"{"data-root":"/data/docker","userns-remap":"default"}"#.into())));
@@ -7955,6 +8230,45 @@ mod tests {
         assert_eq!(sandbox_executor_check(None).verdict, Verdict::Warn);
     }
 
+    /// 0.6.13 on pop-os: with the AppArmor profile loaded the jail still
+    /// failed, "Can't mount proc", which is Docker's /proc masks and not
+    /// AppArmor. The row sent the operator to install a profile already
+    /// installed. Each reason gets its own remedy, and a passed self-test
+    /// shows on the OK row.
+    #[test]
+    fn the_sandbox_executor_row_names_the_remedy_for_each_reason() {
+        let exec = serde_json::json!({"uid": 65600, "slots": 64, "detail": "sandbox-exec (uids 65600-65663)"});
+        let refused = |why: &str| {
+            let c = sandbox_executor_check(Some(&sandbox_health(
+                exec.clone(),
+                serde_json::json!({"mode": "bwrap", "active": "none", "detail": why}),
+            )));
+            assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+            assert!(c.detail.contains(why), "{}", c.detail);
+            c.remedy.unwrap_or_default()
+        };
+        let r = refused("bwrap: Can't mount proc on /proc: Operation not permitted");
+        assert!(r.starts_with("noo upgrade --stack") && !r.contains("apparmor"), "{r}");
+        let r = refused("the isolation self-test failed: the code can see /tls, where the sandbox's own key is");
+        assert!(r.starts_with("noo stack logs sandbox") && !r.contains("apparmor"), "{r}");
+        for why in ["bwrap: Failed to make / slave: Permission denied", "bwrap: No permissions to create new namespace"] {
+            let r = refused(why);
+            assert!(r.contains("/etc/apparmor.d/noo-sandbox") && r.contains("NOO_SANDBOX_APPARMOR=noo-sandbox"), "{r}");
+        }
+
+        let proven = sandbox_health(
+            exec.clone(),
+            serde_json::json!({"mode": "bwrap", "active": "bwrap", "detail": "bwrap", "self_test": {"passed": true, "failures": []}}),
+        );
+        let c = sandbox_executor_check(Some(&proven));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.ends_with("isolation bwrap (self-test passed)"), "{}", c.detail);
+        let older = sandbox_health(exec.clone(), serde_json::json!({"mode": "bwrap", "active": "bwrap", "detail": "bwrap"}));
+        let c = sandbox_executor_check(Some(&older));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.ends_with("isolation bwrap"), "{}", c.detail);
+    }
+
     /// 0.6.11 on pop-os: the server ran as `nonroot` (65532), the kernel
     /// counted its `nproc: 256` with every other 65532 process on the host,
     /// and `/health` answered 500 (`can't start new thread`). The row read
@@ -8044,7 +8358,7 @@ mod tests {
     /// parses into the struct the row reads.
     #[test]
     fn the_shipped_compose_passes_the_sandbox_row_and_the_probe_output_parses() {
-        let compose = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docker-compose.cluster.yml")).unwrap();
+        let compose = std::fs::read_to_string(crate::test_support::repo_file("docker-compose.cluster.yml")).unwrap();
         let good = sandbox_probe("refused: x", "answered HTTP/1.1 200 OK", "refused: y");
         let c = sandbox_listener_check(Some(&compose), Some(&good));
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
@@ -8130,7 +8444,7 @@ mod tests {
     /// file on the running controller), and the probe output parses.
     #[test]
     fn the_shipped_voice_overlay_passes_the_row_and_the_probe_output_parses() {
-        let overlay = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docker-compose.voice.yml")).unwrap();
+        let overlay = std::fs::read_to_string(crate::test_support::repo_file("docker-compose.voice.yml")).unwrap();
         let door = sandbox_probe("refused: x", "answered HTTP/1.1 200 OK", "refused: y");
         let good = VoiceProbe { whisper: door.clone(), piper: door.clone() };
         let c = voice_listeners_check(true, Some(&overlay), Some(&good));
@@ -8190,10 +8504,10 @@ mod tests {
     /// config is not in it.
     #[test]
     fn the_shipped_nats_config_and_compose_pass_the_tls_row() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let cfg = std::fs::read_to_string(repo.join("monitoring/nats/nats-tls.conf")).expect("shipped nats config");
-        let compose = std::fs::read_to_string(repo.join("docker-compose.cluster.yml")).expect("shipped compose");
-        let plain = repo.join("monitoring/nats/nats.conf").is_file();
+        let cfg = std::fs::read_to_string(crate::test_support::repo_file("monitoring/nats/nats-tls.conf")).expect("shipped nats config");
+        let compose = std::fs::read_to_string(crate::test_support::repo_file("docker-compose.cluster.yml")).expect("shipped compose");
+        // Optional by design: a stack without the plaintext listener has no nats.conf.
+        let plain = crate::test_support::repo_root().join("monitoring/nats/nats.conf").is_file();
         let c = nats_tls_check(Some(&cfg), Some(&compose), plain, None);
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
     }
@@ -8220,21 +8534,20 @@ mod tests {
 
     #[test]
     fn the_shipped_loki_config_and_compose_pass_the_listener_row() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let cfg = std::fs::read_to_string(repo.join("monitoring/loki/loki-config-tls.yml")).expect("shipped loki config");
-        let compose = std::fs::read_to_string(repo.join("docker-compose.cluster.yml")).expect("shipped compose");
+        let cfg = std::fs::read_to_string(crate::test_support::repo_file("monitoring/loki/loki-config-tls.yml")).expect("shipped loki config");
+        let compose = std::fs::read_to_string(crate::test_support::repo_file("docker-compose.cluster.yml")).expect("shipped compose");
         let c = loki_listener_check(Some(&cfg), Some(&compose));
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
     }
 
-    const BACKENDS_OK: &str = "services:\n  gateway:\n    ports:\n      - \"8080:8080\"\n  vllm:\n    image: v\n    command:\n      - |\n        ARGS=\"$$ARGS --ssl-certfile /app/pki/services/vllm/service.crt --ssl-cert-reqs 2\"\n  llamacpp:\n    image: l\n  stunnel-llamacpp:\n    image: s\n    volumes:\n      - ./docker/stunnel-llamacpp.conf:/etc/stunnel/stunnel.conf:ro\n  grafana:\n    ports:\n      - \"3000:3000\"\n";
+    const BACKENDS_OK: &str = "services:\n  gateway:\n    ports:\n      - \"8080:8080\"\n  vllm:\n    image: v\n  stunnel-vllm:\n    image: s\n    volumes:\n      - ./docker/stunnel-vllm.conf:/etc/stunnel/stunnel.conf:ro\n  llamacpp:\n    image: l\n  stunnel-llamacpp:\n    image: s\n    volumes:\n      - ./docker/stunnel-llamacpp.conf:/etc/stunnel/stunnel.conf:ro\n  grafana:\n    ports:\n      - \"3000:3000\"\n";
 
     fn conf_verify2(_: &str) -> Option<String> {
         Some("[x]\naccept = 0.0.0.0:8085\nverify = 2\n".into())
     }
 
     /// Each way a backend door can admit a caller without a certificate is
-    /// named: the vLLM flag missing, the sidecar missing, its conf without
+    /// named: the sidecar missing (vLLM's or llama.cpp's), its conf without
     /// verify = 2, and a published port on either.
     #[test]
     fn the_backend_tls_row_names_each_way_a_door_opens_without_a_cert() {
@@ -8244,10 +8557,12 @@ mod tests {
         assert!(ok_row.detail.contains("airllm"), "the exception is named: {}", ok_row.detail);
         assert!(!ok_row.detail.contains("ollama-embed"), "no loopback allowance named for an absent service: {}", ok_row.detail);
 
-        let no_flag = BACKENDS_OK.replace(" --ssl-cert-reqs 2", "");
-        let c = backend_listener_check(Some(&no_flag), &conf_verify2);
+        // vLLM's own TLS listener is no longer a door: without its sidecar
+        // the row fails however the engine is started.
+        let no_door = BACKENDS_OK.replace("  stunnel-vllm:\n    image: s\n    volumes:\n      - ./docker/stunnel-vllm.conf:/etc/stunnel/stunnel.conf:ro\n", "");
+        let c = backend_listener_check(Some(&no_door), &conf_verify2);
         assert_eq!(c.verdict, Verdict::Fail);
-        assert!(c.detail.contains("vllm does not run with --ssl-cert-reqs 2"), "{}", c.detail);
+        assert!(c.detail.contains("vllm has no stunnel-vllm service"), "{}", c.detail);
 
         let no_sidecar = BACKENDS_OK.replace("  stunnel-llamacpp:\n    image: s\n    volumes:\n      - ./docker/stunnel-llamacpp.conf:/etc/stunnel/stunnel.conf:ro\n", "");
         let c = backend_listener_check(Some(&no_sidecar), &conf_verify2);
@@ -8274,8 +8589,8 @@ mod tests {
     /// parse is not vacuous: every backend in COMPOSE_BACKENDS is present.
     #[test]
     fn the_shipped_compose_and_stunnel_confs_pass_the_backend_tls_row() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let compose = std::fs::read_to_string(repo.join("docker-compose.cluster.yml")).expect("shipped compose");
+        let repo = crate::test_support::repo_root();
+        let compose = std::fs::read_to_string(crate::test_support::repo_file("docker-compose.cluster.yml")).expect("shipped compose");
         for (svc, _) in COMPOSE_BACKENDS {
             assert!(compose_service_block(&compose, svc).is_some(), "{svc} is not in the shipped compose file — drop the row or restore the service");
         }
@@ -8497,8 +8812,8 @@ mod tests {
     /// without `verify = 2` each fail the row; the OK text names the door.
     #[test]
     fn the_backend_tls_row_allows_only_a_loopback_mtls_door() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let compose = std::fs::read_to_string(repo.join("docker-compose.cluster.yml")).expect("shipped compose");
+        let repo = crate::test_support::repo_root();
+        let compose = std::fs::read_to_string(crate::test_support::repo_file("docker-compose.cluster.yml")).expect("shipped compose");
         let shipped_conf = |name: &str| std::fs::read_to_string(repo.join("docker").join(format!("stunnel-{name}.conf"))).ok();
         let c = backend_listener_check(Some(&compose), &shipped_conf);
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
@@ -8540,21 +8855,24 @@ mod tests {
         assert!(c.detail.contains("docker/stunnel-ollama-embed.conf does not set verify = 2"), "{}", c.detail);
     }
 
-    /// The compose healthcheck, onboard's readiness probe and the row's
-    /// flag all name the same leaf paths and the same flag: the compose
-    /// file is the declaration, the others must follow it.
+    /// The compose healthcheck and onboard's readiness probe both ask the
+    /// engine on loopback in plain HTTP: the engine holds no leaf and
+    /// serves no TLS (its door does), so a probe presenting a certificate
+    /// to https://localhost would never answer.
     #[test]
-    fn the_vllm_self_probe_and_compose_agree_on_the_leaf_paths() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let compose = std::fs::read_to_string(repo.join("docker-compose.cluster.yml")).expect("shipped compose");
-        let vllm = compose_service_block(&compose, "vllm").expect("vllm service");
-        for needle in ["/app/pki/ca.crt", "/app/pki/services/vllm/service.crt", "/app/pki/services/vllm/service.key"] {
-            assert!(vllm.contains(needle), "compose vllm lacks {needle}");
-            assert!(crate::onboard::steps::VLLM_SELF_PROBE.contains(needle), "onboard's probe lacks {needle}");
+    fn the_vllm_self_probe_and_compose_agree_the_engine_is_plain_on_loopback() {
+        let compose = std::fs::read_to_string(crate::test_support::repo_file("docker-compose.cluster.yml")).expect("shipped compose");
+        for svc in ["vllm", "vllm-secondary"] {
+            let block = compose_service_block(&compose, svc).expect("vllm service");
+            assert!(block.contains("http://127.0.0.1:8000/health"), "compose {svc}'s healthcheck is not plain loopback");
+            assert!(block.contains("--host 127.0.0.1 --port 8000"), "compose {svc} does not bind loopback");
+            for gone in ["/app/pki", "--ssl-", "load_cert_chain", "NOO_VLLM_TLS"] {
+                assert!(!block.contains(gone), "compose {svc} still carries {gone}");
+            }
+            assert!(block.contains(&format!("network_mode: \"service:stunnel-{svc}\"")), "compose {svc} is not in its door's namespace");
         }
-        assert!(vllm.contains("load_cert_chain"), "the compose healthcheck does not present the leaf");
-        assert!(crate::onboard::steps::VLLM_SELF_PROBE.contains("load_cert_chain"));
-        assert!(!vllm.contains("NOO_VLLM_TLS"), "the compose vllm listener must have no plaintext switch");
+        let probe = crate::onboard::steps::VLLM_SELF_PROBE;
+        assert!(probe.contains("http://127.0.0.1:8000/") && !probe.contains("ssl"), "onboard's probe: {probe}");
     }
 
     #[test]
@@ -8681,7 +8999,8 @@ mod tests {
         assert_ne!(ui::glyph(Glyph::Accepted), ui::glyph(Glyph::Warn));
         assert_ne!(ui::glyph(Glyph::Accepted), ui::glyph(Glyph::Ok));
         // render() is the one place a row becomes a glyph; it must not drop Accepted into a failure.
-        assert!(render("controller", &rows));
+        assert!(render("controller", &rows, true));
+        assert!(render("controller", &rows, false));
     }
 
     #[test]
@@ -9363,8 +9682,8 @@ mod tests {
     /// The shipped Postgres policy, and each way it could be weakened.
     #[test]
     fn postgres_hba_row_accepts_the_shipped_file_and_refuses_each_weakening() {
-        let hba = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../docker/postgres/pg_hba.conf")).unwrap();
-        let compose = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../docker-compose.cluster.yml")).unwrap();
+        let hba = std::fs::read_to_string(crate::test_support::repo_file("docker/postgres/pg_hba.conf")).unwrap();
+        let compose = std::fs::read_to_string(crate::test_support::repo_file("docker-compose.cluster.yml")).unwrap();
         assert_eq!(postgres_hba_check(Some(&hba), Some(&compose)).verdict, Verdict::Ok);
         // planted: a plaintext-capable accept line (what initdb writes)
         let bad = format!("{hba}\nhost all all 127.0.0.1/32 trust\n");
@@ -9395,7 +9714,7 @@ mod tests {
     /// fails naming the role.
     #[test]
     fn postgres_role_identity_row_needs_both_the_leaf_and_the_rule() {
-        let hba = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../docker/postgres/pg_hba.conf")).unwrap();
+        let hba = std::fs::read_to_string(crate::test_support::repo_file("docker/postgres/pg_hba.conf")).unwrap();
         let dir = std::env::temp_dir().join(format!("noo-pg-identity-row-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let ca = crate::pki::ClusterCa::new(dir.clone());
@@ -10088,5 +10407,146 @@ mod backup_rows_tests {
         assert_eq!(c.remedy.as_deref(), Some("noo backups setup"));
         assert!(c.detail.contains("every backup is on this machine"));
         assert_eq!(offsite_backup_check(&Ok(Some(Destination::Declined)), &Offsite::NoDump).verdict, Verdict::Accepted);
+    }
+}
+
+/// The default `cluster verify` output is a digest (i277d): counts, only the
+/// rows that are not a plain pass, one verdict. `--verbose` is the full table.
+#[cfg(test)]
+mod digest_tests {
+    use super::*;
+
+    const PLAIN: &str = "plaintext, in the clear on that disk";
+
+    /// A realistic controller section: lots of passes, nine at-rest rows (one
+    /// of them a warning), a failing sandbox row and a warning.
+    fn controller() -> Vec<Check> {
+        let mut v: Vec<Check> = ["posture", "service keys", "pki key modes", "postgres tls", "gateway redis", "nats bus"]
+            .iter().map(|n| ok(n, "ok")).collect();
+        for n in AT_REST_DIR_ROWS {
+            v.push(if n == "postgres at rest" {
+                warn(n, PLAIN, Some("move the data root onto a LUKS2 volume".into()))
+            } else {
+                ok(n, "on a dm-crypt device")
+            });
+        }
+        v.push(fail("sandbox", "bwrap cannot mount /proc", "noo sandbox doctor"));
+        v.push(warn("backup age", "newest dump is 3 days old", None));
+        v
+    }
+
+    #[test]
+    fn many_passes_and_one_fail_digest_to_the_counts_and_the_problem_rows() {
+        let checks = controller();
+        let d = digest(&checks, false);
+        assert_eq!(d.counts, Counts { ok: 14, warn: 2, fail: 1, accepted: 0 });
+        assert!(d.rows.iter().all(|c| c.verdict != Verdict::Ok), "a passing row reached the digest: {:?}", d.rows);
+        let names: Vec<&str> = d.rows.iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["data at rest", "sandbox", "backup age"]);
+        // The remedy still prints, from the full list of checks.
+        assert_eq!(remedies_to_print("controller", &checks)[0].0, "noo sandbox doctor");
+        let line = summary_line("controller", &d.counts);
+        assert!(line.contains("controller") && line.contains("14") && line.contains('1'), "{line}");
+    }
+
+    #[test]
+    fn at_rest_rows_group_into_one_row_naming_only_the_failing_dir() {
+        let d = digest(&controller(), false);
+        let rows: Vec<&Check> = d.rows.iter().filter(|c| c.name.contains("at rest")).collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "data at rest");
+        assert_eq!(rows[0].verdict, Verdict::Warn);
+        assert!(rows[0].detail.starts_with("postgres — "), "{}", rows[0].detail);
+        assert!(!rows[0].detail.contains("loki") && !rows[0].detail.contains("redis"), "{}", rows[0].detail);
+        // Two not-clean dirs are both named; the worse verdict leads.
+        let mut checks = controller();
+        checks.push(fail("age key at rest", "world-readable", "chmod 600 key"));
+        let d = digest(&checks, false);
+        let g = d.rows.iter().find(|c| c.name == "data at rest").unwrap();
+        assert_eq!(g.verdict, Verdict::Fail);
+        assert!(g.detail.starts_with("postgres, age key — "), "{}", g.detail);
+    }
+
+    #[test]
+    fn an_all_green_section_is_one_line_and_the_verdict_is_healthy() {
+        let checks: Vec<Check> = (0..12).map(|_| ok("bus", "ok")).collect();
+        let d = digest(&checks, false);
+        assert!(d.rows.is_empty());
+        assert_eq!(d.counts, Counts { ok: 12, ..Counts::default() });
+        assert_eq!(summary_line("node host3", &d.counts).lines().count(), 1);
+        let mut t = Tally { context: " — 2 node(s) on v0.6.13".into(), ..Tally::default() };
+        t.add("node host3", &checks);
+        t.add("controller", &checks);
+        let (g, line) = verdict_line(&t);
+        assert_eq!(g, Glyph::Ok);
+        assert_eq!(line, "fleet healthy — 2 node(s) on v0.6.13");
+    }
+
+    #[test]
+    fn the_verdict_names_the_problems_and_what_is_still_starting() {
+        let mut t = Tally::default();
+        t.add("controller", &controller());
+        let (g, line) = verdict_line(&t);
+        assert_eq!(g, Glyph::Err);
+        assert_eq!(line, "1 problem needs you: sandbox");
+        let mut t = Tally::default();
+        t.add("node a", &[fail("bus", "x", "noo fix"), ok("gpu", "ok")]);
+        t.add("node b", &[fail("bus", "x", "noo fix")]);
+        assert_eq!(verdict_line(&t).1, "2 problems need you: bus (node a), bus (node b)");
+        let mut t = Tally::default();
+        t.add("controller", &[Check { name: "loki", verdict: Verdict::Starting, detail: "starting".into(), remedy: None }]);
+        assert_eq!(verdict_line(&t).0, Glyph::Warn);
+        // A warning alone is healthy, with the count.
+        let mut t = Tally::default();
+        t.add("controller", &[warn("backup age", "old", None)]);
+        assert_eq!(verdict_line(&t).1, "fleet healthy; 1 row(s) above to read");
+    }
+
+    #[test]
+    fn an_accepted_row_stays_in_the_digest_and_is_counted_apart() {
+        let checks = vec![ok("a", "ok"), accepted("postgres at rest", "accepted risk"), accepted("loki at rest", "accepted risk")];
+        let d = digest(&checks, false);
+        assert_eq!(d.counts, Counts { ok: 1, warn: 0, fail: 0, accepted: 2 });
+        assert_eq!(d.rows.len(), 1);
+        assert_eq!(d.rows[0].verdict, Verdict::Accepted);
+    }
+
+    #[test]
+    fn verbose_keeps_every_row_in_order() {
+        let checks = controller();
+        let d = digest(&checks, true);
+        assert_eq!(d.rows, checks);
+        assert_eq!(d.counts, digest(&checks, false).counts);
+    }
+
+    #[test]
+    fn the_digest_leaves_the_exit_meaning_alone() {
+        // render's bool is "no FAIL row", verbose or not.
+        assert!(!render("controller", &controller(), false));
+        assert!(!render("controller", &controller(), true));
+        assert!(render("controller", &[ok("a", "ok"), warn("b", "w", None)], false));
+    }
+
+    #[test]
+    fn the_digest_group_list_covers_every_at_rest_dir_row() {
+        let env = |_: &str| -> Option<String> { None };
+        for r in at_rest_dirs(&env) {
+            assert!(AT_REST_DIR_ROWS.contains(&r.name), "{} would print as its own row", r.name);
+        }
+        assert_eq!(at_rest_dirs(&env).len(), AT_REST_DIR_ROWS.len());
+    }
+
+    /// i277d rule 4: a remedy is a command the operator can run.
+    #[test]
+    fn no_remedy_asks_for_a_source_edit() {
+        let unknown = crate::pki::KeyIssue {
+            rel: "services/mystery/service.key".into(), mode: 0o644,
+            reader: crate::pki::KeyReader::Unknown, kind: crate::pki::KeyIssueKind::UnknownReader,
+        };
+        let c = pki_key_modes_check(&[unknown], &[], 5);
+        let r = c.remedy.unwrap();
+        // fix-modes tightens a key with no reader row to 0600 (i277a).
+        assert_eq!(r, "noo security pki fix-modes", "{r}");
+        assert!(!r.contains("noo-cli/src") && !r.contains("edit "), "{r}");
     }
 }

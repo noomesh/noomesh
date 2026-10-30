@@ -60,6 +60,7 @@ DOOR = "https://noo-stunnel-ollama-embed:11434"
 PLAIN = "http://ollama-embed:11434"
 LEAF = "ollama-embed"
 SIDECAR = "stunnel-ollama-embed"
+SIDECAR_HOST = "noo-stunnel-ollama-embed"  # its compose hostname: the address its conf accepts on
 
 
 def _code_lines(text: str, comment: str) -> list[str]:
@@ -163,8 +164,9 @@ def test_the_conf_requires_a_client_certificate_and_presents_its_own_leaf():
     assert "verify = 2" in [l.replace("=", " = ").replace("  ", " ") for l in code] or any(
         l.replace(" ", "") == "verify=2" for l in code
     ), "docker/stunnel-ollama-embed.conf does not set verify = 2"
-    assert any(l.replace(" ", "") == "connect=ollama-embed:11434" for l in code), "the conf does not forward to ollama-embed:11434"
-    assert any(l.replace(" ", "") == "accept=0.0.0.0:11434" for l in code), "the conf does not accept on Ollama's own port"
+    # Door generation 3: ollama-embed lives in the sidecar's namespace on loopback.
+    assert any(l.replace(" ", "") == "connect=127.0.0.1:11434" for l in code), "the conf does not forward to ollama-embed on loopback"
+    assert any(l.replace(" ", "") == f"accept={SIDECAR_HOST}:11434" for l in code), "the conf does not accept on the sidecar's own address"
     assert any(l.replace(" ", "") == f"cert=/tls/services/{LEAF}/service.crt" for l in code), "the conf presents a leaf other than ollama-embed's"
     assert any(l.replace(" ", "") == "CAfile=/tls/ca.crt" for l in code), "the conf verifies against something other than the cluster CA"
 
@@ -173,7 +175,11 @@ def test_the_sidecar_fronts_the_backend_on_the_same_profile(services):
     backend, sidecar = services.get("ollama-embed"), services.get(SIDECAR)
     assert backend is not None and sidecar is not None, "ollama-embed or its sidecar vanished from the projection"
     assert set(sidecar.get("profiles") or []) == set(backend.get("profiles") or []) == {"standalone"}
-    assert "ollama-embed" in (sidecar.get("depends_on") or {}), "the sidecar does not depend on the backend"
+    # The backend lives in the sidecar's network namespace, so it is the
+    # backend that depends on the sidecar now (door generation 3).
+    assert backend.get("network_mode") == f"service:{SIDECAR}", "ollama-embed is not in its door's namespace"
+    assert SIDECAR in (backend.get("depends_on") or {}), "the backend does not depend on its door"
+    assert sidecar.get("hostname") == SIDECAR_HOST, "the sidecar's hostname is not the name its conf accepts on"
     mounts = [v if isinstance(v, str) else f"{v.get('source')}:{v.get('target')}" for v in sidecar.get("volumes") or []]
     assert any(f"/tls/services/{LEAF}" in m and f"services/{LEAF}" in m for m in mounts), (
         f"the sidecar does not mount the {LEAF} leaf: {mounts}"
@@ -220,7 +226,8 @@ def test_the_sidecar_healthcheck_presents_its_own_leaf_through_the_door(services
     text = test if isinstance(test, str) else " ".join(str(t) for t in test)
     assert text, "the sidecar has no healthcheck"
     assert "openssl s_client" in text, "the healthcheck does not open a TLS session"
-    assert "-connect 127.0.0.1:11434" in text, "the healthcheck does not dial the door"
+    # The door is on the sidecar's own address; 127.0.0.1:11434 is the plain backend.
+    assert f"-connect {SIDECAR_HOST}:11434" in text, "the healthcheck does not dial the door"
     assert f"-cert /tls/services/{LEAF}/service.crt" in text and f"-key /tls/services/{LEAF}/service.key" in text, (
         "the healthcheck does not present the sidecar's own leaf — it would prove the door admits a bare caller"
     )

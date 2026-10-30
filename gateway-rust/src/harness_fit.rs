@@ -20,8 +20,9 @@
 //!
 //! The window is the node's running chat placement's own engine key when it
 //! sets one, else the harness profile's `context`, which the node agent
-//! renders into that key (#408), capped by the model's own ceiling from
-//! `config/model-capabilities.json` (i226 phase C): no engine setting gives
+//! renders into that key (#408), capped by the model's own ceiling (i226
+//! phase C): the one the node reports from the weights (i285), else the
+//! fallback table `config/model-capabilities.json`. No engine setting gives
 //! a model more context than it was built for. A refusal the ceiling
 //! decides names no window to raise. The GPU's room is not checked here.
 
@@ -77,24 +78,58 @@ fn engine_window(backend: &str, env: &Value, profile_context: u64) -> Option<(u6
     }
 }
 
+/// The context ceiling the node reports for `model` in its heartbeat's
+/// `model_stats` (`context_length`, read from the weights by the node agent;
+/// noomesh-internal i285). A bare tag and its `:latest` are one model.
+pub fn reported_ceiling(node: &Value, model: &str) -> Option<u64> {
+    let latest = |n: &str| if n.contains(':') { n.to_string() } else { format!("{n}:latest") };
+    let want = latest(model.trim());
+    node.get("model_stats")?
+        .as_array()?
+        .iter()
+        .find(|s| s.get("name").and_then(Value::as_str).is_some_and(|n| latest(n.trim()) == want))?
+        .get("context_length")?
+        .as_u64()
+        .filter(|n| *n > 0)
+}
+
+/// The node's reported ceiling for `model` and the fallback table's, when
+/// both exist and differ (i285): the table is stale, or the node runs another
+/// build of the model. The report wins either way; this is for the log.
+pub fn ceiling_disagreement(node: &Value, model: &str) -> Option<(u64, u64)> {
+    let reported = reported_ceiling(node, model)?;
+    let table = crate::model_capabilities::max_context(model)?;
+    (reported != table).then_some((reported, table))
+}
+
+/// The model's own context ceiling and where it came from: the node's report
+/// first, else the fallback table (`config/model-capabilities.json`).
+fn model_ceiling(node: &Value, model: &str) -> Option<(u64, String)> {
+    match reported_ceiling(node, model) {
+        Some(n) => Some((n, format!("{model}'s own context ceiling, as the node reports it"))),
+        None => crate::model_capabilities::max_context(model).map(|n| (n, format!("{model}'s own context ceiling (config/model-capabilities.json)"))),
+    }
+}
+
 /// The window one request gets on a chat placement serving `model`: the
 /// engine's setting, capped by the model's own ceiling. With no engine
-/// setting this can read, the ceiling alone is still an upper bound.
-pub fn chat_window(backend: &str, env: &Value, model: Option<&str>, profile_context: u64) -> Option<Window> {
+/// setting this can read, the ceiling alone is still an upper bound. `node`
+/// is the node's heartbeat record (`Value::Null` when there is none).
+pub fn chat_window(backend: &str, env: &Value, model: Option<&str>, node: &Value, profile_context: u64) -> Option<Window> {
     let engine = engine_window(backend, env, profile_context);
-    let ceiling = model.and_then(|m| crate::model_capabilities::max_context(m).map(|n| (n, m)));
+    let ceiling = model.filter(|m| !m.trim().is_empty()).and_then(|m| model_ceiling(node, m));
     match (engine, ceiling) {
         (Some((n, source)), Some((c, _))) if n <= c => Some(Window { tokens: n, source, model_ceiling: false }),
         (Some((n, source)), None) => Some(Window { tokens: n, source, model_ceiling: false }),
-        (_, Some((c, m))) => Some(Window { tokens: c, source: format!("{m}'s own context ceiling"), model_ceiling: true }),
+        (_, Some((c, source))) => Some(Window { tokens: c, source, model_ceiling: true }),
         (None, None) => None,
     }
 }
 
 /// The smallest window across the node's running chat placements
 /// (backend, env, model): the harness may be pinned to any of them.
-pub fn node_window<'a>(chats: impl IntoIterator<Item = (&'a str, &'a Value, Option<&'a str>)>, profile_context: u64) -> Option<Window> {
-    chats.into_iter().filter_map(|(b, env, m)| chat_window(b, env, m, profile_context)).min_by_key(|w| w.tokens)
+pub fn node_window<'a>(chats: impl IntoIterator<Item = (&'a str, &'a Value, Option<&'a str>)>, node: &Value, profile_context: u64) -> Option<Window> {
+    chats.into_iter().filter_map(|(b, env, m)| chat_window(b, env, m, node, profile_context)).min_by_key(|w| w.tokens)
 }
 
 /// The floor a kind runs at on this node: the slim launch's when the
@@ -173,7 +208,7 @@ mod tests {
     /// awolf on 2026-10-24: vLLM at the image default, no profile value.
     #[test]
     fn the_awolf_window_refuses_copilot_with_the_numbers() {
-        let win = chat_window("vllm", &json!({"VLLM_MAX_MODEL_LEN": "16384"}), Some("gemma-4-12B-it-qat-w4a16-ct"), 32768);
+        let win = chat_window("vllm", &json!({"VLLM_MAX_MODEL_LEN": "16384"}), Some("gemma-4-12B-it-qat-w4a16-ct"), &Value::Null, 32768);
         assert_eq!(win, Some(Window { tokens: 16384, source: "VLLM_MAX_MODEL_LEN on its vllm placement".to_string(), model_ceiling: false }));
         let fit = judge(Some(16385), win);
         assert!(matches!(fit, Fit::Short { floor: 16385, need: 20482, window: 16384, model_ceiling: false, .. }), "{fit:?}");
@@ -184,18 +219,18 @@ mod tests {
 
     #[test]
     fn the_profile_context_is_the_window_when_the_placement_sets_none() {
-        assert_eq!(chat_window("ollama", &json!({}), None, 32768).map(|w| w.tokens), Some(32768));
-        assert_eq!(judge(Some(16385), chat_window("ollama", &json!({}), None, 32768)), Fit::Fits);
-        assert_eq!(chat_window("ollama", &json!({}), None, 0), None, "nothing to read");
-        assert_eq!(chat_window("airllm", &json!({"N_CTX": 8192}), None, 32768), None, "an engine this cannot read");
+        assert_eq!(chat_window("ollama", &json!({}), None, &Value::Null, 32768).map(|w| w.tokens), Some(32768));
+        assert_eq!(judge(Some(16385), chat_window("ollama", &json!({}), None, &Value::Null, 32768)), Fit::Fits);
+        assert_eq!(chat_window("ollama", &json!({}), None, &Value::Null, 0), None, "nothing to read");
+        assert_eq!(chat_window("airllm", &json!({"N_CTX": 8192}), None, &Value::Null, 32768), None, "an engine this cannot read");
     }
 
     #[test]
     fn llamacpp_shares_its_window_across_slots() {
-        let win = chat_window("llamacpp", &json!({"LLAMA_ARG_CTX_SIZE": 32768, "LLAMA_ARG_N_PARALLEL": "2"}), None, 0).unwrap();
+        let win = chat_window("llamacpp", &json!({"LLAMA_ARG_CTX_SIZE": 32768, "LLAMA_ARG_N_PARALLEL": "2"}), None, &Value::Null, 0).unwrap();
         assert_eq!(win.tokens, 16384);
         assert!(win.source.contains("shared by 2 parallel slots"), "{}", win.source);
-        assert_eq!(chat_window("llamacpp", &json!({"N_CTX": "8192", "N_PARALLEL": 1}), None, 0).map(|w| w.tokens), Some(8192));
+        assert_eq!(chat_window("llamacpp", &json!({"N_CTX": "8192", "N_PARALLEL": 1}), None, &Value::Null, 0).map(|w| w.tokens), Some(8192));
     }
 
     /// i226 phase C: an engine set above what the model was built for gets
@@ -205,19 +240,57 @@ mod tests {
         let declared = "gemma4:12b";
         let ceiling = crate::model_capabilities::max_context(declared).unwrap();
         let over = json!({"OLLAMA_CONTEXT_LENGTH": ceiling * 2});
-        let win = chat_window("ollama", &over, Some(declared), 0).unwrap();
+        let win = chat_window("ollama", &over, Some(declared), &Value::Null, 0).unwrap();
         assert_eq!((win.tokens, win.model_ceiling), (ceiling, true));
-        assert_eq!(win.source, "gemma4:12b's own context ceiling");
-        let under = chat_window("ollama", &json!({"OLLAMA_CONTEXT_LENGTH": 8192}), Some(declared), 0).unwrap();
+        assert_eq!(win.source, "gemma4:12b's own context ceiling (config/model-capabilities.json)");
+        let under = chat_window("ollama", &json!({"OLLAMA_CONTEXT_LENGTH": 8192}), Some(declared), &Value::Null, 0).unwrap();
         assert_eq!((under.tokens, under.model_ceiling), (8192, false), "below the ceiling the engine decides");
-        assert_eq!(chat_window("airllm", &json!({}), Some(declared), 0).map(|w| w.tokens), Some(ceiling), "the ceiling alone is an upper bound");
-        assert_eq!(chat_window("ollama", &over, Some("qwen3:8b"), 0).map(|w| w.model_ceiling), Some(false), "an undeclared model has no ceiling");
+        assert_eq!(chat_window("airllm", &json!({}), Some(declared), &Value::Null, 0).map(|w| w.tokens), Some(ceiling), "the ceiling alone is an upper bound");
+        assert_eq!(chat_window("ollama", &over, Some("qwen3:8b"), &Value::Null, 0).map(|w| w.model_ceiling), Some(false), "an undeclared model has no ceiling");
 
         let fit = judge(Some(ceiling + 1), Some(win));
         assert!(matches!(fit, Fit::Short { model_ceiling: true, .. }), "{fit:?}");
         let m = message("n", "copilot", &fit, Some(("ollama", declared))).unwrap();
         assert!(m.ends_with("Fits here: noo (noomesh's own loop); a larger window needs a model built for one"), "{m}");
         assert!(!m.contains("noo cluster place"), "{m}");
+    }
+
+    /// i285: the ceiling the node reads from the weights beats the table,
+    /// and a model the table does not know is capped once the node says.
+    #[test]
+    fn the_nodes_reported_ceiling_wins_over_the_table() {
+        let node = json!({"model_stats": [
+            {"name": "gemma4:12b", "size_bytes": 1, "context_length": 131072},
+            {"name": "qwen3:8b", "context_length": 40960},
+            {"name": "tiny", "context_length": 2048},
+            {"name": "unknown:1b"},
+        ]});
+        assert_eq!(reported_ceiling(&node, "gemma4:12b"), Some(131072));
+        assert_eq!(reported_ceiling(&node, "tiny:latest"), Some(2048), "a bare tag is :latest");
+        assert_eq!(reported_ceiling(&node, "unknown:1b"), None, "an older agent sends no context_length");
+        assert_eq!(reported_ceiling(&Value::Null, "gemma4:12b"), None);
+
+        let big = json!({"OLLAMA_CONTEXT_LENGTH": 262144});
+        let win = chat_window("ollama", &big, Some("gemma4:12b"), &node, 0).unwrap();
+        assert_eq!((win.tokens, win.model_ceiling), (131072, true), "the report, not the table's 262144");
+        assert_eq!(win.source, "gemma4:12b's own context ceiling, as the node reports it");
+        let win = chat_window("ollama", &big, Some("qwen3:8b"), &node, 0).unwrap();
+        assert_eq!((win.tokens, win.model_ceiling), (40960, true), "not in the table, reported by the node");
+        let fit = judge(Some(16385), chat_window("ollama", &big, Some("tiny"), &node, 0));
+        assert!(matches!(fit, Fit::Short { window: 2048, model_ceiling: true, .. }), "{fit:?}");
+    }
+
+    #[test]
+    fn a_report_that_differs_from_the_table_is_named() {
+        let node = json!({"model_stats": [
+            {"name": "gemma4:12b", "context_length": 131072},
+            {"name": "gemma4:12b-it-qat", "context_length": 262144},
+            {"name": "qwen3:8b", "context_length": 40960},
+        ]});
+        assert_eq!(ceiling_disagreement(&node, "gemma4:12b"), Some((131072, 262144)));
+        assert_eq!(ceiling_disagreement(&node, "gemma4:12b-it-qat"), None, "they agree");
+        assert_eq!(ceiling_disagreement(&node, "qwen3:8b"), None, "not in the table");
+        assert_eq!(ceiling_disagreement(&Value::Null, "gemma4:12b"), None, "not reported");
     }
 
     #[test]
@@ -229,7 +302,7 @@ mod tests {
         assert_eq!(judge(Some(16385), None), Fit::Unchecked);
         assert_eq!(message("n", "k", &Fit::Fits, None), None);
         let (a, b) = (json!({"VLLM_MAX_MODEL_LEN": 32768}), json!({"OLLAMA_CONTEXT_LENGTH": 8192}));
-        assert_eq!(node_window([("vllm", &a, None), ("ollama", &b, None)], 0).map(|w| w.tokens), Some(8192));
+        assert_eq!(node_window([("vllm", &a, None), ("ollama", &b, None)], &Value::Null, 0).map(|w| w.tokens), Some(8192));
     }
 
     #[test]
