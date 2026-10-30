@@ -33,7 +33,6 @@ import (
 	"log/slog"
 	"os"
 	"sort"
-	"strings"
 	"sync"
 )
 
@@ -101,58 +100,14 @@ func (t *Tracker) Report() []Entry {
 	return out
 }
 
-// ModeEnv is the per-node switch: NOO_IMAGE_SOURCE=legacy opts a node out
-// of the rail (the default).
-const ModeEnv = "NOO_IMAGE_SOURCE"
+// RetiredEnv is the old rollout switch. The rail is the only image source;
+// the variable has no effect.
+const RetiredEnv = "NOO_IMAGE_SOURCE"
 
-// The two modes.
-const (
-	ModeRail   = "rail"
-	ModeLegacy = "legacy"
-)
-
-// Mode is the node's image-source mode: "legacy" (the pre-rail behaviour)
-// only when ModeEnv says so, case-insensitively; "rail" otherwise. The rail
-// is the default, and a typo fails closed toward it: the controller is the
-// one place images come from, so an unrecognised value must not quietly
-// turn the node into a registry puller.
-func Mode() string {
-	if strings.EqualFold(strings.TrimSpace(os.Getenv(ModeEnv)), ModeLegacy) {
-		return ModeLegacy
-	}
-	return ModeRail
-}
-
-// The values of ModeSource.
-const (
-	ModeSourceEnv     = "env"
-	ModeSourceDefault = "default"
-)
-
-// ModeSource says where Mode came from: "env" when ModeEnv holds a
-// recognised value (rail or legacy), "default" when it is unset, empty or
-// unrecognised. The controller needs it to tell a node that chose legacy
-// (an escape hatch) from one that merely has not rolled yet.
-func ModeSource() string {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(ModeEnv))) {
-	case ModeRail, ModeLegacy:
-		return ModeSourceEnv
-	}
-	return ModeSourceDefault
-}
-
-// LogMode logs, once at startup, an explicit legacy choice (the escape
-// hatch is worth seeing in the log) and an unrecognised value (which means
-// rail).
-func LogMode() {
-	raw := strings.TrimSpace(os.Getenv(ModeEnv))
-	switch {
-	case raw == "":
-	case strings.EqualFold(raw, ModeLegacy):
-		slog.Warn("image source is legacy: images come from the node's own registry pulls, not the controller's rail",
-			"switch", ModeEnv, "remedy", "remove "+ModeEnv+"=legacy from /etc/noo-node-agent.env and restart the agent")
-	case strings.EqualFold(raw, ModeRail):
-	default:
-		slog.Warn("unrecognised image source value; using rail", "switch", ModeEnv, "value", raw)
+// LogRetired logs, once at startup, that RetiredEnv is set and ignored.
+func LogRetired() {
+	if v, ok := os.LookupEnv(RetiredEnv); ok {
+		slog.Warn("NOO_IMAGE_SOURCE is retired and has no effect: images always come from the controller's artifact rail",
+			"switch", RetiredEnv, "value", v, "remedy", "remove it from /etc/noo-node-agent.env")
 	}
 }

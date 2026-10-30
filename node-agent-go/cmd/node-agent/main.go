@@ -169,7 +169,7 @@ func main() {
 		slog.NewJSONHandler(api.OwnLog, &slog.HandlerOptions{Level: logLevel()}),
 	)
 	slog.SetDefault(slog.New(handler))
-	imagesource.LogMode()
+	imagesource.LogRetired()
 
 	// A retired certificate-organization override is a refusal, not a
 	// silently ignored knob: an operator who set one believes it widens or

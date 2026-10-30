@@ -55,8 +55,8 @@ func sortedKeys(m map[string]any) []string {
 // shared list; this fails if a key appears, vanishes or is renamed.
 func TestPayloadGolden_KeySets(t *testing.T) {
 	beat, reg := capturePayloads(t)
-	wantBeat := []string{"active_jobs", "active_sensors", "app_version", "available_models", "backend_leaves", "battery_pct", "bind_addr", "capabilities", "control_transports", "controller_leaf_only", "cpu_cores", "cpu_load", "data_roots", "gpu_model", "image_source_mode", "image_source_mode_source", "is_charging", "legacy_lanes", "load", "location", "mem_used_gb", "model_presence", "network_type", "peer_identity_enforced", "power_source", "ram_gb", "reconcile_refusals", "running_backends", "self_node", "thermal_state", "tier", "vram_gb", "vram_used_gb"}
-	wantReg := []string{"agent_url", "app_version", "backend_leaves", "capabilities", "control_transports", "controller_leaf_only", "data_roots", "hostname", "image_source_mode", "image_source_mode_source", "ip_address", "legacy_lanes", "model_presence", "node_id", "peer_identity_enforced"}
+	wantBeat := []string{"active_jobs", "active_sensors", "app_version", "available_models", "backend_leaves", "battery_pct", "bind_addr", "capabilities", "control_transports", "controller_leaf_only", "cpu_cores", "cpu_load", "data_roots", "gpu_model", "image_source_mode", "is_charging", "legacy_lanes", "load", "location", "mem_used_gb", "model_presence", "network_type", "peer_identity_enforced", "power_source", "ram_gb", "reconcile_refusals", "running_backends", "self_node", "thermal_state", "tier", "vram_gb", "vram_used_gb"}
+	wantReg := []string{"agent_url", "app_version", "backend_leaves", "capabilities", "control_transports", "controller_leaf_only", "data_roots", "hostname", "image_source_mode", "ip_address", "legacy_lanes", "model_presence", "node_id", "peer_identity_enforced"}
 	if got := sortedKeys(beat); !reflect.DeepEqual(got, wantBeat) {
 		t.Errorf("heartbeat keys changed:\n got %v\nwant %v", got, wantBeat)
 	}

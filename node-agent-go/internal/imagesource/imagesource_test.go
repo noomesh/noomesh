@@ -3,9 +3,7 @@
 
 package imagesource
 
-import (
-	"testing"
-)
+import "testing"
 
 func TestLatestRecordWinsAndReportIsSorted(t *testing.T) {
 	tr := &Tracker{}
@@ -25,27 +23,5 @@ func TestLatestRecordWinsAndReportIsSorted(t *testing.T) {
 	}
 	if got[1].Source != Registry {
 		t.Errorf("registry provenance kept: %+v", got[1])
-	}
-}
-
-// Rail is the default: unset, empty and a typo are all rail; only legacy
-// (any case, padded) opts out. The source says env only for a recognised value.
-func TestModeDefaultsToRailAndSourceSaysWhy(t *testing.T) {
-	for _, c := range []struct{ val, mode, source string }{
-		{"", ModeRail, ModeSourceDefault},
-		{"   ", ModeRail, ModeSourceDefault},
-		{"raill", ModeRail, ModeSourceDefault},
-		{"rail", ModeRail, ModeSourceEnv},
-		{" RAIL ", ModeRail, ModeSourceEnv},
-		{"legacy", ModeLegacy, ModeSourceEnv},
-		{"  Legacy\t", ModeLegacy, ModeSourceEnv},
-	} {
-		t.Setenv(ModeEnv, c.val)
-		if got := Mode(); got != c.mode {
-			t.Errorf("%q: Mode() = %q, want %q", c.val, got, c.mode)
-		}
-		if got := ModeSource(); got != c.source {
-			t.Errorf("%q: ModeSource() = %q, want %q", c.val, got, c.source)
-		}
 	}
 }

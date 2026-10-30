@@ -10,8 +10,6 @@ import (
 	"os"
 	"regexp"
 	"strings"
-
-	"github.com/noomesh/noomesh/node-agent-go/internal/imagesource"
 )
 
 // A pinned door does not follow the node's release. Every other door runs
@@ -85,12 +83,11 @@ func pinnedDoorRef(backend string) string {
 }
 
 // pinnedDoorFetchRef is the ref a node fetches and runs a pinned door by: on
-// a rail node the tag ref the controller staged it under (the rail's
-// manifest verifies the tar, as for every rail image), elsewhere the digest
-// ref, so a registry pull cannot land anything else.
+// a node the tag ref the controller staged it under (the rail's
+// manifest verifies the tar, as for every rail image).
 func pinnedDoorFetchRef(backend string) string {
 	ref := pinnedDoorRef(backend)
-	if ref != "" && imageSourceMode() == imagesource.ModeRail {
+	if ref != "" {
 		ref, _ = splitDigest(ref)
 	}
 	return ref

@@ -165,7 +165,6 @@ func TestTheVLLMDoorTakesTheEngineName(t *testing.T) {
 // move with the pin. A pinned door has no fallback image.
 func TestThePinnedDoorFollowsItsPinNotTheRelease(t *testing.T) {
 	t.Setenv(StunnelImageEnv, "")
-	t.Setenv("NOO_IMAGE_SOURCE", "legacy")
 	t.Setenv("NOO_IMAGE_PREFIX", "ghcr.io/noomesh")
 	t.Setenv("NOO_IMAGE_TAG", "v0.6.13")
 	pinned := ReleaseSidecarImage("vllm")
@@ -179,12 +178,8 @@ func TestThePinnedDoorFollowsItsPinNotTheRelease(t *testing.T) {
 	if got := ReleaseSidecarImage("llamacpp"); got != "ghcr.io/noomesh/stunnel:v0.6.14" {
 		t.Fatalf("llama.cpp's door still follows the release: %q", got)
 	}
-	if got := stunnelImageCandidates("vllm"); len(got) != 1 || got[0] != pinned {
-		t.Fatalf("a pinned door has its pin and no fallback: %v", got)
-	}
-	// A rail node fetches the tag ref the controller staged; the rail's
+	// A node fetches the tag ref the controller staged; the rail's
 	// manifest verifies the tar.
-	t.Setenv("NOO_IMAGE_SOURCE", "rail")
 	if got, want := stunnelImageCandidates("vllm"), strings.SplitN(pinned, "@", 2)[0]; len(got) != 1 || got[0] != want {
 		t.Fatalf("rail node fetches %v, want [%s]", got, want)
 	}

@@ -549,38 +549,20 @@ pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
 /// public registry under the third-party fallback. No row from an agent that
 /// does not report (older, or nothing started yet).
 ///
-/// The rail is the default. A node that CHOSE legacy (`image_source_mode`
-/// legacy with `image_source_mode_source` env) WARNs: it is off the rule that
-/// images come from the controller. An older agent reporting legacy with no
-/// source is on the pre-flip default and becomes rail on its next roll, so
-/// it keeps an OK row saying so. On either, the detail names what the rail
-/// would refuse: the placed images that are not staged for the node's arch
-/// (`unstaged_images`, the same input as `images_staged_check`), because an
-/// image the node does not hold and the controller has not staged cannot
+/// The rail is the only image source. An agent reporting
+/// `image_source_mode=legacy` is from before that release: it keeps an OK row
+/// that says it becomes rail on this roll. On it, the detail names what the
+/// rail would refuse: the placed images that are not staged for the node's
+/// arch (`unstaged_images`, the same input as `images_staged_check`), because
+/// an image the node does not hold and the controller has not staged cannot
 /// start on the rail.
 pub(crate) fn image_sources_check(n: &Value) -> Option<Check> {
     let id = n["id"].as_str().unwrap_or("?");
     let legacy = n["image_source_mode"].as_str() == Some("legacy");
-    let chose_legacy = legacy && n["image_source_mode_source"].as_str() == Some("env");
     let would_refuse = match n["unstaged_images"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>()) {
         Some(v) if !v.is_empty() => format!("; on the rail, placed images not staged for this node's arch would be refused unless already present: {}", v.join(", ")),
         _ => String::new(),
     };
-    if chose_legacy {
-        let from = n["image_sources"].as_array().map(|entries| {
-            let off: Vec<String> = entries
-                .iter()
-                .filter(|e| e["source"].as_str() != Some("rail"))
-                .map(|e| format!("{} ({})", e["image"].as_str().unwrap_or("?"), e["source"].as_str().unwrap_or("?")))
-                .collect();
-            if off.is_empty() { String::new() } else { format!("; not from the rail: {}", off.join(", ")) }
-        }).unwrap_or_default();
-        return Some(warn(
-            "image sources",
-            format!("NOO_IMAGE_SOURCE=legacy is set on this node: it pulls images from registries instead of the controller's artifact rail{from}{would_refuse}"),
-            Some(format!("remove NOO_IMAGE_SOURCE=legacy from /etc/noo-node-agent.env on {id} and restart the agent")),
-        ));
-    }
     let entries = n["image_sources"].as_array()?;
     let off: Vec<(String, String)> = entries
         .iter()
@@ -594,12 +576,12 @@ pub(crate) fn image_sources_check(n: &Value) -> Option<Check> {
     }
     let list: Vec<String> = off.iter().map(|(i, s)| format!("{i} ({s})")).collect();
     let first = &off[0].0;
-    // An agent that reports legacy with no source predates the rail default:
-    // it takes images the pre-rail way until its next roll, so this is
-    // information, not a warning. An agent that reports no mode predates both.
+    // An agent that reports legacy predates the rail-only release: it takes
+    // images the pre-rail way until its next roll, so this is information,
+    // not a warning. An agent that reports no mode predates that too.
     if legacy {
         return Some(ok("image sources", format!(
-            "legacy image source on an older agent; it becomes rail on the next agent roll: not from the rail: {}{would_refuse}",
+            "older agent still on the legacy image source; it becomes rail on this roll: not from the rail: {}{would_refuse}",
             list.join(", "))));
     }
     Some(warn(
@@ -8818,27 +8800,20 @@ mod tests {
         let c = image_sources_check(&legacy).unwrap();
         assert_eq!(c.verdict, Verdict::Ok);
         assert!(c.detail.contains("legacy") && c.detail.contains("ollama/ollama:latest (registry)"), "{}", c.detail);
-        assert!(c.detail.contains("becomes rail on the next agent roll"), "{}", c.detail);
+        assert!(c.detail.contains("becomes rail on this roll"), "{}", c.detail);
     }
 
-    /// A node that chose legacy (mode legacy + source env) WARNs with a host-file
-    /// remedy, even before it has started anything, and the detail names what
-    /// the rail would refuse.
+    /// An older agent reporting legacy is OK (it becomes rail on this roll) and the
+    /// detail names what the rail would refuse; a rail node still WARNs.
     #[test]
-    fn image_sources_row_warns_on_explicit_legacy() {
-        let n = serde_json::json!({"id": "host8-ma", "image_source_mode": "legacy", "image_source_mode_source": "env",
+    fn image_sources_row_for_an_older_legacy_agent_says_it_becomes_rail() {
+        let n = serde_json::json!({"id": "host8-ma", "image_source_mode": "legacy",
             "unstaged_images": ["reg/acme/llamacpp:v2"],
             "image_sources": [{"image": "ollama/ollama:latest", "source": "registry"}]});
         let c = image_sources_check(&n).unwrap();
-        assert_eq!(c.verdict, Verdict::Warn);
-        assert!(c.detail.contains("ollama/ollama:latest (registry)") && c.detail.contains("reg/acme/llamacpp:v2") && c.detail.contains("would be refused"), "{}", c.detail);
-        assert_eq!(c.remedy.as_deref(), Some("remove NOO_IMAGE_SOURCE=legacy from /etc/noo-node-agent.env on host8-ma and restart the agent"));
-        let bare = serde_json::json!({"id": "x", "image_source_mode": "legacy", "image_source_mode_source": "env"});
-        assert_eq!(image_sources_check(&bare).unwrap().verdict, Verdict::Warn, "explicit legacy warns with nothing started");
-        // The same legacy mode with source default is the rail-by-default agent's own report
-        // (cannot happen) and an older agent has no source: neither warns.
-        let old = serde_json::json!({"id": "x", "image_source_mode": "legacy", "image_sources": [{"image": "a/b:1", "source": "local"}]});
-        assert_eq!(image_sources_check(&old).unwrap().verdict, Verdict::Ok);
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("becomes rail on this roll") && c.detail.contains("ollama/ollama:latest (registry)")
+            && c.detail.contains("reg/acme/llamacpp:v2") && c.detail.contains("would be refused"), "{}", c.detail);
     }
 
     #[test]
