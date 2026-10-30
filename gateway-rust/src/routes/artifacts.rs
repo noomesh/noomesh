@@ -544,8 +544,10 @@ pub(crate) fn is_own_image_with(image: &str, roots: &[&str]) -> bool {
 }
 
 /// The image a placement needs staged, when the gateway can know it: an
-/// explicit `image` of ours, or — on an amd64 node with a staged release —
-/// the release llama.cpp the agent defaults to (`llamacppDefaultImage`).
+/// explicit `image` of ours, or — on a node whose arch the release publishes
+/// the image for, with a staged release — the release llamacpp / ollama the
+/// agent defaults to. There is no upstream fallback on the node, so a missing
+/// stage is refused up front.
 /// A third-party image is not required: a node may take it from its public
 /// registry under NOO_IMAGE_REGISTRY_FALLBACK. None = nothing to judge.
 pub(crate) fn placement_required_image(
@@ -563,8 +565,29 @@ pub(crate) fn placement_required_image(
         return is_own_image_with(img, &roots).then(|| img.to_string());
     }
     let r = release?;
-    (backend == "llamacpp" && node_arch == "amd64")
-        .then(|| format!("{}/llamacpp:{}", r.prefix.trim_end_matches('/'), r.tag))
+    let name = release_image_for_backend(backend)?;
+    published_for_arch(name, node_arch).then(|| format!("{}/{name}:{}", r.prefix.trim_end_matches('/'), r.tag))
+}
+
+/// The release images the node agent defaults a backend to (`llamacpp` and
+/// `ollama`: ours, never an upstream stand-in) and the architectures the
+/// release publishes them for. The arches are the `platforms` of the
+/// images-release.yml matrix rows; the lock records only index digests, so this
+/// table is the gateway's copy and tests/test_hardened_images_i323.py fails if
+/// it drifts from the matrix.
+pub(crate) const OWN_IMAGE_ARCHES: &[(&str, &[&str])] = &[("llamacpp", &["amd64", "arm64"]), ("ollama", &["amd64", "arm64"])];
+
+fn release_image_for_backend(backend: &str) -> Option<&'static str> {
+    match backend {
+        "llamacpp" => Some("llamacpp"),
+        "ollama" => Some("ollama"),
+        _ => None,
+    }
+}
+
+/// Is `image` published for `arch` by the release (see [`OWN_IMAGE_ARCHES`])?
+pub(crate) fn published_for_arch(image: &str, arch: &str) -> bool {
+    OWN_IMAGE_ARCHES.iter().any(|(n, arches)| *n == image && arches.contains(&arch))
 }
 
 /// The place-time refusal. The phrase "is not staged on the controller" and
@@ -599,8 +622,21 @@ mod tests {
             placement_required_image("llamacpp", None, "amd64", Some(&rel), &[]).as_deref(),
             Some("reg.example/acme/llamacpp:v0.2.103")
         );
-        // ARM nodes default to upstream llama.cpp (third-party): nothing required.
-        assert!(placement_required_image("llamacpp", None, "arm64", Some(&rel), &[]).is_none());
+        // ARM nodes take our llamacpp too (published for arm64): required, so an
+        // unstaged arm64 image is refused up front instead of falling back.
+        assert_eq!(
+            placement_required_image("llamacpp", None, "arm64", Some(&rel), &[]).as_deref(),
+            Some("reg.example/acme/llamacpp:v0.2.103")
+        );
+        for arch in ["amd64", "arm64"] {
+            assert_eq!(
+                placement_required_image("ollama", None, arch, Some(&rel), &[]).as_deref(),
+                Some("reg.example/acme/ollama:v0.2.103"),
+                "{arch}"
+            );
+        }
+        // An arch the release does not publish: nothing to require.
+        assert!(placement_required_image("llamacpp", None, "riscv64", Some(&rel), &[]).is_none());
         // An explicit image of ours is required; a third-party one is not.
         assert_eq!(
             placement_required_image("vllm", Some("reg.example/acme/vllm:v1"), "amd64", Some(&rel), &[]).as_deref(),
@@ -613,7 +649,7 @@ mod tests {
         assert!(placement_required_image("vllm", Some("other.example/ns/v:1"), "amd64", None, &["other.example/ns".into()]).is_some());
         // No staged release, no explicit image: nothing the gateway can judge.
         assert!(placement_required_image("llamacpp", None, "amd64", None, &[]).is_none());
-        assert!(placement_required_image("ollama", None, "amd64", Some(&rel), &[]).is_none());
+        assert!(placement_required_image("vllm", None, "amd64", Some(&rel), &[]).is_none());
     }
 
     #[test]
@@ -626,6 +662,22 @@ mod tests {
             let r = c["ref"].as_str().unwrap();
             assert_eq!(is_own_image_with(r, &roots), c["own"].as_bool().unwrap(), "{r}");
         }
+    }
+
+    #[test]
+    fn an_arm64_placement_is_refused_when_only_amd64_is_staged() {
+        let dir = std::env::temp_dir().join(format!("noo-art-arch-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let rel = StagedRelease { prefix: "reg.example/acme".into(), tag: "v1".into() };
+        for backend in ["llamacpp", "ollama"] {
+            let image = placement_required_image(backend, None, "arm64", Some(&rel), &[]).expect("arm64 is published");
+            std::fs::write(dir.join(image_tar_gz_name(&image, "amd64")), b"x").unwrap();
+            assert!(image_is_staged(&dir, &image, "amd64"), "{backend}: amd64 staged");
+            assert!(!image_is_staged(&dir, &image, "arm64"), "{backend}: arm64 NOT staged, so the placement is refused");
+        }
+        assert!(published_for_arch("llamacpp", "arm64") && published_for_arch("ollama", "amd64"));
+        assert!(!published_for_arch("vllm", "amd64"), "only the table's images");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

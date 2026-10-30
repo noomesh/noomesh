@@ -674,12 +674,8 @@ pub fn cluster_sync_images(g: &Globals, args: &[String]) -> Result<i32, Unhandle
                     succeeded += 1;
                     records.push(json!({"node": nid, "image": img, "result": "ok"}));
                 }
-                Err(e) if e.starts_with(crate::commands::image_stage::NO_VARIANT) => {
-                    let hint = if img.contains("llamacpp") {
-                        "an ARM node runs the upstream llama.cpp image; stage it with -i ghcr.io/ggml-org/llama.cpp:server"
-                    } else {
-                        "stage a multi-arch equivalent with -i <image>"
-                    };
+                Err(e) if crate::commands::image_stage::no_variant_is_skip(img, &arch, &e) => {
+                    let hint = "stage a multi-arch equivalent with -i <image>";
                     say(&format!("  {nid}: {img} is not published for {arch} — skipping ({hint})."));
                     records.push(json!({"node": nid, "image": img, "result": "skipped_arch"}));
                 }

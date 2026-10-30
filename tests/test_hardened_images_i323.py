@@ -97,14 +97,43 @@ def test_the_ollama_lock_row_is_ours_and_every_compose_ollama_runs_it():
     assert "- NOO_BACKEND_IMAGE_OLLAMA=" + ours in COMPOSE
 
 
-def test_the_agent_defaults_are_ours_with_upstream_only_as_the_fallback():
-    assert "func hardenedDefault(" in BACKENDS and "func ensureImageWithFallback(" in BACKENDS
-    assert "var ns *ImageNotStagedError" in BACKENDS
+def test_the_agent_defaults_are_ours_and_there_is_no_upstream_fallback():
+    assert "func hardenedDefault(" in BACKENDS
+    # No fallback path for our images: not staged is a refusal (ImageNotStagedError).
+    assert "ensureImageWithFallback" not in BACKENDS and "Fallback:" not in BACKENDS
+    assert "NOT fall back to an upstream image" in (ROOT / "node-agent-go/internal/docker/artifacts.go").read_text()
     # The arm branch that sent ARM nodes to upstream is gone.
     body = BACKENDS[BACKENDS.index("func llamacppDefaultImage()"):BACKENDS.index("func ollamaDefaultImage()")]
     assert "GOARCH" not in body
     # (d) the retired local-name lookup is deleted.
     assert "pai-assistant/llamacpp:%s" not in BACKENDS and "using hardened llamacpp build" not in BACKENDS
+
+
+def _arches_from_matrix(name: str) -> list[str]:
+    return sorted(p.removeprefix("linux/") for p in _row(name)["platforms"].split(","))
+
+
+def test_the_published_arch_tables_equal_the_release_matrix():
+    """Gateway and CLI keep a twin of the matrix `platforms` (the lock records only
+    index digests); this is what keeps them from drifting."""
+    for path, pat in (("gateway-rust/src/routes/artifacts.rs", r"OWN_IMAGE_ARCHES: &\[\(&str, &\[&str\]\)\] = &\[(.*?)\];"),
+                      ("noo-cli/src/commands/image_stage.rs", r"OWN_IMAGE_ARCHES: &\[\(&str, &\[&str\]\)\] = &\[(.*?)\];")):
+        src = (ROOT / path).read_text()
+        body = re.search(pat, src).group(1)
+        table = {n: sorted(re.findall(r'"([a-z0-9]+)"', arches)) for n, arches in re.findall(r'\("([a-z]+)", &\[(.*?)\]\)', body)}
+        assert table == {n: _arches_from_matrix(n) for n in ("llamacpp", "ollama")}, (path, table)
+
+
+def test_verify_fails_on_upstream_drift():
+    rs = (ROOT / "noo-cli/src/commands/cluster_verify.rs").read_text()
+    body = rs[rs.index("pub(crate) fn hardened_images_check"):]
+    body = body[:body.index("\n}\n")]
+    assert "Some(fail(" in body and "warn(" not in body
+
+
+def test_no_variant_of_our_images_is_not_a_skip():
+    rs = (ROOT / "noo-cli/src/commands/image_stage.rs").read_text()
+    assert rs.count("no_variant_is_skip(") >= 3 and "Err(e) if e.starts_with(NO_VARIANT) =>" not in rs
 
 
 def test_dockerfile_ollama_final_stage_is_non_root():

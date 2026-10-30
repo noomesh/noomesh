@@ -625,8 +625,8 @@ pub(crate) fn hardened_replacement(image: &str, tag: &str) -> Option<String> {
     Some(format!("{}/{name}:{tag}", crate::registry::IMAGE_NAMESPACE))
 }
 
-/// The `hardened images` row: an upstream backend image
-/// (`ollama/ollama`, `ghcr.io/ggml-org/*`) WARNs and names the hardened ref of
+/// The `hardened images` row: FAIL (drift) when an upstream backend image
+/// (`ollama/ollama`, `ghcr.io/ggml-org/*`) runs, naming the hardened ref of
 /// ours that should replace it. The tag is the release the node's own images
 /// carry (`<ns>/<name>:<tag>` in `image_sources`), else `<stack-tag>`. No row
 /// on a node that reports no sources or runs no upstream backend image.
@@ -643,10 +643,10 @@ pub(crate) fn hardened_images_check(n: &Value) -> Option<Check> {
     let swaps: Vec<(&str, String)> = images.iter().filter_map(|i| hardened_replacement(i, tag).map(|h| (*i, h))).collect();
     let (_, first_ours) = swaps.first()?;
     let list: Vec<String> = swaps.iter().map(|(u, h)| format!("{u} -> {h}")).collect();
-    Some(warn(
+    Some(fail(
         "hardened images",
-        format!("upstream image(s) in use where a hardened build of ours exists: {}", list.join(", ")),
-        Some(format!("noo cluster sync-images {id} -i {first_ours}   # stage ours; the agent prefers it on the next start")),
+        format!("drift: upstream image(s) running where a hardened build of ours exists (a node never falls back to upstream on its own): {}", list.join(", ")),
+        format!("noo cluster sync-images {id} -i {first_ours}   # stage ours, then restart the backend (`noo cluster up`); unset LLAMACPP_IMAGE / OLLAMA_IMAGE if an override pins upstream"),
     ))
 }
 
@@ -8859,7 +8859,7 @@ mod tests {
     }
 
     /// `hardened images`: on a rail node an upstream ollama / llama.cpp image
-    /// WARNs naming the hardened ref; ours gets no row.
+    /// FAILs naming the hardened ref; ours gets no row.
     #[test]
     fn hardened_images_row_names_the_replacement_for_an_upstream_image() {
         assert_eq!(hardened_replacement("ollama/ollama:0.40.5@sha256:aa", "v0.6.15").as_deref(), Some("ghcr.io/noomesh/ollama:v0.6.15"));
@@ -8872,7 +8872,8 @@ mod tests {
             {"image": "ollama/ollama:0.40.5", "source": "registry"},
             {"image": "ghcr.io/ggml-org/llama.cpp:server", "source": "registry"}]});
         let c = hardened_images_check(&n).expect("a row");
-        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.verdict, Verdict::Fail, "drift is a FAIL, not a warning");
+        assert!(c.remedy.as_deref().unwrap_or("").contains("sync-images robopi -i ghcr.io/noomesh/ollama:v0.6.15"), "{:?}", c.remedy);
         assert!(c.detail.contains("ollama/ollama:0.40.5 -> ghcr.io/noomesh/ollama:v0.6.15"), "{}", c.detail);
         assert!(c.detail.contains("ghcr.io/ggml-org/llama.cpp:server -> ghcr.io/noomesh/llamacpp:v0.6.15"), "{}", c.detail);
         // Nothing to replace, or an agent that reports nothing: no row.

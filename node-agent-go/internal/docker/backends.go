@@ -309,8 +309,8 @@ var backendSpecs = map[string]BackendSpec{
 	"llamacpp": {
 		// Image is overridable via LLAMACPP_IMAGE env var. The default is our
 		// hardened llama-server from this node's release on every arch
-		// (llamacppDefaultImage); upstream ggml-org is the fallback only
-		// when ours is not staged (ensureImageWithFallback).
+		// (llamacppDefaultImage); a node with no release pin runs upstream
+		// ggml-org. Not staged for the arch is a refusal, never a fallback.
 		Image:         envOr("LLAMACPP_IMAGE", llamacppDefaultImage()),
 		ContainerName: "noo-llamacpp",
 		// llama-server writes nothing outside /models (read-only too).
@@ -377,8 +377,8 @@ var backendSpecs = map[string]BackendSpec{
 	"ollama": {
 		// Our hardened image (release-derived) when this node knows its
 		// release, else the upstream pin; an explicit OLLAMA_IMAGE wins.
-		// chooseBackendImage re-derives it per start (hardenedDefault) and
-		// falls back to the upstream pin only when ours is not staged.
+		// chooseBackendImage re-derives it per start (hardenedDefault); a
+		// node with no release pin keeps the upstream pin; not staged is a refusal.
 		Image:         "${OLLAMA_IMAGE:-" + ollamaDefaultImage() + "}",
 		ContainerName: "noo-ollama",
 		Env: map[string]string{
@@ -507,8 +507,8 @@ func rerankerSpecTEI() BackendSpec {
 
 // rerankerSpecLlamacpp runs llama-server --reranking from the hardened
 // llamacpp image (same image/default-resolution story as the llamacpp LLM
-// backend: our release llamacpp on every arch, upstream as the not-staged
-// fallback; RERANK_IMAGE overrides). Serves Jina-style POST /v1/rerank on :8085; the
+// backend: our release llamacpp on every arch, a refusal when not staged and
+// never upstream; RERANK_IMAGE overrides). Serves Jina-style POST /v1/rerank on :8085; the
 // node-agent /rerank proxy translates to/from the TEI wire contract.
 //
 // RERANK_MODEL is a bare GGUF FILENAME under /models (default
@@ -801,8 +801,9 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 
 	// The image: local if the controller vouches for it, else over the
 	// artifact rail; never a registry pull for our own images (image_source.go).
-	img, err := ensureImageWithFallback(ctx, c, backend, spec.Image, choice.Fallback, choice.RailOnly)
-	if err != nil {
+	ctx = withRailOnly(ctx, choice.RailOnly)
+	img := spec.Image
+	if err := ensureImageFn(ctx, c, img); err != nil {
 		return fmt.Errorf("backend %s image: %w", backend, err)
 	}
 	spec.Image = img
@@ -1853,10 +1854,9 @@ func ReleaseBackendImage(backend string) string {
 	return ""
 }
 
-// Upstream images the agent falls back to ONLY when ours is not available on
-// this node and not staged on the rail (ensureImageWithFallback). The ollama
-// pin is the version docker-compose.cluster.yml names for the `ollama-upstream`
-// lock row and docker/Dockerfile.ollama packages (tests/test_hardened_images_i323.py).
+// What a node with NO release pin (a dev box) runs by default. A node with a
+// pin runs ours and never falls back to these. The ollama version is the one
+// docker/Dockerfile.ollama packages (tests/test_hardened_images_i323.py).
 const (
 	upstreamLlamacppImage = "ghcr.io/ggml-org/llama.cpp:server"
 	upstreamOllamaImage   = "ollama/ollama:0.40.5"
@@ -1895,59 +1895,29 @@ func ollamaDefaultImage() string {
 	return upstreamOllamaImage
 }
 
-// hardenedDefault is the (ours, upstream) pair for a backend whose default
-// image is a hardened build of ours with an upstream fallback, or ("", "")
-// when the backend has none, when an explicit image env names one (that
-// always wins and never falls back), or when this node has no release pin.
-func hardenedDefault(backend string) (ours, upstream string) {
+// hardenedDefault is OUR hardened image for a backend whose default is one,
+// or "" when the backend has none, when an explicit image env names one (that
+// always wins), or when this node has no release pin. There is no upstream
+// fallback for these images: not staged is a refusal.
+func hardenedDefault(backend string) string {
 	var envVar, name string
 	switch backend {
 	case "llamacpp":
-		envVar, name, upstream = "LLAMACPP_IMAGE", "llamacpp", upstreamLlamacppImage
+		envVar, name = "LLAMACPP_IMAGE", "llamacpp"
 	case "reranker":
 		if strings.EqualFold(strings.TrimSpace(os.Getenv("RERANK_ENGINE")), "tei") {
-			return "", ""
+			return ""
 		}
-		envVar, name, upstream = "RERANK_IMAGE", "llamacpp", upstreamLlamacppImage
+		envVar, name = "RERANK_IMAGE", "llamacpp"
 	case "ollama":
-		envVar, name, upstream = "OLLAMA_IMAGE", "ollama", upstreamOllamaImage
+		envVar, name = "OLLAMA_IMAGE", "ollama"
 	default:
-		return "", ""
+		return ""
 	}
 	if strings.TrimSpace(os.Getenv(envVar)) != "" {
-		return "", ""
+		return ""
 	}
-	ours = releaseImage(name)
-	if ours == "" {
-		return "", ""
-	}
-	return ours, upstream
-}
-
-// ensureImageWithFallback makes ref available (EnsureImage: local, rail, or a
-// policy-allowed registry pull) and returns the image to run. When ref is
-// our hardened default and the node can get it from nowhere (not local, not
-// staged on the controller: ImageNotStagedError), it falls back to the
-// upstream image through the same EnsureImage, which applies
-// NOO_IMAGE_REGISTRY_FALLBACK and records source=registry. Any other failure
-// (a verification failure above all) is returned as is: a bad tar must never
-// become an upstream pull.
-func ensureImageWithFallback(ctx context.Context, c *Client, backend, ref, fallback string, railOnly bool) (string, error) {
-	err := ensureImageFn(withRailOnly(ctx, railOnly), c, ref)
-	if err == nil {
-		return ref, nil
-	}
-	var ns *ImageNotStagedError
-	if fallback == "" || fallback == ref || !errors.As(err, &ns) {
-		return ref, err
-	}
-	slog.Warn("image.hardened_not_staged: our image is not on this node and not staged on the controller; "+
-		"falling back to the upstream image. Stage ours with `noo cluster sync-images <node>`",
-		"backend", backend, "ours", ref, "upstream", fallback)
-	if ferr := ensureImageFn(ctx, c, fallback); ferr != nil {
-		return ref, fmt.Errorf("%w; upstream fallback %s also unavailable: %v", err, fallback, ferr)
-	}
-	return fallback, nil
+	return releaseImage(name)
 }
 
 // ExpectsGGUFModel reports whether a backend loads a model FILE from the

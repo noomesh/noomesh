@@ -4216,8 +4216,8 @@ async fn placement_staging_refusal(state: &AppState, node_id: &str, backend: &st
         return None;
     }
     tracing::warn!(node = %node_id, backend = %backend, image = %image, arch = %arch, "placement.image_not_staged");
-    let rail = node["image_source_mode"].as_str() == Some("rail");
-    Some((art::not_staged_refusal(node_id, &image, &arch), rail))
+    // Rail is the only image source: an unstaged image is always a refusal.
+    Some((art::not_staged_refusal(node_id, &image, &arch), true))
 }
 
 /// PUT /api/cluster/nodes/{node_id}/placements/{backend} — upsert.
