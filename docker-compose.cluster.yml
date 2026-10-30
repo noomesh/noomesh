@@ -523,14 +523,6 @@ services:
       - NOO_TAILSCALE_OAUTH_CLIENT_SECRET_FILE=${NOO_TAILSCALE_OAUTH_CLIENT_SECRET:+/run/secrets/noo_tailscale_oauth_client_secret}
       - NOO_BOOTSTRAP_SCRIPT_URL=${NOO_BOOTSTRAP_SCRIPT_URL:-}
       - NGROK_DOMAIN=${NGROK_DOMAIN:-}
-      # Controller SSH PUBLIC key, served by POST /api/cluster/bootstrap
-      # (bootstrap-token enrollment) so a node can install the
-      # forced-command `noo-gate` entry. NOTHING in this repo dials that
-      # key any more — the controller->node SSH lane was removed and no
-      # container holds a private key. Kept only until the gate lane itself
-      # is retired. Empty =
-      # bootstrap enrollment reports itself unconfigured.
-      - NOO_CONTROLLER_SSH_PUBKEY=${NOO_CONTROLLER_SSH_PUBKEY:-}
       # Observability: noo_metrics_query tool (PromQL)
       - NOO_PROMETHEUS_URL=${NOO_PROMETHEUS_URL:-https://prometheus:9090}
       # Alerts: noo_alerts_list adds Alertmanager's own view (active,
