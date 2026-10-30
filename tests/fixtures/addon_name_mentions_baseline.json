@@ -1,7 +1,7 @@
 {
  "docs/cli/fleet.md": 5,
  "docs/development/addons.md": 2,
- "gateway-rust/src/addon_proxy.rs": 9,
+ "gateway-rust/src/addon_proxy.rs": 6,
  "gateway-rust/src/addon_registry.rs": 97,
  "gateway-rust/src/addon_workloads.rs": 43,
  "gateway-rust/src/routes/reservations.rs": 6,

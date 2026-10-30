@@ -355,8 +355,8 @@ fn sample_path(path: &str) -> String {
 }
 
 fn check_upstream(m: &AddonManifest, addon: &str) -> Result<(), String> {
-    // `-` is not legal in an environment variable name: `pai-voice` reads
-    // `NOO_PAI_VOICE_URL`. The container stays `noo-<addon>` verbatim.
+    // `-` is not legal in an environment variable name: `rh-addon` reads
+    // `NOO_RH_ADDON_URL`. The container stays `noo-<addon>` verbatim.
     let want_env = format!("NOO_{}_URL", addon.to_ascii_uppercase().replace('-', "_"));
     if m.base_url_env != want_env {
         return Err(format!(
@@ -395,7 +395,7 @@ pub fn scope_ok(s: &str) -> bool {
     let plain = |t: &str| {
         !t.is_empty() && t.len() <= 32 && t.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
     };
-    // The add-on part may hold `-` (`pai-voice:read`); a word never does.
+    // The add-on part may hold `-` (`rh-addon:read`); a word never does.
     let plain_addon = |t: &str| plain(&t.replace('-', "_"));
     plain_addon(addon) && plain(word) && !word.contains(':')
 }
