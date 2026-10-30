@@ -67,10 +67,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::{self as ts, client::IntoClientRequest, protocol::WebSocketConfig};
 use tokio_tungstenite::WebSocketStream;
 
-use crate::addon_proxy::{AddonManifest, RouteSpec};
-// The bounds a manifest may declare are manifest rules (`addon-manifest`,
-// shared with `noo addons check`); the defaults are this module's own.
-pub use addon_manifest::{MAX_CONNECTIONS_PER_USER, MAX_IDLE_TIMEOUT_SECS, MAX_MAX_MESSAGE_BYTES};
+use crate::addon_proxy::{AddonManifest, RouteRole, RouteSpec};
 use crate::state::AppState;
 
 /// Default largest message (and frame) in either direction.
