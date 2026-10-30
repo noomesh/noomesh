@@ -8523,7 +8523,7 @@ mod sudo_seam_tests {
         let dir = std::env::temp_dir().join(format!("noo-i276-storage-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fake = dir.join("sudo");
-        crate::test_exec::write_exec(&fake, "#!/bin/sh\necho 'sudo: a password is required' >&2\nexit 1\n".to_string(), 0o755);
+        crate::test_exec::write_exec(&fake, "#!/bin/sh\necho 'sudo: a password is required' >&2\nexit 1\n", 0o755);
         SUDO_BIN.with(|b| *b.borrow_mut() = Some(fake.clone()));
 
         let g = crate::Globals { json: false, verbose: false, gateway_override: None, timeout_secs: None, token: None, quiet: true };
