@@ -36,6 +36,19 @@ pub(crate) fn compose_files(ctx: &Ctx) -> Vec<String> {
     compose_files_in(&ctx.repo_root, ctx.dry_run, &ctx.compose_file, &ctx.override_file)
 }
 
+/// This install's compose file list for `root`, with no `Ctx` (the doctor and
+/// `cluster verify` have none): the same `lib-compose.sh compose_file_list`
+/// answer `compose_files` gives, absolute paths, base+override when the
+/// helper is not on disk.
+pub(crate) fn install_compose_files(root: &Path) -> Vec<String> {
+    compose_files_in(
+        root,
+        false,
+        &root.join("docker-compose.cluster.yml"),
+        &root.join("docker-compose.override.yml"),
+    )
+}
+
 /// The list itself, with the install root and the fallback pair passed in so
 /// a test can point it at a scratch tree. Asks `scripts/lib-compose.sh`
 /// (the ONE home) and only falls back to base+override

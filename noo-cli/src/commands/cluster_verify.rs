@@ -2285,6 +2285,59 @@ fn read_daemon_json() -> Result<Option<String>, String> {
     }
 }
 
+/// The `undeclared containers` row: compose containers of this install's
+/// project that no compose file of the install declares (186b). WARN with the
+/// runnable `docker rm -f <names>`; None when clean; a WARN naming why when
+/// the projection could not be computed or docker did not answer, because
+/// "nothing found" from a comparison that never ran is not a pass. Agent-managed
+/// containers carry no `com.docker.compose.service` label and never reach here
+/// (`parse_ps_row`).
+pub(crate) fn undeclared_containers_check(
+    daemon_up: bool,
+    found: &[crate::commands::doctor::ComposeContainer],
+    unreadable: &[(String, String)],
+) -> Option<Check> {
+    const NAME: &str = "undeclared containers";
+    if !daemon_up {
+        return Some(warn(
+            NAME,
+            "the docker daemon did not answer, so running containers were NOT compared with the compose files — not a pass",
+            Some("sudo systemctl start docker".into()),
+        ));
+    }
+    let why: Vec<String> = unreadable.iter().map(|(p, w)| format!("{p}: {w}")).collect();
+    if found.is_empty() {
+        if why.is_empty() {
+            return None;
+        }
+        return Some(warn(
+            NAME,
+            format!("could not compute the compose projection ({}) — nothing was compared, not a pass", why.join("; ")),
+            Some("noo doctor orphans".into()),
+        ));
+    }
+    let names: Vec<&str> = found.iter().map(|c| c.name.as_str()).collect();
+    let mut detail = format!(
+        "{} running but declared by no compose file of this install (compose never stops a container whose service was deleted)",
+        names.join(", ")
+    );
+    if !why.is_empty() {
+        detail.push_str(&format!("; projection unreadable for {} — the list may be incomplete", why.join("; ")));
+    }
+    Some(warn(NAME, detail, Some(format!("docker rm -f {}", names.join(" ")))))
+}
+
+/// The live `undeclared containers` row, from the same scan as
+/// `noo doctor orphans`.
+fn undeclared_containers_row() -> Option<Check> {
+    use crate::commands::doctor::{docker_daemon_up, scan_orphans};
+    if !docker_daemon_up() {
+        return undeclared_containers_check(false, &[], &[]);
+    }
+    let scan = scan_orphans();
+    undeclared_containers_check(true, &scan.found, &scan.unreadable)
+}
+
 /// The "docker userns" row. A daemon with
 /// `userns-remap` shifts every container uid, root included, so the 0600
 /// keys that root-in-container services (redis, nats, grafana, the
@@ -5907,6 +5960,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // reads the host's file (the gateway checks only its own view).
         checks.extend(config_mount_row());
         checks.push(crate::commands::secrets_delivery::secrets_not_in_env_row());
+        // A container compose still runs although no compose file of this
+        // install declares it (186b: noo-cluster-executor ran two days).
+        checks.extend(undeclared_containers_row());
         // No secret is shared between holders any more — the
         // controller secret reaches the gateway alone, and each bus verifier
         // holds its own key.
@@ -7928,6 +7984,31 @@ mod tests {
         let self_on = serde_json::json!({"Self": {"HostName": "pop-os", "Tags": ["tag:controller"], "sshHostKeys": ["k"]}});
         assert!(tailscale_ssh_check(Ok(self_on)).detail.contains("pop-os"));
         assert_eq!(tailscale_ssh_check(Err("not running".into())).verdict, Verdict::Warn);
+    }
+
+    #[test]
+    fn undeclared_containers_row_warns_with_a_runnable_remedy() {
+        let mk = |n: &str| crate::commands::doctor::parse_ps_row(
+            &format!("{n}\tnoomesh\tsvc\t/o/a.yml\t/o\timg:1\tUp 2 days")).unwrap();
+        let found = vec![mk("noo-cluster-executor"), mk("noo-foo")];
+        let c = undeclared_containers_check(true, &found, &[]).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("noo-cluster-executor") && c.detail.contains("noo-foo"));
+        assert_eq!(c.remedy.as_deref(), Some("docker rm -f noo-cluster-executor noo-foo"));
+    }
+
+    #[test]
+    fn undeclared_containers_row_is_absent_when_clean() {
+        assert!(undeclared_containers_check(true, &[], &[]).is_none());
+    }
+
+    #[test]
+    fn undeclared_containers_row_never_reads_clean_when_it_could_not_look() {
+        let c = undeclared_containers_check(true, &[], &[("noomesh".into(), "compose file is gone".into())]).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("compose file is gone") && c.detail.contains("not a pass"));
+        let d = undeclared_containers_check(false, &[], &[]).expect("a row");
+        assert_eq!(d.verdict, Verdict::Warn);
     }
 
     #[test]
