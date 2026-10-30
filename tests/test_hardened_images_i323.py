@@ -76,7 +76,7 @@ def test_dockerfile_ollama_verifies_a_sha256_per_arch():
     assert "TARGETARCH" in DOCKERFILE and "--platform=$BUILDPLATFORM" in DOCKERFILE
     assert "releases/download/v${OLLAMA_VERSION}/" in DOCKERFILE and "latest" not in DOCKERFILE.replace("# ", "").split("FROM", 1)[1]
     # The same runtime contract as upstream ollama/ollama, which the agent's spec relies on.
-    for need in ("OLLAMA_HOST=0.0.0.0:11434", "EXPOSE 11434", 'ENTRYPOINT ["/usr/bin/ollama"]', 'CMD ["serve"]', "/root/.ollama"):
+    for need in ("OLLAMA_HOST=0.0.0.0:11434", "EXPOSE 11434", 'ENTRYPOINT ["/usr/bin/ollama"]', 'CMD ["serve"]', "HOME=/home/nonroot"):
         assert need in DOCKERFILE, need
     assert "NVIDIA_VISIBLE_DEVICES=all" in DOCKERFILE and "/usr/lib/ollama/" in DOCKERFILE
 
@@ -105,3 +105,21 @@ def test_the_agent_defaults_are_ours_with_upstream_only_as_the_fallback():
     assert "GOARCH" not in body
     # (d) the retired local-name lookup is deleted.
     assert "pai-assistant/llamacpp:%s" not in BACKENDS and "using hardened llamacpp build" not in BACKENDS
+
+
+def test_dockerfile_ollama_final_stage_is_non_root():
+    final = DOCKERFILE[DOCKERFILE.rindex("\nFROM "):]
+    m = re.findall(r"^USER\s+(\S+)", final, re.M)
+    assert m and m[-1].split(":")[0] not in ("0", "root"), m
+    assert m[-1] == "65532:65532"
+    assert "/root/.ollama" not in final
+
+
+def test_nothing_overrides_the_ollama_image_back_to_root():
+    svcs = yaml.safe_load(COMPOSE)["services"]
+    for n in ("ollama", "ollama-embed", "ollama-embed-cpu"):
+        assert str(svcs[n].get("user", "65532")) not in ("0", "root", "0:0") and not svcs[n].get("privileged"), n
+    assert 'Privileged: true' not in BACKENDS and 'User: "0"' not in BACKENDS
+    # The agent mounts the existing store at the non-root HOME (was /root/.ollama).
+    store = (ROOT / "node-agent-go/internal/docker/ollama_store.go").read_text()
+    assert 'ollamaOursStore     = "/home/nonroot/.ollama"' in store

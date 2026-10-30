@@ -929,6 +929,7 @@ require_compose_v2 || exit 1
         # shellcheck disable=SC2046  # one service name per word
         reown_nonroot_dirs "${_state_root:-$_data_root}" $(printf '%s\n' "$ACTIVE_SVCS" | grep -xE 'redis|grafana' || true) || exit 1
     fi
+    reown_ollama_stores "$ACTIVE_SVCS" || exit 1
     # The voice add-on mounts the controller's staged models read-only
     # (<MODELS_DIR>/voice/{whisper,piper}, i105). `noo models pull` and
     # `noo addons enable voice` create them; make sure they exist even when
@@ -1015,6 +1016,7 @@ else
         # shellcheck disable=SC2046
         reown_nonroot_dirs "${_state_root:-$_data_root}" $(printf '%s\n' "${SERVICES[@]}" | grep -xE 'redis|grafana' || true) || exit 1
     fi
+    reown_ollama_stores "$(printf '%s\n' "${SERVICES[@]}")" || exit 1
     if printf '%s\n' "${SERVICES[@]}" | grep -qxE 'whisper|piper'; then
         noo_voice_model_dirs
     fi

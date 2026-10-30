@@ -806,6 +806,21 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 		return fmt.Errorf("backend %s image: %w", backend, err)
 	}
 	spec.Image = img
+	// The hardened Ollama image is non-root with its store under HOME: mount
+	// the same host store there and re-own an old root-owned one, once.
+	if backend == "ollama" {
+		var nonRoot bool
+		spec, nonRoot = ollamaStoreFor(spec, img)
+		if nonRoot {
+			for _, v := range spec.Volumes {
+				if v.Target == ollamaOursStore && !v.Volume {
+					if err := c.ensureOllamaStoreOwned(ctx, resolveEnv(v.Source)); err != nil {
+						return fmt.Errorf("backend %s: %w", backend, err)
+					}
+				}
+			}
+		}
+	}
 
 	// Model-weight store (delivery layer): copy the placed model's weights
 	// from the controller's store into this node's HF cache before the
