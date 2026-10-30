@@ -379,6 +379,24 @@ pub(crate) fn wire_key<'a>(spec: &'a ToolSpec, field: &'a str) -> &'a str {
     spec.aliases.get(field).map(String::as_str).unwrap_or(field)
 }
 
+/// A digest of the doors' tool catalogue (both manifests), for `/health`
+/// (authenticated). MCP clients keep the tool list they fetched at connect
+/// and the doors do not push `notifications/tools/list_changed` yet (i277f),
+/// so `noo upgrade` compares this before and after a roll and tells the
+/// operator to reconnect clients when it moved. The native task tools
+/// (`mcp_user_tasks`) are code, not manifest, and are not in it.
+pub(crate) fn catalogue_digest() -> &'static str {
+    static D: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    D.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(include_str!("../mcp-tools.json").as_bytes());
+        h.update([0u8]);
+        h.update(include_str!("../mcp-tools-local.json").as_bytes());
+        hex::encode(h.finalize())[..16].to_string()
+    })
+}
+
 /// Refuse an argument the tool's schema does not declare.
 ///
 /// The request is built from the arguments the client sent, so an unknown
@@ -921,6 +939,15 @@ mod tests {
         assert!(msg.starts_with(&format!("cannot reach the gateway at {base}: ")), "{msg}");
         // reqwest's own Display hides the cause; the chain must carry it.
         assert!(msg.to_lowercase().contains("refused"), "cause missing from: {msg}");
+    }
+
+    /// i277f: a stable short digest of both manifests, for `noo upgrade`.
+    #[test]
+    fn the_catalogue_digest_is_stable_and_short() {
+        let d = super::catalogue_digest();
+        assert_eq!(d.len(), 16);
+        assert!(d.chars().all(|c| c.is_ascii_hexdigit()), "{d}");
+        assert_eq!(d, super::catalogue_digest());
     }
 
     #[test]

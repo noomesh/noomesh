@@ -1652,6 +1652,8 @@ async fn health(
         if let Some(dev) = crate::addons::health_dev_map() {
             body["addons_dev"] = dev;
         }
+        // i277f: `noo upgrade` compares it across a roll (reconnect hint).
+        body["mcp_catalogue"] = json!(crate::mcp_external::catalogue_digest());
     }
     (code, Json(body))
 }
