@@ -217,6 +217,8 @@ jobs:
             # migrations that sqlx-drift diffs against Alembic.
             gateway-rust/*)           gateway=true; sqlx=true; ui=true ;;
             noo-cli/*)                cli=true ;;
+            # A path dependency of both Rust crates (i302): both lanes, nothing else.
+            crates/addon-manifest/*)  gateway=true; cli=true ;;
             # The console. Its own job; it does not compile any Rust.
             ui/*)                     ui=true ;;
             # go-node-agent is unconditional; nothing else compiles this tree.
