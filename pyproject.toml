@@ -97,7 +97,7 @@ db = ["psycopg[binary]>=3.1", "sqlalchemy[asyncio]>=2.0", "alembic>=1.20.1", "pg
 pgvector = ["noomesh[db]"]
 rag = ["noomesh[db]", "markitdown[all]>=0.1"]
 voice = [
-  "faster-whisper>=1.0.0",
+  "faster-whisper>=1.2.1",
   "piper-tts>=1.8.0",
   "edge-tts>=7.2.8",
 ]
