@@ -50,7 +50,6 @@ _VER = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 # An optional `${ANY_OVERRIDE:-...}` wrapper around the default is allowed
 # (OLLAMA_IMAGE, VLLM_IMAGE, NATS_IMAGE: an operator's own image wins).
 THIRD_PARTY: dict[str, dict[str, str]] = {
-    "ollama": {"compose": "ollama/ollama", "repo": "docker.io/ollama/ollama", "ver": _VER},
     "nats": {"compose": "nats", "repo": "docker.io/library/nats", "ver": _VER},
     "nginx": {"compose": "nginx", "repo": "docker.io/library/nginx", "ver": _VER},
     "redis": {"compose": _BASE + "/redis", "repo": DHI + "/redis", "ver": _VER},

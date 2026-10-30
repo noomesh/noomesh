@@ -7785,7 +7785,7 @@ mod backend_image_ref_tests {
         let get = |k: &str| env.get(k).cloned();
         assert_eq!(
             super::placement_image("ollama", None, &get).as_deref(),
-            Some("ollama/ollama:0.40.5@sha256:5d3a2f25f9825628daba94dc0b1d421c7d57d6c03ae5faa9ba050e058bab8241"),
+            Some("noomesh/ollama:latest@sha256:5d3a2f25f9825628daba94dc0b1d421c7d57d6c03ae5faa9ba050e058bab8241"),
         );
         let vllm = super::placement_image("vllm", Some(String::new()), &get).unwrap();
         assert!(vllm.starts_with("vllm/vllm-openai:") && vllm.ends_with("@sha256:fc56161ee42a011aeee78b65d0a81b6683c7d04402fd40503d14d4d6c98f07cb"), "{vllm}");

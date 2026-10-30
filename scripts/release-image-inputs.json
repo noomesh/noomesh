@@ -68,6 +68,12 @@
       "parents": [],
       "inputs": ["docker/Dockerfile.llamacpp"]
     },
+    "ollama": {
+      "dockerfile": "docker/Dockerfile.ollama",
+      "context": ".",
+      "parents": [],
+      "inputs": ["docker/Dockerfile.ollama"]
+    },
     "stunnel": {
       "dockerfile": "docker/Dockerfile.stunnel",
       "context": "docker",

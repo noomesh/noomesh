@@ -70,7 +70,7 @@ pub(crate) const CONTROLLER_ONLY: &[&str] = &[
 /// for every architecture would slow every roll. A node that needs one is
 /// staged by name (`noo cluster sync-images <node> -i <image>`).
 pub(crate) const THIRD_PARTY_LOCK_ROWS: &[&str] = &[
-    "ollama", "nats", "nginx", "redis", "loki", "prometheus", "alertmanager", "grafana", "node-exporter", "tei", "tei-cpu", "vllm",
+    "nats", "nginx", "redis", "loki", "prometheus", "alertmanager", "grafana", "node-exporter", "tei", "tei-cpu", "vllm",
 ];
 
 /// Backend doors pinned to their own image instead of the release
@@ -1189,16 +1189,18 @@ mod tests {
 
     #[test]
     fn a_third_party_lock_row_is_never_staged() {
-        // `ollama@sha256:` pins docker.io/ollama/ollama:<version> for the
-        // controller's own start; it is not `<prefix>/ollama:<tag>`, so a
+        // `nats@sha256:` pins docker.io/library/nats:<version> for the
+        // controller's own start; it is not `<prefix>/nats:<tag>`, so a
         // stage would ask the release registry for an image it never had.
-        let lock = format!("# tag v0.6.5\ngateway@{D}\nollama@{D}\nllamacpp@{D}\n");
+        // `ollama` is OUR hardened image (docker/Dockerfile.ollama, i323) and
+        // IS staged for the nodes.
+        let lock = format!("# tag v0.6.5\ngateway@{D}\nnats@{D}\nollama@{D}\nllamacpp@{D}\n");
         let rows = parse_lock(&lock);
-        assert!(rows.iter().any(|r| r.name == "ollama"), "the row parses like any other");
+        assert!(rows.iter().any(|r| r.name == "nats"), "the row parses like any other");
         for all in [false, true] {
             let staged: Vec<&str> = rows.iter().map(|r| r.name.as_str()).filter(|n| stages_from_lock(n, all)).collect();
-            assert!(!staged.contains(&"ollama"), "all={all}: {staged:?}");
-            assert!(staged.contains(&"llamacpp"), "all={all}: {staged:?}");
+            assert!(!staged.contains(&"nats"), "all={all}: {staged:?}");
+            assert!(staged.contains(&"llamacpp") && staged.contains(&"ollama"), "all={all}: {staged:?}");
         }
         assert!(stages_from_lock("gateway", true) && !stages_from_lock("gateway", false));
     }

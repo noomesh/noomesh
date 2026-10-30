@@ -116,7 +116,7 @@ def test_parents_match_the_FROM_images_and_every_input_matches_a_tracked_file():
 # ---------------------------------------------------------------- the plan
 
 LOCK = "".join(f"{i}@sha256:{i[:3]}\n" for i in
-               ("gateway", "llamacpp", "node-agent", "nvidia-exporter", "piper", "postgres-pgvector",
+               ("gateway", "llamacpp", "node-agent", "nvidia-exporter", "ollama", "piper", "postgres-pgvector",
                 "sandbox", "stunnel", "trellion", "whisper", "worker")) + "source:trellion@TRE\n"
 BASES = "deps-core@sha256:dc\ndeps-base@sha256:db\n"
 RC1, RC2, NEW = "stack-v1.2.3-rc.1", "stack-v1.2.3-rc.2", "stack-v1.2.3-rc.3"

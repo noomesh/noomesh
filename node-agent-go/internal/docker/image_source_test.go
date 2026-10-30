@@ -422,7 +422,9 @@ func TestEveryStartPathFileCallsEnsureImage(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(string(b), "ensureImageFn(ctx, c, ") {
+		// ensureImageWithFallback (backends.go) is ensureImageFn plus the i323
+		// hardened-default fallback; it is not another route to a registry.
+		if !strings.Contains(string(b), "ensureImageFn(ctx, c, ") && !strings.Contains(string(b), "ensureImageWithFallback(ctx, c, ") {
 			t.Errorf("%s no longer resolves its image through ensureImageFn", f)
 		}
 	}

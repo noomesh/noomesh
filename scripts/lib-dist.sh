@@ -801,7 +801,6 @@ dist_third_party_row() {
         node-exporter) echo NODE_EXPORTER ;;
         text-embeddings-inference) echo "TEI TEI_CPU" ;;
         vllm-openai) echo VLLM ;;
-        ollama) echo OLLAMA ;;
     esac
 }
 

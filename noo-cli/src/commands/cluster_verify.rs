@@ -352,6 +352,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     //          placement's image is staged there.
     out.extend(image_sources_check(n));
     out.extend(images_staged_check(n));
+    out.extend(hardened_images_check(n));
 
     // 6c''. Vendor telemetry (docs/security/telemetry.md): no running
     //       backend container lacks the switches that keep its vendor from
@@ -605,6 +606,47 @@ pub(crate) fn images_staged_check(n: &Value) -> Option<Check> {
         "images staged",
         format!("placed but not staged on the artifact rail: {}", names.join(", ")),
         Some(format!("noo cluster sync-images {id} -i {first}   # or `noo upgrade` for the release images")),
+    ))
+}
+
+/// The hardened image of ours that replaces an upstream backend image
+/// (noomesh-internal i323, operator decision 3): upstream `ollama/ollama` ->
+/// `<ns>/ollama:<tag>`, upstream `ghcr.io/ggml-org/llama.cpp` ->
+/// `<ns>/llamacpp:<tag>`. None for any other image, ours included.
+pub(crate) fn hardened_replacement(image: &str, tag: &str) -> Option<String> {
+    let repo = image.split('@').next().unwrap_or(image);
+    let repo = repo.rsplit_once(':').filter(|(r, t)| !t.contains('/') && !r.is_empty()).map_or(repo, |(r, _)| r);
+    let repo = repo.strip_prefix("docker.io/").unwrap_or(repo);
+    let name = match repo {
+        "ollama/ollama" => "ollama",
+        r if r.starts_with("ghcr.io/ggml-org/") => "llamacpp",
+        _ => return None,
+    };
+    Some(format!("{}/{name}:{tag}", crate::registry::IMAGE_NAMESPACE))
+}
+
+/// The `hardened images` row: an upstream backend image
+/// (`ollama/ollama`, `ghcr.io/ggml-org/*`) WARNs and names the hardened ref of
+/// ours that should replace it. The tag is the release the node's own images
+/// carry (`<ns>/<name>:<tag>` in `image_sources`), else `<stack-tag>`. No row
+/// on a node that reports no sources or runs no upstream backend image.
+pub(crate) fn hardened_images_check(n: &Value) -> Option<Check> {
+    let id = n["id"].as_str().unwrap_or("?");
+    let images: Vec<&str> = n["image_sources"].as_array()?.iter().filter_map(|e| e["image"].as_str()).collect();
+    let ns = format!("{}/", crate::registry::IMAGE_NAMESPACE);
+    let tag = images
+        .iter()
+        .filter(|i| i.starts_with(&ns))
+        .filter_map(|i| i.split('@').next()?.rsplit_once(':').map(|(_, t)| t))
+        .find(|t| !t.is_empty() && *t != "latest")
+        .unwrap_or("<stack-tag>");
+    let swaps: Vec<(&str, String)> = images.iter().filter_map(|i| hardened_replacement(i, tag).map(|h| (*i, h))).collect();
+    let (_, first_ours) = swaps.first()?;
+    let list: Vec<String> = swaps.iter().map(|(u, h)| format!("{u} -> {h}")).collect();
+    Some(warn(
+        "hardened images",
+        format!("upstream image(s) in use where a hardened build of ours exists: {}", list.join(", ")),
+        Some(format!("noo cluster sync-images {id} -i {first_ours}   # stage ours; the agent prefers it on the next start")),
     ))
 }
 
@@ -8814,6 +8856,30 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Ok);
         assert!(c.detail.contains("becomes rail on this roll") && c.detail.contains("ollama/ollama:latest (registry)")
             && c.detail.contains("reg/acme/llamacpp:v2") && c.detail.contains("would be refused"), "{}", c.detail);
+    }
+
+    /// `hardened images`: on a rail node an upstream ollama / llama.cpp image
+    /// WARNs naming the hardened ref; ours gets no row.
+    #[test]
+    fn hardened_images_row_names_the_replacement_for_an_upstream_image() {
+        assert_eq!(hardened_replacement("ollama/ollama:0.40.5@sha256:aa", "v0.6.15").as_deref(), Some("ghcr.io/noomesh/ollama:v0.6.15"));
+        assert_eq!(hardened_replacement("docker.io/ollama/ollama:0.40.5", "v1").as_deref(), Some("ghcr.io/noomesh/ollama:v1"));
+        assert_eq!(hardened_replacement("ghcr.io/ggml-org/llama.cpp:server", "v1").as_deref(), Some("ghcr.io/noomesh/llamacpp:v1"));
+        assert_eq!(hardened_replacement("ghcr.io/noomesh/ollama:v1", "v1"), None, "ours is already the hardened one");
+        assert_eq!(hardened_replacement("vllm/vllm-openai:v0.25.0", "v1"), None);
+        let n = serde_json::json!({"id": "robopi", "image_sources": [
+            {"image": "ghcr.io/noomesh/stunnel:v0.6.15", "source": "rail"},
+            {"image": "ollama/ollama:0.40.5", "source": "registry"},
+            {"image": "ghcr.io/ggml-org/llama.cpp:server", "source": "registry"}]});
+        let c = hardened_images_check(&n).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("ollama/ollama:0.40.5 -> ghcr.io/noomesh/ollama:v0.6.15"), "{}", c.detail);
+        assert!(c.detail.contains("ghcr.io/ggml-org/llama.cpp:server -> ghcr.io/noomesh/llamacpp:v0.6.15"), "{}", c.detail);
+        // Nothing to replace, or an agent that reports nothing: no row.
+        let ours = serde_json::json!({"id": "x", "image_sources": [
+            {"image": "ghcr.io/noomesh/ollama:v0.6.15", "source": "rail"}]});
+        assert!(hardened_images_check(&ours).is_none());
+        assert!(hardened_images_check(&serde_json::json!({"id": "old"})).is_none(), "an agent that reports nothing gets no row");
     }
 
     #[test]

@@ -9,11 +9,12 @@ upstream `ghcr.io/ggml-org/llama.cpp:server`, hardened for the release.
 ## It ships
 
 The release workflow (`.github/workflows/images-release.yml`) builds this
-Dockerfile for `linux/amd64` and publishes it as
+Dockerfile for `linux/amd64,linux/arm64` and publishes it as
 `ghcr.io/noomesh/llamacpp:<stack-tag>`, a normal row in the signed stack lock.
 `docker-compose.dist.yml`, the node agent's default and `noo stack` staging
-all pull that image. ARM nodes use the upstream multi-arch image instead
-(building this one for arm64 would be a from-source compile nothing asks for).
+all pull that image, on ARM nodes too (noomesh-internal i323). The upstream
+multi-arch image `ghcr.io/ggml-org/llama.cpp:server` is only the agent's
+fallback when ours is not staged and not pullable on a node.
 
 ## Building it yourself
 

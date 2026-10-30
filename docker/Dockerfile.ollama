@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Hardened Ollama backend: the PINNED upstream release tarball, verified by
+# sha256, on the Docker Hardened Image base the other first-party backends use
+# (see docker/Dockerfile.llamacpp). Replaces the node agent's default of
+# upstream `ollama/ollama:<ver>` (noomesh-internal i323, operator decision 3):
+# nodes take this image over the controller's artifact rail, and fall back to
+# the upstream image only when this one is not staged.
+#
+# Multi-arch (linux/amd64, linux/arm64). The tarball is fetched, verified and
+# unpacked in a stage that runs on the BUILD platform, so the arm64 leg of a
+# multi-platform build under QEMU only copies files: nothing in it is
+# emulated but the runtime package install.
+#
+# Durable update path: bump OLLAMA_VERSION and BOTH sha256 values together
+# (from the release's `sha256sum.txt`), and keep the version equal to the one
+# docker-compose.cluster.yml names for the upstream `ollama-upstream` lock row
+# and node-agent-go/internal/docker/backends.go names as the fallback
+# (tests/test_hardened_images_i323.py compares the three).
+#
+# GPU: the amd64 tarball carries ollama's own GPU runners under lib/ollama
+# (CUDA); they are kept, so a GPU node needs only the nvidia container runtime
+# it has today (the agent requests the device; the driver libraries are
+# injected at run time). Nothing GPU-related is baked in here.
+#
+# Runs as ROOT, deliberately, like the upstream image: the agent mounts the
+# model store at /root/.ollama, and every node already holds models there
+# owned by root; a non-root user would not be able to read them. The agent's
+# backend floor (cap_drop ALL + the chown/setuid set, no-new-privileges)
+# applies to this container exactly as it did to the upstream one.
+
+# Base-image registry: dhi.io by default, our ghcr mirror in the release
+# workflow (--build-arg DHI_REGISTRY=...), as in Dockerfile.llamacpp.
+ARG DHI_REGISTRY=dhi.io
+
+# ── Fetch + verify (build platform) ─────────────────────────────────
+FROM --platform=$BUILDPLATFORM ${DHI_REGISTRY}/uv:0-debian13-dev AS fetch
+ARG TARGETARCH
+ARG OLLAMA_VERSION=0.40.5
+# sha256 of ollama-linux-<arch>.tar.zst from the v0.40.5 release's sha256sum.txt.
+ARG OLLAMA_SHA256_AMD64=dc5eabc292f9949546c90a97c820f924b035e05243b0de13c7f366182562169c
+ARG OLLAMA_SHA256_ARM64=fbe71ebb1a10e59b8480c4d2839826b5f9dff1a6d5c142428b2e7db9b1a2c642
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates zstd \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /dl
+RUN set -eu; \
+    case "${TARGETARCH}" in \
+        amd64) want="${OLLAMA_SHA256_AMD64}" ;; \
+        arm64) want="${OLLAMA_SHA256_ARM64}" ;; \
+        *) echo "Dockerfile.ollama: no Ollama release for TARGETARCH='${TARGETARCH}'" >&2; exit 64 ;; \
+    esac; \
+    f="ollama-linux-${TARGETARCH}.tar.zst"; \
+    curl -fsSL --retry 5 --retry-delay 5 -o "$f" \
+        "https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/$f"; \
+    echo "${want}  $f" | sha256sum -c -; \
+    mkdir -p /out; \
+    zstd -dc "$f" | tar -x -C /out; \
+    rm -f "$f"; \
+    test -x /out/bin/ollama
+
+# ── Runtime ──────────────────────────────────────────────────────────
+FROM ${DHI_REGISTRY}/uv:0-debian13-dev
+
+# ollama's runners link libstdc++ / libgomp; curl is the healthcheck.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libstdc++6 libgomp1 curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=fetch /out/bin/ /usr/bin/
+COPY --from=fetch /out/lib/ollama/ /usr/lib/ollama/
+
+# The same runtime contract as upstream ollama/ollama, so the agent's spec
+# (OLLAMA_HOST, OLLAMA_NO_CLOUD, GPU device request, /root/.ollama volume) is
+# unchanged.
+ENV PATH="/usr/bin:${PATH}" \
+    OLLAMA_HOST=0.0.0.0:11434 \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    NVIDIA_VISIBLE_DEVICES=all \
+    LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+EXPOSE 11434
+VOLUME ["/root/.ollama"]
+
+# Reset the base image's `uv` entrypoint.
+ENTRYPOINT ["/usr/bin/ollama"]
+CMD ["serve"]
