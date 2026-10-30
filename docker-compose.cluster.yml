@@ -441,9 +441,10 @@ services:
       # sent in the node's start request (routes/cluster.rs backend_image_ref).
       # An operator's VLLM_IMAGE / VLLM2_IMAGE / OLLAMA_IMAGE wins, as on the
       # controller's own containers. tests/test_third_party_image_lock.py pins it.
+      # OLLAMA is our hardened image (docker/Dockerfile.ollama, lock row `ollama`).
       - NOO_BACKEND_IMAGE_VLLM=${VLLM_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-}}
       - NOO_BACKEND_IMAGE_VLLM_SECONDARY=${VLLM2_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-}}
-      - NOO_BACKEND_IMAGE_OLLAMA=${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
+      - NOO_BACKEND_IMAGE_OLLAMA=${OLLAMA_IMAGE:-${NOO_IMAGE_PREFIX:-noomesh}/ollama:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_OLLAMA:-}}
       - DATABASE_URL=postgresql://noo_app@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/gateway/pg/noo_app.crt&sslkey=/app/pki/gateway/pg/noo_app.key
       - PGVECTOR_URL=postgresql://noo@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/gateway/pg/noo.crt&sslkey=/app/pki/gateway/pg/noo.key
       - PAGEINDEX_DSN=postgresql://noo@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/gateway/pg/noo.crt&sslkey=/app/pki/gateway/pg/noo.key
@@ -1748,14 +1749,13 @@ services:
     # H-N4: parameterized so it can be pinned to a verified version/digest.
     # A FIXED version, never :latest (2026-10-15: every roll re-pulled a
     # moved `latest` from Docker Hub, 91.6 s, and nothing recorded which
-    # ollama ran). The signed stack lock carries an `ollama@sha256:` row
-    # resolved from THIS tag at release time
-    # (scripts/stack-lock-third-party.py), so a dist start pulls it by
-    # digest and skips it when unchanged. Bump the version here, in all
-    # three ollama services; the next stack release pins the new digest.
-    # Pulled from Docker Hub by the controller only (never staged for nodes:
-    # noo-cli image_stage.rs THIRD_PARTY_LOCK_ROWS).
-    image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
+    # ollama ran). Since i323 this is OUR hardened image
+    # (docker/Dockerfile.ollama: the pinned upstream tarball, sha256-verified),
+    # a release image like llamacpp: the signed stack lock carries its
+    # `ollama@sha256:` row, a dist start pulls it by digest, and the rail
+    # stages it for every node arch. The upstream version is pinned in
+    # Dockerfile.ollama; bump it there with its sha256s.
+    image: ${OLLAMA_IMAGE:-${NOO_IMAGE_PREFIX:-noomesh}/ollama:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_OLLAMA:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
     # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
@@ -1796,7 +1796,7 @@ services:
   ollama-embed:
     logging: *default-logging
     # H-N4: parameterized so it can be pinned to a verified version/digest.
-    image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
+    image: ${OLLAMA_IMAGE:-${NOO_IMAGE_PREFIX:-noomesh}/ollama:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_OLLAMA:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama-embed
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
     # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
@@ -1846,7 +1846,7 @@ services:
   # Enable: docs/operating/runbooks/embed-capacity.md.
   ollama-embed-cpu:
     logging: *default-logging
-    image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
+    image: ${OLLAMA_IMAGE:-${NOO_IMAGE_PREFIX:-noomesh}/ollama:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_OLLAMA:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama-embed-cpu
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
     # capability beyond the start-as-root, chown, drop-to-a-user entrypoint

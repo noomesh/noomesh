@@ -290,7 +290,7 @@ def test_e_the_llamacpp_leg_is_a_plain_core_entry_with_the_shipped_dockerfile():
     entry = [m for m in job["strategy"]["matrix"]["include"] if m.get("name") == "llamacpp"]
     assert len(entry) == 1
     assert entry[0]["dockerfile"] == "docker/Dockerfile.llamacpp"
-    assert entry[0]["platforms"] == "linux/amd64", "x86 only: ARM nodes use the upstream multi-arch image"
+    assert entry[0]["platforms"] == "linux/amd64,linux/arm64", "ARM nodes take our image too (i323); upstream is only the agent fallback"
     assert (REPO / entry[0]["dockerfile"]).is_file()
 
 

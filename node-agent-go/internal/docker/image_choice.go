@@ -66,6 +66,10 @@ func isFloatingRef(ref string) bool {
 type backendImageChoice struct {
 	Ref      string // the image to ensure and run
 	RailOnly bool   // never from a registry (a rail node)
+	// Fallback is the upstream image to use INSTEAD only when Ref (our
+	// hardened default) is neither local nor staged (ensureImageWithFallback).
+	// "" for an explicit image: a named image never silently becomes another.
+	Fallback string
 }
 
 // pickBackendImage is the pure part of the choice: CPU/GPU image, then the
@@ -84,6 +88,14 @@ func pickBackendImage(spec BackendSpec, override string) string {
 // override is StartOverrides.Image (the controller's / the placement's).
 func chooseBackendImage(backend string, spec BackendSpec, override string) (backendImageChoice, error) {
 	ref := pickBackendImage(spec, override)
+	// Nothing named an image: the default is OUR hardened build from this
+	// node's release (an image of ours, rail-only), with the upstream image
+	// as the not-staged fallback (ensureImageWithFallback).
+	if override == "" {
+		if ours, up := hardenedDefault(backend); ours != "" {
+			return backendImageChoice{Ref: ours, RailOnly: true, Fallback: up}, nil
+		}
+	}
 	if ref == "" || isOwnImage(ref) {
 		return backendImageChoice{Ref: ref, RailOnly: ref != ""}, nil
 	}

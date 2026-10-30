@@ -307,10 +307,10 @@ var backendSpecs = map[string]BackendSpec{
 		HealthcheckCmd: vllmHealthcheckCmd,
 	},
 	"llamacpp": {
-		// Image is overridable via LLAMACPP_IMAGE env var. Default chosen
-		// dynamically by initBackends() at startup so ARM nodes (which
-		// don't have a local pai-assistant/llamacpp build) automatically
-		// pull the multi-arch upstream image.
+		// Image is overridable via LLAMACPP_IMAGE env var. The default is our
+		// hardened llama-server from this node's release on every arch
+		// (llamacppDefaultImage); upstream ggml-org is the fallback only
+		// when ours is not staged (ensureImageWithFallback).
 		Image:         envOr("LLAMACPP_IMAGE", llamacppDefaultImage()),
 		ContainerName: "noo-llamacpp",
 		// llama-server writes nothing outside /models (read-only too).
@@ -375,7 +375,11 @@ var backendSpecs = map[string]BackendSpec{
 	// small embedder (harrier is 0.6B at Q4, ~397MB) is entirely viable on
 	// CPU — unlike a chat model, where CPU-only would be painful.
 	"ollama": {
-		Image:         "${OLLAMA_IMAGE:-ollama/ollama:0.40.5}",
+		// Our hardened image (release-derived) when this node knows its
+		// release, else the upstream pin; an explicit OLLAMA_IMAGE wins.
+		// chooseBackendImage re-derives it per start (hardenedDefault) and
+		// falls back to the upstream pin only when ours is not staged.
+		Image:         "${OLLAMA_IMAGE:-" + ollamaDefaultImage() + "}",
 		ContainerName: "noo-ollama",
 		Env: map[string]string{
 			"OLLAMA_HOST":  doorLoopback,
@@ -503,8 +507,8 @@ func rerankerSpecTEI() BackendSpec {
 
 // rerankerSpecLlamacpp runs llama-server --reranking from the hardened
 // llamacpp image (same image/default-resolution story as the llamacpp LLM
-// backend: pai-assistant/llamacpp on x86, upstream ghcr multi-arch on ARM;
-// RERANK_IMAGE overrides). Serves Jina-style POST /v1/rerank on :8085; the
+// backend: our release llamacpp on every arch, upstream as the not-staged
+// fallback; RERANK_IMAGE overrides). Serves Jina-style POST /v1/rerank on :8085; the
 // node-agent /rerank proxy translates to/from the TEI wire contract.
 //
 // RERANK_MODEL is a bare GGUF FILENAME under /models (default
@@ -795,47 +799,13 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 		envOverrides["GPU_COUNT"] = fmt.Sprintf("%d", gpuCount)
 	}
 
-	// Prefer a locally-present hardened llamacpp build over the upstream
-	// multi-arch image. Candidates, in order:
-	//   1. pai-assistant/llamacpp:<GOARCH>  — an explicitly arch-tagged
-	//      build shipped to this node (the cross-arch story; lets an arm64
-	//      edge node get a genuine arm64 image, not a mislabeled one).
-	//   2. pai-assistant/llamacpp:latest    — the controller's compose-built
-	//      image, and what `sync-images` ships same-arch (x86→x86). This is
-	//      what makes the feature fire TODAY on same-arch nodes.
-	// First that exists wins; otherwise fall back to upstream. Explicit
-	// LLAMACPP_IMAGE / placement overrides are respected — spec.Image only
-	// equals the ghcr default when nothing overrode it.
-	if backend == "llamacpp" && spec.Image == "ghcr.io/ggml-org/llama.cpp:server" {
-		for _, hardened := range []string{
-			fmt.Sprintf("pai-assistant/llamacpp:%s", runtime.GOARCH),
-			"pai-assistant/llamacpp:latest",
-		} {
-			info, err := c.docker.ImageInspect(ctx, hardened)
-			if err != nil {
-				continue
-			}
-			// Verify the image's real arch matches this node — guards
-			// against a wrong-arch :latest that would exec-format-error at
-			// start (an x86 image manually loaded on an arm64 box).
-			if info.Architecture != "" && info.Architecture != runtime.GOARCH {
-				slog.Warn("skipping arch-mismatched llamacpp image",
-					"image", hardened, "image_arch", info.Architecture,
-					"node_arch", runtime.GOARCH)
-				continue
-			}
-			slog.Info("using hardened llamacpp build", "image", hardened)
-			spec.Image = hardened
-			break
-		}
-	}
-
 	// The image: local if the controller vouches for it, else over the
 	// artifact rail; never a registry pull for our own images (image_source.go).
-	ctx = withRailOnly(ctx, choice.RailOnly)
-	if err := ensureImageFn(ctx, c, spec.Image); err != nil {
+	img, err := ensureImageWithFallback(ctx, c, backend, spec.Image, choice.Fallback, choice.RailOnly)
+	if err != nil {
 		return fmt.Errorf("backend %s image: %w", backend, err)
 	}
+	spec.Image = img
 
 	// Model-weight store (delivery layer): copy the placed model's weights
 	// from the controller's store into this node's HF cache before the
@@ -1824,11 +1794,6 @@ func runtimesIncludeNvidia[V any](runtimes map[string]V) bool {
 	return ok
 }
 
-// llamacppDefaultImage picks the right llama.cpp image based on host
-// architecture. ARM nodes (Pi/Jetson/RK) use the upstream multi-arch
-// ggml-org image since we don't ship our own ARM build. x86 nodes
-// default to the locally-built pai-assistant variant (DHI hardened,
-// nonroot, TLS-aware) when present.
 // ContainerNameFor is the container a managed backend runs as, "" for a
 // backend the agent does not know.
 func ContainerNameFor(backend string) string {
@@ -1838,7 +1803,7 @@ func ContainerNameFor(backend string) string {
 // ReleaseBackendImage is the image this node derives for backend from its
 // OWN release (NOO_IMAGE_PREFIX/<name>:NOO_IMAGE_TAG) when the placement names
 // no image: the hardened llama-server for llamacpp and for the llama.cpp
-// reranker engine. "" when the backend's default is not release-derived (an
+// reranker engine, and the hardened Ollama. "" when the backend's default is not release-derived (an
 // upstream pin such as vLLM's or TEI's, which the controller sends in the
 // placement from the signed stack lock), when an override names an image
 // that is not this release's, or on a node with no release pin.
@@ -1862,6 +1827,8 @@ func ReleaseBackendImage(backend string) string {
 			return ""
 		}
 		img = envOr("RERANK_IMAGE", llamacppDefaultImage())
+	case "ollama":
+		img = envOr("OLLAMA_IMAGE", ollamaDefaultImage())
 	default:
 		return ""
 	}
@@ -1871,33 +1838,101 @@ func ReleaseBackendImage(backend string) string {
 	return ""
 }
 
-func llamacppDefaultImage() string {
-	// runtime.GOARCH is the architecture the binary is built for, which
-	// matches the host since node-agent runs natively (not under emulation).
-	if runtime.GOARCH == "arm64" || runtime.GOARCH == "arm" {
-		return "ghcr.io/ggml-org/llama.cpp:server"
-	}
-	// x86: the hardened llama-server. `pai-assistant/llamacpp:latest` is a
-	// LOCAL build name — it exists only on a machine that ran
-	// `scripts/build-hardened-llamacpp.sh`, or `noo stack
-	// rebuild` (compose builds the same Dockerfile). On a --dist install nothing builds it and
-	// nothing published it, so the pull failed with "pull access denied"
-	// and llamacpp could never start on an x86 node.
-	// The image is now in the release matrix, so prefer the published one
-	// whenever the deployment tells us which release it is running.
-	prefix := os.Getenv("NOO_IMAGE_PREFIX")
+// Upstream images the agent falls back to ONLY when ours is not available on
+// this node and not staged on the rail (ensureImageWithFallback). The ollama
+// pin is the version docker-compose.cluster.yml names for the `ollama-upstream`
+// lock row and docker/Dockerfile.ollama packages (tests/test_hardened_images_i323.py).
+const (
+	upstreamLlamacppImage = "ghcr.io/ggml-org/llama.cpp:server"
+	upstreamOllamaImage   = "ollama/ollama:0.40.5"
+)
+
+// releaseImage is <NOO_IMAGE_PREFIX>/<name>:<NOO_IMAGE_TAG>, "" on a node with
+// no release pin.
+func releaseImage(name string) string {
+	prefix := strings.TrimRight(os.Getenv("NOO_IMAGE_PREFIX"), "/")
 	tag := os.Getenv("NOO_IMAGE_TAG")
-	if prefix != "" && tag != "" {
-		return prefix + "/llamacpp:" + tag
+	if prefix == "" || tag == "" {
+		return ""
 	}
-	// No release pin and no local hardened build (the hardened build is
-	// published in the release, but a box with no release pin has not pulled
-	// it — see docker/README-llamacpp.md): a box with neither used to fall back
-	// to "pai-assistant/llamacpp:latest", a name that exists only on a
-	// machine that built it, and the pull failed with "pull access
-	// denied". Upstream is the same CPU/OpenBLAS capability class, so it
-	// is the working default here instead.
-	return "ghcr.io/ggml-org/llama.cpp:server"
+	return prefix + "/" + name + ":" + tag
+}
+
+// llamacppDefaultImage is the llama.cpp image a node runs when nothing names
+// one: OUR hardened llama-server from this node's release, on every
+// architecture (amd64 and arm64 are both in the release matrix since i323),
+// else upstream on a box with no release pin. `pai-assistant/llamacpp:latest`
+// is a LOCAL build name that exists only on a machine that built it, so it is
+// never a default.
+func llamacppDefaultImage() string {
+	if img := releaseImage("llamacpp"); img != "" {
+		return img
+	}
+	return upstreamLlamacppImage
+}
+
+// ollamaDefaultImage is the same for Ollama: ours from the release, else the
+// upstream pin.
+func ollamaDefaultImage() string {
+	if img := releaseImage("ollama"); img != "" {
+		return img
+	}
+	return upstreamOllamaImage
+}
+
+// hardenedDefault is the (ours, upstream) pair for a backend whose default
+// image is a hardened build of ours with an upstream fallback, or ("", "")
+// when the backend has none, when an explicit image env names one (that
+// always wins and never falls back), or when this node has no release pin.
+func hardenedDefault(backend string) (ours, upstream string) {
+	var envVar, name string
+	switch backend {
+	case "llamacpp":
+		envVar, name, upstream = "LLAMACPP_IMAGE", "llamacpp", upstreamLlamacppImage
+	case "reranker":
+		if strings.EqualFold(strings.TrimSpace(os.Getenv("RERANK_ENGINE")), "tei") {
+			return "", ""
+		}
+		envVar, name, upstream = "RERANK_IMAGE", "llamacpp", upstreamLlamacppImage
+	case "ollama":
+		envVar, name, upstream = "OLLAMA_IMAGE", "ollama", upstreamOllamaImage
+	default:
+		return "", ""
+	}
+	if strings.TrimSpace(os.Getenv(envVar)) != "" {
+		return "", ""
+	}
+	ours = releaseImage(name)
+	if ours == "" {
+		return "", ""
+	}
+	return ours, upstream
+}
+
+// ensureImageWithFallback makes ref available (EnsureImage: local, rail, or a
+// policy-allowed registry pull) and returns the image to run. When ref is
+// our hardened default and the node can get it from nowhere (not local, not
+// staged on the controller: ImageNotStagedError), it falls back to the
+// upstream image through the same EnsureImage, which applies
+// NOO_IMAGE_REGISTRY_FALLBACK and records source=registry. Any other failure
+// (a verification failure above all) is returned as is: a bad tar must never
+// become an upstream pull.
+func ensureImageWithFallback(ctx context.Context, c *Client, backend, ref, fallback string, railOnly bool) (string, error) {
+	err := ensureImageFn(withRailOnly(ctx, railOnly), c, ref)
+	if err == nil {
+		return ref, nil
+	}
+	var ns *ImageNotStagedError
+	if fallback == "" || fallback == ref || !errors.As(err, &ns) {
+		return ref, err
+	}
+	slog.Warn("image.hardened_not_staged: our image is not on this node and not staged on the controller; "+
+		"falling back to the upstream image. Stage ours with `noo cluster sync-images <node>`",
+		"backend", backend, "ours", ref, "upstream", fallback)
+	if ferr := ensureImageFn(ctx, c, fallback); ferr != nil {
+		return ref, fmt.Errorf("%w; upstream fallback %s also unavailable: %v", err, fallback, ferr)
+	}
+	return fallback, nil
 }
 
 // ExpectsGGUFModel reports whether a backend loads a model FILE from the
