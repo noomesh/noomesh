@@ -174,7 +174,8 @@ struct InferenceRequest {
     /// Default true (the coordinator path).
     #[serde(default)]
     context: Option<bool>,
-    /// Sampling controls, honoured on the raw path (`context: false`).
+    /// Sampling controls, honoured on the raw path (`context: false`, or a
+    /// node preference the pool answered) and on a node pin.
     #[serde(default)]
     max_tokens: Option<u32>,
     #[serde(default)]
@@ -356,7 +357,8 @@ async fn native_inference(
                 let model = if node_from_model { model_name } else { req.model.clone().unwrap_or(model_name) };
 
                 let started = std::time::Instant::now();
-                match chat_completion_on_node(&backend_type, &model, &base_url, &req.prompt).await {
+                let sampling = Sampling { max_tokens: req.max_tokens, temperature: req.temperature };
+                match chat_completion_on_node(&backend_type, &model, &base_url, &req.prompt, sampling).await {
                     Ok(text) => return (StatusCode::OK, Json(json!({
                         "success": true,
                         "data": {
@@ -640,19 +642,18 @@ async fn proxy_ollama_version(State(state): State<Arc<AppState>>) -> impl IntoRe
 /// implementation. Returns the response text, or an error string that keeps
 /// the route's historical wording ("backend returned N: ..." /
 /// "backend unreachable: ...").
+///
+/// `sampling` is the caller's `max_tokens` / `temperature`: sent as given,
+/// [`PINNED_DEFAULT_MAX_TOKENS`] / [`PINNED_DEFAULT_TEMPERATURE`] when absent.
 pub(crate) async fn chat_completion_on_node(
     backend_type: &str,
     model: &str,
     base_url: &str,
     prompt: &str,
+    sampling: Sampling,
 ) -> Result<String, String> {
     let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-    let body = json!({
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 256,
-        "temperature": 0.7,
-    });
+    let body = pinned_chat_body(model, prompt, sampling);
 
     // Add X-Noo-Backend hint for node-agent proxy URLs.
     // 240s: edge nodes are slow — host9 (gemma-4-E2B on a Pi) needs
@@ -675,6 +676,32 @@ pub(crate) async fn chat_completion_on_node(
         }
         Err(e) => Err(format!("backend unreachable: {}", e)),
     }
+}
+
+/// The sampling controls a caller sent with a pinned chat. `None` = not
+/// sent: the pinned path's own defaults apply.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct Sampling {
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f64>,
+}
+
+/// The pinned path's `max_tokens` when the caller sends none.
+pub(crate) const PINNED_DEFAULT_MAX_TOKENS: u32 = 256;
+/// The pinned path's `temperature` when the caller sends none.
+pub(crate) const PINNED_DEFAULT_TEMPERATURE: f64 = 0.7;
+
+/// The body a pinned chat sends the node. The pin used to hard-code 256 /
+/// 0.7 here, so `noo inference run -n X --max-tokens 1 -t 0` ran up to 256
+/// tokens at 0.7 on the pinned node, while the same request honoured both
+/// when the pin was unmet and the pool answered on the raw path (i305).
+pub(crate) fn pinned_chat_body(model: &str, prompt: &str, sampling: Sampling) -> Value {
+    json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": sampling.max_tokens.unwrap_or(PINNED_DEFAULT_MAX_TOKENS),
+        "temperature": sampling.temperature.unwrap_or(PINNED_DEFAULT_TEMPERATURE),
+    })
 }
 
 /// What a pinned chat can get from a named node.
@@ -1717,5 +1744,72 @@ mod pinned_no_chat_tests {
         assert!(NodeChat::NoChat("x".into()).is_node());
         assert!(NodeChat::Serves("a".into(), "b".into(), "c".into()).is_node());
         assert!(!NodeChat::Unknown.is_node());
+    }
+}
+
+/// The pinned path sends the caller's sampling controls to the node (i305).
+/// The node is a real HTTP server on loopback, reached through the real
+/// cluster client and `chat_completion_on_node`, so the assertion is on the
+/// bytes that crossed the wire, not on a helper's return value.
+#[cfg(test)]
+mod pinned_sampling_tests {
+    use super::{chat_completion_on_node, Sampling, PINNED_DEFAULT_MAX_TOKENS, PINNED_DEFAULT_TEMPERATURE};
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    /// A one-route node: records each `/v1/chat/completions` body it gets and
+    /// answers "ok". Returns its base URL and the record.
+    async fn node() -> (String, Arc<Mutex<Vec<Value>>>) {
+        use axum::{routing::post, Json, Router};
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let rec = seen.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let rec = rec.clone();
+                async move {
+                    rec.lock().unwrap().push(body);
+                    Json(json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// `noo inference run -n X --max-tokens 1 -t 0`: the node is asked for
+    /// one token at temperature 0. Before i305 it was asked for 256 at 0.7.
+    #[tokio::test]
+    async fn a_pinned_chat_sends_the_callers_max_tokens_and_temperature() {
+        let (base, seen) = node().await;
+        let text = chat_completion_on_node(
+            "vllm", "m", &base, "Reply with one word: ok",
+            Sampling { max_tokens: Some(1), temperature: Some(0.0) },
+        )
+        .await
+        .expect("the node answered");
+        assert_eq!(text, "ok");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "exactly one call reaches the node: {seen:?}");
+        assert_eq!(seen[0]["max_tokens"], json!(1), "{}", seen[0]);
+        assert_eq!(seen[0]["temperature"].as_f64(), Some(0.0), "{}", seen[0]);
+        assert_eq!(seen[0]["model"], json!("m"));
+        assert_eq!(seen[0]["messages"], json!([{"role": "user", "content": "Reply with one word: ok"}]));
+    }
+
+    /// A caller that sends neither (the `noo_inference` tool, an old client)
+    /// gets what the pin always sent.
+    #[tokio::test]
+    async fn a_pinned_chat_without_sampling_keeps_the_old_defaults() {
+        let (base, seen) = node().await;
+        chat_completion_on_node("vllm", "m", &base, "hi", Sampling::default())
+            .await
+            .expect("the node answered");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0]["max_tokens"], json!(PINNED_DEFAULT_MAX_TOKENS));
+        assert_eq!(seen[0]["temperature"].as_f64(), Some(PINNED_DEFAULT_TEMPERATURE));
+        assert_eq!((PINNED_DEFAULT_MAX_TOKENS, PINNED_DEFAULT_TEMPERATURE), (256, 0.7), "the defaults are the historical ones");
     }
 }
