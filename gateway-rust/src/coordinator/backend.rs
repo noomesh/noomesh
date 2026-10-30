@@ -611,6 +611,11 @@ struct Candidate {
     url: String,
     load: f64,
     excluded: bool,
+    /// The class table's health rule ([`super::classes::node_health`]):
+    /// heartbeat fresh, reachable, not quarantined or offline.
+    healthy: bool,
+    /// Why not, when not healthy.
+    health: String,
 }
 
 /// Has this backend already failed the current request? `exclude_urls` holds
@@ -735,6 +740,29 @@ fn apply_pin(all: &mut Vec<Candidate>, pin: &str) -> Result<(), String> {
 ///
 /// A function rather than four inline tuples so the ORDER can be tested. The
 /// ordering is what failed live, and nothing asserted it.
+/// The KV-scan sort: healthy first (185b: a node that died idle used to
+/// win on its last, low load until the KV entry expired), then exact model
+/// match, preferred backend, lower load.
+fn order_candidates(candidates: &mut [Candidate], target_model: &str, preferred: &str) {
+    candidates.sort_by_key(|c| {
+        let exact = !target_model.is_empty() && c.model_name == target_model;
+        (!c.healthy, sort_key(exact, c.backend_type == preferred, c.load))
+    });
+}
+
+/// `node: why` for each unhealthy candidate's node, once per node.
+fn unhealthy_summary(candidates: &[Candidate]) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    for c in candidates.iter().filter(|c| !c.healthy) {
+        if !seen.contains(&c.node_id.as_str()) {
+            seen.push(&c.node_id);
+            out.push(format!("{}: {}", c.node_id, c.health));
+        }
+    }
+    out.join("; ")
+}
+
 fn sort_key(exact_model: bool, preferred_type: bool, load: f64) -> (i32, i32, i32, i64) {
     (
         if exact_model { 0 } else { 1 },
@@ -948,6 +976,7 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
     let non_chat = non_chat_backends(state).await?;
 
     let mut candidates: Vec<Candidate> = Vec::new();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
 
     if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
         if let Ok(keys) = kv.keys().await {
@@ -956,7 +985,14 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
             for key in keys {
                 if let Ok(entry) = kv.get(&key).await {
                     if let Some(value) = entry {
-                        if let Ok(data) = serde_json::from_slice::<Value>(&value) {
+                        if let Ok(mut data) = serde_json::from_slice::<Value>(&value) {
+                            // Liveness (185b): the KV entry outlives a dead
+                            // node by its 120 s TTL, at whatever load it last
+                            // reported. The class table's rule decides, so a
+                            // pinned turn and raw chat agree on who is up.
+                            let inbound = crate::node_reachability::read_inbound(state, &key).await;
+                            crate::node_reachability::apply_inbound(&mut data, inbound.as_deref());
+                            let (healthy, health) = super::classes::node_health(&key, &data, now);
                             let node_load = data.get("load")
                                 .and_then(|l| l.as_f64())
                                 .map(|l| scale_checked_load(&key, l))
@@ -1015,6 +1051,8 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
                                             url,
                                                                             load: node_load,
                                             excluded,
+                                            healthy,
+                                            health: health.clone(),
                                         });
                                     }
                                 }
@@ -1040,23 +1078,27 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
             }
             return Err(if e.starts_with(&not_served_prefix(pin)) { anyhow::Error::new(ModelNotServed(e)) } else { anyhow::anyhow!(e) });
         }
+        // Every node serving the pin is down (stale heartbeat, unreachable,
+        // quarantined): the pin is a preference, so a live node answers,
+        // as it does when the pin is not served at all.
+        if !candidates.is_empty() && !candidates.iter().any(|c| c.healthy) {
+            let why = unhealthy_summary(&candidates);
+            if let Some(found) = unpinned_from_table(state, exclude_urls).await {
+                tracing::warn!(requested_model = pin, reason = %why, node = ?found.1, model = %found.0.model, "backend_preference_down_mesh_answers");
+                return Ok(found);
+            }
+        }
     } else {
         candidates.retain(|c| !c.excluded);
     }
 
     if !candidates.is_empty() {
-        // Sort by: exact model match → preferred backend → lower load
-        candidates.sort_by(|a, b| {
-            // Tier 0: exact model match (user requested specific model)
-            let a_exact = if !target_model.is_empty() && a.model_name == target_model { 0 } else { 1 };
-            let b_exact = if !target_model.is_empty() && b.model_name == target_model { 0 } else { 1 };
-            // Tier 1: preferred backend type
-            let a_backend = if a.backend_type == *preferred { 0 } else { 1 };
-            let b_backend = if b.backend_type == *preferred { 0 } else { 1 };
-            sort_key(a_exact == 0, a_backend == 0, a.load)
-                .cmp(&sort_key(b_exact == 0, b_backend == 0, b.load))
-        });
+        order_candidates(&mut candidates, target_model, preferred);
         let best = &candidates[0];
+        if !best.healthy {
+            // Nothing healthy anywhere: dial the best of the rest, and say so.
+            tracing::warn!(reason = %unhealthy_summary(&candidates), node = %best.node_id, "backend_resolved_only_unhealthy_candidates_left");
+        }
         // The candidate URL was built using the LOCAL Docker service name
         // (noo-vllm, noo-llamacpp) regardless of which node owns the
         // backend. Rewrite to the actual node IP if the chosen backend
@@ -1289,6 +1331,8 @@ mod tests {
             url: format!("https://noo-{bt}:1"),
             load: 0.0,
             excluded,
+            healthy: true,
+            health: String::new(),
         }
     }
 
@@ -1323,6 +1367,43 @@ mod tests {
         let mut all = vec![cand("host3", "vllm", HF, false), cand("host8", "ollama", "llama3.2:1b", false)];
         let err = apply_pin(&mut all, PIN).unwrap_err();
         assert!(err.contains(PIN) && err.contains(&format!("host3=vllm:{HF}")) && err.contains("host8=ollama:llama3.2:1b"), "{err}");
+    }
+
+    // ── liveness (185b) ──────
+
+    /// A node that died idle kept its last, low load in the KV for up to
+    /// 120 s and won the sort. Healthy now comes before every other key.
+    #[test]
+    fn a_dead_node_with_a_low_load_does_not_win_the_sort() {
+        let mut dead = cand("host8", "ollama", PIN, false);
+        dead.healthy = false;
+        dead.health = "heartbeat 95s old".into();
+        let mut busy = cand("host8-ma", "ollama", PIN, false);
+        busy.load = 0.85;
+        let mut all = vec![dead, busy];
+        super::order_candidates(&mut all, PIN, "ollama");
+        assert_eq!(all[0].node_id, "host8-ma");
+        assert_eq!(super::unhealthy_summary(&all), "host8: heartbeat 95s old");
+    }
+
+    /// The KV scan reads health by the class table's rule, from the record's
+    /// own heartbeat stamp: one definition for both chat paths.
+    #[test]
+    fn the_kv_scan_reads_health_from_the_heartbeat_stamp() {
+        let now = 10_000.0;
+        let fresh = serde_json::json!({"id": "host8", "ip_address": "100.64.0.8", "last_heartbeat": now - 10.0});
+        assert_eq!(crate::coordinator::classes::node_health("host8", &fresh, now), (true, String::new()));
+        let stale = serde_json::json!({"id": "host8", "ip_address": "100.64.0.8", "last_heartbeat": now - 95.0});
+        let (ok, why) = crate::coordinator::classes::node_health("host8", &stale, now);
+        assert!(!ok && why.contains("heartbeat 95s old"), "{why}");
+        let quarantined = serde_json::json!({"id": "host8", "last_heartbeat": now, "status": "quarantined"});
+        assert!(!crate::coordinator::classes::node_health("host8", &quarantined, now).0);
+        let src = include_str!("backend.rs");
+        // The resolver's body only: up to its closing brace, not this test.
+        let body = src.split("pub(crate) async fn resolve_backend_and_node(").nth(1).expect("resolver");
+        let body = body.split("\n}\n").next().expect("resolver body");
+        assert!(body.contains("classes::node_health(&key, &data, now)"), "the KV scan must apply the shared health rule");
+        assert!(body.contains("order_candidates(&mut candidates"), "and sort by it");
     }
 
     // ── the static / discovery paths learn it from the backend (168) ──────
