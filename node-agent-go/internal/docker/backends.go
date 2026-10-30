@@ -208,6 +208,11 @@ type VolumeMount struct {
 	// services/ tree at all, while the controller's $NOO_PKI_DIR carries
 	// every service leaf.
 	Optional bool
+	// Volume: Source is a named Docker volume, not a host path. Docker
+	// creates it on first use; it is no host root, so requireMountSources
+	// and the data-root report pass it by. Used for caches the engine can
+	// rebuild (compile_cache.go).
+	Volume bool
 }
 
 // PKI mount sources. `${NOO_PKI_DIR:-./.pki-placeholder}` keeps the shape
@@ -277,9 +282,18 @@ var backendSpecs = map[string]BackendSpec{
 			"VLLM_DO_NOT_TRACK":        "1",
 			"DO_NOT_TRACK":             "1",
 			"HF_HUB_DISABLE_TELEMETRY": "1",
+			// Every compile cache on the compile-cache volume, so a recreate
+			// does not recompile (compile_cache.go, followup i305). Literal
+			// paths: the mount target is fixed, and a value elsewhere would
+			// only put the cache back in the container layer.
+			"VLLM_CACHE_ROOT":           VLLMCompileCacheTarget,
+			"TRITON_CACHE_DIR":          VLLMCompileCacheTarget + "/triton",
+			"TORCHINDUCTOR_CACHE_DIR":   VLLMCompileCacheTarget + "/inductor",
+			"FLASHINFER_WORKSPACE_BASE": VLLMCompileCacheTarget + "/flashinfer",
 		},
 		Volumes: []VolumeMount{
 			{Source: hfCacheSource, Target: HFCacheTarget},
+			{Source: VLLMCompileCacheVolume, Target: VLLMCompileCacheTarget, Volume: true},
 			// No PKI: the engine serves plain inside its door's namespace,
 			// and the door (noo-stunnel-vllm) holds the vllm leaf.
 		},
@@ -1498,6 +1512,15 @@ func buildMounts(vols []VolumeMount) ([]mount.Mount, []skippedMount) {
 		slog.Info("backend.mount_skipped", "target", v.Target, "source", source, "reason", reason)
 	}
 	for _, v := range vols {
+		if v.Volume {
+			mounts = append(mounts, mount.Mount{
+				Type:     mount.TypeVolume,
+				Source:   v.Source,
+				Target:   v.Target,
+				ReadOnly: v.ReadOnly,
+			})
+			continue
+		}
 		source := resolveEnv(v.Source)
 		if source == "" || strings.HasPrefix(source, "./.pki-placeholder") {
 			skip(v, source, "placeholder source (NOO_PKI_DIR unset)")

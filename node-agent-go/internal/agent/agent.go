@@ -915,6 +915,8 @@ func (a *Agent) backendContainers() map[string]any {
 			adopted[b] = true
 		}
 		m = a.docker.BackendContainersBeside(a.lifeCtx(), adopted)
+		// One warm request per vLLM start before it reads ready (i305).
+		a.server.GateBackendWarmup(a.lifeCtx(), m)
 	}
 	if a.ollama == nil {
 		occupancy.Annotate(m)
