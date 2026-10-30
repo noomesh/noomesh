@@ -101,8 +101,10 @@ services:
   # The standalone profile's embedder sidecar (stunnel-ollama-embed, the
   # mTLS door in front of ollama-embed) runs on EVERY standalone install,
   # so its image is in the release matrix (`stunnel`, docker/Dockerfile.stunnel)
-  # and pulled here. The other stunnel-* services are not overridden (see
-  # below): they are on inference-node profiles a controller never starts.
+  # and pulled here. EVERY stunnel-* door is overridden the same way (below):
+  # a dist install ships no Dockerfile.stunnel, and an engine in
+  # `network_mode: service:<door>` (vllm, vllm-secondary, llamacpp, ...) cannot
+  # start without its door. tests/test_dist_mode.py enforces it.
   stunnel-ollama-embed:
     image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/stunnel:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_STUNNEL:-}
     pull_policy: missing
@@ -113,13 +115,44 @@ services:
     image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/stunnel:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_STUNNEL:-}
     pull_policy: missing
 
+  # Inference-node doors (same published stunnel image). The entrypoint is NOT
+  # overridden: the compose self-pin wrapper (NOO_STUNNEL_SELF_NODE) must stay.
+  stunnel-vllm:
+    image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/stunnel:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_STUNNEL:-}
+    pull_policy: missing
+
+  stunnel-vllm-secondary:
+    image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/stunnel:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_STUNNEL:-}
+    pull_policy: missing
+
+  stunnel-llamacpp:
+    image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/stunnel:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_STUNNEL:-}
+    pull_policy: missing
+
+  stunnel-ollama:
+    image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/stunnel:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_STUNNEL:-}
+    pull_policy: missing
+
+  stunnel-tei:
+    image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/stunnel:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_STUNNEL:-}
+    pull_policy: missing
+
+  stunnel-tei-gpu:
+    image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/stunnel:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_STUNNEL:-}
+    pull_policy: missing
+
+  stunnel-reranker:
+    image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/stunnel:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_STUNNEL:-}
+    pull_policy: missing
+
 # NOT overridden here — and why:
-#   sandbox-base, airllm, stunnel-* (except stunnel-ollama-embed above), browser
+#   sandbox-base, airllm, browser
 #     Not in the `controller` profile, so a controller dist run never starts
-#     them. llamacpp/airllm/stunnel are inference-node images built on the node
-#     that runs them; adding them to the release matrix is the next step if you
-#     want pull-only WORKER installs too (the `stunnel` image IS published now —
-#     the standalone sidecar needs it — so those rows are one line each).
+#     them. llamacpp/airllm are inference-node images built on the node that
+#     runs them; adding them to the release matrix is the next step if you want
+#     pull-only WORKER installs too. (stunnel-* doors are NOT in this list: they
+#     are overridden above, because an engine sharing a door's network namespace
+#     fails to start without its door, on a controller as much as a node.)
 #   redis, nats, vllm, ollama, tei*, reranker, loki, prometheus,
 #   alertmanager, grafana, node-exporter, model-cache
 #     Third-party upstream images — already pulled, never built. Untouched.
