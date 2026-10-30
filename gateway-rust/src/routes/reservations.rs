@@ -209,6 +209,22 @@ async fn actuator(link: &crate::node_link::NodeLink, decl: &crate::addon_workloa
     }
 }
 
+/// The error for a failed actuator start. The agent loads its workload
+/// declarations a moment after it registers; a start in that window meets its
+/// 404 `not_declared`, a transient state (this gateway's own bundle declares
+/// the workload), so the caller is told to retry, not shown a 500. Any other
+/// failure stays an internal error.
+fn start_failure(key: &str, node: &str, e: &str) -> AppError {
+    if e.starts_with("not_declared (404)") {
+        return AppError::UnavailableRetry {
+            code: "node_workloads_not_loaded",
+            detail: format!("{key} cannot start on {node}: the node has not loaded its workload declarations yet; retry"),
+            retry_after_secs: 10,
+        };
+    }
+    AppError::Internal(format!("{key} did not start on {node}: {e}; the GPU was released back to the pool"))
+}
+
 /// Wait until the workload's container runs (and is not `starting` or
 /// `unhealthy` when it has a healthcheck). `Ok(state)` or the reason.
 async fn wait_ready(link: &crate::node_link::NodeLink, decl: &crate::addon_workloads::WorkloadDecl, timeout: std::time::Duration) -> Result<Value, String> {
@@ -363,7 +379,7 @@ async fn reservation_take(
                 json!({"operation_id": id, "generation": generation, "force": false, "legacy": false, "resume": "now"}),
                 std::time::Duration::from_secs(90)).await;
             audit(&state, AuditKind::ReservationTake, &actor, &node, "error", json!({"id": id, "workload": key, "step": "start", "detail": e})).await;
-            return Err(AppError::Internal(format!("{key} did not start on {node}: {e}; the GPU was released back to the pool")));
+            return Err(start_failure(&key, &node, &e));
         }
     };
     steps["started"] = started;
@@ -802,6 +818,20 @@ mod tests {
         // A plain operator hold lists too, with no workload.
         let plain = json!({"gpu_contention": {"state": "held", "lease": {"operation_id": "op-9", "owner": "op"}}});
         assert_eq!(reservation_of("x", &plain).unwrap()["workload"], "");
+    }
+
+    #[test]
+    fn a_not_declared_start_is_a_retryable_503_and_other_failures_stay_internal() {
+        match start_failure("pai-voice/voice-worker", "awolf", "not_declared (404): no such workload") {
+            AppError::UnavailableRetry { code, detail, retry_after_secs } => {
+                assert_eq!(code, "node_workloads_not_loaded");
+                assert!(detail.contains("has not loaded its workload declarations yet; retry"), "{detail}");
+                assert!(retry_after_secs > 0);
+            }
+            other => panic!("not_declared must be retryable, got {other:?}"),
+        }
+        assert!(matches!(start_failure("k", "n", "docker_error (500): boom"), AppError::Internal(_)));
+        assert!(matches!(start_failure("k", "n", "node agent unreachable: x"), AppError::Internal(_)));
     }
 
     #[test]
