@@ -13,6 +13,8 @@ name = "noo"
 path = "src/main.rs"
 
 [dependencies]
+# The add-on route manifest and the gateway's own rules (i302).
+addon-manifest = { path = "../crates/addon-manifest" }
 ureq = { version = "3", default-features = false, features = ["rustls", "json", "platform-verifier"] }
 serde_json = "1"
 sha2 = "0.11.1"

@@ -158,3 +158,24 @@ def test_build_rs_is_in_the_build_context(crate: str) -> None:
         "silently drops every cfg the script sets, which is how the shipped "
         "image lost its pro routes. Add a COPY line."
     )
+
+
+def test_every_path_dependency_is_in_the_build_context() -> None:
+    """A path dependency outside the crate (`../crates/addon-manifest`, i302)
+    is compiled from the build context like the crate's own sources: missing
+    from the COPY list, the image build dies resolving the dependency graph.
+    Every `path = "..."` dependency in the gateway's Cargo.toml must be COPYed."""
+    manifest = (REPO / "gateway-rust" / "Cargo.toml").read_text()
+    deps = re.findall(r'^[A-Za-z0-9_-]+\s*=\s*\{[^}\n]*\bpath\s*=\s*"([^"]+)"', manifest, re.M)
+    assert deps, "no path dependency parsed from gateway-rust/Cargo.toml — the parse broke"
+    copied = _copied_paths(_builder_stage(DOCKERFILE.read_text()))
+    missing = []
+    for d in deps:
+        rel = (REPO / "gateway-rust" / d).resolve().relative_to(REPO).as_posix()
+        if not _is_copied(rel, copied):
+            missing.append(rel)
+    assert not missing, (
+        f"path dependencies {missing} are not copied into the Docker builder stage of "
+        f"{DOCKERFILE.relative_to(REPO)}; add a COPY of each to the directory the "
+        "dependency's relative path resolves to from WORKDIR /build"
+    )

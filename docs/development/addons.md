@@ -396,6 +396,15 @@ add-on when any of these fails:
   covers;
 - no public route collides with a core route.
 
+**Check it in your CI.** These rules live in one crate
+(`crates/addon-manifest`) that the gateway and `noo` both compile, so
+`noo addons check <bundle-dir>` refuses a routes.json the gateway would refuse,
+with the gateway's own sentence. One rule needs a running gateway: whether a
+public write sits where the front door admits a User. `noo addons check` does
+not pass that rule. It prints one `not checked here:` line per route the rule
+applies to, and in `--json` it lists them under `routes_not_checked`. The
+gateway decides those routes when it loads the manifest.
+
 ### Who may call a route
 
 Add-on routes are scoped by permission like every core route, with the same

@@ -67,6 +67,10 @@ WORKDIR /build
 
 # Step 1: Cache dependencies only (rebuilds only when Cargo.toml changes).
 # Cargo registry cache is mounted so re-downloads don't happen across builds.
+# The add-on manifest crate is a path dependency (`../crates/addon-manifest`
+# from /build): it must be in place before the deps-only build resolves the
+# graph. Shared with noo-cli (noomesh-internal i302).
+COPY crates/addon-manifest /crates/addon-manifest
 COPY gateway-rust/Cargo.toml gateway-rust/Cargo.lock* ./
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git,sharing=locked \
@@ -177,10 +181,11 @@ COPY gateway-rust/migrations ./migrations
 # touch` attempt failed with exit 127), and cannot be defeated by whatever
 # timestamps BuildKit happens to write.
 #
-# Only noo-gateway's own fingerprint is removed, so the expensive
-# dependency build stays cached: deps are compiled in the step above from
-# Cargo.toml alone and are untouched here. This costs one crate's compile,
-# not the full tree.
+# Only noo-gateway's own fingerprint is removed, with that of the one local
+# path crate (addon-manifest, COPYed for the step above, so the same mtime
+# trap applies to it), so the expensive dependency build stays cached: deps
+# are compiled in the step above from Cargo.toml alone and are untouched here.
+# This costs two small crates' compile, not the full tree.
 # CONCURRENT BUILDS. `id=` is a fixed key, so every build on this host shares
 # ONE mutable /build/target. BuildKit's default `sharing=shared` lets them in
 # at the same time, and two cargos writing one target dir corrupt each other:
@@ -202,7 +207,7 @@ ARG CARGO_CACHE_ID=cargo-target
 RUN --mount=type=cache,target=/build/target,id=${CARGO_CACHE_ID},sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git,sharing=locked \
-    rm -rf target/release/.fingerprint/noo-gateway-* && \
+    rm -rf target/release/.fingerprint/noo-gateway-* target/release/.fingerprint/addon-manifest-* && \
     cargo build --release && \
     cp target/release/noo-gateway /noo-gateway-built
 

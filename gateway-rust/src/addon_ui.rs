@@ -97,7 +97,7 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::addon_proxy::{AddonManifest, UiSpec};
+use crate::addon_proxy::{AddonManifest, UiRole, UiSpec};
 use crate::state::AppState;
 
 /// The default port range for add-on UI origins: ten add-ons with a UI (ten

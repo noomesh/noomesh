@@ -87,6 +87,7 @@
       "inputs": [
         "docker/Dockerfile.gateway-rust",
         "gateway-rust/**",
+        "crates/addon-manifest/**",
         "tests/fixtures/redaction_corpus.json",
         "tests/fixtures/audit_hash_v2_vectors.json",
         "tests/fixtures/audit_chain_vectors.json",
