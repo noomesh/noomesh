@@ -224,14 +224,14 @@ mod tests {
     fn a_bad_routes_json_gets_the_gateways_refusal() {
         let d = fixture_dir("routes", "rhaddon");
         let good: serde_json::Value = serde_json::from_slice(&std::fs::read(d.join("routes.json")).unwrap()).unwrap();
-        let cases: [(&str, Box<dyn Fn(&mut serde_json::Value)>, &str); 4] = [
-            ("unknown role", Box::new(|m: &mut serde_json::Value| m["routes"][0]["min_role"] = "owner".into()), "min_role \"owner\" is not a role"),
-            ("wrong addon", Box::new(|m: &mut serde_json::Value| m["addon"] = "other".into()), "it names add-on \"other\", but was delivered for \"rhaddon\""),
-            ("duplicate route", Box::new(|m: &mut serde_json::Value| {
+        let cases: [(&str, fn(&mut serde_json::Value), &str); 4] = [
+            ("unknown role", |m: &mut serde_json::Value| m["routes"][0]["min_role"] = "owner".into(), "min_role \"owner\" is not a role"),
+            ("wrong addon", |m: &mut serde_json::Value| m["addon"] = "other".into(), "it names add-on \"other\", but was delivered for \"rhaddon\""),
+            ("duplicate route", |m: &mut serde_json::Value| {
                 let first = m["routes"][0].clone();
                 m["routes"].as_array_mut().unwrap().push(first);
-            }), "route name \"status\" appears twice"),
-            ("no routes", Box::new(|m: &mut serde_json::Value| m["routes"] = serde_json::json!([])), "it declares no routes"),
+            }, "route name \"status\" appears twice"),
+            ("no routes", |m: &mut serde_json::Value| m["routes"] = serde_json::json!([]), "it declares no routes"),
         ];
         for (what, edit, want) in cases {
             let mut m = good.clone();
