@@ -288,14 +288,7 @@ const FOREIGN_SELF_AGENT_LOG_EVERY: std::time::Duration = std::time::Duration::f
 pub(crate) fn foreign_tls(err: &(dyn std::error::Error + 'static)) -> Option<String> {
     let mut cur = Some(err);
     while let Some(e) = cur {
-        // hyper hands the rustls error up inside an io::Error, whose
-        // `source()` skips the error it wraps: look inside it too.
-        let tls = e.downcast_ref::<rustls::Error>().or_else(|| {
-            e.downcast_ref::<std::io::Error>()
-                .and_then(|io| io.get_ref())
-                .and_then(|inner| inner.downcast_ref::<rustls::Error>())
-        });
-        match tls {
+        match e.downcast_ref::<rustls::Error>() {
             Some(t @ rustls::Error::InvalidCertificate(_)) => {
                 return Some(format!("its certificate did not verify against this cluster's CA ({t})"))
             }
@@ -310,7 +303,14 @@ pub(crate) fn foreign_tls(err: &(dyn std::error::Error + 'static)) -> Option<Str
             Some(_) => return None,
             None => {}
         }
-        cur = e.source();
+        // hyper hands the rustls error up inside io::Error, twice (Other
+        // around InvalidData, 0.6.15 batch), and io::Error's `source()` is
+        // the WRAPPED error's source: it skips the error it wraps. Step
+        // into an io::Error by `get_ref()` instead.
+        cur = match e.downcast_ref::<std::io::Error>() {
+            Some(io) => io.get_ref().map(|inner| inner as &(dyn std::error::Error + 'static)),
+            None => e.source(),
+        };
     }
     None
 }
@@ -725,6 +725,13 @@ mod tests {
         let why = foreign_tls(&err).unwrap_or_else(|| panic!("a foreign CA's certificate must be named as such: {err:?}"));
         assert!(why.contains("did not verify against this cluster's CA"), "{why}");
         assert_eq!(probe_self_agent(&client, &base).await, None, "a foreign agent teaches the probe nothing");
+
+        // The exact nesting the batch saw, without the network.
+        let nested = std::io::Error::other(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+        ));
+        assert!(foreign_tls(&nested).is_some_and(|w| w.contains("did not verify")), "{nested:?}");
 
         let down = client.get("https://127.0.0.1:9/health").send().await.unwrap_err();
         assert_eq!(foreign_tls(&down), None, "an agent that is down is not foreign: {down:?}");
