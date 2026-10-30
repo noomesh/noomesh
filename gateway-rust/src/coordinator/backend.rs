@@ -698,6 +698,91 @@ pub fn backend_model_not_found(status: u16, body: &str, pin: &str, backend_url: 
     )))
 }
 
+// ── The static Ollama: ask what it holds before sending it a model ─────
+
+/// How long a positive answer from the static Ollama's `/api/tags` is
+/// trusted. Only a model FOUND in the cached list is served from cache; a
+/// model missing from it always re-asks, so a pull that just finished is
+/// seen on the next request.
+const STATIC_TAGS_TTL: Duration = Duration::from_secs(30);
+
+fn static_tags_cache() -> &'static Mutex<std::collections::HashMap<String, (Instant, Vec<String>)>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, (Instant, Vec<String>)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The model names in an Ollama `/api/tags` body (`{"models":[{"name":..}]}`).
+/// `None` when the body is not that shape, so an unreadable answer is never
+/// mistaken for "holds nothing".
+pub(crate) fn parse_ollama_tags(body: &Value) -> Option<Vec<String>> {
+    let models = body.get("models")?.as_array()?;
+    Some(
+        models
+            .iter()
+            .filter_map(|m| m.get("name").or_else(|| m.get("model")).and_then(Value::as_str))
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// What the static Ollama at `url` holds, or `None` when it could not be
+/// asked (unreachable, non-2xx, unreadable). `None` never refuses: a
+/// backend that cannot be asked is tried, and fails with its own error.
+async fn static_ollama_models(url: &str, model: &str) -> Option<Vec<String>> {
+    if let Ok(cache) = static_tags_cache().lock() {
+        if let Some((at, held)) = cache.get(url) {
+            if at.elapsed() < STATIC_TAGS_TTL && held.iter().any(|h| model_matches_pin(h, model)) {
+                return Some(held.clone());
+            }
+        }
+    }
+    let resp = crate::tls::cluster_client()
+        .get(format!("{url}/api/tags"))
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let held = parse_ollama_tags(&resp.json::<Value>().await.ok()?)?;
+    if let Ok(mut cache) = static_tags_cache().lock() {
+        cache.insert(url.to_string(), (Instant::now(), held.clone()));
+    }
+    Some(held)
+}
+
+/// The refusal for sending `model` to the static Ollama at `url` when that
+/// Ollama (which `held` lists, from its own `/api/tags`) does not have it,
+/// or `None` when it does. Names the model AND the backend, and the real
+/// commands that fix it. A vLLM/HF repo id (`Qwen/Qwen3-8B-AWQ`) is the
+/// usual case: the install's default model was the vLLM one, and the
+/// request used to hang to the global timeout on an Ollama that could never
+/// serve it (i263a).
+pub(crate) fn static_backend_refusal(model: &str, url: &str, held: &[String]) -> Option<ModelNotServed> {
+    if held.iter().any(|h| model_matches_pin(h, model)) {
+        return None;
+    }
+    let holds = if held.is_empty() {
+        "no models".to_string()
+    } else {
+        held.join(", ")
+    };
+    let fix = match held.first() {
+        Some(first) => format!(
+            "make a model it holds the default chat model (noo models switch {first} --backend ollama), \
+             or pull the one you want (noo models pull {model})"
+        ),
+        None => "pull a chat model (noo models pull gemma4:e2b) and make it the default \
+                 (noo models switch gemma4:e2b --backend ollama)"
+            .to_string(),
+    };
+    Some(ModelNotServed(format!(
+        "{}; the only chat backend is the Ollama at {url}, which holds {holds}. {fix}",
+        not_served_prefix(model)
+    )))
+}
+
 /// Apply an explicit model pin to the candidate list: keep only the backends
 /// that serve it, and refuse - naming who serves what - when none does.
 ///
@@ -1210,6 +1295,16 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
                     "No mesh backend and the static ollama at {url} has no model configured — \
                      set cluster.backends.ollama.model (noo onboard --only model)"
                 );
+            }
+            // Ask the Ollama what it holds before sending it a model: with no
+            // mesh chat backend this IS the chat path, and a model it cannot
+            // serve (the install's vLLM repo id) hung to the global timeout
+            // instead of answering (i263a). An unanswerable Ollama is tried.
+            if let Some(held) = static_ollama_models(&url, &model).await {
+                if let Some(refusal) = static_backend_refusal(&model, &url, &held) {
+                    tracing::warn!(url = %url, model = %model, "static_ollama_refused_unserved_model");
+                    return Err(refusal.into());
+                }
             }
             tracing::info!(
                 url = %url, model = %model, source = "static_ollama_url",
@@ -1799,6 +1894,66 @@ mod unpinned_tests {
         assert_eq!(next.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["pop-os"]);
         assert!(pick_unpinned(&t, &["https://192.0.2.212:8081".into(), "https://192.0.2.211:8081".into()]).is_none(),
             "nothing left: fall through to discovery / the static last resort");
+    }
+
+    // ── i263a: the static Ollama is asked what it holds ──
+
+    fn held(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_vllm_repo_id_is_refused_by_a_static_ollama_holding_only_tags() {
+        let r = super::static_backend_refusal(
+            "Qwen/Qwen3-8B-AWQ",
+            "https://noo-stunnel-ollama-embed:11434",
+            &held(&["gemma4:e2b", "nomic-embed-text:latest"]),
+        )
+        .expect("an Ollama that does not hold the model must refuse it");
+        let text = r.to_string();
+        assert!(text.starts_with(&super::not_served_prefix("Qwen/Qwen3-8B-AWQ")), "{text}");
+        assert!(text.contains("noo-stunnel-ollama-embed:11434"), "names the backend: {text}");
+        assert!(text.contains("gemma4:e2b"), "names what it holds: {text}");
+        assert!(text.contains("noo models switch gemma4:e2b --backend ollama"), "real remedy: {text}");
+    }
+
+    #[test]
+    fn a_tag_the_static_ollama_holds_is_not_refused() {
+        let h = held(&["gemma4:e2b", "qwen3:8b"]);
+        assert!(super::static_backend_refusal("gemma4:e2b", "http://o:11434", &h).is_none());
+        let h = held(&["gemma4:latest"]);
+        assert!(super::static_backend_refusal("gemma4", "http://o:11434", &h).is_none(), ":latest is the same model");
+    }
+
+    #[test]
+    fn an_empty_static_ollama_refuses_with_the_pull_remedy() {
+        let text = super::static_backend_refusal("gemma4:e2b", "http://o:11434", &[]).expect("holds nothing").to_string();
+        assert!(text.contains("holds no models"), "{text}");
+        assert!(text.contains("noo models pull gemma4:e2b"), "{text}");
+    }
+
+    #[test]
+    fn a_refusal_answers_404_like_every_other_unserved_model() {
+        let e: anyhow::Error = super::static_backend_refusal("x/y", "http://o", &[]).unwrap().into();
+        assert_eq!(super::resolve_failure_status(&e, 503), 404);
+    }
+
+    #[test]
+    fn tags_parse_to_names_and_an_unreadable_body_is_not_empty() {
+        let body = serde_json::json!({"models": [{"name": "gemma4:e2b"}, {"model": "qwen3:8b"}]});
+        assert_eq!(super::parse_ollama_tags(&body), Some(held(&["gemma4:e2b", "qwen3:8b"])));
+        assert_eq!(super::parse_ollama_tags(&serde_json::json!({"models": []})), Some(vec![]));
+        assert_eq!(super::parse_ollama_tags(&serde_json::json!({"error": "x"})), None);
+    }
+
+    #[test]
+    fn the_static_branch_asks_the_ollama_before_it_resolves() {
+        let src = include_str!("backend.rs");
+        let body = src.split("pub(crate) async fn resolve_backend_and_node(").nth(1).expect("resolver");
+        let ask = body.find("static_ollama_models(&url, &model)").expect("the static branch asks what the Ollama holds");
+        let resolved = body.find("source = \"static_ollama_url\"").expect("static resolution");
+        assert!(ask < resolved, "the check must come before the backend is returned");
+        assert!(body[ask..resolved].contains("static_backend_refusal"));
     }
 
     /// The unpinned branch runs BEFORE the KV scan, and the configured
