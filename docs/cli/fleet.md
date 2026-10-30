@@ -585,7 +585,11 @@ one is matched to a managed container through its cgroup (method
 falls back to accounting: foreign = memory used − the expected footprint of
 the GPU backends it is running (vLLM: `GPU_MEMORY_UTILIZATION` × total)
 (method `memory-accounting`). A Mac or a node without an NVIDIA GPU reports
-`not-measured` and never yields.
+`not-measured` and never yields. The report's `unmeasured` key says why:
+`unified-memory` (Mac), `no-nvidia` (no `nvidia-smi`), `probe-timeout`
+(`nvidia-smi` missed its deadline on a busy GPU), or `driver-lost` (`nvidia-smi`
+is there but fails or prints "Unknown Error": the driver lost the GPU, Xid 79).
+`noo cluster verify` fails the `gpu` row for `driver-lost`.
 
 **When it yields.** The GPU is under pressure when foreign use is above
 `NOO_GPU_YIELD_FOREIGN_MB`, or when what is left after foreign use is less

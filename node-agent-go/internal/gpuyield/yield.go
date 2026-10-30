@@ -156,6 +156,11 @@ type Contention struct {
 	NeedMB int `json:"need_mb"`
 	// Reason: the hold's reason, or why the automatic policy yielded.
 	Reason string `json:"reason,omitempty"`
+	// Unmeasured: why the GPU is not measured (method "not-measured"):
+	// unified-memory | no-nvidia | probe-timeout | driver-lost.
+	Unmeasured string `json:"unmeasured,omitempty"`
+	// UnmeasuredDetail: short first-line nvidia-smi error, for driver-lost.
+	UnmeasuredDetail string `json:"unmeasured_detail,omitempty"`
 	// Policy: "auto" | "off" (NOO_GPU_YIELD=off).
 	Policy string `json:"policy"`
 	// Generation counts accepted holds on this node (persisted; never
@@ -211,8 +216,12 @@ type Controller struct {
 	measured    map[string]int // backend -> last measured MiB (PID method)
 	onResume    func()
 	lastNoMeter bool
-	owned       []docker.NoomeshContainer // this tick's noomesh containers
-	ownedErr    error                     // non-nil: docker could not list them
+	// unmeasured / unmeasuredDetail: the cause of the last unmeasured
+	// reading; cleared on a measured one.
+	unmeasured       string
+	unmeasuredDetail string
+	owned            []docker.NoomeshContainer // this tick's noomesh containers
+	ownedErr         error                     // non-nil: docker could not list them
 	// listErr is the last GPU-backend listing failure, so a host with no
 	// docker (a Mac running a native ollama) warns once per cause, not
 	// once per tick.
@@ -320,6 +329,7 @@ func (c *Controller) Report() Contention {
 		Method: c.method, Since: c.since.UTC().Format(time.RFC3339),
 		PausedBackends: sortedKeys(c.paused), NeedMB: c.needMB, Reason: c.reason, Policy: "auto",
 		Generation: c.generation, Lease: c.lease.clone(), GPUBackends: sortedKeys(c.gpuSet),
+		Unmeasured: c.unmeasured, UnmeasuredDetail: c.unmeasuredDetail,
 	}
 	if c.last.Measured {
 		r.FreeMB = c.last.TotalMB - c.last.UsedMB
@@ -415,6 +425,11 @@ func (c *Controller) decideLocked(r Reading, backends []docker.GPUBackend) (act 
 		// Nothing to judge by. Never pause on no data; a node already
 		// paused stays paused (freeness cannot be confirmed either).
 		c.method = MethodNotMeasured
+		if r.Unmeasured == UnmeasuredDriverLost && c.unmeasured != UnmeasuredDriverLost {
+			slog.Warn("gpuyield: the NVIDIA driver lost the GPU; GPU backends cannot start",
+				"detail", r.UnmeasuredDetail)
+		}
+		c.unmeasured, c.unmeasuredDetail = r.Unmeasured, r.UnmeasuredDetail
 		c.foreignMB, c.noomeshMB, c.unknownMB, c.orphans = 0, 0, 0, nil
 		c.pressureAt, c.clearAt = time.Time{}, time.Time{}
 		if !c.lastNoMeter {
@@ -427,6 +442,7 @@ func (c *Controller) decideLocked(r Reading, backends []docker.GPUBackend) (act 
 		return c.enforceLocked(backends)
 	}
 	c.lastNoMeter = false
+	c.unmeasured, c.unmeasuredDetail = "", ""
 
 	att := c.attribute(r, backends)
 	c.foreignMB, c.method = att.foreignMB, att.method

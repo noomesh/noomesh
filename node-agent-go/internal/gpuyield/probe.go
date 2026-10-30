@@ -5,8 +5,10 @@ package gpuyield
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
@@ -35,6 +37,76 @@ type Reading struct {
 	// / "[N/A]" (the Windows driver owns the processes), and PID
 	// attribution is then impossible.
 	AppsResolved bool
+	// Unmeasured says why Measured is false (one of the Unmeasured*
+	// constants); empty when Measured.
+	Unmeasured string
+	// UnmeasuredDetail is a short first-line copy of the error text, set
+	// for UnmeasuredDriverLost only.
+	UnmeasuredDetail string
+}
+
+// Why a GPU is not measured. Values are a contract with `noo cluster verify`.
+const (
+	// UnmeasuredUnifiedMemory: macOS, no separate GPU pool.
+	UnmeasuredUnifiedMemory = "unified-memory"
+	// UnmeasuredNoNvidia: nvidia-smi is not installed.
+	UnmeasuredNoNvidia = "no-nvidia"
+	// UnmeasuredProbeTimeout: nvidia-smi missed its deadline (a saturated
+	// GPU or slow driver), NOT a lost GPU.
+	UnmeasuredProbeTimeout = "probe-timeout"
+	// UnmeasuredDriverLost: nvidia-smi exists but fails, prints
+	// "Unknown Error" / "Unable to determine", or prints nothing parseable
+	// (Xid 79, "GPU has fallen off the bus").
+	UnmeasuredDriverLost = "driver-lost"
+)
+
+const detailMax = 120
+
+// classifyUnmeasured turns a failed or unparseable nvidia-smi call into a
+// cause. out is stdout (may be empty), err the call error (may be nil).
+func classifyUnmeasured(out string, err error) (cause, detail string) {
+	if err != nil {
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			return UnmeasuredProbeTimeout, ""
+		case errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist):
+			return UnmeasuredNoNvidia, ""
+		}
+		text := err.Error()
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && strings.TrimSpace(string(ee.Stderr)) != "" {
+			text = string(ee.Stderr)
+		} else if strings.TrimSpace(out) != "" {
+			text = out
+		}
+		return UnmeasuredDriverLost, shortDetail(text)
+	}
+	if strings.TrimSpace(out) == "" {
+		return UnmeasuredDriverLost, "no output"
+	}
+	return UnmeasuredDriverLost, shortDetail(out)
+}
+
+// shortDetail is the first non-empty line, capped at detailMax bytes.
+func shortDetail(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if len(line) > detailMax {
+			line = line[:detailMax]
+		}
+		return line
+	}
+	return ""
+}
+
+// smiFault mirrors the launcher's _compose_gpu_state: output naming
+// "Unknown Error" / "Unable to determine" is a lost GPU even at exit 0.
+func smiFault(out string) bool {
+	l := strings.ToLower(out)
+	return strings.Contains(l, "unknown error") || strings.Contains(l, "unable to determine")
 }
 
 // Probe samples GPU memory.
@@ -59,15 +131,17 @@ func (p *SMIProbe) Read(ctx context.Context) Reading {
 	if p.goos == "darwin" {
 		// Unified memory: there is no separate GPU pool to contend for that
 		// this agent can measure. Reported as "not-measured", never paused.
-		return Reading{}
+		return Reading{Unmeasured: UnmeasuredUnifiedMemory}
 	}
 	out, err := p.run("--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits")
 	if err != nil {
-		return Reading{}
+		cause, detail := classifyUnmeasured(out, err)
+		return Reading{Unmeasured: cause, UnmeasuredDetail: detail}
 	}
 	used, total, ok := parseGPUMemory(out)
-	if !ok {
-		return Reading{}
+	if smiFault(out) || !ok {
+		_, detail := classifyUnmeasured(out, nil)
+		return Reading{Unmeasured: UnmeasuredDriverLost, UnmeasuredDetail: detail}
 	}
 	r := Reading{Measured: true, TotalMB: total, UsedMB: used}
 	apps, aerr := p.run("--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits")
