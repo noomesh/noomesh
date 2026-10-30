@@ -3570,15 +3570,7 @@ pub fn storage(ctx: &mut Ctx) {
     ensure_pg_data_path(ctx, &state_root, &home);
 
     let failed = create_storage_dirs(ctx, Path::new(&chosen_root));
-    if failed > 0 {
-        // Every stateful service bind-mounts under this root; carrying on
-        // only moves the failure to `noo stack start`, and under --ci nobody
-        // is watching the warning. Record it so the wizard exits non-zero.
-        ctx.state.hard_failures.push(format!(
-            "storage: {failed} director{} under {chosen_root} could not be created (set NOO_DATA_ROOT to a writable directory)",
-            if failed == 1 { "y" } else { "ies" }
-        ));
-    }
+    record_storage_summary_failure(ctx, failed, &chosen_root);
 
     // Bind-mount summary
     ctx.info("Docker bind-mount paths:");
@@ -4203,6 +4195,29 @@ fn ensure_root_dir(ctx: &mut Ctx, root: &Path) {
     }
 }
 
+/// True once a hard failure about storage is on the verdict. Storage is one
+/// action: the step, its summary and the services step's re-check all
+/// report the same missing directories, so the FIRST failure is the one
+/// the closing block lists (i276).
+fn storage_failure_recorded(ctx: &Ctx) -> bool {
+    ctx.state.hard_failures.iter().any(|f| f.starts_with("storage"))
+}
+
+/// The storage step's own summary failure, unless a refusal for the same
+/// action is already recorded.
+fn record_storage_summary_failure(ctx: &mut Ctx, failed: usize, chosen_root: &str) {
+    if failed == 0 || storage_failure_recorded(ctx) {
+        return;
+    }
+    // Every stateful service bind-mounts under this root; carrying on
+    // only moves the failure to `noo stack start`, and under --ci nobody
+    // is watching the warning. Record it so the wizard exits non-zero.
+    ctx.state.hard_failures.push(format!(
+        "storage: {failed} director{} under {chosen_root} could not be created (set NOO_DATA_ROOT to a writable directory)",
+        if failed == 1 { "y" } else { "ies" }
+    ));
+}
+
 fn create_storage_dirs(ctx: &mut Ctx, root: &Path) -> usize {
     let (mut created, mut existing, mut failed) = (0, 0, 0);
     for (name, target) in &storage_targets(ctx, root) {
@@ -4240,7 +4255,9 @@ fn create_storage_dirs(ctx: &mut Ctx, root: &Path) -> usize {
     let detail = format!("{created} created, {existing} already exist, {failed} failed");
     if failed > 0 {
         ctx.warn(&format!("Storage directories ({detail}) under {}", root.display()));
-        sudo_refused(ctx, &format!("storage ({failed} director(ies) under {})", root.display()), &format!("sudo mkdir -p {}/<each missing directory>, then: noo onboard --only storage", root.display()));
+        if !storage_failure_recorded(ctx) {
+            sudo_refused(ctx, &format!("storage ({failed} director(ies) under {})", root.display()), &format!("sudo mkdir -p {}/<each missing directory>, then: noo onboard --only storage", root.display()));
+        }
     } else {
         ctx.success(&format!("Storage directories ({detail}) under {}", root.display()));
     }
@@ -4968,6 +4985,13 @@ ensure noo_evolve_ddl "${{NOO_EVOLVE_DDL_PASSWORD:-}}"
         // Without it the stack came up by tag, and every later check
         // against the lock (add-on entitlement, image staging) refused with
         // "no verified stack.lock" until an upgrade to the SAME tag (rc.3).
+        // Storage first: a missing bind source refuses the launch AFTER the
+        // whole image set is pulled, and pulling again cannot create it.
+        if let Some((n, root, why)) = storage_preflight_refusal(ctx) {
+            ctx.error(&format!("Stack not started: {why}"));
+            record_storage_summary_failure(ctx, n, &root);
+            return;
+        }
         if !pin_dist_stack_lock(ctx) {
             return;
         }
@@ -4994,6 +5018,14 @@ ensure noo_evolve_ddl "${{NOO_EVOLVE_DDL_PASSWORD:-}}"
             // wizard should be). One automatic repair pass: sweep device-
             // stale volumes + leftover created-but-dead containers, retry
             // once, and only then fail the step.
+            // A preflight refusal (a missing storage directory) is the host's
+            // to fix: a volume sweep cannot create a directory, and the
+            // retry would pull everything again to be refused the same way.
+            if let Some((_, _, why)) = storage_preflight_refusal(ctx) {
+                ctx.error(&format!("Stack launch refused: {why}; no repair retry"));
+                ctx.state.hard_failures.push(format!("services: the stack was not started ({why})"));
+                return;
+            }
             ctx.warn("Stack launch failed — attempting automatic repair (stale volume sweep) and ONE retry...");
             if !ctx.dry_run {
                 let _ = Command::new("bash").arg("-c")
@@ -5463,6 +5495,32 @@ fn fix_volume_mismatches(ctx: &Ctx) {
             "Removed {removed} stale Docker volume(s) (config doesn't match current NOO_DATA_ROOT)"
         ));
     }
+}
+
+/// The launch preflight, over what onboard owns: every storage directory
+/// the stack bind-mounts must exist before anything is pulled or started.
+/// `Some(text)` = refuse. A missing one is a host problem (Docker would
+/// create it root-owned): pulling the image set cannot fix it and neither
+/// can the volume-sweep repair, so neither runs (i276). A dry run creates
+/// nothing and is never refused.
+fn storage_preflight_refusal(ctx: &Ctx) -> Option<(usize, String, String)> {
+    if ctx.dry_run {
+        return None;
+    }
+    let root = ctx.read_env("NOO_DATA_ROOT");
+    let root = if root.is_empty() { crate::commands::data_root::DEFAULT_DATA_ROOT.to_string() } else { root };
+    let missing: Vec<_> = storage_targets(ctx, Path::new(&root)).into_iter().filter(|(_, t)| !t.exists()).collect();
+    let first = missing.first()?;
+    Some((
+        missing.len(),
+        root.clone(),
+        format!(
+            "{}: missing (Docker would create it root-owned) and {} director{} under {root} in all — nothing was pulled or started",
+            first.1.display(),
+            missing.len(),
+            if missing.len() == 1 { "y" } else { "ies" }
+        ),
+    ))
 }
 
 fn ensure_storage_dirs(ctx: &mut Ctx) {
@@ -8456,6 +8514,64 @@ mod sudo_seam_tests {
         assert_eq!(src.matches(raw).count(), 0, "a raw sudo command in onboard: build it with sudo_cmd / ctx_sudo");
         assert_eq!(src.matches(elevate).count(), 0, "the CA trust install elevates through the seam");
         assert!(!src.contains(ui_gate), "a per-site -n decided on the UI instead of the seam");
+    }
+
+    /// i276: the same unwritable storage root, hit by the storage step, its
+    /// summary and the services step's re-check, is ONE failure, the first.
+    #[test]
+    fn storage_is_one_failure_however_many_times_it_is_checked() {
+        let dir = std::env::temp_dir().join(format!("noo-i276-storage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("sudo");
+        crate::test_exec::write_exec(&fake, "#!/bin/sh\necho 'sudo: a password is required' >&2\nexit 1\n".to_string(), 0o755);
+        SUDO_BIN.with(|b| *b.borrow_mut() = Some(fake.clone()));
+
+        let g = crate::Globals { json: false, verbose: false, gateway_override: None, timeout_secs: None, token: None, quiet: true };
+        let ui = TerminalUi;
+        let mut ctx = crate::onboard::build_ctx(&g, &ui, true, false, crate::onboard::Skip::default());
+        ctx.env_path = dir.join(".env");
+        // /proc refuses mkdir even for root, so every target falls through to sudo.
+        let root = std::path::Path::new("/proc/noo-i276-data-root");
+        let first = super::create_storage_dirs(&mut ctx, root);
+        super::record_storage_summary_failure(&mut ctx, first, "/proc/noo-i276-data-root");
+        let second = super::create_storage_dirs(&mut ctx, root);
+        SUDO_BIN.with(|b| *b.borrow_mut() = None);
+
+        assert!(first > 0 && second > 0, "the targets must be refused for this test to prove anything");
+        let storage: Vec<_> = ctx.state.hard_failures.iter().filter(|f| f.starts_with("storage")).collect();
+        assert_eq!(storage.len(), 1, "{:?}", ctx.state.hard_failures);
+        assert!(storage[0].contains("sudo needs a password"), "the first failure is kept: {}", storage[0]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// i276: with a storage directory missing, the preflight refuses before
+    /// any pull, and the same answer gates the repair retry; with them all
+    /// present (or a dry run) it does not.
+    #[test]
+    fn a_missing_storage_directory_is_a_preflight_refusal() {
+        let g = crate::Globals { json: false, verbose: false, gateway_override: None, timeout_secs: None, token: None, quiet: true };
+        let ui = TerminalUi;
+        let mut ctx = crate::onboard::build_ctx(&g, &ui, true, false, crate::onboard::Skip::default());
+        let dir = std::env::temp_dir().join(format!("noo-i276-preflight-{}", std::process::id()));
+        let root = dir.join("data");
+        std::fs::create_dir_all(&dir).unwrap();
+        ctx.env_path = dir.join(".env");
+        std::fs::write(&ctx.env_path, format!("NOO_DATA_ROOT={}\n", root.display())).unwrap();
+
+        let (n, found_root, why) = super::storage_preflight_refusal(&ctx).expect("a missing data root must be refused");
+        assert!(n > 0 && found_root == root.display().to_string(), "{n} {found_root}");
+        assert!(why.contains("missing (Docker would create it root-owned)") && why.contains("nothing was pulled"), "{why}");
+
+        ctx.dry_run = true;
+        assert!(super::storage_preflight_refusal(&ctx).is_none(), "a dry run creates nothing and is never refused");
+        ctx.dry_run = false;
+
+        for (_, t) in super::storage_targets(&ctx, &root) {
+            std::fs::create_dir_all(t).unwrap();
+        }
+        assert!(super::storage_preflight_refusal(&ctx).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The real data-root step, `--ci`, the wizard sharing a terminal, and a
