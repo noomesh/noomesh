@@ -219,6 +219,14 @@ fn self_flagged() -> bool {
 // admits on), so a detailed answer IS the capability. A bare answer (an agent
 // that does not verify client certificates) keeps the bearer; no answer
 // leaves it too, and the probe is retried until the agent answers or beats.
+//
+// An address that reaches ANOTHER cluster's agent is not "no answer": in the
+// 0.6.14 rc.2 rehearsal a gateway with no NOO_GATEWAY_URL fell back to
+// `noo-controller`, which the host's tailnet DNS resolved to the live
+// controller, and the probe failed its handshake 30 times in silence. The
+// cluster CA check stops it before anything is sent, so this is not a leak;
+// it is a misconfiguration the operator could not see. A handshake that
+// fails on a certificate now says so ([`foreign_tls`]), once per interval.
 
 /// Map key for what the startup probe learned. Not a node id (node ids never
 /// start with a NUL); [`note`] for the self node replaces it.
@@ -256,11 +264,67 @@ pub(crate) async fn probe_self_agent(client: &reqwest::Client, base: &str) -> Op
     let mut u = reqwest::Url::parse(base.trim()).ok()?;
     u.set_path("/health");
     u.set_query(None);
-    let resp = client.get(u).timeout(std::time::Duration::from_secs(3)).send().await.ok()?;
+    let resp = match client.get(u).timeout(std::time::Duration::from_secs(3)).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn_if_foreign(base, &e);
+            return None;
+        }
+    };
     if !resp.status().is_success() {
         return None;
     }
     Some(self_agent_admits_leaf(&resp.json::<Value>().await.ok()?))
+}
+
+/// How often the not-this-cluster's-agent WARN repeats per address.
+const FOREIGN_SELF_AGENT_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Why a call to an agent failed on a certificate, if it did: the agent's
+/// certificate did not verify against this cluster's CA (or not for that
+/// name), or the agent refused this gateway's leaf. Either way the address
+/// reached something that is not this cluster's agent. `None` for every
+/// other failure (refused, timed out, reset): an agent that is merely down.
+pub(crate) fn foreign_tls(err: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut cur = Some(err);
+    while let Some(e) = cur {
+        // hyper hands the rustls error up inside an io::Error, whose
+        // `source()` skips the error it wraps: look inside it too.
+        let tls = e.downcast_ref::<rustls::Error>().or_else(|| {
+            e.downcast_ref::<std::io::Error>()
+                .and_then(|io| io.get_ref())
+                .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        });
+        match tls {
+            Some(t @ rustls::Error::InvalidCertificate(_)) => {
+                return Some(format!("its certificate did not verify against this cluster's CA ({t})"))
+            }
+            Some(
+                t @ rustls::Error::AlertReceived(
+                    rustls::AlertDescription::BadCertificate
+                    | rustls::AlertDescription::UnknownCA
+                    | rustls::AlertDescription::CertificateUnknown
+                    | rustls::AlertDescription::CertificateRequired,
+                ),
+            ) => return Some(format!("it refused this gateway's certificate ({t})")),
+            Some(_) => return None,
+            None => {}
+        }
+        cur = e.source();
+    }
+    None
+}
+
+/// The self agent's address reached another cluster's agent: say so.
+fn warn_if_foreign(base: &str, err: &reqwest::Error) {
+    let Some(why) = foreign_tls(err) else { return };
+    if crate::legacy_lanes::log_due(&format!("self_agent_foreign|{base}"), FOREIGN_SELF_AGENT_LOG_EVERY) {
+        tracing::warn!(
+            agent = %base,
+            "the self agent at {base} is not this cluster's agent: {why}. The probe carried no bearer. \
+             Fix: set NOO_GATEWAY_URL to this controller's tailnet address, or NOO_SELF_AGENT_URL to its agent"
+        );
+    }
 }
 
 /// Learn the self agent's credential before its first beat. The first try is
@@ -638,6 +702,32 @@ mod tests {
             note_self_probe(false);
             assert!(header_for_self("https://controller.tail:8081").is_none(), "nor the other way");
         });
+    }
+
+    /// The rc.2 rehearsal case: the self agent's address reaches another
+    /// cluster's agent. The handshake fails on its certificate, the probe
+    /// learns nothing, and the failure is told apart from an agent that is
+    /// merely down (which is not called foreign).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_self_agent_from_another_cluster_is_named_not_silent() {
+        use crate::tls::loopback_verification_tests::{issue, serve};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (ours, _) = issue("our cluster CA", "localhost");
+        let (_, foreign) = issue("another cluster CA", "localhost");
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(rustls::pki_types::CertificateDer::from(ours.cert.der().to_vec())).unwrap();
+        let cfg = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        let client = reqwest::Client::builder().tls_backend_preconfigured(cfg).build().unwrap();
+
+        // `serve` accepts two connections: one call here, one probe.
+        let base = format!("https://localhost:{}", serve(&foreign).await);
+        let err = client.get(format!("{base}/health")).send().await.unwrap_err();
+        let why = foreign_tls(&err).unwrap_or_else(|| panic!("a foreign CA's certificate must be named as such: {err:?}"));
+        assert!(why.contains("did not verify against this cluster's CA"), "{why}");
+        assert_eq!(probe_self_agent(&client, &base).await, None, "a foreign agent teaches the probe nothing");
+
+        let down = client.get("https://127.0.0.1:9/health").send().await.unwrap_err();
+        assert_eq!(foreign_tls(&down), None, "an agent that is down is not foreign: {down:?}");
     }
 
     #[test]
