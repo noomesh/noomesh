@@ -21,6 +21,9 @@ func clearImageEnv(t *testing.T) {
 	for _, k := range []string{"NOO_IMAGE_SOURCE", "NOO_IMAGE_PREFIX", "NOO_IMAGE_TAG", "VLLM_IMAGE", "OLLAMA_IMAGE", "NOO_MODEL_CACHE_URL", preseed.OllamaRegistryPullEnv} {
 		t.Setenv(k, "")
 	}
+	// Rail is the default; these cases model a registry node, which is an
+	// explicit opt-out. Rail cases set NOO_IMAGE_SOURCE=rail themselves.
+	t.Setenv("NOO_IMAGE_SOURCE", "legacy")
 }
 
 // The floating defaults are gone: nothing in the specs resolves to :latest

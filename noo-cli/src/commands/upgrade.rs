@@ -4395,19 +4395,19 @@ pub(crate) fn hold_line(current: &str, newest: &str, holds: &[(String, String)])
 enum LockStageVerdict {
     /// Staged clean (or never staged): roll.
     Clean,
-    /// Failures, but nothing depends on them yet (no online node on
-    /// NOO_IMAGE_SOURCE=rail), or the operator passed --force: roll, and say
-    /// so loudly with the images and the remedy.
+    /// Failures, but nothing depends on them yet (no online Linux node will
+    /// run the rail after this roll), or the operator passed --force: roll,
+    /// and say so loudly with the images and the remedy.
     Warn(String),
     /// Failures and at least one online rail node: refuse unless --force.
     Refuse(String),
 }
 
-/// The pure decision. `rail_nodes` are online nodes reporting
-/// `image_source_mode=rail` — only they pull from the rail, so only they make
-/// a failed stage a reason to stop. While every node is on `legacy` (the
-/// default for the release that ships the rail) a controller-disk or
-/// registry blip must not block upgrades.
+/// The pure decision. `rail_nodes` are the online nodes that will pull from
+/// the rail after this roll (see [`rail_node_ids`]), so a failed stage is a
+/// reason to stop. Only a fleet where every Linux node chose
+/// `NOO_IMAGE_SOURCE=legacy` explicitly lets a controller-disk or registry
+/// blip pass with a warning.
 fn lock_stage_verdict(failed: &[String], rail_nodes: &[String], force: bool) -> LockStageVerdict {
     if failed.is_empty() {
         return LockStageVerdict::Clean;
@@ -4419,7 +4419,7 @@ fn lock_stage_verdict(failed: &[String], rail_nodes: &[String], force: bool) -> 
     );
     if rail_nodes.is_empty() {
         return LockStageVerdict::Warn(format!(
-            "{what} — no online node runs NOO_IMAGE_SOURCE=rail, so nothing pulls them yet; rolling nodes"));
+            "{what} — every online node chose NOO_IMAGE_SOURCE=legacy explicitly (or runs no containers), so nothing pulls them from the rail; rolling nodes"));
     }
     let who = format!("online rail node(s) {} cannot pull them", rail_nodes.join(", "));
     if force {
@@ -4428,16 +4428,34 @@ fn lock_stage_verdict(failed: &[String], rail_nodes: &[String], force: bool) -> 
     LockStageVerdict::Refuse(format!("{what} — {who}. Stage them first, or pass --force"))
 }
 
-/// Online nodes whose agent reports `image_source_mode=rail`. A gateway
-/// that cannot be asked yields none (the gateway wait above already passed).
-fn online_rail_nodes(g: &Globals) -> Vec<String> {
-    crate::http::get_json_opt(g, "/api/cluster/nodes", true, 10)
-        .and_then(|b| b["nodes"].as_array().cloned())
-        .unwrap_or_default()
+/// The online (or busy) nodes that will take images from the rail once this
+/// roll has run: every online Linux node except one that reports
+/// `image_source_mode=legacy` AND `image_source_mode_source=env` (it chose
+/// legacy). A node that reports no `image_source_mode_source` is an agent
+/// from before the flip: it becomes rail on this roll, so it counts, whatever
+/// mode it reports today. Darwin nodes and companions start no containers
+/// and never count. A node that reports no OS is counted (refuse, not skip).
+fn rail_node_ids(nodes: &[serde_json::Value]) -> Vec<String> {
+    nodes
         .iter()
-        .filter(|n| n["status"].as_str() == Some("online") && n["image_source_mode"].as_str() == Some("rail"))
+        .filter(|n| matches!(n["status"].as_str(), Some("online") | Some("busy")))
+        .filter(|n| !super::cluster_provision::is_companion(n))
+        .filter(|n| {
+            let os = n["capabilities"]["os"].as_str().or_else(|| n["os"].as_str()).unwrap_or("");
+            !matches!(os.trim().to_ascii_lowercase().as_str(), "darwin" | "macos" | "osx")
+        })
+        .filter(|n| !(n["image_source_mode"].as_str() == Some("legacy") && n["image_source_mode_source"].as_str() == Some("env")))
         .filter_map(|n| n["id"].as_str().or_else(|| n["node_id"].as_str()).map(str::to_string))
         .collect()
+}
+
+/// The online nodes that will run the rail after this roll. A gateway that
+/// cannot be asked yields none (the gateway wait above already passed).
+fn online_rail_nodes(g: &Globals) -> Vec<String> {
+    let nodes = crate::http::get_json_opt(g, "/api/cluster/nodes", true, 10)
+        .and_then(|b| b["nodes"].as_array().cloned())
+        .unwrap_or_default();
+    rail_node_ids(&nodes)
 }
 
 /// Applies the verdict: None to roll (after a loud warning when there is
@@ -4764,14 +4782,42 @@ mod tests {
         use super::{lock_stage_verdict, LockStageVerdict};
         assert_eq!(lock_stage_verdict(&[], &[], false), LockStageVerdict::Clean);
         let f = vec!["reg/a/llamacpp:v1 (amd64): docker pull: timeout".to_string()];
-        // Every node on legacy (the default this release): warn, roll.
+        // No node will run the rail (all explicit legacy): warn, roll.
         match lock_stage_verdict(&f, &[], false) {
             LockStageVerdict::Warn(m) => {
                 assert!(m.contains("reg/a/llamacpp:v1") && m.contains("noo cluster sync-images --stage-only --lock"), "{m}");
-                assert!(m.contains("no online node runs NOO_IMAGE_SOURCE=rail"), "{m}");
+                assert!(m.contains("chose NOO_IMAGE_SOURCE=legacy explicitly"), "{m}");
             }
             other => panic!("legacy fleet must warn, not refuse: {other:?}"),
         }
+    }
+
+    #[test]
+    fn rail_nodes_are_online_linux_nodes_not_explicitly_on_legacy() {
+        use super::{lock_stage_verdict, rail_node_ids, LockStageVerdict};
+        let nodes = vec![
+            // Pre-flip agent reporting legacy with no source: becomes rail on this roll.
+            serde_json::json!({"id": "old-legacy", "status": "online", "image_source_mode": "legacy", "capabilities": {"os": "linux"}}),
+            // No image_source_mode at all (oldest agent) and no os: counted.
+            serde_json::json!({"id": "oldest", "status": "online"}),
+            // Already rail by default.
+            serde_json::json!({"id": "new-default", "status": "online", "image_source_mode": "rail", "image_source_mode_source": "default", "capabilities": {"os": "linux"}}),
+            // Chose legacy: stays out.
+            serde_json::json!({"id": "chose-legacy", "status": "online", "image_source_mode": "legacy", "image_source_mode_source": "env", "capabilities": {"os": "linux"}}),
+            // Darwin never counts, however it reports.
+            serde_json::json!({"id": "mac", "status": "online", "image_source_mode": "legacy", "capabilities": {"os": "darwin"}}),
+            serde_json::json!({"id": "mac2", "status": "online", "os": "macos"}),
+            // Offline never counts.
+            serde_json::json!({"id": "off", "status": "offline", "image_source_mode": "rail", "capabilities": {"os": "linux"}}),
+        ];
+        let ids = rail_node_ids(&nodes);
+        assert_eq!(ids, vec!["old-legacy", "oldest", "new-default"]);
+        // The headline: nobody reports rail yet, one online pre-flip Linux node: refuse.
+        let only_old = &nodes[..1];
+        let f = vec!["reg/a/llamacpp:v1 (amd64): timeout".to_string()];
+        assert!(matches!(lock_stage_verdict(&f, &rail_node_ids(only_old), false), LockStageVerdict::Refuse(m) if m.contains("old-legacy")));
+        // A fleet of explicit-legacy and Mac nodes only warns.
+        assert!(matches!(lock_stage_verdict(&f, &rail_node_ids(&nodes[3..5]), false), LockStageVerdict::Warn(_)));
     }
 
     #[test]

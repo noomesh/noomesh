@@ -309,7 +309,7 @@ controller sends each node the digest-pinned ref from the release-signed
 node refuses `:latest` and untagged refs outright, and on a dist node
 refuses a ref with no digest: a controller too old to send one leaves the
 node on its versioned default, which a registry node refuses (with the
-controller roll that fixes it) and a `NOO_IMAGE_SOURCE=rail` node runs only
+controller roll that fixes it) and a `rail` node (the default) runs only
 if the controller staged that image (`noo cluster sync-images <node> -i
 <image>`), since the rail verifies the tar against the gateway's manifest.
 On a rail node the image never comes from a registry.
@@ -318,7 +318,7 @@ On a rail node the image never comes from a registry.
 
 | When | What | How |
 |---|---|---|
-| `noo upgrade` (stack stage, after the roll; a stage with failures warns loudly, and blocks the `--nodes` roll unless `--force` only while some online node runs `NOO_IMAGE_SOURCE=rail`) | every node-bound image in the release-signed `stack.lock` (not `gateway`, `worker`, `trellion*`, `postgres-pgvector`, `deps-*`) | pulled **by lock digest**, for every architecture in the fleet |
+| `noo upgrade` (stack stage, after the roll; a stage with failures warns loudly, and blocks the `--nodes` roll unless `--force` while any online Linux node will run the rail after the roll: every one except a node that set `NOO_IMAGE_SOURCE=legacy` itself, and including an older agent that becomes rail on this roll) | every node-bound image in the release-signed `stack.lock` (not `gateway`, `worker`, `trellion*`, `postgres-pgvector`, `deps-*`) | pulled **by lock digest**, for every architecture in the fleet |
 | `noo cluster sync-images --stage-only [--lock] [-i IMG]… [--arch a,b] [--all-images]` | the lock (default) and/or named images | same; `--all-images` stages the controller-only lock images too; stops after staging, no node pulls |
 | `noo cluster sync-images <node> -i IMG` (or `--lock <node>` for the lock's node-bound images) | a named image, for that node's architecture | then asks the node's agent to pull it now |
 | `noo cluster place …` refused with "not staged" | the placement's image | stages it, then places again |
@@ -349,13 +349,26 @@ multi-GB hash happens then and not inside a node's 15-second probe.
 
 ### What a node does
 
-**Rollout switch: `NOO_IMAGE_SOURCE=rail|legacy`** (node env,
-`/etc/noo-node-agent.env`). The first release that ships this defaults to
-`legacy`: a local image is used and an absent one comes from its registry,
-exactly as before — but the controller still stages, the heartbeat still
-reports provenance and `noo cluster verify` still shows its rows (as
-information, not warnings). Turn `rail` on one node at a time; the steps
-below are what `rail` does.
+**Per-node switch: `NOO_IMAGE_SOURCE=legacy`** (node env,
+`/etc/noo-node-agent.env`). The rail is the default: unset, empty or any
+unrecognised value means `rail` (a typo fails closed toward the rule that
+images come from the controller). Setting `legacy` opts one node out: a
+local image is used and an absent one comes from its registry, the pre-rail
+behaviour. The heartbeat reports `image_source_mode` and
+`image_source_mode_source` (`env` when the variable is set to a recognised
+value, `default` otherwise); `noo cluster verify` WARNs on a node that chose
+legacy and says how to remove it. The steps below are what `rail` does.
+
+*Rollout.* The release that made `rail` the default changes the start path
+of every Linux backend: an image the node does not hold and the controller
+has not staged for its architecture is refused instead of pulled. So
+`noo upgrade` counts, before rolling nodes, every online Linux node that will
+run the rail after the roll (all but those that chose `legacy`, and including
+older agents that report no `image_source_mode_source`), and a failed stage of
+the release images refuses the node roll unless `--force`. Darwin nodes start
+no containers and are unaffected. After the roll, check awolf (largest image
+set) and robopi (arm64) with `noo cluster verify`: `image sources` should
+read all from the rail, with third-party `registry` entries accepted.
 
 Every container start path in the agent — backends, the stunnel sidecar,
 the containers API, MCP stdio servers, skills, the profile pull — resolves
@@ -399,7 +412,7 @@ The agent's only registry pull is that fallback; a test
   whose image is not staged for the node's architecture).
 - The gateway refuses a running placement on a `rail` node whose image it
   can name and that is not staged (`409 image X for <arch> is not staged on
-  the controller`), unless `--force`; on a `legacy` node it is a warning.
+  the controller`), unless `--force`; on a node that chose `legacy` it is a warning.
   `noo cluster place` stages the image and places again on that refusal.
 
 ## Push GGUF weights to nodes by hand
@@ -444,7 +457,7 @@ Create it with `noo heartbeat` like any other task; see
 | `HF_HUB_OFFLINE=1` | injected into the backend container | Set only after a successful HF preseed |
 | `NOO_OLLAMA_REGISTRY` | the CLI's environment on the controller | Base URL `noo models fetch ollama:<tag>` reads manifests and blobs from (default `https://registry.ollama.ai`); for a mirror |
 | `NOO_ALLOW_OLLAMA_REGISTRY_PULL` | node-agent env | `1` lets that node `ollama pull` a tag the controller has not staged (default: refused on a placed node) |
-| `NOO_IMAGE_SOURCE` | node-agent env | `legacy` (default this release: pre-rail behaviour) or `rail` (everything above) |
+| `NOO_IMAGE_SOURCE` | node-agent env | `rail` (default; everything above) or `legacy` (per-node opt-out: the pre-rail behaviour) |
 | `NOO_IMAGE_REGISTRY_FALLBACK` | node-agent env | `public` (default) or `off`: may a third-party image the controller has not staged come from its public registry. Our own images are rail-only under both |
 
 Code: `docker/model-cache.nginx.conf`, `node-agent-go/internal/preseed/`,
