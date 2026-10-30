@@ -4621,6 +4621,14 @@ impl ProvisionOutcome {
     pub(crate) fn is_success(&self) -> bool {
         matches!(self, ProvisionOutcome::InUse)
     }
+
+    /// The process exit: 0 for `InUse` and for `InstalledNotYetUsed` (an idle
+    /// consumer is not a failed command; the `!` note still says it has not
+    /// presented the key), 1 for every real failure. `is_success` stays
+    /// strict - it gates retiring the old key on a rotation.
+    pub(crate) fn exits_zero(&self) -> bool {
+        matches!(self, ProvisionOutcome::InUse | ProvisionOutcome::InstalledNotYetUsed)
+    }
 }
 
 /// The decision, pure so every branch can be pinned without a gateway.
@@ -7709,6 +7717,17 @@ mod provision_tests {
 
     /// Only one of four outcomes is success. Three of them LOOK like success
     /// if you check only the step you just ran, which is why each is named.
+    #[test]
+    fn an_idle_consumer_exits_zero_and_every_real_failure_exits_one() {
+        use ProvisionOutcome as O;
+        assert!(O::InUse.exits_zero());
+        assert!(O::InstalledNotYetUsed.exits_zero());
+        assert!(!O::InstalledNotYetUsed.is_success(), "still not proven in use");
+        for o in [O::MintedThenRevoked, O::StoredNotRecreated, O::MintedNotStored] {
+            assert!(!o.exits_zero(), "{o:?} is a real failure");
+        }
+    }
+
     #[test]
     fn exactly_one_outcome_is_success() {
         assert!(classify_provision(MintMode::Issue, true, true, true).is_success());

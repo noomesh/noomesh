@@ -2429,8 +2429,9 @@ pub fn security_service_key_self_revoke(g: &Globals, args: &[String]) -> Result<
 ///     the store and no container holds it, and the next reader of
 ///     `secrets audit` would assume it is live.
 ///   * everything works but nothing calls -> "installed, not yet in use",
-///     with a non-zero exit. A key that is stored but never presented is
-///     indistinguishable from no key at all (#258's rule, applied to a mint).
+///     with exit 0 and a `!` note. A key that is stored but never presented is
+///     indistinguishable from no key at all (#258's rule, applied to a mint),
+///     so the note says so; an idle consumer is not a failed command.
 pub fn security_service_key_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut name: Option<String> = None;
     let mut scopes: Vec<String> = Vec::new();
@@ -2789,7 +2790,7 @@ fn finish(
             "success": outcome.is_success(),
             "detail": detail,
         }));
-        return Ok(if outcome.is_success() { 0 } else { 1 });
+        return Ok(if outcome.exits_zero() { 0 } else { 1 });
     }
     match outcome {
         O::InUse => {
@@ -2804,7 +2805,7 @@ fn finish(
             println!("{}", ui::status_line(Glyph::Warn, &format!(
                 "'{}' is installed but has NOT been presented yet", t.consumer)));
             println!("{}", ui::note(
-                "not a failure and not success. An idle consumer may not call for minutes; \
+                "not a failure and not success (exit 0). An idle consumer may not call for minutes; \
                  a misconfigured one never will, and the two look identical until it does",
             ));
             println!("{}", ui::hint("noo security service-key list"));
@@ -2837,7 +2838,7 @@ fn finish(
             println!("{}", ui::hint("noo stack restart --force"));
         }
     }
-    Ok(if outcome.is_success() { 0 } else { 1 })
+    Ok(if outcome.exits_zero() { 0 } else { 1 })
 }
 
 pub fn security_service_key_retire(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
