@@ -132,3 +132,48 @@ func TestOllamaIsNonRootEverywhere(t *testing.T) {
 		}
 	}
 }
+
+// The upstream fallback (root) writes root-owned blobs/manifests under parents
+// that stay 65532: the probe must still see them.
+func TestOllamaStoreProbeSeesRootFilesUnderOwnedParents(t *testing.T) {
+	const d = "/d"
+	owned := func() map[string]int {
+		return map[string]int{d: 65532, d + "/models": 65532, d + "/models/blobs": 65532,
+			d + "/models/manifests": 65532, d + "/models/blobs/sha256-aa": 65532,
+			d + "/models/manifests/registry.ollama.ai": 65532}
+	}
+	children := map[string][]string{
+		d + "/models/blobs":     {d + "/models/blobs/sha256-aa", d + "/models/blobs/sha256-bb"},
+		d + "/models/manifests": {d + "/models/manifests/registry.ollama.ai"},
+	}
+	prev := ollamaListDir
+	ollamaListDir = func(p string) []string { return children[p] }
+	t.Cleanup(func() { ollamaListDir = prev })
+
+	// all owned: nothing runs
+	u := owned()
+	u[d+"/models/blobs/sha256-bb"] = 65532
+	runs := fakeOwner(t, u)
+	if err := (&Client{}).ensureOllamaStoreOwned(context.Background(), d); err != nil || *runs != 0 {
+		t.Fatalf("all owned: err %v runs %d", err, *runs)
+	}
+	// owned top dirs + a root-owned blob: re-own runs once, then nothing
+	u = owned()
+	u[d+"/models/blobs/sha256-bb"] = 0
+	runs = fakeOwner(t, u)
+	for i := 0; i < 2; i++ {
+		if err := (&Client{}).ensureOllamaStoreOwned(context.Background(), d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if *runs != 1 {
+		t.Fatalf("root blob: runs %d, want 1", *runs)
+	}
+	// a root-owned manifest first-level entry
+	u = owned()
+	u[d+"/models/manifests/registry.ollama.ai"] = 0
+	runs = fakeOwner(t, u)
+	if err := (&Client{}).ensureOllamaStoreOwned(context.Background(), d); err != nil || *runs != 1 {
+		t.Fatalf("root manifest entry: err %v runs %d", err, *runs)
+	}
+}

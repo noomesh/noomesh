@@ -66,10 +66,33 @@ var (
 	}
 )
 
-// ollamaStoreNeedsReown: the store (or its models dir) exists and is not
-// owned by the non-root uid. A fresh, empty or already-owned store is left alone.
+// ollamaListDir lists a directory's direct children (full paths); a seam.
+var ollamaListDir = func(path string) []string {
+	ents, err := os.ReadDir(path)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(ents))
+	for _, e := range ents {
+		out = append(out, filepath.Join(path, e.Name()))
+	}
+	return out
+}
+
+// ollamaStoreNeedsReown: anything the probe sees in the store is not owned by
+// the non-root uid. It checks the store, models, models/blobs and
+// models/manifests, AND the direct children of blobs (flat) and manifests
+// (first level of the tree): the upstream fallback runs as root over this same
+// store and leaves root-owned files under parents that stay 65532, which the
+// non-root image could not delete or replace (`ollama rm`, a layer re-pull).
+// A fresh or empty store is left alone.
 func ollamaStoreNeedsReown(dir string) bool {
-	for _, p := range []string{dir, filepath.Join(dir, "models")} {
+	models := filepath.Join(dir, "models")
+	blobs, manifests := filepath.Join(models, "blobs"), filepath.Join(models, "manifests")
+	paths := []string{dir, models, blobs, manifests}
+	paths = append(paths, ollamaListDir(blobs)...)
+	paths = append(paths, ollamaListDir(manifests)...)
+	for _, p := range paths {
 		if uid, ok := ollamaOwnerUID(p); ok && uid != ollamaStoreUID {
 			return true
 		}
