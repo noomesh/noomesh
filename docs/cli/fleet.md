@@ -832,7 +832,7 @@ drain_started, drained_at}`.
 ### `noo inference` — Run prompts on the GPU cluster
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo inference run` | `<prompt> [-m <model>] [-n <node> [--strict-node]] [--raw] [-u <user>] [--max-tokens <n>] [-t <temperature>]` | Run one prompt through the gateway and print the response; without --raw the answer includes mesh context (RAG, memory, skills) |
+| `noo inference run` | `<prompt> [-m <model>] [-n <node> [--strict-node]] [--raw] [-u <user>] [--max-tokens <n>] [-t <temperature>]` | Run one prompt; --raw skips mesh context (RAG, memory, skills) |
 | `noo inference agent` | `<prompt>` | Run a prompt through the gateway agent runner and print the response |
 
 ### `noo jobs` — Job queue & scheduler management

@@ -231,7 +231,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["models", "switch"], "<model> [--backend <b>] [-y|--yes]", "Switch the active model: rewrites .env/noomesh.yaml, restarts; asks (-y)"),
     (&["models", "refresh"], "[--backend <b>] [--llm]", "Rebuild the model catalog cache from HuggingFace, bypassing the TTL"),
     (&["health"], "", "Probe gateway /health and report per-dependency state; exit 5 if degraded"),
-    (&["inference", "run"], "<prompt> [-m <model>] [-n <node> [--strict-node]] [--raw] [-u <user>] [--max-tokens <n>] [-t <temperature>]", "Run one prompt through the gateway and print the response; without --raw the answer includes mesh context (RAG, memory, skills)"),
+    (&["inference", "run"], "<prompt> [-m <model>] [-n <node> [--strict-node]] [--raw] [-u <user>] [--max-tokens <n>] [-t <temperature>]", "Run one prompt; --raw skips mesh context (RAG, memory, skills)"),
     (&["db", "status"], "", "Show gateway health and every migration stamp (mesh/trellion/evolve); --json supported"),
     (&["doctor", "docker"], "", "Detect unclean-shutdown docker damage (ghosts, empty names) and print recovery"),
     (&["doctor", "privileges"], "", "Report standing power on this box: sudoers drop-ins, gate binaries, SSH keys"),
