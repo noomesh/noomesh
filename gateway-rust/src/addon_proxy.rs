@@ -120,7 +120,7 @@
 //! scopes (the tier gate refuses a User's writes before a scope is asked).
 //!
 //! The tier gate in `auth.rs` asks [`mounted_get_allows`] for a User's GET so
-//! it answers at the front door; [`serve`] asks [`RouteSpec::permits`] again,
+//! it answers at the front door; [`serve`] asks [`RouteRole::permits`] again,
 //! which also covers `admin` routes (Operators pass the front door) and every
 //! alias. A requester with no `RequesterCtx` is a machine credential (cluster
 //! HMAC, service key) that the front door already admitted as trusted; it is
@@ -153,7 +153,7 @@
 //! the gateway's own bearer and the requester's identity, set here, never
 //! forwarded.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path as FsPath;
 use std::sync::{Arc, Mutex};
 
@@ -164,7 +164,6 @@ use axum::{
     routing::{delete, get, patch, post, put},
     Json, Router,
 };
-use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::state::AppState;
@@ -178,217 +177,41 @@ pub const BUNDLE_ROUTES_DIR: &str = "/opt/noo/addon-bundle-routes";
 /// path): `<ROUTES_DIR>/<addon>/routes.json`. Read only when the launcher
 /// delivered none under [`BUNDLE_ROUTES_DIR`].
 pub const ROUTES_DIR: &str = "/opt/noo/addon-routes";
-/// The file name inside an add-on's directory.
-pub const ROUTES_FILE: &str = "routes.json";
+// The manifest's types and every rule that refuses one live in the
+// `addon-manifest` crate, shared with `noo addons check` (noomesh-internal
+// i302). The ones gateway code names through this module are re-exported
+// here; the gateway is a binary, so an unused `pub use` fails clippy, and
+// anything else is named as `addon_manifest::…` where it is used.
+pub use addon_manifest::{AddonManifest, RouteSpec, TaskEventsSpec, UiSpec, DELEGATE_TASKS, METHOD_WS, ROUTES_FILE};
+pub(crate) use addon_manifest::container_of;
+use addon_manifest::{pattern_matches, ManifestRole};
 
-/// Routes the gateway calls by NAME from its own code. Each must be
-/// `internal` when an add-on declares it: the gateway decides when they run
-/// (`agent_meta_loop`, the console and CLI pieces it validates, the core
-/// `POST /api/prompt-skills/evolve`), and a public copy would let a caller
-/// reach them around that decision.
-pub const CALLED_BY_NAME: &[&str] = &[
-    "meta_loop_dispatch",
-    "console_piece",
-    "cli_piece",
-    "prompt_skills_evolve",
-];
-
-/// Gateway-owned namespaces no add-on route may be published under. Most
-/// would collide with a core route anyway; this also stops a STATIC add-on
-/// path from shadowing a core `{param}` route (e.g. its own
-/// `/api/addons/<id>/cli-piece`, which the gateway validates).
-pub const RESERVED_PREFIXES: &[&str] = &[
-    "/api/addons/",
-    "/api/auth",
-    "/api/security/",
-    "/api/config",
-    "/api/users",
-    "/api/v1/settings/",
-    "/api/cluster/",
-    "/api/logs/",
-    "/api/metrics/",
-    "/api/grafana-ds/",
-    // The harness task API: a delegated token is valid only on these
-    // routes, and every account may write its own tasks here, so an add-on
-    // path inside it would blur both rules.
-    "/api/tasks",
-];
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AddonManifest {
-    pub version: u32,
-    /// Must be the add-on the file was delivered for (a plain name,
-    /// [`crate::addon_registry::name_ok`]). The runtime registry
-    /// ([`crate::addon_registry`]) decides whether it is registered at all:
-    /// operator-enabled, and verified by the launcher.
-    pub addon: String,
-    pub base_url_env: String,
-    pub base_url_default: String,
-    #[serde(default = "default_timeout")]
-    pub timeout_secs: u64,
-    pub routes: Vec<RouteSpec>,
-    /// `"tasks"`: the add-on asks to act for a present person through that
-    /// person's own tasks (noomesh-internal i143). Declaring it does nothing
-    /// by itself: the operator must also enable it
-    /// (`addon_delegation.<name>.tasks`, see [`crate::addon_registry`]). The
-    /// only accepted value is `"tasks"`; [`validate`] refuses any other.
-    #[serde(default)]
-    pub delegate: Option<String>,
-    /// Where the gateway POSTs task events for this add-on. Valid only with
-    /// `delegate: "tasks"`, POST only, and never a public route of the same
-    /// manifest: it is reachable by the gateway, not through the front door.
-    #[serde(default)]
-    pub task_events: Option<TaskEventsSpec>,
-    /// The add-on's own web UI, served on an origin of its own
-    /// ([`crate::addon_ui`]). Absent: the add-on serves no UI.
-    #[serde(default)]
-    pub ui: Option<UiSpec>,
-}
-
-/// The manifest's `ui` key: `{"upstream_path": "/", "min_role": "user"}`.
-///
-/// On the add-on's own origin (`https://<host>:<its port>`), `/<rest>` is
-/// fetched from `<upstream><upstream_path>/<rest>` ([`crate::addon_ui`]).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UiSpec {
-    /// Where the add-on serves its UI on its own side: a plain path, no
-    /// `{param}`. Default `/`: the request path on the add-on origin is
-    /// forwarded as it is.
-    #[serde(default = "default_ui_upstream")]
-    pub upstream_path: String,
-    /// The lowest role that may load the UI. Absent means `operator`, as on
-    /// a route.
-    #[serde(default)]
-    pub min_role: Option<String>,
-    /// A label the console may show on its link. Plain text, at most 64
-    /// characters.
-    #[serde(default)]
-    pub title: Option<String>,
-    /// Per request (1–600); falls back to the manifest's.
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-    /// Free text, ignored.
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
-fn default_ui_upstream() -> String {
-    "/".into()
-}
-
-impl UiSpec {
-    /// Absent is `operator`; an unknown word (refused at load) is `admin`.
-    pub fn required_role(&self) -> crate::auth::Role {
-        match self.min_role.as_deref() {
-            None => crate::auth::Role::Operator,
-            Some(w) => parse_role(w).unwrap_or(crate::auth::Role::Admin),
+impl From<ManifestRole> for crate::auth::Role {
+    fn from(r: ManifestRole) -> Self {
+        match r {
+            ManifestRole::User => crate::auth::Role::User,
+            ManifestRole::Operator => crate::auth::Role::Operator,
+            ManifestRole::Admin => crate::auth::Role::Admin,
         }
     }
-
-    /// May a requester of `role` load this UI? A UI takes no scopes.
-    pub fn permits(&self, role: crate::auth::Role) -> bool {
-        role >= self.required_role()
-    }
 }
 
-/// The manifest's `task_events` route: `{"method": "POST", "path": "/..."}`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TaskEventsSpec {
-    pub method: String,
-    pub path: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RouteSpec {
-    /// Stable key for [`call`]. Internal callers name this instead of a path
-    /// literal, so a path change is one edit in one file.
-    pub name: String,
-    pub method: String,
-    pub path: String,
-    #[serde(default)]
-    pub aliases: Vec<String>,
-    /// `name -> format`: `uuid` (validated) or `string`.
-    #[serde(default)]
-    pub params: HashMap<String, String>,
-    #[serde(default)]
-    pub query: bool,
-    /// Reachable from gateway code only — never mounted on the public API.
-    #[serde(default)]
-    pub internal: bool,
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-    /// The lowest role that may call this public route: `user`, `operator` or
-    /// `admin`. Absent means `operator` (see "Who may call a route"). Kept as
-    /// the manifest's own word so an unknown value is refused by
-    /// [`validate`] with a sentence, not a serde variant error.
-    #[serde(default)]
-    pub min_role: Option<String>,
-    /// Add-on scopes (`<addon>:<word>`) that also open this GET route to a
-    /// requester holding `read` plus the scope, below `min_role`.
-    #[serde(default)]
-    pub scopes: Vec<String>,
-    /// Opt-in for a `POST` at `min_role: "user"`: the add-on promises to read
-    /// and write only rows owned by the account the gateway forwards in
-    /// `x-noo-requester-sub`. The gateway does NOT check that promise. Without
-    /// it a `POST` is `operator` or `admin` (see "Who may call a route").
-    #[serde(default)]
-    pub owner_scoped: bool,
-    /// This public route may be sent the add-on delegated task token
-    /// (noomesh-internal i143), so a manifest can keep the token off routes
-    /// that never need it (a GPU media route). Default false. Valid only when
-    /// the manifest declares top-level `delegate: "tasks"`, only on a public
-    /// route, and never on the `task_events` path. Declaring it grants
-    /// nothing by itself: see `AddonEntry::route_receives_delegation`.
-    #[serde(default)]
-    pub receives_delegation: bool,
-    /// `WS` routes only: the largest message (and frame) accepted in either
-    /// direction, in bytes. Default 1 MiB, at most 16 MiB.
-    #[serde(default)]
-    pub max_message_bytes: Option<usize>,
-    /// `WS` routes only: a socket with no frame in either direction for this
-    /// long is closed (1001). Default 300, 1–3600.
-    #[serde(default)]
-    pub idle_timeout_secs: Option<u64>,
-    /// `WS` routes only: how many sockets one account may hold open on this
-    /// route at once. Default 4, 1–64.
-    #[serde(default)]
-    pub max_connections_per_user: Option<u32>,
-    /// Free text for whoever reads the manifest. Ignored by the code.
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
-fn default_timeout() -> u64 {
-    300
-}
-
-/// The role a manifest word names; `None` for anything else.
-fn parse_role(word: &str) -> Option<crate::auth::Role> {
-    match word {
-        "user" => Some(crate::auth::Role::User),
-        "operator" => Some(crate::auth::Role::Operator),
-        "admin" => Some(crate::auth::Role::Admin),
-        _ => None,
-    }
-}
-
-impl RouteSpec {
+/// Who may call a public route, in the gateway's own [`crate::auth::Role`].
+pub trait RouteRole {
     /// The role this route needs. Absent is `operator`; an unknown word (which
     /// [`validate`] refuses at load, so only a hand-built spec can hold one)
     /// is `admin`, so a bad value can only ever shut a route, never open it.
-    pub fn required_role(&self) -> crate::auth::Role {
-        match self.min_role.as_deref() {
-            None => crate::auth::Role::Operator,
-            Some(w) => parse_role(w).unwrap_or(crate::auth::Role::Admin),
-        }
+    fn required_role(&self) -> crate::auth::Role;
+    /// May a requester of `role` holding `held` scopes call this route?
+    fn permits(&self, role: crate::auth::Role, held: &[String]) -> bool;
+}
+
+impl RouteRole for RouteSpec {
+    fn required_role(&self) -> crate::auth::Role {
+        self.manifest_role().into()
     }
 
-    /// May a requester of `role` holding `held` scopes call this route?
-    pub fn permits(&self, role: crate::auth::Role, held: &[String]) -> bool {
+    fn permits(&self, role: crate::auth::Role, held: &[String]) -> bool {
         if role >= self.required_role() {
             return true;
         }
@@ -397,68 +220,33 @@ impl RouteSpec {
     }
 }
 
-impl AddonManifest {
-    pub(crate) fn base_url(&self) -> String {
-        std::env::var(&self.base_url_env)
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| self.base_url_default.clone())
+/// Who may load an add-on's UI, in the gateway's own [`crate::auth::Role`].
+pub trait UiRole {
+    /// Absent is `operator`; an unknown word (refused at load) is `admin`.
+    fn required_role(&self) -> crate::auth::Role;
+    /// May a requester of `role` load this UI? A UI takes no scopes.
+    fn permits(&self, role: crate::auth::Role) -> bool;
+}
+
+impl UiRole for UiSpec {
+    fn required_role(&self) -> crate::auth::Role {
+        self.manifest_role().into()
     }
 
-    fn route(&self, name: &str) -> Option<&RouteSpec> {
-        self.routes.iter().find(|r| r.name == name)
+    fn permits(&self, role: crate::auth::Role) -> bool {
+        role >= self.required_role()
     }
 }
 
 // ── Validation ───────────────────────────────────────────────────────────
 
-const MAX_TIMEOUT_SECS: u64 = 600;
-const SAMPLE_PARAM: &str = "00000000-0000-0000-0000-000000000000";
-
-fn name_ok(s: &str) -> bool {
-    let b = s.as_bytes();
-    !b.is_empty()
-        && b.len() <= 64
-        && b[0].is_ascii_lowercase()
-        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_')
-}
-
-/// The `{param}` names of a path, or why its shape is refused.
-fn path_shape(path: &str) -> Result<Vec<String>, String> {
-    if !path.starts_with('/') || path.len() > 200 {
-        return Err(format!("path {path:?} must start with `/` and be at most 200 bytes"));
-    }
-    if path == "/" {
-        return Err("path `/` is not a route".into());
-    }
-    let mut params = Vec::new();
-    for seg in path[1..].split('/') {
-        if seg.is_empty() || seg == "." || seg == ".." {
-            return Err(format!("path {path:?} has an empty, `.` or `..` segment"));
-        }
-        if let Some(inner) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-            if !name_ok(inner) {
-                return Err(format!("path {path:?}: `{{{inner}}}` is not a plain parameter (no wildcards)"));
-            }
-            params.push(inner.to_string());
-        } else if !seg.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
-            return Err(format!("path {path:?}: segment {seg:?} may hold only [A-Za-z0-9._-]"));
-        }
-    }
-    Ok(params)
-}
-
-/// The path with every `{param}` filled, for asking the front door about it.
-fn sample_path(path: &str) -> String {
-    path.split('/')
-        .map(|seg| if seg.starts_with('{') { SAMPLE_PARAM } else { seg })
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 /// Would the front door let a User-tier caller (holding every scope a person
 /// can hold) make this request? A mutating add-on route must answer no.
-fn user_tier_could_call(method: &axum::http::Method, path: &str) -> bool {
+/// `path` comes with its `{param}`s already filled.
+fn user_tier_could_call(method: &str, path: &str) -> bool {
+    // A method the manifest rules accepted always parses; anything else is
+    // answered "callable", which refuses the manifest rather than mount it.
+    let Ok(method) = axum::http::Method::from_bytes(method.as_bytes()) else { return true };
     let user = crate::auth::RequesterCtx {
         sub: "addon-manifest-check".into(),
         scopes: ["read", "chat", "ingest", "graph"].iter().map(|s| s.to_string()).collect(),
@@ -466,409 +254,14 @@ fn user_tier_could_call(method: &axum::http::Method, path: &str) -> bool {
         harness: None,
         act: None,
     };
-    crate::auth::requester_allows(&user, method, &sample_path(path))
-}
-
-fn check_upstream(m: &AddonManifest, addon: &str) -> Result<(), String> {
-    // `-` is not legal in an environment variable name: `pai-voice` reads
-    // `NOO_PAI_VOICE_URL`. The container stays `noo-<addon>` verbatim.
-    let want_env = format!("NOO_{}_URL", addon.to_ascii_uppercase().replace('-', "_"));
-    if m.base_url_env != want_env {
-        return Err(format!(
-            "base_url_env is {:?}; an add-on's override variable is {want_env}",
-            m.base_url_env
-        ));
-    }
-    let host = container_of(addon);
-    let url = reqwest::Url::parse(&m.base_url_default)
-        .map_err(|e| format!("base_url_default {:?} is not a URL: {e}", m.base_url_default))?;
-    if url.scheme() != "https" {
-        return Err(format!(
-            "base_url_default {:?} must be https:// — add-on doors are mTLS, never plaintext",
-            m.base_url_default
-        ));
-    }
-    if url.host_str() != Some(host.as_str())
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || !matches!(url.path(), "" | "/")
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(format!(
-            "base_url_default {:?} must be https://{host}[:port] — the add-on's own service, \
-             no other host, credentials, path or query",
-            m.base_url_default
-        ));
-    }
-    Ok(())
-}
-
-/// `<addon>:<word>`: namespaced, so no add-on can declare a core scope.
-fn scope_ok(s: &str) -> bool {
-    let Some((addon, word)) = s.split_once(':') else { return false };
-    let plain = |t: &str| {
-        !t.is_empty() && t.len() <= 32 && t.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-    };
-    // The add-on part may hold `-` (`pai-voice:read`); a word never does.
-    let plain_addon = |t: &str| plain(&t.replace('-', "_"));
-    plain_addon(addon) && plain(word) && !word.contains(':')
-}
-
-/// Where every `WS` route of `addon` lives: `/ws/addons/<addon>/`. Under
-/// `/ws/` so a browser may hand its token over as `?token=` on the handshake
-/// (the front door accepts it nowhere else), and under the add-on's own name
-/// so it can never shadow a core socket (`/ws/agent`, `/ws/collab`, …).
-pub fn ws_prefix(addon: &str) -> String {
-    format!("/ws/addons/{addon}/")
-}
-
-/// The WS-only knobs are within range, and absent on any other method.
-fn check_ws_limits(r: &RouteSpec, ctx: &str) -> Result<(), String> {
-    let declared = r.max_message_bytes.is_some() || r.idle_timeout_secs.is_some() || r.max_connections_per_user.is_some();
-    if r.method != METHOD_WS {
-        if declared {
-            return Err(format!(
-                "{ctx}: max_message_bytes, idle_timeout_secs and max_connections_per_user apply to a \"WS\" route only"
-            ));
-        }
-        return Ok(());
-    }
-    if r.internal {
-        return Err(format!(
-            "{ctx}: a WS route cannot be internal — the gateway never opens a socket to an add-on by name"
-        ));
-    }
-    if let Some(n) = r.max_message_bytes {
-        if n == 0 || n > crate::addon_ws::MAX_MAX_MESSAGE_BYTES {
-            return Err(format!(
-                "{ctx}: max_message_bytes {n} outside 1..={}",
-                crate::addon_ws::MAX_MAX_MESSAGE_BYTES
-            ));
-        }
-    }
-    if let Some(t) = r.idle_timeout_secs {
-        if t == 0 || t > crate::addon_ws::MAX_IDLE_TIMEOUT_SECS {
-            return Err(format!(
-                "{ctx}: idle_timeout_secs {t} outside 1..={}",
-                crate::addon_ws::MAX_IDLE_TIMEOUT_SECS
-            ));
-        }
-    }
-    if let Some(c) = r.max_connections_per_user {
-        if c == 0 || c > crate::addon_ws::MAX_CONNECTIONS_PER_USER {
-            return Err(format!(
-                "{ctx}: max_connections_per_user {c} outside 1..={}",
-                crate::addon_ws::MAX_CONNECTIONS_PER_USER
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// The method word of a WebSocket route.
-pub const METHOD_WS: &str = "WS";
-
-/// The HTTP methods a route may declare, uppercase exactly. Every one but
-/// `GET` is a WRITE: it follows the rule a `POST` always has (operator or
-/// admin unless `owner_scoped`, no scopes, never where the front door admits a
-/// User).
-pub const HTTP_METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE"];
-
-/// Is this manifest method a write (`POST`, `PUT`, `PATCH`, `DELETE`)?
-pub fn is_write_method(method: &str) -> bool {
-    method != "GET" && method != METHOD_WS && HTTP_METHODS.contains(&method)
-}
-
-fn check_route(r: &RouteSpec) -> Result<(), String> {
-    let ctx = format!("route {:?}", r.name);
-    if !name_ok(&r.name) {
-        return Err(format!("{ctx}: names are [a-z][a-z0-9_]{{0,63}}"));
-    }
-    if !HTTP_METHODS.contains(&r.method.as_str()) && r.method != METHOD_WS {
-        return Err(format!(
-            "{ctx}: method {:?} — only GET, POST, PUT, PATCH and DELETE, or WS for a WebSocket \
-             route (PUT/PATCH/DELETE/WS need a gateway from the release that reads them)",
-            r.method
-        ));
-    }
-    check_ws_limits(r, &ctx)?;
-    if let Some(t) = r.timeout_secs {
-        if t == 0 || t > MAX_TIMEOUT_SECS {
-            return Err(format!("{ctx}: timeout_secs {t} outside 1..={MAX_TIMEOUT_SECS}"));
-        }
-    }
-    for (p, format) in &r.params {
-        if format != "uuid" && format != "string" {
-            return Err(format!("{ctx}: param {p:?} has format {format:?} — uuid or string"));
-        }
-    }
-    if let Some(word) = r.min_role.as_deref() {
-        let Some(role) = parse_role(word) else {
-            return Err(format!(
-                "{ctx}: min_role {word:?} is not a role — use \"user\", \"operator\" or \"admin\" \
-                 (an unknown value is refused, never read as user)"
-            ));
-        };
-        if is_write_method(&r.method) && role == crate::auth::Role::User && !r.owner_scoped {
-            return Err(format!(
-                "{ctx}: a {} cannot be min_role \"user\" — writes are operator or admin, the \
-                 front door refuses a User's writes and a manifest does not widen that. A route \
-                 whose add-on keeps every row to the calling account may declare \
-                 \"owner_scoped\": true (see \"Who may call a route\" in docs/development/addons.md)",
-                r.method
-            ));
-        }
-    }
-    if r.owner_scoped {
-        if !is_write_method(&r.method) || r.internal {
-            return Err(format!(
-                "{ctx}: owner_scoped applies to a public write route (POST, PUT, PATCH, DELETE) only"
-            ));
-        }
-        if r.min_role.as_deref() != Some("user") {
-            return Err(format!(
-                "{ctx}: owner_scoped is the opt-in for min_role \"user\" on a write; on any other \
-                 role it means nothing — remove it"
-            ));
-        }
-    }
-    if !r.scopes.is_empty() {
-        if r.method != "GET" {
-            return Err(format!("{ctx}: scopes open a GET route only — a scope never widens a write"));
-        }
-        if r.scopes.len() > 8 {
-            return Err(format!("{ctx}: at most 8 scopes per route"));
-        }
-        for sc in &r.scopes {
-            if !scope_ok(sc) {
-                return Err(format!(
-                    "{ctx}: scope {sc:?} must be `<addon>:<word>` ([a-z0-9_] words), so it can \
-                     never be a core scope (read, write, admin, graph, ingest, …)"
-                ));
-            }
-        }
-    }
-    let declared: HashSet<&str> = r.params.keys().map(String::as_str).collect();
-    for path in std::iter::once(&r.path).chain(r.aliases.iter()) {
-        let used = path_shape(path).map_err(|e| format!("{ctx}: {e}"))?;
-        let used: HashSet<&str> = used.iter().map(String::as_str).collect();
-        if used != declared {
-            return Err(format!(
-                "{ctx}: path {path:?} uses params {used:?} but the route declares {declared:?}"
-            ));
-        }
-        if r.internal {
-            continue;
-        }
-        if r.method == METHOD_WS {
-            // The add-on's own `/ws/addons/<addon>/` is checked by
-            // `validate`, which knows the add-on; nothing below applies to a
-            // socket (the handshake is a GET the handler gates itself).
-            if !path.starts_with("/ws/addons/") {
-                return Err(format!("{ctx}: a WS path {path:?} must live under /ws/addons/<addon>/"));
-            }
-            continue;
-        }
-        if !path.starts_with("/api/") {
-            return Err(format!("{ctx}: public path {path:?} must live under /api/"));
-        }
-        if let Some(p) = RESERVED_PREFIXES.iter().find(|p| path.starts_with(**p)) {
-            return Err(format!("{ctx}: public path {path:?} is inside the gateway's own {p} namespace"));
-        }
-        if r.method != "GET" && !r.owner_scoped {
-            let method = axum::http::Method::from_bytes(r.method.as_bytes()).expect("a validated HTTP method");
-            if user_tier_could_call(&method, path) {
-                return Err(format!(
-                    "{ctx}: {} {path:?} would be callable by a User-tier caller — an add-on \
-                     cannot place a write where the front door admits a User",
-                    r.method
-                ));
-            }
-        }
-    }
-    Ok(())
+    crate::auth::requester_allows(&user, &method, path)
 }
 
 /// Is this manifest acceptable for `addon`? `Err` names the first problem.
+/// The rules are [`addon_manifest::validate`]'s; the gateway answers the one
+/// question only it can, whether its front door admits a User at a write.
 pub fn validate(m: &AddonManifest, addon: &str) -> Result<(), String> {
-    if !crate::addon_registry::name_ok(addon) {
-        return Err(format!(
-            "{addon:?} is not a valid add-on name ({})",
-            crate::addon_registry::NAME_RULE
-        ));
-    }
-    if m.version != 1 {
-        return Err(format!("version {} — this gateway reads version 1", m.version));
-    }
-    if m.addon != addon {
-        return Err(format!("it names add-on {:?}, but was delivered for {addon:?}", m.addon));
-    }
-    check_upstream(m, addon)?;
-    if m.timeout_secs == 0 || m.timeout_secs > MAX_TIMEOUT_SECS {
-        return Err(format!("timeout_secs {} outside 1..={MAX_TIMEOUT_SECS}", m.timeout_secs));
-    }
-    if m.routes.is_empty() && m.ui.is_none() {
-        return Err("it declares no routes".into());
-    }
-    check_delegation(m)?;
-    if let Some(ui) = m.ui.as_ref() {
-        check_ui(ui)?;
-    }
-    let mut names = HashSet::new();
-    let mut mounted = HashSet::new();
-    for r in &m.routes {
-        if CALLED_BY_NAME.contains(&r.name.as_str()) && !r.internal {
-            return Err(format!(
-                "route {:?} must be internal: the gateway calls it by name and decides when it runs",
-                r.name
-            ));
-        }
-        check_route(r)?;
-        if r.method == METHOD_WS {
-            let want = ws_prefix(addon);
-            for path in std::iter::once(&r.path).chain(r.aliases.iter()) {
-                if !path.starts_with(&want) || path.len() == want.len() {
-                    return Err(format!(
-                        "route {:?}: WS path {path:?} must live under {want} (the add-on's own \
-                         socket namespace) with at least one segment after it",
-                        r.name
-                    ));
-                }
-            }
-        }
-        for sc in &r.scopes {
-            if sc.split(':').next() != Some(addon) {
-                return Err(format!(
-                    "route {:?}: scope {sc:?} must start with `{addon}:` — an add-on names only its own scopes",
-                    r.name
-                ));
-            }
-        }
-        if !names.insert(r.name.as_str()) {
-            return Err(format!("route name {:?} appears twice", r.name));
-        }
-        if !r.internal {
-            for path in std::iter::once(&r.path).chain(r.aliases.iter()) {
-                if !mounted.insert((r.method.as_str(), path.as_str())) {
-                    return Err(format!("{} {path:?} is declared twice", r.method));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// The `ui` key is acceptable: a plain upstream path, a known role, a sane
-/// timeout and a short plain title.
-fn check_ui(ui: &UiSpec) -> Result<(), String> {
-    if ui.upstream_path == "/" {
-        // The default: the add-on serves its UI from its root.
-    } else if !path_shape(&ui.upstream_path).map_err(|e| format!("ui.upstream_path: {e}"))?.is_empty() {
-        return Err(format!("ui.upstream_path {:?} takes no {{param}} segments", ui.upstream_path));
-    }
-    if let Some(word) = ui.min_role.as_deref() {
-        if parse_role(word).is_none() {
-            return Err(format!(
-                "ui.min_role {word:?} is not a role — use \"user\", \"operator\" or \"admin\" \
-                 (an unknown value is refused, never read as user)"
-            ));
-        }
-    }
-    if let Some(t) = ui.timeout_secs {
-        if t == 0 || t > MAX_TIMEOUT_SECS {
-            return Err(format!("ui.timeout_secs {t} outside 1..={MAX_TIMEOUT_SECS}"));
-        }
-    }
-    if let Some(title) = ui.title.as_deref() {
-        if title.trim().is_empty() || title.chars().count() > 64 || title.chars().any(|c| c.is_control() || c == '<' || c == '>') {
-            return Err(format!("ui.title {title:?} must be 1–64 plain characters (no control characters, no `<` `>`)"));
-        }
-    }
-    Ok(())
-}
-
-// ── Delegation keys ──────────────────────────────────────────────────────
-
-/// The only value `delegate` accepts.
-pub const DELEGATE_TASKS: &str = "tasks";
-
-/// Validate the manifest's `delegate` and `task_events` keys. `Err` is a
-/// sentence naming the key and what to change; nothing here mints or grants
-/// anything, it only decides whether the manifest is acceptable.
-fn check_delegation(m: &AddonManifest) -> Result<(), String> {
-    if let Some(d) = m.delegate.as_deref() {
-        if d != DELEGATE_TASKS {
-            return Err(format!(
-                "delegate {d:?} is not supported — the only value is \"{DELEGATE_TASKS}\" \
-                 (an unknown value is refused, never read as tasks)"
-            ));
-        }
-    }
-    for r in m.routes.iter().filter(|r| r.receives_delegation) {
-        if m.delegate.as_deref() != Some(DELEGATE_TASKS) {
-            return Err(format!(
-                "route {:?}: receives_delegation is valid only when the manifest declares \
-                 \"delegate\": \"{DELEGATE_TASKS}\" — add the delegate key or remove receives_delegation",
-                r.name
-            ));
-        }
-        if r.internal {
-            return Err(format!(
-                "route {:?}: receives_delegation applies to a public route; an internal route is \
-                 called by the gateway, which sends no delegated token",
-                r.name
-            ));
-        }
-        if let Some(ev) = m.task_events.as_ref() {
-            if std::iter::once(&r.path).chain(r.aliases.iter()).any(|p| *p == ev.path) {
-                return Err(format!(
-                    "route {:?}: receives_delegation is not allowed on the task_events path {:?} \
-                     (the gateway calls it, and it carries no delegated token)",
-                    r.name, ev.path
-                ));
-            }
-        }
-    }
-    let Some(ev) = m.task_events.as_ref() else { return Ok(()) };
-    if m.delegate.as_deref() != Some(DELEGATE_TASKS) {
-        return Err(format!(
-            "task_events is valid only with \"delegate\": \"{DELEGATE_TASKS}\" — without \
-             delegation nothing is ever sent there; add the delegate key or remove task_events"
-        ));
-    }
-    if ev.method != "POST" {
-        return Err(format!(
-            "task_events method {:?} — the gateway POSTs task events, so only \"POST\" is accepted",
-            ev.method
-        ));
-    }
-    let params = path_shape(&ev.path).map_err(|e| format!("task_events: {e}"))?;
-    if !params.is_empty() {
-        return Err(format!("task_events path {:?} takes no {{param}} segments", ev.path));
-    }
-    for r in m.routes.iter().filter(|r| !r.internal) {
-        for pat in std::iter::once(&r.path).chain(r.aliases.iter()) {
-            if pattern_matches(pat, &ev.path) {
-                return Err(format!(
-                    "task_events path {:?} equals or matches the public route {:?} ({}): it would \
-                     be reachable through the front door. Give task events a path no public route \
-                     of this manifest covers",
-                    ev.path, pat, r.name
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Does the route pattern `pat` (`{param}` segments match any non-empty
-/// segment) cover `path`? The one matcher the tier gate and the
-/// `task_events` check share.
-fn pattern_matches(pat: &str, path: &str) -> bool {
-    let p: Vec<&str> = pat.split('/').collect();
-    let segs: Vec<&str> = path.split('/').collect();
-    p.len() == segs.len() && p.iter().zip(&segs).all(|(a, b)| (a.starts_with('{') && !b.is_empty()) || a == b)
+    addon_manifest::validate(m, addon, addon_manifest::FrontDoor::Asks(&user_tier_could_call)).map(|_| ())
 }
 
 // ── Loading ──────────────────────────────────────────────────────────────
@@ -926,8 +319,7 @@ pub fn read_manifest_in(dirs: &[&FsPath], addon: &str, required: bool) -> Result
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(format!("add-on {addon:?}: cannot read its route manifest {}: {e}", path.display())),
         };
-        return serde_json::from_str::<AddonManifest>(&raw)
-            .map_err(|e| format!("not a valid manifest: {e}"))
+        return addon_manifest::parse(&raw)
             .and_then(|m| validate(&m, addon).map(|()| m))
             .map(Some)
             .map_err(|why| {
@@ -1468,12 +860,6 @@ pub(crate) fn caller_headers(requester: Option<&crate::auth::RequesterCtx>) -> V
 /// `receives_delegation`, for an add-on the operator enabled.
 pub(crate) fn mints_delegation(requester: Option<&crate::auth::RequesterCtx>, route_receives: bool, operator_enabled: bool) -> bool {
     route_receives && operator_enabled && requester.is_some_and(|r| r.act.is_none())
-}
-
-/// The container name an operator would `docker logs`. Kept alongside the
-/// add-on name so an unreachable-error names something they can act on.
-pub(crate) fn container_of(addon: &str) -> String {
-    format!("noo-{addon}")
 }
 
 /// What an internal caller got back.

@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
@@ -96,6 +97,11 @@ type Server struct {
 	// workloadOps overrides the docker client for the add-on workload
 	// actuator (tests only).
 	workloadOps workloadOps
+
+	// warmer sends one warm request per vLLM container start before the
+	// heartbeat reads it ready (backend_warm.go). Built on first use.
+	warmer   *backendWarmer
+	warmOnce sync.Once
 }
 
 // nativeBackends is the set served natively on this host, backend -> model.

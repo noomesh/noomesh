@@ -1080,10 +1080,8 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     };
     ui::done(&format!("registered as {}", resp["node_name"].as_str().or(cred.node.as_deref()).unwrap_or(&hostname)));
-    // The controller may still advertise a key (an older one always does).
-    // Read and ignore it: enrollment installs no key any more, and failing
-    // on a field we simply stopped using would be a pointless break.
-    let _ssh_key = resp["ssh_public_key"].as_str().unwrap_or("").to_string();
+    // An older controller still advertises `ssh_public_key`; it is ignored:
+    // enrollment installs no key (the `noo-gate` lane is retired).
     let bound_node = resp["node_name"]
         .as_str()
         .map(str::to_string)

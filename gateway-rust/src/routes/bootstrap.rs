@@ -11,9 +11,9 @@
 //! `noo enroll noo1.<blob>`). `noo enroll` POSTs the token to
 //! `POST /api/cluster/bootstrap`. On a valid,
 //! unused, unexpired, unrevoked token — from an allowed CIDR when one was set
-//! — the gateway marks the token used ATOMICALLY and returns the controller's
-//! SSH public key, IF one is configured; a standalone controller advertises
-//! none and the host enrols pull-only. From then on
+//! — the gateway marks the token used ATOMICALLY and returns the node's name
+//! and the controller URL (no SSH key: the `noo-gate` lane is retired, i98a);
+//! the host enrols pull-only. From then on
 //! `noo cluster provision <node>` stages a bundle the node collects.
 //!
 //! It also used to return `{user} ALL=(ALL) NOPASSWD:ALL` as a
@@ -203,59 +203,6 @@ fn cidr_contains(cidr: &str, ip: IpAddr) -> Option<bool> {
         // Family mismatch is a definite non-match, not a parse failure.
         _ => Some(false),
     }
-}
-
-/// The controller's SSH PUBLIC key, from the sources this container can
-/// actually read.
-///
-/// HONEST GAP, on record: NO container in this stack has a ~/.ssh mount
-/// any more — the cluster-executor sidecar that used to hold the operator's
-/// `${HOME}/.ssh` was deleted with the controller\u{2192}node SSH lane on
-/// 2026-09-11, so the PRIVATE half is nowhere in the deployment. Only the
-/// public half is needed here, to be installed on an enrolling node as the
-/// forced-command `noo-gate` entry (a lane nothing currently dials \u{2014}
-/// retired). It arrives
-/// via `NOO_CONTROLLER_SSH_PUBKEY` (config plane — a public key is not a
-/// secret), which the compose file passes through to the gateway env. The
-/// file candidates below exist for bare-metal / dev runs where the gateway
-/// process shares the operator's filesystem; in the container they simply
-/// don't resolve. When NO source yields a key, enrollment reports itself
-/// unconfigured (503) BEFORE looking at the token — never a fabricated key,
-/// and never a burned token.
-fn controller_ssh_pubkey() -> Option<String> {
-    let looks_like_pubkey =
-        |s: &str| s.starts_with("ssh-") || s.starts_with("ecdsa-") || s.starts_with("sk-");
-    if let Ok(v) = std::env::var("NOO_CONTROLLER_SSH_PUBKEY") {
-        let v = v.trim().to_string();
-        if looks_like_pubkey(&v) {
-            return Some(v);
-        }
-        if !v.is_empty() {
-            tracing::warn!(
-                "NOO_CONTROLLER_SSH_PUBKEY is set but does not look like an \
-                 OpenSSH public key (expected 'ssh-…'/'ecdsa-…'/'sk-…') — ignoring it"
-            );
-        }
-    }
-    // Same candidate order as noo-cli's `controller_ssh_pubkey()`
-    // (cluster_provision.rs): prefer modern key types.
-    let home = std::env::var("HOME").unwrap_or_default();
-    let mut dirs: Vec<String> = Vec::new();
-    if !home.is_empty() {
-        dirs.push(format!("{home}/.ssh"));
-    }
-    dirs.push("/root/.ssh".to_string());
-    for dir in dirs {
-        for name in ["id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub"] {
-            if let Ok(s) = std::fs::read_to_string(format!("{dir}/{name}")) {
-                let s = s.trim().to_string();
-                if looks_like_pubkey(&s) {
-                    return Some(s);
-                }
-            }
-        }
-    }
-    None
 }
 
 /// The controller URL the enrollment paste and the enrollment hint point at. Same
@@ -776,19 +723,9 @@ async fn cluster_bootstrap(
 ) -> AppResult {
     let peer_ip = peer.ip();
 
-    // Pull-era (first-contact finding #47): the controller SSH key is the
-    // GATE lane's prerequisite, not enrollment's — the bundle rides the
-    // pull channel and SSH is only the --via-gate fallback. The old hard
-    // requirement 500'd EVERY enrollment on a virgin standalone controller
-    // (which has no SSH keypair by design; live 2026-08-26, first node of
-    // the first standalone fleet). Absent key → enrollment proceeds
-    // pull-only; the response omits the key and the enroll script skips
-    // the pin step.
-    let ssh_pubkey = controller_ssh_pubkey();
-    if ssh_pubkey.is_none() {
-        tracing::info!(ip = %peer_ip,
-            "bootstrap: controller advertises no SSH key — pull-only enrollment (gate lane unavailable)");
-    }
+    // No controller SSH key is served (i98a): the forced-command `noo-gate`
+    // entry it was installed for is retired, and every enroller since the
+    // pull era reads the response without one.
 
     let deny = |reason: DenyReason, token_id: Option<uuid::Uuid>| {
         let db = state.db.clone();
@@ -944,7 +881,6 @@ async fn cluster_bootstrap(
     let gateway = controller_url();
     Ok(Json(json!({
         "status": "ok",
-        "ssh_public_key": ssh_pubkey,
         // The enrolling script substitutes its own user for {user}.
         "controller_url": gateway,
         "role_hint": role_hint,
@@ -1130,7 +1066,6 @@ async fn enroll_tailnet(
 
     Ok(Json(json!({
         "status": "ok",
-        "ssh_public_key": controller_ssh_pubkey(),
         "controller_url": controller_url(),
         "role_hint": "worker",
         "node_name": node_name,

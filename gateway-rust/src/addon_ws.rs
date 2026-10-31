@@ -67,19 +67,15 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::{self as ts, client::IntoClientRequest, protocol::WebSocketConfig};
 use tokio_tungstenite::WebSocketStream;
 
-use crate::addon_proxy::{AddonManifest, RouteSpec};
+use crate::addon_proxy::{AddonManifest, RouteRole, RouteSpec};
 use crate::state::AppState;
 
 /// Default largest message (and frame) in either direction.
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 1 << 20;
-/// The most a manifest may raise it to.
-pub const MAX_MAX_MESSAGE_BYTES: usize = 16 << 20;
 /// Default idle bound: no frame in either direction for this long closes.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
-pub const MAX_IDLE_TIMEOUT_SECS: u64 = 3600;
 /// Default sockets one account may hold open on one route.
 pub const DEFAULT_MAX_CONNECTIONS_PER_USER: u32 = 4;
-pub const MAX_CONNECTIONS_PER_USER: u32 = 64;
 /// TCP connect + TLS + WebSocket handshake to the add-on, at most.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long a close is given to reach each side before the sockets drop.

@@ -9,6 +9,8 @@ license = "AGPL-3.0-only"
 description = "Mesh Gateway — Rust implementation"
 
 [dependencies]
+# The add-on route manifest and its rules, shared with noo-cli (i302).
+addon-manifest = { path = "../crates/addon-manifest" }
 # Web framework
 axum = { version = "0.8", features = ["ws", "json", "multipart"] }
 axum-extra = { version = "0.12", features = ["cookie"] }
@@ -16,7 +18,7 @@ rand = "0.10"
 base64 = "0.23"
 # Intelligent-tier entitlement verification (entitlement.rs). Already in the
 # lock via nkeys, so this adds no new code to the trust boundary.
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 # Agent-message sealing: X25519 key agreement +
 # ChaCha20-Poly1305 AEAD. Pure Rust, same dalek family as the entitlement key.
 x25519-dalek = { version = "3", features = ["static_secrets"] }

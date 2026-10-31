@@ -611,6 +611,11 @@ struct Candidate {
     url: String,
     load: f64,
     excluded: bool,
+    /// The class table's health rule ([`super::classes::node_health`]):
+    /// heartbeat fresh, reachable, not quarantined or offline.
+    healthy: bool,
+    /// Why not, when not healthy.
+    health: String,
 }
 
 /// Has this backend already failed the current request? `exclude_urls` holds
@@ -693,6 +698,91 @@ pub fn backend_model_not_found(status: u16, body: &str, pin: &str, backend_url: 
     )))
 }
 
+// ── The static Ollama: ask what it holds before sending it a model ─────
+
+/// How long a positive answer from the static Ollama's `/api/tags` is
+/// trusted. Only a model FOUND in the cached list is served from cache; a
+/// model missing from it always re-asks, so a pull that just finished is
+/// seen on the next request.
+const STATIC_TAGS_TTL: Duration = Duration::from_secs(30);
+
+fn static_tags_cache() -> &'static Mutex<std::collections::HashMap<String, (Instant, Vec<String>)>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, (Instant, Vec<String>)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The model names in an Ollama `/api/tags` body (`{"models":[{"name":..}]}`).
+/// `None` when the body is not that shape, so an unreadable answer is never
+/// mistaken for "holds nothing".
+pub(crate) fn parse_ollama_tags(body: &Value) -> Option<Vec<String>> {
+    let models = body.get("models")?.as_array()?;
+    Some(
+        models
+            .iter()
+            .filter_map(|m| m.get("name").or_else(|| m.get("model")).and_then(Value::as_str))
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// What the static Ollama at `url` holds, or `None` when it could not be
+/// asked (unreachable, non-2xx, unreadable). `None` never refuses: a
+/// backend that cannot be asked is tried, and fails with its own error.
+async fn static_ollama_models(url: &str, model: &str) -> Option<Vec<String>> {
+    if let Ok(cache) = static_tags_cache().lock() {
+        if let Some((at, held)) = cache.get(url) {
+            if at.elapsed() < STATIC_TAGS_TTL && held.iter().any(|h| model_matches_pin(h, model)) {
+                return Some(held.clone());
+            }
+        }
+    }
+    let resp = crate::tls::cluster_client()
+        .get(format!("{url}/api/tags"))
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let held = parse_ollama_tags(&resp.json::<Value>().await.ok()?)?;
+    if let Ok(mut cache) = static_tags_cache().lock() {
+        cache.insert(url.to_string(), (Instant::now(), held.clone()));
+    }
+    Some(held)
+}
+
+/// The refusal for sending `model` to the static Ollama at `url` when that
+/// Ollama (which `held` lists, from its own `/api/tags`) does not have it,
+/// or `None` when it does. Names the model AND the backend, and the real
+/// commands that fix it. A vLLM/HF repo id (`Qwen/Qwen3-8B-AWQ`) is the
+/// usual case: the install's default model was the vLLM one, and the
+/// request used to hang to the global timeout on an Ollama that could never
+/// serve it (i263a).
+pub(crate) fn static_backend_refusal(model: &str, url: &str, held: &[String]) -> Option<ModelNotServed> {
+    if held.iter().any(|h| model_matches_pin(h, model)) {
+        return None;
+    }
+    let holds = if held.is_empty() {
+        "no models".to_string()
+    } else {
+        held.join(", ")
+    };
+    let fix = match held.first() {
+        Some(first) => format!(
+            "make a model it holds the default chat model (noo models switch {first} --backend ollama), \
+             or pull the one you want (noo models pull {model})"
+        ),
+        None => "pull a chat model (noo models pull gemma4:e2b) and make it the default \
+                 (noo models switch gemma4:e2b --backend ollama)"
+            .to_string(),
+    };
+    Some(ModelNotServed(format!(
+        "{}; the only chat backend is the Ollama at {url}, which holds {holds}. {fix}",
+        not_served_prefix(model)
+    )))
+}
+
 /// Apply an explicit model pin to the candidate list: keep only the backends
 /// that serve it, and refuse - naming who serves what - when none does.
 ///
@@ -735,6 +825,29 @@ fn apply_pin(all: &mut Vec<Candidate>, pin: &str) -> Result<(), String> {
 ///
 /// A function rather than four inline tuples so the ORDER can be tested. The
 /// ordering is what failed live, and nothing asserted it.
+/// The KV-scan sort: healthy first (185b: a node that died idle used to
+/// win on its last, low load until the KV entry expired), then exact model
+/// match, preferred backend, lower load.
+fn order_candidates(candidates: &mut [Candidate], target_model: &str, preferred: &str) {
+    candidates.sort_by_key(|c| {
+        let exact = !target_model.is_empty() && c.model_name == target_model;
+        (!c.healthy, sort_key(exact, c.backend_type == preferred, c.load))
+    });
+}
+
+/// `node: why` for each unhealthy candidate's node, once per node.
+fn unhealthy_summary(candidates: &[Candidate]) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    for c in candidates.iter().filter(|c| !c.healthy) {
+        if !seen.contains(&c.node_id.as_str()) {
+            seen.push(&c.node_id);
+            out.push(format!("{}: {}", c.node_id, c.health));
+        }
+    }
+    out.join("; ")
+}
+
 fn sort_key(exact_model: bool, preferred_type: bool, load: f64) -> (i32, i32, i32, i64) {
     (
         if exact_model { 0 } else { 1 },
@@ -948,6 +1061,7 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
     let non_chat = non_chat_backends(state).await?;
 
     let mut candidates: Vec<Candidate> = Vec::new();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
 
     if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
         if let Ok(keys) = kv.keys().await {
@@ -956,7 +1070,14 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
             for key in keys {
                 if let Ok(entry) = kv.get(&key).await {
                     if let Some(value) = entry {
-                        if let Ok(data) = serde_json::from_slice::<Value>(&value) {
+                        if let Ok(mut data) = serde_json::from_slice::<Value>(&value) {
+                            // Liveness (185b): the KV entry outlives a dead
+                            // node by its 120 s TTL, at whatever load it last
+                            // reported. The class table's rule decides, so a
+                            // pinned turn and raw chat agree on who is up.
+                            let inbound = crate::node_reachability::read_inbound(state, &key).await;
+                            crate::node_reachability::apply_inbound(&mut data, inbound.as_deref());
+                            let (healthy, health) = super::classes::node_health(&key, &data, now);
                             let node_load = data.get("load")
                                 .and_then(|l| l.as_f64())
                                 .map(|l| scale_checked_load(&key, l))
@@ -1015,6 +1136,8 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
                                             url,
                                                                             load: node_load,
                                             excluded,
+                                            healthy,
+                                            health: health.clone(),
                                         });
                                     }
                                 }
@@ -1040,23 +1163,27 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
             }
             return Err(if e.starts_with(&not_served_prefix(pin)) { anyhow::Error::new(ModelNotServed(e)) } else { anyhow::anyhow!(e) });
         }
+        // Every node serving the pin is down (stale heartbeat, unreachable,
+        // quarantined): the pin is a preference, so a live node answers,
+        // as it does when the pin is not served at all.
+        if !candidates.is_empty() && !candidates.iter().any(|c| c.healthy) {
+            let why = unhealthy_summary(&candidates);
+            if let Some(found) = unpinned_from_table(state, exclude_urls).await {
+                tracing::warn!(requested_model = pin, reason = %why, node = ?found.1, model = %found.0.model, "backend_preference_down_mesh_answers");
+                return Ok(found);
+            }
+        }
     } else {
         candidates.retain(|c| !c.excluded);
     }
 
     if !candidates.is_empty() {
-        // Sort by: exact model match → preferred backend → lower load
-        candidates.sort_by(|a, b| {
-            // Tier 0: exact model match (user requested specific model)
-            let a_exact = if !target_model.is_empty() && a.model_name == target_model { 0 } else { 1 };
-            let b_exact = if !target_model.is_empty() && b.model_name == target_model { 0 } else { 1 };
-            // Tier 1: preferred backend type
-            let a_backend = if a.backend_type == *preferred { 0 } else { 1 };
-            let b_backend = if b.backend_type == *preferred { 0 } else { 1 };
-            sort_key(a_exact == 0, a_backend == 0, a.load)
-                .cmp(&sort_key(b_exact == 0, b_backend == 0, b.load))
-        });
+        order_candidates(&mut candidates, target_model, preferred);
         let best = &candidates[0];
+        if !best.healthy {
+            // Nothing healthy anywhere: dial the best of the rest, and say so.
+            tracing::warn!(reason = %unhealthy_summary(&candidates), node = %best.node_id, "backend_resolved_only_unhealthy_candidates_left");
+        }
         // The candidate URL was built using the LOCAL Docker service name
         // (noo-vllm, noo-llamacpp) regardless of which node owns the
         // backend. Rewrite to the actual node IP if the chosen backend
@@ -1168,6 +1295,16 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
                     "No mesh backend and the static ollama at {url} has no model configured — \
                      set cluster.backends.ollama.model (noo onboard --only model)"
                 );
+            }
+            // Ask the Ollama what it holds before sending it a model: with no
+            // mesh chat backend this IS the chat path, and a model it cannot
+            // serve (the install's vLLM repo id) hung to the global timeout
+            // instead of answering (i263a). An unanswerable Ollama is tried.
+            if let Some(held) = static_ollama_models(&url, &model).await {
+                if let Some(refusal) = static_backend_refusal(&model, &url, &held) {
+                    tracing::warn!(url = %url, model = %model, "static_ollama_refused_unserved_model");
+                    return Err(refusal.into());
+                }
             }
             tracing::info!(
                 url = %url, model = %model, source = "static_ollama_url",
@@ -1289,6 +1426,8 @@ mod tests {
             url: format!("https://noo-{bt}:1"),
             load: 0.0,
             excluded,
+            healthy: true,
+            health: String::new(),
         }
     }
 
@@ -1323,6 +1462,45 @@ mod tests {
         let mut all = vec![cand("host3", "vllm", HF, false), cand("host8", "ollama", "llama3.2:1b", false)];
         let err = apply_pin(&mut all, PIN).unwrap_err();
         assert!(err.contains(PIN) && err.contains(&format!("host3=vllm:{HF}")) && err.contains("host8=ollama:llama3.2:1b"), "{err}");
+    }
+
+    // ── liveness (185b) ──────
+
+    /// A node that died idle kept its last, low load in the KV for up to
+    /// 120 s and won the sort. Healthy now comes before every other key.
+    #[test]
+    fn a_dead_node_with_a_low_load_does_not_win_the_sort() {
+        let mut dead = cand("host8", "ollama", PIN, false);
+        dead.healthy = false;
+        dead.health = "heartbeat 95s old".into();
+        let mut busy = cand("host8-ma", "ollama", PIN, false);
+        busy.load = 0.85;
+        let mut all = vec![dead, busy];
+        super::order_candidates(&mut all, PIN, "ollama");
+        assert_eq!(all[0].node_id, "host8-ma");
+        assert_eq!(super::unhealthy_summary(&all), "host8: heartbeat 95s old");
+    }
+
+    /// The KV scan reads health by the class table's rule, from the record's
+    /// own heartbeat stamp: one definition for both chat paths.
+    #[test]
+    fn the_kv_scan_reads_health_from_the_heartbeat_stamp() {
+        let now = 10_000.0;
+        let fresh = serde_json::json!({"id": "host8", "ip_address": "100.64.0.8", "last_heartbeat": now - 10.0});
+        assert_eq!(crate::coordinator::classes::node_health("host8", &fresh, now), (true, String::new()));
+        let stale = serde_json::json!({"id": "host8", "ip_address": "100.64.0.8", "last_heartbeat": now - 95.0});
+        let (ok, why) = crate::coordinator::classes::node_health("host8", &stale, now);
+        assert!(!ok && why.contains("heartbeat 95s old"), "{why}");
+        let quarantined = serde_json::json!({"id": "host8", "last_heartbeat": now, "status": "quarantined"});
+        assert!(!crate::coordinator::classes::node_health("host8", &quarantined, now).0);
+        let src = include_str!("backend.rs");
+        // The resolver's body only: up to its closing brace, not this test.
+        // (`\u{7d}` is a closing brace: a bare one in a string here unbalances the brace
+        // count tests/test_gateway_refuses_plaintext.py strips test modules by.)
+        let body = src.split("pub(crate) async fn resolve_backend_and_node(").nth(1).expect("resolver");
+        let body = body.split("\n\u{7d}\n").next().expect("resolver body");
+        assert!(body.contains("classes::node_health(&key, &data, now)"), "the KV scan must apply the shared health rule");
+        assert!(body.contains("order_candidates(&mut candidates"), "and sort by it");
     }
 
     // ── the static / discovery paths learn it from the backend (168) ──────
@@ -1716,6 +1894,66 @@ mod unpinned_tests {
         assert_eq!(next.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["pop-os"]);
         assert!(pick_unpinned(&t, &["https://192.0.2.212:8081".into(), "https://192.0.2.211:8081".into()]).is_none(),
             "nothing left: fall through to discovery / the static last resort");
+    }
+
+    // ── i263a: the static Ollama is asked what it holds ──
+
+    fn held(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_vllm_repo_id_is_refused_by_a_static_ollama_holding_only_tags() {
+        let r = super::static_backend_refusal(
+            "Qwen/Qwen3-8B-AWQ",
+            "https://noo-stunnel-ollama-embed:11434",
+            &held(&["gemma4:e2b", "nomic-embed-text:latest"]),
+        )
+        .expect("an Ollama that does not hold the model must refuse it");
+        let text = r.to_string();
+        assert!(text.starts_with(&super::not_served_prefix("Qwen/Qwen3-8B-AWQ")), "{text}");
+        assert!(text.contains("noo-stunnel-ollama-embed:11434"), "names the backend: {text}");
+        assert!(text.contains("gemma4:e2b"), "names what it holds: {text}");
+        assert!(text.contains("noo models switch gemma4:e2b --backend ollama"), "real remedy: {text}");
+    }
+
+    #[test]
+    fn a_tag_the_static_ollama_holds_is_not_refused() {
+        let h = held(&["gemma4:e2b", "qwen3:8b"]);
+        assert!(super::static_backend_refusal("gemma4:e2b", "http://o:11434", &h).is_none());
+        let h = held(&["gemma4:latest"]);
+        assert!(super::static_backend_refusal("gemma4", "http://o:11434", &h).is_none(), ":latest is the same model");
+    }
+
+    #[test]
+    fn an_empty_static_ollama_refuses_with_the_pull_remedy() {
+        let text = super::static_backend_refusal("gemma4:e2b", "http://o:11434", &[]).expect("holds nothing").to_string();
+        assert!(text.contains("holds no models"), "{text}");
+        assert!(text.contains("noo models pull gemma4:e2b"), "{text}");
+    }
+
+    #[test]
+    fn a_refusal_answers_404_like_every_other_unserved_model() {
+        let e: anyhow::Error = super::static_backend_refusal("x/y", "http://o", &[]).unwrap().into();
+        assert_eq!(super::resolve_failure_status(&e, 503), 404);
+    }
+
+    #[test]
+    fn tags_parse_to_names_and_an_unreadable_body_is_not_empty() {
+        let body = serde_json::json!({"models": [{"name": "gemma4:e2b"}, {"model": "qwen3:8b"}]});
+        assert_eq!(super::parse_ollama_tags(&body), Some(held(&["gemma4:e2b", "qwen3:8b"])));
+        assert_eq!(super::parse_ollama_tags(&serde_json::json!({"models": []})), Some(vec![]));
+        assert_eq!(super::parse_ollama_tags(&serde_json::json!({"error": "x"})), None);
+    }
+
+    #[test]
+    fn the_static_branch_asks_the_ollama_before_it_resolves() {
+        let src = include_str!("backend.rs");
+        let body = src.split("pub(crate) async fn resolve_backend_and_node(").nth(1).expect("resolver");
+        let ask = body.find("static_ollama_models(&url, &model)").expect("the static branch asks what the Ollama holds");
+        let resolved = body.find("source = \"static_ollama_url\"").expect("static resolution");
+        assert!(ask < resolved, "the check must come before the backend is returned");
+        assert!(body[ask..resolved].contains("static_backend_refusal"));
     }
 
     /// The unpinned branch runs BEFORE the KV scan, and the configured

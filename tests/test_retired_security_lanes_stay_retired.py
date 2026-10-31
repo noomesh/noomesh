@@ -43,6 +43,7 @@ NOT_DELIVERED = {
     "NOO_SELF_CALL_SHARED_SECRET": "retired bridge (#371): a shared secret never buys inference",
     "NOO_CLUSTER_TOKEN_V1": "retired gate: a v1 cluster token is always refused",
     "NOO_CLUSTER_TOKEN_SIGN": "retired agent pin: nodes sign v2 only",
+    "NOO_CONTROLLER_SSH_PUBKEY": "retired gate lane (i98a): no enroller pins a controller SSH key",
 }
 
 

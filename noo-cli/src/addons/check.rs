@@ -11,11 +11,16 @@
 //! are wrapped in the same [`Refusal`], so a bundle this accepts is one those
 //! two steps of enable accept, and the refusal text is enable's.
 //!
+//! `routes.json` is then checked by the gateway's own rules: the
+//! `addon-manifest` crate is compiled into both the gateway and this binary,
+//! so [`check_routes`] refuses what the gateway would refuse at load, with
+//! the gateway's sentence (noomesh-internal i302). One rule needs the
+//! gateway's front door (is a write route where a User may write?); every
+//! route it applies to is listed as not checked, never passed.
+//!
 //! Not covered, because they need what a directory does not have: the
 //! signature and file hashes of the lock, the trust key, the stack's base-image
-//! row, and the pull. `routes.json` is read only for the drain-route rule of
-//! `workloads.json`; the gateway validates the rest of it when it loads the
-//! manifest, and noo-cli has no validator of its own to call. The core's
+//! row, and the pull. The core's
 //! compose facts are the files embedded in this binary ([`Core::embedded`]),
 //! not a live install's, so an install with local compose edits can still
 //! refuse what this passes.
@@ -26,16 +31,29 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use addon_manifest::{FrontDoor, ROUTES_FILE};
+
 use super::guards::{self, Checked, Core};
 use super::resolve::Refusal;
 use super::{decls, trust};
 
+/// What a bundle directory that passed was checked for.
+#[derive(Debug)]
+pub struct DirChecked {
+    /// Enable's guard and resources checks ([`check_files`]).
+    pub guards: Checked,
+    /// `None`: the bundle ships no routes.json (the gateway mounts nothing
+    /// for it). `Some(rules)`: it passed the gateway's rules, except `rules`,
+    /// one sentence per route the front-door rule could not be applied to.
+    pub routes: Option<Vec<String>>,
+}
+
 /// What can still refuse a bundle this passes. Printed on every pass (and in
-/// `--json` as `not_checked`), so exit 0 means "passes enable's guard and
-/// resources checks" and nothing more. routes.json is listed rather than
-/// half-validated: the gateway's validator is the one definition of it.
+/// `--json` as `not_checked`), with the routes the front-door rule could not
+/// be applied to ([`DirChecked::routes`]), so exit 0 means "passes enable's
+/// guard and resources checks and the gateway's routes.json rules" and
+/// nothing more.
 pub const NOT_CHECKED: &[&str] = &[
-    "routes.json content (the gateway validates it on load)",
     "the lock's signature and file hashes",
     "the trust key",
     "the stack's base-image row",
@@ -86,16 +104,33 @@ pub fn check_files(addon: &str, files: &BTreeMap<String, Vec<u8>>, core: &Core) 
     guards::check_bundle_files(addon, files, super::resolve::third_party(addon), core).map_err(Refusal::Decl)
 }
 
-/// [`check_files`] over a bundle directory against the embedded core. `Err`
-/// is the text enable would print for the refusal (`Refusal::why`); a
-/// directory or core that cannot be read is an error in the same string form.
-pub fn check_dir_with(dir: &Path, addon: &str, core: &Core) -> Result<Checked, String> {
+/// The bundle's routes.json under the gateway's own rules
+/// (`addon_manifest::validate`, the function the gateway calls at load).
+/// `Ok(None)`: the bundle ships none. `Ok(Some(rules))`: valid, except
+/// `rules`, which only the gateway can decide (see [`DirChecked::routes`]).
+/// `Err` carries the gateway's sentence.
+pub fn check_routes(addon: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<Option<Vec<String>>, Refusal> {
+    let Some(raw) = files.get(ROUTES_FILE) else { return Ok(None) };
+    let refused = |why: String| Refusal::Decl(format!("{ROUTES_FILE} is refused as the gateway refuses it at load: {why}"));
+    let text = std::str::from_utf8(raw).map_err(|e| refused(format!("not UTF-8: {e}")))?;
+    let manifest = addon_manifest::parse(text).map_err(refused)?;
+    let checked = addon_manifest::validate(&manifest, addon, FrontDoor::NotHere).map_err(refused)?;
+    Ok(Some(checked.unchecked))
+}
+
+/// [`check_files`] and then [`check_routes`] over a bundle directory against
+/// the embedded core. `Err` is the text enable would print for the refusal
+/// (`Refusal::why`); a directory or core that cannot be read is an error in
+/// the same string form.
+pub fn check_dir_with(dir: &Path, addon: &str, core: &Core) -> Result<DirChecked, String> {
     let files = read_bundle_dir(dir)?;
-    check_files(addon, &files, core).map_err(|r| r.why(addon))
+    let guards = check_files(addon, &files, core).map_err(|r| r.why(addon))?;
+    let routes = check_routes(addon, &files).map_err(|r| r.why(addon))?;
+    Ok(DirChecked { guards, routes })
 }
 
 /// [`check_dir_with`] against the core embedded in this binary.
-pub fn check_dir(dir: &Path, addon: &str) -> Result<Checked, String> {
+pub fn check_dir(dir: &Path, addon: &str) -> Result<DirChecked, String> {
     let core = Core::embedded().map_err(|e| format!("add-on {addon} could not be checked: {e}"))?;
     check_dir_with(dir, addon, &core)
 }
@@ -130,18 +165,21 @@ mod tests {
     #[test]
     fn a_pass_names_what_it_did_not_check() {
         let all = NOT_CHECKED.join(" ");
-        for must in ["routes.json", "signature", "trust key", "base-image", "pull"] {
+        for must in ["signature", "trust key", "base-image", "pull"] {
             assert!(all.contains(must), "{must} missing from {all}");
         }
+        // routes.json is checked now (i302); listing it would understate the pass.
+        assert!(!all.contains("routes.json"), "{all}");
         let usage = crate::usage::USAGE.iter().find(|(w, _, _)| *w == ["addons", "check"]).expect("usage row");
-        assert!(usage.2.contains("not routes.json") && usage.2.contains("signature"), "{}", usage.2);
+        assert!(usage.2.contains("routes.json") && !usage.2.contains("not routes.json") && usage.2.contains("signature"), "{}", usage.2);
     }
 
     #[test]
     fn a_good_bundle_directory_passes_and_every_part_was_read() {
         let d = fixture_dir("good", "rhaddon");
         let c = check_dir_with(&d, "rhaddon", &core()).unwrap();
-        assert_eq!(c.mounts, 2, "the overlay and resources.json were both read");
+        assert_eq!(c.guards.mounts, 2, "the overlay and resources.json were both read");
+        assert_eq!(c.routes, Some(vec![]), "routes.json was read and nothing in it needs the front door");
         assert_eq!(name_of_dir(&d).unwrap(), "rhaddon");
         clean(&d);
     }
@@ -176,6 +214,63 @@ mod tests {
         let want = guards::check_bundle_files("rhaddon", &bad_files, true, &core()).unwrap_err();
         assert_eq!(e, Refusal::Decl(want).why("rhaddon"));
         assert!(e.contains("NOO_JWT_SECRET"), "{e}");
+        clean(&d);
+    }
+
+    /// routes.json is refused with the gateway's own sentence: the text is
+    /// `addon_manifest::validate`'s, the function the gateway runs at load.
+    /// Reverting `check_dir_with` to skip `check_routes` fails every case.
+    #[test]
+    fn a_bad_routes_json_gets_the_gateways_refusal() {
+        let d = fixture_dir("routes", "rhaddon");
+        let good: serde_json::Value = serde_json::from_slice(&std::fs::read(d.join("routes.json")).unwrap()).unwrap();
+        // What the case is, how it spoils the manifest, the refusal it earns.
+        type Case = (&'static str, fn(&mut serde_json::Value), &'static str);
+        let cases: [Case; 4] = [
+            ("unknown role", |m: &mut serde_json::Value| m["routes"][0]["min_role"] = "owner".into(), "min_role \"owner\" is not a role"),
+            ("wrong addon", |m: &mut serde_json::Value| m["addon"] = "other".into(), "it names add-on \"other\", but was delivered for \"rhaddon\""),
+            ("duplicate route", |m: &mut serde_json::Value| {
+                let first = m["routes"][0].clone();
+                m["routes"].as_array_mut().unwrap().push(first);
+            }, "route name \"status\" appears twice"),
+            ("no routes", |m: &mut serde_json::Value| m["routes"] = serde_json::json!([]), "it declares no routes"),
+        ];
+        for (what, edit, want) in cases {
+            let mut m = good.clone();
+            edit(&mut m);
+            let text = m.to_string();
+            std::fs::write(d.join("routes.json"), &text).unwrap();
+            let e = check_dir_with(&d, "rhaddon", &core()).unwrap_err();
+            let gateway = addon_manifest::validate(&addon_manifest::parse(&text).unwrap(), "rhaddon", FrontDoor::NotHere).unwrap_err();
+            assert!(gateway.contains(want), "{what}: {gateway}");
+            assert_eq!(e, Refusal::Decl(format!("{ROUTES_FILE} is refused as the gateway refuses it at load: {gateway}")).why("rhaddon"), "{what}");
+        }
+        // Not a manifest at all (an unknown key): serde's refusal, as the gateway logs it.
+        std::fs::write(d.join("routes.json"), r#"{"version":1,"addon":"rhaddon","routez":[]}"#).unwrap();
+        let e = check_dir_with(&d, "rhaddon", &core()).unwrap_err();
+        assert!(e.contains("not a valid manifest"), "{e}");
+        clean(&d);
+    }
+
+    /// The one rule that needs the gateway's front door is reported, per
+    /// route, as not checked: a public write never passes silently.
+    #[test]
+    fn a_public_write_is_listed_as_not_checked_never_passed() {
+        let d = fixture_dir("routes-write", "rhaddon");
+        let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(d.join("routes.json")).unwrap()).unwrap();
+        m["routes"].as_array_mut().unwrap().push(serde_json::json!({"name": "reset", "method": "POST", "path": "/api/rhaddon/reset"}));
+        std::fs::write(d.join("routes.json"), m.to_string()).unwrap();
+        let c = check_dir_with(&d, "rhaddon", &core()).unwrap();
+        let rules = c.routes.expect("routes.json was read");
+        assert_eq!(rules.len(), 1, "{rules:?}");
+        assert!(rules[0].contains("\"reset\"") && rules[0].contains("POST \"/api/rhaddon/reset\"") && rules[0].contains("front door"), "{}", rules[0]);
+        // With a front door to ask, the same rule decides instead of listing.
+        let parsed = addon_manifest::parse(&m.to_string()).unwrap();
+        let admits = |_: &str, _: &str| true;
+        let e = addon_manifest::validate(&parsed, "rhaddon", FrontDoor::Asks(&admits)).unwrap_err();
+        assert!(e.contains("would be callable by a User-tier caller"), "{e}");
+        let refuses = |_: &str, _: &str| false;
+        assert_eq!(addon_manifest::validate(&parsed, "rhaddon", FrontDoor::Asks(&refuses)).unwrap().unchecked, Vec::<String>::new());
         clean(&d);
     }
 

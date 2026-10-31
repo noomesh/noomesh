@@ -38,7 +38,7 @@ jobs:
   # (arch, linkage, embedded-assets sentinel, paired stack tag), and uploads
   # it; the release job below joins them.
   #
-  # All lanes run on GitHub-hosted runners (ubuntu-latest; macos-14 for the
+  # All lanes run on GitHub-hosted runners (ubuntu-latest; macos-15 for the
   # darwin lane). The gnu lanes apt-install cross toolchains and run host cargo,
   # which a hosted runner provides (passwordless sudo, rustup on PATH).
   # ── Tag window ────────────────────────────────────────────
@@ -134,9 +134,9 @@ jobs:
   build:
     needs: [tag-window]
     name: build (${{ matrix.target }})
-    # darwin builds need a real macOS runner (macos-14 is Apple Silicon and free
+    # darwin builds need a real macOS runner (macos-15 is Apple Silicon and free
     # for public repositories); every linux lane is ubuntu-latest.
-    runs-on: ${{ matrix.kind == 'darwin-host' && 'macos-14' || 'ubuntu-latest' }}
+    runs-on: ${{ matrix.kind == 'darwin-host' && 'macos-15' || 'ubuntu-latest' }}
     strategy:
       fail-fast: true
       matrix:
@@ -166,7 +166,7 @@ jobs:
           - target: aarch64-unknown-linux-musl
             kind: musl-zig
             want: static
-          # darwin arm64 — a NATIVE build on Apple Silicon (macos-14): `rustup
+          # darwin arm64 — a NATIVE build on Apple Silicon (macos-15): `rustup
           # target add` + `cargo build`, no cross toolchain and no docker.
           # `release` needs this job, so one failed lane blocks the whole
           # release, and a release without the darwin binaries would leave a
@@ -453,7 +453,7 @@ jobs:
   gateway:
     name: gateway (${{ matrix.target }})
     needs: [reuse-plan]
-    runs-on: ${{ matrix.kind == 'darwin-host' && 'macos-14' || 'ubuntu-latest' }}
+    runs-on: ${{ matrix.kind == 'darwin-host' && 'macos-15' || 'ubuntu-latest' }}
     env:
       REUSE: ${{ needs.reuse-plan.outputs.reuse }}
       RC_TAG: ${{ needs.reuse-plan.outputs.rc_tag }}

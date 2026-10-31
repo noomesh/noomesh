@@ -66,13 +66,15 @@ fi
 # Postgres, and the default bridge for the crates.io index (the compose DB
 # network has no outbound DNS — cargo fails with "Could not resolve host:
 # index.crates.io" there). So: start detached, attach the second network, exec.
+# The whole repo is mounted, not gateway-rust alone: the gateway has a path
+# dependency outside its directory (../crates/addon-manifest, i302).
 docker rm -f noo-sqlx-prepare >/dev/null 2>&1 || true
 docker run -d --name noo-sqlx-prepare \
   --network "$NETWORK" \
   -e DATABASE_URL="$DB_URL" \
-  -v "$REPO_ROOT/gateway-rust":/w -w /w \
+  -v "$REPO_ROOT":/repo -w /repo/gateway-rust \
   -v noo-sqlx-cargo:/usr/local/cargo/registry \
-  -v noo-sqlx-target:/w/target \
+  -v noo-sqlx-target:/repo/gateway-rust/target \
   "$CLI_IMAGE" sleep 7200 >/dev/null
 docker network connect bridge noo-sqlx-prepare
 trap 'docker rm -f noo-sqlx-prepare >/dev/null 2>&1 || true' EXIT

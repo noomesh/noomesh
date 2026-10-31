@@ -651,11 +651,11 @@ jobs:
             platforms: linux/amd64
             extra_args: ""
           # stunnel: the mTLS sidecar image (alpine + stunnel + openssl for
-          # the healthcheck). Built locally by every other stunnel-* service
-          # (inference-node profiles), but stunnel-ollama-embed fronts the
-          # standalone profile's embedder on EVERY standalone install, and a
-          # --dist install never builds — so it is published, from the
-          # ./docker context like nvidia-exporter.
+          # the healthcheck). Every stunnel-* door pulls this published image
+          # on dist installs (since #533): a --dist install never builds, and
+          # stunnel-ollama-embed fronts the standalone profile's embedder on
+          # EVERY standalone install. Published from the ./docker context like
+          # nvidia-exporter.
           #
           # Multi-arch (like node-agent): the node agent runs stunnel sidecars
           # beside the backends it starts, and some nodes are arm64 (host6

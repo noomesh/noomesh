@@ -6,7 +6,7 @@ Does not cover: the cron scheduler (`noo heartbeat`, under Stack & data) or the 
 
 ## Disambiguation
 
-- `noo chat` is a **conversation**: a streaming REPL (or one turn with `--message`) where every turn shares one conversation id. `noo inference run` (Fleet) is one prompt to one backend with no memory; `noo inference agent` is one prompt through the coordinator's tool loop.
+- `noo chat` is a **conversation**: a streaming REPL (or one turn with `--message`) where every turn shares one conversation id. `noo inference run` (Fleet) is one prompt to the gateway, with mesh context unless `--raw`; `noo inference agent` is one prompt through the coordinator's tool loop.
 - `noo agents collaborate` runs one task through several **roles** in sequence; `noo agents send`/`inbox`/`thread` are the agent-to-agent **message bus**; `noo agents peer …` is the A2A door for **external** agents.
 - `noo workflow run` executes a **named multi-step template** compiled into the gateway (`deep_research`, `code_development`, `data_analysis`) with per-step status.
 - `noo channels` inspects and tests the inbound/outbound **adapters** (Telegram, Google Chat, WhatsApp); `noo proactive` is the rule-triggered notifier that sends through them; `noo heartbeat` (Stack & data) is the cron scheduler that can also deliver to them.

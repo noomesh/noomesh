@@ -1324,6 +1324,35 @@ mod tests {
         }
     }
 
+    /// 217: the list says which question it answered. An owner-scoped
+    /// list with no thread filter says so; a thread filter is echoed.
+    #[test]
+    fn the_messages_list_echoes_the_filter_it_applied() {
+        let f = crate::repo::agent_messages::Filter {
+            agent: None,
+            owner: Some("rbwolf"),
+            node_prefix: None,
+            from: None,
+            to: None,
+            thread: None,
+            kind: None,
+            user: None,
+            node: None,
+            harness: None,
+            since: None,
+            unread_only: false,
+            reader: Some("rbwolf/claude-x"),
+            limit: 50,
+        };
+        assert_eq!(super::applied_filter(&f), json!({"scope": "own: rbwolf", "limit": 50}));
+        let f = crate::repo::agent_messages::Filter { thread: Some("thr_b"), unread_only: true, owner: None, ..f };
+        assert_eq!(super::applied_filter(&f), json!({"scope": "all", "thread": "thr_b", "unread": true, "limit": 50}));
+        let src = include_str!("agents.rs");
+        let body = src.split(["async fn ", "messages_list("].concat().as_str()).last().expect("route");
+        let body = &body[..body.find("\n\u{7d}").unwrap()];
+        assert!(body.contains("\"filter\": applied_filter(&filter)"), "the list response must carry the echo");
+    }
+
     /// presence `all=true` is gated on privilege and served by `live_all`.
     #[test]
     fn presence_all_is_operator_only() {
@@ -2310,30 +2339,68 @@ async fn messages_list(
         .map(|s| chrono::DateTime::parse_from_rfc3339(s).map(|t| t.with_timezone(&chrono::Utc)))
         .transpose()
         .map_err(|e| AppError::BadRequest(format!("since: {e}")))?;
-    let rows = crate::repo::agent_messages::list(
-        &state.db,
-        &crate::repo::agent_messages::Filter {
-            agent,
-            owner,
-            node_prefix,
-            from: q.from.as_deref(),
-            to: q.to.as_deref(),
-            thread: q.thread.as_deref(),
-            kind: q.kind.as_deref(),
-            user: q.user.as_deref(),
-            node: q.node.as_deref(),
-            harness: q.harness.as_deref(),
-            since,
-            unread_only: q.unread,
-            // Unread is per reader: this caller's own acks
-            // decide it, whatever a sibling window has done.
-            reader: reader.as_deref(),
-            limit: q.limit.unwrap_or(50),
-        },
-    )
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(Json(json!({ "messages": rows, "count": rows.len() })))
+    let filter = crate::repo::agent_messages::Filter {
+        agent,
+        owner,
+        node_prefix,
+        from: q.from.as_deref(),
+        to: q.to.as_deref(),
+        thread: q.thread.as_deref(),
+        kind: q.kind.as_deref(),
+        user: q.user.as_deref(),
+        node: q.node.as_deref(),
+        harness: q.harness.as_deref(),
+        since,
+        unread_only: q.unread,
+        // Unread is per reader: this caller's own acks
+        // decide it, whatever a sibling window has done.
+        reader: reader.as_deref(),
+        limit: q.limit.unwrap_or(50),
+    };
+    let rows = crate::repo::agent_messages::list(&state.db, &filter)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(json!({ "messages": rows, "count": rows.len(), "filter": applied_filter(&filter) })))
+}
+
+/// The question a list call actually answered (217): the scope it ran in
+/// and every filter applied, so a reader can see a filter that was not.
+/// `noo_agent_thread(thread_id=…)` once returned the caller's whole list
+/// under a thread's name; the door now refuses the unknown argument, and
+/// this echo shows any narrowing that did (or did not) reach the query.
+fn applied_filter(f: &crate::repo::agent_messages::Filter<'_>) -> Value {
+    let scope = if let Some(a) = f.agent {
+        format!("agent {a}")
+    } else if let Some(n) = f.node_prefix {
+        format!("node {n}")
+    } else if let Some(o) = f.owner {
+        format!("own: {o}")
+    } else {
+        "all".to_string()
+    };
+    let mut out = serde_json::Map::new();
+    out.insert("scope".into(), json!(scope));
+    for (k, v) in [
+        ("from", f.from),
+        ("to", f.to),
+        ("thread", f.thread),
+        ("kind", f.kind),
+        ("user", f.user),
+        ("node", f.node),
+        ("harness", f.harness),
+    ] {
+        if let Some(v) = v {
+            out.insert(k.into(), json!(v));
+        }
+    }
+    if let Some(t) = f.since {
+        out.insert("since".into(), json!(t.to_rfc3339()));
+    }
+    if f.unread_only {
+        out.insert("unread".into(), json!(true));
+    }
+    out.insert("limit".into(), json!(f.limit));
+    Value::Object(out)
 }
 
 async fn messages_get(

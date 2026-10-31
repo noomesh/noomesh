@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -430,5 +432,63 @@ func TestPausedBackendFoundRunningIsStoppedAgain(t *testing.T) {
 	c.Tick(context.Background())
 	if len(d.stops) != 2 || d.ctrs[0].Running {
 		t.Fatalf("a paused backend running again must be stopped again: stops=%v", d.stops)
+	}
+}
+
+func TestUnmeasuredCauses(t *testing.T) {
+	notFound := &exec.Error{Name: "nvidia-smi", Err: exec.ErrNotFound}
+	pathErr := &fs.PathError{Op: "fork/exec", Path: "/usr/bin/nvidia-smi", Err: fs.ErrNotExist}
+	long := strings.Repeat("x", 300)
+	cases := []struct {
+		name, goos, out string
+		err             error
+		want            string
+		detail          string
+	}{
+		{"darwin", "darwin", "", nil, UnmeasuredUnifiedMemory, ""},
+		{"not found", "linux", "", notFound, UnmeasuredNoNvidia, ""},
+		{"path not exist", "linux", "", pathErr, UnmeasuredNoNvidia, ""},
+		{"timeout", "linux", "", fmt.Errorf("nvidia-smi: %w", context.DeadlineExceeded), UnmeasuredProbeTimeout, ""},
+		{"stuck", "linux", "", fmt.Errorf("x: %w: %w", errors.New("stuck"), context.DeadlineExceeded), UnmeasuredProbeTimeout, ""},
+		{"exit error", "linux", "", errors.New("exit status 9"), UnmeasuredDriverLost, "exit status 9"},
+		{"exit error stderr", "linux", "", &exec.ExitError{Stderr: []byte("GPU has fallen off the bus.\nsecond")}, UnmeasuredDriverLost, "GPU has fallen off the bus."},
+		{"unparseable", "linux", "garbage", nil, UnmeasuredDriverLost, "garbage"},
+		{"empty output", "linux", "", nil, UnmeasuredDriverLost, "no output"},
+		{"unknown error at exit 0", "linux", "Unable to determine the device handle for GPU0: Unknown Error\n", nil, UnmeasuredDriverLost, "Unable to determine the device handle for GPU0: Unknown Error"},
+		{"unknown error with numbers", "linux", "UNKNOWN ERROR, 100\n", nil, UnmeasuredDriverLost, "UNKNOWN ERROR, 100"},
+		{"long detail capped", "linux", long, nil, UnmeasuredDriverLost, long[:120]},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := &SMIProbe{goos: tc.goos, run: func(...string) (string, error) { return tc.out, tc.err }}
+			r := probe.Read(context.Background())
+			if r.Measured || r.Unmeasured != tc.want || r.UnmeasuredDetail != tc.detail {
+				t.Fatalf("got %+v want %s/%q", r, tc.want, tc.detail)
+			}
+		})
+	}
+}
+
+func TestUnmeasuredReportedAndClearedOnMeasured(t *testing.T) {
+	c, p, _, _ := rig(t, nil)
+	p.r = Reading{Unmeasured: UnmeasuredDriverLost, UnmeasuredDetail: "Unknown Error"}
+	c.Tick(context.Background())
+	r := c.Report()
+	if r.Method != MethodNotMeasured || r.Unmeasured != UnmeasuredDriverLost || r.UnmeasuredDetail != "Unknown Error" {
+		t.Fatalf("driver-lost not reported: %+v", r)
+	}
+	b, _ := json.Marshal(r)
+	if !strings.Contains(string(b), `"unmeasured":"driver-lost"`) {
+		t.Fatalf("json: %s", b)
+	}
+	p.r = pidReading(0, 0)
+	c.Tick(context.Background())
+	r = c.Report()
+	if r.Unmeasured != "" || r.UnmeasuredDetail != "" {
+		t.Fatalf("cause must clear on a measured reading: %+v", r)
+	}
+	b, _ = json.Marshal(r)
+	if strings.Contains(string(b), "unmeasured") {
+		t.Fatalf("omitempty: %s", b)
 	}
 }

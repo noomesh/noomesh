@@ -30,9 +30,9 @@
 package imagesource
 
 import (
+	"log/slog"
 	"os"
 	"sort"
-	"strings"
 	"sync"
 )
 
@@ -100,21 +100,14 @@ func (t *Tracker) Report() []Entry {
 	return out
 }
 
-// ModeEnv is the rollout switch: NOO_IMAGE_SOURCE=rail|legacy.
-const ModeEnv = "NOO_IMAGE_SOURCE"
+// RetiredEnv is the old rollout switch. The rail is the only image source;
+// the variable has no effect.
+const RetiredEnv = "NOO_IMAGE_SOURCE"
 
-// The two modes.
-const (
-	ModeRail   = "rail"
-	ModeLegacy = "legacy"
-)
-
-// Mode is the node's image-source mode: "rail" only when ModeEnv says so,
-// "legacy" (the pre-rail behaviour) otherwise — the default for the first
-// release that ships the rail, so the operator can dry-run it node by node.
-func Mode() string {
-	if strings.EqualFold(strings.TrimSpace(os.Getenv(ModeEnv)), ModeRail) {
-		return ModeRail
+// LogRetired logs, once at startup, that RetiredEnv is set and ignored.
+func LogRetired() {
+	if v, ok := os.LookupEnv(RetiredEnv); ok {
+		slog.Warn("NOO_IMAGE_SOURCE is retired and has no effect: images always come from the controller's artifact rail",
+			"switch", RetiredEnv, "value", v, "remedy", "remove it from /etc/noo-node-agent.env")
 	}
-	return ModeLegacy
 }

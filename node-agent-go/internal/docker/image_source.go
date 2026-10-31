@@ -81,11 +81,8 @@ import (
 //
 // # The rollout switch
 //
-// NOO_IMAGE_SOURCE=rail|legacy (node env). `legacy` — the DEFAULT for the
-// first release that ships this — is the pre-rail behaviour: a local image
-// is used, an absent one is pulled from its registry. Provenance is still
-// reported, so `noo cluster verify` shows what the rail WOULD change. The
-// operator turns `rail` on one node at a time for the live dry-run.
+// The rail is the only image source; there is no switch. (NOO_IMAGE_SOURCE,
+// the old rollout switch, is retired and ignored: see imagesource.LogRetired.)
 //
 // The ONLY registry pull in the agent is registryPull below; a guard test
 // (TestNoRegistryPullOutsideTheFallback) fails on any other.
@@ -131,9 +128,6 @@ func isOwnImage(ref string) bool {
 	}
 	return isOwnImageWith(ref, roots)
 }
-
-// imageSourceMode is the rollout switch (imagesource.Mode, NOO_IMAGE_SOURCE).
-func imageSourceMode() string { return imagesource.Mode() }
 
 // railRetryBackoff is how long a ref whose rail pull failed in transport is
 // left alone before the rail is tried again.
@@ -223,9 +217,6 @@ func (c *Client) resolveImage(ctx context.Context, ref string) (source, imageID 
 	if ref == "" || strings.ContainsAny(ref, " \t\n") {
 		return "", "", fmt.Errorf("invalid image ref %q", ref)
 	}
-	if imageSourceMode() != imagesource.ModeRail {
-		return c.resolveLegacy(ctx, ref)
-	}
 	arch := runtime.GOARCH
 	localID, present := imageLocalID(ctx, c, ref)
 
@@ -303,21 +294,6 @@ func (c *Client) resolveImage(ctx context.Context, ref string) (source, imageID 
 		"fix", fmt.Sprintf("stage it on the controller so this node needs no internet registry: `noo cluster sync-images %s -i %s`; set %s=off to forbid this", nodeIDOrPlaceholder(), ref, RegistryFallbackEnv))
 	if err := imageRegistryPull(ctx, c, ref); err != nil {
 		return "", "", fmt.Errorf("%w; the public-registry fallback failed too: %v", notStaged, err)
-	}
-	id, _ := imageLocalID(ctx, c, ref)
-	return imagesource.Registry, id, nil
-}
-
-// resolveLegacy is the pre-rail behaviour (NOO_IMAGE_SOURCE=legacy): use a
-// local image, pull an absent one from its registry. Provenance is still
-// recorded so verify shows what `rail` would change.
-func (c *Client) resolveLegacy(ctx context.Context, ref string) (string, string, error) {
-	if id, ok := imageLocalID(ctx, c, ref); ok {
-		return imagesource.Local, id, nil
-	}
-	slog.Info("pulling image (legacy image source)", "image", ref, "switch", imagesource.ModeEnv+"=rail takes it from the controller's artifact rail")
-	if err := imageRegistryPull(ctx, c, ref); err != nil {
-		return "", "", fmt.Errorf("pull image %s: %w", ref, err)
 	}
 	id, _ := imageLocalID(ctx, c, ref)
 	return imagesource.Registry, id, nil

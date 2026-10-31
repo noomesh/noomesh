@@ -135,7 +135,14 @@ impl RootSource {
 
 /// [`repo_root`] plus the rung that answered. Same order, one extra fact.
 pub fn repo_root_source() -> (PathBuf, RootSource) {
-    if let Ok(r) = std::env::var("NOO_REPO_ROOT") {
+    repo_root_source_given(std::env::var("NOO_REPO_ROOT").ok())
+}
+
+/// [`repo_root_source`] with `$NOO_REPO_ROOT` passed in, so a test can ask
+/// about a declared root without setting a variable every other test in the
+/// process reads (noomesh-internal 309).
+fn repo_root_source_given(declared: Option<String>) -> (PathBuf, RootSource) {
+    if let Some(r) = declared {
         return (PathBuf::from(r), RootSource::Declared);
     }
     if let Some(d) = standalone_home() {
@@ -144,7 +151,7 @@ pub fn repo_root_source() -> (PathBuf, RootSource) {
     if let Some(d) = cwd_repo_root() {
         return (d, RootSource::Cwd);
     }
-    (repo_root(), RootSource::Derived)
+    (state_home_dir(), RootSource::Derived)
 }
 
 /// The keys that decide WHO the CLI talks to and WHAT vouches for it.
@@ -880,14 +887,40 @@ mod config_plane_trust_tests {
     /// guard is inert if this rung is misreported.
     #[test]
     fn repo_root_source_reports_a_declared_root_as_declared() {
-        let prev = std::env::var("NOO_REPO_ROOT").ok();
-        std::env::set_var("NOO_REPO_ROOT", "/opt/noomesh");
-        let (root, src) = repo_root_source();
+        // Passed in, not set: tests share one process, and a set_var here
+        // was read by every concurrent test that resolves the root (309).
+        let (root, src) = repo_root_source_given(Some("/opt/noomesh".into()));
         assert_eq!(root, PathBuf::from("/opt/noomesh"));
         assert_eq!(src, RootSource::Declared);
-        match prev {
-            Some(v) => std::env::set_var("NOO_REPO_ROOT", v),
-            None => std::env::remove_var("NOO_REPO_ROOT"),
+    }
+
+    /// Nothing but the standalone install path sets `NOO_REPO_ROOT` in this
+    /// process. A test that sets it changes the root every concurrent test
+    /// resolves (309: the web wizard's e2e test and the one above both did);
+    /// hand a root in instead (`build_ctx_at`, `repo_root_source_given`).
+    #[test]
+    fn only_the_standalone_install_sets_noo_repo_root() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    let text = std::fs::read_to_string(&p).unwrap();
+                    let needle = ["set_var(\"NOO_REPO", "_ROOT\""].concat();
+                    for (i, line) in text.lines().enumerate() {
+                        if line.contains(&needle) {
+                            out.push(format!("{}:{}", p.display(), i + 1));
+                        }
+                    }
+                }
+            }
         }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut hits = Vec::new();
+        walk(&src, &mut hits);
+        assert!(!hits.is_empty(), "the scan found nothing at all — the standalone install sets it; the walk broke");
+        let others: Vec<&String> = hits.iter().filter(|h| !h.contains("onboard/standalone.rs:")).collect();
+        assert!(others.is_empty(), "NOO_REPO_ROOT is set outside the standalone install: {others:?}");
     }
 }

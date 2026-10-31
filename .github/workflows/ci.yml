@@ -217,6 +217,8 @@ jobs:
             # migrations that sqlx-drift diffs against Alembic.
             gateway-rust/*)           gateway=true; sqlx=true; ui=true ;;
             noo-cli/*)                cli=true ;;
+            # A path dependency of both Rust crates (i302): both lanes, nothing else.
+            crates/addon-manifest/*)  gateway=true; cli=true ;;
             # The console. Its own job; it does not compile any Rust.
             ui/*)                     ui=true ;;
             # go-node-agent is unconditional; nothing else compiles this tree.
@@ -614,7 +616,7 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           gateway-rust/target
-        key: ${{ runner.os }}-cargo-gw-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('gateway-rust/Cargo.lock') }}-${{ hashFiles('gateway-rust/src/**', 'gateway-rust/.sqlx/**', 'gateway-rust/Cargo.toml', 'gateway-rust/build.rs') }}
+        key: ${{ runner.os }}-cargo-gw-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('gateway-rust/Cargo.lock') }}-${{ hashFiles('gateway-rust/src/**', 'gateway-rust/.sqlx/**', 'gateway-rust/Cargo.toml', 'gateway-rust/build.rs', 'crates/addon-manifest/**') }}
         restore-keys: |
           ${{ runner.os }}-cargo-gw-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('gateway-rust/Cargo.lock') }}-
           ${{ runner.os }}-cargo-gw-rustc${{ steps.rustc.outputs.id }}-
@@ -951,7 +953,7 @@ jobs:
           ~/.cargo/git
           ~/.cargo/bin
           gateway-rust/target
-        key: ${{ runner.os }}-cargo-sqlxdrift-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('gateway-rust/Cargo.lock') }}-${{ hashFiles('gateway-rust/src/**', 'gateway-rust/.sqlx/**', 'gateway-rust/Cargo.toml', 'gateway-rust/build.rs') }}
+        key: ${{ runner.os }}-cargo-sqlxdrift-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('gateway-rust/Cargo.lock') }}-${{ hashFiles('gateway-rust/src/**', 'gateway-rust/.sqlx/**', 'gateway-rust/Cargo.toml', 'gateway-rust/build.rs', 'crates/addon-manifest/**') }}
         restore-keys: |
           ${{ runner.os }}-cargo-sqlxdrift-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('gateway-rust/Cargo.lock') }}-
           ${{ runner.os }}-cargo-sqlxdrift-rustc${{ steps.rustc.outputs.id }}-
@@ -1146,7 +1148,7 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           gateway-rust/target
-        key: ${{ runner.os }}-cargo-routerharness-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('gateway-rust/Cargo.lock') }}-${{ hashFiles('gateway-rust/src/**', 'gateway-rust/.sqlx/**', 'gateway-rust/Cargo.toml', 'gateway-rust/build.rs') }}
+        key: ${{ runner.os }}-cargo-routerharness-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('gateway-rust/Cargo.lock') }}-${{ hashFiles('gateway-rust/src/**', 'gateway-rust/.sqlx/**', 'gateway-rust/Cargo.toml', 'gateway-rust/build.rs', 'crates/addon-manifest/**') }}
         restore-keys: |
           ${{ runner.os }}-cargo-routerharness-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('gateway-rust/Cargo.lock') }}-
           ${{ runner.os }}-cargo-routerharness-rustc${{ steps.rustc.outputs.id }}-
@@ -1293,7 +1295,7 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           noo-cli/target
-        key: ${{ runner.os }}-cargo-paicli-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('noo-cli/Cargo.lock') }}-${{ hashFiles('noo-cli/src/**', 'noo-cli/Cargo.toml', 'noo-cli/build.rs') }}
+        key: ${{ runner.os }}-cargo-paicli-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('noo-cli/Cargo.lock') }}-${{ hashFiles('noo-cli/src/**', 'noo-cli/Cargo.toml', 'noo-cli/build.rs', 'crates/addon-manifest/**') }}
         restore-keys: |
           ${{ runner.os }}-cargo-paicli-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('noo-cli/Cargo.lock') }}-
           ${{ runner.os }}-cargo-paicli-rustc${{ steps.rustc.outputs.id }}-
@@ -1501,7 +1503,7 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           noo-cli/target
-        key: ${{ runner.os }}-cargo-paicli-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('noo-cli/Cargo.lock') }}-${{ hashFiles('noo-cli/src/**', 'noo-cli/Cargo.toml', 'noo-cli/build.rs') }}
+        key: ${{ runner.os }}-cargo-paicli-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('noo-cli/Cargo.lock') }}-${{ hashFiles('noo-cli/src/**', 'noo-cli/Cargo.toml', 'noo-cli/build.rs', 'crates/addon-manifest/**') }}
         restore-keys: |
           ${{ runner.os }}-cargo-paicli-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('noo-cli/Cargo.lock') }}-
           ${{ runner.os }}-cargo-paicli-rustc${{ steps.rustc.outputs.id }}-

@@ -120,6 +120,35 @@ pub fn update_yaml_config(ctx: &Ctx, backend: &str, model: &str) {
     save(ctx, &path, &data);
 }
 
+/// The default chat backend and model a `noomesh.yaml` document names:
+/// `cluster.default_backend` and `cluster.backends.<it>.model`. `None` when
+/// either is absent or empty. The gateway's static-Ollama last resort sends
+/// exactly this pair (`coordinator/backend.rs`), so this is what chat will
+/// try on a box with no placed chat backend.
+fn default_of(data: &Value) -> Option<(String, String)> {
+    let cluster = data.get("cluster")?;
+    let backend = cluster.get("default_backend")?.as_str()?.trim();
+    let model = cluster.get("backends")?.get(backend)?.get("model")?.as_str()?.trim();
+    if backend.is_empty() || model.is_empty() {
+        return None;
+    }
+    Some((backend.to_string(), model.to_string()))
+}
+
+/// Read back what [`update_yaml_config`] was supposed to leave behind.
+/// `update_yaml_config` is deliberately non-fatal and silent on a missing or
+/// unreadable `noomesh.yaml`, so the only way to know the default chat model
+/// is the one just pulled is to read the file again (i263a).
+pub fn configured_default(ctx: &Ctx) -> Result<(String, String), String> {
+    let Some(path) = config_path(ctx) else {
+        return Err(format!("{} does not exist", ctx.repo_root.join("noomesh.yaml").display()));
+    };
+    if !parses(&path) {
+        return Err(format!("{} is not readable as a YAML mapping", path.display()));
+    }
+    default_of(&load(&path)).ok_or_else(|| format!("{} names no default chat backend and model", path.display()))
+}
+
 /// `services.gateway_url` = the advertised self URL. The example seeds it as
 /// `https://localhost:8080`, and nothing rewrote it until now — but enrollment
 /// blobs embed this value (`routes/bootstrap.rs`), so a localhost value
@@ -323,7 +352,23 @@ pub fn update_yaml_addon(ctx: &Ctx, name: &str, on: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::parses;
+    use super::{default_of, parses};
+
+    #[test]
+    fn the_default_is_the_backend_named_and_its_model() {
+        let v: serde_yaml::Value = serde_yaml::from_str(
+            "cluster:\n  default_backend: ollama\n  backends:\n    vllm: {model: Qwen/Qwen3-8B-AWQ}\n    ollama: {model: 'gemma4:e2b'}\n",
+        )
+        .unwrap();
+        assert_eq!(default_of(&v), Some(("ollama".into(), "gemma4:e2b".into())));
+        let stale: serde_yaml::Value = serde_yaml::from_str(
+            "cluster:\n  default_backend: vllm\n  backends:\n    vllm: {model: Qwen/Qwen3-8B-AWQ}\n    ollama: {model: 'gemma4:e2b'}\n",
+        )
+        .unwrap();
+        assert_eq!(default_of(&stale), Some(("vllm".into(), "Qwen/Qwen3-8B-AWQ".into())), "a leftover vllm default is read as such");
+        let none: serde_yaml::Value = serde_yaml::from_str("cluster: {default_backend: ollama}\n").unwrap();
+        assert_eq!(default_of(&none), None);
+    }
 
     /// Every writer here is load → mutate → write-whole, and `load` answers
     /// "empty mapping" for a file it cannot parse. Without this guard the

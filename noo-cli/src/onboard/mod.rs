@@ -520,7 +520,20 @@ pub(crate) fn build_ctx<'a>(
     dry_run: bool,
     skip: Skip,
 ) -> Ctx<'a> {
-    let repo_root = crate::envfile::repo_root();
+    build_ctx_at(g, ui, non_interactive, dry_run, skip, crate::envfile::repo_root())
+}
+
+/// [`build_ctx`] rooted at `repo_root` instead of the resolved one: a test
+/// hands the wizard a hermetic root without setting `NOO_REPO_ROOT` for the
+/// whole test process (noomesh-internal 309).
+pub(crate) fn build_ctx_at<'a>(
+    g: &'a Globals,
+    ui: &'a dyn WizardUi,
+    non_interactive: bool,
+    dry_run: bool,
+    skip: Skip,
+    repo_root: std::path::PathBuf,
+) -> Ctx<'a> {
     Ctx {
         g,
         non_interactive,
@@ -1451,10 +1464,17 @@ fn print_final_summary(ctx: &Ctx) {
             ctx.raw(&format!("    {line}"));
         }
     }
-    if !ctx.dry_run && !ctx.state.interrupted {
+    if welcome_due(ctx.dry_run, ctx.state.interrupted, &Outcome::of(&ctx.state)) {
         ctx.raw("");
         ctx.info("You're all set. Welcome to Noomesh!");
     }
+}
+
+/// The welcome line is for a run that completed. A hard failure puts the
+/// "did NOT complete" block below the summary; "You're all set" above it
+/// read as success to anyone who stopped at the first line (i276).
+fn welcome_due(dry_run: bool, interrupted: bool, outcome: &Outcome) -> bool {
+    !dry_run && !interrupted && outcome.closing_failures().is_empty()
 }
 
 /// `Key: value` lines → `Key    value` with the labels padded to the
@@ -1574,6 +1594,19 @@ mod outcome_tests {
                 "summary and exit code disagree for {o:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod welcome_tests {
+    use super::{welcome_due, Outcome};
+
+    #[test]
+    fn welcome_is_withheld_when_the_verdict_has_a_hard_failure() {
+        assert!(welcome_due(false, false, &Outcome::Completed));
+        assert!(!welcome_due(false, false, &Outcome::Failed(vec!["storage: x".into()])));
+        assert!(!welcome_due(true, false, &Outcome::Completed));
+        assert!(!welcome_due(false, true, &Outcome::Completed));
     }
 }
 

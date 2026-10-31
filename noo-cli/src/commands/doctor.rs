@@ -465,6 +465,71 @@ pub(crate) fn orphans_of<'a>(
     running.iter().filter(|c| !declared.contains(&c.service)).collect()
 }
 
+/// One line of `config/retired-services.txt`: a compose service the repo
+/// removed on purpose and says must stay gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetiredService {
+    pub service: String,
+    pub date: String,
+    pub pr: String,
+}
+
+impl RetiredService {
+    /// `service <svc> was retired on <date> (<PR>)`, the sentence the launcher
+    /// prints when it removes one.
+    pub(crate) fn sentence(&self) -> String {
+        format!("service {} was retired on {} ({})", self.service, self.date, self.pr)
+    }
+}
+
+/// Parse the retired-services list: `<service>  <YYYY-MM-DD>  <PR>` per line,
+/// whole-line `#` comments and blank lines ignored (the PR column starts with
+/// `#` too, so a comment is only a line that BEGINS with one). A missing date
+/// or PR reads as empty rather than hiding the entry.
+pub(crate) fn parse_retired_services(text: &str) -> Vec<RetiredService> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let service = it.next()?.to_string();
+            let date = it.next().unwrap_or("").to_string();
+            let pr = it.collect::<Vec<_>>().join(" ");
+            Some(RetiredService { service, date, pr })
+        })
+        .collect()
+}
+
+/// The list as this install has it: `config/retired-services.txt` under the
+/// install root (the file the launcher reads), else the copy embedded in this
+/// binary. Err when neither can be read, so a caller never reads "nothing
+/// retired" from a list it never saw.
+pub(crate) fn retired_services() -> Result<Vec<RetiredService>, String> {
+    let path = crate::envfile::repo_root().join("config/retired-services.txt");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => crate::onboard::standalone::STANDALONE_ASSETS
+            .iter()
+            .find(|(rel, _, _)| *rel == "config/retired-services.txt")
+            .and_then(|(_, bytes, _)| std::str::from_utf8(bytes).ok().map(str::to_string))
+            .ok_or_else(|| format!("{} is unreadable ({e}) and this binary embeds no copy", path.display()))?,
+    };
+    Ok(parse_retired_services(&text))
+}
+
+/// The running containers whose service is on the retired list, paired with
+/// their entry. Needs no compose projection: a retired service is wrong
+/// whatever the files say.
+pub(crate) fn retired_of(
+    running: &[ComposeContainer],
+    list: &[RetiredService],
+) -> Vec<(ComposeContainer, RetiredService)> {
+    running
+        .iter()
+        .filter_map(|c| list.iter().find(|r| r.service == c.service).map(|r| (c.clone(), r.clone())))
+        .collect()
+}
+
 // ═══════════════════════════════════════════════════════════════
 // `noo doctor secrets`
 // ═══════════════════════════════════════════════════════════════
@@ -625,55 +690,24 @@ pub fn doctor_orphans(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         return Err(Unhandled);
     }
 
-    let daemon_ok = Command::new("docker")
-        .args(["version", "--format", "{{.Server.Version}}"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !daemon_ok {
+    if !docker_daemon_up() {
         fail(g.json, ExitCode::Generic, "daemon_down",
             "the docker daemon is not answering",
             Some("sudo systemctl start docker — then re-run noo doctor orphans"));
     }
 
-    let fmt = concat!(
-        r#"{{.Names}}	{{.Label "com.docker.compose.project"}}	"#,
-        r#"{{.Label "com.docker.compose.service"}}	"#,
-        r#"{{.Label "com.docker.compose.project.config_files"}}	"#,
-        r#"{{.Label "com.docker.compose.project.working_dir"}}	"#,
-        r#"{{.Image}}	{{.Status}}"#,
-    );
-    let running: Vec<ComposeContainer> = docker_lines(&["ps", "--format", fmt])
-        .iter()
-        .filter_map(|l| parse_ps_row(l))
-        .collect();
-
-    let mut by_project: std::collections::BTreeMap<String, Vec<ComposeContainer>> =
-        std::collections::BTreeMap::new();
-    for c in running {
-        by_project.entry(c.project.clone()).or_default().push(c);
-    }
-    by_project.retain(|_, v| is_ours(v));
-
-    let mut found: Vec<ComposeContainer> = Vec::new();
-    let mut unreadable: Vec<(String, String)> = Vec::new();
-
-    for (project, containers) in &by_project {
-        match declared_services(project, containers) {
-            Ok(declared) => {
-                found.extend(orphans_of(containers, &declared).into_iter().cloned())
-            }
-            // A project whose projection we could not compute is NOT a project
-            // with no orphans. R45's lesson: "0 found" from a lookup that never
-            // happened is a clean bill of health for a fleet nobody looked at.
-            Err(why) => unreadable.push((project.clone(), why)),
-        }
-    }
+    let OrphanScan { by_project, found, retired, retired_why, unreadable } = scan_orphans();
 
     if g.json {
         println!("{}", serde_json::json!({
-            "status": if !unreadable.is_empty() { "unreadable" }
+            "status": if !retired.is_empty() { "retired_running" }
+                      else if !unreadable.is_empty() || retired_why.is_some() { "unreadable" }
                       else if found.is_empty() { "clean" } else { "orphans" },
+            "retired": retired.iter().map(|(c, r)| serde_json::json!({
+                "container": c.name, "service": c.service, "project": c.project,
+                "retired_on": r.date, "pr": r.pr,
+            })).collect::<Vec<_>>(),
+            "retired_list_unreadable": retired_why,
             "projects": by_project.keys().collect::<Vec<_>>(),
             "orphans": found.iter().map(|c| serde_json::json!({
                 "container": c.name, "service": c.service,
@@ -683,7 +717,7 @@ pub fn doctor_orphans(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 .map(|(p, w)| serde_json::json!({"project": p, "why": w}))
                 .collect::<Vec<_>>(),
         }));
-        return Ok(if found.is_empty() && unreadable.is_empty() { 0 } else { 1 });
+        return Ok(if found.is_empty() && retired.is_empty() && unreadable.is_empty() && retired_why.is_none() { 0 } else { 1 });
     }
 
     println!("{}", ui::header("compose orphans", None));
@@ -695,8 +729,24 @@ pub fn doctor_orphans(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ("projects", by_project.keys().cloned().collect::<Vec<_>>().join(", ")),
         ("compose services running", by_project.values().map(Vec::len).sum::<usize>().to_string()),
         ("orphans", found.len().to_string()),
+        ("retired services running", retired.len().to_string()),
     ]));
     println!();
+
+    if let Some(why) = &retired_why {
+        println!("{}", ui::status_line(Glyph::Err,
+            &format!("could not read config/retired-services.txt: {why}")));
+        println!("{}", ui::note("this is NOT a report of no retired services — the list was not compared"));
+    }
+    for (c, r) in &retired {
+        println!("{}", ui::status_line(Glyph::Err, &format!(
+            "{} is running although {}", c.name, r.sentence())));
+        println!("    {}", ui::cmd(&format!("docker rm -f {}", c.name)));
+    }
+    if !retired.is_empty() {
+        println!("{}", ui::note("a retired service stays gone: the repo removed it on purpose, and the next start removes it too"));
+        println!();
+    }
 
     for (project, why) in &unreadable {
         println!("{}", ui::status_line(Glyph::Err,
@@ -705,6 +755,9 @@ pub fn doctor_orphans(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
 
     if found.is_empty() && unreadable.is_empty() {
+        if !retired.is_empty() || retired_why.is_some() {
+            return Ok(1);
+        }
         println!("{}", ui::status_line(Glyph::Ok, "every running compose container is still declared"));
         return Ok(0);
     }
@@ -730,39 +783,162 @@ pub fn doctor_orphans(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(1)
 }
 
+/// Is the docker daemon answering?
+pub(crate) fn docker_daemon_up() -> bool {
+    Command::new("docker")
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// What one pass over the running compose containers found.
+pub(crate) struct OrphanScan {
+    pub by_project: std::collections::BTreeMap<String, Vec<ComposeContainer>>,
+    /// Undeclared containers that are NOT retired services (those are in `retired`).
+    pub found: Vec<ComposeContainer>,
+    /// Running containers of a service on config/retired-services.txt: FAIL, not WARN.
+    pub retired: Vec<(ComposeContainer, RetiredService)>,
+    /// Why the retired list could not be read, when it could not. NOT "none retired".
+    pub retired_why: Option<String>,
+    /// Projects whose projection could not be computed, with why. NOT clean.
+    pub unreadable: Vec<(String, String)>,
+}
+
+/// The one computation behind `noo doctor orphans` and the `undeclared
+/// containers` row of `noo cluster verify --controller`. Assumes the daemon
+/// answers (callers check [`docker_daemon_up`] first and say so their way).
+pub(crate) fn scan_orphans() -> OrphanScan {
+    let fmt = concat!(
+        r#"{{.Names}}	{{.Label "com.docker.compose.project"}}	"#,
+        r#"{{.Label "com.docker.compose.service"}}	"#,
+        r#"{{.Label "com.docker.compose.project.config_files"}}	"#,
+        r#"{{.Label "com.docker.compose.project.working_dir"}}	"#,
+        r#"{{.Image}}	{{.Status}}"#,
+    );
+    let running: Vec<ComposeContainer> = docker_lines(&["ps", "--format", fmt])
+        .iter()
+        .filter_map(|l| parse_ps_row(l))
+        .collect();
+
+    let mut by_project: std::collections::BTreeMap<String, Vec<ComposeContainer>> =
+        std::collections::BTreeMap::new();
+    for c in running {
+        by_project.entry(c.project.clone()).or_default().push(c);
+    }
+    by_project.retain(|_, v| is_ours(v));
+
+    let (list, retired_why) = match retired_services() {
+        Ok(l) => (l, None),
+        Err(w) => (Vec::new(), Some(w)),
+    };
+    let mut found: Vec<ComposeContainer> = Vec::new();
+    let mut retired: Vec<(ComposeContainer, RetiredService)> = Vec::new();
+    let mut unreadable: Vec<(String, String)> = Vec::new();
+    for (project, containers) in &by_project {
+        retired.extend(retired_of(containers, &list));
+        match declared_services(project, containers) {
+            Ok(declared) => found.extend(
+                orphans_of(containers, &declared)
+                    .into_iter()
+                    .filter(|c| !list.iter().any(|r| r.service == c.service))
+                    .cloned(),
+            ),
+            // A project whose projection we could not compute is NOT a project
+            // with no orphans. R45's lesson: "0 found" from a lookup that never
+            // happened is a clean bill of health for a fleet nobody looked at.
+            Err(why) => unreadable.push((project.clone(), why)),
+        }
+    }
+    OrphanScan { by_project, found, retired, retired_why, unreadable }
+}
+
+/// The compose files whose union decides what is "declared" for a project.
+///
+/// `labels` is each container's `com.docker.compose.project.config_files`
+/// value; `install` is this install's own list (`compose_file_list`). The
+/// result is: the install's files in their order, then every label file that
+/// `exists` and is not already there. Containers created by different `up`s
+/// carry different lists (an add-on's own `up` names its overlay, the core's
+/// does not), and the old "first container with a label" rule made the verdict
+/// depend on `docker ps` order. Distinct label lists are therefore sorted
+/// (longest first, then text) before they contribute, so the answer is the
+/// same for any container order.
+pub(crate) fn declared_files(
+    labels: &[&str],
+    install: &[String],
+    exists: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    use crate::onboard::sh::normalize_path;
+    // Compare paths, not spellings: `/x/./a.yml` from the install list and
+    // `/x/a.yml` from a label are one file, and naming it twice makes compose
+    // merge it with itself (rc.2: `security_opt array items must be unique`).
+    let install: Vec<String> = install.iter().map(|f| normalize_path(f)).collect();
+    let mut lists: Vec<Vec<String>> = labels
+        .iter()
+        .map(|l| {
+            l.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(normalize_path)
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .collect();
+    lists.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    lists.dedup();
+    let mut out: Vec<String> = Vec::new();
+    for f in install.iter().chain(lists.iter().flatten()) {
+        if !out.contains(f) && (install.contains(f) || exists(f)) {
+            out.push(f.clone());
+        }
+    }
+    out
+}
+
 /// Every service the project's compose files declare, across EVERY profile.
 ///
 /// Two flags carry the whole correctness argument. `--project-directory` makes
 /// relative paths and `.env` resolve the way they did at `up` time, and the
 /// `--profile` fan-out (from `config --profiles`) is what stops a
-/// profile-gated service reading as undeclared.
+/// profile-gated service reading as undeclared. The files are the union
+/// [`declared_files`] describes, never one container's label alone.
 fn declared_services(
     project: &str,
     containers: &[ComposeContainer],
 ) -> Result<std::collections::BTreeSet<String>, String> {
-    let c = containers
-        .iter()
-        .find(|c| !c.config_files.is_empty())
-        .ok_or_else(|| "no container carries a config_files label".to_string())?;
-    let files: Vec<&str> = c.config_files.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let labels: Vec<&str> = containers.iter().map(|c| c.config_files.as_str()).collect();
+    // The install's own list belongs to the install's project: when
+    // COMPOSE_PROJECT_NAME names another one, do not blend it in.
+    let install: Vec<String> = match std::env::var("COMPOSE_PROJECT_NAME") {
+        Ok(p) if !p.is_empty() && p != project => Vec::new(),
+        _ => crate::onboard::sh::install_compose_files(&crate::envfile::repo_root())
+            .into_iter()
+            .filter(|f| std::path::Path::new(f).is_file())
+            .collect(),
+    };
+    let files = declared_files(&labels, &install, &|f| std::path::Path::new(f).is_file());
     if files.is_empty() {
-        return Err("the config_files label is empty".into());
+        return Err("no compose file of this project is on this box (the config_files labels name none that exist)".into());
     }
-    for f in &files {
-        if !std::path::Path::new(f).is_file() {
-            return Err(format!("compose file {f} is gone from this box"));
-        }
-    }
+    // Deterministic whichever container docker listed first.
+    let working_dir = containers
+        .iter()
+        .map(|c| c.working_dir.as_str())
+        .filter(|w| !w.is_empty())
+        .min()
+        .unwrap_or("")
+        .to_string();
 
     let base = |extra: &[&str]| -> Vec<String> {
         let mut a: Vec<String> = vec!["compose".into(), "--project-name".into(), project.into()];
-        if !c.working_dir.is_empty() {
+        if !working_dir.is_empty() {
             a.push("--project-directory".into());
-            a.push(c.working_dir.clone());
+            a.push(working_dir.clone());
         }
         for f in &files {
             a.push("-f".into());
-            a.push((*f).to_string());
+            a.push(f.clone());
         }
         a.extend(extra.iter().map(|s| (*s).to_string()));
         a
@@ -853,6 +1029,76 @@ mod orphan_tests {
             orphans_of(&running, &declared).is_empty(),
             "a profile-gated service is declared even when its profile is off"
         );
+    }
+
+    /// The orphan verdict must not depend on which container docker lists
+    /// first. An add-on's own `up` stamps its overlay on ITS containers; the
+    /// old code read the first labelled container only. Fails on that code:
+    /// the overlay file was in or out of the set by order alone.
+    #[test]
+    fn declared_files_do_not_depend_on_container_order() {
+        let core = "/o/base.yml,/o/override.yml";
+        let addon = "/o/base.yml,/o/override.yml,/o/addon.yml";
+        let exists = |_: &str| true;
+        let a = declared_files(&[core, addon], &[], &exists);
+        let b = declared_files(&[addon, core], &[], &exists);
+        assert_eq!(a, b);
+        assert_eq!(a, vec!["/o/base.yml", "/o/override.yml", "/o/addon.yml"]);
+    }
+
+    #[test]
+    fn declared_files_union_the_install_list_and_skip_gone_label_files() {
+        let install = vec!["/o/base.yml".to_string(), "/o/gpu.yml".to_string()];
+        let exists = |f: &str| f != "/o/gone.yml";
+        let got = declared_files(&["/o/base.yml,/o/gone.yml,/o/addon.yml", ""], &install, &exists);
+        assert_eq!(got, vec!["/o/base.yml", "/o/gpu.yml", "/o/addon.yml"]);
+    }
+
+    /// rc.2 (Part B): `compose_file_list .` gave `./docker-compose.cluster.yml`,
+    /// the install list became `/root/.noo/./docker-compose.cluster.yml`, the
+    /// label said `/root/.noo/docker-compose.cluster.yml`, and the string
+    /// dedup kept both, so compose read the file twice. Fails on that code.
+    #[test]
+    fn one_file_spelled_two_ways_is_declared_once() {
+        let install = vec!["/x/./a.yml".to_string(), "/x//b.yml".to_string()];
+        let got = declared_files(&["/x/a.yml,/x/b.yml,/x/c/../c.yml"], &install, &|_| true);
+        assert_eq!(got, vec!["/x/a.yml", "/x/b.yml", "/x/c.yml"]);
+    }
+
+    #[test]
+    fn no_labels_and_no_install_list_declares_nothing() {
+        assert!(declared_files(&["", " "], &[], &|_| true).is_empty());
+    }
+
+    #[test]
+    fn the_retired_list_parses_comments_and_columns() {
+        let got = parse_retired_services(
+            "# header\n\ncluster-executor  2026-09-11  #98\nfoo 2026-01-02 #1\n  \nbare\n");
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], RetiredService {
+            service: "cluster-executor".into(), date: "2026-09-11".into(), pr: "#98".into() });
+        assert_eq!(got[2].service, "bare");
+        assert_eq!(got[2].date, "");
+    }
+
+    #[test]
+    fn the_shipped_retired_list_names_cluster_executor() {
+        let got = parse_retired_services(include_str!("../../../config/retired-services.txt"));
+        assert!(got.iter().any(|r| r.service == "cluster-executor" && r.date == "2026-09-11"), "{got:?}");
+    }
+
+    #[test]
+    fn a_running_retired_service_is_found_and_only_that() {
+        let running = vec![
+            parse_ps_row(&row("noo-gateway", "noomesh", "gateway")).unwrap(),
+            parse_ps_row(&row("noo-cluster-executor", "noomesh", "cluster-executor")).unwrap(),
+        ];
+        let list = parse_retired_services("cluster-executor  2026-09-11  #98\n");
+        let got = retired_of(&running, &list);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0.name, "noo-cluster-executor");
+        assert_eq!(got[0].1.sentence(), "service cluster-executor was retired on 2026-09-11 (#98)");
+        assert!(retired_of(&running, &[]).is_empty());
     }
 
     #[test]

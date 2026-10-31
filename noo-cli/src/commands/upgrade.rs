@@ -791,6 +791,9 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
     // `--stack` alone is one unit of work; anything with `--nodes` has at
     // least Gateway · CLI Assets · Nodes, so every stage gets its phase.
     let phased = nodes || seats;
+    // i277f: the doors' tool catalogue before the roll (None from a gateway
+    // that does not report it, or none running).
+    let catalogue_before = if stack { mcp_catalogue(g) } else { None };
     if stack {
         if phased && !g.json { println!("{}", ui::phase("Stack")); }
         roll_started = Some(crate::commands::cluster_verify::now_unix());
@@ -902,8 +905,31 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
         if let Some(h) = crate::commands::at_rest_migrate::upgrade_hint() {
             println!("{}", ui::note(&h));
         }
+        if let Some(h) = catalogue_hint(catalogue_before.as_deref(), mcp_catalogue(g).as_deref()) {
+            println!("{}", ui::note(h));
+        }
     }
     Ok(rc)
+}
+
+/// The gateway's MCP tool-catalogue digest (`/health`, authenticated).
+fn mcp_catalogue(g: &Globals) -> Option<String> {
+    crate::http::get_json_opt(g, "/health", true, 5)?
+        .get("mcp_catalogue")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Connected MCP clients keep the tool list they fetched at connect; the
+/// doors cannot tell them it changed yet (i277f). Said only when both
+/// readings exist and differ: a gateway too old to report one says nothing.
+fn catalogue_hint(before: Option<&str>, after: Option<&str>) -> Option<&'static str> {
+    match (before, after) {
+        (Some(b), Some(a)) if a != b => Some(
+            "the MCP tool list changed: reconnect connected MCP clients (`/mcp` in Claude Code, restart Codex) or they keep the old one",
+        ),
+        _ => None,
+    }
 }
 
 /// Normalize a stack tag: `stack-v0.1.74` / `v0.1.74` / `0.1.74` → `v0.1.74`.
@@ -1625,7 +1651,7 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
             return c.status();
         }
         let (status, tally) = crate::onboard::sh::run_summarised(c)?;
-        if let Some(s) = tally.summary() {
+        for s in [tally.pull_summary(), tally.summary()].into_iter().flatten() {
             if status.success() && tally.failed() == 0 { ui::done(&s); } else { ui::failed(&s, None); }
         }
         Ok(status)
@@ -4395,19 +4421,17 @@ pub(crate) fn hold_line(current: &str, newest: &str, holds: &[(String, String)])
 enum LockStageVerdict {
     /// Staged clean (or never staged): roll.
     Clean,
-    /// Failures, but nothing depends on them yet (no online node on
-    /// NOO_IMAGE_SOURCE=rail), or the operator passed --force: roll, and say
-    /// so loudly with the images and the remedy.
+    /// Failures, but nothing depends on them yet (no online Linux node), or the operator passed --force: roll,
+    /// and say so loudly with the images and the remedy.
     Warn(String),
     /// Failures and at least one online rail node: refuse unless --force.
     Refuse(String),
 }
 
-/// The pure decision. `rail_nodes` are online nodes reporting
-/// `image_source_mode=rail` — only they pull from the rail, so only they make
-/// a failed stage a reason to stop. While every node is on `legacy` (the
-/// default for the release that ships the rail) a controller-disk or
-/// registry blip must not block upgrades.
+/// The pure decision. `rail_nodes` are the online nodes that pull from the
+/// rail after this roll (see [`rail_node_ids`]); the rail is the only image
+/// source, so a failed stage strands every one of them. It only warns when
+/// there is no online Linux node at all.
 fn lock_stage_verdict(failed: &[String], rail_nodes: &[String], force: bool) -> LockStageVerdict {
     if failed.is_empty() {
         return LockStageVerdict::Clean;
@@ -4419,7 +4443,7 @@ fn lock_stage_verdict(failed: &[String], rail_nodes: &[String], force: bool) -> 
     );
     if rail_nodes.is_empty() {
         return LockStageVerdict::Warn(format!(
-            "{what} — no online node runs NOO_IMAGE_SOURCE=rail, so nothing pulls them yet; rolling nodes"));
+            "{what} — no online Linux node pulls images from the rail, so nothing is waiting on them; rolling nodes"));
     }
     let who = format!("online rail node(s) {} cannot pull them", rail_nodes.join(", "));
     if force {
@@ -4428,16 +4452,32 @@ fn lock_stage_verdict(failed: &[String], rail_nodes: &[String], force: bool) -> 
     LockStageVerdict::Refuse(format!("{what} — {who}. Stage them first, or pass --force"))
 }
 
-/// Online nodes whose agent reports `image_source_mode=rail`. A gateway
-/// that cannot be asked yields none (the gateway wait above already passed).
-fn online_rail_nodes(g: &Globals) -> Vec<String> {
-    crate::http::get_json_opt(g, "/api/cluster/nodes", true, 10)
-        .and_then(|b| b["nodes"].as_array().cloned())
-        .unwrap_or_default()
+/// The online (or busy) nodes that take images from the rail once this roll
+/// has run: every non-darwin, non-companion node. The rail is the only image
+/// source, so whatever mode an older agent reports today (`legacy` before this
+/// release), it is rail after the roll. Darwin nodes and companions start no
+/// containers and never count. A node that reports no OS is counted (refuse,
+/// not skip).
+fn rail_node_ids(nodes: &[serde_json::Value]) -> Vec<String> {
+    nodes
         .iter()
-        .filter(|n| n["status"].as_str() == Some("online") && n["image_source_mode"].as_str() == Some("rail"))
+        .filter(|n| matches!(n["status"].as_str(), Some("online") | Some("busy")))
+        .filter(|n| !super::cluster_provision::is_companion(n))
+        .filter(|n| {
+            let os = n["capabilities"]["os"].as_str().or_else(|| n["os"].as_str()).unwrap_or("");
+            !matches!(os.trim().to_ascii_lowercase().as_str(), "darwin" | "macos" | "osx")
+        })
         .filter_map(|n| n["id"].as_str().or_else(|| n["node_id"].as_str()).map(str::to_string))
         .collect()
+}
+
+/// The online nodes that will run the rail after this roll. A gateway that
+/// cannot be asked yields none (the gateway wait above already passed).
+fn online_rail_nodes(g: &Globals) -> Vec<String> {
+    let nodes = crate::http::get_json_opt(g, "/api/cluster/nodes", true, 10)
+        .and_then(|b| b["nodes"].as_array().cloned())
+        .unwrap_or_default();
+    rail_node_ids(&nodes)
 }
 
 /// Applies the verdict: None to roll (after a loud warning when there is
@@ -4759,19 +4799,50 @@ mod reexec_tests {
 
 #[cfg(test)]
 mod tests {
+    /// i277f: the reconnect hint only when both readings exist and differ.
+    #[test]
+    fn the_reconnect_hint_needs_two_differing_readings() {
+        assert!(super::catalogue_hint(Some("a"), Some("b")).is_some_and(|h| h.contains("reconnect")));
+        assert!(super::catalogue_hint(Some("a"), Some("a")).is_none());
+        assert!(super::catalogue_hint(None, Some("b")).is_none(), "an older gateway reports nothing: say nothing");
+        assert!(super::catalogue_hint(Some("a"), None).is_none());
+    }
+
     #[test]
     fn a_failed_lock_stage_only_warns_while_no_node_runs_the_rail() {
         use super::{lock_stage_verdict, LockStageVerdict};
         assert_eq!(lock_stage_verdict(&[], &[], false), LockStageVerdict::Clean);
         let f = vec!["reg/a/llamacpp:v1 (amd64): docker pull: timeout".to_string()];
-        // Every node on legacy (the default this release): warn, roll.
+        // No node will run the rail (all explicit legacy): warn, roll.
         match lock_stage_verdict(&f, &[], false) {
             LockStageVerdict::Warn(m) => {
                 assert!(m.contains("reg/a/llamacpp:v1") && m.contains("noo cluster sync-images --stage-only --lock"), "{m}");
-                assert!(m.contains("no online node runs NOO_IMAGE_SOURCE=rail"), "{m}");
+                assert!(m.contains("no online Linux node"), "{m}");
             }
             other => panic!("legacy fleet must warn, not refuse: {other:?}"),
         }
+    }
+
+    #[test]
+    fn rail_nodes_are_every_online_linux_node_whatever_mode_it_reports() {
+        use super::{lock_stage_verdict, rail_node_ids, LockStageVerdict};
+        let nodes = vec![
+            // An agent from before this release reporting legacy: rail after the roll.
+            serde_json::json!({"id": "old-legacy", "status": "online", "image_source_mode": "legacy", "capabilities": {"os": "linux"}}),
+            // No image_source_mode at all and no os: counted.
+            serde_json::json!({"id": "oldest", "status": "online"}),
+            serde_json::json!({"id": "busy-one", "status": "busy", "image_source_mode": "rail", "capabilities": {"os": "linux"}}),
+            // Darwin never counts, however it reports.
+            serde_json::json!({"id": "mac", "status": "online", "image_source_mode": "legacy", "capabilities": {"os": "darwin"}}),
+            serde_json::json!({"id": "mac2", "status": "online", "os": "macos"}),
+            // Offline never counts.
+            serde_json::json!({"id": "off", "status": "offline", "image_source_mode": "rail", "capabilities": {"os": "linux"}}),
+        ];
+        assert_eq!(rail_node_ids(&nodes), vec!["old-legacy", "oldest", "busy-one"]);
+        let f = vec!["reg/a/llamacpp:v1 (amd64): timeout".to_string()];
+        assert!(matches!(lock_stage_verdict(&f, &rail_node_ids(&nodes[..1]), false), LockStageVerdict::Refuse(m) if m.contains("old-legacy")));
+        // Only Mac nodes online: nothing pulls from the rail, so warn.
+        assert!(matches!(lock_stage_verdict(&f, &rail_node_ids(&nodes[3..5]), false), LockStageVerdict::Warn(_)));
     }
 
     #[test]

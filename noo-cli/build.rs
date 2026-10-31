@@ -54,6 +54,11 @@ const STANDALONE_FILES: &[&str] = &[
     // Voice (whisper + piper) as an overlay.
     "docker-compose.voice.yml",
     "config/tailscale-acl.hujson",
+    // Compose services the repo retired (186b): the launchers read it from the
+    // install root to remove a stale container of one, and doctor / cluster
+    // verify read it to FAIL on one still running. An installed box has no
+    // checkout, so it must ship.
+    "config/retired-services.txt",
     "scripts/noomesh-start.sh",
     // `pai stack restart` runs this (mesh.rs) — was missing, so day-2
     // restart on a standalone box would have failed (finding #28's sweep).
