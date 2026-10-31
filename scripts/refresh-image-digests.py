@@ -55,12 +55,26 @@ ROOT = Path(__file__).resolve().parents[1]
 DIGEST = r"sha256:[0-9a-f]{64}"
 HOOK = re.compile(r"\$\{(NOO_IMAGE_DIGEST_[A-Z0-9_]+):-(@" + DIGEST + r")?\}")
 
-# Images this repo builds and ships itself: never a third-party source.
+def release_image_namespace() -> str:
+    """The release image namespace, read from its shell home
+    (scripts/lib-dist.sh `release_image_namespace`), never typed out here
+    (tests/test_image_namespace_declarations.py). Parsed, not sourced, so no
+    side effects; a changed function shape fails loud."""
+    text = (ROOT / "scripts/lib-dist.sh").read_text()
+    m = re.search(r"^release_image_namespace\(\)\s*\{\s*printf\s+'([^']+)';\s*\}", text, re.M)
+    if not m:
+        raise SystemExit("scripts/lib-dist.sh: release_image_namespace() not found in its one-line printf form")
+    return m.group(1)
+
+
+# Images this repo builds and ships itself: never a third-party source. The
+# console image lives under the release namespace (the DHI mirror under it,
+# `<ns>/dhi/...`, IS third-party and stays a pinned source).
 FIRST_PARTY = (
     "pai-assistant/",
     "noomesh/",
     "noo-",
-    "ghcr.io/noomesh/mesh-ui",
+    release_image_namespace() + "/mesh-ui",
     "${NOO_IMAGE_PREFIX",
 )
 
