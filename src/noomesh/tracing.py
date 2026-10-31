@@ -232,17 +232,32 @@ def configure(service_name: str = "noo-worker", env: Optional[Mapping[str, str]]
 
 
 @contextmanager
-def span(name: str, traceparent: Optional[str] = None, attrs: Optional[Dict[str, Any]] = None, kind: int = 5) -> Iterator[Span]:
+def span(
+    name: str,
+    traceparent: Optional[str] = None,
+    attrs: Optional[Dict[str, Any]] = None,
+    kind: int = 5,
+    continue_only: bool = False,
+) -> Iterator[Optional[Span]]:
     """A span for the work inside the block, continuing ``traceparent``
     when it is well formed, else the span in scope, else a new trace. Ends,
     and is exported, when the block does; an exception marks it an error and
-    propagates."""
+    propagates.
+
+    ``continue_only``: with neither a valid ``traceparent`` nor a span in
+    scope, make NO span (the block runs, ``None`` is yielded). The worker hop
+    uses it: a message the gateway did not trace (a heartbeat job, an
+    internal call, an unauthenticated request) must not become an orphan root
+    trace, as the gateway and the node agent never start one either."""
     parent = _current.get()
     cont = parse_traceparent(traceparent)
     if cont:
         trace_id, parent_id = cont
     elif parent is not None:
         trace_id, parent_id = parent.trace_id, parent.span_id
+    elif continue_only:
+        yield None
+        return
     else:
         trace_id, parent_id = _new_id(16), None
     s = Span(name, trace_id, parent_id, kind=kind)

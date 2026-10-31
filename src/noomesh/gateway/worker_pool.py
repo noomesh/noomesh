@@ -306,14 +306,15 @@ async def _handle_request(msg) -> None:
         return
 
     # The gateway's request continues here (i359): one span per handled
-    # subject, parented on the gateway's span when it sent `traceparent`.
+    # subject, parented on the gateway's span. No `traceparent` (a message
+    # the gateway did not trace), no span: a worker never starts a trace.
     traceparent = (msg.headers or {}).get("traceparent")
     span_attrs = {"messaging.destination.name": subject}
     caller = getattr(principal, "sub", None)
     if caller:
         span_attrs["enduser.id"] = caller
     try:
-        with tracing.span(f"worker {subject}", traceparent=traceparent, attrs=span_attrs):
+        with tracing.span(f"worker {subject}", traceparent=traceparent, attrs=span_attrs, continue_only=True):
             with inflight.tracked():
                 result = await handler(request)
         response = {"success": True, "data": result}
