@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright/python:v1.49.0-noble
+FROM mcr.microsoft.com/playwright/python:v1.49.0-noble@sha256:35a390e70ab8ba7fbc909dc01af2329e287e89ccc8fb2f04a1a7ae94cacc5c30
 
 WORKDIR /browser
 

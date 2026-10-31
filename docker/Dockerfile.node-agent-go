@@ -29,7 +29,7 @@
 # --build-arg HUB_MIRROR=docker.io.
 ARG HUB_MIRROR=ghcr.io/noomesh/mirror
 ARG DHI_REGISTRY=dhi.io
-FROM --platform=$BUILDPLATFORM ${DHI_REGISTRY}/golang:1.26-debian13-dev AS builder
+FROM --platform=$BUILDPLATFORM ${DHI_REGISTRY}/golang:1.26-debian13-dev@sha256:ef213048c25a7360bbb52e6b243a782a439e892fa5982ad55c95a4c3c7f9e552 AS builder
 
 # GOTOOLCHAIN=auto (the image says local): Go uses the image's toolchain when
 # it satisfies go.mod's `toolchain` line, and otherwise downloads that release
@@ -60,11 +60,11 @@ RUN CGO_ENABLED=0 GOARCH=$TARGETARCH go build \
     ./cmd/node-agent/
 
 # ── glibc compat layer (standard Alpine has apk, DHI base doesn't) ──
-FROM ${HUB_MIRROR}/library/alpine:3.22 AS gcompat
+FROM ${HUB_MIRROR}/library/alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f AS gcompat
 RUN apk add --no-cache gcompat
 
 # ── Runtime (DHI hardened Alpine — zero CVEs, 3MB base) ──
-FROM ${DHI_REGISTRY}/alpine-base:3.22
+FROM ${DHI_REGISTRY}/alpine-base:3.22@sha256:884b0d572ffb8715be033de215ca17e1c0a372615e65b3937f9a5ee568eb11c5
 
 # Copy gcompat libs from standard Alpine (provides glibc shim for nvidia-smi).
 # The gcompat stage is built for $TARGETARCH, so the ld-linux glob resolves to
