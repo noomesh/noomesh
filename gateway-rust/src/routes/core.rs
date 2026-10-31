@@ -1652,6 +1652,9 @@ async fn health(
         if let Some(dev) = crate::addons::health_dev_map() {
             body["addons_dev"] = dev;
         }
+        // i353b: why each `unhealthy` add-on was refused; `{}` when none.
+        // `noo cluster verify` FAILs an enabled add-on named here.
+        body["addons_refused"] = crate::addons::health_refused_map();
         // i277f: `noo upgrade` compares it across a roll (reconnect hint).
         body["mcp_catalogue"] = json!(crate::mcp_external::catalogue_digest());
     }
