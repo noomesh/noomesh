@@ -52,6 +52,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/embedtarget"
 	"github.com/noomesh/noomesh/node-agent-go/internal/harnessprofile"
 	"github.com/noomesh/noomesh/node-agent-go/internal/occupancy"
+	"github.com/noomesh/noomesh/node-agent-go/internal/tracing"
 )
 
 // Per-backend TLS env-var names. When set to a truthy value, node-agent
@@ -444,6 +445,19 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The gateway's request continues here (i359 C2): one span from the
+	// pick to the end of the relayed answer, a stream included, parented on
+	// the gateway's span. The backend gets this span's traceparent. No
+	// traceparent from the caller, no span (tracing.Start returns nil and
+	// every method below is a no-op).
+	span := tracing.Start("agent inference "+backendType, r.Header.Get("traceparent"))
+	span.SetStr("noo.backend", backendType)
+	answered := 0
+	defer func() { span.End(answered) }()
+	if span != nil {
+		r.Header.Set("traceparent", span.Traceparent())
+	}
+
 	// A caller that does not name a model, or names `auto`, gets the model
 	// the picked backend actually serves (the harness
 	// is placed as `auto` and follows this node's chat placement). The
@@ -531,6 +545,7 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 	serving := s.servingTracker()
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		serving.observe(backendType, resp)
+		answered = resp.StatusCode
 		return nil
 	}
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
@@ -540,6 +555,7 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("inference proxy could not complete the upstream request",
 			"backend", backendType, "target", targetURL, "error", err,
 			"first_byte_timeout_seconds", int(firstByte.Seconds()))
+		answered = http.StatusBadGateway
 		jsonError(rw, http.StatusBadGateway, "backend_unreachable", err.Error())
 	}
 

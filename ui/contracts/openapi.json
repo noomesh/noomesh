@@ -20806,6 +20806,40 @@
           }
         }
       }
+    },
+    "/api/cluster/nodes/{node_id}/traces": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create traces",
+        "description": "[native] Node span ingest: a node-agent sends the spans of the requests it served, continuing the gateway's traces, and the gateway relays them to Tempo stamped with the verified node.",
+        "operationId": "node_traces_ingest",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

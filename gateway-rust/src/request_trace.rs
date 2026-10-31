@@ -552,6 +552,17 @@ pub fn untraced(method: &str, path: &str) -> bool {
         || path == "/metrics"
         || path.starts_with("/static/")
         || crate::middleware::access_log_suppressed(method, path)
+        || is_node_span_push(method, path)
+}
+
+/// A node's span push (`POST /api/cluster/nodes/{id}/traces`): the trace
+/// rail's own traffic, never itself a request worth a trace.
+fn is_node_span_push(method: &str, path: &str) -> bool {
+    method == "POST"
+        && path
+            .strip_prefix("/api/cluster/nodes/")
+            .and_then(|r| r.strip_suffix("/traces"))
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
 /// The route a request matched, as its template (`/api/tasks/{id}`), so a
@@ -1000,6 +1011,7 @@ mod tests {
             ("GET", "/metrics"),
             ("GET", "/static/app.js"),
             ("POST", "/api/cluster/nodes/node-a/logs"),
+            ("POST", "/api/cluster/nodes/node-a/traces"),
         ] {
             assert!(untraced(m, p), "{m} {p}");
         }

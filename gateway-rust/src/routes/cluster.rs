@@ -71,6 +71,15 @@ pub fn router() -> Router<Arc<AppState>> {
             post(super::logs_ingest::node_logs_ingest)
                 .layer(axum::extract::DefaultBodyLimit::max(super::logs_ingest::MAX_BODY + 1024)),
         )
+        // Node span ingest (i359 C2): a node sends the spans of the requests
+        // it served; the gateway re-stamps the resource with the verified
+        // node and relays them to Tempo. Node credential only, self only —
+        // see `traces_ingest.rs`. Body cap above the module's, as for logs.
+        .route(
+            "/api/cluster/nodes/{node_id}/traces",
+            post(super::traces_ingest::node_traces_ingest)
+                .layer(axum::extract::DefaultBodyLimit::max(super::traces_ingest::MAX_BODY + 1024)),
+        )
         .route("/api/cluster/nodes/{id}/register", post(node_register))
         .route("/api/cluster/nodes/{id}/forget", delete(node_forget))
         .route("/api/cluster/backends", get(cluster_backends))
