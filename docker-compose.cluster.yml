@@ -523,14 +523,6 @@ services:
       - NOO_TAILSCALE_OAUTH_CLIENT_SECRET_FILE=${NOO_TAILSCALE_OAUTH_CLIENT_SECRET:+/run/secrets/noo_tailscale_oauth_client_secret}
       - NOO_BOOTSTRAP_SCRIPT_URL=${NOO_BOOTSTRAP_SCRIPT_URL:-}
       - NGROK_DOMAIN=${NGROK_DOMAIN:-}
-      # Controller SSH PUBLIC key, served by POST /api/cluster/bootstrap
-      # (bootstrap-token enrollment) so a node can install the
-      # forced-command `noo-gate` entry. NOTHING in this repo dials that
-      # key any more — the controller->node SSH lane was removed and no
-      # container holds a private key. Kept only until the gate lane itself
-      # is retired. Empty =
-      # bootstrap enrollment reports itself unconfigured.
-      - NOO_CONTROLLER_SSH_PUBKEY=${NOO_CONTROLLER_SSH_PUBKEY:-}
       # Observability: noo_metrics_query tool (PromQL)
       - NOO_PROMETHEUS_URL=${NOO_PROMETHEUS_URL:-https://prometheus:9090}
       # Alerts: noo_alerts_list adds Alertmanager's own view (active,
@@ -1295,8 +1287,15 @@ services:
       # "Up (healthy)" while GPU util sits at 0% and requests time out.
       - VLLM_WSL2_ENABLE_PIN_MEMORY=${VLLM_WSL2_ENABLE_PIN_MEMORY:-1}
       - VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER:-0}
+      # Compile caches on a named volume, so a recreate does not recompile
+      # (node-agent-go/internal/docker/compile_cache.go, followup i305).
+      - VLLM_CACHE_ROOT=/root/.cache/vllm
+      - TRITON_CACHE_DIR=/root/.cache/vllm/triton
+      - TORCHINDUCTOR_CACHE_DIR=/root/.cache/vllm/inductor
+      - FLASHINFER_WORKSPACE_BASE=/root/.cache/vllm/flashinfer
     volumes:
       - ${HF_CACHE_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/hf-cache}:/root/.cache/huggingface
+      - vllm-compile-cache:/root/.cache/vllm
     deploy:
       resources:
         reservations:
@@ -1434,8 +1433,15 @@ services:
       - VLLM_MODEL=${VLLM2_MODEL:-}
       - VLLM_MAX_MODEL_LEN=${VLLM2_MAX_MODEL_LEN:-8192}
       - VLLM_TOOL_PARSER=${VLLM2_TOOL_PARSER:-auto}
+      # Compile caches on a named volume, so a recreate does not recompile
+      # (node-agent-go/internal/docker/compile_cache.go, followup i305).
+      - VLLM_CACHE_ROOT=/root/.cache/vllm
+      - TRITON_CACHE_DIR=/root/.cache/vllm/triton
+      - TORCHINDUCTOR_CACHE_DIR=/root/.cache/vllm/inductor
+      - FLASHINFER_WORKSPACE_BASE=/root/.cache/vllm/flashinfer
     volumes:
       - ${HF_CACHE_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/hf-cache}:/root/.cache/huggingface
+      - vllm-secondary-compile-cache:/root/.cache/vllm
     deploy:
       resources:
         reservations:
@@ -3324,6 +3330,12 @@ volumes:
       o: bind
       device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/ollama
   airllm-cache:
+  # vLLM's compile caches (torch.compile, Triton, FlashInfer JIT): plain named
+  # volumes like airllm-cache, not data-root binds. They hold only kernels the
+  # engine rebuilds, so they are no host root, and Docker creates them. One per
+  # engine; the agent's noo-vllm uses its own noo-vllm-compile-cache.
+  vllm-compile-cache:
+  vllm-secondary-compile-cache:
   hf-cache:
     driver: local
     driver_opts:

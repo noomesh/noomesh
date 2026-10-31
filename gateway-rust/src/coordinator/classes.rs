@@ -542,6 +542,13 @@ pub fn rank_reason(c: &Candidate, in_flight: usize, stalled: bool) -> String {
     out
 }
 
+/// One `mesh_nodes` record's health by the class table's rule
+/// ([`health_of`]): the definition the KV-scan resolver shares (185b).
+/// `data` carries the reachability verdict already (`apply_inbound`).
+pub(crate) fn node_health(key: &str, data: &Value, now_unix: f64) -> (bool, String) {
+    health_of(&node_facts_from_kv(key, data, &[], now_unix))
+}
+
 fn health_of(n: &NodeFacts) -> (bool, String) {
     if n.quarantined {
         return (false, "quarantined".into());

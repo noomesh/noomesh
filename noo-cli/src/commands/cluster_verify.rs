@@ -129,8 +129,8 @@ pub(crate) fn self_agent_lane_check(
 /// - it advertises it and the round trip failed: FAIL. The node says it
 ///   listens and nothing answers, which is the shape of a silently denied
 ///   publish (NATS refuses those without telling the sender).
-/// - it advertises it but no probe result reached us (an older gateway, or
-///   the probe call failed): NOT CHECKED.
+/// - it advertises it but no probe result reached us (none yet, or the
+///   probe call failed): NOT CHECKED, saying so (not blaming the gateway).
 pub(crate) fn control_bus_row(id: &str, n: &Value) -> Check {
     const NAME: &str = "control over bus";
     let advertised = n["control_transports"]["nats_rpc"].as_bool();
@@ -146,7 +146,7 @@ pub(crate) fn control_bus_row(id: &str, n: &Value) -> Check {
                 (Some(true), Some(true)) => ok(NAME, format!("health round trip over NATS in {} ms", p["rtt_ms"].as_u64().unwrap_or(0))),
                 (Some(true), _) => fail(NAME, p["detail"].as_str().unwrap_or("the round trip failed").to_string(),
                     format!("noo cluster nats-users render   # re-render the grants; then noo cluster restart-agent {id}")),
-                _ => warn(NAME, format!("NOT CHECKED — {}", p["detail"].as_str().unwrap_or("the gateway did not run the round-trip probe (older gateway)")),
+                _ => warn(NAME, format!("NOT CHECKED — {}", p["detail"].as_str().unwrap_or("no round-trip probe result has reached the verifier yet (the gateway has not reported one for this node)")),
                     None),
             }
         }
@@ -163,8 +163,8 @@ pub(crate) fn control_bus_row(id: &str, n: &Value) -> Check {
 /// - it advertises it and the round trip failed (including "the gateway holds
 ///   no live tunnel for it"): FAIL. The node says it is connected and the
 ///   gateway cannot use it.
-/// - it advertises it but no probe result reached us (an older gateway, or
-///   the probe call failed): NOT CHECKED.
+/// - it advertises it but no probe result reached us (none yet, or the
+///   probe call failed): NOT CHECKED, saying so (not blaming the gateway).
 pub(crate) fn tunnel_row(id: &str, n: &Value) -> Check {
     const NAME: &str = "streaming over tunnel";
     let advertised = n["control_transports"]["tunnel"].as_bool();
@@ -188,7 +188,7 @@ pub(crate) fn tunnel_row(id: &str, n: &Value) -> Check {
                 }
                 (Some(true), _) => fail(NAME, p["detail"].as_str().unwrap_or("the stream round trip failed").to_string(),
                     format!("noo cluster logs {id}   # 'node tunnel' lines; the node reconnects on its own, and `NOO_AGENT_TUNNEL=off` or `NOO_NODE_TUNNEL=0` turns the tunnel off on purpose")),
-                _ => warn(NAME, format!("NOT CHECKED — {}", p["detail"].as_str().unwrap_or("the gateway did not run the tunnel probe (older gateway)")),
+                _ => warn(NAME, format!("NOT CHECKED — {}", p["detail"].as_str().unwrap_or("no tunnel probe result has reached the verifier yet (the gateway has not reported one for this node)")),
                     None),
             }
         }
@@ -382,6 +382,9 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     // 7. Inbound: the controller can reach the agent.
     match n["inbound"].as_str() {
         Some("ok") => out.push(ok("inbound", "agent reachable from the controller")),
+        // `unknown` is the gateway saying it had no address to dial: nothing
+        // was checked, so it is not a failed check (i276).
+        Some("unknown") => out.push(warn("inbound", "NOT CHECKED — the controller has no address on record to dial this node, so reachability was not tested", Some(format!("noo cluster show {id}   # the address the node registered with")))),
         Some(other) => out.push(fail("inbound", format!("inbound {other}"), format!("noo cluster show {id}   # bind address and tailnet grant"))),
         None => out.push(warn("inbound", "not yet checked", None)),
     }
@@ -497,7 +500,20 @@ pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
     let method = gc["method"].as_str().unwrap_or("?");
     let state = gc["state"].as_str().unwrap_or("?");
     if method == "not-measured" && state != "held" && state != "yielded" && state != "draining" {
-        return Some(ok("gpu", "not measured (no NVIDIA GPU, or unified memory) — the node never yields"));
+        // Why it is not measured (an agent that predates the key sends none).
+        return Some(match gc["unmeasured"].as_str() {
+            Some("driver-lost") => {
+                let detail = gc["unmeasured_detail"].as_str().filter(|d| !d.is_empty()).unwrap_or("no detail");
+                fail("gpu",
+                    format!("the NVIDIA driver lost the GPU (nvidia-smi: {detail}) — GPU backends cannot start"),
+                    format!("reboot {id}; the kernel log names the fault: journalctl -k | grep -i xid"))
+            }
+            Some("probe-timeout") => warn("gpu",
+                "nvidia-smi did not answer in time (GPU saturated or driver slow) — not measured", None),
+            Some("no-nvidia") => ok("gpu", "no NVIDIA GPU — the node never yields"),
+            Some("unified-memory") => ok("gpu", "unified memory — the node never yields"),
+            _ => ok("gpu", "not measured (no NVIDIA GPU, or unified memory) — the node never yields"),
+        });
     }
     let mut off = if gc["policy"].as_str() == Some("off") { " (yield off)".to_string() } else { String::new() };
     // Why: noomesh's own GPU use, and memory nobody could be blamed for, are
@@ -545,8 +561,21 @@ pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
 /// vouched for by the controller's manifest; `registry` = pulled from a
 /// public registry under the third-party fallback. No row from an agent that
 /// does not report (older, or nothing started yet).
+///
+/// The rail is the only image source. An agent reporting
+/// `image_source_mode=legacy` is from before that release: it keeps an OK row
+/// that says it becomes rail on this roll. On it, the detail names what the
+/// rail would refuse: the placed images that are not staged for the node's
+/// arch (`unstaged_images`, the same input as `images_staged_check`), because
+/// an image the node does not hold and the controller has not staged cannot
+/// start on the rail.
 pub(crate) fn image_sources_check(n: &Value) -> Option<Check> {
     let id = n["id"].as_str().unwrap_or("?");
+    let legacy = n["image_source_mode"].as_str() == Some("legacy");
+    let would_refuse = match n["unstaged_images"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>()) {
+        Some(v) if !v.is_empty() => format!("; on the rail, placed images not staged for this node's arch would be refused unless already present: {}", v.join(", ")),
+        _ => String::new(),
+    };
     let entries = n["image_sources"].as_array()?;
     let off: Vec<(String, String)> = entries
         .iter()
@@ -560,12 +589,12 @@ pub(crate) fn image_sources_check(n: &Value) -> Option<Check> {
     }
     let list: Vec<String> = off.iter().map(|(i, s)| format!("{i} ({s})")).collect();
     let first = &off[0].0;
-    // The rollout switch (NOO_IMAGE_SOURCE): a node still on `legacy` takes
-    // images the pre-rail way by design, so this is information for the
-    // dry-run, not a warning. An agent that does not report a mode predates it.
-    if n["image_source_mode"].as_str() != Some("rail") {
+    // An agent that reports legacy predates the rail-only release: it takes
+    // images the pre-rail way until its next roll, so this is information,
+    // not a warning. An agent that reports no mode predates that too.
+    if legacy {
         return Some(ok("image sources", format!(
-            "legacy image source (NOO_IMAGE_SOURCE is not `rail` on this node): not from the rail: {}",
+            "older agent still on the legacy image source; it becomes rail on this roll: not from the rail: {}{would_refuse}",
             list.join(", "))));
     }
     Some(warn(
@@ -2283,6 +2312,88 @@ fn read_daemon_json() -> Result<Option<String>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.to_string()),
     }
+}
+
+/// The `undeclared containers` row: compose containers of this install's
+/// project that no compose file of the install declares (186b). WARN with the
+/// runnable `docker rm -f <names>`; None when clean; a WARN naming why when
+/// the projection could not be computed or docker did not answer, because
+/// "nothing found" from a comparison that never ran is not a pass. Agent-managed
+/// containers carry no `com.docker.compose.service` label and never reach here
+/// (`parse_ps_row`).
+pub(crate) fn undeclared_containers_check(
+    daemon_up: bool,
+    found: &[crate::commands::doctor::ComposeContainer],
+    unreadable: &[(String, String)],
+) -> Option<Check> {
+    const NAME: &str = "undeclared containers";
+    if !daemon_up {
+        return Some(warn(
+            NAME,
+            "the docker daemon did not answer, so running containers were NOT compared with the compose files — not a pass",
+            Some("sudo systemctl start docker".into()),
+        ));
+    }
+    let why: Vec<String> = unreadable.iter().map(|(p, w)| format!("{p}: {w}")).collect();
+    if found.is_empty() {
+        if why.is_empty() {
+            return None;
+        }
+        return Some(warn(
+            NAME,
+            format!("could not compute the compose projection ({}) — nothing was compared, not a pass", why.join("; ")),
+            Some("noo doctor orphans".into()),
+        ));
+    }
+    let names: Vec<&str> = found.iter().map(|c| c.name.as_str()).collect();
+    let mut detail = format!(
+        "{} running but declared by no compose file of this install (compose never stops a container whose service was deleted)",
+        names.join(", ")
+    );
+    if !why.is_empty() {
+        detail.push_str(&format!("; projection unreadable for {} — the list may be incomplete", why.join("; ")));
+    }
+    Some(warn(NAME, detail, Some(format!("docker rm -f {}", names.join(" ")))))
+}
+
+/// The `retired services` row: a container of a service the repo retired
+/// (`config/retired-services.txt`) is still running. FAIL, not the WARN of an
+/// undeclared one: the retired list exists for the services that were removed
+/// because they were unsafe (#98's sidecar ran as root with `~/.ssh` mounted).
+/// None when none run; a WARN naming why when the list could not be read.
+pub(crate) fn retired_services_check(
+    running: &[(crate::commands::doctor::ComposeContainer, crate::commands::doctor::RetiredService)],
+    list_why: Option<&str>,
+) -> Option<Check> {
+    const NAME: &str = "retired services";
+    if running.is_empty() {
+        return list_why.map(|w| warn(
+            NAME,
+            format!("could not read config/retired-services.txt ({w}) — nothing was compared, not a pass"),
+            Some("noo doctor orphans".into()),
+        ));
+    }
+    let detail = running
+        .iter()
+        .map(|(c, r)| format!("{} running: {}", c.name, r.sentence()))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let names: Vec<&str> = running.iter().map(|(c, _)| c.name.as_str()).collect();
+    Some(fail(NAME, detail, format!("docker rm -f {}", names.join(" "))))
+}
+
+/// The live rows from one scan, the same as `noo doctor orphans`: the WARN
+/// `undeclared containers` row and the FAIL `retired services` row.
+fn undeclared_containers_rows() -> Vec<Check> {
+    use crate::commands::doctor::{docker_daemon_up, scan_orphans};
+    if !docker_daemon_up() {
+        return undeclared_containers_check(false, &[], &[]).into_iter().collect();
+    }
+    let scan = scan_orphans();
+    let mut rows: Vec<Check> = Vec::new();
+    rows.extend(retired_services_check(&scan.retired, scan.retired_why.as_deref()));
+    rows.extend(undeclared_containers_check(true, &scan.found, &scan.unreadable));
+    rows
 }
 
 /// The "docker userns" row. A daemon with
@@ -5907,6 +6018,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // reads the host's file (the gateway checks only its own view).
         checks.extend(config_mount_row());
         checks.push(crate::commands::secrets_delivery::secrets_not_in_env_row());
+        // A container compose still runs although no compose file of this
+        // install declares it (186b: noo-cluster-executor ran two days).
+        checks.extend(undeclared_containers_rows());
         // No secret is shared between holders any more — the
         // controller secret reaches the gateway alone, and each bus verifier
         // holds its own key.
@@ -6735,6 +6849,39 @@ mod tests {
         let c = host_checks("host2", &Value::Null, true);
         assert_eq!(verdict(&c, "next boot"), Verdict::Warn);
         assert!(host_checks("host2", &Value::Null, false).is_empty(), "a dead hostd already fails its own row");
+    }
+
+    // ── i276: what a fresh one-box install must not FAIL on ───────────
+
+    /// `unknown` = the gateway had no address to dial: nothing was checked.
+    /// A warning that says so; only a check that actually failed FAILs.
+    #[test]
+    fn inbound_unknown_is_a_warning_naming_that_nothing_was_checked_and_failed_still_fails() {
+        let now = 1_800_000_000;
+        let mut n = healthy(now);
+        n["inbound"] = serde_json::json!("unknown");
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        let r = c.iter().find(|c| c.name == "inbound").unwrap();
+        assert_eq!(r.verdict, Verdict::Warn, "{}", r.detail);
+        assert!(r.detail.contains("NOT CHECKED") && r.detail.contains("no address"), "{}", r.detail);
+        n["inbound"] = serde_json::json!("failed");
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "inbound"), Verdict::Fail);
+    }
+
+    /// An advertised transport with no probe result yet is "no result", not
+    /// "older gateway": the gateway's version is not what is missing.
+    #[test]
+    fn a_missing_probe_result_does_not_blame_the_gateway_version() {
+        let now = 1_800_000_000;
+        let n = with_transports(now, serde_json::json!({"https_listener": true, "nats_rpc": true, "tunnel": true}));
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        for row in ["control over bus", "streaming over tunnel"] {
+            let r = c.iter().find(|c| c.name == row).unwrap();
+            assert_eq!(r.verdict, Verdict::Warn, "{row}");
+            assert!(r.detail.starts_with("NOT CHECKED") && r.detail.contains("no ") && r.detail.contains("probe result"), "{row}: {}", r.detail);
+            assert!(!r.detail.contains("older gateway"), "{row}: {}", r.detail);
+        }
     }
 
     // ── control over bus (i131 phase 1) ───────────────────────────────
@@ -7931,6 +8078,50 @@ mod tests {
     }
 
     #[test]
+    fn undeclared_containers_row_warns_with_a_runnable_remedy() {
+        let mk = |n: &str| crate::commands::doctor::parse_ps_row(
+            &format!("{n}\tnoomesh\tsvc\t/o/a.yml\t/o\timg:1\tUp 2 days")).unwrap();
+        let found = vec![mk("noo-cluster-executor"), mk("noo-foo")];
+        let c = undeclared_containers_check(true, &found, &[]).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("noo-cluster-executor") && c.detail.contains("noo-foo"));
+        assert_eq!(c.remedy.as_deref(), Some("docker rm -f noo-cluster-executor noo-foo"));
+    }
+
+    #[test]
+    fn a_running_retired_service_fails_with_its_retirement_line_and_remedy() {
+        use crate::commands::doctor::{parse_ps_row, parse_retired_services};
+        let c = parse_ps_row("noo-cluster-executor\tnoomesh\tcluster-executor\t/o/a.yml\t/o\timg:1\tUp 2 days").unwrap();
+        let r = parse_retired_services("cluster-executor  2026-09-11  #98\n").remove(0);
+        let row = retired_services_check(&[(c, r)], None).expect("a row");
+        assert_eq!(row.verdict, Verdict::Fail);
+        assert!(row.detail.contains("service cluster-executor was retired on 2026-09-11 (#98)"), "{}", row.detail);
+        assert_eq!(row.remedy.as_deref(), Some("docker rm -f noo-cluster-executor"));
+    }
+
+    #[test]
+    fn the_retired_row_is_absent_when_none_run_and_warns_when_the_list_is_unread() {
+        assert!(retired_services_check(&[], None).is_none());
+        let w = retired_services_check(&[], Some("no such file")).expect("a row");
+        assert_eq!(w.verdict, Verdict::Warn);
+        assert!(w.detail.contains("no such file") && w.detail.contains("not a pass"));
+    }
+
+    #[test]
+    fn undeclared_containers_row_is_absent_when_clean() {
+        assert!(undeclared_containers_check(true, &[], &[]).is_none());
+    }
+
+    #[test]
+    fn undeclared_containers_row_never_reads_clean_when_it_could_not_look() {
+        let c = undeclared_containers_check(true, &[], &[("noomesh".into(), "compose file is gone".into())]).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("compose file is gone") && c.detail.contains("not a pass"));
+        let d = undeclared_containers_check(false, &[], &[]).expect("a row");
+        assert_eq!(d.verdict, Verdict::Warn);
+    }
+
+    #[test]
     fn the_docker_userns_row_fails_a_remapping_daemon() {
         let c = docker_userns_check(Ok(Some(r#"{"data-root":"/data/docker","userns-remap":"default"}"#.into())));
         assert_eq!(c.verdict, Verdict::Fail);
@@ -8622,6 +8813,20 @@ mod tests {
         let c = image_sources_check(&legacy).unwrap();
         assert_eq!(c.verdict, Verdict::Ok);
         assert!(c.detail.contains("legacy") && c.detail.contains("ollama/ollama:latest (registry)"), "{}", c.detail);
+        assert!(c.detail.contains("becomes rail on this roll"), "{}", c.detail);
+    }
+
+    /// An older agent reporting legacy is OK (it becomes rail on this roll) and the
+    /// detail names what the rail would refuse; a rail node still WARNs.
+    #[test]
+    fn image_sources_row_for_an_older_legacy_agent_says_it_becomes_rail() {
+        let n = serde_json::json!({"id": "host8-ma", "image_source_mode": "legacy",
+            "unstaged_images": ["reg/acme/llamacpp:v2"],
+            "image_sources": [{"image": "ollama/ollama:latest", "source": "registry"}]});
+        let c = image_sources_check(&n).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("becomes rail on this roll") && c.detail.contains("ollama/ollama:latest (registry)")
+            && c.detail.contains("reg/acme/llamacpp:v2") && c.detail.contains("would be refused"), "{}", c.detail);
     }
 
     #[test]
@@ -10358,6 +10563,36 @@ mod gpu_contention_tests {
         assert_eq!(c.verdict, Verdict::Ok);
         assert!(c.detail.starts_with("not measured"));
         assert!(gpu_contention_check(&serde_json::json!({"id": "host9"})).is_none());
+    }
+
+    #[test]
+    fn not_measured_names_its_cause() {
+        let row = |extra: serde_json::Value| {
+            let mut gc = serde_json::json!({"state": "free", "method": "not-measured"});
+            for (k, v) in extra.as_object().unwrap() {
+                gc[k] = v.clone();
+            }
+            gpu_contention_check(&node(gc)).unwrap()
+        };
+        let lost = row(serde_json::json!({"unmeasured": "driver-lost", "unmeasured_detail": "Unable to determine the device handle"}));
+        assert_eq!(lost.verdict, Verdict::Fail);
+        assert_eq!(lost.detail, "the NVIDIA driver lost the GPU (nvidia-smi: Unable to determine the device handle) — GPU backends cannot start");
+        assert!(lost.remedy.as_deref().unwrap().contains("journalctl -k | grep -i xid"));
+        let bare = row(serde_json::json!({"unmeasured": "driver-lost"}));
+        assert_eq!(bare.verdict, Verdict::Fail);
+        assert!(bare.detail.contains("nvidia-smi: no detail"));
+        let slow = row(serde_json::json!({"unmeasured": "probe-timeout"}));
+        assert_eq!(slow.verdict, Verdict::Warn);
+        assert!(slow.remedy.is_none());
+        let none = row(serde_json::json!({"unmeasured": "no-nvidia"}));
+        assert_eq!((none.verdict, none.detail.as_str()), (Verdict::Ok, "no NVIDIA GPU — the node never yields"));
+        let mac = row(serde_json::json!({"unmeasured": "unified-memory"}));
+        assert_eq!((mac.verdict, mac.detail.as_str()), (Verdict::Ok, "unified memory — the node never yields"));
+        let old = row(serde_json::json!({}));
+        assert_eq!(old.detail, "not measured (no NVIDIA GPU, or unified memory) — the node never yields");
+        // A hold outranks the cause: the held row keeps its own text.
+        let held = gpu_contention_check(&node(serde_json::json!({"state": "held", "method": "not-measured", "unmeasured": "driver-lost"}))).unwrap();
+        assert_ne!(held.verdict, Verdict::Fail);
     }
 
     #[test]

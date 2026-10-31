@@ -1043,16 +1043,21 @@ pub fn addons_check(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     "{}",
                     json!({
                         "addon": name, "dir": dir, "ok": true, "third_party": third_party, "core": "embedded",
-                        "checked": {"secrets_declared": c.declared, "secret_references": c.referenced, "interpolations": c.interpolated, "mounts": c.mounts},
+                        "checked": {"secrets_declared": c.guards.declared, "secret_references": c.guards.referenced, "interpolations": c.guards.interpolated, "mounts": c.guards.mounts, "routes_json": c.routes.is_some()},
                         "not_checked": crate::addons::check::NOT_CHECKED,
+                        "routes_not_checked": c.routes.clone().unwrap_or_default(),
                     })
                 );
             } else {
-                ui::done(&format!("{name}: the bundle in {dir} passes enable's guard and resources checks"));
+                let routes = if c.routes.is_some() { ", and the gateway's routes.json rules" } else { " (it ships no routes.json)" };
+                ui::done(&format!("{name}: the bundle in {dir} passes enable's guard and resources checks{routes}"));
                 let who = if third_party { "third-party" } else { "first-party" };
                 println!("{}", ui::note(&format!("checked as {who}, against the compose files embedded in this noo")));
                 // A pass here is not "enable will accept it": say what can still refuse it.
                 println!("{}", ui::note(&format!("not checked here: {}", crate::addons::check::NOT_CHECKED.join(", "))));
+                for rule in c.routes.iter().flatten() {
+                    println!("{}", ui::note(&format!("not checked here: {rule}")));
+                }
             }
             Ok(0)
         }

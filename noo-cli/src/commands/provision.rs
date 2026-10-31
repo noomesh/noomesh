@@ -135,14 +135,26 @@ fn record_signing_adoption(node: &str, msg: &str) {
     }
     let ca = crate::pki::ClusterCa::new(crate::pki::pki_dir());
     let Ok(pubkey) = std::fs::read(ca.signing_pub_path()) else { return };
+    mark_signing_adopted(&ca, node, &pubkey);
+}
+
+/// Write the `signing-adopted` marker for `node`: this controller's record
+/// that the node holds the signing key whose public half is `pubkey`. Call
+/// it only on proof the key was installed there (an applier's report, or
+/// the controller's own root install exiting 0).
+fn mark_signing_adopted(ca: &crate::pki::ClusterCa, node: &str, pubkey: &[u8]) {
     let marker = ca.signing_adopted_path(node);
     if let Some(parent) = marker.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(
         &marker,
-        format!("{}\n", super::security_local::signing_pub_fingerprint(&pubkey)),
+        format!("{}\n", super::security_local::signing_pub_fingerprint(pubkey)),
     );
+}
+
+fn read_or_fail_path(p: &Path) -> Result<Vec<u8>, String> {
+    std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))
 }
 
 fn verified_by(msg: &str) -> Option<String> {
@@ -2587,6 +2599,7 @@ fn prep_marker_current(marker: &str, want: &[(&str, &str)]) -> bool {
 /// The inputs of the controller's local "bundle": the same kinds a rail
 /// bundle carries for an agent, delivered by one sudo script.
 struct LocalInputs {
+    signing_pub: Vec<u8>,
     agent_env: Vec<u8>,
     nats_creds: Vec<u8>,
     agent_binary: Vec<u8>,
@@ -2607,6 +2620,12 @@ fn local_bundle(node: &str, i: LocalInputs) -> Result<Vec<(String, Vec<u8>)>, St
         ("ca.crt".into(), i.ca_crt),
         ("node.crt".into(), i.node_crt),
         ("node.key".into(), i.node_key),
+        // The fleet signing PUBLIC key, as a rail bundle's `signing-pub`
+        // carries it. Without it the controller's own node never holds the
+        // key, `signing-adopted` is never true for it, and a fresh box's
+        // `noo cluster verify` asks the operator to provision their own
+        // controller (i276).
+        ("signing-pub".into(), i.signing_pub),
     ];
     v.extend(i.leaves);
     v.push(("agent-env".into(), i.agent_env));
@@ -2684,6 +2703,14 @@ fn local_install_script(s: &LocalScript) -> String {
         if ch("node.key") {
             out.push_str(&format!("install -m 640 -o root -g \"$grp\" \"{w}/node.key\" \"/etc/noo/pki/nodes/{node}/node.key\"\n"));
         }
+    }
+    if ch("signing-pub") {
+        // As noo-apply installs it: 0644, root, group noo-agent (root when
+        // the account does not exist).
+        out.push_str(&format!(
+            "grp=noo-agent; getent group noo-agent >/dev/null || grp=root\n\
+             [ -d /etc/noo/pki ] || install -d -m 750 -o root -g \"$grp\" /etc/noo/pki\n\
+             install -m 644 -o root -g \"$grp\" \"{w}/signing-pub\" /etc/noo/pki/signing.pub\n"));
     }
     // Staged under their bundle kind names; each pair installed the way
     // noo-apply does (root, key 0600, cert 0644, temp + rename).
@@ -2832,6 +2859,8 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
     let leaf_ca = crate::pki::ClusterCa::new(pki.clone());
     ensure_door_leaves_try(&leaf_ca, node)?;
 
+    leaf_ca.ensure_signing_key().map_err(|e| format!("could not read or mint the fleet signing key: {e}"))?;
+    let signing_pub = read_or_fail_path(&leaf_ca.signing_pub_path())?;
     let creds = sops_credentials(&root)?;
     nstep(&format!("obtaining noo-node-agent ({goarch})"));
     let binary = obtain_agent_binary(&root, goarch).map_err(|e| format!(
@@ -2905,6 +2934,7 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
         .map_err(|e| format!("{}: {e}", p.display()));
     let asf = local_agent_secret_files_script(super::enroll::asset_apply());
     let staged = local_bundle(node, LocalInputs {
+        signing_pub: signing_pub.clone(),
         agent_env: env_body.into_bytes(),
         nats_creds,
         agent_binary: binary,
@@ -3003,6 +3033,10 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
             nnote(&format!("could not record {} ({e}) — the next run reinstalls everything", state_path.display()));
         }
     }
+    // Reaching here means the root install exited 0 (or a previous run's
+    // record says this exact key is already there): this node HOLDS the
+    // current signing key, which is what the marker means.
+    mark_signing_adopted(&leaf_ca, node, &signing_pub);
     write_self_lane(node, SelfLaneRecord::Onboard);
     // The rail from here on: the gateway reads the birth cert from the
     // PKI's certificate-only view, which the CLI keeps (no sudo).
@@ -5521,6 +5555,7 @@ mod local_lane_tests {
 
     fn inputs(nats_creds: Vec<u8>) -> LocalInputs {
         LocalInputs {
+            signing_pub: b"-----BEGIN PUBLIC KEY-----\nsp\n-----END PUBLIC KEY-----\n".to_vec(),
             agent_env: b"NODE_ID=ctrl\nCONTROLLER_URL=https://ctrl:8080\n".to_vec(),
             nats_creds,
             agent_binary: b"\x7fELF-agent".to_vec(),
@@ -5548,6 +5583,25 @@ mod local_lane_tests {
         for k in ["ca.crt", "node.crt", "node.key", "svc-vllm.crt", "svc-vllm.key", "agent-binary", "agent-unit", "secret-files"] {
             assert!(kinds.contains(&k), "{k} missing from {kinds:?}");
         }
+    }
+
+    /// i276: the controller's own node gets the signing public key from the
+    /// local install, installed the way noo-apply installs it, and the
+    /// controller then records the adoption it has just proved.
+    #[test]
+    fn the_local_install_delivers_the_signing_key_and_records_the_adoption() {
+        let b = local_bundle("ctrl", inputs(creds("ctrl", "pw-1"))).unwrap();
+        assert!(b.iter().any(|(k, body)| k == "signing-pub" && body.starts_with(b"-----BEGIN PUBLIC KEY")), "signing-pub is staged");
+        let s = script(&["signing-pub"], false);
+        assert!(s.contains("\"/w/signing-pub\" /etc/noo/pki/signing.pub"), "{s}");
+        assert!(!script(&["agent-binary"], true).contains("signing.pub"), "unchanged key: not reinstalled");
+
+        let dir = std::env::temp_dir().join(format!("noo-i276-adopt-{}", std::process::id()));
+        let ca = crate::pki::ClusterCa::new(dir.clone());
+        assert!(!ca.signing_adopted("ctrl"));
+        mark_signing_adopted(&ca, "ctrl", b"-----BEGIN PUBLIC KEY-----\nsp\n-----END PUBLIC KEY-----\n");
+        assert!(ca.signing_adopted("ctrl"), "the marker `cluster verify` reads is written");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

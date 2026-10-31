@@ -36,6 +36,19 @@ pub(crate) fn compose_files(ctx: &Ctx) -> Vec<String> {
     compose_files_in(&ctx.repo_root, ctx.dry_run, &ctx.compose_file, &ctx.override_file)
 }
 
+/// This install's compose file list for `root`, with no `Ctx` (the doctor and
+/// `cluster verify` have none): the same `lib-compose.sh compose_file_list`
+/// answer `compose_files` gives, absolute paths, base+override when the
+/// helper is not on disk.
+pub(crate) fn install_compose_files(root: &Path) -> Vec<String> {
+    compose_files_in(
+        root,
+        false,
+        &root.join("docker-compose.cluster.yml"),
+        &root.join("docker-compose.override.yml"),
+    )
+}
+
 /// The list itself, with the install root and the fallback pair passed in so
 /// a test can point it at a scratch tree. Asks `scripts/lib-compose.sh`
 /// (the ONE home) and only falls back to base+override
@@ -402,9 +415,9 @@ pub fn run_compose_streamed(ctx: &Ctx, args: &[&str]) -> i32 {
     let mut cmd = compose_command(ctx, &full);
     cmd.current_dir(&ctx.repo_root).stdin(Stdio::null());
     launcher_env(ctx, &mut cmd);
-    // Only `up` prints the per-container churn worth collapsing; pull and
-    // build progress stays live.
-    if args.contains(&"up") {
+    // `up` (per-container churn) and `pull` (per-layer progress) are worth
+    // collapsing; build progress stays live.
+    if args.contains(&"up") || args.contains(&"pull") {
         stream_status_summarised(ctx, cmd)
     } else {
         stream_status(ctx, cmd)
@@ -459,6 +472,27 @@ enum ContainerEnd {
 #[derive(Default, Debug)]
 pub struct ComposeTally {
     containers: std::collections::BTreeMap<String, ContainerEnd>,
+    /// `docker compose pull` layer progress: layer id -> true when its last
+    /// state was `Already exists` (nothing fetched).
+    layers: std::collections::BTreeMap<String, bool>,
+}
+
+/// Layer states `docker compose pull` prints after a 12-hex layer id. A line
+/// may carry a trailing byte count (`Downloading 20.97MB`); only the state
+/// is matched, so an `Error: ...` after an id is not progress.
+const LAYER_STATES: [&str; 8] = [
+    "Pulling fs layer",
+    "Waiting",
+    "Downloading",
+    "Verifying Checksum",
+    "Download complete",
+    "Extracting",
+    "Pull complete",
+    "Already exists",
+];
+
+fn is_layer_id(w: &str) -> bool {
+    w.len() == 12 && w.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 impl ComposeTally {
@@ -500,7 +534,19 @@ impl ComposeTally {
             // Network/Volume/Image lines and the legacy "[+] Running 3/3" header.
             Some("Network") | Some("Volume") | Some("Image") => words.next().is_some(),
             Some("[+]") => true,
-            _ => false,
+            // `<12-hex layer id> <state> [size]` from `docker compose pull`.
+            Some(id) if is_layer_id(id) => {
+                let rest = words.collect::<Vec<_>>().join(" ");
+                if LAYER_STATES.iter().any(|st| rest.starts_with(st)) {
+                    self.layers.insert(id.to_string(), rest.starts_with("Already exists"));
+                    true
+                } else {
+                    false
+                }
+            }
+            // Per-service `<service> Pulling` / `<service> Pulled`.
+            Some(_) => matches!(words.collect::<Vec<_>>().as_slice(), ["Pulling"] | ["Pulled"]),
+            None => false,
         };
         !progress || loud
     }
@@ -512,6 +558,16 @@ impl ComposeTally {
 
     fn count(&self, end: ContainerEnd) -> usize {
         self.containers.values().filter(|e| **e == end).count()
+    }
+
+    /// `images pulled: 31 layers (12 already present)`; None when no layer line was seen.
+    pub fn pull_summary(&self) -> Option<String> {
+        let total = self.layers.len();
+        if total == 0 {
+            return None;
+        }
+        let present = self.layers.values().filter(|p| **p).count();
+        Some(format!("images pulled: {total} layer{} ({present} already present)", if total == 1 { "" } else { "s" }))
     }
 
     /// `25 containers: 25 started, 0 failed`; None when no container line was seen.
@@ -547,6 +603,13 @@ impl ComposeTally {
 /// The live path feeds `ComposeTally` line by line; this is its test seam.
 #[cfg(test)]
 pub fn summarise_compose(lines: &[&str]) -> (String, Vec<String>) {
+    let (pulls, summary, pass) = summarise_compose_all(lines);
+    (if pulls.is_empty() { summary } else { format!("{pulls}\n{summary}").trim_end().to_string() }, pass)
+}
+
+/// [`summarise_compose`] with the pull summary kept apart from the container one.
+#[cfg(test)]
+pub fn summarise_compose_all(lines: &[&str]) -> (String, String, Vec<String>) {
     let mut tally = ComposeTally::default();
     let mut pass = Vec::new();
     for l in lines {
@@ -554,7 +617,7 @@ pub fn summarise_compose(lines: &[&str]) -> (String, Vec<String>) {
             pass.push((*l).to_string());
         }
     }
-    (tally.summary().unwrap_or_default(), pass)
+    (tally.pull_summary().unwrap_or_default(), tally.summary().unwrap_or_default(), pass)
 }
 
 /// Run `cmd` with its output piped: passthrough lines are printed live on the
@@ -622,7 +685,7 @@ pub fn stream_status_summarised(ctx: &Ctx, cmd: Command) -> i32 {
     match run_summarised(cmd) {
         Ok((status, tally)) => {
             let code = status.code().unwrap_or(1);
-            if let Some(s) = tally.summary() {
+            for s in [tally.pull_summary(), tally.summary()].into_iter().flatten() {
                 if tally.failed() > 0 || code != 0 {
                     ctx.error(&s);
                 } else {
@@ -1534,5 +1597,57 @@ mod compose_summary_tests {
         let (summary, pass) = summarise_compose(&["hello"]);
         assert_eq!(summary, "");
         assert_eq!(pass, vec!["hello".to_string()]);
+    }
+
+    const PULL: &str = " 7eb306f54786 Pulling fs layer 0B
+ f534929ea814 Download complete 0B
+ 44136fa355b3 Already exists 0B
+ 9e0fb49fcc15 Waiting 0B
+ 9e0fb49fcc15 Downloading 20.97MB
+ 9e0fb49fcc15 Downloading 22.02MB
+ 9e0fb49fcc15 Downloading 22.02MB
+ 9e0fb49fcc15 Verifying Checksum 0B
+ 9e0fb49fcc15 Extracting 1B
+ 9e0fb49fcc15 Pull complete 0B
+ 7eb306f54786 Pull complete 0B
+ f534929ea814 Pull complete 0B
+ noo-gateway Pulling
+ noo-gateway Pulled
+ Image ghcr.io/example/gateway:1 Pulled";
+
+    #[test]
+    fn a_pull_transcript_is_one_summary_line_and_no_passthrough() {
+        let (pulls, containers, pass) = summarise_compose_all(&lines(PULL));
+        assert_eq!(pulls, "images pulled: 4 layers (1 already present)");
+        assert_eq!(containers, "");
+        assert!(pass.is_empty(), "layer progress must be absorbed: {pass:?}");
+    }
+
+    #[test]
+    fn a_pull_error_still_passes_through() {
+        let t = format!("{PULL}\n 9e0fb49fcc15 Error: unexpected EOF\nError response from daemon: pull access denied");
+        let (pulls, _containers, pass) = summarise_compose_all(&lines(&t));
+        assert_eq!(pulls, "images pulled: 4 layers (1 already present)");
+        assert_eq!(
+            pass,
+            vec![" 9e0fb49fcc15 Error: unexpected EOF".to_string(), "Error response from daemon: pull access denied".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_up_transcript_has_no_pull_summary() {
+        let (pulls, containers, pass) = summarise_compose_all(&lines(HAPPY));
+        assert_eq!(pulls, "");
+        assert_eq!(containers, "3 containers: 3 started, 0 failed");
+        assert!(pass.is_empty());
+    }
+
+    #[test]
+    fn a_non_layer_hex_looking_word_is_not_absorbed() {
+        // 11 chars, uppercase, and a real id with an unknown state all pass through.
+        let t = ["7eb306f5478 Pull complete", "7EB306F54786 Pull complete", "7eb306f54786 exploded"];
+        let (pulls, _c, pass) = summarise_compose_all(&t);
+        assert_eq!(pulls, "");
+        assert_eq!(pass.len(), 3);
     }
 }

@@ -70,7 +70,6 @@ func (f *fakeImageRail) install(t *testing.T) {
 		f.local[ref] = "sha256:registry"
 		return nil
 	}
-	t.Setenv(imagesource.ModeEnv, imagesource.ModeRail)
 	resetRailBackoff()
 	imagesource.Reset()
 	prevMem := railMemoryPath
@@ -241,28 +240,20 @@ func TestTransportFailureRunsTheLocalCopyAndBacksOff(t *testing.T) {
 	}
 }
 
-// NOO_IMAGE_SOURCE=legacy (the default this release): the pre-rail
-// behaviour — local if present, else the registry — with provenance still
-// reported. The rail and the controller are never asked.
-func TestLegacyModeIsThePreRailBehaviour(t *testing.T) {
-	f := &fakeImageRail{local: map[string]string{"ollama/ollama:latest": "sha256:o"}, staged: stagedAt(ownRef, "sha256:new")}
+// NOO_IMAGE_SOURCE is retired: whatever it holds (legacy included), an
+// absent staged image is taken over the rail and never from the registry.
+func TestRetiredImageSourceVariableIsIgnored(t *testing.T) {
+	f := &fakeImageRail{local: map[string]string{}, staged: stagedAt(ownRef, "sha256:new")}
 	f.install(t)
-	t.Setenv(imagesource.ModeEnv, "")
-	if imagesource.Mode() != imagesource.ModeLegacy {
-		t.Fatal("unset must mean legacy for this release")
-	}
-	c := &Client{}
-	if err := c.EnsureImage(context.Background(), ownRef); err != nil {
+	t.Setenv(imagesource.RetiredEnv, "legacy")
+	if err := (&Client{}).EnsureImage(context.Background(), ownRef); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.EnsureImage(context.Background(), "ollama/ollama:latest"); err != nil {
-		t.Fatal(err)
+	if len(f.railPulls) != 1 || len(f.registryPull) != 0 {
+		t.Errorf("legacy value must be ignored: rail %v registry %v", f.railPulls, f.registryPull)
 	}
-	if len(f.railPulls) != 0 || len(f.registryPull) != 1 || f.registryPull[0] != ownRef {
-		t.Errorf("legacy: rail %v registry %v", f.railPulls, f.registryPull)
-	}
-	if sourceOf(t, ownRef) != imagesource.Registry || sourceOf(t, "ollama/ollama:latest") != imagesource.Local {
-		t.Errorf("legacy provenance still reported: %+v", imagesource.Report())
+	if sourceOf(t, ownRef) != imagesource.Rail {
+		t.Errorf("provenance: %+v", imagesource.Report())
 	}
 }
 

@@ -8,7 +8,7 @@ Does not cover: the Docker stack on THIS host (`noo stack`), or memory and the k
 
 - `noo cluster` is the **fleet**: nodes, their desired state, enrollment and teardown. `noo stack` (Stack & data) is the Docker stack on **this host** — start, stop, rebuild, clean.
 - `noo cluster place` **declares** that a node should run a backend with a model and lets the node-agent converge to it; `noo cluster down` is the older **imperative** stop call and is not remembered across an agent restart.
-- `noo inference run` sends one prompt straight to a backend; `noo inference agent` runs the coordinator's full agentic loop (plan, tools, reflect); `noo jobs run` queues the prompt through the scheduler and polls the job. `noo chat` (Agents & channels) is the streaming conversation.
+- `noo inference run` sends one prompt to the gateway (a plain model call with `--raw`); `noo inference agent` runs the coordinator's full agentic loop (plan, tools, reflect); `noo jobs run` queues the prompt through the scheduler and polls the job. `noo chat` (Agents & channels) is the streaming conversation.
 - `noo models` is the **catalog** (search, info, recommendations, pull through the gateway's Ollama proxy); getting a model onto a **specific node** is `noo cluster ship-model`, `sync-model-files` or a placement.
 - `noo autonomy` is the self-healing engine (condition → action patrols); `noo heartbeat` (Stack & data) is the cron scheduler for user-facing tasks.
 - `noo skills` runs **containerized code** in a sandbox on a node; `noo prompt-skills` (Memory & knowledge) are prompt templates; `noo tools` is the gateway's registry of the tools an agent may call.
@@ -432,7 +432,9 @@ noo jobs status <job-id> --wait
 noo jobs list --watch
 ```
 
-`inference run` posts to `/api/inference` and prints the response.
+`inference run` posts to `/api/inference` and prints the response. Without
+`--raw` the gateway runs its full pipeline first (RAG, memory, skills, tool
+schemas); `--raw` sends `context: false` for a plain model call.
 `-n <node>` names the node to try first: when it cannot answer, the pool
 does and the CLI says so (`! answered by <model> — <node> could not:
 …`). `--strict-node` keeps the prompt on that node alone and fails
@@ -583,7 +585,11 @@ one is matched to a managed container through its cgroup (method
 falls back to accounting: foreign = memory used − the expected footprint of
 the GPU backends it is running (vLLM: `GPU_MEMORY_UTILIZATION` × total)
 (method `memory-accounting`). A Mac or a node without an NVIDIA GPU reports
-`not-measured` and never yields.
+`not-measured` and never yields. The report's `unmeasured` key says why:
+`unified-memory` (Mac), `no-nvidia` (no `nvidia-smi`), `probe-timeout`
+(`nvidia-smi` missed its deadline on a busy GPU), or `driver-lost` (`nvidia-smi`
+is there but fails or prints "Unknown Error": the driver lost the GPU, Xid 79).
+`noo cluster verify` fails the `gpu` row for `driver-lost`.
 
 **When it yields.** The GPU is under pressure when foreign use is above
 `NOO_GPU_YIELD_FOREIGN_MB`, or when what is left after foreign use is less
@@ -830,7 +836,7 @@ drain_started, drained_at}`.
 ### `noo inference` — Run prompts on the GPU cluster
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo inference run` | `<prompt> [-m <model>] [-b <backend>] [-n <node> [--strict-node]] [-u <user>] [--max-tokens <n>] [-t <temperature>]` | Run one direct model inference through the gateway and print the response |
+| `noo inference run` | `<prompt> [-m <model>] [-n <node> [--strict-node]] [--raw] [-u <user>] [--max-tokens <n>] [-t <temperature>]` | Run one prompt; --raw skips mesh context (RAG, memory, skills) |
 | `noo inference agent` | `<prompt>` | Run a prompt through the gateway agent runner and print the response |
 
 ### `noo jobs` — Job queue & scheduler management

@@ -260,6 +260,10 @@ func (r *Reconciler) nativeBackends(ctx context.Context) map[string]string {
 // Run blocks until ctx cancels. First pass after a short delay (so
 // registration/heartbeat win the race), then every interval.
 func (r *Reconciler) Run(ctx context.Context) {
+	// The actuator routes answer from registration on, so the add-on
+	// workload declarations load now, not at the first tick 30 s away: a
+	// reserve right after an agent restart would meet 404 not_declared.
+	r.loadAddonWorkloads(ctx)
 	select {
 	case <-ctx.Done():
 		return
@@ -367,11 +371,28 @@ func (r *Reconciler) fetchDesired(ctx context.Context, t *tick) bool {
 	return true
 }
 
+// declareAddonWorkloads is the one place desired-config's addon_workloads
+// reach the actuator's table (the first fetch at registration and every tick).
+func declareAddonWorkloads(d *desiredConfig) { addonwl.SetDeclared(d.AddonWorkloads) }
+
+// loadAddonWorkloads fetches desired-config once and declares only the
+// add-on workloads. A failed fetch is left to the tick.
+func (r *Reconciler) loadAddonWorkloads(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	d, err := r.fetch(ctx)
+	if err != nil {
+		slog.Warn("reconcile.addon_workloads_early_load_failed", "error", err)
+		return
+	}
+	declareAddonWorkloads(d)
+}
+
 func (r *Reconciler) publishProfileAndEmbedTarget(ctx context.Context, t *tick) bool {
 	// Before the empty-state return below: the profile is the node's, not a
 	// placement's (the inference proxy reads first_byte_secs from it).
 	applyHarnessProfile(t.desired.HarnessProfile)
-	addonwl.SetDeclared(t.desired.AddonWorkloads)
+	declareAddonWorkloads(t.desired)
 	r.recordChatPlacement(t.desired.Placements)
 	// Before the empty-state return below: a node with nothing placed still
 	// has a disk to keep.

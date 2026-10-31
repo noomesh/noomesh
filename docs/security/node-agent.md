@@ -1196,11 +1196,13 @@ What this does and does not add:
   `config/harness-kinds.json`, and carried in the node's signed bundle; the
   node never fetches it
   ([../getting-started/supported-agent-harnesses.md](../getting-started/supported-agent-harnesses.md#vendor-clis-are-staged-by-the-controller)).
-- **Rollout switch.** `NOO_IMAGE_SOURCE=rail|legacy` (node-local env). The
-  first release that ships the rail defaults to `legacy` — the pre-rail
-  behaviour (local image, else its registry) — while the controller stages
-  and `noo cluster verify` reports provenance anyway. Set `rail` one node at
-  a time for the dry-run.
+- **The rail is the only image source.** There is no mode switch: images
+  come from the controller, never from a registry the node holds a
+  credential for. The retired `NOO_IMAGE_SOURCE` variable is ignored (and
+  logged once at startup). The heartbeat's `image_source_mode` is always
+  `rail`. `noo upgrade` refuses a node roll after a failed release stage
+  while any online Linux node exists, an older agent that becomes rail on
+  the roll included.
 - **Third-party public images** may fall back to their registry only under
   `NOO_IMAGE_REGISTRY_FALLBACK=public` (node-local; the default). Set it to
   `off` for a node that must never reach an internet registry. Every

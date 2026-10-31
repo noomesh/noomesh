@@ -3,7 +3,7 @@
 
 [package]
 name = "noo-cli"
-version = "0.6.14"
+version = "0.6.15"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "pai — Rust front-door CLI for Mesh. The only command-line front door: every verb is native."
@@ -13,6 +13,8 @@ name = "noo"
 path = "src/main.rs"
 
 [dependencies]
+# The add-on route manifest and the gateway's own rules (i302).
+addon-manifest = { path = "../crates/addon-manifest" }
 ureq = { version = "3", default-features = false, features = ["rustls", "json", "platform-verifier"] }
 serde_json = "1"
 sha2 = "0.11.1"

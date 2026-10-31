@@ -555,13 +555,14 @@ pub fn run_web(
             return 1;
         }
     };
-    serve_wizard(g, bridge, server, non_interactive, dry_run, reconfigure, skip, grace)
+    serve_wizard(g, bridge, server, non_interactive, dry_run, reconfigure, skip, grace, crate::envfile::repo_root())
 }
 
 /// Everything `run_web` does once the listener is bound. Split out so a test
 /// can bind port 0 itself, read the OS-assigned port off `Server`, and hand
 /// the live listener over — no pick-then-release window for a parallel test
-/// to steal the port in.
+/// to steal the port in — and hand the wizard its root, rather than setting
+/// `NOO_REPO_ROOT` for every test in the process.
 #[allow(clippy::too_many_arguments)]
 fn serve_wizard(
     g: &crate::Globals,
@@ -572,6 +573,7 @@ fn serve_wizard(
     reconfigure: bool,
     skip: super::Skip,
     grace: Duration,
+    repo_root: std::path::PathBuf,
 ) -> i32 {
     let url = format!("http://127.0.0.1:{}", server.port);
     println!("Starting Noomesh setup wizard at {url}");
@@ -590,7 +592,7 @@ fn serve_wizard(
     }));
 
     let web_ui = WebUi(bridge.clone());
-    let mut ctx = super::build_ctx(g, &web_ui, non_interactive, dry_run, skip);
+    let mut ctx = super::build_ctx_at(g, &web_ui, non_interactive, dry_run, skip, repo_root);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         super::drive(&mut ctx, reconfigure)
     }));
@@ -641,6 +643,15 @@ impl Default for Bridge {
 mod tests {
     use super::*;
     use std::io::Read as _;
+
+    /// A temp dir no other test, in this process or a parallel one, can name:
+    /// the pid alone is the same for every test in the binary, so a
+    /// pid-keyed name is shared by design and unique only by luck (309, #306).
+    fn unique_tmp(tag: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("noo-web-{tag}-{}-{n}", std::process::id()))
+    }
 
     /// One-shot HTTP request; returns the full raw response (headers + body).
     /// Works because every non-SSE route replies `Connection: close`.
@@ -872,7 +883,7 @@ mod tests {
 
     #[test]
     fn browse_lists_only_visible_dirs() {
-        let tmp = std::env::temp_dir().join(format!("noo-web-browse-{}", std::process::id()));
+        let tmp = unique_tmp("browse");
         std::fs::create_dir_all(tmp.join("Beta")).unwrap();
         std::fs::create_dir_all(tmp.join("alpha")).unwrap();
         std::fs::create_dir_all(tmp.join(".hidden")).unwrap();
@@ -926,10 +937,11 @@ mod tests {
         silence_aborts();
         // Hermetic repo root: an empty dir is never "already onboarded", so
         // the guard can't short-circuit the run on a configured dev host.
-        // (No other unit test reads NOO_REPO_ROOT — checked before adding.)
-        let root = std::env::temp_dir().join(format!("noo-web-e2e-{}", std::process::id()));
+        // Handed to the wizard, NOT set as NOO_REPO_ROOT: tests share one
+        // process, and envfile's and steps' tests resolve the root
+        // concurrently (309: this test once set it for all of them).
+        let root = unique_tmp("e2e");
         std::fs::create_dir_all(&root).unwrap();
-        std::env::set_var("NOO_REPO_ROOT", &root);
         let g = crate::Globals { json: false, verbose: false, gateway_override: None, timeout_secs: None, token: None, quiet: false };
         // Bind :0 and keep the listener: the OS-assigned port is read off
         // the live `Server` and the server is handed to the wizard as-is.
@@ -957,7 +969,7 @@ mod tests {
 
         std::thread::scope(|s| {
             let handle =
-                s.spawn(|| serve_wizard(&g, bridge, server, true, true, false, skip, Duration::from_secs(2)));
+                s.spawn(|| serve_wizard(&g, bridge, server, true, true, false, skip, Duration::from_secs(2), root.clone()));
 
             // The listener is already bound, so the first connect succeeds;
             // the wizard thread's progress is bounded by read_sse_until.

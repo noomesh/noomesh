@@ -1327,7 +1327,7 @@ async fn native_inference_tool(state: &AppState, call: &ToolCall, args: &Value) 
             NodeChat::NoChat(msg) => unmet = Some(format!("node '{node_id}' could not answer ({msg})")),
             NodeChat::Serves(backend_type, model_name, base_url) => {
                 let model_used = if node_from_model { model_name } else { model.clone().unwrap_or(model_name) };
-                match inf::chat_completion_on_node(&backend_type, &model_used, &base_url, &prompt).await {
+                match inf::chat_completion_on_node(&backend_type, &model_used, &base_url, &prompt, inf::Sampling::default()).await {
                     Ok(text) => return ok_result(call, text),
                     Err(e) if strict && inf::backend_cannot_chat(&e) => return err_result(
                         call,

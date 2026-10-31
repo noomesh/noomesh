@@ -1,0 +1,15 @@
+# Compose services the repo removed on purpose. One per line:
+#
+#   <service>  <YYYY-MM-DD removed>  <PR>
+#
+# A service named here must stay gone. The launchers (noomesh-start.sh,
+# noomesh-restart.sh, noomesh-rebuild.sh) remove a container of THIS install's
+# compose project whose com.docker.compose.service label is on this list,
+# before the whole-stack `up`, and say so. Nothing else is ever removed
+# automatically. `noo doctor orphans` and `noo cluster verify --controller`
+# FAIL while one still runs. Whole-line `#` comments only (the PR column
+# itself begins with `#`).
+#
+# Removing a service from any docker-compose*.yml requires a line here:
+# tests/test_retired_services.py fails otherwise.
+cluster-executor  2026-09-11  #98

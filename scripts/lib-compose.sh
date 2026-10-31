@@ -119,6 +119,103 @@ compose_file_args() {
     printf '%s' "${_cfa# }"
 }
 
+# The compose project of this install: COMPOSE_PROJECT_NAME, else the cluster
+# file's name:, else noomesh. ONE answer for the report and the removal below.
+_compose_project_name() {
+    _cpn="${COMPOSE_PROJECT_NAME:-}"
+    if [ -z "$_cpn" ]; then
+        _cpn="$(sed -n 's/^name:[[:space:]]*//p' "${1:-.}/docker-compose.cluster.yml" 2>/dev/null | head -n1)"
+        _cpn="${_cpn:-noomesh}"
+    fi
+    printf '%s' "$_cpn"
+}
+
+# ── Remove containers of RETIRED services, and only those (186b step 4) ────
+#
+# config/retired-services.txt (<service>  <YYYY-MM-DD>  <PR>, whole-line `#`
+# comments) lists compose services the repo removed on purpose; `up` leaves
+# their container running (noo-cluster-executor ran two days after #98, root,
+# with ~/.ssh mounted). Before the whole-stack `up` the launcher removes every
+# container, running OR stopped, of THIS install's project whose
+# com.docker.compose.service label is on that list, one line each:
+#
+#   - removed <name>: service <svc> was retired on <date> (<PR>)
+#
+# This is the only automatic removal and it is safe by declaration. It never
+# removes a container whose service is not on the list, one with no service
+# label (agent-managed backends), or one of another project. Exit status is
+# unchanged: a failed rm prints a line and the loop goes on; a list or a
+# docker call it cannot read is said, never read as "nothing retired".
+# $1 is the install root (the dir holding config/ and the compose files).
+compose_remove_retired() {
+    _crr_list="${1:-.}/config/retired-services.txt"
+    if [ ! -r "$_crr_list" ]; then
+        echo "! could not read $_crr_list, so retired services were NOT checked (not a pass): noo doctor orphans" >&2
+        return 0
+    fi
+    _crr_proj="$(_compose_project_name "${1:-.}")"
+    if ! _crr_run="$(docker ps -a --filter "label=com.docker.compose.project=$_crr_proj" \
+            --format '{{.Label "com.docker.compose.service"}} {{.Names}}' 2>/dev/null)"; then
+        echo "! could not list the containers of project $_crr_proj, so retired services were NOT checked (not a pass): noo doctor orphans" >&2
+        return 0
+    fi
+    printf '%s\n' "$_crr_run" | while read -r _crr_svc _crr_name; do
+        [ -n "$_crr_svc" ] && [ -n "$_crr_name" ] || continue
+        # "L <date> <PR…>" when the service is on the list; "L" alone is still a hit.
+        _crr_meta="$(awk -v s="$_crr_svc" '$1 == s { r = "L"; for (i = 2; i <= NF; i++) r = r " " $i; print r; exit }' "$_crr_list")"
+        [ -n "$_crr_meta" ] || continue
+        set -f
+        set -- $_crr_meta
+        shift
+        _crr_date="${1:-}"
+        [ $# -gt 0 ] && shift
+        _crr_pr="$*"
+        if docker rm -f "$_crr_name" >/dev/null 2>&1; then
+            echo "- removed $_crr_name: service $_crr_svc was retired on $_crr_date ($_crr_pr)"
+        else
+            echo "! could not remove $_crr_name (service $_crr_svc was retired on $_crr_date ($_crr_pr)): docker rm -f $_crr_name" >&2
+        fi
+    done
+    return 0
+}
+
+# ── Report (never reap) containers no compose file of this install declares ─
+#
+# `up` does not stop a container whose service was deleted from the compose
+# files (noo-cluster-executor ran two days after #98), and `up --remove-orphans`
+# is NEVER the answer: compose computes orphans against the services and
+# profiles of THAT invocation, and every call shape we have hands it a partial
+# picture (targeted services, profile set, add-on overlays that come and go).
+# So after a whole-stack `up` the launcher only SAYS what is left over:
+#
+#   ! <name> is not declared by any compose file of this install: docker rm -f <name>
+#
+# Declared = a service in $COMPOSE_FILES evaluated with --profile '*' (every
+# profile counts). Project = COMPOSE_PROJECT_NAME, else the cluster file's
+# name:, else noomesh (the pattern bootRestoreScript uses). Containers with
+# no com.docker.compose.service label (agent-managed backends) are never
+# candidates. Exit status is unchanged: this always returns 0, and when it
+# cannot compare it says so rather than reading as clean.
+compose_report_undeclared() {
+    _cru_proj="$(_compose_project_name "${1:-.}")"
+    # shellcheck disable=SC2086
+    if ! _cru_decl="$(docker compose $COMPOSE_FILES --profile '*' config --services 2>/dev/null)" || [ -z "$_cru_decl" ]; then
+        echo "! could not read the compose services of this install, so running containers were NOT compared with them (not a pass): noo doctor orphans" >&2
+        return 0
+    fi
+    if ! _cru_run="$(docker ps --filter "label=com.docker.compose.project=$_cru_proj" \
+            --format '{{.Label "com.docker.compose.service"}} {{.Names}}' 2>/dev/null)"; then
+        echo "! could not list the running containers of project $_cru_proj, so they were NOT compared with the compose files (not a pass): noo doctor orphans" >&2
+        return 0
+    fi
+    printf '%s\n' "$_cru_run" | while read -r _cru_svc _cru_name; do
+        [ -n "$_cru_svc" ] && [ -n "$_cru_name" ] || continue
+        printf '%s\n' "$_cru_decl" | grep -qxF -- "$_cru_svc" && continue
+        echo "! $_cru_name is not declared by any compose file of this install: docker rm -f $_cru_name" >&2
+    done
+    return 0
+}
+
 # ── Compose v2 is a prerequisite, and a pull failure says WHY ─────────────
 #
 # Ubuntu's `docker.io` ships WITHOUT the compose v2 plugin (separate

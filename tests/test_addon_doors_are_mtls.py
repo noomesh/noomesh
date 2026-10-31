@@ -58,6 +58,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 ADDONS_RS = ROOT / "gateway-rust" / "src" / "addons.rs"
 PROXY = ROOT / "gateway-rust" / "src" / "addon_proxy.rs"
+# The manifest rules (check_upstream among them) live in the crate the gateway
+# and `noo addons check` share (noomesh-internal i302).
+MANIFEST_RS = ROOT / "crates" / "addon-manifest" / "src" / "lib.rs"
 STEPS = ROOT / "noo-cli" / "src" / "onboard" / "steps.rs"
 
 # add-on → (cert env, key env, client-CA env) its listener reads. The
@@ -84,11 +87,11 @@ def _manifests() -> list[dict]:
 
 def test_every_manifest_dials_https() -> None:
     """The gateway refuses any manifest whose upstream is not https://."""
-    src = PROXY.read_text()
+    src = MANIFEST_RS.read_text()
     up = src[src.index("fn check_upstream("):]
     up = up[: up.index("\n}\n")]
     assert 'url.scheme() != "https"' in up, (
-        "addon_proxy::check_upstream must refuse a non-https base_url_default: the gateway "
+        "addon_manifest::check_upstream must refuse a non-https base_url_default: the gateway "
         "sends its bearer on every add-on call, so the door must be mTLS"
     )
     assert "container_of(addon)" in up, "the upstream host must be the add-on's own service"

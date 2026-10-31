@@ -1519,6 +1519,36 @@ if [ -f "$WORK/files/cli-binary" ] && [ -s "$WORK/files/cli-user" ]; then
     fi
 fi
 
+# BEGIN retire_container_env
+# The retired container era's compose env (i95). `noo cluster push-secrets`
+# once wrote the fleet credentials to ~/pai-assistant/.env; the agent reads
+# /etc/noo-node-agent.env and nothing reads the old file, but it still held
+# NOO_CLUSTER_SECRET, NOO_NODE_AGENT_TOKEN and the NATS pair at 0644 (robopi,
+# found 2026-09-05). Every bundle that carries the CLI names the node's user,
+# so the next upgrade removes it. AS THE USER, like the CLI install above:
+# root must not follow a symlink planted in a user's tree. Only a regular file
+# holding one of those keys is removed; anything else is left and said.
+# The controller's own bundle carries no CLI, so its tree is never touched.
+if [ -s "$WORK/files/cli-user" ]; then
+    _rce_user="$(tr -d ' \n\r' < "$WORK/files/cli-user")"
+    case "$_rce_user" in root|''|*[!a-z0-9_.-]*) _rce_user="" ;; esac
+    _rce_home=""
+    [ -z "$_rce_user" ] || _rce_home="$(getent passwd "$_rce_user" | cut -d: -f6)"
+    if [ -n "$_rce_home" ] && [ -d "$_rce_home" ]; then
+        _rce_out="$(runuser -u "$_rce_user" -- env HOME="$_rce_home" sh -c '
+            f="$HOME/pai-assistant/.env"
+            { [ -f "$f" ] && [ ! -L "$f" ]; } || exit 0
+            grep -qE "^(NOO_CLUSTER_SECRET|NOO_NODE_AGENT_TOKEN|NATS_USER|NATS_PASSWORD)=" "$f" || { echo kept; exit 0; }
+            rm -f "$f" && echo removed
+        ' 2>/dev/null)" || _rce_out=""
+        case "$_rce_out" in
+            removed) applied="$applied container-env-retired" ;;
+            kept) echo "noo-apply: $_rce_home/pai-assistant/.env holds no fleet credential — left in place" >&2 ;;
+        esac
+    fi
+fi
+# END retire_container_env
+
 # applier is handled in §1b (before the allowlist). Under NOO_APPLY_REEXEC
 # this IS the freshly installed applier: count it, or an applier-only
 # bundle ends in "contained nothing to apply" (exit 65) after a successful

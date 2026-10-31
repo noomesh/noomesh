@@ -294,8 +294,8 @@ mod tests {
     #[test]
     fn the_piece_route_must_be_internal_in_any_manifest() {
         // The gateway fetches and validates the piece; an add-on cannot
-        // publish the route itself (addon_proxy::CALLED_BY_NAME).
-        assert!(crate::addon_proxy::CALLED_BY_NAME.contains(&"console_piece"));
+        // publish the route itself (addon_manifest::CALLED_BY_NAME).
+        assert!(addon_manifest::CALLED_BY_NAME.contains(&"console_piece"));
         let mut m = crate::addon_proxy::tests::sample();
         m.routes.iter_mut().find(|r| r.name == "console_piece").unwrap().internal = false;
         assert!(crate::addon_proxy::validate(&m, "evolve").unwrap_err().contains("internal"));
