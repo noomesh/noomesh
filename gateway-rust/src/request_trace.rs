@@ -414,32 +414,45 @@ pub async fn trace_layer(axum::extract::State(state): axum::extract::State<Arc<A
     }
     // A streamed answer: the trace ends with the stream.
     let (parts, body) = response.into_parts();
-    let mut guard = StreamEnd { state, rec, status, bytes: 0, done: false };
+    let body = count_until_dropped(body, move |bytes| finish(&state, &rec, status, Some(bytes)));
+    Response::from_parts(parts, body)
+}
+
+/// Runs its callback once, with the bytes counted, when dropped.
+struct StreamEnd<F: FnOnce(i64)> {
+    bytes: i64,
+    on_end: Option<F>,
+}
+
+impl<F: FnOnce(i64)> Drop for StreamEnd<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.on_end.take() {
+            f(self.bytes);
+        }
+    }
+}
+
+/// `body`, counting its bytes, calling `on_end(bytes)` once when the stream
+/// is dropped: finished, cut by the client, or never read.
+///
+/// The guard is moved into the closure WHOLE, through `let end = &mut guard`.
+/// Written as `guard.bytes += …`, edition-2021 closures capture just that
+/// field: a copied i64. The guard itself then dropped when the layer
+/// returned, so the trace closed at the headers with 0 bytes (caught by the
+/// batch on #593).
+fn count_until_dropped<F>(body: Body, on_end: F) -> Body
+where
+    F: FnOnce(i64) + Send + 'static,
+{
+    let mut guard = StreamEnd { bytes: 0, on_end: Some(on_end) };
     let stream = body.into_data_stream().map(move |chunk| {
+        let end = &mut guard;
         if let Ok(c) = &chunk {
-            guard.bytes += c.len() as i64;
+            end.bytes += c.len() as i64;
         }
         chunk
     });
-    Response::from_parts(parts, Body::from_stream(stream))
-}
-
-/// Closes a streamed request's trace when its body stream is dropped.
-struct StreamEnd {
-    state: Arc<AppState>,
-    rec: Arc<Recorder>,
-    status: u16,
-    bytes: i64,
-    done: bool,
-}
-
-impl Drop for StreamEnd {
-    fn drop(&mut self) {
-        if !self.done {
-            self.done = true;
-            finish(&self.state, &self.rec, self.status, Some(self.bytes));
-        }
-    }
+    Body::from_stream(stream)
 }
 
 /// End a request's trace: its spans to the exporter, its summary row to
@@ -778,6 +791,34 @@ mod tests {
         assert_eq!(s.actor.as_deref(), Some("alice"));
         assert_eq!(s.actor_kind.as_deref(), Some("user"));
         assert_eq!(current_trace_id(), None);
+    }
+
+    /// A streamed body's trace ends when the STREAM does, with its bytes: not
+    /// when the layer returns, and not with 0. Fails on the field-capture
+    /// version (the callback ran before a byte was read, with 0).
+    #[tokio::test]
+    async fn a_streamed_body_ends_its_trace_with_its_bytes_when_it_is_done() {
+        let seen: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let chunks: Vec<Result<axum::body::Bytes, std::io::Error>> =
+            vec![Ok("data: one\n\n".into()), Ok("data: two\n\n".into())];
+        let body = count_until_dropped(Body::from_stream(futures::stream::iter(chunks)), move |b| {
+            s.lock().expect("lock").push(b);
+        });
+        assert!(seen.lock().expect("lock").is_empty(), "the trace ended before the stream was read");
+        let got = axum::body::to_bytes(body, usize::MAX).await.expect("the body reads");
+        assert_eq!(got.len(), 22);
+        assert_eq!(*seen.lock().expect("lock"), vec![22], "ended once, with every byte counted");
+    }
+
+    /// A client that goes away mid-stream still ends the trace, once.
+    #[tokio::test]
+    async fn a_dropped_stream_ends_its_trace_once() {
+        let seen: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let body = count_until_dropped(Body::from("abc"), move |b| s.lock().expect("lock").push(b));
+        drop(body);
+        assert_eq!(*seen.lock().expect("lock"), vec![0]);
     }
 
     #[test]
