@@ -216,6 +216,7 @@ mod tools;
 mod web_search;
 mod tts_client;
 mod usage;
+mod request_trace;
 mod verify;
 mod websocket;
 mod worker_client;
@@ -680,6 +681,8 @@ async fn main() -> Result<()> {
     erasure_archive::spawn(state.clone());
     // Bounds noo_autonomy_audit (90 days), daily.
     autonomy_audit::spawn(state.clone());
+    // Request tracing (i359): the Tempo exporter and the 30-day summary prune.
+    request_trace::spawn(state.clone());
 
     // Autonomy engine — periodic evaluation of monitor locations
     // (cluster health, backend availability, cert expiry, etc.). All

@@ -887,6 +887,30 @@ them be — and promtail keeps shipping duplicates until you remove it.
 `noo doctor orphans` lists them; then `docker rm -f noo-promtail
 noo-docker-socket-proxy` (the container prefix is `NOO_CONTAINER_PREFIX`).
 
+## Request tracing
+
+Every request the gateway serves becomes a trace (i359, operator decision
+2026-10-31: trace everything, keep 30 days, metadata and sizes only, never
+prompt or answer text). Two places hold it:
+
+- **`noo_request_trace` (Postgres)**, one row per request: when, the route
+  TEMPLATE (`/api/tasks/{id}`, never the filled-in path), method, status,
+  duration, who (`actor`, and `user_uuid` when that is an account), the model,
+  backend and node that answered, prompt and completion tokens, and request and
+  response sizes. `noo_token_usage.trace_id` links each completion to the
+  request that spent it. A daily prune keeps 30 days (a constant, not a
+  setting). An account erase removes the account's rows.
+- **Tempo**, the spans, when `NOO_TEMPO_OTLP_URL` is set: one server span per
+  request with the same facts as attributes, sent as OTLP/HTTP JSON with the
+  gateway's own leaf.
+
+A caller that sends a W3C `traceparent` header is continued (its trace id, the
+gateway's span parented on the caller's); every traced response answers with a
+`traceparent` header naming the gateway's span, so a client can find its own
+trace. A streamed answer's trace ends when the stream does.
+
+Not traced: `/health`, `/metrics`, `/static/` and the node log push.
+
 ## Health endpoints
 
 | Service | Endpoint | Returns |
