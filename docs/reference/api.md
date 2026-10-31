@@ -215,7 +215,8 @@ served model name; it is never a node. A class is an ordered list of
 class set`), or — with nothing declared — one derived class per served
 model. Undeclared, `chat-default` (aliases `default`, `auto`, and an
 absent `model`) is **dynamic**: every live chat node in the mesh, whatever
-it serves, ranked per request (healthy, not stalled in the last 5 min, not
+it serves, ranked per request (healthy, including the node not reporting
+the backend as not serving; not stalled in the last 5 min; not
 thermally hot, GPU not shared, vLLM/GPU before CPU, larger model, fewest
 in flight, load; quarantined and thermal-`critical` nodes only when
 nothing else is left). A declared `chat-default` puts its candidates first.

@@ -202,7 +202,8 @@ class is a preference, not a fence: when none of its candidates can
 answer, every other live chat node follows in the dynamic ranking below,
 and a model nothing serves is answered by `chat-default`. With nothing declared, every served model is its own class and
 `chat-default` is **dynamic**: every live chat node in the mesh, whatever
-model it serves, ranked per request — healthy before not, a node that
+model it serves, ranked per request — healthy before not (a backend its
+node reports as not serving counts as not healthy), a node that
 stalled in the last 5 minutes after one that did not, thermal
 `serious`/`critical` after cooler, a GPU shared with another workload
 after a free one, vLLM then a GPU runtime then CPU, the larger model first,

@@ -221,6 +221,12 @@ pub struct NodeFacts {
     /// `gpu_contention.paused_backends`: lanes the node yielded; never
     /// candidates while listed.
     pub paused_backends: Vec<String>,
+    /// `(backend, reason)` whose `backend_containers.<b>.serving` is
+    /// `false`: the agent saw its model server fail to answer (185b case 2,
+    /// a wedged engine behind a beating agent). Only an explicit `false`
+    /// counts; an agent that predates the field reports nothing and every
+    /// backend reads as serving.
+    pub not_serving: Vec<(String, String)>,
 }
 
 /// One row of `noo_backend_placements` as the table needs it:
@@ -542,11 +548,25 @@ pub fn rank_reason(c: &Candidate, in_flight: usize, stalled: bool) -> String {
     out
 }
 
-/// One `mesh_nodes` record's health by the class table's rule
-/// ([`health_of`]): the definition the KV-scan resolver shares (185b).
+/// One backend of a `mesh_nodes` record, by the class table's rule
+/// ([`backend_health`]): the definition the KV-scan resolver shares (185b).
 /// `data` carries the reachability verdict already (`apply_inbound`).
-pub(crate) fn node_health(key: &str, data: &Value, now_unix: f64) -> (bool, String) {
-    health_of(&node_facts_from_kv(key, data, &[], now_unix))
+pub(crate) fn node_health(key: &str, data: &Value, backend: &str, now_unix: f64) -> (bool, String) {
+    backend_health(&node_facts_from_kv(key, data, &[], now_unix), backend)
+}
+
+/// The node's health ([`health_of`]), then whether the agent reports this
+/// backend's model server as answering.
+fn backend_health(n: &NodeFacts, backend: &str) -> (bool, String) {
+    let (healthy, why) = health_of(n);
+    if !healthy {
+        return (healthy, why);
+    }
+    match n.not_serving.iter().find(|(b, _)| b == backend) {
+        Some((_, reason)) if reason.is_empty() => (false, format!("{backend} not serving")),
+        Some((_, reason)) => (false, format!("{backend} not serving: {reason}")),
+        None => (true, String::new()),
+    }
 }
 
 fn health_of(n: &NodeFacts) -> (bool, String) {
@@ -579,7 +599,7 @@ fn url_for(n: &NodeFacts, backend: &str) -> String {
 }
 
 fn candidate(n: &NodeFacts, backend: &str, model: &str, position: usize, degraded: bool, status: CandidateStatus) -> Candidate {
-    let (healthy, health) = health_of(n);
+    let (healthy, health) = backend_health(n, backend);
     Candidate {
         node_id: n.node_id.clone(),
         backend: backend.to_string(),
@@ -1296,6 +1316,16 @@ pub fn node_facts_from_kv(key: &str, data: &Value, non_chat: &[(String, String)]
             .pointer("/gpu_contention/paused_backends")
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
+        not_serving: data
+            .get("backend_containers")
+            .and_then(Value::as_object)
+            .map(|o| {
+                o.iter()
+                    .filter(|(_, c)| c.get("serving").and_then(Value::as_bool) == Some(false))
+                    .map(|(b, c)| (b.clone(), c.get("serving_reason").and_then(Value::as_str).unwrap_or("").to_string()))
+                    .collect()
+            })
             .unwrap_or_default(),
         node_id,
     }
@@ -2416,6 +2446,36 @@ mod tests {
         let sel = select_with(&t, None, None, false, &|_| false, &idle, &fresh).unwrap();
         let order: Vec<String> = sel.candidates.iter().map(|c| format!("{}/{}", c.node_id, c.backend)).collect();
         assert_eq!(order, ["pop-os/ollama", "mcmini/ollama"], "shared GPU sorts after a free one; the paused lane is gone");
+    }
+
+    /// 185b case 2: mcmini's agent beats, but its ollama stopped answering.
+    /// The GPU 12B would win on rank; reported not serving, it sorts after
+    /// pop-os and says why. Its llamacpp on the same node is untouched.
+    #[test]
+    fn a_backend_the_agent_reports_not_serving_sorts_last_and_says_why() {
+        let rec = serde_json::json!({
+            "id": "mcmini", "ip_address": "100.64.1.2", "load": 0.4, "last_heartbeat": 1000.0,
+            "running_backends": {"ollama": "gemma4:12b", "llamacpp": "gemma4:26b-a4b-it-qat"},
+            "backend_containers": {
+                "ollama": {"running": true, "serving": false, "serving_reason": "probe timed out after 60s"},
+                "llamacpp": {"running": true, "serving": true},
+            },
+        });
+        let f = node_facts_from_kv("mcmini", &rec, &[], 1001.0);
+        assert_eq!(f.not_serving, vec![("ollama".to_string(), "probe timed out after 60s".to_string())]);
+        let mut m = incident()[1].clone();
+        m.not_serving = f.not_serving.clone();
+        let t = build_table(&[incident()[0].clone(), m], &[], &Declarations::default());
+        let sel = select_with(&t, None, None, false, &|_| false, &idle, &fresh).unwrap();
+        let order: Vec<&str> = sel.candidates.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(order, ["pop-os", "mcmini"], "the wedged GPU 12B no longer wins");
+        assert!(!sel.candidates[1].healthy);
+        assert_eq!(sel.candidates[1].health, "ollama not serving: probe timed out after 60s");
+        // Without the report the same table puts mcmini first: the sort, not the fixture, moved it.
+        let t = build_table(&incident(), &[], &Declarations::default());
+        assert_eq!(first_node(&select_with(&t, None, None, false, &|_| false, &idle, &fresh).unwrap()), "mcmini");
+        let other = backend_health(&f, "llamacpp");
+        assert!(other.0, "{other:?}");
     }
 }
 

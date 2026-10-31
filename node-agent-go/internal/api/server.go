@@ -102,6 +102,12 @@ type Server struct {
 	// heartbeat reads it ready (backend_warm.go). Built on first use.
 	warmer   *backendWarmer
 	warmOnce sync.Once
+
+	// serving is the evidence that each engine answers, reported as
+	// `backend_containers.<b>.serving` (backend_serving.go). Built on first
+	// use.
+	serving     *backendServing
+	servingOnce sync.Once
 }
 
 // nativeBackends is the set served natively on this host, backend -> model.

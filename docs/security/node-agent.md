@@ -999,6 +999,23 @@ registration, as `backend_containers`:
 `health` is left out when the container has no healthcheck. The map is
 left out entirely when docker cannot be listed.
 
+A chat engine (`vllm`, `vllm-secondary`, `llamacpp`) also carries
+`serving`: whether its model server is answering. Docker's health cannot
+tell: a hung vLLM engine passes its healthcheck while every request times
+out. The agent counts what its inference proxy relays: the engine's first
+body byte is an answer, and a failed upstream call or a 5xx is a failure. A
+caller that went away counts as neither. An engine with no evidence for 5
+minutes, and nothing in flight, gets one probe: a one-token chat bounded at
+60 s. Two relayed failures in a row, or one failed probe, report
+`"serving": false` with a `serving_reason`. The probe then repeats every
+60 s, and the first answer reports `true` again. The key is left out until
+there is evidence and while the engine is still warming up. A recreated
+container starts over. Ollama is not probed, since a probe would load a
+model nobody asked for. The gateway ranks a backend reported as not
+serving with the unhealthy ones, after every healthy candidate, so it still
+answers when nothing else can. A missing key counts as serving, which is
+how an older agent's heartbeat reads.
+
 The `backend doors` row reads **starting**, not a failure, only when every
 problem on it is "the node holds no leaf yet" or that `backend_tls`
 refusal, and every backend involved is reported running, started less than

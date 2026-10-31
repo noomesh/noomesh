@@ -917,6 +917,8 @@ func (a *Agent) backendContainers() map[string]any {
 		m = a.docker.BackendContainersBeside(a.lifeCtx(), adopted)
 		// One warm request per vLLM start before it reads ready (i305).
 		a.server.GateBackendWarmup(a.lifeCtx(), m)
+		// Is each engine answering (185b): after the warmup, which it reads.
+		a.server.GateBackendServing(a.lifeCtx(), m)
 	}
 	if a.ollama == nil {
 		occupancy.Annotate(m)
