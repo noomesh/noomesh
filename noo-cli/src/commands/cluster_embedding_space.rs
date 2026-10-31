@@ -12,6 +12,7 @@
 //! `/api/external/embeddings`. A space's model does not change by setting
 //! (that is a re-embed: `migrate`); a new purpose is a new space.
 
+use crate::args::{ArgError, Args};
 use crate::http::{delete_json, get_json, post_json, put_json};
 use crate::output::{fail, ExitCode};
 use crate::ui::{self, Col, Glyph};
@@ -155,24 +156,21 @@ pub(crate) fn space_rows(body: &serde_json::Value) -> SpaceRows {
     SpaceRows { rows, no_live, unmatched, migrations }
 }
 
+pub(crate) fn parse_set_with(a: &mut Args) -> Result<(String, String, Option<String>), ArgError> {
+    let dims = a.value(&["--dims"])?;
+    let [space, model]: [String; 2] = a.positionals()?.try_into().map_err(|_| ArgError::new("expected <space> <model>"))?;
+    Ok((space, model, dims))
+}
+
 /// `noo cluster embedding-space set <space> <model> [--dims <n>]`
 pub fn cluster_embedding_space_set(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut positional: Vec<&String> = Vec::new();
-    let mut dims: Option<u64> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--dims" => {
-                let v = iter.next().ok_or(Unhandled)?;
-                dims = Some(v.parse().unwrap_or_else(|_| {
-                    fail(g.json, ExitCode::Usage, "bad_dims", &format!("--dims takes a vector width (e.g. 1024), not '{v}'"), None)
-                }));
-            }
-            t if t.starts_with('-') => return Err(Unhandled),
-            _ => positional.push(tok),
-        }
-    }
-    let [space, model] = positional[..] else { return Err(Unhandled) };
+    let (space, model, dims) = parse_set_with(&mut Args::new(args))?;
+    let (space, model) = (&space, &model);
+    let dims: Option<u64> = dims.map(|v| {
+        v.parse().unwrap_or_else(|_| {
+            fail(g.json, ExitCode::Usage, "bad_dims", &format!("--dims takes a vector width (e.g. 1024), not '{v}'"), None)
+        })
+    });
     let mut body = serde_json::json!({"model": model});
     if let Some(d) = dims {
         body["dims"] = serde_json::json!(d);

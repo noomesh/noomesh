@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::urlencode;
+use crate::args::{ArgError, Args};
 use crate::http::{delete_json_try, get_json, get_json_poll};
 use crate::output::{fail, ExitCode};
 use crate::ui::{self, Col};
@@ -293,20 +294,23 @@ pub(crate) fn render_list(ops: &[Value]) -> String {
 
 // ───────────────────────────── commands ─────────────────────────────
 
+/// `noo ops list` and bare `noo ops` share this: every `list` token is dropped
+/// first (the verb word itself, whichever way it arrived).
+fn args_without_list(args: &[String]) -> Vec<String> {
+    args.iter().filter(|a| a.as_str() != "list").cloned().collect()
+}
+
+pub(crate) fn parse_list_with(a: &mut Args) -> Result<(Option<String>, bool, Option<u32>), ArgError> {
+    let status = a.value(&["--status", "-s"])?;
+    let mine = a.flag(&["--mine"]);
+    let limit = a.number::<u32>(&["--limit", "-n"])?;
+    a.finish()?;
+    Ok((status, mine, limit))
+}
+
 /// `noo ops [list] [--status <s>] [--mine] [--limit <n>]` — GET /api/v1/ops.
 pub fn ops_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut status: Option<String> = None;
-    let mut mine = false;
-    let mut limit: Option<u32> = None;
-    let mut iter = args.iter().filter(|a| a.as_str() != "list");
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--status" | "-s" => status = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--mine" => mine = true,
-            "--limit" | "-n" => limit = Some(iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?),
-            _ => return Err(Unhandled),
-        }
-    }
+    let (status, mine, limit) = parse_list_with(&mut Args::new(&args_without_list(args)))?;
     let mut path = String::from("/api/v1/ops?");
     if mine {
         path.push_str("mine=1&");

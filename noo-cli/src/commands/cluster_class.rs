@@ -19,6 +19,7 @@
 //! ranked per request (quality, health, thermal, stalls, load). Declaring
 //! `chat-default` replaces that with the operator's list.
 
+use crate::args::{ArgError, Args};
 use crate::http::{delete_json, get_json, put_json};
 use crate::output::{fail, ExitCode};
 use crate::ui::{self, Col, Glyph};
@@ -176,23 +177,31 @@ pub(crate) fn chat_default_line(classes: &[serde_json::Value]) -> String {
     }
 }
 
+/// What `noo cluster class set` was asked for.
+pub(crate) struct ClassSetArgs {
+    class: String,
+    words: Vec<String>,
+    degraded_words: Vec<String>,
+    aliases: Vec<String>,
+    pool: bool,
+}
+
+pub(crate) fn parse_class_set_with(a: &mut Args) -> Result<ClassSetArgs, ArgError> {
+    let pool = a.flag(&["--pool"]);
+    let degraded_words = a.values(&["--degraded"])?;
+    let aliases = a.values(&["--alias"])?;
+    let mut positional = a.positionals()?;
+    if positional.is_empty() {
+        return Err(ArgError::new("missing <class>"));
+    }
+    let class = positional.remove(0);
+    Ok(ClassSetArgs { class, words: positional, degraded_words, aliases, pool })
+}
+
 /// `noo cluster class set <class> <node>/<backend>[=<model>]... [--degraded ...]... [--alias <name>]... [--pool]`
 pub fn cluster_class_set(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut positional: Vec<String> = Vec::new();
-    let mut degraded_words: Vec<String> = Vec::new();
-    let mut aliases: Vec<String> = Vec::new();
-    let mut pool = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--pool" => pool = true,
-            "--degraded" => degraded_words.push(iter.next().ok_or(Unhandled)?.clone()),
-            "--alias" => aliases.push(iter.next().ok_or(Unhandled)?.clone()),
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => positional.push(t.to_string()),
-        }
-    }
-    let Some((class, words)) = positional.split_first() else { return Err(Unhandled) };
+    let ClassSetArgs { class, words, degraded_words, aliases, pool } = parse_class_set_with(&mut Args::new(args))?;
+    let (class, words) = (&class, &words[..]);
     if words.is_empty() {
         fail(g.json, ExitCode::Usage, "no_candidates",
             "a class needs at least one candidate: noo cluster class set <class> <node>/<backend>[=<model>]...", None);
