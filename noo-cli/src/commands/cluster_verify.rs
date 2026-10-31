@@ -5325,7 +5325,7 @@ pub(crate) fn gateway_redis_check(health: Option<&Value>) -> Check {
     }
 }
 
-/// The `add-on caller key` row (noomesh followup 304). The gateway mints a
+/// The `gateway add-on caller key` row (noomesh followup 304). The gateway mints a
 /// bearer at each start and signs every add-on call with it; evolve refuses an
 /// unsigned call with 401. A boot whose mint failed serves everything else and
 /// used to say so only in a warn line, so every evolve call failed with
@@ -5333,7 +5333,7 @@ pub(crate) fn gateway_redis_check(health: Option<&Value>) -> Check {
 /// AUTHENTICATED `/health` carries the verdict, the gateway's reason and its
 /// remedy.
 pub(crate) fn addon_caller_check(health: Option<&Value>) -> Check {
-    const NAME: &str = "add-on caller key";
+    const NAME: &str = "gateway add-on caller key";
     let dep = health.map(|h| &h["dependencies"]["addon_caller"]);
     match dep.map(|d| (d, d["healthy"].as_bool())) {
         Some((_, Some(true))) => ok(NAME, "minted at gateway start"),
@@ -5360,7 +5360,7 @@ mod addon_caller_tests {
     fn a_minted_key_passes() {
         let h = json!({"status": "healthy", "dependencies": {"addon_caller": {"healthy": true, "optional": true}}});
         let c = addon_caller_check(Some(&h));
-        assert_eq!((c.name, c.verdict), ("add-on caller key", Verdict::Ok));
+        assert_eq!((c.name, c.verdict), ("gateway add-on caller key", Verdict::Ok));
     }
 
     #[test]
@@ -5377,10 +5377,13 @@ mod addon_caller_tests {
 
     #[test]
     fn no_verdict_is_a_warn_never_a_pass() {
-        // Unreachable, the anonymous body, and a gateway older than the field.
-        let older = json!({"status": "healthy", "dependencies": {"redis": {"healthy": true}}});
+        // Unreachable, the anonymous body, and a gateway older than the field:
+        // in a mixed roll a pre-0.6.16 gateway reads WARN, never FAIL.
+        let older = json!({"status": "healthy", "dependencies": {"redis": {"healthy": true, "state": "connected"}}});
         for body in [None, Some(json!({"status": "healthy"})), Some(older)] {
-            assert_eq!(addon_caller_check(body.as_ref()).verdict, Verdict::Warn);
+            let c = addon_caller_check(body.as_ref());
+            assert_eq!(c.verdict, Verdict::Warn);
+            assert!(c.detail.starts_with("not read:") && c.detail.contains("older than this CLI"), "{}", c.detail);
         }
     }
 }
