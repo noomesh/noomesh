@@ -869,9 +869,20 @@ pub(crate) fn declared_files(
     install: &[String],
     exists: &dyn Fn(&str) -> bool,
 ) -> Vec<String> {
+    use crate::onboard::sh::normalize_path;
+    // Compare paths, not spellings: `/x/./a.yml` from the install list and
+    // `/x/a.yml` from a label are one file, and naming it twice makes compose
+    // merge it with itself (rc.2: `security_opt array items must be unique`).
+    let install: Vec<String> = install.iter().map(|f| normalize_path(f)).collect();
     let mut lists: Vec<Vec<String>> = labels
         .iter()
-        .map(|l| l.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>())
+        .map(|l| {
+            l.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(normalize_path)
+                .collect::<Vec<_>>()
+        })
         .filter(|v| !v.is_empty())
         .collect();
     lists.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
@@ -1041,6 +1052,17 @@ mod orphan_tests {
         let exists = |f: &str| f != "/o/gone.yml";
         let got = declared_files(&["/o/base.yml,/o/gone.yml,/o/addon.yml", ""], &install, &exists);
         assert_eq!(got, vec!["/o/base.yml", "/o/gpu.yml", "/o/addon.yml"]);
+    }
+
+    /// rc.2 (Part B): `compose_file_list .` gave `./docker-compose.cluster.yml`,
+    /// the install list became `/root/.noo/./docker-compose.cluster.yml`, the
+    /// label said `/root/.noo/docker-compose.cluster.yml`, and the string
+    /// dedup kept both, so compose read the file twice. Fails on that code.
+    #[test]
+    fn one_file_spelled_two_ways_is_declared_once() {
+        let install = vec!["/x/./a.yml".to_string(), "/x//b.yml".to_string()];
+        let got = declared_files(&["/x/a.yml,/x/b.yml,/x/c/../c.yml"], &install, &|_| true);
+        assert_eq!(got, vec!["/x/a.yml", "/x/b.yml", "/x/c.yml"]);
     }
 
     #[test]
