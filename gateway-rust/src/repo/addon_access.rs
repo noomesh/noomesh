@@ -100,16 +100,42 @@ where
         .map(|r| r.rows_affected())
 }
 
-/// The enabled accounts that are super admins, sorted.
+/// The enabled accounts that are super admins, sorted. While NO enabled
+/// account carries the flag, every enabled admin is one: migration 104 flags
+/// the admins an upgraded install already has, but a fresh install creates
+/// its admin after the migration ran, and the two must not differ.
 pub async fn super_admins<'e, E>(db: E) -> Result<Vec<String>, sqlx::Error>
 where
     E: sqlx::PgExecutor<'e>,
 {
     sqlx::query_scalar::<_, String>(
-        "SELECT username FROM noo_users WHERE super_admin AND NOT COALESCE(disabled, false) ORDER BY username",
+        "SELECT username FROM noo_users \
+         WHERE NOT COALESCE(disabled, false) \
+           AND (super_admin OR (role = 'admin' AND NOT EXISTS \
+                (SELECT 1 FROM noo_users f WHERE f.super_admin AND NOT COALESCE(f.disabled, false)))) \
+         ORDER BY username",
     )
     .fetch_all(db)
     .await
+}
+
+/// Write the implicit set down before the first explicit change: while no
+/// enabled account is flagged, flag every enabled admin (what
+/// [`super_admins`] already reports). Without it, naming one super admin on
+/// a fresh install would silently demote every other admin, the caller
+/// included. A no-op once any account is flagged.
+pub async fn flag_implicit_super_admins<'e, E>(db: E) -> Result<u64, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query(
+        "UPDATE noo_users SET super_admin = true \
+         WHERE role = 'admin' AND NOT COALESCE(disabled, false) \
+           AND NOT EXISTS (SELECT 1 FROM noo_users f WHERE f.super_admin AND NOT COALESCE(f.disabled, false))",
+    )
+    .execute(db)
+    .await
+    .map(|r| r.rows_affected())
 }
 
 /// Set or clear one account's super-admin flag. Returns rows changed (0 when

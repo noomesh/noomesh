@@ -98,9 +98,10 @@ async fn facts_of(state: &AppState, account: &str, super_admins: &[String]) -> R
     })
 }
 
-/// Is the caller a super admin? While the install has none (a fresh install
-/// before any admin row exists), an admin acts as one, so the install can
-/// never be left with nobody able to change admin settings.
+/// Is the caller a super admin? `super_admins` already counts every enabled
+/// admin while no account is flagged; an empty list (no admin row at all, the
+/// env bootstrap admin) lets an admin act as one, so the install can never be
+/// left with nobody able to change admin settings.
 fn acts_as_super_admin(account: &str, super_admins: &[String]) -> bool {
     super_admins.is_empty() || super_admins.iter().any(|s| s == account)
 }
@@ -336,6 +337,9 @@ async fn super_admin_set(
         )));
     }
     let was = super_admins.iter().any(|s| s == target);
+    // The first explicit change on an install with no flag yet keeps the
+    // admins who were super admins implicitly.
+    crate::repo::addon_access::flag_implicit_super_admins(&state.db).await.map_err(db_err)?;
     let n = crate::repo::addon_access::set_super_admin(&state.db, target, body.on).await.map_err(db_err)?;
     if n == 0 {
         return Err(AppError::NotFound(format!("no account {target:?}")));
@@ -375,6 +379,19 @@ mod tests {
         assert!(!has_unscoped_write(&m, "mine"), "an owner_scoped write and a read do not count");
     }
 
+    /// A fresh install (admin created after migration 104) and an upgraded
+    /// one (admins flagged by it) must name the same super admins: with no
+    /// flag set, every enabled admin is one, and the first explicit change
+    /// writes that set down before it applies.
+    #[test]
+    fn a_fresh_install_counts_its_admins_as_super_admins_until_one_is_named() {
+        let repo = include_str!("../repo/addon_access.rs");
+        let read = repo.split("pub async fn super_admins").nth(1).unwrap().split("pub async fn").next().unwrap();
+        assert!(read.contains("super_admin OR (role = 'admin' AND NOT EXISTS"), "{read}");
+        let flag = repo.split("pub async fn flag_implicit_super_admins").nth(1).unwrap().split("pub async fn").next().unwrap();
+        assert!(flag.contains("SET super_admin = true") && flag.contains("NOT EXISTS"), "a no-op once any is flagged");
+    }
+
     #[test]
     fn with_no_super_admin_an_admin_acts_as_one() {
         assert!(acts_as_super_admin("ana", &[]));
@@ -389,7 +406,7 @@ mod tests {
         let src = include_str!("addon_access.rs");
         let body = src.split("async fn super_admin_set(").nth(1).unwrap().split("\n#[cfg(test)]").next().unwrap();
         let write = body.find("set_super_admin(").expect("the write");
-        for guard in ["r.act.is_some() || r.harness.is_some()", "acts_as_super_admin(&by", "bcrypt::verify(", "is the last super admin"] {
+        for guard in ["r.act.is_some() || r.harness.is_some()", "acts_as_super_admin(&by", "bcrypt::verify(", "is the last super admin", "flag_implicit_super_admins("] {
             let at = body.find(guard).unwrap_or_else(|| panic!("{guard}"));
             assert!(at < write, "{guard} runs before the write");
         }
