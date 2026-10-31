@@ -81,6 +81,18 @@ pub const KEY_PREFIX: &str = "noo-ak-";
 
 static TOKEN: OnceLock<String> = OnceLock::new();
 
+/// Why this boot has no caller credential, when [`init`] ran and could not
+/// mint one. `/health` reports it and `noo cluster verify` fails on it.
+static FAILURE: OnceLock<String> = OnceLock::new();
+
+/// What a boot without the credential costs and what fixes it, in the ERROR
+/// line and in `/health`. An add-on that checks the caller (evolve since
+/// noomesh followup 304) refuses every unsigned call with 401, so this is
+/// never only a warning.
+pub const MISSING_REMEDY: &str = "every add-on call from this gateway goes out unsigned, and an add-on that checks \
+     its caller (evolve) refuses each one with 401. Fix the database error and restart the gateway \
+     (`noo stack restart gateway`): each start mints a new key";
+
 /// The bearer to present to an add-on, or `None` when [`init`] has not run or
 /// could not write the row.
 ///
@@ -89,6 +101,19 @@ static TOKEN: OnceLock<String> = OnceLock::new();
 /// credential would turn a hardening step into an outage.
 pub fn token() -> Option<&'static str> {
     TOKEN.get().map(String::as_str)
+}
+
+/// Why [`init`] could not mint this boot's credential, or `None` when it
+/// minted one or has not run.
+pub fn failure() -> Option<&'static str> {
+    FAILURE.get().map(String::as_str)
+}
+
+/// Record a failed mint and say so at ERROR level with the remedy.
+fn failed(step: &str, e: &sqlx::Error) {
+    let why = format!("could not {step}: {e}");
+    tracing::error!(consumer = CALLER_CONSUMER, "addon caller credential NOT minted: {why}; {MISSING_REMEDY}");
+    let _ = FAILURE.set(why);
 }
 
 /// How long a retired caller row is kept before [`prune_retired`] deletes it.
@@ -134,7 +159,9 @@ fn mint() -> String {
 
 /// Mint this boot's caller credential and publish its hash.
 ///
-/// Best effort by construction: a failure logs and leaves [`token`] at `None`.
+/// A failure does not stop the gateway: it serves everything else, logs at
+/// ERROR with [`MISSING_REMEDY`], leaves [`token`] at `None` and [`failure`]
+/// set, and `noo cluster verify` fails its `add-on caller key` row.
 pub async fn init(db: &PgPool) {
     let token = mint();
     let hash = crate::service_keys::sha256_hex(&token);
@@ -149,7 +176,7 @@ pub async fn init(db: &PgPool) {
     .execute(db)
     .await
     {
-        tracing::warn!("addon caller credential: could not retire the previous key: {e}");
+        failed("retire the previous key", &e);
         return;
     }
 
@@ -169,7 +196,7 @@ pub async fn init(db: &PgPool) {
     .execute(db)
     .await
     {
-        tracing::warn!("addon caller credential: could not publish this boot's key: {e}");
+        failed("publish this boot's key", &e);
         return;
     }
 
@@ -191,6 +218,12 @@ pub async fn init(db: &PgPool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_missing_key_remedy_names_the_cost_and_the_fix() {
+        assert!(MISSING_REMEDY.contains("401"), "{MISSING_REMEDY}");
+        assert!(MISSING_REMEDY.contains("noo stack restart gateway"), "{MISSING_REMEDY}");
+    }
 
     #[test]
     fn a_minted_token_is_the_prefix_then_64_hex_characters() {

@@ -1599,6 +1599,14 @@ async fn health(
         }));
     }
 
+    // This boot's add-on caller credential (noomesh followup 304). Optional
+    // like `systems`: it never moves `status` or the code, because the
+    // gateway serves everything else; `noo cluster verify` fails on it.
+    deps.insert(
+        "addon_caller".into(),
+        addon_caller_dep(crate::addon_auth::token().is_some(), crate::addon_auth::failure()),
+    );
+
     let status = if all_ok { "healthy" } else { "degraded" };
     let peers = state.gossip.alive_peers().len();
 
@@ -1656,6 +1664,20 @@ async fn health(
         body["mcp_catalogue"] = json!(crate::mcp_external::catalogue_digest());
     }
     (code, Json(body))
+}
+
+/// `dependencies.addon_caller`: whether this boot minted the bearer it signs
+/// add-on calls with, and when it did not, why and what that costs.
+fn addon_caller_dep(minted: bool, failure: Option<&str>) -> Value {
+    if minted {
+        return json!({"healthy": true, "optional": true});
+    }
+    json!({
+        "healthy": false,
+        "optional": true,
+        "error": failure.unwrap_or("not minted yet"),
+        "remedy": crate::addon_auth::MISSING_REMEDY,
+    })
 }
 
 /// The health body, by whether the caller presented a credential.
@@ -1842,6 +1864,24 @@ mod tests {
     // those anonymously — the container healthcheck, the compose
     // healthcheck, the host watchdog and hostd's recreate gate all read
     // the status CODE — so the inventory was given away for nothing.
+
+    // ── the add-on caller credential (followup 304) ──────────────
+
+    #[test]
+    fn a_minted_caller_key_is_healthy_and_says_no_more() {
+        assert_eq!(addon_caller_dep(true, None), json!({"healthy": true, "optional": true}));
+    }
+
+    #[test]
+    fn an_unminted_caller_key_is_unhealthy_with_its_reason_and_remedy() {
+        let d = addon_caller_dep(false, Some("could not publish this boot's key: pool timed out"));
+        assert_eq!(d["healthy"], false);
+        assert_eq!(d["optional"], true, "it must never move /health's status code");
+        assert_eq!(d["error"], "could not publish this boot's key: pool timed out");
+        assert_eq!(d["remedy"], crate::addon_auth::MISSING_REMEDY);
+        // Before init has run there is no reason yet, and still no pass.
+        assert_eq!(addon_caller_dep(false, None)["healthy"], false);
+    }
 
     fn deps_fixture() -> serde_json::Map<String, Value> {
         let mut m = serde_json::Map::new();

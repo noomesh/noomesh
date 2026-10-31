@@ -5325,6 +5325,66 @@ pub(crate) fn gateway_redis_check(health: Option<&Value>) -> Check {
     }
 }
 
+/// The `add-on caller key` row (noomesh followup 304). The gateway mints a
+/// bearer at each start and signs every add-on call with it; evolve refuses an
+/// unsigned call with 401. A boot whose mint failed serves everything else and
+/// used to say so only in a warn line, so every evolve call failed with
+/// nothing pointing at the cause. `dependencies.addon_caller` in an
+/// AUTHENTICATED `/health` carries the verdict, the gateway's reason and its
+/// remedy.
+pub(crate) fn addon_caller_check(health: Option<&Value>) -> Check {
+    const NAME: &str = "add-on caller key";
+    let dep = health.map(|h| &h["dependencies"]["addon_caller"]);
+    match dep.map(|d| (d, d["healthy"].as_bool())) {
+        Some((_, Some(true))) => ok(NAME, "minted at gateway start"),
+        Some((d, Some(false))) => {
+            let why = d["error"].as_str().unwrap_or("no reason given");
+            let cost = d["remedy"].as_str().unwrap_or("add-ons that check the caller refuse its calls with 401");
+            fail(NAME, format!("NOT minted at gateway start ({why}): {cost}"), "noo stack restart gateway")
+        }
+        _ => warn(
+            NAME,
+            "not read: no authenticated /health answer with dependencies.addon_caller \
+             (unreachable, no credential, or a gateway older than this CLI)",
+            Some("noo health".into()),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod addon_caller_tests {
+    use super::{addon_caller_check, Verdict};
+    use serde_json::json;
+
+    #[test]
+    fn a_minted_key_passes() {
+        let h = json!({"status": "healthy", "dependencies": {"addon_caller": {"healthy": true, "optional": true}}});
+        let c = addon_caller_check(Some(&h));
+        assert_eq!((c.name, c.verdict), ("add-on caller key", Verdict::Ok));
+    }
+
+    #[test]
+    fn an_unminted_key_fails_with_the_gateways_reason_and_the_restart() {
+        let h = json!({"status": "healthy", "dependencies": {"addon_caller": {
+            "healthy": false, "optional": true,
+            "error": "could not publish this boot's key: pool timed out",
+            "remedy": "evolve refuses each one with 401"}}});
+        let c = addon_caller_check(Some(&h));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("pool timed out") && c.detail.contains("401"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo stack restart gateway"));
+    }
+
+    #[test]
+    fn no_verdict_is_a_warn_never_a_pass() {
+        // Unreachable, the anonymous body, and a gateway older than the field.
+        let older = json!({"status": "healthy", "dependencies": {"redis": {"healthy": true}}});
+        for body in [None, Some(json!({"status": "healthy"})), Some(older)] {
+            assert_eq!(addon_caller_check(body.as_ref()).verdict, Verdict::Warn);
+        }
+    }
+}
+
 /// When the `restart loops` row names `<prefix>-redis`, a failing `gateway
 /// redis` row is the gateway reporting the loop, and `noo stack restart
 /// gateway` cannot fix it: the 0.6.5-rc.1 rehearsal's seeded root-owned AOF
@@ -5875,7 +5935,10 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(embedding_spaces_check(spaces.as_ref()));
         // The gateway's own Redis connection (authenticated /health: the
         // anonymous body carries no dependency map).
-        checks.push(gateway_redis_check(get_json_opt(g, "/health", true, 10).as_ref()));
+        let health = get_json_opt(g, "/health", true, 10);
+        checks.push(gateway_redis_check(health.as_ref()));
+        // The bearer every add-on call is signed with (followup 304).
+        checks.push(addon_caller_check(health.as_ref()));
         {
             let root = crate::envfile::repo_root();
             let store = crate::commands::secrets::SecretStore::load_sops(&root.join("secrets/env.sops"));
