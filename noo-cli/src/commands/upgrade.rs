@@ -926,7 +926,7 @@ fn mcp_catalogue(g: &Globals) -> Option<String> {
 fn catalogue_hint(before: Option<&str>, after: Option<&str>) -> Option<&'static str> {
     match (before, after) {
         (Some(b), Some(a)) if a != b => Some(
-            "the MCP tool list changed: reconnect connected MCP clients (`/mcp` in Claude Code, restart Codex) or they keep the old one",
+            "the MCP tool list changed: a client with a session is told on its next call; reconnect any other (`/mcp` in Claude Code, restart Codex) or it keeps the old list",
         ),
         _ => None,
     }
