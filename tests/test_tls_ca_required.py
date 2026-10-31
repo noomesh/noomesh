@@ -115,10 +115,6 @@ SKIP_PARTS = {"target", "node_modules", ".git", "__pycache__", "tests"}
 
 # path -> why a hit there is legitimate. A stale entry fails, so the list cannot rot.
 ALLOWED = {
-    "docker/Dockerfile.sandbox": "HEALTHCHECK probe of localhost inside the per-call sandbox namespace; "
-    "operator-deferred 2026-09-29 (tests/test_healthchecks_verify_tls.py)",
-    "scripts/noomesh-sandbox.sh": "sandbox smoke helper probing https://localhost:8080/health in the "
-    "throwaway sandbox before its CA is mounted; same deferral as Dockerfile.sandbox",
     "packages/noo-gateway-client/src/noo_gateway/settings.py": "the REFUSAL: raises on verify=False",
     # Source that only DISCUSSES the idiom in comments:
     "src/noomesh/cluster/model_catalog.py": "comment: NEVER verify=False",
