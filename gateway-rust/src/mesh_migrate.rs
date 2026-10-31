@@ -3197,7 +3197,10 @@ mod tests {
         assert!(writer.contains("DELETE FROM noo_request_trace WHERE at <"), "the prune keys on `at`");
         assert!(m.sql.contains("\n    at timestamptz NOT NULL DEFAULT now()"));
         assert!(m.sql.contains("ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS trace_id text"));
-        assert!(include_str!("usage.rs").contains("trace_id, harness_kind, task_id)"));
+        // trace_id sits before the token columns, so the 089 test's
+        // "prompt_tokens, completion_tokens, harness_kind" and the 091 test's
+        // "harness_kind, task_id)" both still read the writer as it is.
+        assert!(include_str!("usage.rs").contains("user_uuid, consumer, trace_id,"));
     }
 
     /// i150: the migration columns sit on the embed-placement revision, all nullable
