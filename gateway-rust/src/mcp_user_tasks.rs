@@ -546,13 +546,14 @@ mod tests {
     #[test]
     fn the_door_lists_audits_then_dispatches_them_as_the_account() {
         let src = include_str!("mcp_external.rs");
-        let handle = &src[src.find("async fn handle(").expect("handle")..src.find("#[cfg(test)]").expect("tests")];
+        // The door's JSON-RPC body lives in `handle_rpc` (`state` is a reference there).
+        let handle = &src[src.find("async fn handle_rpc(").expect("handle_rpc")..src.find("#[cfg(test)]").expect("tests")];
         let list = &handle[handle.find("\"tools/list\" =>").expect("tools/list arm")..handle.find("\"tools/call\" =>").expect("tools/call arm")];
         assert!(list.contains("crate::mcp_user_tasks::tool_list()"), "tools/list must advertise the task tools");
         assert!(!list.contains("user_role"), "the listing is not tier-filtered");
         let call = &handle[handle.find("\"tools/call\" =>").unwrap()..];
         let audit = call.find("AuditKind::McpToolCall").expect("the door's audit row");
-        let dispatch = call.find("crate::mcp_user_tasks::call(&state, &caller.user, name, args)").expect("dispatched as the account");
+        let dispatch = call.find("crate::mcp_user_tasks::call(state, &caller.user, name, args)").expect("dispatched as the account");
         assert!(audit < dispatch, "the call is audited before it runs");
         assert_eq!(call.matches("audit::record(").count(), 1, "one audit path, not a second one for task tools");
     }
