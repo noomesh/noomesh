@@ -165,9 +165,9 @@ def test_the_monthly_workflow_is_scheduled_dispatchable_minimal_and_pinned():
     assert len(crons) == 1 and re.fullmatch(r"\d+ \d+ \d+ \* \*", crons[0]), crons   # a day of the month: monthly
     assert wf["permissions"] == {"contents": "read"}
     job = wf["jobs"]["refresh"]
-    assert job["permissions"] == {"contents": "write", "pull-requests": "write"}
+    assert job["permissions"] == {"contents": "write"}, "push the branch only; no pull-requests permission"
     assert "github.repository == 'noomesh/noomesh'" in job["if"]
-    assert "scripts/refresh-image-digests.py" in text and "gh pr create --base dev" in text
+    assert "scripts/refresh-image-digests.py" in text and "git push origin" in text and "GITHUB_STEP_SUMMARY" in text
     assert "rehearsal" in (ROOT / "scripts/refresh-image-digests.py").read_text()
     for step in job["steps"]:
         if "uses" in step:
