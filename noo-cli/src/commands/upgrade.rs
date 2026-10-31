@@ -514,14 +514,13 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         {
             use std::os::unix::process::CommandExt;
             let mut cmd = std::process::Command::new(&exe);
-            cmd.arg("upgrade").arg("--stage2");
-            if stack { cmd.arg("--stack"); }
-            if nodes { cmd.arg("--nodes"); }
-            if seats_only { cmd.arg("--seats"); }
-            if no_seats { cmd.arg("--no-seats"); }
-            if let Some(t) = &tag_override { cmd.arg("--tag").arg(t); }
-            if skip_gw_key_check { cmd.arg("--skip-gateway-key-check"); }
-            if allow_downgrade { cmd.arg("--allow-downgrade"); }
+            // The token rides the environment ($NOO_TOKEN), never argv: a
+            // command line is readable through /proc/<pid>/cmdline.
+            if let Some(t) = &g.token { cmd.env("NOO_TOKEN", t); }
+            cmd.args(stage2_args(g, &Stage2 {
+                stack, nodes, seats_only, no_seats, tag: tag_override.as_deref(),
+                force, skip_gw_key_check, allow_downgrade,
+            }));
             let err = cmd.exec(); // only returns on failure
             fail(g.json, ExitCode::Generic, "reexec_failed",
                 &format!("could not re-exec the new binary: {err}"),
@@ -4778,9 +4777,101 @@ fn strip_yaml_gate(text: &str, section: &str, key: &str) -> String {
     joined
 }
 
+/// What `noo upgrade` hands its stage-2 re-exec. Every flag the fleet stages
+/// read is a field, so the call site cannot leave one out: `--force` used to
+/// be dropped here, and `noo upgrade --all --force` then met the very
+/// refusal it was passed to get past (909b).
+struct Stage2<'a> {
+    stack: bool,
+    nodes: bool,
+    seats_only: bool,
+    no_seats: bool,
+    tag: Option<&'a str>,
+    force: bool,
+    skip_gw_key_check: bool,
+    allow_downgrade: bool,
+}
+
+/// The re-exec's argv after the binary: the globals first (the stage-2 run is
+/// this command's output, so `--json` and `--quiet` follow it; the token goes
+/// in the environment, never here), then `upgrade --stage2` and the flags.
+fn stage2_args(g: &Globals, s: &Stage2) -> Vec<String> {
+    let mut a: Vec<String> = Vec::new();
+    if g.json { a.push("--json".into()); }
+    if g.quiet { a.push("--quiet".into()); }
+    if g.verbose { a.push("--verbose".into()); }
+    if let Some(u) = &g.gateway_override { a.push("--gateway".into()); a.push(u.clone()); }
+    if let Some(t) = g.timeout_secs { a.push("--timeout".into()); a.push(t.to_string()); }
+    a.push("upgrade".into());
+    a.push("--stage2".into());
+    for (on, flag) in [
+        (s.stack, "--stack"), (s.nodes, "--nodes"), (s.seats_only, "--seats"), (s.no_seats, "--no-seats"),
+        (s.force, "--force"), (s.skip_gw_key_check, "--skip-gateway-key-check"),
+        (s.allow_downgrade, "--allow-downgrade"),
+    ] {
+        if on { a.push(flag.into()); }
+    }
+    if let Some(t) = s.tag { a.push("--tag".into()); a.push(t.to_string()); }
+    a
+}
+
 #[cfg(test)]
 mod reexec_tests {
-    use super::reexec_path;
+    use super::{reexec_path, stage2_args, Stage2};
+
+    /// 909b: (flag, the variable its parser arm sets) for every flag the
+    /// fleet stages read. Checked three ways below: each is a parser arm,
+    /// each is forwarded, and nothing the stage-2 dispatch hands
+    /// run_fleet_stages is missing from it.
+    const FLEET_FLAGS: &[(&str, &str)] = &[
+        ("--stack", "stack"), ("--nodes", "nodes"), ("--seats", "seats_only"), ("--no-seats", "no_seats"),
+        ("--tag", "tag_override"), ("--force", "force"),
+        ("--skip-gateway-key-check", "skip_gw_key_check"), ("--allow-downgrade", "allow_downgrade"),
+    ];
+
+    fn all_set() -> Vec<String> {
+        let g = crate::Globals {
+            json: true, verbose: true, gateway_override: Some("https://ctl:8443".into()),
+            timeout_secs: Some(30), token: Some("tok-secret".into()), quiet: true,
+        };
+        stage2_args(&g, &Stage2 {
+            stack: true, nodes: true, seats_only: true, no_seats: true, tag: Some("v0.6.16"),
+            force: true, skip_gw_key_check: true, allow_downgrade: true,
+        })
+    }
+
+    #[test]
+    fn the_reexec_forwards_every_fleet_flag_and_the_globals() {
+        let args = all_set();
+        for (flag, _) in FLEET_FLAGS {
+            assert!(args.iter().any(|a| a.as_str() == *flag), "{flag} is parsed but not forwarded: {args:?}");
+        }
+        let at = |s: &str| args.iter().position(|a| a.as_str() == s).unwrap_or_else(|| panic!("{s} missing: {args:?}"));
+        assert_eq!(args[at("--tag") + 1], "v0.6.16");
+        for global in ["--json", "--quiet", "--verbose", "--gateway", "--timeout"] {
+            assert!(at(global) < at("upgrade"), "{global} must lead the command");
+        }
+        assert!(!args.iter().any(|a| a.contains("tok-secret")), "the token is never on argv");
+    }
+
+    #[test]
+    fn every_fleet_stage_input_has_a_parsed_and_forwarded_flag() {
+        let src = include_str!("upgrade.rs");
+        for (flag, _) in FLEET_FLAGS {
+            assert!(src.contains(&format!("\"{flag}\" =>")), "{flag} has no parser arm");
+        }
+        // The stage-2 dispatch's call: each argument is a table variable,
+        // `g`, or `seats` (derived from --seats/--no-seats/--nodes).
+        let stage2 = &src[src.find("    if stage2 \u{7b}").expect("stage-2 dispatch")..];
+        let call = &stage2[stage2.find("run_fleet_stages(").expect("call") + "run_fleet_stages(".len()..];
+        let call = &call[..call.find(");").expect("end of call")];
+        let args: Vec<&str> = call.split(',').map(|a| a.trim().trim_end_matches(".as_deref()")).collect();
+        assert!(args.len() >= 8, "parsed {args:?}: the call was not read whole");
+        for arg in args {
+            assert!(arg == "g" || arg == "seats" || FLEET_FLAGS.iter().any(|(_, v)| *v == arg),
+                "run_fleet_stages takes `{arg}` but no forwarded flag sets it: add it to FLEET_FLAGS and Stage2");
+        }
+    }
 
     #[test]
     fn reexec_path_strips_the_deleted_marker_and_requires_a_file() {
