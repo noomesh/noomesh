@@ -67,7 +67,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::{self as ts, client::IntoClientRequest, protocol::WebSocketConfig};
 use tokio_tungstenite::WebSocketStream;
 
-use crate::addon_proxy::{AddonManifest, RouteRole, RouteSpec};
+use crate::addon_proxy::{AddonManifest, RouteSpec};
 use crate::state::AppState;
 
 /// Default largest message (and frame) in either direction.
