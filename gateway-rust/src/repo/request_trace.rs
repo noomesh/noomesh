@@ -12,7 +12,7 @@ use crate::request_trace::SummaryRow;
 
 /// The account a row's actor belongs to: a connection login
 /// (`alice/laptop`) is the account `alice`'s. None for a non-person caller.
-pub fn account_for(actor: Option<&str>, actor_kind: Option<&str>) -> Option<&str> {
+pub fn account_for<'a>(actor: Option<&'a str>, actor_kind: Option<&str>) -> Option<&'a str> {
     match (actor, actor_kind) {
         (Some(a), Some("user")) => Some(crate::auth::account_of(a)),
         _ => None,
