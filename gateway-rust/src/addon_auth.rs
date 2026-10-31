@@ -161,7 +161,7 @@ fn mint() -> String {
 ///
 /// A failure does not stop the gateway: it serves everything else, logs at
 /// ERROR with [`MISSING_REMEDY`], leaves [`token`] at `None` and [`failure`]
-/// set, and `noo cluster verify` fails its `add-on caller key` row.
+/// set, and `noo cluster verify` fails its `gateway add-on caller key` row.
 pub async fn init(db: &PgPool) {
     let token = mint();
     let hash = crate::service_keys::sha256_hex(&token);
