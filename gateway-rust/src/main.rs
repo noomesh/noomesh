@@ -115,6 +115,7 @@ mod confine;
 mod entity_cleanup_task;
 mod task_guard;
 mod graph_prune;
+mod addon_access;
 mod addon_auth;
 mod alert_digest;
 mod addons;
