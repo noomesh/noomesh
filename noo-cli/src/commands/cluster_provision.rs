@@ -46,6 +46,7 @@ use crate::envfile::repo_root;
 use std::path::PathBuf;
 use std::process::Command;
 use super::cluster::{fetch_node, online_nodes, spawn_inherited};
+use crate::args::{ArgError, Args};
 use crate::http::{get_json, get_json_opt, post_json_try};
 use crate::output::{fail, ExitCode};
 use crate::{Globals, Unhandled};
@@ -859,6 +860,16 @@ fn short_name(d: &Value) -> String {
     d["name"].as_str().unwrap_or("").split('.').next().unwrap_or("").to_string()
 }
 
+pub(crate) fn parse_set_primary_with(a: &mut Args) -> Result<(Option<String>, bool, bool), ArgError> {
+    let to = a.value(&["--to"])?;
+    // `--skip-promote` is kept as an alias so an existing runbook does not
+    // break: it always meant "do not promote from here", now the only way.
+    let promoted = a.flag(&["--promoted", "--skip-promote"]);
+    let yes = a.flag(&["--yes", "-y"]);
+    a.finish()?;
+    Ok((to, promoted, yes))
+}
+
 /// `noo cluster set-primary [--to TARGET] [--promoted] [--yes/-y]` — cut the
 /// primary-controller role over to another controller (Tailscale device
 /// rename).
@@ -873,33 +884,18 @@ fn short_name(d: &Value) -> String {
 /// promotion is now an explicit step the operator runs ON the target, and
 /// `--promoted` is how they tell this command they have done it.
 pub fn cluster_set_primary(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut to: Option<String> = None;
-    let mut promoted = false;
-    let mut yes = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--to" => to = Some(iter.next().ok_or(Unhandled)?.clone()),
-            // `--ssh-user` selected an account for a login this command no
-            // longer performs. Refuse it loudly rather than ignore it: a
-            // silently-dropped flag is how an operator concludes the
-            // promotion happened.
-            "--ssh-user" => {
-                let _ = iter.next();
-                fail(g.json, ExitCode::Usage, "ssh_lane_removed",
-                     "`--ssh-user` selected an SSH account; set-primary no longer logs in \
-                      anywhere (the controller\u{2192}node SSH lane was removed 2026-09-11). \
-                      Run the promotion on the target, then re-run with --promoted.",
-                     None);
-            }
-            // Kept as an alias so an existing runbook/script does not break:
-            // it always meant "do not promote from here", which is now the
-            // only behaviour.
-            "--skip-promote" | "--promoted" => promoted = true,
-            "-y" | "--yes" => yes = true,
-            _ => return Err(Unhandled),
-        }
+    // `--ssh-user` selected an account for a login this command no
+    // longer performs. Refuse it loudly rather than ignore it: a
+    // silently-dropped flag is how an operator concludes the
+    // promotion happened.
+    if args.iter().any(|t| t == "--ssh-user") {
+        fail(g.json, ExitCode::Usage, "ssh_lane_removed",
+             "`--ssh-user` selected an SSH account; set-primary no longer logs in \
+              anywhere (the controller\u{2192}node SSH lane was removed 2026-09-11). \
+              Run the promotion on the target, then re-run with --promoted.",
+             None);
     }
+    let (to, promoted, yes) = parse_set_primary_with(&mut Args::new(args))?;
 
     let api_key = tailscale_api_key();
     if api_key.is_empty() {
@@ -1242,31 +1238,37 @@ fn print_enroll_paste(p: &EnrollPaste) {
     }
 }
 
-pub fn cluster_bootstrap_token_create(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut ttl_seconds: Option<i64> = None;
-    let mut role: Option<String> = None;
-    let mut cidr: Option<String> = None;
-    let mut node: Option<String> = None;
+/// What `noo cluster bootstrap-token create` was asked for.
+pub(crate) struct BootstrapTokenArgs {
+    ttl_seconds: Option<i64>,
+    role: Option<String>,
+    cidr: Option<String>,
+    node: Option<String>,
+    with_ts: bool,
+}
+
+pub(crate) fn parse_bootstrap_token_create_with(a: &mut Args) -> Result<BootstrapTokenArgs, ArgError> {
+    let ttl_seconds = match a.value(&["--ttl"])? {
+        None => None,
+        Some(raw) => Some(
+            parse_ttl_seconds(&raw).ok_or_else(|| ArgError::new(format!("--ttl needs 1h, 30m, 24h or seconds, got `{raw}`")))?,
+        ),
+    };
+    let role = a.value(&["--role"])?;
+    let cidr = a.value(&["--cidr"])?;
+    let node = a.value(&["--node"])?;
     // Tailscale-unified is the DEFAULT (operator, 2026-08-18): the common
     // fresh-onboard case is a machine not yet on the tailnet. --no-tailscale
-    // skips it; a missing TS API key degrades gracefully to the plain
-    // enrollment one-liner instead of failing the mint.
-    let mut with_ts = true;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--ttl" => {
-                let raw = iter.next().ok_or(Unhandled)?;
-                ttl_seconds = Some(parse_ttl_seconds(raw).ok_or(Unhandled)?);
-            }
-            "--role" => role = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--cidr" => cidr = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--node" => node = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--with-tailscale" => with_ts = true, // default; kept for compat
-            "--no-tailscale" => with_ts = false,
-            _ => return Err(Unhandled),
-        }
-    }
+    // skips it; --with-tailscale is kept for compat.
+    let _ = a.flag(&["--with-tailscale"]);
+    let with_ts = !a.flag(&["--no-tailscale"]);
+    a.finish()?;
+    Ok(BootstrapTokenArgs { ttl_seconds, role, cidr, node, with_ts })
+}
+
+pub fn cluster_bootstrap_token_create(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let BootstrapTokenArgs { ttl_seconds, role, cidr, node, mut with_ts } =
+        parse_bootstrap_token_create_with(&mut Args::new(args))?;
 
     let mut body = json!({});
     if let Some(t) = ttl_seconds {

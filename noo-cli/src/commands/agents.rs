@@ -13,6 +13,7 @@
 //! read-only ports predate that fix — either side works now.
 
 use super::{ago, truncate};
+use crate::args::{ArgError, Args};
 use crate::http::{get_json, post_json};
 use crate::ui::{self, Col, Glyph};
 use crate::{Globals, Unhandled};
@@ -58,38 +59,35 @@ pub fn agents_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+pub(crate) fn parse_collaborate_with(a: &mut Args) -> Result<(String, Option<Vec<String>>), ArgError> {
+    let roles = a
+        .value(&["--roles", "-r"])?
+        .map(|csv| csv.split(',').map(|r| r.trim().to_string()).collect::<Vec<String>>());
+    let task = a.one("<task>")?;
+    Ok((task, roles))
+}
+
 /// `noo agents collaborate TASK [--roles/-r CSV]` — POST /api/agents/collaborate.
 /// The handler reads only `task`, `roles` and `wait`; `--workflow/-w` and
 /// `--mode/-m` were sent and ignored, so they are refused with a message.
 /// Synchronous: the gateway returns when the collaboration finishes
 /// (Python parity: 300s timeout, spinner while waiting).
 pub fn agents_collaborate(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut task: Option<String> = None;
-    let mut payload = serde_json::json!({});
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--roles" | "-r" => {
-                let csv = iter.next().ok_or(Unhandled)?;
-                let roles: Vec<String> = csv.split(',').map(|r| r.trim().to_string()).collect();
-                payload["roles"] = roles.into();
-            }
-            "--workflow" | "-w" | "--mode" | "-m" => crate::output::fail(
-                g.json,
-                crate::output::ExitCode::Usage,
-                "flag_removed",
-                &format!("agents collaborate no longer takes {tok}: the gateway ignored it"),
-                Some("choose who works with --roles/-r (default: researcher,analyst); `noo agents list` shows the roles"),
-            ),
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => {
-                if task.replace(t.to_string()).is_some() {
-                    return Err(Unhandled); // two positionals — not our surface
-                }
-            }
-        }
+    // The gateway ignored these, so they are refused with the reason.
+    if let Some(tok) = args.iter().find(|t| matches!(t.as_str(), "--workflow" | "-w" | "--mode" | "-m")) {
+        crate::output::fail(
+            g.json,
+            crate::output::ExitCode::Usage,
+            "flag_removed",
+            &format!("agents collaborate no longer takes {tok}: the gateway ignored it"),
+            Some("choose who works with --roles/-r (default: researcher,analyst); `noo agents list` shows the roles"),
+        );
     }
-    let Some(task) = task else { return Err(Unhandled) };
+    let (task, roles) = parse_collaborate_with(&mut Args::new(args))?;
+    let mut payload = serde_json::json!({});
+    if let Some(roles) = roles {
+        payload["roles"] = roles.into();
+    }
     payload["task"] = task.into();
 
     let step = super::Spinner::start(g, "agents collaborating");
@@ -263,22 +261,19 @@ pub fn agents_peer_card(g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
     Ok(0)
 }
 
+pub(crate) fn parse_peer_dispatch_with(a: &mut Args) -> Result<(String, String, String), ArgError> {
+    let role = a.value(&["--role", "-r"])?.unwrap_or_else(|| "agent".to_string());
+    let [agent_id, task]: [String; 2] = a.positionals()?.try_into().map_err(|_| ArgError::new("expected <agent-id> <task>"))?;
+    Ok((agent_id, task, role))
+}
+
 /// `noo agents peer dispatch AGENT_ID TASK [--role/-r ROLE]` —
 /// POST /api/agents/peer/{agent_id}/task. Fire-and-acknowledge: the gateway
 /// returns a task id immediately; the result arrives async on a NATS stream
 /// (Python parity: 30s timeout, role defaults to "agent").
 pub fn agents_peer_dispatch(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut positionals: Vec<String> = Vec::new();
-    let mut role = "agent".to_string();
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--role" | "-r" => role = iter.next().ok_or(Unhandled)?.clone(),
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => positionals.push(t.to_string()),
-        }
-    }
-    let [agent_id, task] = positionals.as_slice() else { return Err(Unhandled) };
+    let (agent_id, task, role) = parse_peer_dispatch_with(&mut Args::new(args))?;
+    let (agent_id, task) = (&agent_id, &task);
     let payload = serde_json::json!({ "task": task, "role": role });
     let body = post_json(
         g,
@@ -374,32 +369,35 @@ fn print_message_rows(rows: &[serde_json::Value]) {
 }
 
 
+/// What `noo agents send` was asked for.
+pub(crate) struct SendArgs {
+    to: Option<String>,
+    text: Vec<String>,
+    from: Option<String>,
+    agent: Option<String>,
+    harness: Option<String>,
+    thread: Option<String>,
+    kind: String,
+    refs: Vec<String>,
+    json_body: Option<String>,
+}
+
+pub(crate) fn parse_send_with(a: &mut Args) -> Result<SendArgs, ArgError> {
+    let from = a.value(&["--from"])?;
+    let agent = a.value(&["--agent"])?;
+    let harness = a.value(&["--harness"])?;
+    let thread = a.value(&["--thread"])?;
+    let kind = a.value(&["--kind"])?.unwrap_or_else(|| "message".to_string());
+    let refs = a.values(&["--ref"])?;
+    let json_body = a.value(&["--body"])?;
+    let mut text = a.positionals()?;
+    let to = if text.is_empty() { None } else { Some(text.remove(0)) };
+    Ok(SendArgs { to, text, from, agent, harness, thread, kind, refs, json_body })
+}
+
 /// `noo agents send <to> <text…> [--from <agent>] [--thread <id>] [--kind <k>] [--ref <msg-id>]…`
 pub fn agents_send(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut to: Option<String> = None;
-    let mut text: Vec<String> = Vec::new();
-    let mut from: Option<String> = None;
-    let mut agent: Option<String> = None;
-    let mut harness: Option<String> = None;
-    let mut thread: Option<String> = None;
-    let mut kind = "message".to_string();
-    let mut refs: Vec<String> = Vec::new();
-    let mut json_body: Option<String> = None;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--from" => from = it.next().cloned(),
-            "--agent" => agent = it.next().cloned(),
-            "--harness" => harness = it.next().cloned(),
-            "--thread" => thread = it.next().cloned(),
-            "--kind" => kind = it.next().cloned().unwrap_or_default(),
-            "--ref" => refs.extend(it.next().cloned()),
-            "--body" => json_body = it.next().cloned(),
-            s if s.starts_with('-') => return Err(Unhandled),
-            s if to.is_none() => to = Some(s.to_string()),
-            s => text.push(s.to_string()),
-        }
-    }
+    let SendArgs { to, text, from, agent, harness, thread, kind, refs, json_body } = parse_send_with(&mut Args::new(args))?;
     let Some(to) = to else {
         ui::failed("usage: noo agents send <to> <text…> [--from <agent>] [--thread <id>] [--kind message|task|result|ack|note] [--ref <msg-id>]… [--body <json>]", None);
         return Ok(2);
@@ -437,20 +435,18 @@ pub fn agents_send(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+pub(crate) fn parse_inbox_with(a: &mut Args) -> Result<(Option<String>, bool, u32), ArgError> {
+    let agent = a.value(&["--agent"])?;
+    let unread = a.flag(&["--unread"]);
+    // A limit that is not a number falls back to the default, as it always did.
+    let limit = a.value(&["--limit"])?.and_then(|v| v.parse().ok()).unwrap_or(50);
+    a.finish()?;
+    Ok((agent, unread, limit))
+}
+
 /// `noo agents inbox [--agent <id>] [--unread] [--limit <n>]` — messages addressed to an agent.
 pub fn agents_inbox(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut agent: Option<String> = None;
-    let mut unread = false;
-    let mut limit = 50u32;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--agent" => agent = it.next().cloned(),
-            "--unread" => unread = true,
-            "--limit" => limit = it.next().and_then(|v| v.parse().ok()).unwrap_or(50),
-            _ => return Err(Unhandled),
-        }
-    }
+    let (agent, unread, limit) = parse_inbox_with(&mut Args::new(args))?;
     let mut path = format!("/api/agents/messages?limit={limit}");
     if let Some(a) = &agent { path.push_str(&format!("&to={}", super::urlencode(a))); }
     if unread { path.push_str("&unread=true"); }
@@ -472,6 +468,12 @@ pub fn agents_inbox(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+pub(crate) fn parse_presence_with(a: &mut Args) -> Result<Option<String>, ArgError> {
+    let owner = a.value(&["--owner"])?;
+    a.finish()?;
+    Ok(owner)
+}
+
 /// `noo agents presence [--owner <account>]` — the live MCP windows under
 /// an account: which of me is open, so I can address
 /// one by name. Everything shown is advertisement — the window says what
@@ -480,14 +482,7 @@ pub fn agents_inbox(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 /// rather than an empty list, so "nobody is online" never means "you may
 /// not look".
 pub fn agents_presence(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut owner: Option<String> = None;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--owner" => owner = it.next().cloned(),
-            _ => return Err(Unhandled),
-        }
-    }
+    let owner = parse_presence_with(&mut Args::new(args))?;
     let mut path = String::from("/api/agents/presence");
     if let Some(o) = &owner { path.push_str(&format!("?owner={}", super::urlencode(o))); }
     let resp = get_json(g, &path, true, 10);
@@ -555,23 +550,30 @@ pub fn agents_thread(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
-/// `noo agents messages [--agent <id>] [--from <id>] [--to <id>] [--user <u>] [--node <n>] [--harness <h>] [--kind <k>] [--since <rfc3339>] [--limit <n>] [--threads]` — operator review.
-pub fn agents_messages(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+/// What `noo agents messages` was asked for.
+pub(crate) struct MessagesArgs {
+    q: Vec<(String, String)>,
+    threads: bool,
+    limit: u32,
+}
+
+pub(crate) fn parse_messages_with(a: &mut Args) -> Result<MessagesArgs, ArgError> {
     let mut q: Vec<(String, String)> = Vec::new();
-    let mut threads = false;
-    let mut limit = 50u32;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--agent" | "--from" | "--to" | "--kind" | "--since" | "--user" | "--node" | "--harness" => {
-                let Some(v) = it.next() else { return Err(Unhandled) };
-                q.push((a.trim_start_matches("--").to_string(), v.clone()));
-            }
-            "--limit" => limit = it.next().and_then(|v| v.parse().ok()).unwrap_or(50),
-            "--threads" => threads = true,
-            _ => return Err(Unhandled),
+    for key in ["agent", "from", "to", "user", "node", "harness", "kind", "since"] {
+        if let Some(v) = a.value(&[format!("--{key}").as_str()])? {
+            q.push((key.to_string(), v));
         }
     }
+    // A limit that is not a number falls back to the default, as it always did.
+    let limit = a.value(&["--limit"])?.and_then(|v| v.parse().ok()).unwrap_or(50);
+    let threads = a.flag(&["--threads"]);
+    a.finish()?;
+    Ok(MessagesArgs { q, threads, limit })
+}
+
+/// `noo agents messages [--agent <id>] [--from <id>] [--to <id>] [--user <u>] [--node <n>] [--harness <h>] [--kind <k>] [--since <rfc3339>] [--limit <n>] [--threads]` — operator review.
+pub fn agents_messages(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let MessagesArgs { q, threads, limit } = parse_messages_with(&mut Args::new(args))?;
     let mut path = if threads { format!("/api/agents/threads?limit={limit}") } else { format!("/api/agents/messages?limit={limit}") };
     for (k, v) in &q { path.push_str(&format!("&{k}={}", super::urlencode(v))); }
     let resp = get_json(g, &path, true, 10);
@@ -652,25 +654,21 @@ pub fn agents_archive_list(g: &Globals, args: &[String]) -> Result<i32, Unhandle
     Ok(0)
 }
 
+pub(crate) fn parse_archive_export_with(a: &mut Args) -> Result<(String, bool, Option<String>), ArgError> {
+    let decrypt = a.flag(&["--decrypt"]);
+    let out = a.value(&["--out", "-o"])?;
+    let target = a.one("<month|file>")?;
+    Ok((target, decrypt, out))
+}
+
 /// `noo agents archive export <month|file> [--decrypt] [--out <path>]` —
 /// GET /api/agents/archive/{month}. JSONL, one archived row per line,
 /// bodies still sealed. `--decrypt` asks the gateway to open them with the
 /// cluster key (operator-only, audited by name and month); decrypted rows
 /// are written ONLY to `--out` (mode 0600), never to stdout or `--json`.
 pub fn agents_archive_export(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut target: Option<&str> = None;
-    let mut decrypt = false;
-    let mut out: Option<&str> = None;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--decrypt" => decrypt = true,
-            "--out" | "-o" => out = Some(it.next().ok_or(Unhandled)?.as_str()),
-            s if !s.starts_with('-') && target.is_none() => target = Some(s),
-            _ => return Err(Unhandled),
-        }
-    }
-    let target = target.ok_or(Unhandled)?;
+    let (target, decrypt, out) = parse_archive_export_with(&mut Args::new(args))?;
+    let (target, out) = (target.as_str(), out.as_deref());
     if decrypt && out.is_none() {
         crate::output::fail(
             g.json,

@@ -30,6 +30,7 @@
 //! and treats Ollama's terminal `{"status":"success"}` as done alongside
 //! the legacy `{"done":true}`.
 
+use crate::args::{ArgError, Args};
 use crate::catalog::{self, Catalog};
 use crate::http::{get_json, get_json_opt, post_json_stream};
 use crate::output::{fail, ExitCode};
@@ -77,6 +78,12 @@ pub fn models_cached(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+pub(crate) fn parse_pull_with(a: &mut Args) -> Result<(String, String), ArgError> {
+    let backend = a.value(&["--backend", "-b"])?.unwrap_or_else(|| "ollama".to_string());
+    let model = a.one("<model>")?;
+    Ok((model, backend))
+}
+
 /// `noo models pull MODEL [--backend/-b ollama]` —
 /// POST /api/terminal/ollama/pull {"model": M}, streamed progress (600s cap
 /// on the whole download, Python parity). Progress lines go to stderr;
@@ -85,21 +92,7 @@ pub fn models_cached(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 pub fn models_pull(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     use std::io::BufRead as _;
 
-    let mut model: Option<String> = None;
-    let mut backend = "ollama".to_string();
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--backend" | "-b" => backend = iter.next().ok_or(Unhandled)?.clone(),
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => {
-                if model.replace(t.to_string()).is_some() {
-                    return Err(Unhandled);
-                }
-            }
-        }
-    }
-    let Some(model) = model else { return Err(Unhandled) };
+    let (model, backend) = parse_pull_with(&mut Args::new(args))?;
     // The voice add-on's models (i105): `whisper:<size>` / `piper:<voice>`
     // are staged into the controller's model store, never pulled by Ollama
     // and never fetched by the voice containers themselves.
@@ -364,24 +357,28 @@ fn show_gated_hint(model_id: &str, gated: &str) {
     }
 }
 
+/// What `noo models list` was asked for.
+pub(crate) struct ListArgs {
+    backend: Option<String>,
+    tier: Option<i64>,
+    limit: usize,
+    refresh: bool,
+}
+
+pub(crate) fn parse_list_with(a: &mut Args) -> Result<ListArgs, ArgError> {
+    let backend = a.value(&["--backend", "-b"])?;
+    let tier = a.number::<i64>(&["--tier", "-t"])?;
+    let limit = a.number::<usize>(&["--limit", "-n"])?.unwrap_or(15);
+    let refresh = a.flag(&["--refresh"]);
+    a.finish()?;
+    Ok(ListArgs { backend, tier, limit, refresh })
+}
+
 /// `noo models list [--backend/-b B] [--tier/-t N] [--limit/-n N] [--refresh]`
 /// — popular models per backend from the HuggingFace-backed catalog cache.
 pub fn models_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     crate::ui::auto_page(); // long output: $PAGER on a TTY (no-op otherwise)
-    let mut backend: Option<String> = None;
-    let mut tier: Option<i64> = None;
-    let mut limit = 15usize;
-    let mut refresh = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--backend" | "-b" => backend = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--tier" | "-t" => tier = Some(iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?),
-            "--limit" | "-n" => limit = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?,
-            "--refresh" => refresh = true,
-            _ => return Err(Unhandled),
-        }
-    }
+    let ListArgs { backend, tier, limit, refresh } = parse_list_with(&mut Args::new(args))?;
 
     let backends: Vec<String> = match &backend {
         Some(b) => vec![b.clone()],
@@ -449,26 +446,17 @@ pub fn models_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+pub(crate) fn parse_search_with(a: &mut Args) -> Result<(String, Option<String>, usize), ArgError> {
+    let backend = a.value(&["--backend", "-b"])?;
+    let limit = a.number::<usize>(&["--limit", "-n"])?.unwrap_or(15);
+    let query = a.one("<query>")?;
+    Ok((query, backend, limit))
+}
+
 /// `noo models search QUERY [--backend/-b B] [--limit/-n N]` — live
 /// HuggingFace search (cached/offline fallback).
 pub fn models_search(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut query: Option<String> = None;
-    let mut backend: Option<String> = None;
-    let mut limit = 15usize;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--backend" | "-b" => backend = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--limit" | "-n" => limit = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?,
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => {
-                if query.replace(t.to_string()).is_some() {
-                    return Err(Unhandled);
-                }
-            }
-        }
-    }
-    let Some(query) = query else { return Err(Unhandled) };
+    let (query, backend, limit) = parse_search_with(&mut Args::new(args))?;
 
     let mut cat = Catalog::new();
     if !g.json {
@@ -596,23 +584,20 @@ pub fn models_info(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+pub(crate) fn parse_recommended_with(a: &mut Args) -> Result<(Option<i64>, Option<String>, bool), ArgError> {
+    let tier = a.number::<i64>(&["--tier", "-t"])?;
+    let arch = a.value(&["--arch"])?;
+    let refresh = a.flag(&["--refresh"]);
+    a.finish()?;
+    Ok((tier, arch, refresh))
+}
+
 /// `noo models recommended [--tier/-t N] [--arch A] [--refresh]` — curated
 /// recommendations for a node's hardware tier + arch. Tier auto-detects
 /// from the gateway's node list when omitted; models already cached on the
 /// cluster are preferred (they preseed over the LAN).
 pub fn models_recommended(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut tier: Option<i64> = None;
-    let mut arch: Option<String> = None;
-    let mut refresh = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--tier" | "-t" => tier = Some(iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?),
-            "--arch" => arch = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--refresh" => refresh = true,
-            _ => return Err(Unhandled),
-        }
-    }
+    let (tier, arch, refresh) = parse_recommended_with(&mut Args::new(args))?;
 
     // Auto-detect tier from cluster node capabilities (best-effort: the
     // Python CLI swallows every error here and defaults to tier 1).
@@ -794,19 +779,17 @@ pub fn models_recommended(g: &Globals, args: &[String]) -> Result<i32, Unhandled
     Ok(0)
 }
 
+pub(crate) fn parse_ollama_with(a: &mut Args) -> Result<(usize, bool), ArgError> {
+    let limit = a.number::<usize>(&["--limit", "-n"])?.unwrap_or(20);
+    let refresh = a.flag(&["--refresh"]);
+    a.finish()?;
+    Ok((limit, refresh))
+}
+
 /// `noo models ollama [--limit/-n N] [--refresh]` — popular
 /// Ollama-compatible models from the catalog.
 pub fn models_ollama(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut limit = 20usize;
-    let mut refresh = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--limit" | "-n" => limit = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?,
-            "--refresh" => refresh = true,
-            _ => return Err(Unhandled),
-        }
-    }
+    let (limit, refresh) = parse_ollama_with(&mut Args::new(args))?;
 
     let mut cat = Catalog::new();
     let models = cat.fetch_models("ollama", None, limit, refresh);
@@ -859,23 +842,16 @@ pub fn models_ollama(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+pub(crate) fn parse_huggingface_with(a: &mut Args) -> Result<(Option<String>, usize), ArgError> {
+    let limit = a.number::<usize>(&["--limit", "-n"])?.unwrap_or(10);
+    let query = a.maybe_one("<query>")?;
+    Ok((query, limit))
+}
+
 /// `noo models huggingface [QUERY] [--limit/-n N]` — HuggingFace search
 /// (default query "mistral instruct awq", Python parity).
 pub fn models_huggingface(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut query: Option<String> = None;
-    let mut limit = 10usize;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--limit" | "-n" => limit = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?,
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => {
-                if query.replace(t.to_string()).is_some() {
-                    return Err(Unhandled);
-                }
-            }
-        }
-    }
+    let (query, limit) = parse_huggingface_with(&mut Args::new(args))?;
     let query = query.unwrap_or_else(|| "mistral instruct awq".to_string());
 
     let mut cat = Catalog::new();
@@ -1102,29 +1078,20 @@ fn rewrite_yaml_for_switch(
     serde_yaml::to_string(&sort_yaml_keys(config)).map_err(|e| e.to_string())
 }
 
+pub(crate) fn parse_switch_with(a: &mut Args) -> Result<(String, String, bool), ArgError> {
+    let backend = a.value(&["--backend", "-b"])?.unwrap_or_else(|| "vllm".to_string());
+    let yes = a.flag(&["--yes", "-y"]);
+    let model = a.one("<model>")?;
+    Ok((model, backend, yes))
+}
+
 /// `noo models switch MODEL [--backend/-b vllm]` — switch the active model
 /// without rebuilding: noomesh.yaml + .env rewrite, then restart only the
 /// backend container (plus a best-effort gateway restart for the new YAML).
 pub fn models_switch(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     use std::process::Command;
 
-    let mut model: Option<String> = None;
-    let mut backend = "vllm".to_string();
-    let mut yes = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--backend" | "-b" => backend = iter.next().ok_or(Unhandled)?.clone(),
-            "-y" | "--yes" => yes = true,
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => {
-                if model.replace(t.to_string()).is_some() {
-                    return Err(Unhandled);
-                }
-            }
-        }
-    }
-    let Some(model) = model else { return Err(Unhandled) };
+    let (model, backend, yes) = parse_switch_with(&mut Args::new(args))?;
     // Rewrites .env + noomesh.yaml and restarts the backend and gateway.
     super::confirm_destructive(g, yes, "Switch the active model, rewrite .env/noomesh.yaml and restart the backend and gateway, to", &model);
 
@@ -1515,21 +1482,19 @@ fn llm_enrich_batch(g: &Globals, models: &mut [Value]) {
     }
 }
 
+pub(crate) fn parse_refresh_with(a: &mut Args) -> Result<(Option<String>, bool), ArgError> {
+    let backend = a.value(&["--backend", "-b"])?;
+    let use_llm = a.flag(&["--llm"]);
+    a.finish()?;
+    Ok((backend, use_llm))
+}
+
 /// `noo models refresh [--backend/-b B] [--llm]` — rebuild the model catalog
 /// from HuggingFace (TTL bypassed), overwriting the shared cache file;
 /// `--llm` additionally runs the coordinator eval and stores the result in
 /// the cache. Exit 0 when at least one backend refreshed; 1 when all failed.
 pub fn models_refresh(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut backend: Option<String> = None;
-    let mut use_llm = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--backend" | "-b" => backend = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--llm" => use_llm = true,
-            _ => return Err(Unhandled),
-        }
-    }
+    let (backend, use_llm) = parse_refresh_with(&mut Args::new(args))?;
     let backends: Vec<String> = match &backend {
         Some(b) => vec![b.clone()],
         None => catalog::ALL_SEARCH_BACKENDS.iter().map(|s| s.to_string()).collect(),

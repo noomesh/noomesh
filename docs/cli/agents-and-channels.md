@@ -234,8 +234,8 @@ or have the person log in and run `noo security service-key self`
 | `noo agents messages` | `[--agent <id>] [--from <id>] [--to <id>] [--user <u>] [--node <n>] [--harness <h>] [--kind <k>] [--since <rfc3339>] [--limit <n>] [--threads]` | Review agent traffic by agent, user, node or harness (operator); --threads lists threads |
 | `noo agents archive list` | — | List the archived agent-mail files (month, messages, size); operator |
 | `noo agents archive export` | `<YYYY-MM\|file> [--decrypt] [--out <path>]` | Write an archived month as JSONL, sealed; --decrypt opens it (audited, needs --out) |
-| `noo agents collaborate` | `<task> [-r <roles-csv>]` | Run a multi-agent collaboration on a task and print each role's output (300s) |
-| `noo agents peer dispatch` | `<agent-id> <task> [-r <role>]` | Dispatch a task to an A2A peer agent and print the task id |
+| `noo agents collaborate` | `<task> [-r\|--roles <roles-csv>]` | Run a multi-agent collaboration on a task and print each role's output (300s) |
+| `noo agents peer dispatch` | `<agent-id> <task> [-r\|--role <role>]` | Dispatch a task to an A2A peer agent and print the task id |
 
 ### `noo tasks` — Objectives the agent loops on until done
 | Command | Arguments | What it does |
