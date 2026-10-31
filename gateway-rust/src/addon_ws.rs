@@ -328,9 +328,7 @@ pub(crate) fn admit(
     requester: Option<&crate::auth::RequesterCtx>,
 ) -> Result<(), Response> {
     if let Some(r) = requester {
-        if !spec.permits(r.role, &r.scopes) {
-            return Err(crate::addon_proxy::forbidden(manifest, spec));
-        }
+        crate::addon_access::route_check(manifest, spec, r)?;
     }
     Ok(())
 }

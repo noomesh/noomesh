@@ -511,6 +511,9 @@ async fn main() -> Result<()> {
     // Keep the behavioral-flag (noo_settings) override cache warm so admin UI
     // toggles take effect within ~15s (no restart) for Rust-read flags.
     crate::settings::spawn_refresh(state.db.clone());
+    // f99: who may use each add-on feature. Features are refused until
+    // the first load (fail closed).
+    crate::addon_access::spawn_refresh(state.db.clone());
     // Embedding spaces (i145): seed `knowledge` on an empty table, then keep
     // the space cache warm the same way.
     crate::embedding_spaces::spawn_refresh(state.clone());

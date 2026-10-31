@@ -414,8 +414,11 @@ pub fn declared_scopes_of(manifests: &[AddonManifest]) -> Vec<String> {
 /// being waved through. False when no mounted route matches. When more than
 /// one pattern matches a path (a static route beside a `{param}` one), ALL of
 /// them must permit: the stricter reading, never the wider.
-pub fn mounted_get_allows(scopes: &[String], role: crate::auth::Role, path: &str) -> bool {
-    get_allows(&manifests(), scopes, role, path)
+///
+/// A features manifest (f99) asks the route's feature for `account`; without
+/// an account it is refused.
+pub fn mounted_get_allows(scopes: &[String], role: crate::auth::Role, account: Option<&str>, path: &str) -> bool {
+    get_allows_for(&manifests(), scopes, role, account, path)
 }
 
 /// May a requester of `role` holding `scopes` make a non-GET `method` call to
@@ -427,11 +430,38 @@ pub fn mounted_owner_scoped_allows(
     method: &axum::http::Method,
     scopes: &[String],
     role: crate::auth::Role,
+    account: Option<&str>,
     path: &str,
 ) -> bool {
-    owner_scoped_allows(&manifests(), method, scopes, role, path)
+    owner_scoped_allows_for(&manifests(), method, scopes, role, account, path)
 }
 
+fn owner_scoped_allows_for(
+    manifests: &[AddonManifest],
+    method: &axum::http::Method,
+    scopes: &[String],
+    role: crate::auth::Role,
+    account: Option<&str>,
+    path: &str,
+) -> bool {
+    let hits = matching(manifests, method.as_str(), path);
+    !hits.is_empty()
+        && hits.iter().all(|(m, r)| r.owner_scoped && crate::addon_access::route_permits(m, r, role, scopes, account))
+}
+
+fn get_allows_for(
+    manifests: &[AddonManifest],
+    scopes: &[String],
+    role: crate::auth::Role,
+    account: Option<&str>,
+    path: &str,
+) -> bool {
+    let hits = matching(manifests, "GET", path);
+    !hits.is_empty() && hits.iter().all(|(m, r)| crate::addon_access::route_permits(m, r, role, scopes, account))
+}
+
+/// The older-shape checks the tests drive (no account).
+#[cfg(test)]
 fn owner_scoped_allows(
     manifests: &[AddonManifest],
     method: &axum::http::Method,
@@ -439,13 +469,12 @@ fn owner_scoped_allows(
     role: crate::auth::Role,
     path: &str,
 ) -> bool {
-    let hits = matching_routes(manifests, method.as_str(), path);
-    !hits.is_empty() && hits.iter().all(|r| r.owner_scoped && r.permits(role, scopes))
+    owner_scoped_allows_for(manifests, method, scopes, role, None, path)
 }
 
+#[cfg(test)]
 fn get_allows(manifests: &[AddonManifest], scopes: &[String], role: crate::auth::Role, path: &str) -> bool {
-    let hits = matching_routes(manifests, "GET", path);
-    !hits.is_empty() && hits.iter().all(|r| r.permits(role, scopes))
+    get_allows_for(manifests, scopes, role, None, path)
 }
 
 #[cfg(test)]
@@ -454,13 +483,17 @@ fn manifests_get_match(manifests: &[AddonManifest], path: &str) -> bool {
 }
 
 pub(crate) fn matching_routes<'a>(manifests: &'a [AddonManifest], method: &str, path: &str) -> Vec<&'a RouteSpec> {
+    matching(manifests, method, path).into_iter().map(|(_, r)| r).collect()
+}
+
+/// [`matching_routes`] with the manifest each route came from (its add-on
+/// and features decide a features-manifest route).
+pub(crate) fn matching<'a>(manifests: &'a [AddonManifest], method: &str, path: &str) -> Vec<(&'a AddonManifest, &'a RouteSpec)> {
     manifests
         .iter()
-        .flat_map(|m| m.routes.iter())
-        .filter(|r| !r.internal && r.method == method)
-        .filter(|r| {
-            std::iter::once(&r.path).chain(r.aliases.iter()).any(|pat| pattern_matches(pat, path))
-        })
+        .flat_map(|m| m.routes.iter().map(move |r| (m, r)))
+        .filter(|(_, r)| !r.internal && r.method == method)
+        .filter(|(_, r)| std::iter::once(&r.path).chain(r.aliases.iter()).any(|pat| pattern_matches(pat, path)))
         .collect()
 }
 
@@ -578,10 +611,11 @@ async fn serve(
         )
             .into_response();
     }
-    // Permission first, before a param is parsed or anything is forwarded.
+    // Permission first, before a param is parsed or anything is forwarded:
+    // the route's own rule, or for a features manifest its feature (f99).
     if let Some(r) = requester {
-        if !spec.permits(r.role, &r.scopes) {
-            return forbidden(manifest, spec);
+        if let Err(resp) = crate::addon_access::route_check(manifest, spec, r) {
+            return resp;
         }
     }
     let mut path = match fill_path(spec, &params) {
