@@ -93,6 +93,25 @@ def test_a_span_continues_the_gateways_trace_and_nests() -> None:
             assert s.parent is None and re.fullmatch(r"[0-9a-f]{32}", s.trace_id) and set(s.trace_id) != {"0"}, bad
 
 
+def test_a_worker_hop_without_a_traceparent_makes_no_span(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    put = []
+    monkeypatch.setattr(tracing._Exporter, "_run", lambda self: None)
+    client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+    assert tracing.configure("noo-worker", env=_env(tmp_path), client=client) is True
+    monkeypatch.setattr(tracing._exporter, "put", put.append)
+    for missing in (None, "", "garbage"):
+        ran = []
+        with tracing.span("worker worker.x", traceparent=missing, continue_only=True) as s:
+            ran.append(1)
+            assert s is None and tracing.current_trace_id() is None
+        assert ran == [1], "the block still runs"
+    assert put == [], "an untraced message made a span (an orphan root trace in Tempo)"
+    tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    with tracing.span("worker worker.x", traceparent=tp, continue_only=True) as s:
+        assert s is not None and s.parent == "00f067aa0ba902b7"
+    assert len(put) == 1
+
+
 def test_an_exception_marks_the_span_and_propagates() -> None:
     with pytest.raises(RuntimeError):
         with tracing.span("boom") as s:
@@ -152,6 +171,6 @@ def test_the_worker_continues_the_gateways_trace_per_subject() -> None:
     src = (ROOT / "src/noomesh/gateway/worker_pool.py").read_text(encoding="utf-8")
     assert 'tracing.configure("noo-worker")' in src
     assert '(msg.headers or {}).get("traceparent")' in src
-    assert re.search(r"with tracing\.span\(\s*f\"worker \{subject\}\",\s*traceparent=traceparent,", src)
+    assert re.search(r"with tracing\.span\(\s*f\"worker \{subject\}\",\s*traceparent=traceparent,[^)]*continue_only=True\)", src)
     rust = (ROOT / "gateway-rust/src/bus_principal.rs").read_text(encoding="utf-8")
     assert 'headers.insert("traceparent", tp.as_str());' in rust, "the gateway no longer sends traceparent to workers"
