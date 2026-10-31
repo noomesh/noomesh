@@ -5417,6 +5417,139 @@ mod gateway_redis_tests {
     }
 }
 
+/// The `gateway add-on` rows (i353b): one per add-on noomesh.yaml switches
+/// on, plus any the gateway refused that is not. On 2026-10-31 the gateway
+/// refused a third-party add-on whole at startup (its routes.json) while `add-on pins`
+/// said verified and `noo addons show` said on; only the gateway log knew.
+/// The authenticated `/health` carries `addons_refused` (`{}` when none);
+/// without it (unreachable, no credential, an older gateway) every row is a
+/// WARN, never a pass: a missing field is not "nothing refused".
+pub(crate) fn gateway_addon_checks(health: Option<&Value>, enabled: &[String]) -> Vec<Check> {
+    const NAME: &str = "gateway add-on";
+    let refused = health.and_then(|h| h["addons_refused"].as_object());
+    let mut names: Vec<&str> = enabled.iter().map(String::as_str).collect();
+    if let Some(r) = refused {
+        names.extend(r.keys().map(String::as_str));
+    }
+    names.sort_unstable();
+    names.dedup();
+    names
+        .into_iter()
+        .map(|n| {
+            let Some(refused) = refused else {
+                return warn(
+                    NAME,
+                    format!(
+                        "{n}: not read: no authenticated /health answer with addons_refused \
+                         (unreachable, no credential, or a gateway older than this CLI)"
+                    ),
+                    Some("noo health".into()),
+                );
+            };
+            if let Some(why) = refused.get(n) {
+                return fail(
+                    NAME,
+                    format!("{n}: refused by the gateway, NOT running: {}", why.as_str().unwrap_or("no reason given")),
+                    "fix the manifest the add-on ships, then `noo addons check <bundle-dir>`",
+                );
+            }
+            match health.and_then(|h| h["addons"][n].as_str()) {
+                Some(word) => ok(NAME, format!("{n}: {word}, not refused")),
+                None => warn(
+                    NAME,
+                    format!("{n}: on in noomesh.yaml but the gateway does not list it (not started since it was enabled?)"),
+                    Some("noo stack start".into()),
+                ),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod gateway_addon_tests {
+    use super::{gateway_addon_checks, Verdict};
+    use serde_json::{json, Value};
+
+    /// An authenticated /health body as the 0.6.16 gateway writes it, with
+    /// the refusal pop-os logged on 2026-10-31 (renamed).
+    fn captured(refused: Value) -> Value {
+        json!({
+            "status": "healthy",
+            "engine": "rust",
+            "version": "0.6.16",
+            "peers": 3,
+            "dependencies": {"postgresql": {"healthy": true}},
+            "addons": {"trellion": "enabled", "rhaddon": "unhealthy", "voice": "disabled"},
+            "addons_refused": refused,
+        })
+    }
+
+    const WHY: &str = "route manifest /opt/noo/addon-bundle-routes/rhaddon/routes.json refused: \
+        route \"get_v1_workspace\": owner_scoped applies to a public write route (POST, PUT, PATCH, DELETE) only. \
+        None of its routes are mounted; fix the manifest the add-on ships";
+
+    fn on(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn a_refused_enabled_addon_fails_with_the_gateway_text_and_the_check_remedy() {
+        let h = captured(json!({"rhaddon": WHY}));
+        let rows = gateway_addon_checks(Some(&h), &on(&["rhaddon", "trellion"]));
+        assert_eq!(rows.len(), 2);
+        let pv = &rows[0];
+        assert_eq!(pv.name, "gateway add-on");
+        assert_eq!(pv.verdict, Verdict::Fail);
+        assert!(pv.detail.starts_with("rhaddon: refused by the gateway, NOT running: "), "{}", pv.detail);
+        assert!(pv.detail.contains("owner_scoped applies to a public write route"), "{}", pv.detail);
+        assert!(pv.remedy.as_deref().is_some_and(|r| r.contains("noo addons check <bundle-dir>")));
+        assert_eq!(rows[1].verdict, Verdict::Ok);
+        assert_eq!(rows[1].detail, "trellion: enabled, not refused");
+    }
+
+    #[test]
+    fn an_empty_refusal_map_passes_every_listed_addon() {
+        let h = captured(json!({}));
+        let rows = gateway_addon_checks(Some(&h), &on(&["trellion"]));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].verdict, Verdict::Ok);
+    }
+
+    #[test]
+    fn a_refusal_of_an_addon_that_is_not_switched_on_still_fails() {
+        let h = captured(json!({"rhaddon": WHY}));
+        let rows = gateway_addon_checks(Some(&h), &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].verdict, Verdict::Fail);
+    }
+
+    #[test]
+    fn no_refusal_field_is_a_warn_never_a_pass() {
+        let mut older = captured(json!({}));
+        older.as_object_mut().unwrap().remove("addons_refused");
+        for body in [None, Some(json!({"status": "healthy"})), Some(older)] {
+            let rows = gateway_addon_checks(body.as_ref(), &on(&["rhaddon"]));
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].verdict, Verdict::Warn, "{body:?}");
+            assert!(rows[0].detail.contains("older than this CLI"), "{}", rows[0].detail);
+        }
+    }
+
+    #[test]
+    fn an_enabled_addon_the_gateway_does_not_list_warns() {
+        let h = captured(json!({}));
+        let rows = gateway_addon_checks(Some(&h), &on(&["evolve"]));
+        assert_eq!(rows[0].verdict, Verdict::Warn);
+        assert!(rows[0].detail.starts_with("evolve: on in noomesh.yaml"), "{}", rows[0].detail);
+    }
+
+    #[test]
+    fn nothing_on_and_nothing_refused_is_no_row() {
+        assert!(gateway_addon_checks(Some(&captured(json!({}))), &[]).is_empty());
+        assert!(gateway_addon_checks(None, &[]).is_empty());
+    }
+}
+
 /// The seat rows whose WARN remedy is the only way out and must print in a
 /// `seat <name>` section: the layout moves (`seat-sync --migrate`, run on the
 /// seat under sudo) and the display. 0.6.10 printed the legacy-layout WARN
@@ -5875,7 +6008,16 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(embedding_spaces_check(spaces.as_ref()));
         // The gateway's own Redis connection (authenticated /health: the
         // anonymous body carries no dependency map).
-        checks.push(gateway_redis_check(get_json_opt(g, "/health", true, 10).as_ref()));
+        let health = get_json_opt(g, "/health", true, 10);
+        checks.push(gateway_redis_check(health.as_ref()));
+        // i353b: an add-on the gateway refused at startup. An unreadable
+        // noomesh.yaml is already a row of its own (`add-on pins`).
+        let enabled: Vec<String> = crate::commands::addons::declared_map_at(&crate::envfile::repo_root().join("noomesh.yaml"))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(n, on)| on.then_some(n))
+            .collect();
+        checks.extend(gateway_addon_checks(health.as_ref(), &enabled));
         {
             let root = crate::envfile::repo_root();
             let store = crate::commands::secrets::SecretStore::load_sops(&root.join("secrets/env.sops"));
