@@ -182,7 +182,7 @@ pub const ROUTES_DIR: &str = "/opt/noo/addon-routes";
 // i302). The ones gateway code names through this module are re-exported
 // here; the gateway is a binary, so an unused `pub use` fails clippy, and
 // anything else is named as `addon_manifest::…` where it is used.
-pub use addon_manifest::{AddonManifest, RouteSpec, TaskEventsSpec, UiSpec, DELEGATE_TASKS, METHOD_WS, ROUTES_FILE};
+pub use addon_manifest::{AddonManifest, RouteSpec, TaskEventsSpec, UiSpec, METHOD_WS, ROUTES_FILE};
 pub(crate) use addon_manifest::container_of;
 use addon_manifest::{pattern_matches, ManifestRole};
 
@@ -1232,7 +1232,7 @@ pub(crate) mod tests {
         let v = delegating(|_| {});
         check(v.clone()).expect("a delegating manifest with its events route is accepted");
         let m: AddonManifest = serde_json::from_value(v).unwrap();
-        assert_eq!(m.delegate.as_deref(), Some(DELEGATE_TASKS));
+        assert_eq!(m.delegate.as_deref(), Some(addon_manifest::DELEGATE_TASKS));
         assert_eq!(
             m.task_events,
             Some(TaskEventsSpec { method: "POST".into(), path: "/internal/task-events".into() })
