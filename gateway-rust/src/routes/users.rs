@@ -1089,13 +1089,16 @@ fn erase_targets(keep_account: bool, episodes_have_user_id: bool) -> Vec<EraseTa
         // `uploads_to_remove`).
         EraseTarget { label: "uploads", table: "noo_uploads", where_sql: "owner = $1" },
         // Request traces (i359): metadata only, but each row names who made the
-        // request (`actor`, and `user_uuid` resolved from it). Before the account
-        // goes, so the subquery still finds it. The spans in Tempo carry the
-        // same name and age out with Tempo's 30 days.
+        // request (`actor`, and `user_uuid` resolved from its account). A
+        // connection login is stored as `alice/<conn>`, so the account part of
+        // the actor is matched (split_part, not LIKE: `_` is a LIKE wildcard and
+        // legal in a username). Before the account goes, so the subquery still
+        // finds it. The spans in Tempo carry the same name and age out with
+        // Tempo's 30 days; an erase cannot reach them (docs/security).
         EraseTarget {
             label: "request_traces",
             table: "noo_request_trace",
-            where_sql: "actor = $1 OR user_uuid = (SELECT user_uuid FROM noo_users WHERE username = $1)",
+            where_sql: "split_part(actor, '/', 1) = $1 OR user_uuid = (SELECT user_uuid FROM noo_users WHERE username = $1)",
         },
     ];
     if !keep_account {
@@ -4423,7 +4426,8 @@ mod tests {
             let t = super::erase_targets(keep, true);
             let r = t.iter().position(|x| x.table == "noo_request_trace").expect("noo_request_trace must be an erase target");
             assert_eq!(t[r].label, "request_traces");
-            assert!(t[r].where_sql.contains("actor = $1") && t[r].where_sql.contains("user_uuid"), "{}", t[r].where_sql);
+            assert!(t[r].where_sql.contains("split_part(actor, '/', 1) = $1") && t[r].where_sql.contains("user_uuid"), "{}", t[r].where_sql);
+            assert!(!t[r].where_sql.contains("LIKE"), "`_` in a username is a LIKE wildcard");
             if let Some(a) = t.iter().position(|x| x.table == "noo_users") {
                 assert!(r < a, "the subquery reads the account: erase traces before it");
             }
@@ -4495,6 +4499,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(staged, 2, "archived like every other store");
+    }
+
+    /// RTBF for request traces against the real table: alice's rows go,
+    /// her connection login's included (`alice/laptop`, which used to keep
+    /// its rows); bob's, `alice_x`'s and an internal caller's stay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rtbf_erases_a_users_request_traces_including_her_connection_logins() {
+        let _serial = crate::ops::tests::DB_LOCK.lock().await;
+        let Some(db) = crate::ops::tests::scratch("rtbf_traces").await else { return };
+        use crate::auth::Role;
+        for who in ["alice", "bob", "alice_x"] {
+            let _ = crate::ops::tests::account(&db, who, Role::User).await;
+        }
+        let row = |actor: &str, kind: &str| crate::request_trace::SummaryRow {
+            trace_id: format!("{:032x}", actor.len()),
+            method: "POST".into(),
+            route: "/v1/chat/completions".into(),
+            status: 200,
+            duration_ms: 1,
+            summary: crate::request_trace::Summary {
+                actor: Some(actor.into()),
+                actor_kind: Some(kind.into()),
+                ..Default::default()
+            },
+            span_count: 1,
+            request_bytes: None,
+            response_bytes: None,
+        };
+        for (actor, kind) in [("alice", "user"), ("alice/laptop", "user"), ("bob", "user"), ("alice_x", "user"), ("internal:cluster:worker", "internal")] {
+            crate::repo::request_trace::insert(&db, &row(actor, kind)).await.unwrap();
+        }
+        let resolved: Option<uuid::Uuid> = sqlx::query_scalar("SELECT user_uuid FROM noo_request_trace WHERE actor = 'alice/laptop'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert!(resolved.is_some(), "a connection login's row carries its account's user_uuid");
+        let run = uuid::Uuid::new_v4();
+        for t in super::erase_targets(true, true).iter().filter(|t| t.table == "noo_request_trace") {
+            sqlx::query(sqlx::AssertSqlSafe(&*t.snapshot_sql())).bind("alice").bind(run).bind(t.label).execute(&db).await.unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(&*t.delete_sql())).bind("alice").execute(&db).await.unwrap();
+        }
+        let left: Vec<String> = sqlx::query_scalar("SELECT actor FROM noo_request_trace ORDER BY 1").fetch_all(&db).await.unwrap();
+        assert_eq!(left, ["alice_x", "bob", "internal:cluster:worker"], "alice's rows are gone, her connection's too, nobody else's");
     }
 
     /// RTBF for the thread walks and the setting, against real tables: the

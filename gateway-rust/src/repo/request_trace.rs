@@ -10,12 +10,23 @@
 
 use crate::request_trace::SummaryRow;
 
+/// The account a row's actor belongs to: a connection login
+/// (`alice/laptop`) is the account `alice`'s. None for a non-person caller.
+pub fn account_for(actor: Option<&str>, actor_kind: Option<&str>) -> Option<&str> {
+    match (actor, actor_kind) {
+        (Some(a), Some("user")) => Some(crate::auth::account_of(a)),
+        _ => None,
+    }
+}
+
 /// Insert one row. The account is resolved by name IN the insert, as the
-/// usage writer does, and a name with no account (a service key, an internal
-/// caller) stores NULL rather than a made-up identity.
+/// usage writer does: the ACCOUNT of a connection login, so its rows carry
+/// the account's `user_uuid` and an erase finds them. A name with no account
+/// (a service key, an internal caller) stores NULL rather than a made-up
+/// identity.
 pub async fn insert(db: &sqlx::PgPool, row: &SummaryRow) -> Result<(), sqlx::Error> {
     let s = &row.summary;
-    let username = if s.actor_kind.as_deref() == Some("user") { s.actor.as_deref() } else { None };
+    let username = account_for(s.actor.as_deref(), s.actor_kind.as_deref());
     sqlx::query(
         "INSERT INTO noo_request_trace
              (trace_id, method, route, status, duration_ms, user_uuid, actor, actor_kind,
@@ -53,4 +64,17 @@ pub async fn prune(db: &sqlx::PgPool, keep_days: i64) -> Result<u64, sqlx::Error
         .execute(db)
         .await?;
     Ok(res.rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_connection_login_resolves_to_its_account() {
+        assert_eq!(account_for(Some("alice/laptop"), Some("user")), Some("alice"));
+        assert_eq!(account_for(Some("alice"), Some("user")), Some("alice"));
+        assert_eq!(account_for(Some("internal:cluster:worker"), Some("internal")), None);
+        assert_eq!(account_for(None, Some("user")), None);
+    }
 }

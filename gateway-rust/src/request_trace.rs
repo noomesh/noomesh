@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 PersonifAI LLC
 
-//! Request tracing (i359): every request the gateway serves becomes a trace
-//! in Tempo and one summary row in `noo_request_trace`.
+//! Request tracing (i359): every authenticated request the gateway serves
+//! becomes a trace in Tempo and one summary row in `noo_request_trace`.
+//! Anonymous, refused (401) and rate-limited (429) requests record nothing:
+//! a flood the limiter answers costs no database write (see [`Recorder`]).
 //!
 //! The operator's decision (2026-10-31): trace everything, keep 30 days,
 //! carry metadata and sizes only — routes, ids, model, node, timings,
@@ -14,9 +16,9 @@
 //!
 //! ## Shape
 //!
-//! [`trace_layer`] wraps the router. It takes the caller's W3C
-//! `traceparent` when one is well formed (a client or an upstream already
-//! tracing) and otherwise starts a trace, puts a [`Recorder`] in a
+//! [`trace_layer`] wraps the router. It holds the caller's W3C
+//! `traceparent` when one is well formed and continues it only once the
+//! caller authenticates (otherwise the request has its own trace), puts a [`Recorder`] in a
 //! task-local for the handler, and answers with a `traceparent` header so a
 //! caller can find its own trace. Code inside the request notes what it
 //! learns: [`note_principal`] (the auth-scoped layer), [`note_usage`] (the
@@ -40,6 +42,7 @@
 //! the log rail's own traffic, which would bury every request a person or
 //! an agent made.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -225,10 +228,21 @@ pub struct Summary {
 }
 
 /// One request's trace while it runs.
+///
+/// Nothing is recorded for a request until authentication has run for it
+/// ([`Recorder::authenticate`], from the auth-scoped principal layer): an
+/// anonymous request, a refused one and a rate-limited one leave no row and
+/// no span, so a flood the limiter answers costs no database write. The
+/// caller's `traceparent` is held until then too: an unauthenticated caller
+/// cannot join a trace it names.
 pub struct Recorder {
-    pub ctx: TraceContext,
-    /// The caller's span, when the request arrived with a `traceparent`.
-    pub parent: Option<[u8; 8]>,
+    span_id: [u8; 8],
+    /// This request's own trace id, used unless an authenticated caller
+    /// sent a `traceparent`.
+    fresh_trace: [u8; 16],
+    /// The caller's `traceparent`, adopted only once it authenticated.
+    incoming: Option<TraceContext>,
+    authenticated: AtomicBool,
     pub method: String,
     pub route: String,
     pub start_ns: u64,
@@ -238,13 +252,11 @@ pub struct Recorder {
 
 impl Recorder {
     fn new(method: &Method, route: String, incoming: Option<TraceContext>, request_bytes: Option<i64>) -> Self {
-        let (trace_id, parent) = match incoming {
-            Some(c) => (c.trace_id, Some(c.span_id)),
-            None => (random_bytes::<16>(), None),
-        };
         Self {
-            ctx: TraceContext { trace_id, span_id: new_span_id() },
-            parent,
+            span_id: new_span_id(),
+            fresh_trace: random_bytes::<16>(),
+            incoming,
+            authenticated: AtomicBool::new(false),
             method: method.as_str().to_string(),
             route,
             start_ns: now_ns(),
@@ -253,8 +265,38 @@ impl Recorder {
         }
     }
 
+    /// Whether authentication admitted the caller.
+    pub fn is_authenticated(&self) -> bool {
+        self.authenticated.load(Ordering::Acquire)
+    }
+
+    fn adopted(&self) -> Option<TraceContext> {
+        self.incoming.filter(|_| self.is_authenticated())
+    }
+
+    /// The request's trace id and its own span id: the caller's trace once
+    /// an authenticated caller continued one, else this request's own.
+    pub fn ctx(&self) -> TraceContext {
+        let trace_id = self.adopted().map(|c| c.trace_id).unwrap_or(self.fresh_trace);
+        TraceContext { trace_id, span_id: self.span_id }
+    }
+
+    /// The caller's span, when an authenticated caller sent `traceparent`.
+    pub fn parent(&self) -> Option<[u8; 8]> {
+        self.adopted().map(|c| c.span_id)
+    }
+
+    /// The caller authenticated as `p`: record this request, under `p`.
+    fn authenticate(&self, p: &crate::bus_principal::Principal) {
+        self.with_summary(|s| {
+            s.actor = Some(p.sub.clone());
+            s.actor_kind = Some(p.kind.as_str().to_string());
+        });
+        self.authenticated.store(true, Ordering::Release);
+    }
+
     pub fn trace_id_hex(&self) -> String {
-        hex::encode(self.ctx.trace_id)
+        hex::encode(self.ctx().trace_id)
     }
 
     fn with_summary(&self, f: impl FnOnce(&mut Summary)) {
@@ -300,10 +342,11 @@ impl Recorder {
         if let Some(n) = response_bytes {
             attrs.push(("http.response.body.size", Attr::Int(n)));
         }
+        let ctx = self.ctx();
         SpanRecord {
-            trace_id: self.ctx.trace_id,
-            span_id: self.ctx.span_id,
-            parent: self.parent,
+            trace_id: ctx.trace_id,
+            span_id: ctx.span_id,
+            parent: self.parent(),
             name: format!("{} {}", self.method, self.route),
             kind: SpanKind::Server,
             start_ns: self.start_ns,
@@ -329,13 +372,11 @@ pub fn current_trace_id() -> Option<String> {
 }
 
 /// The authenticated caller, from the bus principal the auth-scoped layer
-/// builds. Outside a traced request this does nothing.
+/// builds. It is what makes the request in scope recorded at all (see
+/// [`Recorder`]). Outside a traced request this does nothing.
 pub fn note_principal(p: &crate::bus_principal::Principal) {
     if let Some(r) = current() {
-        r.with_summary(|s| {
-            s.actor = Some(p.sub.clone());
-            s.actor_kind = Some(p.kind.as_str().to_string());
-        });
+        r.authenticate(p);
     }
 }
 
@@ -384,7 +425,7 @@ fn is_stream(h: &axum::http::HeaderMap) -> bool {
 }
 
 /// The router layer. See the module docs.
-pub async fn trace_layer(axum::extract::State(state): axum::extract::State<Arc<AppState>>, request: Request, next: Next) -> Response {
+pub async fn trace_layer(request: Request, next: Next) -> Response {
     let path = request.uri().path().to_string();
     if untraced(request.method().as_str(), &path) {
         return next.run(request).await;
@@ -403,19 +444,34 @@ pub async fn trace_layer(axum::extract::State(state): axum::extract::State<Arc<A
 
     let mut response = CURRENT.scope(rec.clone(), next.run(request)).await;
     let status = response.status().as_u16();
-    if let Ok(v) = HeaderValue::from_str(&traceparent(&rec.ctx.trace_id, &rec.ctx.span_id)) {
+    if !recorded(&rec, status) {
+        // Anonymous, refused or rate-limited: nothing to record, nothing to
+        // name in a header.
+        return response;
+    }
+    let ctx = rec.ctx();
+    if let Ok(v) = HeaderValue::from_str(&traceparent(&ctx.trace_id, &ctx.span_id)) {
         response.headers_mut().insert("traceparent", v);
     }
 
     if !is_stream(response.headers()) {
         let bytes = content_length(response.headers());
-        finish(&state, &rec, status, bytes);
+        finish(&rec, status, bytes);
         return response;
     }
     // A streamed answer: the trace ends with the stream.
     let (parts, body) = response.into_parts();
-    let body = count_until_dropped(body, move |bytes| finish(&state, &rec, status, Some(bytes)));
+    let body = count_until_dropped(body, move |bytes| {
+        finish(&rec, status, Some(bytes));
+    });
     Response::from_parts(parts, body)
+}
+
+/// Whether a finished request leaves a row and spans: only an
+/// authenticated one, and not when the answer is a 401 or a 429 (a refused
+/// credential, the rate limiter).
+pub fn recorded(rec: &Recorder, status: u16) -> bool {
+    rec.is_authenticated() && !matches!(status, 401 | 429)
 }
 
 /// Runs its callback once, with the bytes counted, when dropped.
@@ -455,9 +511,13 @@ where
     Body::from_stream(stream)
 }
 
-/// End a request's trace: its spans to the exporter, its summary row to
-/// Postgres. Neither may affect the response, so both are detached.
-fn finish(state: &Arc<AppState>, rec: &Arc<Recorder>, status: u16, response_bytes: Option<i64>) {
+/// End a request's trace: its spans to the exporter, its summary row to the
+/// bounded row queue. Neither may affect the response, and neither waits.
+/// False (and nothing queued) for a request [`recorded`] refuses.
+fn finish(rec: &Arc<Recorder>, status: u16, response_bytes: Option<i64>) -> bool {
+    if !recorded(rec, status) {
+        return false;
+    }
     let root = rec.root_span(status, response_bytes);
     let duration_ms = (root.end_ns.saturating_sub(root.start_ns) / 1_000_000) as i64;
     // One span per request for now; child spans join `span_count` when
@@ -476,10 +536,48 @@ fn finish(state: &Arc<AppState>, rec: &Arc<Recorder>, status: u16, response_byte
         request_bytes: rec.request_bytes,
         response_bytes,
     };
-    let db = state.db.clone();
-    // The runtime is gone only at shutdown; a row lost then is acceptable.
-    if let Ok(h) = tokio::runtime::Handle::try_current() {
-        h.spawn(async move { write_summary(&db, &row).await });
+    enqueue_row(row);
+    true
+}
+
+/// Rows waiting for the writer. Full means Postgres is not keeping up: new
+/// rows are dropped and counted, never queued without bound, and never one
+/// task (one pool connection) per request.
+const ROW_QUEUE: usize = 4_096;
+
+/// Rows one writer pass takes from the queue before it yields.
+const ROW_BATCH: usize = 64;
+
+static ROWS: OnceLock<mpsc::Sender<SummaryRow>> = OnceLock::new();
+/// Rows handed to the queue (recorded requests), for tests and the metric.
+static ROWS_QUEUED: AtomicU64 = AtomicU64::new(0);
+/// Rows dropped on a full queue since the writer last reported them.
+static ROWS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+fn enqueue_row(row: SummaryRow) {
+    ROWS_QUEUED.fetch_add(1, Ordering::Relaxed);
+    let Some(tx) = ROWS.get() else { return };
+    if tx.try_send(row).is_err() {
+        ROWS_DROPPED.fetch_add(1, Ordering::Relaxed);
+        warn_once_a_minute("request_trace_rows_dropped", "summary rows dropped; the database is not keeping up");
+    }
+}
+
+/// The one writer: rows in queue order on one connection at a time, and
+/// the drops reported as `noo_request_trace_rows_dropped_total`.
+async fn row_writer(state: Arc<AppState>, mut rx: mpsc::Receiver<SummaryRow>) {
+    while let Some(first) = rx.recv().await {
+        write_summary(&state.db, &first).await;
+        for _ in 1..ROW_BATCH {
+            match rx.try_recv() {
+                Ok(row) => write_summary(&state.db, &row).await,
+                Err(_) => break,
+            }
+        }
+        let dropped = ROWS_DROPPED.swap(0, Ordering::Relaxed);
+        if dropped > 0 {
+            state.metrics.inc_counter("noo_request_trace_rows_dropped_total", None, dropped).await;
+        }
     }
 }
 
@@ -605,8 +703,13 @@ async fn export_loop(url: String, mut rx: mpsc::Receiver<SpanRecord>) {
     }
 }
 
-/// Boot wiring: the exporter (when Tempo is configured) and the daily prune.
+/// Boot wiring: the row writer, the exporter (when Tempo is configured) and
+/// the daily prune.
 pub fn spawn(state: Arc<AppState>) {
+    let (tx, rx) = mpsc::channel(ROW_QUEUE);
+    if ROWS.set(tx).is_ok() {
+        tokio::spawn(row_writer(state.clone(), rx));
+    }
     match tempo_traces_url(&std::env::var(TEMPO_URL_ENV).unwrap_or_default()) {
         Ok(Some(url)) => {
             let (tx, rx) = mpsc::channel(EXPORT_QUEUE);
@@ -651,21 +754,55 @@ mod tests {
         }
     }
 
-    #[test]
-    fn new_ids_are_never_zero_and_round_trip_through_traceparent() {
-        let rec = Recorder::new(&Method::GET, "/api/x".into(), None, None);
-        let tp = traceparent(&rec.ctx.trace_id, &rec.ctx.span_id);
-        assert_eq!(parse_traceparent(&tp), Some(rec.ctx));
-        assert_eq!(rec.parent, None);
+    fn alice() -> crate::bus_principal::Principal {
+        crate::bus_principal::Principal::user("alice", crate::auth::Role::User, vec!["read".into()])
     }
 
     #[test]
-    fn a_continued_trace_keeps_the_callers_id_and_parents_on_its_span() {
+    fn new_ids_are_never_zero_and_round_trip_through_traceparent() {
+        let rec = Recorder::new(&Method::GET, "/api/x".into(), None, None);
+        let ctx = rec.ctx();
+        let tp = traceparent(&ctx.trace_id, &ctx.span_id);
+        assert_eq!(parse_traceparent(&tp), Some(ctx));
+        assert_eq!(rec.parent(), None);
+    }
+
+    /// An unauthenticated caller's `traceparent` is ignored: it cannot join
+    /// a trace it names. Once the caller authenticates, it is continued.
+    #[test]
+    fn a_traceparent_is_continued_only_for_an_authenticated_caller() {
         let incoming = parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
         let rec = Recorder::new(&Method::POST, "/v1/chat/completions".into(), incoming, Some(10));
-        assert_eq!(hex::encode(rec.ctx.trace_id), "4bf92f3577b34da6a3ce929d0e0e4736");
-        assert_eq!(rec.parent.map(hex::encode).as_deref(), Some("00f067aa0ba902b7"));
-        assert_ne!(rec.ctx.span_id, incoming.expect("parsed").span_id, "the gateway's span is its own");
+        assert_ne!(hex::encode(rec.ctx().trace_id), "4bf92f3577b34da6a3ce929d0e0e4736", "joined before authentication");
+        assert_eq!(rec.parent(), None);
+        rec.authenticate(&alice());
+        assert_eq!(hex::encode(rec.ctx().trace_id), "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(rec.parent().map(hex::encode).as_deref(), Some("00f067aa0ba902b7"));
+        assert_ne!(rec.ctx().span_id, incoming.expect("parsed").span_id, "the gateway's span is its own");
+    }
+
+    /// An anonymous flood costs no database write: a request no principal
+    /// was noted for queues no row (and exports no span), whatever its
+    /// status. Neither do an authenticated 401 or 429. A recorded one does.
+    #[test]
+    fn an_anonymous_flood_queues_no_row() {
+        let before = ROWS_QUEUED.load(Ordering::Relaxed);
+        for status in [200u16, 401, 403, 429, 500] {
+            for _ in 0..200 {
+                let rec = Arc::new(Recorder::new(&Method::POST, "/v1/chat/completions".into(), None, None));
+                assert!(!finish(&rec, status, Some(1)), "an anonymous {status} was recorded");
+            }
+        }
+        for status in [401u16, 429] {
+            let rec = Arc::new(Recorder::new(&Method::POST, "/v1/chat/completions".into(), None, None));
+            rec.authenticate(&alice());
+            assert!(!finish(&rec, status, None), "an authenticated {status} was recorded");
+        }
+        assert_eq!(ROWS_QUEUED.load(Ordering::Relaxed), before, "rows were queued for requests that record nothing");
+        let rec = Arc::new(Recorder::new(&Method::POST, "/v1/chat/completions".into(), None, None));
+        rec.authenticate(&alice());
+        assert!(finish(&rec, 200, Some(1)));
+        assert_eq!(ROWS_QUEUED.load(Ordering::Relaxed), before + 1);
     }
 
     #[test]

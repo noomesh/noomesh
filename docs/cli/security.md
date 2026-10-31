@@ -157,7 +157,11 @@ deleted per store; `erase alice --yes` executes it (`--keep-account`
 keeps the row). An erase keeps a copy of what it deleted for 30 days, so a
 mistake can be undone, and the gateway then purges that copy automatically;
 after 30 days the erase is final. `noo cluster verify --controller` fails the
-`erasure archive` row if that purge stops running. Agents can propose accounts (`user proposals`); an
+`erasure archive` row if that purge stops running. An erase removes the
+account's request-trace summaries (`noo_request_trace`, its connection logins'
+included) but **not the spans in Tempo**: those carry the same account name
+(`enduser.id`) and stay until Tempo's own retention drops them
+(`NOO_TEMPO_RETENTION`, 30 days by default). Agents can propose accounts (`user proposals`); an
 operator decides with `user decide <id> --approve`, which prints the
 generated password once.
 
