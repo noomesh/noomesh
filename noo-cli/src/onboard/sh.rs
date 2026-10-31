@@ -73,7 +73,7 @@ fn compose_files_in(
                     .lines()
                     .map(str::trim)
                     .filter(|l| !l.is_empty())
-                    .map(|l| repo_root.join(l).to_string_lossy().into_owned())
+                    .map(|l| normalize_path(&repo_root.join(l).to_string_lossy()))
                     .collect();
                 if !files.is_empty() {
                     return files;
@@ -86,6 +86,29 @@ fn compose_files_in(
         v.push(override_file.to_string_lossy().into_owned());
     }
     v
+}
+
+/// `path` with `.` segments and repeated separators removed and `..` folded
+/// lexically, so `/root/.noo/./docker-compose.cluster.yml` and the label's
+/// `/root/.noo/docker-compose.cluster.yml` compare equal. No filesystem
+/// access: a symlink is not resolved, the way compose's own labels are not.
+/// The same file named twice makes compose merge it with itself, which
+/// doubles every array in it (`security_opt array items must be unique`).
+pub(crate) fn normalize_path(path: &str) -> String {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in Path::new(path).components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out.to_string_lossy().into_owned()
 }
 
 /// The add-on image environment for this install's composed overlays, with
@@ -1341,6 +1364,9 @@ mod compose_files_tests {
             got.iter().all(|p| Path::new(p).is_absolute()),
             "paths must be absolute — compose is invoked from the wizard's cwd, not the install: {got:?}"
         );
+        // `compose_file_list .` prints `./x.yml`; the list must name each file
+        // the way compose's labels do, or doctor counts one file twice (rc.2).
+        assert!(got.iter().all(|p| !p.contains("/./")), "{got:?}");
     }
 
     #[test]
@@ -1387,6 +1413,13 @@ mod compose_files_tests {
             &root.join("docker-compose.override.yml"),
         );
         assert_eq!(names(&got), ["docker-compose.cluster.yml"], "no override on disk → base only");
+    }
+
+    #[test]
+    fn normalize_path_folds_dot_segments_lexically() {
+        assert_eq!(normalize_path("/root/.noo/./docker-compose.cluster.yml"), "/root/.noo/docker-compose.cluster.yml");
+        assert_eq!(normalize_path("/x//a/../b.yml"), "/x/b.yml");
+        assert_eq!(normalize_path("/x/b.yml"), "/x/b.yml");
     }
 }
 
