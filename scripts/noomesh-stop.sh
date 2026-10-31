@@ -97,13 +97,17 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
         ui_done "Volumes preserved (data intact)"
     fi
 else
-    # Stop specific services
+    # Stop specific services, and remove their containers (i301 a.4). A
+    # container left exited is one boot-restore starts again after a reboot
+    # (it starts every stopped core service, hostd boot.go), so a plain
+    # `compose stop` did not survive one. With no container, boot-restore
+    # (which never recreates) leaves it down until `noo stack start`.
     ui_step "Stopping ${SERVICES[*]}"
 
     if [ -n "$PROFILE" ]; then
-        docker compose $COMPOSE_FILES --profile "$PROFILE" stop "${SERVICES[@]}"
+        docker compose $COMPOSE_FILES --profile "$PROFILE" rm --stop --force "${SERVICES[@]}"
     else
-        docker compose $COMPOSE_FILES stop "${SERVICES[@]}"
+        docker compose $COMPOSE_FILES rm --stop --force "${SERVICES[@]}"
     fi
 fi
 
