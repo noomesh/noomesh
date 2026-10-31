@@ -32,6 +32,7 @@
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
+use crate::args::{ArgError, Args};
 use crate::ui::{self, Col, Glyph};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -45,35 +46,32 @@ use crate::{Globals, Unhandled};
 // noo security generate-secret
 // ─────────────────────────────────────────────────────────────────────────
 
+/// `--length` is 1..=4096 bytes.
+pub(crate) fn parse_generate_secret_with(a: &mut Args) -> Result<(String, Option<usize>), ArgError> {
+    let length = a.number::<usize>(&["--length"])?;
+    if length.is_some_and(|n| n == 0 || n > 4096) {
+        return Err(ArgError::new("--length needs a number from 1 to 4096"));
+    }
+    let secret_type = a.maybe_one("<type>")?.unwrap_or_else(|| "general".to_string());
+    Ok((secret_type, length))
+}
+
+/// A strictly positive day count for the first of `names`.
+fn positive_days(a: &mut Args, names: &[&str], default: i64) -> Result<i64, ArgError> {
+    match a.number::<i64>(names)? {
+        None => Ok(default),
+        Some(d) if d > 0 => Ok(d),
+        Some(_) => Err(ArgError::new(format!("{} needs a number above 0", names[0]))),
+    }
+}
+
 /// `noo security generate-secret [TYPE] [--length N]` — TYPE in
 /// {general, jwt, cluster, fernet}, default "general". Non-fernet types all
 /// print `secrets.token_urlsafe(length)` (length = bytes of entropy,
 /// default 32 → 43 chars); `fernet` prints `Fernet.generate_key()` — 32
 /// urandom bytes as PADDED urlsafe base64 (44 chars ending `=`).
 pub fn security_generate_secret(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut secret_type: Option<String> = None;
-    let mut length: Option<usize> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--length" => {
-                length = Some(
-                    iter.next()
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .filter(|n| *n > 0 && *n <= 4096)
-                        .ok_or(Unhandled)?,
-                );
-            }
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => {
-                if secret_type.is_some() {
-                    return Err(Unhandled); // at most one positional
-                }
-                secret_type = Some(t.to_string());
-            }
-        }
-    }
-    let secret_type = secret_type.unwrap_or_else(|| "general".to_string());
+    let (secret_type, length) = parse_generate_secret_with(&mut Args::new(args))?;
     if let Some((kind, msg)) = secret_args_problem(&secret_type, length) {
         fail(
             g.json,
@@ -2647,6 +2645,15 @@ fn first_pem_block(pem: &str) -> Option<String> {
     Some(pem[start..end].to_string() + "\n")
 }
 
+pub(crate) fn parse_rotate_ca_with(a: &mut Args) -> Result<(i64, i64, bool, bool), ArgError> {
+    let ca_days = positive_days(a, &["--ca-days"], 3650)?;
+    let leaf_days = positive_days(a, &["--leaf-days"], crate::pki::DEFAULT_DAYS)?;
+    let yes = a.flag(&["--yes", "--force", "-y"]);
+    let retire_old = a.flag(&["--retire-old"]);
+    a.finish()?;
+    Ok((ca_days, leaf_days, yes, retire_old))
+}
+
 /// `noo security pki rotate-ca [--ca-days N] [--leaf-days N] [--yes]
 /// [--retire-old]` — REAL cross-signed CA rotation
 /// header promised this for months while nothing could produce it, and a
@@ -2669,20 +2676,7 @@ fn first_pem_block(pem: &str) -> Option<String> {
 ///      the old cert from the local anchor — after verifying every leaf on
 ///      disk chains to the new CA alone.
 pub fn pki_rotate_ca(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut ca_days: i64 = 3650;
-    let mut leaf_days: i64 = crate::pki::DEFAULT_DAYS;
-    let mut yes = false;
-    let mut retire_old = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--ca-days" => ca_days = iter.next().and_then(|v| v.parse().ok()).filter(|d: &i64| *d > 0).ok_or(Unhandled)?,
-            "--leaf-days" => leaf_days = iter.next().and_then(|v| v.parse().ok()).filter(|d: &i64| *d > 0).ok_or(Unhandled)?,
-            "--force" | "--yes" | "-y" => yes = true,
-            "--retire-old" => retire_old = true,
-            _ => return Err(Unhandled),
-        }
-    }
+    let (ca_days, leaf_days, yes, retire_old) = parse_rotate_ca_with(&mut Args::new(args))?;
 
     let ca = ClusterCa::new(pki_dir());
     if !ca.ca_exists() {
@@ -3203,6 +3197,18 @@ fn absorb_plaintext_residue(g: &Globals, root: &Path) -> i32 {
     if conflicts.is_empty() { 0 } else { 1 }
 }
 
+pub(crate) fn parse_issue_node_with(a: &mut Args) -> Result<(String, Option<String>, i64, bool), ArgError> {
+    let days = positive_days(a, &["--days"], crate::pki::DEFAULT_DAYS)?;
+    let mint_only = a.flag(&["--mint-only"]);
+    let mut pos = a.positionals()?.into_iter();
+    let Some(node) = pos.next() else { return Err(ArgError::new("missing <node>")) };
+    let ip = pos.next();
+    if let Some(extra) = pos.next() {
+        return Err(ArgError::new(format!("unexpected argument `{extra}`")));
+    }
+    Ok((node, ip, days, mint_only))
+}
+
 /// `noo security pki issue-node <node> [ip] [--days N] [--mint-only]` —
 /// issue a node cert AND deliver it over the pull rail, waiting for the node
 /// to report it applied.
@@ -3223,21 +3229,7 @@ fn absorb_plaintext_residue(g: &Globals, root: &Path) -> i32 {
 /// aborted a provision trying to restart a missing unit), and pre-minting
 /// for a node that is offline now and will collect later.
 pub fn pki_issue_node(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut node: Option<String> = None;
-    let mut ip: Option<String> = None;
-    let mut days: i64 = crate::pki::DEFAULT_DAYS;
-    let mut mint_only = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--days" => days = iter.next().and_then(|v| v.parse().ok()).filter(|d: &i64| *d > 0).ok_or(Unhandled)?,
-            "--mint-only" => mint_only = true,
-            t if !t.starts_with('-') && node.is_none() => node = Some(t.to_string()),
-            t if !t.starts_with('-') && ip.is_none() => ip = Some(t.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let Some(node) = node else { return Err(Unhandled) };
+    let (node, ip, days, mint_only) = parse_issue_node_with(&mut Args::new(args))?;
     // The address goes into the cert's SANs, and the gateway rejects a
     // handshake to a name or address the cert does not carry — so getting
     // this wrong is not cosmetic.
@@ -3342,6 +3334,13 @@ pub fn pki_issue_node(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
 }
 
+pub(crate) fn parse_push_nodes_with(a: &mut Args) -> Result<(Option<String>, i64, bool), ArgError> {
+    let days = positive_days(a, &["--days"], crate::pki::DEFAULT_DAYS)?;
+    let yes = a.flag(&["--yes", "--force", "-y"]);
+    let only = a.maybe_one("<node>")?;
+    Ok((only, days, yes))
+}
+
 /// `noo security pki push-nodes [NODE] [--days N] [--yes]` — re-issue each
 /// registered fleet node's cert (plus the current ca.crt) and stage a
 /// CA-signed cert bundle on the pull rail for it to collect.
@@ -3361,24 +3360,7 @@ pub fn pki_issue_node(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 /// node-agent (host unit or container, whichever the node runs) — nothing
 /// here reaches into the node to restart anything.
 pub fn pki_push_nodes(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut only: Option<String> = None;
-    let mut days: i64 = crate::pki::DEFAULT_DAYS;
-    let mut yes = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--days" => {
-                days = iter
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .filter(|d: &i64| *d > 0)
-                    .ok_or(Unhandled)?;
-            }
-            "--force" | "--yes" | "-y" => yes = true,
-            t if !t.starts_with('-') && only.is_none() => only = Some(t.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
+    let (only, days, yes) = parse_push_nodes_with(&mut Args::new(args))?;
 
     let ca = ClusterCa::new(pki_dir());
     if !ca.ca_exists() {
@@ -3976,41 +3958,27 @@ pub(crate) fn signing_pub_fingerprint(pem: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
+/// `--reload` is the default; `--no-reload` turns it off (it wins if both
+/// are given). `--no-deliver` is the explicit opt-out for sandboxes and
+/// air-gapped controllers.
+pub(crate) fn parse_rotate_all_with(a: &mut Args) -> Result<(i64, i64, bool, bool, bool), ArgError> {
+    let warn_days = a.number::<i64>(&["--warn-days"])?.unwrap_or(30);
+    let new_days = positive_days(a, &["--new-days"], 90)?;
+    let skip_confirm = a.flag(&["--yes", "--force", "-y"]);
+    let _ = a.flag(&["--reload"]);
+    let no_reload = a.flag(&["--no-reload"]);
+    let no_deliver = a.flag(&["--no-deliver"]);
+    a.finish()?;
+    Ok((warn_days, new_days, skip_confirm, !no_reload, !no_deliver))
+}
+
 /// Re-issues expiring CERTIFICATES only. The Grafana SSO pair under
 /// `pki/sso/` is not a certificate and is never rotated here — by
 /// construction (`list_certs` collects `*.crt`) and on purpose: a new SSO
 /// key logs every open Grafana tab out. It changes only through
 /// `noo security pki issue-sso-key --force`.
 pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut warn_days: i64 = 30;
-    let mut new_days: i64 = 90;
-    let mut skip_confirm = false;
-    let mut reload = true;
-    let mut deliver = true;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--warn-days" => {
-                warn_days = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?;
-            }
-            "--new-days" => {
-                new_days = iter
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .filter(|d: &i64| *d > 0)
-                    .ok_or(Unhandled)?;
-            }
-            "--force" | "--yes" | "-y" => skip_confirm = true,
-            "--reload" => reload = true,
-            "--no-reload" => reload = false,
-            // fu72 #2: delivery is the DEFAULT (rotated-but-undelivered was
-            // the self-soothing lie). --no-deliver is the explicit opt-out
-            // for sandboxes and air-gapped controllers — the closer still
-            // says the node certs were NOT delivered.
-            "--no-deliver" => deliver = false,
-            _ => return Err(Unhandled),
-        }
-    }
+    let (warn_days, new_days, skip_confirm, reload, deliver) = parse_rotate_all_with(&mut Args::new(args))?;
 
     let ca = ClusterCa::new(pki_dir());
     let expiring = ca.expiring_certs(warn_days);

@@ -462,7 +462,7 @@ the lock. The layout both locks are published in is in
 | `noo security org create` | `<org_id> [--name <name>] [--description <text>]` | Create an org |
 | `noo security tailnet policy` | `[--merge \| --push] [--yes]` | Compare live tailnet policy to declared; --merge adds what is missing, --push replaces |
 | `noo security audit verify` | — | Verify audit hashes, the chain, and its head against the exported head (operator-only) |
-| `noo security audit list` | `[--since <30m\|24h\|7d\|time>] [--event <type>] [--actor <name>] [-n <limit>] [--cursor <c>]` | List security audit rows, newest first, with source address (operator-only) |
+| `noo security audit list` | `[--since <30m\|24h\|7d\|time>] [--event <type>] [--actor <name>] [-n\|--limit <n>] [--cursor <c>]` | List security audit rows, newest first, with source address (operator-only) |
 | `noo security at-rest status` | `[--json]` | Show TPM facts, how to enable one, and your recorded at-rest encryption decision |
 | `noo security at-rest opt-out` | — | Record that you accept unencrypted data at rest (audited; needs your own login) |
 | `noo security at-rest opt-in` | — | Withdraw the at-rest opt-out (audited; needs your own login) |
@@ -482,7 +482,7 @@ the lock. The layout both locks are published in is in
 | `noo security service-key revoke` | `<consumer> [--disable-account] [-y\|--yes]` | Revoke a consumer's keys, for good (-y); --disable-account also kills issued tokens |
 | `noo security service-key rotate` | `<consumer> [--scopes <scope>]... [--note <text>]` | Rotate a consumer's key; scopes and rpm kept, old key live until `retire` |
 | `noo security service-key retire` | `<consumer>` | Finish a rotation: deactivate the superseded key, once the new one has been used |
-| `noo security service-key provision` | `<name> [--scopes <s>]... [--wait <secs>] [-y]` | Show the declared grant and confirm, then mint, store, recreate and PROVE the key |
+| `noo security service-key provision` | `<name> [--scopes <s>]... [--wait <secs>] [-y\|--yes]` | Show the declared grant and confirm, then mint, store, recreate and PROVE the key |
 | `noo security service-key set-quota` | `<consumer> <rpm>` | Set the per-minute request cap for a consumer's keys (0 = uncapped) |
 | `noo security service-key self` | `[--note <label>]` | Mint or rotate the caller's own MCP key (raw key shown once) |
 | `noo security service-key self-status` | — | Show whether the caller has an active MCP key and when it was used |

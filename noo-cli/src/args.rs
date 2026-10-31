@@ -97,20 +97,39 @@ impl Args {
         self.rest.len() != before
     }
 
-    /// `--flag <value>`; the last occurrence wins. A flag with no value
-    /// after it is an error.
-    pub fn value(&mut self, names: &[&str]) -> Result<Option<String>, ArgError> {
-        self.note(names);
-        let mut found = None;
+    /// Every occurrence of `--flag <value>`, in order, without recording the
+    /// flag as asked. A flag with no value after it is an error.
+    fn take_values(&mut self, names: &[&str]) -> Result<Vec<String>, ArgError> {
+        let mut found = Vec::new();
         while let Some(i) = self.rest.iter().position(|t| names.contains(&t.as_str())) {
             if i + 1 >= self.rest.len() {
                 return Err(ArgError::new(format!("{} needs a value", self.rest[i])));
             }
             let v = self.rest.remove(i + 1);
             self.rest.remove(i);
-            found = Some(v);
+            found.push(v);
         }
         Ok(found)
+    }
+
+    /// `--flag <value>`; the last occurrence wins. A flag with no value
+    /// after it is an error.
+    pub fn value(&mut self, names: &[&str]) -> Result<Option<String>, ArgError> {
+        self.note(names);
+        Ok(self.take_values(names)?.pop())
+    }
+
+    /// `--flag <value>`, repeatable: every occurrence, in order.
+    pub fn values(&mut self, names: &[&str]) -> Result<Vec<String>, ArgError> {
+        self.note(names);
+        self.take_values(names)
+    }
+
+    /// Like [`Args::value`] for a flag the verb still swallows but no longer
+    /// documents (a removed flag it reports): it is NOT recorded as asked, so
+    /// the usage tie test does not expect it in `usage.rs`.
+    pub fn value_unlisted(&mut self, names: &[&str]) -> Result<Option<String>, ArgError> {
+        Ok(self.take_values(names)?.pop())
     }
 
     /// `--flag <number>`; surrounding whitespace is ignored.
@@ -259,6 +278,7 @@ mod tests {
             addons, autonomy, cluster_gpu, cluster_reserve, cluster_vendor, heartbeat, jobs, logs, memory, rag, recall, tasks,
             walks,
         };
+        use crate::commands::{approval, ops, security, security_local};
         type Probe = fn(&mut Args);
         fn row<'a>(w: &'a [&'a str], p: Probe) -> (&'a [&'a str], Probe) {
             (w, p)
@@ -297,6 +317,28 @@ mod tests {
             row(&["walks", "view"], |a| { let _ = walks::parse_view_with(a); }),
             row(&["recall", "search"], |a| { let _ = recall::parse_search_with(a); }),
             row(&["recall", "prominent"], |a| { let _ = recall::parse_prominent_with(a); }),
+            row(&["security", "user", "create"], |a| { let _ = security::parse_user_create_with(a); }),
+            row(&["security", "user", "allowance"], |a| { let _ = security::parse_allowance_with(a); }),
+            row(&["security", "user", "set-scopes"], |a| { let _ = security::parse_set_scopes_with(a); }),
+            row(&["security", "user", "grant-role"], |a| { let _ = security::parse_roles_with(a); }),
+            row(&["security", "user", "revoke-role"], |a| { let _ = security::parse_roles_with(a); }),
+            row(&["security", "user", "link"], |a| { let _ = security::parse_link_with(a); }),
+            row(&["security", "team", "create"], |a| { let _ = security::parse_team_create_with(a); }),
+            row(&["security", "org", "create"], |a| { let _ = security::parse_org_create_with(a); }),
+            row(&["security", "audit", "list"], |a| { let _ = security::parse_audit_list_with(a); }),
+            row(&["security", "service-key", "issue"], |a| { let _ = security::parse_service_key_issue_with(a); }),
+            row(&["security", "service-key", "self"], |a| { let _ = security::parse_service_key_self_with(a); }),
+            row(&["security", "service-key", "provision"], |a| { let _ = security::parse_service_key_provision_with(a); }),
+            row(&["security", "service-key", "rotate"], |a| { let _ = security::parse_service_key_rotate_with(a); }),
+            row(&["security", "generate-secret"], |a| { let _ = security_local::parse_generate_secret_with(a); }),
+            row(&["security", "pki", "rotate-ca"], |a| { let _ = security_local::parse_rotate_ca_with(a); }),
+            row(&["security", "pki", "issue-node"], |a| { let _ = security_local::parse_issue_node_with(a); }),
+            row(&["security", "pki", "push-nodes"], |a| { let _ = security_local::parse_push_nodes_with(a); }),
+            row(&["security", "pki", "rotate-all"], |a| { let _ = security_local::parse_rotate_all_with(a); }),
+            row(&["approval", "approve"], |a| { let _ = approval::parse_decide_with(a, false); }),
+            row(&["approval", "deny"], |a| { let _ = approval::parse_decide_with(a, true); }),
+            row(&["ops", "list"], |a| { let _ = ops::parse_list_with(a); }),
+            row(&["memory", "embed"], |a| { let _ = memory::parse_embed_with(a); }),
         ];
         let mut bad = Vec::new();
         for (words, probe) in table {
