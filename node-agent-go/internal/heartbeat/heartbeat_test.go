@@ -267,6 +267,27 @@ func TestUsableHostIP(t *testing.T) {
 	}
 }
 
+func TestPickHostIP(t *testing.T) {
+	addrs := func(a ...string) func() []string { return func() []string { return a } }
+	cases := []struct {
+		name string
+		udp  string
+		host func() []string
+		want string
+	}{
+		{"loopback route falls back to the hostname", "127.0.0.1", addrs("192.0.2.10"), "192.0.2.10"},
+		{"usable route wins over the hostname", "10.0.0.5", addrs("192.0.2.10"), "10.0.0.5"},
+		{"no route falls back", "", addrs("192.0.2.10"), "192.0.2.10"},
+		{"loopback route and loopback hostname is empty", "127.0.0.1", addrs("127.0.1.1"), ""},
+		{"unreadable hostname is empty", "127.0.0.1", func() []string { return nil }, ""},
+	}
+	for _, c := range cases {
+		if got := pickHostIP(c.udp, c.host); got != c.want {
+			t.Errorf("%s: pickHostIP(%q) = %q, want %q", c.name, c.udp, got, c.want)
+		}
+	}
+}
+
 func TestAgentURL_IsEmptyWhenNoAddressIsDialable(t *testing.T) {
 	cfg := &config.Config{NodeIP: "", ControllerURL: "https://unreachable-host:8080", AgentPort: 8081}
 	if ip := DetectHostIP(cfg); ip == "" {
