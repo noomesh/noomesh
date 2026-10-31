@@ -46,6 +46,23 @@ fn container_name_for_image(image: &str) -> Option<&'static str> {
 
 
 
+/// What `noo cluster import-model` was asked for.
+pub(crate) struct ImportModelArgs {
+    node: String,
+    name: String,
+    place: bool,
+    role: Option<String>,
+    backend: String,
+}
+
+pub(crate) fn parse_import_model_with(a: &mut Args) -> Result<ImportModelArgs, ArgError> {
+    let place = a.flag(&["--place"]);
+    let role = a.value(&["--role"])?;
+    let backend = a.value(&["--backend", "-b"])?.unwrap_or_else(|| "ollama".to_string());
+    let [node, name]: [String; 2] = a.positionals()?.try_into().map_err(|_| ArgError::new("expected <node> <name>"))?;
+    Ok(ImportModelArgs { node, name, place, role, backend })
+}
+
 /// Where the controller's GGUF weights live on the host — nginx serves it as
 /// `/gguf/`, the gateway manifests it as kind=gguf AND kind=modelfile. The
 /// two share a directory because `ollama create` resolves a Modelfile's
@@ -60,21 +77,8 @@ fn container_name_for_image(image: &str) -> Option<&'static str> {
 /// fetches `<name>.Modelfile`, reads the weight it names, fetches that,
 /// verifies both digests, and runs `ollama create`.
 pub fn cluster_import_model(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut positional: Vec<String> = Vec::new();
-    let mut place = false;
-    let mut role: Option<String> = None;
-    let mut backend = "ollama".to_string();
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--place" => place = true,
-            "--role" => role = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "-b" | "--backend" => backend = iter.next().ok_or(Unhandled)?.clone(),
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => positional.push(t.to_string()),
-        }
-    }
-    let [node, name] = positional.as_slice() else { return Err(Unhandled) };
+    let ImportModelArgs { node, name, place, role, backend } = parse_import_model_with(&mut Args::new(args))?;
+    let (node, name) = (&node, &name);
     if let Some(r) = &role {
         if !matches!(r.as_str(), "chat" | "embed" | "rerank") {
             fail(g.json, ExitCode::Usage, "bad_role", "--role must be chat, embed or rerank", None);
@@ -357,7 +361,7 @@ fn remote_build_sandbox_base(g: &Globals, node_id: &str) -> Result<(), String> {
 /// `--lock`, `--arch` and `--all-images` are phase-1 selectors (they were
 /// `stage-images`'s flags).
 #[derive(Debug)]
-struct SyncImagesArgs {
+pub(crate) struct SyncImagesArgs {
     nodes: Vec<String>,
     images: Vec<String>,
     restart: bool,
@@ -371,31 +375,40 @@ struct SyncImagesArgs {
 }
 
 fn parse_sync_images_args(args: &[String]) -> Result<SyncImagesArgs, Unhandled> {
-    let mut a = SyncImagesArgs {
-        nodes: Vec::new(), images: Vec::new(), restart: true, restart_given: false, all: false,
-        stage_only: false, lock: false, arches: Vec::new(), all_images: false,
-    };
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "-i" | "--image" => a.images.push(iter.next().ok_or(Unhandled)?.clone()),
-            "--images" => a.images.extend(split_image_list(iter.next().ok_or(Unhandled)?)),
-            "--restart" => { a.restart = true; a.restart_given = true }
-            "--no-restart" => { a.restart = false; a.restart_given = true }
-            "--all" => a.all = true,
-            "--stage-only" => a.stage_only = true,
-            "--lock" => a.lock = true,
-            "--all-images" => a.all_images = true,
-            "--arch" => {
-                for x in iter.next().ok_or(Unhandled)?.split(',') {
-                    a.arches.push(crate::commands::image_stage::normalize_arch(x).ok_or(Unhandled)?.to_string());
-                }
-            }
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => a.nodes.push(t.to_string()),
+    Ok(parse_sync_images_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_sync_images_with(a: &mut Args) -> Result<SyncImagesArgs, ArgError> {
+    let mut images = a.values(&["--image", "-i"])?;
+    for list in a.values(&["--images"])? {
+        images.extend(split_image_list(&list));
+    }
+    let restart_given_on = a.flag(&["--restart"]);
+    let restart_given_off = a.flag(&["--no-restart"]);
+    let all = a.flag(&["--all"]);
+    let stage_only = a.flag(&["--stage-only"]);
+    let lock = a.flag(&["--lock"]);
+    let all_images = a.flag(&["--all-images"]);
+    let mut arches = Vec::new();
+    for list in a.values(&["--arch"])? {
+        for x in list.split(',') {
+            let arch = crate::commands::image_stage::normalize_arch(x)
+                .ok_or_else(|| ArgError::new(format!("--arch: unknown architecture `{x}`")))?;
+            arches.push(arch.to_string());
         }
     }
-    Ok(a)
+    let nodes = a.positionals()?;
+    Ok(SyncImagesArgs {
+        nodes,
+        images,
+        restart: restart_given_on || !restart_given_off,
+        restart_given: restart_given_on || restart_given_off,
+        all,
+        stage_only,
+        lock,
+        arches,
+        all_images,
+    })
 }
 
 impl SyncImagesArgs {
@@ -701,6 +714,25 @@ pub fn cluster_sync_images(g: &Globals, args: &[String]) -> Result<i32, Unhandle
 //  ship-model — convert an HF model locally + ship to a node's Ollama
 // ════════════════════════════════════════════════════════════════════
 
+/// What `noo cluster ship-model` was asked for.
+pub(crate) struct ShipModelArgs {
+    hf_id: String,
+    node: String,
+    name: Option<String>,
+    quant: String,
+    place: bool,
+    backend: String,
+}
+
+pub(crate) fn parse_ship_model_with(a: &mut Args) -> Result<ShipModelArgs, ArgError> {
+    let name = a.value(&["--name"])?;
+    let quant = a.value(&["--quant"])?.unwrap_or_else(|| "Q4_K_M".to_string());
+    let place = a.flag(&["--place"]);
+    let backend = a.value(&["--backend", "-b"])?.unwrap_or_else(|| "embedding".to_string());
+    let [hf_id, node]: [String; 2] = a.positionals()?.try_into().map_err(|_| ArgError::new("expected <hf_id> <node>"))?;
+    Ok(ShipModelArgs { hf_id, node, name, quant, place, backend })
+}
+
 /// `noo cluster ship-model HF_ID NODE [--name N] [--quant Q] [--place]
 /// [-b/--backend B]` — run scripts/noo-model-convert.sh locally → GGUF +
 /// Modelfile, publish the pair into the controller's artifact store, and ask
@@ -713,23 +745,8 @@ pub fn cluster_sync_images(g: &Globals, args: &[String]) -> Result<i32, Unhandle
 /// retired. The artifacts are published BEFORE the node is
 /// asked for anything, so a failed import is retried without reconverting.
 pub fn cluster_ship_model(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut positional: Vec<String> = Vec::new();
-    let mut name: Option<String> = None;
-    let mut quant = "Q4_K_M".to_string();
-    let mut place = false;
-    let mut backend = "embedding".to_string();
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--name" => name = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--quant" => quant = iter.next().ok_or(Unhandled)?.clone(),
-            "--place" => place = true,
-            "-b" | "--backend" => backend = iter.next().ok_or(Unhandled)?.clone(),
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => positional.push(t.to_string()),
-        }
-    }
-    let [hf_id, node] = positional.as_slice() else { return Err(Unhandled) };
+    let ShipModelArgs { hf_id, node, name, quant, place, backend } = parse_ship_model_with(&mut Args::new(args))?;
+    let (hf_id, node) = (&hf_id, &node);
     let name = name.unwrap_or_else(|| hf_id.rsplit('/').next().unwrap_or(hf_id).to_lowercase());
 
     let root = repo_root();
