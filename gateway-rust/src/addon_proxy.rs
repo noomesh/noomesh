@@ -1627,6 +1627,7 @@ mod user_read_route_tests {
             delegate: None,
             task_events: None,
             ui: None,
+            features: vec![],
             routes: routes
                 .iter()
                 .map(|(m, p, internal)| RouteSpec {
@@ -1641,6 +1642,7 @@ mod user_read_route_tests {
                     min_role: None,
                     scopes: vec![],
                     owner_scoped: false,
+                    feature: None,
                     receives_delegation: false,
                     max_message_bytes: None,
                     idle_timeout_secs: None,
@@ -1782,14 +1784,24 @@ mod permission_tests {
         let m: AddonManifest = serde_json::from_value(v).unwrap();
         let e = validate(&m, "evolve").unwrap_err();
         assert!(e.contains("POST cannot be min_role") && e.contains("owner_scoped"), "{e}");
-        // The flag means nothing on other shapes: refused, not ignored.
-        for (idx, role) in [(3usize, "operator"), (0, "user")] {
-            let mut v = tests::sample_json();
-            v["routes"][idx]["owner_scoped"] = json!(true);
-            v["routes"][idx]["min_role"] = json!(role);
-            let m: AddonManifest = serde_json::from_value(v).unwrap();
-            assert!(validate(&m, "evolve").unwrap_err().contains("owner_scoped"), "route {idx}");
-        }
+        // On a write at another role it means nothing: refused, not ignored.
+        let mut v = tests::sample_json();
+        v["routes"][3]["owner_scoped"] = json!(true);
+        v["routes"][3]["min_role"] = json!("operator");
+        let m: AddonManifest = serde_json::from_value(v).unwrap();
+        assert!(validate(&m, "evolve").unwrap_err().contains("owner_scoped"), "operator write");
+        // f99: on a read it is the add-on's promise and is accepted; it opens
+        // nothing by itself (min_role still decides in this shape).
+        let mut v = tests::sample_json();
+        v["routes"][0]["owner_scoped"] = json!(true);
+        v["routes"][0]["min_role"] = json!("user");
+        let m: AddonManifest = serde_json::from_value(v).unwrap();
+        validate(&m, "evolve").expect("owner_scoped on a GET is accepted");
+        // An internal route forwards no account: refused.
+        let mut v = tests::sample_json();
+        v["routes"][5]["owner_scoped"] = json!(true);
+        let m: AddonManifest = serde_json::from_value(v).unwrap();
+        assert!(validate(&m, "evolve").unwrap_err().contains("internal route"), "internal");
     }
 
     /// PUT, PATCH and DELETE are writes with the POST rule: accepted at
@@ -2035,5 +2047,101 @@ mod permission_tests {
         let ok = crate::auth::RequesterCtx { role: Role::Operator, ..user };
         let resp = serve(&m, &spec, HashMap::new(), None, None, Some(&ok)).await;
         assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+/// noomesh-internal f99 PR 1: the manifest declares `features`; noomesh will
+/// decide who uses each one. Until the grant store lands, a features
+/// manifest's routes carry no `min_role`, so they read as `operator` (the
+/// absent default): nothing opens wider than today.
+#[cfg(test)]
+mod feature_tests {
+    use super::*;
+    use crate::auth::Role;
+
+    fn features_json() -> Value {
+        json!({
+            "version": 1,
+            "addon": "evolve",
+            "base_url_env": "NOO_EVOLVE_URL",
+            "base_url_default": "https://noo-evolve:8090",
+            "features": [
+                {"name": "converse", "title": "Talk to the assistant", "suggested": "user", "delegate": true},
+                {"name": "transcripts", "title": "Read your transcripts",
+                 "description": "Your own past conversations.", "suggested": "user"},
+                {"name": "manage", "title": "Manage voices and models", "suggested": "operator"}
+            ],
+            "routes": [
+                {"name": "session", "method": "POST", "path": "/api/sample/session", "feature": "converse",
+                 "owner_scoped": true, "receives_delegation": true},
+                {"name": "transcripts", "method": "GET", "path": "/api/sample/transcripts", "feature": "transcripts",
+                 "owner_scoped": true},
+                {"name": "voices", "method": "PUT", "path": "/api/sample/voices", "feature": "manage"},
+                {"name": "stream", "method": "WS", "path": "/ws/addons/evolve/stream", "feature": "converse",
+                 "owner_scoped": true},
+                {"name": "console_piece", "method": "GET", "path": "/console-piece", "internal": true}
+            ],
+            "task_events": {"method": "POST", "path": "/task-events"},
+            "ui": {"feature": "converse", "title": "Voice"}
+        })
+    }
+
+    fn parsed(v: Value) -> AddonManifest {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn a_features_manifest_is_accepted_and_opens_nothing_wider_yet() {
+        let m = parsed(features_json());
+        validate(&m, "evolve").expect("a features manifest is valid");
+        assert!(m.delegates_tasks(), "a feature with delegate: true asks to delegate");
+        assert_eq!(m.feature("transcripts").map(|f| f.suggested.as_str()), Some("user"));
+        // No min_role: every route reads as operator until grants decide.
+        for r in m.routes.iter().filter(|r| !r.internal) {
+            assert!(!r.permits(Role::User, &["read".to_string()]), "{}: a User is not let in yet", r.name);
+            assert!(r.permits(Role::Operator, &[]), "{}", r.name);
+        }
+        assert!(!m.ui.as_ref().unwrap().permits(Role::User));
+    }
+
+    fn refused(edit: impl Fn(&mut Value), want: &str) {
+        let mut v = features_json();
+        edit(&mut v);
+        let e = validate(&parsed(v), "evolve").expect_err(want);
+        assert!(e.contains(want), "want {want:?} in {e}");
+    }
+
+    #[test]
+    fn a_features_manifest_has_one_answer_to_who_may_call() {
+        refused(|v| v["routes"][1]["min_role"] = json!("user"), "min_role and scopes are replaced");
+        refused(|v| v["routes"][1]["scopes"] = json!(["evolve:transcripts"]), "min_role and scopes are replaced");
+        refused(|v| { v["routes"][2].as_object_mut().unwrap().remove("feature"); }, "names its \"feature\"");
+        refused(|v| v["routes"][2]["feature"] = json!("export"), "is not declared");
+        refused(|v| v["routes"][4]["feature"] = json!("manage"), "internal route takes no feature");
+        refused(|v| v["ui"]["min_role"] = json!("user"), "ui.min_role is replaced");
+        refused(|v| { v["ui"].as_object_mut().unwrap().remove("feature"); }, "ui.feature");
+        refused(|v| v["delegate"] = json!("tasks"), "top-level delegate key is replaced");
+        refused(|v| v["features"][0]["delegate"] = json!(false), "receives_delegation needs its feature");
+    }
+
+    #[test]
+    fn a_feature_is_a_plain_word_with_a_plain_title_and_a_known_suggestion() {
+        refused(|v| v["features"][1]["name"] = json!("Read-All"), "names are [a-z0-9_]");
+        refused(|v| v["features"][1]["name"] = json!("converse"), "appears twice");
+        refused(|v| v["features"][1]["title"] = json!(""), "title must be");
+        refused(|v| v["features"][1]["title"] = json!("<b>bold</b>"), "title must be");
+        refused(|v| v["features"][1]["description"] = json!("x".repeat(281)), "description must be");
+        refused(|v| v["features"][1]["suggested"] = json!("everyone"), "grants nothing");
+        refused(
+            |v| v["features"] = Value::Array((0..33).map(|i| json!({"name": format!("f{i}"), "title": "t", "suggested": "none"})).collect()),
+            "at most 32 features",
+        );
+    }
+
+    #[test]
+    fn without_features_nothing_may_name_one() {
+        let mut v = tests::sample_json();
+        v["routes"][0]["feature"] = json!("status");
+        assert!(validate(&parsed(v), "evolve").unwrap_err().contains("declares no"));
     }
 }
