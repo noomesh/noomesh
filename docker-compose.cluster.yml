@@ -1311,7 +1311,10 @@ services:
     # through stunnel-vllm, which joins noo-cluster under this service's names.
     network_mode: "service:stunnel-vllm"
     depends_on:
-      - stunnel-vllm
+      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
+      stunnel-vllm:
+        condition: service_started
+        restart: true
     restart: unless-stopped
     # Plain HTTP on loopback inside the namespace; the image carries python3,
     # not curl. start_period covers a cold model load.
@@ -1468,7 +1471,10 @@ services:
     # through stunnel-vllm-secondary, which joins noo-cluster under this service's names.
     network_mode: "service:stunnel-vllm-secondary"
     depends_on:
-      - stunnel-vllm-secondary
+      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
+      stunnel-vllm-secondary:
+        condition: service_started
+        restart: true
     restart: unless-stopped
     # Plain HTTP on loopback inside the namespace; the image carries python3,
     # not curl. start_period covers a cold model load.
@@ -1675,7 +1681,10 @@ services:
     network_mode: "service:stunnel-llamacpp"
     restart: unless-stopped
     depends_on:
-      - stunnel-llamacpp
+      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
+      stunnel-llamacpp:
+        condition: service_started
+        restart: true
 
   # stunnel mTLS sidecar for llama.cpp (same shape as stunnel-ollama).
   # Accepts on :8085 — the port every client already dials for llamacpp —
@@ -1801,7 +1810,10 @@ services:
     network_mode: "service:stunnel-ollama"
     restart: unless-stopped
     depends_on:
-      - stunnel-ollama
+      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
+      stunnel-ollama:
+        condition: service_started
+        restart: true
 
   # Ollama for the standalone profile: the single ollama that serves the
   # embedder (harrier) AND chat on a one-box install (controller profiles
@@ -1844,7 +1856,10 @@ services:
     network_mode: "service:stunnel-ollama-embed"
     restart: unless-stopped
     depends_on:
-      - stunnel-ollama-embed
+      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
+      stunnel-ollama-embed:
+        condition: service_started
+        restart: true
 
   # OPTIONAL CPU-only embedder beside ollama-embed (profile `embed-cpu`,
   # off unless enabled). A second ollama with NO GPU device request and
@@ -1890,7 +1905,10 @@ services:
     # the GPU one cannot start (a GPU fault holds ollama-embed by name, see
     # scripts/lib-stuck-container.sh), so it must not wait on it.
     depends_on:
-      - stunnel-ollama-embed-cpu
+      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
+      stunnel-ollama-embed-cpu:
+        condition: service_started
+        restart: true
 
   # mTLS door for ollama-embed-cpu: the same shape as stunnel-ollama-embed
   # below, with its own leaf (`ollama-embed-cpu`, issued by `noo upgrade
@@ -2025,7 +2043,10 @@ services:
     network_mode: "service:stunnel-tei"
     restart: unless-stopped
     depends_on:
-      - stunnel-tei
+      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
+      stunnel-tei:
+        condition: service_started
+        restart: true
     command: ["--model-id", "${TEI_MODEL:-BAAI/bge-base-en-v1.5}"]
 
   # Text Embeddings Inference — GPU (worker nodes)
@@ -2068,7 +2089,10 @@ services:
     network_mode: "service:stunnel-tei-gpu"
     restart: unless-stopped
     depends_on:
-      - stunnel-tei-gpu
+      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
+      stunnel-tei-gpu:
+        condition: service_started
+        restart: true
     command: ["--model-id", "${TEI_MODEL:-BAAI/bge-base-en-v1.5}", "--dtype", "float16"]
   stunnel-ollama:
     logging: *default-logging
@@ -2202,7 +2226,10 @@ services:
     network_mode: "service:stunnel-reranker"
     restart: unless-stopped
     depends_on:
-      - stunnel-reranker
+      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
+      stunnel-reranker:
+        condition: service_started
+        restart: true
     command: ["--model-id", "${RERANK_MODEL:-BAAI/bge-reranker-base}", "--dtype", "float16"]
 
   # stunnel mTLS sidecar for the reranker (mirrors stunnel-tei-gpu)
