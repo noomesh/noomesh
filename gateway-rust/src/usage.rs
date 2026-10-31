@@ -385,7 +385,10 @@ where
     S: futures::Stream<Item = Result<Bytes, E>>,
 {
     use futures::StreamExt as _;
-    let tap = UsageTap { ctx, scanner: FrameScanner::default() };
+    // Built inside the request; read when the stream ends, on whichever task
+    // drops it, where the request's task-local is gone (i359).
+    let trace = crate::request_trace::current();
+    let tap = UsageTap { ctx, scanner: FrameScanner::default(), trace };
     inner.scan(tap, |tap, item| {
         if let Ok(chunk) = &item {
             tap.scanner.observe(chunk);
@@ -433,21 +436,25 @@ impl FrameScanner {
 struct UsageTap {
     ctx: StreamUsageCtx,
     scanner: FrameScanner,
+    /// The request the stream answers, so its tokens land on that trace.
+    trace: Option<std::sync::Arc<crate::request_trace::Recorder>>,
 }
 
 impl Drop for UsageTap {
     fn drop(&mut self) {
         if let Some((p, c)) = self.scanner.finish() {
-            record(
-                self.ctx.db.clone(),
-                self.ctx.node_id.clone(),
-                self.ctx.backend.clone(),
-                self.ctx.model.clone(),
-                self.ctx.source,
-                self.ctx.actor.clone(),
-                p,
-                c,
-            );
+            crate::request_trace::with_recorder(self.trace.clone(), || {
+                record(
+                    self.ctx.db.clone(),
+                    self.ctx.node_id.clone(),
+                    self.ctx.backend.clone(),
+                    self.ctx.model.clone(),
+                    self.ctx.source,
+                    self.ctx.actor.clone(),
+                    p,
+                    c,
+                )
+            });
         }
     }
 }

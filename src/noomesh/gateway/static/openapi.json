@@ -20760,6 +20760,52 @@
           }
         }
       }
+    },
+    "/api/traces/requests": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get requests",
+        "description": "[native] `GET /api/traces/requests` \u2014 recent requests from `noo_request_trace`, newest first. Filters: `hours` (default 24, max 720), `route`, `model`, `node`, `actor`, `min_status`, `min_ms`, `limit` (default 100, max 1000). Each row: when, trace id (look it up in Grafana's Tempo data source), method, route template, status, duration, actor, model, backend, node, tokens, span count and sizes. Operator/Admin only.",
+        "operationId": "requests",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/traces/summary": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get summary",
+        "description": "[native] `chat:gemma4:26b \u00b7 embed:harrier` - what a node serves, for one line. A placed-but-missing model shows as such; a stopped one is omitted.",
+        "operationId": "summary",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

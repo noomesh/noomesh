@@ -42,7 +42,7 @@
 //! the log rail's own traffic, which would bury every request a person or
 //! an agent made.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -140,11 +140,13 @@ fn now_ns() -> u64 {
 
 // ── spans ──────────────────────────────────────────────────────────────
 
-/// OTLP span kinds used here. Child spans (a backend call, a retrieval)
-/// add theirs when they are recorded.
+/// OTLP span kinds used here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpanKind {
+    /// The request the gateway served.
     Server = 2,
+    /// A call the gateway made for it (a model backend).
+    Client = 3,
 }
 
 /// An attribute value. Text attributes are names and ids, never content.
@@ -248,6 +250,8 @@ pub struct Recorder {
     pub start_ns: u64,
     pub request_bytes: Option<i64>,
     summary: Mutex<Summary>,
+    /// Child spans closed so far (each is exported as it closes).
+    children: AtomicI64,
 }
 
 impl Recorder {
@@ -262,6 +266,7 @@ impl Recorder {
             start_ns: now_ns(),
             request_bytes,
             summary: Mutex::new(Summary::default()),
+            children: AtomicI64::new(0),
         }
     }
 
@@ -396,6 +401,137 @@ pub fn note_usage(node: Option<&str>, backend: &str, model: &str, prompt_tokens:
     }
 }
 
+/// Run `f` with `rec` as the request in scope: for work that finishes
+/// outside the request's task (a streamed answer's usage is recorded when
+/// the stream ends, on whatever task drops it) but belongs to it.
+pub fn with_recorder<R>(rec: Option<Arc<Recorder>>, f: impl FnOnce() -> R) -> R {
+    match rec {
+        Some(r) => CURRENT.sync_scope(r, f),
+        None => f(),
+    }
+}
+
+// ── child spans: the calls a request makes ────────────────────────────
+
+/// One call the request made (a model backend), open until dropped. It
+/// carries the `traceparent` the callee continues; when dropped it is
+/// exported on its own and counted on the request.
+pub struct ChildSpan {
+    rec: Arc<Recorder>,
+    span_id: [u8; 8],
+    name: String,
+    start_ns: u64,
+    attrs: Vec<(&'static str, Attr)>,
+    status: Option<u16>,
+}
+
+impl ChildSpan {
+    /// The header value the callee continues the trace from.
+    pub fn traceparent(&self) -> String {
+        traceparent(&self.rec.ctx().trace_id, &self.span_id)
+    }
+
+    /// The callee's HTTP status, once it answered.
+    pub fn status(&mut self, status: u16) {
+        self.status = Some(status);
+    }
+
+    fn record(&self) -> SpanRecord {
+        let mut attrs = self.attrs.clone();
+        if let Some(s) = self.status {
+            attrs.push(("http.response.status_code", Attr::Int(s as i64)));
+        }
+        SpanRecord {
+            trace_id: self.rec.ctx().trace_id,
+            span_id: self.span_id,
+            parent: Some(self.rec.ctx().span_id),
+            name: self.name.clone(),
+            kind: SpanKind::Client,
+            start_ns: self.start_ns,
+            end_ns: now_ns(),
+            attrs,
+            error: self.status.is_some_and(|s| s >= 500),
+        }
+    }
+}
+
+impl Drop for ChildSpan {
+    fn drop(&mut self) {
+        self.rec.children.fetch_add(1, Ordering::Relaxed);
+        export(vec![self.record()]);
+    }
+}
+
+/// `host:port` of a URL, for `server.address`. Never the path or query.
+fn server_address(url: &str) -> Option<String> {
+    let u = reqwest::Url::parse(url).ok()?;
+    let host = u.host_str()?;
+    Some(match u.port_or_known_default() {
+        Some(p) => format!("{host}:{p}"),
+        None => host.to_string(),
+    })
+}
+
+/// What a backend span's end time means, so a reader never takes time to
+/// first byte for the whole answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpanEnd {
+    /// The caller read the whole body before the span closed.
+    Body,
+    /// The span closed when the response headers arrived; the body was read
+    /// elsewhere.
+    Headers,
+    /// The span closed when the streamed body did.
+    Stream,
+}
+
+impl SpanEnd {
+    fn as_str(self) -> &'static str {
+        match self {
+            SpanEnd::Body => "body",
+            SpanEnd::Headers => "headers",
+            SpanEnd::Stream => "stream",
+        }
+    }
+}
+
+/// A span for a call to a model backend, when a recorded (authenticated)
+/// request is in scope: an unrecorded request leaves no orphan span.
+pub fn backend_span(backend: &str, model: &str, url: &str, end: SpanEnd) -> Option<ChildSpan> {
+    let rec = current().filter(|r| r.is_authenticated())?;
+    let mut attrs = vec![
+        ("noo.backend", Attr::Str(backend.to_string())),
+        ("noo.model", Attr::Str(model.to_string())),
+        ("noo.span_end", Attr::Str(end.as_str().to_string())),
+    ];
+    if let Some(a) = server_address(url) {
+        attrs.push(("server.address", Attr::Str(a)));
+    }
+    Some(ChildSpan { rec, span_id: new_span_id(), name: format!("backend {backend}"), start_ns: now_ns(), attrs, status: None })
+}
+
+/// `req` with the span's `traceparent`, so the backend (or the node agent
+/// fronting it) continues the trace. Unchanged without a span.
+pub fn propagate(req: reqwest::RequestBuilder, span: Option<&ChildSpan>) -> reqwest::RequestBuilder {
+    match span {
+        Some(s) => req.header("traceparent", s.traceparent()),
+        None => req,
+    }
+}
+
+/// `stream`, holding `span` open until the stream is dropped: a streamed
+/// backend call's span ends with its stream. The span is moved in WHOLE
+/// (`let _held = &span;`), not field by field; see [`count_until_dropped`].
+pub fn hold_until_dropped<S>(stream: S, span: Option<ChildSpan>) -> impl futures::Stream<Item = S::Item>
+where
+    S: futures::Stream,
+{
+    stream.map(move |item| {
+        let _held = &span;
+        item
+    })
+}
+
 // ── the layer ──────────────────────────────────────────────────────────
 
 /// Paths that are not traced: probes, static assets and the node log push.
@@ -520,9 +656,9 @@ fn finish(rec: &Arc<Recorder>, status: u16, response_bytes: Option<i64>) -> bool
     }
     let root = rec.root_span(status, response_bytes);
     let duration_ms = (root.end_ns.saturating_sub(root.start_ns) / 1_000_000) as i64;
-    // One span per request for now; child spans join `span_count` when
-    // they are recorded.
-    let span_count = 1;
+    // Child spans export themselves as they close; a streamed backend call
+    // still running here closes with its stream and is not counted.
+    let span_count = 1 + rec.children.load(Ordering::Relaxed);
     export(vec![root]);
 
     let row = SummaryRow {
@@ -916,6 +1052,77 @@ mod tests {
         let body = count_until_dropped(Body::from("abc"), move |b| s.lock().expect("lock").push(b));
         drop(body);
         assert_eq!(*seen.lock().expect("lock"), vec![0]);
+    }
+
+    /// A streamed answer's usage is recorded when its stream ends, off the
+    /// request's task. Its tokens still reach that request's trace, and
+    /// before the trace closes: the tap carries the recorder, and it drops
+    /// before the trace's stream guard (the inner stream before the map).
+    #[tokio::test]
+    async fn a_streamed_answers_tokens_reach_its_trace_before_it_closes() {
+        let rec = Arc::new(Recorder::new(&Method::POST, "/api/inference/stream".into(), None, None));
+        let seen: Arc<Mutex<Option<Summary>>> = Arc::new(Mutex::new(None));
+        let (r, s) = (rec.clone(), seen.clone());
+        let body = CURRENT
+            .scope(rec.clone(), async move {
+                let frames: Vec<Result<axum::body::Bytes, std::io::Error>> = vec![
+                    Ok("data: {\"choices\":[]}\n\n".into()),
+                    Ok("data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n".into()),
+                ];
+                let ctx = crate::usage::StreamUsageCtx {
+                    db: sqlx::postgres::PgPoolOptions::new()
+                        .acquire_timeout(Duration::from_millis(300))
+                        .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+                        .expect("lazy pool"),
+                    node_id: None,
+                    backend: "vllm".into(),
+                    model: "gemma".into(),
+                    source: "api",
+                    actor: crate::usage::UsageActor::unknown(),
+                };
+                let tapped = crate::usage::tap_stream(futures::stream::iter(frames), ctx);
+                count_until_dropped(Body::from_stream(tapped), move |_| {
+                    *s.lock().expect("lock") = Some(r.summary());
+                })
+            })
+            .await;
+        // Read outside the request's scope, as the server does.
+        axum::body::to_bytes(body, usize::MAX).await.expect("the body reads");
+        let got = seen.lock().expect("lock").clone().expect("the trace closed");
+        assert_eq!((got.prompt_tokens, got.completion_tokens), (7, 3), "{got:?}");
+        assert_eq!(got.model.as_deref(), Some("gemma"));
+    }
+
+    /// A backend call's span: the callee continues the request's trace from
+    /// the span's own id, and closing it counts it on the request.
+    #[tokio::test]
+    async fn a_backend_span_continues_the_trace_and_is_counted() {
+        assert!(backend_span("vllm", "m", "https://n:8081/v1/chat/completions", SpanEnd::Body).is_none(), "no request, no span");
+        let rec = Arc::new(Recorder::new(&Method::POST, "/v1/chat/completions".into(), None, None));
+        CURRENT
+            .scope(rec.clone(), async {
+                assert!(
+                    backend_span("vllm", "gemma", "https://node-a:8081/v1/chat/completions", SpanEnd::Body).is_none(),
+                    "an unauthenticated request makes no backend span"
+                );
+                rec.authenticate(&alice());
+                let mut span =
+                    backend_span("vllm", "gemma", "https://node-a:8081/v1/chat/completions?x=1", SpanEnd::Headers).expect("a span");
+                let tp = parse_traceparent(&span.traceparent()).expect("a valid traceparent");
+                assert_eq!(tp.trace_id, rec.ctx().trace_id, "the same trace");
+                assert_ne!(tp.span_id, rec.ctx().span_id, "its own span");
+                span.status(502);
+                let r = span.record();
+                assert_eq!(r.parent, Some(rec.ctx().span_id));
+                assert_eq!(r.kind, SpanKind::Client);
+                assert!(r.error);
+                let addr = r.attrs.iter().find(|(k, _)| *k == "server.address").map(|(_, v)| v.clone());
+                assert_eq!(addr, Some(Attr::Str("node-a:8081".into())), "host and port, never the path or query");
+                let end = r.attrs.iter().find(|(k, _)| *k == "noo.span_end").map(|(_, v)| v.clone());
+                assert_eq!(end, Some(Attr::Str("headers".into())));
+            })
+            .await;
+        assert_eq!(rec.children.load(Ordering::Relaxed), 1);
     }
 
     #[test]
