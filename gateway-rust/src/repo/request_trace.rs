@@ -66,9 +66,79 @@ pub async fn prune(db: &sqlx::PgPool, keep_days: i64) -> Result<u64, sqlx::Error
     Ok(res.rows_affected())
 }
 
+/// Every row's actor, sorted. For the erase test; operators read rows
+/// through `routes::traces`.
+#[allow(dead_code)]
+pub async fn actors(db: &sqlx::PgPool) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT actor FROM noo_request_trace WHERE actor IS NOT NULL ORDER BY 1").fetch_all(db).await
+}
+
+/// The account `user_uuid` a row with this exact actor resolved to.
+#[allow(dead_code)]
+pub async fn user_uuid_of(db: &sqlx::PgPool, actor: &str) -> Result<Option<uuid::Uuid>, sqlx::Error> {
+    sqlx::query_scalar("SELECT user_uuid FROM noo_request_trace WHERE actor = $1 LIMIT 1").bind(actor).fetch_one(db).await
+}
+
+/// Run one erase store's archive and delete statements for `username`.
+#[allow(dead_code)]
+pub async fn run_erase_statements(
+    db: &sqlx::PgPool,
+    statements: &(String, String, &'static str),
+    username: &str,
+) -> Result<(), sqlx::Error> {
+    let (snapshot, delete, label) = statements;
+    sqlx::query(sqlx::AssertSqlSafe(snapshot.as_str()))
+        .bind(username)
+        .bind(uuid::Uuid::new_v4())
+        .bind(*label)
+        .execute(db)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(delete.as_str())).bind(username).execute(db).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RTBF for request traces against the real table: alice's rows go,
+    /// her connection login's included (`alice/laptop`, which used to keep
+    /// its rows); bob's, `alice_x`'s and an internal caller's stay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rtbf_erases_a_users_request_traces_including_her_connection_logins() {
+        let _serial = crate::ops::tests::DB_LOCK.lock().await;
+        let Some(db) = crate::ops::tests::scratch("rtbf_traces").await else { return };
+        use crate::auth::Role;
+        for who in ["alice", "bob", "alice_x"] {
+            let _ = crate::ops::tests::account(&db, who, Role::User).await;
+        }
+        let row = |actor: &str, kind: &str| SummaryRow {
+            trace_id: format!("{:032x}", actor.len()),
+            method: "POST".into(),
+            route: "/v1/chat/completions".into(),
+            status: 200,
+            duration_ms: 1,
+            summary: crate::request_trace::Summary {
+                actor: Some(actor.into()),
+                actor_kind: Some(kind.into()),
+                ..Default::default()
+            },
+            span_count: 1,
+            request_bytes: None,
+            response_bytes: None,
+        };
+        for (actor, kind) in [("alice", "user"), ("alice/laptop", "user"), ("bob", "user"), ("alice_x", "user"), ("internal:cluster:worker", "internal")] {
+            insert(&db, &row(actor, kind)).await.unwrap();
+        }
+        assert!(user_uuid_of(&db, "alice/laptop").await.unwrap().is_some(), "a connection login's row carries its account's user_uuid");
+        let st = crate::routes::users::erase_statements("noo_request_trace").expect("noo_request_trace is an erase target");
+        run_erase_statements(&db, &st, "alice").await.unwrap();
+        assert_eq!(
+            actors(&db).await.unwrap(),
+            ["alice_x", "bob", "internal:cluster:worker"],
+            "alice's rows are gone, her connection's too, nobody else's"
+        );
+    }
 
     #[test]
     fn a_connection_login_resolves_to_its_account() {
