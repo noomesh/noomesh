@@ -122,6 +122,7 @@ use std::process::Command;
 use serde_json::{json, Value};
 
 use super::secrets::{SecretStore, State};
+use crate::args::{ArgError, Args};
 use crate::output::{fail, ExitCode};
 use crate::{envfile, Globals, Unhandled};
 use crate::ui::{self, Glyph};
@@ -365,6 +366,26 @@ fn container_running(name: &str) -> bool {
 // The command
 // ─────────────────────────────────────────────────────────────────────────
 
+/// What `noo cluster push-secrets` was asked for.
+pub(crate) struct PushSecretsArgs {
+    node_args: Vec<String>,
+    dry_run: bool,
+    yes: bool,
+    gateway_container: Option<String>,
+    sops_path: Option<PathBuf>,
+    explain: bool,
+}
+
+pub(crate) fn parse_push_secrets_with(a: &mut Args) -> Result<PushSecretsArgs, ArgError> {
+    let dry_run = a.flag(&["--dry-run"]);
+    let explain = a.flag(&["--explain"]);
+    let yes = a.flag(&["--yes", "-y"]);
+    let gateway_container = a.value(&["--gateway-container"])?;
+    let sops_path = a.value(&["--sops-file"])?.map(PathBuf::from);
+    let node_args = a.positionals()?;
+    Ok(PushSecretsArgs { node_args, dry_run, yes, gateway_container, sops_path, explain })
+}
+
 /// `noo cluster push-secrets [NODES…] [--dry-run] [--gateway-container C]
 ///  [--sops-file P] [--explain] [-y|--yes] [--json]`
 ///
@@ -374,25 +395,9 @@ fn container_running(name: &str) -> bool {
 /// Keeping the flag would have meant a filter that changes nothing about
 /// what happens — a knob that reads like control and is not.
 pub fn cluster_push_secrets(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut node_args: Vec<String> = Vec::new();
-    let mut dry_run = false;
-    let mut yes = false;
-    let mut gateway_container = crate::envfile::container("gateway");
-    let mut sops_path: Option<PathBuf> = None;
-    let mut explain = false;
-
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--dry-run" => dry_run = true,
-            "--explain" => explain = true,
-            "-y" | "--yes" => yes = true,
-            "--gateway-container" => gateway_container = iter.next().ok_or(Unhandled)?.clone(),
-            "--sops-file" => sops_path = Some(PathBuf::from(iter.next().ok_or(Unhandled)?)),
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => node_args.push(t.to_string()),
-        }
-    }
+    let PushSecretsArgs { node_args, dry_run, yes, gateway_container, sops_path, explain } =
+        parse_push_secrets_with(&mut Args::new(args))?;
+    let gateway_container = gateway_container.unwrap_or_else(|| crate::envfile::container("gateway"));
 
     // `--explain` answers the question this command's existence raises —
     // "why can't it just rotate?" — without contacting anything at all.
