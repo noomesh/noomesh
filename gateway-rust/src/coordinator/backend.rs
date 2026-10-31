@@ -619,6 +619,34 @@ struct Candidate {
     health: String,
 }
 
+/// A lane that serves the model but is kept out of routing by a GPU hold.
+struct HeldLane {
+    node_id: String,
+    backend_type: String,
+    model_name: String,
+}
+
+/// The refusal for a pin whose every serving lane is held, or `None` when the
+/// pin is not in that state (a live candidate serves it, or no held lane does).
+fn pin_all_held(held: &[HeldLane], candidates: &[Candidate], pin: &str) -> Option<String> {
+    if candidates.iter().any(|c| model_matches_pin(&c.model_name, pin)) {
+        return None;
+    }
+    let who: Vec<String> = held
+        .iter()
+        .filter(|h| model_matches_pin(&h.model_name, pin))
+        .map(|h| format!("{}={}", h.node_id, h.backend_type))
+        .collect();
+    if who.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "every node serving '{pin}' has its GPU held ({}) and no other live node can answer; \
+         the model is served again when the hold is released",
+        who.join(" ")
+    ))
+}
+
 /// Has this backend already failed the current request? `exclude_urls` holds
 /// `ResolvedBackend.url` values, which for a registered node are
 /// `https://<ip>:8081`; `local_url` (the docker-service name) is compared too
@@ -1062,6 +1090,8 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
     let non_chat = non_chat_backends(state).await?;
 
     let mut candidates: Vec<Candidate> = Vec::new();
+    // Lanes dropped because a GPU hold keeps them out of routing.
+    let mut held: Vec<HeldLane> = Vec::new();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
 
     if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
@@ -1083,6 +1113,7 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
                                 .map(|l| scale_checked_load(&key, l))
                                 .unwrap_or(0.0);
 
+                            let paused = super::classes::paused_backends_of(&data);
                             let backends = data.get("running_backends")
                                 .or_else(|| data.get("backends"))
                                 .and_then(|b| b.as_object());
@@ -1113,6 +1144,18 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
                                         // placed model.
                                         if crate::model_presence::backend_model_missing(&data, bt) {
                                             tracing::warn!(node = %node_id, backend = %bt, "backend_skipped_model_missing");
+                                            continue;
+                                        }
+                                        // A GPU hold keeps the lane out at once, as it does
+                                        // for the class table; the heartbeat still lists
+                                        // the backend for up to a poll after the stop.
+                                        if super::classes::backend_held(&node_id, &paused, bt) {
+                                            tracing::warn!(node = %node_id, backend = %bt, "backend_skipped_gpu_held");
+                                            held.push(HeldLane {
+                                                node_id: node_id.clone(),
+                                                backend_type: bt.clone(),
+                                                model_name: m.to_string(),
+                                            });
                                             continue;
                                         }
                                         let port = match backend_port(bt.as_str()) {
@@ -1147,6 +1190,20 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
                     }
                 }
             }
+        }
+    }
+
+    // Every node that serves the pin has its GPU held: a live node answers
+    // (the pin is a preference, as below); when none does, say so. Never fall
+    // through to discovery or the static backend, which could send the turn
+    // into the held node.
+    if let Some(pin) = requested_model {
+        if let Some(why) = pin_all_held(&held, &candidates, pin) {
+            if let Some(found) = unpinned_from_table(state, exclude_urls).await {
+                tracing::warn!(requested_model = pin, reason = %why, node = ?found.1, model = %found.0.model, "backend_preference_held_mesh_answers");
+                return Ok(found);
+            }
+            return Err(anyhow::anyhow!(why));
         }
     }
 
@@ -1864,6 +1921,51 @@ mod local_backend_url_tests {
         assert_eq!(local_backend_url("ollama", 11434), "https://noo-stunnel-ollama:11434");
         assert_eq!(local_backend_url("vllm", 8000), "https://noo-vllm:8000");
         assert_eq!(local_backend_url("vllm-secondary", 8000), "https://noo-vllm-secondary:8000");
+    }
+}
+
+/// A pinned model on a node whose GPU is held is not a candidate.
+#[cfg(test)]
+mod pinned_hold_tests {
+    use super::{pin_all_held, Candidate, HeldLane};
+
+    fn held(node: &str, backend: &str, model: &str) -> HeldLane {
+        HeldLane { node_id: node.into(), backend_type: backend.into(), model_name: model.into() }
+    }
+
+    fn live(node: &str, backend: &str, model: &str) -> Candidate {
+        Candidate {
+            node_id: node.into(),
+            backend_type: backend.into(),
+            model_name: model.into(),
+            url: String::new(),
+            load: 0.1,
+            excluded: false,
+            healthy: true,
+            health: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_pin_with_a_live_serving_node_is_unchanged_by_a_held_one() {
+        let held = [held("awolf", "vllm", "gemma4")];
+        let live = [live("pop-os", "llamacpp", "gemma4")];
+        assert!(pin_all_held(&held, &live, "gemma4").is_none(), "the live node serves it: no refusal");
+    }
+
+    #[test]
+    fn a_pin_with_nothing_held_is_unchanged() {
+        assert!(pin_all_held(&[], &[], "gemma4").is_none(), "the not-served path owns this");
+        let other = [held("awolf", "vllm", "qwen3")];
+        assert!(pin_all_held(&other, &[], "gemma4").is_none(), "a held lane of another model is not this pin");
+    }
+
+    #[test]
+    fn a_pin_whose_every_serving_lane_is_held_is_refused_naming_them() {
+        let both = [held("awolf", "vllm", "gemma4:latest"), held("aserve", "vllm", "gemma4")];
+        let why = pin_all_held(&both, &[live("pop-os", "ollama", "qwen3")], "gemma4").expect("refusal");
+        assert!(why.contains("every node serving 'gemma4' has its GPU held"), "{why}");
+        assert!(why.contains("awolf=vllm") && why.contains("aserve=vllm"), "{why}");
     }
 }
 
