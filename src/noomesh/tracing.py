@@ -19,6 +19,8 @@ from typing import Optional
 
 import structlog
 
+from .tls_ca import TlsCaMissing, require_ca
+
 logger = structlog.get_logger()
 
 # Safe import — tracing is optional (monitoring extra)
@@ -28,6 +30,7 @@ try:
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
     from opentelemetry.sdk.resources import Resource
+    import grpc
     OTEL_AVAILABLE = True
 except ImportError:
     OTEL_AVAILABLE = False
@@ -58,17 +61,25 @@ def init_tracing(service_name: str = "noo-gateway") -> bool:
         logger.info("tracing_skipped", reason="OTEL_EXPORTER_OTLP_ENDPOINT not set")
         return False
 
+    # Spans carry request paths and timings, so they leave over TLS checked
+    # against the cluster CA, or not at all. This used to fall back to
+    # plaintext whenever NOO_TLS_CA was unset (followup 510), and an
+    # http:// endpoint makes the exporter choose plaintext on its own.
+    if endpoint.lower().startswith("http://"):
+        logger.warning("tracing_skipped", reason="OTEL_EXPORTER_OTLP_ENDPOINT is http://; spans are exported over TLS only")
+        return False
+    try:
+        ca = require_ca()
+    except TlsCaMissing as e:
+        logger.warning("tracing_skipped", reason=str(e))
+        return False
+
     try:
         resource = Resource.create({"service.name": service_name})
         provider = TracerProvider(resource=resource)
-        # Use TLS for OTel export when cluster TLS is configured
-        _otel_insecure = os.getenv("OTEL_EXPORTER_OTLP_INSECURE", "").lower()
-        if _otel_insecure:
-            insecure = _otel_insecure in ("1", "true", "yes")
-        else:
-            # Default: insecure only when no TLS CA is configured
-            insecure = not os.getenv("NOO_TLS_CA", "")
-        exporter = OTLPSpanExporter(endpoint=endpoint, insecure=insecure)
+        with open(ca, "rb") as f:
+            credentials = grpc.ssl_channel_credentials(root_certificates=f.read())
+        exporter = OTLPSpanExporter(endpoint=endpoint, insecure=False, credentials=credentials)
         provider.add_span_processor(BatchSpanProcessor(exporter))
         trace.set_tracer_provider(provider)
         _tracer = trace.get_tracer(service_name)
