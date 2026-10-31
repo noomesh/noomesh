@@ -1277,6 +1277,8 @@ services:
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - VLLM_MODEL=${VLLM_MODEL:-Qwen/Qwen3-8B-AWQ}
       - VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-16384}
+      # Empty = no --max-num-batched-tokens flag (vLLM's own default). Followup i344a.
+      - VLLM_MAX_NUM_BATCHED_TOKENS=${VLLM_MAX_NUM_BATCHED_TOKENS:-}
       - VLLM_QUANTIZATION=${VLLM_QUANTIZATION:-}
       - TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-1}
       - VLLM_TOOL_PARSER=${VLLM_TOOL_PARSER:-auto}
@@ -1378,6 +1380,17 @@ services:
         ARGS="--model $$VLLM_MODEL $$QUANT_ARG --gpu-memory-utilization $$GPU_MEMORY_UTILIZATION --max-model-len $$VLLM_MAX_MODEL_LEN --tensor-parallel-size $$TENSOR_PARALLEL_SIZE $$MAX_SEQS_ARG --enable-auto-tool-choice --tool-call-parser $$VLLM_TOOL_PARSER --host 127.0.0.1 --port 8000"
         if [ -n "$$VLLM_REASONING_PARSER" ]; then
           ARGS="$$ARGS --reasoning-parser $$VLLM_REASONING_PARSER"
+        fi
+        # Optional --max-num-batched-tokens (followup i344a). Unset or empty adds
+        # nothing: the command line is exactly what it was. A value that is not a
+        # positive integer is logged and ignored, never passed to vLLM (and not
+        # fatal: a bad knob must not crash-loop the engine).
+        if [ -n "$$VLLM_MAX_NUM_BATCHED_TOKENS" ]; then
+          case "$$VLLM_MAX_NUM_BATCHED_TOKENS" in
+            *[!0-9]*) echo "Ignoring VLLM_MAX_NUM_BATCHED_TOKENS='$$VLLM_MAX_NUM_BATCHED_TOKENS': not a positive integer" ;;
+            *[1-9]*)  ARGS="$$ARGS --max-num-batched-tokens $$VLLM_MAX_NUM_BATCHED_TOKENS" ;;
+            *)        echo "Ignoring VLLM_MAX_NUM_BATCHED_TOKENS='$$VLLM_MAX_NUM_BATCHED_TOKENS': not a positive integer" ;;
+          esac
         fi
         # No TLS here: the engine listens on loopback in its door's namespace
         # and the door (stunnel, verify = 2, callers pinned by name) is the

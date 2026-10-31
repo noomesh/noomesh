@@ -114,6 +114,17 @@ ARGS="--model $VLLM_MODEL $QUANT_ARG --gpu-memory-utilization $GPU_MEMORY_UTILIZ
 if [ -n "$VLLM_REASONING_PARSER" ]; then
   ARGS="$ARGS --reasoning-parser $VLLM_REASONING_PARSER"
 fi
+# Optional --max-num-batched-tokens (followup i344a). Unset or empty adds
+# nothing: the command line is exactly what it was. A value that is not a
+# positive integer is logged and ignored, never passed to vLLM (and not
+# fatal: a bad knob must not crash-loop the engine).
+if [ -n "$VLLM_MAX_NUM_BATCHED_TOKENS" ]; then
+  case "$VLLM_MAX_NUM_BATCHED_TOKENS" in
+    *[!0-9]*) echo "Ignoring VLLM_MAX_NUM_BATCHED_TOKENS='$VLLM_MAX_NUM_BATCHED_TOKENS': not a positive integer" ;;
+    *[1-9]*)  ARGS="$ARGS --max-num-batched-tokens $VLLM_MAX_NUM_BATCHED_TOKENS" ;;
+    *)        echo "Ignoring VLLM_MAX_NUM_BATCHED_TOKENS='$VLLM_MAX_NUM_BATCHED_TOKENS': not a positive integer" ;;
+  esac
+fi
 # Plain on 127.0.0.1 ON PURPOSE: this container runs inside its door's
 # network namespace (noo-stunnel-vllm, door generation 5), and the door is
 # the only thing that reaches loopback there. The door presents the vllm
