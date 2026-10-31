@@ -92,6 +92,12 @@ jobs:
             dest: loki:3
             auth: dhi
             dest_org: noomesh/dhi
+          # Tempo 2.10.10, the request-trace store (i359); uid 65532 like the
+          # rest of the runtime set.
+          - source: dhi.io/tempo:2@sha256:5352e76f3c4e531babc76fc29958cfa3286096d2ca0bbf3b46007e46c0249a85
+            dest: tempo:2
+            auth: dhi
+            dest_org: noomesh/dhi
           - source: dhi.io/prometheus:3@sha256:6a5aea3fc3a33fea84bb4ea7925228f8eb67884893970a768603d350e1830489
             dest: prometheus:3
             auth: dhi
@@ -185,6 +191,10 @@ jobs:
             dest_org: noomesh
           - source: grafana/loki:3@sha256:0db216b630ae1f348a1584c67f3cead8b4c1fc839169a39501db664744158e28
             dest: loki:3
+            dest_org: noomesh
+          # Upstream publishes no major tag; 2.10.10 is the release dhi.io/tempo:2 carries.
+          - source: grafana/tempo:2.10.10@sha256:12b0820f13ffa10ce956b6e9acc3b03f3cffded99109be6cc09d106fe56e5d38
+            dest: tempo:2
             dest_org: noomesh
           - source: prom/prometheus:v3@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
             dest: prometheus:3

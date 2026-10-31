@@ -36,6 +36,7 @@ use serde_json::Value;
 use std::process::Command;
 
 mod image_family;
+mod tempo;
 mod warmup;
 pub(crate) mod restart_loops;
 mod gpu_held;
@@ -3645,6 +3646,7 @@ pub(crate) fn at_rest_dirs(env: &dyn Fn(&str) -> Option<String>) -> Vec<AtRestDi
         .unwrap_or_else(|| format!("{home}/.config/sops/age"));
     vec![
         AtRestDir { name: "loki at rest", what: LOKI_WHAT, path: format!("{state}/loki") },
+        AtRestDir { name: "tempo at rest", what: "the request traces (who called which route, when, on which model)", path: format!("{state}/tempo") },
         AtRestDir { name: "postgres at rest", what: "the database files (every account, session, message and memory)", path: pg },
         AtRestDir { name: "redis at rest", what: "the Redis dumps (RDB/AOF: sessions, rate limits, cached results)", path: format!("{state}/redis") },
         AtRestDir { name: "nats at rest", what: "the JetStream streams (queued tasks, agent mail, KV)", path: format!("{state}/nats") },
@@ -3827,7 +3829,7 @@ pub(crate) fn at_rest_swap_check(proc_swaps: &str, encrypted: &dyn Fn(&str, &str
     ok(NAME, format!("{total} swap device(s), each zram or on dm-crypt"))
 }
 
-/// One place that holds sensitive state outside the nine at-rest rows.
+/// One place that holds sensitive state outside the ten at-rest rows.
 pub(crate) struct OutsideItem {
     pub what: String,
     pub path: String,
@@ -3836,7 +3838,7 @@ pub(crate) struct OutsideItem {
 
 /// The "at-rest outside the set" row (i10a): the `claude-config` and
 /// `alertmanager-data` docker volumes, docker's json logs and journald are
-/// not among the nine rows but can hold sensitive text. WARN while any sits
+/// not among the ten rows but can hold sensitive text. WARN while any sits
 /// on a device that is not dm-crypt; ACCEPTED when the person opted out.
 pub(crate) fn at_rest_outside_check(
     items: &[OutsideItem],
@@ -3857,7 +3859,7 @@ pub(crate) fn at_rest_outside_check(
             if items.is_empty() {
                 "none of claude-config, alertmanager-data, docker logs or journald found on disk here".to_string()
             } else {
-                format!("{} location(s) outside the nine rows, all on dm-crypt", items.len())
+                format!("{} location(s) outside the ten rows, all on dm-crypt", items.len())
             },
         );
     }
@@ -3867,7 +3869,7 @@ pub(crate) fn at_rest_outside_check(
     }
     warn(
         NAME,
-        format!("in the clear, outside the nine rows above: {list}"),
+        format!("in the clear, outside the ten rows above: {list}"),
         Some("planned (i10a): claude-config and alertmanager-data ride the encrypted state volume; docker logs and journald need their own handling. Until then anyone holding the drive can read them.".into()),
     )
 }
@@ -3883,7 +3885,7 @@ fn docker_lines(args: &[&str]) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The sensitive locations outside the nine rows that exist on this host,
+/// The sensitive locations outside the ten rows that exist on this host,
 /// with whether the device under each is dm-crypt.
 fn outside_items(proc_mounts: &str) -> Vec<OutsideItem> {
     let mut found: Vec<(String, String)> = Vec::new();
@@ -5654,8 +5656,8 @@ fn remedies_to_print<'a>(title: &str, checks: &'a [Check]) -> Vec<(&'a str, Vec<
 /// The `at_rest_dirs` rows. In the default output they print as one
 /// "data at rest" row that names only the ones that are not clean (the
 /// 0.6.12 roll printed nine near-identical rows).
-const AT_REST_DIR_ROWS: [&str; 9] = [
-    "loki at rest", "postgres at rest", "redis at rest", "nats at rest", "prometheus at rest",
+const AT_REST_DIR_ROWS: [&str; 10] = [
+    "loki at rest", "tempo at rest", "postgres at rest", "redis at rest", "nats at rest", "prometheus at rest",
     "grafana at rest", "noo-data at rest", "pki at rest", "age key at rest",
 ];
 
@@ -6128,6 +6130,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let loki_cfg = std::fs::read_to_string(root.join("monitoring/loki/loki-config-tls.yml")).ok();
         let compose = std::fs::read_to_string(root.join("docker-compose.cluster.yml")).ok();
         checks.push(loki_listener_check(loki_cfg.as_deref(), compose.as_deref()));
+        // Request tracing (i359): Tempo is ready to the gateway, and its
+        // doors are mTLS-only with no published port.
+        checks.extend(tempo::rows(g));
         // The sandbox executor's door (mTLS doors phase 1): compose runs
         // its uvicorn with a required client certificate, and the gateway
         // container proves it live — no cert and plaintext refused, its own
@@ -9571,6 +9576,7 @@ mod tests {
         let rows = at_rest_dirs(&env);
         let path = |name: &str| rows.iter().find(|r| r.name == name).map(|r| r.path.clone()).unwrap_or_else(|| panic!("no row {name}"));
         assert_eq!(path("loki at rest"), "/media/alice/data/noo/loki");
+        assert_eq!(path("tempo at rest"), "/media/alice/data/noo/tempo");
         assert_eq!(path("postgres at rest"), "/media/alice/data/noo/postgres", "NOO_PG_DATA unset → under the data root, as compose defaults it");
         assert_eq!(path("redis at rest"), "/media/alice/data/noo/redis");
         assert_eq!(path("nats at rest"), "/media/alice/data/noo/nats");
@@ -9580,7 +9586,7 @@ mod tests {
         assert_eq!(path("pki at rest"), "/home/alice/.config/mesh/pki", "pki::pki_dir's default");
         assert_eq!(path("age key at rest"), "/home/alice/.config/sops/age");
         assert!(rows.iter().all(|r| r.name.ends_with(" at rest")), "one naming for the whole table");
-        assert_eq!(rows.len(), 9);
+        assert_eq!(rows.len(), 10);
 
         // NOO_STATE_ROOT moves exactly the state set; NOO_PG_DATA still wins
         // for postgres; the PKI / age rows are untouched by it.
@@ -9594,7 +9600,7 @@ mod tests {
         };
         let rows_s = at_rest_dirs(&env_s);
         let path_s = |name: &str| rows_s.iter().find(|r| r.name == name).unwrap().path.clone();
-        for (row, dir) in [("loki", "loki"), ("postgres", "postgres"), ("redis", "redis"), ("nats", "nats"), ("prometheus", "prometheus"), ("grafana", "grafana"), ("noo-data", "noo-data")] {
+        for (row, dir) in [("loki", "loki"), ("tempo", "tempo"), ("postgres", "postgres"), ("redis", "redis"), ("nats", "nats"), ("prometheus", "prometheus"), ("grafana", "grafana"), ("noo-data", "noo-data")] {
             assert_eq!(path_s(&format!("{row} at rest")), format!("/mnt/state/{dir}"), "{row} reads the state root");
         }
         assert_eq!(path_s("pki at rest"), "/home/alice/.config/mesh/pki");

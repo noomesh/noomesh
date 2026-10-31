@@ -119,6 +119,7 @@ SERVICE_CLASS: dict[str, str] = {
     "nvidia-exporter": "none",
     "model-cache": "none",
     "loki": "config",  # analytics.reporting_enabled: false
+    "tempo": "config",  # usage_report.reporting_enabled: false
     "grafana": "config",  # branch fix/grafana-bookmark-and-no-phone-home
     # TLS sidecars
     "stunnel-llamacpp": "none",
@@ -339,6 +340,17 @@ def test_loki_usage_reporting_is_off():
         )
 
 
+def test_tempo_usage_reporting_is_off():
+    configs = sorted((ROOT / "monitoring/tempo").glob("*.yml"))
+    assert configs, "no Tempo config found"
+    for c in configs:
+        doc = yaml.safe_load(c.read_text()) or {}
+        assert doc.get("usage_report", {}).get("reporting_enabled") is False, (
+            f"{c.relative_to(ROOT)}: Tempo reports usage to stats.grafana.org unless "
+            "usage_report.reporting_enabled is false"
+        )
+
+
 def test_no_phone_home_python_dependency():
     text = (ROOT / "pyproject.toml").read_text().lower()
     deps = set(re.findall(r'"\s*([a-z0-9_.-]+)', text))
@@ -356,7 +368,7 @@ def test_the_doc_names_every_switch():
         for k in TELEMETRY_SWITCHES[cls]:
             assert k in doc, f"docs/security/telemetry.md does not mention {k}"
     assert "onnxruntime" in doc and "mobile.events.data.microsoft.com" in doc, "the onnxruntime row names what it sends and where"
-    for svc in ("vLLM", "Ollama", "text-embeddings-inference", "Loki", "Grafana", "NATS"):
+    for svc in ("vLLM", "Ollama", "text-embeddings-inference", "Loki", "Tempo", "Grafana", "NATS"):
         assert svc in doc, f"docs/security/telemetry.md has no row for {svc}"
 
 

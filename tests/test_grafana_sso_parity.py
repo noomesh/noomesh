@@ -179,7 +179,7 @@ def test_read_only_users_are_viewers_only_behind_the_gateway(
     back to https://loki:3100) and watched fail."""
     assert org_roles == {"User": "Viewer", "Operator": "Editor", "Admin": "Admin"}, org_roles
     urls = _datasource_urls()
-    assert set(urls) == {"prometheus", "loki"}, urls
+    assert set(urls) == {"prometheus", "loki", "tempo"}, urls
     for typ, url in urls.items():
         assert url == f"{GATEWAY_DS}{typ}", (
             f"the {typ} data source dials {url}: with a Viewer row in GRAFANA_ORG_ROLES every read-only "

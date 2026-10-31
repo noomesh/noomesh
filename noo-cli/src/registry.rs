@@ -21,8 +21,8 @@
 pub(crate) const IMAGE_NAMESPACE: &str = "ghcr.io/noomesh";
 
 /// The registry namespace a fresh install seeds into `NOO_BASE_REGISTRY` (where
-/// redis / loki / prometheus / alertmanager / grafana / node-exporter come
-/// from): the DHI runtime mirrors that mirror-images.yml publishes under the
+/// redis / loki / prometheus / alertmanager / grafana / node-exporter / tempo
+/// come from): the DHI runtime mirrors that mirror-images.yml publishes under the
 /// NESTED `dhi/` prefix (`dest_org: noomesh/dhi`, list in
 /// scripts/dhi-images.txt). Those are the images the stack is built around:
 /// every service-key reader in `pki::SERVICE_KEY_READERS` and every

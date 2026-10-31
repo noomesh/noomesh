@@ -45,7 +45,7 @@ SCAN_ROOTS = ("gateway-rust/src", "src/noomesh", "noo-cli/src")
 # plaintext exception (see the allow-list) and a sibling PR fronts it.
 SERVICE = (
     r"(?:noo-[a-z0-9-]+|stunnel-[a-z0-9-]+|gateway|vllm(?:-secondary)?|ollama(?!-embed)|tei|"
-    r"reranker|llamacpp|redis|nats|postgres|loki|prometheus|grafana|alertmanager|model-cache|"
+    r"reranker|llamacpp|redis|nats|postgres|loki|tempo|prometheus|grafana|alertmanager|model-cache|"
     r"sandbox|whisper|piper|browser|evolve|trellion|"
     # Loopback is a stack door too when the port is the gateway's (:8080)
     # or the node agent's (:8081): both are TLS-only listeners.

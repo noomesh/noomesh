@@ -795,6 +795,7 @@ dist_third_party_row() {
         nats) echo NATS ;;
         nginx) echo NGINX ;;
         loki) echo LOKI ;;
+        tempo) echo TEMPO ;;
         prometheus) echo PROMETHEUS ;;
         alertmanager) echo ALERTMANAGER ;;
         grafana) echo GRAFANA ;;

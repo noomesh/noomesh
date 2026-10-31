@@ -43,6 +43,7 @@ STATE_VOLUMES = {
     "prometheus-data": "prometheus",
     "grafana-data": "grafana",
     "loki-data": "loki",
+    "tempo-data": "tempo",
     "postgres-data": "postgres",
 }
 # Volumes outside the state set; compose renders only those a selected service
