@@ -118,6 +118,18 @@ pub fn check_routes(addon: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<Op
     Ok(Some(checked.unchecked))
 }
 
+/// [`check_routes`] as the pin path runs it (`noo addons enable | upgrade`,
+/// `upgrade --check`): a bundle the gateway would refuse whole at load is
+/// refused here, with the gateway's sentence, before an image is pulled or a
+/// pin, overlay or switch is written. What only the gateway's front door can
+/// decide is not judged here (`noo addons check` lists it).
+pub fn refuse_bad_routes(addon: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<(), Refusal> {
+    check_routes(addon, files).map(|_| ()).map_err(|r| match r {
+        Refusal::Decl(e) => Refusal::Decl(format!("{e} (nothing was changed)")),
+        other => other,
+    })
+}
+
 /// [`check_files`] and then [`check_routes`] over a bundle directory against
 /// the embedded core. `Err` is the text enable would print for the refusal
 /// (`Refusal::why`); a directory or core that cannot be read is an error in

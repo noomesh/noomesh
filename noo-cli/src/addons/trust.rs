@@ -698,6 +698,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A signed third-party bundle of `rhaddon` carrying `routes` as its
+    /// routes.json beside an empty overlay.
+    fn signed_with_routes(routes: &str) -> crate::addons::lock_fetch::Fetched {
+        use crate::addon_lock;
+        let mut l = third_party_lock(&["v0.6.0"]);
+        l.addon = "rhaddon".into();
+        l.format = addon_lock::FORMAT_V2.into();
+        let files = std::collections::BTreeMap::from([
+            (addon_lock::OVERLAY_FILE.to_string(), b"services: {}\n".to_vec()),
+            ("routes.json".to_string(), routes.as_bytes().to_vec()),
+        ]);
+        l.files = files.iter().map(|(n, b)| (n.clone(), addon_lock::sha256_ref(b))).collect();
+        let (lock, sig) = addon_lock::sign(&l, &seed()).unwrap();
+        crate::addons::lock_fetch::Fetched { lock, sig, files }
+    }
+
+    /// The pin path (`noo addons enable | upgrade`) runs the gateway's own
+    /// routes.json validator (`addon_manifest::validate`) on the verified
+    /// bundle BEFORE an image is pulled or a pin written: `owner_scoped` on a
+    /// GET route is refused with the gateway's sentence and nothing changes.
+    /// A valid manifest still prepares. Reverting the `refuse_bad_routes`
+    /// call in `prepare_from` makes the refused case prepare.
+    #[test]
+    fn prepare_from_refuses_a_routes_json_the_gateway_refuses_before_any_change() {
+        use crate::addons::{self, lock_fetch::Client};
+        let client = Client::new(None);
+        let root = std::env::temp_dir().join(format!("noo-trust-routes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("docker-compose.cluster.yml"), "services:\n  gateway:\n    image: g\n").unwrap();
+        let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &client };
+        let good = include_str!("../../../tests/fixtures/addons/rhaddon/routes.json");
+        let mut m: serde_json::Value = serde_json::from_str(good).unwrap();
+        m["routes"].as_array_mut().unwrap().push(serde_json::json!({
+            "name": "get_v1_workspace", "method": "GET", "path": "/api/rhaddon/v1/workspace", "min_role": "user", "owner_scoped": true
+        }));
+        let bad = m.to_string();
+        let gateway = addon_manifest::validate(&addon_manifest::parse(&bad).unwrap(), "rhaddon", addon_manifest::FrontDoor::NotHere).unwrap_err();
+        assert!(gateway.contains("owner_scoped applies to a public write route") && gateway.contains("get_v1_workspace"), "{gateway}");
+        let mut docker = FakeDocker::default();
+        let r = addons::prepare_from(&ctx, "rhaddon", &anchor(), Some(signed_with_routes(&bad)), &mut docker).expect_err("refused");
+        let why = r.why("rhaddon");
+        assert!(matches!(r, Refusal::Decl(_)) && why.contains(&gateway) && why.contains("nothing was changed"), "{why}");
+        assert!(docker.pulls.is_empty(), "nothing is pulled for a refused bundle: {:?}", docker.pulls);
+        assert!(!addons::pins::pins_path(&root).exists(), "no pins file is written");
+        assert!(!addons::pins::read(&root).unwrap().contains_key("rhaddon"), "nothing is pinned");
+        // The same bundle with a valid manifest prepares (and pulls).
+        let mut docker = FakeDocker::default();
+        addons::prepare_from(&ctx, "rhaddon", &anchor(), Some(signed_with_routes(good)), &mut docker).expect("prepared");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_supplied_lock_with_a_missing_bundle_file_or_plain_http_is_refused() {
         assert!(fetch_supplied("http://example.com/lock.json").unwrap_err().contains("https"));
