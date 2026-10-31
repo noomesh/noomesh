@@ -361,7 +361,7 @@ The agent does not read `noomesh.yaml`; `noo cluster provision` renders
 | `RETRIEVAL_TRACKER_PATH`, `RETRIEVAL_BANDIT_PATH` | compose sets `/data/retrieval_tracker.json`, `/data/retrieval_bandit.json` | retrieval state persisted as JSON on the shared `noo-data` volume, written and read by add-on containers; `RETRIEVAL_TRACKER_FLUSH_*` and `RETRIEVAL_TRACKER_MAX_RECORDS` are add-on-only tuning |
 | `BROWSER_PORT`, `BROWSER_IDLE_TIMEOUT`, `BROWSER_MAX_SESSION`, `BROWSER_URL_ALLOWLIST`, `BROWSER_URL_BLOCKLIST`, `BROWSER_VIEWPORT_WIDTH`, `BROWSER_VIEWPORT_HEIGHT` | — | the browser tool |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `GOOGLE_API_KEY`, `CLOUD_DEFAULT_PROVIDER` | — | cloud providers (needs `CLOUD_PROVIDERS_ENABLED`); **keys = secret store** |
-| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_INSECURE` | — | tracing export |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | — | tracing export (Python services). Always TLS, verified against the cluster CA (`NOO_TLS_CA` or the usual CA paths); an `http://` endpoint or no CA skips tracing with a warning. There is no plaintext switch |
 | `NOO_PLUGIN_DIR` | `~/.noo/plugins` | plugin discovery |
 | `NOO_SKILLS_DIR`, `NOO_SKILLS_HOST_DIR` | `~/.noo/skills` | skill registry |
 | `NOO_HOST_SPOOL_DIR`, `NOO_DATA_DIR`, `NOO_DATA_ROOT`, `NOO_PKI_DIR` | — | paths |
