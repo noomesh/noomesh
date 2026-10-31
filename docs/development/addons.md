@@ -168,7 +168,11 @@ add-on is registered when all three hold:
    (`NOO_ADDONS_VERIFIED`).
 
 An add-on that fails 2 or 3 is **refused, never silently skipped**: no routes,
-`/health` reads `addons.<name>: "unhealthy"`, and the log says why. A missing
+`/health` reads `addons.<name>: "unhealthy"`, the authenticated `/health`
+carries the reason in `addons_refused.<name>` (`{}` when nothing is refused),
+and the log says why. `noo cluster verify --controller` reads it: a `gateway
+add-on` row per add-on noomesh.yaml switches on fails naming the refusal, and
+warns (never passes) when the gateway is too old to report the field. A missing
 lock reads: "add-on `<name>` is enabled in noomesh.yaml but has no verified lock
 for this stack ... Run `noo addons upgrade <name>`". A lock verified for another
 stack is refused the same way, naming both stacks.
