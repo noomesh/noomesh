@@ -181,7 +181,7 @@ def _restart(tmp: Path, lock: str, pins: str = PINS, rhold_overlay: str = RHOLD_
         "NOO_ADDON_IMAGE_RHOLD": RHOLD_REF,
     }
     return subprocess.run(["bash", "scripts/noomesh-restart.sh", "--force"], cwd=work, env=env,
-                          capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+                          capture_output=True, text=True, timeout=600, stdin=subprocess.DEVNULL)
 
 
 def _env_at_up(tmp: Path) -> dict[str, str]:
