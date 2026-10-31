@@ -44,6 +44,7 @@ pub(crate) mod memory;
 mod monitoring;
 mod grafana_ds;
 mod logs_ingest;
+mod traces_ingest;
 pub mod logs_search;
 mod other;
 pub mod peers;

@@ -119,6 +119,9 @@ pub const NODE_ROUTES: &[(&str, &str)] = &[
     // and nothing else's; the handler overwrites the `node` label with
     // `{self}` (routes/logs_ingest.rs).
     ("POST", "/api/cluster/nodes/{self}/logs"),
+    // Span ingest (i359 C2): a node sends its own spans; the handler stamps
+    // the resource with `{self}` (routes/traces_ingest.rs).
+    ("POST", "/api/cluster/nodes/{self}/traces"),
     ("GET", "/api/cluster/nodes/{self}/desired-config"),
     // External MCP discovery report: only for a
     // server placed on this node, which the handler checks.

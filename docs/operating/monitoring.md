@@ -937,6 +937,18 @@ the same OTLP/HTTP JSON the gateway does), so no `OTEL_*` variable changes
 where spans go: only `NOO_TEMPO_OTLP_URL`, `https://` only, the cluster CA,
 the container's own leaf, or no export.
 
+**Node hops.** A node's inference proxy continues the gateway's
+`traceparent` with one span (`agent inference <backend>`) from picking the
+backend, through waiting for a slot, to the end of the relayed answer, a
+stream included, and passes its own span on to the local backend. A call with
+no valid `traceparent` makes no span: a node never starts a trace. Tempo is
+on the controller only, so the agent sends its spans to the gateway
+(`POST /api/cluster/nodes/{id}/traces`, its cluster credential, https only),
+which stamps them with the verified node and relays them; a refused or failed
+batch is dropped on the node, not retried (traces are best effort). Refusals
+and dropped spans are counted per node (`noo_traces_ingest_refused_total`,
+`noo_traces_ingest_dropped_spans_total`).
+
 **Reading them.** `GET /api/traces/requests` lists recent requests (filter by
 route, model, node, actor, status, duration); `GET /api/traces/summary`
 groups the window by route, model, node, backend or actor with request and

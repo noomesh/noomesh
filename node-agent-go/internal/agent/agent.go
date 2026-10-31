@@ -41,6 +41,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/metrics"
 	"github.com/noomesh/noomesh/node-agent-go/internal/occupancy"
 	"github.com/noomesh/noomesh/node-agent-go/internal/reconcile"
+	"github.com/noomesh/noomesh/node-agent-go/internal/tracing"
 	"github.com/noomesh/noomesh/node-agent-go/internal/tunnel"
 )
 
@@ -414,6 +415,7 @@ func (a *Agent) Run() error {
 	// controller answers the route, so an agent rolled before its gateway
 	// idles harmlessly. The heartbeat carries its state either way.
 	a.startLogShip(ctx)
+	a.startSpanExport(ctx)
 
 	// 5. Wait for shutdown signal
 	select {
@@ -733,6 +735,25 @@ func backendAnswers(ctx context.Context, client *http.Client, base string) bool 
 		return true
 	}
 	return false
+}
+
+// startSpanExport sends this node's spans (the requests its inference proxy
+// served, continuing the gateway's traces) to the gateway's node span route
+// (i359 C2), with the same client and credential as log shipping. A
+// plaintext controller URL refuses it, said once.
+func (a *Agent) startSpanExport(ctx context.Context) {
+	e, err := tracing.NewExporter(a.cfg.ControllerURL, a.cfg.NodeID, a.http, func(req *http.Request) error {
+		if a.cfg.ClusterSecret != "" {
+			return auth.SetClusterAuth(req, a.cfg.NodeID, a.cfg.ClusterSecret)
+		}
+		return nil
+	})
+	if err != nil {
+		slog.Warn("span export not started", "error", err)
+		return
+	}
+	tracing.SetDefault(e)
+	go e.Run(ctx)
 }
 
 // startLogShip wires the shipper's sources for this platform and starts
