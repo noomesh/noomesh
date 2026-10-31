@@ -635,10 +635,10 @@ pub fn build_table(nodes: &[NodeFacts], placements: &[PlacementRow], decl: &Decl
             if !INFERENCE_TYPES.contains(&bt.as_str()) || m.is_empty() {
                 continue;
             }
-            if n.non_chat.iter().any(|b| b == bt) || n.model_missing.iter().any(|b| b == bt) || n.paused_backends.iter().any(|b| b == bt) {
+            if n.non_chat.iter().any(|b| b == bt) || n.model_missing.iter().any(|b| b == bt) {
                 continue;
             }
-            if lane_held(&n.node_id, bt) {
+            if backend_held(&n.node_id, &n.paused_backends, bt) {
                 continue;
             }
             let Some(chat_model) = chat_model_for(n, placements, bt, m) else { continue };
@@ -1159,6 +1159,22 @@ pub fn lane_held(node_id: &str, backend: &str) -> bool {
         .is_some_and(|g| g.get(node_id).is_some_and(|v| v.iter().any(|b| b == backend)))
 }
 
+/// The lanes a node's heartbeat says it yielded (`gpu_contention.paused_backends`).
+/// Read defensively: an older agent sends no `gpu_contention` (= none).
+pub fn paused_backends_of(data: &Value) -> Vec<String> {
+    data.pointer("/gpu_contention/paused_backends")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+/// Is this lane out of routing because of a GPU hold: the heartbeat lists it
+/// as paused, or the gateway's own mark says so ([`lane_held`])? The ONE
+/// definition of "held", used by the class table and by the pinned-model scan.
+pub fn backend_held(node_id: &str, paused_backends: &[String], backend: &str) -> bool {
+    paused_backends.iter().any(|b| b == backend) || lane_held(node_id, backend)
+}
+
 // ── stall memory ─────────────────────────────────────────────────────────
 
 /// When each `(node-agent address, backend)` last stalled or timed out. The
@@ -1312,11 +1328,7 @@ pub fn node_facts_from_kv(key: &str, data: &Value, non_chat: &[(String, String)]
             .unwrap_or_default(),
         // Read defensively: an older agent sends no `gpu_contention` (= free).
         gpu_shared: data.pointer("/gpu_contention/state").and_then(Value::as_str) == Some("shared"),
-        paused_backends: data
-            .pointer("/gpu_contention/paused_backends")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-            .unwrap_or_default(),
+        paused_backends: paused_backends_of(data),
         not_serving: data
             .get("backend_containers")
             .and_then(Value::as_object)
@@ -2417,6 +2429,27 @@ mod tests {
         assert_eq!(lanes(&build_table(std::slice::from_ref(&n), &[], &Declarations::default())), ["llamacpp"], "held: only the paused lane is out");
         set_lanes_paused(id, &[]);
         assert_eq!(lanes(&build_table(std::slice::from_ref(&n), &[], &Declarations::default())).len(), 2, "released: both back");
+    }
+
+    /// The pinned-model scan asks the same question as the class table: the
+    /// gateway's mark or the heartbeat's `paused_backends` holds the lane.
+    #[test]
+    fn backend_held_reads_both_the_gateway_mark_and_the_heartbeat() {
+        let id = "backend-held-test";
+        let hb = serde_json::json!({"gpu_contention": {"state": "shared", "paused_backends": ["vllm"]}});
+        let paused = paused_backends_of(&hb);
+        assert_eq!(paused, vec!["vllm"]);
+        assert!(paused_backends_of(&serde_json::json!({})).is_empty(), "an old agent sends none");
+        assert!(backend_held(id, &paused, "vllm"), "the heartbeat says paused");
+        assert!(!backend_held(id, &paused, "llamacpp"), "another lane is untouched");
+        assert!(!backend_held(id, &[], "vllm"), "not held: unchanged");
+        set_lanes_paused(id, &["vllm".to_string()]);
+        assert!(backend_held(id, &[], "vllm"), "the gateway mark alone, heartbeat still listing vLLM");
+        set_lanes_paused(id, &[]);
+        set_node_draining(id, true);
+        assert!(backend_held(id, &[], "llamacpp"), "draining holds every lane");
+        set_node_draining(id, false);
+        assert!(!backend_held(id, &[], "vllm"), "released");
     }
 
     #[test]
