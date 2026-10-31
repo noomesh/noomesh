@@ -716,8 +716,9 @@ mod tests {
 
     /// The pin path (`noo addons enable | upgrade`) runs the gateway's own
     /// routes.json validator (`addon_manifest::validate`) on the verified
-    /// bundle BEFORE an image is pulled or a pin written: `owner_scoped` on a
-    /// GET route is refused with the gateway's sentence and nothing changes.
+    /// bundle BEFORE an image is pulled or a pin written: an unknown role word
+    /// is refused with the gateway's sentence and nothing changes. (The
+    /// 2026-10-31 case, `owner_scoped` on a GET, is legal since f99.)
     /// A valid manifest still prepares. Reverting the `refuse_bad_routes`
     /// call in `prepare_from` makes the refused case prepare.
     #[test]
@@ -732,11 +733,11 @@ mod tests {
         let good = include_str!("../../../tests/fixtures/addons/rhaddon/routes.json");
         let mut m: serde_json::Value = serde_json::from_str(good).unwrap();
         m["routes"].as_array_mut().unwrap().push(serde_json::json!({
-            "name": "get_v1_workspace", "method": "GET", "path": "/api/rhaddon/v1/workspace", "min_role": "user", "owner_scoped": true
+            "name": "get_v1_workspace", "method": "GET", "path": "/api/rhaddon/v1/workspace", "min_role": "everyone"
         }));
         let bad = m.to_string();
         let gateway = addon_manifest::validate(&addon_manifest::parse(&bad).unwrap(), "rhaddon", addon_manifest::FrontDoor::NotHere).unwrap_err();
-        assert!(gateway.contains("owner_scoped applies to a public write route") && gateway.contains("get_v1_workspace"), "{gateway}");
+        assert!(gateway.contains("is not a role") && gateway.contains("get_v1_workspace"), "{gateway}");
         let mut docker = FakeDocker::default();
         let r = addons::prepare_from(&ctx, "rhaddon", &anchor(), Some(signed_with_routes(&bad)), &mut docker).expect_err("refused");
         let why = r.why("rhaddon");

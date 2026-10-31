@@ -349,10 +349,11 @@ impl AddonEntry {
         &self.manifest
     }
 
-    /// Did the manifest declare `delegate: "tasks"`? A declaration alone
+    /// Does the manifest ask to delegate (`delegate: "tasks"`, or a feature
+    /// with `delegate: true`)? A declaration alone
     /// grants nothing: ask [`AddonEntry::operator_enabled`].
     pub fn delegates_tasks(&self) -> bool {
-        self.manifest.delegate.as_deref() == Some(crate::addon_proxy::DELEGATE_TASKS)
+        self.manifest.delegates_tasks()
     }
 
     /// True only when the manifest declares `delegate: "tasks"` AND the
@@ -562,7 +563,7 @@ pub fn build(inp: &Inputs, table_on: &dyn Fn(&str) -> bool) -> Snapshot {
         match verdict {
             Ok(v) => {
                 let enabled = inp.delegation.get(name).is_some_and(|d| d.tasks);
-                if enabled && manifest.delegate.is_none() {
+                if enabled && !manifest.delegates_tasks() {
                     snap.notes.push(format!(
                         "addon_delegation.{name}.tasks is on, but {name}'s manifest does not declare \
                          `delegate: \"tasks\"`, so nothing is delegated"
