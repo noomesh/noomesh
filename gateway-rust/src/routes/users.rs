@@ -1113,6 +1113,14 @@ pub(crate) fn erase_store_tables() -> Vec<&'static str> {
     erase_targets(true, true).iter().map(|t| t.table).collect()
 }
 
+/// The archive (`$1` username, `$2` run id, `$3` store label) and delete
+/// (`$1` username) statements the erase runs for `table`, with its store
+/// label, for a repo test that erases one store against a real table.
+#[allow(dead_code)]
+pub(crate) fn erase_statements(table: &str) -> Option<(String, String, &'static str)> {
+    erase_targets(true, true).iter().find(|t| t.table == table).map(|t| (t.snapshot_sql(), t.delete_sql(), t.label))
+}
+
 #[derive(Deserialize)]
 struct EraseBody {
     /// Default TRUE — an erase call with no body only previews.
@@ -4499,49 +4507,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(staged, 2, "archived like every other store");
-    }
-
-    /// RTBF for request traces against the real table: alice's rows go,
-    /// her connection login's included (`alice/laptop`, which used to keep
-    /// its rows); bob's, `alice_x`'s and an internal caller's stay.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rtbf_erases_a_users_request_traces_including_her_connection_logins() {
-        let _serial = crate::ops::tests::DB_LOCK.lock().await;
-        let Some(db) = crate::ops::tests::scratch("rtbf_traces").await else { return };
-        use crate::auth::Role;
-        for who in ["alice", "bob", "alice_x"] {
-            let _ = crate::ops::tests::account(&db, who, Role::User).await;
-        }
-        let row = |actor: &str, kind: &str| crate::request_trace::SummaryRow {
-            trace_id: format!("{:032x}", actor.len()),
-            method: "POST".into(),
-            route: "/v1/chat/completions".into(),
-            status: 200,
-            duration_ms: 1,
-            summary: crate::request_trace::Summary {
-                actor: Some(actor.into()),
-                actor_kind: Some(kind.into()),
-                ..Default::default()
-            },
-            span_count: 1,
-            request_bytes: None,
-            response_bytes: None,
-        };
-        for (actor, kind) in [("alice", "user"), ("alice/laptop", "user"), ("bob", "user"), ("alice_x", "user"), ("internal:cluster:worker", "internal")] {
-            crate::repo::request_trace::insert(&db, &row(actor, kind)).await.unwrap();
-        }
-        let resolved: Option<uuid::Uuid> = sqlx::query_scalar("SELECT user_uuid FROM noo_request_trace WHERE actor = 'alice/laptop'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
-        assert!(resolved.is_some(), "a connection login's row carries its account's user_uuid");
-        let run = uuid::Uuid::new_v4();
-        for t in super::erase_targets(true, true).iter().filter(|t| t.table == "noo_request_trace") {
-            sqlx::query(sqlx::AssertSqlSafe(&*t.snapshot_sql())).bind("alice").bind(run).bind(t.label).execute(&db).await.unwrap();
-            sqlx::query(sqlx::AssertSqlSafe(&*t.delete_sql())).bind("alice").execute(&db).await.unwrap();
-        }
-        let left: Vec<String> = sqlx::query_scalar("SELECT actor FROM noo_request_trace ORDER BY 1").fetch_all(&db).await.unwrap();
-        assert_eq!(left, ["alice_x", "bob", "internal:cluster:worker"], "alice's rows are gone, her connection's too, nobody else's");
     }
 
     /// RTBF for the thread walks and the setting, against real tables: the
