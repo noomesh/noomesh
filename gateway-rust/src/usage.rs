@@ -127,6 +127,8 @@ pub async fn record_task(db: &sqlx::PgPool, u: &TaskUsage) {
         return;
     }
     let actor = UsageActor::user(u.username.clone(), if u.harness_kind.is_some() { "harness" } else { "task" }).normalised();
+    crate::request_trace::note_usage(u.node_id.as_deref(), &u.backend, &u.model, u.prompt_tokens, u.completion_tokens);
+    let trace_id = crate::request_trace::current_trace_id();
     let node_id = match &u.node_id {
         Some(host) => Some(resolve_node_id(db, host).await),
         None => None,
@@ -139,6 +141,7 @@ pub async fn record_task(db: &sqlx::PgPool, u: &TaskUsage) {
         actor: &actor,
         harness_kind: u.harness_kind.as_deref(),
         task_id: Some(&u.task_id),
+        trace_id: trace_id.as_deref(),
         prompt_tokens: u.prompt_tokens,
         completion_tokens: u.completion_tokens,
     };
@@ -193,6 +196,10 @@ fn spawn_record(
         return;
     }
     let actor = actor.normalised();
+    // Read before the spawn: the request's trace is a task-local and does
+    // not cross it.
+    crate::request_trace::note_usage(node_id.as_deref(), &backend, &model, prompt_tokens, completion_tokens);
+    let trace_id = crate::request_trace::current_trace_id();
     tokio::spawn(async move {
         let node_id = match node_id {
             Some(host) => Some(resolve_node_id(&db, &host).await),
@@ -206,6 +213,7 @@ fn spawn_record(
             actor: &actor,
             harness_kind: harness_kind.as_deref(),
             task_id: None,
+            trace_id: trace_id.as_deref(),
             prompt_tokens,
             completion_tokens,
         };
@@ -528,6 +536,8 @@ struct Row<'a> {
     harness_kind: Option<&'a str>,
     /// The task the tokens were spent on (091); NULL outside a task.
     task_id: Option<&'a str>,
+    /// The request that spent them (104, i359); NULL outside a traced request.
+    trace_id: Option<&'a str>,
     prompt_tokens: u32,
     completion_tokens: u32,
 }
@@ -541,10 +551,10 @@ async fn insert(db: &sqlx::PgPool, row: &Row<'_>) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO noo_token_usage
              (node_id, backend, model, source, user_uuid, consumer,
-              prompt_tokens, completion_tokens, harness_kind, task_id)
+              prompt_tokens, completion_tokens, harness_kind, task_id, trace_id)
          VALUES ($1, $2, $3, $4,
                  (SELECT u.user_uuid FROM noo_users u WHERE u.username = $5),
-                 $6, $7, $8, $9, $10)",
+                 $6, $7, $8, $9, $10, $11)",
     )
     .bind(row.node_id.as_deref())
     .bind(row.backend)
@@ -556,6 +566,7 @@ async fn insert(db: &sqlx::PgPool, row: &Row<'_>) -> Result<(), sqlx::Error> {
     .bind(row.completion_tokens as i32)
     .bind(row.harness_kind)
     .bind(row.task_id)
+    .bind(row.trace_id)
     .execute(db)
     .await
     .map(|_| ())

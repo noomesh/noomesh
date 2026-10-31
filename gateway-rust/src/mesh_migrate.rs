@@ -2200,11 +2200,48 @@ BEGIN
     END IF;
 END $$;
 "#,
+}, Migration {
+    revision: REQUEST_TRACE_REVISION,
+    down_revision: Some(ADDON_ACCESS_REVISION),
+    // Request tracing (i359): one row per request the gateway serves,
+    // metadata and sizes only, never text (`request_trace.rs`). Kept 30 days
+    // by that module's daily prune. `noo_token_usage.trace_id` links a
+    // completion to the request that spent it.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_request_trace (
+    id bigserial PRIMARY KEY,
+    at timestamptz NOT NULL DEFAULT now(),
+    trace_id text NOT NULL,
+    method text NOT NULL,
+    route text NOT NULL,
+    status integer NOT NULL,
+    duration_ms bigint NOT NULL,
+    user_uuid uuid,
+    actor text,
+    actor_kind text,
+    model text,
+    backend text,
+    node_id text,
+    prompt_tokens bigint NOT NULL DEFAULT 0,
+    completion_tokens bigint NOT NULL DEFAULT 0,
+    span_count bigint NOT NULL DEFAULT 1,
+    request_bytes bigint,
+    response_bytes bigint
+);
+CREATE INDEX IF NOT EXISTS noo_request_trace_at_idx ON noo_request_trace (at);
+CREATE INDEX IF NOT EXISTS noo_request_trace_trace_id_idx ON noo_request_trace (trace_id);
+CREATE INDEX IF NOT EXISTS noo_request_trace_route_at_idx ON noo_request_trace (route, at);
+ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS trace_id text
+"#,
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
 /// renumber at rebase is one line.
 pub const ADDON_ACCESS_REVISION: &str = "104_addon_access";
+
+/// Request tracing's summary table and the usage link (i359). A constant
+/// so a renumber at rebase is one line.
+pub const REQUEST_TRACE_REVISION: &str = "105_request_trace";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
@@ -3118,16 +3155,15 @@ mod tests {
         assert!(m.sql.contains("CREATE EXTENSION IF NOT EXISTS pg_stat_statements"));
     }
 
-    /// f99: the add-on access revision is the chain head, sits on 103, and is
+    /// f99: the add-on access revision sits on 103 and is
     /// additive and idempotent: a new table, a defaulted column, the existing
     /// admins as super admins, and the app role's grant.
     #[test]
-    fn addon_access_revision_is_the_head_and_additive() {
+    fn addon_access_revision_is_additive() {
         let m = MIGRATIONS.iter().find(|m| m.revision == ADDON_ACCESS_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "104_addon_access");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(PG_STAT_STATEMENTS_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(ADDON_ACCESS_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_addon_access"));
         assert!(m.sql.contains("ADD COLUMN IF NOT EXISTS super_admin boolean NOT NULL DEFAULT false"));
         assert!(m.sql.contains("SET super_admin = true WHERE role = 'admin'"));
@@ -3138,6 +3174,30 @@ mod tests {
             assert!(m.sql.contains(&format!("    {col} ")), "{col} in the table");
             assert!(repo.contains(col), "{col} in the repository");
         }
+    }
+
+    /// i359: the request-trace revision is the chain head, sits on 104 (f99), is
+    /// idempotent, and creates exactly the columns `request_trace` writes
+    /// and prunes by, plus the usage link `usage` writes.
+    #[test]
+    fn request_trace_revision_is_the_head_and_matches_its_writers() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == REQUEST_TRACE_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "105_request_trace");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(ADDON_ACCESS_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(REQUEST_TRACE_REVISION), "the chain head");
+        assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_request_trace"));
+        assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE"), "no row is rewritten or dropped");
+        let writer = include_str!("request_trace.rs");
+        let insert = writer.split("INSERT INTO noo_request_trace").nth(1).expect("the writer inserts");
+        let cols = insert.split('(').nth(1).and_then(|c| c.split(')').next()).expect("a column list");
+        for col in cols.split(',').map(str::trim) {
+            assert!(m.sql.contains(&format!("\n    {col} ")), "{col} is written but not created");
+        }
+        assert!(writer.contains("DELETE FROM noo_request_trace WHERE at <"), "the prune keys on `at`");
+        assert!(m.sql.contains("\n    at timestamptz NOT NULL DEFAULT now()"));
+        assert!(m.sql.contains("ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS trace_id text"));
+        assert!(include_str!("usage.rs").contains("harness_kind, task_id, trace_id)"));
     }
 
     /// i150: the migration columns sit on the embed-placement revision, all nullable

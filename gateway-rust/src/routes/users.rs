@@ -1088,6 +1088,15 @@ fn erase_targets(keep_account: bool, episodes_have_user_id: bool) -> Vec<EraseTa
         // Raw uploads the user sent (the files go after commit, see
         // `uploads_to_remove`).
         EraseTarget { label: "uploads", table: "noo_uploads", where_sql: "owner = $1" },
+        // Request traces (i359): metadata only, but each row names who made the
+        // request (`actor`, and `user_uuid` resolved from it). Before the account
+        // goes, so the subquery still finds it. The spans in Tempo carry the
+        // same name and age out with Tempo's 30 days.
+        EraseTarget {
+            label: "request_traces",
+            table: "noo_request_trace",
+            where_sql: "actor = $1 OR user_uuid = (SELECT user_uuid FROM noo_users WHERE username = $1)",
+        },
     ];
     if !keep_account {
         t.push(EraseTarget { label: "account", table: "noo_users", where_sql: "username = $1" });
@@ -4404,6 +4413,21 @@ mod tests {
         labels.sort_unstable();
         labels.dedup();
         assert_eq!(labels.len(), t.len());
+    }
+
+    /// Request traces name who made each request: erased with the account and
+    /// when it is kept, by the name AND the resolved account.
+    #[test]
+    fn rtbf_lists_the_request_trace_store() {
+        for keep in [true, false] {
+            let t = super::erase_targets(keep, true);
+            let r = t.iter().position(|x| x.table == "noo_request_trace").expect("noo_request_trace must be an erase target");
+            assert_eq!(t[r].label, "request_traces");
+            assert!(t[r].where_sql.contains("actor = $1") && t[r].where_sql.contains("user_uuid"), "{}", t[r].where_sql);
+            if let Some(a) = t.iter().position(|x| x.table == "noo_users") {
+                assert!(r < a, "the subquery reads the account: erase traces before it");
+            }
+        }
     }
 
     /// Per-account settings (`walks.save_threads`) are an erase target, and

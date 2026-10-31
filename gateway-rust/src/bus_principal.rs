@@ -528,6 +528,9 @@ pub async fn principal_layer(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let principal = from_extensions(request.extensions());
+    if let Some(p) = &principal {
+        crate::request_trace::note_principal(p);
+    }
     match principal {
         Some(p) => with_principal(p, next.run(request)).await,
         None => next.run(request).await,
