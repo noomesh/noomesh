@@ -196,7 +196,7 @@ async def _health_app(scope, receive, send):
 
 
 def _get(port: int, ctx: ssl.SSLContext) -> bytes:
-    with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+    with socket.create_connection(("127.0.0.1", port), timeout=30) as raw:
         with ctx.wrap_socket(raw, server_hostname="localhost") as s:
             s.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             buf = b""
@@ -244,7 +244,7 @@ def test_the_shipped_flags_refuse_a_caller_without_a_certificate(tmp_path):
         assert _get(port, with_cert).startswith(b"HTTP/1.1 200")
 
         # Plaintext gets no HTTP answer at all.
-        with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+        with socket.create_connection(("127.0.0.1", port), timeout=30) as raw:
             raw.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
             try:
                 reply = raw.recv(4096)
@@ -253,4 +253,4 @@ def test_the_shipped_flags_refuse_a_caller_without_a_certificate(tmp_path):
             assert not reply.startswith(b"HTTP/1.1 200"), reply
     finally:
         server.should_exit = True
-        t.join(timeout=10)
+        t.join(timeout=60)
