@@ -386,6 +386,11 @@ pub(crate) fn render_kiosk_service_in(user: &str, mode: Mode, vt: u8, bin: &str)
          ExecStart={bin}/noo-kiosk-launch\n\
          Restart=always\n\
          RestartSec=5\n\
+         # /run/kiosk holds the CDP broker's control socket. systemd makes it\n\
+         # for {user} and removes it with the session; 0755 because the\n\
+         # broker checks each caller itself (SO_PEERCRED).\n\
+         RuntimeDirectory=kiosk\n\
+         RuntimeDirectoryMode=0755\n\
          PAMName=login\n\
          TTYPath=/dev/tty{vt}\n\
          TTYReset=yes\n\
@@ -1148,7 +1153,7 @@ pub fn kiosk_reload(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             g.json,
             ExitCode::Generic,
             "cdp",
-            "the browser is not answering on the debug port, so there is nothing to reload",
+            "the browser is not answering (its broker has published nothing recently), so there is nothing to reload",
             Some("noo kiosk status"),
         );
     }
@@ -1158,8 +1163,11 @@ pub fn kiosk_reload(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if !g.json {
         ui::step("reloading the display");
     }
+    // The broker takes reloads from root, the display user and the seat
+    // user only (SO_PEERCRED), so "refused" above is a who, not a fault.
     if let Err(e) = sh("noo-kiosk-cdp reload") {
-        fail(g.json, ExitCode::Generic, "cdp", &e, Some("journalctl -u kiosk.service -n 50"));
+        fail(g.json, ExitCode::Generic, "cdp", &e,
+            Some("a refusal names the uid: reload as root, the display user or the seat user; anything else is in journalctl -u kiosk.service -n 50"));
     }
 
     // The page needs a moment to come back before it can state anything.
@@ -1383,7 +1391,7 @@ pub fn kiosk_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             ui::bad(&format!("{proxy} — the browser has nothing to talk to"))
         }),
         ("watchdog timer", ui::state(&timer)),
-        ("browser (CDP :9222)", if cdp { ui::good("answering") } else { ui::bad("not answering") }),
+        ("browser (CDP pipe)", if cdp { ui::good("answering") } else { ui::bad("not answering") }),
         ("mint path", mint_path_row(via.as_deref())),
         ("last mint", match minted_at {
             Some(m) if m <= now => format!("{}s ago", now - m),
@@ -2926,7 +2934,7 @@ mod tests {
             !LAUNCH.contains("noo-kiosk-cdp mint"),
             "the launcher mints; the proxy that USES the token should, or expiry is tracked twice"
         );
-        assert!(LAUNCH.contains("--remote-debugging-port=\"$CDP_PORT\""));
+        assert!(LAUNCH.contains("--remote-debugging-pipe"));
         assert!(LAUNCH.contains("kiosk.html?view="));
         // The mint itself is unchanged and still keyless — it just moved.
         assert!(CDP.contains("__nooKioskHeartbeat"));
@@ -2937,33 +2945,43 @@ mod tests {
         );
     }
 
-    /// The debugging port is a full control surface — it reads the token
-    /// out of localStorage and drives the browser. Loopback is the ONLY
-    /// thing bounding it (TCP has no file permissions, so any local user
-    /// qualifies), which makes widening it a silent catastrophe rather
-    /// than a visible one: everything keeps working.
+    /// The browser has NO debugging port (followup 188). A port on loopback
+    /// was a full control surface for any local user: TCP has no file
+    /// modes, so "loopback only" bounded nothing on a shared box. CDP is a
+    /// pipe now, held by the broker that starts the browser.
     ///
     /// Asserted on the flags rather than on behaviour because this cannot
     /// be exercised without a browser, and a test that quietly skips is
-    /// worse than one that reads the launcher.
+    /// worse than one that reads the launcher. The broker itself is
+    /// exercised in tests/test_kiosk_cdp_broker.py.
     #[test]
-    fn the_debugging_port_never_leaves_loopback() {
-        // Stated, not defaulted: Chrome's default is loopback today, and a
-        // default is not a guarantee.
-        assert!(
-            LAUNCH.contains("--remote-debugging-address=127.0.0.1"),
-            "the launcher relies on Chrome's default bind address instead of stating it"
-        );
-        for bad in ["--remote-debugging-address=0.0.0.0", "--remote-debugging-address=::", "--remote-allow-origins=*"] {
+    fn the_browser_has_no_debugging_port() {
+        let launch = own_code(LAUNCH);
+        for gone in ["--remote-debugging-port", "--remote-debugging-address", "--remote-allow-origins", "CDP_PORT"] {
             assert!(
-                !LAUNCH.contains(bad),
-                "{bad} in the launcher: the debugging port would be reachable off this machine, \
-                 and whoever reaches it reads the display's token"
+                !launch.contains(gone),
+                "{gone} in the launcher: a TCP debugging port is back, and any local user can drive the display"
             );
         }
-        // The profile holds the token at rest (localStorage lives in the
-        // user-data-dir), so it must not be world-readable.
-        assert!(LAUNCH.contains("chmod 0700 \"$PROFILE\""), "the profile holding the token is not 0700");
+        assert!(launch.contains("--remote-debugging-pipe"), "the browser has no CDP at all: the watchdog cannot reload it");
+        // The broker must be the browser's PARENT: the pipe is fds 3 and 4,
+        // and only the process that started the browser holds the other end.
+        assert!(
+            launch.contains("cage -- \"$CDP_HELPER\" broker -- \"$BROWSER\""),
+            "the browser is not started by the CDP broker, so nothing holds its pipe"
+        );
+        let cdp = own_code(CDP);
+        for gone in ["9222", "/json/list", "webSocketDebuggerUrl", "NOO_KIOSK_CDP_PORT"] {
+            assert!(!cdp.contains(gone), "noo-kiosk-cdp still speaks to a debugging port ({gone})");
+        }
+        // The control socket lives in the session's RuntimeDirectory, so
+        // it goes when the display does.
+        let u = render_kiosk_service("kiosk", Mode::Dedicated, 1);
+        assert!(u.contains("RuntimeDirectory=kiosk\n"), "{u}");
+        assert!(cdp.contains("SOCK = \"/run/kiosk/cdp.sock\""), "the broker's socket is not in kiosk.service's RuntimeDirectory");
+        // The profile is still the browser's own state, so it is not
+        // world-readable.
+        assert!(LAUNCH.contains("chmod 0700 \"$PROFILE\""), "the browser profile is not 0700");
     }
 
     /// No script may read a stored key any more. If one did, `setup` no
