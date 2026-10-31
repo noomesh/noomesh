@@ -17,7 +17,8 @@
 //!   5. a lock built on a stack image matches that image's row in the
 //!      verified `stack.lock` for `<tag>` (`base_matches`);
 //!   6. not older than the pinned version unless `--allow-downgrade`
-//!      (`is_downgrade`);
+//!      (`version_order`; two different dev builds of one version are unordered,
+//!      and switch on the same stack and key, i358);
 //!   7. pull every image by digest through a throwaway docker config, from
 //!      the route's location (a signed `ghcr.io/…@sha256:…` ref becomes
 //!      `<pull host>/…@sha256:…` on the Proxy route: same bytes, by digest);
@@ -31,7 +32,7 @@
 
 use std::path::Path;
 
-use crate::addon_lock::{self, AddonLockError, TrustAnchor, VerifiedLock};
+use crate::addon_lock::{self, AddonLockError, TrustAnchor, VerifiedLock, VersionOrder};
 use crate::release_fetch::{FetchClass, FetchError};
 
 use super::lock_fetch::{self, Credential, Fetched};
@@ -47,6 +48,10 @@ pub struct Want<'a> {
     pub stack_lock: Option<&'a str>,
     /// The version pinned now, for the downgrade rule.
     pub pinned: Option<&'a str>,
+    /// The pin itself (its stack tag and signing key), for the i358 rule: two
+    /// dev builds of one version switch without `--allow-downgrade` only
+    /// against the same stack and the same key.
+    pub pin: Option<&'a Pin>,
     pub allow_downgrade: bool,
 }
 
@@ -67,6 +72,10 @@ pub enum Refusal {
     BaseRowMissing { image: String, tag: String },
     Base(AddonLockError),
     Downgrade { pinned: String, offered: String },
+    /// Two different `-dev.<hash>` builds of one version (unordered, i358)
+    /// with a condition for switching without `--allow-downgrade` unmet.
+    /// `failed` names it.
+    DevSwitch { pinned: String, offered: String, failed: String },
     Pull(String),
     Write(String),
     /// The encrypted store could not be read (a decrypt failure is never
@@ -129,6 +138,11 @@ impl Refusal {
             Refusal::Downgrade { pinned, offered } => format!(
                 "{addon} {offered} is older than the pinned {pinned}; an add-on may carry database migrations, so this is \
                  refused without --allow-downgrade"
+            ),
+            Refusal::DevSwitch { pinned, offered, failed } => format!(
+                "{addon} {offered} and the pinned {pinned} are two dev builds of one version, which have no order; they \
+                 switch without --allow-downgrade only on the same stack with the same signing key, and {failed}; pass \
+                 --allow-downgrade to switch anyway"
             ),
             Refusal::Pull(e) => format!("{addon}'s images could not be pulled: {e}"),
             Refusal::Write(e) => format!("{addon}'s pin could not be written: {e}"),
@@ -251,12 +265,48 @@ pub fn check(fetched: &Fetched, anchor: &TrustAnchor, want: &Want) -> Result<Ver
             .ok_or_else(|| Refusal::BaseRowMissing { image: base.image.clone(), tag: want.stack_tag.to_string() })?;
         v.lock.base_matches(&row).map_err(Refusal::Base)?;
     }
-    if let Some(p) = want.pinned {
-        if !want.allow_downgrade && addon_lock::is_downgrade(p, &v.lock.version).map_err(Refusal::Lock)? {
-            return Err(Refusal::Downgrade { pinned: p.to_string(), offered: v.lock.version.clone() });
-        }
+    if let Some(line) = downgrade_verdict(want, &v)? {
+        eprintln!("{}", crate::ui::note(&line));
     }
     Ok(v)
+}
+
+/// The downgrade rule, pure: `Ok(None)` for an ordinary upgrade (or any
+/// version under `--allow-downgrade`), `Ok(Some(line))` for the allowed
+/// switch between two dev builds (the line to print), `Err` for a refusal.
+fn downgrade_verdict(want: &Want, v: &VerifiedLock) -> Result<Option<String>, Refusal> {
+    let Some(p) = want.pinned.filter(|_| !want.allow_downgrade) else {
+        return Ok(None);
+    };
+    match addon_lock::version_order(p, &v.lock.version).map_err(Refusal::Lock)? {
+        VersionOrder::Downgrade => Err(Refusal::Downgrade { pinned: p.to_string(), offered: v.lock.version.clone() }),
+        VersionOrder::Unordered => dev_switch(want, p, v).map(Some),
+        VersionOrder::NotDowngrade => Ok(None),
+    }
+}
+
+/// Two dev builds of one version have no order (i358), so the switch is
+/// allowed without `--allow-downgrade` only when the pin is for this stack
+/// and the lock verified against the very key that signed the pin. Returns
+/// the one line that says so, or the condition that failed. Pure.
+fn dev_switch(want: &Want, pinned: &str, v: &VerifiedLock) -> Result<String, Refusal> {
+    let offered = v.lock.version.as_str();
+    let refuse = |failed: String| Refusal::DevSwitch { pinned: pinned.to_string(), offered: offered.to_string(), failed };
+    let pin = want.pin.ok_or_else(|| refuse("the pinned stack and signing key are not known here".to_string()))?;
+    if pin.stack.trim() != want.stack_tag.trim() {
+        return Err(refuse(format!("the pin is for stack {}, and this is stack {}", pin.stack, want.stack_tag)));
+    }
+    match pin.signer.as_deref() {
+        None => Err(refuse(
+            "the pin does not record which key signed it (it predates that), so the same key cannot be shown".to_string(),
+        )),
+        Some(s) if s != v.signer => Err(refuse("this lock is signed by a different key than the pinned one".to_string())),
+        Some(_) => Ok(format!(
+            "{} {offered} replaces {pinned}: a dev suffix is a build hash, not an order, so this is not checked as a \
+             downgrade (same stack, same version, same key)",
+            want.addon
+        )),
+    }
 }
 
 /// Steps 2-6: fetch and check.
@@ -854,7 +904,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_bundle_with_valid_declarations_passes_and_a_bad_one_is_refused_before_any_pin() {
-        let want = Want { addon: "example-addon", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let want = Want { addon: "example-addon", stack_tag: "v0.6.0", stack_lock: None, pinned: None, pin: None, allow_downgrade: false };
         let good = signed_example_bundle(
             &lock("1.0.0", &["v0.6.0"], None),
             &[("system.json", EXAMPLE_SYSTEM.as_bytes()), ("workloads.json", EXAMPLE_WORKLOADS.as_bytes())],
@@ -897,7 +947,7 @@ pub(crate) mod tests {
     }
 
     fn want<'a>(stack_lock: Option<&'a str>, pinned: Option<&'a str>) -> Want<'a> {
-        Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock, pinned, allow_downgrade: false }
+        Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock, pinned, pin: None, allow_downgrade: false }
     }
 
     #[test]
@@ -981,6 +1031,94 @@ pub(crate) mod tests {
         assert!(check(&f, &anchor(), &want(None, Some("1.1.0"))).is_ok(), "the same version is not a downgrade");
     }
 
+    /// A verified lock of `version` signed by the fixture key, and a pin made from it.
+    fn verified_pin(version: &str, stack: &str) -> (VerifiedLock, Pin) {
+        let f = signed(&lock(version, &["v0.6.0"], None));
+        let v = addon_lock::verify(&f.lock, &f.sig, &anchor(), "trellion_intel").unwrap();
+        let pin = Pin::from_verified(&v, stack, &f.lock, None);
+        (v, pin)
+    }
+
+    /// `offered` over a pin of `pinned` (pinned for `stack`, signer `signer`
+    /// when given) through the whole gate: the line a switch prints, or the refusal.
+    fn switch(pinned: &str, offered: &str, stack: &str, signer: Option<&str>) -> Result<Option<String>, Refusal> {
+        let (_, mut pin) = verified_pin(pinned, stack);
+        if let Some(s) = signer {
+            pin.signer = Some(s.to_string());
+        }
+        let f = signed(&lock(offered, &["v0.6.0"], None));
+        // The whole gate, not just the verdict.
+        let w = Want { pin: Some(&pin), ..want(None, Some(pinned)) };
+        let v = check(&f, &anchor(), &w)?;
+        downgrade_verdict(&w, &v)
+    }
+
+    const DEV_A: &str = "0.1.0-dev.29492651a3dc";
+    const DEV_B: &str = "0.1.0-dev.b5a3875db955";
+
+    #[test]
+    fn two_dev_builds_of_one_version_switch_both_ways_with_one_line() {
+        for (pinned, offered) in [(DEV_B, DEV_A), (DEV_A, DEV_B)] {
+            let line = switch(pinned, offered, "v0.6.0", None).expect("accepted without the flag").expect("says so");
+            assert_eq!(
+                line,
+                format!(
+                    "trellion_intel {offered} replaces {pinned}: a dev suffix is a build hash, not an order, so this is \
+                     not checked as a downgrade (same stack, same version, same key)"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn an_all_digit_hash_is_unordered_too_both_ways() {
+        let n = "0.1.0-dev.123456789012";
+        for (pinned, offered) in [(DEV_B, n), (n, DEV_B), (n, "0.1.0-dev.999999999999")] {
+            assert!(switch(pinned, offered, "v0.6.0", None).unwrap().is_some(), "{pinned} -> {offered}");
+        }
+    }
+
+    #[test]
+    fn a_dev_base_downgrade_is_still_refused() {
+        let e = switch("0.1.0-dev.bbbbbbbbbbbb", "0.0.9-dev.aaaaaaaaaaaa", "v0.6.0", None).unwrap_err();
+        assert!(matches!(e, Refusal::Downgrade { .. }), "{e:?}");
+        assert!(e.why("x").contains("--allow-downgrade"));
+    }
+
+    #[test]
+    fn a_dev_switch_across_stacks_or_keys_is_refused_and_says_which() {
+        let e = switch(DEV_B, DEV_A, "v0.5.9", None).unwrap_err();
+        assert!(matches!(e, Refusal::DevSwitch { .. }), "{e:?}");
+        let why = e.why("trellion_intel");
+        assert!(why.contains("the pin is for stack v0.5.9, and this is stack v0.6.0"), "{why}");
+        let e = switch(DEV_B, DEV_A, "v0.6.0", Some("cd".repeat(32).as_str())).unwrap_err();
+        let why = e.why("trellion_intel");
+        assert!(why.contains("signed by a different key than the pinned one"), "{why}");
+        // A pin from before the signer was recorded cannot show the same key.
+        let (_, mut pin) = verified_pin(DEV_B, "v0.6.0");
+        pin.signer = None;
+        let f = signed(&lock(DEV_A, &["v0.6.0"], None));
+        let w = Want { pin: Some(&pin), ..want(None, Some(DEV_B)) };
+        let why = check(&f, &anchor(), &w).unwrap_err().why("trellion_intel");
+        assert!(why.contains("does not record which key signed it"), "{why}");
+        // With the flag, the old behaviour: no questions.
+        let w = Want { allow_downgrade: true, ..w };
+        assert!(check(&f, &anchor(), &w).is_ok());
+    }
+
+    #[test]
+    fn a_release_and_its_own_dev_build_keep_the_semver_answer() {
+        let e = switch("0.1.0", DEV_A, "v0.6.0", None).unwrap_err();
+        assert!(matches!(e, Refusal::Downgrade { .. }), "{e:?}");
+        assert_eq!(switch(DEV_A, "0.1.0", "v0.6.0", None).unwrap(), None, "an upgrade says nothing");
+    }
+
+    #[test]
+    fn an_ordinary_upgrade_prints_no_switch_line() {
+        assert_eq!(switch("1.1.0", "1.2.0", "v0.6.0", None).unwrap(), None);
+        assert_eq!(switch(DEV_A, DEV_A, "v0.6.0", None).unwrap(), None, "re-applying one build");
+    }
+
     #[test]
     fn a_lock_signed_by_another_key_is_refused() {
         let mut a = anchor();
@@ -1025,7 +1163,7 @@ pub(crate) mod tests {
 
     #[test]
     fn pulls_only_what_is_missing_by_digest() {
-        let v = VerifiedLock { lock: lock("1.2.0", &["v0.6.0"], None), key_index: 0, dev_expires_at: None };
+        let v = VerifiedLock { lock: lock("1.2.0", &["v0.6.0"], None), key_index: 0, signer: String::new(), dev_expires_at: None };
         let mut d = FakeDocker::default();
         let cred = Credential { user: "u".into(), token: "t".into() };
         let mut asked = 0;
@@ -1047,7 +1185,7 @@ pub(crate) mod tests {
     fn the_proxy_route_pulls_the_signed_digest_from_the_pull_host() {
         let mut l = lock("1.2.0", &["v0.6.0"], None);
         l.images.insert("trellion-intel-worker".into(), format!("{ROOT}/worker@{}", digest('4')));
-        let v = VerifiedLock { lock: l, key_index: 0, dev_expires_at: None };
+        let v = VerifiedLock { lock: l, key_index: 0, signer: String::new(), dev_expires_at: None };
         let route = lock_fetch::Route::Proxy { root: "addons.noomesh.ai/example/intel".into(), registry: ROOT.into() };
         let mut d = FakeDocker::default();
         let mut asked = 0;

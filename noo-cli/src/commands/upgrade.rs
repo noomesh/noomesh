@@ -3525,7 +3525,7 @@ impl CliAction {
 }
 
 /// `MAJOR.MINOR.PATCH[-pre][+build]` (optional leading `v`) -> comparable parts.
-fn parse_cli_semver(v: &str) -> Option<((u64, u64, u64), Vec<String>)> {
+pub(crate) fn parse_cli_semver(v: &str) -> Option<((u64, u64, u64), Vec<String>)> {
     let v = v.trim().trim_start_matches('v');
     let v = v.split('+').next()?;
     let (core, pre) = match v.split_once('-') {
@@ -4381,7 +4381,7 @@ fn addon_holds(g: &Globals, root: &std::path::Path, target: &str) -> Vec<(String
         .filter_map(|addon| {
             let pinned = pins.get(addon).map(|p| p.version.clone());
             let want = crate::addons::resolve::Want {
-                addon, stack_tag: target, stack_lock: stack_lock.as_deref(), pinned: pinned.as_deref(), allow_downgrade: false,
+                addon, stack_tag: target, stack_lock: stack_lock.as_deref(), pinned: pinned.as_deref(), pin: pins.get(addon), allow_downgrade: false,
             };
             crate::addons::resolve::installed_anchor(addon)
                 .and_then(|a| crate::addons::resolve::fetch_and_check(&client, &a, &want))

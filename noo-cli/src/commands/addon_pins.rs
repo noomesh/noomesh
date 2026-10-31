@@ -147,6 +147,7 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                         stack_tag: &tag,
                         stack_lock: stack_lock.as_deref(),
                         pinned: installed.as_ref().map(|p| p.version.as_str()),
+                        pin: installed.as_ref(),
                         allow_downgrade,
                     };
                     let route = client.route(&anchor).map_err(resolve::Refusal::Route)?;
@@ -580,7 +581,7 @@ mod tests {
         let d = scratch("guard");
         let overlay = format!("{OVERLAY}secrets:\n  stolen:\n    file: ${{NOO_SECRET_RUNDIR:-/x}}/stolen\n    x-noo-source: NOO_JWT_SECRET\n");
         let f = crate::addons::resolve::tests::signed_bundle_with(&lock("1.2.0", &["v0.6.0"], None), &overlay);
-        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, pin: None, allow_downgrade: false };
         let v = resolve::check(&f, &anchor(), &want).unwrap();
         resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0", None).unwrap();
         let reference = v.lock.images["trellion-intel"].clone();
@@ -597,7 +598,7 @@ mod tests {
     fn pinned_root(tag: &str) -> (std::path::PathBuf, String) {
         let d = scratch(tag);
         let f = signed_bundle(&lock("1.2.0", &["v0.6.0"], None));
-        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, pin: None, allow_downgrade: false };
         let v = resolve::check(&f, &anchor(), &want).unwrap();
         resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0", None).unwrap();
         let r = v.lock.images["trellion-intel"].clone();
@@ -616,7 +617,7 @@ mod tests {
                 ("routes.json", EXAMPLE_ROUTES.as_bytes()),
             ],
         );
-        let want = resolve::Want { addon: "example-addon", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let want = resolve::Want { addon: "example-addon", stack_tag: "v0.6.0", stack_lock: None, pinned: None, pin: None, allow_downgrade: false };
         let v = resolve::check(&f, &anchor(), &want).unwrap();
         resolve::record(&d, "example-addon", &v, &f, "v0.6.0", None).unwrap();
         let names = vec!["example-addon".to_string()];
@@ -682,7 +683,7 @@ mod tests {
     fn a_proxy_pin_launches_and_verifies_the_pulled_ref() {
         let d = scratch("proxy-pin");
         let f = signed_bundle(&lock("1.2.0", &["v0.6.0"], None));
-        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, pin: None, allow_downgrade: false };
         let v = resolve::check(&f, &anchor(), &want).unwrap();
         let pull = "addons.noomesh.ai/example/intel";
         resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0", Some(pull.into())).unwrap();
@@ -717,7 +718,7 @@ mod tests {
     fn a_lock_without_a_bundle_is_refused_by_launch_pins_and_verify() {
         let d = scratch("legacy");
         let f = signed(&lock("1.2.0", &["v0.6.0"], None));
-        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, pin: None, allow_downgrade: false };
         let v = resolve::check(&f, &anchor(), &want).unwrap();
         resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0", None).unwrap();
         // An overlay an earlier CLI left in the install root no longer rescues it.
