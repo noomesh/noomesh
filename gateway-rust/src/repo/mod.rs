@@ -78,6 +78,7 @@
 //! exceeds its pin or a new file calls sqlx. Lower a count when you move a
 //! query in; never raise one.
 
+pub mod addon_access;
 pub mod agent_messages;
 pub mod agent_recipients;
 pub mod audit;

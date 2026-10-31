@@ -2168,7 +2168,43 @@ ALTER TABLE noo_embedding_spaces
     // `migration_dsn`). Idempotent. Created in `public` on purpose: the
     // view is read by operators, not by the mesh schema.
     sql: "CREATE EXTENSION IF NOT EXISTS pg_stat_statements SCHEMA public",
+}, Migration {
+    revision: ADDON_ACCESS_REVISION,
+    down_revision: Some(PG_STAT_STATEMENTS_REVISION),
+    // noomesh-internal f99: who may use each add-on feature. One row per
+    // (add-on, feature, subject) set on or off; no row is "inherit". The
+    // decision is `addon_access::decide`. `noo_users.super_admin`: holds
+    // every feature and alone changes a setting that covers an admin.
+    // Every enabled admin becomes a super admin here: today every admin can
+    // already do everything, so nobody gains anything, and the operator
+    // demotes from there. Additive; an older gateway ignores both.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_addon_access (
+    addon    text        NOT NULL,
+    feature  text        NOT NULL,
+    subject  text        NOT NULL,
+    allowed  boolean     NOT NULL,
+    set_by   text        NOT NULL,
+    set_at   timestamptz NOT NULL DEFAULT now(),
+    source   text        NOT NULL,
+    reason   text,
+    PRIMARY KEY (addon, feature, subject),
+    CONSTRAINT noo_addon_access_source_chk CHECK (source IN ('operator', 'accepted_suggestion', 'migrated'))
+);
+ALTER TABLE noo_users ADD COLUMN IF NOT EXISTS super_admin boolean NOT NULL DEFAULT false;
+UPDATE noo_users SET super_admin = true WHERE role = 'admin' AND NOT COALESCE(disabled, false);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'noo_app') THEN
+        GRANT SELECT, INSERT, UPDATE, DELETE ON noo_addon_access TO noo_app;
+    END IF;
+END $$;
+"#,
 }];
+
+/// Add-on feature settings and the super-admin flag (f99). A constant so a
+/// renumber at rebase is one line.
+pub const ADDON_ACCESS_REVISION: &str = "104_addon_access";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
@@ -3072,16 +3108,36 @@ mod tests {
             .contains("(node_id, backend, role, (CASE WHEN role = 'embed' THEN model ELSE '' END))"));
     }
 
-    /// The pg_stat_statements revision is the chain head, sits on 102, and is
-    /// idempotent DDL.
+    /// The pg_stat_statements revision sits on 102 and is idempotent DDL.
     #[test]
-    fn pg_stat_statements_revision_is_the_head_and_idempotent() {
+    fn pg_stat_statements_revision_is_idempotent() {
         let m = MIGRATIONS.iter().find(|m| m.revision == PG_STAT_STATEMENTS_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "103_pg_stat_statements");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(EMBEDDING_SPACE_MIGRATION_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(PG_STAT_STATEMENTS_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE EXTENSION IF NOT EXISTS pg_stat_statements"));
+    }
+
+    /// f99: the add-on access revision is the chain head, sits on 103, and is
+    /// additive and idempotent: a new table, a defaulted column, the existing
+    /// admins as super admins, and the app role's grant.
+    #[test]
+    fn addon_access_revision_is_the_head_and_additive() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == ADDON_ACCESS_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "104_addon_access");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(PG_STAT_STATEMENTS_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(ADDON_ACCESS_REVISION), "the chain head");
+        assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_addon_access"));
+        assert!(m.sql.contains("ADD COLUMN IF NOT EXISTS super_admin boolean NOT NULL DEFAULT false"));
+        assert!(m.sql.contains("SET super_admin = true WHERE role = 'admin'"));
+        assert!(!m.sql.contains("DROP "), "additive only");
+        // The repository's columns are the table's.
+        let repo = include_str!("repo/addon_access.rs");
+        for col in ["addon", "feature", "subject", "allowed", "set_by", "set_at", "source", "reason"] {
+            assert!(m.sql.contains(&format!("    {col} ")), "{col} in the table");
+            assert!(repo.contains(col), "{col} in the repository");
+        }
     }
 
     /// i150: the migration columns sit on the embed-placement revision, all nullable
