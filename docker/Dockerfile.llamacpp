@@ -28,9 +28,22 @@
 # 2026-08-20). Digest-pinned FROMs survive the swap: manifest copies
 # preserve digests.
 ARG DHI_REGISTRY=dhi.io
-FROM ${DHI_REGISTRY}/uv:0-debian13-dev AS builder
+FROM ${DHI_REGISTRY}/uv:0-debian13-dev@sha256:538e03cfb921102dafe5a083a8fb4ee5a7758be4170f32788fac191325b0307d AS builder
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# DHI apt-repo skew (2026-10-31, stack-v0.6.15-rc.1): the base ships
+# libbz2-1.0 / libcrypt1 / libtinfo6 as `+dhiN` builds, while the repo's
+# bzip2 / libcrypt-dev / libncursesw6 were rebuilt as `+deb13u0+dhiN` and
+# depend on the `+deb13u0+` library by exact version, which sorts LOWER, so
+# build-essential (dpkg-dev -> bzip2) is unsolvable. Prefer the `+deb13u0+`
+# builds of those three libraries (priority > 1000 selects the downgrade;
+# apt-get needs --allow-downgrades to take it; a glob version pattern did
+# NOT match, the regex form does, checked against the pinned base).
+# Builder stage only. Remove once DHI republishes matching packages
+# (followup: noomesh-internal 17a, DHI apt skew).
+RUN printf 'Package: libbz2-1.0 libcrypt1 libtinfo6\nPin: version /\\+deb13u0\\+/\nPin-Priority: 1001\n' \
+        > /etc/apt/preferences.d/dhi-deb13u0-skew
+
+RUN apt-get update && apt-get install -y --allow-downgrades --no-install-recommends \
     build-essential cmake git ca-certificates libopenblas-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
@@ -83,7 +96,7 @@ RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF \
  && cmake --build build --config Release -j"$(nproc)" --target llama-server
 
 # ── Runtime ──────────────────────────────────────────────────────────
-FROM ${DHI_REGISTRY}/uv:0-debian13-dev
+FROM ${DHI_REGISTRY}/uv:0-debian13-dev@sha256:538e03cfb921102dafe5a083a8fb4ee5a7758be4170f32788fac191325b0307d
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libopenblas0 libgomp1 curl ca-certificates \
