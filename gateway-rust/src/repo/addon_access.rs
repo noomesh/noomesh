@@ -38,17 +38,19 @@ impl Row {
     }
 }
 
-const COLUMNS: &str = "addon, feature, subject, allowed, set_by, \
-                       to_char(set_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS set_at, source, reason";
 
 /// Every setting, ordered for a stable listing.
 pub async fn list<'e, E>(db: E) -> Result<Vec<Row>, sqlx::Error>
 where
     E: sqlx::PgExecutor<'e>,
 {
-    sqlx::query_as::<_, Row>(&format!("SELECT {COLUMNS} FROM noo_addon_access ORDER BY addon, feature, subject"))
-        .fetch_all(db)
-        .await
+    sqlx::query_as::<_, Row>(
+        "SELECT addon, feature, subject, allowed, set_by, \
+                to_char(set_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS set_at, source, reason \
+         FROM noo_addon_access ORDER BY addon, feature, subject",
+    )
+    .fetch_all(db)
+    .await
 }
 
 /// Set a feature on or off for a subject (insert or replace).

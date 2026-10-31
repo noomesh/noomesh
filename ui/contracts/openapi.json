@@ -20519,6 +20519,201 @@
           }
         }
       }
+    },
+    "/api/addons/{addon}/access": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Add-on access settings",
+        "description": "[native] The add-on's declared features, every on/off setting, stale settings and the super admins (noomesh-internal f99). Operator or above.",
+        "operationId": "addon_access_get",
+        "parameters": [
+          {
+            "name": "addon",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Add-on name."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Set add-on feature access",
+        "description": "[native] Turn one feature on, off or back to inherit for a subject (role:<tier>, team:<name>, user:<account>, key:<consumer>). Admin; a setting that covers an admin is a super admin's, and turning one off needs a reason. Audited (addon_access_set).",
+        "operationId": "addon_access_set",
+        "parameters": [
+          {
+            "name": "addon",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Add-on name."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "feature",
+                  "subject",
+                  "value"
+                ],
+                "properties": {
+                  "feature": {
+                    "type": "string"
+                  },
+                  "subject": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "type": "string",
+                    "enum": [
+                      "on",
+                      "off",
+                      "inherit"
+                    ]
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/security/users/{username}/addon-access": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Add-on access of one account",
+        "description": "[native] Every declared feature of every add-on, on or off for the account, and the setting that decided it. Operator or above.",
+        "operationId": "security_user_addon_access",
+        "parameters": [
+          {
+            "name": "username",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Account name."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/security/users/{username}/super-admin": {
+      "put": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Name or remove a super admin",
+        "description": "[native] A super admin holds every add-on feature and alone changes settings that cover an admin. Only a super admin may call this, re-entering their own password; never an agent or door token; the last super admin cannot be removed. Audited (super_admin_set).",
+        "operationId": "security_user_super_admin",
+        "parameters": [
+          {
+            "name": "username",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Account name."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "on",
+                  "reason",
+                  "password"
+                ],
+                "properties": {
+                  "on": {
+                    "type": "boolean"
+                  },
+                  "reason": {
+                    "type": "string"
+                  },
+                  "password": {
+                    "type": "string",
+                    "format": "password"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
