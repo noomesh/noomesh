@@ -80,7 +80,7 @@ pub(crate) const STEPS: [&str; 12] = [
 ];
 
 /// Compose volumes of the state set that live under NOO_STATE_ROOT.
-const STATE_COPIES: [&str; 7] = ["postgres", "redis", "nats", "prometheus", "grafana", "loki", "noo-data"];
+const STATE_COPIES: [&str; 8] = ["postgres", "redis", "nats", "prometheus", "grafana", "loki", "tempo", "noo-data"];
 /// Plain docker volumes that join the state set at migration (suffix match),
 /// with the compose switch variable and the bind volume it selects.
 const DOCKER_COPIES: [(&str, &str, &str); 2] = [

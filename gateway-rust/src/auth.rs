@@ -2832,7 +2832,7 @@ fn scope_allows_for(scopes: &[String], role: Role, account: Option<&str>, method
     if role >= Role::Operator {
         return true;
     }
-    if METRICS_READ_PATHS.contains(&path) || path.starts_with(LOGS_READ_PREFIX) {
+    if METRICS_READ_PATHS.contains(&path) || path.starts_with(LOGS_READ_PREFIX) || path.starts_with(TRACES_READ_PREFIX) {
         return false;
     }
     if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
@@ -3078,6 +3078,11 @@ pub const METRICS_READ_PATHS: &[&str] = &[
 /// GET; until 2026-09-28 that meant any signed-in user could run LogQL
 /// against Loki. A prefix, so a log route added later is closed by default.
 pub const LOGS_READ_PREFIX: &str = "/api/logs/";
+
+/// Request-trace READS (i359): Operator and Admin only, like logs. A trace
+/// names who made each request and which routes they used, across every
+/// account. A prefix, so a trace route added later is closed by default.
+pub const TRACES_READ_PREFIX: &str = "/api/traces/";
 
 /// The one service leaf that may read `/metrics` by certificate alone:
 /// `noo security pki issue-service prometheus` (CN=prometheus,
@@ -4759,6 +4764,12 @@ mod tests {
         }
         let addon = claims_with(&["metrics", "temporal", "heartbeat"]);
         assert!(!scope_allows(&addon, &Method::GET, "/api/logs/query"), "no add-on scope reads logs");
+        // Request traces (i359) are the same kind of read: every account's routes.
+        for path in ["/api/traces/status", "/api/traces/requests"] {
+            assert!(!scope_allows(&user, &Method::GET, path), "user tier must not read {path}");
+            assert!(!scope_allows(&addon, &Method::GET, path), "no add-on scope reads {path}");
+            assert!(scope_allows(&operator, &Method::GET, path), "operator reads {path}");
+        }
         // The logs gate is a directory prefix, not a stem. (A User tier no longer
         // reads /api/logsomething for another reason: its GETs are an allow-list.)
         assert!(!"/api/logsomething".starts_with(LOGS_READ_PREFIX), "the prefix is a directory, not a stem");

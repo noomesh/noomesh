@@ -54,6 +54,7 @@ THIRD_PARTY: dict[str, dict[str, str]] = {
     "nginx": {"compose": "nginx", "repo": "docker.io/library/nginx", "ver": _VER},
     "redis": {"compose": _BASE + "/redis", "repo": DHI + "/redis", "ver": _VER},
     "loki": {"compose": _BASE + "/loki", "repo": DHI + "/loki", "ver": _VER},
+    "tempo": {"compose": _BASE + "/tempo", "repo": DHI + "/tempo", "ver": _VER},
     "prometheus": {"compose": _BASE + "/prometheus", "repo": DHI + "/prometheus", "ver": _VER},
     "alertmanager": {"compose": _BASE + "/alertmanager", "repo": DHI + "/alertmanager", "ver": _VER},
     "grafana": {"compose": _BASE + "/grafana", "repo": DHI + "/grafana", "ver": _VER},

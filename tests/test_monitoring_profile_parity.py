@@ -45,6 +45,7 @@ MANUAL = ROOT / "docs" / "operating" / "operator-manual.md"
 # The set the operator called "part of the product, not an opt-in".
 MONITORING = {
     "loki",
+    "tempo",
     "prometheus",
     "alertmanager",
     "grafana",

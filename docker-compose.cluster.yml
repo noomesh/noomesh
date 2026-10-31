@@ -704,6 +704,13 @@ services:
       # configured" on every install. tests/test_loki_wiring_parity.py pins
       # the name to the reader.
       - NOO_LOKI_URL=${NOO_LOKI_URL:-https://loki:3100}
+      # Request tracing (i359): the gateway sends its request spans to
+      # Tempo's OTLP HTTP receiver with its own leaf (request_trace.rs). The
+      # per-request summary goes to Postgres either way.
+      - NOO_TEMPO_OTLP_URL=${NOO_TEMPO_OTLP_URL:-https://tempo:4318}
+      # Tempo's query API: the `tempo` verify row's /ready probe and Grafana's
+      # Tempo data source (/api/grafana-ds/tempo), both with the gateway leaf.
+      - NOO_TEMPO_URL=${NOO_TEMPO_URL:-https://tempo:3200}
       # Python sandbox — isolated code execution (internal Docker network),
       # mTLS: the gateway presents its own leaf (tls::cluster_client).
       - NOO_SANDBOX_URL=${NOO_SANDBOX_URL:-https://sandbox:9000}
@@ -2567,6 +2574,36 @@ services:
     healthcheck:
       disable: true
 
+  # Tempo, the request-trace store (i359). The gateway sends a span per
+  # request; Grafana reads them through the gateway's datasource proxy;
+  # the per-request summary an agent queries lives in Postgres
+  # (noo_request_trace), not here. Same monitoring set, same profiles.
+  tempo:
+    logging: *default-logging
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/tempo:2${NOO_IMAGE_DIGEST_TEMPO:-@sha256:5352e76f3c4e531babc76fc29958cfa3286096d2ca0bbf3b46007e46c0249a85}
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-tempo
+    profiles: ["monitoring", "controller", "standalone"]
+    # No external port: the gateway is the only thing that reaches Tempo,
+    # over the Docker network, on 4318 (OTLP HTTP) and 3200 (query API),
+    # both requiring a cluster-CA client certificate.
+    environment:
+      # How long Tempo keeps traces: 30 days, the operator's choice (i359).
+      - NOO_TEMPO_RETENTION=${NOO_TEMPO_RETENTION:-720h}
+    volumes:
+      - ./monitoring/tempo/tempo.yml:/etc/tempo/tempo.yml:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/tempo:/tls/services/tempo:ro
+      - tempo-data:/var/tempo
+    command: ["-config.file=/etc/tempo/tempo.yml", "-config.expand-env=true"]
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    # Distroless and mTLS-only, like Loki: no shell and no probe that can
+    # present a client certificate. Health is the `tempo` row of
+    # `noo cluster verify --controller`, through the gateway.
+    healthcheck:
+      disable: true
+
   # No log shipper here since fleet logging phase 4 (2026-09-28). promtail
   # and its read-only docker-socket-proxy used to sit here and stream every
   # container's stdout through the Docker API. The controller's container
@@ -3409,6 +3446,12 @@ volumes:
       type: none
       o: bind
       device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/loki
+  tempo-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/tempo
   postgres-data:
     # PostgreSQL needs POSIX ownership/permissions (chmod/chown).
     # On Linux/macOS NOO_PG_DATA == NOO_STATE_ROOT/postgres (NOO_STATE_ROOT

@@ -39,6 +39,8 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         // ── Logs: Native Rust (HTTP proxy to Loki / node-agents) ──
         .route("/api/logs/status", get(logs_status))
+        // Request tracing (i359): is Tempo there and ready?
+        .route("/api/traces/status", get(traces_status))
         .route("/api/logs/query", get(logs_query))
         .route("/api/logs/containers", get(logs_containers))
         .route("/api/logs/docker-stats", get(logs_docker_stats))
@@ -199,6 +201,55 @@ async fn logs_status(State(state): State<Arc<AppState>>) -> AppJson {
         "node_registry_available": node_registry_available,
     }))
 }
+
+/// Request-trace status (i359): where the gateway sends spans, and whether
+/// Tempo's query API answers `/ready` to the gateway's leaf. The `tempo` row
+/// of `noo cluster verify --controller` reads this.
+async fn traces_status() -> AppJson {
+    let otlp_url = std::env::var(crate::request_trace::TEMPO_URL_ENV).unwrap_or_default();
+    let tempo_url = std::env::var(TEMPO_QUERY_URL_ENV).unwrap_or_default();
+    let exporting = matches!(crate::request_trace::tempo_traces_url(&otlp_url), Ok(Some(_)));
+    let mut ready = false;
+    let mut detail: Option<String> = None;
+    if !tempo_url.trim().is_empty() {
+        let probe = crate::tls::cluster_client()
+            .get(format!("{}/ready", tempo_url.trim().trim_end_matches('/')))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await;
+        match probe {
+            Ok(r) if r.status().is_success() => ready = true,
+            Ok(r) => {
+                let status = r.status().as_u16();
+                let body: String = r.text().await.unwrap_or_default().trim().chars().take(200).collect();
+                detail = Some(loki_ready_detail(Some(status), &body));
+            }
+            Err(e) => {
+                let mut chain = e.to_string();
+                let mut src = std::error::Error::source(&e);
+                while let Some(x) = src {
+                    chain.push_str(": ");
+                    chain.push_str(&x.to_string());
+                    src = x.source();
+                }
+                detail = Some(loki_ready_detail(None, &chain));
+            }
+        }
+    }
+    Json(json!({
+        "tempo_otlp_url": otlp_url,
+        "exporting": exporting,
+        "tempo_url": tempo_url,
+        "tempo_configured": !tempo_url.trim().is_empty(),
+        "tempo_ready": ready,
+        "tempo_ready_detail": detail,
+        "retention_days": crate::request_trace::RETENTION_DAYS,
+    }))
+}
+
+/// Tempo's query API base (`https://tempo:3200`): the readiness probe and the
+/// Grafana datasource proxy. Empty means no Tempo on this controller.
+pub(crate) const TEMPO_QUERY_URL_ENV: &str = "NOO_TEMPO_URL";
 
 /// One line for a `/ready` miss: `status` + Loki's body, or the transport
 /// error when nothing answered. Bounded; never a credential (Loki's ready

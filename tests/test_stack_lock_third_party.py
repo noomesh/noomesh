@@ -115,7 +115,7 @@ def test_no_third_party_service_runs_an_unpinned_latest():
 
 # ── every runtime third-party image is a lock row (image-pin) ──────────────
 
-RUNTIME = {"nats", "nginx", "redis", "loki", "prometheus", "alertmanager", "grafana",
+RUNTIME = {"nats", "nginx", "redis", "loki", "tempo", "prometheus", "alertmanager", "grafana",
            "node-exporter", "tei", "tei-cpu", "vllm"}
 
 

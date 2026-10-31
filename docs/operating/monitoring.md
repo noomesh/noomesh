@@ -373,8 +373,9 @@ log line under that reference.
 
 ## Grafana
 
-Provisioning lives in `configs/grafana/`: two datasources
-(`prometheus.yml` over HTTPS with the PKI client cert, `loki.yml`), the
+Provisioning lives in `configs/grafana/`: three datasources
+(`prometheus.yml` over HTTPS with the PKI client cert, `loki.yml`,
+`tempo.yml` for request traces, operators only), the
 dashboard provider (`dashboards/dashboard.yml`, refreshed from disk every
 10 seconds, UI edits allowed) and one dashboard,
 `dashboards/cluster-overview.json` ("PAI Cluster Overview", 30-second
@@ -916,6 +917,20 @@ the database falls behind, rows are dropped and counted
 (`noo_request_trace_rows_dropped_total`), never queued without bound.
 
 Not traced: `/health`, `/metrics`, `/static/` and the node log push.
+
+**Tempo** (`noo-tempo`, the DHI image, uid 65532) runs in the same profiles
+as Loki, with no published port. Both its doors require a cluster client
+certificate: the OTLP HTTP receiver on 4318 (the gateway's spans,
+`NOO_TEMPO_OTLP_URL`) and the query API on 3200 (`NOO_TEMPO_URL`), which
+Grafana's Tempo data source reaches only through the gateway
+(`/api/grafana-ds/tempo`, operators and admins). Its internal gRPC is bound
+to loopback and its usage reporting is off. It keeps `NOO_TEMPO_RETENTION`
+(default `720h`) under `$NOO_STATE_ROOT/tempo`. `noo cluster verify
+--controller` carries three rows: `tempo` (the gateway exports and Tempo
+answers `/ready` to the gateway's leaf; `GET /api/traces/status`), `tempo
+listener` (both doors require a client certificate, gRPC on loopback, usage
+reporting off, no published port) and `tempo at rest`. Every
+`/api/traces/*` route is Operator/Admin only.
 
 ## Health endpoints
 

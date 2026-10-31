@@ -1135,7 +1135,7 @@ mod recreate_set_tests {
     fn every_controller_profile_service_is_recreated_by_onboard() {
         let projected = compose_services_with_profile("controller");
         assert!(projected.len() >= 10, "parsed only {} controller-profile services out of the compose file — the line scan broke", projected.len());
-        for must in ["loki", "prometheus", "alertmanager", "grafana", "node-exporter", "gateway", "postgres"] {
+        for must in ["loki", "tempo", "prometheus", "alertmanager", "grafana", "node-exporter", "gateway", "postgres"] {
             assert!(projected.iter().any(|s| s == must), "{must} is no longer in the controller profile");
         }
         let set = recreate_set(&projected, true);
@@ -1147,7 +1147,7 @@ mod recreate_set_tests {
         }
         for svc in HOST_OWNED_SERVICES.iter().chain(GPU_ONLY_SERVICES) {
             assert!(
-                !["loki", "prometheus", "alertmanager", "grafana", "node-exporter"].contains(svc),
+                !["loki", "tempo", "prometheus", "alertmanager", "grafana", "node-exporter"].contains(svc),
                 "{svc} is a monitoring service; it may not be excluded from what onboard recreates"
             );
         }

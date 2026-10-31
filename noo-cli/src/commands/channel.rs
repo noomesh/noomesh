@@ -242,7 +242,7 @@ pub(crate) fn migrate_legacy_base_registry(g: &Globals, check_only: bool) {
         return;
     };
     let line = format!(
-        "NOO_BASE_REGISTRY {} -> {}: the public channel's runtime images (redis, loki, prometheus, alertmanager, grafana, node-exporter) are the DHI mirrors; 0.6.0/0.6.1 wrote the upstream-mirror path",
+        "NOO_BASE_REGISTRY {} -> {}: the public channel's runtime images (redis, loki, prometheus, alertmanager, grafana, node-exporter, tempo) are the DHI mirrors; 0.6.0/0.6.1 wrote the upstream-mirror path",
         change.old, change.new);
     if check_only {
         if !g.json {

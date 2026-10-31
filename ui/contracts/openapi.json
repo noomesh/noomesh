@@ -20714,6 +20714,52 @@
           }
         }
       }
+    },
+    "/api/grafana-ds/tempo/{*path}": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get tempo",
+        "description": "[native] `GET /api/grafana-ds/tempo/{*path}` \u2014 Grafana's Tempo data source (i359), through the gateway. Grafana's service leaf only. Shaped as Tempo's read API (`api/search`, `api/v2/traces/<id>`, tag values): an operator or admin gets it; a read-only account, and Grafana with no user, get nothing, since a trace names who made each request. Never the OTLP push.",
+        "operationId": "tempo",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/traces/status": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get status",
+        "description": "[native] Request-trace status (i359): where the gateway sends spans, and whether Tempo's query API answers `/ready` to the gateway's leaf. The `tempo` row of `noo cluster verify --controller` reads this.",
+        "operationId": "traces_status",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
