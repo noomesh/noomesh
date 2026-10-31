@@ -1144,7 +1144,7 @@ services:
   # Redis (controller node only)
   redis:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/redis:8.6-debian13-dev${NOO_IMAGE_DIGEST_REDIS:-}
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/redis:8.6-debian13-dev${NOO_IMAGE_DIGEST_REDIS:-@sha256:d9903f6fbf1e690837d1e1edc6716a7b399385b3b2cbf3301af06fb8a6168034}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-redis
     profiles: ["controller", "standalone"]
     # NOT root (i64, operator 2026-10-15). The -dev image's USER is 0; it
@@ -1247,7 +1247,7 @@ services:
   # vLLM backend
   vllm:
     logging: *default-logging
-    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-}}
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-@sha256:fc56161ee42a011aeee78b65d0a81b6683c7d04402fd40503d14d4d6c98f07cb}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-vllm
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
     # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
@@ -1410,7 +1410,7 @@ services:
   #   VLLM2_MODEL=Qwen/Qwen3-4B
   vllm-secondary:
     logging: *default-logging
-    image: ${VLLM2_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-}}
+    image: ${VLLM2_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-@sha256:fc56161ee42a011aeee78b65d0a81b6683c7d04402fd40503d14d4d6c98f07cb}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-vllm-secondary
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
     # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
@@ -1987,7 +1987,7 @@ services:
   # PAGEINDEX_EMBEDDING_URL at it explicitly to use it.
   tei:
     logging: *default-logging
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.6${NOO_IMAGE_DIGEST_TEI_CPU:-}
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.6${NOO_IMAGE_DIGEST_TEI_CPU:-@sha256:66db77d7856c9319bbfaf2c5b80a6d0e0ac9ff128ade09eaca1d9c20213617a4}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-tei
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
     # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
@@ -2019,7 +2019,7 @@ services:
   # Use this on nodes with a GPU for faster embedding throughput.
   tei-gpu:
     logging: *default-logging
-    image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-}
+    image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-@sha256:25e35b0b266241a543c5ee305083eced4b6ac0772eb969c3fdaae2d4c2ef7266}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-tei-gpu
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
     # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
@@ -2153,7 +2153,7 @@ services:
   # opt-in `tei-compose` profile; removing them is separate cleanup.
   reranker:
     logging: *default-logging
-    image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-}
+    image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-@sha256:25e35b0b266241a543c5ee305083eced4b6ac0772eb969c3fdaae2d4c2ef7266}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-reranker
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
     # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
@@ -2493,7 +2493,7 @@ services:
   # `controller` service onto `standalone` too.
   loki:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/loki:3${NOO_IMAGE_DIGEST_LOKI:-}
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/loki:3${NOO_IMAGE_DIGEST_LOKI:-@sha256:5f04dd8068afa17dd4da0fe1e88f56011d21a67dc1065b03c5de557971c7fa05}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-loki
     profiles: ["monitoring", "controller", "standalone"]
     # No external port — the gateway reaches Loki over the Docker network
@@ -2542,7 +2542,7 @@ services:
   # Prometheus (every controller, standalone included)
   prometheus:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/prometheus:3${NOO_IMAGE_DIGEST_PROMETHEUS:-}
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/prometheus:3${NOO_IMAGE_DIGEST_PROMETHEUS:-@sha256:6a5aea3fc3a33fea84bb4ea7925228f8eb67884893970a768603d350e1830489}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-prometheus
     profiles: ["monitoring", "controller", "standalone"]
     ports:
@@ -2584,7 +2584,7 @@ services:
   # registry (mirrors the dhi.io/prometheus:3 convention).
   alertmanager:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/alertmanager:0${NOO_IMAGE_DIGEST_ALERTMANAGER:-}
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/alertmanager:0${NOO_IMAGE_DIGEST_ALERTMANAGER:-@sha256:01dd89cce4737ec7e44704681b5d6ee561e9b7880f632b4413b0e547e4dabfda}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-alertmanager
     profiles: ["monitoring", "controller", "standalone"]
     ports:
@@ -2622,7 +2622,7 @@ services:
   # Grafana (every controller, standalone included)
   grafana:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/grafana:12-debian13-dev${NOO_IMAGE_DIGEST_GRAFANA:-}
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/grafana:12-debian13-dev${NOO_IMAGE_DIGEST_GRAFANA:-@sha256:084445dea160e453576f5bd8e551116b0f1d6c52e8abd367d516135f53590c9a}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-grafana
     profiles: ["monitoring", "controller", "standalone"]
     # NOT root (i64, operator 2026-10-15): the -dev image's USER is 0, so
@@ -2704,7 +2704,7 @@ services:
   # metrics are a feature to design, not a profile to re-add.
   node-exporter:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/node-exporter:1${NOO_IMAGE_DIGEST_NODE_EXPORTER:-}
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/node-exporter:1${NOO_IMAGE_DIGEST_NODE_EXPORTER:-@sha256:2bf73eace0e49be4c1c61f14e349b738fdd182fb63560b1e7ed6c7c6885236d8}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-node-exporter
     profiles: ["monitoring", "controller", "standalone"]
     ports:
@@ -3186,7 +3186,7 @@ services:
   # of re-downloading from HuggingFace. No HF proxy, no CDN. See
   # docs/models/weight-cache.md.
   model-cache:
-    image: nginx:1.27-alpine${NOO_IMAGE_DIGEST_NGINX:-}
+    image: nginx:1.27-alpine${NOO_IMAGE_DIGEST_NGINX:-@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-model-cache
     profiles: ["controller", "standalone"]
     ports:

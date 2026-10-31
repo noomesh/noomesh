@@ -60,6 +60,10 @@ env:
   DHI_OWNER: noomesh/dhi
   PLATFORMS: linux/amd64,linux/arm64
   FFMPEG_VERSION: "7.1"           # pinned static-ffmpeg mirror tag
+  # The upstream source of that mirror, tag@digest (followup 17a). Moved only by
+  # scripts/refresh-image-digests.py's monthly PR; a tag that no longer
+  # resolves to this digest fails the copy instead of changing the image.
+  FFMPEG_UPSTREAM: "docker.io/mwader/static-ffmpeg:7.1@sha256:a8090df5f5608daef387e1b2e93b98aaacb4d92153ad904e7d715c725724fca4"
 
 jobs:
   # Promotion model (dev → staging → main, every repo). A release candidate
@@ -203,7 +207,7 @@ jobs:
           set -eux
           docker buildx imagetools create \
             --tag "$REGISTRY/$DHI_OWNER/static-ffmpeg:$FFMPEG_VERSION" \
-            "docker.io/mwader/static-ffmpeg:$FFMPEG_VERSION"
+            "$FFMPEG_UPSTREAM"
 
   # deps-core is the NON-ML tier of the shared Python base:
   # base deps + web/cache/feedback/pgvector/mcp extras, no
