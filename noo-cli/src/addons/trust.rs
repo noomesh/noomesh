@@ -605,7 +605,7 @@ mod tests {
     }
 
     fn want<'a>(tag: &'a str) -> Want<'a> {
-        Want { addon: "pai-voice", stack_tag: tag, stack_lock: None, pinned: None, allow_downgrade: false }
+        Want { addon: "pai-voice", stack_tag: tag, stack_lock: None, pinned: None, pin: None, allow_downgrade: false }
     }
 
     #[test]

@@ -134,12 +134,14 @@ pub fn prepare_from(
         client: if resolve::third_party(addon) { &plain } else { ctx.client },
     };
     let current = pins::read(ctx.root).map_err(Refusal::Write)?;
-    let pinned = current.get(addon).map(|p| p.version.clone());
+    let pin = current.get(addon);
+    let pinned = pin.map(|p| p.version.clone());
     let want = Want {
         addon,
         stack_tag: ctx.tag,
         stack_lock: ctx.stack_lock,
         pinned: pinned.as_deref(),
+        pin,
         allow_downgrade: ctx.allow_downgrade,
     };
     let route = ctx.client.route(&anchor).map_err(Refusal::Route)?;

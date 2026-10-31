@@ -45,7 +45,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::commands::upgrade::cmp_cli_semver;
+use crate::commands::upgrade::{cmp_cli_semver, parse_cli_semver};
 use crate::release_sig;
 
 /// The images-only lock format.
@@ -200,6 +200,9 @@ pub fn relocate(reference: &str, from: &str, to: &str) -> Option<String> {
 pub struct VerifiedLock {
     pub lock: AddonLock,
     pub key_index: usize,
+    /// The signing key itself (lower-case hex), not its index: an index
+    /// moves when the keys trusted for the add-on change (i358).
+    pub signer: String,
     pub dev_expires_at: Option<i64>,
 }
 
@@ -508,8 +511,8 @@ pub fn verify_at(
         return Err(AddonLockError::BadRegistryRoot(anchor.registry.clone()));
     }
     let keys: Vec<&str> = anchor.keys.iter().map(String::as_str).collect();
-    let (key_index, dev_expires_at) = match release_sig::verify_with_keys(lock_bytes, sig_text, &keys) {
-        Ok(i) => (i, None),
+    let (key_index, signer, dev_expires_at) = match release_sig::verify_with_keys(lock_bytes, sig_text, &keys) {
+        Ok(i) => (i, anchor.keys[i].trim().to_ascii_lowercase(), None),
         Err(e) => {
             let dev: Vec<&str> = anchor.dev.iter().map(|d| d.key.as_str()).collect();
             match (!dev.is_empty()).then(|| release_sig::verify_with_keys(lock_bytes, sig_text, &dev)) {
@@ -518,7 +521,7 @@ pub fn verify_at(
                     if now >= d.expires_at {
                         return Err(AddonLockError::DevKeyExpired { key: d.key.clone(), expires_at: d.expires_at });
                     }
-                    (anchor.keys.len() + j, Some(d.expires_at))
+                    (anchor.keys.len() + j, d.key.trim().to_ascii_lowercase(), Some(d.expires_at))
                 }
                 _ => {
                     // release_sig speaks of release keys; here the anchor is the add-on's.
@@ -534,7 +537,7 @@ pub fn verify_at(
         return Err(AddonLockError::NotCanonical);
     }
     lock.validate(expected_addon, Some(root))?;
-    Ok(VerifiedLock { lock, key_index, dev_expires_at })
+    Ok(VerifiedLock { lock, key_index, signer, dev_expires_at })
 }
 
 /// Release-side guard (i163 part A, "never ships"): `release_keys` are the
@@ -558,16 +561,50 @@ pub fn refuse_dev_in_release(release_keys: &[String], dev: &[DevKey]) -> Result<
     Ok(())
 }
 
-/// True when `candidate` orders below `current` by the CLI's semver
-/// precedence (`cmp_cli_semver`: a release outranks its own pre-releases).
+/// How a candidate add-on version stands against the pinned one, for the
+/// downgrade rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionOrder {
+    /// The candidate orders below the pinned version.
+    Downgrade,
+    /// The candidate is the same as, or above, the pinned version.
+    NotDowngrade,
+    /// Two different `-dev.<hash>` builds of one `MAJOR.MINOR.PATCH`: a dev
+    /// suffix is a content hash, which has no order (i358).
+    Unordered,
+}
+
+/// `(core, hash)` of a version whose pre-release is exactly `dev.<hash>`.
+fn dev_build(v: &str) -> Option<((u64, u64, u64), String)> {
+    let (core, pre) = parse_cli_semver(v)?;
+    match pre.as_slice() {
+        [tag, hash] if tag == "dev" && hash.chars().all(|c| c.is_ascii_alphanumeric()) => Some((core, hash.clone())),
+        _ => None,
+    }
+}
+
+/// Where `candidate` stands against the pinned `current`. By the CLI's
+/// semver precedence (`cmp_cli_semver`: a release outranks its own
+/// pre-releases), except two different `-dev.<hash>` builds of one core,
+/// which are [`VersionOrder::Unordered`]: decided before any identifier is
+/// compared, so a hash made only of digits is not read as a number.
 /// An unreadable version is an error, never "not a downgrade": a caller
 /// that cannot order two versions must not move between them silently.
-pub fn is_downgrade(current: &str, candidate: &str) -> Result<bool, AddonLockError> {
+pub fn version_order(current: &str, candidate: &str) -> Result<VersionOrder, AddonLockError> {
     if cmp_cli_semver(current, current).is_none() {
         return Err(AddonLockError::BadVersion(current.to_string()));
     }
+    if cmp_cli_semver(candidate, candidate).is_none() {
+        return Err(AddonLockError::BadVersion(candidate.to_string()));
+    }
+    if let (Some((cc, ch)), Some((nc, nh))) = (dev_build(current), dev_build(candidate)) {
+        if cc == nc && ch != nh {
+            return Ok(VersionOrder::Unordered);
+        }
+    }
     match cmp_cli_semver(candidate, current) {
-        Some(o) => Ok(o == std::cmp::Ordering::Less),
+        Some(std::cmp::Ordering::Less) => Ok(VersionOrder::Downgrade),
+        Some(_) => Ok(VersionOrder::NotDowngrade),
         None => Err(AddonLockError::BadVersion(candidate.to_string())),
     }
 }
@@ -846,14 +883,35 @@ mod tests {
 
     #[test]
     fn downgrade_uses_cli_semver_precedence() {
-        assert_eq!(is_downgrade("1.2.0", "1.1.9"), Ok(true));
-        assert_eq!(is_downgrade("1.2.0", "1.2.0"), Ok(false));
-        assert_eq!(is_downgrade("1.2.0", "1.10.0"), Ok(false));
-        assert_eq!(is_downgrade("1.2.0", "1.2.0-rc.1"), Ok(true), "a pre-release is below its release");
-        assert_eq!(is_downgrade("1.2.0-rc.1", "1.2.0"), Ok(false));
-        assert_eq!(is_downgrade("v1.2.0", "1.2.1"), Ok(false));
-        assert!(matches!(is_downgrade("1.2.0", "next"), Err(AddonLockError::BadVersion(_))));
-        assert!(matches!(is_downgrade("??", "1.0.0"), Err(AddonLockError::BadVersion(_))));
+        use VersionOrder::{Downgrade, NotDowngrade, Unordered};
+        assert_eq!(version_order("1.2.0", "1.1.9"), Ok(Downgrade));
+        assert_eq!(version_order("1.2.0", "1.2.0"), Ok(NotDowngrade));
+        assert_eq!(version_order("1.2.0", "1.10.0"), Ok(NotDowngrade));
+        assert_eq!(version_order("1.2.0", "1.2.0-rc.1"), Ok(Downgrade), "a pre-release is below its release");
+        assert_eq!(version_order("1.2.0-rc.1", "1.2.0"), Ok(NotDowngrade));
+        assert_eq!(version_order("v1.2.0", "1.2.1"), Ok(NotDowngrade));
+        assert!(matches!(version_order("1.2.0", "next"), Err(AddonLockError::BadVersion(_))));
+        assert!(matches!(version_order("??", "1.0.0"), Err(AddonLockError::BadVersion(_))));
+        assert!(matches!(version_order("1.0.0-dev.abc", "next"), Err(AddonLockError::BadVersion(_))));
+        // i358: two dev builds of one core have no order, in either direction.
+        let (a, b) = ("0.1.0-dev.29492651a3dc", "0.1.0-dev.b5a3875db955");
+        assert_eq!(version_order(b, a), Ok(Unordered));
+        assert_eq!(version_order(a, b), Ok(Unordered));
+        // An all-digit hash is not a number: still unordered, both directions.
+        let n = "0.1.0-dev.123456789012";
+        assert_eq!(version_order(b, n), Ok(Unordered));
+        assert_eq!(version_order(n, b), Ok(Unordered));
+        assert_eq!(version_order("0.1.0-dev.123456789012", "0.1.0-dev.999999999999"), Ok(Unordered));
+        assert_eq!(version_order(a, a), Ok(NotDowngrade), "the same build is a re-apply");
+        // The core still decides: a base downgrade is a downgrade, a newer base is not.
+        assert_eq!(version_order("0.1.0-dev.bbb", "0.0.9-dev.aaa"), Ok(Downgrade));
+        assert_eq!(version_order("0.0.9-dev.bbb", "0.1.0-dev.aaa"), Ok(NotDowngrade));
+        // A release against its own dev build keeps the semver answer.
+        assert_eq!(version_order("0.1.0", "0.1.0-dev.aaa"), Ok(Downgrade));
+        assert_eq!(version_order("0.1.0-dev.aaa", "0.1.0"), Ok(NotDowngrade));
+        // Other pre-releases are not dev builds: they keep their order.
+        assert_eq!(version_order("0.1.0-dev.aaa.2", "0.1.0-dev.aaa.1"), Ok(Downgrade));
+        assert_eq!(version_order("0.1.0-rc.1", "0.1.0-dev.aaa"), Ok(Downgrade));
     }
 
     #[test]
