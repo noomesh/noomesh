@@ -927,6 +927,16 @@ whole answer was read), `stream` (the span ended with the streamed answer) or
 not the whole answer). A streamed answer's tokens land on its request's row
 and span when the stream ends.
 
+**Worker hops.** Every `worker.*` message the gateway publishes for a
+request carries its `traceparent` (beside the signed principal header, not
+part of it). The worker continues the trace with one span per handled
+subject (`worker <subject>`, kind CONSUMER, with the subject and the caller),
+an error span when the handler raised, and sends it to Tempo itself with its
+own leaf. No OpenTelemetry SDK is involved (`src/noomesh/tracing.py` writes
+the same OTLP/HTTP JSON the gateway does), so no `OTEL_*` variable changes
+where spans go: only `NOO_TEMPO_OTLP_URL`, `https://` only, the cluster CA,
+the container's own leaf, or no export.
+
 **Reading them.** `GET /api/traces/requests` lists recent requests (filter by
 route, model, node, actor, status, duration); `GET /api/traces/summary`
 groups the window by route, model, node, backend or actor with request and
