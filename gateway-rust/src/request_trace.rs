@@ -371,6 +371,17 @@ pub fn current() -> Option<Arc<Recorder>> {
     CURRENT.try_with(|r| r.clone()).ok()
 }
 
+/// The `traceparent` naming the request in scope's own span, for a hop that
+/// continues the trace without a span of its own here (a worker message).
+/// Only for a recorded (authenticated) request: an unrecorded one leaves no
+/// orphan worker span.
+pub fn current_traceparent() -> Option<String> {
+    current().filter(|r| r.is_authenticated()).map(|r| {
+        let c = r.ctx();
+        traceparent(&c.trace_id, &c.span_id)
+    })
+}
+
 /// The trace id (hex) of the request in scope, for rows that link to it.
 pub fn current_trace_id() -> Option<String> {
     current().map(|r| r.trace_id_hex())
@@ -1016,6 +1027,8 @@ mod tests {
                     vec!["read".into()],
                 ));
                 assert_eq!(current_trace_id(), Some(rec.trace_id_hex()));
+                let tp = parse_traceparent(&current_traceparent().expect("in scope")).expect("valid");
+                assert_eq!((tp.trace_id, tp.span_id), (rec.ctx().trace_id, rec.ctx().span_id), "a worker hop parents on the request's span");
             })
             .await;
         let s = rec.summary();

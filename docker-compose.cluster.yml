@@ -1064,6 +1064,9 @@ services:
       # gateway's (heartbeat_actions.rs), which holds that leaf.
       - NOO_TLS_CERT=${NOO_TLS_CERT:+/app/pki/leaf/service.crt}
       - NOO_TLS_KEY=${NOO_TLS_KEY:+/app/pki/leaf/service.key}
+      # Request tracing (i359): a span per handled worker.* subject, sent to
+      # Tempo with the leaf above (src/noomesh/tracing.py).
+      - NOO_TEMPO_OTLP_URL=${NOO_TEMPO_OTLP_URL:-https://tempo:4318}
       - NOO_EXEC_APPROVAL_MODE=${NOO_EXEC_APPROVAL_MODE:-}
       - NOO_APPROVAL_GCHAT_SPACE=${NOO_APPROVAL_GCHAT_SPACE:-}
       - NOO_APPROVAL_TELEGRAM_CHAT=${NOO_APPROVAL_TELEGRAM_CHAT:-}

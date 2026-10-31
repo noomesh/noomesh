@@ -1,21 +1,43 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026 PersonifAI LLC
 
-"""Distributed tracing via OpenTelemetry.
+"""Request tracing for the Python services (i359 C1).
 
-Provides a ``@trace_span`` decorator and FastAPI middleware.
-Everything is a no-op when:
-  - The ``monitoring`` extra is not installed (opentelemetry not available)
-  - ``OTEL_EXPORTER_OTLP_ENDPOINT`` is not set
+The gateway starts a trace for every request it serves and sends a W3C
+``traceparent`` on each ``worker.*`` message it publishes for that request.
+A worker continues it here: one span per handled subject, parented on the
+gateway's span, sent to Tempo.
 
-Zero overhead in default deployment.
+No OpenTelemetry SDK. The spans are the same OTLP/HTTP JSON the gateway's
+exporter writes (``gateway-rust/src/request_trace.rs``), sent with httpx:
+
+- Tempo has an OTLP HTTP receiver only (no gRPC), which the SDK's default
+  exporter is not;
+- the SDK reads ``OTEL_*`` environment defaults (exporter endpoint,
+  insecure, sampler) that would each need guarding; with no SDK there is no
+  such surface, and the endpoint is ours by construction;
+- the gateway made the same choice (no new crates).
+
+Every export is TLS checked against the cluster CA (``tls_ca.require_ca``)
+with this container's own leaf as the client certificate, because Tempo
+requires one. An ``http://`` endpoint, no CA or no leaf means no export, with
+a warning naming why — never a plaintext or unverified fallback (followup
+510). Spans carry metadata only: names, ids, timings, the subject, never a
+payload.
 """
+
 from __future__ import annotations
 
-import asyncio
+import contextvars
 import os
-from functools import wraps
-from typing import Optional
+import queue
+import re
+import secrets
+import socket
+import threading
+import time
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
 import structlog
 
@@ -23,189 +45,229 @@ from .tls_ca import TlsCaMissing, require_ca
 
 logger = structlog.get_logger()
 
-# Safe import — tracing is optional (monitoring extra)
-try:
-    from opentelemetry import trace
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
-    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-    from opentelemetry.sdk.resources import Resource
-    import grpc
-    OTEL_AVAILABLE = True
-except ImportError:
-    OTEL_AVAILABLE = False
+#: Tempo's OTLP HTTP base (``https://tempo:4318``), as the gateway reads it.
+TEMPO_URL_ENV = "NOO_TEMPO_OTLP_URL"
 
-_tracer = None
-_initialized = False
+#: Spans waiting for export. Full means Tempo is not keeping up: new spans
+#: are dropped and counted, never queued without bound.
+EXPORT_QUEUE = 8192
+EXPORT_BATCH = 512
+EXPORT_EVERY_S = 5.0
+
+_TRACEPARENT = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$")
 
 
-def init_tracing(service_name: str = "noo-gateway") -> bool:
-    """Initialize OpenTelemetry tracing.
+def parse_traceparent(value: Optional[str]) -> Optional[Tuple[str, str]]:
+    """(trace id, parent span id) from a well-formed ``traceparent``, else None.
+    All-zero ids are invalid in W3C trace context and start a new trace."""
+    if not value:
+        return None
+    m = _TRACEPARENT.match(value.strip().lower())
+    if not m:
+        return None
+    trace_id, span_id = m.group(1), m.group(2)
+    if set(trace_id) == {"0"} or set(span_id) == {"0"}:
+        return None
+    return trace_id, span_id
 
-    Returns True if tracing was initialized, False if skipped (deps missing
-    or no endpoint configured).
-    """
-    global _tracer, _initialized
 
-    if _initialized:
-        return _tracer is not None
+def _new_id(nbytes: int) -> str:
+    while True:
+        v = secrets.token_hex(nbytes)
+        if set(v) != {"0"}:
+            return v
 
-    _initialized = True
 
-    if not OTEL_AVAILABLE:
-        logger.info("tracing_skipped", reason="opentelemetry not installed")
+class Span:
+    """One unit of work in a trace. Attribute values are names and numbers."""
+
+    __slots__ = ("trace_id", "span_id", "parent", "name", "kind", "start_ns", "end_ns", "attrs", "error")
+
+    def __init__(self, name: str, trace_id: str, parent: Optional[str], kind: int = 2) -> None:
+        self.trace_id = trace_id
+        self.span_id = _new_id(8)
+        self.parent = parent
+        self.name = name
+        self.kind = kind  # OTLP: 1 internal, 2 server, 3 client, 5 consumer
+        self.start_ns = time.time_ns()
+        self.end_ns = 0
+        self.attrs: Dict[str, Any] = {}
+        self.error = False
+
+    def traceparent(self) -> str:
+        return f"00-{self.trace_id}-{self.span_id}-01"
+
+    def to_otlp(self) -> Dict[str, Any]:
+        attrs = []
+        for k, v in self.attrs.items():
+            if isinstance(v, bool) or not isinstance(v, int):
+                attrs.append({"key": k, "value": {"stringValue": str(v)}})
+            else:
+                attrs.append({"key": k, "value": {"intValue": str(v)}})
+        out: Dict[str, Any] = {
+            "traceId": self.trace_id,
+            "spanId": self.span_id,
+            "name": self.name,
+            "kind": self.kind,
+            "startTimeUnixNano": str(self.start_ns),
+            "endTimeUnixNano": str(self.end_ns or time.time_ns()),
+            "attributes": attrs,
+            "status": {"code": 2 if self.error else 1},
+        }
+        if self.parent:
+            out["parentSpanId"] = self.parent
+        return out
+
+
+def otlp_body(spans: List[Span], service_name: str) -> Dict[str, Any]:
+    """The OTLP/JSON request body for a batch of this process's spans."""
+    resource = [
+        {"key": "service.name", "value": {"stringValue": service_name}},
+        {"key": "host.name", "value": {"stringValue": socket.gethostname()}},
+    ]
+    return {
+        "resourceSpans": [
+            {
+                "resource": {"attributes": resource},
+                "scopeSpans": [{"scope": {"name": service_name}, "spans": [s.to_otlp() for s in spans]}],
+            }
+        ]
+    }
+
+
+def tempo_traces_url(base: Optional[str]) -> Optional[str]:
+    """The OTLP traces URL, None when Tempo is not configured. Raises
+    ValueError for anything but ``https://``: spans go over TLS only."""
+    base = (base or "").strip().rstrip("/")
+    if not base:
+        return None
+    if not base.lower().startswith("https://"):
+        raise ValueError(f"{TEMPO_URL_ENV}={base} is not https://; spans are exported over TLS only")
+    return f"{base}/v1/traces"
+
+
+class _Exporter:
+    """A daemon thread posting batches; a bounded queue in front of it."""
+
+    def __init__(self, url: str, service_name: str, verify: str, cert: Tuple[str, str], client: Any = None) -> None:
+        import httpx
+
+        self.url = url
+        self.service_name = service_name
+        self.dropped = 0
+        self._q: "queue.Queue[Span]" = queue.Queue(maxsize=EXPORT_QUEUE)
+        self._client = client or httpx.Client(verify=verify, cert=cert, timeout=10.0)
+        self._last_warn = 0.0
+        threading.Thread(target=self._run, name="trace-export", daemon=True).start()
+
+    def put(self, span: Span) -> None:
+        try:
+            self._q.put_nowait(span)
+        except queue.Full:
+            self.dropped += 1
+            self._warn("trace_export_queue_full", "spans dropped; Tempo is not keeping up or is down")
+
+    def _warn(self, event: str, detail: str) -> None:
+        now = time.monotonic()
+        if now - self._last_warn >= 60:
+            self._last_warn = now
+            logger.warning(event, detail=detail, dropped=self.dropped)
+
+    def post(self, batch: List[Span]) -> None:
+        try:
+            r = self._client.post(self.url, json=otlp_body(batch, self.service_name))
+            if r.status_code >= 300:
+                self._warn("trace_export_refused", f"Tempo answered {r.status_code}")
+        except Exception as e:  # noqa: BLE001 — tracing never fails the caller
+            self._warn("trace_export_failed", str(e))
+
+    def _run(self) -> None:
+        while True:
+            batch: List[Span] = []
+            deadline = time.monotonic() + EXPORT_EVERY_S
+            while len(batch) < EXPORT_BATCH:
+                try:
+                    batch.append(self._q.get(timeout=max(0.0, deadline - time.monotonic())))
+                except queue.Empty:
+                    break
+            if batch:
+                self.post(batch)
+
+
+_exporter: Optional[_Exporter] = None
+_current: "contextvars.ContextVar[Optional[Span]]" = contextvars.ContextVar("noo_trace_span", default=None)
+
+
+def configure(service_name: str = "noo-worker", env: Optional[Mapping[str, str]] = None, client: Any = None) -> bool:
+    """Start exporting this process's spans to Tempo. True when it will.
+
+    Reads ``NOO_TEMPO_OTLP_URL``, the cluster CA and this container's leaf
+    (``NOO_TLS_CERT`` / ``NOO_TLS_KEY``). Any of them missing or wrong: no
+    export, one warning naming it; spans are still made (so their ids reach
+    logs and events) but go nowhere. Idempotent."""
+    global _exporter
+    env = os.environ if env is None else env
+    if _exporter is not None:
+        return True
+    try:
+        url = tempo_traces_url(env.get(TEMPO_URL_ENV))
+    except ValueError as e:
+        logger.warning("tracing_skipped", reason=str(e))
         return False
-
-    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-    if not endpoint:
-        logger.info("tracing_skipped", reason="OTEL_EXPORTER_OTLP_ENDPOINT not set")
-        return False
-
-    # Spans carry request paths and timings, so they leave over TLS checked
-    # against the cluster CA, or not at all. This used to fall back to
-    # plaintext whenever NOO_TLS_CA was unset (followup 510), and an
-    # http:// endpoint makes the exporter choose plaintext on its own.
-    if endpoint.lower().startswith("http://"):
-        logger.warning("tracing_skipped", reason="OTEL_EXPORTER_OTLP_ENDPOINT is http://; spans are exported over TLS only")
+    if url is None:
+        logger.info("tracing_skipped", reason=f"{TEMPO_URL_ENV} not set")
         return False
     try:
-        ca = require_ca()
+        ca = require_ca(env)
     except TlsCaMissing as e:
         logger.warning("tracing_skipped", reason=str(e))
         return False
-
-    try:
-        resource = Resource.create({"service.name": service_name})
-        provider = TracerProvider(resource=resource)
-        with open(ca, "rb") as f:
-            credentials = grpc.ssl_channel_credentials(root_certificates=f.read())
-        exporter = OTLPSpanExporter(endpoint=endpoint, insecure=False, credentials=credentials)
-        provider.add_span_processor(BatchSpanProcessor(exporter))
-        trace.set_tracer_provider(provider)
-        _tracer = trace.get_tracer(service_name)
-        logger.info("tracing_initialized", endpoint=endpoint, service=service_name)
-        return True
-    except Exception as e:
-        logger.warning("tracing_init_failed", error=str(e))
+    cert, key = (env.get("NOO_TLS_CERT") or "").strip(), (env.get("NOO_TLS_KEY") or "").strip()
+    if not (cert and key and os.path.isfile(cert) and os.path.isfile(key)):
+        logger.warning("tracing_skipped", reason="Tempo requires a client certificate and NOO_TLS_CERT/NOO_TLS_KEY name none")
         return False
+    _exporter = _Exporter(url, service_name, ca, (cert, key), client=client)
+    logger.info("tracing_initialized", endpoint=url, service=service_name)
+    return True
 
 
-def get_tracer():
-    """Get the OTel tracer (None if tracing not initialized)."""
-    return _tracer
+@contextmanager
+def span(name: str, traceparent: Optional[str] = None, attrs: Optional[Dict[str, Any]] = None, kind: int = 5) -> Iterator[Span]:
+    """A span for the work inside the block, continuing ``traceparent``
+    when it is well formed, else the span in scope, else a new trace. Ends,
+    and is exported, when the block does; an exception marks it an error and
+    propagates."""
+    parent = _current.get()
+    cont = parse_traceparent(traceparent)
+    if cont:
+        trace_id, parent_id = cont
+    elif parent is not None:
+        trace_id, parent_id = parent.trace_id, parent.span_id
+    else:
+        trace_id, parent_id = _new_id(16), None
+    s = Span(name, trace_id, parent_id, kind=kind)
+    if attrs:
+        s.attrs.update(attrs)
+    token = _current.set(s)
+    try:
+        yield s
+    except BaseException:
+        s.error = True
+        raise
+    finally:
+        _current.reset(token)
+        s.end_ns = time.time_ns()
+        if _exporter is not None:
+            _exporter.put(s)
 
 
 def current_trace_id() -> Optional[str]:
-    """Get current trace ID as a hex string, or None."""
-    if not OTEL_AVAILABLE or _tracer is None:
-        return None
-    try:
-        span = trace.get_current_span()
-        ctx = span.get_span_context()
-        if ctx and ctx.trace_id:
-            return format(ctx.trace_id, '032x')
-    except Exception:
-        pass
-    return None
+    """The trace id (hex) of the span in scope, or None."""
+    s = _current.get()
+    return s.trace_id if s else None
 
 
 def current_span_id() -> Optional[str]:
-    """Get current span ID as a hex string, or None."""
-    if not OTEL_AVAILABLE or _tracer is None:
-        return None
-    try:
-        span = trace.get_current_span()
-        ctx = span.get_span_context()
-        if ctx and ctx.span_id:
-            return format(ctx.span_id, '016x')
-    except Exception:
-        pass
-    return None
-
-
-def trace_span(name: str = None):
-    """Decorator that creates an OTel span around a function.
-
-    No-op if tracing not initialized. Works with both sync and async functions.
-    """
-    def decorator(func):
-        span_name = name or f"{func.__module__}.{func.__qualname__}"
-
-        if asyncio.iscoroutinefunction(func):
-            @wraps(func)
-            async def async_wrapper(*args, **kwargs):
-                if _tracer is None:
-                    return await func(*args, **kwargs)
-                with _tracer.start_as_current_span(span_name) as span:
-                    try:
-                        result = await func(*args, **kwargs)
-                        return result
-                    except Exception as e:
-                        span.set_attribute("error", True)
-                        span.set_attribute("error.message", str(e))
-                        raise
-            return async_wrapper
-        else:
-            @wraps(func)
-            def sync_wrapper(*args, **kwargs):
-                if _tracer is None:
-                    return func(*args, **kwargs)
-                with _tracer.start_as_current_span(span_name) as span:
-                    try:
-                        result = func(*args, **kwargs)
-                        return result
-                    except Exception as e:
-                        span.set_attribute("error", True)
-                        span.set_attribute("error.message", str(e))
-                        raise
-            return sync_wrapper
-    return decorator
-
-
-async def tracing_middleware(request, call_next):
-    """FastAPI middleware that creates a root span per request.
-
-    Adds trace_id as response header and injects into structlog context.
-    No-op if tracing not initialized.
-    """
-    if _tracer is None:
-        return await call_next(request)
-
-    span_name = f"{request.method} {request.url.path}"
-    with _tracer.start_as_current_span(span_name) as span:
-        # Set request attributes
-        span.set_attribute("http.method", request.method)
-        span.set_attribute("http.url", str(request.url))
-        span.set_attribute("http.route", request.url.path)
-
-        # Inject trace_id into structlog context
-        trace_id = current_trace_id()
-        if trace_id:
-            structlog.contextvars.bind_contextvars(trace_id=trace_id)
-
-        response = await call_next(request)
-
-        # Set response attributes
-        span.set_attribute("http.status_code", response.status_code)
-
-        # Add trace ID to response header
-        if trace_id:
-            response.headers["X-Trace-ID"] = trace_id
-
-        # Clear structlog context
-        structlog.contextvars.unbind_contextvars("trace_id")
-
-        return response
-
-
-def shutdown_tracing():
-    """Flush and shut down the tracer provider."""
-    if not OTEL_AVAILABLE or _tracer is None:
-        return
-    try:
-        provider = trace.get_tracer_provider()
-        if hasattr(provider, 'shutdown'):
-            provider.shutdown()
-        logger.info("tracing_shutdown")
-    except Exception as e:
-        logger.warning("tracing_shutdown_failed", error=str(e))
+    """The span id (hex) of the span in scope, or None."""
+    s = _current.get()
+    return s.span_id if s else None
