@@ -800,6 +800,7 @@ on the gateway's own). Broadcast is refused; a thread needs a seat.
 | PUT / DELETE | `/api/mcp/servers/{id}/placements/{node}` | which registered node hosts or dials it (`noo mcp place/unplace`) |
 | POST | `/api/cluster/nodes/{node}/mcp/{id}/tools` | node rail: the hosting node's discovery report (catalog replaced whole) |
 | GET | `/api/logs/status`, `/query`, `/containers`, `/docker-stats`, `/node/{node_id}/{container}`; POST `/api/logs/tail`, `/api/logs/errors`, `/api/logs/search` | logs: `search` is Loki-only (the gateway builds the LogQL); `tail`/`errors` are Loki-backed with a node-agent scan fallback and say `backend`; every route Operator/Admin only |
+| GET | `/api/traces/status`, `/api/traces/requests`, `/api/traces/summary` | request traces (i359): Tempo's readiness to the gateway; recent requests from `noo_request_trace` (filters `hours` ≤ 720, `route`, `model`, `node`, `actor`, `min_status`, `min_ms`, `limit` ≤ 1000); the window grouped `by` route, model, node, backend or actor with p50/p95/max ms, errors and tokens. Metadata only. Every route Operator/Admin only (`TRACES_READ_PREFIX`); the MCP tools `noo_traces_requests` and `noo_traces_summary` are on the operator door only |
 | GET | `/api/cache/stats` | Redis cache stats |
 | GET, POST | `/api/db/migrations`, `/api/db/migrations/apply` | the mesh migration runner (`noo db`) |
 | POST | `/api/cleanup/heartbeat-runs/restore` | undo one `heartbeat_retention` prune (the prune is that heartbeat task, run on demand via `/api/heartbeat/tasks/{task_id}/run`) |

@@ -66,6 +66,86 @@ pub async fn prune(db: &sqlx::PgPool, keep_days: i64) -> Result<u64, sqlx::Error
     Ok(res.rows_affected())
 }
 
+/// What `/api/traces/requests` filters on. `None` = no filter.
+pub struct Filter<'a> {
+    pub hours: i64,
+    pub route: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub node: Option<&'a str>,
+    pub actor: Option<&'a str>,
+    pub min_status: Option<i32>,
+    pub min_ms: Option<i64>,
+    pub limit: i64,
+}
+
+/// Recent rows, newest first.
+pub async fn recent(db: &sqlx::PgPool, f: &Filter<'_>) -> Result<Vec<sqlx::postgres::PgRow>, sqlx::Error> {
+    sqlx::query(
+        "SELECT at, trace_id, method, route, status, duration_ms, actor, actor_kind, model, backend, node_id,
+                prompt_tokens, completion_tokens, span_count, request_bytes, response_bytes
+           FROM noo_request_trace
+          WHERE at > now() - ($1::bigint * interval '1 hour')
+            AND ($2::text IS NULL OR route = $2)
+            AND ($3::text IS NULL OR model = $3)
+            AND ($4::text IS NULL OR node_id = $4)
+            AND ($5::text IS NULL OR split_part(actor, '/', 1) = $5 OR actor = $5)
+            AND ($6::int IS NULL OR status >= $6)
+            AND ($7::bigint IS NULL OR duration_ms >= $7)
+          ORDER BY at DESC
+          LIMIT $8",
+    )
+    .bind(f.hours)
+    .bind(f.route)
+    .bind(f.model)
+    .bind(f.node)
+    .bind(f.actor)
+    .bind(f.min_status)
+    .bind(f.min_ms)
+    .bind(f.limit)
+    .fetch_all(db)
+    .await
+}
+
+/// The window grouped by `col`, busiest first. One literal statement per
+/// grouping (sqlx takes a `&'static str`, and a column name is never built
+/// from text); `col` is one of `routes::traces::GROUP_BY`'s columns, and any
+/// other value is refused here too.
+pub async fn grouped(
+    db: &sqlx::PgPool,
+    col: &'static str,
+    hours: i64,
+    route: Option<&str>,
+) -> Result<Vec<sqlx::postgres::PgRow>, sqlx::Error> {
+    macro_rules! by {
+        ($col:literal) => {
+            concat!(
+                "SELECT ", $col, " AS key, count(*)::bigint AS requests,
+                        count(*) FILTER (WHERE status >= 500)::bigint AS errors,
+                        percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_ms)::float8 AS p50_ms,
+                        percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms)::float8 AS p95_ms,
+                        max(duration_ms)::bigint AS max_ms,
+                        COALESCE(sum(prompt_tokens), 0)::bigint AS prompt_tokens,
+                        COALESCE(sum(completion_tokens), 0)::bigint AS completion_tokens
+                   FROM noo_request_trace
+                  WHERE at > now() - ($1::bigint * interval '1 hour')
+                    AND ($2::text IS NULL OR route = $2)
+                  GROUP BY 1
+                  ORDER BY 2 DESC
+                  LIMIT 200"
+            )
+        };
+    }
+    let sql: &'static str = match col {
+        "route" => by!("route"),
+        "model" => by!("model"),
+        "node_id" => by!("node_id"),
+        "backend" => by!("backend"),
+        "actor" => by!("actor"),
+        other => return Err(sqlx::Error::Protocol(format!("not a grouping column: {other}"))),
+    };
+    sqlx::query(sql).bind(hours).bind(route).fetch_all(db).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1569,10 +1569,17 @@ async fn send_llm_with_fallback<R: HarnessRuntime>(
         } else {
             crate::node_link::backend_request(reqwest::Method::POST, &url, &backend.backend_type)
         };
+        // The caller reads the body, so this span ends at the headers (i359).
+        let mut span =
+            crate::request_trace::backend_span(&backend.backend_type, &backend.model, &url, crate::request_trace::SpanEnd::Headers);
+        let req = crate::request_trace::propagate(req, span.as_ref());
         // The turn deadline, not the client's fixed backend timeout (#177).
         let failure = match req.json(&body).timeout(remaining).send().await {
             Ok(resp) => {
                 let status = resp.status();
+                if let Some(s) = span.as_mut() {
+                    s.status(status.as_u16());
+                }
                 if status.is_success() {
                     return Ok(resp);
                 }

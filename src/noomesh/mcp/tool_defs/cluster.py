@@ -373,6 +373,55 @@ class PaiMetricsDiscover(ToolDef):
 
 
 @register
+class PaiTracesSummary(ToolDef):
+    """Where requests spend their time (i359 request traces): the gateway's
+    requests over the last `hours` (default 24, at most 720) grouped `by`
+    route (default), model, node, backend or actor, busiest first, each with
+    its count, errors (status >= 500), p50/p95/max duration in ms and prompt
+    and completion tokens. `route` narrows to one route template. Use for
+    'which backend is slow for this kind of request?' and 'where did the
+    load come from?'. Metadata only: no prompt or answer text exists here."""
+
+    name: ClassVar[str] = "noo_traces_summary"
+    description: ClassVar[str] = __doc__
+    method: ClassVar[HttpMethod] = HttpMethod.GET
+    path: ClassVar[str] = "/api/traces/summary"
+    tags: ClassVar[List[str]] = ["observability", "traces", "status"]
+    risk_level: ClassVar[RiskLevel] = RiskLevel.LOW
+
+    hours: Optional[int] = Field(default=None, ge=1, le=720, description="Look back this many hours (default 24)")
+    by: Optional[str] = Field(default=None, description="Group by: route (default), model, node, backend or actor")
+    route: Optional[str] = Field(default=None, description="Only this route template, e.g. '/v1/chat/completions'")
+
+
+@register
+class PaiTracesRequests(ToolDef):
+    """Recent gateway requests from the request traces (i359), newest
+    first: when, trace id, method, route template, status, duration,
+    caller, model, backend, node, tokens and sizes. Filter with `hours`
+    (default 24, at most 720), `route`, `model`, `node`, `actor`,
+    `min_status` (500 = errors only) and `min_ms` (slow ones); `limit`
+    defaults to 100 (at most 1000). A trace id opens the full trace in
+    Grafana's Tempo data source. Metadata only: no prompt or answer text."""
+
+    name: ClassVar[str] = "noo_traces_requests"
+    description: ClassVar[str] = __doc__
+    method: ClassVar[HttpMethod] = HttpMethod.GET
+    path: ClassVar[str] = "/api/traces/requests"
+    tags: ClassVar[List[str]] = ["observability", "traces", "status"]
+    risk_level: ClassVar[RiskLevel] = RiskLevel.LOW
+
+    hours: Optional[int] = Field(default=None, ge=1, le=720, description="Look back this many hours (default 24)")
+    route: Optional[str] = Field(default=None, description="Exact route template, e.g. '/v1/chat/completions'")
+    model: Optional[str] = Field(default=None, description="Only requests answered by this model")
+    node: Optional[str] = Field(default=None, description="Only requests answered on this node id")
+    actor: Optional[str] = Field(default=None, description="Only this caller (a username or service-key consumer)")
+    min_status: Optional[int] = Field(default=None, ge=100, le=599, description="Only statuses at or above this (500 = errors)")
+    min_ms: Optional[int] = Field(default=None, ge=0, description="Only requests that took at least this many ms")
+    limit: Optional[int] = Field(default=None, ge=1, le=1000, description="Rows to return (default 100)")
+
+
+@register
 class PaiAlertsList(ToolDef):
     """List the cluster's alerts: every Prometheus alerting rule with its
     state (firing, pending, inactive), severity, summary, when it became

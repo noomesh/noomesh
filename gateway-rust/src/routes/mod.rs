@@ -15,6 +15,7 @@
 //! scripts/check-openapi-drift.py).
 
 pub(crate) mod admin;
+mod traces;
 mod agents;
 mod cli_piece;
 mod console_piece;
@@ -324,6 +325,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(bootstrap::router())
         .merge(seats::router())
         .merge(inference::router())
+        .merge(traces::router())
         .merge(addon_token::router())
         .merge(addon_access::router())
         .merge(kiosk::router())

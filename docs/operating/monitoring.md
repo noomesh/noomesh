@@ -918,6 +918,23 @@ the database falls behind, rows are dropped and counted
 
 Not traced: `/health`, `/metrics`, `/static/` and the node log push.
 
+**Backend calls** are child spans of the request (`backend <type>`, with
+`noo.model`, `server.address` host:port and the backend's status). The
+gateway sends the backend its `traceparent`, so a node that traces continues
+the same trace. `noo.span_end` says what the span's end means: `body` (the
+whole answer was read), `stream` (the span ended with the streamed answer) or
+`headers` (the body was read elsewhere, so the span is time to first byte,
+not the whole answer). A streamed answer's tokens land on its request's row
+and span when the stream ends.
+
+**Reading them.** `GET /api/traces/requests` lists recent requests (filter by
+route, model, node, actor, status, duration); `GET /api/traces/summary`
+groups the window by route, model, node, backend or actor with request and
+error counts, p50/p95/max duration and tokens. Both are Operator/Admin only,
+and an agent on the operator MCP door reads them as `noo_traces_requests` and
+`noo_traces_summary` (never on `/mcp/user`: a trace names every account's
+requests). A trace id opens the whole trace in Grafana's Tempo data source.
+
 **Tempo** (`noo-tempo`, the DHI image, uid 65532) runs in the same profiles
 as Loki, with no published port. Both its doors require a cluster client
 certificate: the OTLP HTTP receiver on 4318 (the gateway's spans,
