@@ -499,57 +499,17 @@ pub struct SummaryRow {
     pub response_bytes: Option<i64>,
 }
 
-/// Insert one summary row. A failure warns and nothing else: tracing must
-/// never affect serving, and a gateway on a pre-migration schema keeps
-/// running. The account is resolved by name IN the insert, as `usage` does,
-/// and a name with no account (a service key, an internal caller) stores
-/// NULL rather than a made-up identity.
+/// Insert one summary row (`repo::request_trace::insert`). A failure warns
+/// and nothing else: tracing must never affect serving, and a gateway on a
+/// pre-migration schema keeps running.
 pub async fn write_summary(db: &sqlx::PgPool, row: &SummaryRow) {
-    let s = &row.summary;
-    let username = if s.actor_kind.as_deref() == Some("user") { s.actor.as_deref() } else { None };
-    let res = sqlx::query(
-        "INSERT INTO noo_request_trace
-             (trace_id, method, route, status, duration_ms, user_uuid, actor, actor_kind,
-              model, backend, node_id, prompt_tokens, completion_tokens, span_count,
-              request_bytes, response_bytes)
-         VALUES ($1, $2, $3, $4, $5,
-                 (SELECT u.user_uuid FROM noo_users u WHERE u.username = $6),
-                 $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
-    )
-    .bind(&row.trace_id)
-    .bind(&row.method)
-    .bind(&row.route)
-    .bind(row.status)
-    .bind(row.duration_ms)
-    .bind(username)
-    .bind(s.actor.as_deref())
-    .bind(s.actor_kind.as_deref())
-    .bind(s.model.as_deref())
-    .bind(s.backend.as_deref())
-    .bind(s.node.as_deref())
-    .bind(s.prompt_tokens)
-    .bind(s.completion_tokens)
-    .bind(row.span_count)
-    .bind(row.request_bytes)
-    .bind(row.response_bytes)
-    .execute(db)
-    .await;
-    if let Err(e) = res {
+    if let Err(e) = crate::repo::request_trace::insert(db, row).await {
         warn_once_a_minute("request_trace_write_failed", &e.to_string());
     }
 }
 
-/// Bound the table: delete every row older than `keep_days`.
-pub async fn prune(db: &sqlx::PgPool, keep_days: i64) -> Result<u64, sqlx::Error> {
-    let res = sqlx::query("DELETE FROM noo_request_trace WHERE at < now() - ($1::bigint * interval '1 day')")
-        .bind(keep_days)
-        .execute(db)
-        .await?;
-    Ok(res.rows_affected())
-}
-
 async fn prune_tick(state: Arc<AppState>) -> anyhow::Result<()> {
-    match prune(&state.db, RETENTION_DAYS).await {
+    match crate::repo::request_trace::prune(&state.db, RETENTION_DAYS).await {
         Ok(0) => Ok(()),
         Ok(n) => {
             tracing::info!(pruned = n, retention_days = RETENTION_DAYS, "request_trace.pruned");

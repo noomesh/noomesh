@@ -3188,7 +3188,7 @@ mod tests {
         assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(REQUEST_TRACE_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_request_trace"));
         assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE"), "no row is rewritten or dropped");
-        let writer = include_str!("request_trace.rs");
+        let writer = include_str!("repo/request_trace.rs");
         let insert = writer.split("INSERT INTO noo_request_trace").nth(1).expect("the writer inserts");
         let cols = insert.split('(').nth(1).and_then(|c| c.split(')').next()).expect("a column list");
         for col in cols.split(',').map(str::trim) {
@@ -3197,7 +3197,7 @@ mod tests {
         assert!(writer.contains("DELETE FROM noo_request_trace WHERE at <"), "the prune keys on `at`");
         assert!(m.sql.contains("\n    at timestamptz NOT NULL DEFAULT now()"));
         assert!(m.sql.contains("ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS trace_id text"));
-        assert!(include_str!("usage.rs").contains("harness_kind, task_id, trace_id)"));
+        assert!(include_str!("usage.rs").contains("trace_id, harness_kind, task_id)"));
     }
 
     /// i150: the migration columns sit on the embed-placement revision, all nullable

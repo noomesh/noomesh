@@ -551,7 +551,7 @@ async fn insert(db: &sqlx::PgPool, row: &Row<'_>) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO noo_token_usage
              (node_id, backend, model, source, user_uuid, consumer,
-              prompt_tokens, completion_tokens, harness_kind, task_id, trace_id)
+              prompt_tokens, completion_tokens, trace_id, harness_kind, task_id)
          VALUES ($1, $2, $3, $4,
                  (SELECT u.user_uuid FROM noo_users u WHERE u.username = $5),
                  $6, $7, $8, $9, $10, $11)",
@@ -564,9 +564,9 @@ async fn insert(db: &sqlx::PgPool, row: &Row<'_>) -> Result<(), sqlx::Error> {
     .bind(row.actor.consumer.as_deref())
     .bind(row.prompt_tokens as i32)
     .bind(row.completion_tokens as i32)
+    .bind(row.trace_id)
     .bind(row.harness_kind)
     .bind(row.task_id)
-    .bind(row.trace_id)
     .execute(db)
     .await
     .map(|_| ())
