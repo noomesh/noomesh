@@ -147,6 +147,8 @@ pub fn prepare_from(
     // What the overlay takes from core, and (third-party) its name: refused
     // here, before an image is pulled or a pin written (`guards`).
     guards::guard_install(ctx.root, addon, &fetched.files).map_err(Refusal::Decl)?;
+    // The gateway refuses a bad routes.json whole at load: refuse it here, by its own rules.
+    check::refuse_bad_routes(addon, &fetched.files)?;
     resolve::require_bundle(&verified, ctx.tag)?;
     let mut cred = || -> Result<Option<Credential>, String> {
         ctx.client.docker_credential(&route).map_err(|e| format!("{}: {}", route.host(), e.summary()))

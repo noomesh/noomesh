@@ -153,6 +153,7 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     addons::resolve_lock(client, &anchor, &want, supplied)
                         .and_then(|(v, f)| {
                             addons::guards::guard_install(&root, addon, &f.files).map_err(resolve::Refusal::Decl)?;
+                            addons::check::refuse_bad_routes(addon, &f.files)?;
                             Ok((v, f))
                         })
                         .and_then(|(v, f)| resolve::require_bundle(&v, &tag).map(|()| (v, f)))
