@@ -889,9 +889,11 @@ noo-docker-socket-proxy` (the container prefix is `NOO_CONTAINER_PREFIX`).
 
 ## Request tracing
 
-Every request the gateway serves becomes a trace (i359, operator decision
-2026-10-31: trace everything, keep 30 days, metadata and sizes only, never
-prompt or answer text). Two places hold it:
+Every authenticated request the gateway serves becomes a trace (i359,
+operator decision 2026-10-31: trace everything, keep 30 days, metadata and
+sizes only, never prompt or answer text). An anonymous request, a refused
+credential (401) and a rate-limited one (429) record nothing, so a flood costs
+no database write. Two places hold it:
 
 - **`noo_request_trace` (Postgres)**, one row per request: when, the route
   TEMPLATE (`/api/tasks/{id}`, never the filled-in path), method, status,
@@ -904,10 +906,14 @@ prompt or answer text). Two places hold it:
   request with the same facts as attributes, sent as OTLP/HTTP JSON with the
   gateway's own leaf.
 
-A caller that sends a W3C `traceparent` header is continued (its trace id, the
-gateway's span parented on the caller's); every traced response answers with a
-`traceparent` header naming the gateway's span, so a client can find its own
-trace. A streamed answer's trace ends when the stream does.
+An authenticated caller that sends a W3C `traceparent` header is continued
+(its trace id, the gateway's span parented on the caller's); an
+unauthenticated one's is ignored, so it cannot join a trace it names. Every
+recorded response answers with a `traceparent` header naming the gateway's
+span, so a client can find its own trace. A streamed answer's trace ends when
+the stream does. Summary rows go through a bounded queue to one writer; when
+the database falls behind, rows are dropped and counted
+(`noo_request_trace_rows_dropped_total`), never queued without bound.
 
 Not traced: `/health`, `/metrics`, `/static/` and the node log push.
 

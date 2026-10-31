@@ -431,7 +431,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Request tracing (i359), outside the logger so the trace covers it,
         // inside security_headers so the `traceparent` it adds is kept. A
         // `Router::layer`, so the matched route template is known here.
-        .layer(axum_mw::from_fn_with_state(state.clone(), crate::request_trace::trace_layer))
+        .layer(axum_mw::from_fn(crate::request_trace::trace_layer))
         // Outermost so every response carries them, including 401s from the
         // auth gate and static files.
         .layer(axum_mw::from_fn(crate::middleware::security_headers))
