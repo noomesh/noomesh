@@ -1868,7 +1868,6 @@ mod permission_tests {
             (json!({"idle_timeout_secs": 3601}), "idle_timeout_secs"),
             (json!({"max_connections_per_user": 0}), "max_connections_per_user"),
             (json!({"max_connections_per_user": 65}), "max_connections_per_user"),
-            (json!({"owner_scoped": true}), "owner_scoped"),
         ] {
             let mut r = ok.clone();
             for (k, val) in edit.as_object().unwrap() {
@@ -1877,6 +1876,10 @@ mod permission_tests {
             let e = with(r).expect_err(&edit.to_string());
             assert!(e.contains(needle), "{edit}: {e}");
         }
+        // f99: owner_scoped on a socket is the add-on's promise and is accepted.
+        let mut scoped = ok.clone();
+        scoped["owner_scoped"] = json!(true);
+        with(scoped).expect("owner_scoped on a WS route");
         // The WS knobs mean nothing on an HTTP route: refused, not ignored.
         let e = with(json!({"name": "g", "method": "GET", "path": "/api/sample/g", "max_message_bytes": 10})).unwrap_err();
         assert!(e.contains("WS"), "{e}");
