@@ -573,6 +573,7 @@ func (s *Server) handleGPUHold(w http.ResponseWriter, r *http.Request) {
 		Owner       string `json:"owner"`
 		OperationID string `json:"operation_id"`
 		Workload    string `json:"workload"`
+		Purpose     string `json:"purpose"`
 		Mode        string `json:"mode"`
 		TimeoutSecs int    `json:"timeout_secs"`
 		Force       bool   `json:"force"`
@@ -583,6 +584,7 @@ func (s *Server) handleGPUHold(w http.ResponseWriter, r *http.Request) {
 		Owner:       clipField(body.Owner, 200),
 		OperationID: clipField(body.OperationID, 64),
 		Workload:    clipField(body.Workload, 120),
+		Purpose:     clipField(body.Purpose, 16),
 		Mode:        strings.TrimSpace(body.Mode),
 		Timeout:     time.Duration(body.TimeoutSecs) * time.Second,
 		Force:       body.Force,

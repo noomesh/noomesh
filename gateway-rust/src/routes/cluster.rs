@@ -2132,7 +2132,7 @@ async fn clean_node(
 /// start while the GPU is occupied (noomesh-internal i163 parts C and D).
 ///
 /// POST /api/cluster/nodes/{node_id}/gpu/hold — body `{reason?, operation_id?,
-/// owner?, workload?, mode?: drain|immediate, timeout_secs?, force?}`. Operator only;
+/// owner?, workload?, purpose?, mode?: drain|immediate, timeout_secs?, force?}`. Operator only;
 /// audited (`node_gpu_hold`, with the lease and whether it was a force).
 ///
 /// - `operation_id` names the caller's operation; the answer's
@@ -2151,6 +2151,10 @@ async fn clean_node(
 ///   hand-over primitive: the backends stay paused throughout, the pool never
 ///   gets the GPU in between. `workload` (`<addon>/<workload>`) names what
 ///   the GPU went to; the reservation layer keys on it and `operation_id`.
+/// - `purpose: "user"` marks the operator's own use of the GPU (i344b: `noo
+///   cluster gpu mode <node> user`); the lease carries it and the mode is read
+///   back from it. It is the only purpose and never sits beside a `workload`
+///   (400). An older agent drops it, and the hold reads as a manual one.
 /// - One hold or release runs on a node at a time (409 `transition_in_progress`).
 async fn gpu_hold(
     State(state): State<Arc<AppState>>,
@@ -2166,6 +2170,7 @@ async fn gpu_hold(
     let reason = text("reason", 200);
     let operation_id = text("operation_id", 64);
     let workload = text("workload", 120);
+    let purpose = gpu_hold_purpose(&text("purpose", 16), &workload).map_err(AppError::BadRequest)?;
     let legacy = operation_id.is_empty();
     let mut owner = text("owner", 200);
     if owner.is_empty() {
@@ -2183,12 +2188,26 @@ async fn gpu_hold(
         .unwrap_or(GPU_DRAIN_TIMEOUT_DEFAULT_SECS)
         .clamp(1, GPU_DRAIN_TIMEOUT_MAX_SECS);
     let force = legacy || b.get("force").and_then(Value::as_bool).unwrap_or(false);
-    let payload = json!({
+    let mut payload = json!({
         "reason": reason, "operation_id": operation_id, "owner": owner, "workload": workload, "mode": mode,
         "timeout_secs": timeout_secs, "force": force, "legacy": legacy,
     });
+    if !purpose.is_empty() {
+        payload["purpose"] = json!(purpose);
+    }
     let wait = std::time::Duration::from_secs(if mode == "drain" { timeout_secs + 60 } else { 90 });
     gpu_hold_op(&state, actor, &node_id, "hold", payload, wait).await
+}
+
+/// A hold's `purpose`: empty, or `user` (the operator's own use), never
+/// together with a workload. The agent applies the same rule.
+fn gpu_hold_purpose(purpose: &str, workload: &str) -> Result<String, String> {
+    match purpose.to_ascii_lowercase().as_str() {
+        "" => Ok(String::new()),
+        "user" if workload.is_empty() => Ok("user".into()),
+        "user" => Err(format!("purpose user is the operator's own use; a hold for workload {workload:?} has no purpose")),
+        other => Err(format!("purpose must be user or absent, not {other:?}")),
+    }
 }
 
 /// End an operator GPU hold: the node returns to the automatic shared-GPU
@@ -6688,6 +6707,18 @@ mod heartbeat_carry_tests {
         assert!(drain < call && lanes < call, "the lanes leave routing before the agent is asked to stop anything");
         assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/gpu/hold\", post(gpu_hold))"));
         assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/gpu/release\", post(gpu_release))"));
+    }
+
+    #[test]
+    fn a_hold_purpose_is_user_or_absent_and_never_beside_a_workload() {
+        assert_eq!(gpu_hold_purpose("", "").unwrap(), "");
+        assert_eq!(gpu_hold_purpose("User", "").unwrap(), "user");
+        assert!(gpu_hold_purpose("vr", "").unwrap_err().contains("user or absent"));
+        assert!(gpu_hold_purpose("user", "rhaddon/worker").is_err());
+        assert_eq!(gpu_hold_purpose("", "rhaddon/worker").unwrap(), "");
+        // Absent stays off the wire, so an unchanged hold is byte-identical.
+        let h = include_str!("cluster.rs").split("async fn gpu_hold(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        assert!(h.contains("if !purpose.is_empty()"), "purpose is sent only when set");
     }
 
     #[test]

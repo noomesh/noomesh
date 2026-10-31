@@ -713,7 +713,8 @@ way, and a workload that is not reserved answers 409.
 `yielded`, `draining` (a hold waiting for requests in flight) or `held`.
 `generation` counts the node's accepted holds; while draining or held,
 `lease` carries `{owner, operation_id, generation, mode, reason, since,
-drain_started, drained_at}`.
+drain_started, drained_at}`, plus `workload` for a reservation and
+`purpose: "user"` for a hold marking the operator's own use of the GPU.
 
 - `noo cluster status` prints `! host3: GPU in use by other work — vllm paused since <t> (foreign 11.2 GB)`.
 - `noo cluster verify host3` has a `control over bus` row: one `health` round

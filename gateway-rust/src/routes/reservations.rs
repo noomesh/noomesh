@@ -79,6 +79,8 @@ fn reservation_of(node_id: &str, record: &Value) -> Option<Value> {
         "since": lease.get("since").and_then(Value::as_str).unwrap_or(""),
         "mode": lease.get("mode").and_then(Value::as_str).unwrap_or(""),
         "reason": lease.get("reason").and_then(Value::as_str).unwrap_or(""),
+        // i344b: `user` for the operator's own use; empty from an older agent.
+        "purpose": lease.get("purpose").and_then(Value::as_str).unwrap_or(""),
         "paused_backends": gc.get("paused_backends").cloned().unwrap_or(json!([])),
         "gpu_total_mb": gc.get("total_mb").and_then(Value::as_u64).unwrap_or(0),
     }))
@@ -818,6 +820,9 @@ mod tests {
         // A plain operator hold lists too, with no workload.
         let plain = json!({"gpu_contention": {"state": "held", "lease": {"operation_id": "op-9", "owner": "op"}}});
         assert_eq!(reservation_of("x", &plain).unwrap()["workload"], "");
+        assert_eq!(reservation_of("x", &plain).unwrap()["purpose"], "");
+        let user = json!({"gpu_contention": {"state": "held", "lease": {"operation_id": "op-u", "owner": "op", "purpose": "user"}}});
+        assert_eq!(reservation_of("x", &user).unwrap()["purpose"], "user");
     }
 
     #[test]

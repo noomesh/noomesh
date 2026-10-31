@@ -675,13 +675,16 @@ and the vendor-CLI translator skip lines that are not `data:`).
 noomesh-internal i159, parts A and B.
 
 **A GPU hold is an owned lease, and it drains first.** `POST /gpu/hold`
-(controller-only) carries `{reason, owner, operation_id, mode, timeout_secs,
-force}` and `POST /gpu/release` carries `{operation_id, generation, force,
+(controller-only) carries `{reason, owner, operation_id, workload, purpose,
+mode, timeout_secs, force}` and `POST /gpu/release` carries `{operation_id, generation, force,
 resume}` (`internal/gpuyield`, `lease.go`). The agent persists the lease
 (`owner`, `operation_id`, the node's monotonic `generation`) and reports it
 in `gpu_contention.lease`; a release must quote the operation id and
 generation it was given (compare-and-set) or it is `409 held_by_other` with
 the current lease, so a stale retry can never end another operation's hold.
+`purpose` is a closed set: absent, or `user` for the operator's own use of
+the GPU (noomesh-internal i344b), which the lease carries; any other value,
+or `user` beside a `workload`, is refused and no hold is taken.
 `force` takes over or ends any hold and the gateway audits it as a force; a
 body with no operation id is a legacy call from an older CLI, treated as a
 force and audited `legacy`. One hold or release runs per node at a time
