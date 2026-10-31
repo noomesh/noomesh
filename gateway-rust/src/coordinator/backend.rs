@@ -612,7 +612,8 @@ struct Candidate {
     load: f64,
     excluded: bool,
     /// The class table's health rule ([`super::classes::node_health`]):
-    /// heartbeat fresh, reachable, not quarantined or offline.
+    /// heartbeat fresh, reachable, not quarantined or offline, and the
+    /// agent not reporting this backend as not serving.
     healthy: bool,
     /// Why not, when not healthy.
     health: String,
@@ -1077,7 +1078,6 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
                             // pinned turn and raw chat agree on who is up.
                             let inbound = crate::node_reachability::read_inbound(state, &key).await;
                             crate::node_reachability::apply_inbound(&mut data, inbound.as_deref());
-                            let (healthy, health) = super::classes::node_health(&key, &data, now);
                             let node_load = data.get("load")
                                 .and_then(|l| l.as_f64())
                                 .map(|l| scale_checked_load(&key, l))
@@ -1129,6 +1129,7 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
                                         let ip = data.get("ip_address").and_then(|v| v.as_str()).unwrap_or("");
                                         // Failed on a previous attempt of this request.
                                         let excluded = is_excluded(exclude_urls, &url, ip);
+                                        let (healthy, health) = super::classes::node_health(&key, &data, bt, now);
                                         candidates.push(Candidate {
                                             node_id,
                                             backend_type: bt.clone(),
@@ -1137,7 +1138,7 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
                                                                             load: node_load,
                                             excluded,
                                             healthy,
-                                            health: health.clone(),
+                                            health,
                                         });
                                     }
                                 }
@@ -1487,19 +1488,30 @@ mod tests {
     fn the_kv_scan_reads_health_from_the_heartbeat_stamp() {
         let now = 10_000.0;
         let fresh = serde_json::json!({"id": "host8", "ip_address": "100.64.0.8", "last_heartbeat": now - 10.0});
-        assert_eq!(crate::coordinator::classes::node_health("host8", &fresh, now), (true, String::new()));
+        assert_eq!(crate::coordinator::classes::node_health("host8", &fresh, "vllm", now), (true, String::new()));
         let stale = serde_json::json!({"id": "host8", "ip_address": "100.64.0.8", "last_heartbeat": now - 95.0});
-        let (ok, why) = crate::coordinator::classes::node_health("host8", &stale, now);
+        let (ok, why) = crate::coordinator::classes::node_health("host8", &stale, "vllm", now);
         assert!(!ok && why.contains("heartbeat 95s old"), "{why}");
         let quarantined = serde_json::json!({"id": "host8", "last_heartbeat": now, "status": "quarantined"});
-        assert!(!crate::coordinator::classes::node_health("host8", &quarantined, now).0);
+        assert!(!crate::coordinator::classes::node_health("host8", &quarantined, "vllm", now).0);
+        // 185b case 2: the agent says this backend's engine is not answering.
+        // Only that backend is unhealthy; its neighbour on the node is not.
+        let wedged = serde_json::json!({"id": "host8", "last_heartbeat": now,
+            "backend_containers": {"vllm": {"running": true, "serving": false, "serving_reason": "2 requests failed, none answered since"},
+                                   "llamacpp": {"running": true, "serving": true}}});
+        let (ok, why) = crate::coordinator::classes::node_health("host8", &wedged, "vllm", now);
+        assert!(!ok && why == "vllm not serving: 2 requests failed, none answered since", "{why}");
+        assert_eq!(crate::coordinator::classes::node_health("host8", &wedged, "llamacpp", now), (true, String::new()));
+        // An agent that predates the field: no `serving`, so serving.
+        let older = serde_json::json!({"id": "host8", "last_heartbeat": now, "backend_containers": {"vllm": {"running": true}}});
+        assert_eq!(crate::coordinator::classes::node_health("host8", &older, "vllm", now), (true, String::new()));
         let src = include_str!("backend.rs");
         // The resolver's body only: up to its closing brace, not this test.
         // (`\u{7d}` is a closing brace: a bare one in a string here unbalances the brace
         // count tests/test_gateway_refuses_plaintext.py strips test modules by.)
         let body = src.split("pub(crate) async fn resolve_backend_and_node(").nth(1).expect("resolver");
         let body = body.split("\n\u{7d}\n").next().expect("resolver body");
-        assert!(body.contains("classes::node_health(&key, &data, now)"), "the KV scan must apply the shared health rule");
+        assert!(body.contains("classes::node_health(&key, &data, bt, now)"), "the KV scan must apply the shared health rule");
         assert!(body.contains("order_candidates(&mut candidates"), "and sort by it");
     }
 

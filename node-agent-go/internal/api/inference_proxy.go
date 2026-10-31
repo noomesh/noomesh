@@ -526,7 +526,17 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 	// rather than a dead one — was diagnosable only by noticing that the
 	// request took exactly backendFirstByteTimeout. Name the bound in the
 	// line so the next reader does not have to.
-	proxy.ErrorHandler = func(rw http.ResponseWriter, _ *http.Request, err error) {
+	// Every answer, and every failure, is evidence that the engine is (or
+	// is not) serving (backend_serving.go). A caller that went away is not.
+	serving := s.servingTracker()
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		serving.observe(backendType, resp)
+		return nil
+	}
+	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+		if req.Context().Err() == nil {
+			serving.fail(backendType, "relayed request failed: "+err.Error(), false)
+		}
 		slog.Warn("inference proxy could not complete the upstream request",
 			"backend", backendType, "target", targetURL, "error", err,
 			"first_byte_timeout_seconds", int(firstByte.Seconds()))
