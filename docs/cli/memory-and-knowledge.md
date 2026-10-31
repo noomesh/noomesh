@@ -289,7 +289,7 @@ see [add-ons.md](../getting-started/add-ons.md).
 | `noo memory stats` | — | Show memory storage, conversation and tool-usage statistics |
 | `noo memory health` | — | Print the memory subsystem health report |
 | `noo memory tool-stats` | `[--days <n>]` | Show tool call counts and success rates over the last N days |
-| `noo memory embed` | `[--watch]` | Start the background embedding worker, optionally watching progress |
+| `noo memory embed` | `[-w\|--watch]` | Start the background embedding worker, optionally watching progress |
 | `noo memory embed-status` | `[--watch]` | Show embedding worker state and record counts, optionally polling |
 | `noo memory embed-stop` | — | Stop the background embedding worker |
 | `noo memory conversations` | `[--user <user>] [--limit <n>]` | List recent conversations with message counts and previews |
@@ -349,8 +349,8 @@ see [add-ons.md](../getting-started/add-ons.md).
 ### `noo ops` — Asynchronous operations: long runs started as an op, polled for their result
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo ops` | `[--status <s>] [--mine] [--limit <n>]` | Hidden: same as ops list |
-| `noo ops list` | `[--status <s>] [--mine] [--limit <n>]` | List your asynchronous operations, newest first (an admin sees everyone's) |
+| `noo ops` | `[-s\|--status <s>] [--mine] [-n\|--limit <n>]` | Hidden: same as ops list |
+| `noo ops list` | `[-s\|--status <s>] [--mine] [-n\|--limit <n>]` | List your asynchronous operations, newest first (an admin sees everyone's) |
 | `noo ops show` | `<id> [--wait]` | Show one operation: status, progress, result or error; --wait blocks until it finishes |
 | `noo ops cancel` | `<id>` | Cancel an operation: stops the gateway-side wait (the worker run may continue) |
 | `noo ops types` | — | List what can run as an operation, how long each waits and how long a run may take |

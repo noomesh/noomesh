@@ -267,26 +267,35 @@ fn embed_start_outcome(resp: &serde_json::Value) -> EmbedStart {
     }
 }
 
+/// `--watch/-w`, plus the removed tuning flags: each still swallows its value
+/// (a missing one too) and the first seen comes back so the caller can say it
+/// is gone. They are not documented, so they are asked for unlisted.
+pub(crate) fn parse_embed_with(a: &mut Args) -> Result<(bool, Option<&'static str>), ArgError> {
+    let watch = a.flag(&["--watch", "-w"]);
+    let mut removed: Option<&'static str> = None;
+    for f in ["--model"].into_iter().chain(EMBED_REMOVED_FLAGS) {
+        let seen = match a.value_unlisted(&[f]) {
+            Ok(v) => v.is_some(),
+            Err(_) => true,
+        };
+        if seen && removed.is_none() {
+            removed = Some(f);
+        }
+    }
+    if removed.is_none() {
+        a.finish()?;
+    }
+    Ok((watch, removed))
+}
+
 /// `noo memory embed [-w]` — POST /api/memory/embed/start. The gateway reads
 /// no body: batch size and delay come from noomesh.yaml, so the old tuning
 /// flags are gone and passing one says so. `--watch/-w` runs the native
 /// progress poll loop (see [`watch_embed_progress`]).
 pub fn memory_embed(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut watch = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--watch" | "-w" => watch = true,
-            "--model" => {
-                let _ = iter.next();
-                embed_flag_removed(g, "--model");
-            }
-            t if EMBED_REMOVED_FLAGS.contains(&t) => {
-                let _ = iter.next();
-                embed_flag_removed(g, t);
-            }
-            _ => return Err(Unhandled),
-        }
+    let (watch, removed) = parse_embed_with(&mut Args::new(args))?;
+    if let Some(flag) = removed {
+        embed_flag_removed(g, flag);
     }
     let resp = post_json(g, "/api/memory/embed/start", &serde_json::json!({}), true, 10);
     let outcome = embed_start_outcome(&resp);
