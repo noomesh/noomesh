@@ -2800,7 +2800,7 @@ pub const WALKS_SETTINGS_PATH: &str = "/api/v1/walks/settings";
 /// keys, and peer tokens are scoped by their own branches in
 /// `require_any_auth`.
 pub(crate) fn scope_allows(claims: &Claims, method: &axum::http::Method, path: &str) -> bool {
-    scope_allows_for(&claims.scopes, claims.resolved_role(), method, path)
+    scope_allows_for(&claims.scopes, claims.resolved_role(), Some(account_of(&claims.sub)), method, path)
 }
 
 /// Whether an already-authenticated requester may make `method path` — the
@@ -2821,10 +2821,12 @@ pub fn requester_allows(requester: &RequesterCtx, method: &axum::http::Method, p
     if crate::addon_workloads::proxy_allows(&requester.sub, path) {
         return true;
     }
-    scope_allows_for(&requester.scopes, requester.role, method, path)
+    scope_allows_for(&requester.scopes, requester.role, Some(account_of(&requester.sub)), method, path)
 }
 
-fn scope_allows_for(scopes: &[String], role: Role, method: &axum::http::Method, path: &str) -> bool {
+/// `account` is the caller's account: a features add-on route (f99) is
+/// decided per account, every other path by role and scopes.
+fn scope_allows_for(scopes: &[String], role: Role, account: Option<&str>, method: &axum::http::Method, path: &str) -> bool {
     use axum::http::Method;
     let has = |s: &str| scopes.iter().any(|x| x == s);
     if role >= Role::Operator {
@@ -2836,11 +2838,11 @@ fn scope_allows_for(scopes: &[String], role: Role, method: &axum::http::Method, 
     if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
         // An add-on's GET is scoped by the route's own `min_role`/`scopes`
         // (addon_proxy), not waved through with the allow-list.
-        return user_may_read(path) || crate::addon_proxy::mounted_get_allows(scopes, role, path);
+        return user_may_read(path) || crate::addon_proxy::mounted_get_allows(scopes, role, account, path);
     }
     // A write the add-on's manifest opted in with `owner_scoped` (the add-on
     // keeps every row to the forwarded account). Exact manifest match only.
-    if crate::addon_proxy::mounted_owner_scoped_allows(method, scopes, role, path) {
+    if crate::addon_proxy::mounted_owner_scoped_allows(method, scopes, role, account, path) {
         return true;
     }
     if CHAT_QUERY_PREFIXES.iter().any(|p| path.starts_with(p)) {

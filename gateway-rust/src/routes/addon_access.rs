@@ -46,6 +46,14 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/security/users/{username}/super-admin", put(super_admin_set))
 }
 
+/// A write takes effect on the next request: reload the settings every check
+/// reads. A failed reload leaves the periodic one to catch up, and says so.
+async fn reload_now(state: &AppState) {
+    if let Err(e) = addon_access::reload(&state.db).await {
+        tracing::warn!(error = %e, "addon_access_reload_after_write_failed: the change applies within the periodic re-read");
+    }
+}
+
 fn db_err(e: sqlx::Error) -> AppError {
     AppError::Internal(format!("database: {e}"))
 }
@@ -220,6 +228,7 @@ async fn access_set(
                 .map_err(db_err)?;
         }
     }
+    reload_now(&state).await;
     let after = body.value.trim();
     crate::audit::record(
         &state.db,
@@ -331,6 +340,7 @@ async fn super_admin_set(
     if n == 0 {
         return Err(AppError::NotFound(format!("no account {target:?}")));
     }
+    reload_now(&state).await;
     crate::audit::record(
         &state.db,
         AuditEvent::new(AuditKind::SuperAdminSet, &by, target)
