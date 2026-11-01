@@ -880,13 +880,28 @@ pub(crate) fn vendor_telemetry_check(n: &Value) -> Check {
 const DOOR_LEAF_MIN_REMAINING_SECS: i64 = 14 * 86_400;
 
 /// The `backend doors` row for a node record, reading the controller's
-/// copy of each door leaf from its PKI dir.
+/// copy of each door leaf from its PKI dir. Run where there is no
+/// controller PKI at all (no `nodes/` dir: an operator's CLI on a worker
+/// box), the controller's copies are NOT CHECKED HERE and the row says so;
+/// it is never read as "the controller holds no leaf" (i213).
 pub(crate) fn backend_doors_row(n: &Value, now_unix: i64) -> Check {
+    backend_doors_row_in(n, &crate::pki::pki_dir(), now_unix)
+}
+
+/// [`backend_doors_row`] over the PKI dir `pki`.
+pub(crate) fn backend_doors_row_in(n: &Value, pki: &std::path::Path, now_unix: i64) -> Check {
     let id = n["id"].as_str().unwrap_or("?");
-    let leaf_of = |svc: &str| crate::commands::node_leaves::read_leaf(
-        &crate::pki::ClusterCa::new(crate::pki::pki_dir()).node_service_dir(id, svc));
+    if !pki.join("nodes").is_dir() {
+        return backend_doors_check_with(n, None, now_unix);
+    }
+    let ca = crate::pki::ClusterCa::new(pki.to_path_buf());
+    let leaf_of = |svc: &str| crate::commands::node_leaves::read_leaf(&ca.node_service_dir(id, svc));
     backend_doors_check(n, &leaf_of, now_unix)
 }
+
+/// What the row says when the controller's copies could not be read here.
+pub(crate) const DOORS_NOT_CHECKED_HERE: &str =
+    "the controller's copies not checked (no controller PKI here: run `noo cluster verify` on the controller)";
 
 /// The `backend doors` row. For every door-backed
 /// backend on the node — what it runs in Docker (`running_backends`, less
@@ -917,6 +932,18 @@ pub(crate) fn backend_doors_row(n: &Value, now_unix: i64) -> Check {
 /// called for a backend the node actually has, so a record with none
 /// reads nothing from disk.
 pub(crate) fn backend_doors_check(n: &Value, leaf: &dyn Fn(&str) -> crate::commands::node_leaves::LeafState, now_unix: i64) -> Check {
+    backend_doors_check_with(n, Some(leaf), now_unix)
+}
+
+/// [`backend_doors_check`], with `leaf` None where there is no controller
+/// PKI to read: step 2 (the controller's copy) is skipped and the row says it
+/// was not checked here; the node's report and its refusals are judged as
+/// always. A row that would pass becomes a WARN naming where to run it.
+pub(crate) fn backend_doors_check_with(
+    n: &Value,
+    leaf: Option<&dyn Fn(&str) -> crate::commands::node_leaves::LeafState>,
+    now_unix: i64,
+) -> Check {
     use crate::commands::node_leaves::{door_leaf_for_backend, LeafState};
     const NAME: &str = "backend doors";
     let id = n["id"].as_str().unwrap_or("?");
@@ -968,11 +995,12 @@ pub(crate) fn backend_doors_check(n: &Value, leaf: &dyn Fn(&str) -> crate::comma
             door.doors[0].to_string()
         };
         let before = problems.len();
-        match leaf(svc) {
-            LeafState::Missing => problems.push(format!(
+        match leaf.map(|f| f(svc)) {
+            None => {}
+            Some(LeafState::Missing) => problems.push(format!(
                 "{b}: the controller holds no {svc} leaf for {id} (nodes/{id}/services/{svc}/) — no bundle can carry one")),
-            LeafState::Unreadable(e) => problems.push(format!("{b}: the controller's {svc} leaf for {id} is unreadable ({e})")),
-            LeafState::Present { dns, not_after, .. } => {
+            Some(LeafState::Unreadable(e)) => problems.push(format!("{b}: the controller's {svc} leaf for {id} is unreadable ({e})")),
+            Some(LeafState::Present { dns, not_after, .. }) => {
                 if !dns.contains(&dial) {
                     problems.push(format!("{b}: the controller's {svc} leaf for {id} does not name {dial}"));
                 } else if not_after - now_unix < DOOR_LEAF_MIN_REMAINING_SECS {
@@ -1003,6 +1031,21 @@ pub(crate) fn backend_doors_check(n: &Value, leaf: &dyn Fn(&str) -> crate::comma
                 }
             },
         }
+    }
+    if leaf.is_none() {
+        if problems.is_empty() {
+            // Nothing wrong that could be seen from here, and one half that
+            // could not be looked at: a WARN that says where to look.
+            let node_side = if unreported.is_empty() {
+                "leaf present on the node, names its door, not expiring; no refusal"
+            } else {
+                "no refusal recorded, but the agent predates backend doors reporting"
+            };
+            return warn(NAME, format!("{}: {node_side}; {DOORS_NOT_CHECKED_HERE}", backends.join(", ")), None);
+        }
+        // A real problem on the node's side still fails; the row also says
+        // which half it could not check.
+        problems.push(DOORS_NOT_CHECKED_HERE.to_string());
     }
     if !problems.is_empty() {
         let check = fail(NAME, problems.join("; "), remedy);
@@ -7410,6 +7453,53 @@ mod tests {
 
         n["data_roots"]["running_mounts_resolved"] = serde_json::json!({"/opt/noo/hf-cache": "/mnt/d/noo/hf-cache"});
         assert_eq!(data_root_row(&n).verdict, Verdict::Fail);
+    }
+
+    /// i213: run where there is no controller PKI (no `nodes/` dir: an
+    /// operator's CLI on a worker box), the controller's copies are NOT
+    /// CHECKED HERE and the row says where to run it, a WARN, never a red that
+    /// blames the controller. With a `nodes/` dir that lacks this node's
+    /// leaf, the row stays red. A node-side fault still fails either way.
+    #[test]
+    fn the_backend_doors_row_off_the_controller_says_it_did_not_check() {
+        let now = 1_800_000_000;
+        let far = now + 80 * 86_400;
+        let mut n = healthy(now);
+        n["id"] = "host3".into();
+        n["running_backends"] = serde_json::json!({"vllm": "m"});
+        n["backend_runtimes"] = serde_json::json!({"vllm": "docker"});
+        n["backend_leaves"] = serde_json::json!({"vllm": {"dns": ["vllm", "noo-vllm"], "not_after": far}});
+        let root = std::env::temp_dir().join(format!("noo-i213-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // No nodes/ dir at all: not checked here, said, and where to run it.
+        let c = backend_doors_row_in(&n, &root, now);
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains(DOORS_NOT_CHECKED_HERE), "{}", c.detail);
+        assert!(c.detail.contains("run `noo cluster verify` on the controller"), "{}", c.detail);
+        assert!(!c.detail.contains("holds no"), "blamed the controller: {}", c.detail);
+
+        // A node-side fault is still a fault off the controller.
+        let mut bad = n.clone();
+        bad["backend_leaves"]["vllm"]["dns"] = serde_json::json!(["vllm"]);
+        let c = backend_doors_row_in(&bad, &root, now);
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("does not name noo-vllm") && c.detail.contains(DOORS_NOT_CHECKED_HERE), "{}", c.detail);
+
+        // An agent that predates the report: still a WARN, still says why.
+        let mut old = n.clone();
+        old.as_object_mut().unwrap().remove("backend_leaves");
+        let c = backend_doors_row_in(&old, &root, now);
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains(DOORS_NOT_CHECKED_HERE), "{}", c.detail);
+
+        // A controller PKI (nodes/ exists) without this node's leaf: red.
+        std::fs::create_dir_all(root.join("nodes")).unwrap();
+        let c = backend_doors_row_in(&n, &root, now);
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("the controller holds no vllm leaf for host3"), "{}", c.detail);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Every shape of the `backend doors` row, one plant at a time, on a
