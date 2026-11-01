@@ -1113,14 +1113,6 @@ pub(crate) fn erase_store_tables() -> Vec<&'static str> {
     erase_targets(true, true).iter().map(|t| t.table).collect()
 }
 
-/// The archive (`$1` username, `$2` run id, `$3` store label) and delete
-/// (`$1` username) statements the erase runs for `table`, with its store
-/// label, for a repo test that erases one store against a real table.
-#[allow(dead_code)]
-pub(crate) fn erase_statements(table: &str) -> Option<(String, String, &'static str)> {
-    erase_targets(true, true).iter().find(|t| t.table == table).map(|t| (t.snapshot_sql(), t.delete_sql(), t.label))
-}
-
 #[derive(Deserialize)]
 struct EraseBody {
     /// Default TRUE — an erase call with no body only previews.
@@ -4354,7 +4346,7 @@ async fn team_delete_inner(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     /// Security review of #1001: `graph` is a per-account USER scope
     /// (`KNOWN_USER_SCOPES`), not a service-key scope. A service key cannot be
     /// issued it, by itself or beside `read`, so no key can gain the six graph
@@ -4369,6 +4361,13 @@ mod tests {
         assert!(!OPERATOR_ONLY_KEY_SCOPES.contains(&"graph"));
         // control: a vocabulary scope is still accepted, so the test is not vacuous
         assert!(validate_key_scopes(&["chat".to_string()]).is_ok());
+    }
+
+    /// The archive (`$1` username, `$2` run id, `$3` store label) and delete
+    /// (`$1` username) statements the erase runs for `table`, with its store
+    /// label, for a repo test that erases one store against a real table.
+    pub(crate) fn erase_statements(table: &str) -> Option<(String, String, &'static str)> {
+        super::erase_targets(true, true).iter().find(|t| t.table == table).map(|t| (t.snapshot_sql(), t.delete_sql(), t.label))
     }
 
     use axum::response::IntoResponse;
