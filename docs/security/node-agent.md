@@ -954,7 +954,11 @@ applier's install loop and the agent's own door table.
 `noo cluster verify <node>` judges this in its `backend doors` row: for
 each door-backed backend on the node, no `backend_tls` or `backend_door`
 refusal, the controller's copy names the door and is not expiring, and the
-node's own copy does too.
+node's own copy does too. The controller's copy is read from the controller's
+PKI dir, so `noo cluster verify <node>` run where there is none (no `nodes/`
+dir: an operator's CLI on a worker box) says the controller's copies were not
+checked there and to run it on the controller: a WARN, never a red that
+blames the controller (i213). The node's side is judged as always.
 
 The node's copy is what the agent reports. On every heartbeat, and on
 registration, it sends `backend_leaves`: for each door service it holds a
