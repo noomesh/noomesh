@@ -95,6 +95,18 @@ pub const TOKEN_KEY: &str = "NOO_ADDON_REGISTRY_TOKEN";
 /// The user name sent with it. Optional; GHCR checks only the token.
 pub const USER_KEY: &str = "NOO_ADDON_REGISTRY_USER";
 const DEFAULT_USER: &str = "noo";
+/// The only registry host the vendor token (`NOO_ADDON_REGISTRY_TOKEN`) is
+/// ever presented to. A Direct route to any other host gets no credential from
+/// it, so a caller that forgets to swap in a third-party client cannot leak it.
+pub const VENDOR_REGISTRY_HOST: &str = "ghcr.io";
+/// The store key holding one third-party add-on's pull credential (i277h):
+/// `NOO_ADDON_REGISTRY_CRED_<NAME>`, the name upper-cased with `-` as `_`.
+pub const CRED_KEY_PREFIX: &str = "NOO_ADDON_REGISTRY_CRED_";
+
+/// The store key for `addon`'s registry credential.
+pub fn cred_key(addon: &str) -> String {
+    format!("{CRED_KEY_PREFIX}{}", addon.to_ascii_uppercase().replace('-', "_"))
+}
 
 /// The tag an add-on lock for `stack_tag` is published under.
 pub fn lock_tag(stack_tag: &str) -> String {
@@ -264,6 +276,24 @@ pub fn installed_credential() -> Result<Option<Credential>, String> {
     Ok(Some(Credential { user, token }))
 }
 
+/// The pull credential stored for third-party `addon` (i277h), bound to
+/// `root`. `Ok(None)`: the store holds none. `Err`: the store could not be read.
+pub fn stored_bound(addon: &str, root: &str) -> Result<Option<Bound>, String> {
+    let repo = crate::envfile::repo_root();
+    if !crate::envfile::sops_backend_active() {
+        return Ok(None);
+    }
+    let path = repo.join("secrets/env.sops");
+    let store = crate::commands::secrets::SecretStore::load_sops(&path)
+        .map_err(|e| format!("{} could not be read for {}: {e}", path.display(), cred_key(addon)))?;
+    let token = store.get(&cred_key(addon)).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    Ok(token.map(|token| Bound {
+        addon: addon.to_string(),
+        root: root.to_string(),
+        cred: Credential { user: DEFAULT_USER.to_string(), token },
+    }))
+}
+
 /// The lock and signature as fetched, before any verification. From a
 /// bundle, `lock` is the bundle lock and `files` its files by name (each
 /// blob already checked against the manifest digest, and nothing else yet:
@@ -287,6 +317,15 @@ struct Auth {
     proxy: bool,
 }
 
+/// One third-party add-on's pull credential, bound to the registry root the
+/// operator trusted it for. It is presented on a route to exactly that root.
+#[derive(Debug, Clone)]
+pub struct Bound {
+    pub addon: String,
+    pub root: String,
+    pub cred: Credential,
+}
+
 /// An OCI registry client for add-on locks.
 pub struct Client {
     /// Manifest and token requests: no redirects at all.
@@ -295,8 +334,15 @@ pub struct Client {
     /// the Authorization header.
     blob_agent: ureq::Agent,
     scheme: &'static str,
-    /// The vendor token (`NOO_ADDON_REGISTRY_TOKEN`), Direct path only.
+    /// The vendor token (`NOO_ADDON_REGISTRY_TOKEN`), Direct path only, and
+    /// only to `vendor_host`.
     cred: Option<Credential>,
+    /// The one host the vendor token may be presented to (`None`: any host,
+    /// the loopback fake registry of the tests).
+    vendor_host: Option<&'static str>,
+    /// A third-party add-on's own credential and the root it is bound to. A
+    /// client that holds one never presents the vendor token.
+    bound: Option<Bound>,
     /// The entitlement credential, Proxy path only.
     proxy: Option<ProxyAuth>,
     /// The registry host of the current fetch: the token realm must be on it.
@@ -308,19 +354,44 @@ impl Client {
     /// The production client: https only, verified by the platform trust
     /// store, Authorization never forwarded on a redirect.
     pub fn new(cred: Option<Credential>) -> Self {
-        Client { agent: agent(true, 0), blob_agent: agent(true, 5), scheme: "https", cred, proxy: None, host: Default::default(), auth: Default::default() }
+        Client { agent: agent(true, 0), blob_agent: agent(true, 5), scheme: "https", cred, vendor_host: Some(VENDOR_REGISTRY_HOST), bound: None, proxy: None, host: Default::default(), auth: Default::default() }
     }
 
     /// Plain http on loopback, for the fake registry in tests only.
     #[cfg(test)]
     pub(crate) fn plain_http_for_tests(cred: Option<Credential>) -> Self {
-        Client { agent: agent(false, 0), blob_agent: agent(false, 5), scheme: "http", cred, proxy: None, host: Default::default(), auth: Default::default() }
+        Client { agent: agent(false, 0), blob_agent: agent(false, 5), scheme: "http", cred, vendor_host: None, bound: None, proxy: None, host: Default::default(), auth: Default::default() }
     }
 
     /// Add the proxy credential (used only on a Proxy route).
     pub fn with_proxy(mut self, proxy: Option<ProxyAuth>) -> Self {
         self.proxy = proxy;
         self
+    }
+
+    /// Bind a third-party add-on's credential to its registry root. The vendor
+    /// token is dropped: the two never travel together.
+    pub fn with_bound(mut self, bound: Option<Bound>) -> Self {
+        if bound.is_some() {
+            self.cred = None;
+        }
+        self.bound = bound;
+        self
+    }
+
+    /// What a Direct route to `route` presents: the bound credential on its
+    /// root and nowhere else; else the vendor token on the vendor host only.
+    fn direct_credential(&self, route: &Route) -> Option<Credential> {
+        if let Some(b) = &self.bound {
+            return (route.root() == b.root).then(|| b.cred.clone());
+        }
+        let host_ok = self.vendor_host.is_none_or(|h| route.host() == h);
+        if host_ok { self.cred.clone() } else { None }
+    }
+
+    /// Is a third-party credential presented on `route`?
+    pub fn presents_bound(&self, route: &Route) -> bool {
+        self.bound.is_some() && self.direct_credential(route).is_some()
     }
 
     /// The route for `anchor` with this client's credentials.
@@ -332,7 +403,11 @@ impl Client {
     /// credential. Never a secret.
     pub fn describe(&self, route: &Route) -> String {
         match route {
-            Route::Direct { .. } if self.cred.is_some() => format!("via {} ({TOKEN_KEY})", route.host()),
+            Route::Direct { .. } if self.presents_bound(route) => {
+                let addon = self.bound.as_ref().map(|b| b.addon.as_str()).unwrap_or_default();
+                format!("via {} (credential for {addon})", route.root())
+            }
+            Route::Direct { .. } if self.direct_credential(route).is_some() => format!("via {} ({TOKEN_KEY})", route.host()),
             Route::Direct { .. } => format!("via {} (anonymous)", route.host()),
             Route::Proxy { .. } => match &self.proxy {
                 Some(p) => format!("via {} (entitlement {}{})", route.host(), p.ent_id,
@@ -345,7 +420,7 @@ impl Client {
     /// Point the token exchange at `route`'s credential.
     fn arm(&self, route: &Route) {
         let a = match route {
-            Route::Direct { .. } => Auth { basic: self.cred.clone(), pop: None, proxy: false },
+            Route::Direct { .. } => Auth { basic: self.direct_credential(route), pop: None, proxy: false },
             Route::Proxy { .. } => Auth {
                 basic: self.proxy.as_ref().map(|p| Credential { user: p.ent_id.clone(), token: p.entitlement.clone() }),
                 pop: self.proxy.as_ref().and_then(|p| p.key.clone()),
@@ -507,13 +582,14 @@ impl Client {
         self.fetch_armed(route.root(), stack_tag)
     }
 
-    /// The credential docker logs in with to pull `route`'s images: the
-    /// vendor token on the Direct path; on the Proxy path a fresh proxy
+    /// The credential docker logs in with to pull `route`'s images: on the
+    /// Direct path the bound third-party credential (its own root only) or the
+    /// vendor token (the vendor host only), else none; on the Proxy path a fresh proxy
     /// access token (short-lived, scoped to what the entitlement grants)
     /// with the entitlement id as the user. The entitlement and the
     /// controller key never reach docker.
     pub fn docker_credential(&self, route: &Route) -> Result<Option<Credential>, FetchError> {
-        let Route::Proxy { .. } = route else { return Ok(self.cred.clone()) };
+        let Route::Proxy { .. } = route else { return Ok(self.direct_credential(route)) };
         let Some(p) = &self.proxy else {
             return Err(FetchError::new(FetchClass::Auth, format!("{} needs the installed entitlement, and none is usable", route.host())));
         };
@@ -1255,6 +1331,49 @@ mod tests {
         // Without a proxy credential the Proxy route is refused, not tried anonymously.
         let e = Client::plain_http_for_tests(None).docker_credential(&route).unwrap_err();
         assert_eq!(e.class, FetchClass::Auth, "{e}");
+    }
+
+    fn pull_token(c: &Client, root: &str) -> Option<String> {
+        c.docker_credential(&Route::Direct { root: root.into() }).unwrap().map(|c| c.token)
+    }
+
+    fn bound(addon: &str, root: &str) -> Bound {
+        Bound { addon: addon.into(), root: root.into(), cred: Credential { user: "noo".into(), token: "tp-token".into() } }
+    }
+
+    /// The vendor token goes to the vendor's host only: a Direct route to any
+    /// other host presents nothing, even from a client the caller forgot to swap.
+    #[test]
+    fn the_vendor_token_is_presented_to_the_vendor_host_only() {
+        let c = Client::new(Some(Credential { user: "u".into(), token: "vendor-token".into() }));
+        assert_eq!(pull_token(&c, "ghcr.io/example/intel").as_deref(), Some("vendor-token"));
+        assert_eq!(pull_token(&c, "registry.operator.example/example/intel"), None);
+        assert_eq!(pull_token(&c, "ghcr.io.evil.example/example/intel"), None);
+        let other = Route::Direct { root: "registry.operator.example/x/y".into() };
+        assert!(c.describe(&other).contains("anonymous"), "{}", c.describe(&other));
+    }
+
+    /// The third-party credential goes to its bound root only; the vendor token
+    /// never rides with it, and a vendor client never holds it.
+    #[test]
+    fn a_bound_credential_reaches_its_root_only_and_the_vendor_token_never_joins_it() {
+        let c = Client::new(Some(Credential { user: "u".into(), token: "vendor-token".into() })).with_bound(Some(bound("pai-voice", "ghcr.io/personifai/pai-voice")));
+        assert_eq!(pull_token(&c, "ghcr.io/personifai/pai-voice").as_deref(), Some("tp-token"));
+        for other in ["ghcr.io/personifai/other", "ghcr.io/personifai/pai-voice/x", "ghcr.io/noomesh/evolve", "evil.example/personifai/pai-voice"] {
+            assert_eq!(pull_token(&c, other), None, "{other}: neither the bound credential nor the vendor token");
+        }
+        let route = Route::Direct { root: "ghcr.io/personifai/pai-voice".into() };
+        assert_eq!(c.describe(&route), "via ghcr.io/personifai/pai-voice (credential for pai-voice)");
+        // A vendor client has no binding: it presents the vendor token, not the add-on's.
+        let vendor = Client::new(Some(Credential { user: "u".into(), token: "vendor-token".into() }));
+        assert_eq!(pull_token(&vendor, "ghcr.io/personifai/pai-voice").as_deref(), Some("vendor-token"));
+        assert!(!format!("{:?}", bound("a", "b")).contains("tp-token"), "Debug redacts the token");
+    }
+
+    #[test]
+    fn the_store_key_is_per_addon() {
+        assert_eq!(cred_key("pai-voice"), "NOO_ADDON_REGISTRY_CRED_PAI_VOICE");
+        assert_eq!(cred_key("rh_addon2"), "NOO_ADDON_REGISTRY_CRED_RH_ADDON2");
     }
 
     #[test]

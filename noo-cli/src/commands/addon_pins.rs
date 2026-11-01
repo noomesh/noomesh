@@ -119,9 +119,6 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         Ok(p) => p,
         Err(e) => fail(g.json, ExitCode::Generic, "pins_unreadable", &e, Some("noo addons verify")),
     };
-    // A third-party add-on is fetched with NO credential: the vendor token is
-    // never sent to a registry the operator named.
-    let plain = addons::lock_fetch::Client::new(None);
     if lock_ref.is_some() && (named.len() != 1 || !resolve::third_party(&named[0])) {
         fail(g.json, ExitCode::Usage, "usage", "--lock names one third-party add-on's lock: give exactly that add-on", Some(UPGRADE_USAGE));
     }
@@ -129,14 +126,23 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut failed = 0;
     for addon in list {
         let third_party = resolve::third_party(addon);
-        let client = if third_party { &plain } else { &client };
+        // A third-party add-on is fetched with its OWN client: never the vendor
+        // token, and only the credential registered for it (`registry-login`),
+        // sent to the root its keys were trusted for.
+        let own = third_party.then(|| resolve::installed_anchor(addon).and_then(|a| addons::third_party_client(addon, &a)));
+        let client = match &own {
+            Some(Ok(c)) => c,
+            _ => &client,
+        };
         let ctx = addons::Ctx { root: &root, tag: &tag, stack_lock: stack_lock.as_deref(), allow_downgrade, client };
         let installed = current.get(addon).cloned();
         let supplied = match (third_party, lock_ref.as_deref()) {
             (true, Some(r)) => Some(addons::trust::fetch_supplied(r).map_err(resolve::Refusal::Supplied)),
             _ => None,
         };
-        let outcome = if let Some(Err(e)) = &supplied {
+        let outcome = if let Some(Err(e)) = own.as_ref() {
+            Err(e.clone())
+        } else if let Some(Err(e)) = &supplied {
             Err(e.clone())
         } else if check {
             let supplied = supplied.and_then(Result::ok);

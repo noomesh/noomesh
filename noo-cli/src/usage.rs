@@ -385,6 +385,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["addons", "check"], "<bundle-dir> [--name <addon>]", "Enable's guard, resources and routes.json checks on a bundle dir; not signature/key/image"),
     (&["addons", "trust-key"], "<name> <pubkey> [--registry <host/path>] [--dev] [--expires <dur>]", "Trust a third-party add-on's signing key; --dev --expires (max 30d): a temporary dev key"),
     (&["addons", "untrust-key"], "<name> [<pubkey>] [--dev]", "Stop trusting a third-party add-on's signing key; --dev removes its dev key(s)"),
+    (&["addons", "registry-login"], "<addon> [--registry <root>] [--from-file <path>] [--clear]", "Set a third-party add-on's private-registry pull token (stdin or file); --clear drops it"),
     (&["addons", "set"], "<name> --delegate tasks|off", "Let an add-on act on a person's tasks (needs its manifest to declare it too)"),
     (&["addons", "disable"], "<name>", "Declare an add-on OFF in noomesh.yaml; restart applies it"),
     (&["addons", "upgrade"], "[<name>...] [--check] [--allow-downgrade] [--lock <path|https-url>]", "Re-resolve add-ons' signed locks for this stack, pull by digest and re-pin"),

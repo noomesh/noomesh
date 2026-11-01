@@ -708,6 +708,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["addons", "rotate-secret"], commands::addons_rotate_secret),
     (&["addons", "trust-key"], commands::addons_trust_key),
     (&["addons", "untrust-key"], commands::addons_untrust_key),
+    (&["addons", "registry-login"], commands::addons_registry_login),
     (&["addons", "set"], commands::addons_set),
     (&["kiosk", "enroll"], commands::kiosk_enroll),
     (&["kiosk", "invite"], commands::kiosk_invite),

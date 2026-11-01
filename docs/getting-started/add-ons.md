@@ -159,9 +159,23 @@ noo health --json                            # "addons" reads enabled for it
   marks it DEV with the expiry, and `noo addons untrust-key yourthing --dev`
   removes it. See "Development keys" in docs/development/addons.md.
 
-Limits of the third-party path today: the lock and the images are fetched
-**anonymously** from the registry you named, so a private registry is not
-supported (the vendor's `NOO_ADDON_REGISTRY_TOKEN` is never sent to it), and
+A private registry takes one credential per add-on. Create a read-only token
+for the add-on's package (`read:packages` on GHCR) and register it:
+
+```bash
+noo addons registry-login yourthing --registry <root> < token.txt   # or --from-file token.txt
+```
+
+`<root>` must be exactly the root you trusted the add-on's key for. The token is
+read from stdin or the file, never the command line; it is kept in the encrypted
+secret store (`NOO_ADDON_REGISTRY_CRED_YOURTHING`), `noo addons list` shows
+whether one is set (never its value), and it is sent to that registry root and
+nowhere else. The vendor's `NOO_ADDON_REGISTRY_TOKEN` is never sent to it.
+`noo addons registry-login yourthing --clear` removes it, and so does
+`noo addons untrust-key` when it removes the add-on's last key.
+
+Limits of the third-party path today: without that credential the lock and the
+images are fetched **anonymously** from the registry you named, and
 there is no proxy or entitlement-mediated pull. The add-on's own gateway key and
 database credentials are not minted for it: its overlay's key declaration is
 read only for the add-ons the CLI ships, so provision a key with `noo security

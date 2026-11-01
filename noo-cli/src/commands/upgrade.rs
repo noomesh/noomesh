@@ -4287,6 +4287,9 @@ fn addon_client(g: &Globals) -> crate::addons::lock_fetch::Client {
 
 /// Remedy for an add-on that holds a stack roll.
 fn addon_hold_fix(addon: &str, r: &crate::addons::resolve::Refusal) -> String {
+    if let Some(fix) = r.registry_login_fix(addon) {
+        return fix;
+    }
     if r.is_auth() {
         return r.auth_fix().to_string();
     }

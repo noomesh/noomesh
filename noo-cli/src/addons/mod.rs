@@ -80,6 +80,39 @@ pub fn installed_client() -> Result<lock_fetch::Client, String> {
     Ok(lock_fetch::Client::new(cred).with_proxy(proxy))
 }
 
+/// The client for third-party add-on `addon`, trusted for `anchor`: the vendor
+/// token is never in it. When the trust entry records a pull credential bound to
+/// this anchor's registry root, the client carries it for that root only; the
+/// store is read just then. A recorded credential the store cannot produce is an
+/// error, never an anonymous pull that fails later with a bare "unauthorized".
+pub fn third_party_client(addon: &str, anchor: &TrustAnchor) -> Result<lock_fetch::Client, Refusal> {
+    let recorded = trust::installed_credential_root(addon)
+        .map_err(|e| Refusal::Untrusted(format!("the trust list could not be read to resolve {addon}: {e}")))?;
+    let bound = bound_for(addon, anchor, recorded.as_deref(), &|root| lock_fetch::stored_bound(addon, root)).map_err(Refusal::Store)?;
+    Ok(lock_fetch::Client::new(None).with_bound(bound))
+}
+
+/// [`third_party_client`]'s decision over its inputs: the root the trust entry
+/// records a credential for, and a reader of the store. A record bound to some
+/// other root than the one trusted now (the registry was re-trusted since) is
+/// not used.
+fn bound_for(
+    addon: &str,
+    anchor: &TrustAnchor,
+    recorded: Option<&str>,
+    read: &dyn Fn(&str) -> Result<Option<lock_fetch::Bound>, String>,
+) -> Result<Option<lock_fetch::Bound>, String> {
+    let Some(root) = recorded.map(str::trim).filter(|r| *r == anchor.registry.trim()) else { return Ok(None) };
+    match read(root)? {
+        Some(b) => Ok(Some(b)),
+        None => Err(format!(
+            "noomesh.yaml records a registry credential for {addon} ({root}), and the encrypted store holds none ({}). \
+             Register it again: `noo addons registry-login {addon} --registry {root}`",
+            lock_fetch::cred_key(addon)
+        )),
+    }
+}
+
 /// Where and against what one or more add-ons are resolved.
 pub struct Ctx<'a> {
     pub root: &'a Path,
@@ -114,7 +147,7 @@ pub fn resolve_lock(
 
 /// [`prepare`] against an explicit anchor and, optionally, a supplied lock.
 /// A third-party add-on goes through here with the anchor the operator
-/// trusted and a credential-less client.
+/// trusted and its own client ([`third_party_client`]).
 pub fn prepare_from(
     ctx: &Ctx,
     addon: &str,
@@ -122,16 +155,32 @@ pub fn prepare_from(
     supplied: Option<Fetched>,
     docker: &mut dyn Docker,
 ) -> Result<Prepared, Refusal> {
+    // Whoever calls this, a third-party add-on is fetched with its OWN client:
+    // the vendor's registry token must never reach a registry the operator
+    // named, and the add-on's credential goes to its trusted root only.
+    if resolve::third_party(addon) {
+        let own = third_party_client(addon, anchor)?;
+        return prepare_with(ctx, addon, anchor, supplied, docker, &own);
+    }
+    prepare_with(ctx, addon, anchor, supplied, docker, ctx.client)
+}
+
+/// [`prepare_from`] with the client chosen by the caller.
+fn prepare_with(
+    ctx: &Ctx,
+    addon: &str,
+    anchor: &TrustAnchor,
+    supplied: Option<Fetched>,
+    docker: &mut dyn Docker,
+    client: &lock_fetch::Client,
+) -> Result<Prepared, Refusal> {
     let anchor = anchor.clone();
-    // Whoever calls this, a third-party add-on is fetched with NO credential:
-    // the vendor's registry token must never reach a registry the operator named.
-    let plain = lock_fetch::Client::new(None);
     let ctx = &Ctx {
         root: ctx.root,
         tag: ctx.tag,
         stack_lock: ctx.stack_lock,
         allow_downgrade: ctx.allow_downgrade,
-        client: if resolve::third_party(addon) { &plain } else { ctx.client },
+        client,
     };
     let current = pins::read(ctx.root).map_err(Refusal::Write)?;
     let pin = current.get(addon);
@@ -155,7 +204,16 @@ pub fn prepare_from(
     let mut cred = || -> Result<Option<Credential>, String> {
         ctx.client.docker_credential(&route).map_err(|e| format!("{}: {}", route.host(), e.summary()))
     };
-    let pulled = resolve::pull_images(docker, &verified, &route, &mut cred)?;
+    let pulled = resolve::pull_images(docker, &verified, &route, &mut cred).map_err(|r| match r {
+        // Fail loud: a third-party pull refused for access names the verb, and
+        // tells "no credential set" from "the credential was refused".
+        Refusal::Pull(e) if resolve::third_party(addon) && resolve::pull_unauthorized(&e) => Refusal::PullAuth {
+            root: route.root().to_string(),
+            credential_set: ctx.client.presents_bound(&route),
+            detail: e,
+        },
+        r => r,
+    })?;
     Ok(Prepared {
         addon: addon.to_string(),
         verified,
