@@ -256,7 +256,6 @@ x-trellion-env: &trellion-env
   NOO_TLS_KEY: '${NOO_TLS_KEY:+/app/pki/leaf/service.key}'
   NOO_TLS_CA: '${NOO_TLS_CA:+/app/pki/ca.crt}'
   NOO_PKI_DIR: '${NOO_PKI_DIR:-}'
-  NOO_REDIS_TLS: '${NOO_REDIS_TLS:-}'
   NOO_NATS_TLS: '${NOO_NATS_TLS:-}'
   NOO_PG_SSLMODE: '${NOO_PG_SSLMODE:-}'
   # ── RAG / embeddings / LLM endpoints ───────────────────────────────

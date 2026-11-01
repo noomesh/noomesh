@@ -221,6 +221,16 @@ def test_cache_refuses_a_plaintext_redis_url_and_says_why() -> None:
     assert _apply_redis_tls("rediss://redis:6379") == "rediss://redis:6379"
 
 
+def test_noo_redis_tls_is_retired_everywhere_it_was_written_or_passed() -> None:
+    """1242 finding 2: nothing reads NOO_REDIS_TLS (not cache.py, not the
+    Redis entrypoint, not the trellion siblings), so onboarding no longer
+    writes it and compose no longer passes it. A key that is written and
+    passed but never read is a switch that looks live and does nothing. A
+    value left in an old `.env` is ignored."""
+    for rel in ("docker-compose.cluster.yml", "docker-compose.trellion.yml", "noo-cli/src/onboard/steps.rs"):
+        assert "NOO_REDIS_TLS" not in (ROOT / rel).read_text(), f"{rel} writes or passes NOO_REDIS_TLS again"
+
+
 def test_browser_session_is_reached_through_the_node_agent_not_a_plain_node_url() -> None:
     """`format!("http://{host}:{port}")` built the browser session URL, which
     the SERVICE regex cannot see: plaintext HTTP straight at a published

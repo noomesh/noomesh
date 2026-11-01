@@ -3302,7 +3302,6 @@ fn ensure_pki(ctx: &mut Ctx) {
         ("NOO_MTLS_GATEWAY", "true".into()),
         ("NOO_TLS_CERT", format!("{pki}/gateway/gateway.crt")),
         ("NOO_TLS_KEY", format!("{pki}/gateway/gateway.key")),
-        ("NOO_REDIS_TLS", "true".into()),
         ("NOO_NATS_TLS", "true".into()),
         // No NOO_PG_TLS: since 2026-09-28 the Postgres service is TLS-only
         // unconditionally (docker-compose.cluster.yml) and every DSN

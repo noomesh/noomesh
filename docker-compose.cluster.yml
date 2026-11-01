@@ -579,7 +579,6 @@ services:
       - NOO_TLS_CA=${NOO_TLS_CA:+/app/pki/ca.crt}
       - NOO_MTLS_GATEWAY=${NOO_MTLS_GATEWAY:-}
       - NOO_PKI_DIR=${NOO_PKI_DIR:-}
-      - NOO_REDIS_TLS=${NOO_REDIS_TLS:-}
       - NOO_NATS_TLS=${NOO_NATS_TLS:-}
       - NOO_PG_SSLMODE=${NOO_PG_SSLMODE:-}
       # Grafana SSO. The console's "Open Grafana" asks
@@ -1179,7 +1178,6 @@ services:
       - { source: redis_password, target: redis_password, x-noo-uid: "65532" }
     environment:
       - REDIS_PASSWORD_FILE=${REDIS_PASSWORD:+/run/secrets/redis_password}
-      - NOO_REDIS_TLS=${NOO_REDIS_TLS:-}
     volumes:
       - redis-data:/data
       - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
