@@ -510,4 +510,46 @@ describe('useCoordinator', () => {
     expect(result.current.messages.length).toBe(before);
     expect(reconnect).toHaveBeenCalledTimes(1);
   });
+
+  // ── what a turn is doing before its first token (operator, 2026-11-01) ──
+
+  it('tracks the phase frames, then thinking, and clears on the first answer token', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    const { result } = inFlight();
+    fire('onMessage', { type: 'phase', phase: 'routed', node: 'mcmini', slots_busy: 2, slots_total: 2, queued_ahead: 1 });
+    expect(last(result.current.messages).phase).toMatchObject({ kind: 'routed', node: 'mcmini', since: 1_000_000 });
+
+    vi.setSystemTime(1_004_000);
+    fire('onMessage', { type: 'phase', phase: 'prompt', input_tokens: 1834 });
+    expect(last(result.current.messages).phase).toMatchObject({ kind: 'prompt', node: 'mcmini', since: 1_004_000 });
+
+    vi.setSystemTime(1_005_000);
+    fire('onMessage', { type: 'thinking', text: 'hmm' });
+    expect(last(result.current.messages).phase).toMatchObject({ kind: 'thinking', since: 1_005_000 });
+    vi.setSystemTime(1_009_000);
+    fire('onMessage', { type: 'thinking', text: ' more' });
+    expect(last(result.current.messages).phase).toMatchObject({ kind: 'thinking', since: 1_005_000 });
+
+    fire('onMessage', { type: 'content', text: 'Answer' });
+    expect(last(result.current.messages).phase).toBeUndefined();
+    // A late phase frame once tokens flow does not bring the line back.
+    fire('onMessage', { type: 'phase', phase: 'routed', node: 'host8' });
+    expect(last(result.current.messages).phase).toBeUndefined();
+  });
+
+  it('an older gateway with no phase frames still gets a routed line from harness_dispatched', () => {
+    const { result } = inFlight();
+    fire('onMessage', { type: 'harness_dispatched', node: 'mcmini', kind: 'claude-code' });
+    expect(last(result.current.messages).phase).toMatchObject({ kind: 'routed', node: 'mcmini' });
+  });
+
+  it('a tool call, done, or error clears the phase', () => {
+    for (const end of [{ type: 'tool_call', name: 'noo_cluster_status' }, { type: 'done' }, { type: 'error', text: 'x' }]) {
+      const { result } = inFlight();
+      fire('onMessage', { type: 'phase', phase: 'routed', node: 'awolf' });
+      fire('onMessage', end);
+      expect(last(result.current.messages).phase).toBeUndefined();
+    }
+  });
 });

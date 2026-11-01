@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button';
 import { ChatRail } from '@/components/ChatRail';
 import { ApprovalCard } from './ApprovalCard';
 import { useCoordinator, type TurnStats, type ToolRun } from './useCoordinator';
+import { phaseLabel, type TurnPhase } from './phase';
 import { useBackendHealth } from './useBackendHealth';
 import { atTail } from './followTail';
 import { formatElapsed } from './toolElapsed';
@@ -28,6 +29,23 @@ export interface ChatPaneProps {
 
 /** Short model label — `org/Model-Name` renders as `Model-Name`. */
 const shortModel = (m: string) => m.split('/').pop() ?? m;
+
+/**
+ * What a turn is doing before its first token ("queued on mcmini (2/2 busy)
+ * · 4s", "thinking… 12s"), its timer ticking once a second while shown.
+ */
+export function PhaseLine({ phase }: { phase: TurnPhase }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  return (
+    <div className="phase-line" role="status" aria-live="polite">
+      {phaseLabel(phase, now)}
+    </div>
+  );
+}
 
 /**
  * Reasoning disclosure: live and open while the model thinks, then collapses
@@ -346,6 +364,7 @@ export function ChatPane({ panelHidden, onTogglePanel, onToggleChat, collapsed }
                   </span>
                 )}
               </div>
+              {m.streaming && !m.text && m.phase && <PhaseLine phase={m.phase} />}
               {m.thinking && (
                 <ThinkingBlock text={m.thinking} streaming={m.streaming} thinkMs={m.thinkMs} />
               )}

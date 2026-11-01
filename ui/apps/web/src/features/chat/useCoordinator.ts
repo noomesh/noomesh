@@ -4,6 +4,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { createSocket, type ManagedSocket } from '@metis/api';
 import { tokenStore, refreshToken } from '@/lib/client';
+import { phaseFromFrame, type PhaseFrame, type TurnPhase } from './phase';
 
 /** Per-turn accounting from the `done` frame (ws-protocol.md §2B). */
 export interface TurnStats {
@@ -74,6 +75,12 @@ export interface ChatTurn {
    * console names who is answering so the wait is not silent (i233).
    */
   answering?: { node: string; kind?: string };
+  /**
+   * What the turn is doing before its first answer token (queued, reading
+   * the prompt, thinking), shown with a running timer; cleared by the first
+   * token, a tool call, or the turn's end. See `phase.ts`.
+   */
+  phase?: TurnPhase;
 }
 
 export type ChatStatus = 'connecting' | 'live' | 'closed' | 'auth';
@@ -86,7 +93,7 @@ export interface Serving {
 
 // The subset of coordinator server→client frames we render (see
 // contracts/ws/ws-protocol.md §2B).
-interface CoordFrame {
+interface CoordFrame extends PhaseFrame {
   type: string;
   text?: string;
   conversation_id?: string;
@@ -274,7 +281,7 @@ export function useCoordinator() {
   const interrupt = (why: string) => {
     if (!busyRef.current) return;
     takeThinkMs();
-    patchLast((l) => ({ text: (l.text ? `${l.text}\n` : '') + `⚠ ${why}`, streaming: false, error: true }));
+    patchLast((l) => ({ text: (l.text ? `${l.text}\n` : '') + `⚠ ${why}`, streaming: false, error: true, phase: undefined }));
     mark(false);
     sockRef.current?.reconnectNow();
   };
@@ -297,7 +304,7 @@ export function useCoordinator() {
         setStatus('closed');
         // A turn interrupted by a drop would otherwise stream forever.
         if (busyRef.current) {
-          patchLast(() => ({ streaming: false }));
+          patchLast(() => ({ streaming: false, phase: undefined }));
           mark(false);
         }
       },
@@ -312,14 +319,35 @@ export function useCoordinator() {
             if (f.model || f.backend) setServing({ model: f.model, backend: f.backend });
             break;
           case 'harness_dispatched':
-            if (f.node) patchLast(() => ({ answering: { node: f.node!, kind: f.kind || undefined } }));
+            // An older gateway sends no `phase` frames: this is its "routed".
+            if (f.node)
+              patchLast((l) => ({
+                answering: { node: f.node!, kind: f.kind || undefined },
+                phase: l.phase ?? { kind: 'routed', since: Date.now(), node: f.node! },
+              }));
             break;
+          case 'phase': {
+            if (!busyRef.current) break;
+            const now = Date.now();
+            patchLast((l) => {
+              if (l.text) return {}; // tokens are flowing: the answer is the status
+              const next = phaseFromFrame(f, l.phase, now);
+              return next ? { phase: next } : {};
+            });
+            break;
+          }
           case 'working':
             patchLast((l) => ({ working: (l.working ?? '') + (f.text ?? '') }));
             break;
           case 'thinking':
             if (thinkStart.current === null) thinkStart.current = Date.now();
-            patchLast((l) => ({ thinking: (l.thinking ?? '') + (f.text ?? '') }));
+            patchLast((l) => ({
+              thinking: (l.thinking ?? '') + (f.text ?? ''),
+              phase:
+                l.phase?.kind === 'thinking' || l.text
+                  ? l.phase
+                  : { kind: 'thinking', since: Date.now(), node: l.phase && 'node' in l.phase ? l.phase.node : undefined },
+            }));
             break;
           case 'content': {
             // First content token ends the reasoning phase — that's what the
@@ -327,6 +355,7 @@ export function useCoordinator() {
             const ms = takeThinkMs();
             patchLast((l) => ({
               text: l.text + (f.text ?? ''),
+              phase: undefined,
               ...(ms === undefined ? {} : { thinkMs: ms }),
             }));
             break;
@@ -338,6 +367,7 @@ export function useCoordinator() {
           // approval card say *what* it is gating — see `approval_request`.
           case 'tool_call':
             patchLast((l) => ({
+              phase: undefined, // the tool chip is the status from here
               tools: [
                 ...(l.tools ?? []),
                 { name: f.name ?? 'tool', status: 'running', args: summariseArgs(f.arguments) },
@@ -439,6 +469,7 @@ export function useCoordinator() {
             const ms = takeThinkMs();
             patchLast(() => ({
               streaming: false,
+              phase: undefined,
               stats: readStats(f),
               ...(ms === undefined ? {} : { thinkMs: ms }),
             }));
@@ -454,6 +485,7 @@ export function useCoordinator() {
               text: (l.text ? `${l.text}\n` : '') + `⚠ ${f.text ?? 'error'}`,
               streaming: false,
               error: true,
+              phase: undefined,
             }));
             mark(false);
             break;
