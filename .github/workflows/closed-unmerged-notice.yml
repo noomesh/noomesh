@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Say how a pull request was closed without merging.
+#
+# A closing keyword ("fixes <owner>/<repo>#N") in a commit message or PR body in
+# ANY repository closes the referenced PR when it lands, and the close is
+# attributed to the one shared GitHub account, so it looks unattributable
+# (happened 2026-10-17 and 2026-11-01). GitHub records the cause in the
+# ClosedEvent's `closer`; this posts it as one comment, so the close is visible.
+#
+# Trigger is `pull_request: closed`, never `pull_request_target`: the job checks
+# out nothing and runs no PR code. Values from the API (a commit headline is
+# attacker-controlled) are written to files by jq and passed as a --body-file,
+# never interpolated into shell. A fork PR's token cannot comment, so the
+# comment step is skipped for forks.
+name: Closed-unmerged notice
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+
+jobs:
+  notice:
+    if: >-
+      github.event.pull_request.merged == false
+      && github.repository == 'noomesh/noomesh'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+    - name: Find what closed the pull request
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -euo pipefail
+        owner="${REPO%%/*}"
+        name="${REPO#*/}"
+        gh api graphql \
+          -F owner="$owner" -F name="$name" -F number="$PR_NUMBER" \
+          -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){timelineItems(itemTypes:[CLOSED_EVENT],last:1){nodes{... on ClosedEvent{actor{login} closer{__typename ... on Commit{oid messageHeadline repository{nameWithOwner}} ... on PullRequest{number repository{nameWithOwner}}}}}}}}}' \
+          > "$RUNNER_TEMP/closed.json"
+        # jq builds the whole comment; no API value ever reaches a shell.
+        jq -r --arg n "$PR_NUMBER" '
+          (.data.repository.pullRequest.timelineItems.nodes[0] // {}) as $e
+          | ($e.closer // null) as $c
+          | if $c == null then
+              "Closed without merging by \($e.actor.login // "unknown"), with no linked commit."
+            elif $c.__typename == "Commit" then
+              "Closed without merging by a closing keyword in \($c.repository.nameWithOwner) commit \($c.oid[0:7]) (\($c.messageHeadline)). If that was not intended: `gh pr reopen \($n)`."
+            else
+              "Closed without merging by a closing keyword in \($c.repository.nameWithOwner)#\($c.number) (a pull request). If that was not intended: `gh pr reopen \($n)`."
+            end' "$RUNNER_TEMP/closed.json" > "$RUNNER_TEMP/notice.md"
+        test -s "$RUNNER_TEMP/notice.md"
+
+    - name: Post the notice
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        PR_URL: ${{ github.event.pull_request.html_url }}
+      run: gh pr comment "$PR_URL" --body-file "$RUNNER_TEMP/notice.md"

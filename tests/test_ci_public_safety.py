@@ -690,3 +690,22 @@ def test_path_guard_catches_a_removed_records_path():
     assert _REMOVED_RECORDS.search('println!("see internal/followups/78-x.md");')
     assert _REMOVED_RECORDS.search("see internal/CLI_AUTH_PLAN.md")
     assert not _REMOVED_RECORDS.search("node-agent-go/internal/docker/x.go")
+
+
+# ---- (f) the closed-unmerged notice cannot be turned into code execution -------
+
+
+def test_f_the_closed_unmerged_notice_is_inert():
+    doc = _load("closed-unmerged-notice.yml")
+    assert _triggers(doc) == {"pull_request"}  # never pull_request_target
+    assert (doc.get("on") or doc.get(True))["pull_request"]["types"] == ["closed"]
+    perms = doc["jobs"]["notice"]["permissions"]
+    assert perms == {"contents": "read", "pull-requests": "write"}
+    text = (WORKFLOWS_DIR / "closed-unmerged-notice.yml").read_text()
+    steps = doc["jobs"]["notice"]["steps"]
+    for step in steps:
+        assert "uses" not in step, "no action: gh with GITHUB_TOKEN only"
+        # API values (a commit headline is attacker-controlled) never reach the shell
+        assert "${{" not in step.get("run", ""), "expressions go through env:, not the script"
+    assert "merged == false" in doc["jobs"]["notice"]["if"]
+    assert "--body-file" in text
