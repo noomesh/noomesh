@@ -309,12 +309,20 @@ fn decide(n: &Value, want: Want) -> Plan {
         )),
         (Want::User, Mode::User) => Plan::Already(format!("{id}: already mode user")),
         (Want::User, Mode::Mesh) | (Want::User, Mode::Yielded) => {
-            if gc["method"].as_str() == Some("not-measured") && gc["state"].as_str() != Some("yielded") {
+            // Entering user mode never depends on a reading: only a node
+            // that has no GPU to measure, or lost it, is refused. A probe
+            // that is merely not answering (or an agent that gives no
+            // reason) goes ahead with a warning.
+            if gc["method"].as_str() == Some("not-measured") {
                 let why = match gc["unmeasured"].as_str() {
-                    Some("driver-lost") => "the NVIDIA driver lost the GPU; reboot the node first".to_string(),
-                    _ => "the node has no NVIDIA GPU noomesh can measure (none, or unified memory)".to_string(),
+                    Some("driver-lost") => Some("the NVIDIA driver lost the GPU; reboot the node first"),
+                    Some("no-nvidia") => Some("the node has no NVIDIA GPU"),
+                    Some("unified-memory") => Some("the node has unified memory, no separate GPU to hold"),
+                    _ => None,
                 };
-                return Plan::Refuse(refuse("gpu_not_measurable", format!("{id}: {why}"), Some(format!("noo cluster verify {id}"))));
+                if let Some(why) = why {
+                    return Plan::Refuse(refuse("gpu_not_measurable", format!("{id}: {why}"), Some(format!("noo cluster verify {id}"))));
+                }
             }
             Plan::Hold
         }
@@ -349,6 +357,13 @@ fn decide(n: &Value, want: Want) -> Plan {
             Some(format!("{}   # when the other work is done", release_line(id, gc))),
         )),
         (Want::Mesh, Mode::User) => {
+            if gc["method"].as_str() == Some("not-measured") {
+                return Plan::Refuse(refuse(
+                    "gpu_unreadable",
+                    format!("{id}: can't confirm the GPU is clear: the node's GPU probe is not answering (on WSL2: a Windows program is likely using the GPU)"),
+                    Some(format!("noo cluster gpu mode {id} mesh --wait 300   # retries until a measured reading passes the check")),
+                ));
+            }
             if let Some(why) = contention(gc) {
                 return Plan::Refuse(refuse(
                     "gpu_busy_by_other_work",
@@ -399,6 +414,8 @@ pub(crate) struct Outcome {
     /// Seconds from the write to the proof, when there was one.
     pub proof_secs: Option<u64>,
     pub note: Option<String>,
+    /// Something the operator should know that did not stop the change.
+    pub warning: Option<String>,
 }
 
 impl Outcome {
@@ -415,6 +432,7 @@ impl Outcome {
             warm: None,
             proof_secs: None,
             note: None,
+            warning: None,
         }
     }
 
@@ -446,6 +464,9 @@ impl Outcome {
         }
         if let Some(n) = &self.note {
             out["note"] = json!(n);
+        }
+        if let Some(w) = &self.warning {
+            out["warning"] = json!(w);
         }
         out
     }
@@ -494,7 +515,7 @@ pub(crate) fn run(gw: &mut impl Gateway, a: &GpuModeArgs, want: Want) -> Result<
     let mut waited = 0u64;
     let plan = loop {
         let plan = decide(&rec, want);
-        let busy = matches!(&plan, Plan::Refuse(r) if r.kind == "gpu_busy_by_other_work");
+        let busy = matches!(&plan, Plan::Refuse(r) if r.kind == "gpu_busy_by_other_work" || r.kind == "gpu_unreadable");
         if !busy || waited >= budget {
             break plan;
         }
@@ -523,6 +544,11 @@ pub(crate) fn run(gw: &mut impl Gateway, a: &GpuModeArgs, want: Want) -> Result<
         }
         Plan::Hold => {
             let timeout = a.timeout.unwrap_or(120).clamp(1, 900);
+            if rec["gpu_contention"]["method"].as_str() == Some("not-measured") {
+                let w = "GPU memory can't be read right now (the node's GPU probe timed out; on WSL2 this happens while a Windows program loads the GPU); the hold goes ahead, free memory is not confirmed";
+                out.warning = Some(w.to_string());
+                gw.say(&format!("{node}: {w}"));
+            }
             let how = if a.immediate { "immediate" } else { "drain" };
             if a.immediate {
                 gw.say(&format!("{node}: stopping its GPU backends now (--immediate: requests in flight are cut)"));
@@ -707,6 +733,9 @@ fn print_outcome(out: &Outcome, read_only: bool, now: i64) {
     }
     if let Some(note) = &out.note {
         ui::done(note);
+    }
+    if let Some(w) = &out.warning {
+        ui::warned(&format!("{node}: {w}"));
     }
     if !out.changed {
         return;
@@ -1096,14 +1125,54 @@ mod tests {
         let off = json!({"id": "awolf", "status": "offline", "gpu_contention": {"state": "free"}});
         assert_eq!(plan(off, Want::User).kind, "node_not_reporting");
         assert_eq!(plan(json!({"id": "awolf", "status": "online"}), Want::User).kind, "gpu_not_reported");
-        let lost = node(json!({"state": "free", "method": "not-measured", "unmeasured": "driver-lost"}), stopped());
-        let r = plan(lost, Want::User);
-        assert_eq!(r.kind, "gpu_not_measurable");
-        assert!(r.msg.contains("reboot"), "{}", r.msg);
-        let none = node(json!({"state": "free", "method": "not-measured", "unmeasured": "no-nvidia"}), stopped());
-        assert_eq!(plan(none, Want::User).kind, "gpu_not_measurable");
+        for (why, text) in [("driver-lost", "reboot"), ("no-nvidia", "no NVIDIA GPU"), ("unified-memory", "unified memory")] {
+            let n = node(json!({"state": "free", "method": "not-measured", "unmeasured": why}), stopped());
+            let r = plan(n, Want::User);
+            assert_eq!(r.kind, "gpu_not_measurable", "{why}");
+            assert!(r.msg.contains(text), "{why}: {}", r.msg);
+        }
         let unleased = node(json!({"state": "held", "method": "nvidia-smi", "lease": {"purpose": "user"}}), stopped());
         assert_eq!(plan(unleased, Want::Mesh).kind, "gpu_hold_refused");
+    }
+
+    #[test]
+    fn user_holds_and_warns_when_the_probe_is_not_answering() {
+        for gc in [
+            json!({"state": "free", "method": "not-measured", "unmeasured": "probe-timeout"}),
+            json!({"state": "free", "method": "not-measured"}),
+        ] {
+            let mut held = user_gc(0, 0);
+            held["method"] = json!("not-measured");
+            held.as_object_mut().unwrap().remove("noomesh_mb");
+            let mut f = Fake { node: node(gc, warm()), on_hold: node(held, stopped()), ..Default::default() };
+            let out = run(&mut f, &args("awolf", Want::User), Want::User).unwrap();
+            assert_eq!(f.calls, vec!["hold".to_string()], "the hold goes ahead");
+            assert!(out.warning.as_deref().unwrap().contains("GPU memory can't be read right now"), "{:?}", out.warning);
+            assert_eq!(out.free_confirmed, Some(false), "free is not confirmed");
+            assert_eq!(out.mode, Mode::User);
+            assert!(out.to_json()["warning"].is_string());
+        }
+    }
+
+    #[test]
+    fn mesh_refuses_an_unreadable_gpu_and_wait_retries_until_a_reading_passes() {
+        let mut unread = user_gc(0, 0);
+        unread["method"] = json!("not-measured");
+        unread.as_object_mut().unwrap().remove("free_mb");
+        unread.as_object_mut().unwrap().remove("foreign_mb");
+        let mut f = Fake { node: node(unread.clone(), stopped()), ..Default::default() };
+        let r = run(&mut f, &args("awolf", Want::Mesh), Want::Mesh).unwrap_err();
+        assert_eq!(r.kind, "gpu_unreadable");
+        assert!(r.msg.contains("can't confirm the GPU is clear"), "{}", r.msg);
+        assert!(r.hint.unwrap().starts_with("noo cluster gpu mode awolf mesh --wait 300"));
+        assert!(f.calls.is_empty());
+        let mut f = Fake { node: node(unread.clone(), stopped()), on_release: node(free_gc(), warm()), ..Default::default() };
+        f.before = VecDeque::from([node(unread.clone(), stopped()), node(unread, stopped()), node(user_gc(15000, 0), stopped())]);
+        let mut a = args("awolf", Want::Mesh);
+        a.wait = Some(60);
+        let out = run(&mut f, &a, Want::Mesh).unwrap();
+        assert_eq!(f.calls, vec!["release".to_string()]);
+        assert_eq!(out.warm, Some(true));
     }
 
     #[test]
