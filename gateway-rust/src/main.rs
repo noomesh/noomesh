@@ -523,12 +523,11 @@ async fn main() -> Result<()> {
     // back with a fresh JetStream store (what a container recreate does)
     // leaves `mesh_nodes`/`peer_agents` gone, and every reader treats a
     // missing bucket as "no nodes" — an empty fleet, not an error.
-    state::spawn_kv_bucket_watchdog(state.js.clone());
-    // agent-to-agent messaging — the stream and its recorder.
-    agent_messages::ensure_stream(&state.js).await;
-    // The job plane's streams: the worker used to declare them and its grant
-    // no longer allows it (see scheduler_engine.rs).
-    scheduler_engine::ensure_job_plane_streams(&state.js).await;
+    // The same task binds the agent-message stream and the job plane's
+    // streams (the worker used to declare those and its grant no longer
+    // allows it, see scheduler_engine.rs): now, if NATS is up, else when it
+    // connects (i301 a.3: the gateway serves degraded without the bus).
+    state::spawn_bus_objects(state.nats.clone(), state.js.clone());
     agent_messages::spawn_recorder(state.clone());
     // tasks resume when a harness announces itself, and the
     // controller's own resume at boot.

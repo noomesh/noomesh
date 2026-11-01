@@ -45,6 +45,21 @@ pub(super) fn attach_requester(body: &mut Value, ctx: &Option<axum::Extension<Re
     }
 }
 
+/// 503 `bus_unavailable` when the request never left because the gateway is
+/// not connected to NATS (i301 a.3), the same body every bus route answers;
+/// `None` for any other failure.
+pub(super) fn bus_down(e: &anyhow::Error) -> Option<StatusJson> {
+    e.downcast_ref::<crate::worker_client::BusUnavailable>()?;
+    Some((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": super::BUS_UNAVAILABLE,
+            "detail": super::BUS_UNAVAILABLE_DETAIL,
+            "retry_after_secs": super::BUS_RETRY_AFTER_SECS,
+        })),
+    ))
+}
+
 pub(super) fn worker_unavailable(e: impl std::fmt::Display, path: Option<&str>) -> StatusJson {
     let msg = e.to_string();
     // Deliberate refusal (trellion add-on off) gets the operator-facing
@@ -72,6 +87,9 @@ pub(super) fn worker_unavailable(e: impl std::fmt::Display, path: Option<&str>) 
 /// stays 503 via [`worker_unavailable`].
 pub(super) fn worker_failed(e: &anyhow::Error, path: Option<&str>) -> StatusJson {
     use crate::worker_client::{RefusalKind, WorkerRefusal};
+    if let Some(r) = bus_down(e) {
+        return r;
+    }
     if let Some(r) = e.downcast_ref::<WorkerRefusal>() {
         let status = match r.kind {
             RefusalKind::Policy => StatusCode::FORBIDDEN,
@@ -93,7 +111,7 @@ pub fn delegate_get(subject: &'static str) -> impl Fn(State<Arc<AppState>>, Opti
             let client = TrellionClient::new(&state.nats).with_requester(requester);
             match client.call_raw(subject, json!({})).await {
                 Ok(response) => worker_ok(response),
-                Err(e) => worker_unavailable(e, None),
+                Err(e) => bus_down(&e).unwrap_or_else(|| worker_unavailable(e, None)),
             }
         })
     }
@@ -107,7 +125,7 @@ pub fn delegate_post(subject: &'static str) -> impl Fn(State<Arc<AppState>>, Opt
             let client = TrellionClient::new(&state.nats).with_requester(requester);
             match client.call_raw(subject, body).await {
                 Ok(response) => worker_ok(response),
-                Err(e) => worker_unavailable(e, None),
+                Err(e) => bus_down(&e).unwrap_or_else(|| worker_unavailable(e, None)),
             }
         })
     }
@@ -121,6 +139,20 @@ pub fn delegate_post(subject: &'static str) -> impl Fn(State<Arc<AppState>>, Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// i301 a.3: a delegated route answers 503 `bus_unavailable` when the
+    /// request never left; any other worker failure keeps its own answer.
+    #[test]
+    fn a_delegated_route_without_the_bus_is_503_bus_unavailable() {
+        let e = anyhow::Error::new(crate::worker_client::BusUnavailable { subject: "worker.recall.videos".into() });
+        let (status, Json(body)) = worker_failed(&e, None);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "bus_unavailable");
+        assert!(body["detail"].as_str().is_some_and(|d| d.contains("noo stack start")), "{body}");
+        assert!(bus_down(&anyhow::anyhow!("NATS request failed: no responders")).is_none());
+        let src = include_str!("delegation.rs");
+        assert_eq!(src.matches("Err(e) => bus_down(&e).unwrap_or_else(|| worker_unavailable(e, None)),").count(), 2, "both delegate helpers");
+    }
 
     const REFUSAL: &str = "refusing '/etc/passwd': it is outside the directories noomesh may ingest from. allowed roots: /data/ingest/working";
 

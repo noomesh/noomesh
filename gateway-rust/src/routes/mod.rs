@@ -191,6 +191,39 @@ impl IntoResponse for AppError {
     }
 }
 
+/// The machine-readable code of a route that needs the bus while the gateway
+/// is not connected to NATS (i301 a.3).
+pub const BUS_UNAVAILABLE: &str = "bus_unavailable";
+
+/// What a `bus_unavailable` answer says.
+pub const BUS_UNAVAILABLE_DETAIL: &str = "the gateway is not connected to NATS (the bus), so worker dispatch, \
+     gossip and agent messages are down; it reconnects by itself when NATS is up (is the nats container \
+     running? noo stack start)";
+
+/// When to ask again after `bus_unavailable`.
+pub const BUS_RETRY_AFTER_SECS: u64 = 15;
+
+/// 503 `bus_unavailable` with `Retry-After`: the one answer every bus-backed
+/// route gives while NATS is down, so a client retries on the code.
+pub(crate) fn bus_unavailable() -> AppError {
+    AppError::UnavailableRetry {
+        code: BUS_UNAVAILABLE,
+        detail: BUS_UNAVAILABLE_DETAIL.into(),
+        retry_after_secs: BUS_RETRY_AFTER_SECS,
+    }
+}
+
+/// `Err(bus_unavailable())` unless `nats` is connected: the guard for a
+/// route that publishes on the bus itself rather than through
+/// `worker_client` (which refuses on its own).
+pub(crate) fn require_bus(nats: &async_nats::Client) -> Result<(), AppError> {
+    if crate::state::bus_connected(nats) {
+        Ok(())
+    } else {
+        Err(bus_unavailable())
+    }
+}
+
 /// Map a `(StatusCode, msg)` pair from a helper that answers in HTTP terms
 /// (e.g. `settings::mutate_config`) back onto the matching `AppError`, so a
 /// 404/409/503 is not flattened into an anonymous 500.
@@ -444,6 +477,37 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(crate::middleware::panic_response))
 
         .with_state(state)
+}
+
+/// i301 a.3: a route that publishes on the bus itself refuses at once while
+/// NATS is down, with the code, the reason and a `Retry-After`.
+#[cfg(test)]
+mod bus_unavailable_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn require_bus_is_503_bus_unavailable_with_retry_after_while_nats_is_down() {
+        let nats = crate::state::unconnected_bus().await;
+        let e = require_bus(&nats).expect_err("no bus");
+        let r = e.into_response();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(r.headers().get(axum::http::header::RETRY_AFTER).and_then(|v| v.to_str().ok()), Some("15"));
+        let body = axum::body::to_bytes(r.into_body(), 64 * 1024).await.expect("body");
+        let v: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["error"], BUS_UNAVAILABLE);
+        assert!(v["detail"].as_str().is_some_and(|d| d.contains("NATS") && d.contains("noo stack start")), "{v}");
+    }
+
+    /// The agent-message send route asks before it reads KV or publishes.
+    #[test]
+    fn the_message_send_route_asks_for_the_bus_first() {
+        let src = include_str!("agents.rs");
+        let h = src.split("async fn messages_send(").nth(1).expect("handler").split("\nasync fn ").next().unwrap();
+        let guard = h.find("super::require_bus(&state.nats)?;").expect("the bus guard");
+        for later in ["registered_keys(", "agent_messages::publish("] {
+            assert!(guard < h.find(later).unwrap_or_else(|| panic!("{later}")), "{later} runs before the guard");
+        }
+    }
 }
 
 #[cfg(test)]

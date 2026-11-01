@@ -5334,6 +5334,82 @@ mod system_credentials_tests {
     }
 }
 
+/// The authenticated `/health` body, read on a 503 too: a degraded gateway
+/// (no NATS, i301 a.3) answers 503 WITH the dependency map these rows read,
+/// and dropping it would turn every one of them into "not read" exactly when
+/// it matters.
+fn health_body(g: &Globals) -> Option<Value> {
+    let (status, text) = crate::http::get_raw_opt(g, "/health", true, 10)?;
+    health_from(status, &text)
+}
+
+pub(crate) fn health_from(status: u16, text: &str) -> Option<Value> {
+    matches!(status, 200 | 503).then(|| serde_json::from_str(text).ok()).flatten()
+}
+
+/// The `gateway bus` row (i301 a.3). Since 0.6.16 a gateway that cannot
+/// reach NATS SERVES (it used to exit and crash-loop), degraded: worker
+/// dispatch, gossip and agent messages answer 503 `bus_unavailable` until it
+/// connects, which it does by itself once NATS is up.
+pub(crate) fn gateway_bus_check(health: Option<&Value>) -> Check {
+    const NAME: &str = "gateway bus";
+    match health.and_then(|h| h["dependencies"]["nats"]["state"].as_str()) {
+        Some("connected") => ok(NAME, "connected to NATS"),
+        Some(state) => fail(
+            NAME,
+            format!(
+                "not connected to NATS ({state}) — the gateway serves DEGRADED: worker dispatch, gossip and \
+                 agent messages answer 503 bus_unavailable; it reconnects by itself once NATS is up \
+                 (is the nats container running? `noo stack status`)"
+            ),
+            "noo stack start",
+        ),
+        None => warn(
+            NAME,
+            "not read: no authenticated /health answer with dependencies.nats.state \
+             (unreachable, no credential, or a gateway older than this CLI)",
+            Some("noo health".into()),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod gateway_bus_tests {
+    use super::{gateway_bus_check, health_from, Verdict};
+    use serde_json::json;
+
+    #[test]
+    fn a_connected_bus_passes_a_down_one_fails_with_the_start_remedy() {
+        let up = json!({"status": "healthy", "dependencies": {"nats": {"healthy": true, "state": "connected"}}});
+        let c = gateway_bus_check(Some(&up));
+        assert_eq!((c.name, c.verdict), ("gateway bus", Verdict::Ok));
+        for state in ["reconnecting", "unresponsive"] {
+            let down = json!({"status": "degraded", "dependencies": {"nats": {"healthy": false, "state": state}}});
+            let c = gateway_bus_check(Some(&down));
+            assert_eq!(c.verdict, Verdict::Fail, "{state}");
+            assert!(c.detail.contains(&format!("({state})")) && c.detail.contains("bus_unavailable"), "{}", c.detail);
+            assert_eq!(c.remedy.as_deref(), Some("noo stack start"));
+        }
+    }
+
+    #[test]
+    fn no_state_is_a_warn_never_a_pass() {
+        let older = json!({"status": "healthy", "dependencies": {"nats": {"healthy": true}}});
+        for body in [None, Some(json!({"status": "healthy"})), Some(older)] {
+            assert_eq!(gateway_bus_check(body.as_ref()).verdict, Verdict::Warn);
+        }
+    }
+
+    /// The degraded gateway's 503 still carries the map the rows read.
+    #[test]
+    fn a_503_health_body_is_read_not_dropped() {
+        let body = r#"{"status":"degraded","dependencies":{"nats":{"healthy":false,"state":"reconnecting"}}}"#;
+        assert_eq!(health_from(503, body).unwrap()["dependencies"]["nats"]["state"], "reconnecting");
+        assert!(health_from(200, body).is_some());
+        assert!(health_from(401, body).is_none() && health_from(502, "x").is_none());
+    }
+}
+
 /// `dependencies.redis.state` from an AUTHENTICATED `/health` body
 /// (`connected` / `reconnecting` / `unavailable`). `None` when the body is
 /// absent or lacks it: the gateway was unreachable, is older than the field,
@@ -6116,7 +6192,8 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(embedding_spaces_check(spaces.as_ref()));
         // The gateway's own Redis connection (authenticated /health: the
         // anonymous body carries no dependency map).
-        let health = get_json_opt(g, "/health", true, 10);
+        let health = health_body(g);
+        checks.push(gateway_bus_check(health.as_ref()));
         checks.push(gateway_redis_check(health.as_ref()));
         // The bearer every add-on call is signed with (followup 304).
         checks.push(addon_caller_check(health.as_ref()));

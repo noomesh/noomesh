@@ -19,11 +19,17 @@ use crate::nats_credentials::NatsCredential;
 /// Connect to `url`. With `NOO_TLS_CA` set and present, TLS is pinned to
 /// the cluster CA and `NOO_TLS_CERT`/`NOO_TLS_KEY` add mTLS when both
 /// exist; without a CA, TLS is still required against the system store.
+///
+/// `in_background`: return at once and keep connecting (the gateway, i301
+/// a.3: it serves degraded without NATS instead of exiting, and catches up
+/// when the bus comes up). Without it the first connect must succeed (the
+/// node harness, whose supervisor restarts it).
 pub async fn connect(
     url: &str,
     cred: Option<NatsCredential>,
     inbox_prefix: &str,
     request_timeout: Duration,
+    in_background: bool,
 ) -> Result<async_nats::Client> {
     let ca_path = crate::tls::ca_path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let cert_path = std::env::var("NOO_TLS_CERT").unwrap_or_default();
@@ -81,6 +87,9 @@ pub async fn connect(
         .event_callback(crate::state::nats_event_logger);
     if let Some(c) = cred {
         opts = opts.user_and_password(c.user, c.password);
+    }
+    if in_background {
+        opts = opts.retry_on_initial_connect();
     }
     Ok(opts.connect(url).await?)
 }

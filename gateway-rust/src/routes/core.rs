@@ -1556,9 +1556,19 @@ async fn health(
     deps.insert("postgresql".into(), json!({"healthy": db_ok}));
     if !db_ok { all_ok = false; }
 
-    // Check NATS (flush acts as a ping — confirms the connection is live)
-    let nats_ok = state.nats.flush().await.is_ok();
-    deps.insert("nats".into(), json!({"healthy": nats_ok}));
+    // Check NATS. Required, never optional: without the bus there is no
+    // worker dispatch, gossip or agent messaging, so `status` is degraded
+    // and the code 503. Since i301 a.3 the gateway also SERVES without it
+    // (its client keeps connecting in the background), so the check reads
+    // the connection state first and bounds the flush ping: a flush on a
+    // disconnected client waits for the reconnect, and /health must not.
+    // `state` is the word `noo cluster verify` (gateway bus) reads.
+    let nats_ok = crate::state::bus_connected(&state.nats)
+        && tokio::time::timeout(std::time::Duration::from_secs(2), state.nats.flush())
+            .await
+            .is_ok_and(|r| r.is_ok());
+    let nats_state = nats_dependency_state(crate::state::bus_connected(&state.nats), nats_ok);
+    deps.insert("nats".into(), json!({"healthy": nats_ok, "state": nats_state}));
     if !nats_ok { all_ok = false; }
 
     // Check Redis. `state` is the word `noo cluster verify` ("gateway redis")
@@ -1681,6 +1691,17 @@ fn addon_caller_dep(minted: bool, failure: Option<&str>) -> Value {
         "error": failure.unwrap_or("not minted yet"),
         "remedy": crate::addon_auth::MISSING_REMEDY,
     })
+}
+
+/// `dependencies.nats.state`: `connected`, `unresponsive` (connected but the
+/// flush ping did not return in time) or `reconnecting` (no connection; the
+/// client keeps trying).
+fn nats_dependency_state(connected: bool, flushed: bool) -> &'static str {
+    match (connected, flushed) {
+        (true, true) => "connected",
+        (true, false) => "unresponsive",
+        (false, _) => "reconnecting",
+    }
 }
 
 /// The health body, by whether the caller presented a credential.
@@ -1900,6 +1921,19 @@ mod tests {
         let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
         assert_eq!(keys, vec!["status"], "anonymous /health leaked {keys:?}");
         assert_eq!(b["status"], "healthy");
+    }
+
+    /// i301 a.3: `dependencies.nats.state`, and the check never waits on a
+    /// disconnected client (it serves degraded now, and /health must answer).
+    #[test]
+    fn the_nats_dependency_says_why_and_never_waits_on_a_dead_bus() {
+        assert_eq!(nats_dependency_state(true, true), "connected");
+        assert_eq!(nats_dependency_state(true, false), "unresponsive");
+        assert_eq!(nats_dependency_state(false, false), "reconnecting");
+        let src = include_str!("core.rs");
+        let check = src.split("let nats_ok = ").nth(1).unwrap().split(';').next().unwrap();
+        assert!(check.starts_with("crate::state::bus_connected(&state.nats)"), "the state is read first: {check}");
+        assert!(check.contains("tokio::time::timeout(") && check.contains("state.nats.flush()"), "the ping is bounded: {check}");
     }
 
     #[test]
