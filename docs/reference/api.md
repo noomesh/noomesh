@@ -123,6 +123,16 @@ logout, as the CLI makes, counts too) and ends the access token it was using,
 `GET /auth/me` returns the caller's identity and scopes (`401` for a disabled
 or deleted account, or a token issued before the account's session floor).
 
+**Browser origin.** `POST /auth/token`, `/auth/refresh` and `/auth/logout`
+(and their `/api/auth/…` aliases) answer a browser only from the console's own
+origin: a request whose `Sec-Fetch-Site` is not `same-origin` (or `none`), or,
+without that header, whose `Origin` is not the request's own host and port, is
+`403 {"code": "cross_origin_session_request"}` and sets or clears no cookie.
+Cookies ignore ports, so without this a page on another port of the same host
+(an add-on's UI) could sign the console out, rotate its session or plant one.
+A caller that sends neither header (the CLI, a script) is unaffected. Refresh
+and logout log `origin` and `sec_fetch_site`.
+
 **Ending sessions.** `disable`, `set-role`, `set-scopes`, `set-password`,
 `service-key revoke-and-disable` and an approved `disable`/`scopes` proposal
 end the account's sessions immediately: every refresh token is revoked, open

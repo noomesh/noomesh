@@ -395,6 +395,72 @@ pub(crate) const HOST_TICKET_GRANT: &str = "host_ticket";
 /// onboard wizard with no password to hand, and a lost-password recovery.
 ///
 /// Returns a JWT with `sub`, `scopes`, `exp`, `iat` claims.
+/// The console's session endpoints (`/auth/token`, `/api/auth/refresh`,
+/// `/api/auth/logout`) answer a BROWSER only for the console's own pages.
+///
+/// Cookies ignore ports and SameSite counts `host:<other port>` as the same
+/// site, so the Strict `noo_refresh` cookie rides along when a page served on
+/// another port of this host (an add-on's UI) POSTs here. A form-style POST
+/// needs no CORS preflight to take effect, so without this an add-on page
+/// could log the console out (2026-11-01 on pop-os: a logout with no console
+/// request before it), rotate its refresh, or log the browser into another
+/// account (login CSRF, which plants a refresh cookie).
+///
+/// - `Sec-Fetch-Site` present (every current browser sends it): only
+///   `same-origin` (or `none`, a navigation) is accepted; `same-site` (another
+///   port of this host) and `cross-site` are refused.
+/// - else `Origin` present: its host and port must be the request's `Host`.
+/// - neither: not a browser (the CLI, a script, curl): accepted as before.
+///
+/// `Err` is the sentence the 403 carries.
+pub(crate) fn session_origin_refusal(headers: &http::HeaderMap) -> Result<(), String> {
+    let header = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).map(|v| v.trim().to_ascii_lowercase());
+    if let Some(site) = header("sec-fetch-site") {
+        return match site.as_str() {
+            "same-origin" | "none" => Ok(()),
+            other => Err(format!(
+                "a {other} request cannot use the console's session: only the console's own pages may sign in, \
+                 refresh or sign out"
+            )),
+        };
+    }
+    let Some(origin) = header("origin") else { return Ok(()) };
+    let host = header("host").unwrap_or_default();
+    match origin_authority(&origin) {
+        Some(a) if !host.is_empty() && a == without_default_port(&host, origin.starts_with("https://")) => Ok(()),
+        _ => Err(format!("a request from {origin} cannot use the console's session (only its own origin may)")),
+    }
+}
+
+/// `host[:port]` of an `Origin`, the default port dropped; `None` for
+/// `null` or anything that is not `http(s)://authority`.
+fn origin_authority(origin: &str) -> Option<String> {
+    let (https, rest) = if let Some(r) = origin.strip_prefix("https://") {
+        (true, r)
+    } else {
+        (false, origin.strip_prefix("http://")?)
+    };
+    let authority = rest.split('/').next().filter(|a| !a.is_empty())?;
+    Some(without_default_port(authority, https))
+}
+
+fn without_default_port(authority: &str, https: bool) -> String {
+    let default = if https { ":443" } else { ":80" };
+    authority.strip_suffix(default).unwrap_or(authority).to_string()
+}
+
+/// The 403 for [`session_origin_refusal`]: no cookie is set or cleared.
+fn session_origin_forbidden(why: String) -> Response {
+    (StatusCode::FORBIDDEN, Json(json!({"detail": why, "code": "cross_origin_session_request"}))).into_response()
+}
+
+/// The two request headers that say where a session call came from, for the
+/// log line that makes the next incident provable.
+fn origin_fields(headers: &http::HeaderMap) -> (String, String) {
+    let h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or("").chars().take(200).collect::<String>();
+    (h("origin"), h("sec-fetch-site"))
+}
+
 async fn auth_token(
     State(state): State<Arc<AppState>>,
     peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
@@ -402,6 +468,11 @@ async fn auth_token(
     // Accept both JSON and form-urlencoded (OAuth2 form)
     body: axum::body::Bytes,
 ) -> Response {
+    if let Err(why) = session_origin_refusal(&headers) {
+        let (origin, site) = origin_fields(&headers);
+        tracing::warn!(origin = %origin, sec_fetch_site = %site, "auth_token refused: {why}");
+        return session_origin_forbidden(why);
+    }
     // Parse as form-urlencoded first (OAuth2 standard), fall back to JSON
     let creds: TokenRequest = if let Ok(form) = serde_urlencoded::from_bytes::<TokenRequest>(&body) {
         form
@@ -733,6 +804,12 @@ async fn auth_refresh_handler(
     headers: http::HeaderMap,
     jar: CookieJar,
 ) -> Response {
+    let (origin, site) = origin_fields(&headers);
+    if let Err(why) = session_origin_refusal(&headers) {
+        tracing::warn!(origin = %origin, sec_fetch_site = %site, "auth_refresh refused: {why}");
+        return session_origin_forbidden(why);
+    }
+    tracing::info!(origin = %origin, sec_fetch_site = %site, cookie = jar.get(auth_refresh::REFRESH_COOKIE_NAME).is_some(), "auth_refresh");
     let raw_token = match jar.get(auth_refresh::REFRESH_COOKIE_NAME) {
         Some(c) => c.value().to_string(),
         None => {
@@ -1037,6 +1114,12 @@ async fn auth_logout_handler(
     headers: http::HeaderMap,
     jar: CookieJar,
 ) -> Response {
+    let (origin, site) = origin_fields(&headers);
+    if let Err(why) = session_origin_refusal(&headers) {
+        tracing::warn!(origin = %origin, sec_fetch_site = %site, "auth_logout refused: {why}");
+        return session_origin_forbidden(why);
+    }
+    tracing::info!(origin = %origin, sec_fetch_site = %site, cookie = jar.get(auth_refresh::REFRESH_COOKIE_NAME).is_some(), "auth_logout");
     // Whose session is this? The refresh cookie names the account (browser);
     // a CLI logout has no cookie but presents the bearer it is giving up.
     let mut account: Option<String> = None;
@@ -2005,6 +2088,62 @@ mod tests {
         let check = src.split("let nats_ok = ").nth(1).unwrap().split(';').next().unwrap();
         assert!(check.starts_with("crate::state::bus_connected(&state.nats)"), "the state is read first: {check}");
         assert!(check.contains("tokio::time::timeout(") && check.contains("state.nats.flush()"), "the ping is bounded: {check}");
+    }
+
+    fn h(pairs: &[(&str, &str)]) -> http::HeaderMap {
+        let mut m = http::HeaderMap::new();
+        for (k, v) in pairs {
+            m.insert(http::HeaderName::from_bytes(k.as_bytes()).unwrap(), http::HeaderValue::from_str(v).unwrap());
+        }
+        m
+    }
+
+    /// 2026-11-01: an add-on page on another port of the console's host
+    /// logged the console out. The session endpoints answer a browser only
+    /// for the console's own origin; the CLI (no browser headers) as before.
+    #[test]
+    fn the_session_endpoints_refuse_a_browser_request_from_another_origin() {
+        // Every current browser: Sec-Fetch-Site decides.
+        assert!(session_origin_refusal(&h(&[("sec-fetch-site", "same-origin")])).is_ok());
+        assert!(session_origin_refusal(&h(&[("sec-fetch-site", "none")])).is_ok(), "a navigation");
+        for site in ["same-site", "cross-site", "Same-Site"] {
+            let e = session_origin_refusal(&h(&[("sec-fetch-site", site), ("origin", "https://pop-os.ts.net:8443")]))
+                .expect_err(site);
+            assert!(e.contains("console's own pages"), "{e}");
+        }
+        // An older browser: Origin must be this Host (default ports folded).
+        let host = "pop-os.ts.net";
+        assert!(session_origin_refusal(&h(&[("origin", "https://pop-os.ts.net"), ("host", host)])).is_ok());
+        assert!(session_origin_refusal(&h(&[("origin", "https://pop-os.ts.net:443"), ("host", host)])).is_ok());
+        assert!(session_origin_refusal(&h(&[("origin", "https://pop-os.ts.net"), ("host", "pop-os.ts.net:443")])).is_ok());
+        assert!(session_origin_refusal(&h(&[("origin", "http://127.0.0.1:8080"), ("host", "127.0.0.1:8080")])).is_ok());
+        for bad in ["https://pop-os.ts.net:8443", "https://evil.example", "null", "file://x", "https://"] {
+            assert!(session_origin_refusal(&h(&[("origin", bad), ("host", host)])).is_err(), "{bad}");
+        }
+        assert!(session_origin_refusal(&h(&[("origin", "https://pop-os.ts.net")])).is_err(), "no Host: refuse");
+        // Not a browser: unchanged.
+        assert!(session_origin_refusal(&h(&[])).is_ok());
+        assert!(session_origin_refusal(&h(&[("authorization", "Bearer x")])).is_ok());
+    }
+
+    /// Each session handler asks FIRST: before a body is parsed, a cookie is
+    /// read, a token is rotated or revoked, or a cookie is cleared.
+    #[test]
+    fn each_session_handler_checks_the_origin_before_anything_else() {
+        let src = include_str!("core.rs");
+        for (name, first_effect) in [
+            ("async fn auth_token(", "serde_urlencoded::from_bytes::<TokenRequest>"),
+            ("async fn auth_refresh_handler(", "jar.get(auth_refresh::REFRESH_COOKIE_NAME) {"),
+            ("async fn auth_logout_handler(", "auth_refresh::lookup_token("),
+        ] {
+            let body = src.split(name).nth(1).unwrap_or_else(|| panic!("{name}")).split("\nasync fn ").next().unwrap();
+            let check = body.find("session_origin_refusal(&headers)").unwrap_or_else(|| panic!("{name}: no origin check"));
+            let effect = body.find(first_effect).unwrap_or_else(|| panic!("{name}: {first_effect}"));
+            assert!(check < effect, "{name}: the origin check must come first");
+            assert!(body[check..effect].contains("return session_origin_forbidden(why)"), "{name}");
+        }
+        let forbidden = src.split("fn session_origin_forbidden(").nth(1).unwrap().split("\n\u{7d}\n").next().unwrap();
+        assert!(!forbidden.contains("Cookie") && !forbidden.contains("jar"), "a refusal sets or clears no cookie");
     }
 
     #[test]
