@@ -977,7 +977,7 @@ reporting off, no published port) and `tempo at rest`. Every
 
 | Service | Endpoint | Returns |
 |---|---|---|
-| gateway | `GET /health` | **Anonymous:** `status` (`healthy` / `degraded`) and the status code — HTTP 503 when Postgres or NATS is down. That is what every probe reads. **With a credential:** adds `engine`, `version`, `peers`, `dependencies` (`postgresql`, `nats`, `redis` — redis is optional) and `addons`. `noo health` authenticates and exits 5 on degraded; without a login it shows status alone and says so |
+| gateway | `GET /health` | **Anonymous:** `status` (`healthy` / `degraded`) and the status code — HTTP 503 when Postgres or NATS is down. That is what every probe reads. **With a credential:** adds `engine`, `version`, `peers`, `dependencies` (`postgresql`, `nats`, `redis` — redis is optional; `nats.state` is `connected`, `unresponsive` or `reconnecting`) and `addons`. `noo health` authenticates and exits 5 on degraded; without a login it shows status alone and says so. A gateway that cannot reach NATS still serves (since 0.6.16): it waits up to 20 s at start, then answers degraded, bus routes (worker dispatch, agent messages) answer `503 {"error": "bus_unavailable"}` with `Retry-After`, and it connects and binds its KV buckets and streams by itself once NATS is up. `noo cluster verify --controller` shows it as a failing `gateway bus` row |
 | gateway | `GET /api/cluster/status` | node counts and the node list |
 | node-agent | `GET /health` on `:8081` | `{"status": "healthy", "node_id": …}` |
 | vLLM | `GET /health` on `:8000` | backend health |

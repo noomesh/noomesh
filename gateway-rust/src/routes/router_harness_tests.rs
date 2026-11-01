@@ -354,6 +354,26 @@ impl Client {
         self.send(method, path, None, Some(actor)).await
     }
 
+    /// A POST with a real JSON body (the sweep's `{}` would be refused by a
+    /// handler's own extractor before the contract under test is reached).
+    async fn post_json(&self, path: &str, bearer: &str, body: &Value) -> Reply {
+        let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let resp = self
+            .http
+            .post(format!("{}{}", self.base, path))
+            .json(body)
+            .header("x-forwarded-for", format!("198.51.{}.{}", (n / 250) % 250, n % 250 + 1))
+            .bearer_auth(bearer)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("POST {path}: {e}"));
+        let status = resp.status().as_u16();
+        let retry_after = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).map(str::to_string);
+        let text = resp.text().await.unwrap_or_default();
+        let body = serde_json::from_str(&text).unwrap_or(Value::Null);
+        Reply { status, retry_after, body, text }
+    }
+
     async fn send(&self, method: &str, path: &str, bearer: Option<&str>, node_actor: Option<&str>) -> Reply {
         let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let url = format!("{}{}", self.base, path);
@@ -549,6 +569,33 @@ async fn assert_redis_reconnecting(c: &Client, admin: &str) -> Vec<String> {
     failures
 }
 
+/// Contract 4 (i301 a.3). The harness runs with NATS DOWN: the gateway
+/// serves, `/health` says degraded with the bus `reconnecting`, and a bus
+/// route answers 503 `bus_unavailable` with `Retry-After` at once.
+async fn assert_bus_down(c: &Client, admin: &str) -> Vec<String> {
+    let mut failures = Vec::new();
+    let h = c.call("GET", "/health", Some(admin)).await;
+    if h.status != 503 || h.body["status"] != "degraded" {
+        failures.push(format!("/health: want 503 degraded with no bus, got {} {:?}", h.status, h.body["status"]));
+    }
+    if h.body["dependencies"]["nats"]["healthy"] != false || h.body["dependencies"]["nats"]["state"] != "reconnecting" {
+        failures.push(format!("/health: dependencies.nats should be unhealthy/reconnecting, got {}", h.body["dependencies"]["nats"]));
+    }
+    let t = std::time::Instant::now();
+    let r = c.post_json("/api/agents/messages", admin, &json!({"to": "harness-peer", "text": "ping"})).await;
+    if r.status != 503 || r.body["error"] != crate::routes::BUS_UNAVAILABLE {
+        failures.push(format!("POST /api/agents/messages: want 503 bus_unavailable, got {} — {:?}", r.status, r.text));
+    }
+    if r.retry_after.as_deref().and_then(|v| v.parse::<u64>().ok()).is_none() {
+        failures.push(format!("POST /api/agents/messages: 503 without a numeric Retry-After ({:?})", r.retry_after));
+    }
+    if t.elapsed() > std::time::Duration::from_secs(3) {
+        failures.push(format!("POST /api/agents/messages: the refusal took {:?}; it must not wait on the bus", t.elapsed()));
+    }
+    eprintln!("router_harness: bus_unavailable — /health and the agent send route checked");
+    failures
+}
+
 /// Contract 3. Status routes answer 200, with the unmeasurable fields null and
 /// a `<field>_detail` sentence, never a literal 0 / false / [].
 async fn assert_measured(c: &Client, admin: &str) -> Vec<String> {
@@ -659,6 +706,7 @@ async fn the_real_router_holds_authz_redis_and_measured_contracts() {
         failures.extend(assert_redis_reconnecting(&c, &admin).await);
         failures.extend(assert_measured(&c, &admin).await);
         failures.extend(assert_i241_rows(&c, &operator, &admin).await);
+        failures.extend(assert_bus_down(&c, &admin).await);
     }
 
     server.abort();
