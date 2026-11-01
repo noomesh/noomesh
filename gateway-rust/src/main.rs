@@ -727,6 +727,11 @@ async fn main() -> Result<()> {
             config_mount::check_and_alert(&st, &routes::settings::config_path(), "startup").await;
         });
     }
+    // i160a: a bootstrap admin password bcrypt would truncate is said out loud.
+    {
+        let st = state.clone();
+        tokio::spawn(async move { routes::core::warn_overlong_bootstrap_password(&st).await });
+    }
     // Measures the direction WORK travels. A node's status is asserted by
     // its own outbound heartbeat, so a node that accepts no inbound
     // connection still reads healthy (2026-09-04: a cert naming a stale

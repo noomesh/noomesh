@@ -1365,6 +1365,52 @@ fn lookup_user_env(username: &str) -> Option<UserRecord> {
     })
 }
 
+/// bcrypt reads only the first 72 bytes of a password: the crate's `hash`
+/// and `verify` both truncate there (bcrypt 0.19 `_hash_password`), so a
+/// longer bootstrap password authenticates with any string sharing its first
+/// 72 bytes (i160a, i74).
+const BCRYPT_MAX_BYTES: usize = 72;
+
+/// The byte length of a bootstrap password bcrypt would truncate, None when
+/// it fits.
+fn overlong_for_bcrypt(password: &str) -> Option<usize> {
+    (password.len() > BCRYPT_MAX_BYTES).then_some(password.len())
+}
+
+/// Boot check (i160a): a hand-set `NOO_ADMIN_PASSWORD` over 72 bytes is a
+/// weaker credential than it looks. Onboard refuses one; the gateway does not
+/// refuse it yet, since that could lock out an install whose store already
+/// holds one, but says so loudly: an error log, and one operator alert while
+/// the env fallback is still an authentication path (no enabled admin row).
+pub async fn warn_overlong_bootstrap_password(state: &AppState) {
+    let pw = crate::config::secret_env::secret_or_empty("NOO_ADMIN_PASSWORD");
+    let Some(bytes) = overlong_for_bcrypt(&pw) else {
+        return;
+    };
+    let open = env_fallback_allowed(admin_census(&state.db).await);
+    tracing::error!(
+        bytes,
+        env_fallback_open = open,
+        "NOO_ADMIN_PASSWORD is {bytes} bytes; bcrypt checks only the first {BCRYPT_MAX_BYTES}, so any \
+         string sharing them logs in as the bootstrap admin. Fix: noo security admin-password reset"
+    );
+    if !open {
+        return;
+    }
+    crate::operator_alert::send_operator_alert_with(
+        state,
+        crate::operator_alert::OperatorAlert::new(
+            "auth.bootstrap_password_overlong",
+            "NOO_ADMIN_PASSWORD",
+            "⚠️ The bootstrap admin password is longer than bcrypt checks (72 bytes); only its start protects the first login.",
+        )
+        .detail(format!("{bytes} bytes; no enabled admin account yet, so the env password is still a login path"))
+        .investigate("noo security admin-password reset"),
+        24 * 3600,
+    )
+    .await;
+}
+
 /// Strikes at which an account locks.
 const LOCKOUT_STRIKES: i32 = 5;
 /// Minutes an account stays locked once the strike threshold is reached.
@@ -1991,6 +2037,31 @@ mod tests {
         .filter(|c| env_fallback_allowed(*c))
         .collect();
         assert_eq!(open, vec![AdminCensus::NoneEnabled]);
+    }
+
+    /// i160a: the boot warning fires on bytes, not characters, and only past 72.
+    #[test]
+    fn overlong_is_counted_in_bytes_past_seventy_two() {
+        assert_eq!(overlong_for_bcrypt(&"a".repeat(72)), None);
+        assert_eq!(overlong_for_bcrypt(&"a".repeat(73)), Some(73));
+        // 37 two-byte characters: 37 characters, 74 bytes.
+        assert_eq!(overlong_for_bcrypt(&"é".repeat(37)), Some(74));
+        assert_eq!(overlong_for_bcrypt(""), None);
+    }
+
+    /// i74 item 2, answered against the crate this gateway links: `hash`
+    /// truncates at 72 bytes and `verify` agrees with it, so a 73-byte
+    /// password and its 72-byte prefix are the same credential. If the crate
+    /// ever stops truncating, this fails, and the boot warning (i160a) and
+    /// i74's record must be revisited.
+    #[test]
+    fn bcrypt_hash_and_verify_truncate_at_seventy_two_bytes() {
+        let long = format!("{}X", "a".repeat(72));
+        let h = bcrypt::hash(&long, 4).expect("the truncating hash accepts 73 bytes");
+        assert!(bcrypt::verify(&long[..72], &h).unwrap(), "the 72-byte prefix logs in");
+        assert!(bcrypt::verify(format!("{}Y", "a".repeat(72)), &h).unwrap(), "so does any 73rd byte");
+        assert!(!bcrypt::verify("a".repeat(71), &h).unwrap(), "a 71-byte prefix does not");
+        assert!(bcrypt::non_truncating_hash(&long, 4).is_err(), "the non-truncating variant refuses it");
     }
 
     #[test]
