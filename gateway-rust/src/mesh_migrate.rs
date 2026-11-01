@@ -3607,11 +3607,15 @@ mod legacy_layout_tests {
                  request_id text PRIMARY KEY,
                  status text NOT NULL DEFAULT 'pending',
                  created_at timestamptz NOT NULL DEFAULT now());
+             -- 104 reads `disabled` (every ENABLED admin becomes a super
+             -- admin); the baseline at 046 has carried it on every install,
+             -- so the fixture carries it too.
              CREATE TABLE public.noo_users (
                  username text PRIMARY KEY,
                  user_uuid uuid NOT NULL DEFAULT gen_random_uuid() UNIQUE,
                  org_id text NOT NULL DEFAULT 'default',
-                 scopes jsonb NOT NULL DEFAULT '[\"read\"]'::jsonb);
+                 scopes jsonb NOT NULL DEFAULT '[\"read\"]'::jsonb,
+                 disabled boolean NOT NULL DEFAULT false);
              -- 061 backfills conversations from their owner and closes the
              -- column. The fixture carries the three shapes that exist on a
              -- live install: owned by a user in a non-default org, owned by
@@ -3619,6 +3623,11 @@ mod legacy_layout_tests {
              -- (heartbeat / autonomy / system tool records).
              INSERT INTO public.noo_users (username, org_id)
                  VALUES ('tenant', 'acme'), ('solo', 'default');
+             -- 050 maps the admin grant to role 'admin'; 104 then promotes
+             -- the enabled admin alone.
+             INSERT INTO public.noo_users (username, scopes, disabled) VALUES
+                 ('boss', '[\"admin\"]'::jsonb, false),
+                 ('gone', '[\"admin\"]'::jsonb, true);
              CREATE TABLE public.noo_conversations (
                  id uuid PRIMARY KEY,
                  user_id text,
@@ -3715,6 +3724,16 @@ mod legacy_layout_tests {
         // derive trigger, or every tenant's conversations file under the
         // default org and cross-tenant isolation quietly inverts.
         assert_eq!(fresh, "acme");
+
+        // 104: every enabled admin is a super admin, a disabled one is not,
+        // and nobody else is.
+        let supers: Vec<String> = sqlx::query_scalar(
+            "SELECT username FROM public.noo_users WHERE super_admin ORDER BY username",
+        )
+        .fetch_all(&db)
+        .await
+        .expect("104 added super_admin on a legacy install");
+        assert_eq!(supers, vec!["boss".to_string()]);
 
         // The column is closed, so nothing has to re-check the boundary.
         let nullable: bool = sqlx::query_scalar(
