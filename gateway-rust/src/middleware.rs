@@ -2320,7 +2320,7 @@ mod tool_risk_context_tests {
 
 #[cfg(test)]
 mod csp_default_tests {
-    use super::{csp_choice, CspChoice, DEFAULT_CSP};
+    use super::{csp_choice, security_headers, CspChoice, DEFAULT_CSP};
 
     #[test]
     fn the_header_is_sent_with_no_env_at_all() {
@@ -2405,7 +2405,9 @@ mod csp_default_tests {
         assert!(!code.contains("NOO_TLS_CERT"), "HSTS is conditional on an env var again");
 
         let app = axum::Router::new()
-            .route("/x", axum::routing::get(|| async { "ok" }))
+            // A fallback, not `.route(...)`: scripts/check-openapi-drift.py
+            // reads every `.route("…")` as a gateway path.
+            .fallback(|| async { "ok" })
             .layer(axum::middleware::from_fn(security_headers));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://127.0.0.1:{}/x", listener.local_addr().unwrap().port());
