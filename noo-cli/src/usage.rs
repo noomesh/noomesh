@@ -398,6 +398,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["kiosk", "reload"], "", "Reload the page on the display and report the console build either side"),
     (&["kiosk", "seat-sync"], "[--migrate [--print]]", "Hidden: the seat's sync tick (internal); --migrate moves an old root seat, run once"),
     (&["kiosk", "seat-token"], "<seat-name> [--ttl <1h|30m|secs>] [--controller <https://…>]", "Controller: mint a one-time role=seat token; prints the seat's `noo kiosk enroll <blob>`"),
+    (&["kiosk", "seats"], "", "Controller: every enrolled display: last heard, view, quality, console build, apply"),
     (&["kiosk", "serve"], "[--port <n>]", "Hidden: the display's local proxy, run by kiosk-serve.service (internal)"),
     (&["kiosk", "set"], "quality lean|full|auto [--dry-run]", "Change one seat setting (graph drawing quality), keep the rest; restarts the display"),
     (&["kiosk", "setup"], "--mode dedicated|shared --url <https://…ts.net> [--vt <n>] [--user <name>] [--view health|graph] [--rotate <secs>] [--poll <secs>] [--quality lean|full] [--browser <bin>] [--dry-run] [-y|--yes]", "Install the display seat: kiosk user, cage + Chromium unit, token launcher, watchdog"),

@@ -443,4 +443,4 @@ pub use at_rest::{security_at_rest_opt_in, security_at_rest_opt_out, security_at
 pub use at_rest_migrate::{security_at_rest_migrate, security_at_rest_wipe_plaintext};
 pub use at_rest_recovery::{security_at_rest_preflight_firmware, security_at_rest_recovery_key, security_at_rest_reenroll};
 pub use at_rest_volume::security_at_rest_create_volume;
-pub use kiosk_seat::{kiosk_enroll, kiosk_seat_sync, kiosk_seat_token};
+pub use kiosk_seat::{kiosk_enroll, kiosk_seat_sync, kiosk_seat_token, kiosk_seats};
