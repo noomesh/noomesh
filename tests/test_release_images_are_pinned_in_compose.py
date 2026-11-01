@@ -61,6 +61,9 @@ def test_every_released_compose_service_uses_the_release_pin() -> None:
             # the DEFAULT the override falls back to, so it must appear
             # unchanged inside that wrapper.
             pin = re.compile(r"^\$\{LLAMACPP_IMAGE:-" + inner + r"\}$")
+        elif img == "ollama":
+            # Like llamacpp: an operator's OLLAMA_IMAGE wins over the release pin.
+            pin = re.compile(r"^\$\{OLLAMA_IMAGE:-" + inner + r"\}$")
         else:
             pin = re.compile("^" + inner + "$")
         assert pin.match(image), (

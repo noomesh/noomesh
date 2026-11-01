@@ -77,7 +77,7 @@ pub(crate) fn parse_gpu_release_with(a: &mut Args) -> Result<GpuArgs, ArgError> 
 
 /// A fresh operation id for a hold the operator did not name: a random
 /// UUID (v4 layout) from the OS, so two holds never collide.
-fn new_operation_id() -> String {
+pub(crate) fn new_operation_id() -> String {
     use std::io::Read;
     let mut b = [0u8; 16];
     if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).is_err() {
@@ -178,7 +178,7 @@ fn hold_refused(g: &Globals, node: &str, op: &str, status: u16, text: &str) -> !
 }
 
 /// The exit kind and the remedy for a 409's machine-readable code.
-fn refusal_hint(node: &str, op: &str, msg: &str) -> (&'static str, String) {
+pub(crate) fn refusal_hint(node: &str, op: &str, msg: &str) -> (&'static str, String) {
     if msg.starts_with("held_by_other") {
         ("gpu_held_by_other", format!("noo cluster gpu {op} {node} --force   # take it over (audited); or quote the lease's --operation and --generation"))
     } else if msg.starts_with("drain_timeout") {
@@ -192,7 +192,7 @@ fn refusal_hint(node: &str, op: &str, msg: &str) -> (&'static str, String) {
     }
 }
 
-fn paused_list(gc: &Value) -> String {
+pub(crate) fn paused_list(gc: &Value) -> String {
     let names: Vec<&str> = gc["paused_backends"].as_array()
         .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
@@ -214,10 +214,11 @@ pub(crate) fn gpu_status_note(n: &Value) -> Option<String> {
     match gc["state"].as_str()? {
         "yielded" => Some(format!("{id}: GPU in use by other work — {paused} paused{since} (foreign {:.1} GB)",
             gc["foreign_mb"].as_f64().unwrap_or(0.0) / 1024.0)),
-        "held" => Some(format!("{id}: GPU held by {}{} — {paused} paused{since}",
+        "held" => Some(format!("{id}: GPU mode {} — held by {}{}, {paused} paused{since}",
+            super::cluster_gpu_mode::lease_mode(gc).label(),
             lease_holder(gc),
             gc["reason"].as_str().filter(|r| !r.is_empty()).map(|r| format!(" ({r})")).unwrap_or_default())),
-        "draining" => Some(format!("{id}: GPU hold by {} draining — waiting for requests in flight to finish{since}", lease_holder(gc))),
+        "draining" => Some(format!("{id}: GPU mode switching — hold by {} draining, waiting for requests in flight to finish{since}", lease_holder(gc))),
         _ => None,
     }
 }
@@ -279,12 +280,18 @@ mod tests {
         assert_eq!(gpu_status_note(&n).unwrap(),
             "host3: GPU in use by other work — vllm paused since 2026-10-17T12:00:00Z (foreign 11.2 GB)");
         let held = serde_json::json!({"id": "host3", "gpu_contention": {"state": "held", "reason": "voice", "paused_backends": ["vllm"]}});
-        assert_eq!(gpu_status_note(&held).unwrap(), "host3: GPU held by operator (voice) — vllm paused");
+        assert_eq!(gpu_status_note(&held).unwrap(), "host3: GPU mode held (manual) — held by operator (voice), vllm paused");
         let owned = serde_json::json!({"id": "host3", "gpu_contention": {"state": "held", "reason": "voice", "paused_backends": ["vllm"],
             "lease": {"owner": "rbwolf", "operation_id": "op-1", "generation": 3}}});
-        assert_eq!(gpu_status_note(&owned).unwrap(), "host3: GPU held by rbwolf (voice) — vllm paused");
+        assert_eq!(gpu_status_note(&owned).unwrap(), "host3: GPU mode held (manual) — held by rbwolf (voice), vllm paused");
+        let user = serde_json::json!({"id": "host3", "gpu_contention": {"state": "held", "reason": "user", "paused_backends": ["vllm"],
+            "lease": {"owner": "rbwolf", "operation_id": "op-2", "generation": 5, "purpose": "user"}}});
+        assert_eq!(gpu_status_note(&user).unwrap(), "host3: GPU mode user — held by rbwolf (user), vllm paused");
+        let reserved = serde_json::json!({"id": "host3", "gpu_contention": {"state": "held", "paused_backends": ["vllm"],
+            "lease": {"owner": "rbwolf", "operation_id": "res-1", "generation": 6, "workload": "rhaddon/worker"}}});
+        assert_eq!(gpu_status_note(&reserved).unwrap(), "host3: GPU mode workload rhaddon/worker — held by rbwolf, vllm paused");
         let draining = serde_json::json!({"id": "host3", "gpu_contention": {"state": "draining", "lease": {"owner": "rbwolf"}}});
-        assert_eq!(gpu_status_note(&draining).unwrap(), "host3: GPU hold by rbwolf draining — waiting for requests in flight to finish");
+        assert_eq!(gpu_status_note(&draining).unwrap(), "host3: GPU mode switching — hold by rbwolf draining, waiting for requests in flight to finish");
         assert!(gpu_status_note(&serde_json::json!({"id": "x", "gpu_contention": {"state": "free"}})).is_none());
         assert!(gpu_status_note(&serde_json::json!({"id": "x"})).is_none());
     }

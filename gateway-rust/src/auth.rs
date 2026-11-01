@@ -119,6 +119,9 @@ pub const NODE_ROUTES: &[(&str, &str)] = &[
     // and nothing else's; the handler overwrites the `node` label with
     // `{self}` (routes/logs_ingest.rs).
     ("POST", "/api/cluster/nodes/{self}/logs"),
+    // Span ingest (i359 C2): a node sends its own spans; the handler stamps
+    // the resource with `{self}` (routes/traces_ingest.rs).
+    ("POST", "/api/cluster/nodes/{self}/traces"),
     ("GET", "/api/cluster/nodes/{self}/desired-config"),
     // External MCP discovery report: only for a
     // server placed on this node, which the handler checks.
@@ -356,6 +359,14 @@ pub struct Actor {
     /// other kind of delegated token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
+    /// The add-on FEATURE an add-on delegated token was minted under
+    /// (noomesh-internal f99): the auth layer re-checks on every use that the
+    /// account still holds it, so turning the feature off stops the add-on
+    /// acting for that person at once, not when the token expires. Absent on
+    /// every other kind of token, and on a token for an add-on whose
+    /// manifest declares no features.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feature: Option<String>,
 }
 
 /// The harness rail: a token minted for a node-hosted
@@ -2800,7 +2811,7 @@ pub const WALKS_SETTINGS_PATH: &str = "/api/v1/walks/settings";
 /// keys, and peer tokens are scoped by their own branches in
 /// `require_any_auth`.
 pub(crate) fn scope_allows(claims: &Claims, method: &axum::http::Method, path: &str) -> bool {
-    scope_allows_for(&claims.scopes, claims.resolved_role(), method, path)
+    scope_allows_for(&claims.scopes, claims.resolved_role(), Some(account_of(&claims.sub)), method, path)
 }
 
 /// Whether an already-authenticated requester may make `method path` — the
@@ -2821,26 +2832,28 @@ pub fn requester_allows(requester: &RequesterCtx, method: &axum::http::Method, p
     if crate::addon_workloads::proxy_allows(&requester.sub, path) {
         return true;
     }
-    scope_allows_for(&requester.scopes, requester.role, method, path)
+    scope_allows_for(&requester.scopes, requester.role, Some(account_of(&requester.sub)), method, path)
 }
 
-fn scope_allows_for(scopes: &[String], role: Role, method: &axum::http::Method, path: &str) -> bool {
+/// `account` is the caller's account: a features add-on route (f99) is
+/// decided per account, every other path by role and scopes.
+fn scope_allows_for(scopes: &[String], role: Role, account: Option<&str>, method: &axum::http::Method, path: &str) -> bool {
     use axum::http::Method;
     let has = |s: &str| scopes.iter().any(|x| x == s);
     if role >= Role::Operator {
         return true;
     }
-    if METRICS_READ_PATHS.contains(&path) || path.starts_with(LOGS_READ_PREFIX) {
+    if METRICS_READ_PATHS.contains(&path) || path.starts_with(LOGS_READ_PREFIX) || path.starts_with(TRACES_READ_PREFIX) {
         return false;
     }
     if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
         // An add-on's GET is scoped by the route's own `min_role`/`scopes`
         // (addon_proxy), not waved through with the allow-list.
-        return user_may_read(path) || crate::addon_proxy::mounted_get_allows(scopes, role, path);
+        return user_may_read(path) || crate::addon_proxy::mounted_get_allows(scopes, role, account, path);
     }
     // A write the add-on's manifest opted in with `owner_scoped` (the add-on
     // keeps every row to the forwarded account). Exact manifest match only.
-    if crate::addon_proxy::mounted_owner_scoped_allows(method, scopes, role, path) {
+    if crate::addon_proxy::mounted_owner_scoped_allows(method, scopes, role, account, path) {
         return true;
     }
     if CHAT_QUERY_PREFIXES.iter().any(|p| path.starts_with(p)) {
@@ -3076,6 +3089,11 @@ pub const METRICS_READ_PATHS: &[&str] = &[
 /// GET; until 2026-09-28 that meant any signed-in user could run LogQL
 /// against Loki. A prefix, so a log route added later is closed by default.
 pub const LOGS_READ_PREFIX: &str = "/api/logs/";
+
+/// Request-trace READS (i359): Operator and Admin only, like logs. A trace
+/// names who made each request and which routes they used, across every
+/// account. A prefix, so a trace route added later is closed by default.
+pub const TRACES_READ_PREFIX: &str = "/api/traces/";
 
 /// The one service leaf that may read `/metrics` by certificate alone:
 /// `noo security pki issue-service prometheus` (CN=prometheus,
@@ -3348,6 +3366,15 @@ pub async fn require_any_auth(
                 if !rail_token_admitted(claims.resolved_role(), live) {
                     tracing::warn!(sub = %claims.sub, addon, live = ?live, "add-on delegated token refused: account disabled, absent or below the token's role");
                     return Err(StatusCode::UNAUTHORIZED);
+                }
+                // f99: a token minted under an add-on feature is held to it on
+                // every use, so turning the feature off stops the add-on
+                // acting for this person now, not when the token expires.
+                let has_features = crate::addon_registry::get(addon).is_some_and(|e| !e.manifest().features.is_empty());
+                let feature = claims.act.as_ref().and_then(|a| a.feature.as_deref());
+                if let Err(why) = crate::addon_delegation::feature_still_held(has_features, feature, addon, account_of(&claims.sub), live) {
+                    tracing::warn!(sub = %claims.sub, addon, "add-on delegated token refused: {why}");
+                    return Err(StatusCode::FORBIDDEN);
                 }
                 request.extensions_mut().insert(crate::addon_delegation::AddonDelegation { addon: addon.to_string() });
             }
@@ -4757,6 +4784,12 @@ mod tests {
         }
         let addon = claims_with(&["metrics", "temporal", "heartbeat"]);
         assert!(!scope_allows(&addon, &Method::GET, "/api/logs/query"), "no add-on scope reads logs");
+        // Request traces (i359) are the same kind of read: every account's routes.
+        for path in ["/api/traces/status", "/api/traces/requests"] {
+            assert!(!scope_allows(&user, &Method::GET, path), "user tier must not read {path}");
+            assert!(!scope_allows(&addon, &Method::GET, path), "no add-on scope reads {path}");
+            assert!(scope_allows(&operator, &Method::GET, path), "operator reads {path}");
+        }
         // The logs gate is a directory prefix, not a stem. (A User tier no longer
         // reads /api/logsomething for another reason: its GETs are an allow-list.)
         assert!(!"/api/logsomething".starts_with(LOGS_READ_PREFIX), "the prefix is a directory, not a stem");
@@ -6090,6 +6123,9 @@ mod harness_rail_tests {
         assert!(body[registry..live].contains("StatusCode::FORBIDDEN"));
         assert!(body[live..attach].contains("rail_token_admitted(claims.resolved_role(), live)"));
         assert!(body[live..attach].contains("StatusCode::UNAUTHORIZED"));
+        // f99: the feature the token was minted under is held on every use,
+        // after the live role and before the extension is attached.
+        assert!(body[live..attach].contains("crate::addon_delegation::feature_still_held(has_features, feature, addon, account_of(&claims.sub), live)"));
         // The branch is before the terminal peer / kiosk / add-on-consumer
         // returns, so none of them can carry an ADT past it.
         let peer = body.find("claims.scopes.iter().any(|s| s == \"peer\")").expect("peer branch");

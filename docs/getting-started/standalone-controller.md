@@ -59,13 +59,13 @@ sensitive is embedded. From there the eleven wizard steps run unchanged.
 The `standalone` compose profile: `gateway`, `worker`, `trellion`,
 `sandbox`, `postgres`, `redis`, `nats`, `model-cache`, `ollama-embed`
 (the embedding server the knowledge routes use on a standalone box) and
-the monitoring set — `loki`, `prometheus`, `alertmanager`, `grafana`, `node-exporter` and, on a GPU
+the monitoring set — `loki`, `tempo`, `prometheus`, `alertmanager`, `grafana`, `node-exporter` and, on a GPU
 host, `nvidia-exporter` — **not** `node-agent`: the agent runs as a host
 process installed by the pull rail (`noo enroll` + `noo cluster
 provision`), not a compose service. That is the `controller` profile with
 the local embedder in place of the containerised agent, and it is enough
 to enroll nodes, run the mesh and federate. The monitoring set needs
-`GRAFANA_PASSWORD` (onboard mints it) and the `loki`, `alertmanager`, `prometheus`, `grafana` and exporter service leaves
+`GRAFANA_PASSWORD` (onboard mints it) and the `loki`, `tempo`, `alertmanager`, `prometheus`, `grafana` and exporter service leaves
 (onboard issues them; `noo onboard --only enrollment` on an older install).
 
 A fresh standalone controller starts with an empty inventory; the PKI

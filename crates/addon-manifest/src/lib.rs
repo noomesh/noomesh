@@ -115,6 +115,36 @@ pub struct AddonManifest {
     /// add-on serves no UI.
     #[serde(default)]
     pub ui: Option<UiSpec>,
+    /// What the add-on can do, in its own words (noomesh-internal f99). The
+    /// add-on DECLARES features; noomesh decides who may use each one. In a
+    /// manifest that declares any, every public route and the `ui` name one
+    /// (`feature`), and `min_role`, `scopes` and the top-level `delegate` are
+    /// refused: one answer to "who may call this", never two. Empty: the
+    /// older shape, where `min_role`/`scopes` decide.
+    #[serde(default)]
+    pub features: Vec<FeatureSpec>,
+}
+
+/// One declared feature: `{"name": "transcripts", "title": "Read your
+/// transcripts", "suggested": "user"}`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeatureSpec {
+    /// `[a-z0-9_]{1,32}`, unique in the manifest. Its full name is
+    /// `<addon>:<name>`, the add-on scope word.
+    pub name: String,
+    /// What the console and CLI show: 1-64 plain characters.
+    pub title: String,
+    /// At most 280 plain characters.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Who the add-on recommends it for: `user`, `operator`, `admin` or
+    /// `none`. It grants NOTHING: the operator accepts it (or not) at enable.
+    pub suggested: String,
+    /// This feature may act for a present person through their tasks (i143).
+    /// Replaces the top-level `delegate` in a manifest with features.
+    #[serde(default)]
+    pub delegate: bool,
 }
 
 /// The manifest's `ui` key: `{"upstream_path": "/", "min_role": "user"}`.
@@ -137,6 +167,9 @@ pub struct UiSpec {
     /// characters.
     #[serde(default)]
     pub title: Option<String>,
+    /// The feature that opens the UI, in a manifest with `features`.
+    #[serde(default)]
+    pub feature: Option<String>,
     /// Per request (1–600); falls back to the manifest's.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
@@ -194,12 +227,17 @@ pub struct RouteSpec {
     /// requester holding `read` plus the scope, below `min_role`.
     #[serde(default)]
     pub scopes: Vec<String>,
-    /// Opt-in for a `POST` at `min_role: "user"`: the add-on promises to read
-    /// and write only rows owned by the account the gateway forwards in
-    /// `x-noo-requester-sub`. The gateway does NOT check that promise. Without
-    /// it a `POST` is `operator` or `admin`.
+    /// The add-on promises to read and write only rows owned by the account
+    /// the gateway forwards in `x-noo-requester-sub`. The gateway does NOT
+    /// check that promise. Legal on any public route. Without it a write is
+    /// never opened below `operator` (in the older shape: it is the opt-in for
+    /// a write at `min_role: "user"`).
     #[serde(default)]
     pub owner_scoped: bool,
+    /// The declared feature this public route belongs to, in a manifest with
+    /// `features` (required there, refused without them).
+    #[serde(default)]
+    pub feature: Option<String>,
     /// This public route may be sent the add-on delegated task token
     /// (noomesh-internal i143), so a manifest can keep the token off routes
     /// that never need it (a GPU media route). Default false. Valid only when
@@ -278,6 +316,18 @@ impl AddonManifest {
     /// The route called `name`, if the manifest declares one.
     pub fn route(&self, name: &str) -> Option<&RouteSpec> {
         self.routes.iter().find(|r| r.name == name)
+    }
+
+    /// Does the add-on ask to act through a person's tasks: `delegate:
+    /// "tasks"` in the older shape, a feature with `delegate: true` in the
+    /// features shape. Declaring it grants nothing by itself.
+    pub fn delegates_tasks(&self) -> bool {
+        self.delegate.as_deref() == Some(DELEGATE_TASKS) || self.features.iter().any(|f| f.delegate)
+    }
+
+    /// The declared feature called `name`.
+    pub fn feature(&self, name: &str) -> Option<&FeatureSpec> {
+        self.features.iter().find(|f| f.name == name)
     }
 }
 
@@ -497,12 +547,15 @@ fn check_route(r: &RouteSpec, door: &FrontDoor<'_>, checked: &mut Checked) -> Re
         }
     }
     if r.owner_scoped {
-        if !is_write_method(&r.method) || r.internal {
+        if r.internal {
             return Err(format!(
-                "{ctx}: owner_scoped applies to a public write route (POST, PUT, PATCH, DELETE) only"
+                "{ctx}: owner_scoped applies to a public route; an internal route is called by the \
+                 gateway, which forwards no account"
             ));
         }
-        if r.min_role.as_deref() != Some("user") {
+        // On a read it is the add-on's promise and gates nothing. On a write
+        // in the older shape it is the opt-in for min_role "user" only.
+        if is_write_method(&r.method) && r.min_role.is_some() && r.min_role.as_deref() != Some("user") {
             return Err(format!(
                 "{ctx}: owner_scoped is the opt-in for min_role \"user\" on a write; on any other \
                  role it means nothing — remove it"
@@ -593,6 +646,7 @@ pub fn validate(m: &AddonManifest, addon: &str, door: FrontDoor<'_>) -> Result<C
     if m.routes.is_empty() && m.ui.is_none() {
         return Err("it declares no routes".into());
     }
+    check_features(m)?;
     check_delegation(m)?;
     if let Some(ui) = m.ui.as_ref() {
         check_ui(ui)?;
@@ -642,6 +696,118 @@ pub fn validate(m: &AddonManifest, addon: &str, door: FrontDoor<'_>) -> Result<C
     Ok(checked)
 }
 
+// ── Features (noomesh-internal f99) ──────────────────────────────────────
+
+/// The most features one manifest may declare.
+pub const MAX_FEATURES: usize = 32;
+/// The words a feature's `suggested` may hold.
+pub const SUGGESTED_WORDS: &[&str] = &["user", "operator", "admin", "none"];
+
+fn plain_text(s: &str, max: usize) -> bool {
+    !s.trim().is_empty() && s.chars().count() <= max && !s.chars().any(|c| c.is_control() || c == '<' || c == '>')
+}
+
+/// The `features` key and every `feature` reference. With features, each
+/// public route and the `ui` name a declared one and nothing else says who
+/// may call them; without, nothing may name a feature.
+fn check_features(m: &AddonManifest) -> Result<(), String> {
+    if m.features.is_empty() {
+        if let Some(r) = m.routes.iter().find(|r| r.feature.is_some()) {
+            return Err(format!(
+                "route {:?}: feature {:?} names a feature, but the manifest declares no \"features\"",
+                r.name,
+                r.feature.as_deref().unwrap_or("")
+            ));
+        }
+        if m.ui.as_ref().is_some_and(|u| u.feature.is_some()) {
+            return Err("ui.feature names a feature, but the manifest declares no \"features\"".into());
+        }
+        return Ok(());
+    }
+    if m.features.len() > MAX_FEATURES {
+        return Err(format!("at most {MAX_FEATURES} features per manifest"));
+    }
+    let mut seen = HashSet::new();
+    for f in &m.features {
+        let word_ok = !f.name.is_empty()
+            && f.name.len() <= 32
+            && f.name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+        if !word_ok {
+            return Err(format!("feature {:?}: names are [a-z0-9_], 1-32 characters", f.name));
+        }
+        if !seen.insert(f.name.as_str()) {
+            return Err(format!("feature {:?} appears twice", f.name));
+        }
+        if !plain_text(&f.title, 64) {
+            return Err(format!(
+                "feature {:?}: title must be 1-64 plain characters (no control characters, no `<` `>`)",
+                f.name
+            ));
+        }
+        if let Some(d) = f.description.as_deref() {
+            if !plain_text(d, 280) {
+                return Err(format!(
+                    "feature {:?}: description must be 1-280 plain characters (no control characters, no `<` `>`)",
+                    f.name
+                ));
+            }
+        }
+        if !SUGGESTED_WORDS.contains(&f.suggested.as_str()) {
+            return Err(format!(
+                "feature {:?}: suggested {:?} — use \"user\", \"operator\", \"admin\" or \"none\" \
+                 (a suggestion grants nothing; the operator decides)",
+                f.name, f.suggested
+            ));
+        }
+    }
+    if m.delegate.is_some() {
+        return Err(
+            "the top-level delegate key is replaced by \"delegate\": true on a feature in a manifest \
+             with features — move it to the feature that acts for a person"
+                .into(),
+        );
+    }
+    for r in &m.routes {
+        let ctx = format!("route {:?}", r.name);
+        if r.internal {
+            if r.feature.is_some() {
+                return Err(format!("{ctx}: an internal route takes no feature (only the gateway calls it)"));
+            }
+            continue;
+        }
+        if r.min_role.is_some() || !r.scopes.is_empty() {
+            return Err(format!(
+                "{ctx}: min_role and scopes are replaced by \"feature\" in a manifest with features — \
+                 noomesh decides who may use a feature"
+            ));
+        }
+        let Some(name) = r.feature.as_deref() else {
+            return Err(format!("{ctx}: every public route names its \"feature\" in a manifest with features"));
+        };
+        let Some(f) = m.feature(name) else {
+            return Err(format!("{ctx}: feature {name:?} is not declared in \"features\""));
+        };
+        if r.receives_delegation && !f.delegate {
+            return Err(format!(
+                "{ctx}: receives_delegation needs its feature {name:?} to declare \"delegate\": true"
+            ));
+        }
+    }
+    if let Some(ui) = m.ui.as_ref() {
+        if ui.min_role.is_some() {
+            return Err("ui.min_role is replaced by ui.feature in a manifest with features".into());
+        }
+        match ui.feature.as_deref() {
+            None => return Err("ui.feature: the UI names the feature that opens it, in a manifest with features".into()),
+            Some(name) if m.feature(name).is_none() => {
+                return Err(format!("ui.feature {name:?} is not declared in \"features\""));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// The `ui` key is acceptable: a plain upstream path, a known role, a sane
 /// timeout and a short plain title.
 fn check_ui(ui: &UiSpec) -> Result<(), String> {
@@ -689,10 +855,11 @@ fn check_delegation(m: &AddonManifest) -> Result<(), String> {
         }
     }
     for r in m.routes.iter().filter(|r| r.receives_delegation) {
-        if m.delegate.as_deref() != Some(DELEGATE_TASKS) {
+        if !m.delegates_tasks() {
             return Err(format!(
                 "route {:?}: receives_delegation is valid only when the manifest declares \
-                 \"delegate\": \"{DELEGATE_TASKS}\" — add the delegate key or remove receives_delegation",
+                 \"delegate\": \"{DELEGATE_TASKS}\" (or, with features, a feature with \"delegate\": true) — \
+                 add it or remove receives_delegation",
                 r.name
             ));
         }
@@ -714,10 +881,11 @@ fn check_delegation(m: &AddonManifest) -> Result<(), String> {
         }
     }
     let Some(ev) = m.task_events.as_ref() else { return Ok(()) };
-    if m.delegate.as_deref() != Some(DELEGATE_TASKS) {
+    if !m.delegates_tasks() {
         return Err(format!(
-            "task_events is valid only with \"delegate\": \"{DELEGATE_TASKS}\" — without \
-             delegation nothing is ever sent there; add the delegate key or remove task_events"
+            "task_events is valid only with \"delegate\": \"{DELEGATE_TASKS}\" (or, with features, a \
+             feature with \"delegate\": true) — without delegation nothing is ever sent there; add it \
+             or remove task_events"
         ));
     }
     if ev.method != "POST" {

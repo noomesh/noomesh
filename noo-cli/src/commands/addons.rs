@@ -366,6 +366,7 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 json!({
                     "name": n, "declared": d, "effective": d == Some(true), "third_party": true,
                     "signer": signer, "dev": dev, "pin": pins.get(&n), "launch_refused": refusal(&n),
+                    "registry_credential": credential_cell(&config_text(), &n),
                 })
             })
             .collect();
@@ -432,7 +433,8 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     );
     // Third-party add-ons the operator trusts a key for: who signs them, and
     // a DEV marker with the expiry when it is a development key (i163 A).
-    let third = third_party_rows(&config_text(), crate::addon_lock::now_unix());
+    let text = config_text();
+    let third = third_party_rows(&text, crate::addon_lock::now_unix());
     if !third.is_empty() {
         println!();
         let rows: Vec<Vec<String>> = third
@@ -452,6 +454,7 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 };
                 let mut row = vec![n.clone(), declared_cell, signer_cell];
                 row.extend(crate::commands::addon_pins::pin_cells(pins.get(n)));
+                row.push(credential_cell(&text, n));
                 row
             })
             .collect();
@@ -466,6 +469,7 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     ui::Col::left("stack"),
                     ui::Col::left("digest"),
                     ui::Col::left("key"),
+                    ui::Col::left("registry credential"),
                 ],
                 &rows
             )
@@ -1171,6 +1175,7 @@ pub fn addons_untrust_key(g: &Globals, args: &[String]) -> Result<i32, Unhandled
         (true, [name]) => (*name, None),
         _ => return Err(Unhandled),
     };
+    let had_credential = crate::addons::trust::credential_root(&config_text(), name).is_some();
     let edited = if dev {
         edit_yaml(|t| crate::addons::trust::remove_dev_key(t, name, key))
     } else {
@@ -1180,6 +1185,18 @@ pub fn addons_untrust_key(g: &Globals, args: &[String]) -> Result<i32, Unhandled
         Ok(p) => p,
         Err(e) => fail(g.json, ExitCode::Usage, "untrust_key", &e, Some("noo addons list")),
     };
+    // The credential lives beside the trust entry: when the entry is gone, so is it.
+    let entry_gone = !crate::addons::trust::read(&config_text()).unwrap_or_default().contains_key(name);
+    let credential_removed = if had_credential && entry_gone {
+        match drop_stored_credential(name) {
+            Ok(removed) => removed,
+            Err(e) => fail(g.json, ExitCode::Generic, "untrust_key",
+                &format!("{name} is no longer trusted, but its registry credential could not be removed: {e}"),
+                Some(&format!("noo security secrets audit   # then remove {} from the store", crate::addons::lock_fetch::cred_key(name)))),
+        }
+    } else {
+        false
+    };
     let what = match (dev, key) {
         (true, None) => "every development key".to_string(),
         (true, Some(k)) => format!("development key {}", k.to_ascii_lowercase()),
@@ -1188,13 +1205,159 @@ pub fn addons_untrust_key(g: &Globals, args: &[String]) -> Result<i32, Unhandled
     if g.json {
         println!("{}", json!({
             "addon": name, "dev": dev, "removed_key": key.map(str::to_ascii_lowercase),
+            "registry_credential_removed": credential_removed,
             "config": path.display().to_string(),
         }));
     } else {
         ui::done(&format!("{name}: {what} no longer trusted ({})", path.display()));
+        if credential_removed {
+            println!("{}", ui::note(&format!("{name}'s registry credential was removed with its trust entry")));
+        }
         println!("{}", ui::note("a pin made under it stays until `noo addons verify` or the next start re-checks it against the remaining keys"));
     }
     Ok(0)
+}
+
+/// Remove `name`'s pull credential from the secret store. `Ok(false)`: the
+/// store held none (or the sops backend is off, so nothing could be stored).
+fn drop_stored_credential(name: &str) -> Result<bool, String> {
+    if !crate::envfile::sops_backend_active() {
+        return Ok(false);
+    }
+    let key = crate::addons::lock_fetch::cred_key(name);
+    let path = crate::envfile::repo_root().join("secrets/env.sops");
+    let store = crate::commands::secrets::SecretStore::load_sops(&path)?;
+    if !store.contains(&key) {
+        return Ok(false);
+    }
+    crate::commands::secrets::remove_keys(&[key], &path).map(|_| true)
+}
+
+/// The most a registry token may be: no real one is near this.
+const MAX_REGISTRY_TOKEN: usize = 4096;
+
+/// A registry token read from `text` (a file, or stdin): one trimmed token,
+/// never empty, never with whitespace inside.
+fn parse_registry_token(text: &str) -> Result<String, String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Err("the token is empty".into());
+    }
+    if t.len() > MAX_REGISTRY_TOKEN || t.chars().any(char::is_whitespace) {
+        return Err("that is not a single registry token (it has whitespace in it, or is too long)".into());
+    }
+    Ok(t.to_string())
+}
+
+/// `noo addons registry-login <addon> --registry <root> [--from-file <path>] [--clear]`
+///
+/// Register a read-only pull token for ONE third-party add-on's registry root
+/// (i277h). The value is read from stdin or `--from-file`, never argv. It is
+/// stored in the secret store under `NOO_ADDON_REGISTRY_CRED_<NAME>`; the trust
+/// entry records only that it exists and the root it is bound to. `--registry`
+/// must be exactly the root the add-on's keys were trusted for. `--clear`
+/// removes it.
+pub fn addons_registry_login(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    use std::io::{IsTerminal as _, Read as _};
+    let (mut name, mut registry, mut file, mut clear) = (None, None, None, false);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--registry" => match it.next() {
+                Some(v) if !v.starts_with('-') => registry = Some(v.trim().to_string()),
+                _ => return Err(Unhandled),
+            },
+            "--from-file" => match it.next() {
+                Some(v) if !v.starts_with('-') => file = Some(v.clone()),
+                _ => return Err(Unhandled),
+            },
+            "--clear" => clear = true,
+            s if s.starts_with('-') => return Err(Unhandled),
+            _ if name.is_none() => name = Some(a.as_str()),
+            _ => return Err(Unhandled),
+        }
+    }
+    let Some(name) = name else { return Err(Unhandled) };
+    let usage = "noo addons registry-login <addon> --registry <root> [--from-file <path>]";
+    if clear {
+        if registry.is_some() || file.is_some() {
+            fail(g.json, ExitCode::Usage, "registry_login", "--clear takes only the add-on name", Some("noo addons registry-login <addon> --clear"));
+        }
+        let path = config_path();
+        if crate::addons::trust::credential_root(&config_text(), name).is_some() {
+            if let Err(e) = edit_yaml(|t| crate::addons::trust::clear_credential(t, name)) {
+                fail(g.json, ExitCode::Generic, "registry_login", &e, Some("noo addons list"));
+            }
+        }
+        let removed = match drop_stored_credential(name) {
+            Ok(r) => r,
+            Err(e) => fail(g.json, ExitCode::Generic, "registry_login", &format!("the store could not be read or written: {e}"),
+                Some("noo security secrets audit")),
+        };
+        if g.json {
+            println!("{}", json!({"addon": name, "registry_credential": "cleared", "removed_from_store": removed, "config": path.display().to_string()}));
+        } else {
+            ui::done(&format!("{name}: registry credential cleared; its images are pulled anonymously again"));
+        }
+        return Ok(0);
+    }
+    let Some(registry) = registry else {
+        fail(g.json, ExitCode::Usage, "registry_login", "give the registry root the add-on's keys were trusted for", Some(usage));
+    };
+    // Every refusal that needs only the trust entry comes before the store is touched.
+    let before = config_text();
+    if let Err(e) = crate::addons::trust::set_credential(&before, name, &registry) {
+        fail(g.json, ExitCode::Usage, "registry_login", &e, Some("noo addons list"));
+    }
+    if !crate::envfile::sops_backend_active() {
+        fail(g.json, ExitCode::Generic, "registry_login",
+            "this install keeps no encrypted secret store (NOO_SECRETS_BACKEND is not sops), and a registry token is never kept anywhere else",
+            Some("noo security secrets audit"));
+    }
+    let raw = match &file {
+        Some(p) => std::fs::read_to_string(p).map_err(|e| format!("cannot read {p}: {e}")),
+        None if std::io::stdin().is_terminal() => Err("the token is read from stdin or --from-file, never typed as an argument".to_string()),
+        None => {
+            let mut buf = String::new();
+            std::io::stdin().take(MAX_REGISTRY_TOKEN as u64 + 1024).read_to_string(&mut buf).map(|_| buf).map_err(|e| format!("cannot read stdin: {e}"))
+        }
+    };
+    let token = match raw.and_then(|r| parse_registry_token(&r)) {
+        Ok(t) => t,
+        Err(e) => fail(g.json, ExitCode::Usage, "registry_login", &e, Some(usage)),
+    };
+    let key = crate::addons::lock_fetch::cred_key(name);
+    if let Err(e) = crate::commands::secrets::store_upsert(&[(key.clone(), token)]) {
+        fail(g.json, ExitCode::Generic, "registry_login", &format!("the token could not be stored, nothing was recorded: {e}"),
+            Some("noo security secrets audit"));
+    }
+    let path = match edit_yaml(|t| crate::addons::trust::set_credential(t, name, &registry)) {
+        Ok(p) => p,
+        Err(e) => fail(g.json, ExitCode::Generic, "registry_login",
+            &format!("the token is stored as {key}, but the trust entry could not record it: {e}"), Some(usage)),
+    };
+    if g.json {
+        println!("{}", json!({"addon": name, "registry": registry, "registry_credential": "set", "config": path.display().to_string()}));
+    } else {
+        ui::done(&format!("{name}: registry credential stored; it is sent to {registry} and nowhere else"));
+        ui::guide(&[
+            ("noo addons upgrade <name>", "pulls the add-on's signed lock and images with it"),
+            ("noo addons registry-login <addon> --clear", "removes it again (untrust-key removes it too)"),
+        ]);
+    }
+    Ok(0)
+}
+
+/// What `list` shows for a third-party add-on's pull credential, from the
+/// noomesh.yaml TEXT: never the value. A record bound to a root other than the
+/// one trusted now is shown as unused.
+pub(crate) fn credential_cell(text: &str, name: &str) -> String {
+    let trusted = crate::addons::trust::read(text).ok().and_then(|m| m.get(name).map(|a| a.registry.trim().to_string()));
+    match (crate::addons::trust::credential_root(text, name), trusted) {
+        (None, _) => "not set".to_string(),
+        (Some(r), Some(t)) if r == t => format!("set ({r})"),
+        (Some(r), _) => format!("set for {r}, NOT the trusted root: unused"),
+    }
 }
 
 /// `addons list` rows for third-party add-ons (trusted with `trust-key`):
@@ -1263,6 +1426,15 @@ addons:
 compose_env:
   NOO_X: \"1\"
 ";
+
+    #[test]
+    fn a_registry_token_is_one_trimmed_word() {
+        assert_eq!(parse_registry_token("  ghp_abc123\n").unwrap(), "ghp_abc123");
+        assert!(parse_registry_token(" \n").unwrap_err().contains("empty"));
+        assert!(parse_registry_token("two words").is_err());
+        assert!(parse_registry_token("line1\nline2").is_err());
+        assert!(parse_registry_token(&"x".repeat(MAX_REGISTRY_TOKEN + 1)).is_err());
+    }
 
     #[test]
     fn an_existing_entry_is_flipped_and_the_comments_survive() {

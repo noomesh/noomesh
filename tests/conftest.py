@@ -2,6 +2,7 @@
 # Copyright 2026 PersonifAI LLC
 
 """Pytest configuration and fixtures."""
+import os
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,23 @@ _ci_skip_guard.TESTS_DIR = Path(__file__).resolve().parent
 
 pytest_configure = _ci_skip_guard.pytest_configure
 pytest_sessionfinish = _ci_skip_guard.pytest_sessionfinish
+
+
+def _path_without_host_nvidia_smi(path: str) -> str:
+    """`path` minus every directory that holds an `nvidia-smi` (followup i142).
+
+    The launcher tests run the real scripts with `{bindir}:$PATH`, and
+    scripts/lib-compose.sh and noomesh-restart.sh call `nvidia-smi` when it is
+    on PATH. On a WSL2 box with the GPU busy (a game, a batch build) one call
+    blocked for 11 minutes (2026-10-31, awolf), so the tests timed out there
+    and passed on CI runners, which have no NVIDIA driver. Dropping it here
+    gives every box the CI answer ("no NVIDIA driver"). A test that wants a
+    GPU puts its own fake `nvidia-smi` in its bindir, which is not touched."""
+    keep = [d for d in path.split(os.pathsep) if not (d and os.path.isfile(os.path.join(d, "nvidia-smi")))]
+    return os.pathsep.join(keep)
+
+
+os.environ["PATH"] = _path_without_host_nvidia_smi(os.environ.get("PATH", ""))
 
 
 @pytest.fixture

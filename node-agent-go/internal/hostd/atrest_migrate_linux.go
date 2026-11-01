@@ -14,7 +14,7 @@ package hostd
 // (the sources are owned by postgres, redis, … and the PKI keys are 0600).
 //
 //	--src  <abs dir>        the plaintext source (kept, never modified)
-//	--name <state dir>      postgres redis nats prometheus grafana loki
+//	--name <state dir>      postgres redis nats prometheus grafana loki tempo
 //	                        noo-data claude-config alertmanager-data pki
 //	--mode pre|final|verify
 //
@@ -66,7 +66,7 @@ import (
 // MigrateStateNames is what `copy --name` and `wipe --entry` accept: the
 // state set (compose volumes under NOO_STATE_ROOT) plus the PKI.
 var MigrateStateNames = []string{
-	"postgres", "redis", "nats", "prometheus", "grafana", "loki", "noo-data",
+	"postgres", "redis", "nats", "prometheus", "grafana", "loki", "tempo", "noo-data",
 	"claude-config", "alertmanager-data", "pki",
 }
 

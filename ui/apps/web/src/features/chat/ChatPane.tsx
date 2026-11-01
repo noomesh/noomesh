@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button';
 import { ChatRail } from '@/components/ChatRail';
 import { ApprovalCard } from './ApprovalCard';
 import { useCoordinator, type TurnStats, type ToolRun } from './useCoordinator';
+import { phaseLabel, type TurnPhase } from './phase';
 import { useBackendHealth } from './useBackendHealth';
 import { atTail } from './followTail';
 import { formatElapsed } from './toolElapsed';
@@ -28,6 +29,23 @@ export interface ChatPaneProps {
 
 /** Short model label — `org/Model-Name` renders as `Model-Name`. */
 const shortModel = (m: string) => m.split('/').pop() ?? m;
+
+/**
+ * What a turn is doing before its first token ("queued on mcmini (2/2 busy)
+ * · 4s", "thinking… 12s"), its timer ticking once a second while shown.
+ */
+export function PhaseLine({ phase }: { phase: TurnPhase }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  return (
+    <div className="phase-line" role="status" aria-live="polite">
+      {phaseLabel(phase, now)}
+    </div>
+  );
+}
 
 /**
  * Reasoning disclosure: live and open while the model thinks, then collapses
@@ -174,7 +192,7 @@ function StatsFooter({ stats }: { stats: TurnStats }) {
 }
 
 export function ChatPane({ panelHidden, onTogglePanel, onToggleChat, collapsed }: ChatPaneProps) {
-  const { messages, status, send, canSend, busy, serving } = useCoordinator();
+  const { messages, status, send, stop, canSend, busy, serving } = useCoordinator();
   const health = useBackendHealth();
   const [draft, setDraft] = useState('');
   const [model, setModel] = useState('');
@@ -346,6 +364,7 @@ export function ChatPane({ panelHidden, onTogglePanel, onToggleChat, collapsed }
                   </span>
                 )}
               </div>
+              {m.streaming && !m.text && m.phase && <PhaseLine phase={m.phase} />}
               {m.thinking && (
                 <ThinkingBlock text={m.thinking} streaming={m.streaming} thinkMs={m.thinkMs} />
               )}
@@ -384,11 +403,21 @@ export function ChatPane({ panelHidden, onTogglePanel, onToggleChat, collapsed }
               onError={setVoiceError}
             />
           )}
-          <Button type="submit" size="icon" aria-label="Send" disabled={!sendable}>
-            <svg viewBox="0 0 20 20" fill="currentColor">
-              <path d="M3 10l14-6-6 14-2-6z" />
-            </svg>
-          </Button>
+          {busy ? (
+            // A turn in flight: Stop gives up on it here (the composer never
+            // stays locked behind a reply that will not finish).
+            <Button type="button" size="icon" aria-label="Stop" onClick={stop}>
+              <svg viewBox="0 0 20 20" fill="currentColor">
+                <rect x="5" y="5" width="10" height="10" rx="1" />
+              </svg>
+            </Button>
+          ) : (
+            <Button type="submit" size="icon" aria-label="Send" disabled={!sendable}>
+              <svg viewBox="0 0 20 20" fill="currentColor">
+                <path d="M3 10l14-6-6 14-2-6z" />
+              </svg>
+            </Button>
+          )}
         </div>
 
         {voiceError && voice.mic !== 'hidden' && (

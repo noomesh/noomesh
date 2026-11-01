@@ -66,6 +66,7 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/grafana-ds/prometheus/{*path}", get(prometheus).post(prometheus))
         .route("/api/grafana-ds/loki/{*path}", get(loki).post(loki))
+        .route("/api/grafana-ds/tempo/{*path}", get(tempo))
 }
 
 /// The provisioned dashboards whose queries a read-only person may run.
@@ -81,6 +82,8 @@ const DASHBOARDS: &[(&str, &str)] = &[(
 pub enum Upstream {
     Prometheus,
     Loki,
+    /// Request traces (i359).
+    Tempo,
 }
 
 impl Upstream {
@@ -88,6 +91,7 @@ impl Upstream {
         match self {
             Upstream::Prometheus => "prometheus",
             Upstream::Loki => "loki",
+            Upstream::Tempo => "tempo",
         }
     }
 }
@@ -225,6 +229,32 @@ const LOKI_READS: &[&str] = &[
     "loki/api/v1/status/buildinfo",
 ];
 
+/// Tempo's read API as Grafana's Tempo data source calls it (search, tags,
+/// one trace). Never the OTLP push, never the admin or flush endpoints.
+const TEMPO_READS: &[&str] = &[
+    "api/echo",
+    "api/search",
+    "api/search/tags",
+    "api/v2/search/tags",
+    "api/status/buildinfo",
+];
+
+/// `api/traces/<id>` or `api/v2/traces/<id>`, a hex trace id.
+fn tempo_trace_path(p: &str) -> bool {
+    let id = p.strip_prefix("api/v2/traces/").or_else(|| p.strip_prefix("api/traces/"));
+    id.is_some_and(|id| (1..=32).contains(&id.len()) && id.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// `api/search/tag/<tag>/values` or `api/v2/search/tag/<tag>/values`. A tag
+/// may be scoped (`span.http.route`), so dots are allowed.
+fn tempo_tag_values_path(p: &str) -> bool {
+    let tag = p
+        .strip_prefix("api/v2/search/tag/")
+        .or_else(|| p.strip_prefix("api/search/tag/"))
+        .and_then(|t| t.strip_suffix("/values"));
+    tag.is_some_and(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')))
+}
+
 /// `<prefix><label>/values` → the label.
 fn label_values_path<'a>(p: &'a str, prefix: &str) -> Option<&'a str> {
     let label = p.strip_prefix(prefix)?.strip_suffix("/values")?;
@@ -239,6 +269,7 @@ pub fn operator_allows(up: Upstream, path: &str) -> Result<(), String> {
             PROM_READS.contains(&path) || label_values_path(path, "api/v1/label/").is_some()
         }
         Upstream::Loki => LOKI_READS.contains(&path) || label_values_path(path, "loki/api/v1/label/").is_some(),
+        Upstream::Tempo => TEMPO_READS.contains(&path) || tempo_trace_path(path) || tempo_tag_values_path(path),
     };
     if ok {
         Ok(())
@@ -273,6 +304,9 @@ fn known_keys(params: &[(String, String)], allowed: &[&str]) -> Result<(), Strin
 pub fn viewer_allows(list: &Allowlist, up: Upstream, path: &str, params: &[(String, String)]) -> Result<(), String> {
     if up == Upstream::Loki {
         return Err("logs are operator-only; no read-only dashboard reads Loki".into());
+    }
+    if up == Upstream::Tempo {
+        return Err("request traces are operator-only; they name every account's requests".into());
     }
     match path {
         "api/v1/status/buildinfo" => Ok(()),
@@ -439,6 +473,23 @@ async fn loki(
     serve(&state, svc, Upstream::Loki, path, method, uri, headers, body).await
 }
 
+/// `GET /api/grafana-ds/tempo/{*path}` — Grafana's Tempo data source (i359),
+/// through the gateway. Grafana's service leaf only. Shaped as Tempo's read
+/// API (`api/search`, `api/v2/traces/<id>`, tag values): an operator or
+/// admin gets it; a read-only account, and Grafana with no user, get
+/// nothing, since a trace names who made each request. Never the OTLP push.
+async fn tempo(
+    State(state): State<Arc<AppState>>,
+    svc: Option<Extension<Option<VerifiedService>>>,
+    Path(path): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    serve(&state, svc, Upstream::Tempo, path, method, uri, headers, body).await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn serve(
     state: &AppState,
@@ -494,6 +545,8 @@ fn upstream_base(up: Upstream) -> String {
         // Empty = Loki is not configured on this controller, the same
         // default the other Loki readers use; answered as a 502, not guessed.
         Upstream::Loki => crate::config::env_or_yaml("NOO_LOKI_URL", |c| c.services.loki_url.clone(), ""),
+        // Empty = no Tempo on this controller, answered as a 502 like Loki.
+        Upstream::Tempo => std::env::var(crate::routes::admin::TEMPO_QUERY_URL_ENV).unwrap_or_default(),
     }
 }
 
@@ -557,6 +610,40 @@ mod tests {
 
     fn get() -> Method {
         Method::GET
+    }
+
+    /// Tempo (i359): an operator reads search, tags and one trace; nothing
+    /// else, and no read-only account or user-less Grafana reads it at all.
+    #[test]
+    fn tempo_is_operator_only_and_read_only() {
+        let a = allowlist();
+        for path in [
+            "api/search",
+            "api/v2/search/tags",
+            "api/search/tag/service.name/values",
+            "api/v2/search/tag/span.http.route/values",
+            "api/traces/4bf92f3577b34da6a3ce929d0e0e4736",
+            "api/v2/traces/4bf92f3577b34da6a3ce929d0e0e4736",
+            "api/echo",
+        ] {
+            assert_eq!(grafana_ds_allows(a, Some(Role::Operator), Upstream::Tempo, &get(), path, &[]), Ok(()), "{path}");
+            for tier in [Some(Role::User), None] {
+                let e = grafana_ds_allows(a, tier, Upstream::Tempo, &get(), path, &[]).expect_err(path);
+                assert!(e.contains("operator-only"), "{e}");
+            }
+        }
+        for path in [
+            "v1/traces",
+            "otlp/v1/traces",
+            "flush",
+            "shutdown",
+            "api/traces/not-hex",
+            "api/traces/",
+            "api/search/tag/a b/values",
+            "status/config",
+        ] {
+            assert!(grafana_ds_allows(a, Some(Role::Admin), Upstream::Tempo, &get(), path, &[]).is_err(), "{path}");
+        }
     }
 
     /// The compiled list is the shipped dashboard's, and it is not empty —
@@ -734,9 +821,16 @@ mod tests {
     fn the_routes_sit_under_the_gated_prefix() {
         let src = include_str!("grafana_ds.rs");
         let routes: Vec<&str> = src.lines().filter(|l| l.trim_start().starts_with(".route(\"")).collect();
-        assert_eq!(routes.len(), 2, "{routes:?}");
-        for r in routes {
+        assert_eq!(routes.len(), 3, "{routes:?}");
+        for r in &routes {
             assert!(r.contains(&format!(".route(\"{}", crate::auth::GRAFANA_DS_PREFIX)), "{r}");
         }
+        for up in ["prometheus", "loki", "tempo"] {
+            assert!(routes.iter().any(|r| r.contains(&format!("{}{up}/{{*path}}", crate::auth::GRAFANA_DS_PREFIX))), "no {up} route: {routes:?}");
+        }
+        // Tempo (i359) is read with GET only: Grafana's Tempo data source
+        // never posts, and the OTLP push is not on this door.
+        let tempo = routes.iter().find(|r| r.contains("/tempo/")).expect("the tempo route");
+        assert!(tempo.contains("get(tempo)") && !tempo.contains("post("), "{tempo}");
     }
 }

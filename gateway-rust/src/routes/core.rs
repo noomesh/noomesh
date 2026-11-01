@@ -46,24 +46,6 @@ fn token_expire_minutes() -> i64 {
     auth_refresh::default_access_minutes()
 }
 
-/// True when the SESSION is HTTPS — controls the `Secure` flag on the
-/// refresh cookie.
-///
-/// The gateway's own certificate is one way to be sure; the other is
-/// sitting behind a TLS-terminating proxy, where the gateway itself
-/// speaks plain HTTP and would otherwise issue the cookie without
-/// `Secure`. `SameSite=Strict` + the `/api/auth` path
-/// still block CSRF either way; this is about transport exposure.
-/// `NOO_BEHIND_TLS_PROXY=1` declares that deployment shape.
-fn is_secure() -> bool {
-    let own_tls = std::env::var("NOO_TLS_CERT").map(|s| !s.is_empty()).unwrap_or(false);
-    let proxied = matches!(
-        std::env::var("NOO_BEHIND_TLS_PROXY").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("on")
-    );
-    own_tls || proxied
-}
-
 /// The scopes a token carries during the dual-accept window:
 /// the legacy tier scopes DERIVED from the role — the role column is the
 /// source of truth, stored scopes are never copied verbatim — plus any
@@ -395,6 +377,72 @@ pub(crate) const HOST_TICKET_GRANT: &str = "host_ticket";
 /// onboard wizard with no password to hand, and a lost-password recovery.
 ///
 /// Returns a JWT with `sub`, `scopes`, `exp`, `iat` claims.
+/// The console's session endpoints (`/auth/token`, `/api/auth/refresh`,
+/// `/api/auth/logout`) answer a BROWSER only for the console's own pages.
+///
+/// Cookies ignore ports and SameSite counts `host:<other port>` as the same
+/// site, so the Strict `noo_refresh` cookie rides along when a page served on
+/// another port of this host (an add-on's UI) POSTs here. A form-style POST
+/// needs no CORS preflight to take effect, so without this an add-on page
+/// could log the console out (2026-11-01 on pop-os: a logout with no console
+/// request before it), rotate its refresh, or log the browser into another
+/// account (login CSRF, which plants a refresh cookie).
+///
+/// - `Sec-Fetch-Site` present (every current browser sends it): only
+///   `same-origin` (or `none`, a navigation) is accepted; `same-site` (another
+///   port of this host) and `cross-site` are refused.
+/// - else `Origin` present: its host and port must be the request's `Host`.
+/// - neither: not a browser (the CLI, a script, curl): accepted as before.
+///
+/// `Err` is the sentence the 403 carries.
+pub(crate) fn session_origin_refusal(headers: &http::HeaderMap) -> Result<(), String> {
+    let header = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).map(|v| v.trim().to_ascii_lowercase());
+    if let Some(site) = header("sec-fetch-site") {
+        return match site.as_str() {
+            "same-origin" | "none" => Ok(()),
+            other => Err(format!(
+                "a {other} request cannot use the console's session: only the console's own pages may sign in, \
+                 refresh or sign out"
+            )),
+        };
+    }
+    let Some(origin) = header("origin") else { return Ok(()) };
+    let host = header("host").unwrap_or_default();
+    match origin_authority(&origin) {
+        Some(a) if !host.is_empty() && a == without_default_port(&host, origin.starts_with("https://")) => Ok(()),
+        _ => Err(format!("a request from {origin} cannot use the console's session (only its own origin may)")),
+    }
+}
+
+/// `host[:port]` of an `Origin`, the default port dropped; `None` for
+/// `null` or anything that is not `http(s)://authority`.
+fn origin_authority(origin: &str) -> Option<String> {
+    let (https, rest) = if let Some(r) = origin.strip_prefix("https://") {
+        (true, r)
+    } else {
+        (false, origin.strip_prefix("http://")?)
+    };
+    let authority = rest.split('/').next().filter(|a| !a.is_empty())?;
+    Some(without_default_port(authority, https))
+}
+
+fn without_default_port(authority: &str, https: bool) -> String {
+    let default = if https { ":443" } else { ":80" };
+    authority.strip_suffix(default).unwrap_or(authority).to_string()
+}
+
+/// The 403 for [`session_origin_refusal`]: no cookie is set or cleared.
+fn session_origin_forbidden(why: String) -> Response {
+    (StatusCode::FORBIDDEN, Json(json!({"detail": why, "code": "cross_origin_session_request"}))).into_response()
+}
+
+/// The two request headers that say where a session call came from, for the
+/// log line that makes the next incident provable.
+fn origin_fields(headers: &http::HeaderMap) -> (String, String) {
+    let h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or("").chars().take(200).collect::<String>();
+    (h("origin"), h("sec-fetch-site"))
+}
+
 async fn auth_token(
     State(state): State<Arc<AppState>>,
     peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
@@ -402,6 +450,11 @@ async fn auth_token(
     // Accept both JSON and form-urlencoded (OAuth2 form)
     body: axum::body::Bytes,
 ) -> Response {
+    if let Err(why) = session_origin_refusal(&headers) {
+        let (origin, site) = origin_fields(&headers);
+        tracing::warn!(origin = %origin, sec_fetch_site = %site, "auth_token refused: {why}");
+        return session_origin_forbidden(why);
+    }
     // Parse as form-urlencoded first (OAuth2 standard), fall back to JSON
     let creds: TokenRequest = if let Ok(form) = serde_urlencoded::from_bytes::<TokenRequest>(&body) {
         form
@@ -590,7 +643,7 @@ async fn issue_login(state: &AppState, user: &UserRecord, ua: Option<&str>, ip: 
     }
 
     // Build the Set-Cookie header for the refresh.
-    let cookie = auth_refresh::build_refresh_cookie(&raw_refresh, is_secure(), refresh_ttl_days);
+    let cookie = auth_refresh::build_refresh_cookie(&raw_refresh, refresh_ttl_days);
     let jar = CookieJar::new().add(cookie);
 
     (
@@ -733,6 +786,12 @@ async fn auth_refresh_handler(
     headers: http::HeaderMap,
     jar: CookieJar,
 ) -> Response {
+    let (origin, site) = origin_fields(&headers);
+    if let Err(why) = session_origin_refusal(&headers) {
+        tracing::warn!(origin = %origin, sec_fetch_site = %site, "auth_refresh refused: {why}");
+        return session_origin_forbidden(why);
+    }
+    tracing::info!(origin = %origin, sec_fetch_site = %site, cookie = jar.get(auth_refresh::REFRESH_COOKIE_NAME).is_some(), "auth_refresh");
     let raw_token = match jar.get(auth_refresh::REFRESH_COOKIE_NAME) {
         Some(c) => c.value().to_string(),
         None => {
@@ -754,11 +813,7 @@ async fn auth_refresh_handler(
                 let labels = std::collections::HashMap::from([("lane".to_string(), "refresh_token_unprefixed".to_string())]);
                 state.metrics.inc_counter("noo_legacy_lane_uses_total", Some(&labels), 1).await;
             }
-            let cookie = auth_refresh::build_refresh_cookie(
-                &new_raw,
-                is_secure(),
-                auth_refresh::refresh_ttl_days(),
-            );
+            let cookie = auth_refresh::build_refresh_cookie(&new_raw, auth_refresh::refresh_ttl_days());
             let jar = CookieJar::new().add(cookie);
             (
                 jar,
@@ -1037,6 +1092,12 @@ async fn auth_logout_handler(
     headers: http::HeaderMap,
     jar: CookieJar,
 ) -> Response {
+    let (origin, site) = origin_fields(&headers);
+    if let Err(why) = session_origin_refusal(&headers) {
+        tracing::warn!(origin = %origin, sec_fetch_site = %site, "auth_logout refused: {why}");
+        return session_origin_forbidden(why);
+    }
+    tracing::info!(origin = %origin, sec_fetch_site = %site, cookie = jar.get(auth_refresh::REFRESH_COOKIE_NAME).is_some(), "auth_logout");
     // Whose session is this? The refresh cookie names the account (browser);
     // a CLI logout has no cookie but presents the bearer it is giving up.
     let mut account: Option<String> = None;
@@ -1073,7 +1134,7 @@ async fn auth_logout_handler(
         let closed = state.alert_hub.end_sessions(&account);
         tracing::info!(user_id = %account, sockets = closed, floor_shared = raised.shared, "auth_logout ended open sockets");
     }
-    let clear = auth_refresh::build_clear_cookie(is_secure());
+    let clear = auth_refresh::build_clear_cookie();
     let jar = CookieJar::new().add(clear);
     (jar, Json(json!({"ok": true}))).into_response()
 }
@@ -1365,6 +1426,77 @@ fn lookup_user_env(username: &str) -> Option<UserRecord> {
     })
 }
 
+/// bcrypt reads only the first 72 bytes of a password: the crate's `hash`
+/// and `verify` both truncate there (bcrypt 0.19 `_hash_password`), so a
+/// longer bootstrap password authenticates with any string sharing its first
+/// 72 bytes (i160a, i74).
+const BCRYPT_MAX_BYTES: usize = 72;
+
+/// The byte length of a bootstrap password bcrypt would truncate, None when
+/// it fits.
+fn overlong_for_bcrypt(password: &str) -> Option<usize> {
+    (password.len() > BCRYPT_MAX_BYTES).then_some(password.len())
+}
+
+/// What the boot check does for a bootstrap password, given whether the env
+/// fallback is still a login path. Pure, so both outcomes are unit-tested.
+#[derive(Debug, PartialEq, Eq)]
+enum OverlongVerdict {
+    /// 72 bytes or fewer (or unset): nothing to say.
+    Fits,
+    /// Over 72 bytes, an admin row exists: the error log only.
+    Log { bytes: usize },
+    /// Over 72 bytes and still a login path: the error log and one alert.
+    LogAndAlert { bytes: usize },
+}
+
+fn overlong_verdict(password: &str, fallback_open: bool) -> OverlongVerdict {
+    match overlong_for_bcrypt(password) {
+        None => OverlongVerdict::Fits,
+        Some(bytes) if fallback_open => OverlongVerdict::LogAndAlert { bytes },
+        Some(bytes) => OverlongVerdict::Log { bytes },
+    }
+}
+
+/// Boot check (i160a): a hand-set `NOO_ADMIN_PASSWORD` over 72 bytes is a
+/// weaker credential than it looks. Onboard refuses one; the gateway does not
+/// refuse it yet, since that could lock out an install whose store already
+/// holds one, but says so loudly: an error log, and one operator alert while
+/// the env fallback is still an authentication path (no enabled admin row).
+pub async fn warn_overlong_bootstrap_password(state: &AppState) {
+    let pw = crate::config::secret_env::secret_or_empty("NOO_ADMIN_PASSWORD");
+    if overlong_for_bcrypt(&pw).is_none() {
+        return; // no census query for the common case
+    }
+    let open = env_fallback_allowed(admin_census(&state.db).await);
+    let (bytes, alert) = match overlong_verdict(&pw, open) {
+        OverlongVerdict::Fits => return,
+        OverlongVerdict::Log { bytes } => (bytes, false),
+        OverlongVerdict::LogAndAlert { bytes } => (bytes, true),
+    };
+    tracing::error!(
+        bytes,
+        env_fallback_open = open,
+        "NOO_ADMIN_PASSWORD is {bytes} bytes; bcrypt checks only the first {BCRYPT_MAX_BYTES}, so any \
+         string sharing them logs in as the bootstrap admin. Fix: noo security admin-password reset"
+    );
+    if !alert {
+        return;
+    }
+    crate::operator_alert::send_operator_alert_with(
+        state,
+        crate::operator_alert::OperatorAlert::new(
+            "auth.bootstrap_password_overlong",
+            "NOO_ADMIN_PASSWORD",
+            "⚠️ The bootstrap admin password is longer than bcrypt checks (72 bytes); only its start protects the first login.",
+        )
+        .detail(format!("{bytes} bytes; no enabled admin account yet, so the env password is still a login path"))
+        .investigate("noo security admin-password reset"),
+        24 * 3600,
+    )
+    .await;
+}
+
 /// Strikes at which an account locks.
 const LOCKOUT_STRIKES: i32 = 5;
 /// Minutes an account stays locked once the strike threshold is reached.
@@ -1556,9 +1688,19 @@ async fn health(
     deps.insert("postgresql".into(), json!({"healthy": db_ok}));
     if !db_ok { all_ok = false; }
 
-    // Check NATS (flush acts as a ping — confirms the connection is live)
-    let nats_ok = state.nats.flush().await.is_ok();
-    deps.insert("nats".into(), json!({"healthy": nats_ok}));
+    // Check NATS. Required, never optional: without the bus there is no
+    // worker dispatch, gossip or agent messaging, so `status` is degraded
+    // and the code 503. Since i301 a.3 the gateway also SERVES without it
+    // (its client keeps connecting in the background), so the check reads
+    // the connection state first and bounds the flush ping: a flush on a
+    // disconnected client waits for the reconnect, and /health must not.
+    // `state` is the word `noo cluster verify` (gateway bus) reads.
+    let nats_ok = crate::state::bus_connected(&state.nats)
+        && tokio::time::timeout(std::time::Duration::from_secs(2), state.nats.flush())
+            .await
+            .is_ok_and(|r| r.is_ok());
+    let nats_state = nats_dependency_state(crate::state::bus_connected(&state.nats), nats_ok);
+    deps.insert("nats".into(), json!({"healthy": nats_ok, "state": nats_state}));
     if !nats_ok { all_ok = false; }
 
     // Check Redis. `state` is the word `noo cluster verify` ("gateway redis")
@@ -1598,6 +1740,14 @@ async fn health(
             "unprovisioned": unprovisioned,
         }));
     }
+
+    // This boot's add-on caller credential (noomesh followup 304). Optional
+    // like `systems`: it never moves `status` or the code, because the
+    // gateway serves everything else; `noo cluster verify` fails on it.
+    deps.insert(
+        "addon_caller".into(),
+        addon_caller_dep(crate::addon_auth::token().is_some(), crate::addon_auth::failure()),
+    );
 
     let status = if all_ok { "healthy" } else { "degraded" };
     let peers = state.gossip.alive_peers().len();
@@ -1652,10 +1802,38 @@ async fn health(
         if let Some(dev) = crate::addons::health_dev_map() {
             body["addons_dev"] = dev;
         }
+        // i353b: why each `unhealthy` add-on was refused; `{}` when none.
+        // `noo cluster verify` FAILs an enabled add-on named here.
+        body["addons_refused"] = crate::addons::health_refused_map();
         // i277f: `noo upgrade` compares it across a roll (reconnect hint).
         body["mcp_catalogue"] = json!(crate::mcp_external::catalogue_digest());
     }
     (code, Json(body))
+}
+
+/// `dependencies.addon_caller`: whether this boot minted the bearer it signs
+/// add-on calls with, and when it did not, why and what that costs.
+fn addon_caller_dep(minted: bool, failure: Option<&str>) -> Value {
+    if minted {
+        return json!({"healthy": true, "optional": true});
+    }
+    json!({
+        "healthy": false,
+        "optional": true,
+        "error": failure.unwrap_or("not minted yet"),
+        "remedy": crate::addon_auth::MISSING_REMEDY,
+    })
+}
+
+/// `dependencies.nats.state`: `connected`, `unresponsive` (connected but the
+/// flush ping did not return in time) or `reconnecting` (no connection; the
+/// client keeps trying).
+fn nats_dependency_state(connected: bool, flushed: bool) -> &'static str {
+    match (connected, flushed) {
+        (true, true) => "connected",
+        (true, false) => "unresponsive",
+        (false, _) => "reconnecting",
+    }
 }
 
 /// The health body, by whether the caller presented a credential.
@@ -1843,6 +2021,24 @@ mod tests {
     // healthcheck, the host watchdog and hostd's recreate gate all read
     // the status CODE — so the inventory was given away for nothing.
 
+    // ── the add-on caller credential (followup 304) ──────────────
+
+    #[test]
+    fn a_minted_caller_key_is_healthy_and_says_no_more() {
+        assert_eq!(addon_caller_dep(true, None), json!({"healthy": true, "optional": true}));
+    }
+
+    #[test]
+    fn an_unminted_caller_key_is_unhealthy_with_its_reason_and_remedy() {
+        let d = addon_caller_dep(false, Some("could not publish this boot's key: pool timed out"));
+        assert_eq!(d["healthy"], false);
+        assert_eq!(d["optional"], true, "it must never move /health's status code");
+        assert_eq!(d["error"], "could not publish this boot's key: pool timed out");
+        assert_eq!(d["remedy"], crate::addon_auth::MISSING_REMEDY);
+        // Before init has run there is no reason yet, and still no pass.
+        assert_eq!(addon_caller_dep(false, None)["healthy"], false);
+    }
+
     fn deps_fixture() -> serde_json::Map<String, Value> {
         let mut m = serde_json::Map::new();
         m.insert("postgresql".into(), json!({"healthy": true}));
@@ -1857,6 +2053,75 @@ mod tests {
         let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
         assert_eq!(keys, vec!["status"], "anonymous /health leaked {keys:?}");
         assert_eq!(b["status"], "healthy");
+    }
+
+    /// i301 a.3: `dependencies.nats.state`, and the check never waits on a
+    /// disconnected client (it serves degraded now, and /health must answer).
+    #[test]
+    fn the_nats_dependency_says_why_and_never_waits_on_a_dead_bus() {
+        assert_eq!(nats_dependency_state(true, true), "connected");
+        assert_eq!(nats_dependency_state(true, false), "unresponsive");
+        assert_eq!(nats_dependency_state(false, false), "reconnecting");
+        let src = include_str!("core.rs");
+        let check = src.split("let nats_ok = ").nth(1).unwrap().split(';').next().unwrap();
+        assert!(check.starts_with("crate::state::bus_connected(&state.nats)"), "the state is read first: {check}");
+        assert!(check.contains("tokio::time::timeout(") && check.contains("state.nats.flush()"), "the ping is bounded: {check}");
+    }
+
+    fn h(pairs: &[(&str, &str)]) -> http::HeaderMap {
+        let mut m = http::HeaderMap::new();
+        for (k, v) in pairs {
+            m.insert(http::HeaderName::from_bytes(k.as_bytes()).unwrap(), http::HeaderValue::from_str(v).unwrap());
+        }
+        m
+    }
+
+    /// 2026-11-01: an add-on page on another port of the console's host
+    /// logged the console out. The session endpoints answer a browser only
+    /// for the console's own origin; the CLI (no browser headers) as before.
+    #[test]
+    fn the_session_endpoints_refuse_a_browser_request_from_another_origin() {
+        // Every current browser: Sec-Fetch-Site decides.
+        assert!(session_origin_refusal(&h(&[("sec-fetch-site", "same-origin")])).is_ok());
+        assert!(session_origin_refusal(&h(&[("sec-fetch-site", "none")])).is_ok(), "a navigation");
+        for site in ["same-site", "cross-site", "Same-Site"] {
+            let e = session_origin_refusal(&h(&[("sec-fetch-site", site), ("origin", "https://pop-os.ts.net:8443")]))
+                .expect_err(site);
+            assert!(e.contains("console's own pages"), "{e}");
+        }
+        // An older browser: Origin must be this Host (default ports folded).
+        let host = "pop-os.ts.net";
+        assert!(session_origin_refusal(&h(&[("origin", "https://pop-os.ts.net"), ("host", host)])).is_ok());
+        assert!(session_origin_refusal(&h(&[("origin", "https://pop-os.ts.net:443"), ("host", host)])).is_ok());
+        assert!(session_origin_refusal(&h(&[("origin", "https://pop-os.ts.net"), ("host", "pop-os.ts.net:443")])).is_ok());
+        assert!(session_origin_refusal(&h(&[("origin", "http://127.0.0.1:8080"), ("host", "127.0.0.1:8080")])).is_ok());
+        for bad in ["https://pop-os.ts.net:8443", "https://evil.example", "null", "file://x", "https://"] {
+            assert!(session_origin_refusal(&h(&[("origin", bad), ("host", host)])).is_err(), "{bad}");
+        }
+        assert!(session_origin_refusal(&h(&[("origin", "https://pop-os.ts.net")])).is_err(), "no Host: refuse");
+        // Not a browser: unchanged.
+        assert!(session_origin_refusal(&h(&[])).is_ok());
+        assert!(session_origin_refusal(&h(&[("authorization", "Bearer x")])).is_ok());
+    }
+
+    /// Each session handler asks FIRST: before a body is parsed, a cookie is
+    /// read, a token is rotated or revoked, or a cookie is cleared.
+    #[test]
+    fn each_session_handler_checks_the_origin_before_anything_else() {
+        let src = include_str!("core.rs");
+        for (name, first_effect) in [
+            ("async fn auth_token(", "serde_urlencoded::from_bytes::<TokenRequest>"),
+            ("async fn auth_refresh_handler(", "jar.get(auth_refresh::REFRESH_COOKIE_NAME) {"),
+            ("async fn auth_logout_handler(", "auth_refresh::lookup_token("),
+        ] {
+            let body = src.split(name).nth(1).unwrap_or_else(|| panic!("{name}")).split("\nasync fn ").next().unwrap();
+            let check = body.find("session_origin_refusal(&headers)").unwrap_or_else(|| panic!("{name}: no origin check"));
+            let effect = body.find(first_effect).unwrap_or_else(|| panic!("{name}: {first_effect}"));
+            assert!(check < effect, "{name}: the origin check must come first");
+            assert!(body[check..effect].contains("return session_origin_forbidden(why)"), "{name}");
+        }
+        let forbidden = src.split("fn session_origin_forbidden(").nth(1).unwrap().split("\n\u{7d}\n").next().unwrap();
+        assert!(!forbidden.contains("Cookie") && !forbidden.contains("jar"), "a refusal sets or clears no cookie");
     }
 
     #[test]
@@ -1914,6 +2179,50 @@ mod tests {
         .filter(|c| env_fallback_allowed(*c))
         .collect();
         assert_eq!(open, vec![AdminCensus::NoneEnabled]);
+    }
+
+    /// i160a: the boot warning fires on bytes, not characters, and only past 72.
+    #[test]
+    fn overlong_is_counted_in_bytes_past_seventy_two() {
+        assert_eq!(overlong_for_bcrypt(&"a".repeat(72)), None);
+        assert_eq!(overlong_for_bcrypt(&"a".repeat(73)), Some(73));
+        // 37 two-byte characters: 37 characters, 74 bytes.
+        assert_eq!(overlong_for_bcrypt(&"é".repeat(37)), Some(74));
+        assert_eq!(overlong_for_bcrypt(""), None);
+    }
+
+    /// i160a, the boot check's decision (the 0.6.16 rehearsal's no-item
+    /// reason names this test): over 72 bytes logs, and alerts once only
+    /// while the env fallback is a login path; 72 or fewer does nothing.
+    /// And main.rs runs the check at boot.
+    #[test]
+    fn boot_check_logs_and_alerts_only_for_an_overlong_open_fallback() {
+        use OverlongVerdict as V;
+        let long = "a".repeat(80);
+        assert_eq!(overlong_verdict(&long, true), V::LogAndAlert { bytes: 80 });
+        assert_eq!(overlong_verdict(&long, false), V::Log { bytes: 80 });
+        for fits in ["a".repeat(72), String::new()] {
+            assert_eq!(overlong_verdict(&fits, true), V::Fits);
+            assert_eq!(overlong_verdict(&fits, false), V::Fits);
+        }
+        let main_rs = include_str!("../main.rs");
+        assert!(main_rs.contains("routes::core::warn_overlong_bootstrap_password(&st).await"),
+            "main.rs must run the boot check");
+    }
+
+    /// i74 item 2, answered against the crate this gateway links: `hash`
+    /// truncates at 72 bytes and `verify` agrees with it, so a 73-byte
+    /// password and its 72-byte prefix are the same credential. If the crate
+    /// ever stops truncating, this fails, and the boot warning (i160a) and
+    /// i74's record must be revisited.
+    #[test]
+    fn bcrypt_hash_and_verify_truncate_at_seventy_two_bytes() {
+        let long = format!("{}X", "a".repeat(72));
+        let h = bcrypt::hash(&long, 4).expect("the truncating hash accepts 73 bytes");
+        assert!(bcrypt::verify(&long[..72], &h).unwrap(), "the 72-byte prefix logs in");
+        assert!(bcrypt::verify(format!("{}Y", "a".repeat(72)), &h).unwrap(), "so does any 73rd byte");
+        assert!(!bcrypt::verify("a".repeat(71), &h).unwrap(), "a 71-byte prefix does not");
+        assert!(bcrypt::non_truncating_hash(&long, 4).is_err(), "the non-truncating variant refuses it");
     }
 
     #[test]

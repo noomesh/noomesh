@@ -454,7 +454,7 @@ pub fn datasource_findings(files: &[(String, String)], ini: &str) -> Vec<String>
                 url = Some(v.trim().trim_matches(['"', '\'']).to_string());
             }
             if let (Some(ty), Some(u)) = (&typ, &url) {
-                if ty == "prometheus" || ty == "loki" {
+                if ty == "prometheus" || ty == "loki" || ty == "tempo" {
                     seen.push(ty.clone());
                     let want = format!("{GATEWAY_DS_URL}{ty}");
                     if *u != want {
@@ -466,7 +466,7 @@ pub fn datasource_findings(files: &[(String, String)], ini: &str) -> Vec<String>
             }
         }
     }
-    for ty in ["prometheus", "loki"] {
+    for ty in ["prometheus", "loki", "tempo"] {
         if !seen.iter().any(|s| s == ty) {
             out.push(format!("no provisioned {ty} data source was found to check"));
         }
@@ -882,9 +882,14 @@ mod tests {
     const SHIPPED_INI: &str = include_str!("../../../configs/grafana/grafana.ini");
     const SHIPPED_PROM: &str = include_str!("../../../configs/grafana/datasources/prometheus.yml");
     const SHIPPED_LOKI: &str = include_str!("../../../configs/grafana/datasources/loki.yml");
+    const SHIPPED_TEMPO: &str = include_str!("../../../configs/grafana/datasources/tempo.yml");
 
     fn shipped_datasources() -> Vec<(String, String)> {
-        vec![("loki.yml".into(), SHIPPED_LOKI.into()), ("prometheus.yml".into(), SHIPPED_PROM.into())]
+        vec![
+            ("loki.yml".into(), SHIPPED_LOKI.into()),
+            ("prometheus.yml".into(), SHIPPED_PROM.into()),
+            ("tempo.yml".into(), SHIPPED_TEMPO.into()),
+        ]
     }
 
     #[test]

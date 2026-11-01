@@ -274,6 +274,15 @@ func (e *ImageNotStagedError) Error() string {
 	if e.AltTar != "" {
 		tried = e.Tar + " or " + e.AltTar
 	}
+	if isOwnImage(e.Ref) {
+		// One of OUR images (llamacpp, ollama, the sidecars...): never replaced
+		// by an upstream image. Refuse, and say exactly what stages it.
+		return fmt.Sprintf(
+			"image %s not staged on the controller for %s (no tar %s in its artifact store), so this node cannot start it, "+
+				"and it will NOT fall back to an upstream image. On the controller run: `noo cluster sync-images %s -i %s` "+
+				"(stages it for this node's %s), or `noo upgrade --stack` to restage the whole release",
+			e.Ref, e.Arch, tried, nodeIDOrPlaceholder(), e.Ref, e.Arch)
+	}
 	return fmt.Sprintf(
 		"image %s not staged on the controller (no %s tar %s in its artifact store) — run `noo cluster sync-images %s -i %s` or `noo upgrade` on the controller",
 		e.Ref, e.Arch, tried, nodeIDOrPlaceholder(), e.Ref)

@@ -436,6 +436,13 @@ body {
   letter-spacing: 0.04em;
   text-transform: none;
 }
+/* What a turn is doing before its first token (features/chat/phase.ts). */
+.turn .phase-line {
+  font-size: 12px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+  margin: 2px 0 4px;
+}
 .turn.you .u {
   font-size: 14px;
   line-height: 1.5;

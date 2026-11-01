@@ -115,6 +115,7 @@ mod confine;
 mod entity_cleanup_task;
 mod task_guard;
 mod graph_prune;
+mod addon_access;
 mod addon_auth;
 mod alert_digest;
 mod addons;
@@ -215,6 +216,7 @@ mod tools;
 mod web_search;
 mod tts_client;
 mod usage;
+mod request_trace;
 mod verify;
 mod websocket;
 mod worker_client;
@@ -510,6 +512,9 @@ async fn main() -> Result<()> {
     // Keep the behavioral-flag (noo_settings) override cache warm so admin UI
     // toggles take effect within ~15s (no restart) for Rust-read flags.
     crate::settings::spawn_refresh(state.db.clone());
+    // f99: who may use each add-on feature. Features are refused until
+    // the first load (fail closed).
+    crate::addon_access::spawn_refresh(state.db.clone());
     // Embedding spaces (i145): seed `knowledge` on an empty table, then keep
     // the space cache warm the same way.
     crate::embedding_spaces::spawn_refresh(state.clone());
@@ -518,12 +523,11 @@ async fn main() -> Result<()> {
     // back with a fresh JetStream store (what a container recreate does)
     // leaves `mesh_nodes`/`peer_agents` gone, and every reader treats a
     // missing bucket as "no nodes" — an empty fleet, not an error.
-    state::spawn_kv_bucket_watchdog(state.js.clone());
-    // agent-to-agent messaging — the stream and its recorder.
-    agent_messages::ensure_stream(&state.js).await;
-    // The job plane's streams: the worker used to declare them and its grant
-    // no longer allows it (see scheduler_engine.rs).
-    scheduler_engine::ensure_job_plane_streams(&state.js).await;
+    // The same task binds the agent-message stream and the job plane's
+    // streams (the worker used to declare those and its grant no longer
+    // allows it, see scheduler_engine.rs): now, if NATS is up, else when it
+    // connects (i301 a.3: the gateway serves degraded without the bus).
+    state::spawn_bus_objects(state.nats.clone(), state.js.clone());
     agent_messages::spawn_recorder(state.clone());
     // tasks resume when a harness announces itself, and the
     // controller's own resume at boot.
@@ -679,6 +683,8 @@ async fn main() -> Result<()> {
     erasure_archive::spawn(state.clone());
     // Bounds noo_autonomy_audit (90 days), daily.
     autonomy_audit::spawn(state.clone());
+    // Request tracing (i359): the Tempo exporter and the 30-day summary prune.
+    request_trace::spawn(state.clone());
 
     // Autonomy engine — periodic evaluation of monitor locations
     // (cluster health, backend availability, cert expiry, etc.). All
@@ -720,6 +726,11 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             config_mount::check_and_alert(&st, &routes::settings::config_path(), "startup").await;
         });
+    }
+    // i160a: a bootstrap admin password bcrypt would truncate is said out loud.
+    {
+        let st = state.clone();
+        tokio::spawn(async move { routes::core::warn_overlong_bootstrap_password(&st).await });
     }
     // Measures the direction WORK travels. A node's status is asserted by
     // its own outbound heartbeat, so a node that accepts no inbound

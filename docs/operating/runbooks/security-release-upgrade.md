@@ -1586,27 +1586,30 @@ keeps serving with the token already held; a sustained one shows
 "credential rejected" on the screen and says why in
 `noo kiosk status` and `journalctl -u kiosk-serve.service`.
 
-**What is still soft, stated rather than left to be discovered.** The
-browser runs with its DevTools debugging port on loopback, because that is
-how the launcher puts the token into the page and how the watchdog reads
-the heartbeat. That port is a full control surface: anyone with a shell on
-the display can read the token out of it and drive the browser, without
-touching the tailnet at all. TCP has no file permissions, so "anyone with a
-shell" means any local user, not just `kiosk`.
+**The browser has no debugging port.** It used to listen on loopback, and
+TCP has no file permissions, so any local user on the display could attach,
+drive the browser to anything the display's tailnet identity reaches, and
+evaluate script in the page. Since 0.6.16 Chrome runs with
+`--remote-debugging-pipe` as the child of `noo-kiosk-cdp broker`, which holds
+the only end of that pipe. The broker publishes the page's heartbeat and
+build to `/var/lib/kiosk/page.json` (world-readable, nothing secret), which
+is what `noo kiosk status`, the watchdog and the seat heartbeat read. It
+takes one verb, `reload`, on `/run/kiosk/cdp.sock`, and checks each caller
+with `SO_PEERCRED`: root, the display user, and on an enrolled seat the seat
+user. No raw CDP is offered there, so even an allowed caller cannot navigate
+or evaluate.
 
-Loopback is the only thing bounding it today, and the launcher states the
-bind address explicitly so a changed Chrome default cannot widen it
-quietly. Closing it properly means `--remote-debugging-pipe` — no port at
-all, CDP over inherited file descriptors, and a mode-0600 unix socket for
-the watchdog — which is a rearchitecture of the launcher and the helper and
-is not done yet. In practice the exposure matters in proportion to who can
-get a shell on the display, which in `dedicated` mode with the console
-logins off is a short list.
+**What is still soft, stated rather than left to be discovered.** The local
+proxy, `noo-kiosk-serve` on `127.0.0.1:8088`, answers the kiosk read list with
+the display's token attached for any local user. That is the same scoped,
+read-only data the screen shows, but reaching it does not require being the
+display user. A browser cannot load a page over a unix socket, so closing
+it means checking the uid of a loopback TCP peer. That is not done.
 
 | # | Control | Probe | Expected |
 |---|---|---|---|
 | V15 | The page is served | `curl -I https://<controller>.<tailnet>.ts.net/kiosk.html` | 200. A 404 with an explanation means the UI artifact predates PR #133 |
-| V18 | The debugging port is loopback-only | On the display: `ss -ltnp \| grep 9222` | Bound to `127.0.0.1`, never `0.0.0.0` or `[::]`. Anything else means the display's token is readable from the network |
+| V18 | The browser has no debugging port | On the display: `ss -ltnp \| grep -c 9222`, then `noo kiosk reload` as a user who is not root, the display user or the seat user | `0`, and the reload is refused with `refused: uid N may not drive this display`. A listener means the launcher predates 0.6.16: run `noo kiosk setup` or let the seat restage |
 | V16 | The kiosk credential cannot write | Mint a token via `POST /api/kiosk/token`, then `POST` anything with it | 403 `{"error":{"type":"read_only"}}` — **and try a route the middleware never heard of**, which is the control that a per-handler implementation fails years later |
 | V17 | The stream is alive, and silence means dead | Watch `GET /api/events/stream` with the token; then stop the gateway | `hello` with `keepalive_ms`, a `: keepalive` comment every 15 s, then the band goes red within 3 × that. A stream that goes quiet without the band reddening is the failure this whole design exists to avoid |
 

@@ -35,6 +35,21 @@ on every request, so a revoked or narrowed key stops working immediately. (A
 legacy `initialize` handshake also returns an `Mcp-Session-Id`, which only
 separates two windows on one key; it grants nothing.)
 
+**When the tool list changes.** A client fetches the tool list once, when
+it connects, and keeps it; a session also survives a gateway restart. So
+after an upgrade that adds, removes or changes a tool, a session opened
+before it would still hold the old list. The session id records the tool
+catalogue it was opened under. The first answered call of a session whose
+catalogue is not the gateway's current one comes back as a short event
+stream: `notifications/tools/list_changed`, then the answer itself. A
+client that honours the notice (legacy `initialize` advertises
+`listChanged: true`) fetches the list again, once per session. A client
+without a session (the 2026-07-28 protocol, or one that ignores the header)
+is not told: the list result says `ttlMs` (an hour), and reconnecting
+(`/mcp` in Claude Code, restart Codex) refreshes it now. `noo upgrade`
+says so when the catalogue moved. Tools from bridged MCP servers
+(`mcp_*`) change without a restart and are not covered.
+
 Each session has its own agent name, `<account>/<type>-<session>`: the type
 is your client (`claude`, `codex`, `cursor`, `gemini`, else the name your
 client reports, else your key's label) and the session part is random, so a
@@ -293,6 +308,6 @@ a key act with more authority than any human account.
 | `403 this key is not bound to a user` | machine key, or the bound account is disabled — reissue with `--user` |
 | `UNABLE_TO_VERIFY_LEAF_SIGNATURE` | the direct `:8080` URL presents the cluster CA and this client does not trust it. For a **Node** client (Claude Code included) `noo security trust-ca` alone does nothing — Node ignores the OS store. Set `NODE_EXTRA_CA_CERTS` to the CA file, or use the `tailscale serve` URL on 443, which needs no CA |
 | `ENOTFOUND <controller>.<tailnet>.ts.net` | this machine is not resolving through Tailscale: `tailscaled` down, not logged in, or `/etc/resolv.conf` overwritten so `100.100.100.100` is gone. `tailscale status` and `grep nameserver /etc/resolv.conf` separate the three; `sudo tailscale set --accept-dns=true` fixes the last |
-| `404` on a call with a session header | the `Mcp-Session-Id` is unknown or expired (gateway restarted, 24 h idle): the client should re-initialize |
+| `404` on a call with a session header | the `Mcp-Session-Id` is unknown or expired (24 h idle; a gateway restart keeps sessions): the client should re-initialize |
 | `404` | the door is closed (`NOO_MCP_EXTERNAL_ENABLED` unset) or the path is wrong: the user door is `/mcp/user` on `:8080` (`/mcp/external` and the loopback `:3100` listener were both removed in stack-v0.2.40 — the operator door is `/mcp/operator` on `:8080` now) |
 | Query returns nothing | your account may not be in the audience for those docs — ask an operator to tag them `company`, or grant you a `team:*` role |

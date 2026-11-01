@@ -2741,6 +2741,9 @@ pub(crate) const SVC_LIST: &[&str] = &[
     // `noo upgrade --stack` issues on its own.
     "ollama-embed-cpu",
     "node-exporter", "nvidia-exporter", "grafana", "prometheus", "alertmanager",
+    // The request-trace store (i359): its OTLP and query doors require a
+    // cluster client cert; the gateway is the only caller.
+    "tempo",
     "model-cache",
     // The trellion add-ons' own identities: the client
     // certificate noo-trellion and noo-trellion-intel present to Postgres,
@@ -2822,6 +2825,7 @@ pub(crate) fn svc_extra_hostnames(svc: &str) -> Vec<String> {
         // gateway key back. (promtail had the same entry until fleet
         // logging phase 4 retired it; the node-agent ships instead.)
         "loki" => &["noo-loki"],
+        "tempo" => &["noo-tempo"],
         "node-exporter" => &["noo-node-exporter"],
         "nvidia-exporter" => &["noo-nvidia-exporter"],
         // The weight store's mTLS listener. The
@@ -3298,7 +3302,6 @@ fn ensure_pki(ctx: &mut Ctx) {
         ("NOO_MTLS_GATEWAY", "true".into()),
         ("NOO_TLS_CERT", format!("{pki}/gateway/gateway.crt")),
         ("NOO_TLS_KEY", format!("{pki}/gateway/gateway.key")),
-        ("NOO_REDIS_TLS", "true".into()),
         ("NOO_NATS_TLS", "true".into()),
         // No NOO_PG_TLS: since 2026-09-28 the Postgres service is TLS-only
         // unconditionally (docker-compose.cluster.yml) and every DSN
@@ -4081,7 +4084,7 @@ pub(crate) fn ensure_dir_ownership(dir: &str, owner: &str) {
 /// reads/writes them: models, hf-cache, noo-data, ollama, nats-root-image).
 pub(crate) fn subdir_owner(name: &str) -> Option<&'static str> {
     match name {
-        "redis" | "prometheus" | "grafana" | "loki" => Some("65532:65532"),
+        "redis" | "prometheus" | "grafana" | "loki" | "tempo" => Some("65532:65532"),
         // The chainguard postgres runs as uid 70 and initdb needs to own it.
         "postgres" => Some("70:70"),
         _ => None,

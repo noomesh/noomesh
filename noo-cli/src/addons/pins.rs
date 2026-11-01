@@ -52,6 +52,12 @@ pub struct Pin {
     /// Image name to its `ref@sha256:…`.
     pub images: BTreeMap<String, String>,
     pub key_index: usize,
+    /// The trusted key that signed the lock (hex), kept beside `key_index`
+    /// because an index moves when the trusted keys change. A pin written
+    /// before this field has none (i358: two dev builds of one version switch
+    /// without `--allow-downgrade` only against a pin that names its key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<String>,
     /// sha256 (hex) of the cached lock bytes this pin was made from.
     pub lock_sha256: String,
     /// The root the images were pulled from when it is not the signed
@@ -76,6 +82,7 @@ impl Pin {
             stack: stack_tag.trim().to_string(),
             images: v.lock.images.clone(),
             key_index: v.key_index,
+            signer: Some(v.signer.clone()),
             lock_sha256: sha256_hex(lock_bytes),
             pulled_from,
             dev_expires_at: v.dev_expires_at,
@@ -406,6 +413,7 @@ mod tests {
             stack: "v0.6.0".into(),
             images: BTreeMap::from([("evolve".into(), format!("ghcr.io/x/evolve@sha256:{}", "ab".repeat(32)))]),
             key_index: 0,
+            signer: None,
             lock_sha256: sha256_hex(b"{}"),
             pulled_from: None,
             dev_expires_at: None,
@@ -427,6 +435,8 @@ mod tests {
         let old = r#"{"evolve":{"version":"1","stack":"v0.6.0","images":{},"key_index":0,"lock_sha256":"x"}}"#;
         std::fs::write(pins_path(&d), old).unwrap();
         assert_eq!(read(&d).unwrap()["evolve"].pulled_from, None);
+        assert_eq!(read(&d).unwrap()["evolve"].signer, None, "an old pin names no signer (i358)");
+        assert!(!serde_json::to_string(&pin()).unwrap().contains("signer"));
     }
 
     #[test]

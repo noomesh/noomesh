@@ -50,6 +50,10 @@ func TestGPUHoldAndReleaseCarryTheLeaseAndMapRefusals(t *testing.T) {
 	if lease := out["gpu_contention"].(map[string]any)["lease"].(map[string]any); lease["generation"] != float64(7) {
 		t.Fatalf("the lease rides the answer: %v", out)
 	}
+	// i344b: the operator's own use is carried as `purpose`.
+	if code, out = do(s.handleGPUHold, `{"operation_id":"op-u","purpose":"user"}`); code != 200 || gotHold.Purpose != "user" {
+		t.Fatalf("purpose: %d %v %+v", code, out, gotHold)
+	}
 
 	// Refusals.
 	holdErr = &gpuyield.ErrHeld{Current: gpuyield.Lease{Owner: "a", OperationID: "op-0", Generation: 6}}

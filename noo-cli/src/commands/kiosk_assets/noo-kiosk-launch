@@ -15,7 +15,8 @@
 # 2026-09-06 (ui/apps/web/src/kiosk/main.tsx says so), so the launcher was
 # writing a token into storage nothing read, and the display showed
 # "credential rejected" while every endpoint answered 200 to anyone who
-# asked with a header. CDP stays, for the watchdog's reload and heartbeat.
+# asked with a header. CDP stays, for the watchdog's reload and heartbeat,
+# and it is a pipe now, not a port: see the browser's command line below.
 set -euo pipefail
 
 : "${NOO_KIOSK_URL:?NOO_KIOSK_URL missing (see /etc/default/kiosk)}"
@@ -25,9 +26,11 @@ POLL="${NOO_KIOSK_POLL:-}"
 QUALITY="${NOO_KIOSK_QUALITY:-}"
 STATE="${NOO_KIOSK_STATE:-/var/lib/kiosk}"
 PROFILE="$STATE/profile"
-CDP_PORT="${NOO_KIOSK_CDP_PORT:-9222}"
 SERVE_PORT="${NOO_KIOSK_SERVE_PORT:-8088}"
 BROWSER="${NOO_KIOSK_BROWSER:-chromium}"
+# Installed beside this script by setup and by the seat's sync, in /usr/local/bin
+# or the seat's shared dir, which is not always on PATH.
+CDP_HELPER="$(dirname "$(readlink -f "$0")")/noo-kiosk-cdp"
 
 # The local proxy, never the controller. The same bundle fetched straight
 # from the gateway would have no credential behind it.
@@ -88,33 +91,25 @@ if [ "$proxy_up" -ne 1 ]; then
     exit 1
 fi
 
-# cage: a single-window Wayland compositor. Chromium runs inside it with
-# its debugging port on loopback only — that is how the token gets in and
-# how the watchdog reads the page's heartbeat.
+# cage: a single-window Wayland compositor. It runs the CDP broker, and
+# the broker's one child is the browser, which draws the window.
 #
-# KNOWN EXPOSURE, written down rather than implied. This port is a FULL
-# control surface: whoever reaches it can read the token out of
-# localStorage, drive the browser anywhere, and never touch the tailnet
-# doing it. Loopback bounds that to someone with a local shell here — and
-# TCP has no file permissions, so that means ANY local user, not only the
-# kiosk one.
-#
-# What actually closes it is `--remote-debugging-pipe`: no port at all,
-# CDP over fds inherited by a parent that then exposes a mode-0600 unix
-# socket for the watchdog, so file permissions gate what nothing gates
-# today. It is not here because it could not be VERIFIED — the machine
-# this was written on has no browser installed, and an unverified rewrite
-# of the one path that injects the credential is worse than a documented
-# limitation.
+# THE BROWSER HAS NO DEBUGGING PORT (followup 188). It used to listen on
+# 127.0.0.1:9222, and loopback is not a permission: TCP has no file modes,
+# so ANY local user could attach, drive the browser to anything this
+# display's tailnet identity reaches, and evaluate script in the page.
+# `--remote-debugging-pipe` puts CDP on fds 3 and 4 instead, inherited only
+# by the broker that started the browser. The broker publishes the page's
+# heartbeat and build to $STATE/page.json for status and the watchdog, and
+# takes one verb, `reload`, on a unix socket it checks the caller of. No
+# TCP port exists to reach. The broker is the browser's direct parent, so
+# the pipe never depends on cage passing extra fds through to its child.
 #
 # The --disable-background-networking group keeps Chromium's own traffic to
 # Google (component and variations updates, Safe Browsing fetches, crash and
 # domain-reliability reports, UMA) off the kiosk: it shows one local page.
 # docs/security/telemetry.md.
-#
-# The address is stated explicitly rather than left to Chrome's default,
-# so a changed default cannot widen this silently. A guard asserts it.
-cage -- "$BROWSER" \
+cage -- "$CDP_HELPER" broker -- "$BROWSER" \
     --kiosk \
     --noerrdialogs \
     --disable-infobars \
@@ -129,9 +124,7 @@ cage -- "$BROWSER" \
     --metrics-recording-only \
     --no-pings \
     --ozone-platform=wayland \
-    --remote-debugging-address=127.0.0.1 \
-    --remote-debugging-port="$CDP_PORT" \
-    --remote-allow-origins=http://127.0.0.1:"$CDP_PORT" \
+    --remote-debugging-pipe \
     --user-data-dir="$PROFILE" \
     "$PAGE" &
 CAGE_PID=$!
@@ -143,8 +136,8 @@ CAGE_PID=$!
 # systemd restarted it, once a minute, forever.
 #
 # With no token to inject there is nothing to wait for. CDP is now only
-# the watchdog's business: if it never answers, the watchdog says so and
-# the page still renders.
+# the watchdog's business: if the broker stops publishing, the watchdog
+# says so and the page still renders.
 echo "noo-kiosk-launch: showing $PAGE"
 rm -f "$ERR_FILE" 2>/dev/null || true
 

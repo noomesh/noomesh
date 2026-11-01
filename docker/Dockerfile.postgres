@@ -13,7 +13,7 @@
 # 2026-08-20). Digest-pinned FROMs survive the swap: manifest copies
 # preserve digests.
 ARG DHI_REGISTRY=dhi.io
-FROM ${DHI_REGISTRY}/postgres:18-alpine3.22-dev AS builder
+FROM ${DHI_REGISTRY}/postgres:18-alpine3.22-dev@sha256:9bb938ebc72adc10302318b4193fc2b72a80ca2d80c5c1f0a91077ed6e8807c2 AS builder
 
 USER root
 RUN apk add --no-cache --force-overwrite musl musl-utils && \
@@ -32,7 +32,7 @@ RUN git clone --branch v0.8.2 --depth 1 https://github.com/pgvector/pgvector.git
     make with_llvm=no OPTFLAGS="-O3" install
 
 # Runtime
-FROM ${DHI_REGISTRY}/postgres:18-alpine3.22-dev
+FROM ${DHI_REGISTRY}/postgres:18-alpine3.22-dev@sha256:9bb938ebc72adc10302318b4193fc2b72a80ca2d80c5c1f0a91077ed6e8807c2
 
 USER root
 COPY --from=builder /build/vector.so /tmp/vector.so

@@ -795,13 +795,13 @@ dist_third_party_row() {
         nats) echo NATS ;;
         nginx) echo NGINX ;;
         loki) echo LOKI ;;
+        tempo) echo TEMPO ;;
         prometheus) echo PROMETHEUS ;;
         alertmanager) echo ALERTMANAGER ;;
         grafana) echo GRAFANA ;;
         node-exporter) echo NODE_EXPORTER ;;
         text-embeddings-inference) echo "TEI TEI_CPU" ;;
         vllm-openai) echo VLLM ;;
-        ollama) echo OLLAMA ;;
     esac
 }
 

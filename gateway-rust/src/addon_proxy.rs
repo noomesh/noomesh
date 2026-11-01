@@ -182,7 +182,7 @@ pub const ROUTES_DIR: &str = "/opt/noo/addon-routes";
 // i302). The ones gateway code names through this module are re-exported
 // here; the gateway is a binary, so an unused `pub use` fails clippy, and
 // anything else is named as `addon_manifest::…` where it is used.
-pub use addon_manifest::{AddonManifest, RouteSpec, TaskEventsSpec, UiSpec, DELEGATE_TASKS, METHOD_WS, ROUTES_FILE};
+pub use addon_manifest::{AddonManifest, RouteSpec, TaskEventsSpec, UiSpec, METHOD_WS, ROUTES_FILE};
 pub(crate) use addon_manifest::container_of;
 use addon_manifest::{pattern_matches, ManifestRole};
 
@@ -414,8 +414,11 @@ pub fn declared_scopes_of(manifests: &[AddonManifest]) -> Vec<String> {
 /// being waved through. False when no mounted route matches. When more than
 /// one pattern matches a path (a static route beside a `{param}` one), ALL of
 /// them must permit: the stricter reading, never the wider.
-pub fn mounted_get_allows(scopes: &[String], role: crate::auth::Role, path: &str) -> bool {
-    get_allows(&manifests(), scopes, role, path)
+///
+/// A features manifest (f99) asks the route's feature for `account`; without
+/// an account it is refused.
+pub fn mounted_get_allows(scopes: &[String], role: crate::auth::Role, account: Option<&str>, path: &str) -> bool {
+    get_allows_for(&manifests(), scopes, role, account, path)
 }
 
 /// May a requester of `role` holding `scopes` make a non-GET `method` call to
@@ -427,11 +430,38 @@ pub fn mounted_owner_scoped_allows(
     method: &axum::http::Method,
     scopes: &[String],
     role: crate::auth::Role,
+    account: Option<&str>,
     path: &str,
 ) -> bool {
-    owner_scoped_allows(&manifests(), method, scopes, role, path)
+    owner_scoped_allows_for(&manifests(), method, scopes, role, account, path)
 }
 
+fn owner_scoped_allows_for(
+    manifests: &[AddonManifest],
+    method: &axum::http::Method,
+    scopes: &[String],
+    role: crate::auth::Role,
+    account: Option<&str>,
+    path: &str,
+) -> bool {
+    let hits = matching(manifests, method.as_str(), path);
+    !hits.is_empty()
+        && hits.iter().all(|(m, r)| r.owner_scoped && crate::addon_access::route_permits(m, r, role, scopes, account))
+}
+
+fn get_allows_for(
+    manifests: &[AddonManifest],
+    scopes: &[String],
+    role: crate::auth::Role,
+    account: Option<&str>,
+    path: &str,
+) -> bool {
+    let hits = matching(manifests, "GET", path);
+    !hits.is_empty() && hits.iter().all(|(m, r)| crate::addon_access::route_permits(m, r, role, scopes, account))
+}
+
+/// The older-shape checks the tests drive (no account).
+#[cfg(test)]
 fn owner_scoped_allows(
     manifests: &[AddonManifest],
     method: &axum::http::Method,
@@ -439,13 +469,12 @@ fn owner_scoped_allows(
     role: crate::auth::Role,
     path: &str,
 ) -> bool {
-    let hits = matching_routes(manifests, method.as_str(), path);
-    !hits.is_empty() && hits.iter().all(|r| r.owner_scoped && r.permits(role, scopes))
+    owner_scoped_allows_for(manifests, method, scopes, role, None, path)
 }
 
+#[cfg(test)]
 fn get_allows(manifests: &[AddonManifest], scopes: &[String], role: crate::auth::Role, path: &str) -> bool {
-    let hits = matching_routes(manifests, "GET", path);
-    !hits.is_empty() && hits.iter().all(|r| r.permits(role, scopes))
+    get_allows_for(manifests, scopes, role, None, path)
 }
 
 #[cfg(test)]
@@ -454,13 +483,17 @@ fn manifests_get_match(manifests: &[AddonManifest], path: &str) -> bool {
 }
 
 pub(crate) fn matching_routes<'a>(manifests: &'a [AddonManifest], method: &str, path: &str) -> Vec<&'a RouteSpec> {
+    matching(manifests, method, path).into_iter().map(|(_, r)| r).collect()
+}
+
+/// [`matching_routes`] with the manifest each route came from (its add-on
+/// and features decide a features-manifest route).
+pub(crate) fn matching<'a>(manifests: &'a [AddonManifest], method: &str, path: &str) -> Vec<(&'a AddonManifest, &'a RouteSpec)> {
     manifests
         .iter()
-        .flat_map(|m| m.routes.iter())
-        .filter(|r| !r.internal && r.method == method)
-        .filter(|r| {
-            std::iter::once(&r.path).chain(r.aliases.iter()).any(|pat| pattern_matches(pat, path))
-        })
+        .flat_map(|m| m.routes.iter().map(move |r| (m, r)))
+        .filter(|(_, r)| !r.internal && r.method == method)
+        .filter(|(_, r)| std::iter::once(&r.path).chain(r.aliases.iter()).any(|pat| pattern_matches(pat, path)))
         .collect()
 }
 
@@ -578,10 +611,11 @@ async fn serve(
         )
             .into_response();
     }
-    // Permission first, before a param is parsed or anything is forwarded.
+    // Permission first, before a param is parsed or anything is forwarded:
+    // the route's own rule, or for a features manifest its feature (f99).
     if let Some(r) = requester {
-        if !spec.permits(r.role, &r.scopes) {
-            return forbidden(manifest, spec);
+        if let Err(resp) = crate::addon_access::route_check(manifest, spec, r) {
+            return resp;
         }
     }
     let mut path = match fill_path(spec, &params) {
@@ -687,6 +721,9 @@ async fn forward(
     for (name, value) in caller_headers(requester) {
         req = req.header(name, value);
     }
+    if let Some(v) = requester.and_then(|r| crate::addon_access::requester_features(manifest, r)) {
+        req = req.header(REQUESTER_FEATURES, v);
+    }
     // The delegated task token (i143), only where the route opted in and the
     // operator allowed it. The request is built from nothing, so a client's
     // own `x-noo-delegation` can never ride along; this is the only place the
@@ -695,7 +732,7 @@ async fn forward(
         if let Some(entry) = crate::addon_registry::get(&manifest.addon) {
             let route = path.split('?').next().unwrap_or(path);
             if mints_delegation(Some(r), entry.route_receives_delegation(&spec.method, route), entry.operator_enabled()) {
-                match crate::addon_delegation::mint(r, &manifest.addon) {
+                match crate::addon_delegation::mint(r, &manifest.addon, spec.feature.as_deref()) {
                     Some(token) => {
                         if let Ok(mut v) = reqwest::header::HeaderValue::from_str(&token) {
                             v.set_sensitive(true);
@@ -826,6 +863,11 @@ pub const REQUESTER_CONNECTION: &str = "x-noo-requester-connection";
 pub const REQUESTER_ROLE: &str = "x-noo-requester-role";
 /// Comma-separated, in the order the credential carries them.
 pub const REQUESTER_SCOPES: &str = "x-noo-requester-scopes";
+/// The add-on features the requester holds, comma-separated (f99), for a
+/// manifest with features: a hint for the add-on's UI (hide what the person
+/// cannot use), never a permission. The gateway has already refused anything
+/// not granted before the add-on sees the request.
+pub const REQUESTER_FEATURES: &str = "x-noo-requester-features";
 
 /// Build the outbound identity headers.
 ///
@@ -1232,7 +1274,7 @@ pub(crate) mod tests {
         let v = delegating(|_| {});
         check(v.clone()).expect("a delegating manifest with its events route is accepted");
         let m: AddonManifest = serde_json::from_value(v).unwrap();
-        assert_eq!(m.delegate.as_deref(), Some(DELEGATE_TASKS));
+        assert_eq!(m.delegate.as_deref(), Some(addon_manifest::DELEGATE_TASKS));
         assert_eq!(
             m.task_events,
             Some(TaskEventsSpec { method: "POST".into(), path: "/internal/task-events".into() })
@@ -1627,6 +1669,7 @@ mod user_read_route_tests {
             delegate: None,
             task_events: None,
             ui: None,
+            features: vec![],
             routes: routes
                 .iter()
                 .map(|(m, p, internal)| RouteSpec {
@@ -1641,6 +1684,7 @@ mod user_read_route_tests {
                     min_role: None,
                     scopes: vec![],
                     owner_scoped: false,
+                    feature: None,
                     receives_delegation: false,
                     max_message_bytes: None,
                     idle_timeout_secs: None,
@@ -1782,14 +1826,24 @@ mod permission_tests {
         let m: AddonManifest = serde_json::from_value(v).unwrap();
         let e = validate(&m, "evolve").unwrap_err();
         assert!(e.contains("POST cannot be min_role") && e.contains("owner_scoped"), "{e}");
-        // The flag means nothing on other shapes: refused, not ignored.
-        for (idx, role) in [(3usize, "operator"), (0, "user")] {
-            let mut v = tests::sample_json();
-            v["routes"][idx]["owner_scoped"] = json!(true);
-            v["routes"][idx]["min_role"] = json!(role);
-            let m: AddonManifest = serde_json::from_value(v).unwrap();
-            assert!(validate(&m, "evolve").unwrap_err().contains("owner_scoped"), "route {idx}");
-        }
+        // On a write at another role it means nothing: refused, not ignored.
+        let mut v = tests::sample_json();
+        v["routes"][3]["owner_scoped"] = json!(true);
+        v["routes"][3]["min_role"] = json!("operator");
+        let m: AddonManifest = serde_json::from_value(v).unwrap();
+        assert!(validate(&m, "evolve").unwrap_err().contains("owner_scoped"), "operator write");
+        // f99: on a read it is the add-on's promise and is accepted; it opens
+        // nothing by itself (min_role still decides in this shape).
+        let mut v = tests::sample_json();
+        v["routes"][0]["owner_scoped"] = json!(true);
+        v["routes"][0]["min_role"] = json!("user");
+        let m: AddonManifest = serde_json::from_value(v).unwrap();
+        validate(&m, "evolve").expect("owner_scoped on a GET is accepted");
+        // An internal route forwards no account: refused.
+        let mut v = tests::sample_json();
+        v["routes"][5]["owner_scoped"] = json!(true);
+        let m: AddonManifest = serde_json::from_value(v).unwrap();
+        assert!(validate(&m, "evolve").unwrap_err().contains("internal route"), "internal");
     }
 
     /// PUT, PATCH and DELETE are writes with the POST rule: accepted at
@@ -1856,7 +1910,6 @@ mod permission_tests {
             (json!({"idle_timeout_secs": 3601}), "idle_timeout_secs"),
             (json!({"max_connections_per_user": 0}), "max_connections_per_user"),
             (json!({"max_connections_per_user": 65}), "max_connections_per_user"),
-            (json!({"owner_scoped": true}), "owner_scoped"),
         ] {
             let mut r = ok.clone();
             for (k, val) in edit.as_object().unwrap() {
@@ -1865,6 +1918,10 @@ mod permission_tests {
             let e = with(r).expect_err(&edit.to_string());
             assert!(e.contains(needle), "{edit}: {e}");
         }
+        // f99: owner_scoped on a socket is the add-on's promise and is accepted.
+        let mut scoped = ok.clone();
+        scoped["owner_scoped"] = json!(true);
+        with(scoped).expect("owner_scoped on a WS route");
         // The WS knobs mean nothing on an HTTP route: refused, not ignored.
         let e = with(json!({"name": "g", "method": "GET", "path": "/api/sample/g", "max_message_bytes": 10})).unwrap_err();
         assert!(e.contains("WS"), "{e}");
@@ -1932,7 +1989,7 @@ mod permission_tests {
         assert!(!mints_delegation(Some(&person), true, false), "operator has not enabled delegation");
         assert!(!mints_delegation(None, true, true), "no person, no token");
         let mut delegated = person.clone();
-        delegated.act = Some(crate::auth::Actor { sub: "addon:voice".into(), iss_user: None, task: None });
+        delegated.act = Some(crate::auth::Actor { sub: "addon:voice".into(), iss_user: None, task: None, feature: None });
         assert!(!mints_delegation(Some(&delegated), true, true), "a delegated token never mints another");
     }
 
@@ -2035,5 +2092,101 @@ mod permission_tests {
         let ok = crate::auth::RequesterCtx { role: Role::Operator, ..user };
         let resp = serve(&m, &spec, HashMap::new(), None, None, Some(&ok)).await;
         assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+/// noomesh-internal f99 PR 1: the manifest declares `features`; noomesh will
+/// decide who uses each one. Until the grant store lands, a features
+/// manifest's routes carry no `min_role`, so they read as `operator` (the
+/// absent default): nothing opens wider than today.
+#[cfg(test)]
+mod feature_tests {
+    use super::*;
+    use crate::auth::Role;
+
+    fn features_json() -> Value {
+        json!({
+            "version": 1,
+            "addon": "evolve",
+            "base_url_env": "NOO_EVOLVE_URL",
+            "base_url_default": "https://noo-evolve:8090",
+            "features": [
+                {"name": "converse", "title": "Talk to the assistant", "suggested": "user", "delegate": true},
+                {"name": "transcripts", "title": "Read your transcripts",
+                 "description": "Your own past conversations.", "suggested": "user"},
+                {"name": "manage", "title": "Manage voices and models", "suggested": "operator"}
+            ],
+            "routes": [
+                {"name": "session", "method": "POST", "path": "/api/sample/session", "feature": "converse",
+                 "owner_scoped": true, "receives_delegation": true},
+                {"name": "transcripts", "method": "GET", "path": "/api/sample/transcripts", "feature": "transcripts",
+                 "owner_scoped": true},
+                {"name": "voices", "method": "PUT", "path": "/api/sample/voices", "feature": "manage"},
+                {"name": "stream", "method": "WS", "path": "/ws/addons/evolve/stream", "feature": "converse",
+                 "owner_scoped": true},
+                {"name": "console_piece", "method": "GET", "path": "/console-piece", "internal": true}
+            ],
+            "task_events": {"method": "POST", "path": "/task-events"},
+            "ui": {"feature": "converse", "title": "Voice"}
+        })
+    }
+
+    fn parsed(v: Value) -> AddonManifest {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn a_features_manifest_is_accepted_and_opens_nothing_wider_yet() {
+        let m = parsed(features_json());
+        validate(&m, "evolve").expect("a features manifest is valid");
+        assert!(m.delegates_tasks(), "a feature with delegate: true asks to delegate");
+        assert_eq!(m.feature("transcripts").map(|f| f.suggested.as_str()), Some("user"));
+        // No min_role: every route reads as operator until grants decide.
+        for r in m.routes.iter().filter(|r| !r.internal) {
+            assert!(!r.permits(Role::User, &["read".to_string()]), "{}: a User is not let in yet", r.name);
+            assert!(r.permits(Role::Operator, &[]), "{}", r.name);
+        }
+        assert!(!m.ui.as_ref().unwrap().permits(Role::User));
+    }
+
+    fn refused(edit: impl Fn(&mut Value), want: &str) {
+        let mut v = features_json();
+        edit(&mut v);
+        let e = validate(&parsed(v), "evolve").expect_err(want);
+        assert!(e.contains(want), "want {want:?} in {e}");
+    }
+
+    #[test]
+    fn a_features_manifest_has_one_answer_to_who_may_call() {
+        refused(|v| v["routes"][1]["min_role"] = json!("user"), "min_role and scopes are replaced");
+        refused(|v| v["routes"][1]["scopes"] = json!(["evolve:transcripts"]), "min_role and scopes are replaced");
+        refused(|v| { v["routes"][2].as_object_mut().unwrap().remove("feature"); }, "names its \"feature\"");
+        refused(|v| v["routes"][2]["feature"] = json!("export"), "is not declared");
+        refused(|v| v["routes"][4]["feature"] = json!("manage"), "internal route takes no feature");
+        refused(|v| v["ui"]["min_role"] = json!("user"), "ui.min_role is replaced");
+        refused(|v| { v["ui"].as_object_mut().unwrap().remove("feature"); }, "ui.feature");
+        refused(|v| v["delegate"] = json!("tasks"), "top-level delegate key is replaced");
+        refused(|v| v["features"][0]["delegate"] = json!(false), "receives_delegation needs its feature");
+    }
+
+    #[test]
+    fn a_feature_is_a_plain_word_with_a_plain_title_and_a_known_suggestion() {
+        refused(|v| v["features"][1]["name"] = json!("Read-All"), "names are [a-z0-9_]");
+        refused(|v| v["features"][1]["name"] = json!("converse"), "appears twice");
+        refused(|v| v["features"][1]["title"] = json!(""), "title must be");
+        refused(|v| v["features"][1]["title"] = json!("<b>bold</b>"), "title must be");
+        refused(|v| v["features"][1]["description"] = json!("x".repeat(281)), "description must be");
+        refused(|v| v["features"][1]["suggested"] = json!("everyone"), "grants nothing");
+        refused(
+            |v| v["features"] = Value::Array((0..33).map(|i| json!({"name": format!("f{i}"), "title": "t", "suggested": "none"})).collect()),
+            "at most 32 features",
+        );
+    }
+
+    #[test]
+    fn without_features_nothing_may_name_one() {
+        let mut v = tests::sample_json();
+        v["routes"][0]["feature"] = json!("status");
+        assert!(validate(&parsed(v), "evolve").unwrap_err().contains("declares no"));
     }
 }

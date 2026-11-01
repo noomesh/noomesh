@@ -441,9 +441,10 @@ services:
       # sent in the node's start request (routes/cluster.rs backend_image_ref).
       # An operator's VLLM_IMAGE / VLLM2_IMAGE / OLLAMA_IMAGE wins, as on the
       # controller's own containers. tests/test_third_party_image_lock.py pins it.
+      # OLLAMA is our hardened image (docker/Dockerfile.ollama, lock row `ollama`).
       - NOO_BACKEND_IMAGE_VLLM=${VLLM_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-}}
       - NOO_BACKEND_IMAGE_VLLM_SECONDARY=${VLLM2_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-}}
-      - NOO_BACKEND_IMAGE_OLLAMA=${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
+      - NOO_BACKEND_IMAGE_OLLAMA=${OLLAMA_IMAGE:-${NOO_IMAGE_PREFIX:-noomesh}/ollama:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_OLLAMA:-}}
       - DATABASE_URL=postgresql://noo_app@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/gateway/pg/noo_app.crt&sslkey=/app/pki/gateway/pg/noo_app.key
       - PGVECTOR_URL=postgresql://noo@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/gateway/pg/noo.crt&sslkey=/app/pki/gateway/pg/noo.key
       - PAGEINDEX_DSN=postgresql://noo@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/gateway/pg/noo.crt&sslkey=/app/pki/gateway/pg/noo.key
@@ -578,7 +579,6 @@ services:
       - NOO_TLS_CA=${NOO_TLS_CA:+/app/pki/ca.crt}
       - NOO_MTLS_GATEWAY=${NOO_MTLS_GATEWAY:-}
       - NOO_PKI_DIR=${NOO_PKI_DIR:-}
-      - NOO_REDIS_TLS=${NOO_REDIS_TLS:-}
       - NOO_NATS_TLS=${NOO_NATS_TLS:-}
       - NOO_PG_SSLMODE=${NOO_PG_SSLMODE:-}
       # Grafana SSO. The console's "Open Grafana" asks
@@ -703,6 +703,13 @@ services:
       # configured" on every install. tests/test_loki_wiring_parity.py pins
       # the name to the reader.
       - NOO_LOKI_URL=${NOO_LOKI_URL:-https://loki:3100}
+      # Request tracing (i359): the gateway sends its request spans to
+      # Tempo's OTLP HTTP receiver with its own leaf (request_trace.rs). The
+      # per-request summary goes to Postgres either way.
+      - NOO_TEMPO_OTLP_URL=${NOO_TEMPO_OTLP_URL:-https://tempo:4318}
+      # Tempo's query API: the `tempo` verify row's /ready probe and Grafana's
+      # Tempo data source (/api/grafana-ds/tempo), both with the gateway leaf.
+      - NOO_TEMPO_URL=${NOO_TEMPO_URL:-https://tempo:3200}
       # Python sandbox — isolated code execution (internal Docker network),
       # mTLS: the gateway presents its own leaf (tls::cluster_client).
       - NOO_SANDBOX_URL=${NOO_SANDBOX_URL:-https://sandbox:9000}
@@ -1056,6 +1063,9 @@ services:
       # gateway's (heartbeat_actions.rs), which holds that leaf.
       - NOO_TLS_CERT=${NOO_TLS_CERT:+/app/pki/leaf/service.crt}
       - NOO_TLS_KEY=${NOO_TLS_KEY:+/app/pki/leaf/service.key}
+      # Request tracing (i359): a span per handled worker.* subject, sent to
+      # Tempo with the leaf above (src/noomesh/tracing.py).
+      - NOO_TEMPO_OTLP_URL=${NOO_TEMPO_OTLP_URL:-https://tempo:4318}
       - NOO_EXEC_APPROVAL_MODE=${NOO_EXEC_APPROVAL_MODE:-}
       - NOO_APPROVAL_GCHAT_SPACE=${NOO_APPROVAL_GCHAT_SPACE:-}
       - NOO_APPROVAL_TELEGRAM_CHAT=${NOO_APPROVAL_TELEGRAM_CHAT:-}
@@ -1143,7 +1153,7 @@ services:
   # Redis (controller node only)
   redis:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/redis:8.6-debian13-dev${NOO_IMAGE_DIGEST_REDIS:-}
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/redis:8.6-debian13-dev${NOO_IMAGE_DIGEST_REDIS:-@sha256:d9903f6fbf1e690837d1e1edc6716a7b399385b3b2cbf3301af06fb8a6168034}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-redis
     profiles: ["controller", "standalone"]
     # NOT root (i64, operator 2026-10-15). The -dev image's USER is 0; it
@@ -1168,7 +1178,6 @@ services:
       - { source: redis_password, target: redis_password, x-noo-uid: "65532" }
     environment:
       - REDIS_PASSWORD_FILE=${REDIS_PASSWORD:+/run/secrets/redis_password}
-      - NOO_REDIS_TLS=${NOO_REDIS_TLS:-}
     volumes:
       - redis-data:/data
       - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
@@ -1246,7 +1255,7 @@ services:
   # vLLM backend
   vllm:
     logging: *default-logging
-    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-}}
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-@sha256:fc56161ee42a011aeee78b65d0a81b6683c7d04402fd40503d14d4d6c98f07cb}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-vllm
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
     # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
@@ -1276,6 +1285,8 @@ services:
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - VLLM_MODEL=${VLLM_MODEL:-Qwen/Qwen3-8B-AWQ}
       - VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-16384}
+      # Empty = no --max-num-batched-tokens flag (vLLM's own default). Followup i344a.
+      - VLLM_MAX_NUM_BATCHED_TOKENS=${VLLM_MAX_NUM_BATCHED_TOKENS:-}
       - VLLM_QUANTIZATION=${VLLM_QUANTIZATION:-}
       - TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-1}
       - VLLM_TOOL_PARSER=${VLLM_TOOL_PARSER:-auto}
@@ -1308,7 +1319,10 @@ services:
     # through stunnel-vllm, which joins noo-cluster under this service's names.
     network_mode: "service:stunnel-vllm"
     depends_on:
-      - stunnel-vllm
+      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
+      stunnel-vllm:
+        condition: service_started
+        restart: true
     restart: unless-stopped
     # Plain HTTP on loopback inside the namespace; the image carries python3,
     # not curl. start_period covers a cold model load.
@@ -1378,6 +1392,17 @@ services:
         if [ -n "$$VLLM_REASONING_PARSER" ]; then
           ARGS="$$ARGS --reasoning-parser $$VLLM_REASONING_PARSER"
         fi
+        # Optional --max-num-batched-tokens (followup i344a). Unset or empty adds
+        # nothing: the command line is exactly what it was. A value that is not a
+        # positive integer is logged and ignored, never passed to vLLM (and not
+        # fatal: a bad knob must not crash-loop the engine).
+        if [ -n "$$VLLM_MAX_NUM_BATCHED_TOKENS" ]; then
+          case "$$VLLM_MAX_NUM_BATCHED_TOKENS" in
+            *[!0-9]*) echo "Ignoring VLLM_MAX_NUM_BATCHED_TOKENS='$$VLLM_MAX_NUM_BATCHED_TOKENS': not a positive integer" ;;
+            *[1-9]*)  ARGS="$$ARGS --max-num-batched-tokens $$VLLM_MAX_NUM_BATCHED_TOKENS" ;;
+            *)        echo "Ignoring VLLM_MAX_NUM_BATCHED_TOKENS='$$VLLM_MAX_NUM_BATCHED_TOKENS': not a positive integer" ;;
+          esac
+        fi
         # No TLS here: the engine listens on loopback in its door's namespace
         # and the door (stunnel, verify = 2, callers pinned by name) is the
         # only way in. The door holds the `vllm` leaf; this container holds
@@ -1409,7 +1434,7 @@ services:
   #   VLLM2_MODEL=Qwen/Qwen3-4B
   vllm-secondary:
     logging: *default-logging
-    image: ${VLLM2_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-}}
+    image: ${VLLM2_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-@sha256:fc56161ee42a011aeee78b65d0a81b6683c7d04402fd40503d14d4d6c98f07cb}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-vllm-secondary
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
     # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
@@ -1454,7 +1479,10 @@ services:
     # through stunnel-vllm-secondary, which joins noo-cluster under this service's names.
     network_mode: "service:stunnel-vllm-secondary"
     depends_on:
-      - stunnel-vllm-secondary
+      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
+      stunnel-vllm-secondary:
+        condition: service_started
+        restart: true
     restart: unless-stopped
     # Plain HTTP on loopback inside the namespace; the image carries python3,
     # not curl. start_period covers a cold model load.
@@ -1661,7 +1689,10 @@ services:
     network_mode: "service:stunnel-llamacpp"
     restart: unless-stopped
     depends_on:
-      - stunnel-llamacpp
+      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
+      stunnel-llamacpp:
+        condition: service_started
+        restart: true
 
   # stunnel mTLS sidecar for llama.cpp (same shape as stunnel-ollama).
   # Accepts on :8085 — the port every client already dials for llamacpp —
@@ -1748,14 +1779,13 @@ services:
     # H-N4: parameterized so it can be pinned to a verified version/digest.
     # A FIXED version, never :latest (2026-10-15: every roll re-pulled a
     # moved `latest` from Docker Hub, 91.6 s, and nothing recorded which
-    # ollama ran). The signed stack lock carries an `ollama@sha256:` row
-    # resolved from THIS tag at release time
-    # (scripts/stack-lock-third-party.py), so a dist start pulls it by
-    # digest and skips it when unchanged. Bump the version here, in all
-    # three ollama services; the next stack release pins the new digest.
-    # Pulled from Docker Hub by the controller only (never staged for nodes:
-    # noo-cli image_stage.rs THIRD_PARTY_LOCK_ROWS).
-    image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
+    # ollama ran). Since i323 this is OUR hardened image
+    # (docker/Dockerfile.ollama: the pinned upstream tarball, sha256-verified),
+    # a release image like llamacpp: the signed stack lock carries its
+    # `ollama@sha256:` row, a dist start pulls it by digest, and the rail
+    # stages it for every node arch. The upstream version is pinned in
+    # Dockerfile.ollama; bump it there with its sha256s.
+    image: ${OLLAMA_IMAGE:-${NOO_IMAGE_PREFIX:-noomesh}/ollama:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_OLLAMA:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
     # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
@@ -1775,7 +1805,7 @@ services:
       # so the fleet stays US-vendor (model governance).
       - OLLAMA_MODEL=${OLLAMA_MODEL:-}
     volumes:
-      - ${OLLAMA_DATA_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/ollama}:/root/.ollama
+      - ${OLLAMA_DATA_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/ollama}:/home/nonroot/.ollama
     deploy:
       resources:
         reservations:
@@ -1788,7 +1818,10 @@ services:
     network_mode: "service:stunnel-ollama"
     restart: unless-stopped
     depends_on:
-      - stunnel-ollama
+      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
+      stunnel-ollama:
+        condition: service_started
+        restart: true
 
   # Ollama for the standalone profile: the single ollama that serves the
   # embedder (harrier) AND chat on a one-box install (controller profiles
@@ -1796,7 +1829,7 @@ services:
   ollama-embed:
     logging: *default-logging
     # H-N4: parameterized so it can be pinned to a verified version/digest.
-    image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
+    image: ${OLLAMA_IMAGE:-${NOO_IMAGE_PREFIX:-noomesh}/ollama:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_OLLAMA:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama-embed
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
     # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
@@ -1825,13 +1858,16 @@ services:
       # OLLAMA_EMBED_NUM_PARALLEL=1 on a box whose chat model is tight on VRAM.
       - OLLAMA_NUM_PARALLEL=${OLLAMA_EMBED_NUM_PARALLEL:-4}
     volumes:
-      - ollama-embed-data:/root/.ollama
+      - ollama-embed-data:/home/nonroot/.ollama
     # In its door's network namespace (door generation 3): no network of
     # its own, listening on 127.0.0.1, reachable only through stunnel-ollama-embed.
     network_mode: "service:stunnel-ollama-embed"
     restart: unless-stopped
     depends_on:
-      - stunnel-ollama-embed
+      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
+      stunnel-ollama-embed:
+        condition: service_started
+        restart: true
 
   # OPTIONAL CPU-only embedder beside ollama-embed (profile `embed-cpu`,
   # off unless enabled). A second ollama with NO GPU device request and
@@ -1846,7 +1882,7 @@ services:
   # Enable: docs/operating/runbooks/embed-capacity.md.
   ollama-embed-cpu:
     logging: *default-logging
-    image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
+    image: ${OLLAMA_IMAGE:-${NOO_IMAGE_PREFIX:-noomesh}/ollama:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_OLLAMA:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama-embed-cpu
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
     # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
@@ -1868,7 +1904,7 @@ services:
       # the CPU this exists to use.
       - OLLAMA_KEEP_ALIVE=-1
     volumes:
-      - ollama-embed-data:/root/.ollama
+      - ollama-embed-data:/home/nonroot/.ollama
     # In its door's network namespace (door generation 3): no network of
     # its own, listening on 127.0.0.1, reachable only through stunnel-ollama-embed-cpu.
     network_mode: "service:stunnel-ollama-embed-cpu"
@@ -1877,7 +1913,10 @@ services:
     # the GPU one cannot start (a GPU fault holds ollama-embed by name, see
     # scripts/lib-stuck-container.sh), so it must not wait on it.
     depends_on:
-      - stunnel-ollama-embed-cpu
+      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
+      stunnel-ollama-embed-cpu:
+        condition: service_started
+        restart: true
 
   # mTLS door for ollama-embed-cpu: the same shape as stunnel-ollama-embed
   # below, with its own leaf (`ollama-embed-cpu`, issued by `noo upgrade
@@ -1987,7 +2026,7 @@ services:
   # PAGEINDEX_EMBEDDING_URL at it explicitly to use it.
   tei:
     logging: *default-logging
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.6${NOO_IMAGE_DIGEST_TEI_CPU:-}
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.6${NOO_IMAGE_DIGEST_TEI_CPU:-@sha256:66db77d7856c9319bbfaf2c5b80a6d0e0ac9ff128ade09eaca1d9c20213617a4}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-tei
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
     # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
@@ -2012,14 +2051,17 @@ services:
     network_mode: "service:stunnel-tei"
     restart: unless-stopped
     depends_on:
-      - stunnel-tei
+      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
+      stunnel-tei:
+        condition: service_started
+        restart: true
     command: ["--model-id", "${TEI_MODEL:-BAAI/bge-base-en-v1.5}"]
 
   # Text Embeddings Inference — GPU (worker nodes)
   # Use this on nodes with a GPU for faster embedding throughput.
   tei-gpu:
     logging: *default-logging
-    image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-}
+    image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-@sha256:25e35b0b266241a543c5ee305083eced4b6ac0772eb969c3fdaae2d4c2ef7266}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-tei-gpu
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
     # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
@@ -2055,7 +2097,10 @@ services:
     network_mode: "service:stunnel-tei-gpu"
     restart: unless-stopped
     depends_on:
-      - stunnel-tei-gpu
+      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
+      stunnel-tei-gpu:
+        condition: service_started
+        restart: true
     command: ["--model-id", "${TEI_MODEL:-BAAI/bge-base-en-v1.5}", "--dtype", "float16"]
   stunnel-ollama:
     logging: *default-logging
@@ -2153,7 +2198,7 @@ services:
   # opt-in `tei-compose` profile; removing them is separate cleanup.
   reranker:
     logging: *default-logging
-    image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-}
+    image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-@sha256:25e35b0b266241a543c5ee305083eced4b6ac0772eb969c3fdaae2d4c2ef7266}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-reranker
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
     # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
@@ -2189,7 +2234,10 @@ services:
     network_mode: "service:stunnel-reranker"
     restart: unless-stopped
     depends_on:
-      - stunnel-reranker
+      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
+      stunnel-reranker:
+        condition: service_started
+        restart: true
     command: ["--model-id", "${RERANK_MODEL:-BAAI/bge-reranker-base}", "--dtype", "float16"]
 
   # stunnel mTLS sidecar for the reranker (mirrors stunnel-tei-gpu)
@@ -2493,7 +2541,7 @@ services:
   # `controller` service onto `standalone` too.
   loki:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/loki:3${NOO_IMAGE_DIGEST_LOKI:-}
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/loki:3${NOO_IMAGE_DIGEST_LOKI:-@sha256:5f04dd8068afa17dd4da0fe1e88f56011d21a67dc1065b03c5de557971c7fa05}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-loki
     profiles: ["monitoring", "controller", "standalone"]
     # No external port — the gateway reaches Loki over the Docker network
@@ -2527,6 +2575,36 @@ services:
     healthcheck:
       disable: true
 
+  # Tempo, the request-trace store (i359). The gateway sends a span per
+  # request; Grafana reads them through the gateway's datasource proxy;
+  # the per-request summary an agent queries lives in Postgres
+  # (noo_request_trace), not here. Same monitoring set, same profiles.
+  tempo:
+    logging: *default-logging
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/tempo:2${NOO_IMAGE_DIGEST_TEMPO:-@sha256:5352e76f3c4e531babc76fc29958cfa3286096d2ca0bbf3b46007e46c0249a85}
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-tempo
+    profiles: ["monitoring", "controller", "standalone"]
+    # No external port: the gateway is the only thing that reaches Tempo,
+    # over the Docker network, on 4318 (OTLP HTTP) and 3200 (query API),
+    # both requiring a cluster-CA client certificate.
+    environment:
+      # How long Tempo keeps traces: 30 days, the operator's choice (i359).
+      - NOO_TEMPO_RETENTION=${NOO_TEMPO_RETENTION:-720h}
+    volumes:
+      - ./monitoring/tempo/tempo.yml:/etc/tempo/tempo.yml:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/tempo:/tls/services/tempo:ro
+      - tempo-data:/var/tempo
+    command: ["-config.file=/etc/tempo/tempo.yml", "-config.expand-env=true"]
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    # Distroless and mTLS-only, like Loki: no shell and no probe that can
+    # present a client certificate. Health is the `tempo` row of
+    # `noo cluster verify --controller`, through the gateway.
+    healthcheck:
+      disable: true
+
   # No log shipper here since fleet logging phase 4 (2026-09-28). promtail
   # and its read-only docker-socket-proxy used to sit here and stream every
   # container's stdout through the Docker API. The controller's container
@@ -2542,7 +2620,7 @@ services:
   # Prometheus (every controller, standalone included)
   prometheus:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/prometheus:3${NOO_IMAGE_DIGEST_PROMETHEUS:-}
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/prometheus:3${NOO_IMAGE_DIGEST_PROMETHEUS:-@sha256:6a5aea3fc3a33fea84bb4ea7925228f8eb67884893970a768603d350e1830489}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-prometheus
     profiles: ["monitoring", "controller", "standalone"]
     ports:
@@ -2584,7 +2662,7 @@ services:
   # registry (mirrors the dhi.io/prometheus:3 convention).
   alertmanager:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/alertmanager:0${NOO_IMAGE_DIGEST_ALERTMANAGER:-}
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/alertmanager:0${NOO_IMAGE_DIGEST_ALERTMANAGER:-@sha256:01dd89cce4737ec7e44704681b5d6ee561e9b7880f632b4413b0e547e4dabfda}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-alertmanager
     profiles: ["monitoring", "controller", "standalone"]
     ports:
@@ -2622,7 +2700,7 @@ services:
   # Grafana (every controller, standalone included)
   grafana:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/grafana:12-debian13-dev${NOO_IMAGE_DIGEST_GRAFANA:-}
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/grafana:12-debian13-dev${NOO_IMAGE_DIGEST_GRAFANA:-@sha256:084445dea160e453576f5bd8e551116b0f1d6c52e8abd367d516135f53590c9a}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-grafana
     profiles: ["monitoring", "controller", "standalone"]
     # NOT root (i64, operator 2026-10-15): the -dev image's USER is 0, so
@@ -2704,7 +2782,7 @@ services:
   # metrics are a feature to design, not a profile to re-add.
   node-exporter:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/node-exporter:1${NOO_IMAGE_DIGEST_NODE_EXPORTER:-}
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/node-exporter:1${NOO_IMAGE_DIGEST_NODE_EXPORTER:-@sha256:2bf73eace0e49be4c1c61f14e349b738fdd182fb63560b1e7ed6c7c6885236d8}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-node-exporter
     profiles: ["monitoring", "controller", "standalone"]
     ports:
@@ -3186,7 +3264,7 @@ services:
   # of re-downloading from HuggingFace. No HF proxy, no CDN. See
   # docs/models/weight-cache.md.
   model-cache:
-    image: nginx:1.27-alpine${NOO_IMAGE_DIGEST_NGINX:-}
+    image: nginx:1.27-alpine${NOO_IMAGE_DIGEST_NGINX:-@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-model-cache
     profiles: ["controller", "standalone"]
     ports:
@@ -3369,6 +3447,12 @@ volumes:
       type: none
       o: bind
       device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/loki
+  tempo-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/tempo
   postgres-data:
     # PostgreSQL needs POSIX ownership/permissions (chmod/chown).
     # On Linux/macOS NOO_PG_DATA == NOO_STATE_ROOT/postgres (NOO_STATE_ROOT

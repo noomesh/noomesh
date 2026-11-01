@@ -2168,7 +2168,80 @@ ALTER TABLE noo_embedding_spaces
     // `migration_dsn`). Idempotent. Created in `public` on purpose: the
     // view is read by operators, not by the mesh schema.
     sql: "CREATE EXTENSION IF NOT EXISTS pg_stat_statements SCHEMA public",
+}, Migration {
+    revision: ADDON_ACCESS_REVISION,
+    down_revision: Some(PG_STAT_STATEMENTS_REVISION),
+    // noomesh-internal f99: who may use each add-on feature. One row per
+    // (add-on, feature, subject) set on or off; no row is "inherit". The
+    // decision is `addon_access::decide`. `noo_users.super_admin`: holds
+    // every feature and alone changes a setting that covers an admin.
+    // Every enabled admin becomes a super admin here: today every admin can
+    // already do everything, so nobody gains anything, and the operator
+    // demotes from there. Additive; an older gateway ignores both.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_addon_access (
+    addon    text        NOT NULL,
+    feature  text        NOT NULL,
+    subject  text        NOT NULL,
+    allowed  boolean     NOT NULL,
+    set_by   text        NOT NULL,
+    set_at   timestamptz NOT NULL DEFAULT now(),
+    source   text        NOT NULL,
+    reason   text,
+    PRIMARY KEY (addon, feature, subject),
+    CONSTRAINT noo_addon_access_source_chk CHECK (source IN ('operator', 'accepted_suggestion', 'migrated'))
+);
+ALTER TABLE noo_users ADD COLUMN IF NOT EXISTS super_admin boolean NOT NULL DEFAULT false;
+UPDATE noo_users SET super_admin = true WHERE role = 'admin' AND NOT COALESCE(disabled, false);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'noo_app') THEN
+        GRANT SELECT, INSERT, UPDATE, DELETE ON noo_addon_access TO noo_app;
+    END IF;
+END $$;
+"#,
+}, Migration {
+    revision: REQUEST_TRACE_REVISION,
+    down_revision: Some(ADDON_ACCESS_REVISION),
+    // Request tracing (i359): one row per request the gateway serves,
+    // metadata and sizes only, never text (`request_trace.rs`). Kept 30 days
+    // by that module's daily prune. `noo_token_usage.trace_id` links a
+    // completion to the request that spent it.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_request_trace (
+    id bigserial PRIMARY KEY,
+    at timestamptz NOT NULL DEFAULT now(),
+    trace_id text NOT NULL,
+    method text NOT NULL,
+    route text NOT NULL,
+    status integer NOT NULL,
+    duration_ms bigint NOT NULL,
+    user_uuid uuid,
+    actor text,
+    actor_kind text,
+    model text,
+    backend text,
+    node_id text,
+    prompt_tokens bigint NOT NULL DEFAULT 0,
+    completion_tokens bigint NOT NULL DEFAULT 0,
+    span_count bigint NOT NULL DEFAULT 1,
+    request_bytes bigint,
+    response_bytes bigint
+);
+CREATE INDEX IF NOT EXISTS noo_request_trace_at_idx ON noo_request_trace (at);
+CREATE INDEX IF NOT EXISTS noo_request_trace_trace_id_idx ON noo_request_trace (trace_id);
+CREATE INDEX IF NOT EXISTS noo_request_trace_route_at_idx ON noo_request_trace (route, at);
+ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS trace_id text
+"#,
 }];
+
+/// Add-on feature settings and the super-admin flag (f99). A constant so a
+/// renumber at rebase is one line.
+pub const ADDON_ACCESS_REVISION: &str = "104_addon_access";
+
+/// Request tracing's summary table and the usage link (i359). A constant
+/// so a renumber at rebase is one line.
+pub const REQUEST_TRACE_REVISION: &str = "105_request_trace";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
@@ -3072,16 +3145,62 @@ mod tests {
             .contains("(node_id, backend, role, (CASE WHEN role = 'embed' THEN model ELSE '' END))"));
     }
 
-    /// The pg_stat_statements revision is the chain head, sits on 102, and is
-    /// idempotent DDL.
+    /// The pg_stat_statements revision sits on 102 and is idempotent DDL.
     #[test]
-    fn pg_stat_statements_revision_is_the_head_and_idempotent() {
+    fn pg_stat_statements_revision_is_idempotent() {
         let m = MIGRATIONS.iter().find(|m| m.revision == PG_STAT_STATEMENTS_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "103_pg_stat_statements");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(EMBEDDING_SPACE_MIGRATION_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(PG_STAT_STATEMENTS_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE EXTENSION IF NOT EXISTS pg_stat_statements"));
+    }
+
+    /// f99: the add-on access revision sits on 103 and is
+    /// additive and idempotent: a new table, a defaulted column, the existing
+    /// admins as super admins, and the app role's grant.
+    #[test]
+    fn addon_access_revision_is_additive() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == ADDON_ACCESS_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "104_addon_access");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(PG_STAT_STATEMENTS_REVISION));
+        assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_addon_access"));
+        assert!(m.sql.contains("ADD COLUMN IF NOT EXISTS super_admin boolean NOT NULL DEFAULT false"));
+        assert!(m.sql.contains("SET super_admin = true WHERE role = 'admin'"));
+        assert!(!m.sql.contains("DROP "), "additive only");
+        // The repository's columns are the table's.
+        let repo = include_str!("repo/addon_access.rs");
+        for col in ["addon", "feature", "subject", "allowed", "set_by", "set_at", "source", "reason"] {
+            assert!(m.sql.contains(&format!("    {col} ")), "{col} in the table");
+            assert!(repo.contains(col), "{col} in the repository");
+        }
+    }
+
+    /// i359: the request-trace revision is the chain head, sits on 104 (f99), is
+    /// idempotent, and creates exactly the columns `request_trace` writes
+    /// and prunes by, plus the usage link `usage` writes.
+    #[test]
+    fn request_trace_revision_is_the_head_and_matches_its_writers() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == REQUEST_TRACE_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "105_request_trace");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(ADDON_ACCESS_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(REQUEST_TRACE_REVISION), "the chain head");
+        assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_request_trace"));
+        assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE"), "no row is rewritten or dropped");
+        let writer = include_str!("repo/request_trace.rs");
+        let insert = writer.split("INSERT INTO noo_request_trace").nth(1).expect("the writer inserts");
+        let cols = insert.split('(').nth(1).and_then(|c| c.split(')').next()).expect("a column list");
+        for col in cols.split(',').map(str::trim) {
+            assert!(m.sql.contains(&format!("\n    {col} ")), "{col} is written but not created");
+        }
+        assert!(writer.contains("DELETE FROM noo_request_trace WHERE at <"), "the prune keys on `at`");
+        assert!(m.sql.contains("\n    at timestamptz NOT NULL DEFAULT now()"));
+        assert!(m.sql.contains("ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS trace_id text"));
+        // trace_id sits before the token columns, so the 089 test's
+        // "prompt_tokens, completion_tokens, harness_kind" and the 091 test's
+        // "harness_kind, task_id)" both still read the writer as it is.
+        assert!(include_str!("usage.rs").contains("user_uuid, consumer, trace_id,"));
     }
 
     /// i150: the migration columns sit on the embed-placement revision, all nullable
@@ -3488,11 +3607,15 @@ mod legacy_layout_tests {
                  request_id text PRIMARY KEY,
                  status text NOT NULL DEFAULT 'pending',
                  created_at timestamptz NOT NULL DEFAULT now());
+             -- 104 reads `disabled` (every ENABLED admin becomes a super
+             -- admin); the baseline at 046 has carried it on every install,
+             -- so the fixture carries it too.
              CREATE TABLE public.noo_users (
                  username text PRIMARY KEY,
                  user_uuid uuid NOT NULL DEFAULT gen_random_uuid() UNIQUE,
                  org_id text NOT NULL DEFAULT 'default',
-                 scopes jsonb NOT NULL DEFAULT '[\"read\"]'::jsonb);
+                 scopes jsonb NOT NULL DEFAULT '[\"read\"]'::jsonb,
+                 disabled boolean NOT NULL DEFAULT false);
              -- 061 backfills conversations from their owner and closes the
              -- column. The fixture carries the three shapes that exist on a
              -- live install: owned by a user in a non-default org, owned by
@@ -3500,6 +3623,11 @@ mod legacy_layout_tests {
              -- (heartbeat / autonomy / system tool records).
              INSERT INTO public.noo_users (username, org_id)
                  VALUES ('tenant', 'acme'), ('solo', 'default');
+             -- 050 maps the admin grant to role 'admin'; 104 then promotes
+             -- the enabled admin alone.
+             INSERT INTO public.noo_users (username, scopes, disabled) VALUES
+                 ('boss', '[\"admin\"]'::jsonb, false),
+                 ('gone', '[\"admin\"]'::jsonb, true);
              CREATE TABLE public.noo_conversations (
                  id uuid PRIMARY KEY,
                  user_id text,
@@ -3596,6 +3724,18 @@ mod legacy_layout_tests {
         // derive trigger, or every tenant's conversations file under the
         // default org and cross-tenant isolation quietly inverts.
         assert_eq!(fresh, "acme");
+
+        // 104: every enabled admin is a super admin, a disabled one is not,
+        // and nobody else is. Read through repo/ (the sqlx ratchet). The
+        // implicit-flagging write is a no-op only when an ENABLED account
+        // already carries the flag, so 0 here proves 104 wrote it; the
+        // listing then says it is boss alone.
+        let flagged_now = crate::repo::addon_access::flag_implicit_super_admins(&db)
+            .await
+            .expect("104 added super_admin on a legacy install");
+        assert_eq!(flagged_now, 0, "104 flagged the enabled admin itself");
+        let supers = crate::repo::addon_access::super_admins(&db).await.expect("super admins");
+        assert_eq!(supers, vec!["boss".to_string()]);
 
         // The column is closed, so nothing has to re-check the boundary.
         let nullable: bool = sqlx::query_scalar(

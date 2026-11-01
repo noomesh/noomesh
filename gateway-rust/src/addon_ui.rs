@@ -464,6 +464,7 @@ pub fn ui_entries(
     manifests: &[AddonManifest],
     ports: &BTreeMap<String, u16>,
     role: Option<crate::auth::Role>,
+    account: Option<&str>,
     host: Option<&str>,
     enabled: &dyn Fn(&str) -> bool,
 ) -> Vec<UiEntry> {
@@ -473,7 +474,7 @@ pub fn ui_entries(
         .filter_map(|m| {
             let ui = m.ui.as_ref()?;
             let port = *ports.get(&m.addon)?;
-            let can_open = role.is_none_or(|r| ui.permits(r));
+            let can_open = crate::addon_access::ui_opens_for(m, ui, role, account);
             let sees_all = role.is_none_or(|r| r >= crate::auth::Role::Operator);
             (can_open || sees_all).then(|| UiEntry {
                 addon: m.addon.clone(),
@@ -490,9 +491,17 @@ pub fn ui_entries(
 
 /// GET /api/addons/ui — the add-on web UIs this gateway serves, each on its own origin: `[{addon, title, port, url_base, can_open}]`. Any signed-in account; a User sees only the UIs its role may open, an Operator or Admin sees every one (with `can_open`). Open one with `POST /api/addons/{addon_id}/ui-session`.
 async fn ui_list(headers: HeaderMap, ctx: Option<axum::Extension<crate::auth::RequesterCtx>>) -> Response {
-    let role = ctx.map(|axum::Extension(r)| r.role);
+    let role = ctx.as_ref().map(|axum::Extension(r)| r.role);
+    let account = ctx.as_ref().map(|axum::Extension(r)| crate::auth::account_of(&r.sub).to_string());
     let ports = PORTS.get().cloned().unwrap_or_default();
-    let entries = ui_entries(&crate::addon_proxy::manifests(), &ports, role, request_host(&headers), &crate::addons::enabled);
+    let entries = ui_entries(
+        &crate::addon_proxy::manifests(),
+        &ports,
+        role,
+        account.as_deref(),
+        request_host(&headers),
+        &crate::addons::enabled,
+    );
     Json(json!({ "uis": entries })).into_response()
 }
 
@@ -537,7 +546,7 @@ fn unavailable(addon: &str, error: String, state: &str) -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": error, "addon": addon, "state": state }))).into_response()
 }
 
-fn ui_forbidden(addon: &str, ui: &UiSpec) -> Response {
+pub(crate) fn ui_forbidden(addon: &str, ui: &UiSpec) -> Response {
     let need = ui.required_role().as_str();
     (
         StatusCode::FORBIDDEN,
@@ -590,12 +599,12 @@ async fn ui_session(
         )
             .into_response();
     }
-    let (_, ui) = match ui_manifest(&addon_id) {
+    let (manifest, ui) = match ui_manifest(&addon_id) {
         Ok(found) => found,
         Err(resp) => return resp,
     };
-    if !ui.permits(r.role) {
-        return ui_forbidden(&addon_id, &ui);
+    if let Err(resp) = crate::addon_access::ui_check(&manifest, &ui, &r) {
+        return resp;
     }
     let Some(port) = port_of(&addon_id) else {
         return unavailable(
@@ -959,8 +968,8 @@ pub(crate) async fn serve_ui(
     let Some(r) = requester else {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "detail": "no session" }))).into_response();
     };
-    if !ui.permits(r.role) {
-        return ui_forbidden(addon, &ui);
+    if let Err(resp) = crate::addon_access::ui_check(&manifest, &ui, r) {
+        return resp;
     }
     let rest = match ui_rest(raw_path) {
         Ok(rest) => rest,
@@ -990,6 +999,9 @@ pub(crate) async fn serve_ui(
     let mut req = crate::tls::cluster_client().request(up_method, &url).timeout(timeout);
     for (name, value) in crate::addon_proxy::caller_headers(Some(r)) {
         req = req.header(name, value);
+    }
+    if let Some(v) = crate::addon_access::requester_features(&manifest, r) {
+        req = req.header(crate::addon_proxy::REQUESTER_FEATURES, v);
     }
     for name in PASSED_REQUEST_HEADERS {
         for v in headers.get_all(*name) {
@@ -1238,16 +1250,16 @@ mod tests {
         let ms = [user_ui, op_ui];
         let ports: BTreeMap<String, u16> = [("evolve".to_string(), 8451u16), ("other".to_string(), 8452)].into();
         let on = |_: &str| true;
-        let user = ui_entries(&ms, &ports, Some(Role::User), Some("h.ts.net"), &on);
+        let user = ui_entries(&ms, &ports, Some(Role::User), None, Some("h.ts.net"), &on);
         assert_eq!(user.len(), 1);
         assert_eq!(user[0], UiEntry { addon: "evolve".into(), title: "Voice".into(), port: 8451, url_base: Some("https://h.ts.net:8451".into()), can_open: true });
-        let op = ui_entries(&ms, &ports, Some(Role::Operator), None, &on);
+        let op = ui_entries(&ms, &ports, Some(Role::Operator), None, None, &on);
         assert_eq!(op.iter().map(|e| (e.addon.as_str(), e.can_open)).collect::<Vec<_>>(), [("evolve", true), ("other", true)]);
-        let machine = ui_entries(&ms, &ports, None, None, &on);
+        let machine = ui_entries(&ms, &ports, None, None, None, &on);
         assert_eq!(machine.len(), 2, "the launcher fronts every port");
         // Off, or no port allocated: not listed.
-        assert!(ui_entries(&ms, &ports, Some(Role::Admin), None, &|_| false).is_empty());
-        assert_eq!(ui_entries(&ms, &BTreeMap::new(), Some(Role::Admin), None, &on).len(), 0);
+        assert!(ui_entries(&ms, &ports, Some(Role::Admin), None, None, &|_| false).is_empty());
+        assert_eq!(ui_entries(&ms, &BTreeMap::new(), Some(Role::Admin), None, None, &on).len(), 0);
     }
 
     /// The add-on origin carries the console router's outer layers.
@@ -1390,7 +1402,7 @@ mod tests {
     fn serve_ui_checks_permission_before_the_path_or_the_fetch() {
         let src = include_str!("addon_ui.rs");
         let body = src.split("pub(crate) async fn serve_ui(").nth(1).unwrap().split("\n}\n").next().unwrap();
-        let permits = body.find("ui.permits(r.role)").unwrap();
+        let permits = body.find("crate::addon_access::ui_check(&manifest, &ui, r)").unwrap();
         let rest = body.find("ui_rest(raw_path)").unwrap();
         let send = body.find(".send()").unwrap();
         assert!(permits < rest && rest < send);

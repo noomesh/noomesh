@@ -13,9 +13,11 @@
 # THIS repo, which is what lets ci.yml's `credentials:` block read it with
 # the ordinary GITHUB_TOKEN — no PAT involved.
 #
-# Run it by hand: `gh workflow run mirror-images.yml -R noomesh/noomesh`.
-# workflow_dispatch runs the file as it is on the DEFAULT branch (main), so a
-# matrix change reaches the mirror once it is promoted there. There is no
+# Run it by hand: `gh workflow run mirror-images.yml -R noomesh/noomesh --ref <ref>`.
+# workflow_dispatch runs the file as it is on the ref it is dispatched from
+# (the default branch when --ref is omitted), so the release cutter dispatches
+# from the ref that carries the new lanes (dev, before an rc), not by waiting
+# for main. There is no
 # push or schedule trigger: this workflow holds registry credentials and
 # pushes packages, so it starts only on a deliberate dispatch. Mirrored tags
 # are stable majors; refreshes are rare and deliberate.
@@ -55,7 +57,7 @@ jobs:
           # with docker/Dockerfile.postgres's major (pg_dump output differs
           # across majors and the drift check would fail on version, not
           # drift).
-          - source: pgvector/pgvector:pg18
+          - source: pgvector/pgvector:pg18@sha256:c29f30688a9ad961691bdf0ec1650717cc132a5814619d80f80463d6e4c42e47
             dest: pgvector:pg18
 
           # ── Docker Hub base images (build path) ──────────────────────
@@ -70,7 +72,7 @@ jobs:
           # 3.12. That Dockerfile now reads `.python-version` like everything
           # else, so 3.11 has no consumer — see
           # tests/test_python_version_single_source.py.
-          - source: python:3.12-slim
+          - source: python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
             dest: python:3.12-slim
             auth: hub
 
@@ -80,27 +82,33 @@ jobs:
           # these needs DHI_TOKEN at build time, so a credential problem
           # is currently indistinguishable from an outage.
 
-          - source: dhi.io/redis:8.6-debian13-dev
+          - source: dhi.io/redis:8.6-debian13-dev@sha256:d9903f6fbf1e690837d1e1edc6716a7b399385b3b2cbf3301af06fb8a6168034
             dest: redis:8.6-debian13-dev
             auth: dhi
             dest_org: noomesh/dhi
-          - source: dhi.io/grafana:12-debian13-dev
+          - source: dhi.io/grafana:12-debian13-dev@sha256:084445dea160e453576f5bd8e551116b0f1d6c52e8abd367d516135f53590c9a
             dest: grafana:12-debian13-dev
             auth: dhi
             dest_org: noomesh/dhi
-          - source: dhi.io/loki:3
+          - source: dhi.io/loki:3@sha256:5f04dd8068afa17dd4da0fe1e88f56011d21a67dc1065b03c5de557971c7fa05
             dest: loki:3
             auth: dhi
             dest_org: noomesh/dhi
-          - source: dhi.io/prometheus:3
+          # Tempo 2.10.10, the request-trace store (i359); uid 65532 like the
+          # rest of the runtime set.
+          - source: dhi.io/tempo:2@sha256:5352e76f3c4e531babc76fc29958cfa3286096d2ca0bbf3b46007e46c0249a85
+            dest: tempo:2
+            auth: dhi
+            dest_org: noomesh/dhi
+          - source: dhi.io/prometheus:3@sha256:6a5aea3fc3a33fea84bb4ea7925228f8eb67884893970a768603d350e1830489
             dest: prometheus:3
             auth: dhi
             dest_org: noomesh/dhi
-          - source: dhi.io/alertmanager:0
+          - source: dhi.io/alertmanager:0@sha256:01dd89cce4737ec7e44704681b5d6ee561e9b7880f632b4413b0e547e4dabfda
             dest: alertmanager:0
             auth: dhi
             dest_org: noomesh/dhi
-          - source: dhi.io/node-exporter:1
+          - source: dhi.io/node-exporter:1@sha256:2bf73eace0e49be4c1c61f14e349b738fdd182fb63560b1e7ed6c7c6885236d8
             dest: node-exporter:1
             auth: dhi
             dest_org: noomesh/dhi
@@ -112,7 +120,7 @@ jobs:
           # mirroring BY that digest preserves it (manifest copy). The
           # pytorch bases (vllm/airllm) are deliberately NOT mirrored:
           # multi-GB x3 tags of storage for rarely-rebuilt images.
-          - source: dhi.io/rust:1-debian13-dev
+          - source: dhi.io/rust:1-debian13-dev@sha256:be6c6ec91c61ae15b80521052df1c7f60fefd303293563b3dbd9f57e58783809
             dest: rust:1-debian13-dev
             auth: dhi
             dest_org: noomesh/dhi
@@ -120,19 +128,19 @@ jobs:
             dest: python:3.12-debian13
             auth: dhi
             dest_org: noomesh/dhi
-          - source: dhi.io/uv:0-debian13-dev
+          - source: dhi.io/uv:0-debian13-dev@sha256:538e03cfb921102dafe5a083a8fb4ee5a7758be4170f32788fac191325b0307d
             dest: uv:0-debian13-dev
             auth: dhi
             dest_org: noomesh/dhi
-          - source: dhi.io/golang:1.26-debian13-dev
+          - source: dhi.io/golang:1.26-debian13-dev@sha256:ef213048c25a7360bbb52e6b243a782a439e892fa5982ad55c95a4c3c7f9e552
             dest: golang:1.26-debian13-dev
             auth: dhi
             dest_org: noomesh/dhi
-          - source: dhi.io/alpine-base:3.22
+          - source: dhi.io/alpine-base:3.22@sha256:884b0d572ffb8715be033de215ca17e1c0a372615e65b3937f9a5ee568eb11c5
             dest: alpine-base:3.22
             auth: dhi
             dest_org: noomesh/dhi
-          - source: dhi.io/postgres:18-alpine3.22-dev
+          - source: dhi.io/postgres:18-alpine3.22-dev@sha256:9bb938ebc72adc10302318b4193fc2b72a80ca2d80c5c1f0a91077ed6e8807c2
             dest: postgres:18-alpine3.22-dev
             auth: dhi
             dest_org: noomesh/dhi
@@ -177,22 +185,26 @@ jobs:
           # Sources verified upstream 2026-08-19. Pushed with this repo's own
           # GITHUB_TOKEN (the repo lives in the noomesh org); flip these
           # packages PUBLIC after the first push.
-          - source: redis:8
+          - source: redis:8@sha256:4764ce37931aac77c0d033680b339b19b4a4a81772204d268947cb851212d0ac
             dest: redis:8.6-debian13-dev
             dest_org: noomesh
-          - source: grafana/grafana:12.2
+          - source: grafana/grafana:12.2@sha256:d2ac2dae86601550e941f7e1c0b4b7e1f21fadebfa5956ba06fe0b3a64de7cf4
             dest: grafana:12-debian13-dev
             dest_org: noomesh
-          - source: grafana/loki:3
+          - source: grafana/loki:3@sha256:0db216b630ae1f348a1584c67f3cead8b4c1fc839169a39501db664744158e28
             dest: loki:3
             dest_org: noomesh
-          - source: prom/prometheus:v3
+          # Upstream publishes no major tag; 2.10.10 is the release dhi.io/tempo:2 carries.
+          - source: grafana/tempo:2.10.10@sha256:12b0820f13ffa10ce956b6e9acc3b03f3cffded99109be6cc09d106fe56e5d38
+            dest: tempo:2
+            dest_org: noomesh
+          - source: prom/prometheus:v3@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
             dest: prometheus:3
             dest_org: noomesh
-          - source: prom/alertmanager:v0
+          - source: prom/alertmanager:v0@sha256:39d8bb3966c694a124428a3a88fbcffd40bd069129ecd47c059f8a3f17c55f3b
             dest: alertmanager:0
             dest_org: noomesh
-          - source: prom/node-exporter:v1
+          - source: prom/node-exporter:v1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0
             dest: node-exporter:1
             dest_org: noomesh
     steps:

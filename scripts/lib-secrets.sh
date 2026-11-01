@@ -692,7 +692,8 @@ remove_secret_files() {
 
 # Store keys load_secrets never exports (see _load_secrets_sops). The CLI-only
 # names include every noo-cli/src/commands/secrets.rs CLI_ONLY_SECRETS row
-# (tests/test_secrets_not_exported.py holds the two equal).
+# (tests/test_secrets_not_exported.py holds the two equal). The per-add-on
+# NOO_ADDON_REGISTRY_CRED_* keys are skipped by prefix in _load_secrets_sops.
 _SECRETS_NOT_EXPORTED="NOO_IMAGE_TAG NOO_ADDON_REGISTRY_TOKEN NOO_ADDON_REGISTRY_USER"
 
 # ── The age key sealed to the TPM (i10a PR-B) ───────────────────────────────
@@ -774,6 +775,10 @@ _load_secrets_sops() {
         #    the noo CLI from the store itself, held by no container, so they
         #    must not sit in the launcher's, compose's or any child's env.
         case " $_SECRETS_NOT_EXPORTED " in *" ${line%%=*} "*) continue ;; esac
+        #  - NOO_ADDON_REGISTRY_CRED_<NAME> (i277h): one third-party add-on's
+        #    pull token, read by the noo CLI and sent to that add-on's
+        #    registry root only. A name per add-on, so a prefix, not a list.
+        case "${line%%=*}" in NOO_ADDON_REGISTRY_CRED_*) continue ;; esac
         export "$line"
         count=$((count + 1))
     done <<EOF

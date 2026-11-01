@@ -530,6 +530,12 @@ pub async fn try_dispatch<S: TurnSink>(
     // Say who is answering before the wait starts (i233 fix 3): a vendor
     // CLI turn can run for minutes, and a silent wait reads as a hang.
     sink.send_event("harness_dispatched", dispatched_event(&node, kind.as_deref())).await;
+    // The console's phase line (#624): the node's chat backend and its
+    // slots, so a turn waiting on a full node says so.
+    if let Some((backend, served, slots)) = super::classes::node_chat_route(state, &node).await {
+        let f = super::phase::routed(&node, &backend, model.unwrap_or(served.as_str()), slots, 0, 1, None, "harness");
+        sink.send_event("phase", f).await;
+    }
 
     // The turn's tools run on the rail, in another task, where this
     // task's approval task-locals are unset. Register where this turn came

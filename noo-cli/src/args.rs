@@ -97,20 +97,39 @@ impl Args {
         self.rest.len() != before
     }
 
-    /// `--flag <value>`; the last occurrence wins. A flag with no value
-    /// after it is an error.
-    pub fn value(&mut self, names: &[&str]) -> Result<Option<String>, ArgError> {
-        self.note(names);
-        let mut found = None;
+    /// Every occurrence of `--flag <value>`, in order, without recording the
+    /// flag as asked. A flag with no value after it is an error.
+    fn take_values(&mut self, names: &[&str]) -> Result<Vec<String>, ArgError> {
+        let mut found = Vec::new();
         while let Some(i) = self.rest.iter().position(|t| names.contains(&t.as_str())) {
             if i + 1 >= self.rest.len() {
                 return Err(ArgError::new(format!("{} needs a value", self.rest[i])));
             }
             let v = self.rest.remove(i + 1);
             self.rest.remove(i);
-            found = Some(v);
+            found.push(v);
         }
         Ok(found)
+    }
+
+    /// `--flag <value>`; the last occurrence wins. A flag with no value
+    /// after it is an error.
+    pub fn value(&mut self, names: &[&str]) -> Result<Option<String>, ArgError> {
+        self.note(names);
+        Ok(self.take_values(names)?.pop())
+    }
+
+    /// `--flag <value>`, repeatable: every occurrence, in order.
+    pub fn values(&mut self, names: &[&str]) -> Result<Vec<String>, ArgError> {
+        self.note(names);
+        self.take_values(names)
+    }
+
+    /// Like [`Args::value`] for a flag the verb still swallows but no longer
+    /// documents (a removed flag it reports): it is NOT recorded as asked, so
+    /// the usage tie test does not expect it in `usage.rs`.
+    pub fn value_unlisted(&mut self, names: &[&str]) -> Result<Option<String>, ArgError> {
+        Ok(self.take_values(names)?.pop())
     }
 
     /// `--flag <number>`; surrounding whitespace is ignored.
@@ -185,6 +204,17 @@ mod tests {
     }
 
     #[test]
+    fn values_collects_every_occurrence_in_order() {
+        let mut a = Args::new(&s(&["-i", "x", "n1", "--image", "y", "-i", "z"]));
+        assert_eq!(a.values(&["--image", "-i"]).unwrap(), s(&["x", "y", "z"]));
+        assert_eq!(a.values(&["--none"]).unwrap(), Vec::<String>::new());
+        assert_eq!(a.positionals().unwrap(), s(&["n1"]));
+        assert_eq!(a.asked(), s(&["--image", "--none"]).as_slice());
+        let e = Args::new(&s(&["-i"])).values(&["--image", "-i"]).unwrap_err();
+        assert_eq!(e.0, "-i needs a value");
+    }
+
+    #[test]
     fn a_value_may_look_like_a_flag() {
         let mut a = Args::new(&s(&["--q", "--odd"]));
         assert_eq!(a.value(&["--q"]).unwrap().as_deref(), Some("--odd"));
@@ -256,8 +286,13 @@ mod tests {
     #[test]
     fn usage_flags_match_what_converted_parsers_ask_for() {
         use crate::commands::{
-            addons, autonomy, cluster_gpu, cluster_reserve, cluster_vendor, heartbeat, jobs, logs, memory, rag, recall, tasks,
+            addons, autonomy, cluster_gpu, cluster_gpu_mode, cluster_reserve, cluster_vendor, heartbeat, jobs, logs, memory, rag, recall, tasks,
             walks,
+        };
+        use crate::commands::{approval, ops, security, security_local};
+        use crate::commands::{
+            agents, cluster, cluster_class, cluster_embedding_space, cluster_provision, cluster_push_secrets, models,
+            models_fetch,
         };
         type Probe = fn(&mut Args);
         fn row<'a>(w: &'a [&'a str], p: Probe) -> (&'a [&'a str], Probe) {
@@ -297,6 +332,65 @@ mod tests {
             row(&["walks", "view"], |a| { let _ = walks::parse_view_with(a); }),
             row(&["recall", "search"], |a| { let _ = recall::parse_search_with(a); }),
             row(&["recall", "prominent"], |a| { let _ = recall::parse_prominent_with(a); }),
+            row(&["security", "user", "create"], |a| { let _ = security::parse_user_create_with(a); }),
+            row(&["security", "user", "allowance"], |a| { let _ = security::parse_allowance_with(a); }),
+            row(&["security", "user", "set-scopes"], |a| { let _ = security::parse_set_scopes_with(a); }),
+            row(&["security", "user", "grant-role"], |a| { let _ = security::parse_roles_with(a); }),
+            row(&["security", "user", "revoke-role"], |a| { let _ = security::parse_roles_with(a); }),
+            row(&["security", "user", "link"], |a| { let _ = security::parse_link_with(a); }),
+            row(&["security", "team", "create"], |a| { let _ = security::parse_team_create_with(a); }),
+            row(&["security", "org", "create"], |a| { let _ = security::parse_org_create_with(a); }),
+            row(&["security", "audit", "list"], |a| { let _ = security::parse_audit_list_with(a); }),
+            row(&["security", "service-key", "issue"], |a| { let _ = security::parse_service_key_issue_with(a); }),
+            row(&["security", "service-key", "self"], |a| { let _ = security::parse_service_key_self_with(a); }),
+            row(&["security", "service-key", "provision"], |a| { let _ = security::parse_service_key_provision_with(a); }),
+            row(&["security", "service-key", "rotate"], |a| { let _ = security::parse_service_key_rotate_with(a); }),
+            row(&["security", "generate-secret"], |a| { let _ = security_local::parse_generate_secret_with(a); }),
+            row(&["security", "pki", "rotate-ca"], |a| { let _ = security_local::parse_rotate_ca_with(a); }),
+            row(&["security", "pki", "issue-node"], |a| { let _ = security_local::parse_issue_node_with(a); }),
+            row(&["security", "pki", "push-nodes"], |a| { let _ = security_local::parse_push_nodes_with(a); }),
+            row(&["security", "pki", "rotate-all"], |a| { let _ = security_local::parse_rotate_all_with(a); }),
+            row(&["approval", "approve"], |a| { let _ = approval::parse_decide_with(a, false); }),
+            row(&["approval", "deny"], |a| { let _ = approval::parse_decide_with(a, true); }),
+            row(&["ops", "list"], |a| { let _ = ops::parse_list_with(a); }),
+            row(&["memory", "embed"], |a| { let _ = memory::parse_embed_with(a); }),
+            row(&["cluster", "proposals"], |a| { let _ = cluster::parse_proposals_with(a); }),
+            row(&["cluster", "place"], |a| { let _ = cluster::parse_place_with(a); }),
+            row(&["cluster", "unplace"], |a| { let _ = cluster::parse_unplace_with(a); }),
+            row(&["cluster", "logs"], |a| { let _ = cluster::parse_logs_with(a); }),
+            row(&["cluster", "down"], |a| { let _ = cluster::parse_down_with(a); }),
+            row(&["cluster", "set-config"], |a| { let _ = cluster::parse_set_config_with(a); }),
+            row(&["cluster", "sync-model-files"], |a| { let _ = cluster::parse_sync_model_files_with(a); }),
+            row(&["cluster", "seed"], |a| { let _ = cluster::parse_seed_with(a); }),
+            row(&["cluster", "maintenance"], |a| { let _ = cluster::parse_maintenance_on_with(a); }),
+            row(&["cluster", "embedding-space", "set"], |a| { let _ = cluster_embedding_space::parse_set_with(a); }),
+            row(&["cluster", "class", "set"], |a| { let _ = cluster_class::parse_class_set_with(a); }),
+            row(&["cluster", "push-secrets"], |a| { let _ = cluster_push_secrets::parse_push_secrets_with(a); }),
+            row(&["cluster", "set-primary"], |a| { let _ = cluster_provision::parse_set_primary_with(a); }),
+            row(&["cluster", "bootstrap-token", "create"], |a| { let _ = cluster_provision::parse_bootstrap_token_create_with(a); }),
+            row(&["cluster", "import-model"], |a| { let _ = cluster_provision::parse_import_model_with(a); }),
+            row(&["cluster", "ship-model"], |a| { let _ = cluster_provision::parse_ship_model_with(a); }),
+            row(&["cluster", "sync-images"], |a| { let _ = cluster_provision::parse_sync_images_with(a); }),
+            row(&["models", "pull"], |a| { let _ = models::parse_pull_with(a); }),
+            row(&["models", "fetch"], |a| { let _ = models_fetch::parse_fetch_with(a); }),
+            row(&["models", "list"], |a| { let _ = models::parse_list_with(a); }),
+            row(&["models", "search"], |a| { let _ = models::parse_search_with(a); }),
+            row(&["models", "recommended"], |a| { let _ = models::parse_recommended_with(a); }),
+            row(&["models", "ollama"], |a| { let _ = models::parse_ollama_with(a); }),
+            row(&["models", "huggingface"], |a| { let _ = models::parse_huggingface_with(a); }),
+            row(&["models", "switch"], |a| { let _ = models::parse_switch_with(a); }),
+            row(&["models", "refresh"], |a| { let _ = models::parse_refresh_with(a); }),
+            row(&["agents", "collaborate"], |a| { let _ = agents::parse_collaborate_with(a); }),
+            row(&["agents", "peer", "dispatch"], |a| { let _ = agents::parse_peer_dispatch_with(a); }),
+            row(&["agents", "send"], |a| { let _ = agents::parse_send_with(a); }),
+            row(&["agents", "inbox"], |a| { let _ = agents::parse_inbox_with(a); }),
+            row(&["agents", "presence"], |a| { let _ = agents::parse_presence_with(a); }),
+            row(&["agents", "messages"], |a| { let _ = agents::parse_messages_with(a); }),
+            row(&["agents", "archive", "export"], |a| { let _ = agents::parse_archive_export_with(a); }),
+            row(&["rag", "ingest"], |a| { let _ = rag::parse_ingest_with(a); }),
+            row(&["rag", "held"], |a| { let _ = rag::parse_held_with(a); }),
+            row(&["rag", "purge"], |a| { let _ = rag::parse_purge_with(a); }),
+            row(&["cluster", "gpu", "mode"], |a| { let _ = cluster_gpu_mode::parse_gpu_mode_with(a); }),
         ];
         let mut bad = Vec::new();
         for (words, probe) in table {

@@ -227,6 +227,19 @@ impl HarnessRuntime for RemoteRuntime {
         self.max_context_tokens
     }
 
+    async fn route_facts(&self, url: &str, _backend: &str) -> Option<(String, Option<super::classes::Slots>)> {
+        // The placed endpoint is this node's; the slots come live from its
+        // agent (`: queued ahead=N` and the occupancy headers), not from here.
+        match &self.pinned {
+            Some(p) if p.url == url => jwt_harness_node_unverified(&self.token).map(|n| (n, None)),
+            _ => super::backend::node_from_backend_url(url).map(|h| (h, None)),
+        }
+    }
+
+    fn phase_via(&self) -> &'static str {
+        "harness"
+    }
+
     fn credential_expires_at(&self) -> Option<u64> {
         // Read from the token itself, so a task's renewed token (checkpoint)
         // moves the horizon with it.
@@ -435,13 +448,26 @@ impl HarnessRuntime for RemoteRuntime {
 /// verifies it on every call; nothing here trusts the claim for access).
 /// `None` for anything that is not a three-part token with a numeric `exp`.
 pub(crate) fn jwt_exp_unverified(token: &str) -> Option<u64> {
+    let claims = jwt_claims_unverified(token)?;
+    let exp = claims.get("exp")?;
+    exp.as_u64().or_else(|| exp.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
+}
+
+/// The node a harness token was minted for (`harness: node:<id>`), read
+/// WITHOUT verifying it: only to name this node on the console's phase
+/// line, never for access.
+pub(crate) fn jwt_harness_node_unverified(token: &str) -> Option<String> {
+    let claims = jwt_claims_unverified(token)?;
+    let node = claims.get("harness")?.as_str()?.strip_prefix(crate::auth::HARNESS_NODE_PREFIX)?;
+    Some(node.to_string()).filter(|n| !n.is_empty())
+}
+
+fn jwt_claims_unverified(token: &str) -> Option<Value> {
     use base64::Engine as _;
     let mut parts = token.split('.');
     let (_header, payload, _sig) = (parts.next()?, parts.next()?, parts.next()?);
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
-    let claims: Value = serde_json::from_slice(&bytes).ok()?;
-    let exp = claims.get("exp")?;
-    exp.as_u64().or_else(|| exp.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
+    serde_json::from_slice(&bytes).ok()
 }
 
 #[cfg(test)]
@@ -703,6 +729,77 @@ mod tests {
         let events = sink.events();
         assert!(events.iter().any(|(k, v)| k == "metadata" && v["deadline_stop"] == true), "{events:?}");
         assert!(events.iter().any(|(k, v)| k == "content" && v.as_str() == Some(super::super::agent_loop::DEADLINE_NOTE)), "{events:?}");
+    }
+
+    /// A model endpoint behind a node agent whose every slot is taken: the
+    /// agent's `: queued ahead=2` comment and occupancy headers, then the
+    /// answer.
+    async fn queued_model() -> String {
+        use axum::body::Body;
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                let content = serde_json::json!({"choices": [{"index": 0, "delta": {"content": "hello"}}]});
+                let stop = serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]});
+                let body = format!(": queued ahead=2\n\n: keep-alive\n\ndata: {content}\n\ndata: {stop}\n\ndata: [DONE]\n\n");
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .header("x-noo-in-flight", "2")
+                    .header("x-noo-slots", "2")
+                    .body(Body::from(body))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// The console's phase line (#624): a harness turn on mcmini says where
+    /// it went, that the backend began answering, and, from the agent's
+    /// comment, that it waits behind two others, all before the first token.
+    #[tokio::test]
+    async fn a_turn_sends_routed_then_prompt_then_the_agents_queue_before_its_first_token() {
+        use base64::Engine as _;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let gw = fake_gateway(seen.clone()).await;
+        let model = queued_model().await;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::json!({"exp": now + 3600, "harness": "node:mcmini"}).to_string());
+        let token = format!("e30.{payload}.sig");
+        let rt = RemoteRuntime::connect(&gw, &token, reqwest::Client::new()).await.unwrap().pin_backend(openai_at(&model));
+        let sink = Recorder::default();
+
+        let result = super::super::run_streaming_on(&sink, &rt, "what is up", "c1", 5, None, Some("alice"), false).await.unwrap();
+
+        assert_eq!(result.response, "hello");
+        let events = sink.events();
+        let phases: Vec<&Value> = events.iter().filter(|(k, _)| k == "phase").map(|(_, v)| v).collect();
+        assert_eq!(phases.len(), 3, "{events:?}");
+        let r = phases[0];
+        assert_eq!((r["phase"].as_str(), r["node"].as_str(), r["via"].as_str()), (Some("routed"), Some("mcmini"), Some("harness")));
+        assert_eq!((r["attempt"].as_u64(), r["model"].as_str()), (Some(1), Some("gemma4:12b")));
+        assert!(r["slots_busy"].is_null(), "a harness knows no heartbeat slots: {r}");
+        assert_eq!(phases[1]["phase"], "prompt");
+        assert!(phases[1]["input_tokens"].as_u64().is_some_and(|t| t > 0), "{}", phases[1]);
+        let q = phases[2];
+        assert_eq!((q["phase"].as_str(), q["node"].as_str()), (Some("routed"), Some("mcmini")));
+        assert_eq!((q["slots_busy"].as_u64(), q["slots_total"].as_u64(), q["queued_ahead"].as_u64()), (Some(2), Some(2), Some(2)));
+        let first_phase = events.iter().position(|(k, _)| k == "phase").unwrap();
+        let first_token = events.iter().position(|(k, _)| k == "content").expect("content");
+        let last_phase = events.iter().rposition(|(k, _)| k == "phase").unwrap();
+        assert!(first_phase < first_token && last_phase < first_token, "every phase before the first token: {events:?}");
+    }
+
+    #[test]
+    fn the_harness_node_reads_only_a_node_claim() {
+        use base64::Engine as _;
+        let enc = |v: Value| format!("h.{}.s", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string()));
+        assert_eq!(jwt_harness_node_unverified(&enc(serde_json::json!({"harness": "node:mcmini"}))), Some("mcmini".into()));
+        assert_eq!(jwt_harness_node_unverified(&enc(serde_json::json!({"harness": "mcmini"}))), None);
+        assert_eq!(jwt_harness_node_unverified(&enc(serde_json::json!({"harness": "node:"}))), None);
+        assert_eq!(jwt_harness_node_unverified("tok-123"), None);
     }
 
     #[test]

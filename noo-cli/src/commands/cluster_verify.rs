@@ -36,6 +36,7 @@ use serde_json::Value;
 use std::process::Command;
 
 mod image_family;
+mod tempo;
 mod warmup;
 pub(crate) mod restart_loops;
 mod gpu_held;
@@ -352,6 +353,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     //          placement's image is staged there.
     out.extend(image_sources_check(n));
     out.extend(images_staged_check(n));
+    out.extend(hardened_images_check(n));
 
     // 6c''. Vendor telemetry (docs/security/telemetry.md): no running
     //       backend container lacks the switches that keep its vendor from
@@ -373,7 +375,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
 
     // 6e. Shared GPU: the node yielded (or was held off) its GPU for work
     //     outside noomesh. A warn by design, never a failure.
-    out.extend(gpu_contention_check(n));
+    out.extend(gpu_contention_check_at(n, now_unix));
 
     // 6d. The log shipper (fleet logging phase 6), from the agent's own
     //     account in its heartbeat.
@@ -482,11 +484,16 @@ pub(crate) fn harness_tasks_check(n: &Value) -> Option<Check> {
     Some(ok(NAME, detail))
 }
 
+/// A probe that has not answered for longer than this is no longer a blip.
+const GPU_PROBE_FAILING_SECS: i64 = 60;
+
 /// The `gpu` row, from the node agent's `gpu_contention` heartbeat report
 /// (internal/gpuyield). A node that gave its GPU to other work (VR, model
 /// development, a voice stack) is working as designed: yielded and held are
-/// WARNs, never FAILs. No row from an agent that does not report it.
-pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
+/// WARNs, never FAILs. No row from an agent that does not report it. Takes
+/// the clock, so a hold's row can say how long it has lasted (a `now` of 0
+/// says nothing about age).
+pub(crate) fn gpu_contention_check_at(n: &Value, now_unix: i64) -> Option<Check> {
     let id = n["id"].as_str().unwrap_or("?");
     let gc = n.get("gpu_contention").filter(|v| v.is_object())?;
     let gb = |k: &str| gc[k].as_f64().unwrap_or(0.0) / 1024.0;
@@ -508,6 +515,10 @@ pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
                     format!("the NVIDIA driver lost the GPU (nvidia-smi: {detail}) — GPU backends cannot start"),
                     format!("reboot {id}; the kernel log names the fault: journalctl -k | grep -i xid"))
             }
+            Some("probe-timeout") if gc["unmeasured_for_s"].as_i64().unwrap_or(0) > GPU_PROBE_FAILING_SECS => warn("gpu",
+                format!("nvidia-smi has not answered for {} — a Windows program is likely using the GPU (WSL2), or the driver is stuck; the agent yields the GPU backends when this persists",
+                    compact_secs(gc["unmeasured_for_s"].as_i64().unwrap_or(0))),
+                None),
             Some("probe-timeout") => warn("gpu",
                 "nvidia-smi did not answer in time (GPU saturated or driver slow) — not measured", None),
             Some("no-nvidia") => ok("gpu", "no NVIDIA GPU — the node never yields"),
@@ -531,6 +542,10 @@ pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
     Some(match state {
         "free" => ok("gpu", format!("free{off}")),
         "shared" => ok("gpu", format!("shared: foreign {:.1} GB beside noomesh, backends running ({method}){off}", gb("foreign_mb"))),
+        "yielded" if gc["unmeasured"].as_str() == Some("probe-timeout") => warn("gpu",
+            format!("yielded: {paused_phrase} (nvidia-smi not answering for {} — a Windows program is likely using the GPU) — resumes when nvidia-smi answers and the GPU is clear",
+                compact_secs(gc["unmeasured_for_s"].as_i64().unwrap_or(0))),
+            None),
         "yielded" => warn("gpu",
             format!("yielded: {paused_phrase} (foreign {:.1} GB, {method}{off}) — resumes when the GPU frees", gb("foreign_mb")),
             None),
@@ -542,14 +557,32 @@ pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
                 (Some(op), Some(generation)) if !op.is_empty() => format!(" --operation {op} --generation {generation}"),
                 _ => String::new(),
             };
+            // i344b: the row names the mode and how long the hold has lasted;
+            // for `user` it adds what still uses the GPU, so "the GPU is
+            // still busy" is visible without running the switch.
+            let mode = super::cluster_gpu_mode::lease_mode(gc);
+            let age = super::cluster_gpu_mode::lease_age(gc, now_unix)
+                .map(|s| format!(", for {}", super::cluster_gpu_mode::age_text(s)))
+                .unwrap_or_default();
+            let busy = if mode == super::cluster_gpu_mode::Mode::User && gc["foreign_mb"].as_f64().unwrap_or(0.0) > 0.0 {
+                format!(", GPU in use {:.1} GB", gb("foreign_mb"))
+            } else {
+                String::new()
+            };
+            let remedy = if mode == super::cluster_gpu_mode::Mode::User {
+                format!("noo cluster gpu mode {id} mesh   # when the other work is done")
+            } else {
+                format!("noo cluster gpu release {id}{ids}   # when the other work is done")
+            };
             warn("gpu",
-                format!("held by {}{}: {paused_phrase}",
+                format!("mode {}: held by {}{}: {paused_phrase}{age}{busy}",
+                    mode.label(),
                     super::cluster_gpu::lease_holder(gc),
                     gc["reason"].as_str().filter(|r| !r.is_empty()).map(|r| format!(" ({r})")).unwrap_or_default()),
-                Some(format!("noo cluster gpu release {id}{ids}   # when the other work is done")))
+                Some(remedy))
         }
         "draining" => warn("gpu",
-            format!("hold by {} draining: waiting for requests in flight on the GPU backends to finish", super::cluster_gpu::lease_holder(gc)),
+            format!("mode switching: hold by {} draining: waiting for requests in flight on the GPU backends to finish", super::cluster_gpu::lease_holder(gc)),
             None),
         other => warn("gpu", format!("agent reports an unknown gpu_contention state {other:?}"), None),
     })
@@ -618,6 +651,47 @@ pub(crate) fn images_staged_check(n: &Value) -> Option<Check> {
         "images staged",
         format!("placed but not staged on the artifact rail: {}", names.join(", ")),
         Some(format!("noo cluster sync-images {id} -i {first}   # or `noo upgrade` for the release images")),
+    ))
+}
+
+/// The hardened image of ours that replaces an upstream backend image
+/// (noomesh-internal i323, operator decision 3): upstream `ollama/ollama` ->
+/// `<ns>/ollama:<tag>`, upstream `ghcr.io/ggml-org/llama.cpp` ->
+/// `<ns>/llamacpp:<tag>`. None for any other image, ours included.
+pub(crate) fn hardened_replacement(image: &str, tag: &str) -> Option<String> {
+    let repo = image.split('@').next().unwrap_or(image);
+    let repo = repo.rsplit_once(':').filter(|(r, t)| !t.contains('/') && !r.is_empty()).map_or(repo, |(r, _)| r);
+    let repo = repo.strip_prefix("docker.io/").unwrap_or(repo);
+    let name = match repo {
+        "ollama/ollama" => "ollama",
+        r if r.starts_with("ghcr.io/ggml-org/") => "llamacpp",
+        _ => return None,
+    };
+    Some(format!("{}/{name}:{tag}", crate::registry::IMAGE_NAMESPACE))
+}
+
+/// The `hardened images` row: FAIL (drift) when an upstream backend image
+/// (`ollama/ollama`, `ghcr.io/ggml-org/*`) runs, naming the hardened ref of
+/// ours that should replace it. The tag is the release the node's own images
+/// carry (`<ns>/<name>:<tag>` in `image_sources`), else `<stack-tag>`. No row
+/// on a node that reports no sources or runs no upstream backend image.
+pub(crate) fn hardened_images_check(n: &Value) -> Option<Check> {
+    let id = n["id"].as_str().unwrap_or("?");
+    let images: Vec<&str> = n["image_sources"].as_array()?.iter().filter_map(|e| e["image"].as_str()).collect();
+    let ns = format!("{}/", crate::registry::IMAGE_NAMESPACE);
+    let tag = images
+        .iter()
+        .filter(|i| i.starts_with(&ns))
+        .filter_map(|i| i.split('@').next()?.rsplit_once(':').map(|(_, t)| t))
+        .find(|t| !t.is_empty() && *t != "latest")
+        .unwrap_or("<stack-tag>");
+    let swaps: Vec<(&str, String)> = images.iter().filter_map(|i| hardened_replacement(i, tag).map(|h| (*i, h))).collect();
+    let (_, first_ours) = swaps.first()?;
+    let list: Vec<String> = swaps.iter().map(|(u, h)| format!("{u} -> {h}")).collect();
+    Some(fail(
+        "hardened images",
+        format!("drift: upstream image(s) running where a hardened build of ours exists (a node never falls back to upstream on its own): {}", list.join(", ")),
+        format!("noo cluster sync-images {id} -i {first_ours}   # stage ours; the node's reconciler then recreates the backend on it; unset LLAMACPP_IMAGE / OLLAMA_IMAGE if an override pins upstream"),
     ))
 }
 
@@ -837,13 +911,28 @@ pub(crate) fn vendor_telemetry_check(n: &Value) -> Check {
 const DOOR_LEAF_MIN_REMAINING_SECS: i64 = 14 * 86_400;
 
 /// The `backend doors` row for a node record, reading the controller's
-/// copy of each door leaf from its PKI dir.
+/// copy of each door leaf from its PKI dir. Run where there is no
+/// controller PKI at all (no `nodes/` dir: an operator's CLI on a worker
+/// box), the controller's copies are NOT CHECKED HERE and the row says so;
+/// it is never read as "the controller holds no leaf" (i213).
 pub(crate) fn backend_doors_row(n: &Value, now_unix: i64) -> Check {
+    backend_doors_row_in(n, &crate::pki::pki_dir(), now_unix)
+}
+
+/// [`backend_doors_row`] over the PKI dir `pki`.
+pub(crate) fn backend_doors_row_in(n: &Value, pki: &std::path::Path, now_unix: i64) -> Check {
     let id = n["id"].as_str().unwrap_or("?");
-    let leaf_of = |svc: &str| crate::commands::node_leaves::read_leaf(
-        &crate::pki::ClusterCa::new(crate::pki::pki_dir()).node_service_dir(id, svc));
+    if !pki.join("nodes").is_dir() {
+        return backend_doors_check_with(n, None, now_unix);
+    }
+    let ca = crate::pki::ClusterCa::new(pki.to_path_buf());
+    let leaf_of = |svc: &str| crate::commands::node_leaves::read_leaf(&ca.node_service_dir(id, svc));
     backend_doors_check(n, &leaf_of, now_unix)
 }
+
+/// What the row says when the controller's copies could not be read here.
+pub(crate) const DOORS_NOT_CHECKED_HERE: &str =
+    "the controller's copies not checked (no controller PKI here: run `noo cluster verify` on the controller)";
 
 /// The `backend doors` row. For every door-backed
 /// backend on the node — what it runs in Docker (`running_backends`, less
@@ -874,6 +963,18 @@ pub(crate) fn backend_doors_row(n: &Value, now_unix: i64) -> Check {
 /// called for a backend the node actually has, so a record with none
 /// reads nothing from disk.
 pub(crate) fn backend_doors_check(n: &Value, leaf: &dyn Fn(&str) -> crate::commands::node_leaves::LeafState, now_unix: i64) -> Check {
+    backend_doors_check_with(n, Some(leaf), now_unix)
+}
+
+/// [`backend_doors_check`], with `leaf` None where there is no controller
+/// PKI to read: step 2 (the controller's copy) is skipped and the row says it
+/// was not checked here; the node's report and its refusals are judged as
+/// always. A row that would pass becomes a WARN naming where to run it.
+pub(crate) fn backend_doors_check_with(
+    n: &Value,
+    leaf: Option<&dyn Fn(&str) -> crate::commands::node_leaves::LeafState>,
+    now_unix: i64,
+) -> Check {
     use crate::commands::node_leaves::{door_leaf_for_backend, LeafState};
     const NAME: &str = "backend doors";
     let id = n["id"].as_str().unwrap_or("?");
@@ -925,11 +1026,12 @@ pub(crate) fn backend_doors_check(n: &Value, leaf: &dyn Fn(&str) -> crate::comma
             door.doors[0].to_string()
         };
         let before = problems.len();
-        match leaf(svc) {
-            LeafState::Missing => problems.push(format!(
+        match leaf.map(|f| f(svc)) {
+            None => {}
+            Some(LeafState::Missing) => problems.push(format!(
                 "{b}: the controller holds no {svc} leaf for {id} (nodes/{id}/services/{svc}/) — no bundle can carry one")),
-            LeafState::Unreadable(e) => problems.push(format!("{b}: the controller's {svc} leaf for {id} is unreadable ({e})")),
-            LeafState::Present { dns, not_after, .. } => {
+            Some(LeafState::Unreadable(e)) => problems.push(format!("{b}: the controller's {svc} leaf for {id} is unreadable ({e})")),
+            Some(LeafState::Present { dns, not_after, .. }) => {
                 if !dns.contains(&dial) {
                     problems.push(format!("{b}: the controller's {svc} leaf for {id} does not name {dial}"));
                 } else if not_after - now_unix < DOOR_LEAF_MIN_REMAINING_SECS {
@@ -960,6 +1062,21 @@ pub(crate) fn backend_doors_check(n: &Value, leaf: &dyn Fn(&str) -> crate::comma
                 }
             },
         }
+    }
+    if leaf.is_none() {
+        if problems.is_empty() {
+            // Nothing wrong that could be seen from here, and one half that
+            // could not be looked at: a WARN that says where to look.
+            let node_side = if unreported.is_empty() {
+                "leaf present on the node, names its door, not expiring; no refusal"
+            } else {
+                "no refusal recorded, but the agent predates backend doors reporting"
+            };
+            return warn(NAME, format!("{}: {node_side}; {DOORS_NOT_CHECKED_HERE}", backends.join(", ")), None);
+        }
+        // A real problem on the node's side still fails; the row also says
+        // which half it could not check.
+        problems.push(DOORS_NOT_CHECKED_HERE.to_string());
     }
     if !problems.is_empty() {
         let check = fail(NAME, problems.join("; "), remedy);
@@ -3603,6 +3720,7 @@ pub(crate) fn at_rest_dirs(env: &dyn Fn(&str) -> Option<String>) -> Vec<AtRestDi
         .unwrap_or_else(|| format!("{home}/.config/sops/age"));
     vec![
         AtRestDir { name: "loki at rest", what: LOKI_WHAT, path: format!("{state}/loki") },
+        AtRestDir { name: "tempo at rest", what: "the request traces (who called which route, when, on which model)", path: format!("{state}/tempo") },
         AtRestDir { name: "postgres at rest", what: "the database files (every account, session, message and memory)", path: pg },
         AtRestDir { name: "redis at rest", what: "the Redis dumps (RDB/AOF: sessions, rate limits, cached results)", path: format!("{state}/redis") },
         AtRestDir { name: "nats at rest", what: "the JetStream streams (queued tasks, agent mail, KV)", path: format!("{state}/nats") },
@@ -3785,7 +3903,7 @@ pub(crate) fn at_rest_swap_check(proc_swaps: &str, encrypted: &dyn Fn(&str, &str
     ok(NAME, format!("{total} swap device(s), each zram or on dm-crypt"))
 }
 
-/// One place that holds sensitive state outside the nine at-rest rows.
+/// One place that holds sensitive state outside the ten at-rest rows.
 pub(crate) struct OutsideItem {
     pub what: String,
     pub path: String,
@@ -3794,7 +3912,7 @@ pub(crate) struct OutsideItem {
 
 /// The "at-rest outside the set" row (i10a): the `claude-config` and
 /// `alertmanager-data` docker volumes, docker's json logs and journald are
-/// not among the nine rows but can hold sensitive text. WARN while any sits
+/// not among the ten rows but can hold sensitive text. WARN while any sits
 /// on a device that is not dm-crypt; ACCEPTED when the person opted out.
 pub(crate) fn at_rest_outside_check(
     items: &[OutsideItem],
@@ -3815,7 +3933,7 @@ pub(crate) fn at_rest_outside_check(
             if items.is_empty() {
                 "none of claude-config, alertmanager-data, docker logs or journald found on disk here".to_string()
             } else {
-                format!("{} location(s) outside the nine rows, all on dm-crypt", items.len())
+                format!("{} location(s) outside the ten rows, all on dm-crypt", items.len())
             },
         );
     }
@@ -3825,7 +3943,7 @@ pub(crate) fn at_rest_outside_check(
     }
     warn(
         NAME,
-        format!("in the clear, outside the nine rows above: {list}"),
+        format!("in the clear, outside the ten rows above: {list}"),
         Some("planned (i10a): claude-config and alertmanager-data ride the encrypted state volume; docker logs and journald need their own handling. Until then anyone holding the drive can read them.".into()),
     )
 }
@@ -3841,7 +3959,7 @@ fn docker_lines(args: &[&str]) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The sensitive locations outside the nine rows that exist on this host,
+/// The sensitive locations outside the ten rows that exist on this host,
 /// with whether the device under each is dm-crypt.
 fn outside_items(proc_mounts: &str) -> Vec<OutsideItem> {
     let mut found: Vec<(String, String)> = Vec::new();
@@ -5247,6 +5365,82 @@ mod system_credentials_tests {
     }
 }
 
+/// The authenticated `/health` body, read on a 503 too: a degraded gateway
+/// (no NATS, i301 a.3) answers 503 WITH the dependency map these rows read,
+/// and dropping it would turn every one of them into "not read" exactly when
+/// it matters.
+fn health_body(g: &Globals) -> Option<Value> {
+    let (status, text) = crate::http::get_raw_opt(g, "/health", true, 10)?;
+    health_from(status, &text)
+}
+
+pub(crate) fn health_from(status: u16, text: &str) -> Option<Value> {
+    matches!(status, 200 | 503).then(|| serde_json::from_str(text).ok()).flatten()
+}
+
+/// The `gateway bus` row (i301 a.3). Since 0.6.16 a gateway that cannot
+/// reach NATS SERVES (it used to exit and crash-loop), degraded: worker
+/// dispatch, gossip and agent messages answer 503 `bus_unavailable` until it
+/// connects, which it does by itself once NATS is up.
+pub(crate) fn gateway_bus_check(health: Option<&Value>) -> Check {
+    const NAME: &str = "gateway bus";
+    match health.and_then(|h| h["dependencies"]["nats"]["state"].as_str()) {
+        Some("connected") => ok(NAME, "connected to NATS"),
+        Some(state) => fail(
+            NAME,
+            format!(
+                "not connected to NATS ({state}) — the gateway serves DEGRADED: worker dispatch, gossip and \
+                 agent messages answer 503 bus_unavailable; it reconnects by itself once NATS is up \
+                 (is the nats container running? `noo stack status`)"
+            ),
+            "noo stack start",
+        ),
+        None => warn(
+            NAME,
+            "not read: no authenticated /health answer with dependencies.nats.state \
+             (unreachable, no credential, or a gateway older than this CLI)",
+            Some("noo health".into()),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod gateway_bus_tests {
+    use super::{gateway_bus_check, health_from, Verdict};
+    use serde_json::json;
+
+    #[test]
+    fn a_connected_bus_passes_a_down_one_fails_with_the_start_remedy() {
+        let up = json!({"status": "healthy", "dependencies": {"nats": {"healthy": true, "state": "connected"}}});
+        let c = gateway_bus_check(Some(&up));
+        assert_eq!((c.name, c.verdict), ("gateway bus", Verdict::Ok));
+        for state in ["reconnecting", "unresponsive"] {
+            let down = json!({"status": "degraded", "dependencies": {"nats": {"healthy": false, "state": state}}});
+            let c = gateway_bus_check(Some(&down));
+            assert_eq!(c.verdict, Verdict::Fail, "{state}");
+            assert!(c.detail.contains(&format!("({state})")) && c.detail.contains("bus_unavailable"), "{}", c.detail);
+            assert_eq!(c.remedy.as_deref(), Some("noo stack start"));
+        }
+    }
+
+    #[test]
+    fn no_state_is_a_warn_never_a_pass() {
+        let older = json!({"status": "healthy", "dependencies": {"nats": {"healthy": true}}});
+        for body in [None, Some(json!({"status": "healthy"})), Some(older)] {
+            assert_eq!(gateway_bus_check(body.as_ref()).verdict, Verdict::Warn);
+        }
+    }
+
+    /// The degraded gateway's 503 still carries the map the rows read.
+    #[test]
+    fn a_503_health_body_is_read_not_dropped() {
+        let body = r#"{"status":"degraded","dependencies":{"nats":{"healthy":false,"state":"reconnecting"}}}"#;
+        assert_eq!(health_from(503, body).unwrap()["dependencies"]["nats"]["state"], "reconnecting");
+        assert!(health_from(200, body).is_some());
+        assert!(health_from(401, body).is_none() && health_from(502, "x").is_none());
+    }
+}
+
 /// `dependencies.redis.state` from an AUTHENTICATED `/health` body
 /// (`connected` / `reconnecting` / `unavailable`). `None` when the body is
 /// absent or lacks it: the gateway was unreachable, is older than the field,
@@ -5280,6 +5474,69 @@ pub(crate) fn gateway_redis_check(health: Option<&Value>) -> Check {
              (unreachable, no credential, or a gateway older than this CLI)",
             Some("noo health".into()),
         ),
+    }
+}
+
+/// The `gateway add-on caller key` row (noomesh followup 304). The gateway mints a
+/// bearer at each start and signs every add-on call with it; evolve refuses an
+/// unsigned call with 401. A boot whose mint failed serves everything else and
+/// used to say so only in a warn line, so every evolve call failed with
+/// nothing pointing at the cause. `dependencies.addon_caller` in an
+/// AUTHENTICATED `/health` carries the verdict, the gateway's reason and its
+/// remedy.
+pub(crate) fn addon_caller_check(health: Option<&Value>) -> Check {
+    const NAME: &str = "gateway add-on caller key";
+    let dep = health.map(|h| &h["dependencies"]["addon_caller"]);
+    match dep.map(|d| (d, d["healthy"].as_bool())) {
+        Some((_, Some(true))) => ok(NAME, "minted at gateway start"),
+        Some((d, Some(false))) => {
+            let why = d["error"].as_str().unwrap_or("no reason given");
+            let cost = d["remedy"].as_str().unwrap_or("add-ons that check the caller refuse its calls with 401");
+            fail(NAME, format!("NOT minted at gateway start ({why}): {cost}"), "noo stack restart gateway")
+        }
+        _ => warn(
+            NAME,
+            "not read: no authenticated /health answer with dependencies.addon_caller \
+             (unreachable, no credential, or a gateway older than this CLI)",
+            Some("noo health".into()),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod addon_caller_tests {
+    use super::{addon_caller_check, Verdict};
+    use serde_json::json;
+
+    #[test]
+    fn a_minted_key_passes() {
+        let h = json!({"status": "healthy", "dependencies": {"addon_caller": {"healthy": true, "optional": true}}});
+        let c = addon_caller_check(Some(&h));
+        assert_eq!((c.name, c.verdict), ("gateway add-on caller key", Verdict::Ok));
+    }
+
+    #[test]
+    fn an_unminted_key_fails_with_the_gateways_reason_and_the_restart() {
+        let h = json!({"status": "healthy", "dependencies": {"addon_caller": {
+            "healthy": false, "optional": true,
+            "error": "could not publish this boot's key: pool timed out",
+            "remedy": "evolve refuses each one with 401"}}});
+        let c = addon_caller_check(Some(&h));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("pool timed out") && c.detail.contains("401"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo stack restart gateway"));
+    }
+
+    #[test]
+    fn no_verdict_is_a_warn_never_a_pass() {
+        // Unreachable, the anonymous body, and a gateway older than the field:
+        // in a mixed roll a pre-0.6.16 gateway reads WARN, never FAIL.
+        let older = json!({"status": "healthy", "dependencies": {"redis": {"healthy": true, "state": "connected"}}});
+        for body in [None, Some(json!({"status": "healthy"})), Some(older)] {
+            let c = addon_caller_check(body.as_ref());
+            assert_eq!(c.verdict, Verdict::Warn);
+            assert!(c.detail.starts_with("not read:") && c.detail.contains("older than this CLI"), "{}", c.detail);
+        }
     }
 }
 
@@ -5375,6 +5632,139 @@ mod gateway_redis_tests {
     }
 }
 
+/// The `gateway add-on` rows (i353b): one per add-on noomesh.yaml switches
+/// on, plus any the gateway refused that is not. On 2026-10-31 the gateway
+/// refused a third-party add-on whole at startup (its routes.json) while `add-on pins`
+/// said verified and `noo addons show` said on; only the gateway log knew.
+/// The authenticated `/health` carries `addons_refused` (`{}` when none);
+/// without it (unreachable, no credential, an older gateway) every row is a
+/// WARN, never a pass: a missing field is not "nothing refused".
+pub(crate) fn gateway_addon_checks(health: Option<&Value>, enabled: &[String]) -> Vec<Check> {
+    const NAME: &str = "gateway add-on";
+    let refused = health.and_then(|h| h["addons_refused"].as_object());
+    let mut names: Vec<&str> = enabled.iter().map(String::as_str).collect();
+    if let Some(r) = refused {
+        names.extend(r.keys().map(String::as_str));
+    }
+    names.sort_unstable();
+    names.dedup();
+    names
+        .into_iter()
+        .map(|n| {
+            let Some(refused) = refused else {
+                return warn(
+                    NAME,
+                    format!(
+                        "{n}: not read: no authenticated /health answer with addons_refused \
+                         (unreachable, no credential, or a gateway older than this CLI)"
+                    ),
+                    Some("noo health".into()),
+                );
+            };
+            if let Some(why) = refused.get(n) {
+                return fail(
+                    NAME,
+                    format!("{n}: refused by the gateway, NOT running: {}", why.as_str().unwrap_or("no reason given")),
+                    "fix the manifest the add-on ships, then `noo addons check <bundle-dir>`",
+                );
+            }
+            match health.and_then(|h| h["addons"][n].as_str()) {
+                Some(word) => ok(NAME, format!("{n}: {word}, not refused")),
+                None => warn(
+                    NAME,
+                    format!("{n}: on in noomesh.yaml but the gateway does not list it (not started since it was enabled?)"),
+                    Some("noo stack start".into()),
+                ),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod gateway_addon_tests {
+    use super::{gateway_addon_checks, Verdict};
+    use serde_json::{json, Value};
+
+    /// An authenticated /health body as the 0.6.16 gateway writes it, with
+    /// the refusal pop-os logged on 2026-10-31 (renamed).
+    fn captured(refused: Value) -> Value {
+        json!({
+            "status": "healthy",
+            "engine": "rust",
+            "version": "0.6.16",
+            "peers": 3,
+            "dependencies": {"postgresql": {"healthy": true}},
+            "addons": {"trellion": "enabled", "rhaddon": "unhealthy", "voice": "disabled"},
+            "addons_refused": refused,
+        })
+    }
+
+    const WHY: &str = "route manifest /opt/noo/addon-bundle-routes/rhaddon/routes.json refused: \
+        route \"get_v1_workspace\": owner_scoped applies to a public write route (POST, PUT, PATCH, DELETE) only. \
+        None of its routes are mounted; fix the manifest the add-on ships";
+
+    fn on(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn a_refused_enabled_addon_fails_with_the_gateway_text_and_the_check_remedy() {
+        let h = captured(json!({"rhaddon": WHY}));
+        let rows = gateway_addon_checks(Some(&h), &on(&["rhaddon", "trellion"]));
+        assert_eq!(rows.len(), 2);
+        let pv = &rows[0];
+        assert_eq!(pv.name, "gateway add-on");
+        assert_eq!(pv.verdict, Verdict::Fail);
+        assert!(pv.detail.starts_with("rhaddon: refused by the gateway, NOT running: "), "{}", pv.detail);
+        assert!(pv.detail.contains("owner_scoped applies to a public write route"), "{}", pv.detail);
+        assert!(pv.remedy.as_deref().is_some_and(|r| r.contains("noo addons check <bundle-dir>")));
+        assert_eq!(rows[1].verdict, Verdict::Ok);
+        assert_eq!(rows[1].detail, "trellion: enabled, not refused");
+    }
+
+    #[test]
+    fn an_empty_refusal_map_passes_every_listed_addon() {
+        let h = captured(json!({}));
+        let rows = gateway_addon_checks(Some(&h), &on(&["trellion"]));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].verdict, Verdict::Ok);
+    }
+
+    #[test]
+    fn a_refusal_of_an_addon_that_is_not_switched_on_still_fails() {
+        let h = captured(json!({"rhaddon": WHY}));
+        let rows = gateway_addon_checks(Some(&h), &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].verdict, Verdict::Fail);
+    }
+
+    #[test]
+    fn no_refusal_field_is_a_warn_never_a_pass() {
+        let mut older = captured(json!({}));
+        older.as_object_mut().unwrap().remove("addons_refused");
+        for body in [None, Some(json!({"status": "healthy"})), Some(older)] {
+            let rows = gateway_addon_checks(body.as_ref(), &on(&["rhaddon"]));
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].verdict, Verdict::Warn, "{body:?}");
+            assert!(rows[0].detail.contains("older than this CLI"), "{}", rows[0].detail);
+        }
+    }
+
+    #[test]
+    fn an_enabled_addon_the_gateway_does_not_list_warns() {
+        let h = captured(json!({}));
+        let rows = gateway_addon_checks(Some(&h), &on(&["evolve"]));
+        assert_eq!(rows[0].verdict, Verdict::Warn);
+        assert!(rows[0].detail.starts_with("evolve: on in noomesh.yaml"), "{}", rows[0].detail);
+    }
+
+    #[test]
+    fn nothing_on_and_nothing_refused_is_no_row() {
+        assert!(gateway_addon_checks(Some(&captured(json!({}))), &[]).is_empty());
+        assert!(gateway_addon_checks(None, &[]).is_empty());
+    }
+}
+
 /// The seat rows whose WARN remedy is the only way out and must print in a
 /// `seat <name>` section: the layout moves (`seat-sync --migrate`, run on the
 /// seat under sudo) and the display. 0.6.10 printed the legacy-layout WARN
@@ -5416,8 +5806,8 @@ fn remedies_to_print<'a>(title: &str, checks: &'a [Check]) -> Vec<(&'a str, Vec<
 /// The `at_rest_dirs` rows. In the default output they print as one
 /// "data at rest" row that names only the ones that are not clean (the
 /// 0.6.12 roll printed nine near-identical rows).
-const AT_REST_DIR_ROWS: [&str; 9] = [
-    "loki at rest", "postgres at rest", "redis at rest", "nats at rest", "prometheus at rest",
+const AT_REST_DIR_ROWS: [&str; 10] = [
+    "loki at rest", "tempo at rest", "postgres at rest", "redis at rest", "nats at rest", "prometheus at rest",
     "grafana at rest", "noo-data at rest", "pki at rest", "age key at rest",
 ];
 
@@ -5833,7 +6223,19 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(embedding_spaces_check(spaces.as_ref()));
         // The gateway's own Redis connection (authenticated /health: the
         // anonymous body carries no dependency map).
-        checks.push(gateway_redis_check(get_json_opt(g, "/health", true, 10).as_ref()));
+        let health = health_body(g);
+        checks.push(gateway_bus_check(health.as_ref()));
+        checks.push(gateway_redis_check(health.as_ref()));
+        // The bearer every add-on call is signed with (followup 304).
+        checks.push(addon_caller_check(health.as_ref()));
+        // i353b: an add-on the gateway refused at startup. An unreadable
+        // noomesh.yaml is already a row of its own (`add-on pins`).
+        let enabled: Vec<String> = crate::commands::addons::declared_map_at(&crate::envfile::repo_root().join("noomesh.yaml"))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(n, on)| on.then_some(n))
+            .collect();
+        checks.extend(gateway_addon_checks(health.as_ref(), &enabled));
         {
             let root = crate::envfile::repo_root();
             let store = crate::commands::secrets::SecretStore::load_sops(&root.join("secrets/env.sops"));
@@ -5879,6 +6281,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let loki_cfg = std::fs::read_to_string(root.join("monitoring/loki/loki-config-tls.yml")).ok();
         let compose = std::fs::read_to_string(root.join("docker-compose.cluster.yml")).ok();
         checks.push(loki_listener_check(loki_cfg.as_deref(), compose.as_deref()));
+        // Request tracing (i359): Tempo is ready to the gateway, and its
+        // doors are mTLS-only with no published port.
+        checks.extend(tempo::rows(g));
         // The sandbox executor's door (mTLS doors phase 1): compose runs
         // its uvicorn with a required client certificate, and the gateway
         // container proves it live — no cert and plaintext refused, its own
@@ -7156,6 +7561,53 @@ mod tests {
 
         n["data_roots"]["running_mounts_resolved"] = serde_json::json!({"/opt/noo/hf-cache": "/mnt/d/noo/hf-cache"});
         assert_eq!(data_root_row(&n).verdict, Verdict::Fail);
+    }
+
+    /// i213: run where there is no controller PKI (no `nodes/` dir: an
+    /// operator's CLI on a worker box), the controller's copies are NOT
+    /// CHECKED HERE and the row says where to run it, a WARN, never a red that
+    /// blames the controller. With a `nodes/` dir that lacks this node's
+    /// leaf, the row stays red. A node-side fault still fails either way.
+    #[test]
+    fn the_backend_doors_row_off_the_controller_says_it_did_not_check() {
+        let now = 1_800_000_000;
+        let far = now + 80 * 86_400;
+        let mut n = healthy(now);
+        n["id"] = "host3".into();
+        n["running_backends"] = serde_json::json!({"vllm": "m"});
+        n["backend_runtimes"] = serde_json::json!({"vllm": "docker"});
+        n["backend_leaves"] = serde_json::json!({"vllm": {"dns": ["vllm", "noo-vllm"], "not_after": far}});
+        let root = std::env::temp_dir().join(format!("noo-i213-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // No nodes/ dir at all: not checked here, said, and where to run it.
+        let c = backend_doors_row_in(&n, &root, now);
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains(DOORS_NOT_CHECKED_HERE), "{}", c.detail);
+        assert!(c.detail.contains("run `noo cluster verify` on the controller"), "{}", c.detail);
+        assert!(!c.detail.contains("holds no"), "blamed the controller: {}", c.detail);
+
+        // A node-side fault is still a fault off the controller.
+        let mut bad = n.clone();
+        bad["backend_leaves"]["vllm"]["dns"] = serde_json::json!(["vllm"]);
+        let c = backend_doors_row_in(&bad, &root, now);
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("does not name noo-vllm") && c.detail.contains(DOORS_NOT_CHECKED_HERE), "{}", c.detail);
+
+        // An agent that predates the report: still a WARN, still says why.
+        let mut old = n.clone();
+        old.as_object_mut().unwrap().remove("backend_leaves");
+        let c = backend_doors_row_in(&old, &root, now);
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains(DOORS_NOT_CHECKED_HERE), "{}", c.detail);
+
+        // A controller PKI (nodes/ exists) without this node's leaf: red.
+        std::fs::create_dir_all(root.join("nodes")).unwrap();
+        let c = backend_doors_row_in(&n, &root, now);
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("the controller holds no vllm leaf for host3"), "{}", c.detail);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Every shape of the `backend doors` row, one plant at a time, on a
@@ -8829,6 +9281,31 @@ mod tests {
             && c.detail.contains("reg/acme/llamacpp:v2") && c.detail.contains("would be refused"), "{}", c.detail);
     }
 
+    /// `hardened images`: on a rail node an upstream ollama / llama.cpp image
+    /// FAILs naming the hardened ref; ours gets no row.
+    #[test]
+    fn hardened_images_row_names_the_replacement_for_an_upstream_image() {
+        assert_eq!(hardened_replacement("ollama/ollama:0.40.5@sha256:aa", "v0.6.15").as_deref(), Some("ghcr.io/noomesh/ollama:v0.6.15"));
+        assert_eq!(hardened_replacement("docker.io/ollama/ollama:0.40.5", "v1").as_deref(), Some("ghcr.io/noomesh/ollama:v1"));
+        assert_eq!(hardened_replacement("ghcr.io/ggml-org/llama.cpp:server", "v1").as_deref(), Some("ghcr.io/noomesh/llamacpp:v1"));
+        assert_eq!(hardened_replacement("ghcr.io/noomesh/ollama:v1", "v1"), None, "ours is already the hardened one");
+        assert_eq!(hardened_replacement("vllm/vllm-openai:v0.25.0", "v1"), None);
+        let n = serde_json::json!({"id": "robopi", "image_sources": [
+            {"image": "ghcr.io/noomesh/stunnel:v0.6.15", "source": "rail"},
+            {"image": "ollama/ollama:0.40.5", "source": "registry"},
+            {"image": "ghcr.io/ggml-org/llama.cpp:server", "source": "registry"}]});
+        let c = hardened_images_check(&n).expect("a row");
+        assert_eq!(c.verdict, Verdict::Fail, "drift is a FAIL, not a warning");
+        assert!(c.remedy.as_deref().unwrap_or("").contains("sync-images robopi -i ghcr.io/noomesh/ollama:v0.6.15"), "{:?}", c.remedy);
+        assert!(c.detail.contains("ollama/ollama:0.40.5 -> ghcr.io/noomesh/ollama:v0.6.15"), "{}", c.detail);
+        assert!(c.detail.contains("ghcr.io/ggml-org/llama.cpp:server -> ghcr.io/noomesh/llamacpp:v0.6.15"), "{}", c.detail);
+        // Nothing to replace, or an agent that reports nothing: no row.
+        let ours = serde_json::json!({"id": "x", "image_sources": [
+            {"image": "ghcr.io/noomesh/ollama:v0.6.15", "source": "rail"}]});
+        assert!(hardened_images_check(&ours).is_none());
+        assert!(hardened_images_check(&serde_json::json!({"id": "old"})).is_none(), "an agent that reports nothing gets no row");
+    }
+
     #[test]
     fn images_staged_row_names_an_unstaged_placement() {
         let n = serde_json::json!({"id": "host8-ma", "unstaged_images": ["reg/acme/llamacpp:v0.2.103"]});
@@ -9297,6 +9774,7 @@ mod tests {
         let rows = at_rest_dirs(&env);
         let path = |name: &str| rows.iter().find(|r| r.name == name).map(|r| r.path.clone()).unwrap_or_else(|| panic!("no row {name}"));
         assert_eq!(path("loki at rest"), "/media/alice/data/noo/loki");
+        assert_eq!(path("tempo at rest"), "/media/alice/data/noo/tempo");
         assert_eq!(path("postgres at rest"), "/media/alice/data/noo/postgres", "NOO_PG_DATA unset → under the data root, as compose defaults it");
         assert_eq!(path("redis at rest"), "/media/alice/data/noo/redis");
         assert_eq!(path("nats at rest"), "/media/alice/data/noo/nats");
@@ -9306,7 +9784,7 @@ mod tests {
         assert_eq!(path("pki at rest"), "/home/alice/.config/mesh/pki", "pki::pki_dir's default");
         assert_eq!(path("age key at rest"), "/home/alice/.config/sops/age");
         assert!(rows.iter().all(|r| r.name.ends_with(" at rest")), "one naming for the whole table");
-        assert_eq!(rows.len(), 9);
+        assert_eq!(rows.len(), 10);
 
         // NOO_STATE_ROOT moves exactly the state set; NOO_PG_DATA still wins
         // for postgres; the PKI / age rows are untouched by it.
@@ -9320,7 +9798,7 @@ mod tests {
         };
         let rows_s = at_rest_dirs(&env_s);
         let path_s = |name: &str| rows_s.iter().find(|r| r.name == name).unwrap().path.clone();
-        for (row, dir) in [("loki", "loki"), ("postgres", "postgres"), ("redis", "redis"), ("nats", "nats"), ("prometheus", "prometheus"), ("grafana", "grafana"), ("noo-data", "noo-data")] {
+        for (row, dir) in [("loki", "loki"), ("tempo", "tempo"), ("postgres", "postgres"), ("redis", "redis"), ("nats", "nats"), ("prometheus", "prometheus"), ("grafana", "grafana"), ("noo-data", "noo-data")] {
             assert_eq!(path_s(&format!("{row} at rest")), format!("/mnt/state/{dir}"), "{row} reads the state root");
         }
         assert_eq!(path_s("pki at rest"), "/home/alice/.config/mesh/pki");
@@ -10462,6 +10940,11 @@ mod harness_tasks_tests {
 mod gpu_contention_tests {
     use super::*;
 
+    /// The row with no clock (age is not asserted here).
+    fn gpu_contention_check(n: &Value) -> Option<Check> {
+        gpu_contention_check_at(n, 0)
+    }
+
     fn node(gc: Value) -> Value {
         serde_json::json!({"id": "host3", "gpu_contention": gc})
     }
@@ -10472,6 +10955,36 @@ mod gpu_contention_tests {
         assert_eq!(c.verdict, Verdict::Ok);
         assert_eq!(c.name, "gpu");
         assert_eq!(c.detail, "free");
+    }
+
+    #[test]
+    fn a_probe_failing_over_a_minute_warns_and_names_the_likely_cause() {
+        let c = gpu_contention_check(&node(serde_json::json!({
+            "state": "free", "method": "not-measured", "unmeasured": "probe-timeout",
+            "unmeasured_for_s": 150, "paused_backends": []}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("a Windows program is likely using the GPU"), "{}", c.detail);
+        assert!(c.detail.contains("nvidia-smi has not answered for"), "{}", c.detail);
+        // At or under a minute: today's row.
+        let short = gpu_contention_check(&node(serde_json::json!({
+            "state": "free", "method": "not-measured", "unmeasured": "probe-timeout",
+            "unmeasured_for_s": 60, "paused_backends": []}))).unwrap();
+        assert_eq!(short.detail, "nvidia-smi did not answer in time (GPU saturated or driver slow) — not measured");
+        // An old agent sends no duration: today's row, unchanged.
+        let old = gpu_contention_check(&node(serde_json::json!({
+            "state": "free", "method": "not-measured", "unmeasured": "probe-timeout", "paused_backends": []}))).unwrap();
+        assert_eq!(old.verdict, Verdict::Warn);
+        assert_eq!(old.detail, short.detail);
+    }
+
+    #[test]
+    fn yielded_on_a_probe_timeout_names_the_probe_not_foreign_memory() {
+        let c = gpu_contention_check(&node(serde_json::json!({
+            "state": "yielded", "method": "not-measured", "unmeasured": "probe-timeout",
+            "unmeasured_for_s": 90, "paused_backends": ["vllm"]}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("yielded: vllm paused (nvidia-smi not answering for"), "{}", c.detail);
+        assert!(!c.detail.contains("foreign"), "{}", c.detail);
     }
 
     #[test]
@@ -10502,26 +11015,48 @@ mod gpu_contention_tests {
         let c = gpu_contention_check(&node(serde_json::json!({
             "state": "held", "reason": "voice", "method": "nvidia-smi", "paused_backends": ["vllm"]}))).unwrap();
         assert_eq!(c.verdict, Verdict::Warn);
-        assert_eq!(c.detail, "held by operator (voice): vllm paused");
+        assert_eq!(c.detail, "mode held (manual): held by operator (voice): vllm paused");
         assert_eq!(c.remedy.as_deref(), Some("noo cluster gpu release host3   # when the other work is done"));
         // An owned lease (i163 D): the holder is named and the remedy quotes
         // the lease, so the operator's release is a compare-and-set.
         let c = gpu_contention_check(&node(serde_json::json!({
             "state": "held", "reason": "voice", "method": "nvidia-smi", "paused_backends": ["vllm"],
             "lease": {"owner": "rbwolf", "operation_id": "op-1", "generation": 4}}))).unwrap();
-        assert_eq!(c.detail, "held by rbwolf (voice): vllm paused");
+        assert_eq!(c.detail, "mode held (manual): held by rbwolf (voice): vllm paused");
         assert_eq!(c.remedy.as_deref(), Some("noo cluster gpu release host3 --operation op-1 --generation 4   # when the other work is done"));
         let c = gpu_contention_check(&node(serde_json::json!({
             "state": "draining", "method": "nvidia-smi", "paused_backends": [], "lease": {"owner": "rbwolf"}}))).unwrap();
         assert_eq!(c.verdict, Verdict::Warn);
-        assert!(c.detail.starts_with("hold by rbwolf draining"), "{}", c.detail);
+        assert!(c.detail.starts_with("mode switching: hold by rbwolf draining"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_user_hold_names_its_mode_its_age_and_what_still_uses_the_gpu() {
+        let held = |foreign: u64| node(serde_json::json!({
+            "state": "held", "reason": "user", "method": "memory-accounting", "paused_backends": ["vllm"], "foreign_mb": foreign,
+            "lease": {"owner": "rbwolf", "operation_id": "op-7", "generation": 4, "purpose": "user", "since": "2026-11-01T10:00:00Z"}}));
+        let since = parse_rfc3339_unix("2026-11-01T10:00:00Z").unwrap();
+        let c = gpu_contention_check_at(&held(3277), since + 7500).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.detail, "mode user: held by rbwolf (user): vllm paused, for 2 h 5 min, GPU in use 3.2 GB");
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster gpu mode host3 mesh   # when the other work is done"));
+        let clear = gpu_contention_check_at(&held(0), since + 90).unwrap();
+        assert_eq!(clear.detail, "mode user: held by rbwolf (user): vllm paused, for 1 min");
+        // No clock: no age, and the row still names the mode.
+        assert_eq!(gpu_contention_check(&held(0)).unwrap().detail, "mode user: held by rbwolf (user): vllm paused");
+        let reserved = node(serde_json::json!({
+            "state": "held", "method": "nvidia-smi", "paused_backends": ["vllm"],
+            "lease": {"owner": "rbwolf", "operation_id": "res-1", "generation": 6, "workload": "rhaddon/worker"}}));
+        let c = gpu_contention_check(&reserved).unwrap();
+        assert!(c.detail.starts_with("mode workload rhaddon/worker: held by rbwolf"), "{}", c.detail);
+        assert!(c.remedy.unwrap().starts_with("noo cluster gpu release host3 --operation res-1 --generation 6"));
     }
 
     #[test]
     fn held_with_nothing_paused_says_so_and_the_remedy_prints_in_a_node_section() {
         let c = gpu_contention_check(&node(serde_json::json!({
             "state": "held", "method": "nvidia-smi", "paused_backends": []}))).unwrap();
-        assert_eq!(c.detail, "held by operator: no GPU backend paused");
+        assert_eq!(c.detail, "mode held (manual): held by operator: no GPU backend paused");
         let checks = vec![c];
         let r = remedies_to_print("host3", &checks);
         assert_eq!(r.len(), 1, "the gpu warn prints its remedy in a node section");
@@ -10653,7 +11188,7 @@ mod digest_tests {
 
     const PLAIN: &str = "plaintext, in the clear on that disk";
 
-    /// A realistic controller section: lots of passes, nine at-rest rows (one
+    /// A realistic controller section: lots of passes, every at-rest row (one
     /// of them a warning), a failing sandbox row and a warning.
     fn controller() -> Vec<Check> {
         let mut v: Vec<Check> = ["posture", "service keys", "pki key modes", "postgres tls", "gateway redis", "nats bus"]
@@ -10674,14 +11209,18 @@ mod digest_tests {
     fn many_passes_and_one_fail_digest_to_the_counts_and_the_problem_rows() {
         let checks = controller();
         let d = digest(&checks, false);
-        assert_eq!(d.counts, Counts { ok: 14, warn: 2, fail: 1, accepted: 0 });
+        // Six named passes and every at-rest row but postgres's warning:
+        // counted from the table, so a new at-rest row (tempo, i359) does not
+        // break it.
+        let passes = 6 + AT_REST_DIR_ROWS.len() - 1;
+        assert_eq!(d.counts, Counts { ok: passes, warn: 2, fail: 1, accepted: 0 });
         assert!(d.rows.iter().all(|c| c.verdict != Verdict::Ok), "a passing row reached the digest: {:?}", d.rows);
         let names: Vec<&str> = d.rows.iter().map(|c| c.name).collect();
         assert_eq!(names, vec!["data at rest", "sandbox", "backup age"]);
         // The remedy still prints, from the full list of checks.
         assert_eq!(remedies_to_print("controller", &checks)[0].0, "noo sandbox doctor");
         let line = summary_line("controller", &d.counts);
-        assert!(line.contains("controller") && line.contains("14") && line.contains('1'), "{line}");
+        assert!(line.contains("controller") && line.contains(&passes.to_string()) && line.contains('1'), "{line}");
     }
 
     #[test]

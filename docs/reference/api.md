@@ -123,6 +123,16 @@ logout, as the CLI makes, counts too) and ends the access token it was using,
 `GET /auth/me` returns the caller's identity and scopes (`401` for a disabled
 or deleted account, or a token issued before the account's session floor).
 
+**Browser origin.** `POST /auth/token`, `/auth/refresh` and `/auth/logout`
+(and their `/api/auth/…` aliases) answer a browser only from the console's own
+origin: a request whose `Sec-Fetch-Site` is not `same-origin` (or `none`), or,
+without that header, whose `Origin` is not the request's own host and port, is
+`403 {"code": "cross_origin_session_request"}` and sets or clears no cookie.
+Cookies ignore ports, so without this a page on another port of the same host
+(an add-on's UI) could sign the console out, rotate its session or plant one.
+A caller that sends neither header (the CLI, a script) is unaffected. Refresh
+and logout log `origin` and `sec_fetch_site`.
+
 **Ending sessions.** `disable`, `set-role`, `set-scopes`, `set-password`,
 `service-key revoke-and-disable` and an approved `disable`/`scopes` proposal
 end the account's sessions immediately: every refresh token is revoked, open
@@ -215,7 +225,8 @@ served model name; it is never a node. A class is an ordered list of
 class set`), or — with nothing declared — one derived class per served
 model. Undeclared, `chat-default` (aliases `default`, `auto`, and an
 absent `model`) is **dynamic**: every live chat node in the mesh, whatever
-it serves, ranked per request (healthy, not stalled in the last 5 min, not
+it serves, ranked per request (healthy, including the node not reporting
+the backend as not serving; not stalled in the last 5 min; not
 thermally hot, GPU not shared, vLLM/GPU before CPU, larger model, fewest
 in flight, load; quarantined and thermal-`critical` nodes only when
 nothing else is left). A declared `chat-default` puts its candidates first.
@@ -408,6 +419,8 @@ receives flat JSON events, each with a `type`:
 ```json
 {"type": "metadata", "conversation_id": "…", "model": "…", "backend": "…"}
 {"type": "harness_dispatched", "node": "…", "kind": "…"}
+{"type": "phase", "phase": "routed", "node": "…", "backend": "…", "model": "…", "slots_busy": 2, "slots_total": 2, "queued_ahead": 1, "attempt": 1, "via": "gateway", "at_ms": 0}
+{"type": "phase", "phase": "prompt", "input_tokens": 1834, "at_ms": 0}
 {"type": "thinking", "text": "…"}
 {"type": "working", "text": "…"}
 {"type": "content", "text": "token"}
@@ -418,6 +431,17 @@ receives flat JSON events, each with a `type`:
 {"type": "done", "iterations": 3, "tool_calls": 2, "elapsed_seconds": 15.2}
 {"type": "keepalive"}
 ```
+
+`phase` says what a turn is doing before its first token, for the
+console's status line. `routed` names the node a model call went to and
+that backend's slots (null when its agent reports none). It is sent
+before each call, again with `queued_ahead` when the node agent says the
+request is waiting for a slot, and once by the gateway when a node
+harness takes the turn (`via: "harness"`). On a failover within one
+call it carries `attempt` 2 and up, with `previous_node` and
+`previous_reason`. `prompt` means the backend began answering, with the
+loop's estimate of the tokens sent. `at_ms` is the gateway's clock and
+is meant for logs; a client times phases from receipt.
 
 `working` comes only from a turn a node harness runs on a vendor kind
 (Copilot, Claude Code, Codex): the model's text as the harness's translator
@@ -445,6 +469,7 @@ capped at 200 000 characters a turn. It is not the answer, which arrives as
 | POST | `/api/cluster/suggest-placement` | hardware-fit recommendation |
 | POST | `/api/cluster/discover`, `/propose` (`proposed_by` is the authenticated caller; a body field of that name is ignored), `/proposals` (the list), `/proposals/decide`; GET `/proposals/{id}` | node discovery and the propose/approve enrollment flow (`enroll_now` and `proposals/{id}/retry` were removed; re-enroll with a new bootstrap token) |
 | POST | `/api/cluster/nodes/{node_id}/logs` | a node pushes its log batch (Loki push shape, optional gzip); node credential only, `{node_id}` must be the caller; `node` label overwritten with the verified id. `204` accepted, `400`/`413` drop the batch, `429` + `Retry-After` over the per-node budget (`NOO_LOGS_INGEST_BYTES_PER_MIN`, `NOO_LOGS_INGEST_REQUESTS_PER_MIN`), `503` Loki unavailable |
+| POST | `/api/cluster/nodes/{node_id}/traces` | a node sends the spans of the requests its inference proxy served (OTLP/HTTP JSON, ≤ 1 MiB, ≤ 2000 spans); node credential only, `{node_id}` must be the caller, no user or operator token. Each span must continue a trace (`parentSpanId`) and end within 10 minutes of arrival (start ≤ end, ≤ 1 h long); the resource is replaced with `service.name=noo-node-agent`, `noo.node=<verified id>`; only the attribute keys `noo.backend`, `http.response.status_code` and `noo.agent.*` are kept (no identity key such as `enduser.id`); events, links and other attributes are dropped and counted. `204` relayed to Tempo, `400`/`413` drop, `429` + `Retry-After` over 120 pushes or 8 MiB a minute per node, `503` Tempo unavailable. `noo_traces_ingest_refused_total{node,reason}`, `noo_traces_ingest_dropped_spans_total{node}`, `noo_traces_ingest_dropped_attrs_total{node}` |
 | POST | `/api/cluster/mint-join-key`, `/api/cluster/delete-tailscale-device` | tailnet join keys, device removal |
 | GET | `/api/cluster/replication-status` | Postgres replication view |
 | GET, POST | `/api/security/bootstrap-tokens`; POST `…/{id}/revoke` | bootstrap tokens for `noo enroll` |
@@ -775,6 +800,8 @@ on the gateway's own). Broadcast is refused; a thread needs a seat.
 | POST | `/api/security/users/{username}/erase` | right to be forgotten. Body `{dry_run?: bool (default **true**), keep_account?: bool}`: a bare call only previews the per-store row counts and the knowledge-base plan (personal documents go, shared ones are scrubbed). `dry_run: false` snapshots every matched row into the erasure archive and deletes it all in one transaction, removes the user's upload files (when nobody else uploaded the same bytes) and audits it (`user_erase`); `keep_account` wipes the data but keeps the login. Refused: a target above the caller's tier (`403`, also on the dry run), the configured operator account (`NOO_ADMIN_USER`/`NOO_OPERATOR_USER`, `400`), the last admin (unless `keep_account`). **`409` + `Retry-After`** while the account has a write-side [operation](#asynchronous-operations-routesopsrs) live or within its worker window; that refusal marks the account erase-pending, after which every new operation start for it is `423` (see *Erasing an account*). A refused erase is audited (`user_erase_refused`) |
 | GET | `/api/security/erasure-archive` | what the erase archive holds: row and run counts, the age of the oldest copy, the 30-day retention window (`retention_days`), and whether the daily purge is running (Operator+; an authenticated caller below Operator gets `403`, no credential `401`) |
 | GET, POST | `/api/security/users/{username}/links`; POST `/api/security/channel-links/unlink` | channel identity links |
+| GET | `/api/security/users/{username}/addon-access` | every feature every add-on declares, `allowed` for that account and `decided_by` (the setting that gave it: `super admin`, `user:<u>`, `team:<t>`, `role:<tier>` or `nothing set`). Operator or above |
+| PUT | `/api/security/users/{username}/super-admin` | body `{on, reason, password}`: name or remove a super admin (holds every add-on feature; alone changes add-on settings that cover an admin). A super admin only, re-entering their own password; refused for an agent or door token (`403`), for a target that is not an enabled admin (`400`), and for the last super admin (`409`). Audited (`super_admin_set`) |
 | POST, GET | `/api/security/users/propose`, `/api/security/user-proposals`, `…/{id}`; POST `…/{id}/decide` | User files, Operator decides |
 | GET, POST | `/api/security/teams`; DELETE `…/{team}`; GET, POST `…/{team}/spaces`; POST `/api/security/channel-team-links/unlink`; GET, POST `/api/security/orgs` | teams, orgs, space links |
 | GET, POST | `/api/security/kb-rules`; GET `/api/security/role-grants` | knowledge-base access rules and grants |
@@ -797,6 +824,7 @@ on the gateway's own). Broadcast is refused; a thread needs a seat.
 | PUT / DELETE | `/api/mcp/servers/{id}/placements/{node}` | which registered node hosts or dials it (`noo mcp place/unplace`) |
 | POST | `/api/cluster/nodes/{node}/mcp/{id}/tools` | node rail: the hosting node's discovery report (catalog replaced whole) |
 | GET | `/api/logs/status`, `/query`, `/containers`, `/docker-stats`, `/node/{node_id}/{container}`; POST `/api/logs/tail`, `/api/logs/errors`, `/api/logs/search` | logs: `search` is Loki-only (the gateway builds the LogQL); `tail`/`errors` are Loki-backed with a node-agent scan fallback and say `backend`; every route Operator/Admin only |
+| GET | `/api/traces/status`, `/api/traces/requests`, `/api/traces/summary` | request traces (i359): Tempo's readiness to the gateway; recent requests from `noo_request_trace` (filters `hours` ≤ 720, `route`, `model`, `node`, `actor`, `min_status`, `min_ms`, `limit` ≤ 1000); the window grouped `by` route, model, node, backend or actor with p50/p95/max ms, errors and tokens. Metadata only. Every route Operator/Admin only (`TRACES_READ_PREFIX`); the MCP tools `noo_traces_requests` and `noo_traces_summary` are on the operator door only |
 | GET | `/api/cache/stats` | Redis cache stats |
 | GET, POST | `/api/db/migrations`, `/api/db/migrations/apply` | the mesh migration runner (`noo db`) |
 | POST | `/api/cleanup/heartbeat-runs/restore` | undo one `heartbeat_retention` prune (the prune is that heartbeat task, run on demand via `/api/heartbeat/tasks/{task_id}/run`) |
@@ -805,6 +833,7 @@ on the gateway's own). Broadcast is refused; a thread needs a seat.
 | GET | `/api/metrics/query`, `/api/metrics/range`, `/api/metrics/discover`, `/api/alerts/list` | Prometheus passthrough: instant query, range query (11,000-point and 100-series caps), metric/label discovery, and alert rules merged with Alertmanager state (Operator+, read-only) |
 | POST | `/api/monitoring/grafana-session` | open Grafana as yourself: mints a short-lived Grafana login token for the caller's live account (any tier; a disabled account is refused) |
 | GET, POST | `/api/grafana-ds/prometheus/{*path}`, `/api/grafana-ds/loki/{*path}` | Grafana's data sources through the gateway, the viewer's tier enforced per query; Grafana's service leaf only, no bearer opens them |
+| GET, PUT | `/api/addons/{addon}/access` | add-on access (noomesh-internal f99). GET (operator or above): the add-on's declared `features`, every `settings` row, `stale_features` (settings for a feature no longer declared: they open nothing) and `super_admins`; `legacy: true` for a manifest without features. PUT (admin): `{feature, subject, value: on\|off\|inherit, reason?}` with `subject` one of `role:<user\|operator\|admin>`, `team:<name>`, `user:<account>`, `key:<consumer>`; the most specific setting wins (account or key, then team with off winning, then role from the person's tier down). Refused `403`: a setting that covers an admin unless the caller is a super admin, `off` for one without a `reason`, `on` below operator for a feature with a write route the add-on did not declare `owner_scoped`. Audited (`addon_access_set`, from and to) |
 | GET | `/api/addons/{addon_id}/cli-piece`, `/console-piece` | an add-on's own `noo` commands / console diagram slots, validated by the gateway. `404` unknown add-on or no piece, `503` add-on disabled or unlicensed, `502` no answer or an invalid piece |
 | GET | `/api/mcp/status`, `/api/cloud-providers/status`, `/api/coordinator/context`, `/api/capability-router/status` | status views |
 | POST, GET | `/upload`, `/upload/{file_id}` | file upload for ingest and chat |

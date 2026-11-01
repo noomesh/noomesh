@@ -2377,7 +2377,7 @@ mod tests {
             scopes: vec!["read".into(), "write".into(), "admin".into()],
             role,
             harness: harness.map(String::from),
-            act: act.then(|| crate::auth::Actor { sub: "svc:worker".into(), iss_user: None, task: Some("t1".into()) }),
+            act: act.then(|| crate::auth::Actor { sub: "svc:worker".into(), iss_user: None, task: Some("t1".into()), feature: None }),
         }))
     }
 
@@ -2898,7 +2898,7 @@ mod tests {
             scopes: vec!["read".into(), "write".into()],
             role: Role::User,
             harness: harness.map(String::from),
-            act: act.then(|| crate::auth::Actor { sub: "svc:worker".into(), iss_user: None, task: Some("t1".into()) }),
+            act: act.then(|| crate::auth::Actor { sub: "svc:worker".into(), iss_user: None, task: Some("t1".into()), feature: None }),
         };
         for c in [
             ctx("alice", Some("worker:t1"), false),

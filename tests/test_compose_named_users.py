@@ -76,7 +76,7 @@ def test_redis_and_grafana_run_as_the_images_name_for_their_reader_uid() -> None
     for svc, (image, user, uid) in NAMED_USERS.items():
         spec = services[svc]
         assert spec.get("user") == user, f"{svc}: user {spec.get('user')!r}, want {user!r}"
-        assert re.sub(r"\$\{NOO_IMAGE_DIGEST_[A-Z_]+:-\}$", "", spec["image"]).endswith(f"/{image}"), (
+        assert re.sub(r"\$\{NOO_IMAGE_DIGEST_[A-Z_]+:-(?:@sha256:[0-9a-f]{64})?\}$", "", spec["image"]).endswith(f"/{image}"), (
             f"{svc} image is {spec['image']}: re-measure the passwd name for uid {uid} before changing NAMED_USERS")
         # The name's uid is the uid the secrets (and keys, data) are handed to.
         assert str(uid) == OWNED_UIDS[svc], (svc, uid, OWNED_UIDS[svc])

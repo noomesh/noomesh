@@ -354,7 +354,7 @@ kb:
 #    VLLM_IMAGE WHATSAPP_PHONE_ID
 #
 #    Deliberately env-only FOREVER (not phase 3): the
-#    TLS/mTLS family (NOO_NATS_TLS NOO_REDIS_TLS NOO_PG_SSLMODE
+#    TLS/mTLS family (NOO_NATS_TLS NOO_PG_SSLMODE
 #    NOO_PG_SSLROOTCERT NOO_PG_TLS_REQUIRED NOO_MTLS_GATEWAY) — these
 #    are security-posture switches written to .env at boot by the DB
 #    posture and must not be weakenable from a YAML edit.

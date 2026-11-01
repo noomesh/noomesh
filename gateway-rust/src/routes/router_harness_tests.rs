@@ -354,6 +354,47 @@ impl Client {
         self.send(method, path, None, Some(actor)).await
     }
 
+    /// A POST with a real JSON body (the sweep's `{}` would be refused by a
+    /// handler's own extractor before the contract under test is reached).
+    async fn post_json(&self, path: &str, bearer: &str, body: &Value) -> Reply {
+        let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let resp = self
+            .http
+            .post(format!("{}{}", self.base, path))
+            .json(body)
+            .header("x-forwarded-for", format!("198.51.{}.{}", (n / 250) % 250, n % 250 + 1))
+            .bearer_auth(bearer)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("POST {path}: {e}"));
+        let status = resp.status().as_u16();
+        let retry_after = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).map(str::to_string);
+        let text = resp.text().await.unwrap_or_default();
+        let body = serde_json::from_str(&text).unwrap_or(Value::Null);
+        Reply { status, retry_after, body, text }
+    }
+
+    /// A POST with chosen headers and no credential: the session endpoints'
+    /// origin rule (2026-11-01), which reads only the request's own headers.
+    async fn post_with_headers(&self, path: &str, headers: &[(&str, &str)]) -> (Reply, Vec<String>) {
+        let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut req = self
+            .http
+            .post(format!("{}{}", self.base, path))
+            .header("x-forwarded-for", format!("198.51.{}.{}", (n / 250) % 250, n % 250 + 1));
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let resp = req.send().await.unwrap_or_else(|e| panic!("POST {path}: {e}"));
+        let status = resp.status().as_u16();
+        let cookies: Vec<String> =
+            resp.headers().get_all("set-cookie").iter().filter_map(|v| v.to_str().ok()).map(str::to_string).collect();
+        let retry_after = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).map(str::to_string);
+        let text = resp.text().await.unwrap_or_default();
+        let body = serde_json::from_str(&text).unwrap_or(Value::Null);
+        (Reply { status, retry_after, body, text }, cookies)
+    }
+
     async fn send(&self, method: &str, path: &str, bearer: Option<&str>, node_actor: Option<&str>) -> Reply {
         let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let url = format!("{}{}", self.base, path);
@@ -549,6 +590,59 @@ async fn assert_redis_reconnecting(c: &Client, admin: &str) -> Vec<String> {
     failures
 }
 
+/// Contract 4 (i301 a.3). The harness runs with NATS DOWN: the gateway
+/// serves, `/health` says degraded with the bus `reconnecting`, and a bus
+/// route answers 503 `bus_unavailable` with `Retry-After` at once.
+async fn assert_bus_down(c: &Client, admin: &str) -> Vec<String> {
+    let mut failures = Vec::new();
+    let h = c.call("GET", "/health", Some(admin)).await;
+    if h.status != 503 || h.body["status"] != "degraded" {
+        failures.push(format!("/health: want 503 degraded with no bus, got {} {:?}", h.status, h.body["status"]));
+    }
+    if h.body["dependencies"]["nats"]["healthy"] != false || h.body["dependencies"]["nats"]["state"] != "reconnecting" {
+        failures.push(format!("/health: dependencies.nats should be unhealthy/reconnecting, got {}", h.body["dependencies"]["nats"]));
+    }
+    let t = std::time::Instant::now();
+    let r = c.post_json("/api/agents/messages", admin, &json!({"to": "harness-peer", "text": "ping"})).await;
+    if r.status != 503 || r.body["error"] != crate::routes::BUS_UNAVAILABLE {
+        failures.push(format!("POST /api/agents/messages: want 503 bus_unavailable, got {} — {:?}", r.status, r.text));
+    }
+    if r.retry_after.as_deref().and_then(|v| v.parse::<u64>().ok()).is_none() {
+        failures.push(format!("POST /api/agents/messages: 503 without a numeric Retry-After ({:?})", r.retry_after));
+    }
+    if t.elapsed() > std::time::Duration::from_secs(3) {
+        failures.push(format!("POST /api/agents/messages: the refusal took {:?}; it must not wait on the bus", t.elapsed()));
+    }
+    eprintln!("router_harness: bus_unavailable — /health and the agent send route checked");
+    failures
+}
+
+/// Contract 5 (2026-11-01). The console's session endpoints answer a browser
+/// only from the console's own origin: a page on another port of this host
+/// (an add-on UI) cannot log the console out or rotate its refresh; the
+/// console's own page and a non-browser caller work as before.
+async fn assert_session_origin(c: &Client) -> Vec<String> {
+    let mut failures = Vec::new();
+    let addon_page = [("origin", "https://127.0.0.1:8443"), ("sec-fetch-site", "same-site")];
+    for path in ["/api/auth/logout", "/api/auth/refresh", "/auth/token"] {
+        let (r, cookies) = c.post_with_headers(path, &addon_page).await;
+        if r.status != 403 || r.body["code"] != "cross_origin_session_request" {
+            failures.push(format!("{path} from an add-on origin: want 403 cross_origin_session_request, got {} {:?}", r.status, r.text));
+        }
+        if !cookies.is_empty() {
+            failures.push(format!("{path} from an add-on origin set a cookie: {cookies:?}"));
+        }
+    }
+    for (label, headers) in [("same-origin page", vec![("sec-fetch-site", "same-origin")]), ("no browser headers", vec![])] {
+        let (r, cookies) = c.post_with_headers("/api/auth/logout", &headers).await;
+        if r.status != 200 || !cookies.iter().any(|c| c.starts_with("noo_refresh=") && c.contains("Max-Age=0")) {
+            failures.push(format!("/api/auth/logout from a {label}: want 200 clearing noo_refresh, got {} {cookies:?}", r.status));
+        }
+    }
+    eprintln!("router_harness: session origin — logout, refresh and login checked");
+    failures
+}
+
 /// Contract 3. Status routes answer 200, with the unmeasurable fields null and
 /// a `<field>_detail` sentence, never a literal 0 / false / [].
 async fn assert_measured(c: &Client, admin: &str) -> Vec<String> {
@@ -659,6 +753,8 @@ async fn the_real_router_holds_authz_redis_and_measured_contracts() {
         failures.extend(assert_redis_reconnecting(&c, &admin).await);
         failures.extend(assert_measured(&c, &admin).await);
         failures.extend(assert_i241_rows(&c, &operator, &admin).await);
+        failures.extend(assert_bus_down(&c, &admin).await);
+        failures.extend(assert_session_origin(&c).await);
     }
 
     server.abort();

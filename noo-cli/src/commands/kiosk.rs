@@ -386,6 +386,11 @@ pub(crate) fn render_kiosk_service_in(user: &str, mode: Mode, vt: u8, bin: &str)
          ExecStart={bin}/noo-kiosk-launch\n\
          Restart=always\n\
          RestartSec=5\n\
+         # /run/kiosk holds the CDP broker's control socket. systemd makes it\n\
+         # for {user} and removes it with the session; 0755 because the\n\
+         # broker checks each caller itself (SO_PEERCRED).\n\
+         RuntimeDirectory=kiosk\n\
+         RuntimeDirectoryMode=0755\n\
          PAMName=login\n\
          TTYPath=/dev/tty{vt}\n\
          TTYReset=yes\n\
@@ -1148,7 +1153,7 @@ pub fn kiosk_reload(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             g.json,
             ExitCode::Generic,
             "cdp",
-            "the browser is not answering on the debug port, so there is nothing to reload",
+            "the browser is not answering (its broker has published nothing recently), so there is nothing to reload",
             Some("noo kiosk status"),
         );
     }
@@ -1158,8 +1163,11 @@ pub fn kiosk_reload(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if !g.json {
         ui::step("reloading the display");
     }
+    // The broker takes reloads from root, the display user and the seat
+    // user only (SO_PEERCRED), so "refused" above is a who, not a fault.
     if let Err(e) = sh("noo-kiosk-cdp reload") {
-        fail(g.json, ExitCode::Generic, "cdp", &e, Some("journalctl -u kiosk.service -n 50"));
+        fail(g.json, ExitCode::Generic, "cdp", &e,
+            Some("a refusal names the uid: reload as root, the display user or the seat user; anything else is in journalctl -u kiosk.service -n 50"));
     }
 
     // The page needs a moment to come back before it can state anything.
@@ -1282,8 +1290,10 @@ pub fn kiosk_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             "seat",
             ui::muted("not installed on this box (no kiosk.service unit, no published state, no proxy, no browser)").to_string(),
         )]));
+        super::kiosk_seat::print_seats_if_any(g);
         ui::guide(&[
             ("noo kiosk setup", "install the seat ON the display box; a controller has no seat of its own"),
+            ("noo kiosk seats", "on the controller: every enrolled display, one row each"),
             ("noo kiosk seat-token <name>", "on the controller: mint the paste a new display enrolls with"),
         ]);
         return Ok(0);
@@ -1383,7 +1393,7 @@ pub fn kiosk_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             ui::bad(&format!("{proxy} — the browser has nothing to talk to"))
         }),
         ("watchdog timer", ui::state(&timer)),
-        ("browser (CDP :9222)", if cdp { ui::good("answering") } else { ui::bad("not answering") }),
+        ("browser (CDP pipe)", if cdp { ui::good("answering") } else { ui::bad("not answering") }),
         ("mint path", mint_path_row(via.as_deref())),
         ("last mint", match minted_at {
             Some(m) if m <= now => format!("{}s ago", now - m),
@@ -1663,6 +1673,104 @@ pub(crate) fn labels_line(s: &LabelsState) -> String {
 /// or Admin only, recorded with who and when, and applied on the display's
 /// next graph fetch with no gateway restart. The display's own credential
 /// can never reach it. While it is on, the page says `LABELS ON`.
+/// `quality=` on the display page: `lean`, `full`, or `auto` (the page
+/// measures its own frames: the env value empty).
+pub(crate) fn quality_value(word: &str) -> Result<&'static str, String> {
+    match word {
+        "lean" => Ok("lean"),
+        "full" => Ok("full"),
+        "auto" => Ok(""),
+        other => Err(format!("quality must be lean, full or auto, not {other}")),
+    }
+}
+
+/// `env` (the seat's /etc/default/kiosk) with `NOO_KIOSK_QUALITY` set to
+/// `quality` and every other line byte for byte as it was; the key is
+/// appended when an older setup did not write it.
+pub(crate) fn with_quality(env: &str, quality: &str) -> String {
+    let line = format!("NOO_KIOSK_QUALITY={quality}");
+    let mut found = false;
+    let mut out: Vec<String> = env
+        .lines()
+        .map(|l| {
+            if l.starts_with("NOO_KIOSK_QUALITY=") {
+                found = true;
+                line.clone()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    if !found {
+        out.push(line);
+    }
+    out.join("\n") + "\n"
+}
+
+/// `noo kiosk set quality lean|full|auto [--dry-run]`: change the display's
+/// drawing quality and nothing else (i65 2b). `noo kiosk setup --quality`
+/// rewrites the whole seat and needs --mode, --url and --view again, so a
+/// quality fix could change the URL or view by a typo. This edits one line of
+/// /etc/default/kiosk, keeps its mode and group, and restarts the display.
+pub fn kiosk_set(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let usage = "noo kiosk set quality lean|full|auto [--dry-run]";
+    let (word, dry_run) = match args {
+        [k, v] if k == "quality" => (v.as_str(), false),
+        [k, v, d] if k == "quality" && d == "--dry-run" => (v.as_str(), true),
+        _ => fail(g.json, ExitCode::Usage, "usage", &format!("usage: {usage}"), Some("noo kiosk set quality lean")),
+    };
+    let quality = match quality_value(word) {
+        Ok(q) => q,
+        Err(e) => fail(g.json, ExitCode::Usage, "usage", &e, Some("noo kiosk set quality lean")),
+    };
+    let Some(current) = sh_out(&format!("sudo cat {ENV_FILE}")) else {
+        fail(
+            g.json,
+            ExitCode::Generic,
+            "no_setup",
+            &format!("could not read {ENV_FILE}: this display is not set up (or sudo was refused)"),
+            Some("noo kiosk setup --mode dedicated --url https://<controller>.<tailnet>.ts.net"),
+        );
+    };
+    let next = with_quality(&current, quality);
+    let shown = if quality.is_empty() { "auto" } else { quality };
+    if env_line_value(&current, "NOO_KIOSK_QUALITY").as_deref() == Some(quality) {
+        if !g.json {
+            ui::done(&format!("quality is already {shown}; nothing changed"));
+        } else {
+            println!("{}", json!({"quality": shown, "changed": false}));
+        }
+        return Ok(0);
+    }
+    if dry_run {
+        if g.json {
+            println!("{}", json!({"quality": shown, "changed": false, "dry_run": true}));
+        } else {
+            println!("{}", ui::status_line(ui::Glyph::Warn, &format!("dry run: would set NOO_KIOSK_QUALITY={quality} in {ENV_FILE} and restart kiosk.service; nothing else changes")));
+        }
+        return Ok(0);
+    }
+    let user = env_line_value(&current, "NOO_KIOSK_USER").filter(|u| !u.is_empty()).unwrap_or_else(|| "kiosk".into());
+    if let Err(e) = install_text(&next, ENV_FILE, "0640", &format!("root -g {user}")) {
+        fail(g.json, ExitCode::Generic, "write", &e, Some("noo kiosk status"));
+    }
+    if let Err(e) = sh("sudo systemctl restart kiosk.service") {
+        fail(g.json, ExitCode::Generic, "systemctl", &e, Some("journalctl -u kiosk.service -n 50"));
+    }
+    if g.json {
+        println!("{}", json!({"quality": shown, "changed": true}));
+    } else {
+        ui::done(&format!("quality {shown}; the display restarted with it (the rest of the setup is unchanged)"));
+    }
+    Ok(0)
+}
+
+/// The value of `KEY=` in an env file's text, as written.
+fn env_line_value(env: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    env.lines().find_map(|l| l.strip_prefix(&prefix)).map(str::to_string)
+}
+
 pub fn kiosk_labels(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let want = match args {
         [a] if a == "on" => Some(true),
@@ -2704,6 +2812,31 @@ mod tests {
         }
     }
 
+    /// i65 2b: `noo kiosk set quality` changes the one line and keeps
+    /// every other byte of the seat's env file; an older file without the
+    /// key gets it appended; `auto` is the empty value the page reads as
+    /// "decide for yourself"; anything else is refused.
+    #[test]
+    fn set_quality_changes_one_line_and_keeps_the_rest() {
+        let a = SetupArgs {
+            url: "https://c.tail.ts.net".into(), user: "kiosk".into(), view: "graph".into(), rotate: Some(30), poll: None,
+            quality: Some("full".into()), dry_run: false, yes: false, browser: None, mode: Mode::Dedicated, vt: DEDICATED_VT,
+        };
+        let env = render_env(&a);
+        let lean = with_quality(&env, "lean");
+        let diff: Vec<(&str, &str)> = env.lines().zip(lean.lines()).filter(|(x, y)| x != y).collect();
+        assert_eq!(diff, vec![("NOO_KIOSK_QUALITY=full", "NOO_KIOSK_QUALITY=lean")]);
+        assert_eq!(env.lines().count(), lean.lines().count());
+        assert!(lean.contains("NOO_KIOSK_URL=https://c.tail.ts.net\n") && lean.contains("NOO_KIOSK_VIEW=graph\n"));
+        assert!(with_quality(&env, "").contains("\nNOO_KIOSK_QUALITY=\n"), "auto is the empty value");
+        let old = "NOO_KIOSK_URL=https://x\nNOO_KIOSK_VIEW=health\n";
+        assert_eq!(with_quality(old, "lean"), "NOO_KIOSK_URL=https://x\nNOO_KIOSK_VIEW=health\nNOO_KIOSK_QUALITY=lean\n");
+        assert_eq!(quality_value("auto"), Ok(""));
+        assert_eq!(quality_value("lean"), Ok("lean"));
+        assert!(quality_value("medium").unwrap_err().contains("lean, full or auto"));
+        assert_eq!(env_line_value(&env, "NOO_KIOSK_USER").as_deref(), Some("kiosk"));
+    }
+
     #[test]
     fn setup_parses_the_full_shape() {
         let a = parse_setup(&argv(&["--mode", "dedicated", "--url", "https://c.tail.ts.net/", "--view", "graph", "--rotate", "30", "--poll", "10", "--dry-run"])).unwrap();
@@ -2926,7 +3059,7 @@ mod tests {
             !LAUNCH.contains("noo-kiosk-cdp mint"),
             "the launcher mints; the proxy that USES the token should, or expiry is tracked twice"
         );
-        assert!(LAUNCH.contains("--remote-debugging-port=\"$CDP_PORT\""));
+        assert!(LAUNCH.contains("--remote-debugging-pipe"));
         assert!(LAUNCH.contains("kiosk.html?view="));
         // The mint itself is unchanged and still keyless — it just moved.
         assert!(CDP.contains("__nooKioskHeartbeat"));
@@ -2937,33 +3070,43 @@ mod tests {
         );
     }
 
-    /// The debugging port is a full control surface — it reads the token
-    /// out of localStorage and drives the browser. Loopback is the ONLY
-    /// thing bounding it (TCP has no file permissions, so any local user
-    /// qualifies), which makes widening it a silent catastrophe rather
-    /// than a visible one: everything keeps working.
+    /// The browser has NO debugging port (followup 188). A port on loopback
+    /// was a full control surface for any local user: TCP has no file
+    /// modes, so "loopback only" bounded nothing on a shared box. CDP is a
+    /// pipe now, held by the broker that starts the browser.
     ///
     /// Asserted on the flags rather than on behaviour because this cannot
     /// be exercised without a browser, and a test that quietly skips is
-    /// worse than one that reads the launcher.
+    /// worse than one that reads the launcher. The broker itself is
+    /// exercised in tests/test_kiosk_cdp_broker.py.
     #[test]
-    fn the_debugging_port_never_leaves_loopback() {
-        // Stated, not defaulted: Chrome's default is loopback today, and a
-        // default is not a guarantee.
-        assert!(
-            LAUNCH.contains("--remote-debugging-address=127.0.0.1"),
-            "the launcher relies on Chrome's default bind address instead of stating it"
-        );
-        for bad in ["--remote-debugging-address=0.0.0.0", "--remote-debugging-address=::", "--remote-allow-origins=*"] {
+    fn the_browser_has_no_debugging_port() {
+        let launch = own_code(LAUNCH);
+        for gone in ["--remote-debugging-port", "--remote-debugging-address", "--remote-allow-origins", "CDP_PORT"] {
             assert!(
-                !LAUNCH.contains(bad),
-                "{bad} in the launcher: the debugging port would be reachable off this machine, \
-                 and whoever reaches it reads the display's token"
+                !launch.contains(gone),
+                "{gone} in the launcher: a TCP debugging port is back, and any local user can drive the display"
             );
         }
-        // The profile holds the token at rest (localStorage lives in the
-        // user-data-dir), so it must not be world-readable.
-        assert!(LAUNCH.contains("chmod 0700 \"$PROFILE\""), "the profile holding the token is not 0700");
+        assert!(launch.contains("--remote-debugging-pipe"), "the browser has no CDP at all: the watchdog cannot reload it");
+        // The broker must be the browser's PARENT: the pipe is fds 3 and 4,
+        // and only the process that started the browser holds the other end.
+        assert!(
+            launch.contains("cage -- \"$CDP_HELPER\" broker -- \"$BROWSER\""),
+            "the browser is not started by the CDP broker, so nothing holds its pipe"
+        );
+        let cdp = own_code(CDP);
+        for gone in ["9222", "/json/list", "webSocketDebuggerUrl", "NOO_KIOSK_CDP_PORT"] {
+            assert!(!cdp.contains(gone), "noo-kiosk-cdp still speaks to a debugging port ({gone})");
+        }
+        // The control socket lives in the session's RuntimeDirectory, so
+        // it goes when the display does.
+        let u = render_kiosk_service("kiosk", Mode::Dedicated, 1);
+        assert!(u.contains("RuntimeDirectory=kiosk\n"), "{u}");
+        assert!(cdp.contains("SOCK = \"/run/kiosk/cdp.sock\""), "the broker's socket is not in kiosk.service's RuntimeDirectory");
+        // The profile is still the browser's own state, so it is not
+        // world-readable.
+        assert!(LAUNCH.contains("chmod 0700 \"$PROFILE\""), "the browser profile is not 0700");
     }
 
     /// No script may read a stored key any more. If one did, `setup` no

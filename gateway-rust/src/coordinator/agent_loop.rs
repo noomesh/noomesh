@@ -1521,7 +1521,8 @@ pub fn backend_failover_alert(target: &str, detail: impl Into<String>) -> crate:
 /// public-internet client with the provider's auth instead of the node
 /// hint, and retries 429/5xx/transport failures on the same provider
 /// within the same bounded attempts (`send_cloud_attempt`).
-async fn send_llm_with_fallback<R: HarnessRuntime>(
+#[allow(clippy::too_many_arguments)]
+async fn send_llm_with_fallback<R: HarnessRuntime, S: crate::websocket::TurnSink>(
     rt: &R,
     backend: &mut ResolvedBackend,
     failed_urls: &mut Vec<String>,
@@ -1531,7 +1532,17 @@ async fn send_llm_with_fallback<R: HarnessRuntime>(
     force_stream: bool,
     enable_thinking: bool,
     until: Instant,
+    phase: Option<(&S, &mut Option<Value>)>,
 ) -> Result<reqwest::Response> {
+    // The console's `routed` frame (super::phase), sent before each attempt
+    // on a new backend; the last one is handed back for the stream reader's
+    // `: queued` refinement.
+    let (sink, mut last_routed) = match phase {
+        Some((s, r)) => (Some(s), Some(r)),
+        None => (None, None),
+    };
+    let mut routed_url: Option<String> = None;
+    let mut moved: Option<super::phase::Moved> = None;
     // NOO_HARNESS_THINKING: `on`/`off` override the caller's choice for
     // every call on this node; `off` also sets each wire's own switch.
     let thinking = super::thinking::thinking_mode();
@@ -1543,6 +1554,19 @@ async fn send_llm_with_fallback<R: HarnessRuntime>(
         let remaining = until.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             anyhow::bail!("this turn reached its time limit before the model answered");
+        }
+        if let Some(sink) = sink.filter(|_| routed_url.as_deref() != Some(backend.url.as_str())) {
+            routed_url = Some(backend.url.clone());
+            if !super::backend::is_cloud_backend(backend) {
+                if let Some((node, slots)) = rt.route_facts(&backend.url, &backend.backend_type).await {
+                    let busy = super::classes::in_flight(&backend.url, &backend.backend_type);
+                    let f = super::phase::routed(&node, &backend.backend_type, &backend.model, slots, busy, attempt, moved.as_ref(), rt.phase_via());
+                    sink.send_event("phase", f.clone()).await;
+                    if let Some(r) = last_routed.as_mut() {
+                        **r = Some(f);
+                    }
+                }
+            }
         }
         let stream = force_stream || super::backend::wire_format(backend) == "openai";
         let (url, mut body) = build_llm_request(backend, messages, tools, stream, enable_thinking);
@@ -1569,10 +1593,17 @@ async fn send_llm_with_fallback<R: HarnessRuntime>(
         } else {
             crate::node_link::backend_request(reqwest::Method::POST, &url, &backend.backend_type)
         };
+        // The caller reads the body, so this span ends at the headers (i359).
+        let mut span =
+            crate::request_trace::backend_span(&backend.backend_type, &backend.model, &url, crate::request_trace::SpanEnd::Headers);
+        let req = crate::request_trace::propagate(req, span.as_ref());
         // The turn deadline, not the client's fixed backend timeout (#177).
         let failure = match req.json(&body).timeout(remaining).send().await {
             Ok(resp) => {
                 let status = resp.status();
+                if let Some(s) = span.as_mut() {
+                    s.status(status.as_u16());
+                }
                 if status.is_success() {
                     return Ok(resp);
                 }
@@ -1638,6 +1669,10 @@ async fn send_llm_with_fallback<R: HarnessRuntime>(
         let failed_url = backend.url.clone();
         let failed_type = backend.backend_type.clone();
         failed_urls.push(backend.url.clone());
+        if sink.is_some() {
+            let node = rt.route_facts(&failed_url, &failed_type).await.map(|(n, _)| n).unwrap_or_else(|| failed_url.clone());
+            moved = Some(super::phase::Moved { node, reason: failure.clone() });
+        }
         match rt.resolve_backend_excluding(effective_model, failed_urls).await {
             Ok(fallback) if super::backend::is_cloud_backend(&fallback) => {
                 anyhow::bail!("All node backends failed ({failure}); a cloud provider is never a fallback");
@@ -2128,9 +2163,11 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         // proxy, timeouts) are excluded and the next viable backend is
         // tried — each backend at most once per request.
         let pre_send_url = backend.url.clone();
+        let mut routed_frame: Option<Value> = None;
         let resp = match send_llm_with_fallback(
             rt, &mut backend, &mut failed_backend_urls, effective_model,
             &session.messages, Some(&tool_schemas), true, enable_thinking, turn_ends,
+            Some((writer, &mut routed_frame)),
         ).await {
             Ok(r) => {
                 if backend.url != pre_send_url {
@@ -2167,6 +2204,16 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         let mut gemma_thought_pending = true;
         let mut reasoning_filter = super::gemma_channel::ChannelFilter::reasoning();
         let mut content_filter = super::gemma_channel::ChannelFilter::content();
+
+        // The backend answered: it is reading the prompt (a `: queued`
+        // comment below turns the line back into a queue). The node agent's
+        // occupancy headers size that queue.
+        let occupancy = |h: &str| resp.headers().get(h).and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<u32>().ok());
+        let (agent_in_flight, agent_slots) = (occupancy("x-noo-in-flight"), occupancy("x-noo-slots"));
+        if routed_frame.is_some() {
+            let input = estimate_tokens(&session.messages) + estimate_tool_tokens(&tool_schemas);
+            let _ = writer.send_event("phase", super::phase::prompt(input)).await;
+        }
 
         // Buffer for reading SSE lines
         let mut stream = resp.bytes_stream();
@@ -2222,6 +2269,9 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                 let line = buf[..line_end].trim().to_string();
                 buf = buf[line_end + 1..].to_string();
 
+                if let (Some(ahead), Some(r)) = (super::phase::queued_ahead(&line), routed_frame.as_ref()) {
+                    let _ = writer.send_event("phase", super::phase::queued(r, ahead, agent_in_flight, agent_slots)).await;
+                }
                 if !line.starts_with("data: ") { continue; }
                 let data = &line[6..];
                 if data == "[DONE]" { continue; }
@@ -3289,6 +3339,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         let resp = match send_llm_with_fallback(
             rt, &mut backend, &mut failed_backend_urls, effective_model,
             &session.messages, Some(&tool_schemas), false, enable_thinking, turn_ends,
+            None::<(&crate::websocket::NullSink, &mut Option<Value>)>,
         ).await {
             Ok(r) => r,
             Err(e) => {

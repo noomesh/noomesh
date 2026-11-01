@@ -84,6 +84,15 @@ func pickBackendImage(spec BackendSpec, override string) string {
 // override is StartOverrides.Image (the controller's / the placement's).
 func chooseBackendImage(backend string, spec BackendSpec, override string) (backendImageChoice, error) {
 	ref := pickBackendImage(spec, override)
+	// Nothing named an image: the default is OUR hardened build from this
+	// node's release (an image of ours, rail-only). There is NO upstream
+	// fallback: if ours is not staged for this arch the start is refused,
+	// loudly, with the restage command (ImageNotStagedError).
+	if override == "" {
+		if ours := hardenedDefault(backend); ours != "" {
+			return backendImageChoice{Ref: ours, RailOnly: true}, nil
+		}
+	}
 	if ref == "" || isOwnImage(ref) {
 		return backendImageChoice{Ref: ref, RailOnly: ref != ""}, nil
 	}

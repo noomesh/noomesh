@@ -659,10 +659,16 @@ pub(crate) async fn chat_completion_on_node(
     // 240s: edge nodes are slow — host9 (gemma-4-E2B on a Pi) needs
     // ~40s for even one-word replies, so 60s failed any real prompt
     // with a misleading "backend unreachable" (reqwest timeout).
+    let mut span = crate::request_trace::backend_span(backend_type, model, &url, crate::request_trace::SpanEnd::Body);
     let req = crate::node_link::backend_request(reqwest::Method::POST, &url, backend_type)
         .json(&body)
         .timeout(std::time::Duration::from_secs(240));
-    match req.send().await {
+    let req = crate::request_trace::propagate(req, span.as_ref());
+    let sent = req.send().await;
+    if let (Some(s), Ok(resp)) = (span.as_mut(), &sent) {
+        s.status(resp.status().as_u16());
+    }
+    match sent {
         Ok(resp) if resp.status().is_success() => {
             let data: Value = resp.json().await.unwrap_or(json!({}));
             Ok(data.pointer("/choices/0/message/content")
@@ -1335,9 +1341,16 @@ async fn native_inference_stream(
 
     // Stream the response from the backend as SSE.
     // Add X-Noo-Backend hint for node-agent proxy URLs.
+    let mut span =
+        crate::request_trace::backend_span(&backend.backend_type, &backend.model, &url, crate::request_trace::SpanEnd::Stream);
     let req = crate::node_link::backend_stream(reqwest::Method::POST, &url, &backend.backend_type)
         .json(&body);
-    match req.send().await {
+    let req = crate::request_trace::propagate(req, span.as_ref());
+    let sent = req.send().await;
+    if let (Some(s), Ok(resp)) = (span.as_mut(), &sent) {
+        s.status(resp.status().as_u16());
+    }
+    match sent {
         Ok(resp) if resp.status().is_success() => {
             tracing::info!(
                 backend = %backend.backend_type,
@@ -1354,7 +1367,8 @@ async fn native_inference_stream(
                 actor: usage_actor,
             };
             let stream = crate::usage::tap_stream(resp.bytes_stream(), usage_ctx);
-            let body = Body::from_stream(stream);
+            // The backend span ends with the stream it answered.
+            let body = Body::from_stream(crate::request_trace::hold_until_dropped(stream, span));
 
             axum::response::Response::builder()
                 .status(200)

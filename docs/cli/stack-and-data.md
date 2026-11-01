@@ -32,7 +32,13 @@ map in `noomesh.yaml` and composes each enabled add-on's overlay and
 profile itself). `--dist` with `--dev` or `--build` is an error. `status`
 is native `docker ps` — `service | state | since | image | ports` for
 every `noo-*` container, `N of M containers not running` when something
-is down, and `no containers` with a hint when nothing is. `logs` with one
+is down, and `no containers` with a hint when nothing is. It exits 1 when a
+container is crash-looping (`restarting`), `dead`, or `exited` and not a
+declared one-shot that exited 0, and it names each (`exited and not a
+finished one-shot: ...`; `--json` lists them under `failed`). The declared
+one-shots are `config/oneshot-services.txt` (the build-only base images and
+the evolve add-on's route copier); the roll summary of `start`, `restart`
+and `noo upgrade` reads the same list, so the two agree. `logs` with one
 service is `docker logs`; with none or several it is compose logs.
 `stop --volumes` also removes the volumes. See
 [the operator manual](../operating/operator-manual.md).

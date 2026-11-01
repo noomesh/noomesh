@@ -35,6 +35,7 @@ stunnel-vllm
 stunnel-vllm-secondary
 tei
 tei-gpu
+tempo
 trellion
 vllm
 vllm-secondary

@@ -381,7 +381,8 @@ pub(crate) fn wire_key<'a>(spec: &'a ToolSpec, field: &'a str) -> &'a str {
 
 /// A digest of the doors' tool catalogue (both manifests), for `/health`
 /// (authenticated). MCP clients keep the tool list they fetched at connect
-/// and the doors do not push `notifications/tools/list_changed` yet (i277f),
+/// and are told to re-list only on their next request
+/// ([`crate::mcp_session::with_list_changed`], i277f),
 /// so `noo upgrade` compares this before and after a roll and tells the
 /// operator to reconnect clients when it moved. The native task tools
 /// (`mcp_user_tasks`) are code, not manifest, and are not in it.
@@ -753,11 +754,19 @@ pub(crate) struct RpcRequest {
 /// is the curated `external`-tagged manifest (mcp-tools.json) — a subset
 /// of the operator door, with admin and self-modify tools excluded
 /// by construction. Per-consumer rate limits apply.
+/// `/mcp/user`. Every answer passes through
+/// [`crate::mcp_session::with_list_changed`]: a session opened under
+/// another tool catalogue is told to re-list (i277f).
 async fn handle(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    let resp = handle_rpc(&state, &headers, &body).await;
+    crate::mcp_session::with_list_changed(&headers, resp).await
+}
+
+async fn handle_rpc(state: &Arc<AppState>, headers: &HeaderMap, body: &[u8]) -> Response {
     if !enabled() {
         return rpc_http_error(
             StatusCode::NOT_FOUND,
@@ -765,12 +774,12 @@ async fn handle(
         );
     }
 
-    let caller = match authenticate(&state, &headers).await {
+    let caller = match authenticate(state, headers).await {
         Ok(c) => c,
         Err(resp) => return resp,
     };
 
-    let env: Envelope = match mcp_protocol::parse(mcp_protocol::Door::Tls, &headers, &body) {
+    let env: Envelope = match mcp_protocol::parse(mcp_protocol::Door::Tls, headers, body) {
         Ok(e) => e,
         Err(resp) => return resp,
     };
@@ -779,7 +788,7 @@ async fn handle(
     // a live session names this window. Resolved before
     // dispatch so an unknown id is a 404 on every method, which is what
     // tells a compliant client to re-initialize.
-    let session = match crate::mcp_session::from_headers(&state.db, &headers, &caller.consumer).await {
+    let session = match crate::mcp_session::from_headers(&state.db, headers, &caller.consumer).await {
         Ok(s) => s,
         Err(resp) => return resp,
     };
@@ -810,7 +819,7 @@ async fn handle(
                 // The task tools (i83 E1d): in process, owner-scoped to
                 // this caller — see `mcp_user_tasks`.
                 arr.extend(crate::mcp_user_tasks::tool_list());
-                for t in crate::mcp_bridge::catalog_for(&state, Some(&caller.user)).await {
+                for t in crate::mcp_bridge::catalog_for(state, Some(&caller.user)).await {
                     arr.push(t.mcp_tool());
                 }
             }
@@ -829,10 +838,10 @@ async fn handle(
             // External MCP tool: the bridge checks the
             // caller's audience and runs it on the hosting node.
             if name.starts_with(crate::mcp_bridge::PREFIX) {
-                let ids = crate::mcp_bridge::server_ids(&state).await;
+                let ids = crate::mcp_bridge::server_ids(state).await;
                 if let Some((server, tool_name)) = crate::mcp_bridge::split_name(name, &ids) {
                     let argv = Value::Object(args.clone());
-                    return match crate::mcp_bridge::call(&state, Some(&caller.user), &server, &tool_name, &argv).await {
+                    return match crate::mcp_bridge::call(state, Some(&caller.user), &server, &tool_name, &argv).await {
                         Ok(text) => env.result(json!({ "content": [{"type": "text", "text": text}], "isError": false }), SERVER_NAME),
                         Err(e) => env.result(json!({ "content": [{"type": "text", "text": e}], "isError": true }), SERVER_NAME),
                     };
@@ -859,7 +868,7 @@ async fn handle(
             .await;
 
             let outcome = if task_tool {
-                crate::mcp_user_tasks::call(&state, &caller.user, name, args).await
+                crate::mcp_user_tasks::call(state, &caller.user, name, args).await
             } else {
                 call_tool(&caller, session.as_deref(), name, args).await
             };
@@ -1203,6 +1212,15 @@ mod tests {
             assert!(head.contains("mcp_session::open("), "{name} must open a session on initialize");
             assert!(head.contains("mcp_session::attach("), "{name} must return the id on the initialize response");
         }
+        // i277f: every answer of both doors passes the catalogue check.
+        let user = include_str!("mcp_external.rs");
+        let entry = user.split("async fn handle(").nth(1).expect("user door entry");
+        let entry = &entry[..entry.find("async fn handle_rpc(").expect("handle_rpc")];
+        assert!(entry.contains("mcp_session::with_list_changed(&headers, resp)"), "the user door must pass its answer through with_list_changed");
+        let op = include_str!("mcp_local.rs");
+        let entry = op.split("async fn handle_over_tls(").nth(1).expect("operator door entry");
+        let entry = &entry[..entry.find("async fn dispatch(").expect("dispatch")];
+        assert!(entry.contains("mcp_session::with_list_changed(&headers, resp)"), "the operator door must pass its answer through with_list_changed");
     }
 
     #[test]

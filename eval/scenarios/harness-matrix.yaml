@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# How each harness does on each kind of device, and with which model: the same
+# six tasks under every harness kind, on every node below in turn. On demand,
+# by one command; a timer or a scheduled agent can run the same command later.
+#
+# WHILE IT RUNS THIS CHANGES each node's harness placement (NOO_HARNESS_KIND)
+# and, for a cell with `variants`, that backend's model, and puts both back at
+# the end and on error. awolf, mcmini and pop-os serve live clients: run it
+# off-peak, and a scenario with variants needs --allow-placement-changes.
+# It refuses to start while a busy_locks file is held (a Rust build on awolf
+# skews every number).
+#
+# From the repository root:
+#   live:     PYTHONPATH=eval python3 -m noo_eval run eval/scenarios/harness-matrix.yaml --gateway URL
+#             (operator credential in NOO_EVAL_TOKEN or --token)
+#   dry run:  PYTHONPATH=eval python3 -m noo_eval run eval/scenarios/harness-matrix.yaml --fixture --history -
+# Writes eval/reports/harness-matrix.html and .json, and appends every row to
+# eval/reports/harness-matrix-history.jsonl (--history), which the report's
+# trend chart reads (all git-ignored).
+#
+# check: contains:<text> (case-insensitive) | regex:<re> | nonempty | state:<state>
+name: Harness matrix
+description: >
+  noo, copilot, claude-code and codex on an NVIDIA/vLLM node, an Apple/Ollama
+  node, a CPU/llama.cpp node and an arm64 edge box: pass rate, wall time,
+  loops and tokens, sliced by harness, hardware, backend and model.
+harness_matrix:
+  kinds: [noo, copilot, claude-code, codex]
+  cells:
+    - node: awolf          # NVIDIA, vLLM
+      # A model variant runs the same tasks with another model on that
+      # backend; the model must already be on the node (never downloaded).
+      # variants:
+      #   - {backend: vllm, model: google/gemma-4-12B-it-qat-w4a16-ct}
+    - node: mcmini         # Apple, Ollama
+    - node: pop-os         # CPU, llama.cpp
+    - node: robopi         # arm64 Pi. Skipped by what it reports at run time: on
+                           # 0.6.15 its ollama cannot start (stunnel sidecar image
+                           # refused by the agent's tar check; fixed in #623), and a
+                           # node serving no chat model is a SKIP with its reason.
+  busy_locks:
+    - ~/.cache/noo-batch/run.lock     # a noo-batch Rust build holds this on awolf
+  task_timeout_s: 600
+  poll_s: 5
+  settle_s: 20
+  ready_timeout_s: 300
+  model_ready_timeout_s: 600
+  require_dispatch: true
+  task_sets:
+    - name: basics
+      tasks:
+        - name: reply-ok
+          objective: "Reply with the single word: ok"
+          loop_budget: 2
+          check: "regex:(?i)^\\W*ok\\W*$"
+          timeout_s: 180
+        - name: mesh-nodes
+          objective: >
+            Use your noomesh tools to list the nodes in this mesh, then finish
+            with an answer that names every node.
+          loop_budget: 4
+          check: "contains:awolf"
+        - name: delegate
+          objective: >
+            Delegate a child task whose objective is "Reply with the single
+            word: pong", wait for it, then finish with the child's answer.
+          loop_budget: 6
+          check: "contains:pong"
+    - name: realistic
+      tasks:
+        - name: tool-chain
+          objective: >
+            Use your noomesh tools to find which node in this mesh reports the
+            most GPU memory (VRAM), then finish with just that node's name.
+          loop_budget: 6
+          check: "contains:awolf"
+        - name: compute
+          objective: >
+            Compute the SHA-256 hex digest of the exact text noomesh (seven
+            lowercase letters, no newline) by running code or a tool, not from
+            memory, and finish with only its first 12 hex characters.
+          loop_budget: 6
+          check: "contains:7a94b54f5f92"
+        - name: explain
+          objective: >
+            In two or three sentences, explain what a reverse proxy does, and
+            mention TLS.
+          loop_budget: 2
+          check: "contains:TLS"
