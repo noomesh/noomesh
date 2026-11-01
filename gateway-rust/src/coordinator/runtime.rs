@@ -72,11 +72,13 @@ pub(crate) trait HarnessRuntime: Sync {
     async fn resolve_backend_for_model(&self, model: Option<&str>) -> Result<ResolvedBackend>;
     async fn resolve_backend_excluding(&self, model: Option<&str>, exclude_urls: &[String]) -> Result<ResolvedBackend>;
     /// The node a backend URL belongs to and that backend's slots, for the
-    /// console's `routed` frame. A node harness does not know (its gateway
-    /// sends the turn's `routed` at dispatch), so the default is `None` and
-    /// no frame is sent.
+    /// console's `routed` frame. `None` = unknown, and no frame is sent.
     async fn route_facts(&self, _url: &str, _backend: &str) -> Option<(String, Option<super::classes::Slots>)> {
         None
+    }
+    /// The `routed` frame's `via`: `gateway` in process, `harness` on a node.
+    fn phase_via(&self) -> &'static str {
+        "gateway"
     }
     /// A cloud model, single turn, no tools. NOT the loop's path: the loop
     /// resolves a cloud model to a cloud backend and runs it with tools
