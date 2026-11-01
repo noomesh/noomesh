@@ -821,9 +821,16 @@ mod tests {
     fn the_routes_sit_under_the_gated_prefix() {
         let src = include_str!("grafana_ds.rs");
         let routes: Vec<&str> = src.lines().filter(|l| l.trim_start().starts_with(".route(\"")).collect();
-        assert_eq!(routes.len(), 2, "{routes:?}");
-        for r in routes {
+        assert_eq!(routes.len(), 3, "{routes:?}");
+        for r in &routes {
             assert!(r.contains(&format!(".route(\"{}", crate::auth::GRAFANA_DS_PREFIX)), "{r}");
         }
+        for up in ["prometheus", "loki", "tempo"] {
+            assert!(routes.iter().any(|r| r.contains(&format!("{}{up}/{{*path}}", crate::auth::GRAFANA_DS_PREFIX))), "no {up} route: {routes:?}");
+        }
+        // Tempo (i359) is read with GET only: Grafana's Tempo data source
+        // never posts, and the OTLP push is not on this door.
+        let tempo = routes.iter().find(|r| r.contains("/tempo/")).expect("the tempo route");
+        assert!(tempo.contains("get(tempo)") && !tempo.contains("post("), "{tempo}");
     }
 }
