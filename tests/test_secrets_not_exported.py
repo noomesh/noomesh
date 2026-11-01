@@ -27,7 +27,8 @@ def test_cli_only_secrets_are_not_exported(tmp_path):
     sops.write_text(
         "#!/bin/sh\n"
         "printf 'POSTGRES_PASSWORD=pg\\nNOO_ADDON_REGISTRY_TOKEN=ghp_secret\\n"
-        "NOO_ADDON_REGISTRY_USER=bot\\nNOO_IMAGE_TAG=v0.0.1\\n'\n"
+        "NOO_ADDON_REGISTRY_USER=bot\\nNOO_IMAGE_TAG=v0.0.1\\n"
+        "NOO_ADDON_REGISTRY_CRED_PAI_VOICE=tp\\n'\n"
     )
     sops.chmod(sops.stat().st_mode | stat.S_IEXEC)
     (tmp_path / "secrets").mkdir()
@@ -36,7 +37,7 @@ def test_cli_only_secrets_are_not_exported(tmp_path):
 cd {tmp_path}
 . {REPO}/scripts/lib-secrets.sh
 _load_secrets_sops >/dev/null
-env | grep -E '^(POSTGRES_PASSWORD|NOO_ADDON_REGISTRY_TOKEN|NOO_ADDON_REGISTRY_USER|NOO_IMAGE_TAG)=' | sort
+env | grep -E '^(POSTGRES_PASSWORD|NOO_ADDON_REGISTRY_TOKEN|NOO_ADDON_REGISTRY_USER|NOO_IMAGE_TAG|NOO_ADDON_REGISTRY_CRED_[A-Z_]*)=' | sort
 """
     env = {"PATH": f"{bindir}:{os.environ['PATH']}", "HOME": str(tmp_path)}
     r = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)

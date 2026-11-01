@@ -204,7 +204,9 @@ appears later gets its routes at the next start.
 signed `noo-addon-lock/2` bundle (see "The signed add-on lock" below). The
 operator trusts your signing key with `noo addons trust-key <name> <pubkey>
 --registry <root>` (the CLI ships no key for you), and your images must sit
-under that registry root and be pullable anonymously.
+under that registry root. If the package is private, the operator registers a
+read-only token for it with `noo addons registry-login <name> --registry <root>`
+(see "Add-ons" in getting started); without one the pull is anonymous.
 
 **Development keys.** To develop and test an add-on on your own mesh before it
 ships in a release, the operator can trust a temporary development key instead

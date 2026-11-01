@@ -77,6 +77,9 @@ pub enum Refusal {
     /// `failed` names it.
     DevSwitch { pinned: String, offered: String, failed: String },
     Pull(String),
+    /// A third-party add-on's pull was refused for want of (or by) its own
+    /// registry credential (i277h). `credential_set`: one was presented.
+    PullAuth { root: String, credential_set: bool, detail: String },
     Write(String),
     /// The encrypted store could not be read (a decrypt failure is never
     /// "nothing installed").
@@ -112,6 +115,12 @@ impl Refusal {
                 ),
             },
             Refusal::Fetch { reference, err, via: None, .. } => match err.class {
+                FetchClass::Auth if third_party(addon) => format!(
+                    "the registry refused {reference} (access refused). If {addon}'s package is private, register a \
+                     read-only token for it with `noo addons registry-login {addon} --registry {}`; if one is already \
+                     set, the registry refused it: replace it with the same command",
+                    root_of(reference)
+                ),
                 FetchClass::Auth => format!(
                     "the registry refused {reference} (access refused): the controller's {} cannot read {addon}'s package",
                     lock_fetch::TOKEN_KEY
@@ -145,6 +154,15 @@ impl Refusal {
                  --allow-downgrade to switch anyway"
             ),
             Refusal::Pull(e) => format!("{addon}'s images could not be pulled: {e}"),
+            Refusal::PullAuth { root, credential_set: false, detail } => format!(
+                "{addon}'s images could not be pulled: {detail}. {root} refused an anonymous pull and no credential is \
+                 set for {addon}: register a read-only token for it with `noo addons registry-login {addon} --registry {root}`"
+            ),
+            Refusal::PullAuth { root, credential_set: true, detail } => format!(
+                "{addon}'s images could not be pulled: {detail}. {root} refused the credential stored for {addon} \
+                 (expired, revoked, or without read access to the package): replace it with \
+                 `noo addons registry-login {addon} --registry {root}`"
+            ),
             Refusal::Write(e) => format!("{addon}'s pin could not be written: {e}"),
             Refusal::Store(e) => format!("the encrypted store could not be read to resolve {addon}: {e}"),
             Refusal::Unbundled { tag } => unbundled(addon, tag),
@@ -158,6 +176,18 @@ impl Refusal {
         matches!(self, Refusal::Fetch { err, .. } if err.class == FetchClass::Auth)
     }
 
+    /// The remedy for a third-party add-on's registry credential: set or
+    /// replace it. `None` for every other refusal.
+    pub fn registry_login_fix(&self, addon: &str) -> Option<String> {
+        match self {
+            Refusal::PullAuth { root, .. } => Some(format!("noo addons registry-login {addon} --registry {root}")),
+            Refusal::Fetch { reference, err, via: None, .. } if err.class == FetchClass::Auth && third_party(addon) => {
+                Some(format!("noo addons registry-login {addon} --registry {}", root_of(reference)))
+            }
+            _ => None,
+        }
+    }
+
     /// True when the refusal came from the vendor's add-on registry proxy:
     /// the remedy is the entitlement, never `NOO_ADDON_REGISTRY_TOKEN`.
     pub fn is_proxy(&self) -> bool {
@@ -168,6 +198,17 @@ impl Refusal {
     pub fn auth_fix(&self) -> &'static str {
         if self.is_proxy() { PROXY_FIX } else { TOKEN_FIX }
     }
+}
+
+/// `<root>:stack-<tag>` → `<root>`.
+fn root_of(reference: &str) -> &str {
+    reference.rsplit_once(":stack-").map_or(reference, |(root, _)| root)
+}
+
+/// Does a docker pull error read as the registry refusing access?
+pub fn pull_unauthorized(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    ["unauthorized", "denied", "authentication required", "forbidden", "refused", "401", "403"].iter().any(|w| e.contains(w))
 }
 
 /// The refusal for an add-on lock the registry does not have (HTTP 404,
@@ -540,6 +581,20 @@ impl LiveDocker {
     }
 }
 
+/// The arguments of `docker login` for the throwaway config `dir`. The token
+/// is NOT among them: it goes to the child's stdin (`--password-stdin`), so it
+/// is in no argv and no `ps` line.
+pub(crate) fn login_args(dir: &Path, host: &str, user: &str) -> Vec<String> {
+    let cfg = dir.display().to_string();
+    ["--config", &cfg, "login", host, "--username", user, "--password-stdin"].iter().map(|s| s.to_string()).collect()
+}
+
+/// The arguments of `docker pull` for `reference` through the throwaway config `dir`.
+pub(crate) fn pull_args(dir: &Path, reference: &str) -> Vec<String> {
+    let cfg = dir.display().to_string();
+    ["--config", &cfg, "pull", "--quiet", reference].iter().map(|s| s.to_string()).collect()
+}
+
 fn last_line(b: &[u8]) -> String {
     String::from_utf8_lossy(b).lines().last().unwrap_or("").to_string()
 }
@@ -562,9 +617,7 @@ impl Docker for LiveDocker {
         let dir = ThrowawayConfig::new(&self.runtime)?;
         if let Some(c) = cred {
             let mut child = std::process::Command::new("docker")
-                .arg("--config")
-                .arg(&dir.0)
-                .args(["login", host, "--username", &c.user, "--password-stdin"])
+                .args(login_args(&dir.0, host, &c.user))
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped())
@@ -580,9 +633,7 @@ impl Docker for LiveDocker {
         }
         for r in refs {
             let out = std::process::Command::new("docker")
-                .arg("--config")
-                .arg(&dir.0)
-                .args(["pull", "--quiet", r])
+                .args(pull_args(&dir.0, r))
                 .output()
                 .map_err(|e| format!("docker pull: {e}"))?;
             if !out.status.success() {
