@@ -1560,7 +1560,7 @@ async fn send_llm_with_fallback<R: HarnessRuntime, S: crate::websocket::TurnSink
             if !super::backend::is_cloud_backend(backend) {
                 if let Some((node, slots)) = rt.route_facts(&backend.url, &backend.backend_type).await {
                     let busy = super::classes::in_flight(&backend.url, &backend.backend_type);
-                    let f = super::phase::routed(&node, &backend.backend_type, &backend.model, slots, busy, attempt, moved.as_ref(), "gateway");
+                    let f = super::phase::routed(&node, &backend.backend_type, &backend.model, slots, busy, attempt, moved.as_ref(), rt.phase_via());
                     sink.send_event("phase", f.clone()).await;
                     if let Some(r) = last_routed.as_mut() {
                         **r = Some(f);
