@@ -412,7 +412,7 @@ mod tests {
                 scopes: vec![],
                 role: Role::User,
                 harness: harness.then(|| "node:host3".to_string()),
-                act: act.then(|| crate::auth::Actor { sub: "key:svc".into(), iss_user: None, task: None }),
+                act: act.then(|| crate::auth::Actor { sub: "key:svc".into(), iss_user: None, task: None, feature: None }),
             }))
         };
         assert_eq!(person_at_the_browser(&person("alice", false, false)).as_deref(), Ok("alice"));

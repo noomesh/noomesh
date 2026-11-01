@@ -69,25 +69,65 @@ pub fn addon_of(claims: &Claims) -> Option<&str> {
 
 /// The claims, unsigned. `None` when the secret is insecure (the same
 /// judgement every mint makes, in `auth::scoped_claims`).
-pub(crate) fn claims(requester: &RequesterCtx, addon: &str, secret: &str) -> Option<Value> {
+///
+/// `feature`: the add-on feature of the route the token was minted for, in a
+/// manifest with features (f99). The auth layer holds every use to it.
+pub(crate) fn claims(requester: &RequesterCtx, addon: &str, feature: Option<&str>, secret: &str) -> Option<Value> {
     let mut c = crate::auth::scoped_claims(crate::auth::account_of(&requester.sub), requester.role.as_str(), &requester.scopes, TTL_SECS, secret)?;
     c["act"] = json!({ "sub": format!("{ACTOR_PREFIX}{addon}") });
+    if let Some(f) = feature {
+        c["act"]["feature"] = json!(f);
+    }
     c["jti"] = json!(uuid::Uuid::new_v4().to_string());
     Some(c)
 }
 
 /// [`mint`] with the keys passed in (tests).
-pub(crate) fn mint_with(requester: &RequesterCtx, addon: &str, secret: &str, signing: Option<&crate::jwks::SigningKey>) -> Option<String> {
-    crate::worker_delegation::sign(&claims(requester, addon, secret)?, secret, signing)
+pub(crate) fn mint_with(
+    requester: &RequesterCtx,
+    addon: &str,
+    feature: Option<&str>,
+    secret: &str,
+    signing: Option<&crate::jwks::SigningKey>,
+) -> Option<String> {
+    crate::worker_delegation::sign(&claims(requester, addon, feature, secret)?, secret, signing)
 }
 
 /// Mint for one proxied request with the gateway's own keys: ES256 under
 /// `NOO_JWT_SIGNING_KEY` when configured, HS256 otherwise. `None` when the
 /// gateway has no usable secret; the add-on then gets no token and fails
 /// closed.
-pub fn mint(requester: &RequesterCtx, addon: &str) -> Option<String> {
+pub fn mint(requester: &RequesterCtx, addon: &str, feature: Option<&str>) -> Option<String> {
     let secret = crate::auth::configured_jwt_secret()?;
-    mint_with(requester, addon, &secret, crate::jwks::signing_key())
+    mint_with(requester, addon, feature, &secret, crate::jwks::signing_key())
+}
+
+/// Does a token minted under `feature` still act for `account` (f99)? A
+/// manifest without features: nothing to hold (`Ok`). With features: the
+/// token must name one, and the account (at its `live` role) must still
+/// hold it, so turning the feature off stops the add-on at the next call.
+pub(crate) fn feature_still_held(
+    has_features: bool,
+    feature: Option<&str>,
+    addon: &str,
+    account: &str,
+    live: Option<crate::auth::Role>,
+) -> Result<(), String> {
+    if !has_features {
+        return Ok(());
+    }
+    let Some(feature) = feature else {
+        return Err("the token names no feature, and the add-on declares features".into());
+    };
+    let Some(role) = live else {
+        return Err("the account is disabled or absent".into());
+    };
+    let d = crate::addon_access::feature_allows(addon, feature, account, role);
+    if d.allowed {
+        Ok(())
+    } else {
+        Err(format!("feature {feature:?} is off for {account} ({})", d.decided_by))
+    }
 }
 
 /// Every `(METHOD, path template)` an ADT may call. Nothing else: not
@@ -127,6 +167,32 @@ pub fn confine(claims: &Claims, method: &str, path: &str) -> Result<(), StatusCo
 mod tests {
     use super::*;
     use crate::auth::{verify_token_with, Role};
+
+    /// f99: the token names the feature of the route it was minted for, and
+    /// only when there is one; it parses back into `Actor::feature`.
+    #[test]
+    fn a_token_carries_its_feature_only_when_minted_under_one() {
+        let c = claims(&alice(), "voice", Some("converse"), SECRET).expect("claims");
+        assert_eq!(c["act"]["feature"], "converse");
+        assert_eq!(c["act"]["sub"], "addon:voice");
+        let plain = claims(&alice(), "voice", None, SECRET).expect("claims");
+        assert!(plain["act"].get("feature").is_none(), "{plain}");
+        let tok = mint_with(&alice(), "voice", Some("converse"), SECRET, None).unwrap();
+        let back = verify_token_with(&tok, SECRET, None).expect("verifies");
+        assert_eq!(back.act.and_then(|a| a.feature).as_deref(), Some("converse"));
+    }
+
+    /// The rule the auth layer applies on every use.
+    #[test]
+    fn a_features_addon_token_must_name_a_feature_the_account_still_holds() {
+        assert_eq!(feature_still_held(false, None, "voice", "alice", Some(Role::User)), Ok(()), "no features: nothing to hold");
+        assert!(feature_still_held(true, None, "voice", "alice", Some(Role::User)).unwrap_err().contains("names no feature"));
+        assert!(feature_still_held(true, Some("converse"), "voice", "alice", None).unwrap_err().contains("disabled"));
+        // The unit tests never load the settings, so a feature is refused
+        // (fail closed): the token stops acting.
+        let e = feature_still_held(true, Some("converse"), "voice", "alice", Some(Role::Admin)).unwrap_err();
+        assert!(e.contains("\"converse\" is off for alice") && e.contains("not loaded"), "{e}");
+    }
 
     const SECRET: &str = "addon-delegation-test-secret-not-a-real-one";
 
@@ -192,7 +258,7 @@ mod tests {
     #[test]
     fn mint_then_verify_names_the_addon_and_expires_within_five_minutes() {
         let key = es256();
-        let tok = mint_with(&alice(), "voice", SECRET, Some(&key)).expect("mints");
+        let tok = mint_with(&alice(), "voice", None, SECRET, Some(&key)).expect("mints");
         assert_eq!(jsonwebtoken::decode_header(&tok).unwrap().alg, jsonwebtoken::Algorithm::ES256);
         let claims = verify_token_with(&tok, SECRET, Some(&key)).expect("the ordinary verifier accepts it");
         assert_eq!(addon_of(&claims), Some("voice"));
@@ -202,30 +268,30 @@ mod tests {
         assert!(claims.harness.is_none() && claims.conv.is_none());
 
         // Two mints are two tokens.
-        let again = mint_with(&alice(), "voice", SECRET, Some(&key)).unwrap();
+        let again = mint_with(&alice(), "voice", None, SECRET, Some(&key)).unwrap();
         assert_ne!(tok, again);
     }
 
     #[test]
     fn without_a_signing_key_it_is_hs256_and_an_insecure_secret_mints_nothing() {
-        let tok = mint_with(&alice(), "voice", SECRET, None).unwrap();
+        let tok = mint_with(&alice(), "voice", None, SECRET, None).unwrap();
         assert_eq!(jsonwebtoken::decode_header(&tok).unwrap().alg, jsonwebtoken::Algorithm::HS256);
         assert!(verify_token_with(&tok, SECRET, None).is_ok());
-        assert!(mint_with(&alice(), "voice", crate::auth::INSECURE_DEFAULT_JWT_SECRET, None).is_none());
+        assert!(mint_with(&alice(), "voice", None, crate::auth::INSECURE_DEFAULT_JWT_SECRET, None).is_none());
     }
 
     #[test]
     fn only_an_addon_actor_is_an_adt() {
-        let tok = mint_with(&alice(), "voice", SECRET, None).unwrap();
+        let tok = mint_with(&alice(), "voice", None, SECRET, None).unwrap();
         let mut claims = verify_token_with(&tok, SECRET, None).unwrap();
         assert_eq!(confine(&claims, "POST", "/api/tasks"), Ok(()));
         assert_eq!(confine(&claims, "POST", "/mcp/user"), Err(StatusCode::FORBIDDEN));
         assert_eq!(confine(&claims, "POST", "/api/tasks/x/resubmit"), Err(StatusCode::FORBIDDEN));
         // A worker-delegated or ordinary token is none of this module's business.
-        claims.act = Some(crate::auth::Actor { sub: "svc:worker".into(), iss_user: None, task: None });
+        claims.act = Some(crate::auth::Actor { sub: "svc:worker".into(), iss_user: None, task: None, feature: None });
         assert_eq!(addon_of(&claims), None);
         assert_eq!(confine(&claims, "POST", "/mcp/user"), Ok(()));
-        claims.act = Some(crate::auth::Actor { sub: ACTOR_PREFIX.into(), iss_user: None, task: None });
+        claims.act = Some(crate::auth::Actor { sub: ACTOR_PREFIX.into(), iss_user: None, task: None, feature: None });
         assert_eq!(addon_of(&claims), None, "an empty add-on name is no add-on");
         claims.act = None;
         assert_eq!(confine(&claims, "POST", "/mcp/user"), Ok(()));

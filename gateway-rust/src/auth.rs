@@ -359,6 +359,14 @@ pub struct Actor {
     /// other kind of delegated token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
+    /// The add-on FEATURE an add-on delegated token was minted under
+    /// (noomesh-internal f99): the auth layer re-checks on every use that the
+    /// account still holds it, so turning the feature off stops the add-on
+    /// acting for that person at once, not when the token expires. Absent on
+    /// every other kind of token, and on a token for an add-on whose
+    /// manifest declares no features.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feature: Option<String>,
 }
 
 /// The harness rail: a token minted for a node-hosted
@@ -3359,6 +3367,15 @@ pub async fn require_any_auth(
                     tracing::warn!(sub = %claims.sub, addon, live = ?live, "add-on delegated token refused: account disabled, absent or below the token's role");
                     return Err(StatusCode::UNAUTHORIZED);
                 }
+                // f99: a token minted under an add-on feature is held to it on
+                // every use, so turning the feature off stops the add-on
+                // acting for this person now, not when the token expires.
+                let has_features = crate::addon_registry::get(addon).is_some_and(|e| !e.manifest().features.is_empty());
+                let feature = claims.act.as_ref().and_then(|a| a.feature.as_deref());
+                if let Err(why) = crate::addon_delegation::feature_still_held(has_features, feature, addon, account_of(&claims.sub), live) {
+                    tracing::warn!(sub = %claims.sub, addon, "add-on delegated token refused: {why}");
+                    return Err(StatusCode::FORBIDDEN);
+                }
                 request.extensions_mut().insert(crate::addon_delegation::AddonDelegation { addon: addon.to_string() });
             }
             if claims.scopes.iter().any(|s| s == "peer") {
@@ -6106,6 +6123,9 @@ mod harness_rail_tests {
         assert!(body[registry..live].contains("StatusCode::FORBIDDEN"));
         assert!(body[live..attach].contains("rail_token_admitted(claims.resolved_role(), live)"));
         assert!(body[live..attach].contains("StatusCode::UNAUTHORIZED"));
+        // f99: the feature the token was minted under is held on every use,
+        // after the live role and before the extension is attached.
+        assert!(body[live..attach].contains("crate::addon_delegation::feature_still_held(has_features, feature, addon, account_of(&claims.sub), live)"));
         // The branch is before the terminal peer / kiosk / add-on-consumer
         // returns, so none of them can carry an ADT past it.
         let peer = body.find("claims.scopes.iter().any(|s| s == \"peer\")").expect("peer branch");

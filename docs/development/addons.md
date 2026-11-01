@@ -508,9 +508,16 @@ their `feature`; `min_role`, `scopes`, `ui.min_role` and the top-level
 `delegate` are refused (one answer to "who may call this"); `receives_delegation`
 needs its feature to delegate; `internal` routes take none.
 
-Until the release that stores who holds each feature, a features manifest's
-routes and UI read as `operator`, the default for a route that names no role:
-nothing opens wider than it would without features. Keep each route
+Who holds a feature is decided by the install's admins (on, off or inherit
+per role, team, account and service key; noomesh-internal f99), and every
+surface asks the same check: the front door, your HTTP and WS routes, your UI
+origin and the delegated task token. On each proxied request the gateway also
+sends `X-Noo-Requester-Features`: the features of YOUR add-on the caller
+holds, comma-separated (empty when none). Use it to hide what the person
+cannot use; never treat it as a permission (the gateway already refused
+anything not granted). A delegated task token is minted under the route's
+feature and is refused on its next use once that feature is turned off for
+the person. Keep each route
 `owner_scoped` where it holds: a write is never opened below `operator` without
 it.
 

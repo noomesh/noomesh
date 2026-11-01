@@ -1241,6 +1241,7 @@ fn delegated(base: &RequesterCtx, run: &str) -> RequesterCtx {
             sub: crate::worker_delegation::WORKER_ACTOR.to_string(),
             iss_user: None,
             task: Some(run.to_string()),
+            feature: None,
         }),
         ..base.clone()
     }
@@ -1944,7 +1945,7 @@ fn the_audit_intent_row_precedes_the_worker_call_in_the_source() {
 fn exchanged(base: &RequesterCtx, consumer: &str) -> RequesterCtx {
     RequesterCtx {
         harness: Some(format!("mcp-external:{consumer}")),
-        act: Some(crate::auth::Actor { sub: format!("key:{consumer}"), iss_user: Some("root".into()), task: None }),
+        act: Some(crate::auth::Actor { sub: format!("key:{consumer}"), iss_user: Some("root".into()), task: None, feature: None }),
         ..base.clone()
     }
 }

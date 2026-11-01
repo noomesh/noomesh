@@ -426,6 +426,9 @@ async fn serve_ws(
     };
     // 5. Dial the add-on with the verified identity, then upgrade.
     let mut outbound: Vec<(&'static str, String)> = crate::addon_proxy::caller_headers(requester.as_ref());
+    if let Some(v) = requester.as_ref().and_then(|r| crate::addon_access::requester_features(manifest, r)) {
+        outbound.push((crate::addon_proxy::REQUESTER_FEATURES, v));
+    }
     if let Some(r) = requester.as_ref() {
         if let Some(entry) = crate::addon_registry::get(addon) {
             let route = path.split('?').next().unwrap_or(&path);
@@ -434,7 +437,7 @@ async fn serve_ws(
                 entry.route_receives_delegation(crate::addon_proxy::METHOD_WS, route),
                 entry.operator_enabled(),
             ) {
-                match crate::addon_delegation::mint(r, addon) {
+                match crate::addon_delegation::mint(r, addon, spec.feature.as_deref()) {
                     Some(token) => outbound.push((crate::addon_delegation::HEADER, token)),
                     None => tracing::error!(addon, "add-on delegation: could not mint the delegated token; the add-on socket gets none and fails closed"),
                 }

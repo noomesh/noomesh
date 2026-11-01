@@ -1000,6 +1000,9 @@ pub(crate) async fn serve_ui(
     for (name, value) in crate::addon_proxy::caller_headers(Some(r)) {
         req = req.header(name, value);
     }
+    if let Some(v) = crate::addon_access::requester_features(&manifest, r) {
+        req = req.header(crate::addon_proxy::REQUESTER_FEATURES, v);
+    }
     for name in PASSED_REQUEST_HEADERS {
         for v in headers.get_all(*name) {
             req = req.header(*name, v.as_bytes());

@@ -721,6 +721,9 @@ async fn forward(
     for (name, value) in caller_headers(requester) {
         req = req.header(name, value);
     }
+    if let Some(v) = requester.and_then(|r| crate::addon_access::requester_features(manifest, r)) {
+        req = req.header(REQUESTER_FEATURES, v);
+    }
     // The delegated task token (i143), only where the route opted in and the
     // operator allowed it. The request is built from nothing, so a client's
     // own `x-noo-delegation` can never ride along; this is the only place the
@@ -729,7 +732,7 @@ async fn forward(
         if let Some(entry) = crate::addon_registry::get(&manifest.addon) {
             let route = path.split('?').next().unwrap_or(path);
             if mints_delegation(Some(r), entry.route_receives_delegation(&spec.method, route), entry.operator_enabled()) {
-                match crate::addon_delegation::mint(r, &manifest.addon) {
+                match crate::addon_delegation::mint(r, &manifest.addon, spec.feature.as_deref()) {
                     Some(token) => {
                         if let Ok(mut v) = reqwest::header::HeaderValue::from_str(&token) {
                             v.set_sensitive(true);
@@ -860,6 +863,11 @@ pub const REQUESTER_CONNECTION: &str = "x-noo-requester-connection";
 pub const REQUESTER_ROLE: &str = "x-noo-requester-role";
 /// Comma-separated, in the order the credential carries them.
 pub const REQUESTER_SCOPES: &str = "x-noo-requester-scopes";
+/// The add-on features the requester holds, comma-separated (f99), for a
+/// manifest with features: a hint for the add-on's UI (hide what the person
+/// cannot use), never a permission. The gateway has already refused anything
+/// not granted before the add-on sees the request.
+pub const REQUESTER_FEATURES: &str = "x-noo-requester-features";
 
 /// Build the outbound identity headers.
 ///
@@ -1981,7 +1989,7 @@ mod permission_tests {
         assert!(!mints_delegation(Some(&person), true, false), "operator has not enabled delegation");
         assert!(!mints_delegation(None, true, true), "no person, no token");
         let mut delegated = person.clone();
-        delegated.act = Some(crate::auth::Actor { sub: "addon:voice".into(), iss_user: None, task: None });
+        delegated.act = Some(crate::auth::Actor { sub: "addon:voice".into(), iss_user: None, task: None, feature: None });
         assert!(!mints_delegation(Some(&delegated), true, true), "a delegated token never mints another");
     }
 
