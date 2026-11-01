@@ -672,6 +672,22 @@ func TestTarManifestCheck(t *testing.T) {
 		{"oci index, one image named right", map[string]string{"index.json": `{"manifests":[{"annotations":{"io.containerd.image.name":"` + ownRef + `"}}]}`}, true},
 		{"oci index, two images", map[string]string{"index.json": `{"manifests":[{},{}]}`}, false},
 		{"oci index names another", map[string]string{"index.json": `{"manifests":[{"annotations":{"io.containerd.image.name":"docker.io/library/alpine:latest"}}]}`}, false},
+		// What `docker save --platform linux/arm64` writes on Docker 29's
+		// containerd store for a buildx image (reproduced 2026-11-01 from
+		// ghcr.io/noomesh/stunnel:v0.6.15): the image plus its attestation.
+		{"oci index, one image and its attestation", map[string]string{"index.json": `{"manifests":[` +
+			`{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:0888","annotations":{"io.containerd.image.name":"` + ownRef + `"},"platform":{"architecture":"arm64","os":"linux"}},` +
+			`{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:9d54","annotations":{"io.containerd.manifest.subject":"sha256:0888"},"artifactType":"application/vnd.docker.attestation.manifest.v1+json"}]}`}, true},
+		{"oci index, two platforms (a multi-arch export)", map[string]string{"index.json": `{"manifests":[` +
+			`{"annotations":{"io.containerd.image.name":"` + ownRef + `"},"platform":{"architecture":"amd64","os":"linux"}},` +
+			`{"annotations":{"io.containerd.image.name":"` + ownRef + `"},"platform":{"architecture":"arm64","os":"linux"}}]}`}, false},
+		{"oci index, only an attestation", map[string]string{"index.json": `{"manifests":[{"annotations":{"vnd.docker.reference.type":"attestation-manifest"}}]}`}, false},
+		{"oci index, an attestation that names a tag", map[string]string{"index.json": `{"manifests":[` +
+			`{"annotations":{"io.containerd.image.name":"` + ownRef + `"}},` +
+			`{"annotations":{"io.containerd.manifest.subject":"sha256:0888","io.containerd.image.name":"` + ownRef + `"}}]}`}, false},
+		{"oci index, an attestation that names another image", map[string]string{"index.json": `{"manifests":[` +
+			`{"annotations":{"io.containerd.image.name":"` + ownRef + `"}},` +
+			`{"annotations":{"io.containerd.manifest.subject":"sha256:0888","io.containerd.image.name":"docker.io/library/alpine:latest"}}]}`}, false},
 		{"not an image archive", map[string]string{"hello.txt": "x"}, false},
 	}
 	for _, c := range cases {
