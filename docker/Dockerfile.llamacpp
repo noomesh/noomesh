@@ -41,7 +41,8 @@ FROM ${DHI_REGISTRY}/uv:0-debian13-dev@sha256:538e03cfb921102dafe5a083a8fb4ee5a7
 # the version is a regex (the glob `*+deb13u0+*` never matches), and the
 # package is the regex `/./`, not `*`: `Package: *` is apt's general form,
 # which honours only release/origin pins and silently ignores a version pin.
-# Builder stage only. Remove once DHI republishes matching packages
+# Every stage that installs with apt on this base (the runtime below too, and
+# both stages of Dockerfile.ollama). Remove once DHI republishes matching packages
 # (followup: noomesh-internal 17a, DHI apt skew).
 RUN printf 'Package: /./\nPin: version /\\+deb13u0\\+/\nPin-Priority: 1001\n' \
         > /etc/apt/preferences.d/dhi-deb13u0-skew
@@ -101,7 +102,10 @@ RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF \
 # ── Runtime ──────────────────────────────────────────────────────────
 FROM ${DHI_REGISTRY}/uv:0-debian13-dev@sha256:538e03cfb921102dafe5a083a8fb4ee5a7758be4170f32788fac191325b0307d
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# The DHI +deb13u0+ apt skew: see the builder stage's note (noomesh-internal 17a).
+RUN printf 'Package: /./\nPin: version /\\+deb13u0\\+/\nPin-Priority: 1001\n' \
+        > /etc/apt/preferences.d/dhi-deb13u0-skew
+RUN apt-get update && apt-get install -y --no-install-recommends --allow-downgrades \
     libopenblas0 libgomp1 curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
