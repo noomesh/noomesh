@@ -13,9 +13,11 @@
 # THIS repo, which is what lets ci.yml's `credentials:` block read it with
 # the ordinary GITHUB_TOKEN — no PAT involved.
 #
-# Run it by hand: `gh workflow run mirror-images.yml -R noomesh/noomesh`.
-# workflow_dispatch runs the file as it is on the DEFAULT branch (main), so a
-# matrix change reaches the mirror once it is promoted there. There is no
+# Run it by hand: `gh workflow run mirror-images.yml -R noomesh/noomesh --ref <ref>`.
+# workflow_dispatch runs the file as it is on the ref it is dispatched from
+# (the default branch when --ref is omitted), so the release cutter dispatches
+# from the ref that carries the new lanes (dev, before an rc), not by waiting
+# for main. There is no
 # push or schedule trigger: this workflow holds registry credentials and
 # pushes packages, so it starts only on a deliberate dispatch. Mirrored tags
 # are stable majors; refreshes are rare and deliberate.
