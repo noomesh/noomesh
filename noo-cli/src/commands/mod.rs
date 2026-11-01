@@ -33,6 +33,7 @@ pub mod cluster_vendor;
 pub mod node_vendor;
 pub mod cluster_push_secrets;
 pub mod cluster_gpu;
+pub mod cluster_gpu_mode;
 pub mod cluster_reserve;
 pub mod cluster_profile;
 pub mod cluster_verify;
@@ -210,6 +211,7 @@ pub use cluster_host_telemetry::{cluster_host_telemetry_apply, cluster_host_tele
 pub use cluster_vendor::{cluster_vendor_install, cluster_vendor_stage, cluster_vendor_status, cluster_vendor_usage};
 pub use cluster_push_secrets::cluster_push_secrets;
 pub use cluster_gpu::{cluster_gpu_hold, cluster_gpu_release};
+pub use cluster_gpu_mode::cluster_gpu_mode;
 pub use cluster_reserve::{cluster_release, cluster_reservations, cluster_reserve, cluster_workloads};
 pub use cluster_profile::cluster_profile;
 pub use cluster_verify::cluster_verify;
