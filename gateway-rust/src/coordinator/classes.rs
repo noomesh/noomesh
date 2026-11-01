@@ -1274,7 +1274,7 @@ pub fn node_facts_from_kv(key: &str, data: &Value, non_chat: &[(String, String)]
                 .collect()
         })
         .unwrap_or_default();
-    let unreported = unreported_backends(data);
+    let unreported = unreported_backends(data, &node_id, non_chat);
     let available_models = data
         .get("available_models")
         .and_then(Value::as_array)
@@ -1348,19 +1348,44 @@ pub fn node_facts_from_kv(key: &str, data: &Value, non_chat: &[(String, String)]
     }
 }
 
-/// The inference backends a heartbeat lists with an empty (or non-string)
-/// model: alive as far as the agent knows, but invisible to routing (185a).
-fn unreported_backends(data: &Value) -> Vec<String> {
+/// The chat-capable inference backends a heartbeat lists with an empty (or
+/// non-string) model: alive as far as the agent knows, but invisible to
+/// routing (185a). Left out, so the warning stays trustworthy: a backend
+/// placed for embed or rerank only (`non_chat`, never a chat lane), and one
+/// still warming up (`backend_containers.<bt>`: `warmup` running or `health`
+/// starting, #546), which every vLLM start would otherwise report.
+fn unreported_backends(data: &Value, node_id: &str, non_chat: &[(String, String)]) -> Vec<String> {
+    let warming = |bt: &str| {
+        let c = data.pointer(&format!("/backend_containers/{bt}"));
+        c.and_then(|c| c.get("warmup")).and_then(Value::as_str) == Some("running")
+            || c.and_then(|c| c.get("health")).and_then(Value::as_str) == Some("starting")
+    };
     data.get("running_backends")
         .or_else(|| data.get("backends"))
         .and_then(Value::as_object)
         .map(|o| {
             o.iter()
                 .filter(|(bt, m)| INFERENCE_TYPES.contains(&bt.as_str()) && m.as_str().is_none_or(str::is_empty))
+                .filter(|(bt, _)| !non_chat.iter().any(|(n, b)| n == node_id && b == *bt))
+                .filter(|(bt, _)| !warming(bt.as_str()))
                 .map(|(bt, _)| bt.clone())
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Warn for a node's unreported backends, only while the node itself is live
+/// by the table's own rule ([`health_of`]): a dead node's record lingers in
+/// the KV for its TTL and is not news. Both skip points call this.
+pub(crate) fn note_unreported(n: &NodeFacts) {
+    for bt in unreported_to_note(n) {
+        note_model_unreported(&n.node_id, bt);
+    }
+}
+
+/// The backends [`note_unreported`] warns for: none while the node is not live.
+fn unreported_to_note(n: &NodeFacts) -> &[String] {
+    if health_of(n).0 { &n.unreported } else { &[] }
 }
 
 /// How often one `(node, backend)` may log `backend_model_unreported`.
@@ -1505,9 +1530,7 @@ pub async fn load_table(state: &AppState) -> Result<ClassTable> {
     let (decl, placements) = declared_and_placements(state).await?;
     let nodes = kv_node_facts(state, &placements).await;
     for n in &nodes {
-        for bt in &n.unreported {
-            note_model_unreported(&n.node_id, bt);
-        }
+        note_unreported(n);
     }
     note_yaml_model_is_a_hint(state);
     Ok(build_table(&nodes, &placements, &decl))
@@ -1812,6 +1835,39 @@ mod tests {
         let d = t.class(CHAT_DEFAULT).expect("chat-default");
         let got: Vec<&str> = d.candidates.iter().map(|c| c.backend.as_str()).collect();
         assert_eq!(got, vec!["ollama"], "no routing change: the unreported backends are in no class");
+    }
+
+    /// harness's review of #619: the warning is only trustworthy if it is not
+    /// noise. An embed/rerank-only backend is never a chat lane; a vLLM
+    /// warming up names no model on every start; a dead node's record lingers.
+    #[test]
+    fn unreported_skips_non_chat_warming_and_dead_nodes() {
+        let rec = |containers: Value, hb: f64| serde_json::json!({
+            "id": "host3", "ip_address": "10.0.0.3", "last_heartbeat": hb,
+            "running_backends": {"vllm": "", "llamacpp": "", "ollama": ""},
+            "backend_containers": containers,
+        });
+        let non_chat = [("host3".to_string(), "llamacpp".to_string())];
+        let sorted = |mut v: Vec<String>| { v.sort(); v };
+
+        // llamacpp is placed for embed only: not a chat lane, no warning.
+        let f = node_facts_from_kv("host3", &rec(serde_json::json!({}), 1000.0), &non_chat, 1001.0);
+        assert_eq!(sorted(f.unreported.clone()), vec!["ollama".to_string(), "vllm".to_string()]);
+
+        // vLLM warming (#546) by either signal: not yet news.
+        for warm in [serde_json::json!({"vllm": {"warmup": "running"}}), serde_json::json!({"vllm": {"health": "starting"}})] {
+            let f = node_facts_from_kv("host3", &rec(warm, 1000.0), &non_chat, 1001.0);
+            assert_eq!(f.unreported, vec!["ollama".to_string()]);
+        }
+        // Warm and healthy, still no model: that is the case to report.
+        let f = node_facts_from_kv("host3", &rec(serde_json::json!({"vllm": {"warmup": "ok", "health": "healthy"}}), 1000.0), &non_chat, 1001.0);
+        assert_eq!(sorted(f.unreported.clone()), vec!["ollama".to_string(), "vllm".to_string()]);
+        assert_eq!(unreported_to_note(&f).len(), 2, "a live node is noted");
+
+        // The same record 10 minutes stale (dead, lingering in the KV): nothing noted.
+        let dead = node_facts_from_kv("host3", &rec(serde_json::json!({}), 1000.0), &non_chat, 1600.0);
+        assert!(!dead.unreported.is_empty());
+        assert!(unreported_to_note(&dead).is_empty(), "a dead node is not news");
     }
 
     #[test]

@@ -1088,6 +1088,8 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
     // anything not serving `chat`. Placements default to 'chat', so this is
     // a no-op for every backend not explicitly marked otherwise.
     let non_chat = non_chat_backends(state).await?;
+    // The same pairs as the class table's facts take them (185a's note).
+    let non_chat_pairs: Vec<(String, String)> = non_chat.iter().cloned().collect();
 
     let mut candidates: Vec<Candidate> = Vec::new();
     // Lanes dropped because a GPU hold keeps them out of routing.
@@ -1113,6 +1115,10 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
                                 .map(|l| scale_checked_load(&key, l))
                                 .unwrap_or(0.0);
 
+                            // 185a: backends that name no model are skipped
+                            // below; say so (live node, chat role, not warming),
+                            // by the class table's own facts.
+                            super::classes::note_unreported(&super::classes::node_facts_from_kv(&key, &data, &non_chat_pairs, now));
                             let paused = super::classes::paused_backends_of(&data);
                             let backends = data.get("running_backends")
                                 .or_else(|| data.get("backends"))
@@ -1121,13 +1127,7 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
                                 for (bt, model_val) in backends {
                                     if !inference_types.contains(&bt.as_str()) { continue; }
                                     let m = model_val.as_str().unwrap_or("");
-                                    if m.is_empty() {
-                                        // 185a: no model to route by; say so, rate-limited.
-                                        let node = data.get("id").and_then(|i| i.as_str()).unwrap_or(&key);
-                                        super::classes::note_model_unreported(node, bt);
-                                        continue;
-                                    }
-                                    {
+                                    if !m.is_empty() {
                                         let node_id = data.get("id")
                                             .and_then(|i| i.as_str())
                                             .unwrap_or(&key)
