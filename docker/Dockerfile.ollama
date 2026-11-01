@@ -47,7 +47,11 @@ ARG OLLAMA_VERSION=0.40.5
 ARG OLLAMA_SHA256_AMD64=dc5eabc292f9949546c90a97c820f924b035e05243b0de13c7f366182562169c
 ARG OLLAMA_SHA256_ARM64=fbe71ebb1a10e59b8480c4d2839826b5f9dff1a6d5c142428b2e7db9b1a2c642
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# The DHI +deb13u0+ apt skew (noomesh-internal 17a; why the package is the
+# regex /./ and the version a regex: Dockerfile.llamacpp's builder note).
+RUN printf 'Package: /./\nPin: version /\\+deb13u0\\+/\nPin-Priority: 1001\n' \
+        > /etc/apt/preferences.d/dhi-deb13u0-skew
+RUN apt-get update && apt-get install -y --no-install-recommends --allow-downgrades \
     curl ca-certificates zstd \
     && rm -rf /var/lib/apt/lists/*
 
@@ -71,7 +75,11 @@ RUN set -eu; \
 FROM ${DHI_REGISTRY}/uv:0-debian13-dev@sha256:538e03cfb921102dafe5a083a8fb4ee5a7758be4170f32788fac191325b0307d
 
 # ollama's runners link libstdc++ / libgomp; curl is the healthcheck.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# The DHI +deb13u0+ apt skew (noomesh-internal 17a; why the package is the
+# regex /./ and the version a regex: Dockerfile.llamacpp's builder note).
+RUN printf 'Package: /./\nPin: version /\\+deb13u0\\+/\nPin-Priority: 1001\n' \
+        > /etc/apt/preferences.d/dhi-deb13u0-skew
+RUN apt-get update && apt-get install -y --no-install-recommends --allow-downgrades \
     libstdc++6 libgomp1 curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
