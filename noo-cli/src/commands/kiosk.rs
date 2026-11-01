@@ -1671,6 +1671,104 @@ pub(crate) fn labels_line(s: &LabelsState) -> String {
 /// or Admin only, recorded with who and when, and applied on the display's
 /// next graph fetch with no gateway restart. The display's own credential
 /// can never reach it. While it is on, the page says `LABELS ON`.
+/// `quality=` on the display page: `lean`, `full`, or `auto` (the page
+/// measures its own frames: the env value empty).
+pub(crate) fn quality_value(word: &str) -> Result<&'static str, String> {
+    match word {
+        "lean" => Ok("lean"),
+        "full" => Ok("full"),
+        "auto" => Ok(""),
+        other => Err(format!("quality must be lean, full or auto, not {other}")),
+    }
+}
+
+/// `env` (the seat's /etc/default/kiosk) with `NOO_KIOSK_QUALITY` set to
+/// `quality` and every other line byte for byte as it was; the key is
+/// appended when an older setup did not write it.
+pub(crate) fn with_quality(env: &str, quality: &str) -> String {
+    let line = format!("NOO_KIOSK_QUALITY={quality}");
+    let mut found = false;
+    let mut out: Vec<String> = env
+        .lines()
+        .map(|l| {
+            if l.starts_with("NOO_KIOSK_QUALITY=") {
+                found = true;
+                line.clone()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    if !found {
+        out.push(line);
+    }
+    out.join("\n") + "\n"
+}
+
+/// `noo kiosk set quality lean|full|auto [--dry-run]`: change the display's
+/// drawing quality and nothing else (i65 2b). `noo kiosk setup --quality`
+/// rewrites the whole seat and needs --mode, --url and --view again, so a
+/// quality fix could change the URL or view by a typo. This edits one line of
+/// /etc/default/kiosk, keeps its mode and group, and restarts the display.
+pub fn kiosk_set(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let usage = "noo kiosk set quality lean|full|auto [--dry-run]";
+    let (word, dry_run) = match args {
+        [k, v] if k == "quality" => (v.as_str(), false),
+        [k, v, d] if k == "quality" && d == "--dry-run" => (v.as_str(), true),
+        _ => fail(g.json, ExitCode::Usage, "usage", &format!("usage: {usage}"), Some("noo kiosk set quality lean")),
+    };
+    let quality = match quality_value(word) {
+        Ok(q) => q,
+        Err(e) => fail(g.json, ExitCode::Usage, "usage", &e, Some("noo kiosk set quality lean")),
+    };
+    let Some(current) = sh_out(&format!("sudo cat {ENV_FILE}")) else {
+        fail(
+            g.json,
+            ExitCode::Generic,
+            "no_setup",
+            &format!("could not read {ENV_FILE}: this display is not set up (or sudo was refused)"),
+            Some("noo kiosk setup --mode dedicated --url https://<controller>.<tailnet>.ts.net"),
+        );
+    };
+    let next = with_quality(&current, quality);
+    let shown = if quality.is_empty() { "auto" } else { quality };
+    if env_line_value(&current, "NOO_KIOSK_QUALITY").as_deref() == Some(quality) {
+        if !g.json {
+            ui::done(&format!("quality is already {shown}; nothing changed"));
+        } else {
+            println!("{}", json!({"quality": shown, "changed": false}));
+        }
+        return Ok(0);
+    }
+    if dry_run {
+        if g.json {
+            println!("{}", json!({"quality": shown, "changed": false, "dry_run": true}));
+        } else {
+            println!("{}", ui::status_line(ui::Glyph::Warn, &format!("dry run: would set NOO_KIOSK_QUALITY={quality} in {ENV_FILE} and restart kiosk.service; nothing else changes")));
+        }
+        return Ok(0);
+    }
+    let user = env_line_value(&current, "NOO_KIOSK_USER").filter(|u| !u.is_empty()).unwrap_or_else(|| "kiosk".into());
+    if let Err(e) = install_text(&next, ENV_FILE, "0640", &format!("root -g {user}")) {
+        fail(g.json, ExitCode::Generic, "write", &e, Some("noo kiosk status"));
+    }
+    if let Err(e) = sh("sudo systemctl restart kiosk.service") {
+        fail(g.json, ExitCode::Generic, "systemctl", &e, Some("journalctl -u kiosk.service -n 50"));
+    }
+    if g.json {
+        println!("{}", json!({"quality": shown, "changed": true}));
+    } else {
+        ui::done(&format!("quality {shown}; the display restarted with it (the rest of the setup is unchanged)"));
+    }
+    Ok(0)
+}
+
+/// The value of `KEY=` in an env file's text, as written.
+fn env_line_value(env: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    env.lines().find_map(|l| l.strip_prefix(&prefix)).map(str::to_string)
+}
+
 pub fn kiosk_labels(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let want = match args {
         [a] if a == "on" => Some(true),
@@ -2710,6 +2808,31 @@ mod tests {
                  reach it by driving the browser by hand, which no restart survives"
             );
         }
+    }
+
+    /// i65 2b: `noo kiosk set quality` changes the one line and keeps
+    /// every other byte of the seat's env file; an older file without the
+    /// key gets it appended; `auto` is the empty value the page reads as
+    /// "decide for yourself"; anything else is refused.
+    #[test]
+    fn set_quality_changes_one_line_and_keeps_the_rest() {
+        let a = SetupArgs {
+            url: "https://c.tail.ts.net".into(), user: "kiosk".into(), view: "graph".into(), rotate: Some(30), poll: None,
+            quality: Some("full".into()), dry_run: false, yes: false, browser: None, mode: Mode::Dedicated, vt: DEDICATED_VT,
+        };
+        let env = render_env(&a);
+        let lean = with_quality(&env, "lean");
+        let diff: Vec<(&str, &str)> = env.lines().zip(lean.lines()).filter(|(x, y)| x != y).collect();
+        assert_eq!(diff, vec![("NOO_KIOSK_QUALITY=full", "NOO_KIOSK_QUALITY=lean")]);
+        assert_eq!(env.lines().count(), lean.lines().count());
+        assert!(lean.contains("NOO_KIOSK_URL=https://c.tail.ts.net\n") && lean.contains("NOO_KIOSK_VIEW=graph\n"));
+        assert!(with_quality(&env, "").contains("\nNOO_KIOSK_QUALITY=\n"), "auto is the empty value");
+        let old = "NOO_KIOSK_URL=https://x\nNOO_KIOSK_VIEW=health\n";
+        assert_eq!(with_quality(old, "lean"), "NOO_KIOSK_URL=https://x\nNOO_KIOSK_VIEW=health\nNOO_KIOSK_QUALITY=lean\n");
+        assert_eq!(quality_value("auto"), Ok(""));
+        assert_eq!(quality_value("lean"), Ok("lean"));
+        assert!(quality_value("medium").unwrap_err().contains("lean, full or auto"));
+        assert_eq!(env_line_value(&env, "NOO_KIOSK_USER").as_deref(), Some("kiosk"));
     }
 
     #[test]
