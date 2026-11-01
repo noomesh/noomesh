@@ -172,12 +172,11 @@ fn clean_attr(a: &Value) -> Option<Value> {
             return None;
         }
         json!({"stringValue": s})
-    } else if let Some(i) = v.get("intValue") {
+    } else {
+        let i = v.get("intValue")?;
         let n = i.as_str().map(str::to_string).or_else(|| i.as_i64().map(|n| n.to_string()))?;
         n.parse::<i64>().ok()?;
         json!({"intValue": n})
-    } else {
-        return None;
     };
     Some(json!({"key": key, "value": value}))
 }
