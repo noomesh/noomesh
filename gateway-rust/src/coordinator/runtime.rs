@@ -71,6 +71,13 @@ pub(crate) trait HarnessRuntime: Sync {
     async fn detect_model_from_prompt(&self, prompt: &str) -> Option<String>;
     async fn resolve_backend_for_model(&self, model: Option<&str>) -> Result<ResolvedBackend>;
     async fn resolve_backend_excluding(&self, model: Option<&str>, exclude_urls: &[String]) -> Result<ResolvedBackend>;
+    /// The node a backend URL belongs to and that backend's slots, for the
+    /// console's `routed` frame. A node harness does not know (its gateway
+    /// sends the turn's `routed` at dispatch), so the default is `None` and
+    /// no frame is sent.
+    async fn route_facts(&self, _url: &str, _backend: &str) -> Option<(String, Option<super::classes::Slots>)> {
+        None
+    }
     /// A cloud model, single turn, no tools. NOT the loop's path: the loop
     /// resolves a cloud model to a cloud backend and runs it with tools
     /// (i83 phase C). Kept for the harness rail's `CloudRun` op.
@@ -230,6 +237,15 @@ impl HarnessRuntime for InProcessRuntime<'_> {
 
     async fn resolve_backend_excluding(&self, model: Option<&str>, exclude_urls: &[String]) -> Result<ResolvedBackend> {
         super::backend::resolve_backend_excluding(self.state, model, exclude_urls).await
+    }
+
+    async fn route_facts(&self, url: &str, backend: &str) -> Option<(String, Option<super::classes::Slots>)> {
+        // A static or discovered backend is on no live node's record: name
+        // its host, slots unknown.
+        match super::classes::route_facts(self.state, url, backend).await {
+            Some(r) => Some(r),
+            None => super::backend::node_from_backend_url(url).map(|h| (h, None)),
+        }
     }
 
     async fn run_cloud_completion(&self, prompt: &str, conversation_id: &str, channel: &str, model: &str) -> Result<CoordinatorResult> {

@@ -419,6 +419,8 @@ receives flat JSON events, each with a `type`:
 ```json
 {"type": "metadata", "conversation_id": "…", "model": "…", "backend": "…"}
 {"type": "harness_dispatched", "node": "…", "kind": "…"}
+{"type": "phase", "phase": "routed", "node": "…", "backend": "…", "model": "…", "slots_busy": 2, "slots_total": 2, "queued_ahead": 1, "attempt": 1, "via": "gateway", "at_ms": 0}
+{"type": "phase", "phase": "prompt", "input_tokens": 1834, "at_ms": 0}
 {"type": "thinking", "text": "…"}
 {"type": "working", "text": "…"}
 {"type": "content", "text": "token"}
@@ -429,6 +431,17 @@ receives flat JSON events, each with a `type`:
 {"type": "done", "iterations": 3, "tool_calls": 2, "elapsed_seconds": 15.2}
 {"type": "keepalive"}
 ```
+
+`phase` says what a turn is doing before its first token, for the
+console's status line. `routed` names the node a model call went to and
+that backend's slots (null when its agent reports none). It is sent
+before each call, again with `queued_ahead` when the node agent says the
+request is waiting for a slot, and once by the gateway when a node
+harness takes the turn (`via: "harness"`). On a failover within one
+call it carries `attempt` 2 and up, with `previous_node` and
+`previous_reason`. `prompt` means the backend began answering, with the
+loop's estimate of the tokens sent. `at_ms` is the gateway's clock and
+is meant for logs; a client times phases from receipt.
 
 `working` comes only from a turn a node harness runs on a vendor kind
 (Copilot, Claude Code, Codex): the model's text as the harness's translator
