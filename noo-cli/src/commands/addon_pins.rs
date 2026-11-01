@@ -623,18 +623,18 @@ mod tests {
     #[test]
     fn verify_reports_the_registry_credential_state_never_the_value() {
         let root = "ghcr.io/example/intel";
-        let none = "addon_trust:\n  pai-voice:\n    registry: ghcr.io/example/intel\n    keys: []\n";
+        let none = "addon_trust:\n  rhaddon:\n    registry: ghcr.io/example/intel\n    keys: []\n";
         let rec = format!("{none}    registry_credential:\n      root: {root}\n");
         let never = |_: &str| -> Result<bool, String> { panic!("the store is not read without a record") };
-        let st = credential_state(none, "pai-voice", &never).unwrap();
+        let st = credential_state(none, "rhaddon", &never).unwrap();
         assert_eq!(st, CredState::NotSet);
-        assert_eq!(st.text("pai-voice"), "registry credential: not set");
-        let st = credential_state(&rec, "pai-voice", &|r| Ok(r == root)).unwrap();
-        assert_eq!(st.text("pai-voice"), format!("registry credential: set ({root})"));
-        let st = credential_state(&rec, "pai-voice", &|_| Ok(false)).unwrap();
+        assert_eq!(st.text("rhaddon"), "registry credential: not set");
+        let st = credential_state(&rec, "rhaddon", &|r| Ok(r == root)).unwrap();
+        assert_eq!(st.text("rhaddon"), format!("registry credential: set ({root})"));
+        let st = credential_state(&rec, "rhaddon", &|_| Ok(false)).unwrap();
         assert_eq!(st, CredState::Missing(root.to_string()));
-        assert!(st.text("pai-voice").contains(&format!("noo addons registry-login pai-voice --registry {root}")), "{}", st.text("pai-voice"));
-        assert!(credential_state(&rec, "pai-voice", &|_| Err("sops: no key".into())).is_err());
+        assert!(st.text("rhaddon").contains(&format!("noo addons registry-login rhaddon --registry {root}")), "{}", st.text("rhaddon"));
+        assert!(credential_state(&rec, "rhaddon", &|_| Err("sops: no key".into())).is_err());
     }
 
     use super::*;
