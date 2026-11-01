@@ -715,6 +715,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["kiosk", "reload"], commands::kiosk_reload),
     (&["kiosk", "seat-sync"], commands::kiosk_seat_sync),
     (&["kiosk", "seat-token"], commands::kiosk_seat_token),
+    (&["kiosk", "seats"], commands::kiosk_seats),
     (&["kiosk", "serve"], commands::kiosk_serve),
     (&["kiosk", "set"], commands::kiosk_set),
     (&["kiosk", "setup"], commands::kiosk_setup),

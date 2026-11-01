@@ -1290,8 +1290,10 @@ pub fn kiosk_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             "seat",
             ui::muted("not installed on this box (no kiosk.service unit, no published state, no proxy, no browser)").to_string(),
         )]));
+        super::kiosk_seat::print_seats_if_any(g);
         ui::guide(&[
             ("noo kiosk setup", "install the seat ON the display box; a controller has no seat of its own"),
+            ("noo kiosk seats", "on the controller: every enrolled display, one row each"),
             ("noo kiosk seat-token <name>", "on the controller: mint the paste a new display enrolls with"),
         ]);
         return Ok(0);
