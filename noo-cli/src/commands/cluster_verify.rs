@@ -10933,7 +10933,7 @@ mod digest_tests {
 
     const PLAIN: &str = "plaintext, in the clear on that disk";
 
-    /// A realistic controller section: lots of passes, nine at-rest rows (one
+    /// A realistic controller section: lots of passes, every at-rest row (one
     /// of them a warning), a failing sandbox row and a warning.
     fn controller() -> Vec<Check> {
         let mut v: Vec<Check> = ["posture", "service keys", "pki key modes", "postgres tls", "gateway redis", "nats bus"]
@@ -10954,14 +10954,18 @@ mod digest_tests {
     fn many_passes_and_one_fail_digest_to_the_counts_and_the_problem_rows() {
         let checks = controller();
         let d = digest(&checks, false);
-        assert_eq!(d.counts, Counts { ok: 14, warn: 2, fail: 1, accepted: 0 });
+        // Six named passes and every at-rest row but postgres's warning:
+        // counted from the table, so a new at-rest row (tempo, i359) does not
+        // break it.
+        let passes = 6 + AT_REST_DIR_ROWS.len() - 1;
+        assert_eq!(d.counts, Counts { ok: passes, warn: 2, fail: 1, accepted: 0 });
         assert!(d.rows.iter().all(|c| c.verdict != Verdict::Ok), "a passing row reached the digest: {:?}", d.rows);
         let names: Vec<&str> = d.rows.iter().map(|c| c.name).collect();
         assert_eq!(names, vec!["data at rest", "sandbox", "backup age"]);
         // The remedy still prints, from the full list of checks.
         assert_eq!(remedies_to_print("controller", &checks)[0].0, "noo sandbox doctor");
         let line = summary_line("controller", &d.counts);
-        assert!(line.contains("controller") && line.contains("14") && line.contains('1'), "{line}");
+        assert!(line.contains("controller") && line.contains(&passes.to_string()) && line.contains('1'), "{line}");
     }
 
     #[test]
