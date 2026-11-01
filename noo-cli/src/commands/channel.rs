@@ -268,10 +268,33 @@ pub(crate) fn migrate_legacy_base_registry(g: &Globals, check_only: bool) {
     }
 }
 
+/// Why a channel switch is refused on this machine, or None. A box with no
+/// install root (`home`, `~/.noo`) is a kiosk seat or a CLI-only machine: its
+/// channel is not set here. Seats are restaged by the controller (`noo
+/// upgrade --all`, or `--seats`, i77), so the channel is the controller's and
+/// the seat follows it. Refused before anything is written: a switch used to
+/// die mid-way with "could not record the previous channel" (i65). Never
+/// creates `home`.
+pub(crate) fn seat_refusal(home: &Path) -> Option<String> {
+    if home.is_dir() {
+        return None;
+    }
+    Some(format!(
+        "this machine has no install root ({}): it is a kiosk seat or a CLI-only box, and a seat's \
+         release channel is not set on the seat. Switch the channel on the controller \
+         (for example `noo upgrade --channel public` there); the seat follows on the controller's next \
+         `noo upgrade --all` (or `noo upgrade --seats`)",
+        home.display()
+    ))
+}
+
 /// Run the channel step. Returns `Some(code)` when the run should end here
 /// (`--check`, or already on the channel with nothing else asked), else
 /// `None` and the normal upgrade continues against the new channel.
 pub(crate) fn run(g: &Globals, req: Request, yes: bool, check_only: bool, installed: &str) -> Option<i32> {
+    if let Some(why) = seat_refusal(&crate::onboard::standalone::default_home()) {
+        fail(g.json, ExitCode::Generic, "no_install_root", &why, Some("nothing was changed"));
+    }
     let now = current();
     let target = match &req {
         Request::Public => Channel::public(),
@@ -373,6 +396,31 @@ pub(crate) fn run(g: &Globals, req: Request, yes: bool, check_only: bool, instal
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// i65: a seat (no install root) is refused before anything is written,
+    /// with where the channel IS set, and nothing is created; an install
+    /// root lets the switch proceed. The refusal is the first thing `run`
+    /// does, before the snapshot write that used to fail.
+    #[test]
+    fn a_seat_without_an_install_root_is_refused_and_nothing_is_created() {
+        let base = std::env::temp_dir().join(format!("noo-i65-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let home = base.join(".noo");
+        let why = seat_refusal(&home).expect("a seat is refused");
+        assert!(why.contains("no install root") && why.contains("on the controller"), "{why}");
+        assert!(why.contains("noo upgrade --all") && why.contains("noo upgrade --seats"), "{why}");
+        assert!(!home.exists(), "the refusal created the install root");
+        std::fs::create_dir_all(&home).unwrap();
+        assert_eq!(seat_refusal(&home), None, "an install root may switch");
+        let _ = std::fs::remove_dir_all(&base);
+
+        let src = include_str!("channel.rs");
+        let run = &src[src.find("pub(crate) fn run(").expect("run")..];
+        let refuse = run.find("seat_refusal(").expect("run checks for a seat");
+        assert!(refuse < run.find("write_snapshot(").expect("run writes the snapshot"), "the seat check must come before any write");
+        assert!(refuse < run.find("resolve_latest(").expect("run probes"), "and before the network probe");
+    }
 
     fn ch(r: &str, p: &str, b: &str) -> Channel {
         Channel { repo: r.into(), image_prefix: p.into(), base_registry: b.into() }
