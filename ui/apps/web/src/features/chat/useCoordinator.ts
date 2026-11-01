@@ -203,6 +203,15 @@ const GREETING: ChatTurn = {
   text: 'Connected to the mesh. Ask me about the cluster, or anything else.',
 };
 
+/**
+ * The longest an in-flight turn may go without ANY frame before the console
+ * gives up on it. The gateway sends a `keepalive` frame every 30 s while a turn
+ * runs, so this is three missed keepalives: the turn (or the socket under it)
+ * is gone. Without it, a turn whose `done` never arrived left the composer
+ * disabled while the status read `live`, until a page reload (0.6.15).
+ */
+export const TURN_IDLE_MS = 95_000;
+
 /** Live coordinator chat over /ws/coordinator via @metis/api's reconnecting socket. */
 export function useCoordinator() {
   const [messages, setMessages] = useState<ChatTurn[]>([GREETING]);
@@ -212,9 +221,16 @@ export function useCoordinator() {
   // would misroute the first turn's content/done frames into the wrong bubble).
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
+  // The in-flight turn's idle clock (TURN_IDLE_MS); re-armed by every frame.
+  const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearIdle = () => {
+    if (idleTimer.current !== null) clearTimeout(idleTimer.current);
+    idleTimer.current = null;
+  };
   const mark = (v: boolean) => {
     busyRef.current = v;
     setBusy(v);
+    if (!v) clearIdle();
   };
   const sockRef = useRef<ManagedSocket | null>(null);
   const convId = useRef<string | null>(null);
@@ -247,6 +263,29 @@ export function useCoordinator() {
       return copy;
     });
 
+  /**
+   * End the in-flight turn from this side: the bubble says why, the composer
+   * unlocks, and the socket is replaced. The gateway runs one turn at a time
+   * per socket, so a hung turn on the old one would otherwise swallow the next
+   * prompt; a fresh socket is a fresh session (the conversation id is kept).
+   * The old socket's handlers are detached by reconnectNow, so a late frame
+   * from the abandoned turn cannot land in the next reply.
+   */
+  const interrupt = (why: string) => {
+    if (!busyRef.current) return;
+    takeThinkMs();
+    patchLast((l) => ({ text: (l.text ? `${l.text}\n` : '') + `⚠ ${why}`, streaming: false, error: true }));
+    mark(false);
+    sockRef.current?.reconnectNow();
+  };
+  const armIdle = () => {
+    clearIdle();
+    idleTimer.current = setTimeout(
+      () => interrupt(`No word from the mesh for ${TURN_IDLE_MS / 1000} s; this reply was cut off. Send it again.`),
+      TURN_IDLE_MS,
+    );
+  };
+
   useEffect(() => {
     const sock = createSocket('/ws/coordinator', {
       baseUrl: '',
@@ -265,6 +304,8 @@ export function useCoordinator() {
       onAuthFail: () => setStatus('auth'),
       onMessage: (data) => {
         const f = data as CoordFrame;
+        // Any frame, keepalive included, is the turn (and its socket) alive.
+        if (busyRef.current) armIdle();
         switch (f.type) {
           case 'metadata':
             if (f.conversation_id) convId.current = f.conversation_id;
@@ -422,7 +463,10 @@ export function useCoordinator() {
       },
     });
     sockRef.current = sock;
-    return () => sock.close();
+    return () => {
+      clearIdle();
+      sock.close();
+    };
   }, []);
 
   /** `model` is the user's override from the picker; null/'' means let the gateway choose. */
@@ -449,11 +493,15 @@ export function useCoordinator() {
     if (!ok) return;
     thinkStart.current = null;
     mark(true);
+    armIdle();
     setMessages((ms) => [...ms, { role: 'you', text: p }, { role: 'metis', text: '', streaming: true }]);
   };
 
   // Only allow a send when connected and no turn is mid-stream.
   const canSend = status === 'live' && !busy;
 
-  return { messages, status, send, canSend, busy, serving };
+  /** The Stop button: give up on the in-flight turn now (see `interrupt`). */
+  const stop = () => interrupt('Stopped. The mesh may still finish that turn, but it will not appear here.');
+
+  return { messages, status, send, stop, canSend, busy, serving };
 }

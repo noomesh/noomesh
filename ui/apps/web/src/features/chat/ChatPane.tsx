@@ -174,7 +174,7 @@ function StatsFooter({ stats }: { stats: TurnStats }) {
 }
 
 export function ChatPane({ panelHidden, onTogglePanel, onToggleChat, collapsed }: ChatPaneProps) {
-  const { messages, status, send, canSend, busy, serving } = useCoordinator();
+  const { messages, status, send, stop, canSend, busy, serving } = useCoordinator();
   const health = useBackendHealth();
   const [draft, setDraft] = useState('');
   const [model, setModel] = useState('');
@@ -384,11 +384,21 @@ export function ChatPane({ panelHidden, onTogglePanel, onToggleChat, collapsed }
               onError={setVoiceError}
             />
           )}
-          <Button type="submit" size="icon" aria-label="Send" disabled={!sendable}>
-            <svg viewBox="0 0 20 20" fill="currentColor">
-              <path d="M3 10l14-6-6 14-2-6z" />
-            </svg>
-          </Button>
+          {busy ? (
+            // A turn in flight: Stop gives up on it here (the composer never
+            // stays locked behind a reply that will not finish).
+            <Button type="button" size="icon" aria-label="Stop" onClick={stop}>
+              <svg viewBox="0 0 20 20" fill="currentColor">
+                <rect x="5" y="5" width="10" height="10" rx="1" />
+              </svg>
+            </Button>
+          ) : (
+            <Button type="submit" size="icon" aria-label="Send" disabled={!sendable}>
+              <svg viewBox="0 0 20 20" fill="currentColor">
+                <path d="M3 10l14-6-6 14-2-6z" />
+              </svg>
+            </Button>
+          )}
         </div>
 
         {voiceError && voice.mic !== 'hidden' && (
