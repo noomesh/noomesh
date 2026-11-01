@@ -2,7 +2,7 @@
 // Copyright 2026 PersonifAI LLC
 
 // @vitest-environment jsdom
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 
 // Hoisted so the vi.mock factory can reference the fake socket without a TDZ error.
@@ -37,7 +37,7 @@ vi.mock('@/lib/client', () => ({
   refreshToken: async () => 'tok',
 }));
 
-import { useCoordinator, type ChatTurn } from './useCoordinator';
+import { useCoordinator, TURN_IDLE_MS, type ChatTurn } from './useCoordinator';
 
 const last = (arr: ChatTurn[]) => arr[arr.length - 1]!;
 const fire = (name: string, arg?: unknown) => act(() => H.opts.current[name]?.(arg));
@@ -46,6 +46,11 @@ beforeEach(() => {
   H.sock.readyState = 0;
   H.sock.send.mockClear();
   H.opts.current = {};
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 describe('useCoordinator', () => {
@@ -443,5 +448,66 @@ describe('useCoordinator', () => {
     fire('onMessage', { type: 'error', text: 'backend down' });
     expect(last(result.current.messages)).toMatchObject({ text: '⚠ backend down', error: true });
     expect(result.current.canSend).toBe(true);
+  });
+
+  // ── a turn whose done never arrives (0.6.15: Send stayed disabled while live) ──
+
+  const inFlight = () => {
+    const hook = renderHook(() => useCoordinator());
+    fire('onOpen', {});
+    H.sock.readyState = 1;
+    act(() => hook.result.current.send('q'));
+    return hook;
+  };
+
+  it('gives up on a turn after TURN_IDLE_MS with no frame: composer unlocks, socket replaced', () => {
+    vi.useFakeTimers();
+    const reconnect = vi.spyOn(H.sock, 'reconnectNow');
+    const { result } = inFlight();
+    fire('onMessage', { type: 'content', text: 'partial' });
+
+    act(() => vi.advanceTimersByTime(TURN_IDLE_MS - 1));
+    expect(result.current.canSend).toBe(false);
+    // A keepalive is the turn still alive: the clock starts again.
+    fire('onMessage', { type: 'keepalive' });
+    act(() => vi.advanceTimersByTime(TURN_IDLE_MS - 1));
+    expect(result.current.canSend).toBe(false);
+    expect(reconnect).not.toHaveBeenCalled();
+
+    act(() => vi.advanceTimersByTime(1));
+    expect(result.current.canSend).toBe(true);
+    expect(result.current.status).toBe('live');
+    const l = last(result.current.messages);
+    expect(l).toMatchObject({ streaming: false, error: true });
+    expect(l.text).toContain('partial');
+    expect(l.text).toContain('cut off');
+    expect(reconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('a finished turn leaves no idle clock behind', () => {
+    vi.useFakeTimers();
+    const reconnect = vi.spyOn(H.sock, 'reconnectNow');
+    const { result } = inFlight();
+    fire('onMessage', { type: 'content', text: 'done answer' });
+    fire('onMessage', { type: 'done' });
+    act(() => vi.advanceTimersByTime(TURN_IDLE_MS * 2));
+    expect(last(result.current.messages)).toMatchObject({ text: 'done answer' });
+    expect(last(result.current.messages).error).toBeFalsy();
+    expect(reconnect).not.toHaveBeenCalled();
+  });
+
+  it('stop() ends the in-flight turn at once and replaces the socket; idle, it does nothing', () => {
+    const reconnect = vi.spyOn(H.sock, 'reconnectNow');
+    const { result } = inFlight();
+    act(() => result.current.stop());
+    expect(result.current.canSend).toBe(true);
+    expect(last(result.current.messages)).toMatchObject({ streaming: false, error: true });
+    expect(last(result.current.messages).text).toContain('Stopped');
+    expect(reconnect).toHaveBeenCalledTimes(1);
+
+    const before = result.current.messages.length;
+    act(() => result.current.stop());
+    expect(result.current.messages.length).toBe(before);
+    expect(reconnect).toHaveBeenCalledTimes(1);
   });
 });
