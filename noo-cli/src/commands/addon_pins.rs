@@ -299,6 +299,36 @@ pub(crate) fn verify_one(
     v
 }
 
+/// A third-party add-on's registry credential as `verify` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CredState {
+    NotSet,
+    Set(String),
+    /// The trust entry records one for this root and the store holds none.
+    Missing(String),
+}
+
+impl CredState {
+    /// The row text; never the value.
+    pub(crate) fn text(&self, addon: &str) -> String {
+        match self {
+            CredState::NotSet => "registry credential: not set".to_string(),
+            CredState::Set(r) => format!("registry credential: set ({r})"),
+            CredState::Missing(r) => format!(
+                "registry credential: recorded for {r} but missing from the store; register it again with \
+                 `noo addons registry-login {addon} --registry {r}`"
+            ),
+        }
+    }
+}
+
+/// The credential state of `addon` from the noomesh.yaml TEXT; `in_store` is
+/// asked only when the trust entry records one (given the recorded root).
+pub(crate) fn credential_state(text: &str, addon: &str, in_store: &dyn Fn(&str) -> Result<bool, String>) -> Result<CredState, String> {
+    let Some(root) = crate::addons::trust::credential_root(text, addon) else { return Ok(CredState::NotSet) };
+    Ok(if in_store(&root)? { CredState::Set(root) } else { CredState::Missing(root) })
+}
+
 /// `noo addons verify`
 pub fn addons_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     match args {
@@ -324,7 +354,19 @@ pub fn addons_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     };
     let verdicts: Vec<Verdict> =
         list.iter().map(|a| verify_one(&root, a, &tag, resolve::installed_anchor(a), &mut docker, &running)).collect();
-    let bad = verdicts.iter().filter(|v| v.problem.is_some()).count();
+    // Third-party add-ons: is a registry credential set (the trust entry says;
+    // the store is read only when it records one).
+    let text = std::fs::read_to_string(crate::commands::addons::config_path()).unwrap_or_default();
+    let creds: std::collections::BTreeMap<String, Result<CredState, String>> = list
+        .iter()
+        .filter(|a| resolve::third_party(a))
+        .map(|a| {
+            let st = credential_state(&text, a, &|root| addons::lock_fetch::stored_bound(a, root).map(|b| b.is_some()));
+            (a.to_string(), st)
+        })
+        .collect();
+    let cred_bad = creds.values().filter(|c| !matches!(c, Ok(CredState::NotSet | CredState::Set(_)))).count();
+    let bad = verdicts.iter().filter(|v| v.problem.is_some()).count() + cred_bad;
     if g.json {
         let rows: Vec<_> = verdicts
             .iter()
@@ -334,9 +376,14 @@ pub fn addons_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 "key_index": v.pin.as_ref().map(|p| p.key_index), "images": v.pin.as_ref().map(|p| &p.images),
                 "dev_expires_at": v.pin.as_ref().and_then(|p| p.dev_expires_at).map(crate::addon_lock::utc_rfc3339),
                 "pulled_from": v.pin.as_ref().and_then(|p| p.pulled_from.as_ref()),
+                "registry_credential": creds.get(&v.addon).map(|c| match c {
+                    Ok(st) => st.text(&v.addon),
+                    Err(e) => format!("registry credential: unreadable ({e})"),
+                }),
             }))
             .collect();
-        println!("{}", json!({"stack": tag, "verified": verdicts.len() - bad, "failed": bad, "addons": rows}));
+        let ok = verdicts.iter().filter(|v| v.problem.is_none()).count();
+        println!("{}", json!({"stack": tag, "verified": ok, "failed": bad, "addons": rows}));
         return Ok(if bad == 0 { 0 } else { 1 });
     }
     println!("{}", ui::header("add-on pins", Some(&format!("stack {tag}"))));
@@ -357,6 +404,12 @@ pub fn addons_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             }
             (Some(why), _) => println!("{}", ui::status_line(ui::Glyph::Err, &format!("{}: {why}", v.addon))),
             (None, None) => {}
+        }
+        match creds.get(&v.addon) {
+            Some(Ok(st @ CredState::Missing(_))) => println!("{}", ui::status_line(ui::Glyph::Err, &format!("{}: {}", v.addon, st.text(&v.addon)))),
+            Some(Ok(st)) => println!("{}", ui::muted(&format!("  {}: {}", v.addon, st.text(&v.addon)))),
+            Some(Err(e)) => println!("{}", ui::status_line(ui::Glyph::Err, &format!("{}: registry credential could not be read: {e}", v.addon))),
+            None => {}
         }
     }
     if bad > 0 {
@@ -564,6 +617,26 @@ pub(crate) fn pin_cells(pin: Option<&pins::Pin>) -> [String; 4] {
 
 #[cfg(test)]
 mod tests {
+
+    /// `verify`'s credential row: set, not set, and recorded-but-missing (a
+    /// failure that names the verb). The store is asked only for a record.
+    #[test]
+    fn verify_reports_the_registry_credential_state_never_the_value() {
+        let root = "ghcr.io/example/intel";
+        let none = "addon_trust:\n  pai-voice:\n    registry: ghcr.io/example/intel\n    keys: []\n";
+        let rec = format!("{none}    registry_credential:\n      root: {root}\n");
+        let never = |_: &str| -> Result<bool, String> { panic!("the store is not read without a record") };
+        let st = credential_state(none, "pai-voice", &never).unwrap();
+        assert_eq!(st, CredState::NotSet);
+        assert_eq!(st.text("pai-voice"), "registry credential: not set");
+        let st = credential_state(&rec, "pai-voice", &|r| Ok(r == root)).unwrap();
+        assert_eq!(st.text("pai-voice"), format!("registry credential: set ({root})"));
+        let st = credential_state(&rec, "pai-voice", &|_| Ok(false)).unwrap();
+        assert_eq!(st, CredState::Missing(root.to_string()));
+        assert!(st.text("pai-voice").contains(&format!("noo addons registry-login pai-voice --registry {root}")), "{}", st.text("pai-voice"));
+        assert!(credential_state(&rec, "pai-voice", &|_| Err("sops: no key".into())).is_err());
+    }
+
     use super::*;
     use crate::addons::resolve::tests::{anchor, lock, signed, signed_bundle, FakeDocker, OVERLAY, ROOT};
 
