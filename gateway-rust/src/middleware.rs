@@ -1764,12 +1764,12 @@ pub async fn security_headers(request: Request, next: Next) -> Response {
             }
         },
     }
-    if std::env::var("NOO_TLS_CERT").ok().filter(|v| !v.is_empty()).is_some() {
-        set(
-            axum::http::header::STRICT_TRANSPORT_SECURITY,
-            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
-        );
-    }
+    // Unconditional: the gateway serves HTTPS and nothing else
+    // (`tls::require_server_material`), so every response came over TLS.
+    set(
+        axum::http::header::STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+    );
     response
 }
 
@@ -2391,6 +2391,30 @@ mod csp_default_tests {
         let body = src.split("pub async fn security_headers(").nth(1).unwrap().split("\n}\n").next().unwrap();
         assert!(body.contains("csp_choice(csp_env.as_deref())"));
         assert!(body.contains("X_FRAME_OPTIONS"));
+    }
+
+    /// HSTS rides every response with no env at all (1242 finding 4). It
+    /// used to hang off `NOO_TLS_CERT`, which `tls::require_server_material`
+    /// makes mandatory at boot, so the predicate could never be false in a
+    /// running gateway; it is gone, and no variable can switch HSTS off.
+    #[tokio::test]
+    async fn hsts_is_sent_with_no_env() {
+        let src = include_str!("middleware.rs");
+        let body = src.split("pub async fn security_headers(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let code: String = body.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        assert!(!code.contains("NOO_TLS_CERT"), "HSTS is conditional on an env var again");
+
+        let app = axum::Router::new()
+            .route("/x", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(security_headers));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://127.0.0.1:{}/x", listener.local_addr().unwrap().port());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let r = reqwest::Client::new().get(&url).send().await.unwrap();
+        assert_eq!(
+            r.headers().get("strict-transport-security").and_then(|v| v.to_str().ok()),
+            Some("max-age=31536000; includeSubDomains"),
+        );
     }
 }
 

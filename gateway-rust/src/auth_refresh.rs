@@ -134,14 +134,13 @@ pub fn hash_token(raw: &str) -> String {
 
 /// Build the `Set-Cookie` header value for a refresh token.
 ///
-/// `secure` should mirror whether the gateway is serving HTTPS — when
-/// false (dev http on localhost) the cookie still applies but the
-/// browser won't restrict it to TLS. Production deployments always
-/// have `NOO_TLS_CERT` set and so always pass `secure=true`.
-pub fn build_refresh_cookie(raw_token: &str, secure: bool, ttl_days: i64) -> Cookie<'static> {
+/// Always `Secure`: the gateway serves HTTPS and nothing else
+/// (`tls::require_server_material` refuses to start without its leaf), so
+/// there is no plain-HTTP session for a non-`Secure` cookie to serve.
+pub fn build_refresh_cookie(raw_token: &str, ttl_days: i64) -> Cookie<'static> {
     let mut cookie = Cookie::new(REFRESH_COOKIE_NAME, raw_token.to_string());
     cookie.set_http_only(true);
-    cookie.set_secure(secure);
+    cookie.set_secure(true);
     cookie.set_same_site(SameSite::Strict);
     cookie.set_path("/api/auth");
     cookie.set_max_age(time::Duration::seconds(ttl_days * 86400));
@@ -150,10 +149,10 @@ pub fn build_refresh_cookie(raw_token: &str, secure: bool, ttl_days: i64) -> Coo
 
 /// Build the `Set-Cookie` header to *clear* the refresh cookie on
 /// logout. Same name + path as the live cookie, with `Max-Age=0`.
-pub fn build_clear_cookie(secure: bool) -> Cookie<'static> {
+pub fn build_clear_cookie() -> Cookie<'static> {
     let mut cookie = Cookie::new(REFRESH_COOKIE_NAME, "");
     cookie.set_http_only(true);
-    cookie.set_secure(secure);
+    cookie.set_secure(true);
     cookie.set_same_site(SameSite::Strict);
     cookie.set_path("/api/auth");
     cookie.set_max_age(time::Duration::ZERO);
@@ -454,6 +453,22 @@ pub fn time_until(when: DateTime<Utc>) -> Duration {
 #[cfg(test)]
 mod prefix_tests {
     use super::*;
+
+    /// The refresh cookie and its clearing twin are `Secure` with no env at
+    /// all (1242 finding 4). The gateway cannot boot without its TLS leaf
+    /// (`tls::require_server_material`), so `NOO_TLS_CERT` and the retired
+    /// `NOO_BEHIND_TLS_PROXY` decided nothing; an old `.env` that still sets
+    /// the proxy variable is ignored because nothing reads it.
+    #[test]
+    fn refresh_cookies_are_always_secure() {
+        assert_eq!(build_refresh_cookie("noo-rt-x", 1).secure(), Some(true));
+        assert_eq!(build_clear_cookie().secure(), Some(true));
+        for (name, src) in [("auth_refresh.rs", include_str!("auth_refresh.rs")), ("routes/core.rs", include_str!("routes/core.rs"))] {
+            let code = src.split("#[cfg(test)]").next().unwrap_or(src);
+            assert!(!code.contains("NOO_BEHIND_TLS_PROXY"), "{name} reads the retired proxy switch again");
+            assert!(!code.contains("set_secure(secure)"), "{name}: the cookie's Secure flag is a parameter again");
+        }
+    }
 
     fn body_is_43_base64url(body: &str) -> bool {
         body.len() == 43

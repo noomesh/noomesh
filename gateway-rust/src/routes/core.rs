@@ -46,24 +46,6 @@ fn token_expire_minutes() -> i64 {
     auth_refresh::default_access_minutes()
 }
 
-/// True when the SESSION is HTTPS — controls the `Secure` flag on the
-/// refresh cookie.
-///
-/// The gateway's own certificate is one way to be sure; the other is
-/// sitting behind a TLS-terminating proxy, where the gateway itself
-/// speaks plain HTTP and would otherwise issue the cookie without
-/// `Secure`. `SameSite=Strict` + the `/api/auth` path
-/// still block CSRF either way; this is about transport exposure.
-/// `NOO_BEHIND_TLS_PROXY=1` declares that deployment shape.
-fn is_secure() -> bool {
-    let own_tls = std::env::var("NOO_TLS_CERT").map(|s| !s.is_empty()).unwrap_or(false);
-    let proxied = matches!(
-        std::env::var("NOO_BEHIND_TLS_PROXY").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("on")
-    );
-    own_tls || proxied
-}
-
 /// The scopes a token carries during the dual-accept window:
 /// the legacy tier scopes DERIVED from the role — the role column is the
 /// source of truth, stored scopes are never copied verbatim — plus any
@@ -661,7 +643,7 @@ async fn issue_login(state: &AppState, user: &UserRecord, ua: Option<&str>, ip: 
     }
 
     // Build the Set-Cookie header for the refresh.
-    let cookie = auth_refresh::build_refresh_cookie(&raw_refresh, is_secure(), refresh_ttl_days);
+    let cookie = auth_refresh::build_refresh_cookie(&raw_refresh, refresh_ttl_days);
     let jar = CookieJar::new().add(cookie);
 
     (
@@ -831,11 +813,7 @@ async fn auth_refresh_handler(
                 let labels = std::collections::HashMap::from([("lane".to_string(), "refresh_token_unprefixed".to_string())]);
                 state.metrics.inc_counter("noo_legacy_lane_uses_total", Some(&labels), 1).await;
             }
-            let cookie = auth_refresh::build_refresh_cookie(
-                &new_raw,
-                is_secure(),
-                auth_refresh::refresh_ttl_days(),
-            );
+            let cookie = auth_refresh::build_refresh_cookie(&new_raw, auth_refresh::refresh_ttl_days());
             let jar = CookieJar::new().add(cookie);
             (
                 jar,
@@ -1156,7 +1134,7 @@ async fn auth_logout_handler(
         let closed = state.alert_hub.end_sessions(&account);
         tracing::info!(user_id = %account, sockets = closed, floor_shared = raised.shared, "auth_logout ended open sockets");
     }
-    let clear = auth_refresh::build_clear_cookie(is_secure());
+    let clear = auth_refresh::build_clear_cookie();
     let jar = CookieJar::new().add(clear);
     (jar, Json(json!({"ok": true}))).into_response()
 }
