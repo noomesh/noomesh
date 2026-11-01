@@ -5472,7 +5472,7 @@ mod approval_decider_tests {
             scopes: vec!["read".into(), "write".into(), "admin".into()],
             role: Role::Admin,
             harness: harness.map(String::from),
-            act: act.then(|| Actor { sub: "svc:worker".into(), iss_user: None, task: Some("t1".into()) }),
+            act: act.then(|| Actor { sub: "svc:worker".into(), iss_user: None, task: Some("t1".into()), feature: None }),
         }))
     }
 

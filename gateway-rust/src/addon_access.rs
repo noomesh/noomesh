@@ -356,6 +356,21 @@ pub fn ui_opens_for(m: &AddonManifest, ui: &UiSpec, role: Option<Role>, account:
     }
 }
 
+/// The `x-noo-requester-features` value for this requester and add-on: the
+/// declared features it holds, comma-separated, in declaration order. `None`
+/// for a manifest without features (the header is not sent at all).
+pub fn requester_features(m: &AddonManifest, r: &RequesterCtx) -> Option<String> {
+    if m.features.is_empty() {
+        return None;
+    }
+    let account = crate::auth::account_of(&r.sub);
+    Some(held_features(m, |f| feature_allows(&m.addon, f, account, r.role).allowed))
+}
+
+fn held_features(m: &AddonManifest, holds: impl Fn(&str) -> bool) -> String {
+    m.features.iter().filter(|f| holds(&f.name)).map(|f| f.name.as_str()).collect::<Vec<_>>().join(",")
+}
+
 /// One refusal shape on every surface (f99 section 5): the add-on, the
 /// feature in the add-on's words, the account and the setting that decided.
 /// It never lists who DOES hold the feature.
@@ -547,6 +562,24 @@ mod tests {
         for f in ["fn owner_scoped_allows_for(", "fn get_allows_for("] {
             assert!(body(proxy, f).contains("crate::addon_access::route_permits("), "{f}");
         }
+    }
+
+    /// f99: the hint header lists exactly the held features, in declaration
+    /// order, and is not sent at all for a manifest without features.
+    #[test]
+    fn the_requester_features_hint_lists_what_is_held_and_nothing_for_a_legacy_manifest() {
+        let m = manifest(json!({
+            "version": 1, "addon": "evolve", "base_url_env": "NOO_EVOLVE_URL", "base_url_default": "https://noo-evolve:8090",
+            "features": [{"name": "converse", "title": "Talk", "suggested": "user"},
+                         {"name": "transcripts", "title": "Read", "suggested": "user"},
+                         {"name": "manage", "title": "Manage", "suggested": "operator"}],
+            "routes": [{"name": "s", "method": "GET", "path": "/api/sample/s", "feature": "converse"}]
+        }));
+        assert_eq!(held_features(&m, |f| f != "transcripts"), "converse,manage");
+        assert_eq!(held_features(&m, |_| false), "");
+        let r = RequesterCtx { sub: "ana".into(), scopes: vec![], role: Role::Admin, harness: None, act: None };
+        assert!(requester_features(&legacy(), &r).is_none(), "no header for a legacy manifest");
+        assert_eq!(requester_features(&m, &r).as_deref(), Some(""), "nothing held before the settings load");
     }
 
     #[test]
