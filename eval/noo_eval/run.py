@@ -37,12 +37,12 @@ import sys
 import time
 from pathlib import Path
 
-from . import collector, driver, harness_compare, identity, report
+from . import collector, driver, harness_compare, harness_matrix, identity, report
 from .demo import build_demo
-from .harness_fake import FakeClock, FakeHarnessGateway
+from .harness_fake import FakeClock, FakeHarnessGateway, fixture_facts
 from .faults import NodeKillInjector, schedule_faults
 from .scenario import Scenario
-from .schema import RunResult, SecurityPosture
+from .schema import HarnessMatrix, RunResult, SecurityPosture
 
 
 def _slug(s: str) -> str:
@@ -105,14 +105,70 @@ async def _compare_run(args, scn: Scenario) -> RunResult:
                      gateway=args.gateway, harness_compare=hc, notes=notes)
 
 
+async def _matrix_run(args, scn: Scenario) -> RunResult:
+    """A harness-matrix scenario: every (node, model variant) in turn, live
+    against ``--gateway`` or against one fake gateway per node (``--fixture``).
+    Rows are appended to ``--history`` (unless it is ``-``) and the report's
+    trend reads it back."""
+    spec = scn.harness_matrix
+    started = args.started_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if args.fixture:
+        hm = HarnessMatrix(kinds=list(spec.kinds))
+        clock = FakeClock()
+        for cell in spec.cells:
+            one = spec.model_copy(update={"cells": [cell]})
+            fake = FakeHarnessGateway(node=cell.node, clock=clock, facts=fixture_facts(cell.node))
+            async with fake.client() as c:
+                part = await harness_matrix.run_matrix(one, c, clock=clock, sleep=clock.sleep)
+            hm.cells.extend(part.cells)
+        name, gateway = f"SYNTHETIC fixture — {scn.name}", "fake gateway (--fixture)"
+        notes = ["--fixture: canned nodes and answers from noo_eval/harness_fake.py; nothing was placed."]
+    else:
+        why = harness_matrix.preflight(spec, allow_placement_changes=args.allow_placement_changes)
+        if why:
+            print(f"[noo-eval] not started: {why}")
+            return RunResult(scenario=scn.name, axes=["harness_kind", "node", "model"], started_at=started,
+                             gateway=args.gateway, harness_matrix=HarnessMatrix(kinds=list(spec.kinds), refused=why))
+        token = args.token or os.getenv("NOO_EVAL_TOKEN", "")
+        verify = _resolve_verify(getattr(args, "ca", ""))
+        task_token = os.getenv(spec.task_token_env, "") if spec.task_token_env else ""
+        notes = []
+        if spec.task_token_env and not task_token:
+            notes.append(f"{spec.task_token_env} is unset: tasks and usage ran under the --token credential")
+
+        def client(tok: str) -> httpx.AsyncClient:
+            auth = {"Authorization": f"Bearer {tok}"} if tok else {}
+            return httpx.AsyncClient(base_url=args.gateway, headers=auth, timeout=30.0, verify=verify)
+
+        print(f"[noo-eval] {scn.name}: harness matrix on {', '.join(c.node for c in spec.cells)} → {args.gateway} "
+              "(this CHANGES each node's harness placement, and a variant's model, while it runs, and restores them)")
+        async with client(token) as ops:
+            if task_token:
+                async with client(task_token) as tc:
+                    hm = await harness_matrix.run_matrix(spec, ops, tc)
+            else:
+                hm = await harness_matrix.run_matrix(spec, ops)
+        name, gateway = scn.name, args.gateway
+    if args.history != "-":
+        harness_matrix.append_history(args.history, harness_matrix.rows(hm, run_id=started, scenario=name))
+        hm.history = harness_matrix.read_history(args.history)
+        notes.append(f"history: {args.history}")
+    return RunResult(scenario=name, axes=["harness_kind", "node", "model"], started_at=started,
+                     gateway=gateway, harness_matrix=hm, notes=notes)
+
+
 async def _live_run(args) -> RunResult:
     scn = Scenario.load(args.scenario)
+    if scn.harness_matrix is not None:
+        if not args.fixture and not args.gateway:
+            raise SystemExit("noo_eval run: --gateway URL is required (or --fixture for a dry run)")
+        return await _matrix_run(args, scn)
     if scn.harness_compare is not None:
         if not args.fixture and not args.gateway:
             raise SystemExit("noo_eval run: --gateway URL is required (or --fixture for a dry run)")
         return await _compare_run(args, scn)
     if args.fixture:
-        raise SystemExit("noo_eval run: --fixture applies to harness-compare scenarios only")
+        raise SystemExit("noo_eval run: --fixture applies to harness-compare and harness-matrix scenarios only")
     if not args.gateway:
         raise SystemExit("noo_eval run: --gateway URL is required")
     token = args.token or os.getenv("NOO_EVAL_TOKEN", "")
@@ -209,7 +265,13 @@ def main(argv=None) -> int:
     pr.add_argument("scenario")
     pr.add_argument("--gateway", default="")
     pr.add_argument("--fixture", action="store_true",
-                    help="harness-compare only: run against the built-in fake gateway (synthetic)")
+                    help="harness-compare / harness-matrix: run against the built-in fake gateway (synthetic)")
+    pr.add_argument("--allow-placement-changes", action="store_true",
+                    help="harness-matrix: confirm this window is yours, so a scenario's model variants "
+                         "may take a node's chat model from its live users for the run")
+    pr.add_argument("--history", default="eval/reports/harness-matrix-history.jsonl",
+                    help="harness-matrix: JSON-lines file each run appends its rows to, and the "
+                         "report's trend reads ('-' keeps none)")
     pr.add_argument("--prom", default="")
     pr.add_argument("--token", default="")
     pr.add_argument("--started-at", default="")
@@ -235,6 +297,10 @@ def main(argv=None) -> int:
     print(f"[noo-eval] report → {out}")
     if result.harness_compare is not None:
         twin = report.write_compare_json(result, Path(out).with_suffix(".json"))
+        print(f"[noo-eval] report json → {twin}")
+    if result.harness_matrix is not None:
+        twin = Path(out).with_suffix(".json")
+        twin.write_text(result.harness_matrix.model_dump_json(indent=2, exclude={"history"}), encoding="utf-8")
         print(f"[noo-eval] report json → {twin}")
     if getattr(args, "json", ""):
         Path(args.json).parent.mkdir(parents=True, exist_ok=True)
