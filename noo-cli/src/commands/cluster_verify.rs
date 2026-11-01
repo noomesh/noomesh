@@ -490,13 +490,9 @@ const GPU_PROBE_FAILING_SECS: i64 = 60;
 /// The `gpu` row, from the node agent's `gpu_contention` heartbeat report
 /// (internal/gpuyield). A node that gave its GPU to other work (VR, model
 /// development, a voice stack) is working as designed: yielded and held are
-/// WARNs, never FAILs. No row from an agent that does not report it.
-pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
-    gpu_contention_check_at(n, 0)
-}
-
-/// [`gpu_contention_check`] with the clock, so a hold's row can say how long
-/// it has lasted (a `now` of 0 says nothing about age).
+/// WARNs, never FAILs. No row from an agent that does not report it. Takes
+/// the clock, so a hold's row can say how long it has lasted (a `now` of 0
+/// says nothing about age).
 pub(crate) fn gpu_contention_check_at(n: &Value, now_unix: i64) -> Option<Check> {
     let id = n["id"].as_str().unwrap_or("?");
     let gc = n.get("gpu_contention").filter(|v| v.is_object())?;
@@ -10943,6 +10939,11 @@ mod harness_tasks_tests {
 #[cfg(test)]
 mod gpu_contention_tests {
     use super::*;
+
+    /// The row with no clock (age is not asserted here).
+    fn gpu_contention_check(n: &Value) -> Option<Check> {
+        gpu_contention_check_at(n, 0)
+    }
 
     fn node(gc: Value) -> Value {
         serde_json::json!({"id": "host3", "gpu_contention": gc})
