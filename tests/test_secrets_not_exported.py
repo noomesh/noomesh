@@ -28,7 +28,7 @@ def test_cli_only_secrets_are_not_exported(tmp_path):
         "#!/bin/sh\n"
         "printf 'POSTGRES_PASSWORD=pg\\nNOO_ADDON_REGISTRY_TOKEN=ghp_secret\\n"
         "NOO_ADDON_REGISTRY_USER=bot\\nNOO_IMAGE_TAG=v0.0.1\\n"
-        "NOO_ADDON_REGISTRY_CRED_PAI_VOICE=tp\\n'\n"
+        "NOO_ADDON_REGISTRY_CRED_RHADDON=tp\\n'\n"
     )
     sops.chmod(sops.stat().st_mode | stat.S_IEXEC)
     (tmp_path / "secrets").mkdir()

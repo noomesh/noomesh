@@ -1357,22 +1357,22 @@ mod tests {
     /// never rides with it, and a vendor client never holds it.
     #[test]
     fn a_bound_credential_reaches_its_root_only_and_the_vendor_token_never_joins_it() {
-        let c = Client::new(Some(Credential { user: "u".into(), token: "vendor-token".into() })).with_bound(Some(bound("pai-voice", "ghcr.io/personifai/pai-voice")));
-        assert_eq!(pull_token(&c, "ghcr.io/personifai/pai-voice").as_deref(), Some("tp-token"));
-        for other in ["ghcr.io/personifai/other", "ghcr.io/personifai/pai-voice/x", "ghcr.io/noomesh/evolve", "evil.example/personifai/pai-voice"] {
+        let c = Client::new(Some(Credential { user: "u".into(), token: "vendor-token".into() })).with_bound(Some(bound("rhaddon", "registry.example/rhaddon")));
+        assert_eq!(pull_token(&c, "registry.example/rhaddon").as_deref(), Some("tp-token"));
+        for other in ["registry.example/other", "registry.example/rhaddon/x", "ghcr.io/noomesh/evolve", "evil.example/rhaddon"] {
             assert_eq!(pull_token(&c, other), None, "{other}: neither the bound credential nor the vendor token");
         }
-        let route = Route::Direct { root: "ghcr.io/personifai/pai-voice".into() };
-        assert_eq!(c.describe(&route), "via ghcr.io/personifai/pai-voice (credential for pai-voice)");
+        let route = Route::Direct { root: "registry.example/rhaddon".into() };
+        assert_eq!(c.describe(&route), "via registry.example/rhaddon (credential for rhaddon)");
         // A vendor client has no binding: it presents the vendor token, not the add-on's.
         let vendor = Client::new(Some(Credential { user: "u".into(), token: "vendor-token".into() }));
-        assert_eq!(pull_token(&vendor, "ghcr.io/personifai/pai-voice").as_deref(), Some("vendor-token"));
+        assert_eq!(pull_token(&vendor, "registry.example/rhaddon").as_deref(), Some("vendor-token"));
         assert!(!format!("{:?}", bound("a", "b")).contains("tp-token"), "Debug redacts the token");
     }
 
     #[test]
     fn the_store_key_is_per_addon() {
-        assert_eq!(cred_key("pai-voice"), "NOO_ADDON_REGISTRY_CRED_PAI_VOICE");
+        assert_eq!(cred_key("rhaddon"), "NOO_ADDON_REGISTRY_CRED_RHADDON");
         assert_eq!(cred_key("rh_addon2"), "NOO_ADDON_REGISTRY_CRED_RH_ADDON2");
     }
 

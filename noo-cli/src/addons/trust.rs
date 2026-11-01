@@ -683,7 +683,7 @@ mod tests {
     }
 
     fn want<'a>(tag: &'a str) -> Want<'a> {
-        Want { addon: "pai-voice", stack_tag: tag, stack_lock: None, pinned: None, pin: None, allow_downgrade: false }
+        Want { addon: "rhaddon", stack_tag: tag, stack_lock: None, pinned: None, pin: None, allow_downgrade: false }
     }
 
     #[test]
@@ -993,14 +993,20 @@ mod tests {
 
     const TOKEN: &str = "ghp_s3cr3tPullToken";
 
+    fn rh_lock() -> crate::addon_lock::AddonLock {
+        let mut l = third_party_lock(&["v0.6.0"]);
+        l.addon = "rhaddon".into();
+        l
+    }
+
     fn trusted_text() -> String {
-        add_key("addons:\n  pai-voice: true\n", "pai-voice", &pk(), Some(ROOT)).unwrap()
+        add_key("addons:\n  rhaddon: true\n", "rhaddon", &pk(), Some(ROOT)).unwrap()
     }
 
     fn bound_client() -> crate::addons::lock_fetch::Client {
         use crate::addons::lock_fetch::{Bound, Client, Credential};
         let cred = Credential { user: "noo".into(), token: TOKEN.into() };
-        Client::plain_http_for_tests(None).with_bound(Some(Bound { addon: "pai-voice".into(), root: ROOT.into(), cred }))
+        Client::plain_http_for_tests(None).with_bound(Some(Bound { addon: "rhaddon".into(), root: ROOT.into(), cred }))
     }
 
     fn prep_root(tag: &str) -> std::path::PathBuf {
@@ -1020,17 +1026,17 @@ mod tests {
         let bc = bound_client();
         let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &bc };
         let mut docker = FakeDocker::default();
-        let f = signed_bundle(&third_party_lock(&["v0.6.0"]));
-        let p = addons::prepare_with(&ctx, "pai-voice", &anchor(), Some(f), &mut docker, &bc).expect("prepared");
+        let f = signed_bundle(&rh_lock());
+        let p = addons::prepare_with(&ctx, "rhaddon", &anchor(), Some(f), &mut docker, &bc).expect("prepared");
         assert_eq!(docker.pulls.len(), 1, "one login and pull for the one root: {:?}", docker.pulls);
         assert_eq!(docker.pulls[0].0, "ghcr.io");
         assert!(docker.pulls[0].2, "the credential reached the pull");
-        assert_eq!(p.via, format!("via {ROOT} (credential for pai-voice)"));
+        assert_eq!(p.via, format!("via {ROOT} (credential for rhaddon)"));
         // The same pull without the binding is anonymous (the old behaviour).
         let mut anon = FakeDocker::default();
         let plain = crate::addons::lock_fetch::Client::plain_http_for_tests(None);
-        let f = signed_bundle(&third_party_lock(&["v0.6.0"]));
-        addons::prepare_with(&ctx, "pai-voice", &anchor(), Some(f), &mut anon, &plain).expect("prepared");
+        let f = signed_bundle(&rh_lock());
+        addons::prepare_with(&ctx, "rhaddon", &anchor(), Some(f), &mut anon, &plain).expect("prepared");
         assert!(anon.pulls.iter().all(|(_, _, had)| !had), "{:?}", anon.pulls);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1056,8 +1062,8 @@ mod tests {
         let root = prep_root("cred-cache");
         let bc = bound_client();
         let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &bc };
-        let f = signed_bundle(&third_party_lock(&["v0.6.0"]));
-        let p = addons::prepare_with(&ctx, "pai-voice", &anchor(), Some(f), &mut FakeDocker::default(), &bc).unwrap();
+        let f = signed_bundle(&rh_lock());
+        let p = addons::prepare_with(&ctx, "rhaddon", &anchor(), Some(f), &mut FakeDocker::default(), &bc).unwrap();
         addons::commit(&root, &p, "v0.6.0").unwrap();
         fn walk(d: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             for e in std::fs::read_dir(d).unwrap().flatten() {
@@ -1085,18 +1091,18 @@ mod tests {
         let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &plain };
         let run = |client: &crate::addons::lock_fetch::Client| {
             let mut docker = FakeDocker { fail_pull: true, ..Default::default() };
-            let f = signed_bundle(&third_party_lock(&["v0.6.0"]));
-            addons::prepare_with(&ctx, "pai-voice", &anchor(), Some(f), &mut docker, client).expect_err("refused")
+            let f = signed_bundle(&rh_lock());
+            addons::prepare_with(&ctx, "rhaddon", &anchor(), Some(f), &mut docker, client).expect_err("refused")
         };
-        let verb = format!("noo addons registry-login pai-voice --registry {ROOT}");
+        let verb = format!("noo addons registry-login rhaddon --registry {ROOT}");
         let unset = run(&plain);
         assert!(matches!(unset, Refusal::PullAuth { credential_set: false, .. }), "{unset:?}");
-        let why = unset.why("pai-voice");
+        let why = unset.why("rhaddon");
         assert!(why.contains(&verb) && why.contains("no credential is set"), "{why}");
-        assert_eq!(unset.registry_login_fix("pai-voice").as_deref(), Some(verb.as_str()));
+        assert_eq!(unset.registry_login_fix("rhaddon").as_deref(), Some(verb.as_str()));
         let set = run(&bound_client());
         assert!(matches!(set, Refusal::PullAuth { credential_set: true, .. }), "{set:?}");
-        let why = set.why("pai-voice");
+        let why = set.why("rhaddon");
         assert!(why.contains(&verb) && why.contains("refused the credential stored") && !why.contains(TOKEN), "{why}");
         // The lock fetch itself, refused for access, says the same.
         let fetch = Refusal::Fetch {
@@ -1105,12 +1111,12 @@ mod tests {
             err: Box::new(crate::release_fetch::FetchError::new(crate::release_fetch::FetchClass::Auth, "x")),
             via: None,
         };
-        assert!(fetch.why("pai-voice").contains(&verb), "{}", fetch.why("pai-voice"));
-        assert_eq!(fetch.registry_login_fix("pai-voice").as_deref(), Some(verb.as_str()));
+        assert!(fetch.why("rhaddon").contains(&verb), "{}", fetch.why("rhaddon"));
+        assert_eq!(fetch.registry_login_fix("rhaddon").as_deref(), Some(verb.as_str()));
         // A public package still pulls anonymously (the existing contract).
         let mut ok = FakeDocker::default();
-        let f = signed_bundle(&third_party_lock(&["v0.6.0"]));
-        assert!(addons::prepare_with(&ctx, "pai-voice", &anchor(), Some(f), &mut ok, &plain).is_ok());
+        let f = signed_bundle(&rh_lock());
+        assert!(addons::prepare_with(&ctx, "rhaddon", &anchor(), Some(f), &mut ok, &plain).is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1119,72 +1125,73 @@ mod tests {
     #[test]
     fn the_client_binds_only_a_record_for_the_trusted_root() {
         use crate::addons::{bound_for, lock_fetch::{Bound, Credential}};
-        let cred = |root: &str| Bound { addon: "pai-voice".into(), root: root.into(), cred: Credential { user: "noo".into(), token: TOKEN.into() } };
+        let cred = |root: &str| Bound { addon: "rhaddon".into(), root: root.into(), cred: Credential { user: "noo".into(), token: TOKEN.into() } };
         let never = |_: &str| -> Result<Option<Bound>, String> { panic!("the store is not read without a record") };
-        assert!(bound_for("pai-voice", &anchor(), None, &never).unwrap().is_none());
-        assert!(bound_for("pai-voice", &anchor(), Some("ghcr.io/other/place"), &never).unwrap().is_none(), "bound elsewhere: unused");
-        let b = bound_for("pai-voice", &anchor(), Some(ROOT), &|r| Ok(Some(cred(r)))).unwrap().unwrap();
+        assert!(bound_for("rhaddon", &anchor(), None, &never).unwrap().is_none());
+        assert!(bound_for("rhaddon", &anchor(), Some("ghcr.io/other/place"), &never).unwrap().is_none(), "bound elsewhere: unused");
+        let b = bound_for("rhaddon", &anchor(), Some(ROOT), &|r| Ok(Some(cred(r)))).unwrap().unwrap();
         assert_eq!(b.root, ROOT);
-        let e = bound_for("pai-voice", &anchor(), Some(ROOT), &|_| Ok(None)).unwrap_err();
-        assert!(e.contains("noo addons registry-login pai-voice") && e.contains("NOO_ADDON_REGISTRY_CRED_PAI_VOICE"), "{e}");
-        assert!(bound_for("pai-voice", &anchor(), Some(ROOT), &|_| Err("sops: no key".into())).is_err());
+        let e = bound_for("rhaddon", &anchor(), Some(ROOT), &|_| Ok(None)).unwrap_err();
+        assert!(e.contains("noo addons registry-login rhaddon") && e.contains("NOO_ADDON_REGISTRY_CRED_RHADDON"), "{e}");
+        assert!(bound_for("rhaddon", &anchor(), Some(ROOT), &|_| Err("sops: no key".into())).is_err());
     }
 
     #[test]
     fn the_trust_entry_records_that_a_credential_exists_and_its_root_never_the_value() {
         let t = trusted_text();
-        let set = set_credential(&t, "pai-voice", ROOT).unwrap();
-        assert_eq!(credential_root(&set, "pai-voice").as_deref(), Some(ROOT));
-        assert_eq!(read(&set).unwrap()["pai-voice"].keys, vec![pk()], "the keys are untouched");
+        let set = set_credential(&t, "rhaddon", ROOT).unwrap();
+        assert_eq!(credential_root(&set, "rhaddon").as_deref(), Some(ROOT));
+        assert_eq!(read(&set).unwrap()["rhaddon"].keys, vec![pk()], "the keys are untouched");
         assert!(!set.contains(TOKEN));
-        assert_eq!(credential_root(&t, "pai-voice"), None);
+        assert_eq!(credential_root(&t, "rhaddon"), None);
         // Cleared again: no record, the trust entry stays.
-        let cleared = clear_credential(&set, "pai-voice").unwrap();
-        assert_eq!(credential_root(&cleared, "pai-voice"), None);
-        assert_eq!(read(&cleared).unwrap()["pai-voice"].keys, vec![pk()]);
-        assert_eq!(clear_credential(&cleared, "pai-voice").unwrap(), cleared, "clearing nothing changes nothing");
+        let cleared = clear_credential(&set, "rhaddon").unwrap();
+        assert_eq!(credential_root(&cleared, "rhaddon"), None);
+        assert_eq!(read(&cleared).unwrap()["rhaddon"].keys, vec![pk()]);
+        assert_eq!(clear_credential(&cleared, "rhaddon").unwrap(), cleared, "clearing nothing changes nothing");
     }
 
     #[test]
     fn registry_login_refuses_what_it_cannot_bind() {
         let t = trusted_text();
         // No trust entry.
-        let e = set_credential("addons:\n  pai-voice: true\n", "pai-voice", ROOT).unwrap_err();
+        let e = set_credential("addons:\n  rhaddon: true\n", "rhaddon", ROOT).unwrap_err();
         assert!(e.contains("no trust entry") && e.contains("trust-key"), "{e}");
         // Not the trusted root: another host, a path under it, a parent of it.
         for bad in ["evil.example/example/intel", "ghcr.io/example/intel/sub", "ghcr.io/example"] {
-            let e = set_credential(&t, "pai-voice", bad).unwrap_err();
+            let e = set_credential(&t, "rhaddon", bad).unwrap_err();
             assert!(e.contains("--registry ghcr.io/example/intel"), "{bad}: {e}");
         }
         // A built-in add-on is pulled with its licence.
         assert!(set_credential(&t, "evolve", ROOT).unwrap_err().contains("ships with the stack"));
         // Two names that share one store slot are refused.
-        let both = add_key(&t, "pai_voice", &pk(), Some(ROOT)).unwrap();
-        assert!(set_credential(&both, "pai-voice", ROOT).unwrap_err().contains("NOO_ADDON_REGISTRY_CRED_PAI_VOICE"));
+        let one = add_key("addons:\n  rhaddon: true\n", "rh-addon", &pk(), Some(ROOT)).unwrap();
+        let both = add_key(&one, "rh_addon", &pk(), Some(ROOT)).unwrap();
+        assert!(set_credential(&both, "rh-addon", ROOT).unwrap_err().contains("NOO_ADDON_REGISTRY_CRED_RH_ADDON"));
     }
 
     /// Removing the last key removes the entry, and the credential record with it.
     #[test]
     fn untrusting_the_last_key_takes_the_credential_record_with_it() {
-        let set = set_credential(&trusted_text(), "pai-voice", ROOT).unwrap();
-        let gone = remove_key(&set, "pai-voice", &pk()).unwrap();
-        assert!(credential_root(&gone, "pai-voice").is_none() && !gone.contains("registry_credential"), "{gone}");
-        assert!(!read(&gone).unwrap().contains_key("pai-voice"));
+        let set = set_credential(&trusted_text(), "rhaddon", ROOT).unwrap();
+        let gone = remove_key(&set, "rhaddon", &pk()).unwrap();
+        assert!(credential_root(&gone, "rhaddon").is_none() && !gone.contains("registry_credential"), "{gone}");
+        assert!(!read(&gone).unwrap().contains_key("rhaddon"));
         // With a key left, the entry (and its credential) stays.
-        let two = add_key(&set, "pai-voice", &pk2(), None).unwrap();
-        let one = remove_key(&two, "pai-voice", &pk2()).unwrap();
-        assert_eq!(credential_root(&one, "pai-voice").as_deref(), Some(ROOT));
+        let two = add_key(&set, "rhaddon", &pk2(), None).unwrap();
+        let one = remove_key(&two, "rhaddon", &pk2()).unwrap();
+        assert_eq!(credential_root(&one, "rhaddon").as_deref(), Some(ROOT));
     }
 
     #[test]
     fn list_shows_set_or_not_set_never_the_value() {
         use crate::commands::addons::credential_cell;
         let t = trusted_text();
-        assert_eq!(credential_cell(&t, "pai-voice"), "not set");
-        let set = set_credential(&t, "pai-voice", ROOT).unwrap();
-        assert_eq!(credential_cell(&set, "pai-voice"), format!("set ({ROOT})"));
+        assert_eq!(credential_cell(&t, "rhaddon"), "not set");
+        let set = set_credential(&t, "rhaddon", ROOT).unwrap();
+        assert_eq!(credential_cell(&set, "rhaddon"), format!("set ({ROOT})"));
         // Re-trusted on another root since: shown, and not used.
         let moved = set.replace(&format!("registry: {ROOT}"), "registry: ghcr.io/example/moved");
-        assert!(credential_cell(&moved, "pai-voice").contains("NOT the trusted root"), "{}", credential_cell(&moved, "pai-voice"));
+        assert!(credential_cell(&moved, "rhaddon").contains("NOT the trusted root"), "{}", credential_cell(&moved, "rhaddon"));
     }
 }
