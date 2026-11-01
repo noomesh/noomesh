@@ -282,6 +282,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["cluster", "maintenance"], commands::cluster_maintenance),
     (&["cluster", "gpu", "hold"], commands::cluster_gpu_hold),
     (&["cluster", "gpu", "release"], commands::cluster_gpu_release),
+    (&["cluster", "gpu", "mode"], commands::cluster_gpu_mode),
     // Reservations: an add-on's declared workload takes a GPU out of the
     // pool (drain, owned hold, start) and gives it back (drain, stop,
     // release); the low-level `gpu hold|release` stay for emergencies.
@@ -1381,7 +1382,7 @@ pub(crate) fn is_reserved_command_word(word: &str) -> bool {
 /// value, which falls through to `rest` next) for the handler.
 fn subcommand_owns_timeout(rest: &[String]) -> bool {
     let words: Vec<&str> = rest.iter().map(String::as_str).collect();
-    matches!(words.as_slice(), ["cluster", "reserve", ..] | ["cluster", "gpu", "hold", ..])
+    matches!(words.as_slice(), ["cluster", "reserve", ..] | ["cluster", "gpu", "hold", ..] | ["cluster", "gpu", "mode", ..])
 }
 
 /// Parse `argv` (the args AFTER the program name) into the global options and a

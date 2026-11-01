@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn usage_flags_match_what_converted_parsers_ask_for() {
         use crate::commands::{
-            addons, autonomy, cluster_gpu, cluster_reserve, cluster_vendor, heartbeat, jobs, logs, memory, rag, recall, tasks,
+            addons, autonomy, cluster_gpu, cluster_gpu_mode, cluster_reserve, cluster_vendor, heartbeat, jobs, logs, memory, rag, recall, tasks,
             walks,
         };
         use crate::commands::{approval, ops, security, security_local};
@@ -390,6 +390,7 @@ mod tests {
             row(&["rag", "ingest"], |a| { let _ = rag::parse_ingest_with(a); }),
             row(&["rag", "held"], |a| { let _ = rag::parse_held_with(a); }),
             row(&["rag", "purge"], |a| { let _ = rag::parse_purge_with(a); }),
+            row(&["cluster", "gpu", "mode"], |a| { let _ = cluster_gpu_mode::parse_gpu_mode_with(a); }),
         ];
         let mut bad = Vec::new();
         for (words, probe) in table {

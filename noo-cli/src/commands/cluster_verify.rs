@@ -375,7 +375,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
 
     // 6e. Shared GPU: the node yielded (or was held off) its GPU for work
     //     outside noomesh. A warn by design, never a failure.
-    out.extend(gpu_contention_check(n));
+    out.extend(gpu_contention_check_at(n, now_unix));
 
     // 6d. The log shipper (fleet logging phase 6), from the agent's own
     //     account in its heartbeat.
@@ -492,6 +492,12 @@ const GPU_PROBE_FAILING_SECS: i64 = 60;
 /// development, a voice stack) is working as designed: yielded and held are
 /// WARNs, never FAILs. No row from an agent that does not report it.
 pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
+    gpu_contention_check_at(n, 0)
+}
+
+/// [`gpu_contention_check`] with the clock, so a hold's row can say how long
+/// it has lasted (a `now` of 0 says nothing about age).
+pub(crate) fn gpu_contention_check_at(n: &Value, now_unix: i64) -> Option<Check> {
     let id = n["id"].as_str().unwrap_or("?");
     let gc = n.get("gpu_contention").filter(|v| v.is_object())?;
     let gb = |k: &str| gc[k].as_f64().unwrap_or(0.0) / 1024.0;
@@ -555,14 +561,32 @@ pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
                 (Some(op), Some(generation)) if !op.is_empty() => format!(" --operation {op} --generation {generation}"),
                 _ => String::new(),
             };
+            // i344b: the row names the mode and how long the hold has lasted;
+            // for `user` it adds what still uses the GPU, so "the GPU is
+            // still busy" is visible without running the switch.
+            let mode = super::cluster_gpu_mode::lease_mode(gc);
+            let age = super::cluster_gpu_mode::lease_age(gc, now_unix)
+                .map(|s| format!(", for {}", super::cluster_gpu_mode::age_text(s)))
+                .unwrap_or_default();
+            let busy = if mode == super::cluster_gpu_mode::Mode::User && gc["foreign_mb"].as_f64().unwrap_or(0.0) > 0.0 {
+                format!(", GPU in use {:.1} GB", gb("foreign_mb"))
+            } else {
+                String::new()
+            };
+            let remedy = if mode == super::cluster_gpu_mode::Mode::User {
+                format!("noo cluster gpu mode {id} mesh   # when the other work is done")
+            } else {
+                format!("noo cluster gpu release {id}{ids}   # when the other work is done")
+            };
             warn("gpu",
-                format!("held by {}{}: {paused_phrase}",
+                format!("mode {}: held by {}{}: {paused_phrase}{age}{busy}",
+                    mode.label(),
                     super::cluster_gpu::lease_holder(gc),
                     gc["reason"].as_str().filter(|r| !r.is_empty()).map(|r| format!(" ({r})")).unwrap_or_default()),
-                Some(format!("noo cluster gpu release {id}{ids}   # when the other work is done")))
+                Some(remedy))
         }
         "draining" => warn("gpu",
-            format!("hold by {} draining: waiting for requests in flight on the GPU backends to finish", super::cluster_gpu::lease_holder(gc)),
+            format!("mode switching: hold by {} draining: waiting for requests in flight on the GPU backends to finish", super::cluster_gpu::lease_holder(gc)),
             None),
         other => warn("gpu", format!("agent reports an unknown gpu_contention state {other:?}"), None),
     })
@@ -10990,26 +11014,48 @@ mod gpu_contention_tests {
         let c = gpu_contention_check(&node(serde_json::json!({
             "state": "held", "reason": "voice", "method": "nvidia-smi", "paused_backends": ["vllm"]}))).unwrap();
         assert_eq!(c.verdict, Verdict::Warn);
-        assert_eq!(c.detail, "held by operator (voice): vllm paused");
+        assert_eq!(c.detail, "mode held (manual): held by operator (voice): vllm paused");
         assert_eq!(c.remedy.as_deref(), Some("noo cluster gpu release host3   # when the other work is done"));
         // An owned lease (i163 D): the holder is named and the remedy quotes
         // the lease, so the operator's release is a compare-and-set.
         let c = gpu_contention_check(&node(serde_json::json!({
             "state": "held", "reason": "voice", "method": "nvidia-smi", "paused_backends": ["vllm"],
             "lease": {"owner": "rbwolf", "operation_id": "op-1", "generation": 4}}))).unwrap();
-        assert_eq!(c.detail, "held by rbwolf (voice): vllm paused");
+        assert_eq!(c.detail, "mode held (manual): held by rbwolf (voice): vllm paused");
         assert_eq!(c.remedy.as_deref(), Some("noo cluster gpu release host3 --operation op-1 --generation 4   # when the other work is done"));
         let c = gpu_contention_check(&node(serde_json::json!({
             "state": "draining", "method": "nvidia-smi", "paused_backends": [], "lease": {"owner": "rbwolf"}}))).unwrap();
         assert_eq!(c.verdict, Verdict::Warn);
-        assert!(c.detail.starts_with("hold by rbwolf draining"), "{}", c.detail);
+        assert!(c.detail.starts_with("mode switching: hold by rbwolf draining"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_user_hold_names_its_mode_its_age_and_what_still_uses_the_gpu() {
+        let held = |foreign: u64| node(serde_json::json!({
+            "state": "held", "reason": "user", "method": "memory-accounting", "paused_backends": ["vllm"], "foreign_mb": foreign,
+            "lease": {"owner": "rbwolf", "operation_id": "op-7", "generation": 4, "purpose": "user", "since": "2026-11-01T10:00:00Z"}}));
+        let since = parse_rfc3339_unix("2026-11-01T10:00:00Z").unwrap();
+        let c = gpu_contention_check_at(&held(3277), since + 7500).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.detail, "mode user: held by rbwolf (user): vllm paused, for 2 h 5 min, GPU in use 3.2 GB");
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster gpu mode host3 mesh   # when the other work is done"));
+        let clear = gpu_contention_check_at(&held(0), since + 90).unwrap();
+        assert_eq!(clear.detail, "mode user: held by rbwolf (user): vllm paused, for 1 min");
+        // No clock: no age, and the row still names the mode.
+        assert_eq!(gpu_contention_check(&held(0)).unwrap().detail, "mode user: held by rbwolf (user): vllm paused");
+        let reserved = node(serde_json::json!({
+            "state": "held", "method": "nvidia-smi", "paused_backends": ["vllm"],
+            "lease": {"owner": "rbwolf", "operation_id": "res-1", "generation": 6, "workload": "rhaddon/worker"}}));
+        let c = gpu_contention_check(&reserved).unwrap();
+        assert!(c.detail.starts_with("mode workload rhaddon/worker: held by rbwolf"), "{}", c.detail);
+        assert!(c.remedy.unwrap().starts_with("noo cluster gpu release host3 --operation res-1 --generation 6"));
     }
 
     #[test]
     fn held_with_nothing_paused_says_so_and_the_remedy_prints_in_a_node_section() {
         let c = gpu_contention_check(&node(serde_json::json!({
             "state": "held", "method": "nvidia-smi", "paused_backends": []}))).unwrap();
-        assert_eq!(c.detail, "held by operator: no GPU backend paused");
+        assert_eq!(c.detail, "mode held (manual): held by operator: no GPU backend paused");
         let checks = vec![c];
         let r = remedies_to_print("host3", &checks);
         assert_eq!(r.len(), 1, "the gpu warn prints its remedy in a node section");

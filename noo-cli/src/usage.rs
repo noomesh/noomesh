@@ -36,6 +36,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
         (&["cluster", "restart-agent"], "<node>", "Ask the gateway to restart a node's node-agent"),
         (&["cluster", "maintenance"], "<node> on --reason <text> [--until <duration>] | <node> off | list", "Mute a known-down node's operator alerts (operator-only); the daily summary still lists it"),
         (&["cluster", "gpu", "hold"], "<node> [--reason <text>] [--operation <id>] [--timeout <secs>] [--immediate] [--force]", "Drain, then pause a node's GPU backends, held as an owned lease until released (operator)"),
+        (&["cluster", "gpu", "mode"], "<node> [user|mesh] [--timeout <secs>] [--immediate] [--wait <secs>] [--no-wait]", "Show a node's GPU mode, or switch it: user (GPU free for you) or mesh (vLLM back, warm)"),
         (&["cluster", "gpu", "release"], "<node> [--operation <id> --generation <n>] [--force] [--now]", "End a GPU hold by its lease (or any with --force); backends resume when free, or now"),
         (&["cluster", "reserve"], "<addon>/<workload> [--node <node>] [--hand-over <reservation-id>] [--timeout <secs>]", "Reserve a GPU for an add-on workload: drain the pool there, pause it, start the workload"),
         (&["cluster", "reservations"], "", "List the GPU reservations the nodes hold: id, workload, holder, node, state"),
