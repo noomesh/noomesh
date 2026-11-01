@@ -27,6 +27,7 @@ mod agent_loop;
 pub(crate) mod anthropic_wire;
 mod backend;
 pub mod classes;
+pub(crate) mod phase;
 mod cloud;
 mod context;
 mod dispatch;

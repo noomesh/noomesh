@@ -1590,6 +1590,33 @@ async fn declared_and_placements(state: &AppState) -> Result<(Declarations, Vec<
     }
 }
 
+/// The node a backend URL belongs to and that backend's slots, for the
+/// console's `routed` frame. `None` when no live node serves `url` (a static
+/// or discovered backend).
+pub fn route_of(nodes: &[NodeFacts], url: &str, backend: &str) -> Option<(String, Option<Slots>)> {
+    nodes
+        .iter()
+        .find(|n| url_for(n, backend) == url)
+        .map(|n| (n.node_id.clone(), n.slots.iter().find(|(b, _)| b == backend).map(|(_, s)| *s)))
+}
+
+/// [`route_of`] over the live KV facts.
+pub async fn route_facts(state: &AppState, url: &str, backend: &str) -> Option<(String, Option<Slots>)> {
+    let (_, placements) = declared_and_placements(state).await.ok()?;
+    route_of(&kv_node_facts(state, &placements).await, url, backend)
+}
+
+/// A node's chat backend and its slots, for the `routed` frame dispatch
+/// sends when a harness takes a turn: the first backend the node runs that
+/// is not a non-chat lane.
+pub async fn node_chat_route(state: &AppState, node: &str) -> Option<(String, String, Option<Slots>)> {
+    let (_, placements) = declared_and_placements(state).await.ok()?;
+    let nodes = kv_node_facts(state, &placements).await;
+    let n = nodes.iter().find(|n| n.node_id == node)?;
+    let (b, m) = n.running.iter().find(|(b, _)| !n.non_chat.contains(b))?;
+    Some((b.clone(), m.clone(), n.slots.iter().find(|(x, _)| x == b).map(|(_, s)| *s)))
+}
+
 /// The live table: KV facts + placements + declarations.
 pub async fn load_table(state: &AppState) -> Result<ClassTable> {
     let (decl, placements) = declared_and_placements(state).await?;
@@ -2760,6 +2787,20 @@ mod tests {
         let c = c.unwrap();
         assert_eq!(full_rank(&c, 0), 0, "a free slot");
         assert_eq!(full_rank(&c, 1), 1, "this gateway's one request fills it");
+    }
+
+    /// The `routed` frame names the node a URL belongs to and that
+    /// backend's slots; a URL no live node serves is unknown.
+    #[test]
+    fn route_of_finds_the_node_and_its_backends_slots_by_url() {
+        let s = Slots { in_flight: 2, total: 2, queued: 1 };
+        let mut m = node("mcmini", "100.64.1.2", &[("ollama", "gemma4:12b")], &[], true, 2, 0.1);
+        m.slots = vec![("ollama".into(), s)];
+        let a = node("awolf", "100.64.1.3", &[("vllm", HF)], &[], true, 1, 0.1);
+        let nodes = [a.clone(), m.clone()];
+        assert_eq!(route_of(&nodes, &url_for(&m, "ollama"), "ollama"), Some(("mcmini".to_string(), Some(s))));
+        assert_eq!(route_of(&nodes, &url_for(&a, "vllm"), "vllm"), Some(("awolf".to_string(), None)), "no slots reported");
+        assert_eq!(route_of(&nodes, "http://10.9.9.9:11434", "ollama"), None);
     }
 
     /// 185b case 2: mcmini's agent beats, but its ollama stopped answering.
