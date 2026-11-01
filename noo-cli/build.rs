@@ -59,6 +59,10 @@ const STANDALONE_FILES: &[&str] = &[
     // verify read it to FAIL on one still running. An installed box has no
     // checkout, so it must ship.
     "config/retired-services.txt",
+    // Compose services that run once and exit 0 by design (i64a): `noo stack
+    // status` and the roll summary read it to tell a finished one-shot from
+    // a container that died. An installed box has no checkout, so it ships.
+    "config/oneshot-services.txt",
     "scripts/noomesh-start.sh",
     // `pai stack restart` runs this (mesh.rs) — was missing, so day-2
     // restart on a standalone box would have failed (finding #28's sweep).
