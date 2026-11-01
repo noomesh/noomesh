@@ -44,9 +44,13 @@ export interface PhaseFrame {
 /** The phase a `phase` frame moves the turn to, or null for one we do not know. */
 export function phaseFromFrame(f: PhaseFrame, prev: TurnPhase | undefined, now: number): TurnPhase | null {
   if (f.phase === 'routed' && f.node) {
+    // A harness turn sends routed more than once for the same attempt (the
+    // gateway at dispatch, the node's loop, the agent's queue): the line keeps
+    // its clock, so "queued … · 9s" is the whole wait, not the last frame's.
+    const same = prev?.kind === 'routed' && prev.node === f.node && (prev.attempt ?? 1) === (f.attempt ?? 1);
     return {
       kind: 'routed',
-      since: now,
+      since: same ? prev.since : now,
       node: f.node,
       model: f.model,
       slotsBusy: f.slots_busy,

@@ -55,6 +55,22 @@ describe('phaseFromFrame', () => {
       inputTokens: 10,
     });
     expect(phaseFromFrame({ phase: 'routed' }, undefined, T0)).toBeNull();
+  });
+
+  it('keeps the clock across repeated routed frames for the same node and attempt (harness turns send several)', () => {
+    const gw = phaseFromFrame({ phase: 'routed', node: 'mcmini', slots_busy: null, slots_total: null }, undefined, T0)!;
+    const queued = phaseFromFrame(
+      { phase: 'routed', node: 'mcmini', slots_busy: 2, slots_total: 2, queued_ahead: 2 },
+      gw,
+      T0 + 3_000,
+    )!;
+    expect(queued.since).toBe(T0);
+    expect(phaseLabel(queued, T0 + 9_000)).toBe('queued on mcmini (2/2 busy, 2 ahead) · 9s');
+    // Another node, or a retry, starts a new clock.
+    expect(phaseFromFrame({ phase: 'routed', node: 'awolf' }, queued, T0 + 10_000)!.since).toBe(T0 + 10_000);
+    expect(
+      phaseFromFrame({ phase: 'routed', node: 'mcmini', attempt: 2, previous_node: 'mcmini' }, queued, T0 + 11_000)!.since,
+    ).toBe(T0 + 11_000);
     expect(phaseFromFrame({ phase: 'compiling' }, undefined, T0)).toBeNull();
   });
 });
