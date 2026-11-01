@@ -538,10 +538,11 @@ impl ComposeTally {
                     let end = match state.as_str() {
                         // Compose prints a bare `Exited` with no exit code, so a one-shot that
                         // finished cleanly (noo-evolve-routes) looks the same as a crash. Count
-                        // it done: an `up` whose container really died still surfaces through
-                        // compose's own exit status and its loud error/unhealthy lines. Only
-                        // an `Exited` that carries a code (`Exited (1)`) is a failure below.
-                        "started" | "exited" | "healthy" | "running" | "recreated" | "created" | "restarted" => ContainerEnd::Started,
+                        // it done ONLY for a declared one-shot (config/oneshot-services.txt,
+                        // i64a): the list `noo stack status` reads too, so the roll summary and
+                        // status agree. Any other bare `Exited`, and every `Exited (N)`, fails.
+                        "exited" if crate::oneshots::is_oneshot(name) => ContainerEnd::Started,
+                        "started" | "healthy" | "running" | "recreated" | "created" | "restarted" => ContainerEnd::Started,
                         "stopped" | "removed" | "killed" => ContainerEnd::Gone,
                         s if s.contains("error") || s.contains("fail") || s.contains("unhealthy") || s.contains("exited") => {
                             ContainerEnd::Failed
@@ -1606,6 +1607,16 @@ mod compose_summary_tests {
         let (summary, pass) = summarise_compose(&lines(&t));
         assert_eq!(summary, "4 containers: 4 started, 0 failed");
         assert!(pass.is_empty(), "progress must be absorbed: {pass:?}");
+    }
+
+    /// i64a: a bare `Exited` is done only for a declared one-shot; any other
+    /// service that exits during the roll is named as failed, as `noo stack
+    /// status` will then name it.
+    #[test]
+    fn a_bare_exited_counts_as_done_only_for_a_declared_one_shot() {
+        let t = format!("{HAPPY}\n Container noo-evolve-routes  Exited\n Container noo-worker  Exited");
+        let (summary, _pass) = summarise_compose(&lines(&t));
+        assert_eq!(summary, "5 containers: 4 started, 1 failed (noo-worker)");
     }
 
     #[test]
