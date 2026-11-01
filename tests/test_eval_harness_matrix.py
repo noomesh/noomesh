@@ -52,7 +52,7 @@ def test_the_sample_scenario_loads_and_names_four_device_types():
     spec = scn.harness_matrix
     assert spec is not None
     assert [c.node for c in spec.cells] == ["awolf", "mcmini", "pop-os", "robopi"]
-    assert spec.cells[3].skip, "robopi is recorded as SKIP until its arm64 stunnel is fixed"
+    assert spec.cells[3].skip is None, "robopi is skipped by what it reports at run time, not hardcoded"
     assert sum(len(ts.tasks) for ts in spec.task_sets) == 6
     assert "~/.cache/noo-batch/run.lock" in spec.busy_locks
 
@@ -89,6 +89,17 @@ def test_a_node_that_serves_no_chat_model_is_skipped_not_failed():
     assert cell.skipped and "serves no chat model" in cell.skip_reason and cell.compare is None
     rows = hm.rows(out, run_id="r", scenario="s")
     assert [r["status"] for r in rows] == ["skipped"], "a skipped cell is one SKIP row, no task failures"
+
+
+def test_the_skip_quotes_the_nodes_own_reason_and_a_fixed_node_is_measured():
+    broken = fixture_facts("robopi")
+    out, _ = _run(_spec([{"node": "robopi"}]), broken)
+    assert out.cells[0].skipped and out.cells[0].skip_reason.endswith(": stunnel sidecar image refused by the agent's tar check")
+    fixed = {**broken, "running_backends": {"ollama": "gemma4:e2b"}, "reconcile_refusals": []}
+    out, _ = _run(_spec([{"node": "robopi"}]), fixed)
+    assert not out.cells[0].skipped and out.cells[0].compare is not None, "no scenario edit needed once it serves"
+    assert hm.refusal_note({"reconcile_refusals": [{"target": "harness", "reason": "kind unknown"}]}) == "", \
+        "a harness refusal is the harness's result, not the node's reason"
 
 
 def test_a_scenario_skip_is_recorded_with_its_reason_and_nothing_is_placed():
@@ -154,7 +165,7 @@ def test_the_fixture_run_writes_report_json_and_history(tmp_path):
     assert html.count("<svg") == 9, "two charts for each of four slices, plus the trend"
     for slice_title in ("each cell", "hardware (GPU)", "backend", "model"):
         assert f"By {slice_title}" in html
-    assert "SKIPPED" in html and "robopi" in html
+    assert "SKIPPED" in html and "robopi" in html and "tar check" in html
     rows = hm.read_history(hist)
     assert len({r["run"] for r in rows}) == 2
     assert sum(r["status"] == "skipped" for r in rows) == 2, "robopi, once per run"

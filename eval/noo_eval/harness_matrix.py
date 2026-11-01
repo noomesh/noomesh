@@ -122,6 +122,17 @@ def chat_backend(n: Optional[dict]) -> tuple[str, str]:
     return "", ""
 
 
+def refusal_note(n: Optional[dict]) -> str:
+    """The node's own reason a backend is not running (its first reconcile
+    refusal that is not about the harness), as ``": <reason>"``; "" when it
+    gives none. A node that cannot serve is skipped by what it says NOW, so a
+    fixed node is measured again without editing the scenario."""
+    for r in (n or {}).get("reconcile_refusals") or []:
+        if r.get("target") != "harness" and r.get("reason"):
+            return f": {first_line(r['reason'])}"
+    return ""
+
+
 def has_model(n: Optional[dict], model: str) -> bool:
     """The node already holds ``model`` (its ``available_models``, names or
     ``{"name": …}`` entries; a ``:latest`` tag matches its bare name)."""
@@ -188,7 +199,7 @@ class Matrix:
         if variant is None:
             cr.backend, cr.model = chat_backend(n)
             if not cr.backend:
-                cr.skipped, cr.skip_reason = True, "the node serves no chat model now"
+                cr.skipped, cr.skip_reason = True, "the node serves no chat model now" + refusal_note(n)
                 return cr
             cr.compare = await self._compare(cell.node)
             return cr

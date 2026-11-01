@@ -270,6 +270,12 @@ FIXTURE_NODES: dict[str, dict] = {
     "pop-os": {"ram_gb": 64, "cpu_cores": 24, "arch": "x86_64", "tier": 2, "app_version": "0.6.15",
                "running_backends": {"llamacpp": "gemma-4-26B-A4B-it-Q4_K_M.gguf"},
                "available_models": ["gemma-4-26B-A4B-it-Q4_K_M.gguf"]},
+    # An edge box whose chat backend cannot start (the 0.6.15 arm64 state):
+    # it lists ollama with no model and says why in a reconcile refusal.
+    "robopi": {"ram_gb": 8, "cpu_cores": 4, "arch": "aarch64", "tier": 3, "app_version": "0.6.15",
+               "running_backends": {"ollama": ""}, "available_models": [],
+               "reconcile_refusals": [{"scope": "placement", "target": "ollama",
+                                       "reason": "stunnel sidecar image refused by the agent's tar check"}]},
 }
 
 

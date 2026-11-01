@@ -36,11 +36,10 @@ harness_matrix:
       #   - {backend: vllm, model: google/gemma-4-12B-it-qat-w4a16-ct}
     - node: mcmini         # Apple, Ollama
     - node: pop-os         # CPU, llama.cpp
-    - node: robopi         # arm64 Pi
-      skip: >-
-        its ollama cannot start on 0.6.15 (no stunnel image: the arm64
-        ghcr.io/noomesh/stunnel archive index lists 2 images, a staged tar must
-        hold one); remove this line once that is fixed
+    - node: robopi         # arm64 Pi. Skipped by what it reports at run time: on
+                           # 0.6.15 its ollama cannot start (stunnel sidecar image
+                           # refused by the agent's tar check; fixed in #623), and a
+                           # node serving no chat model is a SKIP with its reason.
   busy_locks:
     - ~/.cache/noo-batch/run.lock     # a noo-batch Rust build holds this on awolf
   task_timeout_s: 600
