@@ -1121,7 +1121,13 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
                                 for (bt, model_val) in backends {
                                     if !inference_types.contains(&bt.as_str()) { continue; }
                                     let m = model_val.as_str().unwrap_or("");
-                                    if !m.is_empty() {
+                                    if m.is_empty() {
+                                        // 185a: no model to route by; say so, rate-limited.
+                                        let node = data.get("id").and_then(|i| i.as_str()).unwrap_or(&key);
+                                        super::classes::note_model_unreported(node, bt);
+                                        continue;
+                                    }
+                                    {
                                         let node_id = data.get("id")
                                             .and_then(|i| i.as_str())
                                             .unwrap_or(&key)

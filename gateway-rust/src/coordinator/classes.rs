@@ -189,6 +189,9 @@ pub struct NodeFacts {
     pub ip: String,
     /// `(backend, model)` the heartbeat reports running.
     pub running: Vec<(String, String)>,
+    /// Inference backends the heartbeat lists with NO model (185a). They are
+    /// not in `running` and so in no class; `load_table` says so, rate-limited.
+    pub unreported: Vec<String>,
     /// Model names the node has locally (Ollama tags, GGUFs).
     pub available_models: Vec<String>,
     /// Backends whose `model_presence.present` is `false`.
@@ -1271,6 +1274,7 @@ pub fn node_facts_from_kv(key: &str, data: &Value, non_chat: &[(String, String)]
                 .collect()
         })
         .unwrap_or_default();
+    let unreported = unreported_backends(data);
     let available_models = data
         .get("available_models")
         .and_then(Value::as_array)
@@ -1339,7 +1343,58 @@ pub fn node_facts_from_kv(key: &str, data: &Value, non_chat: &[(String, String)]
                     .collect()
             })
             .unwrap_or_default(),
+        unreported,
         node_id,
+    }
+}
+
+/// The inference backends a heartbeat lists with an empty (or non-string)
+/// model: alive as far as the agent knows, but invisible to routing (185a).
+fn unreported_backends(data: &Value) -> Vec<String> {
+    data.get("running_backends")
+        .or_else(|| data.get("backends"))
+        .and_then(Value::as_object)
+        .map(|o| {
+            o.iter()
+                .filter(|(bt, m)| INFERENCE_TYPES.contains(&bt.as_str()) && m.as_str().is_none_or(str::is_empty))
+                .map(|(bt, _)| bt.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// How often one `(node, backend)` may log `backend_model_unreported`.
+const UNREPORTED_LOG_WINDOW: Duration = Duration::from_secs(3600);
+
+/// Rate limiter for [`note_model_unreported`]: true when `key` may log now,
+/// recording the time. Pure over `seen`, so the window is tested.
+fn unreported_due(seen: &mut HashMap<String, Instant>, key: &str, now: Instant, window: Duration) -> bool {
+    match seen.get(key) {
+        Some(prev) if now.duration_since(*prev) < window => false,
+        _ => {
+            seen.insert(key.to_string(), now);
+            true
+        }
+    }
+}
+
+/// 185a: a backend that reports no model is left out of chat routing (the
+/// class table groups by model, and the KV fallback needs one to send). That
+/// used to be silent, so a node with a loading vLLM or an old agent simply
+/// vanished from the pool. Said at WARN, once per `(node, backend)` per hour,
+/// from both skip points (`load_table`, `backend::resolve_backend_excluding`).
+pub(crate) fn note_model_unreported(node: &str, backend: &str) {
+    static SEEN: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    let due = {
+        let mut seen = SEEN.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        unreported_due(&mut seen, &format!("{node}/{backend}"), Instant::now(), UNREPORTED_LOG_WINDOW)
+    };
+    if due {
+        tracing::warn!(
+            node = %node, backend = %backend,
+            "backend_model_unreported: the node lists this backend but names no model, so chat routing \
+             leaves it out (a vLLM still loading, or an agent that cannot read its model)"
+        );
     }
 }
 
@@ -1449,6 +1504,11 @@ async fn declared_and_placements(state: &AppState) -> Result<(Declarations, Vec<
 pub async fn load_table(state: &AppState) -> Result<ClassTable> {
     let (decl, placements) = declared_and_placements(state).await?;
     let nodes = kv_node_facts(state, &placements).await;
+    for n in &nodes {
+        for bt in &n.unreported {
+            note_model_unreported(&n.node_id, bt);
+        }
+    }
     note_yaml_model_is_a_hint(state);
     Ok(build_table(&nodes, &placements, &decl))
 }
@@ -1732,6 +1792,38 @@ mod tests {
         let got: Vec<String> = d.candidates.iter().map(|c| format!("{}={}", c.backend, c.model)).collect();
         assert_eq!(got, vec![format!("ollama={model}")], "{got:?}");
         assert!(t.class("harrier:latest").is_none() && t.class("harrier").is_none(), "no derived class for the embedder");
+    }
+
+    /// 185a: an inference backend listed with no model is recorded as
+    /// unreported (so `load_table` warns), stays out of `running` and so out
+    /// of every class; a non-inference backend is not counted.
+    #[test]
+    fn a_backend_with_no_model_is_unreported_and_in_no_class() {
+        let data = serde_json::json!({
+            "id": "host3", "ip_address": "10.0.0.3", "last_heartbeat": 1000.0,
+            "running_backends": {"vllm": "", "llamacpp": null, "ollama": "gemma4:12b", "tei": ""},
+        });
+        let f = node_facts_from_kv("host3", &data, &[], 1001.0);
+        let mut unreported = f.unreported.clone();
+        unreported.sort();
+        assert_eq!(unreported, vec!["llamacpp".to_string(), "vllm".to_string()]);
+        assert_eq!(f.running, vec![("ollama".to_string(), "gemma4:12b".to_string())]);
+        let t = build_table(&[f], &[], &Declarations::default());
+        let d = t.class(CHAT_DEFAULT).expect("chat-default");
+        let got: Vec<&str> = d.candidates.iter().map(|c| c.backend.as_str()).collect();
+        assert_eq!(got, vec!["ollama"], "no routing change: the unreported backends are in no class");
+    }
+
+    #[test]
+    fn model_unreported_logs_once_per_node_backend_per_window() {
+        let mut seen = HashMap::new();
+        let t0 = Instant::now();
+        let w = Duration::from_secs(3600);
+        assert!(unreported_due(&mut seen, "host3/vllm", t0, w));
+        assert!(!unreported_due(&mut seen, "host3/vllm", t0 + Duration::from_secs(60), w), "not per request");
+        assert!(unreported_due(&mut seen, "host3/llamacpp", t0 + Duration::from_secs(60), w), "per backend");
+        assert!(unreported_due(&mut seen, "host8/vllm", t0 + Duration::from_secs(60), w), "per node");
+        assert!(unreported_due(&mut seen, "host3/vllm", t0 + w, w), "window elapsed");
     }
 
     #[test]
