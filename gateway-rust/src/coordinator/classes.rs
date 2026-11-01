@@ -59,7 +59,9 @@
 //!
 //! The dynamic ranking, lowest first ([`rank_key`]): degraded, unhealthy
 //! (stale heartbeat, unreachable, quarantined), stalled in the last
-//! [`STALL_DEMOTION`] (5 min), thermal `serious`/`critical`, GPU shared
+//! [`STALL_DEMOTION`] (5 min), thermal `serious`/`critical`, every slot
+//! busy (the agent's `backend_containers.<b>.{in_flight, slots, queued}`,
+//! the shorter queue first: [`full_rank`]), GPU shared
 //! with a foreign workload (`gpu_contention.state: shared`; a lane listed in
 //! `gpu_contention.paused_backends` is not a candidate at all), engine (vLLM,
 //! then a GPU runtime, then CPU), larger model first (parameter estimate,
@@ -218,6 +220,11 @@ pub struct NodeFacts {
     /// `gpu_contention.state == "shared"`: something else on the node (a
     /// game, a model build) is using the GPU. Absent = free.
     pub gpu_shared: bool,
+    /// Per backend, the agent's own count of requests in flight (every
+    /// caller, not only this gateway), its slots, and how many wait queued
+    /// on it: `backend_containers.<bt>.{in_flight, slots, queued}` (i159).
+    /// A backend with unknown slots (0 or absent) is not listed.
+    pub slots: Vec<(String, Slots)>,
     /// `gpu_contention.paused_backends`: lanes the node yielded; never
     /// candidates while listed.
     pub paused_backends: Vec<String>,
@@ -280,6 +287,8 @@ pub struct Candidate {
     pub quarantined: bool,
     /// The node reports its GPU shared with a foreign workload.
     pub gpu_shared: bool,
+    /// This backend's occupancy from its agent; `None` = unknown (never full).
+    pub slots: Option<Slots>,
     /// The class this candidate was selected through, as logs print it
     /// (`chat-default(dynamic)`); set by [`select`].
     #[serde(skip)]
@@ -325,6 +334,7 @@ impl Candidate {
             thermal: None,
             quarantined: false,
             gpu_shared: false,
+            slots: None,
             class_label: String::new(),
             rank: String::new(),
         }
@@ -467,19 +477,43 @@ pub fn order_key(c: &Candidate) -> (u8, u8, usize, i64) {
     )
 }
 
+/// A backend's occupancy as its node agent reports it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Slots {
+    pub in_flight: u32,
+    pub total: u32,
+    pub queued: u32,
+}
+
+/// 0 when the candidate can start a request now; 1 + its queue when every
+/// slot is taken. Busy is the larger of the agent's count (every caller,
+/// as of its last heartbeat) and this gateway's own live count, so neither
+/// a stale heartbeat nor callers this gateway cannot see hide a full node.
+/// Unknown slots are never "full". 2026-11-01: a console turn sat behind two
+/// external callers on mcmini's ollama while awolf's vLLM was free.
+pub fn full_rank(c: &Candidate, in_flight: usize) -> u32 {
+    match c.slots {
+        Some(s) if s.total > 0 && (s.in_flight as usize).max(in_flight) >= s.total as usize => 1 + s.queued,
+        _ => 0,
+    }
+}
+
 /// The dynamic default's routing order, lowest first: non-degraded,
 /// healthy, not stalled in the last [`STALL_DEMOTION`], not thermally
-/// `serious`/`critical`, GPU not shared with a foreign workload
+/// `serious`/`critical`, a free slot (a full backend after every one that
+/// can start now, the shorter queue first: [`full_rank`]), GPU not shared
+/// with a foreign workload
 /// (`gpu_contention.state: shared`), engine (vLLM < GPU runtime < CPU), the larger
 /// model (`-params`, tenths of a billion), fewest requests in flight from
 /// this gateway, heartbeat load, position. A function so the ORDER is what
 /// gets tested.
-pub fn rank_key(c: &Candidate, in_flight: usize, stalled: bool) -> (u8, u8, u8, u8, u8, u8, i64, usize, i64, usize) {
+pub fn rank_key(c: &Candidate, in_flight: usize, stalled: bool) -> (u8, u8, u8, u8, u32, u8, u8, i64, usize, i64, usize) {
     (
         if c.degraded { 1 } else { 0 },
         if c.healthy { 0 } else { 1 },
         if stalled { 1 } else { 0 },
         thermal_rank(c.thermal.as_deref()),
+        full_rank(c, in_flight),
         if c.gpu_shared { 1 } else { 0 },
         engine_rank(&c.backend, c.gpu),
         -((c.params_b.unwrap_or(0.0) * 10.0) as i64),
@@ -535,6 +569,11 @@ pub fn rank_reason(c: &Candidate, in_flight: usize, stalled: bool) -> String {
     }
     if let Some(t) = c.thermal.as_deref().filter(|t| thermal_rank(Some(t)) > 0) {
         out.push_str(&format!(",thermal={t}"));
+    }
+    if full_rank(c, in_flight) > 0 {
+        if let Some(sl) = c.slots {
+            out.push_str(&format!(",slots_full={}/{},queued={}", (sl.in_flight as usize).max(in_flight), sl.total, sl.queued));
+        }
     }
     if c.gpu_shared {
         out.push_str(",gpu_shared");
@@ -618,6 +657,7 @@ fn candidate(n: &NodeFacts, backend: &str, model: &str, position: usize, degrade
         thermal: n.thermal.clone(),
         quarantined: n.quarantined,
         gpu_shared: n.gpu_shared,
+        slots: n.slots.iter().find(|(b, _)| b == backend).map(|(_, s)| *s),
         class_label: String::new(),
         rank: String::new(),
     }
@@ -864,16 +904,17 @@ pub fn rank<'a>(
 }
 
 /// A pool's routing order, lowest first: non-degraded, healthy, not
-/// recently stalled, not thermally hot, GPU not shared, fewest requests in flight from this
+/// recently stalled, not thermally hot, a free slot ([`full_rank`]), GPU not shared, fewest requests in flight from this
 /// gateway, heartbeat load, declared position. No engine or model-size key:
 /// declaring a pool says its peers are interchangeable, and a size key
 /// would send every request to the biggest peer and never spread.
-pub fn pool_key(c: &Candidate, in_flight: usize, stalled: bool) -> (u8, u8, u8, u8, u8, usize, i64, usize) {
+pub fn pool_key(c: &Candidate, in_flight: usize, stalled: bool) -> (u8, u8, u8, u8, u32, u8, usize, i64, usize) {
     (
         if c.degraded { 1 } else { 0 },
         if c.healthy { 0 } else { 1 },
         if stalled { 1 } else { 0 },
         thermal_rank(c.thermal.as_deref()),
+        full_rank(c, in_flight),
         if c.gpu_shared { 1 } else { 0 },
         in_flight,
         (c.load * 100.0) as i64,
@@ -1072,6 +1113,12 @@ pub fn select_with(
             skipped.push(format!("{}/{}: {} (demoted)", c.node_id, c.backend, c.health));
         } else if thermal_rank(c.thermal.as_deref()) > 0 {
             skipped.push(format!("{}/{}: thermal {} (demoted)", c.node_id, c.backend, c.thermal.as_deref().unwrap_or("?")));
+        } else if full_rank(&c, b) > 0 {
+            let sl = c.slots.unwrap_or_default();
+            skipped.push(format!(
+                "{}/{}: all {} slots busy, {} queued (demoted)",
+                c.node_id, c.backend, sl.total, sl.queued
+            ));
         } else if c.gpu_shared {
             skipped.push(format!("{}/{}: GPU shared with another workload (demoted)", c.node_id, c.backend));
         }
@@ -1258,6 +1305,22 @@ impl Drop for InFlight {
 
 // ── loaders ──────────────────────────────────────────────────────────────
 
+/// `backend_containers.<bt>.{in_flight, slots, queued}` for each backend
+/// whose slots the agent knows (an older agent, or an engine with unknown
+/// parallelism, reports none and is never treated as full).
+fn slots_of(data: &Value) -> Vec<(String, Slots)> {
+    let n = |c: &Value, k: &str| c.get(k).and_then(Value::as_u64).unwrap_or(0).min(u64::from(u32::MAX)) as u32;
+    data.get("backend_containers")
+        .and_then(Value::as_object)
+        .map(|o| {
+            o.iter()
+                .filter(|(_, c)| n(c, "slots") > 0)
+                .map(|(b, c)| (b.clone(), Slots { in_flight: n(c, "in_flight"), total: n(c, "slots"), queued: n(c, "queued") }))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// One node's facts from its `mesh_nodes` record.
 pub fn node_facts_from_kv(key: &str, data: &Value, non_chat: &[(String, String)], now_unix: f64) -> NodeFacts {
     let node_id = data.get("id").and_then(Value::as_str).unwrap_or(key).to_string();
@@ -1302,7 +1365,9 @@ pub fn node_facts_from_kv(key: &str, data: &Value, non_chat: &[(String, String)]
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let last = data.get("last_heartbeat").or_else(|| data.get("ts")).and_then(Value::as_f64);
+    let slots = slots_of(data);
     NodeFacts {
+        slots,
         ip: data.get("ip_address").and_then(Value::as_str).unwrap_or("").to_string(),
         running,
         available_models,
@@ -2479,6 +2544,74 @@ mod tests {
         let sel = select_with(&t, None, None, false, &|_| false, &idle, &fresh).unwrap();
         let order: Vec<String> = sel.candidates.iter().map(|c| format!("{}/{}", c.node_id, c.backend)).collect();
         assert_eq!(order, ["pop-os/ollama", "mcmini/ollama"], "shared GPU sorts after a free one; the paused lane is gone");
+    }
+
+    /// 2026-11-01: a console turn sat "answering on mcmini" behind two
+    /// external callers on mcmini's ollama (2/2 slots busy) while awolf's vLLM
+    /// was free but demoted as "GPU shared". A full backend sorts after every
+    /// one that can start now, shared GPU or not.
+    #[test]
+    fn a_backend_with_every_slot_busy_sorts_after_a_free_one_on_a_shared_gpu() {
+        let mcmini = serde_json::json!({
+            "id": "mcmini", "ip_address": "100.64.1.2", "load": 0.2, "last_heartbeat": 1000.0,
+            "capabilities": {"unified_memory": true},
+            "running_backends": {"ollama": "gemma4:12b"},
+            "backend_containers": {"ollama": {"running": true, "serving": true, "in_flight": 2, "slots": 2, "queued": 1}},
+        });
+        let awolf = serde_json::json!({
+            "id": "awolf", "ip_address": "100.64.1.3", "load": 0.1, "last_heartbeat": 1000.0, "vram_gb": 16.0,
+            "running_backends": {"vllm": "google/gemma-4-12B-it-qat-w4a16-ct"},
+            "gpu_contention": {"state": "shared", "foreign_mb": 11000},
+            "backend_containers": {"vllm": {"running": true, "serving": true, "in_flight": 0, "slots": 4, "queued": 0}},
+        });
+        let m = node_facts_from_kv("mcmini", &mcmini, &[], 1001.0);
+        let a = node_facts_from_kv("awolf", &awolf, &[], 1001.0);
+        assert_eq!(m.slots, vec![("ollama".to_string(), Slots { in_flight: 2, total: 2, queued: 1 })]);
+        assert!(a.gpu_shared);
+        let order = |nodes: &[NodeFacts]| {
+            let t = build_table(nodes, &[], &Declarations::default());
+            let sel = select_with(&t, None, None, false, &|_| false, &idle, &fresh).unwrap();
+            (sel.candidates.iter().map(|c| c.node_id.clone()).collect::<Vec<_>>(), sel)
+        };
+        let (got, sel) = order(&[m.clone(), a.clone()]);
+        assert_eq!(got, ["awolf", "mcmini"], "the free shared-GPU vLLM goes first");
+        assert!(sel.candidates[1].rank.contains("slots_full=2/2,queued=1"), "{}", sel.candidates[1].rank);
+        assert!(sel.skipped.iter().any(|s| s == "mcmini/ollama: all 2 slots busy, 1 queued (demoted)"), "{:?}", sel.skipped);
+        // The same nodes with a free slot on mcmini: the shared GPU demotes awolf
+        // again. The slot count, not the fixture, moved it.
+        let mut m_free = m.clone();
+        m_free.slots = vec![("ollama".to_string(), Slots { in_flight: 1, total: 2, queued: 0 })];
+        assert_eq!(order(&[m_free, a.clone()]).0, ["mcmini", "awolf"]);
+        // An older agent (no slots reported) is never treated as full.
+        let mut m_old = m;
+        m_old.slots.clear();
+        assert_eq!(order(&[m_old, a]).0, ["mcmini", "awolf"]);
+    }
+
+    /// Every candidate full: the shorter queue first. This gateway's own live
+    /// count fills a node whose last heartbeat still showed a free slot.
+    #[test]
+    fn when_every_backend_is_full_the_shorter_queue_goes_first() {
+        let n = |id: &str, ip: &str, s: Slots| NodeFacts {
+            slots: vec![("ollama".to_string(), s)],
+            ..node(id, ip, &[("ollama", "gemma4:12b")], &[], true, 2, 0.1)
+        };
+        let nodes = [
+            n("a", "100.64.0.1", Slots { in_flight: 2, total: 2, queued: 3 }),
+            n("b", "100.64.0.2", Slots { in_flight: 2, total: 2, queued: 0 }),
+        ];
+        let t = build_table(&nodes, &[], &Declarations::default());
+        let sel = select_with(&t, None, None, false, &|_| false, &idle, &fresh).unwrap();
+        let got: Vec<&str> = sel.candidates.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(got, ["b", "a"]);
+        let stale = n("c", "100.64.0.3", Slots { in_flight: 0, total: 1, queued: 0 });
+        let c = t.class(CHAT_DEFAULT).unwrap().candidates.first().cloned().map(|mut c| {
+            c.slots = stale.slots.first().map(|(_, s)| *s);
+            c
+        });
+        let c = c.unwrap();
+        assert_eq!(full_rank(&c, 0), 0, "a free slot");
+        assert_eq!(full_rank(&c, 1), 1, "this gateway's one request fills it");
     }
 
     /// 185b case 2: mcmini's agent beats, but its ollama stopped answering.
