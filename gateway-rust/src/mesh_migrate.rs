@@ -3726,13 +3726,15 @@ mod legacy_layout_tests {
         assert_eq!(fresh, "acme");
 
         // 104: every enabled admin is a super admin, a disabled one is not,
-        // and nobody else is.
-        let supers: Vec<String> = sqlx::query_scalar(
-            "SELECT username FROM public.noo_users WHERE super_admin ORDER BY username",
-        )
-        .fetch_all(&db)
-        .await
-        .expect("104 added super_admin on a legacy install");
+        // and nobody else is. Read through repo/ (the sqlx ratchet). The
+        // implicit-flagging write is a no-op only when an ENABLED account
+        // already carries the flag, so 0 here proves 104 wrote it; the
+        // listing then says it is boss alone.
+        let flagged_now = crate::repo::addon_access::flag_implicit_super_admins(&db)
+            .await
+            .expect("104 added super_admin on a legacy install");
+        assert_eq!(flagged_now, 0, "104 flagged the enabled admin itself");
+        let supers = crate::repo::addon_access::super_admins(&db).await.expect("super admins");
         assert_eq!(supers, vec!["boss".to_string()]);
 
         // The column is closed, so nothing has to re-check the boundary.
