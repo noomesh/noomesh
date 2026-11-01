@@ -944,7 +944,9 @@ stream included, and passes its own span on to the local backend. A call with
 no valid `traceparent` makes no span: a node never starts a trace. Tempo is
 on the controller only, so the agent sends its spans to the gateway
 (`POST /api/cluster/nodes/{id}/traces`, its cluster credential, https only),
-which stamps them with the verified node and relays them; a refused or failed
+which stamps them with the verified node, keeps only the agent's own
+attribute keys (a node cannot name a user on a span) and spans that ended in
+the last 10 minutes, and relays them; a refused or failed
 batch is dropped on the node, not retried (traces are best effort). Refusals
 and dropped spans are counted per node (`noo_traces_ingest_refused_total`,
 `noo_traces_ingest_dropped_spans_total`).

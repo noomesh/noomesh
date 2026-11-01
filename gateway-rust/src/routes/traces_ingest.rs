@@ -20,9 +20,17 @@
 //!   `parentSpanId` (16 hex, REQUIRED: a node never starts a trace, it
 //!   continues the gateway's), `name` (≤ [`MAX_NAME`]), `kind`, the two
 //!   timestamps, `status`, and at most [`MAX_ATTRS`] attributes with string
-//!   or integer values (keys ≤ 64, strings ≤ 256 bytes). Anything else on a
-//!   span (events, links, other fields) is dropped; a span that fails a rule
-//!   is dropped and counted, not the whole batch. At most [`MAX_SPANS`] spans.
+//!   or integer values (strings ≤ 256 bytes) whose KEY is on
+//!   [`ALLOWED_ATTRS`] or under [`AGENT_ATTR_PREFIX`]: a node cannot put
+//!   `enduser.id`, `service.name` or `noo.node` on a span and attribute a
+//!   request to someone. Any other attribute is dropped and counted. Anything
+//!   else on a span (events, links, other fields) is dropped.
+//! * time: a span must END within [`TIME_WINDOW_NS`] of when the gateway
+//!   receives it, start no later than it ends, and last at most
+//!   [`MAX_DURATION_NS`], so a node cannot backdate or future-date one out of
+//!   (or to the top of) the retention window.
+//! * a span that fails a rule is dropped and counted, not the whole batch.
+//!   At most [`MAX_SPANS`] spans.
 //! * identity: the resource is REPLACED with `service.name=noo-node-agent`
 //!   and `noo.node=<the verified id>`, whatever the body claimed, so a span
 //!   in Tempo that names a node was sent by that node.
@@ -33,8 +41,9 @@
 //!   configured (the agent drops the batch: traces are best effort, and the
 //!   gateway holds nothing).
 //!
-//! Every refusal is counted in `noo_traces_ingest_refused_total{node,reason}`
-//! and every dropped span in `noo_traces_ingest_dropped_spans_total{node}`.
+//! Every refusal is counted in `noo_traces_ingest_refused_total{node,reason}`,
+//! every dropped span in `noo_traces_ingest_dropped_spans_total{node}` and
+//! every dropped attribute in `noo_traces_ingest_dropped_attrs_total{node}`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -56,8 +65,15 @@ pub const MAX_BODY: usize = 1024 * 1024;
 pub const MAX_SPANS: usize = 2_000;
 pub const MAX_NAME: usize = 128;
 pub const MAX_ATTRS: usize = 32;
-const MAX_ATTR_KEY: usize = 64;
 const MAX_ATTR_VALUE: usize = 256;
+/// The span attribute keys a node may send: what its agent writes today.
+pub const ALLOWED_ATTRS: &[&str] = &["noo.backend", "http.response.status_code"];
+/// Room for the agent's own later attributes, never an identity key.
+pub const AGENT_ATTR_PREFIX: &str = "noo.agent.";
+/// How far a span's end may be from the time the gateway receives it.
+pub const TIME_WINDOW_NS: u64 = 10 * 60 * 1_000_000_000;
+/// The longest span a node may report (a long streamed answer is minutes).
+pub const MAX_DURATION_NS: u64 = 60 * 60 * 1_000_000_000;
 pub const REQUESTS_PER_MIN: u64 = 120;
 pub const BYTES_PER_MIN: u64 = 8 * 1024 * 1024;
 /// What the resource of every forwarded span says it is.
@@ -140,10 +156,14 @@ fn is_hex(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit()) && s.bytes().any(|b| b != b'0')
 }
 
+fn key_allowed(key: &str) -> bool {
+    ALLOWED_ATTRS.contains(&key) || (key.len() > AGENT_ATTR_PREFIX.len() && key.len() <= 64 && key.starts_with(AGENT_ATTR_PREFIX))
+}
+
 /// One attribute as kept, or None when it breaks a rule.
 fn clean_attr(a: &Value) -> Option<Value> {
     let key = a.get("key")?.as_str()?;
-    if key.is_empty() || key.len() > MAX_ATTR_KEY {
+    if !key_allowed(key) {
         return None;
     }
     let v = a.get("value")?;
@@ -162,8 +182,9 @@ fn clean_attr(a: &Value) -> Option<Value> {
     Some(json!({"key": key, "value": value}))
 }
 
-/// One span as kept, or None when it breaks a rule.
-fn clean_span(s: &Value) -> Option<Value> {
+/// One span as kept, with how many of its attributes were dropped, or None
+/// when the span itself breaks a rule. `now_ns` is when the push arrived.
+fn clean_span(s: &Value, now_ns: u64) -> Option<(Value, u64)> {
     let trace_id = s.get("traceId")?.as_str()?;
     let span_id = s.get("spanId")?.as_str()?;
     let parent = s.get("parentSpanId")?.as_str()?;
@@ -176,17 +197,22 @@ fn clean_span(s: &Value) -> Option<Value> {
     }
     let start = s.get("startTimeUnixNano")?.as_str()?;
     let end = s.get("endTimeUnixNano")?.as_str()?;
-    if start.parse::<u64>().is_err() || end.parse::<u64>().is_err() {
+    let (start_ns, end_ns) = (start.parse::<u64>().ok()?, end.parse::<u64>().ok()?);
+    if start_ns > end_ns || end_ns - start_ns > MAX_DURATION_NS || end_ns.abs_diff(now_ns) > TIME_WINDOW_NS {
         return None;
     }
-    let attrs = match s.get("attributes") {
-        None => Vec::new(),
-        Some(Value::Array(a)) if a.len() <= MAX_ATTRS => a.iter().map(clean_attr).collect::<Option<Vec<_>>>()?,
+    let (attrs, dropped_attrs) = match s.get("attributes") {
+        None => (Vec::new(), 0),
+        Some(Value::Array(a)) if a.len() <= MAX_ATTRS => {
+            let kept: Vec<Value> = a.iter().filter_map(clean_attr).collect();
+            let dropped = (a.len() - kept.len()) as u64;
+            (kept, dropped)
+        }
         Some(_) => return None,
     };
     let kind = s.get("kind").and_then(Value::as_u64).filter(|k| *k <= 5).unwrap_or(0);
     let code = s.get("status").and_then(|st| st.get("code")).and_then(Value::as_u64).filter(|c| *c <= 2).unwrap_or(0);
-    Some(json!({
+    Some((json!({
         "traceId": trace_id.to_ascii_lowercase(),
         "spanId": span_id.to_ascii_lowercase(),
         "parentSpanId": parent.to_ascii_lowercase(),
@@ -196,7 +222,7 @@ fn clean_span(s: &Value) -> Option<Value> {
         "endTimeUnixNano": end,
         "attributes": attrs,
         "status": {"code": code},
-    }))
+    }), dropped_attrs))
 }
 
 /// What a push becomes: the OTLP body forwarded to Tempo, and the counts.
@@ -205,11 +231,12 @@ pub struct Prepared {
     pub body: Value,
     pub kept: u64,
     pub dropped: u64,
+    pub dropped_attrs: u64,
 }
 
 /// Parse, clean and re-stamp a push for `node_id`. Refuses only what no
 /// retry could fix (not JSON, not OTLP, too many spans, nothing left).
-pub fn prepare(raw: &[u8], node_id: &str) -> Result<Prepared, Refusal> {
+pub fn prepare(raw: &[u8], node_id: &str, now_ns: u64) -> Result<Prepared, Refusal> {
     let v: Value = serde_json::from_slice(raw).map_err(|e| Refusal::Malformed(format!("body is not JSON: {e}")))?;
     let rs = v
         .get("resourceSpans")
@@ -218,6 +245,7 @@ pub fn prepare(raw: &[u8], node_id: &str) -> Result<Prepared, Refusal> {
     let mut spans = Vec::new();
     let mut seen = 0usize;
     let mut dropped = 0u64;
+    let mut dropped_attrs = 0u64;
     for r in rs {
         for scope in r.get("scopeSpans").and_then(Value::as_array).into_iter().flatten() {
             for s in scope.get("spans").and_then(Value::as_array).into_iter().flatten() {
@@ -225,8 +253,11 @@ pub fn prepare(raw: &[u8], node_id: &str) -> Result<Prepared, Refusal> {
                 if seen > MAX_SPANS {
                     return Err(Refusal::Malformed(format!("more than {MAX_SPANS} spans in one push")));
                 }
-                match clean_span(s) {
-                    Some(c) => spans.push(c),
+                match clean_span(s, now_ns) {
+                    Some((c, d)) => {
+                        spans.push(c);
+                        dropped_attrs += d;
+                    }
                     None => dropped += 1,
                 }
             }
@@ -247,13 +278,17 @@ pub fn prepare(raw: &[u8], node_id: &str) -> Result<Prepared, Refusal> {
     let body = json!({
         "resourceSpans": [{"resource": resource, "scopeSpans": [{"scope": {"name": NODE_SERVICE}, "spans": spans}]}]
     });
-    Ok(Prepared { body, kept, dropped })
+    Ok(Prepared { body, kept, dropped, dropped_attrs })
 }
 
 static BUDGET: LazyLock<NodeBudget> = LazyLock::new(NodeBudget::default);
 
 fn limits() -> Limits {
     Limits { bytes_per_min: BYTES_PER_MIN, requests_per_min: REQUESTS_PER_MIN }
+}
+
+fn now_ns() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
 }
 
 fn now_secs() -> u64 {
@@ -331,13 +366,16 @@ pub async fn node_traces_ingest(
         Ok(None) => return refuse(Refusal::TempoDown("Tempo is not configured on this controller (NOO_TEMPO_OTLP_URL)".into())).await,
         Err(e) => return refuse(Refusal::TempoDown(e)).await,
     };
-    let prepared = match prepare(&body, &node_id) {
+    let prepared = match prepare(&body, &node_id, now_ns()) {
         Ok(p) => p,
         Err(r) => return refuse(r).await,
     };
     let labels = HashMap::from([("node".to_string(), node_id.clone())]);
     if prepared.dropped > 0 {
         state.metrics.inc_counter("noo_traces_ingest_dropped_spans_total", Some(&labels), prepared.dropped).await;
+    }
+    if prepared.dropped_attrs > 0 {
+        state.metrics.inc_counter("noo_traces_ingest_dropped_attrs_total", Some(&labels), prepared.dropped_attrs).await;
     }
     match forward(&url, &prepared.body).await {
         Ok(()) => {
@@ -357,12 +395,15 @@ mod tests {
         ClusterNode(id.into(), ClusterKind::Node)
     }
 
+    /// A fixed "now" for the pushes the tests build.
+    const NOW: u64 = 1_793_400_000_000_000_000;
+
     fn span(parent: Option<&str>) -> Value {
         let mut s = json!({
             "traceId": "4bf92f3577b34da6a3ce929d0e0e4736", "spanId": "00f067aa0ba902b7",
             "name": "agent inference vllm", "kind": 2,
-            "startTimeUnixNano": "1", "endTimeUnixNano": "2",
-            "attributes": [{"key": "noo.backend", "value": {"stringValue": "vllm"}}, {"key": "n", "value": {"intValue": "3"}}],
+            "startTimeUnixNano": (NOW - 1_000).to_string(), "endTimeUnixNano": NOW.to_string(),
+            "attributes": [{"key": "noo.backend", "value": {"stringValue": "vllm"}}, {"key": "http.response.status_code", "value": {"intValue": "200"}}],
             "status": {"code": 1},
             "events": [{"name": "x"}],
         });
@@ -370,6 +411,10 @@ mod tests {
             s["parentSpanId"] = json!(p);
         }
         s
+    }
+
+    fn prepare_at(raw: &[u8], node: &str) -> Result<Prepared, Refusal> {
+        prepare(raw, node, NOW)
     }
 
     fn push(spans: Vec<Value>, resource: Value) -> Vec<u8> {
@@ -398,7 +443,7 @@ mod tests {
             {"key": "service.name", "value": {"stringValue": "noo-gateway"}},
             {"key": "noo.node", "value": {"stringValue": "host8"}},
         ]});
-        let p = prepare(&push(vec![span(Some("1111111111111111"))], claimed), "host3").expect("accepted");
+        let p = prepare_at(&push(vec![span(Some("1111111111111111"))], claimed), "host3").expect("accepted");
         let res = &p.body["resourceSpans"][0]["resource"]["attributes"];
         assert_eq!(res[0]["value"]["stringValue"], json!(NODE_SERVICE));
         assert_eq!(res[1]["value"]["stringValue"], json!("host3"), "the body's node claim is overwritten");
@@ -416,18 +461,61 @@ mod tests {
         let mut zero = span(Some("1111111111111111"));
         zero["traceId"] = json!("0".repeat(32));
         let mut big_attr = span(Some("1111111111111111"));
-        big_attr["attributes"] = json!([{"key": "k", "value": {"stringValue": "v".repeat(MAX_ATTR_VALUE + 1)}}]);
-        let p = prepare(&push(vec![span(None), long, zero, big_attr, span(Some("2222222222222222"))], json!({})), "host3")
+        big_attr["attributes"] = json!([{"key": "noo.backend", "value": {"stringValue": "v".repeat(MAX_ATTR_VALUE + 1)}}]);
+        let p = prepare_at(&push(vec![span(None), long, zero, big_attr, span(Some("2222222222222222"))], json!({})), "host3")
             .expect("one span is fine");
-        assert_eq!((p.kept, p.dropped), (1, 4));
-        let none = prepare(&push(vec![span(None)], json!({})), "host3").expect_err("nothing left");
+        // The oversize attribute goes; its span stays.
+        assert_eq!((p.kept, p.dropped, p.dropped_attrs), (2, 3, 1));
+        let none = prepare_at(&push(vec![span(None)], json!({})), "host3").expect_err("nothing left");
         assert_eq!(none.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A node cannot attribute a request to anyone: an identity attribute
+    /// (or any key off the allow-list) is dropped from the span and counted;
+    /// the span itself is kept.
+    #[test]
+    fn a_node_cannot_set_an_identity_attribute() {
+        let mut s = span(Some("1111111111111111"));
+        s["attributes"] = json!([
+            {"key": "enduser.id", "value": {"stringValue": "alice"}},
+            {"key": "service.name", "value": {"stringValue": "noo-gateway"}},
+            {"key": "noo.node", "value": {"stringValue": "host8"}},
+            {"key": "noo.backend", "value": {"stringValue": "vllm"}},
+            {"key": "noo.agent.queue_ms", "value": {"intValue": "4"}},
+        ]);
+        let p = prepare_at(&push(vec![s], json!({})), "host3").expect("the span is kept");
+        let attrs = p.body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"].as_array().expect("attrs").clone();
+        let keys: Vec<&str> = attrs.iter().filter_map(|a| a["key"].as_str()).collect();
+        assert_eq!(keys, ["noo.backend", "noo.agent.queue_ms"]);
+        assert_eq!((p.kept, p.dropped, p.dropped_attrs), (1, 0, 3));
+    }
+
+    /// A span must end near now, start before it ends and last at most an
+    /// hour: a node cannot backdate or future-date one.
+    #[test]
+    fn a_span_outside_the_time_window_is_dropped() {
+        let at = |start: u64, end: u64| {
+            let mut s = span(Some("1111111111111111"));
+            s["startTimeUnixNano"] = json!(start.to_string());
+            s["endTimeUnixNano"] = json!(end.to_string());
+            s
+        };
+        let min = 60 * 1_000_000_000u64;
+        let spans = vec![
+            at(NOW - 2 * min, NOW - min),             // ended a minute ago: kept
+            at(NOW - 30 * min, NOW - 20 * min),       // ended 20 min ago
+            at(NOW + 20 * min, NOW + 21 * min),       // ends in the future
+            at(NOW, NOW - 1),                         // ends before it starts
+            at(NOW - 90 * min, NOW - min),            // 89 minutes long
+        ];
+        let p = prepare_at(&push(spans, json!({})), "host3").expect("one is fine");
+        assert_eq!((p.kept, p.dropped), (1, 4));
     }
 
     #[test]
     fn limits_answer_with_the_number() {
         let too_many: Vec<Value> = (0..=MAX_SPANS).map(|_| span(Some("1111111111111111"))).collect();
-        assert!(prepare(&push(too_many, json!({})), "host3").expect_err("over").message().contains(&MAX_SPANS.to_string()));
+        assert!(prepare_at(&push(too_many, json!({})), "host3").expect_err("over").message().contains(&MAX_SPANS.to_string()));
         let r = Refusal::RateLimited { what: "requests_per_min", retry_after: 7 };
         assert!(r.message().contains(&REQUESTS_PER_MIN.to_string()), "{}", r.message());
         let resp = r.into_response();
