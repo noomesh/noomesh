@@ -595,12 +595,11 @@ impl AppState {
 
         let js = async_nats::jetstream::new(nats.clone());
         // Userinfo scrubbed: an operator may put the password in the URL.
-        let url_shown = crate::redact::scrub_url_userinfo(&nats_url);
         if wait_for_bus(&nats, BUS_BOOT_WAIT).await {
-            tracing::info!(url = %url_shown, "NATS connected");
+            tracing::info!(url = %crate::redact::scrub_url_userinfo(&nats_url), "NATS connected");
         } else {
             tracing::error!(
-                url = %url_shown,
+                url = %crate::redact::scrub_url_userinfo(&nats_url),
                 waited_secs = BUS_BOOT_WAIT.as_secs(),
                 "nats.unavailable — the gateway starts DEGRADED: worker dispatch, gossip and agent messages \
                  are down (503 bus_unavailable), /health reports degraded; it connects by itself when NATS is up \
