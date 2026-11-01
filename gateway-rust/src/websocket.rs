@@ -442,10 +442,16 @@ where
     tokio::pin!(run);
     tokio::pin!(revoked);
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    // After a runtime stall, one keepalive, not a burst of them.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        // Biased, in this order: a revoke that lands as the turn finishes
+        // still wins (a signed-out session gets no reply, P1), and a tick due
+        // at the turn's end cannot put a keepalive after its last frame.
         tokio::select! {
-            r = &mut run => return Some(r),
+            biased;
             _ = &mut revoked => return None,
+            r = &mut run => return Some(r),
             _ = tick.tick() => keepalive().await,
         }
     }
@@ -547,6 +553,14 @@ mod session_tests {
     async fn a_revoked_session_drops_the_turn() {
         let run = std::future::pending::<u32>();
         let revoked = tokio::time::sleep(std::time::Duration::from_secs(5));
+        assert_eq!(run_turn_with_keepalive(run, revoked, TURN_KEEPALIVE, || async {}).await, None);
+    }
+
+    /// Biased: a turn that finishes as the session is revoked delivers nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_revoke_ready_with_the_turns_result_wins() {
+        let run = std::future::ready(7u32);
+        let revoked = std::future::ready(());
         assert_eq!(run_turn_with_keepalive(run, revoked, TURN_KEEPALIVE, || async {}).await, None);
     }
 
