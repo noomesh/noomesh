@@ -1377,6 +1377,26 @@ fn overlong_for_bcrypt(password: &str) -> Option<usize> {
     (password.len() > BCRYPT_MAX_BYTES).then_some(password.len())
 }
 
+/// What the boot check does for a bootstrap password, given whether the env
+/// fallback is still a login path. Pure, so both outcomes are unit-tested.
+#[derive(Debug, PartialEq, Eq)]
+enum OverlongVerdict {
+    /// 72 bytes or fewer (or unset): nothing to say.
+    Fits,
+    /// Over 72 bytes, an admin row exists: the error log only.
+    Log { bytes: usize },
+    /// Over 72 bytes and still a login path: the error log and one alert.
+    LogAndAlert { bytes: usize },
+}
+
+fn overlong_verdict(password: &str, fallback_open: bool) -> OverlongVerdict {
+    match overlong_for_bcrypt(password) {
+        None => OverlongVerdict::Fits,
+        Some(bytes) if fallback_open => OverlongVerdict::LogAndAlert { bytes },
+        Some(bytes) => OverlongVerdict::Log { bytes },
+    }
+}
+
 /// Boot check (i160a): a hand-set `NOO_ADMIN_PASSWORD` over 72 bytes is a
 /// weaker credential than it looks. Onboard refuses one; the gateway does not
 /// refuse it yet, since that could lock out an install whose store already
@@ -1384,17 +1404,22 @@ fn overlong_for_bcrypt(password: &str) -> Option<usize> {
 /// the env fallback is still an authentication path (no enabled admin row).
 pub async fn warn_overlong_bootstrap_password(state: &AppState) {
     let pw = crate::config::secret_env::secret_or_empty("NOO_ADMIN_PASSWORD");
-    let Some(bytes) = overlong_for_bcrypt(&pw) else {
-        return;
-    };
+    if overlong_for_bcrypt(&pw).is_none() {
+        return; // no census query for the common case
+    }
     let open = env_fallback_allowed(admin_census(&state.db).await);
+    let (bytes, alert) = match overlong_verdict(&pw, open) {
+        OverlongVerdict::Fits => return,
+        OverlongVerdict::Log { bytes } => (bytes, false),
+        OverlongVerdict::LogAndAlert { bytes } => (bytes, true),
+    };
     tracing::error!(
         bytes,
         env_fallback_open = open,
         "NOO_ADMIN_PASSWORD is {bytes} bytes; bcrypt checks only the first {BCRYPT_MAX_BYTES}, so any \
          string sharing them logs in as the bootstrap admin. Fix: noo security admin-password reset"
     );
-    if !open {
+    if !alert {
         return;
     }
     crate::operator_alert::send_operator_alert_with(
@@ -2047,6 +2072,25 @@ mod tests {
         // 37 two-byte characters: 37 characters, 74 bytes.
         assert_eq!(overlong_for_bcrypt(&"é".repeat(37)), Some(74));
         assert_eq!(overlong_for_bcrypt(""), None);
+    }
+
+    /// i160a, the boot check's decision (the 0.6.16 rehearsal's no-item
+    /// reason names this test): over 72 bytes logs, and alerts once only
+    /// while the env fallback is a login path; 72 or fewer does nothing.
+    /// And main.rs runs the check at boot.
+    #[test]
+    fn boot_check_logs_and_alerts_only_for_an_overlong_open_fallback() {
+        use OverlongVerdict as V;
+        let long = "a".repeat(80);
+        assert_eq!(overlong_verdict(&long, true), V::LogAndAlert { bytes: 80 });
+        assert_eq!(overlong_verdict(&long, false), V::Log { bytes: 80 });
+        for fits in ["a".repeat(72), String::new()] {
+            assert_eq!(overlong_verdict(&fits, true), V::Fits);
+            assert_eq!(overlong_verdict(&fits, false), V::Fits);
+        }
+        let main_rs = include_str!("../main.rs");
+        assert!(main_rs.contains("routes::core::warn_overlong_bootstrap_password(&st).await"),
+            "main.rs must run the boot check");
     }
 
     /// i74 item 2, answered against the crate this gateway links: `hash`
