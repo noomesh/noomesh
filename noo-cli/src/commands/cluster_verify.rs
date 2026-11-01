@@ -484,6 +484,9 @@ pub(crate) fn harness_tasks_check(n: &Value) -> Option<Check> {
     Some(ok(NAME, detail))
 }
 
+/// A probe that has not answered for longer than this is no longer a blip.
+const GPU_PROBE_FAILING_SECS: i64 = 60;
+
 /// The `gpu` row, from the node agent's `gpu_contention` heartbeat report
 /// (internal/gpuyield). A node that gave its GPU to other work (VR, model
 /// development, a voice stack) is working as designed: yielded and held are
@@ -510,6 +513,10 @@ pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
                     format!("the NVIDIA driver lost the GPU (nvidia-smi: {detail}) — GPU backends cannot start"),
                     format!("reboot {id}; the kernel log names the fault: journalctl -k | grep -i xid"))
             }
+            Some("probe-timeout") if gc["unmeasured_for_s"].as_i64().unwrap_or(0) > GPU_PROBE_FAILING_SECS => warn("gpu",
+                format!("nvidia-smi has not answered for {} — a Windows program is likely using the GPU (WSL2), or the driver is stuck; the agent yields the GPU backends when this persists",
+                    compact_secs(gc["unmeasured_for_s"].as_i64().unwrap_or(0))),
+                None),
             Some("probe-timeout") => warn("gpu",
                 "nvidia-smi did not answer in time (GPU saturated or driver slow) — not measured", None),
             Some("no-nvidia") => ok("gpu", "no NVIDIA GPU — the node never yields"),
@@ -533,6 +540,10 @@ pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
     Some(match state {
         "free" => ok("gpu", format!("free{off}")),
         "shared" => ok("gpu", format!("shared: foreign {:.1} GB beside noomesh, backends running ({method}){off}", gb("foreign_mb"))),
+        "yielded" if gc["unmeasured"].as_str() == Some("probe-timeout") => warn("gpu",
+            format!("yielded: {paused_phrase} (nvidia-smi not answering for {} — a Windows program is likely using the GPU) — resumes when nvidia-smi answers and the GPU is clear",
+                compact_secs(gc["unmeasured_for_s"].as_i64().unwrap_or(0))),
+            None),
         "yielded" => warn("gpu",
             format!("yielded: {paused_phrase} (foreign {:.1} GB, {method}{off}) — resumes when the GPU frees", gb("foreign_mb")),
             None),
@@ -10919,6 +10930,36 @@ mod gpu_contention_tests {
         assert_eq!(c.verdict, Verdict::Ok);
         assert_eq!(c.name, "gpu");
         assert_eq!(c.detail, "free");
+    }
+
+    #[test]
+    fn a_probe_failing_over_a_minute_warns_and_names_the_likely_cause() {
+        let c = gpu_contention_check(&node(serde_json::json!({
+            "state": "free", "method": "not-measured", "unmeasured": "probe-timeout",
+            "unmeasured_for_s": 150, "paused_backends": []}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("a Windows program is likely using the GPU"), "{}", c.detail);
+        assert!(c.detail.contains("nvidia-smi has not answered for"), "{}", c.detail);
+        // At or under a minute: today's row.
+        let short = gpu_contention_check(&node(serde_json::json!({
+            "state": "free", "method": "not-measured", "unmeasured": "probe-timeout",
+            "unmeasured_for_s": 60, "paused_backends": []}))).unwrap();
+        assert_eq!(short.detail, "nvidia-smi did not answer in time (GPU saturated or driver slow) — not measured");
+        // An old agent sends no duration: today's row, unchanged.
+        let old = gpu_contention_check(&node(serde_json::json!({
+            "state": "free", "method": "not-measured", "unmeasured": "probe-timeout", "paused_backends": []}))).unwrap();
+        assert_eq!(old.verdict, Verdict::Warn);
+        assert_eq!(old.detail, short.detail);
+    }
+
+    #[test]
+    fn yielded_on_a_probe_timeout_names_the_probe_not_foreign_memory() {
+        let c = gpu_contention_check(&node(serde_json::json!({
+            "state": "yielded", "method": "not-measured", "unmeasured": "probe-timeout",
+            "unmeasured_for_s": 90, "paused_backends": ["vllm"]}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("yielded: vllm paused (nvidia-smi not answering for"), "{}", c.detail);
+        assert!(!c.detail.contains("foreign"), "{}", c.detail);
     }
 
     #[test]
