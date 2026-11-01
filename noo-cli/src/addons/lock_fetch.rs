@@ -1366,7 +1366,8 @@ mod tests {
         assert_eq!(c.describe(&route), "via registry.example/rhaddon (credential for rhaddon)");
         // A vendor client has no binding: it presents the vendor token, not the add-on's.
         let vendor = Client::new(Some(Credential { user: "u".into(), token: "vendor-token".into() }));
-        assert_eq!(pull_token(&vendor, "registry.example/rhaddon").as_deref(), Some("vendor-token"));
+        assert_eq!(pull_token(&vendor, "ghcr.io/example/intel").as_deref(), Some("vendor-token"));
+        assert_eq!(pull_token(&vendor, "registry.example/rhaddon"), None, "and only on the vendor host");
         assert!(!format!("{:?}", bound("a", "b")).contains("tp-token"), "Debug redacts the token");
     }
 
