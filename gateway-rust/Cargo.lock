@@ -1868,6 +1868,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac",
+ "hyper-util",
  "jsonwebtoken",
  "libc",
  "rand 0.10.3",

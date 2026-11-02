@@ -138,6 +138,15 @@ services:
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-gateway
     profiles: ["controller", "standalone"]
+    # Docker's default soft nofile is 1024. On 2026-11-02 a leak of idle
+    # keep-alive connections (~22/h) reached it after ~45 h and the gateway
+    # could not read its secrets or reach Postgres. The leak is fixed
+    # (conn_timeouts.rs); this headroom is the mitigation, and the gateway
+    # warns at 70% of whatever soft limit it gets (fd_watch, #649).
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
     # The gateway runs as uid 65532 (nonroot), but ./.noo-host-spool is owned by
     # the host operator (uid/gid 1000). With no shared group the gateway cannot
     # write command files, so every host-spool action — notably the 6-hourly

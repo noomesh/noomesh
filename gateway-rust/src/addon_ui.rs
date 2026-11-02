@@ -246,7 +246,9 @@ pub fn spawn_origins(state: Arc<AppState>, tls: axum_server::tls_rustls::RustlsC
         tokio::spawn(async move {
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
             tracing::info!(addon = %addon, port, "add-on UI origin listening (TLS)");
-            if let Err(e) = axum_server::bind_rustls(addr, tls)
+            let mut server = axum_server::bind_rustls(addr, tls);
+            crate::conn_timeouts::apply(server.http_builder());
+            if let Err(e) = server
                 .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                 .await
             {

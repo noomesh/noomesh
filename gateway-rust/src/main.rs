@@ -81,6 +81,7 @@ mod cert_expiry;
 mod config;
 mod coordinator;
 mod config_mount;
+mod conn_timeouts;
 mod dependency_watchdog;
 mod fd_watch;
 mod node_agent_auth;
@@ -803,8 +804,12 @@ async fn main() -> Result<()> {
     // each request's extensions so the rate limiter can key on the real client
     // IP (see middleware::extract_client_ip) instead of one shared "unknown"
     // bucket.
-    axum_server::bind(addr.parse::<std::net::SocketAddr>()?)
-        .acceptor(acceptor)
+    let mut server = axum_server::bind(addr.parse::<std::net::SocketAddr>()?).acceptor(acceptor);
+    // Idle keep-alive connections are closed (conn_timeouts.rs): without a
+    // timer hyper held them forever, and a leaking client exhausted
+    // RLIMIT_NOFILE on 2026-11-02.
+    conn_timeouts::apply(server.http_builder());
+    server
         .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .await?;
 
