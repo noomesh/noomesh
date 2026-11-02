@@ -15,7 +15,7 @@
 //! tests/secrets_store.rs for why CI runners lack them); the pure ordering
 //! and refusal rules are covered by the unit tests, which need nothing.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
