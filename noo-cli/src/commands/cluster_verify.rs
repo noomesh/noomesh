@@ -5378,6 +5378,14 @@ pub(crate) fn health_from(status: u16, text: &str) -> Option<Value> {
     matches!(status, 200 | 503).then(|| serde_json::from_str(text).ok()).flatten()
 }
 
+/// The rows verify can still show when the node list did not answer: the
+/// `gateway bus` row when /health says the bus is down (it explains the
+/// silence); nothing otherwise, since an unread /health proves nothing.
+pub(crate) fn unanswered_nodes_rows(health: Option<&Value>) -> Vec<Check> {
+    let c = gateway_bus_check(health);
+    if c.verdict == Verdict::Fail { vec![c] } else { Vec::new() }
+}
+
 /// The `gateway bus` row (i301 a.3). Since 0.6.16 a gateway that cannot
 /// reach NATS SERVES (it used to exit and crash-loop), degraded: worker
 /// dispatch, gossip and agent messages answer 503 `bus_unavailable` until it
@@ -5406,8 +5414,35 @@ pub(crate) fn gateway_bus_check(health: Option<&Value>) -> Check {
 
 #[cfg(test)]
 mod gateway_bus_tests {
-    use super::{gateway_bus_check, health_from, Verdict};
+    use super::{gateway_bus_check, health_from, unanswered_nodes_rows, Verdict};
     use serde_json::json;
+
+    /// 0.6.16-rc.3: with NATS down, the node list did not answer in 10 s and
+    /// verify printed only "nothing can be verified"; the `gateway bus` row,
+    /// which exists for that state, never showed.
+    #[test]
+    fn an_unanswered_node_list_still_shows_the_bus_row_when_the_bus_is_down() {
+        let down = json!({"status": "degraded", "dependencies": {"nats": {"healthy": false, "state": "reconnecting"}}});
+        let rows = unanswered_nodes_rows(Some(&down));
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].name, rows[0].verdict), ("gateway bus", Verdict::Fail));
+        assert!(rows[0].detail.contains("not connected to NATS (reconnecting)"), "{}", rows[0].detail);
+        assert_eq!(rows[0].remedy.as_deref(), Some("noo stack start"));
+        let up = json!({"dependencies": {"nats": {"state": "connected"}}});
+        assert!(unanswered_nodes_rows(Some(&up)).is_empty(), "a connected bus explains nothing");
+        assert!(unanswered_nodes_rows(None).is_empty(), "an unread /health proves nothing");
+        // The key is joined at run time so this test's own text never
+        // matches it (a test module sits above the code in this file).
+        let src = include_str!("cluster_verify.rs");
+        let key = ["let Some(body) = get_json_opt(g, ", "\"/api/cluster/nodes\", true, 10) else {"].concat();
+        assert_eq!(src.matches(key.as_str()).count(), 1, "one node-list read");
+        let branch = src.split(key.as_str()).nth(1).unwrap();
+        let branch = &branch[..branch.find("return Ok(1);").expect("its early return")];
+        let reads = ["unanswered_nodes_rows(", "health_body(g).as_ref())"].concat();
+        let prints = ["render(\"controller\", ", "&bus, true)"].concat();
+        assert!(branch.contains(reads.as_str()), "the early return reads /health");
+        assert!(branch.contains(prints.as_str()), "and prints the row");
+    }
 
     #[test]
     fn a_connected_bus_passes_a_down_one_fails_with_the_start_remedy() {
@@ -6019,9 +6054,17 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             warmup::wait_for_node_warmup(g, &nodes);
         }
         let Some(body) = get_json_opt(g, "/api/cluster/nodes", true, 10) else {
+            // A gateway whose bus is down still answers /health at once: say
+            // so with the `gateway bus` row rather than only "nothing can be
+            // verified" (0.6.16-rc.3: an older gateway's node list waited on
+            // NATS KV past this 10 s bound).
+            let bus = unanswered_nodes_rows(health_body(g).as_ref());
             if g.json {
-                println!("{}", serde_json::json!({ "ok": false, "error": "gateway unreachable" }));
+                println!("{}", serde_json::json!({ "ok": false, "error": "gateway unreachable", "controller": { "ok": false, "checks": checks_json(&bus) } }));
             } else {
+                if !bus.is_empty() {
+                    render("controller", &bus, true);
+                }
                 let after = waited_for_gateway.map(|s| format!(" after waiting {s}s")).unwrap_or_default();
                 println!("{}", ui::status_line(Glyph::Err, &format!("the gateway did not answer /api/cluster/nodes{after} — nothing can be verified")));
                 ui::guide(&[("noo health", "is the controller up"), ("noo stack status", "which container is not")]);

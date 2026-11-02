@@ -1085,8 +1085,14 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
     // merging known-but-missing (offline) nodes below.
     let mut live_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Try NATS KV first (has full registration data from node-agent)
-    if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
+    // Try NATS KV first (has full registration data from node-agent) — but
+    // only on a connected bus. On a disconnected client a JetStream request
+    // does not fail fast: it waits out the request timeout (120 s), and
+    // `noo cluster verify` (10 s) gave up with "nothing can be verified" in
+    // the one state its `gateway bus` row exists for (0.6.16-rc.3, i301 a.3).
+    let bus_up = crate::state::bus_connected(&state.nats);
+    let kv = if bus_up { state.js.get_key_value("mesh_nodes").await.ok() } else { None };
+    if let Some(kv) = kv {
         use tokio_stream::StreamExt;
         if let Ok(keys) = kv.keys().await {
             let keys: Vec<String> = keys.filter_map(|k| k.ok()).collect().await;
@@ -1361,6 +1367,7 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
             .and_then(|v| v.as_object())
             .map(|m| m.iter().map(|(k, v)| format!("{}: {}", k, v.as_str().unwrap_or("?"))).collect())
             .unwrap_or_default();
+        let (status, status_detail) = db_node_status(bus_up);
         let mut node = json!({
             "id": node_id,
             "hostname": hostname,
@@ -1377,7 +1384,8 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
             "is_arm": is_arm,
             "backends": backends,
             "running_backends": rb.unwrap_or_else(|| json!({})),
-            "status": "offline",
+            "status": status,
+            "status_detail": status_detail,
             "last_heartbeat": last_hb.map(|t| t.to_rfc3339().replace("+00:00", "Z")),
             "last_heartbeat_source": "database",
             "heartbeat_age_secs": last_hb.map(|t| (chrono::Utc::now() - t).num_seconds().max(0)),
@@ -1400,7 +1408,33 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
         }
     }
 
-    (nodes, offline_merge_error)
+    (nodes, nodes_list_error(bus_up, offline_merge_error))
+}
+
+/// What the gateway says when its bus is down and the node list comes from
+/// the database alone.
+pub(crate) const NODES_BUS_DOWN: &str =
+    "the gateway is not connected to NATS: live node state is unavailable, so every node shows its last record from the database (noo stack start brings the bus back)";
+
+/// A database-only node's status. With the bus up, a node missing from KV
+/// has stopped heartbeating: `offline`. With the bus down, nothing is known
+/// about any node: `unknown`, saying why, never a fleet-wide `offline`.
+fn db_node_status(bus_up: bool) -> (&'static str, Value) {
+    if bus_up {
+        ("offline", Value::Null)
+    } else {
+        ("unknown", json!(NODES_BUS_DOWN))
+    }
+}
+
+/// The list's `error`: the bus being down comes first (it explains every
+/// node), then a database read failure.
+fn nodes_list_error(bus_up: bool, db_error: Option<String>) -> Option<String> {
+    match (bus_up, db_error) {
+        (true, e) => e,
+        (false, None) => Some(NODES_BUS_DOWN.to_string()),
+        (false, Some(e)) => Some(format!("{NODES_BUS_DOWN}; {e}")),
+    }
 }
 
 /// Count nodes by the `status` string `collect_cluster_nodes` assigned.
@@ -7956,5 +7990,40 @@ mod start_over_the_bus_tests {
             assert!(body.contains("NodeLink::for_node("), "{f} must resolve its link with for_node");
             assert!(!body.contains("NodeLink::for_base("), "{f} sends /start by address: it never rides the bus");
         }
+    }
+}
+
+#[cfg(test)]
+mod nodes_bus_down_tests {
+    use super::*;
+
+    /// 0.6.16-rc.3: with NATS stopped, `/api/cluster/nodes` waited out the
+    /// JetStream request timeout on the KV read and `noo cluster verify`
+    /// gave up before its `gateway bus` row. The KV read happens only on a
+    /// connected bus, and the database nodes say why they are `unknown`.
+    #[test]
+    fn the_node_list_never_waits_on_kv_while_the_bus_is_down() {
+        let src = include_str!("cluster.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("test modules")];
+        let body = src.split("pub(crate) async fn collect_cluster_nodes(").nth(1).expect("collect_cluster_nodes");
+        let body = body.split("\n\u{7d}\n").next().unwrap();
+        let gate = body.find("let bus_up = crate::state::bus_connected(&state.nats);").expect("the bus is checked");
+        let read = body.find("if bus_up { state.js.get_key_value(\"mesh_nodes\").await.ok() } else { None }").expect("the KV read is gated");
+        assert!(gate < read, "checked before the read");
+        assert_eq!(body.matches("state.js.").count(), 1, "no other JetStream call in the node list");
+        assert!(body.contains("nodes_list_error(bus_up, offline_merge_error)"), "the reason reaches the response");
+    }
+
+    #[test]
+    fn database_nodes_are_unknown_with_the_reason_while_the_bus_is_down() {
+        assert_eq!(db_node_status(true), ("offline", Value::Null));
+        let (status, detail) = db_node_status(false);
+        assert_eq!(status, "unknown");
+        assert!(detail.as_str().unwrap().contains("not connected to NATS"), "{detail}");
+        assert_eq!(nodes_list_error(true, None), None);
+        assert_eq!(nodes_list_error(true, Some("db".into())).as_deref(), Some("db"));
+        assert_eq!(nodes_list_error(false, None).as_deref(), Some(NODES_BUS_DOWN));
+        let both = nodes_list_error(false, Some("cannot read cluster_nodes".into())).unwrap();
+        assert!(both.starts_with(NODES_BUS_DOWN) && both.ends_with("; cannot read cluster_nodes"), "{both}");
     }
 }
