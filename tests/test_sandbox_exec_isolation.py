@@ -429,8 +429,57 @@ def test_rlimits_are_enforced_in_the_child(scrubbed_python):
     assert "(0, 0) (128, 128)" in result["output"], result
 
 
-def test_timeout_kills_the_whole_process_group(scrubbed_python):
-    started = time.monotonic()
+class _HandshakePopen(subprocess.Popen):
+    """`run_code`'s Popen with a spawn handshake in front of its timer.
+
+    `run_code` starts its timeout in `proc.communicate(code, timeout=…)`, and
+    the snippet only starts once that call has written it to stdin, so a slow
+    interpreter start under suite load used to spend the whole 1 s before the
+    snippet had forked anything ("spawned" missing, noomesh-internal i440). This
+    writes the code itself, blocks until the snippet's first stdout line says
+    it has spawned (60 s, then a FAILURE, never a skip), and only then hands
+    the real timeout to `communicate`. The consumed line goes back in front of
+    the output.
+    """
+
+    handshake_at: float | None = None
+
+    def communicate(self, input=None, timeout=None):
+        if input is not None:
+            self.stdin.write(input)
+            self.stdin.close()
+            self.stdin = None  # the code is sent; communicate() must not touch stdin again
+            self._seen = self._first_line(deadline=60.0)
+            type(self).handshake_at = time.monotonic()
+        out, err = super().communicate(None, timeout=timeout)
+        seen, self._seen = getattr(self, "_seen", b""), b""
+        return seen + (out or b""), err
+
+    def _first_line(self, deadline: float) -> bytes:
+        import selectors
+
+        fd, buf = self.stdout.fileno(), b""
+        end = time.monotonic() + deadline
+        with selectors.DefaultSelector() as sel:
+            sel.register(fd, selectors.EVENT_READ)
+            while b"\n" not in buf:
+                left = end - time.monotonic()
+                if left <= 0 or not sel.select(left):
+                    pytest.fail(f"the snippet never signalled it spawned within {deadline:.0f}s: {buf!r}")
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    pytest.fail(f"the snippet closed stdout before signalling: {buf!r}")
+                buf += chunk
+        return buf
+
+
+def test_timeout_kills_the_whole_process_group(scrubbed_python, monkeypatch):
+    # The snippet forks a 30 s grandchild, then says so. The 1 s timer starts
+    # only after that (the handshake above), so the grandchild always exists
+    # when the timeout fires. It inherits the stdout pipe: if killpg missed
+    # it, the post-kill communicate() would wait out its 30 s.
+    monkeypatch.setattr(_HandshakePopen, "handshake_at", None)
+    monkeypatch.setattr(sandbox.subprocess, "Popen", _HandshakePopen)
     result = sandbox.run_code(
         "import subprocess, time\n"
         "subprocess.Popen(['sleep', '30'])\n"
@@ -439,11 +488,13 @@ def test_timeout_kills_the_whole_process_group(scrubbed_python):
         1,
         "process",
     )
-    elapsed = time.monotonic() - started
+    done = time.monotonic()
+    assert _HandshakePopen.handshake_at is not None, "run_code did not go through the handshake Popen"
     assert result["timed_out"] is True, result
     assert "timed out after 1.0s" in result["output"]
-    assert "spawned" in result["output"]  # output captured before the kill
-    assert elapsed < 10, f"killpg did not end the session: {elapsed:.1f}s"
+    assert "spawned" in result["output"]  # the grandchild existed before the kill
+    after = done - _HandshakePopen.handshake_at
+    assert after < 10, f"killpg did not end the session: {after:.1f}s after the spawn"
 
 
 def test_output_is_capped_not_unbounded(monkeypatch, scrubbed_python):
