@@ -227,7 +227,7 @@ def _probe(tmp_path, smi=None, lspci=None, fn="_compose_gpu_state"):
     # nvidia-smi can never answer for the test.
     tools = tmp_path / "tools"
     tools.mkdir(exist_ok=True)
-    for t in ("grep", "cat", "dirname", "sed", "tr", "head", "printf", "echo"):
+    for t in ("grep", "cat", "dirname", "sed", "tr", "head", "printf", "echo", "mktemp", "sleep", "rm", "mv"):
         src = subprocess.run(["bash", "-c", f"command -v {t}"], capture_output=True, text=True).stdout.strip()
         if src.startswith("/") and not (tools / t).is_symlink():
             (tools / t).symlink_to(src)

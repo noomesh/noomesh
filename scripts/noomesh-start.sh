@@ -346,7 +346,7 @@ detect_gpu_tier() {
         return
     fi
     local vram_mb
-    vram_mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+    vram_mb=$(_noo_nvidia_smi_bounded "${NOO_GPU_PROBE_SECS:-5}" --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
     # Guard (same as noomesh-rebuild.sh): nvidia-smi can print an error to
     # stdout ("Failed to initialize NVML: ..."), which would reach the
     # arithmetic below and abort the script. Only a purely numeric value is
@@ -372,6 +372,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # fu 46: per-instance namespace (project, prefix, network, ports).
 . "$SCRIPT_DIR/lib-instance.sh"
+# lib-compose.sh owns the bounded nvidia-smi probe detect_gpu_tier uses.
+. "$SCRIPT_DIR/lib-compose.sh"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 if [ -f "$PROJECT_ROOT/pyproject.toml" ]; then
     # [trellion]: noo-trellion is an extra since an earlier change (it is
