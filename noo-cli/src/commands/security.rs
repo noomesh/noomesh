@@ -391,6 +391,80 @@ pub fn security_user_set_scopes(g: &Globals, args: &[String]) -> Result<i32, Unh
     Ok(0)
 }
 
+/// `<username> on|off --reason <text> [--password-stdin] [-y|--yes]`.
+pub(crate) fn parse_super_admin_with(a: &mut Args) -> Result<(String, bool, String, bool, bool), ArgError> {
+    let reason = a.value(&["--reason"])?.unwrap_or_default();
+    let password_stdin = a.flag(&["--password-stdin"]);
+    let yes = a.flag(&["-y", "--yes"]);
+    let mut p = a.positionals()?;
+    if p.len() != 2 {
+        return Err(ArgError::new("usage: <username> on|off --reason <text>"));
+    }
+    let on = match p.pop().unwrap_or_default().to_ascii_lowercase().as_str() {
+        "on" => true,
+        "off" => false,
+        other => return Err(ArgError::new(format!("the setting is on or off (got `{other}`)"))),
+    };
+    if reason.trim().is_empty() {
+        return Err(ArgError::new("--reason is required: the change is audited with it"));
+    }
+    Ok((p.remove(0), on, reason.trim().to_string(), password_stdin, yes))
+}
+
+/// `noo security user super-admin <username> on|off --reason <text>` (f99
+/// 2.2): a super admin names or removes another, through the gateway, with a
+/// confirmation, a reason and their OWN password re-entered. The gateway
+/// refuses an agent or door token, a wrong password, and clearing the last
+/// super admin. Recovery is `noo security admin-password reset`.
+pub fn security_user_super_admin(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    use std::io::BufRead as _;
+    let (username, on, reason, password_stdin, yes) = parse_super_admin_with(&mut Args::new(args))?;
+    let what = if on { "make" } else { "remove" };
+    super::confirm_prompt(
+        g,
+        yes,
+        &format!("{what} '{username}' {} super admin (holds every add-on feature and configures admins)?", if on { "a" } else { "as" }),
+    );
+    // Your own password, once: it proves the person at the keyboard, not the
+    // target's. Never prompted in --json mode; never echoed.
+    let password = if password_stdin {
+        let mut line = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut line);
+        line.trim_end_matches(['\n', '\r']).to_string()
+    } else if g.json || unsafe { libc::isatty(0) } != 1 {
+        fail(
+            g.json,
+            ExitCode::Generic,
+            "password_required",
+            "re-enter your own password to change a super admin; cannot prompt here",
+            Some("pipe it via --password-stdin (one line)"),
+        );
+    } else {
+        prompt_secret("Your password: ")
+    };
+    let body = put_json(
+        g,
+        &format!("/api/security/users/{}/super-admin", super::urlencode(&username)),
+        &json!({"on": on, "reason": reason, "password": password}),
+        true,
+        TIMEOUT,
+    );
+    if g.json {
+        println!("{body}");
+        return Ok(0);
+    }
+    let now = body["super_admin"].as_bool().unwrap_or(on);
+    let was = body["was"].as_bool();
+    let line = match (was, now) {
+        (Some(w), n) if w == n => format!("{username} was already {}a super admin", if n { "" } else { "not " }),
+        (_, true) => format!("{username} is now a super admin"),
+        (_, false) => format!("{username} is no longer a super admin"),
+    };
+    ui::close_done(&line);
+    ui::guide(&[("noo addons access <user>", "what an account may use, and the setting that decided it")]);
+    Ok(0)
+}
+
 /// Shared by `grant-role` and `revoke-role`.
 pub(crate) fn parse_roles_with(a: &mut Args) -> Result<(String, Vec<String>), ArgError> {
     let roles = a.values(&["--role", "-r"])?;
@@ -3363,5 +3437,49 @@ mod password_policy_tests {
         assert!(crate::password_policy::weak_password("hunter22", "alice").is_some());
         assert!(crate::password_policy::weak_password("Password123!", "alice").is_some());
         assert!(crate::password_policy::weak_password("a-long-enough-phrase", "alice").is_none());
+    }
+}
+
+#[cfg(test)]
+mod super_admin_tests {
+    use super::parse_super_admin_with;
+    use crate::args::Args;
+
+    fn parse(v: &[&str]) -> Result<(String, bool, String, bool, bool), crate::args::ArgError> {
+        parse_super_admin_with(&mut Args::new(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>()))
+    }
+
+    #[test]
+    fn super_admin_takes_a_user_on_or_off_and_a_reason() {
+        assert_eq!(parse(&["bob", "on", "--reason", "second owner"]).unwrap(), ("bob".into(), true, "second owner".into(), false, false));
+        assert_eq!(
+            parse(&["bob", "OFF", "--reason", "left", "--password-stdin", "-y"]).unwrap(),
+            ("bob".into(), false, "left".into(), true, true)
+        );
+        for (bad, why) in [
+            (vec!["bob", "on"], "--reason is required"),
+            (vec!["bob", "on", "--reason", "  "], "--reason is required"),
+            (vec!["bob", "maybe", "--reason", "x"], "on or off"),
+            (vec!["bob", "--reason", "x"], "usage"),
+            (vec!["bob", "on", "extra", "--reason", "x"], "usage"),
+        ] {
+            let e = parse(&bad).unwrap_err();
+            assert!(e.0.contains(why), "{bad:?}: {e}");
+        }
+    }
+
+    /// Confirm, then the person's own password, then the gateway: a refused
+    /// confirmation asks for no password and sends nothing.
+    #[test]
+    fn super_admin_confirms_then_asks_the_password_then_calls_the_gateway() {
+        let src = include_str!("security.rs");
+        let start = src.find("pub fn security_user_super_admin(").expect("the verb");
+        let rest = &src[start..];
+        let body = &rest[..rest[1..].find("\npub fn ").map(|i| i + 1).unwrap_or(rest.len())];
+        let confirm = body.find("super::confirm_prompt(").expect("confirms");
+        let password = body.find("prompt_secret(\"Your password: \")").expect("asks the password");
+        let call = body.find("put_json(").expect("calls the route");
+        assert!(confirm < password && password < call, "confirm -> password -> PUT");
+        assert!(body.contains("\"password\": password"), "the password is the body's, never a header or the URL");
     }
 }
