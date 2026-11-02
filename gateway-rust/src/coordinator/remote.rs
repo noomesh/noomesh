@@ -847,7 +847,11 @@ mod tests {
 
         let result = super::super::run_streaming_on(&sink, &rt, "what is up", "c1", 5, None, Some("alice"), true).await.unwrap();
 
-        assert_eq!(result.response, "hello");
+        // The saved turn keeps the reasoning as a `<think>` block, as the SSE
+        // path does for a `reasoning` delta (session history); the answer is
+        // what is left outside it.
+        assert_eq!(result.response, "<think>let me see</think>\n\nhello");
+        assert_eq!(crate::verify::response::strip_think_blocks(&result.response).trim(), "hello");
         let events = sink.events();
         assert!(events.iter().any(|(k, v)| k == "thinking" && v.as_str().is_some_and(|t| t.contains("let me see"))), "{events:?}");
         assert!(events.iter().any(|(k, v)| k == "content" && v.as_str() == Some("hello")), "{events:?}");
