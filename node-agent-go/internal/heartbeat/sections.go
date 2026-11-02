@@ -10,7 +10,6 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/imagesource"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
-	"github.com/noomesh/noomesh/node-agent-go/internal/sidecarimage"
 	"github.com/noomesh/noomesh/node-agent-go/internal/version"
 )
 
@@ -85,11 +84,6 @@ var (
 	}}
 
 	secImageProvenance = payloadSection{name: "imageProvenance", add: func(r *Reporter, p map[string]any) {
-		// "published" or "fallback-alpine" for the stunnel sidecar image.
-		// Omitted until a sidecar has been started.
-		if si := sidecarimage.Report(); si != "" {
-			p["stunnel_image"] = si
-		}
 		// Where each image this process started a container from came from:
 		// "rail" | "local" | "registry". Omitted until a start.
 		if is := imagesource.Report(); is != nil {
