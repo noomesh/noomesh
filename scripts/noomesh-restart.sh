@@ -121,13 +121,14 @@ service_profile() {
 }
 
 # Detect GPU tier: Tier 1 (>=10GB VRAM), Tier 2 (4-10GB), or none
+# The VRAM read is bounded (a stuck WSL2 GPU reads as "unknown": no tier).
 detect_gpu_tier() {
     if ! command -v nvidia-smi &>/dev/null; then
         echo ""
         return
     fi
     local vram_mb
-    vram_mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+    vram_mb=$(_noo_nvidia_smi_bounded "${NOO_GPU_PROBE_SECS:-5}" --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
     # Guard (same as noomesh-rebuild.sh): nvidia-smi can print an error to
     # stdout ("Failed to initialize NVML: ..."), which would reach the
     # arithmetic below and abort the script. Only a purely numeric value is
