@@ -738,6 +738,7 @@ docker run --rm -v \"\$PWD/noomesh.yaml\":/f alpine sh -c 'chgrp 65532 /f && chm
 # The file list has ONE home: base, GPU overlay,
 # override, add-on overlays, then dist last so pinned image refs win.
 . "$(dirname "$0")/lib-compose.sh"
+_compose_gpu_probe   # in THIS shell, so the notice below reuses the answer
 COMPOSE_FILES="$(compose_file_args .)"
 compose_gpu_notice
 # Every add-on service compose renders must run exactly its verified pin,

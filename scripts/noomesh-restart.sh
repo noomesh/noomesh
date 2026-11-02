@@ -192,6 +192,7 @@ fi
 # dist mode and the add-on map are both known.
 . "$_LIBDIR/lib-compose.sh"
 . "$_LIBDIR/lib-restart.sh"
+_compose_gpu_probe   # in THIS shell, so the notice below reuses the answer
 COMPOSE_FILES="$(compose_file_args .)"
 compose_gpu_notice
 

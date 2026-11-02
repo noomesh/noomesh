@@ -108,11 +108,27 @@ _noo_nvidia_smi_bounded() {
 # set up without the NVIDIA stack, not a fault. NOO_COMPOSE_GPU=1|0 overrides
 # (tests, headless boxes); 0 reads "none", the operator's choice of CPU.
 # NOO_GPU_PROBE_SECS (default 5) is the deadline of each of the two probes.
+#
+# The answer is cached in _NOO_GPU_STATE for the life of the process, so a
+# launcher run costs at most one deadline when the GPU is busy. A cache set
+# inside $(...) dies with that subshell: call _compose_gpu_probe in the
+# CURRENT shell first (the launchers do, before compose_file_args). The
+# NOO_COMPOSE_GPU override is read first and never cached.
+_NOO_GPU_STATE=""
+
 _compose_gpu_state() {
     case "${NOO_COMPOSE_GPU:-}" in
         1) echo ok; return 0 ;;
         0) echo none; return 0 ;;
     esac
+    _compose_gpu_probe
+    echo "$_NOO_GPU_STATE"
+}
+
+# Fill _NOO_GPU_STATE (once) in the calling shell. No output.
+_compose_gpu_probe() {
+    case "${NOO_COMPOSE_GPU:-}" in 1|0) return 0 ;; esac
+    [ -n "$_NOO_GPU_STATE" ] && return 0
     if command -v nvidia-smi >/dev/null 2>&1; then
         _noo_gpu_secs="${NOO_GPU_PROBE_SECS:-5}"
         _noo_nvidia_smi_bounded "$_noo_gpu_secs" -L >/dev/null 2>&1
@@ -122,22 +138,23 @@ _compose_gpu_state() {
             _noo_gpu_rc=$?
         fi
         if [ "$_noo_gpu_rc" -eq 124 ]; then
-            echo busy
+            _NOO_GPU_STATE=busy
         elif [ "$_noo_gpu_rc" -eq 0 ] \
             && ! printf '%s\n' "$_noo_gpu_q" | grep -qiE 'unknown error|unable to determine'; then
-            echo ok
+            _NOO_GPU_STATE=ok
         else
-            echo lost
+            _NOO_GPU_STATE=lost
         fi
         return 0
     fi
-    echo none
+    _NOO_GPU_STATE=none
 }
 
 # A GPU the base can hand to ollama-embed? Probe, unless told. A busy GPU
 # (the probe did not answer in time) keeps the overlay: dropping GPU backends
 # on a restart because a game was loading would be worse than asking for them.
 _compose_gpu_visible() {
+    _compose_gpu_probe
     case "$(_compose_gpu_state)" in
         ok|busy) return 0 ;;
         *) return 1 ;;
@@ -152,6 +169,7 @@ _compose_gpu_visible() {
 # NOO_GPU_LOST=1 tells lib-stuck-container.sh the cause is already said, so a
 # GPU backend held on the same start names itself without repeating it.
 compose_gpu_notice() {
+    _compose_gpu_probe
     case "$(_compose_gpu_state)" in
         lost)
             NOO_GPU_LOST=1; export NOO_GPU_LOST

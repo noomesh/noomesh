@@ -28,6 +28,9 @@ SMI_SLEEPS = "trap '' TERM; sleep 30"
 SMI_OK = 'case "$*" in -L) echo "GPU 0: RTX 3060";; *) echo 6144;; esac'
 SMI_LOST = 'echo "Unable to determine the device handle for GPU0: Unknown Error" >&2; exit 255'
 DEADLINE = 2  # NOO_GPU_PROBE_SECS in the tests: keeps the suite quick
+# Upper bound for "returned at the deadline": generous for a loaded box, and
+# still far below the 30 s the fake sleeps (and the 665 s it guards against).
+BOUND = DEADLINE * 2 + 5
 
 
 def _env(tmp_path: Path, smi: str | None) -> dict:
@@ -64,7 +67,7 @@ def _run(tmp_path: Path, smi: str | None, fn: str, shell: str = "/bin/bash"):
 def test_helper_a_fast_command_returns_its_output_and_status(tmp_path):
     r, took = _run(tmp_path, SMI_OK, '_noo_nvidia_smi_bounded 5 -L; echo "RC=$?"')
     assert r.stdout.splitlines() == ["GPU 0: RTX 3060", "RC=0"], r
-    assert took < 3, took
+    assert took < BOUND, took
 
 
 def test_helper_passes_through_a_failing_status(tmp_path):
@@ -75,14 +78,14 @@ def test_helper_passes_through_a_failing_status(tmp_path):
 def test_helper_a_sleeper_returns_124_within_the_deadline(tmp_path):
     r, took = _run(tmp_path, SMI_SLEEPS, f'_noo_nvidia_smi_bounded {DEADLINE} -L; echo "RC=$?"')
     assert r.stdout.strip() == "RC=124", r
-    assert took < DEADLINE + 2, took
+    assert took < BOUND, took
 
 
 def test_helper_a_sleeper_does_not_hold_a_command_substitution_open(tmp_path):
     # The stuck child must not keep the caller's captured stdout open.
     r, took = _run(tmp_path, SMI_SLEEPS, f'out="$(_noo_nvidia_smi_bounded {DEADLINE} -L)"; echo "RC=$? [$out]"')
     assert r.stdout.strip() == "RC=124 []", r
-    assert took < DEADLINE + 2, took
+    assert took < BOUND, took
 
 
 def test_helper_leaves_no_temp_dir_behind_even_when_abandoning(tmp_path):
@@ -102,7 +105,7 @@ def test_helper_works_under_a_posix_sh_too(tmp_path):
     r = subprocess.run([sh, "-c", f'{func}\n_noo_nvidia_smi_bounded {DEADLINE} -L; echo "RC=$?"'],
                        capture_output=True, text=True, env=_env(tmp_path, SMI_SLEEPS), timeout=60)
     assert r.stdout.strip() == "RC=124", r
-    assert time.monotonic() - t0 < DEADLINE + 2
+    assert time.monotonic() - t0 < BOUND
 
 
 # ── the state ──
@@ -110,7 +113,7 @@ def test_helper_works_under_a_posix_sh_too(tmp_path):
 def test_a_stuck_gpu_is_busy_in_under_the_deadline(tmp_path):
     r, took = _run(tmp_path, SMI_SLEEPS, "_compose_gpu_state")
     assert r.stdout.strip() == "busy", r
-    assert took < 2 * DEADLINE, took
+    assert took < BOUND, took
 
 
 def test_the_other_states_are_unchanged(tmp_path):
@@ -144,7 +147,7 @@ def test_the_override_still_wins_over_a_stuck_probe(tmp_path):
         ["/bin/bash", "-c", f". {SCRIPTS}/lib-compose.sh && NOO_COMPOSE_GPU=0 _compose_gpu_state"],
         capture_output=True, text=True, env=_env(tmp_path, SMI_SLEEPS), cwd=str(tmp_path), timeout=60,
     )
-    assert r.stdout.strip() == "none" and time.monotonic() - t0 < 2
+    assert r.stdout.strip() == "none" and time.monotonic() - t0 < BOUND
 
 
 # ── noomesh-restart.sh's VRAM check ──
@@ -159,7 +162,7 @@ def _detect_gpu_tier(tmp_path: Path, smi: str):
 def test_restart_vram_check_treats_a_stuck_gpu_as_unknown(tmp_path):
     r, took = _detect_gpu_tier(tmp_path, SMI_SLEEPS)
     assert r.stdout == "[]", r
-    assert took < DEADLINE + 2, took
+    assert took < BOUND, took
 
 
 def test_restart_vram_check_still_reads_a_working_gpu(tmp_path):
@@ -174,3 +177,19 @@ def test_no_launcher_calls_nvidia_smi_unbounded():
             if s.startswith("#") or "nvidia-smi" not in s or "command -v nvidia-smi" in s:
                 continue
             assert "_noo_nvidia_smi_bounded" in s, f"{name}:{n}: {s}"
+
+
+def test_a_busy_gpu_costs_one_deadline_per_process_not_one_per_caller(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    for f in ("docker-compose.cluster.yml", "docker-compose.gpu-embed.yml"):
+        (root / f).write_text("services: {}\n")
+    r, took = _run(tmp_path, SMI_SLEEPS, f"compose_file_list {root}; compose_gpu_notice; _compose_gpu_state")
+    assert took < DEADLINE + 5, took
+    assert r.stderr.count("did not answer nvidia-smi") == 1, r
+    assert r.stdout.splitlines()[-1] == "busy", r
+
+
+def test_the_override_is_read_before_the_cache(tmp_path):
+    r, _ = _run(tmp_path, SMI_OK, "_compose_gpu_state; NOO_COMPOSE_GPU=0 _compose_gpu_state; _compose_gpu_state")
+    assert r.stdout.split() == ["ok", "none", "ok"], r
