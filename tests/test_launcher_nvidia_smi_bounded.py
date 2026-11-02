@@ -27,10 +27,13 @@ SCRIPTS = REPO_ROOT / "scripts"
 SMI_SLEEPS = "trap '' TERM; sleep 30"
 SMI_OK = 'case "$*" in -L) echo "GPU 0: RTX 3060";; *) echo 6144;; esac'
 SMI_LOST = 'echo "Unable to determine the device handle for GPU0: Unknown Error" >&2; exit 255'
-DEADLINE = 2  # NOO_GPU_PROBE_SECS in the tests: keeps the suite quick
+DEADLINE = 2  # the helper tests pass their own short deadline
 # Upper bound for "returned at the deadline": generous for a loaded box, and
 # still far below the 30 s the fake sleeps (and the 665 s it guards against).
 BOUND = DEADLINE * 2 + 5
+# Production callers pass 5; the tests that go through _compose_gpu_state use it.
+PROD_DEADLINE = 5
+PROD_BOUND = PROD_DEADLINE * 2 + 5
 
 
 def _env(tmp_path: Path, smi: str | None) -> dict:
@@ -49,8 +52,7 @@ def _env(tmp_path: Path, smi: str | None) -> dict:
             (tools / t).symlink_to(src)
     tmp = tmp_path / "tmp"
     tmp.mkdir(exist_ok=True)
-    return {"PATH": f"{bindir}:{tools}", "HOME": str(tmp_path), "TMPDIR": str(tmp),
-            "NOO_GPU_PROBE_SECS": str(DEADLINE)}
+    return {"PATH": f"{bindir}:{tools}", "HOME": str(tmp_path), "TMPDIR": str(tmp)}
 
 
 def _run(tmp_path: Path, smi: str | None, fn: str, shell: str = "/bin/bash"):
@@ -113,7 +115,7 @@ def test_helper_works_under_a_posix_sh_too(tmp_path):
 def test_a_stuck_gpu_is_busy_in_under_the_deadline(tmp_path):
     r, took = _run(tmp_path, SMI_SLEEPS, "_compose_gpu_state")
     assert r.stdout.strip() == "busy", r
-    assert took < BOUND, took
+    assert took < PROD_BOUND, took
 
 
 def test_the_other_states_are_unchanged(tmp_path):
@@ -125,7 +127,7 @@ def test_the_other_states_are_unchanged(tmp_path):
 def test_busy_prints_one_line_and_does_not_claim_the_gpu_is_lost(tmp_path):
     r, _ = _run(tmp_path, SMI_SLEEPS, 'compose_gpu_notice; echo "LOST=${NOO_GPU_LOST:-}"')
     lines = r.stderr.rstrip("\n").splitlines()
-    assert lines == [f"  the GPU did not answer nvidia-smi within {DEADLINE} s (busy: on WSL2 a Windows "
+    assert lines == [f"  the GPU did not answer nvidia-smi within {PROD_DEADLINE} s (busy: on WSL2 a Windows "
                      "program is likely using it); the GPU overlay is kept"], r
     assert r.stdout.strip() == "LOST=", "busy is not lost: lib-stuck-container must not say 'lost, above'"
 
@@ -162,7 +164,7 @@ def _detect_gpu_tier(tmp_path: Path, smi: str):
 def test_restart_vram_check_treats_a_stuck_gpu_as_unknown(tmp_path):
     r, took = _detect_gpu_tier(tmp_path, SMI_SLEEPS)
     assert r.stdout == "[]", r
-    assert took < BOUND, took
+    assert took < PROD_BOUND, took
 
 
 def test_restart_vram_check_still_reads_a_working_gpu(tmp_path):
@@ -185,7 +187,7 @@ def test_a_busy_gpu_costs_one_deadline_per_process_not_one_per_caller(tmp_path):
     for f in ("docker-compose.cluster.yml", "docker-compose.gpu-embed.yml"):
         (root / f).write_text("services: {}\n")
     r, took = _run(tmp_path, SMI_SLEEPS, f"compose_file_list {root}; compose_gpu_notice; _compose_gpu_state")
-    assert took < DEADLINE + 5, took
+    assert took < PROD_DEADLINE + 5, took
     assert r.stderr.count("did not answer nvidia-smi") == 1, r
     assert r.stdout.splitlines()[-1] == "busy", r
 

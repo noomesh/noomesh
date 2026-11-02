@@ -49,8 +49,8 @@ fi
 # uninterruptibly in the dxg driver; `timeout 5 nvidia-smi` itself returned
 # only after 665 s, because GNU timeout waits for its child after signalling
 # it. So the deadline lives here, and nothing waits on the probe:
-#   _noo_nvidia_smi_bounded [secs] -- args...    (secs defaults to 5; the
-#   "--" is optional when the first word is not a number)
+#   _noo_nvidia_smi_bounded <secs> [--] args...    (the deadline is required, no
+#   default: every production caller passes 5)
 # The probe runs in the BACKGROUND in a subshell cut off from our stdin,
 # stdout and stderr (a caller inside $(...) must not be held open by a stuck
 # child), writing its output to a file and its exit status to another. We poll
@@ -59,11 +59,10 @@ fi
 # NOT wait, do not read a pipe the child holds, remove the temp dir (the child
 # may keep the unlinked files) and return 124 = "stuck". POSIX sh.
 _noo_nvidia_smi_bounded() {
-    _nsb_secs=5
     case "${1:-}" in
-        ''|*[!0-9]*) ;;
-        *) _nsb_secs="$1"; shift ;;
+        ''|*[!0-9]*) echo "_noo_nvidia_smi_bounded: the first argument is the deadline in seconds" >&2; return 2 ;;
     esac
+    _nsb_secs="$1"; shift
     [ "${1:-}" = "--" ] && shift
     _nsb_dir="$(mktemp -d "${TMPDIR:-/tmp}/noo-smi.XXXXXX" 2>/dev/null)" || return 125
     (
@@ -107,7 +106,6 @@ _noo_nvidia_smi_bounded() {
 # and that GPU is not lost. A card with no driver installed is "none": a box
 # set up without the NVIDIA stack, not a fault. NOO_COMPOSE_GPU=1|0 overrides
 # (tests, headless boxes); 0 reads "none", the operator's choice of CPU.
-# NOO_GPU_PROBE_SECS (default 5) is the deadline of each of the two probes.
 #
 # The answer is cached in _NOO_GPU_STATE for the life of the process, so a
 # launcher run costs at most one deadline when the GPU is busy. A cache set
@@ -130,7 +128,7 @@ _compose_gpu_probe() {
     case "${NOO_COMPOSE_GPU:-}" in 1|0) return 0 ;; esac
     [ -n "$_NOO_GPU_STATE" ] && return 0
     if command -v nvidia-smi >/dev/null 2>&1; then
-        _noo_gpu_secs="${NOO_GPU_PROBE_SECS:-5}"
+        _noo_gpu_secs=5
         _noo_nvidia_smi_bounded "$_noo_gpu_secs" -L >/dev/null 2>&1
         _noo_gpu_rc=$?
         if [ "$_noo_gpu_rc" -eq 0 ]; then
@@ -175,7 +173,7 @@ compose_gpu_notice() {
             NOO_GPU_LOST=1; export NOO_GPU_LOST
             echo "  the NVIDIA driver lost the GPU (nvidia-smi cannot read it): the embedder starts on CPU; reboot to get the GPU back" >&2 ;;
         busy)
-            echo "  the GPU did not answer nvidia-smi within ${NOO_GPU_PROBE_SECS:-5} s (busy: on WSL2 a Windows program is likely using it); the GPU overlay is kept" >&2 ;;
+            echo "  the GPU did not answer nvidia-smi within 5 s (busy: on WSL2 a Windows program is likely using it); the GPU overlay is kept" >&2 ;;
     esac
     return 0
 }

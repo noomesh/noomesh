@@ -128,7 +128,7 @@ detect_gpu_tier() {
         return
     fi
     local vram_mb
-    vram_mb=$(_noo_nvidia_smi_bounded "${NOO_GPU_PROBE_SECS:-5}" --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+    vram_mb=$(_noo_nvidia_smi_bounded 5 --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
     # Guard (same as noomesh-rebuild.sh): nvidia-smi can print an error to
     # stdout ("Failed to initialize NVML: ..."), which would reach the
     # arithmetic below and abort the script. Only a purely numeric value is
