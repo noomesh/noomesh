@@ -26,7 +26,6 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
 	"github.com/noomesh/noomesh/node-agent-go/internal/metrics"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
-	"github.com/noomesh/noomesh/node-agent-go/internal/sidecarimage"
 )
 
 func newTestReporter(t *testing.T, serverURL string, cfg *config.Config) *Reporter {
@@ -703,41 +702,6 @@ func TestReporter_HeartbeatCarriesBackendLeaves(t *testing.T) {
 	}
 	if na, _ := v["not_after"].(float64); int64(na) != notAfter {
 		t.Errorf("backend_leaves.vllm.not_after = %v, want %d", v["not_after"], notAfter)
-	}
-}
-
-// `stunnel_image`: absent until a sidecar image has been
-// chosen, then the LAST choice — "published" or "fallback-alpine" — on
-// every beat and on registration.
-func TestReporter_HeartbeatCarriesStunnelImage(t *testing.T) {
-	var payload map[string]any
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		payload = nil
-		json.NewDecoder(r.Body).Decode(&payload)
-		w.WriteHeader(200)
-	}))
-	defer server.Close()
-	r := newTestReporter(t, server.URL, nil)
-
-	r.SendHeartbeat()
-	if v, ok := payload["stunnel_image"]; ok {
-		t.Fatalf("stunnel_image = %v before any sidecar start, want the key omitted", v)
-	}
-
-	sidecarimage.Chose("noomesh/stunnel:latest", false, nil)
-	r.SendHeartbeat()
-	if got := payload["stunnel_image"]; got != sidecarimage.Published {
-		t.Errorf("heartbeat stunnel_image = %v, want %q", got, sidecarimage.Published)
-	}
-
-	sidecarimage.Chose("alpine:3.20", true, []string{"ghcr.io/x/stunnel:v1: not found"})
-	r.SendHeartbeat()
-	if got := payload["stunnel_image"]; got != sidecarimage.FallbackAlpine {
-		t.Errorf("heartbeat stunnel_image = %v, want %q", got, sidecarimage.FallbackAlpine)
-	}
-	r.Register(hardware.Capabilities{CPUCores: 1, Tier: 2}, "192.168.1.10")
-	if got := payload["stunnel_image"]; got != sidecarimage.FallbackAlpine {
-		t.Errorf("registration stunnel_image = %v, want %q", got, sidecarimage.FallbackAlpine)
 	}
 }
 

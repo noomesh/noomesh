@@ -565,16 +565,23 @@ func TestSidecarSpec(t *testing.T) {
 	t.Setenv("NOO_IMAGE_PREFIX", "ghcr.io/x/noomesh")
 	t.Setenv("NOO_IMAGE_TAG", "v9")
 	got := strings.Join(stunnelImageCandidates("llamacpp"), ",")
-	if got != "ghcr.io/x/noomesh/stunnel:v9,noomesh/stunnel:latest,"+stunnelFallbackImage {
+	// i407: the release's own image and nothing after it — no
+	// controller-only `noomesh/stunnel:latest`, no alpine + apk fallback.
+	if got != "ghcr.io/x/noomesh/stunnel:v9" {
 		t.Errorf("image candidates: %s", got)
+	}
+	for _, retired := range []string{"noomesh/stunnel:latest", "alpine"} {
+		if strings.Contains(got, retired) {
+			t.Errorf("a retired sidecar fallback is back: %s in %s", retired, got)
+		}
 	}
 	t.Setenv(StunnelImageEnv, "my/stunnel:1")
 	if c := stunnelImageCandidates("llamacpp"); c[0] != "my/stunnel:1" {
 		t.Errorf("override must come first: %v", c)
 	}
-	// The sidecar script installs stunnel only when the image lacks it.
-	if !strings.Contains(stunnelSidecarScript, "exec stunnel") || !strings.Contains(stunnelSidecarScript, "apk add") {
-		t.Error("sidecar script shape")
+	// The sidecar script runs the image's stunnel and installs nothing.
+	if !strings.Contains(stunnelSidecarScript, "exec stunnel") || strings.Contains(stunnelSidecarScript, "apk") {
+		t.Error("sidecar script shape: it must exec the image's stunnel and install nothing")
 	}
 	// A sidecar name reads back to its backend; compose's tei-gpu too.
 	for name, want := range map[string]string{
@@ -862,8 +869,8 @@ func TestDoorSelfNameReadsTheAgentLeaf(t *testing.T) {
 // The backend privilege floor (i301, internal#300): beside no-new-privileges
 // and CapDrop ALL, an image whose write set was measured empty runs on a
 // read-only root with a tmpfs /tmp. llama-server (llamacpp and the reranker)
-// and every door sidecar on the published stunnel image take it; the alpine
-// fallback door cannot (its entrypoint runs `apk add`).
+// and every door sidecar (the published stunnel image; the alpine fallback is
+// retired, i407) take it.
 func TestReadOnlyRootFloor(t *testing.T) {
 	if !backendSpecs["llamacpp"].ReadOnlyRoot || !rerankerSpecLlamacpp().ReadOnlyRoot {
 		t.Error("llama-server writes nothing outside its read-only /models: llamacpp and the reranker take a read-only root")
@@ -886,7 +893,7 @@ func TestReadOnlyRootFloor(t *testing.T) {
 	// Both create paths apply it.
 	for file, call := range map[string]string{
 		"backends.go": "rootFloor(hostCfg, spec.ReadOnlyRoot)",
-		"sidecar.go":  "rootFloor(hostCfg, image != stunnelFallbackImage)",
+		"sidecar.go":  "rootFloor(hostCfg, true)",
 	} {
 		src, err := os.ReadFile(file)
 		if err != nil {
