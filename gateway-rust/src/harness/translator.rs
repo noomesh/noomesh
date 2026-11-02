@@ -783,7 +783,7 @@ async fn responses(State(sh): State<Arc<Shared>>, bytes: Bytes) -> Response {
 
 // ── Ollama's /api/chat ──────────────────────────────────────────────────
 
-mod ollama {
+pub(crate) mod ollama {
     use serde_json::{json, Value};
 
     fn text_of(content: Option<&Value>) -> String {
@@ -925,16 +925,31 @@ mod ollama {
     }
 
     /// Streamed `/api/chat` lines -> OpenAI chunks.
-    pub(super) struct Chunker {
+    pub(crate) struct Chunker {
         id: String,
         model: String,
         created: i64,
         tools: usize,
+        /// `message.thinking` -> `delta.reasoning` (the field the gateway's
+        /// own loop reads, as the node agent's translation does). Off for the
+        /// vendor-CLI translator, whose clients get the answer only.
+        reasoning: bool,
     }
 
     impl Chunker {
-        pub(super) fn new(model: &str) -> Self {
-            Self { id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()), model: model.to_string(), created: chrono::Utc::now().timestamp(), tools: 0 }
+        pub(crate) fn new(model: &str) -> Self {
+            Self {
+                id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
+                model: model.to_string(),
+                created: chrono::Utc::now().timestamp(),
+                tools: 0,
+                reasoning: false,
+            }
+        }
+
+        /// The same, with reasoning carried (the gateway's agent loop, i411).
+        pub(crate) fn with_reasoning(model: &str) -> Self {
+            Self { reasoning: true, ..Self::new(model) }
         }
 
         fn chunk(&self, choices: Value) -> Value {
@@ -943,9 +958,14 @@ mod ollama {
 
         /// One NDJSON object -> zero or more chunks. The closing `done`
         /// object becomes a finish chunk and a usage chunk.
-        pub(super) fn chunks(&mut self, v: &Value) -> Vec<Value> {
+        pub(crate) fn chunks(&mut self, v: &Value) -> Vec<Value> {
             let mut out = Vec::new();
             let m = v.get("message").cloned().unwrap_or_else(|| json!({}));
+            if self.reasoning {
+                if let Some(t) = m.get("thinking").and_then(|t| t.as_str()).filter(|t| !t.is_empty()) {
+                    out.push(self.chunk(json!([{"index": 0, "delta": {"reasoning": t}, "finish_reason": null}])));
+                }
+            }
             let text = text_of(m.get("content"));
             if !text.is_empty() {
                 out.push(self.chunk(json!([{"index": 0, "delta": {"content": text}, "finish_reason": null}])));
@@ -965,6 +985,89 @@ mod ollama {
             }
             out
         }
+    }
+
+    /// An `/api/chat` NDJSON body -> the SSE lines (`data: <chunk>`) an
+    /// OpenAI stream reader reads, line by line as bytes arrive. A line that
+    /// is not a JSON object is passed through untouched, so the reader's
+    /// own "nothing readable" check still sees it (i411).
+    pub(crate) struct NdjsonToSse {
+        held: String,
+        chunker: Chunker,
+    }
+
+    impl NdjsonToSse {
+        pub(crate) fn new(model: &str) -> Self {
+            Self { held: String::new(), chunker: Chunker::with_reasoning(model) }
+        }
+
+        /// Feed the next bytes; returns the complete SSE lines they finish.
+        pub(crate) fn push(&mut self, text: &str) -> String {
+            self.held.push_str(text);
+            let mut out = String::new();
+            while let Some(end) = self.held.find('\n') {
+                let line: String = self.held.drain(..=end).collect();
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<Value>(line) {
+                    Ok(v) if v.is_object() => {
+                        for c in self.chunker.chunks(&v) {
+                            out.push_str(&format!("data: {c}\n"));
+                        }
+                    }
+                    _ => {
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                }
+            }
+            out
+        }
+    }
+}
+
+#[cfg(test)]
+mod ndjson_to_sse_tests {
+    use super::ollama::NdjsonToSse;
+    use serde_json::Value;
+
+    fn chunks(sse: &str) -> Vec<Value> {
+        sse.lines().map(|l| serde_json::from_str(l.strip_prefix("data: ").expect("an SSE data line")).unwrap()).collect()
+    }
+
+    /// i411: Ollama's native stream, split mid-line across reads, becomes the
+    /// OpenAI chunks the agent loop reads: reasoning, content, a tool call,
+    /// then the finish and usage.
+    #[test]
+    fn a_native_ollama_stream_becomes_openai_chunks_line_by_line() {
+        let mut t = NdjsonToSse::new("gemma4:12b");
+        let body = concat!(
+            r#"{"model":"gemma4:12b","message":{"role":"assistant","content":"","thinking":"let me see"},"done":false}"#, "\n",
+            r#"{"model":"gemma4:12b","message":{"role":"assistant","content":"hel"},"done":false}"#, "\n",
+            r#"{"model":"gemma4:12b","message":{"role":"assistant","content":"lo"},"done":false}"#, "\n",
+            r#"{"model":"gemma4:12b","message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"web_search","arguments":{"q":"x"}}}]},"done":false}"#, "\n",
+            r#"{"model":"gemma4:12b","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":12,"eval_count":3}"#, "\n",
+        );
+        let (a, b) = body.split_at(50);
+        let first = t.push(a);
+        assert!(first.is_empty(), "nothing before the first newline: {first:?}");
+        let c = chunks(&(first + &t.push(b)));
+        let delta = |i: usize| &c[i]["choices"][0]["delta"];
+        assert_eq!(delta(0)["reasoning"], "let me see");
+        assert_eq!((delta(1)["content"].as_str(), delta(2)["content"].as_str()), (Some("hel"), Some("lo")));
+        assert_eq!(delta(3)["tool_calls"][0]["function"]["name"], "web_search");
+        assert!(c.iter().any(|x| x["choices"][0]["finish_reason"].as_str().is_some()), "a finish chunk");
+        assert!(c.iter().any(|x| x.get("usage").is_some()), "a usage chunk");
+    }
+
+    /// A line that is not JSON passes through as it is, so the loop's
+    /// "nothing readable" check still sees it rather than an empty body.
+    #[test]
+    fn a_line_that_is_not_json_passes_through() {
+        let mut t = NdjsonToSse::new("m");
+        assert_eq!(t.push("<html>bad gateway</html>\n\n"), "<html>bad gateway</html>\n");
     }
 }
 

@@ -802,6 +802,79 @@ mod tests {
         assert_eq!(jwt_harness_node_unverified("tok-123"), None);
     }
 
+    /// An Ollama dialled directly (no node agent in front): `/api/chat`
+    /// answers in NDJSON. `body` is what it sends back, as is.
+    async fn native_ollama(body: &'static str, calls: Arc<std::sync::atomic::AtomicUsize>) -> String {
+        // A fallback, not a `.route`: the openapi drift check reads every
+        // route string as a gateway path. The loop posts to `/api/chat`.
+        let app = Router::new().fallback(move || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                axum::response::Response::builder()
+                    .header("content-type", "application/x-ndjson")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    fn ollama_at(url: &str) -> ResolvedBackend {
+        ResolvedBackend { url: url.into(), model: "gemma4:12b".into(), backend_type: "ollama".into(), api_format: "ollama".into() }
+    }
+
+    /// i411: the loop streamed a directly dialled Ollama's NDJSON through an
+    /// SSE reader, skipped every line, and saved an empty answer with no
+    /// error. Each line is now read: the reasoning streams as `thinking`,
+    /// the answer as `content`.
+    #[tokio::test]
+    async fn a_directly_dialled_ollama_streams_its_answer_and_its_thinking() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let gw = fake_gateway(seen.clone()).await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body = concat!(
+            r#"{"model":"gemma4:12b","message":{"role":"assistant","content":"","thinking":"let me see"},"done":false}"#, "\n",
+            r#"{"model":"gemma4:12b","message":{"role":"assistant","content":"hello"},"done":false}"#, "\n",
+            r#"{"model":"gemma4:12b","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":9,"eval_count":2}"#, "\n",
+        );
+        let model = native_ollama(body, calls.clone()).await;
+        let rt = RemoteRuntime::connect(&gw, "tok-123", reqwest::Client::new()).await.unwrap().pin_backend(ollama_at(&model));
+        let sink = Recorder::default();
+
+        let result = super::super::run_streaming_on(&sink, &rt, "what is up", "c1", 5, None, Some("alice"), true).await.unwrap();
+
+        assert_eq!(result.response, "hello");
+        let events = sink.events();
+        assert!(events.iter().any(|(k, v)| k == "thinking" && v.as_str().is_some_and(|t| t.contains("let me see"))), "{events:?}");
+        assert!(events.iter().any(|(k, v)| k == "content" && v.as_str() == Some("hello")), "{events:?}");
+        assert!(!events.iter().any(|(k, _)| k == "error"), "{events:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// i411, P3: a body with nothing readable in it is the backend's error,
+    /// named to the client, never an empty answer the loop saves and nudges.
+    #[tokio::test]
+    async fn a_body_with_nothing_readable_is_an_error_naming_the_backend() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let gw = fake_gateway(seen.clone()).await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let model = native_ollama("<html>502 bad gateway</html>\n", calls.clone()).await;
+        let rt = RemoteRuntime::connect(&gw, "tok-123", reqwest::Client::new()).await.unwrap().pin_backend(ollama_at(&model));
+        let sink = Recorder::default();
+
+        let _ = super::super::run_streaming_on(&sink, &rt, "what is up", "c1", 5, None, Some("alice"), false).await;
+
+        let events = sink.events();
+        let err = events.iter().find(|(k, _)| k == "error").map(|(_, v)| v.as_str().unwrap_or("").to_string()).expect("an error event");
+        assert!(err.contains("nothing this gateway can read") && err.contains("502 bad gateway") && err.contains("backend ollama"), "{err}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "not nudged into another call");
+        assert!(!events.iter().any(|(k, v)| k == "metadata" && v.get("auto_continue").is_some()), "{events:?}");
+    }
+
     #[test]
     fn the_token_expiry_reads_only_a_well_formed_exp() {
         use base64::Engine as _;
