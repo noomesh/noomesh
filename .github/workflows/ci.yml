@@ -122,6 +122,7 @@ jobs:
       sqlx: ${{ steps.diff.outputs.sqlx }}
       ui: ${{ steps.diff.outputs.ui }}
       llamacpp: ${{ steps.diff.outputs.llamacpp }}
+      ollama: ${{ steps.diff.outputs.ollama }}
       deferred: ${{ steps.diff.outputs.deferred }}
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -153,6 +154,7 @@ jobs:
         if [ -n "${BASE:-}" ]; then
           lc_range="$BASE...HEAD"
           lc_pattern='^(docker/Dockerfile\.llamacpp$|\.github/workflows/ci\.yml$)'
+          ol_pattern='^(docker/Dockerfile\.ollama$|\.github/workflows/ci\.yml$)'
         else
           lc_release="$(git tag --list 'stack-v*' | grep -vE -- '-rc\.' | sort -V | tail -1 || true)"
           if [ -z "$lc_release" ] && git rev-parse -q --verify refs/remotes/origin/main >/dev/null; then
@@ -160,6 +162,7 @@ jobs:
           fi
           lc_range="${lc_release:+$lc_release..HEAD}"
           lc_pattern='^docker/Dockerfile\.llamacpp$'
+          ol_pattern='^docker/Dockerfile\.ollama$'
         fi
         if [ -n "$lc_range" ]; then
           lc_changed="$(git diff --name-only "$lc_range" 2>/dev/null)" || lc_range=""
@@ -172,6 +175,17 @@ jobs:
           llamacpp=false; echo "llamacpp: its inputs are unchanged in $lc_range"
         fi
         echo "llamacpp=$llamacpp" >> "$GITHUB_OUTPUT"
+        # ── ollama: the same rule for docker/Dockerfile.ollama (i415). Its one
+        # input in this tree too (tests/test_ci_scope_declarations.py holds
+        # it), the same range, the same fail-open.
+        if [ -z "$lc_range" ]; then
+          ollama=true; echo "ollama: no base to diff against — building (fail open)"
+        elif printf '%s\n' "$lc_changed" | grep -qE "$ol_pattern"; then
+          ollama=true; echo "ollama: its inputs changed in $lc_range"
+        else
+          ollama=false; echo "ollama: its inputs are unchanged in $lc_range"
+        fi
+        echo "ollama=$ollama" >> "$GITHUB_OUTPUT"
 
         # A push (to dev/main) is the integration point — never narrow it.
         all_true() {
@@ -1662,8 +1676,10 @@ jobs:
   llamacpp-image:
     # The hardened llama-server (docker/Dockerfile.llamacpp) is
     # otherwise built by the release workflow alone, on a TAG, so a break would
-    # surface after the tag exists. This job compiles the builder stage on every
-    # PR that changes the Dockerfile so the break lands on the PR; layer cache
+    # surface after the tag exists. This job builds the WHOLE image (amd64) on
+    # every PR that changes the Dockerfile so the break lands on the PR. It built
+    # the builder stage only until 0.6.16-rc.1, whose release then failed in the
+    # runtime stage (i415); layer cache
     # makes the unchanged case a hit in seconds. The compile steps are gated on
     # the repository, NOT on hashFiles(): a moved or renamed Dockerfile must
     # fail this job, not quietly skip it.
@@ -1710,20 +1726,61 @@ jobs:
     - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487  # v4.0.0
       if: needs.scope.outputs.llamacpp == 'true'
 
-    - name: Compile llama-server (builder stage, linux/amd64)
+    - name: Build the llama-server image (every stage, linux/amd64)
       if: needs.scope.outputs.llamacpp == 'true' && github.repository == 'noomesh/noomesh' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
       run: |
         set -o pipefail
-        docker buildx build --load --target builder -f docker/Dockerfile.llamacpp \
+        docker buildx build --load -f docker/Dockerfile.llamacpp \
           --cache-from type=gha,scope=ci-llamacpp \
           --cache-to type=gha,mode=max,scope=ci-llamacpp \
-          -t noomesh-llamacpp-builder:${{ github.sha }} . 2>&1 | tail -n 200
-        # The image must say which llama.cpp it holds — the whole point of the
-        # pin — and the binary must at least start. --entrypoint: the builder's
-        # base image is the uv image, whose entrypoint is `uv`.
-        docker run --rm --entrypoint sh noomesh-llamacpp-builder:${{ github.sha }} \
-          -c 'cat /src/LLAMACPP_COMMIT && /src/build/bin/llama-server --version'
-        docker rmi noomesh-llamacpp-builder:${{ github.sha }} >/dev/null 2>&1 || true
+          -t noomesh-llamacpp:${{ github.sha }} . 2>&1 | tail -n 200
+        # The image must say which llama.cpp it holds (the whole point of the
+        # pin) and the binary, with the runtime stage's libraries, must start.
+        docker run --rm --entrypoint sh noomesh-llamacpp:${{ github.sha }} \
+          -c 'cat /opt/llama/LLAMACPP_COMMIT && llama-server --version'
+        docker rmi noomesh-llamacpp:${{ github.sha }} >/dev/null 2>&1 || true
+
+  ollama-image:
+    # The hardened ollama image (docker/Dockerfile.ollama) is built by the
+    # release workflow alone, on a TAG. 0.6.16-rc.1's release failed in its
+    # runtime stage, and nothing had built it on a PR (i415). Same shape as
+    # llamacpp-image: the whole image, amd64, whenever ITS inputs changed;
+    # always runs and reports, only the build is conditional.
+    runs-on: ubuntu-latest
+    needs: [preflight, scope]
+    if: ${{ github.repository == 'noomesh/noomesh' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' && needs.scope.outputs.ollama == 'true' }}
+    concurrency:
+      group: ci-ollama-image-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    steps:
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+    - name: dhi.io login
+      env:
+        DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+        DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+      run: |
+        if [ -n "$DHI_TOKEN" ]; then
+          echo "$DHI_TOKEN" | docker login dhi.io -u "$DHI_USERNAME" --password-stdin \
+            || echo "dhi.io login failed — continuing anonymously" >&2
+        else
+          echo "no DHI creds in secrets — anonymous pull" >&2
+        fi
+
+    - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+    - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487  # v4.0.0
+
+    - name: Build the ollama image (every stage, linux/amd64)
+      run: |
+        set -o pipefail
+        docker buildx build --load -f docker/Dockerfile.ollama \
+          --cache-from type=gha,scope=ci-ollama \
+          --cache-to type=gha,mode=max,scope=ci-ollama \
+          -t noomesh-ollama:${{ github.sha }} . 2>&1 | tail -n 200
+        # The binary, with the runtime stage's libraries, must start.
+        docker run --rm --entrypoint /usr/bin/ollama noomesh-ollama:${{ github.sha }} --version
+        docker rmi noomesh-ollama:${{ github.sha }} >/dev/null 2>&1 || true
 
   openapi-drift:
     # The OpenAPI spec is what the console builds its typed client against, so a
