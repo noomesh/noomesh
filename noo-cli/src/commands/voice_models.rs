@@ -335,7 +335,7 @@ pub(crate) fn stage(root: &Path, m: &VoiceModel, progress: bool) -> Result<Stage
     let repo = repo_of(m)?;
     let dir = staged_dir(root, m);
     std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e} (the model store, MODELS_DIR else <data root>/models, must be writable by you)", dir.display()))?;
-    let base = models_fetch::hf_base();
+    let base = models_fetch::hf_base().map_err(|why| format!("{why} ({})", crate::catalog::HF_ENDPOINT_REMEDY))?;
     let token = models_fetch::hf_token();
     let wanted = select_files(m, &siblings(&base, token.as_deref(), &repo)?)?;
     let mut files = Vec::new();

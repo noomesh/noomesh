@@ -5114,3 +5114,55 @@ fn agents_archive_decrypt_refused_by_the_gateway_writes_nothing() {
     assert_ne!(out.status.code(), Some(0));
     assert!(!out_path.exists(), "a refused decrypt must not leave a file");
 }
+
+// ── HF_ENDPOINT: https, or http to this machine only (noomesh-internal i445) ──
+
+/// A non-loopback address of this machine, so a plain-http HF_ENDPOINT can
+/// point at a real listener that is NOT loopback. The UDP connect sends
+/// nothing; it only asks the kernel which source address it would use.
+fn non_loopback_ip() -> std::net::IpAddr {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").expect("udp bind");
+    s.connect("192.0.2.1:9").expect("a route off this box (TEST-NET-1)");
+    let ip = s.local_addr().expect("local addr").ip();
+    assert!(!ip.is_loopback() && !ip.is_unspecified(), "this test needs a non-loopback address, got {ip}");
+    ip
+}
+
+#[test]
+fn a_plain_http_hf_endpoint_off_this_machine_is_refused_and_nothing_is_sent() {
+    let ip = non_loopback_ip();
+    let listener = TcpListener::bind((ip, 0)).expect("bind the non-loopback address");
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{ip}:{port}");
+    let home_dir = temp_home("hf-refused");
+    let home = home_dir.to_string_lossy().into_owned();
+    let store = home_dir.join("models");
+    std::fs::create_dir_all(&store).unwrap();
+    let store = store.to_string_lossy().into_owned();
+
+    for args in [
+        vec!["--json", "models", "fetch", "org/name", "model.gguf"],
+        vec!["--json", "models", "search", "llama"],
+        vec!["--json", "models", "info", "org/name"],
+    ] {
+        let out = run(
+            &args,
+            &[
+                ("HOME", &home),
+                ("HF_ENDPOINT", &endpoint),
+                ("HF_TOKEN", "hf_planted_must_not_leave"),
+                ("MODELS_DIR", &store),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?} must be refused as a usage error: {stderr}");
+        assert!(stderr.contains("hf_endpoint_refused") && stderr.contains("HF_ENDPOINT="), "{args:?}: {stderr}");
+        assert!(!stderr.contains("hf_planted_must_not_leave"), "{args:?} printed the token: {stderr}");
+    }
+    // Nothing reached the listener: no connection, so no token on any wire.
+    match listener.accept() {
+        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("a request reached the refused endpoint: {other:?}"),
+    }
+}
