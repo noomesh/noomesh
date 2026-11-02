@@ -738,23 +738,14 @@ pub(crate) fn scan_findings(i: &ScanInputs) -> Vec<Finding> {
     // Gateway transport. Two CRITICALs, because the CLI sends a
     // bearer credential on nearly every request and both states hand it to
     // an unauthenticated peer:
-    //   * a plain-http gateway that is not this machine, and
+    //   * a plain-http gateway (this machine's included: there is no
+    //     plaintext lane, 1242 finding 7), and
     //   * an https gateway with no usable trust anchor.
     // The CLI already refuses both at request time; the scan is how an
     // operator finds out BEFORE a command fails, and how a fleet audit sees
     // it at all.
-    match &i.gateway_trust {
-        Err(why) => issues.push((
-            "CRITICAL",
-            "Gateway Transport",
-            format!("{} — {why}", i.gateway_url),
-        )),
-        Ok(crate::http::Trust::LoopbackPlaintext) if !i.gateway_url.is_empty() => issues.push((
-            "LOW",
-            "Gateway Transport",
-            format!("{} is plain http:// to this machine — fine for local development, never for a real gateway", i.gateway_url),
-        )),
-        Ok(_) => {}
+    if let Err(why) = &i.gateway_trust {
+        issues.push(("CRITICAL", "Gateway Transport", format!("{} — {why}", i.gateway_url)));
     }
 
     issues
@@ -5407,17 +5398,17 @@ mod tests {
         }
     }
 
-    /// The local-development carve-out is reported, but it is not a crisis:
-    /// an http gateway on this machine is what `noo` defaults to before TLS
-    /// is configured.
+    /// There is no local-development carve-out any more (1242 finding 7): an
+    /// http gateway on this machine is refused like any other, so the scan
+    /// reports it CRITICAL, from the same resolve_trust the requests use.
     #[test]
-    fn scan_reports_loopback_http_as_low() {
+    fn scan_reports_loopback_http_as_critical() {
         let mut i = clean_inputs();
         i.gateway_url = "http://localhost:8080".into();
-        i.gateway_trust = Ok(crate::http::Trust::LoopbackPlaintext);
+        i.gateway_trust = crate::http::resolve_trust(&i.gateway_url);
         let f = scan_findings(&i);
-        assert_eq!(f.len(), 1);
-        assert_eq!(f[0].0, "LOW");
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].0, "CRITICAL");
         assert_eq!(f[0].1, "Gateway Transport");
     }
 

@@ -1697,7 +1697,7 @@ gateway@{D}
         let calls = shared_daemon();
         PARALLELISM_OVERRIDE.with(|p| p.set(Some(3)));
         let mut gl = g();
-        gl.gateway_override = Some("http://127.0.0.1:9".into()); // prewarm is best-effort; refuse fast
+        gl.gateway_override = Some("https://127.0.0.1:9".into()); // prewarm is best-effort; refuse fast
         let arches = vec!["amd64".to_string(), "arm64".to_string()];
         let sum = stage_lock(&gl, &lock, "reg.example/acme", "v1", &arches, true);
         PARALLELISM_OVERRIDE.with(|p| p.set(None));

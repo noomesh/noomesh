@@ -6093,14 +6093,16 @@ mod keyless_tests {
     fn one_shot_gateway(status: u16, body: &'static str) -> String {
         use std::io::{Read, Write};
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", l.local_addr().unwrap());
+        let url = format!("https://{}", l.local_addr().unwrap());
         std::thread::spawn(move || {
             // The probe may retry after a 401 refresh attempt: serve a few.
             for _ in 0..3 {
-                let Ok((mut c, _)) = l.accept() else { return };
+                let Ok((tcp, _)) = l.accept() else { return };
+                let Some(mut c) = crate::test_tls::accept(tcp) else { continue };
                 let mut buf = [0u8; 2048];
                 let _ = c.read(&mut buf);
                 let _ = write!(c, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                crate::test_tls::close(&mut c);
             }
         });
         url
@@ -6115,6 +6117,7 @@ mod keyless_tests {
     /// still counts, and an answering gateway that cannot be read refuses.
     #[test]
     fn a_down_gateway_falls_back_to_the_store_check_but_an_unreadable_one_refuses() {
+        let _ca = crate::test_tls::trust();
         use super::{pre_roll_key_verdict, read_gateway_key_shortfall, unverified_keys_warning, PreRollKeys};
         let req = vec![("worker".to_string(), "svc:worker".to_string())];
         let none: Vec<String> = vec![];
@@ -6122,7 +6125,7 @@ mod keyless_tests {
 
         // Closed port: bind, learn the port, drop the listener.
         let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
-        let (db, down) = read_gateway_key_shortfall(&probe_globals(format!("http://127.0.0.1:{port}")), &req);
+        let (db, down) = read_gateway_key_shortfall(&probe_globals(format!("https://127.0.0.1:{port}")), &req);
         assert_eq!((db.as_ref(), down), (None, true), "connection refused means nothing answered");
         assert_eq!(pre_roll_key_verdict(&none, db.as_deref(), false, down), PreRollKeys::GoUnverified, "store check passed: go, with the warning");
         assert_eq!(pre_roll_key_verdict(&worker, db.as_deref(), false, down), PreRollKeys::Missing(worker.clone()),
@@ -6136,7 +6139,7 @@ mod keyless_tests {
         // that would fix it goes ahead on the store check.
         let crashing = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let url = format!("http://{}", l.local_addr().unwrap());
+            let url = format!("https://{}", l.local_addr().unwrap());
             std::thread::spawn(move || {
                 if let Ok((c, _)) = l.accept() {
                     // Leave the request unread: the close goes out as RST.

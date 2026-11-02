@@ -26,13 +26,6 @@ use ureq::Agent;
 /// [`resolve_trust`], reported by `noo auth status` and `noo security scan`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Trust {
-    /// `http://` to a loopback host. The ONE unencrypted lane, and it never
-    /// leaves the machine, and only for a URL passed EXPLICITLY (the CLI's
-    /// own default is `https://localhost:<port>` — the gateway has no
-    /// plaintext listener): every `--gateway http://127.0.0.1:<port>` in
-    /// `noo-cli/tests/gateway_integration.rs`, which drives a mock gateway
-    /// on a loopback port. A non-loopback `http://` is refused instead.
-    LoopbackPlaintext,
     /// The base URL IS the enrolled controller (`/etc/noo/controller-url`)
     /// and this box holds the anchor enrollment wrote — verify against THAT
     /// FILE. See [`Trust::Enrolled`] for why the file and not the machine.
@@ -65,7 +58,6 @@ impl Trust {
     /// A phrase completing "TLS verified against …", for display.
     pub fn describe(&self) -> String {
         match self {
-            Self::LoopbackPlaintext => "no TLS — plain http:// to a loopback address".into(),
             Self::EnrolledCa(p) => format!(
                 "the enrolled cluster CA at {} (named by {})",
                 p.display(),
@@ -84,7 +76,6 @@ impl Trust {
     /// Machine-readable tag for `--json`.
     pub fn label(&self) -> &'static str {
         match self {
-            Self::LoopbackPlaintext => "loopback_plaintext",
             Self::EnrolledCa(_) => "enrolled_ca",
             Self::Enrolled => "enrolled",
             Self::EnvCa(_) => "env_ca",
@@ -179,17 +170,46 @@ fn enrolled_anchor(
 /// blank. The source-scan test `config_readers_have_one_owner` in
 /// `src/config_readers.rs` fails on any other file that reads it.
 pub fn tls_ca_env() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        if let Some(p) = TEST_CA.with(|c| c.borrow().clone()) {
+            return Some(p);
+        }
+    }
     let v = std::env::var("NOO_TLS_CA").unwrap_or_default();
     let v = v.trim();
     if v.is_empty() { None } else { Some(PathBuf::from(v)) }
 }
 
+// A unit test's own CA for a mock gateway on this thread: `$NOO_TLS_CA`
+// without touching the process environment that parallel tests share.
+#[cfg(test)]
+thread_local! {
+    static TEST_CA: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Trust `ca` (a PEM file) for this test thread's requests, until the guard
+/// drops. The in-crate counterpart of the integration suites' `NOO_TLS_CA`.
+#[cfg(test)]
+pub(crate) fn trust_test_ca(ca: &std::path::Path) -> impl Drop {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_CA.with(|c| *c.borrow_mut() = None);
+        }
+    }
+    TEST_CA.with(|c| *c.borrow_mut() = Some(ca.to_path_buf()));
+    Reset
+}
+
 /// Resolve the trust anchor for `base_url`, or say why there is none.
 ///
 /// Order — the first rung that answers wins:
-///   1. `http://` → loopback only ([`Trust::LoopbackPlaintext`]); anything
-///      else is an error, because a cleartext gateway on the wire has no
-///      integrity at all and the CLI would post a bearer token into it.
+///   1. `http://` → an error, loopback included: the gateway serves https
+///      only, a cleartext gateway has no integrity at all, and the CLI would
+///      post a bearer token into it. (Until 0.6.17 a loopback `http://` was a
+///      carve-out for the integration tests' mock gateways; they serve TLS
+///      now, 1242 finding 7.)
 ///   2. the ENROLLED controller URL → the CA ENROLLMENT ITSELF WROTE, and
 ///      only the platform verifier when that file cannot be read. This
 ///      outranks `$NOO_TLS_CA` on purpose: a dev clone's `.env` on an HOST3
@@ -250,22 +270,17 @@ fn resolve_trust_with(base_url: &str, enrolled: Option<String>) -> Result<Trust,
         }
     }
 
-    if let Some(rest) = base.strip_prefix("http://") {
-        let host = url_host(base);
-        if is_loopback_host(host) {
-            return Ok(Trust::LoopbackPlaintext);
-        }
-        let _ = rest;
+    if base.starts_with("http://") {
         return Err(format!(
             "refusing to talk to {base} over plain http:// — TLS is required for every \
-             non-loopback gateway. This CLI sends a bearer credential on almost every \
-             request and cleartext gives it away to anyone on the path"
+             gateway, this machine's included (the gateway serves https only). This CLI \
+             sends a bearer credential on almost every request and cleartext gives it \
+             away to anyone on the path. Use https://"
         ));
     }
     if !base.starts_with("https://") {
         return Err(format!(
-            "gateway URL {base} has no scheme this CLI can use — it must be https:// \
-             (or http:// to a loopback address for local development)"
+            "gateway URL {base} has no scheme this CLI can use — it must be https://"
         ));
     }
 
@@ -325,10 +340,7 @@ fn tls_for(trust: &Trust) -> ureq::tls::TlsConfig {
 fn tls_for_with(trust: &Trust, client: Option<ureq::tls::ClientCert>) -> ureq::tls::TlsConfig {
     let b = TlsConfig::builder().client_cert(client);
     match trust {
-        // No TLS is negotiated on a plain-http request, so the config is
-        // irrelevant; keep the platform verifier so a redirect to https
-        // is still verified rather than silently accepted.
-        Trust::LoopbackPlaintext | Trust::Enrolled | Trust::Platform => {
+        Trust::Enrolled | Trust::Platform => {
             b.root_certs(RootCerts::PlatformVerifier).build()
         }
         Trust::EnvCa(p) | Trust::ClusterCa(p) | Trust::EnrolledCa(p) => {
@@ -1421,12 +1433,9 @@ pub(crate) fn agent_with_client_cert(
     default_timeout: u64,
     pair: &crate::operator_cert::OperatorPair,
 ) -> Result<Agent, String> {
+    // resolve_trust refuses every http:// URL, so the certificate (and the
+    // token bound to it) only ever goes over TLS.
     let trust = resolve_trust(base_url)?;
-    if trust == Trust::LoopbackPlaintext {
-        return Err(format!(
-            "{base_url} is plain http — an operator client certificate is presented only over TLS"
-        ));
-    }
     let cert = Certificate::from_pem(pair.cert_pem.as_bytes())
         .map_err(|e| format!("operator certificate unreadable: {e}"))?;
     let key = ureq::tls::PrivateKey::from_pem(pair.key_pem.as_bytes())
@@ -1756,21 +1765,20 @@ mod trust_tests {
         );
     }
 
+    /// 1242 finding 7: there is no plaintext lane, loopback included. The
+    /// integration suites' mock gateways serve TLS (tests/common/test_tls.rs).
     #[test]
-    fn loopback_http_is_the_only_plaintext_lane() {
+    fn loopback_http_is_refused_too() {
         let _g = env_lock();
         clean_env("loopback");
-        for ok in [
+        for bad in [
             "http://localhost:8080",
             "http://127.0.0.1:8080",
             "http://127.0.0.53:9090/",
             "http://[::1]:8080",
         ] {
-            assert_eq!(
-                resolve_trust(ok).unwrap(),
-                Trust::LoopbackPlaintext,
-                "{ok} should be the loopback carve-out"
-            );
+            let err = resolve_trust(bad).expect_err("{bad} must be refused");
+            assert!(err.contains("TLS is required") && err.contains("this machine's included"), "{bad}: {err}");
         }
     }
 

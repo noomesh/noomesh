@@ -8240,12 +8240,12 @@ mod zero_hmac_onboard_tests {
         let (seen2, stop2) = (seen.clone(), stop.clone());
         std::thread::spawn(move || {
             while !stop2.load(std::sync::atomic::Ordering::SeqCst) {
-                let Ok((mut s, _)) = listener.accept() else {
+                let Ok((tcp, _)) = listener.accept() else {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                     continue;
                 };
-                s.set_nonblocking(false).ok();
-                s.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+                tcp.set_nonblocking(false).ok();
+                let Some(mut s) = crate::test_tls::accept(tcp) else { continue };
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 4096];
                 loop {
@@ -8283,6 +8283,7 @@ mod zero_hmac_onboard_tests {
                     out.len()
                 );
                 let _ = s.write_all(resp.as_bytes());
+                crate::test_tls::close(&mut s);
             }
         });
         (port, seen, stop)
@@ -8306,6 +8307,9 @@ mod zero_hmac_onboard_tests {
     /// Run the gateway-facing tail of the wizard once; return what the fake
     /// gateway saw, the SQL the host path wrote, and the wizard's events.
     fn walk(non_interactive: bool, password_in_memory: bool, answers: &[&str], stored_login: bool) -> (Vec<Seen>, Vec<String>, Vec<String>) {
+        // The fake gateway serves TLS (there is no plain-http lane): trust its
+        // throwaway CA on this thread for the whole walk.
+        let _ca = crate::test_tls::trust();
         let _env = crate::commands::grafana_door::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "noo-zero-hmac-{}-{}-{}-{}",
@@ -8335,7 +8339,7 @@ mod zero_hmac_onboard_tests {
             std::env::remove_var(k);
         }
         let (port, seen, stop) = fake_gateway(full_listing());
-        let base = format!("http://127.0.0.1:{port}");
+        let base = format!("https://127.0.0.1:{port}");
         if stored_login {
             std::fs::create_dir_all(creds.parent().unwrap()).unwrap();
             std::fs::write(&creds, serde_json::json!({
