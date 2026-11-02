@@ -1,0 +1,16 @@
+# Compose services that run ONCE and exit 0 by design. One per line:
+#
+#   <service>  <what it does>
+#
+# `noo stack status` FAILs (exit 1) on an Exited container unless its service
+# is named here AND it exited 0; the roll summary (`noo stack start|restart`,
+# `noo upgrade`) counts a bare `Exited` from compose as done only for a service
+# named here. A service is matched by its compose service label, or by its
+# container name (`<prefix>-<service>`). Whole-line `#` comments only.
+#
+# A `restart: "no"` service added to any docker-compose*.yml needs a line here:
+# tests/test_oneshot_services.py fails otherwise. noomesh-internal i64a.
+deps-core          build-only base image; `command: ["true"]`, never part of `up`
+deps-base          build-only base image; `command: ["true"]`, never part of `up`
+sandbox-base       build-only base image; `command: ["true"]`, never part of `up`
+noo-evolve-routes  the evolve add-on copies its route manifest into a volume and exits (its own overlay)

@@ -76,6 +76,8 @@ mod http;
 pub(crate) mod onboard;
 mod operator_cert;
 mod output;
+// The declared one-shot compose services (i64a): `stack status` and the roll summary.
+mod oneshots;
 mod pki;
 mod role;
 mod shell_completion;
@@ -280,6 +282,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["cluster", "maintenance"], commands::cluster_maintenance),
     (&["cluster", "gpu", "hold"], commands::cluster_gpu_hold),
     (&["cluster", "gpu", "release"], commands::cluster_gpu_release),
+    (&["cluster", "gpu", "mode"], commands::cluster_gpu_mode),
     // Reservations: an add-on's declared workload takes a GPU out of the
     // pool (drain, owned hold, start) and gives it back (drain, stop,
     // release); the low-level `gpu hold|release` stay for emergencies.
@@ -706,6 +709,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["addons", "rotate-secret"], commands::addons_rotate_secret),
     (&["addons", "trust-key"], commands::addons_trust_key),
     (&["addons", "untrust-key"], commands::addons_untrust_key),
+    (&["addons", "registry-login"], commands::addons_registry_login),
     (&["addons", "set"], commands::addons_set),
     (&["kiosk", "enroll"], commands::kiosk_enroll),
     (&["kiosk", "invite"], commands::kiosk_invite),
@@ -713,7 +717,9 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["kiosk", "reload"], commands::kiosk_reload),
     (&["kiosk", "seat-sync"], commands::kiosk_seat_sync),
     (&["kiosk", "seat-token"], commands::kiosk_seat_token),
+    (&["kiosk", "seats"], commands::kiosk_seats),
     (&["kiosk", "serve"], commands::kiosk_serve),
+    (&["kiosk", "set"], commands::kiosk_set),
     (&["kiosk", "setup"], commands::kiosk_setup),
     (&["kiosk", "status"], commands::kiosk_status),
     (&["kiosk", "teardown"], commands::kiosk_teardown),
@@ -1377,7 +1383,7 @@ pub(crate) fn is_reserved_command_word(word: &str) -> bool {
 /// value, which falls through to `rest` next) for the handler.
 fn subcommand_owns_timeout(rest: &[String]) -> bool {
     let words: Vec<&str> = rest.iter().map(String::as_str).collect();
-    matches!(words.as_slice(), ["cluster", "reserve", ..] | ["cluster", "gpu", "hold", ..])
+    matches!(words.as_slice(), ["cluster", "reserve", ..] | ["cluster", "gpu", "hold", ..] | ["cluster", "gpu", "mode", ..])
 }
 
 /// Parse `argv` (the args AFTER the program name) into the global options and a

@@ -80,7 +80,7 @@ pub(crate) const STEPS: [&str; 12] = [
 ];
 
 /// Compose volumes of the state set that live under NOO_STATE_ROOT.
-const STATE_COPIES: [&str; 7] = ["postgres", "redis", "nats", "prometheus", "grafana", "loki", "noo-data"];
+const STATE_COPIES: [&str; 8] = ["postgres", "redis", "nats", "prometheus", "grafana", "loki", "tempo", "noo-data"];
 /// Plain docker volumes that join the state set at migration (suffix match),
 /// with the compose switch variable and the bind volume it selects.
 const DOCKER_COPIES: [(&str, &str, &str); 2] = [
@@ -1782,8 +1782,12 @@ exit 0
     #[test]
     fn preflight_sizes_the_volume_from_the_root_measurement() {
         let rig = Rig::new();
-        // 8 entries (7 state dirs + pki) at 20 GiB each, as root reports them,
+        // Every state dir plus the PKI at 20 GiB each, as root reports them,
         // although the files on disk are a few bytes (what `du` would say).
+        // Counted from the list, so a new state dir (tempo, i359) does not
+        // break the arithmetic.
+        let entries = STATE_COPIES.len() as u64 + 1;
+        let total = entries * 20 * GIB_;
         std::fs::write(rig.ctl.join("measure_each"), (20 * GIB_).to_string()).unwrap();
         let plan = compute_plan(&rig.ctx());
         // The dir backend checks free space on a real tmp disk; whether that
@@ -1791,11 +1795,10 @@ exit 0
         // figure used is the measured one.
         match plan {
             Ok(p) => {
-                assert_eq!(p["du_bytes"].as_u64().unwrap(), 8 * 20 * GIB_);
-                assert_eq!(p["size_gib"].as_u64().unwrap(), at_rest_volume::size_for(8 * 20 * GIB_));
-                assert_eq!(p["size_gib"].as_u64().unwrap(), 320);
+                assert_eq!(p["du_bytes"].as_u64().unwrap(), total);
+                assert_eq!(p["size_gib"].as_u64().unwrap(), at_rest_volume::size_for(total));
             }
-            Err(e) => assert!(e.contains("not enough free space") && e.contains("160 GiB"), "{e}"),
+            Err(e) => assert!(e.contains("not enough free space") && e.contains(&format!("{} GiB", entries * 20)), "{e}"),
         }
         let c = rig.calls();
         assert!(c.contains("hostd at-rest measure --entry"), "{c}");

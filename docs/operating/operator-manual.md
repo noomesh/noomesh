@@ -32,6 +32,7 @@ and the wizard is `noo onboard`. Adding machines is `noo enroll` (see `noo --hel
 | `alertmanager` | `noo-alertmanager` | `127.0.0.1:9093` | receives the bundled alert rules (no-op receiver until you configure one) |
 | `grafana` | `noo-grafana` | `127.0.0.1:3000` (HTTPS; `NOO_GRAFANA_BIND_ADDR` moves it) | dashboards; open from the console (**Open Grafana**) — noomesh accounts are its only login |
 | `loki` | `noo-loki` | — | the log store; every node's agent (the controller's own host agent included) ships container and journal lines through the gateway's ingest route — no container holds the Docker socket |
+| `tempo` | `noo-tempo` | — | the request-trace store (i359): the gateway sends a span per request over mTLS; Grafana reads it through the gateway, operators only. 30 days |
 | `node-exporter` | `noo-node-exporter` | `9100` | host metrics |
 | `nvidia-exporter` | `noo-nvidia-exporter` | `9400` | GPU metrics; scaled to 0 automatically when the host has no NVIDIA runtime |
 | `node-agent` | — | — | not in the `controller` profile (only the `node-agent-compose` profile): the controller's own agent runs on the host as a systemd service (`noo onboard --only services` installs it), never as a container |

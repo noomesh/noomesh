@@ -474,6 +474,12 @@ pub fn headers_for_principal(
     })?;
     let mut headers = async_nats::HeaderMap::new();
     headers.insert(HEADER, token.as_str());
+    // The request this message serves (i359): the worker continues its
+    // trace, parented on the gateway's span. Not signed and not trusted for
+    // anything but tracing.
+    if let Some(tp) = crate::request_trace::current_traceparent() {
+        headers.insert("traceparent", tp.as_str());
+    }
     Some(headers)
 }
 
@@ -528,6 +534,9 @@ pub async fn principal_layer(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let principal = from_extensions(request.extensions());
+    if let Some(p) = &principal {
+        crate::request_trace::note_principal(p);
+    }
     match principal {
         Some(p) => with_principal(p, next.run(request)).await,
         None => next.run(request).await,

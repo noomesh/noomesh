@@ -123,6 +123,42 @@ class HarnessCompare(BaseModel):
     swept: list[str] = Field(default_factory=list)
 
 
+class Hardware(BaseModel):
+    """What a node IS, read off its record at run time (None = not reported)."""
+    gpu: Optional[str] = None            # GPU model, "apple-unified", or None for CPU-only
+    vram_gb: Optional[float] = None
+    unified_memory: bool = False
+    ram_gb: Optional[float] = None
+    cpu_cores: Optional[int] = None
+    arch: Optional[str] = None
+    tier: Optional[int] = None
+    stack: Optional[str] = None          # the node agent's version
+
+
+class MatrixCellRun(BaseModel):
+    """One (node, model variant) of a harness matrix."""
+    node: str
+    backend: str = ""                    # the chat backend that served the cell
+    model: str = ""
+    variant: bool = False                # the run placed this model (vs as found)
+    hardware: Hardware = Field(default_factory=Hardware)
+    skipped: bool = False
+    skip_reason: str = ""
+    restored: bool = True                # a variant's backend placement was put back
+    restore_note: str = ""
+    compare: Optional[HarnessCompare] = None
+
+
+class HarnessMatrix(BaseModel):
+    """A harness-matrix run: harness compare on every (node, variant)."""
+    kinds: list[str] = Field(default_factory=list)
+    cells: list[MatrixCellRun] = Field(default_factory=list)
+    refused: str = ""                    # why the run did not start (preflight), if it did not
+    # Rows of earlier runs plus this one (the history file), for the trend
+    # chart; filled by the runner, empty when no history is kept.
+    history: list[dict] = Field(default_factory=list)
+
+
 class RunResult(BaseModel):
     """The full artifact of one evaluation run."""
     scenario: str
@@ -137,4 +173,5 @@ class RunResult(BaseModel):
     replication: list[ReplEvent] = Field(default_factory=list)
     security: SecurityPosture = Field(default_factory=SecurityPosture)
     harness_compare: Optional[HarnessCompare] = None
+    harness_matrix: Optional[HarnessMatrix] = None
     notes: list[str] = Field(default_factory=list)

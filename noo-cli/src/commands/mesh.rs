@@ -248,6 +248,7 @@ fn mesh_status_once(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let Ok(c) = serde_json::from_str::<serde_json::Value>(line) else { continue };
         containers.push(serde_json::json!({
             "name": c["Names"].as_str().unwrap_or(""),
+            "service": compose_service(c["Labels"].as_str().unwrap_or("")),
             "image": c["Image"].as_str().unwrap_or(""),
             "state": c["State"].as_str().unwrap_or(""),
             "status": c["Status"].as_str().unwrap_or(""),
@@ -255,11 +256,15 @@ fn mesh_status_once(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }));
     }
     let count = containers.len();
-    // A container docker keeps restarting is broken, not "up": the exit
-    // code says so (i58), whatever the table prints.
-    let exit = stack_exit_code(&containers);
+    // A container docker keeps restarting is broken, not "up" (i58); so is
+    // one that EXITED, unless it is a declared one-shot that exited 0 (i64a):
+    // the exit code says so, whatever the table prints.
+    let failed = failed_containers(&containers, crate::oneshots::declared());
+    let exit = i32::from(!failed.is_empty());
     if g.json {
-        print_json(&serde_json::json!({"containers": containers, "count": count, "tailnet_serve": serve_word(&serve)}));
+        print_json(&serde_json::json!({
+            "containers": containers, "count": count, "failed": failed, "tailnet_serve": serve_word(&serve),
+        }));
         return Ok(exit);
     }
 
@@ -282,6 +287,11 @@ fn mesh_status_once(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             let state = c["state"].as_str().unwrap_or("");
             let glyph = match state {
                 "running" => {
+                    running += 1;
+                    Glyph::Ok
+                }
+                // A declared one-shot that finished cleanly is done, not down.
+                "exited" if finished_oneshot(c, crate::oneshots::declared()) => {
                     running += 1;
                     Glyph::Ok
                 }
@@ -318,6 +328,10 @@ fn mesh_status_once(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         if !looping.is_empty() {
             println!("{}", ui::status_line(Glyph::Err, &format!("crash-looping (Restarting): {}", looping.join(", "))));
         }
+        let exited: Vec<&str> = failed.iter().map(String::as_str).filter(|n| !looping.contains(n)).collect();
+        if !exited.is_empty() {
+            println!("{}", ui::status_line(Glyph::Err, &format!("exited and not a finished one-shot: {}", exited.join(", "))));
+        }
         println!("{}", ui::hint("noo stack logs <service>"));
     }
     // A controller with no serve mapping is reachable by IP and by nothing
@@ -344,10 +358,38 @@ fn mesh_status_once(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(exit)
 }
 
-/// Exit code for `noo stack status`: 1 when any container is `restarting`
-/// (crash-looping), else 0. `restarting` is never counted as running.
-fn stack_exit_code(containers: &[serde_json::Value]) -> i32 {
-    i32::from(containers.iter().any(|c| c["state"].as_str() == Some("restarting")))
+/// The compose service from docker's `Labels` (`k=v,k=v`), or "".
+fn compose_service(labels: &str) -> String {
+    labels
+        .split(',')
+        .find_map(|kv| kv.strip_prefix("com.docker.compose.service="))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A declared one-shot (by its compose service, else its container name)
+/// that exited 0.
+fn finished_oneshot(c: &serde_json::Value, oneshots: &[String]) -> bool {
+    let service = c["service"].as_str().unwrap_or("");
+    let name = c["name"].as_str().unwrap_or("");
+    let declared = (!service.is_empty() && crate::oneshots::is_oneshot_in(service, oneshots))
+        || crate::oneshots::is_oneshot_in(name, oneshots);
+    declared && crate::oneshots::exit_code(c["status"].as_str().unwrap_or("")) == Some(0)
+}
+
+/// The containers that make `noo stack status` exit 1: `restarting`
+/// (crash-looping, i58), `dead`, and `exited` unless a declared one-shot
+/// that exited 0 (i64a). Named, in docker's order.
+fn failed_containers(containers: &[serde_json::Value], oneshots: &[String]) -> Vec<String> {
+    containers
+        .iter()
+        .filter(|c| match c["state"].as_str().unwrap_or("") {
+            "restarting" | "dead" => true,
+            "exited" => !finished_oneshot(c, oneshots),
+            _ => false,
+        })
+        .map(|c| c["name"].as_str().unwrap_or("").to_string())
+        .collect()
 }
 
 /// `tailscale serve status` on a CONTROLLER (a worker fronts nothing);
@@ -1281,11 +1323,43 @@ pub fn mesh_sandbox(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 #[cfg(test)]
 mod stop_clean_tests {
     #[test]
-    fn stack_exit_is_nonzero_only_when_a_container_is_restarting() {
+    fn stack_exit_is_nonzero_when_a_container_is_restarting() {
         let c = |state: &str| serde_json::json!({"name": "noo-x", "state": state});
-        assert_eq!(stack_exit_code(&[c("running"), c("running")]), 0);
-        assert_eq!(stack_exit_code(&[c("running"), c("restarting")]), 1);
-        assert_eq!(stack_exit_code(&[]), 0);
+        let none: Vec<String> = Vec::new();
+        assert!(failed_containers(&[c("running"), c("running")], &none).is_empty());
+        assert_eq!(failed_containers(&[c("running"), c("restarting")], &none).len(), 1);
+        assert!(failed_containers(&[], &none).is_empty());
+    }
+
+    /// i64a: an Exited container fails `noo stack status` unless it is a
+    /// declared one-shot that exited 0; the failure names the container.
+    #[test]
+    fn an_exited_container_fails_unless_it_is_a_finished_declared_one_shot() {
+        let ex = |name: &str, service: &str, status: &str| {
+            serde_json::json!({"name": name, "service": service, "state": "exited", "status": status})
+        };
+        let list = crate::oneshots::parse(include_str!("../../../config/oneshot-services.txt"));
+        // A long-running service that exited, cleanly or not: a failure.
+        assert_eq!(failed_containers(&[ex("noo-worker", "worker", "Exited (1) 2 minutes ago")], &list), ["noo-worker"]);
+        assert_eq!(failed_containers(&[ex("noo-redis", "redis", "Exited (0) 2 minutes ago")], &list), ["noo-redis"]);
+        // The evolve route one-shot that finished: done (by label or by name).
+        assert!(failed_containers(&[ex("noo-evolve-routes", "noo-evolve-routes", "Exited (0) 3 hours ago")], &list).is_empty());
+        assert!(failed_containers(&[ex("noo-evolve-routes", "", "Exited (0) 3 hours ago")], &list).is_empty());
+        // A declared one-shot that FAILED is still a failure.
+        assert_eq!(
+            failed_containers(&[ex("noo-evolve-routes", "noo-evolve-routes", "Exited (2) 3 hours ago")], &list),
+            ["noo-evolve-routes"]
+        );
+        // dead is never fine.
+        let dead = serde_json::json!({"name": "noo-nats", "state": "dead", "status": "Dead"});
+        assert_eq!(failed_containers(&[dead], &list), ["noo-nats"]);
+    }
+
+    #[test]
+    fn the_compose_service_is_read_from_the_labels() {
+        assert_eq!(compose_service("com.docker.compose.project=noomesh,com.docker.compose.service=gateway,x=y"), "gateway");
+        assert_eq!(compose_service("a=b"), "");
+        assert_eq!(compose_service(""), "");
     }
 
     use super::*;

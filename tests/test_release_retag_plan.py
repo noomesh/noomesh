@@ -42,6 +42,7 @@ MATRIX = WF["jobs"]["images"]["strategy"]["matrix"]["include"]
 
 LOCK = """gateway@sha256:g
 llamacpp@sha256:l
+ollama@sha256:o
 node-agent@sha256:n
 nvidia-exporter@sha256:x
 piper@sha256:p

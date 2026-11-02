@@ -44,48 +44,138 @@ fi
 [ -n "${_NOO_LIB_ADDONS_LOADED:-}" ] || . "$_lib_compose_dir/lib-addons.sh"
 [ -n "${_NOO_LIB_DIST_LOADED:-}" ]   || . "$_lib_compose_dir/lib-dist.sh"
 
+# nvidia-smi with a deadline that HOLDS. On a WSL2 node whose GPU a Windows
+# program is using, one nvidia-smi call blocked 11 minutes, stuck
+# uninterruptibly in the dxg driver; `timeout 5 nvidia-smi` itself returned
+# only after 665 s, because GNU timeout waits for its child after signalling
+# it. So the deadline lives here, and nothing waits on the probe:
+#   _noo_nvidia_smi_bounded <secs> [--] args...    (the deadline is required, no
+#   default: every production caller passes 5)
+# The probe runs in the BACKGROUND in a subshell cut off from our stdin,
+# stdout and stderr (a caller inside $(...) must not be held open by a stuck
+# child), writing its output to a file and its exit status to another. We poll
+# for the status file. Finished: print the output, return nvidia-smi's own
+# status. Past the deadline: send TERM then KILL (it may not die; fine), do
+# NOT wait, do not read a pipe the child holds, remove the temp dir (the child
+# may keep the unlinked files) and return 124 = "stuck". POSIX sh.
+_noo_nvidia_smi_bounded() {
+    case "${1:-}" in
+        ''|*[!0-9]*) echo "_noo_nvidia_smi_bounded: the first argument is the deadline in seconds" >&2; return 2 ;;
+    esac
+    _nsb_secs="$1"; shift
+    [ "${1:-}" = "--" ] && shift
+    _nsb_dir="$(mktemp -d "${TMPDIR:-/tmp}/noo-smi.XXXXXX" 2>/dev/null)" || return 125
+    (
+        nvidia-smi "$@" >"$_nsb_dir/out" 2>&1 </dev/null &
+        _nsb_child=$!
+        echo "$_nsb_child" >"$_nsb_dir/pid"
+        wait "$_nsb_child"
+        echo "$?" >"$_nsb_dir/rc.tmp" && mv "$_nsb_dir/rc.tmp" "$_nsb_dir/rc"
+    ) >/dev/null 2>&1 </dev/null &
+    _nsb_sub=$!
+    # Not "disown": dash has none, and a bash job-table entry is harmless.
+    _nsb_ticks=$((_nsb_secs * 10))
+    while [ ! -f "$_nsb_dir/rc" ] && [ "$_nsb_ticks" -gt 0 ]; do
+        sleep 0.1 2>/dev/null || sleep 1
+        _nsb_ticks=$((_nsb_ticks - 1))
+    done
+    if [ -f "$_nsb_dir/rc" ]; then
+        _nsb_rc="$(cat "$_nsb_dir/rc")"
+        cat "$_nsb_dir/out" 2>/dev/null
+        rm -rf "$_nsb_dir"
+        wait "$_nsb_sub" 2>/dev/null
+        return "$_nsb_rc"
+    fi
+    _nsb_child="$(cat "$_nsb_dir/pid" 2>/dev/null)"
+    for _nsb_sig in TERM KILL; do
+        [ -n "$_nsb_child" ] && kill "-$_nsb_sig" "$_nsb_child" 2>/dev/null
+        kill "-$_nsb_sig" "$_nsb_sub" 2>/dev/null
+    done
+    rm -rf "$_nsb_dir"
+    return 124
+}
+
 # What the NVIDIA GPU is doing: "ok" (answers a per-device query), "lost"
 # (the driver is installed and cannot read the card: i277e, Xid 79/154, "GPU
-# has fallen off the bus"), or "none" (no NVIDIA driver). `nvidia-smi -L` alone
+# has fallen off the bus"), "busy" (the driver is there and the GPU did not
+# answer within the deadline: on WSL2, a Windows program using it), or "none"
+# (no NVIDIA driver). `nvidia-smi -L` alone
 # is not enough: it can list the card while the device-handle call the
 # container runtime makes fails. The query asks only for the index, which every
 # GPU answers: memory.total is "[N/A]" on a unified-memory GPU (GB10, Jetson),
 # and that GPU is not lost. A card with no driver installed is "none": a box
 # set up without the NVIDIA stack, not a fault. NOO_COMPOSE_GPU=1|0 overrides
 # (tests, headless boxes); 0 reads "none", the operator's choice of CPU.
+#
+# The answer is cached in _NOO_GPU_STATE for the life of the process, so a
+# launcher run costs at most one deadline when the GPU is busy. A cache set
+# inside $(...) dies with that subshell: call _compose_gpu_probe in the
+# CURRENT shell first (the launchers do, before compose_file_args). The
+# NOO_COMPOSE_GPU override is read first and never cached.
+_NOO_GPU_STATE=""
+
 _compose_gpu_state() {
     case "${NOO_COMPOSE_GPU:-}" in
         1) echo ok; return 0 ;;
         0) echo none; return 0 ;;
     esac
+    _compose_gpu_probe
+    echo "$_NOO_GPU_STATE"
+}
+
+# Fill _NOO_GPU_STATE (once) in the calling shell. No output.
+_compose_gpu_probe() {
+    case "${NOO_COMPOSE_GPU:-}" in 1|0) return 0 ;; esac
+    [ -n "$_NOO_GPU_STATE" ] && return 0
     if command -v nvidia-smi >/dev/null 2>&1; then
-        if nvidia-smi -L >/dev/null 2>&1 \
-            && _noo_gpu_q="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>&1)" \
+        _noo_gpu_secs=5
+        _noo_nvidia_smi_bounded "$_noo_gpu_secs" -L >/dev/null 2>&1
+        _noo_gpu_rc=$?
+        if [ "$_noo_gpu_rc" -eq 0 ]; then
+            _noo_gpu_q="$(_noo_nvidia_smi_bounded "$_noo_gpu_secs" --query-gpu=index --format=csv,noheader 2>&1)"
+            _noo_gpu_rc=$?
+        fi
+        if [ "$_noo_gpu_rc" -eq 124 ]; then
+            _NOO_GPU_STATE=busy
+        elif [ "$_noo_gpu_rc" -eq 0 ] \
             && ! printf '%s\n' "$_noo_gpu_q" | grep -qiE 'unknown error|unable to determine'; then
-            echo ok
+            _NOO_GPU_STATE=ok
         else
-            echo lost
+            _NOO_GPU_STATE=lost
         fi
         return 0
     fi
-    echo none
+    _NOO_GPU_STATE=none
 }
 
-# A GPU the base can hand to ollama-embed? Probe, unless told.
+# A GPU the base can hand to ollama-embed? Probe, unless told. A busy GPU
+# (the probe did not answer in time) keeps the overlay: dropping GPU backends
+# on a restart because a game was loading would be worse than asking for them.
 _compose_gpu_visible() {
-    [ "$(_compose_gpu_state)" = ok ]
+    _compose_gpu_probe
+    case "$(_compose_gpu_state)" in
+        ok|busy) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
-# One line when the driver lost the GPU, naming the cause and the choice.
-# The overlay is then NOT requested (_compose_gpu_visible is false), so the
+# One line when the driver lost the GPU, naming the cause and the choice; one
+# line when the GPU is busy. For lost, the overlay is then NOT requested
+# (_compose_gpu_visible is false), so the
 # embedder starts on CPU and the core never waits on a device that cannot
 # answer. Silent otherwise. Launchers call it once, after the file list.
 # NOO_GPU_LOST=1 tells lib-stuck-container.sh the cause is already said, so a
 # GPU backend held on the same start names itself without repeating it.
 compose_gpu_notice() {
-    [ "$(_compose_gpu_state)" = lost ] || return 0
-    NOO_GPU_LOST=1; export NOO_GPU_LOST
-    echo "  the NVIDIA driver lost the GPU (nvidia-smi cannot read it): the embedder starts on CPU; reboot to get the GPU back" >&2
+    _compose_gpu_probe
+    case "$(_compose_gpu_state)" in
+        lost)
+            NOO_GPU_LOST=1; export NOO_GPU_LOST
+            echo "  the NVIDIA driver lost the GPU (nvidia-smi cannot read it): the embedder starts on CPU; reboot to get the GPU back" >&2 ;;
+        busy)
+            echo "  the GPU did not answer nvidia-smi within 5 s (busy: on WSL2 a Windows program is likely using it); the GPU overlay is kept" >&2 ;;
+    esac
+    return 0
 }
 
 compose_file_list() {

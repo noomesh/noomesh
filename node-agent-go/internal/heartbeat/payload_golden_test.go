@@ -11,6 +11,7 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/noomesh/noomesh/node-agent-go/internal/config"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
 )
 
@@ -28,7 +29,9 @@ func capturePayloads(t *testing.T) (beat, reg map[string]any) {
 	t.Setenv("NOO_PKI_DIR", t.TempDir())
 	t.Setenv("NOO_BIND_ADDR", "")
 	t.Setenv("NODE_LOCATION", "")
-	r := newTestReporter(t, server.URL, nil)
+	// NodeIP pins the address: with a loopback controller (the test server)
+	// the detected one is the host's own, which differs per machine.
+	r := newTestReporter(t, server.URL, &config.Config{NodeID: "test-node", Tier: 3, NodeIP: "192.168.1.10"})
 	r.Register(hardware.Capabilities{CPUCores: 1}, "192.168.1.10")
 	reg = got
 	r.SendHeartbeat()
@@ -55,7 +58,7 @@ func sortedKeys(m map[string]any) []string {
 // shared list; this fails if a key appears, vanishes or is renamed.
 func TestPayloadGolden_KeySets(t *testing.T) {
 	beat, reg := capturePayloads(t)
-	wantBeat := []string{"active_jobs", "active_sensors", "app_version", "available_models", "backend_leaves", "battery_pct", "bind_addr", "capabilities", "control_transports", "controller_leaf_only", "cpu_cores", "cpu_load", "data_roots", "gpu_model", "image_source_mode", "is_charging", "legacy_lanes", "load", "location", "mem_used_gb", "model_presence", "network_type", "peer_identity_enforced", "power_source", "ram_gb", "reconcile_refusals", "running_backends", "self_node", "thermal_state", "tier", "vram_gb", "vram_used_gb"}
+	wantBeat := []string{"active_jobs", "active_sensors", "agent_url", "app_version", "available_models", "backend_leaves", "battery_pct", "bind_addr", "capabilities", "control_transports", "controller_leaf_only", "cpu_cores", "cpu_load", "data_roots", "gpu_model", "image_source_mode", "ip_address", "is_charging", "legacy_lanes", "load", "location", "mem_used_gb", "model_presence", "network_type", "peer_identity_enforced", "power_source", "ram_gb", "reconcile_refusals", "running_backends", "self_node", "thermal_state", "tier", "vram_gb", "vram_used_gb"}
 	wantReg := []string{"agent_url", "app_version", "backend_leaves", "capabilities", "control_transports", "controller_leaf_only", "data_roots", "hostname", "image_source_mode", "ip_address", "legacy_lanes", "model_presence", "node_id", "peer_identity_enforced"}
 	if got := sortedKeys(beat); !reflect.DeepEqual(got, wantBeat) {
 		t.Errorf("heartbeat keys changed:\n got %v\nwant %v", got, wantBeat)

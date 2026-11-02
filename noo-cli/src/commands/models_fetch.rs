@@ -36,6 +36,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::args::{ArgError, Args};
 use crate::output::{fail, ExitCode};
 use crate::ui;
 use crate::{Globals, Unhandled};
@@ -64,37 +65,30 @@ impl FetchArgs {
 
 /// Parse `<hf_repo> <file.gguf> [--revision <rev>] [--force]`.
 pub(crate) fn parse_args(args: &[String]) -> Result<FetchArgs, String> {
-    let mut pos: Vec<String> = Vec::new();
-    let mut revision = "main".to_string();
-    let mut force = false;
-    let mut it = args.iter();
-    while let Some(t) = it.next() {
-        match t.as_str() {
-            "--revision" | "-r" => {
-                revision = it.next().ok_or("--revision needs a value")?.clone();
-            }
-            "--force" => force = true,
-            s if s.starts_with('-') => return Err(format!("unknown flag {s}")),
-            s => pos.push(s.to_string()),
-        }
-    }
+    parse_fetch_with(&mut Args::new(args)).map_err(|e| e.0)
+}
+
+pub(crate) fn parse_fetch_with(a: &mut Args) -> Result<FetchArgs, ArgError> {
+    let revision = a.value(&["--revision", "-r"])?.unwrap_or_else(|| "main".to_string());
+    let force = a.flag(&["--force"]);
+    let pos = a.positionals()?;
     if pos.len() != 2 {
-        return Err("expected exactly two arguments: <hf_repo> <file.gguf>".into());
+        return Err(ArgError::new("expected exactly two arguments: <hf_repo> <file.gguf>"));
     }
     let repo = pos[0].trim_matches('/').to_string();
     let file = pos[1].trim_start_matches('/').to_string();
     let parts: Vec<&str> = repo.split('/').collect();
     if parts.len() != 2 || parts.iter().any(|p| p.is_empty() || *p == "." || *p == "..") {
-        return Err(format!("'{repo}' is not a Hugging Face repo id (want <org>/<name>)"));
+        return Err(ArgError::new(format!("'{repo}' is not a Hugging Face repo id (want <org>/<name>)")));
     }
     if file.split('/').any(|s| s.is_empty() || s == "." || s == "..") {
-        return Err(format!("'{file}' is not a file path inside the repo"));
+        return Err(ArgError::new(format!("'{file}' is not a file path inside the repo")));
     }
     if !file.to_ascii_lowercase().ends_with(".gguf") {
-        return Err(format!("'{file}' is not a .gguf file — the controller store holds GGUF weights only"));
+        return Err(ArgError::new(format!("'{file}' is not a .gguf file — the controller store holds GGUF weights only")));
     }
     if revision.is_empty() || revision.contains("..") {
-        return Err(format!("'{revision}' is not a usable revision"));
+        return Err(ArgError::new(format!("'{revision}' is not a usable revision")));
     }
     Ok(FetchArgs { repo, file, revision, force })
 }

@@ -54,6 +54,8 @@ registry cached, e.g. `scripts/cargo-docker.sh check --tests` (set
 
 Project layout, extension points and conventions:
 [docs/development/developer-guide.md](docs/development/developer-guide.md).
+The principles a review holds every change to, cited as P1–P8:
+[docs/development/principles.md](docs/development/principles.md).
 
 ## Branch and PR flow
 

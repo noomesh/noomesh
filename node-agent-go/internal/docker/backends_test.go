@@ -13,7 +13,6 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -746,9 +745,6 @@ func TestOtherBackendsKeepImageHealthcheck(t *testing.T) {
 // "pull access denied". ARM was unaffected — it
 // already resolves to the upstream multi-arch image.
 func TestLlamacppImagePrefersThePublishedRelease(t *testing.T) {
-	if runtime.GOARCH == "arm64" || runtime.GOARCH == "arm" {
-		t.Skip("arm resolves to the upstream image; this covers the x86 default")
-	}
 	t.Setenv("NOO_IMAGE_PREFIX", "ghcr.io/noomesh")
 	t.Setenv("NOO_IMAGE_TAG", "v0.2.21")
 	if got := llamacppDefaultImage(); got != "ghcr.io/noomesh/llamacpp:v0.2.21" {
@@ -764,9 +760,6 @@ func TestLlamacppImagePrefersThePublishedRelease(t *testing.T) {
 // local build still wins via the separate ImageInspect preference check
 // elsewhere in this package; this function only picks the DEFAULT.
 func TestLlamacppImageFallsBackToUpstreamWithNoPinAndNoLocalBuild(t *testing.T) {
-	if runtime.GOARCH == "arm64" || runtime.GOARCH == "arm" {
-		t.Skip("arm resolves to the upstream image; this covers the x86 default")
-	}
 	t.Setenv("NOO_IMAGE_PREFIX", "")
 	t.Setenv("NOO_IMAGE_TAG", "")
 	if got := llamacppDefaultImage(); got != "ghcr.io/ggml-org/llama.cpp:server" {

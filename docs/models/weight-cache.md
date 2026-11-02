@@ -391,7 +391,7 @@ its image through one function (`EnsureImage`):
    release namespaces, `noomesh/*`, `pai-assistant/*`, `noo-*`) a refusal:
    `image X not staged on the controller — run noo cluster sync-images
    <node> -i X or noo upgrade`. A **public third-party** image (upstream
-   llama.cpp for ARM, ollama, the alpine sidecar fallback) may come from its
+   vLLM, TEI, the alpine sidecar fallback; never our llamacpp or ollama, which are refused with no upstream stand-in) may come from its
    registry only while `NOO_IMAGE_REGISTRY_FALLBACK=public` (the default),
    logged at WARN as `image.registry_fallback`; `off` makes the node
    rail-only. Prefer staging those too (`noo cluster sync-images <node> -i

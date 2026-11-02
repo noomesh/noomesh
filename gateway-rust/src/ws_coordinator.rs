@@ -246,11 +246,35 @@ async fn handle_chat(
                 // A logout or an admin ending the account's sessions drops the
                 // turn here, tools and all; the guard sends the 4401 close and
                 // the loop ends on the peer's close reply. Expiry never
-                // revokes: it lets the turn finish (`TurnGate`).
-                let outcome = tokio::select! {
-                    r = run => r,
-                    _ = gate.revoked() => {
+                // revokes: it lets the turn finish (`TurnGate`). While the
+                // turn runs, a keepalive every TURN_KEEPALIVE tells the console
+                // it is alive: its frames can be minutes apart, and the console
+                // gives up on a silent turn (0.6.15: Send stayed disabled).
+                let ka_writer = writer.clone();
+                let outcome = match crate::websocket::run_turn_with_keepalive(
+                    run,
+                    gate.revoked(),
+                    crate::websocket::TURN_KEEPALIVE,
+                    || {
+                        let w = ka_writer.clone();
+                        async move {
+                            let _ = w.send_keepalive().await;
+                        }
+                    },
+                )
+                .await
+                {
+                    Some(r) => r,
+                    None => {
                         tracing::info!(user_id = %user_id, conv_id = %conv_id, "ws_coordinator turn dropped: session revoked");
+                        // The turn in flight owns the console's last reply: end
+                        // it there, so the composer unlocks even when the 4401
+                        // close is slow to arrive. (Between turns, a session end
+                        // sends no error frame; see the guard above.)
+                        let _ = writer
+                            .send_event("error", json!("Your session ended (signed out), so this reply stopped. Sign in and send it again."))
+                            .await;
+                        let _ = writer.send_event("done", json!({"iterations": 0, "error": "session revoked"})).await;
                         continue;
                     }
                 };

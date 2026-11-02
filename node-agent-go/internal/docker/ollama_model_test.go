@@ -101,13 +101,13 @@ func TestDirTarPutsBothFilesInOneDirectory(t *testing.T) {
 	}
 	// convertDir without its leading slash, which is what CopyToContainer
 	// wants for a destination of "/".
-	for _, want := range []string{"convert/", "convert/m.Modelfile", "convert/w.gguf"} {
+	for _, want := range []string{"home/nonroot/.ollama/convert/", "home/nonroot/.ollama/convert/m.Modelfile", "home/nonroot/.ollama/convert/w.gguf"} {
 		if _, ok := seen[want]; !ok {
 			t.Errorf("tar lacks %q; has %v", want, seen)
 		}
 	}
-	if seen["convert/w.gguf"] != int64(len("weights")) {
-		t.Errorf("weight round-tripped as %d bytes", seen["convert/w.gguf"])
+	if seen["home/nonroot/.ollama/convert/w.gguf"] != int64(len("weights")) {
+		t.Errorf("weight round-tripped as %d bytes", seen["home/nonroot/.ollama/convert/w.gguf"])
 	}
 }
 
@@ -164,5 +164,54 @@ func TestPullOllamaModelStripsOllamaPrefix(t *testing.T) {
 	_, err = c.PullOllamaModel(context.Background(), "ollama:hf.co/org/repo")
 	if err == nil || !strings.Contains(err.Error(), "neither a store artifact name nor a registry.ollama.ai reference") {
 		t.Fatalf("err = %v, want a bad-reference refusal", err)
+	}
+}
+
+// rc.2 (0.6.16): the hardened image is uid 65532 with a root-owned `/`, so the
+// staging dir must be under the user's store, and the archive entries must be
+// owned by that user (the daemon otherwise extracts them as root).
+func TestConvertDirIsNotRootLevelAndEntriesAreOwnedByTheImageUser(t *testing.T) {
+	if !strings.HasPrefix(convertDir, ollamaOursStore+"/") {
+		t.Fatalf("convertDir %q is not under the non-root store %q", convertDir, ollamaOursStore)
+	}
+	if strings.Count(strings.TrimPrefix(convertDir, "/"), "/") < 2 {
+		t.Fatalf("convertDir %q is a root-level path", convertDir)
+	}
+	dir := t.TempDir()
+	for _, n := range []string{"m.Modelfile", "w.gguf"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	buf, err := dirTar(dir, []string{"m.Modelfile", "w.gguf"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(buf)
+	n := 0
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		n++
+		if !strings.HasPrefix(h.Name, strings.TrimPrefix(convertDir, "/")) {
+			t.Errorf("entry %q is outside convertDir", h.Name)
+		}
+		if h.Uid != 65532 || h.Gid != 65532 {
+			t.Errorf("entry %q owned %d:%d, want 65532:65532", h.Name, h.Uid, h.Gid)
+		}
+		if h.Mode&0o044 != 0o044 {
+			t.Errorf("entry %q mode %o is not world-readable", h.Name, h.Mode)
+		}
+	}
+	if n != 3 {
+		t.Errorf("want dir + 2 files, got %d entries", n)
+	}
+	if got := convertCleanupCmd(); got[len(got)-1] != convertDir {
+		t.Errorf("cleanup targets %v, want %s", got, convertDir)
 	}
 }

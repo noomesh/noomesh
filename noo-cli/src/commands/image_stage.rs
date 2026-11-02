@@ -70,7 +70,7 @@ pub(crate) const CONTROLLER_ONLY: &[&str] = &[
 /// for every architecture would slow every roll. A node that needs one is
 /// staged by name (`noo cluster sync-images <node> -i <image>`).
 pub(crate) const THIRD_PARTY_LOCK_ROWS: &[&str] = &[
-    "ollama", "nats", "nginx", "redis", "loki", "prometheus", "alertmanager", "grafana", "node-exporter", "tei", "tei-cpu", "vllm",
+    "nats", "nginx", "redis", "loki", "tempo", "prometheus", "alertmanager", "grafana", "node-exporter", "tei", "tei-cpu", "vllm",
 ];
 
 /// Backend doors pinned to their own image instead of the release
@@ -111,6 +111,28 @@ pub(crate) fn door_pin_refs(prefix: &str) -> Vec<(String, String, String)> {
 /// Error prefix for "this image is not published for that architecture" —
 /// a skip, not a failure (llama.cpp on ARM uses the upstream image).
 pub(crate) const NO_VARIANT: &str = "no variant for";
+
+/// Release images the node agent defaults a backend to, and the architectures
+/// the release publishes them for: the `platforms` of the images-release.yml
+/// matrix rows (the lock records only index digests). The gateway keeps a twin
+/// (`OWN_IMAGE_ARCHES`); tests/test_hardened_images_i323.py holds both equal
+/// to the matrix. For these images a missing arch is a FAILURE, never a skip:
+/// the node does not fall back to an upstream image.
+pub(crate) const OWN_IMAGE_ARCHES: &[(&str, &[&str])] = &[("llamacpp", &["amd64", "arm64"]), ("ollama", &["amd64", "arm64"])];
+
+/// Is `image` (a lock row name or a full ref) one the release publishes for `arch`?
+pub(crate) fn own_image_published(image: &str, arch: &str) -> bool {
+    let repo = image.split('@').next().unwrap_or(image);
+    let repo = repo.rsplit_once(':').filter(|(_, t)| !t.contains('/')).map_or(repo, |(r, _)| r);
+    let name = repo.rsplit('/').next().unwrap_or(repo);
+    OWN_IMAGE_ARCHES.iter().any(|(n, arches)| *n == name && arches.contains(&arch))
+}
+
+/// A "no variant" stage error is a SKIP only for an image the release does not
+/// publish for `arch`; for llamacpp / ollama on a published arch it is a failure.
+pub(crate) fn no_variant_is_skip(image: &str, arch: &str, err: &str) -> bool {
+    err.starts_with(NO_VARIANT) && !own_image_published(image, arch)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LockRow {
@@ -821,7 +843,7 @@ fn stage_lock_image(g: &Globals, image: &str, digest: &str, tag: &str, source: &
                     Err(e) => Staged::Failed(format!("{label}: {e}")),
                 }
             }
-            Err(e) if e.starts_with(NO_VARIANT) => Staged::Skipped(format!("{label}: not published for {arch}")),
+            Err(e) if no_variant_is_skip(image, arch, &e) => Staged::Skipped(format!("{label}: not published for {arch}")),
             Err(e) => Staged::Failed(format!("{label}: {e}")),
         });
     }
@@ -1095,7 +1117,7 @@ pub(crate) fn stage_selection(g: &Globals, images: &[String], arches: &[String],
             }
             match stage_and_record(g, img, arch, source) {
                 Ok(_) => sum.staged.push(label),
-                Err(e) if e.starts_with(NO_VARIANT) => sum.skipped.push(format!("{label}: not published for {arch}")),
+                Err(e) if no_variant_is_skip(img, arch, &e) => sum.skipped.push(format!("{label}: not published for {arch}")),
                 Err(e) => sum.failed.push(format!("{label}: {e}")),
             }
         }
@@ -1188,17 +1210,37 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_variant_of_our_published_image_is_a_failure_not_a_skip() {
+        let e = format!("{NO_VARIANT} arm64: x publishes only amd64");
+        // llamacpp / ollama are published for both arches: a stage that cannot
+        // produce one is a FAILURE (the node would otherwise have no image).
+        for img in ["llamacpp", "ollama", "ghcr.io/noomesh/ollama:v0.6.16", "ghcr.io/noomesh/llamacpp:v0.6.16@sha256:aa"] {
+            for arch in ["amd64", "arm64"] {
+                assert!(!no_variant_is_skip(img, arch, &e), "{img} {arch}");
+            }
+        }
+        // An image we genuinely do not publish for that arch, or an arch we do not publish: still a skip.
+        assert!(no_variant_is_skip("nvidia-exporter", "arm64", &e));
+        assert!(no_variant_is_skip("ollama", "riscv64", &e));
+        // Any other error is never a skip.
+        assert!(!no_variant_is_skip("nvidia-exporter", "arm64", "boom"));
+        assert!(own_image_published("ghcr.io/noomesh/ollama:v1", "arm64") && !own_image_published("ghcr.io/noomesh/stunnel:v1", "arm64"));
+    }
+
+    #[test]
     fn a_third_party_lock_row_is_never_staged() {
-        // `ollama@sha256:` pins docker.io/ollama/ollama:<version> for the
-        // controller's own start; it is not `<prefix>/ollama:<tag>`, so a
+        // `nats@sha256:` pins docker.io/library/nats:<version> for the
+        // controller's own start; it is not `<prefix>/nats:<tag>`, so a
         // stage would ask the release registry for an image it never had.
-        let lock = format!("# tag v0.6.5\ngateway@{D}\nollama@{D}\nllamacpp@{D}\n");
+        // `ollama` is OUR hardened image (docker/Dockerfile.ollama, i323) and
+        // IS staged for the nodes.
+        let lock = format!("# tag v0.6.5\ngateway@{D}\nnats@{D}\nollama@{D}\nllamacpp@{D}\n");
         let rows = parse_lock(&lock);
-        assert!(rows.iter().any(|r| r.name == "ollama"), "the row parses like any other");
+        assert!(rows.iter().any(|r| r.name == "nats"), "the row parses like any other");
         for all in [false, true] {
             let staged: Vec<&str> = rows.iter().map(|r| r.name.as_str()).filter(|n| stages_from_lock(n, all)).collect();
-            assert!(!staged.contains(&"ollama"), "all={all}: {staged:?}");
-            assert!(staged.contains(&"llamacpp"), "all={all}: {staged:?}");
+            assert!(!staged.contains(&"nats"), "all={all}: {staged:?}");
+            assert!(staged.contains(&"llamacpp") && staged.contains(&"ollama"), "all={all}: {staged:?}");
         }
         assert!(stages_from_lock("gateway", true) && !stages_from_lock("gateway", false));
     }

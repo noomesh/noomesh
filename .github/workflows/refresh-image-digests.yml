@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Monthly refresh of every digest-pinned third-party image (followup 17a).
+#
+# Every base/mirror image source in this repo is written `tag@sha256:<index
+# digest>`, so a rebuild of an old commit builds the same bases. The price is
+# that nothing moves on its own. This workflow is the "on purpose": once a
+# month it re-resolves each pinned tag to its CURRENT index digest
+# (scripts/refresh-image-digests.py, the same parser tests/test_image_digest_pins_17a.py
+# guards with), and when anything moved it pushes ONE branch
+# (bot/refresh-image-digests-YYYYMMDD-<run>) and writes old -> new per source
+# into the run summary. It does not open the pull request (operator decision
+# 2026-10-31): a person opens it from the branch, so CI runs normally and no
+# repository setting has to let workflows create pull requests. The merge is
+# the decision; a moved digest is a different base image, so it needs a
+# release-candidate rehearsal before it ships.
+#
+# Run it by hand: `gh workflow run refresh-image-digests.yml -R noomesh/noomesh`.
+# Like mirror-images.yml, a scheduled or dispatched run reads this file from
+# the DEFAULT branch, so it starts once the file is promoted there.
+#
+# Token: the job's own GITHUB_TOKEN with contents:write, only to push the
+# branch. No pull-requests permission.
+#
+# dhi.io sources need DHI_USERNAME / DHI_TOKEN, as in mirror-images.yml. Without
+# them those sources are reported UNRESOLVED and the job ends red AFTER opening
+# the branch for whatever did resolve: a stale pin is loud, never silent.
+name: refresh image digests
+
+on:
+  schedule:
+    - cron: '23 5 1 * *'   # monthly, the 1st at 05:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    if: github.repository == 'noomesh/noomesh'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout dev   # actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: dev
+
+      - name: Log in to the source registries
+        env:
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+        run: |
+          if [ -z "${DHI_TOKEN:-}" ] || [ -z "${DHI_USERNAME:-}" ]; then
+            echo "::warning::no DHI_USERNAME/DHI_TOKEN: dhi.io sources will be reported unresolved"
+            exit 0
+          fi
+          echo "$DHI_TOKEN" | docker login dhi.io -u "$DHI_USERNAME" --password-stdin
+          echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin
+
+      - name: Re-resolve every pinned digest
+        id: refresh
+        run: |
+          rc=0
+          python3 scripts/refresh-image-digests.py --report "$RUNNER_TEMP/digests.md" || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if git diff --quiet; then echo "changed=false" >> "$GITHUB_OUTPUT"; else echo "changed=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Push the refresh branch
+        if: steps.refresh.outputs.changed == 'true'
+        env:
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          branch="bot/refresh-image-digests-$(date -u +%Y%m%d)-${RUN_ID}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git commit -am "images: refresh pinned base/mirror digests (monthly, 17a)"
+          git push origin "$branch"
+          {
+            echo "## Image digests moved (followup 17a)"
+            echo
+            echo "Branch \`$branch\` holds the new pins. Open a pull request into dev from it:"
+            echo
+            echo "    gh pr create -R $REPO --base dev --head $branch --title 'images: refresh pinned base/mirror digests (monthly, 17a)'"
+            echo
+            echo "A moved digest is a different base image: rehearse a release candidate before it ships."
+            echo
+            cat "$RUNNER_TEMP/digests.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if any source could not be resolved
+        if: steps.refresh.outputs.rc != '0'
+        run: |
+          echo "::error::some image sources could not be resolved (see the report above); their pins were left as they were"
+          exit 1

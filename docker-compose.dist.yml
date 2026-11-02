@@ -153,6 +153,6 @@ services:
 #     pull-only WORKER installs too. (stunnel-* doors are NOT in this list: they
 #     are overridden above, because an engine sharing a door's network namespace
 #     fails to start without its door, on a controller as much as a node.)
-#   redis, nats, vllm, ollama, tei*, reranker, loki, prometheus,
+#   redis, nats, vllm, ollama, tei*, reranker, loki, tempo, prometheus,
 #   alertmanager, grafana, node-exporter, model-cache
 #     Third-party upstream images — already pulled, never built. Untouched.

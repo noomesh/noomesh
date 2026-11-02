@@ -1839,8 +1839,99 @@ pub(crate) fn migrate_kind(legacy_applier_present: bool, sync_unit: Option<&str>
 /// Every enrolled seat, or `None` when the gateway does not answer (an older
 /// gateway has no seat routes: that is "no seats", said once by the caller).
 pub(crate) fn list_seats(g: &Globals) -> Option<Vec<Value>> {
-    crate::http::get_json_opt(g, "/api/cluster/seats", true, 15)
+    list_seats_within(g, 15)
+}
+
+/// [`list_seats`] with the caller's timeout: `noo kiosk status` asks in
+/// passing on a box with no seat, and must not hang there for 15s.
+fn list_seats_within(g: &Globals, secs: u64) -> Option<Vec<Value>> {
+    crate::http::get_json_opt(g, "/api/cluster/seats", true, secs)
         .and_then(|d| d["seats"].as_array().cloned())
+}
+
+/// One `noo kiosk seats` row: the registry as a table, without a verdict
+/// (judging each seat is `noo cluster verify`). Pure over the
+/// `/api/cluster/seats` record and the clock, so every cell is pinned.
+pub(crate) fn seat_row(seat: &Value, now: i64) -> Vec<String> {
+    let hb = &seat["heartbeat"];
+    let text = |v: &Value| v.as_str().unwrap_or("").to_string();
+    let seen = match seat["last_seen"].as_str().and_then(super::cluster_verify::parse_rfc3339_unix) {
+        Some(t) if now - t <= SEAT_HEARTBEAT_MAX_AGE_SECS =>
+            ui::good(&format!("{} ago", super::backups::human_age(now - t))),
+        Some(t) => ui::bad(&format!("{} ago", super::backups::human_age(now - t))),
+        None => ui::bad("never"),
+    };
+    let bundle = match (seat["staged_sha"].as_str(), seat["applied_sha"].as_str(), seat["apply_rc"].as_i64()) {
+        (None, _, _) => String::new(),
+        (Some(st), Some(ap), Some(0)) if st == ap => "applied".to_string(),
+        (Some(st), Some(ap), Some(rc)) if st == ap => ui::bad(&format!("apply failed (exit {rc})")),
+        _ => ui::warn("staged, not applied"),
+    };
+    vec![
+        text(&seat["seat_name"]),
+        seen,
+        text(&hb["kiosk"]["mode"]),
+        text(&hb["kiosk"]["view"]),
+        text(&hb["kiosk"]["quality"]),
+        text(&hb["console_build"]),
+        text(&hb["cli_version"]),
+        bundle,
+    ]
+}
+
+fn seats_table(seats: &[Value], now: i64) -> String {
+    use crate::ui::Col;
+    let rows: Vec<Vec<String>> = seats.iter().map(|s| seat_row(s, now)).collect();
+    ui::table(
+        &[
+            Col::left("seat"), Col::left("seen"), Col::left("mode"), Col::left("view"),
+            Col::left("quality"), Col::left("console"), Col::left("cli"), Col::left("bundle"),
+        ],
+        &rows,
+    )
+}
+
+/// `noo kiosk seats`: every display enrolled with this controller, one row
+/// each, read from the seat registry (`/api/cluster/seats`). Read-only.
+pub fn kiosk_seats(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    if !args.is_empty() {
+        return Err(Unhandled);
+    }
+    let Some(seats) = list_seats(g) else {
+        fail(
+            g.json,
+            ExitCode::RemoteError,
+            "unreachable",
+            "the gateway did not answer /api/cluster/seats (not reachable from here, or it predates seats)",
+            Some("noo cluster status"),
+        )
+    };
+    if g.json {
+        println!("{}", json!({ "seats": seats, "count": seats.len() }));
+        return Ok(0);
+    }
+    let count = seats.len().to_string();
+    println!("{}", ui::header("kiosk seats", Some(&count)));
+    if seats.is_empty() {
+        println!("{}", ui::kv(&[("seats", ui::muted("none enrolled with this controller"))]));
+        ui::guide(&[("noo kiosk seat-token <name>", "mint the paste a new display enrolls with")]);
+        return Ok(0);
+    }
+    print!("{}", seats_table(&seats, now_unix()));
+    ui::guide(&[("noo cluster verify", "judge each seat: online, CLI current, display build, last apply")]);
+    Ok(0)
+}
+
+/// For `noo kiosk status` on a box with no seat of its own: when this box's
+/// gateway answers with enrolled seats (a controller), show them, so the
+/// controller's `status` is the controller's view. Silent otherwise.
+pub(crate) fn print_seats_if_any(g: &Globals) {
+    let Some(seats) = list_seats_within(g, 5) else { return };
+    if seats.is_empty() {
+        return;
+    }
+    println!("{}", ui::section(&format!("seats enrolled with this controller ({})", seats.len())));
+    print!("{}", seats_table(&seats, now_unix()));
 }
 
 fn check(name: &'static str, verdict: super::cluster_verify::Verdict, detail: String, remedy: Option<String>) -> super::cluster_verify::Check {
@@ -3013,6 +3104,44 @@ exec {real_install} "$@"
         let prod = &src[..src.find("#[cfg(test)]").unwrap()];
         assert!(!prod.contains("enroll::ca_agent("), "a seat call uses the cluster-CA-only client");
         assert_eq!(prod.matches("seat_agent(&").count(), 2, "redeem + seat-sync both use seat_agent");
+    }
+
+    /// i188: `noo kiosk seats` shows the registry as the controller holds it,
+    /// one row per seat, without judging it (that is `noo cluster verify`).
+    #[test]
+    fn a_seats_row_reads_the_registry() {
+        let seen = "2026-11-01T10:00:00+00:00";
+        let t = super::super::cluster_verify::parse_rfc3339_unix(seen).expect("fixture timestamp parses");
+        let mut seat = json!({
+            "seat_name": "lobby",
+            "last_seen": seen,
+            "heartbeat": {"cli_version": "0.6.16", "console_build": "stack-v0.6.16",
+                          "kiosk": {"user": "kiosk", "mode": "dedicated", "view": "graph", "quality": "lean"}},
+            "staged_sha": "aa", "applied_sha": "aa", "apply_rc": 0,
+        });
+        let row = seat_row(&seat, t + 30);
+        assert_eq!(row.len(), 8, "one cell per column");
+        assert_eq!(row[0], "lobby");
+        assert!(row[1].contains("30s ago"), "{}", row[1]);
+        assert_eq!(&row[2..7], &["dedicated", "graph", "lean", "stack-v0.6.16", "0.6.16"]);
+        assert_eq!(row[7], "applied");
+
+        // Quiet past the heartbeat window, and a newer bundle not applied yet.
+        seat["staged_sha"] = json!("bb");
+        let row = seat_row(&seat, t + 600);
+        assert!(row[1].contains("10m ago"), "{}", row[1]);
+        assert!(row[7].contains("staged, not applied"), "{}", row[7]);
+
+        // The staged bundle applied and failed.
+        seat["applied_sha"] = json!("bb");
+        seat["apply_rc"] = json!(2);
+        assert!(seat_row(&seat, t + 30)[7].contains("apply failed (exit 2)"));
+
+        // Enrolled, never heard from, nothing staged: said, not invented.
+        let fresh = json!({"seat_name": "hall", "last_seen": null, "heartbeat": null, "staged_sha": null});
+        let row = seat_row(&fresh, t);
+        assert!(row[1].contains("never"), "{}", row[1]);
+        assert!(row[2..].iter().all(String::is_empty), "{row:?}");
     }
 
     struct TestCa {

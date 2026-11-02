@@ -933,6 +933,8 @@ async fn classify_one(
     });
 
     for attempt in 0..2 {
+        let mut span =
+            crate::request_trace::backend_span(&backend.backend_type, &backend.model, url, crate::request_trace::SpanEnd::Body);
         let req = crate::node_link::backend_request_on(
             client,
             reqwest::Method::POST,
@@ -941,10 +943,14 @@ async fn classify_one(
         )
         .json(&body)
         .timeout(Duration::from_secs(60));
+        let req = crate::request_trace::propagate(req, span.as_ref());
         let resp = req
             .send()
             .await
             .map_err(|e| upstream(StatusCode::BAD_GATEWAY, format!("classify backend at {url} unreachable: {e}")))?;
+        if let Some(s) = span.as_mut() {
+            s.status(resp.status().as_u16());
+        }
         if !resp.status().is_success() {
             if attempt == 1 {
                 let s = resp.status();

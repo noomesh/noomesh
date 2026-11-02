@@ -284,7 +284,12 @@ cmd_rehearse() {
     sx noo db status || true
     sx noo db verify-plane || true
     info "-- 4/4 gateway health endpoint"
-    sx curl -kfsS https://localhost:8080/health && echo || sx curl -fsS http://localhost:8080/health && echo || true
+    # Verified against the CA onboard just minted inside (it writes
+    # NOO_TLS_CA to the inner .env). No -k and no plain-http retry: the
+    # gateway serves TLS only, so either would only hide a broken probe.
+    sx sh -c 'ca="$(sed -n "s/^NOO_TLS_CA=//p" .env | tail -n 1)"
+              [ -n "$ca" ] || { echo "no NOO_TLS_CA in .env: onboard did not mint a CA" >&2; exit 1; }
+              curl -fsS --cacert "$ca" https://localhost:8080/health' && echo || true
     ok "Rehearsal sequence finished — review output above."
 }
 

@@ -28,6 +28,10 @@ NEW = {
     "noo_metrics_range": "/api/metrics/range",
     "noo_metrics_discover": "/api/metrics/discover",
     "noo_alerts_list": "/api/alerts/list",
+    # Request traces (i359): every account's routes, so operator door only
+    # (auth::TRACES_READ_PREFIX refuses /api/traces/* below Operator).
+    "noo_traces_summary": "/api/traces/summary",
+    "noo_traces_requests": "/api/traces/requests",
 }
 
 
@@ -70,12 +74,17 @@ def test_the_gateway_refuses_these_paths_below_operator() -> None:
     m = re.search(r"pub const METRICS_READ_PATHS: &\[&str\] = &\[(.*?)\];", src, re.S)
     assert m, "METRICS_READ_PATHS not found — the parse found nothing"
     listed = set(re.findall(r'"([^"]+)"', m.group(1)))
-    assert set(NEW.values()) <= listed, set(NEW.values()) - listed
-    # And each is a real, GET-only route.
-    admin = (ROOT / "gateway-rust" / "src" / "routes" / "admin.rs").read_text(encoding="utf-8")
+    t = re.search(r'pub const TRACES_READ_PREFIX: &str = "([^"]+)";', src)
+    assert t, "TRACES_READ_PREFIX not found — the parse found nothing"
+    gated = {p for p in NEW.values() if p in listed or p.startswith(t.group(1))}
+    assert set(NEW.values()) == gated, set(NEW.values()) - gated
+    assert "path.starts_with(TRACES_READ_PREFIX)" in src, "the traces prefix is declared but not enforced"
+    # And each is a real, GET-only route, in the file that serves it.
+    routes = ROOT / "gateway-rust" / "src" / "routes"
     for path in NEW.values():
-        assert re.search(rf'\.route\("{re.escape(path)}",\s*get\(', admin), path
-        assert not re.search(rf'\.route\("{re.escape(path)}",[^)]*post\(', admin), path
+        text = (routes / ("traces.rs" if path.startswith(t.group(1)) else "admin.rs")).read_text(encoding="utf-8")
+        assert re.search(rf'\.route\("{re.escape(path)}",\s*get\(', text), path
+        assert not re.search(rf'\.route\("{re.escape(path)}",[^)]*post\(', text), path
 
 
 def test_no_tool_field_is_a_raw_write() -> None:

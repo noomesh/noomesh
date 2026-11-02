@@ -101,6 +101,7 @@ SIBLING_INPUTS: dict[str, tuple[str, ...]] = {
     "postgres-pgvector": (),
     "llamacpp": (),
     "stunnel": (),
+    "ollama": (),
     "nvidia-exporter": (),
     "gateway": (),
     "node-agent": (),

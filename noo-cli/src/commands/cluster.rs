@@ -38,6 +38,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use super::truncate;
+use crate::args::{ArgError, Args};
 use crate::http::{
     delete_json, get_json, post_json, post_json_try, put_json,
 };
@@ -854,24 +855,20 @@ pub fn cluster_desired(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
 /// Parsed `noo cluster proposals` surface.
 #[derive(Debug, PartialEq)]
-struct ProposalsArgs {
+pub(crate) struct ProposalsArgs {
     status: Option<String>,
     limit: Option<u64>,
 }
 
 fn parse_proposals_args(args: &[String]) -> Result<ProposalsArgs, Unhandled> {
-    let mut out = ProposalsArgs { status: None, limit: None };
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--status" => out.status = Some(it.next().ok_or(Unhandled)?.clone()),
-            "--limit" | "-n" => {
-                out.limit = Some(it.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?)
-            }
-            _ => return Err(Unhandled),
-        }
-    }
-    Ok(out)
+    Ok(parse_proposals_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_proposals_with(a: &mut Args) -> Result<ProposalsArgs, ArgError> {
+    let status = a.value(&["--status"])?;
+    let limit = a.number::<u64>(&["--limit", "-n"])?;
+    a.finish()?;
+    Ok(ProposalsArgs { status, limit })
 }
 
 /// `noo cluster proposals [--status <s>] [--limit <n>]` — POST
@@ -1005,6 +1002,46 @@ fn harness_cell(n: &serde_json::Value) -> String {
     }
 }
 
+/// What `noo cluster place` was asked for.
+pub(crate) struct PlaceArgs {
+    node: String,
+    backend: String,
+    model: String,
+    port: Option<i64>,
+    tls: bool,
+    image: Option<String>,
+    stopped: bool,
+    force: bool,
+    role: Option<String>,
+    kind: Option<String>,
+    env_changes: Vec<(String, Option<String>)>,
+    on: Option<String>,
+}
+
+pub(crate) fn parse_place_with(a: &mut Args) -> Result<PlaceArgs, ArgError> {
+    // The hardware target (cpu | gpu), stored with the placement.
+    let on = a.value(&["--on"])?;
+    // Place even when `noo cluster fit` says the models do not fit.
+    let force = a.flag(&["--force"]);
+    // Placement env (repeatable); `KEY=` removes KEY.
+    let mut env_changes = Vec::new();
+    for raw in a.values(&["--env"])? {
+        let change = parse_env_change(&raw).ok_or_else(|| ArgError::new(format!("--env needs KEY=VALUE, got `{raw}`")))?;
+        env_changes.push(change);
+    }
+    let port = a.number::<i64>(&["--port"])?;
+    let tls = a.flag(&["--tls"]);
+    let image = a.value(&["--image"])?;
+    let stopped = a.flag(&["--stopped"]);
+    // What the backend serves (chat | embed | rerank; the harness implies its own).
+    let role = a.value(&["--role"])?;
+    // Which harness runs on the node; only meaningful with the `harness` backend.
+    let kind = a.value(&["--kind"])?;
+    let [node, backend, model]: [String; 3] =
+        a.positionals()?.try_into().map_err(|_| ArgError::new("expected <node> <backend> <model>"))?;
+    Ok(PlaceArgs { node, backend, model, port, tls, image, stopped, force, role, kind, env_changes, on })
+}
+
 /// `noo cluster place NODE BACKEND MODEL [--on cpu|gpu] [--env KEY=VALUE]... [--port P] [--tls]
 /// [--image IMG] [--stopped]` — PUT /api/cluster/nodes/{node}/placements/{backend}.
 /// Declares that NODE should run BACKEND with MODEL; the node-agent
@@ -1015,48 +1052,9 @@ fn harness_cell(n: &serde_json::Value) -> String {
 /// the node's reported hardware and usage profile unless `--env` names them
 /// (`cluster_tune`).
 pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut positional: Vec<String> = Vec::new();
-    let mut port: Option<i64> = None;
-    let mut tls = false;
-    let mut image: Option<String> = None;
-    let mut stopped = false;
-    let mut force = false;
-    let mut role: Option<String> = None;
-    let mut kind: Option<String> = None;
-    let mut env_changes: Vec<(String, Option<String>)> = Vec::new();
-    let mut on: Option<String> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            // The hardware target: cpu | gpu. Stored with the placement.
-            "--on" => on = Some(iter.next().ok_or(Unhandled)?.clone()),
-            // Place even when `noo cluster fit` says the models do not fit
-            // the node's memory (the gateway otherwise refuses with a 409).
-            "--force" => force = true,
-            // Placement env (repeatable): runtime tuning the node's agent
-            // applies to the backend, e.g. VLLM_TOOL_PARSER=gemma4. Merged
-            // into what the placement already carries; `KEY=` removes KEY.
-            // Before this flag the only way to set one was a hand-built curl
-            // with a token read out of the credential file (2026-09-29).
-            "--env" => env_changes.push(parse_env_change(iter.next().ok_or(Unhandled)?).ok_or(Unhandled)?),
-            "--port" => port = Some(iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?),
-            "--tls" => tls = true,
-            "--image" => image = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--stopped" => stopped = true,
-            // What the backend serves. `embed` is what makes the node's agent
-            // advertise the `embed` capability and route /embed to this
-            // backend; a chat placement of an embedding model is invisible
-            // to the mesh embedder (host2 + harrier, 2026-09-09).
-            "--role" => role = Some(iter.next().ok_or(Unhandled)?.clone()),
-            // Which harness runs on the node: `noo` (the
-            // default) or a kind from config/harness-kinds.json. Only meaningful with the
-            // `harness` backend; travels in the placement's env.
-            "--kind" => kind = Some(iter.next().ok_or(Unhandled)?.clone()),
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => positional.push(t.to_string()),
-        }
-    }
-    let [node, backend, model] = positional.as_slice() else { return Err(Unhandled) };
+    let PlaceArgs { node, backend, model, port, tls, image, stopped, force, mut role, kind, mut env_changes, on } =
+        parse_place_with(&mut Args::new(args))?;
+    let (node, backend, model) = (&node, &backend, &model);
     if let Some(k) = &kind {
         if backend != "harness" {
             crate::output::fail(g.json, crate::output::ExitCode::Usage, "bad_kind",
@@ -1621,6 +1619,22 @@ mod placement_env_tests {
     }
 }
 
+/// What `noo cluster unplace` was asked for.
+pub(crate) struct UnplaceArgs {
+    node: String,
+    backend: String,
+    role: Option<String>,
+    model: Option<String>,
+}
+
+pub(crate) fn parse_unplace_with(a: &mut Args) -> Result<UnplaceArgs, ArgError> {
+    let role = a.value(&["--role"])?;
+    // Which embed model to remove: a node may serve several.
+    let model = a.value(&["--model"])?;
+    let [node, backend]: [String; 2] = a.positionals()?.try_into().map_err(|_| ArgError::new("expected <node> <backend>"))?;
+    Ok(UnplaceArgs { node, backend, role, model })
+}
+
 /// `noo cluster unplace NODE BACKEND [--role R [--model M]]` —
 /// DELETE /api/cluster/nodes/{node}/placements/{backend}. The agent stops
 /// managing the backend.
@@ -1633,20 +1647,9 @@ mod placement_env_tests {
 /// it. A container nobody manages is visible; an unmanaged harness is
 /// not, which is why one is left and the other is not.
 pub fn cluster_unplace(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut positional: Vec<&String> = Vec::new();
-    let mut role: Option<&String> = None;
-    let mut model: Option<&String> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--role" => role = Some(iter.next().ok_or(Unhandled)?),
-            // Which embed model to remove: a node may serve several.
-            "--model" => model = Some(iter.next().ok_or(Unhandled)?),
-            t if t.starts_with('-') => return Err(Unhandled),
-            _ => positional.push(tok),
-        }
-    }
-    let [node, backend] = positional.as_slice() else { return Err(Unhandled) };
+    let parsed = parse_unplace_with(&mut Args::new(args))?;
+    let (node, backend) = (&parsed.node, &parsed.backend);
+    let (role, model) = (parsed.role.as_ref(), parsed.model.as_ref());
     if model.is_some() && role.map(|r| r.as_str()) != Some("embed") {
         crate::output::fail(g.json, crate::output::ExitCode::Usage, "bad_model",
             "--model names which embed model to remove: pass it with --role embed", None);
@@ -1863,6 +1866,25 @@ pub(crate) fn fetch_node(g: &Globals, node_id: &str) -> serde_json::Value {
     );
 }
 
+/// What `noo cluster logs` was asked for.
+pub(crate) struct LogsArgs {
+    node: Option<String>,
+    service: Option<String>,
+    backend: Option<String>,
+    tail: u64,
+}
+
+pub(crate) fn parse_logs_with(a: &mut Args) -> Result<LogsArgs, ArgError> {
+    let backend = a.value(&["--backend", "-b"])?;
+    let tail = a.number::<u64>(&["--tail", "-n"])?.unwrap_or(50);
+    let mut words = a.positionals()?.into_iter();
+    let (node, service) = (words.next(), words.next());
+    if let Some(extra) = words.next() {
+        return Err(ArgError::new(format!("unexpected argument `{extra}`")));
+    }
+    Ok(LogsArgs { node, service, backend, tail })
+}
+
 /// `noo cluster logs [NODE] [SERVICE] [-b BACKEND] [-n TAIL]` — container
 /// logs from a node, over the mesh.
 ///
@@ -1873,48 +1895,28 @@ pub(crate) fn fetch_node(g: &Globals, node_id: &str) -> serde_json::Value {
 /// that rail, which also works on a node the operator has no key for —
 /// which is now every node.
 pub fn cluster_logs(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut positional: Vec<String> = Vec::new();
-    let mut backend: Option<String> = None;
-    let mut tail: u64 = 50;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "-b" | "--backend" => backend = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "-n" | "--tail" => {
-                tail = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?
-            }
-            // `-f` streamed because ssh held the pipe open. The rail is a
-            // one-shot tail, so rather than fake it with a poll loop, say
-            // where streaming lives.
-            "-f" | "--follow" => {
-                fail(
-                    g.json,
-                    ExitCode::Usage,
-                    "follow_unsupported",
-                    "`--follow` is not available over the mesh log rail (it is a one-shot tail)",
-                    Some("no live follow yet — poll the log store instead: `noo logs query <logql>`"),
-                );
-            }
-            // `-u` chose the SSH user. There is no SSH user any more.
-            "-u" | "--user" => {
-                fail(
-                    g.json,
-                    ExitCode::Usage,
-                    "user_unsupported",
-                    "`--user` selected an SSH account; cluster logs no longer uses SSH",
-                    Some("drop the flag — the node-agent serves these logs over the mesh"),
-                );
-            }
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => positional.push(t.to_string()),
-        }
+    // `-f` streamed because ssh held the pipe open. The rail is a one-shot
+    // tail, so rather than fake it with a poll loop, say where streaming lives.
+    if args.iter().any(|t| t == "-f" || t == "--follow") {
+        fail(
+            g.json,
+            ExitCode::Usage,
+            "follow_unsupported",
+            "`--follow` is not available over the mesh log rail (it is a one-shot tail)",
+            Some("no live follow yet — poll the log store instead: `noo logs query <logql>`"),
+        );
     }
-    let (node, service) = match positional.as_slice() {
-        [] => (None, None),
-        [node] => (Some(node.clone()), None),
-        [node, service] => (Some(node.clone()), Some(service.clone())),
-        _ => return Err(Unhandled),
-    };
+    // `-u` chose the SSH user. There is no SSH user any more.
+    if args.iter().any(|t| t == "-u" || t == "--user") {
+        fail(
+            g.json,
+            ExitCode::Usage,
+            "user_unsupported",
+            "`--user` selected an SSH account; cluster logs no longer uses SSH",
+            Some("drop the flag — the node-agent serves these logs over the mesh"),
+        );
+    }
+    let LogsArgs { node, service, backend, tail } = parse_logs_with(&mut Args::new(args))?;
     let backend = backend.or(service);
     let container = match &backend {
         Some(b) if b.starts_with("noo-") => b.clone(),
@@ -2015,6 +2017,13 @@ pub fn cluster_restart_agent(g: &Globals, args: &[String]) -> Result<i32, Unhand
     Ok(0)
 }
 
+pub(crate) fn parse_down_with(a: &mut Args) -> Result<(String, Option<String>, bool), ArgError> {
+    let node = a.value(&["--node"])?;
+    let yes = a.flag(&["--yes", "-y"]);
+    let backend = a.one("<backend>")?;
+    Ok((backend, node, yes))
+}
+
 /// `noo cluster down BACKEND [--node NODE] [-y/--yes]` —
 /// POST /api/cluster/backends/stop. Stops BACKEND on NODE, or on ALL nodes
 /// when --node is omitted (Python parity: `node_id` travels as null).
@@ -2022,20 +2031,7 @@ pub fn cluster_restart_agent(g: &Globals, args: &[String]) -> Result<i32, Unhand
 /// nodes}?", exactly Python's prompt); `--yes` skips, and unlike Python a
 /// --json or non-TTY invocation errors instead of blocking on the prompt.
 pub fn cluster_down(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut backend: Option<String> = None;
-    let mut node: Option<String> = None;
-    let mut yes = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--node" => node = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "-y" | "--yes" => yes = true,
-            t if t.starts_with('-') => return Err(Unhandled),
-            t if backend.is_none() => backend = Some(t.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let Some(backend) = backend else { return Err(Unhandled) };
+    let (backend, node, yes) = parse_down_with(&mut Args::new(args))?;
 
     let target = match &node {
         Some(n) => format!("{backend} on {n}"),
@@ -2180,134 +2176,172 @@ fn retired_set_config_flag(flag: &str) -> Option<&'static str> {
     }
 }
 
+/// What `noo cluster set-config` was asked for, before any value is judged.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct SetConfigArgs {
+    node: String,
+    data_root: Option<String>,
+    models_dir: Option<String>,
+    ip: Option<String>,
+    tier: Option<i64>,
+    gpu_model: Option<String>,
+    min_battery: Option<f64>,
+    require_wifi: Option<bool>,
+    block_thermal: Option<String>,
+    policy_default: bool,
+    harness: Option<String>,
+    /// `None` not given, `Some(None)` is `default`, `Some(Some(n))` a number.
+    loop_budget: Option<Option<i64>>,
+    vram_gb: Option<f64>,
+    usage: Option<String>,
+    vendor_kinds: Option<String>,
+}
+
+pub(crate) fn parse_set_config_with(a: &mut Args) -> Result<SetConfigArgs, ArgError> {
+    let usage = a.value(&["--usage"])?;
+    let harness = a.value(&["--harness"])?;
+    let loop_budget = match a.value(&["--loop-budget"])? {
+        None => None,
+        Some(v) if v == "default" => Some(None),
+        Some(v) => {
+            let n = v.parse::<i64>().map_err(|_| ArgError::new(format!("--loop-budget needs a number or `default`, got `{v}`")))?;
+            Some(Some(n))
+        }
+    };
+    let data_root = a.value(&["--data-root"])?;
+    let models_dir = a.value(&["--models-dir"])?;
+    let ip = a.value(&["--ip"])?;
+    let tier = a.number::<i64>(&["--tier"])?;
+    let gpu_model = a.value(&["--gpu-model"])?;
+    let vram_gb = a.number::<f64>(&["--vram-gb"])?;
+    // Companion policy: each flag sets one key of the stored object.
+    let min_battery = a.number::<f64>(&["--min-battery"])?;
+    let require_wifi = match a.value(&["--require-wifi"])?.as_deref() {
+        None => None,
+        Some("true" | "yes" | "1") => Some(true),
+        Some("false" | "no" | "0") => Some(false),
+        Some(v) => return Err(ArgError::new(format!("--require-wifi needs true or false, got `{v}`"))),
+    };
+    let block_thermal = a.value(&["--block-thermal"])?;
+    let policy_default = a.flag(&["--policy-default"]);
+    let vendor_kinds = a.value(&["--vendor-kinds"])?;
+    let node = a.one("<node>")?;
+    Ok(SetConfigArgs {
+        node,
+        data_root,
+        models_dir,
+        ip,
+        tier,
+        gpu_model,
+        min_battery,
+        require_wifi,
+        block_thermal,
+        policy_default,
+        harness,
+        loop_budget,
+        vram_gb,
+        usage,
+        vendor_kinds,
+    })
+}
+
 /// `noo cluster set-config NODE [--usage shared|dedicated|default] [--data-root P] [--models-dir P]
 /// [--ip A] [--tier T] [--gpu-model G] [--vram-gb V]` —
 /// PUT /api/cluster/nodes/{node}/config with only the provided keys (parity
 /// with Python's non-None body build). Errors if nothing was passed.
 pub fn cluster_set_config(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut node: Option<String> = None;
+    // `--ssh-user` is retired, not unknown: say why.
+    if args.iter().any(|t| t == "--ssh-user") {
+        fail(
+            g.json,
+            ExitCode::Usage,
+            "ssh_user_retired",
+            retired_set_config_flag("--ssh-user").unwrap_or("retired flag"),
+            Some("nothing connects to a node over SSH any more; see `noo cluster show <node>` for what the controller uses"),
+        );
+    }
+    let p = parse_set_config_with(&mut Args::new(args))?;
+    let node = p.node;
     let mut body = serde_json::Map::new();
     let mut policy = serde_json::Map::new();
-    let mut clear_policy = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        macro_rules! next {
-            () => {
-                iter.next().ok_or(Unhandled)?.clone()
-            };
-        }
-        match tok.as_str() {
-            "--data-root" => {
-                // The data root becomes this node's allowed host root, so only
-                // a dedicated, conventional `noo` directory may be declared.
-                let root = next!();
-                let (macos, home) = crate::commands::data_root::infer_os(&root);
-                if let Some((code, why)) = crate::commands::data_root::shape_problem(&root, macos, &home) {
-                    fail(
-                        g.json,
-                        ExitCode::Usage,
-                        "data_root_policy",
-                        &format!("data root refused ({code}): {why}"),
-                        Some("use /var/lib/noo, or a dedicated <data disk>/noo (macOS: ~/noomesh or /Volumes/<disk>/noo)"),
-                    );
-                }
-                body.insert("data_root".into(), serde_json::json!(root));
-            }
-            "--models-dir" => {
-                body.insert("models_dir".into(), serde_json::json!(next!()));
-            }
-            "--ssh-user" => fail(
+    let clear_policy = p.policy_default;
+    if let Some(root) = p.data_root {
+        // The data root becomes this node's allowed host root, so only
+        // a dedicated, conventional `noo` directory may be declared.
+        let (macos, home) = crate::commands::data_root::infer_os(&root);
+        if let Some((code, why)) = crate::commands::data_root::shape_problem(&root, macos, &home) {
+            fail(
                 g.json,
                 ExitCode::Usage,
-                "ssh_user_retired",
-                retired_set_config_flag("--ssh-user").unwrap_or("retired flag"),
-                Some("nothing connects to a node over SSH any more; see `noo cluster show <node>` for what the controller uses"),
-            ),
-            "--ip" => {
-                body.insert("ip_address".into(), serde_json::json!(next!()));
+                "data_root_policy",
+                &format!("data root refused ({code}): {why}"),
+                Some("use /var/lib/noo, or a dedicated <data disk>/noo (macOS: ~/noomesh or /Volumes/<disk>/noo)"),
+            );
+        }
+        body.insert("data_root".into(), serde_json::json!(root));
+    }
+    if let Some(v) = p.models_dir {
+        body.insert("models_dir".into(), serde_json::json!(v));
+    }
+    if let Some(v) = p.ip {
+        body.insert("ip_address".into(), serde_json::json!(v));
+    }
+    if let Some(v) = p.tier {
+        body.insert("tier".into(), serde_json::json!(v));
+    }
+    if let Some(v) = p.gpu_model {
+        body.insert("gpu_model".into(), serde_json::json!(v));
+    }
+    if let Some(v) = p.min_battery {
+        policy.insert("min_battery_pct".into(), serde_json::json!(v));
+    }
+    if let Some(v) = p.require_wifi {
+        policy.insert("require_wifi".into(), serde_json::json!(v));
+    }
+    if let Some(v) = p.block_thermal {
+        let states: Vec<String> = v.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+        policy.insert("blocked_thermal_states".into(), serde_json::json!(states));
+    }
+    // The harness policy: whether the loop follows this node's chat backend on its own.
+    if let Some(v) = p.harness {
+        if !matches!(v.as_str(), "auto" | "manual" | "off") {
+            fail(g.json, ExitCode::Usage, "bad_harness_policy", "--harness must be auto, manual or off", None);
+        }
+        body.insert("harness_policy".into(), serde_json::json!(v));
+    }
+    // The loop budget a task gets when it lands on this node and named none; `default` clears it.
+    match p.loop_budget {
+        None => {}
+        Some(None) => {
+            body.insert("default_loop_budget".into(), serde_json::Value::Null);
+        }
+        Some(Some(n)) => {
+            if !(1..=500).contains(&n) {
+                fail(g.json, ExitCode::Usage, "bad_loop_budget", "--loop-budget must be 1..=500, or `default`", None);
             }
-            "--tier" => {
-                let v: i64 = next!().parse().map_err(|_| Unhandled)?;
-                body.insert("tier".into(), serde_json::json!(v));
-            }
-            "--gpu-model" => {
-                body.insert("gpu_model".into(), serde_json::json!(next!()));
-            }
-            // Companion policy. Each flag sets one key
-            // of the stored object; the gateway validates and merges onto
-            // its default at read time. `--policy-default` clears the row's
-            // policy so the node follows the gateway default again.
-            "--min-battery" => {
-                let v: f64 = next!().parse().map_err(|_| Unhandled)?;
-                policy.insert("min_battery_pct".into(), serde_json::json!(v));
-            }
-            "--require-wifi" => {
-                let v = match next!().as_str() { "true" | "yes" | "1" => true, "false" | "no" | "0" => false, _ => return Err(Unhandled) };
-                policy.insert("require_wifi".into(), serde_json::json!(v));
-            }
-            "--block-thermal" => {
-                let states: Vec<String> = next!().split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
-                policy.insert("blocked_thermal_states".into(), serde_json::json!(states));
-            }
-            "--policy-default" => {
-                clear_policy = true;
-            }
-            // The harness policy: whether the loop
-            // follows this node's chat backend on its own.
-            "--harness" => {
-                let v = next!();
-                if !matches!(v.as_str(), "auto" | "manual" | "off") {
-                    fail(g.json, ExitCode::Usage, "bad_harness_policy", "--harness must be auto, manual or off", None);
-                }
-                body.insert("harness_policy".into(), serde_json::json!(v));
-            }
-            // The loop budget a task gets when it lands on this node and
-            // named none; `default` clears it.
-            "--loop-budget" => {
-                let v = next!();
-                if v == "default" {
-                    body.insert("default_loop_budget".into(), serde_json::Value::Null);
-                } else {
-                    let n: i64 = v.parse().map_err(|_| Unhandled)?;
-                    if !(1..=500).contains(&n) {
-                        fail(g.json, ExitCode::Usage, "bad_loop_budget", "--loop-budget must be 1..=500, or `default`", None);
-                    }
-                    body.insert("default_loop_budget".into(), serde_json::json!(n));
-                }
-            }
-            "--vram-gb" => {
-                let v: f64 = next!().parse().map_err(|_| Unhandled)?;
-                body.insert("vram_gb".into(), serde_json::json!(v));
-            }
-            // How much of the node a placement may assume: `shared` (someone
-            // uses it too: ~25% of cores, one request at a time, more GPU
-            // headroom) or `dedicated` (cores - 2, normal headroom).
-            // `default` clears it: dedicated on the controller, shared
-            // elsewhere.
-            "--usage" => {
-                let v = next!();
-                match v.as_str() {
-                    "shared" | "dedicated" => body.insert("usage_profile".into(), serde_json::json!(v)),
-                    "default" => body.insert("usage_profile".into(), serde_json::Value::Null),
-                    _ => fail(g.json, ExitCode::Usage, "bad_usage_profile", "--usage must be shared, dedicated or default", None),
-                };
-            }
-            // The vendor CLIs this node carries whatever its harness
-            // placement names (`noo cluster vendor install` adds to it);
-            // `none` clears. Delivered by the next restage.
-            "--vendor-kinds" => {
-                let v = next!();
-                match super::cluster_vendor::parse_vendor_kinds(&v, &crate::harness_kinds::shipped()) {
-                    Ok(k) => body.insert("vendor_kinds".into(), serde_json::json!(k)),
-                    Err(e) => fail(g.json, ExitCode::Usage, "bad_vendor_kinds", &e, None),
-                };
-            }
-            t if t.starts_with('-') => return Err(Unhandled),
-            t if node.is_none() => node = Some(t.to_string()),
-            _ => return Err(Unhandled),
+            body.insert("default_loop_budget".into(), serde_json::json!(n));
         }
     }
-    let Some(node) = node else { return Err(Unhandled) };
+    if let Some(v) = p.vram_gb {
+        body.insert("vram_gb".into(), serde_json::json!(v));
+    }
+    // How much of the node a placement may assume: `shared`, `dedicated`, or
+    // `default` (clears it: dedicated on the controller, shared elsewhere).
+    if let Some(v) = p.usage {
+        match v.as_str() {
+            "shared" | "dedicated" => body.insert("usage_profile".into(), serde_json::json!(v)),
+            "default" => body.insert("usage_profile".into(), serde_json::Value::Null),
+            _ => fail(g.json, ExitCode::Usage, "bad_usage_profile", "--usage must be shared, dedicated or default", None),
+        };
+    }
+    // The vendor CLIs this node carries whatever its harness placement names;
+    // `none` clears. Delivered by the next restage.
+    if let Some(v) = p.vendor_kinds {
+        match super::cluster_vendor::parse_vendor_kinds(&v, &crate::harness_kinds::shipped()) {
+            Ok(k) => body.insert("vendor_kinds".into(), serde_json::json!(k)),
+            Err(e) => fail(g.json, ExitCode::Usage, "bad_vendor_kinds", &e, None),
+        };
+    }
     if clear_policy && !policy.is_empty() {
         fail(g.json, ExitCode::Usage, "policy_conflict",
             "--policy-default clears the stored companion policy; do not combine it with --min-battery / --require-wifi / --block-thermal", None);
@@ -2595,6 +2629,13 @@ pub fn cluster_reconnect(g: &Globals, _args: &[String]) -> Result<i32, Unhandled
 
 // ── sync-model-files (ship gguf weights over the artifact rail) ─────
 
+pub(crate) fn parse_sync_model_files_with(a: &mut Args) -> Result<(Vec<String>, Vec<String>, bool), ArgError> {
+    let models = a.values(&["--model", "-m"])?;
+    let dry_run = a.flag(&["--dry-run"]);
+    let nodes = a.positionals()?;
+    Ok((nodes, models, dry_run))
+}
+
 /// `noo cluster sync-model-files [NODE…] [-m/--model FILE]… [--dry-run]` —
 /// ship gguf weights from the controller store to worker nodes. Source =
 /// $MODELS_DIR else $NOO_DATA_ROOT/models (default DEFAULT_DATA_ROOT/models).
@@ -2605,27 +2646,18 @@ pub fn cluster_reconnect(g: &Globals, _args: &[String]) -> Result<i32, Unhandled
 /// lists the jobs it would send and sends none. `-u/--user` is a retired
 /// flag (there is no account to name) and is refused.
 pub fn cluster_sync_model_files(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut want_nodes: Vec<String> = Vec::new();
-    let mut want_models: Vec<String> = Vec::new();
-    let mut dry_run = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "-m" | "--model" => want_models.push(iter.next().ok_or(Unhandled)?.clone()),
-            // `-u` chose an SSH account. There is no SSH account: the node
-            // pulls its own copy. Refusing beats silently ignoring it.
-            "-u" | "--user" => fail(
-                g.json,
-                ExitCode::Usage,
-                "user_unsupported",
-                "`--user` selected an SSH account; sync-model-files no longer pushes over SSH",
-                Some("drop the flag — each node pulls from the model cache and verifies the digest"),
-            ),
-            "--dry-run" => dry_run = true,
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => want_nodes.push(t.to_string()),
-        }
+    // `-u` chose an SSH account. There is no SSH account: the node
+    // pulls its own copy. Refusing beats silently ignoring it.
+    if args.iter().any(|t| t == "-u" || t == "--user") {
+        fail(
+            g.json,
+            ExitCode::Usage,
+            "user_unsupported",
+            "`--user` selected an SSH account; sync-model-files no longer pushes over SSH",
+            Some("drop the flag — each node pulls from the model cache and verifies the digest"),
+        );
     }
+    let (want_nodes, want_models, dry_run) = parse_sync_model_files_with(&mut Args::new(args))?;
 
     // Resolve the controller store (env already carries .env via ensure_repo_env).
     // One resolver with `noo models fetch`, so the file it downloads is the
@@ -3080,21 +3112,19 @@ fn seed_export_model_classes(classes: &serde_json::Value) -> serde_yaml::Mapping
     out
 }
 
+pub(crate) fn parse_seed_with(a: &mut Args) -> Result<(PathBuf, bool, bool), ArgError> {
+    let file = a.value(&["--file", "-f"])?.map_or_else(|| PathBuf::from("config/cluster-seed.yaml"), PathBuf::from);
+    let export = a.flag(&["--export"]);
+    let dry_run = a.flag(&["--dry-run"]);
+    a.finish()?;
+    Ok((file, export, dry_run))
+}
+
 /// `noo cluster seed [-f/--file PATH] [--export] [--dry-run]` — apply (or
 /// export) the cluster's desired state from a local seed file. The default
 /// path is relative to the CURRENT directory (Python parity).
 pub fn cluster_seed(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut file = PathBuf::from("config/cluster-seed.yaml");
-    let (mut export, mut dry_run) = (false, false);
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "-f" | "--file" => file = PathBuf::from(iter.next().ok_or(Unhandled)?),
-            "--export" => export = true,
-            "--dry-run" => dry_run = true,
-            _ => return Err(Unhandled),
-        }
-    }
+    let (file, export, dry_run) = parse_seed_with(&mut Args::new(args))?;
     // Per-item progress is narration: stderr in both modes (the human path used to print it on stdout).
 
     if export {
@@ -3608,6 +3638,19 @@ fn parse_until(s: &str) -> Option<i64> {
     n.checked_mul(mult)
 }
 
+pub(crate) fn parse_maintenance_on_with(a: &mut Args) -> Result<(String, Option<i64>), ArgError> {
+    let reason = a.value(&["--reason"])?;
+    let until_secs = match a.value(&["--until"])? {
+        None => None,
+        Some(v) => Some(
+            parse_until(&v).ok_or_else(|| ArgError::new(format!("--until needs a window like 30s, 45m, 4h or 2d, got `{v}`")))?,
+        ),
+    };
+    a.finish()?;
+    let reason = reason.filter(|r| !r.trim().is_empty()).ok_or_else(|| ArgError::new("--reason needs some text"))?;
+    Ok((reason, until_secs))
+}
+
 fn parse_maintenance_args(args: &[String]) -> Result<MaintenanceArgs, ()> {
     match args {
         [l] if l == "list" => Ok(MaintenanceArgs::List),
@@ -3615,17 +3658,7 @@ fn parse_maintenance_args(args: &[String]) -> Result<MaintenanceArgs, ()> {
             Ok(MaintenanceArgs::Off { node: node.clone() })
         }
         [node, on, rest @ ..] if on == "on" && !node.starts_with('-') => {
-            let mut reason: Option<String> = None;
-            let mut until_secs: Option<i64> = None;
-            let mut iter = rest.iter();
-            while let Some(tok) = iter.next() {
-                match tok.as_str() {
-                    "--reason" => reason = Some(iter.next().ok_or(())?.clone()),
-                    "--until" => until_secs = Some(parse_until(iter.next().ok_or(())?).ok_or(())?),
-                    _ => return Err(()),
-                }
-            }
-            let reason = reason.filter(|r| !r.trim().is_empty()).ok_or(())?;
+            let (reason, until_secs) = parse_maintenance_on_with(&mut Args::new(rest)).map_err(|_| ())?;
             Ok(MaintenanceArgs::On { node: node.clone(), reason, until_secs })
         }
         _ => Err(()),

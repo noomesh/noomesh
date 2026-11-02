@@ -289,7 +289,7 @@ see [add-ons.md](../getting-started/add-ons.md).
 | `noo memory stats` | — | Show memory storage, conversation and tool-usage statistics |
 | `noo memory health` | — | Print the memory subsystem health report |
 | `noo memory tool-stats` | `[--days <n>]` | Show tool call counts and success rates over the last N days |
-| `noo memory embed` | `[--watch]` | Start the background embedding worker, optionally watching progress |
+| `noo memory embed` | `[-w\|--watch]` | Start the background embedding worker, optionally watching progress |
 | `noo memory embed-status` | `[--watch]` | Show embedding worker state and record counts, optionally polling |
 | `noo memory embed-stop` | — | Stop the background embedding worker |
 | `noo memory conversations` | `[--user <user>] [--limit <n>]` | List recent conversations with message counts and previews |
@@ -301,14 +301,14 @@ see [add-ons.md](../getting-started/add-ons.md).
 | `noo rag status` | — | Show PageIndex RAG table counts and embedder state |
 | `noo rag docs` | `[--untagged] [--audience <role>] [--match <glob>] [--title <text>] [--limit <n>]` | List every document with audience, source and who ingested it; filterable |
 | `noo rag doc` | `<id>` | Show one document: audience, provenance, audience history and a text preview |
-| `noo rag ingest` | `<path>... [-t <title>] [-r] [--audience <role>[,<role>]]` | Ingest text files or a folder; audience defaults to you, share with team:<name> or company |
+| `noo rag ingest` | `<path>... [-t\|--title <title>] [-r\|--recursive] [--audience <role>[,<role>]]` | Ingest text files or a folder; audience defaults to you, share with team:<name> or company |
 | `noo rag scan` | `[-s\|--source folders\|drives\|all]` | Run one synchronous ingest scan of watched folders and/or drives |
 | `noo rag deduplicate` | `[--dry-run] [-y]` | Delete duplicate (doc_id, page_no) pages, keeping the newest; confirms first |
 | `noo rag retag` | `(--match <glob> \| --doc-id <id>) --role <r>[,<r>] [--relabel] [--apply] [--limit <n>]` | Change which audience documents belong to; dry-run unless --apply |
 | `noo rag hold` | `(--title-prefix <p> \| --doc <id>...) [--reason <r>] [--apply]` | Keep documents but take them out of embedding and search; dry-run unless --apply |
 | `noo rag unhold` | `(--title-prefix <p> \| --doc <id>...) [--apply]` | Make held documents eligible for embedding and search again; dry-run unless --apply |
 | `noo rag held` | `[--reason <r>] [--export <file>]` | List held documents; --export writes every held id and title to a file |
-| `noo rag purge` | `--reason <r> [--apply] [-y]` | Delete the documents held under a reason (irreversible); dry-run unless --apply |
+| `noo rag purge` | `--reason <r> [--apply] [-y\|--yes]` | Delete the documents held under a reason (irreversible); dry-run unless --apply |
 
 ### `noo recall` — Episodic recall (System 1 memory)
 | Command | Arguments | What it does |
@@ -349,8 +349,8 @@ see [add-ons.md](../getting-started/add-ons.md).
 ### `noo ops` — Asynchronous operations: long runs started as an op, polled for their result
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo ops` | `[--status <s>] [--mine] [--limit <n>]` | Hidden: same as ops list |
-| `noo ops list` | `[--status <s>] [--mine] [--limit <n>]` | List your asynchronous operations, newest first (an admin sees everyone's) |
+| `noo ops` | `[-s\|--status <s>] [--mine] [-n\|--limit <n>]` | Hidden: same as ops list |
+| `noo ops list` | `[-s\|--status <s>] [--mine] [-n\|--limit <n>]` | List your asynchronous operations, newest first (an admin sees everyone's) |
 | `noo ops show` | `<id> [--wait]` | Show one operation: status, progress, result or error; --wait blocks until it finishes |
 | `noo ops cancel` | `<id>` | Cancel an operation: stops the gateway-side wait (the worker run may continue) |
 | `noo ops types` | — | List what can run as an operation, how long each waits and how long a run may take |

@@ -65,8 +65,13 @@ impl Reach {
 
 /// Dial one node's agent the way the work does.
 pub async fn probe_node(state: &AppState, node_id: &str) -> Reach {
-    let Ok(link) = crate::node_link::NodeLink::for_node(state, node_id).await else {
-        return Reach::Unknown;
+    let own = own_agent_link(crate::self_node::is_self_node(node_id), crate::node_link::NodeLink::self_agent);
+    let link = match own {
+        Some(link) => link,
+        None => match crate::node_link::NodeLink::for_node(state, node_id).await {
+            Ok(link) => link,
+            Err(_) => return Reach::Unknown,
+        },
     };
     let req = link
         .request(reqwest::Method::GET, "/health")
@@ -81,6 +86,22 @@ pub async fn probe_node(state: &AppState, node_id: &str) -> Reach {
         Ok(r) => Reach::Failed(format!("agent answered {}", r.status())),
         Err(e) => Reach::Failed(reason(&e)),
     }
+}
+
+/// The controller's own node is reached through its self agent, the way every
+/// other call to it goes: its `mesh_nodes` record can carry no address on a
+/// standalone box (the agent dials a loopback controller and registers none),
+/// and "unknown" for the node the controller runs on helps nobody. `None`
+/// when this is another node, or the self agent has no usable address; the
+/// caller then resolves the node by its record.
+fn own_agent_link(
+    is_self: bool,
+    self_agent: impl FnOnce() -> Result<crate::node_link::NodeLink, String>,
+) -> Option<crate::node_link::NodeLink> {
+    if !is_self {
+        return None;
+    }
+    self_agent().ok()
 }
 
 /// A short, operator-facing reason. `reqwest`'s Display is a chain that
@@ -278,6 +299,23 @@ mod tests {
         assert_eq!(Reach::Ok.as_str(), "ok");
         assert_eq!(Reach::Failed("x".into()).as_str(), "failed");
         assert_eq!(Reach::Unknown.as_str(), "unknown");
+    }
+
+    #[test]
+    fn the_controllers_own_node_is_probed_through_the_self_agent() {
+        let link = own_agent_link(true, || Ok(crate::node_link::NodeLink::self_agent_at("https://self:8081".into())));
+        assert_eq!(link.map(|l| l.base().to_string()).as_deref(), Some("https://self:8081"));
+    }
+
+    #[test]
+    fn another_node_never_asks_for_the_self_agent() {
+        let link = own_agent_link(false, || panic!("the self agent is for the controller's own node only"));
+        assert!(link.is_none());
+    }
+
+    #[test]
+    fn a_self_agent_without_an_address_falls_back_to_the_record() {
+        assert!(own_agent_link(true, || Err("localhost controller URL".into())).is_none());
     }
 
     #[test]

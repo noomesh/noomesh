@@ -20519,6 +20519,327 @@
           }
         }
       }
+    },
+    "/api/addons/{addon}/access": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Add-on access settings",
+        "description": "[native] The add-on's declared features, every on/off setting, stale settings and the super admins (noomesh-internal f99). Operator or above.",
+        "operationId": "addon_access_get",
+        "parameters": [
+          {
+            "name": "addon",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Add-on name."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Set add-on feature access",
+        "description": "[native] Turn one feature on, off or back to inherit for a subject (role:<tier>, team:<name>, user:<account>, key:<consumer>). Admin; a setting that covers an admin is a super admin's, and turning one off needs a reason. Audited (addon_access_set).",
+        "operationId": "addon_access_set",
+        "parameters": [
+          {
+            "name": "addon",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Add-on name."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "feature",
+                  "subject",
+                  "value"
+                ],
+                "properties": {
+                  "feature": {
+                    "type": "string"
+                  },
+                  "subject": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "type": "string",
+                    "enum": [
+                      "on",
+                      "off",
+                      "inherit"
+                    ]
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/security/users/{username}/addon-access": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Add-on access of one account",
+        "description": "[native] Every declared feature of every add-on, on or off for the account, and the setting that decided it. Operator or above.",
+        "operationId": "security_user_addon_access",
+        "parameters": [
+          {
+            "name": "username",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Account name."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/security/users/{username}/super-admin": {
+      "put": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Name or remove a super admin",
+        "description": "[native] A super admin holds every add-on feature and alone changes settings that cover an admin. Only a super admin may call this, re-entering their own password; never an agent or door token; the last super admin cannot be removed. Audited (super_admin_set).",
+        "operationId": "security_user_super_admin",
+        "parameters": [
+          {
+            "name": "username",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Account name."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "on",
+                  "reason",
+                  "password"
+                ],
+                "properties": {
+                  "on": {
+                    "type": "boolean"
+                  },
+                  "reason": {
+                    "type": "string"
+                  },
+                  "password": {
+                    "type": "string",
+                    "format": "password"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/grafana-ds/tempo/{*path}": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get tempo",
+        "description": "[native] `GET /api/grafana-ds/tempo/{*path}` \u2014 Grafana's Tempo data source (i359), through the gateway. Grafana's service leaf only. Shaped as Tempo's read API (`api/search`, `api/v2/traces/<id>`, tag values): an operator or admin gets it; a read-only account, and Grafana with no user, get nothing, since a trace names who made each request. Never the OTLP push.",
+        "operationId": "tempo",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/traces/status": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get status",
+        "description": "[native] Request-trace status (i359): where the gateway sends spans, and whether Tempo's query API answers `/ready` to the gateway's leaf. The `tempo` row of `noo cluster verify --controller` reads this.",
+        "operationId": "traces_status",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/traces/requests": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get requests",
+        "description": "[native] `GET /api/traces/requests` \u2014 recent requests from `noo_request_trace`, newest first. Filters: `hours` (default 24, max 720), `route`, `model`, `node`, `actor`, `min_status`, `min_ms`, `limit` (default 100, max 1000). Each row: when, trace id (look it up in Grafana's Tempo data source), method, route template, status, duration, actor, model, backend, node, tokens, span count and sizes. Operator/Admin only.",
+        "operationId": "requests",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/traces/summary": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get summary",
+        "description": "[native] `chat:gemma4:26b \u00b7 embed:harrier` - what a node serves, for one line. A placed-but-missing model shows as such; a stopped one is omitted.",
+        "operationId": "summary",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/nodes/{node_id}/traces": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create traces",
+        "description": "[native] Node span ingest: a node-agent sends the spans of the requests it served, continuing the gateway's traces, and the gateway relays them to Tempo stamped with the verified node.",
+        "operationId": "node_traces_ingest",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

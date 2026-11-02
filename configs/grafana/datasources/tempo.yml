@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+apiVersion: 1
+
+# Tempo (request traces, i359), THROUGH THE GATEWAY, never https://tempo
+# directly — the same door as Loki (see loki.yml). The gateway admits only
+# Grafana's service leaf, reads X-Grafana-User, and answers operators and
+# admins only: a trace names every account's requests. Read API only.
+# `noo cluster verify --controller` FAILs its "grafana door" row if this URL
+# dials Tempo directly, and tests/test_grafana_sso_parity.py fails the build.
+datasources:
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: https://gateway:8080/api/grafana-ds/tempo
+    isDefault: false
+    editable: false
+    jsonData:
+      tlsAuth: true
+      tlsAuthWithCACert: true
+      # Plain HTTP reads only: the gateway proxies Tempo's HTTP read API,
+      # not its gRPC streaming search.
+      streamingEnabled:
+        search: false
+        metrics: false
+      # From a span to the gateway's log lines around it.
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: "-1m"
+        spanEndTimeShift: "1m"
+    secureJsonData:
+      tlsCACert: $__file{/app/pki/ca.crt}
+      tlsClientCert: $__file{/app/pki/services/grafana/service.crt}
+      tlsClientKey: $__file{/app/pki/services/grafana/service.key}

@@ -58,7 +58,7 @@ ARG UI_IMAGE=ghcr.io/noomesh/mesh-ui-web:latest
 # another stage's body.)
 FROM ${UI_IMAGE} AS ui
 
-FROM ${DHI_REGISTRY}/rust:1-debian13-dev AS builder
+FROM ${DHI_REGISTRY}/rust:1-debian13-dev@sha256:be6c6ec91c61ae15b80521052df1c7f60fefd303293563b3dbd9f57e58783809 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*

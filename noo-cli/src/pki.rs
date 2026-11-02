@@ -428,6 +428,7 @@ pub const SERVICE_KEY_READERS: &[(&str, KeyReader)] = &[
     ("reranker", KeyReader::ContainerUid(65532)),
     // DHI runtime images: nonroot 65532.
     ("loki", KeyReader::ContainerUid(65532)),
+    ("tempo", KeyReader::ContainerUid(65532)),
     ("prometheus", KeyReader::ContainerUid(65532)),
     ("alertmanager", KeyReader::ContainerUid(65532)),
     ("node-exporter", KeyReader::ContainerUid(65532)),

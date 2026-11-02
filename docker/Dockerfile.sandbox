@@ -109,9 +109,14 @@ ENTRYPOINT ["python", "/opt/entrypoint.py"]
 
 USER sandbox-server
 
-EXPOSE 8080
+EXPOSE 9000
 
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-    CMD python -c "import urllib.request,ssl; ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE; urllib.request.urlopen('https://localhost:8080/health',context=ctx,timeout=5)" || exit 1
+# No probe of its own. Everything a probe needs comes from compose: the
+# port and TLS flags on the uvicorn command, the CA and leaf mounted under
+# /tls, and the root-then-setpriv start that decides who may read the key.
+# The image used to carry a probe of :8080 with verification off, a port
+# nothing listens on; compose's verified probe always replaced it. Compose
+# keeps the one probe (docker-compose.cluster.yml `sandbox-health`).
+HEALTHCHECK NONE
 
 CMD []

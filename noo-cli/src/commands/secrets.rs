@@ -7555,7 +7555,7 @@ mod provision_tests {
         l.files = files.iter().map(|(n, b)| (n.clone(), crate::addon_lock::sha256_ref(b))).collect();
         let (bytes, sig) = crate::addon_lock::sign(&l, &resolve::tests::seed()).unwrap();
         let f = crate::addons::lock_fetch::Fetched { lock: bytes, sig, files };
-        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, pin: None, allow_downgrade: false };
         let v = resolve::check(&f, &resolve::tests::anchor(), &want).unwrap();
         resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0", None).unwrap();
 
@@ -7607,7 +7607,7 @@ mod provision_tests {
         l.files = files.iter().map(|(n, b)| (n.clone(), crate::addon_lock::sha256_ref(b))).collect();
         let (bytes, sig) = crate::addon_lock::sign(&l, &resolve::tests::seed()).unwrap();
         let f = crate::addons::lock_fetch::Fetched { lock: bytes, sig, files: files.clone() };
-        let want = resolve::Want { addon, stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let want = resolve::Want { addon, stack_tag: "v0.6.0", stack_lock: None, pinned: None, pin: None, allow_downgrade: false };
         let v = resolve::check(&f, &resolve::tests::anchor(), &want).unwrap();
         resolve::record(&d, addon, &v, &f, "v0.6.0", None).unwrap();
 

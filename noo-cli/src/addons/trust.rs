@@ -61,10 +61,16 @@
 //! to `addons.lock`, and the launcher's verdict covering it.
 //!
 //! Limits, stated because they differ from a built-in add-on:
-//! - images and the lock artifact are fetched ANONYMOUSLY. The controller's
+//! - images and the lock artifact are fetched ANONYMOUSLY unless the operator
+//!   registered a credential for the add-on (below). The controller's
 //!   `NOO_ADDON_REGISTRY_TOKEN` is the vendor's credential and is never sent
-//!   to a registry the operator named; a private third-party registry is not
-//!   supported yet.
+//!   to a registry the operator named.
+//! - a private package: `noo addons registry-login <name> --registry <root>`
+//!   stores a read-only token for THAT add-on in the secret store
+//!   (`NOO_ADDON_REGISTRY_CRED_<NAME>`) and records beside its trust entry only
+//!   that one exists and the root it is bound to (`registry_credential.root`).
+//!   `<root>` must be exactly the root the entry trusts. The token is sent to
+//!   that root and nowhere else; `untrust-key` removes it with the entry.
 //! - the controller pulls from the trusted `registry` root only (no `pull`
 //!   proxy root); a lock whose images sit outside it is refused.
 //! - a lock supplied with `--lock` must have its bundle files beside it.
@@ -83,6 +89,9 @@ pub const TRUST_SECTION: &str = "addon_trust";
 pub const DEV_KEYS: &str = "dev_keys";
 /// The longest a development key may be trusted for: 30 days.
 pub const DEV_MAX_SECS: i64 = 30 * 86_400;
+/// The key under `addon_trust.<name>` recording that a pull credential is
+/// stored for it: `{root: <registry root it is bound to>}`. Never the value.
+pub const REGISTRY_CREDENTIAL: &str = "registry_credential";
 /// The noomesh.yaml section holding per-add-on delegation switches.
 pub const DELEGATION_SECTION: &str = "addon_delegation";
 
@@ -209,6 +218,24 @@ pub fn trusted_anchor(name: &str) -> Result<Option<TrustAnchor>, String> {
     Ok(read(&text)?.remove(name))
 }
 
+/// The root `name`'s stored pull credential is bound to, from a noomesh.yaml
+/// TEXT. `None`: none is recorded.
+pub fn credential_root(text: &str, name: &str) -> Option<String> {
+    let doc: Value = serde_yaml::from_str(text).ok()?;
+    let root = doc.get(TRUST_SECTION)?.get(name)?.get(REGISTRY_CREDENTIAL)?.get("root")?.as_str()?.trim();
+    (!root.is_empty()).then(|| root.to_string())
+}
+
+/// [`credential_root`] for this install's noomesh.yaml. `Err` = unreadable.
+pub fn installed_credential_root(name: &str) -> Result<Option<String>, String> {
+    let path = crate::commands::addons::config_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    Ok(credential_root(&text, name))
+}
+
 /// Third-party add-on names the operator trusts a key for, in noomesh.yaml TEXT.
 pub fn trusted_names(text: &str) -> Vec<String> {
     read(text).map(|m| m.into_keys().filter(|n| !is_builtin(n)).collect()).unwrap_or_default()
@@ -277,6 +304,57 @@ fn section_mapping(text: &str, section: &str) -> Result<Mapping, String> {
         Some(Value::Mapping(m)) => Ok(m.clone()),
         Some(_) => Err(format!("{section} must be a map")),
     }
+}
+
+/// `text` with a pull credential recorded for `name`, bound to `root`. The
+/// add-on must hold a trust entry, and `root` must be exactly the registry
+/// root that entry trusts (a path under it, or a parent, is refused: the
+/// credential travels to the route's root, which is the trusted one).
+pub fn set_credential(text: &str, name: &str, root: &str) -> Result<String, String> {
+    if !name_ok(name) {
+        return Err(format!("`{name}` is not an add-on name (lowercase letters, digits, `-` and `_`, starting with a letter)"));
+    }
+    if is_builtin(name) {
+        return Err(format!("{name} ships with the stack and is pulled with its own licence; it takes no registry credential here"));
+    }
+    let root = root.trim();
+    let mut sec = section_mapping(text, TRUST_SECTION)?;
+    let k = Value::String(name.to_string());
+    let Some(mut entry) = sec.get(&k).and_then(Value::as_mapping).cloned() else {
+        return Err(format!(
+            "{name} has no trust entry, so there is no registry to bind a credential to. Trust its signer first: \
+             `noo addons trust-key {name} <pubkey> --registry {root}`"
+        ));
+    };
+    let trusted = entry.get("registry").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if trusted != root {
+        return Err(format!(
+            "{name} trusts the registry root {trusted:?}, not {root:?}. A credential is bound to exactly the root the trust \
+             entry names: pass `--registry {trusted}`"
+        ));
+    }
+    let clash = sec.keys().filter_map(Value::as_str).find(|n| *n != name && super::lock_fetch::cred_key(n) == super::lock_fetch::cred_key(name));
+    if let Some(other) = clash {
+        return Err(format!("{other} is trusted too and would share {name}'s credential slot ({}); rename one of them", super::lock_fetch::cred_key(name)));
+    }
+    let mut rec = Mapping::new();
+    rec.insert(Value::String("root".into()), Value::String(root.to_string()));
+    entry.insert(Value::String(REGISTRY_CREDENTIAL.into()), Value::Mapping(rec));
+    sec.insert(k, Value::Mapping(entry));
+    Ok(replace_section(text, TRUST_SECTION, Some(&Value::Mapping(sec))))
+}
+
+/// `text` without the credential record under `name`'s trust entry (no-op
+/// when there is none).
+pub fn clear_credential(text: &str, name: &str) -> Result<String, String> {
+    let mut sec = section_mapping(text, TRUST_SECTION)?;
+    let k = Value::String(name.to_string());
+    let Some(mut entry) = sec.get(&k).and_then(Value::as_mapping).cloned() else { return Ok(text.to_string()) };
+    if entry.remove(REGISTRY_CREDENTIAL).is_none() {
+        return Ok(text.to_string());
+    }
+    sec.insert(k, Value::Mapping(entry));
+    Ok(replace_section(text, TRUST_SECTION, Some(&Value::Mapping(sec))))
 }
 
 /// `text` with `key` trusted for `name`. A first key needs `registry`.
@@ -605,7 +683,7 @@ mod tests {
     }
 
     fn want<'a>(tag: &'a str) -> Want<'a> {
-        Want { addon: "pai-voice", stack_tag: tag, stack_lock: None, pinned: None, allow_downgrade: false }
+        Want { addon: "pai-voice", stack_tag: tag, stack_lock: None, pinned: None, pin: None, allow_downgrade: false }
     }
 
     #[test]
@@ -695,6 +773,59 @@ mod tests {
         let why = r.why("grafana");
         assert!(why.contains("`grafana` is a core service"), "{why}");
         assert!(docker.pulls.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A signed third-party bundle of `rhaddon` carrying `routes` as its
+    /// routes.json beside an empty overlay.
+    fn signed_with_routes(routes: &str) -> crate::addons::lock_fetch::Fetched {
+        use crate::addon_lock;
+        let mut l = third_party_lock(&["v0.6.0"]);
+        l.addon = "rhaddon".into();
+        l.format = addon_lock::FORMAT_V2.into();
+        let files = std::collections::BTreeMap::from([
+            (addon_lock::OVERLAY_FILE.to_string(), b"services: {}\n".to_vec()),
+            ("routes.json".to_string(), routes.as_bytes().to_vec()),
+        ]);
+        l.files = files.iter().map(|(n, b)| (n.clone(), addon_lock::sha256_ref(b))).collect();
+        let (lock, sig) = addon_lock::sign(&l, &seed()).unwrap();
+        crate::addons::lock_fetch::Fetched { lock, sig, files }
+    }
+
+    /// The pin path (`noo addons enable | upgrade`) runs the gateway's own
+    /// routes.json validator (`addon_manifest::validate`) on the verified
+    /// bundle BEFORE an image is pulled or a pin written: an unknown role word
+    /// is refused with the gateway's sentence and nothing changes. (The
+    /// 2026-10-31 case, `owner_scoped` on a GET, is legal since f99.)
+    /// A valid manifest still prepares. Reverting the `refuse_bad_routes`
+    /// call in `prepare_from` makes the refused case prepare.
+    #[test]
+    fn prepare_from_refuses_a_routes_json_the_gateway_refuses_before_any_change() {
+        use crate::addons::{self, lock_fetch::Client};
+        let client = Client::new(None);
+        let root = std::env::temp_dir().join(format!("noo-trust-routes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("docker-compose.cluster.yml"), "services:\n  gateway:\n    image: g\n").unwrap();
+        let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &client };
+        let good = include_str!("../../../tests/fixtures/addons/rhaddon/routes.json");
+        let mut m: serde_json::Value = serde_json::from_str(good).unwrap();
+        m["routes"].as_array_mut().unwrap().push(serde_json::json!({
+            "name": "get_v1_workspace", "method": "GET", "path": "/api/rhaddon/v1/workspace", "min_role": "everyone"
+        }));
+        let bad = m.to_string();
+        let gateway = addon_manifest::validate(&addon_manifest::parse(&bad).unwrap(), "rhaddon", addon_manifest::FrontDoor::NotHere).unwrap_err();
+        assert!(gateway.contains("is not a role") && gateway.contains("get_v1_workspace"), "{gateway}");
+        let mut docker = FakeDocker::default();
+        let r = addons::prepare_from(&ctx, "rhaddon", &anchor(), Some(signed_with_routes(&bad)), &mut docker).expect_err("refused");
+        let why = r.why("rhaddon");
+        assert!(matches!(r, Refusal::Decl(_)) && why.contains(&gateway) && why.contains("nothing was changed"), "{why}");
+        assert!(docker.pulls.is_empty(), "nothing is pulled for a refused bundle: {:?}", docker.pulls);
+        assert!(!addons::pins::pins_path(&root).exists(), "no pins file is written");
+        assert!(!addons::pins::read(&root).unwrap().contains_key("rhaddon"), "nothing is pinned");
+        // The same bundle with a valid manifest prepares (and pulls).
+        let mut docker = FakeDocker::default();
+        addons::prepare_from(&ctx, "rhaddon", &anchor(), Some(signed_with_routes(good)), &mut docker).expect("prepared");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -856,5 +987,211 @@ mod tests {
         let r = resolve::check(&f, &dev_anchor(past), &want("v0.6.0")).expect_err("expired");
         let why = r.why("pai-voice");
         assert!(why.contains("expired") && why.contains("--dev --expires"), "{why}");
+    }
+
+    // ── a per-add-on registry credential (i277h) ────────────────────────
+
+    const TOKEN: &str = "ghp_s3cr3tPullToken";
+
+    fn rh_lock() -> crate::addon_lock::AddonLock {
+        let mut l = third_party_lock(&["v0.6.0"]);
+        l.addon = "rhaddon".into();
+        l
+    }
+
+    fn trusted_text() -> String {
+        add_key("addons:\n  rhaddon: true\n", "rhaddon", &pk(), Some(ROOT)).unwrap()
+    }
+
+    fn bound_client() -> crate::addons::lock_fetch::Client {
+        use crate::addons::lock_fetch::{Bound, Client, Credential};
+        let cred = Credential { user: "noo".into(), token: TOKEN.into() };
+        Client::plain_http_for_tests(None).with_bound(Some(Bound { addon: "rhaddon".into(), root: ROOT.into(), cred }))
+    }
+
+    fn prep_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("noo-trust-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("docker-compose.cluster.yml"), "services:\n  gateway:\n    image: g\n").unwrap();
+        root
+    }
+
+    /// A third-party pull with a stored credential asks docker for ONE login, to
+    /// the bound root's host, and says so. Without the binding it is anonymous.
+    #[test]
+    fn a_stored_credential_is_presented_once_to_the_bound_root() {
+        use crate::addons;
+        let root = prep_root("cred-pull");
+        let bc = bound_client();
+        let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &bc };
+        let mut docker = FakeDocker::default();
+        let f = signed_bundle(&rh_lock());
+        let p = addons::prepare_with(&ctx, "rhaddon", &anchor(), Some(f), &mut docker, &bc).expect("prepared");
+        assert_eq!(docker.pulls.len(), 1, "one login and pull for the one root: {:?}", docker.pulls);
+        assert_eq!(docker.pulls[0].0, "ghcr.io");
+        assert!(docker.pulls[0].2, "the credential reached the pull");
+        assert_eq!(p.via, format!("via {ROOT} (credential for rhaddon)"));
+        // The same pull without the binding is anonymous (the old behaviour).
+        let mut anon = FakeDocker::default();
+        let plain = crate::addons::lock_fetch::Client::plain_http_for_tests(None);
+        let f = signed_bundle(&rh_lock());
+        addons::prepare_with(&ctx, "rhaddon", &anchor(), Some(f), &mut anon, &plain).expect("prepared");
+        assert!(anon.pulls.iter().all(|(_, _, had)| !had), "{:?}", anon.pulls);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The token is on docker's stdin, never in argv; the throwaway config
+    /// directory is the only thing the command line names.
+    #[test]
+    fn docker_login_takes_the_token_on_stdin_never_in_argv() {
+        let dir = std::path::Path::new("/run/noo/.runtime/cfg-1");
+        let login = resolve::login_args(dir, "ghcr.io", "noo");
+        assert!(login.contains(&"--password-stdin".to_string()), "{login:?}");
+        assert!(login[0] == "--config" && login[1] == dir.display().to_string(), "{login:?}");
+        let pull = resolve::pull_args(dir, "ghcr.io/example/intel@sha256:aa");
+        assert!(login.iter().chain(&pull).all(|a| !a.contains(TOKEN) && a != "--password"), "{login:?} {pull:?}");
+        assert!(pull.contains(&"--config".to_string()), "a pull never reads the operator's own docker login");
+    }
+
+    /// The credential is in the secret store only: not the pins file, not the
+    /// cached lock, not the materialised bundle directory.
+    #[test]
+    fn the_credential_is_in_neither_the_pins_file_nor_the_lock_cache() {
+        use crate::addons;
+        let root = prep_root("cred-cache");
+        let bc = bound_client();
+        let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &bc };
+        let f = signed_bundle(&rh_lock());
+        let p = addons::prepare_with(&ctx, "rhaddon", &anchor(), Some(f), &mut FakeDocker::default(), &bc).unwrap();
+        addons::commit(&root, &p, "v0.6.0").unwrap();
+        fn walk(d: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() { walk(&p, out) } else { out.push(p) }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        assert!(files.iter().any(|f| f.ends_with(addons::pins::PINS_FILE)), "the pins file was written: {files:?}");
+        for f in files {
+            let bytes = std::fs::read(&f).unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains(TOKEN), "{} holds the credential", f.display());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A private package with no credential: the refusal says so and names the
+    /// verb. With a credential the registry still refuses: a different message.
+    #[test]
+    fn a_refused_private_pull_names_the_verb_and_tells_set_from_unset() {
+        use crate::addons;
+        let root = prep_root("cred-refused");
+        let plain = crate::addons::lock_fetch::Client::plain_http_for_tests(None);
+        let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &plain };
+        let run = |client: &crate::addons::lock_fetch::Client| {
+            let mut docker = FakeDocker { fail_pull: true, ..Default::default() };
+            let f = signed_bundle(&rh_lock());
+            addons::prepare_with(&ctx, "rhaddon", &anchor(), Some(f), &mut docker, client).expect_err("refused")
+        };
+        let verb = format!("noo addons registry-login rhaddon --registry {ROOT}");
+        let unset = run(&plain);
+        assert!(matches!(unset, Refusal::PullAuth { credential_set: false, .. }), "{unset:?}");
+        let why = unset.why("rhaddon");
+        assert!(why.contains(&verb) && why.contains("no credential is set"), "{why}");
+        assert_eq!(unset.registry_login_fix("rhaddon").as_deref(), Some(verb.as_str()));
+        let set = run(&bound_client());
+        assert!(matches!(set, Refusal::PullAuth { credential_set: true, .. }), "{set:?}");
+        let why = set.why("rhaddon");
+        assert!(why.contains(&verb) && why.contains("refused the credential stored") && !why.contains(TOKEN), "{why}");
+        // The lock fetch itself, refused for access, says the same.
+        let fetch = Refusal::Fetch {
+            reference: format!("{ROOT}:stack-v0.6.0"),
+            stack_tag: "v0.6.0".into(),
+            err: Box::new(crate::release_fetch::FetchError::new(crate::release_fetch::FetchClass::Auth, "x")),
+            via: None,
+        };
+        assert!(fetch.why("rhaddon").contains(&verb), "{}", fetch.why("rhaddon"));
+        assert_eq!(fetch.registry_login_fix("rhaddon").as_deref(), Some(verb.as_str()));
+        // A public package still pulls anonymously (the existing contract).
+        let mut ok = FakeDocker::default();
+        let f = signed_bundle(&rh_lock());
+        assert!(addons::prepare_with(&ctx, "rhaddon", &anchor(), Some(f), &mut ok, &plain).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The binding decision: only a record bound to the root trusted now is
+    /// used, and a record the store cannot back is loud.
+    #[test]
+    fn the_client_binds_only_a_record_for_the_trusted_root() {
+        use crate::addons::{bound_for, lock_fetch::{Bound, Credential}};
+        let cred = |root: &str| Bound { addon: "rhaddon".into(), root: root.into(), cred: Credential { user: "noo".into(), token: TOKEN.into() } };
+        let never = |_: &str| -> Result<Option<Bound>, String> { panic!("the store is not read without a record") };
+        assert!(bound_for("rhaddon", &anchor(), None, &never).unwrap().is_none());
+        assert!(bound_for("rhaddon", &anchor(), Some("ghcr.io/other/place"), &never).unwrap().is_none(), "bound elsewhere: unused");
+        let b = bound_for("rhaddon", &anchor(), Some(ROOT), &|r| Ok(Some(cred(r)))).unwrap().unwrap();
+        assert_eq!(b.root, ROOT);
+        let e = bound_for("rhaddon", &anchor(), Some(ROOT), &|_| Ok(None)).unwrap_err();
+        assert!(e.contains("noo addons registry-login rhaddon") && e.contains("NOO_ADDON_REGISTRY_CRED_RHADDON"), "{e}");
+        assert!(bound_for("rhaddon", &anchor(), Some(ROOT), &|_| Err("sops: no key".into())).is_err());
+    }
+
+    #[test]
+    fn the_trust_entry_records_that_a_credential_exists_and_its_root_never_the_value() {
+        let t = trusted_text();
+        let set = set_credential(&t, "rhaddon", ROOT).unwrap();
+        assert_eq!(credential_root(&set, "rhaddon").as_deref(), Some(ROOT));
+        assert_eq!(read(&set).unwrap()["rhaddon"].keys, vec![pk()], "the keys are untouched");
+        assert!(!set.contains(TOKEN));
+        assert_eq!(credential_root(&t, "rhaddon"), None);
+        // Cleared again: no record, the trust entry stays.
+        let cleared = clear_credential(&set, "rhaddon").unwrap();
+        assert_eq!(credential_root(&cleared, "rhaddon"), None);
+        assert_eq!(read(&cleared).unwrap()["rhaddon"].keys, vec![pk()]);
+        assert_eq!(clear_credential(&cleared, "rhaddon").unwrap(), cleared, "clearing nothing changes nothing");
+    }
+
+    #[test]
+    fn registry_login_refuses_what_it_cannot_bind() {
+        let t = trusted_text();
+        // No trust entry.
+        let e = set_credential("addons:\n  rhaddon: true\n", "rhaddon", ROOT).unwrap_err();
+        assert!(e.contains("no trust entry") && e.contains("trust-key"), "{e}");
+        // Not the trusted root: another host, a path under it, a parent of it.
+        for bad in ["evil.example/example/intel", "ghcr.io/example/intel/sub", "ghcr.io/example"] {
+            let e = set_credential(&t, "rhaddon", bad).unwrap_err();
+            assert!(e.contains("--registry ghcr.io/example/intel"), "{bad}: {e}");
+        }
+        // A built-in add-on is pulled with its licence.
+        assert!(set_credential(&t, "evolve", ROOT).unwrap_err().contains("ships with the stack"));
+        // Two names that share one store slot are refused.
+        let one = add_key("addons:\n  rhaddon: true\n", "rh-addon", &pk(), Some(ROOT)).unwrap();
+        let both = add_key(&one, "rh_addon", &pk(), Some(ROOT)).unwrap();
+        assert!(set_credential(&both, "rh-addon", ROOT).unwrap_err().contains("NOO_ADDON_REGISTRY_CRED_RH_ADDON"));
+    }
+
+    /// Removing the last key removes the entry, and the credential record with it.
+    #[test]
+    fn untrusting_the_last_key_takes_the_credential_record_with_it() {
+        let set = set_credential(&trusted_text(), "rhaddon", ROOT).unwrap();
+        let gone = remove_key(&set, "rhaddon", &pk()).unwrap();
+        assert!(credential_root(&gone, "rhaddon").is_none() && !gone.contains("registry_credential"), "{gone}");
+        assert!(!read(&gone).unwrap().contains_key("rhaddon"));
+        // With a key left, the entry (and its credential) stays.
+        let two = add_key(&set, "rhaddon", &pk2(), None).unwrap();
+        let one = remove_key(&two, "rhaddon", &pk2()).unwrap();
+        assert_eq!(credential_root(&one, "rhaddon").as_deref(), Some(ROOT));
+    }
+
+    #[test]
+    fn list_shows_set_or_not_set_never_the_value() {
+        use crate::commands::addons::credential_cell;
+        let t = trusted_text();
+        assert_eq!(credential_cell(&t, "rhaddon"), "not set");
+        let set = set_credential(&t, "rhaddon", ROOT).unwrap();
+        assert_eq!(credential_cell(&set, "rhaddon"), format!("set ({ROOT})"));
+        // Re-trusted on another root since: shown, and not used.
+        let moved = set.replace(&format!("registry: {ROOT}"), "registry: ghcr.io/example/moved");
+        assert!(credential_cell(&moved, "rhaddon").contains("NOT the trusted root"), "{}", credential_cell(&moved, "rhaddon"));
     }
 }

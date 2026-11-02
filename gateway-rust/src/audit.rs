@@ -116,6 +116,7 @@ impl From<String> for Outcome {
 /// `routes::core` (an add-on, or a site that was missed, still writes a row).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AuditKind {
+    AddonAccessSet,
     AgentArchiveDecrypt,
     AgentKeyRegistered,
     ApprovalDecision,
@@ -207,6 +208,7 @@ pub(crate) enum AuditKind {
     ServiceKeySetQuota,
     SettingFlagSet,
     StackRebuild,
+    SuperAdminSet,
     TailnetEnrollAdmitted,
     TailnetEnrollDenied,
     TaskAnswered,
@@ -242,6 +244,7 @@ impl AuditKind {
     /// The `event_type` column value.
     pub(crate) fn as_str(&self) -> &str {
         match self {
+            Self::AddonAccessSet => "addon_access_set",
             Self::AgentArchiveDecrypt => "agent_archive_decrypt",
             Self::AgentKeyRegistered => "agent_key_registered",
             Self::ApprovalDecision => "approval_decision",
@@ -333,6 +336,7 @@ impl AuditKind {
             Self::ServiceKeySetQuota => "service_key_set_quota",
             Self::SettingFlagSet => "setting_flag_set",
             Self::StackRebuild => "stack_rebuild",
+            Self::SuperAdminSet => "super_admin_set",
             Self::TailnetEnrollAdmitted => "tailnet_enroll_admitted",
             Self::TailnetEnrollDenied => "tailnet_enroll_denied",
             Self::TaskAnswered => "task_answered",
@@ -369,6 +373,7 @@ impl AuditKind {
     /// [`AuditEvent::severity`].
     pub(crate) fn default_severity(&self) -> Severity {
         match self {
+            Self::AddonAccessSet => Severity::Info,
             Self::AgentArchiveDecrypt => Severity::Warning,
             Self::AgentKeyRegistered => Severity::Info,
             Self::ApprovalDecision => Severity::Info,
@@ -460,6 +465,7 @@ impl AuditKind {
             Self::ServiceKeySetQuota => Severity::Info,
             Self::SettingFlagSet => Severity::Info,
             Self::StackRebuild => Severity::Warning,
+            Self::SuperAdminSet => Severity::Warning,
             Self::TailnetEnrollAdmitted => Severity::Warning,
             Self::TailnetEnrollDenied => Severity::Warning,
             Self::TaskAnswered => Severity::Info,
@@ -493,6 +499,7 @@ impl AuditKind {
     /// The kind a wire string names; an unknown string is `Other`.
     pub(crate) fn from_wire(s: &str) -> Self {
         match s {
+            "addon_access_set" => Self::AddonAccessSet,
             "agent_archive_decrypt" => Self::AgentArchiveDecrypt,
             "agent_key_registered" => Self::AgentKeyRegistered,
             "approval_decision" => Self::ApprovalDecision,
@@ -584,6 +591,7 @@ impl AuditKind {
             "service_key_set_quota" => Self::ServiceKeySetQuota,
             "setting_flag_set" => Self::SettingFlagSet,
             "stack_rebuild" => Self::StackRebuild,
+            "super_admin_set" => Self::SuperAdminSet,
             "tailnet_enroll_admitted" => Self::TailnetEnrollAdmitted,
             "tailnet_enroll_denied" => Self::TailnetEnrollDenied,
             "task_answered" => Self::TaskAnswered,
@@ -618,6 +626,7 @@ impl AuditKind {
     #[cfg(test)]
     fn known() -> Vec<Self> {
         vec![
+            Self::AddonAccessSet,
             Self::AgentArchiveDecrypt,
             Self::AgentKeyRegistered,
             Self::ApprovalDecision,
@@ -709,6 +718,7 @@ impl AuditKind {
             Self::ServiceKeySetQuota,
             Self::SettingFlagSet,
             Self::StackRebuild,
+            Self::SuperAdminSet,
             Self::TailnetEnrollAdmitted,
             Self::TailnetEnrollDenied,
             Self::TaskAnswered,
@@ -1125,6 +1135,7 @@ mod tests {
     /// rows, alerts and `noo security audit` filters match on these strings.
     /// (Derived from the call sites on origin/dev: 117 distinct strings.)
     const PINNED: &[&str] = &[
+        "addon_access_set",
         "agent_archive_decrypt",
         "agent_key_registered",
         "approval_decision",
@@ -1216,6 +1227,7 @@ mod tests {
         "service_key_set_quota",
         "setting_flag_set",
         "stack_rebuild",
+        "super_admin_set",
         "tailnet_enroll_admitted",
         "tailnet_enroll_denied",
         "task_answered",
@@ -1266,7 +1278,7 @@ mod tests {
         let mut want: Vec<String> = PINNED.iter().map(|s| s.to_string()).collect();
         want.sort();
         assert_eq!(got, want, "a kind was renamed, added or dropped: edit PINNED on purpose");
-        assert_eq!(PINNED.len(), 117);
+        assert_eq!(PINNED.len(), 119);
     }
 
     #[test]

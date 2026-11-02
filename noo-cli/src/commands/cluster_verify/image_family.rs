@@ -3,7 +3,7 @@
 
 //! The "image family" controller row.
 //!
-//! The six third-party runtime services (redis and the monitoring set) pull
+//! The seven third-party runtime services (redis and the monitoring set) pull
 //! `${NOO_BASE_REGISTRY}/<name>:<tag>`. Two image families are published
 //! under the SAME names and tags: the DHI mirrors at `ghcr.io/noomesh/dhi/`
 //! and the upstream official images at `ghcr.io/noomesh/`. Every service key
@@ -35,7 +35,8 @@ use std::process::Command;
 pub(crate) const NAME: &str = "image family";
 
 /// The compose services that pull through `NOO_BASE_REGISTRY`.
-pub(crate) const RUNTIME_SERVICES: [&str; 6] = ["redis", "loki", "prometheus", "alertmanager", "grafana", "node-exporter"];
+pub(crate) const RUNTIME_SERVICES: [&str; 7] =
+    ["redis", "loki", "prometheus", "alertmanager", "grafana", "node-exporter", "tempo"];
 
 /// One running runtime container, as `docker inspect` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -479,6 +480,7 @@ mod tests {
             live("alertmanager", format!("{base}/alertmanager:0"), "65532:65532", 65532),
             live("grafana", format!("{base}/grafana:12-debian13-dev"), "grafana", 65532),
             live("node-exporter", format!("{base}/node-exporter:1"), "nonroot", 65532),
+            live("tempo", format!("{base}/tempo:2"), "65532", 65532),
         ]
     }
 

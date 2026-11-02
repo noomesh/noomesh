@@ -78,6 +78,7 @@
 //! exceeds its pin or a new file calls sqlx. Lower a count when you move a
 //! query in; never raise one.
 
+pub mod addon_access;
 pub mod agent_messages;
 pub mod agent_recipients;
 pub mod audit;
@@ -87,6 +88,7 @@ pub mod graph;
 pub mod heartbeat;
 pub mod kb_grants;
 pub mod prompt_skills;
+pub mod request_trace;
 pub mod settings;
 pub mod tasks;
 pub mod prompt_skill_proposals;

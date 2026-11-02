@@ -119,9 +119,6 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         Ok(p) => p,
         Err(e) => fail(g.json, ExitCode::Generic, "pins_unreadable", &e, Some("noo addons verify")),
     };
-    // A third-party add-on is fetched with NO credential: the vendor token is
-    // never sent to a registry the operator named.
-    let plain = addons::lock_fetch::Client::new(None);
     if lock_ref.is_some() && (named.len() != 1 || !resolve::third_party(&named[0])) {
         fail(g.json, ExitCode::Usage, "usage", "--lock names one third-party add-on's lock: give exactly that add-on", Some(UPGRADE_USAGE));
     }
@@ -129,14 +126,23 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut failed = 0;
     for addon in list {
         let third_party = resolve::third_party(addon);
-        let client = if third_party { &plain } else { &client };
+        // A third-party add-on is fetched with its OWN client: never the vendor
+        // token, and only the credential registered for it (`registry-login`),
+        // sent to the root its keys were trusted for.
+        let own = third_party.then(|| resolve::installed_anchor(addon).and_then(|a| addons::third_party_client(addon, &a)));
+        let client = match &own {
+            Some(Ok(c)) => c,
+            _ => &client,
+        };
         let ctx = addons::Ctx { root: &root, tag: &tag, stack_lock: stack_lock.as_deref(), allow_downgrade, client };
         let installed = current.get(addon).cloned();
         let supplied = match (third_party, lock_ref.as_deref()) {
             (true, Some(r)) => Some(addons::trust::fetch_supplied(r).map_err(resolve::Refusal::Supplied)),
             _ => None,
         };
-        let outcome = if let Some(Err(e)) = &supplied {
+        let outcome = if let Some(Err(e)) = own.as_ref() {
+            Err(e.clone())
+        } else if let Some(Err(e)) = &supplied {
             Err(e.clone())
         } else if check {
             let supplied = supplied.and_then(Result::ok);
@@ -147,12 +153,14 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                         stack_tag: &tag,
                         stack_lock: stack_lock.as_deref(),
                         pinned: installed.as_ref().map(|p| p.version.as_str()),
+                        pin: installed.as_ref(),
                         allow_downgrade,
                     };
                     let route = client.route(&anchor).map_err(resolve::Refusal::Route)?;
                     addons::resolve_lock(client, &anchor, &want, supplied)
                         .and_then(|(v, f)| {
                             addons::guards::guard_install(&root, addon, &f.files).map_err(resolve::Refusal::Decl)?;
+                            addons::check::refuse_bad_routes(addon, &f.files)?;
                             Ok((v, f))
                         })
                         .and_then(|(v, f)| resolve::require_bundle(&v, &tag).map(|()| (v, f)))
@@ -291,6 +299,36 @@ pub(crate) fn verify_one(
     v
 }
 
+/// A third-party add-on's registry credential as `verify` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CredState {
+    NotSet,
+    Set(String),
+    /// The trust entry records one for this root and the store holds none.
+    Missing(String),
+}
+
+impl CredState {
+    /// The row text; never the value.
+    pub(crate) fn text(&self, addon: &str) -> String {
+        match self {
+            CredState::NotSet => "registry credential: not set".to_string(),
+            CredState::Set(r) => format!("registry credential: set ({r})"),
+            CredState::Missing(r) => format!(
+                "registry credential: recorded for {r} but missing from the store; register it again with \
+                 `noo addons registry-login {addon} --registry {r}`"
+            ),
+        }
+    }
+}
+
+/// The credential state of `addon` from the noomesh.yaml TEXT; `in_store` is
+/// asked only when the trust entry records one (given the recorded root).
+pub(crate) fn credential_state(text: &str, addon: &str, in_store: &dyn Fn(&str) -> Result<bool, String>) -> Result<CredState, String> {
+    let Some(root) = crate::addons::trust::credential_root(text, addon) else { return Ok(CredState::NotSet) };
+    Ok(if in_store(&root)? { CredState::Set(root) } else { CredState::Missing(root) })
+}
+
 /// `noo addons verify`
 pub fn addons_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     match args {
@@ -316,7 +354,19 @@ pub fn addons_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     };
     let verdicts: Vec<Verdict> =
         list.iter().map(|a| verify_one(&root, a, &tag, resolve::installed_anchor(a), &mut docker, &running)).collect();
-    let bad = verdicts.iter().filter(|v| v.problem.is_some()).count();
+    // Third-party add-ons: is a registry credential set (the trust entry says;
+    // the store is read only when it records one).
+    let text = std::fs::read_to_string(crate::commands::addons::config_path()).unwrap_or_default();
+    let creds: std::collections::BTreeMap<String, Result<CredState, String>> = list
+        .iter()
+        .filter(|a| resolve::third_party(a))
+        .map(|a| {
+            let st = credential_state(&text, a, &|root| addons::lock_fetch::stored_bound(a, root).map(|b| b.is_some()));
+            (a.to_string(), st)
+        })
+        .collect();
+    let cred_bad = creds.values().filter(|c| !matches!(c, Ok(CredState::NotSet | CredState::Set(_)))).count();
+    let bad = verdicts.iter().filter(|v| v.problem.is_some()).count() + cred_bad;
     if g.json {
         let rows: Vec<_> = verdicts
             .iter()
@@ -326,9 +376,14 @@ pub fn addons_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 "key_index": v.pin.as_ref().map(|p| p.key_index), "images": v.pin.as_ref().map(|p| &p.images),
                 "dev_expires_at": v.pin.as_ref().and_then(|p| p.dev_expires_at).map(crate::addon_lock::utc_rfc3339),
                 "pulled_from": v.pin.as_ref().and_then(|p| p.pulled_from.as_ref()),
+                "registry_credential": creds.get(&v.addon).map(|c| match c {
+                    Ok(st) => st.text(&v.addon),
+                    Err(e) => format!("registry credential: unreadable ({e})"),
+                }),
             }))
             .collect();
-        println!("{}", json!({"stack": tag, "verified": verdicts.len() - bad, "failed": bad, "addons": rows}));
+        let ok = verdicts.iter().filter(|v| v.problem.is_none()).count();
+        println!("{}", json!({"stack": tag, "verified": ok, "failed": bad, "addons": rows}));
         return Ok(if bad == 0 { 0 } else { 1 });
     }
     println!("{}", ui::header("add-on pins", Some(&format!("stack {tag}"))));
@@ -349,6 +404,12 @@ pub fn addons_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             }
             (Some(why), _) => println!("{}", ui::status_line(ui::Glyph::Err, &format!("{}: {why}", v.addon))),
             (None, None) => {}
+        }
+        match creds.get(&v.addon) {
+            Some(Ok(st @ CredState::Missing(_))) => println!("{}", ui::status_line(ui::Glyph::Err, &format!("{}: {}", v.addon, st.text(&v.addon)))),
+            Some(Ok(st)) => println!("{}", ui::muted(&format!("  {}: {}", v.addon, st.text(&v.addon)))),
+            Some(Err(e)) => println!("{}", ui::status_line(ui::Glyph::Err, &format!("{}: registry credential could not be read: {e}", v.addon))),
+            None => {}
         }
     }
     if bad > 0 {
@@ -556,6 +617,26 @@ pub(crate) fn pin_cells(pin: Option<&pins::Pin>) -> [String; 4] {
 
 #[cfg(test)]
 mod tests {
+
+    /// `verify`'s credential row: set, not set, and recorded-but-missing (a
+    /// failure that names the verb). The store is asked only for a record.
+    #[test]
+    fn verify_reports_the_registry_credential_state_never_the_value() {
+        let root = "ghcr.io/example/intel";
+        let none = "addon_trust:\n  rhaddon:\n    registry: ghcr.io/example/intel\n    keys: []\n";
+        let rec = format!("{none}    registry_credential:\n      root: {root}\n");
+        let never = |_: &str| -> Result<bool, String> { panic!("the store is not read without a record") };
+        let st = credential_state(none, "rhaddon", &never).unwrap();
+        assert_eq!(st, CredState::NotSet);
+        assert_eq!(st.text("rhaddon"), "registry credential: not set");
+        let st = credential_state(&rec, "rhaddon", &|r| Ok(r == root)).unwrap();
+        assert_eq!(st.text("rhaddon"), format!("registry credential: set ({root})"));
+        let st = credential_state(&rec, "rhaddon", &|_| Ok(false)).unwrap();
+        assert_eq!(st, CredState::Missing(root.to_string()));
+        assert!(st.text("rhaddon").contains(&format!("noo addons registry-login rhaddon --registry {root}")), "{}", st.text("rhaddon"));
+        assert!(credential_state(&rec, "rhaddon", &|_| Err("sops: no key".into())).is_err());
+    }
+
     use super::*;
     use crate::addons::resolve::tests::{anchor, lock, signed, signed_bundle, FakeDocker, OVERLAY, ROOT};
 
@@ -579,7 +660,7 @@ mod tests {
         let d = scratch("guard");
         let overlay = format!("{OVERLAY}secrets:\n  stolen:\n    file: ${{NOO_SECRET_RUNDIR:-/x}}/stolen\n    x-noo-source: NOO_JWT_SECRET\n");
         let f = crate::addons::resolve::tests::signed_bundle_with(&lock("1.2.0", &["v0.6.0"], None), &overlay);
-        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, pin: None, allow_downgrade: false };
         let v = resolve::check(&f, &anchor(), &want).unwrap();
         resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0", None).unwrap();
         let reference = v.lock.images["trellion-intel"].clone();
@@ -596,7 +677,7 @@ mod tests {
     fn pinned_root(tag: &str) -> (std::path::PathBuf, String) {
         let d = scratch(tag);
         let f = signed_bundle(&lock("1.2.0", &["v0.6.0"], None));
-        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, pin: None, allow_downgrade: false };
         let v = resolve::check(&f, &anchor(), &want).unwrap();
         resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0", None).unwrap();
         let r = v.lock.images["trellion-intel"].clone();
@@ -615,7 +696,7 @@ mod tests {
                 ("routes.json", EXAMPLE_ROUTES.as_bytes()),
             ],
         );
-        let want = resolve::Want { addon: "example-addon", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let want = resolve::Want { addon: "example-addon", stack_tag: "v0.6.0", stack_lock: None, pinned: None, pin: None, allow_downgrade: false };
         let v = resolve::check(&f, &anchor(), &want).unwrap();
         resolve::record(&d, "example-addon", &v, &f, "v0.6.0", None).unwrap();
         let names = vec!["example-addon".to_string()];
@@ -681,7 +762,7 @@ mod tests {
     fn a_proxy_pin_launches_and_verifies_the_pulled_ref() {
         let d = scratch("proxy-pin");
         let f = signed_bundle(&lock("1.2.0", &["v0.6.0"], None));
-        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, pin: None, allow_downgrade: false };
         let v = resolve::check(&f, &anchor(), &want).unwrap();
         let pull = "addons.noomesh.ai/example/intel";
         resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0", Some(pull.into())).unwrap();
@@ -716,7 +797,7 @@ mod tests {
     fn a_lock_without_a_bundle_is_refused_by_launch_pins_and_verify() {
         let d = scratch("legacy");
         let f = signed(&lock("1.2.0", &["v0.6.0"], None));
-        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, pin: None, allow_downgrade: false };
         let v = resolve::check(&f, &anchor(), &want).unwrap();
         resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0", None).unwrap();
         // An overlay an earlier CLI left in the install root no longer rescues it.

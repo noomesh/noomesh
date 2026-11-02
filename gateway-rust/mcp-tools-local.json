@@ -5621,6 +5621,208 @@
       "aliases": {},
       "auth": "cluster",
       "body_field": "",
+      "description": "Recent gateway requests from the request traces (i359), newest\nfirst: when, trace id, method, route template, status, duration,\ncaller, model, backend, node, tokens and sizes. Filter with `hours`\n(default 24, at most 720), `route`, `model`, `node`, `actor`,\n`min_status` (500 = errors only) and `min_ms` (slow ones); `limit`\ndefaults to 100 (at most 1000). A trace id opens the full trace in\nGrafana's Tempo data source. Metadata only: no prompt or answer text.",
+      "had_custom_format": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "description": "Recent gateway requests from the request traces (i359), newest\nfirst: when, trace id, method, route template, status, duration,\ncaller, model, backend, node, tokens and sizes. Filter with `hours`\n(default 24, at most 720), `route`, `model`, `node`, `actor`,\n`min_status` (500 = errors only) and `min_ms` (slow ones); `limit`\ndefaults to 100 (at most 1000). A trace id opens the full trace in\nGrafana's Tempo data source. Metadata only: no prompt or answer text.",
+        "properties": {
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Only this caller (a username or service-key consumer)",
+            "title": "Actor"
+          },
+          "hours": {
+            "anyOf": [
+              {
+                "maximum": 720,
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Look back this many hours (default 24)",
+            "title": "Hours"
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "maximum": 1000,
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Rows to return (default 100)",
+            "title": "Limit"
+          },
+          "min_ms": {
+            "anyOf": [
+              {
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Only requests that took at least this many ms",
+            "title": "Min Ms"
+          },
+          "min_status": {
+            "anyOf": [
+              {
+                "maximum": 599,
+                "minimum": 100,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Only statuses at or above this (500 = errors)",
+            "title": "Min Status"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Only requests answered by this model",
+            "title": "Model"
+          },
+          "node": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Only requests answered on this node id",
+            "title": "Node"
+          },
+          "route": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Exact route template, e.g. '/v1/chat/completions'",
+            "title": "Route"
+          }
+        },
+        "title": "PaiTracesRequests",
+        "type": "object"
+      },
+      "method": "GET",
+      "name": "noo_traces_requests",
+      "path": "/api/traces/requests",
+      "risk_level": "low",
+      "tags": [
+        "observability",
+        "traces",
+        "status"
+      ],
+      "timeout_secs": 30
+    },
+    {
+      "aliases": {},
+      "auth": "cluster",
+      "body_field": "",
+      "description": "Where requests spend their time (i359 request traces): the gateway's\nrequests over the last `hours` (default 24, at most 720) grouped `by`\nroute (default), model, node, backend or actor, busiest first, each with\nits count, errors (status >= 500), p50/p95/max duration in ms and prompt\nand completion tokens. `route` narrows to one route template. Use for\n'which backend is slow for this kind of request?' and 'where did the\nload come from?'. Metadata only: no prompt or answer text exists here.",
+      "had_custom_format": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "description": "Where requests spend their time (i359 request traces): the gateway's\nrequests over the last `hours` (default 24, at most 720) grouped `by`\nroute (default), model, node, backend or actor, busiest first, each with\nits count, errors (status >= 500), p50/p95/max duration in ms and prompt\nand completion tokens. `route` narrows to one route template. Use for\n'which backend is slow for this kind of request?' and 'where did the\nload come from?'. Metadata only: no prompt or answer text exists here.",
+        "properties": {
+          "by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Group by: route (default), model, node, backend or actor",
+            "title": "By"
+          },
+          "hours": {
+            "anyOf": [
+              {
+                "maximum": 720,
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Look back this many hours (default 24)",
+            "title": "Hours"
+          },
+          "route": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Only this route template, e.g. '/v1/chat/completions'",
+            "title": "Route"
+          }
+        },
+        "title": "PaiTracesSummary",
+        "type": "object"
+      },
+      "method": "GET",
+      "name": "noo_traces_summary",
+      "path": "/api/traces/summary",
+      "risk_level": "low",
+      "tags": [
+        "observability",
+        "traces",
+        "status"
+      ],
+      "timeout_secs": 30
+    },
+    {
+      "aliases": {},
+      "auth": "cluster",
+      "body_field": "",
       "description": "List user-management proposals and their status (pending, approved,\ndenied, failed). Use to check whether a requested account change has\nbeen approved yet.",
       "had_custom_format": true,
       "input_schema": {

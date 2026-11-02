@@ -33,7 +33,9 @@
 //!
 //! ## What the id is, and is not
 //!
-//! The id is 128 random bits. It distinguishes sessions; it does **not**
+//! The id is 128 random bits, then `.` and the public digest of the tool
+//! catalogue it was opened under (see "catalogue freshness" below). It
+//! distinguishes sessions; it does **not**
 //! authorise anything — the bearer key does that, on every request, as
 //! before. A session is bound to the consumer that opened it and refused
 //! to any other, so a leaked id is useless without the key, and with the
@@ -85,12 +87,13 @@ fn b64url(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// A fresh, unguessable session id.
+/// A fresh, unguessable session id: 128 random bits, then `.` and the
+/// tool catalogue it was opened under ([`catalogue_of`]).
 fn new_id() -> String {
     use rand::Rng;
     let mut b = [0u8; 16];
     rand::rng().fill_bytes(&mut b);
-    b64url(&b)
+    format!("{}.{}", b64url(&b), crate::mcp_external::catalogue_digest())
 }
 
 /// The short suffix that tells two sessions of one key apart. Lowercase
@@ -219,7 +222,7 @@ pub async fn from_headers(
     consumer: &str,
 ) -> Result<Option<String>, axum::response::Response> {
     use axum::response::IntoResponse;
-    let Some(id) = headers.get(HEADER).and_then(|v| v.to_str().ok()).map(str::trim).filter(|s| !s.is_empty()) else {
+    let Some(id) = presented(headers) else {
         return Ok(None);
     };
     match resolve(db, id, consumer).await {
@@ -234,6 +237,11 @@ pub async fn from_headers(
                 .into_response())
         }
     }
+}
+
+/// The session id a request presents, if any.
+fn presented(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers.get(HEADER).and_then(|v| v.to_str().ok()).map(str::trim).filter(|s| !s.is_empty())
 }
 
 /// Stamp a freshly opened session onto the `initialize` response.
@@ -454,6 +462,103 @@ pub async fn live_all(db: &sqlx::PgPool) -> Result<Vec<serde_json::Value>, sqlx:
     })).collect())
 }
 
+// ── catalogue freshness (i277f) ──────────────────────────────────────
+//
+// A client keeps the tool list it fetched when its session opened, and a
+// session survives a gateway restart (the row). So a roll that changes the
+// catalogue left every open window on the old list, with nothing to tell
+// it: a tool added in 0.6.11 was missing in a session opened before. Nor
+// does a client re-list when it re-initializes (gateway log 2026-10-30:
+// 404, `initialize`, and straight back to tool calls).
+//
+// Each id carries the catalogue it was opened under. The first answered
+// request of a session whose catalogue is not this gateway's goes back as
+// an SSE stream that leads with `notifications/tools/list_changed`; a
+// client answers that by fetching `tools/list` again. Legacy initialize
+// advertises `listChanged: true` so it listens. The client asked for SSE
+// (Streamable HTTP requires both types in `Accept`); one that did not
+// gets plain JSON and is told on a later request that does. An id minted
+// before this carries no catalogue and counts as stale. Told once per id
+// per process, so a restart may tell a session again: one extra list.
+//
+// The bridged external MCP servers (`mcp_bridge`) are not in the digest:
+// they change without a restart, and a session is not told.
+
+/// The method a client re-lists on.
+pub const LIST_CHANGED: &str = "notifications/tools/list_changed";
+
+/// The catalogue digest an id was opened under (`None`: minted before ids
+/// carried one).
+pub fn catalogue_of(id: &str) -> Option<&str> {
+    id.rsplit_once('.').map(|(_, d)| d)
+}
+
+static TOLD: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+fn told() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    TOLD.get_or_init(Default::default)
+}
+
+/// Does the session `id` still hold a tool list from another catalogue?
+pub fn owes_list_changed(id: &str) -> bool {
+    if catalogue_of(id) == Some(crate::mcp_external::catalogue_digest()) {
+        return false;
+    }
+    told().lock().map(|s| !s.contains(id)).unwrap_or(false)
+}
+
+fn mark_told(id: &str) {
+    if let Ok(mut s) = told().lock() {
+        if s.len() >= MAX_SESSIONS {
+            s.clear(); // bounded; the cost of forgetting is one more list
+        }
+        s.insert(id.to_string());
+    }
+}
+
+/// Both doors pass every answer through here. An answered (200, JSON)
+/// request of a session that owes the notice goes back as SSE: the
+/// `list_changed` notification, then the answer. Anything else is returned
+/// unchanged.
+pub async fn with_list_changed(headers: &axum::http::HeaderMap, resp: axum::response::Response) -> axum::response::Response {
+    use axum::http::header;
+    let Some(id) = presented(headers) else { return resp };
+    let json = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|c| c.starts_with("application/json"));
+    let sse = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/event-stream"));
+    if resp.status() != axum::http::StatusCode::OK || !json || !sse || !owes_list_changed(id) {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "mcp answer body unreadable; list_changed not sent");
+            return axum::response::Response::from_parts(parts, axum::body::Body::empty());
+        }
+    };
+    // One `data:` line per event: re-serialised compact, so a newline in
+    // the answer cannot split it.
+    let Ok(answer) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return axum::response::Response::from_parts(parts, axum::body::Body::from(bytes));
+    };
+    let note = serde_json::json!({"jsonrpc": "2.0", "method": LIST_CHANGED});
+    let stream = format!("event: message\ndata: {note}\n\nevent: message\ndata: {answer}\n\n");
+    parts.headers.insert(header::CONTENT_TYPE, axum::http::HeaderValue::from_static("text/event-stream"));
+    parts.headers.insert(header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-cache"));
+    parts.headers.remove(header::CONTENT_LENGTH);
+    mark_told(id);
+    tracing::info!(opened_under = catalogue_of(id).unwrap_or("none"), now = crate::mcp_external::catalogue_digest(),
+        "mcp tool catalogue changed since this session opened; sent tools/list_changed");
+    axum::response::Response::from_parts(parts, axum::body::Body::from(stream))
+}
+
 /// Live session count, for `/health`-style reporting and tests.
 pub fn live() -> usize {
     registry().read().map(|m| m.len()).unwrap_or(0)
@@ -462,6 +567,81 @@ pub fn live() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn answered() -> axum::response::Response {
+        use axum::response::IntoResponse;
+        axum::Json(serde_json::json!({"jsonrpc": "2.0", "id": 7, "result": {"content": [{"type": "text", "text": "a\nb"}]}})).into_response()
+    }
+
+    fn presenting(id: &str, accept: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(HEADER, id.parse().unwrap());
+        h.insert(axum::http::header::ACCEPT, accept.parse().unwrap());
+        h
+    }
+
+    async fn text(resp: axum::response::Response) -> (String, String) {
+        let ct = resp.headers().get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (ct, String::from_utf8(b.to_vec()).unwrap())
+    }
+
+    const BOTH: &str = "application/json, text/event-stream";
+
+    /// A session opened now holds this catalogue: never told.
+    #[tokio::test]
+    async fn a_session_opened_now_carries_the_catalogue_and_is_not_told() {
+        let (id, _) = open_local("fresh", "self:fresh", None).unwrap();
+        assert_eq!(catalogue_of(&id), Some(crate::mcp_external::catalogue_digest()));
+        assert!(!owes_list_changed(&id));
+        let (ct, _) = text(with_list_changed(&presenting(&id, BOTH), answered()).await).await;
+        assert!(ct.starts_with("application/json"), "{ct}");
+    }
+
+    /// The 0.6.11 case: a session from before a roll that changed the
+    /// catalogue. Its next answer leads with list_changed, then the answer
+    /// itself, whole; the one after is plain JSON again.
+    #[tokio::test]
+    async fn a_session_from_another_catalogue_is_told_once_then_answered_plainly() {
+        let id = "c3RhbGUtc2Vzc2lvbi1vbmU.0123456789abcdef";
+        assert!(owes_list_changed(id));
+        let (ct, body) = text(with_list_changed(&presenting(id, BOTH), answered()).await).await;
+        assert_eq!(ct, "text/event-stream");
+        let events: Vec<serde_json::Value> = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .map(|d| serde_json::from_str(d).expect("each data line is one JSON message"))
+            .collect();
+        assert_eq!(events.len(), 2, "{body}");
+        assert_eq!(events[0]["method"], LIST_CHANGED);
+        assert!(events[0].get("id").is_none(), "a notification carries no id");
+        assert_eq!(events[1]["id"], 7);
+        assert_eq!(events[1]["result"]["content"][0]["text"], "a\nb", "the answer arrives unchanged");
+        assert!(!owes_list_changed(id));
+        let (ct, _) = text(with_list_changed(&presenting(id, BOTH), answered()).await).await;
+        assert!(ct.starts_with("application/json"), "told once: {ct}");
+    }
+
+    /// An id minted before ids carried a catalogue counts as stale. A
+    /// client that does not take SSE, a refusal and a notification's 202
+    /// pass unchanged, and the session still owes the notice.
+    #[tokio::test]
+    async fn only_an_answered_request_that_takes_sse_carries_the_notice() {
+        use axum::response::IntoResponse;
+        let old = "b2xkLXN0eWxlLWlkLW5vLWRvdA";
+        assert_eq!(catalogue_of(old), None);
+        assert!(owes_list_changed(old));
+        let (ct, _) = text(with_list_changed(&presenting(old, "application/json"), answered()).await).await;
+        assert!(ct.starts_with("application/json"), "{ct}");
+        let r = with_list_changed(&presenting(old, BOTH), axum::http::StatusCode::ACCEPTED.into_response()).await;
+        assert_eq!(r.status(), axum::http::StatusCode::ACCEPTED);
+        let mut refused = answered();
+        *refused.status_mut() = axum::http::StatusCode::NOT_FOUND;
+        assert_eq!(with_list_changed(&presenting(old, BOTH), refused).await.status(), axum::http::StatusCode::NOT_FOUND);
+        assert!(owes_list_changed(old), "nothing was sent, so the notice is still owed");
+        let (ct, _) = text(with_list_changed(&axum::http::HeaderMap::new(), answered()).await).await;
+        assert!(ct.starts_with("application/json"), "no session, nothing to tell: {ct}");
+    }
 
     #[test]
     fn a_session_is_a_valid_connection_under_its_account() {

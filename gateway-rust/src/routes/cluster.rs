@@ -71,6 +71,15 @@ pub fn router() -> Router<Arc<AppState>> {
             post(super::logs_ingest::node_logs_ingest)
                 .layer(axum::extract::DefaultBodyLimit::max(super::logs_ingest::MAX_BODY + 1024)),
         )
+        // Node span ingest (i359 C2): a node sends the spans of the requests
+        // it served; the gateway re-stamps the resource with the verified
+        // node and relays them to Tempo. Node credential only, self only —
+        // see `traces_ingest.rs`. Body cap above the module's, as for logs.
+        .route(
+            "/api/cluster/nodes/{node_id}/traces",
+            post(super::traces_ingest::node_traces_ingest)
+                .layer(axum::extract::DefaultBodyLimit::max(super::traces_ingest::MAX_BODY + 1024)),
+        )
         .route("/api/cluster/nodes/{id}/register", post(node_register))
         .route("/api/cluster/nodes/{id}/forget", delete(node_forget))
         .route("/api/cluster/backends", get(cluster_backends))
@@ -1076,8 +1085,14 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
     // merging known-but-missing (offline) nodes below.
     let mut live_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Try NATS KV first (has full registration data from node-agent)
-    if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
+    // Try NATS KV first (has full registration data from node-agent) — but
+    // only on a connected bus. On a disconnected client a JetStream request
+    // does not fail fast: it waits out the request timeout (120 s), and
+    // `noo cluster verify` (10 s) gave up with "nothing can be verified" in
+    // the one state its `gateway bus` row exists for (0.6.16-rc.3, i301 a.3).
+    let bus_up = crate::state::bus_connected(&state.nats);
+    let kv = if bus_up { state.js.get_key_value("mesh_nodes").await.ok() } else { None };
+    if let Some(kv) = kv {
         use tokio_stream::StreamExt;
         if let Ok(keys) = kv.keys().await {
             let keys: Vec<String> = keys.filter_map(|k| k.ok()).collect().await;
@@ -1352,6 +1367,7 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
             .and_then(|v| v.as_object())
             .map(|m| m.iter().map(|(k, v)| format!("{}: {}", k, v.as_str().unwrap_or("?"))).collect())
             .unwrap_or_default();
+        let (status, status_detail) = db_node_status(bus_up);
         let mut node = json!({
             "id": node_id,
             "hostname": hostname,
@@ -1368,7 +1384,8 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
             "is_arm": is_arm,
             "backends": backends,
             "running_backends": rb.unwrap_or_else(|| json!({})),
-            "status": "offline",
+            "status": status,
+            "status_detail": status_detail,
             "last_heartbeat": last_hb.map(|t| t.to_rfc3339().replace("+00:00", "Z")),
             "last_heartbeat_source": "database",
             "heartbeat_age_secs": last_hb.map(|t| (chrono::Utc::now() - t).num_seconds().max(0)),
@@ -1391,7 +1408,33 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
         }
     }
 
-    (nodes, offline_merge_error)
+    (nodes, nodes_list_error(bus_up, offline_merge_error))
+}
+
+/// What the gateway says when its bus is down and the node list comes from
+/// the database alone.
+pub(crate) const NODES_BUS_DOWN: &str =
+    "the gateway is not connected to NATS: live node state is unavailable, so every node shows its last record from the database (noo stack start brings the bus back)";
+
+/// A database-only node's status. With the bus up, a node missing from KV
+/// has stopped heartbeating: `offline`. With the bus down, nothing is known
+/// about any node: `unknown`, saying why, never a fleet-wide `offline`.
+fn db_node_status(bus_up: bool) -> (&'static str, Value) {
+    if bus_up {
+        ("offline", Value::Null)
+    } else {
+        ("unknown", json!(NODES_BUS_DOWN))
+    }
+}
+
+/// The list's `error`: the bus being down comes first (it explains every
+/// node), then a database read failure.
+fn nodes_list_error(bus_up: bool, db_error: Option<String>) -> Option<String> {
+    match (bus_up, db_error) {
+        (true, e) => e,
+        (false, None) => Some(NODES_BUS_DOWN.to_string()),
+        (false, Some(e)) => Some(format!("{NODES_BUS_DOWN}; {e}")),
+    }
 }
 
 /// Count nodes by the `status` string `collect_cluster_nodes` assigned.
@@ -2132,7 +2175,7 @@ async fn clean_node(
 /// start while the GPU is occupied (noomesh-internal i163 parts C and D).
 ///
 /// POST /api/cluster/nodes/{node_id}/gpu/hold — body `{reason?, operation_id?,
-/// owner?, workload?, mode?: drain|immediate, timeout_secs?, force?}`. Operator only;
+/// owner?, workload?, purpose?, mode?: drain|immediate, timeout_secs?, force?}`. Operator only;
 /// audited (`node_gpu_hold`, with the lease and whether it was a force).
 ///
 /// - `operation_id` names the caller's operation; the answer's
@@ -2151,6 +2194,10 @@ async fn clean_node(
 ///   hand-over primitive: the backends stay paused throughout, the pool never
 ///   gets the GPU in between. `workload` (`<addon>/<workload>`) names what
 ///   the GPU went to; the reservation layer keys on it and `operation_id`.
+/// - `purpose: "user"` marks the operator's own use of the GPU (i344b: `noo
+///   cluster gpu mode <node> user`); the lease carries it and the mode is read
+///   back from it. It is the only purpose and never sits beside a `workload`
+///   (400). An older agent drops it, and the hold reads as a manual one.
 /// - One hold or release runs on a node at a time (409 `transition_in_progress`).
 async fn gpu_hold(
     State(state): State<Arc<AppState>>,
@@ -2166,6 +2213,7 @@ async fn gpu_hold(
     let reason = text("reason", 200);
     let operation_id = text("operation_id", 64);
     let workload = text("workload", 120);
+    let purpose = gpu_hold_purpose(&text("purpose", 16), &workload).map_err(AppError::BadRequest)?;
     let legacy = operation_id.is_empty();
     let mut owner = text("owner", 200);
     if owner.is_empty() {
@@ -2183,12 +2231,26 @@ async fn gpu_hold(
         .unwrap_or(GPU_DRAIN_TIMEOUT_DEFAULT_SECS)
         .clamp(1, GPU_DRAIN_TIMEOUT_MAX_SECS);
     let force = legacy || b.get("force").and_then(Value::as_bool).unwrap_or(false);
-    let payload = json!({
+    let mut payload = json!({
         "reason": reason, "operation_id": operation_id, "owner": owner, "workload": workload, "mode": mode,
         "timeout_secs": timeout_secs, "force": force, "legacy": legacy,
     });
+    if !purpose.is_empty() {
+        payload["purpose"] = json!(purpose);
+    }
     let wait = std::time::Duration::from_secs(if mode == "drain" { timeout_secs + 60 } else { 90 });
     gpu_hold_op(&state, actor, &node_id, "hold", payload, wait).await
+}
+
+/// A hold's `purpose`: empty, or `user` (the operator's own use), never
+/// together with a workload. The agent applies the same rule.
+fn gpu_hold_purpose(purpose: &str, workload: &str) -> Result<String, String> {
+    match purpose.to_ascii_lowercase().as_str() {
+        "" => Ok(String::new()),
+        "user" if workload.is_empty() => Ok("user".into()),
+        "user" => Err(format!("purpose user is the operator's own use; a hold for workload {workload:?} has no purpose")),
+        other => Err(format!("purpose must be user or absent, not {other:?}")),
+    }
 }
 
 /// End an operator GPU hold: the node returns to the automatic shared-GPU
@@ -4216,8 +4278,8 @@ async fn placement_staging_refusal(state: &AppState, node_id: &str, backend: &st
         return None;
     }
     tracing::warn!(node = %node_id, backend = %backend, image = %image, arch = %arch, "placement.image_not_staged");
-    let rail = node["image_source_mode"].as_str() == Some("rail");
-    Some((art::not_staged_refusal(node_id, &image, &arch), rail))
+    // Rail is the only image source: an unstaged image is always a refusal.
+    Some((art::not_staged_refusal(node_id, &image, &arch), true))
 }
 
 /// PUT /api/cluster/nodes/{node_id}/placements/{backend} — upsert.
@@ -6691,6 +6753,18 @@ mod heartbeat_carry_tests {
     }
 
     #[test]
+    fn a_hold_purpose_is_user_or_absent_and_never_beside_a_workload() {
+        assert_eq!(gpu_hold_purpose("", "").unwrap(), "");
+        assert_eq!(gpu_hold_purpose("User", "").unwrap(), "user");
+        assert!(gpu_hold_purpose("vr", "").unwrap_err().contains("user or absent"));
+        assert!(gpu_hold_purpose("user", "rhaddon/worker").is_err());
+        assert_eq!(gpu_hold_purpose("", "rhaddon/worker").unwrap(), "");
+        // Absent stays off the wire, so an unchanged hold is byte-identical.
+        let h = include_str!("cluster.rs").split("async fn gpu_hold(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        assert!(h.contains("if !purpose.is_empty()"), "purpose is sent only when set");
+    }
+
+    #[test]
     fn with_contention_replaces_only_the_contention() {
         let rec = json!({"id": "awolf", "status": "online", "gpu_contention": {"state": "free"}});
         let gc = json!({"state": "held", "lease": {"operation_id": "op-1", "owner": "op"}});
@@ -7785,7 +7859,7 @@ mod backend_image_ref_tests {
         let get = |k: &str| env.get(k).cloned();
         assert_eq!(
             super::placement_image("ollama", None, &get).as_deref(),
-            Some("ollama/ollama:0.40.5@sha256:5d3a2f25f9825628daba94dc0b1d421c7d57d6c03ae5faa9ba050e058bab8241"),
+            Some("noomesh/ollama:latest@sha256:5d3a2f25f9825628daba94dc0b1d421c7d57d6c03ae5faa9ba050e058bab8241"),
         );
         let vllm = super::placement_image("vllm", Some(String::new()), &get).unwrap();
         assert!(vllm.starts_with("vllm/vllm-openai:") && vllm.ends_with("@sha256:fc56161ee42a011aeee78b65d0a81b6683c7d04402fd40503d14d4d6c98f07cb"), "{vllm}");
@@ -7916,5 +7990,40 @@ mod start_over_the_bus_tests {
             assert!(body.contains("NodeLink::for_node("), "{f} must resolve its link with for_node");
             assert!(!body.contains("NodeLink::for_base("), "{f} sends /start by address: it never rides the bus");
         }
+    }
+}
+
+#[cfg(test)]
+mod nodes_bus_down_tests {
+    use super::*;
+
+    /// 0.6.16-rc.3: with NATS stopped, `/api/cluster/nodes` waited out the
+    /// JetStream request timeout on the KV read and `noo cluster verify`
+    /// gave up before its `gateway bus` row. The KV read happens only on a
+    /// connected bus, and the database nodes say why they are `unknown`.
+    #[test]
+    fn the_node_list_never_waits_on_kv_while_the_bus_is_down() {
+        let src = include_str!("cluster.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("test modules")];
+        let body = src.split("pub(crate) async fn collect_cluster_nodes(").nth(1).expect("collect_cluster_nodes");
+        let body = body.split("\n\u{7d}\n").next().unwrap();
+        let gate = body.find("let bus_up = crate::state::bus_connected(&state.nats);").expect("the bus is checked");
+        let read = body.find("if bus_up { state.js.get_key_value(\"mesh_nodes\").await.ok() } else { None }").expect("the KV read is gated");
+        assert!(gate < read, "checked before the read");
+        assert_eq!(body.matches("state.js.").count(), 1, "no other JetStream call in the node list");
+        assert!(body.contains("nodes_list_error(bus_up, offline_merge_error)"), "the reason reaches the response");
+    }
+
+    #[test]
+    fn database_nodes_are_unknown_with_the_reason_while_the_bus_is_down() {
+        assert_eq!(db_node_status(true), ("offline", Value::Null));
+        let (status, detail) = db_node_status(false);
+        assert_eq!(status, "unknown");
+        assert!(detail.as_str().unwrap().contains("not connected to NATS"), "{detail}");
+        assert_eq!(nodes_list_error(true, None), None);
+        assert_eq!(nodes_list_error(true, Some("db".into())).as_deref(), Some("db"));
+        assert_eq!(nodes_list_error(false, None).as_deref(), Some(NODES_BUS_DOWN));
+        let both = nodes_list_error(false, Some("cannot read cluster_nodes".into())).unwrap();
+        assert!(both.starts_with(NODES_BUS_DOWN) && both.ends_with("; cannot read cluster_nodes"), "{both}");
     }
 }

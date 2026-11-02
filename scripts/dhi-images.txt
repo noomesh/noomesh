@@ -28,6 +28,7 @@
 mirror redis
 mirror grafana
 mirror loki
+mirror tempo
 mirror prometheus
 mirror alertmanager
 mirror node-exporter

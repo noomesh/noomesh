@@ -26,6 +26,7 @@
 
 use serde_json::{json, Value};
 
+use crate::args::{ArgError, Args};
 use crate::http::{get_json, post_json, post_json_operator, put_json};
 use crate::output::{fail, ExitCode};
 use crate::ui::{self, Col, Glyph};
@@ -219,22 +220,17 @@ pub fn security_user_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled
     Ok(0)
 }
 
+pub(crate) fn parse_user_create_with(a: &mut Args) -> Result<(String, Vec<String>, bool), ArgError> {
+    let scopes = a.values(&["--scope"])?;
+    let password_stdin = a.flag(&["--password-stdin"]);
+    let username = a.one("<username>")?;
+    Ok((username, scopes, password_stdin))
+}
+
 /// `noo security user create USERNAME [--scope S]… [--password-stdin]`
 /// POST /api/security/users. Scopes default to ["read","write"].
 pub fn security_user_create(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut username: Option<String> = None;
-    let mut scopes: Vec<String> = Vec::new();
-    let mut password_stdin = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--scope" => scopes.push(iter.next().ok_or(Unhandled)?.clone()),
-            "--password-stdin" => password_stdin = true,
-            s if !s.starts_with('-') && username.is_none() => username = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let username = username.ok_or(Unhandled)?;
+    let (username, mut scopes, password_stdin) = parse_user_create_with(&mut Args::new(args))?;
     if scopes.is_empty() {
         // Read-only by default: `read` +
         // `write` resolves to the OPERATOR tier, so the old default made
@@ -275,6 +271,20 @@ pub fn security_user_revoke_role(g: &Globals, args: &[String]) -> Result<i32, Un
     roles_call(g, args, "roles/revoke")
 }
 
+/// (username, tokens, period, clear)
+pub(crate) type AllowanceArgs = (String, Option<i64>, Option<String>, bool);
+
+pub(crate) fn parse_allowance_with(a: &mut Args) -> Result<AllowanceArgs, ArgError> {
+    let tokens = a.number::<i64>(&["--tokens", "-t"])?;
+    if tokens.is_some_and(|n| n < 0) {
+        return Err(ArgError::new("--tokens needs a number of 0 or more"));
+    }
+    let period = a.value(&["--period", "-p"])?;
+    let clear = a.flag(&["--clear"]);
+    let username = a.one("<username>")?;
+    Ok((username, tokens, period, clear))
+}
+
 /// `noo security user set-scopes USERNAME --scope/-s S…`
 /// POST /api/security/users/{u}/scopes. **Admin-only** — `write` cannot
 /// promote itself (gateway `scope_mutation_guard`).
@@ -290,21 +300,7 @@ pub fn security_user_revoke_role(g: &Globals, args: &[String]) -> Result<i32, Un
 /// — a person's standing token allowance (i83 G). With no flag it shows the
 /// allowance and its use; `--tokens` sets it (Admin); `--clear` removes it.
 pub fn security_user_allowance(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut username: Option<String> = None;
-    let mut tokens: Option<i64> = None;
-    let mut period: Option<String> = None;
-    let mut clear = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--tokens" | "-t" => tokens = Some(iter.next().and_then(|v| v.parse().ok()).filter(|n: &i64| *n >= 0).ok_or(Unhandled)?),
-            "--period" | "-p" => period = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--clear" => clear = true,
-            s if !s.starts_with('-') && username.is_none() => username = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let username = username.ok_or(Unhandled)?;
+    let (username, tokens, period, clear) = parse_allowance_with(&mut Args::new(args))?;
     if clear && (tokens.is_some() || period.is_some()) {
         fail(g.json, ExitCode::Usage, "usage", "--clear takes no --tokens or --period", None);
     }
@@ -357,18 +353,14 @@ pub fn security_user_allowance(g: &Globals, args: &[String]) -> Result<i32, Unha
     Ok(0)
 }
 
+pub(crate) fn parse_set_scopes_with(a: &mut Args) -> Result<(String, Vec<String>), ArgError> {
+    let scopes = a.values(&["--scope", "-s"])?;
+    let username = a.one("<username>")?;
+    Ok((username, scopes))
+}
+
 pub fn security_user_set_scopes(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut username: Option<String> = None;
-    let mut scopes: Vec<String> = Vec::new();
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--scope" | "-s" => scopes.push(iter.next().ok_or(Unhandled)?.clone()),
-            s if !s.starts_with('-') && username.is_none() => username = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let username = username.ok_or(Unhandled)?;
+    let (username, scopes) = parse_set_scopes_with(&mut Args::new(args))?;
     if scopes.is_empty() {
         ui::failed(
             "at least one --scope is required, and the list replaces the existing \
@@ -399,18 +391,15 @@ pub fn security_user_set_scopes(g: &Globals, args: &[String]) -> Result<i32, Unh
     Ok(0)
 }
 
+/// Shared by `grant-role` and `revoke-role`.
+pub(crate) fn parse_roles_with(a: &mut Args) -> Result<(String, Vec<String>), ArgError> {
+    let roles = a.values(&["--role", "-r"])?;
+    let username = a.one("<username>")?;
+    Ok((username, roles))
+}
+
 fn roles_call(g: &Globals, args: &[String], suffix: &str) -> Result<i32, Unhandled> {
-    let mut username: Option<String> = None;
-    let mut roles: Vec<String> = Vec::new();
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--role" | "-r" => roles.push(iter.next().ok_or(Unhandled)?.clone()),
-            s if !s.starts_with('-') && username.is_none() => username = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let username = username.ok_or(Unhandled)?;
+    let (username, roles) = parse_roles_with(&mut Args::new(args))?;
     if roles.is_empty() {
         return Err(Unhandled); // Python: --role is a required option
     }
@@ -464,20 +453,20 @@ pub fn security_user_list_roles(g: &Globals, args: &[String]) -> Result<i32, Unh
     Ok(0)
 }
 
+pub(crate) fn parse_link_with(a: &mut Args) -> Result<([String; 3], Option<String>), ArgError> {
+    let display_name = a.value(&["--name"])?;
+    let pos = a.positionals()?;
+    let n = pos.len();
+    let triple: [String; 3] = pos
+        .try_into()
+        .map_err(|_| ArgError::new(format!("expected <username> <channel> <channel_user_id>, got {n} argument(s)")))?;
+    Ok((triple, display_name))
+}
+
 /// `noo security user link USERNAME CHANNEL CHANNEL_USER_ID [--name NAME]`
 /// POST /api/security/users/{u}/links.
 pub fn security_user_link(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut pos: Vec<String> = Vec::new();
-    let mut display_name: Option<String> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--name" => display_name = Some(iter.next().ok_or(Unhandled)?.clone()),
-            s if !s.starts_with('-') => pos.push(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let [username, channel, channel_user_id] = pos.try_into().map_err(|_| Unhandled)?;
+    let ([username, channel, channel_user_id], display_name) = parse_link_with(&mut Args::new(args))?;
     let mut payload = json!({"channel": channel, "channel_user_id": channel_user_id});
     if let Some(name) = display_name {
         payload["display_name"] = Value::String(name);
@@ -888,27 +877,21 @@ pub fn security_user_proposals(g: &Globals, args: &[String]) -> Result<i32, Unha
     Ok(0)
 }
 
+/// No tie-test row: usage.rs spells the pair `(--approve | --deny)`, which the tie test cannot read.
+pub(crate) fn parse_decide_with(a: &mut Args) -> Result<(i64, bool, bool, Option<String>), ArgError> {
+    let approve = a.flag(&["--approve"]);
+    let deny = a.flag(&["--deny"]);
+    let reason = a.value(&["--reason"])?;
+    let raw = a.one("<id>")?;
+    let id = raw.parse::<i64>().map_err(|_| ArgError::new(format!("<id> must be a number, got `{raw}`")))?;
+    Ok((id, approve, deny, reason))
+}
+
 /// `noo security user decide ID (--approve | --deny) [--reason R]`
 /// POST /api/security/user-proposals/{id}/decide. Approve-create prints the
 /// generated password once — it is not stored.
 pub fn security_user_decide(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut id: Option<i64> = None;
-    let mut approve = false;
-    let mut deny = false;
-    let mut reason: Option<String> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--approve" => approve = true,
-            "--deny" => deny = true,
-            "--reason" => reason = Some(iter.next().ok_or(Unhandled)?.clone()),
-            s if !s.starts_with('-') && id.is_none() => {
-                id = Some(s.parse().map_err(|_| Unhandled)?)
-            }
-            _ => return Err(Unhandled),
-        }
-    }
-    let id = id.ok_or(Unhandled)?;
+    let (id, approve, deny, reason) = parse_decide_with(&mut Args::new(args))?;
     // A scheduled-task proposal is a person's decision at a terminal, with the whole task shown and
     // the task id typed. This command has neither, so it will not decide one.
     // By id, not out of the newest-50 list: the answer must not depend on where the proposal sits in it.
@@ -1000,20 +983,16 @@ pub fn security_team_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled
     Ok(0)
 }
 
+pub(crate) fn parse_team_create_with(a: &mut Args) -> Result<(String, Option<String>), ArgError> {
+    let description = a.value(&["--description", "-d"])?;
+    let name = a.one("<name>")?;
+    Ok((name, description))
+}
+
 /// `noo security team create NAME [--description/-d D]`
 /// POST /api/kb/teams/create (team-api error contract).
 pub fn security_team_create(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut name: Option<String> = None;
-    let mut description: Option<String> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--description" | "-d" => description = Some(iter.next().ok_or(Unhandled)?.clone()),
-            s if !s.starts_with('-') && name.is_none() => name = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let name = name.ok_or(Unhandled)?;
+    let (name, description) = parse_team_create_with(&mut Args::new(args))?;
     let body = post_json(
         g,
         "/api/kb/teams/create",
@@ -1176,23 +1155,18 @@ pub fn security_org_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     Ok(0)
 }
 
+pub(crate) fn parse_org_create_with(a: &mut Args) -> Result<(String, Option<String>, Option<String>), ArgError> {
+    let name = a.value(&["--name"])?;
+    let description = a.value(&["--description", "-d"])?;
+    let org_id = a.one("<org_id>")?;
+    Ok((org_id, name, description))
+}
+
 /// `noo security org create ORG_ID [--name N] [--description/-d D]`
 /// POST /api/security/orgs. Only the provided fields go in the payload
 /// (Python builds it conditionally too).
 pub fn security_org_create(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut org_id: Option<String> = None;
-    let mut name: Option<String> = None;
-    let mut description: Option<String> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--name" => name = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--description" | "-d" => description = Some(iter.next().ok_or(Unhandled)?.clone()),
-            s if !s.starts_with('-') && org_id.is_none() => org_id = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let org_id = org_id.ok_or(Unhandled)?;
+    let (org_id, name, description) = parse_org_create_with(&mut Args::new(args))?;
     let mut payload = json!({"id": org_id});
     if let Some(n) = name {
         payload["name"] = Value::String(n);
@@ -1396,29 +1370,34 @@ pub(crate) fn exported_head_line(export: &Value) -> (Glyph, String) {
 
 // ── security audit list ─────────────────────────────────────────────────────
 
+/// The gateway's query parameters, in a fixed order.
+pub(crate) fn parse_audit_list_with(a: &mut Args) -> Result<Vec<String>, ArgError> {
+    let since = a.value(&["--since"])?;
+    let event = a.value(&["--event", "--event-type"])?;
+    let actor = a.value(&["--actor"])?;
+    let limit = a.number::<u32>(&["--limit", "-n"])?;
+    let cursor = a.value(&["--cursor"])?;
+    a.finish()?;
+    let params = [
+        ("since", since),
+        ("event_type", event),
+        ("actor", actor),
+        ("limit", limit.map(|n| n.to_string())),
+        ("cursor", cursor),
+    ];
+    Ok(params
+        .into_iter()
+        .filter_map(|(key, v)| v.map(|v| format!("{key}={}", super::urlencode(&v))))
+        .collect())
+}
+
 /// `noo security audit list` — GET /api/security/audit/list.
 ///
 /// Reads the security audit log (Operator and above), newest first. Filters are
 /// applied by the gateway; `--cursor` continues from a previous page's
 /// `next_cursor`. Reading is itself recorded as an `audit_log_read` row.
 pub fn security_audit_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut query: Vec<String> = Vec::new();
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        let key = match tok.as_str() {
-            "--since" => "since",
-            "--event" | "--event-type" => "event_type",
-            "--actor" => "actor",
-            "--limit" | "-n" => "limit",
-            "--cursor" => "cursor",
-            _ => return Err(Unhandled),
-        };
-        let v = iter.next().ok_or(Unhandled)?;
-        if key == "limit" && v.parse::<u32>().is_err() {
-            return Err(Unhandled);
-        }
-        query.push(format!("{key}={}", super::urlencode(v)));
-    }
+    let query = parse_audit_list_with(&mut Args::new(args))?;
     let path = if query.is_empty() {
         "/api/security/audit/list".to_string()
     } else {
@@ -2002,6 +1981,18 @@ fn print_issued(body: &Value) {
     ]);
 }
 
+/// (consumer, scopes, note, rpm, user)
+pub(crate) type IssueArgs = (String, Vec<String>, Option<String>, Option<i64>, Option<String>);
+
+pub(crate) fn parse_service_key_issue_with(a: &mut Args) -> Result<IssueArgs, ArgError> {
+    let scopes = a.values(&["--scopes"])?;
+    let note = a.value(&["--note"])?;
+    let rpm = a.number::<i64>(&["--rpm"])?;
+    let user = a.value(&["--user"])?;
+    let consumer = a.one("<consumer>")?;
+    Ok((consumer, scopes, note, rpm, user))
+}
+
 /// `noo security service-key issue CONSUMER [--scopes S]… [--note N] [--rpm N] [--user U]`
 /// POST /api/security/service-keys. Scopes default to the full set.
 ///
@@ -2013,23 +2004,7 @@ fn print_issued(body: &Value) {
 /// and validates it against `noo_users`; the flag was simply never added, so
 /// the documented CI-bot recipe failed as an unknown argument.
 pub fn security_service_key_issue(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut consumer: Option<String> = None;
-    let mut scopes: Vec<String> = Vec::new();
-    let mut note: Option<String> = None;
-    let mut rpm: Option<i64> = None;
-    let mut user: Option<String> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--scopes" => scopes.push(iter.next().ok_or(Unhandled)?.clone()),
-            "--note" => note = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--rpm" => rpm = Some(iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?),
-            "--user" => user = Some(iter.next().ok_or(Unhandled)?.clone()),
-            s if !s.starts_with('-') && consumer.is_none() => consumer = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let consumer = consumer.ok_or(Unhandled)?;
+    let (consumer, mut scopes, note, rpm, user) = parse_service_key_issue_with(&mut Args::new(args))?;
     if scopes.is_empty() {
         scopes = SERVICE_KEY_SCOPES.iter().map(|s| s.to_string()).collect();
     }
@@ -2285,17 +2260,16 @@ mod service_key_list_tests {
 // drift: identity and scopes come from the caller's JWT server-side, and
 // neither frontend can name a consumer or pick a scope set.
 
+pub(crate) fn parse_service_key_self_with(a: &mut Args) -> Result<Option<String>, ArgError> {
+    let note = a.value(&["--note"])?;
+    a.finish()?;
+    Ok(note)
+}
+
 /// `noo security service-key self [--note LABEL]`
 /// POST /api/security/service-keys/self — mint or rotate the CALLER's mcp key.
 pub fn security_service_key_self(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut note: Option<String> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--note" => note = Some(iter.next().ok_or(Unhandled)?.clone()),
-            _ => return Err(Unhandled),
-        }
-    }
+    let note = parse_service_key_self_with(&mut Args::new(args))?;
     let body = post_json(
         g,
         "/api/security/service-keys/self",
@@ -2395,6 +2369,14 @@ pub fn security_service_key_self_revoke(g: &Globals, args: &[String]) -> Result<
     Ok(0)
 }
 
+pub(crate) fn parse_service_key_provision_with(a: &mut Args) -> Result<(String, Vec<String>, u64, bool), ArgError> {
+    let scopes = a.values(&["--scopes"])?;
+    let wait_secs = a.number::<u64>(&["--wait"])?.unwrap_or(90);
+    let yes = a.flag(&["--yes", "-y"]);
+    let name = a.one("<name>")?;
+    Ok((name, scopes, wait_secs, yes))
+}
+
 /// `noo security service-key revoke CONSUMER`
 /// POST /api/security/service-keys/{c}/revoke.
 /// `noo security service-key retire <consumer>` — finish a rotation.
@@ -2433,21 +2415,7 @@ pub fn security_service_key_self_revoke(g: &Globals, args: &[String]) -> Result<
 ///     indistinguishable from no key at all (#258's rule, applied to a mint),
 ///     so the note says so; an idle consumer is not a failed command.
 pub fn security_service_key_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut name: Option<String> = None;
-    let mut scopes: Vec<String> = Vec::new();
-    let mut wait_secs: u64 = 90;
-    let mut yes = false;
-    let mut it = args.iter();
-    while let Some(tok) = it.next() {
-        match tok.as_str() {
-            "--scopes" => scopes.push(it.next().ok_or(Unhandled)?.to_string()),
-            "--wait" => wait_secs = it.next().ok_or(Unhandled)?.parse().map_err(|_| Unhandled)?,
-            "-y" | "--yes" => yes = true,
-            s if !s.starts_with('-') && name.is_none() => name = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let name = name.ok_or(Unhandled)?;
+    let (name, scopes, wait_secs, yes) = parse_service_key_provision_with(&mut Args::new(args))?;
     let Some(t) = crate::commands::secrets::provision_targets(&name) else {
         fail(
             g.json,
@@ -2970,24 +2938,19 @@ pub(crate) fn current_scopes(keys: &[Value], consumer: &str) -> Option<Vec<Strin
     (!kept.is_empty()).then_some(kept)
 }
 
+pub(crate) fn parse_service_key_rotate_with(a: &mut Args) -> Result<(String, Vec<String>, Option<String>), ArgError> {
+    let scopes = a.values(&["--scopes"])?;
+    let note = a.value(&["--note"])?;
+    let consumer = a.one("<consumer>")?;
+    Ok((consumer, scopes, note))
+}
+
 /// `noo security service-key rotate CONSUMER [--scopes S]… [--note N]`
 /// POST /api/security/service-keys/{c}/rotate (rpm quota is preserved).
 /// The gateway SUPERSEDES the previous keys (they stay live until `retire`);
 /// without `--scopes` the new key keeps the current key's scopes.
 pub fn security_service_key_rotate(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut consumer: Option<String> = None;
-    let mut scopes: Vec<String> = Vec::new();
-    let mut note: Option<String> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--scopes" => scopes.push(iter.next().ok_or(Unhandled)?.clone()),
-            "--note" => note = Some(iter.next().ok_or(Unhandled)?.clone()),
-            s if !s.starts_with('-') && consumer.is_none() => consumer = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let consumer = consumer.ok_or(Unhandled)?;
+    let (consumer, mut scopes, note) = parse_service_key_rotate_with(&mut Args::new(args))?;
     let mut kept = false;
     if scopes.is_empty() {
         // Rotating must not silently narrow (or widen) a key: carry the

@@ -5,7 +5,9 @@ package gpuyield
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -289,5 +291,46 @@ func TestLeaseAndGenerationSurviveRestartButADrainDoesNot(t *testing.T) {
 	c4 := New(ConfigFromEnv(env(nil)), p, d, dir)
 	if r := c4.Report(); r.State == StateDraining || r.State == StateHeld || r.Lease != nil || r.Generation != 2 {
 		t.Fatalf("a draining state must not be restored: %+v", r)
+	}
+}
+
+// i344b: `purpose: user` marks the operator's own use. It rides the lease,
+// survives an agent restart, is absent from the wire when unset, and is a
+// closed set that never sits beside a workload.
+func TestPurposeUserRidesTheLeaseAndIsAClosedSet(t *testing.T) {
+	dir := t.TempDir()
+	p := &fakeProbe{r: pidReading(8000, 0)}
+	d := &fakeDocker{ctrs: []docker.GPUBackend{{Backend: "vllm", ID: vllmID, Running: true}}}
+	c := New(ConfigFromEnv(env(nil)), p, d, dir)
+	r, err := c.Hold(context.Background(), HoldRequest{OperationID: "op-u", Owner: "rbwolf", Reason: "user", Purpose: " User "})
+	if err != nil || r.Lease == nil || r.Lease.Purpose != PurposeUser {
+		t.Fatalf("purpose user: %+v %v", r.Lease, err)
+	}
+	if r2 := New(ConfigFromEnv(env(nil)), p, d, dir).Report(); r2.Lease == nil || r2.Lease.Purpose != PurposeUser {
+		t.Fatalf("purpose lost across restart: %+v", r2.Lease)
+	}
+	if _, err := c.Release(context.Background(), ReleaseRequest{OperationID: "op-u", Generation: 1}); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	for _, bad := range []HoldRequest{
+		{OperationID: "op-x", Purpose: "vr"},
+		{OperationID: "op-y", Purpose: PurposeUser, Workload: "rhaddon/worker"},
+	} {
+		if _, err := c.Hold(context.Background(), bad); err == nil {
+			t.Fatalf("refused: %+v", bad)
+		}
+		if r := c.Report(); r.State == StateHeld || r.Lease != nil {
+			t.Fatalf("a refused purpose must take no hold: %+v", r)
+		}
+	}
+
+	plain, err := c.Hold(context.Background(), HoldRequest{OperationID: "op-p"})
+	if err != nil {
+		t.Fatalf("plain hold: %v", err)
+	}
+	b, _ := json.Marshal(plain.Lease)
+	if strings.Contains(string(b), "purpose") {
+		t.Fatalf("an unset purpose must not reach the wire: %s", b)
 	}
 }

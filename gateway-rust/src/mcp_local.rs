@@ -327,7 +327,10 @@ async fn handle_over_tls(
         Ok(c) => c,
         Err(resp) => return resp,
     };
-    dispatch(mcp_protocol::Door::Tls, &headers, &body, &state, caller).await
+    // A session opened under another tool catalogue is told to re-list
+    // (i277f).
+    let resp = dispatch(mcp_protocol::Door::Tls, &headers, &body, &state, caller).await;
+    crate::mcp_session::with_list_changed(&headers, resp).await
 }
 
 /// The JSON-RPC surface. The caller is mandatory: the door has one

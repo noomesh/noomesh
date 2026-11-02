@@ -73,8 +73,13 @@ ANSWERS = [   # first match wins: the delegation objective quotes the one-word o
 class FakeHarnessGateway:
     def __init__(self, node: str = "awolf", original_kind: Optional[str] = "noo",
                  clock: Optional[FakeClock] = None,
-                 profiles: Optional[dict[str, KindProfile]] = None, synthesized: bool = False):
+                 profiles: Optional[dict[str, KindProfile]] = None, synthesized: bool = False,
+                 facts: Optional[dict] = None):
         self.node = node
+        # Extra node-record fields (harness matrix: hardware, running_backends,
+        # available_models); a chat-backend placement PUT updates running_backends.
+        self.facts = json.loads(json.dumps(facts or {}))
+        self.backend_placements: dict[str, dict] = {}
         self.clock = clock or FakeClock()
         self.profiles = profiles or PROFILES
         self.placement: Optional[dict] = None
@@ -128,7 +133,7 @@ class FakeHarnessGateway:
         return {"id": self.node, "hostname": self.node, "status": "online",
                 "last_heartbeat": f"beat-{self.beat}",
                 "host_services": {"harness": harness},
-                "reconcile_refusals": refusals}
+                "reconcile_refusals": refusals, **self.facts}
 
     # ── tasks ──
     def _answer(self, objective: str) -> str:
@@ -192,8 +197,8 @@ class FakeHarnessGateway:
         body = json.loads(request.content) if request.content else None
         node_base = f"/api/cluster/nodes/{self.node}"
         if method == "GET" and path == f"{node_base}/desired-config":
-            return httpx.Response(200, json={"node_id": self.node,
-                                             "placements": [self.placement] if self.placement else []})
+            placed = ([self.placement] if self.placement else []) + list(self.backend_placements.values())
+            return httpx.Response(200, json={"node_id": self.node, "placements": placed})
         if method == "GET" and path == "/api/cluster/nodes":
             return httpx.Response(200, json={"nodes": [self._node()], "stats": {}})
         if path == f"{node_base}/placements/harness":
@@ -211,6 +216,18 @@ class FakeHarnessGateway:
                 return httpx.Response(200, json={"ok": True, "node_id": self.node, "backend": "harness"})
             if method == "DELETE":
                 self.placement, self.running_kind = None, None
+                return httpx.Response(200, json={"ok": True})
+        if path.startswith(f"{node_base}/placements/"):
+            bt = path.rsplit("/", 1)[-1]
+            self.writes.append((method, path, body))
+            running = self.facts.setdefault("running_backends", {})
+            if method == "PUT":
+                self.backend_placements[bt] = {**(body or {}), "backend": bt}
+                running[bt] = (body or {}).get("model") or ""
+                return httpx.Response(200, json={"ok": True, "node_id": self.node, "backend": bt})
+            if method == "DELETE":
+                self.backend_placements.pop(bt, None)
+                running.pop(bt, None)
                 return httpx.Response(200, json={"ok": True})
         if method == "POST" and path == "/api/tasks":
             return httpx.Response(200, json=self._create(body or {}))
@@ -237,3 +254,32 @@ class FakeHarnessGateway:
 
     def client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(base_url="http://fake-gateway", transport=httpx.MockTransport(self.handle))
+
+
+# Harness-matrix fixture: one canned node record per device type the matrix
+# scenario names (SYNTHETIC, like everything here). A node not listed gets a
+# CPU llama.cpp record.
+FIXTURE_NODES: dict[str, dict] = {
+    "awolf": {"gpu_model": "NVIDIA GeForce RTX 4090", "vram_gb": 24, "ram_gb": 64, "cpu_cores": 16,
+              "arch": "x86_64", "tier": 1, "app_version": "0.6.15",
+              "running_backends": {"vllm": "google/gemma-4-12B-it-qat-w4a16-ct"},
+              "available_models": ["google/gemma-4-12B-it-qat-w4a16-ct", "Qwen/Qwen3-4B-AWQ"]},
+    "mcmini": {"capabilities": {"unified_memory": True}, "ram_gb": 32, "cpu_cores": 10, "arch": "arm64",
+               "tier": 2, "app_version": "0.6.15", "running_backends": {"ollama": "gemma4:12b"},
+               "available_models": [{"name": "gemma4:12b"}, {"name": "gemma4:e4b"}]},
+    "pop-os": {"ram_gb": 64, "cpu_cores": 24, "arch": "x86_64", "tier": 2, "app_version": "0.6.15",
+               "running_backends": {"llamacpp": "gemma-4-26B-A4B-it-Q4_K_M.gguf"},
+               "available_models": ["gemma-4-26B-A4B-it-Q4_K_M.gguf"]},
+    # An edge box whose chat backend cannot start (the 0.6.15 arm64 state):
+    # it lists ollama with no model and says why in a reconcile refusal.
+    "robopi": {"ram_gb": 8, "cpu_cores": 4, "arch": "aarch64", "tier": 3, "app_version": "0.6.15",
+               "running_backends": {"ollama": ""}, "available_models": [],
+               "reconcile_refusals": [{"scope": "placement", "target": "ollama",
+                                       "reason": "stunnel sidecar image refused by the agent's tar check"}]},
+}
+
+
+def fixture_facts(node: str) -> dict:
+    return FIXTURE_NODES.get(node, {"ram_gb": 8, "cpu_cores": 4, "arch": "x86_64", "tier": 3,
+                                    "running_backends": {"llamacpp": "llama3.2:1b"},
+                                    "available_models": ["llama3.2:1b"]})

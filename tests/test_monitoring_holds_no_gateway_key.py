@@ -41,6 +41,7 @@ MONITORING_SERVICES = {
     "grafana",
     "alertmanager",
     "loki",
+    "tempo",
     "node-exporter",
     "nvidia-exporter",
 }

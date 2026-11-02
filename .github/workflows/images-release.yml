@@ -60,6 +60,10 @@ env:
   DHI_OWNER: noomesh/dhi
   PLATFORMS: linux/amd64,linux/arm64
   FFMPEG_VERSION: "7.1"           # pinned static-ffmpeg mirror tag
+  # The upstream source of that mirror, tag@digest (followup 17a). Moved only by
+  # scripts/refresh-image-digests.py's monthly PR; a tag that no longer
+  # resolves to this digest fails the copy instead of changing the image.
+  FFMPEG_UPSTREAM: "docker.io/mwader/static-ffmpeg:7.1@sha256:a8090df5f5608daef387e1b2e93b98aaacb4d92153ad904e7d715c725724fca4"
 
 jobs:
   # Promotion model (dev → staging → main, every repo). A release candidate
@@ -203,7 +207,7 @@ jobs:
           set -eux
           docker buildx imagetools create \
             --tag "$REGISTRY/$DHI_OWNER/static-ffmpeg:$FFMPEG_VERSION" \
-            "docker.io/mwader/static-ffmpeg:$FFMPEG_VERSION"
+            "$FFMPEG_UPSTREAM"
 
   # deps-core is the NON-ML tier of the shared Python base:
   # base deps + web/cache/feedback/pgvector/mcp extras, no
@@ -629,11 +633,16 @@ jobs:
             context: .
             platforms: linux/amd64
             extra_args: ""
-          # llamacpp: the hardened llama-server, x86 only. ARM nodes resolve
-          # to the upstream multi-arch ghcr.io/ggml-org/llama.cpp:server
-          # (node-agent's llamacppDefaultImage), so building it here for
-          # arm64 would ship an image nothing asks for — and it is a
-          # from-source CMake build, so the QEMU cost is real.
+          # llamacpp: the hardened llama-server, amd64 + arm64. Since i323
+          # (operator decision 3, 2026-10-30) ARM nodes take OUR image too, over
+          # the rail, instead of upstream ghcr.io/ggml-org/llama.cpp:server;
+          # upstream stays the agent's fallback when ours is not staged. The
+          # Dockerfile is a portable CPU/OpenBLAS build (GGML_NATIVE=OFF, no
+          # CUDA, no x86 SIMD flags) on the multi-arch DHI uv base, so the arm64
+          # leg is the same build under QEMU. That is a from-source CMake
+          # compile of llama-server only (`--target llama-server`), the slowest
+          # leg of the release: the gha layer cache (scope llamacpp) makes a
+          # re-run of an unchanged Dockerfile a cache hit.
           #
           # It was absent from this matrix entirely until 2026-09-04, which
           # meant a --dist install could never start llamacpp on an x86
@@ -648,7 +657,20 @@ jobs:
             image: llamacpp
             dockerfile: docker/Dockerfile.llamacpp
             context: .
-            platforms: linux/amd64
+            platforms: linux/amd64,linux/arm64
+            extra_args: ""
+          # ollama: the hardened Ollama (docker/Dockerfile.ollama): the pinned
+          # upstream release tarball, sha256-verified, on the same DHI base.
+          # amd64 + arm64, like llamacpp. The tarball is fetched and unpacked in
+          # a BUILDPLATFORM stage, so the arm64 leg under QEMU only copies
+          # files. Its lock row is `ollama` (a node-bound release image, staged
+          # on the rail for every fleet arch); the upstream pin the
+          # controller's own ollama services run is the `ollama-upstream` row.
+          - name: ollama
+            image: ollama
+            dockerfile: docker/Dockerfile.ollama
+            context: .
+            platforms: linux/amd64,linux/arm64
             extra_args: ""
           # stunnel: the mTLS sidecar image (alpine + stunnel + openssl for
           # the healthcheck). Every stunnel-* door pulls this published image

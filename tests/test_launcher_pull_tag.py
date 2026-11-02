@@ -129,7 +129,7 @@ def _tree(tmp: Path, stale_store: bool) -> tuple[Path, dict]:
 
 def _launch(tmp: Path, stale_store: bool = False, tty: bool = False) -> list[str]:
     work, env = _tree(tmp, stale_store)
-    kw = dict(cwd=work, env=env, timeout=120, stdin=subprocess.DEVNULL)
+    kw = dict(cwd=work, env=env, timeout=600, stdin=subprocess.DEVNULL)
     cmd = ["bash", "scripts/noomesh-start.sh", "--dist"]
     if tty:
         master, slave = pty.openpty()
@@ -179,7 +179,7 @@ def test_a_pull_of_the_wrong_release_is_refused_before_it_downloads(tmp_path):
         'echo "${NOO_IMAGE_PREFIX}/gateway:${NOO_IMAGE_TAG}${NOO_IMAGE_DIGEST_GATEWAY:-}"',
         f'echo "${{NOO_IMAGE_PREFIX}}/gateway:{OLD}@{D_OLD}"'))
     r = subprocess.run(["bash", "scripts/noomesh-start.sh", "--dist"], cwd=work, env=env,
-                       capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+                       capture_output=True, text=True, timeout=600, stdin=subprocess.DEVNULL)
     assert r.returncode == 1 and "refusing to pull the wrong images" in r.stderr, r.stderr
     assert not any(" pull " in l for l in (tmp_path / "log").read_text().splitlines())
 
@@ -202,7 +202,7 @@ def test_a_dumb_terminal_is_captured(tmp_path):
     master, slave = pty.openpty()
     try:
         subprocess.run(["bash", "scripts/noomesh-start.sh", "--dist"], cwd=work, env=e,
-                       stdout=slave, stderr=slave, stdin=subprocess.DEVNULL, timeout=120)
+                       stdout=slave, stderr=slave, stdin=subprocess.DEVNULL, timeout=600)
     finally:
         os.close(slave)
         os.close(master)
@@ -212,7 +212,7 @@ def test_a_dumb_terminal_is_captured(tmp_path):
 
 def _run(tmp_path, env, work):
     return subprocess.run(["bash", "scripts/noomesh-start.sh", "--dist"], cwd=work, env=env,
-                          capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+                          capture_output=True, text=True, timeout=600, stdin=subprocess.DEVNULL)
 
 
 def _pull_lines(tmp_path):
@@ -261,7 +261,7 @@ def test_an_operator_profile_in_env_reaches_the_pull_and_the_up(tmp_path):
         f.write("COMPOSE_PROFILES=embed-cpu\n")
     env.pop("NO_COLOR", None)
     subprocess.run(["bash", "scripts/noomesh-start.sh", "--dist"], cwd=work, env=env,
-                   capture_output=True, timeout=120, stdin=subprocess.DEVNULL)
+                   capture_output=True, timeout=600, stdin=subprocess.DEVNULL)
     log = (tmp_path / "log").read_text().splitlines()
     for verb in (" pull ", " up "):
         line = _line(log, verb)

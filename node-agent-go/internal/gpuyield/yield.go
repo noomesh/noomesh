@@ -24,6 +24,10 @@
 // or too little GPU left for what the placed GPU backends need. Pressure
 // held for NOO_GPU_YIELD_AFTER_S (60 s) yields; the GPU staying clear for
 // NOO_GPU_RESUME_AFTER_S (120 s) resumes. NOO_GPU_YIELD=off never yields.
+// A probe that answered before and now misses its deadline (nvidia-smi
+// stalls while a Windows program loads the GPU on WSL2) counts as pressure
+// too; only measured clear readings resume. A node whose probe never
+// answered, and no-nvidia / unified-memory / driver-lost, never yield.
 //
 // Hold (operator): `noo cluster gpu hold <node>` pauses now and never
 // auto-resumes; `release` hands the node back to the automatic policy. That
@@ -161,6 +165,10 @@ type Contention struct {
 	Unmeasured string `json:"unmeasured,omitempty"`
 	// UnmeasuredDetail: short first-line nvidia-smi error, for driver-lost.
 	UnmeasuredDetail string `json:"unmeasured_detail,omitempty"`
+	// UnmeasuredForS: how long (whole seconds) the GPU has been unmeasured
+	// for the cause above; absent while measured or from an older agent.
+	// `noo cluster verify` warns on a probe-timeout older than a minute.
+	UnmeasuredForS int `json:"unmeasured_for_s,omitempty"`
 	// Policy: "auto" | "off" (NOO_GPU_YIELD=off).
 	Policy string `json:"policy"`
 	// Generation counts accepted holds on this node (persisted; never
@@ -220,8 +228,19 @@ type Controller struct {
 	// reading; cleared on a measured one.
 	unmeasured       string
 	unmeasuredDetail string
-	owned            []docker.NoomeshContainer // this tick's noomesh containers
-	ownedErr         error                     // non-nil: docker could not list them
+	// unmeasuredAt: when the current unmeasured cause began (zero while
+	// measured).
+	unmeasuredAt time.Time
+	// everMeasured: a probe has answered with a measured reading since this
+	// agent started. A probe timeout counts as pressure only then, so a node
+	// with no working nvidia-smi never yields.
+	everMeasured bool
+	// inflight is the probe still running past its deadline (nil = none).
+	// Only Tick touches it.
+	inflight      chan Reading
+	probeDeadline time.Duration
+	owned         []docker.NoomeshContainer // this tick's noomesh containers
+	ownedErr      error                     // non-nil: docker could not list them
 	// listErr is the last GPU-backend listing failure, so a host with no
 	// docker (a Mac running a native ollama) warns once per cause, not
 	// once per tick.
@@ -247,7 +266,7 @@ func New(cfg Config, probe Probe, d Docker, stateDir string) *Controller {
 		state: StateFree, method: MethodNotMeasured,
 		stopped: map[string]string{}, paused: map[string]bool{},
 		gpuSet: map[string]bool{}, measured: map[string]int{},
-		drainTimeout: DefaultDrainTimeout,
+		drainTimeout: DefaultDrainTimeout, probeDeadline: ProbeDeadline,
 	}
 	c.since = c.now()
 	if stateDir != "" {
@@ -331,6 +350,11 @@ func (c *Controller) Report() Contention {
 		Generation: c.generation, Lease: c.lease.clone(), GPUBackends: sortedKeys(c.gpuSet),
 		Unmeasured: c.unmeasured, UnmeasuredDetail: c.unmeasuredDetail,
 	}
+	if c.unmeasured != "" && !c.unmeasuredAt.IsZero() {
+		if d := c.now().Sub(c.unmeasuredAt); d > 0 {
+			r.UnmeasuredForS = int(d / time.Second)
+		}
+	}
 	if c.last.Measured {
 		r.FreeMB = c.last.TotalMB - c.last.UsedMB
 		if r.FreeMB < 0 {
@@ -383,7 +407,7 @@ func (c *Controller) noteListErr(err error) {
 
 // Tick is one sample + decision.
 func (c *Controller) Tick(ctx context.Context) {
-	r := c.probe.Read(ctx)
+	r := c.sample(ctx)
 	lctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	backends, err := c.docker.GPUBackendContainers(lctx)
 	cancel()
@@ -406,6 +430,46 @@ func (c *Controller) Tick(ctx context.Context) {
 	c.execute(ctx, act)
 }
 
+// ProbeDeadline bounds one probe in the controller loop. SMIProbe makes up to
+// two nvidia-smi calls of 5 s each (hardware.NvidiaSMI); this is above both.
+const ProbeDeadline = 12 * time.Second
+
+// sample reads the probe without ever letting it block the loop for longer
+// than the probe deadline. A probe that misses its deadline keeps running in
+// its goroutine (nvidia-smi stuck in the kernel cannot be killed); while it
+// does, no second probe starts and every tick reports a probe-timeout. When
+// the stuck probe finally answers, that answer is the next tick's reading.
+func (c *Controller) sample(ctx context.Context) Reading {
+	timeout := Reading{Unmeasured: UnmeasuredProbeTimeout}
+	if c.inflight != nil {
+		select {
+		case r := <-c.inflight:
+			c.inflight = nil
+			return r
+		default:
+			return timeout
+		}
+	}
+	ch := make(chan Reading, 1)
+	c.inflight = ch
+	pctx, cancel := context.WithTimeout(ctx, c.probeDeadline)
+	go func() {
+		defer cancel()
+		ch <- c.probe.Read(pctx)
+	}()
+	timer := time.NewTimer(c.probeDeadline)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		c.inflight = nil
+		return r
+	case <-timer.C:
+		return timeout
+	case <-ctx.Done():
+		return timeout
+	}
+}
+
 // actions are the docker calls a decision needs, run OUTSIDE the lock: a
 // graceful stop can take half a minute, and the heartbeat's Report must not
 // wait on it.
@@ -422,16 +486,27 @@ func (c *Controller) decideLocked(r Reading, backends []docker.GPUBackend) (act 
 	c.refreshGPUSetLocked(backends)
 
 	if !r.Measured {
-		// Nothing to judge by. Never pause on no data; a node already
-		// paused stays paused (freeness cannot be confirmed either).
+		// Nothing to judge by, with one exception below. Never pause on no
+		// data; a node already paused stays paused (freeness cannot be
+		// confirmed either).
 		c.method = MethodNotMeasured
 		if r.Unmeasured == UnmeasuredDriverLost && c.unmeasured != UnmeasuredDriverLost {
 			slog.Warn("gpuyield: the NVIDIA driver lost the GPU; GPU backends cannot start",
 				"detail", r.UnmeasuredDetail)
 		}
+		if r.Unmeasured != c.unmeasured || c.unmeasuredAt.IsZero() {
+			c.unmeasuredAt = now
+		}
 		c.unmeasured, c.unmeasuredDetail = r.Unmeasured, r.UnmeasuredDetail
 		c.foreignMB, c.noomeshMB, c.unknownMB, c.orphans = 0, 0, 0, nil
-		c.pressureAt, c.clearAt = time.Time{}, time.Time{}
+		c.clearAt = time.Time{} // a timeout is never "clear"
+		if r.Unmeasured == UnmeasuredProbeTimeout && c.everMeasured && c.cfg.Enabled {
+			// A probe that answered before and now stops answering: on WSL2
+			// that is a Windows program loading the GPU (i396). It is
+			// pressure, judged by the same window as foreign use.
+			return c.timeoutPressureLocked(now, backends)
+		}
+		c.pressureAt = time.Time{}
 		if !c.lastNoMeter {
 			slog.Info("gpuyield: GPU memory not measurable on this node; yield inactive")
 			c.lastNoMeter = true
@@ -441,6 +516,8 @@ func (c *Controller) decideLocked(r Reading, backends []docker.GPUBackend) (act 
 		}
 		return c.enforceLocked(backends)
 	}
+	c.everMeasured = true
+	c.unmeasuredAt = time.Time{}
 	c.lastNoMeter = false
 	c.unmeasured, c.unmeasuredDetail = "", ""
 
@@ -507,6 +584,31 @@ func (c *Controller) decideLocked(r Reading, backends []docker.GPUBackend) (act 
 			"why", why, "after", c.cfg.YieldAfter)
 	}
 	c.setStateLocked(next, why)
+	if now.Sub(c.pressureAt) >= c.cfg.YieldAfter {
+		return c.pauseLocked(backends, StateYielded, why)
+	}
+	return act
+}
+
+// timeoutPressureLocked is the probe-timeout case of decideLocked: the
+// probe is not answering, which counts as pressure. YieldAfter of
+// consecutive timeouts yields; nothing here ever resumes (only measured
+// clear readings do).
+func (c *Controller) timeoutPressureLocked(now time.Time, backends []docker.GPUBackend) (act actions) {
+	why := "GPU probe (nvidia-smi) not answering: a program outside noomesh is likely using the GPU"
+	switch c.state {
+	case StateDraining:
+		return act
+	case StateHeld:
+		return c.enforceLocked(backends)
+	case StateYielded:
+		c.reason = why
+		return c.enforceLocked(backends)
+	}
+	if c.pressureAt.IsZero() {
+		c.pressureAt = now
+		slog.Info("gpuyield: GPU probe not answering; yielding if it persists", "after", c.cfg.YieldAfter)
+	}
 	if now.Sub(c.pressureAt) >= c.cfg.YieldAfter {
 		return c.pauseLocked(backends, StateYielded, why)
 	}

@@ -1035,7 +1035,7 @@ mod tests {
             scopes: vec!["read".into(), "write".into(), "admin".into()],
             role,
             harness: harness.map(String::from),
-            act: act.then(|| crate::auth::Actor { sub: "key:x".into(), iss_user: None, task: None }),
+            act: act.then(|| crate::auth::Actor { sub: "key:x".into(), iss_user: None, task: None, feature: None }),
         }
     }
 

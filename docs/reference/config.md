@@ -725,7 +725,7 @@ Decide in this order:
    `NOO_TRELLION_INTEL_ENABLED` or `NOO_VOICE_ENABLED` in `.env` — a stale
    flag beside a live declaration is how a licensed add-on silently changes
    state on upgrade. The TLS/mTLS family
-   (`NOO_TLS_*`, `NOO_NATS_TLS`, `NOO_PG_SSLMODE`, `NOO_REDIS_TLS`,
+   (`NOO_TLS_*`, `NOO_NATS_TLS`, `NOO_PG_SSLMODE`,
    `NOO_MTLS_*`) is also env-only for good: it must not be weakenable from
    a YAML edit and is needed to *connect* to the database.
 4. **Everything else** → `noomesh.yaml`: a nested section if the

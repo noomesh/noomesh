@@ -432,10 +432,11 @@ func (c *Client) PrefetchImages(ctx context.Context, refs []string, placements i
 // reconciler can prefetch it. It calls the same chooseBackendImage as
 // StartBackendSDK (image_choice.go): CPU image on a node without NVIDIA, the
 // controller's override, ${VAR} substitution and the pinning policy. It
-// returns "" when it cannot tell (unknown backend), when the policy refuses
-// the ref (the start path reports why), or when StartBackendSDK would swap in
-// a locally-built hardened llama.cpp (present locally, so nothing to fetch).
-// A wrong answer here only costs a missed or wasted prefetch.
+// returns "" when it cannot tell (unknown backend) or when the policy refuses
+// the ref (the start path reports why). For a hardened default it is OURS; if
+// ours is not staged the start falls back to upstream and the prefetch has
+// merely failed (logged). A wrong answer here only costs a missed or wasted
+// prefetch.
 func BackendImageRef(backend, override string) string {
 	spec, ok := backendSpecs[backend]
 	if !ok {
@@ -444,12 +445,6 @@ func BackendImageRef(backend, override string) string {
 	choice, err := chooseBackendImage(backend, spec, override)
 	if err != nil {
 		return "" // the start path refuses it with the explanation
-	}
-	if backend == "llamacpp" && choice.Ref == "ghcr.io/ggml-org/llama.cpp:server" {
-		// StartBackendSDK prefers a locally-present hardened build; if one
-		// is here the upstream image is not needed, and if none is, the
-		// start path pulls the upstream one itself.
-		return ""
 	}
 	return choice.Ref
 }

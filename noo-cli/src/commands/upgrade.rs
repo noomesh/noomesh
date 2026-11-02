@@ -514,14 +514,13 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         {
             use std::os::unix::process::CommandExt;
             let mut cmd = std::process::Command::new(&exe);
-            cmd.arg("upgrade").arg("--stage2");
-            if stack { cmd.arg("--stack"); }
-            if nodes { cmd.arg("--nodes"); }
-            if seats_only { cmd.arg("--seats"); }
-            if no_seats { cmd.arg("--no-seats"); }
-            if let Some(t) = &tag_override { cmd.arg("--tag").arg(t); }
-            if skip_gw_key_check { cmd.arg("--skip-gateway-key-check"); }
-            if allow_downgrade { cmd.arg("--allow-downgrade"); }
+            // The token rides the environment ($NOO_TOKEN), never argv: a
+            // command line is readable through /proc/<pid>/cmdline.
+            if let Some(t) = &g.token { cmd.env("NOO_TOKEN", t); }
+            cmd.args(stage2_args(g, &Stage2 {
+                stack, nodes, seats_only, no_seats, tag: tag_override.as_deref(),
+                force, skip_gw_key_check, allow_downgrade,
+            }));
             let err = cmd.exec(); // only returns on failure
             fail(g.json, ExitCode::Generic, "reexec_failed",
                 &format!("could not re-exec the new binary: {err}"),
@@ -926,7 +925,7 @@ fn mcp_catalogue(g: &Globals) -> Option<String> {
 fn catalogue_hint(before: Option<&str>, after: Option<&str>) -> Option<&'static str> {
     match (before, after) {
         (Some(b), Some(a)) if a != b => Some(
-            "the MCP tool list changed: reconnect connected MCP clients (`/mcp` in Claude Code, restart Codex) or they keep the old one",
+            "the MCP tool list changed: a client with a session is told on its next call; reconnect any other (`/mcp` in Claude Code, restart Codex) or it keeps the old list",
         ),
         _ => None,
     }
@@ -1039,6 +1038,12 @@ fn reconcile_addon_nats_principals(g: &Globals, root: &std::path::Path) {
 ///   user now, which is safe because nothing may present it (verify
 ///   with /connz?auth=1 first — the runbook's step). The launcher's
 ///   pre-`up` check refuses the start if this did not happen.
+/// - reconcile_storage_dirs (1.9)
+///   1.9. Create every data directory THIS release's compose binds that an
+///   upgraded install never made (0.6.16: `tempo`; onboarding's storage
+///   step made the rest). Before the pin moves, so a directory that cannot
+///   be created refuses with nothing moved; the launcher's bind check would
+///   otherwise refuse after the pin, naming `noo onboard --only storage`.
 /// - reconcile_service_certs (2.5)
 ///   2.5. Reconcile service certs a NEW release's compose expects but an
 ///   upgraded (not freshly onboarded) install never issued — see
@@ -1109,6 +1114,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     migrate_retired_yaml_gates(g, &roll.root);
     rerender_nats_users_for_roll(g, &roll.root);
     refresh_deploy_slice(g, &roll);
+    reconcile_storage_dirs(g, &roll.root);
     move_pin(g, &roll, target_stack_lock.as_deref(), &addon_prep);
 
     // Everything the launcher's bind checks and the new compose expect.
@@ -2078,6 +2084,55 @@ fn missing_service_certs<'a>(
     existing: &std::collections::HashSet<&str>,
 ) -> Vec<&'a str> {
     all.iter().copied().filter(|s| !existing.contains(s)).collect()
+}
+
+/// A release can add a data directory its compose binds (0.6.16: `tempo`,
+/// under the state root). Onboarding's storage step creates the tree, but an
+/// UPGRADED install never runs it again, so the launcher's bind-source check
+/// refused the 0.6.15 -> 0.6.16 move on every existing controller
+/// (`tempo: … missing (Docker would create it root-owned)`), after the pin
+/// had moved. This creates each missing directory through onboarding's own
+/// code (`storage_targets_in` over `onboard::STORAGE_SUBDIRS`, `create_storage_dir`
+/// with its owner), before the pin moves, and refuses loudly when one cannot
+/// be made. Existing directories are never touched.
+fn reconcile_storage_dirs(g: &Globals, root: &std::path::Path) {
+    let env = root.join(".env");
+    let read = |k: &str| crate::onboard::env::read_env_key(&env, k);
+    let data = read("NOO_DATA_ROOT");
+    if data.trim().is_empty() {
+        // Compose requires it; the launcher refuses with its own remedy.
+        return;
+    }
+    let state = crate::commands::data_root::state_root_of(Some(read("NOO_STATE_ROOT").as_str()), data.trim());
+    let missing = missing_storage_dirs(std::path::Path::new(data.trim()), std::path::Path::new(&state), &read("NOO_PG_DATA"));
+    let mut failed: Vec<String> = Vec::new();
+    for (name, path) in &missing {
+        match crate::onboard::steps::create_storage_dir(name, path) {
+            Ok(()) => if !g.json {
+                ui::done(&format!("created {} (new in this release)", path.display()));
+            },
+            Err(e) => failed.push(format!("{} ({e})", path.display())),
+        }
+    }
+    if !failed.is_empty() {
+        fail(g.json, ExitCode::Generic, "storage_dir_failed",
+            &format!("could not create this release's data director{} {} — nothing was changed; \
+                      the new stack would refuse to start without {}",
+                if failed.len() == 1 { "y" } else { "ies" }, failed.join(", "),
+                if failed.len() == 1 { "it" } else { "them" }),
+            Some("noo onboard --only storage   # then re-run: noo upgrade --stack"));
+    }
+}
+
+/// The storage directories this binary's release expects (onboarding's
+/// `onboard::STORAGE_SUBDIRS` floor, placed by `storage_targets_in`) that do not
+/// exist yet.
+fn missing_storage_dirs(data: &std::path::Path, state: &std::path::Path, pg_data: &str) -> Vec<(String, std::path::PathBuf)> {
+    let names: Vec<String> = crate::onboard::STORAGE_SUBDIRS.iter().map(|s| s.to_string()).collect();
+    crate::onboard::steps::storage_targets_in(&names, data, state, pg_data)
+        .into_iter()
+        .filter(|(_, p)| !p.exists())
+        .collect()
 }
 
 /// A release can add a service whose compose mounts
@@ -3525,7 +3580,7 @@ impl CliAction {
 }
 
 /// `MAJOR.MINOR.PATCH[-pre][+build]` (optional leading `v`) -> comparable parts.
-fn parse_cli_semver(v: &str) -> Option<((u64, u64, u64), Vec<String>)> {
+pub(crate) fn parse_cli_semver(v: &str) -> Option<((u64, u64, u64), Vec<String>)> {
     let v = v.trim().trim_start_matches('v');
     let v = v.split('+').next()?;
     let (core, pre) = match v.split_once('-') {
@@ -4288,6 +4343,9 @@ fn addon_client(g: &Globals) -> crate::addons::lock_fetch::Client {
 
 /// Remedy for an add-on that holds a stack roll.
 fn addon_hold_fix(addon: &str, r: &crate::addons::resolve::Refusal) -> String {
+    if let Some(fix) = r.registry_login_fix(addon) {
+        return fix;
+    }
     if r.is_auth() {
         return r.auth_fix().to_string();
     }
@@ -4381,7 +4439,7 @@ fn addon_holds(g: &Globals, root: &std::path::Path, target: &str) -> Vec<(String
         .filter_map(|addon| {
             let pinned = pins.get(addon).map(|p| p.version.clone());
             let want = crate::addons::resolve::Want {
-                addon, stack_tag: target, stack_lock: stack_lock.as_deref(), pinned: pinned.as_deref(), allow_downgrade: false,
+                addon, stack_tag: target, stack_lock: stack_lock.as_deref(), pinned: pinned.as_deref(), pin: pins.get(addon), allow_downgrade: false,
             };
             crate::addons::resolve::installed_anchor(addon)
                 .and_then(|a| crate::addons::resolve::fetch_and_check(&client, &a, &want))
@@ -4778,9 +4836,101 @@ fn strip_yaml_gate(text: &str, section: &str, key: &str) -> String {
     joined
 }
 
+/// What `noo upgrade` hands its stage-2 re-exec. Every flag the fleet stages
+/// read is a field, so the call site cannot leave one out: `--force` used to
+/// be dropped here, and `noo upgrade --all --force` then met the very
+/// refusal it was passed to get past (909b).
+struct Stage2<'a> {
+    stack: bool,
+    nodes: bool,
+    seats_only: bool,
+    no_seats: bool,
+    tag: Option<&'a str>,
+    force: bool,
+    skip_gw_key_check: bool,
+    allow_downgrade: bool,
+}
+
+/// The re-exec's argv after the binary: the globals first (the stage-2 run is
+/// this command's output, so `--json` and `--quiet` follow it; the token goes
+/// in the environment, never here), then `upgrade --stage2` and the flags.
+fn stage2_args(g: &Globals, s: &Stage2) -> Vec<String> {
+    let mut a: Vec<String> = Vec::new();
+    if g.json { a.push("--json".into()); }
+    if g.quiet { a.push("--quiet".into()); }
+    if g.verbose { a.push("--verbose".into()); }
+    if let Some(u) = &g.gateway_override { a.push("--gateway".into()); a.push(u.clone()); }
+    if let Some(t) = g.timeout_secs { a.push("--timeout".into()); a.push(t.to_string()); }
+    a.push("upgrade".into());
+    a.push("--stage2".into());
+    for (on, flag) in [
+        (s.stack, "--stack"), (s.nodes, "--nodes"), (s.seats_only, "--seats"), (s.no_seats, "--no-seats"),
+        (s.force, "--force"), (s.skip_gw_key_check, "--skip-gateway-key-check"),
+        (s.allow_downgrade, "--allow-downgrade"),
+    ] {
+        if on { a.push(flag.into()); }
+    }
+    if let Some(t) = s.tag { a.push("--tag".into()); a.push(t.to_string()); }
+    a
+}
+
 #[cfg(test)]
 mod reexec_tests {
-    use super::reexec_path;
+    use super::{reexec_path, stage2_args, Stage2};
+
+    /// 909b: (flag, the variable its parser arm sets) for every flag the
+    /// fleet stages read. Checked three ways below: each is a parser arm,
+    /// each is forwarded, and nothing the stage-2 dispatch hands
+    /// run_fleet_stages is missing from it.
+    const FLEET_FLAGS: &[(&str, &str)] = &[
+        ("--stack", "stack"), ("--nodes", "nodes"), ("--seats", "seats_only"), ("--no-seats", "no_seats"),
+        ("--tag", "tag_override"), ("--force", "force"),
+        ("--skip-gateway-key-check", "skip_gw_key_check"), ("--allow-downgrade", "allow_downgrade"),
+    ];
+
+    fn all_set() -> Vec<String> {
+        let g = crate::Globals {
+            json: true, verbose: true, gateway_override: Some("https://ctl:8443".into()),
+            timeout_secs: Some(30), token: Some("tok-secret".into()), quiet: true,
+        };
+        stage2_args(&g, &Stage2 {
+            stack: true, nodes: true, seats_only: true, no_seats: true, tag: Some("v0.6.16"),
+            force: true, skip_gw_key_check: true, allow_downgrade: true,
+        })
+    }
+
+    #[test]
+    fn the_reexec_forwards_every_fleet_flag_and_the_globals() {
+        let args = all_set();
+        for (flag, _) in FLEET_FLAGS {
+            assert!(args.iter().any(|a| a.as_str() == *flag), "{flag} is parsed but not forwarded: {args:?}");
+        }
+        let at = |s: &str| args.iter().position(|a| a.as_str() == s).unwrap_or_else(|| panic!("{s} missing: {args:?}"));
+        assert_eq!(args[at("--tag") + 1], "v0.6.16");
+        for global in ["--json", "--quiet", "--verbose", "--gateway", "--timeout"] {
+            assert!(at(global) < at("upgrade"), "{global} must lead the command");
+        }
+        assert!(!args.iter().any(|a| a.contains("tok-secret")), "the token is never on argv");
+    }
+
+    #[test]
+    fn every_fleet_stage_input_has_a_parsed_and_forwarded_flag() {
+        let src = include_str!("upgrade.rs");
+        for (flag, _) in FLEET_FLAGS {
+            assert!(src.contains(&format!("\"{flag}\" =>")), "{flag} has no parser arm");
+        }
+        // The stage-2 dispatch's call: each argument is a table variable,
+        // `g`, or `seats` (derived from --seats/--no-seats/--nodes).
+        let stage2 = &src[src.find("    if stage2 \u{7b}").expect("stage-2 dispatch")..];
+        let call = &stage2[stage2.find("run_fleet_stages(").expect("call") + "run_fleet_stages(".len()..];
+        let call = &call[..call.find(");").expect("end of call")];
+        let args: Vec<&str> = call.split(',').map(|a| a.trim().trim_end_matches(".as_deref()")).collect();
+        assert!(args.len() >= 8, "parsed {args:?}: the call was not read whole");
+        for arg in args {
+            assert!(arg == "g" || arg == "seats" || FLEET_FLAGS.iter().any(|(_, v)| *v == arg),
+                "run_fleet_stages takes `{arg}` but no forwarded flag sets it: add it to FLEET_FLAGS and Stage2");
+        }
+    }
 
     #[test]
     fn reexec_path_strips_the_deleted_marker_and_requires_a_file() {
@@ -6284,5 +6434,89 @@ pub(crate) mod phase_src {
     /// The ordered phase list of `noo upgrade --stack`.
     pub(crate) fn list() -> &'static str {
         body("upgrade_stack")
+    }
+}
+
+#[cfg(test)]
+mod storage_dir_tests {
+    use super::missing_storage_dirs;
+    use crate::onboard::{STATE_SUBDIRS, STORAGE_SUBDIRS};
+
+    /// A data root holding every storage directory except `skip`.
+    fn root_without(tag: &str, names: &[&str], skip: &[&str]) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("noo-storage-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        for n in names {
+            if !skip.contains(n) {
+                std::fs::create_dir_all(d.join(n)).unwrap();
+            }
+        }
+        d
+    }
+
+    /// 0.6.16: a data root onboarded by 0.6.15 has every directory but
+    /// `tempo`; the roll must find exactly that one (the launcher refused the
+    /// move on every existing controller without it).
+    #[test]
+    fn an_old_data_root_missing_tempo_needs_exactly_tempo() {
+        let root = root_without("tempo", STORAGE_SUBDIRS, &["tempo"]);
+        assert_eq!(missing_storage_dirs(&root, &root, ""), vec![("tempo".to_string(), root.join("tempo"))]);
+        std::fs::create_dir_all(root.join("tempo")).unwrap();
+        assert!(missing_storage_dirs(&root, &root, "").is_empty(), "a complete root needs nothing");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With `NOO_STATE_ROOT` set elsewhere the state set lives there, and a
+    /// nested directory (the voice models) is found too.
+    #[test]
+    fn a_separate_state_root_gets_its_new_dir_there() {
+        let data = root_without("data", STORAGE_SUBDIRS, &["models/voice/piper"]);
+        let state = root_without("state", STATE_SUBDIRS, &["tempo"]);
+        let missing = missing_storage_dirs(&data, &state, "");
+        assert_eq!(missing, vec![
+            ("models/voice/piper".to_string(), data.join("models/voice/piper")),
+            ("tempo".to_string(), state.join("tempo")),
+        ]);
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// Postgres' device is NOO_PG_DATA: under another path it is not ours to
+    /// make, so its absence under the root is not "missing".
+    #[test]
+    fn postgres_elsewhere_is_not_created() {
+        let root = root_without("pg", STORAGE_SUBDIRS, &["postgres"]);
+        assert!(missing_storage_dirs(&root, &root, "/home/op/noo-pg/postgres").is_empty());
+        assert_eq!(missing_storage_dirs(&root, &root, "").len(), 1, "an unset NOO_PG_DATA means the root's own postgres");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Onboarding's creation helper makes the directory (a name with no
+    /// service owner, so no container is started by the test).
+    #[test]
+    fn the_shared_helper_creates_the_directory() {
+        let root = root_without("create", &[], &[]);
+        let target = root.join("noo-data");
+        crate::onboard::steps::create_storage_dir("noo-data", &target).unwrap();
+        assert!(target.is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The step runs after the new deploy slice and BEFORE the pin moves (a
+    /// failure leaves the old release pinned) and long before the launcher's
+    /// bind check; it creates through onboarding's helper and refuses loudly.
+    #[test]
+    fn storage_dirs_are_made_before_the_pin_moves() {
+        let list = super::phase_src::list();
+        let at = |n: &str| list.find(n).unwrap_or_else(|| panic!("{n} not in the phase list"));
+        let step = at("reconcile_storage_dirs(g, &roll.root)");
+        assert!(at("refresh_deploy_slice(") < step, "after the new release's compose is laid down");
+        for later in ["move_pin(", "launch_stack("] {
+            assert!(step < at(later), "the data directories must exist before `{later}`");
+        }
+        let body = super::phase_src::body("reconcile_storage_dirs");
+        assert!(body.contains("crate::onboard::steps::create_storage_dir("), "created through onboarding's helper");
+        assert!(body.contains("\"storage_dir_failed\""), "a directory that cannot be made is a refusal");
     }
 }

@@ -21,9 +21,9 @@ service. Found 2026-09-29 in `dev`:
 
 This guard reads every service's healthcheck across the composed
 projection (base + every add-on overlay) and every `HEALTHCHECK` in the
-tree's Dockerfiles, and refuses the verification-off idioms. The one
-allow-listed line is named below with the reason; when it is fixed the
-entry comes out (a stale entry fails, so the list cannot rot).
+tree's Dockerfiles, and refuses the verification-off idioms. Nothing is
+allow-listed; an entry added later must name its reason, and a stale one
+fails, so the list cannot rot.
 
 Planted: `ctx.check_hostname=False` back into the nvidia-exporter compose
 healthcheck → `test_no_compose_healthcheck_disables_verification` fails
@@ -53,12 +53,10 @@ FORBIDDEN = (
     re.compile(r"insecure_skip_verify:\s*true"),
 )
 
-# file → the one substring that is allowed there, and why. Deferred by the
-# operator (2026-09-29): the sandbox image's probe is inside a per-call
-# bwrap namespace and its TLS material is a separate piece of work.
-ALLOWED = {
-    "docker/Dockerfile.sandbox": "ctx.verify_mode=ssl.CERT_NONE; urllib.request.urlopen('https://localhost:8080/health'",
-}
+# file → the one substring that is allowed there, and why. Empty since the
+# sandbox image dropped its verification-off probe (followups 510 + 1241 §3);
+# the stale-entry check stays so a future entry cannot rot.
+ALLOWED: dict[str, str] = {}
 
 
 def _hits(text: str) -> list[str]:
@@ -143,3 +141,22 @@ def test_the_idioms_are_actually_matched(pattern: str) -> None:
 def test_ordinary_flags_are_not_false_positives() -> None:
     assert not _hits("curl -sk-free https://x"), "-sk-free is not -k"
     assert not _hits("wget -qO- http://127.0.0.1:8084/healthz")
+
+
+def test_the_sandbox_has_one_probe_and_it_verifies_over_mtls() -> None:
+    """The sandbox image declares no probe (it once shipped one with
+    verification off, on a port nothing listened on); compose holds the only
+    one, and it checks the server against the CA and presents the sandbox's
+    own leaf, on the port the uvicorn command actually binds. Both executor
+    services share it."""
+    assert _healthcheck_instructions(ROOT / "docker/Dockerfile.sandbox") == ["HEALTHCHECK NONE"]
+    svcs = raw_services_union()
+    for name in ("sandbox", "sandbox-extra"):
+        svc = svcs[name]
+        cmd = svc["command"]
+        port = cmd[cmd.index("--port") + 1]
+        probe = " ".join(svc["healthcheck"]["test"])
+        assert "cafile='/tls/ca.crt'" in probe, (name, probe)
+        assert "load_cert_chain('/tls/services/sandbox/service.crt','/tls/services/sandbox/service.key')" in probe, (name, probe)
+        assert f"https://localhost:{port}/health" in probe, (name, port, probe)
+        assert "http://" not in probe, (name, probe)

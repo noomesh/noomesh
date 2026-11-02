@@ -265,7 +265,7 @@ pub async fn run() -> Result<()> {
             crate::nats_credentials::ALLOW_ANONYMOUS_VAR
         ),
     }
-    let nats = crate::bus::connect(&nats_url, cred, &inbox_prefix(&node), Duration::from_secs(30)).await?;
+    let nats = crate::bus::connect(&nats_url, cred, &inbox_prefix(&node), Duration::from_secs(30), false).await?;
     tracing::info!(node = %node, gateway = %gateway, model = %model, endpoint = %model_url, "harness: online");
 
     let client = crate::tls::cluster_client();

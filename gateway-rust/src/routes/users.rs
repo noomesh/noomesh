@@ -1088,6 +1088,18 @@ fn erase_targets(keep_account: bool, episodes_have_user_id: bool) -> Vec<EraseTa
         // Raw uploads the user sent (the files go after commit, see
         // `uploads_to_remove`).
         EraseTarget { label: "uploads", table: "noo_uploads", where_sql: "owner = $1" },
+        // Request traces (i359): metadata only, but each row names who made the
+        // request (`actor`, and `user_uuid` resolved from its account). A
+        // connection login is stored as `alice/<conn>`, so the account part of
+        // the actor is matched (split_part, not LIKE: `_` is a LIKE wildcard and
+        // legal in a username). Before the account goes, so the subquery still
+        // finds it. The spans in Tempo carry the same name and age out with
+        // Tempo's 30 days; an erase cannot reach them (docs/security).
+        EraseTarget {
+            label: "request_traces",
+            table: "noo_request_trace",
+            where_sql: "split_part(actor, '/', 1) = $1 OR user_uuid = (SELECT user_uuid FROM noo_users WHERE username = $1)",
+        },
     ];
     if !keep_account {
         t.push(EraseTarget { label: "account", table: "noo_users", where_sql: "username = $1" });
@@ -4334,7 +4346,7 @@ async fn team_delete_inner(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     /// Security review of #1001: `graph` is a per-account USER scope
     /// (`KNOWN_USER_SCOPES`), not a service-key scope. A service key cannot be
     /// issued it, by itself or beside `read`, so no key can gain the six graph
@@ -4349,6 +4361,13 @@ mod tests {
         assert!(!OPERATOR_ONLY_KEY_SCOPES.contains(&"graph"));
         // control: a vocabulary scope is still accepted, so the test is not vacuous
         assert!(validate_key_scopes(&["chat".to_string()]).is_ok());
+    }
+
+    /// The archive (`$1` username, `$2` run id, `$3` store label) and delete
+    /// (`$1` username) statements the erase runs for `table`, with its store
+    /// label, for a repo test that erases one store against a real table.
+    pub(crate) fn erase_statements(table: &str) -> Option<(String, String, &'static str)> {
+        super::erase_targets(true, true).iter().find(|t| t.table == table).map(|t| (t.snapshot_sql(), t.delete_sql(), t.label))
     }
 
     use axum::response::IntoResponse;
@@ -4404,6 +4423,22 @@ mod tests {
         labels.sort_unstable();
         labels.dedup();
         assert_eq!(labels.len(), t.len());
+    }
+
+    /// Request traces name who made each request: erased with the account and
+    /// when it is kept, by the name AND the resolved account.
+    #[test]
+    fn rtbf_lists_the_request_trace_store() {
+        for keep in [true, false] {
+            let t = super::erase_targets(keep, true);
+            let r = t.iter().position(|x| x.table == "noo_request_trace").expect("noo_request_trace must be an erase target");
+            assert_eq!(t[r].label, "request_traces");
+            assert!(t[r].where_sql.contains("split_part(actor, '/', 1) = $1") && t[r].where_sql.contains("user_uuid"), "{}", t[r].where_sql);
+            assert!(!t[r].where_sql.contains("LIKE"), "`_` in a username is a LIKE wildcard");
+            if let Some(a) = t.iter().position(|x| x.table == "noo_users") {
+                assert!(r < a, "the subquery reads the account: erase traces before it");
+            }
+        }
     }
 
     /// Per-account settings (`walks.save_threads`) are an erase target, and

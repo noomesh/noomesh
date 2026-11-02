@@ -79,6 +79,12 @@ pub(crate) async fn request_with_timeout(
     {
         anyhow::bail!("{}: {subject}", crate::addons::INTEL_DISABLED_MARKER);
     }
+    // No bus, no round trip (i301 a.3): fail at once with a typed error the
+    // routes answer as 503 `bus_unavailable`, instead of holding the caller
+    // for the whole worker timeout while the client reconnects.
+    if !crate::state::bus_connected(nats) {
+        return Err(anyhow::Error::new(BusUnavailable { subject: subject.to_string() }));
+    }
     let data = serde_json::to_vec(payload)?;
 
     // Every `worker.*` message carries the caller. See
@@ -107,6 +113,21 @@ pub(crate) async fn request_with_timeout(
 
     reply_result(subject, value)
 }
+
+/// The gateway is not connected to NATS: nothing was sent. Typed so routes
+/// answer 503 `bus_unavailable` (`routes::bus_unavailable`), not a timeout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusUnavailable {
+    pub subject: String,
+}
+
+impl std::fmt::Display for BusUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NATS is not connected; {} was not sent", self.subject)
+    }
+}
+
+impl std::error::Error for BusUnavailable {}
 
 /// The NATS round-trip did not answer within the deadline. A typed error
 /// (its text is unchanged: `Worker timeout on <subject>`) so
@@ -420,6 +441,20 @@ pub async fn request_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// i301 a.3: with NATS down a worker request fails AT ONCE with the typed
+    /// error the routes answer as 503 `bus_unavailable`, not after the
+    /// worker timeout, and nothing is sent.
+    #[tokio::test]
+    async fn a_request_without_the_bus_fails_at_once_and_typed() {
+        let nats = crate::state::unconnected_bus().await;
+        let t = std::time::Instant::now();
+        let e = request_with_timeout(&nats, "worker.test.ping", &serde_json::json!({}), Duration::from_secs(30))
+            .await
+            .expect_err("no bus");
+        assert!(e.downcast_ref::<BusUnavailable>().is_some(), "typed BusUnavailable, got: {e}");
+        assert!(t.elapsed() < Duration::from_millis(500), "not after a timeout: {:?}", t.elapsed());
+    }
 
     /// the per-dispatch user token is a bearer. A DLQ row is
     /// persisted and replayed later, so the token must never reach it.

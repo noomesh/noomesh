@@ -274,6 +274,9 @@ fn mint_shared_secrets(addon: &str) -> Result<Vec<String>, Refusal> {
 /// The remedy for a step-0 refusal, by cause.
 pub(crate) fn pin_fix(addon: &str, r: &crate::addons::resolve::Refusal) -> String {
     use crate::addons::resolve::Refusal as R;
+    if let Some(fix) = r.registry_login_fix(addon) {
+        return fix;
+    }
     if r.is_auth() {
         return r.auth_fix().to_string();
     }
@@ -321,11 +324,13 @@ impl EnableOps for Live<'_> {
             ));
         };
         let stack_lock = addons::resolve::installed_stack_lock(&root, &tag);
-        // A third-party registry is the OPERATOR's choice, not the vendor's: it
-        // gets no credential (the vendor token is never sent to it) and no
-        // entitlement proxy. Anonymous pulls only.
+        // A third-party registry is the OPERATOR's choice, not the vendor's: the
+        // vendor token is never sent to it and there is no entitlement proxy.
+        // It gets only the credential the operator registered for THIS add-on
+        // (`noo addons registry-login`), bound to the root the keys were trusted for.
         let client = if third_party {
-            addons::lock_fetch::Client::new(None)
+            let own = addons::resolve::installed_anchor(addon).and_then(|a| addons::third_party_client(addon, &a));
+            own.map_err(|r| Refusal { why: format!("{}. Nothing was changed", r.why(addon)), fix: pin_fix(addon, &r) })?
         } else {
             addons::installed_client().map_err(|e| Refusal {
                 why: format!("{e}. Nothing was changed"),

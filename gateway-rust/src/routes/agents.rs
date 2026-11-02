@@ -2037,6 +2037,11 @@ async fn messages_send(
     cluster: Option<Extension<ClusterNode>>,
     Json(req): Json<SendReq>,
 ) -> AppResult {
+    // No bus: 503 `bus_unavailable` at once (i301 a.3). Below, the sender's
+    // keys are read from KV and the envelope is published to the stream;
+    // either would wait out a timeout on a disconnected client and then
+    // read as an internal error.
+    super::require_bus(&state.nats)?;
     let who = caller(&requester, &cluster);
     who.check_broadcast(&req.to)?;
     let from = who.acting_agent(req.from.as_deref())?;

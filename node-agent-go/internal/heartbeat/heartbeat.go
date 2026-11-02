@@ -628,6 +628,7 @@ func DetectHostIP(cfg *config.Config) string {
 	}
 
 	// Parse controller host:port for source IP detection
+	udp := ""
 	parsed, err := url.Parse(cfg.ControllerURL)
 	if err == nil {
 		host := parsed.Hostname()
@@ -641,28 +642,41 @@ func DetectHostIP(cfg *config.Config) string {
 		if err == nil {
 			defer conn.Close()
 			if localAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
-				return localAddr.IP.String()
+				udp = localAddr.IP.String()
 			}
 		}
 	}
+	return pickHostIP(udp, hostnameAddrs)
+}
 
-	// Fallback: the hostname's addresses — but ONLY one the controller can
-	// dial. On Debian-family hosts the hostname resolves to 127.0.1.1 and to
-	// nothing else; returning that (or a bare hostname, or 127.0.0.1) told
-	// the controller to route this node's inference to itself. host3 did
-	// exactly that on 2026-09-22 whenever the UDP detection above failed:
-	// ~200 chat completions a minute came back 502. Empty means "no
-	// dialable address known" and the caller OMITS the field, so the
-	// controller keeps the last good one.
+// hostnameAddrs is the hostname's addresses, or nil when they cannot be read.
+func hostnameAddrs() []string {
 	hostname, err := os.Hostname()
 	if err != nil {
-		return ""
+		return nil
 	}
 	addrs, err := net.LookupHost(hostname)
 	if err != nil {
-		return ""
+		return nil
 	}
-	return usableHostIP(addrs)
+	return addrs
+}
+
+// pickHostIP chooses the address to register: the UDP route's local address
+// when another host could dial it, else the hostname's addresses — but ONLY
+// one the controller can dial. A controller on loopback (a standalone box's
+// own agent) routes to 127.0.0.1; returning that left the controller's own
+// node with no address at all (i276). On Debian-family hosts the hostname
+// resolves to 127.0.1.1 and to nothing else; returning that (or a bare
+// hostname, or 127.0.0.1) told the controller to route this node's inference
+// to itself. host3 did exactly that on 2026-09-22: ~200 chat completions a
+// minute came back 502. Empty means "no dialable address known" and the
+// caller OMITS the field, so the controller keeps the last good one.
+func pickHostIP(udp string, hostAddrs func() []string) string {
+	if ip := usableHostIP([]string{udp}); ip != "" {
+		return ip
+	}
+	return usableHostIP(hostAddrs())
 }
 
 // setDialableAddress records where the controller may reach this node — or

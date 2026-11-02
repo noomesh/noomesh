@@ -373,8 +373,9 @@ log line under that reference.
 
 ## Grafana
 
-Provisioning lives in `configs/grafana/`: two datasources
-(`prometheus.yml` over HTTPS with the PKI client cert, `loki.yml`), the
+Provisioning lives in `configs/grafana/`: three datasources
+(`prometheus.yml` over HTTPS with the PKI client cert, `loki.yml`,
+`tempo.yml` for request traces, operators only), the
 dashboard provider (`dashboards/dashboard.yml`, refreshed from disk every
 10 seconds, UI edits allowed) and one dashboard,
 `dashboards/cluster-overview.json` ("PAI Cluster Overview", 30-second
@@ -887,11 +888,96 @@ them be — and promtail keeps shipping duplicates until you remove it.
 `noo doctor orphans` lists them; then `docker rm -f noo-promtail
 noo-docker-socket-proxy` (the container prefix is `NOO_CONTAINER_PREFIX`).
 
+## Request tracing
+
+Every authenticated request the gateway serves becomes a trace (i359,
+operator decision 2026-10-31: trace everything, keep 30 days, metadata and
+sizes only, never prompt or answer text). An anonymous request, a refused
+credential (401) and a rate-limited one (429) record nothing, so a flood costs
+no database write. Two places hold it:
+
+- **`noo_request_trace` (Postgres)**, one row per request: when, the route
+  TEMPLATE (`/api/tasks/{id}`, never the filled-in path), method, status,
+  duration, who (`actor`, and `user_uuid` when that is an account), the model,
+  backend and node that answered, prompt and completion tokens, and request and
+  response sizes. `noo_token_usage.trace_id` links each completion to the
+  request that spent it. A daily prune keeps 30 days (a constant, not a
+  setting). An account erase removes the account's rows.
+- **Tempo**, the spans, when `NOO_TEMPO_OTLP_URL` is set: one server span per
+  request with the same facts as attributes, sent as OTLP/HTTP JSON with the
+  gateway's own leaf.
+
+An authenticated caller that sends a W3C `traceparent` header is continued
+(its trace id, the gateway's span parented on the caller's); an
+unauthenticated one's is ignored, so it cannot join a trace it names. Every
+recorded response answers with a `traceparent` header naming the gateway's
+span, so a client can find its own trace. A streamed answer's trace ends when
+the stream does. Summary rows go through a bounded queue to one writer; when
+the database falls behind, rows are dropped and counted
+(`noo_request_trace_rows_dropped_total`), never queued without bound.
+
+Not traced: `/health`, `/metrics`, `/static/` and the node log push.
+
+**Backend calls** are child spans of the request (`backend <type>`, with
+`noo.model`, `server.address` host:port and the backend's status). The
+gateway sends the backend its `traceparent`, so a node that traces continues
+the same trace. `noo.span_end` says what the span's end means: `body` (the
+whole answer was read), `stream` (the span ended with the streamed answer) or
+`headers` (the body was read elsewhere, so the span is time to first byte,
+not the whole answer). A streamed answer's tokens land on its request's row
+and span when the stream ends.
+
+**Worker hops.** Every `worker.*` message the gateway publishes for a
+request carries its `traceparent` (beside the signed principal header, not
+part of it). The worker continues the trace with one span per handled
+subject (`worker <subject>`, kind CONSUMER, with the subject and the caller),
+an error span when the handler raised, and sends it to Tempo itself with its
+own leaf. No OpenTelemetry SDK is involved (`src/noomesh/tracing.py` writes
+the same OTLP/HTTP JSON the gateway does), so no `OTEL_*` variable changes
+where spans go: only `NOO_TEMPO_OTLP_URL`, `https://` only, the cluster CA,
+the container's own leaf, or no export.
+
+**Node hops.** A node's inference proxy continues the gateway's
+`traceparent` with one span (`agent inference <backend>`) from picking the
+backend, through waiting for a slot, to the end of the relayed answer, a
+stream included, and passes its own span on to the local backend. A call with
+no valid `traceparent` makes no span: a node never starts a trace. Tempo is
+on the controller only, so the agent sends its spans to the gateway
+(`POST /api/cluster/nodes/{id}/traces`, its cluster credential, https only),
+which stamps them with the verified node, keeps only the agent's own
+attribute keys (a node cannot name a user on a span) and spans that ended in
+the last 10 minutes, and relays them; a refused or failed
+batch is dropped on the node, not retried (traces are best effort). Refusals
+and dropped spans are counted per node (`noo_traces_ingest_refused_total`,
+`noo_traces_ingest_dropped_spans_total`).
+
+**Reading them.** `GET /api/traces/requests` lists recent requests (filter by
+route, model, node, actor, status, duration); `GET /api/traces/summary`
+groups the window by route, model, node, backend or actor with request and
+error counts, p50/p95/max duration and tokens. Both are Operator/Admin only,
+and an agent on the operator MCP door reads them as `noo_traces_requests` and
+`noo_traces_summary` (never on `/mcp/user`: a trace names every account's
+requests). A trace id opens the whole trace in Grafana's Tempo data source.
+
+**Tempo** (`noo-tempo`, the DHI image, uid 65532) runs in the same profiles
+as Loki, with no published port. Both its doors require a cluster client
+certificate: the OTLP HTTP receiver on 4318 (the gateway's spans,
+`NOO_TEMPO_OTLP_URL`) and the query API on 3200 (`NOO_TEMPO_URL`), which
+Grafana's Tempo data source reaches only through the gateway
+(`/api/grafana-ds/tempo`, operators and admins). Its internal gRPC is bound
+to loopback and its usage reporting is off. It keeps `NOO_TEMPO_RETENTION`
+(default `720h`) under `$NOO_STATE_ROOT/tempo`. `noo cluster verify
+--controller` carries three rows: `tempo` (the gateway exports and Tempo
+answers `/ready` to the gateway's leaf; `GET /api/traces/status`), `tempo
+listener` (both doors require a client certificate, gRPC on loopback, usage
+reporting off, no published port) and `tempo at rest`. Every
+`/api/traces/*` route is Operator/Admin only.
+
 ## Health endpoints
 
 | Service | Endpoint | Returns |
 |---|---|---|
-| gateway | `GET /health` | **Anonymous:** `status` (`healthy` / `degraded`) and the status code — HTTP 503 when Postgres or NATS is down. That is what every probe reads. **With a credential:** adds `engine`, `version`, `peers`, `dependencies` (`postgresql`, `nats`, `redis` — redis is optional) and `addons`. `noo health` authenticates and exits 5 on degraded; without a login it shows status alone and says so |
+| gateway | `GET /health` | **Anonymous:** `status` (`healthy` / `degraded`) and the status code — HTTP 503 when Postgres or NATS is down. That is what every probe reads. **With a credential:** adds `engine`, `version`, `peers`, `dependencies` (`postgresql`, `nats`, `redis` — redis is optional; `nats.state` is `connected`, `unresponsive` or `reconnecting`) and `addons`. `noo health` authenticates and exits 5 on degraded; without a login it shows status alone and says so. A gateway that cannot reach NATS still serves (since 0.6.16): it waits up to 20 s at start, then answers degraded, bus routes (worker dispatch, agent messages) answer `503 {"error": "bus_unavailable"}` with `Retry-After`, and it connects and binds its KV buckets and streams by itself once NATS is up. `noo cluster verify --controller` shows it as a failing `gateway bus` row |
 | gateway | `GET /api/cluster/status` | node counts and the node list |
 | node-agent | `GET /health` on `:8081` | `{"status": "healthy", "node_id": …}` |
 | vLLM | `GET /health` on `:8000` | backend health |

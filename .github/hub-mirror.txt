@@ -20,11 +20,11 @@
 #
 # source                                                       consumers
 library/rust:1-bookworm                                        scripts/cargo-docker.sh (ci.yml rust-gateway, noo-cli, standalone-smoke)
-library/python:3.12-slim                                       Dockerfile (ci.yml build)
+library/python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159                                       Dockerfile (ci.yml build)
 library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b  docker/Dockerfile.whisper, docker/Dockerfile.piper
 library/alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8  docker/Dockerfile.stunnel
-library/alpine:3.22                                            docker/Dockerfile.node-agent-prebuilt, docker/Dockerfile.node-agent-go (gcompat stage)
+library/alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f                                            docker/Dockerfile.node-agent-prebuilt, docker/Dockerfile.node-agent-go (gcompat stage)
 library/alpine:latest                                          workspace-reclaim steps (`docker run alpine`, before checkout; local image first)
-nvidia/cuda:12.2.0-base-ubuntu22.04                            docker/Dockerfile.nvidia-exporter
-pgvector/pgvector:pg16                                         CI `services:` postgres
-pgvector/pgvector:pg18                                         noomesh ci.yml `services:` (today via mirror-images.yml's ghcr.io/<owner>/pgvector:pg18)
+nvidia/cuda:12.2.0-base-ubuntu22.04@sha256:ecdf8549dd5f12609e365217a64dedde26ecda26da8f3ff3f82def6749f53051                            docker/Dockerfile.nvidia-exporter
+pgvector/pgvector:pg16@sha256:0dd3149a06e4579a0d70d8fef9945636cd514005e7237deb27f9b67886f8dc4f                                         CI `services:` postgres
+pgvector/pgvector:pg18@sha256:c29f30688a9ad961691bdf0ec1650717cc132a5814619d80f80463d6e4c42e47                                         noomesh ci.yml `services:` (today via mirror-images.yml's ghcr.io/<owner>/pgvector:pg18)

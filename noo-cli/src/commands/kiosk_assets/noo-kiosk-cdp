@@ -1,42 +1,55 @@
 #!/usr/bin/env python3
-"""noo-kiosk-cdp — the display's tiny hands: mint, inject, navigate, probe.
+"""noo-kiosk-cdp — the display's tiny hands: mint, and the browser's one parent.
 
-Stdlib only (a stock Ubuntu has python3, nothing else is promised). The
-Chrome DevTools Protocol is spoken over a hand-rolled websocket client
-because `websocket-client` is not installed on a fresh laptop and this
-file must work the first time it runs.
+Stdlib only (a stock Ubuntu has python3, nothing else is promised), so this
+file works the first time it runs.
 
-There is NO durable secret to protect here any more: the display mints
-by proving its tailnet identity (publish a nonce on its own tailnet
-address, let the controller come and read it), so nothing is stored
-between mints except the short-lived token in /var/lib/kiosk/token.json.
+There is NO durable secret to protect here: the display mints by proving its
+tailnet identity (publish a nonce on its own tailnet address, let the
+controller come and read it), so nothing is stored between mints except the
+short-lived token in /var/lib/kiosk/token.json, which `noo-kiosk-serve` uses.
 Nothing travels on argv either way.
 
-Subcommands (all exit non-zero on failure, JSON on stdout where useful):
-  mint         prove tailnet identity, write token.json (0600)
-  start URL    navigate, WAIT for the origin to commit, inject, reload
-  inject       localStorage['noo_kiosk_token'] = <token from token.json>
-  navigate URL Page.navigate
-  reload       Page.reload
-  heartbeat    print window.__nooKioskHeartbeat (ms epoch) or "null"
-  frame        print the graph page's {ms, quality} frame measure as JSON, or "null"
-  build        print the stack tag this console was built from, or "null"
-  probe        exit 0 iff CDP answers on 127.0.0.1:9222
-  expires      print token expiry as epoch seconds (from token.json)
+THE BROWSER HAS NO DEBUGGING PORT (followup 188). It used to listen on a
+loopback TCP port, and loopback is not a permission: TCP has no file modes, so
+any local user could attach, drive the browser to anything this display's
+tailnet identity can reach, and evaluate script in the page. Now Chrome runs
+with `--remote-debugging-pipe` as the child of `broker`, which holds the only
+end of that pipe and offers two things:
 
-`start` exists because the ORDER matters and the wrong order is silent.
-localStorage belongs to an ORIGIN. Injecting while the browser still sits
-on about:blank writes to an opaque origin nothing can read back; navigating
-afterwards lands on a document whose storage is empty. The page then sends
-no Authorization header and every call 401s — while the dashboard itself
-renders perfectly, because the bundle is public. That shipped, and the
-first real display never loaded a single tile until it was found.
+  - $STATE/page.json (0644, nothing secret): the page's heartbeat, build and
+    frame measure, rewritten every PUBLISH_EVERY seconds. Anyone may read
+    it, so `noo kiosk status` and the seat heartbeat need no privilege.
+  - one verb, `reload`, on a unix socket. The caller is checked with
+    SO_PEERCRED against root, the display user, and the owner of the
+    directory these scripts live in (the seat user on an enrolled seat, who
+    can already rewrite this file, so reloading the page grants it
+    nothing). There is no raw CDP on the socket: an allowed caller still
+    cannot navigate or evaluate.
+
+Subcommands (all exit non-zero on failure):
+  mint                  prove tailnet identity, write token.json (0600)
+  broker -- BROWSER...  run the browser on the pipe; exits when it does
+  reload                ask the broker to reload the page
+  heartbeat             window.__nooKioskHeartbeat (ms epoch) or "null"
+  frame                 the graph page's {ms, quality} frame measure as JSON, or "null"
+  build                 the stack tag this console was built from, or "null"
+  probe                 exit 0 iff the broker published within FRESH_FOR seconds
 """
-import base64, http.server, json, os, secrets, socket, string, struct, subprocess, sys, threading, time, urllib.request, urllib.error, urllib.parse
+import http.server, json, os, secrets, socket, string, struct, subprocess, sys, threading, time, urllib.request, urllib.error
 
 STATE = os.environ.get("NOO_KIOSK_STATE", "/var/lib/kiosk")
 TOKEN_FILE = os.path.join(STATE, "token.json")
-CDP = ("127.0.0.1", int(os.environ.get("NOO_KIOSK_CDP_PORT", "9222")))
+PAGE_FILE = os.path.join(STATE, "page.json")
+# kiosk.service's RuntimeDirectory, so systemd creates it for the display
+# user and removes it with the session: a socket never outlives its broker.
+SOCK = "/run/kiosk/cdp.sock"
+PUBLISH_EVERY = 10  # seconds
+# Older than this, page.json says the browser stopped answering. Several
+# publishes wide, so one slow evaluate is not a strike against the display.
+FRESH_FOR = 45  # seconds
+
+
 
 
 def die(msg, code=1):
@@ -178,273 +191,281 @@ def mint():
     print(json.dumps({"expires_at": rec["expires_at"], "consumer": rec["consumer"], "via": "tailnet"}))
 
 
-def read_token():
-    try:
-        with open(TOKEN_FILE) as f:
-            return json.load(f)
-    except FileNotFoundError:
-        die("no token yet — run `noo-kiosk-cdp mint` first", 2)
-    except Exception as e:  # noqa: BLE001
-        die(f"token.json unreadable: {e}", 2)
+
+# ── the pipe: CDP over the browser's fds 3 and 4 ───────────────────────
 
 
-# ── a websocket client small enough to trust ───────────────────────────
+class Pipe:
+    """Chrome reads commands on fd 3 and writes replies on fd 4, each one a
+    JSON message ended by a NUL. One reader thread files replies by id, so
+    the publisher and the socket can both call without reading each
+    other's answers."""
 
-
-class WS:
-    def __init__(self, url):
-        # ws://127.0.0.1:9222/devtools/page/<id>
-        rest = url.split("://", 1)[1]
-        hostport, path = rest.split("/", 1)
-        host, port = hostport.split(":")
-        self.sock = socket.create_connection((host, int(port)), timeout=10)
-        key = base64.b64encode(os.urandom(16)).decode()
-        self.sock.sendall(
-            (
-                f"GET /{path} HTTP/1.1\r\nHost: {hostport}\r\nUpgrade: websocket\r\n"
-                f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
-            ).encode()
-        )
-        resp = b""
-        while b"\r\n\r\n" not in resp:
-            chunk = self.sock.recv(4096)
-            if not chunk:
-                raise RuntimeError("websocket handshake: connection closed")
-            resp += chunk
-        if b" 101 " not in resp.split(b"\r\n", 1)[0]:
-            raise RuntimeError("websocket handshake refused: " + resp.split(b"\r\n", 1)[0].decode(errors="replace"))
-        self.buf = resp.split(b"\r\n\r\n", 1)[1]
+    def __init__(self, wfd, rfd):
+        self.w, self.r = wfd, rfd
+        self.lock = threading.Lock()
+        self.pending = {}
         self.next_id = 0
+        self.closed = False
+        self.session = None
+        threading.Thread(target=self._read, daemon=True).start()
 
-    def _recv_exact(self, n):
-        while len(self.buf) < n:
-            chunk = self.sock.recv(65536)
-            if not chunk:
-                raise RuntimeError("websocket closed")
-            self.buf += chunk
-        out, self.buf = self.buf[:n], self.buf[n:]
-        return out
-
-    def send(self, text):
-        data = text.encode()
-        mask = os.urandom(4)
-        head = bytes([0x81])
-        n = len(data)
-        if n < 126:
-            head += bytes([0x80 | n])
-        elif n < 65536:
-            head += bytes([0x80 | 126]) + struct.pack("!H", n)
-        else:
-            head += bytes([0x80 | 127]) + struct.pack("!Q", n)
-        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
-        self.sock.sendall(head + mask + masked)
-
-    def recv(self):
+    def _read(self):
+        buf = b""
         while True:
-            b0, b1 = self._recv_exact(2)
-            op = b0 & 0x0F
-            n = b1 & 0x7F
-            if n == 126:
-                n = struct.unpack("!H", self._recv_exact(2))[0]
-            elif n == 127:
-                n = struct.unpack("!Q", self._recv_exact(8))[0]
-            if b1 & 0x80:
-                self._recv_exact(4)
-            payload = self._recv_exact(n)
-            if op == 0x1:
-                return payload.decode()
-            if op == 0x8:
-                raise RuntimeError("websocket closed by peer")
-            # ping/pong/binary/continuation: ignore
+            try:
+                chunk = os.read(self.r, 65536)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                self.closed = True
+                with self.lock:
+                    for slot in self.pending.values():
+                        slot[0].set()
+                return
+            buf += chunk
+            while b"\0" in buf:
+                raw, buf = buf.split(b"\0", 1)
+                try:
+                    m = json.loads(raw)
+                except ValueError:
+                    continue
+                if "id" in m:
+                    with self.lock:
+                        slot = self.pending.pop(m["id"], None)
+                    if slot:
+                        slot[1] = m
+                        slot[0].set()
+                elif m.get("method") == "Target.detachedFromTarget" and m.get("params", {}).get("sessionId") == self.session:
+                    self.session = None
 
-    def call(self, method, params=None):
-        self.next_id += 1
-        mid = self.next_id
-        self.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            msg = json.loads(self.recv())
-            if msg.get("id") == mid:
-                if "error" in msg:
-                    raise RuntimeError(f"{method}: {msg['error']}")
-                return msg.get("result", {})
-        raise RuntimeError(f"{method}: no reply")
+    def call(self, method, params=None, session=None, timeout=15):
+        if self.closed:
+            raise RuntimeError("the browser has gone")
+        slot = [threading.Event(), None]
+        with self.lock:
+            self.next_id += 1
+            mid = self.next_id
+            self.pending[mid] = slot
+            msg = {"id": mid, "method": method, "params": params or {}}
+            if session:
+                msg["sessionId"] = session
+            data = json.dumps(msg).encode() + b"\0"
+            while data:
+                data = data[os.write(self.w, data):]
+        if not slot[0].wait(timeout):
+            with self.lock:
+                self.pending.pop(mid, None)
+            raise RuntimeError(f"{method}: no reply in {timeout}s")
+        m = slot[1]
+        if m is None:
+            raise RuntimeError("the browser has gone")
+        if "error" in m:
+            raise RuntimeError(f"{method}: {m['error']}")
+        return m.get("result", {})
 
-    def close(self):
+    def page_session(self):
+        """A session on the page the display shows, attached on first use.
+
+        Prefers a real http(s) document: Chrome lists internal surfaces as
+        page targets too, and "the first target" is not reliably ours."""
+        if self.session:
+            return self.session
+        pages = [t for t in self.call("Target.getTargets").get("targetInfos", []) if t.get("type") == "page"]
+        if not pages:
+            raise RuntimeError("no page target yet")
+        web = [t for t in pages if (t.get("url") or "").startswith(("http://", "https://"))]
+        t = (web or pages)[0]
+        self.session = self.call("Target.attachToTarget", {"targetId": t["targetId"], "flatten": True})["sessionId"]
+        return self.session
+
+    def on_page(self, method, params=None):
+        sid = self.page_session()
         try:
-            self.sock.close()
-        except Exception:  # noqa: BLE001
-            pass
+            return self.call(method, params, session=sid)
+        except RuntimeError:
+            # A replaced target or a closed session: attach afresh next time
+            # rather than failing every call after it.
+            self.session = None
+            raise
+
+    def evaluate(self, expr):
+        return self.on_page("Runtime.evaluate", {"expression": expr, "returnByValue": True}).get("result", {}).get("value")
 
 
-def origin_of(u):
-    """scheme://host for a URL, or "" for about:blank and friends.
+def spawn(cmd):
+    """The browser, with the pipe on its fds 3 and 4 and nothing else."""
+    to_r, to_w = os.pipe()
+    from_r, from_w = os.pipe()
 
-    This is the unit localStorage is keyed by, so it is the unit every
-    decision about WHERE a token lands has to be made in.
-    """
-    p = urllib.parse.urlsplit(u or "")
-    return f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else ""
+    def onto_3_and_4():
+        # os.pipe() fds are close-on-exec, and dup2(3, 3) is a no-op that
+        # KEEPS the flag: when a pipe end already sits on fd 3, Chrome
+        # starts without it and exits before saying a word (the 188 spike).
+        # Two defences, either enough alone: duplicating to fresh fds first
+        # makes both dup2s real, and pass_fds clears the flag on 3 and 4.
+        # tests/test_kiosk_cdp_broker.py runs with the ends on 3 and 4.
+        a, b = os.dup(to_r), os.dup(from_w)
+        os.dup2(a, 3)
+        os.dup2(b, 4)
 
-
-def list_targets():
-    with urllib.request.urlopen(f"http://{CDP[0]}:{CDP[1]}/json/list", timeout=3) as r:
-        return [t for t in json.loads(r.read().decode())
-                if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
-
-
-def target_by_id(tid):
-    try:
-        for t in list_targets():
-            if t.get("id") == tid:
-                return t
-    except Exception:  # noqa: BLE001
-        return None
-    return None
+    proc = subprocess.Popen(cmd, preexec_fn=onto_3_and_4, close_fds=True, pass_fds=(3, 4))
+    os.close(to_r)
+    os.close(from_w)
+    return proc, Pipe(to_w, from_r)
 
 
-def page_target(wait_s=0, want_origin=None):
-    """A `page` target CDP lists; waits up to wait_s for one.
+# ── what the broker publishes ──────────────────────────────────────────
 
-    Prefers a real http(s) document. Chrome lists internal surfaces as
-    page targets too — the omnibox popup is one, seen on the live display
-    — and "the first target" is not reliably the page we mean. Injecting
-    into `chrome://…` writes localStorage for THAT origin, which is the
-    same bug as injecting into about:blank wearing a different hat.
 
-    `want_origin` makes it exact: return only a target already on that
-    origin, which is what `start` needs after a navigate.
-    """
-    deadline = time.time() + wait_s
-    last = None
-    while True:
+def write_page_file(facts):
+    os.makedirs(STATE, exist_ok=True)
+    tmp = PAGE_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    with os.fdopen(fd, "w") as f:
+        json.dump(facts, f)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, PAGE_FILE)
+
+
+def publish_once(pipe):
+    """Ask the page, then write what it said. A page that cannot be asked
+    writes NOTHING, so page.json goes stale and `probe` fails: that is the
+    watchdog's signal, and a file that kept saying "fine" would hide it."""
+    facts = {
+        "heartbeat": pipe.evaluate("window.__nooKioskHeartbeat ?? null"),
+        # A string literal in the bundle, so it survives minification.
+        "build": pipe.evaluate("window.__nooKioskBuild ?? null"),
+        "frame": pipe.evaluate("window.__nooKioskFrame ?? null"),
+        "updated_at": int(time.time()),
+    }
+    write_page_file(facts)
+
+
+def publish_loop(pipe):
+    while not pipe.closed:
         try:
-            targets = list_targets()
-            if want_origin:
-                for t in targets:
-                    if origin_of(t.get("url", "")) == want_origin:
-                        return t
-                last = f"no page target on {want_origin} yet"
-            else:
-                for t in targets:
-                    if (t.get("url") or "").startswith(("http://", "https://")):
-                        return t
-                if targets:
-                    # Only about:blank so far — correct at startup, and
-                    # what `start` navigates away from.
-                    return targets[0]
-                last = "no page target yet"
+            publish_once(pipe)
         except Exception as e:  # noqa: BLE001
-            last = str(e)
-        if time.time() >= deadline:
-            die(f"CDP not answering on {CDP[0]}:{CDP[1]}: {last}", 5)
-        time.sleep(0.5)
+            print(f"noo-kiosk-cdp: broker: cannot read the page: {e}", file=sys.stderr, flush=True)
+        time.sleep(PUBLISH_EVERY)
 
 
-def evaluate_on(t, expr):
-    ws = WS(t["webSocketDebuggerUrl"])
-    try:
-        res = ws.call("Runtime.evaluate", {"expression": expr, "returnByValue": True})
-    finally:
-        ws.close()
-    return res.get("result", {}).get("value")
+# ── the control socket ─────────────────────────────────────────────────
 
 
-def evaluate(expr, wait_s=0):
-    return evaluate_on(page_target(wait_s), expr)
+def allowed_uids():
+    """root, the display user, and whoever owns the directory this file is
+    in. Off a seat that is root (/usr/local/bin); on an enrolled seat it is
+    the seat user, whose sync reloads the page after a console roll and who
+    can already rewrite this script."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    return {0, os.getuid(), os.stat(here).st_uid}
 
 
-def inject_on(t):
-    tok = read_token()["token"]
-    # JSON-encode so the token is a string literal, whatever it contains.
-    evaluate_on(t, f"localStorage.setItem('noo_kiosk_token', {json.dumps(tok)}); 'ok'")
+def peer_uid(conn):
+    return struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))[1]
 
 
-def inject(wait_s):
-    inject_on(page_target(wait_s))
-    print("injected")
-
-
-def navigate(url, wait_s):
-    t = page_target(wait_s)
-    ws = WS(t["webSocketDebuggerUrl"])
-    try:
-        ws.call("Page.navigate", {"url": url})
-    finally:
-        ws.close()
-    print("navigated")
-
-
-def start(url, wait_s):
-    """navigate → WAIT for the origin to commit → inject → reload.
-
-    One subcommand rather than three shell calls, because the steps are
-    only correct in this order and only if each one has actually landed.
-    `Page.navigate` returns before the new document exists, so injecting
-    straight afterwards races the commit and can still write to
-    about:blank — the very bug this replaces, with a smaller window.
-
-    Refuses rather than guessing: if the page has not reached the target
-    origin in time, the token would go somewhere it cannot be read back
-    from, and a display that fails loudly beats one showing a dashboard
-    with nothing in it.
-    """
-    want = origin_of(url)
-    if not want:
-        die(f"start needs an absolute http(s) URL, got {url!r}", 2)
-
-    t = page_target(wait_s)
-    ws = WS(t["webSocketDebuggerUrl"])
-    try:
-        ws.call("Page.navigate", {"url": url})
-    finally:
-        ws.close()
-
-    tid = t.get("id")
-    deadline = time.time() + max(wait_s, 30)
-    while True:
-        cur = target_by_id(tid) if tid else None
-        if cur and origin_of(cur.get("url", "")) == want:
-            t = cur
+def answer(conn, pipe, allowed):
+    """One request on an accepted connection. The peer is checked before a
+    byte is read, and the only verb is `reload`."""
+    uid = peer_uid(conn)
+    if uid not in allowed:
+        conn.sendall(f"refused: uid {uid} may not drive this display\n".encode())
+        return
+    conn.settimeout(5)
+    verb = b""
+    while b"\n" not in verb and len(verb) < 64:
+        chunk = conn.recv(64)
+        if not chunk:
             break
-        # The target can be replaced rather than navigated in some
-        # flows; accept any target that reached the origin.
-        try:
-            for other in list_targets():
-                if origin_of(other.get("url", "")) == want:
-                    t = other
-                    cur = other
-                    break
-        except Exception:  # noqa: BLE001
-            pass
-        if cur and origin_of(cur.get("url", "")) == want:
-            break
-        if time.time() >= deadline:
-            at = (cur or {}).get("url", "?")
-            die(
-                f"page did not reach {want} in time (still at {at!r}) — refusing to inject, "
-                "because the token would land on the wrong origin and the display would show "
-                "a dashboard that never loads",
-                7,
-            )
-        time.sleep(0.3)
-
-    inject_on(t)
-    ws = WS(t["webSocketDebuggerUrl"])
+        verb += chunk
+    verb = verb.split(b"\n", 1)[0].strip().decode(errors="replace")
+    if verb != "reload":
+        conn.sendall(f"refused: unknown verb {verb[:32]!r}\n".encode())
+        return
     try:
-        ws.call("Page.reload", {"ignoreCache": True})
-    finally:
-        ws.close()
-    print("started")
+        pipe.on_page("Page.reload", {"ignoreCache": True})
+    except Exception as e:  # noqa: BLE001
+        conn.sendall(f"error: {e}\n".encode())
+        return
+    conn.sendall(b"ok\n")
+
+
+def listen():
+    try:
+        os.unlink(SOCK)
+    except FileNotFoundError:
+        pass
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(SOCK)
+    # connect() needs WRITE on the socket file, and the seat user is not
+    # the display user, so the mode cannot be the gate. The peer check in
+    # `answer` is.
+    os.chmod(SOCK, 0o666)
+    s.listen(4)
+    return s
+
+
+def serve(srv, pipe, allowed):
+    while not pipe.closed:
+        conn, _ = srv.accept()
+        with conn:
+            try:
+                answer(conn, pipe, allowed)
+            except Exception as e:  # noqa: BLE001
+                print(f"noo-kiosk-cdp: broker: {e}", file=sys.stderr, flush=True)
+
+
+def broker(argv):
+    if len(argv) < 2 or argv[0] != "--":
+        die("usage: noo-kiosk-cdp broker -- BROWSER [ARGS...]", 2)
+    proc, pipe = spawn(argv[1:])
+    try:
+        srv = listen()
+    except OSError as e:
+        # The page still shows without the socket; only reloads are lost.
+        # Say so where status and the journal will see it.
+        print(f"noo-kiosk-cdp: broker: no control socket at {SOCK}: {e}", file=sys.stderr, flush=True)
+    else:
+        threading.Thread(target=serve, args=(srv, pipe, allowed_uids()), daemon=True).start()
+    threading.Thread(target=publish_loop, args=(pipe,), daemon=True).start()
+    sys.exit(proc.wait())
+
+
+# ── the reading end: everyone else ─────────────────────────────────────
+
+
+def page_facts():
+    try:
+        with open(PAGE_FILE) as f:
+            d = json.load(f)
+    except FileNotFoundError:
+        die("the display has published nothing yet (no page.json): is kiosk.service running?", 5)
+    except Exception as e:  # noqa: BLE001
+        die(f"page.json unreadable: {e}", 5)
+    age = int(time.time()) - int(d.get("updated_at") or 0)
+    if age > FRESH_FOR:
+        die(f"the browser has not answered for {age}s (page.json is stale)", 5)
+    return d
 
 
 def reload():
-    t = page_target()
-    ws = WS(t["webSocketDebuggerUrl"])
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(20)
     try:
-        ws.call("Page.reload", {"ignoreCache": True})
+        s.connect(SOCK)
+        s.sendall(b"reload\n")
+        reply = s.recv(512).decode(errors="replace").strip()
+    except (FileNotFoundError, ConnectionRefusedError):
+        die(f"no broker on {SOCK}: is kiosk.service running?", 5)
+    except OSError as e:
+        die(f"{SOCK}: {e}", 5)
     finally:
-        ws.close()
+        s.close()
+    if reply != "ok":
+        die(reply or "the broker closed without answering", 5)
     print("reloaded")
 
 
@@ -452,40 +473,28 @@ def main(argv):
     if not argv:
         die(__doc__.strip(), 2)
     cmd, rest = argv[0], argv[1:]
-    wait_s = int(os.environ.get("NOO_KIOSK_CDP_WAIT", "0"))
     if cmd == "mint":
         mint()
-    elif cmd == "start":
-        if not rest:
-            die("start needs a URL", 2)
-        start(rest[0], wait_s)
-    elif cmd == "inject":
-        inject(wait_s)
-    elif cmd == "navigate":
-        if not rest:
-            die("navigate needs a URL", 2)
-        navigate(rest[0], wait_s)
+    elif cmd == "broker":
+        broker(rest)
     elif cmd == "reload":
         reload()
     elif cmd == "heartbeat":
-        v = evaluate("window.__nooKioskHeartbeat ?? null")
+        v = page_facts().get("heartbeat")
         print("null" if v is None else int(v))
     elif cmd == "build":
-        # Which build of the console is on this screen. A string literal in
-        # the bundle, so it survives minification — the whole point of it.
-        # "null" on a console cut before the stamp existed.
-        v = evaluate("window.__nooKioskBuild ?? null")
+        # Which build of the console is on this screen; "null" on a console
+        # cut before the stamp existed.
+        v = page_facts().get("build")
         print("null" if v is None else str(v))
     elif cmd == "frame":
-        # The graph page's smoothed frame work (ms) and drawing tier, as
-        # JSON, or "null" on a view that does not measure one.
-        v = evaluate("window.__nooKioskFrame ? JSON.stringify(window.__nooKioskFrame) : null")
-        print("null" if v is None else v)
+        # The graph page's smoothed frame work (ms) and drawing tier, or
+        # "null" on a view that does not measure one.
+        v = page_facts().get("frame")
+        print("null" if v is None else json.dumps(v))
     elif cmd == "probe":
-        page_target()
+        page_facts()
         print("ok")
-    elif cmd == "expires":
-        print(int(read_token().get("expires_at", 0)))
     else:
         die(f"unknown subcommand {cmd!r}", 2)
 

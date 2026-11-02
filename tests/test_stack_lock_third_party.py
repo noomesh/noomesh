@@ -6,8 +6,8 @@
 On the 0.6.3 -> 0.6.4 roll (2026-10-15) every image pulled by digest in
 about ten seconds except `ollama/ollama:latest`: 91.6 s, a moved upstream
 tag, and no release recorded which ollama ran. Compose now names a FIXED
-ollama version, the lock job resolves that tag's digest into an
-`ollama@sha256:` row (scripts/stack-lock-third-party.py), the launcher
+version, the lock job resolves that tag's digest into a
+`<name>@sha256:` row (scripts/stack-lock-third-party.py), the launcher
 exports it like any image row, and the CLI never stages it for nodes.
 """
 
@@ -38,50 +38,45 @@ M = _mod()
 COMPOSE = (ROOT / "docker-compose.cluster.yml").read_text()
 
 
-def test_compose_names_one_fixed_ollama_version():
-    v = M.compose_version("ollama", COMPOSE)
-    assert re.fullmatch(r"\d+\.\d+\.\d+", v), v
-    services = yaml.safe_load(COMPOSE)["services"]
-    runs = {n for n, s in services.items() if "ollama/ollama" in str(s.get("image", ""))}
-    assert runs == {"ollama", "ollama-embed", "ollama-embed-cpu"}, runs
-    for n in runs:
-        assert services[n]["image"] == f"${{OLLAMA_IMAGE:-ollama/ollama:{v}${{NOO_IMAGE_DIGEST_OLLAMA:-}}}}", n
+def test_compose_names_one_fixed_nginx_version():
+    v = M.compose_version("nginx", COMPOSE)
+    assert re.fullmatch(r"[0-9][A-Za-z0-9._-]*", v), v
 
 
 @pytest.mark.parametrize("text, why", [
-    ("    image: ${OLLAMA_IMAGE:-ollama/ollama:latest${NOO_IMAGE_DIGEST_OLLAMA:-}}\n", "latest"),
-    ("    image: ${OLLAMA_IMAGE:-ollama/ollama:1.0.0${NOO_IMAGE_DIGEST_OLLAMA:-}}\n"
-     "    image: ${OLLAMA_IMAGE:-ollama/ollama:1.0.0}\n", "carry the"),
-    ("    image: ${OLLAMA_IMAGE:-ollama/ollama:1.0.0${NOO_IMAGE_DIGEST_OLLAMA:-}}\n"
-     "    image: ${OLLAMA_IMAGE:-ollama/ollama:1.0.1${NOO_IMAGE_DIGEST_OLLAMA:-}}\n", "several versions"),
-    ("    image: ollama/ollama:latest\n", "no compose service"),
+    ("    image: ${NGINX_IMAGE:-nginx:latest${NOO_IMAGE_DIGEST_NGINX:-}}\n", "latest"),
+    ("    image: ${NGINX_IMAGE:-nginx:1.0.0${NOO_IMAGE_DIGEST_NGINX:-}}\n"
+     "    image: ${NGINX_IMAGE:-nginx:1.0.0}\n", "carry the"),
+    ("    image: ${NGINX_IMAGE:-nginx:1.0.0${NOO_IMAGE_DIGEST_NGINX:-}}\n"
+     "    image: ${NGINX_IMAGE:-nginx:1.0.1${NOO_IMAGE_DIGEST_NGINX:-}}\n", "several versions"),
+    ("    image: nginx:latest\n", "no compose service"),
     ("    image: nginx:1.27-alpine\n", "no compose service"),
 ])
 def test_a_compose_file_the_lock_cannot_pin_is_refused(text, why):
     with pytest.raises(M.LockError, match=why):
-        M.compose_version("ollama", text)
+        M.compose_version("nginx", text)
 
 
 def test_rows_writes_a_lock_row_from_the_resolved_digest(tmp_path, monkeypatch, capsys):
     seen = []
     monkeypatch.setattr(M, "resolve", lambda ref: seen.append(ref) or D)
     compose = tmp_path / "c.yml"
-    compose.write_text("    image: ${OLLAMA_IMAGE:-ollama/ollama:9.9.9${NOO_IMAGE_DIGEST_OLLAMA:-}}\n")
-    assert M.main(["rows", "--out", str(tmp_path / "digests"), "--compose", str(compose), "--only", "ollama"]) == 0
-    assert seen == ["docker.io/ollama/ollama:9.9.9"]
-    assert (tmp_path / "digests" / "ollama").read_text() == f"ollama@{D}\n"
+    compose.write_text("    image: ${NGINX_IMAGE:-nginx:9.9.9${NOO_IMAGE_DIGEST_NGINX:-}}\n")
+    assert M.main(["rows", "--out", str(tmp_path / "digests"), "--compose", str(compose), "--only", "nginx"]) == 0
+    assert seen == ["docker.io/library/nginx:9.9.9"]
+    assert (tmp_path / "digests" / "nginx").read_text() == f"nginx@{D}\n"
 
 
 def test_rows_fails_the_job_on_latest(tmp_path):
     compose = tmp_path / "c.yml"
-    compose.write_text("    image: ${OLLAMA_IMAGE:-ollama/ollama:latest${NOO_IMAGE_DIGEST_OLLAMA:-}}\n")
-    assert M.main(["rows", "--out", str(tmp_path / "d"), "--compose", str(compose), "--only", "ollama"]) == 1
+    compose.write_text("    image: ${NGINX_IMAGE:-nginx:latest${NOO_IMAGE_DIGEST_NGINX:-}}\n")
+    assert M.main(["rows", "--out", str(tmp_path / "d"), "--compose", str(compose), "--only", "nginx"]) == 1
     assert not (tmp_path / "d").exists()
 
 
-def test_the_launcher_exports_the_ollama_row():
-    got = _exported_for(LOCK + f"ollama@{D}\n")
-    assert got["NOO_IMAGE_DIGEST_OLLAMA"] == f"@{D}"
+def test_the_launcher_exports_the_nginx_row():
+    got = _exported_for(LOCK + f"nginx@{D}\n")
+    assert got["NOO_IMAGE_DIGEST_NGINX"] == f"@{D}"
 
 
 def test_the_lock_job_pins_third_party_rows_before_signing_and_without_the_seed():
@@ -120,7 +115,7 @@ def test_no_third_party_service_runs_an_unpinned_latest():
 
 # ── every runtime third-party image is a lock row (image-pin) ──────────────
 
-RUNTIME = {"ollama", "nats", "nginx", "redis", "loki", "prometheus", "alertmanager", "grafana",
+RUNTIME = {"nats", "nginx", "redis", "loki", "tempo", "prometheus", "alertmanager", "grafana",
            "node-exporter", "tei", "tei-cpu", "vllm"}
 
 
@@ -163,14 +158,16 @@ def test_the_gateway_forwards_the_locked_backend_refs_at_the_compose_version():
     v = M.compose_version("vllm", COMPOSE)
     assert env["NOO_BACKEND_IMAGE_VLLM"] == f"${{VLLM_IMAGE:-vllm/vllm-openai:{v}${{NOO_IMAGE_DIGEST_VLLM:-}}}}"
     assert env["NOO_BACKEND_IMAGE_VLLM_SECONDARY"] == f"${{VLLM2_IMAGE:-vllm/vllm-openai:{v}${{NOO_IMAGE_DIGEST_VLLM:-}}}}"
-    o = M.compose_version("ollama", COMPOSE)
-    assert env["NOO_BACKEND_IMAGE_OLLAMA"] == f"${{OLLAMA_IMAGE:-ollama/ollama:{o}${{NOO_IMAGE_DIGEST_OLLAMA:-}}}}"
+    # Ollama on a node is OUR hardened image (docker/Dockerfile.ollama, lock row
+    # `ollama`, staged on the rail); upstream is the agent's fallback only (i323).
+    assert env["NOO_BACKEND_IMAGE_OLLAMA"] == (
+        "${OLLAMA_IMAGE:-${NOO_IMAGE_PREFIX:-noomesh}/ollama:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_OLLAMA:-}}")
+
 
 
 def test_node_defaults_name_the_compose_versions():
     go = (ROOT / "node-agent-go/internal/docker/backends.go").read_text()
     assert f"vllm/vllm-openai:{M.compose_version('vllm', COMPOSE)}" in go
-    assert f"ollama/ollama:{M.compose_version('ollama', COMPOSE)}" in go
     assert "vllm-openai:latest" not in go and "ollama/ollama:latest" not in go
 
 

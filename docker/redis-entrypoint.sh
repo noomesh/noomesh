@@ -67,8 +67,8 @@ CONFEOF
 
 # TLS is not optional on the controller and there is no switch here to make it
 # optional: the plain port is disabled and client certificates are mandatory.
-# Cert material comes from the read-only /tls bind. (NOO_REDIS_TLS is passed to
-# the container for the CLIENTS' benefit; it has never gated the server.)
+# Cert material comes from the read-only /tls bind. (The retired NOO_REDIS_TLS
+# never gated the server; no client reads it either, 1242 finding 2.)
 cat >> "$CONF" <<CONFEOF
 tls-port 6379
 port 0

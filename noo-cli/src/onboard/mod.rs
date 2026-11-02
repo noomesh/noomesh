@@ -94,7 +94,8 @@ pub(crate) const SECRETS: &[(&str, &str)] = &[
 /// directory source the projection has under the root:
 /// tests/test_onboard_storage_dirs_cover_compose.py fails when it does not.
 pub(crate) const STORAGE_SUBDIRS: &[&str] = &[
-    "noo-data", "redis", "nats", "ollama", "hf-cache", "models", "prometheus", "grafana", "loki", "postgres", "images",
+    "noo-data", "redis", "nats", "ollama", "hf-cache", "models", "prometheus", "grafana", "loki", "tempo", "postgres",
+    "images",
     // The voice add-on's read-only staged-model mounts (i105): created even
     // when voice is off, so turning it on later never hits the bind check.
     "models/voice/whisper", "models/voice/piper",
@@ -106,7 +107,7 @@ pub(crate) const STORAGE_SUBDIRS: &[&str] = &[
 /// `${NOO_STATE_ROOT:-${NOO_DATA_ROOT}}`; models, hf-cache, ollama and images
 /// are not here and always stay under the data root.
 /// tests/test_state_root_groundwork.py holds this to the compose file.
-pub(crate) const STATE_SUBDIRS: &[&str] = &["noo-data", "redis", "nats", "prometheus", "grafana", "loki", "postgres"];
+pub(crate) const STATE_SUBDIRS: &[&str] = &["noo-data", "redis", "nats", "prometheus", "grafana", "loki", "tempo", "postgres"];
 
 /// The eleven step titles, in wizard order — the single source for both
 /// `run_all`'s banners and the TUI's step list. DEPENDENCY-ORDERED

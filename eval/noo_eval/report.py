@@ -189,6 +189,8 @@ def _render_compare(run: RunResult) -> str:
 
 
 def _render(run: RunResult) -> str:
+    if run.harness_matrix is not None:
+        return _render_matrix(run)
     if run.harness_compare is not None:
         return _render_compare(run)
     agg = aggregate(run)
@@ -285,6 +287,117 @@ def _render(run: RunResult) -> str:
 </div>
 """
     return body
+
+
+# ── harness matrix ──────────────────────────────────────────────────────
+
+# The slices the operator asked for (2026-11-01): harness against hardware,
+# backend and model, and each cell (node · backend · model) on its own.
+_MATRIX_SLICES = [("cell", "each cell (node · backend · model)"), ("hw_gpu", "hardware (GPU)"),
+                  ("backend", "backend"), ("model", "model")]
+
+
+def _slice_charts(rows: list[dict], kinds: list[str], dim: str, what: str) -> str:
+    """Pass rate and median wall time per kind across one dimension: two
+    charts (two measures, two scales; never one dual axis), each beside its
+    table, and every kind in the scenario's order so a kind keeps its colour
+    from chart to chart."""
+    from .harness_matrix import slice_by
+    s = slice_by(rows, dim)
+    if not s:
+        return ""
+    labels = list(s)
+    rate = {k: [100.0 * s[lab].get(k, {}).get("pass_rate", 0.0) for lab in labels] for k in kinds}
+    wall = {k: [s[lab].get(k, {}).get("median_wall_s") or 0.0 for lab in labels] for k in kinds}
+
+    def cell(lab: str, k: str) -> str:
+        a = s[lab].get(k)
+        if not a:
+            return "<td class='muted'>—</td>"
+        return f"<td>{a['passed']}/{a['ran']} · {_num(a['median_wall_s'], '{:.0f}')}s</td>"
+
+    trs = "".join(f"<tr><td>{_esc(lab)}</td>" + "".join(cell(lab, k) for k in kinds) + "</tr>" for lab in labels)
+    table = ("<table class='grid'><thead><tr><th>" + _esc(what) + "</th>"
+             + "".join(f"<th>{_esc(k)}</th>" for k in kinds)
+             + "</tr></thead><tbody>" + trs + "</tbody></table>"
+             "<p class='sub'>passed/ran · median wall time</p>")
+    return (f"<h3>By {_esc(what)}</h3>"
+            + svg.bar_group(labels, rate, unit="%", title="Pass rate by harness")
+            + svg.bar_group(labels, wall, unit=" s", title="Median wall time by harness (lower is faster)")
+            + table)
+
+
+def _matrix_cells(hm) -> str:
+    trs = []
+    for c in hm.cells:
+        hw = c.hardware
+        hw_s = " · ".join(x for x in (
+            hw.gpu or "CPU only", f"{hw.vram_gb:g} GB VRAM" if hw.vram_gb else "",
+            f"{hw.ram_gb:g} GB RAM" if hw.ram_gb else "", f"{hw.cpu_cores} cores" if hw.cpu_cores else "",
+            hw.arch or "") if x)
+        if c.skipped:
+            verdict = f"<span class='warn'>SKIPPED</span>: {_esc(c.skip_reason)}"
+        else:
+            ran = [r for r in c.compare.runs if not r.skipped] if c.compare else []
+            verdict = f"{sum(r.passed for r in ran)}/{len(ran)} passed"
+        restore = "" if c.restored else f" <span class='bad'>NOT RESTORED: {_esc(c.restore_note)}</span>"
+        trs.append(f"<tr><td><b>{_esc(c.node)}</b></td><td>{_esc(hw_s)}</td><td>{_esc(c.backend or '—')}</td>"
+                   f"<td>{_esc(c.model or '—')}{' (placed for the run)' if c.variant else ''}</td>"
+                   f"<td>{_esc(hw.stack or '—')}</td><td class='wrap-cell'>{verdict}{restore}</td></tr>")
+    return ("<table class='grid'><thead><tr><th>Node</th><th>Hardware</th><th>Backend</th><th>Model</th>"
+            "<th>Agent</th><th>Result</th></tr></thead><tbody>" + "".join(trs) + "</tbody></table>")
+
+
+def _render_matrix(run: RunResult) -> str:
+    from .harness_matrix import rows as matrix_rows, trend
+    hm = run.harness_matrix
+    synthetic = "SYNTHETIC" in run.scenario.upper()
+    banner = ('<div class="synthetic-banner">SYNTHETIC FIXTURE — every value below came from the '
+              'fake gateway in noo_eval/harness_fake.py. It says nothing about any harness.</div>'
+              if synthetic else "")
+    if hm.refused:
+        body = f"<section><h2>Not run</h2><p>{_esc(hm.refused)}</p></section>"
+        kpis = ""
+    else:
+        rs = matrix_rows(hm, run_id=run.started_at or "this run", scenario=run.scenario)
+        measured = [r for r in rs if r["status"] in ("pass", "fail")]
+        skipped_cells = sum(c.skipped for c in hm.cells)
+        restored = all(c.restored and (c.compare is None or c.compare.restored) for c in hm.cells)
+        kpis = "".join([
+            _kpi(str(len(hm.cells) - skipped_cells), "cells measured"),
+            _kpi(str(skipped_cells), "cells skipped", "warn" if skipped_cells else ""),
+            _kpi(str(len(hm.kinds)), "harness kinds"),
+            _kpi(f"{sum(r['status'] == 'pass' for r in measured)}/{len(measured)}", "tasks passed"),
+            _kpi("yes" if restored else "NO", "placements restored", "ok" if restored else "bad"),
+        ])
+        slices = "".join(_slice_charts(rs, hm.kinds, dim, what) for dim, what in _MATRIX_SLICES)
+        tr = trend(hm.history) if hm.history else {}
+        trend_html = ""
+        if tr and max(len(v) for v in tr.values()) > 1:
+            series = {k: [(float(i), y) for i, y in tr[k]] for k in hm.kinds if k in tr}
+            trend_html = ("<section><h2>Pass rate across runs</h2><p class='sub'>Each point is one run in "
+                          "the history file, oldest first.</p>"
+                          + svg.line_series(series, unit="%", x_label=" (run)") + "</section>")
+        body = (f"<section><h2>Cells</h2>{_matrix_cells(hm)}</section>"
+                f"<section><h2>How each harness does</h2><p class='sub'>Measured tasks only: skipped cells and "
+                f"tasks are left out, never counted as failures.</p>{slices}</section>{trend_html}")
+    notes = "".join(f"<li>{_esc(n)}</li>" for n in run.notes if n)
+    notes_html = f"<section><h2>Notes</h2><ul>{notes}</ul></section>" if notes else ""
+    return f"""
+<style>{_CSS}</style>
+<div class="wrap">
+{banner}
+<header>
+  <div class="eyebrow">harness matrix</div>
+  <h1>{_esc(run.scenario)}</h1>
+  <div class="meta">kinds {_esc(', '.join(hm.kinds))} &nbsp;·&nbsp; {_esc(run.gateway or 'cluster')} &nbsp;·&nbsp; {_esc(run.started_at)}</div>
+</header>
+<div class="kpis">{kpis}</div>
+{body}
+{notes_html}
+<footer>Generated by <code>noo-eval</code> · self-contained (no external assets)</footer>
+</div>
+"""
 
 
 def build_body(run: RunResult) -> str:

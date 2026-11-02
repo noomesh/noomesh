@@ -86,10 +86,18 @@ case "$OLLAMA_MODE" in
         ;;
     container)
         say "ollama create $OLLAMA_NAME (in the noo-ollama container)"
-        docker exec noo-ollama sh -c 'mkdir -p /convert'
-        docker cp "$ABS_WORK/$OUT" "noo-ollama:/convert/$OUT"
-        docker cp "$MODELFILE" "noo-ollama:/convert/Modelfile"
-        docker exec -w /convert noo-ollama ollama create "$OLLAMA_NAME" -f Modelfile
+        # The hardened image is uid 65532 with a root-owned `/`: stage under
+        # the user's own store (a mounted volume), never at a root-level path.
+        # Keep in step with noo-cli OLLAMA_CONVERT_DIR / node-agent convertDir.
+        OLLAMA_CONVERT_DIR=/home/nonroot/.ollama/convert
+        chmod a+r "$ABS_WORK/$OUT" "$MODELFILE"
+        docker exec noo-ollama sh -c "rm -rf $OLLAMA_CONVERT_DIR && mkdir -p $OLLAMA_CONVERT_DIR"
+        docker cp "$ABS_WORK/$OUT" "noo-ollama:$OLLAMA_CONVERT_DIR/$OUT"
+        docker cp "$MODELFILE" "noo-ollama:$OLLAMA_CONVERT_DIR/Modelfile"
+        rc=0
+        docker exec -w "$OLLAMA_CONVERT_DIR" noo-ollama ollama create "$OLLAMA_NAME" -f Modelfile || rc=$?
+        docker exec noo-ollama rm -rf "$OLLAMA_CONVERT_DIR" >/dev/null 2>&1 || true
+        [ "$rc" -eq 0 ] || exit "$rc"
         ;;
     none)
         say "no Ollama (host binary or noo-ollama container) found — GGUF is ready."

@@ -155,19 +155,48 @@ func checkTarManifestReader(r io.Reader, ref string) error {
 	}
 	if indexJSON != nil {
 		var idx struct {
-			Manifests []struct {
-				Annotations map[string]string `json:"annotations"`
-			} `json:"manifests"`
+			Manifests []ociIndexEntry `json:"manifests"`
 		}
 		if err := json.Unmarshal(indexJSON, &idx); err != nil {
 			return fmt.Errorf("unreadable index.json: %w", err)
 		}
-		if len(idx.Manifests) != 1 {
-			return fmt.Errorf("the archive index lists %d images; a staged tar must hold exactly one", len(idx.Manifests))
+		images := 0
+		for _, m := range idx.Manifests {
+			// Every entry, attestation or not: a name here is a tag
+			// `docker load` would set, so it must be the requested ref.
+			if name := m.Annotations["io.containerd.image.name"]; name != "" && normalizeRef(name) != want {
+				return fmt.Errorf("the archive names %q, not the requested %s", name, ref)
+			}
+			if m.isAttestation() {
+				if m.Annotations["io.containerd.image.name"] != "" {
+					return errors.New("the archive's attestation entry carries an image name; loading it would tag it")
+				}
+				continue
+			}
+			images++
 		}
-		if name := idx.Manifests[0].Annotations["io.containerd.image.name"]; name != "" && normalizeRef(name) != want {
-			return fmt.Errorf("the archive names %q, not the requested %s", name, ref)
+		if images != 1 {
+			return fmt.Errorf("the archive index lists %d images; a staged tar must hold exactly one", images)
 		}
 	}
 	return nil
+}
+
+// ociIndexEntry is one row of an image archive's index.json.
+type ociIndexEntry struct {
+	ArtifactType string            `json:"artifactType"`
+	Annotations  map[string]string `json:"annotations"`
+}
+
+// isAttestation: the buildx provenance/SBOM manifest that rides beside an
+// image. `docker save --platform` on the containerd image store exports it
+// with its subject (Docker 29: `artifactType`
+// application/vnd.docker.attestation.manifest.v1+json and
+// `io.containerd.manifest.subject`), so a single-platform tar of a buildx
+// image lists two entries and holds ONE image. Counting it as an image
+// refused every arm64 sidecar (robopi, 0.6.15 stunnel, 2026-11-01).
+func (e ociIndexEntry) isAttestation() bool {
+	return e.ArtifactType == "application/vnd.docker.attestation.manifest.v1+json" ||
+		e.Annotations["vnd.docker.reference.type"] == "attestation-manifest" ||
+		e.Annotations["io.containerd.manifest.subject"] != ""
 }

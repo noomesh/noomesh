@@ -109,7 +109,7 @@ def _install(tmp: Path, lock: str | None) -> tuple[Path, dict[str, str]]:
 def _restart(tmp: Path, lock: str | None, *names: str) -> subprocess.CompletedProcess:
     work, env = _install(tmp, lock)
     return subprocess.run(["bash", "scripts/noomesh-restart.sh", "--force", *names], cwd=work, env=env,
-                          capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+                          capture_output=True, text=True, timeout=600, stdin=subprocess.DEVNULL)
 
 
 def _lock(tag: str = TAG) -> str:
@@ -141,7 +141,7 @@ def test_force_restart_with_the_lock_renders_every_locked_image_by_digest(tmp_pa
     for name, digest in lock.items():
         assert refs[name].endswith(f"@{digest}"), (name, refs[name])
     # the core images the rehearsal saw by tag
-    assert refs["ollama"].startswith("ollama/ollama:") and "@sha256:" in refs["ollama"], refs["ollama"]
+    assert "/ollama:" in refs["ollama"] and "@sha256:" in refs["ollama"], refs["ollama"]  # our hardened image (i323)
     assert f"/gateway:{TAG}@sha256:" in refs["gateway"], refs["gateway"]
     # the stale store pin did not survive
     assert "1" * 64 not in "\n".join(refs.values())

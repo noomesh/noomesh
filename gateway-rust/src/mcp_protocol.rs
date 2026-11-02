@@ -239,9 +239,12 @@ impl Envelope {
         match self.era {
             Era::Legacy => rpc_result(
                 self.req.id.clone(),
+                // `listChanged`: a session opened under another catalogue
+                // is sent `notifications/tools/list_changed` on its next
+                // answered request (`mcp_session::with_list_changed`).
                 json!({
                     "protocolVersion": LEGACY_VERSION,
-                    "capabilities": {"tools": {"listChanged": false}},
+                    "capabilities": {"tools": {"listChanged": true}},
                     "serverInfo": server_info(server_name),
                 }),
             ),
@@ -649,6 +652,19 @@ mod tests {
         assert_eq!(v["result"]["resultType"], "complete");
         assert_eq!(v["result"]["capabilities"]["tools"]["listChanged"], false);
         assert_eq!(v["id"], "d");
+    }
+
+    /// A legacy session is told when the catalogue moves under it
+    /// (`mcp_session::with_list_changed`), so legacy initialize says it may
+    /// be. A modern client has no session to tell: discover keeps `false`.
+    #[tokio::test]
+    async fn legacy_initialize_advertises_list_changed_and_discover_does_not() {
+        let legacy = parse_tls(&HeaderMap::new(), br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#).unwrap();
+        let (s, v) = body_json(legacy.initialize("t")).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["result"]["capabilities"]["tools"]["listChanged"], true);
+        let (_, d) = body_json(legacy.discover("t", "hi")).await;
+        assert_eq!(d["result"]["capabilities"]["tools"]["listChanged"], false);
     }
 
     #[tokio::test]

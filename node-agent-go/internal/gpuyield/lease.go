@@ -44,6 +44,12 @@ const (
 	ModeImmediate = "immediate"
 )
 
+// PurposeUser marks a hold as the operator's own use of the GPU (VR,
+// experiments): `noo cluster gpu mode <node> user` sets it, and the mode is
+// read back from the lease (i344b). The only purpose there is; a workload
+// hold is named by Workload instead.
+const PurposeUser = "user"
+
 // DefaultDrainTimeout bounds a drain hold whose request named no timeout.
 const DefaultDrainTimeout = 120 * time.Second
 
@@ -56,7 +62,9 @@ type Lease struct {
 	OperationID string `json:"operation_id"`
 	// Workload names what the GPU went to (`<addon>/<workload>`, the
 	// reservation layer's key); empty for a plain operator hold.
-	Workload   string `json:"workload,omitempty"`
+	Workload string `json:"workload,omitempty"`
+	// Purpose is PurposeUser for the operator's own use; empty otherwise.
+	Purpose    string `json:"purpose,omitempty"`
 	Generation uint64 `json:"generation"`
 	Mode       string `json:"mode"`
 	Reason     string `json:"reason,omitempty"`
@@ -94,6 +102,8 @@ type HoldRequest struct {
 	Owner       string
 	OperationID string
 	Workload    string
+	// Purpose: "" or PurposeUser; never together with Workload.
+	Purpose string
 	// Mode: ModeDrain (default) or ModeImmediate.
 	Mode string
 	// Timeout bounds the drain; 0 = DefaultDrainTimeout.
@@ -153,6 +163,13 @@ func (c *Controller) Hold(ctx context.Context, req HoldRequest) (Contention, err
 	if mode != ModeDrain && mode != ModeImmediate {
 		return c.Report(), fmt.Errorf("unknown hold mode %q", req.Mode)
 	}
+	purpose := strings.ToLower(strings.TrimSpace(req.Purpose))
+	if purpose != "" && purpose != PurposeUser {
+		return c.Report(), fmt.Errorf("unknown hold purpose %q (only %q)", req.Purpose, PurposeUser)
+	}
+	if purpose != "" && strings.TrimSpace(req.Workload) != "" {
+		return c.Report(), fmt.Errorf("a hold for workload %q has no purpose; purpose %q is the operator's own use", req.Workload, purpose)
+	}
 	if req.OperationID == "" {
 		req.Force = true
 		req.OperationID = "legacy-" + c.now().UTC().Format("20060102T150405Z")
@@ -203,7 +220,7 @@ func (c *Controller) Hold(ctx context.Context, req HoldRequest) (Contention, err
 	c.generation++
 	now := c.now()
 	c.lease = &Lease{Owner: req.Owner, OperationID: req.OperationID, Workload: strings.TrimSpace(req.Workload),
-		Generation: c.generation, Mode: mode, Reason: reason, Since: now.UTC().Format(time.RFC3339)}
+		Purpose: purpose, Generation: c.generation, Mode: mode, Reason: reason, Since: now.UTC().Format(time.RFC3339)}
 	drain := mode == ModeDrain && c.drainer != nil
 	var gpuBackends []string
 	if drain {

@@ -401,7 +401,8 @@ func (c *Client) HealStrandedEngines(ctx context.Context) []string {
 			"sidecar", SidecarContainerFor(key))
 		out = append(out, name)
 	}
-	return out
+	// The doors no backendDoors entry names (door_children.go).
+	return append(out, c.healStrandedDoorChildren(ctx)...)
 }
 
 // doorLeafService names the service leaf a backend's door serves with:

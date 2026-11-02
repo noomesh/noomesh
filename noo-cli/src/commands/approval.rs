@@ -10,6 +10,7 @@
 //! Python CLI's direct-SQL UPDATE, so no CLI path touches the DB anymore.
 
 use super::truncate;
+use crate::args::{ArgError, Args};
 use crate::http::{get_json, post_json};
 use crate::output::ExitCode;
 use crate::ui::{self, Col, Glyph};
@@ -160,22 +161,16 @@ pub fn approval_deny(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     decide(g, args, "deny")
 }
 
+/// `--reason/-r` is deny-only, matching the Python flag surface: on approve it
+/// stays an unknown flag.
+pub(crate) fn parse_decide_with(a: &mut Args, deny: bool) -> Result<(String, Option<String>), ArgError> {
+    let reason = if deny { a.value(&["--reason", "-r"])? } else { None };
+    let request_id = a.one("<request-id>")?;
+    Ok((request_id, reason))
+}
+
 fn decide(g: &Globals, args: &[String], decision: &str) -> Result<i32, Unhandled> {
-    let mut request_id: Option<&String> = None;
-    let mut reason: Option<String> = None;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            // `--reason` is deny-only, matching the Python flag surface.
-            "--reason" | "-r" if decision == "deny" => {
-                reason = Some(iter.next().ok_or(Unhandled)?.clone());
-            }
-            t if t.starts_with('-') => return Err(Unhandled),
-            _ if request_id.is_none() => request_id = Some(tok),
-            _ => return Err(Unhandled),
-        }
-    }
-    let Some(request_id) = request_id else { return Err(Unhandled) };
+    let (request_id, reason) = parse_decide_with(&mut Args::new(args), decision == "deny")?;
 
     let mut body = serde_json::json!({ "decision": decision });
     if let Some(r) = &reason {
@@ -183,7 +178,7 @@ fn decide(g: &Globals, args: &[String], decision: &str) -> Result<i32, Unhandled
     }
     let resp = post_json(
         g,
-        &format!("/api/approval/{}/decide", super::urlencode(request_id)),
+        &format!("/api/approval/{}/decide", super::urlencode(&request_id)),
         &body,
         true,
         10,

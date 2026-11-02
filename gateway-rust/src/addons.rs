@@ -197,6 +197,31 @@ pub fn health_dev_map() -> Option<serde_json::Value> {
     (!map.is_empty()).then_some(serde_json::Value::Object(map))
 }
 
+/// `/health` `addons_refused`: `{ "<name>": "<why>" }` for every add-on
+/// `/health` calls `unhealthy` because the gateway refused it (at load, at
+/// mount, or a development key that expired), with the text the gateway log
+/// carries (i353b). Always present on the authenticated body, `{}` when
+/// there is none, so a reader can tell "none refused" from a gateway older
+/// than the field.
+pub fn health_refused_map() -> serde_json::Value {
+    refused_map(health_names(), |n| {
+        if health_word(n) == "unhealthy" {
+            crate::addon_proxy::refusal(n)
+        } else {
+            None
+        }
+    })
+}
+
+fn refused_map(names: Vec<String>, why: impl Fn(&str) -> Option<String>) -> serde_json::Value {
+    serde_json::Value::Object(
+        names
+            .into_iter()
+            .filter_map(|n| why(&n).map(|w| (n, serde_json::Value::String(w))))
+            .collect(),
+    )
+}
+
 /// Is the named add-on usable (flag on AND licensed where required)?
 pub fn enabled(name: &str) -> bool {
     state(name) == AddonState::Enabled
@@ -376,6 +401,15 @@ pub fn identity_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refused_map_carries_each_refusal_and_is_an_empty_object_without_one() {
+        let names = vec!["rhaddon".to_string(), "trellion".to_string()];
+        let m = refused_map(names.clone(), |n| (n == "rhaddon").then(|| "route manifest refused".to_string()));
+        assert_eq!(m, serde_json::json!({"rhaddon": "route manifest refused"}));
+        let none = refused_map(names, |_| None);
+        assert!(none.as_object().is_some_and(|o| o.is_empty()), "{none}");
+    }
 
     #[test]
     fn licensed_addons_need_both_switches_open_ones_only_the_flag() {

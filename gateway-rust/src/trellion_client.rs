@@ -199,13 +199,17 @@ fn refusing_addon(msg: &str) -> Option<&'static str> {
 ///
 ///   - add-on off            -> `Unavailable` with the add-on's own refusal
 ///                              sentence (the one `require_trellion` serves)
+///   - no bus                -> 503 `bus_unavailable` (i301 a.3)
 ///   - worker timeout        -> `Upstream` (502) naming the subject
 ///   - structured refusal    -> `Forbidden` (policy) / `BadRequest` (invalid)
 ///   - anything else         -> `Unavailable("Worker unavailable: ...")`
 pub(crate) fn map_error(subject: &str, e: &anyhow::Error) -> AppError {
-    use crate::worker_client::{RefusalKind, WorkerRefusal, WorkerTimeout};
+    use crate::worker_client::{BusUnavailable, RefusalKind, WorkerRefusal, WorkerTimeout};
     if let Some(addon) = refusing_addon(&e.to_string()) {
         return AppError::Unavailable(crate::addons::refusal_msg(addon));
+    }
+    if e.downcast_ref::<BusUnavailable>().is_some() {
+        return crate::routes::bus_unavailable();
     }
     if e.downcast_ref::<WorkerTimeout>().is_some() {
         return AppError::Upstream(format!("worker timed out on {subject}"));
@@ -280,6 +284,18 @@ impl<'a> TrellionClient<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_bus_maps_to_503_bus_unavailable() {
+        let e = anyhow::Error::new(crate::worker_client::BusUnavailable { subject: "worker.rag.query".into() });
+        match map_error("worker.rag.query", &e) {
+            AppError::UnavailableRetry { code, retry_after_secs, .. } => {
+                assert_eq!(code, crate::routes::BUS_UNAVAILABLE);
+                assert!(retry_after_secs > 0);
+            }
+            other => panic!("want 503 bus_unavailable, got {other:?}"),
+        }
+    }
 
     /// The pinned subject set. Regenerate from the tree with
     /// `grep -rohE '"worker\.[a-z_]+\.[a-z_]+"' gateway-rust/src | sort -u`

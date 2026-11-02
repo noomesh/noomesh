@@ -104,6 +104,7 @@ the binary's own usage table by `scripts/gen-cli-docs.py`.
 
 | Document | Description |
 |----------|-------------|
+| [development/principles.md](development/principles.md) | The eight engineering principles a review asks about (least privilege, secure by default, fail loud, one behaviour, fast, clean and clear, who runs changes, proof), each with an example, and how to cite them as P1–P8 |
 | [development/developer-guide.md](development/developer-guide.md) | Build, test and extend noomesh: repository layout, the toolchain per tree (cargo in Docker, go test, pytest), the test suite, and the extension points (MCP tools, skills, worker handlers, backends, CLI commands, routes) |
 | [development/addons.md](development/addons.md) | Building an add-on: the declaration row, the route manifest the gateway proxies from, the drift check that belongs in your repo, and what presence/refusal/entitlement you get for free |
 | [development/wsl-disk.md](development/wsl-disk.md) | Keeping a WSL2 controller's `.vhdx` from growing forever: log caps, rebuild pruning, the compact script |

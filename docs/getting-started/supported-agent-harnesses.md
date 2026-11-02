@@ -479,6 +479,50 @@ in the scenario to run the tasks as a user and read only that user's usage.
 The `noo` kind records no token usage for its loops today, so its token
 columns read "not reported" rather than 0.
 
+### Across devices and models: the harness matrix
+
+A scenario with a `harness_matrix:` block runs the same comparison on
+several nodes in turn (and, per node, under several models), so you can see
+how each harness does by **hardware, backend and model**, and where one is
+slow. `eval/scenarios/harness-matrix.yaml` is the sample: an NVIDIA node
+(vLLM), an Apple node (Ollama), a CPU node (llama.cpp) and an arm64 edge
+box, under all four kinds, with six tasks (the three above, plus a
+multi-step tool chain, a computation that has to be run rather than
+recalled, and a short explanation).
+
+```sh
+PYTHONPATH=eval python3 -m noo_eval run eval/scenarios/harness-matrix.yaml --gateway https://<controller>:8080
+PYTHONPATH=eval python3 -m noo_eval run eval/scenarios/harness-matrix.yaml --fixture --history -
+```
+
+It runs on demand. Scheduling it is the same command run from a timer (a
+systemd timer, cron, or a scheduled agent) in a window when the nodes are
+yours: each cell changes the node's harness placement for the run.
+
+- **Cells.** One per node, as it is placed now. `variants:` runs the cell
+  again with another `backend`/`model`, placed for the run and put back
+  after. A variant's model must already be on the node (`available_models`):
+  the benchmark never starts a download, it records the cell as skipped.
+  Because a variant takes the node's chat model from its users, a scenario
+  with variants needs `--allow-placement-changes`.
+- **Skipped, never failed.** A cell marked `skip: <reason>`, a node the
+  gateway does not know, or a node that serves no chat model is recorded as
+  SKIPPED with the reason. Its harnesses are not charged a failure.
+- **Not while the box is busy.** `busy_locks:` lists lock files that must
+  be free to start (the sample lists the noo-batch Rust build lock: a build
+  on a measured box skews every number). If one is held, the run does not
+  start and the report says why.
+- **What a row records.** The node's hardware (GPU and VRAM, unified
+  memory, RAM, CPU cores, architecture, tier, agent version), its backend
+  and model, the harness kind, and the task's result, wall time, loops and
+  tokens.
+- **Report and history.** `eval/reports/harness-matrix.html` charts pass
+  rate and median wall time per harness, by cell, by hardware, by backend
+  and by model, each chart with its table, and a JSON twin beside it. Every
+  run appends its rows to `--history`
+  (`eval/reports/harness-matrix-history.jsonl` by default; `-` keeps none),
+  and the report draws the pass rate across runs from that file.
+
 ## Telemetry
 
 The vendor switches each third-party harness must be launched with, the

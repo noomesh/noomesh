@@ -41,6 +41,7 @@ from typing import Any
 import structlog
 
 from .. import json_fast as json
+from .. import tracing
 from ..cluster import reply_ledger
 from . import bus_principal, inflight
 
@@ -304,9 +305,18 @@ async def _handle_request(msg) -> None:
             await msg.respond(json.dumps({"error": f"no handler for {subject}"}).encode())
         return
 
+    # The gateway's request continues here (i359): one span per handled
+    # subject, parented on the gateway's span. No `traceparent` (a message
+    # the gateway did not trace), no span: a worker never starts a trace.
+    traceparent = (msg.headers or {}).get("traceparent")
+    span_attrs = {"messaging.destination.name": subject}
+    caller = getattr(principal, "sub", None)
+    if caller:
+        span_attrs["enduser.id"] = caller
     try:
-        with inflight.tracked():
-            result = await handler(request)
+        with tracing.span(f"worker {subject}", traceparent=traceparent, attrs=span_attrs, continue_only=True):
+            with inflight.tracked():
+                result = await handler(request)
         response = {"success": True, "data": result}
     except Exception as e:
         # With the traceback: the reply carries only the text, so this line
@@ -486,6 +496,9 @@ async def start_worker_pool(messaging: Any) -> None:
         return
 
     _log_code_source()
+    # Request tracing (i359): this process's spans to Tempo, when it is
+    # configured; the spans are made either way.
+    tracing.configure("noo-worker")
 
     # A surfaces=core noo-worker runs WITHOUT the trellion package by design
     # (Dockerfile.worker: no torch, no noo-trellion). The ML-pack inits below

@@ -290,7 +290,7 @@ static TS_NET: LazyLock<Regex> = LazyLock::new(|| {
 });
 static NOO_NAME: LazyLock<Regex> = LazyLock::new(|| re(r"(?-u:\b)noo-[a-z0-9][a-z0-9-]*[a-z0-9](?::\d{1,5})?"));
 static STACK_HOSTPORT: LazyLock<Regex> = LazyLock::new(|| {
-    re(r"(?i)(?-u:\b)(?:localhost|gateway|postgres|redis|nats|loki|trellion(?:-intel)?|prometheus|grafana|alertmanager|vllm|llamacpp|ollama|tei):\d{2,5}(?-u:\b)")
+    re(r"(?i)(?-u:\b)(?:localhost|gateway|postgres|redis|nats|loki|tempo|trellion(?:-intel)?|prometheus|grafana|alertmanager|vllm|llamacpp|ollama|tei):\d{2,5}(?-u:\b)")
 });
 static INTERNAL_PATH: LazyLock<Regex> = LazyLock::new(|| {
     re(r#"(^|[^\w.~/-])((?:/app|/opt/noo|/var/lib/noo[\w.-]*|/etc/noo[\w.-]*|/run/secrets|/tmp/noo[\w.-]*|~/\.noo[\w.-]*)(?:/[^\s`'"<>)\]]*)?)"#)

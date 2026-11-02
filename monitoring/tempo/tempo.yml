@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Tempo for noomesh (i359): a single binary on the controller holding the
+# gateway's request spans. Every door is mTLS with the cluster CA; Tempo's
+# internal gRPC stays on loopback. Checked against dhi.io/tempo:2 (2.10.10)
+# on 2026-10-31: OTLP with a client cert 200, without one refused, plaintext
+# refused, a span read back by id.
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+  # The query API. Grafana's Tempo datasource reaches it through the
+  # gateway (/api/grafana-ds/tempo), never directly.
+  http_tls_config:
+    cert_file: /tls/services/tempo/service.crt
+    key_file: /tls/services/tempo/service.key
+    client_auth_type: RequireAndVerifyClientCert
+    client_ca_file: /tls/ca.crt
+  # Traffic between Tempo's own modules in the single binary: loopback only.
+  grpc_listen_address: 127.0.0.1
+  grpc_listen_port: 9095
+  log_level: warn
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        # OTLP over HTTP only (the gateway's exporter); no gRPC receiver.
+        http:
+          endpoint: 0.0.0.0:4318
+          tls:
+            cert_file: /tls/services/tempo/service.crt
+            key_file: /tls/services/tempo/service.key
+            client_ca_file: /tls/ca.crt
+
+ingester:
+  lifecycler:
+    address: 127.0.0.1
+    # /ready answers as soon as the ingester is up (the default waits 15s
+    # after, so the verify row's first read after a recreate would fail).
+    min_ready_duration: 0s
+    ring:
+      kvstore:
+        store: inmemory
+      replication_factor: 1
+
+compactor:
+  compaction:
+    # 30 days by default (compose NOO_TEMPO_RETENTION), the operator's choice.
+    block_retention: ${NOO_TEMPO_RETENTION:-720h}
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/traces
+    wal:
+      path: /var/tempo/wal
+
+# Tempo reports anonymous usage to stats.grafana.org by default
+# (docs/security/telemetry.md). Off.
+usage_report:
+  reporting_enabled: false

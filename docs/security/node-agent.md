@@ -675,13 +675,16 @@ and the vendor-CLI translator skip lines that are not `data:`).
 noomesh-internal i159, parts A and B.
 
 **A GPU hold is an owned lease, and it drains first.** `POST /gpu/hold`
-(controller-only) carries `{reason, owner, operation_id, mode, timeout_secs,
-force}` and `POST /gpu/release` carries `{operation_id, generation, force,
+(controller-only) carries `{reason, owner, operation_id, workload, purpose,
+mode, timeout_secs, force}` and `POST /gpu/release` carries `{operation_id, generation, force,
 resume}` (`internal/gpuyield`, `lease.go`). The agent persists the lease
 (`owner`, `operation_id`, the node's monotonic `generation`) and reports it
 in `gpu_contention.lease`; a release must quote the operation id and
 generation it was given (compare-and-set) or it is `409 held_by_other` with
 the current lease, so a stale retry can never end another operation's hold.
+`purpose` is a closed set: absent, or `user` for the operator's own use of
+the GPU (noomesh-internal i344b), which the lease carries; any other value,
+or `user` beside a `workload`, is refused and no hold is taken.
 `force` takes over or ends any hold and the gateway audits it as a force; a
 body with no operation id is a legacy call from an older CLI, treated as a
 force and audited `legacy`. One hold or release runs per node at a time
@@ -951,7 +954,11 @@ applier's install loop and the agent's own door table.
 `noo cluster verify <node>` judges this in its `backend doors` row: for
 each door-backed backend on the node, no `backend_tls` or `backend_door`
 refusal, the controller's copy names the door and is not expiring, and the
-node's own copy does too.
+node's own copy does too. The controller's copy is read from the controller's
+PKI dir, so `noo cluster verify <node>` run where there is none (no `nodes/`
+dir: an operator's CLI on a worker box) says the controller's copies were not
+checked there and to run it on the controller: a WARN, never a red that
+blames the controller (i213). The node's side is judged as always.
 
 The node's copy is what the agent reports. On every heartbeat, and on
 registration, it sends `backend_leaves`: for each door service it holds a
@@ -998,6 +1005,23 @@ registration, as `backend_containers`:
 
 `health` is left out when the container has no healthcheck. The map is
 left out entirely when docker cannot be listed.
+
+A chat engine (`vllm`, `vllm-secondary`, `llamacpp`) also carries
+`serving`: whether its model server is answering. Docker's health cannot
+tell: a hung vLLM engine passes its healthcheck while every request times
+out. The agent counts what its inference proxy relays: the engine's first
+body byte is an answer, and a failed upstream call or a 5xx is a failure. A
+caller that went away counts as neither. An engine with no evidence for 5
+minutes, and nothing in flight, gets one probe: a one-token chat bounded at
+60 s. Two relayed failures in a row, or one failed probe, report
+`"serving": false` with a `serving_reason`. The probe then repeats every
+60 s, and the first answer reports `true` again. The key is left out until
+there is evidence and while the engine is still warming up. A recreated
+container starts over. Ollama is not probed, since a probe would load a
+model nobody asked for. The gateway ranks a backend reported as not
+serving with the unhealthy ones, after every healthy candidate, so it still
+answers when nothing else can. A missing key counts as serving, which is
+how an older agent's heartbeat reads.
 
 The `backend doors` row reads **starting**, not a failure, only when every
 problem on it is "the node holds no leaf yet" or that `backend_tls`

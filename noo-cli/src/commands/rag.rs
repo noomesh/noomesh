@@ -564,6 +564,28 @@ fn existing_note(name: &str, resp: &serde_json::Value) -> Option<String> {
     ))
 }
 
+/// What `noo rag ingest` was asked for.
+pub(crate) struct IngestArgs {
+    paths: Vec<String>,
+    title: Option<String>,
+    recursive: bool,
+    audience: Vec<String>,
+}
+
+pub(crate) fn parse_ingest_with(a: &mut Args) -> Result<IngestArgs, ArgError> {
+    let title = a.value(&["--title", "-t"])?;
+    let recursive = a.flag(&["--recursive", "-r"]);
+    let mut audience: Vec<String> = Vec::new();
+    for raw in a.values(&["--audience", "--role"])? {
+        audience.extend(parse_audience(&raw));
+    }
+    let paths = a.positionals()?;
+    if paths.is_empty() {
+        return Err(ArgError::new("missing <path>"));
+    }
+    Ok(IngestArgs { paths, title, recursive, audience })
+}
+
 /// `noo rag ingest PATH… [--title/-t T] [--recursive/-r]` — POST
 /// /api/v1/rag/ingest with `{"text": <file content>, "title", "source_uri"}`
 /// per file (see module docs for why this differs from Python's dead
@@ -589,25 +611,7 @@ fn existing_note(name: &str, resp: &serde_json::Value) -> Option<String> {
 /// `--json`: raw gateway JSON for one file, a JSON array of them for
 /// several.
 pub fn rag_ingest(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut paths: Vec<String> = Vec::new();
-    let mut title: Option<String> = None;
-    let mut recursive = false;
-    let mut audience: Vec<String> = Vec::new();
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--title" | "-t" => title = Some(iter.next().ok_or(Unhandled)?.clone()),
-            "--recursive" | "-r" => recursive = true,
-            "--audience" | "--role" => {
-                audience.extend(parse_audience(iter.next().ok_or(Unhandled)?));
-            }
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => paths.push(t.to_string()),
-        }
-    }
-    if paths.is_empty() {
-        return Err(Unhandled);
-    }
+    let IngestArgs { paths, title, recursive, audience } = parse_ingest_with(&mut Args::new(args))?;
 
     // Expand, remembering which files the operator named and which we found,
     // because that is what decides whether a failure is fatal below.
@@ -1245,29 +1249,20 @@ pub fn rag_unhold(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 }
 
 #[derive(Debug, PartialEq, Eq, Default)]
-struct HeldArgs {
+pub(crate) struct HeldArgs {
     reason: Option<String>,
     export: Option<String>,
 }
 
 fn parse_held_args(args: &[String]) -> Result<HeldArgs, Unhandled> {
-    let mut a = HeldArgs::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--reason" => {
-                i += 1;
-                a.reason = Some(args.get(i).ok_or(Unhandled)?.clone());
-            }
-            "--export" => {
-                i += 1;
-                a.export = Some(args.get(i).ok_or(Unhandled)?.clone());
-            }
-            _ => return Err(Unhandled),
-        }
-        i += 1;
-    }
-    Ok(a)
+    Ok(parse_held_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_held_with(a: &mut Args) -> Result<HeldArgs, ArgError> {
+    let reason = a.value(&["--reason"])?;
+    let export = a.value(&["--export"])?;
+    a.finish()?;
+    Ok(HeldArgs { reason, export })
 }
 
 /// The export file: EVERY held id and title, for reconciliation.
@@ -1386,28 +1381,22 @@ fn purge_confirmation(yes: bool, json: bool, tty: bool, typed: Option<&str>, cou
 }
 
 #[derive(Debug, PartialEq, Eq, Default)]
-struct PurgeArgs {
+pub(crate) struct PurgeArgs {
     reason: Option<String>,
     apply: bool,
     yes: bool,
 }
 
 fn parse_purge_args(args: &[String]) -> Result<PurgeArgs, Unhandled> {
-    let mut a = PurgeArgs::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--reason" => {
-                i += 1;
-                a.reason = Some(args.get(i).ok_or(Unhandled)?.clone());
-            }
-            "--apply" => a.apply = true,
-            "-y" | "--yes" => a.yes = true,
-            _ => return Err(Unhandled),
-        }
-        i += 1;
-    }
-    Ok(a)
+    Ok(parse_purge_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_purge_with(a: &mut Args) -> Result<PurgeArgs, ArgError> {
+    let reason = a.value(&["--reason"])?;
+    let apply = a.flag(&["--apply"]);
+    let yes = a.flag(&["--yes", "-y"]);
+    a.finish()?;
+    Ok(PurgeArgs { reason, apply, yes })
 }
 
 /// `noo rag purge --reason <r> [--apply] [-y]` — DELETE the documents held

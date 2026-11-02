@@ -172,6 +172,27 @@ def test_every_backend_door_requires_a_client_certificate(services):
     assert checked >= 6, f"only {checked} backend doors checked — the parse is not looking at the file it was written for"
 
 
+def test_a_door_restart_restarts_its_backend(services):
+    """i317 e1: a backend in its door's network namespace stays in the OLD
+    namespace when the door alone restarts, alive and unreachable. Compose
+    restarts it with the door only when the dependency says `restart: true`
+    (a restart outside compose is the node agent's door_children.go)."""
+    checked = 0
+    for name, front in sorted(BACKEND_SERVICES.items()):
+        svc = services.get(name)
+        if svc is None or svc.get("network_mode") != f"service:{front}":
+            continue
+        checked += 1
+        deps = svc.get("depends_on")
+        assert isinstance(deps, dict) and front in deps, (
+            f"{name} must depend on {front} in the long form, with restart: true"
+        )
+        assert deps[front].get("restart") is True, (
+            f"{name}'s depends_on {front} lacks restart: true: restarting the door strands {name}"
+        )
+    assert checked >= 6, f"only {checked} fronted backends checked — the parse is not looking at the file it was written for"
+
+
 def _published(svc: dict) -> list[str]:
     out = []
     for p in svc.get("ports") or []:

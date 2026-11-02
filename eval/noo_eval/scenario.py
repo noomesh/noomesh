@@ -136,6 +136,75 @@ class HarnessCompareSpec(BaseModel):
         return self
 
 
+class ModelVariant(BaseModel):
+    """Run a cell's tasks with ``backend`` serving ``model`` (placed for the
+    run, the original placement restored after). The model must already be
+    on the node (its ``available_models``): a benchmark never downloads."""
+    backend: str
+    model: str
+
+
+class MatrixCell(BaseModel):
+    """One node of a harness matrix. No ``variants`` = as the node is placed
+    now. ``skip`` records the cell as skipped with that reason, never run
+    (a node known to be unable to serve, e.g. a broken backend)."""
+    node: str
+    variants: list[ModelVariant] = Field(default_factory=list)
+    skip: Optional[str] = None
+
+
+class HarnessMatrixSpec(BaseModel):
+    """harness × node × model: the harness-compare task sets on every cell.
+
+    Each (node, variant) runs exactly as :class:`HarnessCompareSpec` does on
+    one node, and adds what that node IS (hardware, backend, model) to every
+    row, so the report can slice by any of them. Writes, all restored: each
+    node's harness placement, and for a variant its backend placement.
+    ``busy_locks`` are files whose ``flock`` must be FREE to start (e.g. a
+    Rust build lock on a measured box: a build skews every number).
+    """
+    cells: list[MatrixCell]
+    kinds: list[str]
+    task_sets: list[TaskSet] = Field(default_factory=list)
+    tasks: list[CompareTask] = Field(default_factory=list)
+    task_timeout_s: float = 600.0
+    poll_s: float = 5.0
+    settle_s: float = 20.0
+    ready_timeout_s: float = 300.0
+    usage_settle_s: float = 3.0
+    require_dispatch: bool = True
+    sweep_leftovers: bool = True
+    task_token_env: Optional[str] = None
+    model_ready_timeout_s: float = 600.0   # a variant whose model never serves is recorded, not waited on
+    busy_locks: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _shape(self) -> "HarnessMatrixSpec":
+        if self.tasks:
+            self.task_sets = [TaskSet(name="default", tasks=self.tasks), *self.task_sets]
+            self.tasks = []
+        if not self.cells:
+            raise ValueError("harness_matrix needs at least one cell")
+        if not self.kinds:
+            raise ValueError("harness_matrix needs at least one kind")
+        if not any(ts.tasks for ts in self.task_sets):
+            raise ValueError("harness_matrix needs at least one task")
+        return self
+
+    def has_variants(self) -> bool:
+        return any(c.variants for c in self.cells if not c.skip)
+
+    def compare_spec(self, node: str) -> HarnessCompareSpec:
+        """The one-node compare this matrix runs on ``node``."""
+        return HarnessCompareSpec(
+            node=node, kinds=list(self.kinds), task_sets=list(self.task_sets),
+            task_timeout_s=self.task_timeout_s, poll_s=self.poll_s, settle_s=self.settle_s,
+            ready_timeout_s=self.ready_timeout_s, usage_settle_s=self.usage_settle_s,
+            require_dispatch=self.require_dispatch, sweep_leftovers=self.sweep_leftovers,
+            task_token_env=self.task_token_env,
+        )
+
+
 class Scenario(BaseModel):
     name: str
     description: str = ""
@@ -149,6 +218,7 @@ class Scenario(BaseModel):
     isolation_probes: bool = False   # run cross-user leak tests after the load phase
     identity: Optional[IdentitySpec] = None   # window / foreign-account probes
     harness_compare: Optional[HarnessCompareSpec] = None   # which harness kind is better here
+    harness_matrix: Optional[HarnessMatrixSpec] = None     # ... across nodes, backends and models
 
     @classmethod
     def load(cls, path: str | Path) -> "Scenario":

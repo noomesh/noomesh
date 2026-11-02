@@ -168,7 +168,11 @@ add-on is registered when all three hold:
    (`NOO_ADDONS_VERIFIED`).
 
 An add-on that fails 2 or 3 is **refused, never silently skipped**: no routes,
-`/health` reads `addons.<name>: "unhealthy"`, and the log says why. A missing
+`/health` reads `addons.<name>: "unhealthy"`, the authenticated `/health`
+carries the reason in `addons_refused.<name>` (`{}` when nothing is refused),
+and the log says why. `noo cluster verify --controller` reads it: a `gateway
+add-on` row per add-on noomesh.yaml switches on fails naming the refusal, and
+warns (never passes) when the gateway is too old to report the field. A missing
 lock reads: "add-on `<name>` is enabled in noomesh.yaml but has no verified lock
 for this stack ... Run `noo addons upgrade <name>`". A lock verified for another
 stack is refused the same way, naming both stacks.
@@ -200,7 +204,9 @@ appears later gets its routes at the next start.
 signed `noo-addon-lock/2` bundle (see "The signed add-on lock" below). The
 operator trusts your signing key with `noo addons trust-key <name> <pubkey>
 --registry <root>` (the CLI ships no key for you), and your images must sit
-under that registry root and be pullable anonymously.
+under that registry root. If the package is private, the operator registers a
+read-only token for it with `noo addons registry-login <name> --registry <root>`
+(see "Add-ons" in getting started); without one the pull is anonymous.
 
 **Development keys.** To develop and test an add-on on your own mesh before it
 ships in a release, the operator can trust a temporary development key instead
@@ -279,7 +285,8 @@ to a name it did not know.
 | `timeout_secs` | Per route (1–600); falls back to the manifest's. |
 | `min_role` | `user`, `operator` or `admin`: the lowest role that may call this public route. **Absent means `operator`**, for every method. Any other value refuses the whole manifest. A write (`POST`, `PUT`, `PATCH`, `DELETE`) cannot be `user` unless `owner_scoped`. |
 | `scopes` | Optional, `GET` only: add-on scopes written `<yourname>:<word>` that also open the route to an account holding `read` plus the scope, below `min_role`. Always namespaced, so a manifest can never name a core scope (`graph`, `ingest`, …). |
-| `owner_scoped` | A write at `min_role: "user"` whose add-on keeps every row to the calling account (see below). |
+| `owner_scoped` | The add-on keeps every row to the calling account (see below). Legal on any public route; on a write in this shape it is the opt-in for `min_role: "user"`. |
+| `feature` | The declared feature this route belongs to, in a manifest with `features` (see "Features"). Refused without them. |
 | `max_message_bytes` | `WS` only: largest message (and frame) either way, bytes. Default 1048576 (1 MiB), at most 16 MiB. |
 | `idle_timeout_secs` | `WS` only: no frame either way for this long closes the socket (1001). Default 300, 1–3600. |
 | `max_connections_per_user` | `WS` only: sockets one account may hold open on this route. Default 4, 1–64; the next is a `429`. |
@@ -442,9 +449,10 @@ The default is: declare it, or it is Operator. A write (`POST`, `PUT`, `PATCH`,
 `DELETE`) cannot be `min_role: "user"`, because the front door refuses a User's
 writes.
 
-A route may opt out with `"owner_scoped": true`, and only a write at
-`"min_role": "user"` may (the flag on any other shape is refused at load, not
-ignored). It means the add-on **promises to read and write only rows owned by
+A route may opt out with `"owner_scoped": true`. On a write it is allowed only
+at `"min_role": "user"` (on a write at any other role it is refused at load, not
+ignored); on a `GET` or `WS` route it is the same promise and opens nothing by
+itself; an `internal` route cannot carry it. It means the add-on **promises to read and write only rows owned by
 the account the gateway forwards**, for example a person's own voice sessions,
 notes and tasks. The gateway does not check that promise; add the flag only to
 routes that keep it. What the gateway does:
@@ -471,7 +479,49 @@ itself, never as "anyone".
 ```
 
 An add-on image that declares `owner_scoped` is refused whole by a gateway that
-predates the field, for the same reason; roll the gateway first.
+predates the field, for the same reason; roll the gateway first. The same holds
+for `owner_scoped` on a `GET` or `WS` route, which a gateway before the release
+that ships features refuses.
+
+#### Features: what your add-on can do (noomesh-internal f99)
+
+Instead of `min_role` and `scopes`, a manifest may declare **features**: what
+the add-on can do, in its own words. noomesh decides who may use each one; the
+add-on only describes them.
+
+```json
+"features": [
+  {"name": "converse", "title": "Talk to the assistant", "suggested": "user", "delegate": true},
+  {"name": "transcripts", "title": "Read your transcripts", "suggested": "user"},
+  {"name": "manage", "title": "Manage voices and models", "suggested": "operator"}
+]
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | `[a-z0-9_]`, 1-32 characters, unique. Its full name is `<yourname>:<name>`. |
+| `title` | 1-64 plain characters, shown to admins and users. |
+| `description` | Optional, at most 280 plain characters. |
+| `suggested` | `user`, `operator`, `admin` or `none`: who you recommend it for. **It grants nothing**: the operator accepts it, or not, when enabling the add-on. |
+| `delegate` | `true` when this feature acts for a present person through their tasks. It replaces the top-level `delegate`. |
+
+At most 32. In a manifest with `features`, every public route and the `ui` name
+their `feature`; `min_role`, `scopes`, `ui.min_role` and the top-level
+`delegate` are refused (one answer to "who may call this"); `receives_delegation`
+needs its feature to delegate; `internal` routes take none.
+
+Who holds a feature is decided by the install's admins (on, off or inherit
+per role, team, account and service key; noomesh-internal f99), and every
+surface asks the same check: the front door, your HTTP and WS routes, your UI
+origin and the delegated task token. On each proxied request the gateway also
+sends `X-Noo-Requester-Features`: the features of YOUR add-on the caller
+holds, comma-separated (empty when none). Use it to hide what the person
+cannot use; never treat it as a permission (the gateway already refused
+anything not granted). A delegated task token is minted under the route's
+feature and is refused on its next use once that feature is turned off for
+the person. Keep each route
+`owner_scoped` where it holds: a write is never opened below `operator` without
+it.
 
 Rolling: the gateway rolls first. A gateway that predates `min_role` refuses an
 unknown manifest field outright (unknown keys fail the whole manifest), so an

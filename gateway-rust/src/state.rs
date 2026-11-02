@@ -231,6 +231,7 @@ pub(crate) async fn nats_event_logger(event: async_nats::Event) {
     match event {
         async_nats::Event::Connected => {
             tracing::info!("nats.connected — gateway bus is live (subscriptions replayed)");
+            BUS_UP.notify_one();
         }
         async_nats::Event::Disconnected => {
             tracing::warn!(
@@ -360,17 +361,61 @@ pub async fn ensure_kv_buckets(js: &async_nats::jetstream::Context, verbose: boo
     }
 }
 
-/// Re-assert the KV buckets every 60s so a NATS server that came back with a
-/// fresh JetStream store is repaired without a gateway restart. Same shape as
-/// the `scheduler_completions` consumer loop: idempotent, cheap, and the only
-/// thing standing between a wiped store and a permanently empty fleet view.
-pub fn spawn_kv_bucket_watchdog(js: async_nats::jetstream::Context) {
+/// How long the gateway waits for its first NATS connection before it serves
+/// degraded (i301 a.3).
+pub const BUS_BOOT_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Is the client connected to the bus right now?
+pub fn bus_connected(nats: &async_nats::Client) -> bool {
+    nats.connection_state() == async_nats::connection::State::Connected
+}
+
+/// Wait up to `max` for `nats` to connect; true when it did.
+pub async fn wait_for_bus(nats: &async_nats::Client, max: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + max;
+    while !bus_connected(nats) {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    true
+}
+
+/// Woken by every `Connected` event ([`nats_event_logger`]): the bus objects
+/// are re-asserted at once, not at the next tick.
+static BUS_UP: std::sync::LazyLock<tokio::sync::Notify> = std::sync::LazyLock::new(tokio::sync::Notify::new);
+
+/// Bind (or create) everything on the bus the gateway depends on: the KV
+/// buckets, the agent-message stream and the job plane's streams.
+/// Idempotent. Skipped while disconnected (each call would only fail).
+pub async fn ensure_bus_objects(nats: &async_nats::Client, js: &async_nats::jetstream::Context, verbose: bool) {
+    if !bus_connected(nats) {
+        return;
+    }
+    ensure_kv_buckets(js, verbose).await;
+    crate::agent_messages::ensure_stream(js).await;
+    crate::scheduler_engine::ensure_job_plane_streams(js).await;
+}
+
+/// Bind the bus objects now (when connected), on every reconnect, and every
+/// 60 s. Before i301 a.3 the streams were created once at boot and the KV
+/// buckets re-asserted every 60 s, so a gateway that started without NATS
+/// never had its streams until a restart, and a NATS recreated with a fresh
+/// JetStream store (what `noo stack start` does) left them gone too.
+pub fn spawn_bus_objects(nats: async_nats::Client, js: async_nats::jetstream::Context) {
     tokio::spawn(async move {
+        ensure_bus_objects(&nats, &js, true).await;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
-        tick.tick().await; // consume the immediate first tick — startup just ran
+        tick.tick().await; // the immediate first tick: the call above just ran
         loop {
-            tick.tick().await;
-            ensure_kv_buckets(&js, false).await;
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = BUS_UP.notified() => {
+                    tracing::info!("nats.connected — binding the KV buckets and streams");
+                }
+            }
+            ensure_bus_objects(&nats, &js, false).await;
         }
     });
 }
@@ -533,19 +578,34 @@ impl AppState {
         let nats_request_timeout = std::time::Duration::from_secs(
             crate::config::env_or_yaml_u64("NOO_WORKER_TIMEOUT_SECS", |c| c.worker.timeout_secs, 120),
         );
+        // In the background (i301 a.3): a gateway without NATS used to exit
+        // and crash-loop ("failed to lookup address ... nats"), taking the
+        // UI, the MCP doors and every non-bus route down with the bus. It
+        // now waits a bounded while, then serves degraded: `/health` says
+        // so, bus routes answer 503 `bus_unavailable`, and the KV buckets
+        // and streams are bound when the bus comes up (`spawn_bus_objects`).
         let nats = crate::bus::connect(
             &nats_url,
             nats_cred.clone(),
             crate::nats_credentials::INBOX_PREFIX,
             nats_request_timeout,
+            true,
         )
         .await?;
 
         let js = async_nats::jetstream::new(nats.clone());
         // Userinfo scrubbed: an operator may put the password in the URL.
-        tracing::info!(url = %crate::redact::scrub_url_userinfo(&nats_url), "NATS connected");
-
-        ensure_kv_buckets(&js, true).await;
+        if wait_for_bus(&nats, BUS_BOOT_WAIT).await {
+            tracing::info!(url = %crate::redact::scrub_url_userinfo(&nats_url), "NATS connected");
+        } else {
+            tracing::error!(
+                url = %crate::redact::scrub_url_userinfo(&nats_url),
+                waited_secs = BUS_BOOT_WAIT.as_secs(),
+                "nats.unavailable — the gateway starts DEGRADED: worker dispatch, gossip and agent messages \
+                 are down (503 bus_unavailable), /health reports degraded; it connects by itself when NATS is up \
+                 (is the nats container running? noo stack start)"
+            );
+        }
 
         // Redis (optional — graceful degradation if unavailable). Waits a
         // bounded while for the first connection, then serves without it and
@@ -811,3 +871,51 @@ mod pg_tls_url_tests {
     }
 }
 
+/// A client that never connects (nothing listens on port 1): the gateway's
+/// view of a NATS that is down. Test-only, shared by the i301 a.3 tests.
+#[cfg(test)]
+pub(crate) async fn unconnected_bus() -> async_nats::Client {
+    async_nats::ConnectOptions::new()
+        .retry_on_initial_connect()
+        .request_timeout(Some(std::time::Duration::from_secs(1)))
+        .connect("nats://127.0.0.1:1")
+        .await
+        .expect("a background client is built without a server")
+}
+
+#[cfg(test)]
+mod bus_down_tests {
+    use super::*;
+
+    /// i301 a.3: a gateway with no NATS gets a client at once, reports it
+    /// unconnected, and the bounded boot wait gives up instead of hanging.
+    #[tokio::test]
+    async fn a_missing_bus_is_waited_for_a_bounded_while_then_reported() {
+        let nats = unconnected_bus().await;
+        assert!(!bus_connected(&nats));
+        let t = std::time::Instant::now();
+        assert!(!wait_for_bus(&nats, std::time::Duration::from_millis(600)).await);
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "the wait is bounded: {:?}", t.elapsed());
+        assert_eq!(BUS_BOOT_WAIT, std::time::Duration::from_secs(20));
+    }
+
+    /// The bus objects are bound by one task, on every reconnect and every
+    /// 60 s, never once at boot: main no longer creates the streams itself.
+    #[test]
+    fn the_streams_and_buckets_are_bound_by_the_bus_task() {
+        let main = include_str!("main.rs");
+        assert!(main.contains("state::spawn_bus_objects(state.nats.clone(), state.js.clone())"));
+        assert!(!main.contains("agent_messages::ensure_stream(&state.js)"), "a boot-only stream create is back");
+        assert!(!main.contains("scheduler_engine::ensure_job_plane_streams(&state.js)"), "a boot-only stream create is back");
+        let src = include_str!("state.rs");
+        let objs = src.split("pub async fn ensure_bus_objects").nth(1).unwrap().split("\npub fn ").next().unwrap();
+        for call in ["ensure_kv_buckets(js, verbose)", "agent_messages::ensure_stream(js)", "scheduler_engine::ensure_job_plane_streams(js)"] {
+            assert!(objs.contains(call), "{call}");
+        }
+        let logger = src.split("pub(crate) async fn nats_event_logger").nth(1).unwrap();
+        assert!(logger.split("Event::Disconnected").next().unwrap().contains("BUS_UP.notify_one()"), "Connected wakes the task");
+        let new = src.split("pub async fn new(").nth(1).unwrap().split("Self::assemble(").next().unwrap();
+        assert!(new.contains("nats_request_timeout,\n            true,"), "the gateway connects in the background");
+        assert!(!new.contains("ensure_kv_buckets("), "no bus call before the bus is known to be up");
+    }
+}
