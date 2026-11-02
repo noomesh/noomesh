@@ -395,7 +395,7 @@ pub fn security_user_set_scopes(g: &Globals, args: &[String]) -> Result<i32, Unh
 pub(crate) fn parse_super_admin_with(a: &mut Args) -> Result<(String, bool, String, bool, bool), ArgError> {
     let reason = a.value(&["--reason"])?.unwrap_or_default();
     let password_stdin = a.flag(&["--password-stdin"]);
-    let yes = a.flag(&["-y", "--yes"]);
+    let yes = a.flag(&["--yes", "-y"]);
     let mut p = a.positionals()?;
     if p.len() != 2 {
         return Err(ArgError::new("usage: <username> on|off --reason <text>"));
