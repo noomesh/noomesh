@@ -346,7 +346,7 @@ detect_gpu_tier() {
         return
     fi
     local vram_mb
-    vram_mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+    vram_mb=$(_noo_nvidia_smi_bounded 5 --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
     # Guard (same as noomesh-rebuild.sh): nvidia-smi can print an error to
     # stdout ("Failed to initialize NVML: ..."), which would reach the
     # arithmetic below and abort the script. Only a purely numeric value is
@@ -372,6 +372,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # fu 46: per-instance namespace (project, prefix, network, ports).
 . "$SCRIPT_DIR/lib-instance.sh"
+# lib-compose.sh owns the bounded nvidia-smi probe detect_gpu_tier uses.
+. "$SCRIPT_DIR/lib-compose.sh"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 if [ -f "$PROJECT_ROOT/pyproject.toml" ]; then
     # [trellion]: noo-trellion is an extra since an earlier change (it is
@@ -736,6 +738,7 @@ docker run --rm -v \"\$PWD/noomesh.yaml\":/f alpine sh -c 'chgrp 65532 /f && chm
 # The file list has ONE home: base, GPU overlay,
 # override, add-on overlays, then dist last so pinned image refs win.
 . "$(dirname "$0")/lib-compose.sh"
+_compose_gpu_probe   # in THIS shell, so the notice below reuses the answer
 COMPOSE_FILES="$(compose_file_args .)"
 compose_gpu_notice
 # Every add-on service compose renders must run exactly its verified pin,
