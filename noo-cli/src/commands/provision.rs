@@ -2126,13 +2126,20 @@ fn self_node_redemption(node: &str) -> Result<Redemption, String> {
         return Err(format!("{SELF_BIRTH_CRT} is not a PEM certificate"));
     }
     let root = crate::envfile::repo_root();
-    let gpu = Command::new("nvidia-smi").output().map(|o| o.status.success()).unwrap_or(false);
+    // A busy driver is a present one (i425): the fact stays true.
+    let gpu = crate::host_exec::gpu_kept(crate::host_exec::probe_gpu("reporting the GPU as present"));
     Ok(Redemption {
         ip: crate::onboard::util::detect_ip(),
         user: std::env::var("USER").unwrap_or_default(),
         birth_cert: Some(cert),
         facts: Some(self_node_facts(std::env::consts::ARCH, &local_data_root(&root), gpu)),
     })
+}
+
+/// The default provision tier for a GPU probe: a GPU, busy or not, is "2";
+/// none is "3". Pure.
+pub(crate) fn gpu_tier(p: crate::host_exec::GpuProbe) -> &'static str {
+    if crate::host_exec::gpu_kept(p) { "2" } else { "3" }
 }
 
 /// The facts the self node reports for itself, in the shape `noo enroll`
@@ -2779,8 +2786,7 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
     // to /data/noo while every volume lived on the chosen drive.
     let data_root = local_data_root(&root);
     let tier = tier.map(str::to_string).unwrap_or_else(|| {
-        let gpu = Command::new("nvidia-smi").output().map(|o| o.status.success()).unwrap_or(false);
-        if gpu { "2".into() } else { "3".into() }
+        gpu_tier(crate::host_exec::probe_gpu("keeping the GPU tier (2)")).into()
     });
 
     // Prep (idempotent): noo-agent account, /etc/noo, gate tooling. The
@@ -4580,6 +4586,15 @@ pub(crate) const HARNESS_TLS_KEY: &str = "/etc/noo/pki/harness/node.key";
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_busy_gpu_provisions_as_a_gpu_node_and_a_missing_one_does_not() {
+        use super::gpu_tier;
+        use crate::host_exec::GpuProbe;
+        assert_eq!(gpu_tier(GpuProbe::Present), "2");
+        assert_eq!(gpu_tier(GpuProbe::Busy), "2");
+        assert_eq!(gpu_tier(GpuProbe::Missing), "3");
+    }
+
     // The controller must never stage a bundle the node's applier cannot
     // parse. host6 sat in that deadlock for a day (2026-09-19): every
     // restage refused with `unknown kind 'harness-binary'`, and the fix
