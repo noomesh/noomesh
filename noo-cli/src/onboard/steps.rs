@@ -4145,29 +4145,51 @@ fn state_root_path(ctx: &Ctx, root: &Path) -> PathBuf {
 /// when `NOO_PG_DATA` points there; elsewhere it is not ours to make).
 /// Identical to the old per-root list while `NOO_STATE_ROOT` is unset.
 fn storage_targets(ctx: &Ctx, root: &Path) -> Vec<(String, PathBuf)> {
-    let state = state_root_path(ctx, root);
+    storage_targets_in(&storage_subdirs(ctx, root), root, &state_root_path(ctx, root), &ctx.read_env("NOO_PG_DATA"))
+}
+
+/// [`storage_targets`] over explicit inputs: the directory names, the data
+/// root, the state root (the data root itself when `NOO_STATE_ROOT` is
+/// unset) and `NOO_PG_DATA`. Pure, and shared with `noo upgrade --stack`,
+/// which creates a directory a NEW release added before its launcher's
+/// bind check runs (0.6.16: `tempo`, refused on every moved controller).
+pub(crate) fn storage_targets_in(names: &[String], root: &Path, state: &Path, pg_data: &str) -> Vec<(String, PathBuf)> {
     let trim = |p: &Path| p.to_string_lossy().trim_end_matches('/').to_string();
-    let separated = trim(&state) != trim(root);
+    let separated = trim(state) != trim(root);
+    let pg = pg_data.trim_end_matches('/');
+    // Postgres' device is NOO_PG_DATA; under another path it is not ours.
+    let pg_off = |base: &Path| !pg.is_empty() && pg != format!("{}/postgres", trim(base));
     let mut out: Vec<(String, PathBuf)> = Vec::new();
-    for name in storage_subdirs(ctx, root) {
+    for name in names {
+        if name == "postgres" && pg_off(root) {
+            continue;
+        }
         if separated && STATE_SUBDIRS.contains(&name.as_str()) {
             continue;
         }
-        let target = root.join(&name);
-        out.push((name, target));
+        out.push((name.clone(), root.join(name)));
     }
     if separated {
-        let pg = ctx.read_env("NOO_PG_DATA");
-        let pg = pg.trim_end_matches('/');
-        let pg_elsewhere = !pg.is_empty() && pg != format!("{}/postgres", trim(&state));
         for name in STATE_SUBDIRS {
-            if *name == "postgres" && pg_elsewhere {
+            if *name == "postgres" && pg_off(state) {
                 continue;
             }
             out.push((name.to_string(), state.join(name)));
         }
     }
     out
+}
+
+/// Create one storage directory as the caller, then hand it to its service
+/// uid ([`subdir_owner`], while it is still empty). Onboarding's storage step
+/// and the stack roll both create through here, so a directory a release
+/// adds gets the same owner either way.
+pub(crate) fn create_storage_dir(name: &str, target: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(target)?;
+    if let Some(owner) = subdir_owner(name) {
+        ensure_dir_ownership(&target.to_string_lossy(), owner);
+    }
+    Ok(())
 }
 
 /// Returns how many subdirectories could not be created.
@@ -4232,12 +4254,9 @@ fn create_storage_dirs(ctx: &mut Ctx, root: &Path) -> usize {
             created += 1;
             continue;
         }
-        match std::fs::create_dir_all(target) {
-            Ok(_) => {
+        match create_storage_dir(name, target) {
+            Ok(()) => {
                 created += 1;
-                if let Some(owner) = subdir_owner(name.as_str()) {
-                    ensure_dir_ownership(&target.to_string_lossy(), owner);
-                }
             }
             Err(_) => {
                 // retry with sudo — `-n` unless a person can answer (i267)
