@@ -316,15 +316,15 @@ mod tests {
         assert!(b >= a);
     }
 
-    /// A script `body` under a per-process scratch dir; returns its path.
+    /// A script `body` under a per-process scratch dir; returns its path. It
+    /// is run as `sh <path>` and never exec'd (a just-written file can hit
+    /// ETXTBSY when another test forks).
     fn fake(name: &str, body: &str) -> String {
-        use std::os::unix::fs::PermissionsExt as _;
         let dir = std::env::temp_dir().join(format!("noo-host-exec-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("nvidia-smi");
         std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         p.to_string_lossy().into_owned()
     }
 
@@ -332,7 +332,7 @@ mod tests {
     fn a_stuck_program_is_busy_within_the_deadline_and_not_waited_for() {
         let p = fake("smi-slow", "sleep 30");
         let t = Instant::now();
-        let a = run_within(&p, Duration::from_millis(300), &[]);
+        let a = run_within("sh", Duration::from_millis(300), &[p.as_str()]);
         assert!(matches!(a, SmiAnswer::Busy), "{a:?}");
         assert!(t.elapsed() < Duration::from_millis(300) + Duration::from_secs(2), "{:?}", t.elapsed());
     }
@@ -340,7 +340,7 @@ mod tests {
     #[test]
     fn a_fast_program_is_done_with_its_output_and_status() {
         let p = fake("smi-fast", "echo GPU 0: fake; echo oops >&2; exit 3");
-        match run_within(&p, Duration::from_secs(5), &[]) {
+        match run_within("sh", Duration::from_secs(5), &[p.as_str()]) {
             SmiAnswer::Done(o) => {
                 assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "GPU 0: fake");
                 assert_eq!(String::from_utf8_lossy(&o.stderr).trim(), "oops");
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn a_large_output_does_not_block_on_a_full_pipe() {
         let p = fake("smi-big", "yes x | head -c 300000");
-        match run_within(&p, Duration::from_secs(5), &[]) {
+        match run_within("sh", Duration::from_secs(5), &[p.as_str()]) {
             SmiAnswer::Done(o) => assert_eq!(o.stdout.len(), 300000),
             other => panic!("{other:?}"),
         }
@@ -367,9 +367,9 @@ mod tests {
 
     #[test]
     fn busy_keeps_the_gpu_choice_and_a_failed_tool_does_not() {
-        let slow = run_within(&fake("s", "sleep 30"), Duration::from_millis(100), &[]);
-        let bad = run_within(&fake("b", "exit 9"), Duration::from_secs(5), &[]);
-        let ok = run_within(&fake("o", "exit 0"), Duration::from_secs(5), &[]);
+        let slow = run_within("sh", Duration::from_millis(100), &[fake("s", "sleep 30").as_str()]);
+        let bad = run_within("sh", Duration::from_secs(5), &[fake("b", "exit 9").as_str()]);
+        let ok = run_within("sh", Duration::from_secs(5), &[fake("o", "exit 0").as_str()]);
         assert_eq!(classify_gpu(&slow), GpuProbe::Busy);
         assert_eq!(classify_gpu(&bad), GpuProbe::Missing);
         assert_eq!(classify_gpu(&ok), GpuProbe::Present);
