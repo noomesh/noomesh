@@ -717,6 +717,18 @@ pub(crate) struct StreamedResponse {
     pub deadline_hit: bool,
 }
 
+/// A stream that ended with bytes but not one readable event: the reason,
+/// naming what came back. `None` when an event was read, the body was empty,
+/// or the stream already ended as a cut, the deadline or a provider error.
+pub(crate) fn unreadable_stream(events_read: usize, body_head: &str, ended_otherwise: bool) -> Option<String> {
+    let head = body_head.trim();
+    if events_read > 0 || head.is_empty() || ended_otherwise {
+        return None;
+    }
+    let shown: String = head.chars().take(160).collect();
+    Some(format!("the model answered with nothing this gateway can read as a stream (it began: {shown:?})"))
+}
+
 /// Accumulate a streamed answer. `started` is when the call was sent (for
 /// the cut message); `until` is when the turn must stop. A mid-stream
 /// failure ends the read and is reported in [`StreamedResponse::cut`], and
@@ -2223,6 +2235,15 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         // so everything below is shared by every wire.
         let mut anthropic_sse = (super::backend::wire_format(&backend) == "anthropic")
             .then(super::anthropic_wire::SseTranslator::new);
+        // A directly dialled Ollama (no node agent in front: a node with no
+        // address, a standalone controller's OLLAMA_URL) answers /api/chat in
+        // NDJSON, not SSE: each line becomes the SSE chunks below (i411). It
+        // used to be skipped line by line, an empty answer with no error.
+        let mut ndjson = (super::backend::wire_format(&backend) == "ollama")
+            .then(|| crate::harness::translator::ollama::NdjsonToSse::new(&backend.model));
+        // What the body was, for the error when nothing in it was readable.
+        let mut events_read = 0usize;
+        let mut body_head = String::new();
         let mut stream_failed = false;
 
         // A body error mid-stream (the idle bound, a reset) is a CUT, kept
@@ -2262,7 +2283,14 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                 }
             };
 
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            let text = String::from_utf8_lossy(&chunk);
+            if body_head.len() < 300 {
+                body_head.extend(text.chars().take(300 - body_head.len()));
+            }
+            match ndjson.as_mut() {
+                Some(t) => buf.push_str(&t.push(&text)),
+                None => buf.push_str(&text),
+            }
 
             // Process complete SSE lines
             while let Some(line_end) = buf.find('\n') {
@@ -2290,6 +2318,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                     (p, _) => p,
                 };
                 if let Some(chunk_json) = parsed {
+                    events_read += 1;
                     // Extract delta from SSE chunk
                     let delta = chunk_json.get("choices")
                         .and_then(|c| c.get(0))
@@ -2446,6 +2475,14 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                 }
             }
             if stream_failed { break; }
+        }
+        if let Some(why) = unreadable_stream(events_read, &body_head, stream_cut.is_some() || hit_deadline || stream_failed) {
+            // Fail loud (P3): a body with nothing readable in it is the
+            // backend's error, not an empty answer to save and nudge (i411).
+            let msg = format!("{why} (backend {} at {})", backend.backend_type, crate::redact::scrub_url_userinfo(&backend.url));
+            tracing::error!(backend = %crate::redact::scrub_url_userinfo(&backend.url), "{msg}");
+            let _ = writer.send_event("error", json!(msg)).await;
+            stream_failed = true;
         }
         if stream_failed {
             // The provider ended the stream with an error event (already
@@ -4120,5 +4157,19 @@ mod request_size_tests {
         for path in ["\"stream\");", "\"nonstream\");"] {
             assert!(src.contains(&format!("log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), {path}")), "{path}");
         }
+    }
+}
+
+#[cfg(test)]
+mod unreadable_stream_tests {
+    use super::unreadable_stream;
+
+    #[test]
+    fn a_body_with_nothing_readable_is_an_error_not_an_empty_answer() {
+        let why = unreadable_stream(0, "  {\"message\":{\"content\":\"hi\"}}\n", false).expect("an error");
+        assert!(why.contains("nothing this gateway can read") && why.contains("message"), "{why}");
+        assert_eq!(unreadable_stream(1, "data: {}", false), None, "an event was read");
+        assert_eq!(unreadable_stream(0, " \n ", false), None, "an empty body is the empty-answer path, as before");
+        assert_eq!(unreadable_stream(0, "junk", true), None, "a cut, the deadline or a provider error already said why");
     }
 }
