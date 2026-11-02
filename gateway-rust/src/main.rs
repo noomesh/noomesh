@@ -82,6 +82,7 @@ mod config;
 mod coordinator;
 mod config_mount;
 mod dependency_watchdog;
+mod fd_watch;
 mod node_agent_auth;
 mod node_link;
 mod node_rpc;
@@ -718,6 +719,8 @@ async fn main() -> Result<()> {
     // gone, but nothing was consuming that, so a four-hour database outage
     // on 2026-08-03 reached nobody. See dependency_watchdog.rs.
     dependency_watchdog::spawn(state.clone());
+    // 2026-11-02 EMFILE outage: warn at 70% of RLIMIT_NOFILE, page at 90%.
+    fd_watch::spawn(state.clone());
     // say so when the config file bind mount points at an
     // unlinked inode (host file replaced by rename). Re-checked after every
     // config write in routes/settings.rs.

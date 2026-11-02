@@ -5512,6 +5512,51 @@ pub(crate) fn gateway_redis_check(health: Option<&Value>) -> Check {
     }
 }
 
+/// The `gateway fds` row: the gateway's open file descriptors against its
+/// soft `RLIMIT_NOFILE` (`dependencies.fds` in the authenticated `/health`).
+/// On 2026-11-02 the pop-os gateway hit the limit after ~45 h and spent five
+/// hours unable to read its secrets or reach Postgres; nothing had shown the
+/// climb. Warn at the gateway's own warn share (70%), fail at its critical
+/// share (90%) or when it could not count at all. The gateway names both
+/// shares, so this row and its alert loop cannot disagree.
+pub(crate) fn gateway_fds_check(health: Option<&Value>) -> Check {
+    const NAME: &str = "gateway fds";
+    let Some(dep) = health.map(|h| &h["dependencies"]["fds"]).filter(|d| d.is_object()) else {
+        return warn(
+            NAME,
+            "not read: no authenticated /health answer with dependencies.fds \
+             (unreachable, no credential, or a gateway older than this CLI)",
+            Some("noo health".into()),
+        );
+    };
+    let count = match (dep["open"].as_u64(), dep["soft_limit"].as_u64()) {
+        (Some(open), Some(soft)) => format!("{open} of {soft} open ({}%)", open.saturating_mul(100) / soft.max(1)),
+        (Some(open), None) => format!("{open} open (no finite soft limit)"),
+        _ => format!("not counted: {}", dep["error"].as_str().unwrap_or("no reason given")),
+    };
+    match dep["level"].as_str() {
+        Some("ok") => ok(NAME, count),
+        Some("warn") => warn(
+            NAME,
+            format!(
+                "{count}: past {}% of the soft limit; something is holding descriptors. \
+                 Watch `process_open_fds` in Grafana; at the limit the gateway cannot read secrets or reach the database",
+                dep["warn_pct"].as_u64().unwrap_or(70)
+            ),
+            Some("noo stack logs gateway --tail 200".into()),
+        ),
+        Some(level) => fail(
+            NAME,
+            format!(
+                "{count} ({level}): the gateway is about to refuse connections, secret reads and database \
+                 connections. Restart it, and keep the `process_open_fds` graph for the leak"
+            ),
+            "noo stack restart gateway",
+        ),
+        None => warn(NAME, format!("{count}; no level in the answer"), Some("noo health".into())),
+    }
+}
+
 /// The `gateway add-on caller key` row (noomesh followup 304). The gateway mints a
 /// bearer at each start and signs every add-on call with it; evolve refuses an
 /// unsigned call with 401. A boot whose mint failed serves everything else and
@@ -6269,6 +6314,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let health = health_body(g);
         checks.push(gateway_bus_check(health.as_ref()));
         checks.push(gateway_redis_check(health.as_ref()));
+        checks.push(gateway_fds_check(health.as_ref()));
         // The bearer every add-on call is signed with (followup 304).
         checks.push(addon_caller_check(health.as_ref()));
         // i353b: an add-on the gateway refused at startup. An unreadable
@@ -11365,5 +11411,49 @@ mod digest_tests {
         // fix-modes tightens a key with no reader row to 0600 (i277a).
         assert_eq!(r, "noo security pki fix-modes", "{r}");
         assert!(!r.contains("noo-cli/src") && !r.contains("edit "), "{r}");
+    }
+}
+
+#[cfg(test)]
+mod gateway_fds_tests {
+    use super::{gateway_fds_check, Verdict};
+    use serde_json::json;
+
+    fn body(fds: serde_json::Value) -> serde_json::Value {
+        json!({"status": "healthy", "dependencies": {"fds": fds}})
+    }
+
+    #[test]
+    fn the_row_follows_the_gateways_own_level() {
+        let at = |level: &str, open: u64| {
+            gateway_fds_check(Some(&body(json!({"healthy": level != "critical", "level": level, "open": open,
+                "soft_limit": 1024, "hard_limit": 524288, "warn_pct": 70, "critical_pct": 90}))))
+        };
+        let c = at("ok", 200);
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("200 of 1024 open (19%)"), "{}", c.detail);
+        let c = at("warn", 800);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("800 of 1024 open (78%)") && c.detail.contains("past 70%"), "{}", c.detail);
+        let c = at("critical", 1000);
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("(critical)"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_gateway_that_could_not_count_fails_and_says_why() {
+        let c = gateway_fds_check(Some(&body(json!({"healthy": false, "level": "critical",
+            "error": "cannot list /proc/self/fd: Too many open files (os error 24)"}))));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("os error 24"), "{}", c.detail);
+    }
+
+    #[test]
+    fn an_older_gateway_or_no_answer_is_a_warning_not_a_pass() {
+        assert_eq!(gateway_fds_check(None).verdict, Verdict::Warn);
+        let old = json!({"status": "healthy", "dependencies": {"nats": {"healthy": true}}});
+        let c = gateway_fds_check(Some(&old));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("not read"), "{}", c.detail);
     }
 }
