@@ -369,3 +369,90 @@ async fn every_usage_summary_shape_parses_against_the_real_schema() {
          for the six groups the rollup can serve"
     );
 }
+
+// ── 5. Temporal projects: the org bound fails closed (i434) ────────
+
+/// Trellion's two temporal tables, in the shape the project readers use
+/// (trellion's chain creates them; the mesh chain does not), plus three
+/// projects: one in `acme`, one in `globex`, one never stamped.
+async fn temporal_projects_fixture(db: &PgPool) {
+    sqlx::raw_sql(
+        "CREATE TABLE noo_entities_typed ( \
+           id uuid PRIMARY KEY DEFAULT gen_random_uuid(), type text NOT NULL, \
+           canonical_name text NOT NULL, org_id text, UNIQUE (type, canonical_name)); \
+         CREATE TABLE noo_temporal_edges ( \
+           id uuid PRIMARY KEY DEFAULT gen_random_uuid(), subject_id uuid NOT NULL, \
+           predicate text NOT NULL, object_value text, object_entity_id uuid, \
+           confidence double precision NOT NULL DEFAULT 1.0, \
+           valid_from timestamptz NOT NULL DEFAULT now(), valid_to timestamptz); \
+         INSERT INTO noo_entities_typed (type, canonical_name, org_id) VALUES \
+           ('project', 'acme-rocket', 'acme'), ('project', 'globex-secret', 'globex'), \
+           ('project', 'unstamped-plan', NULL); \
+         INSERT INTO noo_temporal_edges (subject_id, predicate, object_value) \
+           SELECT id, 'decided', 'ship it' FROM noo_entities_typed",
+    )
+    .execute(db)
+    .await
+    .expect("temporal fixture");
+    crate::repo::users::create(db, "ada", "x", &serde_json::json!(["read"]), Some("acme"))
+        .await
+        .expect("user ada in acme");
+    // Prove the fixture: every project has a live edge, so an empty answer
+    // below is the org bound refusing, not a fixture that holds nothing.
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM noo_temporal_edges e JOIN noo_entities_typed s ON e.subject_id = s.id \
+          WHERE s.type = 'project' AND e.valid_to IS NULL",
+    )
+    .fetch_one(db)
+    .await
+    .expect("count fixture");
+    assert_eq!(live, 3, "three live project edges in the fixture");
+}
+
+const ALL_PROJECTS: [&str; 3] = ["acme-rocket", "globex-secret", "unstamped-plan"];
+
+#[tokio::test]
+async fn project_decisions_are_read_in_one_org_and_unstamped_rows_in_none() {
+    let Some(db) = scratch().await else { return };
+    temporal_projects_fixture(&db).await;
+
+    let acme = crate::temporal_graph::recent_project_decisions(&db, "acme", 20).await.expect("read acme");
+    let names: Vec<&str> = acme.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(names, ["acme-rocket"], "acme reads its own project only");
+
+    assert_eq!(crate::temporal_graph::resolve_org(&db, Some("ada")).await.expect("lookup"), Some("acme".to_string()));
+    let ctx = crate::temporal_graph::fetch_temporal_context(&db, Some("ada")).await.unwrap_or_default();
+    assert!(ctx.contains("acme-rocket"), "ada's prompt carries her org's project: {ctx}");
+    assert!(!ctx.contains("globex-secret") && !ctx.contains("unstamped-plan"), "{ctx}");
+}
+
+#[tokio::test]
+async fn an_unresolved_identity_reads_no_projects() {
+    let Some(db) = scratch().await else { return };
+    temporal_projects_fixture(&db).await;
+    for who in [None, Some("svc:trading"), Some("internal"), Some("nobody")] {
+        assert_eq!(crate::temporal_graph::resolve_org(&db, who).await.expect("lookup"), None, "{who:?}");
+        let ctx = crate::temporal_graph::fetch_temporal_context(&db, who).await.unwrap_or_default();
+        for p in ALL_PROJECTS {
+            assert!(!ctx.contains(p), "{who:?} must read no project, got {ctx}");
+        }
+    }
+}
+
+/// The 2026-11-02 shape: the org lookup fails while the project table is
+/// readable. Before i434 that bound NULL and returned every tenant's
+/// projects.
+#[tokio::test]
+async fn an_org_lookup_the_database_cannot_answer_reads_no_projects() {
+    let Some(db) = scratch().await else { return };
+    temporal_projects_fixture(&db).await;
+    sqlx::raw_sql("ALTER TABLE noo_users RENAME TO noo_users_away")
+        .execute(&db)
+        .await
+        .expect("make the org lookup fail");
+    assert!(crate::temporal_graph::resolve_org(&db, Some("ada")).await.is_err(), "the lookup must fail here");
+    let ctx = crate::temporal_graph::fetch_temporal_context(&db, Some("ada")).await.unwrap_or_default();
+    for p in ALL_PROJECTS {
+        assert!(!ctx.contains(p), "a failed org lookup must read no project, got {ctx}");
+    }
+}
