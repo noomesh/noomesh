@@ -276,25 +276,25 @@ mod tests {
 
     #[test]
     fn set_access_takes_features_then_the_value_and_exactly_one_subject() {
-        let s = parse_set_access_with(&mut args(&["pai-voice", "voice", "transcribe", "on", "--role", "user"])).unwrap();
+        let s = parse_set_access_with(&mut args(&["rhaddon", "voice", "transcribe", "on", "--role", "user"])).unwrap();
         assert_eq!(
             s,
             SetAccess {
-                addon: "pai-voice".into(),
+                addon: "rhaddon".into(),
                 features: vec!["voice".into(), "transcribe".into()],
                 value: "on".into(),
                 subject: "role:user".into(),
                 reason: None,
             }
         );
-        let s = parse_set_access_with(&mut args(&["pai-voice", "voice", "OFF", "--user", "guest", "--reason", "trial ended"])).unwrap();
+        let s = parse_set_access_with(&mut args(&["rhaddon", "voice", "OFF", "--user", "guest", "--reason", "trial ended"])).unwrap();
         assert_eq!((s.value.as_str(), s.subject.as_str(), s.reason.as_deref()), ("off", "user:guest", Some("trial ended")));
         for (bad, why) in [
-            (vec!["pai-voice", "voice", "on"], "say who"),
-            (vec!["pai-voice", "voice", "on", "--role", "user", "--team", "studio"], "one subject"),
-            (vec!["pai-voice", "on", "--role", "user"], "missing arguments"),
-            (vec!["pai-voice", "voice", "maybe", "--role", "user"], "on, off or inherit"),
-            (vec!["pai-voice", "voice", "on", "--role", "user", "--bogus"], "unknown flag"),
+            (vec!["rhaddon", "voice", "on"], "say who"),
+            (vec!["rhaddon", "voice", "on", "--role", "user", "--team", "studio"], "one subject"),
+            (vec!["rhaddon", "on", "--role", "user"], "missing arguments"),
+            (vec!["rhaddon", "voice", "maybe", "--role", "user"], "on, off or inherit"),
+            (vec!["rhaddon", "voice", "on", "--role", "user", "--bogus"], "unknown flag"),
         ] {
             let e = parse_set_access_with(&mut args(&bad)).unwrap_err();
             assert!(e.0.contains(why), "{bad:?}: {e}");
@@ -314,10 +314,10 @@ mod tests {
     #[test]
     fn features_shows_declared_settings_stale_and_super_admins() {
         let body = json!({
-            "addon": "pai-voice", "legacy": false,
+            "addon": "rhaddon", "legacy": false,
             "features": [{"name": "voice", "title": "Talk to the assistant", "description": "", "suggested": "user",
                           "delegate": false, "routes": ["speak", "listen"], "ui": true, "has_unscoped_write": false}],
-            "settings": [{"addon": "pai-voice", "feature": "voice", "subject": "user:guest", "allowed": false,
+            "settings": [{"addon": "rhaddon", "feature": "voice", "subject": "user:guest", "allowed": false,
                           "set_by": "admin", "set_at": "2026-11-02T10:00:00Z", "source": "operator", "reason": "trial ended"}],
             "stale_features": ["old-thing"],
             "super_admins": ["admin"],
@@ -336,7 +336,7 @@ mod tests {
         let body = json!({
             "account": "guest", "role": "user", "teams": ["studio"], "super_admin": false,
             "addons": [
-                {"addon": "pai-voice", "legacy": false, "features": [
+                {"addon": "rhaddon", "legacy": false, "features": [
                     {"feature": "voice", "title": "Talk", "allowed": false, "decided_by": "user:guest"},
                     {"feature": "transcribe", "title": "Transcribe", "allowed": true, "decided_by": "team:studio"}]},
                 {"addon": "rhaddon", "legacy": true, "features": []},
