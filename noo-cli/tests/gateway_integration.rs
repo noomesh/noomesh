@@ -48,10 +48,25 @@ impl Mock {
         Mock::start_seq(vec![http_response(status, reason, ctype, body); count])
     }
 
+    /// A mock Hugging Face API: plain http, because the HF client is not a
+    /// gateway client. It does not go through the CLI's gateway trust (no
+    /// `NOO_TLS_CA`, the public roots only), and `HF_ENDPOINT` is the
+    /// standard huggingface_hub override, which may name an http mirror. Point
+    /// `HF_ENDPOINT` at it with [`hf_url`].
+    fn start_hf(status: u16, reason: &str, ctype: &str, body: &str, count: usize) -> Mock {
+        Mock::serve(vec![http_response(status, reason, ctype, body); count], false)
+    }
+
     /// Serve one pre-rendered HTTP response per connection, in order —
     /// for poll-loop commands whose successive fetches must differ
     /// (e.g. `memory embed-status --watch`: running → running → idle).
     fn start_seq(responses: Vec<String>) -> Mock {
+        Mock::serve(responses, true)
+    }
+
+    /// `tls`: the mock gateway serves TLS (the CLI has no plain-http gateway
+    /// lane, 1242 finding 7); a mock HF API does not.
+    fn serve(responses: Vec<String>, tls: bool) -> Mock {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let port = listener.local_addr().unwrap().port();
         let handle = thread::spawn(move || {
@@ -78,7 +93,17 @@ impl Mock {
                         Err(_) => break None,
                     }
                 };
-                let Some(mut stream) = stream.take().and_then(tls_accept) else { break };
+                let Some(tcp) = stream.take() else { break };
+                if !tls {
+                    let mut tcp = tcp;
+                    tcp.set_nonblocking(false).ok();
+                    tcp.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    captured.push(read_request(&mut tcp));
+                    let _ = tcp.write_all(response.as_bytes());
+                    let _ = tcp.flush();
+                    continue;
+                }
+                let Some(mut stream) = tls_accept(tcp) else { break };
                 captured.push(read_request(&mut stream));
                 tls_reply(&mut stream, &response);
             }
@@ -229,6 +254,12 @@ fn run_with_stdin_env(args: &[&str], input: &str, extra_env: &[(&str, &str)]) ->
 
 fn gw(port: u16) -> String {
     format!("https://127.0.0.1:{port}")
+}
+
+/// `HF_ENDPOINT` for a [`Mock::start_hf`] mock (plain http: HF is not a
+/// gateway, see `start_hf`).
+fn hf_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}")
 }
 
 /// The per-command case helper: mock one gateway route (`method` + `path` →
@@ -1623,12 +1654,12 @@ fn models_list_offline_falls_back_to_curated_catalog() {
 #[test]
 fn models_search_queries_hf_and_normalizes() {
     let hf_body = r#"[{"modelId":"meta-llama/Llama-3.1-8B-Instruct","tags":["awq","text-generation"],"downloads":3000000,"likes":120,"gated":false}]"#;
-    let mock = Mock::start(200, "OK", "application/json", hf_body, 1);
+    let mock = Mock::start_hf(200, "OK", "application/json", hf_body, 1);
     let home_dir = temp_home("search");
     let home = home_dir.to_string_lossy().into_owned();
     let out = run(
         &["--json", "models", "search", "llama"],
-        &[("HOME", &home), ("HF_ENDPOINT", &gw(mock.port))],
+        &[("HOME", &home), ("HF_ENDPOINT", &hf_url(mock.port))],
     );
     let reqs = mock.requests();
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
@@ -1649,12 +1680,12 @@ fn models_search_queries_hf_and_normalizes() {
 #[test]
 fn models_info_renders_gated_badge_and_hint() {
     let hf_body = r#"{"id":"meta-llama/Llama-3.1-8B-Instruct","author":"meta-llama","gated":"manual","downloads":3000000,"likes":12345,"tags":["safetensors"],"siblings":[{"rfilename":"model.safetensors"}],"cardData":{"license":"llama3.1"}}"#;
-    let mock = Mock::start(200, "OK", "application/json", hf_body, 1);
+    let mock = Mock::start_hf(200, "OK", "application/json", hf_body, 1);
     let home_dir = temp_home("info");
     let home = home_dir.to_string_lossy().into_owned();
     let out = run(
         &["models", "info", "meta-llama/Llama-3.1-8B-Instruct"],
-        &[("HOME", &home), ("HF_ENDPOINT", &gw(mock.port))],
+        &[("HOME", &home), ("HF_ENDPOINT", &hf_url(mock.port))],
     );
     let _ = mock.requests();
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
@@ -1680,12 +1711,12 @@ fn models_info_renders_gated_badge_and_hint() {
 
 #[test]
 fn models_info_not_found_exits_1() {
-    let mock = Mock::start(404, "Not Found", "application/json", r#"{"error":"unknown"}"#, 1);
+    let mock = Mock::start_hf(404, "Not Found", "application/json", r#"{"error":"unknown"}"#, 1);
     let home_dir = temp_home("info404");
     let home = home_dir.to_string_lossy().into_owned();
     let out = run(
         &["models", "info", "nope/not-a-model"],
-        &[("HOME", &home), ("HF_ENDPOINT", &gw(mock.port))],
+        &[("HOME", &home), ("HF_ENDPOINT", &hf_url(mock.port))],
     );
     let _ = mock.requests();
     assert_eq!(out.status.code(), Some(1), "HF 404 must map to Generic(1)");
@@ -1730,12 +1761,12 @@ fn models_recommended_rejects_invalid_tier() {
 
 #[test]
 fn models_huggingface_uses_default_query() {
-    let mock = Mock::start(200, "OK", "application/json", "[]", 1);
+    let mock = Mock::start_hf(200, "OK", "application/json", "[]", 1);
     let home_dir = temp_home("hf");
     let home = home_dir.to_string_lossy().into_owned();
     let out = run(
         &["--json", "models", "huggingface"],
-        &[("HOME", &home), ("HF_ENDPOINT", &gw(mock.port))],
+        &[("HOME", &home), ("HF_ENDPOINT", &hf_url(mock.port))],
     );
     let reqs = mock.requests();
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
@@ -3151,12 +3182,12 @@ fn models_refresh_bypasses_ttl_and_writes_python_shaped_cache() {
     )
     .unwrap();
 
-    let mock = Mock::start(200, "OK", "application/json", HF_LLAMA_GGUF, 1);
+    let mock = Mock::start_hf(200, "OK", "application/json", HF_LLAMA_GGUF, 1);
     let out = run(
         &["--json", "models", "refresh", "--backend", "llamacpp"],
         &[
             ("HOME", &home),
-            ("HF_ENDPOINT", &gw(mock.port)),
+            ("HF_ENDPOINT", &hf_url(mock.port)),
             ("NOO_MODEL_VENDORS", "llama"),
         ],
     );
@@ -3256,7 +3287,7 @@ fn models_refresh_reads_python_written_cache_back() {
 fn models_refresh_llm_posts_coordinator_eval_and_stores_in_cache() {
     let home_dir = temp_home("refreshllm");
     let home = home_dir.to_string_lossy().into_owned();
-    let hf = Mock::start(200, "OK", "application/json", HF_LLAMA_GGUF, 1);
+    let hf = Mock::start_hf(200, "OK", "application/json", HF_LLAMA_GGUF, 1);
     // The coordinator's reply embeds the JSON array in prose — the parser
     // must take first-'['..last-']' (Python's greedy `\[.*\]` DOTALL).
     let gw_body = r#"{"response":"Here is my analysis:\n[{\"id\": \"bartowski/Llama-3.2-3B-Instruct-GGUF\", \"tool_parser\": \"llama3_json\", \"tool_calling\": true, \"reasoning\": false, \"agentic_quality\": \"good\"}]\nDone."}"#;
@@ -3274,7 +3305,7 @@ fn models_refresh_llm_posts_coordinator_eval_and_stores_in_cache() {
         ],
         &[
             ("HOME", &home),
-            ("HF_ENDPOINT", &gw(hf.port)),
+            ("HF_ENDPOINT", &hf_url(hf.port)),
             ("NOO_MODEL_VENDORS", "llama"),
         ],
     );
@@ -3320,7 +3351,7 @@ fn models_refresh_llm_gateway_down_is_best_effort() {
     // try/except-pass).
     let home_dir = temp_home("refreshllmdown");
     let home = home_dir.to_string_lossy().into_owned();
-    let hf = Mock::start(200, "OK", "application/json", HF_LLAMA_GGUF, 1);
+    let hf = Mock::start_hf(200, "OK", "application/json", HF_LLAMA_GGUF, 1);
     let dead = dead_url();
     let out = run(
         &[
@@ -3335,7 +3366,7 @@ fn models_refresh_llm_gateway_down_is_best_effort() {
         ],
         &[
             ("HOME", &home),
-            ("HF_ENDPOINT", &gw(hf.port)),
+            ("HF_ENDPOINT", &hf_url(hf.port)),
             ("NOO_MODEL_VENDORS", "llama"),
         ],
     );
