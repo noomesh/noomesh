@@ -322,12 +322,15 @@ mod tests {
             "stale_features": ["old-thing"],
             "super_admins": ["admin"],
         });
+        // The ui helpers capitalise section titles and status lines, so the
+        // words are compared without case.
         let out = render_features(&body);
-        for want in ["voice", "Talk to the assistant", "2 + ui", "user:guest", "trial ended", "old-thing", "admin"] {
-            assert!(out.contains(want), "missing {want:?} in:\n{out}");
+        for want in ["voice", "talk to the assistant", "2 + ui", "user:guest", "trial ended", "old-thing", "admin"] {
+            assert!(out.to_lowercase().contains(want), "missing {want:?} in:\n{out}");
         }
         let legacy = render_features(&json!({"addon": "rhaddon", "legacy": true, "features": [], "settings": [], "stale_features": [], "super_admins": []}));
-        assert!(legacy.contains("declares no features") && legacy.contains("none set"), "{legacy}");
+        let low = legacy.to_lowercase();
+        assert!(low.contains("rhaddon declares no features") && low.contains("none set"), "{legacy}");
     }
 
     /// Driven by the route's JSON as `person_view` builds it.
@@ -344,7 +347,7 @@ mod tests {
         });
         let out = render_person(&body);
         for want in ["guest", "studio", "voice", "user:guest", "transcribe", "team:studio", "rhaddon", "declares no features"] {
-            assert!(out.contains(want), "missing {want:?} in:\n{out}");
+            assert!(out.to_lowercase().contains(want), "missing {want:?} in:\n{out}");
         }
     }
 }
