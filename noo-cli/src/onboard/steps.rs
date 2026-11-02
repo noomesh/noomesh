@@ -274,14 +274,20 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
     }
 
     ctx.progress("Detecting GPU...");
+    let mut gpu_busy = false;
     match util::detect_gpu() {
-        Some((model, vram)) => {
+        util::GpuDetect::Found(model, vram) => {
             ctx.state.gpu_model = model.clone();
             ctx.state.vram_gb = vram;
             ctx.state.tier = util::tier_for_vram(vram);
             ctx.success(&format!("GPU: {model} ({vram:.0} GB) — Tier {}", ctx.state.tier));
         }
-        None => {
+        util::GpuDetect::Busy => {
+            gpu_busy = true;
+            ctx.state.tier = util::tier_when_busy(ctx.state.tier);
+            ctx.warn(&util::gpu_busy_line(ctx.state.tier));
+        }
+        util::GpuDetect::None => {
             ctx.state.tier = 3;
             ctx.warn("GPU: none detected — CPU-only (Tier 3)");
         }
@@ -294,7 +300,10 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
     // GPU-less runtime check downstream reads as "no GPU". Same recipe as
     // the node-side prep-host.sh, offered with the same consent posture as
     // the other installers.
-    let have_driver = Command::new("nvidia-smi").output().map(|o| o.status.success()).unwrap_or(false);
+    // A busy answer above already said the driver is there: no second wait.
+    let have_driver = gpu_busy
+        || crate::host_exec::classify_gpu(&crate::host_exec::nvidia_smi_within(crate::host_exec::SMI_DEADLINE, &[]))
+            == crate::host_exec::GpuProbe::Present;
     let runtime_ready = Command::new("docker")
         .args(["info", "--format", "{{json .Runtimes}}"])
         .output().ok()
@@ -6113,12 +6122,17 @@ pub fn first_model(ctx: &mut Ctx) {
     // detected and the recommendations said "Tier 0" (2026-09-01). The
     // detection is one nvidia-smi call — just run it when state is empty.
     if ctx.state.tier == 0 {
-        if let Some((gpu, vram)) = util::detect_gpu() {
-            ctx.state.gpu_model = gpu;
-            ctx.state.vram_gb = vram;
-            ctx.state.tier = util::tier_for_vram(vram);
-        } else {
-            ctx.state.tier = 3; // CPU-only, never 0
+        match util::detect_gpu() {
+            util::GpuDetect::Found(gpu, vram) => {
+                ctx.state.gpu_model = gpu;
+                ctx.state.vram_gb = vram;
+                ctx.state.tier = util::tier_for_vram(vram);
+            }
+            util::GpuDetect::Busy => {
+                ctx.state.tier = util::tier_when_busy(ctx.state.tier);
+                ctx.warn(&util::gpu_busy_line(ctx.state.tier));
+            }
+            util::GpuDetect::None => ctx.state.tier = 3, // CPU-only, never 0
         }
     }
     let has_anthropic = !ctx.read_env("ANTHROPIC_API_KEY").is_empty();
