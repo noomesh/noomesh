@@ -249,7 +249,7 @@ detect_gpu_tier() {
     # Method 1: nvidia-smi on host
     if command -v nvidia-smi &>/dev/null; then
         local vram_mb
-        vram_mb=$(_noo_nvidia_smi_bounded "${NOO_GPU_PROBE_SECS:-5}" --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+        vram_mb=$(_noo_nvidia_smi_bounded 5 --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
         # Guard: nvidia-smi can print an error to stdout (e.g. "Failed to
         # initialize NVML: GPU access blocked by the operating system") which
         # would otherwise reach the arithmetic below and abort the script with
