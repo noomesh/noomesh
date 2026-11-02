@@ -341,6 +341,9 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 | `noo addons show` | `<name>` | Show one add-on's switch, pin, and the database, workloads and inputs its bundle declares |
 | `noo addons enable` | `<name> [--force] [--lock <path\|https-url>] [--provision-only]` | Pin an add-on's signed lock, mint credentials, declare it ON (--provision-only: DB only) |
 | `noo addons check` | `<bundle-dir> [--name <addon>]` | Enable's guard, resources and routes.json checks on a bundle dir; not signature/key/image |
+| `noo addons features` | `<name>` | Show an add-on's features, who each is set on or off for, and the super admins |
+| `noo addons set-access` | `<name> <feature>... on\|off\|inherit --role <r>\|--team <t>\|--user <u>\|--key <k> [--reason <text>]` | Turn add-on features on or off for a role, team, user or key; inherit clears it (admin) |
+| `noo addons access` | `<user>` | Show what one account may use in each add-on, and the setting that decided it |
 | `noo addons trust-key` | `<name> <pubkey> [--registry <host/path>] [--dev] [--expires <dur>]` | Trust a third-party add-on's signing key; --dev --expires (max 30d): a temporary dev key |
 | `noo addons untrust-key` | `<name> [<pubkey>] [--dev]` | Stop trusting a third-party add-on's signing key; --dev removes its dev key(s) |
 | `noo addons registry-login` | `<addon> [--registry <root>] [--from-file <path>] [--clear]` | Set a third-party add-on's private-registry pull token (stdin or file); --clear drops it |
