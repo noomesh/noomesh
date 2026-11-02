@@ -189,7 +189,6 @@ mod ratchet {
     ("routes/other.rs", 1),
     ("routes/ownership_scoping_tests.rs", 11),
     ("routes/seats.rs", 23),
-    ("routes/temporal.rs", 1),
     ("routes/ui.rs", 3),
     ("routes/usage.rs", 5),
     ("routes/users.rs", 98),

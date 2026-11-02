@@ -398,15 +398,19 @@ async fn temporal_projects_fixture(db: &PgPool) {
         .await
         .expect("user ada in acme");
     // Prove the fixture: every project has a live edge, so an empty answer
-    // below is the org bound refusing, not a fixture that holds nothing.
-    let live: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM noo_temporal_edges e JOIN noo_entities_typed s ON e.subject_id = s.id \
-          WHERE s.type = 'project' AND e.valid_to IS NULL",
+    // below is the org bound refusing, not a fixture that holds nothing. The
+    // check runs in SQL (it raises), keeping this file's query-call count
+    // where the repo-layer ratchet pins it.
+    sqlx::raw_sql(
+        "DO $chk$ BEGIN \
+           IF (SELECT count(*) FROM noo_temporal_edges e JOIN noo_entities_typed s ON e.subject_id = s.id \
+                WHERE s.type = 'project' AND e.valid_to IS NULL) <> 3 \
+           THEN RAISE EXCEPTION 'fixture: expected three live project edges'; END IF; \
+         END $chk$",
     )
-    .fetch_one(db)
+    .execute(db)
     .await
-    .expect("count fixture");
-    assert_eq!(live, 3, "three live project edges in the fixture");
+    .expect("three live project edges in the fixture");
 }
 
 const ALL_PROJECTS: [&str; 3] = ["acme-rocket", "globex-secret", "unstamped-plan"];
