@@ -5345,6 +5345,30 @@ fn ensure_embed_model(ctx: &mut Ctx) {
     }
 }
 
+/// Where `ollama create` stages a Modelfile and its weight INSIDE the ollama
+/// container. The hardened image runs as uid 65532 with a root-owned `/`, so
+/// a root-level `/convert` cannot be made (rc.2, 0.6.16); the directory lives
+/// in the user's own store (HOME/.ollama, a mounted volume writable in every
+/// deployment shape). Beside `models/`, never inside it. The same value is in
+/// node-agent-go (`convertDir`) and scripts/noo-model-convert.sh
+/// (`OLLAMA_CONVERT_DIR`); tests/test_ollama_convert_dir.py ties them.
+pub(crate) const OLLAMA_CONVERT_DIR: &str = "/home/nonroot/.ollama/convert";
+
+/// The shell line that stages harrier into the embed container, creates the
+/// model, and removes the staging directory whatever the outcome. Returns the
+/// exit status of `ollama create`, not of the cleanup.
+pub(crate) fn harrier_create_script(embed: &str, host_dir: &str) -> String {
+    let c = OLLAMA_CONVERT_DIR;
+    format!(
+        "chmod a+r '{host_dir}/harrier-Q4_K_M.gguf' '{host_dir}/harrier.Modelfile'; \
+         docker exec {embed} sh -c 'rm -rf {c} && mkdir -p {c}' && \
+         docker cp '{host_dir}/harrier-Q4_K_M.gguf' {embed}:{c}/ && \
+         docker cp '{host_dir}/harrier.Modelfile' {embed}:{c}/Modelfile && \
+         docker exec -w {c} {embed} ollama create harrier -f Modelfile; rc=$?; \
+         docker exec {embed} rm -rf {c} >/dev/null 2>&1; exit $rc"
+    )
+}
+
 /// The harrier artifact image: `<release namespace>/harrier:v1`, published
 /// by `.github/workflows/publish-harrier.yml` from the `models-harrier-v1`
 /// release. Follows NOO_IMAGE_PREFIX so a mirror or a namespace change
@@ -5394,13 +5418,7 @@ pub(crate) fn ensure_embed_model_core(model: &str) -> Vec<String> {
                 .status().map(|s| s.success()).unwrap_or(false);
         let created = sha_ok
             && Command::new("bash").arg("-c")
-                .arg(format!(
-                    "docker exec {embed} mkdir -p /convert && \
-                     docker cp '{d}/harrier-Q4_K_M.gguf' {embed}:/convert/ && \
-                     docker cp '{d}/harrier.Modelfile' {embed}:/convert/Modelfile && \
-                     docker exec -w /convert {embed} ollama create harrier -f Modelfile",
-                    d = tmp.display()
-                ))
+                .arg(harrier_create_script(&embed, &tmp.display().to_string()))
                 .status().map(|s| s.success()).unwrap_or(false);
         let _ = std::fs::remove_dir_all(&tmp);
         if created {
@@ -5409,8 +5427,8 @@ pub(crate) fn ensure_embed_model_core(model: &str) -> Vec<String> {
             out_lines.push(format!(
                 "!Could not fetch/create harrier from {artifact} — RAG embedding stays down. Manual recovery:"));
             out_lines.push(format!("      docker create --name harrier-src {artifact} && docker cp harrier-src:/harrier/. /tmp/harrier/ && docker rm harrier-src"));
-            out_lines.push(format!("      docker cp /tmp/harrier/harrier-Q4_K_M.gguf {embed}:/convert/ && docker cp /tmp/harrier/harrier.Modelfile {embed}:/convert/Modelfile"));
-            out_lines.push(format!("      docker exec -w /convert {embed} ollama create harrier -f Modelfile"));
+            out_lines.push(format!("      docker exec {embed} mkdir -p {OLLAMA_CONVERT_DIR} && docker cp /tmp/harrier/harrier-Q4_K_M.gguf {embed}:{OLLAMA_CONVERT_DIR}/ && docker cp /tmp/harrier/harrier.Modelfile {embed}:{OLLAMA_CONVERT_DIR}/Modelfile"));
+            out_lines.push(format!("      docker exec -w {OLLAMA_CONVERT_DIR} {embed} ollama create harrier -f Modelfile"));
         }
         return out_lines;
     }
@@ -8804,5 +8822,21 @@ mod sudo_seam_tests {
         assert!(f.starts_with("data root: sudo needs a password and this non-interactive run cannot ask — run: sudo install -d"), "{f}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // rc.2 (0.6.16): the hardened ollama image is uid 65532 with a root-owned
+    // `/`, so a root-level staging dir cannot be created. Every path the
+    // harrier step names must sit under the user's own store.
+    #[test]
+    fn harrier_staging_dir_is_under_the_non_root_store() {
+        assert!(super::OLLAMA_CONVERT_DIR.starts_with("/home/nonroot/.ollama/"));
+        assert!(!super::OLLAMA_CONVERT_DIR.starts_with("/convert"));
+        let script = super::harrier_create_script("noo-ollama-embed", "/tmp/h");
+        assert!(!script.contains(" /convert"), "{script}");
+        assert!(!script.contains(":/convert"), "{script}");
+        assert!(script.contains("mkdir -p /home/nonroot/.ollama/convert"), "{script}");
+        assert!(script.contains("-w /home/nonroot/.ollama/convert noo-ollama-embed ollama create harrier"), "{script}");
+        // Cleaned up after, and the verdict is ollama create's, not rm's.
+        assert!(script.contains("rm -rf /home/nonroot/.ollama/convert >/dev/null 2>&1; exit $rc"), "{script}");
     }
 }

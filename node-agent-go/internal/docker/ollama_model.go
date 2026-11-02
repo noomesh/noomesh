@@ -44,7 +44,17 @@ const OllamaContainer = "noo-ollama"
 // convertDir is where the Modelfile and its weight are placed INSIDE the
 // ollama container. `FROM ./<file>` resolves relative to the Modelfile, so
 // the two must share one directory whatever the path is.
-const convertDir = "/convert"
+//
+// It lives in the non-root user's own store (the hardened image runs as
+// 65532 with a root-owned `/`, so a root-level /convert cannot be made;
+// 0.6.16 rc.2) — a mounted volume, writable in every rootfs mode, beside
+// models/ rather than inside it. Removed after each create. The same value is
+// in noo-cli (OLLAMA_CONVERT_DIR) and scripts/noo-model-convert.sh.
+const convertDir = ollamaOursStore + "/convert"
+
+// convertOwner is the uid/gid the staged files are written as, so the
+// container's user can read them and remove the directory afterwards.
+const convertOwner = ollamaStoreUID
 
 // PullOllamaModelResult reports what actually happened on the node.
 type PullOllamaModelResult struct {
@@ -404,6 +414,9 @@ func (c *Client) ollamaCreateInContainer(ctx context.Context, work, name, modelf
 	if _, err := c.docker.CopyToContainer(copyCtx, OllamaContainer, client.CopyToContainerOptions{
 		DestinationPath: "/",
 		Content:         tarball,
+		// Without this the daemon extracts every entry as the container's
+		// root and ignores the uid/gid in the archive.
+		CopyUIDGID: true,
 	}); err != nil {
 		return "", fmt.Errorf("copy the model into %s: %w", OllamaContainer, err)
 	}
@@ -427,6 +440,9 @@ func (c *Client) ollamaCreateInContainer(ctx context.Context, work, name, modelf
 	att.Close()
 	out := strings.TrimSpace(string(raw))
 	ins, err := c.docker.ExecInspect(copyCtx, created.ID, client.ExecInspectOptions{})
+	// The staging dir sits on the persistent model volume: remove it whatever
+	// the outcome (best effort; the next create starts with a clean copy).
+	c.removeConvertDir(copyCtx)
 	if err != nil {
 		return "", fmt.Errorf("exec inspect: %w", err)
 	}
@@ -438,6 +454,20 @@ func (c *Client) ollamaCreateInContainer(ctx context.Context, work, name, modelf
 	return out, nil
 }
 
+// removeConvertDir deletes the staging directory in the ollama container.
+func (c *Client) removeConvertDir(ctx context.Context) {
+	rm, err := c.docker.ExecCreate(ctx, OllamaContainer, client.ExecCreateOptions{
+		Cmd: convertCleanupCmd(),
+	})
+	if err != nil {
+		return
+	}
+	_, _ = c.docker.ExecStart(ctx, rm.ID, client.ExecStartOptions{})
+}
+
+// convertCleanupCmd is the argv that clears convertDir.
+func convertCleanupCmd() []string { return []string{"rm", "-rf", convertDir} }
+
 // dirTar packs named files from dir into the tar CopyToContainer wants,
 // rooted so they extract into convertDir.
 func dirTar(dir string, names []string) (*bytes.Buffer, error) {
@@ -447,6 +477,8 @@ func dirTar(dir string, names []string) (*bytes.Buffer, error) {
 	if err := tw.WriteHeader(&tar.Header{
 		Name:     root + "/",
 		Mode:     0o755,
+		Uid:      convertOwner,
+		Gid:      convertOwner,
 		Typeflag: tar.TypeDir,
 		ModTime:  time.Unix(0, 0),
 	}); err != nil {
@@ -460,6 +492,8 @@ func dirTar(dir string, names []string) (*bytes.Buffer, error) {
 		if err := tw.WriteHeader(&tar.Header{
 			Name:    root + "/" + n,
 			Mode:    0o644,
+			Uid:     convertOwner,
+			Gid:     convertOwner,
 			Size:    int64(len(body)),
 			ModTime: time.Unix(0, 0),
 		}); err != nil {
