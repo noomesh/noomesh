@@ -15,11 +15,15 @@
 //! tests/secrets_store.rs for why CI runners lack them); the pure ordering
 //! and refusal rules are covered by the unit tests, which need nothing.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
+
+#[path = "common/test_tls.rs"]
+mod test_tls;
+use test_tls::{test_tls, tls_accept, tls_reply};
 
 fn bin() -> String {
     std::env::var("NOO_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_noo").to_string())
@@ -113,30 +117,35 @@ struct Gateway {
 
 fn gateway() -> Gateway {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}", l.local_addr().unwrap());
+    let url = format!("https://{}", l.local_addr().unwrap());
     let log = Arc::new(Mutex::new(Vec::new()));
     let active = Arc::new(Mutex::new(false));
     let (log2, active2) = (log.clone(), active.clone());
     std::thread::spawn(move || {
         for s in l.incoming() {
-            let Ok(mut s) = s else { continue };
-            let mut r = BufReader::new(s.try_clone().unwrap());
-            let mut line = String::new();
-            if r.read_line(&mut line).is_err() {
-                continue;
-            }
-            let mut len = 0usize;
-            loop {
-                let mut h = String::new();
-                if r.read_line(&mut h).is_err() || h == "\r\n" || h.is_empty() {
-                    break;
+            let Some(mut s) = s.ok().and_then(tls_accept) else { continue };
+            // Read the request through a reader that borrows the TLS stream,
+            // then answer on the same stream.
+            let line = {
+                let mut r = BufReader::new(&mut s);
+                let mut line = String::new();
+                if r.read_line(&mut line).is_err() {
+                    continue;
                 }
-                if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
-                    len = v.trim().parse().unwrap_or(0);
+                let mut len = 0usize;
+                loop {
+                    let mut h = String::new();
+                    if r.read_line(&mut h).is_err() || h == "\r\n" || h.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
                 }
-            }
-            let mut body = vec![0u8; len];
-            let _ = r.read_exact(&mut body);
+                let mut body = vec![0u8; len];
+                let _ = r.read_exact(&mut body);
+                line
+            };
             let req = line.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
             log2.lock().unwrap().push(req.clone());
             let (status, resp) = match req.as_str() {
@@ -154,11 +163,11 @@ fn gateway() -> Gateway {
                 }
                 _ => (404, r#"{"detail":"not found"}"#.to_string()),
             };
-            let _ = write!(
-                s,
+            let out = format!(
                 "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp}",
                 resp.len()
             );
+            tls_reply(&mut s, &out);
         }
     });
     Gateway { url, log }
@@ -171,6 +180,7 @@ fn noo(root: &Path, gw: &str, args: &[&str]) -> Output {
         .env("HOME", root)
         .env("SOPS_AGE_KEY_FILE", root.join("age.key"))
         .env("NOO_GATEWAY_URL", gw)
+        .env("NOO_TLS_CA", &test_tls().ca_path)
         .env_remove("NOO_TOKEN")
         .env_remove("NOO_EVOLVE_DDL_PASSWORD")
         .env_remove("NOO_EVOLVE_DB_PASSWORD")
@@ -247,7 +257,7 @@ fn an_unreachable_gateway_changes_nothing() {
     // A port nothing listens on.
     let dead = {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("http://{}", l.local_addr().unwrap())
+        format!("https://{}", l.local_addr().unwrap())
     };
     let o = noo(&root, &dead, &["addons", "enable", "evolve"]);
     assert!(!o.status.success(), "{}", text(&o));

@@ -10,16 +10,19 @@
 //! was (and was not) sent.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use serde_json::{json, Value};
+
+#[path = "common/test_tls.rs"]
+mod test_tls;
+use test_tls::{test_tls, tls_accept, tls_reply};
 
 #[derive(Clone, Debug)]
 struct Seen {
@@ -51,8 +54,7 @@ impl Mock {
                 if st2.load(Ordering::SeqCst) {
                     break;
                 }
-                let Ok(mut stream) = conn else { continue };
-                stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let Some(mut stream) = conn.ok().and_then(tls_accept) else { continue };
                 let req = read_request(&mut stream);
                 let mut lines = req.lines();
                 let mut first = lines.next().unwrap_or("").split_whitespace();
@@ -68,14 +70,14 @@ impl Mock {
                     "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
                     text.len()
                 );
-                let _ = stream.write_all(resp.as_bytes());
+                tls_reply(&mut stream, &resp);
             }
         });
         Mock { port, seen, stop, handle: Some(handle) }
     }
 
     fn url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
+        format!("https://127.0.0.1:{}", self.port)
     }
 
     fn seen(&self) -> Vec<Seen> {
@@ -97,7 +99,7 @@ impl Drop for Mock {
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> String {
+fn read_request<S: Read>(stream: &mut S) -> String {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     let mut want: Option<usize> = None;
@@ -188,7 +190,7 @@ impl Home {
     }
 
     fn cache_file(&self, port: u16) -> PathBuf {
-        self.0.join("addon-cli").join(format!("http___127_0_0_1_{port}.json"))
+        self.0.join("addon-cli").join(format!("https___127_0_0_1_{port}.json"))
     }
 
     /// Pre-seed the per-controller cache, as an earlier run would have.
@@ -213,6 +215,7 @@ fn run(home: &Path, url: &str, args: &[&str]) -> Output {
         cmd.env_remove(k);
     }
     cmd.env("HOME", home)
+        .env("NOO_TLS_CA", &test_tls().ca_path)
         .env("NOO_CREDENTIALS_FILE", home.join("creds.json"))
         .stdin(Stdio::null());
     cmd.output().expect("spawn noo")
@@ -394,7 +397,7 @@ fn help_works_offline_from_the_cache() {
         l.local_addr().unwrap().port()
     };
     home.seed(port, 0, "enabled");
-    let url = format!("http://127.0.0.1:{port}");
+    let url = format!("https://127.0.0.1:{port}");
     let o = run(&home.0, &url, &["ga", "--help"]);
     assert_eq!(o.status.code(), Some(0), "stderr: {}", err(&o));
     let text = out(&o);

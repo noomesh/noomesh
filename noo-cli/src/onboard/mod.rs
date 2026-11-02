@@ -1684,13 +1684,14 @@ mod posture_tests {
         ]})
     }
 
-    /// A one-request fake gateway on an ephemeral port, plain HTTP.
+    /// A one-request fake gateway on an ephemeral port, TLS with the unit
+    /// tests' throwaway CA (`crate::test_tls`; a test holds `trust()`).
     fn fake_gateway(body: String) -> (u16, std::thread::JoinHandle<String>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let h = std::thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            s.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+            let (tcp, _) = listener.accept().unwrap();
+            let mut s = crate::test_tls::accept(tcp).expect("tls");
             let mut buf = [0u8; 4096];
             let n = s.read(&mut buf).unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]).to_string();
@@ -1699,6 +1700,7 @@ mod posture_tests {
                 body.len()
             );
             let _ = s.write_all(resp.as_bytes());
+            crate::test_tls::close(&mut s);
             req
         });
         (port, h)
@@ -1708,7 +1710,7 @@ mod posture_tests {
         crate::Globals {
             json: false,
             verbose: false,
-            gateway_override: Some(format!("http://127.0.0.1:{port}")),
+            gateway_override: Some(format!("https://127.0.0.1:{port}")),
             timeout_secs: None,
             token: None,
             quiet: false,
@@ -1719,6 +1721,7 @@ mod posture_tests {
     /// must schedule the restart (a non-empty pending list is the trigger).
     #[test]
     fn a_pending_gate_from_the_gateway_schedules_the_restart() {
+        let _ca = crate::test_tls::trust();
         let (port, h) = fake_gateway(real_shape(true).to_string());
         let pending = posture_pending_restart(&globals(port));
         let req = h.join().unwrap();
@@ -1729,6 +1732,7 @@ mod posture_tests {
     /// Nothing set, or everything already running as declared: no restart.
     #[test]
     fn an_empty_or_applied_posture_skips_the_restart() {
+        let _ca = crate::test_tls::trust();
         let (port, h) = fake_gateway(serde_json::json!({"count": 0, "posture": [], "retired": []}).to_string());
         assert_eq!(posture_pending_restart(&globals(port)), Some(vec![]));
         h.join().unwrap();

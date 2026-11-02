@@ -24,6 +24,9 @@ fn bin() -> &'static str {
 #[path = "common/scratch_dir.rs"]
 mod scratch_dir;
 use scratch_dir::ScratchDir;
+#[path = "common/test_tls.rs"]
+mod test_tls;
+use test_tls::{test_tls, tls_accept, tls_reply};
 
 /// Fresh scratch dir per call; removed when the test ends, panicking or not.
 fn scratch(tag: &str) -> ScratchDir {
@@ -186,9 +189,9 @@ fn scan_reports_full_finding_set_on_bare_env() {
         .collect();
     // Severity-sorted, stable within a severity (Python's sorted()).
     // No "Gateway Transport" row: with nothing configured the CLI's gateway
-    // default is https://localhost (the gateway has no plaintext listener),
-    // so the loopback-plaintext carve-out is not reached. It used to be a
-    // LOW row here, when the default fell back to http://localhost.
+    // default is https://localhost (the gateway has no plaintext listener).
+    // There is no plaintext lane at all any more (1242 finding 7); an http
+    // gateway, loopback included, is a CRITICAL row.
     assert_eq!(
         checks,
         vec![
@@ -669,7 +672,7 @@ fn rotate_signing_key_refuses_to_report_a_rollout_it_could_not_enumerate() {
     // Port 1 on loopback: nothing listens, and it is not a hostname lookup,
     // so this is a connection refusal rather than a DNS timeout.
     let mut cmd = Command::new(bin());
-    cmd.args(["--json", "--gateway", "http://localhost:1", "security", "pki",
+    cmd.args(["--json", "--gateway", "https://localhost:1", "security", "pki",
               "rotate-signing-key", "--deliver-only", "--yes"])
         .env("NOO_REPO_ROOT", &repo)
         .env("NOO_PKI_DIR", &pki);
@@ -719,7 +722,7 @@ fn forgetting_a_node_archives_its_key_material_instead_of_orphaning_it() {
     // failed forget would destroy material for a node that is still
     // registered. Assert exactly that, then drive the local half directly.
     let mut cmd = Command::new(bin());
-    cmd.args(["--gateway", "http://localhost:1", "cluster", "forget", "host8", "-y"])
+    cmd.args(["--gateway", "https://localhost:1", "cluster", "forget", "host8", "-y"])
         .env("NOO_REPO_ROOT", &repo)
         .env("NOO_PKI_DIR", &pki);
     for var in ["NOO_TLS_CA", "NOO_GATEWAY_URL", "CONTROLLER_URL"] {
@@ -741,7 +744,7 @@ fn forgetting_a_node_archives_its_key_material_instead_of_orphaning_it() {
 /// (`gateway_integration.rs` has the general harness; this suite is
 /// otherwise gateway-free and needs exactly one reply.)
 fn mock_once(body: &'static str) -> (u16, std::thread::JoinHandle<()>) {
-    use std::io::{Read as _, Write as _};
+    use std::io::Read as _;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
     let h = std::thread::spawn(move || {
@@ -749,9 +752,8 @@ fn mock_once(body: &'static str) -> (u16, std::thread::JoinHandle<()>) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             match listener.accept() {
-                Ok((mut sock, _)) => {
-                    sock.set_nonblocking(false).ok();
-                    sock.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+                Ok((tcp, _)) => {
+                    let Some(mut sock) = tls_accept(tcp) else { return };
                     let mut buf = [0u8; 4096];
                     let _ = sock.read(&mut buf);
                     let resp = format!(
@@ -759,8 +761,7 @@ fn mock_once(body: &'static str) -> (u16, std::thread::JoinHandle<()>) {
                          Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(), body
                     );
-                    let _ = sock.write_all(resp.as_bytes());
-                    let _ = sock.flush();
+                    tls_reply(&mut sock, &resp);
                     return;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -789,14 +790,17 @@ fn a_successful_forget_moves_the_key_material_out_of_the_nodes_directory() {
 
     let (port, h) = mock_once(r#"{"ok":true,"enrollments_revoked":1}"#);
     let mut cmd = Command::new(bin());
-    cmd.args(["--json", "--gateway", &format!("http://localhost:{port}"),
+    cmd.args(["--json", "--gateway", &format!("https://localhost:{port}"),
               "cluster", "forget", "host8", "-y"])
         .env("NOO_REPO_ROOT", &repo)
         .env("NOO_PKI_DIR", &pki)
         .env("NOO_CLUSTER_SECRET", "test-secret");
-    for var in ["NOO_TLS_CA", "NOO_GATEWAY_URL", "CONTROLLER_URL"] {
+    for var in ["NOO_GATEWAY_URL", "CONTROLLER_URL"] {
         cmd.env_remove(var);
     }
+    // The mock serves the suite's throwaway CA; it outranks the cluster CA
+    // this test's NOO_PKI_DIR holds (resolve_trust rung 3 before 4).
+    cmd.env("NOO_TLS_CA", &test_tls().ca_path);
     let out = cmd.output().expect("spawn noo");
     let _ = h.join();
     assert!(out.status.success(), "stdout: {}\nstderr: {}", stdout(&out), stderr(&out));
