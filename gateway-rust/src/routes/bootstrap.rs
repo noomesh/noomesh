@@ -1522,10 +1522,15 @@ pub const BIRTH_PROOF_HEADER: &str = "x-noo-birth-proof";
 /// mints a new one); the most recent row that actually carries a cert is the
 /// live identity, so ordering is on `created_at` and rows with no cert are
 /// skipped rather than shadowing an older row that has one.
-async fn birth_cert_for(db: &sqlx::PgPool, node: &str) -> Option<String> {
+///
+/// A database error is a 503 that names it, never `Ok(None)`: "no cert"
+/// reads as `NoBirthCert` and tells the operator to re-enroll a node whose
+/// row is there (the seat lane did exactly that on 2026-11-02, with the
+/// gateway out of file descriptors).
+async fn birth_cert_for(db: &sqlx::PgPool, node: &str) -> Result<Option<String>, AppError> {
     // The controller's own node: the host file, never a row (i67).
     if let Some(cert) = self_birth_cert(node, crate::self_node::self_node_id().as_deref(), read_self_birth_cert) {
-        return cert;
+        return Ok(cert);
     }
     sqlx::query_scalar::<_, String>(
         "SELECT birth_cert FROM noo_bootstrap_tokens \
@@ -1535,8 +1540,13 @@ async fn birth_cert_for(db: &sqlx::PgPool, node: &str) -> Option<String> {
     .bind(node)
     .fetch_optional(db)
     .await
-    .ok()
-    .flatten()
+    .map_err(|e| {
+        tracing::error!(node = %node, error = %e, "birth_cert_read_failed");
+        AppError::Unavailable(format!(
+            "cannot read the birth certificate recorded for node '{node}': the database \
+             answered {e}. The node's proof was not checked; nothing about the node is wrong"
+        ))
+    })
 }
 
 /// The sha256 of the blob currently staged for this node, if one is staged.
@@ -1572,7 +1582,7 @@ async fn check_birth_proof(
     sha: &str,
 ) -> Result<(), AppError> {
     let header = headers.get(BIRTH_PROOF_HEADER).and_then(|v| v.to_str().ok());
-    let cert = birth_cert_for(db, node).await;
+    let cert = birth_cert_for(db, node).await?;
     let now = chrono::Utc::now().timestamp();
     crate::birth_proof::verify(header, purpose, node, sha, cert.as_deref(), now).map_err(|e| {
         tracing::warn!(node = %node, reason = ?e, "bundle_pull_write_proof_rejected");
@@ -2181,6 +2191,25 @@ mod tests {
         let src = include_str!("bootstrap.rs");
         let code = src.split("#[cfg(test)]").next().unwrap();
         assert!(!code.contains(&["\"/etc/noo/", "self-node"].concat()), "no host /etc path is read");
+    }
+
+    /// A database that cannot answer is a 503 naming the error, never the
+    /// `NoBirthCert` 403 that tells the operator to re-enroll the node.
+    #[tokio::test]
+    async fn an_unreadable_birth_cert_is_a_503_not_no_birth_cert() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool");
+        let headers = axum::http::HeaderMap::new();
+        let got = check_birth_proof(&pool, &headers, crate::birth_proof::Purpose::Fetch, "rh-not-self", "abc").await;
+        match got {
+            Err(AppError::Unavailable(m)) => {
+                assert!(m.contains("cannot read the birth certificate recorded for node 'rh-not-self'"), "{m}");
+                assert!(!m.contains("re-enroll") && !m.contains("NoBirthCert"), "{m}");
+            }
+            other => panic!("expected a 503, got {other:?}"),
+        }
     }
 
     /// No route writes the self node's identity: the only self-node route is
