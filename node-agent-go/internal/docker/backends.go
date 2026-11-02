@@ -1366,6 +1366,9 @@ func fetchArtifactManifest(ctx context.Context, kind, name string) *artifactMani
 	if err != nil {
 		return nil
 	}
+	// A transport for one request: close its connection when done, or the
+	// controller holds it (2026-11-02 EMFILE, see config.HTTPTransport).
+	defer transport.CloseIdleConnections()
 	httpClient := &http.Client{Timeout: 15 * time.Second, Transport: transport}
 	resp, err := httpClient.Do(req)
 	if err != nil {
