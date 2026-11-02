@@ -50,6 +50,12 @@ const (
 // hold is named by Workload instead.
 const PurposeUser = "user"
 
+// MinHoldFor and MaxHoldFor bound a user hold's timer (`--for`, i344b).
+const (
+	MinHoldFor = 60 * time.Second
+	MaxHoldFor = 7 * 24 * time.Hour
+)
+
 // DefaultDrainTimeout bounds a drain hold whose request named no timeout.
 const DefaultDrainTimeout = 120 * time.Second
 
@@ -69,6 +75,9 @@ type Lease struct {
 	Mode       string `json:"mode"`
 	Reason     string `json:"reason,omitempty"`
 	Since      string `json:"since"`
+	// ExpiresAt (RFC 3339) is when a user hold hands the GPU back to the
+	// automatic policy; empty = indefinite (i344b).
+	ExpiresAt string `json:"expires_at,omitempty"`
 	// DrainStarted / DrainedAt bracket the drain of a mode-drain hold.
 	DrainStarted string `json:"drain_started,omitempty"`
 	DrainedAt    string `json:"drained_at,omitempty"`
@@ -104,6 +113,10 @@ type HoldRequest struct {
 	Workload    string
 	// Purpose: "" or PurposeUser; never together with Workload.
 	Purpose string
+	// For (user holds only) makes the hold expire back to the automatic
+	// policy after this long; 0 = indefinite. Asked again by the operation
+	// that holds the GPU, it moves the expiry (extend) without a new drain.
+	For time.Duration
 	// Mode: ModeDrain (default) or ModeImmediate.
 	Mode string
 	// Timeout bounds the drain; 0 = DefaultDrainTimeout.
@@ -170,6 +183,12 @@ func (c *Controller) Hold(ctx context.Context, req HoldRequest) (Contention, err
 	if purpose != "" && strings.TrimSpace(req.Workload) != "" {
 		return c.Report(), fmt.Errorf("a hold for workload %q has no purpose; purpose %q is the operator's own use", req.Workload, purpose)
 	}
+	if req.For < 0 || (req.For > 0 && (req.For < MinHoldFor || req.For > MaxHoldFor)) {
+		return c.Report(), fmt.Errorf("hold duration %s is outside %s to %s", req.For, MinHoldFor, MaxHoldFor)
+	}
+	if req.For > 0 && purpose != PurposeUser {
+		return c.Report(), fmt.Errorf("a hold duration is only for purpose %q", PurposeUser)
+	}
 	if req.OperationID == "" {
 		req.Force = true
 		req.OperationID = "legacy-" + c.now().UTC().Format("20060102T150405Z")
@@ -204,7 +223,13 @@ func (c *Controller) Hold(ctx context.Context, req HoldRequest) (Contention, err
 	c.refreshGPUSetLocked(backends)
 	if c.lease != nil && (c.state == StateHeld || c.state == StateDraining) {
 		if c.lease.OperationID == req.OperationID {
-			// The same operation asking again: already its hold.
+			// The same operation asking again: already its hold. With a
+			// duration on a held user lease it moves the expiry (extend).
+			if req.For > 0 && c.state == StateHeld && c.lease.Purpose == PurposeUser {
+				c.lease.ExpiresAt = c.now().Add(req.For).UTC().Format(time.RFC3339)
+				c.saveLocked()
+				slog.Info("gpuyield: user GPU hold extended", "operation", req.OperationID, "expires_at", c.lease.ExpiresAt)
+			}
 			c.mu.Unlock()
 			return c.Report(), nil
 		}
@@ -221,6 +246,9 @@ func (c *Controller) Hold(ctx context.Context, req HoldRequest) (Contention, err
 	now := c.now()
 	c.lease = &Lease{Owner: req.Owner, OperationID: req.OperationID, Workload: strings.TrimSpace(req.Workload),
 		Purpose: purpose, Generation: c.generation, Mode: mode, Reason: reason, Since: now.UTC().Format(time.RFC3339)}
+	if req.For > 0 {
+		c.lease.ExpiresAt = now.Add(req.For).UTC().Format(time.RFC3339)
+	}
 	drain := mode == ModeDrain && c.drainer != nil
 	var gpuBackends []string
 	if drain {
@@ -310,17 +338,41 @@ func (c *Controller) Release(ctx context.Context, req ReleaseRequest) (Contentio
 		act = c.resumeLocked("hold released, resume now")
 	} else {
 		slog.Info("gpuyield: operator GPU hold released; automatic policy resumes when the GPU is free", "operation", req.OperationID)
-		c.state = StateYielded
-		c.since = c.now()
-		c.reason = "hold released; resuming when the GPU is free"
-		c.clearAt = time.Time{}
-		if len(c.paused) == 0 {
-			c.state = StateFree
-			c.reason = ""
-		}
-		c.saveLocked()
+		c.handBackLocked()
 	}
 	c.mu.Unlock()
 	c.execute(ctx, act)
 	return c.Report(), nil
+}
+
+// handBackLocked ends a hold without resuming: the node returns to the
+// automatic policy, which resumes once the GPU has stayed clear. The caller
+// has already cleared the lease.
+func (c *Controller) handBackLocked() {
+	c.state = StateYielded
+	c.since = c.now()
+	c.reason = "hold released; resuming when the GPU is free"
+	c.clearAt = time.Time{}
+	if len(c.paused) == 0 {
+		c.state = StateFree
+		c.reason = ""
+	}
+	c.saveLocked()
+}
+
+// expireLeaseLocked hands the GPU back to the automatic policy (never a
+// resume-now: the operator's own work may still be on the GPU) when a held
+// lease's expiry has passed. A lease with no expiry never does.
+func (c *Controller) expireLeaseLocked() {
+	if c.state != StateHeld || c.lease == nil || c.lease.ExpiresAt == "" {
+		return
+	}
+	at, err := time.Parse(time.RFC3339, c.lease.ExpiresAt)
+	if err != nil || c.now().Before(at) {
+		return
+	}
+	slog.Info("gpuyield: user GPU hold expired; handing the GPU back to the automatic policy",
+		"operation", c.lease.OperationID, "expired_at", c.lease.ExpiresAt)
+	c.lease = nil
+	c.handBackLocked()
 }

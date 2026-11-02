@@ -2175,7 +2175,7 @@ async fn clean_node(
 /// start while the GPU is occupied (noomesh-internal i163 parts C and D).
 ///
 /// POST /api/cluster/nodes/{node_id}/gpu/hold — body `{reason?, operation_id?,
-/// owner?, workload?, purpose?, mode?: drain|immediate, timeout_secs?, force?}`. Operator only;
+/// owner?, workload?, purpose?, for_secs?, mode?: drain|immediate, timeout_secs?, force?}`. Operator only;
 /// audited (`node_gpu_hold`, with the lease and whether it was a force).
 ///
 /// - `operation_id` names the caller's operation; the answer's
@@ -2198,6 +2198,10 @@ async fn clean_node(
 ///   cluster gpu mode <node> user`); the lease carries it and the mode is read
 ///   back from it. It is the only purpose and never sits beside a `workload`
 ///   (400). An older agent drops it, and the hold reads as a manual one.
+/// - `for_secs` (60 to 604800, only with `purpose: "user"`, else 400) makes the
+///   lease expire on the node back to the automatic policy (`gpu mode <node>
+///   user --for`); the same operation asking again moves the expiry. The lease
+///   in the audit carries `expires_at`. Absent, the hold is indefinite.
 /// - One hold or release runs on a node at a time (409 `transition_in_progress`).
 async fn gpu_hold(
     State(state): State<Arc<AppState>>,
@@ -2214,6 +2218,7 @@ async fn gpu_hold(
     let operation_id = text("operation_id", 64);
     let workload = text("workload", 120);
     let purpose = gpu_hold_purpose(&text("purpose", 16), &workload).map_err(AppError::BadRequest)?;
+    let for_secs = gpu_hold_for(b.get("for_secs"), &purpose).map_err(AppError::BadRequest)?;
     let legacy = operation_id.is_empty();
     let mut owner = text("owner", 200);
     if owner.is_empty() {
@@ -2238,8 +2243,29 @@ async fn gpu_hold(
     if !purpose.is_empty() {
         payload["purpose"] = json!(purpose);
     }
+    if let Some(secs) = for_secs {
+        payload["for_secs"] = json!(secs);
+    }
     let wait = std::time::Duration::from_secs(if mode == "drain" { timeout_secs + 60 } else { 90 });
     gpu_hold_op(&state, actor, &node_id, "hold", payload, wait).await
+}
+
+/// Seconds a user hold lasts before it hands back to the automatic policy.
+const GPU_HOLD_FOR_MIN_SECS: u64 = 60;
+const GPU_HOLD_FOR_MAX_SECS: u64 = 7 * 24 * 3600;
+
+/// A hold's `for_secs`: absent is `None` (indefinite); otherwise a whole number
+/// in range, and only beside `purpose: user`. The agent applies the same rule.
+fn gpu_hold_for(raw: Option<&Value>, purpose: &str) -> Result<Option<u64>, String> {
+    let Some(v) = raw.filter(|v| !v.is_null()) else { return Ok(None) };
+    let secs = v.as_u64().ok_or_else(|| "for_secs must be a whole number of seconds".to_string())?;
+    if !(GPU_HOLD_FOR_MIN_SECS..=GPU_HOLD_FOR_MAX_SECS).contains(&secs) {
+        return Err(format!("for_secs must be {GPU_HOLD_FOR_MIN_SECS} to {GPU_HOLD_FOR_MAX_SECS} seconds, not {secs}"));
+    }
+    if purpose != "user" {
+        return Err("for_secs is only for purpose user (the operator's own use of the GPU)".into());
+    }
+    Ok(Some(secs))
 }
 
 /// A hold's `purpose`: empty, or `user` (the operator's own use), never
@@ -6762,6 +6788,25 @@ mod heartbeat_carry_tests {
         // Absent stays off the wire, so an unchanged hold is byte-identical.
         let h = include_str!("cluster.rs").split("async fn gpu_hold(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
         assert!(h.contains("if !purpose.is_empty()"), "purpose is sent only when set");
+    }
+
+    #[test]
+    fn a_hold_for_is_bounded_whole_seconds_and_user_only() {
+        assert_eq!(gpu_hold_for(None, "").unwrap(), None);
+        assert_eq!(gpu_hold_for(Some(&json!(null)), "").unwrap(), None);
+        assert_eq!(gpu_hold_for(Some(&json!(1800)), "user").unwrap(), Some(1800));
+        assert_eq!(gpu_hold_for(Some(&json!(60)), "user").unwrap(), Some(60));
+        assert_eq!(gpu_hold_for(Some(&json!(604800)), "user").unwrap(), Some(604800));
+        assert!(gpu_hold_for(Some(&json!(59)), "user").unwrap_err().contains("60 to 604800"));
+        assert!(gpu_hold_for(Some(&json!(604801)), "user").is_err());
+        assert!(gpu_hold_for(Some(&json!(0)), "user").is_err());
+        assert!(gpu_hold_for(Some(&json!(-5)), "user").is_err());
+        assert!(gpu_hold_for(Some(&json!("30m")), "user").unwrap_err().contains("whole number"));
+        assert!(gpu_hold_for(Some(&json!(1800)), "").unwrap_err().contains("purpose user"));
+        // Absent stays off the wire, so an unchanged hold is byte-identical.
+        let h = include_str!("cluster.rs").split("async fn gpu_hold(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        assert!(h.contains("if let Some(secs) = for_secs"), "for_secs is sent only when set");
+        assert!(h.contains("gpu_hold_for(b.get(\"for_secs\"), &purpose)"), "the route validates it");
     }
 
     #[test]
