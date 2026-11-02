@@ -155,7 +155,6 @@ pub fn nvidia_smi_within(deadline: Duration, args: &[&str]) -> SmiAnswer {
 /// `Busy` WITHOUT calling `wait` or joining the drain threads (the pipes may
 /// be held open by a child that never dies).
 fn run_within(program: &str, deadline: Duration, args: &[&str]) -> SmiAnswer {
-    use std::io::Read as _;
     use std::sync::mpsc;
     fn drain<R: std::io::Read + Send + 'static>(r: Option<R>) -> mpsc::Receiver<Vec<u8>> {
         let (tx, rx) = mpsc::channel();
