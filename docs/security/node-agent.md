@@ -688,7 +688,11 @@ generation it was given (compare-and-set) or it is `409 held_by_other` with
 the current lease, so a stale retry can never end another operation's hold.
 `purpose` is a closed set: absent, or `user` for the operator's own use of
 the GPU (noomesh-internal i344b), which the lease carries; any other value,
-or `user` beside a `workload`, is refused and no hold is taken.
+or `user` beside a `workload`, is refused and no hold is taken. `for_secs` (60 s to 7 days, only with
+`purpose: user`) sets `expires_at` on the lease: the agent ends the hold at
+that time and returns to the automatic policy (no resume-now), also after a
+restart; the same operation asking again moves it. Any other use of
+`for_secs` is refused.
 `force` takes over or ends any hold and the gateway audits it as a force; a
 body with no operation id is a legacy call from an older CLI, treated as a
 force and audited `legacy`. One hold or release runs per node at a time

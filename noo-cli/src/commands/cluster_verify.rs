@@ -564,6 +564,7 @@ pub(crate) fn gpu_contention_check_at(n: &Value, now_unix: i64) -> Option<Check>
             let age = super::cluster_gpu_mode::lease_age(gc, now_unix)
                 .map(|s| format!(", for {}", super::cluster_gpu_mode::age_text(s)))
                 .unwrap_or_default();
+            let age = format!("{age}{}", super::cluster_gpu_mode::until_text(gc, now_unix).map(|t| format!(", {t}")).unwrap_or_default());
             let busy = if mode == super::cluster_gpu_mode::Mode::User && gc["foreign_mb"].as_f64().unwrap_or(0.0) > 0.0 {
                 format!(", GPU in use {:.1} GB", gb("foreign_mb"))
             } else {
@@ -11071,6 +11072,17 @@ mod gpu_contention_tests {
             "state": "draining", "method": "nvidia-smi", "paused_backends": [], "lease": {"owner": "rbwolf"}}))).unwrap();
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.starts_with("mode switching: hold by rbwolf draining"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_timed_user_hold_says_until_when() {
+        let held = node(serde_json::json!({
+            "state": "held", "reason": "user", "method": "memory-accounting", "paused_backends": ["vllm"], "foreign_mb": 0,
+            "lease": {"owner": "rbwolf", "operation_id": "op-7", "generation": 4, "purpose": "user",
+                "since": "2026-11-01T10:00:00Z", "expires_at": "2026-11-01T17:40:00Z"}}));
+        let since = parse_rfc3339_unix("2026-11-01T10:00:00Z").unwrap();
+        let c = gpu_contention_check_at(&held, since + 6 * 3600 + 20 * 60).unwrap();
+        assert_eq!(c.detail, "mode user: held by rbwolf (user): vllm paused, for 6 h 20 min, until 17:40 UTC (in 80 min)");
     }
 
     #[test]
