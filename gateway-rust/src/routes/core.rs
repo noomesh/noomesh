@@ -1749,6 +1749,14 @@ async fn health(
         addon_caller_dep(crate::addon_auth::token().is_some(), crate::addon_auth::failure()),
     );
 
+    // Open fds against RLIMIT_NOFILE (fd_watch.rs). Critical (90%, or the
+    // count cannot be read) says "degraded" like Redis does, and like Redis
+    // it never reaches the status code: a 503 drives the post-recreate
+    // rollback, and the cure for a leak is a restart, not the old image.
+    let fds = crate::fd_watch::read();
+    if crate::fd_watch::level_of(&fds) == crate::fd_watch::Level::Critical { all_ok = false; }
+    deps.insert("fds".into(), crate::fd_watch::health_dep(&fds));
+
     let status = if all_ok { "healthy" } else { "degraded" };
     let peers = state.gossip.alive_peers().len();
 
@@ -1882,6 +1890,9 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
         "# TYPE noo_gateway_start_time_seconds gauge\nnoo_gateway_start_time_seconds {}\n",
         crate::legacy_lanes::process_start_unix()
     ));
+
+    // Open fds and the soft limit (fd_watch.rs; the 2026-11-02 EMFILE outage).
+    body.push_str(&crate::fd_watch::metrics_text(&crate::fd_watch::read()));
 
     // In-process counters/gauges (Phase 2 events + Python pushes)
     body.push_str(&state.metrics.render().await);
