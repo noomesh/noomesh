@@ -3688,9 +3688,9 @@ six==1.17.0 \
     #   -c docker/core-lock/requirements.txt
     #   markdownify
     #   python-dateutil
-smart-open==8.0.4 \
-    --hash=sha256:8a3a67679942fa40d1a93ed3aea37619b4b4ec5458f1d5a9228dfc301db11b4c \
-    --hash=sha256:8cff8321f0b0ae4bd9cb0cd0c507c135ad6aa980171248fca520b645fd6ff717
+smart-open==9.0.1 \
+    --hash=sha256:0d5fdbc8b90c90e57651bd369028afecbcf89273e3ff9cd5f66ddfee78a8302a \
+    --hash=sha256:9dd0de10c98c7dfc6c05096fb8bc5ef3ed280c994ec2aa8fb747ab14bd528804
     # via weasel
 sniffio==1.3.1 \
     --hash=sha256:2f6da418d1f1e0fddd844478f41680e794e6051915791a034ff65e5f100525a2 \
