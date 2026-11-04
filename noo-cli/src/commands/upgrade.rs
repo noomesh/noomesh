@@ -1077,6 +1077,11 @@ fn reconcile_addon_nats_principals(g: &Globals, root: &std::path::Path) {
 ///   step made the rest). Before the pin moves, so a directory that cannot
 ///   be created refuses with nothing moved; the launcher's bind check would
 ///   otherwise refuse after the pin, naming `noo onboard --only storage`.
+///   THIS release = this CLI's compiled list plus, from the verified lock,
+///   any directory the target stack names that this CLI does not (a
+///   `--tag` roll to another stack, i467). A lock-only name is checked here
+///   (name, nesting, beneath its root, no symlink) and refuses before
+///   anything is created when it fails; it is created with its root's owner.
 /// - reconcile_service_certs (2.5)
 ///   2.5. Reconcile service certs a NEW release's compose expects but an
 ///   upgraded (not freshly onboarded) install never issued — see
@@ -1148,7 +1153,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     rerender_nats_users_for_roll(g, &roll.root);
     // The last refusal before the pin. Its names come from this binary's
     // compiled STORAGE_SUBDIRS, not from the slice.
-    reconcile_storage_dirs(g, &roll.root);
+    reconcile_storage_dirs(g, &roll.root, &roll.tag, target_stack_lock.as_deref());
     // i458 (b): the deploy slice moves WITH the pin. Written after every
     // refusal above, so a refused roll leaves the old release's compose and
     // scripts over the old images (pop-os, 0.6.16: CLI and slice 0.6.16 over
@@ -2163,17 +2168,37 @@ fn missing_service_certs<'a>(
 /// code (`storage_targets_in` over `onboard::STORAGE_SUBDIRS`, `create_storage_dir`
 /// with its owner), before the pin moves, and refuses loudly when one cannot
 /// be made. Existing directories are never touched.
-fn reconcile_storage_dirs(g: &Globals, root: &std::path::Path) {
+fn reconcile_storage_dirs(g: &Globals, root: &std::path::Path, tag: &str, lock: Option<&str>) {
+    // The target stack's own list (i467), when its verified lock carries
+    // one: a `--tag` roll to a stack this CLI was not built with can bind a
+    // directory this CLI does not know. Lines that cannot be read refuse.
+    let lock_lists = match lock.map(lock_storage_lists) {
+        Some(Err(e)) => fail(g.json, ExitCode::Generic, "stack_lock_storage_unreadable",
+            &format!("stack-{tag}.lock: {e} — nothing was changed"),
+            Some("the release was not produced by the release workflow; do not work around this")),
+        Some(Ok(l)) => l,
+        None => None,
+    };
     // No NOO_DATA_ROOT: compose requires it; the launcher refuses with its own remedy.
-    let Some(targets) = storage_dir_targets_in_env(root) else { return };
-    let missing: Vec<(String, std::path::PathBuf)> = targets.into_iter().filter(|(_, p)| !p.exists()).collect();
+    let Some(compiled) = storage_dir_targets_in_env(root) else { return };
+    let from_lock = lock_lists.as_ref().and_then(|l| storage_dir_targets_in_env_with(root, Some(l))).unwrap_or_default();
+    let planned = match plan_storage_dirs(compiled, from_lock) {
+        Ok(p) => p,
+        Err(bad) => fail(g.json, ExitCode::Generic, "stack_lock_storage_name",
+            &format!("stack-{tag}.lock names data director{} this CLI will not create: {} — nothing was changed",
+                if bad.len() == 1 { "y" } else { "ies" }, bad.join("; ")),
+            Some("the release was not produced by the release workflow; do not work around this")),
+    };
     let mut failed: Vec<String> = Vec::new();
-    for (name, path) in &missing {
-        match crate::onboard::steps::create_storage_dir(name, path) {
+    for d in planned.iter().filter(|d| !d.path.exists()) {
+        let made = crate::onboard::steps::create_storage_dir(&d.name, &d.path)
+            .and_then(|()| if d.lock_only { own_like(&d.path, &d.base) } else { Ok(()) });
+        match made {
             Ok(()) => if !g.json {
-                ui::done(&format!("created {} (new in this release)", path.display()));
+                let why = if d.lock_only { format!("named by stack-{tag}.lock") } else { "new in this release".to_string() };
+                ui::done(&format!("created {} ({why})", d.path.display()));
             },
-            Err(e) => failed.push(format!("{} ({e})", path.display())),
+            Err(e) => failed.push(format!("{} ({e})", d.path.display())),
         }
     }
     if !failed.is_empty() {
@@ -2184,6 +2209,97 @@ fn reconcile_storage_dirs(g: &Globals, root: &std::path::Path) {
                 if failed.len() == 1 { "it" } else { "them" }),
             Some("noo onboard --only storage   # then re-run: noo upgrade --stack"));
     }
+}
+
+/// One data directory the roll makes sure of: `base` is the data or state
+/// root it sits under; `lock_only` = named by the target's lock and not by
+/// this CLI's compiled list.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PlannedDir {
+    pub(crate) name: String,
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) base: std::path::PathBuf,
+    pub(crate) lock_only: bool,
+}
+
+/// The compiled targets plus the lock's targets this CLI does not have,
+/// each lock-only one checked HERE (the release lane's check is not
+/// trusted): a name of plain segments, nested only beneath a directory this
+/// CLI already places (`models/...`), and a path under its root with no
+/// symlink on the way. `Err` names every name refused; nothing is created.
+pub(crate) fn plan_storage_dirs(
+    compiled: Vec<(String, std::path::PathBuf)>,
+    from_lock: Vec<(String, std::path::PathBuf)>,
+) -> Result<Vec<PlannedDir>, Vec<String>> {
+    let base_of = |name: &str, path: &std::path::Path| {
+        let mut b = path.to_path_buf();
+        for _ in name.split('/') {
+            b.pop();
+        }
+        b
+    };
+    let known: std::collections::HashSet<std::path::PathBuf> = compiled.iter().map(|(_, p)| p.clone()).collect();
+    let mut out: Vec<PlannedDir> = compiled.iter()
+        .map(|(n, p)| PlannedDir { name: n.clone(), path: p.clone(), base: base_of(n, p), lock_only: false })
+        .collect();
+    let mut bad: Vec<String> = Vec::new();
+    for (n, p) in from_lock.into_iter().filter(|(_, p)| !known.contains(p)) {
+        let base = base_of(&n, &p);
+        match lock_only_dir_ok(&n, &p, &base) {
+            Ok(()) => out.push(PlannedDir { name: n, path: p, base, lock_only: true }),
+            Err(e) => bad.push(format!("{n:?}: {e}")),
+        }
+    }
+    if bad.is_empty() { Ok(out) } else { Err(bad) }
+}
+
+/// A storage directory name: lowercase, digits, `-` and `_` segments, no
+/// empty, `.` or `..` segment, never absolute.
+pub(crate) fn storage_name_ok(n: &str) -> bool {
+    !n.is_empty() && !n.starts_with('/')
+        && n.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != ".."
+            && seg.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_'))
+}
+
+/// The checks for one lock-only directory (see [`plan_storage_dirs`]).
+fn lock_only_dir_ok(name: &str, path: &std::path::Path, base: &std::path::Path) -> Result<(), String> {
+    if !storage_name_ok(name) {
+        return Err("not a directory name under the data root".into());
+    }
+    if let Some((first, _)) = name.split_once('/') {
+        if !crate::onboard::STORAGE_SUBDIRS.contains(&first) {
+            return Err(format!("nested under {first:?}, which this CLI does not place"));
+        }
+    }
+    if path.parent().is_none() || !path.starts_with(base) || path == base {
+        return Err("does not resolve beneath its root".into());
+    }
+    // Every component that exists below the root must be a real directory:
+    // a symlink would send the create (and the stack's bind) elsewhere.
+    let mut cur = base.to_path_buf();
+    for seg in name.split('/') {
+        cur.push(seg);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => return Err(format!("{} is a symlink", cur.display())),
+            Ok(m) if !m.is_dir() => return Err(format!("{} exists and is not a directory", cur.display())),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(format!("{}: {e}", cur.display())),
+        }
+    }
+    Ok(())
+}
+
+/// Give `dir` the owner of `base` (a lock-only name has no `subdir_owner`
+/// entry, so it belongs to whoever owns its root, as onboarding leaves
+/// every unlisted directory).
+fn own_like(dir: &std::path::Path, base: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let (want, got) = (std::fs::metadata(base)?, std::fs::metadata(dir)?);
+    if (want.uid(), want.gid()) == (got.uid(), got.gid()) {
+        return Ok(());
+    }
+    std::os::unix::fs::chown(dir, Some(want.uid()), Some(want.gid()))
 }
 
 /// Every storage directory this binary's release expects, placed under the
@@ -2236,10 +2352,7 @@ pub(crate) fn lock_storage_lists(text: &str) -> Result<Option<StorageLists>, Str
         }
         let names: Vec<String> = first.split(',').map(|n| n.trim().to_string()).collect();
         for n in &names {
-            let ok = !n.is_empty() && !n.starts_with('/')
-                && n.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != ".."
-                    && seg.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_'));
-            if !ok {
+            if !storage_name_ok(n) {
                 return Err(format!("the lock's `{}` names {n:?}, not a directory under the data root", key.trim()));
             }
         }
@@ -6837,6 +6950,92 @@ mod storage_dir_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A temp data root holding `dirs`.
+    fn base_with(tag: &str, dirs: &[&str]) -> std::path::PathBuf {
+        let b = std::env::temp_dir().join(format!("noo-plan-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&b);
+        for d in dirs {
+            std::fs::create_dir_all(b.join(d)).unwrap();
+        }
+        std::fs::create_dir_all(&b).unwrap();
+        b
+    }
+
+    /// i467 item 3: a name only the target stack's lock carries is planned
+    /// beside the compiled ones; a name both carry is planned once.
+    #[test]
+    fn the_roll_plans_the_union_of_its_list_and_the_locks() {
+        let b = base_with("union", &[]);
+        let compiled = vec![("tempo".to_string(), b.join("tempo"))];
+        let lock = vec![("tempo".to_string(), b.join("tempo")), ("newdir".to_string(), b.join("newdir"))];
+        let p = super::plan_storage_dirs(compiled, lock).unwrap();
+        let got: Vec<(&str, bool)> = p.iter().map(|d| (d.name.as_str(), d.lock_only)).collect();
+        assert_eq!(got, vec![("tempo", false), ("newdir", true)]);
+        assert_eq!(p[1].base, b);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// Names from the lock become paths, so this CLI checks each lock-only
+    /// one itself: `../etc` and `/tmp/x` refuse (in the lock parser AND in
+    /// the plan, which does not trust the parser), and nothing is planned.
+    #[test]
+    fn a_lock_naming_a_path_outside_the_root_refuses() {
+        let b = base_with("escape", &[]);
+        for name in ["../etc", "/tmp/x"] {
+            let lock_text = format!("# storage-subdirs noo-data,{name}\n# state-subdirs noo-data\n");
+            assert!(super::lock_storage_lists(&lock_text).is_err(), "the lock parser refuses {name}");
+            let e = super::plan_storage_dirs(vec![], vec![(name.to_string(), b.join(name))]).unwrap_err();
+            assert!(e[0].contains("not a directory name"), "{name}: {e:?}");
+        }
+        let e = super::plan_storage_dirs(vec![], vec![("ollama/x".to_string(), b.join("ollama/x")), ("x/y".to_string(), b.join("x/y"))]).unwrap_err();
+        assert_eq!(e.len(), 1, "nested only beneath a directory this CLI places: {e:?}");
+        assert!(e[0].contains("\"x/y\"") && e[0].contains("does not place"), "{e:?}");
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// A symlink on the way would send the create (and the stack's bind)
+    /// outside the root: refused, and its target is never written.
+    #[test]
+    fn a_symlink_under_the_root_refuses_a_lock_only_dir() {
+        let b = base_with("link", &[]);
+        let elsewhere = base_with("link-target", &[]);
+        std::os::unix::fs::symlink(&elsewhere, b.join("models")).unwrap();
+        let e = super::plan_storage_dirs(vec![], vec![("models/new".to_string(), b.join("models/new"))]).unwrap_err();
+        assert!(e[0].contains("is a symlink"), "{e:?}");
+        assert!(!elsewhere.join("new").exists());
+        let _ = std::fs::remove_dir_all(&b);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    /// A valid lock-only name is created through onboarding's helper and
+    /// carries its root's owner (it has no subdir_owner entry).
+    #[test]
+    fn a_lock_only_dir_is_created_with_its_roots_owner() {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(crate::onboard::steps::subdir_owner("newdir"), None);
+        let b = base_with("own", &[]);
+        let p = super::plan_storage_dirs(vec![], vec![("newdir".to_string(), b.join("newdir"))]).unwrap();
+        crate::onboard::steps::create_storage_dir(&p[0].name, &p[0].path).unwrap();
+        super::own_like(&p[0].path, &p[0].base).unwrap();
+        let (root, made) = (std::fs::metadata(&b).unwrap(), std::fs::metadata(b.join("newdir")).unwrap());
+        assert!(made.is_dir());
+        assert_eq!((made.uid(), made.gid()), (root.uid(), root.gid()));
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// The roll refuses an unreadable lock list and a refused name before it
+    /// creates anything, and lock-only directories get their root's owner.
+    #[test]
+    fn the_roll_refuses_bad_lock_names_before_creating() {
+        let body = super::phase_src::body("reconcile_storage_dirs");
+        let at = |n: &str| body.find(n).unwrap_or_else(|| panic!("{n} not in reconcile_storage_dirs"));
+        let create = at("create_storage_dir(");
+        assert!(at("\"stack_lock_storage_unreadable\"") < create);
+        assert!(at("\"stack_lock_storage_name\"") < create);
+        assert!(at("plan_storage_dirs(") < create);
+        assert!(body.contains("if d.lock_only { own_like(&d.path, &d.base) }"), "lock-only dirs take the root's owner");
+    }
+
     /// The step runs after the new deploy slice and BEFORE the pin moves (a
     /// failure leaves the old release pinned) and long before the launcher's
     /// bind check; it creates through onboarding's helper and refuses loudly.
@@ -6844,7 +7043,7 @@ mod storage_dir_tests {
     fn storage_dirs_are_made_before_the_pin_moves() {
         let list = super::phase_src::list();
         let at = |n: &str| list.find(n).unwrap_or_else(|| panic!("{n} not in the phase list"));
-        let step = at("reconcile_storage_dirs(g, &roll.root)");
+        let step = at("reconcile_storage_dirs(g, &roll.root, &roll.tag, target_stack_lock.as_deref())");
         // i458 (b): the slice is written AFTER this refusal, so a refused
         // roll leaves the old compose (slice_moves_with_the_pin pins that).
         for later in ["refresh_deploy_slice(", "move_pin(", "launch_stack("] {
