@@ -3213,12 +3213,14 @@ mod lane_tests {
     }
 
     /// The node agent's own golden heartbeat (noomesh/noomesh#673, Phase 1),
-    /// read as the gateway reads it. If either half changes the contract,
-    /// this fails on the next build of the other.
+    /// read as the gateway reads it. The copy under `testdata/` is inside the
+    /// gateway's build context; `tests/test_lanes_fixture_parity.py` fails
+    /// when it differs by a byte from the agent's
+    /// `node-agent-go/internal/heartbeat/testdata/lanes_fixture.json`, so a
+    /// contract change on either side fails one of the two.
     #[test]
     fn the_node_agents_golden_lanes_route_as_agreed() {
-        let golden: Value =
-            serde_json::from_str(include_str!("../../../node-agent-go/internal/heartbeat/testdata/lanes_fixture.json")).expect("the fixture parses");
+        let golden: Value = serde_json::from_str(include_str!("testdata/lanes_fixture.json")).expect("the fixture parses");
         let mut r = rec("n1", "100.64.0.1", golden["lanes"].clone(), json!({}));
         r["running_backends"] = golden["running_backends"].clone();
         let f = facts(&r);

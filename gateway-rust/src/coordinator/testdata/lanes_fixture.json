@@ -1,0 +1,66 @@
+{
+  "lanes": [
+    {
+      "backend": "vllm",
+      "model": "org/new-model",
+      "role": "chat",
+      "state": "loading",
+      "reason": "reconciling: runtime runs org/old-model"
+    },
+    {
+      "backend": "ollama",
+      "model": "gemma4:12b",
+      "role": "chat",
+      "state": "serving",
+      "reason": ""
+    },
+    {
+      "backend": "ollama",
+      "model": "qwen3:4b",
+      "role": "chat",
+      "state": "on_demand",
+      "reason": "not loaded"
+    },
+    {
+      "backend": "ollama",
+      "model": "harrier",
+      "role": "embed",
+      "state": "missing",
+      "reason": "not on disk"
+    },
+    {
+      "backend": "ollama",
+      "model": "mystery:7b",
+      "role": "chat",
+      "state": "unknown",
+      "reason": "no presence yet"
+    },
+    {
+      "backend": "llamacpp",
+      "model": "m.gguf",
+      "role": "",
+      "state": "serving",
+      "reason": ""
+    },
+    {
+      "backend": "reranker",
+      "model": "bge-rerank.gguf",
+      "role": "rerank",
+      "state": "down",
+      "reason": "not running"
+    },
+    {
+      "backend": "embedding",
+      "model": "BAAI/bge-small",
+      "role": "embed",
+      "state": "unplaced",
+      "reason": ""
+    }
+  ],
+  "running_backends": {
+    "embedding": "BAAI/bge-small",
+    "llamacpp": "m.gguf",
+    "ollama": "gemma4:12b",
+    "vllm": "org/old-model"
+  }
+}
