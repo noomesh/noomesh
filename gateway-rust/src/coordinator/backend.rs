@@ -1118,22 +1118,26 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
                             // 185a: backends that name no model are skipped
                             // below; say so (live node, chat role, not warming),
                             // by the class table's own facts.
-                            super::classes::note_unreported(&super::classes::node_facts_from_kv(&key, &data, &non_chat_pairs, now));
+                            let facts = super::classes::node_facts_from_kv(&key, &data, &non_chat_pairs, now);
+                            super::classes::note_unreported(&facts);
                             let paused = super::classes::paused_backends_of(&data);
-                            let backends = data.get("running_backends")
-                                .or_else(|| data.get("backends"))
-                                .and_then(|b| b.as_object());
-                            if let Some(backends) = backends {
-                                for (bt, model_val) in backends {
+                            // The class table's reading of the record (i403):
+                            // the routable chat lanes when the agent sends
+                            // `lanes`, else `running_backends` as before. A
+                            // loading or missing lane is not offered here
+                            // either.
+                            {
+                                for (bt, m) in &facts.running {
                                     if !inference_types.contains(&bt.as_str()) { continue; }
-                                    let m = model_val.as_str().unwrap_or("");
+                                    let m = m.as_str();
                                     if !m.is_empty() {
                                         let node_id = data.get("id")
                                             .and_then(|i| i.as_str())
                                             .unwrap_or(&key)
                                             .to_string();
-                                        // Declared for embed/rerank, not chat.
-                                        if non_chat.contains(&(node_id.clone(), bt.clone())) {
+                                        // Declared for embed/rerank, not chat: the
+                                        // lanes' roles, else the placement join.
+                                        if facts.non_chat.contains(bt) {
                                             // WARN, not debug: this is a routing
                                             // decision. At prod log level a
                                             // debug line is invisible, so a
@@ -2086,5 +2090,22 @@ mod unpinned_tests {
         let scan = body.find("get_key_value(\"mesh_nodes\")").expect("kv scan");
         assert!(unpinned < scan);
         assert!(body.contains("let target_model = requested_model.unwrap_or(\"\");"), "no configured-default tier-0 key");
+    }
+}
+
+#[cfg(test)]
+mod lane_fallback_tests {
+    /// i403: the KV-scan fallback offers what the class table would route,
+    /// not the raw inventory. A `loading` lane whose `running_backends` entry
+    /// still names its model must not come back in through this path.
+    #[test]
+    fn the_kv_fallback_reads_the_class_table_facts_not_the_raw_inventory() {
+        let src = include_str!("backend.rs");
+        let fallback = &src[src.find("let non_chat = non_chat_backends(state).await?;").expect("the fallback")..];
+        let fallback = fallback.split("// Every node that serves the pin has its GPU held").next().unwrap();
+        let raw = ["data.get(\"running", "_backends\")"].concat();
+        assert!(!fallback.contains(&raw), "the fallback re-reads the raw inventory");
+        assert!(fallback.contains("for (bt, m) in &facts.running"), "it iterates the facts");
+        assert!(fallback.contains("facts.non_chat.contains(bt)"), "and takes non-chat from them");
     }
 }
