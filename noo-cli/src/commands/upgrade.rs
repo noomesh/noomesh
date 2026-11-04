@@ -2451,7 +2451,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
             if !g.json { println!("{}", ui::phase("Nodes")); }
             let mut failed: Vec<String> = Vec::new();
             let mut pending: Vec<super::provision::PendingApply> = Vec::new();
-            println!();
+            ui::blank();
             upgrade_self_node(g, &me, &mut failed, &mut pending);
             if !pending.is_empty() {
                 wait_and_settle_nodes(g, &pending, Some(&me), &mut failed);
@@ -2477,7 +2477,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         std::env::set_var(super::node_leaves::UPGRADE_RESTAGES_LEAVES_ENV, "1");
     }
     if !g.json { println!("{}", ui::phase("Nodes")); }
-    println!("{}", ui::note(&format!("restaging provision bundles for {} node(s): {}", names.len(), names.join(", "))));
+    ui::say(&ui::note(&format!("restaging provision bundles for {} node(s): {}", names.len(), names.join(", "))));
     let mut failed: Vec<String> = Vec::new();
     // Nodes staged with --stage-only, waiting for their apply report.
     let mut pending: Vec<super::provision::PendingApply> = Vec::new();
@@ -2511,7 +2511,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
                 ui::rewrite_line(&ui::note(line));
                 drew_wait = true;
             }
-            (false, false) => println!("{}", ui::note(line)),
+            (false, false) => ui::say(&ui::note(line)),
         },
     );
     if drew_wait {
@@ -2519,15 +2519,15 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     }
     for n in &names {
         if let Some((_, why)) = skipped.iter().find(|(s, _)| s == n) {
-            println!();
-            println!("{}", ui::item(n));
-            println!("{}", ui::sub(&ui::status_line(Glyph::Warn,
+            ui::blank();
+            ui::say(&ui::item(n));
+            ui::say(&ui::sub(&ui::status_line(Glyph::Warn,
                 &format!("{n}: skipped — offline before the roll ({why}); nothing to wait for"))));
             continue;
         }
         // Each node is an item; cluster provision prints the `ui::item`
         // label and its indented steps. A blank line separates nodes.
-        println!();
+        ui::blank();
         // Whether this node ever reported an apply is read BEFORE the
         // staging replaces its row; the combined wait needs it for the
         // legacy fallback (the child judged the same fact for its own steps).
@@ -2548,7 +2548,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         match super::provision::staged_sha_of(g, n) {
             Some(sha) => pending.push(super::provision::PendingApply { node: n.clone(), sha, legacy }),
             None => {
-                println!("{}", ui::sub(&ui::status_line(Glyph::Err,
+                ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
                     &format!("{n}: staged, but the gateway reports no staged bundle to wait on"))));
                 failed.push(n.clone());
             }
@@ -2562,7 +2562,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     let me = local_agent_node(&names);
     if let Some(me) = &me {
         // The child prints its own `ui::item` label, as the rail nodes do.
-        println!();
+        ui::blank();
         upgrade_self_node(g, me, &mut failed, &mut pending);
     }
     if !pending.is_empty() {
@@ -2634,7 +2634,7 @@ const NODES_APPLY_POLL_SECS: u64 = 5;
 /// `self_node` is the controller's own node when it is among `pending`: it
 /// gets the self-node post-apply steps and is named "(self node)" in `failed`.
 fn wait_and_settle_nodes(g: &Globals, pending: &[super::provision::PendingApply], self_node: Option<&str>, failed: &mut Vec<String>) {
-    println!();
+    ui::blank();
     let ends = super::provision::wait_nodes_applied(g, pending, NODES_APPLY_BUDGET_SECS, NODES_APPLY_POLL_SECS);
     let mut applied = 0usize;
     let mut unconfirmed = 0usize;
@@ -2652,8 +2652,8 @@ fn wait_and_settle_nodes(g: &Globals, pending: &[super::provision::PendingApply]
     if g.json {
         println!("{}", serde_json::json!({"nodes_apply": json_rows}));
     } else {
-        println!();
-        println!("{}", ui::note(&format!(
+        ui::blank();
+        ui::say(&ui::note(&format!(
             "{} of {} staged node(s) applied{}",
             applied, pending.len(),
             if unconfirmed > 0 { format!(", {unconfirmed} unconfirmed (legacy fetcher)") } else { String::new() })));
@@ -2674,8 +2674,8 @@ fn settle_end(g: &Globals, n: &str, end: super::provision::ApplyEnd, is_self: bo
     use super::provision::ApplyEnd;
     match end {
         ApplyEnd::Applied { rc: 0, msg } => {
-            println!();
-            println!("{}", ui::item(n));
+            ui::blank();
+            ui::say(&ui::item(n));
             if is_self {
                 super::provision::after_self_applied(g, n, &msg);
             } else {
@@ -2685,10 +2685,10 @@ fn settle_end(g: &Globals, n: &str, end: super::provision::ApplyEnd, is_self: bo
         }
         ApplyEnd::Applied { rc, msg } => {
             let tail: String = msg.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
-            println!();
-            println!("{}", ui::item(n));
+            ui::blank();
+            ui::say(&ui::item(n));
             ui::capture("applier output", tail.trim());
-            println!("{}", ui::sub(&ui::status_line(Glyph::Err,
+            ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
                 &format!("{n}: the applier refused the bundle (exit {rc}); the node kept its previous state"))));
             if !g.json {
                 ui::guide(&[(&format!("noo cluster provision {n} --wait"), "fix the cause above, then re-stage")]);
@@ -2699,9 +2699,9 @@ fn settle_end(g: &Globals, n: &str, end: super::provision::ApplyEnd, is_self: bo
             (serde_json::json!({"node": n, "outcome": "unconfirmed"}), Settled::Unconfirmed)
         }
         ApplyEnd::NotReported { fetched } => {
-            println!();
-            println!("{}", ui::item(n));
-            println!("{}", ui::sub(&ui::status_line(Glyph::Err, &if fetched {
+            ui::blank();
+            ui::say(&ui::item(n));
+            ui::say_err(&ui::sub(&ui::status_line(Glyph::Err, &if fetched {
                 format!("{n}: fetched the bundle but reported no apply outcome within {}m", NODES_APPLY_BUDGET_SECS / 60)
             } else {
                 format!("{n}: bundle staged but the node never fetched it within {}m", NODES_APPLY_BUDGET_SECS / 60)
@@ -2925,7 +2925,7 @@ fn mac_leaves_pass(g: &Globals, nodes: &[String], budget: u64) -> Vec<(String, M
     if !g.json { println!("{}", ui::phase("Mac Leaves")); }
     let floor = floor_str();
     if !g.json {
-        println!("{}", ui::note(&format!(
+        ui::say(&ui::note(&format!(
             "{} staged without backend door leaves (applier below noo-cli {floor}); \
              restaging once each reports the new CLI", nodes.join(", "))));
     }
@@ -2940,7 +2940,7 @@ fn mac_leaves_pass(g: &Globals, nodes: &[String], budget: u64) -> Vec<(String, M
             if reached_leaf_floor(&v) {
                 if !g.json {
                     let msg = format!("{n} reports {v}");
-                    match poll.take() { Some(p) => p.done(&msg), None => println!("{}", ui::sub(&ui::status_line(Glyph::Ok, &msg))) }
+                    match poll.take() { Some(p) => p.done(&msg), None => ui::say(&ui::sub(&ui::status_line(Glyph::Ok, &msg))) }
                 }
                 break true;
             }
@@ -2958,7 +2958,7 @@ fn mac_leaves_pass(g: &Globals, nodes: &[String], budget: u64) -> Vec<(String, M
         };
         if !reached {
             if !g.json {
-                println!("{}", ui::sub(&ui::status_line(Glyph::Warn, &format!(
+                ui::say(&ui::sub(&ui::status_line(Glyph::Warn, &format!(
                     "{n} did not report noo-cli {floor} within {}s — its leaves are not staged", budget))));
             }
             out.push((n.clone(), MacLeaves::TimedOut));
@@ -2977,14 +2977,14 @@ fn mac_leaves_pass(g: &Globals, nodes: &[String], budget: u64) -> Vec<(String, M
         match super::provision::staged_sha_of(g, n) {
             Some(sha) => pending.push(super::provision::PendingApply { node: n.clone(), sha, legacy }),
             None => {
-                println!("{}", ui::sub(&ui::status_line(Glyph::Err,
+                ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
                     &format!("{n}: staged, but the gateway reports no staged bundle to wait on"))));
                 out.push((n.clone(), MacLeaves::RestageFailed));
             }
         }
     }
     if !pending.is_empty() {
-        println!();
+        ui::blank();
         for (n, end) in super::provision::wait_nodes_applied(g, &pending, NODES_APPLY_BUDGET_SECS, NODES_APPLY_POLL_SECS) {
             let outcome = mac_leaves_outcome(&end);
             settle_end(g, &n, end, false);
@@ -3053,7 +3053,7 @@ fn upgrade_self_node(g: &Globals, me: &str, failed: &mut Vec<String>, pending: &
     match super::provision::staged_sha_of(g, me) {
         Some(sha) => pending.push(super::provision::PendingApply { node: me.to_string(), sha, legacy }),
         None => {
-            println!("{}", ui::sub(&ui::status_line(Glyph::Err,
+            ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
                 &format!("{me}: staged, but the gateway reports no staged bundle to wait on"))));
             failed.push(format!("{me} (self node)"));
         }
@@ -3488,11 +3488,11 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
     // per-item work; details hang under the closing line).
     if !uploaded.is_empty() {
         ui::done(&format!("{} CLI asset(s) uploaded to the controller ({version})", uploaded.len()));
-        println!("{}", ui::note(&uploaded.join(", ")));
+        ui::say(&ui::note(&uploaded.join(", ")));
     }
     if !already_held.is_empty() {
         ui::done(&format!("{} CLI asset(s) already on the gateway (sha256 matches, not re-uploaded)", already_held.len()));
-        println!("{}", ui::note(&already_held.join(", ")));
+        ui::say(&ui::note(&already_held.join(", ")));
     }
 }
 
@@ -6521,5 +6521,120 @@ mod storage_dir_tests {
         let body = super::phase_src::body("reconcile_storage_dirs");
         assert!(body.contains("crate::onboard::steps::create_storage_dir("), "created through onboarding's helper");
         assert!(body.contains("\"storage_dir_failed\""), "a directory that cannot be made is a refusal");
+    }
+}
+
+/// i388: under `--json`, stdout carries only JSON lines. The nodes and seats
+/// stages printed their per-node labels, blank separators and failure lines
+/// with raw `println!` whatever the mode, so `noo --json upgrade --nodes`
+/// (and the stage-2 re-exec of `--all --json`) was not parseable line by
+/// line. Narration now goes through `ui::say`/`ui::blank` (dropped under
+/// --json/--quiet) and failure lines through `ui::say_err` (stderr there).
+#[cfg(test)]
+mod json_stdout_tests {
+    use crate::commands::provision::ApplyEnd;
+
+    const CHILD_ENV: &str = "NOO_TEST_SETTLE_END_CHILD";
+    const BEGIN: &str = "<<<settle-end-begin>>>";
+    const END: &str = "<<<settle-end-end>>>";
+    const CHILD: &str = "commands::upgrade::json_stdout_tests::settle_end_child";
+
+    /// The child half: runs only when the test below re-execs this binary
+    /// with CHILD_ENV set, so its prints reach a real stdout (libtest
+    /// captures them in-process). Every ApplyEnd that needs no gateway.
+    #[test]
+    fn settle_end_child() {
+        let Ok(mode) = std::env::var(CHILD_ENV) else { return };
+        let json = mode == "json";
+        if json {
+            crate::ui::set_silent(true);
+        }
+        let g = crate::Globals {
+            json, verbose: false, gateway_override: None, timeout_secs: None, token: None, quiet: false,
+        };
+        println!("{BEGIN}");
+        let mut rows = Vec::new();
+        for end in [
+            ApplyEnd::NotReported { fetched: false },
+            ApplyEnd::NotReported { fetched: true },
+            ApplyEnd::Applied { rc: 2, msg: "applier: refused the bundle".to_string() },
+            ApplyEnd::LegacyUnconfirmed,
+        ] {
+            rows.push(super::settle_end(&g, "rh-node", end, false).0);
+        }
+        if json {
+            // what wait_and_settle_nodes prints under --json
+            println!("{}", serde_json::json!({"nodes_apply": rows}));
+        }
+        println!("{END}");
+    }
+
+    fn child(mode: &str) -> (Vec<String>, String) {
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", CHILD, "--nocapture", "--test-threads", "1"])
+            .env(CHILD_ENV, mode)
+            .output()
+            .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(out.status.success(), "child failed: {stdout}");
+        let lines: Vec<String> = stdout.lines()
+            // libtest may print `test <name> ... ` ahead of the first line
+            .skip_while(|l| !l.ends_with(BEGIN)).skip(1)
+            .take_while(|l| !l.starts_with(END))
+            .map(str::to_string)
+            .collect();
+        assert!(stdout.contains(END), "the child never reached its end marker: {stdout}");
+        (lines, String::from_utf8_lossy(&out.stderr).to_string())
+    }
+
+    #[test]
+    fn settle_end_writes_only_json_lines_to_stdout_under_json() {
+        // the human run prints the node's label and its failure lines: the
+        // test can see stdout, so an empty --json stdout means something
+        let (human, _) = child("human");
+        assert!(human.iter().any(|l| l.contains("rh-node") && l.contains("never fetched")), "human stdout: {human:?}");
+        let (json, err) = child("json");
+        assert!(!json.is_empty(), "the nodes_apply row must be on stdout");
+        for l in &json {
+            assert!(serde_json::from_str::<serde_json::Value>(l).is_ok(), "non-JSON stdout line under --json: {l:?} (all: {json:?})");
+        }
+        let v: serde_json::Value = serde_json::from_str(json.last().unwrap()).unwrap();
+        assert_eq!(v["nodes_apply"][0]["outcome"], "not_fetched");
+        assert_eq!(v["nodes_apply"][2]["outcome"], "refused");
+        // failures are not dropped: they go to stderr
+        assert!(err.contains("rh-node: bundle staged but the node never fetched it"), "stderr: {err}");
+        assert!(err.contains("the applier refused the bundle (exit 2)"), "stderr: {err}");
+    }
+
+    /// `fn <name>(` through its first column-0 closing brace, in `src`.
+    fn body<'a>(src: &'a str, file: &str, name: &str) -> &'a str {
+        let start = src.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("fn {name} not found in {file}"));
+        let rest = &src[start..];
+        &rest[..rest.find("\n}\n").unwrap_or_else(|| panic!("end of fn {name} in {file}"))]
+    }
+
+    /// Every stdout print reachable from the nodes and seats stages goes
+    /// through a mode-aware printer; a raw `println!` is allowed only on a
+    /// line that is itself the JSON branch (names `g.json` or prints `json!`).
+    #[test]
+    fn fleet_stage_functions_have_no_raw_stdout_print() {
+        let files: [(&str, &str, &[&str]); 3] = [
+            ("upgrade.rs", include_str!("upgrade.rs").split("#[cfg(test)]").next().unwrap(),
+             &["upgrade_nodes", "wait_and_settle_nodes", "settle_end", "mac_leaves_pass", "upgrade_self_node", "upload_cli_assets"]),
+            ("kiosk_seat.rs", include_str!("kiosk_seat.rs"), &["upgrade_seats"]),
+            ("cluster_verify.rs", include_str!("cluster_verify.rs"), &["verify_node_after_apply"]),
+        ];
+        let mut raw = Vec::new();
+        for (file, src, fns) in files {
+            for name in fns {
+                for line in body(src, file, name).lines() {
+                    let code = line.split("//").next().unwrap_or("").replace("eprintln!(", "").replace("eprint!(", "");
+                    if (code.contains("println!(") || code.contains("print!(")) && !code.contains("g.json") && !code.contains("json!(") {
+                        raw.push(format!("{file} fn {name}: {}", line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(raw.is_empty(), "raw stdout prints in the fleet stages (use ui::say / ui::blank / ui::say_err):\n{}", raw.join("\n"));
     }
 }

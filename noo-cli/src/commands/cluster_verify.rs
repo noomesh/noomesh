@@ -6669,17 +6669,24 @@ pub(crate) fn verify_node_after_apply(g: &Globals, node: &str) -> bool {
         std::thread::sleep(std::time::Duration::from_secs(3));
     }
     let Some(n) = last else {
-        println!("{}", ui::status_line(Glyph::Warn, &format!("{node}: not in /api/cluster/nodes yet — verify with `noo cluster verify {node}` once it heartbeats")));
+        ui::say(&ui::status_line(Glyph::Warn, &format!("{node}: not in /api/cluster/nodes yet — verify with `noo cluster verify {node}` once it heartbeats")));
         return true;
     };
     if !heard_since(&n, since) {
-        println!("{}", ui::status_line(Glyph::Warn, &format!(
+        ui::say(&ui::status_line(Glyph::Warn, &format!(
             "{node}: no heartbeat from the new build within {POST_APPLY_WAIT_SECS}s — judging the last record it sent; `noo cluster verify {node}` re-checks")));
     }
     let checks = node_checks(&with_harness_wanted(g, &n), &controller_stack_tag(), env!("CARGO_PKG_VERSION"), now_unix(), signing_adopted_for(node));
     // A `starting` row is not a pass: the caller's note
     // says the invariant does not hold YET, and `cluster verify` re-checks.
-    render(&format!("verify {node}"), &checks, g.verbose) && !checks.iter().any(|c| c.verdict == Verdict::Starting)
+    // Under --quiet/--json the table stays off stdout (the caller's JSON
+    // rows are the record); the verdict is render's own rule.
+    let passed = if ui::quiet() {
+        !checks.iter().any(|c| c.verdict == Verdict::Fail)
+    } else {
+        render(&format!("verify {node}"), &checks, g.verbose)
+    };
+    passed && !checks.iter().any(|c| c.verdict == Verdict::Starting)
 }
 
 /// Two and a half heartbeat intervals: one missed beat is not a verdict.
