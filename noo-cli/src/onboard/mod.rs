@@ -109,16 +109,6 @@ pub(crate) const STORAGE_SUBDIRS: &[&str] = &[
 /// tests/test_state_root_groundwork.py holds this to the compose file.
 pub(crate) const STATE_SUBDIRS: &[&str] = &["noo-data", "redis", "nats", "prometheus", "grafana", "loki", "tempo", "postgres"];
 
-/// The two signed stack-lock header lines that carry [`STORAGE_SUBDIRS`] and
-/// [`STATE_SUBDIRS`] (i467). The release lane copies them, from the checked-in
-/// `storage-dirs.lock-lines` this is pinned to, into `stack-<tag>.lock`
-/// before it is signed, so `noo upgrade --check` on an older CLI can read the
-/// TARGET release's directories from its verified lock
-/// (`upgrade::lock_storage_lists`).
-pub(crate) fn storage_lock_lines() -> String {
-    format!("# storage-subdirs {}\n# state-subdirs {}\n", STORAGE_SUBDIRS.join(","), STATE_SUBDIRS.join(","))
-}
-
 /// The eleven step titles, in wizard order — the single source for both
 /// `run_all`'s banners and the TUI's step list. DEPENDENCY-ORDERED
 /// (finding #16, operator design 2026-08-20): Secrets (credential gen +
@@ -1540,13 +1530,23 @@ pub(crate) fn posture_pending_restart(g: &Globals) -> Option<Vec<String>> {
 pub(crate) const FINAL_VERIFY_ARGS: &[&str] = &["--controller", "--wait"];
 
 #[cfg(test)]
-mod storage_lock_lines_tests {
+pub(crate) mod storage_lock_lines_tests {
+    /// The two signed stack-lock header lines that carry `STORAGE_SUBDIRS` and
+    /// `STATE_SUBDIRS` (i467). The release lane copies them, from the checked-in
+    /// `storage-dirs.lock-lines` this is pinned to, into `stack-<tag>.lock`
+    /// before it is signed, so `noo upgrade --check` on an older CLI can read the
+    /// TARGET release's directories from its verified lock
+    /// (`upgrade::lock_storage_lists`).
+    pub(crate) fn storage_lock_lines() -> String {
+        format!("# storage-subdirs {}\n# state-subdirs {}\n", super::STORAGE_SUBDIRS.join(","), super::STATE_SUBDIRS.join(","))
+    }
+
     /// The file the release lane signs into every stack lock is this build's
     /// lists, byte for byte: a directory added to STORAGE_SUBDIRS without the
     /// file (or the other way) fails here, not in a roll.
     #[test]
     fn the_checked_in_lock_lines_are_the_compiled_lists() {
-        assert_eq!(include_str!("storage-dirs.lock-lines"), super::storage_lock_lines(),
+        assert_eq!(include_str!("storage-dirs.lock-lines"), storage_lock_lines(),
             "regenerate noo-cli/src/onboard/storage-dirs.lock-lines from STORAGE_SUBDIRS/STATE_SUBDIRS");
     }
 }
