@@ -330,9 +330,17 @@ impl Lane {
     }
 
     /// One `lanes` entry, or `None` when it names no backend or no model.
+    ///
+    /// An absolute path (a llamacpp or reranker placement, `/models/x.gguf`)
+    /// is named by its file, as `running_backends` names it
+    /// (`docker/client.go`, MODEL_PATH after the last `/`), so the lane keeps
+    /// the class name clients already send. A repo id (`google/gemma-…`) is
+    /// not a path and is kept whole.
     pub fn from_value(v: &Value) -> Option<Lane> {
         let text = |k: &str| v.get(k).and_then(Value::as_str).map(str::trim).unwrap_or("").to_string();
-        let (backend, model) = (text("backend"), text("model"));
+        let backend = text("backend");
+        let placed = text("model");
+        let model = if placed.starts_with('/') { placed.rsplit('/').next().unwrap_or("").to_string() } else { placed };
         if backend.is_empty() || model.is_empty() {
             return None;
         }
@@ -3184,6 +3192,57 @@ mod lane_tests {
         assert!(t.class("HF-12B").is_none());
         assert!(t.all_chat.is_none());
         assert_eq!(t.skipped_lanes, vec![("n1".into(), "vllm".into(), "HF-12B".into(), "lane loading: warming".into())]);
+    }
+
+    #[test]
+    fn an_absolute_path_is_named_by_its_file_and_a_repo_id_is_kept_whole() {
+        let n = facts(&rec(
+            "n1",
+            "100.64.0.1",
+            json!([
+                lane("llamacpp", "/models/sub/x.gguf", "chat", "serving", ""),
+                lane("vllm", "google/gemma-4-12B-it-qat-w4a16-ct", "chat", "serving", ""),
+                lane("ollama", "/", "chat", "serving", ""),
+            ]),
+            json!({}),
+        ));
+        let models: Vec<&str> = n.lanes.as_ref().unwrap().iter().map(|l| l.model.as_str()).collect();
+        assert_eq!(models, ["x.gguf", "google/gemma-4-12B-it-qat-w4a16-ct"], "a bare `/` names nothing and is dropped");
+        let t = build_table(&[n], &[], &Declarations::default());
+        assert!(t.class("x.gguf").is_some(), "the class clients already name");
+    }
+
+    /// The node agent's own golden heartbeat (noomesh/noomesh#673, Phase 1),
+    /// read as the gateway reads it. If either half changes the contract,
+    /// this fails on the next build of the other.
+    #[test]
+    fn the_node_agents_golden_lanes_route_as_agreed() {
+        let golden: Value =
+            serde_json::from_str(include_str!("../../../node-agent-go/internal/heartbeat/testdata/lanes_fixture.json")).expect("the fixture parses");
+        let mut r = rec("n1", "100.64.0.1", golden["lanes"].clone(), json!({}));
+        r["running_backends"] = golden["running_backends"].clone();
+        let f = facts(&r);
+        let states: Vec<&str> = f.lanes.as_ref().unwrap().iter().map(|l| l.state.as_str()).collect();
+        for st in ["serving", "on_demand", "loading", "missing", "unplaced", "unknown", "down"] {
+            assert!(states.contains(&st), "the fixture covers {st}: {states:?}");
+        }
+        assert!(states.iter().all(|s| !matches!(LaneState::parse(s), LaneState::Other(_))), "every state is one this gateway names: {states:?}");
+        let mut running = f.running.clone();
+        running.sort();
+        assert_eq!(
+            running,
+            [("llamacpp", "m.gguf"), ("ollama", "gemma4:12b"), ("ollama", "mystery:7b"), ("ollama", "qwen3:4b")]
+                .map(|(b, m)| (b.to_string(), m.to_string()))
+        );
+        assert!(!f.running.iter().any(|(b, _)| b == "vllm"), "the stale running_backends.vllm is ignored while lanes are sent");
+        assert!(f.non_chat.contains(&"reranker".to_string()) && f.non_chat.contains(&"embedding".to_string()));
+        let t = build_table(&[f], &[], &Declarations::default());
+        assert!(t.class("org/old-model").is_none() && t.class("org/new-model").is_none());
+        assert_eq!(t.skipped_lanes, vec![(
+            "n1".to_string(), "vllm".to_string(), "org/new-model".to_string(), "lane loading: reconciling: runtime runs org/old-model".to_string(),
+        )]);
+        let order: Vec<&str> = t.all_chat.as_ref().unwrap().candidates.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(&order[2..], ["qwen3:4b", "mystery:7b"], "on demand, then unconfirmed, after both serving lanes: {order:?}");
     }
 
     #[test]
