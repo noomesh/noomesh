@@ -77,7 +77,8 @@ PUBLIC_PREFIXES = ("/assets/",)
 READ_PATHS = (
     "/api/cluster/status",
     "/api/cluster/gpu-metrics",
-    "/api/jobs",
+    # NOT here: the general jobs list, followup 1000. The queue tile reads
+    # /api/kiosk/jobs (covered by READ_PREFIXES), five fields and no payload.
     "/api/scheduler/status",
     "/api/heartbeat/status",
     "/api/memory/health",

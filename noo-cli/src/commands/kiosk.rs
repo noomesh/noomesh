@@ -2151,7 +2151,7 @@ mod tests {
     fn the_proxy_allowlist_matches_the_gateway() {
         let gw_paths = gateway_list("KIOSK_READ_PATHS");
         let gw_prefixes = gateway_list("KIOSK_READ_PREFIXES");
-        assert!(gw_paths.len() >= 8, "read the gateway list wrong: {gw_paths:?}");
+        assert!(gw_paths.len() >= 7, "read the gateway list wrong: {gw_paths:?}");
 
         let src = serve_asset();
         assert_eq!(
