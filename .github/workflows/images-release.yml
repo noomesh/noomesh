@@ -948,6 +948,15 @@ jobs:
           # the checked-out source in a step that holds no signing seed; the
           # signing step only copies it into the lock (see "Assemble + sign").
           scripts/mesh-migration-head.sh > mesh-migration-head.txt
+          # The release's storage and state directory lists (i467), as the
+          # CLI built from this commit compiles them (a Rust test pins the
+          # file to STORAGE_SUBDIRS/STATE_SUBDIRS). Exactly the two header
+          # lines, or the release stops here.
+          cp noo-cli/src/onboard/storage-dirs.lock-lines storage-dirs.txt
+          [ "$(wc -l < storage-dirs.txt)" = 2 ] \
+            && grep -qE '^# storage-subdirs [a-z0-9_/-]+(,[a-z0-9_/-]+)*$' storage-dirs.txt \
+            && grep -qE '^# state-subdirs [a-z0-9_/-]+(,[a-z0-9_/-]+)*$' storage-dirs.txt \
+            || { echo "::error::noo-cli/src/onboard/storage-dirs.lock-lines is not the two storage header lines"; cat storage-dirs.txt; exit 1; }
 
       # THE ONE JOB THAT MUST NOT BE COMPROMISED, and until 2026-09-04 it was
       # the softest. Signing needs a CLI with the `security release-sign` verb
@@ -1044,7 +1053,10 @@ jobs:
           # understate it.
           head="$(cat mesh-migration-head.txt)"
           case "$head" in [0-9][0-9][0-9]_*) ;; *) echo "::error::mesh-migration-head.txt is not a revision id: $head"; exit 1 ;; esac
-          { echo "# stack $TAG"; echo "# mesh-migration-head $head"; cat digests/* | sort; } > "stack-$TAG.lock"
+          # Then the release's storage directory lists (i467): `noo upgrade
+          # --check` on an older CLI reads the target's directories from
+          # here, signed, so a mirror cannot drop or add one.
+          { echo "# stack $TAG"; echo "# mesh-migration-head $head"; cat storage-dirs.txt; cat digests/* | sort; } > "stack-$TAG.lock"
           echo "== stack-$TAG.lock =="; cat "stack-$TAG.lock"
           ./noo-x86_64-unknown-linux-gnu security release-sign "stack-$TAG.lock"
           ./noo-x86_64-unknown-linux-gnu security release-verify "stack-$TAG.lock"
