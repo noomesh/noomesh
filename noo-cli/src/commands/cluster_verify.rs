@@ -2231,6 +2231,82 @@ pub(crate) fn storage_dirs_row(root: &std::path::Path) -> Check {
     storage_dirs_check(dirs.as_deref())
 }
 
+/// One fleet node's needs from the controller's release-asset cache.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AssetNeed {
+    pub(crate) node: String,
+    pub(crate) os: String,
+    pub(crate) arch: String,
+    /// The platform was assumed (no enrollment facts), not reported.
+    pub(crate) assumed: bool,
+    pub(crate) assets: Vec<String>,
+}
+
+/// What provision stages for `node` from the cache, by platform: the
+/// privileged helper always; the harness and the CLI except on the
+/// controller's own node (its gateway is the harness, `noo upgrade` its CLI).
+pub(crate) fn asset_need(node: &str, facts: Option<&Value>, self_node: bool) -> AssetNeed {
+    use crate::commands::provision::{cli_asset_for, gateway_asset_for, hostd_asset_for, platform_from_facts};
+    let (os, arch, assumed) = platform_from_facts(facts);
+    let mut assets: Vec<String> = hostd_asset_for(&os, &arch).into_iter().collect();
+    if !self_node {
+        assets.extend(gateway_asset_for(&os, &arch));
+        assets.extend(cli_asset_for(&os, &arch));
+    }
+    AssetNeed { node: node.to_string(), os, arch, assumed, assets }
+}
+
+const RELEASE_ASSETS: &str = "release assets";
+
+/// The `release assets` row (i11b): every harness, helper and CLI asset the
+/// fleet's bundles carry is in the controller's cache for this release.
+/// A missing one used to show only when provisioning reached that node. An
+/// assumed platform is named in the detail, so a wrong guess is visible.
+pub(crate) fn release_assets_check(version: &str, needs: &[AssetNeed], present: &dyn Fn(&str) -> bool) -> Check {
+    let mut missing: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    let mut all: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for n in needs {
+        for a in &n.assets {
+            all.insert(a.as_str());
+            if !present(a) {
+                missing.entry(a.as_str()).or_default().push(n.node.as_str());
+            }
+        }
+    }
+    let assumed: Vec<String> = needs.iter().filter(|n| n.assumed)
+        .map(|n| format!("{} assumed {}/{} (no enrollment facts)", n.node, n.os, n.arch)).collect();
+    let tail = if assumed.is_empty() { String::new() } else { format!("; {}", assumed.join(", ")) };
+    if missing.is_empty() {
+        let platforms: std::collections::BTreeSet<(&str, &str)> = needs.iter().map(|n| (n.os.as_str(), n.arch.as_str())).collect();
+        return ok(RELEASE_ASSETS, format!("all {} assets for {} platform{} cached for {version}{tail}",
+            all.len(), platforms.len(), if platforms.len() == 1 { "" } else { "s" }));
+    }
+    let list: Vec<String> = missing.iter().map(|(a, nodes)| format!("{a} ({})", nodes.join(", "))).collect();
+    warn(RELEASE_ASSETS, format!("missing from the {version} cache: {}{tail} — those bundles go without them", list.join(", ")),
+        Some("noo upgrade --nodes".to_string()))
+}
+
+/// [`release_assets_check`] for this box. The cache is the CONTROLLER's
+/// (`provision::cli_asset_cache_dir`), so the row runs only where provision
+/// would read it (`role::detect().controller`, as provision decides); from
+/// any other box it says it did not check, and never reports that box's
+/// empty cache as the fleet's.
+pub(crate) fn release_assets_row(on_controller: bool, cache: &std::path::Path, nodes: &[Value], toks: &[Value]) -> Option<Check> {
+    if !on_controller {
+        return Some(warn(RELEASE_ASSETS,
+            "not checked: the asset cache is on the controller and this box is not it (run verify there)", None));
+    }
+    let needs: Vec<AssetNeed> = nodes.iter().filter_map(|n| n["id"].as_str()).map(|id| {
+        let facts = crate::commands::provision::latest_redemption(toks, id).and_then(|t| t.get("facts")).filter(|f| f.is_object());
+        asset_need(id, facts, crate::role::is_self_node(id))
+    }).collect();
+    if needs.is_empty() {
+        return None;
+    }
+    let present = |a: &str| std::fs::metadata(cache.join(a)).is_ok_and(|m| m.is_file() && m.len() > 0);
+    Some(release_assets_check(env!("CARGO_PKG_VERSION"), &needs, &present))
+}
+
 /// The `off-site backup` row. Undecided is a WARN with `noo backups setup`;
 /// `none` chosen on purpose is an accepted gap and stays quiet.
 pub(crate) fn offsite_backup_check(
@@ -6385,6 +6461,17 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             model_cache_plain_port_published(),
             &nodes_refusing_model_cache_url(&fleet),
         ));
+        // i11b: every asset the fleet's bundles carry is cached here.
+        {
+            let toks: Vec<Value> = get_json_opt(g, "/api/security/bootstrap-tokens", true, 15)
+                .and_then(|b| b["tokens"].as_array().cloned())
+                .unwrap_or_default();
+            let root = crate::envfile::repo_root();
+            if let Some(c) = release_assets_row(crate::role::detect().controller.is_some(),
+                &crate::commands::provision::cli_asset_cache_dir(&root), &fleet, &toks) {
+                checks.push(c);
+            }
+        }
         let (id_host, id_ip, id_ts) = crate::onboard::steps::local_cert_identity();
         checks.push(service_cert_names_check(&externally_reachable_leaf_names(
             &crate::pki::pki_dir(), &id_host, &id_ip, &id_ts,
@@ -7082,6 +7169,78 @@ mod tests {
                       serde_json::json!({ "nvidia_driver": "prebuilt", "nvidia_driver_version": "580" }), serde_json::json!({})] {
             assert!(gpu_row(&next_boot_without_module(extra)).remedy.unwrap().contains("make 7.0.0-31-generic the default again"));
         }
+    }
+
+    /// i11b: the row names each missing asset with the nodes whose bundles
+    /// go without it, the controller's own node needs only hostd, and an
+    /// assumed platform is said.
+    #[test]
+    fn release_assets_names_each_missing_asset_and_its_nodes() {
+        let mac = serde_json::json!({ "os": "macos", "arch": "arm64" });
+        let pi = serde_json::json!({ "os": "linux", "arch": "aarch64" });
+        let needs = vec![
+            asset_need("mcmini", Some(&mac), false),
+            asset_need("robopi", Some(&pi), false),
+            asset_need("ctl", None, true),
+        ];
+        assert_eq!(needs[2].assets, vec!["noo-hostd-x86_64-unknown-linux-gnu".to_string()], "self node: hostd only");
+        assert_eq!(needs[0].assets.len(), 3, "hostd, harness and CLI for a remote node");
+        let have: Vec<String> = needs.iter().flat_map(|n| n.assets.clone())
+            .filter(|a| a != "noo-gateway-aarch64-apple-darwin").collect();
+        let c = release_assets_check("0.6.17", &needs, &|a: &str| have.iter().any(|h| h == a));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("noo-gateway-aarch64-apple-darwin (mcmini)"), "{}", c.detail);
+        assert!(!c.detail.contains("robopi)"), "robopi has all it needs: {}", c.detail);
+        assert!(c.detail.contains("ctl assumed linux/x86_64"), "the guess is visible: {}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo upgrade --nodes"));
+        let c = release_assets_check("0.6.17", &needs, &|_: &str| true);
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.starts_with("all 7 assets for 3 platforms cached for 0.6.17"), "{}", c.detail);
+    }
+
+    /// The row reads the cache dir it is given, only on the controller; from
+    /// another box an empty cache is "not checked", never missing assets.
+    #[test]
+    fn release_assets_row_reads_the_controllers_cache_only() {
+        let dir = std::env::temp_dir().join(format!("noo-asset-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let nodes = vec![serde_json::json!({ "id": "robopi-i11b-test" })];
+        let toks = vec![serde_json::json!({ "node_name": "robopi-i11b-test", "used_at": "2026-11-04T10:00:00Z",
+            "used_by_ip": "100.1.1.1", "facts": { "os": "linux", "arch": "aarch64" } })];
+        let off = release_assets_row(false, &dir, &nodes, &toks).unwrap();
+        assert_eq!(off.verdict, Verdict::Warn);
+        assert!(off.detail.starts_with("not checked") && !off.detail.contains("missing"), "{}", off.detail);
+        let c = release_assets_row(true, &dir, &nodes, &toks).unwrap();
+        assert!(c.detail.contains("noo-hostd-aarch64-unknown-linux-gnu (robopi-i11b-test)"), "{}", c.detail);
+        for a in ["noo-hostd-aarch64-unknown-linux-gnu", "noo-gateway-aarch64-unknown-linux-musl", "noo-aarch64-unknown-linux-musl"] {
+            std::fs::write(dir.join(a), b"x").unwrap();
+        }
+        std::fs::write(dir.join("noo-aarch64-unknown-linux-musl"), b"").unwrap();
+        let c = release_assets_row(true, &dir, &nodes, &toks).unwrap();
+        assert!(c.detail.contains("noo-aarch64-unknown-linux-musl (robopi-i11b-test)"), "an empty file is not an asset: {}", c.detail);
+        std::fs::write(dir.join("noo-aarch64-unknown-linux-musl"), b"x").unwrap();
+        assert_eq!(release_assets_row(true, &dir, &nodes, &toks).unwrap().verdict, Verdict::Ok);
+        assert!(release_assets_row(true, &dir, &[], &toks).is_none(), "no fleet, no row");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Provision, `noo upgrade --nodes` and this row derive a node's
+    /// platform in one place, so what verify calls missing is what provision
+    /// would stage.
+    #[test]
+    fn provision_upgrade_and_verify_share_the_platform() {
+        let prov = include_str!("provision.rs");
+        let prov = prov.split("#[cfg(test)]").next().unwrap();
+        for f in ["fn attach_hostd(", "fn attach_cli(", "fn attach_harness("] {
+            let body = &prov[prov.find(f).unwrap()..];
+            let body = &body[..body.find("\n\u{7d}\n").unwrap()];
+            assert!(body.contains("platform_from_facts("), "{f} derives its platform in the shared fn");
+            assert!(!body.contains("f.get(\"arch\")"), "{f} has its own arch rule again");
+        }
+        let up = include_str!("upgrade.rs");
+        let up = &up[up.find("fn asset_platforms(").unwrap()..];
+        assert!(up[..up.find("\n\u{7d}\n").unwrap()].contains("platform_from_facts("));
     }
 
     #[test]
