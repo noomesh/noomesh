@@ -2137,15 +2137,9 @@ fn missing_service_certs<'a>(
 /// with its owner), before the pin moves, and refuses loudly when one cannot
 /// be made. Existing directories are never touched.
 fn reconcile_storage_dirs(g: &Globals, root: &std::path::Path) {
-    let env = root.join(".env");
-    let read = |k: &str| crate::onboard::env::read_env_key(&env, k);
-    let data = read("NOO_DATA_ROOT");
-    if data.trim().is_empty() {
-        // Compose requires it; the launcher refuses with its own remedy.
-        return;
-    }
-    let state = crate::commands::data_root::state_root_of(Some(read("NOO_STATE_ROOT").as_str()), data.trim());
-    let missing = missing_storage_dirs(std::path::Path::new(data.trim()), std::path::Path::new(&state), &read("NOO_PG_DATA"));
+    // No NOO_DATA_ROOT: compose requires it; the launcher refuses with its own remedy.
+    let Some(targets) = storage_dir_targets_in_env(root) else { return };
+    let missing: Vec<(String, std::path::PathBuf)> = targets.into_iter().filter(|(_, p)| !p.exists()).collect();
     let mut failed: Vec<String> = Vec::new();
     for (name, path) in &missing {
         match crate::onboard::steps::create_storage_dir(name, path) {
@@ -2168,12 +2162,34 @@ fn reconcile_storage_dirs(g: &Globals, root: &std::path::Path) {
 /// The storage directories this binary's release expects (onboarding's
 /// `onboard::STORAGE_SUBDIRS` floor, placed by `storage_targets_in`) that do not
 /// exist yet.
+#[cfg(test)]
 fn missing_storage_dirs(data: &std::path::Path, state: &std::path::Path, pg_data: &str) -> Vec<(String, std::path::PathBuf)> {
-    let names: Vec<String> = crate::onboard::STORAGE_SUBDIRS.iter().map(|s| s.to_string()).collect();
-    crate::onboard::steps::storage_targets_in(&names, data, state, pg_data)
+    storage_dir_targets(data, state, pg_data)
         .into_iter()
         .filter(|(_, p)| !p.exists())
         .collect()
+}
+
+/// Every storage directory this binary's release expects, placed under the
+/// data and state roots (onboarding's own `storage_targets_in`).
+pub(crate) fn storage_dir_targets(data: &std::path::Path, state: &std::path::Path, pg_data: &str) -> Vec<(String, std::path::PathBuf)> {
+    let names: Vec<String> = crate::onboard::STORAGE_SUBDIRS.iter().map(|s| s.to_string()).collect();
+    crate::onboard::steps::storage_targets_in(&names, data, state, pg_data)
+}
+
+/// [`storage_dir_targets`] for the install at `root`, from its `.env`
+/// (`NOO_DATA_ROOT`, `NOO_STATE_ROOT`, `NOO_PG_DATA`). `None` when
+/// `NOO_DATA_ROOT` is unset.
+pub(crate) fn storage_dir_targets_in_env(root: &std::path::Path) -> Option<Vec<(String, std::path::PathBuf)>> {
+    let env = root.join(".env");
+    let read = |k: &str| crate::onboard::env::read_env_key(&env, k);
+    let data = read("NOO_DATA_ROOT");
+    let data = data.trim();
+    if data.is_empty() {
+        return None;
+    }
+    let state = crate::commands::data_root::state_root_of(Some(read("NOO_STATE_ROOT").as_str()), data);
+    Some(storage_dir_targets(std::path::Path::new(data), std::path::Path::new(&state), &read("NOO_PG_DATA")))
 }
 
 /// A release can add a service whose compose mounts
