@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/harnessprofile"
+	"github.com/noomesh/noomesh/node-agent-go/internal/lanes"
 )
 
 // ollamaContextKey is the placement env key the profile's context
@@ -248,4 +249,18 @@ func (r *Reconciler) ChatPlacement() (backend, model string, ok bool) {
 		return "", "", false
 	}
 	return r.chatDesired.Backend, r.chatDesired.Model, true
+}
+
+// publishLanePlacements hands the heartbeat the running placements it
+// builds `lanes` from (proposal i403): every non-harness row the controller
+// wants running, with its role and model verbatim.
+func publishLanePlacements(all []placement) {
+	var out []lanes.Placed
+	for _, p := range all {
+		if p.Backend == "harness" || p.DesiredState != "running" {
+			continue
+		}
+		out = append(out, lanes.Placed{Backend: p.Backend, Model: p.Model, Role: p.Role})
+	}
+	lanes.SetPlaced(out)
 }

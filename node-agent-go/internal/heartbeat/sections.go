@@ -114,6 +114,15 @@ var (
 		}
 	}}
 
+	// Runs after backend_containers and model_presence: it reads what they
+	// put in the payload instead of asking docker and ollama a second time.
+	secLanes = payloadSection{name: "lanes", add: func(r *Reporter, p map[string]any) {
+		// One lane per (backend, placed model) with a state (proposal i403,
+		// Phase 1). ALWAYS sent: `[]` is "no lanes", an absent key is an
+		// agent too old to report. running_backends is unchanged.
+		p["lanes"] = r.lanesReport(p)
+	}}
+
 	secGPUContention = payloadSection{name: "gpuContention", add: func(r *Reporter, p map[string]any) {
 		// Shared-GPU contention (internal/gpuyield): is something outside
 		// noomesh using the GPU, and are our GPU backends paused for it.
@@ -155,6 +164,7 @@ var heartbeatSections = []payloadSection{
 	secImageProvenance,
 	secBackendContainers,
 	secModelPresence,
+	secLanes,
 	secGPUContention,
 }
 

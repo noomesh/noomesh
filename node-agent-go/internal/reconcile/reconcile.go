@@ -394,6 +394,7 @@ func (r *Reconciler) publishProfileAndEmbedTarget(ctx context.Context, t *tick) 
 	applyHarnessProfile(t.desired.HarnessProfile)
 	declareAddonWorkloads(t.desired)
 	r.recordChatPlacement(t.desired.Placements)
+	publishLanePlacements(t.desired.Placements)
 	// Before the empty-state return below: a node with nothing placed still
 	// has a disk to keep.
 	if r.onReclaimPolicy != nil {
