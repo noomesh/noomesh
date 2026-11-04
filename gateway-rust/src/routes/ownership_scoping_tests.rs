@@ -284,19 +284,38 @@ async fn entity_identity_reports_the_subject_type_and_name() {
         .expect("upsert project entity");
 
     assert_eq!(
-        crate::temporal_graph::entity_identity(&db, &user_id).await,
+        crate::temporal_graph::entity_identity(&db, &user_id).await.expect("read"),
         Some(("user".to_string(), "ada".to_string())),
         "a 'user' subject is per-person data and must be scopeable by name"
     );
     assert_eq!(
-        crate::temporal_graph::entity_identity(&db, &project_id).await,
+        crate::temporal_graph::entity_identity(&db, &project_id).await.expect("read"),
         Some(("project".to_string(), "noomesh".to_string())),
         "a 'project' subject is the shared brain — global by design"
     );
     assert_eq!(
-        crate::temporal_graph::entity_identity(&db, "00000000-0000-0000-0000-000000000000").await,
+        crate::temporal_graph::entity_identity(&db, "00000000-0000-0000-0000-000000000000").await.expect("read"),
         None,
     );
+}
+
+/// The #650 sweep: an entity read the database cannot answer is an error,
+/// never "gone". `scope_entity` reads "gone" as "nothing to scope", so an
+/// error used to skip the ownership check before the fact read.
+#[tokio::test]
+async fn an_entity_read_the_database_cannot_answer_is_an_error_not_gone() {
+    // No fixture on purpose: the mesh chain does not create trellion's
+    // `noo_entities_typed`, so on a scratch database every read of it fails.
+    let Some(db) = scratch().await else { return };
+    assert!(
+        crate::temporal_graph::entity_identity(&db, "00000000-0000-0000-0000-000000000000").await.is_err(),
+        "an unreadable entity table must be Err, not Ok(None)"
+    );
+    assert!(
+        crate::temporal_graph::try_find_entity_id(&db, "user", "ada").await.is_err(),
+        "the name lookup the routes use must be Err too"
+    );
+    assert_eq!(crate::temporal_graph::find_entity_id(&db, "user", "ada").await, None, "prompt context: a missing section");
 }
 
 // ── 5. Usage: every assembled statement must PARSE, scoped and not ───────

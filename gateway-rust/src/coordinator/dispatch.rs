@@ -366,17 +366,19 @@ pub(crate) fn choose_node_for_address(live: &[(String, String)], configured: &[S
 /// Map an address or name onto a `node_id`, through the live registry
 /// first. See `choose_node_for_address` for the rule.
 pub async fn resolve_node_id(state: &AppState, host: &str) -> Result<String, String> {
+    // An unreadable registry is the reason, never "no live node": that let a
+    // lone (possibly stale) config row win, the misroute this rule prevents.
     let live: Vec<(String, String)> = crate::repo::cluster::all_nodes(&state.db)
         .await
         .map(|rows| rows.into_iter().map(|(id, ip, _)| (id, ip)).collect())
-        .unwrap_or_default();
+        .map_err(|e| format!("cannot read the live node registry to resolve {host}: {e}"))?;
     let configured: Vec<String> = sqlx::query_scalar(
         "SELECT node_id FROM noo_node_config WHERE node_id = $1 OR ip_address = $1 ORDER BY node_id",
     )
     .bind(host)
     .fetch_all(&state.db)
     .await
-    .unwrap_or_default();
+    .map_err(|e| format!("cannot read the node config to resolve {host}: {e}"))?;
     choose_node_for_address(&live, &configured, host)
 }
 
