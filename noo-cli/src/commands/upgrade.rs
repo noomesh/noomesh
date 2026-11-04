@@ -6761,7 +6761,7 @@ mod storage_dir_tests {
     fn lock_storage_lists_reads_only_well_formed_pairs() {
         let compiled = (STORAGE_SUBDIRS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
                         STATE_SUBDIRS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        let lock = format!("# stack v0.6.18\n{}x@sha256:00\n", crate::onboard::storage_lock_lines());
+        let lock = format!("# stack v0.6.18\n{}x@sha256:00\n", crate::onboard::storage_lock_lines_tests::storage_lock_lines());
         assert_eq!(super::lock_storage_lists(&lock), Ok(Some(compiled)));
         assert_eq!(super::lock_storage_lists("# stack v0.6.16\nx@sha256:00\n"), Ok(None));
         for bad in [
@@ -6784,7 +6784,7 @@ mod storage_dir_tests {
         let key = crate::release_sig::signing_key_from_seed_hex(&"11".repeat(32)).unwrap();
         let pk = crate::release_sig::pubkey_hex(&key);
         let lock = format!("# stack v0.6.18\n# mesh-migration-head 100_x\n{}gateway@sha256:{}\n",
-            crate::onboard::storage_lock_lines(), "ab".repeat(32));
+            crate::onboard::storage_lock_lines_tests::storage_lock_lines(), "ab".repeat(32));
         let sig = crate::release_sig::sign(&key, lock.as_bytes());
         let verify = |d: &[u8], s: &str| crate::release_sig::verify_with_keys(d, s, &[pk.as_str()]);
         let serve = |body: String| {
