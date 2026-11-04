@@ -4019,3 +4019,11 @@ body {
   text-decoration: underline;
   cursor: pointer;
 }
+
+/* Add-on access (f99): the add-on picker, each feature's tags, the forms. */
+.addon-access-pick { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 12px; }
+.addon-access-feature { margin-top: 12px; }
+.addon-access-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 6px 0; }
+.addon-access-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; margin: 8px 0; }
+.addon-access-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; min-width: 160px; flex: 1 1 160px; }
+.addon-access-form select { height: 36px; border: 1px solid var(--input); border-radius: 6px; background: var(--background); color: var(--foreground); padding: 0 8px; }
