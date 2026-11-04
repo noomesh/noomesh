@@ -446,16 +446,22 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // re-exec the NEW one to materialise ITS assets, not ours.
     let sh = crate::onboard::standalone::default_home();
     if sh.join(".noo-standalone").is_file() {
-        let refreshed = Command::new(&exe)
-            .args(["stack", "sync-assets"])
-            .stdout(std::process::Stdio::null())
+        // `--json` so the NEW binary says whether it wrote the slice or left
+        // it for the stack stage (i458 b: the slice moves with the pin).
+        let out = Command::new(&exe)
+            .args(["--json", "stack", "sync-assets"])
             .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if refreshed {
+            .output()
+            .ok()
+            .filter(|o| o.status.success());
+        let status = out.as_ref().map(|o| sync_assets_status(&String::from_utf8_lossy(&o.stdout)));
+        if let Some(status) = status {
             if !g.json {
-                println!("{}", ui::note(&format!("deploy slice refreshed under {}", sh.display())));
+                println!("{}", ui::note(&match status.as_deref() {
+                    Some("deferred") => format!(
+                        "deploy slice under {} stays at the stack's release until the stack stage moves it", sh.display()),
+                    _ => format!("deploy slice refreshed under {}", sh.display()),
+                }));
             }
         } else if !g.json {
             ui::warned("could not refresh the deploy slice");
@@ -1113,8 +1119,14 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     // Prepare the install, then move the pin.
     migrate_retired_yaml_gates(g, &roll.root);
     rerender_nats_users_for_roll(g, &roll.root);
-    refresh_deploy_slice(g, &roll);
+    // The last refusal before the pin. Its names come from this binary's
+    // compiled STORAGE_SUBDIRS, not from the slice.
     reconcile_storage_dirs(g, &roll.root);
+    // i458 (b): the deploy slice moves WITH the pin. Written after every
+    // refusal above, so a refused roll leaves the old release's compose and
+    // scripts over the old images (pop-os, 0.6.16: CLI and slice 0.6.16 over
+    // 0.6.15 images after the storage refusal).
+    refresh_deploy_slice(g, &roll);
     move_pin(g, &roll, target_stack_lock.as_deref(), &addon_prep);
 
     // Everything the launcher's bind checks and the new compose expect.
@@ -1263,6 +1275,35 @@ fn refuse_plaintext_install(g: &Globals, root: &std::path::Path) {
             &format!("{why} — refusing to roll a stack whose secrets are not all encrypted at rest; nothing was changed"),
             Some(crate::commands::plaintext_env::REMEDY));
     }
+}
+
+/// i458 (b): does `noo stack sync-assets` leave the deploy slice for the
+/// stack stage? Some((pin, paired)) when this binary's slice belongs to a
+/// stack the install does not run yet: the pin is older than (or another rc
+/// of) the release this binary pairs with. Writing it then would put the new
+/// compose and scripts over the old images (the slice/tag skew), and a
+/// refused stack stage would leave them there. A pin at or past the pairing,
+/// no pin (a fresh install) or no pairing (a dev build) refreshes as before.
+pub(crate) fn slice_waits_for_stack(root: &std::path::Path) -> Option<(String, String)> {
+    slice_defer(&pinned_tag(root), crate::onboard::standalone::STANDALONE_STACK_TAG)
+}
+
+fn slice_defer(pin: &str, baked: &str) -> Option<(String, String)> {
+    if pin.trim().is_empty() || baked.trim().is_empty() {
+        return None;
+    }
+    let (pin, paired) = (norm_stack_tag(pin), norm_stack_tag(baked));
+    let behind = pin != paired && stack_semver(&rc_core(&pin)) <= stack_semver(&rc_core(&paired));
+    behind.then_some((pin, paired))
+}
+
+/// The `status` of `noo --json stack sync-assets` ("ok", "deferred"), from
+/// its stdout; None when it printed no JSON status (an older binary's
+/// human output, or nothing).
+fn sync_assets_status(stdout: &str) -> Option<String> {
+    stdout.lines().rev()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        .find_map(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string))
 }
 
 /// The tag `.env` pins now (empty when unpinned).
@@ -5115,7 +5156,7 @@ mod tests {
         let src = include_str!("upgrade.rs");
         let src = src.split("#[cfg(test)]").next().unwrap();
         let f = &src[src.find("fn mac_leaves_pass(").unwrap()..];
-        let f = &f[..f.find("\n}\n").unwrap()];
+        let f = &f[..f.find("\n\u{7d}\n").unwrap()];
         assert!(f.contains(r#"provision_one(g, n, &["--stage-only"])"#), "{f}");
         assert_eq!(f.matches("provision_one(").count(), 1, "no full serial provision left");
         assert_eq!(f.matches("wait_nodes_applied(").count(), 1, "one wait over every staged Mac");
@@ -6431,7 +6472,7 @@ pub(crate) mod phase_src {
         let code = code();
         let start = code.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("fn {name} not found in upgrade.rs"));
         let rest = &code[start..];
-        &rest[..rest.find("\n}\n").unwrap_or_else(|| panic!("end of fn {name}"))]
+        &rest[..rest.find("\n\u{7d}\n").unwrap_or_else(|| panic!("end of fn {name}"))]
     }
 
     /// The ordered phase list of `noo upgrade --stack`.
@@ -6514,8 +6555,9 @@ mod storage_dir_tests {
         let list = super::phase_src::list();
         let at = |n: &str| list.find(n).unwrap_or_else(|| panic!("{n} not in the phase list"));
         let step = at("reconcile_storage_dirs(g, &roll.root)");
-        assert!(at("refresh_deploy_slice(") < step, "after the new release's compose is laid down");
-        for later in ["move_pin(", "launch_stack("] {
+        // i458 (b): the slice is written AFTER this refusal, so a refused
+        // roll leaves the old compose (slice_moves_with_the_pin pins that).
+        for later in ["refresh_deploy_slice(", "move_pin(", "launch_stack("] {
             assert!(step < at(later), "the data directories must exist before `{later}`");
         }
         let body = super::phase_src::body("reconcile_storage_dirs");
@@ -6610,7 +6652,7 @@ mod json_stdout_tests {
     fn body<'a>(src: &'a str, file: &str, name: &str) -> &'a str {
         let start = src.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("fn {name} not found in {file}"));
         let rest = &src[start..];
-        &rest[..rest.find("\n}\n").unwrap_or_else(|| panic!("end of fn {name} in {file}"))]
+        &rest[..rest.find("\n\u{7d}\n").unwrap_or_else(|| panic!("end of fn {name} in {file}"))]
     }
 
     /// Every stdout print reachable from the nodes and seats stages goes
@@ -6636,5 +6678,59 @@ mod json_stdout_tests {
             }
         }
         assert!(raw.is_empty(), "raw stdout prints in the fleet stages (use ui::say / ui::blank / ui::say_err):\n{}", raw.join("\n"));
+    }
+}
+
+/// i458 (b): the deploy slice moves with the pin. A roll refused in the
+/// stack stage left the NEW release's compose and scripts over the OLD
+/// images on pop-os (0.6.16): stage 1's `stack sync-assets` and the stack
+/// stage's refresh both wrote the slice before the storage refusal.
+#[cfg(test)]
+mod slice_pin_tests {
+    use super::{slice_defer, sync_assets_status};
+
+    #[test]
+    fn the_slice_waits_while_the_pin_is_behind_the_pairing() {
+        // the pop-os state: CLI paired with 0.6.16, stack still on 0.6.15
+        assert_eq!(slice_defer("v0.6.15", "stack-v0.6.16"), Some(("v0.6.15".into(), "v0.6.16".into())));
+        // an rc CLI over the last final, and one rc over another
+        assert!(slice_defer("v0.6.16", "stack-v0.6.17-rc.1").is_some());
+        assert!(slice_defer("v0.6.17-rc.1", "stack-v0.6.17-rc.2").is_some());
+        // the forms .env carries
+        assert!(slice_defer("stack-v0.6.15", "v0.6.16").is_some());
+    }
+
+    #[test]
+    fn the_slice_refreshes_at_or_past_the_pairing_and_without_one() {
+        assert_eq!(slice_defer("v0.6.16", "stack-v0.6.16"), None, "the stack runs this release");
+        assert_eq!(slice_defer("v0.6.17", "stack-v0.6.16"), None, "a stack cut after this CLI (the pairing is a floor)");
+        assert_eq!(slice_defer("", "stack-v0.6.16"), None, "a fresh install has no pin yet");
+        assert_eq!(slice_defer("v0.6.15", ""), None, "a dev build carries no pairing");
+    }
+
+    #[test]
+    fn stage_one_reads_the_sync_assets_status() {
+        assert_eq!(sync_assets_status("\u{7b}\"status\":\"deferred\",\"action\":\"sync-assets\"\u{7d}\n").as_deref(), Some("deferred"));
+        assert_eq!(sync_assets_status("\u{7b}\"status\":\"ok\",\"action\":\"sync-assets\"\u{7d}").as_deref(), Some("ok"));
+        assert_eq!(sync_assets_status("deploy slice refreshed under /root/.noo\n"), None, "an older binary's human line");
+    }
+
+    /// The stack stage writes the slice after the last refusal and right
+    /// before the pin: every preflight and the storage refusal come first.
+    #[test]
+    fn slice_moves_with_the_pin() {
+        let list = super::phase_src::list();
+        let at = |n: &str| list.find(n).unwrap_or_else(|| panic!("{n} not in the phase list"));
+        let slice = at("refresh_deploy_slice(");
+        for earlier in ["preflight_db_compat(", "preflight_service_keys(", "addon_preflight(", "reconcile_storage_dirs("] {
+            assert!(at(earlier) < slice, "`{earlier}` can refuse the roll: it must run before the slice is written");
+        }
+        assert!(slice < at("move_pin("), "the slice is written with the pin");
+        // and `stack sync-assets` (what stage 1 runs) asks the same question
+        let mesh = include_str!("mesh.rs");
+        let body = &mesh[mesh.find("pub fn mesh_sync_assets(").expect("mesh_sync_assets")..];
+        let body = &body[..body.find("\n\u{7d}\n").expect("end of mesh_sync_assets")];
+        let ask = body.find("slice_waits_for_stack(").expect("sync-assets must ask slice_waits_for_stack");
+        assert!(ask < body.find("materialize(").expect("materialize"), "before it writes anything");
     }
 }
