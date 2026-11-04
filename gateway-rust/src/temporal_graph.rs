@@ -32,6 +32,23 @@ pub async fn find_entity_id(
     entity_type: &str,
     canonical_name: &str,
 ) -> Option<String> {
+    match try_find_entity_id(db, entity_type, canonical_name).await {
+        Ok(found) => found,
+        Err(e) => {
+            // Prompt context only (Layer D): a missing section, said in the log.
+            tracing::warn!(error = %e, entity_type, "temporal_entity_lookup_failed");
+            None
+        }
+    }
+}
+
+/// [`find_entity_id`] with the database error kept: a route answers 503
+/// for it, never "no such entity" (sweep of #650).
+pub async fn try_find_entity_id(
+    db: &PgPool,
+    entity_type: &str,
+    canonical_name: &str,
+) -> std::result::Result<Option<String>, sqlx::Error> {
     let normalized = canonical_name.trim().to_lowercase();
     let row: Result<Option<(String,)>, _> = sqlx::query_as(
         "SELECT id::text FROM noo_entities_typed \
@@ -42,12 +59,15 @@ pub async fn find_entity_id(
     .fetch_optional(db)
     .await;
 
-    row.ok().flatten().map(|(s,)| s)
+    Ok(row?.map(|(s,)| s))
 }
 
 /// Upsert an entity by (type, canonical_name), returning its id as text.
 /// Names are normalized (trim + lowercase) to match `find_entity_id`.
-/// `(type, canonical_name)` of one entity, or `None` if it is gone.
+/// `(type, canonical_name)` of one entity, `Ok(None)` if it is gone. A
+/// database error is `Err`, never `None`: the scope check reads `None` as
+/// "nothing to scope", so an error there would skip the ownership check
+/// and the fact read after it could return another person's facts.
 ///
 /// The scope check on `/api/temporal/facts` and `/api/temporal/evolution`
 /// needs this: those routes address a subject by OPAQUE id as well as by
@@ -56,15 +76,13 @@ pub async fn find_entity_id(
 pub async fn entity_identity(
     db: &sqlx::PgPool,
     entity_id: &str,
-) -> Option<(String, String)> {
+) -> std::result::Result<Option<(String, String)>, sqlx::Error> {
     sqlx::query_as::<_, (String, String)>(
         "SELECT type, canonical_name FROM noo_entities_typed WHERE id = $1::uuid",
     )
     .bind(entity_id)
     .fetch_optional(db)
     .await
-    .ok()
-    .flatten()
 }
 
 pub async fn upsert_entity(

@@ -826,16 +826,25 @@ pub enum CeilingReason {
 type Restricted = Vec<(String, Vec<String>, CeilingReason)>;
 static RESTRICTED_TURNS: std::sync::Mutex<Restricted> = std::sync::Mutex::new(Vec::new());
 
+/// The restricted-turn list, poisoned or not. A poisoned lock (a panic while
+/// it was held) must not read as "no ceiling": `.lock().ok()?` used to make
+/// `ceiling_for_run` and `turn_tool_denied` answer None, which gave an
+/// unauthorised task every tool. The list itself stays consistent: every
+/// mutation is one push, remove or take.
+fn restricted() -> std::sync::MutexGuard<'static, Restricted> {
+    RESTRICTED_TURNS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// While held, tool calls in the heartbeat turn(s) of `conversation_id` are limited to read-only
 /// tools. `take_denied` is what the run refused, for its result.
 pub struct TurnCeiling(String, CeilingReason);
 
 impl TurnCeiling {
     pub fn take_denied(&self) -> Vec<String> {
-        RESTRICTED_TURNS
-            .lock()
-            .ok()
-            .and_then(|mut v| v.iter_mut().find(|(c, _, _)| *c == self.0).map(|(_, d, _)| std::mem::take(d)))
+        restricted()
+            .iter_mut()
+            .find(|(c, _, _)| *c == self.0)
+            .map(|(_, d, _)| std::mem::take(d))
             .unwrap_or_default()
     }
 
@@ -852,10 +861,9 @@ impl TurnCeiling {
 
 impl Drop for TurnCeiling {
     fn drop(&mut self) {
-        if let Ok(mut v) = RESTRICTED_TURNS.lock() {
-            if let Some(i) = v.iter().position(|(c, _, _)| *c == self.0) {
-                v.remove(i);
-            }
+        let mut v = restricted();
+        if let Some(i) = v.iter().position(|(c, _, _)| *c == self.0) {
+            v.remove(i);
         }
     }
 }
@@ -905,7 +913,7 @@ pub async fn ceiling_for_run(db: &sqlx::PgPool, task_id: &str, action: &str, con
             CeilingReason::AuthorisationUnreadable
         }
     };
-    RESTRICTED_TURNS.lock().ok()?.push((conversation_id.to_string(), Vec::new(), reason));
+    restricted().push((conversation_id.to_string(), Vec::new(), reason));
     Some(TurnCeiling(conversation_id.to_string(), reason))
 }
 
@@ -921,7 +929,7 @@ pub fn turn_tool_denied(conversation_id: &str, channel: &str, tool: &str, _args:
         }
         return None;
     }
-    let mut v = RESTRICTED_TURNS.lock().ok()?;
+    let mut v = restricted();
     let entry = v
         .iter_mut()
         .find(|(c, _, _)| conversation_id == c || conversation_id.starts_with(&format!("{c}-")))?;
@@ -1824,6 +1832,25 @@ mod ceiling_unreadable_tests {
         let note = c.take_note().expect("the run result notes the refusal");
         assert!(note.contains("could not be read") && note.contains("Nothing needs re-authorising"), "{note}");
         assert!(c.take_note().is_none(), "the refusals are taken once");
+        drop(c);
+        assert!(turn_tool_denied(conv, "heartbeat", "noo_job_cancel", &json!({})).is_none(), "the limit ends with the run");
+    }
+
+    /// A panic while the list was held poisons the lock; the ceiling must
+    /// hold through it, not read as "no ceiling".
+    #[tokio::test]
+    async fn a_poisoned_turn_list_still_limits_the_run() {
+        let _ = std::thread::spawn(|| {
+            let _held = RESTRICTED_TURNS.lock();
+            panic!("poison the restricted-turn list");
+        })
+        .join();
+        assert!(RESTRICTED_TURNS.is_poisoned(), "the test must actually poison the lock");
+        let conv = "heartbeat-poisoned-list";
+        let c = ceiling_for_run(&unreachable_pool(), "poisoned-list", "custom_prompt", conv)
+            .await
+            .expect("still limited");
+        assert!(turn_tool_denied(conv, "heartbeat", "noo_job_cancel", &json!({})).is_some(), "a mutating tool is refused");
         drop(c);
         assert!(turn_tool_denied(conv, "heartbeat", "noo_job_cancel", &json!({})).is_none(), "the limit ends with the run");
     }

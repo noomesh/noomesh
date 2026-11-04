@@ -4157,7 +4157,7 @@ async fn harness_kind_fit(
     node_id: &str,
     kind: &crate::harness_kinds::HarnessKind,
     existing: &[StoredPlacement],
-) -> (crate::harness_fit::Fit, Option<(String, String)>) {
+) -> Result<(crate::harness_fit::Fit, Option<(String, String)>), AppError> {
     let chats: Vec<&StoredPlacement> = existing
         .iter()
         .filter(|p| p.backend != "harness" && p.desired_state == "running" && p.role == "chat")
@@ -4183,7 +4183,11 @@ async fn harness_kind_fit(
     let tier = crate::node_tier::derive(&crate::node_tier::facts_from_capabilities(record.get("capabilities").unwrap_or(&json!({}))))
         .tier()
         .and_then(|t| u8::try_from(t).ok());
-    let overrides = crate::repo::cluster::node_harness_profile_overrides(&state.db, node_id).await.unwrap_or_else(|_| json!({}));
+    // The operator's per-node profile decides the window and the prompt
+    // floor: an unreadable one is a 503, not the tier default (#650 sweep).
+    let overrides = crate::repo::cluster::node_harness_profile_overrides(&state.db, node_id)
+        .await
+        .map_err(|e| AppError::Unavailable(format!("cannot read node '{node_id}' harness profile: {e}")))?;
     let profile = crate::harness_profile::resolve(tier, &overrides, None, None);
     let window = crate::harness_fit::node_window(chats.iter().map(|p| (p.backend.as_str(), &p.env, p.model.as_deref())), &record, profile.context);
     let floor = crate::harness_fit::kind_floor(kind, profile.claude_prompt == "slim");
@@ -4194,7 +4198,7 @@ async fn harness_kind_fit(
         .min_by_key(|(n, _)| *n)
         // No model name, no `noo cluster place` line to suggest.
         .and_then(|(_, p)| p.model.clone().filter(|m| !m.is_empty()).map(|m| (p.backend.clone(), m)));
-    (crate::harness_fit::judge(floor, window), chat)
+    Ok((crate::harness_fit::judge(floor, window), chat))
 }
 
 async fn stored_placements(state: &AppState, node_id: &str) -> Result<Vec<StoredPlacement>, AppError> {
@@ -4214,7 +4218,11 @@ async fn stored_placements(state: &AppState, node_id: &str) -> Result<Vec<Stored
 /// The node's memory facts for the fit check: its heartbeat record (the
 /// `mesh_nodes` KV), topped up from `cluster_nodes` and the operator's
 /// `noo_node_config.vram_gb` override. Nothing is probed.
-pub(crate) async fn node_fit_facts(state: &AppState, node_id: &str) -> Value {
+///
+/// A database error is `Err` (503), never "no override": the operator's
+/// `vram_gb` cap and `usage_profile` used to drop silently, so a placement
+/// the declared config refuses was admitted with a larger memory limit.
+pub(crate) async fn node_fit_facts(state: &AppState, node_id: &str) -> Result<Value, AppError> {
     let mut node = match state.js.get_key_value("mesh_nodes").await {
         Ok(kv) => match kv.get(node_id).await {
             Ok(Some(e)) => serde_json::from_slice::<Value>(&e).unwrap_or_else(|_| json!({})),
@@ -4223,25 +4231,28 @@ pub(crate) async fn node_fit_facts(state: &AppState, node_id: &str) -> Value {
         Err(_) => json!({}),
     };
     let has = |n: &Value, k: &str| n.get(k).and_then(|v| v.as_f64()).is_some_and(|v| v > 0.0);
+    let unreadable = |what: &str, e: sqlx::Error| AppError::Unavailable(format!("cannot read node '{node_id}' {what}: {e}"));
     if !has(&node, "vram_gb") || !has(&node, "ram_gb") {
-        if let Ok(Some((vram, ram))) = sqlx::query_as::<_, (Option<f64>, Option<f64>)>(
+        if let Some((vram, ram)) = sqlx::query_as::<_, (Option<f64>, Option<f64>)>(
             "SELECT vram_gb, ram_gb FROM cluster_nodes WHERE node_id = $1",
         )
         .bind(node_id)
         .fetch_optional(&state.db)
         .await
+        .map_err(|e| unreadable("memory facts", e))?
         {
             if !has(&node, "vram_gb") { if let Some(v) = vram { node["vram_gb"] = json!(v); } }
             if !has(&node, "ram_gb") { if let Some(v) = ram { node["ram_gb"] = json!(v); } }
         }
     }
     let mut usage_stored: Option<String> = None;
-    if let Ok(Some((v, usage))) = sqlx::query_as::<_, (Option<f64>, Option<String>)>(
+    if let Some((v, usage)) = sqlx::query_as::<_, (Option<f64>, Option<String>)>(
         "SELECT vram_gb, usage_profile FROM noo_node_config WHERE node_id = $1",
     )
     .bind(node_id)
     .fetch_optional(&state.db)
     .await
+    .map_err(|e| unreadable("config (vram_gb, usage_profile)", e))?
     {
         if let Some(v) = v.filter(|v| *v > 0.0) { node["vram_gb"] = json!(v); }
         usage_stored = usage;
@@ -4250,7 +4261,7 @@ pub(crate) async fn node_fit_facts(state: &AppState, node_id: &str) -> Value {
     node["usage_profile"] = json!(usage);
     node["usage_profile_source"] = json!(usage_source);
     node["fleet_model_stats"] = Value::Array(fleet_model_sizes(state, node_id).await);
-    node
+    Ok(node)
 }
 
 /// Every OTHER node's reported model sizes (`model_stats[].size_bytes` from
@@ -4303,7 +4314,11 @@ async fn placement_staging_refusal(state: &AppState, node_id: &str, backend: &st
     if !dir.is_dir() {
         return None;
     }
-    let node = node_fit_facts(state, node_id).await;
+    // Fail closed, and say why: an unreadable node is not an unknown arch.
+    let node = match node_fit_facts(state, node_id).await {
+        Ok(node) => node,
+        Err(e) => return Some((format!("cannot check the image is staged for '{node_id}': {e}"), true)),
+    };
     let arch = node["capabilities"]["arch"].as_str().or_else(|| node["arch"].as_str()).unwrap_or("").to_string();
     if arch.is_empty() {
         return None;
@@ -4413,7 +4428,7 @@ async fn placement_put(
 
     let target = body.target.as_deref().map(str::trim).filter(|t| !t.is_empty());
     if target.is_some() {
-        let node = node_fit_facts(&state, &node_id).await;
+        let node = node_fit_facts(&state, &node_id).await?;
         validate_target(&backend, target, &node).map_err(AppError::BadRequest)?;
     }
 
@@ -4429,7 +4444,7 @@ async fn placement_put(
         let ptarget = effective_target_after_upsert(mine, body.model.as_deref(), target);
         let proposed = StoredPlacement { backend: backend.clone(), role: role.clone(), model, env, desired_state: "running".into(), target: ptarget };
         if proposed.model.as_deref().is_some_and(|m| !m.is_empty()) {
-            let mut node = node_fit_facts(&state, &node_id).await;
+            let mut node = node_fit_facts(&state, &node_id).await?;
             with_size_hint(&mut node, proposed.model.as_deref(), body.model_size_bytes);
             let embed_ctx = crate::embedding_client::EMBED_NUM_CTX;
             let after = crate::placement_fit::evaluate(&node, &fit_specs(&existing, Some((&backend, &role, body.model.as_deref())), Some(&proposed)), embed_ctx);
@@ -4463,7 +4478,7 @@ async fn placement_put(
         let kind = body.env.as_ref().and_then(|e| e.get("NOO_HARNESS_KIND")).and_then(|k| k.as_str()).unwrap_or("noo").to_string();
         if let Some(row) = crate::harness_kinds::get(&kind) {
             let existing = stored_placements(&state, &node_id).await?;
-            let (fit, chat) = harness_kind_fit(&state, &node_id, row, &existing).await;
+            let (fit, chat) = harness_kind_fit(&state, &node_id, row, &existing).await?;
             if let Some(msg) = crate::harness_fit::message(&node_id, &kind, &fit, chat.as_ref().map(|(b, m)| (b.as_str(), m.as_str()))) {
                 match fit {
                     crate::harness_fit::Fit::Short { .. } if !body.force => return Err(AppError::Conflict(msg)),
@@ -4646,7 +4661,7 @@ async fn placement_fit_post(
 ) -> AppResult {
     let with = body.and_then(|Json(b)| b.with);
     let existing = stored_placements(&state, &node_id).await?;
-    let mut node = node_fit_facts(&state, &node_id).await;
+    let mut node = node_fit_facts(&state, &node_id).await?;
     let (replacing, proposed) = match &with {
         Some(w) => {
             let role = resolve_role(&w.backend, w.role.as_deref()).map_err(AppError::BadRequest)?;
@@ -6027,7 +6042,7 @@ native process)".into());
                 }
                 None => None,
             };
-            let node = node_fit_facts(&state, node_id).await;
+            let node = node_fit_facts(&state, node_id).await?;
             let replacing = proposed.as_ref().map(|p| (p.backend.clone(), p.role.clone(), p.model.clone()));
             Some(crate::placement_fit::evaluate(
                 &node,
