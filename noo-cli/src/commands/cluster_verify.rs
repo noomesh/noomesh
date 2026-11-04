@@ -2140,6 +2140,70 @@ pub(crate) fn backup_age_check(f: &crate::commands::backups::Freshness) -> Check
     }
 }
 
+/// Whether one storage directory is there, as the operator can see it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DirSeen {
+    Present,
+    Missing,
+    /// The path could not be checked (a parent the operator cannot search).
+    Unchecked(String),
+}
+
+pub(crate) fn dir_seen(p: &std::path::Path) -> DirSeen {
+    match p.try_exists() {
+        Ok(true) => DirSeen::Present,
+        Ok(false) => DirSeen::Missing,
+        Err(e) => DirSeen::Unchecked(e.to_string()),
+    }
+}
+
+const STORAGE_DIRS_REMEDY: &str = "noo onboard --only storage";
+
+/// The `data directories` row: every directory this release's compose binds
+/// (`onboard::STORAGE_SUBDIRS`, placed under the data and state roots) exists
+/// on this controller. A release that adds one (0.6.16: `tempo`) refuses the
+/// stack roll until it is there; this row says so before the roll. A path
+/// that cannot be checked is named as such, never counted present.
+pub(crate) fn storage_dirs_check(dirs: Option<&[(String, std::path::PathBuf, DirSeen)]>) -> Check {
+    const NAME: &str = "data directories";
+    let Some(dirs) = dirs else {
+        return warn(NAME, "NOO_DATA_ROOT is not set in .env; the data directories were not checked",
+            Some(STORAGE_DIRS_REMEDY.to_string()));
+    };
+    let missing: Vec<String> = dirs.iter()
+        .filter(|(_, _, s)| *s == DirSeen::Missing)
+        .map(|(_, p, _)| p.display().to_string())
+        .collect();
+    let unchecked: Vec<String> = dirs.iter()
+        .filter_map(|(_, p, s)| match s {
+            DirSeen::Unchecked(e) => Some(format!("{} ({e})", p.display())),
+            _ => None,
+        })
+        .collect();
+    if missing.is_empty() && unchecked.is_empty() {
+        return ok(NAME, format!("all {} present", dirs.len()));
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !missing.is_empty() {
+        parts.push(format!("missing {} (the stack roll refuses without {})", missing.join(", "),
+            if missing.len() == 1 { "it" } else { "them" }));
+    }
+    if !unchecked.is_empty() {
+        parts.push(format!("not checked {}", unchecked.join(", ")));
+    }
+    warn(NAME, parts.join("; "), (!missing.is_empty()).then(|| STORAGE_DIRS_REMEDY.to_string()))
+}
+
+/// [`storage_dirs_check`] for the install at `root`, read from its `.env`.
+pub(crate) fn storage_dirs_row(root: &std::path::Path) -> Check {
+    let dirs: Option<Vec<(String, std::path::PathBuf, DirSeen)>> = super::upgrade::storage_dir_targets_in_env(root)
+        .map(|t| t.into_iter().map(|(n, p)| {
+            let seen = dir_seen(&p);
+            (n, p, seen)
+        }).collect());
+    storage_dirs_check(dirs.as_deref())
+}
+
 /// The `off-site backup` row. Undecided is a WARN with `noo backups setup`;
 /// `none` chosen on purpose is an accepted gap and stays quiet.
 pub(crate) fn offsite_backup_check(
@@ -6233,6 +6297,8 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             );
             checks.push(offsite_backup_check(&configured, &state));
         }
+        // A release's new data directory, missing here, refuses the stack roll.
+        checks.push(storage_dirs_row(&crate::envfile::repo_root()));
         // i67: the controller's own node (when this box runs one) rides the rail.
         if let Some(me) = crate::commands::provision::self_node_name()
             .filter(|_| std::path::Path::new("/usr/local/bin/noo-node-agent").is_file())
@@ -11492,5 +11558,82 @@ mod gateway_fds_tests {
         let c = gateway_fds_check(Some(&old));
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.starts_with("not read"), "{}", c.detail);
+    }
+}
+
+#[cfg(test)]
+mod storage_dirs_row_tests {
+    use super::{storage_dirs_check, storage_dirs_row, DirSeen, Verdict};
+    use crate::onboard::STORAGE_SUBDIRS;
+
+    /// An install root whose `.env` points at a data root holding every
+    /// storage directory except `skip`.
+    fn install_without(tag: &str, skip: &[&str]) -> (std::path::PathBuf, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("noo-verify-dirs-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (root, data) = (base.join("install"), base.join("data"));
+        std::fs::create_dir_all(&root).unwrap();
+        for n in STORAGE_SUBDIRS {
+            if !skip.contains(n) {
+                std::fs::create_dir_all(data.join(n)).unwrap();
+            }
+        }
+        std::fs::write(root.join(".env"), format!("NOO_DATA_ROOT={}\n", data.display())).unwrap();
+        (base, data)
+    }
+
+    /// 0.6.15 -> 0.6.16: a controller onboarded before `tempo` existed. The
+    /// row names the directory and the remedy; once it exists the row is OK.
+    #[test]
+    fn a_missing_release_dir_is_a_warn_naming_it_and_the_remedy() {
+        let (base, data) = install_without("tempo", &["tempo"]);
+        let c = storage_dirs_row(&base.join("install"));
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains(&data.join("tempo").display().to_string()), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo onboard --only storage"));
+        std::fs::create_dir_all(data.join("tempo")).unwrap();
+        let c = storage_dirs_row(&base.join("install"));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert_eq!(c.detail, format!("all {} present", STORAGE_SUBDIRS.len()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// pop-os 11-03: the voice model mounts, nested two deep.
+    #[test]
+    fn nested_dirs_are_checked_too() {
+        let (base, data) = install_without("voice", &["models/voice/whisper", "models/voice/piper"]);
+        let c = storage_dirs_row(&base.join("install"));
+        assert_eq!(c.verdict, Verdict::Warn);
+        for d in ["models/voice/whisper", "models/voice/piper"] {
+            assert!(c.detail.contains(&data.join(d).display().to_string()), "{d}: {}", c.detail);
+        }
+        assert!(c.detail.contains("without them"), "{}", c.detail);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// No NOO_DATA_ROOT: nothing was checked, and the row says so.
+    #[test]
+    fn no_data_root_is_not_checked_never_ok() {
+        let c = storage_dirs_check(None);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("not checked"), "{}", c.detail);
+        let base = std::env::temp_dir().join(format!("noo-verify-dirs-noenv-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        assert_eq!(storage_dirs_row(&base).verdict, Verdict::Warn, "no .env at all");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A path the operator cannot stat is "not checked", never present, and
+    /// alone carries no onboarding remedy (nothing is known to be missing).
+    #[test]
+    fn an_unchecked_path_is_never_counted_present() {
+        let dirs = vec![
+            ("noo-data".to_string(), std::path::PathBuf::from("/d/noo-data"), DirSeen::Present),
+            ("tempo".to_string(), std::path::PathBuf::from("/s/tempo"), DirSeen::Unchecked("Permission denied".into())),
+        ];
+        let c = storage_dirs_check(Some(&dirs));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.detail, "not checked /s/tempo (Permission denied)");
+        assert_eq!(c.remedy, None);
     }
 }
