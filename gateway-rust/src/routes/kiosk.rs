@@ -169,13 +169,17 @@ async fn jobs(State(state): State<Arc<AppState>>, Query(p): Query<JobsParams>) -
         // Unscoped on purpose: the mesh-wide queue is global by design
         // (`scope: None` is what `job_visible` treats as "every job").
         scope: None,
-        fleet: false,
     };
     let full = super::admin::list_jobs_for(state, params).await?;
     Ok(Json(json!({
-        "jobs": pick_from(&full, "jobs", &["job_id", "status", "type", "node_id", "created_at"]),
+        "jobs": pick_from(&full, "jobs", KIOSK_JOB_FIELDS),
     })))
 }
+
+/// What the display draws of a job (`SnapshotJob`). Never `payload` or
+/// `result`: those carry the prompt text of whatever the mesh is working on,
+/// and this is the ONLY job list a kiosk token can read (followup 1000).
+const KIOSK_JOB_FIELDS: &[&str] = &["job_id", "status", "type", "node_id", "created_at"];
 
 /// `SnapshotScheduler`.
 async fn scheduler(State(state): State<Arc<AppState>>) -> AppResult {
@@ -948,6 +952,23 @@ fn heartbeat_tasks(v: &Value) -> Vec<(String, bool, Option<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Followup 1000: the kiosk's job list (its only one) never carries a
+    /// payload or a result, whatever the general route's answer holds.
+    #[test]
+    fn the_kiosk_job_list_never_carries_a_payload() {
+        let full = json!({"jobs": [{
+            "job_id": "j1", "status": "running", "type": "chat", "node_id": "n1",
+            "created_at": "2026-11-04T15:00:00Z", "owner": "alice",
+            "payload": {"prompt": "secret"}, "result": "also secret",
+        }]});
+        let got = pick_from(&full, "jobs", KIOSK_JOB_FIELDS);
+        assert_eq!(got[0]["job_id"], "j1");
+        assert_eq!(got[0]["node_id"], "n1");
+        let text = got.to_string();
+        assert!(!text.contains("secret") && !text.contains("alice"), "{text}");
+        assert!(!KIOSK_JOB_FIELDS.iter().any(|f| matches!(*f, "payload" | "result" | "owner")));
+    }
 
     /// The retired KEY lane stays retired: `/api/kiosk/token` is not a
     /// route (so the router 404s it and the middleware admits no key for
