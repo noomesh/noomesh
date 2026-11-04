@@ -112,7 +112,9 @@ async function snapshot(
       (d.nodes ?? []).map((n) => ({ ...n, id: n.id ?? '' })),
     ),
     guard('gpus', () => client.GET('/api/cluster/gpu-metrics'), (d: { gpus?: SourceData['gpus'] | null }) => d.gpus ?? []),
-    guard('jobs', () => client.GET('/api/jobs'), (d: { jobs?: Array<Partial<SourceData['jobs'][number]>> | null }) =>
+    // The queue through the KIOSK PROJECTION (followup 1000): five fields, no
+    // payload or result. The general `/api/jobs` is closed to this token.
+    guard('jobs', () => client.GET('/api/kiosk/jobs'), (d: { jobs?: Array<Partial<SourceData['jobs'][number]>> | null }) =>
       (d.jobs ?? []).filter((j) => !!j.job_id).map((j) => ({ ...j, job_id: j.job_id! })),
     ),
     guard('scheduler', () => client.GET('/api/scheduler/status'), (d: SourceData['scheduler']) => d),

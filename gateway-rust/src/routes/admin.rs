@@ -881,10 +881,6 @@ pub(super) struct ListJobsParams {
     /// the unowned ones.
     #[serde(skip)]
     pub(super) scope: Option<String>,
-    /// A kiosk display token: also lists the unowned (fleet) jobs. `serde(skip)`
-    /// like `scope`, set only by the route from the verified credential.
-    #[serde(skip)]
-    pub(super) fleet: bool,
 }
 
 /// Whether a job hash is visible to `scope`.
@@ -908,15 +904,6 @@ pub(crate) fn job_visible(owner: &str, scope: Option<&str>) -> bool {
         // see and cancel only their own jobs").
         Some(me) => !owner.is_empty() && account_of(owner) == me,
     }
-}
-
-/// [`job_visible`] for the LIST route, plus the one deliberate exception: a
-/// kiosk display token (a User-tier subject that is not a person) lists the
-/// queue of the whole mesh, as the kiosk projection (`routes/kiosk.rs`)
-/// already does unscoped. `fleet` is true only for such a token; it widens
-/// nothing for a person.
-pub(crate) fn job_listed(owner: &str, scope: Option<&str>, fleet: bool) -> bool {
-    job_visible(owner, scope) || (fleet && owner.is_empty())
 }
 
 /// Whether the caller may CHANGE (cancel, reprioritize) the job. Stricter than
@@ -949,9 +936,6 @@ async fn list_jobs(
         cluster.as_ref().map(|Extension(c)| c),
     )
     .map_err(AppError::Forbidden)?;
-    params.fleet = requester
-        .as_ref()
-        .is_some_and(|Extension(r)| r.scopes.iter().any(|s| s == crate::auth::KIOSK_SCOPE));
     Ok(Json(list_jobs_for(state, params).await?))
 }
 
@@ -989,17 +973,11 @@ pub(super) async fn list_jobs_for(state: Arc<AppState>, params: ListJobsParams) 
             }
             // Ownership, applied where the other filters are so it cannot be
             // skipped by an early `continue` above it.
-            if !job_listed(
-                map.get("owner").map(|s| s.as_str()).unwrap_or(""),
-                params.scope.as_deref(),
-                params.fleet,
-            ) {
+            if !job_visible(map.get("owner").map(|s| s.as_str()).unwrap_or(""), params.scope.as_deref()) {
                 continue;
             }
 
-            // A kiosk display (`fleet`) is a shared screen: it gets the job
-            // without its payload.
-            jobs.push(job_to_json(&map, params.fleet));
+            jobs.push(job_to_json(&map));
         }
     }
 
@@ -1017,15 +995,12 @@ pub(super) async fn list_jobs_for(state: Arc<AppState>, params: ListJobsParams) 
 }
 
 /// A job hash as JSON, deserializing the payload field (JSON if it parses,
-/// else the raw string). `strip_payload` drops it altogether: a shared display
-/// must not show what was asked of the fleet.
-pub(crate) fn job_to_json(map: &std::collections::HashMap<String, String>, strip_payload: bool) -> Value {
+/// else the raw string). A shared display never gets this: it reads
+/// `/api/kiosk/jobs`, which keeps five fields of it (followup 1000).
+pub(crate) fn job_to_json(map: &std::collections::HashMap<String, String>) -> Value {
     let mut job = serde_json::Map::new();
     for (k, v) in map {
         if k == "payload" {
-            if strip_payload {
-                continue;
-            }
             match serde_json::from_str::<Value>(v) {
                 Ok(parsed) => { job.insert(k.clone(), parsed); }
                 Err(_) => { job.insert(k.clone(), json!(v)); }
@@ -4729,7 +4704,7 @@ mod job_type_routing_tests {
 
 #[cfg(test)]
 mod job_ownership_tests {
-    use super::{clamp_user_job_knobs, job_listed, job_mutable_by, job_to_json, job_visible, user_submit_refusal, USER_JOB_PAYLOAD_MAX_BYTES};
+    use super::{clamp_user_job_knobs, job_mutable_by, job_to_json, job_visible, user_submit_refusal, USER_JOB_PAYLOAD_MAX_BYTES};
     use crate::auth::{account_of, scoped_account, RequesterCtx, Role};
     use crate::routes::AppError;
     use serde_json::json;
@@ -4777,31 +4752,26 @@ mod job_ownership_tests {
         assert!(!job_visible("", Some("alice")));
     }
 
-    /// The kiosk token's list never carries a payload (a shared screen), while
-    /// every other caller's list still does.
+    /// The general list carries the payload (the caller's own jobs, or
+    /// Operator+). The kiosk's list is the projection's (followup 1000):
+    /// `routes::kiosk::tests::the_kiosk_job_list_never_carries_a_payload`.
     #[test]
-    fn the_kiosk_list_never_carries_a_payload() {
+    fn the_general_list_carries_the_payload() {
         let mut m = std::collections::HashMap::new();
         m.insert("job_id".to_string(), "j1".to_string());
-        m.insert("status".to_string(), "queued".to_string());
-        m.insert("payload".to_string(), r#"{"prompt":"secret"}"#.to_string());
-        let kiosk = job_to_json(&m, true);
-        assert!(kiosk.get("payload").is_none(), "{kiosk}");
-        assert_eq!(kiosk["job_id"], "j1");
-        assert!(!kiosk.to_string().contains("secret"));
-        assert_eq!(job_to_json(&m, false)["payload"]["prompt"], "secret");
+        m.insert("payload".to_string(), r#"{"prompt":"mine"}"#.to_string());
+        assert_eq!(job_to_json(&m)["payload"]["prompt"], "mine");
     }
 
-    /// The kiosk display lists the whole queue, so its token (and only a
-    /// token with the kiosk scope: `fleet`) also lists unowned jobs. It
-    /// never sees another person's job, and a person never gets `fleet`.
+    /// A User lists only its own account's jobs, never unowned fleet work;
+    /// there is no kiosk exception any more (followup 1000).
     #[test]
-    fn only_a_kiosk_token_lists_the_unowned_fleet_jobs() {
-        assert!(job_listed("", Some("kiosk:hall"), true));
-        assert!(!job_listed("bob", Some("kiosk:hall"), true));
-        assert!(!job_listed("", Some("alice"), false));
-        assert!(job_listed("alice", Some("alice"), false));
-        assert!(job_listed("bob", None, false));
+    fn a_user_lists_only_its_own_jobs() {
+        assert!(!job_visible("", Some("kiosk:hall")));
+        assert!(!job_visible("bob", Some("kiosk:hall")));
+        assert!(!job_visible("", Some("alice")));
+        assert!(job_visible("alice", Some("alice")));
+        assert!(job_visible("bob", None));
     }
 
     /// Not a prefix match, not a case fold — the owner is the account name

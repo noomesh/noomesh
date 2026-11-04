@@ -1086,7 +1086,10 @@ pub const KIOSK_READ_PATHS: &[&str] = &[
     // The health view's sources, fetched once per stream connection.
     "/api/cluster/status",
     "/api/cluster/gpu-metrics",
-    "/api/jobs",
+    // NOT here: `/api/jobs` (followup 1000). The display reads the queue
+    // from `/api/kiosk/jobs`, the projection (five fields, no payload or
+    // result). On the general route a kiosk token needed its own exception
+    // to list the unowned fleet jobs at all; that exception is gone.
     "/api/scheduler/status",
     "/api/heartbeat/status",
     "/api/memory/health",
@@ -4583,12 +4586,16 @@ mod tests {
         for p in KIOSK_READ_PATHS {
             assert_eq!(kiosk_may(&Method::GET, p), Ok(()), "{p}");
         }
-        for p in ["/api/kiosk/nodes", "/api/kiosk/gpus", "/api/kiosk/graph"] {
+        for p in ["/api/kiosk/nodes", "/api/kiosk/gpus", "/api/kiosk/graph", "/api/kiosk/jobs"] {
             assert_eq!(kiosk_may(&Method::GET, p), Ok(()), "{p}");
         }
         // Guard the guard: an empty allowlist would make the loop above
         // vacuous and the refusal test pass for the wrong reason.
-        assert!(KIOSK_READ_PATHS.len() >= 8, "the allowlist lost entries");
+        assert!(KIOSK_READ_PATHS.len() >= 7, "the allowlist lost entries");
+        // Followup 1000: the queue comes from the projection only.
+        for p in ["/api/jobs", "/api/jobs/history", "/api/jobs/0f9c1d2e-0000-4000-8000-000000000001"] {
+            assert_eq!(kiosk_may(&Method::GET, p), Err(KioskRefusal::OutOfScope), "{p}");
+        }
     }
 
     /// Acceptance 2. Whatever the bound account holds, the token the key
