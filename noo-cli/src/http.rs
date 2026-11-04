@@ -238,16 +238,20 @@ pub fn resolve_trust(base_url: &str) -> Result<Trust, String> {
     let enrolled = crate::envfile::controller_url_from_file(std::path::Path::new(
         crate::envfile::ENROLLED_CONTROLLER_URL,
     ));
-    resolve_trust_with(base_url, enrolled)
+    resolve_trust_with(base_url, enrolled, &cluster_ca_candidates())
 }
 
-/// [`resolve_trust`] with the enrollment record passed in.
+/// [`resolve_trust`] with the enrollment record and the cluster-CA
+/// candidates passed in.
 ///
 /// The record lives at one absolute path, `/etc/noo/controller-url`, which
 /// a test cannot create — so the ladder's most important rung used to be
 /// the one rung nothing exercised. Taking it as an argument makes the whole
-/// precedence testable, including on a machine that IS enrolled.
-fn resolve_trust_with(base_url: &str, enrolled: Option<String>) -> Result<Trust, String> {
+/// precedence testable, including on a machine that IS enrolled. The same
+/// for the candidates: [`cluster_ca_candidates`] always ends at the literal
+/// `/etc/noo/pki/ca.crt`, so a test that asserted the platform verifier
+/// failed on every enrolled box (followup 186c), awolf included.
+fn resolve_trust_with(base_url: &str, enrolled: Option<String>, candidates: &[PathBuf]) -> Result<Trust, String> {
     let base = base_url.trim_end_matches('/');
 
     // NOO_TLS_INSECURE existed for one afternoon (PR #99) as an explicit
@@ -293,7 +297,7 @@ fn resolve_trust_with(base_url: &str, enrolled: Option<String>) -> Result<Trust,
         // error, same as rung 4: that is corruption of this box's own
         // declared anchor, and quietly verifying against something else
         // would hide it.
-        return enrolled_anchor(cluster_ca_candidates(), base);
+        return enrolled_anchor(candidates.to_vec(), base);
     }
 
     if let Some(p) = tls_ca_env() {
@@ -314,8 +318,8 @@ fn resolve_trust_with(base_url: &str, enrolled: Option<String>) -> Result<Trust,
         return Ok(Trust::EnvCa(p));
     }
 
-    for cand in cluster_ca_candidates() {
-        let Ok(pem) = std::fs::read(&cand) else { continue };
+    for cand in candidates {
+        let Ok(pem) = std::fs::read(cand) else { continue };
         Certificate::from_pem(&pem).map_err(|e| {
             format!(
                 "the cluster CA at {} is not a PEM certificate: {e}. Re-issue it \
@@ -323,7 +327,7 @@ fn resolve_trust_with(base_url: &str, enrolled: Option<String>) -> Result<Trust,
                 cand.display()
             )
         })?;
-        return Ok(Trust::ClusterCa(cand));
+        return Ok(Trust::ClusterCa(cand.clone()));
     }
 
     Ok(Trust::Platform)
@@ -1606,6 +1610,46 @@ mod posture_route_tests {
 
 #[cfg(test)]
 mod trust_tests {
+    /// This box's cluster-CA candidates minus the literal node path: the
+    /// per-test `$NOO_PKI_DIR` (set by `clean_env`) only. Through these,
+    /// "nothing on disk" is true on an enrolled box too (followup 186c).
+    fn test_candidates() -> Vec<PathBuf> {
+        vec![crate::pki::pki_dir().join("ca.crt")]
+    }
+
+    /// `resolve_trust` with no enrollment record and [`test_candidates`].
+    fn rt(base_url: &str) -> Result<Trust, String> {
+        super::resolve_trust_with(base_url, None, &test_candidates())
+    }
+
+    /// The shipped resolver looks where a node keeps its CA: the node lane
+    /// is the literal `/etc/noo/pki/ca.crt`, after this box's own PKI dir.
+    #[test]
+    fn the_node_ca_stays_a_candidate_of_the_shipped_resolver() {
+        let c = super::cluster_ca_candidates();
+        assert_eq!(c.first(), Some(&crate::pki::pki_dir().join("ca.crt")));
+        assert!(c.contains(&PathBuf::from("/etc/noo/pki/ca.crt")), "{c:?}");
+        let src = include_str!("http.rs");
+        let outer = &src[src.find("pub fn resolve_trust(").unwrap()..];
+        let outer = &outer[..outer.find("\n\u{7d}\n").unwrap()];
+        assert!(outer.contains("resolve_trust_with(base_url, enrolled, &cluster_ca_candidates())"),
+            "resolve_trust passes the real candidates: {outer}");
+    }
+
+    /// A CA planted in a later candidate (where a node's sits) resolves as
+    /// the cluster CA; an unreadable earlier one is skipped.
+    #[test]
+    fn a_ca_in_a_later_candidate_is_the_cluster_ca() {
+        let _g = env_lock();
+        let d = clean_env("later-candidate");
+        let node = d.join("node-pki");
+        std::fs::create_dir_all(&node).unwrap();
+        let ca = node.join("ca.crt");
+        std::fs::write(&ca, a_real_ca_pem()).unwrap();
+        let got = super::resolve_trust_with("https://gw.example:8080", None, &[d.join("ca.crt"), ca.clone()]).unwrap();
+        assert_eq!(got, Trust::ClusterCa(ca));
+        assert_eq!(super::resolve_trust_with("https://gw.example:8080", None, &[d.join("ca.crt")]).unwrap(), Trust::Platform);
+    }
     use super::*;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -1672,7 +1716,7 @@ mod trust_tests {
         std::fs::write(&ca, a_real_ca_pem()).unwrap();
         let url = "https://controller.example:8080";
 
-        let got = resolve_trust_with(url, Some(url.to_string())).unwrap();
+        let got = resolve_trust_with(url, Some(url.to_string()), &test_candidates()).unwrap();
         assert_eq!(got, Trust::EnrolledCa(ca), "enrolled must verify against its own CA file");
     }
 
@@ -1691,7 +1735,7 @@ mod trust_tests {
         std::env::set_var("NOO_TLS_CA", &stale);
         let url = "https://controller.example:8080";
 
-        let got = resolve_trust_with(url, Some(url.to_string()));
+        let got = resolve_trust_with(url, Some(url.to_string()), &test_candidates());
         std::env::remove_var("NOO_TLS_CA");
         assert_eq!(
             got.unwrap(),
@@ -1710,7 +1754,7 @@ mod trust_tests {
         let ca = d.join("ca.crt");
         std::fs::write(&ca, a_real_ca_pem()).unwrap();
 
-        let got = resolve_trust_with("https://somewhere.else:8080", Some("https://controller.example:8080".into()))
+        let got = resolve_trust_with("https://somewhere.else:8080", Some("https://controller.example:8080".into()), &test_candidates())
             .unwrap();
         assert_eq!(got, Trust::ClusterCa(ca), "a non-enrolled URL uses rung 4, not the enrolled rung");
     }
@@ -1777,7 +1821,7 @@ mod trust_tests {
             "http://127.0.0.53:9090/",
             "http://[::1]:8080",
         ] {
-            let err = resolve_trust(bad).expect_err("{bad} must be refused");
+            let err = rt(bad).expect_err("{bad} must be refused");
             assert!(err.contains("TLS is required") && err.contains("this machine's included"), "{bad}: {err}");
         }
     }
@@ -1796,7 +1840,7 @@ mod trust_tests {
             // Not loopback however friendly it looks.
             "http://localhost.evil.example.com:8080",
         ] {
-            let err = resolve_trust(bad).expect_err("{bad} must be refused");
+            let err = rt(bad).expect_err("{bad} must be refused");
             assert!(err.contains("TLS is required"), "unhelpful error for {bad}: {err}");
         }
     }
@@ -1810,14 +1854,14 @@ mod trust_tests {
 
         let missing = d.join("nope.crt");
         std::env::set_var("NOO_TLS_CA", &missing);
-        let err = resolve_trust("https://gw.example:8080").expect_err("missing CA must fail");
+        let err = rt("https://gw.example:8080").expect_err("missing CA must fail");
         assert!(err.contains(&missing.display().to_string()), "error must name the path: {err}");
         assert!(err.contains("will not fall back"), "error must say it is fail-closed: {err}");
 
         let garbage = d.join("garbage.crt");
         std::fs::write(&garbage, b"this is not a certificate\n").unwrap();
         std::env::set_var("NOO_TLS_CA", &garbage);
-        let err = resolve_trust("https://gw.example:8080").expect_err("garbage CA must fail");
+        let err = rt("https://gw.example:8080").expect_err("garbage CA must fail");
         assert!(err.contains(&garbage.display().to_string()), "error must name the path: {err}");
         assert!(err.contains("not a PEM certificate"), "error must say why: {err}");
 
@@ -1833,7 +1877,7 @@ mod trust_tests {
         std::fs::write(&env_ca, &pem).unwrap();
         std::fs::write(d.join("ca.crt"), &pem).unwrap();
         std::env::set_var("NOO_TLS_CA", &env_ca);
-        assert_eq!(resolve_trust("https://gw.example:8080").unwrap(), Trust::EnvCa(env_ca));
+        assert_eq!(rt("https://gw.example:8080").unwrap(), Trust::EnvCa(env_ca));
         std::env::remove_var("NOO_TLS_CA");
     }
 
@@ -1845,7 +1889,7 @@ mod trust_tests {
         let d = clean_env("pkica");
         let ca = d.join("ca.crt");
         std::fs::write(&ca, a_real_ca_pem()).unwrap();
-        assert_eq!(resolve_trust("https://gw.example:8080").unwrap(), Trust::ClusterCa(ca));
+        assert_eq!(rt("https://gw.example:8080").unwrap(), Trust::ClusterCa(ca));
     }
 
     /// A readable ca.crt that is not a certificate is corruption, not a
@@ -1855,7 +1899,7 @@ mod trust_tests {
         let _g = env_lock();
         let d = clean_env("corruptca");
         std::fs::write(d.join("ca.crt"), b"-----BEGIN CERTIFICATE-----\nnope\n").unwrap();
-        let err = resolve_trust("https://gw.example:8080").expect_err("corrupt CA must fail");
+        let err = rt("https://gw.example:8080").expect_err("corrupt CA must fail");
         assert!(err.contains("ca.crt"), "error must name the file: {err}");
     }
 
@@ -1864,7 +1908,7 @@ mod trust_tests {
     fn last_resort_is_the_platform_verifier() {
         let _g = env_lock();
         clean_env("platform");
-        assert_eq!(resolve_trust("https://gw.example:8080").unwrap(), Trust::Platform);
+        assert_eq!(rt("https://gw.example:8080").unwrap(), Trust::Platform);
     }
 
     #[test]
@@ -1907,10 +1951,10 @@ mod trust_tests {
         let _g = env_lock();
         clean_env("no-escape");
         // Baseline: without the variable this URL resolves fine.
-        assert_eq!(resolve_trust("https://gw.example:8080").unwrap(), Trust::Platform);
+        assert_eq!(rt("https://gw.example:8080").unwrap(), Trust::Platform);
         for v in ["1", "true", "yes"] {
             std::env::set_var("NOO_TLS_INSECURE", v);
-            let err = resolve_trust("https://gw.example:8080")
+            let err = rt("https://gw.example:8080")
                 .expect_err("NOO_TLS_INSECURE must be refused, not honoured");
             assert!(err.contains("no unverified-TLS lane"), "{v}: {err}");
             assert!(err.contains("NOO_TLS_CA"), "the error must say how to fix it: {err}");
@@ -1920,7 +1964,7 @@ mod trust_tests {
         for v in ["0", "", "  "] {
             std::env::set_var("NOO_TLS_INSECURE", v);
             assert!(
-                resolve_trust("https://gw.example:8080").is_ok(),
+                rt("https://gw.example:8080").is_ok(),
                 "NOO_TLS_INSECURE={v:?} means 'not asking for it' and must not refuse"
             );
         }
@@ -1941,33 +1985,33 @@ mod trust_tests {
         let remote = "https://noo-controller.example.ts.net:8080";
 
         // No CA anywhere: WebPKI, never "verify nothing".
-        assert_eq!(resolve_trust(remote).unwrap(), Trust::Platform);
+        assert_eq!(rt(remote).unwrap(), Trust::Platform);
 
         // A pinned CA outranks the platform verifier.
         let ca = dir.join("ca.crt");
         std::fs::write(&ca, a_real_ca_pem()).unwrap();
-        assert_eq!(resolve_trust(remote).unwrap(), Trust::ClusterCa(ca.clone()));
+        assert_eq!(rt(remote).unwrap(), Trust::ClusterCa(ca.clone()));
 
         // A CA that does not parse is refused rather than ignored — and it
         // is refused with the opt-in set, too, which is #99's own case.
         let bad = tmpdir("no-downgrade-bad").join("ca.crt");
         std::fs::write(&bad, "not a certificate").unwrap();
         std::env::set_var("NOO_TLS_CA", &bad);
-        assert!(resolve_trust(remote).is_err(), "an unparseable $NOO_TLS_CA is refused");
+        assert!(rt(remote).is_err(), "an unparseable $NOO_TLS_CA is refused");
         std::env::set_var("NOO_TLS_INSECURE", "1");
-        assert!(resolve_trust(remote).is_err(), "and the refusal survives the retired opt-in");
+        assert!(rt(remote).is_err(), "and the refusal survives the retired opt-in");
         std::env::remove_var("NOO_TLS_INSECURE");
         std::env::remove_var("NOO_TLS_CA");
 
         // An https loopback gateway with no CA does NOT disable verification.
         let empty = clean_env("no-downgrade-loopback");
         let _ = empty;
-        assert_eq!(resolve_trust("https://localhost:8080").unwrap(), Trust::Platform);
-        assert_eq!(resolve_trust("https://127.0.0.1:9080").unwrap(), Trust::Platform);
-        assert_eq!(resolve_trust("https://[::1]:8080").unwrap(), Trust::Platform);
+        assert_eq!(rt("https://localhost:8080").unwrap(), Trust::Platform);
+        assert_eq!(rt("https://127.0.0.1:9080").unwrap(), Trust::Platform);
+        assert_eq!(rt("https://[::1]:8080").unwrap(), Trust::Platform);
 
         // A remote cleartext gateway is refused; #99 allowed it as `Plain`.
-        assert!(resolve_trust("http://noo-controller.example.ts.net:8080").is_err());
+        assert!(rt("http://noo-controller.example.ts.net:8080").is_err());
     }
 }
 
