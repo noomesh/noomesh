@@ -289,11 +289,15 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // (i458: a check only; nothing is created here).
         let root = crate::envfile::repo_root();
         let storage = (stack || root.join(".env").is_file()).then(|| {
-            let dirs = storage_dirs_seen(&root);
             // The running CLI's compiled list is the roll's list unless an
-            // upgrade is pending (KeepNewer: this CLI does the roll).
+            // upgrade is pending (KeepNewer: this CLI does the roll). Then
+            // the target's own lists come from its signed stack lock (i467),
+            // and only when that cannot be read does this CLI's list stand in.
             let list_target = if action == CliAction::KeepNewer { current.as_str() } else { version.as_str() };
-            storage_check_report(dirs.as_deref(), &current, list_target)
+            let tag = norm_stack_tag(tag_override.as_deref().unwrap_or(list_target));
+            let (lists, from, source, caveat) = storage_list_choice(&current, list_target, || target_storage_lists(g, &tag));
+            let dirs = storage_dirs_seen(&root, lists.as_ref());
+            storage_check_report(dirs.as_deref(), &from, source, list_target, caveat)
         });
         if g.json {
             let mut o = serde_json::json!({
@@ -2182,9 +2186,6 @@ fn reconcile_storage_dirs(g: &Globals, root: &std::path::Path) {
     }
 }
 
-/// The storage directories this binary's release expects (onboarding's
-/// `onboard::STORAGE_SUBDIRS` floor, placed by `storage_targets_in`) that do not
-/// exist yet.
 /// Every storage directory this binary's release expects, placed under the
 /// data and state roots (onboarding's own `storage_targets_in`).
 pub(crate) fn storage_dir_targets(data: &std::path::Path, state: &std::path::Path, pg_data: &str) -> Vec<(String, std::path::PathBuf)> {
@@ -2196,6 +2197,14 @@ pub(crate) fn storage_dir_targets(data: &std::path::Path, state: &std::path::Pat
 /// (`NOO_DATA_ROOT`, `NOO_STATE_ROOT`, `NOO_PG_DATA`). `None` when
 /// `NOO_DATA_ROOT` is unset.
 pub(crate) fn storage_dir_targets_in_env(root: &std::path::Path) -> Option<Vec<(String, std::path::PathBuf)>> {
+    storage_dir_targets_in_env_with(root, None)
+}
+
+/// A release's (storage, state) directory lists, as its signed lock states them.
+pub(crate) type StorageLists = (Vec<String>, Vec<String>);
+
+/// [`storage_dir_targets_in_env`] for another release's `lists` (`None`: this build's).
+fn storage_dir_targets_in_env_with(root: &std::path::Path, lists: Option<&StorageLists>) -> Option<Vec<(String, std::path::PathBuf)>> {
     let env = root.join(".env");
     let read = |k: &str| crate::onboard::env::read_env_key(&env, k);
     let data = read("NOO_DATA_ROOT");
@@ -2204,27 +2213,101 @@ pub(crate) fn storage_dir_targets_in_env(root: &std::path::Path) -> Option<Vec<(
         return None;
     }
     let state = crate::commands::data_root::state_root_of(Some(read("NOO_STATE_ROOT").as_str()), data);
-    Some(storage_dir_targets(std::path::Path::new(data), std::path::Path::new(&state), &read("NOO_PG_DATA")))
+    let (data, state, pg) = (std::path::Path::new(data), std::path::Path::new(&state), read("NOO_PG_DATA"));
+    Some(match lists {
+        None => storage_dir_targets(data, state, &pg),
+        Some((names, state_names)) => crate::onboard::steps::storage_targets_with(names, state_names, data, state, &pg),
+    })
+}
+
+/// The storage and state directory lists a stack lock carries
+/// (`# storage-subdirs a,b,...` and `# state-subdirs ...`, written by the
+/// release lane from `onboard/storage-dirs.lock-lines` before signing).
+/// `Ok(None)`: the lock carries neither line (a release before i467). `Err`:
+/// only one of them, two that disagree, or a name that is not a relative
+/// directory under the root. Signed bytes that cannot be read are never
+/// guessed around.
+pub(crate) fn lock_storage_lists(text: &str) -> Result<Option<StorageLists>, String> {
+    let one = |key: &str| -> Result<Option<Vec<String>>, String> {
+        let found: Vec<&str> = text.lines().filter_map(|l| l.trim().strip_prefix(key)).map(str::trim).collect();
+        let Some(first) = found.first() else { return Ok(None) };
+        if found.iter().any(|f| f != first) {
+            return Err(format!("the lock carries two different `{}` lines", key.trim()));
+        }
+        let names: Vec<String> = first.split(',').map(|n| n.trim().to_string()).collect();
+        for n in &names {
+            let ok = !n.is_empty() && !n.starts_with('/')
+                && n.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != ".."
+                    && seg.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_'));
+            if !ok {
+                return Err(format!("the lock's `{}` names {n:?}, not a directory under the data root", key.trim()));
+            }
+        }
+        Ok(Some(names))
+    };
+    match (one("# storage-subdirs ")?, one("# state-subdirs ")?) {
+        (None, None) => Ok(None),
+        (Some(st), Some(sa)) => match sa.iter().find(|n| !st.contains(n)) {
+            Some(n) => Err(format!("the lock's state list names {n:?}, which its storage list does not")),
+            None => Ok(Some((st, sa))),
+        },
+        _ => Err("the lock carries one of `# storage-subdirs` / `# state-subdirs` without the other".into()),
+    }
+}
+
+/// Which list `--check` holds this box to: this CLI's when it is the target
+/// (no fetch), else the target's from its lock (`fetch`), else this CLI's
+/// with the caveat naming why. Returns (lists, list_from, source, caveat).
+pub(crate) fn storage_list_choice(
+    current: &str,
+    target: &str,
+    fetch: impl FnOnce() -> Result<StorageLists, String>,
+) -> (Option<StorageLists>, String, &'static str, Option<String>) {
+    if target == current {
+        return (None, current.to_string(), "cli", None);
+    }
+    match fetch() {
+        Ok(l) => (Some(l), format!("the {target} stack lock"), "lock", None),
+        Err(why) => (None, current.to_string(), "cli", Some(format!(
+            "checked against noo {current}'s list ({why}); {target} may add directories: \
+             run `noo upgrade` first, then `noo upgrade --all --check` to check its list"))),
+    }
+}
+
+/// The target release's lists from its signed stack lock (fetched and
+/// verified exactly as the roll does), or why they cannot be had.
+fn target_storage_lists(g: &Globals, tag: &str) -> Result<StorageLists, String> {
+    match try_stack_lock(g, tag) {
+        Ok(Some(text)) => match lock_storage_lists(&text) {
+            Ok(Some(l)) => Ok(l),
+            Ok(None) => Err(format!("stack-{tag}.lock carries no storage list")),
+            Err(e) => Err(format!("stack-{tag}.lock: {e}")),
+        },
+        Ok(None) => Err(format!("stack-{tag} publishes no signed lock")),
+        Err((_, msg, _)) => Err(msg),
+    }
 }
 
 /// Each of this release's storage directories for the install at `root`
 /// and whether it is there (`None`: no `NOO_DATA_ROOT` in its `.env`).
 /// Reads only; never creates.
-fn storage_dirs_seen(root: &std::path::Path) -> Option<Vec<(String, std::path::PathBuf, crate::commands::cluster_verify::DirSeen)>> {
-    storage_dir_targets_in_env(root).map(|t| t.into_iter().map(|(n, p)| {
+fn storage_dirs_seen(root: &std::path::Path, lists: Option<&StorageLists>) -> Option<Vec<(String, std::path::PathBuf, crate::commands::cluster_verify::DirSeen)>> {
+    storage_dir_targets_in_env_with(root, lists).map(|t| t.into_iter().map(|(n, p)| {
         let seen = crate::commands::cluster_verify::dir_seen(&p);
         (n, p, seen)
     }).collect())
 }
 
 /// The `--check` storage row: verify's `data directories` judgement, its
-/// `--json` object, and, when the list checked (`list_from`, the running
-/// CLI's) is not the release that will do the roll (`target`), the caveat
-/// that says so.
+/// `--json` object, and the caveat (`caveat`, when the list checked is not
+/// the target release's own). `list_from` names the list: this CLI's version
+/// (`source` "cli") or the target's signed lock (`source` "lock").
 pub(crate) fn storage_check_report(
     dirs: Option<&[(String, std::path::PathBuf, crate::commands::cluster_verify::DirSeen)]>,
     list_from: &str,
+    source: &str,
     target: &str,
+    caveat: Option<String>,
 ) -> (serde_json::Value, crate::commands::cluster_verify::Check, Option<String>) {
     use crate::commands::cluster_verify::{storage_dirs_check, DirSeen, Verdict};
     let c = storage_dirs_check(dirs);
@@ -2233,11 +2316,9 @@ pub(crate) fn storage_check_report(
     };
     let missing = paths(|s| *s == DirSeen::Missing);
     let unchecked = paths(|s| matches!(s, DirSeen::Unchecked(_)));
-    let caveat = (list_from != target).then(|| format!(
-        "checked against noo {list_from}'s list; {target} may add directories: \
-         run `noo upgrade` first, then `noo upgrade --all --check` to check its list"));
     let j = serde_json::json!({
         "list_from": list_from,
+        "list_source": source,
         "target": target,
         "checked": dirs.is_some(),
         "verdict": if c.verdict == Verdict::Ok { "ok" } else { "warn" },
@@ -6619,8 +6700,8 @@ mod storage_dir_tests {
     fn check_names_a_missing_dir_with_the_remedy_and_creates_nothing() {
         let data = root_without("check", STORAGE_SUBDIRS, &["tempo"]);
         let root = install_at("check", &data);
-        let dirs = super::storage_dirs_seen(&root);
-        let (j, c, caveat) = super::storage_check_report(dirs.as_deref(), "0.6.17", "0.6.17");
+        let dirs = super::storage_dirs_seen(&root, None);
+        let (j, c, caveat) = super::storage_check_report(dirs.as_deref(), "0.6.17", "cli", "0.6.17", None);
         assert_eq!(c.verdict, crate::commands::cluster_verify::Verdict::Warn, "{}", c.detail);
         assert_eq!(j["verdict"], "warn");
         assert_eq!(j["checked"], true);
@@ -6629,25 +6710,95 @@ mod storage_dir_tests {
         assert_eq!(caveat, None, "the running CLI's list is the roll's");
         assert!(!data.join("tempo").exists(), "--check must never create a directory");
         std::fs::create_dir_all(data.join("tempo")).unwrap();
-        let (j, _, _) = super::storage_check_report(super::storage_dirs_seen(&root).as_deref(), "0.6.17", "0.6.17");
+        let (j, _, _) = super::storage_check_report(super::storage_dirs_seen(&root, None).as_deref(), "0.6.17", "cli", "0.6.17", None);
         assert_eq!(j["verdict"], "ok");
         assert_eq!(j["missing"], serde_json::json!([]));
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// With an upgrade pending, the list checked is this CLI's, not the
-    /// target's, and both the row and the JSON say so.
+    /// With an upgrade pending and no readable list in the target's lock, the
+    /// list checked is this CLI's, and the caveat says so and why.
     #[test]
-    fn a_pending_upgrade_says_whose_list_was_checked() {
-        let data = root_without("pending", STORAGE_SUBDIRS, &[]);
-        let root = install_at("pending", &data);
-        let (j, _, caveat) = super::storage_check_report(super::storage_dirs_seen(&root).as_deref(), "0.6.17", "0.6.18");
-        assert_eq!((j["list_from"].as_str(), j["target"].as_str()), (Some("0.6.17"), Some("0.6.18")));
+    fn a_pending_upgrade_without_a_lock_list_says_whose_list_was_checked() {
+        let (lists, from, source, caveat) = super::storage_list_choice("0.6.17", "0.6.18",
+            || Err("stack-v0.6.18.lock carries no storage list".into()));
+        assert_eq!((lists, from.as_str(), source), (None, "0.6.17", "cli"));
         let caveat = caveat.expect("a caveat when the lists differ");
-        assert!(caveat.contains("noo 0.6.17's list") && caveat.contains("noo upgrade --all --check"), "{caveat}");
+        for want in ["noo 0.6.17's list", "carries no storage list", "noo upgrade --all --check"] {
+            assert!(caveat.contains(want), "{want}: {caveat}");
+        }
+        let (_, _, _, none) = super::storage_list_choice("0.6.17", "0.6.17", || panic!("no fetch when this CLI is the target"));
+        assert_eq!(none, None);
+    }
+
+    /// i467 "done when": from a box on CLI N, a directory only N+1 adds is
+    /// found through N+1's lock list, with the remedy, and nothing is created.
+    #[test]
+    fn a_dir_only_the_target_adds_is_found_through_its_lock_list() {
+        let data = root_without("lock", STORAGE_SUBDIRS, &[]);
+        let root = install_at("lock", &data);
+        let mut storage: Vec<String> = STORAGE_SUBDIRS.iter().map(|s| s.to_string()).collect();
+        storage.push("newdir".into());
+        let state: Vec<String> = STATE_SUBDIRS.iter().map(|s| s.to_string()).collect();
+        let (lists, from, source, caveat) = super::storage_list_choice("0.6.17", "0.6.18", || Ok((storage, state)));
+        assert_eq!((source, caveat), ("lock", None));
+        let (j, _, _) = super::storage_check_report(super::storage_dirs_seen(&root, lists.as_ref()).as_deref(), &from, source, "0.6.18", None);
+        assert_eq!(j["list_source"], "lock");
+        assert_eq!(j["missing"], serde_json::json!([data.join("newdir").display().to_string()]));
+        assert_eq!(j["remedy"], "noo onboard --only storage");
+        assert!(!data.join("newdir").exists(), "--check must never create a directory");
+        // This CLI's own list finds nothing missing on the same box.
+        let (j, _, _) = super::storage_check_report(super::storage_dirs_seen(&root, None).as_deref(), "0.6.17", "cli", "0.6.17", None);
+        assert_eq!(j["verdict"], "ok");
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The lock's lines read back as this build's lists; a lock before i467
+    /// has none; anything else unreadable is an error, never a guess.
+    #[test]
+    fn lock_storage_lists_reads_only_well_formed_pairs() {
+        let compiled = (STORAGE_SUBDIRS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                        STATE_SUBDIRS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let lock = format!("# stack v0.6.18\n{}x@sha256:00\n", crate::onboard::storage_lock_lines());
+        assert_eq!(super::lock_storage_lists(&lock), Ok(Some(compiled)));
+        assert_eq!(super::lock_storage_lists("# stack v0.6.16\nx@sha256:00\n"), Ok(None));
+        for bad in [
+            "# storage-subdirs a,b\n",
+            "# storage-subdirs a,b\n# state-subdirs a\n# storage-subdirs a\n",
+            "# storage-subdirs a,../etc\n# state-subdirs a\n",
+            "# storage-subdirs a,/etc\n# state-subdirs a\n",
+            "# storage-subdirs a,,b\n# state-subdirs a\n",
+            "# storage-subdirs a\n# state-subdirs b\n",
+        ] {
+            assert!(super::lock_storage_lists(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// The lines are inside the signed bytes: a lock carrying them signs and
+    /// verifies through the roll's own fetch-and-verify, and a lock whose
+    /// storage line was altered after signing is refused.
+    #[test]
+    fn the_storage_lines_are_covered_by_the_lock_signature() {
+        let key = crate::release_sig::signing_key_from_seed_hex(&"11".repeat(32)).unwrap();
+        let pk = crate::release_sig::pubkey_hex(&key);
+        let lock = format!("# stack v0.6.18\n# mesh-migration-head 100_x\n{}gateway@sha256:{}\n",
+            crate::onboard::storage_lock_lines(), "ab".repeat(32));
+        let sig = crate::release_sig::sign(&key, lock.as_bytes());
+        let verify = |d: &[u8], s: &str| crate::release_sig::verify_with_keys(d, s, &[pk.as_str()]);
+        let serve = |body: String| {
+            let sig = sig.clone();
+            move |_: &str, name: &str| -> Result<Vec<u8>, crate::release_fetch::FetchError> {
+                Ok(if name.ends_with(".sig") { sig.clone().into_bytes() } else { body.clone().into_bytes() })
+            }
+        };
+        let text = super::stack_lock_with("v0.6.18", &mut serve(lock.clone()), &verify).unwrap().expect("a lock");
+        assert!(super::lock_storage_lists(&text).unwrap().is_some());
+        let tampered = lock.replacen(",tempo,", ",tempo,extra,", 1);
+        assert_ne!(tampered, lock, "the tamper applied");
+        let e = super::stack_lock_with("v0.6.18", &mut serve(tampered), &verify).unwrap_err();
+        assert_eq!(e.0, "stack_lock_invalid", "{}", e.1);
     }
 
     /// No NOO_DATA_ROOT: "not checked", never OK.
@@ -6655,7 +6806,7 @@ mod storage_dir_tests {
     fn check_without_a_data_root_is_not_checked() {
         let root = std::env::temp_dir().join(format!("noo-check-noenv-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let (j, _, _) = super::storage_check_report(super::storage_dirs_seen(&root).as_deref(), "0.6.17", "0.6.17");
+        let (j, _, _) = super::storage_check_report(super::storage_dirs_seen(&root, None).as_deref(), "0.6.17", "cli", "0.6.17", None);
         assert_eq!((j["checked"].as_bool(), j["verdict"].as_str()), (Some(false), Some("warn")));
         let _ = std::fs::remove_dir_all(&root);
     }

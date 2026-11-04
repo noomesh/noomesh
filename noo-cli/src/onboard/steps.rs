@@ -4163,6 +4163,13 @@ fn storage_targets(ctx: &Ctx, root: &Path) -> Vec<(String, PathBuf)> {
 /// which creates a directory a NEW release added before its launcher's
 /// bind check runs (0.6.16: `tempo`, refused on every moved controller).
 pub(crate) fn storage_targets_in(names: &[String], root: &Path, state: &Path, pg_data: &str) -> Vec<(String, PathBuf)> {
+    let state_names: Vec<String> = STATE_SUBDIRS.iter().map(|s| s.to_string()).collect();
+    storage_targets_with(names, &state_names, root, state, pg_data)
+}
+
+/// [`storage_targets_in`] with the state set given (`noo upgrade --check`
+/// places a TARGET release's lists, read from its signed lock).
+pub(crate) fn storage_targets_with(names: &[String], state_names: &[String], root: &Path, state: &Path, pg_data: &str) -> Vec<(String, PathBuf)> {
     let trim = |p: &Path| p.to_string_lossy().trim_end_matches('/').to_string();
     let separated = trim(state) != trim(root);
     let pg = pg_data.trim_end_matches('/');
@@ -4173,17 +4180,17 @@ pub(crate) fn storage_targets_in(names: &[String], root: &Path, state: &Path, pg
         if name == "postgres" && pg_off(root) {
             continue;
         }
-        if separated && STATE_SUBDIRS.contains(&name.as_str()) {
+        if separated && state_names.contains(name) {
             continue;
         }
         out.push((name.clone(), root.join(name)));
     }
     if separated {
-        for name in STATE_SUBDIRS {
-            if *name == "postgres" && pg_off(state) {
+        for name in state_names {
+            if name == "postgres" && pg_off(state) {
                 continue;
             }
-            out.push((name.to_string(), state.join(name)));
+            out.push((name.clone(), state.join(name)));
         }
     }
     out
