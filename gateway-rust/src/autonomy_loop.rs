@@ -397,6 +397,16 @@ pub(crate) fn gate_of(name: &str, config: &serde_json::Value) -> Option<(bool, b
 ///      without touching config files)
 /// Config entries with non-builtin names are custom locations owned by
 /// other machinery and are not returned here.
+/// Every location held off: what an unreadable override table means. The
+/// operator's toggles cannot be read, so none of the defaults may act on
+/// their behalf (an override may have disabled or disarmed any of them).
+fn hold_all(mut locs: Vec<LocationDef>) -> Vec<LocationDef> {
+    for l in &mut locs {
+        l.enabled = false;
+    }
+    locs
+}
+
 pub(crate) async fn load_locations(state: &AppState) -> Vec<LocationDef> {
     let mut locs = default_locations();
 
@@ -429,15 +439,26 @@ pub(crate) async fn load_locations(state: &AppState) -> Vec<LocationDef> {
     }
 
     // Layer 3: DB overrides. Tolerate a missing table (pre-migration
-    // startup ordering) — the loop must never die on this query.
+    // startup ordering) — the loop must never die on this query. But ONLY a
+    // missing table is "no overrides": any other error used to drop the
+    // operator's runtime toggles, so a location they disabled or disarmed ran
+    // again on the YAML/builtin defaults (#650 sweep). Then nothing runs this
+    // tick and the node reclaim policy reads disabled, until the read works.
     let rows: Vec<(String, Option<bool>, Option<i32>, Option<serde_json::Value>)> =
-        sqlx::query_as(
+        match sqlx::query_as(
             "SELECT name, enabled, check_interval_seconds, config \
              FROM noo_autonomy_overrides",
         )
         .fetch_all(&state.db)
         .await
-        .unwrap_or_default();
+        {
+            Ok(rows) => rows,
+            Err(e) if crate::repo::missing_table(&e) => Vec::new(),
+            Err(e) => {
+                tracing::warn!(error = %e, "autonomy_overrides_unreadable: every location held off this tick");
+                return hold_all(locs);
+            }
+        };
     for (name, enabled, interval, config) in rows {
         if let Some(builtin) = locs.iter_mut().find(|l| l.name == name) {
             if let Some(e) = enabled {
@@ -468,12 +489,22 @@ pub(crate) async fn load_custom_locations(
     let builtin_names: std::collections::HashSet<String> =
         default_locations().into_iter().map(|l| l.name).collect();
 
-    let rows: Vec<(String, serde_json::Value, bool)> = sqlx::query_as(
+    // Only a missing table is "no DB locations". Any other error used to
+    // empty `seen`, so a YAML-seed location the DB had disabled ran again
+    // (#650 sweep): no custom location runs this tick instead.
+    let rows: Vec<(String, serde_json::Value, bool)> = match sqlx::query_as(
         "SELECT name, definition, enabled FROM noo_autonomy_locations",
     )
     .fetch_all(&state.db)
     .await
-    .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        Err(e) if crate::repo::missing_table(&e) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(error = %e, "autonomy_locations_unreadable: no custom location runs this tick");
+            return Vec::new();
+        }
+    };
     for (name, definition, enabled) in rows {
         seen.insert(name.clone());
         if !enabled || builtin_names.contains(&name) {
@@ -724,5 +755,23 @@ mod gate_tests {
         let mut listed: Vec<String> = super::GATE_CAPABLE.iter().map(|s| s.to_string()).collect();
         listed.sort();
         assert_eq!(with_config, listed, "GATE_CAPABLE drifted from the dispatch");
+    }
+}
+
+/// #650 sweep: an unreadable override table holds every location off (an
+/// override may have disabled or disarmed any of them), and only a missing
+/// table reads as "no overrides".
+#[cfg(test)]
+mod unreadable_override_tests {
+    use super::*;
+
+    #[test]
+    fn an_unreadable_override_table_holds_every_location_off() {
+        let held = hold_all(default_locations());
+        assert!(!held.is_empty());
+        let still: Vec<&str> = held.iter().filter(|l| l.enabled).map(|l| l.name.as_str()).collect();
+        assert!(still.is_empty(), "{still:?}");
+        assert!(!crate::repo::missing_table(&sqlx::Error::PoolTimedOut), "an outage is not a missing table");
+        assert!(!crate::repo::missing_table(&sqlx::Error::RowNotFound));
     }
 }

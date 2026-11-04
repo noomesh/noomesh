@@ -1304,11 +1304,14 @@ pub async fn eval_missing_graph_entities(state: &AppState) -> Result<bool, Strin
         .map_err(|e| format!("page count query failed: {e}"))?;
 
     // `entities` may not exist yet (Trellion graph migration applied
-    // separately). Defensive: if the query fails, treat entities=0.
-    let entities: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entities")
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or(0);
+    // separately): only THAT is entities=0. Any other failure used to read as
+    // 0 too, so every page looked like a gap and an extraction was queued for
+    // nothing (#650 sweep).
+    let entities: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM entities").fetch_one(&state.db).await {
+        Ok(n) => n,
+        Err(e) if crate::repo::missing_table(&e) => 0,
+        Err(e) => return Err(format!("entity count query failed: {e}")),
+    };
 
     let gap = (pages - entities).max(0);
     let should_fire = gap > THRESHOLD;

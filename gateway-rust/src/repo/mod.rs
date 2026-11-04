@@ -94,6 +94,15 @@ pub mod tasks;
 pub mod prompt_skill_proposals;
 pub mod users;
 
+/// Is this error "the table does not exist" (Postgres 42P01)? The ONE error a
+/// reader may answer as "nothing there": on a box that has not migrated yet,
+/// the table is genuinely absent. Every other failure (the database down, a
+/// pool timeout, a permission error, schema drift) is not "empty" and must
+/// not read as it.
+pub fn missing_table(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("42P01"))
+}
+
 // ── The ratchet ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
