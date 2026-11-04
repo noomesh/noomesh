@@ -1741,7 +1741,7 @@ export interface paths {
         };
         /**
          * Get job
-         * @description [native] Returns details for a specific job.
+         * @description [native] Returns details for a specific job. For a completed `embed_batch` job, `?vectors=1` adds `vectors` (one float32 row per input) read from a 15-minute side key; once it has expired the answer is 410.
          */
         get: operations["get_job"];
         put?: never;
@@ -4876,7 +4876,7 @@ export interface paths {
         put?: never;
         /**
          * Mint a Tailscale pre-auth join key
-         * @description [native] Rust (routes/cluster.rs). Tailscale control-plane mint; returns bootstrap one-liner. Operator surface.
+         * @description [native] Rust (routes/cluster.rs). Tailscale control-plane mint; returns the pre-auth key. Operator surface.
          */
         post: {
             parameters: {
@@ -8627,6 +8627,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/agents/whoami": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * This session's own agent name
+         * @description The acting agent name of this session (the address other sessions use to message it), its account, the harness the credential arrived through, and whether it is privileged.
+         */
+        get: operations["agent_whoami"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agents/name": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Name this MCP session
+         * @description Give the calling MCP session a name its person chose: {"name": "general"} turns <account>/<type>-<random> into <account>/<type>-general, the address other sessions then use. The type half (the client, e.g. claude) is kept. Only a session can be renamed. A name another live session of the account already holds is shared (a name is a mailbox); shared_with counts the sessions already there. Mail already sent to the old name stays addressed to it.
+         */
+        post: operations["agent_name"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/docs/openapi": {
         parameters: {
             query?: never;
@@ -10393,6 +10433,250 @@ export interface paths {
          * @description [native] POST /api/addons/{addon_id}/ws-ticket — a single-use ticket for opening one of the add-on's WebSocket routes from a browser, which cannot send an Authorization header on a WebSocket. Send the access token as `Authorization: Bearer`; open `/ws/addons/{addon_id}/…?ticket=<ticket>` within 30 seconds. The ticket is bound to this person and this add-on and is consumed by the first handshake that presents it. The route's own `min_role` is checked at the handshake. 401 without a person's bearer, 404 when the add-on declares no WebSocket route, 503 when it is off.
          */
         post: operations["ws_ticket"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/cluster/nodes/{node_id}/tunnel-probe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get tunnel probe
+         * @description [native] GET /api/cluster/nodes/{node_id}/tunnel-probe
+         */
+        get: operations["tunnel_probe"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/node/tunnel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get tunnel
+         * @description [native] GET /api/node/tunnel: the node's upgrade. Admission: a node-actor cluster token (the auth layer put it in `ClusterNode`), on a connection whose mTLS leaf names the same node, with a certificate thumbprint to bind the hello to. Anything less is refused with the remedy. After the upgrade the node must still answer the gateway's signed challenge.
+         */
+        get: operations["upgrade"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/external/embeddings/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Embeddings job (external)
+         * @description [native] Submit a bulk embedding batch as a job. Workers claim it from a JetStream work queue (`path: pull`); when no node is pulling for the model the gateway embeds it itself (`path: push`). Poll `GET /api/external/embeddings/jobs/{job_id}?vectors=1` for the vectors, kept 15 minutes. At most 64 texts per job and the encoded result must fit the 600 KiB cap (413 names it). `space` wins over `model` when both are given; both follow the synchronous route's rules (`<space>@next` embeds with a migration's next model). Authenticated by a **service key** with the `embeddings` scope. The synchronous `POST /api/external/embeddings` is unchanged and never queues.
+         */
+        post: operations["embeddings_job_submit"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/external/embeddings/jobs/{job_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Embeddings job status (external)
+         * @description [native] One embedding job, as its submitter sees it (a job another consumer submitted is 404). With `vectors=1`, a completed job adds `vectors`: one row of float32 per input, in order. The vectors are kept 15 minutes after completion; after that the answer is 410 and the batch is resubmitted. The same job is readable at `GET /api/jobs/{job_id}` by a caller that reaches the scheduler routes.
+         */
+        get: operations["embeddings_job_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/addons/{addon}/access": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Add-on access settings
+         * @description [native] The add-on's declared features, every on/off setting, stale settings and the super admins (noomesh-internal f99). Operator or above.
+         */
+        get: operations["addon_access_get"];
+        /**
+         * Set add-on feature access
+         * @description [native] Turn one feature on, off or back to inherit for a subject (role:<tier>, team:<name>, user:<account>, key:<consumer>). Admin; a setting that covers an admin is a super admin's, and turning one off needs a reason. Audited (addon_access_set).
+         */
+        put: operations["addon_access_set"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/security/users/{username}/addon-access": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Add-on access of one account
+         * @description [native] Every declared feature of every add-on, on or off for the account, and the setting that decided it. Operator or above.
+         */
+        get: operations["security_user_addon_access"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/security/users/{username}/super-admin": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Name or remove a super admin
+         * @description [native] A super admin holds every add-on feature and alone changes settings that cover an admin. Only a super admin may call this, re-entering their own password; never an agent or door token; the last super admin cannot be removed. Audited (super_admin_set).
+         */
+        put: operations["security_user_super_admin"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/grafana-ds/tempo/{*path}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get tempo
+         * @description [native] `GET /api/grafana-ds/tempo/{*path}` — Grafana's Tempo data source (i359), through the gateway. Grafana's service leaf only. Shaped as Tempo's read API (`api/search`, `api/v2/traces/<id>`, tag values): an operator or admin gets it; a read-only account, and Grafana with no user, get nothing, since a trace names who made each request. Never the OTLP push.
+         */
+        get: operations["tempo"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/traces/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get status
+         * @description [native] Request-trace status (i359): where the gateway sends spans, and whether Tempo's query API answers `/ready` to the gateway's leaf. The `tempo` row of `noo cluster verify --controller` reads this.
+         */
+        get: operations["traces_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/traces/requests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get requests
+         * @description [native] `GET /api/traces/requests` — recent requests from `noo_request_trace`, newest first. Filters: `hours` (default 24, max 720), `route`, `model`, `node`, `actor`, `min_status`, `min_ms`, `limit` (default 100, max 1000). Each row: when, trace id (look it up in Grafana's Tempo data source), method, route template, status, duration, actor, model, backend, node, tokens, span count and sizes. Operator/Admin only.
+         */
+        get: operations["requests"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/traces/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get summary
+         * @description [native] `chat:gemma4:26b · embed:harrier` - what a node serves, for one line. A placed-but-missing model shows as such; a stopped one is omitted.
+         */
+        get: operations["summary"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/cluster/nodes/{node_id}/traces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create traces
+         * @description [native] Node span ingest: a node-agent sends the spans of the requests it served, continuing the gateway's traces, and the gateway relays them to Tempo stamped with the verified node.
+         */
+        post: operations["node_traces_ingest"];
         delete?: never;
         options?: never;
         head?: never;
@@ -12834,7 +13118,9 @@ export interface operations {
     };
     get_job: {
         parameters: {
-            query?: never;
+            query?: {
+                vectors?: "1" | "true";
+            };
             header?: never;
             path: {
                 job_id: string;
@@ -12845,6 +13131,13 @@ export interface operations {
         responses: {
             /** @description OK */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The job's vectors expired; resubmit the batch */
+            410: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -19394,7 +19687,10 @@ export interface operations {
     };
     messages_list: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Operators only: include every session's data, not just the caller's own. 403 for anyone else. */
+                all?: boolean;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -19494,7 +19790,10 @@ export interface operations {
     };
     threads_list: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Operators only: include every session's data, not just the caller's own. 403 for anyone else. */
+                all?: boolean;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -20796,6 +21095,8 @@ export interface operations {
             query?: {
                 /** @description Account to list. Defaults to the caller's own. */
                 owner?: string;
+                /** @description Operators only: include every session's data, not just the caller's own. 403 for anyone else. */
+                all?: boolean;
             };
             header?: never;
             path?: never;
@@ -20826,6 +21127,70 @@ export interface operations {
             };
             /** @description The caller may not list that account's presence. */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    agent_whoami: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        name?: string | null;
+                        account?: string | null;
+                        harness?: string;
+                        privileged?: boolean;
+                    };
+                };
+            };
+        };
+    };
+    agent_name: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description The session half of the new name: 1-64 of A-Z a-z 0-9 _ -. */
+                    name: string;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        name?: string;
+                        account?: string;
+                        previous?: string;
+                        shared_with?: number;
+                    };
+                };
+            };
+            /** @description Not an MCP session, or an invalid name. */
+            400: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -23981,6 +24346,502 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    tunnel_probe: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    upgrade: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    embeddings_job_submit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    input: string | string[];
+                    /** @description Embedding space; the default space when absent. */
+                    space?: string;
+                    /** @description Alias as on the synchronous route; used when `space` is absent. */
+                    model?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        job_id?: string;
+                        /** @enum {string} */
+                        path?: "pull" | "push";
+                        model?: string;
+                    };
+                };
+            };
+            /** @description Bad input, or an unknown embedding space */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error?: {
+                            message?: string;
+                            type?: string;
+                            ref?: string;
+                        };
+                    };
+                };
+            };
+            /** @description The service key lacks the `embeddings` scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error?: {
+                            message?: string;
+                            type?: string;
+                            ref?: string;
+                        };
+                    };
+                };
+            };
+            /** @description `<space>@next` without a migration, or a migration that has not started */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error?: {
+                            message?: string;
+                            type?: string;
+                            ref?: string;
+                        };
+                    };
+                };
+            };
+            /** @description Over the batch cap; the message names the cap */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error?: {
+                            message?: string;
+                            type?: string;
+                            ref?: string;
+                        };
+                    };
+                };
+            };
+            /** @description The model's work queue is full; `Retry-After` says when to retry */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error?: {
+                            message?: string;
+                            type?: string;
+                            ref?: string;
+                        };
+                    };
+                };
+            };
+            /** @description No node serves the model, or the job store is down */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error?: {
+                            message?: string;
+                            type?: string;
+                            ref?: string;
+                        };
+                    };
+                };
+            };
+        };
+    };
+    embeddings_job_status: {
+        parameters: {
+            query?: {
+                vectors?: "1" | "true";
+            };
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        job_id?: string;
+                        /** @enum {string} */
+                        status?: "queued" | "running" | "completed" | "dead" | "cancelled";
+                        /** @enum {string} */
+                        path?: "pull" | "push";
+                        model?: string;
+                        space?: string;
+                        n?: number;
+                        dims?: number;
+                        node_id?: string;
+                        error?: string;
+                        status_detail?: string;
+                        created_at?: string;
+                        completed_at?: string;
+                        vectors?: number[][];
+                    };
+                };
+            };
+            /** @description The service key lacks the `embeddings` scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error?: {
+                            message?: string;
+                            type?: string;
+                            ref?: string;
+                        };
+                    };
+                };
+            };
+            /** @description No such job, or not this consumer's */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error?: {
+                            message?: string;
+                            type?: string;
+                            ref?: string;
+                        };
+                    };
+                };
+            };
+            /** @description The vectors expired; resubmit the batch */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The job store did not answer */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error?: {
+                            message?: string;
+                            type?: string;
+                            ref?: string;
+                        };
+                    };
+                };
+            };
+        };
+    };
+    addon_access_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Add-on name. */
+                addon: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    addon_access_set: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Add-on name. */
+                addon: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    feature: string;
+                    subject: string;
+                    /** @enum {string} */
+                    value: "on" | "off" | "inherit";
+                    reason?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    security_user_addon_access: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Account name. */
+                username: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    security_user_super_admin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Account name. */
+                username: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    on: boolean;
+                    reason: string;
+                    /** Format: password */
+                    password: string;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    tempo: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    traces_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    requests: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    summary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    node_traces_ingest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
             };
         };
     };
