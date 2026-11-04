@@ -263,8 +263,10 @@ pub enum LaneState {
     Missing,
     /// Running, named, and no placement explains it (a native engine).
     Unplaced,
-    /// Placed, and the agent cannot tell (no presence entry yet).
+    /// Placed, and the agent cannot tell yet (reason `no presence yet`).
     Unknown,
+    /// Placed and not running, unhealthy, or running unnamed: not routed.
+    Down,
     /// A word this gateway does not know (a newer agent). Not routed: a state
     /// the gateway cannot read is not a state it may assume serves.
     Other(String),
@@ -279,6 +281,7 @@ impl LaneState {
             "missing" => LaneState::Missing,
             "unplaced" => LaneState::Unplaced,
             "unknown" => LaneState::Unknown,
+            "down" => LaneState::Down,
             other => LaneState::Other(other.to_string()),
         }
     }
@@ -291,6 +294,7 @@ impl LaneState {
             LaneState::Missing => "missing",
             LaneState::Unplaced => "unplaced",
             LaneState::Unknown => "unknown",
+            LaneState::Down => "down",
             LaneState::Other(s) => s,
         }
     }
@@ -303,7 +307,7 @@ impl LaneState {
             LaneState::Serving => Some(0),
             LaneState::OnDemand => Some(1),
             LaneState::Unknown | LaneState::Unplaced => Some(2),
-            LaneState::Loading | LaneState::Missing | LaneState::Other(_) => None,
+            LaneState::Loading | LaneState::Missing | LaneState::Down | LaneState::Other(_) => None,
         }
     }
 }
@@ -3180,6 +3184,15 @@ mod lane_tests {
         assert!(t.class("HF-12B").is_none());
         assert!(t.all_chat.is_none());
         assert_eq!(t.skipped_lanes, vec![("n1".into(), "vllm".into(), "HF-12B".into(), "lane loading: warming".into())]);
+    }
+
+    #[test]
+    fn a_down_lane_is_not_routed_and_says_why() {
+        let n = facts(&rec("n1", "100.64.0.1", json!([lane("llamacpp", "x.gguf", "chat", "down", "not running")]), json!({})));
+        assert_eq!(n.lanes.as_ref().unwrap()[0].state, LaneState::Down);
+        let t = build_table(&[n], &[], &Declarations::default());
+        assert!(t.all_chat.is_none());
+        assert_eq!(t.skipped_lanes[0].3, "lane down: not running");
     }
 
     #[test]
