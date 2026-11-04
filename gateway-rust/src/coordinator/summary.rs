@@ -207,14 +207,34 @@ pub(super) async fn fire_temporal_extraction(
     assistant_response: &str,
     user_id: Option<&str>,
 ) {
-    // User message
-    if !user_message.trim().is_empty() {
-        let payload = json!({
-            "conversation_id": conversation_id,
-            "author": "user",
-            "message_text": user_message,
-            "user_id": user_id,
-        });
+    if user_message.trim().is_empty() && assistant_response.trim().is_empty() {
+        return;
+    }
+    // The extractor stamps this org on every entity it writes but the agent's
+    // own (i435): project state is read back with a strict org match, so an
+    // unstamped project reaches no one. `None` (no caller, a team with no
+    // org) is stamped 'default' by the extractor. A database error is NOT
+    // `None`: stamping a guessed org could put one org's project state in
+    // another's, so the turn is not extracted and the reason is logged.
+    let org_id = match crate::temporal_graph::resolve_org(&state.db, user_id).await {
+        Ok(org) => org,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                conversation_id,
+                "temporal_extraction_skipped_org_unreadable"
+            );
+            return;
+        }
+    };
+
+    for payload in temporal_extract_payloads(
+        conversation_id,
+        user_message,
+        assistant_response,
+        user_id,
+        org_id.as_deref(),
+    ) {
         crate::worker_client::publish_fire_and_forget_metered(
             state.nats.clone(),
             state.db.clone(),
@@ -223,21 +243,55 @@ pub(super) async fn fire_temporal_extraction(
             state.metrics.clone(),
         );
     }
+}
 
-    // Assistant response (cleaned of think blocks already by caller)
-    if !assistant_response.trim().is_empty() {
-        let payload = json!({
-            "conversation_id": conversation_id,
-            "author": "assistant",
-            "message_text": assistant_response,
-            "user_id": user_id,
-        });
-        crate::worker_client::publish_fire_and_forget_metered(
-            state.nats.clone(),
-            state.db.clone(),
-            "worker.temporal.extract",
-            payload,
-            state.metrics.clone(),
-        );
+/// One `worker.temporal.extract` request per non-empty message (the user's,
+/// then the assistant's, cleaned of think blocks by the caller), each
+/// carrying the requester's org for the extractor to stamp (i435).
+fn temporal_extract_payloads(
+    conversation_id: &str,
+    user_message: &str,
+    assistant_response: &str,
+    user_id: Option<&str>,
+    org_id: Option<&str>,
+) -> Vec<Value> {
+    [("user", user_message), ("assistant", assistant_response)]
+        .into_iter()
+        .filter(|(_, text)| !text.trim().is_empty())
+        .map(|(author, text)| {
+            json!({
+                "conversation_id": conversation_id,
+                "author": author,
+                "message_text": text,
+                "user_id": user_id,
+                "org_id": org_id,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod temporal_extract_payload_tests {
+    use super::temporal_extract_payloads;
+
+    #[test]
+    fn every_message_carries_the_requesters_org() {
+        let p = temporal_extract_payloads("c1", "we chose rustls", "noted", Some("ada"), Some("acme"));
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[0]["author"], "user");
+        assert_eq!(p[1]["author"], "assistant");
+        for m in &p {
+            assert_eq!(m["org_id"], "acme");
+            assert_eq!(m["user_id"], "ada");
+            assert_eq!(m["conversation_id"], "c1");
+        }
+    }
+
+    #[test]
+    fn an_unresolved_org_is_sent_as_null() {
+        let p = temporal_extract_payloads("c1", "hello", "", None, None);
+        assert_eq!(p.len(), 1, "an empty assistant reply is not extracted");
+        assert!(p[0]["org_id"].is_null());
+        assert_eq!(p[0]["message_text"], "hello");
     }
 }
