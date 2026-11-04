@@ -105,7 +105,7 @@ func TestBuild_States(t *testing.T) {
 			want: []Lane{{"reranker", "bge-rerank.gguf", "rerank", StateServing, ReasonNone}},
 		},
 		{
-			name: "docker same model but unhealthy: unknown",
+			name: "docker same model but unhealthy: down, unhealthy",
 			in: Inputs{
 				Placed:   []Placed{{"vllm", "org/m", "chat"}},
 				Running:  map[string]string{"vllm": "org/m"},
@@ -113,22 +113,52 @@ func TestBuild_States(t *testing.T) {
 				Containers: map[string]any{"vllm": map[string]any{
 					"running": true, "health": "unhealthy"}},
 			},
-			want: []Lane{{"vllm", "org/m", "chat", StateUnknown, ReasonNone}},
+			want: []Lane{{"vllm", "org/m", "chat", StateDown, ReasonUnhealthy}},
 		},
 		{
-			name: "docker placed but not running: unknown",
+			name: "docker not serving for a non-warmup reason: down, unhealthy",
+			in: Inputs{
+				Placed:   []Placed{{"vllm", "org/m", "chat"}},
+				Running:  map[string]string{"vllm": "org/m"},
+				Runtimes: docker,
+				Containers: map[string]any{"vllm": map[string]any{
+					"running": true, "health": "healthy", "serving": false, "serving_reason": "probe timed out"}},
+			},
+			want: []Lane{{"vllm", "org/m", "chat", StateDown, ReasonUnhealthy}},
+		},
+		{
+			name: "docker placed but not running: down, not running",
 			in:   Inputs{Placed: []Placed{{"vllm", "org/m", "chat"}}},
-			want: []Lane{{"vllm", "org/m", "chat", StateUnknown, ReasonNone}},
+			want: []Lane{{"vllm", "org/m", "chat", StateDown, ReasonNotRunning}},
 		},
 		{
-			name: "docker runtime names no model: no mismatch is claimed",
+			name: "llamacpp placed path vs reported basename is the same model (reconciler rule)",
+			in: Inputs{
+				Placed:     []Placed{{"llamacpp", "/models/x.gguf", "chat"}},
+				Running:    map[string]string{"llamacpp": "x.gguf"},
+				Runtimes:   docker,
+				Containers: map[string]any{"llamacpp": healthy()},
+			},
+			want: []Lane{{"llamacpp", "/models/x.gguf", "chat", StateServing, ReasonNone}},
+		},
+		{
+			name: "native non-ollama runs another model: down, not running",
+			in: Inputs{
+				Placed:   []Placed{{"llamacpp", "b.gguf", "chat"}},
+				Running:  map[string]string{"llamacpp": "a.gguf"},
+				Runtimes: map[string]string{"llamacpp": "native"},
+			},
+			want: []Lane{{"llamacpp", "b.gguf", "chat", StateDown, ReasonNotRunning}},
+		},
+		{
+			name: "docker runtime names no model: down, unnamed backend",
 			in: Inputs{
 				Placed:     []Placed{{"embedding", "BAAI/bge", "embed"}},
 				Running:    map[string]string{"embedding": "tei"},
 				Runtimes:   docker,
 				Containers: map[string]any{"embedding": healthy()},
 			},
-			want: []Lane{{"embedding", "BAAI/bge", "embed", StateUnknown, ReasonNone}},
+			want: []Lane{{"embedding", "BAAI/bge", "embed", StateDown, ReasonUnnamedBackend}},
 		},
 		{
 			name: "two placed ollama models give two lanes: serving and on_demand",
@@ -166,9 +196,36 @@ func TestBuild_States(t *testing.T) {
 			want: []Lane{{"ollama", "gemma4:12b", "chat", StateUnknown, ReasonNoPresenceYet}},
 		},
 		{
-			name: "ollama not running: unknown",
+			name: "ollama not running: down, not running",
 			in:   Inputs{Placed: []Placed{{"ollama", "gemma4:12b", "chat"}}},
-			want: []Lane{{"ollama", "gemma4:12b", "chat", StateUnknown, ReasonNone}},
+			want: []Lane{{"ollama", "gemma4:12b", "chat", StateDown, ReasonNotRunning}},
+		},
+		{
+			name: "bare placed name with :latest loaded is serving",
+			in: Inputs{
+				Placed:  []Placed{{"ollama", "harrier", "embed"}},
+				Running: map[string]string{"ollama": "gemma4:12b"},
+				Ollama:  Ollama{Known: true, Loaded: map[string]bool{"harrier:latest": true}},
+			},
+			want: []Lane{{"ollama", "harrier", "embed", StateServing, ReasonNone}},
+		},
+		{
+			name: "placed :latest with the bare name on disk is on_demand",
+			in: Inputs{
+				Placed:  []Placed{{"ollama", "harrier:latest", "embed"}},
+				Running: map[string]string{"ollama": "gemma4:12b"},
+				Ollama:  Ollama{Known: true, OnDisk: map[string]bool{"harrier": true}},
+			},
+			want: []Lane{{"ollama", "harrier:latest", "embed", StateOnDemand, ReasonNotLoaded}},
+		},
+		{
+			name: "other tags are not :latest",
+			in: Inputs{
+				Placed:  []Placed{{"ollama", "gemma4", "chat"}},
+				Running: map[string]string{"ollama": "gemma4:12b"},
+				Ollama:  Ollama{Known: true, Loaded: map[string]bool{"gemma4:12b": true}},
+			},
+			want: []Lane{{"ollama", "gemma4", "chat", StateUnknown, ReasonNoPresenceYet}},
 		},
 		{
 			name: "ollama health starting: loading",
@@ -204,7 +261,7 @@ func TestBuild_States(t *testing.T) {
 			in: Inputs{
 				Placed: []Placed{{"vllm", " ", "chat"}, {"harness", "x", ""}, {"vllm", "org/m", "chat"}, {"vllm", "org/m", "chat"}},
 			},
-			want: []Lane{{"vllm", "org/m", "chat", StateUnknown, ReasonNone}},
+			want: []Lane{{"vllm", "org/m", "chat", StateDown, ReasonNotRunning}},
 		},
 		{
 			name: "no placements and nothing running: an empty slice, not nil",

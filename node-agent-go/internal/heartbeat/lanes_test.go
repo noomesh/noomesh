@@ -29,7 +29,9 @@ func fixtureInputs() (lanes.Inputs, map[string]string) {
 			{Backend: "ollama", Model: "gemma4:12b", Role: "chat"},
 			{Backend: "ollama", Model: "qwen3:4b", Role: "chat"},
 			{Backend: "ollama", Model: "harrier", Role: "embed"},
+			{Backend: "ollama", Model: "mystery:7b", Role: "chat"},
 			{Backend: "llamacpp", Model: "m.gguf", Role: ""},
+			{Backend: "reranker", Model: "bge-rerank.gguf", Role: "rerank"},
 		},
 		Presence: map[string]modelpresence.Entry{
 			"ollama":       {Model: "gemma4:12b", Role: "chat", Present: true},
@@ -73,10 +75,13 @@ func TestLanesFixtureMatchesBuilder(t *testing.T) {
 		m := l.(map[string]any)
 		states[m["state"].(string)] = m["reason"].(string)
 	}
-	for _, s := range []string{"serving", "on_demand", "loading", "missing", "unplaced", "unknown"} {
+	for _, s := range []string{"serving", "on_demand", "loading", "missing", "unplaced", "unknown", "down"} {
 		if _, ok := states[s]; !ok {
 			t.Errorf("fixture has no %s lane", s)
 		}
+	}
+	if states["unknown"] != "no presence yet" || states["down"] != "not running" {
+		t.Errorf("unknown/down reasons = %q / %q", states["unknown"], states["down"])
 	}
 	if states["loading"] != "reconciling: runtime runs org/old-model" {
 		t.Errorf("loading reason = %q", states["loading"])

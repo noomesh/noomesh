@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/noomesh/noomesh/node-agent-go/internal/modelname"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
 )
 
@@ -33,6 +34,8 @@ const (
 	StateMissing  = "missing"
 	StateUnplaced = "unplaced"
 	StateUnknown  = "unknown"
+	// StateDown: placed, and not routable for a reason the agent can name.
+	StateDown = "down"
 )
 
 // Reasons. The vocabulary is fixed; free text is allowed only after the
@@ -45,6 +48,8 @@ const (
 	ReasonNotOnDisk      = "not on disk"
 	ReasonNoPresenceYet  = "no presence yet"
 	ReasonNotLoaded      = "not loaded"
+	ReasonNotRunning     = "not running"
+	ReasonUnhealthy      = "unhealthy"
 	ReasonUnnamedBackend = "unnamed backend"
 )
 
@@ -111,8 +116,27 @@ type Inputs struct {
 	Ollama     Ollama
 }
 
-// Same is the model comparison: exact equality after trimming whitespace.
-func Same(a, b string) bool { return strings.TrimSpace(a) == strings.TrimSpace(b) }
+// Same is the docker model comparison: the reconciler's own rule
+// (modelname.Matches), after trimming whitespace.
+func Same(a, b string) bool {
+	return modelname.Matches(strings.TrimSpace(a), strings.TrimSpace(b))
+}
+
+// sameOllama compares ollama names for state only: exact after trimming,
+// except a bare name equals its `:latest` in both directions.
+func sameOllama(a, b string) bool {
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	return a == b || a+":latest" == b || a == b+":latest"
+}
+
+func hasOllama(set map[string]bool, model string) bool {
+	for m, ok := range set {
+		if ok && sameOllama(m, model) {
+			return true
+		}
+	}
+	return false
+}
 
 func roleOf(r string) string {
 	if r = strings.TrimSpace(r); r != "" {
@@ -225,27 +249,34 @@ func derive(in Inputs, p Placed) (string, string) {
 	// 4 and 5.
 	if isOllama {
 		if !running {
-			return StateUnknown, ReasonNone
+			return StateDown, ReasonNotRunning
 		}
-		o := in.Ollama
-		if o.Loaded[p.Model] || o.Loaded[strings.TrimSpace(p.Model)] {
+		if hasOllama(in.Ollama.Loaded, p.Model) {
 			return StateServing, ReasonNone
 		}
-		onDisk := o.OnDisk[strings.TrimSpace(p.Model)] || o.Held[strings.TrimSpace(p.Model)] || (havePres && pres.Present)
-		if onDisk {
+		if hasOllama(in.Ollama.OnDisk, p.Model) || hasOllama(in.Ollama.Held, p.Model) || (havePres && pres.Present) {
 			return StateOnDemand, ReasonNotLoaded
 		}
-		if !havePres {
-			return StateUnknown, ReasonNoPresenceYet
-		}
-		return StateUnknown, ReasonNone
+		// Running, but nothing says whether it holds the model.
+		return StateUnknown, ReasonNoPresenceYet
 	}
-	if runs != "" && life != nil && !servingOff && (health == "" || health == "healthy") {
-		if r, _ := life["running"].(bool); r {
-			return StateServing, ReasonNone
+	if !running {
+		return StateDown, ReasonNotRunning
+	}
+	rm := runtimeModel(p.Backend, in.Running[p.Backend])
+	switch {
+	case rm == "":
+		return StateDown, ReasonUnnamedBackend
+	case !Same(rm, p.Model):
+		// Not a docker container, so the agent will not replace it.
+		return StateDown, ReasonNotRunning
+	}
+	if life != nil {
+		if r, _ := life["running"].(bool); !r || servingOff || (health != "" && health != "healthy") {
+			return StateDown, ReasonUnhealthy
 		}
 	}
-	return StateUnknown, ReasonNone
+	return StateServing, ReasonNone
 }
 
 var (
