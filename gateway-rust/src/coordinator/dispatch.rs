@@ -141,40 +141,48 @@ pub fn parse_policy(v: Option<&str>) -> String {
 /// running `harness` placement, or `harness_policy = auto` on the node's
 /// config with a running chat backend to follow. `off` wins over both.
 /// The same rule the desired-config route uses to tell the node agent.
-pub async fn harness_effective(state: &AppState, node: &str) -> bool {
+///
+/// `Err` when the database cannot answer. It used to read a failed query
+/// as "no row" (i436): the policy became the fleet default (`auto`), so a
+/// node whose operator set `off` could be dispatched to while Postgres was
+/// unreachable. A caller that gets `Err` does not dispatch and says why.
+pub async fn harness_effective(state: &AppState, node: &str) -> Result<bool, String> {
+    harness_effective_in(&state.db, node).await
+}
+
+async fn harness_effective_in(db: &sqlx::PgPool, node: &str) -> Result<bool, String> {
+    let unread = |what: &str, e: sqlx::Error| format!("cannot read {what} for node '{node}': {e}");
+    // No row is a real answer (the fleet default applies); an error is not.
     let policy: Option<String> = sqlx::query_scalar("SELECT harness_policy FROM noo_node_config WHERE node_id = $1")
         .bind(node)
-        .fetch_optional(&state.db)
+        .fetch_optional(db)
         .await
-        .ok()
-        .flatten();
+        .map_err(|e| unread("its harness policy", e))?;
     let policy = policy.unwrap_or_else(harness_default_policy);
     if policy == "off" {
-        return false;
+        return Ok(false);
     }
     let placed: Option<String> = sqlx::query_scalar(
         "SELECT desired_state FROM noo_backend_placements WHERE node_id = $1 AND backend = 'harness'",
     )
     .bind(node)
-    .fetch_optional(&state.db)
+    .fetch_optional(db)
     .await
-    .ok()
-    .flatten();
+    .map_err(|e| unread("its harness placement", e))?;
     if placed.as_deref() == Some("running") {
-        return true;
+        return Ok(true);
     }
     if policy != "auto" || placed.is_some() {
-        return false;
+        return Ok(false);
     }
-    let chat: Option<i64> = sqlx::query_scalar(
+    let chat: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM noo_backend_placements WHERE node_id = $1 AND backend <> 'harness'          AND desired_state = 'running' AND (role IS NULL OR role = '' OR role = 'chat')",
     )
     .bind(node)
-    .fetch_optional(&state.db)
+    .fetch_one(db)
     .await
-    .ok()
-    .flatten();
-    chat.unwrap_or(0) > 0
+    .map_err(|e| unread("its chat placements", e))?;
+    Ok(chat > 0)
 }
 
 /// Which node, if any, should run a turn for `model`: the node holding
@@ -228,10 +236,14 @@ pub async fn harness_node_explained(state: &AppState, model: Option<&str>) -> Re
     if let Err(why) = self_node_dispatchable(state, &node).await {
         return Err(format!("{named} is served by the controller's own node ('{node}'), which runs turns in process — {why}"));
     }
-    if !harness_effective(state, &node).await {
-        return Err(format!(
-            "node '{node}' serves {named} but has no harness: place one with `noo cluster place {node} harness`"
-        ));
+    match harness_effective(state, &node).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(format!(
+                "node '{node}' serves {named} but has no harness: place one with `noo cluster place {node} harness`"
+            ))
+        }
+        Err(e) => return Err(format!("{named} is served by node '{node}', but {e}, so it is not dispatched there")),
     }
     Ok(node)
 }
@@ -268,7 +280,7 @@ pub async fn self_node_dispatchable(state: &AppState, node: &str) -> Result<bool
     if !is_controller_node(node) {
         return Ok(false);
     }
-    let placed = harness_effective(state, node).await;
+    let placed = harness_effective(state, node).await?;
     let record = if placed { node_record(state, node).await } else { None };
     self_node_verdict(node, placed, record.as_ref()).map(|()| true)
 }
@@ -759,5 +771,32 @@ mod harness_policy_default_tests {
         // An operator who turned harnesses off must keep them off through a
         // default change.
         assert_eq!(parse_policy(Some("off")), "off");
+    }
+}
+
+#[cfg(test)]
+mod harness_effective_db_error_tests {
+    use super::harness_effective_in;
+
+    /// i436: with the database unreachable, the policy read used to fail
+    /// into the fleet default (`auto`), so an operator's `off` could act as
+    /// `auto`. An unreadable policy is now an error, never a default.
+    #[tokio::test]
+    async fn an_unreachable_database_is_an_error_not_the_default_policy() {
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(300))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool");
+        let r = harness_effective_in(&db, "node-1").await;
+        let e = r.expect_err("no answer from the database is not an answer");
+        assert!(e.contains("cannot read its harness policy for node 'node-1'"), "{e}");
+    }
+
+    /// And the dispatcher's reason carries it, so the in-process run says why.
+    #[test]
+    fn the_dispatch_reason_names_the_unread_policy() {
+        let src = include_str!("dispatch.rs");
+        let code = &src[..src.find("mod harness_effective_db_error_tests").expect("this module")];
+        assert!(code.contains("Err(e) => return Err(format!(\"{named} is served by node '{node}', but {e}"));
     }
 }

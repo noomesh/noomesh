@@ -1070,16 +1070,20 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
     // harness invariant printed a green `policy manual` for all five nodes of a
     // fleet whose policies it had not looked at. One query for the
     // whole fleet, resolved exactly as the single-node route resolves it.
-    let harness_policies: std::collections::HashMap<String, String> =
+    //
+    // A failed query is not "no rows" (i436). It used to read that way, so
+    // every node showed the fleet default (`auto`) while Postgres was down,
+    // including nodes set to `off`. Now the field is left off and
+    // `harness_policy_error` says why, which `noo cluster verify` reports as
+    // "policy not reported" instead of judging a default.
+    let harness_policies: Result<std::collections::HashMap<String, String>, String> =
         sqlx::query_as::<_, (String, Option<String>)>(
             "SELECT node_id, harness_policy FROM noo_node_config",
         )
         .fetch_all(&state.db)
         .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|(id, p)| p.map(|p| (id, p)))
-        .collect();
+        .map(|rows| rows.into_iter().filter_map(|(id, p)| p.map(|p| (id, p))).collect())
+        .map_err(|e| format!("cannot read the harness policies: {e}"));
     let task_holds = node_task_holds(&state.db).await;
     // node_ids seen live in KV — used to suppress duplicate DB rows when
     // merging known-but-missing (offline) nodes below.
@@ -1266,16 +1270,22 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
 
                         // Declared harness policy — the row when there is one,
                         // otherwise the same fleet default the single-node
-                        // route applies. Never absent, so a consumer cannot
-                        // quietly substitute a default of its own.
+                        // route applies. Absent only when the table could not
+                        // be read, and then `harness_policy_error` says so; a
+                        // consumer never sees a default standing in for an error.
                         // Own the key: `id` above borrows `data`, and reading
                         // it here would hold that borrow across the writes.
                         let policy_key =
                             data.get("id").and_then(|i| i.as_str()).unwrap_or(&key).to_string();
-                        data["harness_policy"] = json!(harness_policies
-                            .get(&policy_key)
-                            .cloned()
-                            .unwrap_or_else(crate::coordinator::harness_default_policy));
+                        match &harness_policies {
+                            Ok(policies) => {
+                                data["harness_policy"] = json!(policies
+                                    .get(&policy_key)
+                                    .cloned()
+                                    .unwrap_or_else(crate::coordinator::harness_default_policy));
+                            }
+                            Err(e) => data["harness_policy_error"] = json!(e),
+                        }
                         // What the node's harness holds (i227 fix 4): absent
                         // only when the query failed, never defaulted.
                         if let Some(holds) = task_holds.as_ref() {
