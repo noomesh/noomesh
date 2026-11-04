@@ -4287,6 +4287,22 @@ mod user_writes_tests {
         status.code().unwrap_or_else(|| panic!("own-process case {case} was killed ({status}):\n{text}"))
     }
 
+    /// The before-main case hook is test-only: the shipped `noo` never runs
+    /// a case (privileged code) because an environment variable is set. Every
+    /// link section, and every use of the case variable, sits inside this
+    /// `#[cfg(test)]` module.
+    #[test]
+    fn the_case_constructor_exists_only_in_this_test_module() {
+        let src = include_str!("node_fetch.rs");
+        let start = src.find("#[cfg(test)]\nmod user_writes_tests \u{7b}").expect("this test module");
+        let end = start + src[start..].find("\n\u{7d}\n").expect("its end");
+        for needle in [concat!("#[link_", "section"), concat!("NOO_TEST_OWN_", "PROCESS_CASE")] {
+            let hits: Vec<usize> = src.match_indices(needle).map(|(i, _)| i).collect();
+            assert!(!hits.is_empty(), "{needle} not found: the guard reads the wrong file");
+            assert!(hits.iter().all(|&i| start < i && i < end), "{needle} appears outside the #[cfg(test)] module");
+        }
+    }
+
     /// A case runs before main, alone on one thread, and its exit code comes
     /// back (the mutant without the constructor runs nothing and fails here).
     #[cfg(target_os = "linux")]
