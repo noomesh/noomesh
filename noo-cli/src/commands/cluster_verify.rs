@@ -406,7 +406,10 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     if n["self_node"].as_bool() == Some(true) {
         out.push(ok("harness", "in process — the controller's own gateway runs turns; no harness unit here by design"));
     } else { match (n["harness_policy"].as_str(), state) {
-        (None, _) => out.push(warn("harness", "policy not reported by the gateway — cannot judge the harness",
+        (None, _) => out.push(warn("harness", match n["harness_policy_error"].as_str() {
+                Some(e) => format!("policy not reported by the gateway ({e}) — cannot judge the harness"),
+                None => "policy not reported by the gateway — cannot judge the harness".to_string(),
+            },
             Some(format!("noo cluster show {id}   # the policy is on the node's config row")))),
         (Some("auto"), "running") => out.push(ok("harness", "running (policy auto)")),
         (Some("auto"), "") => out.push(warn("harness", "policy auto, state not reported yet", None)),
@@ -7975,6 +7978,21 @@ mod tests {
         // The old behaviour, spelled out so a reintroduction is loud: a
         // running harness under an ABSENT policy must not read as fine.
         assert_ne!(h.verdict, Verdict::Ok);
+    }
+
+    /// i436: when the gateway cannot read the policies it sends no
+    /// `harness_policy` and says why. The row warns and carries the reason.
+    #[test]
+    fn an_unreadable_harness_policy_warns_with_the_gateway_reason() {
+        let now = 1_800_000_000;
+        let mut n = healthy(now);
+        let o = n.as_object_mut().unwrap();
+        o.remove("harness_policy");
+        o.insert("harness_policy_error".into(), serde_json::json!("cannot read the harness policies: pool timed out"));
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        let h = c.iter().find(|c| c.name == "harness").unwrap();
+        assert_eq!(h.verdict, Verdict::Warn);
+        assert!(h.detail.contains("pool timed out"), "{}", h.detail);
     }
 
     /// And the gateway must actually send it, or the check above only ever
