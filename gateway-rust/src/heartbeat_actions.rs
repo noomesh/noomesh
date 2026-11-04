@@ -1868,20 +1868,15 @@ pub async fn run_llm_action(
         // The note goes on the error path too: a research run that failed "without sources" because
         // its search was refused must say why.
         Ok(Ok(mut text)) => {
-            if let Some(c) = &ceiling {
-                let denied = c.take_denied();
-                if !denied.is_empty() {
-                    text.push_str(&crate::task_guard::denied_note(&denied));
-                }
+            if let Some(note) = ceiling.as_ref().and_then(crate::task_guard::TurnCeiling::take_note) {
+                text.push_str(&note);
             }
             Ok(text)
         }
         Ok(Err(e)) => {
-            let denied = ceiling.as_ref().map(|c| c.take_denied()).unwrap_or_default();
-            if denied.is_empty() {
-                Err(e)
-            } else {
-                Err(anyhow::anyhow!("{e}{}", crate::task_guard::denied_note(&denied)))
+            match ceiling.as_ref().and_then(crate::task_guard::TurnCeiling::take_note) {
+                None => Err(e),
+                Some(note) => Err(anyhow::anyhow!("{e}{note}")),
             }
         }
         Err(_) => anyhow::bail!(
@@ -2167,16 +2162,16 @@ pub async fn run_rust_native_task(
         // runs under the task's ceiling like every LLM-driven action (conversations are keyed on the task).
         let ceiling = crate::task_guard::ceiling_for_run(&state.db, task_id, action, &format!("heartbeat-{task_id}")).await;
         let r = action_self_benchmark(state, config, task_id).await;
-        let denied = ceiling.as_ref().map(|c| c.take_denied()).unwrap_or_default();
-        return match r {
-            Ok(mut text) => {
-                if !denied.is_empty() {
-                    text.push_str(&crate::task_guard::denied_note(&denied));
+        let note = ceiling.as_ref().and_then(crate::task_guard::TurnCeiling::take_note);
+        return match (r, note) {
+            (Ok(mut text), note) => {
+                if let Some(note) = note {
+                    text.push_str(&note);
                 }
                 Ok(text.into())
             }
-            Err(e) if !denied.is_empty() => Err(format!("{e}{}", crate::task_guard::denied_note(&denied))),
-            Err(e) => Err(e),
+            (Err(e), Some(note)) => Err(format!("{e}{note}")),
+            (Err(e), None) => Err(e),
         };
     }
     run_rust_native_action(state, action, config).await
