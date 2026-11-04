@@ -28,7 +28,9 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
 	"github.com/noomesh/noomesh/node-agent-go/internal/dataroots"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
+	"github.com/noomesh/noomesh/node-agent-go/internal/lanes"
 	"github.com/noomesh/noomesh/node-agent-go/internal/metrics"
+	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
 )
 
 // Reporter sends registration and heartbeat messages to the gateway controller.
@@ -50,6 +52,7 @@ type Reporter struct {
 	// (backend -> model), as distinct from the model it is placed to serve.
 	// nil until installed; the key is then omitted.
 	getLoaded  func() map[string]string
+	getHeld    func() []string
 	activeJobs func() int
 	// ollamaDoor resolves the dockerised ollama's door for the model
 	// inventory (docker.BackendDialURL("ollama")); nil until installed.
@@ -178,6 +181,41 @@ func (r *Reporter) backendContainersReport() map[string]any {
 		return nil
 	}
 	return r.backendContainers()
+}
+
+// SetHeldModels installs the adopted ollama's held set (backendrt.Native.
+// HeldModels), one input to a lane's on_demand state. Optional.
+func (r *Reporter) SetHeldModels(f func() []string) { r.getHeld = f }
+
+// lanesReport builds the payload's `lanes` from the sections already in p
+// (running_backends, backend_runtimes, backend_containers, model_stats), the
+// model presence registry and the reconciler's placements. Never nil.
+func (r *Reporter) lanesReport(p map[string]any) []lanes.Lane {
+	in := lanes.Inputs{
+		Placed:   lanes.PlacedNow(),
+		Presence: modelpresence.Report(),
+	}
+	in.Running, _ = p["running_backends"].(map[string]string)
+	in.Runtimes, _ = p["backend_runtimes"].(map[string]string)
+	in.Containers, _ = p["backend_containers"].(map[string]any)
+	if ms, ok := p["model_stats"].([]ModelStat); ok && len(ms) > 0 {
+		in.Ollama = lanes.Ollama{Known: true, OnDisk: map[string]bool{}, Loaded: map[string]bool{}}
+		for _, m := range ms {
+			in.Ollama.OnDisk[m.Name] = true
+			if m.Loaded {
+				in.Ollama.Loaded[m.Name] = true
+			}
+		}
+	}
+	if r.getHeld != nil {
+		in.Ollama.Held = map[string]bool{}
+		for _, m := range r.getHeld() {
+			in.Ollama.Held[m] = true
+		}
+	}
+	out, unnamed := lanes.Build(in)
+	lanes.NoteUnnamed(unnamed)
+	return out
 }
 
 // SetLoadedModels installs the loaded-model reporter, echoed on every

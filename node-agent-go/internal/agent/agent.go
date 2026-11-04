@@ -562,6 +562,7 @@ func (a *Agent) startMessaging(ctx context.Context) {
 		defer cancel()
 		return a.native.Loaded(ctx)
 	})
+	a.hb.SetHeldModels(func() []string { return a.native.HeldModels() })
 	a.hb.SetDataMounts(func() (map[string][]string, error) { return a.docker.ManagedDataMounts(a.lifeCtx()) })
 	a.hb.SetHostState(a.hostServices)
 	a.hb.SetModelBench(func() any {
