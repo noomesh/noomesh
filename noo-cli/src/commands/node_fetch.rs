@@ -4197,23 +4197,118 @@ mod user_writes_tests {
         d
     }
 
+    /// Set in the re-exec'd test process [`in_own_process`] starts, to the
+    /// name of the one test it runs.
+    const OWN_PROCESS_ENV: &str = "NOO_TEST_OWN_PROCESS";
+
+    /// How many threads this process has (`/proc/self/status`), when known.
+    fn thread_count() -> Option<usize> {
+        std::fs::read_to_string("/proc/self/status").ok()?
+            .lines().find_map(|l| l.strip_prefix("Threads:"))?.trim().parse().ok()
+    }
+
+    /// Run the calling test, `name`, in a test process of its own. libtest
+    /// runs tests on parallel threads, and a `fork()` there can copy a lock
+    /// another thread holds (the allocator's, the environment's, getpwnam's):
+    /// the child then blocks forever and the parent's wait with it (batch run
+    /// 2026-11-04, `root_only_a_lowered_child_cannot_setuid_0`, 35 min). The
+    /// parent re-runs exactly this test with `--test-threads=1`, where libtest
+    /// runs it on the main thread, and waits a bounded time.
+    /// `true`: this IS that process, run the body. `false`: the body passed
+    /// there (a failure, a missing run or a timeout panics here).
+    fn in_own_process(name: &str) -> bool {
+        if std::env::var(OWN_PROCESS_ENV).ok().as_deref() == Some(name) {
+            return true;
+        }
+        let module = module_path!().split_once("::").map(|(_, m)| m).unwrap_or(module_path!());
+        let full = format!("{module}::{name}");
+        let out = std::env::temp_dir().join(format!("noo-own-process-{name}-{}.log", std::process::id()));
+        let log = std::fs::File::create(&out).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &full, "--test-threads=1", "--nocapture"])
+            .env(OWN_PROCESS_ENV, name)
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .expect("re-exec the test binary");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break st;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let text = std::fs::read_to_string(&out).unwrap_or_default();
+                let _ = std::fs::remove_file(&out);
+                panic!("{name} did not finish in 120 s in its own process and was killed:\n{text}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let text = std::fs::read_to_string(&out).unwrap_or_default();
+        let _ = std::fs::remove_file(&out);
+        assert!(status.success(), "{name} failed in its own process ({status}):\n{text}");
+        assert!(text.contains(&format!("test {full} ... ok")), "{name}: its own process ran no such test:\n{text}");
+        false
+    }
+
     /// Run `f` in a forked child and return its exit code: the effective
     /// uid is process-wide, so a test that lowers must never lower the test
-    /// runner itself.
+    /// runner itself. Only from a test's own process ([`in_own_process`]),
+    /// where the fork copies one thread and no lock another thread held; a
+    /// child that has not exited in 60 s is killed and the test fails.
     fn in_child(f: impl FnOnce() -> i32) -> i32 {
+        assert!(std::env::var_os(OWN_PROCESS_ENV).is_some(), "in_child forks: call it only inside in_own_process");
+        if let Some(n) = thread_count() {
+            assert_eq!(n, 1, "in_child would fork a process with {n} threads");
+        }
         let pid = unsafe { libc::fork() };
         if pid == 0 {
             let code = f();
             unsafe { libc::_exit(code) };
         }
+        assert!(pid > 0, "fork failed");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let mut status = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        loop {
+            let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if r == pid {
+                break;
+            }
+            assert!(r == 0, "waitpid failed");
+            if std::time::Instant::now() > deadline {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, &mut status, 0);
+                }
+                panic!("the forked child did not exit in 60 s and was killed");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(libc::WIFEXITED(status), "the forked child did not exit normally (status {status})");
         libc::WEXITSTATUS(status)
+    }
+
+    /// The re-exec'd process runs the one test alone, on one thread, so a
+    /// fork there copies no lock (the mutant that skips the re-exec forks
+    /// from the parallel runner and fails here).
+    #[test]
+    fn a_test_in_its_own_process_runs_on_one_thread() {
+        if !in_own_process("a_test_in_its_own_process_runs_on_one_thread") {
+            return;
+        }
+        if let Some(n) = thread_count() {
+            assert_eq!(n, 1, "the test's own process has {n} threads");
+        }
+        assert_eq!(in_child(|| 7), 7, "the forked child's exit code comes back");
     }
 
     #[test]
     fn root_only_dropped_the_poll_cannot_write_a_root_file_and_root_scopes_can() {
         if !require_root("root_only_dropped_the_poll_cannot_write_a_root_file_and_root_scopes_can") {
+            return;
+        }
+        if !in_own_process("root_only_dropped_the_poll_cannot_write_a_root_file_and_root_scopes_can") {
             return;
         }
         let d = scratch("victim");
@@ -4252,6 +4347,9 @@ mod user_writes_tests {
     #[test]
     fn root_only_a_lowered_child_cannot_setuid_0() {
         if !require_root("root_only_a_lowered_child_cannot_setuid_0") {
+            return;
+        }
+        if !in_own_process("root_only_a_lowered_child_cannot_setuid_0") {
             return;
         }
         let code = in_child(|| {
@@ -4691,6 +4789,9 @@ mod user_writes_tests {
     #[test]
     fn root_only_a_root_owned_cadence_file_is_replaced_by_the_lowered_poll() {
         if !require_root("root_only_a_root_owned_cadence_file_is_replaced_by_the_lowered_poll") {
+            return;
+        }
+        if !in_own_process("root_only_a_root_owned_cadence_file_is_replaced_by_the_lowered_poll") {
             return;
         }
         let d = scratch("cadence-root");
