@@ -104,11 +104,6 @@ voice = [
 cloud = ["anthropic>=0.25", "openai>=1.12", "google-generativeai>=0.8.6"]
 cache = ["redis[hiredis]>=8.1.0"]
 feedback = ["noomesh[db]"]
-monitoring = [
-  "opentelemetry-api>=1.20",
-  "opentelemetry-sdk>=1.20",
-  "opentelemetry-exporter-otlp>=1.45.1",
-]
 
 dev = [
   "pytest>=9.1.1",
@@ -123,7 +118,7 @@ dev = [
 ]
 
 all = [
-  "noomesh[web,mcp,db,rag,voice,cloud,cache,feedback,monitoring]",
+  "noomesh[web,mcp,db,rag,voice,cloud,cache,feedback]",
 ]
 
 [project.scripts]
