@@ -2326,6 +2326,7 @@ pub(crate) fn storage_check_report(
         "missing": missing,
         "unchecked": unchecked,
         "remedy": c.remedy,
+        "caveat": caveat,
     });
     (j, c, caveat)
 }
@@ -6728,8 +6729,12 @@ mod storage_dir_tests {
         for want in ["noo 0.6.17's list", "carries no storage list", "noo upgrade --all --check"] {
             assert!(caveat.contains(want), "{want}: {caveat}");
         }
+        let (j, _, _) = super::storage_check_report(None, &from, source, "0.6.18", Some(caveat.clone()));
+        assert_eq!(j["caveat"].as_str(), Some(caveat.as_str()), "--json carries the caveat too");
         let (_, _, _, none) = super::storage_list_choice("0.6.17", "0.6.17", || panic!("no fetch when this CLI is the target"));
         assert_eq!(none, None);
+        let (j, _, _) = super::storage_check_report(None, "0.6.17", "cli", "0.6.17", None);
+        assert!(j["caveat"].is_null());
     }
 
     /// i467 "done when": from a box on CLI N, a directory only N+1 adds is
