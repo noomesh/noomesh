@@ -78,8 +78,15 @@ pub fn spawn(state: Arc<AppState>) {
             async move {
                 // Global kill switch checked AFTER record_tick (inside the
                 // managed loop) so a disabled engine still reads as alive.
-                if !is_enabled(&state).await {
-                    return Ok(());
+                // Fail closed (operator 2026-11-04): a switch that cannot be
+                // read is off for this tick, and the skip is said out loud.
+                match read_switch(&state).await {
+                    Switch::On => {}
+                    Switch::Off => return Ok(()),
+                    Switch::Unreadable(cause) => {
+                        skipped_switch_unreadable(&state, &cause).await;
+                        return Ok(());
+                    }
                 }
                 poll_locations(state, last_eval)
                     .await
@@ -251,13 +258,89 @@ async fn handle_issue_report(state: Arc<AppState>, agent_id: String, report: ser
     }
 }
 
-/// Read the global enabled flag. Mirrors Python's Redis key
-/// `noo:autonomy:enabled` (toggled via `/api/autonomy/{enable,disable}`).
+const SWITCH_KEY: &str = "noo:autonomy:enabled";
+
+/// What the global switch (`noo:autonomy:enabled`, set by
+/// `/api/autonomy/{enable,disable}`) says this tick.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Switch {
+    On,
+    Off,
+    /// No Redis, or Redis failed: the operator's choice cannot be known.
+    Unreadable(String),
+}
+
+impl Switch {
+    /// Only a switch read as on lets autonomy act.
+    pub(crate) fn acts(&self) -> bool {
+        matches!(self, Switch::On)
+    }
+}
+
+/// `None` is a gateway without Redis. A key that was never set is the
+/// documented default (on); a Redis that cannot answer is not a key that
+/// was never set, so it reads as unreadable and autonomy holds.
+pub(crate) fn switch_from(read: Option<Result<Option<String>, String>>) -> Switch {
+    match read {
+        None => Switch::Unreadable("no redis configured".into()),
+        Some(Err(e)) => Switch::Unreadable(e),
+        Some(Ok(None)) => Switch::On,
+        Some(Ok(Some(s))) if s == "1" || s.eq_ignore_ascii_case("true") => Switch::On,
+        Some(Ok(Some(_))) => Switch::Off,
+    }
+}
+
+pub(crate) async fn read_switch(state: &AppState) -> Switch {
+    let read = match state.redis.as_ref() {
+        None => None,
+        Some(r) => Some(r.get_string_checked(SWITCH_KEY).await),
+    };
+    switch_from(read)
+}
+
+/// True only when the switch was read and says on.
 pub async fn is_enabled(state: &AppState) -> bool {
-    let Some(r) = state.redis.as_ref() else { return true; };
-    match r.get_string("noo:autonomy:enabled").await {
-        Some(s) => s == "1" || s.eq_ignore_ascii_case("true"),
-        None => true, // default enabled (matches Python)
+    read_switch(state).await.acts()
+}
+
+/// One alert an hour while the switch stays unreadable. Kept in process:
+/// the operator_alert cooldown lives in the same Redis that just failed,
+/// and a failed SET NX there reads as "cooling down", which would swallow
+/// the alert.
+const SWITCH_ALERT_EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
+static SWITCH_ALERTED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+fn switch_alert_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    match last {
+        None => true,
+        Some(t) => now.duration_since(t) >= SWITCH_ALERT_EVERY,
+    }
+}
+
+async fn skipped_switch_unreadable(state: &AppState, cause: &str) {
+    tracing::warn!(cause, "autonomy_skipped_switch_unreadable");
+    let due = {
+        let mut last = SWITCH_ALERTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = std::time::Instant::now();
+        let due = switch_alert_due(*last, now);
+        if due {
+            *last = Some(now);
+        }
+        due
+    };
+    if due {
+        crate::operator_alert::send_operator_alert_with(
+            state,
+            crate::operator_alert::OperatorAlert::new(
+                "autonomy.switch_unreadable",
+                "cluster",
+                "Autonomy is holding: its on/off switch cannot be read from Redis, so no autonomous action runs until it can.".to_string(),
+            )
+            .detail(cause.to_string())
+            .investigate("noo autonomy status"),
+            0,
+        )
+        .await;
     }
 }
 
@@ -764,6 +847,40 @@ mod gate_tests {
 #[cfg(test)]
 mod unreadable_override_tests {
     use super::*;
+
+    #[test]
+    fn with_redis_down_no_autonomous_action_runs() {
+        // Operator 2026-11-04: unreadable (Redis down or erroring) fails closed.
+        let down = switch_from(Some(Err("connection refused".into())));
+        assert_eq!(down, Switch::Unreadable("connection refused".into()));
+        assert!(!down.acts());
+        assert!(!switch_from(None).acts(), "no redis configured holds too");
+    }
+
+    #[test]
+    fn a_never_set_switch_stays_on() {
+        // Operator 2026-11-04: Redis up, key absent is the default, ON. Only an
+        // unreadable switch holds; the two must never collapse into one.
+        let never_set = switch_from(Some(Ok(None)));
+        assert_eq!(never_set, Switch::On);
+        assert!(never_set.acts());
+    }
+
+    #[test]
+    fn a_readable_switch_still_means_what_it_says() {
+        assert!(switch_from(Some(Ok(Some("1".into())))).acts());
+        assert!(switch_from(Some(Ok(Some("TRUE".into())))).acts());
+        assert!(!switch_from(Some(Ok(Some("0".into())))).acts());
+        assert!(!switch_from(Some(Ok(Some("off".into())))).acts());
+    }
+
+    #[test]
+    fn the_switch_alert_repeats_hourly_not_every_tick() {
+        let t = std::time::Instant::now();
+        assert!(switch_alert_due(None, t));
+        assert!(!switch_alert_due(Some(t), t + std::time::Duration::from_secs(30)));
+        assert!(switch_alert_due(Some(t), t + SWITCH_ALERT_EVERY));
+    }
 
     #[test]
     fn an_unreadable_override_table_holds_every_location_off() {
