@@ -3662,7 +3662,11 @@ pub async fn require_any_auth(
     // handler mints, which is where it belongs. (The kiosk key lane, the
     // first door here, was retired on 2026-09-30.)
     if let Some(required) = exchange_scope_for(&path, request.method()) {
-        if let Some(consumer) = service_keys::resolve(&state.db, &t).await {
+        let found = match service_keys::resolve(&state.db, &t).await {
+            Ok(found) => found,
+            Err(unavailable) => return Ok(unavailable.into_response()),
+        };
+        if let Some(consumer) = found {
             if !consumer.has_scope(required) {
                 return Err(StatusCode::UNAUTHORIZED);
             }
@@ -3687,7 +3691,11 @@ pub async fn require_any_auth(
     // route's scope gets in, a key without it gets the scope refusal, and a
     // bearer that is no key falls through to the 401 below.
     if let Some(required) = direct_key_scope_for(&path, request.method()) {
-        match direct_key_admission(service_keys::resolve(&state.db, &t).await, required) {
+        let found = match service_keys::resolve(&state.db, &t).await {
+            Ok(found) => found,
+            Err(unavailable) => return Ok(unavailable.into_response()),
+        };
+        match direct_key_admission(found, required) {
             DirectKey::Forbidden(r) => return Ok(r),
             DirectKey::Admit(consumer) => {
                 if let Some(limit) = consumer.rpm_limit {
@@ -3710,8 +3718,13 @@ pub async fn require_any_auth(
     // key must not unlock admin/cluster routes.
     if is_inference_surface {
         // Named per-consumer service keys (`noo_service_keys`): resolve the
-        // bearer to a Consumer + scopes (cached 60s). See service_keys.rs.
-        if let Some(consumer) = service_keys::resolve(&state.db, &t).await {
+        // bearer to a Consumer + scopes (cached 5 s). See service_keys.rs.
+        // An unreadable key store is a 503, not this bearer's 401 (i437).
+        let found = match service_keys::resolve(&state.db, &t).await {
+            Ok(found) => found,
+            Err(unavailable) => return Ok(unavailable.into_response()),
+        };
+        if let Some(consumer) = found {
             // Per-consumer quota: stop one named consumer from monopolising the
             // shared inference surface. Only named keys with an rpm_limit are
             // capped; internal callers (rpm_limit=None) are never throttled here.
@@ -6768,7 +6781,7 @@ mod voice_direct_key_tests {
         let src = include_str!("auth.rs");
         let body = src.split("pub async fn require_any_auth(").nth(1).unwrap().split("\npub async fn ").next().unwrap();
         let door = body.find("direct_key_scope_for(&path, request.method())").expect("the direct-key door");
-        let admission = body.find("direct_key_admission(service_keys::resolve(&state.db, &t).await, required)").expect("the decision");
+        let admission = body.find("direct_key_admission(found, required)").expect("the decision");
         let inference = body.find("    if is_inference_surface {\n        // Named per-consumer").expect("the inference block");
         assert!(door < admission && admission < inference, "the door precedes the inference block");
         // A non-key bearer must fall through (to the 401), not be admitted.

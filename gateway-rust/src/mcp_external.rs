@@ -186,8 +186,10 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Caller, R
         .filter(|s| !s.is_empty())
         .ok_or_else(|| rpc_http_error(StatusCode::UNAUTHORIZED, "missing bearer token"))?;
 
+    // An unreadable key store is a 503 naming it, not "unknown key" (i437).
     let consumer = crate::service_keys::resolve(&state.db, bearer)
         .await
+        .map_err(|u| rpc_http_error(StatusCode::SERVICE_UNAVAILABLE, &u.message()))?
         .ok_or_else(|| rpc_http_error(StatusCode::FORBIDDEN, "unknown or revoked key"))?;
 
     let redis = state.redis.as_ref();
