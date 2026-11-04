@@ -2114,21 +2114,21 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
     let mut failed: Vec<String> = Vec::new();
     for s in &seats {
         let name = s["seat_name"].as_str().unwrap_or("?").to_string();
-        println!();
-        println!("{}", ui::item(&format!("seat {name}")));
+        ui::blank();
+        ui::say(&ui::item(&format!("seat {name}")));
         match stage_seat(g, s) {
             Ok(sha) => {
-                println!("{}", ui::sub(&ui::status_line(Glyph::Ok, "staged (CLI + kiosk assets, signed, encrypted to the seat's birth cert)")));
+                ui::say(&ui::sub(&ui::status_line(Glyph::Ok, "staged (CLI + kiosk assets, signed, encrypted to the seat's birth cert)")));
                 pending.push(super::provision::PendingApply { node: name, sha, legacy: false });
             }
             Err(e) => {
-                println!("{}", ui::sub(&ui::status_line(Glyph::Err, &format!("not staged: {e}"))));
+                ui::say_err(&ui::sub(&ui::status_line(Glyph::Err, &format!("not staged: {e}"))));
                 failed.push(name);
             }
         }
     }
     if !pending.is_empty() {
-        println!();
+        ui::blank();
         let ends = super::provision::wait_applied_via(g, &pending, 600, 5,
             &|n| format!("/api/cluster/seats/{n}/status"), "seat");
         let tag = super::cluster_verify::controller_stack_tag();
@@ -2158,13 +2158,13 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
                 rows.push(json!({"seat": n, "ok": seat_ok, "outcome": format!("{end:?}"),
                     "checks": checks.iter().map(|c| json!({"name": c.name, "verdict": format!("{:?}", c.verdict), "detail": c.detail})).collect::<Vec<_>>()}));
             } else {
-                println!();
-                println!("{}", ui::item(&format!("seat {n}")));
+                ui::blank();
+                ui::say(&ui::item(&format!("seat {n}")));
                 match &end {
                     super::provision::ApplyEnd::Applied { rc: 0, .. } => {}
-                    super::provision::ApplyEnd::Applied { rc: _, msg } => println!("{}", ui::sub(&ui::status_line(Glyph::Err,
+                    super::provision::ApplyEnd::Applied { rc: _, msg } => ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
                         &format!("apply failed: {}", msg.trim_start_matches("apply failed: ").chars().take(300).collect::<String>())))),
-                    other => println!("{}", ui::sub(&ui::status_line(Glyph::Err, &format!("{other:?} within 10m")))),
+                    other => ui::say_err(&ui::sub(&ui::status_line(Glyph::Err, &format!("{other:?} within 10m")))),
                 }
                 for c in &checks {
                     let glyph = match c.verdict {
@@ -2172,7 +2172,7 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
                         super::cluster_verify::Verdict::Fail => Glyph::Err,
                         _ => Glyph::Warn,
                     };
-                    println!("{}", ui::sub(&ui::status_line(glyph, &format!("{}: {}", c.name, c.detail))));
+                    ui::say(&ui::sub(&ui::status_line(glyph, &format!("{}: {}", c.name, c.detail))));
                 }
             }
         }
