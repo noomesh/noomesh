@@ -2162,14 +2162,6 @@ fn reconcile_storage_dirs(g: &Globals, root: &std::path::Path) {
 /// The storage directories this binary's release expects (onboarding's
 /// `onboard::STORAGE_SUBDIRS` floor, placed by `storage_targets_in`) that do not
 /// exist yet.
-#[cfg(test)]
-fn missing_storage_dirs(data: &std::path::Path, state: &std::path::Path, pg_data: &str) -> Vec<(String, std::path::PathBuf)> {
-    storage_dir_targets(data, state, pg_data)
-        .into_iter()
-        .filter(|(_, p)| !p.exists())
-        .collect()
-}
-
 /// Every storage directory this binary's release expects, placed under the
 /// data and state roots (onboarding's own `storage_targets_in`).
 pub(crate) fn storage_dir_targets(data: &std::path::Path, state: &std::path::Path, pg_data: &str) -> Vec<(String, std::path::PathBuf)> {
@@ -6499,7 +6491,12 @@ pub(crate) mod phase_src {
 
 #[cfg(test)]
 mod storage_dir_tests {
-    use super::missing_storage_dirs;
+    fn missing_storage_dirs(data: &std::path::Path, state: &std::path::Path, pg_data: &str) -> Vec<(String, std::path::PathBuf)> {
+        super::storage_dir_targets(data, state, pg_data)
+            .into_iter()
+            .filter(|(_, p)| !p.exists())
+            .collect()
+    }
     use crate::onboard::{STATE_SUBDIRS, STORAGE_SUBDIRS};
 
     /// A data root holding every storage directory except `skip`.
