@@ -3630,8 +3630,7 @@ fn asset_platforms(toks: &[serde_json::Value], own_os: &str, own_arch: &str) -> 
         ("linux".to_string(), "aarch64".to_string()),
     ];
     v.extend(toks.iter().filter_map(|t| t.get("facts")).map(|f| {
-        let os = f.get("os").and_then(|v| v.as_str()).unwrap_or("linux").to_string();
-        let arch = f.get("arch").and_then(|v| v.as_str()).unwrap_or("x86_64").to_string();
+        let (os, arch, _) = crate::commands::provision::platform_from_facts(Some(f));
         (os, arch)
     }));
     v.sort();

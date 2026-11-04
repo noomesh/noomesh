@@ -336,7 +336,7 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     let mut files = base_bundle_files(&id, &machine, env_body, binary, material);
     attach_applier_and_fetcher(&machine, &mut files);
     attach_hostd(g, &site, &enrollment, &machine, &mut files);
-    attach_cli(&a, &site, &enrollment, &id, &machine, &mut files);
+    attach_cli(g, &a, &site, &enrollment, &id, &machine, &mut files);
     attach_harness(g, &a, &site, &enrollment, &id, &machine, &vars, &mut files);
     attach_vendor_clis(g, &a, &site, &enrollment, &machine, &work, &mut files);
     drop_binaries_the_node_already_runs(g, &a, &machine, &mut files);
@@ -1132,14 +1132,11 @@ fn attach_applier_and_fetcher(m: &ProvMachine, files: &mut Vec<(&'static str, Ve
 /// which is what every Linux node did on 2026-09-19, because the
 /// rail never carried this kind. Absent from an older release is a
 /// note, not a failure: the applier simply installs no helper.
-fn attach_hostd(g: &Globals, site: &ProvSite, enr: &ProvEnrollment, m: &ProvMachine, files: &mut Vec<(&'static str, Vec<u8>)>) {
+fn attach_hostd(g: &Globals, site: &ProvSite, enr: &ProvEnrollment, _m: &ProvMachine, files: &mut Vec<(&'static str, Vec<u8>)>) {
     let root = site.root.clone();
     let record = &enr.record;
-    let darwin = m.darwin;
-    let f = record.as_ref().and_then(|r| r.facts.clone()).unwrap_or_else(|| serde_json::json!({}));
-    let os = f.get("os").and_then(|v| v.as_str()).unwrap_or(if darwin { "macos" } else { "linux" });
-    let arch = f.get("arch").and_then(|v| v.as_str()).unwrap_or("x86_64");
-    if let Some(asset) = hostd_asset_for(os, arch) {
+    let (os, arch, _) = platform_from_facts(record.as_ref().and_then(|r| r.facts.as_ref()));
+    if let Some(asset) = hostd_asset_for(&os, &arch) {
         match cached_release_asset(g, &root, &asset) {
             Ok(bytes) => {
                 nnote(&format!("bundle carries the privileged helper ({asset}, {})", human_bytes(bytes.len())));
@@ -1164,30 +1161,37 @@ fn attach_hostd(g: &Globals, site: &ProvSite, enr: &ProvEnrollment, m: &ProvMach
 /// running `noo upgrade`, managed by its CLI stage, and a bundle that
 /// installs over it replaces the binary mid-run (2026-09-11: every node
 /// after host8 in `--nodes` failed to spawn). Same rail, one file fewer.
-fn attach_cli(a: &ProvisionArgs, site: &ProvSite, enr: &ProvEnrollment, id: &ProvIdentity, m: &ProvMachine, files: &mut Vec<(&'static str, Vec<u8>)>) {
+fn attach_cli(g: &Globals, a: &ProvisionArgs, site: &ProvSite, enr: &ProvEnrollment, id: &ProvIdentity, _m: &ProvMachine, files: &mut Vec<(&'static str, Vec<u8>)>) {
     let node = a.node.clone();
     let root = site.root.clone();
     let record = &enr.record;
     let user = id.user.clone();
-    let darwin = m.darwin;
     let self_node = crate::role::is_self_node(&node);
-    let f = record.as_ref().and_then(|r| r.facts.clone()).unwrap_or_else(|| serde_json::json!({}));
-    let os = f.get("os").and_then(|v| v.as_str()).unwrap_or(if darwin { "macos" } else { "linux" });
-    let arch = f.get("arch").and_then(|v| v.as_str()).unwrap_or("x86_64");
+    let (os, arch, _) = platform_from_facts(record.as_ref().and_then(|r| r.facts.as_ref()));
     if self_node {
         nnote("this is the controller's own node — the bundle carries no CLI (noo upgrade manages it)");
-    } else {
-        if let Some(asset) = cli_asset_for(os, arch) {
-            let cached = cli_asset_cache_dir(&root).join(&asset);
-            if let Ok(bytes) = std::fs::read(&cached) {
-                if !bytes.is_empty() && !user.is_empty() {
-                    nnote(&format!("bundle carries the CLI for {user} ({asset}, {})", human_bytes(bytes.len())));
-                    files.push(("cli-binary", bytes));
-                    files.push(("cli-user", user.clone().into_bytes()));
-                }
+    } else if let Some(asset) = cli_asset_for(&os, &arch) {
+        // Fetched like the harness and hostd when the cache lacks it (i11b):
+        // reading the cache only left a node without its CLI, silently,
+        // after one failed fetch during `noo upgrade`.
+        match cached_release_asset(g, &root, &asset) {
+            Ok(bytes) if !user.is_empty() => {
+                nnote(&format!("bundle carries the CLI for {user} ({asset}, {})", human_bytes(bytes.len())));
+                files.push(("cli-binary", bytes));
+                files.push(("cli-user", user.clone().into_bytes()));
             }
+            Ok(_) => nnote(&format!("no CLI in this bundle: {node} has no enrolling user on record to own ~/.local/bin")),
+            Err(e) => nnote(&cli_omitted_note(&node, &asset, &e)),
         }
     }
+}
+
+/// What provision says when a node's bundle goes without its CLI because
+/// the asset is neither cached nor fetchable: the node, the asset, why, and
+/// the command that refills the cache.
+pub(crate) fn cli_omitted_note(node: &str, asset: &str, err: &str) -> String {
+    format!("no CLI in this bundle: {asset} is not in the controller's asset cache and the release \
+             fetch failed ({err}) — {node} keeps the CLI it has until `noo upgrade --nodes` caches it")
 }
 
 /// The harness: the gateway binary for this platform, its env and unit.
@@ -1207,9 +1211,7 @@ fn attach_harness(g: &Globals, a: &ProvisionArgs, site: &ProvSite, enr: &ProvEnr
     if self_node {
         nnote("this is the controller's own node — no harness in the bundle (the gateway runs turns in process)");
     } else {
-        let f = record.as_ref().and_then(|r| r.facts.clone()).unwrap_or_else(|| serde_json::json!({}));
-        let os = f.get("os").and_then(|v| v.as_str()).unwrap_or(if darwin { "macos" } else { "linux" });
-        let arch = f.get("arch").and_then(|v| v.as_str()).unwrap_or("x86_64");
+        let (os, arch, _) = platform_from_facts(record.as_ref().and_then(|r| r.facts.as_ref()));
         let knows_harness = applier_knows_harness_kinds(darwin, &node_app_version);
         if !knows_harness {
             nnote(&format!(
@@ -1218,7 +1220,7 @@ fn attach_harness(g: &Globals, a: &ProvisionArgs, site: &ProvSite, enr: &ProvEnr
                  newer CLI; the next restage carries the harness."
             ));
         }
-        match gateway_asset_for(os, arch).filter(|_| knows_harness) {
+        match gateway_asset_for(&os, &arch).filter(|_| knows_harness) {
             Some(asset) => {
                 match cached_release_asset(g, &root, &asset) {
                     Ok(bytes) if super::enroll::asset_harness_env_tmpl().is_empty() => {
@@ -2234,6 +2236,18 @@ pub(crate) struct Redemption {
 pub(crate) fn redemption_record(g: &Globals, node: &str) -> Option<Redemption> {
     let doc = crate::http::get_json(g, "/api/security/bootstrap-tokens", true, 15);
     let toks = doc.get("tokens")?.as_array()?;
+    let t = latest_redemption(toks, node)?;
+    Some(Redemption {
+        ip: t.get("used_by_ip").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        user: t.get("enroll_user").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        birth_cert: t.get("birth_cert").and_then(|v| v.as_str()).map(str::to_string),
+        facts: t.get("facts").cloned().filter(|f| f.is_object()),
+    })
+}
+
+/// `node`'s latest redeemed, unrevoked bootstrap token: its enrollment
+/// record (provision's, and `cluster verify`'s for the node's platform).
+pub(crate) fn latest_redemption<'a>(toks: &'a [serde_json::Value], node: &str) -> Option<&'a serde_json::Value> {
     let mut hits: Vec<&serde_json::Value> = toks.iter()
         .filter(|t| t.get("node_name").and_then(|v| v.as_str()) == Some(node)
             && !t.get("revoked").and_then(|v| v.as_bool()).unwrap_or(false)
@@ -2241,13 +2255,7 @@ pub(crate) fn redemption_record(g: &Globals, node: &str) -> Option<Redemption> {
             && t.get("used_by_ip").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()))
         .collect();
     hits.sort_by_key(|t| t.get("used_at").and_then(|v| v.as_str()).unwrap_or("").to_string());
-    let t = hits.last()?;
-    Some(Redemption {
-        ip: t.get("used_by_ip").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        user: t.get("enroll_user").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        birth_cert: t.get("birth_cert").and_then(|v| v.as_str()).map(str::to_string),
-        facts: t.get("facts").cloned().filter(|f| f.is_object()),
-    })
+    hits.last().copied()
 }
 
 /// Tier ladder over the ENROLLMENT facts JSON — same rules as the gate-facts
@@ -3453,6 +3461,17 @@ pub(crate) fn gzip_bundle(bundle: &Path, work: &Path) -> Result<std::path::PathB
 /// POST raw bytes to a gateway path (the encrypted bundle — too large and
 /// too binary for the JSON helpers). Same base-url/TLS posture as http.rs;
 /// bearer from the standard resolution.
+/// A node's platform for release assets, from its enrollment facts:
+/// `(os, arch, assumed)`. Absent facts (older enroll clients, the
+/// controller's own local lane) read as linux / x86_64, and `assumed` says
+/// so. Provision, `noo upgrade --nodes` (what it caches) and `cluster
+/// verify` (what is missing) all ask HERE, so they agree on what a node needs.
+pub(crate) fn platform_from_facts(facts: Option<&serde_json::Value>) -> (String, String, bool) {
+    let os = facts.and_then(|f| f.get("os")).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let arch = facts.and_then(|f| f.get("arch")).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    (os.unwrap_or("linux").to_string(), arch.unwrap_or("x86_64").to_string(), os.is_none() || arch.is_none())
+}
+
 /// The release asset name for a node's platform, from its enrollment facts.
 /// The gateway binary asset for a node's platform: what
 /// the node runs as its harness.
@@ -4407,6 +4426,37 @@ mod cluster_trust_tests {
         let body = "NODE_ID=h\nNODE_AGENT_BIND=all\n# NODE_AGENT_BIND is a comment\nLOG_LEVEL=info\n";
         assert_eq!(drop_env_keys(body, CLUSTER_TRUST_ENV_KEYS),
             "NODE_ID=h\n# NODE_AGENT_BIND is a comment\nLOG_LEVEL=info\n");
+    }
+}
+
+#[cfg(test)]
+mod cli_asset_refill_tests {
+    /// i11b: a CLI asset missing from the cache is fetched like the harness
+    /// and hostd (attach_cli used to read the cache only and drop it
+    /// silently), and when it cannot be had the note names the node, the
+    /// asset, why, and the command that refills the cache.
+    #[test]
+    fn a_missing_cli_asset_is_fetched_or_said_never_dropped() {
+        let src = include_str!("provision.rs");
+        let src = src.split("#[cfg(test)]").next().unwrap();
+        let cli = &src[src.find("fn attach_cli(").unwrap()..];
+        let cli = &cli[..cli.find("\n\u{7d}\n").unwrap()];
+        assert!(cli.contains("cached_release_asset(g, &root, &asset)"), "the CLI asset is fetched when the cache lacks it");
+        assert!(cli.contains("Err(e) => nnote(&cli_omitted_note(&node, &asset, &e))"), "and its absence is said");
+        assert!(!cli.contains("std::fs::read(&cached)"), "never a cache-only read again");
+        let note = super::cli_omitted_note("robopi", "noo-aarch64-unknown-linux-musl", "HTTP 503");
+        for want in ["robopi", "noo-aarch64-unknown-linux-musl", "HTTP 503", "noo upgrade --nodes"] {
+            assert!(note.contains(want), "{want}: {note}");
+        }
+    }
+
+    /// Absent facts read as linux / x86_64 and say so.
+    #[test]
+    fn platform_from_facts_names_an_assumption() {
+        let mac = serde_json::json!({ "os": "macos", "arch": "arm64" });
+        assert_eq!(super::platform_from_facts(Some(&mac)), ("macos".into(), "arm64".into(), false));
+        assert_eq!(super::platform_from_facts(None), ("linux".into(), "x86_64".into(), true));
+        assert_eq!(super::platform_from_facts(Some(&serde_json::json!({ "os": "linux" }))), ("linux".into(), "x86_64".into(), true));
     }
 }
 
