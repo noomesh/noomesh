@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -363,5 +365,63 @@ func TestModelStatsCarryTheContextCeiling(t *testing.T) {
 	got := n.ModelStats(context.Background())
 	if len(got) != 1 || got[0].ContextLength != 262144 {
 		t.Fatalf("ModelStats = %+v, want the ceiling 262144", got)
+	}
+}
+
+func TestSeedHeldRoundTripAndTolerance(t *testing.T) {
+	const base = "http://127.0.0.1:59871"
+	dir := t.TempDir()
+	t.Cleanup(func() { NewNativeAt(base).SetHeldModels() })
+
+	// Missing file: empty, no error.
+	if got, err := NewNativeAt(base).SeedHeld(dir); err != nil || len(got) != 0 {
+		t.Fatalf("missing file: got %v, %v; want empty, nil", got, err)
+	}
+
+	writer := NewNativeAt(base)
+	writer.SetHeldModels("gemma4:12b", "harrier:latest")
+	if err := writer.SaveHeld(dir); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(filepath.Join(dir, heldStateFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("state file mode %v, want 0600", fi.Mode().Perm())
+	}
+	if m, _ := filepath.Glob(filepath.Join(dir, "*.tmp")); len(m) != 0 {
+		t.Fatalf("temp files left behind: %v", m)
+	}
+
+	// A restart: memory empty, file present.
+	writer.SetHeldModels()
+	got, err := NewNativeAt(base).SeedHeld(dir)
+	if err != nil || len(got) != 2 || got[0] != "gemma4:12b" || got[1] != "harrier:latest" {
+		t.Fatalf("seed: got %v, %v", got, err)
+	}
+
+	// Another server's entry is not seeded onto this lane.
+	if got, _ := NewNativeAt("http://127.0.0.1:59872").SeedHeld(dir); len(got) != 0 {
+		t.Fatalf("seeded a different base's models: %v", got)
+	}
+
+	// Corrupt file: error, nothing seeded, no panic.
+	NewNativeAt(base).SetHeldModels()
+	if err := os.WriteFile(filepath.Join(dir, heldStateFile), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	n := NewNativeAt(base)
+	if got, err := n.SeedHeld(dir); err == nil || len(got) != 0 || len(n.HeldModels()) != 0 {
+		t.Fatalf("corrupt file: got %v, %v; want empty and an error to log", got, err)
+	}
+	// And a save rebuilds it.
+	n.SetHeldModels("gemma4:12b")
+	if err := n.SaveHeld(dir); err != nil {
+		t.Fatal(err)
+	}
+	n.SetHeldModels()
+	if got, err := n.SeedHeld(dir); err != nil || len(got) != 1 {
+		t.Fatalf("rebuilt: got %v, %v", got, err)
 	}
 }

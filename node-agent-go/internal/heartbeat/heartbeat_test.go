@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/noomesh/noomesh/node-agent-go/internal/backendrt"
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
 	"github.com/noomesh/noomesh/node-agent-go/internal/metrics"
@@ -945,4 +946,80 @@ func TestModelStatsMergesTheChatModel(t *testing.T) {
 	if got := r.modelStats(); len(got) != 2 || got[0].Name != "harrier:latest" || got[1] != chat[0] {
 		t.Errorf("with an ollama lane: %+v", got)
 	}
+}
+
+// Followup i418: a restarted agent's adopted ollama must name its placed model
+// on the FIRST heartbeat, with no reconcile pass. The ollama here is up with
+// nothing loaded (the state right after a restart); the model can only come
+// from the persisted held set.
+func TestFirstHeartbeatAfterRestartReportsSeededHeldModel(t *testing.T) {
+	ollama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tags":
+			_, _ = w.Write([]byte(`{"models":[{"name":"gemma4:12b","model":"gemma4:12b"}]}`))
+		case "/api/ps":
+			_, _ = w.Write([]byte(`{"models":[]}`))
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer ollama.Close()
+	stateDir := t.TempDir()
+
+	// The previous agent process: a reconcile pass held the model and saved it.
+	prev := backendrt.NewStackAt(ollama.URL)
+	prev.SetHeldModels("gemma4:12b")
+	if err := prev.SaveHeld(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	prev.SetHeldModels() // process memory is gone
+
+	run := func(t *testing.T) map[string]any {
+		t.Helper()
+		var payload map[string]any
+		ctrl := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/cluster/nodes/test-node/heartbeat" {
+				_ = json.NewDecoder(r.Body).Decode(&payload)
+			}
+			w.WriteHeader(200)
+		}))
+		defer ctrl.Close()
+		// The new agent process: seed at start, then the heartbeat.
+		lane := backendrt.NewStackAt(ollama.URL)
+		lane.SetHeldModels() // a fresh process: the held store starts empty
+		if _, err := lane.SeedHeld(stateDir); err != nil {
+			t.Logf("seed (logged, carried on empty): %v", err)
+		}
+		cfg := &config.Config{NodeID: "test-node", ControllerURL: ctrl.URL, Tier: 3}
+		gpu := hardware.NewGPUDetector(nil, "http")
+		rpt := NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, metrics.NewCollector(gpu), gpu,
+			func() map[string]string { return lane.Running(context.Background()) },
+			func() int { return 0 },
+		)
+		rpt.SendHeartbeat()
+		backends, _ := payload["running_backends"].(map[string]any)
+		return backends
+	}
+
+	t.Run("stored placement", func(t *testing.T) {
+		if got := run(t)["ollama"]; got != "gemma4:12b" {
+			t.Fatalf("first heartbeat running_backends[ollama] = %v, want gemma4:12b", got)
+		}
+	})
+	t.Run("corrupt file", func(t *testing.T) {
+		if err := os.WriteFile(filepath.Join(stateDir, "held-models.json"), []byte("\x00garbage"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := run(t)["ollama"]; !ok || got != "" {
+			t.Fatalf("corrupt file: running_backends[ollama] = %v (present=%v), want empty string", got, ok)
+		}
+	})
+	t.Run("missing file", func(t *testing.T) {
+		if err := os.Remove(filepath.Join(stateDir, "held-models.json")); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := run(t)["ollama"]; !ok || got != "" {
+			t.Fatalf("missing file: running_backends[ollama] = %v (present=%v), want empty string", got, ok)
+		}
+	})
 }
