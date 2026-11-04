@@ -29,11 +29,25 @@
       "reason": "not on disk"
     },
     {
+      "backend": "ollama",
+      "model": "mystery:7b",
+      "role": "chat",
+      "state": "unknown",
+      "reason": "no presence yet"
+    },
+    {
       "backend": "llamacpp",
       "model": "m.gguf",
       "role": "",
-      "state": "unknown",
+      "state": "serving",
       "reason": ""
+    },
+    {
+      "backend": "reranker",
+      "model": "bge-rerank.gguf",
+      "role": "rerank",
+      "state": "down",
+      "reason": "not running"
     },
     {
       "backend": "embedding",

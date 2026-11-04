@@ -52,6 +52,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/harnessprofile"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hostsvc"
 	"github.com/noomesh/noomesh/node-agent-go/internal/mcpsrv"
+	"github.com/noomesh/noomesh/node-agent-go/internal/modelname"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
 	"github.com/noomesh/noomesh/node-agent-go/internal/occupancy"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
@@ -642,7 +643,7 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 		// Converged when running with the placement's model (compare
 		// basenames — detection may report a bare filename) AND the
 		// stamped spec hash matches the desired one.
-		if isRunning && modelMatches(curModel, p.Model) {
+		if isRunning && modelname.Matches(curModel, p.Model) {
 			// Running as asked: an earlier start failure no longer
 			// applies.
 			refusals.Clear("backend_start", p.Backend)
@@ -1315,19 +1316,6 @@ func shortHash(h string) string {
 		return h[:8]
 	}
 	return h
-}
-
-func modelMatches(current, desired string) bool {
-	if current == "" || desired == "" {
-		return current == desired
-	}
-	base := func(s string) string {
-		if i := strings.LastIndex(s, "/"); i >= 0 {
-			return s[i+1:]
-		}
-		return s
-	}
-	return base(current) == base(desired)
 }
 
 func (r *Reconciler) fetch(ctx context.Context) (*desiredConfig, error) {
