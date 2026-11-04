@@ -309,6 +309,19 @@ func (a *Agent) Run() error {
 	a.startMessaging(ctx)
 	time.Sleep(2 * time.Second) // give messaging time to connect
 
+	// 2b. Seed the adopted ollama's held model from the last reconcile, so the
+	// first heartbeat names it. Without this it reports no model until the
+	// first reconcile pass (30 s after start, then the class-table refresh)
+	// and chat to the node 404s meanwhile (followup i418). The reconciler
+	// stays the authority; a missing or corrupt file means start empty.
+	if a.native != nil {
+		if held, err := a.native.SeedHeld(a.cfg.StateDir); err != nil {
+			slog.Warn("held model seed unreadable; starting empty", "error", err)
+		} else if len(held) > 0 {
+			slog.Info("held model seeded from last reconcile", "models", held)
+		}
+	}
+
 	// 3. Register with controller (retry until available)
 	caps := hardware.Detect(a.cfg, a.gpu)
 	hostIP := heartbeat.DetectHostIP(a.cfg)

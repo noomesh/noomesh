@@ -612,6 +612,11 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 					hcancel()
 				}
 				r.native.SetHeldModels(held...)
+				// Persist it so the next agent start can report this
+				// model on its first heartbeat (followup i418).
+				if err := r.native.SaveHeld(r.cfg.StateDir); err != nil {
+					slog.Warn("reconcile.held_state_save_failed", "error", err)
+				}
 				// A launchd-managed ollama gets the placement env
 				// through its plist (OllamaGuard.Tuning): the merged
 				// env when several roles share the daemon, a lone
