@@ -1303,6 +1303,33 @@ fn is_wsl2(running_kernel: &str) -> bool {
 ///
 /// 2026-09-24, the controller: kernel 7.1.5 installed, the next boot hung,
 /// and the fallback (6.18.7) had no NVIDIA module. Each of those is a row.
+/// What fixes "the next boot (`next`) has no NVIDIA module", by how this
+/// node's driver is installed (followup 476): hostd's `nvidia_driver` fact,
+/// else (an hostd before the fact) an installed `nvidia-dkms-<N>` package.
+/// `sudo dkms autoinstall` answers "command not found" on a box that uses
+/// Ubuntu's prebuilt modules; the prebuilt package is named only from the
+/// fact, never guessed, and with neither the remedy names no install
+/// command. Every branch keeps the way out: the running kernel as default.
+pub(crate) fn gpu_driver_remedy(host: &Value, next: &str, running: &str, runbook: &str) -> String {
+    let back = format!("make {running} the default again (see {runbook})");
+    let dkms_pkg = host["platform"].as_object()
+        .is_some_and(|p| p.keys().any(|k| k.strip_prefix("nvidia-dkms-").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))));
+    let ver = host["nvidia_driver_version"].as_str().filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()));
+    match (host["nvidia_driver"].as_str(), ver) {
+        (Some("dkms"), _) => format!("sudo dkms autoinstall -k {next}   # or {back}"),
+        (Some("prebuilt"), Some(v)) => {
+            let meta = if next.ends_with("-generic") {
+                format!("; linux-modules-nvidia-{v}-generic installs it with each new kernel")
+            } else {
+                String::new()
+            };
+            format!("sudo apt install linux-modules-nvidia-{v}-{next}   # prebuilt driver{meta}; or {back}")
+        }
+        (None, _) if dkms_pkg => format!("sudo dkms autoinstall -k {next}   # or {back}"),
+        _ => format!("{back}; `dpkg -l | grep -E 'nvidia-dkms|linux-modules-nvidia'` shows how the driver is installed"),
+    }
+}
+
 pub(crate) fn host_checks(id: &str, host: &Value, hostd_alive: bool) -> Vec<Check> {
     let mut out = Vec::new();
     if host.is_null() {
@@ -1355,7 +1382,7 @@ pub(crate) fn host_checks(id: &str, host: &Value, hostd_alive: bool) -> Vec<Chec
         if !default.is_empty() && has(&default) == Some(false) {
             out.push(fail("gpu driver",
                 format!("the next boot ({default}) has no NVIDIA module — the GPU backends will not start"),
-                format!("sudo dkms autoinstall -k {default}   # or make {running} the default again (see {runbook})")));
+                gpu_driver_remedy(host, &default, &running, runbook)));
         } else if !fallback.is_empty() && has(&fallback) == Some(false) {
             out.push(warn("gpu driver",
                 format!("the fallback kernel ({fallback}) has no NVIDIA module — if the next boot fails, the node comes back without its GPU"),
@@ -6996,6 +7023,65 @@ mod tests {
             "tailscale_state": "Running", "tailscale_online": true,
             "telemetry": { "tailscale_logs": "off", "tailscale_logs_configured": true, "os_reporters": [] }
         })
+    }
+
+    /// host2 before a reboot into 7.0.0-34: running 31 has its module, the
+    /// next boot does not. `extra` adds the driver facts under test.
+    fn next_boot_without_module(extra: Value) -> Value {
+        let mut h = serde_json::json!({
+            "os": "linux", "running_kernel": "7.0.0-31-generic", "boot_loader": "grub",
+            "default_kernel": "7.0.0-34-generic", "fallback_kernel": "7.0.0-31-generic",
+            "nvidia_module": { "7.0.0-31-generic": true, "7.0.0-34-generic": false },
+            "platform": { "nvidia-driver-580": "580.95.05", "tailscale": "1.102.4" },
+            "held": [], "tailscale_state": "Running", "tailscale_online": true,
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            if k == "platform" {
+                for (pk, pv) in v.as_object().unwrap() {
+                    h["platform"][pk] = pv.clone();
+                }
+            } else {
+                h[k] = v.clone();
+            }
+        }
+        h
+    }
+
+    fn gpu_row(h: &Value) -> Check {
+        host_checks("host2", h, true).into_iter().find(|c| c.name == "gpu driver").expect("a gpu driver row")
+    }
+
+    /// Followup 476: the remedy matches how the driver is installed.
+    #[test]
+    fn the_gpu_driver_remedy_follows_the_install_layout() {
+        // dkms (the fact)
+        let r = gpu_row(&next_boot_without_module(serde_json::json!({ "nvidia_driver": "dkms" })));
+        assert_eq!(r.verdict, Verdict::Fail);
+        let rem = r.remedy.unwrap();
+        assert!(rem.starts_with("sudo dkms autoinstall -k 7.0.0-34-generic"), "{rem}");
+        // prebuilt (the fact): the package for the next kernel, never dkms
+        let r = gpu_row(&next_boot_without_module(serde_json::json!({ "nvidia_driver": "prebuilt", "nvidia_driver_version": "580" })));
+        let rem = r.remedy.unwrap();
+        assert!(rem.starts_with("sudo apt install linux-modules-nvidia-580-7.0.0-34-generic"), "{rem}");
+        assert!(rem.contains("linux-modules-nvidia-580-generic"), "the metapackage for a -generic kernel: {rem}");
+        assert!(!rem.contains("dkms"), "a prebuilt box has no dkms: {rem}");
+        // no fact (an older hostd), nvidia-dkms installed: dkms
+        let r = gpu_row(&next_boot_without_module(serde_json::json!({ "platform": { "nvidia-dkms-580": "580.95.05" } })));
+        assert!(r.remedy.unwrap().starts_with("sudo dkms autoinstall -k 7.0.0-34-generic"));
+        // no fact, no nvidia-dkms: no install command is guessed
+        let r = gpu_row(&next_boot_without_module(serde_json::json!({})));
+        let rem = r.remedy.unwrap();
+        assert!(!rem.contains("sudo dkms") && !rem.contains("apt install"), "{rem}");
+        assert!(rem.starts_with("make 7.0.0-31-generic the default again"), "{rem}");
+        assert!(rem.contains("linux-modules-nvidia"), "it names the dpkg check: {rem}");
+        // prebuilt without a usable version: the same no-guess remedy
+        let r = gpu_row(&next_boot_without_module(serde_json::json!({ "nvidia_driver": "prebuilt" })));
+        assert!(r.remedy.unwrap().starts_with("make 7.0.0-31-generic the default again"));
+        // every branch keeps the way back
+        for extra in [serde_json::json!({ "nvidia_driver": "dkms" }),
+                      serde_json::json!({ "nvidia_driver": "prebuilt", "nvidia_driver_version": "580" }), serde_json::json!({})] {
+            assert!(gpu_row(&next_boot_without_module(extra)).remedy.unwrap().contains("make 7.0.0-31-generic the default again"));
+        }
     }
 
     #[test]
