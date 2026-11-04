@@ -285,6 +285,16 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // `--check --stack`: is a newer stack published, and does an add-on
         // that is on hold this controller back (no lock for it yet)?
         let stack_check = if stack { stack_hold_check(g) } else { None };
+        // This box's data directories against the list the roll will use
+        // (i458: a check only; nothing is created here).
+        let root = crate::envfile::repo_root();
+        let storage = (stack || root.join(".env").is_file()).then(|| {
+            let dirs = storage_dirs_seen(&root);
+            // The running CLI's compiled list is the roll's list unless an
+            // upgrade is pending (KeepNewer: this CLI does the roll).
+            let list_target = if action == CliAction::KeepNewer { current.as_str() } else { version.as_str() };
+            storage_check_report(dirs.as_deref(), &current, list_target)
+        });
         if g.json {
             let mut o = serde_json::json!({
                 "current": current, "latest": version, "up_to_date": up_to_date, "target": target,
@@ -295,6 +305,9 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     "current": cur, "newest": newest,
                     "holds": holds.iter().map(|(a, w)| serde_json::json!({"addon": a, "why": w})).collect::<Vec<_>>(),
                 });
+            }
+            if let Some((j, _, _)) = &storage {
+                o["storage"] = j.clone();
             }
             println!("{o}");
         } else if action == CliAction::KeepNewer {
@@ -315,6 +328,16 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 println!("{}", ui::status_line(glyph, &hold_line(cur, newest, holds)));
                 for (a, why) in holds {
                     println!("{}", ui::note(&format!("{a}: {why}")));
+                }
+            }
+            if let Some((_, c, caveat)) = &storage {
+                let glyph = if c.verdict == crate::commands::cluster_verify::Verdict::Ok { Glyph::Ok } else { Glyph::Warn };
+                println!("{}", ui::status_line(glyph, &format!("{}: {}", c.name, c.detail)));
+                if let Some(r) = &c.remedy {
+                    println!("{}", ui::note(&format!("fix before the roll: {r}")));
+                }
+                if let Some(cv) = caveat {
+                    println!("{}", ui::note(cv));
                 }
             }
         }
@@ -2182,6 +2205,48 @@ pub(crate) fn storage_dir_targets_in_env(root: &std::path::Path) -> Option<Vec<(
     }
     let state = crate::commands::data_root::state_root_of(Some(read("NOO_STATE_ROOT").as_str()), data);
     Some(storage_dir_targets(std::path::Path::new(data), std::path::Path::new(&state), &read("NOO_PG_DATA")))
+}
+
+/// Each of this release's storage directories for the install at `root`
+/// and whether it is there (`None`: no `NOO_DATA_ROOT` in its `.env`).
+/// Reads only; never creates.
+fn storage_dirs_seen(root: &std::path::Path) -> Option<Vec<(String, std::path::PathBuf, crate::commands::cluster_verify::DirSeen)>> {
+    storage_dir_targets_in_env(root).map(|t| t.into_iter().map(|(n, p)| {
+        let seen = crate::commands::cluster_verify::dir_seen(&p);
+        (n, p, seen)
+    }).collect())
+}
+
+/// The `--check` storage row: verify's `data directories` judgement, its
+/// `--json` object, and, when the list checked (`list_from`, the running
+/// CLI's) is not the release that will do the roll (`target`), the caveat
+/// that says so.
+pub(crate) fn storage_check_report(
+    dirs: Option<&[(String, std::path::PathBuf, crate::commands::cluster_verify::DirSeen)]>,
+    list_from: &str,
+    target: &str,
+) -> (serde_json::Value, crate::commands::cluster_verify::Check, Option<String>) {
+    use crate::commands::cluster_verify::{storage_dirs_check, DirSeen, Verdict};
+    let c = storage_dirs_check(dirs);
+    let paths = |want: fn(&DirSeen) -> bool| -> Vec<String> {
+        dirs.unwrap_or_default().iter().filter(|(_, _, s)| want(s)).map(|(_, p, _)| p.display().to_string()).collect()
+    };
+    let missing = paths(|s| *s == DirSeen::Missing);
+    let unchecked = paths(|s| matches!(s, DirSeen::Unchecked(_)));
+    let caveat = (list_from != target).then(|| format!(
+        "checked against noo {list_from}'s list; {target} may add directories: \
+         run `noo upgrade` first, then `noo upgrade --all --check` to check its list"));
+    let j = serde_json::json!({
+        "list_from": list_from,
+        "target": target,
+        "checked": dirs.is_some(),
+        "verdict": if c.verdict == Verdict::Ok { "ok" } else { "warn" },
+        "detail": c.detail,
+        "missing": missing,
+        "unchecked": unchecked,
+        "remedy": c.remedy,
+    });
+    (j, c, caveat)
 }
 
 /// A release can add a service whose compose mounts
@@ -6537,6 +6602,62 @@ mod storage_dir_tests {
         ]);
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// An install root whose `.env` names `data` as its data root.
+    fn install_at(tag: &str, data: &std::path::Path) -> std::path::PathBuf {
+        let r = std::env::temp_dir().join(format!("noo-check-install-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&r);
+        std::fs::create_dir_all(&r).unwrap();
+        std::fs::write(r.join(".env"), format!("NOO_DATA_ROOT={}\n", data.display())).unwrap();
+        r
+    }
+
+    /// `noo upgrade --check`: a box missing one of the roll's directories is
+    /// told which, with the onboarding remedy, and nothing is created.
+    #[test]
+    fn check_names_a_missing_dir_with_the_remedy_and_creates_nothing() {
+        let data = root_without("check", STORAGE_SUBDIRS, &["tempo"]);
+        let root = install_at("check", &data);
+        let dirs = super::storage_dirs_seen(&root);
+        let (j, c, caveat) = super::storage_check_report(dirs.as_deref(), "0.6.17", "0.6.17");
+        assert_eq!(c.verdict, crate::commands::cluster_verify::Verdict::Warn, "{}", c.detail);
+        assert_eq!(j["verdict"], "warn");
+        assert_eq!(j["checked"], true);
+        assert_eq!(j["missing"], serde_json::json!([data.join("tempo").display().to_string()]));
+        assert_eq!(j["remedy"], "noo onboard --only storage");
+        assert_eq!(caveat, None, "the running CLI's list is the roll's");
+        assert!(!data.join("tempo").exists(), "--check must never create a directory");
+        std::fs::create_dir_all(data.join("tempo")).unwrap();
+        let (j, _, _) = super::storage_check_report(super::storage_dirs_seen(&root).as_deref(), "0.6.17", "0.6.17");
+        assert_eq!(j["verdict"], "ok");
+        assert_eq!(j["missing"], serde_json::json!([]));
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With an upgrade pending, the list checked is this CLI's, not the
+    /// target's, and both the row and the JSON say so.
+    #[test]
+    fn a_pending_upgrade_says_whose_list_was_checked() {
+        let data = root_without("pending", STORAGE_SUBDIRS, &[]);
+        let root = install_at("pending", &data);
+        let (j, _, caveat) = super::storage_check_report(super::storage_dirs_seen(&root).as_deref(), "0.6.17", "0.6.18");
+        assert_eq!((j["list_from"].as_str(), j["target"].as_str()), (Some("0.6.17"), Some("0.6.18")));
+        let caveat = caveat.expect("a caveat when the lists differ");
+        assert!(caveat.contains("noo 0.6.17's list") && caveat.contains("noo upgrade --all --check"), "{caveat}");
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// No NOO_DATA_ROOT: "not checked", never OK.
+    #[test]
+    fn check_without_a_data_root_is_not_checked() {
+        let root = std::env::temp_dir().join(format!("noo-check-noenv-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (j, _, _) = super::storage_check_report(super::storage_dirs_seen(&root).as_deref(), "0.6.17", "0.6.17");
+        assert_eq!((j["checked"].as_bool(), j["verdict"].as_str()), (Some(false), Some("warn")));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Postgres' device is NOO_PG_DATA: under another path it is not ours to
