@@ -1,0 +1,51 @@
+{
+  "gpu_compute_cap": "8.6",
+  "nvidia_runtime": true,
+  "nvidia_driver_caps_ok": true,
+  "controller_host": false,
+  "data_root_free_gb": 412.5,
+  "addon_workloads_policy": "approve",
+  "addon_workloads_approvals": [
+    {
+      "addon": "rhaddon",
+      "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ],
+  "model_sets": [
+    {
+      "id": "rh-s2s-7b",
+      "revision": "0123456789abcdef0123456789abcdef01234567",
+      "state": "verified"
+    },
+    {
+      "id": "rh-voices-a",
+      "revision": "v1",
+      "state": "fetching"
+    },
+    {
+      "id": "rh-stt-small",
+      "revision": "r1",
+      "state": "refused",
+      "reason": "set_unverified"
+    }
+  ],
+  "node_workloads": [
+    {
+      "addon": "rhaddon",
+      "name": "worker",
+      "state": "running",
+      "ready": true,
+      "model": "rh-s2s-7b",
+      "slots": 1,
+      "door_port": 38443,
+      "reservation": "0b1f5f0e-6a3e-4a54-9d3c-0a4e5b9c7d21"
+    },
+    {
+      "addon": "rhaddon",
+      "name": "echo",
+      "state": "provisioned",
+      "ready": false,
+      "door_port": 38444
+    }
+  ]
+}
