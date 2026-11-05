@@ -377,6 +377,10 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     //     outside noomesh. A warn by design, never a failure.
     out.extend(gpu_contention_check_at(n, now_unix));
 
+    // 6e'. Lanes (proposal i403): what the class table routes on this node,
+    //      by the agent's lane states.
+    out.push(lanes_check(n));
+
     // 6d. The log shipper (fleet logging phase 6), from the agent's own
     //     account in its heartbeat.
     out.push(log_shipper_check(id, &n["log_ship"], now_unix, hb_recent));
@@ -489,6 +493,63 @@ pub(crate) fn harness_tasks_check(n: &Value) -> Option<Check> {
 
 /// A probe that has not answered for longer than this is no longer a blip.
 const GPU_PROBE_FAILING_SECS: i64 = 60;
+
+/// The `lanes` row (proposal i403, Phase 3): the agent's lanes as the
+/// gateway's class table reads them from the node record. A chat lane the
+/// table does not route (`loading`, `missing`, `down`, or a state this CLI
+/// does not know) is a WARN naming it, its state and the agent's reason: "the
+/// node is up but not serving chat" reads as why, not as absence. `unknown`
+/// and `unplaced` are routed, ranked last, and named as unconfirmed. `[]`
+/// while `running_backends` lists a backend is a WARN (the agent says nothing
+/// is placed, so nothing routes). No key is an agent that predates lanes,
+/// routed by `running_backends`: said, not warned.
+pub(crate) fn lanes_check(n: &Value) -> Check {
+    const NAME: &str = "lanes";
+    let id = n["id"].as_str().unwrap_or("?");
+    let Some(raw) = n.get("lanes") else {
+        return ok(NAME, "not reported (an agent older than 0.6.17): routed by running_backends");
+    };
+    let Some(lanes) = raw.as_array() else {
+        return warn(NAME, "the agent's lanes are not a list: routed by running_backends", Some(format!("noo cluster show {id}")));
+    };
+    let text = |l: &Value, k: &str| l[k].as_str().map(str::trim).unwrap_or("").to_string();
+    let named: Vec<&Value> = lanes.iter().filter(|l| !text(l, "backend").is_empty() && !text(l, "model").is_empty()).collect();
+    if named.is_empty() {
+        let running = match &n["running_backends"] {
+            Value::Object(m) => m.len(),
+            Value::Array(a) => a.len(),
+            _ => 0,
+        };
+        if running > 0 {
+            return warn(NAME, format!("no lanes, yet {running} backend(s) running: this node routes nothing"), Some(format!("noo cluster show {id}")));
+        }
+        return ok(NAME, "none: nothing placed on this node");
+    }
+    let (chat, other): (Vec<&Value>, Vec<&Value>) = named.into_iter().partition(|l| matches!(text(l, "role").as_str(), "" | "chat"));
+    let label = |l: &Value| {
+        let why = text(l, "reason");
+        let base = format!("{}={}: {}", text(l, "backend"), text(l, "model"), text(l, "state"));
+        if why.is_empty() { base } else { format!("{base} ({why})") }
+    };
+    let count = |st: &str| chat.iter().filter(|l| text(l, "state") == st).count();
+    let unconfirmed: Vec<String> = chat.iter().filter(|l| matches!(text(l, "state").as_str(), "unknown" | "unplaced")).map(|l| label(l)).collect();
+    let not_routed: Vec<String> = chat
+        .iter()
+        .filter(|l| !matches!(text(l, "state").as_str(), "serving" | "on_demand" | "unknown" | "unplaced"))
+        .map(|l| label(l))
+        .collect();
+    let mut detail = format!("{} chat lane(s): {} serving, {} on demand", chat.len(), count("serving"), count("on_demand"));
+    if !unconfirmed.is_empty() {
+        detail.push_str(&format!("; unconfirmed, ranked last: {}", unconfirmed.join(", ")));
+    }
+    if !other.is_empty() {
+        detail.push_str(&format!("; {} other lane(s)", other.len()));
+    }
+    if not_routed.is_empty() {
+        return ok(NAME, detail);
+    }
+    warn(NAME, format!("not routed: {}; {detail}", not_routed.join(", ")), Some(format!("noo cluster show {id}")))
+}
 
 /// The `gpu` row, from the node agent's `gpu_contention` heartbeat report
 /// (internal/gpuyield). A node that gave its GPU to other work (VR, model
@@ -11558,6 +11619,74 @@ mod harness_tasks_tests {
     fn the_row_is_in_node_checks() {
         let src = include_str!("cluster_verify.rs").split("mod harness_tasks_tests").next().unwrap();
         assert!(src.contains("out.extend(harness_tasks_check(n));"));
+    }
+}
+
+#[cfg(test)]
+mod lanes_row_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn row(lanes: Option<Value>, running: Value) -> Check {
+        let mut n = json!({"id": "host3", "running_backends": running});
+        if let Some(l) = lanes {
+            n["lanes"] = l;
+        }
+        lanes_check(&n)
+    }
+
+    fn lane(backend: &str, model: &str, role: &str, state: &str, reason: &str) -> Value {
+        json!({"backend": backend, "model": model, "role": role, "state": state, "reason": reason})
+    }
+
+    /// Each state lands where the gateway's class table puts it.
+    #[test]
+    fn a_chat_lane_the_table_does_not_route_warns_with_its_state_and_reason() {
+        let c = row(Some(json!([
+            lane("ollama", "gemma4:12b", "chat", "serving", ""),
+            lane("ollama", "qwen3:4b", "chat", "on_demand", "not loaded"),
+            lane("vllm", "org/new-model", "chat", "loading", "reconciling: runtime runs org/old-model"),
+            lane("llamacpp", "small.gguf", "", "missing", "not on disk"),
+            lane("vllm", "org/other", "chat", "down", "not running"),
+            lane("ollama", "harrier", "embed", "missing", "not on disk"),
+            lane("native", "mistral", "chat", "unplaced", ""),
+        ])), json!({}));
+        assert_eq!((c.name, c.verdict), ("lanes", Verdict::Warn), "{}", c.detail);
+        assert!(c.detail.starts_with(
+            "not routed: vllm=org/new-model: loading (reconciling: runtime runs org/old-model), llamacpp=small.gguf: missing (not on disk), vllm=org/other: down (not running); "
+        ), "{}", c.detail);
+        assert!(c.detail.contains("6 chat lane(s): 1 serving, 1 on demand; unconfirmed, ranked last: native=mistral: unplaced; 1 other lane(s)"), "{}", c.detail);
+        assert!(!c.detail.contains("harrier"), "a non-chat lane is not judged here: {}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster show host3"));
+        let unknown_word = row(Some(json!([lane("vllm", "m", "chat", "frobbing", "")])), json!({}));
+        assert_eq!(unknown_word.verdict, Verdict::Warn, "a state the gateway cannot read is not routed");
+    }
+
+    #[test]
+    fn serving_on_demand_and_unconfirmed_lanes_are_ok() {
+        let c = row(Some(json!([lane("ollama", "gemma4:12b", "chat", "serving", ""), lane("ollama", "q", "chat", "unknown", "no presence yet")])), json!({}));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert_eq!(c.detail, "2 chat lane(s): 1 serving, 0 on demand; unconfirmed, ranked last: ollama=q: unknown (no presence yet)");
+    }
+
+    #[test]
+    fn no_key_is_an_older_agent_and_an_empty_list_with_backends_running_routes_nothing() {
+        let old = row(None, json!({"ollama": "gemma4:12b"}));
+        assert_eq!(old.verdict, Verdict::Ok);
+        assert!(old.detail.contains("routed by running_backends"), "{}", old.detail);
+        let empty = row(Some(json!([])), json!({"ollama": "gemma4:12b"}));
+        assert_eq!(empty.verdict, Verdict::Warn);
+        assert_eq!(empty.detail, "no lanes, yet 1 backend(s) running: this node routes nothing");
+        assert_eq!(row(Some(json!([])), json!({})).verdict, Verdict::Ok);
+        assert_eq!(row(Some(json!("garbage")), json!({})).verdict, Verdict::Warn);
+        // A lane with no model is dropped by the gateway, so it is not counted.
+        assert_eq!(row(Some(json!([lane("vllm", "", "chat", "serving", "")])), json!({})).detail, "none: nothing placed on this node");
+    }
+
+    #[test]
+    fn the_row_is_on_every_node() {
+        let code = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        assert!(code.contains("out.push(lanes_check(n));"));
     }
 }
 
