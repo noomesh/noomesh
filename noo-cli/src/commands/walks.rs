@@ -392,7 +392,7 @@ mod tests {
     #[test]
     fn the_empty_hint_does_not_claim_entity_search_saves_a_thread() {
         let src = include_str!("walks.rs");
-        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let body = crate::test_src::own_code(src);
         assert!(
             !body.contains("\"noo graph search"),
             "`noo graph search` is not a way to save a thread"

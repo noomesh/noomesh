@@ -1827,13 +1827,11 @@ mod at_rest_tests {
         let posture = m.find("steps::security_posture(ctx);").expect("posture call");
         let record = m.find("steps::at_rest_record(ctx);").expect("the opt-out is never recorded");
         assert!(record > posture, "the flag is written where posture is applied, after the gateway is up");
-        let steps = include_str!("steps.rs");
-        let storage = &steps[steps.find("pub fn storage(").unwrap()..];
-        let storage = &storage[..storage.find("\n}\n").unwrap()];
+        let steps = crate::test_src::own_code(include_str!("steps.rs"));
+        let storage = crate::test_src::fn_body(&steps, "pub fn storage(");
         assert!(storage.contains("at_rest_choice(ctx, &chosen_root)"), "the storage step does not ask about encryption at rest");
         // the wizard never writes the flag before the gateway exists
-        let choice = &steps[steps.find("fn at_rest_choice(").unwrap()..];
-        let choice = &choice[..choice.find("\n}\n").unwrap()];
+        let choice = crate::test_src::fn_body(&steps, "fn at_rest_choice(");
         assert!(!choice.contains("flags/set"), "at_rest_choice must only remember the answer");
         assert!(choice.contains("state.at_rest_opt_out = true"));
         assert!(choice.contains("at_rest_encrypt_fresh(ctx, data_root)"), "'yes' makes the encrypted volume");
@@ -1846,9 +1844,8 @@ mod at_rest_tests {
     /// stops the wizard there.
     #[test]
     fn a_yes_makes_the_volume_before_any_state_or_service() {
-        let steps = include_str!("steps.rs");
-        let storage = &steps[steps.find("pub fn storage(").unwrap()..];
-        let storage = &storage[..storage.find("\n}\n").unwrap()];
+        let steps = crate::test_src::own_code(include_str!("steps.rs"));
+        let storage = crate::test_src::fn_body(&steps, "pub fn storage(");
         let at = |needle: &str| storage.find(needle).unwrap_or_else(|| panic!("storage() lacks {needle}"));
         let choice = at("if !at_rest_choice(ctx, &chosen_root) {");
         assert!(at("ensure_root_dir(ctx, Path::new(&chosen_root));") < choice, "the data root must exist first (the backing file lives in it)");
@@ -1861,12 +1858,10 @@ mod at_rest_tests {
         let stop = run.find("if ctx.state.interrupted {").expect("run_all must stop after a failed volume");
         assert!(stop < run.find("steps::services(ctx);").unwrap(), "the stop must come before the services start");
         // the yes path is the trait-driven setup_fresh, and a failure is a hard failure
-        let enc = &steps[steps.find("fn at_rest_encrypt_fresh(").unwrap()..];
-        let enc = &enc[..enc.find("\n}\n").unwrap()];
+        let enc = crate::test_src::fn_body(&steps, "fn at_rest_encrypt_fresh(");
         assert!(enc.contains("vol::setup_fresh(&mut io, plan)"));
         assert!(enc.contains("Err(e) => at_rest_stop(ctx, &e)"));
-        let stop_fn = &steps[steps.find("fn at_rest_stop(").unwrap()..];
-        assert!(stop_fn[..stop_fn.find("\n}\n").unwrap()].contains("ctx.state.interrupted = true"));
+        assert!(crate::test_src::fn_body(&steps, "fn at_rest_stop(").contains("ctx.state.interrupted = true"));
         assert!(!State::default().at_rest_recovery_ack, "no acknowledgement until the person retypes the key");
     }
 

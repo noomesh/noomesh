@@ -971,9 +971,8 @@ mod entity_cleanup_tests {
     /// the command talks to a live gateway.
     #[test]
     fn apply_confirms_before_it_sends_the_apply_request() {
-        let src = include_str!("graph.rs");
-        let body = &src[src.find("pub fn graph_entity_cleanup").unwrap()..];
-        let body = &body[..body.find("\n}\n").unwrap()];
+        let src = crate::test_src::own_code(include_str!("graph.rs"));
+        let body = crate::test_src::fn_body(&src, "pub fn graph_entity_cleanup");
         let preview = body.find("cleanup_body(false").expect("a preview request");
         let confirm = body.find("confirm_destructive(").expect("--apply must confirm");
         let apply = body.find("cleanup_body(true").expect("an apply request");
@@ -983,9 +982,8 @@ mod entity_cleanup_tests {
 
     #[test]
     fn the_restore_hint_names_the_real_command_with_the_run_id() {
-        let src = include_str!("graph.rs");
-        let body = &src[src.find("pub fn graph_entity_cleanup").unwrap()..];
-        let body = &body[..body.find("\n}\n").unwrap()];
+        let src = crate::test_src::own_code(include_str!("graph.rs"));
+        let body = crate::test_src::fn_body(&src, "pub fn graph_entity_cleanup");
         assert!(body.contains("noo graph prune restore --run {run_id}"), "the undo hint is the real command");
         assert!(!body.contains("to undo: POST"), "no raw-route hint any more");
     }

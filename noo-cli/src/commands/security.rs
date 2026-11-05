@@ -3269,11 +3269,9 @@ mod audit_verify_export_tests {
 mod admin_password_reset_tests {
     /// The function body, from its signature to the next top-level fn.
     fn body() -> &'static str {
-        let src = include_str!("security.rs");
-        let src = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
-        let start = src.find("pub fn security_admin_password_reset").expect("the verb exists");
-        let rest = &src[start..];
-        &rest[..rest[1..].find("\npub fn ").map(|i| i + 1).unwrap_or(rest.len())]
+        static CODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let code = CODE.get_or_init(|| crate::test_src::own_code(include_str!("security.rs")));
+        crate::test_src::fn_body(code, "pub fn security_admin_password_reset")
     }
 
     /// Whether the new password may be printed is decided BEFORE the old one
@@ -3323,12 +3321,11 @@ mod admin_password_reset_tests {
 mod clifix_security_tests {
     use super::*;
 
-    /// The body of the first `pub fn` named `sig` (up to the next top-level item).
+    /// The body of the first `pub fn` named `sig`, through its own closing
+    /// brace (followup 215: `test_src::fn_body`).
     fn body_of<'a>(src: &'a str, sig: &str) -> &'a str {
-        let start = src.find(sig).unwrap_or_else(|| panic!("{sig} not found"));
-        let rest = &src[start + sig.len()..];
-        let end = rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len());
-        &rest[..end]
+        let item = crate::test_src::fn_body(src, sig);
+        &item[sig.len()..]
     }
 
     /// A confirmation that comes after the request is a notice, not a gate.

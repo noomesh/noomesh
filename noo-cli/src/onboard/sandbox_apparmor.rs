@@ -243,9 +243,8 @@ mod tests {
     /// that refuses every call.
     #[test]
     fn the_services_step_installs_the_profile() {
-        let src = include_str!("steps.rs");
-        let body = &src[src.find("pub fn services(ctx: &mut Ctx)").expect("services step")..];
-        let body = &body[..body.find("\n}\n").expect("end of services")];
+        let src = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&src, "pub fn services(ctx: &mut Ctx)");
         let at = body.find("super::sandbox_apparmor::ensure(ctx)").expect("services() must call sandbox_apparmor::ensure (i263b)");
         let start = body.find("run_compose").unwrap_or(usize::MAX);
         assert!(at < start, "the profile is installed before the stack starts");

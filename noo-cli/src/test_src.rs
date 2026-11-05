@@ -301,11 +301,9 @@ mod tests {
         let _ = fn_body(&code, "fn renamed_away(");
     }
 
-    /// The cut at the first `#[cfg(test)]` cannot come back: no file under
-    /// noo-cli/src except this one splits on it (followup 215, slice 2).
-    #[test]
-    fn no_guard_cuts_at_the_first_cfg_test() {
-        let needle = concat!("split(\"#[cfg(", "test)]\")");
+    /// Every file under noo-cli/src except this one that contains any of
+    /// `needles`, after proving it read the tree (at least 50 files).
+    fn files_containing(needles: &[String]) -> Vec<String> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let (mut seen, mut hits) = (0usize, Vec::new());
         let mut dirs = vec![root];
@@ -316,14 +314,80 @@ mod tests {
                     dirs.push(p);
                 } else if p.extension().is_some_and(|x| x == "rs") && p.file_name().is_some_and(|n| n != "test_src.rs") {
                     seen += 1;
-                    if std::fs::read_to_string(&p).unwrap_or_default().contains(needle) {
+                    let text = std::fs::read_to_string(&p).unwrap_or_default();
+                    if needles.iter().any(|n| text.contains(n.as_str())) {
                         hits.push(p.display().to_string());
                     }
                 }
             }
         }
         assert!(seen >= 50, "read only {seen} files: this guard is looking in the wrong place");
+        hits
+    }
+
+    /// The cut at the first `#[cfg(test)]` cannot come back, in either
+    /// shape: `split(...)` (followup 215, slice 2) or `find(...)` used as the
+    /// end of a slice (slice 3, which found ten that slice 2's guard missed).
+    #[test]
+    fn no_guard_cuts_at_the_first_cfg_test() {
+        let attr = concat!("\"#[cfg(", "test)]\")");
+        let hits = files_containing(&[format!("split({attr})"), format!("find({attr})")]);
         assert!(hits.is_empty(), "read source through crate::test_src::own_code instead: {hits:?}");
+    }
+
+    /// No guard bounds a body by the first column-0 closing brace (followup
+    /// 215, slice 3): `fn_body` bounds it by its own. The needles are built
+    /// at run time, so this file carries no bare closing brace in a string.
+    #[test]
+    fn no_body_is_cut_at_a_column_zero_brace() {
+        let close = '\u{7d}';
+        let hits = files_containing(&[
+            format!("find(\"\\n{close}\\n\")"),
+            "find(\"\\n\\u{7d}\\n\")".to_string(),
+        ]);
+        assert!(hits.is_empty(), "bound the body with crate::test_src::fn_body instead: {hits:?}");
+    }
+
+    /// The failure mode slice 3 removes: a column-0 `}` inside a raw string
+    /// in the body. The first column-0 brace is not the function's end.
+    #[test]
+    fn a_column_zero_brace_in_a_string_does_not_end_the_body() {
+        let src = [
+            "fn render() -> &'static str \u{7b}",
+            "    let t = r#\"",
+            "head \u{7b}",
+            "\u{7d}",
+            "\"#;",
+            "    after_the_string();",
+            "    t",
+            "\u{7d}",
+            "",
+            "fn next() \u{7b}\u{7d}",
+        ].join("\n");
+        let body = fn_body(&src, "fn render(");
+        assert!(body.contains("after_the_string();") && body.ends_with('\u{7d}'), "{body}");
+        assert!(!body.contains("fn next("), "{body}");
+    }
+
+    /// A non-`fn` item is bounded the same way: a module and an impl block,
+    /// as guards that bound a test module do (node_fetch's #692 guard).
+    #[test]
+    fn a_module_or_impl_marker_is_bounded_by_its_own_brace() {
+        let src = [
+            "#[cfg(test)]",
+            "mod inner \u{7b}",
+            "    fn a() \u{7b} let _ = \"\u{7d}\"; \u{7d}",
+            "    fn b() \u{7b}\u{7d}",
+            "\u{7d}",
+            "impl Thing \u{7b}",
+            "    fn c(&self) \u{7b}\u{7d}",
+            "\u{7d}",
+            "fn after() \u{7b}\u{7d}",
+        ].join("\n");
+        let m = fn_body(&src, "mod inner \u{7b}");
+        assert!(m.contains("fn b()") && !m.contains("impl Thing"), "{m}");
+        let i = fn_body(&src, "impl Thing");
+        assert!(i.contains("fn c(&self)") && !i.contains("fn after("), "{i}");
     }
 
     /// Non-ASCII in comments and code survives blanking.
