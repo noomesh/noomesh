@@ -211,8 +211,11 @@ def _classify(changed: list[str], **env: str) -> dict[str, str]:
     assert lc in run, "the llamacpp diff line moved; update this harness"
     run = run.replace(lc, 'lc_changed="$FIXTURE"')
     with tempfile.NamedTemporaryFile("w+", suffix=".out") as out:
+        # Actions runs a `run:` step as `bash -e -o pipefail`; so does this
+        # (a `printf | grep -q` that SIGPIPEs is false only under pipefail).
         subprocess.run(
-            ["bash", "-c", "set -eu\n" + run],
+            ["bash", "-c", "set -euo pipefail\n" + run],
+            cwd=ROOT,
             env={
                 "PATH": "/usr/bin:/bin",
                 "BASE": "fixture",
@@ -514,3 +517,69 @@ def test_a_push_builds_ollama_only_when_it_differs_from_the_last_release(tmp_pat
     assert unrelated["ollama"] == "false", unrelated
     touched = _scope_on_push(tmp_path / "t", [released, ({ol: "FROM y\n"}, None)])
     assert touched["ollama"] == "true" and touched["llamacpp"] == "false", touched
+
+
+_CRATES = {"gateway-rust": "gateway", "noo-cli": "cli"}
+_INCLUDE = re.compile(r'include_(?:str|bytes)!\(\s*"([^"]+)"\s*\)')
+
+
+def _out_of_crate_inputs() -> dict[str, set[str]]:
+    """Every repository file outside a crate that the crate compiles in
+    (include_str!/include_bytes!), mapped to the scope outputs of the crates
+    that read it. Read here independently of the step's own derivation."""
+    found: dict[str, set[str]] = {}
+    for crate, lane in _CRATES.items():
+        for src in sorted((ROOT / crate).rglob("*.rs")):
+            if "target" in src.relative_to(ROOT).parts:
+                continue
+            for m in _INCLUDE.finditer(src.read_text(errors="replace")):
+                path = (src.parent / m.group(1)).resolve()
+                try:
+                    rel = path.relative_to(ROOT).as_posix()
+                except ValueError:
+                    continue
+                if not rel.startswith(crate + "/"):
+                    found.setdefault(rel, set()).add(lane)
+    return found
+
+
+def _step_crate_inputs(crate: str) -> set[str]:
+    """The scope step's OWN derivation (`crate_inputs`), run once on this tree."""
+    import subprocess
+
+    run = next(s["run"] for s in _workflow()["jobs"]["scope"]["steps"] if s.get("id") == "diff")
+    start = run.index("crate_inputs() {\n")
+    fn = run[start : run.index("\n}\n", start) + 3]
+    r = subprocess.run(["bash", "-c", "set -euo pipefail\n" + fn + f"crate_inputs {crate}\n"],
+                       cwd=ROOT, env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, check=True)
+    return set(r.stdout.split())
+
+
+def test_every_out_of_crate_include_arms_its_crates_lane() -> None:
+    """A file a crate compiles in from outside its own tree is that crate's
+    input wherever it lives. 2026-11-05: tests/fixtures/test_src_cases.json,
+    read by both crates, routed as `tests/*` to sqlx only, so a change to its
+    rows built neither Rust lane, on the PR or in the merge queue; a docs page
+    the CLI embeds was "documentation only"."""
+    inputs = _out_of_crate_inputs()
+    # The scan found what this test is about (not a silent empty pass).
+    assert inputs.get("tests/fixtures/test_src_cases.json") == {"gateway", "cli"}, inputs
+    assert inputs.get("tests/fixtures/own_image_cases.json") == {"gateway", "cli"}, inputs
+    assert len(inputs) >= 20, f"only {len(inputs)} out-of-crate inputs found: {sorted(inputs)}"
+    # The step derives exactly this set for each crate, so every one arms it.
+    for crate, lane in _CRATES.items():
+        want = {p for p, lanes in inputs.items() if lane in lanes}
+        got = _step_crate_inputs(crate)
+        assert got == want, f"{crate}: the scope step misses {sorted(want - got)}, extra {sorted(got - want)}"
+    # End to end, one per bucket a compiled-in file used to fall in.
+    for path, lanes in [("tests/fixtures/test_src_cases.json", {"gateway", "cli"}),
+                        ("docs/getting-started/add-ons.md", {"cli"}),
+                        ("gateway-rust/src/routes/users.rs", {"gateway", "cli"}),
+                        ("node-agent-go/internal/docker/backends.go", {"cli"})]:
+        assert path in inputs, f"{path} is no longer compiled in; pick another example"
+        got = _classify([path])
+        assert got["code"] == "true" and all(got[l] == "true" for l in lanes), f"{path}: {got}"
+    # Only the crate that reads it: a gateway-only fixture does not build the CLI.
+    only_gw = sorted(p for p, l in inputs.items() if l == {"gateway"} and p.startswith("tests/"))
+    assert only_gw, "no gateway-only fixture left to hold the narrowing to"
+    assert _classify([only_gw[0]])["cli"] == "false", only_gw[0]

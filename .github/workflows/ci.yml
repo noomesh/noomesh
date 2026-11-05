@@ -198,6 +198,35 @@ jobs:
         fi
         changed="$(git diff --name-only "$BASE...HEAD")"
         [ -n "$changed" ] || { all_true; exit 0; }
+        # ── What each crate compiles in from outside its own tree ────────
+        # An include_str!/include_bytes! of a file elsewhere in the repo
+        # (tests/fixtures/test_src_cases.json, a gateway route file the CLI
+        # pins, a docs page) makes that file the crate's input wherever it
+        # lives: it arms the crate's lane below, whatever bucket its path
+        # falls in, and it is never "documentation only". Derived from the
+        # crates' own source on every run, never listed by hand
+        # (tests/test_ci_scope_declarations.py holds every such path to its
+        # lane). 2026-11-05: test_src_cases.json, read by both crates, routed
+        # as tests/* to sqlx only, so a row change built neither Rust lane on
+        # the PR or in the merge queue.
+        crate_inputs() {
+          grep -rnoE --include='*.rs' 'include_(str|bytes)!\("[^"]+"\)' "$1" 2>/dev/null \
+            | while IFS=: read -r src _ m; do
+                rel="${m#*\(\"}"; rel="${rel%\"\)}"
+                realpath -m --relative-to=. "$(dirname "$src")/$rel"
+              done | grep -v "^$1/" | sort -u || true
+        }
+        gw_inputs="$(crate_inputs gateway-rust)"
+        cli_inputs="$(crate_inputs noo-cli)"
+        gw_in=false; cli_in=false
+        while IFS= read -r f; do
+          [ -n "$f" ] || continue
+          if grep -qxF -- "$f" <<<"$gw_inputs"; then gw_in=true; fi
+          if grep -qxF -- "$f" <<<"$cli_inputs"; then cli_in=true; fi
+        done <<EOF
+        $changed
+        EOF
+        echo "crate inputs changed: gateway=$gw_in cli=$cli_in"
         echo "changed files:"; printf '%s\n' "$changed" | sed 's/^/  /'
         # COUNT the documentation lines and compare with the total, rather than
         # asking `grep -v` whether a non-doc line exists: `grep -c` means the
@@ -206,7 +235,7 @@ jobs:
         total="$(printf '%s\n' "$changed" | wc -l)"
         docs="$(printf '%s\n' "$changed" | grep -cE '^(internal/|docs/)|\.md$' || true)"
         echo "changed=$total docs=$docs"
-        if [ "$total" -eq "$docs" ]; then
+        if [ "$total" -eq "$docs" ] && [ "$gw_in" = false ] && [ "$cli_in" = false ]; then
           echo "code=false" >> "$GITHUB_OUTPUT"
           echo "documentation only — the build steps will be skipped"
         else
@@ -248,6 +277,9 @@ jobs:
           gateway=true; cli=true; sqlx=true; ui=true
           echo "unrecognised path(s) — every gate stays on:$unknown"
         fi
+        # A crate's out-of-tree input (crate_inputs, above) arms its own lane.
+        if [ "$gw_in" = true ]; then gateway=true; fi
+        if [ "$cli_in" = true ]; then cli=true; fi
         # docker/Dockerfile.llamacpp is routed to "unknown" above (docker/ is
         # not a recognised tree), so it re-arms every gate like any other
         # unrecognised path. Its OWN build
