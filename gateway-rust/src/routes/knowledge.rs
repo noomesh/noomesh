@@ -39,7 +39,10 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         // RAG query/ingest — kb group of the memory provider (still NATS →
         // Python PageIndex runtime inside trellion, via the facade)
-        .route("/api/v1/rag/query", post(rag_query))
+        // Standalone queries may include owner-only Google evidence.
+        .route("/api/v1/rag/query", post(rag_query).layer(axum::middleware::from_fn(
+            super::connections::private_response_headers,
+        )))
         .route("/api/v1/rag/retag", post(rag_retag))
         .route("/api/v1/rag/ingest", post(rag_ingest))
         // Document upload — the multipart endpoint died with the archived
