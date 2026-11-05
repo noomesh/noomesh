@@ -60,3 +60,22 @@ func TestIsARM(t *testing.T) {
 		t.Errorf("IsARM() = %v, expected %v for GOARCH=%s", isArm, expected, runtime.GOARCH)
 	}
 }
+
+func TestMemoryInfoFrom(t *testing.T) {
+	if got := memoryInfoFrom(0, 0); got != (MemoryInfo{}) {
+		t.Errorf("zero total = %+v, want zero value", got)
+	}
+	// The darwin vm_stat failure: total known, available -1.
+	got := memoryInfoFrom(16<<20, -1)
+	if got.TotalKB != 16<<20 || got.AvailableKnown || got.AvailableKB != 0 {
+		t.Errorf("vm_stat failure = %+v, want total set and AvailableKnown=false", got)
+	}
+	got = memoryInfoFrom(16<<20, 4<<20)
+	if !got.AvailableKnown || got.AvailableKB != 4<<20 {
+		t.Errorf("good read = %+v", got)
+	}
+	// A genuine 0 available is a measurement, not an unknown.
+	if got = memoryInfoFrom(16<<20, 0); !got.AvailableKnown {
+		t.Errorf("measured 0 must stay known: %+v", got)
+	}
+}
