@@ -116,17 +116,25 @@ impl DumpTables {
     }
 }
 
+/// Create `path` new and 0600 from its first byte. The dump holds every
+/// secret table, and the roles file names every role: neither may exist at
+/// the umask's mode even for a moment. `create_new` also refuses a path that
+/// is already there, a planted symlink included.
+pub(crate) fn create_private(path: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// Dump `noomesh` from the `pg` container into `out` (gzip, 0600, created
 /// fresh) and count its tables per schema in the same pass, so the count is
 /// the dump's own and cannot race a migration that runs mid-export.
 pub(crate) fn dump_counting(pg: &str, out: &Path) -> Result<BTreeMap<String, u64>, String> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(out)
-        .map_err(|e| format!("{}: {e}", out.display()))?;
+    let file = create_private(out)?;
     let mut child = Command::new("docker")
         .args(["exec", pg, "pg_dump", "-U", "noo", "noomesh"])
         .stdin(Stdio::null())
@@ -311,6 +319,26 @@ pub(crate) fn roles_without_password(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dump and the roles file are created 0600, never at the umask's
+    /// mode (the old export's shell line set `umask 077` for the same reason).
+    #[test]
+    fn the_dump_and_the_roles_file_are_private_from_the_start() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("noo-migrate-db-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("pg.sql.gz");
+        drop(create_private(&f).expect("created"));
+        assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(create_private(&f).is_err(), "an existing path is refused, never reused");
+        let _ = std::fs::remove_dir_all(&dir);
+        let code = crate::test_src::own_code(include_str!("migrate_db.rs"));
+        assert!(crate::test_src::fn_body(&code, "fn dump_counting(").contains("create_private(out)"), "the dump file is created private");
+        let export = crate::test_src::own_code(include_str!("migrate.rs"));
+        assert!(export.contains("migrate_db::dump_counting("), "export dumps through dump_counting");
+        assert!(export.contains("migrate_db::create_private("), "export writes the roles file private");
+    }
 
     #[test]
     fn the_dump_count_reads_table_headers_and_skips_copy_data() {

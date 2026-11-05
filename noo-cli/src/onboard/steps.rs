@@ -9302,10 +9302,8 @@ mod archive_restore_tests {
     /// the table count matches.
     #[test]
     fn the_restore_reaches_psql_only_through_the_stopping_helper() {
-        let src = include_str!("steps.rs");
-        let start = src.find("fn restore_archive_db(").expect("restore_archive_db is gone: this guard is stale");
-        let body = &src[start..];
-        let body = &body[..body.find("\n\u{7d}\n").expect("the end of restore_archive_db")];
+        let code = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&code, "fn restore_archive_db(");
         assert!(body.contains("mdb::psql(PG, \"noomesh\", &mut flate2::read::GzDecoder"), "the dump goes through mdb::psql");
         assert!(!body.contains("gunzip") && !body.contains("\"psql\""), "a direct psql here would skip ON_ERROR_STOP");
         let check = body.find("mdb::table_check(").expect("the table check");

@@ -265,10 +265,8 @@ pub fn migrate_export(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             return Err("no noo_* roles found; the dump would not restore on a clean server".into());
         }
         {
-            use std::os::unix::fs::OpenOptionsExt as _;
             use std::io::Write as _;
-            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
-                .open(stage.join(super::migrate_db::ROLES_MEMBER)).map_err(|e| e.to_string())?;
+            let mut f = super::migrate_db::create_private(&stage.join(super::migrate_db::ROLES_MEMBER))?;
             writeln!(f, "-- noomesh cluster roles for this archive's dump (no passwords)\n{}", roles.trim_end())
                 .map_err(|e| e.to_string())?;
         }
@@ -476,6 +474,11 @@ mod stage_tests {
         let src = include_str!("migrate.rs");
         let code = crate::test_src::own_code(src);
         assert!(!code.contains("std::process::id()"), "a pid-named stage is back");
-        assert!(code.contains("umask 077; set -o pipefail; docker exec"), "the dump lost its umask");
+        // The dump is no longer a shell line under `umask 077`: it streams
+        // through migrate_db::dump_counting, which creates the file 0600
+        // with create_new (pinned functionally there, in
+        // the_dump_and_the_roles_file_are_private_from_the_start).
+        assert!(code.contains("migrate_db::dump_counting(&pg, &stage.join(\"db/pg.sql.gz\"))"), "the dump lost its private file");
+        assert!(!code.contains("pg_dump -U noo noomesh | gzip >"), "a shell redirect would create the dump at the umask's mode");
     }
 }
