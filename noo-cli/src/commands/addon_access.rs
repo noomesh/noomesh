@@ -23,7 +23,7 @@
 use serde_json::{json, Value};
 
 use crate::args::{ArgError, Args};
-use crate::http::{get_json, put_json};
+use crate::http::{get_json, get_json_try, put_json, put_json_try};
 use crate::ui::{self, Col, Glyph};
 use crate::{Globals, Unhandled};
 
@@ -257,6 +257,217 @@ fn cell(v: &Value) -> String {
     }
 }
 
+// ── suggestions become grants (f99 3.2) ──────────────────────────────────
+//
+// An add-on's `suggested` audience grants nothing. It becomes a grant only
+// when an admin accepts it, once, here: `noo addons accept-suggestions`, which
+// `enable` runs when the gateway already has the add-on loaded. The question
+// is asked against the gateway's live feature list, never the bundle on disk,
+// and an upgrade never asks it.
+
+/// What the caller said about the question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Consent {
+    /// `--yes` (`enable --accept-suggested`): accept without asking.
+    Yes,
+    /// Nothing said: ask on a TTY, otherwise print the command.
+    Ask,
+    /// `enable --no-grants`: do not ask.
+    No,
+}
+
+/// What to do about pending suggestions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Act {
+    Write,
+    Prompt,
+    /// `--json` or no TTY: never prompt, write nothing, print the command.
+    Hint,
+    Skip,
+}
+
+pub(crate) fn act_for(consent: Consent, json: bool, tty: bool) -> Act {
+    match consent {
+        Consent::Yes => Act::Write,
+        Consent::No => Act::Skip,
+        Consent::Ask if json || !tty => Act::Hint,
+        Consent::Ask => Act::Prompt,
+    }
+}
+
+/// `(feature, role)` for each feature the add-on suggests for `user` or
+/// `operator` whose cell for that role is not set yet (on or off: an admin's
+/// explicit `off` is a decision, not a gap). Declaration order.
+pub(crate) fn pending_suggestions(body: &Value) -> Vec<(String, String)> {
+    let settings = body["settings"].as_array().map(|a| a.as_slice()).unwrap_or_default();
+    feature_grants(body)
+        .into_iter()
+        .filter(|f| matches!(f.suggested.as_str(), "user" | "operator"))
+        .filter(|f| {
+            let cell = format!("role:{}", f.suggested);
+            !settings.iter().any(|s| s["feature"].as_str() == Some(f.name.as_str()) && s["subject"].as_str() == Some(cell.as_str()))
+        })
+        .map(|f| (f.name, f.suggested))
+        .collect()
+}
+
+/// The command that asks the question.
+pub(crate) fn accept_command(addon: &str) -> String {
+    format!("noo addons accept-suggestions {addon}")
+}
+
+/// What the question came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Suggestions {
+    Legacy,
+    NothingPending,
+    Hinted(Vec<(String, String)>),
+    Skipped(Vec<(String, String)>),
+    Declined(Vec<(String, String)>),
+    Written { on: Vec<(String, String)>, failed: Vec<(String, String, String)> },
+}
+
+impl Suggestions {
+    pub(crate) fn json(&self) -> Value {
+        let pairs = |v: &[(String, String)]| v.iter().map(|(f, r)| json!({"feature": f, "role": r})).collect::<Vec<_>>();
+        match self {
+            Suggestions::Legacy => json!({"legacy": true}),
+            Suggestions::NothingPending => json!({"pending": []}),
+            Suggestions::Hinted(p) => json!({"pending": pairs(p), "written": false}),
+            Suggestions::Skipped(p) => json!({"pending": pairs(p), "written": false, "skipped": true}),
+            Suggestions::Declined(p) => json!({"pending": pairs(p), "written": false, "declined": true}),
+            Suggestions::Written { on, failed } => json!({
+                "accepted": pairs(on),
+                "failed": failed.iter().map(|(f, r, e)| json!({"feature": f, "role": r, "error": e})).collect::<Vec<_>>(),
+            }),
+        }
+    }
+
+    /// Human lines (no trailing newline per line; one per entry).
+    pub(crate) fn lines(&self, addon: &str) -> Vec<(Glyph, String)> {
+        let list = |v: &[(String, String)]| v.iter().map(|(f, r)| format!("{f} for {r}")).collect::<Vec<_>>().join(", ");
+        match self {
+            Suggestions::Legacy => vec![(Glyph::Bullet, format!("{addon} declares no features: its routes keep their own roles"))],
+            Suggestions::NothingPending => vec![(Glyph::Ok, format!("{addon}: every suggested feature is already set"))],
+            Suggestions::Hinted(p) => vec![(
+                Glyph::Bullet,
+                format!("{addon} suggests {}: not turned on (asked only on a terminal, or with --yes)", list(p)),
+            )],
+            Suggestions::Skipped(p) => vec![(Glyph::Bullet, format!("{addon} suggests {}: left off (--no-grants)", list(p)))],
+            Suggestions::Declined(p) => vec![(Glyph::Bullet, format!("{addon} suggests {}: left off", list(p)))],
+            Suggestions::Written { on, failed } => {
+                let mut v = Vec::new();
+                if !on.is_empty() {
+                    v.push((Glyph::Ok, format!("{addon}: turned on as suggested: {}", list(on))));
+                }
+                for (f, r, e) in failed {
+                    v.push((Glyph::Err, format!("{addon}: {f} for {r} not turned on: {e}")));
+                }
+                v
+            }
+        }
+    }
+}
+
+/// Ask the question against the gateway's live feature list. `Err` is the
+/// read's error: the gateway has not loaded the add-on (404 until the next
+/// `noo stack restart --force`) or could not be reached.
+pub(crate) fn run_suggestions(g: &Globals, addon: &str, consent: Consent) -> Result<Suggestions, String> {
+    let path = format!("/api/addons/{}/access", super::urlencode(addon));
+    let body = get_json_try(g, &path, true, TIMEOUT)?;
+    if body["legacy"].as_bool() == Some(true) {
+        return Ok(Suggestions::Legacy);
+    }
+    let pending = pending_suggestions(&body);
+    if pending.is_empty() {
+        return Ok(Suggestions::NothingPending);
+    }
+    let tty = unsafe { libc::isatty(0) } == 1;
+    match act_for(consent, g.json, tty) {
+        Act::Skip => Ok(Suggestions::Skipped(pending)),
+        Act::Hint => Ok(Suggestions::Hinted(pending)),
+        Act::Prompt => {
+            use std::io::{BufRead as _, Write as _};
+            println!("{}", ui::section(&format!("{addon} suggests")));
+            for (f, r) in &pending {
+                let title = body["features"]
+                    .as_array()
+                    .and_then(|a| a.iter().find(|x| x["name"].as_str() == Some(f.as_str())))
+                    .and_then(|x| x["title"].as_str())
+                    .unwrap_or("");
+                println!("  {f} ({title}): every {r}");
+            }
+            eprint!("Turn these on as suggested? [y/N]: ");
+            let _ = std::io::stderr().flush();
+            let mut line = String::new();
+            let _ = std::io::stdin().lock().read_line(&mut line);
+            if matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                Ok(write_suggestions(g, &path, pending))
+            } else {
+                Ok(Suggestions::Declined(pending))
+            }
+        }
+        Act::Write => Ok(write_suggestions(g, &path, pending)),
+    }
+}
+
+fn write_suggestions(g: &Globals, path: &str, pending: Vec<(String, String)>) -> Suggestions {
+    let (mut on, mut failed) = (Vec::new(), Vec::new());
+    for (f, r) in pending {
+        let body = json!({"feature": f, "subject": format!("role:{r}"), "value": "on", "source": "accepted_suggestion"});
+        match put_json_try(g, path, &body, true, TIMEOUT) {
+            Ok(_) => on.push((f, r)),
+            Err(e) => failed.push((f, r, e)),
+        }
+    }
+    Suggestions::Written { on, failed }
+}
+
+/// The line that says when to ask, for an add-on the gateway has not loaded.
+pub(crate) fn not_loaded_line(addon: &str, why: &str) -> String {
+    format!("{addon}: suggested access not asked yet: the gateway loads it on the next `noo stack restart --force` ({why}); then: {}", accept_command(addon))
+}
+
+/// `<name> [--yes]`.
+pub(crate) fn parse_accept_suggestions_with(a: &mut Args) -> Result<(String, bool), ArgError> {
+    let yes = a.flag(&["--yes", "-y"]);
+    let addon = a.one("<name>")?;
+    Ok((addon, yes))
+}
+
+/// `noo addons accept-suggestions <name> [--yes]`: turn each feature on for
+/// the audience its add-on suggests, once, as an admin's decision recorded
+/// `accepted_suggestion`. Asks on a terminal; `--json` and pipes never
+/// prompt and write nothing without `--yes`.
+pub fn addons_accept_suggestions(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let (addon, yes) = parse_accept_suggestions_with(&mut Args::new(args))?;
+    let consent = if yes { Consent::Yes } else { Consent::Ask };
+    let s = match run_suggestions(g, &addon, consent) {
+        Ok(s) => s,
+        Err(e) if e.contains("not registered") => crate::output::fail(
+            g.json,
+            crate::output::ExitCode::Generic,
+            "addon_not_loaded",
+            &format!("the gateway has not loaded {addon} yet, so its features cannot be read or set ({e})"),
+            Some("noo stack restart --force   # then run this again"),
+        ),
+        Err(e) => crate::output::fail(g.json, crate::output::ExitCode::Generic, "access_unread", &e, Some(&format!("noo addons features {addon}"))),
+    };
+    let failed = matches!(&s, Suggestions::Written { failed, .. } if !failed.is_empty());
+    if g.json {
+        println!("{}", json!({"addon": addon, "suggestions": s.json()}));
+    } else {
+        for (glyph, line) in s.lines(&addon) {
+            println!("{}", ui::status_line(glyph, &line));
+        }
+        if let Suggestions::Hinted(_) = s {
+            let cmd = format!("{} --yes", accept_command(&addon));
+            ui::guide(&[(cmd.as_str(), "turn them on as suggested")]);
+        }
+    }
+    Ok(if failed { 1 } else { 0 })
+}
+
 /// `noo addons set-access <name> <feature>... on|off|inherit --role|--team|--user|--key [--reason]`.
 pub fn addons_set_access(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let SetAccess { addon, features, value, subject, reason } = parse_set_access_with(&mut Args::new(args))?;
@@ -407,6 +618,85 @@ mod tests {
         assert!(out.contains("no longer declares (kept, they open nothing): export"), "{out}");
         let legacy = render_show_features("old", &json!({"addon": "old", "legacy": true, "features": [], "settings": []}));
         assert!(legacy.contains("legacy manifest"), "{legacy}");
+    }
+
+    #[test]
+    fn json_and_pipes_never_prompt_and_write_only_with_yes() {
+        assert_eq!(act_for(Consent::Yes, true, false), Act::Write);
+        assert_eq!(act_for(Consent::Yes, false, true), Act::Write);
+        assert_eq!(act_for(Consent::Ask, true, true), Act::Hint, "--json never prompts, even on a terminal");
+        assert_eq!(act_for(Consent::Ask, false, false), Act::Hint, "a pipe never prompts");
+        assert_eq!(act_for(Consent::Ask, false, true), Act::Prompt);
+        assert_eq!(act_for(Consent::No, false, true), Act::Skip);
+        assert_eq!(act_for(Consent::No, true, false), Act::Skip);
+    }
+
+    #[test]
+    fn pending_suggestions_are_the_unset_user_or_operator_cells() {
+        let body = json!({
+            "addon": "rhaddon", "legacy": false,
+            "features": [
+                {"name": "converse", "title": "Talk", "suggested": "user"},
+                {"name": "transcripts", "title": "Read", "suggested": "user"},
+                {"name": "review", "title": "Review", "suggested": "operator"},
+                {"name": "export", "title": "Export", "suggested": "operator"},
+                {"name": "manage", "title": "Manage", "suggested": "admin"},
+                {"name": "internal", "title": "Internal", "suggested": "none"}
+            ],
+            "settings": [
+                {"feature": "transcripts", "subject": "role:user", "allowed": false},
+                {"feature": "export", "subject": "role:operator", "allowed": true},
+                {"feature": "review", "subject": "team:studio", "allowed": true}
+            ]
+        });
+        assert_eq!(
+            pending_suggestions(&body),
+            vec![("converse".to_string(), "user".to_string()), ("review".to_string(), "operator".to_string())],
+            "an explicit off is a decision; a set cell is done; admin and none are never suggestions to accept"
+        );
+        assert!(pending_suggestions(&json!({"legacy": true, "features": [], "settings": []})).is_empty());
+    }
+
+    #[test]
+    fn accept_suggestions_parses_name_and_yes() {
+        assert_eq!(parse_accept_suggestions_with(&mut args(&["rhaddon"])).unwrap(), ("rhaddon".to_string(), false));
+        assert_eq!(parse_accept_suggestions_with(&mut args(&["rhaddon", "--yes"])).unwrap(), ("rhaddon".to_string(), true));
+        assert_eq!(parse_accept_suggestions_with(&mut args(&["-y", "rhaddon"])).unwrap(), ("rhaddon".to_string(), true));
+        assert!(parse_accept_suggestions_with(&mut args(&[])).is_err());
+    }
+
+    #[test]
+    fn a_write_records_accepted_suggestion_and_the_outcome_says_what_happened() {
+        let src = include_str!("addon_access.rs");
+        let body = src.split("fn write_suggestions(").nth(1).unwrap().split("\n\u{7d}\n").next().unwrap();
+        assert!(body.contains(r#""source": "accepted_suggestion""#), "the gateway validates this; the CLI must send it");
+        assert!(body.contains(r#""value": "on""#));
+        let w = Suggestions::Written { on: vec![("converse".into(), "user".into())], failed: vec![("review".into(), "operator".into(), "HTTP 400".into())] };
+        assert_eq!(w.json()["accepted"][0]["feature"], "converse");
+        assert_eq!(w.json()["failed"][0]["error"], "HTTP 400");
+        let h = Suggestions::Hinted(vec![("converse".into(), "user".into())]);
+        assert_eq!(h.json()["written"], false);
+        assert!(h.lines("rhaddon")[0].1.contains("converse for user"));
+    }
+
+    #[test]
+    fn enable_refuses_accept_suggested_before_it_changes_anything_and_upgrade_never_asks() {
+        let addons = include_str!("addons.rs");
+        let set = addons.split("fn set(g: &Globals").nth(1).unwrap().split("\npub fn addons_enable").next().unwrap();
+        let refuse = set.find("--accept-suggested needs the gateway to have").expect("the up-front refusal");
+        let enable = set.find("addon_enable::enable(").expect("the enable step");
+        assert!(refuse < enable, "refused before the switch, the key or the pin is touched");
+        let ask = set.find("access::run_suggestions(g, name, consent)").expect("asked after enable");
+        assert!(enable < ask, "asked only once the switch is on");
+        // The question has exactly two callers: this verb and enable. An
+        // upgrade never grants (proposal 3.2).
+        let code = |t: &'static str| t.split("\n#[cfg(test)]").next().unwrap();
+        let call = ["run_suggestions", "(g,"].concat();
+        let callers = code(addons).matches(&call).count() + code(include_str!("addon_access.rs")).matches(&call).count();
+        assert_eq!(callers, 2, "run_suggestions is called from enable and accept-suggestions only");
+        for upgrade in [include_str!("addon_pins.rs"), include_str!("addon_lock_cmd.rs")] {
+            assert!(!upgrade.contains("run_suggestions") && !upgrade.contains("accepted_suggestion"));
+        }
     }
 
     fn args(v: &[&str]) -> Args {

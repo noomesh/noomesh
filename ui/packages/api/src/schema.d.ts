@@ -24653,6 +24653,11 @@ export interface operations {
                     /** @enum {string} */
                     value: "on" | "off" | "inherit";
                     reason?: string;
+                    /**
+                     * @description operator (the default), or accepted_suggestion: only for value on and the role the add-on suggests the feature for (user or operator); anything else is a 400 naming the declared suggestion.
+                     * @enum {string}
+                     */
+                    source?: "operator" | "accepted_suggestion";
                 };
             };
         };

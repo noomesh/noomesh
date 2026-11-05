@@ -20599,6 +20599,14 @@
                   },
                   "reason": {
                     "type": "string"
+                  },
+                  "source": {
+                    "type": "string",
+                    "enum": [
+                      "operator",
+                      "accepted_suggestion"
+                    ],
+                    "description": "operator (the default), or accepted_suggestion: only for value on and the role the add-on suggests the feature for (user or operator); anything else is a 400 naming the declared suggestion."
                   }
                 }
               }

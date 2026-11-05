@@ -5144,7 +5144,8 @@ pub(crate) fn addon_access_check(reads: AccessReads) -> Check {
         return warn(
             ROW,
             format!("on only for admins, though the add-on suggests more: {}{tail}", list.join(", ")),
-            Some(format!("noo addons set-access {a} {f} on --role {s}   # or keep it admin-only on purpose")),
+            // One command for whoever skipped the question at enable.
+            Some(format!("noo addons accept-suggestions {a}   # or one feature: noo addons set-access {a} {f} on --role {s}")),
         );
     }
     if let Some((a, _)) = reads.iter().find(|(_, r)| r.is_err()) {
@@ -9861,7 +9862,10 @@ mod tests {
         for quiet in ["transcripts", "manage", "internal", "unlabelled"] {
             assert!(!c.detail.contains(&format!("rhaddon/{quiet}")), "{quiet}: {}", c.detail);
         }
-        assert_eq!(c.remedy.as_deref(), Some("noo addons set-access rhaddon converse on --role user   # or keep it admin-only on purpose"));
+        assert_eq!(
+            c.remedy.as_deref(),
+            Some("noo addons accept-suggestions rhaddon   # or one feature: noo addons set-access rhaddon converse on --role user")
+        );
     }
 
     #[test]
