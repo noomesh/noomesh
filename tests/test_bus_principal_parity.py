@@ -21,6 +21,7 @@ import re
 from pathlib import Path
 
 from noomesh.gateway import bus_principal as bp
+from tests import _rust_src as rs
 
 ROOT = Path(__file__).resolve().parents[1]
 RUST = ROOT / "gateway-rust/src/bus_principal.rs"
@@ -41,7 +42,7 @@ def _rust_const(name: str) -> str:
 
 def _rust_claim_fields() -> list[str]:
     """Field names of the `struct Claims`, comments stripped first."""
-    src = re.sub(r"//[^\n]*", "", _rust_source())
+    src = rs.own_code(_rust_source())
     block = re.search(r"struct Claims<'a>\s*\{(.*?)\n\}", src, re.S)
     assert block, "struct Claims not found — did the shape change?"
     return re.findall(r"^\s*(\w+):", block.group(1), re.M)
@@ -99,7 +100,7 @@ def test_the_nonce_cache_outlives_the_window_a_replay_could_use() -> None:
 def test_neither_side_uses_the_controller_secret() -> None:
     """an earlier change: the bus is signed per audience, never with the
     shared controller secret, on either side (comments aside)."""
-    rust = re.sub(r"//[^\n]*", "", _rust_source().split("#[cfg(test)]")[0])
+    rust = rs.own_code(_rust_source())
     assert "NOO_CONTROLLER_SECRET" not in rust and "controller_secret" not in rust
     import ast
 
@@ -165,7 +166,7 @@ def test_the_key_is_retired_not_catalogued() -> None:
     from noomesh.posture import POSTURE_KEYS
 
     assert "NOO_BUS_PRINCIPAL" not in POSTURE_KEYS
-    src = re.sub(r"//[^\n]*", "", POSTURE_RS.read_text())
+    src = rs.own_code(POSTURE_RS.read_text())
     retired = re.search(r"RETIRED_BRIDGES:.*?=\s*&\[(.*?)\n\];", src, re.S)
     assert retired, "RETIRED_BRIDGES not found in posture.rs — did the shape change?"
     m = re.search(r'key:\s*"NOO_BUS_PRINCIPAL",\s*closed:\s*"([^"]*)"', retired.group(1))

@@ -33,6 +33,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tests import _rust_src as rs
 from tests._compose_projection import env_of, full_projection
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,12 +48,9 @@ _DEFAULTED = re.compile(r'unwrap_or\("\$([A-Z_][A-Z0-9_]*)"\)')
 
 
 def _renderer_body() -> str:
-    """nats_users.rs up to its test module: the tests legitimately spell the
+    """nats_users.rs without its test items: the tests legitimately spell the
     legacy text (to prove the parser can SEE it); the renderer must not."""
-    src = RENDERER.read_text()
-    cut = src.find("#[cfg(test)]")
-    assert cut > 0, "nats_users.rs has no test module — the split this guard relies on moved"
-    return src[:cut]
+    return rs.own_code(RENDERER.read_text())
 
 
 def _emitted_variables(body: str) -> set[str]:

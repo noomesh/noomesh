@@ -34,6 +34,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tests import _rust_src as rs
+
 ROOT = Path(__file__).resolve().parents[1]
 MAIN = ROOT / "gateway-rust/src/main.rs"
 TLS = ROOT / "gateway-rust/src/tls.rs"
@@ -63,39 +65,10 @@ ALLOW: dict[tuple[str, str], str] = {
 }
 
 
-def _strip_test_modules(text: str) -> str:
-    """Remove every `#[cfg(test)] mod … { … }` block (brace-matched — some
-    files carry a test module mid-file, not only at the end). Test modules
-    dial ephemeral loopback listeners and are not a door."""
-    out: list[str] = []
-    i = 0
-    while True:
-        j = text.find("#[cfg(test)]", i)
-        if j < 0:
-            out.append(text[i:])
-            break
-        out.append(text[i:j])
-        k = text.find("{", j)
-        if k < 0:
-            break
-        depth, n = 0, k
-        while n < len(text):
-            if text[n] == "{":
-                depth += 1
-            elif text[n] == "}":
-                depth -= 1
-                if depth == 0:
-                    break
-            n += 1
-        i = n + 1
-    return "".join(out)
-
-
 def _code_only(path: Path, text: str) -> str:
     """Drop comment lines and, for Rust, the test modules."""
     if path.suffix == ".rs":
-        text = _strip_test_modules(text)
-        return "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("//"))
+        return rs.own_code(text)
     return "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
 
 

@@ -26,6 +26,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from tests import _rust_src as rs
+
 ROOT = Path(__file__).resolve().parents[1]
 RS = (ROOT / "noo-cli/src/commands/addon_provision.rs").read_text()
 
@@ -83,7 +85,7 @@ def test_the_launcher_composes_nothing_it_was_not_told_to() -> None:
 
 
 def test_the_command_never_declares_the_addon_on() -> None:
-    body = RS[: RS.index("#[cfg(test)]")]
+    body = rs.own_code(RS)
     for forbidden in ("write_addon_at(", "write_addon(", "set_addon("):
         assert forbidden not in body, forbidden
 
@@ -122,8 +124,8 @@ def test_the_broker_has_one_implementation() -> None:
     gw = ROOT / "gateway-rust/src"
     broker = (gw / "system_provision.rs").read_text()
     cli = (gw / "system_provision_cli.rs").read_text()
-    body = broker[: broker.index("#[cfg(test)]")]
+    body = rs.own_code(broker)
     reconcile = body[body.index("pub async fn reconcile(") :]
     assert "provision_system(db, name, spec, &delivered)" in reconcile
     assert "ensure_schema(" not in reconcile and "ensure_role(" not in reconcile
-    assert "provision_system(&db, &p.name, &p.spec, &p.delivered)" in cli[: cli.index("#[cfg(test)]")]
+    assert "provision_system(&db, &p.name, &p.spec, &p.delivered)" in rs.own_code(cli)
