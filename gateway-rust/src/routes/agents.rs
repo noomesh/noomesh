@@ -1075,6 +1075,25 @@ mod tests {
         assert_eq!(caller(&None, &None).harness, "unknown");
     }
 
+    /// Followup 1309: `from_id.node` is where the sender runs, never the
+    /// controller that relayed a door call.
+    #[test]
+    fn a_requester_has_no_sender_node() {
+        for role in [Role::User, Role::Operator] {
+            assert_eq!(caller(&jwt("alice", role, None), &None).sender_node("ctl"), None, "{role:?}");
+            assert_eq!(caller(&jwt("alice", role, Some("mcp-external:acme")), &None).sender_node("ctl"), None, "{role:?}");
+        }
+    }
+
+    #[test]
+    fn a_node_or_internal_caller_keeps_its_real_node() {
+        let node = Some(Extension(ClusterNode("host3".into(), ClusterKind::Node)));
+        assert_eq!(caller(&None, &node).sender_node("ctl").as_deref(), Some("host3"));
+        let internal = Some(Extension(ClusterNode("mcp-local".into(), ClusterKind::Internal)));
+        assert_eq!(caller(&None, &internal).sender_node("ctl").as_deref(), Some("ctl"), "an internal service runs on the controller");
+        assert_eq!(caller(&None, &None).sender_node("ctl"), None, "anonymous is nowhere");
+    }
+
     /// M21b: broadcast fans out to every connected peer, so only callers
     /// the stack already trusts fleet-wide may ask for it.
     #[test]
@@ -1622,6 +1641,21 @@ fn caller(requester: &Option<Extension<RequesterCtx>>, cluster: &Option<Extensio
 }
 
 impl Caller {
+    /// The node a message from this caller was SENT from, or None when the
+    /// gateway cannot know it (followup 1309). A node token names its node;
+    /// an internal service runs on the controller (`here`). A requester
+    /// (a user or operator JWT, the external MCP door) arrives from a machine
+    /// the gateway never sees, so it gets no node: stamping the controller
+    /// made every door message claim to come from the box that relayed it.
+    /// Which door it came through is already `harness`.
+    fn sender_node(&self, here: &str) -> Option<String> {
+        match (&self.node, &self.sub) {
+            (Some(n), _) => Some(n.clone()),
+            (None, None) if self.privileged => Some(here.to_string()),
+            _ => None,
+        }
+    }
+
     /// Is `agent` one this caller may act as or read for?
     ///
     /// a user credential now owns names under its own prefix
@@ -2141,16 +2175,14 @@ async fn messages_send(
     };
 
     let user = who.sub.clone();
-    // A node-bound caller's messages are attributed to that node, not the
-    // controller that relayed them.
-    let node = who.node.clone().unwrap_or_else(crate::agent_messages::controller_node);
+    let node = who.sender_node(&crate::agent_messages::controller_node());
     // `harness` comes from the credential class, never the body — a sender
     // used to be able to label itself `claude-code` and have the CLI print
     // it in the same column as the server-derived user and node. Whatever
     // the caller asked for rides along as a clearly-named claim.
     let identity = crate::agent_messages::Identity::new(
         user.as_deref(),
-        Some(&node),
+        node.as_deref(),
         Some(req.agent.as_deref().unwrap_or(&from)),
         Some(&who.harness),
     )

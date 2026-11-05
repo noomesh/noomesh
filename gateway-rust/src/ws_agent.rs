@@ -182,6 +182,16 @@ pub(crate) fn handshake_allowed(
 
 // ── Connection handler ────────────────────────────────────────────
 
+/// The identity a WS peer's messages carry. Server-derived: the token's
+/// subject, the agent id bound to it, and `ws:<agent_id>` as the harness.
+/// The peer's own name for itself rides along as a claim. No node: the peer
+/// runs on a machine the gateway does not know (followup 1309), and the
+/// controller it connected to is not where it is.
+fn peer_identity(sub: &str, agent_id: &str, claimed: &str) -> crate::agent_messages::Identity {
+    crate::agent_messages::Identity::new(Some(sub), None, Some(agent_id), Some(&format!("ws:{agent_id}")))
+        .with_claimed_harness(Some(claimed))
+}
+
 async fn handle_peer(
     mut socket: WebSocket,
     state: Arc<AppState>,
@@ -414,13 +424,7 @@ async fn handle_peer(
     // few lines above, so it is the one thing about this connection the
     // gateway has verified. `hello.name` is free text and rides along as a
     // clearly-marked claim.
-    let peer_identity = crate::agent_messages::Identity::new(
-        Some(&claims.sub),
-        Some(&crate::agent_messages::controller_node()),
-        Some(&agent_id),
-        Some(&format!("ws:{agent_id}")),
-    )
-    .with_claimed_harness(Some(&hello.name));
+    let peer_identity = peer_identity(&claims.sub, &agent_id, &hello.name);
 
     // Per-connection budgets. The HTTP rate limiter
     // skips `/ws*` — and must, since it sees one request per connection —
@@ -1034,6 +1038,17 @@ mod tests {
             !collab_relay("agent.collab.c-3.ctrl", &start, "hermes-1", &mut mine),
             "a node id that happens to equal an agent id is not a peer slot"
         );
+    }
+
+    /// Followup 1309: a WS peer connects from a machine the gateway does not
+    /// know, so its messages carry no node, not the controller's name.
+    #[test]
+    fn a_ws_peer_has_no_sender_node() {
+        let id = super::peer_identity("peer:hermes-1", "hermes-1", "Hermes");
+        assert_eq!(id.node, None, "{id:?}");
+        assert_eq!(id.user.as_deref(), Some("peer:hermes-1"));
+        assert_eq!(id.harness.as_deref(), Some("ws:hermes-1"));
+        assert_eq!(id.harness_claimed.as_deref(), Some("Hermes"));
     }
 
     /// Identity on this surface is server-derived; the peer's own name for
