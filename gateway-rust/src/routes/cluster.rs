@@ -2549,7 +2549,13 @@ pub(crate) async fn gpu_hold_op(
     let req = link.request(reqwest::Method::POST, &format!("/gpu/{op}")).json(&payload).timeout(wait);
     let outcome = req.send().await;
     let (ok, result) = match outcome {
-        Ok(resp) if resp.status().is_success() => (true, Ok(resp.json::<Value>().await.unwrap_or(json!({})))),
+        Ok(resp) if resp.status().is_success() => {
+            // The 2xx says the hold changed; an answer that cannot be read
+            // does not undo that, so `ok` stays true and the caller gets the
+            // error, never `{}` as the agent's lease (i460).
+            let read = crate::upstream_body::json_2xx(resp, &format!("node {node_id}")).await;
+            (true, read.map_err(|e| AppError::Upstream(format!("{e}; the GPU {op} did take effect on the node"))))
+        }
         Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
             // The agent's refusal is the answer: a lease someone else holds,
             // a drain that did not finish, a transition in progress.
@@ -2565,28 +2571,12 @@ pub(crate) async fn gpu_hold_op(
         }
         Err(e) => (false, Err(AppError::Upstream(format!("Failed to contact node agent: {e}")))),
     };
-    match (op, ok) {
-        ("hold", true) => {
-            // The hold is on: the agent reports the paused lanes; keep the
-            // node out of routing until the heartbeat carries them.
-            let paused: Vec<String> = result
-                .as_ref()
-                .ok()
-                .and_then(|v| v.pointer("/gpu_contention/paused_backends"))
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-                .unwrap_or_default();
-            crate::coordinator::classes::set_node_draining(node_id, false);
-            crate::coordinator::classes::set_lanes_paused(node_id, &paused);
-        }
-        ("hold", false) if draining => {
-            crate::coordinator::classes::set_node_draining(node_id, false);
-            if !drain_lanes.is_empty() {
-                crate::coordinator::classes::set_lanes_paused(node_id, &[]);
-            }
-        }
-        ("release", true) => crate::coordinator::classes::set_lanes_paused(node_id, &[]),
-        _ => {}
+    let marks = hold_marks(op, ok, result.as_ref().ok(), draining, &drain_lanes);
+    if let Some(on) = marks.draining {
+        crate::coordinator::classes::set_node_draining(node_id, on);
+    }
+    if let Some(lanes) = &marks.lanes {
+        crate::coordinator::classes::set_lanes_paused(node_id, lanes);
     }
     // Read-after-write: the lease the agent just returned goes into the
     // node's KV record now, so reservation list/status/release see it
@@ -2613,6 +2603,39 @@ pub(crate) async fn gpu_hold_op(
     let mut out = result?;
     out["node"] = json!(node_id);
     Ok(Json(out))
+}
+
+/// What a GPU hold or release does to the gateway's own routing marks
+/// (`classes::set_node_draining` / `set_lanes_paused`); `None` leaves that
+/// mark as it is. The heartbeat's `paused_backends` is a separate input to
+/// routing and clears neither mark: only this does.
+#[derive(Debug, PartialEq)]
+pub(crate) struct HoldMarks {
+    pub draining: Option<bool>,
+    pub lanes: Option<Vec<String>>,
+}
+
+/// The marks after `op` (`hold` / `release`), pure. `body` is the agent's
+/// answer when it could be read; `draining` and `drain_lanes` are what the
+/// drain marked before the call.
+pub(crate) fn hold_marks(op: &str, ok: bool, body: Option<&Value>, draining: bool, drain_lanes: &[String]) -> HoldMarks {
+    let keep = HoldMarks { draining: None, lanes: None };
+    match (op, ok) {
+        // The hold is on and the agent said which lanes it paused: those
+        // replace the drain's marks.
+        ("hold", true) => match body {
+            Some(v) => HoldMarks { draining: Some(false), lanes: Some(crate::coordinator::classes::paused_backends_of(v)) },
+            // The hold is on but its answer was unreadable (i460): which
+            // lanes it paused is unknown, so the drain's marks stay until
+            // the release clears them.
+            None => keep,
+        },
+        ("hold", false) if draining => HoldMarks { draining: Some(false), lanes: (!drain_lanes.is_empty()).then(Vec::new) },
+        // A release ends both marks, whatever the hold's answer was: before
+        // this it cleared only the lanes, so a kept drain mark outlived it.
+        ("release", true) => HoldMarks { draining: Some(false), lanes: Some(Vec::new()) },
+        _ => keep,
+    }
 }
 
 /// How long the gateway waits on a node's bench: a cold load of a large
@@ -6961,6 +6984,28 @@ mod heartbeat_carry_tests {
         assert!(drain < call && lanes < call, "the lanes leave routing before the agent is asked to stop anything");
         assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/gpu/hold\", post(gpu_hold))"));
         assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/gpu/release\", post(gpu_release))"));
+    }
+
+    /// i460: an unreadable hold answer keeps the drain's marks (the hold is
+    /// on, its lanes unknown), and a release always ends both marks.
+    #[test]
+    fn an_unreadable_hold_keeps_its_marks_and_a_release_ends_them() {
+        let lanes = vec!["vllm".to_string()];
+        let answer = json!({"gpu_contention": {"paused_backends": ["vllm", "llamacpp"]}});
+        assert_eq!(
+            hold_marks("hold", true, Some(&answer), true, &[]),
+            HoldMarks { draining: Some(false), lanes: Some(vec!["vllm".into(), "llamacpp".into()]) },
+            "a read answer replaces the drain marks with the lanes the agent paused"
+        );
+        assert_eq!(hold_marks("hold", true, None, true, &[]), HoldMarks { draining: None, lanes: None }, "never un-drained on a guess");
+        assert_eq!(hold_marks("hold", true, None, true, &lanes), HoldMarks { draining: None, lanes: None });
+        for body in [Some(&answer), None] {
+            assert_eq!(hold_marks("release", true, body, false, &[]), HoldMarks { draining: Some(false), lanes: Some(vec![]) });
+        }
+        assert_eq!(hold_marks("hold", false, None, true, &lanes), HoldMarks { draining: Some(false), lanes: Some(vec![]) }, "a refused drain undoes its marks");
+        assert_eq!(hold_marks("hold", false, None, true, &[]), HoldMarks { draining: Some(false), lanes: None });
+        assert_eq!(hold_marks("hold", false, None, false, &[]), HoldMarks { draining: None, lanes: None });
+        assert_eq!(hold_marks("release", false, None, false, &[]), HoldMarks { draining: None, lanes: None }, "a refused release changes nothing");
     }
 
     #[test]
