@@ -36,6 +36,7 @@ use std::path::Path;
 
 use serde_json::json;
 
+use crate::addons::decls::ROUTES_FILE;
 use crate::addons::{self, pins, resolve};
 use crate::output::{fail, ExitCode};
 use crate::ui;
@@ -136,6 +137,12 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         };
         let ctx = addons::Ctx { root: &root, tag: &tag, stack_lock: stack_lock.as_deref(), allow_downgrade, client };
         let installed = current.get(addon).cloned();
+        // The routes.json the installed bundle declared, read before the new
+        // one replaces it: what the add-on suggested until now.
+        let old_routes = pins::materialised_files(&root, addon, [&ROUTES_FILE.to_string()]).remove(ROUTES_FILE);
+        let new_suggestions = |files: &std::collections::BTreeMap<String, Vec<u8>>| {
+            suggestion_changes(old_routes.as_deref(), files.get(ROUTES_FILE).map(Vec::as_slice))
+        };
         let supplied = match (third_party, lock_ref.as_deref()) {
             (true, Some(r)) => Some(addons::trust::fetch_supplied(r).map_err(resolve::Refusal::Supplied)),
             _ => None,
@@ -164,22 +171,31 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                             Ok((v, f))
                         })
                         .and_then(|(v, f)| resolve::require_bundle(&v, &tag).map(|()| (v, f)))
-                        .map(|(v, f)| (pins::Pin::from_verified(&v, &tag, &f.lock, route.pulled_from()), 0usize, client.describe(&route)))
+                        .map(|(v, f)| {
+                            let pin = pins::Pin::from_verified(&v, &tag, &f.lock, route.pulled_from());
+                            (pin, 0usize, client.describe(&route), new_suggestions(&f.files))
+                        })
                 })
         } else {
             let supplied = supplied.and_then(Result::ok);
             resolve::installed_anchor(addon)
                 .and_then(|anchor| addons::prepare_from(&ctx, addon, &anchor, supplied, &mut resolve::LiveDocker::new(&root)))
-                .and_then(|p| addons::commit(&root, &p, &tag).map(|pin| (pin, p.pulled, p.via.clone())))
+                .and_then(|p| {
+                    let suggested = new_suggestions(&p.fetched.files);
+                    addons::commit(&root, &p, &tag).map(|pin| (pin, p.pulled, p.via.clone(), suggested))
+                })
         };
         match outcome {
-            Ok((offered, pulled, via)) => {
+            Ok((offered, pulled, via, suggested)) => {
                 let changed = installed.as_ref() != Some(&offered);
                 rows.push(json!({
                     "addon": addon, "installed": installed.as_ref().map(|p| &p.version),
                     "offered": offered.version, "stack": tag, "key_index": offered.key_index,
                     "changed": changed, "pulled": pulled, "pinned": !check, "via": via,
                     "pulled_from": offered.pulled_from,
+                    "new_suggestions": suggested.iter()
+                        .map(|n| json!({"feature": n.feature, "suggested": n.suggested, "was": n.was}))
+                        .collect::<Vec<_>>(),
                 }));
                 if !g.json {
                     let was = installed.as_ref().map(|p| format!("{} for {}", p.version, p.stack)).unwrap_or_else(|| "not pinned".into());
@@ -191,6 +207,9 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                             offered.version, offered.key_index));
                     } else {
                         ui::done(&format!("{addon} {} already pinned for stack {tag}: nothing changed", offered.version));
+                    }
+                    if !suggested.is_empty() {
+                        println!("{}", ui::note(&suggestion_note(addon, &suggested, check)));
                     }
                 }
             }
@@ -231,6 +250,49 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ]);
     }
     Ok(if failed == 0 { 0 } else { 1 })
+}
+
+/// A feature the new bundle suggests for `user` or `operator` that the
+/// installed one did not: new, or its suggestion changed. An upgrade only
+/// reports it: it grants nothing (f99 proposal 3.2); the operator accepts
+/// with `noo addons accept-suggestions` once the gateway has loaded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NewSuggestion {
+    pub feature: String,
+    pub suggested: String,
+    pub was: Option<String>,
+}
+
+/// The [`NewSuggestion`]s between two routes.json files, by feature name.
+/// No new routes.json, or one that does not parse (the pin path refuses
+/// that bundle first), suggests nothing; no old one (a first pin) means
+/// every user or operator suggestion is new.
+pub(crate) fn suggestion_changes(old: Option<&[u8]>, new: Option<&[u8]>) -> Vec<NewSuggestion> {
+    let features = |b: Option<&[u8]>| -> std::collections::BTreeMap<String, String> {
+        b.and_then(|b| std::str::from_utf8(b).ok())
+            .and_then(|t| addon_manifest::parse(t).ok())
+            .map(|m| m.features.into_iter().map(|f| (f.name, f.suggested)).collect())
+            .unwrap_or_default()
+    };
+    let (was, now) = (features(old), features(new));
+    now.into_iter()
+        .filter(|(name, s)| matches!(s.as_str(), "user" | "operator") && was.get(name) != Some(s))
+        .map(|(feature, suggested)| NewSuggestion { was: was.get(&feature).cloned(), feature, suggested })
+        .collect()
+}
+
+/// The line an upgrade prints for an add-on's [`NewSuggestion`]s.
+pub(crate) fn suggestion_note(addon: &str, s: &[NewSuggestion], check: bool) -> String {
+    let list = s
+        .iter()
+        .map(|n| match &n.was {
+            Some(w) => format!("{} for {} (was {w})", n.feature, n.suggested),
+            None => format!("{} for {}", n.feature, n.suggested),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let when = if check { "after the upgrade and a restart" } else { "after the restart" };
+    format!("{addon} now suggests {list}; nothing was granted. To accept, {when} run: noo addons accept-suggestions {addon}")
 }
 
 /// One add-on's verify verdict.
@@ -638,6 +700,40 @@ mod tests {
     }
 
     use super::*;
+
+    /// An upgrade names a feature only when the new bundle suggests it for
+    /// user or operator and the old one did not; it writes nothing.
+    #[test]
+    fn upgrade_reports_only_new_or_changed_user_and_operator_suggestions() {
+        let routes = |features: serde_json::Value| {
+            json!({"version": 1, "addon": "rhaddon", "base_url_env": "RH_URL", "base_url_default": "http://rhaddon:8080",
+                   "routes": [], "features": features})
+            .to_string()
+            .into_bytes()
+        };
+        let f = |name: &str, suggested: &str| json!({"name": name, "title": name, "suggested": suggested});
+        let old = routes(json!([f("converse", "user"), f("review", "admin"), f("export", "operator")]));
+        let new = routes(json!([f("converse", "user"), f("review", "operator"), f("export", "none"), f("voice", "user"), f("audit", "admin")]));
+        let got = suggestion_changes(Some(old.as_slice()), Some(new.as_slice()));
+        let n = |feature: &str, suggested: &str, was: Option<&str>| NewSuggestion {
+            feature: feature.into(),
+            suggested: suggested.into(),
+            was: was.map(Into::into),
+        };
+        assert_eq!(got, vec![n("review", "operator", Some("admin")), n("voice", "user", None)]);
+        assert!(suggestion_changes(Some(new.as_slice()), Some(new.as_slice())).is_empty(), "an unchanged bundle suggests nothing new");
+        assert!(suggestion_changes(Some(old.as_slice()), None).is_empty(), "no routes.json, no suggestion");
+        assert_eq!(suggestion_changes(None, Some(new.as_slice())).len(), 3, "a first pin: every user or operator suggestion");
+        let line = suggestion_note("rhaddon", &got, false);
+        assert!(line.contains("review for operator (was admin), voice for user; nothing was granted"), "{line}");
+        assert!(line.ends_with("after the restart run: noo addons accept-suggestions rhaddon"), "{line}");
+        assert!(suggestion_note("rhaddon", &got, true).contains("after the upgrade and a restart run:"));
+        // Report-only: the upgrade path writes no access setting.
+        let code = crate::test_src::own_code(include_str!("addon_pins.rs"));
+        let upgrade = crate::test_src::fn_body(&code, "pub fn addons_upgrade(");
+        assert!(upgrade.contains("suggestion_changes(") && !upgrade.contains("/access") && !upgrade.contains("put_json"));
+    }
+
     use crate::addons::resolve::tests::{anchor, lock, signed, signed_bundle, FakeDocker, OVERLAY, ROOT};
 
     fn scratch(tag: &str) -> std::path::PathBuf {
