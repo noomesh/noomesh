@@ -1403,6 +1403,31 @@ fn attach_door_leaves(g: &Globals, a: &ProvisionArgs, enr: &ProvEnrollment, m: &
         nnote(&super::node_leaves::withheld_leaves_note(&node, &node_app_version,
             super::node_leaves::upgrade_restages_leaves()));
     }
+    // Enabled add-ons' node workload doors (svc-addon-*): gated by their own
+    // floor on EVERY OS, one line per node when withheld.
+    let doors = super::node_leaves::node_workload_doors(&crate::envfile::repo_root());
+    if doors.is_empty() {
+        return;
+    }
+    if !super::node_leaves::applier_knows_addon_leaf_kinds(&node_app_version) {
+        nnote(&super::node_leaves::addon_leaves_withheld_note(&node, &node_app_version));
+        return;
+    }
+    match super::node_leaves::addon_leaf_payloads(ca, &node, &doors) {
+        Ok((leaves, skipped)) => {
+            let n = leaves.len() / 2;
+            // Bundle kinds are `&'static str`; these few names live for the
+            // rest of this short-lived CLI process anyway.
+            files.extend(leaves.into_iter().map(|(k, b)| (&*Box::leak(k.into_boxed_str()), b)));
+            if skipped.is_empty() {
+                nnote(&format!("bundle carries {n} add-on door leaves (services/addon-<a>-<w>/ on the node)"));
+            } else {
+                nnote(&format!("bundle carries {n} add-on door leaves; NOT {} (half a pair on disk — \
+                    `noo cluster provision {node}` again re-issues it)", skipped.join(", ")));
+            }
+        }
+        Err(e) => { scrub(&work); fail(g.json, ExitCode::Generic, "leaf_read", &e, None); }
+    }
 }
 
 /// The node's own NATS credential.
@@ -1770,6 +1795,17 @@ fn ensure_door_leaves_try(ca: &crate::pki::ClusterCa, node: &str) -> Result<(), 
             }
         }
         Err(e) => return Err(format!("could not issue {node}'s backend door leaves: {e}")),
+    }
+    // Enabled add-ons' node workload doors: one more leaf each, same issuer.
+    // An invalid pair is an error naming it, never a silent skip.
+    let doors = super::node_leaves::node_workload_doors(&crate::envfile::repo_root());
+    match super::node_leaves::ensure_addon_leaves(ca, node, crate::pki::DEFAULT_DAYS, &doors) {
+        Ok(issued) => {
+            for (svc, why) in issued {
+                nstep(&format!("add-on door leaf {svc}: issued ({why})"));
+            }
+        }
+        Err(e) => return Err(format!("could not issue {node}'s add-on door leaves: {e}")),
     }
     // The keys this bundle packs are the CLI's alone on this disk (0600,
     // `pki::KeyReader::Cli`). Issuance sets that; a key from before

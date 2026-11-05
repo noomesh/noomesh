@@ -589,6 +589,16 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
         Err(e) => { crate::ui::warned(&format!("backend door leaves not installed: {e}")); false }
     };
     let all_ok = all_ok && leaves_ok;
+    let addon_leaves_ok = match install_addon_leaves(&payloads, &base.join("pki")) {
+        Ok(done) => {
+            if !done.is_empty() {
+                crate::ui::done(&format!("noo node fetch: add-on door leaves installed ({})", done.join(", ")));
+            }
+            true
+        }
+        Err(e) => { crate::ui::warned(&format!("add-on door leaves not installed: {e}")); false }
+    };
+    let all_ok = all_ok && addon_leaves_ok;
     // Last env write of this apply (the merges above wrote plain lines, and
     // the agent binary is installed).
     let all_ok = all_ok && agent_secrets_to_files(base, user, as_root)
@@ -1717,6 +1727,45 @@ pub(crate) fn install_service_leaves(payloads: &Payloads, pki: &Path) -> Result<
     Ok(done)
 }
 
+/// Install the `svc-addon-<name>.crt` / `.key` pairs a bundle carries into
+/// `<pki>/services/addon-<name>/service.{crt,key}` — the add-on workload door
+/// leaves, same modes and temp + rename as [`install_service_leaves`]. Every
+/// name is re-judged by `node_leaves::addon_leaf_kind_ok` (nothing malformed
+/// reaches a path join); a half pair is refused; a leaf the bundle omits is
+/// left alone. Returns the service names installed.
+pub(crate) fn install_addon_leaves(payloads: &Payloads, pki: &Path) -> Result<Vec<String>, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut stems = std::collections::BTreeSet::new();
+    for kind in payloads.keys() {
+        if !kind.starts_with("svc-addon-") {
+            continue;
+        }
+        if !crate::commands::node_leaves::addon_leaf_kind_ok(kind) {
+            return Err(format!("'{kind}' is not a well-formed add-on leaf kind — refusing"));
+        }
+        let stem = kind.trim_end_matches(".crt").trim_end_matches(".key");
+        stems.insert(stem.trim_start_matches("svc-").to_string());
+    }
+    let mut done = Vec::new();
+    for service in stems {
+        let (c, k) = match (payloads.get(&format!("svc-{service}.crt")), payloads.get(&format!("svc-{service}.key"))) {
+            (Some(c), Some(k)) => (c, k),
+            _ => return Err(format!("svc-{service} carries half a leaf (cert and key travel together) — refusing")),
+        };
+        let dir = pki.join("services").join(&service);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+        for d in [pki.join("services"), dir.clone()] {
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("chmod {}: {e}", d.display()))?;
+        }
+        for (bytes, name, mode) in [(k, "service.key", 0o600), (c, "service.crt", 0o644)] {
+            user_write(&dir.join(name), bytes, mode).map_err(|e| format!("install {name}: {e}"))?;
+        }
+        done.push(service);
+    }
+    Ok(done)
+}
+
 /// The `host-telemetry` payload is bound to one node and carries nothing
 /// else: exactly one non-blank line, `NODE=<name>`. A fixed operation, so no
 /// command, path or value can ride in it. Mirrors `host_telemetry_payload_ok`
@@ -2759,7 +2808,9 @@ fn verify_bundle_with(stage: &Path, ca: &Path, ca_pub: &Path, node: &str, self_u
         }
         let mut it = line.split_whitespace();
         let (Some(sum), Some(kind)) = (it.next(), it.next()) else { continue };
-        if !KNOWN_KINDS.contains(&kind) {
+        // An add-on workload door leaf (`svc-addon-<name>.crt|.key`) is judged
+        // by shape, not listed: the set is open (node_leaves::addon_leaf_kind_ok).
+        if !KNOWN_KINDS.contains(&kind) && !crate::commands::node_leaves::addon_leaf_kind_ok(kind) {
             // The self-update above already ran: reaching here means the
             // bundle's CLI IS this binary (or there is none), so the kind is
             // genuinely unknown to the newest CLI the controller has.
@@ -4125,6 +4176,38 @@ mod tests {
         payloads.insert("svc-vllm.crt".into(), b"NEW".to_vec());
         assert!(install_service_leaves(&payloads, &pki).is_err());
         assert_eq!(std::fs::read_to_string(pki.join("services/vllm/service.crt")).unwrap(), "CRT");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn addon_leaves_land_under_their_service_dir_and_malformed_kinds_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("noo-mac-addon-leaves-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pki = dir.join("pki");
+        let mut payloads = Payloads::new();
+        payloads.insert("svc-addon-rhaddon-worker.crt".into(), b"CRT".to_vec());
+        payloads.insert("svc-addon-rhaddon-worker.key".into(), b"KEY".to_vec());
+        let done = install_addon_leaves(&payloads, &pki).unwrap();
+        assert_eq!(done, vec!["addon-rhaddon-worker".to_string()]);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let d = pki.join("services/addon-rhaddon-worker");
+        assert_eq!(std::fs::read_to_string(d.join("service.key")).unwrap(), "KEY");
+        assert_eq!(mode(&d.join("service.key")), 0o600);
+        assert_eq!(mode(&d.join("service.crt")), 0o644);
+        assert_eq!(mode(&d), 0o755);
+        // A half pair is refused.
+        let mut half = Payloads::new();
+        half.insert("svc-addon-a-b.crt".into(), b"C".to_vec());
+        assert!(install_addon_leaves(&half, &pki).is_err());
+        assert!(!pki.join("services/addon-a-b").exists());
+        // Malformed names are refused and nothing is installed for them.
+        for bad in ["svc-addon-Bad.crt", "svc-addon-a_b-w.crt", "svc-addon-../x.crt", "svc-addon-a-.key"] {
+            let mut p = Payloads::new();
+            p.insert(bad.into(), b"X".to_vec());
+            assert!(install_addon_leaves(&p, &pki).is_err(), "{bad}");
+        }
+        assert!(!dir.join("x").exists() && !pki.join("x").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
