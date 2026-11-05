@@ -20,7 +20,7 @@ func TestHostServicesReportNamesTheRunningKind(t *testing.T) {
 	for _, c := range []struct {
 		state hostsvc.State
 		kind  string
-	}{{hostsvc.Stopped, "copilot"}, {hostsvc.Absent, "noo"}, {hostsvc.Running, ""}} {
+	}{{hostsvc.Stopped, "copilot"}, {hostsvc.Absent, "noo"}, {hostsvc.Unknown, "noo"}, {hostsvc.Running, ""}} {
 		h := hostServicesReport(c.state, "systemd", c.kind)["harness"].(map[string]any)
 		if _, ok := h["kind"]; ok {
 			t.Fatalf("%s with kind %q must report no kind: %v", c.state, c.kind, h)

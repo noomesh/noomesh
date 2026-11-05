@@ -29,6 +29,16 @@ func (r *Reconciler) convergeHarness(ctx context.Context, p placement, all []pla
 		return
 	}
 	state := r.harness.State(ctx)
+	if state == hostsvc.Unknown {
+		// The probe could not answer. Not stopped, not running: take no
+		// lifecycle action (a start or restart here could bounce a harness
+		// that is serving turns) and record no refusal (no start was
+		// attempted). The next tick looks again.
+		slog.Warn("reconcile.harness_state_unknown", "backend", "harness",
+			"runtime", r.harness.Runtime(), "desired", p.DesiredState,
+			"detail", "the service manager's state probe gave no answer (tool missing, timed out, or unrecognized output); leaving the harness as it is")
+		return
+	}
 	switch p.DesiredState {
 	case "running":
 		// The kind is checked BEFORE anything
@@ -225,6 +235,12 @@ func (r *Reconciler) reapUnplacedHarness(ctx context.Context, all []placement) {
 // about, and silence here reads as a clean stop.
 // It reports whether the service is now stopped.
 func (r *Reconciler) stopHarness(ctx context.Context, state hostsvc.State) bool {
+	if state == hostsvc.Unknown {
+		// Cannot tell whether it runs: not stopped, so report false and
+		// leave the started kind alone.
+		slog.Warn("reconcile.stop_skipped_state_unknown", "backend", "harness")
+		return false
+	}
 	if state != hostsvc.Running {
 		return true
 	}
