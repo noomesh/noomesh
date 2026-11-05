@@ -352,8 +352,8 @@ addons_report_licensed() {
 # addons_stop_disabled — a licensed add-on (first or third party, one path)
 # declared OFF: its overlay is not composed, so `up` never touches its
 # containers, and with `restart: unless-stopped` a crash-looping one keeps
-# looping (pop-os 2026-11-05: noo-pai-voice and noo-pai-voice-coordinator,
-# off in noomesh.yaml, survived the 0.6.16 roll into its restart-loop check).
+# looping (2026-11-05: a third-party add-on's two containers, off in
+# noomesh.yaml, survived a roll into its restart-loop check).
 # Each container of THIS install's project whose service is one the overlay
 # OWNS (read from the overlay's TEXT, never rendered: an off add-on's overlay
 # can interpolate variables nothing sets, and rendering it to `stop` it failed
