@@ -19,5 +19,12 @@
     {"ref": "vllm/vllm-openai:latest", "own": false},
     {"ref": "someone/noo-thing:1", "own": false},
     {"ref": "Bad/Upper:1", "own": true}
+  ],
+  "$staged_names_comment": "THE staged-name rule: a placement ref names its rail tar after its digest is cut at the first '@' (never at the last ':', which may be a registry port). Read by noo-cli (image_stage.rs) and gateway-rust (routes/artifacts.rs); the node agent strips the same way in chooseBackendImage. 2026-11-05: a digest-pinned ollama placement read as unstaged on every node.",
+  "staged_names": [
+    {"ref": "ghcr.io/noomesh/ollama:v0.6.16", "arch": "amd64", "staged_ref": "ghcr.io/noomesh/ollama:v0.6.16", "tar_gz": "ghcr.io_noomesh_ollama_v0.6.16_amd64.tar.gz"},
+    {"ref": "ghcr.io/noomesh/ollama:v0.6.16@sha256:e6def2406ca1bba7253fb6566940ca61cabd8e1064902984faa263507bb6c3aa", "arch": "arm64", "staged_ref": "ghcr.io/noomesh/ollama:v0.6.16", "tar_gz": "ghcr.io_noomesh_ollama_v0.6.16_arm64.tar.gz"},
+    {"ref": "registry.local:5000/noomesh/llamacpp:v0.6.16", "arch": "amd64", "staged_ref": "registry.local:5000/noomesh/llamacpp:v0.6.16", "tar_gz": "registry.local_5000_noomesh_llamacpp_v0.6.16_amd64.tar.gz"},
+    {"ref": "registry.local:5000/noomesh/llamacpp:v0.6.16@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "arch": "amd64", "staged_ref": "registry.local:5000/noomesh/llamacpp:v0.6.16", "tar_gz": "registry.local_5000_noomesh_llamacpp_v0.6.16_amd64.tar.gz"}
   ]
 }

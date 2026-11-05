@@ -654,7 +654,11 @@ pub(crate) fn images_staged_check(n: &Value) -> Option<Check> {
     Some(warn(
         "images staged",
         format!("placed but not staged on the artifact rail: {}", names.join(", ")),
-        Some(format!("noo cluster sync-images {id} -i {first}   # or `noo upgrade` for the release images")),
+        // Staged by tag: `-i repo:tag@digest` would name a tar nothing reads.
+        Some(format!(
+            "noo cluster sync-images {id} -i {}   # or `noo upgrade` for the release images",
+            crate::commands::image_stage::staged_ref(first)
+        )),
     ))
 }
 
@@ -9740,6 +9744,17 @@ mod tests {
         assert!(c.detail.contains("reg/acme/llamacpp:v0.2.103"), "{}", c.detail);
         assert!(c.remedy.unwrap().contains("noo cluster sync-images host8-ma -i reg/acme/llamacpp:v0.2.103"));
         assert!(images_staged_check(&serde_json::json!({"id": "x"})).is_none());
+    }
+
+    #[test]
+    fn images_staged_hint_stages_a_pinned_ref_by_its_tag() {
+        let pinned = format!("reg.example:5000/acme/ollama:v0.6.16@sha256:{}", "e".repeat(64));
+        let n = serde_json::json!({"id": "robopi", "unstaged_images": [pinned]});
+        let c = images_staged_check(&n).unwrap();
+        assert!(c.detail.contains(&pinned), "the row names what is placed: {}", c.detail);
+        let remedy = c.remedy.unwrap();
+        assert!(remedy.contains("noo cluster sync-images robopi -i reg.example:5000/acme/ollama:v0.6.16 "), "{remedy}");
+        assert!(!remedy.contains('@'), "{remedy}");
     }
 
     #[test]
