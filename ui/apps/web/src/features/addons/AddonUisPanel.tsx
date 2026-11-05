@@ -18,10 +18,6 @@ export function AddonUisPanel() {
   const [notes, setNotes] = useState<Record<string, string>>({});
 
   async function onOpen(ui: AddonUi) {
-    if (ui.addon === 'pai-voice') {
-      window.open('/voice-space', '_blank', 'noopener');
-      return;
-    }
     setNotes((n) => ({ ...n, [ui.addon]: '' }));
     // Before any await: a window.open after the POST resolves is what popup
     // blockers refuse.

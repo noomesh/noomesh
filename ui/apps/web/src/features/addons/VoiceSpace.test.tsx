@@ -15,7 +15,14 @@ import { VoiceSpace, voiceFrameUrl } from './VoiceSpace';
 describe('Voice Space', () => {
   beforeEach(() => {
     cleanup(); state.open.mockReset();
+    document.head.innerHTML = '<meta name="noo-voice-space-addon" content="rhaddon">';
     state.auth = { ready: true, isLoggedIn: true, user: { username: 'alice' } };
+  });
+  it('requires an operator-configured workspace', () => {
+    document.head.innerHTML = '';
+    render(<VoiceSpace />);
+    expect(screen.getByRole('status').textContent).toBe('No voice workspace is configured.');
+    expect(state.open).not.toHaveBeenCalled();
   });
   it('embeds only an isolated same-host HTTPS handoff', () => {
     const here = { hostname: 'mesh.test', origin: 'https://mesh.test' } as Location;
@@ -33,7 +40,7 @@ describe('Voice Space', () => {
     expect(state.open).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: 'Open voice' }));
     const frame = await screen.findByTitle('Voice workspace');
-    expect(state.open).toHaveBeenCalledWith('pai-voice');
+    expect(state.open).toHaveBeenCalledWith('rhaddon');
     expect(frame.getAttribute('allow')).toBe(`microphone https://${window.location.hostname}:8458; autoplay https://${window.location.hostname}:8458`);
     expect(frame.getAttribute('sandbox')).not.toContain('allow-top-navigation');
     expect(frame.getAttribute('referrerpolicy')).toBe('no-referrer');

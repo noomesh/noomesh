@@ -47,7 +47,7 @@ def peers():
             self.wfile.write(body)
 
         def do_POST(self):
-            if self.server is console and self.path == '/api/addons/pai-voice/ui-session':
+            if self.server is console and self.path == '/api/addons/rhaddon/ui-session':
                 if self.headers.get('Authorization') != 'Bearer '+TOKEN:
                     return self.reply(status=401)
                 state['minted'] += 1
@@ -79,7 +79,10 @@ def peers():
                         "frame-ancestors 'none'; base-uri 'self'; form-action 'self'; frame-src "+voice_origin),
                         'Permissions-Policy': f'geolocation=(), camera=(), microphone=(self "{voice_origin}")',
                         'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer'}
-                return self.reply(file.read_bytes(), content_type=mimetypes.guess_type(file)[0] or 'application/octet-stream', headers=headers)
+                body = file.read_bytes()
+                if path == '/voice-space':
+                    body = body.replace(b'<head>', b'<head><meta name="noo-voice-space-addon" content="rhaddon">', 1)
+                return self.reply(body, content_type=mimetypes.guess_type(file)[0] or 'application/octet-stream', headers=headers)
             assert not self.headers.get('Authorization'), 'Bearer leaked to frame'
             if path == '/__noo/session':
                 assert self.headers.get('Sec-Fetch-Mode') == 'navigate'

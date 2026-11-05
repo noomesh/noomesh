@@ -60,6 +60,7 @@ docker inspect noo-gateway --format '{{range .Mounts}}{{println .Destination}}{{
 
 | Variable | Default | Read by | Purpose |
 |---|---|---|---|
+| `NOO_VOICE_SPACE_ADDON` | unset | gateway UI route, compose | add-on ID opened by the `/voice-space` shell; set under `compose_env` in `noomesh.yaml` and recreate the gateway to apply. Unset or invalid shows an unconfigured page. The add-on keeps its own origin and role checks. |
 | `NOO_SECRETS_BACKEND` | `env` when unset (onboarding always writes `sops`) | `scripts/lib-secrets.sh` | `sops` decrypts `secrets/env.sops` into the launcher environment; `env` (plaintext `.env`) is retired — the launcher refuses to start it, and verify, scan and upgrade fail it ([secrets](../security/secrets.md#noo_secrets_backend)) |
 | `NOO_SECRET_RUNDIR` | unset: `/run/noo/secrets` as root, `/dev/shm/noo-secrets-<uid>` otherwise | `scripts/lib-secrets.sh` | the tmpfs directory the launcher writes the compose `file:` secrets to (0700, must be RAM-backed or the launch is refused); exported to compose, which has a nonexistent default so a launch that skipped the launcher fails instead of starting without credentials ([secrets](../security/secrets.md#where-the-files-live)) |
 | `NOO_SECRET_CHOWN_IMAGE` | `alpine` | `scripts/lib-secrets.sh` | the image of the throwaway container that hands the secret files to their containers' uids when the launcher is not root (no network, only `CAP_CHOWN`) |
