@@ -761,11 +761,17 @@ pub(crate) async fn prune_restore_entity(db: &sqlx::PgPool, sid: &str) -> Value 
     }
 
     // Same (name, type) re-extracted since deletion? Graft onto it instead
-    // of violating the entities_name_type_idx unique index.
-    let existing: Option<String> = sqlx::query_scalar(
+    // of violating the entities_name_type_idx unique index. A failed read is
+    // not "no such entity": the restore would then insert the original id
+    // beside a live entity it should have merged into (i460).
+    let existing: Option<String> = match sqlx::query_scalar(
         "SELECT entity_id::text FROM entities WHERE canonical_name = $1 AND type = $2",
     ).bind(&name).bind(&etype)
-     .fetch_optional(db).await.ok().flatten();
+     .fetch_optional(db).await
+    {
+        Ok(found) => found,
+        Err(e) => return restore_db_error(sid, "find_existing", &e),
+    };
 
     let target_id = existing.clone().unwrap_or_else(|| orig_id.clone());
     if existing.is_none() {
@@ -1749,5 +1755,24 @@ mod tests {
         assert_eq!(prune_remap(Some("a"), "a", "b"), "b");
         assert_eq!(prune_remap(Some("c"), "a", "b"), "c");
         assert_eq!(prune_remap(None, "a", "b"), "");
+    }
+}
+
+/// prune_restore_entity's "is it already there" read stops the restore on
+/// an error instead of answering "no" (i460). Read as source: a pool that
+/// cannot connect fails the staging-row read first, so only a live database
+/// with a failing second query reaches this branch.
+#[cfg(test)]
+mod restore_read_error_tests {
+    #[test]
+    fn a_failed_existing_entity_read_stops_the_restore() {
+        let own = crate::test_src::own_code(include_str!("provider.rs"));
+        let body = crate::test_src::fn_body(&own, "pub(crate) async fn prune_restore_entity(");
+        let read = body.find("SELECT entity_id::text FROM entities WHERE canonical_name = $1 AND type = $2")
+            .expect("the existing-entity read");
+        let insert = body.find("INSERT INTO entities").expect("the entity insert");
+        let between = &body[read..insert];
+        assert!(between.contains("Err(e) => return restore_db_error(sid, \"find_existing\", &e),"), "{between}");
+        assert!(!between.contains(".ok()") && !between.contains("unwrap_or"), "the read's error must not become None: {between}");
     }
 }
