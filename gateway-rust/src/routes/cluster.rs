@@ -2572,7 +2572,7 @@ pub(crate) fn hold_marks(op: &str, ok: bool, body: Option<&Value>, draining: boo
         ("hold", false) if draining => HoldMarks { draining: Some(false), lanes: (!drain_lanes.is_empty()).then(Vec::new) },
         // A release ends both marks, whatever the hold's answer was: before
         // this it cleared only the lanes, so a kept drain mark outlived it.
-        ("release", true) => HoldMarks { draining: Some(false), lanes: Some(Vec::new()) },
+        ("release", true) => HoldMarks { draining: None, lanes: Some(Vec::new()) }, // MUTANT: a release leaves the drain mark again
         _ => keep,
     }
 }
