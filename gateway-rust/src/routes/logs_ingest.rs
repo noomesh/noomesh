@@ -850,13 +850,12 @@ mod tests {
 
     #[tokio::test]
     async fn loki_down_is_a_503_that_keeps_the_batch_on_the_node() {
-        // A port nothing listens on.
-        let dead = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let url = format!("http://{}", l.local_addr().unwrap());
-            drop(l);
-            url
-        };
+        // A port nothing listens on: bound for the whole test but never
+        // listening, so a connect is refused and no parallel test can take
+        // it (a dropped listener freed the port for any test's fake server).
+        let held = tokio::net::TcpSocket::new_v4().unwrap();
+        held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let dead = format!("http://{}", held.local_addr().unwrap());
         let client = reqwest::Client::new();
         let got = forward_to_loki(&client, &dead, b"{}".to_vec()).await;
         assert!(matches!(got, Forward::Down(_)), "{got:?}");
