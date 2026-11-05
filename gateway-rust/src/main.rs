@@ -110,6 +110,8 @@ mod embed_jobs;
 mod embedding_client;
 mod embedding_spaces;
 mod google_auth;
+mod connections;
+mod integrations;
 mod host_daemon;
 mod mcp_external;
 mod mcp_local;
@@ -666,6 +668,7 @@ async fn main() -> Result<()> {
     // i520: the full chain verify every 6 h, so a broken row pages on its own.
     audit_verify::spawn(state.clone());
     ingest_loop::spawn(state.clone());
+    integrations::sync::spawn(state.clone());
     recall_archive_loop::spawn(state.clone());
 
     // Heartbeat scheduler — fires due tasks from noo_heartbeat_tasks every

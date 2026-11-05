@@ -2233,6 +2233,51 @@ CREATE INDEX IF NOT EXISTS noo_request_trace_trace_id_idx ON noo_request_trace (
 CREATE INDEX IF NOT EXISTS noo_request_trace_route_at_idx ON noo_request_trace (route, at);
 ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS trace_id text
 "#,
+}, Migration {
+    revision: CONNECTIONS_REVISION,
+    down_revision: Some(REQUEST_TRACE_REVISION),
+    sql: r#"
+CREATE TABLE noo_connected_accounts (
+    id uuid PRIMARY KEY,
+    owner_uuid uuid NOT NULL REFERENCES noo_users(user_uuid) ON DELETE CASCADE,
+    provider text NOT NULL CHECK (provider = 'google'),
+    label text NOT NULL CHECK (length(btrim(label)) BETWEEN 1 AND 100),
+    email_hint text CHECK (length(email_hint) <= 254),
+    status text NOT NULL DEFAULT 'needs_auth' CHECK (status = 'needs_auth'),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (id, owner_uuid)
+);
+CREATE INDEX ix_connected_accounts_owner ON noo_connected_accounts(owner_uuid);
+CREATE TABLE noo_connection_sources (
+    id uuid PRIMARY KEY,
+    owner_uuid uuid NOT NULL REFERENCES noo_users(user_uuid) ON DELETE CASCADE,
+    account_id uuid NOT NULL,
+    name text NOT NULL CHECK (length(btrim(name)) BETWEEN 1 AND 100),
+    kind text NOT NULL CHECK (kind IN ('google_drive', 'gmail')),
+    policy jsonb NOT NULL CHECK (jsonb_typeof(policy) = 'object' AND policy->>'kind' IS NOT NULL AND policy->>'kind' = kind),
+    status text NOT NULL DEFAULT 'draft' CHECK (status = 'draft'),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    FOREIGN KEY (account_id, owner_uuid) REFERENCES noo_connected_accounts(id, owner_uuid) ON DELETE CASCADE
+);
+CREATE INDEX ix_connection_sources_owner ON noo_connection_sources(owner_uuid);
+CREATE INDEX ix_connection_sources_account ON noo_connection_sources(account_id, owner_uuid);
+"#,
+}, Migration {
+    revision: INTEGRATION_OAUTH_REVISION,
+    down_revision: Some(CONNECTIONS_REVISION),
+    sql: include_str!("integrations/schema.sql"),
+}, Migration {
+    revision: INTEGRATION_PAIRING_REVISION,
+    down_revision: Some(INTEGRATION_OAUTH_REVISION),
+    sql: include_str!("integrations/pairing.sql"),
+}, Migration {
+    revision: INTEGRATION_CONTENT_REVISION,
+    down_revision: Some(INTEGRATION_PAIRING_REVISION),
+    sql: include_str!("integrations/content.sql"),
+}, Migration {
+    revision: INTEGRATION_PACING_REVISION,
+    down_revision: Some(INTEGRATION_CONTENT_REVISION),
+    sql: "ALTER TABLE noo_integration_sync ADD COLUMN last_gmail_scan timestamptz, ADD COLUMN last_gmail_page timestamptz; CREATE INDEX integration_sync_owner_pacing ON noo_integration_sync(owner_uuid)",
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
@@ -2243,9 +2288,19 @@ pub const ADDON_ACCESS_REVISION: &str = "104_addon_access";
 /// so a renumber at rebase is one line.
 pub const REQUEST_TRACE_REVISION: &str = "105_request_trace";
 
+/// Google connections (noomesh #451): accounts, OAuth, pairing, the
+/// private corpus and its pacing, in that order on top of request tracing.
+pub const CONNECTIONS_REVISION: &str = "106_connection_drafts";
+pub const INTEGRATION_OAUTH_REVISION: &str = "107_integration_oauth";
+pub const INTEGRATION_PAIRING_REVISION: &str = "108_integration_pairing";
+pub const INTEGRATION_CONTENT_REVISION: &str = "109_integration_content";
+pub const INTEGRATION_PACING_REVISION: &str = "110_integration_pacing";
+
+
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
 pub const PG_STAT_STATEMENTS_REVISION: &str = "103_pg_stat_statements";
+
 
 /// The embedding-space migration revision (i150). A constant so a renumber
 /// at rebase is one line.
@@ -3176,16 +3231,18 @@ mod tests {
         }
     }
 
-    /// i359: the request-trace revision is the chain head, sits on 104 (f99), is
+    /// i359: the request-trace revision sits on 104 (f99), is
     /// idempotent, and creates exactly the columns `request_trace` writes
     /// and prunes by, plus the usage link `usage` writes.
     #[test]
-    fn request_trace_revision_is_the_head_and_matches_its_writers() {
+    fn request_trace_revision_sits_on_f99_and_matches_its_writers() {
         let m = MIGRATIONS.iter().find(|m| m.revision == REQUEST_TRACE_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "105_request_trace");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(ADDON_ACCESS_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(REQUEST_TRACE_REVISION), "the chain head");
+        let next = MIGRATIONS.iter().find(|n| n.down_revision == Some(REQUEST_TRACE_REVISION)).map(|n| n.revision);
+        assert_eq!(next, Some(CONNECTIONS_REVISION), "Google connections build on request tracing");
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(INTEGRATION_PACING_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_request_trace"));
         assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE"), "no row is rewritten or dropped");
         let writer = include_str!("repo/request_trace.rs");
@@ -3211,6 +3268,7 @@ mod tests {
         assert_eq!(m.revision, "102_embedding_space_migration");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(EMBED_PLACEMENT_MODEL_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(INTEGRATION_PACING_REVISION), "the chain head");
         for col in [
             "next_model text", "next_dims integer", "migration_state text", "migration_progress jsonb",
             "migration_started_at timestamptz", "migration_reported_at timestamptz",

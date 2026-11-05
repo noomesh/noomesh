@@ -124,6 +124,14 @@ def _ignored(path: str) -> bool:
     return verdict
 
 
+@pytest.mark.parametrize("path", [
+    ".env", ".env.local", ".sops.yaml", "noomesh.yaml",
+    "pki/ca.key", "pki/gateway/gateway.key", "secrets/env.sops",
+])
+def test_installation_credentials_never_enter_the_image_build_context(path: str) -> None:
+    assert _ignored(path), f"installation credential/config enters Docker context: {path}"
+
+
 def test_copied_sources_are_not_shadowed_by_dockerignore() -> None:
     """A COPY line is a promise the build context cannot keep if .dockerignore
     excludes the source. PR #540 shipped `COPY tests/fixtures/…` over a
