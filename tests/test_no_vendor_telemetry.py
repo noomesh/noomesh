@@ -53,8 +53,7 @@ def test_google_integration_hosts_have_outbound_inventory_rows():
 
     hosts = set()
     for path in (ROOT / "gateway-rust/src/integrations").glob("*.rs"):
-        source = path.read_text()
-        source = source.split("#[cfg(test)]", 1)[0]
+        source = rs.own_code(path.read_text())
         hosts.update(urlsplit(url).hostname for url in re.findall(r'https://[^"\s]+', source))
     required = {"accounts.google.com", "oauth2.googleapis.com", "openidconnect.googleapis.com",
                 "gmail.googleapis.com", "www.googleapis.com"}

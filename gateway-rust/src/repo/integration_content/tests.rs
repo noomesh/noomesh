@@ -602,20 +602,14 @@ async fn provider_ingest_search_and_identical_content_are_private_across_users_a
             .await
             .unwrap()
     );
-    assert_eq!(
-        search(&db.pool, &v, alice, "apricot", 20).await.unwrap()["items"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    assert_eq!(
-        search(&db.pool, &v, bob, "apricot", 20).await.unwrap()["items"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
+    let mine = search(&db.pool, &v, alice, "apricot", 20).await.unwrap();
+    assert_eq!(mine["items"].as_array().unwrap().len(), 1);
+    // The owner predicate, not only the sealing context, keeps Bob's rows out:
+    // a search that reached them would count them unreadable.
+    assert_eq!(mine["unavailable"], false, "Alice's search must not even see Bob's rows");
+    let theirs = search(&db.pool, &v, bob, "apricot", 20).await.unwrap();
+    assert_eq!(theirs["items"].as_array().unwrap().len(), 2);
+    assert_eq!(theirs["unavailable"], false);
     // No global KB/graph tables are even created in this DB: the entire
     // import/search/retry path succeeds without publishing to those services.
     assert!(

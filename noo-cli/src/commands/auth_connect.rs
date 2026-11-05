@@ -151,21 +151,29 @@ fn run(g: &Globals, provider: &str, services: Vec<&str>) -> Result<Value, String
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(100))
                 }
-                Err(_) => return Err("Local callback listener failed".into()),
+                Err(e) => return Err(format!("Local callback listener failed: {e}")),
             }
         }
         Err("Google sign-in expired. Connect again".into())
     })();
-    if result.is_err() {
-        let _ = crate::http::post_json_try(
+    result.map_err(|e| {
+        with_cancel(e, crate::http::post_json_try(
             g,
             "/api/connections/oauth/cancel",
             &json!({"session_id":id}),
             true,
             15,
-        );
+        ))
+    })
+}
+
+/// A failed connect cancels its gateway session; if that cancel fails too,
+/// say so (the session still expires on its own) instead of dropping it.
+fn with_cancel(error: String, cancel: Result<Value, String>) -> String {
+    match cancel {
+        Ok(_) => error,
+        Err(c) => format!("{error} (cancelling it also failed: {c}; it expires on its own)"),
     }
-    result
 }
 
 fn run_pairing(g: &Globals, provider: &str, services: Vec<&str>) -> Result<Value, String> {
@@ -204,7 +212,7 @@ fn run_pairing(g: &Globals, provider: &str, services: Vec<&str>) -> Result<Value
                 Some("pending" | "authorizing") => {}
                 Some("cancelled") => return Err("Pairing cancelled. Start again when ready".into()),
                 Some("expired") => break,
-                _ => return Err("Unexpected pairing status".into()),
+                other => return Err(format!("Unexpected pairing status {other:?}")),
             }
             if Instant::now() >= deadline {
                 break;
@@ -216,10 +224,7 @@ fn run_pairing(g: &Globals, provider: &str, services: Vec<&str>) -> Result<Value
         }
         Err("Pairing expired. Run the connect command again for a new code".into())
     })();
-    if result.is_err() {
-        let _ = crate::http::delete_json_try(g, &path, true, 15);
-    }
-    result
+    result.map_err(|e| with_cancel(e, crate::http::delete_json_try(g, &path, true, 15)))
 }
 
 pub fn auth_connect(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
@@ -262,10 +267,13 @@ pub fn auth_connect(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             }
             Ok(0)
         }
-        Err(detail) => {
-            eprintln!("{detail}");
-            Ok(1)
-        }
+        Err(detail) => crate::output::fail(
+            g.json,
+            crate::output::ExitCode::Generic,
+            "auth_connect_failed",
+            &detail,
+            None,
+        ),
     }
 }
 
@@ -293,5 +301,26 @@ mod tests {
                 .unwrap()
                 .is_err()
         );
+    }
+
+    /// A failed cancel is named next to the failure, not dropped.
+    #[test]
+    fn a_failed_cancel_is_named_with_the_connect_error() {
+        assert_eq!(with_cancel("Pairing expired".into(), Ok(json!({}))), "Pairing expired");
+        let both = with_cancel("Pairing expired".into(), Err("gateway answered HTTP 502".into()));
+        assert!(both.starts_with("Pairing expired"), "{both}");
+        assert!(both.contains("gateway answered HTTP 502"), "{both}");
+    }
+
+    /// `--json` callers get the error envelope and exit code, not bare text.
+    #[test]
+    fn a_failed_connect_answers_through_the_error_envelope() {
+        let own = include_str!("auth_connect.rs");
+        let own = &own[..own.find("#[cfg(test)]").expect("the test module")];
+        let entry = &own[own.find("pub fn auth_connect(").expect("the entry point")..];
+        assert!(entry.contains("crate::output::fail("), "the failure goes through output::fail");
+        assert!(entry.contains("\"auth_connect_failed\""), "with a stable error code");
+        assert!(!entry.contains("eprintln!"), "no bare stderr line for the failure");
+        assert!(!own.contains("let _ = crate::http::"), "a cancel's failure is not dropped");
     }
 }
