@@ -22,6 +22,8 @@ An unknown field is refused everywhere.
 
 Every validator refuses duplicate object keys, at any depth (code `duplicate_key`): Go keeps the last value and `serde_json` refuses the repeat, so a document must not be readable two ways. The CLI and gateway validators must match this.
 
+JSON null is refused on every field except those named nullable (today: `reservation`); every validator must match. The code is `field_type`, also in desired-config (where a type error elsewhere is `desired_invalid`). Go's decoder reads a null on a non-pointer field as a no-op that keeps the zero value (`"accel": {"gpu": null}` reads as 0), while `serde` refuses it, so the null must be refused on the raw tokens before any typed decode. The list is the table under "Nullable fields".
+
 Core never names a real add-on. The fixture add-on is `rhaddon`, and its
 declaration is `tests/fixtures/addons/rhaddon/node-workloads.json`.
 
@@ -204,6 +206,22 @@ worker. The worker holds no credential and no user token.
 - any state to `absent`: remove the worker, sidecar and network.
 - A refusal never changes the container: the row reports its last good state
   with a `reason`.
+
+## Nullable fields
+
+The one list every validator copies (the agent's is
+`node-agent-go/internal/nodewl/nullable.go`; a test holds the two equal). A
+pattern is a JSON pointer relative to the root of that document kind, with `*`
+standing for any one array index. A JSON null at any other path is refused with
+`field_type`.
+
+| Document | Nullable pointer | Why |
+|---|---|---|
+| desired-config fragment | `/node_workloads/*/reservation` | a provisioned entry holds no reservation |
+| `node-workloads.json` | (none) | |
+| `model-set.json` | (none) | |
+
+The heartbeat example never sends a null: an unknown value is omitted.
 
 ## Heartbeat keys (A4)
 

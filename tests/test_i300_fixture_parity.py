@@ -302,6 +302,40 @@ def test_the_doc_lists_exactly_the_agents_reasons() -> None:
     assert "noo upgrade --nodes" in row
 
 
+def test_the_nullable_table_is_the_agents_list_and_the_fixtures_use_no_other_null() -> None:
+    section = doc_text().split("## Nullable fields", 1)[1].split("\n## ", 1)[0]
+    doc_ptrs = sorted(re.findall(r"^\| [^|]+\| `(/[^`]*)` \|", section, re.M))
+    go = (REPO / "node-agent-go/internal/nodewl/nullable.go").read_text()
+    go_ptrs = sorted(re.findall(r'^\s+"(/[^"]*)",$', go, re.M))
+    assert doc_ptrs == go_ptrs == ["/node_workloads/*/reservation"]
+
+    def nulls(node, path=""):
+        if node is None:
+            yield path
+        elif isinstance(node, dict):
+            for k, v in node.items():
+                yield from nulls(v, f"{path}/{k}")
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                yield from nulls(v, f"{path}/*")
+
+    allowed = set(doc_ptrs)
+    for p in sorted(CANON.rglob("*.json")):
+        try:
+            obj = json.loads(p.read_text())
+        except ValueError:
+            continue
+        if p.name in ("cases.json",):
+            continue
+        bad = {n for n in nulls(obj) if n not in allowed}
+        rel = p.relative_to(CANON)
+        # A refusal fixture may carry the null it is there to refuse.
+        if p.name.startswith("refuse-null-"):
+            assert len(bad) == 1, (rel, bad)
+        else:
+            assert not bad, f"{rel} carries a null at {bad} that the contract does not name nullable"
+
+
 def test_the_doc_names_every_refusal_code_the_fixtures_pin() -> None:
     text = doc_text()
     codes = {c["code"] for d in DIRS for c in cases(d) if c["code"]}
