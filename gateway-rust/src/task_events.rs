@@ -511,21 +511,10 @@ async fn deliver_task(state: &Arc<AppState>, mut d: Due) {
             Ok(r) => r,
             Err(e) => return record_failure(db, &d, &format!("event not read: {e}")).await,
         };
-        let earliest: std::result::Result<Option<i64>, String> =
-            sqlx::query_scalar("SELECT min(seq) FROM noo_task_events WHERE task_id = $1")
-                .bind(d.task_id)
-                .fetch_one(db)
-                .await
-                .map_err(|e| e.to_string());
+        let earliest = crate::repo::task_events::earliest_seq(db, d.task_id).await.map_err(|e| e.to_string());
         let Some(row) = row else {
             // The event we owe is gone (swept, never written, or a gap).
-            let next_retained: std::result::Result<Option<i64>, String> =
-                sqlx::query_scalar("SELECT min(seq) FROM noo_task_events WHERE task_id = $1 AND seq > $2")
-                    .bind(d.task_id)
-                    .bind(d.next_seq)
-                    .fetch_one(db)
-                    .await
-                    .map_err(|e| e.to_string());
+            let next_retained = crate::repo::task_events::next_retained_seq(db, d.task_id, d.next_seq).await.map_err(|e| e.to_string());
             let resume = match missing_event_step(d.next_seq, earliest, next_retained) {
                 Missing::Retry(why) => return record_failure(db, &d, &why).await,
                 Missing::PastEnd => {
