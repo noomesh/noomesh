@@ -350,13 +350,12 @@ fn embed_flag_removed(g: &Globals, flag: &str) -> ! {
 /// initial state is "running").
 /// `[--watch|-w]` → watch.
 pub(crate) fn parse_embed_status(args: &[String]) -> Result<bool, Unhandled> {
-    let mut watch = false;
-    for tok in args {
-        match tok.as_str() {
-            "--watch" | "-w" => watch = true,
-            _ => return Err(Unhandled),
-        }
-    }
+    Ok(parse_embed_status_with(&mut crate::args::Args::new(args))?)
+}
+
+pub(crate) fn parse_embed_status_with(a: &mut crate::args::Args) -> Result<bool, crate::args::ArgError> {
+    let watch = a.flag(&["--watch", "-w"]);
+    a.finish()?;
     Ok(watch)
 }
 

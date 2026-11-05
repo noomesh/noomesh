@@ -282,7 +282,7 @@ mod tests {
         syntax
             .split_whitespace()
             .flat_map(|t| t.split('|'))
-            .map(|t| t.trim_matches(|c: char| c == '[' || c == ']' || c == '.'))
+            .map(|t| t.trim_matches(|c: char| c == '[' || c == ']' || c == '(' || c == ')' || c == '.'))
             .filter(|t| t.starts_with("--"))
             .map(str::to_string)
             .collect()
@@ -422,6 +422,13 @@ mod tests {
             row(&["security", "pki", "rotate-signing-key"], |a| { let _ = security_local::parse_rotate_signing_key_with(a); }),
             row(&["security", "trust-ca"], |a| { let _ = security_local::parse_trust_ca_with(a); }),
             row(&["security", "untrust-ca"], |a| { let _ = security_local::parse_untrust_ca_with(a); }),
+            // i191 D2 pass 4 (memory, ops, rag), behaviour pinned by parse_pin_tests.
+            row(&["memory", "embed-status"], |a| { let _ = memory::parse_embed_status_with(a); }),
+            row(&["ops", "show"], |a| { let _ = ops::parse_ops_show_with(a); }),
+            row(&["rag", "deduplicate"], |a| { let _ = rag::parse_dedup_with(a); }),
+            row(&["rag", "retag"], |a| { let _ = rag::parse_retag_with(a); }),
+            row(&["rag", "hold"], |a| { let _ = rag::parse_hold_with(a, true); }),
+            row(&["rag", "unhold"], |a| { let _ = rag::parse_hold_with(a, false); }),
         ];
         let mut bad = Vec::new();
         for (words, probe) in table {

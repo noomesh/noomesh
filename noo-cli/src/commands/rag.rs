@@ -878,14 +878,13 @@ pub fn rag_scan(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
 /// Flags of `rag deduplicate`: `(dry_run, yes)`.
 fn parse_dedup_flags(args: &[String]) -> Result<(bool, bool), Unhandled> {
-    let (mut dry_run, mut yes) = (false, false);
-    for tok in args {
-        match tok.as_str() {
-            "--dry-run" => dry_run = true,
-            "--yes" | "-y" => yes = true,
-            _ => return Err(Unhandled),
-        }
-    }
+    Ok(parse_dedup_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_dedup_with(a: &mut Args) -> Result<(bool, bool), ArgError> {
+    let dry_run = a.flag(&["--dry-run"]);
+    let yes = a.flag(&["--yes", "-y"]);
+    a.finish()?;
     Ok((dry_run, yes))
 }
 
@@ -990,52 +989,49 @@ pub(crate) enum RetagRefused {
 /// [--relabel] [--apply]`. `Err(Unhandled)` is an unknown flag, a flag with
 /// no value or a `--limit` that is not a number (the usage line).
 pub(crate) fn parse_retag(args: &[String]) -> Result<Result<RetagArgs, RetagRefused>, Unhandled> {
-    let mut roles: Vec<String> = Vec::new();
-    let mut doc_ids: Vec<String> = Vec::new();
-    let mut matcher: Option<String> = None;
-    let mut apply = false;
-    let mut relabel = false;
-    let mut limit: u64 = 1000;
-
+    // `--clear` is refused where it stands, as a flag: what comes before it is
+    // still parsed (and can still be the usage error), what follows is not
+    // read. A `--clear` that is the value of a flag is that value.
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--role" | "--roles" => {
-                i += 1;
-                let v = args.get(i).ok_or(Unhandled)?;
-                roles.extend(v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+            "--clear" => {
+                parse_retag_with(&mut Args::new(&args[..i]))?;
+                return Ok(Err(RetagRefused::Clear));
             }
-            "--match" => {
-                i += 1;
-                matcher = Some(args.get(i).ok_or(Unhandled)?.clone());
-            }
-            "--doc-id" => {
-                i += 1;
-                doc_ids.push(args.get(i).ok_or(Unhandled)?.clone());
-            }
-            "--limit" => {
-                i += 1;
-                limit = args.get(i).ok_or(Unhandled)?.parse().map_err(|_| Unhandled)?;
-            }
-            // Opting IN to overwriting an audience somebody chose. Without
-            // it only untagged documents are touched.
-            "--relabel" => relabel = true,
-            "--apply" => apply = true,
-            // Clearing an audience is gone: it left the document untagged,
-            // which a document never is. Kept as a flag only to say so.
-            "--clear" => return Ok(Err(RetagRefused::Clear)),
-            _ => return Err(Unhandled),
+            "--role" | "--roles" | "--match" | "--doc-id" | "--limit" => i += 2,
+            _ => i += 1,
         }
-        i += 1;
     }
-
-    if matcher.is_none() && doc_ids.is_empty() {
+    let a = parse_retag_with(&mut Args::new(args))?;
+    if a.matcher.is_none() && a.doc_ids.is_empty() {
         return Ok(Err(RetagRefused::NoTarget));
     }
-    if roles.is_empty() {
+    if a.roles.is_empty() {
         return Ok(Err(RetagRefused::NoRoles));
     }
-    Ok(Ok(RetagArgs { roles, doc_ids, matcher, apply, relabel, limit }))
+    Ok(Ok(a))
+}
+
+/// The flags of `rag retag` (the refusals are [`parse_retag`]'s).
+pub(crate) fn parse_retag_with(a: &mut Args) -> Result<RetagArgs, ArgError> {
+    let mut roles = Vec::new();
+    for v in a.values(&["--role", "--roles"])? {
+        roles.extend(v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+    }
+    let matcher = a.value(&["--match"])?;
+    let doc_ids = a.values(&["--doc-id"])?;
+    // Parsed as the loop did: no trimming, so ` 5` is refused.
+    let limit = match a.value(&["--limit"])? {
+        None => 1000,
+        Some(v) => v.parse().map_err(|_| ArgError::new(format!("--limit needs a number, got `{v}`")))?,
+    };
+    // Opting IN to overwriting an audience somebody chose. Without it only
+    // untagged documents are touched.
+    let relabel = a.flag(&["--relabel"]);
+    let apply = a.flag(&["--apply"]);
+    a.finish()?;
+    Ok(RetagArgs { roles, doc_ids, matcher, apply, relabel, limit })
 }
 
 pub fn rag_retag(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
@@ -1122,7 +1118,7 @@ const SHOW_IDS: usize = 5;
 const EXPORT_PAGE: u64 = 5000;
 
 #[derive(Debug, PartialEq, Eq, Default)]
-struct HoldArgs {
+pub(crate) struct HoldArgs {
     title_prefix: Option<String>,
     doc_ids: Vec<String>,
     reason: Option<String>,
@@ -1133,39 +1129,58 @@ struct HoldArgs {
 /// `Ok(Err(msg))` is a usage mistake worth a sentence; `Err(Unhandled)` is an
 /// unknown flag (falls through to the usage text).
 fn parse_hold_args(args: &[String], takes_reason: bool) -> Result<Result<HoldArgs, String>, Unhandled> {
-    let mut a = HoldArgs::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--title-prefix" => {
-                i += 1;
-                a.title_prefix = Some(args.get(i).ok_or(Unhandled)?.clone());
-            }
-            // `--doc a b c` and `--doc a --doc b` both work.
-            "--doc" => {
-                i += 1;
-                let first = args.get(i).ok_or(Unhandled)?;
-                a.doc_ids.push(first.clone());
-                while args.get(i + 1).is_some_and(|n| !n.starts_with('-')) {
-                    i += 1;
-                    a.doc_ids.push(args[i].clone());
-                }
-            }
-            "--reason" if takes_reason => {
-                i += 1;
-                a.reason = Some(args.get(i).ok_or(Unhandled)?.clone());
-            }
-            "--apply" => a.apply = true,
-            _ => return Err(Unhandled),
-        }
-        i += 1;
-    }
+    let a = parse_hold_with(&mut Args::new(&doc_runs_as_flags(args)), takes_reason)?;
     Ok(match (&a.title_prefix, a.doc_ids.is_empty()) {
         (None, true) => Err("give --title-prefix <p> or --doc <id>; refusing to hold everything by omission".into()),
         (Some(_), false) => Err("give --title-prefix or --doc, not both".into()),
         (Some(p), _) if p.is_empty() => Err("--title-prefix must not be empty".into()),
         _ => Ok(a),
     })
+}
+
+/// `--doc a b c` as `--doc a --doc b --doc c`: the ids after `--doc` run up
+/// to the next token that starts with `-`. A flag's own value is never read
+/// as an id.
+fn doc_runs_as_flags(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let t = &args[i];
+        out.push(t.clone());
+        match t.as_str() {
+            "--doc" => {
+                if let Some(first) = args.get(i + 1) {
+                    out.push(first.clone());
+                    i += 1;
+                    while args.get(i + 1).is_some_and(|n| !n.starts_with('-')) {
+                        i += 1;
+                        out.push("--doc".to_string());
+                        out.push(args[i].clone());
+                    }
+                }
+            }
+            "--title-prefix" | "--reason" => {
+                if let Some(v) = args.get(i + 1) {
+                    out.push(v.clone());
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The flags of `rag hold` (`takes_reason`) and `rag unhold`.
+pub(crate) fn parse_hold_with(a: &mut Args, takes_reason: bool) -> Result<HoldArgs, ArgError> {
+    let title_prefix = a.value(&["--title-prefix"])?;
+    // `--doc a b c` and `--doc a --doc b` both work (doc_runs_as_flags).
+    let doc_ids = a.values(&["--doc"])?;
+    let reason = if takes_reason { a.value(&["--reason"])? } else { None };
+    let apply = a.flag(&["--apply"]);
+    a.finish()?;
+    Ok(HoldArgs { title_prefix, doc_ids, reason, apply })
 }
 
 fn hold_body(a: &HoldArgs, with_reason: bool) -> serde_json::Value {
