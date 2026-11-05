@@ -564,18 +564,23 @@ pub async fn execute_task(state: Arc<AppState>, task_id: &str) -> Result<(), Str
 
     // Dispatch to configured channels. We do this on success only —
     // sending an empty/error body to a channel is noisier than useful.
-    let (notified, mut artifacts, delivery_failed) = if status == "success" && !result_text.is_empty() {
+    // A failed self-check delivers its digest too (channel_report): it is
+    // the report, and its unread reads lead it.
+    let report = heartbeat_actions::channel_report(&status, &action, &result_text, &error_text);
+    let (notified, mut artifacts, delivery_failed) = if let Some(body) = report.as_deref() {
         // Ingest the finished report into the local KB so future runs
         // (and `noo_rag_query` callers) can see it. Best-effort and
-        // a no-op for non-research actions.
-        heartbeat_actions::ingest_report_to_kb(
-            &state,
-            task_id,
-            &task_name,
-            &action,
-            &run_id,
-            &result_text,
-        ).await;
+        // a no-op for non-research actions. A failed run is not ingested.
+        if status == "success" {
+            heartbeat_actions::ingest_report_to_kb(
+                &state,
+                task_id,
+                &task_name,
+                &action,
+                &run_id,
+                &result_text,
+            ).await;
+        }
         heartbeat_actions::notify_channels(
             task_id,
             &task_name,
@@ -583,7 +588,7 @@ pub async fn execute_task(state: Arc<AppState>, task_id: &str) -> Result<(), Str
             &config,
             &channels,
             &recipients,
-            &result_text,
+            body,
             native_system.as_ref().map(|(c, d)| (c.as_str(), *d)),
         ).await
     } else {
@@ -760,11 +765,7 @@ pub async fn execute_task(state: Arc<AppState>, task_id: &str) -> Result<(), Str
     // reads. That is how database_backup stayed broken for weeks. Cooldown-
     // deduped per task, so a persistently broken task alerts hourly, not every run.
     if status == "error" {
-        let detail: String = if error_text.is_empty() {
-            "no error detail recorded".to_string()
-        } else {
-            error_text.chars().take(300).collect()
-        };
+        let detail: String = heartbeat_actions::task_failed_detail(&error_text);
         // The failure text is evidence for the log, not the channel: it is
         // whatever the action's error was — an upstream body, a path, a DSN.
         crate::operator_alert::send_operator_alert_with(
