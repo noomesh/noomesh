@@ -343,21 +343,13 @@ pub fn ops_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 /// `noo ops show <id> [--wait]` — GET /api/v1/ops/{id}.
 /// `<id> [--wait|-w]` → (id, wait).
 pub(crate) fn parse_ops_show(args: &[String]) -> Result<(String, bool), Unhandled> {
-    let mut id: Option<String> = None;
-    let mut wait = false;
-    for tok in args {
-        match tok.as_str() {
-            "--wait" | "-w" => wait = true,
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => {
-                if id.replace(t.to_string()).is_some() {
-                    return Err(Unhandled);
-                }
-            }
-        }
-    }
-    let Some(id) = id else { return Err(Unhandled) };
-    Ok((id, wait))
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_ops_show_with(&mut crate::args::Args::new(args))?)
+}
+
+pub(crate) fn parse_ops_show_with(a: &mut crate::args::Args) -> Result<(String, bool), crate::args::ArgError> {
+    let wait = a.flag(&["--wait", "-w"]);
+    Ok((a.one("<id>")?, wait))
 }
 
 pub fn ops_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {

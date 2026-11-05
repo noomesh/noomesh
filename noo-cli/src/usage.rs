@@ -263,7 +263,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["rag", "doc"], "<id>", "Show one document: audience, provenance, audience history and a text preview"),
     (&["rag", "ingest"], "<path>... [-t|--title <title>] [-r|--recursive] [--audience <role>[,<role>]]", "Ingest text files or a folder; audience defaults to you, share with team:<name> or company"),
     (&["rag", "scan"], "[-s|--source folders|drives|all]", "Run one synchronous ingest scan of watched folders and/or drives"),
-    (&["rag", "deduplicate"], "[--dry-run] [-y]", "Delete duplicate (doc_id, page_no) pages, keeping the newest; confirms first"),
+    (&["rag", "deduplicate"], "[--dry-run] [-y|--yes]", "Delete duplicate (doc_id, page_no) pages, keeping the newest; confirms first"),
     (&["rag", "retag"], "(--match <glob> | --doc-id <id>) --role <r>[,<r>] [--relabel] [--apply] [--limit <n>]", "Change which audience documents belong to; dry-run unless --apply"),
     (&["rag", "hold"], "(--title-prefix <p> | --doc <id>...) [--reason <r>] [--apply]", "Keep documents but take them out of embedding and search; dry-run unless --apply"),
     (&["rag", "unhold"], "(--title-prefix <p> | --doc <id>...) [--apply]", "Make held documents eligible for embedding and search again; dry-run unless --apply"),
