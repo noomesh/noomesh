@@ -46,6 +46,11 @@ pub(crate) const WATCHDOG: &str = include_str!("kiosk_assets/noo-kiosk-watchdog"
 pub(crate) const SERVE: &str = include_str!("kiosk_assets/noo-kiosk-serve");
 
 pub const ENV_FILE: &str = "/etc/default/kiosk";
+/// root:root 0644. It holds no secret (the keyless mint; pinned by
+/// `the_env_file_never_holds_a_key_shaped_line`), and the seat's sync, which
+/// runs as the seat user and not as the display user, reports what it says.
+/// At 0640 root:<display user> the seat read "" for every setting.
+pub(crate) const ENV_MODE: &str = "0644";
 pub const STATE_DIR: &str = "/var/lib/kiosk";
 const BIN_DIR: &str = "/usr/local/bin";
 const UNIT_DIR: &str = "/etc/systemd/system";
@@ -271,8 +276,8 @@ pub(crate) fn render_env(a: &SetupArgs) -> String {
     let poll = a.poll.map(|p| p.to_string()).unwrap_or_default();
     let quality = a.quality.clone().unwrap_or_default();
     format!(
-        "# Written by `noo kiosk setup`. root:{user} 0640 — the kiosk user reads it,\n\
-         # nobody else.\n\
+        "# Written by `noo kiosk setup`. root:root 0644: nothing here is secret,\n\
+         # and the seat's sync reads it to report the display's settings.\n\
          #\n\
          # THERE IS NO KEY HERE, and that is the design. The display mints its\n\
          # short-lived token by proving its tailnet identity: it publishes a\n\
@@ -681,7 +686,7 @@ pub fn kiosk_setup(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         None => (BIN_DIR, "0755", "root"),
     };
     let files: Vec<(String, String, &str, &str)> = vec![
-        (ENV_FILE.into(), render_env(&a), "0640", "root"),
+        (ENV_FILE.into(), render_env(&a), ENV_MODE, "root"),
         (format!("{run_dir}/noo-kiosk-launch"), LAUNCH.into(), run_mode, run_owner),
         (format!("{run_dir}/noo-kiosk-cdp"), CDP.into(), run_mode, run_owner),
         (format!("{BIN_DIR}/noo-kiosk-watchdog"), WATCHDOG.into(), "0755", "root"),
@@ -787,11 +792,10 @@ pub fn kiosk_setup(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // 2. the files
     for (p, c, m, o) in &files {
         ui::step(&format!("installing {p}"));
-        // The env file is root:kiosk so the launcher (kiosk) can read it
-        // and nothing else on the box can; a seat's shared-dir scripts are
-        // <seat user>:<display group>.
+        // The env file is root:root 0644 (ENV_MODE); a seat's shared-dir
+        // scripts are <seat user>:<display group>.
         let group = if p == ENV_FILE {
-            a.user.as_str()
+            "root"
         } else if seat_user.is_some() && p.starts_with(super::kiosk_seat::SEAT_KIOSK_DIR) {
             display_group.as_str()
         } else {
@@ -1734,11 +1738,22 @@ pub fn kiosk_set(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     };
     let next = with_quality(&current, quality);
     let shown = if quality.is_empty() { "auto" } else { quality };
+    // A file from 0.6.16 or older is 0640 root:<display user>, which the seat's
+    // sync cannot read. Any `set` converges it, even when the value is unchanged.
+    let stale_mode = std::fs::metadata(ENV_FILE).map(|m| env_mode_is_stale(&m)).unwrap_or(false);
     if env_line_value(&current, "NOO_KIOSK_QUALITY").as_deref() == Some(quality) {
+        if stale_mode && !dry_run {
+            if let Err(e) = install_text(&current, ENV_FILE, ENV_MODE, "root -g root") {
+                fail(g.json, ExitCode::Generic, "write", &e, Some("noo kiosk status"));
+            }
+        }
         if !g.json {
+            if stale_mode && !dry_run {
+                ui::done(&format!("{ENV_FILE} is now {ENV_MODE} root:root, so the seat can report it"));
+            }
             ui::done(&format!("quality is already {shown}; nothing changed"));
         } else {
-            println!("{}", json!({"quality": shown, "changed": false}));
+            println!("{}", json!({"quality": shown, "changed": false, "mode_converged": stale_mode && !dry_run}));
         }
         return Ok(0);
     }
@@ -1750,8 +1765,7 @@ pub fn kiosk_set(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
         return Ok(0);
     }
-    let user = env_line_value(&current, "NOO_KIOSK_USER").filter(|u| !u.is_empty()).unwrap_or_else(|| "kiosk".into());
-    if let Err(e) = install_text(&next, ENV_FILE, "0640", &format!("root -g {user}")) {
+    if let Err(e) = install_text(&next, ENV_FILE, ENV_MODE, "root -g root") {
         fail(g.json, ExitCode::Generic, "write", &e, Some("noo kiosk status"));
     }
     if let Err(e) = sh("sudo systemctl restart kiosk.service") {
@@ -1763,6 +1777,16 @@ pub fn kiosk_set(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ui::done(&format!("quality {shown}; the display restarted with it (the rest of the setup is unchanged)"));
     }
     Ok(0)
+}
+
+/// True when the env file is not root:root 0644 (an older 0640 install).
+fn env_mode_is_stale(m: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    stale_env_mode(m.mode(), m.uid(), m.gid())
+}
+
+fn stale_env_mode(mode: u32, uid: u32, gid: u32) -> bool {
+    mode & 0o7777 != 0o644 || uid != 0 || gid != 0
 }
 
 /// The value of `KEY=` in an env file's text, as written.
@@ -2896,6 +2920,47 @@ mod tests {
         }
         // The whole point of the keyless mint: nothing durable is written.
         assert!(!env.contains("NOO_KIOSK_KEY"), "the env file must carry no key");
+    }
+
+    /// The env file is world-readable (ENV_MODE 0644) because nothing in it
+    /// is secret. This is what keeps that true: every line either `setup` or
+    /// `set quality` writes has a known, non-secret name, and none is shaped
+    /// like a credential. A new variable must be added here on purpose.
+    #[test]
+    fn the_env_file_never_holds_a_key_shaped_line() {
+        assert_eq!(ENV_MODE, "0644");
+        let known = ["NOO_KIOSK_URL", "NOO_KIOSK_VIEW", "NOO_KIOSK_ROTATE", "NOO_KIOSK_POLL", "NOO_KIOSK_QUALITY",
+                     "NOO_KIOSK_STATE", "NOO_KIOSK_USER", "NOO_KIOSK_DIALBACK_PORT", "NOO_KIOSK_SERVE_PORT",
+                     "NOO_KIOSK_MODE", "NOO_KIOSK_VT"];
+        let mut a = sample();
+        a.rotate = Some(30);
+        a.poll = Some(5);
+        a.quality = Some("lean".into());
+        let full = render_env(&a);
+        for env in [render_env(&sample()), full.clone(), with_quality(&full, "full"), with_quality("", "lean")] {
+            let mut names = 0;
+            for line in env.lines().filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#')) {
+                let (name, value) = line.split_once('=').unwrap_or_else(|| panic!("not KEY=value: {line}"));
+                names += 1;
+                assert!(known.contains(&name), "{name} is new in the env file: add it to `known` only if it is not secret");
+                let upper = name.to_ascii_uppercase();
+                for bad in ["KEY", "TOKEN", "SECRET", "PASS", "CRED", "AUTH"] {
+                    assert!(!upper.contains(bad), "{name} looks like a credential, and the env file is world-readable");
+                }
+                assert!(!value.starts_with("noo-"), "{name}={value} looks like a minted token");
+                assert!(!value.contains("BEGIN"), "{name} carries PEM");
+            }
+            assert!(names >= 1, "the scan read no lines: {env:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_root_root_0644_env_file_is_current() {
+        assert!(!stale_env_mode(0o100644, 0, 0));
+        assert!(stale_env_mode(0o100640, 0, 1001), "the 0.6.16 shape converges");
+        assert!(stale_env_mode(0o100644, 0, 1001));
+        assert!(stale_env_mode(0o100600, 0, 0));
+        assert!(stale_env_mode(0o100644, 1000, 0));
         // Every variable the scripts read is one the env file writes.
         for script in [LAUNCH, WATCHDOG, CDP] {
             for var in ["NOO_KIOSK_URL", "NOO_KIOSK_VIEW", "NOO_KIOSK_ROTATE", "NOO_KIOSK_POLL", "NOO_KIOSK_STATE", "NOO_KIOSK_USER", "NOO_KIOSK_DIALBACK_PORT", "NOO_KIOSK_MODE", "NOO_KIOSK_VT"] {
