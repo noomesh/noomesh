@@ -872,8 +872,9 @@ pub fn gather(root: &Path) -> Facts {
 }
 
 /// `GRAFANA_ROOT_URL` is process-global; tests that set or read it hold this.
+/// It is the crate's one env lock (`test_support::ENV_LOCK`).
 #[cfg(test)]
-pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) use crate::test_support::ENV_LOCK as TEST_ENV_LOCK;
 
 #[cfg(test)]
 mod tests {

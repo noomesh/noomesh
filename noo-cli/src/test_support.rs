@@ -111,6 +111,21 @@ pub fn hand_built_repo_reads(src: &str) -> Vec<usize> {
     hits
 }
 
+/// The crate's one lock for process-global environment variables in tests.
+///
+/// `std::env::set_var` is process-wide and tests run on many threads, so two
+/// cases that set or read the same variable under DIFFERENT locks race: the
+/// http trust cases and onboard's walk both set `$NOO_PKI_DIR`, and a case
+/// that read it unlocked saw another case's directory (2026-11-05). Every
+/// case that sets or reads `$NOO_PKI_DIR` holds this one (grafana_door's
+/// `TEST_ENV_LOCK` is this static under another name).
+pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// [`ENV_LOCK`], recovered if a panicking case poisoned it.
+pub fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +236,77 @@ mod tests {
              building a path outside the crate from CARGO_MANIFEST_DIR:\n{}",
             offenders.join("\n")
         );
+    }
+}
+
+#[cfg(test)]
+mod env_lock_tests {
+    use super::ENV_LOCK;
+
+    /// grafana_door's lock is not a second lock: it is this one.
+    #[test]
+    fn grafana_door_s_lock_is_the_crate_lock() {
+        assert!(std::ptr::eq(&crate::commands::grafana_door::TEST_ENV_LOCK, &ENV_LOCK));
+    }
+
+    /// Every file that writes `$NOO_PKI_DIR` uses the crate lock and keeps no
+    /// lock of its own, so no two writers can hold different locks.
+    #[test]
+    fn every_writer_of_the_pki_dir_holds_the_crate_lock() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let (mut seen, mut writers, mut bad) = (0usize, Vec::new(), Vec::new());
+        let mut dirs = vec![root.clone()];
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(&d).expect("read src/").flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    dirs.push(p);
+                    continue;
+                }
+                if p.extension().is_none_or(|x| x != "rs") || p.ends_with("test_support.rs") {
+                    continue;
+                }
+                seen += 1;
+                let text = crate::test_src::strip_comments(&std::fs::read_to_string(&p).unwrap());
+                if !(text.contains("set_var(\"NOO_PKI_DIR\"") || text.contains("remove_var(\"NOO_PKI_DIR\"")) {
+                    continue;
+                }
+                let name = p.strip_prefix(&root).unwrap().display().to_string();
+                writers.push(name.clone());
+                if text.contains("Mutex::new(())") {
+                    bad.push(format!("{name}: keeps a lock of its own"));
+                }
+                if !(text.contains("test_support::env_lock()") || text.contains("TEST_ENV_LOCK")) {
+                    bad.push(format!("{name}: does not take the crate lock"));
+                }
+            }
+        }
+        assert!(seen >= 50, "read only {seen} files: this guard is looking in the wrong place");
+        assert!(writers.len() >= 2, "found only {writers:?}: the http trust cases and onboard's walk both write it");
+        assert!(bad.is_empty(), "{bad:?}");
+    }
+
+    /// In http's trust cases, every case that touches the environment (sets
+    /// or reads it, directly or through clean_env / pki_dir /
+    /// cluster_ca_candidates) takes the lock first.
+    #[test]
+    fn every_http_trust_case_that_touches_the_env_takes_the_lock() {
+        let src = crate::test_src::strip_comments(include_str!("http.rs"));
+        let module = crate::test_src::fn_body(&src, "mod trust_tests");
+        let mut cases = 0;
+        let mut bad = Vec::new();
+        for (at, _) in module.match_indices("#[test]") {
+            let after = &module[at..];
+            let Some(f) = after.find("fn ") else { continue };
+            let name: String = after[f + 3..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            let body = crate::test_src::fn_body(after, &format!("fn {name}("));
+            cases += 1;
+            let touches = ["clean_env(", "set_var(", "remove_var(", "pki_dir()", "cluster_ca_candidates()"].iter().any(|n| body.contains(n));
+            if touches && !body.contains("env_lock()") {
+                bad.push(name);
+            }
+        }
+        assert!(cases >= 20, "read only {cases} trust cases: this guard is looking in the wrong place");
+        assert!(bad.is_empty(), "these trust cases touch the environment without env_lock(): {bad:?}");
     }
 }

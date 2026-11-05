@@ -17,7 +17,7 @@
 
 use crate::output::{fail, ExitCode};
 use crate::Globals;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use ureq::tls::{Certificate, RootCerts, TlsConfig};
 use ureq::Agent;
@@ -125,7 +125,13 @@ pub(crate) fn is_loopback(url: &str) -> bool {
 /// `~/.config/mesh/pki`) is where `noo security pki` keeps `ca.crt` on a
 /// controller; `/etc/noo/pki/ca.crt` is where prep-host lands it on a node.
 fn cluster_ca_candidates() -> Vec<PathBuf> {
-    let mut v = vec![crate::pki::pki_dir().join("ca.crt")];
+    cluster_ca_candidates_in(&crate::pki::pki_dir())
+}
+
+/// [`cluster_ca_candidates`] for a given PKI dir, so a test can check the
+/// list without reading the process-global `$NOO_PKI_DIR`.
+fn cluster_ca_candidates_in(pki_dir: &Path) -> Vec<PathBuf> {
+    let mut v = vec![pki_dir.join("ca.crt")];
     let node = PathBuf::from("/etc/noo/pki/ca.crt");
     if !v.contains(&node) {
         v.push(node);
@@ -1626,13 +1632,21 @@ mod trust_tests {
     /// is the literal `/etc/noo/pki/ca.crt`, after this box's own PKI dir.
     #[test]
     fn the_node_ca_stays_a_candidate_of_the_shipped_resolver() {
-        let c = super::cluster_ca_candidates();
-        assert_eq!(c.first(), Some(&crate::pki::pki_dir().join("ca.crt")));
-        assert!(c.contains(&PathBuf::from("/etc/noo/pki/ca.crt")), "{c:?}");
+        // The list over a fixed dir: no read of $NOO_PKI_DIR, which the other
+        // trust cases set (it read it unlocked, twice, and flaked when a
+        // concurrent case moved it in between: 2026-11-05). The lock is held
+        // anyway, as every case here that names the env-reading calls does.
+        let _g = env_lock();
+        let c = super::cluster_ca_candidates_in(Path::new("/x/pki"));
+        assert_eq!(c, vec![PathBuf::from("/x/pki/ca.crt"), PathBuf::from("/etc/noo/pki/ca.crt")]);
+        let node = super::cluster_ca_candidates_in(Path::new("/etc/noo/pki"));
+        assert_eq!(node, vec![PathBuf::from("/etc/noo/pki/ca.crt")], "the node's own dir is not listed twice");
         let src = crate::test_src::own_code(include_str!("http.rs"));
         let outer = crate::test_src::fn_body(&src, "pub fn resolve_trust(");
         assert!(outer.contains("resolve_trust_with(base_url, enrolled, &cluster_ca_candidates())"),
             "resolve_trust passes the real candidates: {outer}");
+        let shipped = crate::test_src::fn_body(&src, "fn cluster_ca_candidates(");
+        assert!(shipped.contains("cluster_ca_candidates_in(&crate::pki::pki_dir())"), "the shipped list is the tested one: {shipped}");
     }
 
     /// A CA planted in a later candidate (where a node's sits) resolves as
@@ -1650,12 +1664,13 @@ mod trust_tests {
         assert_eq!(super::resolve_trust_with("https://gw.example:8080", None, &[d.join("ca.crt")]).unwrap(), Trust::Platform);
     }
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::MutexGuard;
 
     /// $NOO_TLS_CA / $NOO_PKI_DIR are process-global; these cases set them.
+    /// The crate's one env lock, so a case in another module that sets
+    /// $NOO_PKI_DIR (onboard's walk) cannot move it under these.
     fn env_lock() -> MutexGuard<'static, ()> {
-        static L: OnceLock<Mutex<()>> = OnceLock::new();
-        L.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+        crate::test_support::env_lock()
     }
 
     fn tmpdir(tag: &str) -> PathBuf {
