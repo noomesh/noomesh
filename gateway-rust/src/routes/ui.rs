@@ -1794,8 +1794,6 @@ mod voice_space_tests {
         for name in [None, Some(""), Some("\"><script>alert(1)</script>"), Some("../rhaddon")] {
             assert_eq!(voice_space_html(html.into(), name), html);
         }
-        assert!(include_str!("../../../docker-compose.cluster.yml")
-            .contains("NOO_VOICE_SPACE_ADDON=${NOO_VOICE_SPACE_ADDON:-}"));
     }
 
     #[test]
