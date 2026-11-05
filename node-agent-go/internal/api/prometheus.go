@@ -32,7 +32,7 @@ func (s *Server) handlePrometheusMetrics(w http.ResponseWriter, r *http.Request)
 	// GPU metrics
 	gpuMetrics := s.gpu.Metrics()
 	if gpuMetrics != nil {
-		gpuModel := s.gpu.DetectModel()
+		gpuModel, _ := s.gpu.DetectModel()
 		if gpuModel == "" {
 			gpuModel = "unknown"
 		}

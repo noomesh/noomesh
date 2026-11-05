@@ -374,7 +374,11 @@ func (s *Server) handleGPUMetrics(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{
 		"available": true,
 		"node_id":   s.cfg.NodeID,
-		"gpu_model": s.gpu.DetectModel(),
+	}
+	// Metrics answered, so the card is there; a failed name probe leaves the
+	// key out rather than reporting an empty model.
+	if model, err := s.gpu.DetectModel(); err == nil {
+		resp["gpu_model"] = model
 	}
 	// A field the probe could not read is absent, never 0.
 	for k, v := range map[string]*float64{
