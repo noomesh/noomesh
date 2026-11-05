@@ -2250,6 +2250,11 @@ pub(crate) fn dir_seen(p: &std::path::Path) -> DirSeen {
 }
 
 const STORAGE_DIRS_REMEDY: &str = "noo onboard --only storage";
+/// For a directory only the target's lock names: onboarding creates this
+/// CLI's compiled list and nothing else, so it can never make one; the roll
+/// does, before the pin moves (reconcile_storage_dirs).
+pub(crate) const STORAGE_DIRS_LOCK_ONLY_REMEDY: &str =
+    "noo upgrade --stack   # the roll creates each directory the target's lock names, before the pin moves";
 
 /// The `data directories` row: every directory this release's compose binds
 /// (`onboard::STORAGE_SUBDIRS`, placed under the data and state roots) exists
@@ -2257,15 +2262,24 @@ const STORAGE_DIRS_REMEDY: &str = "noo onboard --only storage";
 /// stack roll until it is there; this row says so before the roll. A path
 /// that cannot be checked is named as such, never counted present.
 pub(crate) fn storage_dirs_check(dirs: Option<&[(String, std::path::PathBuf, DirSeen)]>) -> Check {
+    storage_dirs_check_with(dirs, &[])
+}
+
+/// [`storage_dirs_check`], where `lock_only` are the paths only the target's
+/// lock names (`noo upgrade --check`). When every missing directory is one of
+/// them the remedy is the roll: onboarding would leave them missing, and the
+/// check would name it again, a loop (harness 0.6.17 review, c4).
+pub(crate) fn storage_dirs_check_with(dirs: Option<&[(String, std::path::PathBuf, DirSeen)]>, lock_only: &[std::path::PathBuf]) -> Check {
     const NAME: &str = "data directories";
     let Some(dirs) = dirs else {
         return warn(NAME, "NOO_DATA_ROOT is not set in .env; the data directories were not checked",
             Some(STORAGE_DIRS_REMEDY.to_string()));
     };
-    let missing: Vec<String> = dirs.iter()
+    let missing_paths: Vec<&std::path::PathBuf> = dirs.iter()
         .filter(|(_, _, s)| *s == DirSeen::Missing)
-        .map(|(_, p, _)| p.display().to_string())
+        .map(|(_, p, _)| p)
         .collect();
+    let missing: Vec<String> = missing_paths.iter().map(|p| p.display().to_string()).collect();
     let unchecked: Vec<String> = dirs.iter()
         .filter_map(|(_, p, s)| match s {
             DirSeen::Unchecked(e) => Some(format!("{} ({e})", p.display())),
@@ -2283,7 +2297,14 @@ pub(crate) fn storage_dirs_check(dirs: Option<&[(String, std::path::PathBuf, Dir
     if !unchecked.is_empty() {
         parts.push(format!("not checked {}", unchecked.join(", ")));
     }
-    warn(NAME, parts.join("; "), (!missing.is_empty()).then(|| STORAGE_DIRS_REMEDY.to_string()))
+    let remedy = if missing_paths.is_empty() {
+        None
+    } else if missing_paths.iter().all(|p| lock_only.contains(p)) {
+        Some(STORAGE_DIRS_LOCK_ONLY_REMEDY.to_string())
+    } else {
+        Some(STORAGE_DIRS_REMEDY.to_string())
+    };
+    warn(NAME, parts.join("; "), remedy)
 }
 
 /// [`storage_dirs_check`] for the install at `root`, read from its `.env`.
