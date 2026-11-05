@@ -355,7 +355,7 @@ pub async fn search(
     }
     // Bound decryption and memory. Personal content is never indexed or cached
     // by the shared service. The caller is told when this initial window caps.
-    let rows: Vec<(Uuid, Uuid, String, Value)> = sqlx::query_as("SELECT d.id,d.source_id,d.item_key,d.sealed FROM noo_integration_documents d JOIN noo_connection_sources s ON s.id=d.source_id AND s.owner_uuid=d.owner_uuid JOIN noo_connected_accounts a ON a.id=s.account_id AND a.owner_uuid=s.owner_uuid JOIN noo_users u ON u.user_uuid=d.owner_uuid WHERE d.owner_uuid=$1 AND NOT u.disabled AND a.status='connected' ORDER BY d.updated_at DESC,d.id LIMIT 1001")
+    let rows: Vec<(Uuid, Uuid, String, Value)> = sqlx::query_as("SELECT d.id,d.source_id,d.item_key,d.sealed FROM noo_integration_documents d JOIN noo_connection_sources s ON s.id=d.source_id AND s.owner_uuid=d.owner_uuid JOIN noo_connected_accounts a ON a.id=s.account_id AND a.owner_uuid=s.owner_uuid JOIN noo_users u ON u.user_uuid=d.owner_uuid WHERE $1::uuid IS NOT NULL AND NOT u.disabled AND a.status='connected' ORDER BY d.updated_at DESC,d.id LIMIT 1001")
         .bind(owner).fetch_all(db).await?;
     let truncated = rows.len() > 1000;
     let mut hits = Vec::new();
