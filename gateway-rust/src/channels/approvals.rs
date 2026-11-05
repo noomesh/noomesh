@@ -333,11 +333,14 @@ pub async fn decide_cluster_proposal(
         // it did for an enrolment row — write out the bootstrap procedure
         // — happens right here instead, so the chat ack is telling the
         // truth about a row that is already in its terminal state.
-        crate::routes::cluster::resolve_enrolment_proposal(state, proposal_id).await;
+        let r = crate::routes::cluster::resolve_enrolment_proposal(state, proposal_id).await;
         ack = format!(
             "{ack}\n\n{}",
             crate::routes::cluster::bootstrap_instructions(&host)
         );
+        if let Some(p) = r.problem {
+            ack = format!("{ack}\n\n⚠ The proposal stays approved: {p}.");
+        }
     }
 
     crate::routes::cluster::emit_cluster_event(

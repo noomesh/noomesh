@@ -2717,12 +2717,15 @@ async fn proposals_decide(
             // anything since). The sidecar is gone, so the gateway
             // does that one useful step itself, now, rather than leaving a
             // row in 'approved' that nothing will ever pick up.
-            let final_status = if new_status == "approved" {
-                resolve_enrolment_proposal(&state, id).await
-            } else {
-                new_status.to_string()
-            };
-            Ok(Json(json!({ "id": id, "status": final_status })))
+            if new_status == "approved" {
+                let r = resolve_enrolment_proposal(&state, id).await;
+                let mut out = json!({ "id": id, "status": r.status });
+                if let Some(p) = r.problem {
+                    out["problem"] = json!(p);
+                }
+                return Ok(Json(out));
+            }
+            Ok(Json(json!({ "id": id, "status": new_status })))
         }
         None => Err(AppError::NotFound(format!(
             "Proposal '{id}' not found or not pending"
@@ -2752,16 +2755,39 @@ pub(crate) fn bootstrap_instructions(host: &str) -> String {
 /// Returns the status actually written, so the caller reports what is
 /// true rather than what it hoped for. A DB failure leaves the row
 /// 'approved' and says 'approved'.
-pub(crate) async fn resolve_enrolment_proposal(state: &AppState, id: &str) -> String {
-    let host: Option<(String,)> = sqlx::query_as(
+pub(crate) async fn resolve_enrolment_proposal(state: &AppState, id: &str) -> Resolution {
+    resolve_enrolment_proposal_in(&state.db, id).await
+}
+
+/// What resolving an approved enrolment proposal wrote: the row's status,
+/// and, when the bootstrap instructions could not be written, why.
+#[derive(Debug)]
+pub(crate) struct Resolution {
+    pub status: String,
+    pub problem: Option<String>,
+}
+
+/// [`resolve_enrolment_proposal`] over a pool. A host that cannot be read is
+/// not "no host": the row stays `approved` (what is actually written) and the
+/// read's error is the problem the caller reports (i460).
+pub(crate) async fn resolve_enrolment_proposal_in(db: &sqlx::PgPool, id: &str) -> Resolution {
+    let stuck = |what: String| {
+        tracing::warn!(proposal = %id, problem = %what, "proposal_resolve_failed");
+        Resolution { status: "approved".to_string(), problem: Some(what) }
+    };
+    let host: Option<(String,)> = match sqlx::query_as(
         "SELECT host FROM noo_cluster_proposals WHERE id = $1::uuid"
     )
     .bind(id)
-    .fetch_optional(&state.db)
+    .fetch_optional(db)
     .await
-    .ok()
-    .flatten();
-    let Some((host,)) = host else { return "approved".to_string() };
+    {
+        Ok(h) => h,
+        Err(e) => return stuck(format!("the proposal's host could not be read, so no bootstrap instructions were written: {e}")),
+    };
+    let Some((host,)) = host else {
+        return stuck("the proposal is gone, so no bootstrap instructions were written".to_string());
+    };
 
     let log = bootstrap_instructions(&host);
     let res = sqlx::query(
@@ -2771,15 +2797,12 @@ pub(crate) async fn resolve_enrolment_proposal(state: &AppState, id: &str) -> St
     )
     .bind(id)
     .bind(&log)
-    .execute(&state.db)
+    .execute(db)
     .await;
 
     match res {
-        Ok(_) => "needs_bootstrap".to_string(),
-        Err(e) => {
-            tracing::warn!(proposal = %id, error = %e, "proposal_resolve_failed");
-            "approved".to_string()
-        }
+        Ok(_) => Resolution { status: "needs_bootstrap".to_string(), problem: None },
+        Err(e) => stuck(format!("the bootstrap instructions could not be written: {e}")),
     }
 }
 
@@ -6277,6 +6300,30 @@ async fn probe_ssh(host: String) -> bool {
 /// Hard cap at 30s (tokio timeout, same semantics as the Python
 /// asyncio.wait_for): a /24 should finish in <5s; if probes are hanging
 /// something deeper is wrong and we want to fail visibly.
+/// Every enrolled node, keyed by its ip and by its hostname. Python
+/// consulted the node registry; the Rust source of truth for "already
+/// enrolled" is the persistent cluster_nodes table. An unreadable table is a
+/// 503 that names it, never "nothing is enrolled": discover would then offer
+/// every enrolled node as a new host to propose (i460).
+pub(crate) async fn enrolled_index(db: &sqlx::PgPool) -> Result<std::collections::HashMap<String, String>, AppError> {
+    let rows = crate::repo::cluster::all_nodes(db).await.map_err(|e| {
+        AppError::Unavailable(format!(
+            "cannot read the enrolled nodes, so discover cannot tell a new host from an enrolled one: {e}"
+        ))
+    })?;
+    let mut registered = std::collections::HashMap::new();
+    // Both columns are NOT NULL, so only emptiness needs guarding.
+    for (node_id, ip, hostname) in rows {
+        if !ip.is_empty() {
+            registered.insert(ip, node_id.clone());
+        }
+        if !hostname.is_empty() {
+            registered.insert(hostname, node_id);
+        }
+    }
+    Ok(registered)
+}
+
 async fn cluster_discover(
     State(state): State<Arc<AppState>>,
     body: Option<Json<Value>>,
@@ -6290,6 +6337,10 @@ async fn cluster_discover(
         .filter(|s| !s.is_empty()).map(String::from);
 
     tracing::info!("cluster_discover.start");
+
+    // Read before any probe, so an unreadable registry fails the request
+    // instead of listing every enrolled node as newly discovered.
+    let registered = enrolled_index(&state.db).await?;
 
     let work = async {
         let inv = load_cluster_inventory(inventory_path.as_deref());
@@ -6359,24 +6410,7 @@ async fn cluster_discover(
             }
         }
 
-        // Cross-check enrolled nodes. Python consulted the node registry;
-        // the Rust source of truth for "already enrolled" is the
-        // persistent cluster_nodes table (ip + hostname both match).
-        let mut registered: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        let rows = crate::repo::cluster::all_nodes(&state.db)
-            .await
-            .unwrap_or_default();
-        // Both columns are NOT NULL, so only emptiness needs guarding — the
-        // previous `Option::filter` was doing a null check that could not fire.
-        for (node_id, ip, hostname) in rows {
-            if !ip.is_empty() {
-                registered.insert(ip, node_id.clone());
-            }
-            if !hostname.is_empty() {
-                registered.insert(hostname, node_id);
-            }
-        }
+        // Cross-check enrolled nodes: `registered`, read before the probes.
 
         let mut trusted: Vec<Value> = Vec::new();
         let mut discovered: Vec<Value> = Vec::new();
@@ -8148,5 +8182,40 @@ mod lanes_carried_tests {
         let carry = beat.find("carry_lanes(&mut data, &body);").expect("the heartbeat stores lanes");
         let put = beat.find("kv.put(&node_id").expect("the heartbeat's KV write");
         assert!(carry < put, "stored before the record is written");
+    }
+}
+
+/// A database read's error is not "absent" on the enrolment paths (i460):
+/// each is run against a pool that cannot connect.
+#[cfg(test)]
+mod db_read_error_tests {
+    use crate::routes::AppError;
+
+    fn dead_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool")
+    }
+
+    /// An approved proposal whose host cannot be read stays `approved` and
+    /// says why; it used to return `approved` silently, as if there were no
+    /// row.
+    #[tokio::test]
+    async fn an_unreadable_proposal_host_is_reported_not_swallowed() {
+        let r = super::resolve_enrolment_proposal_in(&dead_pool(), "00000000-0000-0000-0000-000000000000").await;
+        assert_eq!(r.status, "approved");
+        let p = r.problem.expect("the read's error is the reported problem");
+        assert!(p.contains("host could not be read"), "{p}");
+    }
+
+    /// An unreadable node registry fails discover; it used to read as "no
+    /// node is enrolled", so every enrolled node was offered as a new host.
+    #[tokio::test]
+    async fn an_unreadable_registry_fails_discover() {
+        match super::enrolled_index(&dead_pool()).await {
+            Err(AppError::Unavailable(m)) => assert!(m.contains("cannot read the enrolled nodes"), "{m}"),
+            other => panic!("expected a 503 naming the read, got {other:?}"),
+        }
     }
 }
