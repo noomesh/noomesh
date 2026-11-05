@@ -3093,6 +3093,32 @@ struct SelfCheckParams {
 
 type RecentFailure = (String, Option<String>, String, String, Option<i32>, chrono::DateTime<Utc>, Option<String>, Option<String>);
 
+/// One self-check read that failed: its name, the error KIND (what a
+/// channel may carry: [`read_error_kind`]) and the full error (the run
+/// record and the log only; channels leave the box).
+#[derive(Clone, Debug)]
+struct UnreadRead {
+    name: String,
+    kind: String,
+    error: String,
+}
+
+/// What a failed read was, without its text: a Postgres SQLSTATE, or the
+/// sqlx variant. Never the message, which can name hosts, tables or roles.
+fn read_error_kind(e: &sqlx::Error) -> String {
+    match e {
+        sqlx::Error::Database(d) => match d.code() {
+            Some(c) if c == "42501" => format!("permission denied ({c})"),
+            Some(c) => format!("database error ({c})"),
+            None => "database error".to_string(),
+        },
+        sqlx::Error::PoolTimedOut => "database unavailable (PoolTimedOut)".to_string(),
+        sqlx::Error::PoolClosed => "database unavailable (PoolClosed)".to_string(),
+        sqlx::Error::Io(_) => "database unreachable (Io)".to_string(),
+        _ => "database error".to_string(),
+    }
+}
+
 /// The self-check's six reads. A read that fails is named in `unread`
 /// with its error, never read as "nothing to report" (i460).
 struct SelfCheckReads {
@@ -3102,15 +3128,16 @@ struct SelfCheckReads {
     failed_cycles: Vec<(String, i32, String)>,
     security_spikes: Vec<(String, i64)>,
     active_activities: Vec<(String, String, String, chrono::DateTime<Utc>)>,
-    unread: Vec<String>,
+    unread: Vec<UnreadRead>,
 }
 
 /// One section's rows, or none with the read named in `unread`.
-fn section<T>(name: &str, read: Result<Vec<T>, sqlx::Error>, unread: &mut Vec<String>) -> Vec<T> {
+fn section<T>(name: &str, read: Result<Vec<T>, sqlx::Error>, unread: &mut Vec<UnreadRead>) -> Vec<T> {
     match read {
         Ok(rows) => rows,
         Err(e) => {
-            unread.push(format!("{name}: {e}"));
+            tracing::warn!(read = %name, error = %e, "self_check_read_failed");
+            unread.push(UnreadRead { name: name.to_string(), kind: read_error_kind(&e), error: e.to_string() });
             Vec::new()
         }
     }
@@ -3228,8 +3255,23 @@ async fn self_check_reads(db: &sqlx::PgPool, p: &SelfCheckParams) -> SelfCheckRe
 /// The digest's ending. Anything unread fails the run with the digest as
 /// its error and never prints the all-clear (i460); otherwise the
 /// all-clear is printed only when nothing was found.
-fn finish_self_check(mut out: String, anything_to_report: bool, unread: &[String]) -> Result<String, String> {
+fn finish_self_check(mut out: String, anything_to_report: bool, unread: &[UnreadRead]) -> Result<String, String> {
     if !unread.is_empty() {
+        // What was NOT checked goes first, right under the title: it is why
+        // the run failed, and the task_failed detail is the first 300 chars.
+        let mut first = String::from("## ❓ Not checked\n\n");
+        for u in unread {
+            first.push_str(&format!("- {}: {}\n", u.name, u.kind));
+        }
+        first.push('\n');
+        let at = out.find("\n\n").map(|i| i + 2).unwrap_or(0);
+        out.insert_str(at, &first);
+        // The full errors close the digest, for the run record only: the
+        // channel copy ([`channel_report`]) stops before them.
+        out.push_str(READ_ERRORS_HEADING);
+        for u in unread {
+            out.push_str(&format!("- {}: {}\n", u.name, u.error));
+        }
         return Err(out);
     }
     if !anything_to_report {
@@ -3412,13 +3454,6 @@ async fn action_agent_self_check(
         out.push('\n');
     }
 
-    if !unread.is_empty() {
-        out.push_str("## ❓ Not checked\n\n");
-        for u in &unread {
-            out.push_str(&format!("- {u}\n"));
-        }
-        out.push('\n');
-    }
     if !anything_to_report || dispatch_inputs_unread(&unread) {
         if anything_to_report {
             out.push_str("_The findings were not handed to the evolve add-on: the reads it acts on were not checked._\n");
@@ -3471,8 +3506,37 @@ async fn action_agent_self_check(
 
 /// The two reads the evolve add-on acts on: with either unread, its
 /// findings are incomplete and are not handed over.
-fn dispatch_inputs_unread(unread: &[String]) -> bool {
-    unread.iter().any(|u| u.starts_with("recent heartbeat failures") || u.starts_with("repeat-offender tasks"))
+fn dispatch_inputs_unread(unread: &[UnreadRead]) -> bool {
+    unread.iter().any(|u| u.name.starts_with("recent heartbeat failures") || u.name.starts_with("repeat-offender tasks"))
+}
+
+/// Where a failed self-check's full read errors start in its digest.
+const READ_ERRORS_HEADING: &str = "\n## Read errors (run record only)\n\n";
+
+/// What a finished run sends to its channels, if anything: a successful
+/// run's result; and, for the self-check alone, a FAILED run's digest up to
+/// its read errors (its Err is the digest: "Not checked" first, the
+/// findings of the reads that worked, and no raw error text). Every other
+/// action's error is evidence for the log, never the channel. One
+/// function for the cron tick and "run now".
+pub fn channel_report(status: &str, action: &str, result_text: &str, error_text: &str) -> Option<String> {
+    match status {
+        "success" if !result_text.is_empty() => Some(result_text.to_string()),
+        "error" if action == "agent_self_check" && !error_text.is_empty() => {
+            Some(error_text.split(READ_ERRORS_HEADING).next().unwrap_or("").to_string())
+        }
+        _ => None,
+    }
+}
+
+/// The `heartbeat.task_failed` detail: the first 300 characters of the
+/// error (a failed self-check's starts with what was not checked).
+pub fn task_failed_detail(error_text: &str) -> String {
+    if error_text.is_empty() {
+        "no error detail recorded".to_string()
+    } else {
+        error_text.chars().take(300).collect()
+    }
 }
 
 // ─── write_log ─────────────────────────────────────────────────────────
@@ -5920,7 +5984,7 @@ mod db_read_error_tests {
             repeat_offender_threshold: 2,
         };
         let r = self_check_reads(&dead_pool(), &p).await;
-        let names: Vec<&str> = r.unread.iter().map(|u| u.split(": ").next().unwrap_or("")).collect();
+        let names: Vec<&str> = r.unread.iter().map(|u| u.name.as_str()).collect();
         assert_eq!(
             names,
             [
@@ -5941,7 +6005,11 @@ mod db_read_error_tests {
     /// all-clear is printed only when everything was read and nothing found.
     #[test]
     fn an_unread_section_fails_the_self_check_and_never_prints_the_all_clear() {
-        let unread = vec!["security event spikes (audit log): pool timed out".to_string()];
+        let unread = vec![UnreadRead {
+            name: "security event spikes (audit log)".into(),
+            kind: "database unavailable (PoolTimedOut)".into(),
+            error: "pool timed out while waiting for an open connection".into(),
+        }];
         let e = finish_self_check("# digest\n".into(), false, &unread).unwrap_err();
         assert!(!e.contains("Nothing notable"), "{e}");
         assert!(finish_self_check("# digest\n".into(), true, &unread).is_err());
@@ -6013,5 +6081,76 @@ mod avg_load_tests {
         assert_eq!(avg_load_line(&nodes[..2]).as_deref(), Some("- **Avg Load**: 40%"));
         assert_eq!(avg_load_line(&nodes[2..3]).as_deref(), Some("- **Avg Load**: not reported (1 not reporting a load)"));
         assert_eq!(avg_load_line(&nodes[3..]), None, "no online node");
+    }
+}
+
+#[cfg(test)]
+mod self_check_delivery_tests {
+    use super::{channel_report, finish_self_check, read_error_kind, task_failed_detail, UnreadRead};
+
+    /// A read error whose text names a host, the way an I/O error can.
+    fn leaky() -> sqlx::Error {
+        sqlx::Error::Io(std::io::Error::other("connect to 10.9.8.7:5432 refused (rh-secret-host)"))
+    }
+
+    /// A failed self-check still reaches its channel: what was not checked
+    /// first, then the findings of the reads that worked. The channel copy
+    /// carries each unread read's name and error KIND only; the raw error
+    /// text stays in the run record (the Err) and the log.
+    #[test]
+    fn a_failed_self_check_delivers_not_checked_first_and_no_raw_error_text() {
+        let e = leaky();
+        let unread = vec![UnreadRead {
+            name: "recent heartbeat failures (noo_heartbeat_runs)".into(),
+            kind: read_error_kind(&e),
+            error: e.to_string(),
+        }];
+        let out = "# Agent Self-Check — now\n\n## 🛑 Failed self-develop cycles — 1\n\n- cycle 7\n\n".to_string();
+        let digest = finish_self_check(out, true, &unread).unwrap_err();
+        let nc = digest.find("## ❓ Not checked").expect("the section");
+        assert!(nc < digest.find("## 🛑 Failed self-develop cycles").unwrap(), "first: {digest}");
+        assert!(digest.starts_with("# Agent Self-Check"), "{digest}");
+        assert!(digest.contains("rh-secret-host"), "the run record keeps the full error: {digest}");
+
+        let channel = channel_report("error", "agent_self_check", "", &digest).expect("delivered");
+        assert!(channel.contains("- recent heartbeat failures (noo_heartbeat_runs): database unreachable (Io)"), "{channel}");
+        assert!(channel.contains("cycle 7"), "the findings that were read: {channel}");
+        for raw in ["rh-secret-host", "10.9.8.7", "refused"] {
+            assert!(!channel.contains(raw), "raw error text {raw:?} in the channel copy: {channel}");
+        }
+        // The task_failed detail leads with the reason.
+        assert!(task_failed_detail(&digest).contains("Not checked"), "{}", task_failed_detail(&digest));
+    }
+
+    /// Only the self-check's failure is a report. Any other action's error
+    /// is evidence for the log; a success is delivered as before.
+    #[test]
+    fn only_a_failed_self_check_is_delivered_on_error() {
+        assert_eq!(channel_report("error", "research_report", "", "DSN postgres://x"), None);
+        assert_eq!(channel_report("error", "agent_self_check", "", ""), None);
+        assert_eq!(channel_report("success", "research_report", "the report", "").as_deref(), Some("the report"));
+        assert_eq!(channel_report("success", "research_report", "", ""), None);
+        assert_eq!(task_failed_detail(""), "no error detail recorded");
+    }
+
+    /// A kind never carries the error's text.
+    #[test]
+    fn a_read_error_kind_names_the_failure_not_its_text() {
+        assert_eq!(read_error_kind(&sqlx::Error::PoolTimedOut), "database unavailable (PoolTimedOut)");
+        assert_eq!(read_error_kind(&leaky()), "database unreachable (Io)");
+        assert_eq!(read_error_kind(&sqlx::Error::Protocol("rh-secret-host".into())), "database error");
+    }
+
+    /// Both delivery sites (the cron tick and "run now") decide through
+    /// channel_report, not a success-only test of their own.
+    #[test]
+    fn both_delivery_sites_use_channel_report() {
+        let tick = crate::test_src::own_code(include_str!("heartbeat_loop.rs"));
+        let body = crate::test_src::fn_body(&tick, "pub async fn execute_task(");
+        assert!(body.contains("heartbeat_actions::channel_report(&status, &action, &result_text, &error_text)"), "the cron tick");
+        assert!(body.contains("heartbeat_actions::task_failed_detail(&error_text)"), "the task_failed detail");
+        let now = crate::test_src::own_code(include_str!("routes/intelligence.rs"));
+        let body = crate::test_src::fn_body(&now, "async fn execute_manual_run(");
+        assert!(body.contains("heartbeat_actions::channel_report(&status, &action, &result_text, &error_text)"), "run now");
     }
 }
