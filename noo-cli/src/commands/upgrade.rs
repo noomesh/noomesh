@@ -294,10 +294,11 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             // the target's own lists come from its signed stack lock (i467),
             // and only when that cannot be read does this CLI's list stand in.
             let list_target = if action == CliAction::KeepNewer { current.as_str() } else { version.as_str() };
-            let tag = norm_stack_tag(tag_override.as_deref().unwrap_or(list_target));
-            let (lists, from, source, caveat) = storage_list_choice(&current, list_target, || target_storage_lists(g, &tag));
-            let dirs = storage_dirs_seen(&root, lists.as_ref());
-            storage_check_report(dirs.as_deref(), &from, source, list_target, caveat)
+            let check_target = storage_check_target(list_target, tag_override.as_deref());
+            let tag = norm_stack_tag(&check_target);
+            let (lists, from, source, caveat) = storage_list_choice(&current, &check_target, || target_storage_lists(g, &tag));
+            let seen = storage_dirs_seen(&root, lists.as_ref());
+            storage_check_report(seen.as_ref(), &from, source, &check_target, caveat)
         });
         if g.json {
             let mut o = serde_json::json!({
@@ -2224,6 +2225,7 @@ fn reconcile_storage_dirs(g: &Globals, root: &std::path::Path, tag: &str, lock: 
             Some("the release was not produced by the release workflow; do not work around this")),
     };
     let mut failed: Vec<String> = Vec::new();
+    let mut lock_only_failed = false;
     for d in planned.iter().filter(|d| !d.path.exists()) {
         // Created with its intended owner (onboarding's one rule: a service
         // uid, else the owner of the root it sits under), or refused with
@@ -2234,7 +2236,10 @@ fn reconcile_storage_dirs(g: &Globals, root: &std::path::Path, tag: &str, lock: 
                 let why = if d.lock_only { format!("named by stack-{tag}.lock") } else { "new in this release".to_string() };
                 ui::done(&format!("created {} ({why})", d.path.display()));
             },
-            Err(e) => failed.push(format!("{} ({e})", d.path.display())),
+            Err(e) => {
+                lock_only_failed |= d.lock_only;
+                failed.push(format!("{} ({e})", d.path.display()));
+            }
         }
     }
     if !failed.is_empty() {
@@ -2243,7 +2248,20 @@ fn reconcile_storage_dirs(g: &Globals, root: &std::path::Path, tag: &str, lock: 
                       the new stack would refuse to start without {}",
                 if failed.len() == 1 { "y" } else { "ies" }, failed.join(", "),
                 if failed.len() == 1 { "it" } else { "them" }),
-            Some("noo onboard --only storage   # then re-run: noo upgrade --stack"));
+            Some(storage_dir_failure_remedy(lock_only_failed)));
+    }
+}
+
+/// The remedy when the roll could not create a data directory. Onboarding
+/// creates this CLI's compiled list and nothing else, so for a directory only
+/// the target's lock names it is never the fix: run again it leaves that
+/// directory missing and the roll refuses again, a loop (harness 0.6.17
+/// review, c4). The create error above names what it found and the chown.
+pub(crate) fn storage_dir_failure_remedy(lock_only_failed: bool) -> &'static str {
+    if lock_only_failed {
+        "fix each directory as the line above says (its owner, or create it), then re-run: noo upgrade --stack"
+    } else {
+        "noo onboard --only storage   # then re-run: noo upgrade --stack"
     }
 }
 
@@ -2420,14 +2438,52 @@ fn target_storage_lists(g: &Globals, tag: &str) -> Result<StorageLists, String> 
     }
 }
 
-/// Each of this release's storage directories for the install at `root`
-/// and whether it is there (`None`: no `NOO_DATA_ROOT` in its `.env`).
-/// Reads only; never creates.
-fn storage_dirs_seen(root: &std::path::Path, lists: Option<&StorageLists>) -> Option<Vec<(String, std::path::PathBuf, crate::commands::cluster_verify::DirSeen)>> {
-    storage_dir_targets_in_env_with(root, lists).map(|t| t.into_iter().map(|(n, p)| {
-        let seen = crate::commands::cluster_verify::dir_seen(&p);
+/// What `--check` found: each of the roll's data directories for the
+/// install, whether it is there, and which of them only the target's lock
+/// names (onboarding cannot create those; the roll does).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SeenDirs {
+    pub(crate) dirs: Vec<(String, std::path::PathBuf, crate::commands::cluster_verify::DirSeen)>,
+    pub(crate) lock_only: Vec<std::path::PathBuf>,
+}
+
+/// The release `--check` holds this box's directories to: the `--tag`
+/// release when one is given (the roll reads that stack's lock), else
+/// `list_target` (harness 0.6.17 review, c2: with `--tag` the check used
+/// `list_target`, so it read another release's list than the roll would).
+pub(crate) fn storage_check_target(list_target: &str, tag_override: Option<&str>) -> String {
+    match tag_override {
+        Some(t) => norm_stack_tag(t).trim_start_matches('v').to_string(),
+        None => list_target.to_string(),
+    }
+}
+
+/// The roll's data directories for the install at `root`, the set
+/// reconcile_storage_dirs makes: this CLI's compiled list plus each directory
+/// `lists` (the target's lock) names that it does not. A lock-only name the
+/// roll would refuse (lock_only_dir_ok, the roll's own check) is "not
+/// checked", naming why. `None`: no `NOO_DATA_ROOT` in its `.env`. Reads
+/// only; never creates.
+fn storage_dirs_seen(root: &std::path::Path, lists: Option<&StorageLists>) -> Option<SeenDirs> {
+    use crate::commands::cluster_verify::{dir_seen, DirSeen};
+    let compiled = storage_dir_targets_in_env(root)?;
+    let from_lock = lists.and_then(|l| storage_dir_targets_in_env_with(root, Some(l))).unwrap_or_default();
+    let known: std::collections::HashSet<std::path::PathBuf> = compiled.iter().map(|(_, p)| p.clone()).collect();
+    let mut dirs: Vec<(String, std::path::PathBuf, DirSeen)> = compiled.into_iter().map(|(n, p)| {
+        let seen = dir_seen(&p);
         (n, p, seen)
-    }).collect())
+    }).collect();
+    let mut lock_only = Vec::new();
+    for (n, p) in from_lock.into_iter().filter(|(_, p)| !known.contains(p)) {
+        let base = crate::onboard::steps::storage_base(&n, &p);
+        let seen = match lock_only_dir_ok(&n, &p, &base) {
+            Ok(()) => dir_seen(&p),
+            Err(e) => DirSeen::Unchecked(format!("the roll refuses this name: {e}")),
+        };
+        lock_only.push(p.clone());
+        dirs.push((n, p, seen));
+    }
+    Some(SeenDirs { dirs, lock_only })
 }
 
 /// The `--check` storage row: verify's `data directories` judgement, its
@@ -2435,14 +2491,15 @@ fn storage_dirs_seen(root: &std::path::Path, lists: Option<&StorageLists>) -> Op
 /// the target release's own). `list_from` names the list: this CLI's version
 /// (`source` "cli") or the target's signed lock (`source` "lock").
 pub(crate) fn storage_check_report(
-    dirs: Option<&[(String, std::path::PathBuf, crate::commands::cluster_verify::DirSeen)]>,
+    seen: Option<&SeenDirs>,
     list_from: &str,
     source: &str,
     target: &str,
     caveat: Option<String>,
 ) -> (serde_json::Value, crate::commands::cluster_verify::Check, Option<String>) {
-    use crate::commands::cluster_verify::{storage_dirs_check, DirSeen, Verdict};
-    let c = storage_dirs_check(dirs);
+    use crate::commands::cluster_verify::{storage_dirs_check_with, DirSeen, Verdict};
+    let dirs = seen.map(|s| s.dirs.as_slice());
+    let c = storage_dirs_check_with(dirs, seen.map_or(&[][..], |s| s.lock_only.as_slice()));
     let paths = |want: fn(&DirSeen) -> bool| -> Vec<String> {
         dirs.unwrap_or_default().iter().filter(|(_, _, s)| want(s)).map(|(_, p, _)| p.display().to_string()).collect()
     };
@@ -6870,7 +6927,7 @@ mod storage_dir_tests {
         let data = root_without("check", STORAGE_SUBDIRS, &["tempo"]);
         let root = install_at("check", &data);
         let dirs = super::storage_dirs_seen(&root, None);
-        let (j, c, caveat) = super::storage_check_report(dirs.as_deref(), "0.6.17", "cli", "0.6.17", None);
+        let (j, c, caveat) = super::storage_check_report(dirs.as_ref(), "0.6.17", "cli", "0.6.17", None);
         assert_eq!(c.verdict, crate::commands::cluster_verify::Verdict::Warn, "{}", c.detail);
         assert_eq!(j["verdict"], "warn");
         assert_eq!(j["checked"], true);
@@ -6879,7 +6936,7 @@ mod storage_dir_tests {
         assert_eq!(caveat, None, "the running CLI's list is the roll's");
         assert!(!data.join("tempo").exists(), "--check must never create a directory");
         std::fs::create_dir_all(data.join("tempo")).unwrap();
-        let (j, _, _) = super::storage_check_report(super::storage_dirs_seen(&root, None).as_deref(), "0.6.17", "cli", "0.6.17", None);
+        let (j, _, _) = super::storage_check_report(super::storage_dirs_seen(&root, None).as_ref(), "0.6.17", "cli", "0.6.17", None);
         assert_eq!(j["verdict"], "ok");
         assert_eq!(j["missing"], serde_json::json!([]));
         let _ = std::fs::remove_dir_all(&data);
@@ -6916,16 +6973,69 @@ mod storage_dir_tests {
         let state: Vec<String> = STATE_SUBDIRS.iter().map(|s| s.to_string()).collect();
         let (lists, from, source, caveat) = super::storage_list_choice("0.6.17", "0.6.18", || Ok((storage, state)));
         assert_eq!((source, caveat), ("lock", None));
-        let (j, _, _) = super::storage_check_report(super::storage_dirs_seen(&root, lists.as_ref()).as_deref(), &from, source, "0.6.18", None);
+        let (j, _, _) = super::storage_check_report(super::storage_dirs_seen(&root, lists.as_ref()).as_ref(), &from, source, "0.6.18", None);
         assert_eq!(j["list_source"], "lock");
         assert_eq!(j["missing"], serde_json::json!([data.join("newdir").display().to_string()]));
-        assert_eq!(j["remedy"], "noo onboard --only storage");
+        // Onboarding (this CLI's list) can never make `newdir`: the remedy is
+        // the roll, which creates it before the pin moves (0.6.17 review c4).
+        assert_eq!(j["remedy"], crate::commands::cluster_verify::STORAGE_DIRS_LOCK_ONLY_REMEDY);
+        assert!(!j["remedy"].as_str().unwrap().contains("onboard"), "{}", j["remedy"]);
         assert!(!data.join("newdir").exists(), "--check must never create a directory");
         // This CLI's own list finds nothing missing on the same box.
-        let (j, _, _) = super::storage_check_report(super::storage_dirs_seen(&root, None).as_deref(), "0.6.17", "cli", "0.6.17", None);
+        let (j, _, _) = super::storage_check_report(super::storage_dirs_seen(&root, None).as_ref(), "0.6.17", "cli", "0.6.17", None);
         assert_eq!(j["verdict"], "ok");
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// harness 0.6.17 review c2: `--check --tag X` holds the box to X's
+    /// lock, as the roll does, even when no CLI upgrade is pending (the
+    /// check used `list_target`, this CLI's version, and fetched nothing);
+    /// and it checks the roll's set, this CLI's compiled list PLUS the
+    /// lock's, so a compiled directory the lock leaves out is still checked.
+    #[test]
+    fn check_with_a_tag_holds_the_box_to_that_tags_lock_and_the_rolls_set() {
+        assert_eq!(super::storage_check_target("0.6.17", Some("stack-v0.6.18")), "0.6.18");
+        assert_eq!(super::storage_check_target("0.6.17", Some("v0.6.18-rc.2")), "0.6.18-rc.2");
+        assert_eq!(super::storage_check_target("0.6.17", None), "0.6.17");
+        let target = super::storage_check_target("0.6.17", Some("v0.6.18"));
+        let fetched = std::cell::Cell::new(None::<String>);
+        let data = root_without("tagcheck", STORAGE_SUBDIRS, &["tempo"]);
+        let root = install_at("tagcheck", &data);
+        let mut storage: Vec<String> = STORAGE_SUBDIRS.iter().filter(|s| **s != "tempo").map(|s| s.to_string()).collect();
+        storage.push("newdir".into());
+        let state: Vec<String> = STATE_SUBDIRS.iter().map(|s| s.to_string()).collect();
+        let (lists, from, source, _) = super::storage_list_choice("0.6.17", &target, || {
+            fetched.set(Some(super::norm_stack_tag(&target)));
+            Ok((storage, state))
+        });
+        assert_eq!(fetched.take().as_deref(), Some("v0.6.18"), "the tag's lock is read, not this CLI's list");
+        assert_eq!((source, from.as_str()), ("lock", "the 0.6.18 stack lock"));
+        let seen = super::storage_dirs_seen(&root, lists.as_ref()).expect("NOO_DATA_ROOT is set");
+        assert_eq!(seen.lock_only, vec![data.join("newdir")]);
+        let (j, _, _) = super::storage_check_report(Some(&seen), &from, source, &target, None);
+        assert_eq!(j["target"], "0.6.18");
+        let mut missing: Vec<String> = j["missing"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        missing.sort();
+        let mut want = vec![data.join("newdir").display().to_string(), data.join("tempo").display().to_string()];
+        want.sort();
+        assert_eq!(missing, want, "the compiled `tempo` the lock omits is still the roll's");
+        // A compiled directory is missing too: onboarding makes that one.
+        assert_eq!(j["remedy"], "noo onboard --only storage");
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// harness 0.6.17 review c4: a directory only the target's lock names
+    /// that the roll could not create is never sent back to onboarding,
+    /// which does not know it (the operator would loop).
+    #[test]
+    fn a_lock_only_create_failure_never_names_onboarding() {
+        assert!(!super::storage_dir_failure_remedy(true).contains("onboard"), "{}", super::storage_dir_failure_remedy(true));
+        assert!(super::storage_dir_failure_remedy(true).contains("noo upgrade --stack"));
+        assert_eq!(super::storage_dir_failure_remedy(false), "noo onboard --only storage   # then re-run: noo upgrade --stack");
+        let body = crate::test_src::fn_body(super::phase_src::code(), "fn reconcile_storage_dirs(");
+        assert!(body.contains("lock_only_failed |= d.lock_only;") && body.contains("Some(storage_dir_failure_remedy(lock_only_failed))"), "{body}");
     }
 
     /// The lock's lines read back as this build's lists; a lock before i467
@@ -6979,7 +7089,7 @@ mod storage_dir_tests {
     fn check_without_a_data_root_is_not_checked() {
         let root = std::env::temp_dir().join(format!("noo-check-noenv-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let (j, _, _) = super::storage_check_report(super::storage_dirs_seen(&root, None).as_deref(), "0.6.17", "cli", "0.6.17", None);
+        let (j, _, _) = super::storage_check_report(super::storage_dirs_seen(&root, None).as_ref(), "0.6.17", "cli", "0.6.17", None);
         assert_eq!((j["checked"].as_bool(), j["verdict"].as_str()), (Some(false), Some("warn")));
         let _ = std::fs::remove_dir_all(&root);
     }
