@@ -125,9 +125,13 @@ pub(super) async fn generate_running_summary(
         }
     };
 
-    let resp_json: Value = match resp.json().await {
+    // A reply that cannot be read is said, never a silent skip (i460).
+    let resp_json = match crate::upstream_body::json_2xx(resp, "the summary model").await {
         Ok(v) => v,
-        Err(_) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "summary_llm_reply_unreadable; the summary is not updated");
+            return;
+        }
     };
 
     let summary_text = resp_json.get("choices")

@@ -553,9 +553,22 @@ async fn skills_run(
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
             let duration_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let data = resp.json::<Value>().await.unwrap_or(json!({}));
-
-            let exit_code = data.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(-1);
+            // An answer that cannot be read, or one without an exit code, is
+            // said as such: it used to read as "Container exited with code
+            // -1", a cause the container never gave (i460).
+            let (exit_code, data) = match crate::upstream_body::json_2xx(resp, &format!("node {node_id}")).await.and_then(|d| skill_exit(&d).map(|c| (c, d))) {
+                Ok(read) => read,
+                Err(e) => {
+                    tracing::warn!(container = %container_name, error = %e, "skill_container_answer_unreadable");
+                    return Ok(Json(json!({
+                        "success": false,
+                        "error": format!("{e}; the skill may have run"),
+                        "duration_ms": duration_ms,
+                        "container_id": container_name,
+                        "node_id": node_id,
+                    })));
+                }
+            };
             let stdout = data.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
             let stderr = data.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
             let container_id = data.get("container_id").and_then(|v| v.as_str())
@@ -1043,11 +1056,29 @@ async fn workflows_run(
 }
 
 
+/// The skill run's exit code from the node agent's answer; an answer
+/// without one is an error, never `-1` (i460).
+fn skill_exit(data: &Value) -> Result<i64, String> {
+    data.get("exit_code")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| format!("the node agent's skill answer has no exit_code: {}", truncate_str(&data.to_string(), 200)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use crate::auth::{ClusterKind, ClusterNode, RequesterCtx, Role};
+
+    /// i460: a skill answer without an exit code is said as such, never
+    /// "exited with code -1".
+    #[test]
+    fn a_skill_answer_without_an_exit_code_is_an_error_not_minus_one() {
+        assert_eq!(skill_exit(&json!({"exit_code": 0, "stdout": "{}"})), Ok(0));
+        assert_eq!(skill_exit(&json!({"exit_code": -1})), Ok(-1), "a real -1 stays a real -1");
+        let e = skill_exit(&json!({"stdout": "x"})).unwrap_err();
+        assert!(e.starts_with("the node agent's skill answer has no exit_code"), "{e}");
+    }
 
     fn jwt(sub: &str, role: Role, harness: Option<&str>) -> Option<Extension<RequesterCtx>> {
         Some(Extension(RequesterCtx {
