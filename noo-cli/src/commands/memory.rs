@@ -348,7 +348,8 @@ fn embed_flag_removed(g: &Globals, flag: &str) -> ! {
 /// (Redis flag + SQL embedding counts). With `--watch`, keeps polling while
 /// the worker is running (Python parity: only enters the loop when the
 /// initial state is "running").
-pub fn memory_embed_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+/// `[--watch|-w]` → watch.
+pub(crate) fn parse_embed_status(args: &[String]) -> Result<bool, Unhandled> {
     let mut watch = false;
     for tok in args {
         match tok.as_str() {
@@ -356,6 +357,11 @@ pub fn memory_embed_status(g: &Globals, args: &[String]) -> Result<i32, Unhandle
             _ => return Err(Unhandled),
         }
     }
+    Ok(watch)
+}
+
+pub fn memory_embed_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let watch = parse_embed_status(args)?;
     let body = get_json(g, "/api/memory/embed/status", true, 10);
     if g.json {
         println!("{body}");
@@ -599,6 +605,31 @@ mod tests {
     fn the_ignored_tuning_flags_are_all_listed() {
         for f in ["-b", "--batch-size", "-d", "--delay", "-m", "--max-batches", "-g", "--build-graph", "-t", "--threshold"] {
             assert!(EMBED_REMOVED_FLAGS.contains(&f), "{f}");
+        }
+    }
+}
+
+/// What the memory parser left on a hand-rolled loop accepts and refuses,
+/// pinned before it moves to `args::Args` (i191 D2 pass 4). `None` is
+/// `Err(Unhandled)`: the usage line, exit 2.
+#[cfg(test)]
+mod parse_pin_tests {
+    use super::*;
+
+    #[test]
+    fn old_parse_embed_status_table() {
+        let rows: &[(&[&str], Option<bool>)] = &[
+            (&[], Some(false)),
+            (&["--watch"], Some(true)),
+            (&["-w"], Some(true)),
+            (&["-w", "--watch"], Some(true)),
+            (&["--bogus"], None),
+            (&["now"], None),
+            (&["-"], None),
+        ];
+        for (args, want) in rows {
+            let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            assert_eq!(parse_embed_status(&argv).ok(), *want, "memory embed-status {args:?}");
         }
     }
 }

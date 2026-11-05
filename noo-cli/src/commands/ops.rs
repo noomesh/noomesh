@@ -341,7 +341,8 @@ pub fn ops_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 }
 
 /// `noo ops show <id> [--wait]` — GET /api/v1/ops/{id}.
-pub fn ops_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+/// `<id> [--wait|-w]` → (id, wait).
+pub(crate) fn parse_ops_show(args: &[String]) -> Result<(String, bool), Unhandled> {
     let mut id: Option<String> = None;
     let mut wait = false;
     for tok in args {
@@ -356,6 +357,11 @@ pub fn ops_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
     let Some(id) = id else { return Err(Unhandled) };
+    Ok((id, wait))
+}
+
+pub fn ops_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let (id, wait) = parse_ops_show(args)?;
     let path = format!("/api/v1/ops/{}", urlencode(&id));
     let mut op = get_json(g, &path, true, 15);
     if wait && !is_terminal(op["status"].as_str().unwrap_or("")) {
@@ -595,5 +601,32 @@ mod tests {
         assert!(ops_list(&g, &argv(&["--bogus"])).is_err());
         assert!(ops_list(&g, &argv(&["--limit", "x"])).is_err());
         assert!(ops_types(&g, &argv(&["x"])).is_err());
+    }
+}
+
+/// What the ops parser left on a hand-rolled loop accepts and refuses,
+/// pinned before it moves to `args::Args` (i191 D2 pass 4). `None` is
+/// `Err(Unhandled)`: the usage line, exit 2.
+#[cfg(test)]
+mod parse_pin_tests {
+    use super::*;
+
+    #[test]
+    fn old_parse_ops_show_table() {
+        let id = |s: &str, w: bool| Some((s.to_string(), w));
+        let rows: &[(&[&str], Option<(String, bool)>)] = &[
+            (&["op-1"], id("op-1", false)),
+            (&["op-1", "--wait"], id("op-1", true)),
+            (&["-w", "op-1"], id("op-1", true)),
+            (&[], None),
+            (&["--wait"], None),
+            (&["op-1", "op-2"], None),
+            (&["op-1", "--bogus"], None),
+            (&["-"], None),
+        ];
+        for (args, want) in rows {
+            let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            assert_eq!(&parse_ops_show(&argv).ok(), want, "ops show {args:?}");
+        }
     }
 }
