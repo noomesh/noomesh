@@ -5075,8 +5075,13 @@ pub(crate) fn enabled_addons(health: &Value) -> Vec<String> {
     v
 }
 
+/// One enabled add-on and its `GET /api/addons/{addon}/access` body, or why it was not read.
+pub(crate) type AccessRead = (String, Result<Value, String>);
+/// Every enabled add-on's read, or why `/health` itself was not read.
+pub(crate) type AccessReads = Result<Vec<AccessRead>, String>;
+
 /// `/health`'s enabled add-ons, then `GET /api/addons/{addon}/access` for each.
-fn addon_access_reads(g: &Globals) -> Result<Vec<(String, Result<Value, String>)>, String> {
+fn addon_access_reads(g: &Globals) -> AccessReads {
     let health = crate::http::get_json_try(g, "/health", false, 10).map_err(|e| format!("/health: {e}"))?;
     Ok(enabled_addons(&health)
         .into_iter()
@@ -5094,7 +5099,7 @@ fn addon_access_reads(g: &Globals) -> Result<Vec<(String, Result<Value, String>)
 /// admin-only on purpose and is never a warning. Stale settings (for features
 /// no longer declared) are listed; they open nothing. An access body that
 /// cannot be read is a WARN that names it, never a silent OK.
-pub(crate) fn addon_access_check(reads: Result<Vec<(String, Result<Value, String>)>, String>) -> Check {
+pub(crate) fn addon_access_check(reads: AccessReads) -> Check {
     use crate::commands::addon_access::{feature_grants, stale_features};
     const ROW: &str = "add-on access";
     let reads = match reads {
