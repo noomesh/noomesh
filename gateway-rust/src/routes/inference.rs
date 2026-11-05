@@ -908,11 +908,17 @@ async fn proxy_backend_health(
         .timeout(std::time::Duration::from_secs(5));
     match req.send().await {
         Ok(resp) => {
-            let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
-                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
             crate::coordinator::warn_if_node_agent_outdated(resp.status(), &url);
-            let body = resp.text().await.unwrap_or_default();
-            (status, body).into_response()
+            // A body cut off mid-transfer is a 502 naming the backend, never
+            // its status over an empty body (i460).
+            match crate::upstream_body::whole_text(resp, "the backend").await {
+                Ok((code, body)) => (
+                    axum::http::StatusCode::from_u16(code).unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
+                    body,
+                )
+                    .into_response(),
+                Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+            }
         }
         Err(e) => (StatusCode::BAD_GATEWAY, format!("Backend unreachable: {e}")).into_response(),
     }

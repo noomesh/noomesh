@@ -748,13 +748,17 @@ async fn forward(
         req = req.json(&b);
     }
     match req.send().await {
-        Ok(resp) => {
-            let status =
-                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let text = resp.text().await.unwrap_or_default();
-            let json: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
-            (status, Json(json)).into_response()
-        }
+        // The add-on's status and body pass through; a body cut off
+        // mid-transfer is a 502 naming it, never its status over `{"raw": ""}`
+        // (i460).
+        Ok(resp) => match crate::upstream_body::whole_text(resp, &format!("add-on {}", manifest.addon)).await {
+            Ok((code, text)) => {
+                let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY);
+                let json: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
+                (status, Json(json)).into_response()
+            }
+            Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
+        },
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(unreachable_body(&manifest.addon, &base, &e)),
