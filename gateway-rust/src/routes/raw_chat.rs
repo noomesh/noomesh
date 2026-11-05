@@ -1561,11 +1561,14 @@ mod tests {
     #[tokio::test]
     async fn a_mix_of_a_stall_and_a_dead_port_is_a_502_not_a_504() {
         let wedged = fake_backend(Fake::HeadersOnly).await;
-        // A port nothing listens on.
-        let dead = {
-            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            format!("http://{}", l.local_addr().unwrap())
-        };
+        // A port nothing listens on: bound for the whole test but never
+        // listening, so a connect is refused and no other test can take it.
+        // A listener dropped at once freed the port, and a parallel test's
+        // fake backend could bind it and answer (batch 2026-11-05, "neither
+        // candidate can answer").
+        let held = tokio::net::TcpSocket::new_v4().unwrap();
+        held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let dead = format!("http://{}", held.local_addr().unwrap());
         let cands = [cand("a", "vllm", "m", &wedged.url), cand("b", "ollama", "m", &dead)];
         let (r, _) = run(&cands, false, FAST).await;
         let e = match r {
