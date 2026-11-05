@@ -1729,9 +1729,18 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
         if g.verbose || g.json {
             return c.status();
         }
-        let (status, tally) = crate::onboard::sh::run_summarised(c)?;
+        let (status, tally, tail) = crate::onboard::sh::run_summarised(c)?;
         for s in [tally.pull_summary(), tally.summary()].into_iter().flatten() {
             if status.success() && tally.failed() == 0 { ui::done(&s); } else { ui::failed(&s, None); }
+        }
+        // A launcher that exits non-zero is never silent: its last lines,
+        // unfiltered, even the ones the summary absorbed.
+        let lines = crate::onboard::sh::failure_tail(status.success(), &tail, "noo upgrade --stack --verbose");
+        if let Some((head, rest)) = lines.split_first() {
+            ui::failed(&format!("the launcher exited {}: {head}", status.code().map_or("by a signal".to_string(), |c| c.to_string())), None);
+            for l in rest {
+                eprintln!("{l}");
+            }
         }
         Ok(status)
     };
