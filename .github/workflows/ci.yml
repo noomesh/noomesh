@@ -519,6 +519,19 @@ jobs:
         go vet ./...
         go test ./...
 
+    # mcmini is a real darwin node: the darwin agent and its test files must
+    # build. Cross-compiled on Linux; `-exec /bin/true` compiles each test
+    # binary without running it (a darwin binary cannot run here).
+    - name: Build and vet for darwin (compile-only tests)
+      if: needs.scope.outputs.code == 'true'
+      env:
+        GOOS: darwin
+        GOARCH: arm64
+      run: |
+        go build ./...
+        go vet ./...
+        go test -count=1 -exec /bin/true ./...
+
   rust-gateway:
     runs-on: ubuntu-latest
     needs: [preflight, scope]
