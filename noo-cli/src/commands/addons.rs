@@ -641,6 +641,11 @@ pub fn addons_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     } else {
         None
     };
+    // Who may use each feature (f99): only the gateway knows, and only for an
+    // add-on it has loaded, so an add-on that is off is not asked about.
+    let access: Option<Result<serde_json::Value, String>> = (resolve(declared, default_on) && refused.is_none()).then(|| {
+        crate::http::get_json_try(g, &format!("/api/addons/{}/access", super::urlencode(key)), true, 15)
+    });
 
     if g.json {
         println!(
@@ -664,6 +669,11 @@ pub fn addons_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 "bundle": has_bundle.then(|| bundle_dir.display().to_string()),
                 "declarations": decl_json(&decls),
                 "password_env": decls.as_ref().ok().and_then(|d| d.system.as_ref()).map(|_| json!([pw, ddl])),
+                "access": match &access {
+                    None => serde_json::Value::Null,
+                    Some(Ok(body)) => body.clone(),
+                    Some(Err(e)) => json!({"error": e}),
+                },
             })
         );
         return Ok(if decls.is_ok() { 0 } else { 1 });
@@ -761,6 +771,14 @@ pub fn addons_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             0
         }
     };
+    match &access {
+        None => {}
+        Some(Ok(body)) => print!("{}", crate::commands::addon_access::render_show_features(key, body)),
+        Some(Err(e)) => {
+            println!("{}", ui::section("features"));
+            println!("{}", ui::status_line(ui::Glyph::Warn, &format!("who may use each feature: not read from the gateway ({e})")));
+        }
+    }
     println!();
     if refused.is_some() {
         ui::guide(&[

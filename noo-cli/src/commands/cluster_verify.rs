@@ -5064,6 +5064,90 @@ pub(crate) fn nats_principals_check(users_conf: Option<&str>, bridge_sites: &[(S
     ok("nats principals", detail)
 }
 
+/// The add-ons `/health` reports as enabled, sorted (the console's Access
+/// page reads the same list).
+pub(crate) fn enabled_addons(health: &Value) -> Vec<String> {
+    let mut v: Vec<String> = health["addons"]
+        .as_object()
+        .map(|m| m.iter().filter(|(_, st)| st.as_str() == Some("enabled")).map(|(k, _)| k.clone()).collect())
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// `/health`'s enabled add-ons, then `GET /api/addons/{addon}/access` for each.
+fn addon_access_reads(g: &Globals) -> Result<Vec<(String, Result<Value, String>)>, String> {
+    let health = crate::http::get_json_try(g, "/health", false, 10).map_err(|e| format!("/health: {e}"))?;
+    Ok(enabled_addons(&health)
+        .into_iter()
+        .map(|a| {
+            let r = crate::http::get_json_try(g, &format!("/api/addons/{}/access", crate::commands::urlencode(&a)), true, 15);
+            (a, r)
+        })
+        .collect())
+}
+
+/// The `add-on access` row (noomesh-internal f99, section 6). WARN for a
+/// feature the add-on suggests for users or operators that nobody below
+/// admin holds: not a fault, but usually an `enable` that skipped the
+/// suggestions. A feature suggested for admin, or for nobody, may be
+/// admin-only on purpose and is never a warning. Stale settings (for features
+/// no longer declared) are listed; they open nothing. An access body that
+/// cannot be read is a WARN that names it, never a silent OK.
+pub(crate) fn addon_access_check(reads: Result<Vec<(String, Result<Value, String>)>, String>) -> Check {
+    use crate::commands::addon_access::{feature_grants, stale_features};
+    const ROW: &str = "add-on access";
+    let reads = match reads {
+        Ok(r) => r,
+        Err(e) => return warn(ROW, format!("not read: {e}"), Some("noo cluster verify --controller   # again once the gateway answers".into())),
+    };
+    if reads.is_empty() {
+        return ok(ROW, "no add-on is enabled");
+    }
+    let mut unmet: Vec<(String, String, String)> = Vec::new();
+    let mut unread: Vec<String> = Vec::new();
+    let mut stale: Vec<String> = Vec::new();
+    let (mut legacy, mut features) = (0usize, 0usize);
+    for (addon, r) in &reads {
+        match r {
+            Err(e) => unread.push(format!("{addon} ({e})")),
+            Ok(body) if body["legacy"].as_bool() == Some(true) => legacy += 1,
+            Ok(body) => {
+                for f in feature_grants(body) {
+                    features += 1;
+                    if f.suggestion_unmet() {
+                        unmet.push((addon.clone(), f.name, f.suggested));
+                    }
+                }
+                stale.extend(stale_features(body).into_iter().map(|f| format!("{addon}/{f}")));
+            }
+        }
+    }
+    let mut notes: Vec<String> = Vec::new();
+    if legacy > 0 {
+        notes.push(format!("{legacy} legacy (each route's own role decides)"));
+    }
+    if !stale.is_empty() {
+        notes.push(format!("stale settings kept, opening nothing: {}", stale.join(", ")));
+    }
+    if !unread.is_empty() {
+        notes.push(format!("not read: {}", unread.join(", ")));
+    }
+    let tail = if notes.is_empty() { String::new() } else { format!("; {}", notes.join("; ")) };
+    if let Some((a, f, s)) = unmet.first() {
+        let list: Vec<String> = unmet.iter().map(|(a, f, s)| format!("{a}/{f} (suggested for {s})")).collect();
+        return warn(
+            ROW,
+            format!("on only for admins, though the add-on suggests more: {}{tail}", list.join(", ")),
+            Some(format!("noo addons set-access {a} {f} on --role {s}   # or keep it admin-only on purpose")),
+        );
+    }
+    if let Some((a, _)) = reads.iter().find(|(_, r)| r.is_err()) {
+        return warn(ROW, format!("{features} feature(s) read{tail}"), Some(format!("noo addons features {a}")));
+    }
+    ok(ROW, format!("{} add-on(s), {features} feature(s): each one suggested for users or operators is on for someone{tail}", reads.len()))
+}
+
 /// Judge the posture, key and doctor outputs. Pure over the JSON so the
 /// decisions are pinned; the verb below only collects the inputs.
 pub(crate) fn controller_checks(
@@ -6604,6 +6688,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             &retired_bridge_sites(dotenv_value(RETIRED_NATS_BRIDGE).as_deref(), &posture),
             &crate::commands::nats_users::declared_addon_principals(&root),
         ));
+        // f99: a feature the add-on suggests for users or operators that only
+        // admins hold (usually an enable that skipped the suggestions).
+        checks.push(addon_access_check(addon_access_reads(g)));
         // Postgres is TLS-only with a required cluster-CA client certificate
         // (2026-09-28): the shipped policy, and a live refusal of a client
         // that presents none.
@@ -9733,6 +9820,95 @@ mod tests {
             {"image": "ghcr.io/noomesh/ollama:v0.6.15", "source": "rail"}]});
         assert!(hardened_images_check(&ours).is_none());
         assert!(hardened_images_check(&serde_json::json!({"id": "old"})).is_none(), "an agent that reports nothing gets no row");
+    }
+
+    /// A `GET /api/addons/{addon}/access` body shaped like the route's.
+    fn access_body(features: Value, settings: Value) -> Value {
+        serde_json::json!({"addon": "rhaddon", "legacy": false, "features": features, "settings": settings,
+                           "stale_features": [], "super_admins": ["root"]})
+    }
+
+    fn setting(feature: &str, subject: &str, allowed: bool) -> Value {
+        serde_json::json!({"addon": "rhaddon", "feature": feature, "subject": subject, "allowed": allowed,
+                           "set_by": "root", "set_at": "2026-11-05T06:00:00Z", "source": "operator", "reason": null})
+    }
+
+    #[test]
+    fn addon_access_warns_only_for_a_user_or_operator_suggestion_that_only_admins_hold() {
+        let body = access_body(
+            serde_json::json!([
+                {"name": "converse", "title": "Talk", "suggested": "user"},
+                {"name": "transcripts", "title": "Read", "suggested": "operator"},
+                {"name": "manage", "title": "Manage", "suggested": "admin"},
+                {"name": "internal", "title": "Internal", "suggested": "none"},
+                {"name": "unlabelled", "title": "No suggestion"}
+            ]),
+            serde_json::json!([
+                setting("converse", "role:admin", true),
+                setting("transcripts", "team:studio", true),
+                setting("converse", "user:bob", false)
+            ]),
+        );
+        let c = addon_access_check(Ok(vec![("rhaddon".into(), Ok(body))]));
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("rhaddon/converse (suggested for user)"), "{}", c.detail);
+        // Granted below admin, or suggested for admin / nobody: never a warning.
+        for quiet in ["transcripts", "manage", "internal", "unlabelled"] {
+            assert!(!c.detail.contains(&format!("rhaddon/{quiet}")), "{quiet}: {}", c.detail);
+        }
+        assert_eq!(c.remedy.as_deref(), Some("noo addons set-access rhaddon converse on --role user   # or keep it admin-only on purpose"));
+    }
+
+    #[test]
+    fn addon_access_is_ok_for_features_meant_for_admins_alone() {
+        let body = access_body(
+            serde_json::json!([{"name": "manage", "title": "Manage", "suggested": "admin"},
+                               {"name": "internal", "title": "Internal", "suggested": "none"}]),
+            serde_json::json!([]),
+        );
+        let c = addon_access_check(Ok(vec![("rhaddon".into(), Ok(body))]));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.contains("1 add-on(s), 2 feature(s)"), "{}", c.detail);
+    }
+
+    #[test]
+    fn addon_access_counts_a_star_setting_for_every_feature() {
+        let body = access_body(
+            serde_json::json!([{"name": "converse", "title": "Talk", "suggested": "user"},
+                               {"name": "transcripts", "title": "Read", "suggested": "operator"}]),
+            serde_json::json!([setting("*", "role:user", true)]),
+        );
+        assert_eq!(addon_access_check(Ok(vec![("rhaddon".into(), Ok(body))])).verdict, Verdict::Ok);
+    }
+
+    #[test]
+    fn addon_access_names_what_it_could_not_read_and_what_is_stale() {
+        let mut stale = access_body(serde_json::json!([{"name": "converse", "title": "Talk", "suggested": "user"}]),
+                                    serde_json::json!([setting("converse", "role:user", true), setting("export", "role:user", true)]));
+        stale["stale_features"] = serde_json::json!(["export"]);
+        let legacy = serde_json::json!({"addon": "old", "legacy": true, "features": [], "settings": [], "stale_features": []});
+        let c = addon_access_check(Ok(vec![
+            ("rhaddon".into(), Ok(stale)),
+            ("old".into(), Ok(legacy)),
+            ("gone".into(), Err("HTTP 404: add-on \"gone\" is not registered".into())),
+        ]));
+        assert_eq!(c.verdict, Verdict::Warn, "an unread add-on is never a silent OK: {}", c.detail);
+        assert!(c.detail.contains("not read: gone (HTTP 404"), "{}", c.detail);
+        assert!(c.detail.contains("stale settings kept, opening nothing: rhaddon/export"), "{}", c.detail);
+        assert!(c.detail.contains("1 legacy"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo addons features gone"));
+
+        let h = addon_access_check(Err("/health: connection refused".into()));
+        assert_eq!(h.verdict, Verdict::Warn);
+        assert!(h.detail.contains("/health: connection refused"), "{}", h.detail);
+        assert_eq!(addon_access_check(Ok(vec![])).detail, "no add-on is enabled");
+    }
+
+    #[test]
+    fn enabled_addons_are_the_ones_health_calls_enabled() {
+        let h = serde_json::json!({"addons": {"rhaddon": "enabled", "voice": "disabled", "intel": "enabled", "x": "starting"}});
+        assert_eq!(enabled_addons(&h), vec!["intel".to_string(), "rhaddon".to_string()]);
+        assert!(enabled_addons(&serde_json::json!({"status": "ok"})).is_empty());
     }
 
     #[test]

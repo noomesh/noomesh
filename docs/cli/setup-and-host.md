@@ -338,7 +338,7 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 | Command | Arguments | What it does |
 |---|---|---|
 | `noo addons list` | — | Show every add-on: declared, effective and whether the licence grants it |
-| `noo addons show` | `<name>` | Show one add-on's switch, pin, and the database, workloads and inputs its bundle declares |
+| `noo addons show` | `<name>` | Show one add-on's switch, pin, bundle declarations, and who may use each feature |
 | `noo addons enable` | `<name> [--force] [--lock <path\|https-url>] [--provision-only]` | Pin an add-on's signed lock, mint credentials, declare it ON (--provision-only: DB only) |
 | `noo addons check` | `<bundle-dir> [--name <addon>]` | Enable's guard, resources and routes.json checks on a bundle dir; not signature/key/image |
 | `noo addons features` | `<name>` | Show an add-on's features, who each is set on or off for, and the super admins |

@@ -157,6 +157,98 @@ fn render_settings(settings: &[Value]) -> String {
     ui::table(&[Col::left("feature"), Col::left("for"), Col::left("is"), Col::left("set by"), Col::left("reason")], &rows)
 }
 
+/// One declared feature and who, below admin, it is on for, read from
+/// `GET /api/addons/{addon}/access`. Super admins always hold every feature,
+/// and a `role:admin` setting covers admins only, so neither counts here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FeatureGrant {
+    pub name: String,
+    /// The add-on's suggested audience: `user`, `operator`, `admin` or `none`.
+    pub suggested: String,
+    /// Subjects it is on for, other than `role:admin` (a `*` setting counts for every feature).
+    pub on_for: Vec<String>,
+}
+
+impl FeatureGrant {
+    /// The add-on suggests it for users or operators and nobody below admin
+    /// has it: usually an `enable` that skipped the suggestions. A feature
+    /// suggested for admin (or for nobody) may be admin-only on purpose, so it
+    /// never counts (proposal f99 section 6).
+    pub fn suggestion_unmet(&self) -> bool {
+        matches!(self.suggested.as_str(), "user" | "operator") && self.on_for.is_empty()
+    }
+}
+
+/// Every declared feature of the access body, in declaration order. Empty for
+/// a legacy manifest (no features).
+pub(crate) fn feature_grants(body: &Value) -> Vec<FeatureGrant> {
+    let settings = body["settings"].as_array().map(|a| a.as_slice()).unwrap_or_default();
+    body["features"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .map(|f| {
+            let name = f["name"].as_str().unwrap_or("").to_string();
+            let mut on_for: Vec<String> = settings
+                .iter()
+                .filter(|s| s["allowed"].as_bool() == Some(true))
+                .filter(|s| s["feature"].as_str().is_some_and(|x| x == name || x == "*"))
+                .filter_map(|s| s["subject"].as_str())
+                .filter(|s| *s != "role:admin")
+                .map(str::to_string)
+                .collect();
+            on_for.sort();
+            on_for.dedup();
+            let suggested = f["suggested"].as_str().filter(|s| !s.is_empty()).unwrap_or("none").to_string();
+            FeatureGrant { name, suggested, on_for }
+        })
+        .collect()
+}
+
+/// The stale settings' features (kept, they open nothing).
+pub(crate) fn stale_features(body: &Value) -> Vec<String> {
+    let mut v: Vec<String> =
+        body["stale_features"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// The `features` block of `noo addons show <name>`: per feature, its
+/// suggestion and who it is on for, with the suggested-not-granted ones
+/// marked, and any stale settings.
+pub(crate) fn render_show_features(addon: &str, body: &Value) -> String {
+    let mut out = format!("{}\n", ui::section("features"));
+    if body["legacy"].as_bool() == Some(true) {
+        out.push_str(&format!("{}\n", ui::muted("  none declared: each route's own role decides (a legacy manifest)")));
+    } else {
+        let grants = feature_grants(body);
+        if grants.is_empty() {
+            out.push_str(&format!("{}\n", ui::muted("  none declared")));
+        }
+        let rows: Vec<Vec<String>> = grants
+            .iter()
+            .map(|f| {
+                let on = if f.on_for.is_empty() { ui::muted("admins only") } else { f.on_for.join(", ") };
+                let note = if f.suggestion_unmet() { ui::warn("suggested, not granted") } else { String::new() };
+                vec![f.name.clone(), f.suggested.clone(), on, note]
+            })
+            .collect();
+        if !rows.is_empty() {
+            out.push_str(&ui::table(&[Col::left("feature"), Col::left("suggested"), Col::left("on for"), Col::left("")], &rows));
+        }
+    }
+    let stale = stale_features(body);
+    if !stale.is_empty() {
+        out.push_str(&format!(
+            "{}\n",
+            ui::status_line(Glyph::Warn, &format!("set for features {addon} no longer declares (kept, they open nothing): {}", stale.join(", ")))
+        ));
+    }
+    out
+}
+
 fn cell(v: &Value) -> String {
     match v {
         Value::Null => String::new(),
@@ -269,6 +361,53 @@ pub(crate) fn render_person(body: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn show_body() -> Value {
+        json!({
+            "addon": "rhaddon", "legacy": false,
+            "features": [
+                {"name": "converse", "title": "Talk", "suggested": "user"},
+                {"name": "transcripts", "title": "Read", "suggested": "operator"},
+                {"name": "manage", "title": "Manage", "suggested": "admin"},
+                {"name": "unlabelled", "title": "No suggestion", "suggested": null}
+            ],
+            "settings": [
+                {"addon": "rhaddon", "feature": "converse", "subject": "role:admin", "allowed": true},
+                {"addon": "rhaddon", "feature": "transcripts", "subject": "team:studio", "allowed": true},
+                {"addon": "rhaddon", "feature": "transcripts", "subject": "user:bob", "allowed": false},
+                {"addon": "rhaddon", "feature": "export", "subject": "role:user", "allowed": true}
+            ],
+            "stale_features": ["export"],
+            "super_admins": ["root"]
+        })
+    }
+
+    #[test]
+    fn feature_grants_read_who_below_admin_holds_each_feature() {
+        let g = feature_grants(&show_body());
+        let by = |n: &str| g.iter().find(|f| f.name == n).cloned().unwrap();
+        assert_eq!(g.len(), 4, "the stale `export` setting is not a declared feature");
+        assert!(by("converse").on_for.is_empty(), "role:admin is not below admin");
+        assert!(by("converse").suggestion_unmet());
+        assert_eq!(by("transcripts").on_for, vec!["team:studio".to_string()], "an off setting grants nothing");
+        assert!(!by("transcripts").suggestion_unmet());
+        assert!(!by("manage").suggestion_unmet(), "suggested for admin: admin-only may be on purpose");
+        assert_eq!(by("unlabelled").suggested, "none");
+        assert!(!by("unlabelled").suggestion_unmet());
+    }
+
+    #[test]
+    fn show_marks_the_suggested_not_granted_and_the_stale() {
+        let out = render_show_features("rhaddon", &show_body());
+        let line = |n: &str| out.lines().find(|l| l.contains(n)).unwrap_or_default().to_string();
+        assert!(line("converse").contains("suggested, not granted"), "{out}");
+        assert!(line("converse").contains("admins only"), "{out}");
+        assert!(line("transcripts").contains("team:studio") && !line("transcripts").contains("not granted"), "{out}");
+        assert!(!line("manage").contains("not granted"), "{out}");
+        assert!(out.contains("no longer declares (kept, they open nothing): export"), "{out}");
+        let legacy = render_show_features("old", &json!({"addon": "old", "legacy": true, "features": [], "settings": []}));
+        assert!(legacy.contains("legacy manifest"), "{legacy}");
+    }
 
     fn args(v: &[&str]) -> Args {
         Args::new(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
