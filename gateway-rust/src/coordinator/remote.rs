@@ -154,12 +154,16 @@ impl RemoteRuntime {
             .await
             .map_err(|e| anyhow!("harness rail {name}: {e}"))?;
         let status = resp.status();
-        let body: Value = resp.json().await.unwrap_or(Value::Null);
         if !status.is_success() {
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
             let msg = body.get("error").and_then(|e| e.as_str()).unwrap_or("").to_string();
             return Err(anyhow!("harness rail {name}: HTTP {} {msg}", status.as_u16()));
         }
-        Ok(body)
+        // A 2xx that is cut off or not JSON is an error, never `Null` as
+        // the op's result (i460).
+        crate::upstream_body::json_2xx(resp, "the gateway")
+            .await
+            .map_err(|e| anyhow!("harness rail {name}: {e}"))
     }
 
     async fn text(&self, op: HarnessOp) -> Option<String> {
@@ -901,5 +905,26 @@ mod tests {
         assert!(!deadline_stop(1, t0, t0 + Duration::from_secs(60), budget), "the first call runs while there is any time");
         assert!(deadline_stop(2, t0, t0 + Duration::from_secs(60), budget), "a later call that cannot fit stops");
         assert!(!deadline_stop(4, t0, t0 + Duration::from_secs(600), budget));
+    }
+
+    /// i460: a rail answer that is 200 but cut off, or not JSON, is an
+    /// error naming the op, never `Null` as the op's result.
+    #[tokio::test]
+    async fn a_cut_off_or_non_json_rail_answer_is_an_error_not_null() {
+        for base in [crate::upstream_body::stub_cut_short().await, crate::upstream_body::stub_not_json().await] {
+            let rt = RemoteRuntime {
+                gateway: base,
+                token: "t".into(),
+                client: reqwest::Client::new(),
+                metrics: Arc::new(crate::metrics::MetricsState::new()),
+                max_context_tokens: None,
+                max_session_messages: 1,
+                skills: crate::prompt_skills::SkillRegistry::default(),
+                runbooks: Vec::new(),
+                pinned: None,
+            };
+            let e = rt.call(HarnessOp::Config).await.unwrap_err().to_string();
+            assert!(e.starts_with("harness rail config: the gateway answered HTTP 200"), "{e}");
+        }
     }
 }

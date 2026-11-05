@@ -75,6 +75,7 @@ mod test_src;
 mod task_budget;
 mod task_context;
 mod task_events;
+mod upstream_body;
 mod text;
 mod auth_refresh;
 mod cache;
