@@ -1534,7 +1534,7 @@ jobs:
       run: |
         echo "::error::HUB_MIRROR_OFF is set on a public repository: Docker Hub pulls are rate limited. Populate the GHCR mirrors and delete the variable."
         exit 1
-    - name: Rust image from the mirror (Hub on a miss)
+    - name: Rust and smoke images from the mirror (Hub on a miss)
       env:
         HUB_MIRROR: ${{ vars.HUB_MIRROR }}
         HUB_MIRROR_OFF: ${{ vars.HUB_MIRROR_OFF }}
@@ -1547,6 +1547,14 @@ jobs:
           ref=docker.io/library/rust:1-bookworm
         fi
         echo "CARGO_DOCKER_IMAGE=$ref" >> "$GITHUB_ENV"
+        # The bare container the smoke runs the binary in, from the same mirror:
+        # an anonymous Hub pull of ubuntu:24.04 shares the runners' per-IP limit.
+        smoke="$(python3 "$GITHUB_WORKSPACE/scripts/hub-mirror.py" ref library/ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852)" || smoke=""
+        if [ -z "$smoke" ]; then
+          echo "::warning::hub-mirror.py gave no image — ubuntu:24.04 from Docker Hub"
+          smoke=docker.io/library/ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
+        fi
+        echo "SMOKE_IMAGE=$smoke" >> "$GITHUB_ENV"
     - name: Rust toolchain id (cache key)
       id: rustc
       if: needs.scope.outputs.code == 'true' && needs.scope.outputs.deferred != 'true'
@@ -1574,7 +1582,7 @@ jobs:
       run: |
         set -eux
         docker run --rm -v "${PWD}/noo-cli/target/release/noo":/usr/local/bin/noo:ro \
-          ubuntu:24.04 bash -euxc '
+          "$SMOKE_IMAGE" bash -euxc '
             # The whole point: prove there is no Python to fall back to.
             ! command -v python3
             ! command -v python
@@ -1601,7 +1609,7 @@ jobs:
       run: |
         set -eux
         docker run --rm -v "${PWD}/noo-cli/target/release/noo":/usr/local/bin/noo:ro \
-          ubuntu:24.04 bash -euxc '
+          "$SMOKE_IMAGE" bash -euxc '
             # 3. A bare group: usage error, exit 2.
             set +e
             out="$(noo plugins 2>&1)"
