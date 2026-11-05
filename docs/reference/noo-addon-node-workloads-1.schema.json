@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://noomesh.ai/schemas/noo-addon-node-workloads-1.json",
+  "title": "noo-addon-node-workloads/1: an add-on's node workloads (node-workloads.json)",
+  "description": "A file of the add-on's signed bundle, listed in the bundle lock beside resources.json and routes.json. Core builds the container from this closed declaration and places it on a capable node; the add-on never supplies a ref, a mount, a capability or a free-form env. Validated by the CLI (noo-cli/src/addons/decls.rs), the gateway (gateway-rust/src/addon_workloads.rs) and the node agent (node-agent-go/internal/nodewl), each against tests/fixtures/i300/node-workloads/ (cases.json lists the stable refusal code for each). The door's DNS SAN noo-stunnel-<addon>-<workload> must be one DNS label of at most 63 characters, so a node workload is refused when len(addon) + 1 + len(workload) > 51. Contract: docs/reference/node-workloads.md. Design: noomesh-internal proposals/i300 section 4.1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "workloads"],
+  "properties": {
+    "format": { "const": "noo-addon-node-workloads/1" },
+    "workloads": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "$ref": "#/$defs/workload" } }
+  },
+  "$defs": {
+    "word": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}$" },
+    "path": { "type": "string", "maxLength": 128, "pattern": "^/[A-Za-z0-9._~/-]*$" },
+    "target": {
+      "type": "string", "maxLength": 128,
+      "pattern": "^/[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$",
+      "description": "A container path. Never / (the pattern needs a component)."
+    },
+    "bound": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "minProperties": 1,
+          "properties": { "min": { "type": "integer" }, "max": { "type": "integer" } },
+          "description": "An integer range. A value is a base-10 integer string in desired-config." },
+        { "type": "object", "additionalProperties": false, "required": ["one_of"],
+          "properties": { "one_of": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "type": "string", "pattern": "^[A-Za-z0-9._:-]{1,64}$" } } },
+          "description": "An enum of strings. Booleans are {\"one_of\": [\"false\"]}." }
+      ]
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "image", "uid", "port", "protocols", "health", "drain", "accel", "limits"],
+      "properties": {
+        "name": { "type": "string", "maxLength": 49, "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$", "description": "One DNS label piece of the door name noo-stunnel-<addon>-<workload>: lower-case letters, digits and -, no leading or trailing -. len(addon)+1+len(workload) <= 51 (x-noo-rules)." },
+        "image": { "$ref": "#/$defs/word", "description": "A NAME in the signed lock's images map, never a ref (x-noo-rules)." },
+        "uid": { "type": "integer", "minimum": 1, "maximum": 4294967294, "description": "0 is refused. Never the image's default user." },
+        "command": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "type": "string", "minLength": 1, "maxLength": 256 } },
+        "port": { "type": "integer", "minimum": 1024, "maximum": 65535 },
+        "protocols": { "type": "array", "minItems": 1, "maxItems": 2, "items": { "enum": ["http", "ws"] } },
+        "health": {
+          "type": "object", "additionalProperties": false, "required": ["ready", "live", "start_secs"],
+          "properties": {
+            "ready": { "$ref": "#/$defs/path" },
+            "live": { "$ref": "#/$defs/path" },
+            "start_secs": { "type": "integer", "minimum": 1, "maximum": 600 }
+          }
+        },
+        "drain": {
+          "type": "object", "additionalProperties": false, "required": ["path", "timeout_secs"],
+          "properties": {
+            "path": { "$ref": "#/$defs/path", "description": "POSTed by the node agent through the door." },
+            "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600 }
+          }
+        },
+        "accel": {
+          "type": "object", "additionalProperties": false, "required": ["gpu"],
+          "properties": {
+            "gpu": { "type": "integer", "minimum": 0, "maximum": 8 },
+            "realtime": { "type": "boolean", "default": false }
+          }
+        },
+        "models": {
+          "type": "array", "maxItems": 8,
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["slot", "target", "accepts"],
+            "properties": {
+              "slot": { "$ref": "#/$defs/word" },
+              "target": { "$ref": "#/$defs/target", "not": { "pattern": "^/(proc|sys|dev)(/|$)" } },
+              "accepts": {
+                "type": "object", "additionalProperties": false, "required": ["kind"],
+                "properties": {
+                  "kind": { "enum": ["voice", "voice-pack"] },
+                  "runtime": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$" }
+                }
+              },
+              "many": { "type": "boolean", "default": false },
+              "optional": { "type": "boolean", "default": false }
+            }
+          }
+        },
+        "env": {
+          "type": "object", "maxProperties": 32,
+          "propertyNames": {
+            "pattern": "^[A-Z][A-Z0-9_]{0,63}$",
+            "not": { "pattern": "^(NOO_|NVIDIA_|CUDA_|LD_|PYTHON|HF_|TRANSFORMERS_)" }
+          },
+          "additionalProperties": { "$ref": "#/$defs/bound" },
+          "description": "Keys must start with <ADDON_UPPER>_ (x-noo-rules)."
+        },
+        "scratch": {
+          "type": "array", "maxItems": 4,
+          "items": {
+            "oneOf": [
+              { "type": "object", "additionalProperties": false, "required": ["target", "max_mb"],
+                "properties": { "target": { "$ref": "#/$defs/target", "not": { "pattern": "^/(proc|sys|dev)(/|$)" } }, "max_mb": { "type": "integer", "minimum": 1, "maximum": 65536 } } },
+              { "type": "object", "additionalProperties": false, "required": ["target", "tmpfs_mb"],
+                "properties": { "target": { "$ref": "#/$defs/target", "not": { "pattern": "^/(proc|sys|dev)(/|$)" } }, "tmpfs_mb": { "type": "integer", "minimum": 1, "maximum": 16384 } } }
+            ]
+          }
+        },
+        "limits": {
+          "type": "object", "additionalProperties": false, "required": ["ram_mb", "cpus", "pids"],
+          "properties": {
+            "ram_mb": { "type": "integer", "minimum": 64, "maximum": 1048576 },
+            "cpus": { "type": "number", "minimum": 0.1, "maximum": 128 },
+            "pids": { "type": "integer", "minimum": 1, "maximum": 32768 }
+          }
+        }
+      }
+    }
+  },
+  "x-noo-rules": [
+    "image names a key of the signed lock's images map; an unknown name is refused (image_not_in_lock). The digest comes from the lock, so the bundle signature covers it.",
+    "workload names are unique within the file (name_duplicate).",
+    "door name: the door's DNS SAN is noo-stunnel-<addon>-<workload>, which must be ONE DNS label of at most 63 characters, so a node workload is refused when len(addon) + 1 + len(workload) > 51 (door_name_too_long). Both the workload name (above) and the add-on name must match ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ (door_name_invalid): _, upper case and a leading or trailing - are refused, and _ is never mapped to - (a per-file validator cannot see a collision between two add-ons). The add-on name is known only at validation, so it is not a schema check.",
+    "env keys must start with <ADDON_UPPER>_ (the add-on name upper-cased, - as _), with the addon known at validation (env_key_outside_prefix). Refused prefixes win over the add-on prefix: NOO_, NVIDIA_, CUDA_, LD_, PYTHON, HF_, TRANSFORMERS_ (env_key_refused_prefix, stated above in propertyNames).",
+    "an env bound with min and max needs min <= max (env_bound_invalid). Values in desired-config are strings: an integer bound takes a base-10 integer string, an enum takes one of its members, a boolean is {\"one_of\": [\"false\"]}.",
+    "scratch targets are not /, /proc, /sys or /dev (or below them), are unique, and neither equal, inside nor around any model slot target (scratch_target_refused, scratch_invalid, scratch_in_model_slot).",
+    "model slot names and targets are unique, and no slot target is inside another (model_slot_invalid).",
+    "the agent mounts each chosen set read-only at its slot target, as one directory; many=true slots mount each set under <target>/<set id>; optional=true slots may stay empty.",
+    "an unknown field is refused everywhere (unknown_field); a CLI from before a minor addition refuses the lock rather than half-reading it."
+  ]
+}
