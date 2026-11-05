@@ -61,7 +61,8 @@
 //! (stale heartbeat, unreachable, quarantined), stalled in the last
 //! [`STALL_DEMOTION`] (5 min), thermal `serious`/`critical`, every slot
 //! busy (the agent's `backend_containers.<b>.{in_flight, slots, queued}`,
-//! the shorter queue first: [`full_rank`]), GPU shared
+//! the shorter queue first: [`full_rank`]), then the lane state (serving,
+//! on demand, unconfirmed: [`LaneState::rank`]), GPU shared
 //! with a foreign workload (`gpu_contention.state: shared`; a lane listed in
 //! `gpu_contention.paused_backends` is not a candidate at all), engine (vLLM,
 //! then a GPU runtime, then CPU), larger model first (parameter estimate,
@@ -352,6 +353,15 @@ impl Lane {
 }
 
 /// A node's lane for `(backend, model)`, when its agent reports lanes.
+/// The routing rank of a node's lane for (backend, model): its state's
+/// [`LaneState::rank`], or 0 when the node sends no matching lane (an agent
+/// that predates lanes). The class table's candidates and the KV-scan
+/// resolver (backend.rs) both rank by this one function, so a pinned model
+/// and raw chat cannot disagree on lane state.
+pub fn lane_rank_of(n: &NodeFacts, backend: &str, model: &str) -> u8 {
+    lane_of(n, backend, model).and_then(|l| l.state.rank()).unwrap_or(0)
+}
+
 fn lane_of<'a>(n: &'a NodeFacts, backend: &str, model: &str) -> Option<&'a Lane> {
     n.lanes.as_ref()?.iter().find(|l| l.backend == backend && same_model(&l.model, model))
 }
@@ -645,23 +655,34 @@ pub fn full_rank(c: &Candidate, in_flight: usize) -> u32 {
     }
 }
 
+/// Can this candidate start a request well NOW: not stalled in the last
+/// [`STALL_DEMOTION`], not thermally `serious`/`critical`, a free slot (a
+/// full backend after every one that can start now, the shorter queue
+/// first: [`full_rank`]). Ranked BEFORE the lane state in [`rank_key`] and
+/// [`pool_key`]: a serving lane that is full or stalled must not beat a free
+/// on-demand peer (the 2026-11-01 incident #621 fixed, which lane state
+/// (#669) brought back whenever the free peer's model was not resident).
+/// Among equally available candidates the lane state still decides, so a
+/// serving lane wins over an on-demand one. One function, so the two keys
+/// cannot order these differently.
+pub fn availability_key(c: &Candidate, in_flight: usize, stalled: bool) -> (u8, u8, u32) {
+    (if stalled { 1 } else { 0 }, thermal_rank(c.thermal.as_deref()), full_rank(c, in_flight))
+}
+
 /// The dynamic default's routing order, lowest first: non-degraded,
-/// healthy, lane state ([`LaneState::rank`]), not stalled in the last [`STALL_DEMOTION`], not thermally
-/// `serious`/`critical`, a free slot (a full backend after every one that
-/// can start now, the shorter queue first: [`full_rank`]), GPU not shared
-/// with a foreign workload
+/// healthy, available now ([`availability_key`]: not stalled, not
+/// thermally hot, a free slot), lane state ([`LaneState::rank`]), GPU not
+/// shared with a foreign workload
 /// (`gpu_contention.state: shared`), engine (vLLM < GPU runtime < CPU), the larger
 /// model (`-params`, tenths of a billion), fewest requests in flight from
 /// this gateway, heartbeat load, position. A function so the ORDER is what
 /// gets tested.
-pub fn rank_key(c: &Candidate, in_flight: usize, stalled: bool) -> (u8, u8, u8, u8, u8, u32, u8, u8, i64, usize, i64, usize) {
+pub fn rank_key(c: &Candidate, in_flight: usize, stalled: bool) -> (u8, u8, (u8, u8, u32), u8, u8, u8, i64, usize, i64, usize) {
     (
         if c.degraded { 1 } else { 0 },
         if c.healthy { 0 } else { 1 },
+        availability_key(c, in_flight, stalled),
         c.lane_rank,
-        if stalled { 1 } else { 0 },
-        thermal_rank(c.thermal.as_deref()),
-        full_rank(c, in_flight),
         if c.gpu_shared { 1 } else { 0 },
         engine_rank(&c.backend, c.gpu),
         -((c.params_b.unwrap_or(0.0) * 10.0) as i64),
@@ -816,7 +837,7 @@ fn candidate(n: &NodeFacts, backend: &str, model: &str, position: usize, degrade
         class_label: String::new(),
         rank: String::new(),
         lane_state: lane.map(|l| l.state.as_str().to_string()),
-        lane_rank: lane.and_then(|l| l.state.rank()).unwrap_or(0),
+        lane_rank: lane_rank_of(n, backend, model),
         unplaced_lane: lane.is_some_and(|l| l.state == LaneState::Unplaced),
     }
 }
@@ -1092,19 +1113,18 @@ pub fn rank<'a>(
     out
 }
 
-/// A pool's routing order, lowest first: non-degraded, healthy, lane
-/// state, not recently stalled, not thermally hot, a free slot ([`full_rank`]), GPU not shared, fewest requests in flight from this
-/// gateway, heartbeat load, declared position. No engine or model-size key:
+/// A pool's routing order, lowest first: non-degraded, healthy, available
+/// now ([`availability_key`]: not recently stalled, not thermally hot, a
+/// free slot), lane state, GPU not shared, fewest requests in flight from
+/// this gateway, heartbeat load, declared position. No engine or model-size key:
 /// declaring a pool says its peers are interchangeable, and a size key
 /// would send every request to the biggest peer and never spread.
-pub fn pool_key(c: &Candidate, in_flight: usize, stalled: bool) -> (u8, u8, u8, u8, u8, u32, u8, usize, i64, usize) {
+pub fn pool_key(c: &Candidate, in_flight: usize, stalled: bool) -> (u8, u8, (u8, u8, u32), u8, u8, usize, i64, usize) {
     (
         if c.degraded { 1 } else { 0 },
         if c.healthy { 0 } else { 1 },
+        availability_key(c, in_flight, stalled),
         c.lane_rank,
-        if stalled { 1 } else { 0 },
-        thermal_rank(c.thermal.as_deref()),
-        full_rank(c, in_flight),
         if c.gpu_shared { 1 } else { 0 },
         in_flight,
         load_key(c.load),
@@ -3355,5 +3375,65 @@ mod lane_tests {
         let t = build_table(&[n], &[], &Declarations::default());
         assert!(t.class("gemma4:12b").is_some() && t.class("gemma4:e2b").is_some());
         assert_eq!(t.all_chat.as_ref().unwrap().candidates[0].model, "gemma4:12b");
+    }
+}
+
+#[cfg(test)]
+mod availability_before_lane_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// One ollama node at t=1000 with a chat lane in `state` and its slots.
+    fn node(id: &str, ip: &str, state: &str, in_flight: u32, queued: u32) -> NodeFacts {
+        let r = json!({
+            "id": id, "ip_address": ip, "last_heartbeat": 1000.0, "vram_gb": 0.0,
+            "running_backends": {"ollama": "gemma4:12b"},
+            "lanes": [{"backend": "ollama", "model": "gemma4:12b", "role": "chat", "state": state, "reason": ""}],
+            "backend_containers": {"ollama": {"running": true, "serving": true, "in_flight": in_flight, "slots": 2, "queued": queued}},
+        });
+        node_facts_from_kv(id, &r, &[], 1001.0)
+    }
+
+    fn default_order(nodes: &[NodeFacts], stalled: &dyn Fn(&Candidate) -> bool) -> Vec<String> {
+        let t = build_table(nodes, &[], &Declarations::default());
+        let sel = select_with(&t, None, None, false, &|_| false, &|_| 0, stalled).expect("a selection");
+        sel.candidates.iter().map(|c| c.node_id.clone()).collect()
+    }
+
+    /// The 2026-11-01 shape again, through lane state (#669): the serving
+    /// lane is full and queued, its peer's model is not resident (on demand)
+    /// but it has free slots. The free peer goes first; among free lanes
+    /// the serving one still wins.
+    #[test]
+    fn a_full_serving_lane_ranks_after_a_free_on_demand_one() {
+        let full = node("a-serving", "100.64.0.1", "serving", 2, 3);
+        let free = node("b-ondemand", "100.64.0.2", "on_demand", 0, 0);
+        assert_eq!(default_order(&[full, free.clone()], &|_| false), ["b-ondemand", "a-serving"]);
+        let idle = node("a-serving", "100.64.0.1", "serving", 0, 0);
+        assert_eq!(default_order(&[idle.clone(), free.clone()], &|_| false), ["a-serving", "b-ondemand"], "equally free: serving wins");
+        // Stalled in the last few minutes: the same demotion as full.
+        assert_eq!(default_order(&[idle, free], &|c| c.node_id == "a-serving"), ["b-ondemand", "a-serving"]);
+    }
+
+    /// The pool key orders availability before lane state the same way,
+    /// through the same function.
+    #[test]
+    fn the_pool_key_ranks_availability_before_lane_state() {
+        let mk = |id: &str, lane_rank: u8, in_flight: u32, queued: u32| {
+            let mut c = Candidate::synthetic(id.into(), "ollama".into(), "m".into(), String::new());
+            c.lane_rank = lane_rank;
+            c.slots = Some(Slots { in_flight, total: 2, queued });
+            c
+        };
+        let full_serving = mk("a", 0, 2, 3);
+        let free_on_demand = mk("b", 1, 0, 0);
+        assert!(pool_key(&free_on_demand, 0, false) < pool_key(&full_serving, 0, false));
+        assert!(rank_key(&free_on_demand, 0, false) < rank_key(&full_serving, 0, false));
+        let free_serving = mk("a", 0, 0, 0);
+        assert!(pool_key(&free_serving, 0, false) < pool_key(&free_on_demand, 0, false));
+        assert!(pool_key(&free_on_demand, 0, false) < pool_key(&free_serving, 0, true), "stalled");
+        let mut hot = free_serving.clone();
+        hot.thermal = Some("serious".into());
+        assert!(pool_key(&free_on_demand, 0, false) < pool_key(&hot, 0, false), "thermally serious");
     }
 }
