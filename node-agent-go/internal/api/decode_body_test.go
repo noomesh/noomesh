@@ -174,18 +174,18 @@ func TestCleanMalformedBodyIs400AndStopsNothing(t *testing.T) {
 }
 
 func TestWorkloadStopMalformedBodyIs400AndStopsNothing(t *testing.T) {
-	addonwl.SetDeclared([]addonwl.Decl{{Addon: "pai-voice", Name: "voice-worker", Container: "noo-pai-voice-worker"}})
+	addonwl.SetDeclared([]addonwl.Decl{{Addon: "rhaddon", Name: "worker", Container: "noo-rhaddon-worker"}})
 	t.Cleanup(func() { addonwl.SetDeclared(nil) })
-	f := &fakeWorkloads{ctr: &dockerpkg.WorkloadState{ID: "c1", Name: "noo-pai-voice-worker", Running: true}}
+	f := &fakeWorkloads{ctr: &dockerpkg.WorkloadState{ID: "c1", Name: "noo-rhaddon-worker", Running: true}}
 	m := workloadMux(&Server{workloadOps: f})
 	for name, body := range badBodies {
-		code, out := call(t, m, "POST", "/api/addon-workloads/pai-voice/voice-worker/stop", body)
+		code, out := call(t, m, "POST", "/api/addon-workloads/rhaddon/worker/stop", body)
 		wantInvalidBody(t, name, code, out)
 	}
 	if len(f.stops) != 0 {
 		t.Fatalf("a malformed body must not stop the workload: %v", f.stops)
 	}
-	if code, _ := call(t, m, "POST", "/api/addon-workloads/pai-voice/voice-worker/stop", ""); code != 200 || len(f.stops) != 1 {
+	if code, _ := call(t, m, "POST", "/api/addon-workloads/rhaddon/worker/stop", ""); code != 200 || len(f.stops) != 1 {
 		t.Fatalf("empty body: %d %v", code, f.stops)
 	}
 }
