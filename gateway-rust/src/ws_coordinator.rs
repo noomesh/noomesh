@@ -354,7 +354,7 @@ mod tests {
         // the first version of it failed, and the third time this session
         // that a source-reading guard has been fooled by the prose beside
         // the code it guards.
-        let src = &whole[..whole.find("#[cfg(test)]").unwrap_or(whole.len())];
+        let src = crate::test_src::own_code(whole);
         src.lines()
             .map(|l| match l.find("//") {
                 Some(i) => &l[..i],

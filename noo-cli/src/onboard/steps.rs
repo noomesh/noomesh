@@ -8359,9 +8359,8 @@ mod grafana_door_step_tests {
     /// The step above is only worth its test while the wizard runs it.
     #[test]
     fn the_pki_step_runs_the_grafana_door() {
-        let src = include_str!("steps.rs");
-        let body = src.split("pub fn pki_enrollment(ctx: &mut Ctx) {").nth(1).expect("pki_enrollment exists");
-        let body = body.split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn pki_enrollment(");
         assert!(body.contains("\n    grafana_door(ctx);"), "pki_enrollment must call grafana_door");
     }
 

@@ -776,8 +776,8 @@ mod tests {
     #[test]
     fn get_following_takes_every_hop_through_next_hop() {
         // Prove the parse found the function before trusting an absence.
-        let src = include_str!("models_fetch.rs");
-        let body = src.split("pub(crate) fn get_following(").nth(1).expect("get_following").split("\n\u{7d}\n").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("models_fetch.rs"));
+        let body = crate::test_src::fn_body(&own, "pub(crate) fn get_following(");
         assert!(body.contains("next_hop(&cur, loc)?"), "every redirect goes through next_hop");
         assert!(!body.contains("join_location("), "no hop may bypass next_hop");
     }

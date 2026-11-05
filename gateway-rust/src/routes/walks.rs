@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn no_route_here_takes_an_account_from_the_request_except_the_audited_admin_view() {
         let src = include_str!("walks.rs");
-        let code = &src[..src.find("#[cfg(test)]").unwrap()];
+        let code = &crate::test_src::own_code(src);
         // the only handler that reads a `user` parameter is the admin view (and the counts filter)
         assert_eq!(code.matches("user: Option<String>").count(), 2, "AdminQuery and StatsQuery");
         assert!(code.contains("signed_in(&ctx)?"), "settings routes derive the account from the credential");

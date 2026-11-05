@@ -1500,15 +1500,16 @@ mod tests {
         assert_eq!(queue_recheck_after(&env(Some("5"))).as_secs(), 60, "at least a minute");
         assert_eq!(queue_recheck_after(&env(Some("later"))).as_secs(), 600);
 
-        let src = include_str!("tasks.rs").split("mod tests {").next().unwrap();
-        let sweep = src.split("pub fn spawn_stale_sweep(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("tasks.rs"));
+        let sweep = crate::test_src::fn_body(&own, "pub fn spawn_stale_sweep(");
         assert!(sweep.contains("offer_waiting_again(&state).await;"), "the sweep offers queued tasks again");
-        let list = include_str!("repo/tasks.rs").split("pub async fn waiting_ids<").nth(1).unwrap().split("\n}\n").next().unwrap();
-        assert!(src.split("async fn list_waiting(").nth(1).unwrap().contains("crate::repo::tasks::waiting_ids(db, older_than.as_secs_f64())"));
+        let repo = crate::test_src::own_code(include_str!("repo/tasks.rs"));
+        let list = crate::test_src::fn_body(&repo, "pub async fn waiting_ids<");
+        assert!(own.split("async fn list_waiting(").nth(1).unwrap().contains("crate::repo::tasks::waiting_ids(db, older_than.as_secs_f64())"));
         for clause in ["state = 'open'", "node IS NOT NULL", "budget_state IS NULL", "loop_budget > 0", "updated_at < now() - make_interval(secs => $1)"] {
             assert!(list.contains(clause), "{clause}");
         }
-        let offer = src.split("async fn offer_waiting_again(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let offer = crate::test_src::fn_body(&own, "async fn offer_waiting_again(");
         assert!(offer.contains("start(state, &t).await"), "the offer goes through start's rules");
     }
 

@@ -1288,13 +1288,11 @@ mod tests {
     /// window to ack clears a message for every sibling again.
     #[test]
     fn unread_and_ack_are_per_reader() {
-        let repo = include_str!("../repo/agent_messages.rs");
-        let list = repo.split("pub async fn list(").nth(1).expect("list");
-        let list = &list[..list.find("\n}").unwrap()];
+        let repo = crate::test_src::own_code(include_str!("../repo/agent_messages.rs"));
+        let list = crate::test_src::fn_body(&repo, "pub async fn list(");
         assert!(list.contains("noo_agent_message_reads") && list.contains("x.reader ="),
             "unread must be computed from the per-reader reads table");
-        let ack = repo.split("pub async fn mark_read(").nth(1).expect("mark_read");
-        let ack = &ack[..ack.find("\n}").unwrap()];
+        let ack = crate::test_src::fn_body(&repo, "pub async fn mark_read(");
         assert!(ack.contains("INSERT INTO noo_agent_message_reads"),
             "ack must record the reader, not only flip the message's read_at");
         // And both routes hand the ACTING identity in as the reader.
@@ -1331,11 +1329,9 @@ mod tests {
     /// a second definition of "mine".
     #[test]
     fn messages_and_threads_both_apply_the_scope_rule() {
-        let src = include_str!("agents.rs");
+        let own = crate::test_src::own_code(include_str!("agents.rs"));
         for f in ["async fn messages_list(", "async fn threads_list("] {
-            let needle = ["async fn ", f.trim_start_matches("async fn ")].concat();
-            let body = src.split(needle.as_str()).last().expect("route");
-            let body = &body[..body.find("\n}").unwrap()];
+            let body = crate::test_src::fn_body(&own, f);
             let call = ["list_sees_everything(", "who.privileged"].concat();
             assert!(body.contains(&call), "{f} must apply list_sees_everything");
             assert!(body.contains("q.all"), "{f} must honour all=");
@@ -1366,19 +1362,16 @@ mod tests {
         assert_eq!(super::applied_filter(&f), json!({"scope": "own: rbwolf", "limit": 50}));
         let f = crate::repo::agent_messages::Filter { thread: Some("thr_b"), unread_only: true, owner: None, ..f };
         assert_eq!(super::applied_filter(&f), json!({"scope": "all", "thread": "thr_b", "unread": true, "limit": 50}));
-        let src = include_str!("agents.rs");
-        let body = src.split(["async fn ", "messages_list("].concat().as_str()).last().expect("route");
-        let body = &body[..body.find("\n\u{7d}").unwrap()];
+        let own = crate::test_src::own_code(include_str!("agents.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn messages_list(");
         assert!(body.contains("\"filter\": applied_filter(&filter)"), "the list response must carry the echo");
     }
 
     /// presence `all=true` is gated on privilege and served by `live_all`.
     #[test]
     fn presence_all_is_operator_only() {
-        let src = include_str!("agents.rs");
-        let needle = ["async fn ", "presence_list("].concat();
-        let body = src.split(needle.as_str()).last().expect("presence route");
-        let body = &body[..body.find("\n}").unwrap()];
+        let own = crate::test_src::own_code(include_str!("agents.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn presence_list(");
         let gate = ["q.get(\"all\")", ".is_some_and"].concat();
         assert!(body.contains(&gate), "presence must read all=");
         let deny = ["if !who.priv", "ileged {"].concat();
@@ -1404,14 +1397,10 @@ mod tests {
     /// siblings; swap the other way in `owns` and it could act as them.
     #[test]
     fn presence_is_visible_to_siblings_but_not_actable() {
-        // Needles assembled at runtime: this test module precedes the route
-        // in the file, so a literal needle matches the test's own source
-        // first and slices the wrong region (that is how the first version
-        // of this test failed on correct code).
-        let src = include_str!("agents.rs");
-        let fn_needle = ["async fn ", "presence_list("].concat();
-        let body = src.split(fn_needle.as_str()).last().expect("presence route");
-        let body = &body[..body.find("\n}").unwrap()];
+        // The route is read from the file's own code, test module removed, so a
+        // literal marker cannot match this test's own source.
+        let own = crate::test_src::own_code(include_str!("agents.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn presence_list(");
         let wide = ["same_owner", "(m, &owner)"].concat();
         let narrow = ["who.owns", "(&owner)"].concat();
         assert!(body.contains(&wide), "presence must be scoped by same_owner");

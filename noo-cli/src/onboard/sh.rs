@@ -1214,9 +1214,11 @@ mod addon_compose_tests {
         let start = body
             .find("addon_compose_overlay_args() {")
             .unwrap_or_else(|| panic!("{} has no addon_compose_overlay_args — did it move?", path.display()));
-        let rest = &body[start..];
-        let end = rest.find("\n}").expect("unterminated addon_compose_overlay_args");
-        rest[..end].to_string()
+        // Shell, not Rust: the function ends at its column-0 closing brace
+        // line (crate::test_src lexes Rust, so it does not apply here).
+        let lines: Vec<&str> = body[start..].lines().take_while(|l| !l.starts_with('\u{7d}')).collect();
+        assert!(body[start..].lines().count() > lines.len(), "unterminated addon_compose_overlay_args");
+        lines.join("\n")
     }
 
     /// Two copies of one decision, pinned to each other.

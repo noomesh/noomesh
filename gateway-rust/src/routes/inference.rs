@@ -1499,12 +1499,8 @@ mod identity_tests {
             is_credential_optional, is_handler_authenticated, PUBLIC_GET_PATH_PREFIXES,
             PUBLIC_PATHS_EXACT, PUBLIC_PATH_PREFIXES,
         };
-        let src = include_str!("inference.rs");
-        let router = src
-            .split("pub fn router()")
-            .nth(1)
-            .and_then(|t| t.split("\n}\n").next())
-            .expect("router fn");
+        let own = crate::test_src::own_code(include_str!("inference.rs"));
+        let router = crate::test_src::fn_body(&own, "pub fn router()");
         let paths: Vec<&str> = router
             .match_indices(".route(\"")
             .filter_map(|(i, m)| router[i + m.len()..].split('"').next())

@@ -2420,7 +2420,7 @@ mod tests {
     fn skill_proposals_need_an_operator_login() {
         // The refusal is the `Operator` extractor (`authz::tests` drives it
         // through a router); what is pinned here is that both routes take it.
-        let code = &include_str!("settings.rs")[..include_str!("settings.rs").find("#[cfg(test)]").unwrap()];
+        let code = &crate::test_src::own_code(include_str!("settings.rs"));
         for sig in ["async fn prompt_skills_proposals(", "async fn prompt_skills_decide("] {
             let at = code.find(sig).expect(sig);
             let head = &code[at..at + code[at..].find(") -> AppResult").unwrap()];
@@ -2434,13 +2434,8 @@ mod tests {
     #[test]
     fn promotion_routes_are_wired_to_the_gates_and_the_proposal_queue() {
         let src = include_str!("settings.rs");
-        let code = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
-        let body_of = |sig: &str| {
-            let at = code.find(sig).unwrap_or_else(|| panic!("{sig}"));
-            let rest = &code[at..];
-            let end = rest.find("\n}\n").unwrap_or(rest.len());
-            rest[..end].to_string()
-        };
+        let code = &crate::test_src::own_code(src);
+        let body_of = |sig: &str| crate::test_src::fn_body(code, sig).to_string();
         let decide = body_of("async fn prompt_skills_decide(");
         let (person, write) = (decide.find("skill_decider_refusal(").unwrap(), decide.find("decide(&state.db").unwrap());
         assert!(decide.contains("reviewer: Operator"), "the operator gate is the extractor, which runs first");
@@ -2925,10 +2920,9 @@ mod tests {
     #[test]
     fn both_user_dirs_mutations_check_the_person_before_writing() {
         let src = include_str!("settings.rs");
-        let code = &src[..src.find("#[cfg(test)]").unwrap()];
+        let code = &crate::test_src::own_code(src);
         for sig in ["async fn user_dirs_add(", "async fn user_dirs_remove("] {
-            let body = &code[code.find(sig).expect(sig)..];
-            let body = &body[..body.find("\n}\n").unwrap()];
+            let body = crate::test_src::fn_body(code, sig);
             let gate = body.find("user_dirs_person_refusal(&origin, cluster.is_some())").unwrap_or_else(|| panic!("{sig} has no person gate"));
             let write = body.find("mutate_config(").expect(sig);
             assert!(body.contains("resolve_origin(&state.db, &requester)"), "{sig}");
@@ -2952,10 +2946,8 @@ mod tests {
     /// test above would still pass.
     #[test]
     fn gated_config_sections_are_real() {
-        let cfg = include_str!("../config.rs");
-        let start = cfg.find("pub struct AppConfig {").expect("AppConfig not found");
-        let end = start + cfg[start..].find("\n}").expect("AppConfig unterminated");
-        let body = &cfg[start..end];
+        let cfg = crate::test_src::own_code(include_str!("../config.rs"));
+        let body = crate::test_src::fn_body(&cfg, "pub struct AppConfig ");
         for section in GATED_CONFIG_SECTIONS {
             assert!(
                 body.contains(&format!("pub {section}:")),

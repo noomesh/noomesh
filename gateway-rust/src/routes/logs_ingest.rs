@@ -916,7 +916,8 @@ mod tests {
     #[test]
     fn the_handler_records_the_planned_metrics_on_the_gateway_registry() {
         let src = include_str!("logs_ingest.rs");
-        let body = src.split("pub async fn node_logs_ingest(").nth(1).unwrap().split("#[cfg(test)]").next().unwrap();
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "pub async fn node_logs_ingest(");
         for m in ["noo_logs_ingest_lines_total", "noo_logs_ingest_bytes_total", "noo_logs_last_seen_unix", "noo_logs_ingest_redacted_total"] {
             assert!(body.contains(m), "{m}");
         }

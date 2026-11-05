@@ -337,8 +337,8 @@ mod tests {
     #[test]
     fn the_handler_takes_its_role_from_the_live_row_function() {
         let src = include_str!("monitoring.rs");
-        let body = src.split("async fn grafana_session(").nth(1).expect("the handler exists");
-        let body = body.split("#[cfg(test)]").next().unwrap();
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "async fn grafana_session(");
         assert!(body.contains("grafana_session_role("), "the handler must call auth::grafana_session_role");
         assert!(body.contains("users::role_scopes_disabled("), "the handler must re-read the account row");
         assert!(body.contains("mint_grafana_jwt_with("), "the handler must mint through the pinned mint");
@@ -394,12 +394,11 @@ mod tests {
     #[test]
     fn the_handler_gates_the_read_only_viewer() {
         let src = include_str!("monitoring.rs");
-        let body = src.split("async fn grafana_session(").nth(1).expect("the handler exists");
-        let body = body.split("#[cfg(test)]").next().unwrap();
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "async fn grafana_session(");
         assert!(body.contains("if live == Some(Role::User) && !disabled {\n        viewer_gate(&key).await"), "{body}");
         assert!(body.contains("grafana_session_role(live, disabled, &viewer)"));
-        let gate = src.split("async fn viewer_gate(").nth(1).expect("viewer_gate exists");
-        let gate = gate.split("\n}\n").next().unwrap();
+        let gate = crate::test_src::fn_body(&own, "async fn viewer_gate(");
         assert!(gate.contains("fetch_grafana_evidence(GRAFANA_INTERNAL_URL, key)"));
         assert!(gate.contains("grafana_viewer_gate(flag.as_deref(), Some(evidence))"));
     }

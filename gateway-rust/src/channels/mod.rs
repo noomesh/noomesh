@@ -551,7 +551,7 @@ mod scoped_turn_tests {
             ("telegram", include_str!("telegram.rs")),
             ("google_chat", include_str!("google_chat_pipeline.rs")),
         ] {
-            let code = &src[..src.find("#[cfg(test)]").unwrap()];
+            let code = &crate::test_src::own_code(src);
             assert!(code.contains("account_principal("), "{name} must resolve the account's principal");
             let run = code.find("coordinator::run(").unwrap_or_else(|| panic!("{name}: no coordinator::run"));
             let scoped = code.find("super::scoped_turn(").unwrap_or_else(|| panic!("{name}: no scoped_turn"));
@@ -579,7 +579,8 @@ mod scoped_turn_tests {
     #[test]
     fn scoped_turn_uses_the_room_principal() {
         let src = include_str!("mod.rs");
-        let body = src.split("pub async fn scoped_turn").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "pub async fn scoped_turn");
         assert!(body.contains("room_principal(principal, shared)"));
     }
 }

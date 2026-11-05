@@ -20,6 +20,13 @@
 //!
 //! Matching one spelling, and reading source where behaviour could be run,
 //! remain the author's judgement.
+//!
+//! Two crates carry this file: noo-cli/src/test_src.rs and
+//! gateway-rust/src/test_src.rs (the gateway is a binary crate, so it cannot
+//! import the CLI's). The copies are byte-identical
+//! (tests/test_test_src_copies.py), and both run every row of
+//! tests/fixtures/test_src_cases.json, so an edit to one fails until the
+//! other matches.
 
 /// What a byte of Rust source is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,21 +308,22 @@ mod tests {
         let _ = fn_body(&code, "fn renamed_away(");
     }
 
-    /// Every file under noo-cli/src except this one that contains any of
-    /// `needles`, after proving it read the tree (at least 50 files).
-    fn files_containing(needles: &[String]) -> Vec<String> {
+    /// Every file under this crate's src/ except this one where `cuts`
+    /// holds for one of the file's `find("…")` / `split("…")` literals,
+    /// after proving it read the tree (at least 50 files).
+    fn files_cutting_at(cuts: impl Fn(&str) -> bool) -> Vec<String> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let (mut seen, mut hits) = (0usize, Vec::new());
         let mut dirs = vec![root];
         while let Some(d) = dirs.pop() {
-            for e in std::fs::read_dir(&d).expect("read noo-cli/src").flatten() {
+            for e in std::fs::read_dir(&d).expect("read src/").flatten() {
                 let p = e.path();
                 if p.is_dir() {
                     dirs.push(p);
                 } else if p.extension().is_some_and(|x| x == "rs") && p.file_name().is_some_and(|n| n != "test_src.rs") {
                     seen += 1;
                     let text = std::fs::read_to_string(&p).unwrap_or_default();
-                    if needles.iter().any(|n| text.contains(n.as_str())) {
+                    if cut_literals(&text).into_iter().any(&cuts) {
                         hits.push(p.display().to_string());
                     }
                 }
@@ -325,26 +333,56 @@ mod tests {
         hits
     }
 
-    /// The cut at the first `#[cfg(test)]` cannot come back, in either
-    /// shape: `split(...)` (followup 215, slice 2) or `find(...)` used as the
-    /// end of a slice (slice 3, which found ten that slice 2's guard missed).
+    /// The literal argument of every `find("…")` and `split("…")` in
+    /// `text`, as written (escapes not decoded), up to its closing quote.
+    fn cut_literals(text: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        for verb in ["find(\"", "split(\""] {
+            for (at, _) in text.match_indices(verb) {
+                let lit = &text[at + verb.len()..];
+                let b = lit.as_bytes();
+                let (mut i, mut end) = (0, lit.len());
+                while i < b.len() {
+                    match b[i] {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            end = i;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                out.push(&lit[..end]);
+            }
+        }
+        out
+    }
+
+    /// The cut at a `#[cfg(test)]` cannot come back, in any spelling:
+    /// `split` (followup 215, slice 2), `find` used as the end of a slice
+    /// (slice 3, which found ten that slice 2's guard missed), or a literal
+    /// that merely contains the attribute (`"\n#[cfg(test)]"`,
+    /// `"#[cfg(test)]\nmod tests"`: the gateway slice found five that
+    /// slice 3's exact-match guard missed).
     #[test]
     fn no_guard_cuts_at_the_first_cfg_test() {
-        let attr = concat!("\"#[cfg(", "test)]\")");
-        let hits = files_containing(&[format!("split({attr})"), format!("find({attr})")]);
+        let attr = concat!("#[cfg(", "test)]");
+        let hits = files_cutting_at(|lit| lit.contains(attr));
         assert!(hits.is_empty(), "read source through crate::test_src::own_code instead: {hits:?}");
     }
 
     /// No guard bounds a body by the first column-0 closing brace (followup
-    /// 215, slice 3): `fn_body` bounds it by its own. The needles are built
-    /// at run time, so this file carries no bare closing brace in a string.
+    /// 215, slice 3): `fn_body` bounds it by its own. Every spelling: `find`
+    /// or `split`, the brace written plain or as its escape, with or without
+    /// the newline after it (the gateway slice found 41 that slice 3's guard,
+    /// matching one spelling, had passed). The prefixes are built at run
+    /// time, so this file carries no bare brace in a string.
     #[test]
     fn no_body_is_cut_at_a_column_zero_brace() {
-        let close = '\u{7d}';
-        let hits = files_containing(&[
-            format!("find(\"\\n{close}\\n\")"),
-            "find(\"\\n\\u{7d}\\n\")".to_string(),
-        ]);
+        let (open, close) = ('\u{7b}', '\u{7d}');
+        let plain = format!("\\n{close}");
+        let escaped = format!("\\n\\u{open}7d{close}");
+        let hits = files_cutting_at(|lit| lit.starts_with(&plain) || lit.starts_with(&escaped));
         assert!(hits.is_empty(), "bound the body with crate::test_src::fn_body instead: {hits:?}");
     }
 
@@ -388,6 +426,42 @@ mod tests {
         assert!(m.contains("fn b()") && !m.contains("impl Thing"), "{m}");
         let i = fn_body(&src, "impl Thing");
         assert!(i.contains("fn c(&self)") && !i.contains("fn after("), "{i}");
+    }
+
+    /// The shared rows both copies of this file must agree on, byte for
+    /// byte: own_code, each body, and each marker that must be stale.
+    #[test]
+    fn every_shared_case_holds() {
+        let fx: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/test_src_cases.json")).expect("test_src_cases.json parses");
+        let cases = fx["cases"].as_array().expect("cases");
+        assert!(cases.len() >= 6, "the shared table lost rows: {}", cases.len());
+        let (mut bodies, mut stale) = (0usize, 0usize);
+        for c in cases {
+            let name = c["name"].as_str().expect("name");
+            let src = c["src"].as_str().expect("src");
+            let code = own_code(src);
+            assert_eq!(code, c["own_code"].as_str().expect("own_code"), "{name}: own_code");
+            for b in c["bodies"].as_array().expect("bodies") {
+                let marker = b["marker"].as_str().expect("marker");
+                let of = match b["of"].as_str().expect("of") {
+                    "src" => src,
+                    "own_code" => code.as_str(),
+                    other => panic!("{name}: unknown `of` {other}"),
+                };
+                assert_eq!(fn_body(of, marker), b["body"].as_str().expect("body"), "{name}: fn_body({marker})");
+                bodies += 1;
+            }
+            for m in c["stale_in_own_code"].as_array().expect("stale_in_own_code") {
+                let marker = m.as_str().expect("marker");
+                let got = std::panic::catch_unwind(|| fn_body(&code, marker).len());
+                let Err(msg) = got else { panic!("{name}: `{marker}` should be stale") };
+                let msg = msg.downcast_ref::<String>().cloned().unwrap_or_default();
+                assert!(msg.contains("this guard is stale"), "{name}: {msg}");
+                stale += 1;
+            }
+        }
+        assert!(bodies >= 13 && stale >= 3, "rows ran: {bodies} bodies, {stale} stale markers");
     }
 
     /// Non-ASCII in comments and code survives blanking.

@@ -5227,13 +5227,12 @@ pub(crate) mod tests {
             handlers.len()
         );
 
-        // Body of a top-level `async fn`, relying on rustfmt putting the
-        // closing brace at column 0.
+        // Body of a top-level `async fn`, bounded by its own closing brace.
+        let own = crate::test_src::own_code(src);
         let body_of = |name: &str| -> Option<&str> {
-            let start = src.find(&format!("async fn {name}("))?;
-            let rest = &src[start..];
-            let end = rest.find("\n}\n").unwrap_or(rest.len());
-            Some(&rest[..end])
+            let marker = format!("async fn {name}(");
+            own.find(&marker)?;
+            Some(crate::test_src::fn_body(&own, &marker))
         };
 
         // Audited directly, or via one level of delegation. `security_team_delete`
@@ -5309,13 +5308,8 @@ pub(crate) mod tests {
     #[test]
     fn the_approval_workflow_is_mirrored_on_the_security_surface() {
         let src = include_str!("users.rs");
-        let body_of = |name: &str| -> &str {
-            let start = src
-                .find(&format!("async fn {name}("))
-                .unwrap_or_else(|| panic!("{name} not found"));
-            let rest = &src[start..];
-            &rest[..rest.find("\n}\n").unwrap_or(rest.len())]
-        };
+        let own = crate::test_src::own_code(src);
+        let body_of = |name: &str| -> &str { crate::test_src::fn_body(&own, &format!("async fn {name}(")) };
         // The mirror of what `users_admin_mutation_guard` protects on the
         // legacy side — exactly create/password/disable, per the design.
         for h in ["user_create", "user_set_password", "user_disable"] {
@@ -5353,11 +5347,8 @@ pub(crate) mod tests {
         // And the handler actually runs it (source check, like the other
         // surface-parity tests in this module).
         let src = include_str!("users.rs");
-        let body = src
-            .split("async fn users_list(")
-            .nth(1)
-            .expect("users_list not found");
-        let body = &body[..body.find("\n}\n").expect("no close for users_list")];
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "async fn users_list(");
         assert!(
             body.contains("_op: OperatorOrInternal"),
             "users_list must take the shared read extractor"
@@ -5369,11 +5360,8 @@ pub(crate) mod tests {
     #[test]
     fn the_user_list_exposes_lockout_state() {
         let src = include_str!("users.rs");
-        let body = src
-            .split("async fn users_list(")
-            .nth(1)
-            .expect("users_list not found");
-        let body = &body[..body.find("\n}\n").expect("no close for users_list")];
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "async fn users_list(");
         assert!(
             body.contains("list_with_lock"),
             "users_list must use the projection that carries locked_until"
@@ -5801,8 +5789,8 @@ mod session_end_tests {
 
     #[test]
     fn the_routine_does_all_of_it() {
-        let src = include_str!("../session_floor.rs");
-        let body = src.split("pub async fn end_account_sessions(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("../session_floor.rs"));
+        let body = crate::test_src::fn_body(&own, "pub async fn end_account_sessions(");
         for step in [
             "revoke_all_for_user(",
             "raise(state, account, reason)",

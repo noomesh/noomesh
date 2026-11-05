@@ -1,0 +1,129 @@
+{
+  "_comment": "Shared cases for the two copies of test_src.rs (noo-cli/src and gateway-rust/src, followup 215). Both crates run every row and must produce exactly these outputs, so a change to one copy fails until the other matches. own_code is byte-exact (comments blanked to spaces, test-only items removed); each body is fn_body(of, marker); each stale marker must panic 'this guard is stale' on own_code.",
+  "cases": [
+    {
+      "name": "guard_fixture",
+      "why": "A doc comment naming the call, a test-only fn ABOVE the code under guard, a function followed by a test module, braces inside strings, raw strings, char literals and lifetimes.",
+      "src": "/// Explains why `danger()` must come after `setup()`.\nfn run<'a>(x: &'a str) -> usize {\n    // danger(); was here once\n    setup();\n    let s = \"a } in a string\";\n    let r = r#\"raw { \"quoted\" }\"#;\n    let c = '}';\n    let d = '\\\\';\n    let q = '\\'';\n    danger();\n    s.len() + r.len() + x.len() + c.len_utf8() + d.len_utf8() + q.len_utf8()\n}\n\n#[cfg(test)]\nfn only_in_tests() -> [u8; 2] { setup(); [0; 2] }\n\nfn later() {\n    /* block { comment */ finish();\n}\n\n#[cfg(test)]\nmod tests {\n    fn t() { assert!(src.contains(\"later_marker\")); }\n}\n\nfn after_tests() { tail(); }",
+      "own_code": "                                                      \nfn run<'a>(x: &'a str) -> usize {\n                              \n    setup();\n    let s = \"a } in a string\";\n    let r = r#\"raw { \"quoted\" }\"#;\n    let c = '}';\n    let d = '\\\\';\n    let q = '\\'';\n    danger();\n    s.len() + r.len() + x.len() + c.len_utf8() + d.len_utf8() + q.len_utf8()\n}\n\n\n\nfn later() {\n                          finish();\n}\n\n\n\nfn after_tests() { tail(); }",
+      "bodies": [
+        {
+          "of": "own_code",
+          "marker": "fn run<",
+          "body": "fn run<'a>(x: &'a str) -> usize {\n                              \n    setup();\n    let s = \"a } in a string\";\n    let r = r#\"raw { \"quoted\" }\"#;\n    let c = '}';\n    let d = '\\\\';\n    let q = '\\'';\n    danger();\n    s.len() + r.len() + x.len() + c.len_utf8() + d.len_utf8() + q.len_utf8()\n}"
+        },
+        {
+          "of": "own_code",
+          "marker": "fn later(",
+          "body": "fn later() {\n                          finish();\n}"
+        },
+        {
+          "of": "own_code",
+          "marker": "fn after_tests(",
+          "body": "fn after_tests() { tail(); }"
+        }
+      ],
+      "stale_in_own_code": [
+        "fn renamed_away(",
+        "fn only_in_tests("
+      ]
+    },
+    {
+      "name": "column_zero_brace_in_a_raw_string",
+      "why": "The first column-0 closing brace is inside a raw string, not the function's end.",
+      "src": "fn render() -> &'static str {\n    let t = r#\"\nhead {\n}\n\"#;\n    after_the_string();\n    t\n}\n\nfn next() {}",
+      "own_code": "fn render() -> &'static str {\n    let t = r#\"\nhead {\n}\n\"#;\n    after_the_string();\n    t\n}\n\nfn next() {}",
+      "bodies": [
+        {
+          "of": "src",
+          "marker": "fn render(",
+          "body": "fn render() -> &'static str {\n    let t = r#\"\nhead {\n}\n\"#;\n    after_the_string();\n    t\n}"
+        },
+        {
+          "of": "src",
+          "marker": "fn next(",
+          "body": "fn next() {}"
+        }
+      ],
+      "stale_in_own_code": []
+    },
+    {
+      "name": "module_and_impl_markers",
+      "why": "A non-fn item is bounded the same way; fn_body over the raw source keeps a test module whole, own_code drops it.",
+      "src": "#[cfg(test)]\nmod inner {\n    fn a() { let _ = \"}\"; }\n    fn b() {}\n}\nimpl Thing {\n    fn c(&self) {}\n}\nfn after() {}",
+      "own_code": "\nimpl Thing {\n    fn c(&self) {}\n}\nfn after() {}",
+      "bodies": [
+        {
+          "of": "src",
+          "marker": "mod inner {",
+          "body": "mod inner {\n    fn a() { let _ = \"}\"; }\n    fn b() {}\n}"
+        },
+        {
+          "of": "src",
+          "marker": "impl Thing",
+          "body": "impl Thing {\n    fn c(&self) {}\n}"
+        },
+        {
+          "of": "own_code",
+          "marker": "impl Thing",
+          "body": "impl Thing {\n    fn c(&self) {}\n}"
+        }
+      ],
+      "stale_in_own_code": [
+        "mod inner {"
+      ]
+    },
+    {
+      "name": "multibyte_text",
+      "why": "Non-ASCII in comments, strings and chars survives blanking, byte for byte.",
+      "src": "fn f() { let _ = \"—\"; let c = 'é'; } // a — dash\n/* ünïcode */ fn g() {}",
+      "own_code": "fn f() { let _ = \"—\"; let c = 'é'; }              \n                fn g() {}",
+      "bodies": [
+        {
+          "of": "own_code",
+          "marker": "fn f(",
+          "body": "fn f() { let _ = \"—\"; let c = 'é'; }"
+        },
+        {
+          "of": "own_code",
+          "marker": "fn g(",
+          "body": "fn g() {}"
+        }
+      ],
+      "stale_in_own_code": []
+    },
+    {
+      "name": "items_ending_in_a_semicolon",
+      "why": "A test-only use or const ends at its own semicolon (not one inside brackets); an attribute inside a string or a comment is not an item.",
+      "src": "#[cfg(test)]\nuse std::collections::HashMap;\n#[cfg(test)]\nconst K: [u8; 2] = [1, 2];\nconst NOTE: &str = \"#[cfg(test)] is just text\";\n// #[cfg(test)] in a comment\nfn kept() { let b = b\"}\"; let rb = br#\"{\"#; }",
+      "own_code": "\n\nconst NOTE: &str = \"#[cfg(test)] is just text\";\n                            \nfn kept() { let b = b\"}\"; let rb = br#\"{\"#; }",
+      "bodies": [
+        {
+          "of": "own_code",
+          "marker": "fn kept(",
+          "body": "fn kept() { let b = b\"}\"; let rb = br#\"{\"#; }"
+        }
+      ],
+      "stale_in_own_code": []
+    },
+    {
+      "name": "nested_block_comments_and_lifetimes",
+      "why": "Block comments nest; a lifetime is not a char literal, so the brace after it is code.",
+      "src": "/* outer /* inner } */ still comment { */\nfn life<'a, 'b>(x: &'a str, _y: &'b str) -> &'a str {\n    if x.is_empty() { x } else { x }\n}\nstruct S<'s> { v: &'s str }",
+      "own_code": "                                         \nfn life<'a, 'b>(x: &'a str, _y: &'b str) -> &'a str {\n    if x.is_empty() { x } else { x }\n}\nstruct S<'s> { v: &'s str }",
+      "bodies": [
+        {
+          "of": "own_code",
+          "marker": "fn life<",
+          "body": "fn life<'a, 'b>(x: &'a str, _y: &'b str) -> &'a str {\n    if x.is_empty() { x } else { x }\n}"
+        },
+        {
+          "of": "own_code",
+          "marker": "struct S<",
+          "body": "struct S<'s> { v: &'s str }"
+        }
+      ],
+      "stale_in_own_code": []
+    }
+  ]
+}

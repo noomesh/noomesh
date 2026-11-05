@@ -941,7 +941,7 @@ mod tests {
     #[test]
     fn the_signer_never_uses_the_controller_secret() {
         let src = include_str!("bus_principal.rs");
-        let code = &src[..src.find("#[cfg(test)]").unwrap()];
+        let code = crate::test_src::own_code(src);
         let code: String = code.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
         assert!(!code.contains("controller_secret"), "the bus signer reads the controller secret again");
         assert!(!code.contains("NOO_CONTROLLER_SECRET"), "the bus signer names the controller secret again");

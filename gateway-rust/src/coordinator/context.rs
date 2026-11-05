@@ -1054,7 +1054,7 @@ mod data_frame_tests {
     #[test]
     fn the_loop_sends_fetched_layers_through_the_frame_not_the_system_message() {
         let src = include_str!("agent_loop.rs");
-        let code = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let code = crate::test_src::own_code(src);
         assert!(code.matches("attach_retrieved_data(").count() >= 2, "both loops must attach the frame");
         for var in ["rag_ctx", "mem_ctx", "channel_ctx", "video_ctx", "temporal_ctx"] {
             assert!(!code.contains(&format!("Some(ref c) = {var} {{ push_layer")), "{var} is back on the system message");
@@ -1230,7 +1230,7 @@ mod data_frame_tests {
     #[test]
     fn the_loop_frames_cluster_awareness_in_both_paths() {
         let src = include_str!("agent_loop.rs");
-        let code = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let code = crate::test_src::own_code(src);
         assert!(!code.contains("persona_prompt.push_str(&rt.cluster_awareness()"), "node-reported text is back on the system message");
         assert_eq!(code.matches("CLUSTER_FRAME_LABEL").count(), 2, "both loops frame the cluster layer");
         assert_eq!(code.matches("CLUSTER_GUIDANCE").count(), 2);
@@ -1253,7 +1253,7 @@ mod data_frame_tests {
     #[test]
     fn the_loop_frames_summary_evolved_skills_and_companion_text() {
         let src = include_str!("agent_loop.rs");
-        let code = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let code = crate::test_src::own_code(src);
         for var in ["abc_ctx", "skills_ctx", "companion_ctx", "evolved_skills"] {
             assert!(!code.contains(&format!("Some(ref c) = {var} {{ push_layer")), "{var} is back on the system message");
         }

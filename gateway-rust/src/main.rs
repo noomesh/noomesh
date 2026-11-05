@@ -70,6 +70,8 @@ mod harness_profile;
 mod harness;
 mod harness_main;
 mod tasks;
+#[cfg(test)]
+mod test_src;
 mod task_budget;
 mod task_context;
 mod task_events;

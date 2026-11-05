@@ -156,8 +156,8 @@ mod tests {
     #[test]
     fn write_log_opens_through_open_output_before_it_gathers() {
         let src = include_str!("heartbeat_actions.rs");
-        let f = &src[src.find("async fn action_write_log(").unwrap()..];
-        let f = &f[..f.find("\n}\n").unwrap()];
+        let own = crate::test_src::own_code(src);
+        let f = crate::test_src::fn_body(&own, "async fn action_write_log(");
         let open = f.find("confine::open_output(").expect("write_log opens with O_NOFOLLOW");
         let gather = f.find("gather_section(").expect("gathers");
         assert!(open < gather, "opened before the slow gather, not after");
