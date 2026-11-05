@@ -24,20 +24,24 @@ use crate::output::{fail, ExitCode};
 use crate::ui::{self, Col, Glyph};
 use crate::{Globals, Unhandled};
 
-pub(crate) fn parse_query_with(a: &mut Args) -> Result<(String, String, Option<String>), ArgError> {
+pub(crate) fn parse_query_with(a: &mut Args) -> Result<(String, String, Option<String>, bool), ArgError> {
+    let personal = a.flag(&["--personal"]);
     let strategy = a.value(&["--strategy", "-s"])?.unwrap_or_else(|| "hybrid".to_string());
     let persona = a.value(&["--persona", "-p"])?;
     let question = a.one("<question>")?;
-    Ok((question, strategy, persona))
+    Ok((question, strategy, persona, personal))
 }
 
 /// `noo rag query QUESTION [--strategy/-s S] [--persona/-p ID]` —
 /// POST /api/v1/rag/query {"question", "strategy", ["persona_id"]}.
 pub fn rag_query(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let (q, strategy, persona) = parse_query_with(&mut Args::new(args))?;
+    let (q, strategy, persona, personal) = parse_query_with(&mut Args::new(args))?;
     let mut body = serde_json::json!({ "question": q, "strategy": strategy });
     if let Some(p) = &persona {
         body["persona_id"] = p.as_str().into();
+    }
+    if personal {
+        body["include_personal"] = true.into();
     }
 
     // Retrieval + verification is slow — Python parity: 60s.
@@ -62,6 +66,9 @@ pub fn rag_query(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
     println!("{}", ui::header("rag query", Some(&meta.join(" · "))));
 
+    if resp["personal_sources_unavailable"] == true {
+        eprintln!("Personal sources were unavailable or refused; available results are shown.");
+    }
     if let Some(answer) = resp["answer"].as_str().filter(|a| !a.is_empty()) {
         println!();
         println!("{answer}");
