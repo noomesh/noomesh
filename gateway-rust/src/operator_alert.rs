@@ -63,10 +63,45 @@ fn local_cooldowns() -> &'static Mutex<HashMap<String, Instant>> {
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-async fn cooldown_acquired(state: &AppState, key: &str, secs: i64) -> bool {
-    if let Some(r) = state.redis.as_ref() {
-        return r.set_nx_ex(key, "1", secs).await;
+/// Redis failed under the alert path (i460). The cooldown and the persisting
+/// state fall back to this process's own maps, the ones used when there is no
+/// Redis at all. Said here, and counted, because saying it through
+/// operator_alert would be circular: `noo_operator_alert_store_errors_total`
+/// (label `op`) is what Prometheus and the Redis alerts can see.
+static STORE_ERROR_LOG: std::sync::LazyLock<crate::log_gate::LogGate> =
+    std::sync::LazyLock::new(|| crate::log_gate::LogGate::new(300));
+
+async fn store_error(state: &AppState, op: &'static str, error: &str) {
+    let labels = HashMap::from([("op".to_string(), op.to_string())]);
+    state.metrics.inc_counter("noo_operator_alert_store_errors_total", Some(&labels), 1).await;
+    if let Some(suppressed) = STORE_ERROR_LOG.should_log(op, unix_now().max(0) as u64) {
+        tracing::warn!(op, error, suppressed, "operator_alert_store_unavailable: using this process's cooldown and state until Redis answers");
     }
+}
+
+/// Is this alert outside its cooldown? Redis answers when it can. When it
+/// cannot (an error) or is absent, this process's own cooldown decides:
+/// reading an outage as "cooling down" dropped every cooldown-gated alert for
+/// as long as Redis failed, which is exactly when they matter.
+fn cooldown_admit(redis: Option<Result<bool, String>>, local: impl FnOnce() -> bool) -> bool {
+    match redis {
+        Some(Ok(acquired)) => acquired,
+        Some(Err(_)) | None => local(),
+    }
+}
+
+async fn cooldown_acquired(state: &AppState, key: &str, secs: i64) -> bool {
+    let redis = match state.redis.as_ref() {
+        Some(r) => Some(r.set_nx_ex_checked(key, "1", secs).await),
+        None => None,
+    };
+    if let Some(Err(e)) = &redis {
+        store_error(state, "cooldown", e).await;
+    }
+    cooldown_admit(redis, || local_cooldown(key, secs))
+}
+
+fn local_cooldown(key: &str, secs: i64) -> bool {
     let mut map = local_cooldowns().lock().unwrap_or_else(|p| p.into_inner());
     let now = Instant::now();
     let acquired = match map.get(key) {
@@ -262,21 +297,25 @@ fn state_key(kind: &str, target: &str) -> String {
 
 async fn load_state(state: &AppState, key: &str) -> Option<PersistState> {
     if let Some(r) = state.redis.as_ref() {
-        let raw = r.get_string(key).await?;
-        return serde_json::from_str(&raw).ok();
+        // An error is not "no prior state": read that way, a persisting
+        // alert was re-announced as new on every tick of the outage.
+        match r.get_string_checked(key).await {
+            Ok(raw) => return raw.and_then(|raw| serde_json::from_str(&raw).ok()),
+            Err(e) => store_error(state, "load_state", &e).await,
+        }
     }
     local_states().lock().unwrap_or_else(|p| p.into_inner()).get(key).cloned()
 }
 
 async fn save_state(state: &AppState, key: &str, st: &PersistState) {
     if let Some(r) = state.redis.as_ref() {
-        if let Ok(raw) = serde_json::to_string(st) {
-            if r.set_string(key, &raw).await {
-                r.expire(key, STATE_TTL_SECS).await;
-            }
+        let Ok(raw) = serde_json::to_string(st) else { return };
+        if r.set_string(key, &raw).await {
+            r.expire(key, STATE_TTL_SECS).await;
             r.sadd(OPEN_SET_KEY, key).await;
+            return;
         }
-        return;
+        store_error(state, "save_state", "SET failed").await;
     }
     local_states().lock().unwrap_or_else(|p| p.into_inner()).insert(key.to_string(), st.clone());
 }
@@ -548,6 +587,24 @@ pub async fn dispatch_raw(message: &ChannelText) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// i460: a Redis error under the cooldown used to read as "cooling down",
+    /// so every cooldown-gated alert was dropped while Redis failed.
+    #[test]
+    fn a_redis_error_falls_back_to_this_process_cooldown() {
+        assert!(cooldown_admit(Some(Err("connection refused".into())), || true), "an outage is not a cooldown");
+        assert!(!cooldown_admit(Some(Err("connection refused".into())), || false), "the local cooldown still dedupes");
+        assert!(cooldown_admit(Some(Ok(true)), || false), "Redis answers when it can");
+        assert!(!cooldown_admit(Some(Ok(false)), || true), "a held Redis cooldown wins");
+        assert!(cooldown_admit(None, || true));
+    }
+
+    #[test]
+    fn the_local_cooldown_admits_once_per_window() {
+        let key = "noo:alerts:cooldown:test.local_cooldown:t1";
+        assert!(local_cooldown(key, 3600));
+        assert!(!local_cooldown(key, 3600), "a repeat inside the window is held");
+    }
 
     const H: i64 = 3600;
 

@@ -886,9 +886,18 @@ async fn queue_disk_reclaim(state: &AppState, watermark: f64, dry_run: bool, cac
         tracing::warn!("autonomy.disk_reclaim.skipped_no_redis");
         return;
     };
-    if !r.set_nx_ex(DEDUP_KEY, "1", DEDUP_TTL_SECS).await {
-        tracing::debug!("autonomy.disk_reclaim.dedup_skip");
-        return;
+    match r.set_nx_ex_checked(DEDUP_KEY, "1", DEDUP_TTL_SECS).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::debug!("autonomy.disk_reclaim.dedup_skip");
+            return;
+        }
+        // Fail closed (no reclaim is the safe side of a data-deleting
+        // action), but not silently.
+        Err(e) => {
+            tracing::warn!(error = %e, "autonomy.disk_reclaim.skipped_dedup_unreadable: the hourly reclaim slot cannot be claimed in Redis, so no reclaim is queued");
+            return;
+        }
     }
 
     let mut args = vec![
@@ -1328,9 +1337,17 @@ pub async fn eval_missing_graph_entities(state: &AppState) -> Result<bool, Strin
             // time-critical, so a coarse window is fine.
             const DEDUP_KEY: &str = "noo:autonomy:dedup:background_graph";
             const DEDUP_TTL_SECS: i64 = 600; // 10 min
-            if !redis.set_nx_ex(DEDUP_KEY, "1", DEDUP_TTL_SECS).await {
-                tracing::debug!(entity_gap = gap, "autonomy.missing_graph_entities.dedup_skip");
-                return Ok(should_fire);
+            match redis.set_nx_ex_checked(DEDUP_KEY, "1", DEDUP_TTL_SECS).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(entity_gap = gap, "autonomy.missing_graph_entities.dedup_skip");
+                    return Ok(should_fire);
+                }
+                // Fail closed (no job is better than one per tick), but not silently.
+                Err(e) => {
+                    tracing::warn!(entity_gap = gap, error = %e, "autonomy.missing_graph_entities.skipped_dedup_unreadable: the 10-minute graph-job slot cannot be claimed in Redis, so no job is submitted");
+                    return Ok(should_fire);
+                }
             }
             tracing::info!(entity_gap = gap, pages, entities, "autonomy.missing_graph_entities.submit_graph_job");
             let payload = serde_json::json!({"scope": "extract", "source": "autonomy"});
@@ -3785,7 +3802,15 @@ pub async fn eval_custom_location(
     if cooldown > 0 {
         if let Some(r) = redis(state) {
             let key = format!("noo:autonomy:custom_cooldown:{name}");
-            if !r.set_nx_ex(&key, "1", cooldown).await {
+            let held = match r.set_nx_ex_checked(&key, "1", cooldown).await {
+                Ok(acquired) => !acquired,
+                // Fail closed (the action does not re-fire), but not silently.
+                Err(e) => {
+                    tracing::warn!(location = %name, error = %e, "autonomy.custom_location.skipped_cooldown_unreadable: the action's re-fire cooldown cannot be read in Redis, so it does not fire");
+                    true
+                }
+            };
+            if held {
                 return json!({
                     "name": name,
                     "fired": true,

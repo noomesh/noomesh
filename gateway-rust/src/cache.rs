@@ -651,6 +651,13 @@ impl RedisCache {
     /// already existed or on error. Used by operator_alert for per-condition
     /// alert cooldowns shared across gateway restarts.
     pub async fn set_nx_ex(&self, key: &str, value: &str, ttl_secs: i64) -> bool {
+        self.set_nx_ex_checked(key, value, ttl_secs).await.unwrap_or(false)
+    }
+
+    /// [`set_nx_ex`], telling "the key already exists" (`Ok(false)`) from
+    /// "Redis failed" (`Err`). A caller that must not read an outage as
+    /// "someone else holds it" (an alert cooldown) uses this one.
+    pub async fn set_nx_ex_checked(&self, key: &str, value: &str, ttl_secs: i64) -> Result<bool, String> {
         self.client
             .set::<fred::types::Value, _, _>(
                 key,
@@ -661,7 +668,7 @@ impl RedisCache {
             )
             .await
             .map(|v| !v.is_null())
-            .unwrap_or(false)
+            .map_err(|e| e.to_string())
     }
 
     /// SET key 1 NX EX <ttl>, telling "already there" apart from "Redis
