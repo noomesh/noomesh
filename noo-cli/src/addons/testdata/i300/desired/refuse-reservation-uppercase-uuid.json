@@ -1,0 +1,121 @@
+{
+  "node_workloads": [
+    {
+      "addon": "rhaddon",
+      "name": "worker",
+      "decl": {
+        "name": "worker",
+        "image": "addon-worker",
+        "uid": 1000,
+        "command": [
+          "rhaddon-worker"
+        ],
+        "port": 9003,
+        "protocols": [
+          "http",
+          "ws"
+        ],
+        "health": {
+          "ready": "/health/ready",
+          "live": "/health/live",
+          "start_secs": 300
+        },
+        "drain": {
+          "path": "/v1/lifecycle/drain",
+          "timeout_secs": 420
+        },
+        "accel": {
+          "gpu": 1,
+          "realtime": true
+        },
+        "models": [
+          {
+            "slot": "main",
+            "target": "/models/main",
+            "accepts": {
+              "kind": "voice",
+              "runtime": "rh-s2s"
+            }
+          },
+          {
+            "slot": "voices",
+            "target": "/models/voices",
+            "accepts": {
+              "kind": "voice-pack"
+            },
+            "many": false,
+            "optional": true
+          }
+        ],
+        "env": {
+          "RHADDON_SLOTS": {
+            "min": 1,
+            "max": 4
+          },
+          "RHADDON_QUANT": {
+            "one_of": [
+              "int8"
+            ]
+          },
+          "RHADDON_LOG_AUDIO": {
+            "one_of": [
+              "false"
+            ]
+          }
+        },
+        "scratch": [
+          {
+            "target": "/cache",
+            "max_mb": 4096
+          },
+          {
+            "target": "/tmp",
+            "tmpfs_mb": 256
+          }
+        ],
+        "limits": {
+          "ram_mb": 24576,
+          "cpus": 4,
+          "pids": 512
+        }
+      },
+      "image": {
+        "name": "addon-worker",
+        "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "sets": {
+        "main": [
+          {
+            "id": "rh-s2s-7b",
+            "revision": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ],
+        "voices": [
+          {
+            "id": "rh-voices-a",
+            "revision": "v1"
+          }
+        ]
+      },
+      "profile": "int8",
+      "env": {
+        "RHADDON_SLOTS": "1",
+        "RHADDON_QUANT": "int8",
+        "RHADDON_LOG_AUDIO": "false"
+      },
+      "door": {
+        "leaf": "svc-addon-rhaddon-worker",
+        "admit": [
+          "node-a"
+        ]
+      },
+      "start_secs": 300,
+      "drain": {
+        "path": "/v1/lifecycle/drain",
+        "timeout_secs": 420
+      },
+      "reservation": "0B1F5F0E-6A3E-4A54-9D3C-0A4E5B9C7D21",
+      "state": "running"
+    }
+  ]
+}

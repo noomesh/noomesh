@@ -10,6 +10,7 @@ pub mod check;
 pub mod decls;
 pub mod guards;
 pub mod lock_fetch;
+pub mod node_workloads;
 pub mod pins;
 pub mod pop;
 pub mod provisioned;
