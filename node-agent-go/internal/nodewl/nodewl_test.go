@@ -26,6 +26,8 @@ type fixtureCase struct {
 	Valid bool   `json:"valid"`
 	Code  string `json:"code"`
 	Addon string `json:"addon"`
+	// Set pairs a desired case with a model-set fixture for CheckProfile.
+	Set string `json:"set"`
 }
 
 func readFile(t *testing.T, rel ...string) []byte {
@@ -103,6 +105,14 @@ func TestNodeWorkloadsFixtures(t *testing.T) {
 func TestDesiredFixtures(t *testing.T) {
 	for _, c := range loadCases(t, "desired") {
 		es, err := ParseDesired(readFile(t, "desired", c.File), testAgentCN)
+		if err == nil && c.Set != "" {
+			// ParseDesired cannot see the set; the pairing is judged by CheckProfile.
+			ms, perr := ParseModelSet(readFile(t, filepath.FromSlash(c.Set)))
+			if perr != nil || len(es) != 1 {
+				t.Fatalf("%s: paired set %s: %v (%d entries)", c.File, c.Set, perr, len(es))
+			}
+			err = CheckProfile(es[0], *ms)
+		}
 		check(t, c, err)
 		if c.Valid && c.File != "valid-empty.json" && len(es) == 0 {
 			t.Errorf("%s: parsed but returned no entries", c.File)
@@ -189,9 +199,64 @@ func TestEveryCodeAFixtureNamesIsProduced(t *testing.T) {
 	for _, c := range loadCases(t, "desired") {
 		want[c.Code] = true
 	}
-	for _, code := range []string{ReasonDeclInvalid, ReasonDesiredInvalid, ReasonDoorLeafMissing, ReasonImageMissing, ReasonSetMissing, ReasonSetSlotInvalid, ReasonAdmitInvalid, ReasonEnvOutOfBounds} {
+	for _, code := range []string{ReasonDeclInvalid, ReasonDesiredInvalid, ReasonDoorLeafMissing, ReasonImageMissing, ReasonSetMissing, ReasonSetSlotInvalid, ReasonAdmitInvalid, ReasonEnvOutOfBounds, ReasonProfileInvalid} {
 		if !want[code] {
 			t.Errorf("no desired fixture produces %q", code)
+		}
+	}
+}
+
+func TestCheckProfileRealtimeAndNames(t *testing.T) {
+	yes, no := true, false
+	str := func(s string) *string { return &s }
+	set := ModelSet{ID: "s", Needs: Needs{Profiles: []Profile{
+		{Name: "live", Accel: "cuda", Realtime: &yes},
+		{Name: "unstated", Accel: "cuda"},
+		{Name: "batch", Accel: "cuda", Realtime: &no},
+	}}}
+	rt := Decl{Accel: Accel{GPU: 1, Realtime: true}}
+	for _, row := range []struct {
+		name    string
+		profile *string
+		decl    Decl
+		ok      bool
+	}{
+		{"named realtime profile", str("live"), rt, true},
+		{"realtime unstated counts as realtime", str("unstated"), rt, true},
+		{"realtime:false profile for a realtime workload", str("batch"), rt, false},
+		{"realtime:false profile for a non-realtime workload", str("batch"), Decl{Accel: Accel{GPU: 1}}, true},
+		{"unknown name", str("nope"), rt, false},
+		{"missing", nil, rt, false},
+		{"empty", str(""), rt, false},
+	} {
+		err := CheckProfile(Entry{Profile: row.profile, Decl: row.decl}, set)
+		if row.ok && err != nil || !row.ok && CodeOf(err) != ReasonProfileInvalid {
+			t.Errorf("%s: got %v", row.name, err)
+		}
+	}
+}
+
+func TestComputeCapIsNumeric(t *testing.T) {
+	for _, row := range []struct {
+		have, need string
+		want       bool
+	}{
+		{"10.0", "8.0", true}, // a string compare would say no
+		{"8.6", "8.0", true},
+		{"8.0", "8.0", true},
+		{"7.5", "8.0", false},
+		{"8.10", "8.9", true}, // a string compare would say no
+		{"8.9", "8.10", false},
+		{"9.0", "8.9", true},
+	} {
+		got, err := ComputeCapAtLeast(row.have, row.need)
+		if err != nil || got != row.want {
+			t.Errorf("ComputeCapAtLeast(%q, %q) = %v, %v; want %v", row.have, row.need, got, err, row.want)
+		}
+	}
+	for _, bad := range [][2]string{{"", "8.0"}, {"8", "8.0"}, {"abc", "8.0"}, {"8.0", "x.y"}, {"8.0.1", "8.0"}, {"-1.0", "8.0"}, {"8.6", ""}} {
+		if got, err := ComputeCapAtLeast(bad[0], bad[1]); err == nil || got {
+			t.Errorf("ComputeCapAtLeast(%q, %q) = %v, %v; want an error (unknown, never low)", bad[0], bad[1], got, err)
 		}
 	}
 }

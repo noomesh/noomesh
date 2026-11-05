@@ -129,6 +129,7 @@ Separate from the existing `addon_workloads` key. One row per
  "decl": { "...": "the validated workload object, verbatim" },
  "image": {"name": "addon-worker", "digest": "sha256:<64 hex>"},
  "sets": {"main": [{"id": "...", "revision": "..."}]},
+ "profile": "int8",
  "env": {"RHADDON_SLOTS": "1"},
  "door": {"leaf": "svc-addon-rhaddon-worker", "admit": ["<this node's agent CN>"]},
  "start_secs": 300,
@@ -137,7 +138,19 @@ Separate from the existing `addon_workloads` key. One row per
  "state": "provisioned"}
 ```
 
-`reservation` is a canonical lower-case UUID string or `null`. `start_secs` and
+`profile` names the load profile of the **main slot's** set (the first declared
+model slot): it is required when that slot has a set, and it must name one of
+that set's `needs.profiles`. `ParseDesired` cannot see the set manifest, so it
+checks the shape only (a non-empty lower-case word); `nodewl.CheckProfile(entry,
+mainSet)` then refuses (`profile_invalid`) a profile that is missing or not
+listed by the set, or one with `realtime: false` when the decl's
+`accel.realtime` is true (a profile that does not state `realtime` counts as
+realtime-capable). An entry whose decl has no model slot carries no profile.
+
+`reservation` is a canonical **lower-case** UUID string or `null` (the gateway
+mints ids with `Uuid::new_v4().to_string()`,
+`gateway-rust/src/routes/reservations.rs:345`, which is lower-case canonical;
+an upper-case or non-UUID id is `desired_invalid`). `start_secs` and
 `drain` equal the decl's. `image.name` equals `decl.image`. `door.leaf` is
 `svc-addon-<addon>-<name>`. `sets` keys are declared slots, a non-optional slot
 has at least one set, and a `many: false` slot has at most one (not checked for
@@ -161,8 +174,13 @@ does not declare is out of bounds.
 
 Because the agent is the only door client, it relays the gateway's calls to the
 worker. It forwards **exactly three** gateway-set headers, `X-Noo-Reservation`
-(a UUID), `X-Noo-Requester-Sub` and `X-Noo-Requester-Role`, taken from the
-gateway's authenticated call. It **strips any client-supplied copy** of those
+(a lower-case UUID), `X-Noo-Requester-Sub` and `X-Noo-Requester-Role`, taken
+from the gateway's authenticated call. The gateway's constants
+(`gateway-rust/src/routes/reservations.rs:569-571`, on origin/dev) are
+`PEER_RESERVATION_HEADER = "x-noo-reservation"`,
+`PEER_SUB_HEADER = "x-noo-requester-sub"` and
+`PEER_ROLE_HEADER = "x-noo-requester-role"`; the agent's list is exactly
+those three. It **strips any client-supplied copy** of those
 three, and strips `Origin` and `Authorization`, before the request reaches the
 worker. The worker holds no credential and no user token.
 
@@ -194,7 +212,7 @@ become a fact (the i495 rule). A `null` is never sent.
 
 | Key | Type | Notes |
 |---|---|---|
-| `gpu_compute_cap` | string, `"8.6"` | omitted when unknown |
+| `gpu_compute_cap` | string, `"8.6"` | omitted when unknown. Compared with a set's `min_compute` **numerically as (major, minor)**, never as strings (`"10.0"` is above `"8.0"`, `"8.10"` above `"8.9"`): `nodewl.ComputeCapAtLeast`. A value that does not parse is an error the caller treats as **unknown**, never as low |
 | `nvidia_runtime` | bool | the nvidia container runtime is registered |
 | `nvidia_driver_caps_ok` | bool | `compute,utility` driver capabilities are usable |
 | `controller_host` | bool | this node is the controller's host |
@@ -222,6 +240,7 @@ The agent's fixed vocabulary for the `reason` of a `node_workloads` or
 | `set_missing` | a required slot has no set | choose a model for the slot |
 | `set_slot_invalid` | `sets` names an undeclared slot, several sets for a `many: false` slot, or a malformed id or revision | fix the placement |
 | `set_unverified` | a set's signature, hashes or `.verified` marker did not check out | re-stage the set; check the node holds `signing.pub` |
+| `profile_invalid` | the entry's `profile` is missing, not one of the main set's profiles, or not realtime-capable for a realtime workload | fix the placement's profile |
 | `disk` | the data root lacks space for the set or the scratch plus the margin | free space on the node |
 | `consent_none` | the node's `addon_workloads_policy` is `none` | the node's owner sets `approve` or `auto` |
 | `consent_unapproved` | policy is `approve` and this add-on and digest are not approved | approve the add-on and digest on the node |
@@ -236,6 +255,8 @@ The agent's fixed vocabulary for the `reason` of a `node_workloads` or
 | `start_timeout` | the worker was not ready within `start_secs` | read the worker's logs; raise `start_secs` in the add-on |
 | `crashed` | the worker exited while it should run | read the worker's logs |
 | `drain_timeout` | the drain did not finish in `drain.timeout_secs`; reported as `needs_attention` | wait; the session is never cut |
+
+The placement facts (`consent_none`, `consent_unapproved`, `nvidia_runtime_missing`, `driver_caps_missing`, `compute_cap_low`, `arch_mismatch`, `controller_host`, `disk`) are also the gateway's placement refusal codes, spelled identically: the gateway refuses a placement with the code the agent would report.
 
 `image_missing` also covers a malformed digest at parse time. A refusal of the
 decl inside an entry is reported as `decl_invalid` and carries the inner code.
@@ -264,7 +285,8 @@ Every file kind also has `duplicate_key` (see above); in desired-config it is re
 
 **desired-config:** the codes are reasons: `desired_invalid`, `decl_invalid`,
 `image_missing`, `door_leaf_missing`, `admit_invalid`, `env_out_of_bounds`,
-`set_missing`, `set_slot_invalid`.
+`set_missing`, `set_slot_invalid`, `profile_invalid` (from `CheckProfile`, run
+with the paired set manifest).
 
 The first failing rule wins; the fixtures each carry one defect, so order does
 not matter to them. Precedence worth knowing: a refused env prefix wins over
