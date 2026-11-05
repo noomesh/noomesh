@@ -4067,7 +4067,10 @@ fn ensure_pg_data_path(ctx: &mut Ctx, chosen_root: &str, home: &str) {
 /// sudo, and works whoever runs the wizard. Only applied while the dir is
 /// EMPTY — an initialized cluster's ownership is never touched.
 pub(crate) fn ensure_pg_data_ownership(pg: &str) {
-    ensure_dir_ownership(pg, "70:70");
+    // A failed chown is reported by the storage step's owner check, which
+    // finds this empty directory with the wrong owner (a WARN with the
+    // `sudo chown` line), so the result is not needed here.
+    let _ = ensure_dir_ownership(pg, "70:70");
 }
 
 /// Chown an EMPTY service data dir to the uid its container runs as, via a
@@ -4077,14 +4080,20 @@ pub(crate) fn ensure_pg_data_ownership(pg: &str) {
 /// queries.active into a dir owned by whoever ran the wizard — the sandbox
 /// --dist rehearsal hit both. Never touches a non-empty dir: initialized
 /// data keeps whatever ownership it has.
-pub(crate) fn ensure_dir_ownership(dir: &str, owner: &str) {
+pub(crate) fn ensure_dir_ownership(dir: &str, owner: &str) -> Result<(), String> {
     let empty = std::fs::read_dir(dir).map(|mut d| d.next().is_none()).unwrap_or(false);
     if !empty {
-        return;
+        return Ok(());
     }
-    let _ = Command::new("docker")
+    match Command::new("docker")
         .args(["run", "--rm", "-v", &format!("{dir}:/d"), "alpine", "chown", owner, "/d"])
-        .output();
+        .output()
+    {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!("docker chown {owner} exited {}: {}", o.status,
+            String::from_utf8_lossy(&o.stderr).trim().lines().last().unwrap_or(""))),
+        Err(e) => Err(format!("docker chown {owner} could not run: {e}")),
+    }
 }
 
 /// Nonroot service uids per data subdir (observed on the live images:
@@ -4196,16 +4205,137 @@ pub(crate) fn storage_targets_with(names: &[String], state_names: &[String], roo
     out
 }
 
-/// Create one storage directory as the caller, then hand it to its service
-/// uid ([`subdir_owner`], while it is still empty). Onboarding's storage step
-/// and the stack roll both create through here, so a directory a release
-/// adds gets the same owner either way.
-pub(crate) fn create_storage_dir(name: &str, target: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(target)?;
-    if let Some(owner) = subdir_owner(name) {
-        ensure_dir_ownership(&target.to_string_lossy(), owner);
+/// A storage directory's owner as `(uid, gid)`.
+pub(crate) type Owner = (u32, u32);
+
+fn parse_owner(s: &str) -> Option<Owner> {
+    let (u, g) = s.split_once(':')?;
+    Some((u.parse().ok()?, g.parse().ok()?))
+}
+
+/// The data or state root a storage directory `name` (e.g. `models/voice/piper`)
+/// sits under: `target` with `name`'s segments taken off.
+pub(crate) fn storage_base(name: &str, target: &Path) -> PathBuf {
+    let mut b = target.to_path_buf();
+    for _ in name.split('/') {
+        b.pop();
     }
-    Ok(())
+    b
+}
+
+/// Who should own storage directory `name` under `base`: its service uid
+/// ([`subdir_owner`]) when it has one, else whoever owns the root it sits
+/// under, read BEFORE anything is created. A root the operator owns gives
+/// the operator; a root owned by the node agent (pop-os: 993:982, as its
+/// `models`) gives the node agent. Onboarding's storage step, its sudo path
+/// and the stack roll (`noo upgrade`, including a lock-only directory) all
+/// ask here, so no two places decide differently.
+pub(crate) fn intended_owner(name: &str, base: &Path) -> std::io::Result<Owner> {
+    if let Some(o) = subdir_owner(name).and_then(parse_owner) {
+        return Ok(o);
+    }
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(base)?;
+    Ok((m.uid(), m.gid()))
+}
+
+/// The owner check after a create, and over an existing EMPTY directory:
+/// `None` when `dir` is owned by `want`, else what is wrong and the exact
+/// command that fixes it.
+pub(crate) fn owner_mismatch(dir: &Path, want: Owner) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let got = match std::fs::metadata(dir) {
+        Ok(m) => (m.uid(), m.gid()),
+        Err(e) => return Some(format!("{} cannot be read ({e})", dir.display())),
+    };
+    (got != want).then(|| format!("{} is owned by {}:{}, wants {}:{} — sudo chown {}:{} {}",
+        dir.display(), got.0, got.1, want.0, want.1, want.0, want.1, dir.display()))
+}
+
+/// Why a storage directory was not made as it should be.
+#[derive(Debug)]
+pub(crate) enum StorageDirError {
+    /// It could not be created (as this user).
+    Create(std::io::Error),
+    /// It exists, with the wrong owner: the message names both and the chown.
+    Owner(String),
+}
+
+impl std::fmt::Display for StorageDirError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StorageDirError::Create(e) => write!(f, "{e}"),
+            StorageDirError::Owner(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+/// Create one storage directory as the caller and give it its intended
+/// owner ([`intended_owner`]): a service uid through a throwaway container
+/// while it is still empty, or the root's owner. It counts as made only when
+/// it carries that owner; otherwise `Owner` says what it has and the chown.
+/// Missing parents (`models/voice` for `models/voice/piper`) take the root's
+/// owner; an existing parent is never touched.
+pub(crate) fn create_storage_dir(name: &str, target: &Path) -> Result<(), StorageDirError> {
+    let base = storage_base(name, target);
+    let want = intended_owner(name, &base).map_err(StorageDirError::Create)?;
+    let root_owner = intended_owner("", &base).map_err(StorageDirError::Create)?;
+    let made = missing_components(&base, name);
+    std::fs::create_dir_all(target).map_err(StorageDirError::Create)?;
+    let mut problems: Vec<String> = Vec::new();
+    for dir in &made {
+        let w = if dir == target { want } else { root_owner };
+        if owner_mismatch(dir, w).is_none() {
+            continue;
+        }
+        let fixed = if dir == target && subdir_owner(name).is_some() {
+            ensure_dir_ownership(&dir.to_string_lossy(), &format!("{}:{}", w.0, w.1))
+        } else {
+            std::os::unix::fs::chown(dir, Some(w.0), Some(w.1)).map_err(|e| e.to_string())
+        };
+        if let Some(m) = owner_mismatch(dir, w) {
+            problems.push(match fixed {
+                Err(e) => format!("{m} ({e})"),
+                Ok(()) => m,
+            });
+        }
+    }
+    if problems.is_empty() { Ok(()) } else { Err(StorageDirError::Owner(problems.join("; "))) }
+}
+
+/// The components of `base`/`name` that do not exist yet, outermost first:
+/// for `models/voice/piper` with `models` present, `models/voice` and
+/// `models/voice/piper`. Never an existing directory.
+pub(crate) fn missing_components(base: &Path, name: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut cur = base.to_path_buf();
+    for seg in name.split('/') {
+        cur.push(seg);
+        if !cur.exists() {
+            out.push(cur.clone());
+        }
+    }
+    out
+}
+
+/// The sudo fallback for one storage directory, as `install -d` argument
+/// lists: one per MISSING component (GNU `install -d -o -g -m` re-owns and
+/// re-modes a directory that already exists, so an existing parent such as
+/// pop-os's 993:982 `models` must never be passed), each with its owner: the
+/// leaf its [`intended_owner`], a parent the root's owner.
+pub(crate) fn sudo_install_plan(name: &str, target: &Path) -> std::io::Result<Vec<Vec<String>>> {
+    let base = storage_base(name, target);
+    Ok(sudo_install_plan_with(name, target, intended_owner(name, &base)?, intended_owner("", &base)?))
+}
+
+/// [`sudo_install_plan`] with the owners given (the leaf's, the root's).
+pub(crate) fn sudo_install_plan_with(name: &str, target: &Path, want: Owner, root_owner: Owner) -> Vec<Vec<String>> {
+    let base = storage_base(name, target);
+    missing_components(&base, name).into_iter().map(|dir| {
+        let o = if dir == target { want } else { root_owner };
+        vec!["install".into(), "-d".into(), "-o".into(), o.0.to_string(), "-g".into(), o.1.to_string(),
+             "-m".into(), "0755".into(), dir.to_string_lossy().into_owned()]
+    }).collect()
 }
 
 /// Returns how many subdirectories could not be created.
@@ -4227,13 +4357,26 @@ fn ensure_root_dir(ctx: &mut Ctx, root: &Path) {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|s| !s.is_empty())
     };
-    let (Some(uid), Some(gid)) = (id("-u"), id("-g")) else { return };
+    let (Some(uid), Some(gid)) = invoking_user(id("-u"), id("-g"),
+        std::env::var("SUDO_UID").ok(), std::env::var("SUDO_GID").ok()) else { return };
     let ok = ctx_sudo(ctx).args(["install", "-d", "-o", &uid, "-g", &gid, "-m", "0755"]).arg(root)
         .status().map(|s| s.success()).unwrap_or(false);
     if !ok {
         ctx.warn(&format!("could not create {} (sudo install -d failed); create it owned by you and re-run", root.display()));
         sudo_refused(ctx, "data root", &format!("sudo install -d -o {uid} -g {gid} -m 0755 {}", root.display()));
     }
+}
+
+/// The user a NEW data root is created for: this process's `id -u`/`id -g`,
+/// except when the CLI itself runs under sudo (uid 0 with SUDO_UID and
+/// SUDO_GID set), where it is the person who ran sudo, never 0:0.
+pub(crate) fn invoking_user(uid: Option<String>, gid: Option<String>, sudo_uid: Option<String>, sudo_gid: Option<String>)
+    -> (Option<String>, Option<String>) {
+    let numeric = |s: &Option<String>| s.as_deref().is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()));
+    if uid.as_deref() == Some("0") && numeric(&sudo_uid) && numeric(&sudo_gid) {
+        return (sudo_uid, sudo_gid);
+    }
+    (uid, gid)
 }
 
 /// True once a hard failure about storage is on the verdict. Storage is one
@@ -4260,10 +4403,20 @@ fn record_storage_summary_failure(ctx: &mut Ctx, failed: usize, chosen_root: &st
 }
 
 fn create_storage_dirs(ctx: &mut Ctx, root: &Path) -> usize {
-    let (mut created, mut existing, mut failed) = (0, 0, 0);
+    let (mut created, mut existing, mut wrong, mut failed) = (0, 0, 0, 0);
+    let mut owner_lines: Vec<String> = Vec::new();
     for (name, target) in &storage_targets(ctx, root) {
         if target.exists() {
             existing += 1;
+            // An EMPTY directory with the wrong owner is said, with the
+            // chown, never changed; a non-empty one keeps its owner.
+            let empty = std::fs::read_dir(target).map(|mut d| d.next().is_none()).unwrap_or(false);
+            if empty && !ctx.dry_run {
+                if let Some(m) = intended_owner(name, &storage_base(name, target)).ok().and_then(|w| owner_mismatch(target, w)) {
+                    wrong += 1;
+                    ctx.warn(&m);
+                }
+            }
             continue;
         }
         if ctx.dry_run {
@@ -4271,35 +4424,62 @@ fn create_storage_dirs(ctx: &mut Ctx, root: &Path) -> usize {
             continue;
         }
         match create_storage_dir(name, target) {
-            Ok(()) => {
-                created += 1;
+            Ok(()) => created += 1,
+            Err(StorageDirError::Owner(m)) => {
+                wrong += 1;
+                owner_lines.push(m);
             }
-            Err(_) => {
-                // retry with sudo — `-n` unless a person can answer (i267)
-                let ok = ctx_sudo(ctx)
-                    .args(["mkdir", "-p"])
-                    .arg(target)
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                if ok {
-                    created += 1;
-                } else {
-                    failed += 1;
+            Err(StorageDirError::Create(_)) => {
+                // Retry with sudo (`-n` unless a person can answer, i267):
+                // `install -d` with the intended owner, one call per MISSING
+                // component, each re-checked right before it runs.
+                let plan = match sudo_install_plan(name, target) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        failed += 1;
+                        continue;
+                    }
+                };
+                let mut ok = true;
+                for args in &plan {
+                    let dir = Path::new(args.last().map(String::as_str).unwrap_or(""));
+                    if dir.exists() {
+                        continue;
+                    }
+                    ok &= ctx_sudo(ctx).args(args).status().map(|s| s.success()).unwrap_or(false);
+                }
+                let want = intended_owner(name, &storage_base(name, target)).ok();
+                match (ok && target.is_dir(), want.and_then(|w| owner_mismatch(target, w))) {
+                    (true, None) => created += 1,
+                    (true, Some(m)) => {
+                        wrong += 1;
+                        owner_lines.push(m);
+                    }
+                    (false, _) => failed += 1,
                 }
             }
         }
     }
-    let detail = format!("{created} created, {existing} already exist, {failed} failed");
-    if failed > 0 {
+    let detail = format!("{created} created, {existing} already exist, {wrong} wrong owner, {failed} failed");
+    for m in &owner_lines {
+        ctx.warn(m);
+    }
+    if failed > 0 || !owner_lines.is_empty() {
         ctx.warn(&format!("Storage directories ({detail}) under {}", root.display()));
-        if !storage_failure_recorded(ctx) {
+        if failed > 0 && !storage_failure_recorded(ctx) {
             sudo_refused(ctx, &format!("storage ({failed} director(ies) under {})", root.display()), &format!("sudo mkdir -p {}/<each missing directory>, then: noo onboard --only storage", root.display()));
         }
+        if !owner_lines.is_empty() && !storage_failure_recorded(ctx) {
+            ctx.state.hard_failures.push(format!(
+                "storage: {} director{} under {} created with the wrong owner (the chown for each is printed above)",
+                owner_lines.len(), if owner_lines.len() == 1 { "y" } else { "ies" }, root.display()));
+        }
+    } else if wrong > 0 {
+        ctx.warn(&format!("Storage directories ({detail}) under {}", root.display()));
     } else {
         ctx.success(&format!("Storage directories ({detail}) under {}", root.display()));
     }
-    failed
+    failed + owner_lines.len()
 }
 
 fn verify_bind_mount(ctx: &mut Ctx, root: &str) {
@@ -8882,5 +9062,119 @@ mod sudo_seam_tests {
         assert!(script.contains("-w /home/nonroot/.ollama/convert noo-ollama-embed ollama create harrier"), "{script}");
         // Cleaned up after, and the verdict is ollama create's, not rm's.
         assert!(script.contains("rm -rf /home/nonroot/.ollama/convert >/dev/null 2>&1; exit $rc"), "{script}");
+    }
+}
+
+#[cfg(test)]
+mod storage_owner_tests {
+    use super::{create_storage_dir, intended_owner, invoking_user, missing_components, owner_mismatch,
+                storage_base, sudo_install_plan_with, StorageDirError};
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
+
+    fn base(tag: &str) -> PathBuf {
+        let b = std::env::temp_dir().join(format!("noo-owner-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&b);
+        std::fs::create_dir_all(&b).unwrap();
+        b
+    }
+
+    fn owner_of(p: &Path) -> (u32, u32) {
+        let m = std::fs::metadata(p).unwrap();
+        (m.uid(), m.gid())
+    }
+
+    /// GNU `install -d -o -g -m` re-owns an EXISTING directory, so the sudo
+    /// fallback names only what is missing: with `models` present, the
+    /// plan for models/voice/piper is models/voice and models/voice/piper.
+    #[test]
+    fn only_missing_components_are_installed() {
+        let b = base("missing");
+        std::fs::create_dir_all(b.join("models")).unwrap();
+        assert_eq!(missing_components(&b, "models/voice/piper"), vec![b.join("models/voice"), b.join("models/voice/piper")]);
+        assert_eq!(storage_base("models/voice/piper", &b.join("models/voice/piper")), b);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// pop-os 2026-11-05: root 993:982, models 993:982, the voice dirs
+    /// missing, tempo missing. The sudo path gives each its owner and never
+    /// touches `models`.
+    #[test]
+    fn the_pop_os_layout_gets_its_owners() {
+        let b = base("popos");
+        std::fs::create_dir_all(b.join("models")).unwrap();
+        let agent = (993, 982);
+        let plan = sudo_install_plan_with("models/voice/piper", &b.join("models/voice/piper"), agent, agent);
+        let args = |o: (u32, u32), dir: &Path| -> Vec<String> {
+            vec!["install".to_string(), "-d".to_string(), "-o".to_string(), o.0.to_string(), "-g".to_string(),
+                 o.1.to_string(), "-m".to_string(), "0755".to_string(), dir.to_string_lossy().into_owned()]
+        };
+        assert_eq!(plan, vec![args(agent, &b.join("models/voice")), args(agent, &b.join("models/voice/piper"))]);
+        let models = b.join("models").to_string_lossy().into_owned();
+        assert!(!plan.iter().any(|a| a.last() == Some(&models)), "models is never passed");
+        let tempo = sudo_install_plan_with("tempo", &b.join("tempo"), (65532, 65532), agent);
+        assert_eq!(tempo, vec![args((65532, 65532), &b.join("tempo"))]);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// A service dir wants its service uid; any other wants its root's owner.
+    #[test]
+    fn the_intended_owner_is_the_service_uid_else_the_roots_owner() {
+        let b = base("intended");
+        assert_eq!(intended_owner("tempo", &b).unwrap(), (65532, 65532));
+        assert_eq!(intended_owner("postgres", &b).unwrap(), (70, 70));
+        assert_eq!(intended_owner("models/voice/piper", &b).unwrap(), owner_of(&b));
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// The mismatch names the dir, both owners and the exact chown.
+    #[test]
+    fn a_wrong_owner_is_named_with_its_chown() {
+        let b = base("mismatch");
+        let me = owner_of(&b);
+        assert_eq!(owner_mismatch(&b, me), None);
+        let m = owner_mismatch(&b, (65532, 65532)).expect("a mismatch");
+        assert!(m.contains(&format!("is owned by {}:{}", me.0, me.1)) && m.contains("wants 65532:65532"), "{m}");
+        assert!(m.ends_with(&format!("sudo chown 65532:65532 {}", b.display())), "{m}");
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// "Created" only with the intended owner, or a failure that says so: a
+    /// service dir is either 65532-owned afterwards or refused with its chown
+    /// (the throwaway container is not there in every test environment).
+    #[test]
+    fn a_created_dir_has_its_owner_or_says_why_not() {
+        let b = base("create");
+        match create_storage_dir("tempo", &b.join("tempo")) {
+            Ok(()) => assert_eq!(owner_of(&b.join("tempo")), (65532, 65532), "created means owned by its service"),
+            Err(StorageDirError::Owner(m)) => assert!(m.contains("wants 65532:65532") && m.contains("sudo chown 65532:65532"), "{m}"),
+            Err(StorageDirError::Create(e)) => panic!("could not create in a temp dir: {e}"),
+        }
+        create_storage_dir("models/voice/piper", &b.join("models/voice/piper")).unwrap();
+        for d in ["models", "models/voice", "models/voice/piper"] {
+            assert_eq!(owner_of(&b.join(d)), owner_of(&b), "{d} takes its root's owner");
+        }
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// A NEW root is created for the person who ran the CLI: under sudo
+    /// that is SUDO_UID/SUDO_GID, never 0:0.
+    #[test]
+    fn a_new_root_belongs_to_the_invoking_user_never_root_under_sudo() {
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(invoking_user(s("0"), s("0"), s("1000"), s("1000")), (s("1000"), s("1000")));
+        assert_eq!(invoking_user(s("1000"), s("1000"), s("0"), s("0")), (s("1000"), s("1000")), "SUDO_* only matters as root");
+        assert_eq!(invoking_user(s("0"), s("0"), None, None), (s("0"), s("0")), "real root, no sudo");
+        assert_eq!(invoking_user(s("0"), s("0"), s("x"), s("1000")), (s("0"), s("0")), "a non-numeric SUDO_UID is not used");
+    }
+
+    /// The step reports a wrong owner as its own count, never "0 failed".
+    #[test]
+    fn the_summary_counts_wrong_owners() {
+        let code = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&code, "fn create_storage_dirs(");
+        assert!(body.contains("{created} created, {existing} already exist, {wrong} wrong owner, {failed} failed"), "{body}");
+        assert!(!body.contains(".args([\"mkdir\", \"-p\"])"), "no sudo mkdir -p (it makes root:root)");
+        assert!(body.contains("sudo_install_plan(name, target)"));
     }
 }
