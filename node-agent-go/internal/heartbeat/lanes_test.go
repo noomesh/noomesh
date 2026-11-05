@@ -21,6 +21,7 @@ func fixtureInputs() (lanes.Inputs, map[string]string) {
 		"vllm":      "org/old-model",
 		"ollama":    "gemma4:12b",
 		"llamacpp":  "m.gguf",
+		"airllm":    "org/air-model",
 		"embedding": "BAAI/bge-small",
 	}
 	return lanes.Inputs{
@@ -32,14 +33,20 @@ func fixtureInputs() (lanes.Inputs, map[string]string) {
 			{Backend: "ollama", Model: "mystery:7b", Role: "chat"},
 			{Backend: "llamacpp", Model: "m.gguf", Role: ""},
 			{Backend: "reranker", Model: "bge-rerank.gguf", Role: "rerank"},
+			{Backend: "airllm", Model: "org/air-model", Role: "chat"},
 		},
 		Presence: map[string]modelpresence.Entry{
 			"ollama":       {Model: "gemma4:12b", Role: "chat", Present: true},
 			"ollama#embed": {Model: "harrier", Role: "embed", Present: false},
 		},
-		Running:    running,
-		Runtimes:   map[string]string{"vllm": "docker", "ollama": "docker", "llamacpp": "docker", "embedding": "docker"},
-		Containers: map[string]any{"vllm": map[string]any{"running": true, "health": "healthy"}},
+		Running:  running,
+		Runtimes: map[string]string{"vllm": "docker", "ollama": "docker", "llamacpp": "docker", "embedding": "docker", "airllm": "docker"},
+		// airllm runs but has NO entry: no health report, so down, never
+		// serving (i495 item 4).
+		Containers: map[string]any{
+			"vllm":     map[string]any{"running": true, "health": "healthy"},
+			"llamacpp": map[string]any{"running": true, "health": "healthy"},
+		},
 		Ollama: lanes.Ollama{Known: true,
 			OnDisk: map[string]bool{"gemma4:12b": true, "qwen3:4b": true},
 			Loaded: map[string]bool{"gemma4:12b": true}},
@@ -80,8 +87,17 @@ func TestLanesFixtureMatchesBuilder(t *testing.T) {
 			t.Errorf("fixture has no %s lane", s)
 		}
 	}
-	if states["unknown"] != "no presence yet" || states["down"] != "not running" {
-		t.Errorf("unknown/down reasons = %q / %q", states["unknown"], states["down"])
+	hasNoReport := false
+	for _, l := range want["lanes"].([]any) {
+		if m := l.(map[string]any); m["backend"] == "airllm" && m["state"] == "down" && m["reason"] == "no health report" {
+			hasNoReport = true
+		}
+	}
+	if !hasNoReport {
+		t.Error("fixture has no down / no health report lane")
+	}
+	if states["unknown"] != "no presence yet" {
+		t.Errorf("unknown reason = %q", states["unknown"])
 	}
 	if states["loading"] != "reconciling: runtime runs org/old-model" {
 		t.Errorf("loading reason = %q", states["loading"])

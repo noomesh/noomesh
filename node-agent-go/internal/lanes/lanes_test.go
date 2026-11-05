@@ -237,6 +237,35 @@ func TestBuild_States(t *testing.T) {
 			want: []Lane{{"ollama", "gemma4:12b", "chat", StateLoading, ReasonStarting}},
 		},
 		{
+			name: "docker backend running with no containers entry: down, no health report, never serving",
+			in: Inputs{
+				Placed:     []Placed{{"vllm", "org/m", "chat"}},
+				Running:    map[string]string{"vllm": "org/m"},
+				Runtimes:   docker,
+				Containers: map[string]any{"llamacpp": healthy()}, // another backend's entry only
+			},
+			want: []Lane{{"vllm", "org/m", "chat", StateDown, ReasonNoHealthReport}},
+		},
+		{
+			name: "backend_containers omitted (docker list failed): down, no health report",
+			in: Inputs{
+				Placed:   []Placed{{"vllm", "org/m", "chat"}},
+				Running:  map[string]string{"vllm": "org/m"},
+				Runtimes: docker,
+			},
+			want: []Lane{{"vllm", "org/m", "chat", StateDown, ReasonNoHealthReport}},
+		},
+		{
+			name: "health unknown (inspect failed): down, no health report",
+			in: Inputs{
+				Placed:     []Placed{{"vllm", "org/m", "chat"}},
+				Running:    map[string]string{"vllm": "org/m"},
+				Runtimes:   docker,
+				Containers: map[string]any{"vllm": map[string]any{"health": "unknown"}},
+			},
+			want: []Lane{{"vllm", "org/m", "chat", StateDown, ReasonNoHealthReport}},
+		},
+		{
 			name: "unplaced running backend that names its model",
 			in: Inputs{
 				Running:  map[string]string{"llamacpp": "native.gguf", "embedding": "BAAI/bge"},

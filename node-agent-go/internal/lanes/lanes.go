@@ -41,15 +41,21 @@ const (
 // Reasons. The vocabulary is fixed; free text is allowed only after the
 // colon of ReasonReconciling.
 const (
-	ReasonNone           = ""
-	ReasonWarming        = "warming"
-	ReasonStarting       = "starting"
-	ReasonReconciling    = "reconciling: "
-	ReasonNotOnDisk      = "not on disk"
-	ReasonNoPresenceYet  = "no presence yet"
-	ReasonNotLoaded      = "not loaded"
-	ReasonNotRunning     = "not running"
-	ReasonUnhealthy      = "unhealthy"
+	ReasonNone          = ""
+	ReasonWarming       = "warming"
+	ReasonStarting      = "starting"
+	ReasonReconciling   = "reconciling: "
+	ReasonNotOnDisk     = "not on disk"
+	ReasonNoPresenceYet = "no presence yet"
+	ReasonNotLoaded     = "not loaded"
+	ReasonNotRunning    = "not running"
+	ReasonUnhealthy     = "unhealthy"
+	// ReasonNoHealthReport: a non-ollama docker backend runs, but the
+	// heartbeat carries no health report for it (backend_containers omitted
+	// because docker could not be listed, the entry missing, or its health
+	// "unknown" because inspect failed). Not routable: `serving` needs a
+	// report, and `unknown` is reserved for ReasonNoPresenceYet (i495, item 4).
+	ReasonNoHealthReport = "no health report"
 	ReasonUnnamedBackend = "unnamed backend"
 )
 
@@ -270,6 +276,12 @@ func derive(in Inputs, p Placed) (string, string) {
 	case !Same(rm, p.Model):
 		// Not a docker container, so the agent will not replace it.
 		return StateDown, ReasonNotRunning
+	}
+	// A docker backend is `serving` only on a health report that says so. No
+	// report (nil life), or one whose health is "unknown" (inspect failed),
+	// is not evidence of health: down, never serving.
+	if in.Runtimes[p.Backend] == "docker" && (life == nil || health == "unknown") {
+		return StateDown, ReasonNoHealthReport
 	}
 	if life != nil {
 		if r, _ := life["running"].(bool); !r || servingOff || (health != "" && health != "healthy") {

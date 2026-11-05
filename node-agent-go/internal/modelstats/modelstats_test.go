@@ -182,3 +182,38 @@ func TestMergeFillsAndAppends(t *testing.T) {
 		t.Errorf("nothing merged into nothing: %+v", got)
 	}
 }
+
+// i495 item 4: a failed /api/ps is "loaded unknown", never "not loaded".
+func TestParseCheckedFailedPsIsUnknownNotUnloaded(t *testing.T) {
+	got := ParseChecked([]byte(tagsBody), nil, false)
+	if len(got) != 2 {
+		t.Fatalf("models = %+v, want the two on disk", got)
+	}
+	for _, s := range got {
+		if !s.LoadedUnknown || s.Loaded || s.ResidentBytes != 0 || s.VRAMBytes != 0 {
+			t.Errorf("%s = %+v, want LoadedUnknown with nothing claimed", s.Name, s)
+		}
+		b, err := json.Marshal(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		_ = json.Unmarshal(b, &m)
+		for _, k := range []string{"loaded", "resident_bytes", "vram_bytes"} {
+			if _, ok := m[k]; ok {
+				t.Errorf("%s: wire shape carries %q while unknown: %s", s.Name, k, b)
+			}
+		}
+		if m["name"] != s.Name || m["size_bytes"] == nil {
+			t.Errorf("%s: name and size_bytes must still ride: %s", s.Name, b)
+		}
+	}
+	// A ps that ANSWERED with nothing loaded is a fact: loaded:false, 0 bytes.
+	known := ParseChecked([]byte(tagsBody), []byte(`{"models":[]}`), true)
+	b, _ := json.Marshal(known[0])
+	var m map[string]any
+	_ = json.Unmarshal(b, &m)
+	if v, ok := m["loaded"]; !ok || v != false || m["resident_bytes"] != float64(0) {
+		t.Errorf("answered-empty ps must report loaded:false and 0 bytes, got %s", b)
+	}
+}
