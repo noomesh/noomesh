@@ -420,11 +420,15 @@ mod node_choice_tests {
 }
 
 pub async fn role_of(state: &AppState, user: &str) -> Option<Role> {
-    let role: Option<String> = crate::repo::users::enabled_role(&state.db, user)
-        .await
-        .ok()
-        .flatten();
-    role.and_then(|r| r.parse().ok())
+    match crate::repo::users::enabled_role(&state.db, user).await {
+        Ok(role) => role.and_then(|r| r.parse().ok()),
+        // Not "unknown or disabled": the role could not be read. The turn
+        // still runs in process (fail closed), but the log names the cause.
+        Err(e) => {
+            tracing::warn!(user, error = %e, "harness dispatch: the user's role could not be read; running in process");
+            None
+        }
+    }
 }
 
 /// The kind a harness named in its ack. A harness older than 0.6.13
@@ -800,5 +804,18 @@ mod harness_effective_db_error_tests {
         let src = include_str!("dispatch.rs");
         let code = &src[..src.find("mod harness_effective_db_error_tests").expect("this module")];
         assert!(code.contains("Err(e) => return Err(format!(\"{named} is served by node '{node}', but {e}"));
+    }
+}
+
+/// role_of's error is logged as what it is (i460, P3: no wrong reason).
+#[cfg(test)]
+mod role_read_error_tests {
+    #[test]
+    fn an_unreadable_role_is_logged_as_unreadable_not_as_unknown() {
+        let own = crate::test_src::own_code(include_str!("dispatch.rs"));
+        let body = crate::test_src::fn_body(&own, "pub async fn role_of(");
+        assert!(!body.contains(".ok()"), "the read's error must not become None silently: {body}");
+        let err = &body[body.find("Err(e) =>").expect("the error arm")..];
+        assert!(err.contains("the user's role could not be read"), "{err}");
     }
 }
