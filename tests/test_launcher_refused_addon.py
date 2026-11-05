@@ -405,7 +405,7 @@ addons_stop_leftovers addons_stop_disabled; echo "rc=$?"
     return subprocess.run(["bash", "-c", body], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
 
 
-# pai-voice's real shape: an off add-on whose overlay needs a variable
+# The live shape: an off add-on whose overlay needs a variable
 # nothing sets while it is off. Rendering it to `stop` it failed silently.
 NEEDS_UNSET_VAR_OVERLAY = """services:
   noo-rhold:
@@ -442,33 +442,34 @@ def test_a_declared_off_addon_without_its_overlay_is_said(tmp_path: Path) -> Non
     assert "add-on rhold is declared off but its overlay is gone, so its containers were NOT checked: noo doctor orphans" in r.stderr
 
 
-# pop-os 2026-11-05, exactly: `pai-voice: false` in noomesh.yaml renders as
-# `pai-voice=0` (launch_render.rs render_addons), and the hyphenated add-on's
+# The live 2026-11-05 shape, with a fictional name: `rh-voice: false` in
+# noomesh.yaml renders as `rh-voice=0` (launch_render.rs render_addons), and
+# the hyphenated add-on's
 # ONE overlay owns two services, both left crash-looping, its coordinator
 # needing a variable nothing sets while the add-on is off.
-PAI_VOICE_OVERLAY = """services:
-  noo-pai-voice:
-    image: ${NOO_ADDON_IMAGE_PAI_VOICE:-x}
-    container_name: noo-pai-voice
+RH_VOICE_OVERLAY = """services:
+  noo-rh-voice:
+    image: ${NOO_ADDON_IMAGE_RH_VOICE:-x}
+    container_name: noo-rh-voice
     restart: unless-stopped
-  noo-pai-voice-coordinator:
-    image: ${NOO_ADDON_IMAGE_PAI_VOICE_COORDINATOR:-x}
-    container_name: noo-pai-voice-coordinator
+  noo-rh-voice-coordinator:
+    image: ${NOO_ADDON_IMAGE_RH_VOICE_COORDINATOR:-x}
+    container_name: noo-rh-voice-coordinator
     restart: unless-stopped
     volumes:
-      - ${PAI_VOICE_COORDINATOR_SECRETS_DIR:?PAI_VOICE_COORDINATOR_SECRETS_DIR must be set}:/run/secrets:ro
+      - ${RH_VOICE_COORDINATOR_SECRETS_DIR:?RH_VOICE_COORDINATOR_SECRETS_DIR must be set}:/run/secrets:ro
 """
 
 
-def test_pop_os_pai_voice_false_removes_both_of_its_containers(tmp_path: Path) -> None:
-    r = _off_run(tmp_path, PAI_VOICE_OVERLAY, addon="pai-voice",
-                 running=RUNNING_BEFORE + "noo-pai-voice\nnoo-pai-voice-coordinator\n")
+def test_hyphenated_addon_false_removes_both_of_its_containers(tmp_path: Path) -> None:
+    r = _off_run(tmp_path, RH_VOICE_OVERLAY, addon="rh-voice",
+                 running=RUNNING_BEFORE + "noo-rh-voice\nnoo-rh-voice-coordinator\n")
     assert "rc=0" in r.stdout, (r.stdout, r.stderr)
     running = _running(tmp_path)
-    assert not {"noo-pai-voice", "noo-pai-voice-coordinator"} & running, running
+    assert not {"noo-rh-voice", "noo-rh-voice-coordinator"} & running, running
     assert {"gateway", "worker", "postgres", "other-addon"} <= running, running
-    for c in ["noo-pai-voice", "noo-pai-voice-coordinator"]:
-        assert f"- removed {c}: add-on pai-voice is declared off (its data is kept)" in r.stdout, r.stdout
-        assert f"last log lines of {c} (add-on pai-voice, declared off)" in r.stderr, r.stderr
+    for c in ["noo-rh-voice", "noo-rh-voice-coordinator"]:
+        assert f"- removed {c}: add-on rh-voice is declared off (its data is kept)" in r.stdout, r.stdout
+        assert f"last log lines of {c} (add-on rh-voice, declared off)" in r.stderr, r.stderr
     removed = sorted(l for l in (tmp_path / "log").read_text().splitlines() if l.startswith("DOCKER rm -f "))
-    assert removed == ["DOCKER rm -f noo-pai-voice", "DOCKER rm -f noo-pai-voice-coordinator"], removed
+    assert removed == ["DOCKER rm -f noo-rh-voice", "DOCKER rm -f noo-rh-voice-coordinator"], removed
