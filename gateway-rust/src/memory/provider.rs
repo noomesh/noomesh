@@ -712,6 +712,112 @@ fn ownerless_refusal(sid: &str) -> Value {
 /// a fixed message: a database error can quote row values (a duplicate key, a
 /// constraint's columns) from somebody's staged data. The detail goes to the
 /// gateway log as the step and the SQLSTATE only, never the message.
+/// The staged-prune review list (`GET /api/v1/graph/prune/staged`). It is
+/// what an operator reads before restoring, so an empty list must mean
+/// nothing is staged: a read that fails is `{"error": …}` (the route answers
+/// 503), never an empty list (i460).
+pub(crate) async fn prune_staged(db: &sqlx::PgPool, limit: i64, reason: Option<&str>, include_restored: bool) -> Value {
+    match prune_staged_rows(db, limit, reason, include_restored).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "graph_prune_staged_unreadable");
+            json!({ "error": e })
+        }
+    }
+}
+
+async fn prune_staged_rows(db: &sqlx::PgPool, limit: i64, reason: Option<&str>, include_restored: bool) -> Result<Value, String> {
+    let mut sql = String::from(
+        "SELECT staging_id::text, entity_id::text, canonical_name, entity_type, \
+                reason, staged_at::text, restored_at::text, run_id, \
+                jsonb_array_length(COALESCE(payload->'edges', '[]'::jsonb)), \
+                jsonb_array_length(COALESCE(payload->'mentions', '[]'::jsonb)) \
+         FROM graph_prune_staging WHERE 1=1",
+    );
+    if !include_restored {
+        sql.push_str(" AND restored_at IS NULL");
+    }
+    if reason.is_some() {
+        sql.push_str(" AND reason = $2");
+    }
+    sql.push_str(" ORDER BY staged_at DESC LIMIT $1");
+
+    let q = sqlx::query_as::<_, (String, String, String, String, String,
+        String, Option<String>, Option<String>, i32, i32)>(sqlx::AssertSqlSafe(&*sql))
+        .bind(limit);
+    let q = if let Some(r) = reason { q.bind(r) } else { q };
+
+    let rows = match q.fetch_all(db).await {
+        Ok(rows) => rows,
+        // Table missing (42P01): prune never ran, so report empty rather
+        // than 500. Any OTHER error is the error, never "not run yet".
+        Err(e) if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("42P01") => {
+            return Ok(json!({
+                "staged": [], "counts": {},
+                "note": "staging table not created yet — graph_prune has not run",
+            }));
+        }
+        Err(e) => return Err(format!("cannot read the staged entities: {e}")),
+    };
+
+    let staged: Vec<Value> = rows.iter().map(|r| json!({
+        "staging_id": r.0, "entity_id": r.1, "canonical_name": r.2,
+        "entity_type": r.3, "reason": r.4, "staged_at": r.5,
+        "restored_at": r.6, "run_id": r.7,
+        "edge_count": r.8, "mention_count": r.9,
+    })).collect();
+
+    let counts_rows = sqlx::query_as::<_, (String, i64)>(
+        "SELECT reason, COUNT(*) FROM graph_prune_staging \
+         WHERE restored_at IS NULL GROUP BY reason",
+    ).fetch_all(db).await.map_err(|e| format!("cannot read the staged counts: {e}"))?;
+    let mut counts = serde_json::Map::new();
+    for (reason, n) in counts_rows {
+        counts.insert(reason, json!(n));
+    }
+
+    // Staged EDGES (edge-metabolism tier writes graph_edge_prune_staging).
+    // Endpoint names resolved for display; entity may itself be staged, in
+    // which case the name comes back NULL and the UI shows the id prefix.
+    let mut edge_sql = String::from(
+        "SELECT s.staging_id::text, s.edge_id::text, s.rel_type, s.reason, \
+                s.staged_at::text, s.restored_at::text, s.confidence, \
+                se.canonical_name, de.canonical_name, \
+                s.src_entity_id::text, s.dst_entity_id::text \
+         FROM graph_edge_prune_staging s \
+         LEFT JOIN entities se ON se.entity_id = s.src_entity_id \
+         LEFT JOIN entities de ON de.entity_id = s.dst_entity_id \
+         WHERE 1=1",
+    );
+    if !include_restored {
+        edge_sql.push_str(" AND s.restored_at IS NULL");
+    }
+    edge_sql.push_str(" ORDER BY s.staged_at DESC LIMIT $1");
+    let edge_rows = sqlx::query_as::<_, (String, String, String, String, String,
+        Option<String>, Option<f64>, Option<String>, Option<String>, String, String)>(sqlx::AssertSqlSafe(&*edge_sql))
+        .bind(limit)
+        .fetch_all(db).await.map_err(|e| format!("cannot read the staged edges: {e}"))?;
+    let staged_edges: Vec<Value> = edge_rows.iter().map(|r| json!({
+        "staging_id": r.0, "edge_id": r.1, "rel_type": r.2, "reason": r.3,
+        "staged_at": r.4, "restored_at": r.5, "confidence": r.6,
+        "src_name": r.7.clone().unwrap_or_else(|| r.9[..8.min(r.9.len())].to_string()),
+        "dst_name": r.8.clone().unwrap_or_else(|| r.10[..8.min(r.10.len())].to_string()),
+    })).collect();
+    let edge_counts_rows = sqlx::query_as::<_, (String, i64)>(
+        "SELECT reason, COUNT(*) FROM graph_edge_prune_staging \
+         WHERE restored_at IS NULL GROUP BY reason",
+    ).fetch_all(db).await.map_err(|e| format!("cannot read the staged edge counts: {e}"))?;
+    let mut edge_counts = serde_json::Map::new();
+    for (reason, n) in edge_counts_rows {
+        edge_counts.insert(reason, json!(n));
+    }
+
+    Ok(json!({
+        "staged": staged, "counts": counts,
+        "staged_edges": staged_edges, "edge_counts": edge_counts,
+    }))
+}
+
 fn restore_db_error(sid: &str, step: &'static str, e: &sqlx::Error) -> Value {
     let sqlstate = e.as_database_error().and_then(|d| d.code()).map(|c| c.into_owned());
     tracing::warn!(staging_id = sid, step, sqlstate = sqlstate.as_deref().unwrap_or("-"), "graph_prune_restore_failed");
@@ -1292,94 +1398,7 @@ impl NatsTrellion<'_> {
         include_restored: bool,
     ) -> Value {
         self.count("graph.prune_staged").await;
-
-        let mut sql = String::from(
-            "SELECT staging_id::text, entity_id::text, canonical_name, entity_type, \
-                    reason, staged_at::text, restored_at::text, run_id, \
-                    jsonb_array_length(COALESCE(payload->'edges', '[]'::jsonb)), \
-                    jsonb_array_length(COALESCE(payload->'mentions', '[]'::jsonb)) \
-             FROM graph_prune_staging WHERE 1=1",
-        );
-        if !include_restored {
-            sql.push_str(" AND restored_at IS NULL");
-        }
-        if reason.is_some() {
-            sql.push_str(" AND reason = $2");
-        }
-        sql.push_str(" ORDER BY staged_at DESC LIMIT $1");
-
-        let q = sqlx::query_as::<_, (String, String, String, String, String,
-            String, Option<String>, Option<String>, i32, i32)>(sqlx::AssertSqlSafe(&*sql))
-            .bind(limit);
-        let q = if let Some(r) = reason { q.bind(r) } else { q };
-
-        let rows = match q.fetch_all(self.db).await {
-            Ok(rows) => rows,
-            // Table missing → prune never ran; report empty rather than 500
-            Err(_) => {
-                return json!({
-                    "staged": [], "counts": {},
-                    "note": "staging table not created yet — graph_prune has not run",
-                });
-            }
-        };
-
-        let staged: Vec<Value> = rows.iter().map(|r| json!({
-            "staging_id": r.0, "entity_id": r.1, "canonical_name": r.2,
-            "entity_type": r.3, "reason": r.4, "staged_at": r.5,
-            "restored_at": r.6, "run_id": r.7,
-            "edge_count": r.8, "mention_count": r.9,
-        })).collect();
-
-        let counts_rows = sqlx::query_as::<_, (String, i64)>(
-            "SELECT reason, COUNT(*) FROM graph_prune_staging \
-             WHERE restored_at IS NULL GROUP BY reason",
-        ).fetch_all(self.db).await.unwrap_or_default();
-        let mut counts = serde_json::Map::new();
-        for (reason, n) in counts_rows {
-            counts.insert(reason, json!(n));
-        }
-
-        // Staged EDGES (edge-metabolism tier writes graph_edge_prune_staging).
-        // Endpoint names resolved for display; entity may itself be staged, in
-        // which case the name comes back NULL and the UI shows the id prefix.
-        let mut edge_sql = String::from(
-            "SELECT s.staging_id::text, s.edge_id::text, s.rel_type, s.reason, \
-                    s.staged_at::text, s.restored_at::text, s.confidence, \
-                    se.canonical_name, de.canonical_name, \
-                    s.src_entity_id::text, s.dst_entity_id::text \
-             FROM graph_edge_prune_staging s \
-             LEFT JOIN entities se ON se.entity_id = s.src_entity_id \
-             LEFT JOIN entities de ON de.entity_id = s.dst_entity_id \
-             WHERE 1=1",
-        );
-        if !include_restored {
-            edge_sql.push_str(" AND s.restored_at IS NULL");
-        }
-        edge_sql.push_str(" ORDER BY s.staged_at DESC LIMIT $1");
-        let edge_rows = sqlx::query_as::<_, (String, String, String, String, String,
-            Option<String>, Option<f64>, Option<String>, Option<String>, String, String)>(sqlx::AssertSqlSafe(&*edge_sql))
-            .bind(limit)
-            .fetch_all(self.db).await.unwrap_or_default();
-        let staged_edges: Vec<Value> = edge_rows.iter().map(|r| json!({
-            "staging_id": r.0, "edge_id": r.1, "rel_type": r.2, "reason": r.3,
-            "staged_at": r.4, "restored_at": r.5, "confidence": r.6,
-            "src_name": r.7.clone().unwrap_or_else(|| r.9[..8.min(r.9.len())].to_string()),
-            "dst_name": r.8.clone().unwrap_or_else(|| r.10[..8.min(r.10.len())].to_string()),
-        })).collect();
-        let edge_counts_rows = sqlx::query_as::<_, (String, i64)>(
-            "SELECT reason, COUNT(*) FROM graph_edge_prune_staging \
-             WHERE restored_at IS NULL GROUP BY reason",
-        ).fetch_all(self.db).await.unwrap_or_default();
-        let mut edge_counts = serde_json::Map::new();
-        for (reason, n) in edge_counts_rows {
-            edge_counts.insert(reason, json!(n));
-        }
-
-        json!({
-            "staged": staged, "counts": counts,
-            "staged_edges": staged_edges, "edge_counts": edge_counts,
-        })
+        prune_staged(self.db, limit, reason, include_restored).await
     }
 
     async fn graph_prune_restore_entity(&self, sid: &str) -> Value {
@@ -1775,5 +1794,34 @@ mod restore_read_error_tests {
         let stmt = &body[read..end];
         assert!(stmt.contains("Err(e) => return restore_db_error(sid, \"find_existing\", &e),"), "{stmt}");
         assert!(!stmt.contains(".ok()") && !stmt.contains(".unwrap_or"), "the read's error must not become None: {stmt}");
+    }
+}
+
+/// The staged-prune review list is never an empty list on a failed read
+/// (i460).
+#[cfg(test)]
+mod staged_read_error_tests {
+    #[tokio::test]
+    async fn an_unreadable_staging_table_is_an_error_not_an_empty_list() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool");
+        let v = super::prune_staged(&pool, 10, None, false).await;
+        let e = v["error"].as_str().unwrap_or_else(|| panic!("an error, not {v}"));
+        assert!(e.contains("cannot read the staged entities"), "{e}");
+        assert!(v.get("staged").is_none() && v.get("note").is_none(), "no list and no 'not run yet' note: {v}");
+    }
+
+    /// The three reads after the first: a pool that cannot connect fails the
+    /// first, so these are read as source.
+    #[test]
+    fn every_later_staged_read_propagates_its_error() {
+        let own = crate::test_src::own_code(include_str!("provider.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn prune_staged_rows(");
+        assert!(!body.contains(".await.unwrap_or_default()"), "a read's error must not become an empty list");
+        for what in ["the staged counts", "the staged edges", "the staged edge counts"] {
+            assert!(body.contains(&format!("map_err(|e| format!(\"cannot read {what}: ")), "{what}");
+        }
     }
 }

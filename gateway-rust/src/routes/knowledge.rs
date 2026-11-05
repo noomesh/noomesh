@@ -1673,6 +1673,11 @@ async fn graph_prune_staged(
         .memory()
         .graph_prune_staged(limit, params.reason.as_deref(), params.include_restored)
         .await;
+    // The review list before a restore: an unreadable one is a 503 that
+    // names the read, never an empty list (i460).
+    if let Some(e) = body.get("error").and_then(Value::as_str) {
+        return Err(AppError::Unavailable(e.to_string()));
+    }
     Ok(Json(body))
 }
 

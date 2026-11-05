@@ -5288,25 +5288,34 @@ mod tests {
 
 /// The stamp a version table holds, per-system schema first (fresh layout)
 /// then `public` (legacy) — the same resolution order the runners use.
-async fn stamp_of(db: &sqlx::PgPool, schema: &str, table: &str) -> Option<String> {
+async fn stamp_of(db: &sqlx::PgPool, schema: &str, table: &str) -> Result<Option<String>, String> {
     for rel in [format!("{schema}.{table}"), format!("public.{table}")] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(&rel)
             .fetch_one(db)
             .await
-            .ok()?;
+            .map_err(|e| format!("cannot look up {rel}: {e}"))?;
         if exists {
             let v: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT version_num FROM {rel} LIMIT 1")))
                 .fetch_optional(db)
                 .await
-                .ok()
-                .flatten();
+                .map_err(|e| format!("cannot read {rel}: {e}"))?;
             if v.is_some() {
-                return v;
+                return Ok(v);
             }
         }
     }
-    None
+    Ok(None)
+}
+
+/// A stamp as the migration status shows it: the revision, null when the
+/// chain has no stamp, and `unreadable: <error>` when it could not be read,
+/// so a failed read is never mistaken for "no migration" (i460).
+fn stamp_json(stamp: Result<Option<String>, String>) -> Value {
+    match stamp {
+        Ok(v) => json!(v),
+        Err(e) => json!(format!("unreadable: {e}")),
+    }
 }
 
 /// GET /api/db/migrations — mesh (native runner: current, head, ported
@@ -5345,11 +5354,11 @@ async fn db_migrations(State(state): State<Arc<AppState>>) -> AppResult {
         },
         "memory": {
             "owner": "trellion (alembic, applied at its container start)",
-            "current": stamp_of(&state.db, "trellion", "alembic_version_memory").await,
+            "current": stamp_json(stamp_of(&state.db, "trellion", "alembic_version_memory").await),
         },
         "evolve": {
             "owner": "evolve (alembic, evolve overlay)",
-            "current": stamp_of(&state.db, "evolve", "alembic_version_evolve").await,
+            "current": stamp_json(stamp_of(&state.db, "evolve", "alembic_version_evolve").await),
         },
     })))
 }
@@ -5494,5 +5503,23 @@ mod approval_decider_tests {
             let body = &src[start..start + 700];
             assert!(body.contains("require_human_decider("), "{f} must refuse non-person credentials");
         }
+    }
+}
+
+/// A migration stamp that cannot be read says so; it is never shown as
+/// null, which reads as "no migration" (i460).
+#[cfg(test)]
+mod stamp_read_error_tests {
+    #[tokio::test]
+    async fn an_unreadable_stamp_reads_unreadable_not_null() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool");
+        let got = super::stamp_json(super::stamp_of(&pool, "trellion", "alembic_version_memory").await);
+        let s = got.as_str().unwrap_or_else(|| panic!("a string, not {got}"));
+        assert!(s.starts_with("unreadable: cannot look up trellion.alembic_version_memory"), "{s}");
+        assert_eq!(super::stamp_json(Ok(None)), serde_json::Value::Null, "no stamp is still null");
+        assert_eq!(super::stamp_json(Ok(Some("abc".into()))), serde_json::json!("abc"));
     }
 }
