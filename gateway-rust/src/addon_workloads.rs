@@ -363,24 +363,24 @@ mod tests {
         use crate::auth::{RequesterCtx, Role};
         use axum::http::Method;
         let secret = "workload-test-signing-key-not-a-deployed-credential";
-        let token = crate::auth::mint_addon_jwt("svc:pai-voice", &["metrics".into()], 60, secret, None).unwrap();
+        let token = crate::auth::mint_addon_jwt("svc:rhaddon", &["metrics".into()], 60, secret, None).unwrap();
         let claims = crate::auth::verify_token_with(&token, secret, None).unwrap();
-        assert_eq!(claims.sub, "addon:svc:pai-voice");
+        assert_eq!(claims.sub, "addon:svc:rhaddon");
         let requester = RequesterCtx { sub: claims.sub, scopes: claims.scopes,
             role: Role::User, harness: None, act: None };
-        assert!(subject_owns(&requester.sub, "pai-voice"));
+        assert!(subject_owns(&requester.sub, "rhaddon"));
         for tail in ["status", "proxy/v1/worker/ws"] {
-            let own = format!("/api/addon-workloads/pai-voice/voice-worker/{tail}");
+            let own = format!("/api/addon-workloads/rhaddon/voice-worker/{tail}");
             assert!(crate::auth::requester_allows(&requester, &Method::GET, &own));
-            assert!(!proxy_allows(&requester.sub, &own.replace("pai-voice", "other-addon")));
+            assert!(!proxy_allows(&requester.sub, &own.replace("rhaddon", "other-addon")));
         }
-        for path in ["/api/cluster/reservations", "/api/addon-workloads/pai-voice/voice-worker/start"] {
+        for path in ["/api/cluster/reservations", "/api/addon-workloads/rhaddon/voice-worker/start"] {
             assert!(!crate::auth::requester_allows(&requester, &Method::POST, path));
         }
-        for sub in ["svc:pai-voice", "addon:svc:other-addon", "addon:svc:svc:pai-voice", "alice", "addon:svc:"] {
-            assert!(!subject_owns(sub, "pai-voice"), "{sub}");
+        for sub in ["svc:rhaddon", "addon:svc:other-addon", "addon:svc:svc:rhaddon", "alice", "addon:svc:"] {
+            assert!(!subject_owns(sub, "rhaddon"), "{sub}");
         }
-        assert!(!subject_owns("addon:svc:../pai-voice", "../pai-voice"));
+        assert!(!subject_owns("addon:svc:../rhaddon", "../rhaddon"));
     }
 
     #[test]
