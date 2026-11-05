@@ -50,6 +50,13 @@
       "reason": "not running"
     },
     {
+      "backend": "airllm",
+      "model": "org/air-model",
+      "role": "chat",
+      "state": "down",
+      "reason": "no health report"
+    },
+    {
       "backend": "embedding",
       "model": "BAAI/bge-small",
       "role": "embed",
@@ -58,6 +65,7 @@
     }
   ],
   "running_backends": {
+    "airllm": "org/air-model",
     "embedding": "BAAI/bge-small",
     "llamacpp": "m.gguf",
     "ollama": "gemma4:12b",

@@ -3240,9 +3240,10 @@ mod lane_tests {
         assert!(f.non_chat.contains(&"reranker".to_string()) && f.non_chat.contains(&"embedding".to_string()));
         let t = build_table(&[f], &[], &Declarations::default());
         assert!(t.class("org/old-model").is_none() && t.class("org/new-model").is_none());
-        assert_eq!(t.skipped_lanes, vec![(
-            "n1".to_string(), "vllm".to_string(), "org/new-model".to_string(), "lane loading: reconciling: runtime runs org/old-model".to_string(),
-        )]);
+        assert_eq!(t.skipped_lanes, vec![
+            ("n1".to_string(), "vllm".to_string(), "org/new-model".to_string(), "lane loading: reconciling: runtime runs org/old-model".to_string()),
+            ("n1".to_string(), "airllm".to_string(), "org/air-model".to_string(), "lane down: no health report".to_string()),
+        ]);
         let order: Vec<&str> = t.all_chat.as_ref().unwrap().candidates.iter().map(|c| c.model.as_str()).collect();
         assert_eq!(&order[2..], ["qwen3:4b", "mystery:7b"], "on demand, then unconfirmed, after both serving lanes: {order:?}");
     }
