@@ -6089,7 +6089,12 @@ mod clifix_security_tests {
         let c = body.find("confirm_prompt(").expect("absorb-files never confirms");
         let r = body.find("Command::new").expect("no script run");
         assert!(c < r);
-        assert!(body.contains("\"--yes\"") && body.contains("\"-y\""));
+        // The flags live in the parser the handler calls first (i191 D2 pass
+        // 4); its table pins that both spellings are accepted.
+        let p = body.find("parse_absorb_files(args)").expect("the handler parses through parse_absorb_files");
+        assert!(p < c, "the arguments are parsed before anything is asked or run");
+        let parse = body_of(include_str!("security_local.rs"), "pub(crate) fn parse_absorb_files(");
+        assert!(parse.contains("\"--yes\"") && parse.contains("\"-y\""));
     }
 
     #[test]
