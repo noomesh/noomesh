@@ -38,6 +38,33 @@ pub(crate) const ROLES_MEMBER: &str = "db/pgroles.sql";
 /// roles file gets these pre-created NOLOGIN, the way restore-drill does.
 pub(crate) const KNOWN_ROLES: &[&str] = &["noo_app", "noo_trellion", "noo_trellion_ddl", "noo_evolve", "noo_evolve_ddl"];
 
+/// The roles EVERY stack logs in as (the gateway, trellion and its DDL
+/// broker); onboard mints a store password for each. The evolve pair is
+/// used only with the evolve add-on, whose `noo addon enable` mints
+/// `NOO_EVOLVE_DDL_PASSWORD`; without it they are never logged in as.
+pub(crate) const CORE_LOGIN_ROLES: &[&str] = &["noo_app", "noo_trellion", "noo_trellion_ddl"];
+
+/// The evolve add-on's roles, logged in as only when evolve runs.
+pub(crate) const EVOLVE_ROLES: &[&str] = &["noo_evolve", "noo_evolve_ddl"];
+
+/// Does a noomesh.yaml declare `addon` on? `addons:` is the one declaration;
+/// evolve is opt-in, so not stated (or no file) is off.
+pub(crate) fn declared_on(noomesh_yaml: Option<&str>, addon: &str) -> bool {
+    noomesh_yaml
+        .and_then(|t| serde_yaml::from_str::<serde_yaml::Value>(t).ok())
+        .and_then(|v| v.get("addons")?.get(addon)?.as_bool())
+        .unwrap_or(false)
+}
+
+/// Which roles must log in, when the archive's roles file cannot say (an
+/// archive from before it): the roles this install logs in as, read from
+/// the archive's own noomesh.yaml. The core roles always; the evolve pair
+/// when that file declares evolve on.
+pub(crate) fn fallback_login_roles(evolve_on: bool) -> BTreeSet<String> {
+    let evolve: &[&str] = if evolve_on { EVOLVE_ROLES } else { &[] };
+    CORE_LOGIN_ROLES.iter().chain(evolve).map(|r| r.to_string()).collect()
+}
+
 /// The same statement scripts/backup-controller.sh uses: one idempotent DO
 /// block per live `noo_*` role, LOGIN or NOLOGIN as it is now, never
 /// SUPERUSER, CREATEROLE or BYPASSRLS, and no password column read at all.
@@ -367,6 +394,34 @@ DO $r$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'noo_readonly
         let bad = roles_without_password(&created, &login);
         assert_eq!(bad, vec!["noo_app".to_string(), "noo_extra".to_string()], "LOGIN roles the file created; noo_readonly is NOLOGIN");
         assert!(roles_without_password(&BTreeSet::new(), &login).is_empty());
+    }
+
+    /// An archive without a roles file: the five fallback roles came back
+    /// NOLOGIN with no password. The core three are what every stack logs in
+    /// as, so they are the error; the evolve pair is only used with the
+    /// add-on (whose enable step mints their passwords), so it is not.
+    #[test]
+    fn an_old_archive_holds_the_core_roles_to_a_password() {
+        let created: BTreeSet<String> = KNOWN_ROLES.iter().map(|s| s.to_string()).collect();
+        let bad = roles_without_password(&created, &fallback_login_roles(false));
+        assert_eq!(bad, vec!["noo_app".to_string(), "noo_trellion".into(), "noo_trellion_ddl".into()]);
+        assert!(CORE_LOGIN_ROLES.iter().chain(EVOLVE_ROLES).all(|r| KNOWN_ROLES.contains(r)));
+    }
+
+    /// The archive's noomesh.yaml declares evolve on, and the store gave its
+    /// roles no password: the stack would log in as them, so it is an error.
+    #[test]
+    fn an_old_archive_with_evolve_declared_on_holds_its_roles_too() {
+        let yaml = "addons:\n  trellion: true\n  evolve: true\n";
+        assert!(declared_on(Some(yaml), "evolve"));
+        let created: BTreeSet<String> = ["noo_evolve", "noo_evolve_ddl"].iter().map(|s| s.to_string()).collect();
+        let bad = roles_without_password(&created, &fallback_login_roles(declared_on(Some(yaml), "evolve")));
+        assert_eq!(bad, vec!["noo_evolve".to_string(), "noo_evolve_ddl".into()]);
+        // Off, not stated, no file, or unparseable: evolve's roles stay a warning.
+        for off in [Some("addons:\n  evolve: false\n"), Some("addons:\n  trellion: true\n"), None, Some(": not yaml [")] {
+            assert!(!declared_on(off, "evolve"), "{off:?}");
+            assert!(roles_without_password(&created, &fallback_login_roles(declared_on(off, "evolve"))).is_empty());
+        }
     }
 
     #[test]
