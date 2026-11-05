@@ -236,17 +236,24 @@ pub fn for_nodes() -> Vec<Value> {
 
 /// The front door's rule for the workload proxy and status
 /// (`/api/addon-workloads/{addon}/{workload}/proxy/...` and `.../status`): an
-/// add-on's own token (`sub = addon:<addon>`) may reach the routes under ITS
+/// add-on's own token (`sub = addon:svc:<addon>`) may reach the routes under ITS
 /// OWN add-on name and no other. Everything else on the path stays with the
 /// tier gate (an operator passes it anyway).
 pub fn proxy_allows(sub: &str, path: &str) -> bool {
-    let Some(addon) = sub.strip_prefix(crate::auth::ADDON_SUBJECT_PREFIX) else { return false };
-    if addon.is_empty() || !crate::addon_registry::name_ok(addon) {
-        return false;
-    }
     let Some(rest) = path.strip_prefix("/api/addon-workloads/") else { return false };
     let Some((owner, tail)) = rest.split_once('/') else { return false };
-    owner == addon && matches!(tail.split('/').nth(1), Some("proxy") | Some("status"))
+    subject_owns(sub, owner) && matches!(tail.split('/').nth(1), Some("proxy") | Some("status"))
+}
+
+/// Provisioning names consumers `svc:<addon>`; the exchange door preserves
+/// that name in the JWT. Keep legacy explicitly-issued `addon:<addon>` keys
+/// working too. Do not change the authenticated subject forwarded to a worker.
+pub fn subject_owns(sub: &str, addon: &str) -> bool {
+    if !workload_name_ok(addon) {
+        return false;
+    }
+    let Some(consumer) = sub.strip_prefix(crate::auth::ADDON_SUBJECT_PREFIX) else { return false };
+    consumer == addon || consumer.strip_prefix("svc:") == Some(addon)
 }
 
 /// The front door's rule for an add-on's reserve and release (i300 H5): a
@@ -380,6 +387,31 @@ mod tests {
         assert!(!proxy_allows("addon:pai-voice", "/api/cluster/reservations"), "not the reservation API");
         assert!(!proxy_allows("user:alice", "/api/addon-workloads/pai-voice/voice-worker/proxy/x"), "not an add-on token");
         assert!(!proxy_allows("addon:", "/api/addon-workloads//x/proxy/x"));
+    }
+
+    #[test]
+    fn provisioned_consumer_tokens_reach_only_their_own_workload() {
+        use crate::auth::{RequesterCtx, Role};
+        use axum::http::Method;
+        let secret = "workload-test-signing-key-not-a-deployed-credential";
+        let token = crate::auth::mint_addon_jwt("svc:pai-voice", &["metrics".into()], 60, secret, None).unwrap();
+        let claims = crate::auth::verify_token_with(&token, secret, None).unwrap();
+        assert_eq!(claims.sub, "addon:svc:pai-voice");
+        let requester = RequesterCtx { sub: claims.sub, scopes: claims.scopes,
+            role: Role::User, harness: None, act: None };
+        assert!(subject_owns(&requester.sub, "pai-voice"));
+        for tail in ["status", "proxy/v1/worker/ws"] {
+            let own = format!("/api/addon-workloads/pai-voice/voice-worker/{tail}");
+            assert!(crate::auth::requester_allows(&requester, &Method::GET, &own));
+            assert!(!proxy_allows(&requester.sub, &own.replace("pai-voice", "other-addon")));
+        }
+        for path in ["/api/cluster/reservations", "/api/addon-workloads/pai-voice/voice-worker/start"] {
+            assert!(!crate::auth::requester_allows(&requester, &Method::POST, path));
+        }
+        for sub in ["svc:pai-voice", "addon:svc:other-addon", "addon:svc:svc:pai-voice", "alice", "addon:svc:"] {
+            assert!(!subject_owns(sub, "pai-voice"), "{sub}");
+        }
+        assert!(!subject_owns("addon:svc:../pai-voice", "../pai-voice"));
     }
 
     #[test]
