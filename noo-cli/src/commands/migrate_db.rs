@@ -87,7 +87,7 @@ pub(crate) struct DumpTables {
 
 impl DumpTables {
     pub(crate) fn line(&mut self, l: &str) {
-        let l = l.trim_end_matches(|c: char| c == '\n' || c == '\r');
+        let l = l.trim_end_matches(['\n', '\r']);
         if self.in_copy {
             if l == "\\." {
                 self.in_copy = false;
