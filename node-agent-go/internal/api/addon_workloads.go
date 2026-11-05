@@ -20,8 +20,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
-	"io"
 	"net/http"
 	"time"
 
@@ -157,7 +155,9 @@ func (s *Server) handleWorkloadStop(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		TimeoutSecs int `json:"timeout_secs"`
 	}
-	_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body)
+	if !decodeBodyOr400(w, r, 4096, &body) {
+		return
+	}
 	grace := workloadStopGrace
 	if body.TimeoutSecs > 0 && body.TimeoutSecs <= 600 {
 		grace = body.TimeoutSecs
