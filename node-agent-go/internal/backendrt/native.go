@@ -146,8 +146,9 @@ func (n *Native) ModelStats(ctx context.Context) []modelstats.ModelStat {
 	if err != nil {
 		return nil
 	}
-	ps, _ := n.get(ctx, n.ollamaBase+"/api/ps")
-	stats := modelstats.Parse(tags, ps)
+	// A failed /api/ps is "loaded: unknown", not "nothing loaded" (i495).
+	ps, psErr := n.get(ctx, n.ollamaBase+"/api/ps")
+	stats := modelstats.ParseChecked(tags, ps, psErr == nil)
 	laneCeilings.Fill(stats, func(name string) ([]byte, error) {
 		body, _ := json.Marshal(map[string]string{"model": name})
 		return n.send(ctx, http.MethodPost, n.ollamaBase+"/api/show", body)

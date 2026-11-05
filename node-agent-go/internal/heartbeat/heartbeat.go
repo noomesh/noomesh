@@ -202,7 +202,11 @@ func (r *Reporter) lanesReport(p map[string]any) []lanes.Lane {
 		in.Ollama = lanes.Ollama{Known: true, OnDisk: map[string]bool{}, Loaded: map[string]bool{}}
 		for _, m := range ms {
 			in.Ollama.OnDisk[m.Name] = true
-			if m.Loaded {
+			// A model whose loaded state is unknown (/api/ps failed) is not
+			// marked Loaded, so it falls to on_demand/"not loaded" via the
+			// on-disk set: routable, and the first call pays a load at
+			// worst. It is never `serving` on a guess, and never `missing`.
+			if m.Loaded && !m.LoadedUnknown {
 				in.Ollama.Loaded[m.Name] = true
 			}
 		}
@@ -265,23 +269,26 @@ func (r *Reporter) ollamaModelStats() []ModelStat {
 	if strings.HasPrefix(base, "https://") && r.client != nil {
 		client.Transport = r.client.Transport
 	}
-	get := func(path string) []byte {
+	get := func(path string) ([]byte, bool) {
 		resp, err := client.Get(base + path)
 		if err != nil {
-			return nil
+			return nil, false
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			return nil
+			return nil, false
 		}
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return b
+		b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return b, err == nil
 	}
-	tags := get("/api/tags")
-	if tags == nil {
+	tags, tagsOK := get("/api/tags")
+	if !tagsOK {
 		return nil
 	}
-	stats := modelstats.Parse(tags, get("/api/ps"))
+	// /api/ps failing leaves tags answered: every model is listed (it is on
+	// disk) with "loaded" unknown, never reported as not loaded (i495).
+	ps, psOK := get("/api/ps")
+	stats := modelstats.ParseChecked(tags, ps, psOK)
 	r.ceilings.Fill(stats, func(name string) ([]byte, error) {
 		body, _ := json.Marshal(map[string]string{"model": name})
 		resp, err := client.Post(base+"/api/show", "application/json", bytes.NewReader(body))

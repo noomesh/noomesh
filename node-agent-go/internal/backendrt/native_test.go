@@ -425,3 +425,45 @@ func TestSeedHeldRoundTripAndTolerance(t *testing.T) {
 		t.Fatalf("rebuilt: got %v, %v", got, err)
 	}
 }
+
+// i495 item 4: /api/tags answered but /api/ps failed (HTTP 500, or the
+// connection closed): every model is listed with loaded UNKNOWN, not false.
+func TestModelStatsFailedPsIsLoadedUnknown(t *testing.T) {
+	tags := `{"models":[{"name":"ps-fail:12b","size":7000000000,"digest":"i495"}]}`
+	cases := map[string]func(w http.ResponseWriter, r *http.Request){
+		"500": func(w http.ResponseWriter, r *http.Request) { http.Error(w, "boom", http.StatusInternalServerError) },
+		"closed connection": func(w http.ResponseWriter, r *http.Request) {
+			c, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				_ = c.Close()
+			}
+		},
+	}
+	for name, psHandler := range cases {
+		t.Run(name, func(t *testing.T) {
+			n := stub(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/tags":
+					_, _ = w.Write([]byte(tags))
+				case "/api/ps":
+					psHandler(w, r)
+				default:
+					http.NotFound(w, r)
+				}
+			})
+			got := n.ModelStats(context.Background())
+			if len(got) != 1 || got[0].Name != "ps-fail:12b" || got[0].SizeBytes != 7000000000 {
+				t.Fatalf("ModelStats = %+v, want the one model on disk", got)
+			}
+			if !got[0].LoadedUnknown || got[0].Loaded {
+				t.Errorf("failed /api/ps must give loaded unknown, got %+v", got[0])
+			}
+			b, _ := json.Marshal(got[0])
+			var m map[string]any
+			_ = json.Unmarshal(b, &m)
+			if _, ok := m["loaded"]; ok {
+				t.Errorf("wire shape must omit loaded: %s", b)
+			}
+		})
+	}
+}
