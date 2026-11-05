@@ -1792,12 +1792,15 @@ mod voice_space_tests {
 
     #[tokio::test]
     async fn voice_space_policy_survives_the_console_security_layer() {
-        use tower::ServiceExt;
-        let app = axum::Router::new()
+        let app = axum::Router::<()>::new()
             .fallback(|| async { (voice_space_headers(Some("https://mesh.test:8458"), None), "shell") })
             .layer(axum::middleware::from_fn(crate::middleware::security_headers));
-        let response = app.oneshot(axum::http::Request::builder().uri("/voice-space")
-            .body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = reqwest::Client::builder().no_proxy().build().unwrap()
+            .get(format!("http://{address}/voice-space")).send().await.unwrap();
+        server.abort();
         assert_eq!(response.headers()["x-frame-options"], "DENY");
         assert_eq!(response.headers()["permissions-policy"], "geolocation=(), camera=(), microphone=(self \"https://mesh.test:8458\")");
         assert!(response.headers()["content-security-policy"].to_str().unwrap().contains("frame-src https://mesh.test:8458"));
