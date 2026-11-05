@@ -2316,6 +2316,7 @@ pub const PUBLIC_PATHS_EXACT: &[&str] = &[
     // scraper's service leaf, so the scrape authenticates by certificate and
     // everyone else by an Operator-or-Admin login — see METRICS_READ_PATHS.
     "/dashboard",   // alias for /
+    "/voice-space", // console-owned shell; session mint and add-on APIs still require auth
     // The kiosk page. A top-level navigation cannot carry
     // an Authorization header and the bundle is not the secret: the page
     // holds nothing until the host launcher injects a kiosk token, and

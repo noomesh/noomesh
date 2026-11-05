@@ -581,6 +581,12 @@ fn request_host(headers: &HeaderMap) -> Option<&str> {
         .and_then(plain_hostname)
 }
 
+/// Exact isolated origin used by a console-owned embedding page. The same
+/// hostname validation and listener assignment as the session handoff apply.
+pub fn embedding_origin(headers: &HeaderMap, addon: &str) -> Option<String> {
+    Some(format!("https://{}:{}", request_host(headers)?, port_of(addon)?))
+}
+
 /// POST /api/addons/{addon_id}/ui-session — hand the signed-in person over to an add-on's web UI, which is served on an origin of its own (a port of its own on this host). Send the access token as `Authorization: Bearer`; checks the UI's `min_role` and answers a one-time code (30 s, single use, bound to this person and add-on) and the URL `https://<host>:<port>/__noo/session?code=<code>` to navigate to. The add-on origin redeems it and sets its own cookie. 401 without a person's bearer, 403 below the UI's role, 404 when the add-on serves no UI, 503 when it is off or its UI listener is not up.
 async fn ui_session(
     Path(addon_id): Path<String>,
@@ -772,7 +778,7 @@ pub fn redeem_request_ok(headers: &HeaderMap, port: u16) -> bool {
 }
 
 /// `GET /__noo/session?code=…` on the add-on origin: redeem the code (bound
-/// to this browser, top-level navigation only), set this origin's own
+/// to this browser, same-site navigation only), set this origin's own
 /// cookie, clear the binding cookie, go to `/`.
 fn redeem(o: &Origin, query: Option<&str>, headers: &HeaderMap) -> Response {
     let refused = || {
