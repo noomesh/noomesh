@@ -6,6 +6,7 @@ package heartbeat
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"math"
 	"net/http"
@@ -84,7 +85,7 @@ func TestSendHeartbeat_ZeroTotalMemoryStillDelivers(t *testing.T) {
 	cfg := &config.Config{NodeID: "test-node", ControllerURL: srv.URL, Tier: 3}
 	gpu := hardware.NewGPUDetector(nil, "http")
 	coll := metrics.NewCollectorWithSources(gpu,
-		func() float64 { return 0.3 },
+		func() (float64, bool) { return 0.3, true },
 		func() hardware.MemoryInfo { return hardware.MemoryInfo{} })
 	rpt := NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, coll, gpu,
 		func() (map[string]string, error) { return map[string]string{}, nil },
@@ -104,5 +105,49 @@ func TestSendHeartbeat_ZeroTotalMemoryStillDelivers(t *testing.T) {
 	}
 	if _, ok := payload["mem_used_gb"]; ok {
 		t.Errorf("mem_used_gb = %v, want omitted", payload["mem_used_gb"])
+	}
+}
+
+// A CPU that cannot be read: the beat arrives with neither load nor cpu_load
+// (not 0, not null), even though memory is known.
+func TestSendHeartbeat_UnknownCPUOmitsLoadKeys(t *testing.T) {
+	var mu sync.Mutex
+	var raw []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		raw, _ = io.ReadAll(r.Body)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{NodeID: "test-node", ControllerURL: srv.URL, Tier: 3}
+	gpu := hardware.NewGPUDetector(nil, "http")
+	coll := metrics.NewCollectorWithSources(gpu,
+		func() (float64, bool) { return 0, false },
+		func() hardware.MemoryInfo {
+			return hardware.MemoryInfo{TotalKB: 16 << 20, AvailableKB: 4 << 20, AvailableKnown: true}
+		})
+	rpt := NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, coll, gpu,
+		func() (map[string]string, error) { return map[string]string{}, nil },
+		func() int { return 0 })
+	rpt.SendHeartbeat()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if raw == nil {
+		t.Fatal("no heartbeat arrived")
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("body is not JSON: %v", err)
+	}
+	for _, k := range []string{"load", "cpu_load"} {
+		if v, ok := payload[k]; ok {
+			t.Errorf("%s present (%s), want the key absent", k, v)
+		}
+	}
+	if string(payload["mem_used_gb"]) != "12" {
+		t.Errorf("mem_used_gb = %s, want 12", payload["mem_used_gb"])
 	}
 }

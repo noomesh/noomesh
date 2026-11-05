@@ -14,19 +14,19 @@ import (
 
 // SystemMetrics holds a point-in-time snapshot of node resource usage.
 type SystemMetrics struct {
-	Load       float64  `json:"load"`
+	Load       *float64 `json:"load,omitempty"`
 	CPULoad    *float64 `json:"cpu_load,omitempty"`
 	MemUsedGB  *float64 `json:"mem_used_gb,omitempty"`
 	VRAMUsedGB *float64 `json:"vram_used_gb,omitempty"`
 }
 
-// Collector gathers system metrics from /proc and GPU.
+// Collector gathers system metrics from /proc (or the platform equivalent) and GPU.
 type Collector struct {
 	gpu *hardware.GPUDetector
 
 	// Sources, swappable so a test can feed a machine that reports an
 	// impossible memory read. NewCollector wires the real ones.
-	cpuLoad func() float64
+	cpuLoad func() (float64, bool)
 	memInfo func() hardware.MemoryInfo
 
 	// memAvailLog is the last logged availability state, so the warning
@@ -42,7 +42,7 @@ func NewCollector(gpu *hardware.GPUDetector) *Collector {
 
 // NewCollectorWithSources is NewCollector with the CPU and memory readers
 // supplied by the caller.
-func NewCollectorWithSources(gpu *hardware.GPUDetector, cpu func() float64, mem func() hardware.MemoryInfo) *Collector {
+func NewCollectorWithSources(gpu *hardware.GPUDetector, cpu func() (float64, bool), mem func() hardware.MemoryInfo) *Collector {
 	return &Collector{gpu: gpu, cpuLoad: cpu, memInfo: mem}
 }
 
@@ -52,37 +52,43 @@ func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 // compute is the pure half of Collect: the composite load and the memory
 // figure from a CPU load and a memory read. Every division is guarded, so a
 // zero total gives no NaN: memory-used is nil (omitted) and the load is
-// computed from the CPU alone. A non-finite CPU load falls back to 0, which
-// is what a failed loadavg read has always reported.
-func compute(cpuLoad float64, mem hardware.MemoryInfo) (load float64, memUsedGB *float64) {
-	if !finite(cpuLoad) {
-		cpuLoad = 0
+// computed from the CPU alone. An unknown CPU (cpuOK false, or non-finite)
+// makes the load nil, even when memory is known: a false 0 would win
+// routing tiebreaks, and the gateway ranks an absent load last.
+func compute(cpuLoad float64, cpuOK bool, mem hardware.MemoryInfo) (load, memUsedGB *float64) {
+	known := cpuOK && finite(cpuLoad)
+	if mem.TotalKB > 0 && mem.AvailableKnown {
+		avail := math.Min(float64(mem.AvailableKB), float64(mem.TotalKB))
+		used := math.Round((float64(mem.TotalKB)-avail)/1048576.0*10) / 10
+		memUsedGB = &used
 	}
-	if mem.TotalKB <= 0 || !mem.AvailableKnown {
-		return math.Round(math.Min(math.Max(cpuLoad, 0), 1.0)*100) / 100, nil
+	if !known {
+		return nil, memUsedGB
+	}
+	if memUsedGB == nil {
+		l := math.Round(math.Min(math.Max(cpuLoad, 0), 1.0)*100) / 100
+		return &l, nil
 	}
 	avail := math.Min(float64(mem.AvailableKB), float64(mem.TotalKB))
 	memLoad := 1.0 - avail/float64(mem.TotalKB)
-	used := math.Round((float64(mem.TotalKB)-avail)/1048576.0*10) / 10
-	memUsedGB = &used
 	// Composite load: 60% CPU + 40% memory
-	load = math.Round(math.Min(cpuLoad*0.6+memLoad*0.4, 1.0)*100) / 100
-	return load, memUsedGB
+	l := math.Round(math.Min(cpuLoad*0.6+memLoad*0.4, 1.0)*100) / 100
+	return &l, memUsedGB
 }
 
 // Collect gathers current system metrics.
 // Matches Python _get_system_metrics().
 func (c *Collector) Collect() SystemMetrics {
-	m := SystemMetrics{Load: 0.5}
+	var m SystemMetrics
 
-	cpuLoad := c.cpuLoad()
-	if !finite(cpuLoad) {
-		cpuLoad = 0
+	cpuLoad, cpuOK := c.cpuLoad()
+	cpuOK = cpuOK && finite(cpuLoad)
+	if cpuOK {
+		m.CPULoad = &cpuLoad
 	}
-	m.CPULoad = &cpuLoad
 
 	mem := c.memInfo()
-	m.Load, m.MemUsedGB = compute(cpuLoad, mem)
+	m.Load, m.MemUsedGB = compute(cpuLoad, cpuOK, mem)
 	c.noteMemory(mem)
 
 	// VRAM usage

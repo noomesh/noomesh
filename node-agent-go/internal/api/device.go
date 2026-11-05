@@ -138,9 +138,11 @@ func (s *Server) handleDeviceBattery(w http.ResponseWriter, r *http.Request) {
 		"power_source":  ps.PowerSource,
 		"thermal_state": ps.ThermalState,
 		"network_type":  ps.NetworkType,
-		"cpu_load":      hardware.CPULoad(),
 		"mem_total_gb":  float64(mem.TotalKB) / 1024.0 / 1024.0,
 		"mem_used_gb":   float64(mem.TotalKB-mem.AvailableKB) / 1024.0 / 1024.0,
+	}
+	if cpu, ok := hardware.CPULoad(); ok { // unknown is omitted, never 0
+		resp["cpu_load"] = cpu
 	}
 	if ps.TempC != nil {
 		resp["temp_c"] = *ps.TempC
