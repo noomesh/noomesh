@@ -6106,16 +6106,16 @@ mod mac_runner_env_tests {
 /// owns a behaviour (`body`), or reads the whole verb (`verb`).
 #[cfg(test)]
 pub(crate) mod phase_src {
-    fn code() -> &'static str {
-        include_str!("provision.rs").split("#[cfg(test)]").next().expect("non-test source")
+    /// This file as guards read it: comments blanked, every `#[cfg(test)]`
+    /// item removed whole (followup 215, `crate::test_src`).
+    pub(crate) fn code() -> &'static str {
+        static CODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        CODE.get_or_init(|| crate::test_src::own_code(include_str!("provision.rs")))
     }
 
-    /// `fn <name>(` through the first column-0 closing brace.
+    /// `fn <name>(` through its own closing brace; panics when it is gone.
     pub(crate) fn body(name: &str) -> &'static str {
-        let code = code();
-        let start = code.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("fn {name} not found in provision.rs"));
-        let rest = &code[start..];
-        &rest[..rest.find("\n}\n").unwrap_or_else(|| panic!("end of fn {name}"))]
+        crate::test_src::fn_body(code(), &format!("fn {name}("))
     }
 
     /// The ordered phase list of `noo cluster provision`.
