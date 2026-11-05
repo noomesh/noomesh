@@ -403,7 +403,11 @@ the archive carried. A role the stack logs in as that came back without a
 password stops the import with its name; run
 `noo security secrets resync --all`, then `noo onboard --only services`.
 An archive exported before roles were carried gets the known `noo_*`
-roles `NOLOGIN`, and only a non-zero table count is checked.
+roles `NOLOGIN`, and only a non-zero table count is checked; the core
+roles every stack logs in as (`noo_app`, `noo_trellion`,
+`noo_trellion_ddl`), and `noo_evolve` and `noo_evolve_ddl` when the
+archive's own `noomesh.yaml` declares `evolve: true`, must still get their
+password from the secret store, or the import stops the same way.
 
 Order matters — secrets first, or nothing else can start.
 

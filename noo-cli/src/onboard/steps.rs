@@ -5001,9 +5001,8 @@ fn restore_archive_db(ctx: &Ctx, dump: &Path, marker: &Path) -> Result<Vec<Strin
     let gz = std::fs::File::open(dump).map_err(|e| format!("{}: {e}", dump.display()))?;
     mdb::psql(PG, "noomesh", &mut flate2::read::GzDecoder::new(gz), false).map_err(|e| format!("dump: {e}"))?;
 
-    let manifest: Option<serde_json::Value> = dump
-        .parent()
-        .and_then(Path::parent)
+    let archive_root = dump.parent().and_then(Path::parent);
+    let manifest: Option<serde_json::Value> = archive_root
         .and_then(|d| std::fs::read_to_string(d.join("manifest.json")).ok())
         .and_then(|t| serde_json::from_str(&t).ok());
     let expected = manifest.as_ref().and_then(mdb::manifest_tables);
@@ -5012,16 +5011,25 @@ fn restore_archive_db(ctx: &Ctx, dump: &Path, marker: &Path) -> Result<Vec<Strin
     let _ = std::fs::write(marker, "restored\n");
     ctx.success(&format!("Archive database restored: {summary}"));
 
-    if !from_file && !created.is_empty() {
-        // Without a roles file nothing says which of these the stack logs in
-        // as, so this is a pointer rather than a stop.
+    // Which roles must log in: the roles file says; for an older archive,
+    // the roles this install logs in as per the archive's own noomesh.yaml.
+    let login = if from_file {
+        mdb::login_roles(&script)
+    } else {
+        let carried = archive_root.map(|d| d.join("home/noomesh.yaml")).and_then(|p| std::fs::read_to_string(p).ok());
+        mdb::fallback_login_roles(mdb::declared_on(carried.as_deref(), "evolve"))
+    };
+    let no_password = mdb::roles_without_password(&created, &login);
+    let rest: Vec<String> = created.iter().filter(|r| !no_password.contains(*r)).cloned().collect();
+    if !rest.is_empty() {
+        // Created without a password but not logged in as by this stack
+        // (NOLOGIN in the roles file, or the evolve pair without the add-on).
         ctx.warn(&format!(
-            "Role(s) {} were created NOLOGIN with no password; if the stack uses them, run `noo security secrets resync --all`",
-            created.iter().cloned().collect::<Vec<_>>().join(", ")
+            "Role(s) {} came back without a password; if you enable what uses them, run `noo security secrets resync --all`",
+            rest.join(", ")
         ));
     }
-    let login = if from_file { mdb::login_roles(&script) } else { std::collections::BTreeSet::new() };
-    Ok(mdb::roles_without_password(&created, &login))
+    Ok(no_password)
 }
 
 
