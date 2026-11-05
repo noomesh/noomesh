@@ -161,3 +161,7 @@ demo-out/
 
 # Licensed add-ons materialised from their signed bundles (noo addons enable|upgrade)
 /addons/
+
+# Written by test-core's pytest line (CI and scripts/test-core-local.sh).
+.coverage
+coverage.xml
