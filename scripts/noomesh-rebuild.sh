@@ -668,6 +668,10 @@ if [ "$START_STACK" = true ]; then
     # Retired services (config/retired-services.txt): remove a stale container of
     # one BEFORE the up, one line each; nothing else is removed (186b step 4).
     compose_remove_retired .
+    # A licensed add-on declared off: its containers are removed (data kept),
+    # BEFORE the up, so a failing up cannot leave them looping; a core
+    # service found stopped afterwards fails the start.
+    addons_stop_leftovers addons_stop_disabled || exit 1
     check_bind_sources ${RECREATE_SERVICES} || exit 1
     docker compose $COMPOSE_FILES $PROFILE_ARGS up -d --force-recreate ${RECREATE_SERVICES}
 
@@ -675,9 +679,6 @@ if [ "$START_STACK" = true ]; then
     if [ "${TRELLION_STOP_ON_OFF:-}" = "1" ]; then
         docker compose $COMPOSE_FILES -f "$(addons_trellion_overlay)" stop trellion 2>/dev/null || true
     fi
-    # Licensed add-ons switched off: stop the services their overlay OWNS;
-    # a core service found stopped afterwards fails the rebuild.
-    addons_stop_leftovers addons_stop_disabled || exit 1
     if [ "${VOICE_STOP_ON_OFF:-}" = "1" ]; then
         docker compose $COMPOSE_FILES -f "$(addons_voice_overlay)" stop whisper piper 2>/dev/null || true
     fi

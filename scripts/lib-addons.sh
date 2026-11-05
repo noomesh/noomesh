@@ -349,22 +349,48 @@ addons_report_licensed() {
     return 0
 }
 
-# addons_stop_disabled — a licensed add-on switched OFF on a live stack: its
-# overlay is not composed, so `up` never touches its containers. Name the
-# overlay just to reach them, and stop the services it adds.
+# addons_stop_disabled — a licensed add-on (first or third party, one path)
+# declared OFF: its overlay is not composed, so `up` never touches its
+# containers, and with `restart: unless-stopped` a crash-looping one keeps
+# looping (pop-os 2026-11-05: noo-pai-voice and noo-pai-voice-coordinator,
+# off in noomesh.yaml, survived the 0.6.16 roll into its restart-loop check).
+# Each container of THIS install's project whose service is one the overlay
+# OWNS (read from the overlay's TEXT, never rendered: an off add-on's overlay
+# can interpolate variables nothing sets, and rendering it to `stop` it failed
+# silently) is removed, by declaration, the way a retired service is: its last
+# log lines are printed first so the reason it was looping is kept, then
+# `docker rm -f` WITHOUT -v (its volumes and data stay), one line each.
+# A failed removal, or containers it could not list, is said, never hidden.
+# Run BEFORE the whole-stack `up`, so a failing `up` cannot leave them running.
 addons_stop_disabled() {
+    _asd_proj="${COMPOSE_PROJECT_NAME:-noomesh}"
     for _asd_n in $(addon_licensed_names); do
         addon_on "$_asd_n" 0 && continue
-        # A refused add-on's overlay is never composed, not even to stop it:
-        # addons_stop_refused reaches its containers by label instead.
+        # A refused add-on is stopped by addons_stop_refused (it comes back).
         case ",${_NOO_ADDONS_REFUSED}," in *",$_asd_n,"*) continue ;; esac
         _asd_o="$(addon_overlay "$_asd_n" 2>/dev/null)"
-        [ -n "$_asd_o" ] || continue
-        _asd_s="$(addon_own_services "$_asd_o" | tr '\n' ' ')"
-        [ -n "${_asd_s// /}" ] || continue
-        _ADDON_STOPPED="${_ADDON_STOPPED:- }${_asd_s} "
-        # shellcheck disable=SC2086
-        docker compose $COMPOSE_FILES -f "$_asd_o" stop $_asd_s 2>/dev/null || true
+        if [ -z "$_asd_o" ]; then
+            printf '%s\n' "$NOO_ADDON_MAP" | grep -qx "${_asd_n}=0" \
+                && echo "! add-on $_asd_n is declared off but its overlay is gone, so its containers were NOT checked: noo doctor orphans" >&2
+            continue
+        fi
+        for _asd_s in $(addon_own_services "$_asd_o"); do
+            if ! _asd_names="$(docker ps -a --filter "label=com.docker.compose.project=${_asd_proj}" \
+                    --filter "label=com.docker.compose.service=${_asd_s}" --format '{{.Names}}' 2>/dev/null)"; then
+                echo "! could not list the containers of service ${_asd_s} (add-on ${_asd_n}, declared off), so they were NOT removed: noo doctor orphans" >&2
+                continue
+            fi
+            for _asd_c in $_asd_names; do
+                _ADDON_STOPPED="${_ADDON_STOPPED:- }${_asd_s} "
+                echo "last log lines of $_asd_c (add-on $_asd_n, declared off), kept before it is removed:" >&2
+                docker logs --tail 20 "$_asd_c" 2>&1 | sed 's/^/  | /' >&2
+                if docker rm -f "$_asd_c" >/dev/null 2>&1; then
+                    echo "- removed $_asd_c: add-on $_asd_n is declared off (its data is kept)"
+                else
+                    echo "WARNING: could not remove $_asd_c (add-on $_asd_n is declared off): docker rm -f $_asd_c" >&2
+                fi
+            done
+        done
     done
     return 0
 }

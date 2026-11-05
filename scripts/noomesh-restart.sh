@@ -291,6 +291,10 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
         # Retired services (config/retired-services.txt): remove a stale container of
         # one BEFORE the up, one line each; nothing else is removed (186b step 4).
         compose_remove_retired .
+        # A licensed add-on declared off: its containers are removed (data kept),
+        # BEFORE the up, so a failing up cannot leave them looping; a core
+        # service found stopped afterwards fails the start.
+        addons_stop_leftovers addons_stop_disabled || exit 1
         # shellcheck disable=SC2086
         check_bind_sources --no-deps $ACTIVE_SVCS || exit 1
         noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d --no-build --force-recreate $GPU_SCALE $AGENT_SCALE $ADDON_HOLD_SCALE || _up_rc=$?
