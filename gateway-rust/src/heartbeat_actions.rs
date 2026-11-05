@@ -2706,6 +2706,23 @@ async fn action_cluster_health(
 
 // ─── cost_report ───────────────────────────────────────────────────────
 
+/// Token totals over the last `period_days` — direct SQL on
+/// noo_conversations, mirroring the Python
+/// ConversationStore.get_conversation_stats path. `Err` names the read.
+async fn cost_tokens(db: &sqlx::PgPool, period_days: i64) -> Result<(i64, i64), String> {
+    let (tokens_in, tokens_out): (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT COALESCE(SUM(total_tokens_in)::bigint, 0), \
+                COALESCE(SUM(total_tokens_out)::bigint, 0) \
+         FROM noo_conversations \
+         WHERE updated_at > NOW() - ($1::int * INTERVAL '1 day')",
+    )
+    .bind(period_days as i32)
+    .fetch_one(db)
+    .await
+    .map_err(|e| format!("cost_report: cannot read the token totals from noo_conversations: {e}"))?;
+    Ok((tokens_in.unwrap_or(0), tokens_out.unwrap_or(0)))
+}
+
 async fn action_cost_report(
     state: &crate::state::AppState,
     config: &Value,
@@ -2731,20 +2748,9 @@ async fn action_cost_report(
         0.0
     };
 
-    // Token totals over the period — direct SQL on noo_conversations
-    // mirrors the Python ConversationStore.get_conversation_stats path.
-    let (tokens_in, tokens_out): (Option<i64>, Option<i64>) = sqlx::query_as(
-        "SELECT COALESCE(SUM(total_tokens_in)::bigint, 0), \
-                COALESCE(SUM(total_tokens_out)::bigint, 0) \
-         FROM noo_conversations \
-         WHERE updated_at > NOW() - ($1::int * INTERVAL '1 day')",
-    )
-    .bind(period_days as i32)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or((Some(0), Some(0)));
-    let tokens_in = tokens_in.unwrap_or(0);
-    let tokens_out = tokens_out.unwrap_or(0);
+    // Token totals over the period. A failed read fails the run (i460):
+    // a zero would report a $0.00 cost for traffic that was never counted.
+    let (tokens_in, tokens_out) = cost_tokens(&state.db, period_days).await?;
     let cloud_cost =
         (tokens_in as f64 / 1_000_000.0) * cloud_in_per_m
             + (tokens_out as f64 / 1_000_000.0) * cloud_out_per_m;
@@ -3075,6 +3081,163 @@ fn classify_run_issue(
     None
 }
 
+/// What [`action_agent_self_check`] is told to look for.
+#[derive(Clone, Copy)]
+struct SelfCheckParams {
+    lookback_hours: i64,
+    stuck_threshold_minutes: i64,
+    security_spike_threshold: i64,
+    repeat_offender_days: i64,
+    repeat_offender_threshold: i64,
+}
+
+type RecentFailure = (String, Option<String>, String, String, Option<i32>, chrono::DateTime<Utc>, Option<String>, Option<String>);
+
+/// The self-check's six reads. A read that fails is named in `unread`
+/// with its error, never read as "nothing to report" (i460).
+struct SelfCheckReads {
+    recent_failures: Vec<RecentFailure>,
+    repeat_offenders: Vec<(String, Option<String>, i64)>,
+    stuck_cycles: Vec<(String, i32, chrono::DateTime<Utc>)>,
+    failed_cycles: Vec<(String, i32, String)>,
+    security_spikes: Vec<(String, i64)>,
+    active_activities: Vec<(String, String, String, chrono::DateTime<Utc>)>,
+    unread: Vec<String>,
+}
+
+/// One section's rows, or none with the read named in `unread`.
+fn section<T>(name: &str, read: Result<Vec<T>, sqlx::Error>, unread: &mut Vec<String>) -> Vec<T> {
+    match read {
+        Ok(rows) => rows,
+        Err(e) => {
+            unread.push(format!("{name}: {e}"));
+            Vec::new()
+        }
+    }
+}
+
+async fn self_check_reads(db: &sqlx::PgPool, p: &SelfCheckParams) -> SelfCheckReads {
+    let SelfCheckParams { lookback_hours, stuck_threshold_minutes, security_spike_threshold, repeat_offender_days, repeat_offender_threshold } = *p;
+    let mut unread = Vec::new();
+    // ── Section 1: recent heartbeat failures ──────────────────────────
+    let recent_failures: Vec<RecentFailure> = section(
+        "recent heartbeat failures (noo_heartbeat_runs)",
+        sqlx::query_as(
+            "SELECT task_id, task_name, action, status, duration_ms, started_at, error, result_text \
+             FROM noo_heartbeat_runs \
+             WHERE started_at > NOW() - ($1::int * INTERVAL '1 hour') \
+               AND (status = 'error' \
+                    OR COALESCE(BTRIM(error), '') <> '' \
+                    OR (status = 'success' AND COALESCE(duration_ms, 0) < 1000 \
+                        AND NOT (action = ANY($2)) \
+                        AND COALESCE(result_text, '') !~ \
+                            '^\\s*(Skipped:|Thought experiment: (not enough connected entities|no new queries this run))')) \
+             ORDER BY started_at DESC \
+             LIMIT 50",
+        )
+        .bind(lookback_hours as i32)
+        .bind(CHEAP_ACTIONS)
+        .fetch_all(db)
+        .await,
+        &mut unread,
+    );
+
+    // ── Section 2: repeat-offender tasks ──────────────────────────────
+    let repeat_offenders: Vec<(String, Option<String>, i64)> = section(
+        "repeat-offender tasks (noo_heartbeat_runs)",
+        sqlx::query_as(
+        "SELECT task_id, task_name, COUNT(*)::bigint \
+         FROM noo_heartbeat_runs \
+         WHERE status = 'error' \
+           AND started_at > NOW() - ($1::int * INTERVAL '1 day') \
+         GROUP BY task_id, task_name \
+         HAVING COUNT(*) > $2::bigint \
+         ORDER BY COUNT(*) DESC",
+    )
+    .bind(repeat_offender_days as i32)
+    .bind(repeat_offender_threshold)
+    .fetch_all(db)
+    .await,
+        &mut unread,
+    );
+
+    // ── Section 3: stuck self-develop cycles ──────────────────────────
+    let stuck_cycles: Vec<(String, i32, chrono::DateTime<Utc>)> = section(
+        "stuck self-develop cycles (noo_self_develop_log)",
+        sqlx::query_as(
+        "SELECT cycle_id::text, MAX(iteration), MIN(started_at) \
+         FROM noo_self_develop_log \
+         WHERE status = 'running' \
+           AND started_at < NOW() - ($1::int * INTERVAL '1 minute') \
+         GROUP BY cycle_id \
+         ORDER BY MIN(started_at) DESC \
+         LIMIT 20",
+    )
+    .bind(stuck_threshold_minutes as i32)
+    .fetch_all(db)
+    .await,
+        &mut unread,
+    );
+
+    // ── Section 4: failed self-develop cycles ─────────────────────────
+    let failed_cycles: Vec<(String, i32, String)> = section(
+        "failed self-develop cycles (noo_self_develop_log)",
+        sqlx::query_as(
+        "SELECT DISTINCT ON (cycle_id) cycle_id::text, iteration, COALESCE(goal, '') \
+         FROM noo_self_develop_log \
+         WHERE status = 'failed' \
+           AND completed_at > NOW() - ($1::int * INTERVAL '1 hour') \
+         ORDER BY cycle_id, completed_at DESC \
+         LIMIT 20",
+    )
+    .bind(lookback_hours as i32)
+    .fetch_all(db)
+    .await,
+        &mut unread,
+    );
+
+    // ── Section 5: security event spikes ──────────────────────────────
+    let security_spikes: Vec<(String, i64)> = section(
+        "security event spikes (audit log)",
+        crate::repo::audit::spikes_last_hour(db, security_spike_threshold)
+            .await,
+        &mut unread,
+    );
+
+    // ── Section 6: active activities (Phase 3 meta-loop) ──────────────
+    // Flag stalled activities (no progress in stuck_threshold_minutes
+    // applied to a longer scale — 7 days). The digest just lists
+    // active + paused; auto-action on stalled comes in Phase C.
+    let active_activities: Vec<(String, String, String, chrono::DateTime<Utc>)> = section(
+        "active activities (noo_agent_activities)",
+        sqlx::query_as(
+            "SELECT name, kind, status, last_activity_at \
+             FROM noo_agent_activities \
+             WHERE status IN ('active', 'paused') \
+             ORDER BY last_activity_at DESC \
+             LIMIT 20",
+        )
+        .fetch_all(db)
+        .await,
+        &mut unread,
+    );
+
+    SelfCheckReads { recent_failures, repeat_offenders, stuck_cycles, failed_cycles, security_spikes, active_activities, unread }
+}
+
+/// The digest's ending. Anything unread fails the run with the digest as
+/// its error and never prints the all-clear (i460); otherwise the
+/// all-clear is printed only when nothing was found.
+fn finish_self_check(mut out: String, anything_to_report: bool, unread: &[String]) -> Result<String, String> {
+    if !unread.is_empty() {
+        return Err(out);
+    }
+    if !anything_to_report {
+        out.push_str("✅ Nothing notable — all systems clean.\n");
+    }
+    Ok(out)
+}
+
 async fn action_agent_self_check(
     state: &std::sync::Arc<crate::state::AppState>,
     config: &Value,
@@ -3102,95 +3265,26 @@ async fn action_agent_self_check(
 
     let scan_id = uuid::Uuid::new_v4();
 
-    // ── Section 1: recent heartbeat failures ──────────────────────────
-    let recent_failures: Vec<(String, Option<String>, String, String, Option<i32>, chrono::DateTime<Utc>, Option<String>, Option<String>)> =
-        sqlx::query_as(
-            "SELECT task_id, task_name, action, status, duration_ms, started_at, error, result_text \
-             FROM noo_heartbeat_runs \
-             WHERE started_at > NOW() - ($1::int * INTERVAL '1 hour') \
-               AND (status = 'error' \
-                    OR COALESCE(BTRIM(error), '') <> '' \
-                    OR (status = 'success' AND COALESCE(duration_ms, 0) < 1000 \
-                        AND NOT (action = ANY($2)) \
-                        AND COALESCE(result_text, '') !~ \
-                            '^\\s*(Skipped:|Thought experiment: (not enough connected entities|no new queries this run))')) \
-             ORDER BY started_at DESC \
-             LIMIT 50",
-        )
-        .bind(lookback_hours as i32)
-        .bind(CHEAP_ACTIONS)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
-
-    // ── Section 2: repeat-offender tasks ──────────────────────────────
-    let repeat_offenders: Vec<(String, Option<String>, i64)> = sqlx::query_as(
-        "SELECT task_id, task_name, COUNT(*)::bigint \
-         FROM noo_heartbeat_runs \
-         WHERE status = 'error' \
-           AND started_at > NOW() - ($1::int * INTERVAL '1 day') \
-         GROUP BY task_id, task_name \
-         HAVING COUNT(*) > $2::bigint \
-         ORDER BY COUNT(*) DESC",
+    let reads = self_check_reads(
+        &state.db,
+        &SelfCheckParams {
+            lookback_hours,
+            stuck_threshold_minutes,
+            security_spike_threshold,
+            repeat_offender_days,
+            repeat_offender_threshold,
+        },
     )
-    .bind(repeat_offender_days as i32)
-    .bind(repeat_offender_threshold)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-
-    // ── Section 3: stuck self-develop cycles ──────────────────────────
-    // noo_self_develop_log is created by migration 006; tolerate
-    // missing table (DB not migrated yet) by returning empty.
-    let stuck_cycles: Vec<(String, i32, chrono::DateTime<Utc>)> = sqlx::query_as(
-        "SELECT cycle_id::text, MAX(iteration), MIN(started_at) \
-         FROM noo_self_develop_log \
-         WHERE status = 'running' \
-           AND started_at < NOW() - ($1::int * INTERVAL '1 minute') \
-         GROUP BY cycle_id \
-         ORDER BY MIN(started_at) DESC \
-         LIMIT 20",
-    )
-    .bind(stuck_threshold_minutes as i32)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-
-    // ── Section 4: failed self-develop cycles ─────────────────────────
-    let failed_cycles: Vec<(String, i32, String)> = sqlx::query_as(
-        "SELECT DISTINCT ON (cycle_id) cycle_id::text, iteration, COALESCE(goal, '') \
-         FROM noo_self_develop_log \
-         WHERE status = 'failed' \
-           AND completed_at > NOW() - ($1::int * INTERVAL '1 hour') \
-         ORDER BY cycle_id, completed_at DESC \
-         LIMIT 20",
-    )
-    .bind(lookback_hours as i32)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-
-    // ── Section 5: security event spikes ──────────────────────────────
-    let security_spikes: Vec<(String, i64)> =
-        crate::repo::audit::spikes_last_hour(&state.db, security_spike_threshold)
-            .await
-            .unwrap_or_default();
-
-    // ── Section 6: active activities (Phase 3 meta-loop) ──────────────
-    // Flag stalled activities (no progress in stuck_threshold_minutes
-    // applied to a longer scale — 7 days). The digest just lists
-    // active + paused; auto-action on stalled comes in Phase C.
-    let active_activities: Vec<(String, String, String, chrono::DateTime<Utc>)> =
-        sqlx::query_as(
-            "SELECT name, kind, status, last_activity_at \
-             FROM noo_agent_activities \
-             WHERE status IN ('active', 'paused') \
-             ORDER BY last_activity_at DESC \
-             LIMIT 20",
-        )
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    .await;
+    let SelfCheckReads {
+        recent_failures,
+        repeat_offenders,
+        stuck_cycles,
+        failed_cycles,
+        security_spikes,
+        active_activities,
+        unread,
+    } = reads;
 
     // ── Format the digest ─────────────────────────────────────────────
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC");
@@ -3318,9 +3412,18 @@ async fn action_agent_self_check(
         out.push('\n');
     }
 
-    if !anything_to_report {
-        out.push_str("✅ Nothing notable — all systems clean.\n");
-        return Ok(out);
+    if !unread.is_empty() {
+        out.push_str("## ❓ Not checked\n\n");
+        for u in &unread {
+            out.push_str(&format!("- {u}\n"));
+        }
+        out.push('\n');
+    }
+    if !anything_to_report || dispatch_inputs_unread(&unread) {
+        if anything_to_report {
+            out.push_str("_The findings were not handed to the evolve add-on: the reads it acts on were not checked._\n");
+        }
+        return finish_self_check(out, anything_to_report, &unread);
     }
 
     // ── Hand the findings to the add-on ───────────────────────────────
@@ -3363,7 +3466,13 @@ async fn action_agent_self_check(
         }
     }
 
-    Ok(out)
+    finish_self_check(out, anything_to_report, &unread)
+}
+
+/// The two reads the evolve add-on acts on: with either unread, its
+/// findings are incomplete and are not handed over.
+fn dispatch_inputs_unread(unread: &[String]) -> bool {
+    unread.iter().any(|u| u.starts_with("recent heartbeat failures") || u.starts_with("repeat-offender tasks"))
 }
 
 // ─── write_log ─────────────────────────────────────────────────────────
@@ -5759,3 +5868,70 @@ mod backup_retention_tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
+
+#[cfg(test)]
+mod db_read_error_tests {
+    use super::*;
+
+    fn dead_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool")
+    }
+
+    /// i460: a database that cannot answer fails the cost report; it never
+    /// reports 0 tokens and a $0.00 cost.
+    #[tokio::test]
+    async fn a_failed_token_read_fails_the_cost_report() {
+        match cost_tokens(&dead_pool(), 7).await {
+            Err(e) => assert!(e.starts_with("cost_report: cannot read the token totals from noo_conversations"), "{e}"),
+            Ok(t) => panic!("a dead pool read as {t:?} tokens"),
+        }
+    }
+
+    /// i460: each of the self-check's six reads that fails is named, never
+    /// read as an empty section ("nothing to report").
+    #[tokio::test]
+    async fn every_unreadable_self_check_read_is_named_never_nothing_to_report() {
+        let p = SelfCheckParams {
+            lookback_hours: 24,
+            stuck_threshold_minutes: 30,
+            security_spike_threshold: 10,
+            repeat_offender_days: 7,
+            repeat_offender_threshold: 2,
+        };
+        let r = self_check_reads(&dead_pool(), &p).await;
+        let names: Vec<&str> = r.unread.iter().map(|u| u.split(": ").next().unwrap_or("")).collect();
+        assert_eq!(
+            names,
+            [
+                "recent heartbeat failures (noo_heartbeat_runs)",
+                "repeat-offender tasks (noo_heartbeat_runs)",
+                "stuck self-develop cycles (noo_self_develop_log)",
+                "failed self-develop cycles (noo_self_develop_log)",
+                "security event spikes (audit log)",
+                "active activities (noo_agent_activities)",
+            ],
+            "{:?}",
+            r.unread
+        );
+        assert!(dispatch_inputs_unread(&r.unread), "the add-on's inputs were not read");
+    }
+
+    /// The ending: an unread section fails the run with the digest, and the
+    /// all-clear is printed only when everything was read and nothing found.
+    #[test]
+    fn an_unread_section_fails_the_self_check_and_never_prints_the_all_clear() {
+        let unread = vec!["security event spikes (audit log): pool timed out".to_string()];
+        let e = finish_self_check("# digest\n".into(), false, &unread).unwrap_err();
+        assert!(!e.contains("Nothing notable"), "{e}");
+        assert!(finish_self_check("# digest\n".into(), true, &unread).is_err());
+        assert!(!dispatch_inputs_unread(&unread), "spikes are not what the add-on acts on");
+        let clean = finish_self_check("# digest\n".into(), false, &[]).unwrap();
+        assert!(clean.ends_with("✅ Nothing notable — all systems clean.\n"), "{clean}");
+        let found = finish_self_check("# digest\n".into(), true, &[]).unwrap();
+        assert!(!found.contains("Nothing notable"), "{found}");
+    }
+}
+
