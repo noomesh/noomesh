@@ -95,9 +95,13 @@ pub fn router() -> Router<Arc<AppState>> {
 /// file here is a broken image rather than a reason to serve something
 /// else — say so instead of degrading into a blank page.
 async fn serve_index() -> impl IntoResponse {
+    serve_index_with_addon(None).await
+}
+
+async fn serve_index_with_addon(addon: Option<&str>) -> axum::response::Response {
     let path = format!("{}/index.html", crate::paths::UI_WWW_DIR);
     match tokio::fs::read_to_string(&path).await {
-        Ok(content) => axum::response::Html(content).into_response(),
+        Ok(content) => axum::response::Html(voice_space_html(content, addon)).into_response(),
         Err(e) => {
             tracing::error!("dashboard index unreadable at {path}: {e}");
             (
@@ -114,11 +118,20 @@ async fn serve_index() -> impl IntoResponse {
 /// Console-owned shell only; add-on scripts still execute on their isolated
 /// origin. All data and the one-use session handoff remain authenticated.
 async fn serve_voice_space(headers: axum::http::HeaderMap) -> axum::response::Response {
-    let mut response = serve_index().await.into_response();
-    let origin = crate::addon_ui::embedding_origin(&headers, "pai-voice");
+    let configured_addon = std::env::var("NOO_VOICE_SPACE_ADDON").ok();
+    let addon = configured_addon.as_deref().filter(|name| crate::addon_registry::name_ok(name));
+    let mut response = serve_index_with_addon(addon).await;
+    let origin = addon.and_then(|name| crate::addon_ui::embedding_origin(&headers, name));
     let configured = std::env::var("NOO_CSP").ok();
     response.headers_mut().extend(voice_space_headers(origin.as_deref(), configured.as_deref()));
     response
+}
+
+fn voice_space_html(content: String, addon: Option<&str>) -> String {
+    match addon.filter(|name| crate::addon_registry::name_ok(name)) {
+        Some(name) => content.replacen("<head>", &format!("<head><meta name=\"noo-voice-space-addon\" content=\"{name}\">"), 1),
+        None => content,
+    }
 }
 
 fn voice_space_headers(origin: Option<&str>, configured: Option<&str>) -> axum::http::HeaderMap {
@@ -1774,6 +1787,18 @@ mod voice_space_tests {
     use super::*;
 
     #[test]
+    fn voice_space_configuration_cannot_inject_html() {
+        let html = "<html><head></head><body></body></html>";
+        assert!(voice_space_html(html.into(), Some("rhaddon"))
+            .contains("<meta name=\"noo-voice-space-addon\" content=\"rhaddon\">"));
+        for name in [None, Some(""), Some("\"><script>alert(1)</script>"), Some("../rhaddon")] {
+            assert_eq!(voice_space_html(html.into(), name), html);
+        }
+        assert!(include_str!("../../../docker-compose.cluster.yml")
+            .contains("NOO_VOICE_SPACE_ADDON=${NOO_VOICE_SPACE_ADDON:-}"));
+    }
+
+    #[test]
     fn voice_space_delegates_only_to_the_isolated_voice_origin() {
         let origin = "https://mesh.test:8458";
         let headers = voice_space_headers(Some(origin), None);
@@ -1787,7 +1812,7 @@ mod voice_space_tests {
             assert!(!voice_space_headers(Some(origin), Some(custom)).contains_key("content-security-policy"));
         }
         assert!(crate::auth::PUBLIC_PATHS_EXACT.contains(&"/voice-space"));
-        assert!(!crate::auth::PUBLIC_PATHS_EXACT.contains(&"/api/addons/pai-voice/ui-session"));
+        assert!(!crate::auth::PUBLIC_PATHS_EXACT.contains(&"/api/addons/rhaddon/ui-session"));
     }
 
     #[tokio::test]
