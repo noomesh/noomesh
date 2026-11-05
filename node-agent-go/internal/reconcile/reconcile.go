@@ -494,7 +494,15 @@ func (r *Reconciler) ensureModelsDir(ctx context.Context, t *tick) bool {
 // by a process this agent does not own.
 func (r *Reconciler) discoverNative(ctx context.Context, t *tick) bool {
 	// 2. Converge placements.
-	t.running = r.docker.RunningBackends(ctx)
+	running, err := r.docker.RunningBackends(ctx)
+	if err != nil {
+		// Could not ask docker is not "nothing is running": acting on {}
+		// would stop, remove and recreate healthy backends. Skip the pass.
+		slog.Warn("reconcile.docker_list_failed", "error", err,
+			"effect", "tick skipped: no start, recreate or stop this pass")
+		return false
+	}
+	t.running = running
 	// Backends served NATIVELY on this node (darwin: an ollama the operator
 	// runs for Metal access, which Docker on a Mac cannot reach). They are
 	// reported to the controller and routed to like any other backend, but
@@ -519,12 +527,24 @@ func (r *Reconciler) readFloatingRefs(ctx context.Context, t *tick) bool {
 	// Spec-drift signal: the fingerprint we stamped on each running
 	// backend's container (SpecHashLabel), so a changed placement env /
 	// image / port / tls (not just model) triggers a recreate.
-	t.specLabels = r.docker.BackendLabels(ctx, dockerpkg.SpecHashLabel)
+	specLabels, err := r.docker.BackendLabels(ctx, dockerpkg.SpecHashLabel)
+	if err != nil {
+		slog.Warn("reconcile.docker_list_failed", "error", err,
+			"effect", "tick skipped: no start, recreate or stop this pass")
+		return false
+	}
+	t.specLabels = specLabels
 	// Backends still running on a floating ref (`:latest`, no tag) that an
 	// older agent created. The spec hash cannot see it — a placement with
 	// no image of its own hashes the same whichever ref the agent picked —
 	// so it is its own drift signal: recreated once from the pinned ref.
-	t.floating = r.docker.FloatingBackendImages(ctx)
+	floating, err := r.docker.FloatingBackendImages(ctx)
+	if err != nil {
+		slog.Warn("reconcile.docker_list_failed", "error", err,
+			"effect", "tick skipped: no start, recreate or stop this pass")
+		return false
+	}
+	t.floating = floating
 	return true
 }
 

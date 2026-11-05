@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelstats"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,8 +40,8 @@ type Reporter struct {
 	cfg         *config.Config
 	client      *http.Client
 	collector   *metrics.Collector
-	gpu         *hardware.GPUDetector
-	getBackends func() map[string]string
+	gpu         hardware.GPUProbe
+	getBackends func() (map[string]string, error)
 	// dataMounts: managed backend containers' host mount sources (1253).
 	dataMounts func() (map[string][]string, error)
 	// getRuntimes reports WHICH runtime serves each running backend —
@@ -146,6 +148,10 @@ type Reporter struct {
 	// loop's goroutine (SendHeartbeat is not called concurrently).
 	failStreak  int
 	silentSince time.Time
+
+	// gpuProbeErr is the last GPU-probe error that was logged, so a probe
+	// that keeps failing the same way warns once per change, not every beat.
+	gpuProbeErr string
 }
 
 // NewReporter creates a heartbeat reporter.
@@ -153,8 +159,8 @@ func NewReporter(
 	cfg *config.Config,
 	client *http.Client,
 	collector *metrics.Collector,
-	gpu *hardware.GPUDetector,
-	getBackends func() map[string]string,
+	gpu hardware.GPUProbe,
+	getBackends func() (map[string]string, error),
 	activeJobs func() int,
 ) *Reporter {
 	return &Reporter{
@@ -466,18 +472,12 @@ func (r *Reporter) SendHeartbeat() {
 	m := r.collector.Collect()
 	clk.mark("metrics")
 
-	gpuModel := r.cfg.GPUModel
-	if gpuModel == "" {
-		gpuModel = r.gpu.DetectModel()
-	}
-	vramGB := r.cfg.VRAMGB
-	if vramGB == 0 {
-		vramGB = r.gpu.DetectVRAM()
-	}
+	gpuModel, vramGB, gpuErr := r.gpuIdentity()
+	r.redetectCaps(gpuErr)
 	clk.mark("gpu_identity")
 	power := hardware.ReadPowerStatus()
 	clk.mark("power")
-	backends := r.getBackends()
+	backends, backendsErr := r.getBackends()
 	clk.mark("backends")
 	jobs := r.activeJobs()
 	clk.mark("jobs")
@@ -490,19 +490,16 @@ func (r *Reporter) SendHeartbeat() {
 	clk.mark("sensors")
 
 	payload := map[string]any{
-		"load":             m.Load,
-		"running_backends": backends,
-		"self_node":        r.cfg.SelfNode,
-		"active_jobs":      jobs,
-		"cpu_load":         m.CPULoad,
-		"mem_used_gb":      m.MemUsedGB,
-		"vram_used_gb":     m.VRAMUsedGB,
-		"gpu_model":        gpuModel,
-		"cpu_cores":        hardware.CPUCores(),
-		"ram_gb":           hardware.TotalMemoryGB(),
-		"vram_gb":          vramGB,
-		"tier":             r.cfg.Tier,
-		"ip_address":       hostIP,
+		"load":         m.Load,
+		"self_node":    r.cfg.SelfNode,
+		"active_jobs":  jobs,
+		"cpu_load":     m.CPULoad,
+		"mem_used_gb":  m.MemUsedGB,
+		"vram_used_gb": m.VRAMUsedGB,
+		"cpu_cores":    hardware.CPUCores(),
+		"ram_gb":       hardware.TotalMemoryGB(),
+		"tier":         r.cfg.Tier,
+		"ip_address":   hostIP,
 		// Interface this node published its control API on. Empty
 		// or 0.0.0.0 = all interfaces; a tailnet IP = confined to the overlay.
 		// Broadcast so the controller/dashboard can verify each node's binding.
@@ -517,6 +514,20 @@ func (r *Reporter) SendHeartbeat() {
 		// Report our own control-API URL (see agentURL).
 		"agent_url":      selfURL,
 		"active_sensors": sensors,
+	}
+	// running_backends: omitted when docker could not be asked. The gateway
+	// stores an omitted key as {}, so routing fails closed for this beat,
+	// which is wanted; sending {} would say "nothing runs" as a fact.
+	if backendsErr != nil {
+		slog.Warn("heartbeat omits running_backends: docker could not be asked", "error", backendsErr)
+	} else {
+		payload["running_backends"] = backends
+	}
+	// gpu_model / vram_gb: omitted when the GPU probe failed, so the gateway
+	// keeps the last value instead of recording a GPU node as CPU-only.
+	if gpuErr == nil {
+		payload["gpu_model"] = gpuModel
+		payload["vram_gb"] = vramGB
 	}
 	r.companionTelemetry(payload, power)
 	setDialableAddress(payload, hostIP, selfURL)
@@ -559,7 +570,10 @@ func (r *Reporter) SendHeartbeat() {
 
 	if resp.StatusCode == 404 {
 		slog.Warn("heartbeat 404, re-registering")
-		caps := hardware.Detect(r.cfg, r.gpu)
+		caps, capsErr := hardware.Detect(r.cfg, r.gpu, r.caps)
+		if capsErr != nil {
+			slog.Warn("gpu probe failed while re-registering; keeping the previous GPU capability", "error", capsErr)
+		}
 		hostIP := DetectHostIP(r.cfg)
 		r.Register(caps, hostIP)
 		r.noteOutcome(clk, nil)
@@ -888,4 +902,57 @@ func (r *Reporter) controlTransports() map[string]bool {
 	rpc := r.natsRPC != nil && r.natsRPC()
 	tun := r.tunnel != nil && r.tunnel()
 	return map[string]bool{"https_listener": true, "nats_rpc": rpc, "tunnel": tun}
+}
+
+// gpuIdentity is the beat's gpu_model and vram_gb: the configured value, else
+// the probe's. A failed probe returns an error and the caller omits both keys
+// (the gateway keeps the stored value of an omitted key), instead of
+// reporting "" and 0 for a GPU node. Warns once per change of the error.
+func (r *Reporter) gpuIdentity() (model string, vramGB float64, err error) {
+	model = r.cfg.GPUModel
+	if model == "" {
+		m, merr := r.gpu.DetectModel()
+		model, err = m, merr
+	}
+	vramGB = r.cfg.VRAMGB
+	if vramGB == 0 {
+		v, verr := r.gpu.DetectVRAM()
+		vramGB, err = v, errors.Join(err, verr)
+	}
+	if err != nil {
+		if msg := err.Error(); msg != r.gpuProbeErr {
+			r.gpuProbeErr = msg
+			slog.Warn("gpu probe failed; heartbeat omits gpu_model and vram_gb so the controller keeps the last value",
+				"error", err)
+		}
+		return "", 0, err
+	}
+	if r.gpuProbeErr != "" {
+		r.gpuProbeErr = ""
+		slog.Info("gpu probe recovered")
+	}
+	return model, vramGB, nil
+}
+
+// redetectCaps re-runs hardware.Detect on a beat while the registered
+// capabilities came from a failed probe, once the probe answers again. When
+// the capabilities changed it re-registers with them: Register is the same
+// call the 404 path makes, and it refreshes the echo every beat carries.
+func (r *Reporter) redetectCaps(probeErr error) {
+	if r.caps == nil || !r.caps.ProbeIncomplete || probeErr != nil {
+		return
+	}
+	caps, err := hardware.Detect(r.cfg, r.gpu, r.caps)
+	if err != nil {
+		return
+	}
+	old := *r.caps
+	old.ProbeIncomplete = false
+	if reflect.DeepEqual(old, caps) {
+		r.caps = &caps
+		return
+	}
+	slog.Info("gpu probe recovered; re-registering with the detected capabilities",
+		"gpu_model", caps.GPUModel, "vram_gb", caps.VRAMGB, "backends", caps.Backends)
+	r.Register(caps, DetectHostIP(r.cfg))
 }

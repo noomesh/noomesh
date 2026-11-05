@@ -16,18 +16,22 @@ type fakeGPU struct {
 	vram  float64
 	count int
 	model string
+	err   error // every probe fails with this
 }
 
-func (f fakeGPU) DetectVRAM() float64 { return f.vram }
-func (f fakeGPU) DetectCount() int    { return f.count }
-func (f fakeGPU) DetectModel() string { return f.model }
+func (f fakeGPU) DetectVRAM() (float64, error) { return f.vram, f.err }
+func (f fakeGPU) DetectCount() (int, error)    { return f.count, f.err }
+func (f fakeGPU) DetectModel() (string, error) { return f.model, f.err }
 
 // A stale GPU_MODEL env on a GPU-less host (e.g. a Pi provisioned from a
 // laptop's config) must not be advertised as a real GPU. With no nvidia-smi
 // present, DetectVRAM/DetectCount return 0, so the env model is cleared.
 func TestDetect_ClearsStaleGPUEnvWhenNoHardware(t *testing.T) {
 	// No GPU detected, whatever this machine actually has.
-	caps := Detect(&config.Config{GPUModel: "NVIDIA GeForce RTX 3080 Laptop GPU"}, fakeGPU{})
+	caps, err := Detect(&config.Config{GPUModel: "NVIDIA GeForce RTX 3080 Laptop GPU"}, fakeGPU{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if caps.GPUModel != "" {
 		t.Errorf("expected GPUModel cleared when no VRAM/GPU detected, got %q", caps.GPUModel)
 	}
@@ -40,7 +44,10 @@ func TestDetect_ClearsStaleGPUEnvWhenNoHardware(t *testing.T) {
 // hardware (e.g. nvidia-smi unreachable inside the container) — keep the
 // declared model.
 func TestDetect_KeepsGPUEnvWhenVRAMDeclared(t *testing.T) {
-	caps := Detect(&config.Config{GPUModel: "RTX 3060", VRAMGB: 12.0}, fakeGPU{})
+	caps, err := Detect(&config.Config{GPUModel: "RTX 3060", VRAMGB: 12.0}, fakeGPU{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if caps.GPUModel != "RTX 3060" {
 		t.Errorf("expected declared GPUModel kept when VRAM declared, got %q", caps.GPUModel)
 	}

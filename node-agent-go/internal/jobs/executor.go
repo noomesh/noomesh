@@ -423,7 +423,10 @@ func (e *Executor) executeInference(ctx context.Context, payload map[string]any,
 	prompt, _ := payload["prompt"].(string)
 	model, _ := payload["model"].(string)
 
-	backends := e.docker.RunningBackends(ctx)
+	backends, err := e.docker.RunningBackends(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("docker unavailable: could not list running backends: %w", err)
+	}
 	if backend == "" {
 		for _, b := range []string{"vllm", "llamacpp", "ollama"} {
 			if _, ok := backends[b]; ok {

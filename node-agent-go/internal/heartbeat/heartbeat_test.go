@@ -43,7 +43,7 @@ func newTestReporter(t *testing.T, serverURL string, cfg *config.Config) *Report
 	gpu := hardware.NewGPUDetector(nil, "http")
 	coll := metrics.NewCollector(gpu)
 	return NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, coll, gpu,
-		func() map[string]string { return map[string]string{} },
+		func() (map[string]string, error) { return map[string]string{}, nil },
 		func() int { return 0 },
 	)
 }
@@ -152,7 +152,7 @@ func TestReporter_HeartbeatPayload(t *testing.T) {
 	gpu := hardware.NewGPUDetector(nil, "http")
 	coll := metrics.NewCollector(gpu)
 	rpt := NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, coll, gpu,
-		func() map[string]string { return map[string]string{"vllm": "Qwen/Qwen3-8B"} },
+		func() (map[string]string, error) { return map[string]string{"vllm": "Qwen/Qwen3-8B"}, nil },
 		func() int { return 3 },
 	)
 	rpt.cfg.ControllerURL = server.URL
@@ -204,7 +204,7 @@ func TestReporter_AuthHeader(t *testing.T) {
 	gpu := hardware.NewGPUDetector(nil, "http")
 	coll := metrics.NewCollector(gpu)
 	rpt := NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, coll, gpu,
-		func() map[string]string { return map[string]string{} },
+		func() (map[string]string, error) { return map[string]string{}, nil },
 		func() int { return 0 },
 	)
 	rpt.cfg.ControllerURL = server.URL
@@ -312,7 +312,7 @@ func TestReporter_RunCancellation(t *testing.T) {
 	gpu := hardware.NewGPUDetector(nil, "http")
 	coll := metrics.NewCollector(gpu)
 	rpt := NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, coll, gpu,
-		func() map[string]string { return map[string]string{} },
+		func() (map[string]string, error) { return map[string]string{}, nil },
 		func() int { return 0 },
 	)
 
@@ -993,7 +993,7 @@ func TestFirstHeartbeatAfterRestartReportsSeededHeldModel(t *testing.T) {
 		cfg := &config.Config{NodeID: "test-node", ControllerURL: ctrl.URL, Tier: 3}
 		gpu := hardware.NewGPUDetector(nil, "http")
 		rpt := NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, metrics.NewCollector(gpu), gpu,
-			func() map[string]string { return lane.Running(context.Background()) },
+			func() (map[string]string, error) { return lane.Running(context.Background()), nil },
 			func() int { return 0 },
 		)
 		rpt.SendHeartbeat()

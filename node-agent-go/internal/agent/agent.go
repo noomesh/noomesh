@@ -104,8 +104,20 @@ func (a *Agent) lifeCtx() context.Context {
 }
 
 func (a *Agent) runningBackends() map[string]string {
-	out, _ := a.runningBackendsWithRuntime()
+	out, _, _ := a.runningBackendsWithRuntime()
 	return out
+}
+
+// runningBackendsChecked is runningBackends for the heartbeat: a docker list
+// error is returned, not folded into the map, so the beat can omit
+// `running_backends` ("could not ask docker") instead of reporting what
+// remained (native + harness) as everything that runs.
+func (a *Agent) runningBackendsChecked() (map[string]string, error) {
+	out, _, err := a.runningBackendsWithRuntime()
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // runningBackendsWithRuntime is the same map plus WHICH runtime serves each
@@ -123,8 +135,17 @@ func (a *Agent) runningBackends() map[string]string {
 // platform: once a native llama-server exists, "managed" becomes a
 // per-BACKEND fact on the same node, and a platform assumption would be
 // wrong again.
-func (a *Agent) runningBackendsWithRuntime() (map[string]string, map[string]string) {
-	out := a.docker.RunningBackends(a.lifeCtx())
+//
+// err is the docker list error (the map is then only the native and harness
+// part, and incomplete): the mesh and gossip callers still use it, the
+// heartbeat does not.
+func (a *Agent) runningBackendsWithRuntime() (map[string]string, map[string]string, error) {
+	out, err := a.docker.RunningBackends(a.lifeCtx())
+	if err != nil {
+		slog.Warn("docker.running_backends_failed", "error", err,
+			"effect", "heartbeat omits running_backends this beat; mesh and gossip list native backends only")
+		out = map[string]string{}
+	}
 	rt := make(map[string]string, len(out))
 	for b := range out {
 		rt[b] = "docker"
@@ -144,12 +165,12 @@ func (a *Agent) runningBackendsWithRuntime() (map[string]string, map[string]stri
 		out["harness"] = "auto"
 		rt["harness"] = a.harness.Runtime()
 	}
-	return out, rt
+	return out, rt, err
 }
 
 // backendRuntimes is the runtime map alone, for the heartbeat.
 func (a *Agent) backendRuntimes() map[string]string {
-	_, rt := a.runningBackendsWithRuntime()
+	_, rt, _ := a.runningBackendsWithRuntime()
 	return rt
 }
 
@@ -225,7 +246,7 @@ func New(cfg *config.Config) (*Agent, error) {
 	// Heartbeat reporter
 	hb := heartbeat.NewReporter(
 		cfg, httpClient, coll, gpu,
-		func() map[string]string { return a.runningBackends() },
+		func() (map[string]string, error) { return a.runningBackendsChecked() },
 		func() int { return 0 }, // updated after jobs executor is wired
 	)
 	if bc := backendContainersOf(docker, cfg.Tier); bc != nil {
@@ -323,7 +344,11 @@ func (a *Agent) Run() error {
 	}
 
 	// 3. Register with controller (retry until available)
-	caps := hardware.Detect(a.cfg, a.gpu)
+	caps, capsErr := hardware.Detect(a.cfg, a.gpu, nil)
+	if capsErr != nil {
+		slog.Warn("gpu probe failed at registration; keeping the configured GPU capability and re-detecting on later heartbeats",
+			"error", capsErr)
+	}
 	hostIP := heartbeat.DetectHostIP(a.cfg)
 	slog.Info("registering with controller", "ip", hostIP)
 
@@ -359,7 +384,7 @@ func (a *Agent) Run() error {
 	// Derives its watch list from container configs each cycle; verdicts
 	// ride the /gpu payload for the controller's gpu_health evaluator.
 	if caps.GPUCount > 0 {
-		wd := gpuwatch.New(a.docker, func() bool { return a.gpu.DetectModel() != "" })
+		wd := gpuwatch.New(a.docker, func() bool { m, _ := a.gpu.DetectModel(); return m != "" })
 		// A backend that ANSWERS is never restarted on a GPU probe alone.
 		// The container name is `noo-<backend>`, which is the same mapping
 		// the inference proxy uses to address it.
@@ -559,7 +584,7 @@ func (a *Agent) startMessaging(ctx context.Context) {
 	// Re-wire heartbeat with job count + bus status
 	a.hb = heartbeat.NewReporter(
 		a.cfg, a.http, a.coll, a.gpu,
-		a.runningBackends,
+		a.runningBackendsChecked,
 		a.jobs.ActiveCount,
 	)
 	a.hb.SetBusStatus(func() any { return a.busStatus() })

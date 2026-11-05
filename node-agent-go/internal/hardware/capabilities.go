@@ -4,6 +4,7 @@
 package hardware
 
 import (
+	"errors"
 	"runtime"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
@@ -44,6 +45,10 @@ type Capabilities struct {
 	// heartbeats. Raw on purpose: the model→family mapping stays in its one
 	// canonical home (noo-cli `sbc_family_from_model`), never copied here.
 	DeviceTreeModel string `json:"device_tree_model,omitempty"`
+
+	// ProbeIncomplete: the GPU probe failed when this was built, so the GPU
+	// fields are configured/previous values, not measurements. Not sent.
+	ProbeIncomplete bool `json:"-"`
 }
 
 // detectGPUAPI reports which GPU compute API this node exposes. Today the
@@ -72,29 +77,57 @@ func detectGPUAPI(gpuModel string) string {
 //
 // *GPUDetector satisfies this already; no call site changes.
 type GPUProbe interface {
-	DetectVRAM() float64
-	DetectCount() int
-	DetectModel() string
+	DetectVRAM() (float64, error)
+	DetectCount() (int, error)
+	DetectModel() (string, error)
 }
 
 // Detect gathers hardware capabilities for this node.
-func Detect(cfg *config.Config, gpu GPUProbe) Capabilities {
+//
+// A GPU probe that FAILS (timeout, non-zero exit, unparseable output) is not
+// "no GPU": the returned error is non-nil, Capabilities.ProbeIncomplete is set,
+// and the GPU fields come from the configuration, then from prev (the
+// capabilities already registered, nil at boot), so a GPU node does not lose
+// vllm/airllm because nvidia-smi was briefly slow. The caller re-runs Detect
+// until the error clears. An absent nvidia-smi is a clean "no GPU".
+func Detect(cfg *config.Config, gpu GPUProbe, prev *Capabilities) (Capabilities, error) {
+	var probeErr error
 	vram := cfg.VRAMGB
 	if vram == 0 {
-		vram = gpu.DetectVRAM()
+		v, err := gpu.DetectVRAM()
+		vram, probeErr = v, errors.Join(probeErr, err)
 	}
-	gpuCount := gpu.DetectCount()
+	gpuCount, err := gpu.DetectCount()
+	probeErr = errors.Join(probeErr, err)
 
 	gpuModel := cfg.GPUModel
 	if gpuModel == "" {
-		gpuModel = gpu.DetectModel()
+		m, err := gpu.DetectModel()
+		gpuModel, probeErr = m, errors.Join(probeErr, err)
 	}
-	// Don't advertise a GPU the hardware can't back up. A stale GPU_MODEL
-	// env (e.g. copied from another host when this node was provisioned)
-	// would otherwise make a GPU-less box — a Raspberry Pi — report a
-	// discrete GPU. If the env declared a model but neither VRAM nor a GPU
-	// count is detectable, treat the env as wrong and clear it.
-	if gpuModel != "" && vram <= 0 && gpuCount == 0 {
+	if probeErr != nil {
+		// Unknown, not absent: fall back to what was configured or already
+		// registered, and never clear the model below.
+		if prev != nil {
+			if gpuModel == "" {
+				gpuModel = prev.GPUModel
+			}
+			if vram == 0 {
+				vram = prev.VRAMGB
+			}
+			if gpuCount == 0 {
+				gpuCount = prev.GPUCount
+			}
+		}
+		if gpuCount == 0 && gpuModel != "" {
+			gpuCount = 1
+		}
+	} else if gpuModel != "" && vram <= 0 && gpuCount == 0 {
+		// Don't advertise a GPU the hardware can't back up. A stale GPU_MODEL
+		// env (e.g. copied from another host when this node was provisioned)
+		// would otherwise make a GPU-less box — a Raspberry Pi — report a
+		// discrete GPU. If the env declared a model but neither VRAM nor a GPU
+		// count is detectable, treat the env as wrong and clear it.
 		gpuModel = ""
 	}
 
@@ -166,15 +199,16 @@ func Detect(cfg *config.Config, gpu GPUProbe) Capabilities {
 	backends = servableBackends(backends)
 
 	return Capabilities{
-		CPUCores: CPUCores(),
-		RAMGB:    TotalMemoryGB(),
-		GPUModel: gpuModel,
-		VRAMGB:   vram,
-		GPUCount: gpuCount,
-		IsARM:    IsARM(),
-		Backends: backends,
-		Tools:    tools,
-		Tier:     cfg.Tier,
+		ProbeIncomplete: probeErr != nil,
+		CPUCores:        CPUCores(),
+		RAMGB:           TotalMemoryGB(),
+		GPUModel:        gpuModel,
+		VRAMGB:          vram,
+		GPUCount:        gpuCount,
+		IsARM:           IsARM(),
+		Backends:        backends,
+		Tools:           tools,
+		Tier:            cfg.Tier,
 
 		OS:              runtime.GOOS,
 		Arch:            runtime.GOARCH,
@@ -184,7 +218,7 @@ func Detect(cfg *config.Config, gpu GPUProbe) Capabilities {
 		// Docker-for-Mac can't pass the GPU into a container, so on macOS a
 		// GPU is only usable by a native backend. Everywhere else, yes.
 		CanGPUPassthrough: !isDarwin,
-	}
+	}, probeErr
 }
 
 // RuntimeCapabilities returns a list of capability strings based on
