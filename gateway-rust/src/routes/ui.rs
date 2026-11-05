@@ -38,6 +38,7 @@ pub fn router() -> Router<Arc<AppState>> {
         // ── Dashboard HTML pages ──
         .route("/", get(serve_index))
         .route("/dashboard", get(serve_index))  // redirect to modular shell
+        .route("/voice-space", get(serve_voice_space))
         // The unattended display. The gateway has no SPA
         // fallback — deliberately — so the second HTML entry the console
         // build emits needs its own route or it 404s. Public like `/`:
@@ -108,6 +109,33 @@ async fn serve_index() -> impl IntoResponse {
                 .into_response()
         }
     }
+}
+
+/// Console-owned shell only; add-on scripts still execute on their isolated
+/// origin. All data and the one-use session handoff remain authenticated.
+async fn serve_voice_space(headers: axum::http::HeaderMap) -> axum::response::Response {
+    let mut response = serve_index().await.into_response();
+    let origin = crate::addon_ui::embedding_origin(&headers, "pai-voice");
+    let configured = std::env::var("NOO_CSP").ok();
+    response.headers_mut().extend(voice_space_headers(origin.as_deref(), configured.as_deref()));
+    response
+}
+
+fn voice_space_headers(origin: Option<&str>, configured: Option<&str>) -> axum::http::HeaderMap {
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+    let mut headers = HeaderMap::new();
+    headers.insert(axum::http::header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if let Some(origin) = origin {
+        headers.insert(HeaderName::from_static("permissions-policy"),
+            HeaderValue::from_str(&format!("geolocation=(), camera=(), microphone=(self \"{origin}\")")).unwrap());
+        // Respect an operator's custom CSP or opt-out; extend only the
+        // built-in policy. A restrictive custom policy stays restrictive.
+        if crate::middleware::csp_choice(configured) == crate::middleware::CspChoice::Default {
+            headers.insert(HeaderName::from_static("content-security-policy"),
+                HeaderValue::from_str(&format!("{}; frame-src {origin}", crate::middleware::DEFAULT_CSP)).unwrap());
+        }
+    }
+    headers
 }
 
 /// Serve the kiosk page — `dist/kiosk.html` from the same UI artifact as
@@ -1738,6 +1766,41 @@ mod runbook_title_tests {
     fn no_frontmatter_keeps_old_rule() {
         assert_eq!(runbook_title("x", "# Plain Title\nbody"), "Plain Title");
         assert_eq!(runbook_title("fallback-name", "   \n\n"), "fallback-name");
+    }
+}
+
+#[cfg(test)]
+mod voice_space_tests {
+    use super::*;
+
+    #[test]
+    fn voice_space_delegates_only_to_the_isolated_voice_origin() {
+        let origin = "https://mesh.test:8458";
+        let headers = voice_space_headers(Some(origin), None);
+        assert_eq!(headers["permissions-policy"], "geolocation=(), camera=(), microphone=(self \"https://mesh.test:8458\")");
+        let csp = headers["content-security-policy"].to_str().unwrap();
+        assert!(csp.ends_with("frame-src https://mesh.test:8458"));
+        assert!(csp.contains("script-src 'self';") && csp.contains("connect-src 'self';"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(!voice_space_headers(None, None).contains_key("permissions-policy"));
+        for custom in ["off", "default-src 'none'"] {
+            assert!(!voice_space_headers(Some(origin), Some(custom)).contains_key("content-security-policy"));
+        }
+        assert!(crate::auth::PUBLIC_PATHS_EXACT.contains(&"/voice-space"));
+        assert!(!crate::auth::PUBLIC_PATHS_EXACT.contains(&"/api/addons/pai-voice/ui-session"));
+    }
+
+    #[tokio::test]
+    async fn voice_space_policy_survives_the_console_security_layer() {
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .fallback(|| async { (voice_space_headers(Some("https://mesh.test:8458"), None), "shell") })
+            .layer(axum::middleware::from_fn(crate::middleware::security_headers));
+        let response = app.oneshot(axum::http::Request::builder().uri("/voice-space")
+            .body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.headers()["x-frame-options"], "DENY");
+        assert_eq!(response.headers()["permissions-policy"], "geolocation=(), camera=(), microphone=(self \"https://mesh.test:8458\")");
+        assert!(response.headers()["content-security-policy"].to_str().unwrap().contains("frame-src https://mesh.test:8458"));
     }
 }
 
