@@ -204,7 +204,10 @@ pub struct NodeFacts {
     /// other than chat (`ollama#embed`). Empty from an agent that predates
     /// the field: the placements and the name registry still apply.
     pub reported_non_chat_models: Vec<(String, String)>,
-    pub load: f64,
+    /// The heartbeat's `load` as stored (`current_load`, 0.0-1.0). `None`
+    /// = the agent did not report a number: unknown, ranked after every
+    /// reported load, never read as idle.
+    pub load: Option<f64>,
     pub tier: Option<i64>,
     /// `vram_gb > 0`, or unified memory (Apple silicon).
     pub gpu: bool,
@@ -383,7 +386,8 @@ pub struct Candidate {
     pub healthy: bool,
     /// Why not healthy, for the operator surfaces; empty when healthy.
     pub health: String,
-    pub load: f64,
+    /// `None` = not reported (see [`NodeFacts::load`]); sorts last.
+    pub load: Option<f64>,
     /// The node-agent address work is sent to (`https://<ip>:8081`), or the
     /// controller-local docker URL when the node has no registered address.
     /// Not serialised: no API surface carries a dial address.
@@ -451,7 +455,7 @@ impl Candidate {
             status: CandidateStatus::Placed,
             healthy: true,
             health: String::new(),
-            load: 0.0,
+            load: None,
             url,
             tier: None,
             gpu: false,
@@ -595,8 +599,16 @@ fn engine_rank(backend: &str, gpu: bool) -> u8 {
     }
 }
 
+/// A load as a sort key: a reported load x100 (the scale is 0.0-1.0), and
+/// an unreported one after every reported load. An agent that cannot read
+/// its load omits it; reading that as 0.0 made the node look the least
+/// loaded and drew work to it.
+pub fn load_key(load: Option<f64>) -> i64 {
+    load.map(|l| (l * 100.0) as i64).unwrap_or(i64::MAX)
+}
+
 fn derive_key(c: &Candidate) -> (u8, u8, i64, i64) {
-    (c.lane_rank, engine_rank(&c.backend, c.gpu), c.tier.unwrap_or(i64::MAX), (c.load * 100.0) as i64)
+    (c.lane_rank, engine_rank(&c.backend, c.gpu), c.tier.unwrap_or(i64::MAX), load_key(c.load))
 }
 
 /// The routing order within a class, lowest first: non-degraded, healthy,
@@ -608,7 +620,7 @@ pub fn order_key(c: &Candidate) -> (u8, u8, u8, usize, i64) {
         if c.healthy { 0 } else { 1 },
         c.lane_rank,
         c.position,
-        (c.load * 100.0) as i64,
+        load_key(c.load),
     )
 }
 
@@ -654,7 +666,7 @@ pub fn rank_key(c: &Candidate, in_flight: usize, stalled: bool) -> (u8, u8, u8, 
         engine_rank(&c.backend, c.gpu),
         -((c.params_b.unwrap_or(0.0) * 10.0) as i64),
         in_flight,
-        (c.load * 100.0) as i64,
+        load_key(c.load),
         c.position,
     )
 }
@@ -696,7 +708,10 @@ pub fn rank_reason(c: &Candidate, in_flight: usize, stalled: bool) -> String {
         Some(p) => out.push_str(&format!(",params={}", (p * 10.0).round() / 10.0)),
         None => out.push_str(",params=?"),
     }
-    out.push_str(&format!(",load={:.2}", c.load));
+    match c.load {
+        Some(l) => out.push_str(&format!(",load={l:.2}")),
+        None => out.push_str(",load=?"),
+    }
     if in_flight > 0 {
         out.push_str(&format!(",in_flight={in_flight}"));
     }
@@ -1092,7 +1107,7 @@ pub fn pool_key(c: &Candidate, in_flight: usize, stalled: bool) -> (u8, u8, u8, 
         full_rank(c, in_flight),
         if c.gpu_shared { 1 } else { 0 },
         in_flight,
-        (c.load * 100.0) as i64,
+        load_key(c.load),
         c.position,
     )
 }
@@ -1581,7 +1596,10 @@ pub fn node_facts_from_kv(key: &str, data: &Value, non_chat: &[(String, String)]
         model_missing,
         reported_non_chat_models,
         non_chat: non_chat_backends,
-        load: data.get("load").and_then(Value::as_f64).map(|l| l.clamp(0.0, 1.0)).unwrap_or(0.0),
+        // `current_load` is the key node_heartbeat stores (`carry_load`);
+        // this read `load`, which nothing writes, so every live node
+        // ranked at 0.0. Absent or not a number = unknown.
+        load: data.get("current_load").and_then(Value::as_f64).map(|l| l.clamp(0.0, 1.0)),
         tier: data.get("tier").and_then(Value::as_i64),
         gpu: vram > 0.0 || unified,
         heartbeat_age_secs: last.map(|t| (now_unix - t).max(0.0)),
@@ -2036,7 +2054,7 @@ mod tests {
             available_models: available.iter().map(|s| s.to_string()).collect(),
             model_missing: vec![],
             non_chat: vec![],
-            load,
+            load: Some(load),
             tier: Some(tier),
             gpu,
             heartbeat_age_secs: Some(5.0),
@@ -2541,7 +2559,7 @@ mod tests {
     #[test]
     fn kv_record_becomes_facts() {
         let data = serde_json::json!({
-            "id": "host6", "ip_address": "100.64.0.11", "load": 0.2, "tier": 2, "vram_gb": 0,
+            "id": "host6", "ip_address": "100.64.0.11", "current_load": 0.2, "tier": 2, "vram_gb": 0,
             "capabilities": {"unified_memory": true},
             "running_backends": {"ollama": "gemma4:26b"},
             "available_models": ["gemma4:26b", {"name": "gemma4:12b"}],
@@ -2705,7 +2723,7 @@ mod tests {
     fn a_quarantined_node_is_excluded_unless_it_is_the_only_one_left() {
         let rec = |status: &str| {
             serde_json::json!({
-                "id": "mcmini", "ip_address": "100.64.1.2", "status": status, "load": 0.1,
+                "id": "mcmini", "ip_address": "100.64.1.2", "status": status, "current_load": 0.1,
                 "capabilities": {"unified_memory": true},
                 "running_backends": {"ollama": "gemma4:12b"}, "last_heartbeat": 1000.0,
             })
@@ -2920,7 +2938,7 @@ mod tests {
     #[test]
     fn gpu_contention_shared_demotes_and_a_paused_lane_is_no_candidate() {
         let rec = serde_json::json!({
-            "id": "mcmini", "ip_address": "100.64.1.2", "load": 0.1, "last_heartbeat": 1000.0,
+            "id": "mcmini", "ip_address": "100.64.1.2", "current_load": 0.1, "last_heartbeat": 1000.0,
             "capabilities": {"unified_memory": true},
             "running_backends": {"ollama": "gemma4:12b", "llamacpp": "gemma4:26b-a4b-it-qat"},
             "gpu_contention": {"state": "shared", "foreign_mb": 4000, "paused_backends": ["llamacpp"]},
@@ -2953,13 +2971,13 @@ mod tests {
     #[test]
     fn a_backend_with_every_slot_busy_sorts_after_a_free_one_on_a_shared_gpu() {
         let mcmini = serde_json::json!({
-            "id": "mcmini", "ip_address": "100.64.1.2", "load": 0.2, "last_heartbeat": 1000.0,
+            "id": "mcmini", "ip_address": "100.64.1.2", "current_load": 0.2, "last_heartbeat": 1000.0,
             "capabilities": {"unified_memory": true},
             "running_backends": {"ollama": "gemma4:12b"},
             "backend_containers": {"ollama": {"running": true, "serving": true, "in_flight": 2, "slots": 2, "queued": 1}},
         });
         let awolf = serde_json::json!({
-            "id": "awolf", "ip_address": "100.64.1.3", "load": 0.1, "last_heartbeat": 1000.0, "vram_gb": 16.0,
+            "id": "awolf", "ip_address": "100.64.1.3", "current_load": 0.1, "last_heartbeat": 1000.0, "vram_gb": 16.0,
             "running_backends": {"vllm": "google/gemma-4-12B-it-qat-w4a16-ct"},
             "gpu_contention": {"state": "shared", "foreign_mb": 11000},
             "backend_containers": {"vllm": {"running": true, "serving": true, "in_flight": 0, "slots": 4, "queued": 0}},
@@ -3034,7 +3052,7 @@ mod tests {
     #[test]
     fn a_backend_the_agent_reports_not_serving_sorts_last_and_says_why() {
         let rec = serde_json::json!({
-            "id": "mcmini", "ip_address": "100.64.1.2", "load": 0.4, "last_heartbeat": 1000.0,
+            "id": "mcmini", "ip_address": "100.64.1.2", "current_load": 0.4, "last_heartbeat": 1000.0,
             "running_backends": {"ollama": "gemma4:12b", "llamacpp": "gemma4:26b-a4b-it-qat"},
             "backend_containers": {
                 "ollama": {"running": true, "serving": false, "serving_reason": "probe timed out after 60s"},
