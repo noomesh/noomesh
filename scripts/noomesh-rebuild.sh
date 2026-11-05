@@ -677,10 +677,10 @@ if [ "$START_STACK" = true ]; then
 
     # Opt-out enforcement — same as noomesh-start.sh.
     if [ "${TRELLION_STOP_ON_OFF:-}" = "1" ]; then
-        docker compose $COMPOSE_FILES -f "$(addons_trellion_overlay)" stop trellion 2>/dev/null || true
+        addons_compose_stop_intended "trellion is off" $COMPOSE_FILES -f "$(addons_trellion_overlay)" -- trellion
     fi
     if [ "${VOICE_STOP_ON_OFF:-}" = "1" ]; then
-        docker compose $COMPOSE_FILES -f "$(addons_voice_overlay)" stop whisper piper 2>/dev/null || true
+        addons_compose_stop_intended "voice is off" $COMPOSE_FILES -f "$(addons_voice_overlay)" -- whisper piper
     fi
 
     # Ensure all other services in the active profiles are running.

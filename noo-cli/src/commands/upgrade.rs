@@ -834,7 +834,21 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
         // started: the post-roll gate judges only the restarts made during it.
         roll_baseline = crate::commands::cluster_verify::restart_loops::snapshot(
             &crate::commands::cluster_verify::restart_loops::real_docker, &crate::envfile::container_prefix());
-        let (stack_rc, run) = upgrade_stack(g, tag_override, force, skip_gw_key_check, allow_downgrade)?;
+        // The containers the launcher stops on purpose are recorded here, so
+        // the gate never reads one as a crash of the roll.
+        let stops = launcher_stops_file(g);
+        let (stack_rc, run) = upgrade_stack(g, tag_override, force, skip_gw_key_check, allow_downgrade, stops.as_ref().map(|(_, f)| f.as_path()))?;
+        if let Some((dir, file)) = stops {
+            match crate::commands::cluster_verify::restart_loops::read_intended(&file) {
+                Ok(s) => roll_baseline.1 = s,
+                Err(e) => if !g.json {
+                    eprintln!("{}", ui::status_line(Glyph::Warn, &format!(
+                        "the launcher's record of the containers it stopped could not be read ({e}); \
+                         each is judged by its state alone")));
+                },
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
         rc = stack_rc;
         staging = run;
         if rc != 0 {
@@ -1128,7 +1142,8 @@ fn reconcile_addon_nats_principals(g: &Globals, root: &std::path::Path) {
 ///   run_fleet_stages to join. The failure paths below join it here.
 ///
 /// The phase functions follow, in list order.
-fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool)
+fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool,
+    stops: Option<&std::path::Path>)
     -> Result<(i32, Option<crate::commands::image_stage::StageRun>), Unhandled>
 {
     // What and whether: nothing below writes anything.
@@ -1175,7 +1190,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
 
     // Stage node images (overlapping the launcher), then launch.
     let staging = crate::commands::image_stage::start_stage_release_images(g, target_stack_lock.clone(), &roll.tag);
-    launch_stack(g, &roll, staging)
+    launch_stack(g, &roll, staging, stops)
 }
 
 
@@ -1701,7 +1716,7 @@ fn move_pin(g: &Globals, roll: &Roll, target_stack_lock: Option<&str>, addon_pre
 /// Pin moved to v0.1.76, the launcher deployed v0.1.75, and the
 /// Command printed "✓ stack now on v0.1.76" — a false success on the
 /// Exact hotfix the operator was waiting for.
-fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage::StageRun)
+fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage::StageRun, stops: Option<&std::path::Path>)
     -> Result<(i32, Option<crate::commands::image_stage::StageRun>), Unhandled>
 {
     let root = &roll.root;
@@ -1724,6 +1739,11 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
             .env("NOO_STUCK_REPORT", &stuck_report)
             .env("NOO_CLI_BIN", &cli_bin)
             .current_dir(root);
+        // A handoff, not a behaviour switch: where the launcher records the
+        // containers it stops on purpose (lib-addons.sh addons_note_intended_stop).
+        if let Some(p) = stops {
+            c.env("NOO_LAUNCHER_STOPS", p);
+        }
         c
     };
     // Default: the launcher's per-container compose lines collapse into one
@@ -4858,6 +4878,37 @@ fn lock_stage_blocker(g: &Globals, failed: &[String], force: bool) -> Option<Str
             None
         }
         LockStageVerdict::Refuse(m) => Some(m),
+    }
+}
+
+/// A fresh, private file for the launcher's record of the containers it
+/// stops on purpose during this roll (`NOO_LAUNCHER_STOPS`, read by the
+/// post-roll gate: restart_loops::IntendedStops). A 0700 directory with an
+/// unguessable name (migrate::private_stage) holding one 0600 file created
+/// new, so no earlier roll's record and no other user's file is ever read.
+/// `None`, said, when either cannot be made: the gate then judges every
+/// stopped container by its state, never excusing one.
+fn launcher_stops_file(g: &Globals) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let made = crate::commands::migrate::private_stage("noo-launch-stops").and_then(|dir| {
+        let file = dir.join("stops");
+        match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&file) {
+            Ok(_) => Ok((dir, file)),
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                Err(format!("cannot create {}: {e}", file.display()))
+            }
+        }
+    });
+    match made {
+        Ok(p) => Some(p),
+        Err(e) => {
+            if !g.json {
+                eprintln!("{}", ui::status_line(Glyph::Warn, &format!(
+                    "{e}; a container the launcher stops on purpose is judged by its state alone")));
+            }
+            None
+        }
     }
 }
 

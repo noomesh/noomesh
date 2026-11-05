@@ -118,9 +118,58 @@ fn gate_facts(docker: DockerRun, c: &str) -> Option<GateFacts> {
 
 /// What the gate knew of each stack container when the roll started:
 /// name -> (Id, RestartCount). Best-effort: a container it could not read is
-/// absent, and is then judged by its count since it was created.
+/// absent, and is then judged by its count since it was created. The second
+/// field is the launcher's own record of the containers it stopped on
+/// purpose during the roll ([`IntendedStops`]), read once the launcher exits.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct Baseline(pub(crate) std::collections::HashMap<String, (String, i64)>);
+pub(crate) struct Baseline(pub(crate) std::collections::HashMap<String, (String, i64)>, pub(crate) IntendedStops);
+
+/// The containers the launcher stopped ON PURPOSE during this roll: a
+/// refused add-on's leftover (`addons_stop_refused`), trellion or the voice
+/// services switched off. A crash-looping one is stopped with its last exit
+/// code (1), so by its state alone it reads "exited 1 during the roll" and
+/// refused a roll the launcher did right (harness 0.6.17 review, a1).
+/// The CLI creates a fresh 0600 file per roll and hands its path to the
+/// launcher as `NOO_LAUNCHER_STOPS`; the launcher appends `<id> <reason>`
+/// before each such stop (lib-addons.sh `addons_note_intended_stop`).
+/// Matched by container Id, never by name: a container recreated under the
+/// same name is a different container. A file that cannot be read is an
+/// empty set (the caller warns): every stop is then judged by its state,
+/// never excused.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct IntendedStops(pub(crate) Vec<(String, String)>);
+
+/// A recorded Id this short is never matched as a prefix (`docker ps -q`
+/// prints 12 characters; anything shorter could match an unrelated Id).
+const MIN_ID_PREFIX: usize = 12;
+
+impl IntendedStops {
+    /// One `<id> <reason>` per line; a blank line or one with no reason is
+    /// skipped.
+    pub(crate) fn parse(text: &str) -> Self {
+        IntendedStops(text.lines().filter_map(|l| {
+            let (id, why) = l.trim().split_once(' ')?;
+            let why = why.trim();
+            (!id.is_empty() && !why.is_empty()).then(|| (id.to_string(), why.to_string()))
+        }).collect())
+    }
+
+    /// Why the launcher stopped the container with the full Id `id`, when it
+    /// did: the recorded Id equals it, or is a prefix of it at least
+    /// [`MIN_ID_PREFIX`] long.
+    pub(crate) fn reason(&self, id: &str) -> Option<&str> {
+        self.0.iter()
+            .find(|(rec, _)| rec == id || (rec.len() >= MIN_ID_PREFIX && id.starts_with(rec.as_str())))
+            .map(|(_, why)| why.as_str())
+    }
+}
+
+/// The launcher's record at `path`, or why it could not be read.
+pub(crate) fn read_intended(path: &std::path::Path) -> Result<IntendedStops, String> {
+    std::fs::read_to_string(path)
+        .map(|t| IntendedStops::parse(&t))
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
 
 impl Baseline {
     /// Restarts made since the baseline: the delta for the same container,
@@ -142,7 +191,7 @@ pub(crate) fn snapshot(docker: DockerRun, prefix: &str) -> Baseline {
             m.insert(c, (f.id, f.restart_count));
         }
     }
-    Baseline(m)
+    Baseline(m, IntendedStops::default())
 }
 
 /// How a container that is not live ended, judged against the roll's start.
@@ -250,8 +299,15 @@ pub(crate) fn scan(docker: DockerRun, prefix: &str, now_unix: i64, gate: Option<
             match ended(&st, facts.as_ref(), t) {
                 Ended::Clean => {}
                 Ended::Crashed(code) => {
-                    let last_error = last_error_of(docker, &c);
-                    looping.push(Looping { container: c, restarts: st.restart_count, last_error, crashed: Some(code) });
+                    // The launcher stopped it on purpose: its last exit code
+                    // is the loop's, not a crash of the roll.
+                    let intended = gate.zip(facts.as_ref()).and_then(|((_, base), f)| base.1.reason(&f.id));
+                    if let Some(why) = intended {
+                        notes.push(format!("{c} was stopped by the launcher ({why}); its last exit was {code}, not a crash of the roll"));
+                    } else {
+                        let last_error = last_error_of(docker, &c);
+                        looping.push(Looping { container: c, restarts: st.restart_count, last_error, crashed: Some(code) });
+                    }
                 }
                 Ended::Stopped => notes.push(format!(
                     "{c} is stopped (exit {}), not looping; if nothing declares it, remove it: docker rm -f {c}",
@@ -504,7 +560,7 @@ mod tests {
     }
 
     fn baseline(rows: &[(&str, &str, i64)]) -> Baseline {
-        Baseline(rows.iter().map(|(n, id, c)| (n.to_string(), (id.to_string(), *c))).collect())
+        Baseline(rows.iter().map(|(n, id, c)| (n.to_string(), (id.to_string(), *c))).collect(), IntendedStops::default())
     }
 
     fn no_sleep() -> impl FnMut(u64) {
@@ -597,5 +653,47 @@ mod tests {
             &baseline(&[("noo-redis", "id-r", 0)]), &|| NOW, &mut no_sleep()).unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].line(), format!("noo-redis is restart-looping (4 restarts): {AOF}"));
+    }
+
+    /// harness 0.6.17 review a1: a crash-looping add-on container the
+    /// launcher stops on purpose (refused this start) keeps its last exit
+    /// code, 1, and finished during the roll. Recorded by the launcher, it is
+    /// a line; the same container NOT recorded is still a crash. Matched by
+    /// Id: a recorded short Id matches its full Id, another Id does not.
+    #[test]
+    fn a_container_the_launcher_stopped_on_purpose_is_a_line_not_a_crash() {
+        let since = NOW - 300;
+        let full = "a1b2c3d4e5f6a7b8c9d0";
+        let inspect = HashMap::from([("noo-rhold", state_exit(false, NOW - 120, 0, false, 1))]);
+        let facts = HashMap::from([("noo-rhold", format!("{full}|0|{}|false", rfc3339(NOW - 100)))]);
+        let logs = HashMap::from([("noo-rhold", "FATAL: no key")]);
+        let mut base = baseline(&[("noo-rhold", full, 0)]);
+        base.1 = IntendedStops::parse("a1b2c3d4e5f6 add-on rhold was refused this start\n");
+        let (v, notes) = gate_loops(&fake_facts(&inspect, &facts, &logs), "noo", since, &base, &|| NOW, &mut no_sleep()).unwrap();
+        assert!(v.is_empty(), "{v:?}");
+        assert_eq!(notes, vec!["noo-rhold was stopped by the launcher (add-on rhold was refused this start); \
+            its last exit was 1, not a crash of the roll".to_string()]);
+        // Not recorded, or recorded under another Id: the crash refuses, as before.
+        for rec in ["", "ffffffffffff add-on rhold was refused this start", "a1b2 add-on rhold was refused this start"] {
+            base.1 = IntendedStops::parse(rec);
+            let (v, _) = gate_loops(&fake_facts(&inspect, &facts, &logs), "noo", since, &base, &|| NOW, &mut no_sleep()).unwrap();
+            assert_eq!(v.first().and_then(|l| l.crashed), Some(1), "{rec:?}: {v:?}");
+        }
+    }
+
+    #[test]
+    fn the_launchers_record_is_read_by_line_and_a_missing_one_is_an_error() {
+        let s = IntendedStops::parse("abc123def456 trellion is off\n\nbad\nfeed00000000   voice is off  \n");
+        assert_eq!(s.0, vec![("abc123def456".to_string(), "trellion is off".to_string()),
+                             ("feed00000000".to_string(), "voice is off".to_string())]);
+        assert_eq!(s.reason("abc123def456ffff"), Some("trellion is off"));
+        assert_eq!(s.reason("abc123"), None, "a shorter Id never matches a longer record");
+        let dir = std::env::temp_dir().join(format!("noo-intended-stops-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(read_intended(&dir.join("missing")).is_err());
+        std::fs::write(dir.join("stops"), "abc123def456 trellion is off\n").unwrap();
+        let read = read_intended(&dir.join("stops"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(read.unwrap().0, s.0[..1].to_vec());
     }
 }
