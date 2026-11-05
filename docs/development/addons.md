@@ -1501,6 +1501,16 @@ when the bundle also ships `routes.json`); the gateway checks `drain.route`
 against the manifest it loaded. Nodes receive the registered add-ons'
 workloads in `desired-config` (`addon_workloads`) and act on nothing else.
 
+A provisioned service key is named `svc:<addon>`. Exchanging it at
+`POST /api/addon/token` produces subject `addon:svc:<addon>`, which may observe
+and proxy only that add-on's reserved workloads. The middleware and both
+workload handlers use the same ownership check. Existing explicitly-issued
+`addon:<addon>` identities remain supported. Neither form grants reservation
+creation, node actuators, or another add-on's workload. The proxy preserves the
+authenticated subject in `X-Noo-Requester-Sub`; a worker must check the actual
+service identity and reservation rather than expect the legacy spelling.
+
+
 **Shipping it.** Add the files to the bundle when you sign it:
 
 ```sh
