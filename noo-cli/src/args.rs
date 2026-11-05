@@ -56,6 +56,16 @@ impl From<ArgError> for crate::Unhandled {
     }
 }
 
+/// Refuse a lone `-` the way the hand-rolled loops did (it starts with `-`,
+/// so they rejected it), where `Args` would take it as a positional. For
+/// parsers converted with their old behaviour pinned (i191 D2 pass 4).
+pub fn refuse_lone_dash(args: &[String]) -> Result<(), ArgError> {
+    if args.iter().any(|a| a == "-") {
+        return Err(ArgError::new("unexpected argument `-`"));
+    }
+    Ok(())
+}
+
 /// The message of the last `ArgError` turned into `Unhandled` on this
 /// thread, once.
 pub fn take_message() -> Option<String> {
@@ -396,6 +406,22 @@ mod tests {
             row(&["addons", "accept-suggestions"], |a| { let _ = addon_access::parse_accept_suggestions_with(a); }),
             row(&["addons", "access"], |a| { let _ = addon_access::parse_access_with(a); }),
             row(&["security", "user", "super-admin"], |a| { let _ = security::parse_super_admin_with(a); }),
+            // i191 D2 pass 4 (security + security_local), behaviour pinned by parse_pin_tests.
+            row(&["security", "user", "set-password"], |a| { let _ = security::parse_set_password_with(a); }),
+            row(&["security", "admin-password", "reset"], |a| { let _ = security::parse_admin_password_reset_with(a); }),
+            row(&["security", "user", "disable"], |a| { let _ = security::parse_username_and_yes_with(a); }),
+            row(&["security", "user", "erase"], |a| { let _ = security::parse_user_erase_with(a); }),
+            row(&["security", "team", "delete"], |a| { let _ = security::parse_team_delete_with(a); }),
+            row(&["security", "posture", "apply-profile"], |a| { let _ = security::parse_posture_apply_profile_with(a); }),
+            row(&["security", "service-key", "list"], |a| { let _ = security::parse_service_key_list_with(a); }),
+            row(&["security", "service-key", "retire"], |a| { let _ = security::parse_service_key_retire_with(a); }),
+            row(&["security", "service-key", "revoke"], |a| { let _ = security::parse_service_key_revoke_with(a); }),
+            row(&["security", "scan"], |a| { let _ = security_local::parse_scan_with(a); }),
+            row(&["cluster", "teardown-node"], |a| { let _ = security_local::parse_teardown_node_with(a); }),
+            row(&["security", "secrets", "absorb-files"], |a| { let _ = security_local::parse_absorb_files_with(a); }),
+            row(&["security", "pki", "rotate-signing-key"], |a| { let _ = security_local::parse_rotate_signing_key_with(a); }),
+            row(&["security", "trust-ca"], |a| { let _ = security_local::parse_trust_ca_with(a); }),
+            row(&["security", "untrust-ca"], |a| { let _ = security_local::parse_untrust_ca_with(a); }),
         ];
         let mut bad = Vec::new();
         for (words, probe) in table {
