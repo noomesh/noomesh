@@ -611,6 +611,8 @@ struct Candidate {
     url: String,
     /// `None` = the node reported no load: sorts after every reported one.
     load: Option<f64>,
+    /// [`super::classes::lane_rank_of`]: serving 0, on demand 1, unconfirmed 2.
+    lane_rank: u8,
     excluded: bool,
     /// The class table's health rule ([`super::classes::node_health`]):
     /// heartbeat fresh, reachable, not quarantined or offline, and the
@@ -857,11 +859,15 @@ fn apply_pin(all: &mut Vec<Candidate>, pin: &str) -> Result<(), String> {
 /// ordering is what failed live, and nothing asserted it.
 /// The KV-scan sort: healthy first (185b: a node that died idle used to
 /// win on its last, low load until the KV entry expired), then exact model
-/// match, preferred backend, lower load.
+/// match, the lane state (the class table's [`super::classes::lane_rank_of`]:
+/// without it a serving lane with an unreported load lost to an on-demand
+/// or unconfirmed peer here while raw chat picked it), preferred backend,
+/// lower load.
 fn order_candidates(candidates: &mut [Candidate], target_model: &str, preferred: &str) {
     candidates.sort_by_key(|c| {
         let exact = !target_model.is_empty() && c.model_name == target_model;
-        (!c.healthy, sort_key(exact, c.backend_type == preferred, c.load))
+        let (e, p, busy, load) = sort_key(exact, c.backend_type == preferred, c.load);
+        (!c.healthy, e, c.lane_rank, p, busy, load)
     });
 }
 
@@ -1188,12 +1194,14 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
                                         // Failed on a previous attempt of this request.
                                         let excluded = is_excluded(exclude_urls, &url, ip);
                                         let (healthy, health) = super::classes::node_health(&key, &data, bt, now);
+                                        let lane_rank = super::classes::lane_rank_of(&facts, bt, m);
                                         candidates.push(Candidate {
                                             node_id,
                                             backend_type: bt.clone(),
                                             model_name: m.to_string(),
                                             url,
                                                                             load: node_load,
+                                            lane_rank,
                                             excluded,
                                             healthy,
                                             health,
@@ -1498,6 +1506,7 @@ mod tests {
             model_name: model.into(),
             url: format!("https://noo-{bt}:1"),
             load: Some(0.0),
+            lane_rank: 0,
             excluded,
             healthy: true,
             health: String::new(),
@@ -1952,6 +1961,7 @@ mod pinned_hold_tests {
             model_name: model.into(),
             url: String::new(),
             load: Some(0.1),
+            lane_rank: 0,
             excluded: false,
             healthy: true,
             health: String::new(),
@@ -2109,5 +2119,53 @@ mod lane_fallback_tests {
         assert!(!fallback.contains(&raw), "the fallback re-reads the raw inventory");
         assert!(fallback.contains("for (bt, m) in &facts.running"), "it iterates the facts");
         assert!(fallback.contains("facts.non_chat.contains(bt)"), "and takes non-chat from them");
+    }
+}
+
+#[cfg(test)]
+mod lane_rank_agreement_tests {
+    use super::super::classes::{build_table, lane_rank_of, node_facts_from_kv, select_with, Declarations, NodeFacts};
+    use super::{order_candidates, Candidate};
+    use serde_json::{json, Value};
+
+    fn rec(id: &str, ip: &str, state: &str, load: Option<f64>) -> Value {
+        let mut r = json!({
+            "id": id, "ip_address": ip, "last_heartbeat": 1000.0, "vram_gb": 0.0,
+            "running_backends": {"ollama": "gemma4:12b"},
+            "lanes": [{"backend": "ollama", "model": "gemma4:12b", "role": "chat", "state": state, "reason": ""}],
+        });
+        if let Some(l) = load {
+            r["current_load"] = json!(l);
+        }
+        r
+    }
+
+    /// A pinned model through the KV-scan resolver and through the class
+    /// table pick the same node: the serving lane, even with no load
+    /// reported, over an on-demand peer at 0.95.
+    #[test]
+    fn a_pinned_model_and_raw_chat_agree_on_lane_state() {
+        let a = node_facts_from_kv("a-serving", &rec("a-serving", "100.64.0.1", "serving", None), &[], 1001.0);
+        let b = node_facts_from_kv("b-ondemand", &rec("b-ondemand", "100.64.0.2", "on_demand", Some(0.95)), &[], 1001.0);
+        let t = build_table(&[b.clone(), a.clone()], &[], &Declarations::default());
+        let sel = select_with(&t, Some("gemma4:12b"), None, false, &|_| false, &|_| 0, &|_| false).expect("a selection");
+        assert_eq!(sel.candidates[0].node_id, "a-serving", "raw chat");
+        let mk = |f: &NodeFacts| Candidate {
+            node_id: f.node_id.clone(),
+            backend_type: "ollama".into(),
+            model_name: "gemma4:12b".into(),
+            url: String::new(),
+            load: f.load,
+            lane_rank: lane_rank_of(f, "ollama", "gemma4:12b"),
+            excluded: false,
+            healthy: true,
+            health: String::new(),
+        };
+        let mut cands = vec![mk(&b), mk(&a)];
+        order_candidates(&mut cands, "gemma4:12b", "ollama");
+        assert_eq!(cands[0].node_id, "a-serving", "the KV-scan resolver");
+        // The resolver ranks through the class table's own function.
+        let code = crate::test_src::own_code(include_str!("backend.rs"));
+        assert!(code.contains("super::classes::lane_rank_of(&facts, bt, m)"), "one lane-rank function");
     }
 }
