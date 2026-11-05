@@ -741,7 +741,7 @@ pub async fn eval_disk_watermark(
 
     if breached.is_empty() {
         // Local disks fine — the fleet's may not be.
-        return Ok(eval_node_disks(state, watermark).await);
+        return eval_node_disks(state, watermark).await;
     }
 
     let detail = breached.join("; ");
@@ -776,7 +776,11 @@ pub async fn eval_disk_watermark(
     }
     // Node disks are checked regardless of the local outcome — one full
     // controller must not mask a full worker or vice versa.
-    let _ = eval_node_disks(state, watermark).await;
+    // A node list that cannot be read is a failed evaluation, never "no
+    // node is full" (i460): the controller's own alert above still went out.
+    eval_node_disks(state, watermark)
+        .await
+        .map_err(|e| format!("{e}; the controller's own disk alert was sent"))?;
     Ok(true)
 }
 
@@ -816,16 +820,11 @@ fn node_disk_breaches(body: &serde_json::Value, watermark: f64) -> Vec<String> {
 /// longer advises removing containerd leases by age — that deleted live
 /// containers' snapshots on host3. Unreachable agents are
 /// node_health's finding, skipped here (same scope discipline as gpu_health).
-async fn eval_node_disks(state: &AppState, watermark: f64) -> bool {
-    let nodes: Vec<(String,)> = sqlx::query_as(
-        "SELECT node_id FROM cluster_nodes WHERE status = 'online'",
-    )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+async fn eval_node_disks(state: &AppState, watermark: f64) -> Result<bool, String> {
+    let nodes = online_node_ids(&state.db).await?;
 
     let mut any = false;
-    for (node_id,) in nodes {
+    for node_id in nodes {
         let Ok(link) = crate::node_link::NodeLink::for_node(state, &node_id).await
         else {
             continue;
@@ -861,7 +860,18 @@ async fn eval_node_disks(state: &AppState, watermark: f64) -> bool {
         )
         .await;
     }
-    any
+    Ok(any)
+}
+
+/// The online nodes whose disks [`eval_node_disks`] probes. A read that
+/// fails is an error naming the read (i460): an empty list would read as
+/// "no node is full", silent on exactly the outage to surface.
+async fn online_node_ids(db: &sqlx::PgPool) -> Result<Vec<String>, String> {
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT node_id FROM cluster_nodes WHERE status = 'online'")
+        .fetch_all(db)
+        .await
+        .map_err(|e| format!("node disks not checked: cannot read the online nodes from cluster_nodes: {e}"))?;
+    Ok(rows.into_iter().map(|(n,)| n).collect())
 }
 
 /// Queue a `disk-reclaim` op on the host watcher spool and report the
@@ -4451,5 +4461,30 @@ mod embed_backlog_tests {
     #[test]
     fn new_work_after_a_clear_snapshot_starts_a_fresh_window() {
         assert_eq!(v(12, true, Some((0, 0)), 5 * W, W), (B::Watching { now: 12, prev: Some(0) }, Some((12, 5 * W))));
+    }
+}
+
+#[cfg(test)]
+mod node_disk_read_tests {
+    use super::*;
+
+    fn dead_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool")
+    }
+
+    /// i460: a database that cannot answer is "not checked", never "no node
+    /// is full", and the evaluation fails on it.
+    #[tokio::test]
+    async fn an_unreadable_node_list_fails_the_node_disk_check() {
+        match online_node_ids(&dead_pool()).await {
+            Err(e) => assert!(e.starts_with("node disks not checked: cannot read the online nodes from cluster_nodes"), "{e}"),
+            Ok(v) => panic!("a dead pool read as {} online node(s)", v.len()),
+        }
+        let code = crate::test_src::own_code(include_str!("autonomy_evaluators.rs"));
+        let body = crate::test_src::fn_body(&code, "async fn eval_node_disks(");
+        assert!(body.contains("online_node_ids(&state.db).await?"), "{body}");
     }
 }
