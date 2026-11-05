@@ -124,6 +124,27 @@
         }
       ],
       "stale_in_own_code": []
+    },
+    {
+      "name": "raw_string_holding_a_quote_and_a_brace",
+      "why": "A raw string may hold a quote followed by a closing brace; read as an ordinary string, that brace would be code and end the body early.",
+      "src": "fn render() -> &'static str {\n    let t = r#\"a \"} b\"#;\n    tail();\n    t\n}\n\n#[cfg(test)]\nfn probe() { let _ = r##\"x \"}# y\"##; }\n\nfn after() {}",
+      "own_code": "fn render() -> &'static str {\n    let t = r#\"a \"} b\"#;\n    tail();\n    t\n}\n\n\n\nfn after() {}",
+      "bodies": [
+        {
+          "of": "src",
+          "marker": "fn render(",
+          "body": "fn render() -> &'static str {\n    let t = r#\"a \"} b\"#;\n    tail();\n    t\n}"
+        },
+        {
+          "of": "own_code",
+          "marker": "fn after(",
+          "body": "fn after() {}"
+        }
+      ],
+      "stale_in_own_code": [
+        "fn probe("
+      ]
     }
   ]
 }
