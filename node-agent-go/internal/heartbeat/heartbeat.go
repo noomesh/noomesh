@@ -529,6 +529,10 @@ func (r *Reporter) SendHeartbeat() {
 		payload["gpu_model"] = gpuModel
 		payload["vram_gb"] = vramGB
 	}
+	if m.MemUsedGB == nil {
+		// Memory unmeasured: omit the key rather than send null or a number.
+		delete(payload, "mem_used_gb")
+	}
 	r.companionTelemetry(payload, power)
 	setDialableAddress(payload, hostIP, selfURL)
 
@@ -539,7 +543,7 @@ func (r *Reporter) SendHeartbeat() {
 		}
 	}
 
-	body, err := json.Marshal(payload)
+	body, err := marshalPayload(payload)
 	if err != nil {
 		r.noteOutcome(clk, fmt.Errorf("heartbeat marshal failed: %w", err))
 		return

@@ -39,6 +39,11 @@ func TotalMemoryGB() float64 {
 type MemoryInfo struct {
 	TotalKB     int64
 	AvailableKB int64
+	// AvailableKnown is false when the total was read but the available
+	// figure could not be (vm_stat failed on macOS, no MemAvailable line).
+	// AvailableKB is then 0 and means NOTHING: 0 available would read as a
+	// machine with every byte in use.
+	AvailableKnown bool
 }
 
 // ReadMemoryInfo reports total and available memory, zeroed when unknown —
@@ -48,7 +53,20 @@ func ReadMemoryInfo() MemoryInfo {
 	if !ok {
 		return MemoryInfo{}
 	}
-	return MemoryInfo{TotalKB: totalKB, AvailableKB: availKB}
+	return memoryInfoFrom(totalKB, availKB)
+}
+
+// memoryInfoFrom turns a raw read into a MemoryInfo. A negative availKB is
+// the readers' "could not measure" marker; a total of zero or less is
+// unknown as a whole.
+func memoryInfoFrom(totalKB, availKB int64) MemoryInfo {
+	if totalKB <= 0 {
+		return MemoryInfo{}
+	}
+	if availKB < 0 {
+		return MemoryInfo{TotalKB: totalKB}
+	}
+	return MemoryInfo{TotalKB: totalKB, AvailableKB: availKB, AvailableKnown: true}
 }
 
 // CPULoad returns the 1-minute load average normalized by core count (0.0–1.0).
