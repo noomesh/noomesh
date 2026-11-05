@@ -82,7 +82,9 @@ def test_every_fixture_is_in_its_cases_file_and_back() -> None:
         on_disk = {p.name for p in (CANON / d).iterdir()} - {"cases.json", "lock.json"}
         assert listed == on_disk, f"{d}: cases.json and the directory disagree: {listed ^ on_disk}"
         for c in cases(d):
-            assert set(c) <= {"file", "valid", "code", "addon"}
+            assert set(c) <= {"file", "valid", "code", "addon", "set"}
+            if "set" in c:  # a desired case paired with a model-set fixture
+                assert d == "desired" and (CANON / c["set"]).is_file(), c
             assert c["valid"] == (c["code"] == ""), f"{d}/{c['file']}"
 
 

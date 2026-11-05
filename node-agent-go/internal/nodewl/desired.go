@@ -29,18 +29,22 @@ var (
 
 // Entry is one `node_workloads` row of desired-config.
 type Entry struct {
-	Addon       string              `json:"addon"`
-	Name        string              `json:"name"`
-	DeclRaw     json.RawMessage     `json:"decl"`
-	Decl        Decl                `json:"-"`
-	Image       ImageRef            `json:"image"`
-	Sets        map[string][]SetRef `json:"sets"`
-	Env         map[string]string   `json:"env"`
-	Door        *Door               `json:"door"`
-	StartSecs   int64               `json:"start_secs"`
-	Drain       Drain               `json:"drain"`
-	Reservation *string             `json:"reservation"`
-	State       string              `json:"state"`
+	Addon     string              `json:"addon"`
+	Name      string              `json:"name"`
+	DeclRaw   json.RawMessage     `json:"decl"`
+	Decl      Decl                `json:"-"`
+	Image     ImageRef            `json:"image"`
+	Sets      map[string][]SetRef `json:"sets"`
+	Env       map[string]string   `json:"env"`
+	Door      *Door               `json:"door"`
+	StartSecs int64               `json:"start_secs"`
+	Drain     Drain               `json:"drain"`
+	// Profile names the load profile of the main slot's set (needs.profiles).
+	// ParseDesired checks its shape only; CheckProfile judges it against the
+	// set's manifest.
+	Profile     *string `json:"profile"`
+	Reservation *string `json:"reservation"`
+	State       string  `json:"state"`
 }
 
 type ImageRef struct {
@@ -112,6 +116,9 @@ func parseEntry(raw []byte, ownAgentCN string) (Entry, error) {
 	case StateProvisioned, StateRunning, StateAbsent:
 	default:
 		return e, fail(ReasonDesiredInvalid, "state %q", e.State)
+	}
+	if e.Profile != nil && !setProfileRe.MatchString(*e.Profile) {
+		return e, fail(ReasonDesiredInvalid, "profile must be a non-empty lower-case word")
 	}
 	if e.Reservation != nil && !uuidRe.MatchString(*e.Reservation) {
 		return e, fail(ReasonDesiredInvalid, "reservation is not a canonical lower-case UUID")

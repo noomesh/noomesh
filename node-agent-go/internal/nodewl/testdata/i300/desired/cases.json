@@ -2,12 +2,14 @@
   {
     "file": "valid-provisioned.json",
     "valid": true,
-    "code": ""
+    "code": "",
+    "set": "model-sets/valid-voice.json"
   },
   {
     "file": "valid-running.json",
     "valid": true,
-    "code": ""
+    "code": "",
+    "set": "model-sets/valid-voice.json"
   },
   {
     "file": "valid-absent.json",
@@ -23,6 +25,29 @@
     "file": "valid-empty.json",
     "valid": true,
     "code": ""
+  },
+  {
+    "file": "refuse-profile-malformed.json",
+    "valid": false,
+    "code": "desired_invalid"
+  },
+  {
+    "file": "refuse-profile-unknown.json",
+    "valid": false,
+    "code": "profile_invalid",
+    "set": "model-sets/valid-voice.json"
+  },
+  {
+    "file": "refuse-profile-missing.json",
+    "valid": false,
+    "code": "profile_invalid",
+    "set": "model-sets/valid-voice.json"
+  },
+  {
+    "file": "refuse-profile-not-realtime.json",
+    "valid": false,
+    "code": "profile_invalid",
+    "set": "model-sets/valid-voice.json"
   },
   {
     "file": "refuse-trailing-data.json",

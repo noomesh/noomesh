@@ -16,6 +16,7 @@ const (
 	ReasonSetMissing           = "set_missing"
 	ReasonSetSlotInvalid       = "set_slot_invalid"
 	ReasonSetUnverified        = "set_unverified"
+	ReasonProfileInvalid       = "profile_invalid"
 	ReasonDisk                 = "disk"
 	ReasonConsentNone          = "consent_none"
 	ReasonConsentUnapproved    = "consent_unapproved"
@@ -36,7 +37,7 @@ const (
 var Reasons = []string{
 	ReasonDeclInvalid, ReasonDesiredInvalid, ReasonDoorLeafMissing, ReasonImageMissing,
 	ReasonImageDigestMismatch, ReasonSetMissing, ReasonSetSlotInvalid, ReasonSetUnverified,
-	ReasonDisk, ReasonConsentNone, ReasonConsentUnapproved, ReasonNvidiaRuntimeMissing,
+	ReasonProfileInvalid, ReasonDisk, ReasonConsentNone, ReasonConsentUnapproved, ReasonNvidiaRuntimeMissing,
 	ReasonDriverCapsMissing, ReasonComputeCapLow, ReasonArchMismatch, ReasonControllerHost,
 	ReasonAdmitInvalid, ReasonEnvOutOfBounds, ReasonContainerConflict, ReasonStartTimeout,
 	ReasonCrashed, ReasonDrainTimeout,

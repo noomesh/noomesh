@@ -84,6 +84,7 @@
         "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
       },
       "sets": {},
+      "profile": "int8",
       "env": {},
       "door": {
         "leaf": "svc-addon-rhaddon-worker",

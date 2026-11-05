@@ -97,6 +97,7 @@
           }
         ]
       },
+      "profile": "int8",
       "env": {
         "RHADDON_SLOTS": "1",
         "RHADDON_QUANT": "bf16",
