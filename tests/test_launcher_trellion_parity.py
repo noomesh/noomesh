@@ -111,11 +111,19 @@ def test_trellion_switch_contract(launcher: str) -> None:
         f"{launcher}: the OFF branch must name the overlay to reach the service it stops — "
         "the overlay is not composed when the add-on is off"
     )
-    assert "TRELLION_STOP_ON_OFF" in body and "stop trellion" in body, (
+    # The stop goes through addons_compose_stop_intended (lib-addons.sh),
+    # which records the container for the post-roll gate and then runs
+    # `docker compose <args> stop <services>`; both halves are held here.
+    assert "TRELLION_STOP_ON_OFF" in body and (
+        'addons_compose_stop_intended "trellion is off" $COMPOSE_FILES -f "$(addons_trellion_overlay)" -- trellion' in body
+    ), (
         f"{launcher}: the OFF branch must STOP a leftover trellion container "
         "— `up` ignores unselected profiles, so a container from a previous "
         "enabled run keeps running (rehearsal round 2, 2026-08-13)"
     )
+    lib = (SCRIPTS / "lib-addons.sh").read_text()
+    stop_fn = lib.split("\naddons_compose_stop_intended() {\n", 1)[1].split("\n}\n", 1)[0]
+    assert 'docker compose "${_acs_args[@]}" stop "$@"' in stop_fn, "addons_compose_stop_intended must stop the services it is given"
 
 
 @pytest.mark.parametrize("launcher", LAUNCHERS)
