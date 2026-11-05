@@ -380,19 +380,20 @@ addons_stop_leftovers addons_stop_disabled; echo "rc=$?"
     assert "last log lines of noo-rhold" in r.stderr and "  | fake last line of noo-rhold" in r.stderr, r.stderr
 
 
-def _off_run(tmp_path: Path, overlay: str, env_extra: dict[str, str] | None = None, with_overlay: bool = True):
+def _off_run(tmp_path: Path, overlay: str, env_extra: dict[str, str] | None = None, with_overlay: bool = True,
+             addon: str = "rhold", running: str = RUNNING_BEFORE):
     root = tmp_path / "root"
     (root / "scripts").mkdir(parents=True)
     shutil.copy(ROOT / "scripts" / "lib-addons.sh", root / "scripts" / "lib-addons.sh")
     shutil.copy(ROOT / "docker-compose.cluster.yml", root / "docker-compose.cluster.yml")
     if with_overlay:
-        (root / "addons" / "rhold").mkdir(parents=True)
-        (root / "addons" / "rhold" / "docker-compose.yml").write_text(overlay)
+        (root / "addons" / addon).mkdir(parents=True)
+        (root / "addons" / addon / "docker-compose.yml").write_text(overlay)
     bindir = tmp_path / "bin"
     bindir.mkdir()
     (bindir / "docker").write_text(FAKE_DOCKER)
     (bindir / "docker").chmod(0o755)
-    (tmp_path / "running").write_text(RUNNING_BEFORE)
+    (tmp_path / "running").write_text(running)
     body = f"""
 . {root}/scripts/lib-addons.sh
 COMPOSE_FILES="-f {root}/docker-compose.cluster.yml"
@@ -400,7 +401,7 @@ addons_stop_leftovers addons_stop_disabled; echo "rc=$?"
 """
     env = {"PATH": f"{bindir}:{os.environ['PATH']}", "HOME": str(tmp_path), "LOGF": str(tmp_path / "log"),
            "RUNNING": str(tmp_path / "running"), "FAKE_SERVICES_NEED_PROFILE": "1",
-           "NOO_ADDON_MAP_OVERRIDE": "1", "NOO_ADDON_MAP": "rhold=0\n", **(env_extra or {})}
+           "NOO_ADDON_MAP_OVERRIDE": "1", "NOO_ADDON_MAP": f"{addon}=0\n", **(env_extra or {})}
     return subprocess.run(["bash", "-c", body], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
 
 
@@ -439,3 +440,35 @@ def test_a_declared_off_addon_without_its_overlay_is_said(tmp_path: Path) -> Non
     r = _off_run(tmp_path, "", with_overlay=False)
     assert "rc=0" in r.stdout, (r.stdout, r.stderr)
     assert "add-on rhold is declared off but its overlay is gone, so its containers were NOT checked: noo doctor orphans" in r.stderr
+
+
+# pop-os 2026-11-05, exactly: `pai-voice: false` in noomesh.yaml renders as
+# `pai-voice=0` (launch_render.rs render_addons), and the hyphenated add-on's
+# ONE overlay owns two services, both left crash-looping, its coordinator
+# needing a variable nothing sets while the add-on is off.
+PAI_VOICE_OVERLAY = """services:
+  noo-pai-voice:
+    image: ${NOO_ADDON_IMAGE_PAI_VOICE:-x}
+    container_name: noo-pai-voice
+    restart: unless-stopped
+  noo-pai-voice-coordinator:
+    image: ${NOO_ADDON_IMAGE_PAI_VOICE_COORDINATOR:-x}
+    container_name: noo-pai-voice-coordinator
+    restart: unless-stopped
+    volumes:
+      - ${PAI_VOICE_COORDINATOR_SECRETS_DIR:?PAI_VOICE_COORDINATOR_SECRETS_DIR must be set}:/run/secrets:ro
+"""
+
+
+def test_pop_os_pai_voice_false_removes_both_of_its_containers(tmp_path: Path) -> None:
+    r = _off_run(tmp_path, PAI_VOICE_OVERLAY, addon="pai-voice",
+                 running=RUNNING_BEFORE + "noo-pai-voice\nnoo-pai-voice-coordinator\n")
+    assert "rc=0" in r.stdout, (r.stdout, r.stderr)
+    running = _running(tmp_path)
+    assert not {"noo-pai-voice", "noo-pai-voice-coordinator"} & running, running
+    assert {"gateway", "worker", "postgres", "other-addon"} <= running, running
+    for c in ["noo-pai-voice", "noo-pai-voice-coordinator"]:
+        assert f"- removed {c}: add-on pai-voice is declared off (its data is kept)" in r.stdout, r.stdout
+        assert f"last log lines of {c} (add-on pai-voice, declared off)" in r.stderr, r.stderr
+    removed = sorted(l for l in (tmp_path / "log").read_text().splitlines() if l.startswith("DOCKER rm -f "))
+    assert removed == ["DOCKER rm -f noo-pai-voice", "DOCKER rm -f noo-pai-voice-coordinator"], removed
