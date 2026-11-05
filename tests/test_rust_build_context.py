@@ -23,6 +23,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tests import _rust_src as rsrc
+
 ROOT = Path(__file__).resolve().parents[1]
 RUST_SRC = ROOT / "gateway-rust/src"
 DOCKERFILE = ROOT / "docker/Dockerfile.gateway-rust"
@@ -55,19 +57,13 @@ def _embedded_outside_src() -> list[tuple[Path, Path]]:
     business in the Docker context. `stt_client.rs` embeds a .wav fixture that
     way and correctly is not COPY'd.
 
-    Heuristic — anything after the file's FIRST `#[cfg(test)]` is treated as
-    test-only, which matches this codebase's convention of a single test module
-    at the end. A production embed placed below a test module would be missed;
-    that is the trade for a static check with no cargo dependency.
+    Reads `rsrc.own_code`, which removes each `#[cfg(test)]` item whole, so a
+    production embed placed below a test module is still seen.
     """
     found = []
     for rs in RUST_SRC.rglob("*.rs"):
-        text = rs.read_text()
-        test_at = text.find("#[cfg(test)]")
-        cutoff = test_at if test_at >= 0 else len(text)
+        text = rsrc.own_code(rs.read_text())
         for m in INCLUDE.finditer(text):
-            if m.start() >= cutoff:
-                continue
             rel = m.group(1)
             target = (rs.parent / rel).resolve()
             try:

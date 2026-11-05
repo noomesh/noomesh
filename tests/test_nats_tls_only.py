@@ -36,6 +36,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tests import _rust_src as rs
+
 ROOT = Path(__file__).resolve().parents[1]
 NATS_DIR = ROOT / "monitoring/nats"
 COMPOSE_FILES = sorted(ROOT.glob("docker-compose*.yml"))
@@ -103,7 +105,7 @@ def test_the_launcher_refuses_a_stale_nats_config_selector() -> None:
     bind = _code((ROOT / "scripts/lib-bind-addr.sh").read_text())
     assert "NOO_NATS_CONFIG" not in bind, "lib-bind-addr.sh still picks the monitoring scheme from NOO_NATS_CONFIG"
     assert 'https://localhost:${NOO_PORT_NATS_MON' in bind, "the printed NATS monitoring URL is not https"
-    steps = _code((ROOT / "noo-cli/src/onboard/steps.rs").read_text(), "//")
+    steps = rs.own_code((ROOT / "noo-cli/src/onboard/steps.rs").read_text())
     assert "NOO_NATS_CONFIG" not in steps, "onboard still writes NOO_NATS_CONFIG into .env"
 
 
@@ -130,8 +132,10 @@ CLIENT_DEFAULTS = [
 def test_every_client_default_for_the_bus_and_redis_is_a_tls_scheme() -> None:
     for rel, tls_form, plain_forms in CLIENT_DEFAULTS:
         text = (ROOT / rel).read_text()
-        comment = "//" if rel.endswith((".rs", ".go")) else "#"
-        code = _code(text, comment)
+        if rel.endswith(".rs"):
+            code = rs.own_code(text)
+        else:
+            code = _code(text, "//" if rel.endswith(".go") else "#")
         assert tls_form in code, f"{rel}: the TLS default {tls_form!r} is gone — the scan would otherwise prove nothing"
         for plain in plain_forms:
             assert plain not in code, f"{rel}: plaintext default {plain!r} is back"
@@ -180,11 +184,11 @@ def test_the_gateway_dials_node_agents_over_https_only() -> None:
     (`tests/test_node_link_is_the_only_node_door.py` keeps the others out), and
     none of them switches on NOO_TLS_CA: a node agent has no plaintext listener
     to dial. The controller-local fallback in admin.rs stays https as well."""
-    link = _code((ROOT / "gateway-rust/src/node_link.rs").read_text(), "//").split("#[cfg(test)]")[0]
+    link = rs.own_code((ROOT / "gateway-rust/src/node_link.rs").read_text())
     built = re.findall(r'format!\("(\w+)://\{ip\}:\{AGENT_PORT\}"\)', link)
     assert len(built) >= 2, f"expected the for_node and for_ip URL builders, found {len(built)} — the parse found too little"
     assert set(built) == {"https"}, f"a node-agent URL can still be http: {built}"
     assert 'format!("http://' not in link
-    admin = _code((ROOT / "gateway-rust/src/routes/admin.rs").read_text(), "//")
+    admin = rs.own_code((ROOT / "gateway-rust/src/routes/admin.rs").read_text())
     m = re.search(r'let proto = ([^;]+);\s*(?://[^\n]*)?\n[^\n]*format!\("\{proto\}://node-agent', admin)
     assert m and m.group(1).strip() == '"https"', "the local agent fallback can be http"

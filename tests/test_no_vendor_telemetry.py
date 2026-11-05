@@ -34,6 +34,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests import _rust_src as rs
 from tests._compose_projection import env_of, full_projection
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -391,10 +392,8 @@ VERIFY_RS = ROOT / "noo-cli/src/commands/cluster_verify.rs"
 
 
 def _non_test_source(path: Path) -> str:
-    """The file up to its `#[cfg(test)]` module, which is always last."""
-    text = path.read_text()
-    cut = re.search(r"^#\[cfg\(test\)\]\s*$", text, re.M)
-    return text[: cut.start()] if cut else text
+    """The file's own code: comments blanked, every `#[cfg(test)]` item removed."""
+    return rs.own_code(path.read_text())
 
 
 def test_tailscaled_log_upload_switch_is_set_where_noomesh_installs_it():
@@ -414,14 +413,12 @@ def test_every_brew_command_noomesh_runs_turns_analytics_off():
     assert "HOMEBREW_NO_ANALYTICS=1" in _non_test_source(VENDOR_RS)
     found = []
     problems = []
-    for rs in sorted((ROOT / "noo-cli/src").rglob("*.rs")):
-        for n, line in enumerate(_non_test_source(rs).splitlines(), 1):
-            if line.lstrip().startswith("//"):
-                continue
+    for src_file in sorted((ROOT / "noo-cli/src").rglob("*.rs")):
+        for n, line in enumerate(rs.own_code_lines(src_file.read_text()).splitlines(), 1):
             if re.search(r"\bbrew (install|list|services|upgrade|update|analytics)\b", line):
-                found.append(f"{rs.name}:{n}")
+                found.append(f"{src_file.name}:{n}")
                 if "{b}" not in line and "BREW_ENV" not in line and "HOMEBREW_NO_ANALYTICS=1" not in line:
-                    problems.append(f"{rs.relative_to(ROOT)}:{n}: {line.strip()[:110]}")
+                    problems.append(f"{src_file.relative_to(ROOT)}:{n}: {line.strip()[:110]}")
     assert len(found) >= 4, f"only {found} brew commands found — the scan no longer matches enroll.rs"
     assert not problems, "brew runs without HOMEBREW_NO_ANALYTICS=1:\n  " + "\n  ".join(problems)
     assert "HOMEBREW_NO_ANALYTICS=1" in (ROOT / "scripts/setup-dev.sh").read_text()
@@ -473,18 +470,18 @@ def test_tailscaled_logs_stay_local_and_reach_loki():
 
 
 def test_the_operator_opt_in_marker_is_the_same_path_in_rust_and_go():
-    rs = re.search(r'TAILSCALE_UPLOAD_MARKER: &str = "([^"]+)"', VENDOR_RS.read_text())
+    marker_rs = re.search(r'TAILSCALE_UPLOAD_MARKER: &str = "([^"]+)"', VENDOR_RS.read_text())
     go = re.search(r'TailscaleUploadMarker = "([^"]+)"', HOSTTEL_GO.read_text())
-    assert rs and go, "marker constant not found in vendor.rs / hosttelemetry.go"
-    assert rs.group(1) == go.group(1) == "/etc/noo/allow-tailscale-log-upload"
+    assert marker_rs and go, "marker constant not found in vendor.rs / hosttelemetry.go"
+    assert marker_rs.group(1) == go.group(1) == "/etc/noo/allow-tailscale-log-upload"
 
 
 KIOSK_RS = ROOT / "noo-cli/src/commands/kiosk.rs"
 
 
 def _kiosk_code() -> str:
-    # Everything before the first test module: the shipped code, not its tests.
-    return KIOSK_RS.read_text().split("\n#[cfg(test)]\nmod tests", 1)[0]
+    # The shipped code, not its tests: comments blanked, test items removed.
+    return rs.own_code(KIOSK_RS.read_text())
 
 
 def test_kiosk_setup_switches_off_the_displays_tailscaled_log_upload():
@@ -506,8 +503,7 @@ def test_kiosk_status_shows_the_hosts_own_reporters_without_privilege():
     code = _kiosk_code()
     for row in ('"tailscale logs"', '"os reporters"'):
         assert row in code, f"noo kiosk status has no {row} row"
-    status = code.split("pub fn kiosk_status", 1)[1].split("// ── teardown", 1)[0]
-    live = "\n".join(l for l in status.splitlines() if not l.lstrip().startswith("//"))
+    live = rs.fn_body(code, "pub fn kiosk_status")
     assert "sudo" not in live, "status must stay readable without privilege"
 
 

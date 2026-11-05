@@ -22,6 +22,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tests import _rust_src as rs
+
 ROOT = Path(__file__).resolve().parents[1]
 
 # Where the namespace is declared. Each entry: (path, regex with ONE group
@@ -275,15 +277,12 @@ HOME_PREFIXES = ("tests/test_", "docs/", "ui/docs/", "internal/", ".worktrees/",
 
 def _code_lines(rel: str, text: str):
     """(lineno, line) of the lines that can be CODE: not comments, and for
-    Rust not the `#[cfg(test)]` tail (fixtures), for Go not *_test.go."""
+    Rust not any `#[cfg(test)]` item (fixtures), for Go not *_test.go."""
     if rel.endswith("_test.go") or rel.endswith(".md"):
         return
     lines = text.splitlines()
     if rel.endswith(".rs"):
-        for i, ln in enumerate(lines):
-            if ln.strip() == "#[cfg(test)]":
-                lines = lines[:i]
-                break
+        lines = rs.own_code_lines(text).splitlines()
     for i, ln in enumerate(lines, 1):
         st = ln.lstrip()
         if st.startswith(("//", "#", "*", "<!--")):
