@@ -71,9 +71,9 @@ fn local_cooldowns() -> &'static Mutex<HashMap<String, Instant>> {
 static STORE_ERROR_LOG: std::sync::LazyLock<crate::log_gate::LogGate> =
     std::sync::LazyLock::new(|| crate::log_gate::LogGate::new(300));
 
-async fn store_error(state: &AppState, op: &'static str, error: &str) {
+async fn store_error(metrics: &crate::metrics::MetricsState, op: &'static str, error: &str) {
     let labels = HashMap::from([("op".to_string(), op.to_string())]);
-    state.metrics.inc_counter("noo_operator_alert_store_errors_total", Some(&labels), 1).await;
+    metrics.inc_counter("noo_operator_alert_store_errors_total", Some(&labels), 1).await;
     if let Some(suppressed) = STORE_ERROR_LOG.should_log(op, unix_now().max(0) as u64) {
         tracing::warn!(op, error, suppressed, "operator_alert_store_unavailable: using this process's cooldown and state until Redis answers");
     }
@@ -96,7 +96,7 @@ async fn cooldown_acquired(state: &AppState, key: &str, secs: i64) -> bool {
         None => None,
     };
     if let Some(Err(e)) = &redis {
-        store_error(state, "cooldown", e).await;
+        store_error(&state.metrics, "cooldown", e).await;
     }
     cooldown_admit(redis, || local_cooldown(key, secs))
 }
@@ -295,38 +295,73 @@ fn state_key(kind: &str, target: &str) -> String {
     format!("noo:alerts:state:{kind}:{target}")
 }
 
-async fn load_state(state: &AppState, key: &str) -> Option<PersistState> {
-    if let Some(r) = state.redis.as_ref() {
+// The persisting state lives in Redis when Redis takes it. The local map
+// holds only what this process saved while Redis could not, until it is
+// dropped or superseded by a Redis save; it is read whenever Redis has no
+// copy (absent, erroring, or `None`).
+
+async fn load_state(redis: Option<&crate::cache::RedisCache>, metrics: &crate::metrics::MetricsState, key: &str) -> Option<PersistState> {
+    let read = match redis {
+        Some(r) => Some(r.get_string_checked(key).await),
+        None => None,
+    };
+    if let Some(Err(e)) = &read {
         // An error is not "no prior state": read that way, a persisting
         // alert was re-announced as new on every tick of the outage.
-        match r.get_string_checked(key).await {
-            Ok(raw) => return raw.and_then(|raw| serde_json::from_str(&raw).ok()),
-            Err(e) => store_error(state, "load_state", &e).await,
-        }
+        store_error(metrics, "load_state", e).await;
     }
-    local_states().lock().unwrap_or_else(|p| p.into_inner()).get(key).cloned()
+    let local = local_states().lock().unwrap_or_else(|p| p.into_inner()).get(key).cloned();
+    load_choice(read, local)
 }
 
-async fn save_state(state: &AppState, key: &str, st: &PersistState) {
-    if let Some(r) = state.redis.as_ref() {
+/// Which copy of a persisting state counts, pure. Redis's when it has one;
+/// otherwise the one this process saved while Redis could not take it. Read
+/// `Ok(None)` as "nothing open" and a condition saved locally during an
+/// outage was never cleared, then came back as open in the next outage.
+fn load_choice(redis: Option<Result<Option<String>, String>>, local: Option<PersistState>) -> Option<PersistState> {
+    match redis {
+        Some(Ok(Some(raw))) => serde_json::from_str(&raw).ok().or(local),
+        _ => local,
+    }
+}
+
+async fn save_state(redis: Option<&crate::cache::RedisCache>, metrics: &crate::metrics::MetricsState, key: &str, st: &PersistState) {
+    if let Some(r) = redis {
         let Ok(raw) = serde_json::to_string(st) else { return };
         if r.set_string(key, &raw).await {
             r.expire(key, STATE_TTL_SECS).await;
             r.sadd(OPEN_SET_KEY, key).await;
+            // Redis holds it now; an older local copy must not outlive it.
+            local_states().lock().unwrap_or_else(|p| p.into_inner()).remove(key);
             return;
         }
-        store_error(state, "save_state", "SET failed").await;
+        store_error(metrics, "save_state", "SET failed").await;
     }
     local_states().lock().unwrap_or_else(|p| p.into_inner()).insert(key.to_string(), st.clone());
 }
 
-async fn drop_state(state: &AppState, key: &str) {
-    if let Some(r) = state.redis.as_ref() {
-        r.del_key(key).await;
-        r.srem(OPEN_SET_KEY, key).await;
-        return;
-    }
+/// Close a persisting state everywhere it may be. The local copy always
+/// goes: it is what [`load_state`] reads while Redis errors, so keeping it
+/// (as this did when Redis was configured) sent "recovered" again on every
+/// tick of an outage and left it to come back in a later one.
+async fn drop_state(redis: Option<&crate::cache::RedisCache>, metrics: &crate::metrics::MetricsState, key: &str) {
     local_states().lock().unwrap_or_else(|p| p.into_inner()).remove(key);
+    if let Some(r) = redis {
+        if let Err(e) = r.del_key_checked(key).await {
+            store_error(metrics, "drop_state", &e).await;
+        }
+        if let Err(e) = r.srem_checked(OPEN_SET_KEY, key).await {
+            store_error(metrics, "drop_state", &e).await;
+        }
+    }
+}
+
+/// The state half of clearing a condition: what was open (if anything),
+/// now dropped.
+async fn take_state(redis: Option<&crate::cache::RedisCache>, metrics: &crate::metrics::MetricsState, key: &str) -> Option<PersistState> {
+    let prev = load_state(redis, metrics, key).await?;
+    drop_state(redis, metrics, key).await;
+    Some(prev)
 }
 
 /// Every persisting condition currently open (announced or held back).
@@ -334,7 +369,7 @@ pub async fn open_conditions(state: &AppState) -> Vec<PersistState> {
     let mut out = Vec::new();
     if let Some(r) = state.redis.as_ref() {
         for key in r.smembers(OPEN_SET_KEY).await {
-            match load_state(state, &key).await {
+            match load_state(Some(r), &state.metrics, &key).await {
                 Some(st) => out.push(st),
                 None => {
                     r.srem(OPEN_SET_KEY, &key).await; // expired: the set must not outlive it
@@ -454,8 +489,8 @@ pub async fn send_operator_alert_with(
         // On change, not on time: the schedule replaces the cooldown.
         let key = state_key(&alert.kind, &alert.target);
         let muted = target_muted(state, &alert.target, now).await;
-        let (step, st) = persisting_step(load_state(state, &key).await, &alert, now, muted);
-        save_state(state, &key, &st).await;
+        let (step, st) = persisting_step(load_state(state.redis.as_ref(), &state.metrics, &key).await, &alert, now, muted);
+        save_state(state.redis.as_ref(), &state.metrics, &key, &st).await;
         match step {
             Step::Quiet => return AlertOutcome::Cooldown,
             Step::Muted(first) => {
@@ -511,14 +546,12 @@ pub async fn send_operator_alert_detached_with(
 /// Returns true when a recovered message was queued.
 pub async fn clear_operator_alert(state: &AppState, recovered: OperatorAlert) -> bool {
     let key = state_key(&recovered.kind, &recovered.target);
-    let prev = load_state(state, &key).await;
-    if prev.is_none() {
+    let Some(prev) = take_state(state.redis.as_ref(), &state.metrics, &key).await else {
         return false;
-    }
+    };
     let now = unix_now();
     let muted = target_muted(state, &recovered.target, now).await;
-    let step = clear_step(prev.as_ref(), now, muted);
-    drop_state(state, &key).await;
+    let step = clear_step(Some(&prev), now, muted);
     let reference = egress::new_ref();
     match step {
         ClearStep::Nothing => false,
@@ -726,5 +759,40 @@ mod tests {
         // The buffer is empty again, so the next alert opens a new window.
         assert!(take_pending(&buf).is_empty());
         assert!(push_pending(&buf, pending("gamma")));
+    }
+
+    /// The dead-Redis shape, against a real client whose server never
+    /// answers: onset, recover, recover. The first recover finds the onset
+    /// (saved locally, since Redis failed) and drops it; the second finds
+    /// nothing, so "recovered" is sent once. Before, drop_state returned
+    /// after the failing Redis DEL with the local copy still there, and every
+    /// later tick (node_reachability's 120 s loop) sent "recovered" again.
+    #[tokio::test]
+    async fn with_redis_down_a_recovery_is_taken_once() {
+        let dead = crate::cache::RedisCache::dead_for_tests();
+        let metrics = crate::metrics::MetricsState::new();
+        let a = alert();
+        let key = format!("{}:dead-redis-test", state_key(&a.kind, &a.target));
+        let (_, onset) = persisting_step(None, &a, 0, false);
+        save_state(Some(&dead), &metrics, &key, &onset).await;
+        let first = take_state(Some(&dead), &metrics, &key).await.expect("the first recover sees the onset");
+        assert_eq!(clear_step(Some(&first), 2 * H, false), ClearStep::Deliver(2 * H));
+        assert_eq!(take_state(Some(&dead), &metrics, &key).await, None, "the second recover finds nothing to announce");
+        assert_eq!(load_state(Some(&dead), &metrics, &key).await, None, "nothing is left to come back in a later outage");
+    }
+
+    /// Which copy counts: Redis's when it has one, else this process's,
+    /// including when Redis answers "none" (a condition saved during an
+    /// outage is cleared once Redis is back, not left to resurface).
+    #[test]
+    fn the_local_copy_counts_whenever_redis_has_none() {
+        let (_, local) = persisting_step(None, &alert(), 0, false);
+        let (_, newer) = persisting_step(None, &alert(), 7 * H, false);
+        let raw = serde_json::to_string(&newer).unwrap();
+        assert_eq!(load_choice(Some(Ok(Some(raw))), Some(local.clone())), Some(newer), "Redis's copy wins");
+        assert_eq!(load_choice(Some(Ok(None)), Some(local.clone())), Some(local.clone()), "Redis has none: the local one");
+        assert_eq!(load_choice(Some(Err("refused".into())), Some(local.clone())), Some(local.clone()));
+        assert_eq!(load_choice(None, Some(local.clone())), Some(local));
+        assert_eq!(load_choice(Some(Ok(None)), None), None);
     }
 }
