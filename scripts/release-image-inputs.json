@@ -99,6 +99,7 @@
         "tests/fixtures/audit_chain_vectors.json",
         "tests/fixtures/kb_audience_isolation.json",
         "tests/fixtures/own_image_cases.json",
+        "tests/fixtures/test_src_cases.json",
         "config/harness-kinds.json",
         "config/harness-profiles.json",
         "config/model-capabilities.json",
