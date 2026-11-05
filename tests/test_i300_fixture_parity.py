@@ -187,11 +187,13 @@ def load_schema(name: str) -> dict:
 NOT_IN_SCHEMA = {
     "model-sets": {
         "refuse-trailing-data.json",
+        "refuse-duplicate-key.json",
         "refuse-notice-not-in-files.json",
         "refuse-files-duplicate-path.json",
     },
     "node-workloads": {
         "refuse-trailing-data.json",
+        "refuse-duplicate-key.json",
         "refuse-image-not-in-lock.json",
         "refuse-name-duplicate.json",
         "refuse-env-key-outside-prefix.json",
