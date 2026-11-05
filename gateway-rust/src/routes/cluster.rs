@@ -246,6 +246,25 @@ pub(crate) fn carry_reported(data: &mut Value, body: &Value, key: &str) {
     }
 }
 
+/// The agent's `lanes` (proposal i403), stored on every beat so the class
+/// table reads them (`node_facts_from_kv`). An agent that reports lanes
+/// sends the key on EVERY beat (`[]` included: "no lanes"; the agent's
+/// `secLanes` section is unconditional), so a beat without it is an agent
+/// too old to report, or a downgrade. The stored key is then removed and
+/// routing falls back to `running_backends`, never routing on lanes the node
+/// no longer reports. Not `carry_reported`, which keeps the last value.
+/// A key that is not a list is treated as absent.
+pub(crate) fn carry_lanes(data: &mut Value, body: &Value) {
+    match body.get("lanes").filter(|v| v.is_array()) {
+        Some(v) => data["lanes"] = v.clone(),
+        None => {
+            if let Some(o) = data.as_object_mut() {
+                o.remove("lanes");
+            }
+        }
+    }
+}
+
 async fn node_heartbeat(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
@@ -273,6 +292,7 @@ async fn node_heartbeat(
     data["status"] = json!("online");
     data["current_load"] = json!(body.get("load").and_then(|v| v.as_f64()).unwrap_or(0.0));
     data["running_backends"] = body.get("running_backends").cloned().unwrap_or(json!({}));
+    carry_lanes(&mut data, &body);
     // The node on the controller's own device says so (NOO_SELF_NODE);
     // fleet views and node verbs branch on it.
     if let Some(v) = body.get("self_node") { if !v.is_null() { data["self_node"] = v.clone(); } }
@@ -8094,5 +8114,39 @@ mod nodes_bus_down_tests {
         assert_eq!(nodes_list_error(false, None).as_deref(), Some(NODES_BUS_DOWN));
         let both = nodes_list_error(false, Some("cannot read cluster_nodes".into())).unwrap();
         assert!(both.starts_with(NODES_BUS_DOWN) && both.ends_with("; cannot read cluster_nodes"), "{both}");
+    }
+}
+
+#[cfg(test)]
+mod lanes_carried_tests {
+    use super::*;
+    use crate::coordinator::classes::node_facts_from_kv;
+
+    /// Phase 2 read `lanes` from mesh_nodes, but this handler never stored
+    /// them, so every live node routed by `running_backends` and the tests,
+    /// which seeded the record, passed. The agent's golden beat goes through
+    /// the handler's own step into the record the class table reads.
+    #[test]
+    fn a_heartbeat_stores_the_agents_lanes_and_a_beat_without_them_clears_them() {
+        let golden: Value = serde_json::from_str(include_str!("../coordinator/testdata/lanes_fixture.json")).expect("the fixture parses");
+        let mut data = json!({"id": "n1", "ip_address": "100.64.0.1"});
+        carry_lanes(&mut data, &golden);
+        let lanes = node_facts_from_kv("n1", &data, &[], 0.0).lanes;
+        assert!(lanes.as_ref().is_some_and(|l| l.len() >= 4), "the beat's lanes reach the class table: {lanes:?}");
+        // An older agent (or a downgrade): no key, so no stale lanes.
+        carry_lanes(&mut data, &json!({"running_backends": golden["running_backends"]}));
+        assert!(data.get("lanes").is_none(), "{data}");
+        assert_eq!(node_facts_from_kv("n1", &data, &[], 0.0).lanes, None, "falls back to running_backends");
+        // `[]` is kept: an agent with no lanes routes nothing.
+        carry_lanes(&mut data, &json!({"lanes": []}));
+        assert_eq!(node_facts_from_kv("n1", &data, &[], 0.0).lanes.map(|l| l.len()), Some(0));
+        carry_lanes(&mut data, &json!({"lanes": "garbage"}));
+        assert!(data.get("lanes").is_none(), "a non-list is absent");
+        // The handler runs this step before its KV write.
+        let code = crate::test_src::own_code(include_str!("cluster.rs"));
+        let beat = crate::test_src::fn_body(&code, "async fn node_heartbeat(");
+        let carry = beat.find("carry_lanes(&mut data, &body);").expect("the heartbeat stores lanes");
+        let put = beat.find("kv.put(&node_id").expect("the heartbeat's KV write");
+        assert!(carry < put, "stored before the record is written");
     }
 }
