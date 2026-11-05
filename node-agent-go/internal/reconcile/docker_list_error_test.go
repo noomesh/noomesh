@@ -85,6 +85,10 @@ func tickFixture(t *testing.T, d *listDaemon) *Reconciler {
 		_, _ = w.Write([]byte(`{"placements":[{"backend":"vllm","model":"google/gemma","image":"vllm/vllm-openai:v0.25.0","port":8000,"desired_state":"running"}]}`))
 	}))
 	t.Cleanup(ctl.Close)
+	// The image manifest probe reads the controller URL from CONTROLLER_URL
+	// (ctrlenv), not from cfg; point it at the same fake so no test here
+	// needs the network or DNS (the default is https://gateway:8080).
+	t.Setenv("CONTROLLER_URL", ctl.URL)
 
 	r := New(&config.Config{ControllerURL: ctl.URL, NodeID: "n1", StateDir: t.TempDir()}, dc, ctl.Client(), nil)
 	return r
