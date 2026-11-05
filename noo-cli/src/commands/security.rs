@@ -2916,7 +2916,8 @@ fn finish(
     Ok(if outcome.exits_zero() { 0 } else { 1 })
 }
 
-pub fn security_service_key_retire(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+/// `CONSUMER` → the consumer. No flags.
+pub(crate) fn parse_service_key_retire(args: &[String]) -> Result<String, Unhandled> {
     let mut consumer: Option<String> = None;
     for tok in args {
         match tok.as_str() {
@@ -2924,7 +2925,11 @@ pub fn security_service_key_retire(g: &Globals, args: &[String]) -> Result<i32, 
             _ => return Err(Unhandled),
         }
     }
-    let consumer = consumer.ok_or(Unhandled)?;
+    consumer.ok_or(Unhandled)
+}
+
+pub fn security_service_key_retire(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let consumer = parse_service_key_retire(args)?;
     let body = post_json(
         g,
         &format!("/api/security/service-keys/{consumer}/retire"),
@@ -2952,13 +2957,8 @@ pub fn security_service_key_retire(g: &Globals, args: &[String]) -> Result<i32, 
     Ok(0)
 }
 
-pub fn security_service_key_revoke(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    // `--disable-account` is the kill switch. Revoking a key
-    // stops the NEXT mint; a token already issued keeps working until it
-    // expires. Disabling the bound account is what reaches those, because
-    // the gateway re-checks a delegated token's subject on every request.
-    // An operator stopping a runaway agent almost always means both, and
-    // the gateway does them in one transaction so there is no half-state.
+/// `CONSUMER [--disable-account] [--yes|-y]` → (consumer, disable_account, yes).
+pub(crate) fn parse_service_key_revoke(args: &[String]) -> Result<(String, bool, bool), Unhandled> {
     let mut consumer: Option<String> = None;
     let mut disable_account = false;
     let mut yes = false;
@@ -2970,7 +2970,17 @@ pub fn security_service_key_revoke(g: &Globals, args: &[String]) -> Result<i32, 
             _ => return Err(Unhandled),
         }
     }
-    let consumer = consumer.ok_or(Unhandled)?;
+    Ok((consumer.ok_or(Unhandled)?, disable_account, yes))
+}
+
+pub fn security_service_key_revoke(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    // `--disable-account` is the kill switch. Revoking a key
+    // stops the NEXT mint; a token already issued keeps working until it
+    // expires. Disabling the bound account is what reaches those, because
+    // the gateway re-checks a delegated token's subject on every request.
+    // An operator stopping a runaway agent almost always means both, and
+    // the gateway does them in one transaction so there is no half-state.
+    let (consumer, disable_account, yes) = parse_service_key_revoke(args)?;
     // Irreversible: a revoked key cannot be brought back, only replaced, and
     // --disable-account also locks the bound user out.
     super::confirm_destructive(
@@ -3632,6 +3642,31 @@ mod parse_pin_tests {
             (&["--callers", "--all"], Some(Revoked::Every)),
             (&["--bogus"], None),
             (&["consumer"], None),
+        ]);
+    }
+
+    #[test]
+    fn old_parse_service_key_retire_table() {
+        check("service-key retire", parse_service_key_retire, &[
+            (&["agent-1"], Some(st("agent-1"))),
+            (&[], None),
+            (&["agent-1", "agent-2"], None),
+            (&["agent-1", "--yes"], None),
+            (&["-"], None),
+        ]);
+    }
+
+    #[test]
+    fn old_parse_service_key_revoke_table() {
+        check("service-key revoke", parse_service_key_revoke, &[
+            (&["agent-1"], Some((st("agent-1"), false, false))),
+            (&["agent-1", "--disable-account", "-y"], Some((st("agent-1"), true, true))),
+            (&["--yes", "agent-1"], Some((st("agent-1"), false, true))),
+            (&[], None),
+            (&["--disable-account"], None),
+            (&["agent-1", "agent-2"], None),
+            (&["agent-1", "--force"], None),
+            (&["-"], None),
         ]);
     }
 }
