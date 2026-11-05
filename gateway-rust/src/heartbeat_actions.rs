@@ -3519,6 +3519,23 @@ fn errors_section_text(rows: Result<Vec<(Option<String>, Option<String>, Option<
     }
 }
 
+/// The digest's average load over the online nodes that REPORTED one. The
+/// node records carry `current_load` (0.0-1.0, as node_heartbeat stores it);
+/// this read `load`, which they do not carry, defaulted every node to 0.0
+/// and printed the 0-1 average as a percent ("0.1%"). A node with no load
+/// is counted as unreported, never as idle.
+fn avg_load_line(nodes: &[Value]) -> Option<String> {
+    let online: Vec<&Value> = nodes.iter().filter(|n| n.get("status").and_then(|s| s.as_str()) == Some("online")).collect();
+    let loads: Vec<f64> = online.iter().filter_map(|n| n.get("current_load").and_then(|v| v.as_f64())).collect();
+    let unreported = online.len() - loads.len();
+    let note = if unreported > 0 { format!(" ({unreported} not reporting a load)") } else { String::new() };
+    if loads.is_empty() {
+        return (unreported > 0).then(|| format!("- **Avg Load**: not reported{note}"));
+    }
+    let avg = loads.iter().sum::<f64>() / loads.len() as f64;
+    Some(format!("- **Avg Load**: {:.0}%{note}", avg * 100.0))
+}
+
 async fn gather_section(state: &crate::state::AppState, section: &str) -> String {
     match section {
         "cluster" => match cluster_nodes(state).await {
@@ -3539,15 +3556,7 @@ async fn gather_section(state: &crate::state::AppState, section: &str) -> String
                         .unwrap_or("?");
                     lines.push(format!("  - OFFLINE: {name}"));
                 }
-                let loads: Vec<f64> = nodes
-                    .iter()
-                    .filter(|n| n.get("status").and_then(|s| s.as_str()) == Some("online"))
-                    .map(|n| n.get("load").and_then(|v| v.as_f64()).unwrap_or(0.0))
-                    .collect();
-                if !loads.is_empty() {
-                    let avg = loads.iter().sum::<f64>() / loads.len() as f64;
-                    lines.push(format!("- **Avg Load**: {avg:.1}%"));
-                }
+                lines.extend(avg_load_line(&nodes));
                 lines.join("\n")
             }
         },
@@ -5985,3 +5994,24 @@ mod i460_followup_tests {
     }
 }
 
+#[cfg(test)]
+mod avg_load_tests {
+    use super::avg_load_line;
+    use serde_json::json;
+
+    /// The records carry `current_load` on the 0.0-1.0 scale. An online node
+    /// that reports none is named as such, never averaged in as 0.0.
+    #[test]
+    fn the_digest_averages_only_reported_loads_as_a_percent() {
+        let nodes = [
+            json!({"id": "a", "status": "online", "current_load": 0.2}),
+            json!({"id": "b", "status": "online", "current_load": 0.6}),
+            json!({"id": "c", "status": "online"}),
+            json!({"id": "d", "status": "offline", "current_load": 0.9}),
+        ];
+        assert_eq!(avg_load_line(&nodes).as_deref(), Some("- **Avg Load**: 40% (1 not reporting a load)"));
+        assert_eq!(avg_load_line(&nodes[..2]).as_deref(), Some("- **Avg Load**: 40%"));
+        assert_eq!(avg_load_line(&nodes[2..3]).as_deref(), Some("- **Avg Load**: not reported (1 not reporting a load)"));
+        assert_eq!(avg_load_line(&nodes[3..]), None, "no online node");
+    }
+}

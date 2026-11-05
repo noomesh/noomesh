@@ -609,7 +609,8 @@ struct Candidate {
     backend_type: String,
     model_name: String,
     url: String,
-    load: f64,
+    /// `None` = the node reported no load: sorts after every reported one.
+    load: Option<f64>,
     excluded: bool,
     /// The class table's health rule ([`super::classes::node_health`]):
     /// heartbeat fresh, reachable, not quarantined or offline, and the
@@ -877,13 +878,14 @@ fn unhealthy_summary(candidates: &[Candidate]) -> String {
     out.join("; ")
 }
 
-fn sort_key(exact_model: bool, preferred_type: bool, load: f64) -> (i32, i32, i32, i64) {
+fn sort_key(exact_model: bool, preferred_type: bool, load: Option<f64>) -> (i32, i32, i32, i64) {
     (
         if exact_model { 0 } else { 1 },
         if preferred_type { 0 } else { 1 },
-        busy_rank(load),
+        // An unreported load ranks after a busy node, never as idle.
+        load.map(busy_rank).unwrap_or(2),
         // Integer for Ord; x100 because the scale is 0.0–1.0.
-        (load * 100.0) as i64,
+        super::classes::load_key(load),
     )
 }
 
@@ -1110,10 +1112,13 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
                             // pinned turn and raw chat agree on who is up.
                             let inbound = crate::node_reachability::read_inbound(state, &key).await;
                             crate::node_reachability::apply_inbound(&mut data, inbound.as_deref());
-                            let node_load = data.get("load")
+                            // `current_load` is the key node_heartbeat
+                            // stores; this read `load`, which nothing
+                            // writes, so busy_rank never saw a live load.
+                            // Absent = unknown (sorts last), never 0.0.
+                            let node_load = data.get("current_load")
                                 .and_then(|l| l.as_f64())
-                                .map(|l| scale_checked_load(&key, l))
-                                .unwrap_or(0.0);
+                                .map(|l| scale_checked_load(&key, l));
 
                             // 185a: backends that name no model are skipped
                             // below; say so (live node, chat role, not warming),
@@ -1264,7 +1269,7 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
             model = %best.model_name,
             url = %resolved_url,
             gossip_url = %best.url,
-            load = best.load, candidates = candidates.len(),
+            load = ?best.load, candidates = candidates.len(),
             requested_model = ?requested_model,
             source = "nats_kv",
             "backend_resolved"
@@ -1492,7 +1497,7 @@ mod tests {
             backend_type: bt.into(),
             model_name: model.into(),
             url: format!("https://noo-{bt}:1"),
-            load: 0.0,
+            load: Some(0.0),
             excluded,
             healthy: true,
             health: String::new(),
@@ -1542,7 +1547,7 @@ mod tests {
         dead.healthy = false;
         dead.health = "heartbeat 95s old".into();
         let mut busy = cand("host8-ma", "ollama", PIN, false);
-        busy.load = 0.85;
+        busy.load = Some(0.85);
         let mut all = vec![dead, busy];
         super::order_candidates(&mut all, PIN, "ollama");
         assert_eq!(all[0].node_id, "host8-ma");
@@ -1645,8 +1650,8 @@ mod tests {
         // The tier that could never fire. Same backend type, same model
         // situation: the only difference is load, and 0.98 used to compare
         // false against 80.0 so it ranked as "not busy".
-        let busy = sort_key(false, true, 0.98);
-        let idle = sort_key(false, true, 0.10);
+        let busy = sort_key(false, true, Some(0.98));
+        let idle = sort_key(false, true, Some(0.10));
         assert!(idle < busy, "idle={idle:?} busy={busy:?}");
         assert_eq!(busy.2, 1, "0.98 must register as busy");
         assert_eq!(idle.2, 0);
@@ -1664,8 +1669,8 @@ mod tests {
         // decision where the two candidates differed in type. On the live
         // incident the decisive fault was that NOTHING advertised a model
         // (the SetHeld instance bug), so the only candidate carrying one won.
-        let busy_preferred = sort_key(false, true, 0.98);
-        let idle_other = sort_key(false, false, 0.10);
+        let busy_preferred = sort_key(false, true, Some(0.98));
+        let idle_other = sort_key(false, false, Some(0.10));
         assert!(busy_preferred < idle_other, "type outranks load, deliberately");
     }
 
@@ -1673,19 +1678,19 @@ mod tests {
     fn an_exact_model_match_still_outranks_everything() {
         // Tier 0 is not weakened by the fix: a node holding the requested model
         // wins even while busy, because the alternative is the wrong model.
-        let exact_busy = sort_key(true, false, 0.99);
-        let idle_preferred = sort_key(false, true, 0.01);
+        let exact_busy = sort_key(true, false, Some(0.99));
+        let idle_preferred = sort_key(false, true, Some(0.01));
         assert!(exact_busy < idle_preferred);
     }
 
     #[test]
     fn among_equally_idle_nodes_the_preferred_type_still_wins() {
-        assert!(sort_key(false, true, 0.10) < sort_key(false, false, 0.10));
+        assert!(sort_key(false, true, Some(0.10)) < sort_key(false, false, Some(0.10)));
     }
 
     #[test]
     fn among_equally_busy_nodes_the_lighter_one_wins() {
-        assert!(sort_key(false, false, 0.91) < sort_key(false, false, 0.99));
+        assert!(sort_key(false, false, Some(0.91)) < sort_key(false, false, Some(0.99)));
     }
 
     #[test]
@@ -1946,7 +1951,7 @@ mod pinned_hold_tests {
             backend_type: backend.into(),
             model_name: model.into(),
             url: String::new(),
-            load: 0.1,
+            load: Some(0.1),
             excluded: false,
             healthy: true,
             health: String::new(),
@@ -1988,7 +1993,7 @@ mod unpinned_tests {
             node_id: id.into(),
             ip: ip.into(),
             running: vec![(backend.into(), model.into())],
-            load,
+            load: Some(load),
             gpu,
             heartbeat_age_secs: Some(2.0),
             inbound_ok: true,

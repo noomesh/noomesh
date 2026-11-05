@@ -254,6 +254,23 @@ pub(crate) fn carry_reported(data: &mut Value, body: &Value, key: &str) {
 /// routing falls back to `running_backends`, never routing on lanes the node
 /// no longer reports. Not `carry_reported`, which keeps the last value.
 /// A key that is not a list is treated as absent.
+/// The agent's `load` (0.0-1.0), stored as `current_load` on every beat.
+/// An agent that cannot read its load omits the key (macOS reported 0,
+/// a lie; personifai-df's i495 agent work): absent or not a number is
+/// UNKNOWN, so the key is removed. `unwrap_or(0.0)` made such a node look
+/// the least loaded in placement and routing, which drew work to it. Not
+/// `carry_reported`, which would keep the last value.
+pub(crate) fn carry_load(data: &mut Value, body: &Value) {
+    match body.get("load").and_then(Value::as_f64) {
+        Some(l) => data["current_load"] = json!(l),
+        None => {
+            if let Some(o) = data.as_object_mut() {
+                o.remove("current_load");
+            }
+        }
+    }
+}
+
 pub(crate) fn carry_lanes(data: &mut Value, body: &Value) {
     match body.get("lanes").filter(|v| v.is_array()) {
         Some(v) => data["lanes"] = v.clone(),
@@ -290,7 +307,7 @@ async fn node_heartbeat(
     data["id"] = json!(node_id);
     data["hostname"] = json!(node_id);  // Use node_id, not container hostname
     data["status"] = json!("online");
-    data["current_load"] = json!(body.get("load").and_then(|v| v.as_f64()).unwrap_or(0.0));
+    carry_load(&mut data, &body);
     data["running_backends"] = body.get("running_backends").cloned().unwrap_or(json!({}));
     carry_lanes(&mut data, &body);
     // The node on the controller's own device says so (NOO_SELF_NODE);
@@ -587,7 +604,8 @@ async fn node_heartbeat(
     let vram_gb = data.get("vram_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let cpu_cores = data.get("cpu_cores").and_then(|v| v.as_i64()).unwrap_or(4) as i32;
     let ram_gb = data.get("ram_gb").and_then(|v| v.as_f64()).unwrap_or(8.0);
-    let current_load = data.get("current_load").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    // NULL when the beat carried no numeric load (`carry_load`).
+    let current_load: Option<f64> = data.get("current_load").and_then(|v| v.as_f64());
     let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("online").to_string();
     let running_backends = data.get("running_backends").cloned().unwrap_or_else(|| json!({}));
     let agent_url = data.get("agent_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -1597,7 +1615,8 @@ pub(crate) async fn cluster_backends(State(state): State<Arc<AppState>>) -> AppJ
                 if let Ok(Some(entry)) = kv.get(&key).await {
                     if let Ok(data) = serde_json::from_slice::<Value>(&entry) {
                         let hostname = data.get("hostname").and_then(|h| h.as_str()).unwrap_or(&key);
-                        let load = data.get("load").and_then(|l| l.as_f64()).unwrap_or(0.0);
+                        // the key the heartbeat stores; null when unreported
+                        let load = data.get("current_load").and_then(|l| l.as_f64());
                         if let Some(rb) = data.get("running_backends").and_then(|r| r.as_object()) {
                             for (bt, model_val) in rb {
                                 let model = model_val.as_str().unwrap_or("?");
@@ -3293,7 +3312,8 @@ async fn terminal_backends(State(state): State<Arc<AppState>>) -> AppJson {
                 if let Ok(Some(entry)) = kv.get(&key).await {
                     if let Ok(data) = serde_json::from_slice::<Value>(&entry) {
                         let hostname = data.get("hostname").and_then(|h| h.as_str()).unwrap_or(&key);
-                        let load = data.get("load").and_then(|l| l.as_f64()).unwrap_or(0.0);
+                        // the key the heartbeat stores; null when unreported
+                        let load = data.get("current_load").and_then(|l| l.as_f64());
                         if let Some(rb) = data.get("running_backends").and_then(|r| r.as_object()) {
                             for (bt, model_val) in rb {
                                 let model = model_val.as_str().unwrap_or("?");
@@ -8148,6 +8168,68 @@ mod nodes_bus_down_tests {
         assert_eq!(nodes_list_error(false, None).as_deref(), Some(NODES_BUS_DOWN));
         let both = nodes_list_error(false, Some("cannot read cluster_nodes".into())).unwrap();
         assert!(both.starts_with(NODES_BUS_DOWN) && both.ends_with("; cannot read cluster_nodes"), "{both}");
+    }
+}
+
+#[cfg(test)]
+mod load_carried_tests {
+    use super::*;
+    use crate::coordinator::classes::{build_table, node_facts_from_kv, Declarations};
+    use crate::scheduler_candidates::{get_candidate_nodes, CompanionPolicies};
+    use crate::scheduler_engine::snapshot_from_kv;
+    use crate::scheduler_job::TaskPriority;
+
+    /// One node's record as node_heartbeat builds it from a beat: the
+    /// registration fields, then the handler's own load step.
+    fn record(id: &str, ip: &str, beat: &Value) -> Value {
+        let mut data = json!({
+            "id": id, "ip_address": ip, "status": "online", "tier": 2, "vram_gb": 0,
+            "last_heartbeat": 1000.0, "running_backends": {"ollama": "gemma4:12b"},
+        });
+        carry_load(&mut data, beat);
+        data
+    }
+
+    /// A beat with a load stores it where every reader looks; a beat without
+    /// one (an agent that cannot read it), or with one that is not a number,
+    /// leaves the load UNKNOWN, never 0.0. Read back through the class table
+    /// and the scheduler, which are what rank on it.
+    #[test]
+    fn a_beat_without_a_numeric_load_is_unknown_never_idle() {
+        let mut data = record("n1", "100.64.0.1", &json!({"load": 0.4}));
+        assert_eq!(data["current_load"], json!(0.4));
+        assert_eq!(node_facts_from_kv("n1", &data, &[], 1000.0).load, Some(0.4));
+        assert_eq!(snapshot_from_kv("n1", &data, 1000.0).current_load, Some(0.4));
+        for beat in [json!({}), json!({"load": null}), json!({"load": "0"})] {
+            carry_load(&mut data, &beat);
+            assert!(data.get("current_load").is_none(), "{beat}: {data}");
+            assert_eq!(node_facts_from_kv("n1", &data, &[], 1000.0).load, None, "{beat}");
+            assert_eq!(snapshot_from_kv("n1", &data, 1000.0).current_load, None, "{beat}");
+        }
+        // The handler runs this step, not a 0.0 default, before its KV write.
+        let code = crate::test_src::own_code(include_str!("cluster.rs"));
+        let beat = crate::test_src::fn_body(&code, "async fn node_heartbeat(");
+        let carry = beat.find("carry_load(&mut data, &body);").expect("the heartbeat stores the load");
+        let put = beat.find("kv.put(&node_id").expect("the heartbeat's KV write");
+        assert!(carry < put, "stored before the record is written");
+        assert!(!beat.contains("body.get(\"load\")"), "the beat's load is read only by carry_load");
+    }
+
+    /// The node that did not report a load ranks after one that reported a
+    /// high one, in routing (the derived class) and in placement (the
+    /// scheduler). Named so a by-name tiebreak would put it first.
+    #[test]
+    fn an_unreported_load_ranks_after_a_reported_one() {
+        let quiet = record("a-mac", "100.64.0.1", &json!({}));
+        let busy = record("b-linux", "100.64.0.2", &json!({"load": 0.8}));
+        let facts = [node_facts_from_kv("a-mac", &quiet, &[], 1000.0), node_facts_from_kv("b-linux", &busy, &[], 1000.0)];
+        let t = build_table(&facts, &[], &Declarations::default());
+        let order: Vec<&str> = t.class("gemma4:12b").expect("the derived class").candidates.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(order, ["b-linux", "a-mac"], "routing");
+        let snaps = [snapshot_from_kv("a-mac", &quiet, 1000.0), snapshot_from_kv("b-linux", &busy, 1000.0)];
+        let placed: Vec<&str> =
+            get_candidate_nodes(&snaps, None, None, TaskPriority::Medium, 0.0, &CompanionPolicies::default()).iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(placed, ["b-linux", "a-mac"], "placement");
     }
 }
 

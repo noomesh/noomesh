@@ -657,7 +657,7 @@ async fn resolve_skill_node(
     }
 
     // Score each node: read current_load from KV, filter by GPU if needed
-    let mut best: Option<(String, String, f64)> = None;
+    let mut best: Option<(String, String, i64)> = None;
 
     if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
         for (nid, url, _hostname) in &agents {
@@ -676,7 +676,8 @@ async fn resolve_skill_node(
                         if !has_gpu { continue; }
                     }
 
-                    let load = data.get("current_load").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                    // An unreported load sorts after every reported one.
+                    let load = crate::coordinator::classes::load_key(data.get("current_load").and_then(|v| v.as_f64()));
                     if best.as_ref().map(|(_, _, bl)| load < *bl).unwrap_or(true) {
                         best = Some((nid.clone(), url.clone(), load));
                     }
