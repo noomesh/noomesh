@@ -43,13 +43,21 @@ const (
 	Stopped State = "stopped"
 	// Running: installed and active.
 	Running State = "running"
+	// Unknown: the probe could not answer — the init system's tool is
+	// missing, timed out, was killed, or said nothing recognizable. It is
+	// NOT Stopped: a caller that read "could not look" as "not running"
+	// would start or restart a harness that may be serving turns.
+	Unknown State = "unknown"
 )
 
 // Service is the lifecycle the reconciler drives. One implementation per
 // init system, plus a fake for tests.
 type Service interface {
 	// State never needs privilege and never returns an error for "not
-	// running": absence and inactivity are states, not failures.
+	// running": absence and inactivity are states, not failures. A probe
+	// that cannot answer (tool missing, timeout, killed, no recognizable
+	// output) is Unknown, never Stopped; callers must take no lifecycle
+	// action on Unknown.
 	State(ctx context.Context) State
 	Start(ctx context.Context) error
 	Stop(ctx context.Context) error
@@ -125,18 +133,44 @@ type systemd struct{}
 func (s *systemd) Runtime() string { return "systemd" }
 
 func (s *systemd) State(ctx context.Context) State {
-	if _, err := os.Stat("/etc/systemd/system/" + UnitName + ".service"); err != nil {
+	if _, err := statFile("/etc/systemd/system/" + UnitName + ".service"); err != nil {
 		return Absent
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	// is-active exits 0 for active, non-zero otherwise; the word on stdout
-	// is the state. Unprivileged.
-	out, _ := exec.CommandContext(ctx, "systemctl", "is-active", UnitName).Output()
-	if strings.TrimSpace(string(out)) == "active" {
-		return Running
+	// is the state. Unprivileged. A non-zero exit alone is NOT a failure
+	// to probe (inactive/failed/activating all exit non-zero); only the
+	// lack of a recognizable word is.
+	out, _ := runIsActive(ctx)
+	if ctx.Err() != nil {
+		return Unknown // timed out or cancelled: whatever it printed is partial
 	}
-	return Stopped
+	return parseIsActive(string(out))
+}
+
+// statFile and runIsActive are seams so tests never touch the real unit
+// directory or run the real systemctl.
+var statFile = os.Stat
+
+var runIsActive = func(ctx context.Context) ([]byte, error) {
+	return exec.CommandContext(ctx, "systemctl", "is-active", UnitName).Output()
+}
+
+// parseIsActive maps `systemctl is-active` stdout to a State. Every word
+// systemd documents for an installed unit that is not active is Stopped
+// (activating included: the unit is Restart=always, and the existing
+// reading of it as not running is kept); anything else, including no
+// output, is Unknown.
+func parseIsActive(out string) State {
+	word, _, _ := strings.Cut(strings.TrimSpace(out), "\n")
+	switch strings.TrimSpace(word) {
+	case "active":
+		return Running
+	case "inactive", "failed", "activating", "deactivating", "reloading", "refreshing", "maintenance":
+		return Stopped
+	}
+	return Unknown
 }
 
 // Restarts reads systemd's own restart counter.
@@ -351,7 +385,7 @@ func (l *launchd) WhyNotRunning(ctx context.Context) string {
 }
 
 func (l *launchd) State(ctx context.Context) State {
-	if _, err := os.Stat(l.plist()); err != nil {
+	if _, err := statFile(l.plist()); err != nil {
 		return Absent
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -359,14 +393,39 @@ func (l *launchd) State(ctx context.Context) State {
 	// `launchctl print system/<label>` exits 0 only when the job is
 	// bootstrapped into the system domain; with KeepAlive that means
 	// running or about to be. Reading state needs no privilege.
-	out, err := exec.CommandContext(ctx, "launchctl", "print", l.target()).Output()
-	if err != nil {
-		return Stopped
+	out, err := runLaunchPrint(ctx, l.target())
+	return parseLaunchPrint(ctx, out, err)
+}
+
+// runLaunchPrint is the launchctl probe, a seam so tests never run the
+// real binary.
+var runLaunchPrint = func(ctx context.Context, target string) ([]byte, error) {
+	return exec.CommandContext(ctx, "launchctl", "print", target).Output()
+}
+
+// parseLaunchPrint maps `launchctl print` to a State. launchctl ANSWERING
+// "no such job" is a non-zero exit it ran to completion with: Stopped. A
+// launchctl that could not run, timed out, was killed by a signal, or
+// printed no `state =` line gave no answer: Unknown.
+func parseLaunchPrint(ctx context.Context, out []byte, err error) State {
+	if ctx.Err() != nil {
+		return Unknown
 	}
-	if strings.Contains(string(out), "state = running") {
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && ee.ProcessState != nil && ee.ProcessState.Exited() {
+			return Stopped
+		}
+		return Unknown
+	}
+	s := string(out)
+	if strings.Contains(s, "state = running") {
 		return Running
 	}
-	return Stopped
+	if strings.Contains(s, "state = ") {
+		return Stopped
+	}
+	return Unknown
 }
 
 // Start and Stop go through noo-hostd, exactly as on Linux. The agent runs
