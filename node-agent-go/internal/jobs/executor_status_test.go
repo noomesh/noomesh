@@ -144,3 +144,63 @@ func checkStatus(t *testing.T, got any, err error, wantErr []string, wantStatus,
 		t.Fatalf("job recorded as %q, want %q", ev, wantEvent)
 	}
 }
+
+func TestFailedPayloadRetryable(t *testing.T) {
+	cases := []struct {
+		name      string
+		status    int // 0 = transport error
+		wantRetry any // nil = field absent
+	}{
+		{"401", 401, false},
+		{"403", 403, false},
+		{"500", 500, nil},
+		{"429", 429, nil},
+		{"transport error", 0, nil},
+	}
+	for _, tc := range cases {
+		check := func(t *testing.T, err error) {
+			t.Helper()
+			p := failedPayload("job-1", err)
+			if p["job_id"] != "job-1" || p["error"] != err.Error() {
+				t.Fatalf("payload = %v", p)
+			}
+			got, present := p["retryable"]
+			if tc.wantRetry == nil && present {
+				t.Fatalf("retryable must be absent, got %v", got)
+			}
+			if tc.wantRetry != nil && got != tc.wantRetry {
+				t.Fatalf("retryable = %v, want %v", got, tc.wantRetry)
+			}
+		}
+		t.Run("inference/"+tc.name, func(t *testing.T) {
+			var err error
+			if tc.status == 0 {
+				srv := httptest.NewServer(reply(200, ""))
+				srv.Close()
+				req, _ := http.NewRequest(http.MethodPost, srv.URL, nil)
+				_, err = postInference(srv.Client(), req, "vllm")
+			} else {
+				srv := httptest.NewServer(reply(tc.status, "no"))
+				defer srv.Close()
+				req, _ := http.NewRequest(http.MethodPost, srv.URL, nil)
+				_, err = postInference(srv.Client(), req, "vllm")
+			}
+			if err == nil {
+				t.Fatal("want error")
+			}
+			check(t, err)
+		})
+		if tc.status == 0 {
+			continue
+		}
+		t.Run("controller/"+tc.name, func(t *testing.T) {
+			e, done := controllerExec("", reply(tc.status, "no"))
+			defer done()
+			_, err := e.executeBackgroundCache(context.Background(), map[string]any{})
+			if err == nil {
+				t.Fatal("want error")
+			}
+			check(t, err)
+		})
+	}
+}
