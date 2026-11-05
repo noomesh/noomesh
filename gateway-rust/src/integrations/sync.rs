@@ -547,13 +547,17 @@ pub fn spawn(state: Arc<crate::state::AppState>) {
                         .await;
                         if let Err(error) = result {
                             // No provider response, title, content or source policy in logs.
-                            if content::fail(&state.db, &job, &error).await.is_err() {
-                                tracing::warn!("cannot record private sync retry");
+                            if let Err(record) = content::fail(&state.db, &job, &error).await {
+                                tracing::warn!(
+                                    error = %record.log_cause(),
+                                    cause = %error.log_cause(),
+                                    "cannot record private sync retry"
+                                );
                             }
                         }
                         continue;
                     }
-                    Err(_) => tracing::warn!("private sync queue unavailable"),
+                    Err(error) => tracing::warn!(error = %error.log_cause(), "private sync queue unavailable"),
                     Ok(None) => {}
                 }
             }

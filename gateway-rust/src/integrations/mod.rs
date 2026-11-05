@@ -70,6 +70,21 @@ pub enum Error {
     Storage(#[from] sqlx::Error),
 }
 
+impl Error {
+    /// What a log line may say about this error (i460: name the cause). The
+    /// database's own message for storage; a fixed category otherwise, since
+    /// provider-facing text can echo request material and never reaches logs.
+    pub fn log_cause(&self) -> String {
+        match self {
+            Error::Storage(cause) => cause.to_string(),
+            Error::Invalid(_) => "invalid".into(),
+            Error::Unavailable(_) => "unavailable".into(),
+            Error::Reauth => "reauth".into(),
+            Error::NotFound => "not_found".into(),
+        }
+    }
+}
+
 impl From<Error> for crate::routes::AppError {
     fn from(e: Error) -> Self {
         use crate::routes::AppError;
@@ -79,7 +94,7 @@ impl From<Error> for crate::routes::AppError {
             Error::Reauth => AppError::Conflict(e.to_string()),
             Error::NotFound => AppError::NotFound(e.to_string()),
             Error::Storage(_) => {
-                tracing::error!("integration database operation failed");
+                tracing::error!(error = %e.log_cause(), "integration database operation failed");
                 AppError::Internal(e.to_string())
             }
         }
@@ -98,5 +113,43 @@ impl IntegrationConfig {
         } else {
             String::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod log_cause_tests {
+    use super::Error;
+
+    /// i460: a log line names the database's own cause, and only a fixed
+    /// category for anything a provider could have shaped.
+    #[test]
+    fn a_log_names_the_storage_cause_and_never_provider_text() {
+        let storage = Error::Storage(sqlx::Error::PoolTimedOut);
+        assert_eq!(storage.log_cause(), sqlx::Error::PoolTimedOut.to_string());
+        assert_ne!(storage.log_cause(), storage.to_string(), "the log names the cause, not the user line");
+        for (error, word) in [
+            (Error::Invalid("fixture-provider-text-a".into()), "invalid"),
+            (Error::Unavailable("fixture-provider-text-b".into()), "unavailable"),
+            (Error::Reauth, "reauth"),
+            (Error::NotFound, "not_found"),
+        ] {
+            assert_eq!(error.log_cause(), word);
+        }
+    }
+
+    /// The sites that used to drop the error now log its cause.
+    #[test]
+    fn the_sync_and_retrieval_failures_name_their_cause() {
+        let sync = crate::test_src::own_code(include_str!("sync.rs"));
+        assert!(!sync.contains(".await.is_err()"), "a failed retry record is logged with its cause");
+        assert!(!sync.contains("Err(_) => tracing::warn!"), "a queue failure is logged with its cause");
+        assert!(sync.matches(".log_cause()").count() >= 3, "sync names the queue, retry and record causes");
+        let provider = crate::test_src::own_code(include_str!("../memory/provider.rs"));
+        let reply = crate::test_src::fn_body(&provider, "async fn kb_reply_with_personal(");
+        assert!(reply.contains("error.log_cause()"), "a private retrieval failure names its cause");
+        assert!(!reply.contains("Err(_) =>") && !reply.contains("|_|"), "no failure in the reply is dropped unnamed");
+        let content = crate::test_src::own_code(include_str!("../repo/integration_content.rs"));
+        assert!(!content.contains("unreadable = true") && !content.contains("unavailable = true"),
+            "unreadable sealed documents are counted, not flagged");
     }
 }
