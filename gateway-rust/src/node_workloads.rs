@@ -370,6 +370,85 @@ fn check_duplicate_keys(b: &[u8]) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// Where the contract allows JSON `null` ("## Nullable fields"), as pointers
+/// from the document root with `*` for any array index. Everywhere else a
+/// null is `field_type`: Go reads null on a plain field as its zero value and
+/// this port's optional fields read it as absent, so without this walk both
+/// would accept `"accel": {"gpu": null}` as something it is not.
+const NULLABLE_DESIRED: &[&str] = &["/node_workloads/*/reservation"];
+/// The same rule for one entry validated on its own.
+const NULLABLE_ENTRY: &[&str] = &["/reservation"];
+/// `node-workloads.json` and `model-set.json` allow null nowhere.
+const NULLABLE_NONE: &[&str] = &[];
+
+enum Seg<'a> {
+    Key(&'a str),
+    Index(usize),
+}
+
+/// Refuse a null outside `nullable`, judged on the raw document (so a
+/// missing key and a null key stay apart). A document that does not parse is
+/// left to the typed decode, which reports `bad_json`.
+fn check_nulls(b: &[u8], nullable: &[&str]) -> Result<(), Refusal> {
+    match serde_json::from_slice::<Value>(b) {
+        Ok(v) => check_nulls_value(&v, nullable),
+        Err(_) => Ok(()),
+    }
+}
+
+fn check_nulls_value(v: &Value, nullable: &[&str]) -> Result<(), Refusal> {
+    let mut path = Vec::new();
+    walk_nulls(v, &mut path, nullable)
+}
+
+fn walk_nulls<'a>(v: &'a Value, path: &mut Vec<Seg<'a>>, nullable: &[&str]) -> Result<(), Refusal> {
+    match v {
+        Value::Null if !path.is_empty() => {
+            if nullable.iter().any(|p| pointer_matches(p, path)) {
+                Ok(())
+            } else {
+                fail(code::FIELD_TYPE, format!("{} is null, which is allowed only at {nullable:?}", render_path(path)))
+            }
+        }
+        Value::Object(m) => {
+            for (k, x) in m {
+                path.push(Seg::Key(k));
+                walk_nulls(x, path, nullable)?;
+                path.pop();
+            }
+            Ok(())
+        }
+        Value::Array(a) => {
+            for (i, x) in a.iter().enumerate() {
+                path.push(Seg::Index(i));
+                walk_nulls(x, path, nullable)?;
+                path.pop();
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `*` matches an array index only; an object key `"0"` is not an index.
+fn pointer_matches(pattern: &str, path: &[Seg]) -> bool {
+    let want: Vec<&str> = pattern.split('/').skip(1).collect();
+    want.len() == path.len()
+        && want.iter().zip(path).all(|(w, seg)| match seg {
+            Seg::Key(k) => *w != "*" && w == k,
+            Seg::Index(_) => *w == "*",
+        })
+}
+
+fn render_path(path: &[Seg]) -> String {
+    path.iter()
+        .map(|s| match s {
+            Seg::Key(k) => format!("/{k}"),
+            Seg::Index(i) => format!("/{i}"),
+        })
+        .collect()
+}
+
 /// Map a serde_json error to a contract code. A syntax or EOF error is
 /// `bad_json` (this includes data after the document); a data error is told
 /// apart by serde's message: `unknown field`, `missing field`, anything else
@@ -553,6 +632,8 @@ pub fn validate_decl(
     addon: &str,
     lock_images: &BTreeSet<String>,
 ) -> Result<NodeWorkloads, Refusal> {
+    check_duplicate_keys(bytes)?;
+    check_nulls(bytes, NULLABLE_NONE)?;
     let file: DeclFile = decode_strict(bytes)?;
     let g = generic(bytes);
     require_keys(Some(&g), "node-workloads.json", &["format", "workloads"])?;
@@ -1068,6 +1149,8 @@ pub fn valid_set_path(p: &str) -> bool {
 /// Validate a model-set.json (after its signature has been verified over
 /// these exact bytes). The first refusal wins.
 pub fn validate_model_set(bytes: &[u8]) -> Result<ModelSet, Refusal> {
+    check_duplicate_keys(bytes)?;
+    check_nulls(bytes, NULLABLE_NONE)?;
     let m: ModelSet = decode_strict(bytes)?;
     let g = generic(bytes);
     require_keys(
@@ -1420,6 +1503,11 @@ fn desired_invalid(r: Refusal) -> Refusal {
 /// has CN `agent_cn`. A refusal's code is one of the reasons in [`code`]. The
 /// first refusal wins.
 pub fn validate_desired(bytes: &[u8], agent_cn: &str) -> Result<Vec<DesiredEntry>, Refusal> {
+    // The whole fragment is walked first: a null (even on a decl field inside
+    // an entry) is `field_type` itself, never folded into desired_invalid or
+    // decl_invalid.
+    check_duplicate_keys(bytes)?;
+    check_nulls(bytes, NULLABLE_DESIRED)?;
     let frag: DesiredFragment = decode_strict(bytes).map_err(desired_invalid)?;
     require_keys(Some(&generic(bytes)), "desired-config", &["node_workloads"])
         .map_err(desired_invalid)?;
@@ -1439,6 +1527,7 @@ pub fn validate_desired(bytes: &[u8], agent_cn: &str) -> Result<Vec<DesiredEntry
 /// Validate one `node_workloads` entry. `raw` must come from a document
 /// already read strictly (no repeated keys), as [`validate_desired`] does.
 pub fn validate_desired_entry(raw: &Value, agent_cn: &str) -> Result<DesiredEntry, Refusal> {
+    check_nulls_value(raw, NULLABLE_ENTRY)?;
     let mut e: DesiredEntry = decode_value(raw).map_err(desired_invalid)?;
     require_keys(
         Some(raw),
@@ -2025,6 +2114,38 @@ mod tests {
         let sibling = obj(r#"("a": ("x": 1), "b": ("x": 2))"#);
         let e = validate_model_set(sibling.as_bytes()).unwrap_err();
         assert_eq!(e.code, code::UNKNOWN_FIELD, "{e}");
+    }
+
+    #[test]
+    fn null_is_refused_outside_the_named_nullable_fields() {
+        // A null on a decl field is field_type, never read as its zero value.
+        let decl = obj(r#"(
+            "format": "noo-addon-node-workloads/1",
+            "workloads": [("name": "a", "accel": ("gpu": null))]
+        )"#);
+        let e = validate_decl(decl.as_bytes(), TEST_ADDON, &lock_images()).unwrap_err();
+        assert_eq!(e.code, code::FIELD_TYPE, "{e}");
+        // In desired-config, null comes back as field_type ITSELF, even on a
+        // decl field nested inside an entry (not desired_invalid, not
+        // decl_invalid), because the whole fragment is walked first.
+        let frag = obj(r#"("node_workloads": [("decl": ("uid": null))])"#);
+        let e = validate_desired(frag.as_bytes(), "node-a").unwrap_err();
+        assert_eq!(e.code, code::FIELD_TYPE, "{e}");
+        // The one nullable field passes the walk.
+        let ok = obj(r#"("node_workloads": [("reservation": null)])"#);
+        let v: Value = serde_json::from_str(&ok).unwrap();
+        assert!(check_nulls_value(&v, NULLABLE_DESIRED).is_ok());
+        // `*` is an array index only: an object key "0" is not one.
+        let keyed = obj(r#"("node_workloads": ("0": ("reservation": null)))"#);
+        let v: Value = serde_json::from_str(&keyed).unwrap();
+        assert_eq!(check_nulls_value(&v, NULLABLE_DESIRED).unwrap_err().code, code::FIELD_TYPE);
+        // Judged from the document root: the entry pattern does not match
+        // the same key one level down.
+        let deep = obj(r#"("x": ("reservation": null))"#);
+        let v: Value = serde_json::from_str(&deep).unwrap();
+        assert!(check_nulls_value(&v, NULLABLE_ENTRY).is_err());
+        // A document that does not parse is left to the typed decode.
+        assert_eq!(validate_model_set(b"not json").unwrap_err().code, code::BAD_JSON);
     }
 
     #[test]

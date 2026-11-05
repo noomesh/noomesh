@@ -27,6 +27,11 @@
     "code": ""
   },
   {
+    "file": "refuse-null-profile.json",
+    "valid": false,
+    "code": "field_type"
+  },
+  {
     "file": "refuse-profile-malformed.json",
     "valid": false,
     "code": "desired_invalid"
