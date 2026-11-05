@@ -382,7 +382,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["usage", "me"], "[-p|--period day|week|month] [-u|--user <user>]", "Show your token spend this period: node, cloud and harness apart, and your allowance"),
     (&["upgrade"], "[--check] [--version <X.Y.Z>] [--stack] [--nodes] [--seats|--no-seats] [--all] [--tag <vX.Y.Z>] [--controller] [--allow-unsigned] [--force] [--skip-gateway-key-check] [--allow-downgrade] [--stage2] [--channel <public|rollback|custom>] [--release-repo <owner/repo>] [--image-prefix <registry/path>] [--base-registry <registry/path>] [--yes]", "Self-update noo, optionally stack, nodes and kiosk seats; --channel moves release channel"),
     (&["addons", "list"], "", "Show every add-on: declared, effective and whether the licence grants it"),
-    (&["addons", "show"], "<name>", "Show one add-on's switch, pin, and the database, workloads and inputs its bundle declares"),
+    (&["addons", "show"], "<name>", "Show one add-on's switch, pin, bundle declarations, and who may use each feature"),
     (&["addons", "enable"], "<name> [--force] [--lock <path|https-url>] [--provision-only]", "Pin an add-on's signed lock, mint credentials, declare it ON (--provision-only: DB only)"),
     (&["addons", "check"], "<bundle-dir> [--name <addon>]", "Enable's guard, resources and routes.json checks on a bundle dir; not signature/key/image"),
     (&["addons", "features"], "<name>", "Show an add-on's features, who each is set on or off for, and the super admins"),
