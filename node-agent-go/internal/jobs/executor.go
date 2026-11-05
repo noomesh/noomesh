@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -346,10 +347,7 @@ func (e *Executor) handleDispatch(data []byte) {
 
 		if jobEventKind(err) == "failed" {
 			slog.Error("job failed", "job_id", job.JobID, "error", err)
-			e.nats.PublishJobEvent("failed", map[string]any{
-				"job_id": job.JobID,
-				"error":  err.Error(),
-			})
+			e.nats.PublishJobEvent("failed", failedPayload(job.JobID, err))
 			return
 		}
 
@@ -509,7 +507,7 @@ func postInference(client *http.Client, req *http.Request, backend string) (any,
 		// retry machinery engages — otherwise an error JSON body gets
 		// recorded as a successful result and the job reads "completed".
 		// This also covers 1xx and 3xx, which are not an answer either.
-		return nil, fmt.Errorf("backend %s HTTP %d: %s", backend, resp.StatusCode, bodySnippet(body, 300))
+		return nil, authRefused(resp.StatusCode, fmt.Errorf("backend %s HTTP %d: %s", backend, resp.StatusCode, bodySnippet(body, 300)))
 	}
 	if readErr != nil {
 		return nil, fmt.Errorf("backend %s HTTP %d: reading response body: %w", backend, resp.StatusCode, readErr)
@@ -532,9 +530,36 @@ func controllerStatus(resp *http.Response) (present bool, err error) {
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
-		return true, fmt.Errorf("controller %s HTTP %d: %s", resp.Request.URL.Path, resp.StatusCode, snippet)
+		return true, authRefused(resp.StatusCode, fmt.Errorf("controller %s HTTP %d: %s", resp.Request.URL.Path, resp.StatusCode, snippet))
 	}
 	return true, nil
+}
+
+// nonRetryableError marks a failure another node cannot fix: the same
+// credentials would be refused again, so the retry budget only delays the
+// answer. The gateway reads `retryable:false` (scheduler_completions.rs
+// is_retryable); an absent field means retryable.
+type nonRetryableError struct{ err error }
+
+func (n *nonRetryableError) Error() string { return n.err.Error() }
+func (n *nonRetryableError) Unwrap() error { return n.err }
+
+// authRefused wraps err as non-retryable when the status is 401 or 403.
+func authRefused(status int, err error) error {
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return &nonRetryableError{err: err}
+	}
+	return err
+}
+
+// failedPayload is the body of the events.job.failed message for err.
+func failedPayload(jobID string, err error) map[string]any {
+	p := map[string]any{"job_id": jobID, "error": err.Error()}
+	var nr *nonRetryableError
+	if errors.As(err, &nr) {
+		p["retryable"] = false
+	}
+	return p
 }
 
 // jobEventKind is the lifecycle event a job's outcome is published as.
