@@ -255,19 +255,30 @@ pub fn migrate_export(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let result = (|| -> Result<(String, usize), String> {
         std::fs::create_dir_all(stage.join("db")).map_err(|e| e.to_string())?;
 
+        // The roles the dump names but cannot carry (i45): an idempotent
+        // CREATE ROLE script, attributes only, never a password. Without it
+        // the dump does not restore on a clean server.
+        ui::step("reading the database roles (no passwords)");
+        let roles = super::migrate_db::psql(&pg, "noomesh", &mut super::migrate_db::ROLES_SQL.as_bytes(), true)
+            .map_err(|e| format!("could not read the noo_* roles: {e}"))?;
+        if roles.trim().is_empty() {
+            return Err("no noo_* roles found; the dump would not restore on a clean server".into());
+        }
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+                .open(stage.join(super::migrate_db::ROLES_MEMBER)).map_err(|e| e.to_string())?;
+            writeln!(f, "-- noomesh cluster roles for this archive's dump (no passwords)\n{}", roles.trim_end())
+                .map_err(|e| e.to_string())?;
+        }
+
         // Fresh dump, never a stale backup file. Plain SQL like every other
         // rail here — restore is psql, no pg_restore anywhere in the fleet.
+        // Its tables are counted per schema in the same pass, so the
+        // manifest's count and the dump are one snapshot.
         ui::step(&format!("dumping the database ({pg})"));
-        let dump = Command::new("bash")
-            .arg("-c")
-            .arg(format!("umask 077; set -o pipefail; docker exec {pg} pg_dump -U noo noomesh | gzip > '{}'",
-                stage.join("db/pg.sql.gz").display()))
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !dump {
-            return Err("pg_dump failed".into());
-        }
+        let pg_tables = super::migrate_db::dump_counting(&pg, &stage.join("db/pg.sql.gz"))?;
 
         ui::step("staging controller state");
         for rel in STATE_PATHS {
@@ -299,6 +310,8 @@ pub fn migrate_export(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             "data_root": read_env("NOO_DATA_ROOT"),
             "node_id": read_env("NODE_ID"),
             "pg_dump_sha256": sha256_file(&stage.join("db/pg.sql.gz")),
+            "pg_roles_sha256": sha256_file(&stage.join(super::migrate_db::ROLES_MEMBER)),
+            "pg_tables": pg_tables,
         });
         std::fs::write(stage.join(MANIFEST), serde_json::to_string_pretty(&manifest).unwrap())
             .map_err(|e| e.to_string())?;
@@ -331,7 +344,7 @@ pub fn migrate_export(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
         let listing = Command::new("tar").arg("-tzf").arg(&vt).output()
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
-        for need in [MANIFEST, "db/pg.sql.gz", "home/secrets/env.sops", "home/pki/ca.key", "age/keys.txt"] {
+        for need in [MANIFEST, "db/pg.sql.gz", super::migrate_db::ROLES_MEMBER, "home/secrets/env.sops", "home/pki/ca.key", "age/keys.txt"] {
             if !listing.lines().any(|l| l == need) {
                 return Err(format!("self-verify: {need} missing from the archive"));
             }

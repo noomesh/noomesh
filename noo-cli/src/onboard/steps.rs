@@ -4922,6 +4922,109 @@ fn pin_dist_stack_lock(ctx: &mut Ctx) -> bool {
     }
 }
 
+/// Store roles WITH passwords: the bash half reads the secret store, the
+/// password reaches psql on stdin (never argv, which `ps` shows), and the
+/// script prints one `<status> <role>` line per role, never a value.
+const STORE_ROLES_SH: &str = r#"set -u; cd "$1"
+if ! { source scripts/lib-secrets.sh && load_secrets; } >/dev/null 2>&1; then echo "store unloaded"; fi
+ensure() {
+  role="$1"; pw="${2:-}"
+  ex=$(docker exec noo-postgres psql -X -U noo -d postgres -tAc "select 1 from pg_roles where rolname='$role'" 2>/dev/null) || { echo "failed $role"; return; }
+  if [ "$ex" = "1" ]; then echo "exists $role"; return; fi
+  if [ -z "$pw" ]; then echo "nopassword $role"; return; fi
+  esc=$(printf %s "$pw" | sed "s/'/''/g")
+  if printf "CREATE ROLE %s LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS PASSWORD '%s';\n" "$role" "$esc" \
+       | docker exec -i noo-postgres psql -q -X -v ON_ERROR_STOP=1 -U noo -d postgres >/dev/null 2>&1; then
+    echo "created $role"
+  else
+    echo "failed $role"
+  fi
+}
+ensure noo_app "${NOO_APP_DB_PASSWORD:-}"
+ensure noo_trellion "${NOO_TRELLION_DB_PASSWORD:-}"
+ensure noo_trellion_ddl "${NOO_TRELLION_DDL_PASSWORD:-}"
+ensure noo_evolve "${NOO_EVOLVE_DB_PASSWORD:-}"
+ensure noo_evolve_ddl "${NOO_EVOLVE_DDL_PASSWORD:-}"
+"#;
+
+/// The archive restore (i45), each step ON_ERROR_STOP, first error named:
+/// (1) the roles the secret store holds passwords for; (2) the archive's
+/// roles file (or, for an archive without one, the known roles NOLOGIN);
+/// (3) the dump; (4) the live tables per schema must equal the manifest's.
+/// The marker is written only after (4). A role the stack logs in as that
+/// came back without a password is an error after the restore: the stack
+/// would start and fail authentication with nothing pointing at why.
+/// Returns the roles that must log in but came back without a password.
+fn restore_archive_db(ctx: &Ctx, dump: &Path, marker: &Path) -> Result<Vec<String>, String> {
+    use crate::commands::migrate_db as mdb;
+    const PG: &str = "noo-postgres";
+
+    ctx.progress("Creating the database roles the secret store holds passwords for...");
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(STORE_ROLES_SH)
+        .arg("noo-store-roles")
+        .arg(&ctx.repo_root)
+        .output()
+        .map_err(|e| format!("role step: {e}"))?;
+    let report = String::from_utf8_lossy(&out.stdout).to_string();
+    if report.lines().any(|l| l == "store unloaded") {
+        ctx.warn("The secret store did not load: no role gets its password from it on this run");
+    }
+    let mut status: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for l in report.lines() {
+        if let Some((st, role)) = l.split_once(' ') {
+            status.insert(role.to_string(), st.to_string());
+        }
+    }
+    let failed: Vec<&String> = status.iter().filter(|(_, st)| st.as_str() == "failed").map(|(r, _)| r).collect();
+    if !failed.is_empty() {
+        return Err(format!("could not create role(s) {failed:?} from the secret store"));
+    }
+
+    let before = mdb::noo_roles(PG)?;
+    let roles_file = dump.with_file_name("pgroles.sql");
+    let (script, from_file) = match std::fs::read_to_string(&roles_file) {
+        Ok(s) => (s, true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            ctx.warn("This archive has no roles file (exported before roles were carried): creating the known noo_* roles NOLOGIN");
+            (mdb::fallback_roles_script(), false)
+        }
+        Err(e) => return Err(format!("{}: {e}", roles_file.display())),
+    };
+    ctx.progress(if from_file { "Applying the archive's roles..." } else { "Pre-creating the known roles..." });
+    mdb::psql(PG, "noomesh", &mut script.as_bytes(), false).map_err(|e| format!("roles: {e}"))?;
+    let after = mdb::noo_roles(PG)?;
+    let created: std::collections::BTreeSet<String> = after.difference(&before).cloned().collect();
+
+    ctx.progress("Restoring the archive database...");
+    let gz = std::fs::File::open(dump).map_err(|e| format!("{}: {e}", dump.display()))?;
+    mdb::psql(PG, "noomesh", &mut flate2::read::GzDecoder::new(gz), false).map_err(|e| format!("dump: {e}"))?;
+
+    let manifest: Option<serde_json::Value> = dump
+        .parent()
+        .and_then(Path::parent)
+        .and_then(|d| std::fs::read_to_string(d.join("manifest.json")).ok())
+        .and_then(|t| serde_json::from_str(&t).ok());
+    let expected = manifest.as_ref().and_then(mdb::manifest_tables);
+    let live = mdb::live_tables(PG)?;
+    let summary = mdb::table_check(expected.as_ref(), &live)?;
+    let _ = std::fs::write(marker, "restored\n");
+    ctx.success(&format!("Archive database restored: {summary}"));
+
+    if !from_file && !created.is_empty() {
+        // Without a roles file nothing says which of these the stack logs in
+        // as, so this is a pointer rather than a stop.
+        ctx.warn(&format!(
+            "Role(s) {} were created NOLOGIN with no password; if the stack uses them, run `noo security secrets resync --all`",
+            created.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    let login = if from_file { mdb::login_roles(&script) } else { std::collections::BTreeSet::new() };
+    Ok(mdb::roles_without_password(&created, &login))
+}
+
+
 // ── Step 5: Services ─────────────────────────────────────────────────────
 
 pub fn services(ctx: &mut Ctx) {
@@ -4965,44 +5068,23 @@ pub fn services(ctx: &mut Ctx) {
                 ctx.error("postgres did not come up — cannot restore the archive database");
                 return;
             }
-            ctx.progress("Ensuring cluster-global roles from the secret store...");
-            let roles = format!(
-                r#"set -e; cd '{home}'
-source scripts/lib-secrets.sh >/dev/null 2>&1 && load_secrets >/dev/null 2>&1 || true
-ensure() {{
-  role="$1"; pw="$2"; [ -z "$pw" ] && return 0
-  ex=$(docker exec noo-postgres psql -U noo -d postgres -tAc "select 1 from pg_roles where rolname='$role'" || true)
-  if [ "$ex" != "1" ]; then
-    esc=$(printf %s "$pw" | sed "s/'/''/g")
-    docker exec noo-postgres psql -q -U noo -d postgres -c "CREATE ROLE $role LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS PASSWORD '$esc'" >/dev/null
-  fi
-}}
-ensure noo_app "${{NOO_APP_DB_PASSWORD:-}}"
-ensure noo_trellion "${{NOO_TRELLION_DB_PASSWORD:-}}"
-ensure noo_trellion_ddl "${{NOO_TRELLION_DDL_PASSWORD:-}}"
-ensure noo_evolve "${{NOO_EVOLVE_DB_PASSWORD:-}}"
-ensure noo_evolve_ddl "${{NOO_EVOLVE_DDL_PASSWORD:-}}"
-"#,
-                home = ctx.repo_root.display(),
-            );
-            let _ = Command::new("bash").arg("-c").arg(&roles).status();
-            ctx.progress("Restoring the archive database...");
-            let restored = Command::new("bash")
-                .arg("-c")
-                .arg(format!(
-                    "set -o pipefail; gunzip -c '{}' | docker exec -i noo-postgres psql -q -U noo -d noomesh",
-                    dump.display()
-                ))
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if restored {
-                let _ = std::fs::write(&marker, "restored
-");
-                ctx.success("Archive database restored — the stack boots onto the carried world.");
-            } else {
-                ctx.error("Database restore FAILED — fix and re-run (the wizard resumes; the archive is untouched)");
-                return;
+            match restore_archive_db(ctx, &dump, &marker) {
+                Err(e) => {
+                    ctx.error(&format!(
+                        "Database restore FAILED: {e}. Fix it and re-run (the wizard resumes; the archive is untouched)"
+                    ));
+                    return;
+                }
+                Ok(no_password) if !no_password.is_empty() => {
+                    ctx.error(&format!(
+                        "The database is restored, but role(s) {} came back without a password and the stack \
+                         logs in as them: it would start and fail authentication. Run `noo security secrets resync --all`, \
+                         then `noo onboard --only services`",
+                        no_password.join(", ")
+                    ));
+                    return;
+                }
+                Ok(_) => {}
             }
         }
     }
@@ -9173,5 +9255,39 @@ mod storage_owner_tests {
         assert!(body.contains("{created} created, {existing} already exist, {wrong} wrong owner, {failed} failed"), "{body}");
         assert!(!body.contains(".args([\"mkdir\", \"-p\"])"), "no sudo mkdir -p (it makes root:root)");
         assert!(body.contains("sudo_install_plan(name, target)"));
+    }
+}
+
+#[cfg(test)]
+mod archive_restore_tests {
+    use super::STORE_ROLES_SH;
+
+    /// i45: the role step used `psql -c "CREATE ROLE ... PASSWORD '...'"`,
+    /// which puts the password in argv, where any local user's `ps` reads it.
+    #[test]
+    fn a_role_password_never_reaches_argv() {
+        let mut lines = STORE_ROLES_SH.lines().skip_while(|l| !l.contains("CREATE ROLE"));
+        let create = lines.next().expect("the CREATE ROLE line");
+        assert!(create.trim_start().starts_with("if printf"), "the statement is printed into a pipe: {create}");
+        let pipe = lines.next().unwrap_or("");
+        assert!(pipe.contains("docker exec -i noo-postgres psql") && pipe.contains("ON_ERROR_STOP=1"), "{pipe}");
+        assert!(!STORE_ROLES_SH.contains("-c \"CREATE ROLE"), "a password in psql -c is visible to ps");
+        assert!(!STORE_ROLES_SH.contains("|| true"), "a failed store load is reported, not swallowed");
+    }
+
+    /// The restore reaches psql only through `migrate_db::psql` (stdin,
+    /// ON_ERROR_STOP=1, first ERROR line), and accepts the restore only after
+    /// the table count matches.
+    #[test]
+    fn the_restore_reaches_psql_only_through_the_stopping_helper() {
+        let src = include_str!("steps.rs");
+        let start = src.find("fn restore_archive_db(").expect("restore_archive_db is gone: this guard is stale");
+        let body = &src[start..];
+        let body = &body[..body.find("\n\u{7d}\n").expect("the end of restore_archive_db")];
+        assert!(body.contains("mdb::psql(PG, \"noomesh\", &mut flate2::read::GzDecoder"), "the dump goes through mdb::psql");
+        assert!(!body.contains("gunzip") && !body.contains("\"psql\""), "a direct psql here would skip ON_ERROR_STOP");
+        let check = body.find("mdb::table_check(").expect("the table check");
+        let marker = body.find("std::fs::write(marker").expect("the marker write");
+        assert!(check < marker, "the marker is written only after the table check");
     }
 }

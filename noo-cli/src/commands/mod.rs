@@ -71,6 +71,7 @@ pub mod mesh;
 pub mod nats_users;
 pub mod controller;
 pub mod migrate;
+pub mod migrate_db;
 pub mod models;
 pub mod models_fetch;
 pub mod ollama_stage;
