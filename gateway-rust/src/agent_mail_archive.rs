@@ -466,20 +466,23 @@ pub async fn export(
 
 /// Where the archive lives for the read routes: the retention task's
 /// `archive_dir` when it names one, else the default.
-pub async fn configured_dir(db: &sqlx::PgPool) -> PathBuf {
+///
+/// An unreadable task row is an error, never the default directory: the
+/// archive routes would list and export the default as if it were the one
+/// the operator configured (i460).
+pub async fn configured_dir(db: &sqlx::PgPool) -> Result<PathBuf, String> {
     let cfg: Option<Value> = sqlx::query_scalar("SELECT config FROM noo_heartbeat_tasks WHERE id = $1")
         .bind(ACTION)
         .fetch_optional(db)
         .await
-        .ok()
-        .flatten();
+        .map_err(|e| format!("cannot read the agent-mail archive's configured directory: {e}"))?;
     let dir = cfg
         .as_ref()
         .and_then(|c| c.get("archive_dir"))
         .and_then(Value::as_str)
         .filter(|d| archive_dir_problem(d).is_none())
         .unwrap_or(DEFAULT_ARCHIVE_DIR);
-    PathBuf::from(dir)
+    Ok(PathBuf::from(dir))
 }
 
 #[cfg(test)]
@@ -749,5 +752,21 @@ mod tests {
         assert!(matches!(export(&db, &dir, true, "root", "../../etc/passwd", None, false).await, Err(ExportError::BadRequest(_))));
         assert!(matches!(export(&db, &dir, true, "root", "2001-01", None, false).await, Err(ExportError::NotFound(_))));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The configured directory's read error is not "no configuration" (i460).
+#[cfg(test)]
+mod db_read_error_tests {
+    #[tokio::test]
+    async fn an_unreadable_task_row_is_an_error_not_the_default_dir() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool");
+        match super::configured_dir(&pool).await {
+            Err(m) => assert!(m.contains("cannot read the agent-mail archive's configured directory"), "{m}"),
+            Ok(dir) => panic!("an unreadable config must not answer a directory, got {}", dir.display()),
+        }
     }
 }

@@ -2274,7 +2274,7 @@ async fn archive_list(
     if !who.privileged {
         return Err(AppError::Forbidden("the agent-mail archive is operator-only".into()));
     }
-    let dir = crate::agent_mail_archive::configured_dir(&state.db).await;
+    let dir = crate::agent_mail_archive::configured_dir(&state.db).await.map_err(AppError::Unavailable)?;
     let d = dir.clone();
     let files = tokio::task::spawn_blocking(move || crate::agent_mail_archive::list(&d))
         .await
@@ -2306,7 +2306,7 @@ async fn archive_export(
 ) -> AppResult {
     use crate::agent_mail_archive::ExportError as E;
     let who = caller(&requester, &cluster);
-    let dir = crate::agent_mail_archive::configured_dir(&state.db).await;
+    let dir = crate::agent_mail_archive::configured_dir(&state.db).await.map_err(AppError::Unavailable)?;
     let keys = if q.decrypt { crate::agent_crypto::controller_keys() } else { None };
     crate::agent_mail_archive::export(&state.db, &dir, who.privileged, &who.label, &month, keys, q.decrypt)
         .await
