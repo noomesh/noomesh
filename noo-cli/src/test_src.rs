@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn comments_are_blanked_so_prose_never_matches() {
         let code = own_code(&fixture());
-        let run = fn_body(&code, "fn run(");
+        let run = fn_body(&code, "fn run<");
         assert_eq!(run.matches("danger()").count(), 1, "only the call, not the doc or the comment: {run}");
         assert!(!code.contains("Explains why"));
         assert!(!code.contains("block"), "block comments too");
@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn a_body_ends_at_its_own_brace() {
         let code = own_code(&fixture());
-        let run = fn_body(&code, "fn run(");
+        let run = fn_body(&code, "fn run<");
         assert!(run.ends_with('\u{7d}') && run.contains("danger();"), "{run}");
         assert!(!run.contains("fn later("), "{run}");
         let later = fn_body(&code, "fn later(");
