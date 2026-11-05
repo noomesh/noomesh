@@ -48,12 +48,12 @@ pub(crate) const CORE_LOGIN_ROLES: &[&str] = &["noo_app", "noo_trellion", "noo_t
 pub(crate) const EVOLVE_ROLES: &[&str] = &["noo_evolve", "noo_evolve_ddl"];
 
 /// Does a noomesh.yaml declare `addon` on? `addons:` is the one declaration;
-/// evolve is opt-in, so not stated (or no file) is off.
-pub(crate) fn declared_on(noomesh_yaml: Option<&str>, addon: &str) -> bool {
-    noomesh_yaml
-        .and_then(|t| serde_yaml::from_str::<serde_yaml::Value>(t).ok())
-        .and_then(|v| v.get("addons")?.get(addon)?.as_bool())
-        .unwrap_or(false)
+/// evolve is opt-in, so not stated (or no file) is off. A file that does not
+/// parse is NOT "not stated": it is an error the caller names.
+pub(crate) fn declared_on(noomesh_yaml: Option<&str>, addon: &str) -> Result<bool, String> {
+    let Some(text) = noomesh_yaml else { return Ok(false) };
+    let v: serde_yaml::Value = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
+    Ok(v.get("addons").and_then(|a| a.get(addon)).and_then(serde_yaml::Value::as_bool).unwrap_or(false))
 }
 
 /// Which roles must log in, when the archive's roles file cannot say (an
@@ -413,15 +413,17 @@ DO $r$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'noo_readonly
     #[test]
     fn an_old_archive_with_evolve_declared_on_holds_its_roles_too() {
         let yaml = "addons:\n  trellion: true\n  evolve: true\n";
-        assert!(declared_on(Some(yaml), "evolve"));
+        assert_eq!(declared_on(Some(yaml), "evolve"), Ok(true));
         let created: BTreeSet<String> = ["noo_evolve", "noo_evolve_ddl"].iter().map(|s| s.to_string()).collect();
-        let bad = roles_without_password(&created, &fallback_login_roles(declared_on(Some(yaml), "evolve")));
+        let bad = roles_without_password(&created, &fallback_login_roles(true));
         assert_eq!(bad, vec!["noo_evolve".to_string(), "noo_evolve_ddl".into()]);
-        // Off, not stated, no file, or unparseable: evolve's roles stay a warning.
-        for off in [Some("addons:\n  evolve: false\n"), Some("addons:\n  trellion: true\n"), None, Some(": not yaml [")] {
-            assert!(!declared_on(off, "evolve"), "{off:?}");
-            assert!(roles_without_password(&created, &fallback_login_roles(declared_on(off, "evolve"))).is_empty());
+        // Off, not stated, or no file: evolve's roles stay a warning.
+        for off in [Some("addons:\n  evolve: false\n"), Some("addons:\n  trellion: true\n"), None] {
+            assert_eq!(declared_on(off, "evolve"), Ok(false), "{off:?}");
         }
+        assert!(roles_without_password(&created, &fallback_login_roles(false)).is_empty());
+        // A file that does not parse is its own answer, never "not stated".
+        assert!(declared_on(Some("addons: [unclosed"), "evolve").is_err());
     }
 
     #[test]
