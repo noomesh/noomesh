@@ -2191,8 +2191,10 @@ fn reconcile_storage_dirs(g: &Globals, root: &std::path::Path, tag: &str, lock: 
     };
     let mut failed: Vec<String> = Vec::new();
     for d in planned.iter().filter(|d| !d.path.exists()) {
-        let made = crate::onboard::steps::create_storage_dir(&d.name, &d.path)
-            .and_then(|()| if d.lock_only { own_like(&d.path, &d.base) } else { Ok(()) });
+        // Created with its intended owner (onboarding's one rule: a service
+        // uid, else the owner of the root it sits under), or refused with
+        // what it got and the chown.
+        let made = crate::onboard::steps::create_storage_dir(&d.name, &d.path);
         match made {
             Ok(()) => if !g.json {
                 let why = if d.lock_only { format!("named by stack-{tag}.lock") } else { "new in this release".to_string() };
@@ -2231,13 +2233,7 @@ pub(crate) fn plan_storage_dirs(
     compiled: Vec<(String, std::path::PathBuf)>,
     from_lock: Vec<(String, std::path::PathBuf)>,
 ) -> Result<Vec<PlannedDir>, Vec<String>> {
-    let base_of = |name: &str, path: &std::path::Path| {
-        let mut b = path.to_path_buf();
-        for _ in name.split('/') {
-            b.pop();
-        }
-        b
-    };
+    let base_of = crate::onboard::steps::storage_base;
     let known: std::collections::HashSet<std::path::PathBuf> = compiled.iter().map(|(_, p)| p.clone()).collect();
     let mut out: Vec<PlannedDir> = compiled.iter()
         .map(|(n, p)| PlannedDir { name: n.clone(), path: p.clone(), base: base_of(n, p), lock_only: false })
@@ -2290,17 +2286,6 @@ fn lock_only_dir_ok(name: &str, path: &std::path::Path, base: &std::path::Path) 
     Ok(())
 }
 
-/// Give `dir` the owner of `base` (a lock-only name has no `subdir_owner`
-/// entry, so it belongs to whoever owns its root, as onboarding leaves
-/// every unlisted directory).
-fn own_like(dir: &std::path::Path, base: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let (want, got) = (std::fs::metadata(base)?, std::fs::metadata(dir)?);
-    if (want.uid(), want.gid()) == (got.uid(), got.gid()) {
-        return Ok(());
-    }
-    std::os::unix::fs::chown(dir, Some(want.uid()), Some(want.gid()))
-}
 
 /// Every storage directory this binary's release expects, placed under the
 /// data and state roots (onboarding's own `storage_targets_in`).
@@ -7015,7 +7000,6 @@ mod storage_dir_tests {
         let b = base_with("own", &[]);
         let p = super::plan_storage_dirs(vec![], vec![("newdir".to_string(), b.join("newdir"))]).unwrap();
         crate::onboard::steps::create_storage_dir(&p[0].name, &p[0].path).unwrap();
-        super::own_like(&p[0].path, &p[0].base).unwrap();
         let (root, made) = (std::fs::metadata(&b).unwrap(), std::fs::metadata(b.join("newdir")).unwrap());
         assert!(made.is_dir());
         assert_eq!((made.uid(), made.gid()), (root.uid(), root.gid()));
@@ -7032,7 +7016,13 @@ mod storage_dir_tests {
         assert!(at("\"stack_lock_storage_unreadable\"") < create);
         assert!(at("\"stack_lock_storage_name\"") < create);
         assert!(at("plan_storage_dirs(") < create);
-        assert!(body.contains("if d.lock_only { own_like(&d.path, &d.base) }"), "lock-only dirs take the root's owner");
+        assert!(body.contains("crate::onboard::steps::create_storage_dir(&d.name, &d.path)"), "every dir, lock-only included, through onboarding's helper");
+        let steps = crate::test_src::own_code(include_str!("../onboard/steps.rs"));
+        let create = crate::test_src::fn_body(&steps, "pub(crate) fn create_storage_dir(");
+        assert!(create.contains("intended_owner(name, &base)") && create.contains("owner_mismatch("), "which gives it its intended owner, checked");
+        let plan = crate::test_src::fn_body(super::phase_src::code(), "pub(crate) fn plan_storage_dirs(");
+        assert!(plan.contains("crate::onboard::steps::storage_base"), "and places it with the same base rule");
+        assert!(!super::phase_src::code().contains("fn own_like("), "no second owner rule");
     }
 
     /// The step runs after the new deploy slice and BEFORE the pin moves (a
