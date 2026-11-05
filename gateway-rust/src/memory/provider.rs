@@ -1770,9 +1770,10 @@ mod restore_read_error_tests {
         let body = crate::test_src::fn_body(&own, "pub(crate) async fn prune_restore_entity(");
         let read = body.find("SELECT entity_id::text FROM entities WHERE canonical_name = $1 AND type = $2")
             .expect("the existing-entity read");
-        let insert = body.find("INSERT INTO entities").expect("the entity insert");
-        let between = &body[read..insert];
-        assert!(between.contains("Err(e) => return restore_db_error(sid, \"find_existing\", &e),"), "{between}");
-        assert!(!between.contains(".ok()") && !between.contains("unwrap_or"), "the read's error must not become None: {between}");
+        // The read's own statement: from the query to the next binding.
+        let end = read + body[read..].find("let target_id").expect("the binding after the read");
+        let stmt = &body[read..end];
+        assert!(stmt.contains("Err(e) => return restore_db_error(sid, \"find_existing\", &e),"), "{stmt}");
+        assert!(!stmt.contains(".ok()") && !stmt.contains(".unwrap_or"), "the read's error must not become None: {stmt}");
     }
 }
