@@ -301,6 +301,31 @@ mod tests {
         let _ = fn_body(&code, "fn renamed_away(");
     }
 
+    /// The cut at the first `#[cfg(test)]` cannot come back: no file under
+    /// noo-cli/src except this one splits on it (followup 215, slice 2).
+    #[test]
+    fn no_guard_cuts_at_the_first_cfg_test() {
+        let needle = concat!("split(\"#[cfg(", "test)]\")");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let (mut seen, mut hits) = (0usize, Vec::new());
+        let mut dirs = vec![root];
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(&d).expect("read noo-cli/src").flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") && p.file_name().is_some_and(|n| n != "test_src.rs") {
+                    seen += 1;
+                    if std::fs::read_to_string(&p).unwrap_or_default().contains(needle) {
+                        hits.push(p.display().to_string());
+                    }
+                }
+            }
+        }
+        assert!(seen >= 50, "read only {seen} files: this guard is looking in the wrong place");
+        assert!(hits.is_empty(), "read source through crate::test_src::own_code instead: {hits:?}");
+    }
+
     /// Non-ASCII in comments and code survives blanking.
     #[test]
     fn multibyte_text_survives() {

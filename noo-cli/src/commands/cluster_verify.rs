@@ -7231,7 +7231,7 @@ mod tests {
     #[test]
     fn provision_upgrade_and_verify_share_the_platform() {
         let prov = include_str!("provision.rs");
-        let prov = prov.split("#[cfg(test)]").next().unwrap();
+        let prov = crate::test_src::own_code(prov);
         for f in ["fn attach_hostd(", "fn attach_cli(", "fn attach_harness("] {
             let body = &prov[prov.find(f).unwrap()..];
             let body = &body[..body.find("\n\u{7d}\n").unwrap()];
