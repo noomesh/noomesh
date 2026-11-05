@@ -158,7 +158,7 @@ func ValidSetPath(p string) bool {
 // verified over these exact bytes). The first refusal wins.
 func ParseModelSet(b []byte) (*ModelSet, error) {
 	var m ModelSet
-	if err := decodeStrict(b, &m); err != nil {
+	if err := decodeStrict(b, &m, nullableModelSet); err != nil {
 		return nil, err
 	}
 	g := generic(b)

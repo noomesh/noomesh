@@ -66,6 +66,9 @@ type Door struct {
 }
 
 func desiredInvalid(err error) error {
+	if e, ok := err.(*Error); ok && e.passthrough {
+		return err // a JSON null is field_type, as in every validator
+	}
 	switch CodeOf(err) {
 	case CodeBadJSON, CodeUnknownField, CodeFieldType, CodeFieldMissing:
 		return &Error{Code: ReasonDesiredInvalid, Detail: err.Error()}
@@ -81,7 +84,7 @@ func ParseDesired(b []byte, ownAgentCN string) ([]Entry, error) {
 	var frag struct {
 		NodeWorkloads []json.RawMessage `json:"node_workloads"`
 	}
-	if err := decodeStrict(b, &frag); err != nil {
+	if err := decodeStrict(b, &frag, nullableDesired); err != nil {
 		return nil, desiredInvalid(err)
 	}
 	if err := requireKeys(generic(b), "desired-config", "node_workloads"); err != nil {
@@ -106,7 +109,8 @@ func ParseDesired(b []byte, ownAgentCN string) ([]Entry, error) {
 
 func parseEntry(raw []byte, ownAgentCN string) (Entry, error) {
 	var e Entry
-	if err := decodeStrict(raw, &e); err != nil {
+	// raw is a part of the fragment whose tokens ParseDesired already walked.
+	if err := decodeTyped(raw, &e); err != nil {
 		return e, desiredInvalid(err)
 	}
 	if err := requireKeys(generic(raw), "node_workloads[]", "addon", "name", "decl", "image", "sets", "env", "start_secs", "drain", "reservation", "state"); err != nil {

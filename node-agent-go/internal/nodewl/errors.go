@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 )
 
@@ -34,6 +35,9 @@ type Error struct {
 	Code   string
 	Detail string
 	Inner  string
+	// passthrough: desired-config reports this code as itself instead of
+	// folding it into desired_invalid (a null, a duplicate key).
+	passthrough bool
 }
 
 func (e *Error) Error() string {
@@ -75,12 +79,46 @@ const (
 // differential). Every validator refuses it.
 const CodeDuplicateKey = "duplicate_key"
 
-// checkDuplicateKeys walks b token by token and refuses a repeated key in
-// any object. Syntax errors are not its business: the typed decode that
-// follows reports them as bad_json.
-func checkDuplicateKeys(b []byte) error {
+// JSON null is refused on every field, with field_type, except the fields the
+// contract names nullable (nullable.go; the table in node-workloads.md). Go's
+// decoder treats null on a non-pointer field as a no-op that keeps the zero
+// value (`"accel": {"gpu": null}` reads as gpu 0), while serde refuses it: a
+// parser differential. Every validator refuses it.
+
+// seg is one step of the path the walk is at: an object key, or an array
+// index (idx true).
+type seg struct {
+	s   string
+	idx bool
+}
+
+var ptrEscape = strings.NewReplacer("~", "~0", "/", "~1")
+
+// matchesPointer reports whether path is the JSON pointer pat, where a `*`
+// matches any one array index.
+func matchesPointer(path []seg, pat string) bool {
+	parts := strings.Split(strings.TrimPrefix(pat, "/"), "/")
+	if len(parts) != len(path) {
+		return false
+	}
+	for i, p := range parts {
+		if p == "*" && path[i].idx {
+			continue
+		}
+		if p != ptrEscape.Replace(path[i].s) || path[i].idx {
+			return false
+		}
+	}
+	return true
+}
+
+// checkTokens walks b token by token and refuses a repeated key in any object
+// (duplicate_key) and a JSON null at any path not in nullable (field_type).
+// Syntax errors are not its business: the typed decode that follows reports
+// them as bad_json.
+func checkTokens(b []byte, nullable []string) error {
 	dec := json.NewDecoder(bytes.NewReader(b))
-	err := walkValue(dec)
+	err := walkValue(dec, nil, nullable)
 	var e *Error
 	if errors.As(err, &e) {
 		return e
@@ -88,10 +126,18 @@ func checkDuplicateKeys(b []byte) error {
 	return nil
 }
 
-func walkValue(dec *json.Decoder) error {
+func walkValue(dec *json.Decoder, path []seg, nullable []string) error {
 	tok, err := dec.Token()
 	if err != nil {
 		return err
+	}
+	if tok == nil {
+		for _, p := range nullable {
+			if matchesPointer(path, p) {
+				return nil
+			}
+		}
+		return &Error{Code: CodeFieldType, Detail: "JSON null at " + pointerOf(path) + " (null is refused except on fields the contract names nullable)", passthrough: true}
 	}
 	d, ok := tok.(json.Delim)
 	if !ok {
@@ -110,13 +156,13 @@ func walkValue(dec *json.Decoder) error {
 				return fail(CodeDuplicateKey, "key %q is repeated in an object", k)
 			}
 			seen[k] = true
-			if err := walkValue(dec); err != nil {
+			if err := walkValue(dec, append(path[:len(path):len(path)], seg{s: k}), nullable); err != nil {
 				return err
 			}
 		}
 	case '[':
-		for dec.More() {
-			if err := walkValue(dec); err != nil {
+		for i := 0; dec.More(); i++ {
+			if err := walkValue(dec, append(path[:len(path):len(path)], seg{s: strconv.Itoa(i), idx: true}), nullable); err != nil {
 				return err
 			}
 		}
@@ -125,12 +171,30 @@ func walkValue(dec *json.Decoder) error {
 	return err
 }
 
-// decodeStrict decodes exactly one JSON value into v: a repeated key is
-// refused, so are unknown fields and anything after the value.
-func decodeStrict(b []byte, v any) error {
-	if err := checkDuplicateKeys(b); err != nil {
+func pointerOf(path []seg) string {
+	var sb strings.Builder
+	for _, s := range path {
+		sb.WriteString("/" + ptrEscape.Replace(s.s))
+	}
+	if sb.Len() == 0 {
+		return "(root)"
+	}
+	return sb.String()
+}
+
+// decodeStrict walks b (duplicate keys, nulls outside nullable) and then
+// decodes exactly one JSON value into v: unknown fields are refused and so is
+// anything after the value. It is for a whole document; a part of a document
+// already walked is decoded with decodeTyped.
+func decodeStrict(b []byte, v any, nullable []string) error {
+	if err := checkTokens(b, nullable); err != nil {
 		return err
 	}
+	return decodeTyped(b, v)
+}
+
+// decodeTyped is the typed half of decodeStrict, for bytes already walked.
+func decodeTyped(b []byte, v any) error {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {

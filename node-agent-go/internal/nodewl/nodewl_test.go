@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -257,6 +258,56 @@ func TestComputeCapIsNumeric(t *testing.T) {
 	for _, bad := range [][2]string{{"", "8.0"}, {"8", "8.0"}, {"abc", "8.0"}, {"8.0", "x.y"}, {"8.0.1", "8.0"}, {"-1.0", "8.0"}, {"8.6", ""}} {
 		if got, err := ComputeCapAtLeast(bad[0], bad[1]); err == nil || got {
 			t.Errorf("ComputeCapAtLeast(%q, %q) = %v, %v; want an error (unknown, never low)", bad[0], bad[1], got, err)
+		}
+	}
+}
+
+func TestNullIsRefusedExceptWhereNamedNullable(t *testing.T) {
+	lock := map[string]string{"addon-worker": "x"}
+	// The differential: Go would read this as gpu 0, which is valid.
+	good := string(readFile(t, "node-workloads", "valid-minimal.json"))
+	bad := strings.Replace(good, `"gpu": 0`, `"gpu": null`, 1)
+	if bad == good {
+		t.Fatal("the mutation did not apply")
+	}
+	if _, err := ParseDecl(testAddon, []byte(bad), lock); CodeOf(err) != CodeFieldType {
+		t.Errorf("accel.gpu null: got %v, want field_type", err)
+	}
+	if _, err := ParseDecl(testAddon, []byte(`{"format": null, "workloads": null}`), lock); CodeOf(err) != CodeFieldType {
+		t.Errorf("top-level nulls: got %v", err)
+	}
+	if _, err := ParseDecl(testAddon, []byte(`null`), lock); CodeOf(err) != CodeFieldType {
+		t.Errorf("a null document: got %v", err)
+	}
+	// reservation is the one nullable pointer, and only at its place.
+	if _, err := ParseDesired(readFile(t, "desired", "valid-provisioned.json"), testAgentCN); err != nil {
+		t.Errorf("reservation null must parse: %v", err)
+	}
+	s := string(readFile(t, "desired", "valid-provisioned.json"))
+	s = strings.Replace(s, `"state": "provisioned"`, `"state": null`, 1)
+	if _, err := ParseDesired([]byte(s), testAgentCN); CodeOf(err) != CodeFieldType {
+		t.Errorf("state null: got %v, want field_type", err)
+	}
+}
+
+func TestNullablePointerMatching(t *testing.T) {
+	idx := func(s string) seg { return seg{s: s, idx: true} }
+	key := func(s string) seg { return seg{s: s} }
+	p := "/node_workloads/*/reservation"
+	for _, row := range []struct {
+		path []seg
+		want bool
+	}{
+		{[]seg{key("node_workloads"), idx("0"), key("reservation")}, true},
+		{[]seg{key("node_workloads"), idx("7"), key("reservation")}, true},
+		{[]seg{key("node_workloads"), key("0"), key("reservation")}, false}, // a key "0" is not an index
+		{[]seg{key("node_workloads"), idx("0"), key("profile")}, false},
+		{[]seg{key("node_workloads"), idx("0"), key("decl"), key("reservation")}, false},
+		{[]seg{key("reservation")}, false},
+		{nil, false},
+	} {
+		if got := matchesPointer(row.path, p); got != row.want {
+			t.Errorf("%s vs %v = %v, want %v", p, row.path, got, row.want)
 		}
 	}
 }

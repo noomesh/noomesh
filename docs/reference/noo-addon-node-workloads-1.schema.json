@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://noomesh.ai/schemas/noo-addon-node-workloads-1.json",
   "title": "noo-addon-node-workloads/1: an add-on's node workloads (node-workloads.json)",
-  "description": "A file of the add-on's signed bundle, listed in the bundle lock beside resources.json and routes.json. Core builds the container from this closed declaration and places it on a capable node; the add-on never supplies a ref, a mount, a capability or a free-form env. Validated by the CLI (noo-cli/src/addons/decls.rs), the gateway (gateway-rust/src/addon_workloads.rs) and the node agent (node-agent-go/internal/nodewl), each against tests/fixtures/i300/node-workloads/ (cases.json lists the stable refusal code for each). The door's DNS SAN noo-stunnel-<addon>-<workload> must be one DNS label of at most 63 characters, so a node workload is refused when len(addon) + 1 + len(workload) > 51. Contract: docs/reference/node-workloads.md. Design: noomesh-internal proposals/i300 section 4.1.",
+  "description": "A file of the add-on's signed bundle, listed in the bundle lock beside resources.json and routes.json. Core builds the container from this closed declaration and places it on a capable node; the add-on never supplies a ref, a mount, a capability or a free-form env. Validated by the CLI (noo-cli/src/addons/decls.rs), the gateway (gateway-rust/src/addon_workloads.rs) and the node agent (node-agent-go/internal/nodewl), each against tests/fixtures/i300/node-workloads/ (cases.json lists the stable refusal code for each). The door's DNS SAN noo-stunnel-<addon>-<workload> must be one DNS label of at most 63 characters, so a node workload is refused when len(addon) + 1 + len(workload) > 51. JSON null is refused on every field (this format has no nullable field), and so is a repeated object key; every validator must match. Contract: docs/reference/node-workloads.md. Design: noomesh-internal proposals/i300 section 4.1.",
   "type": "object",
   "additionalProperties": false,
   "required": ["format", "workloads"],
@@ -120,6 +120,7 @@
     "scratch targets are not /, /proc, /sys or /dev (or below them), are unique, and neither equal, inside nor around any model slot target (scratch_target_refused, scratch_invalid, scratch_in_model_slot).",
     "model slot names and targets are unique, and no slot target is inside another (model_slot_invalid).",
     "the agent mounts each chosen set read-only at its slot target, as one directory; many=true slots mount each set under <target>/<set id>; optional=true slots may stay empty.",
+    "JSON null is refused on every field with field_type (the schema's types already refuse it; Go's decoder would read `\"gpu\": null` as 0). This format has no nullable field. A repeated object key is refused with duplicate_key.",
     "an unknown field is refused everywhere (unknown_field); a CLI from before a minor addition refuses the lock rather than half-reading it."
   ]
 }

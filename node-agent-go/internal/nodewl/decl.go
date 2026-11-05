@@ -141,7 +141,7 @@ func ParseDecl(addon string, b []byte, lockImages map[string]string) ([]Decl, er
 		Format    string            `json:"format"`
 		Workloads []json.RawMessage `json:"workloads"`
 	}
-	if err := decodeStrict(b, &file); err != nil {
+	if err := decodeStrict(b, &file, nullableNodeWorkloads); err != nil {
 		return nil, err
 	}
 	g := generic(b)
@@ -176,7 +176,8 @@ func ParseDecl(addon string, b []byte, lockImages map[string]string) ([]Decl, er
 // verified lock.
 func parseWorkload(addon string, raw []byte, lockImages map[string]string, checkLock bool) (Decl, error) {
 	var d Decl
-	if err := decodeStrict(raw, &d); err != nil {
+	// raw is a part of a document whose tokens were already walked.
+	if err := decodeTyped(raw, &d); err != nil {
 		return d, err
 	}
 	g := generic(raw)

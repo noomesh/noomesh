@@ -55,6 +55,11 @@
     "code": "duplicate_key"
   },
   {
+    "file": "refuse-null-nested.json",
+    "valid": false,
+    "code": "field_type"
+  },
+  {
     "file": "refuse-bad-format.json",
     "valid": false,
     "code": "bad_format"
