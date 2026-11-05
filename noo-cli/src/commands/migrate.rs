@@ -461,7 +461,7 @@ mod stage_tests {
     #[test]
     fn export_and_import_no_longer_stage_under_a_pid_name() {
         let src = include_str!("migrate.rs");
-        let code = src.split("#[cfg(test)]").next().unwrap();
+        let code = crate::test_src::own_code(src);
         assert!(!code.contains("std::process::id()"), "a pid-named stage is back");
         assert!(code.contains("umask 077; set -o pipefail; docker exec"), "the dump lost its umask");
     }

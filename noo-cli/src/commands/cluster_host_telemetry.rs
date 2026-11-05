@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn each_node_is_gated_on_its_heartbeat_before_the_next() {
         let me_src = include_str!("cluster_host_telemetry.rs");
-        let code = me_src.split("#[cfg(test)]").next().unwrap();
+        let code = crate::test_src::own_code(me_src);
         assert!(code.contains("deliver_kind_to_nodes_then(") && code.contains("Some(&wait)"), "no per-node gate handed to the skeleton");
         assert!(code.contains("confirm_effect_via_heartbeat"), "the gate is no longer the effect test");
         let sk = include_str!("cluster_provision_subprocess.rs");

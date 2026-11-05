@@ -4438,7 +4438,7 @@ mod cli_asset_refill_tests {
     #[test]
     fn a_missing_cli_asset_is_fetched_or_said_never_dropped() {
         let src = include_str!("provision.rs");
-        let src = src.split("#[cfg(test)]").next().unwrap();
+        let src = crate::test_src::own_code(src);
         let cli = &src[src.find("fn attach_cli(").unwrap()..];
         let cli = &cli[..cli.find("\n\u{7d}\n").unwrap()];
         assert!(cli.contains("cached_release_asset(g, &root, &asset)"), "the CLI asset is fetched when the cache lacks it");
@@ -4909,7 +4909,7 @@ mod tests {
     #[test]
     fn the_local_lane_reissues_on_missing_controller_names() {
         let whole = include_str!("provision.rs");
-        let src = whole.split("#[cfg(test)]").next().unwrap();
+        let src = crate::test_src::own_code(whole);
         let local = &src[src.find("fn provision_local_in(").expect("provision_local_in")..];
         let body = &local[..local.find("ensure_door_leaves_try(").expect("door leaves step")];
         assert!(body.contains("cert_covers_sans(&node_crt, role.required_dns()"), "coverage test missing");
@@ -4922,7 +4922,7 @@ mod tests {
         let whole = include_str!("provision.rs");
         // Only the real code: the literals in this test would otherwise
         // match themselves.
-        let src = whole.split("#[cfg(test)]").next().unwrap();
+        let src = crate::test_src::own_code(whole);
         let calls: Vec<&str> = src
             .match_indices("pki_issue_node(")
             .map(|(i, _)| &src[i..(i + 200).min(src.len())])
@@ -4945,7 +4945,7 @@ mod tests {
     #[test]
     fn every_prep_insecure_site_carries_the_ca_pin() {
         let whole = include_str!("provision.rs");
-        let src = whole.split("#[cfg(test)]").next().unwrap();
+        let src = crate::test_src::own_code(whole);
         let sites: Vec<usize> = src.match_indices("\"PREP_INSECURE=1\"").map(|(i, _)| i).collect();
         assert!(!sites.is_empty(), "no PREP_INSECURE=1 site found — did it move?");
         for i in sites {
@@ -4965,7 +4965,7 @@ mod tests {
     #[test]
     fn retired_backend_tls_switches_are_not_rendered() {
         let whole = include_str!("provision.rs");
-        let src = whole.split("#[cfg(test)]").next().unwrap();
+        let src = crate::test_src::own_code(whole);
         for key in ["noo_vllm_tls", "noo_llamacpp_tls", "noo_ollama_tls"] {
             assert!(!src.contains(&format!("vars.insert(\"{key}\"")), "{key} is rendered again");
         }
@@ -5457,7 +5457,7 @@ mod self_node_rail_tests {
         assert_eq!(pull_target_cert(false, || panic!("local read for a remote node"), || Some("REC".into())),
             Some("REC".into()));
         let whole = include_str!("provision.rs");
-        let src = whole.split("#[cfg(test)]").next().unwrap();
+        let src = crate::test_src::own_code(whole);
         let f = &src[src.find("pub(crate) fn stage_bundle_pull(").unwrap()..];
         assert!(f[..f.find("\n}\n").unwrap()].contains("pull_target_cert(is_self"));
     }
@@ -5518,7 +5518,7 @@ mod self_node_rail_tests {
     #[test]
     fn the_rail_verb_has_no_sudo_lane_and_builds_the_self_node_locally() {
         let whole = include_str!("provision.rs");
-        let src = whole.split("#[cfg(test)]").next().unwrap();
+        let src = crate::test_src::own_code(whole);
         // The rail verb is the phase list plus every phase it runs.
         let body = phase_src::verb();
         assert!(!body.contains("provision_local("), "the rail verb must not call the first-install lane");
@@ -5548,7 +5548,7 @@ mod self_node_rail_tests {
         assert!(aa.find("if self_steps").unwrap() < lane && lane < hostd, "{aa}");
         assert!(aa.contains(r#"applier_applied(msg, "hostd-binary")"#), "{aa}");
         let up = include_str!("upgrade.rs");
-        let up = up.split("#[cfg(test)]").next().unwrap();
+        let up = crate::test_src::own_code(up);
         let f = &up[up.find("fn upgrade_self_node(").unwrap()..];
         let f = &f[..f.find("\n}\n").unwrap()];
         assert!(f.contains(r#"provision_one(g, me, &["--stage-only"])"#), "{f}");
@@ -5773,7 +5773,7 @@ mod local_lane_tests {
         assert!(!s.contains("/etc/noo/self-node"), "no root-written copy for the gateway: {s}");
         assert!(!script(&[], false).contains("openssl req"), "no prep: no identity step");
         let whole = include_str!("provision.rs");
-        let src = whole.split("#[cfg(test)]").next().unwrap();
+        let src = crate::test_src::own_code(whole);
         assert!(src.contains(r#".arg(format!("PREP_BIRTH_KEY={}/birth.key", work.display()))"#));
         assert!(src.contains("let prep_cmd = if prep_current && units_missing.is_empty()"),
             "prep re-runs while a pull unit is missing");
@@ -5989,7 +5989,7 @@ mod upgrade_stages_every_node_before_waiting_tests {
     #[test]
     fn the_nodes_phase_stages_all_then_waits_once() {
         let up = include_str!("upgrade.rs");
-        let up = up.split("#[cfg(test)]").next().unwrap();
+        let up = crate::test_src::own_code(up);
         let f = &up[up.find("fn upgrade_nodes(").unwrap()..];
         let f = &f[..f.find("\n}\n").unwrap()];
         let stage = f.find(r#"provision_one(g, n, &["--stage-only"])"#).expect("remote nodes are staged with --stage-only");
@@ -6008,9 +6008,9 @@ mod upgrade_stages_every_node_before_waiting_tests {
     #[test]
     fn the_self_nodes_post_apply_steps_have_one_function_and_two_callers() {
         let prov = include_str!("provision.rs");
-        let prov = prov.split("#[cfg(test)]").next().unwrap();
+        let prov = crate::test_src::own_code(prov);
         let up = include_str!("upgrade.rs");
-        let up = up.split("#[cfg(test)]").next().unwrap();
+        let up = crate::test_src::own_code(up);
         let verb = super::phase_src::body("await_apply");
         assert!(verb.contains("after_self_applied(g, &node, msg)"), "the single-node verb");
         let settle = &up[up.find("fn settle_end(").unwrap()..];

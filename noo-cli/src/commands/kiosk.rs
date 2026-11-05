@@ -1957,7 +1957,7 @@ mod tests {
         assert!(c.contains(crate::vendor::TAILSCALE_UPLOAD_MARKER), "an operator's opt-in must stop the seat re-applying the switch: {c}");
         assert!(c.find("tee -a").unwrap() < c.find("systemctl restart tailscaled").unwrap(), "{c}");
         // And setup actually runs it.
-        let body = include_str!("kiosk.rs").split("#[cfg(test)]").next().unwrap();
+        let body = crate::test_src::own_code(include_str!("kiosk.rs"));
         assert!(body.contains("sh(&tailscale_logs_off_cmd())"), "kiosk_setup no longer switches the upload off");
         assert!(body.contains("(\"tailscale logs\""), "kiosk status shows no tailscale logs row");
     }
@@ -2239,12 +2239,12 @@ mod tests {
     /// running the proxy's own publisher as an UNPRIVILEGED process into
     /// a temp dir, then asserting every row status prints is populated —
     /// and that the absent case says so rather than inventing a value.
-    /// Source with the test module cut off, so a guard can never match its
-    /// own assertions or the prose explaining them — the way two guards in
-    /// this file once passed.
-    fn own_code(src: &str) -> String {
-        let body = src.split("#[cfg(test)]").next().unwrap_or(src);
-        body.lines()
+    /// A kiosk asset (the bash launcher, the python CDP helper) without its
+    /// `//` lines. kiosk.rs itself is read through `crate::test_src::own_code`
+    /// (comments blanked, test items removed whole); these two are not Rust,
+    /// so the Rust lexer is not theirs.
+    fn asset_code(src: &str) -> String {
+        src.lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n")
@@ -2256,7 +2256,7 @@ mod tests {
     /// asked — reasonably — why the regular command would not do it.
     #[test]
     fn reloading_the_display_is_a_noo_verb() {
-        let own = own_code(include_str!("kiosk.rs"));
+        let own = crate::test_src::own_code(include_str!("kiosk.rs"));
         assert!(own.contains("pub fn kiosk_reload"), "this guard is stale: kiosk_reload is gone");
         assert!(
             own.contains("noo-kiosk-cdp reload"),
@@ -2294,7 +2294,7 @@ mod tests {
     /// file that can silently age out on every display in the fleet.
     #[test]
     fn staleness_covers_every_seat_script() {
-        let own = own_code(include_str!("kiosk.rs"));
+        let own = crate::test_src::own_code(include_str!("kiosk.rs"));
         let installed: std::collections::BTreeSet<&str> = own
             .match_indices("/usr/local/bin/noo-kiosk-")
             .map(|(i, _)| {
@@ -2322,7 +2322,7 @@ mod tests {
     /// implemented.
     #[test]
     fn the_console_build_reaches_the_operator() {
-        let cdp = own_code(CDP);
+        let cdp = asset_code(CDP);
         assert!(
             cdp.contains("__nooKioskBuild"),
             "noo-kiosk-cdp cannot read the build the console publishes"
@@ -2331,7 +2331,7 @@ mod tests {
             cdp.contains(r#"cmd == "build""#),
             "noo-kiosk-cdp has no `build` command for status to call"
         );
-        let own = own_code(include_str!("kiosk.rs"));
+        let own = crate::test_src::own_code(include_str!("kiosk.rs"));
         assert!(
             own.contains("noo-kiosk-cdp build"),
             "status never asks for the build: the cdp command is dead code"
@@ -3081,7 +3081,7 @@ mod tests {
     /// exercised in tests/test_kiosk_cdp_broker.py.
     #[test]
     fn the_browser_has_no_debugging_port() {
-        let launch = own_code(LAUNCH);
+        let launch = asset_code(LAUNCH);
         for gone in ["--remote-debugging-port", "--remote-debugging-address", "--remote-allow-origins", "CDP_PORT"] {
             assert!(
                 !launch.contains(gone),
@@ -3095,7 +3095,7 @@ mod tests {
             launch.contains("cage -- \"$CDP_HELPER\" broker -- \"$BROWSER\""),
             "the browser is not started by the CDP broker, so nothing holds its pipe"
         );
-        let cdp = own_code(CDP);
+        let cdp = asset_code(CDP);
         for gone in ["9222", "/json/list", "webSocketDebuggerUrl", "NOO_KIOSK_CDP_PORT"] {
             assert!(!cdp.contains(gone), "noo-kiosk-cdp still speaks to a debugging port ({gone})");
         }
@@ -3267,7 +3267,7 @@ mod tests {
     /// None and teardown never unmasks the getty it masked (i191 D3).
     #[test]
     fn teardown_reads_is_enabled_through_the_any_status_helper() {
-        let body = include_str!("kiosk.rs").split("#[cfg(test)]").next().unwrap();
+        let body = crate::test_src::own_code(include_str!("kiosk.rs"));
         for needle in [
             "sh_out_any(\"systemctl is-enabled getty@.service 2>/dev/null\").as_deref() == Some(\"masked\")",
             "sh_out_any(\"systemctl is-enabled display-manager.service 2>/dev/null\").as_deref() == Some(\"disabled\")",
@@ -3282,10 +3282,13 @@ mod tests {
     #[test]
     fn setup_confirms_before_it_disables_the_display_manager() {
         let src = include_str!("kiosk.rs");
-        let body = src.split("#[cfg(test)]").next().unwrap();
+        let body = crate::test_src::own_code(src);
         let confirm = body.find("display_manager_will_be_disabled(a.mode").expect("setup must gate the disable");
         let disable = body.find("sudo systemctl disable --now display-manager.service").unwrap();
-        let first_write = body.find("// 1. the user").unwrap();
+        // The first write is step 1's useradd (anchored on its code: the
+        // comment that names the step is blanked, followup 215).
+        let first_write = body.find("\"sudo useradd --system --create-home --home-dir").expect("setup's first write, the useradd");
+        assert_eq!(body.matches("sudo useradd").count(), 1, "one useradd, so the anchor is the first write");
         assert!(confirm < first_write && first_write < disable, "the confirm must precede every write");
         assert!(parse_setup(&["--url".into(), "https://c.t.ts.net".into(), "--mode".into(), "shared".into(), "-y".into()]).unwrap().yes);
     }

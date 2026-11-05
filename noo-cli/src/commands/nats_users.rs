@@ -1406,7 +1406,7 @@ mod tests {
         assert!(!conf.to_ascii_lowercase().contains("seat"), "{conf}");
         // Structural: the renderer's only fleet source is the node registry.
         let src = include_str!("nats_users.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let prod = crate::test_src::own_code(src);
         assert!(!prod.contains("/api/cluster/seats") && !prod.contains("kiosk_seat"),
             "nats_users must never enumerate seats");
         assert!(prod.contains("\"/api/cluster/nodes\""));

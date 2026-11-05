@@ -555,12 +555,12 @@ mod tests {
             ("commands/upgrade.rs", include_str!("commands/upgrade.rs")),
             ("host_access.rs", include_str!("host_access.rs")),
         ] {
-            let code = src.split("#[cfg(test)]").next().unwrap();
+            let code = crate::test_src::own_code(src);
             for needle in ["\"cli-onboard\"", "\"cli-break-glass\"", "\"cli-posture\"", "NOO_BREAK_GLASS\")", "shared_secret_bearer", "HMAC_ACTOR_"] {
                 assert!(!code.contains(needle), "{name} still carries {needle}");
             }
         }
-        let code = include_str!("auth.rs").split("#[cfg(test)]").next().unwrap();
+        let code = crate::test_src::own_code(include_str!("auth.rs"));
         assert!(!code.contains("NOO_CONTROLLER_SECRET"), "auth.rs must not read the controller secret");
     }
 

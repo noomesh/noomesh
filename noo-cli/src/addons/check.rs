@@ -314,7 +314,7 @@ mod tests {
     /// network and no install; the only read is the directory itself.
     #[test]
     fn the_check_reads_only_the_directory() {
-        let src = include_str!("check.rs").split("#[cfg(test)]").next().unwrap();
+        let src = crate::test_src::own_code(include_str!("check.rs"));
         for banned in ["lock_fetch", "std::net", "ureq", "repo_root", "of_install", "guard_install", "std::process"] {
             assert!(!src.contains(&format!("{banned}::")) && !src.contains(&format!("use {banned}")), "check.rs must not use {banned}");
         }

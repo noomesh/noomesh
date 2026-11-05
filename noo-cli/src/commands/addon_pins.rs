@@ -788,7 +788,7 @@ mod tests {
     #[test]
     fn docker_facing_pin_refs_go_through_local_images() {
         let src = include_str!("addon_pins.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let prod = crate::test_src::own_code(src);
         assert!(!prod.contains("in &pin.images"), "iterate pin.local_images(), not pin.images");
         assert!(prod.matches("pin.local_images()").count() >= 2, "verify and launch-pins both map refs");
     }

@@ -5415,7 +5415,7 @@ mod tests {
     #[test]
     fn the_mac_pass_stages_only_then_waits_once() {
         let src = include_str!("upgrade.rs");
-        let src = src.split("#[cfg(test)]").next().unwrap();
+        let src = crate::test_src::own_code(src);
         let f = &src[src.find("fn mac_leaves_pass(").unwrap()..];
         let f = &f[..f.find("\n\u{7d}\n").unwrap()];
         assert!(f.contains(r#"provision_one(g, n, &["--stage-only"])"#), "{f}");
@@ -7147,8 +7147,9 @@ mod json_stdout_tests {
     /// line that is itself the JSON branch (names `g.json` or prints `json!`).
     #[test]
     fn fleet_stage_functions_have_no_raw_stdout_print() {
+        let up = crate::test_src::own_code(include_str!("upgrade.rs"));
         let files: [(&str, &str, &[&str]); 3] = [
-            ("upgrade.rs", include_str!("upgrade.rs").split("#[cfg(test)]").next().unwrap(),
+            ("upgrade.rs", up.as_str(),
              &["upgrade_nodes", "wait_and_settle_nodes", "settle_end", "mac_leaves_pass", "upgrade_self_node", "upload_cli_assets"]),
             ("kiosk_seat.rs", include_str!("kiosk_seat.rs"), &["upgrade_seats"]),
             ("cluster_verify.rs", include_str!("cluster_verify.rs"), &["verify_node_after_apply"]),
