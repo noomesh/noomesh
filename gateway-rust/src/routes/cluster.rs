@@ -1954,7 +1954,8 @@ mod node_agent_auth_tests {
         assert_eq!(node_agent_bearer(Some("")), None);
         // ...and the function cannot even be handed a secret to sign with.
         let src = include_str!("cluster.rs");
-        let body = src.split("pub(crate) fn node_agent_bearer(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "pub(crate) fn node_agent_bearer(");
         assert!(!body.contains(&["mint_cluster", "_token"].concat()), "the fallback is back: {body}");
     }
 }
@@ -7554,9 +7555,10 @@ mod model_class_tests {
     #[test]
     fn model_class_writes_are_audited() {
         let src = include_str!("cluster.rs");
-        let put = src.split("async fn model_class_put(").nth(1).unwrap().split("\n}\n").next().unwrap();
-        let del = src.split("async fn model_class_delete(").nth(1).unwrap().split("\n}\n").next().unwrap();
-        let get = src.split("async fn model_classes_get(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(src);
+        let put = crate::test_src::fn_body(&own, "async fn model_class_put(");
+        let del = crate::test_src::fn_body(&own, "async fn model_class_delete(");
+        let get = crate::test_src::fn_body(&own, "async fn model_classes_get(");
         assert!(put.contains("audit::record(") && put.contains("AuditKind::ModelClassDeclared"), "PUT audits");
         assert!(put.contains("\"unknown_nodes\": unknown_nodes"), "the audit row names the unknown nodes");
         assert!(del.contains("audit::record(") && del.contains("AuditKind::ModelClassRemoved"), "DELETE audits");
@@ -7881,10 +7883,8 @@ mod proposer_tests {
     #[test]
     fn the_handler_does_not_read_proposed_by_from_the_body() {
         let src = include_str!("cluster.rs");
-        let start = src.find("async fn cluster_propose(").unwrap();
-        let rest = &src[start..];
-        let end = rest.find("\n}\n").unwrap();
-        let body = &rest[..end];
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "async fn cluster_propose(");
         assert!(body.contains("proposer_of("));
         assert!(!body.contains("body.get(\"proposed_by\")"), "caller-asserted provenance is back");
         assert!(!body.contains("body.get(\"conversation_id\")"));
@@ -8054,9 +8054,9 @@ mod start_over_the_bus_tests {
     #[test]
     fn every_start_caller_resolves_its_link_by_node_id() {
         let src = include_str!("cluster.rs");
-        let src = src.split("mod start_over_the_bus_tests").next().unwrap();
+        let own = crate::test_src::own_code(src);
         for f in ["async fn start_backend_core(", "async fn models_cache(", "async fn models_pull("] {
-            let body = src.split(f).nth(1).expect(f).split("\n}\n").next().unwrap();
+            let body = crate::test_src::fn_body(&own, f);
             assert!(body.contains("NodeLink::for_node("), "{f} must resolve its link with for_node");
             assert!(!body.contains("NodeLink::for_base("), "{f} sends /start by address: it never rides the bus");
         }
@@ -8074,9 +8074,8 @@ mod nodes_bus_down_tests {
     #[test]
     fn the_node_list_never_waits_on_kv_while_the_bus_is_down() {
         let src = include_str!("cluster.rs");
-        let src = &src[..src.find("#[cfg(test)]").expect("test modules")];
-        let body = src.split("pub(crate) async fn collect_cluster_nodes(").nth(1).expect("collect_cluster_nodes");
-        let body = body.split("\n\u{7d}\n").next().unwrap();
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "pub(crate) async fn collect_cluster_nodes(");
         let gate = body.find("let bus_up = crate::state::bus_connected(&state.nats);").expect("the bus is checked");
         let read = body.find("if bus_up { state.js.get_key_value(\"mesh_nodes\").await.ok() } else { None }").expect("the KV read is gated");
         assert!(gate < read, "checked before the read");

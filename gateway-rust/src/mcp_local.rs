@@ -661,8 +661,7 @@ mod tests {
         let strip = |src: &str| -> String {
             src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
         };
-        let this = strip(include_str!("mcp_local.rs"));
-        let body = &this[..this.find("#[cfg(test)]").expect("tests follow the code")];
+        let body = &crate::test_src::own_code(include_str!("mcp_local.rs"));
         let sig = &body[body.find("async fn dispatch(").expect("dispatch")..];
         let sig = &sig[..sig.find(") -> Response").expect("dispatch signature")];
         assert!(sig.contains("caller: OperatorCaller"), "dispatch must take its caller by value:\n{sig}");

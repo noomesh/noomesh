@@ -875,11 +875,12 @@ mod tests {
         let rel = src.split("async fn reservation_release(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
         assert!(rel.contains("holder != actor && !force"), "only the holder, or a force");
         assert!(rel.find("drain_and_stop(").unwrap() < rel.find("\"release\"").unwrap(), "the workload stops before the lease is released");
-        let proxy = src.split("async fn workload_proxy(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("reservations.rs"));
+        let proxy = crate::test_src::fn_body(&own, "async fn workload_proxy(");
         assert!(proxy.contains("r[\"state\"] == \"held\""), "only a reserved workload is reachable");
         assert!(proxy.contains("decl.container"), "the container comes from the declaration, never the caller");
         assert!(proxy.find("r.role < crate::auth::Role::Operator").unwrap() < proxy.find("lookup(&addon").unwrap(), "identity before anything is looked up");
-        let relay = src.split("async fn relay_websocket(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let relay = crate::test_src::fn_body(&own, "async fn relay_websocket(");
         assert!(relay.contains("CLOSE_RESERVATION_ENDED"), "a relayed stream closes with the reservation");
         assert_eq!(CLOSE_RESERVATION_ENDED, 4001);
     }

@@ -145,7 +145,8 @@ mod tests {
     /// `(suffix, handler expression)` for every row under `prefix`.
     fn rows(prefix: &str) -> BTreeMap<String, String> {
         let src = include_str!("recall.rs");
-        let body = &src[src.find("pub fn router()").unwrap()..src.find("#[cfg(test)]").unwrap()];
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "pub fn router()");
         body.lines()
             .filter_map(|l| l.trim().strip_prefix(".route(\""))
             .filter_map(|l| l.strip_prefix(prefix))

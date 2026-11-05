@@ -464,7 +464,7 @@ mod prefix_tests {
         assert_eq!(build_refresh_cookie("noo-rt-x", 1).secure(), Some(true));
         assert_eq!(build_clear_cookie().secure(), Some(true));
         for (name, src) in [("auth_refresh.rs", include_str!("auth_refresh.rs")), ("routes/core.rs", include_str!("routes/core.rs"))] {
-            let code = src.split("#[cfg(test)]").next().unwrap_or(src);
+            let code = crate::test_src::own_code(src);
             assert!(!code.contains("NOO_BEHIND_TLS_PROXY"), "{name} reads the retired proxy switch again");
             assert!(!code.contains("set_secure(secure)"), "{name}: the cookie's Secure flag is a parameter again");
         }

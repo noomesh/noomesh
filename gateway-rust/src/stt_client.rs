@@ -681,7 +681,7 @@ mod tests {
     #[test]
     fn every_stt_dial_goes_through_the_door() {
         let src = include_str!("stt_client.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let prod = crate::test_src::own_code(src);
         assert!(!prod.contains("tls::cluster_client()"), "a direct cluster_client() dial bypasses STT_DOOR");
         assert_eq!(prod.matches("STT_DOOR.client(").count(), 2, "transcribe + probe");
     }

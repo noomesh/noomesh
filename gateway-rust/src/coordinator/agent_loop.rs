@@ -4016,7 +4016,7 @@ mod max_tokens_default_tests {
     #[test]
     fn vllm_max_tokens_has_a_single_declared_default() {
         let src = include_str!("agent_loop.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let prod = crate::test_src::own_code(src);
         let key = concat!("\"VLLM", "_MAX_TOKENS\"");
         assert_eq!(
             prod.matches(key).count(),
@@ -4039,7 +4039,7 @@ mod cloud_loop_tests {
     #[test]
     fn neither_loop_entry_point_short_circuits_to_the_single_turn_path() {
         let src = include_str!("agent_loop.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let prod = crate::test_src::own_code(src);
         let sealed = [
             "run_streaming_on", "run_streaming_on_bound", "run_inner", "run_inner_bound",
             "send_llm_with_fallback", "send_cloud_attempt",

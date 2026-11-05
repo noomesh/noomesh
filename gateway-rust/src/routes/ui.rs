@@ -1902,7 +1902,8 @@ mod browser_key_tests {
         assert!(!code.contains("\"NOO_CLUSTER_SECRET\")"), "browser_start reads the fleet secret again");
         assert!(code.contains("\"NOO_BROWSER_KEY\": browser_key.clone(),"));
         assert!(code.contains("\"NOO_CLUSTER_SECRET\": browser_key,"), "the one-release compat name must carry the BROWSER key");
-        let header = src.split("fn browser_auth_header() -> Option<(String, String)> {").nth(1).unwrap().split("\n}").next().unwrap();
+        let own = crate::test_src::own_code(src);
+        let header = crate::test_src::fn_body(&own, "fn browser_auth_header()");
         assert!(header.contains("secret_opt(BROWSER_KEY)") && !header.contains("NOO_CLUSTER_SECRET"), "{header}");
     }
 }

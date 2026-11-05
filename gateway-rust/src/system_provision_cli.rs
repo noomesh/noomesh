@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn the_boot_reconcile_and_this_path_share_one_implementation() {
         let broker = include_str!("system_provision.rs");
-        let broker = &broker[..broker.find("#[cfg(test)]").expect("tests mod")];
+        let broker = crate::test_src::own_code(broker);
         let reconcile = &broker[broker.find("pub async fn reconcile(").expect("reconcile")..];
         assert!(reconcile.contains("provision_system(db, name, spec, &delivered)"), "reconcile must call provision_system");
         assert!(
@@ -303,7 +303,7 @@ mod tests {
             "reconcile must not carry its own copy of the steps"
         );
         let this = include_str!("system_provision_cli.rs");
-        let this = &this[..this.find("#[cfg(test)]").expect("tests mod")];
+        let this = crate::test_src::own_code(this);
         assert!(this.contains("provision_system(&db, &p.name, &p.spec, &p.delivered)"));
         assert!(!this.contains("sqlx::query"), "this path carries no SQL of its own");
     }

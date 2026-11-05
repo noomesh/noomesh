@@ -1205,8 +1205,9 @@ mod tests {
             }
         }
         let ha = include_str!("heartbeat_actions.rs");
-        let rt = &ha[ha.find("pub async fn run_rust_native_task(").unwrap()..];
-        assert!(rt[..rt.find("\n}\n").unwrap()].contains("ceiling_for_run("), "self_benchmark runs under a ceiling");
+        let ha = crate::test_src::own_code(ha);
+        let rt = crate::test_src::fn_body(&ha, "pub async fn run_rust_native_task(");
+        assert!(rt.contains("ceiling_for_run("), "self_benchmark runs under a ceiling");
     }
 
     #[test]
@@ -1534,12 +1535,8 @@ mod tests {
 
     #[test]
     fn the_handlers_use_the_guard_and_the_decide_route_checks_a_person() {
-        let routes = include_str!("routes/intelligence.rs");
-        let block = |name: &str| {
-            let start = routes.find(&format!("async fn {name}(")).unwrap_or_else(|| panic!("{name}"));
-            let rest = &routes[start..];
-            rest[..rest.find("\n}\n").unwrap()].to_string()
-        };
+        let routes = crate::test_src::own_code(include_str!("routes/intelligence.rs"));
+        let block = |name: &str| crate::test_src::fn_body(&routes, &format!("async fn {name}(")).to_string();
         for h in ["heartbeat_create_task", "heartbeat_schedule_task"] {
             assert!(block(h).contains("write_task("), "{h} writes through the guard");
             assert!(!block(h).contains("upsert_task("), "{h} does not write around it");
@@ -1562,8 +1559,8 @@ mod tests {
         assert!(st[st.find("pub(crate) fn needs_person(").unwrap()..].contains("EGRESS_TARGET_SETTINGS"));
         assert!(EGRESS_TARGET_SETTINGS.contains(&"NOO_REPORTS_DRIVE_FOLDER_ID"));
         let users = include_str!("routes/users.rs");
-        let decide = &users[users.find("async fn proposal_decide(").unwrap()..];
-        let decide = &decide[..decide.find("\n}\n").unwrap()];
+        let users = crate::test_src::own_code(users);
+        let decide = crate::test_src::fn_body(&users, "async fn proposal_decide(");
         assert!(decide.contains("check_approver("), "approval re-classifies and requires a person");
         assert!(decide.contains("apply_approved("));
     }
@@ -1741,8 +1738,9 @@ mod tests {
         v.recipients = json!(["777"]);
         assert!(matches!(write_task(&db, &door(), &v, "create").await.unwrap(), Written::Proposed { .. }), "no recorded author");
         let comm = include_str!("routes/communication.rs");
-        let create = &comm[comm.find("async fn create_saved_recipient(").unwrap()..];
-        assert!(create[..create.find("\n}\n").unwrap()].contains("resolve_origin("), "the saved-recipient write records a person");
+        let comm = crate::test_src::own_code(comm);
+        let create = crate::test_src::fn_body(&comm, "async fn create_saved_recipient(");
+        assert!(create.contains("resolve_origin("), "the saved-recipient write records a person");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

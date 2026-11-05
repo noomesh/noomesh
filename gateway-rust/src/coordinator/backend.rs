@@ -1572,12 +1572,9 @@ mod tests {
         // An agent that predates the field: no `serving`, so serving.
         let older = serde_json::json!({"id": "host8", "last_heartbeat": now, "backend_containers": {"vllm": {"running": true}}});
         assert_eq!(crate::coordinator::classes::node_health("host8", &older, "vllm", now), (true, String::new()));
-        let src = include_str!("backend.rs");
+        let own = crate::test_src::own_code(include_str!("backend.rs"));
         // The resolver's body only: up to its closing brace, not this test.
-        // (`\u{7d}` is a closing brace: a bare one in a string here unbalances the brace
-        // count tests/test_gateway_refuses_plaintext.py strips test modules by.)
-        let body = src.split("pub(crate) async fn resolve_backend_and_node(").nth(1).expect("resolver");
-        let body = body.split("\n\u{7d}\n").next().expect("resolver body");
+        let body = crate::test_src::fn_body(&own, "pub(crate) async fn resolve_backend_and_node(");
         assert!(body.contains("classes::node_health(&key, &data, bt, now)"), "the KV scan must apply the shared health rule");
         assert!(body.contains("order_candidates(&mut candidates"), "and sort by it");
     }

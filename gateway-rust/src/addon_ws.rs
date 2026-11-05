@@ -969,8 +969,8 @@ mod tests {
     /// that dials (or upgrades) before the permission check fails here.
     #[test]
     fn serve_ws_checks_permission_before_it_dials_or_upgrades() {
-        let src = include_str!("addon_ws.rs");
-        let body = src.split("async fn serve_ws(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("addon_ws.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn serve_ws(");
         let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("serve_ws no longer contains {needle:?}"));
         let admit_at = at("admit(manifest, spec");
         let enabled_at = at("crate::addons::enabled(addon)");
@@ -1016,8 +1016,8 @@ mod tests {
     /// one that does not redeem; it never falls back to an anonymous socket.
     #[test]
     fn serve_ws_redeems_the_ticket_first_and_fails_closed() {
-        let src = include_str!("addon_ws.rs");
-        let body = src.split("async fn serve_ws(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("addon_ws.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn serve_ws(");
         let redeem = body.find("redeem_ticket(t, addon)").unwrap();
         let admit_at = body.find("admit(manifest, spec").unwrap();
         assert!(redeem < admit_at);

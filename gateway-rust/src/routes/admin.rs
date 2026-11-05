@@ -5085,8 +5085,8 @@ mod tests {
         assert!(loki_ready_detail(None, "error sending request: tls handshake eof").starts_with("no answer: "));
         assert!(loki_ready_detail(Some(503), &"x".repeat(1000)).len() < 260, "bounded");
         let src = include_str!("admin.rs");
-        let body = &src[src.find("async fn logs_status(").unwrap()..];
-        let body = &body[..body.find("\n}\n").unwrap()];
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "async fn logs_status(");
         assert!(body.contains("\"loki_ready_detail\": detail"), "the reason is not returned");
         assert!(!body.contains("unwrap_or(false)"), "the probe folds its reason into false again");
     }

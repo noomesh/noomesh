@@ -3009,11 +3009,8 @@ mod tests {
     fn node_heartbeat_alerts_are_persisting_and_have_a_clear_path() {
         // The wiring the schedule depends on: per-node, persisting, cleared.
         let src = include_str!("autonomy_evaluators.rs");
-        let body = src
-            .split("async fn alert_nodes_on_change(")
-            .nth(1)
-            .expect("alert_nodes_on_change not found");
-        let body = &body[..body.find("\n}\n").unwrap()];
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "async fn alert_nodes_on_change(");
         assert!(body.contains(".persisting()"), "node-offline alerts must be persisting");
         assert!(body.contains("clear_operator_alert"), "a node that heartbeats again must be reported recovered");
     }
@@ -4283,12 +4280,8 @@ mod ssh_lane_removed_tests {
         // END somewhere honest. Assert the calls are present rather than
         // trusting that they are.
         let src = include_str!("autonomy_evaluators.rs");
-        let src = src.split("mod ssh_lane_removed_tests").next().unwrap();
-        let unreachable = src
-            .split("pub async fn eval_worker_node_agent_unreachable")
-            .nth(1)
-            .expect("evaluator not found — this guard is reading the wrong file");
-        let unreachable = &unreachable[..unreachable.find("\n}\n").unwrap_or(unreachable.len())];
+        let src = crate::test_src::own_code(src);
+        let unreachable = crate::test_src::fn_body(&src, "pub async fn eval_worker_node_agent_unreachable");
         assert!(
             unreachable.contains("send_operator_alert"),
             "worker_node_agent_unreachable no longer tells anyone"
@@ -4298,11 +4291,7 @@ mod ssh_lane_removed_tests {
             "the alert must carry the manual command, not just the symptom"
         );
 
-        let unbound = src
-            .split("async fn revive_for_unbound_consumer")
-            .nth(1)
-            .expect("unbound-consumer path not found");
-        let unbound = &unbound[..unbound.find("\n}\n").unwrap_or(unbound.len())];
+        let unbound = crate::test_src::fn_body(&src, "async fn revive_for_unbound_consumer");
         assert!(
             unbound.contains("restart_agent_via_rail"),
             "an agent that ANSWERS should be restarted over the rail, not alerted about"

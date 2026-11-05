@@ -1206,7 +1206,7 @@ mod tests {
     #[test]
     fn the_read_path_never_awaits_or_touches_a_database() {
         let src = include_str!("addon_registry.rs");
-        let prod = &src[..src.find("#[cfg(test)]").unwrap()];
+        let prod = crate::test_src::own_code(src);
         // Strip comments so the doc text above may name what it forbids.
         let code: String = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
         for banned in [".await", "async fn", "sqlx", "PgPool", "AppState", "tokio::"] {

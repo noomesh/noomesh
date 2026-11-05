@@ -217,22 +217,19 @@ fn close_paren(s: &str, open: usize) -> Option<usize> {
     None
 }
 
-/// Source with `//` comments removed. Handlers are read from ALL of it
+/// Source with comments blanked ([`crate::test_src::strip_comments`], which
+/// leaves a `//` inside a string alone). Handlers are read from ALL of it
 /// (several routes files define handlers after their test module);
 /// registrations only from [`production_prefix`], because a test module's
 /// private router is not a gateway route.
 fn without_comments(raw: &str) -> String {
-    raw.lines()
-        .map(|l| l.find("//").map_or(l, |i| &l[..i]))
-        .collect::<Vec<_>>()
-        .join("\n")
+    crate::test_src::strip_comments(raw)
 }
 
-/// The part of the stripped source before the first `#[cfg(test)]`. Every
-/// routes file declares its router at the top, ahead of its tests (checked by
-/// `grep`: no `.route(` registration follows a `#[cfg(test)]` in any file).
-fn production_prefix(src: &str) -> &str {
-    &src[..src.find("#[cfg(test)]").unwrap_or(src.len())]
+/// The stripped source without its `#[cfg(test)]` items, so a test module's
+/// private router is not read as a registration and nothing after one is lost.
+fn production_prefix(src: &str) -> String {
+    crate::test_src::own_code(src)
 }
 
 /// Every `routes/*.rs` (and `routes/core/*.rs`) file as (name, comment-stripped source).
@@ -286,7 +283,7 @@ fn guarded_routes() -> (Vec<Guarded>, Vec<String>) {
             }
         }
         let mut registered = BTreeSet::new();
-        let prod = production_prefix(&src);
+        let prod = &production_prefix(&src);
         let mut at = 0;
         while let Some(i) = prod[at..].find(needle) {
             let open = at + i + needle.len() - 1;

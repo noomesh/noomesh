@@ -545,11 +545,11 @@ mod tests {
     /// Every surface asks the one check; none keeps a `permits` of its own.
     #[test]
     fn every_surface_calls_the_one_check() {
-        let body = |src: &'static str, start: &str| -> &'static str {
-            src.split(start).nth(1).unwrap_or_else(|| panic!("{start}")).split("\n\u{7d}\n").next().unwrap()
+        let body = |src: &str, start: &str| -> String {
+            crate::test_src::fn_body(&crate::test_src::own_code(src), start).to_string()
         };
         let proxy = include_str!("addon_proxy.rs");
-        let serve = body(proxy, "\nasync fn serve(");
+        let serve = body(proxy, "async fn serve(");
         assert!(serve.contains("crate::addon_access::route_check(manifest, spec, r)") && !serve.contains(".permits("));
         let ws = body(include_str!("addon_ws.rs"), "pub(crate) fn admit(");
         assert!(ws.contains("crate::addon_access::route_check(manifest, spec, r)") && !ws.contains(".permits("));

@@ -404,7 +404,8 @@ mod tests {
     #[test]
     fn super_admin_changes_check_the_caller_before_writing() {
         let src = include_str!("addon_access.rs");
-        let body = src.split("async fn super_admin_set(").nth(1).unwrap().split("\n#[cfg(test)]").next().unwrap();
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "async fn super_admin_set(");
         let write = body.find("set_super_admin(").expect("the write");
         for guard in ["r.act.is_some() || r.harness.is_some()", "acts_as_super_admin(&by", "bcrypt::verify(", "is the last super admin", "flag_implicit_super_admins("] {
             let at = body.find(guard).unwrap_or_else(|| panic!("{guard}"));

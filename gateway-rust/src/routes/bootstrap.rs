@@ -1821,8 +1821,8 @@ mod tests {
     #[test]
     fn redeemer_hashes_what_is_presented_so_both_forms_redeem() {
         let src = include_str!("bootstrap.rs");
-        let start = src.find("async fn cluster_bootstrap(").unwrap();
-        let handler = &src[start..src[start..].find("\n}\n").unwrap() + start];
+        let own = crate::test_src::own_code(src);
+        let handler = crate::test_src::fn_body(&own, "async fn cluster_bootstrap(");
         assert!(handler.contains("hash_token(body.token.trim())"), "the redeemer must hash the presented token");
         assert!(!handler.contains(".strip_prefix(BOOTSTRAP_TOKEN_PREFIX)"), "stripping the prefix orphans every stored token");
         let legacy = "RQm-sKtAHXH6SlzZSlXJp08TMyd2rkAZxb_EwgBRV_8";
@@ -1932,13 +1932,12 @@ mod tests {
     #[test]
     fn both_lanes_check_the_name_before_writing() {
         let src = include_str!("bootstrap.rs");
-        let src = src.split("#[cfg(test)]").next().unwrap();
+        let src = &crate::test_src::own_code(src);
         for (handler, write) in [
             ("async fn cluster_bootstrap(", "UPDATE noo_bootstrap_tokens"),
             ("async fn enroll_tailnet(", "INSERT INTO noo_bootstrap_tokens"),
         ] {
-            let start = src.find(handler).unwrap();
-            let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+            let body = crate::test_src::fn_body(src, handler);
             let check = body.find("node_name_claim::conflict(").unwrap_or_else(|| panic!("{handler} has no name check"));
             let wrote = body.find(write).unwrap_or_else(|| panic!("{handler} has no {write}"));
             assert!(check < wrote, "{handler}: the name check must precede {write}");
@@ -1959,8 +1958,8 @@ mod tests {
     #[test]
     fn redemption_failures_are_uniform() {
         let src = include_str!("bootstrap.rs");
-        let handler_start = src.find("async fn cluster_bootstrap(").unwrap();
-        let handler = &src[handler_start..src[handler_start..].find("\n}\n").unwrap() + handler_start];
+        let own = crate::test_src::own_code(src);
+        let handler = crate::test_src::fn_body(&own, "async fn cluster_bootstrap(");
         // Exactly one Forbidden construction inside the handler, and it uses
         // the shared constant.
         assert_eq!(
@@ -1985,8 +1984,8 @@ mod tests {
     #[test]
     fn raw_token_never_persisted_or_audited() {
         let src = include_str!("bootstrap.rs");
-        let create_start = src.find("async fn bootstrap_token_create(").unwrap();
-        let create = &src[create_start..src[create_start..].find("\n}\n").unwrap() + create_start];
+        let own = crate::test_src::own_code(src);
+        let create = crate::test_src::fn_body(&own, "async fn bootstrap_token_create(");
         assert!(create.contains(".bind(&token_hash)"), "INSERT must bind the hash");
         assert!(!create.contains(".bind(&raw)"), "the raw token must never be bound to SQL");
         // The audit call's arguments (everything up to its `.await`) must not
@@ -2005,6 +2004,7 @@ mod tests {
     #[test]
     fn every_bootstrap_mutation_writes_an_audit_row() {
         let src = include_str!("bootstrap.rs");
+        let own = crate::test_src::own_code(src);
         let mut handlers: Vec<String> = Vec::new();
         for line in src.lines() {
             if !line.contains("\"/api/") {
@@ -2027,10 +2027,7 @@ mod tests {
         }
         assert!(handlers.len() >= 3, "expected create/revoke/bootstrap, found {handlers:?}");
         for name in &handlers {
-            let start = src
-                .find(&format!("async fn {name}("))
-                .unwrap_or_else(|| panic!("{name} not found"));
-            let body = &src[start..src[start..].find("\n}\n").unwrap_or(src.len() - start) + start];
+            let body = crate::test_src::fn_body(&own, &format!("async fn {name}("));
             assert!(
                 body.contains("audit::record"),
                 "mutating bootstrap route handler {name} writes no audit row"
@@ -2189,7 +2186,7 @@ mod tests {
         assert_eq!(self_birth_cert_path("pop-os"), "/app/pki/nodes/pop-os/birth.crt");
         assert_eq!(self_birth_cert_path(" pop-os "), "/app/pki/nodes/pop-os/birth.crt");
         let src = include_str!("bootstrap.rs");
-        let code = src.split("#[cfg(test)]").next().unwrap();
+        let code = &crate::test_src::own_code(src);
         assert!(!code.contains(&["\"/etc/noo/", "self-node"].concat()), "no host /etc path is read");
     }
 
@@ -2217,11 +2214,11 @@ mod tests {
     #[test]
     fn no_api_writes_the_self_nodes_birth_cert() {
         let src = include_str!("bootstrap.rs");
-        let code = src.split("#[cfg(test)]").next().unwrap();
+        let code = &crate::test_src::own_code(src);
         for line in code.lines().filter(|l| l.contains("\"/api/cluster/self-node")) {
             assert!(line.contains("get(") && !line.contains("post(") && !line.contains("put("), "{line}");
         }
-        let f = &code[code.find("async fn birth_cert_for(").unwrap()..];
+        let f = crate::test_src::fn_body(code, "async fn birth_cert_for(");
         let file = f.find("self_birth_cert(").expect("host file first");
         let row = f.find("FROM noo_bootstrap_tokens").expect("then the row");
         assert!(file < row);
@@ -2234,13 +2231,8 @@ mod tests {
     #[test]
     fn no_pull_lane_route_writes_without_a_proof() {
         let src = include_str!("bootstrap.rs");
-        let body = |name: &str| -> String {
-            let tail = src
-                .split(&format!("async fn {name}("))
-                .nth(1)
-                .unwrap_or_else(|| panic!("{name} must still exist"));
-            tail.split("\n}\n").next().unwrap_or_default().to_string()
-        };
+        let own = crate::test_src::own_code(src);
+        let body = |name: &str| -> String { crate::test_src::fn_body(&own, &format!("async fn {name}(")).to_string() };
         let checker = body("check_birth_proof");
         // Assert the parse found the real body before trusting an absence.
         assert!(checker.contains("birth_proof::verify"), "parse missed check_birth_proof");

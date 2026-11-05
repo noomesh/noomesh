@@ -3061,17 +3061,13 @@ mod tests {
         let src = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/kiosk.rs"),
         ).expect("own source unreadable");
-        let start = src.find("pub fn kiosk_teardown(").expect("kiosk_teardown not found — this guard is stale");
-        let body = &src[start..];
-        // Stop at the test module. `kiosk_teardown` is the LAST `pub fn` in
-        // this file, so slicing to the next one ran to end-of-file and swept
-        // in this very test — whose assertions spell out the exact calls
-        // being searched for. The guard found itself and passed with the
-        // real calls gutted. Planting that is how it was caught.
-        let end = body
-            .find("\n#[cfg(test)]")
-            .expect("the test module moved — this guard would read itself and always pass");
-        let body = &body[..end];
+        // `kiosk_teardown` is the LAST `pub fn` in this file, so slicing to
+        // the next one once ran into this very test, whose assertions spell
+        // out the calls searched for: the guard found itself and passed with
+        // the real calls gutted. The body ends at its own brace, and the
+        // test modules are gone from what it reads.
+        let own = crate::test_src::own_code(&src);
+        let body = crate::test_src::fn_body(&own, "pub fn kiosk_teardown(");
         assert!(
             !body.contains("fn teardown_reverses_the_getty_mask"),
             "the guard is reading its own assertions; it would pass whatever teardown does"

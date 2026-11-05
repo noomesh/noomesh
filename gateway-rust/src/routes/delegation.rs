@@ -151,7 +151,7 @@ mod tests {
         assert!(body["detail"].as_str().is_some_and(|d| d.contains("noo stack start")), "{body}");
         assert!(bus_down(&anyhow::anyhow!("NATS request failed: no responders")).is_none());
         // The code above the tests only: this test's own literal would count.
-        let src = include_str!("delegation.rs").split("\n#[cfg(test)]").next().unwrap();
+        let src = &crate::test_src::own_code(include_str!("delegation.rs"));
         assert_eq!(src.matches("Err(e) => bus_down(&e).unwrap_or_else(|| worker_unavailable(e, None)),").count(), 2, "both delegate helpers");
     }
 

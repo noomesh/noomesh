@@ -2131,7 +2131,8 @@ mod tests {
             assert!(check < effect, "{name}: the origin check must come first");
             assert!(body[check..effect].contains("return session_origin_forbidden(why)"), "{name}");
         }
-        let forbidden = src.split("fn session_origin_forbidden(").nth(1).unwrap().split("\n\u{7d}\n").next().unwrap();
+        let own = crate::test_src::own_code(src);
+        let forbidden = crate::test_src::fn_body(&own, "fn session_origin_forbidden(");
         assert!(!forbidden.contains("Cookie") && !forbidden.contains("jar"), "a refusal sets or clears no cookie");
     }
 

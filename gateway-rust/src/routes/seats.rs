@@ -868,12 +868,12 @@ mod tests {
     #[test]
     fn seat_and_node_tokens_live_in_separate_tables() {
         let seats = include_str!("seats.rs");
-        let prod = seats.split("#[cfg(test)]").next().unwrap();
+        let prod = crate::test_src::own_code(seats);
         assert!(prod.contains("FROM noo_seat_tokens WHERE token_hash"));
         assert!(!prod.contains("FROM noo_bootstrap_tokens WHERE token_hash"), "the seat lane must not redeem node tokens");
         assert!(!prod.contains("UPDATE noo_bootstrap_tokens"), "the seat lane must not write node tokens");
         let boot = include_str!("bootstrap.rs");
-        let boot = boot.split("#[cfg(test)]").next().unwrap();
+        let boot = crate::test_src::own_code(boot);
         assert!(!boot.contains("noo_seat_tokens"), "the node redemption must not read seat tokens");
         assert!(!boot.contains("noo_seats"), "node birth certs never come from the seat registry");
         assert!(crate::auth_refresh::generate_seat_token().starts_with("noo-st-"));
@@ -885,20 +885,18 @@ mod tests {
     #[test]
     fn every_seat_rail_route_requires_a_seat_proof() {
         let src = include_str!("seats.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let prod = crate::test_src::own_code(src);
         for (handler, purpose) in [
             ("async fn seat_bundle_get(", "Purpose::SeatGet"),
             ("async fn seat_fetch_receipt(", "Purpose::SeatFetch"),
             ("async fn seat_apply_report(", "Purpose::SeatApply"),
             ("async fn seat_heartbeat(", "Purpose::SeatHeartbeat"),
         ] {
-            let body = prod.split(handler).nth(1).expect(handler);
-            let body = &body[..body.find("\nasync fn ").or_else(|| body.find("\n// ═")).unwrap_or(body.len())];
+            let body = crate::test_src::fn_body(&prod, handler);
             assert!(body.contains("check_seat_proof("), "{handler} must check a seat proof");
             assert!(body.contains(purpose), "{handler} must sign {purpose}");
         }
-        let lookup = prod.split("async fn seat_cert_for(").nth(1).unwrap();
-        let lookup = &lookup[..lookup.find("\n}").unwrap()];
+        let lookup = crate::test_src::fn_body(&prod, "async fn seat_cert_for(");
         assert!(lookup.contains("FROM noo_seats") && !lookup.contains("noo_bootstrap_tokens"));
     }
 
@@ -925,8 +923,8 @@ mod tests {
     #[test]
     fn the_enrolment_response_hands_out_nothing() {
         let src = include_str!("seats.rs");
-        let body = src.split("async fn seat_enroll(").nth(1).unwrap();
-        let body = &body[..body.find("\n}\n").unwrap()];
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "async fn seat_enroll(");
         let resp = body.split("Ok(Json(json!({").nth(1).unwrap();
         for leak in ["secret", "token\"", "nats", "leaf", "key", "password"] {
             assert!(!resp.to_lowercase().contains(leak), "the seat-enroll response must not carry {leak}");

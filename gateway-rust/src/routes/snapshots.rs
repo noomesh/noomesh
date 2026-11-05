@@ -479,9 +479,8 @@ mod curriculum_audience_tests {
     #[test]
     fn the_blanket_403_is_gone() {
         let src = include_str!("snapshots.rs");
-        let code = &src[..src.find("#[cfg(test)]").unwrap()];
-        let f = &code[code.find("async fn snapshots_curriculum(").unwrap()..];
-        let f = &f[..f.find("\n}\n").unwrap()];
+        let code = &crate::test_src::own_code(src);
+        let f = crate::test_src::fn_body(code, "async fn snapshots_curriculum(");
         assert!(!f.contains("FORBIDDEN"));
         assert!(f.contains("resolve("));
     }
@@ -559,10 +558,9 @@ mod snapshot_audience_tests {
     #[test]
     fn only_a_restricted_caller_takes_the_scoped_path() {
         let src = include_str!("snapshots.rs");
-        let code = &src[..src.find("#[cfg(test)]").unwrap()];
+        let code = &crate::test_src::own_code(src);
         for f in ["async fn snapshots_list(", "async fn snapshots_get(", "async fn snapshots_diff("] {
-            let body = &code[code.find(f).unwrap()..];
-            let body = &body[..body.find("\n}\n").unwrap()];
+            let body = crate::test_src::fn_body(code, f);
             assert!(body.contains("resolve_audience("), "{f}");
             assert!(body.contains("Audience::Roles(_)"), "{f}");
         }

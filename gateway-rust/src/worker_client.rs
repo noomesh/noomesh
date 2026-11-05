@@ -478,8 +478,8 @@ mod tests {
     #[test]
     fn insert_dlq_writes_the_stripped_payload() {
         let src = include_str!("worker_client.rs");
-        let body = src.split("async fn insert_dlq(").nth(1).expect("insert_dlq exists");
-        let body = &body[..body.find("\n}\n").expect("end of insert_dlq")];
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "async fn insert_dlq(");
         assert!(body.contains("dlq_row_payload(payload, principal)"), "insert_dlq must store dlq_row_payload(..)");
     }
 }

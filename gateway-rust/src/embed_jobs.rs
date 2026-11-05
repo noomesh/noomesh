@@ -1867,7 +1867,7 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/scheduler_engine.rs"),
         )
         .unwrap();
-        let prod = &src[..src.find("#[cfg(test)]").unwrap()];
+        let prod = crate::test_src::own_code(&src);
         assert!(
             prod.matches("crate::embed_jobs::is_embed_job").count() >= 3,
             "reap_timeouts, janitor and recover_from_restart must each skip embed jobs"

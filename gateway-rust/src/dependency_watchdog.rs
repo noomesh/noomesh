@@ -636,20 +636,11 @@ mod alert_path_is_dependency_free {
     const AUTH_RS: &str = include_str!("auth.rs");
     const OPERATOR_ALERT_RS: &str = include_str!("operator_alert.rs");
 
-    /// Slice out one top-level `fn` body. Relies on rustfmt's guarantee that a
-    /// top-level closing brace sits at column 0 — true throughout this crate,
-    /// and a far smaller assumption than brace-matching through string
-    /// literals and comments.
-    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
-        let needle = format!("fn {name}(");
-        let start = src
-            .find(&needle)
-            .unwrap_or_else(|| panic!("no `{needle}` — was it renamed? update this test"));
-        let rest = &src[start..];
-        let end = rest
-            .find("\n}\n")
-            .unwrap_or_else(|| panic!("no top-level close for `{needle}`"));
-        &rest[..end]
+    /// Slice out one `fn` body, bounded by its own matching brace (and
+    /// not by a column-0 closing brace, which a raw string could hold).
+    fn fn_body(src: &str, name: &str) -> String {
+        let own = crate::test_src::own_code(src);
+        crate::test_src::fn_body(&own, &format!("fn {name}(")).to_string()
     }
 
     fn assert_no_db(what: &str, body: &str) {
@@ -671,7 +662,7 @@ mod alert_path_is_dependency_free {
     fn channels_send_handler_stays_db_free() {
         assert_no_db(
             "channels_send",
-            fn_body(COMMUNICATION_RS, "channels_send"),
+            &fn_body(COMMUNICATION_RS, "channels_send"),
         );
     }
 
@@ -679,13 +670,13 @@ mod alert_path_is_dependency_free {
     fn send_channel_message_stays_db_free() {
         assert_no_db(
             "send_channel_message",
-            fn_body(COMMUNICATION_RS, "send_channel_message"),
+            &fn_body(COMMUNICATION_RS, "send_channel_message"),
         );
     }
 
     #[test]
     fn dispatch_raw_stays_db_free() {
-        assert_no_db("dispatch_raw", fn_body(OPERATOR_ALERT_RS, "dispatch_raw"));
+        assert_no_db("dispatch_raw", &fn_body(OPERATOR_ALERT_RS, "dispatch_raw"));
     }
 
     #[test]

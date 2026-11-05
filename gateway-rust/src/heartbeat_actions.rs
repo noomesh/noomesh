@@ -5608,37 +5608,11 @@ mod delivery_envelope_tests {
 /// by URL, by the loopback client, or by the HMAC header — fails here.
 #[cfg(test)]
 mod no_self_call_tests {
-    /// The file with its `#[cfg(test)] mod … { … }` blocks cut out: the
-    /// tests name the patterns they forbid. Brace counting is enough here —
-    /// a test body's braces balance.
+    /// The file as code: comments blanked and every `#[cfg(test)]` item
+    /// removed (the tests name the patterns they forbid).
     fn src(name: &str) -> String {
         let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(name);
-        let text = std::fs::read_to_string(&p).unwrap();
-        let mut out = String::new();
-        let mut rest = text.as_str();
-        while let Some(at) = rest.find("#[cfg(test)]\nmod ") {
-            out.push_str(&rest[..at]);
-            let block = &rest[at..];
-            let open = block.find('{').expect("a test module body");
-            let mut depth = 0usize;
-            let mut end = block.len();
-            for (i, c) in block[open..].char_indices() {
-                match c {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = open + i + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            rest = &block[end..];
-        }
-        out.push_str(rest);
-        out
+        crate::test_src::own_code(&std::fs::read_to_string(&p).unwrap())
     }
 
     #[test]

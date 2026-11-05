@@ -822,9 +822,8 @@ async fn eval_cert_expiry(state: &AppState) -> Result<bool, String> {
 mod gate_tests {
     #[test]
     fn gate_capable_matches_the_dispatch() {
-        let src = include_str!("autonomy_loop.rs");
-        let dispatch = src.split("async fn evaluate_location").nth(1).expect("present");
-        let dispatch = &dispatch[..dispatch.find("\n}").unwrap_or(dispatch.len())];
+        let own = crate::test_src::own_code(include_str!("autonomy_loop.rs"));
+        let dispatch = crate::test_src::fn_body(&own, "async fn evaluate_location(");
         let mut with_config: Vec<String> = Vec::new();
         for line in dispatch.lines() {
             if !line.contains("&loc.config") { continue; }

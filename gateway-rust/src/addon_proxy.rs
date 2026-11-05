@@ -1959,8 +1959,8 @@ mod permission_tests {
         assert_eq!(all(REQUESTER_ROLE), ["user"]);
         assert_eq!(all(REQUESTER_SCOPES), ["read"]);
         // forward() copies only caller_headers() onto a fresh request.
-        let src = include_str!("addon_proxy.rs");
-        let body = src.split("async fn forward(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("addon_proxy.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn forward(");
         assert!(body.contains("for (name, value) in caller_headers(requester)"), "forward builds identity from the verified ctx");
         assert!(!body.contains("HeaderMap") && !body.contains("headers()"), "forward must not pass client headers through");
     }
@@ -1972,8 +1972,8 @@ mod permission_tests {
     fn a_client_sent_delegation_header_is_never_forwarded() {
         let h = caller_headers(Some(&super::tests::ctx("alice", Role::User, &["read"])));
         assert!(!h.iter().any(|(n, _)| n.eq_ignore_ascii_case(crate::addon_delegation::HEADER)));
-        let src = include_str!("addon_proxy.rs");
-        let body = src.split("async fn forward(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("addon_proxy.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn forward(");
         assert_eq!(body.matches("crate::addon_delegation::HEADER").count(), 1, "one place sets it");
         let set = body.find("crate::addon_delegation::HEADER").unwrap();
         let guard = body.find("mints_delegation(").unwrap();

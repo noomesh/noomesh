@@ -1267,8 +1267,8 @@ mod tests {
     /// The add-on origin carries the console router's outer layers.
     #[test]
     fn the_origin_router_has_the_main_routers_layers() {
-        let src = include_str!("addon_ui.rs");
-        let body = src.split("pub fn origin_router(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("addon_ui.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn origin_router(");
         for layer in ["audit_context::origin_layer", "middleware::rate_limit", "middleware::request_logger", "CatchPanicLayer"] {
             assert!(body.contains(layer), "{layer}");
         }
@@ -1402,8 +1402,8 @@ mod tests {
     /// upstream is the verified one only.
     #[test]
     fn serve_ui_checks_permission_before_the_path_or_the_fetch() {
-        let src = include_str!("addon_ui.rs");
-        let body = src.split("pub(crate) async fn serve_ui(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("addon_ui.rs"));
+        let body = crate::test_src::fn_body(&own, "pub(crate) async fn serve_ui(");
         let permits = body.find("crate::addon_access::ui_check(&manifest, &ui, r)").unwrap();
         let rest = body.find("ui_rest(raw_path)").unwrap();
         let send = body.find(".send()").unwrap();
@@ -1415,13 +1415,13 @@ mod tests {
     /// The origin gate reads this add-on's cookie and never a bearer.
     #[test]
     fn the_gate_takes_only_the_addons_cookie() {
-        let src = include_str!("addon_ui.rs");
-        let body = src.split("async fn gate(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("addon_ui.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn gate(");
         assert!(body.contains("cookie_name(&o.addon)"));
         assert!(!body.contains("AUTHORIZATION") && !body.contains("verify_token"), "no bearer on an add-on origin");
         assert!(body.find("origin_rule(").unwrap() < body.find("cookie_value(").unwrap());
         assert!(body.contains("session_refusal("), "the person is re-checked on every request");
-        let refusal = src.split("pub async fn session_refusal(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let refusal = crate::test_src::fn_body(&own, "pub async fn session_refusal(");
         for check in ["session_floor::refuses", "live_account_role", "rail_token_admitted", "addons::enabled"] {
             assert!(refusal.contains(check), "{check}");
         }
