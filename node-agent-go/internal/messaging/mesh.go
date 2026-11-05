@@ -30,7 +30,7 @@ type MeshResponder struct {
 	client      *Client
 	nodeID      string
 	getBackends func() map[string]BackendInfo
-	getLoad     func() float64
+	getLoad     func() *float64
 
 	subMu          sync.Mutex
 	sub            *nats.Subscription
@@ -49,7 +49,7 @@ func NewMeshResponder(
 	client *Client,
 	nodeID string,
 	getBackends func() map[string]BackendInfo,
-	getLoad func() float64,
+	getLoad func() *float64,
 ) *MeshResponder {
 	return &MeshResponder{
 		client:      client,
@@ -69,18 +69,21 @@ type discoverRequest struct {
 // buildOffer picks the first backend satisfying the request filters and
 // returns the canonical offer payload the requesters deserialize
 // (Rust BackendOffer / Python _select_best candidates). Returns nil when
-// nothing matches or the node is shedding load (load > 0.95), in which
+// nothing matches or the node is shedding load (load > 0.95) or its load is unknown, in which
 // case the responder stays silent and the requester times out over to the
 // next resolution stage. Pure function so the reply contract is testable
 // without NATS.
 func buildOffer(
 	nodeID string,
 	backends map[string]BackendInfo,
-	load float64,
+	load *float64,
 	req discoverRequest,
 ) map[string]any {
-	if load > 0.95 {
-		return nil // too loaded, don't respond (matches Python)
+	// The gateway's BackendOffer requires a numeric load, so an offer with
+	// the load left out would not parse. An UNKNOWN load (nil) therefore
+	// gets no offer at all, like a shedding node: never an offer with 0.
+	if load == nil || *load > 0.95 {
+		return nil // unknown or too loaded: stay silent
 	}
 	for backendType, info := range backends {
 		if req.Model != "" && info.Model != req.Model {
@@ -96,16 +99,17 @@ func buildOffer(
 		if apiFormat == "" {
 			apiFormat = "openai"
 		}
-		return map[string]any{
+		offer := map[string]any{
 			"type":         "offer",
 			"node_id":      nodeID,
 			"backend_type": backendType,
 			"model":        info.Model,
 			"url":          info.URL,
-			"load":         load,
 			"api_format":   apiFormat,
 			"ts":           time.Now().Unix(),
 		}
+		offer["load"] = *load
+		return offer
 	}
 	return nil
 }

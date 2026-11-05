@@ -21,7 +21,7 @@ func TestMeshDiscoverSubjectMatchesGateway(t *testing.T) {
 }
 
 func TestBuildOffer_CanonicalShape(t *testing.T) {
-	offer := buildOffer("node-1", sampleBackends(), 0.3, discoverRequest{})
+	offer := buildOffer("node-1", sampleBackends(), f64(0.3), discoverRequest{})
 	if offer == nil {
 		t.Fatal("expected an offer")
 	}
@@ -43,39 +43,39 @@ func TestBuildOffer_CanonicalShape(t *testing.T) {
 }
 
 func TestBuildOffer_ModelFilter(t *testing.T) {
-	if offer := buildOffer("n", sampleBackends(), 0.1, discoverRequest{Model: "other-model"}); offer != nil {
+	if offer := buildOffer("n", sampleBackends(), f64(0.1), discoverRequest{Model: "other-model"}); offer != nil {
 		t.Error("expected no offer for non-matching model")
 	}
-	if offer := buildOffer("n", sampleBackends(), 0.1, discoverRequest{Model: "Qwen/Qwen3-8B-AWQ"}); offer == nil {
+	if offer := buildOffer("n", sampleBackends(), f64(0.1), discoverRequest{Model: "Qwen/Qwen3-8B-AWQ"}); offer == nil {
 		t.Error("expected offer for matching model")
 	}
 }
 
 func TestBuildOffer_BackendTypeFilter(t *testing.T) {
-	if offer := buildOffer("n", sampleBackends(), 0.1, discoverRequest{BackendType: "ollama"}); offer != nil {
+	if offer := buildOffer("n", sampleBackends(), f64(0.1), discoverRequest{BackendType: "ollama"}); offer != nil {
 		t.Error("expected no offer for non-matching backend_type")
 	}
 }
 
 func TestBuildOffer_LoadShedding(t *testing.T) {
-	if offer := buildOffer("n", sampleBackends(), 0.96, discoverRequest{}); offer != nil {
+	if offer := buildOffer("n", sampleBackends(), f64(0.96), discoverRequest{}); offer != nil {
 		t.Error("expected no offer when load > 0.95")
 	}
 }
 
 func TestBuildOffer_EmptyBackendsOrURL(t *testing.T) {
-	if offer := buildOffer("n", nil, 0.1, discoverRequest{}); offer != nil {
+	if offer := buildOffer("n", nil, f64(0.1), discoverRequest{}); offer != nil {
 		t.Error("expected no offer with no backends")
 	}
 	b := map[string]BackendInfo{"vllm": {Model: "m", URL: ""}}
-	if offer := buildOffer("n", b, 0.1, discoverRequest{}); offer != nil {
+	if offer := buildOffer("n", b, f64(0.1), discoverRequest{}); offer != nil {
 		t.Error("expected no offer when backend has no URL")
 	}
 }
 
 func TestBuildOffer_DefaultAPIFormat(t *testing.T) {
 	b := map[string]BackendInfo{"llamacpp": {Model: "m", URL: "http://x:8085"}}
-	offer := buildOffer("n", b, 0.1, discoverRequest{})
+	offer := buildOffer("n", b, f64(0.1), discoverRequest{})
 	if offer == nil {
 		t.Fatal("expected an offer")
 	}
@@ -116,5 +116,15 @@ func TestGossipAnnounceSubjectUsesTheIdVerbatim(t *testing.T) {
 		if got, want := gossipAnnounceSubject(id), "mesh.gossip.announce."+id; got != want {
 			t.Errorf("gossipAnnounceSubject(%q) = %q, want %q", id, got, want)
 		}
+	}
+}
+
+func f64(v float64) *float64 { return &v }
+
+// An unknown load must never become an offer carrying 0 (an idle node) and
+// must not produce an offer the gateway cannot parse (load is required).
+func TestBuildOffer_UnknownLoadGivesNoOffer(t *testing.T) {
+	if offer := buildOffer("n", sampleBackends(), nil, discoverRequest{}); offer != nil {
+		t.Errorf("unknown load offered: %v", offer)
 	}
 }

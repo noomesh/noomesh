@@ -651,7 +651,7 @@ func (a *Agent) startMessaging(ctx context.Context) {
 		func() map[string]messaging.BackendInfo {
 			return meshBackendInfos(a.runningBackends(), heartbeat.DialableAgentURL(a.cfg), scheme)
 		},
-		func() float64 {
+		func() *float64 {
 			return a.coll.Collect().Load
 		},
 	)
@@ -680,18 +680,27 @@ func (a *Agent) startMessaging(ctx context.Context) {
 					}
 				}
 			}
-			return map[string]any{
+			return gossipAnnouncement(map[string]any{
 				"hostname":     a.cfg.NodeID,
 				"backends":     backendInfo,
-				"load":         a.coll.Collect().Load,
 				"tier":         a.cfg.Tier,
 				"vram_gb":      a.cfg.VRAMGB,
 				"capabilities": rtCaps.Detect(),
-			}
+			}, a.coll.Collect().Load)
 		},
 		interval,
 	)
 	a.gossip.Start()
+}
+
+// gossipAnnouncement adds the node's load to a gossip body. An unknown load
+// (nil) is left OUT: the reader treats an absent load as fully loaded
+// (pessimistic), and announcing 0 would advertise an idle node.
+func gossipAnnouncement(body map[string]any, load *float64) map[string]any {
+	if load != nil {
+		body["load"] = *load
+	}
+	return body
 }
 
 // busStatus builds the node's own view of its NATS bus for /health and the

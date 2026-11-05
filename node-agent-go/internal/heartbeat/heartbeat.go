@@ -490,10 +490,8 @@ func (r *Reporter) SendHeartbeat() {
 	clk.mark("sensors")
 
 	payload := map[string]any{
-		"load":         m.Load,
 		"self_node":    r.cfg.SelfNode,
 		"active_jobs":  jobs,
-		"cpu_load":     m.CPULoad,
 		"mem_used_gb":  m.MemUsedGB,
 		"vram_used_gb": m.VRAMUsedGB,
 		"cpu_cores":    hardware.CPUCores(),
@@ -529,6 +527,7 @@ func (r *Reporter) SendHeartbeat() {
 		payload["gpu_model"] = gpuModel
 		payload["vram_gb"] = vramGB
 	}
+	addLoad(payload, m)
 	if m.MemUsedGB == nil {
 		// Memory unmeasured: omit the key rather than send null or a number.
 		delete(payload, "mem_used_gb")
@@ -959,4 +958,16 @@ func (r *Reporter) redetectCaps(probeErr error) {
 	slog.Info("gpu probe recovered; re-registering with the detected capabilities",
 		"gpu_model", caps.GPUModel, "vram_gb", caps.VRAMGB, "backends", caps.Backends)
 	r.Register(caps, DetectHostIP(r.cfg))
+}
+
+// addLoad puts the load figures in a heartbeat body. An unknown load is
+// OMITTED, never 0: the gateway ranks an absent load after every reported
+// one, whereas a false 0 wins routing tiebreaks.
+func addLoad(payload map[string]any, m metrics.SystemMetrics) {
+	if m.Load != nil {
+		payload["load"] = *m.Load
+	}
+	if m.CPULoad != nil {
+		payload["cpu_load"] = *m.CPULoad
+	}
 }
