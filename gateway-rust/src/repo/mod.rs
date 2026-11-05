@@ -90,6 +90,7 @@ pub mod kb_grants;
 pub mod prompt_skills;
 pub mod request_trace;
 pub mod settings;
+pub mod task_events;
 pub mod tasks;
 pub mod prompt_skill_proposals;
 pub mod users;
@@ -210,7 +211,7 @@ mod ratchet {
     ("system_provision_cli.rs", 1),
     ("task_budget.rs", 2),
     ("task_context.rs", 4),
-    ("task_events.rs", 15),
+    ("task_events.rs", 14),
     ("task_guard.rs", 29),
     ("tasks.rs", 11),
     ("temporal_graph.rs", 10),
