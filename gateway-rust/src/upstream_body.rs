@@ -39,6 +39,16 @@ pub async fn text_2xx(resp: reqwest::Response, upstream: &str) -> Result<String,
     resp.text().await.map_err(|e| unread(upstream, status, &e))
 }
 
+/// The upstream's status and its whole body, for a route that passes both
+/// through. A body that cannot be read in full is an error naming
+/// `upstream` and the status: passed through, it would be the upstream's
+/// status over a partial or empty body (an interrupted 200 read as an empty
+/// success).
+pub async fn whole_text(resp: reqwest::Response, upstream: &str) -> Result<(u16, String), String> {
+    let status = resp.status().as_u16();
+    resp.text().await.map(|b| (status, b)).map_err(|e| unread(upstream, status, &e))
+}
+
 /// reqwest's Display for a body error is "error decoding response body";
 /// the cause ("end of file before message length reached") is in the chain.
 fn unread(upstream: &str, status: u16, e: &reqwest::Error) -> String {
@@ -126,6 +136,37 @@ mod tests {
         assert!(e.starts_with("the sandbox answered HTTP 200 but its body could not be read"), "{e}");
     }
 
+    /// A pass-through keeps the upstream's status and body, whatever the
+    /// status; only a body cut short is an error, and it names the status.
+    #[tokio::test]
+    async fn a_pass_through_keeps_status_and_body_and_refuses_a_cut_body() {
+        let base = stub("404 Not Found", None, b"no such stream").await;
+        assert_eq!(whole_text(get(&base).await, "Loki").await.unwrap(), (404, "no such stream".to_string()));
+        let base = stub_not_json().await;
+        assert_eq!(whole_text(get(&base).await, "Loki").await.unwrap().1, "<html>proxy page</html>", "not JSON is not this helper's business");
+        let base = stub_cut_short().await;
+        let e = whole_text(get(&base).await, "Loki").await.unwrap_err();
+        assert!(e.starts_with("Loki answered HTTP 200 but its body could not be read"), "{e}");
+    }
+
+    /// The four pass-through and read sites of i460 part 2 read through this
+    /// module; none reads its body with a default.
+    #[test]
+    fn the_pass_through_sites_read_whole_bodies() {
+        for (file, src, marker) in [
+            ("addon_proxy.rs", include_str!("addon_proxy.rs"), "async fn forward("),
+            ("routes/admin.rs", include_str!("routes/admin.rs"), "async fn logs_query("),
+            ("routes/inference.rs", include_str!("routes/inference.rs"), "async fn proxy_backend_health("),
+            ("routes/cluster.rs", include_str!("routes/cluster.rs"), "async fn cluster_gpu_metrics("),
+        ] {
+            let own = crate::test_src::own_code(src);
+            let body = crate::test_src::fn_body(&own, marker);
+            assert!(body.contains("crate::upstream_body::"), "{file} {marker} does not read through upstream_body");
+            let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(!compact.contains(".text().await.unwrap_or"), "{file} {marker} reads a body with a default");
+        }
+    }
+
     #[tokio::test]
     async fn a_body_that_is_not_json_is_an_error_showing_what_came() {
         let base = stub_not_json().await;
@@ -146,9 +187,9 @@ mod tests {
             ("routes/agents.rs", 1, "i460 PR3: the node list answers with the cause, not 'unreachable'"),
             (
                 "routes/cluster.rs",
-                2,
-                "i460 PR2: the controller GPU-metrics read; and gpu_hold_op, whose 2xx means the agent \
-                 already held or released the GPU, so its state machine needs its own decision",
+                1,
+                "gpu_hold_op: its 2xx means the agent already held or released the GPU, so its \
+                 state machine has its own PR (wt/b4-gpu-hold-body)",
             ),
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

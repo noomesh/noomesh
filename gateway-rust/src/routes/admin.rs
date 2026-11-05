@@ -291,12 +291,12 @@ async fn logs_query(Query(params): Query<LogQueryParams>) -> impl IntoResponse {
     if let Some(end) = &params.end { url.push_str(&format!("&end={end}")); }
 
     match client.get(&url).timeout(std::time::Duration::from_secs(30)).send().await {
-        Ok(resp) => {
-            let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
-                .unwrap_or(StatusCode::BAD_GATEWAY);
-            let body = resp.text().await.unwrap_or_default();
-            (status, body).into_response()
-        }
+        // Loki's status and body pass through; a body cut off mid-transfer
+        // is a 502 naming Loki, never its 200 over an empty body (i460).
+        Ok(resp) => match crate::upstream_body::whole_text(resp, "Loki").await {
+            Ok((code, body)) => (StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY), body).into_response(),
+            Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
+        },
         Err(e) => (StatusCode::BAD_GATEWAY,
             Json(json!({"error": format!("Loki unreachable: {e}")}))).into_response(),
     }

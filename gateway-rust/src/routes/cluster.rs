@@ -1693,7 +1693,11 @@ pub(super) async fn cluster_gpu_metrics(State(state): State<Arc<AppState>>) -> A
 
     match client.get(&exporter_url).timeout(std::time::Duration::from_secs(5)).send().await {
         Ok(resp) if resp.status().is_success() => {
-            let body = resp.text().await.unwrap_or_default();
+            // A cut-off scrape is an error, never "no GPUs" (i460).
+            let body = match crate::upstream_body::text_2xx(resp, "nvidia-exporter").await {
+                Ok(b) => b,
+                Err(e) => return Json(json!({"error": e, "gpus": []})),
+            };
             let mut gpus = parse_prometheus_gpu_metrics(&body);
             // The exporter is the controller's own, so these GPUs belong
             // to the controller node. Name it: the kiosk (and anything
