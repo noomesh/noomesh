@@ -1065,11 +1065,11 @@ mod tests {
     #[test]
     fn workload_peer_keeps_the_exchanged_service_identity() {
         let requester = crate::auth::RequesterCtx {
-            sub: "addon:svc:pai-voice".into(), scopes: vec!["metrics".into()],
+            sub: "addon:svc:rhaddon".into(), scopes: vec!["metrics".into()],
             role: crate::auth::Role::User, harness: None, act: None,
         };
         let headers = peer_headers("reservation-id", &requester);
-        assert!(headers.contains(&(PEER_SUB_HEADER.into(), "addon:svc:pai-voice".into())));
+        assert!(headers.contains(&(PEER_SUB_HEADER.into(), "addon:svc:rhaddon".into())));
         assert!(headers.contains(&(PEER_ROLE_HEADER.into(), "user".into())));
         assert!(!headers.iter().any(|(name, _)| name == "authorization"));
     }
