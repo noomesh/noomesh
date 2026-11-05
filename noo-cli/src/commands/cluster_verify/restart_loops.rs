@@ -12,9 +12,17 @@
 //! judged by its `RestartCount` and how recently it started, never by its
 //! state at one instant.
 //!
-//! The rule: a stack container (`<prefix>-*`) is restart-looping when
-//! `RestartCount > 2` AND it is restarting now, or started within the last
-//! [`RECENT_SECS`], or (the upgrade gate) started after the stack roll.
+//! The rule: a stack container (`<prefix>-*`) is restart-looping when it is
+//! LIVE (running, or restarting now), has restarted more than
+//! [`MAX_RESTARTS`] times, AND it is restarting now, or started within the
+//! last [`RECENT_SECS`], or (the upgrade gate) started after the stack roll.
+//! The upgrade gate counts only the restarts made DURING the roll: a
+//! [`Baseline`] taken when the roll starts holds each container's Id and
+//! RestartCount, so a lifetime count is never judged (pop-os 2026-11-05: two
+//! containers the operator had `docker stop`ped, 117 lifetime restarts,
+//! refused a clean roll). A container that is not live is judged by how it
+//! ended ([`Ended`]): crashed during the roll refuses, stopped before it is
+//! one line, exit 0 (a one-shot) is nothing.
 //! The row names the container, its restart count and its last error line
 //! (`docker logs --tail 50`, the last line matching fatal / permission
 //! denied / error).
@@ -58,20 +66,111 @@ pub(crate) struct Looping {
     pub restarts: i64,
     /// The last log line that names a failure; `None` when none matched.
     pub last_error: Option<String>,
+    /// `Some(code)`: not a loop but a crash, it exited `code` during the
+    /// roll and stayed down (the upgrade gate only).
+    pub crashed: Option<i64>,
 }
 
 impl Looping {
-    /// `noo-redis is restart-looping (37 restarts): <last error>`
+    /// `noo-redis is restart-looping (37 restarts): <last error>`, or
+    /// `noo-x exited 1 during the roll: <last error>`.
     pub(crate) fn line(&self) -> String {
         let err = self.last_error.as_deref().unwrap_or("no fatal/error line in its last 50 log lines");
-        format!("{} is restart-looping ({} restarts): {err}", self.container, self.restarts)
+        match self.crashed {
+            Some(code) => format!("{} exited {code} during the roll: {err}", self.container),
+            None => format!("{} is restart-looping ({} restarts): {err}", self.container, self.restarts),
+        }
     }
+}
+
+/// `docker inspect` fields only the upgrade gate reads (warm-up's shared
+/// INSPECT_TEMPLATE is parsed by three other readers and stays as it is).
+pub(crate) const GATE_TEMPLATE: &str = "{{.Id}}|{{.RestartCount}}|{{.State.FinishedAt}}|{{.State.OOMKilled}}";
+
+/// One container as [`GATE_TEMPLATE`] reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GateFacts {
+    pub id: String,
+    pub restart_count: i64,
+    /// `.State.FinishedAt`; docker's zero time (never finished) reads as far past.
+    pub finished_unix: i64,
+    pub oom_killed: bool,
+}
+
+pub(crate) fn parse_gate_facts(line: &str) -> Option<GateFacts> {
+    let mut p = line.trim().splitn(4, '|');
+    let id = p.next()?.trim().to_string();
+    if id.is_empty() {
+        return None;
+    }
+    let restart_count = p.next()?.trim().parse().ok()?;
+    let finished_unix = p.next().and_then(|t| super::parse_rfc3339_unix(t.trim())).unwrap_or(i64::MIN);
+    let oom_killed = p.next().map(|v| v.trim() == "true").unwrap_or(false);
+    Some(GateFacts { id, restart_count, finished_unix, oom_killed })
+}
+
+fn gate_facts(docker: DockerRun, c: &str) -> Option<GateFacts> {
+    match docker(&["inspect", "-f", GATE_TEMPLATE, c]) {
+        Ok((true, out, _)) => parse_gate_facts(&out),
+        _ => None,
+    }
+}
+
+/// What the gate knew of each stack container when the roll started:
+/// name -> (Id, RestartCount). Best-effort: a container it could not read is
+/// absent, and is then judged by its count since it was created.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Baseline(pub(crate) std::collections::HashMap<String, (String, i64)>);
+
+impl Baseline {
+    /// Restarts made since the baseline: the delta for the same container,
+    /// the whole count for one the roll created (a new Id; compose's
+    /// recreate starts the count at 0).
+    pub(crate) fn since(&self, name: &str, now: &GateFacts) -> i64 {
+        match self.0.get(name) {
+            Some((id, before)) if *id == now.id => (now.restart_count - before).max(0),
+            _ => now.restart_count,
+        }
+    }
+}
+
+/// The [`Baseline`] for this stack, taken when the roll starts.
+pub(crate) fn snapshot(docker: DockerRun, prefix: &str) -> Baseline {
+    let mut m = std::collections::HashMap::new();
+    for c in stack_containers(docker, prefix).unwrap_or_default() {
+        if let Some(f) = gate_facts(docker, &c) {
+            m.insert(c, (f.id, f.restart_count));
+        }
+    }
+    Baseline(m)
+}
+
+/// How a container that is not live ended, judged against the roll's start.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Ended {
+    /// Exit 0 (a one-shot that did its job): nothing to say.
+    Clean,
+    /// Stopped by someone (SIGTERM 143, or a stop's SIGKILL 137 that was not
+    /// an OOM kill), or it ended before the roll: said, never a refusal.
+    Stopped,
+    /// Exited non-zero DURING the roll and stayed down: a broken stack.
+    Crashed(i64),
+}
+
+pub(crate) fn ended(st: &ContainerState, facts: Option<&GateFacts>, since: i64) -> Ended {
+    if st.exit_code == 0 {
+        return Ended::Clean;
+    }
+    let during = facts.is_some_and(|f| f.finished_unix >= since);
+    let stop_signal = st.exit_code == 143 || (st.exit_code == 137 && !facts.is_some_and(|f| f.oom_killed));
+    if during && !stop_signal { Ended::Crashed(st.exit_code) } else { Ended::Stopped }
 }
 
 /// The loop rule, pure. `since` is the stack roll's start (the upgrade
 /// gate); `None` for `cluster verify`.
 pub(crate) fn is_looping(st: &ContainerState, now_unix: i64, since: Option<i64>) -> bool {
-    st.restart_count > MAX_RESTARTS
+    (st.running || st.restarting)
+        && st.restart_count > MAX_RESTARTS
         && (st.restarting
             || now_unix - st.started_unix < RECENT_SECS
             || since.is_some_and(|t| st.started_unix >= t))
@@ -113,25 +212,54 @@ pub(crate) fn service_of<'a>(container: &'a str, prefix: &str) -> &'a str {
     container.strip_prefix(prefix).and_then(|s| s.strip_prefix('-')).unwrap_or(container)
 }
 
-/// One look: the looping containers, and how many more have restarted
-/// since `since` without (yet) being a loop.
-pub(crate) fn scan(docker: DockerRun, prefix: &str, now_unix: i64, since: Option<i64>) -> Result<(Vec<Looping>, usize), String> {
+/// The last failure line of `c`'s log.
+fn last_error_of(docker: DockerRun, c: &str) -> Option<String> {
+    match docker(&["logs", "--tail", "50", c]) {
+        Ok((_, out, err)) => last_error_line(&format!("{out}\n{err}")),
+        Err(_) => None,
+    }
+}
+
+/// One look: the looping (or, for the gate, crashed) containers, how many
+/// more have restarted since `since` without (yet) being a loop, and one
+/// line per container that is stopped and would once have been called a
+/// loop. `gate` is the roll's start and [`Baseline`] (the upgrade gate);
+/// `None` for `cluster verify`.
+pub(crate) fn scan(docker: DockerRun, prefix: &str, now_unix: i64, gate: Option<(i64, &Baseline)>) -> Result<(Vec<Looping>, usize, Vec<String>), String> {
     let mut looping = Vec::new();
     let mut suspects = 0;
+    let mut notes = Vec::new();
+    let since = gate.map(|(t, _)| t);
     for c in stack_containers(docker, prefix)? {
         let inspected = warmup::read_inspect(docker(&["inspect", "-f", warmup::INSPECT_TEMPLATE, c.as_str()]));
-        let Inspected::Ok(st) = inspected else { continue };
+        let Inspected::Ok(mut st) = inspected else { continue };
+        let facts = gate.and_then(|_| gate_facts(docker, &c));
+        if let (Some((_, base)), Some(f)) = (gate, facts.as_ref()) {
+            // Only the restarts made during the roll count.
+            st.restart_count = base.since(&c, f);
+        }
+        let live = st.running || st.restarting;
         if is_looping(&st, now_unix, since) {
-            let last_error = match docker(&["logs", "--tail", "50", c.as_str()]) {
-                Ok((_, out, err)) => last_error_line(&format!("{out}\n{err}")),
-                Err(_) => None,
-            };
-            looping.push(Looping { container: c, restarts: st.restart_count, last_error });
-        } else if since.is_some_and(|t| is_suspect(&st, t)) {
-            suspects += 1;
+            let last_error = last_error_of(docker, &c);
+            looping.push(Looping { container: c, restarts: st.restart_count, last_error, crashed: None });
+        } else if live {
+            if since.is_some_and(|t| is_suspect(&st, t)) {
+                suspects += 1;
+            }
+        } else if let Some(t) = since {
+            match ended(&st, facts.as_ref(), t) {
+                Ended::Clean => {}
+                Ended::Crashed(code) => {
+                    let last_error = last_error_of(docker, &c);
+                    looping.push(Looping { container: c, restarts: st.restart_count, last_error, crashed: Some(code) });
+                }
+                Ended::Stopped => notes.push(format!(
+                    "{c} is stopped (exit {}), not looping; if nothing declares it, remove it: docker rm -f {c}",
+                    st.exit_code)),
+            }
         }
     }
-    Ok((looping, suspects))
+    Ok((looping, suspects, notes))
 }
 
 /// The `restart loops` row from one [`scan`].
@@ -150,7 +278,7 @@ pub(crate) fn row(found: Result<Vec<Looping>, String>, prefix: &str) -> Check {
 /// `noo cluster verify --controller`'s row.
 pub(crate) fn restart_loops_row() -> Check {
     let prefix = crate::envfile::container_prefix();
-    row(scan(&real_docker, &prefix, super::now_unix(), None).map(|(v, _)| v), &prefix)
+    row(scan(&real_docker, &prefix, super::now_unix(), None).map(|(v, _, _)| v), &prefix)
 }
 
 /// `noo upgrade --stack`'s post-roll gate: the looping containers, judged
@@ -162,14 +290,15 @@ pub(crate) fn gate_loops(
     docker: DockerRun,
     prefix: &str,
     since: i64,
+    baseline: &Baseline,
     clock: &dyn Fn() -> i64,
     sleep: &mut dyn FnMut(u64),
-) -> Result<Vec<Looping>, String> {
+) -> Result<(Vec<Looping>, Vec<String>), String> {
     let start = clock();
     loop {
-        let (looping, suspects) = scan(docker, prefix, clock(), Some(since))?;
+        let (looping, suspects, notes) = scan(docker, prefix, clock(), Some((since, baseline)))?;
         if !looping.is_empty() || suspects == 0 || clock() - start >= GATE_SETTLE_SECS {
-            return Ok(looping);
+            return Ok((looping, notes));
         }
         sleep(GATE_POLL_SECS);
     }
@@ -196,6 +325,12 @@ mod tests {
                     names.push("other-redis"); // another stack's container: never judged
                     Ok((true, names.join("\n"), String::new()))
                 }
+                "inspect" if args[2] == GATE_TEMPLATE => {
+                    // Id `id-<c>`, its restart count, never finished, no OOM.
+                    let l = inspect.get(c).ok_or_else(|| format!("no such container {c}"))?;
+                    let restarts = l.split('|').nth(3).unwrap_or("0");
+                    Ok((true, format!("id-{c}|{restarts}|0001-01-01T00:00:00Z|false"), String::new()))
+                }
                 "inspect" => {
                     assert_eq!(args[2], warmup::INSPECT_TEMPLATE);
                     inspect.get(c).map(|l| (true, l.clone(), String::new())).ok_or_else(|| format!("no such container {c}"))
@@ -211,9 +346,17 @@ mod tests {
 
     /// running|startedAt|health|restarts|restarting|exit
     fn state(running: bool, started: i64, restarts: i64, restarting: bool) -> String {
-        let secs = started - 1_791_936_000; // 2026-10-14T00:00:00Z
+        state_exit(running, started, restarts, restarting, 1)
+    }
+
+    fn rfc3339(t: i64) -> String {
+        let secs = t - 1_791_936_000; // 2026-10-14T00:00:00Z
         let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-        format!("{running}|2026-10-14T{h:02}:{m:02}:{s:02}.123456789Z||{restarts}|{restarting}|1")
+        format!("2026-10-14T{h:02}:{m:02}:{s:02}.123456789Z")
+    }
+
+    fn state_exit(running: bool, started: i64, restarts: i64, restarting: bool, exit: i64) -> String {
+        format!("{running}|{}||{restarts}|{restarting}|{exit}", rfc3339(started))
     }
 
     const AOF: &str = "1:C 16 Oct 2026 03:01:02.000 # Fatal error: can't open the AOF manifest file appendonlydir/appendonly.aof.manifest for reading: Permission denied";
@@ -234,7 +377,7 @@ mod tests {
         // An earlier error line, then the fatal one, then a non-matching tail.
         let full = format!("1:C boot\nsome error earlier\n{AOF}\n1:C bye");
         let logs = HashMap::from([("noo-redis", full.as_str())]);
-        let (v, _) = scan(&fake(&inspect, &logs), "noo", NOW, None).unwrap();
+        let (v, _, _) = scan(&fake(&inspect, &logs), "noo", NOW, None).unwrap();
         assert_eq!(v.len(), 1, "{v:?}");
         assert_eq!(v[0].container, "noo-redis");
         assert_eq!(v[0].restarts, 187);
@@ -249,7 +392,7 @@ mod tests {
     fn restarting_now_counts_however_long_ago_it_started() {
         let inspect = HashMap::from([("noo-loki", state(false, NOW - 5000, 9, true))]);
         let logs = HashMap::new();
-        let (v, _) = scan(&fake(&inspect, &logs), "noo", NOW, None).unwrap();
+        let (v, _, _) = scan(&fake(&inspect, &logs), "noo", NOW, None).unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].last_error, None);
         assert!(v[0].line().contains("no fatal/error line"));
@@ -264,7 +407,7 @@ mod tests {
             ("noo-gateway", state(true, NOW - 10, MAX_RESTARTS, false)),
         ]);
         let logs = HashMap::new();
-        let (v, _) = scan(&fake(&inspect, &logs), "noo", NOW, None).unwrap();
+        let (v, _, _) = scan(&fake(&inspect, &logs), "noo", NOW, None).unwrap();
         assert!(v.is_empty(), "{v:?}");
         let c = row(Ok(v), "noo");
         assert_eq!(c.verdict, Verdict::Ok);
@@ -281,7 +424,7 @@ mod tests {
     #[test]
     fn docker_unlistable_is_a_warning_not_a_pass() {
         let docker = |_: &[&str]| -> Result<(bool, String, String), String> { Err("No such file or directory".into()) };
-        let c = row(scan(&docker, "noo", NOW, None).map(|(v, _)| v), "noo");
+        let c = row(scan(&docker, "noo", NOW, None).map(|(v, _, _)| v), "noo");
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.contains("could not run docker"), "{}", c.detail);
     }
@@ -311,7 +454,7 @@ mod tests {
         };
         let clock = Cell::new(NOW);
         let mut slept = Vec::new();
-        let v = gate_loops(&docker, "noo", since, &|| clock.get(), &mut |s| {
+        let (v, _) = gate_loops(&docker, "noo", since, &Baseline::default(), &|| clock.get(), &mut |s| {
             slept.push(s);
             clock.set(clock.get() + s as i64);
         })
@@ -326,14 +469,14 @@ mod tests {
         let inspect = HashMap::from([("noo-redis", state(true, NOW - 20, 0, false))]);
         let logs = HashMap::new();
         let mut slept = 0;
-        let v = gate_loops(&fake(&inspect, &logs), "noo", NOW - 40, &|| NOW, &mut |_| slept += 1).unwrap();
+        let (v, _) = gate_loops(&fake(&inspect, &logs), "noo", NOW - 40, &Baseline::default(), &|| NOW, &mut |_| slept += 1).unwrap();
         assert!(v.is_empty());
         assert_eq!(slept, 0);
         // A container that restarted once and stays there: looked at until
         // the cap, then passed.
         let inspect = HashMap::from([("noo-redis", state(true, NOW - 20, 1, false))]);
         let clock = Cell::new(NOW);
-        let v = gate_loops(&fake(&inspect, &logs), "noo", NOW - 40, &|| clock.get(), &mut |s| clock.set(clock.get() + s as i64)).unwrap();
+        let (v, _) = gate_loops(&fake(&inspect, &logs), "noo", NOW - 40, &Baseline::default(), &|| clock.get(), &mut |s| clock.set(clock.get() + s as i64)).unwrap();
         assert!(v.is_empty());
         assert!(clock.get() - NOW >= GATE_SETTLE_SECS && clock.get() - NOW < GATE_SETTLE_SECS + GATE_POLL_SECS as i64 + 1);
     }
@@ -343,5 +486,116 @@ mod tests {
         assert_eq!(service_of("noo-redis", "noo"), "redis");
         assert_eq!(service_of("lab-grafana", "lab"), "grafana");
         assert_eq!(service_of("weird", "noo"), "weird");
+    }
+
+    /// A fake whose GATE_TEMPLATE answers come from `facts` (Id, count,
+    /// FinishedAt, OOMKilled) for the containers it names.
+    fn fake_facts<'a>(inspect: &'a HashMap<&'a str, String>, facts: &'a HashMap<&'a str, String>, logs: &'a HashMap<&'a str, &'a str>)
+        -> impl Fn(&[&str]) -> Result<(bool, String, String), String> + 'a {
+        let base = fake(inspect, logs);
+        move |args: &[&str]| {
+            if args[0] == "inspect" && args[2] == GATE_TEMPLATE {
+                if let Some(f) = facts.get(*args.last().unwrap()) {
+                    return Ok((true, f.clone(), String::new()));
+                }
+            }
+            base(args)
+        }
+    }
+
+    fn baseline(rows: &[(&str, &str, i64)]) -> Baseline {
+        Baseline(rows.iter().map(|(n, id, c)| (n.to_string(), (id.to_string(), *c))).collect())
+    }
+
+    fn no_sleep() -> impl FnMut(u64) {
+        |_| {}
+    }
+
+    /// pop-os 2026-11-05: the operator `docker stop`ped two looping
+    /// containers BEFORE the roll; Exited, 117 lifetime restarts, last start
+    /// minutes old. The gate passed nothing and refused the roll. Now: not a
+    /// loop, one line, no refusal.
+    #[test]
+    fn a_container_stopped_before_the_roll_is_a_line_not_a_refusal() {
+        let since = NOW - 300;
+        let inspect = HashMap::from([("noo-voice", state_exit(false, NOW - 400, 117, false, 143))]);
+        let facts = HashMap::from([("noo-voice", format!("id-v|117|{}|false", rfc3339(NOW - 350)))]);
+        let logs = HashMap::new();
+        let (v, notes) = gate_loops(&fake_facts(&inspect, &facts, &logs), "noo", since,
+            &baseline(&[("noo-voice", "id-v", 117)]), &|| NOW, &mut no_sleep()).unwrap();
+        assert!(v.is_empty(), "{v:?}");
+        assert_eq!(notes, vec!["noo-voice is stopped (exit 143), not looping; if nothing declares it, remove it: docker rm -f noo-voice".to_string()]);
+        // cluster verify agrees: a stopped container is not looping now.
+        let (v, _, _) = scan(&fake_facts(&inspect, &facts, &logs), "noo", NOW, None).unwrap();
+        assert!(v.is_empty(), "{v:?}");
+    }
+
+    /// A running container with a high LIFETIME count that has not restarted
+    /// during the roll is not looping: only the delta from the baseline counts.
+    #[test]
+    fn only_restarts_during_the_roll_count() {
+        let since = NOW - 300;
+        let inspect = HashMap::from([("noo-ollama", state(true, NOW - 200, 117, false))]);
+        let facts = HashMap::from([("noo-ollama", format!("id-o|117|{}|false", rfc3339(NOW - 201)))]);
+        let logs = HashMap::new();
+        let (v, _) = gate_loops(&fake_facts(&inspect, &facts, &logs), "noo", since,
+            &baseline(&[("noo-ollama", "id-o", 117)]), &|| NOW, &mut no_sleep()).unwrap();
+        assert!(v.is_empty(), "{v:?}");
+        // The same container, restarted 3 times during the roll: a loop.
+        let inspect = HashMap::from([("noo-ollama", state(true, NOW - 20, 120, false))]);
+        let facts = HashMap::from([("noo-ollama", format!("id-o|120|{}|false", rfc3339(NOW - 21)))]);
+        let (v, _) = gate_loops(&fake_facts(&inspect, &facts, &logs), "noo", since,
+            &baseline(&[("noo-ollama", "id-o", 117)]), &|| NOW, &mut no_sleep()).unwrap();
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].restarts, 3, "the delta, not the lifetime count");
+        // Recreated by the roll (a new Id): its whole count is since the roll.
+        let facts = HashMap::from([("noo-ollama", format!("id-new|4|{}|false", rfc3339(NOW - 21)))]);
+        let inspect = HashMap::from([("noo-ollama", state(true, NOW - 20, 4, false))]);
+        let (v, _) = gate_loops(&fake_facts(&inspect, &facts, &logs), "noo", since,
+            &baseline(&[("noo-ollama", "id-o", 117)]), &|| NOW, &mut no_sleep()).unwrap();
+        assert_eq!(v.first().map(|l| l.restarts), Some(4), "{v:?}");
+    }
+
+    /// A container that crashed DURING the roll and stayed down (restart
+    /// policy no, or on-failure past its retries) is a broken stack: refused,
+    /// with its exit code and last log line. Exit 0 (a one-shot) is nothing.
+    #[test]
+    fn a_crash_during_the_roll_refuses_and_a_one_shot_does_not() {
+        let since = NOW - 300;
+        let inspect = HashMap::from([
+            ("noo-worker", state_exit(false, NOW - 120, 0, false, 1)),
+            ("noo-evolve-routes", state_exit(false, NOW - 150, 0, false, 0)),
+        ]);
+        let facts = HashMap::from([
+            ("noo-worker", format!("id-w|0|{}|false", rfc3339(NOW - 100))),
+            ("noo-evolve-routes", format!("id-r|0|{}|false", rfc3339(NOW - 140))),
+        ]);
+        let logs = HashMap::from([("noo-worker", "boot\nFATAL: cannot connect to the bus")]);
+        let (v, notes) = gate_loops(&fake_facts(&inspect, &facts, &logs), "noo", since,
+            &Baseline::default(), &|| NOW, &mut no_sleep()).unwrap();
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].line(), "noo-worker exited 1 during the roll: FATAL: cannot connect to the bus");
+        assert!(notes.is_empty(), "the one-shot's exit 0 says nothing: {notes:?}");
+        // An OOM kill during the roll is a crash; a stop's SIGKILL is not.
+        let inspect = HashMap::from([("noo-worker", state_exit(false, NOW - 120, 0, false, 137))]);
+        let oom = HashMap::from([("noo-worker", format!("id-w|0|{}|true", rfc3339(NOW - 100)))]);
+        let (v, _) = gate_loops(&fake_facts(&inspect, &oom, &logs), "noo", since, &Baseline::default(), &|| NOW, &mut no_sleep()).unwrap();
+        assert_eq!(v.first().and_then(|l| l.crashed), Some(137), "{v:?}");
+        let stop = HashMap::from([("noo-worker", format!("id-w|0|{}|false", rfc3339(NOW - 100)))]);
+        let (v, notes) = gate_loops(&fake_facts(&inspect, &stop, &logs), "noo", since, &Baseline::default(), &|| NOW, &mut no_sleep()).unwrap();
+        assert!(v.is_empty() && notes.len() == 1, "{v:?} {notes:?}");
+    }
+
+    /// The 2026-10-16 redis, live and looping during the roll, is still caught.
+    #[test]
+    fn the_redis_loop_during_the_roll_is_still_caught() {
+        let since = NOW - 300;
+        let inspect = HashMap::from([("noo-redis", state(false, NOW - 5, 4, true))]);
+        let facts = HashMap::from([("noo-redis", format!("id-r|4|{}|false", rfc3339(NOW - 6)))]);
+        let logs = HashMap::from([("noo-redis", AOF)]);
+        let (v, _) = gate_loops(&fake_facts(&inspect, &facts, &logs), "noo", since,
+            &baseline(&[("noo-redis", "id-r", 0)]), &|| NOW, &mut no_sleep()).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].line(), format!("noo-redis is restart-looping (4 restarts): {AOF}"));
     }
 }

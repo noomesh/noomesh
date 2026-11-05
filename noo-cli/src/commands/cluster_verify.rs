@@ -5845,6 +5845,7 @@ mod gateway_redis_tests {
                     container: container.into(),
                     restarts: 7,
                     last_error: Some("Fatal error: can't open the AOF manifest file appendonly.aof.manifest: Permission denied".into()),
+                    crashed: None,
                 }]),
                 "noo",
             )

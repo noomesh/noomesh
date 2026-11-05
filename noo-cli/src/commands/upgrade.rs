@@ -815,6 +815,7 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
     let mut rc = 0;
     let mut failed_stage = "";
     let mut roll_started: Option<i64> = None;
+    let mut roll_baseline = crate::commands::cluster_verify::restart_loops::Baseline::default();
     // The node-image staging started inside upgrade_stack (overlapping the
     // launcher). It is joined AFTER the gateway health wait below, so the
     // 20-40 s wait overlaps the last exports; every path that leaves this
@@ -829,6 +830,10 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
     if stack {
         if phased && !g.json { println!("{}", ui::phase("Stack")); }
         roll_started = Some(crate::commands::cluster_verify::now_unix());
+        // What each stack container's restart count was when the roll
+        // started: the post-roll gate judges only the restarts made during it.
+        roll_baseline = crate::commands::cluster_verify::restart_loops::snapshot(
+            &crate::commands::cluster_verify::restart_loops::real_docker, &crate::envfile::container_prefix());
         let (stack_rc, run) = upgrade_stack(g, tag_override, force, skip_gw_key_check, allow_downgrade)?;
         rc = stack_rc;
         staging = run;
@@ -855,7 +860,7 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
                 );
                 rc = 1;
                 failed_stage = "stack";
-            } else if !post_roll_restart_loops_clear(g, roll_started) {
+            } else if !post_roll_restart_loops_clear(g, roll_started, &roll_baseline) {
                 rc = 1;
                 failed_stage = "stack";
             }
@@ -882,7 +887,7 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
             );
             rc = 1;
             failed_stage = "nodes";
-        } else if !post_roll_restart_loops_clear(g, roll_started) {
+        } else if !post_roll_restart_loops_clear(g, roll_started, &roll_baseline) {
             // The node phase never starts on a stack whose core container
             // restart-loops (0.6.4 redis AOF, 2026-10-16).
             rc = 1;
@@ -4865,19 +4870,26 @@ fn lock_stage_blocker(g: &Globals, failed: &[String], force: bool) -> Option<Str
 /// for up to a minute while a container has restarted but not yet looped).
 /// `None` (no roll this run): nothing to judge. A docker that cannot list
 /// the stack warns and does not block.
-fn post_roll_restart_loops_clear(g: &Globals, roll_started: Option<i64>) -> bool {
+fn post_roll_restart_loops_clear(g: &Globals, roll_started: Option<i64>, baseline: &crate::commands::cluster_verify::restart_loops::Baseline) -> bool {
     use crate::commands::cluster_verify::{now_unix, restart_loops as rl};
     let Some(since) = roll_started else { return true };
     let prefix = crate::envfile::container_prefix();
-    match rl::gate_loops(&rl::real_docker, &prefix, since, &now_unix, &mut |s| std::thread::sleep(Duration::from_secs(s))) {
-        Ok(v) if v.is_empty() => true,
-        Ok(v) => {
+    match rl::gate_loops(&rl::real_docker, &prefix, since, baseline, &now_unix, &mut |s| std::thread::sleep(Duration::from_secs(s))) {
+        Ok((v, notes)) if v.is_empty() => {
+            if !g.json {
+                for n in &notes {
+                    println!("{}", ui::note(n));
+                }
+            }
+            true
+        }
+        Ok((v, _)) => {
             for l in &v {
                 eprintln!("{}", ui::status_line(Glyph::Err, &l.line()));
             }
             let svc = rl::service_of(&v[0].container, &prefix).to_string();
             ui::close_failed(
-                &format!("{} stack container(s) restart-looping after the roll — the node phase does not start on a broken stack", v.len()),
+                &format!("{} stack container(s) restart-looping or crashed after the roll — the node phase does not start on a broken stack", v.len()),
                 Some(&format!("noo stack logs {svc}")),
             );
             false
