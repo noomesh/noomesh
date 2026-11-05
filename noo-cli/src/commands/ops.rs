@@ -611,10 +611,12 @@ mod tests {
 mod parse_pin_tests {
     use super::*;
 
+    type Row = (&'static [&'static str], Option<(String, bool)>);
+
     #[test]
     fn old_parse_ops_show_table() {
         let id = |s: &str, w: bool| Some((s.to_string(), w));
-        let rows: &[(&[&str], Option<(String, bool)>)] = &[
+        let rows: &[Row] = &[
             (&["op-1"], id("op-1", false)),
             (&["op-1", "--wait"], id("op-1", true)),
             (&["-w", "op-1"], id("op-1", true)),

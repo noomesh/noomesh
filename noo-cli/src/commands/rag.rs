@@ -1977,9 +1977,14 @@ mod parse_pin_tests {
         argv(v)
     }
 
+    type Argv = &'static [&'static str];
+    type DedupRow = (Argv, Option<(bool, bool)>);
+    type RetagRow = (Argv, Option<Result<RetagArgs, RetagRefused>>);
+    type HoldRow = (Argv, bool, Option<Result<HoldArgs, String>>);
+
     #[test]
     fn old_parse_dedup_flags_table() {
-        let rows: &[(&[&str], Option<(bool, bool)>)] = &[
+        let rows: &[DedupRow] = &[
             (&[], Some((false, false))),
             (&["--dry-run"], Some((true, false))),
             (&["-y"], Some((false, true))),
@@ -1999,7 +2004,7 @@ mod parse_pin_tests {
             Some(Ok(RetagArgs { roles: sv(roles), doc_ids: sv(doc_ids), matcher: matcher.map(str::to_string), apply, relabel, limit }))
         };
         let no = |r: RetagRefused| Some(Err(r));
-        let rows: Vec<(&[&str], Option<Result<RetagArgs, RetagRefused>>)> = vec![
+        let rows: Vec<RetagRow> = vec![
             (&["--role", "admin", "--match", "*.pdf"], ok(&["admin"], &[], Some("*.pdf"), false, false, 1000)),
             (&["--roles", "a, b,,", "--role", "c", "--doc-id", "d1", "--doc-id", "d2"], ok(&["a", "b", "c"], &["d1", "d2"], None, false, false, 1000)),
             (&["--doc-id", "d1", "--role", "admin", "--relabel", "--apply", "--limit", "5"], ok(&["admin"], &["d1"], None, true, true, 5)),
@@ -2034,7 +2039,7 @@ mod parse_pin_tests {
         let no_target = "give --title-prefix <p> or --doc <id>; refusing to hold everything by omission";
         let both = "give --title-prefix or --doc, not both";
         // (args, takes_reason: hold true / unhold false, want)
-        let rows: Vec<(&[&str], bool, Option<Result<HoldArgs, String>>)> = vec![
+        let rows: Vec<HoldRow> = vec![
             (&["--title-prefix", "p"], true, held(Some("p"), &[], None, false)),
             (&["--doc", "a", "b", "--doc", "c", "--apply"], true, held(None, &["a", "b", "c"], None, true)),
             (&["--doc", "a", "--reason", "r"], true, held(None, &["a"], Some("r"), false)),
