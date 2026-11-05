@@ -814,8 +814,11 @@ mod role_read_error_tests {
     fn an_unreadable_role_is_logged_as_unreadable_not_as_unknown() {
         let own = crate::test_src::own_code(include_str!("dispatch.rs"));
         let body = crate::test_src::fn_body(&own, "pub async fn role_of(");
-        assert!(!body.contains(".ok()"), "the read's error must not become None silently: {body}");
-        let err = &body[body.find("Err(e) =>").expect("the error arm")..];
+        // The read is matched, not swallowed: no default chained after its
+        // `.await` (the Ok arm's `r.parse().ok()` parses the role string).
+        assert!(body.contains("match crate::repo::users::enabled_role(&state.db, user).await {"), "{body}");
+        assert!(!body.contains(".await.ok()") && !body.contains(".await.unwrap_or"), "the read's error must not become None silently: {body}");
+        let err = &body[body.find("Err(e) =>").expect("the error arm, binding the error")..];
         assert!(err.contains("the user's role could not be read"), "{err}");
     }
 }
