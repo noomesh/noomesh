@@ -314,7 +314,9 @@ func (s *Server) handleClean(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req cleanReq
-	json.NewDecoder(r.Body).Decode(&req) // ignore errors, defaults are fine
+	if !decodeBodyOr400(w, r, 4096, &req) {
+		return
+	}
 
 	slog.Info("clean requested", "remove_folder", req.RemoveFolder, "deep", req.Deep)
 
@@ -549,6 +551,44 @@ func (s *Server) handleSkillRun(w http.ResponseWriter, r *http.Request) {
 
 // --- Helpers ---
 
+// decodeOptionalBody is the one rule for a request body that drives an
+// action: an EMPTY body (EOF before any byte) means "no fields" and leaves v
+// at its zero value (the legacy behaviour), while anything else that is not
+// exactly one well-formed JSON value for v (syntax, wrong type, truncated,
+// longer than limit, trailing data) is an error. A malformed body must never
+// decode to zero fields and run the action with defaults, which is wider than
+// the caller asked (followup i495 item 3).
+func decodeOptionalBody(r *http.Request, limit int64, v any) error {
+	if r.Body == nil {
+		return nil
+	}
+	dec := json.NewDecoder(io.LimitReader(r.Body, limit+1))
+	if err := dec.Decode(v); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
+	if dec.InputOffset() > limit {
+		return errors.New("body exceeds " + strconv.FormatInt(limit, 10) + " bytes")
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("unexpected data after the JSON value")
+	}
+	return nil
+}
+
+// decodeBodyOr400 runs decodeOptionalBody and, on failure, answers 400
+// {"error":"invalid_body","detail":...} and reports false: the caller returns
+// without running its action.
+func decodeBodyOr400(w http.ResponseWriter, r *http.Request, limit int64, v any) bool {
+	if err := decodeOptionalBody(r, limit, v); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_body", "detail": err.Error()})
+		return false
+	}
+	return true
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -579,7 +619,9 @@ func (s *Server) handleGPUHold(w http.ResponseWriter, r *http.Request) {
 		TimeoutSecs int    `json:"timeout_secs"`
 		Force       bool   `json:"force"`
 	}
-	_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body)
+	if !decodeBodyOr400(w, r, 4096, &body) {
+		return
+	}
 	req := gpuyield.HoldRequest{
 		Reason:      clipField(body.Reason, 200),
 		Owner:       clipField(body.Owner, 200),
@@ -614,7 +656,9 @@ func (s *Server) handleGPURelease(w http.ResponseWriter, r *http.Request) {
 		Force       bool   `json:"force"`
 		Resume      string `json:"resume"`
 	}
-	_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body)
+	if !decodeBodyOr400(w, r, 4096, &body) {
+		return
+	}
 	req := gpuyield.ReleaseRequest{
 		OperationID: clipField(body.OperationID, 64),
 		Generation:  body.Generation,

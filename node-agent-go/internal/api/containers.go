@@ -42,7 +42,9 @@ func (s *Server) handleCleanupImages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req cleanupImagesReq
-	_ = json.NewDecoder(r.Body).Decode(&req) // empty body → full run
+	if !decodeBodyOr400(w, r, 4096, &req) {
+		return
+	}
 
 	removed, err := s.docker.CleanupImages(r.Context(), req.DryRun)
 	if err != nil {
@@ -64,7 +66,9 @@ func (s *Server) handleCleanupLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req cleanupLogsReq
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if !decodeBodyOr400(w, r, 4096, &req) {
+		return
+	}
 
 	truncated, err := s.docker.CleanupLogs(r.Context(), req.DryRun, req.MaxSizeMB)
 	if err != nil {
