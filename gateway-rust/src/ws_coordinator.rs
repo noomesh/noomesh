@@ -89,8 +89,10 @@ async fn handle_chat(
     // payload's `user_id` is advisory and `effective_user_id` already
     // discards it when it disagrees, so there is exactly one subject here
     // and no impersonation path to preserve.
-    let principal =
+    let mut principal =
         crate::bus_principal::Principal::user(user_id.clone(), role, claims.scopes.clone());
+    principal.act = claims.act.clone();
+    principal.harness = claims.harness.clone();
     tracing::info!(user_id = %user_id, "ws_coordinator connected");
 
     let (writer, mut stream, forwarder) = WsWriter::spawn(socket);
