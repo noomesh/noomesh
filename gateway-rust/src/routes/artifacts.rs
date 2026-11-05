@@ -495,9 +495,20 @@ pub(crate) fn image_tar_gz_name(image: &str, arch: &str) -> String {
     format!("{}.gz", image_tar_name(image, arch))
 }
 
+/// The ref a placement's image is staged under: the digest cut off at the
+/// first '@' (never at the last ':', which may be a registry port). The rail
+/// tar is named by `repo:tag`, and the node agent strips a pinned digest the
+/// same way before it asks for the tar. Twin: noo-cli `image_stage::staged_ref`;
+/// `staged_names` in tests/fixtures/own_image_cases.json holds both to one table.
+pub(crate) fn staged_ref(image: &str) -> &str {
+    image.split_once('@').map_or(image, |(r, _)| r)
+}
+
 /// Whether the store holds this image for `arch` in either form (an older
-/// controller store holds the plain `.tar`).
+/// controller store holds the plain `.tar`). A digest-pinned ref is looked up
+/// under its tag (`staged_ref`).
 pub(crate) fn image_is_staged(dir: &Path, image: &str, arch: &str) -> bool {
+    let image = staged_ref(image);
     dir.join(image_tar_gz_name(image, arch)).is_file() || dir.join(image_tar_name(image, arch)).is_file()
 }
 
@@ -597,8 +608,9 @@ pub(crate) fn not_staged_refusal(node: &str, image: &str, arch: &str) -> String 
     format!(
         "image {image} for {arch} is not staged on the controller, so {node} cannot start it \
          (a node pulls images only from the controller's artifact rail and holds no registry \
-         credential). Stage it: `noo cluster sync-images {node} -i {image}` (or `noo upgrade` for \
-         the release images), then place again; --force places it anyway"
+         credential). Stage it: `noo cluster sync-images {node} -i {staged}` (or `noo upgrade` for \
+         the release images), then place again; --force places it anyway",
+        staged = staged_ref(image)
     )
 }
 
@@ -747,6 +759,39 @@ mod tests {
         std::fs::write(dir.join(image_tar_gz_name("a/b:c", "amd64")), b"x").unwrap();
         assert!(image_is_staged(&dir, "a/b:c", "amd64"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staged_names_match_the_shared_fixture() {
+        let fx: serde_json::Value = serde_json::from_str(include_str!("../../../tests/fixtures/own_image_cases.json")).unwrap();
+        let rows = fx["staged_names"].as_array().expect("staged_names table");
+        assert!(rows.len() >= 4, "fixture parse found {} staged_names rows", rows.len());
+        for row in rows {
+            let (r, arch) = (row["ref"].as_str().unwrap(), row["arch"].as_str().unwrap());
+            assert_eq!(staged_ref(r), row["staged_ref"].as_str().unwrap(), "{r}");
+            assert_eq!(image_tar_gz_name(staged_ref(r), arch), row["tar_gz"].as_str().unwrap(), "{r}");
+        }
+    }
+
+    #[test]
+    fn a_digest_pinned_placement_is_staged_under_its_tag() {
+        // 2026-11-05, after the 0.6.16 roll: a placement pinned to
+        // ghcr.io/noomesh/ollama:v0.6.16@sha256:e6def24... read as unstaged
+        // while the rail held its tag-named tars; a PUT of that ref is refused.
+        let dir = std::env::temp_dir().join(format!("noo-art-digest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tag = "registry.local:5000/noomesh/ollama:v0.6.16";
+        let pinned = format!("{tag}@sha256:{}", "e".repeat(64));
+        assert!(!image_is_staged(&dir, &pinned, "amd64"));
+        std::fs::write(dir.join(image_tar_gz_name(tag, "amd64")), b"x").unwrap();
+        assert!(image_is_staged(&dir, &pinned, "amd64"), "a digest-pinned ref is staged under its tag");
+        assert!(image_is_staged(&dir, tag, "amd64"));
+        assert!(!image_is_staged(&dir, &pinned, "arm64"), "the other arch is still unstaged");
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = not_staged_refusal("robopi", &pinned, "arm64");
+        assert!(m.contains(&format!("image {pinned} for arm64 is not staged")), "{m}");
+        assert!(m.contains(&format!("noo cluster sync-images robopi -i {tag}`")), "{m}");
     }
 
     #[test]
