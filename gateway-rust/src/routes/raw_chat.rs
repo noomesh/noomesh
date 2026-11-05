@@ -1343,6 +1343,11 @@ mod tests {
     const FAST: Timeouts =
         Timeouts { header: Duration::from_millis(250), first_token: Duration::from_millis(250), idle: Duration::from_millis(250) };
 
+    /// For a test that asserts something happens well BEFORE a window: long
+    /// enough that "waited the window" and "a loaded box" cannot overlap.
+    const BUSY_WINDOW: Timeouts =
+        Timeouts { header: Duration::from_secs(5), first_token: Duration::from_secs(5), idle: Duration::from_secs(5) };
+
     type Alerts = Arc<Mutex<Vec<(String, String)>>>;
 
     async fn run(cands: &[Candidate], stream: bool, t: Timeouts) -> (Result<CoreSuccess, RawChatError>, Alerts) {
@@ -1388,10 +1393,14 @@ mod tests {
             let spare = fake_backend(Fake::Answer("from the spare")).await;
             let cands = [cand("mcmini", "ollama", "m", &full.url), cand("pop-os", "ollama", "m", &spare.url)];
             let started = Instant::now();
-            let (r, alerts) = run(&cands, stream, FAST).await;
+            // Its own long window: a busy candidate that was waited out would
+            // take all of it, so half of it separates "at once" from "at the
+            // window" with seconds to spare. The old bound (200 ms under a
+            // 250 ms window) failed under a loaded batch build, 2026-11-05.
+            let (r, alerts) = run(&cands, stream, BUSY_WINDOW).await;
             let ok = r.unwrap_or_else(|e| panic!("stream={stream}: {} {}", e.status, e.detail));
             assert_eq!(ok.index, 1, "the spare answered");
-            assert!(started.elapsed() < Duration::from_millis(200), "busy is answered at once, not at the window");
+            assert!(started.elapsed() < BUSY_WINDOW.header / 2, "busy is answered at once, not at the window");
             assert!(alerts.lock().unwrap().is_empty(), "busy is load, not an incident: {:?}", alerts.lock().unwrap());
             assert_eq!(full.asked_to_reject(), vec![true], "not the last candidate: asked to reject when full");
             assert_eq!(spare.asked_to_reject(), vec![false], "the last candidate is waited on, never asked to reject");
