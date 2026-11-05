@@ -2,6 +2,7 @@
 // Copyright 2026 PersonifAI LLC
 
 import type { GpuContention } from './gpuContention';
+import type { Lane } from './lanes';
 
 // View model for a cluster node — the fields the NodeCard renders. Populated
 // from the contract's node object (see mapNode). The optional telemetry fields
@@ -27,4 +28,6 @@ export interface ClusterNode {
   load?: number;
   // node agent `gpu_contention` (shared-GPU yield); absent from older agents
   gpuContention?: GpuContention;
+  // node agent `lanes` (i403); undefined from an agent that predates them
+  lanes?: Lane[];
 }

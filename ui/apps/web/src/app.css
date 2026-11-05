@@ -1232,6 +1232,15 @@ body {
   color: var(--warn);
 }
 
+/* ---- chat lanes not routed (node agent lanes, i403) ---- */
+.node .lane-state {
+  margin-top: 6px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--warn);
+  overflow-wrap: anywhere;
+}
+
 /* ---- node footer (backends + heartbeat) ---- */
 .node-foot {
   display: flex;
