@@ -20,6 +20,8 @@ file. A schema states the shape; the rules it cannot state (anything needing
 the lock, the add-on's name, or two values compared) are in its `x-noo-rules`.
 An unknown field is refused everywhere.
 
+Every validator refuses duplicate object keys, at any depth (code `duplicate_key`): Go keeps the last value and `serde_json` refuses the repeat, so a document must not be readable two ways. The CLI and gateway validators must match this.
+
 Core never names a real add-on. The fixture add-on is `rhaddon`, and its
 declaration is `tests/fixtures/addons/rhaddon/node-workloads.json`.
 
@@ -242,7 +244,9 @@ decl inside an entry is reported as `decl_invalid` and carries the inner code.
 
 The stable codes a validator returns for a file. The fixtures pin each.
 
-**`node-workloads.json`:** `bad_json`, `unknown_field`, `field_type`,
+Every file kind also has `duplicate_key` (see above); in desired-config it is returned as itself, not as `desired_invalid`.
+
+**`node-workloads.json`:** `bad_json`, `duplicate_key`, `unknown_field`, `field_type`,
 `field_missing`, `bad_format`, `workloads_invalid`, `door_name_invalid`,
 `door_name_too_long`, `name_duplicate`, `image_not_in_lock`, `uid_invalid`,
 `command_invalid`, `port_invalid`, `protocols_invalid`, `health_invalid`,

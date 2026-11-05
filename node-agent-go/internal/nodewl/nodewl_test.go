@@ -171,7 +171,7 @@ func TestEveryCodeAFixtureNamesIsProduced(t *testing.T) {
 		}
 	}
 	for _, code := range []string{
-		CodeBadJSON, CodeUnknownField, CodeBadFormat, CodeFieldMissing,
+		CodeBadJSON, CodeUnknownField, CodeBadFormat, CodeFieldMissing, CodeDuplicateKey,
 		CodeWorkloadsInvalid, CodeDoorNameInvalid, CodeDoorNameTooLong, CodeNameDuplicate, CodeImageNotInLock,
 		CodeUIDInvalid, CodeCommandInvalid, CodePortInvalid, CodeProtocolsInvalid, CodeHealthInvalid,
 		CodeDrainInvalid, CodeAccelInvalid, CodeModelSlotInvalid, CodeEnvKeyOutsidePrefix,

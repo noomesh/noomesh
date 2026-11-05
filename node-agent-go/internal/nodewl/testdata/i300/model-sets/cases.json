@@ -50,6 +50,11 @@
     "code": "bad_json"
   },
   {
+    "file": "refuse-duplicate-key.json",
+    "valid": false,
+    "code": "duplicate_key"
+  },
+  {
     "file": "refuse-bad-format.json",
     "valid": false,
     "code": "bad_format"

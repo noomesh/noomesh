@@ -69,9 +69,68 @@ const (
 	CodeBadFormat    = "bad_format"    // `format` is not the one this parser reads
 )
 
-// decodeStrict decodes exactly one JSON value into v: unknown fields are
-// refused and so is anything after the value.
+// CodeDuplicateKey: an object repeats a key, at any depth. Go keeps the last
+// value and serde_json's derived structs refuse the repeat, so a document
+// could otherwise be validated with one value and run with another (a parser
+// differential). Every validator refuses it.
+const CodeDuplicateKey = "duplicate_key"
+
+// checkDuplicateKeys walks b token by token and refuses a repeated key in
+// any object. Syntax errors are not its business: the typed decode that
+// follows reports them as bad_json.
+func checkDuplicateKeys(b []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	err := walkValue(dec)
+	var e *Error
+	if errors.As(err, &e) {
+		return e
+	}
+	return nil
+}
+
+func walkValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	d, ok := tok.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch d {
+	case '{':
+		seen := map[string]bool{}
+		for dec.More() {
+			kt, err := dec.Token()
+			if err != nil {
+				return err
+			}
+			k, _ := kt.(string)
+			if seen[k] {
+				return fail(CodeDuplicateKey, "key %q is repeated in an object", k)
+			}
+			seen[k] = true
+			if err := walkValue(dec); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for dec.More() {
+			if err := walkValue(dec); err != nil {
+				return err
+			}
+		}
+	}
+	_, err = dec.Token() // the closing delimiter
+	return err
+}
+
+// decodeStrict decodes exactly one JSON value into v: a repeated key is
+// refused, so are unknown fields and anything after the value.
 func decodeStrict(b []byte, v any) error {
+	if err := checkDuplicateKeys(b); err != nil {
+		return err
+	}
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {

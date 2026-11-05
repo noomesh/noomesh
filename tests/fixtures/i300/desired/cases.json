@@ -30,6 +30,11 @@
     "code": "desired_invalid"
   },
   {
+    "file": "refuse-duplicate-key.json",
+    "valid": false,
+    "code": "duplicate_key"
+  },
+  {
     "file": "refuse-unknown-field.json",
     "valid": false,
     "code": "desired_invalid"
