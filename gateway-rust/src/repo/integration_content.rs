@@ -248,15 +248,17 @@ pub async fn versions(db: &PgPool, vault: &Vault, job: &Job) -> Result<BTreeMap<
     let rows: Vec<(String, Value)> = sqlx::query_as("SELECT item_key,sealed FROM noo_integration_documents WHERE owner_uuid=$1 AND source_id=$2 LIMIT 2000")
         .bind(job.owner).bind(job.source).fetch_all(db).await?;
     let mut known = BTreeMap::new();
-    let mut unreadable = false;
+    let mut unreadable = 0usize;
     for (item, sealed) in rows {
         match vault.open::<Document>(&sealed, &context(job.owner, job.source, &item)) {
             Ok(doc) if !doc.version.is_empty() => { known.insert(item, doc.version.clone()); }
             Ok(_) => {}
-            Err(_) => { unreadable = true; }
+            Err(_) => { unreadable += 1; }
         }
     }
-    if unreadable { tracing::warn!("private sync inventory contains unreadable documents; refetching"); }
+    if unreadable > 0 {
+        tracing::warn!(unreadable, source = %job.source, "private sync inventory contains unreadable documents; refetching");
+    }
     Ok(known)
 }
 
@@ -269,7 +271,9 @@ pub async fn fail(db: &PgPool, job: &Job, error: &Error) -> Result<(), Error> {
     };
     let result = sqlx::query("UPDATE noo_integration_sync SET lease=NULL,lease_until=NULL,attempts=attempts+1,fault=$4,status=CASE WHEN attempts>=4 OR $4 IN ('reauth','limit') THEN 'error' ELSE 'queued' END,next_run=now()+interval '1 minute' * power(2,least(attempts,4)) WHERE source_id=$1 AND owner_uuid=$2 AND lease=$3")
         .bind(job.source).bind(job.owner).bind(job.lease).bind(fault).execute(db).await?;
-    if result.rows_affected() > 0 { tracing::warn!(fault, "private sync failed; retry policy applied"); }
+    if result.rows_affected() > 0 {
+        tracing::warn!(fault, cause = %error.log_cause(), source = %job.source, "private sync failed; retry policy applied");
+    }
     Ok(())
 }
 
@@ -315,11 +319,11 @@ pub async fn search(
         .bind(owner).fetch_all(db).await?;
     let truncated = rows.len() > 1000;
     let mut hits = Vec::new();
-    let mut unavailable = false;
+    let mut unreadable = 0usize;
     for (id, source, item, sealed) in rows.into_iter().take(1000) {
         let doc: Document = match vault.open(&sealed, &context(owner, source, &item)) {
             Ok(doc) => doc,
-            Err(_) => { unavailable = true; continue; }
+            Err(_) => { unreadable += 1; continue; }
         };
         let lower = format!("{}\n{}", doc.title, doc.text).to_lowercase();
         let score = terms.iter().filter(|t| lower.contains(t.as_str())).count();
@@ -340,7 +344,8 @@ pub async fn search(
         }
     }
     hits.sort_by_key(|a| std::cmp::Reverse(a.0));
-    if unavailable { tracing::warn!("private search skipped unreadable documents"); }
+    let unavailable = unreadable > 0;
+    if unavailable { tracing::warn!(unreadable, %owner, "private search skipped unreadable documents"); }
     Ok(
         json!({"items":hits.into_iter().take(limit.min(20)).map(|(_,v)|v).collect::<Vec<_>>(),"truncated":truncated,"unavailable":unavailable}),
     )
