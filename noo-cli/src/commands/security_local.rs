@@ -900,13 +900,13 @@ type ScanParts<'a> = (
 /// over "TLS not configured".
 /// `[--strict]` → strict.
 pub(crate) fn parse_scan(args: &[String]) -> Result<bool, Unhandled> {
-    let mut strict = false;
-    for a in args {
-        match a.as_str() {
-            "--strict" => strict = true,
-            _ => return Err(Unhandled),
-        }
-    }
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_scan_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_scan_with(a: &mut Args) -> Result<bool, ArgError> {
+    let strict = a.flag(&["--strict"]);
+    a.finish()?;
     Ok(strict)
 }
 
@@ -2281,34 +2281,29 @@ pub(crate) struct TeardownArgs {
 /// `[NODE | --all] [-y|--yes] [--purge-data] [--purge-tailscale] [--factory]`;
 /// `--all` with a node is refused.
 pub(crate) fn parse_teardown_node(args: &[String]) -> Result<TeardownArgs, Unhandled> {
-    let mut node: Option<String> = None;
-    let mut all = false;
-    let mut yes = false;
-    let mut purge_data = false;
-    let mut purge_ts = false;
-    for tok in args {
-        match tok.as_str() {
-            "-y" | "--yes" => yes = true,
-            // Every enrolled node except this box, one confirmation, one
-            // tailnet answer
-            // three fetch waits and three prompts on the pre-walk teardown).
-            "--all" => all = true,
-            // Also delete the node's data root (models/caches). Off by
-            // default — a rebirth usually WANTS the cached models.
-            "--purge-data" => purge_data = true,
-            // Also uninstall tailscale — but noo-apply only acts on it if
-            // the node's marker says PAI installed it (never a pre-existing
-            // one). docker/nvidia are deliberately not offered: pre-existing,
-            // high blast radius.
-            "--purge-tailscale" => purge_ts = true,
-            // Everything: de-enroll + data + tailscale. The full reversal.
-            "--factory" => { purge_data = true; purge_ts = true; }
-            t if !t.starts_with('-') && node.is_none() => node = Some(t.to_string()),
-            _ => return Err(Unhandled),
-        }
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_teardown_node_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_teardown_node_with(a: &mut Args) -> Result<TeardownArgs, ArgError> {
+    let yes = a.flag(&["--yes", "-y"]);
+    // Every enrolled node except this box, one confirmation, one tailnet answer.
+    let all = a.flag(&["--all"]);
+    // Also delete the node's data root (models/caches). Off by default: a
+    // rebirth usually WANTS the cached models.
+    let mut purge_data = a.flag(&["--purge-data"]);
+    // Also uninstall tailscale, but noo-apply only acts on it if the node's
+    // marker says PAI installed it (never a pre-existing one). docker/nvidia
+    // are deliberately not offered: pre-existing, high blast radius.
+    let mut purge_ts = a.flag(&["--purge-tailscale"]);
+    // Everything: de-enroll + data + tailscale. The full reversal.
+    if a.flag(&["--factory"]) {
+        purge_data = true;
+        purge_ts = true;
     }
+    let node = a.maybe_one("<node>")?;
     if all && node.is_some() {
-        return Err(Unhandled);
+        return Err(ArgError::new("give a node or --all, not both"));
     }
     Ok(TeardownArgs { node, all, yes, purge_data, purge_ts })
 }
@@ -3046,13 +3041,13 @@ fn rotate_ca_retire(g: &Globals, ca: &ClusterCa, yes: bool) -> Result<i32, Unhan
 /// Shells the script, which verifies the round-trip before shredding.
 /// `[--yes|-y]` → yes.
 pub(crate) fn parse_absorb_files(args: &[String]) -> Result<bool, Unhandled> {
-    let mut yes = false;
-    for tok in args {
-        match tok.as_str() {
-            "--yes" | "-y" => yes = true,
-            _ => return Err(Unhandled),
-        }
-    }
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_absorb_files_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_absorb_files_with(a: &mut Args) -> Result<bool, ArgError> {
+    let yes = a.flag(&["--yes", "-y"]);
+    a.finish()?;
     Ok(yes)
 }
 
@@ -3673,22 +3668,19 @@ pub(crate) fn adoption_of(d: &CertDelivery, reports_applies: bool) -> Adoption {
 /// yet. Re-run for the stragglers.
 /// `[NODE] [--force|--yes|-y] [--deliver-only]` → (only, yes, reuse).
 pub(crate) fn parse_rotate_signing_key(args: &[String]) -> Result<(Option<String>, bool, bool), Unhandled> {
-    let mut only: Option<String> = None;
-    let mut yes = false;
-    let mut reuse = false;
-    for tok in args {
-        match tok.as_str() {
-            "--force" | "--yes" | "-y" => yes = true,
-            // The bootstrap case: a cluster that has a signing key already
-            // (minted with the CA, or lazily on a push) but whose nodes have
-            // never been handed the public half. Nothing is rotated; the
-            // existing key is delivered.
-            "--deliver-only" => reuse = true,
-            t if !t.starts_with('-') && only.is_none() => only = Some(t.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    Ok((only, yes, reuse))
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_rotate_signing_key_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_rotate_signing_key_with(a: &mut Args) -> Result<(Option<String>, bool, bool), ArgError> {
+    // `--force` is an old spelling of `--yes`, still accepted, not documented.
+    let yes = a.flag(&["--yes", "-y", "--force"]);
+    // The bootstrap case: a cluster that has a signing key already (minted
+    // with the CA, or lazily on a push) but whose nodes have never been
+    // handed the public half. Nothing is rotated; the existing key is
+    // delivered.
+    let reuse = a.flag(&["--deliver-only"]);
+    Ok((a.maybe_one("<node>")?, yes, reuse))
 }
 
 pub fn pki_rotate_signing_key(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
@@ -4645,17 +4637,12 @@ fn remove_ca_linux_store(em: &mut Emitter) -> bool {
 /// still exits 0 after printing the manual fallback (Python parity).
 /// `[CA_PATH]` → the path, if given. No flags.
 pub(crate) fn parse_trust_ca(args: &[String]) -> Result<Option<String>, Unhandled> {
-    let mut ca_path: Option<String> = None;
-    for tok in args {
-        if tok.starts_with('-') {
-            return Err(Unhandled);
-        }
-        if ca_path.is_some() {
-            return Err(Unhandled);
-        }
-        ca_path = Some(tok.clone());
-    }
-    Ok(ca_path)
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_trust_ca_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_trust_ca_with(a: &mut Args) -> Result<Option<String>, ArgError> {
+    a.maybe_one("<ca_path>")
 }
 
 pub fn security_trust_ca(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
@@ -4719,17 +4706,21 @@ pub(crate) enum UntrustRefused {
     Path(String),
 }
 
-/// `[-y|--yes]` → yes. Stops at the first refused token, as the loop did.
+/// `[-y|--yes]` → yes. The FIRST token left after `--yes` decides the
+/// refusal, as the loop did: a flag (a lone `-` included) is the usage error,
+/// anything else is a CA path.
 pub(crate) fn parse_untrust_ca(args: &[String]) -> Result<bool, UntrustRefused> {
-    let mut yes = false;
-    for tok in args {
-        match tok.as_str() {
-            "--yes" | "-y" => yes = true,
-            t if t.starts_with('-') => return Err(UntrustRefused::Unhandled),
-            t => return Err(UntrustRefused::Path(t.to_string())),
-        }
+    let mut a = Args::new(args);
+    let yes = parse_untrust_ca_with(&mut a);
+    match args.iter().find(|t| !matches!(t.as_str(), "--yes" | "-y")) {
+        None => Ok(yes),
+        Some(t) if t.starts_with('-') => Err(UntrustRefused::Unhandled),
+        Some(t) => Err(UntrustRefused::Path(t.to_string())),
     }
-    Ok(yes)
+}
+
+pub(crate) fn parse_untrust_ca_with(a: &mut Args) -> bool {
+    a.flag(&["--yes", "-y"])
 }
 
 pub fn security_untrust_ca(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
@@ -6093,7 +6084,7 @@ mod clifix_security_tests {
         // 4); its table pins that both spellings are accepted.
         let p = body.find("parse_absorb_files(args)").expect("the handler parses through parse_absorb_files");
         assert!(p < c, "the arguments are parsed before anything is asked or run");
-        let parse = body_of(include_str!("security_local.rs"), "pub(crate) fn parse_absorb_files(");
+        let parse = body_of(include_str!("security_local.rs"), "pub(crate) fn parse_absorb_files_with(");
         assert!(parse.contains("\"--yes\"") && parse.contains("\"-y\""));
     }
 

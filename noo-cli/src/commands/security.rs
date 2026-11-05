@@ -614,16 +614,13 @@ pub fn security_user_links(g: &Globals, args: &[String]) -> Result<i32, Unhandle
 /// getpass ("New password:"/"Confirm:"); the flag is the agent path.
 /// `USERNAME [--password-stdin]` → (username, password_stdin).
 pub(crate) fn parse_set_password(args: &[String]) -> Result<(String, bool), Unhandled> {
-    let mut username: Option<String> = None;
-    let mut password_stdin = false;
-    for tok in args {
-        match tok.as_str() {
-            "--password-stdin" => password_stdin = true,
-            s if !s.starts_with('-') && username.is_none() => username = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    Ok((username.ok_or(Unhandled)?, password_stdin))
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_set_password_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_set_password_with(a: &mut Args) -> Result<(String, bool), ArgError> {
+    let password_stdin = a.flag(&["--password-stdin"]);
+    Ok((a.one("<username>")?, password_stdin))
 }
 
 pub fn security_user_set_password(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
@@ -647,14 +644,14 @@ pub fn security_user_set_password(g: &Globals, args: &[String]) -> Result<i32, U
 
 /// `[--stdout] [--yes|-y]` → (stdout, yes).
 pub(crate) fn parse_admin_password_reset(args: &[String]) -> Result<(bool, bool), Unhandled> {
-    let (mut stdout_flag, mut yes) = (false, false);
-    for tok in args {
-        match tok.as_str() {
-            "--stdout" => stdout_flag = true,
-            "--yes" | "-y" => yes = true,
-            _ => return Err(Unhandled),
-        }
-    }
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_admin_password_reset_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_admin_password_reset_with(a: &mut Args) -> Result<(bool, bool), ArgError> {
+    let stdout_flag = a.flag(&["--stdout"]);
+    let yes = a.flag(&["--yes", "-y"]);
+    a.finish()?;
     Ok((stdout_flag, yes))
 }
 
@@ -816,16 +813,13 @@ pub(crate) fn enable_body(username: &str) -> Value {
 
 /// `<username> [-y|--yes]` — exactly one name, any order.
 fn username_and_yes(args: &[String]) -> Result<(String, bool), Unhandled> {
-    let mut name: Option<String> = None;
-    let mut yes = false;
-    for tok in args {
-        match tok.as_str() {
-            "--yes" | "-y" => yes = true,
-            s if !s.starts_with('-') && name.is_none() => name = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    Ok((name.ok_or(Unhandled)?, yes))
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_username_and_yes_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_username_and_yes_with(a: &mut Args) -> Result<(String, bool), ArgError> {
+    let yes = a.flag(&["--yes", "-y"]);
+    Ok((a.one("<username>")?, yes))
 }
 
 /// `noo security user erase USERNAME [--yes/-y] [--keep-account]`
@@ -834,18 +828,14 @@ fn username_and_yes(args: &[String]) -> Result<(String, bool), Unhandled> {
 /// is deleted, so no confirmation prompt is needed); `--yes` executes.
 /// `USERNAME [--yes|-y] [--keep-account]` → (username, yes, keep_account).
 pub(crate) fn parse_user_erase(args: &[String]) -> Result<(String, bool, bool), Unhandled> {
-    let mut username: Option<String> = None;
-    let mut yes = false;
-    let mut keep_account = false;
-    for tok in args {
-        match tok.as_str() {
-            "--yes" | "-y" => yes = true,
-            "--keep-account" => keep_account = true,
-            s if !s.starts_with('-') && username.is_none() => username = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    Ok((username.ok_or(Unhandled)?, yes, keep_account))
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_user_erase_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_user_erase_with(a: &mut Args) -> Result<(String, bool, bool), ArgError> {
+    let yes = a.flag(&["--yes", "-y"]);
+    let keep_account = a.flag(&["--keep-account"]);
+    Ok((a.one("<username>")?, yes, keep_account))
 }
 
 pub fn security_user_erase(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
@@ -1110,18 +1100,14 @@ pub fn security_team_create(g: &Globals, args: &[String]) -> Result<i32, Unhandl
 /// passed through in the payload, exactly like Python.
 /// `NAME [--force] [--yes|-y]` → (name, force, yes).
 pub(crate) fn parse_team_delete(args: &[String]) -> Result<(String, bool, bool), Unhandled> {
-    let mut name: Option<String> = None;
-    let mut force = false;
-    let mut yes = false;
-    for tok in args {
-        match tok.as_str() {
-            "--force" => force = true,
-            "--yes" | "-y" => yes = true,
-            s if !s.starts_with('-') && name.is_none() => name = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    Ok((name.ok_or(Unhandled)?, force, yes))
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_team_delete_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_team_delete_with(a: &mut Args) -> Result<(String, bool, bool), ArgError> {
+    let force = a.flag(&["--force"]);
+    let yes = a.flag(&["--yes", "-y"]);
+    Ok((a.one("<name>")?, force, yes))
 }
 
 pub fn security_team_delete(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
@@ -1942,16 +1928,13 @@ pub fn security_posture_set(g: &Globals, args: &[String]) -> Result<i32, Unhandl
 /// whether the last node has crossed the boundary the bridge exists for.
 /// `PROFILE [--include-bridges]` → (profile, include_bridges).
 pub(crate) fn parse_posture_apply_profile(args: &[String]) -> Result<(String, bool), Unhandled> {
-    let mut include_bridges = false;
-    let mut rest: Vec<String> = Vec::new();
-    for a in args {
-        match a.as_str() {
-            "--include-bridges" => include_bridges = true,
-            other => rest.push(other.to_string()),
-        }
-    }
-    let [profile] = positional::<1>(&rest)?;
-    Ok((profile, include_bridges))
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_posture_apply_profile_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_posture_apply_profile_with(a: &mut Args) -> Result<(String, bool), ArgError> {
+    let include_bridges = a.flag(&["--include-bridges"]);
+    Ok((a.one("<profile>")?, include_bridges))
 }
 
 pub fn security_posture_apply_profile(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
@@ -2183,16 +2166,19 @@ pub(crate) fn retired_scope_keys(keys: &[&Value]) -> Vec<(String, String)> {
 /// `--json` is always complete.
 /// `[--all] [--callers]` → which revoked rows to add; `--callers` wins.
 pub(crate) fn parse_service_key_list(args: &[String]) -> Result<Revoked, Unhandled> {
-    let mut revoked = Revoked::Hidden;
-    for a in args {
-        match a.as_str() {
-            "--all" if revoked == Revoked::Hidden => revoked = Revoked::Issued,
-            "--all" => {}
-            "--callers" => revoked = Revoked::Every,
-            _ => return Err(Unhandled),
-        }
-    }
-    Ok(revoked)
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_service_key_list_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_service_key_list_with(a: &mut Args) -> Result<Revoked, ArgError> {
+    let all = a.flag(&["--all"]);
+    let callers = a.flag(&["--callers"]);
+    a.finish()?;
+    Ok(match (callers, all) {
+        (true, _) => Revoked::Every,
+        (false, true) => Revoked::Issued,
+        (false, false) => Revoked::Hidden,
+    })
 }
 
 pub fn security_service_key_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
@@ -2918,14 +2904,12 @@ fn finish(
 
 /// `CONSUMER` → the consumer. No flags.
 pub(crate) fn parse_service_key_retire(args: &[String]) -> Result<String, Unhandled> {
-    let mut consumer: Option<String> = None;
-    for tok in args {
-        match tok.as_str() {
-            s if !s.starts_with('-') && consumer.is_none() => consumer = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    consumer.ok_or(Unhandled)
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_service_key_retire_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_service_key_retire_with(a: &mut Args) -> Result<String, ArgError> {
+    a.one("<consumer>")
 }
 
 pub fn security_service_key_retire(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
@@ -2959,18 +2943,14 @@ pub fn security_service_key_retire(g: &Globals, args: &[String]) -> Result<i32, 
 
 /// `CONSUMER [--disable-account] [--yes|-y]` → (consumer, disable_account, yes).
 pub(crate) fn parse_service_key_revoke(args: &[String]) -> Result<(String, bool, bool), Unhandled> {
-    let mut consumer: Option<String> = None;
-    let mut disable_account = false;
-    let mut yes = false;
-    for tok in args {
-        match tok.as_str() {
-            "--disable-account" => disable_account = true,
-            "--yes" | "-y" => yes = true,
-            s if !s.starts_with('-') && consumer.is_none() => consumer = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    Ok((consumer.ok_or(Unhandled)?, disable_account, yes))
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_service_key_revoke_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_service_key_revoke_with(a: &mut Args) -> Result<(String, bool, bool), ArgError> {
+    let disable_account = a.flag(&["--disable-account"]);
+    let yes = a.flag(&["--yes", "-y"]);
+    Ok((a.one("<consumer>")?, disable_account, yes))
 }
 
 pub fn security_service_key_revoke(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
