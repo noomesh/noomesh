@@ -1722,52 +1722,18 @@ pub(super) async fn cluster_gpu_metrics(State(state): State<Arc<AppState>>) -> A
             // Fallback: proxy to node agents' /gpu endpoint
             let agents = all_node_agents(&state).await;
             let mut all_gpus = Vec::new();
+            let mut unreachable = Vec::new();
             for (node_id, agent_url, hostname) in &agents {
-                let req = crate::node_link::NodeLink::for_base(agent_url)
-                    .request(reqwest::Method::GET, "/gpu")
-                    .timeout(std::time::Duration::from_secs(3));
-                if let Ok(resp) = req.send().await {
-                    if let Ok(data) = resp.json::<Value>().await {
-                        if data.get("available").and_then(|v| v.as_bool()) == Some(true) {
-                            // Node agent returns flat metrics; transform to match observe.js format
-                            // observe.js expects: temperature, memory_used (MB, /1024 → GB), power, utilization, name
-                            let gpu_model = data.get("gpu_model").and_then(|v| v.as_str()).unwrap_or("GPU");
-                            // Each of these was `.unwrap_or(0.0)`: a field the
-                            // node-agent omitted or renamed rendered as a real
-                            // reading of 0 °C / 0 W / 0% utilization. "0%
-                            // utilization" is not cosmetic — it is an input to
-                            // placement decisions and to the operator's read of
-                            // whether a GPU is busy. An absent metric is now
-                            // null, which consumers can render as "—" instead
-                            // of as an idle, ice-cold GPU.
-                            all_gpus.push(json!({
-                                // The GPU's MODEL, not the machine it is in.
-                                // This was `hostname`, so every tile on this
-                                // path was labelled with its own host — and
-                                // since the tile already shows the node, an
-                                // operator saw "host3 host3" and "host8
-                                // host8" (the two spellings being node_id and
-                                // hostname) and read one machine as two.
-                                // `gpu_model` was already being read two lines
-                                // up and then ignored. Where the node-agent
-                                // reports no model it is "GPU", which is
-                                // uninformative but true; the hostname here
-                                // was informative and false.
-                                "name": gpu_model,
-                                "node_id": node_id.clone(),
-                                "hostname": hostname.clone(),
-                                "gpu_model": gpu_model,
-                                "index": all_gpus.len().to_string(),
-                                "temperature": metric_or_null(&data, "temperature_c"),
-                                "memory_used": metric_or_null(&data, "memory_used_mb"),
-                                "power": metric_or_null(&data, "power_draw_w"),
-                                "utilization": metric_or_null(&data, "gpu_utilization_percent"),
-                            }));
-                        }
-                    }
+                let link = crate::node_link::NodeLink::for_base(agent_url);
+                match node_gpu(&link, node_id, hostname, all_gpus.len()).await {
+                    Ok(Some(gpu)) => all_gpus.push(gpu),
+                    Ok(None) => {}
+                    // A node whose /gpu could not be read is named, never
+                    // shown as a node with no GPU (i460).
+                    Err(error) => unreachable.push(json!({"node_id": node_id, "hostname": hostname, "error": error})),
                 }
             }
-            Json(json!({"gpus": all_gpus, "source": if all_gpus.is_empty() { "none" } else { "node_agent" }}))
+            Json(json!({"gpus": all_gpus, "unreachable": unreachable, "source": if all_gpus.is_empty() { "none" } else { "node_agent" }}))
         }
     }
 }
@@ -1785,6 +1751,57 @@ fn controller_identity() -> (String, String) {
         .unwrap_or_else(|| "controller".to_string());
     let id = crate::self_node::self_node_id().unwrap_or_else(|| host.clone());
     (id, host)
+}
+
+/// One node agent's `/gpu`, in the shape the GPU tiles read: `None` when the
+/// node reports no GPU (`available` not true), `Err` when its answer could
+/// not be had or read.
+async fn node_gpu(link: &crate::node_link::NodeLink, node_id: &str, hostname: &str, index: usize) -> Result<Option<Value>, String> {
+    let resp = link
+        .request(reqwest::Method::GET, "/gpu")
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|e| format!("node {node_id}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("node {node_id} answered HTTP {}", resp.status().as_u16()));
+    }
+    let data = crate::upstream_body::json_2xx(resp, &format!("node {node_id}")).await?;
+    if data.get("available").and_then(|v| v.as_bool()) != Some(true) {
+        return Ok(None);
+    }
+    let gpu_model = data.get("gpu_model").and_then(|v| v.as_str()).unwrap_or("GPU");
+    // Each of these was `.unwrap_or(0.0)`: a field the
+    // node-agent omitted or renamed rendered as a real
+    // reading of 0 °C / 0 W / 0% utilization. "0%
+    // utilization" is not cosmetic — it is an input to
+    // placement decisions and to the operator's read of
+    // whether a GPU is busy. An absent metric is now
+    // null, which consumers can render as "—" instead
+    // of as an idle, ice-cold GPU.
+    Ok(Some(json!({
+        // The GPU's MODEL, not the machine it is in.
+        // This was `hostname`, so every tile on this
+        // path was labelled with its own host — and
+        // since the tile already shows the node, an
+        // operator saw "host3 host3" and "host8
+        // host8" (the two spellings being node_id and
+        // hostname) and read one machine as two.
+        // `gpu_model` was already being read two lines
+        // up and then ignored. Where the node-agent
+        // reports no model it is "GPU", which is
+        // uninformative but true; the hostname here
+        // was informative and false.
+        "name": gpu_model,
+        "node_id": node_id,
+        "hostname": hostname,
+        "gpu_model": gpu_model,
+        "index": index.to_string(),
+        "temperature": metric_or_null(&data, "temperature_c"),
+        "memory_used": metric_or_null(&data, "memory_used_mb"),
+        "power": metric_or_null(&data, "power_draw_w"),
+        "utilization": metric_or_null(&data, "gpu_utilization_percent"),
+    })))
 }
 
 /// Read one numeric telemetry field, returning JSON `null` when it is absent
@@ -7293,15 +7310,15 @@ mod gpu_label_tests {
         );
 
         let at = src
-            .find("all_gpus.push(json!({")
-            .expect("the fallback's GPU emit is gone — this guard is stale");
+            .find("Ok(Some(json!({")
+            .expect("the fallback's GPU emit (node_gpu) is gone — this guard is stale");
         // Bound the block at its own terminator rather than by a character
         // count. The first version read a fixed 900 chars and broke the
         // moment the comment above the emit grew — a guard that depends on
         // how much prose sits near the code is a guard that fails for the
         // wrong reason.
         let close = src[at..]
-            .find("}));")
+            .find("})))")
             .expect("the GPU emit is not terminated — this guard is stale");
         let emit = &src[at..at + close];
         let name_line = emit
@@ -7318,6 +7335,27 @@ mod gpu_label_tests {
             "the fallback labels a GPU with its HOSTNAME again — the tile already shows the \
              node, so this renders the machine twice and reads as two machines: {name_line}"
         );
+    }
+
+    /// The fallback's per-node read, against a loopback agent: a GPU is
+    /// labelled with its model, a node with none is `None`, and an answer
+    /// cut off mid-body is an error naming the node (i460), never "no GPU".
+    #[tokio::test]
+    async fn a_node_gpu_is_its_model_none_or_a_named_error() {
+        use crate::upstream_body::{stub, stub_cut_short};
+        let link = |b: &str| crate::node_link::NodeLink::for_base(b);
+        let base = stub("200 OK", None, b"{\"available\": true, \"gpu_model\": \"RTX 4080\", \"temperature_c\": 61}").await;
+        let gpu = super::node_gpu(&link(&base), "host3", "host3.lan", 0).await.unwrap().expect("a GPU");
+        assert_eq!(gpu["name"], "RTX 4080");
+        assert_eq!(gpu["hostname"], "host3.lan");
+        assert_eq!(gpu["temperature"], serde_json::json!(61.0));
+        let base = stub("200 OK", None, b"{\"available\": false}").await;
+        assert_eq!(super::node_gpu(&link(&base), "host9", "host9", 0).await, Ok(None));
+        let base = stub_cut_short().await;
+        let e = super::node_gpu(&link(&base), "host9", "host9", 0).await.unwrap_err();
+        assert!(e.starts_with("node host9 answered HTTP 200 but its body could not be read"), "{e}");
+        let base = stub("404 Not Found", None, b"").await;
+        assert_eq!(super::node_gpu(&link(&base), "host9", "host9", 0).await, Err("node host9 answered HTTP 404".into()));
     }
 }
 

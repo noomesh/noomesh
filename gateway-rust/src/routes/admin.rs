@@ -370,49 +370,66 @@ async fn logs_containers(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ContainerQueryParams>,
 ) -> AppJson {
-    let mut results: Vec<Value> = Vec::new();
+    let targets = container_targets(&state, params.node_id.as_deref()).await;
+    let (results, unreachable) = gather_node_lists(targets, "/logs/containers").await;
+    Json(json!({"containers": results, "unreachable": unreachable}))
+}
 
-    let nodes = all_node_agents(&state).await;
-
-    if !nodes.is_empty() {
-        for (nid, agent_url, hostname) in &nodes {
-            if let Some(ref filter) = params.node_id {
-                if nid != filter { continue; }
-            }
-            let req = crate::node_link::NodeLink::for_base(agent_url).request(reqwest::Method::GET, "/logs/containers");
-            match req.timeout(std::time::Duration::from_secs(10)).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    if let Ok(containers) = resp.json::<Vec<Value>>().await {
-                        for mut c in containers {
-                            c["node_id"] = json!(nid);
-                            c["node_hostname"] = json!(hostname);
-                            results.push(c);
-                        }
-                    }
-                }
-                Ok(_) | Err(_) => {
-                    tracing::debug!(node_id = %nid, "container list failed");
-                }
-            }
+/// The node agents a per-node list asks: every node (or the one `node_id`
+/// names), else the local agent when no node is known and none was named.
+async fn container_targets(state: &AppState, node_id: Option<&str>) -> Vec<(String, String, crate::node_link::NodeLink)> {
+    let nodes = all_node_agents(state).await;
+    if nodes.is_empty() {
+        if node_id.is_none() {
+            return vec![("local".into(), "local".into(), crate::node_link::NodeLink::self_agent_at(local_agent_url()))];
         }
-    } else if params.node_id.is_none() {
-        // Fallback: try local node-agent directly
-        let local = local_agent_url();
-        let req = crate::node_link::NodeLink::self_agent_at(local).request(reqwest::Method::GET, "/logs/containers");
-        if let Ok(resp) = req.timeout(std::time::Duration::from_secs(10)).send().await {
-            if resp.status().is_success() {
-                if let Ok(containers) = resp.json::<Vec<Value>>().await {
-                    for mut c in containers {
-                        c["node_id"] = json!("local");
-                        c["node_hostname"] = json!("local");
-                        results.push(c);
-                    }
+        return Vec::new();
+    }
+    nodes
+        .into_iter()
+        .filter(|(nid, _, _)| node_id.is_none_or(|f| f == nid.as_str()))
+        .map(|(nid, url, host)| (nid, host, crate::node_link::NodeLink::for_base(&url)))
+        .collect()
+}
+
+/// Each target's list at `path`, tagged with its node, and the nodes whose
+/// list could not be had, each with why (i460). A node that failed used to
+/// vanish from the answer (debug-logged only), so its containers read as
+/// "none there".
+async fn gather_node_lists(targets: Vec<(String, String, crate::node_link::NodeLink)>, path: &str) -> (Vec<Value>, Vec<Value>) {
+    let mut results = Vec::new();
+    let mut unreachable = Vec::new();
+    for (nid, hostname, link) in targets {
+        match node_list(&link, path, &nid).await {
+            Ok(items) => {
+                for mut c in items {
+                    c["node_id"] = json!(nid);
+                    c["node_hostname"] = json!(hostname);
+                    results.push(c);
                 }
+            }
+            Err(error) => {
+                tracing::warn!(node_id = %nid, path, %error, "node list not read");
+                unreachable.push(json!({"node_id": nid, "node_hostname": hostname, "error": error}));
             }
         }
     }
+    (results, unreachable)
+}
 
-    Json(json!({"containers": results}))
+/// One node's JSON list at `path`, or why not.
+async fn node_list(link: &crate::node_link::NodeLink, path: &str, node: &str) -> Result<Vec<Value>, String> {
+    let resp = link
+        .request(reqwest::Method::GET, path)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("node {node}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("node {node} answered HTTP {}", resp.status().as_u16()));
+    }
+    let v = crate::upstream_body::json_2xx(resp, &format!("node {node}")).await?;
+    serde_json::from_value(v).map_err(|e| format!("node {node} answered something that is not a list: {e}"))
 }
 
 /// Get live container resource stats (CPU, memory, net/block I/O) across nodes.
@@ -422,50 +439,10 @@ async fn logs_docker_stats(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ContainerQueryParams>,
 ) -> AppJson {
-    let mut results: Vec<Value> = Vec::new();
-
-    let nodes = all_node_agents(&state).await;
-
-    if !nodes.is_empty() {
-        for (nid, agent_url, hostname) in &nodes {
-            if let Some(ref filter) = params.node_id {
-                if nid != filter { continue; }
-            }
-            let req = crate::node_link::NodeLink::for_base(agent_url).request(reqwest::Method::GET, "/stats/containers");
-            match req.timeout(std::time::Duration::from_secs(10)).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    if let Ok(containers) = resp.json::<Vec<Value>>().await {
-                        for mut c in containers {
-                            c["node_id"] = json!(nid);
-                            c["node_hostname"] = json!(hostname);
-                            results.push(c);
-                        }
-                    }
-                }
-                Ok(_) | Err(_) => {
-                    tracing::debug!(node_id = %nid, "container stats failed");
-                }
-            }
-        }
-    } else if params.node_id.is_none() {
-        // Fallback: try local node-agent directly
-        let local = local_agent_url();
-        let req = crate::node_link::NodeLink::self_agent_at(local).request(reqwest::Method::GET, "/stats/containers");
-        if let Ok(resp) = req.timeout(std::time::Duration::from_secs(10)).send().await {
-            if resp.status().is_success() {
-                if let Ok(containers) = resp.json::<Vec<Value>>().await {
-                    for mut c in containers {
-                        c["node_id"] = json!("local");
-                        c["node_hostname"] = json!("local");
-                        results.push(c);
-                    }
-                }
-            }
-        }
-    }
-
+    let targets = container_targets(&state, params.node_id.as_deref()).await;
+    let (results, unreachable) = gather_node_lists(targets, "/stats/containers").await;
     let timestamp = chrono::Utc::now().to_rfc3339();
-    Json(json!({"containers": results, "timestamp": timestamp}))
+    Json(json!({"containers": results, "unreachable": unreachable, "timestamp": timestamp}))
 }
 
 #[derive(Deserialize)]
@@ -5521,5 +5498,34 @@ mod stamp_read_error_tests {
         assert!(s.starts_with("unreadable: cannot look up trellion.alembic_version_memory"), "{s}");
         assert_eq!(super::stamp_json(Ok(None)), serde_json::Value::Null, "no stamp is still null");
         assert_eq!(super::stamp_json(Ok(Some("abc".into()))), serde_json::json!("abc"));
+    }
+}
+
+#[cfg(test)]
+mod node_list_tests {
+    use super::*;
+
+    /// i460: a node whose container list cannot be had is named in
+    /// `unreachable` with why, never dropped so that its containers read
+    /// as "none there". Against loopback agents: one answers, one cuts its
+    /// body short, one answers 500, one answers an object, not a list.
+    #[tokio::test]
+    async fn a_node_whose_list_cannot_be_read_is_named_not_dropped() {
+        use crate::upstream_body::{stub, stub_cut_short};
+        let good = stub("200 OK", None, b"[{\"name\": \"noo-gateway\"}]").await;
+        let cut = stub_cut_short().await;
+        let down = stub("500 Internal Server Error", None, b"[]").await;
+        let odd = stub("200 OK", None, b"{\"containers\": []}").await;
+        let t = |id: &str, b: &str| (id.to_string(), format!("{id}.lan"), crate::node_link::NodeLink::for_base(b));
+        let (items, unreachable) =
+            gather_node_lists(vec![t("a", &good), t("b", &cut), t("c", &down), t("d", &odd)], "/logs/containers").await;
+        assert_eq!(items, vec![json!({"name": "noo-gateway", "node_id": "a", "node_hostname": "a.lan"})]);
+        let named: Vec<&str> = unreachable.iter().map(|u| u["node_id"].as_str().unwrap()).collect();
+        assert_eq!(named, ["b", "c", "d"], "{unreachable:?}");
+        let why = |i: usize| unreachable[i]["error"].as_str().unwrap().to_string();
+        assert!(why(0).starts_with("node b answered HTTP 200 but its body could not be read"), "{}", why(0));
+        assert_eq!(why(1), "node c answered HTTP 500");
+        assert!(why(2).starts_with("node d answered something that is not a list"), "{}", why(2));
+        assert_eq!(unreachable[1]["node_hostname"], "c.lan");
     }
 }

@@ -184,7 +184,6 @@ mod tests {
     #[test]
     fn no_success_arm_reads_its_body_leniently() {
         const ALLOWED: &[(&str, usize, &str)] = &[
-            ("routes/agents.rs", 1, "i460 PR3: the node list answers with the cause, not 'unreachable'"),
             (
                 "routes/cluster.rs",
                 1,
