@@ -4,6 +4,7 @@
 package hardware
 
 import (
+	"math"
 	"runtime"
 	"testing"
 )
@@ -114,6 +115,20 @@ func TestParseDarwinLoadavg(t *testing.T) {
 	}
 	if got := normaliseLoad(0.5, 0); got != 0.5 {
 		t.Errorf("normaliseLoad(0.5, 0) = %v, want 0.5 (cores floor at 1)", got)
+	}
+}
+
+// A real sample, captured on the mcmini fleet node (Apple silicon, macOS):
+// `sysctl -n vm.loadavg` printed "{ 1.02 1.08 1.03 }" and `sysctl -n hw.ncpu`
+// printed 10. The heartbeat's load is then 1.02/10 = 0.102.
+func TestParseDarwinLoadavgCapturedSample(t *testing.T) {
+	const captured = "{ 1.02 1.08 1.03 }\n"
+	load1, ok := parseDarwinLoadavg(captured)
+	if !ok || load1 != 1.02 {
+		t.Fatalf("parseDarwinLoadavg(%q) = %v,%v want 1.02,true", captured, load1, ok)
+	}
+	if got := normaliseLoad(load1, 10); math.Abs(got-0.102) > 1e-12 {
+		t.Errorf("normaliseLoad(1.02, 10) = %v, want 0.102", got)
 	}
 }
 
