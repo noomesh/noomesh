@@ -667,8 +667,8 @@ mod tests {
 
     #[test]
     fn a_write_records_accepted_suggestion_and_the_outcome_says_what_happened() {
-        let src = include_str!("addon_access.rs");
-        let body = src.split("fn write_suggestions(").nth(1).unwrap().split("\n\u{7d}\n").next().unwrap();
+        let src = crate::test_src::own_code(include_str!("addon_access.rs"));
+        let body = crate::test_src::fn_body(&src, "fn write_suggestions(");
         assert!(body.contains(r#""source": "accepted_suggestion""#), "the gateway validates this; the CLI must send it");
         assert!(body.contains(r#""value": "on""#));
         let w = Suggestions::Written { on: vec![("converse".into(), "user".into())], failed: vec![("review".into(), "operator".into(), "HTTP 400".into())] };
@@ -681,8 +681,8 @@ mod tests {
 
     #[test]
     fn enable_refuses_accept_suggested_before_it_changes_anything_and_upgrade_never_asks() {
-        let addons = include_str!("addons.rs");
-        let set = addons.split("fn set(g: &Globals").nth(1).unwrap().split("\npub fn addons_enable").next().unwrap();
+        let addons = crate::test_src::own_code(include_str!("addons.rs"));
+        let set = crate::test_src::fn_body(&addons, "fn set(g: &Globals");
         let refuse = set.find("--accept-suggested needs the gateway to have").expect("the up-front refusal");
         let enable = set.find("addon_enable::enable(").expect("the enable step");
         assert!(refuse < enable, "refused before the switch, the key or the pin is touched");
@@ -690,11 +690,11 @@ mod tests {
         assert!(enable < ask, "asked only once the switch is on");
         // The question has exactly two callers: this verb and enable. An
         // upgrade never grants (proposal 3.2).
-        let code = |t: &'static str| t.split("\n#[cfg(test)]").next().unwrap();
         let call = ["run_suggestions", "(g,"].concat();
-        let callers = code(addons).matches(&call).count() + code(include_str!("addon_access.rs")).matches(&call).count();
+        let own = crate::test_src::own_code(include_str!("addon_access.rs"));
+        let callers = addons.matches(&call).count() + own.matches(&call).count();
         assert_eq!(callers, 2, "run_suggestions is called from enable and accept-suggestions only");
-        for upgrade in [include_str!("addon_pins.rs"), include_str!("addon_lock_cmd.rs")] {
+        for upgrade in [include_str!("addon_pins.rs"), include_str!("addon_lock_cmd.rs")].map(crate::test_src::own_code) {
             assert!(!upgrade.contains("run_suggestions") && !upgrade.contains("accepted_suggestion"));
         }
     }

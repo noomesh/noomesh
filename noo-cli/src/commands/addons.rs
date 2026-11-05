@@ -912,7 +912,7 @@ fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
                 ExitCode::Generic,
                 "addon_not_loaded",
                 &format!("--accept-suggested needs the gateway to have {name} loaded already, and it has not ({e}); nothing was changed"),
-                Some(&format!("noo addons enable {name}   # then: noo stack restart --force; noo addons accept-suggestions {name} --yes")),
+                Some(&format!("noo addons enable {name} && noo stack restart --force && noo addons accept-suggestions {name} --yes")),
             );
         }
     }
