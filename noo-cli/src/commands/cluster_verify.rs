@@ -5142,8 +5142,12 @@ pub(crate) type AccessRead = (String, Result<Value, String>);
 pub(crate) type AccessReads = Result<Vec<AccessRead>, String>;
 
 /// `/health`'s enabled add-ons, then `GET /api/addons/{addon}/access` for each.
+/// The health read is AUTHENTICATED (`health_body`, as the `gateway fds` row
+/// reads it): an anonymous `/health` is liveness only (`{"status"}`), so the
+/// unauthenticated read found no add-on and the row always said "no add-on
+/// is enabled" (0.6.17 rehearsal review, A-addonsugg.row).
 fn addon_access_reads(g: &Globals) -> AccessReads {
-    let health = crate::http::get_json_try(g, "/health", false, 10).map_err(|e| format!("/health: {e}"))?;
+    let health = health_body(g).ok_or_else(|| "/health: not read (no authenticated health body)".to_string())?;
     Ok(enabled_addons(&health)
         .into_iter()
         .map(|a| {
@@ -12211,5 +12215,19 @@ mod storage_dirs_row_tests {
         assert_eq!(c.verdict, Verdict::Warn);
         assert_eq!(c.detail, "not checked /s/tempo (Permission denied)");
         assert_eq!(c.remedy, None);
+    }
+}
+
+#[cfg(test)]
+mod addon_access_health_tests {
+    /// The add-on list comes from the authenticated health body: the
+    /// anonymous one carries only `status`, which names no add-on.
+    #[test]
+    fn the_add_on_access_row_reads_the_authenticated_health() {
+        let code = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let body = crate::test_src::fn_body(&code, "fn addon_access_reads(");
+        assert!(body.contains("health_body(g)"), "{body}");
+        assert!(!body.contains("\"/health\", false"), "an anonymous /health names no add-on: {body}");
+        assert!(super::enabled_addons(&serde_json::json!({"status": "healthy"})).is_empty(), "what the anonymous read sees");
     }
 }
