@@ -898,8 +898,8 @@ type ScanParts<'a> = (
 /// are real posture problems, they are just not outages. The default stays
 /// CRITICAL-only so `noo security scan` on a dev box does not fail a script
 /// over "TLS not configured".
-pub fn security_scan(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    crate::ui::auto_page(); // long output: $PAGER on a TTY (no-op otherwise)
+/// `[--strict]` → strict.
+pub(crate) fn parse_scan(args: &[String]) -> Result<bool, Unhandled> {
     let mut strict = false;
     for a in args {
         match a.as_str() {
@@ -907,6 +907,12 @@ pub fn security_scan(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             _ => return Err(Unhandled),
         }
     }
+    Ok(strict)
+}
+
+pub fn security_scan(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    crate::ui::auto_page(); // long output: $PAGER on a TTY (no-op otherwise)
+    let strict = parse_scan(args)?;
 
     // WHAT is being scanned comes first, in the output and in the JSON. The
     // root is chosen by a ranking (envfile::repo_root_source); an operator
@@ -2262,7 +2268,19 @@ pub(crate) fn delete_tailnet_device(g: &Globals, name: &str, ip: Option<&str>) -
 /// teardown over — this is the sanctioned path, and it never touches user
 /// data on the node. A node with no birth cert on record predates the pull
 /// rail and must be re-enrolled before it can be torn down this way.
-pub fn cluster_teardown_node(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+/// What `noo cluster teardown-node` was asked to do.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TeardownArgs {
+    pub node: Option<String>,
+    pub all: bool,
+    pub yes: bool,
+    pub purge_data: bool,
+    pub purge_ts: bool,
+}
+
+/// `[NODE | --all] [-y|--yes] [--purge-data] [--purge-tailscale] [--factory]`;
+/// `--all` with a node is refused.
+pub(crate) fn parse_teardown_node(args: &[String]) -> Result<TeardownArgs, Unhandled> {
     let mut node: Option<String> = None;
     let mut all = false;
     let mut yes = false;
@@ -2289,8 +2307,15 @@ pub fn cluster_teardown_node(g: &Globals, args: &[String]) -> Result<i32, Unhand
             _ => return Err(Unhandled),
         }
     }
+    if all && node.is_some() {
+        return Err(Unhandled);
+    }
+    Ok(TeardownArgs { node, all, yes, purge_data, purge_ts })
+}
+
+pub fn cluster_teardown_node(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let TeardownArgs { node, all, yes, purge_data, purge_ts } = parse_teardown_node(args)?;
     if all {
-        if node.is_some() { return Err(Unhandled); }
         let me = crate::role::detect().node.map(|n| n.name);
         let inventory = fleet_nodes_from_registry(g);
         let targets: Vec<(String, String, String)> = inventory.iter()
@@ -3019,7 +3044,8 @@ fn rotate_ca_retire(g: &Globals, ca: &ClusterCa, yes: bool) -> Result<i32, Unhan
 /// the SOPS store
 /// because bind-mounts need files and the sops rail only fed env vars).
 /// Shells the script, which verifies the round-trip before shredding.
-pub fn secrets_absorb_files(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+/// `[--yes|-y]` → yes.
+pub(crate) fn parse_absorb_files(args: &[String]) -> Result<bool, Unhandled> {
     let mut yes = false;
     for tok in args {
         match tok.as_str() {
@@ -3027,6 +3053,11 @@ pub fn secrets_absorb_files(g: &Globals, args: &[String]) -> Result<i32, Unhandl
             _ => return Err(Unhandled),
         }
     }
+    Ok(yes)
+}
+
+pub fn secrets_absorb_files(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let yes = parse_absorb_files(args)?;
     // It shreds the source files (after reading each back from the store),
     // so say so before touching anything.
     super::confirm_prompt(
@@ -3640,7 +3671,8 @@ pub(crate) fn adoption_of(d: &CertDelivery, reports_applies: bool) -> Adoption {
 /// (`<pki>/nodes/<node>/signing-adopted`). A node that does not confirm
 /// keeps getting CA-signed bundles — nothing breaks, it just has not moved
 /// yet. Re-run for the stragglers.
-pub fn pki_rotate_signing_key(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+/// `[NODE] [--force|--yes|-y] [--deliver-only]` → (only, yes, reuse).
+pub(crate) fn parse_rotate_signing_key(args: &[String]) -> Result<(Option<String>, bool, bool), Unhandled> {
     let mut only: Option<String> = None;
     let mut yes = false;
     let mut reuse = false;
@@ -3656,6 +3688,11 @@ pub fn pki_rotate_signing_key(g: &Globals, args: &[String]) -> Result<i32, Unhan
             _ => return Err(Unhandled),
         }
     }
+    Ok((only, yes, reuse))
+}
+
+pub fn pki_rotate_signing_key(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let (only, yes, reuse) = parse_rotate_signing_key(args)?;
 
     let ca = ClusterCa::new(pki_dir());
     if !ca.ca_exists() {
@@ -4606,7 +4643,8 @@ fn remove_ca_linux_store(em: &mut Emitter) -> bool {
 /// OS/browser trust store (defaults to `$NOO_PKI_DIR/ca.crt`). Missing CA
 /// file → exit 1 with the pki-init hint; an install that could not complete
 /// still exits 0 after printing the manual fallback (Python parity).
-pub fn security_trust_ca(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+/// `[CA_PATH]` → the path, if given. No flags.
+pub(crate) fn parse_trust_ca(args: &[String]) -> Result<Option<String>, Unhandled> {
     let mut ca_path: Option<String> = None;
     for tok in args {
         if tok.starts_with('-') {
@@ -4617,6 +4655,11 @@ pub fn security_trust_ca(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
         }
         ca_path = Some(tok.clone());
     }
+    Ok(ca_path)
+}
+
+pub fn security_trust_ca(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let ca_path = parse_trust_ca(args)?;
     let ca_file = ca_path
         .map(PathBuf::from)
         .unwrap_or_else(|| pki_dir().join("ca.crt"));
@@ -4667,21 +4710,40 @@ pub fn security_trust_ca(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
 /// trust store. Destructive → agent-first confirm contract. Removal is keyed
 /// on the certificate CN, not a file (it works after the PEM is deleted), so
 /// there is no CA path to give: passing one is refused rather than ignored.
-pub fn security_untrust_ca(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+/// Why `noo security untrust-ca` refused its arguments.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UntrustRefused {
+    /// An unknown flag: the usage error (exit 2).
+    Unhandled,
+    /// A CA path, which the verb does not take: its own message (exit 2).
+    Path(String),
+}
+
+/// `[-y|--yes]` → yes. Stops at the first refused token, as the loop did.
+pub(crate) fn parse_untrust_ca(args: &[String]) -> Result<bool, UntrustRefused> {
     let mut yes = false;
     for tok in args {
         match tok.as_str() {
             "--yes" | "-y" => yes = true,
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => fail(
-                g.json,
-                ExitCode::Usage,
-                "unexpected_argument",
-                &format!("untrust-ca takes no CA path ('{t}'): it removes the cluster CA by name, whatever file it came from"),
-                Some("noo security untrust-ca [--yes]"),
-            ),
+            t if t.starts_with('-') => return Err(UntrustRefused::Unhandled),
+            t => return Err(UntrustRefused::Path(t.to_string())),
         }
     }
+    Ok(yes)
+}
+
+pub fn security_untrust_ca(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let yes = match parse_untrust_ca(args) {
+        Ok(yes) => yes,
+        Err(UntrustRefused::Unhandled) => return Err(Unhandled),
+        Err(UntrustRefused::Path(t)) => fail(
+            g.json,
+            ExitCode::Usage,
+            "unexpected_argument",
+            &format!("untrust-ca takes no CA path ('{t}'): it removes the cluster CA by name, whatever file it came from"),
+            Some("noo security untrust-ca [--yes]"),
+        ),
+    };
 
     super::confirm_destructive(g, yes, "untrust", "cluster CA from OS trust store");
 
@@ -6035,5 +6097,119 @@ mod clifix_security_tests {
         let body = body_of(include_str!("security_local.rs"), "pub fn security_untrust_ca(");
         assert!(!body.contains("let _ = ca_path"), "the argument must not be swallowed");
         assert!(body.contains("takes no CA path"));
+    }
+}
+
+/// What each local security parser accepts and refuses, pinned before the
+/// hand-rolled loops move to `args::Args` (i191 D2 pass 4): the conversion
+/// must leave every row as it is. `None` is a refusal: `Err(Unhandled)`, which
+/// the dispatcher turns into the verb's usage line and exit 2.
+#[cfg(test)]
+mod parse_pin_tests {
+    use super::*;
+
+    type Row<T> = (&'static [&'static str], Option<T>);
+
+    fn check<T: PartialEq + std::fmt::Debug>(verb: &str, parse: fn(&[String]) -> Result<T, Unhandled>, rows: &[Row<T>]) {
+        assert!(rows.len() >= 4, "{verb}: too few rows to pin anything");
+        assert!(rows.iter().any(|r| r.1.is_some()) && rows.iter().any(|r| r.1.is_none()), "{verb}: pin both an accepted and a refused form");
+        for (args, want) in rows {
+            let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let got = parse(&argv).ok();
+            assert_eq!(got.as_ref(), want.as_ref(), "{verb} {args:?}");
+        }
+    }
+
+    fn td(node: Option<&str>, all: bool, yes: bool, purge_data: bool, purge_ts: bool) -> Option<TeardownArgs> {
+        Some(TeardownArgs { node: node.map(str::to_string), all, yes, purge_data, purge_ts })
+    }
+
+    #[test]
+    fn old_parse_scan_table() {
+        check("security scan", parse_scan, &[
+            (&[], Some(false)),
+            (&["--strict"], Some(true)),
+            (&["--strict", "--strict"], Some(true)),
+            (&["--bogus"], None),
+            (&["root"], None),
+            (&["-"], None),
+        ]);
+    }
+
+    #[test]
+    fn old_parse_teardown_node_table() {
+        check("cluster teardown-node", parse_teardown_node, &[
+            (&[], td(None, false, false, false, false)),
+            (&["n1"], td(Some("n1"), false, false, false, false)),
+            (&["--all", "-y"], td(None, true, true, false, false)),
+            (&["n1", "--purge-data"], td(Some("n1"), false, false, true, false)),
+            (&["--purge-tailscale", "n1", "--yes"], td(Some("n1"), false, true, false, true)),
+            (&["n1", "--factory"], td(Some("n1"), false, false, true, true)),
+            (&["--all", "n1"], None),
+            (&["n1", "--all"], None),
+            (&["n1", "n2"], None),
+            (&["n1", "--bogus"], None),
+            (&["-"], None),
+        ]);
+    }
+
+    #[test]
+    fn old_parse_absorb_files_table() {
+        check("secrets absorb-files", parse_absorb_files, &[
+            (&[], Some(false)),
+            (&["-y"], Some(true)),
+            (&["--yes"], Some(true)),
+            (&["--force"], None),
+            (&["file"], None),
+            (&["-"], None),
+        ]);
+    }
+
+    #[test]
+    fn old_parse_rotate_signing_key_table() {
+        let n1 = || Some("n1".to_string());
+        check("pki rotate-signing-key", parse_rotate_signing_key, &[
+            (&[], Some((None, false, false))),
+            (&["n1"], Some((n1(), false, false))),
+            (&["--force"], Some((None, true, false))),
+            (&["-y", "--deliver-only", "n1"], Some((n1(), true, true))),
+            (&["--yes", "--deliver-only"], Some((None, true, true))),
+            (&["n1", "n2"], None),
+            (&["--bogus"], None),
+            (&["-"], None),
+        ]);
+    }
+
+    #[test]
+    fn old_parse_trust_ca_table() {
+        check("security trust-ca", parse_trust_ca, &[
+            (&[], Some(None)),
+            (&["/x/ca.crt"], Some(Some("/x/ca.crt".to_string()))),
+            (&["a.crt", "b.crt"], None),
+            (&["--path"], None),
+            (&["-"], None),
+        ]);
+    }
+
+    /// untrust-ca refuses two ways: an unknown flag is the usage error, a CA
+    /// path is its own `unexpected_argument` message. Both exit 2.
+    #[test]
+    fn old_parse_untrust_ca_table() {
+        let path = |p: &str| -> Result<bool, UntrustRefused> { Err(UntrustRefused::Path(p.to_string())) };
+        let rows: &[(&[&str], Result<bool, UntrustRefused>)] = &[
+            (&[], Ok(false)),
+            (&["-y"], Ok(true)),
+            (&["--yes", "-y"], Ok(true)),
+            (&["--bogus"], Err(UntrustRefused::Unhandled)),
+            (&["-"], Err(UntrustRefused::Unhandled)),
+            (&["/x/ca.crt"], path("/x/ca.crt")),
+            (&["-y", "/x/ca.crt"], path("/x/ca.crt")),
+            (&["/x/ca.crt", "--bogus"], path("/x/ca.crt")),
+        ];
+        for (args, want) in rows {
+            let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            assert_eq!(&parse_untrust_ca(&argv), want, "untrust-ca {args:?}");
+        }
+        assert_eq!(ExitCode::Usage as i32, 2, "the path refusal exits 2, like the usage error");
     }
 }
