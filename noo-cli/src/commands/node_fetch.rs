@@ -4589,24 +4589,21 @@ mod user_writes_tests {
         include_str!("node_fetch.rs")
     }
 
-    fn body(name: &str) -> &'static str {
-        let s = src();
-        let at = s.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("fn {name} is gone"));
-        let rest = &s[at..];
-        &rest[..rest.find("\n}\n").unwrap()]
+    /// This file as guards read it (followup 215, `crate::test_src`):
+    /// comments blanked, every `#[cfg(test)]` item removed whole.
+    fn production_code() -> &'static str {
+        static CODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        CODE.get_or_init(|| crate::test_src::own_code(src()))
     }
 
-    /// The source without its `#[cfg(test)]` modules.
+    /// `fn <name>(` through its own closing brace; panics when it is gone.
+    fn body(name: &str) -> &'static str {
+        crate::test_src::fn_body(production_code(), &format!("fn {name}("))
+    }
+
+    /// The source without its `#[cfg(test)]` items, comments blanked.
     fn production() -> String {
-        let mut out = String::new();
-        let mut rest = src();
-        while let Some(at) = rest.find("#[cfg(test)]\nmod ") {
-            out.push_str(&rest[..at]);
-            let tail = &rest[at..];
-            rest = &tail[tail.find("\n}\n").map_or(tail.len(), |e| e + 3)..];
-        }
-        out.push_str(rest);
-        out
+        production_code().to_string()
     }
 
     /// H2 third review, L6: every child of the applier is spawned by `run`

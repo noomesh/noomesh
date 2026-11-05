@@ -84,6 +84,8 @@ mod shell_completion;
 #[cfg(test)]
 mod test_exec;
 #[cfg(test)]
+mod test_src;
+#[cfg(test)]
 mod test_support;
 #[cfg(test)]
 mod test_tls;
