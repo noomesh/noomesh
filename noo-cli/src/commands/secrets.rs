@@ -1230,6 +1230,63 @@ pub fn spec_for(key: &str) -> Option<&'static SecretSpec> {
     registry().find(|s| s.key == key)
 }
 
+/// [`spec_for`], or the family a key belongs to by its shape. Only the audit
+/// and the rotation plan ask this: `secrets remove` must keep treating an
+/// unused `NATS_NODE_PASSWORD_<NODE>` as removable (the audit's
+/// `node-password-unused` finding tells the operator to remove it).
+pub fn spec_or_family(key: &str) -> Option<&'static SecretSpec> {
+    spec_for(key).or_else(|| family_spec(key))
+}
+
+/// `NATS_NODE_PASSWORD_<NODE>`: one per node, so no static row can name
+/// them (see the note above `NATS_NODE_PASSWORD` in CORE_REGISTRY). They do
+/// have a rotation path, and the audit said "no rotation plan" for every
+/// node's key (pop-os onboarding, 2026-11-05). Recognised by shape here and
+/// NOT part of `registry()`, so nothing expects a literal key to exist.
+pub(crate) const NATS_NODE_FAMILY: SecretSpec = SecretSpec {
+    key: "NATS_NODE_PASSWORD_<NODE>",
+    class: Class::ExternalTool { tool: "noo cluster nats-creds rotate <node>" },
+    gen_bytes: 0,
+    consequence: "that node's bus principal. The server verifies a bcrypt digest of it and \
+                  the node holds the value (delivered over the rail): `noo cluster nats-creds \
+                  rotate <node>` mints, re-renders the digest, HUPs the server and delivers \
+                  it; `noo cluster provision` mints it when a node is born",
+    consumers: &["noo-nats"],
+    required_when: Requirement::Optional,
+};
+
+/// The spec a key belongs to by its SHAPE (a family), when no row names it.
+fn family_spec(key: &str) -> Option<&'static SecretSpec> {
+    let node = key.strip_prefix("NATS_NODE_PASSWORD_")?;
+    (!node.is_empty() && node.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'))
+        .then_some(&NATS_NODE_FAMILY)
+}
+
+/// Variables whose name looks like a credential but whose VALUE is a path to
+/// one, and the file-backed secret that holds the real thing. Exempt from
+/// the credential findings only while the value has a path's shape
+/// ([`path_shaped`]); key material under one of these names is an ERROR.
+pub(crate) const PATH_VALUED: &[(&str, &str)] = &[
+    // The gateway's TLS key FILE (…/pki/gateway/gateway.key); the key is
+    // issued and rotated by `noo security pki`.
+    ("NOO_TLS_KEY", "the gateway key file under the PKI dir (`noo security pki`)"),
+    // The legacy container path of a materialised Google Chat service-account
+    // key (gateway-rust google_auth.rs ENV_PATH); the key is the sops secret.
+    ("GOOGLE_CHAT_CREDENTIALS", "NOO_FILECRED_GOOGLE_CHAT_B64"),
+];
+
+/// Does `v` have a path's shape: absolute, one line, no whitespace, no PEM
+/// armour, and no component longer than a file name can be (a base64 key is
+/// one long run)? Reads the value; prints and keeps nothing of it.
+pub(crate) fn path_shaped(v: &str) -> bool {
+    let v = v.trim();
+    v.starts_with('/')
+        && v.len() <= 4096
+        && !v.contains("-----BEGIN")
+        && !v.chars().any(char::is_whitespace)
+        && v.split('/').all(|seg| seg.len() <= 255)
+}
+
 /// Registry entries whose value is DERIVED from `parent` and are therefore
 /// invalidated the instant it rotates.
 ///
@@ -1747,6 +1804,10 @@ pub struct AuditRow {
     pub class: Option<&'static str>,
     pub disposition: Option<&'static str>,
     pub credential_shaped: bool,
+    /// A [`PATH_VALUED`] name holding something that is not a path (key
+    /// material): the file-backed secret it should use. Derived from the
+    /// value's shape; the value itself is not kept.
+    pub key_material: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1790,7 +1851,15 @@ pub fn audit_rows(sops: &SecretStore, env: &SecretStore) -> Vec<AuditRow> {
             } else {
                 (env_state, env.value_len(k), env.sha8(k))
             };
-            let spec = spec_for(k);
+            let spec = spec_or_family(k);
+            // A path-valued name: exempt while its value is a path, an
+            // ERROR when it holds key material.
+            let authoritative = if in_sops { sops.get(k) } else { env.get(k) };
+            let path_valued = PATH_VALUED.iter().find(|(n, _)| *n == k.as_str());
+            let key_material = path_valued.and_then(|(_, use_instead)| {
+                authoritative.filter(|v| !v.trim().is_empty() && !path_shaped(v)).map(|_| *use_instead)
+            });
+            let exempt_path = path_valued.is_some() && key_material.is_none();
             AuditRow {
                 key: k.clone(),
                 in_sops,
@@ -1803,7 +1872,8 @@ pub fn audit_rows(sops: &SecretStore, env: &SecretStore) -> Vec<AuditRow> {
                 env_sha8: if in_sops && in_env { env.sha8(k) } else { None },
                 class: spec.map(|s| s.class.label()),
                 disposition: spec.map(|s| s.class.disposition()),
-                credential_shaped: spec.is_some() || looks_like_credential(k),
+                credential_shaped: spec.is_some() || (looks_like_credential(k) && !exempt_path),
+                key_material,
             }
         })
         .collect()
@@ -1946,6 +2016,18 @@ pub fn audit_findings(
                         .into(),
                 });
             }
+        }
+        // (4b) Key material under a name that must hold a path: louder than
+        // an unclassified credential, it is a secret in the wrong place.
+        if let Some(use_instead) = r.key_material {
+            out.push(Finding {
+                severity: Severity::Error,
+                kind: "key-material-not-a-path",
+                key: r.key.clone(),
+                message: format!("{} holds key material, not a path; use the file-backed secret \
+                                  ({use_instead}) and set {} to its path, or remove it",
+                    r.key, r.key),
+            });
         }
         // (5) A credential-shaped key with no rotation plan.
         if r.credential_shaped && r.class.is_none() {
@@ -2147,6 +2229,7 @@ fn audit_json(
             "class": r.class,
             "rotation": r.disposition,
             "credential_shaped": r.credential_shaped,
+            "key_material": r.key_material.is_some(),
         })).collect::<Vec<_>>(),
         "findings": findings.iter().map(|f| serde_json::json!({
             "severity": f.severity.label().to_ascii_lowercase(),
@@ -2503,7 +2586,7 @@ pub fn build_plan(
 ) -> Vec<PlanItem> {
     keys.iter()
         .map(|key| {
-            let spec = spec_for(key);
+            let spec = spec_or_family(key);
             let from_stdin = stdin_key == Some(key.as_str());
             let mut refusal = None;
             let (class_label, disposition, consequence, consumers) = match spec {
@@ -8465,4 +8548,66 @@ mod clifix_security_tests {
         assert!(super::pins_in(&std::collections::BTreeMap::new(), &keys).is_empty());
     }
 
+}
+
+#[cfg(test)]
+mod audit_classify_tests {
+    use super::{audit_findings, audit_rows, path_shaped, registry, spec_for, spec_or_family, Class, SecretStore, Severity};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    fn audit(sops: &[(&str, &str)], env: &[(&str, &str)]) -> Vec<super::Finding> {
+        let m = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>();
+        let sops = SecretStore::from_map(m(sops), PathBuf::from("/f/secrets/env.sops"), true);
+        let env = SecretStore::from_map(m(env), PathBuf::from("/f/.env"), true);
+        audit_findings(&audit_rows(&sops, &env), true, &|_| false)
+    }
+
+    /// pop-os onboarding 2026-11-05: every node's password, the TLS key path
+    /// and the Google Chat key path read "unclassified-credential: no
+    /// rotation plan". A node password has one (nats-creds rotate); the
+    /// other two hold paths.
+    #[test]
+    fn node_passwords_and_path_valued_names_are_not_unclassified() {
+        let f = audit(&[("NATS_NODE_PASSWORD_HOST8", "pw8"), ("NATS_NODE_PASSWORD_POP_OS", "pwp")],
+                      &[("NOO_TLS_KEY", "/var/lib/noo/state/pki/gateway/gateway.key"),
+                        ("GOOGLE_CHAT_CREDENTIALS", "/app/google-chat-sa-key.json")]);
+        for k in ["NATS_NODE_PASSWORD_HOST8", "NATS_NODE_PASSWORD_POP_OS", "NOO_TLS_KEY", "GOOGLE_CHAT_CREDENTIALS"] {
+            assert!(!f.iter().any(|x| x.key == k && matches!(x.kind, "unclassified-credential" | "credential-in-env" | "key-material-not-a-path")),
+                "{k}: {f:?}");
+        }
+        // The rule still bites for an unknown credential.
+        let f = audit(&[("SOME_UNKNOWN_TOKEN", "t")], &[]);
+        assert!(f.iter().any(|x| x.kind == "unclassified-credential" && x.key == "SOME_UNKNOWN_TOKEN"));
+    }
+
+    /// A node password is the family, rotated by nats-creds; nothing expects
+    /// a literal key, and `secrets remove` still sees no registered spec.
+    #[test]
+    fn a_node_password_belongs_to_the_nats_family() {
+        let s = spec_or_family("NATS_NODE_PASSWORD_HOST8").expect("the family");
+        assert!(matches!(s.class, Class::ExternalTool { tool: "noo cluster nats-creds rotate <node>" }));
+        assert_eq!(s.gen_bytes, 0, "this tool never mints one");
+        assert!(spec_or_family("NATS_NODE_PASSWORD_").is_none());
+        assert!(spec_or_family("NATS_NODE_PASSWORD_host8").is_none(), "keys are upper case");
+        assert!(spec_for("NATS_NODE_PASSWORD_HOST8").is_none(), "removal of an unused one stays allowed");
+        assert!(!registry().any(|s| s.key == "NATS_NODE_PASSWORD_<NODE>"), "no registry row to find absent");
+    }
+
+    /// Exempt only while the value is a path: key material under either
+    /// name is an ERROR naming the file-backed secret, never the value.
+    #[test]
+    fn key_material_under_a_path_name_is_an_error() {
+        let pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END PRIVATE KEY-----";
+        let blob = "/".to_string() + &"A".repeat(400);
+        let f = audit(&[("NOO_TLS_KEY", pem), ("GOOGLE_CHAT_CREDENTIALS", "{\"type\":\"service_account\"}")], &[]);
+        for (k, names) in [("NOO_TLS_KEY", "noo security pki"), ("GOOGLE_CHAT_CREDENTIALS", "NOO_FILECRED_GOOGLE_CHAT_B64")] {
+            let e = f.iter().find(|x| x.key == k && x.kind == "key-material-not-a-path").unwrap_or_else(|| panic!("{k}: {f:?}"));
+            assert_eq!(e.severity, Severity::Error);
+            assert!(e.message.contains("holds key material, not a path") && e.message.contains(names), "{}", e.message);
+            assert!(!e.message.contains("BEGIN") && !e.message.contains("service_account"), "never the value");
+        }
+        assert!(path_shaped("/var/lib/noo/state/pki/gateway/gateway.key"));
+        assert!(!path_shaped(pem) && !path_shaped("relative/key") && !path_shaped(&blob) && !path_shaped("/a b"));
+    }
 }
