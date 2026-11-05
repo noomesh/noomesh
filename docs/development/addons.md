@@ -636,7 +636,9 @@ answers `{"uis": [{"addon", "title", "port", "url_base", "can_open"}]}`: a
 User sees the UIs its role may open, an Operator or Admin sees all of them.
 The console's **Add-ons** tab lists them with an **Open** button.
 
-For `pai-voice`, **Open** goes to `https://<console DNS>/voice-space`. This
+Set `compose_env.NOO_VOICE_SPACE_ADDON` in `noomesh.yaml` to the chosen add-on
+ID (for example `rhaddon`), then recreate the gateway to apply it. Bookmark
+`https://<console DNS>/voice-space`. This
 console-owned page embeds the voice UI on its assigned isolated origin; it does
 not proxy add-on scripts onto the console origin. Sign in and select **Open
 voice**. The address bar remains `/voice-space`, while the assigned add-on port

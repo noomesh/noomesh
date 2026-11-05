@@ -20,14 +20,17 @@ export function voiceFrameUrl(value: string, here: Location): URL {
 /** The address bar stays on /voice-space; no console bearer crosses the frame. */
 export function VoiceSpace() {
   const { ready, isLoggedIn, user } = useAuth();
+  const addon = document.querySelector<HTMLMetaElement>('meta[name="noo-voice-space-addon"]')?.content;
   return <>
     <LoginOverlay />
     {!ready && <p role="status">Connecting…</p>}
-    {ready && isLoggedIn && user && <AuthenticatedVoiceSpace key={user.username} />}
+    {ready && isLoggedIn && user && (addon
+      ? <AuthenticatedVoiceSpace key={user.username} addon={addon} />
+      : <p role="status">No voice workspace is configured.</p>)}
   </>;
 }
 
-function AuthenticatedVoiceSpace() {
+function AuthenticatedVoiceSpace({ addon }: { addon: string }) {
   const open = useOpenAddonUi();
   const [frame, setFrame] = useState<{ url: string; origin: string } | null>(null);
   const [error, setError] = useState('');
@@ -37,7 +40,7 @@ function AuthenticatedVoiceSpace() {
     setError('');
     setFrame(null);
     try {
-      const url = voiceFrameUrl(await open.mutateAsync('pai-voice'), window.location);
+      const url = voiceFrameUrl(await open.mutateAsync(addon), window.location);
       setFrame({ url: url.href, origin: url.origin });
     } catch (e) {
       setError((e as Error).message || 'Voice Space could not open.');
