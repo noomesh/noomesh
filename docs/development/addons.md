@@ -643,6 +643,21 @@ answers `{"uis": [{"addon", "title", "port", "url_base", "can_open"}]}`: a
 User sees the UIs its role may open, an Operator or Admin sees all of them.
 The console's **Add-ons** tab lists them with an **Open** button.
 
+For `pai-voice`, **Open** goes to `https://<console DNS>/voice-space`. This
+console-owned page embeds the voice UI on its assigned isolated origin; it does
+not proxy add-on scripts onto the console origin. Sign in and select **Open
+voice**. The address bar remains `/voice-space`, while the assigned add-on port
+must still be reachable. Only this shell delegates microphone permission to
+that exact origin. A custom `NOO_CSP` is respected; it must permit that origin
+in `frame-src` if the operator wants to embed it. Reload/reconnect obtains a new
+one-use handoff, and console logout removes the frame.
+
+The disposable browser check (`scripts/check_voice_space_browser.py`, after
+building `ui/apps/web`, with Playwright/Chromium installed) exercises real
+loopback HTTPS navigation, cookie binding, origin isolation, microphone
+permission, a synthetic WebSocket roundtrip, reload and logout. It does not
+exercise a deployed gateway or GPU model.
+
 **Session handoff.**
 
 1. The console calls `POST /api/addons/<name>/ui-session` on its own origin
@@ -655,8 +670,9 @@ The console's **Add-ons** tab lists them with an **Open** button.
    the browser that minted the code presents it on your origin; any other
    browser does not have it.
 2. The console opens `url` (`https://<host>:<port>/__noo/session?code=…`) in
-   a new tab. Your origin redeems the code only when the binding cookie
-   matches and the request is a top-level navigation no other site started
+   a new tab (or the console-owned Voice Space iframe). Your origin redeems
+   the code only when the binding cookie matches and it is a navigation no
+   other site started
    (no foreign `Origin`, no `Sec-Fetch-Site: cross-site`, `Sec-Fetch-Mode:
    navigate` when the browser sends it). It sets its own cookie
    `noo_ui_<name>` (HttpOnly, Secure, SameSite=Strict, host-only, `Path=/`).
