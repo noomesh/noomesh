@@ -42,7 +42,11 @@ func newTestReporter(t *testing.T, serverURL string, cfg *config.Config) *Report
 	}
 	gpu := hardware.NewGPUDetector(nil, "http")
 	coll := metrics.NewCollector(gpu)
-	return NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, coll, gpu,
+	// The identity probe is scripted (a clean "no GPU" answer), never the
+	// host's nvidia-smi: on a GPU host whose probe errors, gpu_model and
+	// vram_gb are omitted (i495), which made the key-set golden depend on
+	// the machine running the test.
+	return NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, coll, &scriptedGPU{},
 		func() (map[string]string, error) { return map[string]string{}, nil },
 		func() int { return 0 },
 	)
