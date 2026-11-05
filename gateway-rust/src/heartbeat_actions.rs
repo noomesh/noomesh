@@ -3500,6 +3500,25 @@ fn resolve_workspace_dir(state: &crate::state::AppState) -> String {
 
 /// Render one section of the log. Never fails the action: a section that
 /// cannot be gathered renders its own error inline, matching the original.
+/// The digest's "errors" section. A failed read names the read and its
+/// error (i460): "Scheduler not available." blamed a scheduler that was
+/// running, for a database it could not read.
+fn errors_section_text(rows: Result<Vec<(Option<String>, Option<String>, Option<String>)>, sqlx::Error>) -> String {
+    match rows {
+        Err(e) => format!("Recent errors not checked: cannot read noo_heartbeat_runs: {e}"),
+        Ok(r) if r.is_empty() => "No recent errors.".to_string(),
+        Ok(r) => r
+            .iter()
+            .map(|(ts, name, err)| {
+                let err = err.clone().unwrap_or_default();
+                let err: String = err.chars().take(200).collect();
+                format!("- **{}** `{}`: {err}", ts.clone().unwrap_or_default(), name.clone().unwrap_or_default(),)
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
 async fn gather_section(state: &crate::state::AppState, section: &str) -> String {
     match section {
         "cluster" => match cluster_nodes(state).await {
@@ -3576,23 +3595,7 @@ async fn gather_section(state: &crate::state::AppState, section: &str) -> String
                 )
                 .fetch_all(&state.db)
                 .await;
-            match rows {
-                Err(_) => "Scheduler not available.".to_string(),
-                Ok(r) if r.is_empty() => "No recent errors.".to_string(),
-                Ok(r) => r
-                    .iter()
-                    .map(|(ts, name, err)| {
-                        let err = err.clone().unwrap_or_default();
-                        let err: String = err.chars().take(200).collect();
-                        format!(
-                            "- **{}** `{}`: {err}",
-                            ts.clone().unwrap_or_default(),
-                            name.clone().unwrap_or_default(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            }
+            errors_section_text(rows)
         }
         "backends" => match local_get(state, "/api/cluster/backends").await {
             Err(e) => format!("Error fetching backend data: {e}"),
@@ -4952,7 +4955,12 @@ async fn action_self_benchmark(
             std::time::Duration::from_secs(timeout_secs),
             crate::bus_principal::with_principal(
         crate::bus_principal::unattended_principal(crate::heartbeat_actions::HEARTBEAT_CONVERSATION_OWNER),
-        crate::coordinator::run(
+        // Thinking OFF, as every unattended turn: the benchmark scores
+        // latency and keyword hits on trivial prompts under a short timeout.
+        // Think tokens would inflate the latency it reports, and on gemma-4
+        // the non-streaming path returns the bare `thought` prefix inside the
+        // answer it scores (the weekly_research failure, 2026-09-27).
+        crate::coordinator::run_with_thinking(
                 state,
                 prompt,
                 &conversation_id,
@@ -4960,6 +4968,7 @@ async fn action_self_benchmark(
                 5, // benchmark prompts are single-step; a small cap bounds cost
                 None,
                 Some(HEARTBEAT_CONVERSATION_OWNER),
+                false,
             ),
     ),
         )
@@ -5932,6 +5941,47 @@ mod db_read_error_tests {
         assert!(clean.ends_with("✅ Nothing notable — all systems clean.\n"), "{clean}");
         let found = finish_self_check("# digest\n".into(), true, &[]).unwrap();
         assert!(!found.contains("Nothing notable"), "{found}");
+    }
+}
+
+#[cfg(test)]
+mod i460_followup_tests {
+    use super::*;
+
+    /// i460: a failed read of the errors section names the read, never a
+    /// scheduler that was running.
+    #[test]
+    fn the_errors_section_names_a_failed_read() {
+        let t = errors_section_text(Err(sqlx::Error::PoolTimedOut));
+        assert!(t.starts_with("Recent errors not checked: cannot read noo_heartbeat_runs: "), "{t}");
+        assert!(!t.contains("Scheduler"), "{t}");
+        assert_eq!(errors_section_text(Ok(Vec::new())), "No recent errors.");
+    }
+
+    /// The benchmark is an unattended turn: thinking off, through
+    /// run_with_thinking, never the bare run (which thinks).
+    #[test]
+    fn the_self_benchmark_runs_with_thinking_off() {
+        let code = crate::test_src::own_code(include_str!("heartbeat_actions.rs"));
+        let body = crate::test_src::fn_body(&code, "async fn action_self_benchmark(");
+        assert!(!body.contains("coordinator::run("), "the bare run thinks");
+        let call = body.split("coordinator::run_with_thinking(").nth(1).expect("run_with_thinking is called");
+        // The call's own arguments, up to its matching parenthesis.
+        let mut depth = 1;
+        let end = call
+            .char_indices()
+            .find(|&(_, c)| {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            })
+            .map(|(i, _)| i)
+            .expect("the call closes");
+        let args = &call[..end];
+        assert_eq!(args.rsplit(',').map(str::trim).find(|a| !a.is_empty()), Some("false"), "{args}");
     }
 }
 

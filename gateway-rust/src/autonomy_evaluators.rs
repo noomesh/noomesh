@@ -3440,6 +3440,12 @@ mod tests {
 ///
 /// One query, LEFT JOIN, both counts. `to_regclass` guards make it a clean
 /// no-op on an OSS install, where neither table exists.
+/// The OSS case of [`eval_cross_domain_link_integrity`]: the tables are not
+/// there at all (Postgres 42P01), and nothing else.
+fn link_integrity_tables_absent(e: &sqlx::Error) -> bool {
+    crate::repo::missing_table(e)
+}
+
 pub async fn eval_cross_domain_link_integrity(state: &AppState) -> Result<bool, String> {
     let row: Option<(i64, i64)> = sqlx::query_as(
         "SELECT count(*) FILTER (WHERE e.source_cycle_id IS NOT NULL),
@@ -3454,8 +3460,10 @@ pub async fn eval_cross_domain_link_integrity(state: &AppState) -> Result<bool, 
     .map_err(|e| {
         // An OSS install has neither table and the FROM clause itself fails
         // before the guard can help — that is fine and expected, not an
-        // error worth a warn-level log every hour.
-        if e.to_string().contains("does not exist") {
+        // error worth a warn-level log every hour. Only 42P01: a missing
+        // COLUMN ("column ... does not exist", 42703) is a schema fault to
+        // report, which the old substring test read as a missing table.
+        if link_integrity_tables_absent(&e) {
             return String::new();
         }
         format!("cross-domain link query failed: {e}")
@@ -4488,3 +4496,53 @@ mod node_disk_read_tests {
         assert!(body.contains("online_node_ids(&state.db).await?"), "{body}");
     }
 }
+
+#[cfg(test)]
+mod link_integrity_error_tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    /// A Postgres error with a code and a message, as sqlx surfaces one.
+    #[derive(Debug)]
+    struct PgFake(&'static str, &'static str);
+    impl std::fmt::Display for PgFake {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.1)
+        }
+    }
+    impl std::error::Error for PgFake {}
+    impl sqlx::error::DatabaseError for PgFake {
+        fn message(&self) -> &str {
+            self.1
+        }
+        fn code(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed(self.0))
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn pg(code: &'static str, msg: &'static str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(PgFake(code, msg)))
+    }
+
+    /// i460: only a missing table is the OSS no-op. A missing column says
+    /// "does not exist" too, and is a schema fault that must be reported.
+    #[test]
+    fn a_missing_column_is_not_read_as_missing_tables() {
+        assert!(link_integrity_tables_absent(&pg("42P01", "relation \"noo_temporal_edges\" does not exist")));
+        assert!(!link_integrity_tables_absent(&pg("42703", "column e.source_cycle_id does not exist")));
+        assert!(!link_integrity_tables_absent(&pg("42883", "function to_regclass(unknown) does not exist")));
+    }
+}
+
