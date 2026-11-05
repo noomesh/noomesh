@@ -1,0 +1,13 @@
+{
+  "providers": [
+    {
+      "id": "google",
+      "name": "Google",
+      "services": ["google_drive", "gmail"],
+      "authorization_available": false,
+      "authorization_detail": "Google sign-in is not available yet. Prepare your accounts and sources now; sign-in will be required before any Google data is accessed."
+    }
+  ],
+  "accounts": [],
+  "sources": []
+}
