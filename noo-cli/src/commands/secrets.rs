@@ -6122,7 +6122,12 @@ mod tests {
         let src = crate::test_src::own_code(include_str!("secrets.rs"));
         let body = crate::test_src::fn_body(&src, "pub fn secrets_rotate(");
         let check = body.find("install_secrets_floor_refusal()").expect("rotate no longer checks the secrets floor");
-        for mutation in ["psql_stdin(", ".commit(&sops_path)", "confirm_destructive(", "Phase 1: mint"] {
+        // Phase 1 (minting) is anchored on its code, not the comment that
+        // names it (comments are blanked, followup 215): the map the new
+        // values go into, and the generator itself.
+        for mutation in ["psql_stdin(", ".commit(&sops_path)", "confirm_destructive(",
+                         "let mut new_values: BTreeMap<String, String> = BTreeMap::new();",
+                         "super::security_local::token_urlsafe(n)"] {
             let at = body.find(mutation).unwrap_or_else(|| panic!("{mutation} not found in secrets_rotate — update this test"));
             assert!(check < at, "the secrets-floor check comes AFTER `{mutation}` in secrets_rotate");
         }
