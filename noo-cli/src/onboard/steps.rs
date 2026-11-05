@@ -5016,8 +5016,22 @@ fn restore_archive_db(ctx: &Ctx, dump: &Path, marker: &Path) -> Result<Vec<Strin
     let login = if from_file {
         mdb::login_roles(&script)
     } else {
-        let carried = archive_root.map(|d| d.join("home/noomesh.yaml")).and_then(|p| std::fs::read_to_string(p).ok());
-        mdb::fallback_login_roles(mdb::declared_on(carried.as_deref(), "evolve"))
+        let carried = match archive_root.map(|d| d.join("home/noomesh.yaml")) {
+            Some(p) => match std::fs::read_to_string(&p) {
+                Ok(t) => Ok(Some(t)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(format!("{}: {e}", p.display())),
+            },
+            None => Ok(None),
+        };
+        let evolve_on = match carried.and_then(|t| mdb::declared_on(t.as_deref(), "evolve")) {
+            Ok(on) => on,
+            Err(e) => {
+                ctx.warn(&format!("Could not read the archive's add-on declaration: {e}; evolve roles not checked"));
+                false
+            }
+        };
+        mdb::fallback_login_roles(evolve_on)
     };
     let no_password = mdb::roles_without_password(&created, &login);
     let rest: Vec<String> = created.iter().filter(|r| !no_password.contains(*r)).cloned().collect();
