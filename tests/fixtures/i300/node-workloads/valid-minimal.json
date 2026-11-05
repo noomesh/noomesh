@@ -1,0 +1,31 @@
+{
+  "format": "noo-addon-node-workloads/1",
+  "workloads": [
+    {
+      "name": "echo",
+      "image": "addon-worker",
+      "uid": 1000,
+      "port": 8080,
+      "protocols": [
+        "http"
+      ],
+      "health": {
+        "ready": "/ready",
+        "live": "/live",
+        "start_secs": 10
+      },
+      "drain": {
+        "path": "/drain",
+        "timeout_secs": 30
+      },
+      "accel": {
+        "gpu": 0
+      },
+      "limits": {
+        "ram_mb": 256,
+        "cpus": 0.5,
+        "pids": 64
+      }
+    }
+  ]
+}

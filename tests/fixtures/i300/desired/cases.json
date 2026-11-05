@@ -1,0 +1,197 @@
+[
+  {
+    "file": "valid-provisioned.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "valid-running.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "valid-absent.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "valid-optional-slot-empty.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "valid-empty.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "refuse-trailing-data.json",
+    "valid": false,
+    "code": "desired_invalid"
+  },
+  {
+    "file": "refuse-unknown-field.json",
+    "valid": false,
+    "code": "desired_invalid"
+  },
+  {
+    "file": "refuse-missing-key.json",
+    "valid": false,
+    "code": "desired_invalid"
+  },
+  {
+    "file": "refuse-state.json",
+    "valid": false,
+    "code": "desired_invalid"
+  },
+  {
+    "file": "refuse-reservation-not-uuid.json",
+    "valid": false,
+    "code": "desired_invalid"
+  },
+  {
+    "file": "refuse-reservation-uppercase-uuid.json",
+    "valid": false,
+    "code": "desired_invalid"
+  },
+  {
+    "file": "refuse-name-differs-from-decl.json",
+    "valid": false,
+    "code": "desired_invalid"
+  },
+  {
+    "file": "refuse-start-secs-differs.json",
+    "valid": false,
+    "code": "desired_invalid"
+  },
+  {
+    "file": "refuse-decl-uid-zero.json",
+    "valid": false,
+    "code": "decl_invalid"
+  },
+  {
+    "file": "refuse-decl-unknown-field.json",
+    "valid": false,
+    "code": "decl_invalid"
+  },
+  {
+    "file": "refuse-decl-env-prefix.json",
+    "valid": false,
+    "code": "decl_invalid"
+  },
+  {
+    "file": "refuse-image-digest-malformed.json",
+    "valid": false,
+    "code": "image_missing"
+  },
+  {
+    "file": "refuse-image-digest-empty.json",
+    "valid": false,
+    "code": "image_missing"
+  },
+  {
+    "file": "refuse-image-name-differs.json",
+    "valid": false,
+    "code": "image_missing"
+  },
+  {
+    "file": "refuse-door-absent.json",
+    "valid": false,
+    "code": "door_leaf_missing"
+  },
+  {
+    "file": "refuse-door-leaf-empty.json",
+    "valid": false,
+    "code": "door_leaf_missing"
+  },
+  {
+    "file": "refuse-door-leaf-wrong-name.json",
+    "valid": false,
+    "code": "desired_invalid"
+  },
+  {
+    "file": "refuse-admit-two.json",
+    "valid": false,
+    "code": "admit_invalid"
+  },
+  {
+    "file": "refuse-admit-other-cn.json",
+    "valid": false,
+    "code": "admit_invalid"
+  },
+  {
+    "file": "refuse-admit-empty.json",
+    "valid": false,
+    "code": "admit_invalid"
+  },
+  {
+    "file": "refuse-admit-gateway-only.json",
+    "valid": false,
+    "code": "admit_invalid"
+  },
+  {
+    "file": "refuse-env-above-max.json",
+    "valid": false,
+    "code": "env_out_of_bounds"
+  },
+  {
+    "file": "refuse-env-below-min.json",
+    "valid": false,
+    "code": "env_out_of_bounds"
+  },
+  {
+    "file": "refuse-env-not-integer.json",
+    "valid": false,
+    "code": "env_out_of_bounds"
+  },
+  {
+    "file": "refuse-env-plus-sign.json",
+    "valid": false,
+    "code": "env_out_of_bounds"
+  },
+  {
+    "file": "refuse-env-not-in-enum.json",
+    "valid": false,
+    "code": "env_out_of_bounds"
+  },
+  {
+    "file": "refuse-env-fixed-bool-true.json",
+    "valid": false,
+    "code": "env_out_of_bounds"
+  },
+  {
+    "file": "refuse-env-undeclared-key.json",
+    "valid": false,
+    "code": "env_out_of_bounds"
+  },
+  {
+    "file": "refuse-env-value-not-string.json",
+    "valid": false,
+    "code": "desired_invalid"
+  },
+  {
+    "file": "refuse-set-missing-required.json",
+    "valid": false,
+    "code": "set_missing"
+  },
+  {
+    "file": "refuse-set-empty-required.json",
+    "valid": false,
+    "code": "set_missing"
+  },
+  {
+    "file": "refuse-set-slot-unknown.json",
+    "valid": false,
+    "code": "set_slot_invalid"
+  },
+  {
+    "file": "refuse-set-many-on-single.json",
+    "valid": false,
+    "code": "set_slot_invalid"
+  },
+  {
+    "file": "refuse-set-revision-dotdot.json",
+    "valid": false,
+    "code": "set_slot_invalid"
+  }
+]
