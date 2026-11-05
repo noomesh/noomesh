@@ -153,17 +153,19 @@ pub async fn json_response<T: serde::de::DeserializeOwned>(
         data.extend_from_slice(&chunk);
     }
     if !response.status().is_success() {
-        let value: serde_json::Value = serde_json::from_slice(&data).unwrap_or_default();
         // Only fixed OAuth error categories may enter logs. Provider details
         // can echo request material and must never be logged or returned.
-        let category = match value.get("error").and_then(|e| e.as_str()) {
-            Some("invalid_client") => "invalid_client",
-            Some("invalid_request") => "invalid_request",
-            Some("invalid_grant") => "invalid_grant",
-            Some("invalid_scope") => "invalid_scope",
-            Some("access_denied") => "access_denied",
-            Some("unauthorized_client") => "unauthorized_client",
-            _ => "unknown",
+        // A body that is not JSON (a proxy page, a cut read) says so.
+        let value = serde_json::from_slice::<serde_json::Value>(&data);
+        let category = match value.as_ref().map(|v| v.get("error").and_then(|e| e.as_str())) {
+            Err(_) => "not_json",
+            Ok(Some("invalid_client")) => "invalid_client",
+            Ok(Some("invalid_request")) => "invalid_request",
+            Ok(Some("invalid_grant")) => "invalid_grant",
+            Ok(Some("invalid_scope")) => "invalid_scope",
+            Ok(Some("access_denied")) => "access_denied",
+            Ok(Some("unauthorized_client")) => "unauthorized_client",
+            Ok(_) => "unknown",
         };
         tracing::warn!(
             status = response.status().as_u16(),

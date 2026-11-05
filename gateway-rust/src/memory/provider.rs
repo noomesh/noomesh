@@ -250,8 +250,8 @@ async fn kb_reply_with_personal(
     let refused = requested && crate::integrations::content::requester_account(
         &crate::bus_principal::current()).is_none();
     let evidence = if requested && !refused {
-        personal.await.unwrap_or_else(|_| {
-            tracing::warn!("private retrieval unavailable; preserving shared results");
+        personal.await.unwrap_or_else(|error| {
+            tracing::warn!(error = %error.log_cause(), "private retrieval unavailable; preserving shared results");
             json!({"items":[],"unavailable":true})
         })
     } else {
@@ -261,7 +261,10 @@ async fn kb_reply_with_personal(
     let mut reply = match shared.await {
         Ok(reply) => reply,
         Err(error) if private.is_empty() => return Err(error),
-        Err(_) => json!({"data":{"answer":"","citations":[],"shared_kb_unavailable":true}}),
+        Err(error) => {
+            tracing::warn!(error = %error, "shared knowledge base unavailable; answering from personal sources only");
+            json!({"data":{"answer":"","citations":[],"shared_kb_unavailable":true}})
+        }
     };
     if requested {
         let payload = if reply.get("data").is_some() { &mut reply["data"] } else { &mut reply };
