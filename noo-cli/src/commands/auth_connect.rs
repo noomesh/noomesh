@@ -267,13 +267,11 @@ pub fn auth_connect(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             }
             Ok(0)
         }
-        Err(detail) => crate::output::fail(
-            g.json,
-            crate::output::ExitCode::Generic,
-            "auth_connect_failed",
-            &detail,
-            None,
-        ),
+        Err(detail) => {
+            // MUTANT: bare stderr text, even under --json.
+            eprintln!("{detail}");
+            Ok(1)
+        }
     }
 }
 
