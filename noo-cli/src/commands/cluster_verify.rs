@@ -7251,6 +7251,7 @@ mod tests {
             "harness_policy": "auto",
             "host_services": { "harness": { "state": "running" } },
             "self_node": false,
+            "lanes": [{ "backend": "ollama", "model": "gemma4:12b", "role": "chat", "state": "serving", "reason": "" }],
         })
     }
 
@@ -7979,7 +7980,9 @@ mod tests {
         let c = node_checks(&healthy(now), "v0.2.70", "0.5.57", now, Some(true));
         let failed: Vec<_> = c.iter().filter(|c| c.verdict == Verdict::Fail).map(|c| c.name).collect();
         assert!(failed.is_empty(), "{failed:?}");
-        assert_eq!(c.len(), 22, "sixteen node invariants (the log shipper, peer identity, control over bus, streaming over tunnel, backend doors, vendor telemetry, backend images and data root among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
+        assert_eq!(c.len(), 23, "seventeen node invariants (the log shipper, peer identity, control over bus, streaming over tunnel, backend doors, vendor telemetry, backend images, data root and lanes among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
+        let lanes = c.iter().find(|c| c.name == "lanes").expect("the lanes row");
+        assert_eq!((lanes.verdict, lanes.detail.as_str()), (Verdict::Ok, "1 chat lane(s): 1 serving, 0 on demand"));
     }
 
     /// The door refusals ride the heartbeat as `backend_tls` (refused to
