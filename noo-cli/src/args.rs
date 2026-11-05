@@ -393,6 +393,7 @@ mod tests {
             row(&["cluster", "gpu", "mode"], |a| { let _ = cluster_gpu_mode::parse_gpu_mode_with(a); }),
             row(&["addons", "features"], |a| { let _ = addon_access::parse_features_with(a); }),
             row(&["addons", "set-access"], |a| { let _ = addon_access::parse_set_access_with(a); }),
+            row(&["addons", "accept-suggestions"], |a| { let _ = addon_access::parse_accept_suggestions_with(a); }),
             row(&["addons", "access"], |a| { let _ = addon_access::parse_access_with(a); }),
             row(&["security", "user", "super-admin"], |a| { let _ = security::parse_super_admin_with(a); }),
         ];

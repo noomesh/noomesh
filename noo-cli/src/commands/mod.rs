@@ -439,7 +439,7 @@ pub use release_sign::*;
 pub use addon_lock_cmd::{security_addon_lock_sign, security_addon_lock_verify};
 pub use addon_pins::{addons_launch_pins, addons_upgrade, addons_verify};
 pub use addon_resources::{addons_launch_resources, addons_rotate_secret};
-pub use addon_access::{addons_access, addons_features, addons_set_access};
+pub use addon_access::{addons_accept_suggestions, addons_access, addons_features, addons_set_access};
 pub use addons::{addons_check, addons_disable, addons_enable, addons_list, addons_registry_login, addons_set, addons_show, addons_trust_key, addons_untrust_key};
 pub use backups::{backups_setup, backups_status};
 pub use kiosk::*;
