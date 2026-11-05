@@ -371,7 +371,11 @@ pub async fn query_loki(client: &reqwest::Client, loki_url: &str, q: &BuiltQuery
         .await;
     match sent {
         Ok(resp) if resp.status().is_success() => {
-            let body = resp.text().await.unwrap_or_default();
+            // A body cut off mid-transfer is Loki being down, not a parse error.
+            let body = match crate::upstream_body::text_2xx(resp, "Loki").await {
+                Ok(b) => b,
+                Err(e) => return LokiOutcome::Down(e),
+            };
             match parse_query_range(&body, q.direction) {
                 Ok(mut lines) => {
                     lines.truncate(q.limit);

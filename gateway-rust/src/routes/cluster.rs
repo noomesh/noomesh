@@ -2182,7 +2182,10 @@ async fn clean_node(
 
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
-            let mut result = resp.json::<Value>().await.unwrap_or(json!({}));
+            // An unreadable answer is an error, never a bare `{"status":"ok"}`.
+            let mut result = crate::upstream_body::json_2xx(resp, &format!("node {node_id}"))
+                .await
+                .map_err(AppError::Upstream)?;
             result["status"] = json!("ok");
             tracing::info!(node_id = %node_id, "node cleaned");
             Ok(Json(result))

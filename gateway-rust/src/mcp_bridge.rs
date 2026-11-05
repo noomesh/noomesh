@@ -279,8 +279,10 @@ pub async fn call(state: &AppState, user: Option<&str>, server: &str, tool: &str
             .timeout(std::time::Duration::from_secs(130));
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {
-                let body: Value = resp.json().await.unwrap_or(json!({}));
-                let out = flatten_result(&body);
+                // Not retried on the next node: the call may have run.
+                let out = crate::upstream_body::json_2xx(resp, &format!("'{server}' on {node}"))
+                    .await
+                    .and_then(|body| flatten_result(&body));
                 record(state, server, tool, user, out.is_ok(), started).await;
                 return out;
             }

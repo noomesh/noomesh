@@ -1016,7 +1016,11 @@ async fn native_python_exec(call: &ToolCall, args: &Value) -> ToolResult {
         .await
     {
         Ok(resp) if resp.status().is_success() => {
-            let payload: Value = resp.json().await.unwrap_or(json!({}));
+            // A cut-off or non-JSON 2xx is an error, never "(no output)".
+            let payload = match crate::upstream_body::json_2xx(resp, "the sandbox").await {
+                Ok(p) => p,
+                Err(e) => return err_result(call, e),
+            };
             let output = payload
                 .get("output")
                 .and_then(|o| o.as_str())

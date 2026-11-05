@@ -199,7 +199,7 @@ async fn actuator(link: &crate::node_link::NodeLink, decl: &crate::addon_workloa
     let method = if op.is_empty() { reqwest::Method::GET } else { reqwest::Method::POST };
     let req = link.request(method, &actuator_path(decl, op)).json(&body).timeout(std::time::Duration::from_secs(wait_secs));
     match req.send().await {
-        Ok(resp) if resp.status().is_success() => Ok(resp.json::<Value>().await.unwrap_or(json!({}))),
+        Ok(resp) if resp.status().is_success() => crate::upstream_body::json_2xx(resp, &format!("the {} workload actuator", decl.name)).await,
         Ok(resp) => {
             let status = resp.status().as_u16();
             let v = resp.json::<Value>().await.unwrap_or(json!({}));
@@ -883,5 +883,14 @@ mod tests {
         let relay = crate::test_src::fn_body(&own, "async fn relay_websocket(");
         assert!(relay.contains("CLOSE_RESERVATION_ENDED"), "a relayed stream closes with the reservation");
         assert_eq!(CLOSE_RESERVATION_ENDED, 4001);
+    }
+
+    /// i460: an actuator 200 cut off mid-body is an error naming the
+    /// workload, never `{}` handed to the caller as the agent's answer.
+    #[tokio::test]
+    async fn a_cut_off_actuator_answer_is_an_error_not_an_empty_object() {
+        let link = crate::node_link::NodeLink::for_base(&crate::upstream_body::stub_cut_short().await);
+        let e = actuator(&link, &decl(true, 1), "/start", json!({}), 5).await.unwrap_err();
+        assert!(e.starts_with("the voice-worker workload actuator answered HTTP 200 but its body could not be read"), "{e}");
     }
 }

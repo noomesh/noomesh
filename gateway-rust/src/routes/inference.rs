@@ -670,7 +670,7 @@ pub(crate) async fn chat_completion_on_node(
     }
     match sent {
         Ok(resp) if resp.status().is_success() => {
-            let data: Value = resp.json().await.unwrap_or(json!({}));
+            let data = crate::upstream_body::json_2xx(resp, "the backend").await?;
             Ok(data.pointer("/choices/0/message/content")
                 .and_then(|v| v.as_str()).unwrap_or("").to_string())
         }
@@ -1821,5 +1821,17 @@ mod pinned_sampling_tests {
         assert_eq!(seen[0]["max_tokens"], json!(PINNED_DEFAULT_MAX_TOKENS));
         assert_eq!(seen[0]["temperature"].as_f64(), Some(PINNED_DEFAULT_TEMPERATURE));
         assert_eq!((PINNED_DEFAULT_MAX_TOKENS, PINNED_DEFAULT_TEMPERATURE), (256, 0.7), "the defaults are the historical ones");
+    }
+
+    /// i460: a 200 cut off mid-body, or one that is not JSON, is an error
+    /// naming the backend, never an empty completion.
+    #[tokio::test]
+    async fn a_cut_off_or_non_json_answer_is_an_error_not_an_empty_completion() {
+        let base = crate::upstream_body::stub_cut_short().await;
+        let e = chat_completion_on_node("vllm", "m", &base, "hi", Sampling::default()).await.unwrap_err();
+        assert!(e.starts_with("the backend answered HTTP 200 but its body could not be read"), "{e}");
+        let base = crate::upstream_body::stub_not_json().await;
+        let e = chat_completion_on_node("vllm", "m", &base, "hi", Sampling::default()).await.unwrap_err();
+        assert!(e.starts_with("the backend answered HTTP 200 but its body is not JSON"), "{e}");
     }
 }
