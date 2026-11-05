@@ -7233,14 +7233,12 @@ mod tests {
         let prov = include_str!("provision.rs");
         let prov = crate::test_src::own_code(prov);
         for f in ["fn attach_hostd(", "fn attach_cli(", "fn attach_harness("] {
-            let body = &prov[prov.find(f).unwrap()..];
-            let body = &body[..body.find("\n\u{7d}\n").unwrap()];
+            let body = crate::test_src::fn_body(&prov, f);
             assert!(body.contains("platform_from_facts("), "{f} derives its platform in the shared fn");
             assert!(!body.contains("f.get(\"arch\")"), "{f} has its own arch rule again");
         }
-        let up = include_str!("upgrade.rs");
-        let up = &up[up.find("fn asset_platforms(").unwrap()..];
-        assert!(up[..up.find("\n\u{7d}\n").unwrap()].contains("platform_from_facts("));
+        let up = crate::test_src::own_code(include_str!("upgrade.rs"));
+        assert!(crate::test_src::fn_body(&up, "fn asset_platforms(").contains("platform_from_facts("));
     }
 
     #[test]
@@ -8318,7 +8316,7 @@ mod tests {
     #[test]
     fn the_nodes_list_route_stamps_the_policy_it_is_judged_on() {
         let src = include_str!("../../../gateway-rust/src/routes/cluster.rs");
-        let code = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let code = crate::test_src::own_code(src);
         assert!(
             code.contains("data[\"harness_policy\"]"),
             "collect_cluster_nodes must stamp harness_policy onto every record"
@@ -10401,7 +10399,7 @@ mod tests {
     #[test]
     fn the_nodes_route_carries_the_shippers_account() {
         let src = include_str!("../../../gateway-rust/src/routes/cluster.rs");
-        let code = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let code = crate::test_src::own_code(src);
         assert!(code.contains("carry_reported(&mut data, &body, \"log_ship\")"), "node_heartbeat must carry log_ship onto the record");
     }
 

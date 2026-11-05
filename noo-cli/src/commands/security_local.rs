@@ -6018,9 +6018,7 @@ mod clifix_security_tests {
     }
 
     fn body_of<'a>(src: &'a str, sig: &str) -> &'a str {
-        let start = src.find(sig).unwrap_or_else(|| panic!("{sig} not found"));
-        let rest = &src[start..];
-        &rest[..rest.find("\n}\n").unwrap()]
+        crate::test_src::fn_body(src, sig)
     }
 
     #[test]

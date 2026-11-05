@@ -3656,9 +3656,8 @@ mod tests {
 
     #[test]
     fn the_cli_floor_runs_before_the_self_update_writes() {
-        let src = include_str!("node_fetch.rs");
-        let at = src.find("fn self_update_and_reexec(").unwrap();
-        let f = &src[at..at + src[at..].find("\n}\n").unwrap()];
+        let src = crate::test_src::own_code(include_str!("node_fetch.rs"));
+        let f = crate::test_src::fn_body(&src, "fn self_update_and_reexec(");
         assert!(f.find("apply_generation_of(&payload)").unwrap() < f.find("root_install(&payload").unwrap());
     }
 
@@ -3668,9 +3667,8 @@ mod tests {
     /// It now runs before any kind or env key is judged, as noo-apply.sh §1b.
     #[test]
     fn the_bundled_cli_is_installed_before_any_kind_or_env_key_is_judged() {
-        let src = include_str!("node_fetch.rs");
-        let at = src.find("fn verify_bundle_with(").unwrap();
-        let f = &src[at..at + src[at..].find("\n}\n").unwrap()];
+        let src = crate::test_src::own_code(include_str!("node_fetch.rs"));
+        let f = crate::test_src::fn_body(&src, "fn verify_bundle_with(");
         let update = f.find("self_update_and_reexec(&text").unwrap();
         assert!(update < f.find("KNOWN_KINDS.contains(&kind)").unwrap(), "self-update after the kind check");
         assert_eq!(f.matches("self_update_and_reexec(").count(), 1, "one trigger, ahead of every check");
@@ -4294,8 +4292,9 @@ mod user_writes_tests {
     #[test]
     fn the_case_constructor_exists_only_in_this_test_module() {
         let src = include_str!("node_fetch.rs");
-        let start = src.find("#[cfg(test)]\nmod user_writes_tests \u{7b}").expect("this test module");
-        let end = start + src[start..].find("\n\u{7d}\n").expect("its end");
+        let module = crate::test_src::fn_body(src, "#[cfg(test)]\nmod user_writes_tests \u{7b}");
+        let start = src.find(module).expect("the module slice is part of the file");
+        let end = start + module.len();
         for needle in [concat!("#[link_", "section"), concat!("NOO_TEST_OWN_", "PROCESS_CASE")] {
             let hits: Vec<usize> = src.match_indices(needle).map(|(i, _)| i).collect();
             assert!(!hits.is_empty(), "{needle} not found: the guard reads the wrong file");

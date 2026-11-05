@@ -5416,8 +5416,7 @@ mod tests {
     fn the_mac_pass_stages_only_then_waits_once() {
         let src = include_str!("upgrade.rs");
         let src = crate::test_src::own_code(src);
-        let f = &src[src.find("fn mac_leaves_pass(").unwrap()..];
-        let f = &f[..f.find("\n\u{7d}\n").unwrap()];
+        let f = crate::test_src::fn_body(&src, "fn mac_leaves_pass(");
         assert!(f.contains(r#"provision_one(g, n, &["--stage-only"])"#), "{f}");
         assert_eq!(f.matches("provision_one(").count(), 1, "no full serial provision left");
         assert_eq!(f.matches("wait_nodes_applied(").count(), 1, "one wait over every staged Mac");
@@ -7135,11 +7134,12 @@ mod json_stdout_tests {
         assert!(err.contains("the applier refused the bundle (exit 2)"), "stderr: {err}");
     }
 
-    /// `fn <name>(` through its first column-0 closing brace, in `src`.
+    /// `fn <name>(` through its own closing brace, in `src` (followup 215:
+    /// `test_src::fn_body`, never the first column-0 brace). `file` names it
+    /// in the panic when it is gone.
     fn body<'a>(src: &'a str, file: &str, name: &str) -> &'a str {
-        let start = src.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("fn {name} not found in {file}"));
-        let rest = &src[start..];
-        &rest[..rest.find("\n\u{7d}\n").unwrap_or_else(|| panic!("end of fn {name} in {file}"))]
+        assert!(src.contains(&format!("fn {name}(")), "fn {name} not found in {file}");
+        crate::test_src::fn_body(src, &format!("fn {name}("))
     }
 
     /// Every stdout print reachable from the nodes and seats stages goes
@@ -7215,9 +7215,8 @@ mod slice_pin_tests {
         }
         assert!(slice < at("move_pin("), "the slice is written with the pin");
         // and `stack sync-assets` (what stage 1 runs) asks the same question
-        let mesh = include_str!("mesh.rs");
-        let body = &mesh[mesh.find("pub fn mesh_sync_assets(").expect("mesh_sync_assets")..];
-        let body = &body[..body.find("\n\u{7d}\n").expect("end of mesh_sync_assets")];
+        let mesh = crate::test_src::own_code(include_str!("mesh.rs"));
+        let body = crate::test_src::fn_body(&mesh, "pub fn mesh_sync_assets(");
         let ask = body.find("slice_waits_for_stack(").expect("sync-assets must ask slice_waits_for_stack");
         assert!(ask < body.find("materialize(").expect("materialize"), "before it writes anything");
     }

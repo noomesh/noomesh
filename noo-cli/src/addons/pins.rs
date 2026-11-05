@@ -548,9 +548,8 @@ mod tests {
         std::fs::set_permissions(addon_dir(&d, "evolve"), std::fs::Permissions::from_mode(0o700)).unwrap();
         materialise(&d, "evolve", &files).unwrap();
         assert_eq!(mode(&addon_dir(&d, "evolve")), BUNDLE_DIR_MODE);
-        let src = include_str!("pins.rs");
-        let body = &src[src.find("pub fn materialise(").unwrap()..];
-        let body = &body[..body.find("\n}\n").unwrap()];
+        let src = crate::test_src::own_code(include_str!("pins.rs"));
+        let body = crate::test_src::fn_body(&src, "pub fn materialise(");
         assert!(
             body.contains("set_bundle_mode(&new, BUNDLE_DIR_MODE)"),
             "the new bundle dir's mode must be set explicitly, not left to the umask"

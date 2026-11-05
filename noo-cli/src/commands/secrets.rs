@@ -6119,10 +6119,8 @@ mod tests {
     /// observable than where it sits.
     #[test]
     fn rotate_checks_the_secrets_floor_before_any_mutation() {
-        let src = include_str!("secrets.rs");
-        let body_start = src.find("pub fn secrets_rotate(").expect("secrets_rotate");
-        let body = &src[body_start..];
-        let body = &body[..body.find("\n}\n").expect("end of secrets_rotate")];
+        let src = crate::test_src::own_code(include_str!("secrets.rs"));
+        let body = crate::test_src::fn_body(&src, "pub fn secrets_rotate(");
         let check = body.find("install_secrets_floor_refusal()").expect("rotate no longer checks the secrets floor");
         for mutation in ["psql_stdin(", ".commit(&sops_path)", "confirm_destructive(", "Phase 1: mint"] {
             let at = body.find(mutation).unwrap_or_else(|| panic!("{mutation} not found in secrets_rotate — update this test"));
@@ -8530,9 +8528,8 @@ mod sops_resolution_tests {
 mod clifix_security_tests {
     #[test]
     fn tidy_confirms_before_it_writes_anything() {
-        let src = include_str!("secrets.rs");
-        let start = src.find("pub fn secrets_tidy(").unwrap();
-        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        let src = crate::test_src::own_code(include_str!("secrets.rs"));
+        let body = crate::test_src::fn_body(&src, "pub fn secrets_tidy(");
         let c = body.find("confirm_prompt(").expect("tidy never confirms");
         let w = body.find("tidy_plaintext(").expect("tidy no longer thins .env");
         assert!(c < w, "the confirmation must precede the first write");

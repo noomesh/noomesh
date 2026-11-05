@@ -1629,9 +1629,8 @@ mod trust_tests {
         let c = super::cluster_ca_candidates();
         assert_eq!(c.first(), Some(&crate::pki::pki_dir().join("ca.crt")));
         assert!(c.contains(&PathBuf::from("/etc/noo/pki/ca.crt")), "{c:?}");
-        let src = include_str!("http.rs");
-        let outer = &src[src.find("pub fn resolve_trust(").unwrap()..];
-        let outer = &outer[..outer.find("\n\u{7d}\n").unwrap()];
+        let src = crate::test_src::own_code(include_str!("http.rs"));
+        let outer = crate::test_src::fn_body(&src, "pub fn resolve_trust(");
         assert!(outer.contains("resolve_trust_with(base_url, enrolled, &cluster_ca_candidates())"),
             "resolve_trust passes the real candidates: {outer}");
     }

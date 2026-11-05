@@ -3101,7 +3101,7 @@ exec {real_install} "$@"
         // `seat_agent`; the node's `ca_agent` trusts the cluster CA alone and
         // refuses the front door's public certificate (homeserver, 10-17).
         let src = include_str!("kiosk_seat.rs");
-        let prod = &src[..src.find("#[cfg(test)]").unwrap()];
+        let prod = crate::test_src::own_code(src);
         assert!(!prod.contains("enroll::ca_agent("), "a seat call uses the cluster-CA-only client");
         assert_eq!(prod.matches("seat_agent(&").count(), 2, "redeem + seat-sync both use seat_agent");
     }

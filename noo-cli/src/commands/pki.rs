@@ -1152,9 +1152,8 @@ mod clifix_security_tests {
 
     #[test]
     fn revoke_client_confirms_before_the_gateway_is_called_and_accepts_yes() {
-        let src = include_str!("pki.rs");
-        let start = src.find("pub fn pki_revoke_client(").unwrap();
-        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        let src = crate::test_src::own_code(include_str!("pki.rs"));
+        let body = crate::test_src::fn_body(&src, "pub fn pki_revoke_client(");
         let c = body.find("confirm_destructive(").expect("revoke-client never confirms");
         let r = body.find("post_json_operator(").expect("no request");
         assert!(c < r, "confirm must come first");

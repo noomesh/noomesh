@@ -1253,15 +1253,17 @@ mod tests {
     #[test]
     fn the_command_never_puts_the_key_in_json() {
         let src = include_str!("at_rest_volume.rs");
-        let cmd = &src[src.find("pub fn security_at_rest_create_volume(").unwrap()..src.find("#[cfg(test)]").unwrap()];
+        let prod = crate::test_src::own_code(src);
+        let cmd = &prod[prod.find("pub fn security_at_rest_create_volume(").unwrap()..];
         let json_out = &cmd[cmd.find("if g.json {\n        println!(").expect("the JSON result block")..];
         let json_out = &json_out[..json_out.find("return Ok(0);").unwrap()];
         assert!(json_out.contains("recovery_key_acknowledged"), "found the wrong block: {json_out}");
         assert!(!json_out.contains("created.recovery_key"), "the key reached the JSON output");
         assert!(!json_out.contains("\"recovery_key\""), "the key reached the JSON output");
         // the one place the key is printed: ui::value, on a terminal
-        let reveal = &src[src.find("fn reveal_on_terminal(").unwrap()..];
-        assert!(reveal[..reveal.find("\n}\n").unwrap()].contains("ui::value(key)"));
+        let code = crate::test_src::own_code(src);
+        let reveal = crate::test_src::fn_body(&code, "fn reveal_on_terminal(");
+        assert!(reveal.contains("ui::value(key)"));
     }
 
     /// The loop→crypt chain lsblk reports for a file-backed volume is what

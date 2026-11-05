@@ -981,7 +981,7 @@ mod tests {
     #[test]
     fn the_module_never_writes_the_switch() {
         let src = include_str!("addon_provision.rs");
-        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let body = crate::test_src::own_code(src);
         for forbidden in ["write_addon_at(", "write_addon(", "set_addon(", "issue_key(", "reconcile_principals"] {
             assert!(!body.contains(forbidden), "{forbidden} would make provision-only start something");
         }

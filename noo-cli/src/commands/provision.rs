@@ -4439,8 +4439,7 @@ mod cli_asset_refill_tests {
     fn a_missing_cli_asset_is_fetched_or_said_never_dropped() {
         let src = include_str!("provision.rs");
         let src = crate::test_src::own_code(src);
-        let cli = &src[src.find("fn attach_cli(").unwrap()..];
-        let cli = &cli[..cli.find("\n\u{7d}\n").unwrap()];
+        let cli = crate::test_src::fn_body(&src, "fn attach_cli(");
         assert!(cli.contains("cached_release_asset(g, &root, &asset)"), "the CLI asset is fetched when the cache lacks it");
         assert!(cli.contains("Err(e) => nnote(&cli_omitted_note(&node, &asset, &e))"), "and its absence is said");
         assert!(!cli.contains("std::fs::read(&cached)"), "never a cache-only read again");
@@ -5401,9 +5400,8 @@ mod self_node_rail_tests {
         assert!(e.contains("ca.crt") || e.contains("prep-host"), "{e}");
         let _ = std::fs::remove_dir_all(&base);
         // And the onboard caller warns and goes on, never `fail`s.
-        let steps = include_str!("../onboard/steps.rs");
-        let f = &steps[steps.find("fn ensure_self_agent(").unwrap()..];
-        let f = &f[..f.find("\n}\n").unwrap()];
+        let steps = crate::test_src::own_code(include_str!("../onboard/steps.rs"));
+        let f = crate::test_src::fn_body(&steps, "fn ensure_self_agent(");
         assert!(f.contains("if let Err(e) = crate::commands::provision::provision_local("), "{f}");
         assert!(f.contains("provision_one(ctx.g, &node_id, &[])"), "the rail branch runs in a child");
         assert!(!f.contains("fail("), "{f}");
@@ -5458,8 +5456,8 @@ mod self_node_rail_tests {
             Some("REC".into()));
         let whole = include_str!("provision.rs");
         let src = crate::test_src::own_code(whole);
-        let f = &src[src.find("pub(crate) fn stage_bundle_pull(").unwrap()..];
-        assert!(f[..f.find("\n}\n").unwrap()].contains("pull_target_cert(is_self"));
+        let f = crate::test_src::fn_body(&src, "pub(crate) fn stage_bundle_pull(");
+        assert!(f.contains("pull_target_cert(is_self"));
     }
 
     #[test]
@@ -5541,16 +5539,14 @@ mod self_node_rail_tests {
         let applied = apply.find("reported: applied (exit 0)").expect("the applied arm");
         let call = apply.find("after_self_applied(g, &node, msg)").expect("the self node's post-apply steps");
         assert!(applied < call, "the self steps run only after the node reported exit 0");
-        let aa = &src[src.find("fn after_applied(").unwrap()..];
-        let aa = &aa[..aa.find("\n}\n").unwrap()];
+        let aa = crate::test_src::fn_body(&src, "fn after_applied(");
         let lane = aa.find("write_self_lane(node, SelfLaneRecord::Rail)").expect("the lane record");
         let hostd = aa.find("refresh_controller_hostd(").expect("the hostd restart");
         assert!(aa.find("if self_steps").unwrap() < lane && lane < hostd, "{aa}");
         assert!(aa.contains(r#"applier_applied(msg, "hostd-binary")"#), "{aa}");
         let up = include_str!("upgrade.rs");
         let up = crate::test_src::own_code(up);
-        let f = &up[up.find("fn upgrade_self_node(").unwrap()..];
-        let f = &f[..f.find("\n}\n").unwrap()];
+        let f = crate::test_src::fn_body(&up, "fn upgrade_self_node(");
         assert!(f.contains(r#"provision_one(g, me, &["--stage-only"])"#), "{f}");
         assert!(!f.contains("--local"), "{f}");
     }
@@ -5990,8 +5986,7 @@ mod upgrade_stages_every_node_before_waiting_tests {
     fn the_nodes_phase_stages_all_then_waits_once() {
         let up = include_str!("upgrade.rs");
         let up = crate::test_src::own_code(up);
-        let f = &up[up.find("fn upgrade_nodes(").unwrap()..];
-        let f = &f[..f.find("\n}\n").unwrap()];
+        let f = crate::test_src::fn_body(&up, "fn upgrade_nodes(");
         let stage = f.find(r#"provision_one(g, n, &["--stage-only"])"#).expect("remote nodes are staged with --stage-only");
         let me = f.rfind("upgrade_self_node(g, me, &mut failed, &mut pending)").expect("the self node is staged into the same pending list");
         let wait = f.rfind("wait_and_settle_nodes(g, &pending").expect("the combined wait");
@@ -6013,8 +6008,7 @@ mod upgrade_stages_every_node_before_waiting_tests {
         let up = crate::test_src::own_code(up);
         let verb = super::phase_src::body("await_apply");
         assert!(verb.contains("after_self_applied(g, &node, msg)"), "the single-node verb");
-        let settle = &up[up.find("fn settle_end(").unwrap()..];
-        let settle = &settle[..settle.find("\n}\n").unwrap()];
+        let settle = crate::test_src::fn_body(&up, "fn settle_end(");
         assert!(settle.contains("after_self_applied(g, n, &msg)"), "the combined wait");
         for (name, body) in [("provision.rs", prov), ("upgrade.rs", up)] {
             assert_eq!(body.matches("refresh_controller_hostd(").count(), if name == "provision.rs" { 2 } else { 0 },

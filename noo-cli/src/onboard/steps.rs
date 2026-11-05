@@ -7755,16 +7755,14 @@ mod plaintext_credential_tests {
     /// fails here.)
     #[test]
     fn the_store_is_armed_before_any_secret_and_never_falls_back_to_plaintext() {
-        let src = include_str!("steps.rs");
-        let body = &src[src.find("pub fn secrets_setup(").expect("secrets_setup")..];
-        let body = &body[..body.find("\n}\n").expect("end of secrets_setup")];
+        let src = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&src, "pub fn secrets_setup(");
         let arm = body.find("if !arm_secret_store(ctx)").expect("secrets_setup arms the store");
         for mint in ["SECRETS {", "ctx.update_env(\"NOO_ADMIN_PASSWORD\"", "NOO_BACKUP_PASSPHRASE", "NOO_APP_DB_PASSWORD"] {
             let at = body.find(mint).unwrap_or_else(|| panic!("{mint} not in secrets_setup"));
             assert!(arm < at, "the store must be armed before `{mint}`");
         }
-        let arm_fn = &src[src.find("fn arm_secret_store(").expect("arm_secret_store")..];
-        let arm_fn = &arm_fn[..arm_fn.find("\n}\n").expect("end")];
+        let arm_fn = crate::test_src::fn_body(&src, "fn arm_secret_store(");
         let plaintext_fallback = ["leaving", " plaintext .env"].concat();
         assert!(!arm_fn.contains(&plaintext_fallback), "a warn-and-continue fallback is back");
         assert!(!arm_fn.contains("ctx.warn(\"SOPS"), "a SOPS failure must refuse, not warn");
