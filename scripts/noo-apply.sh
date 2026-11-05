@@ -75,6 +75,27 @@ CA="$PKI/ca.crt"
 
 KNOWN_KINDS="ca.crt node.crt node.key agent-env agent-unit agent-binary teardown applier hostd-binary restart-backends host-telemetry cli-binary cli-user fetcher nats-creds fleet-secrets signing-pub harness-binary harness-env harness-unit svc-vllm.crt svc-vllm.key svc-llamacpp.crt svc-llamacpp.key svc-ollama.crt svc-ollama.key svc-tei.crt svc-tei.key svc-reranker.crt svc-reranker.key vendor-cli vendor-cli-manifest vendor-cli-2 vendor-cli-2-manifest vendor-cli-3 vendor-cli-3-manifest"
 
+# An add-on's node workload door leaf travels as svc-addon-<addon>-<workload>
+# .crt|.key. The set is open (one pair per enabled add-on workload), so it is
+# judged by SHAPE here, not listed in KNOWN_KINDS: the stem after `svc-` is
+# `addon-` plus a name matching ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$, at most 57
+# characters in all (addon + `-` + workload <= 51). No `/`, no `.`, no
+# uppercase, no leading or trailing `-`. Mirrors node_leaves::addon_door_name_ok
+# and sign-bundle.sh; tests/test_addon_door_leaves_on_the_rail.py pins both.
+# BEGIN addon_leaf_kind
+addon_leaf_kind_ok() {  # $1 = bundle kind; 0 only for a well-formed svc-addon-*.crt|.key
+    case "$1" in
+        svc-addon-*.crt) _alk="${1%.crt}" ;;
+        svc-addon-*.key) _alk="${1%.key}" ;;
+        *) return 1 ;;
+    esac
+    _alk="${_alk#svc-}"
+    [ "${#_alk}" -gt 6 ] && [ "${#_alk}" -le 57 ] || return 1
+    case "$_alk" in *[!a-z0-9-]*|-*|*-|addon--*) return 1 ;; esac
+    return 0
+}
+# END addon_leaf_kind
+
 # ── 0. The tar's SHAPE, before a single byte is extracted ────
 # This applier runs as root and writes into the extraction directory. A
 # symlink or hardlink member would turn one of those writes (or a later
@@ -349,7 +370,7 @@ while read -r sum kind; do
     case "$sum" in \#*) continue ;; esac
     case " $KNOWN_KINDS " in
         *" $kind "*) : ;;
-        *) echo "noo-apply: unknown kind '$kind' — this node's applier is older than the bundle; refusing" >&2; exit 76 ;;
+        *) addon_leaf_kind_ok "$kind" || { echo "noo-apply: unknown kind '$kind' — this node's applier is older than the bundle (or the kind is malformed); refusing" >&2; exit 76; } ;;
     esac
     f="$WORK/files/$kind"
     [ -f "$f" ] || { echo "noo-apply: manifest names '$kind' but the bundle lacks it" >&2; exit 65; }
@@ -893,6 +914,38 @@ for _svc in vllm llamacpp ollama tei reranker; do
     mv -f "$_d/.service.key.next" "$_d/service.key"
     mv -f "$_d/.service.crt.next" "$_d/service.crt"
     applied="$applied svc-$_svc"
+done
+
+# svc-addon-<addon>-<workload>.crt|.key — an enabled add-on's node workload
+# door leaf. Same checks, ownership, modes and temp + rename as the static
+# loop above (kept as a copy of it, not a function: the static install block
+# is lifted verbatim by tests/test_apply_unchanged_configs.py), into
+# $PKI/services/addon-<addon>-<workload>/. Never deletes one the bundle omits.
+for _asvc in $(for _af in "$WORK"/files/svc-addon-*.crt "$WORK"/files/svc-addon-*.key; do
+        [ -e "$_af" ] || continue
+        _ab="$(basename "$_af")"; _ab="${_ab#svc-}"; echo "${_ab%.*}"
+    done | sort -u); do
+    addon_leaf_kind_ok "svc-$_asvc.crt" || { echo "noo-apply: svc-$_asvc is not a well-formed add-on leaf name — refusing" >&2; exit 65; }
+    _c="$WORK/files/svc-$_asvc.crt"; _k="$WORK/files/svc-$_asvc.key"
+    [ -f "$_c" ] && [ -f "$_k" ] || { echo "noo-apply: svc-$_asvc carries half a leaf (cert and key travel together) — refusing" >&2; exit 65; }
+    _d="$PKI/services/$_asvc"
+    if config_unchanged "$_k" "$_d/service.key" 600 root:root \
+        && config_unchanged "$_c" "$_d/service.crt" 644 root:root; then
+        applied="$applied svc-$_asvc=unchanged"
+        continue
+    fi
+    openssl verify -CAfile "$PKI/ca.crt" "$_c" >/dev/null 2>&1 \
+        || { echo "noo-apply: svc-$_asvc.crt does not verify against $PKI/ca.crt — refusing" >&2; exit 65; }
+    _cp="$(openssl x509 -in "$_c" -noout -pubkey 2>/dev/null || true)"
+    _kp="$(openssl pkey -in "$_k" -pubout 2>/dev/null || true)"
+    [ -n "$_cp" ] && [ -n "$_kp" ] && [ "$_cp" = "$_kp" ] \
+        || { echo "noo-apply: svc-$_asvc.key is not the key of svc-$_asvc.crt — refusing" >&2; exit 65; }
+    install -d -m 755 -o root -g root "$PKI/services" "$_d"
+    install -m 600 -o root -g root "$_k" "$_d/.service.key.next"
+    install -m 644 -o root -g root "$_c" "$_d/.service.crt.next"
+    mv -f "$_d/.service.key.next" "$_d/service.key"
+    mv -f "$_d/.service.crt.next" "$_d/service.crt"
+    applied="$applied svc-$_asvc"
 done
 
 # agent-env — credentials; root-only, systemd (pid 1) reads it, not the agent

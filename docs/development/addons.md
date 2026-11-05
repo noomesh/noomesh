@@ -1522,6 +1522,20 @@ from there.
 `noo addons show <name>` prints what an add-on's bundle declares; `noo addons
 list` lists the add-ons that declare anything.
 
+**Node workload doors.** An add-on's node workload is served through a
+`noo-stunnel-<addon>-<workload>` door, and each node holds a per-node leaf for
+it: `cluster provision` issues `addon-<addon>-<workload>` under the node's
+service leaves (same issuer and renewal as the built-in backend doors) and
+packs it as the bundle kinds `svc-addon-<addon>-<workload>.crt|.key`, which
+the node installs to `/etc/noo/pki/services/addon-<addon>-<workload>/`. Both
+names must match `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$` and
+`<addon>-<workload>` is at most 51 characters; anything else is refused when
+the leaf is issued, naming the pair. Enabling a new add-on does not reach
+nodes by itself: run `noo upgrade --nodes` to deliver the leaves (`noo addons
+enable` says so when the add-on declares node workloads). A node whose applier
+predates these kinds (CLI older than 0.6.18) is sent none, and provision names
+it and the same remedy.
+
 ## Declaring runtime inputs
 
 Your services need things only the stack can produce: the gateway's URL and

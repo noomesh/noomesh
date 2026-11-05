@@ -554,6 +554,20 @@ pub(crate) fn report(addon: &str, e: &Enabled) {
     } else {
         ui::done(&format!("{addon} was already declared on in {} — nothing changed there", e.config.display()));
     }
+    let doors = super::node_leaves::node_workload_doors(&crate::envfile::repo_root());
+    if let Some(hint) = node_workload_hint(&doors, addon) {
+        ui::say(&ui::note(&hint));
+    }
+}
+
+/// The re-provision step an enable prints, only when `addon` declares node
+/// workloads (a door leaf per node is delivered by `noo upgrade --nodes`).
+pub(crate) fn node_workload_hint(doors: &[(String, String)], addon: &str) -> Option<String> {
+    doors.iter().any(|(a, _)| a == addon).then(|| {
+        "This add-on declares node workloads; run `noo upgrade --nodes` \
+         to deliver their door leaves."
+            .to_string()
+    })
 }
 
 /// The JSON object an enable contributes, shared by both callers.
@@ -692,6 +706,16 @@ addons:
 
     fn evolve_on(p: &Path) -> bool {
         crate::commands::addons::declared_in(&std::fs::read_to_string(p).unwrap()).get("evolve") == Some(&true)
+    }
+
+    #[test]
+    fn the_node_workload_hint_prints_only_for_an_addon_that_declares_workloads() {
+        let doors = vec![("rhaddon".to_string(), "worker".to_string())];
+        let hint = node_workload_hint(&doors, "rhaddon").expect("declares a workload");
+        assert!(hint.contains("noo upgrade --nodes"), "{hint}");
+        assert!(!hint.contains('\n'));
+        assert!(node_workload_hint(&doors, "evolve").is_none());
+        assert!(node_workload_hint(&[], "rhaddon").is_none());
     }
 
     #[test]
