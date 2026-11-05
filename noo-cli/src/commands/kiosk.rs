@@ -1742,10 +1742,9 @@ pub fn kiosk_set(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // sync cannot read. Any `set` converges it, even when the value is unchanged.
     let stale_mode = std::fs::metadata(ENV_FILE).map(|m| env_mode_is_stale(&m)).unwrap_or(false);
     if env_line_value(&current, "NOO_KIOSK_QUALITY").as_deref() == Some(quality) {
-        if stale_mode && !dry_run {
-            if let Err(e) = install_text(&current, ENV_FILE, ENV_MODE, "root -g root") {
-                fail(g.json, ExitCode::Generic, "write", &e, Some("noo kiosk status"));
-            }
+        let converge = if stale_mode && !dry_run { install_text(&current, ENV_FILE, ENV_MODE, "root -g root") } else { Ok(()) };
+        if let Err(e) = converge {
+            fail(g.json, ExitCode::Generic, "write", &e, Some("noo kiosk status"));
         }
         if !g.json {
             if stale_mode && !dry_run {
@@ -2920,6 +2919,14 @@ mod tests {
         }
         // The whole point of the keyless mint: nothing durable is written.
         assert!(!env.contains("NOO_KIOSK_KEY"), "the env file must carry no key");
+        // Every variable the scripts read is one the env file writes.
+        for script in [LAUNCH, WATCHDOG, CDP] {
+            for var in ["NOO_KIOSK_URL", "NOO_KIOSK_VIEW", "NOO_KIOSK_ROTATE", "NOO_KIOSK_POLL", "NOO_KIOSK_STATE", "NOO_KIOSK_USER", "NOO_KIOSK_DIALBACK_PORT", "NOO_KIOSK_MODE", "NOO_KIOSK_VT"] {
+                if script.contains(var) {
+                    assert!(env.contains(&format!("{var}=")), "{var} read but not written");
+                }
+            }
+        }
     }
 
     /// The env file is world-readable (ENV_MODE 0644) because nothing in it
@@ -2928,7 +2935,7 @@ mod tests {
     /// like a credential. A new variable must be added here on purpose.
     #[test]
     fn the_env_file_never_holds_a_key_shaped_line() {
-        assert_eq!(ENV_MODE, "0644");
+        assert_eq!(u32::from_str_radix(ENV_MODE, 8).ok(), Some(0o644), "ENV_MODE is world-readable on purpose; see below");
         let known = ["NOO_KIOSK_URL", "NOO_KIOSK_VIEW", "NOO_KIOSK_ROTATE", "NOO_KIOSK_POLL", "NOO_KIOSK_QUALITY",
                      "NOO_KIOSK_STATE", "NOO_KIOSK_USER", "NOO_KIOSK_DIALBACK_PORT", "NOO_KIOSK_SERVE_PORT",
                      "NOO_KIOSK_MODE", "NOO_KIOSK_VT"];
@@ -2961,14 +2968,6 @@ mod tests {
         assert!(stale_env_mode(0o100644, 0, 1001));
         assert!(stale_env_mode(0o100600, 0, 0));
         assert!(stale_env_mode(0o100644, 1000, 0));
-        // Every variable the scripts read is one the env file writes.
-        for script in [LAUNCH, WATCHDOG, CDP] {
-            for var in ["NOO_KIOSK_URL", "NOO_KIOSK_VIEW", "NOO_KIOSK_ROTATE", "NOO_KIOSK_POLL", "NOO_KIOSK_STATE", "NOO_KIOSK_USER", "NOO_KIOSK_DIALBACK_PORT", "NOO_KIOSK_MODE", "NOO_KIOSK_VT"] {
-                if script.contains(var) {
-                    assert!(env.contains(&format!("{var}=")), "{var} read but not written");
-                }
-            }
-        }
     }
 
     #[test]
