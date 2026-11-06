@@ -141,6 +141,7 @@ mod agent_mail_archive;
 mod audit_integrity;
 mod audit_chain;
 mod audit_head_export;
+mod audit_verify;
 mod audit_context;
 mod audit_spool;
 mod autonomy_audit;
@@ -660,6 +661,8 @@ async fn main() -> Result<()> {
 
     // The signed audit chain head, recorded outside the database.
     audit_head_export::spawn(state.clone());
+    // i520: the full chain verify every 6 h, so a broken row pages on its own.
+    audit_verify::spawn(state.clone());
     ingest_loop::spawn(state.clone());
     recall_archive_loop::spawn(state.clone());
 
