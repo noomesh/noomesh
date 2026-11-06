@@ -94,6 +94,9 @@ type Server struct {
 
 	// proxyTarget overrides docker.ProxyTarget (tests only).
 	proxyTarget func(string) (string, error)
+	// workloadDoors overrides the docker client for the node-workload relay
+	// (tests only).
+	workloadDoors nodeWorkloadDoors
 	// workloadOps overrides the docker client for the add-on workload
 	// actuator (tests only).
 	workloadOps workloadOps
