@@ -105,6 +105,28 @@ pub fn queued() -> usize {
     QUEUE.lock().map(|q| q.len()).unwrap_or(0)
 }
 
+/// The spool's lines for `/metrics` (i520): rows lost since the gateway
+/// started (overflow past [`CAP`], and rows lost for a reason the spool does
+/// not handle, [`note_lost`]), rows held now, and the cap. Every lost row is
+/// lost evidence, so `AuditSpoolRowsLost` pages on any increase.
+pub fn metrics_text() -> String {
+    format!(
+        "# HELP noo_audit_spool_lost_total Audit rows lost since the gateway started (spool overflow or unrecoverable).
+         # TYPE noo_audit_spool_lost_total counter
+         noo_audit_spool_lost_total {}
+         # HELP noo_audit_spool_depth Audit rows held in the spool now, waiting for the database.
+         # TYPE noo_audit_spool_depth gauge
+         noo_audit_spool_depth {}
+         # HELP noo_audit_spool_capacity Audit rows the spool can hold before it loses one.
+         # TYPE noo_audit_spool_capacity gauge
+         noo_audit_spool_capacity {}
+",
+        LOST_TOTAL.load(Ordering::Relaxed),
+        queued(),
+        CAP
+    )
+}
+
 /// What `/api/security/audit/verify` reports as `spool`.
 #[derive(Debug, Clone, Serialize, Default, PartialEq)]
 pub struct SpoolView {
@@ -264,6 +286,11 @@ mod tests {
         assert!(!enqueue(sec(CAP)), "a full queue refuses the new row");
         let v = view();
         assert_eq!((v.queued_now, v.queued_total, v.lost_total), (CAP as u64, CAP as u64, 1));
+        // i520: the same facts reach /metrics, where a rule can page on them.
+        let m = metrics_text();
+        assert!(m.contains("# TYPE noo_audit_spool_lost_total counter\nnoo_audit_spool_lost_total 1\n"), "{m}");
+        assert!(m.contains(&format!("\nnoo_audit_spool_depth {CAP}\n")), "{m}");
+        assert!(m.contains(&format!("\nnoo_audit_spool_capacity {CAP}\n")), "{m}");
         if let Ok(q) = QUEUE.lock() {
             assert_eq!(q.front(), Some(&sec(0)), "the oldest evidence is kept");
         }

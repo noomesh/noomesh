@@ -816,6 +816,8 @@ pub async fn verify_db(db: &sqlx::PgPool) -> Result<Report, sqlx::Error> {
     let file = crate::audit_head_export::head_file();
     crate::audit_head_export::check(&file, crate::audit_head_export::read_file(&file), keys.current.as_deref(), &rows, &mut report);
     report.verdict = if report.breaks.is_empty() && report.problems.is_empty() { "ok" } else { "fail" }.into();
+    // i520: a failed verdict is a Prometheus counter, so it can page.
+    crate::audit_verify::count_report(&report);
     Ok(report)
 }
 
