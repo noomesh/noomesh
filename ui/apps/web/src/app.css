@@ -42,6 +42,10 @@
      than being one fixed value, so a 13" laptop is not needlessly narrow and a
      4K monitor is not a single 2000px line. */
   --measure: 46rem;
+  /* The console is dark-only. Without this a native control (a <select>'s
+     open option list, a date picker) renders in the light system scheme:
+     white popups carrying the app's light text, unreadable. */
+  color-scheme: dark;
 
   --sans: system-ui, 'Segoe UI', -apple-system, Roboto, sans-serif;
   --mono: ui-monospace, 'Cascadia Code', 'JetBrains Mono', 'SF Mono', Consolas, Menlo, monospace;
@@ -3966,6 +3970,22 @@ body {
   flex-direction: column;
   gap: 7px;
   min-width: 0;
+}
+/* Each column scrolls on its own, so opening a thread at its newest message
+   never scrolls the thread list out of view. */
+.traffic-threads,
+.traffic-messages {
+  max-height: calc(100vh - 170px);
+  overflow-y: auto;
+}
+/* The open thread's name stays at the top of its scrolling column. */
+.traffic-messages > .subhead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  margin: 0;
+  padding: 4px 0 6px;
+  background: var(--bg);
 }
 .traffic-thread {
   display: flex;

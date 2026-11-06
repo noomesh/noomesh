@@ -2,7 +2,16 @@
 // Copyright 2026 PersonifAI LLC
 
 import { describe, it, expect } from 'vitest';
-import { filterThreads, parseMessages, parseThreads, renderBody } from './useAgentTraffic';
+import {
+  PREVIEW_CHARS,
+  PREVIEW_LINES,
+  filterThreads,
+  parseMessages,
+  parseThreads,
+  previewOf,
+  recipientLabel,
+  renderBody,
+} from './useAgentTraffic';
 
 const threads = parseThreads({
   threads: [
@@ -35,9 +44,26 @@ describe('agent traffic', () => {
     expect(m[1].fromNode).toBe('n1');
   });
 
-  it('renders body.text, else pretty JSON, collapsing long bodies', () => {
-    expect(renderBody({ text: 'hi' })).toEqual({ text: 'hi', isText: true, long: false });
+  it('renders body.text, else pretty JSON, collapsing long bodies to a preview', () => {
+    expect(renderBody({ text: 'hi' })).toEqual({ text: 'hi', isText: true, long: false, preview: 'hi' });
     expect(renderBody({ a: 1 }).text).toBe('{\n  "a": 1\n}');
-    expect(renderBody({ text: 'x'.repeat(700) }).long).toBe(true);
+    const long = renderBody({ text: 'x'.repeat(700) });
+    expect(long.long).toBe(true);
+    expect(long.preview).toBe(`${'x'.repeat(PREVIEW_CHARS)}…`);
+  });
+
+  it('previews the first lines of a long body, and nothing is cut from a short one', () => {
+    const lines = Array.from({ length: PREVIEW_LINES + 3 }, (_, i) => `line ${i}`).join('\n');
+    expect(previewOf(lines)).toBe(`${lines.split('\n').slice(0, PREVIEW_LINES).join('\n')}…`);
+    expect(previewOf('short\nbody')).toBe('short\nbody');
+  });
+
+  it('never counts the thread address as a participant', () => {
+    const t = parseThreads({
+      threads: [{ thread_id: 't', messages: 2, started: 'a', last: 'b', senders: ['rbwolf/op'], recipients: ['thread', 'rbwolf/codex'] }],
+    });
+    expect(t[0].participants).toEqual(['rbwolf/codex', 'rbwolf/op']);
+    expect(recipientLabel('thread')).toEqual({ text: 'the thread', isThread: true });
+    expect(recipientLabel('rbwolf/codex')).toEqual({ text: 'rbwolf/codex', isThread: false });
   });
 });
