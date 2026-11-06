@@ -189,11 +189,13 @@ services:
       - /home/nonroot:size=64m,mode=0700,uid=65532,gid=65532
     ports:
       # NOO_BIND_ADDR (H-N2/N3/N5): host interface every cluster-plane port binds to.
-      # Defaults to 0.0.0.0 (non-breaking). Set NOO_BIND_ADDR=<tailnet-ip> in .env to
-      # confine NATS/node-agent/Grafana/exporters/gateway to the Tailscale
-      # overlay. There is no public tunnel any more — the tailnet (and LAN
-      # /mDNS) is the only way in. See .env.example.
-      - "${NOO_BIND_ADDR:-0.0.0.0}:${NOO_PORT_GATEWAY:-8080}:8080"
+      # The launchers and noo-hostd's recreate derive it from NOO_BIND_MODE
+      # (scripts/lib-bind-addr.sh resolve_bind_addr: tailnet, local, all, or
+      # an address) and refuse an unset mode. The default here only applies
+      # to a compose run that bypasses them, and it is LOOPBACK (i515a,
+      # secure by default): such a run fails closed, never open on every
+      # interface. 0.0.0.0 is only ever the written-down NOO_BIND_MODE=all.
+      - "${NOO_BIND_ADDR:-127.0.0.1}:${NOO_PORT_GATEWAY:-8080}:8080"
       # Add-on UI origins (gateway-rust/src/addon_ui.rs): each add-on with a
       # `ui` gets an HTTPS listener of its own on a port from this range, so
       # its scripts run on an origin separate from the console's. Same
@@ -1222,7 +1224,7 @@ services:
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-nats
     profiles: ["controller", "standalone"]
     ports:
-      - "${NOO_BIND_ADDR:-0.0.0.0}:${NOO_PORT_NATS:-4222}:4222"   # Client connections (workers need access; auth via NATS creds + mTLS)
+      - "${NOO_BIND_ADDR:-127.0.0.1}:${NOO_PORT_NATS:-4222}:4222"   # Client connections (workers need access; auth via NATS creds + mTLS)
       # Monitoring — localhost only on the host, and on the TLS profile it
       # is HTTPS with client-cert verification (an earlier change N9): every
       # container on `noo-cluster` could previously read /connz (bus user +
@@ -2311,7 +2313,7 @@ services:
       - { source: noo_cluster_secret, target: noo_cluster_secret, x-noo-uid: "0" }
       - { source: nats_node_password, target: nats_node_password, x-noo-uid: "0" }
     ports:
-      - "${NOO_BIND_ADDR:-0.0.0.0}:${NOO_PORT_NODE_AGENT:-8081}:8081"  # Control API (H-N5 — confine to tailnet via NOO_BIND_ADDR)
+      - "${NOO_BIND_ADDR:-127.0.0.1}:${NOO_PORT_NODE_AGENT:-8081}:8081"  # Control API (H-N5 — confine to tailnet via NOO_BIND_ADDR)
     environment:
       - NODE_ID=${NODE_ID:-auto}
       - NODE_IP=${NODE_IP:-}  # LAN IP for registration (set by provisioner)
@@ -2466,7 +2468,7 @@ services:
     profiles: ["sensors"]
     secrets: *node-agent-secrets
     ports:
-      - "${NOO_BIND_ADDR:-0.0.0.0}:${NOO_SENSOR_AGENT_PORT:-8082}:${NOO_SENSOR_AGENT_PORT:-8082}"
+      - "${NOO_BIND_ADDR:-127.0.0.1}:${NOO_SENSOR_AGENT_PORT:-8082}:${NOO_SENSOR_AGENT_PORT:-8082}"
     environment:
       # Distinct identity. Tier 5 => NodeType.COMPANION at registration.
       - NODE_ID=${NODE_ID:-auto}-sensors
@@ -2724,9 +2726,9 @@ services:
     secrets:
       - { source: grafana_admin_password, target: grafana_admin_password, x-noo-uid: "65532" }
     ports:
-      # §3f R28. NOT NOO_BIND_ADDR, whose default is 0.0.0.0: Grafana is the
-      # one service here with its own user database and its own login, and
-      # inheriting a fleet-wide "publish everywhere" default put an admin UI
+      # §3f R28. NOT NOO_BIND_ADDR, which NOO_BIND_MODE=all sets to 0.0.0.0:
+      # Grafana is the one service here with its own user database and its own
+      # login, and inheriting a fleet-wide "publish everywhere" setting put an admin UI
       # on every interface. Loopback, also on a tailnet controller once
       # `tailscale serve` is confirmed fronting this port on the tailnet
       # name with the tailnet's certificate (noo-cli/src/tailnet_serve.rs):
@@ -2795,7 +2797,7 @@ services:
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-node-exporter
     profiles: ["monitoring", "controller", "standalone"]
     ports:
-      - "${NOO_BIND_ADDR:-0.0.0.0}:${NOO_PORT_NODE_EXPORTER:-9100}:9100"  # H-N5 — exporter reachable by controller scrape over tailnet only
+      - "${NOO_BIND_ADDR:-127.0.0.1}:${NOO_PORT_NODE_EXPORTER:-9100}:9100"  # H-N5 — exporter reachable by controller scrape over tailnet only
     volumes:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
@@ -2828,7 +2830,7 @@ services:
     user: nonroot
     profiles: ["controller", "standalone", "gpu-tier1", "gpu-tier2"]
     ports:
-      - "${NOO_BIND_ADDR:-0.0.0.0}:${NOO_PORT_NVIDIA_EXPORTER:-9400}:9400"  # H-N5 — GPU exporter reachable by controller scrape over tailnet only
+      - "${NOO_BIND_ADDR:-127.0.0.1}:${NOO_PORT_NVIDIA_EXPORTER:-9400}:9400"  # H-N5 — GPU exporter reachable by controller scrape over tailnet only
     environment:
       # Always set: the exporter refuses to start without all three rather
       # than serving GPU metrics over plain HTTP to anyone on the network.
@@ -3285,7 +3287,7 @@ services:
       # `ports:` entry here fails tests/test_model_cache_mtls_only.py and the
       # `noo cluster verify` "model cache" row. §3f R28: NOO_BIND_ADDR
       # confines it, never 0.0.0.0 by omission.
-      - "${NOO_BIND_ADDR:-0.0.0.0}:${NOO_MODEL_CACHE_TLS_PORT:-8443}:8443"
+      - "${NOO_BIND_ADDR:-127.0.0.1}:${NOO_MODEL_CACHE_TLS_PORT:-8443}:8443"
     volumes:
       - ./docker/model-cache.nginx.conf:/etc/nginx/conf.d/default.conf:ro
       # The served tree, shared by every listener (outside conf.d/ so the
