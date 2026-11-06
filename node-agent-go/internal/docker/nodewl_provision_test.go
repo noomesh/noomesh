@@ -777,3 +777,82 @@ func TestArtifactArch(t *testing.T) {
 		t.Errorf("arch %q", got)
 	}
 }
+
+// tempSets is a set store whose sealed dirs are real directories under one
+// t.TempDir(), laid out as the archive is: <root>/<id>/<rev>/<files>.
+type tempSets struct{ root string }
+
+func (s tempSets) State(modelsets.Ref) modelsets.Status {
+	return modelsets.Status{State: modelsets.StateVerified}
+}
+func (s tempSets) Dir(r modelsets.Ref) string { return filepath.Join(s.root, r.ID, r.Revision) }
+
+// TestSetMountKeepsTheSetLayoutUnderTheSlotTarget pins the contract a worker
+// relies on: a set file P in a slot with target T is seen at exactly T/P. A
+// many:false slot binds its set's ROOT at the target; a many:true slot binds
+// each set at <target>/<set id>. Every set bind is read-only.
+func TestSetMountKeepsTheSetLayoutUnderTheSlotTarget(t *testing.T) {
+	h := newHarness(t)
+	store := tempSets{root: t.TempDir()}
+	refs := map[string]modelsets.Ref{
+		"voices": {ID: "rh-voices-a", Revision: "v1"},
+		"x1":     {ID: "rh-extra-1", Revision: "v1"},
+		"x2":     {ID: "rh-extra-2", Revision: "v1"},
+	}
+	for _, r := range refs {
+		if err := os.MkdirAll(filepath.Join(store.Dir(r), "voices"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	voiceFile := filepath.Join(store.Dir(refs["voices"]), "voices", "a.pt")
+	if err := os.WriteFile(voiceFile, []byte("pt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	acc := &nodewl.Accepts{Kind: "voice-pack"}
+	h.entry.Decl.Models = []nodewl.Slot{
+		{Slot: "voices", Target: "/models/voice-pack", Accepts: acc, Many: false},
+		{Slot: "extras", Target: "/models/extras", Accepts: acc, Many: true},
+	}
+	h.entry.Sets = map[string][]nodewl.SetRef{
+		"voices": {{ID: refs["voices"].ID, Revision: refs["voices"].Revision}},
+		"extras": {{ID: refs["x1"].ID, Revision: refs["x1"].Revision}, {ID: refs["x2"].ID, Revision: refs["x2"].Revision}},
+	}
+	h.p.Sets = store
+
+	_, w := mustProvision(t, h)
+
+	binds := map[string]mount.Mount{}
+	for _, m := range w.Host.Mounts {
+		if m.Type != mount.TypeBind {
+			continue
+		}
+		binds[m.Target] = m
+		if !m.ReadOnly {
+			t.Errorf("set bind at %s is not read-only", m.Target)
+		}
+	}
+	// (a) many:false: the set ROOT at exactly the slot target.
+	m, ok := binds["/models/voice-pack"]
+	if !ok {
+		t.Fatalf("no bind at /models/voice-pack; binds: %v", binds)
+	}
+	if m.Source != store.Dir(refs["voices"]) {
+		t.Errorf("many:false source %q, want the set root %q (not a sub-directory)", m.Source, store.Dir(refs["voices"]))
+	}
+	// The worker sees Target/voices/a.pt; on disk that is Source/voices/a.pt.
+	if _, err := os.Stat(filepath.Join(m.Source, "voices", "a.pt")); err != nil {
+		t.Errorf("Source %q does not hold voices/a.pt, so the worker would not see /models/voice-pack/voices/a.pt: %v", m.Source, err)
+	}
+	// (b) many:true: <target>/<set id> for each set, each rooted at its own set.
+	for _, k := range []string{"x1", "x2"} {
+		want := "/models/extras/" + refs[k].ID
+		b, ok := binds[want]
+		if !ok {
+			t.Errorf("no bind at %s; binds: %v", want, binds)
+			continue
+		}
+		if b.Source != store.Dir(refs[k]) {
+			t.Errorf("many:true source %q, want %q", b.Source, store.Dir(refs[k]))
+		}
+	}
+}
