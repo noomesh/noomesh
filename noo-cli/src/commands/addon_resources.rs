@@ -284,11 +284,13 @@ fn launch_one(a: &LaunchArgs, addon: &str, dev: Option<&Path>, store: &mut Optio
     for (var, path) in &written.mounts {
         out.push(format!("mount {addon} {var} {}", path.display()));
     }
-    if written.fresh {
-        for (_, path) in &written.mounts {
+    if let Some(tmp) = &written.tmp_dir {
+        // Fresh (i509): hand over and mark the TEMPORARY generation, then the
+        // launcher renames it to the final one the mounts name.
+        for path in written.handover() {
             out.push(format!("own {addon} {} {}", res.uid, path.display()));
         }
-        out.push(format!("gen {addon} {}", written.gen_dir.display()));
+        out.push(format!("gen {addon} {} {}", tmp.display(), written.gen_dir.display()));
     }
     for s in &written.stale {
         out.push(format!("stale {addon} {}", s.display()));
