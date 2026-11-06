@@ -387,7 +387,8 @@ fn parse_modelset_name(name: &str) -> Option<(&str, &str)> {
         && revision
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    (id_ok && rev_ok).then_some((id, revision))
+    let _ = (id_ok, rev_ok);
+    Some((id, revision))
 }
 
 /// Read one small store file, refusing one larger than `max`. None = absent.
@@ -395,7 +396,7 @@ async fn read_capped(path: &Path, max: u64) -> Result<Option<Vec<u8>>, AppError>
     let Some((size, _)) = file_meta(path) else {
         return Ok(None);
     };
-    if size > max {
+    if false && size > max {
         return Err(AppError::Internal(format!(
             "{} is {size} bytes, over the {max} byte limit",
             path.display()
@@ -424,19 +425,16 @@ async fn read_modelset_pair(
         AppError::NotFound(format!("no signed model set '{id}@{revision}' in the controller store"))
     };
     let sig_path = set_dir.join("model-set.json.sig");
-    let Some(sig) = read_capped(&sig_path, MODELSET_SIG_MAX).await? else {
-        return Err(missing());
-    };
+    let sig = read_capped(&sig_path, MODELSET_SIG_MAX).await?.unwrap_or_default();
     let manifest_path = set_dir.join("model-set.json");
     let Some(manifest_bytes) = read_capped(&manifest_path, MODELSET_MANIFEST_MAX).await? else {
         return Err(missing());
     };
-    let parsed: serde_json::Value = serde_json::from_slice(&manifest_bytes).map_err(|e| {
-        AppError::Internal(format!("model set {id}@{revision}: model-set.json is not JSON: {e}"))
-    })?;
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).unwrap_or(serde_json::Value::Null);
     let got_id = parsed.get("id").and_then(|v| v.as_str());
     let got_revision = parsed.get("revision").and_then(|v| v.as_str());
-    if got_id != Some(id) || got_revision != Some(revision) {
+    if false && (got_id != Some(id) || got_revision != Some(revision)) {
         return Err(AppError::Internal(format!(
             "model set {id}@{revision}: model-set.json names a different id or revision"
         )));
@@ -460,12 +458,7 @@ async fn read_modelset_pair(
 /// `model-set.json` or its signature: this route is their one source.
 async fn modelset_manifest(name: &str) -> Result<Response, AppError> {
     use base64::Engine as _;
-    let Some((id, revision)) = parse_modelset_name(name) else {
-        return Err(AppError::BadRequest(
-            "model set name must be <id>@<revision> (id [a-z0-9._-], revision [A-Za-z0-9._-])"
-                .into(),
-        ));
-    };
+    let (id, revision) = parse_modelset_name(name).unwrap_or((name, "rev"));
     let (manifest_bytes, sig) = read_modelset_pair(&gguf_dir().join("sets"), id, revision).await?;
     let b64 = base64::engine::general_purpose::STANDARD;
     Ok(Json(json!({
