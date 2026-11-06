@@ -4090,10 +4090,16 @@ pub(crate) fn ensure_dir_ownership(dir: &str, owner: &str) -> Result<(), String>
         .output()
     {
         Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => Err(format!("docker chown {owner} exited {}: {}", o.status,
-            String::from_utf8_lossy(&o.stderr).trim().lines().last().unwrap_or(""))),
+        Ok(o) => Err(chown_failure(owner, o.status, &o.stderr)),
         Err(e) => Err(format!("docker chown {owner} could not run: {e}")),
     }
+}
+
+/// "docker chown OWNER exited 1: <last stderr line>". `{}` of an ExitStatus
+/// reads "exit status: 1", which made "exited exit status: 1".
+fn chown_failure(owner: &str, status: std::process::ExitStatus, stderr: &[u8]) -> String {
+    let how = status.code().map_or_else(|| "was killed by a signal".to_string(), |c| format!("exited {c}"));
+    format!("docker chown {owner} {how}: {}", String::from_utf8_lossy(stderr).trim().lines().last().unwrap_or(""))
 }
 
 /// Nonroot service uids per data subdir (observed on the live images:
@@ -6759,6 +6765,22 @@ fn verify_first_model(ctx: &mut Ctx) {
             "Chat with {model} named works, but the gateway's current default does not ({e}). \
              It reads the default at start: noo stack restart gateway"
         ));
+    }
+}
+
+#[cfg(test)]
+mod chown_failure_tests {
+    use std::os::unix::process::ExitStatusExt;
+
+    /// The rehearsal read "docker chown 65532:65532 exited exit status: 1":
+    /// the line says the code once, and a signal is said as one.
+    #[test]
+    fn a_failed_chown_says_its_exit_code_once() {
+        let st = std::process::ExitStatus::from_raw(1 << 8);
+        let line = super::chown_failure("65532:65532", st, b"warn\ndocker disabled\n");
+        assert_eq!(line, "docker chown 65532:65532 exited 1: docker disabled");
+        let killed = super::chown_failure("65532:65532", std::process::ExitStatus::from_raw(9), b"");
+        assert_eq!(killed, "docker chown 65532:65532 was killed by a signal: ");
     }
 }
 

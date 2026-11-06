@@ -2061,6 +2061,17 @@ fn self_prep_line(node: &str, prep: &Path, data_root: &str, work: &Path) -> Resu
     Ok(format!("{} || echo \"host prep exited $? — continuing\" >&2\n", command_line(&c)))
 }
 
+/// A root shell running `script` (`program` is `sudo`; a test passes `env`).
+/// Its stdout goes to OUR stderr: what the script prints (prep-host's `say`
+/// lines) is progress for a person, and under `--json` stdout carries the one
+/// JSON document only (0.6.17-rc.1 rehearsal, B5.json: two prep-host lines
+/// on stdout). stdin and stderr stay inherited, since sudo may prompt.
+pub(crate) fn root_shell(program: &str, script: &str) -> Command {
+    let mut c = Command::new(program);
+    c.args(["sh", "-c", script]).stdout(std::process::Stdio::from(std::io::stderr()));
+    c
+}
+
 /// The ONE-TIME creation of this controller's node identity (i67 migration:
 /// a controller installed before 0.6.3 has no birth key, pull units or
 /// gateway copy). One sudo, said as such; afterwards every install of this
@@ -2080,7 +2091,7 @@ pub(crate) fn ensure_self_identity(node: &str) -> Result<(), String> {
         Err(e) => { let _ = std::fs::remove_dir_all(&work); return Err(e); }
     };
     let script = format!("set -e\n{}", self_identity_script(node, &work, Path::new("/etc/noo"), &line));
-    let ok = Command::new("sudo").args(["sh", "-c", &script]).status().map(|s| s.success()).unwrap_or(false);
+    let ok = root_shell("sudo", &script).status().map(|s| s.success()).unwrap_or(false);
     let _ = std::fs::remove_dir_all(&work);
     if !ok {
         return Err("the identity script did not complete (see output above)".into());
@@ -3051,7 +3062,7 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
             leaves: &leaves.iter().map(|(k, _)| k.to_string()).collect::<Vec<_>>(),
             restart: !changed.is_empty() || !active,
         });
-        let code = Command::new("sudo").args(["sh", "-c", &script])
+        let code = root_shell("sudo", &script)
             .status().ok().and_then(|s| s.code());
         // Scrub the staged secrets regardless of outcome.
         for staged_kind in ["agent-env", "nats-creds", "node.key"].into_iter()
@@ -4671,6 +4682,23 @@ pub(crate) const HARNESS_TLS_KEY: &str = "/etc/noo/pki/harness/node.key";
 
 #[cfg(test)]
 mod tests {
+    /// What a root script prints never reaches our stdout (`--json` carries
+    /// one document there): it goes to stderr. The run is real (`env` in
+    /// place of sudo): the script's own stderr line proves it ran.
+    #[test]
+    fn a_root_script_prints_nothing_on_stdout() {
+        let o = super::root_shell("env", "echo 'prep-host: Docker present'; echo ran >&2")
+            .output()
+            .expect("run sh");
+        assert!(o.status.success(), "{o:?}");
+        assert_eq!(String::from_utf8_lossy(&o.stderr), "ran\n", "the script did not run");
+        assert!(o.stdout.is_empty(), "a root script wrote to stdout: {:?}", String::from_utf8_lossy(&o.stdout));
+        // Both sudo sites that run host prep go through it.
+        let prod = crate::test_src::own_code(include_str!("provision.rs"));
+        assert_eq!(prod.matches("root_shell(\"sudo\", &script)").count(), 2);
+        assert!(!prod.contains("Command::new(\"sudo\").args([\"sh\", \"-c\""), "a sudo shell bypasses root_shell");
+    }
+
     #[test]
     fn a_busy_gpu_provisions_as_a_gpu_node_and_a_missing_one_does_not() {
         use super::gpu_tier;
