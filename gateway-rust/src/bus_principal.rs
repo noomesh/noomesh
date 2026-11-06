@@ -870,7 +870,7 @@ mod tests {
     fn delegation_provenance_survives_signing_and_replay() {
         let ctx = crate::auth::RequesterCtx {
             sub: "alice/agent".into(), role: crate::auth::Role::Admin, scopes: vec!["admin".into()],
-            act: Some(crate::auth::Actor { sub: "key:fixture-agent".into(), iss_user: Some("alice".into()), task: None }),
+            act: Some(crate::auth::Actor { sub: "key:fixture-agent".into(), iss_user: Some("alice".into()), task: None, feature: None }),
             harness: Some("mcp-external:fixture-agent".into()),
         };
         let principal = for_requester(&ctx);
