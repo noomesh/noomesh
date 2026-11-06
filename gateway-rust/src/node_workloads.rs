@@ -1461,7 +1461,26 @@ pub struct DesiredEntry {
 #[serde(deny_unknown_fields, default)]
 pub struct ImageRef {
     pub name: String,
+    /// The lock digest: the REGISTRY MANIFEST digest. Record-only on the node.
     pub digest: String,
+    /// The image ID (config digest) the CLI recorded after its digest-verified
+    /// pull (the `.imageid` sidecar). The node runs the worker by this ID only.
+    pub id: String,
+    /// The rail artifact: `noo-addon-wl_<addon>_<image>_<digest hex>_<arch>.tar`.
+    pub artifact: String,
+}
+
+/// Is `artifact` the rail tar name for (addon, image name, digest)? The arch
+/// is checked against the node's at runtime (F5, `arch_mismatch`).
+pub fn artifact_ok(artifact: &str, addon: &str, name: &str, digest: &str) -> bool {
+    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+    let Some(arch) = artifact
+        .strip_prefix(&format!("noo-addon-wl_{addon}_{name}_{hex}_"))
+        .and_then(|rest| rest.strip_suffix(".tar"))
+    else {
+        return false;
+    };
+    matches!(arch, "amd64" | "arm64")
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -1581,7 +1600,19 @@ pub fn validate_desired_entry(raw: &Value, agent_cn: &str) -> Result<DesiredEntr
     if e.image.name != d.image || !digest_re().is_match(&e.image.digest) {
         return fail(
             code::IMAGE_MISSING,
-            format!("image must be {{name: {:?}, digest: sha256:<64 hex>}}", d.image),
+            format!("image must be {{name: {:?}, digest: sha256:<64 hex>, id, artifact}}", d.image),
+        );
+    }
+    if !digest_re().is_match(&e.image.id) {
+        return fail(code::IMAGE_MISSING, "image.id must be sha256:<64 lower-case hex>");
+    }
+    if !artifact_ok(&e.image.artifact, &e.addon, &e.image.name, &e.image.digest) {
+        return fail(
+            code::IMAGE_MISSING,
+            format!(
+                "image.artifact must be noo-addon-wl_{}_{}_<hex of digest>_<amd64|arm64>.tar",
+                e.addon, e.image.name
+            ),
         );
     }
     let Some(door) = e.door.as_ref().filter(|d| !d.leaf.is_empty()) else {
@@ -1910,6 +1941,24 @@ mod tests {
         assert_eq!(es[0].state, STATE_PROVISIONED);
         assert_eq!(es[1].state, STATE_RUNNING);
         assert!(es[0].reservation.is_none() && es[1].reservation.is_some());
+    }
+
+    #[test]
+    fn the_artifact_names_its_own_addon_image_digest_and_a_known_arch() {
+        let d = format!("sha256:{}", "ab".repeat(32));
+        let good = format!("noo-addon-wl_rhaddon_addon-worker_{}_amd64.tar", "ab".repeat(32));
+        assert!(artifact_ok(&good, "rhaddon", "addon-worker", &d));
+        assert!(artifact_ok(&good.replace("amd64", "arm64"), "rhaddon", "addon-worker", &d));
+        for bad in [
+            good.replace("amd64", "riscv64"),
+            good.replace("rhaddon", "other"),
+            good.replace("addon-worker", "other-image"),
+            good.replace(&"ab".repeat(32), &"cd".repeat(32)),
+            good.replace(".tar", ".tgz"),
+            format!("../{good}"),
+        ] {
+            assert!(!artifact_ok(&bad, "rhaddon", "addon-worker", &d), "{bad}");
+        }
     }
 
     #[test]
