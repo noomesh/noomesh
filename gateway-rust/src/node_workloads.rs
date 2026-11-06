@@ -693,13 +693,23 @@ pub struct EnvBound {
 
 /// Writable space: a size-capped named volume (`max_mb`) or a tmpfs
 /// (`tmpfs_mb`), exactly one of the two.
+///
+/// `exec` (i300 A12, default `false`): this one scratch is mounted without
+/// `noexec`, so the worker can load native code it compiled itself (Triton's
+/// kernel cache). At most one entry per workload, sized at most
+/// [`EXEC_SCRATCH_MAX_MB`]; a non-boolean is `field_type`.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Scratch {
     pub target: String,
     pub max_mb: Option<i64>,
     pub tmpfs_mb: Option<i64>,
+    pub exec: bool,
 }
+
+/// The largest scratch that may be `exec` (i300 A12): 1024 MiB, whichever of
+/// `max_mb` or `tmpfs_mb` sizes it.
+pub const EXEC_SCRATCH_MAX_MB: i64 = 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -1108,6 +1118,18 @@ fn validate_scratch(ss: &[Scratch], ms: &[Slot]) -> Result<(), Refusal> {
             return fail(
                 code::SCRATCH_INVALID,
                 format!("scratch[{i}]: size out of range"),
+            );
+        }
+        if s.exec && s.max_mb.or(s.tmpfs_mb).is_some_and(|v| v > EXEC_SCRATCH_MAX_MB) {
+            return fail(
+                code::SCRATCH_INVALID,
+                format!("scratch[{i}]: an exec scratch is at most {EXEC_SCRATCH_MAX_MB} MiB"),
+            );
+        }
+        if s.exec && ss[..i].iter().any(|o| o.exec) {
+            return fail(
+                code::SCRATCH_INVALID,
+                format!("scratch[{i}]: a second exec scratch (at most one per workload)"),
             );
         }
         for o in &ss[..i] {
@@ -2163,6 +2185,64 @@ mod tests {
     fn another_nodes_agent_is_not_admitted() {
         let e = validate_desired(&read(&["desired", "valid-running.json"]), "node-b").unwrap_err();
         assert_eq!(e.code, code::ADMIT_INVALID);
+    }
+
+    /// valid-rhaddon.json with its one workload's `scratch` replaced.
+    fn with_scratch(scratch: Value) -> Result<NodeWorkloads, Refusal> {
+        let mut v: Value = serde_json::from_slice(&read(&["node-workloads", "valid-rhaddon.json"])).unwrap();
+        v["workloads"][0]["scratch"] = scratch;
+        validate_decl(&serde_json::to_vec(&v).unwrap(), "rhaddon", &lock_images(), Some(&fixture_routes()))
+    }
+
+    /// i300 A12: one scratch may be `exec`, up to 1024 MiB of either kind;
+    /// `exec: false` and an absent `exec` are the same.
+    #[test]
+    fn one_exec_scratch_is_accepted() {
+        for exec in [
+            serde_json::json!({"target": "/cache/triton", "tmpfs_mb": 512, "exec": true}),
+            serde_json::json!({"target": "/cache/triton", "tmpfs_mb": 1024, "exec": true}),
+            serde_json::json!({"target": "/cache/triton", "max_mb": 1024, "exec": true}),
+            serde_json::json!({"target": "/cache/triton", "max_mb": 4096, "exec": false}),
+        ] {
+            let nw = with_scratch(serde_json::json!([{"target": "/cache", "max_mb": 4096}, exec.clone()]))
+                .unwrap_or_else(|e| panic!("{exec}: {e}"));
+            assert_eq!(nw.workloads[0].scratch[1].exec, exec["exec"] == true, "{exec}");
+            assert!(!nw.workloads[0].scratch[0].exec, "absent exec is false");
+        }
+    }
+
+    #[test]
+    fn a_second_exec_scratch_is_refused() {
+        let e = with_scratch(serde_json::json!([
+            {"target": "/cache/triton", "tmpfs_mb": 512, "exec": true},
+            {"target": "/cache/other", "tmpfs_mb": 64, "exec": true},
+        ]))
+        .unwrap_err();
+        assert_eq!(e.code, code::SCRATCH_INVALID, "{e}");
+        assert!(e.to_string().contains("second exec scratch"), "{e}");
+    }
+
+    #[test]
+    fn an_exec_scratch_over_1024_mib_is_refused_either_kind() {
+        for big in [
+            serde_json::json!({"target": "/cache/triton", "tmpfs_mb": 1025, "exec": true}),
+            serde_json::json!({"target": "/cache/triton", "max_mb": 1025, "exec": true}),
+        ] {
+            let e = with_scratch(serde_json::json!([big.clone()])).unwrap_err();
+            assert_eq!(e.code, code::SCRATCH_INVALID, "{big}: {e}");
+            assert!(e.to_string().contains("at most 1024 MiB"), "{big}: {e}");
+        }
+        // The cap is on exec only: a plain scratch keeps its own range.
+        assert!(with_scratch(serde_json::json!([{"target": "/cache", "tmpfs_mb": 2048}])).is_ok());
+    }
+
+    #[test]
+    fn a_non_boolean_exec_is_field_type() {
+        for bad in [serde_json::json!("true"), serde_json::json!(1), Value::Null] {
+            let e = with_scratch(serde_json::json!([{"target": "/cache/triton", "tmpfs_mb": 512, "exec": bad.clone()}]))
+                .unwrap_err();
+            assert_eq!(e.code, code::FIELD_TYPE, "{bad}: {e}");
+        }
     }
 
     #[test]
