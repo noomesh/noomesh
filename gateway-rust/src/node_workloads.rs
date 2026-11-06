@@ -72,6 +72,7 @@ pub mod code {
     pub const SCRATCH_INVALID: &str = "scratch_invalid";
     pub const SCRATCH_IN_MODEL_SLOT: &str = "scratch_in_model_slot";
     pub const LIMITS_INVALID: &str = "limits_invalid";
+    pub const SERVICE_DRAIN_INVALID: &str = "service_drain_invalid";
 
     // model-set.json.
     pub const ID_INVALID: &str = "id_invalid";
@@ -528,6 +529,9 @@ pub struct Decl {
     pub protocols: Vec<String>,
     pub health: Health,
     pub drain: Drain,
+    /// The add-on's CPU-side drain route, which the gateway calls first on
+    /// release (service drain, then the worker's `drain.path`). Required.
+    pub service_drain: Option<ServiceDrain>,
     pub accel: Accel,
     pub models: Vec<Slot>,
     pub env: BTreeMap<String, EnvBound>,
@@ -548,6 +552,81 @@ pub struct Health {
 pub struct Drain {
     pub path: String,
     pub timeout_secs: i64,
+}
+
+/// A route NAME in the add-on's routes.json (never a path, never inferred)
+/// and how long the gateway waits for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ServiceDrain {
+    pub route: String,
+    pub timeout_secs: i64,
+}
+
+/// An add-on's routes as name -> internal?, the input the `service_drain`
+/// cross-file rule needs. The node agent has none and passes `None`.
+pub type Routes = BTreeMap<String, bool>;
+
+/// Read `routes.json` into [`Routes`]. Only `name` and `internal` matter here;
+/// the manifest itself is validated by the add-on registry.
+pub fn routes_from_json(b: &[u8]) -> Result<Routes, String> {
+    let v: Value = serde_json::from_slice(b).map_err(|e| e.to_string())?;
+    let mut out = Routes::new();
+    for r in v["routes"].as_array().map(Vec::as_slice).unwrap_or_default() {
+        if let Some(name) = r["name"].as_str() {
+            out.insert(name.to_string(), r["internal"].as_bool() == Some(true));
+        }
+    }
+    Ok(out)
+}
+
+/// The route-name rule of routes.json (crates/addon-manifest `name_ok`).
+fn route_name_ok(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty()
+        && b.len() <= 64
+        && b[0].is_ascii_lowercase()
+        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_')
+}
+
+/// `service_drain` is required; its shape is always checked. `routes` None
+/// (the agent) skips ONLY the route-exists-and-is-internal rule.
+fn validate_service_drain(s: Option<&ServiceDrain>, routes: Option<&Routes>) -> Result<(), Refusal> {
+    let Some(s) = s else {
+        return fail(
+            code::SERVICE_DRAIN_INVALID,
+            "`service_drain` is required: the add-on's drain route and timeout",
+        );
+    };
+    if !route_name_ok(&s.route) {
+        return fail(
+            code::SERVICE_DRAIN_INVALID,
+            format!("service_drain.route {:?} is not a route name ([a-z][a-z0-9_]{{0,63}})", s.route),
+        );
+    }
+    if s.timeout_secs < 1 || s.timeout_secs > 3600 {
+        return fail(
+            code::SERVICE_DRAIN_INVALID,
+            format!("service_drain.timeout_secs {} (1..3600)", s.timeout_secs),
+        );
+    }
+    let Some(routes) = routes else {
+        return Ok(());
+    };
+    match routes.get(&s.route) {
+        None => fail(
+            code::SERVICE_DRAIN_INVALID,
+            format!("service_drain.route {:?} is not a route of the add-on's routes.json", s.route),
+        ),
+        Some(false) => fail(
+            code::SERVICE_DRAIN_INVALID,
+            format!(
+                "service_drain.route {:?} must be an `internal` route: the gateway calls it and decides when",
+                s.route
+            ),
+        ),
+        Some(true) => Ok(()),
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -626,11 +705,15 @@ pub fn env_prefix(addon: &str) -> String {
 
 /// Validate a node-workloads.json for `addon`. `lock_images` is the set of
 /// image NAMES in the add-on's verified lock (`images` map keys); a
-/// workload's `image` must be one of them. The first refusal wins.
+/// workload's `image` must be one of them. `routes` is the add-on's
+/// routes.json ([`routes_from_json`]): `service_drain.route` must be an
+/// internal route of it; `None` skips only that cross-file rule (the gateway
+/// and the CLI always pass it). The first refusal wins.
 pub fn validate_decl(
     bytes: &[u8],
     addon: &str,
     lock_images: &BTreeSet<String>,
+    routes: Option<&Routes>,
 ) -> Result<NodeWorkloads, Refusal> {
     check_duplicate_keys(bytes)?;
     check_nulls(bytes, NULLABLE_NONE)?;
@@ -652,7 +735,7 @@ pub fn validate_decl(
     let mut out = Vec::with_capacity(file.workloads.len());
     let mut seen: HashSet<String> = HashSet::new();
     for (i, raw) in file.workloads.iter().enumerate() {
-        let d = parse_workload(addon, raw, Some(lock_images))?;
+        let d = parse_workload(addon, raw, Some(lock_images), routes)?;
         if !seen.insert(d.name.clone()) {
             return fail(
                 code::NAME_DUPLICATE,
@@ -674,6 +757,7 @@ fn parse_workload(
     addon: &str,
     raw: &Value,
     lock: Option<&BTreeSet<String>>,
+    routes: Option<&Routes>,
 ) -> Result<Decl, Refusal> {
     // Go decodes JSON null into a struct as a no-op, leaving the zero value.
     let d: Decl = if raw.is_null() {
@@ -704,7 +788,7 @@ fn parse_workload(
     ] {
         require_keys(field(Some(raw), sub), sub, keys)?;
     }
-    validate_decl_rules(addon, &d, lock)?;
+    validate_decl_rules(addon, &d, lock, routes)?;
     Ok(d)
 }
 
@@ -729,6 +813,7 @@ fn validate_decl_rules(
     addon: &str,
     d: &Decl,
     lock: Option<&BTreeSet<String>>,
+    routes: Option<&Routes>,
 ) -> Result<(), Refusal> {
     if !door_name_re().is_match(addon) {
         return fail(
@@ -825,6 +910,7 @@ fn validate_decl_rules(
             "drain needs an absolute path and timeout_secs 1..3600",
         );
     }
+    validate_service_drain(d.service_drain.as_ref(), routes)?;
     if d.accel.gpu < 0 || d.accel.gpu > 8 {
         return fail(code::ACCEL_INVALID, format!("accel.gpu {} (0..8)", d.accel.gpu));
     }
@@ -1584,7 +1670,9 @@ pub fn validate_desired_entry(raw: &Value, agent_cn: &str) -> Result<DesiredEntr
             );
         }
     }
-    let d = parse_workload(&e.addon, &e.decl, None).map_err(|inner| Refusal {
+    let d = // No routes: the gateway already held service_drain to routes.json when it
+    // validated the add-on; the entry re-checks its shape only, as the agent does.
+    parse_workload(&e.addon, &e.decl, None, None).map_err(|inner| Refusal {
         code: code::DECL_INVALID,
         detail: inner.detail,
         inner: Some(inner.code),
@@ -1822,7 +1910,7 @@ mod tests {
         let cases: Vec<Case> = serde_json::from_slice(&read(&[dir, "cases.json"]))
             .unwrap_or_else(|e| panic!("{dir}/cases.json: {e}"));
         assert!(!cases.is_empty(), "{dir}/cases.json has no cases");
-        let mut listed: HashSet<String> = ["cases.json", "lock.json"]
+        let mut listed: HashSet<String> = ["cases.json", "lock.json", "routes.json"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -1860,15 +1948,45 @@ mod tests {
         v["images"].as_object().expect("lock images").keys().cloned().collect()
     }
 
+    fn fixture_routes() -> Routes {
+        let r = routes_from_json(&read(&["node-workloads", "routes.json"])).unwrap();
+        assert!(r.get("drain") == Some(&true) && r.get("status") == Some(&false) && r.len() == 2, "{r:?}");
+        r
+    }
+
+    /// `None` routes (the agent) skips only the cross-file rule; the shape of
+    /// service_drain is always checked.
+    #[test]
+    fn no_routes_skips_only_the_cross_file_check() {
+        let lock = lock_images();
+        for f in ["refuse-service-drain-route-unknown.json", "refuse-service-drain-route-public.json"] {
+            let b = read(&["node-workloads", f]);
+            assert!(validate_decl(&b, TEST_ADDON, &lock, None).is_ok(), "{f} with no routes");
+            let e = validate_decl(&b, TEST_ADDON, &lock, Some(&fixture_routes())).unwrap_err();
+            assert_eq!(e.code, code::SERVICE_DRAIN_INVALID, "{f}: {e}");
+        }
+        for f in [
+            "refuse-service-drain-missing.json",
+            "refuse-service-drain-route-empty.json",
+            "refuse-service-drain-timeout-zero.json",
+            "refuse-service-drain-timeout-3601.json",
+            "refuse-service-drain-route-name.json",
+        ] {
+            let e = validate_decl(&read(&["node-workloads", f]), TEST_ADDON, &lock, None).unwrap_err();
+            assert_eq!(e.code, code::SERVICE_DRAIN_INVALID, "{f}: {e}");
+        }
+    }
+
     #[test]
     fn node_workloads_fixtures() {
         let lock = lock_images();
         assert!(!lock.is_empty(), "lock.json lists no images");
+        let routes = fixture_routes();
         let cases = load_cases("node-workloads");
         let mut rows = 0;
         for c in &cases {
             let addon = c.addon.as_deref().unwrap_or(TEST_ADDON);
-            let r = validate_decl(&read(&["node-workloads", c.file.as_str()]), addon, &lock);
+            let r = validate_decl(&read(&["node-workloads", c.file.as_str()]), addon, &lock, Some(&routes));
             if c.valid {
                 if let Ok(nw) = &r {
                     assert!(!nw.workloads.is_empty(), "{}: parsed with no workloads", c.file);
@@ -1973,6 +2091,7 @@ mod tests {
             &read(&["node-workloads", "valid-rhaddon.json"]),
             "rhaddon",
             &lock_images(),
+            Some(&fixture_routes()),
         )
         .unwrap();
         assert_eq!(nw.workloads.len(), 1);
@@ -2150,14 +2269,14 @@ mod tests {
             "format": "noo-addon-node-workloads/1",
             "workloads": [("name": "a", "health": ("ready": "/a", "ready": "/b"))]
         )"#);
-        let e = validate_decl(decl.as_bytes(), TEST_ADDON, &lock_images()).unwrap_err();
+        let e = validate_decl(decl.as_bytes(), TEST_ADDON, &lock_images(), Some(&fixture_routes())).unwrap_err();
         assert_eq!(e.code, code::DUPLICATE_KEY, "{e}");
         // In a map-typed field (env), which serde would collapse silently.
         let env = obj(r#"(
             "format": "noo-addon-node-workloads/1",
             "workloads": [("name": "a", "env": ("RHADDON_X": ("min": 1), "RHADDON_X": ("min": 2)))]
         )"#);
-        let e = validate_decl(env.as_bytes(), TEST_ADDON, &lock_images()).unwrap_err();
+        let e = validate_decl(env.as_bytes(), TEST_ADDON, &lock_images(), Some(&fixture_routes())).unwrap_err();
         assert_eq!(e.code, code::DUPLICATE_KEY, "{e}");
         // The same key in sibling objects is not a repeat.
         let sibling = obj(r#"("a": ("x": 1), "b": ("x": 2))"#);
@@ -2172,7 +2291,7 @@ mod tests {
             "format": "noo-addon-node-workloads/1",
             "workloads": [("name": "a", "accel": ("gpu": null))]
         )"#);
-        let e = validate_decl(decl.as_bytes(), TEST_ADDON, &lock_images()).unwrap_err();
+        let e = validate_decl(decl.as_bytes(), TEST_ADDON, &lock_images(), Some(&fixture_routes())).unwrap_err();
         assert_eq!(e.code, code::FIELD_TYPE, "{e}");
         // In desired-config, null comes back as field_type ITSELF, even on a
         // decl field nested inside an entry (not desired_invalid, not
