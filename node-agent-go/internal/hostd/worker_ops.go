@@ -432,7 +432,7 @@ func opUnitLogs(ctx context.Context, e *Engine, name string, c *Command) (int, s
 	if rc != 0 {
 		return rc, fmt.Sprintf("journalctl for %s exited %d", unit, rc)
 	}
-	if err := os.WriteFile(filepath.Join(e.Spool, name+LogOutSuffix), []byte(out), 0o644); err != nil {
+	if err := spoolWriteFile(e.Spool, name+LogOutSuffix, []byte(out), 0o644); err != nil {
 		return 1, "could not write the log payload: " + err.Error()
 	}
 	return 0, ""

@@ -214,7 +214,7 @@ func opRecreate(ctx context.Context, e *Engine, name string, c *Command) (int, s
 		"UNHEALTHY %s at %s\n  op=%s service=%s\n  rollback.sha=%s\n  rollback.files=%s\n"+
 			"  NOTE: auto-rollback intentionally NOT performed (host tree may hold uncommitted work).\n",
 		name, stamp(), c.Op, c.Service, sha, files)
-	if err := os.WriteFile(filepath.Join(e.Spool, "UNHEALTHY-"+name+".alert"), []byte(body), 0o644); err != nil {
+	if err := spoolWriteFile(e.Spool, "UNHEALTHY-"+name+".alert", []byte(body), 0o644); err != nil {
 		e.logf("ERROR %s: cannot write UNHEALTHY alert file (the operator will not see it in the spool): %v", name, err)
 	}
 
@@ -525,12 +525,13 @@ func opStackRebuild(ctx context.Context, e *Engine, name string, c *Command) (in
 		args = append(args, a)
 	}
 
-	marker := filepath.Join(e.Spool, name+".rebuild.running")
-	if existing, _ := filepath.Glob(filepath.Join(e.Spool, "*.rebuild.running")); len(existing) > 0 {
+	markerName := name + ".rebuild.running"
+	marker := filepath.Join(e.Spool, markerName)
+	if existing, _ := spoolNamesWithSuffix(e.Spool, ".rebuild.running"); len(existing) > 0 {
 		return 1, "another stack rebuild is already running"
 	}
 	logPath := filepath.Join(e.Spool, name+".rebuild.log")
-	if err := os.WriteFile(marker, nil, 0o644); err != nil {
+	if err := spoolWriteFile(e.Spool, markerName, nil, 0o644); err != nil {
 		return 1, fmt.Sprintf("cannot claim rebuild marker: %v", err)
 	}
 
@@ -565,7 +566,8 @@ func opStackRebuild(ctx context.Context, e *Engine, name string, c *Command) (in
 // job — it must land on disk as it happens, not be buffered into a result
 // field that appears when it is already too late to watch.
 func (e *Engine) runRebuildScript(ctx context.Context, logPath string, args []string) int {
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	dir, base := splitSpoolPath(logPath)
+	f, err := spoolOpenAppend(dir, base)
 	if err != nil {
 		return 1
 	}

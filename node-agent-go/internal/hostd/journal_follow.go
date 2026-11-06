@@ -294,12 +294,9 @@ func (e *Engine) cursorPath() string { return filepath.Join(e.Spool, JournalCurs
 // readCursor returns the persisted cursor, or "" when there is none or it
 // is too old to resume from safely.
 func (e *Engine) readCursor() string {
-	st, err := os.Stat(e.cursorPath())
-	if err != nil || time.Since(st.ModTime()) > journalCursorMaxAge {
-		return ""
-	}
-	b, err := os.ReadFile(e.cursorPath())
-	if err != nil {
+	// A single line in a user-owned directory: NOFOLLOW, regular, capped.
+	b, mod, err := spoolReadFile(e.Spool, JournalCursorFile, maxSpoolSmallReadBytes)
+	if err != nil || time.Since(mod) > journalCursorMaxAge {
 		return ""
 	}
 	c := strings.TrimSpace(string(b))
@@ -310,11 +307,7 @@ func (e *Engine) readCursor() string {
 }
 
 func (e *Engine) writeCursor(c string) {
-	tmp := e.cursorPath() + ".tmp"
-	if err := os.WriteFile(tmp, []byte(c+"\n"), 0o644); err != nil {
-		return
-	}
-	_ = os.Rename(tmp, e.cursorPath())
+	_ = spoolWriteFile(e.Spool, JournalCursorFile, []byte(c+"\n"), 0o644)
 }
 
 // rotatingWriter appends lines to path and, past cap bytes, renames it to
@@ -336,7 +329,8 @@ func newRotatingWriter(path string, capBytes int64) (*rotatingWriter, error) {
 }
 
 func (w *rotatingWriter) open() error {
-	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	dir, base := splitSpoolPath(w.path)
+	f, err := spoolOpenAppend(dir, base)
 	if err != nil {
 		return err
 	}
@@ -362,7 +356,8 @@ func (w *rotatingWriter) WriteLine(line []byte) error {
 
 func (w *rotatingWriter) rotate() error {
 	_ = w.f.Close()
-	if err := os.Rename(w.path, w.path+".1"); err != nil && !os.IsNotExist(err) {
+	dir, base := splitSpoolPath(w.path)
+	if err := spoolRename(dir, base, base+".1"); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return w.open()
