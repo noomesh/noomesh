@@ -1714,7 +1714,8 @@ pub(crate) fn with_quality(env: &str, quality: &str) -> String {
 /// On an enrolled seat, the controller command that sets what `noo kiosk
 /// set` was asked for (i510 c1); `None` on a box that is not a seat.
 pub(crate) fn seat_display_pointer(seat: Option<&str>, args: &[String]) -> Option<String> {
-    let seat = seat?;
+    // MUTANT: a seat edits its own file again.
+    let seat = seat.filter(|s| s.is_empty())?;
     let value = match args {
         [k, v, ..] if k == "quality" && ["lean", "full", "auto"].contains(&v.as_str()) => v.as_str(),
         _ => "lean",
