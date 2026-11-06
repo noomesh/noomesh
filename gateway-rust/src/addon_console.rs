@@ -253,8 +253,9 @@ mod tests {
             .is_err());
         }
         let core = crate::routes::core_router();
+        let probe_path = "/example-space";
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-            || core.route("/example-space", get(|| async { "probe" }))
+            || core.route(probe_path, get(|| async { "probe" }))
         ))
         .is_ok());
     }
