@@ -1350,11 +1350,8 @@ pub fn kiosk_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // "The proxy has not said" is a real answer and a different one from
     // "expired". Neither is a guess.
     let unsaid = ui::muted("unknown (the proxy has published no state)").to_string();
-    let expiry = match expires {
-        Some(e) if e > now => format!("in {}s", e - now),
-        Some(_) => ui::bad("expired"),
-        None => unsaid.clone(),
-    };
+    let hb_age = heartbeat.map(|ms| (now * 1000 - ms) / 1000);
+    let expiry = token_expiry_cell(expires, minted_at, hb_age, now).unwrap_or_else(|| unsaid.clone());
     let hb = match heartbeat {
         Some(ms) => {
             let age = (now * 1000 - ms) / 1000;
@@ -1422,12 +1419,7 @@ pub fn kiosk_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ("tailscale logs", telemetry_rows_cell(&telem, "tailscale logs")),
         ("os reporters", telemetry_rows_cell(&telem, "os reporters")),
         ("graph frame", match &frame {
-            Some(v) => {
-                let ms = v["ms"].as_i64().unwrap_or(0);
-                let tier = v["quality"].as_str().unwrap_or("?");
-                let s = format!("{ms}ms of work per frame, drawing {tier}");
-                if ms > 33 { ui::warn(&s) } else { s }
-            }
+            Some(v) => graph_frame_cell(v),
             None if cdp => ui::muted("not measured (not the graph view, or the page has not painted yet)").to_string(),
             None => ui::muted("unknown (CDP not answering)").to_string(),
         }),
@@ -1873,6 +1865,46 @@ fn labels_via_proxy(port: i64) -> Option<bool> {
         .read_json()
         .ok()?;
     seat_labels(&body)
+}
+
+/// The "token expires" cell, or `None` when the proxy has not said.
+///
+/// The display lives on one events stream and makes no other authenticated
+/// request while it is busy, and the proxy mints only on a request. So a
+/// stored token can lapse while the page is live: that is not a broken
+/// display, and the cell says so instead of a bare "expired". (Since the
+/// gateway ends a kiosk stream at its token's exp, the reconnect re-mints.)
+pub(crate) fn token_expiry_cell(expires: Option<i64>, minted_at: Option<i64>, heartbeat_age: Option<i64>, now: i64) -> Option<String> {
+    let e = expires?;
+    if e > now {
+        return Some(format!("in {}s", e - now));
+    }
+    let mint = minted_at
+        .filter(|t| *t <= now)
+        .map(|t| format!(", last mint {}s ago", now - t))
+        .unwrap_or_default();
+    let ago = now - e;
+    Some(if heartbeat_age.is_some_and(|a| a <= 300) {
+        ui::warn(&format!(
+            "expired {ago}s ago{mint}; the display is live on a stream that predates it and renews on its next request"
+        ))
+    } else {
+        ui::bad(&format!("expired {ago}s ago{mint}"))
+    })
+}
+
+/// The "graph frame" cell from the page's `{ms, quality, pinned}` measure.
+/// A quality pinned by `?quality=` (`noo kiosk set quality lean|full`)
+/// turns the governor off, so its average never moves from 0: say "pinned"
+/// instead of a misleading "0ms of work per frame".
+pub(crate) fn graph_frame_cell(v: &serde_json::Value) -> String {
+    let tier = v["quality"].as_str().unwrap_or("?");
+    if v["pinned"].as_bool() == Some(true) {
+        return format!("pinned {tier} (governor off; `noo kiosk set quality auto` lets it measure)");
+    }
+    let ms = v["ms"].as_i64().unwrap_or(0);
+    let s = format!("{ms}ms of work per frame, drawing {tier}");
+    if ms > 33 { ui::warn(&s) } else { s }
 }
 
 /// The `labels` flag of a `/api/kiosk/graph` answer.
@@ -3389,5 +3421,39 @@ mod reload_line_tests {
         assert_eq!(reload_line(Some("stack-v0.6.13"), Some("stack-v0.6.13")), "console build stack-v0.6.13 (unchanged)");
         assert_eq!(reload_line(Some("stack-v0.6.12"), Some("stack-v0.6.13")), "console build stack-v0.6.12 -> stack-v0.6.13");
         assert_eq!(reload_line(None, Some("stack-v0.6.13")), "console build stack-v0.6.13");
+    }
+}
+
+#[cfg(test)]
+mod status_wording_tests {
+    use super::{graph_frame_cell, token_expiry_cell};
+    use serde_json::json;
+
+    /// A token that lapsed under a live stream is not a broken display, and
+    /// the cell says which it is.
+    #[test]
+    fn an_expired_token_under_a_live_stream_says_so() {
+        let now = 10_000;
+        assert_eq!(token_expiry_cell(None, None, None, now), None, "the proxy has not said");
+        assert_eq!(token_expiry_cell(Some(10_093), None, None, now).as_deref(), Some("in 93s"));
+        let live = token_expiry_cell(Some(9_000), Some(8_100), Some(15), now).unwrap();
+        assert!(live.contains("expired 1000s ago, last mint 1900s ago"), "{live}");
+        assert!(live.contains("the display is live on a stream that predates it"), "{live}");
+        let dead = token_expiry_cell(Some(9_000), Some(8_100), Some(900), now).unwrap();
+        assert!(dead.contains("expired 1000s ago") && !dead.contains("live"), "{dead}");
+        let unknown = token_expiry_cell(Some(9_000), None, None, now).unwrap();
+        assert!(unknown.contains("expired 1000s ago") && !unknown.contains("last mint"), "{unknown}");
+    }
+
+    /// A pinned tier reads as pinned, never as "0ms of work per frame".
+    #[test]
+    fn a_pinned_tier_reads_pinned_not_zero_ms() {
+        let pinned = graph_frame_cell(&json!({"ms": 0, "quality": "lean", "pinned": true}));
+        assert!(pinned.starts_with("pinned lean (governor off"), "{pinned}");
+        assert!(!pinned.contains("0ms"), "{pinned}");
+        let measured = graph_frame_cell(&json!({"ms": 12, "quality": "full", "pinned": false}));
+        assert_eq!(measured, "12ms of work per frame, drawing full");
+        // An older console that does not publish the flag keeps the old cell.
+        assert_eq!(graph_frame_cell(&json!({"ms": 12, "quality": "lean"})), "12ms of work per frame, drawing lean");
     }
 }

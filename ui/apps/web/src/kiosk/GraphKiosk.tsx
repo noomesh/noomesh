@@ -52,6 +52,8 @@ declare global {
     __nooKioskFrame?: {
       ms: number;
       quality: Quality;
+      /** `?quality=` pinned the tier: the governor is off and `ms` stays 0. */
+      pinned: boolean;
       sim: number;
       paint: number;
       dpr: number;
@@ -306,6 +308,7 @@ function Cloud({ view, labels, quality }: { view: GraphView; labels: boolean; qu
       window.__nooKioskFrame = {
         ms: Math.round(gov.avgMs),
         quality: gov.quality,
+        pinned: quality !== undefined,
         sim: Math.round(avgSim * 10) / 10,
         paint: Math.round(avgPaint * 10) / 10,
         dpr,
