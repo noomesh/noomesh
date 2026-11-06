@@ -115,8 +115,10 @@ realtime}`, `models[]`, `env`, `scratch[]` and `limits {ram_mb, cpus, pids}`
 The door's DNS SAN is `noo-stunnel-<addon>-<workload>`, which must be one DNS
 label of at most 63 characters. So **a node workload is refused when
 `len(addon) + 1 + len(workload) > 51`** (`door_name_too_long`), and both the
-workload name and the add-on name must match `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`
-(`door_name_invalid`): `_`, upper case and a leading or trailing `-` are
+workload name and the add-on name must be lower-case letters, digits and `-`,
+starting and ending with a letter or digit (the `name` pattern in the
+node-workloads schema; `door_name_invalid`): `_`, upper case and a leading or
+trailing `-` are
 refused. `_` is **not** mapped to `-`: a per-file validator cannot see a
 collision between two add-ons. The fixtures pin 51 (valid) and 52 (refused),
 by workload name and by add-on name.
@@ -317,7 +319,7 @@ the add-on prefix; `scratch_target_refused` wins over `scratch_invalid`.
 | CLI, `noo-cli/src/addons/decls.rs` (F2) | `node-workloads.json` at `enable`, `upgrade --check`, `verify` and launch; the lock's images map | `tests/fixtures/i300/node-workloads/` |
 | Gateway, `gateway-rust/src/addon_workloads.rs` (harness) | the same file at every start; env values at placement; builds the desired-config entry | the same fixtures; `desired/` for the entry it emits |
 | Node agent, `node-agent-go/internal/nodewl` | the decl inside every desired-config entry (re-checked, not trusted); the entry; env values; the signed model-set manifest | all three fixture directories |
-| The staging side (CLI), model sets | `model-set.json` at `noo models stage` | `tests/fixtures/i300/model-sets/` |
+| The staging side (CLI), model sets | `model-set.json` at staging, before it is written (i300 F2b) | `tests/fixtures/i300/model-sets/` |
 
 `tests/test_i300_fixture_parity.py` holds the agent's copy of the fixtures
 byte-identical to the canonical set, checks the gateway and CLI copies
