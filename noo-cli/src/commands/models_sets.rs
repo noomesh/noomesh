@@ -683,12 +683,17 @@ pub(crate) struct Staged {
     pub files: Vec<FileRec>,
     pub accept: &'static str,
     pub accepted: Option<(String, String)>,
-    pub manifest: Vec<u8>,
 }
 
 impl Staged {
     pub(crate) fn bytes(&self) -> u64 {
         self.files.iter().map(|f| f.bytes).sum()
+    }
+
+    /// The `model-set.json` as written to the set dir.
+    #[cfg(test)]
+    pub(crate) fn manifest(&self) -> Vec<u8> {
+        std::fs::read(self.dir.join(MANIFEST)).expect("the set dir holds its manifest")
     }
 }
 
@@ -1080,7 +1085,7 @@ pub(crate) fn stage_set(
     std::fs::rename(&sig_part, &sig_path)
         .map_err(|e| io_err(&format!("renaming into {}", sig_path.display()), e))?;
 
-    Ok(Staged { dir: set_dir, files: recs, accept, accepted, manifest })
+    Ok(Staged { dir: set_dir, files: recs, accept, accepted })
 }
 
 /// The human lines for a finished stage.
@@ -1794,7 +1799,7 @@ mod tests {
         }
         assert!(!set.join(".gitattributes").exists());
         let manifest = std::fs::read(set.join(MANIFEST)).unwrap();
-        assert_eq!(manifest, staged.manifest);
+        assert_eq!(manifest, staged.manifest());
         model_set::validate(&manifest).expect("the written manifest is valid");
         let v: Value = serde_json::from_slice(&manifest).unwrap();
         assert_eq!(v["source"]["hf"]["digests"], "authenticated");
@@ -1867,14 +1872,14 @@ mod tests {
         let mut req = request("voice");
         req.accept_license = true;
         let st = run(&f, None, &dir, &req, None).0.expect("accepted by flag");
-        let v: Value = serde_json::from_slice(&st.manifest).unwrap();
+        let v: Value = serde_json::from_slice(&st.manifest()).unwrap();
         assert_eq!(v["license"]["accept"], "operator");
         assert_eq!(v["license"]["accepted"], json!({"by": "alice", "at": "2026-11-05T10:00:00Z"}));
 
         let dir2 = tmpdir("stage-gated-recorded");
         let rec = Some(("bob".to_string(), "2026-10-01T00:00:00Z".to_string()));
         let st = run(&f, None, &dir2, &request("voice"), rec).0.expect("accepted by record");
-        let v: Value = serde_json::from_slice(&st.manifest).unwrap();
+        let v: Value = serde_json::from_slice(&st.manifest()).unwrap();
         assert_eq!(v["license"]["accepted"], json!({"by": "bob", "at": "2026-10-01T00:00:00Z"}));
     }
 
@@ -1910,7 +1915,7 @@ mod tests {
         assert!(sent.iter().any(|a| a.as_deref() == Some(format!("Bearer {token}").as_str())));
 
         // ... and it is in nothing the command wrote or printed.
-        let manifest = String::from_utf8(staged.manifest.clone()).unwrap();
+        let manifest = String::from_utf8(staged.manifest()).unwrap();
         let mut said = lines.clone();
         said.extend(render(&req, &staged));
         let mut everything = vec![manifest, format!("{staged:?}")];
@@ -2161,8 +2166,8 @@ mod tests {
         assert!(!set.join("voices.tgz").exists(), "the archive is not part of the set");
         assert!(set.join(SIGNATURE).exists());
         assert_no_work_dir(&dir);
-        model_set::validate(&staged.manifest).expect("the manifest is valid");
-        let v: Value = serde_json::from_slice(&staged.manifest).unwrap();
+        model_set::validate(&staged.manifest()).expect("the manifest is valid");
+        let v: Value = serde_json::from_slice(&staged.manifest()).unwrap();
         let files = v["files"].as_array().unwrap();
         let paths: Vec<&str> = files.iter().map(|x| x["path"].as_str().unwrap()).collect();
         assert_eq!(paths, ["README.md", "a.bin", "voices/b.bin"]);
@@ -2250,7 +2255,7 @@ mod tests {
         all.extend(["--license-additional", b]);
         let req = request_with(&all);
         let staged = run(&f, None, &dir, &req, None).0.expect("staged");
-        let v: Value = serde_json::from_slice(&staged.manifest).unwrap();
+        let v: Value = serde_json::from_slice(&staged.manifest()).unwrap();
         let extra = v["license"]["additional"].as_array().unwrap();
         assert_eq!(extra.len(), 2);
         assert_eq!(extra[0], json!({"id": "CC-BY-4.0", "url": url, "notice_path": "README.md"}));
