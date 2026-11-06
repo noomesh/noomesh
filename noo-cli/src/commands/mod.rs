@@ -73,6 +73,7 @@ pub mod controller;
 pub mod migrate;
 pub mod migrate_db;
 pub mod models;
+pub mod models_extract;
 pub mod models_fetch;
 pub mod models_sets;
 pub mod ollama_stage;
