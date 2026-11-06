@@ -2272,4 +2272,82 @@ mod tests {
             assert_nothing_left(&dir);
         }
     }
+
+    // ── the --file selection and the 64-file cap ─────────────────────────
+
+    #[test]
+    fn a_repeated_file_and_a_file_the_repo_does_not_list_are_refused_before_any_download() {
+        let f = hf(json!(false));
+        let twice = ["--file", "README.md", "--file", "README.md"];
+        let unlisted = ["--file", "nope.bin", "--file", "README.md"];
+        for (tag, flags, want) in [
+            ("twice", twice, "--file README.md is given twice"),
+            ("unlisted", unlisted, "the repo has no file `nope.bin`"),
+        ] {
+            let dir = tmpdir(&format!("select-{tag}"));
+            let e = run(&f, None, &dir, &request_with(&flags), None).0.expect_err("refused");
+            assert!(matches!(e, StageError::Input(_)), "{e}");
+            assert!(e.to_string().contains(want), "{tag}: {e}");
+            assert!(downloaded_nothing(&f), "{tag}");
+            assert_nothing_left(&dir);
+        }
+    }
+
+    /// A repo of `n` small files, f0.bin .. f<n-1>.bin; only the listing is served.
+    fn repo_of(n: usize) -> Fake {
+        serve(move |_, path| {
+            if !path.starts_with(&format!("/api/models/{REPO}/revision/{SHA}")) {
+                return resp(404, b"");
+            }
+            let siblings: Vec<Value> = (0..n)
+                .map(|i| {
+                    let name = format!("f{i}.bin");
+                    json!({"rfilename": name, "size": 1, "blobId": "1".repeat(40)})
+                })
+                .collect();
+            let doc = json!({
+                "sha": SHA,
+                "gated": false,
+                "cardData": {"license": "apache-2.0"},
+                "siblings": siblings,
+            });
+            resp(200, doc.to_string().as_bytes())
+        })
+    }
+
+    #[test]
+    fn a_set_of_more_than_64_files_is_refused_before_any_download() {
+        let dir = tmpdir("select-65");
+        let f = repo_of(65);
+        let e = run(&f, None, &dir, &request("voice"), None).0.expect_err("65 files");
+        assert!(matches!(e, StageError::Input(_)), "{e}");
+        let m = e.to_string();
+        assert!(m.contains("65 files is more than a set holds (64)"), "{m}");
+        assert!(downloaded_nothing(&f));
+        assert_nothing_left(&dir);
+        // 64 is within the cap: the stage goes on, and stops at the missing download.
+        let dir = tmpdir("select-64");
+        let e = run(&repo_of(64), None, &dir, &request("voice"), None).0.expect_err("no files");
+        assert!(!e.to_string().contains("more than a set holds"), "{e}");
+    }
+
+    #[test]
+    fn staged_files_plus_archive_members_past_64_are_refused_and_leave_nothing() {
+        let members: Vec<Vec<u8>> = (0..64).map(|i| file(&format!("m{i}.bin"), b"x")).collect();
+        let req = request_with(&["--extract", "voices.tgz"]);
+        // README.md (staged as itself) + 64 members = 65.
+        let dir = tmpdir("extract-cap");
+        let f = hf_archive(gz(&tar(&members)), true);
+        let e = run(&f, None, &dir, &req, None).0.expect_err("65 files");
+        assert!(matches!(e, StageError::Input(_)), "{e}");
+        let m = e.to_string();
+        assert!(m.contains("65 files is more than a set holds (64)"), "{m}");
+        assert!(m.contains("narrow the member glob"), "{m}");
+        assert_nothing_left(&dir);
+        // README.md + 63 members = 64 stages.
+        let dir = tmpdir("extract-cap-ok");
+        let f = hf_archive(gz(&tar(&members[..63])), true);
+        let staged = run(&f, None, &dir, &req, None).0.expect("64 files");
+        assert_eq!(staged.files.len(), 64);
+    }
 }
