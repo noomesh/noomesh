@@ -254,6 +254,7 @@ pub async fn emit_revoked(db: &sqlx::PgPool, task_id: &str, reason: &str) {
 
 /// What [`emit_final_state`] did.
 #[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)] // MUTANT: Unreadable is no longer built; the test, not the lint, must catch it
 pub enum FinalState {
     /// The terminal state was emitted (or its emit failed and was logged).
     Emitted,
@@ -290,12 +291,8 @@ pub async fn emit_final_state(db: &sqlx::PgPool, task_id: &str, why: Option<&str
             emit_logged(db, task_id, "state", state_data(&s, why)).await;
             FinalState::Emitted
         }
-        Ok(_) => FinalState::NotTerminal,
-        Err(e) => {
-            tracing::error!(task = task_id, error = %e,
-                "task_events: the task's state could not be read; its final state event was NOT emitted");
-            FinalState::Unreadable(e.to_string())
-        }
+        // MUTANT: an unreadable state is "not terminal" again.
+        Ok(_) | Err(_) => FinalState::NotTerminal,
     }
 }
 
