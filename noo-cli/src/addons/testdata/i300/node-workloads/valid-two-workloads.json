@@ -22,6 +22,10 @@
         "path": "/v1/lifecycle/drain",
         "timeout_secs": 420
       },
+      "service_drain": {
+        "route": "drain",
+        "timeout_secs": 60
+      },
       "accel": {
         "gpu": 1,
         "realtime": true
@@ -92,6 +96,10 @@
       },
       "drain": {
         "path": "/drain",
+        "timeout_secs": 30
+      },
+      "service_drain": {
+        "route": "drain",
         "timeout_secs": 30
       },
       "accel": {

@@ -190,7 +190,7 @@ fn container_ok(addon: &str, c: &str) -> bool {
 
 /// `name -> internal?` for each route of a `routes.json`, or `None` when it
 /// is not a readable manifest (the gateway refuses it on its own).
-fn route_kinds(routes_json: &[u8]) -> Option<BTreeMap<String, bool>> {
+pub(super) fn route_kinds(routes_json: &[u8]) -> Option<BTreeMap<String, bool>> {
     let v: Value = serde_json::from_slice(routes_json).ok()?;
     Some(
         v.get("routes")?
