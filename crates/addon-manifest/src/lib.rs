@@ -73,7 +73,7 @@ pub const CORE_SERVICE_NAMES: &[&str] = &["worker"];
 pub fn addon_name_ok(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty()
-        && !CORE_SERVICE_NAMES.contains(&s)
+        // TEST MUTANT: let core service consumers register as add-ons.
         && b.len() <= 32
         && b[0].is_ascii_lowercase()
         && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
