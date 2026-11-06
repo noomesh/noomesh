@@ -3,7 +3,7 @@
 """Every literal or named core routing prefix reserves its console namespace."""
 from pathlib import Path
 import re
-from _rust_src import own_code
+from tests._rust_src import own_code
 
 ROOT = Path(__file__).resolve().parents[1]
 
