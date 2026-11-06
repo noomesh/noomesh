@@ -22,9 +22,8 @@ func TestNilModelSetsProviderReportsUnknown(t *testing.T) {
 		if got := r.modelSetsReport(); got != nil {
 			t.Errorf("modelSetsReport = %v, want nil", got)
 		}
+		r.SendHeartbeat()
 	}()
-
-	r.SendHeartbeat()
 	if v, ok := cap.last(&cap.beats)["model_sets"]; ok {
 		t.Errorf("a nil provider sent model_sets = %v", v)
 	}
