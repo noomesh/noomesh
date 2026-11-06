@@ -43,9 +43,7 @@ STRIPS = [
 ]
 
 # Converted by a PR of its own, named here; each entry must still need it.
-PENDING = {
-    "test_db_read_errors_are_not_absent.py": "the i460 guard PR widens it and moves it to _rust_src in one change",
-}
+PENDING: dict[str, str] = {}
 
 
 def _hits(text: str) -> list[str]:
