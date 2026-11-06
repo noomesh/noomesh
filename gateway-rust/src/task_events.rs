@@ -834,6 +834,24 @@ mod unreadable_task_tests {
         assert_eq!(emit_final_state(&dead_pool(), "not-a-uuid", None).await, FinalState::NotTerminal);
     }
 
+    /// P1: an unreadable origin can never route a task's events to an add-on.
+    /// `emit` reads the task's own `created_via` again and takes the add-on
+    /// only from a read that succeeded; a failed read is an error (logged by
+    /// `emit_logged`), and no delivery row or event is written. The worst
+    /// case is an add-on missing an event, loudly.
+    #[tokio::test]
+    async fn an_unreadable_origin_routes_nothing() {
+        let id = uuid::Uuid::new_v4().to_string();
+        assert!(emit(&dead_pool(), &id, "state", state_data("done", None)).await.is_err(),
+            "an origin that cannot be read routes the event nowhere, and says so");
+        let own = crate::test_src::own_code(include_str!("task_events.rs"));
+        let body = crate::test_src::fn_body(&own, "pub async fn emit(");
+        let read = body.find("crate::repo::tasks::created_via(db, uuid).await?").expect("emit reads the origin and fails on an error");
+        let route = body.find("and_then(addon_of)").expect("the add-on comes from that read");
+        let insert = body.find("INSERT INTO noo_task_event_delivery").expect("the delivery row");
+        assert!(read < route && route < insert, "read, then route, then write");
+    }
+
     /// i460: an origin that cannot be read is not "core": the task's events
     /// still go out (emit decides), so an add-on's task is not cut off.
     #[tokio::test]
