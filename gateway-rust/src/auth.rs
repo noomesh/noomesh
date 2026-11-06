@@ -3110,6 +3110,23 @@ fn is_metrics_scrape(method: &axum::http::Method, path: &str, service: Option<&c
         && service.is_some_and(|s| s.0 == METRICS_SCRAPER_SERVICE)
 }
 
+/// Alertmanager's critical-alert intake (i515b): `routes::alert_intake`.
+/// Opened by [`ALERT_INTAKE_SERVICE`]'s leaf ALONE, before the bearer: no
+/// token, user, add-on or node credential reaches it.
+pub const ALERT_INTAKE_PATH: &str = "/api/alerts/alertmanager";
+
+/// The one service leaf that may post to [`ALERT_INTAKE_PATH`]:
+/// `noo security pki issue-service alertmanager` (CN=alertmanager,
+/// O=Mesh Cluster Service), the leaf its webhook receiver dials with.
+pub const ALERT_INTAKE_SERVICE: &str = "alertmanager";
+
+/// Whether this request is Alertmanager posting to its intake with its leaf.
+pub(crate) fn is_alert_intake(method: &axum::http::Method, path: &str, service: Option<&crate::node_identity::VerifiedService>) -> bool {
+    *method == axum::http::Method::POST
+        && path == ALERT_INTAKE_PATH
+        && service.is_some_and(|s| s.0 == ALERT_INTAKE_SERVICE)
+}
+
 /// Grafana's data sources, through the gateway: every path
 /// under this prefix answers Grafana's own service leaf and nothing else —
 /// no bearer token, no other certificate (`routes::grafana_ds`).
@@ -3262,6 +3279,18 @@ pub async fn require_any_auth(
     if is_metrics_scrape(request.method(), &path, scraper.as_ref()) {
         request.extensions_mut().insert(AuthActor(format!("svc:{METRICS_SCRAPER_SERVICE}")));
         return Ok(next.run(request).await);
+    }
+
+    // Alertmanager's intake, by its service leaf ALONE, before the bearer
+    // and returning here either way: no token opens this path, and no other
+    // leaf (the scraper's, Grafana's, a node's, an operator's) does.
+    if path == ALERT_INTAKE_PATH {
+        if is_alert_intake(request.method(), &path, scraper.as_ref()) {
+            request.extensions_mut().insert(AuthActor(format!("svc:{ALERT_INTAKE_SERVICE}")));
+            return Ok(next.run(request).await);
+        }
+        tracing::info!(path = %path, "alert_intake_refused: answers Alertmanager's own service leaf only");
+        return Err(StatusCode::FORBIDDEN);
     }
 
     // Grafana's data sources, by Grafana's service leaf
@@ -4894,6 +4923,43 @@ mod tests {
         assert!(!is_metrics_scrape(&Method::GET, "/api/cluster/status", Some(&prom)));
         assert!(!is_metrics_scrape(&Method::GET, "/metrics", Some(&graf)));
         assert!(!is_metrics_scrape(&Method::GET, "/metrics", None));
+    }
+
+    /// i515b: Alertmanager's leaf posts to its intake and nothing else does
+    /// — not the scraper's or Grafana's leaf, not a request with no service
+    /// leaf (a bearer, a user, a node or an operator certificate).
+    #[test]
+    fn the_alert_intake_admits_alertmanagers_leaf_only() {
+        use crate::node_identity::VerifiedService;
+        let am = VerifiedService(ALERT_INTAKE_SERVICE.into());
+        let prom = VerifiedService("prometheus".into());
+        let graf = VerifiedService("grafana".into());
+        assert_eq!(ALERT_INTAKE_SERVICE, "alertmanager");
+        assert!(is_alert_intake(&Method::POST, ALERT_INTAKE_PATH, Some(&am)));
+        assert!(!is_alert_intake(&Method::POST, ALERT_INTAKE_PATH, Some(&prom)));
+        assert!(!is_alert_intake(&Method::POST, ALERT_INTAKE_PATH, Some(&graf)));
+        assert!(!is_alert_intake(&Method::POST, ALERT_INTAKE_PATH, None), "no service leaf: a bearer-only request");
+        assert!(!is_alert_intake(&Method::GET, ALERT_INTAKE_PATH, Some(&am)));
+        assert!(!is_alert_intake(&Method::POST, "/api/alerts/list", Some(&am)), "the leaf opens the intake only");
+        assert!(!is_alert_intake(&Method::GET, "/metrics", Some(&am)));
+    }
+
+    /// The middleware decides the intake path by the leaf BEFORE it reads a
+    /// bearer and returns there either way, so a bearer-only request (user,
+    /// add-on, node or operator token) is a 403 and never reaches a door.
+    #[test]
+    fn the_alert_intake_is_decided_before_the_bearer_and_is_not_public() {
+        let src = include_str!("auth.rs");
+        let body = src.split("pub async fn require_any_auth(").nth(1).expect("middleware");
+        let branch = body.find("if path == ALERT_INTAKE_PATH \u{7b}").expect("the intake branch");
+        let bearer = body.find("let token = bearer_token(&request);").expect("the bearer read");
+        assert!(branch < bearer, "the leaf check must come before the bearer");
+        let arm = &body[branch..bearer];
+        assert!(arm.contains("is_alert_intake(request.method(), &path, scraper.as_ref())"), "{arm}");
+        assert!(arm.contains("return Err(StatusCode::FORBIDDEN);"), "{arm}");
+        assert!(!passes_without_bearer_check(ALERT_INTAKE_PATH, false, false));
+        assert!(!passes_without_bearer_check(ALERT_INTAKE_PATH, false, true));
+        assert!(!PUBLIC_PATHS_EXACT.contains(&ALERT_INTAKE_PATH));
     }
 
     // The birth-proof routes step past this middleware because

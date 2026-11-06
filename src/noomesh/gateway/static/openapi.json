@@ -20848,6 +20848,40 @@
           }
         }
       }
+    },
+    "/api/alerts/alertmanager": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create alertmanager",
+        "description": "[native] `POST /api/alerts/alertmanager` — Alertmanager's webhook. Alertmanager's service leaf only. Critical alerts only: `firing` raises a persisting operator alert for (`prometheus.<alertname>`, target), `resolved` clears it; onsets are flap-guarded. Answers `{accepted, refused}` counts and never echoes the alert's annotations.",
+        "operationId": "alertmanager_intake",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

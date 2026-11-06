@@ -90,7 +90,7 @@ fn cooldown_admit(redis: Option<Result<bool, String>>, local: impl FnOnce() -> b
     }
 }
 
-async fn cooldown_acquired(state: &AppState, key: &str, secs: i64) -> bool {
+pub(crate) async fn cooldown_acquired(state: &AppState, key: &str, secs: i64) -> bool {
     let redis = match state.redis.as_ref() {
         Some(r) => Some(r.set_nx_ex_checked(key, "1", secs).await),
         None => None,
@@ -362,6 +362,12 @@ async fn take_state(redis: Option<&crate::cache::RedisCache>, metrics: &crate::m
     let prev = load_state(redis, metrics, key).await?;
     drop_state(redis, metrics, key).await;
     Some(prev)
+}
+
+/// Whether a persisting condition is open for (kind, target): announced, or
+/// held back by maintenance. Read the same way the funnel reads it.
+pub async fn condition_open(state: &AppState, kind: &str, target: &str) -> bool {
+    load_state(state.redis.as_ref(), &state.metrics, &state_key(kind, target)).await.is_some()
 }
 
 /// Every persisting condition currently open (announced or held back).

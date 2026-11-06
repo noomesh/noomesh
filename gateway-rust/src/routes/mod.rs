@@ -42,6 +42,7 @@ mod reservations;
 pub(crate) mod knowledge;
 pub(crate) mod memory;
 mod monitoring;
+mod alert_intake;
 mod grafana_ds;
 mod logs_ingest;
 mod traces_ingest;
@@ -384,6 +385,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(admin::router())
         .merge(audit_read::router())
         .merge(monitoring::router())
+        .merge(alert_intake::router())
         .merge(grafana_ds::router())
         .merge(users::router())
         .merge(agents::router())
