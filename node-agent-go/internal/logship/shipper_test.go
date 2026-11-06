@@ -117,6 +117,28 @@ func newShipper(t *testing.T, srv *httptest.Server, node string, tune func(*Conf
 	return s
 }
 
+// runUntilCleanup runs s until the test ends, and the test does not end
+// until Run has returned. On shutdown Run spills its in-flight batch into
+// StateDir, and t.TempDir removes that directory in its own cleanup: a Run
+// still writing then fails the test with "TempDir RemoveAll cleanup:
+// unlinkat …/logship: directory not empty" (flaky go-node-agent, run
+// 42230233221). Cleanups run last-registered first, so this one (registered
+// after newShipper's t.TempDir) cancels and waits before the directory goes.
+func runUntilCleanup(t *testing.T, s *Shipper) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); s.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Errorf("the shipper did not stop within 10s of its context ending")
+		}
+	})
+}
+
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -307,9 +329,7 @@ func TestAcceptedBatchesCountAndCarryAuth(t *testing.T) {
 	srv := httptest.NewTLSServer(ig.handler(t, "n1"))
 	defer srv.Close()
 	s := newShipper(t, srv, "n1", nil)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go s.Run(ctx)
+	runUntilCleanup(t, s)
 	for i := 0; i < 5; i++ {
 		s.Offer(entry("noo-vllm", fmt.Sprintf("INFO line %d", i)))
 	}
@@ -337,9 +357,7 @@ func TestA4xxDropsTheBatchWithoutRetry(t *testing.T) {
 	srv := httptest.NewTLSServer(ig.handler(t, "n1"))
 	defer srv.Close()
 	s := newShipper(t, srv, "n1", nil)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go s.Run(ctx)
+	runUntilCleanup(t, s)
 	waitFor(t, "route probe", func() bool { return atomic.LoadInt32(&ig.hits) >= 1 })
 	s.Offer(entry("c", "first"))
 	waitFor(t, "first batch answered", func() bool { return atomic.LoadInt32(&ig.hits) >= 2 })
@@ -366,9 +384,7 @@ func TestA5xxIsRetriedUntilAccepted(t *testing.T) {
 	srv := httptest.NewTLSServer(ig.handler(t, "n1"))
 	defer srv.Close()
 	s := newShipper(t, srv, "n1", nil)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go s.Run(ctx)
+	runUntilCleanup(t, s)
 	waitFor(t, "route probe", func() bool { return atomic.LoadInt32(&ig.hits) >= 1 })
 	s.Offer(entry("c", "keep me"))
 	waitFor(t, "line accepted after two 5xx", func() bool { return s.State()["shipped_total"].(int64) == 1 })
@@ -389,9 +405,7 @@ func TestA429WaitsRetryAfterThenRetries(t *testing.T) {
 	srv := httptest.NewTLSServer(ig.handler(t, "n1"))
 	defer srv.Close()
 	s := newShipper(t, srv, "n1", nil)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go s.Run(ctx)
+	runUntilCleanup(t, s)
 	waitFor(t, "route probe", func() bool { return atomic.LoadInt32(&ig.hits) >= 1 })
 	s.Offer(entry("c", "rate limited"))
 	waitFor(t, "429 answered", func() bool { return atomic.LoadInt32(&ig.hits) >= 2 })
@@ -454,9 +468,7 @@ func TestControllerAwayKeepsTheBatch(t *testing.T) {
 	_ = awayURL
 
 	s := newShipper(t, srv, "n1", nil)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go s.Run(ctx)
+	runUntilCleanup(t, s)
 	waitFor(t, "route probe", func() bool { return atomic.LoadInt32(&ig.hits) >= 1 })
 	// Point the pusher at the dead listener, offer, then bring it back.
 	live := s.push.url
@@ -492,9 +504,7 @@ func TestSourcesStartOnlyOnceTheRouteExists(t *testing.T) {
 	s := newShipper(t, srv, "n1", nil)
 	src := &fakeSource{}
 	s.AddSource(src)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go s.Run(ctx)
+	runUntilCleanup(t, s)
 	waitFor(t, "two 404 probes", func() bool { return atomic.LoadInt32(&ig.hits) >= 2 })
 	if src.started.Load() {
 		t.Fatal("a source started while the route answered 404")
@@ -538,9 +548,7 @@ func TestOverflowSpillsToDiskAndRecovers(t *testing.T) {
 	if fi, err := os.Stat(filepath.Join(spillDir, "spill.ndjson")); err != nil || fi.Size() == 0 {
 		t.Fatalf("spill file missing or empty: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go s.Run(ctx)
+	runUntilCleanup(t, s)
 	waitFor(t, "shipper ready", func() bool { return s.State()["route_ready"] == true })
 	for i := 0; i < 6; i++ { // kick until memory and spill are drained
 		s.kick()
@@ -590,9 +598,7 @@ func TestShutdownSpillsTheInFlightBatch(t *testing.T) {
 	srv2 := httptest.NewTLSServer(ig2.handler(t, "n1"))
 	defer srv2.Close()
 	s2 := newShipper(t, srv2, "n1", func(c *Config) { c.StateDir = s.cfg.StateDir })
-	ctx2, cancel2 := context.WithCancel(context.Background())
-	defer cancel2()
-	go s2.Run(ctx2)
+	runUntilCleanup(t, s2)
 	waitFor(t, "spilled batch delivered by the next start", func() bool { return ig2.lines() == 1 })
 }
 
@@ -696,9 +702,7 @@ func TestACredentialRefusalKeepsTheBatch(t *testing.T) {
 	srv := httptest.NewTLSServer(ig.handler(t, "n1"))
 	defer srv.Close()
 	s := newShipper(t, srv, "n1", nil)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go s.Run(ctx)
+	runUntilCleanup(t, s)
 	waitFor(t, "route probe", func() bool { return atomic.LoadInt32(&ig.hits) >= 1 })
 	s.Offer(entry("c", "still good"))
 	waitFor(t, "delivered after the 403", func() bool { return s.State()["shipped_total"].(int64) == 1 })
