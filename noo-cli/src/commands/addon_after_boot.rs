@@ -178,6 +178,53 @@ pub fn parse_owner(text: &str) -> Result<(u32, String), String> {
     }
 }
 
+// ── Which declared containers are down, and which are held ────────
+
+/// An add-on's declared containers (`x-noo-addon: containers`) as they are
+/// now: `down` are expected to run and do not; `held` the launcher never
+/// starts (a GPU, the Docker socket or privileged mode, `resources::holds`),
+/// with why. A held container is neither expected to run nor started.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Containers {
+    pub down: Vec<String>,
+    pub held: Vec<(String, String)>,
+}
+
+/// Split `declared` against what is `running` and what the launcher holds
+/// (`held`: container name and why). Pure; [`down_containers_at`] reads the
+/// three from the machine.
+pub fn split_containers(declared: &[String], running: &[String], held: &[(String, String)]) -> Containers {
+    let mut c = Containers::default();
+    for d in declared {
+        if let Some((_, why)) = held.iter().find(|(h, _)| h == d) {
+            c.held.push((d.clone(), why.clone()));
+        } else if !running.contains(d) {
+            c.down.push(d.clone());
+        }
+    }
+    c
+}
+
+/// The containers the launcher holds for this overlay, by container name:
+/// `resources::holds` (the launcher's own rule, third-party add-ons only, as
+/// `launch-resources` applies it), each held service mapped to its
+/// `container_name` (else the service name).
+pub fn held_containers(overlay: &str, third_party: bool) -> Result<Vec<(String, String)>, String> {
+    if !third_party {
+        return Ok(Vec::new());
+    }
+    let doc: Value = serde_yaml::from_str::<serde_yaml::Value>(overlay)
+        .map_err(|e| format!("the overlay is not valid YAML ({e})"))
+        .and_then(|y| serde_json::to_value(y).map_err(|e| e.to_string()))?;
+    Ok(crate::addons::resources::holds(overlay)?
+        .into_iter()
+        .map(|(svc, why)| {
+            let cn = doc["services"][svc.as_str()]["container_name"].as_str().map(str::to_string).unwrap_or(svc);
+            (cn, why)
+        })
+        .collect())
+}
+
 // ── The seams ─────────────────────────────────────────────────────
 
 /// Owner and mode of a file (a symlink is not followed).
@@ -254,8 +301,8 @@ pub trait Run {
     /// Why the stored credential cannot be used, `None` when it can.
     fn credential_problem(&mut self) -> Option<String>;
     fn enabled_addons(&mut self) -> Result<Vec<String>, String>;
-    /// The add-on's declared containers that are not running.
-    fn down_containers(&mut self, addon: &str) -> Result<Vec<String>, String>;
+    /// The add-on's declared containers: which are down, which are held.
+    fn containers(&mut self, addon: &str) -> Result<Containers, String>;
     /// The guard's sentence when the add-on guards refuse its bundle.
     fn guard_refusal(&mut self, addon: &str) -> Option<String>;
     /// The normal launcher start. `Err` carries what to report.
@@ -376,8 +423,13 @@ pub fn run(os: &dyn Os, paths: &Paths, limits: &Limits, r: &mut dyn Run, journal
 
     let mut all_ok = true;
     for a in &enabled {
-        let down = match r.down_containers(a) {
-            Ok(d) => d,
+        let down = match r.containers(a) {
+            Ok(c) => {
+                for (h, why) in &c.held {
+                    journal(&format!("{a}: {h} is held ({why}); not started"));
+                }
+                c.down
+            }
             Err(e) => {
                 journal(&format!("{a}: cannot tell whether its containers are running ({e}); run: noo stack restart {a}"));
                 all_ok = false;
@@ -417,7 +469,7 @@ fn attempt(r: &mut dyn Run, addon: &str, down: &[String]) -> Outcome {
     if let Err(tail) = r.start(addon) {
         return Outcome::Failed(Code::LauncherFailed, tail);
     }
-    match r.down_containers(addon) {
+    match r.containers(addon).map(|c| c.down) {
         Ok(still) if still.is_empty() => Outcome::Started,
         Ok(still) => Outcome::Failed(Code::StillDownAfterStart, format!("the launcher finished but these containers are still not running: {}", still.join(", "))),
         Err(e) => Outcome::Failed(Code::StillDownAfterStart, format!("the launcher finished but its containers could not be read ({e}); they were down before: {}", down.join(", "))),
@@ -509,7 +561,7 @@ impl Run for Live<'_> {
         crate::addons::licensed_on(&self.root).map(|v| v.into_iter().map(str::to_string).collect())
     }
 
-    fn down_containers(&mut self, addon: &str) -> Result<Vec<String>, String> {
+    fn containers(&mut self, addon: &str) -> Result<Containers, String> {
         down_containers_at(&self.root, addon)
     }
 
@@ -541,17 +593,18 @@ impl Run for Live<'_> {
     }
 }
 
-/// The add-on's declared containers (`x-noo-addon: containers`) that are not
-/// running, on the install at `root`.
-fn down_containers_at(root: &Path, addon: &str) -> Result<Vec<String>, String> {
+/// The add-on's declared containers (`x-noo-addon: containers`) on the
+/// install at `root`: which are down, and which the launcher holds.
+pub(crate) fn down_containers_at(root: &Path, addon: &str) -> Result<Containers, String> {
     use crate::addons::resolve::Docker as _;
     let overlay = crate::addons::pins::addon_dir(root, addon).join("docker-compose.yml");
     let text = std::fs::read_to_string(&overlay).map_err(|e| format!("{}: {e}", overlay.display()))?;
     let decl = crate::addon_decl_parse::parse_decl(&format!("{addon}'s overlay"), &text, Some(addon))?
         .ok_or_else(|| format!("{addon}'s overlay declares no x-noo-addon containers"))?;
     let mut docker = crate::addons::resolve::LiveDocker::new(root);
-    let running = docker.running().map_err(|e| format!("could not list running containers: {e}"))?;
-    Ok(decl.containers.into_iter().filter(|c| !running.iter().any(|r| &r.name == c)).collect())
+    let running: Vec<String> = docker.running().map_err(|e| format!("could not list running containers: {e}"))?.into_iter().map(|c| c.name).collect();
+    let held = held_containers(&text, crate::addons::resolve::third_party(addon))?;
+    Ok(split_containers(&decl.containers, &running, &held))
 }
 
 /// A random (version 4) UUID from 16 bytes of the kernel's randomness.
@@ -590,7 +643,7 @@ pub fn report_restarted(g: &Globals, named: &[String]) {
     let Ok(enabled) = crate::addons::licensed_on(&root) else { return };
     let enabled: Vec<String> = enabled.into_iter().map(str::to_string).collect();
     for a in restarted_addons(named, &enabled) {
-        if !matches!(down_containers_at(&root, &a), Ok(d) if d.is_empty()) {
+        if !matches!(down_containers_at(&root, &a), Ok(c) if c.down.is_empty()) {
             continue;
         }
         let sent = fresh_uuid().and_then(|id| {
@@ -680,6 +733,8 @@ mod tests {
         started_flag: BTreeMap<String, bool>,
         guard: BTreeMap<String, String>,
         launcher_error: BTreeMap<String, String>,
+        /// addon -> held containers and why
+        held: BTreeMap<String, Vec<(String, String)>>,
         starts: Vec<String>,
         reports: Vec<(String, Value)>,
         reject: BTreeMap<String, ReportError>,
@@ -710,11 +765,14 @@ mod tests {
         fn enabled_addons(&mut self) -> Result<Vec<String>, String> {
             Ok(self.enabled.clone())
         }
-        fn down_containers(&mut self, addon: &str) -> Result<Vec<String>, String> {
-            if self.started_flag.get(addon).copied().unwrap_or(false) {
-                return Ok(self.down_after.get(addon).cloned().unwrap_or_default());
-            }
-            Ok(self.down.get(addon).cloned().unwrap_or_default())
+        fn containers(&mut self, addon: &str) -> Result<Containers, String> {
+            let held = self.held.get(addon).cloned().unwrap_or_default();
+            let down = if self.started_flag.get(addon).copied().unwrap_or(false) {
+                self.down_after.get(addon).cloned().unwrap_or_default()
+            } else {
+                self.down.get(addon).cloned().unwrap_or_default()
+            };
+            Ok(Containers { down, held })
         }
         fn guard_refusal(&mut self, addon: &str) -> Option<String> {
             self.guard.get(addon).cloned()
@@ -969,6 +1027,45 @@ mod tests {
             report_body(BOOT, &Outcome::Failed(Code::StillDownAfterStart, String::new())),
             json!({"boot_id": BOOT, "outcome": "failed", "code": "still_down_after_start"})
         );
+    }
+
+    /// A held container (the launcher's hold) is neither expected to run nor
+    /// started; another declared container that is down still is. Not
+    /// subtracting holds turns a held GPU worker into a FAIL every boot.
+    #[test]
+    fn a_held_container_is_not_down_and_another_down_one_still_is() {
+        let declared = vec!["noo-rhaddon".to_string(), "noo-rhaddon-gpu".to_string()];
+        let held = vec![("noo-rhaddon-gpu".to_string(), "asks for a GPU".to_string())];
+        let c = split_containers(&declared, &["noo-rhaddon".to_string()], &held);
+        assert_eq!(c, Containers { down: vec![], held: held.clone() }, "held only: nothing is down");
+        let c = split_containers(&declared, &[], &held);
+        assert_eq!(c.down, vec!["noo-rhaddon".to_string()], "only the container that should run is down");
+        assert_eq!(c.held, held);
+        assert_eq!(split_containers(&declared, &[], &[]).down, declared, "without a hold both are down");
+    }
+
+    /// The hold is the launcher's (`resources::holds`), for a third-party
+    /// add-on only, by container name.
+    #[test]
+    fn holds_are_read_from_the_launchers_rule_by_container_name() {
+        let overlay = include_str!("../../../tests/fixtures/addons/rhaddon/docker-compose.yml");
+        let held = held_containers(overlay, true).unwrap();
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].0, "noo-rhaddon-gpu");
+        assert!(held[0].1.contains("GPU"), "{held:?}");
+        assert!(held_containers(overlay, false).unwrap().is_empty(), "the launcher holds nothing of a first-party add-on");
+    }
+
+    #[test]
+    fn an_add_on_whose_only_missing_container_is_held_is_not_started_or_reported() {
+        let os = good_os();
+        let mut fake = healthy_fake(&["rhaddon"], &[]);
+        fake.held.insert("rhaddon".into(), vec![("noo-rhaddon-gpu".into(), "asks for a GPU".into())]);
+        let (code, lines) = go(&os, &mut fake);
+        assert_eq!(code, 0, "{lines:?}");
+        assert!(fake.starts.is_empty() && fake.reports.is_empty(), "a held container is never started or reported");
+        assert_eq!(lines.iter().filter(|l| l.contains("held")).count(), 1, "one log line: {lines:?}");
+        assert!(lines.iter().any(|l| l.contains("noo-rhaddon-gpu is held (asks for a GPU)")), "{lines:?}");
     }
 
     #[test]
