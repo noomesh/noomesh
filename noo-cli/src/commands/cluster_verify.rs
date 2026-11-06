@@ -5619,6 +5619,29 @@ pub(crate) fn tailnet_merge_missing(j: &Value) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// The `add-on containers` row for one enabled add-on (i509): its declared
+/// containers (`x-noo-addon: containers`) that are not running, or why they
+/// could not be read. Down is a FAIL naming `noo stack restart <addon>`: after
+/// a reboot, nothing else says that an add-on did not come back. A container
+/// the launcher HOLDS (`addon_after_boot::split_containers`, the launcher's
+/// own rule) is not expected to run: a note on an OK row, never a FAIL.
+pub(crate) fn addon_containers_row(addon: &str, state: Result<crate::commands::addon_after_boot::Containers, String>) -> Check {
+    const ROW: &str = "add-on containers";
+    let restart = format!("noo stack restart {addon}");
+    match state {
+        Ok(c) if c.down.is_empty() => {
+            let held: Vec<String> = c.held.iter().map(|(h, why)| format!("held: {h} ({why})")).collect();
+            if held.is_empty() {
+                ok(ROW, format!("{addon}: every declared container is running"))
+            } else {
+                ok(ROW, format!("{addon}: every container that should run is running; {}", held.join("; ")))
+            }
+        }
+        Ok(c) => fail(ROW, format!("{addon}: not running: {}", c.down.join(", ")), restart),
+        Err(e) => fail(ROW, format!("{addon}: whether its containers run could not be read ({e})"), restart),
+    }
+}
+
 /// The `add-on pins` row from `noo addons verify --json`: "N verified (key
 /// #i)" or the first failing add-on and why.
 pub(crate) fn addon_pins_check(ec: i32, v: &Value) -> Check {
@@ -6617,9 +6640,16 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // An unreadable noomesh.yaml is a failed row, never "no add-on on".
         match crate::addons::licensed_on(&crate::envfile::repo_root()) {
             Ok(on) if on.is_empty() => {}
-            Ok(_) => {
+            Ok(on) => {
                 let (ec, pins, _) = self_json(g, &["addons", "verify"]);
                 checks.push(addon_pins_check(ec, &pins));
+                // i509: an enabled add-on whose containers are down (after a
+                // reboot the boot-time start may have failed) is a FAIL that
+                // names the restart, one row per add-on.
+                let root = crate::envfile::repo_root();
+                for a in on {
+                    checks.push(addon_containers_row(a, crate::commands::addon_after_boot::down_containers_at(&root, a)));
+                }
             }
             Err(e) => checks.push(fail("add-on pins", format!("which add-ons are on is unknown: {e}"), "noo addons list")),
         }
@@ -7101,6 +7131,35 @@ mod tests {
     /// The `model classes` row: declared candidates must be
     /// placed or available; unplaced → WARN naming class + node with the
     /// placement that fixes it; a class with nothing routable → FAIL.
+
+    /// i509 step 5: an enabled add-on that is down FAILS, naming it and the
+    /// restart; one that runs passes; an unreadable state is not a pass.
+    #[test]
+    fn an_enabled_add_on_whose_containers_are_down_fails_and_names_the_restart() {
+        use crate::commands::addon_after_boot::split_containers;
+        let declared = vec!["noo-rhaddon".to_string(), "noo-rhaddon-worker".to_string(), "noo-rhaddon-gpu".to_string()];
+        let all: Vec<String> = declared[..2].to_vec();
+        let gpu = vec![("noo-rhaddon-gpu".to_string(), "asks for a GPU".to_string())];
+        let up = super::addon_containers_row("rhaddon", Ok(split_containers(&declared[..2], &all, &[])));
+        assert_eq!((up.name, up.verdict), ("add-on containers", super::Verdict::Ok), "{up:?}");
+        assert!(up.detail.starts_with("rhaddon: "), "{up:?}");
+        let down = super::addon_containers_row("rhaddon", Ok(split_containers(&declared[..2], &[], &[])));
+        assert_eq!(down.verdict, super::Verdict::Fail, "{down:?}");
+        assert!(down.detail.contains("rhaddon") && down.detail.contains("noo-rhaddon, noo-rhaddon-worker"), "{down:?}");
+        assert_eq!(down.remedy.as_deref(), Some("noo stack restart rhaddon"));
+        let unknown = super::addon_containers_row("rhaddon", Err("docker is not answering".into()));
+        assert_eq!(unknown.verdict, super::Verdict::Fail, "an unreadable state is never a pass: {unknown:?}");
+        assert!(unknown.detail.contains("docker is not answering"), "{unknown:?}");
+        assert_eq!(unknown.remedy.as_deref(), Some("noo stack restart rhaddon"));
+        // A held container is a note, not a FAIL (the launcher never starts it).
+        let held = super::addon_containers_row("rhaddon", Ok(split_containers(&declared, &all, &gpu)));
+        assert_eq!(held.verdict, super::Verdict::Ok, "a held container is not a FAIL: {held:?}");
+        assert!(held.detail.contains("held: noo-rhaddon-gpu (asks for a GPU)"), "{held:?}");
+        // Held plus another one down: a FAIL that names only the down one.
+        let both = super::addon_containers_row("rhaddon", Ok(split_containers(&declared, &["noo-rhaddon".to_string()], &gpu)));
+        assert_eq!(both.verdict, super::Verdict::Fail, "{both:?}");
+        assert!(both.detail.contains("not running: noo-rhaddon-worker") && !both.detail.contains("noo-rhaddon-gpu"), "{both:?}");
+    }
     #[test]
     fn model_classes_row_warns_on_unplaced_and_fails_on_a_dead_class() {
         use super::model_classes_check;
