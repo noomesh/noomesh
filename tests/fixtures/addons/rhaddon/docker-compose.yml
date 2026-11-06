@@ -27,9 +27,22 @@ services:
     environment:
       RHADDON_GATEWAY_URL: ${RHADDON_GATEWAY_URL:-}
       RHADDON_PUBLIC_ORIGINS: ${RHADDON_PUBLIC_ORIGINS:-}
+    # Long-form binds with host-path creation off (i509): these sources are
+    # tmpfs generation directories a reboot empties, and a short-form bind
+    # whose source is missing is created as root by dockerd's boot restart.
     volumes:
-      - ${RHADDON_WORK_DIR:-/nonexistent/rhaddon-work-unset}:/run/rhaddon:ro
-      - ${RHADDON_COORD_DIR:-/nonexistent/rhaddon-coord-unset}:/run/rhaddon-coord:ro
+      - type: bind
+        source: ${RHADDON_WORK_DIR:-/nonexistent/rhaddon-work-unset}
+        target: /run/rhaddon
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RHADDON_COORD_DIR:-/nonexistent/rhaddon-coord-unset}
+        target: /run/rhaddon-coord
+        read_only: true
+        bind:
+          create_host_path: false
     command: ["sh", "-c", "exec sleep 2147483647"]
     healthcheck:
       test: ["CMD-SHELL", "for f in /run/rhaddon/ca.crt /run/rhaddon/leaf.crt /run/rhaddon/leaf.key /run/rhaddon/peer-key /run/rhaddon-coord/peer-key /run/rhaddon-coord/runtime-url /run/rhaddon-coord/db/pgpass /run/rhaddon-coord/db/client.key; do test -r $$f && test -s $$f || exit 1; done; grep -q 'sslmode=verify-full' /run/rhaddon-coord/runtime-url && test \"$$RHADDON_GATEWAY_URL\" = https://gateway:8080"]

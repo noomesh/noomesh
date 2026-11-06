@@ -219,8 +219,11 @@ fn launch_one(a: &LaunchArgs, addon: &str, dev: Option<&Path>, store: &mut Optio
     // What its overlay takes from core (only its own secrets) and, for a
     // third-party add-on, its name: checked again here, on the files this
     // start composes, before any of its inputs is produced.
-    if let Err(e) = guards::guard_install(&a.root, addon, &files) {
-        return vec![refuse(e)];
+    match guards::guard_install(&a.root, addon, &files) {
+        // A declared mount in a form dockerd may create at boot (i509):
+        // a WARNING in 0.6.18, one line each, printed by the launcher.
+        Ok(c) => out.extend(c.warnings.iter().map(|w| format!("warn {addon} {}", w.replace('\n', " ")))),
+        Err(e) => return vec![refuse(e)],
     }
     if resolve::third_party(addon) {
         let overlay = files.get("docker-compose.yml").map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
