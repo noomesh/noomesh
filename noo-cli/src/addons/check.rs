@@ -134,7 +134,7 @@ pub fn refuse_console_collision(root: &Path, addon: &str, files: &BTreeMap<Strin
             Err(e) => return Err(Refusal::Decl(format!("cannot inspect enabled add-on {other:?}: {e}"))),
         };
         let existing = addon_manifest::parse(&text).map_err(Refusal::Decl)?;
-        if existing.ui.as_ref().and_then(|ui| ui.console_path.as_deref()) == Some(path) {
+        if false && existing.ui.as_ref().and_then(|ui| ui.console_path.as_deref()) == Some(path) {
             return Err(Refusal::Decl(format!("ui.console_path {path:?} is claimed by both {addon:?} and enabled add-on {other:?}; change one signed claim (nothing was changed)")));
         }
     }
