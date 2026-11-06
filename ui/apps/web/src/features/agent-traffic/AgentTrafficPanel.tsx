@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 PersonifAI LLC
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useAuth } from '@metis/core';
 import { relTime } from '@/lib/format';
 import { StatusBadge } from '@/components/StatusBadge';
@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
   filterThreads,
+  recipientLabel,
   renderBody,
   usePresence,
   useThreadMessages,
@@ -18,15 +19,17 @@ import {
 
 const REFRESH_MS = 10_000;
 
-function Message({ m }: { m: TrafficMessage }) {
+export function Message({ m }: { m: TrafficMessage }) {
   const b = renderBody(m.body);
+  const to = recipientLabel(m.to);
   const [open, setOpen] = useState(false);
   const closed = m.enc.endsWith(':closed');
   return (
     <div className="traffic-msg">
       <div className="traffic-msg-head">
         <span className="traffic-route">
-          {m.from} <span aria-hidden>→</span> {m.to}
+          {m.from} <span aria-hidden>→</span>{' '}
+          {to.isThread ? <span className="traffic-dim">{to.text}</span> : to.text}
         </span>
         <span className="scope-chip">{m.kind || 'message'}</span>
         <StatusBadge tone={m.sigVerified ? 'good' : 'warn'}>
@@ -37,9 +40,7 @@ function Message({ m }: { m: TrafficMessage }) {
           {new Date(m.ts).toLocaleString()} · {relTime(m.ts)} ago
         </span>
       </div>
-      <pre className={b.isText ? 'traffic-body text' : 'traffic-body'} hidden={b.long && !open}>
-        {b.text}
-      </pre>
+      <pre className={b.isText ? 'traffic-body text' : 'traffic-body'}>{b.long && !open ? b.preview : b.text}</pre>
       {b.long && (
         <button type="button" className="traffic-more" onClick={() => setOpen((o) => !o)}>
           {open ? 'Collapse' : `Show all (${b.text.length.toLocaleString()} chars)`}
@@ -65,6 +66,18 @@ export function AgentTrafficPanel() {
   const selected = picked ?? shown[0]?.id ?? null;
   const msgs = useThreadMessages(selected, ms);
   const thread = all.find((t) => t.id === selected);
+  // Open a thread at its newest message (the view reads oldest first), once
+  // per thread: a refresh must not yank the reader back down. Only the
+  // message column scrolls, so the thread list stays in view.
+  const column = useRef<HTMLDivElement>(null);
+  const jumpedTo = useRef<string | null>(null);
+  const count = msgs.data?.length ?? 0;
+  useEffect(() => {
+    const el = column.current;
+    if (!el || !selected || !count || jumpedTo.current === selected) return;
+    jumpedTo.current = selected;
+    el.scrollTop = el.scrollHeight;
+  }, [selected, count]);
 
   if (!isOperator) {
     return (
@@ -109,7 +122,12 @@ export function AgentTrafficPanel() {
             value={text}
             onChange={(e) => setText(e.target.value)}
           />
-          <select aria-label="Filter by participant" value={who} onChange={(e) => setWho(e.target.value)}>
+          <select
+            className="filter-select"
+            aria-label="Filter by participant"
+            value={who}
+            onChange={(e) => setWho(e.target.value)}
+          >
             <option value="">All participants</option>
             {names.map((n) => (
               <option key={n} value={n}>
@@ -127,7 +145,9 @@ export function AgentTrafficPanel() {
               className={t.id === selected ? 'traffic-thread on' : 'traffic-thread'}
               onClick={() => setPicked(t.id)}
             >
-              <span className="traffic-thread-id">{t.id.slice(0, 12)}</span>
+              <span className="traffic-thread-id" title={t.id}>
+                {t.id.slice(0, 12)}
+              </span>
               <span className="traffic-thread-who">{t.participants.join(', ')}</span>
               <span className="traffic-thread-meta">
                 {t.messages} msg · {relTime(t.last)} ago
@@ -136,7 +156,7 @@ export function AgentTrafficPanel() {
           ))}
         </div>
 
-        <div className="traffic-messages">
+        <div className="traffic-messages" ref={column}>
           {thread && (
             <h3 className="subhead">
               {thread.id} · {thread.messages} messages
