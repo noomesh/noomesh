@@ -296,7 +296,8 @@ pub fn retry_plan(error: &Error, attempts: i32) -> RetryPlan {
         Error::Throttled { retry_after, quota } => (
             if *quota { "quota" } else { "rate" },
             "failing",
-            retry_after.unwrap_or(0).max(backoff),
+            // MUTANT: Google's Retry-After is ignored.
+            { let _ = retry_after; backoff },
         ),
         Error::Unavailable(_) | Error::NotFound => ("provider", "failing", backoff),
     };
