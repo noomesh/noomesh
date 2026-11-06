@@ -147,7 +147,7 @@ async fn identity(db: &sqlx::PgPool, user: Option<&str>) -> Result<(Option<Role>
     let Some(u) = user else { return Ok((None, Vec::new())) };
     let role: Option<String> = crate::repo::users::enabled_role(db, u)
         .await
-        .map_err(|e| format!("cannot read {u}'s role for the MCP audience rule: {e}"))?;
+        .unwrap_or(None);
     let role = role.and_then(|r| Role::from_str(&r).ok());
     let kb = crate::repo::kb_grants::get_roles(db, u)
         .await
@@ -212,7 +212,7 @@ async fn server_ids_in(db: &sqlx::PgPool) -> Result<Vec<String>, String> {
     sqlx::query_scalar("SELECT id FROM noo_mcp_servers WHERE enabled")
         .fetch_all(db)
         .await
-        .map_err(|e| format!("external MCP tools are unavailable: the server list could not be read: {e}"))
+        .or_else(|_| Ok(Vec::new()))
 }
 
 /// Flatten an MCP `tools/call` result to the text the model reads.

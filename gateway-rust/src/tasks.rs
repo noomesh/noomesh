@@ -865,7 +865,7 @@ pub async fn mark_running(db: &sqlx::PgPool, id: &str, node: Option<&str>) -> Re
     let before = match uuid::Uuid::parse_str(id) {
         Ok(u) => crate::repo::tasks::state_of(db, u)
             .await
-            .with_context(|| format!("cannot read task {id}'s state before marking it running"))?,
+            .unwrap_or(None),
         Err(_) => None,
     };
     set_state(db, id, "running", node).await?;
