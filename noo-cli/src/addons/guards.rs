@@ -924,11 +924,17 @@ mod tests {
     /// the `create_host_path` check) fails the second and third cases.
     #[test]
     fn a_declared_mount_must_be_a_long_bind_that_never_creates_its_source() {
+        // The fixture's own header (its x-noo-addon block declares the key
+        // its resources.json's addon_key needs) and system.json (its db
+        // resources need one), with one service whose first volume varies.
+        let fixture = include_str!("../../../tests/fixtures/addons/rhaddon/docker-compose.yml");
+        let header = &fixture[..fixture.find("\nservices:\n").expect("the fixture overlay has a services block") + 1];
         let bundle = |vol: &str| {
-            let text = format!("services:\n  noo-rhaddon:\n    image: x\n    volumes:\n      - {vol}\n      - rh-cache:/cache\n      - {{ type: tmpfs, target: /scratch }}\nvolumes:\n  rh-cache:\n");
+            let text = format!("{header}services:\n  noo-rhaddon:\n    image: x\n    volumes:\n      - {vol}\n      - rh-cache:/cache\n      - {{ type: tmpfs, target: /scratch }}\nvolumes:\n  rh-cache:\n");
             BTreeMap::from([
                 ("docker-compose.yml".to_string(), text.into_bytes()),
                 ("resources.json".to_string(), include_bytes!("../../../tests/fixtures/addons/rhaddon/resources.json").to_vec()),
+                ("system.json".to_string(), include_bytes!("../../../tests/fixtures/addons/rhaddon/system.json").to_vec()),
             ])
         };
         let warned = |vol: &str, third_party: bool| check_bundle_files("rhaddon", &bundle(vol), third_party, &plain_core()).unwrap().warnings;
@@ -955,11 +961,12 @@ mod tests {
         }
         // The shipped fixture is in the long form, and a bundle without
         // resources.json declares no mounts, so neither is warned.
-        let fixture = BTreeMap::from([
-            ("docker-compose.yml".to_string(), include_bytes!("../../../tests/fixtures/addons/rhaddon/docker-compose.yml").to_vec()),
+        let shipped = BTreeMap::from([
+            ("docker-compose.yml".to_string(), fixture.as_bytes().to_vec()),
             ("resources.json".to_string(), include_bytes!("../../../tests/fixtures/addons/rhaddon/resources.json").to_vec()),
+            ("system.json".to_string(), include_bytes!("../../../tests/fixtures/addons/rhaddon/system.json").to_vec()),
         ]);
-        let c = check_bundle_files("rhaddon", &fixture, true, &plain_core()).unwrap();
+        let c = check_bundle_files("rhaddon", &shipped, true, &plain_core()).unwrap();
         assert_eq!((c.mounts, c.warnings), (2, Vec::new()), "the fixture's two mounts were read and pass");
         let mut bare = bundle(bad[0]);
         bare.remove("resources.json");
