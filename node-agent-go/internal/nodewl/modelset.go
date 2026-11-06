@@ -14,28 +14,29 @@ const FormatModelSet = "noo-model-set/1"
 
 // Refusal codes of ParseModelSet, beside the shared ones in errors.go.
 const (
-	CodeIDInvalid        = "id_invalid"
-	CodeRevisionInvalid  = "revision_invalid"
-	CodeKindInvalid      = "kind_invalid"
-	CodeModalityInvalid  = "modality_invalid"
-	CodeRuntimeInvalid   = "runtime_invalid"
-	CodeSourceInvalid    = "source_invalid"
-	CodeLicenseInvalid   = "license_invalid"
-	CodePathInvalid      = "path_invalid"
-	CodeSHA256Invalid    = "sha256_invalid"
-	CodeFilesInvalid     = "files_invalid"
-	CodeNoticeNotInFiles = "notice_not_in_files"
-	CodeProfileInvalid   = "profile_invalid"
-	CodeArchInvalid      = "arch_invalid"
-	CodeFitsRequired     = "fits_required"
-	CodeFitsForbidden    = "fits_forbidden"
-	CodeFitsInvalid      = "fits_invalid"
-	CodeTrustRequired    = "trust_required"
-	CodeTrustInvalid     = "trust_invalid"
-	digestsAuthenticated = "authenticated"
-	digestsOperatorTrust = "operator-trusted-local"
-	maxSetFiles          = 64
-	maxSetFileBytes      = int64(1) << 40
+	CodeIDInvalid          = "id_invalid"
+	CodeRevisionInvalid    = "revision_invalid"
+	CodeKindInvalid        = "kind_invalid"
+	CodeModalityInvalid    = "modality_invalid"
+	CodeRuntimeInvalid     = "runtime_invalid"
+	CodeSourceInvalid      = "source_invalid"
+	CodeLicenseInvalid     = "license_invalid"
+	CodePathInvalid        = "path_invalid"
+	CodeSHA256Invalid      = "sha256_invalid"
+	CodeFilesInvalid       = "files_invalid"
+	CodeFromArchiveInvalid = "from_archive_invalid"
+	CodeNoticeNotInFiles   = "notice_not_in_files"
+	CodeProfileInvalid     = "profile_invalid"
+	CodeArchInvalid        = "arch_invalid"
+	CodeFitsRequired       = "fits_required"
+	CodeFitsForbidden      = "fits_forbidden"
+	CodeFitsInvalid        = "fits_invalid"
+	CodeTrustRequired      = "trust_required"
+	CodeTrustInvalid       = "trust_invalid"
+	digestsAuthenticated   = "authenticated"
+	digestsOperatorTrust   = "operator-trusted-local"
+	maxSetFiles            = 64
+	maxSetFileBytes        = int64(1) << 40
 )
 
 var (
@@ -96,8 +97,9 @@ type Accepted struct {
 }
 
 type Additional struct {
-	ID  string `json:"id"`
-	URL string `json:"url"`
+	ID         string `json:"id"`
+	URL        string `json:"url"`
+	NoticePath string `json:"notice_path,omitempty"`
 }
 
 type File struct {
@@ -105,6 +107,18 @@ type File struct {
 	Bytes  int64  `json:"bytes"`
 	SHA256 string `json:"sha256"`
 	Role   string `json:"role,omitempty"`
+	// FromArchive says the controller extracted this file from an archive of
+	// the same upstream repo and revision at staging. Nodes only ever see the
+	// flat, verified file; the archive itself is not part of the set.
+	FromArchive *FromArchive `json:"from_archive,omitempty"`
+}
+
+// FromArchive names the archive a file was extracted from, and the archive's
+// own digest and size.
+type FromArchive struct {
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+	Bytes  int64  `json:"bytes"`
 }
 
 type Needs struct {
@@ -188,6 +202,9 @@ func ParseModelSet(b []byte) (*ModelSet, error) {
 		if err := requireKeys(f, "files[]", "path", "bytes", "sha256"); err != nil {
 			return nil, err
 		}
+		if err := requireKeys(field(f, "from_archive"), "files[].from_archive", "path", "sha256", "bytes"); err != nil {
+			return nil, err
+		}
 	}
 	for _, p := range items(field(g, "needs"), "profiles") {
 		if err := requireKeys(p, "needs.profiles[]", "name", "accel"); err != nil {
@@ -232,7 +249,7 @@ func checkSet(m *ModelSet) error {
 	if err := checkLicense(m.License); err != nil {
 		return err
 	}
-	if err := checkFiles(m.Files, m.License.NoticeFiles); err != nil {
+	if err := checkFiles(m.Files, m.License); err != nil {
 		return err
 	}
 	if err := checkNeeds(m.Needs); err != nil {
@@ -285,11 +302,13 @@ func checkLicense(l License) error {
 	return nil
 }
 
-func checkFiles(files []File, notices []string) error {
+func checkFiles(files []File, lic License) error {
+	notices := lic.NoticeFiles
 	if len(files) < 1 || len(files) > maxSetFiles {
 		return fail(CodeFilesInvalid, "%d files (1..%d)", len(files), maxSetFiles)
 	}
 	have := map[string]bool{}
+	role := map[string]string{}
 	for _, f := range files {
 		if !ValidSetPath(f.Path) {
 			return fail(CodePathInvalid, "file path %q", f.Path)
@@ -305,10 +324,30 @@ func checkFiles(files []File, notices []string) error {
 		default:
 			return fail(CodeFilesInvalid, "%s: role %q", f.Path, f.Role)
 		}
+		if a := f.FromArchive; a != nil {
+			if !ValidSetPath(a.Path) || !sha256Re.MatchString(a.SHA256) || a.Bytes < 1 || a.Bytes > maxSetFileBytes {
+				return fail(CodeFromArchiveInvalid, "%s: from_archive needs a set path, a lower-case sha256 and bytes", f.Path)
+			}
+			if f.Role == "notice" {
+				return fail(CodeFromArchiveInvalid, "%s: a notice file is staged as itself, not extracted from an archive", f.Path)
+			}
+		}
 		if have[f.Path] {
 			return fail(CodeFilesInvalid, "path %q is listed twice", f.Path)
 		}
 		have[f.Path] = true
+		role[f.Path] = f.Role
+	}
+	for _, a := range lic.Additional {
+		if a.NoticePath == "" {
+			continue
+		}
+		if !ValidSetPath(a.NoticePath) {
+			return fail(CodePathInvalid, "license.additional %s: notice_path %q", a.ID, a.NoticePath)
+		}
+		if role[a.NoticePath] != "notice" {
+			return fail(CodeNoticeNotInFiles, "license.additional %s: notice_path %q is not a role notice file in files", a.ID, a.NoticePath)
+		}
 	}
 	if len(notices) > 16 {
 		return fail(CodeLicenseInvalid, "%d notice files (at most 16)", len(notices))

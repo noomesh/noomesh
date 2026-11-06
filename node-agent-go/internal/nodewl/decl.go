@@ -87,8 +87,14 @@ type Health struct {
 	StartSecs int64  `json:"start_secs"`
 }
 
+// Drain is the worker's own drain, called by the agent through the door.
+// POST Path: a 2xx means the drain was accepted (it must be idempotent). The
+// agent then polls GET DonePath every 2 s: 200 means drained, anything else
+// (non-200, a connection error, an unreachable door) means not yet.
+// TimeoutSecs bounds the WHOLE drain, the POST plus the polling.
 type Drain struct {
 	Path        string `json:"path"`
+	DonePath    string `json:"done_path"`
 	TimeoutSecs int64  `json:"timeout_secs"`
 }
 
@@ -122,6 +128,9 @@ func RoutesFromJSON(b []byte) (map[string]bool, error) {
 type Accel struct {
 	GPU      int64 `json:"gpu"`
 	Realtime bool  `json:"realtime,omitempty"`
+	// SlotsEnv names the declared integer env key that sets the worker's
+	// slot count (see validateSlotsEnv).
+	SlotsEnv string `json:"slots_env,omitempty"`
 }
 
 // Slot is a model slot: the agent mounts the set the operator chose, read-only,
@@ -274,8 +283,8 @@ func validate(addon string, d *Decl, lockImages map[string]string, checkLock boo
 	if !okPath(d.Health.Ready) || !okPath(d.Health.Live) || d.Health.StartSecs < 1 || d.Health.StartSecs > 600 {
 		return fail(CodeHealthInvalid, "health needs absolute paths and start_secs 1..600")
 	}
-	if !okPath(d.Drain.Path) || d.Drain.TimeoutSecs < 1 || d.Drain.TimeoutSecs > 3600 {
-		return fail(CodeDrainInvalid, "drain needs an absolute path and timeout_secs 1..3600")
+	if !okPath(d.Drain.Path) || !okPath(d.Drain.DonePath) || d.Drain.TimeoutSecs < 1 || d.Drain.TimeoutSecs > 3600 {
+		return fail(CodeDrainInvalid, "drain needs absolute path and done_path, and timeout_secs 1..3600")
 	}
 	if err := validateServiceDrain(d.ServiceDrain, routes); err != nil {
 		return err
@@ -289,12 +298,33 @@ func validate(addon string, d *Decl, lockImages map[string]string, checkLock boo
 	if err := validateEnv(addon, d.Env); err != nil {
 		return err
 	}
+	if err := validateSlotsEnv(d.Accel.SlotsEnv, d.Env); err != nil {
+		return err
+	}
 	if err := validateScratch(d.Scratch, d.Models); err != nil {
 		return err
 	}
 	l := d.Limits
 	if l.RAMMB < 64 || l.RAMMB > 1048576 || l.CPUs < 0.1 || l.CPUs > 128 || l.PIDs < 1 || l.PIDs > 32768 {
 		return fail(CodeLimitsInvalid, "limits out of range: ram_mb 64..1048576, cpus 0.1..128, pids 1..32768")
+	}
+	return nil
+}
+
+// validateSlotsEnv: accel.slots_env names one of the decl's OWN declared env
+// keys, and that key has an integer bound (min and/or max), not an enum.
+// Placement sizes VRAM as the profile's vram_mb plus per_slot_vram_mb times the
+// placed value of that key; absent means one slot.
+func validateSlotsEnv(key string, env map[string]EnvBound) error {
+	if key == "" {
+		return nil
+	}
+	b, ok := env[key]
+	if !ok {
+		return fail(CodeAccelInvalid, "accel.slots_env %q is not a declared env key", key)
+	}
+	if b.OneOf != nil || (b.Min == nil && b.Max == nil) {
+		return fail(CodeAccelInvalid, "accel.slots_env %q must have an integer min/max bound", key)
 	}
 	return nil
 }

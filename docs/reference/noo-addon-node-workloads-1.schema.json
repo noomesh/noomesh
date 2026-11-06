@@ -48,9 +48,10 @@
           }
         },
         "drain": {
-          "type": "object", "additionalProperties": false, "required": ["path", "timeout_secs"],
+          "type": "object", "additionalProperties": false, "required": ["path", "done_path", "timeout_secs"],
           "properties": {
-            "path": { "$ref": "#/$defs/path", "description": "POSTed by the node agent through the door." },
+            "path": { "$ref": "#/$defs/path", "description": "POSTed by the node agent through the door; a 2xx means the drain was accepted, and it must be idempotent." },
+            "done_path": { "$ref": "#/$defs/path", "description": "GET by the node agent through the door every 2 s after the POST: 200 means drained, anything else means not yet. timeout_secs bounds the whole drain, the POST plus the polling." },
             "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600 }
           }
         },
@@ -66,7 +67,8 @@
           "type": "object", "additionalProperties": false, "required": ["gpu"],
           "properties": {
             "gpu": { "type": "integer", "minimum": 0, "maximum": 8 },
-            "realtime": { "type": "boolean", "default": false }
+            "realtime": { "type": "boolean", "default": false },
+            "slots_env": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$", "description": "One of this decl's OWN env keys, with an integer min/max bound (x-noo-rules). Placement sizes VRAM as the profile's vram_mb plus per_slot_vram_mb times the placed value of that key; absent means one slot." }
           }
         },
         "models": {
@@ -122,6 +124,7 @@
   "x-noo-rules": [
     "image names a key of the signed lock's images map; an unknown name is refused (image_not_in_lock). The digest comes from the lock, so the bundle signature covers it.",
     "workload names are unique within the file (name_duplicate).",
+    "accel.slots_env, when present, is a key of the same workload's env whose bound is an integer min and/or max, not a one_of (accel_invalid).",
     "service_drain.route names a route of the add-on's routes.json (the same bundle) that exists and is marked \"internal\": true (service_drain_invalid otherwise). A validator given no routes.json (the node agent) skips only this existence and internal check; the shape of service_drain (present, a route name, timeout_secs 1..3600) is always checked.",
     "door name: the door's DNS SAN is noo-stunnel-<addon>-<workload>, which must be ONE DNS label of at most 63 characters, so a node workload is refused when len(addon) + 1 + len(workload) > 51 (door_name_too_long). Both the workload name (above) and the add-on name must match ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ (door_name_invalid): _, upper case and a leading or trailing - are refused, and _ is never mapped to - (a per-file validator cannot see a collision between two add-ons). The add-on name is known only at validation, so it is not a schema check.",
     "env keys must start with <ADDON_UPPER>_ (the add-on name upper-cased, - as _), with the addon known at validation (env_key_outside_prefix). Refused prefixes win over the add-on prefix: NOO_, NVIDIA_, CUDA_, LD_, PYTHON, HF_, TRANSFORMERS_ (env_key_refused_prefix, stated above in propertyNames).",

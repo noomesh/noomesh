@@ -25,6 +25,11 @@
     "code": ""
   },
   {
+    "file": "valid-from-archive.json",
+    "valid": true,
+    "code": ""
+  },
+  {
     "file": "valid-trusted-local-digests.json",
     "valid": true,
     "code": ""
@@ -33,6 +38,41 @@
     "file": "valid-local-unverified.json",
     "valid": true,
     "code": ""
+  },
+  {
+    "file": "refuse-from-archive-sha256.json",
+    "valid": false,
+    "code": "from_archive_invalid"
+  },
+  {
+    "file": "refuse-from-archive-path.json",
+    "valid": false,
+    "code": "from_archive_invalid"
+  },
+  {
+    "file": "refuse-from-archive-bytes.json",
+    "valid": false,
+    "code": "from_archive_invalid"
+  },
+  {
+    "file": "refuse-from-archive-and-notice.json",
+    "valid": false,
+    "code": "from_archive_invalid"
+  },
+  {
+    "file": "refuse-from-archive-unknown-field.json",
+    "valid": false,
+    "code": "unknown_field"
+  },
+  {
+    "file": "refuse-additional-notice-not-in-files.json",
+    "valid": false,
+    "code": "notice_not_in_files"
+  },
+  {
+    "file": "refuse-additional-notice-not-a-notice.json",
+    "valid": false,
+    "code": "notice_not_in_files"
   },
   {
     "file": "refuse-unknown-field.json",

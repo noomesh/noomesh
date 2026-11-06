@@ -183,6 +183,10 @@
               "url": {
                 "type": "string",
                 "pattern": "^https://[^\\s]{1,500}$"
+              },
+              "notice_path": {
+                "$ref": "#/$defs/path",
+                "description": "A role notice file in files that carries this attribution's text (x-noo-rules)."
               }
             }
           },
@@ -223,8 +227,21 @@
             ],
             "default": "weights",
             "description": "notice and config files are staged and verified like any file but are not what the worker loads."
+          },
+          "from_archive": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "sha256", "bytes"],
+            "description": "The controller extracted this file from an archive of the SAME upstream repo and revision at staging. Nodes only ever see the flat verified file; the archive is not part of the set.",
+            "properties": {
+              "path": { "$ref": "#/$defs/path" },
+              "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+              "bytes": { "type": "integer", "minimum": 1, "maximum": 1099511627776 }
+            }
           }
-        }
+        },
+        "if": { "required": ["from_archive"] },
+        "then": { "properties": { "role": { "not": { "const": "notice" } } } }
       }
     },
     "needs": {
@@ -382,6 +399,8 @@
     "license.accept=operator: staging refuses until the operator accepts; `accepted` {by, at} is then written into the manifest and the audit log. accept=none must not carry `accepted`.",
     "A profile with accel=cuda should state vram_mb; min_compute is only meaningful for accel=cuda.",
     "The signature is not a field: it is the detached file beside the manifest (model-set.json.sig), see docs/reference/node-workloads.md.",
+    "a file carries from_archive or role notice, never both (stated above as if/then); a from_archive archive comes from the same upstream repo and revision as the set (the CLI enforces it); the archive is extracted by the controller at staging, never by a node (from_archive_invalid for a shape error).",
+    "license.additional[].notice_path, when present, names a file of files whose role is notice (notice_not_in_files).",
     "JSON null is refused on every field with field_type (the schema's types already refuse it; Go's decoder would read it as an absent value). This format has no nullable field. A repeated object key is refused with duplicate_key.",
     "An unknown field is refused everywhere (additionalProperties false): a node from before a minor addition must refuse the set, not half-load it."
   ],

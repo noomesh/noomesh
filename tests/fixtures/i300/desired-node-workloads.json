@@ -22,6 +22,7 @@
         },
         "drain": {
           "path": "/v1/lifecycle/drain",
+          "done_path": "/v1/lifecycle/drain/done",
           "timeout_secs": 420
         },
         "service_drain": {
@@ -30,7 +31,8 @@
         },
         "accel": {
           "gpu": 1,
-          "realtime": true
+          "realtime": true,
+          "slots_env": "RHADDON_SLOTS"
         },
         "models": [
           {
@@ -118,6 +120,7 @@
       "start_secs": 300,
       "drain": {
         "path": "/v1/lifecycle/drain",
+        "done_path": "/v1/lifecycle/drain/done",
         "timeout_secs": 420
       },
       "reservation": null,
@@ -141,6 +144,7 @@
         },
         "drain": {
           "path": "/drain",
+          "done_path": "/drain/done",
           "timeout_secs": 30
         },
         "service_drain": {
@@ -173,6 +177,7 @@
       "start_secs": 10,
       "drain": {
         "path": "/drain",
+        "done_path": "/drain/done",
         "timeout_secs": 30
       },
       "reservation": "0b1f5f0e-6a3e-4a54-9d3c-0a4e5b9c7d21",

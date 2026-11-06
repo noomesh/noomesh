@@ -191,6 +191,8 @@ NOT_IN_SCHEMA = {
         "refuse-trailing-data.json",
         "refuse-duplicate-key.json",
         "refuse-notice-not-in-files.json",
+        "refuse-additional-notice-not-in-files.json",
+        "refuse-additional-notice-not-a-notice.json",
         "refuse-files-duplicate-path.json",
     },
     "node-workloads": {
@@ -199,6 +201,8 @@ NOT_IN_SCHEMA = {
         "refuse-image-not-in-lock.json",
         "refuse-service-drain-route-unknown.json",
         "refuse-service-drain-route-public.json",
+        "refuse-accel-slots-env-undeclared.json",
+        "refuse-accel-slots-env-enum.json",
         "refuse-name-duplicate.json",
         "refuse-env-key-outside-prefix.json",
         "refuse-env-bound-inverted.json",
@@ -347,13 +351,14 @@ def test_the_doc_names_every_refusal_code_the_fixtures_pin() -> None:
 
 def test_the_doc_states_the_signing_key_and_the_relay_rule() -> None:
     text = doc_text()
-    for needle in ("ECDSA", "P-384", "signing.pub", "/etc/noo/pki", "X-Noo-Reservation", "X-Noo-Requester-Sub", "X-Noo-Requester-Role", "Origin", "Authorization"):
+    for needle in ("ECDSA", "P-384", "signing.pub", "/etc/noo/pki", "X-Noo-Reservation", "X-Noo-Requester-Sub", "X-Noo-Requester-Role", "Origin", "Authorization", "Cookie", "Sec-WebSocket-Protocol", "NOO_SELF_NODE", "NOO_ADDON_WORKLOADS_ON_CONTROLLER", "NOO_ADDON_WORKLOADS", "addon-workload-approvals.json", "weights_only=True", "**409**", "done_path"):
         assert needle in text, needle
 
 
 # ---------------------------------------------------------- the examples
 
 HEARTBEAT_TYPES = {
+    "os": str,  # runtime.GOOS, always reported
     "gpu_compute_cap": str,
     "nvidia_runtime": bool,
     "nvidia_driver_caps_ok": bool,
@@ -371,6 +376,7 @@ def test_the_heartbeat_example_has_the_a4_keys_and_only_them() -> None:
     assert set(hb) == set(HEARTBEAT_TYPES)
     for k, t in HEARTBEAT_TYPES.items():
         assert isinstance(hb[k], t), k
+    assert hb["os"] in ("linux", "darwin", "windows")
     assert re.fullmatch(r"\d{1,2}\.\d", hb["gpu_compute_cap"])
     assert hb["addon_workloads_policy"] in ("none", "approve", "auto")
     assert all(set(a) == {"addon", "digest"} for a in hb["addon_workloads_approvals"])
@@ -383,9 +389,13 @@ def test_the_heartbeat_example_has_the_a4_keys_and_only_them() -> None:
     for w in hb["node_workloads"]:
         # An unknown value is OMITTED, never defaulted or null (the i495 rule:
         # an error must not become a fact).
-        assert {"addon", "name", "state", "ready", "door_port"} <= set(w) <= {"addon", "name", "state", "ready", "model", "slots", "door_port", "reservation", "reason"}
+        # (`slots` is not a phase 2 row key: placement sizes it from slots_env.)
+        assert {"addon", "name", "state", "ready", "door_port"} <= set(w) <= {"addon", "name", "state", "ready", "model", "door_port", "reservation", "reason"}
         assert None not in w.values()
-        assert w["state"] in ("provisioned", "running", "absent")
+        # Reported states: the desired three plus draining and needs_attention,
+        # which never appear in desired-config.
+        assert w["state"] in ("provisioned", "running", "absent", "draining", "needs_attention")
+        assert (w["state"] == "needs_attention") == (w.get("reason") == "drain_timeout")
         assert w.get("reason", "crashed") in reasons
 
 

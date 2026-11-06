@@ -12,11 +12,23 @@ import (
 	"strings"
 )
 
-// Node workload states in desired-config.
+// Node workload states in desired-config. Only these three are ever desired.
 const (
 	StateProvisioned = "provisioned"
 	StateRunning     = "running"
 	StateAbsent      = "absent"
+)
+
+// Reported-only row states (heartbeat `node_workloads[].state`). They never
+// appear in desired-config: ParseDesired refuses them with desired_invalid.
+const (
+	// ReportedDraining: from the accepted drain POST until the done poll
+	// answers 200 or the drain times out. The gateway proxy answers 409 to a
+	// NEW session while the row says draining.
+	ReportedDraining = "draining"
+	// ReportedNeedsAttention: a drain timeout (reason drain_timeout); the
+	// worker is left running and no live session is cut.
+	ReportedNeedsAttention = "needs_attention"
 )
 
 var (
