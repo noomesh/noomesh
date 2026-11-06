@@ -22098,6 +22098,7 @@
               "syncing",
               "idle",
               "paused",
+              "failing",
               "error"
             ]
           },
@@ -22109,6 +22110,8 @@
               "reauth",
               "limit",
               "storage",
+              "rate",
+              "quota",
               null
             ]
           },
