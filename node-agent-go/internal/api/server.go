@@ -419,18 +419,23 @@ func (s *Server) ListenAndServe() error {
 			ErrorLog:  log.New(quietTLSLogger{}, "", 0),
 			TLSConfig: tlsCfg,
 		}
-		slog.Info("control API starting with TLS", "port", port, "bind", plan.Why, "cert", s.cfg.TLSCert, "client_auth", "RequireAndVerifyClientCert")
+		if plan.Awaiting {
+			slog.Warn("control API starting with TLS on loopback only", "port", port, "bind", plan.Why)
+		} else {
+			slog.Info("control API starting with TLS", "port", port, "bind", plan.Why, "cert", s.cfg.TLSCert, "client_auth", "RequireAndVerifyClientCert")
+		}
 		errc := make(chan error, len(lns))
 		for _, ln := range lns {
 			// Cert/key are already loaded into TLSConfig.Certificates.
 			go func(ln net.Listener) { errc <- server.ServeTLS(ln, "", "") }(ln)
 		}
-		if plan.Derived == "" {
+		if !plan.followed() {
 			return <-errc
 		}
 		// The derived address can move (DHCP, tailscale coming up after the
-		// agent). Follow it: a listener bound to a stale address would leave
-		// the node unreachable until someone restarts the agent.
+		// agent), and an awaited one can appear. Follow it: a listener bound to
+		// a stale address, or to loopback only, would leave the node
+		// unreachable until someone restarts the agent.
 		moved := false
 		tick := time.NewTicker(bindRecheck)
 		for !moved {
@@ -441,7 +446,7 @@ func (s *Server) ListenAndServe() error {
 				return err
 			case <-tick.C:
 				if now := s.DetectBindIP(); now != "" && now != plan.Derived {
-					slog.Warn("control API: the controller-reachable address changed; rebinding", "was", plan.Derived, "now", now)
+					slog.Warn("control API: the controller-reachable address changed; rebinding", "was", plan.Derived, "now", now, "awaited", plan.Awaiting)
 					moved = true
 				}
 			}
