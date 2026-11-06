@@ -1555,6 +1555,14 @@ jobs:
           smoke=docker.io/library/ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
         fi
         echo "SMOKE_IMAGE=$smoke" >> "$GITHUB_ENV"
+        # The rotation rehearsal's stub project image, from the same mirror
+        # (its default, alpine:3.20, was a Hub pull that hit the limit, #762).
+        rehearsal="$(python3 "$GITHUB_WORKSPACE/scripts/hub-mirror.py" ref library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc)" || rehearsal=""
+        if [ -z "$rehearsal" ]; then
+          echo "::warning::hub-mirror.py gave no image — alpine:3.20 from Docker Hub"
+          rehearsal=docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+        fi
+        echo "NOO_REHEARSAL_IMAGE=$rehearsal" >> "$GITHUB_ENV"
     - name: Rust toolchain id (cache key)
       id: rustc
       if: needs.scope.outputs.code == 'true' && needs.scope.outputs.deferred != 'true'
