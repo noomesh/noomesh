@@ -453,6 +453,10 @@ pub fn ensure_addon_leaves(
     Ok(issued)
 }
 
+/// One add-on door bundle payload: (kind, bytes). The kind is owned
+/// (`svc-addon-<a>-<w>.crt`), unlike [`LeafPayload`]'s fixed names.
+pub type AddonLeafPayload = (String, Vec<u8>);
+
 /// Bundle payloads for `node`'s add-on door leaves: `svc-addon-<a>-<w>.crt` +
 /// `.key` for every door whose pair is on disk. A half pair is skipped and
 /// named in the second return, as in [`leaf_payloads`].
@@ -460,7 +464,7 @@ pub fn addon_leaf_payloads(
     ca: &ClusterCa,
     node: &str,
     doors: &[(String, String)],
-) -> Result<(Vec<(String, Vec<u8>)>, Vec<String>), String> {
+) -> Result<(Vec<AddonLeafPayload>, Vec<String>), String> {
     for (a, w) in doors {
         check_addon_door(a, w)?;
     }
