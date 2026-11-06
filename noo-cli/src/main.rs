@@ -63,6 +63,7 @@ mod entitlement;
 mod entitlement_terms;
 mod harness_kinds;
 mod harness_profiles;
+mod model_set;
 mod registry;
 mod release_fetch;
 mod release_sig;
@@ -235,6 +236,12 @@ const NATIVE: &[(&[&str], Handler)] = &[
     // Download a GGUF from Hugging Face into the controller store
     // (resume + LFS sha256 verify; commands/models_fetch.rs).
     (&["models", "fetch"], commands::models_fetch),
+    // Model sets (i300 F2b): authenticated HF fetch, signed manifest
+    // (commands/models_sets.rs). `models list --kind` is a branch of the
+    // catalog `models list` below.
+    (&["models", "stage"], commands::models_stage),
+    (&["models", "accept"], commands::models_accept),
+    (&["models", "rm"], commands::models_rm),
     (&["browser", "status"], commands::browser_status),
     (&["browser", "open"], commands::browser_open),
     (&["browser", "stop"], commands::browser_stop),

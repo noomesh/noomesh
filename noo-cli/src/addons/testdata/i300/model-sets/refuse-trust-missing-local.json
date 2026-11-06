@@ -1,0 +1,40 @@
+{
+  "format": "noo-model-set/1",
+  "id": "rh-stt-small",
+  "revision": "r1",
+  "kind": "voice",
+  "modality": "stt",
+  "runtime": [
+    "rh-stt"
+  ],
+  "source": {
+    "local": {
+      "verified": false
+    }
+  },
+  "license": {
+    "id": "MIT",
+    "url": "https://example.invalid/mit",
+    "accept": "none"
+  },
+  "files": [
+    {
+      "path": "model.bin",
+      "bytes": 1000,
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  ],
+  "needs": {
+    "profiles": [
+      {
+        "name": "cpu",
+        "accel": "cpu",
+        "ram_mb": 1024
+      }
+    ],
+    "cpu_fallback": true,
+    "arch": [
+      "amd64"
+    ]
+  }
+}

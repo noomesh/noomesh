@@ -1,0 +1,368 @@
+[
+  {
+    "file": "valid-full.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "valid-rhaddon.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "valid-minimal.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "valid-two-workloads.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "valid-env-fixed-bool.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "valid-scratch-near-slot.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "refuse-unknown-field.json",
+    "valid": false,
+    "code": "unknown_field"
+  },
+  {
+    "file": "refuse-unknown-field-top.json",
+    "valid": false,
+    "code": "unknown_field"
+  },
+  {
+    "file": "refuse-unknown-field-image-ref.json",
+    "valid": false,
+    "code": "unknown_field"
+  },
+  {
+    "file": "refuse-trailing-data.json",
+    "valid": false,
+    "code": "bad_json"
+  },
+  {
+    "file": "refuse-duplicate-key.json",
+    "valid": false,
+    "code": "duplicate_key"
+  },
+  {
+    "file": "refuse-null-gpu.json",
+    "valid": false,
+    "code": "field_type"
+  },
+  {
+    "file": "refuse-service-drain-missing.json",
+    "valid": false,
+    "code": "service_drain_invalid"
+  },
+  {
+    "file": "refuse-service-drain-route-empty.json",
+    "valid": false,
+    "code": "service_drain_invalid"
+  },
+  {
+    "file": "refuse-service-drain-route-name.json",
+    "valid": false,
+    "code": "service_drain_invalid"
+  },
+  {
+    "file": "refuse-service-drain-route-unknown.json",
+    "valid": false,
+    "code": "service_drain_invalid"
+  },
+  {
+    "file": "refuse-service-drain-route-public.json",
+    "valid": false,
+    "code": "service_drain_invalid"
+  },
+  {
+    "file": "refuse-service-drain-timeout-zero.json",
+    "valid": false,
+    "code": "service_drain_invalid"
+  },
+  {
+    "file": "refuse-service-drain-timeout-3601.json",
+    "valid": false,
+    "code": "service_drain_invalid"
+  },
+  {
+    "file": "refuse-service-drain-unknown-field.json",
+    "valid": false,
+    "code": "unknown_field"
+  },
+  {
+    "file": "refuse-drain-done-path-missing.json",
+    "valid": false,
+    "code": "drain_invalid"
+  },
+  {
+    "file": "refuse-drain-done-path-invalid.json",
+    "valid": false,
+    "code": "drain_invalid"
+  },
+  {
+    "file": "refuse-accel-slots-env-undeclared.json",
+    "valid": false,
+    "code": "accel_invalid"
+  },
+  {
+    "file": "refuse-accel-slots-env-enum.json",
+    "valid": false,
+    "code": "accel_invalid"
+  },
+  {
+    "file": "refuse-accel-slots-env-malformed.json",
+    "valid": false,
+    "code": "accel_invalid"
+  },
+  {
+    "file": "refuse-bad-format.json",
+    "valid": false,
+    "code": "bad_format"
+  },
+  {
+    "file": "refuse-no-workloads.json",
+    "valid": false,
+    "code": "workloads_invalid"
+  },
+  {
+    "file": "refuse-missing-limits.json",
+    "valid": false,
+    "code": "field_missing"
+  },
+  {
+    "file": "refuse-name-uppercase.json",
+    "valid": false,
+    "code": "door_name_invalid"
+  },
+  {
+    "file": "refuse-name-underscore.json",
+    "valid": false,
+    "code": "door_name_invalid"
+  },
+  {
+    "file": "refuse-name-leading-dash.json",
+    "valid": false,
+    "code": "door_name_invalid"
+  },
+  {
+    "file": "refuse-name-trailing-dash.json",
+    "valid": false,
+    "code": "door_name_invalid"
+  },
+  {
+    "file": "refuse-addon-underscore.json",
+    "valid": false,
+    "code": "door_name_invalid",
+    "addon": "rh_addon"
+  },
+  {
+    "file": "refuse-addon-uppercase.json",
+    "valid": false,
+    "code": "door_name_invalid",
+    "addon": "RhAddon"
+  },
+  {
+    "file": "refuse-addon-trailing-dash.json",
+    "valid": false,
+    "code": "door_name_invalid",
+    "addon": "rhaddon-"
+  },
+  {
+    "file": "valid-door-name-51.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "refuse-door-name-52.json",
+    "valid": false,
+    "code": "door_name_too_long"
+  },
+  {
+    "file": "valid-door-name-51-by-addon.json",
+    "valid": true,
+    "code": "",
+    "addon": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  {
+    "file": "refuse-door-name-52-by-addon.json",
+    "valid": false,
+    "code": "door_name_too_long",
+    "addon": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  {
+    "file": "valid-addon-hyphen.json",
+    "valid": true,
+    "code": "",
+    "addon": "rh-addon"
+  },
+  {
+    "file": "refuse-name-duplicate.json",
+    "valid": false,
+    "code": "name_duplicate"
+  },
+  {
+    "file": "refuse-image-not-in-lock.json",
+    "valid": false,
+    "code": "image_not_in_lock"
+  },
+  {
+    "file": "refuse-uid-zero.json",
+    "valid": false,
+    "code": "uid_invalid"
+  },
+  {
+    "file": "refuse-command-empty.json",
+    "valid": false,
+    "code": "command_invalid"
+  },
+  {
+    "file": "refuse-port-low.json",
+    "valid": false,
+    "code": "port_invalid"
+  },
+  {
+    "file": "refuse-protocol-tcp.json",
+    "valid": false,
+    "code": "protocols_invalid"
+  },
+  {
+    "file": "refuse-health-start-secs-high.json",
+    "valid": false,
+    "code": "health_invalid"
+  },
+  {
+    "file": "refuse-drain-timeout-zero.json",
+    "valid": false,
+    "code": "drain_invalid"
+  },
+  {
+    "file": "refuse-accel-gpu-high.json",
+    "valid": false,
+    "code": "accel_invalid"
+  },
+  {
+    "file": "refuse-limits-pids-zero.json",
+    "valid": false,
+    "code": "limits_invalid"
+  },
+  {
+    "file": "refuse-slot-no-accepts.json",
+    "valid": false,
+    "code": "model_slot_invalid"
+  },
+  {
+    "file": "refuse-slot-kind.json",
+    "valid": false,
+    "code": "model_slot_invalid"
+  },
+  {
+    "file": "refuse-slot-target-proc.json",
+    "valid": false,
+    "code": "model_slot_invalid"
+  },
+  {
+    "file": "refuse-env-key-outside-prefix.json",
+    "valid": false,
+    "code": "env_key_outside_prefix"
+  },
+  {
+    "file": "refuse-env-key-noo.json",
+    "valid": false,
+    "code": "env_key_refused_prefix"
+  },
+  {
+    "file": "refuse-env-key-nvidia.json",
+    "valid": false,
+    "code": "env_key_refused_prefix"
+  },
+  {
+    "file": "refuse-env-key-cuda.json",
+    "valid": false,
+    "code": "env_key_refused_prefix"
+  },
+  {
+    "file": "refuse-env-key-ld.json",
+    "valid": false,
+    "code": "env_key_refused_prefix"
+  },
+  {
+    "file": "refuse-env-key-python.json",
+    "valid": false,
+    "code": "env_key_refused_prefix"
+  },
+  {
+    "file": "refuse-env-key-hf.json",
+    "valid": false,
+    "code": "env_key_refused_prefix"
+  },
+  {
+    "file": "refuse-env-key-transformers.json",
+    "valid": false,
+    "code": "env_key_refused_prefix"
+  },
+  {
+    "file": "refuse-env-bound-inverted.json",
+    "valid": false,
+    "code": "env_bound_invalid"
+  },
+  {
+    "file": "refuse-env-bound-empty.json",
+    "valid": false,
+    "code": "env_bound_invalid"
+  },
+  {
+    "file": "refuse-env-bound-empty-enum.json",
+    "valid": false,
+    "code": "env_bound_invalid"
+  },
+  {
+    "file": "refuse-scratch-root.json",
+    "valid": false,
+    "code": "scratch_target_refused"
+  },
+  {
+    "file": "refuse-scratch-proc.json",
+    "valid": false,
+    "code": "scratch_target_refused"
+  },
+  {
+    "file": "refuse-scratch-sys.json",
+    "valid": false,
+    "code": "scratch_target_refused"
+  },
+  {
+    "file": "refuse-scratch-dev.json",
+    "valid": false,
+    "code": "scratch_target_refused"
+  },
+  {
+    "file": "refuse-scratch-dev-shm.json",
+    "valid": false,
+    "code": "scratch_target_refused"
+  },
+  {
+    "file": "refuse-scratch-both-sizes.json",
+    "valid": false,
+    "code": "scratch_invalid"
+  },
+  {
+    "file": "refuse-scratch-in-model-slot.json",
+    "valid": false,
+    "code": "scratch_in_model_slot"
+  },
+  {
+    "file": "refuse-scratch-equals-model-slot.json",
+    "valid": false,
+    "code": "scratch_in_model_slot"
+  }
+]

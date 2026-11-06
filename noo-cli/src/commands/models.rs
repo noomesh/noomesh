@@ -363,6 +363,8 @@ pub(crate) struct ListArgs {
     tier: Option<i64>,
     limit: usize,
     refresh: bool,
+    /// `--kind voice|voice-pack`: list staged model sets, not the catalog.
+    kind: Option<String>,
 }
 
 pub(crate) fn parse_list_with(a: &mut Args) -> Result<ListArgs, ArgError> {
@@ -370,15 +372,24 @@ pub(crate) fn parse_list_with(a: &mut Args) -> Result<ListArgs, ArgError> {
     let tier = a.number::<i64>(&["--tier", "-t"])?;
     let limit = a.number::<usize>(&["--limit", "-n"])?.unwrap_or(15);
     let refresh = a.flag(&["--refresh"]);
+    let kind = a.value(&["--kind"])?;
     a.finish()?;
-    Ok(ListArgs { backend, tier, limit, refresh })
+    if kind.is_some() && (backend.is_some() || tier.is_some() || refresh) {
+        return Err(ArgError::new(
+            "--kind lists staged model sets; it does not combine with --backend, --tier or --refresh",
+        ));
+    }
+    Ok(ListArgs { backend, tier, limit, refresh, kind })
 }
 
 /// `noo models list [--backend/-b B] [--tier/-t N] [--limit/-n N] [--refresh]`
 /// — popular models per backend from the HuggingFace-backed catalog cache.
 pub fn models_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     crate::ui::auto_page(); // long output: $PAGER on a TTY (no-op otherwise)
-    let ListArgs { backend, tier, limit, refresh } = parse_list_with(&mut Args::new(args))?;
+    let ListArgs { backend, tier, limit, refresh, kind } = parse_list_with(&mut Args::new(args))?;
+    if let Some(kind) = kind {
+        return super::models_sets::list_sets(g, &kind);
+    }
 
     let backends: Vec<String> = match &backend {
         Some(b) => vec![b.clone()],
