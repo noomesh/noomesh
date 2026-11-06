@@ -131,7 +131,9 @@ Separate from the existing `addon_workloads` key. One row per
 ```json
 {"addon": "rhaddon", "name": "worker",
  "decl": { "...": "the validated workload object, verbatim" },
- "image": {"name": "addon-worker", "digest": "sha256:<64 hex>"},
+ "image": {"name": "addon-worker", "digest": "sha256:<64 hex>",
+           "id": "sha256:<64 hex>",
+           "artifact": "noo-addon-wl_rhaddon_addon-worker_<64 hex>_amd64.tar"},
  "sets": {"main": [{"id": "...", "revision": "..."}]},
  "profile": "int8",
  "env": {"RHADDON_SLOTS": "1"},
@@ -160,6 +162,41 @@ an upper-case or non-UUID id is `desired_invalid`). `start_secs` and
 has at least one set, and a `many: false` slot has at most one (not checked for
 `absent`). The agent re-checks `env` against the decl's bounds; a key the decl
 does not declare is out of bounds.
+
+### The image: digest, id and artifact
+
+The lock digest is the **registry manifest digest**; a docker image ID is the
+**config digest**, and a classic `docker save` drops RepoDigests, so a node
+cannot check a loaded tar against the lock digest. `image` is therefore
+`{name, digest, id, artifact}`:
+
+- `digest`: `sha256:` and 64 lower-case hex, from the verified lock. **Record
+  only** on the node.
+- `id`: `sha256:` and 64 lower-case hex, the image ID the CLI recorded after
+  its digest-verified pull (the `.imageid` sidecar).
+- `artifact`: the rail name of the staged tar,
+  `noo-addon-wl_<addon>_<image name>_<64 hex>_<arch>.tar`, where the 64 hex
+  equal the hex of `digest`, `<addon>` and `<image name>` equal the entry's
+  `addon` and `image.name`, and `<arch>` is `amd64` or `arm64`.
+
+`ParseDesired` refuses any violation, and a malformed `digest`, with
+`image_missing`. Matching `<arch>` against the node's own arch is a runtime
+check, F5's job, reported as `arch_mismatch`.
+
+Node rules (enforced in F5):
+
+- The worker is created from `image.id`, never from a tag or a repo name.
+- Loading the tar must yield **exactly one** image, and its ID must equal
+  `image.id`. Anything else is `image_digest_mismatch`.
+- Only the CLI writes the `.imageid` sidecar, at staging. The gateway only
+  reads it, when it builds the entry, and never caches it across a restage. A
+  changed ID changes the entry, so the agent reprovisions.
+
+**Trust boundary.** In phase 2 the controller is the root of trust for the
+image, the same as it is for the tar's rail sha256: the node trusts the
+`id` the controller names and checks the tar against it, but cannot check the
+id against the add-on's signed lock. Phase 3's node-side lock-signature check
+closes that gap.
 
 ### Door and amendments
 
@@ -193,11 +230,11 @@ worker. The worker holds no credential and no user token.
 | State | Meaning |
 |---|---|
 | `absent` | Nothing of this workload on the node: worker, sidecar and network removed. |
-| `provisioned` | Image loaded and matches the digest, sets verified, sidecar and worker created **stopped**, on an `internal: true` network. The resting state. |
+| `provisioned` | Image loaded and its ID equals `image.id`, sets verified, sidecar and worker created **stopped**, on an `internal: true` network. The resting state. |
 | `running` | Started. Ready when `health.ready` answers through the door within `start_secs`. |
 
-- `absent` to `provisioned`: load the image from the rail, check its ID equals
-  `image.digest`, verify the sets, create the sidecar and the worker stopped.
+- `absent` to `provisioned`: load the image tar from the rail, check it yields
+  exactly one image whose ID equals `image.id`, verify the sets, create the sidecar and the worker stopped.
 - `provisioned` to `running`: start. A worker not ready within `start_secs`
   reports `start_timeout`.
 - **Release returns the row to `provisioned`**: call `drain.path` (POST) through
@@ -255,8 +292,8 @@ The agent's fixed vocabulary for the `reason` of a `node_workloads` or
 | `decl_invalid` | the decl fails the node-workloads rules (the inner refusal code is logged) | fix the add-on's `node-workloads.json` |
 | `desired_invalid` | the entry is malformed: unknown field, wrong type, bad state, reservation not a UUID, name or `start_secs`/`drain` differing from the decl, wrong `door.leaf` | a gateway bug or version skew: upgrade the controller |
 | `door_leaf_missing` | the door leaf is not available: it is not in the provision bundle yet, or this node's applier predates the `svc-addon-*` leaf kind | re-provision (`noo upgrade --nodes`) |
-| `image_missing` | the image name or digest is absent or malformed, or the image is not on the rail | re-enable or upgrade the add-on on the controller |
-| `image_digest_mismatch` | the loaded image's ID differs from `image.digest` | re-stage the image; investigate the rail |
+| `image_missing` | `image` is not `{name, digest, id, artifact}` as above (name, digest, id or artifact absent, malformed or inconsistent), or the tar is not on the rail | re-enable or upgrade the add-on on the controller |
+| `image_digest_mismatch` | the tar did not load as exactly one image, or that image's ID differs from `image.id` | re-stage the image; investigate the rail |
 | `set_missing` | a required slot has no set | choose a model for the slot |
 | `set_slot_invalid` | `sets` names an undeclared slot, several sets for a `many: false` slot, or a malformed id or revision | fix the placement |
 | `set_unverified` | a set's signature, hashes or `.verified` marker did not check out | re-stage the set; check the node holds `signing.pub` |
@@ -267,7 +304,7 @@ The agent's fixed vocabulary for the `reason` of a `node_workloads` or
 | `nvidia_runtime_missing` | `accel.gpu` > 0 and the nvidia runtime is not registered | install the NVIDIA container toolkit |
 | `driver_caps_missing` | the driver cannot grant `compute,utility` | fix the driver or toolkit |
 | `compute_cap_low` | the GPU's compute capability is below the set's `min_compute` | place on a newer GPU |
-| `arch_mismatch` | the node's arch is not in the set's `needs.arch` | place on another node |
+| `arch_mismatch` | the node's arch is not in the set's `needs.arch`, or differs from the `<arch>` of `image.artifact` | place on another node |
 | `controller_host` | the node is the controller's host and has not opted in (D4) | opt in for a single-box install, or place elsewhere |
 | `admit_invalid` | `door.admit` is not exactly `[<own agent CN>]` | a gateway bug or version skew |
 | `env_out_of_bounds` | an env key is undeclared or its value is outside the decl's bound | fix the placement's env |
@@ -278,7 +315,7 @@ The agent's fixed vocabulary for the `reason` of a `node_workloads` or
 
 The placement facts (`consent_none`, `consent_unapproved`, `nvidia_runtime_missing`, `driver_caps_missing`, `compute_cap_low`, `arch_mismatch`, `controller_host`, `disk`) are also the gateway's placement refusal codes, spelled identically: the gateway refuses a placement with the code the agent would report.
 
-`image_missing` also covers a malformed digest at parse time. A refusal of the
+`image_missing` also covers a malformed digest, id or artifact at parse time. A refusal of the
 decl inside an entry is reported as `decl_invalid` and carries the inner code.
 
 ## Refusal codes
