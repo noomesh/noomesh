@@ -5629,7 +5629,7 @@ pub(crate) fn addon_containers_row(addon: &str, state: Result<crate::commands::a
     const ROW: &str = "add-on containers";
     let restart = format!("noo stack restart {addon}");
     match state {
-        Ok(c) if c.down.is_empty() => {
+        Ok(c) if c.down.is_empty() && c.held.is_empty() => {
             let held: Vec<String> = c.held.iter().map(|(h, why)| format!("held: {h} ({why})")).collect();
             if held.is_empty() {
                 ok(ROW, format!("{addon}: every declared container is running"))
