@@ -386,6 +386,12 @@ pub fn parse_node_workloads(
             format!("{NODE_WORKLOADS_FILE}: null is not a value here (leave the field out)"),
         ));
     }
+    // Syntax first, over the whole input, as Go's json.Unmarshal does: a
+    // truncated document (`[1, 2`) is bad_json, not the type error a typed
+    // decode would hit before it reached the end.
+    if let Err(e) = serde_json::from_slice::<serde::de::IgnoredAny>(bytes) {
+        return Err(refuse("bad_json", format!("{NODE_WORKLOADS_FILE}: {e}")));
+    }
     let file: File = serde_json::from_slice(bytes)
         .map_err(|e| decode_refusal(NODE_WORKLOADS_FILE, &e))?;
     let (Some(format), Some(raws)) = (file.format, file.workloads) else {
