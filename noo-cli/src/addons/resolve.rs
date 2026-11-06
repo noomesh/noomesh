@@ -1005,7 +1005,7 @@ pub(crate) mod tests {
 
     /// A signed bundle of `rhaddon` carrying [`OVERLAY`], this
     /// node-workloads.json and this routes.json.
-    fn signed_rh_bundle(l: &AddonLock, node_workloads: &[u8], routes: &[u8]) -> Fetched {
+    pub(crate) fn signed_rh_bundle(l: &AddonLock, node_workloads: &[u8], routes: &[u8]) -> Fetched {
         let mut l = l.clone();
         l.addon = "rhaddon".into();
         l.format = addon_lock::FORMAT_V2.into();
