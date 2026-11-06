@@ -325,8 +325,8 @@ mod tests {
         };
         let sixteen_plus: String = (0..17).map(|i| ok(&format!("w{i}"), &format!("noo-pai-voice-w{i}"), "")).collect::<Vec<_>>().join(",");
         for (text, needle) in [
-            (format!(r#"{{"workloads": [{}]}}"#, ok("Voice", "noo-pai-voice-x", "")), "names are"),
-            (format!(r#"{{"workloads": [{}]}}"#, ok("voice_worker", "noo-pai-voice-x", "")), "names are"),
+            (format!(r#"{{"workloads": [{}]}}"#, ok("Voice", "noo-pai-voice-x", "")), "invalid add-on or workload name"),
+            (format!(r#"{{"workloads": [{}]}}"#, ok("voice_worker", "noo-pai-voice-x", "")), "invalid add-on or workload name"),
             (format!(r#"{{"workloads": [{}]}}"#, ok("w", "pai-voice-worker", "")), "noo-pai-voice-"),
             (format!(r#"{{"workloads": [{}]}}"#, ok("w", "noo-x", "")), "noo-pai-voice-"),
             (r#"{"workloads": [{"name": "w", "container": "noo-pai-voice-x", "gpu": true, "need_mb": 0, "drain": {"route": "drain", "timeout_secs": 120}}]}"#.to_string(), "need_mb"),
