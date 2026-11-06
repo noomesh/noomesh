@@ -291,10 +291,14 @@ mod tests {
 
     fn fixture() -> Vec<NodeWorkload> {
         let text = include_str!("../../../tests/fixtures/addons/rhaddon/node-workloads.json");
+        let routes = super::super::node_workloads::routes_from_json(
+            include_bytes!("../../../tests/fixtures/addons/rhaddon/routes.json"),
+        );
         super::super::node_workloads::parse_node_workloads(
             "rhaddon",
             text.as_bytes(),
             &lock_images(),
+            Some(&routes),
         )
         .expect("the rhaddon fixture parses")
     }
