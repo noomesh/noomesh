@@ -2173,12 +2173,14 @@ fn seat_binding_check(seat: &Value, name: &str) -> Option<super::cluster_verify:
     let bound = seat.get("tailnet_name")?;
     Some(match bound.as_str() {
         Some(device) => check("seat binding", Verdict::Ok, format!("bound to tailnet device {device}"), None),
-        None => {
+        // MUTANT: an unbound seat reads as bound.
+        None if name.is_empty() => {
             let reported = seat["heartbeat"]["tailnet"]["name"].as_str().unwrap_or("<tailnet-device>");
             check("seat binding", Verdict::Fail,
                 "not bound to a tailnet device: its display cannot mint a kiosk token".into(),
                 Some(format!("noo kiosk seats bind {name} {reported}")))
         }
+        None => check("seat binding", Verdict::Ok, "bound".into(), None),
     })
 }
 
