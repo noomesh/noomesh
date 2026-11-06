@@ -107,16 +107,30 @@ impl Api for Google<'_> {
             .send()
             .await
             .map_err(|_| Error::Unavailable("Cannot reach Google for private sync".into()))?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(Error::Reauth);
-        }
-        if !response.status().is_success() {
-            return Err(Error::Unavailable(
-                "Google private sync is unavailable; retry or check access".into(),
-            ));
+        if !status.is_success() {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            // The error body only refines the status (which reason Google
+            // gave). A body that cannot be read is classified by its status.
+            let mut body = Vec::new();
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) if body.len() + chunk.len() <= 64 * 1024 => body.extend_from_slice(&chunk),
+                    Ok(_) => break,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "google refusal body unreadable; classifying by status");
+                        break;
+                    }
+                }
+            }
+            return Err(refusal(status.as_u16(), retry_after.as_deref(), &body));
         }
         let mut data = Vec::new();
         while let Some(chunk) = response
@@ -130,6 +144,51 @@ impl Api for Google<'_> {
             data.extend_from_slice(&chunk);
         }
         Ok(Some(data))
+    }
+}
+
+/// Rate reasons Google sends on a 403 (and in a 429's body).
+const RATE_REASONS: &[&str] = &["rateLimitExceeded", "userRateLimitExceeded", "RATE_LIMIT_EXCEEDED"];
+/// Quota reasons: the day's or the project's allowance is spent.
+const QUOTA_REASONS: &[&str] = &["quotaExceeded", "dailyLimitExceeded", "dailyLimitExceededUnreg"];
+/// The grant lacks a scope: only reconnecting (new consent) can fix it.
+const SCOPE_REASONS: &[&str] = &["insufficientPermissions", "ACCESS_TOKEN_SCOPE_INSUFFICIENT"];
+/// The longest Retry-After honoured; a larger one is clamped, not trusted.
+pub(crate) const MAX_RETRY_AFTER_SECS: u64 = 24 * 3600;
+
+/// What a non-2xx (other than 404) from a Google API means for the sync.
+/// Rate and quota refusals back off without counting as a provider fault;
+/// a missing scope needs the person to reconnect; anything else is a
+/// provider fault retried on the capped backoff.
+pub(crate) fn refusal(status: u16, retry_after: Option<&str>, body: &[u8]) -> Error {
+    // Retry-After in seconds. Google does not send the HTTP-date form to
+    // API clients; a value that is not a number is ignored, not guessed.
+    let wait = retry_after
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|s| s.min(MAX_RETRY_AFTER_SECS));
+    // Both error shapes: `error.errors[].reason` (v1/v3 APIs) and
+    // `error.details[].reason` (google.rpc.ErrorInfo). A body that is not
+    // JSON names no reason, and the status alone decides.
+    let parsed = serde_json::from_slice::<Value>(body).ok();
+    let reasons: Vec<&str> = parsed
+        .as_ref()
+        .map(|v| {
+            ["errors", "details"]
+                .iter()
+                .flat_map(|k| v["error"][*k].as_array().into_iter().flatten())
+                .filter_map(|e| e["reason"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    let has = |set: &[&str]| reasons.iter().any(|r| set.contains(r));
+    let exhausted = parsed.as_ref().and_then(|v| v["error"]["status"].as_str()) == Some("RESOURCE_EXHAUSTED");
+    match status {
+        401 => Error::Reauth,
+        429 => Error::Throttled { retry_after: wait, quota: has(QUOTA_REASONS) },
+        403 if has(QUOTA_REASONS) => Error::Throttled { retry_after: wait, quota: true },
+        403 if has(RATE_REASONS) || exhausted => Error::Throttled { retry_after: wait, quota: false },
+        403 if has(SCOPE_REASONS) => Error::Reauth,
+        _ => Error::Unavailable("Google private sync is unavailable; retry or check access".into()),
     }
 }
 
@@ -500,10 +559,26 @@ pub(crate) async fn page(
     }
 }
 
+/// The warning the sync worker logs when it cannot run: once per outage of
+/// the key, not every 10 s. The vault's errors are this crate's own text
+/// (and the secret reader's name, path and reason), never the key itself.
+fn idle_warning(vault: &Result<Vault, Error>, warned: bool) -> Option<String> {
+    match vault {
+        Err(error) if !warned => Some(error.to_string()),
+        _ => None,
+    }
+}
+
 pub fn spawn(state: Arc<crate::state::AppState>) {
     tokio::spawn(async move {
+        let mut vault_warned = false;
         loop {
-            if let Ok(vault) = Vault::configured() {
+            let vault = Vault::configured();
+            if let Some(why) = idle_warning(&vault, vault_warned) {
+                tracing::warn!(error = %why, "private sync is idle: the integration encryption key is unusable");
+            }
+            vault_warned = vault.is_err();
+            if let Ok(vault) = vault {
                 match content::claim(&state.db, &vault).await {
                     Ok(Some(job)) => {
                         let result = async {
@@ -699,5 +774,57 @@ mod tests {
             let policy = serde_json::from_value(value).unwrap();
             assert!(page(&fixture(), &policy, None, BTreeMap::new()).await.is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::{idle_warning, refusal, Error, Vault, MAX_RETRY_AFTER_SECS};
+
+    fn body(reason: &str) -> Vec<u8> {
+        serde_json::json!({"error": {"code": 403, "errors": [{"reason": reason}]}}).to_string().into_bytes()
+    }
+
+    /// A 429, or a 403 naming a rate or quota reason, is a throttle that
+    /// carries Google's Retry-After; a missing scope needs a reconnect; any
+    /// other refusal is a provider fault.
+    #[test]
+    fn google_refusals_are_classified_and_retry_after_is_kept() {
+        match refusal(429, Some("120"), b"") {
+            Error::Throttled { retry_after: Some(120), quota: false } => {}
+            other => panic!("429: {other:?}"),
+        }
+        match refusal(403, Some(" 30 "), &body("userRateLimitExceeded")) {
+            Error::Throttled { retry_after: Some(30), quota: false } => {}
+            other => panic!("rate 403: {other:?}"),
+        }
+        match refusal(403, None, &body("dailyLimitExceeded")) {
+            Error::Throttled { retry_after: None, quota: true } => {}
+            other => panic!("quota 403: {other:?}"),
+        }
+        let rpc = serde_json::json!({"error": {"status": "RESOURCE_EXHAUSTED", "details": [{"reason": "RATE_LIMIT_EXCEEDED"}]}});
+        assert!(matches!(refusal(403, None, rpc.to_string().as_bytes()), Error::Throttled { quota: false, .. }));
+        assert!(matches!(refusal(403, None, &body("insufficientPermissions")), Error::Reauth));
+        assert!(matches!(refusal(401, None, b""), Error::Reauth));
+        // A 403 with no known reason, a 5xx, or a proxy page: provider fault.
+        for (status, raw) in [(403, body("domainPolicy")), (503, b"<html>".to_vec()), (500, Vec::new())] {
+            assert!(matches!(refusal(status, Some("60"), &raw), Error::Unavailable(_)), "{status}");
+        }
+        // Retry-After is clamped, and a date or garbage is ignored, not guessed.
+        assert!(matches!(refusal(429, Some("99999999"), b""), Error::Throttled { retry_after: Some(MAX_RETRY_AFTER_SECS), .. }));
+        assert!(matches!(refusal(429, Some("Wed, 21 Oct 2015 07:28:00 GMT"), b""), Error::Throttled { retry_after: None, .. }));
+    }
+
+    /// An unusable key is said once per outage, with the cause, and never
+    /// carries the key.
+    #[test]
+    fn an_unusable_key_is_warned_once() {
+        let missing: Result<Vault, Error> = Vault::from_secret("short");
+        let why = idle_warning(&missing, false).expect("the first idle loop warns");
+        assert!(why.contains("integration encryption key"), "{why}");
+        assert!(!why.contains("short"), "the warning never carries the key");
+        assert_eq!(idle_warning(&missing, true), None, "not again every 10 s");
+        let usable = Vault::from_secret(&"k".repeat(32));
+        assert_eq!(idle_warning(&usable, false), None);
     }
 }

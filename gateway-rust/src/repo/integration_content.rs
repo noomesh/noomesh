@@ -117,14 +117,17 @@ pub async fn claim(db: &PgPool, vault: &Vault) -> Result<Option<Job>, Error> {
             continue;
         };
         let gmail = matches!(policy, crate::connections::SourcePolicy::Gmail { .. });
-        if gmail {
-            // Serialize claims for this owner without locking other job rows.
-            // The transaction lock releases automatically on commit/rollback.
+        {
+            // One page per owner at a time, at most one a second, whatever
+            // the provider (Drive and Gmail share the owner's Google quota);
+            // a new full Gmail scan at most once a minute. Serialize claims
+            // for this owner without locking other job rows. The transaction
+            // lock releases automatically on commit/rollback.
             let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended('noomesh/google-owner/' || $1::uuid::text, 0))")
                 .bind(owner).fetch_one(&mut *tx).await?;
             let due: Option<chrono::DateTime<chrono::Utc>> = if locked {
-                sqlx::query_scalar("SELECT due FROM (SELECT GREATEST(max(last_gmail_page)+interval '1 second',CASE WHEN $2 THEN max(last_gmail_scan)+interval '1 minute' ELSE NULL END) AS due FROM noo_integration_sync WHERE owner_uuid=$1) AS pacing WHERE due>now()")
-                    .bind(owner).bind(starting).fetch_optional(&mut *tx).await?
+                sqlx::query_scalar("SELECT due FROM (SELECT GREATEST(max(last_page)+interval '1 second',CASE WHEN $2 THEN max(last_gmail_scan)+interval '1 minute' ELSE NULL END) AS due FROM noo_integration_sync WHERE owner_uuid=$1) AS pacing WHERE due>now()")
+                    .bind(owner).bind(starting && gmail).fetch_optional(&mut *tx).await?
             } else {
                 Some(sqlx::query_scalar("SELECT now()+interval '1 second'").fetch_one(&mut *tx).await?)
             };
@@ -135,7 +138,7 @@ pub async fn claim(db: &PgPool, vault: &Vault) -> Result<Option<Job>, Error> {
                 continue;
             }
         }
-        sqlx::query("UPDATE noo_integration_sync SET lease=$2,lease_until=now()+interval '5 minutes',imported=CASE WHEN generation IS NULL THEN 0 ELSE imported END,skipped=CASE WHEN generation IS NULL THEN 0 ELSE skipped END,generation=$3,status='syncing',last_gmail_page=CASE WHEN $4 THEN now() ELSE last_gmail_page END,last_gmail_scan=CASE WHEN $4 AND $5 THEN now() ELSE last_gmail_scan END WHERE source_id=$1")
+        sqlx::query("UPDATE noo_integration_sync SET lease=$2,lease_until=now()+interval '5 minutes',imported=CASE WHEN generation IS NULL THEN 0 ELSE imported END,skipped=CASE WHEN generation IS NULL THEN 0 ELSE skipped END,generation=$3,status='syncing',last_page=now(),last_gmail_scan=CASE WHEN $4 AND $5 THEN now() ELSE last_gmail_scan END WHERE source_id=$1")
             .bind(source).bind(lease).bind(generation).bind(gmail).bind(starting).execute(&mut *tx).await?;
         tx.commit().await?;
         return Ok(Some(Job {
@@ -262,17 +265,54 @@ pub async fn versions(db: &PgPool, vault: &Vault, job: &Job) -> Result<BTreeMap<
     Ok(known)
 }
 
-pub async fn fail(db: &PgPool, job: &Job, error: &Error) -> Result<(), Error> {
-    let fault = match error {
-        Error::Reauth => "reauth",
-        Error::Invalid(_) => "limit",
-        Error::Storage(_) => "storage",
-        _ => "provider",
+/// The longest a failing source waits between tries.
+pub const MAX_RETRY_SECS: u64 = 3600;
+
+/// What a failed sync page does next.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RetryPlan {
+    pub fault: &'static str,
+    /// `error` stops until the person acts (reconnect, narrow the source);
+    /// `failing` retries by itself and says so.
+    pub status: &'static str,
+    pub delay_secs: u64,
+}
+
+/// 1, 2, 4 … minutes, capped at an hour.
+pub fn backoff_secs(attempts: i32) -> u64 {
+    (60u64 << attempts.clamp(0, 6)).min(MAX_RETRY_SECS)
+}
+
+/// Only what the person must fix is terminal: a lost grant (`reauth`) or a
+/// source over its limits (`limit`). A provider, storage, rate or quota
+/// fault keeps retrying on the capped backoff; a rate or quota refusal
+/// waits at least as long as Google asked (Retry-After).
+pub fn retry_plan(error: &Error, attempts: i32) -> RetryPlan {
+    let backoff = backoff_secs(attempts);
+    let (fault, status, delay_secs) = match error {
+        Error::Reauth => ("reauth", "error", backoff),
+        Error::Invalid(_) => ("limit", "error", backoff),
+        Error::Storage(_) => ("storage", "failing", backoff),
+        Error::Throttled { retry_after, quota } => (
+            if *quota { "quota" } else { "rate" },
+            "failing",
+            retry_after.unwrap_or(0).max(backoff),
+        ),
+        Error::Unavailable(_) | Error::NotFound => ("provider", "failing", backoff),
     };
-    let result = sqlx::query("UPDATE noo_integration_sync SET lease=NULL,lease_until=NULL,attempts=attempts+1,fault=$4,status=CASE WHEN attempts>=4 OR $4 IN ('reauth','limit') THEN 'error' ELSE 'queued' END,next_run=now()+interval '1 minute' * power(2,least(attempts,4)) WHERE source_id=$1 AND owner_uuid=$2 AND lease=$3")
-        .bind(job.source).bind(job.owner).bind(job.lease).bind(fault).execute(db).await?;
+    RetryPlan { fault, status, delay_secs }
+}
+
+pub async fn fail(db: &PgPool, job: &Job, error: &Error) -> Result<(), Error> {
+    let attempts: Option<i32> = sqlx::query_scalar("SELECT attempts FROM noo_integration_sync WHERE source_id=$1 AND owner_uuid=$2 AND lease=$3")
+        .bind(job.source).bind(job.owner).bind(job.lease).fetch_optional(db).await?;
+    // The lease moved on (expired and re-claimed): that run owns the row now.
+    let Some(attempts) = attempts else { return Ok(()) };
+    let plan = retry_plan(error, attempts);
+    let result = sqlx::query("UPDATE noo_integration_sync SET lease=NULL,lease_until=NULL,attempts=attempts+1,fault=$4,status=$5,next_run=now()+$6::double precision*interval '1 second' WHERE source_id=$1 AND owner_uuid=$2 AND lease=$3")
+        .bind(job.source).bind(job.owner).bind(job.lease).bind(plan.fault).bind(plan.status).bind(plan.delay_secs as f64).execute(db).await?;
     if result.rows_affected() > 0 {
-        tracing::warn!(fault, cause = %error.log_cause(), source = %job.source, "private sync failed; retry policy applied");
+        tracing::warn!(fault = plan.fault, status = plan.status, retry_in_s = plan.delay_secs, cause = %error.log_cause(), source = %job.source, "private sync failed; retry policy applied");
     }
     Ok(())
 }
