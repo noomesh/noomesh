@@ -1414,4 +1414,19 @@ mod display_reader_tests {
         assert_eq!(kiosk_device(&ctx("alice", &["kiosk"])), None);
         assert_eq!(kiosk_device(&ctx("kiosk:", &["kiosk"])), None);
     }
+
+    /// The seat comes only from the token's own device: the handler takes no
+    /// path or query extractor, so no caller can name another display's seat.
+    /// A later "convenience" seat parameter must go red here.
+    #[test]
+    fn the_display_reader_takes_its_seat_only_from_the_token() {
+        let own = crate::test_src::own_code(include_str!("kiosk.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn display(");
+        let signature = &body[..body.find(") -> Response").expect("the handler's signature")];
+        for extractor in ["Path", "Query", "Json", "Form", "RawQuery", "HeaderMap"] {
+            assert!(!signature.contains(extractor), "display() takes a {extractor}: the seat must come from the token alone");
+        }
+        assert!(body.contains("kiosk_device(c)"), "the device is the token's");
+        assert!(body.contains("display_for_tailnet(&state.db, &device)"), "and only it picks the seat");
+    }
 }
