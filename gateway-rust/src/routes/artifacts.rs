@@ -22,6 +22,10 @@
 //! files with one hash each. HF repo trees (many files per model) need a
 //! manifest-of-files and stay out until a step needs them.
 //!
+//! `modelset` (i300 F3) is the manifest-of-files: `<id>@<revision>` answers
+//! the signed `model-set.json` and its detached signature, and the manifest
+//! itself carries each file's sha256 (see [`modelset_manifest`]).
+//!
 //! Digests are cached in `/data/artifact-digests.json` keyed by
 //! (kind/name → size, mtime, sha256): hashing a 15 GB GGUF takes real time,
 //! and the answer only changes when the file does. A (size, mtime) match
@@ -353,6 +357,130 @@ fn retired_kind(kind: &str, name: &str) -> Option<AppError> {
     })
 }
 
+// ── model sets: a signed manifest plus the files it names (i300 F3) ────────
+
+/// Largest `model-set.json` the rail will serve. A real one is a few KiB
+/// (at most 64 file entries); a file past this is a mistake, not a set.
+const MODELSET_MANIFEST_MAX: u64 = 1 << 20;
+/// Largest detached signature. A DER P-384 ECDSA signature is ~104 bytes.
+const MODELSET_SIG_MAX: u64 = 16 << 10;
+/// The key a node verifies a model-set signature against: the fleet bundle
+/// signing key (`signing.pub` on the node), see docs/reference/node-workloads.md.
+const MODELSET_KEY: &str = "fleet-signing";
+
+/// Split a `<id>@<revision>` request name, checking both halves against the
+/// `noo-model-set/1` patterns: id `^[a-z0-9][a-z0-9._-]{0,63}$`, revision
+/// `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`. Both become path components under
+/// the store, and both start with an alphanumeric, so neither can be `.` or
+/// `..`, and neither can hold a `/`.
+fn parse_modelset_name(name: &str) -> Option<(&str, &str)> {
+    let (id, revision) = name.split_once('@')?;
+    let id_ok = !id.is_empty()
+        && id.len() <= 64
+        && id.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && id.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')
+        });
+    let rev_ok = !revision.is_empty()
+        && revision.len() <= 128
+        && revision.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && revision
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    (id_ok && rev_ok).then_some((id, revision))
+}
+
+/// Read one small store file, refusing one larger than `max`. None = absent.
+async fn read_capped(path: &Path, max: u64) -> Result<Option<Vec<u8>>, AppError> {
+    let Some((size, _)) = file_meta(path) else {
+        return Ok(None);
+    };
+    if size > max {
+        return Err(AppError::Internal(format!(
+            "{} is {size} bytes, over the {max} byte limit",
+            path.display()
+        )));
+    }
+    match tokio::fs::read(path).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(AppError::Internal(format!("reading {}: {e}", path.display()))),
+    }
+}
+
+/// The signed pair of a staged set: the exact bytes of `model-set.json` and
+/// of `model-set.json.sig`, under `<sets_root>/<id>/<revision>/`. A set with no
+/// signature does not exist (the CLI writes the signature LAST, so a stage
+/// that died half way has none): 404. The manifest must parse as JSON and
+/// name the same `id` and `revision` as the request; this is a shape check,
+/// not the contract validator and not a signature check (the node does both).
+async fn read_modelset_pair(
+    sets_root: &Path,
+    id: &str,
+    revision: &str,
+) -> Result<(Vec<u8>, Vec<u8>), AppError> {
+    let set_dir = sets_root.join(id).join(revision);
+    let missing = || {
+        AppError::NotFound(format!("no signed model set '{id}@{revision}' in the controller store"))
+    };
+    let sig_path = set_dir.join("model-set.json.sig");
+    let Some(sig) = read_capped(&sig_path, MODELSET_SIG_MAX).await? else {
+        return Err(missing());
+    };
+    let manifest_path = set_dir.join("model-set.json");
+    let Some(manifest_bytes) = read_capped(&manifest_path, MODELSET_MANIFEST_MAX).await? else {
+        return Err(missing());
+    };
+    let parsed: serde_json::Value = serde_json::from_slice(&manifest_bytes).map_err(|e| {
+        AppError::Internal(format!("model set {id}@{revision}: model-set.json is not JSON: {e}"))
+    })?;
+    let got_id = parsed.get("id").and_then(|v| v.as_str());
+    let got_revision = parsed.get("revision").and_then(|v| v.as_str());
+    if got_id != Some(id) || got_revision != Some(revision) {
+        return Err(AppError::Internal(format!(
+            "model set {id}@{revision}: model-set.json names a different id or revision"
+        )));
+    }
+    Ok((manifest_bytes, sig))
+}
+
+/// GET /api/artifacts/manifest/modelset/{id}@{revision}
+///
+/// Response (200, JSON): `{"kind":"modelset","name","id","revision",
+/// "manifest_b64","sig_b64","key":"fleet-signing","data_path"}`.
+/// `manifest_b64` is the standard base64 of the EXACT bytes of
+/// `model-set.json` and `sig_b64` of `model-set.json.sig`: a node decodes
+/// both and verifies the signature over those bytes before it parses
+/// anything. Carrying the bytes as base64 (not as embedded JSON) is what keeps
+/// them exact. `data_path` is `/sets/<id>/<revision>`; the node fetches each
+/// file the signed manifest lists at `<data_path>/<files[].path>` from the
+/// model cache and checks it against that file's sha256 and byte count in the
+/// manifest, so there is no per-file hashing here (the gguf kind hashes
+/// because nothing else states its digest). The model cache does not serve
+/// `model-set.json` or its signature: this route is their one source.
+async fn modelset_manifest(name: &str) -> Result<Response, AppError> {
+    use base64::Engine as _;
+    let Some((id, revision)) = parse_modelset_name(name) else {
+        return Err(AppError::BadRequest(
+            "model set name must be <id>@<revision> (id [a-z0-9._-], revision [A-Za-z0-9._-])"
+                .into(),
+        ));
+    };
+    let (manifest_bytes, sig) = read_modelset_pair(&gguf_dir().join("sets"), id, revision).await?;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    Ok(Json(json!({
+        "kind": "modelset",
+        "name": name,
+        "id": id,
+        "revision": revision,
+        "manifest_b64": b64.encode(manifest_bytes),
+        "sig_b64": b64.encode(sig),
+        "key": MODELSET_KEY,
+        "data_path": format!("/sets/{id}/{revision}"),
+    }))
+    .into_response())
+}
+
 /// GET /api/artifacts/manifest/{kind}/{name}
 async fn manifest(
     State(_state): State<Arc<AppState>>,
@@ -361,9 +489,12 @@ async fn manifest(
     if let Some(refusal) = retired_kind(&kind, &name) {
         return Err(refusal);
     }
+    if kind == "modelset" {
+        return modelset_manifest(&name).await;
+    }
     let Some((dir, data_prefix, ext)) = kind_facts(&kind) else {
         return Err(AppError::BadRequest(format!(
-            "unknown artifact kind '{kind}' (kinds: gguf, image, modelfile)"
+            "unknown artifact kind '{kind}' (kinds: gguf, image, modelfile, modelset)"
         )));
     };
     if !valid_artifact_name(&name, ext) {
@@ -824,6 +955,104 @@ mod tests {
         assert!(kind_facts("modelfile").is_some());
         assert!(kind_facts("model").is_none(), "future kinds arrive explicitly, not by default");
         assert!(kind_facts("").is_none());
+    }
+
+    #[test]
+    fn modelset_names_follow_the_schema_patterns() {
+        assert_eq!(parse_modelset_name("kokoro-82m@abc123"), Some(("kokoro-82m", "abc123")));
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(parse_modelset_name(&format!("a.b_c-d@{sha}")), Some(("a.b_c-d", sha)));
+        let long_id = "a".repeat(64);
+        assert!(parse_modelset_name(&format!("{long_id}@r1")).is_some());
+        let too_long_id = "a".repeat(65);
+        let long_rev = "r".repeat(128);
+        let too_long_rev = "r".repeat(129);
+        assert!(parse_modelset_name(&format!("x@{long_rev}")).is_some());
+        for bad in [
+            "",
+            "noat",
+            "@rev",
+            "id@",
+            "Upper@rev",
+            "-lead@rev",
+            "id@-lead",
+            "id@.",
+            "id@..",
+            "..@rev",
+            "id@../x",
+            "../id@rev",
+            "a/b@rev",
+            "id@a/b",
+            "id@a b",
+            "id@a\\b",
+            "id@r@s",
+            "id@r%2e",
+            "id.gguf",
+        ] {
+            assert!(parse_modelset_name(bad).is_none(), "{bad:?} must be refused");
+        }
+        assert!(parse_modelset_name(&format!("{too_long_id}@r1")).is_none());
+        assert!(parse_modelset_name(&format!("x@{too_long_rev}")).is_none());
+    }
+
+    #[test]
+    fn modelset_is_not_a_flat_file_kind() {
+        // It has its own route branch; the gguf/image plumbing is unchanged.
+        assert!(kind_facts("modelset").is_none());
+        assert!(!valid_artifact_name("kokoro@rev1", ".gguf"));
+    }
+
+    fn modelset_tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("noo-art-sets-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn a_set_without_its_signature_does_not_exist() {
+        let root = modelset_tmp("nosig");
+        let set = root.join("kokoro").join("rev1");
+        std::fs::create_dir_all(&set).unwrap();
+        let body = json!({"id": "kokoro", "revision": "rev1"}).to_string();
+        std::fs::write(set.join("model-set.json"), body).unwrap();
+        let err = read_modelset_pair(&root, "kokoro", "rev1").await.unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)), "{err}");
+        // A set directory that is not there at all is the same answer.
+        let err = read_modelset_pair(&root, "kokoro", "other").await.unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_signed_set_returns_the_exact_bytes() {
+        let root = modelset_tmp("signed");
+        let set = root.join("kokoro").join("rev1");
+        std::fs::create_dir_all(&set).unwrap();
+        // Spacing and key order are deliberate: the bytes must come back as
+        // stored, not re-serialised.
+        let body = b"{ \"revision\" : \"rev1\",\n \"id\":\"kokoro\" }\n".to_vec();
+        std::fs::write(set.join("model-set.json"), &body).unwrap();
+        std::fs::write(set.join("model-set.json.sig"), [1u8, 2, 3]).unwrap();
+        let (got, sig) = read_modelset_pair(&root, "kokoro", "rev1").await.unwrap();
+        assert_eq!(got, body);
+        assert_eq!(sig.as_slice(), &[1u8, 2, 3]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_manifest_naming_another_set_or_not_json_is_refused() {
+        let root = modelset_tmp("mismatch");
+        let set = root.join("kokoro").join("rev1");
+        std::fs::create_dir_all(&set).unwrap();
+        std::fs::write(set.join("model-set.json.sig"), [9u8]).unwrap();
+        let other = json!({"id": "kokoro", "revision": "rev2"}).to_string();
+        std::fs::write(set.join("model-set.json"), other).unwrap();
+        let err = read_modelset_pair(&root, "kokoro", "rev1").await.unwrap_err();
+        assert!(matches!(err, AppError::Internal(_)), "{err}");
+        std::fs::write(set.join("model-set.json"), "not json").unwrap();
+        let err = read_modelset_pair(&root, "kokoro", "rev1").await.unwrap_err();
+        assert!(matches!(err, AppError::Internal(_)), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
