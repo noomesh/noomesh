@@ -6135,6 +6135,16 @@ mod gateway_redis_tests {
     }
 }
 
+/// A missing map is unknown, never a pass. Console path refusal does not
+/// imply that the add-on's separate API or port is unavailable.
+pub(crate) fn gateway_addon_path_checks(health: Option<&Value>) -> Vec<Check> {
+    match health.and_then(|h| h["addons_paths_refused"].as_object()) {
+        None => vec![warn("add-on console paths", "not read: no authenticated path-refusal map", Some("noo health".into()))],
+        Some(paths) if paths.is_empty() => vec![ok("add-on console paths", "no refused console paths")],
+        Some(paths) => paths.iter().map(|(name, why)| fail("add-on console paths", format!("{name}: {}", why.as_str().unwrap_or("refused")), "fix signed ui.console_path claims and restart the gateway")).collect(),
+    }
+}
+
 /// The `gateway add-on` rows (i353b): one per add-on noomesh.yaml switches
 /// on, plus any the gateway refused that is not. On 2026-10-31 the gateway
 /// refused a third-party add-on whole at startup (its routes.json) while `add-on pins`
@@ -6185,7 +6195,13 @@ pub(crate) fn gateway_addon_checks(health: Option<&Value>, enabled: &[String]) -
 
 #[cfg(test)]
 mod gateway_addon_tests {
-    use super::{gateway_addon_checks, Verdict};
+    use super::{gateway_addon_checks, gateway_addon_path_checks, Verdict};
+    #[test]
+    fn console_path_refusal_never_looks_healthy() {
+        assert_eq!(gateway_addon_path_checks(Some(&serde_json::json!({"addons_paths_refused":{"rhaddon":"collision"}})))[0].verdict, Verdict::Fail);
+        assert_eq!(gateway_addon_path_checks(Some(&serde_json::json!({"addons_paths_refused":{}})))[0].verdict, Verdict::Ok);
+        assert_eq!(gateway_addon_path_checks(None)[0].verdict, Verdict::Warn);
+    }
     use serde_json::{json, Value};
 
     /// An authenticated /health body as the 0.6.16 gateway writes it, with
@@ -6768,6 +6784,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .filter_map(|(n, on)| on.then_some(n))
             .collect();
         checks.extend(gateway_addon_checks(health.as_ref(), &enabled));
+        checks.extend(gateway_addon_path_checks(health.as_ref()));
         {
             let root = crate::envfile::repo_root();
             let store = crate::commands::secrets::SecretStore::load_sops(&root.join("secrets/env.sops"));

@@ -1816,6 +1816,7 @@ async fn health(
         // The add-ons with a manifest (the runtime registry), sorted, `[]`
         // when none: the only ones `/api/addons/{name}/access` answers.
         body["addons_registered"] = json!(crate::addons::health_registered());
+        body["addons_paths_refused"] = json!(crate::addon_console::refusals());
         // i277f: `noo upgrade` compares it across a roll (reconnect hint).
         body["mcp_catalogue"] = json!(crate::mcp_external::catalogue_digest());
     }

@@ -133,6 +133,7 @@ mod node_workloads;
 mod node_workload_sources;
 mod workload_placement;
 mod addon_ui;
+mod addon_console;
 mod addon_ws;
 mod addon_delegation;
 mod addon_registry;
