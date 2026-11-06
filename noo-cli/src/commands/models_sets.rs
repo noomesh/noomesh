@@ -27,6 +27,15 @@
 //! git blob id from the same authenticated listing and hashed here. There is
 //! no local-directory source and no `--trust-local`.
 //!
+//! `--extract <archive>[:<glob>]` takes files out of ONE archive of the same
+//! repo and commit (an LFS file, so its sha256 is Hugging Face's own): the
+//! controller extracts it ([`super::models_extract`]: regular files only,
+//! streaming size caps, safe names) into a work dir beside the set, and moves
+//! the members into the set only after every one has passed. The set then
+//! lists each member with its own sha256 and bytes plus `from_archive`; the
+//! archive is not a file of the set. A refusal leaves no set dir and no
+//! `model-set.json`.
+//!
 //! The manifest is validated ([`crate::model_set`], a port of the node
 //! agent's validator) before it is written, and signed with the fleet bundle
 //! signing key (`pki/signing.key`, ECDSA P-384): `openssl dgst -sha256 -sign`
@@ -39,6 +48,7 @@ use std::process::Command;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
+use super::models_extract::{self, Limits};
 use super::models_fetch::{self, FetchArgs, FetchErr};
 use crate::args::{ArgError, Args};
 use crate::model_set;
@@ -73,6 +83,72 @@ pub(crate) struct StageArgs {
     pub fits_revision: Option<String>,
     pub fits_runtime: Option<String>,
     pub accept_license: bool,
+    /// `--extract <archive>[:<glob>]`: take the set's files out of an archive.
+    pub extract: Option<ExtractSpec>,
+    /// `--license-additional <id>=<url>[,<notice path>]`, exactly as declared.
+    pub license_additional: Vec<AdditionalLicense>,
+}
+
+/// `--extract <archive path>[:<member glob>]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExtractSpec {
+    /// A file of the SAME repo and revision as the set.
+    pub archive: String,
+    pub glob: Option<String>,
+}
+
+/// `--license-additional <id>=<url>[,<notice path>]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdditionalLicense {
+    pub id: String,
+    pub url: String,
+    pub notice_path: Option<String>,
+}
+
+pub(crate) fn parse_extract(raw: &str) -> Result<ExtractSpec, String> {
+    let (archive, glob) = match raw.split_once(':') {
+        Some((a, g)) => (a, Some(g)),
+        None => (raw, None),
+    };
+    if !model_set::valid_set_path(archive) {
+        return Err(format!(
+            "--extract `{archive}` is not a file path of the repo (relative, at most one \
+             directory level, characters A-Za-z0-9._-)"
+        ));
+    }
+    if let Some(g) = glob {
+        let ok_char = |b: u8| b.is_ascii_alphanumeric() || b"._-*?/".contains(&b);
+        if g.is_empty() || g.len() > 128 || !g.bytes().all(ok_char) {
+            return Err(format!(
+                "--extract member glob `{g}` takes letters, digits, . _ - / and the wildcards * ?"
+            ));
+        }
+    }
+    Ok(ExtractSpec { archive: archive.to_string(), glob: glob.map(str::to_string) })
+}
+
+pub(crate) fn parse_additional(raw: &str) -> Result<AdditionalLicense, String> {
+    let shape = "--license-additional is <id>=<url>[,<notice path>]";
+    let Some((id, rest)) = raw.split_once('=') else {
+        return Err(format!("`{raw}`: {shape}"));
+    };
+    let (url, notice) = match rest.rsplit_once(',') {
+        Some((u, n)) => (u, Some(n)),
+        None => (rest, None),
+    };
+    if id.is_empty() || url.is_empty() {
+        return Err(format!("`{raw}`: {shape}"));
+    }
+    if let Some(n) = notice {
+        if !model_set::valid_set_path(n) {
+            return Err(format!("`{raw}`: the notice path `{n}` is not a set file path"));
+        }
+    }
+    Ok(AdditionalLicense {
+        id: id.to_string(),
+        url: url.to_string(),
+        notice_path: notice.map(str::to_string),
+    })
 }
 
 /// `hf:<org>/<name>@<40-hex commit>` into (repo, commit).
@@ -116,6 +192,8 @@ pub(crate) fn parse_stage_with(a: &mut Args) -> Result<StageArgs, ArgError> {
     let fits_revision = a.value(&["--fits-revision"])?;
     let fits_runtime = a.value(&["--fits-runtime"])?;
     let accept_license = a.flag(&["--accept-license"]);
+    let extract = a.value(&["--extract"])?;
+    let additional = a.values(&["--license-additional"])?;
     let spec = a.one("<hf:repo@sha>")?;
     let (repo, sha) = parse_spec(&spec).map_err(ArgError::new)?;
     let need = |v: Option<String>, flag: &str| {
@@ -134,6 +212,11 @@ pub(crate) fn parse_stage_with(a: &mut Args) -> Result<StageArgs, ArgError> {
     if fits_revision.is_some() && fits_model.is_none() {
         return Err(ArgError::new("--fits-revision pins a --fits-model"));
     }
+    let extract = extract.map(|raw| parse_extract(&raw)).transpose().map_err(ArgError::new)?;
+    let mut license_additional = Vec::new();
+    for raw in &additional {
+        license_additional.push(parse_additional(raw).map_err(ArgError::new)?);
+    }
     Ok(StageArgs {
         repo,
         sha,
@@ -149,6 +232,8 @@ pub(crate) fn parse_stage_with(a: &mut Args) -> Result<StageArgs, ArgError> {
         fits_revision,
         fits_runtime,
         accept_license,
+        extract,
+        license_additional,
     })
 }
 
@@ -205,6 +290,8 @@ pub(crate) enum StageError {
     Invalid(model_set::Refusal),
     /// The request itself is wrong.
     Input(String),
+    /// The archive named by --extract broke an extraction rule.
+    Extract(String),
     /// Anything else the transfer said.
     Fetch(String),
     Io(String),
@@ -234,6 +321,7 @@ impl std::fmt::Display for StageError {
             ),
             StageError::License(m)
             | StageError::Input(m)
+            | StageError::Extract(m)
             | StageError::Fetch(m)
             | StageError::Io(m)
             | StageError::Exists(m) => write!(f, "{m}"),
@@ -379,6 +467,16 @@ pub(crate) struct FileRec {
     pub bytes: u64,
     pub sha256: String,
     pub role: &'static str,
+    /// Set when the controller extracted this file from an archive.
+    pub from_archive: Option<ArchiveRef>,
+}
+
+/// The archive a file was extracted from (`files[].from_archive`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArchiveRef {
+    pub path: String,
+    pub sha256: String,
+    pub bytes: u64,
 }
 
 struct Meta<'a> {
@@ -399,9 +497,31 @@ fn build_manifest(m: &Meta, files: &[FileRec], needs: &Value) -> Value {
     if !notices.is_empty() {
         license["notice_files"] = json!(notices);
     }
+    if !m.req.license_additional.is_empty() {
+        let extra: Vec<Value> = m
+            .req
+            .license_additional
+            .iter()
+            .map(|a| {
+                let mut v = json!({"id": a.id, "url": a.url});
+                if let Some(n) = &a.notice_path {
+                    v["notice_path"] = json!(n);
+                }
+                v
+            })
+            .collect();
+        license["additional"] = json!(extra);
+    }
     let listed: Vec<Value> = files
         .iter()
-        .map(|f| json!({"path": f.path, "bytes": f.bytes, "sha256": f.sha256, "role": f.role}))
+        .map(|f| {
+            let mut v =
+                json!({"path": f.path, "bytes": f.bytes, "sha256": f.sha256, "role": f.role});
+            if let Some(a) = &f.from_archive {
+                v["from_archive"] = json!({"path": a.path, "sha256": a.sha256, "bytes": a.bytes});
+            }
+            v
+        })
         .collect();
     let mut doc = json!({
         "format": model_set::FORMAT,
@@ -631,6 +751,7 @@ fn fetch_lfs(env: &Env, req: &StageArgs, s: &Sibling, dir: &Path) -> Result<File
         bytes: out.size,
         sha256: out.sha256,
         role: role_of(&s.path, true),
+        from_archive: None,
     })
 }
 
@@ -679,7 +800,126 @@ fn fetch_small(env: &Env, req: &StageArgs, s: &Sibling, dir: &Path) -> Result<Fi
         bytes: bytes.len() as u64,
         sha256: hex::encode(Sha256::digest(&bytes)),
         role: role_of(&s.path, false),
+        from_archive: None,
     })
+}
+
+/// The archive `--extract` names, from the listing of the set's own repo at
+/// its pinned commit. It must be an LFS file: its sha256 then comes from the
+/// authenticated Hugging Face metadata, as a weights file's does.
+fn find_archive<'a>(
+    listing: &'a Listing,
+    req: &StageArgs,
+    spec: &ExtractSpec,
+) -> Result<&'a Sibling, StageError> {
+    let Some(s) = listing.files.iter().find(|s| s.path == spec.archive) else {
+        return Err(StageError::Input(format!(
+            "--extract names `{}`, which {}@{} does not list: the archive must be a file of the \
+             same repo and revision as the set",
+            spec.archive,
+            req.repo,
+            req.sha.get(..12).unwrap_or(&req.sha)
+        )));
+    };
+    if !s.lfs || s.lfs_sha256.is_none() {
+        return Err(StageError::Input(format!(
+            "--extract `{}` is not an LFS file with a published sha256: refusing an archive \
+             whose digest does not come from Hugging Face's own metadata",
+            spec.archive
+        )));
+    }
+    Ok(s)
+}
+
+/// Remove the extraction work dir (a path this module named) and, when they
+/// are left empty, the set's id dir and `sets/`: a refusal leaves no trace.
+fn discard_work(work: &Path) {
+    let _ = std::fs::remove_dir_all(work);
+    if let Some(id_dir) = work.parent() {
+        let _ = std::fs::remove_dir(id_dir);
+        if let Some(sets) = id_dir.parent() {
+            let _ = std::fs::remove_dir(sets);
+        }
+    }
+}
+
+/// Fetch the archive (authenticated, sha256 against the LFS metadata), then
+/// extract it into `<work>/out` with the streaming caps. Any extraction
+/// refusal discards `work` and returns; a failed download keeps it, so a
+/// re-run resumes the partial archive. The members come back as file records
+/// with their own digest and a `from_archive`; nothing is in the set yet.
+fn stage_extract(
+    env: &Env,
+    req: &StageArgs,
+    archive: &Sibling,
+    spec: &ExtractSpec,
+    work: &Path,
+    taken: &[&Sibling],
+    say: &mut dyn FnMut(&str),
+) -> Result<Vec<FileRec>, StageError> {
+    let adir = work.join("archive");
+    mkdir(work)?;
+    mkdir(&adir)?;
+    say(&format!("{} ({}, to extract)", archive.path, models_fetch::human(archive.size)));
+    let fetched = fetch_lfs(env, req, archive, &adir)?;
+    let local = adir.join(archive.path.rsplit('/').next().unwrap_or(&archive.path));
+    let out = work.join("out");
+    let _ = std::fs::remove_dir_all(&out);
+    let glob = spec.glob.as_deref();
+    let members = match models_extract::extract(&local, glob, &out, &Limits::DEFAULT) {
+        Ok(m) => m,
+        Err(why) => {
+            discard_work(work);
+            return Err(StageError::Extract(format!("{}: {why}", spec.archive)));
+        }
+    };
+    if let Some(m) = members.iter().find(|m| taken.iter().any(|t| t.path == m.path)) {
+        discard_work(work);
+        return Err(StageError::Input(format!(
+            "`{}` is both a file of the repo staged as itself and a member of {}",
+            m.path, spec.archive
+        )));
+    }
+    if taken.len() + members.len() > 64 {
+        discard_work(work);
+        return Err(StageError::Input(format!(
+            "{} files is more than a set holds (64): narrow the member glob or choose the \
+             files with --file",
+            taken.len() + members.len()
+        )));
+    }
+    say(&format!("extracted {} file(s) from {}", members.len(), spec.archive));
+    let from = ArchiveRef {
+        path: spec.archive.clone(),
+        sha256: fetched.sha256,
+        bytes: fetched.bytes,
+    };
+    Ok(members
+        .into_iter()
+        .map(|m| FileRec {
+            path: m.path,
+            bytes: m.bytes,
+            sha256: m.sha256,
+            role: "weights",
+            from_archive: Some(from.clone()),
+        })
+        .collect())
+}
+
+/// Rename every extracted member from the work dir into the set, then remove
+/// the work dir (the archive goes with it). model-set.json and its signature
+/// are still written after this, last.
+fn place_extracted(work: &Path, set_dir: &Path, recs: &[FileRec]) -> Result<(), StageError> {
+    for r in recs {
+        if let Some((sub, _)) = r.path.split_once('/') {
+            mkdir(&set_dir.join(sub))?;
+        }
+        let dest = set_dir.join(&r.path);
+        std::fs::rename(work.join("out").join(&r.path), &dest)
+            .map_err(|e| io_err(&format!("renaming into {}", dest.display()), e))?;
+    }
+    let _ = std::fs::remove_dir_all(work);
+    Ok(())
 }
 
 /// Stage `req` into `<models_dir>/sets/<id>/<sha>/`: list the pinned commit,
@@ -693,7 +933,17 @@ pub(crate) fn stage_set(
     say: &mut dyn FnMut(&str),
 ) -> Result<Staged, StageError> {
     let listing = list_repo(env, req)?;
-    let chosen = select(&listing, &req.files)?;
+    let mut chosen = select(&listing, &req.files)?;
+    // The archive is looked up in THIS repo's listing at THIS commit, so it is
+    // always the set's own repo and revision; the archive itself is not a file
+    // of the set.
+    let archive = match &req.extract {
+        Some(spec) => {
+            chosen.retain(|s| s.path != spec.archive);
+            Some(find_archive(&listing, req, spec)?)
+        }
+        None => None,
+    };
 
     let accept: &'static str = if listing.gated { "operator" } else { "none" };
     let accepted = if listing.gated {
@@ -737,15 +987,31 @@ pub(crate) fn stage_set(
 
     // The contract, checked on the real shape with placeholder digests, so a
     // bad flag or a bad needs file costs no download.
-    let placeholder: Vec<FileRec> = chosen
+    let mut placeholder: Vec<FileRec> = chosen
         .iter()
         .map(|s| FileRec {
             path: s.path.clone(),
             bytes: s.size,
             sha256: "0".repeat(64),
             role: role_of(&s.path, s.lfs),
+            from_archive: None,
         })
         .collect();
+    if let Some(a) = archive {
+        // One stand-in for the files the archive will give, so the manifest's
+        // from_archive shape is judged before any download.
+        placeholder.push(FileRec {
+            path: "extracted.bin".to_string(),
+            bytes: 1,
+            sha256: "0".repeat(64),
+            role: "weights",
+            from_archive: Some(ArchiveRef {
+                path: a.path.clone(),
+                sha256: "0".repeat(64),
+                bytes: a.size.max(1),
+            }),
+        });
+    }
     let pre = manifest_bytes(&build_manifest(&meta, &placeholder, needs))?;
     model_set::validate(&pre).map_err(StageError::Invalid)?;
 
@@ -765,9 +1031,20 @@ pub(crate) fn stage_set(
     }
     mkdir(&sets)?;
     mkdir(&id_dir)?;
-    mkdir(&set_dir)?;
-
+    // Extraction comes first and is all-or-nothing: until every member has
+    // passed, the set's own directory does not exist.
     let mut recs: Vec<FileRec> = Vec::new();
+    let mut work: Option<PathBuf> = None;
+    if let (Some(spec), Some(a)) = (&req.extract, archive) {
+        let w = id_dir.join(format!(".extract-{}", req.sha));
+        recs = stage_extract(env, req, a, spec, &w, &chosen, say)?;
+        work = Some(w);
+    }
+    mkdir(&set_dir)?;
+    if let Some(w) = &work {
+        place_extracted(w, &set_dir, &recs)?;
+    }
+
     for s in &chosen {
         let dir = match s.path.split_once('/') {
             Some((sub, _)) => {
@@ -785,6 +1062,7 @@ pub(crate) fn stage_set(
         };
         recs.push(rec);
     }
+    recs.sort_by(|a, b| a.path.cmp(&b.path));
 
     let manifest = manifest_bytes(&build_manifest(&meta, &recs, needs))?;
     model_set::validate(&manifest).map_err(StageError::Invalid)?;
@@ -819,6 +1097,10 @@ pub(crate) fn render(req: &StageArgs, s: &Staged) -> Vec<String> {
         Some((by, at)) => format!("licence: operator-accepted by {by} at {at}"),
         None => "licence: no operator acceptance required".to_string(),
     });
+    let extracted = s.files.iter().filter(|f| f.from_archive.is_some()).count();
+    if extracted > 0 {
+        out.push(format!("extracted: {extracted} file(s) from an archive of the same commit"));
+    }
     out.push(format!("dir: {}", s.dir.display()));
     out
 }
@@ -1083,6 +1365,7 @@ pub fn models_stage(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 StageError::License(_) => ("license_not_accepted", ExitCode::Generic),
                 StageError::Invalid(_) => ("invalid_manifest", ExitCode::Usage),
                 StageError::Input(_) => ("bad_request", ExitCode::Usage),
+                StageError::Extract(_) => ("extract_refused", ExitCode::Usage),
                 StageError::Exists(_) => ("already_staged", ExitCode::Generic),
                 StageError::Fetch(_) => ("fetch_failed", ExitCode::RemoteError),
                 StageError::Io(_) => ("stage_failed", ExitCode::Generic),
@@ -1111,7 +1394,15 @@ pub fn models_stage(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let files: Vec<Value> = staged
             .files
             .iter()
-            .map(|f| json!({"path": f.path, "bytes": f.bytes, "sha256": f.sha256, "role": f.role}))
+            .map(|f| {
+                let mut v =
+                    json!({"path": f.path, "bytes": f.bytes, "sha256": f.sha256, "role": f.role});
+                if let Some(a) = &f.from_archive {
+                    let from = json!({"path": a.path, "sha256": a.sha256, "bytes": a.bytes});
+                    v["from_archive"] = from;
+                }
+                v
+            })
             .collect();
         let accepted = staged.accepted.as_ref().map(|(b, a)| json!({"by": b, "at": a}));
         println!("{}", json!({
@@ -1747,5 +2038,238 @@ mod tests {
         // And with no public key to check against, it is not called ok.
         let unchecked = scan(&dir, &dir.join("absent.pub"), Some("voice"));
         assert_eq!(unchecked[0].signature, "no signing.pub");
+    }
+
+    // ── --extract and --license-additional ───────────────────────────────
+
+    use crate::commands::models_extract::testkit::{file, gz, other, tar};
+
+    /// A fake Hugging Face whose repo holds README.md and one archive,
+    /// `voices.tgz`, an LFS file when `lfs` is set.
+    fn hf_archive(archive: Vec<u8>, lfs: bool) -> Fake {
+        serve(move |method, path| {
+            if path.starts_with(&format!("/api/models/{REPO}/revision/{SHA}")) {
+                let blob = crate::commands::voice_models::git_blob_sha1;
+                let mut arch = json!({
+                    "rfilename": "voices.tgz",
+                    "size": archive.len(),
+                    "blobId": "3".repeat(40),
+                });
+                if lfs {
+                    arch["lfs"] = json!({
+                        "sha256": sha256_hex(&archive),
+                        "size": archive.len(),
+                        "pointerSize": 134,
+                    });
+                }
+                let doc = json!({
+                    "sha": SHA,
+                    "gated": false,
+                    "cardData": {"license": "apache-2.0"},
+                    "siblings": [
+                        {"rfilename": ".gitattributes", "size": 10, "blobId": "1".repeat(40)},
+                        {"rfilename": "README.md", "size": README.len(), "blobId": blob(README)},
+                        arch,
+                    ],
+                });
+                return resp(200, doc.to_string().as_bytes());
+            }
+            let resolve = format!("/{REPO}/resolve/{SHA}/");
+            match path.strip_prefix(resolve.as_str()) {
+                Some("README.md") => resp(200, README),
+                Some("voices.tgz") => {
+                    let mut r = resp(302, b"");
+                    r.headers.push(("Location".into(), "/cdn/voices.tgz".into()));
+                    let etag = format!("\"{}\"", sha256_hex(&archive));
+                    r.headers.push(("x-linked-etag".into(), etag));
+                    r.headers.push(("x-linked-size".into(), archive.len().to_string()));
+                    r
+                }
+                _ if path == "/cdn/voices.tgz" && method == "GET" => resp(200, &archive),
+                _ => resp(404, b""),
+            }
+        })
+    }
+
+    fn request_with(extra: &[&str]) -> StageArgs {
+        let mut a = s(&[
+            "--kind", "voice", "--id", "test-voice-set", "--modality", "tts", "--runtime",
+            "test-rt", "--needs", "needs.json",
+        ]);
+        a.extend(s(extra));
+        a.push(format!("hf:{REPO}@{SHA}"));
+        parse_stage_with(&mut Args::new(&a)).expect("parses")
+    }
+
+    fn set_dir_of(dir: &Path) -> PathBuf {
+        dir.join("sets/test-voice-set").join(SHA)
+    }
+
+    /// A refused stage leaves no set dir, no manifest, no work dir.
+    fn assert_nothing_left(dir: &Path) {
+        let set = set_dir_of(dir);
+        assert!(!set.exists(), "{} was left behind", set.display());
+        assert!(!set.join(MANIFEST).exists());
+        assert_no_work_dir(dir);
+    }
+
+    fn assert_no_work_dir(dir: &Path) {
+        let work = dir.join("sets/test-voice-set").join(format!(".extract-{SHA}"));
+        assert!(!work.exists(), "{} was left behind", work.display());
+    }
+
+    fn downloaded_nothing(f: &Fake) -> bool {
+        f.seen.lock().unwrap().iter().all(|(_, p, _)| !p.contains("/resolve/"))
+    }
+
+    fn two_members() -> Vec<Vec<u8>> {
+        vec![file("a.bin", b"alpha"), file("voices/b.bin", b"bravo!")]
+    }
+
+    #[test]
+    fn extract_and_license_additional_arguments_are_parsed_strictly() {
+        let plain = ExtractSpec { archive: "voices.tgz".to_string(), glob: None };
+        assert_eq!(parse_extract("voices.tgz").unwrap(), plain);
+        let globbed = parse_extract("voices.tgz:voices/*.bin").unwrap();
+        assert_eq!(globbed.glob.as_deref(), Some("voices/*.bin"));
+        for bad in ["", "../x.tgz", "a/b/c.tgz", "voices.tgz:", "voices.tgz:a b", "/abs.tgz"] {
+            assert!(parse_extract(bad).is_err(), "{bad:?}");
+        }
+        let url = "https://creativecommons.org/licenses/by/4.0/";
+        let bare = parse_additional(&format!("CC-BY-4.0={url}")).unwrap();
+        assert_eq!((bare.id.as_str(), bare.url.as_str()), ("CC-BY-4.0", url));
+        assert_eq!(bare.notice_path, None);
+        let with = parse_additional(&format!("CC-BY-4.0={url},NOTICE.txt")).unwrap();
+        assert_eq!(with.url, url);
+        assert_eq!(with.notice_path.as_deref(), Some("NOTICE.txt"));
+        for bad in ["no-equals", "=https://x.example", "id=", "id=https://x.example,../n"] {
+            assert!(parse_additional(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn extract_takes_members_out_of_the_archive_and_lists_each_with_from_archive() {
+        let dir = tmpdir("extract-ok");
+        let archive = gz(&tar(&two_members()));
+        let f = hf_archive(archive.clone(), true);
+        let req = request_with(&["--extract", "voices.tgz"]);
+        let (r, lines) = run(&f, None, &dir, &req, None);
+        let staged = r.expect("staged");
+        let set = set_dir_of(&dir);
+        assert_eq!(std::fs::read(set.join("a.bin")).unwrap(), b"alpha");
+        assert_eq!(std::fs::read(set.join("voices/b.bin")).unwrap(), b"bravo!");
+        assert!(!set.join("voices.tgz").exists(), "the archive is not part of the set");
+        assert!(set.join(SIGNATURE).exists());
+        assert_no_work_dir(&dir);
+        model_set::validate(&staged.manifest).expect("the manifest is valid");
+        let v: Value = serde_json::from_slice(&staged.manifest).unwrap();
+        let files = v["files"].as_array().unwrap();
+        let paths: Vec<&str> = files.iter().map(|x| x["path"].as_str().unwrap()).collect();
+        assert_eq!(paths, ["README.md", "a.bin", "voices/b.bin"]);
+        assert!(files[0].get("from_archive").is_none());
+        assert_eq!(files[1]["sha256"], sha256_hex(b"alpha"));
+        assert_eq!(files[1]["bytes"], 5);
+        for i in [1, 2] {
+            assert_eq!(files[i]["from_archive"]["path"], "voices.tgz");
+            assert_eq!(files[i]["from_archive"]["sha256"], sha256_hex(&archive));
+            assert_eq!(files[i]["from_archive"]["bytes"], archive.len());
+        }
+        assert!(lines.iter().any(|l| l.contains("extracted 2 file(s)")), "{lines:?}");
+        assert!(render(&req, &staged).iter().any(|l| l.contains("extracted: 2")));
+    }
+
+    #[test]
+    fn a_member_glob_extracts_only_what_it_matches() {
+        let dir = tmpdir("extract-glob");
+        let f = hf_archive(gz(&tar(&two_members())), true);
+        let req = request_with(&["--extract", "voices.tgz:voices/*"]);
+        let staged = run(&f, None, &dir, &req, None).0.expect("staged");
+        let set = set_dir_of(&dir);
+        assert!(set.join("voices/b.bin").exists() && !set.join("a.bin").exists());
+        let paths: Vec<&str> = staged.files.iter().map(|x| x.path.as_str()).collect();
+        assert_eq!(paths, ["README.md", "voices/b.bin"]);
+    }
+
+    #[test]
+    fn a_refusal_in_the_middle_of_the_archive_leaves_no_set_dir_and_no_manifest() {
+        let dir = tmpdir("extract-allornothing");
+        let mut entries = two_members();
+        entries.push(other("c.bin", b'2', "/etc/passwd"));
+        entries.push(file("d.bin", b"never reached"));
+        let f = hf_archive(gz(&tar(&entries)), true);
+        let req = request_with(&["--extract", "voices.tgz"]);
+        let e = run(&f, None, &dir, &req, None).0.expect_err("refused");
+        assert!(matches!(e, StageError::Extract(_)), "{e}");
+        assert!(e.to_string().contains("a symlink"), "{e}");
+        assert_nothing_left(&dir);
+        // The archive without the symlink stages: the refusal was the extractor's.
+        let dir = tmpdir("extract-allornothing-control");
+        let f = hf_archive(gz(&tar(&two_members())), true);
+        assert!(run(&f, None, &dir, &req, None).0.is_ok());
+    }
+
+    #[test]
+    fn an_archive_member_that_is_also_a_staged_file_is_refused_before_any_set_dir() {
+        let dir = tmpdir("extract-collide");
+        let f = hf_archive(gz(&tar(&[file("README.md", b"mine")])), true);
+        let req = request_with(&["--extract", "voices.tgz"]);
+        let e = run(&f, None, &dir, &req, None).0.expect_err("collision");
+        assert!(matches!(e, StageError::Input(_)), "{e}");
+        assert!(e.to_string().contains("README.md"), "{e}");
+        assert_nothing_left(&dir);
+    }
+
+    #[test]
+    fn an_archive_the_repo_does_not_list_or_that_is_not_lfs_is_refused_before_any_download() {
+        let dir = tmpdir("extract-unlisted");
+        let f = hf_archive(gz(&tar(&two_members())), true);
+        let req = request_with(&["--extract", "other.tgz"]);
+        let e = run(&f, None, &dir, &req, None).0.expect_err("not listed");
+        assert!(e.to_string().contains("does not list"), "{e}");
+        assert!(downloaded_nothing(&f));
+        assert_nothing_left(&dir);
+
+        let dir = tmpdir("extract-not-lfs");
+        let f = hf_archive(gz(&tar(&two_members())), false);
+        let req = request_with(&["--extract", "voices.tgz"]);
+        let e = run(&f, None, &dir, &req, None).0.expect_err("no LFS digest");
+        assert!(e.to_string().contains("not an LFS file"), "{e}");
+        assert!(downloaded_nothing(&f));
+        assert_nothing_left(&dir);
+    }
+
+    #[test]
+    fn license_additional_records_what_is_declared_and_nothing_more() {
+        let dir = tmpdir("addl-ok");
+        let url = "https://creativecommons.org/licenses/by/4.0/";
+        let f = hf_archive(gz(&tar(&two_members())), true);
+        let a = format!("CC-BY-4.0={url},README.md");
+        let b = "MIT=https://opensource.org/license/mit";
+        let flags = ["--extract", "voices.tgz", "--license-additional", a.as_str()];
+        let mut all = flags.to_vec();
+        all.extend(["--license-additional", b]);
+        let req = request_with(&all);
+        let staged = run(&f, None, &dir, &req, None).0.expect("staged");
+        let v: Value = serde_json::from_slice(&staged.manifest).unwrap();
+        let extra = v["license"]["additional"].as_array().unwrap();
+        assert_eq!(extra.len(), 2);
+        assert_eq!(extra[0], json!({"id": "CC-BY-4.0", "url": url, "notice_path": "README.md"}));
+        // No notice path was given, so none is recorded: nothing is inferred.
+        assert_eq!(extra[1], json!({"id": "MIT", "url": "https://opensource.org/license/mit"}));
+    }
+
+    #[test]
+    fn a_notice_path_that_is_not_a_staged_notice_file_is_refused_before_any_download() {
+        for (tag, path) in [("ghost", "ghost.txt"), ("member", "a.bin")] {
+            let dir = tmpdir(&format!("addl-{tag}"));
+            let f = hf_archive(gz(&tar(&two_members())), true);
+            let a = format!("MIT=https://opensource.org/license/mit,{path}");
+            let flags = ["--extract", "voices.tgz", "--license-additional", a.as_str()];
+            let req = request_with(&flags);
+            let e = run(&f, None, &dir, &req, None).0.expect_err("not a notice");
+            assert!(matches!(&e, StageError::Invalid(r) if r.code == "notice_not_in_files"), "{e}");
+            assert!(downloaded_nothing(&f), "{path}");
+            assert_nothing_left(&dir);
+        }
     }
 }

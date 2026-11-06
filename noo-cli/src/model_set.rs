@@ -250,15 +250,19 @@ fn shape(root: &Value) -> R<&Map<String, Value>> {
         str_list(lic, "license", "notice_files")?;
         for a in items(lic, "license", "additional")? {
             let o = as_obj(a, "license.additional[]")?;
-            keys_ok(o, "license.additional[]", &["id", "url"])?;
-            typed_all(o, "license.additional[]", &["id", "url"], Ty::Str)?;
+            keys_ok(o, "license.additional[]", &["id", "url", "notice_path"])?;
+            typed_all(o, "license.additional[]", &["id", "url", "notice_path"], Ty::Str)?;
         }
     }
     for f in items(m, top, "files")? {
         let o = as_obj(f, "files[]")?;
-        keys_ok(o, "files[]", &["path", "bytes", "sha256", "role"])?;
+        keys_ok(o, "files[]", &["path", "bytes", "sha256", "role", "from_archive"])?;
         typed_all(o, "files[]", &["path", "sha256", "role"], Ty::Str)?;
         typed(o, "files[]", "bytes", Ty::Int)?;
+        if let Some(a) = sub(o, "files[]", "from_archive", &["path", "sha256", "bytes"])? {
+            typed_all(a, "files[].from_archive", &["path", "sha256"], Ty::Str)?;
+            typed(a, "files[].from_archive", "bytes", Ty::Int)?;
+        }
     }
     let needs_keys = ["profiles", "cpu_fallback", "arch"];
     if let Some(n) = sub(m, top, "needs", &needs_keys)? {
@@ -314,6 +318,8 @@ fn required(m: &Map<String, Value>) -> R<()> {
     if let Some(Value::Array(files)) = m.get("files") {
         for f in files {
             require(Some(f), "files[]", &["path", "bytes", "sha256"])?;
+            let archive = f.get("from_archive");
+            require(archive, "files[].from_archive", &["path", "sha256", "bytes"])?;
         }
     }
     let profiles = m.get("needs").and_then(|n| n.get("profiles"));
@@ -570,6 +576,7 @@ fn check_files(m: &Map<String, Value>) -> R<()> {
         return refuse("files_invalid", format!("{} files (1..64)", files.len()));
     }
     let mut have: Vec<&str> = Vec::new();
+    let mut notice_paths: Vec<&str> = Vec::new();
     for f in files {
         let Some(o) = f.as_object() else {
             return refuse("field_type", "files[] must be an object");
@@ -589,12 +596,48 @@ fn check_files(m: &Map<String, Value>) -> R<()> {
         if !matches!(role, "" | "weights" | "notice" | "config") {
             return refuse("files_invalid", format!("{path}: role {role:?}"));
         }
+        if let Some(a) = o.get("from_archive").and_then(Value::as_object) {
+            let ab = a.get("bytes").and_then(Value::as_i64).unwrap_or(0);
+            if !valid_set_path(text(a, "path"))
+                || !sha256_ok(text(a, "sha256"))
+                || !(1..=(1i64 << 40)).contains(&ab)
+            {
+                return refuse(
+                    "from_archive_invalid",
+                    format!("{path}: from_archive needs a set path, a lower-case sha256 and bytes"),
+                );
+            }
+            if role == "notice" {
+                return refuse(
+                    "from_archive_invalid",
+                    format!("{path}: a notice file is staged as itself, not extracted"),
+                );
+            }
+        }
         if have.contains(&path) {
             return refuse("files_invalid", format!("path {path:?} is listed twice"));
         }
         have.push(path);
+        if role == "notice" {
+            notice_paths.push(path);
+        }
     }
     let lic = object(m, "license")?;
+    if let Some(Value::Array(extra)) = lic.get("additional") {
+        for a in extra.iter().filter_map(Value::as_object) {
+            let np = text(a, "notice_path");
+            if np.is_empty() {
+                continue;
+            }
+            let at = format!("license.additional {}: notice_path {np:?}", text(a, "id"));
+            if !valid_set_path(np) {
+                return refuse("path_invalid", at);
+            }
+            if !notice_paths.contains(&np) {
+                return refuse("notice_not_in_files", format!("{at} is not a role notice file"));
+            }
+        }
+    }
     let notices: Vec<&str> = match lic.get("notice_files") {
         Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
         _ => Vec::new(),
@@ -854,6 +897,74 @@ mod tests {
         let mut v = valid_doc();
         v["files"][0]["bytes"] = Value::from(0);
         assert_eq!(code_of(&v), "files_invalid");
+    }
+
+    fn archive_doc() -> Value {
+        let raw = std::fs::read(dir().join("valid-from-archive.json")).expect("fixture");
+        serde_json::from_slice(&raw).expect("JSON")
+    }
+
+    #[test]
+    fn from_archive_is_judged_with_the_go_validators_codes() {
+        let v = archive_doc();
+        assert_eq!(code_of(&v), "ok");
+        // A shape error inside from_archive.
+        let mut v = archive_doc();
+        v["files"][0]["from_archive"]["extra"] = Value::from(1);
+        assert_eq!(code_of(&v), "unknown_field");
+        let mut v = archive_doc();
+        v["files"][0]["from_archive"]["bytes"] = Value::from("99");
+        assert_eq!(code_of(&v), "field_type");
+        let mut v = archive_doc();
+        v["files"][0]["from_archive"].as_object_mut().unwrap().remove("sha256");
+        assert_eq!(code_of(&v), "field_missing");
+        // A bad value is from_archive_invalid, whichever of the three it is.
+        let bad: [(&str, Value); 5] = [
+            ("path", Value::from("../voices.tgz")),
+            ("path", Value::from("a/b/c.tgz")),
+            ("sha256", Value::from("7".repeat(63))),
+            ("bytes", Value::from(0)),
+            ("bytes", Value::from((1i64 << 40) + 1)),
+        ];
+        for (key, val) in bad {
+            let mut v = archive_doc();
+            v["files"][0]["from_archive"][key] = val.clone();
+            assert_eq!(code_of(&v), "from_archive_invalid", "{key} = {val}");
+        }
+        // A notice file is staged as itself, never extracted.
+        let mut v = archive_doc();
+        v["files"][3]["from_archive"] = v["files"][0]["from_archive"].clone();
+        assert_eq!(code_of(&v), "from_archive_invalid");
+        // An earlier check still wins over from_archive (the Go order).
+        let mut v = archive_doc();
+        v["files"][0]["from_archive"]["bytes"] = Value::from(0);
+        v["files"][0]["sha256"] = Value::from("nope");
+        assert_eq!(code_of(&v), "sha256_invalid");
+    }
+
+    #[test]
+    fn a_license_additional_notice_path_must_name_a_role_notice_file() {
+        let mut v = archive_doc();
+        v["license"]["additional"][0]["notice_path"] = Value::from("README.md");
+        assert_eq!(code_of(&v), "ok");
+        // Nothing is inferred: with no notice_path the entry stands alone.
+        let mut v = archive_doc();
+        v["license"]["additional"][0].as_object_mut().unwrap().remove("notice_path");
+        assert_eq!(code_of(&v), "ok");
+        // Not in files, in files but not a notice, and not a set path.
+        for (path, want) in [
+            ("absent.txt", "notice_not_in_files"),
+            ("config.json", "notice_not_in_files"),
+            ("model.safetensors", "notice_not_in_files"),
+            ("../LICENSE.txt", "path_invalid"),
+        ] {
+            let mut v = archive_doc();
+            v["license"]["additional"][0]["notice_path"] = Value::from(path);
+            assert_eq!(code_of(&v), want, "{path}");
+        }
+        let mut v = archive_doc();
+        v["license"]["additional"][0]["notice_path"] = Value::from(7);
+        assert_eq!(code_of(&v), "field_type");
     }
 
     #[test]
