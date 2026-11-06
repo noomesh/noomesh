@@ -15,7 +15,7 @@ use crate::output::{fail, ExitCode};
 use crate::ui::{self, Col, Glyph};
 use crate::{Globals, Unhandled};
 
-fn docker_lines(args: &[&str]) -> Vec<String> {
+pub(crate) fn docker_lines(args: &[&str]) -> Vec<String> {
     Command::new("docker")
         .args(args)
         .output()
@@ -1178,6 +1178,34 @@ pub(crate) fn bind_mode_setting() -> String {
     crate::onboard::env::read_env_key(&env, "NOO_BIND_MODE")
 }
 
+/// True when `NOO_BIND_MODE` records the every-interface decision, the
+/// values `scripts/lib-bind-addr.sh` reads as `all`.
+pub(crate) fn bind_mode_is_all(mode: &str) -> bool {
+    matches!(mode.trim().to_ascii_lowercase().as_str(), "all" | "0.0.0.0")
+}
+
+/// What ports published on every interface mean (i515a). Shared by
+/// `noo doctor exposure` and `noo security scan`, so the two never disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenVerdict {
+    /// Nothing is published on every interface.
+    Confined,
+    /// Published on every interface by the recorded `NOO_BIND_MODE=all`: a
+    /// decision, reported by name, never a failure (a box that chose it is
+    /// not red forever).
+    Decided,
+    /// Published on every interface with no recorded decision: a failure.
+    Undecided,
+}
+
+pub(crate) fn open_verdict(open: usize, bind_mode: &str) -> OpenVerdict {
+    match (open, bind_mode_is_all(bind_mode)) {
+        (0, _) => OpenVerdict::Confined,
+        (_, true) => OpenVerdict::Decided,
+        (_, false) => OpenVerdict::Undecided,
+    }
+}
+
 /// Which interface a published port is reachable on.
 ///
 /// The distinction the mesh cares about is not "is there a firewall" but
@@ -1310,12 +1338,17 @@ pub fn doctor_exposure(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
     let open: Vec<&Published> = published.iter().filter(|p| p.reach == Reach::AnyInterface).collect();
     let bind_mode = bind_mode_setting();
+    let verdict = open_verdict(open.len(), &bind_mode);
     let nonlocal = nonlocal_bind_enabled();
     let race = boot_race(&published, nonlocal);
 
     if g.json {
         println!("{}", serde_json::json!({
-            "status": if open.is_empty() { "confined" } else { "any_interface" },
+            "status": match verdict {
+                OpenVerdict::Confined => "confined",
+                OpenVerdict::Decided => "any_interface_decided",
+                OpenVerdict::Undecided => "any_interface",
+            },
             "bind_mode": if bind_mode.is_empty() { serde_json::Value::Null } else { bind_mode.clone().into() },
             "ip_nonlocal_bind": nonlocal,
             "boot_safe": if nonlocal.is_none() { serde_json::Value::Null } else { (!race).into() },
@@ -1329,7 +1362,7 @@ pub fn doctor_exposure(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 },
             })).collect::<Vec<_>>(),
         }));
-        return Ok(if open.is_empty() && !race { 0 } else { 1 });
+        return Ok(i32::from(verdict == OpenVerdict::Undecided || race));
     }
 
     println!("{}", ui::header("port exposure", None));
@@ -1374,6 +1407,19 @@ pub fn doctor_exposure(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         println!("{}", ui::status_line(Glyph::Ok, "every published port is confined to the tailnet or this machine"));
         return Ok(0);
     }
+    if verdict == OpenVerdict::Decided {
+        println!("{}", ui::status_line(Glyph::Warn, &format!(
+            "{} port(s) are reachable from ANY interface, by the recorded decision NOO_BIND_MODE={bind_mode}",
+            open.len()
+        )));
+        println!("{}", ui::note(
+            "config/tailscale-acl.hujson governs these ports over the tailnet only; any host on the local \
+             network can reach them directly. That is what `all` means, and it was chosen."
+        ));
+        ui::guide(&[("NOO_BIND_MODE=tailnet in .env, then noo stack restart --force",
+                     "confines them to this node's tailnet IP if the decision changes")]);
+        return Ok(i32::from(race));
+    }
     println!("{}", ui::status_line(Glyph::Err, &format!(
         "{} port(s) are reachable from ANY interface — the tailnet policy governs one door, and these have a second",
         open.len()
@@ -1403,6 +1449,22 @@ pub fn doctor_exposure(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 #[cfg(test)]
 mod exposure_tests {
     use super::*;
+
+    /// i515a: every-interface ports with no recorded decision fail; with
+    /// NOO_BIND_MODE=all recorded they are a named decision, so a box that
+    /// chose it is never red forever. lib-bind-addr.sh reads `all` and
+    /// `0.0.0.0` as the same decision.
+    #[test]
+    fn open_ports_fail_unless_all_is_the_recorded_decision() {
+        assert_eq!(open_verdict(0, ""), OpenVerdict::Confined);
+        assert_eq!(open_verdict(0, "all"), OpenVerdict::Confined);
+        for undecided in ["", "tailnet", "local", "100.64.0.9", "al"] {
+            assert_eq!(open_verdict(2, undecided), OpenVerdict::Undecided, "{undecided:?}");
+        }
+        for decided in ["all", " ALL ", "0.0.0.0"] {
+            assert_eq!(open_verdict(2, decided), OpenVerdict::Decided, "{decided:?}");
+        }
+    }
 
     /// The unset-mode note must not describe the retired
     /// `all` default as current, and must name the refusal.

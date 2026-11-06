@@ -246,6 +246,10 @@ pub(crate) struct ScanInputs {
     /// `Some(why)` when the repo `.env` holds a secret-class value
     /// (`plaintext_env::AtRest::plaintext_problem`) — names only.
     pub env_plaintext_secrets: Option<String>,
+    /// Ports this install's containers publish on every interface
+    /// (`container host_port`), and the recorded NOO_BIND_MODE (i515a).
+    /// `None` when docker could not be read: not checked, never "confined".
+    pub open_ports: Option<(Vec<String>, String)>,
     /// The posture-class checks (audit key, mTLS, hatches, gateway gates).
     /// `Default` is "nothing to report", so a fixture that does not care
     /// about them stays quiet; `security_scan` fills every field it could
@@ -347,6 +351,28 @@ pub(crate) type Finding = (&'static str, &'static str, String); // (severity, ch
 /// The check list from `security_cli.py::security_scan`, finding-for-finding
 /// (same wording, same severities). Returns findings in insertion order;
 /// the caller sorts by severity (stable, like Python's `sorted`).
+/// What `docker ps` shows this install's containers publishing on every
+/// interface, with the recorded bind mode. `None` when docker does not answer.
+fn open_ports_seen() -> Option<(Vec<String>, String)> {
+    use crate::commands::doctor::{docker_lines, is_our_container, parse_published, Reach};
+    let up = Command::new("docker")
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !up {
+        return None;
+    }
+    let mut open: Vec<String> = docker_lines(&["ps", "--format", "{{.Names}}\t{{.Ports}}"])
+        .iter()
+        .flat_map(|l| parse_published(l))
+        .filter(|p| is_our_container(&p.container) && p.reach == Reach::AnyInterface)
+        .map(|p| format!("{} {}", p.container, p.host_port))
+        .collect();
+    open.sort();
+    open.dedup();
+    Some((open, crate::commands::doctor::bind_mode_setting()))
+}
+
 pub(crate) fn scan_findings(i: &ScanInputs) -> Vec<Finding> {
     let mut issues: Vec<Finding> = Vec::new();
 
@@ -746,6 +772,26 @@ pub(crate) fn scan_findings(i: &ScanInputs) -> Vec<Finding> {
     // it at all.
     if let Err(why) = &i.gateway_trust {
         issues.push(("CRITICAL", "Gateway Transport", format!("{} — {why}", i.gateway_url)));
+    }
+
+    // i515a: a cluster-plane port on every interface. With no recorded
+    // NOO_BIND_MODE=all nobody decided it: CRITICAL, so the scan fails. With
+    // it, the decision is named at LOW, so a box that chose it is not red.
+    if let Some((open, mode)) = &i.open_ports {
+        let list = open.join(", ");
+        match crate::commands::doctor::open_verdict(open.len(), mode) {
+            crate::commands::doctor::OpenVerdict::Confined => {}
+            crate::commands::doctor::OpenVerdict::Decided => issues.push((
+                "LOW",
+                "Port Exposure",
+                format!("{} port(s) on every interface by the recorded decision NOO_BIND_MODE={mode} ({list}); the tailnet policy does not govern them", open.len()),
+            )),
+            crate::commands::doctor::OpenVerdict::Undecided => issues.push((
+                "CRITICAL",
+                "Port Exposure",
+                format!("{} port(s) on every interface with no NOO_BIND_MODE=all recorded ({list}): set NOO_BIND_MODE=tailnet in .env, then noo stack restart --force", open.len()),
+            )),
+        }
     }
 
     issues
@@ -1275,6 +1321,7 @@ fn install_findings(
             .map(|(k, _)| (*k).to_string())
             .collect(),
         env_plaintext_secrets: crate::commands::plaintext_env::AtRest::read(root).plaintext_problem(),
+        open_ports: open_ports_seen(),
         posture: PostureInputs {
             controller_secret: Some(env_var("NOO_CONTROLLER_SECRET")),
             admin_password: Some(env_var("NOO_ADMIN_PASSWORD")).filter(|p| !p.is_empty()),
@@ -5177,6 +5224,7 @@ mod tests {
             runtime_residue: Vec::new(),
             retired_store_keys: Vec::new(),
             env_plaintext_secrets: None,
+            open_ports: None,
             posture: PostureInputs::default(),
         }
     }
@@ -5394,6 +5442,32 @@ mod tests {
     #[test]
     fn scan_clean_config_has_no_findings() {
         assert!(scan_findings(&clean_inputs()).is_empty());
+    }
+
+    /// i515a: a cluster-plane port on every interface fails the scan
+    /// (CRITICAL) unless NOO_BIND_MODE=all is recorded, when it is named at
+    /// LOW; confined ports and an unread docker say nothing.
+    #[test]
+    fn scan_fails_an_undecided_open_port_and_names_a_decided_one() {
+        let with = |open: &[&str], mode: &str| {
+            let mut i = clean_inputs();
+            i.open_ports = Some((open.iter().map(|s| s.to_string()).collect(), mode.to_string()));
+            scan_findings(&i)
+        };
+        let f = with(&["noo-gateway 8080"], "tailnet");
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!((f[0].0, f[0].1), ("CRITICAL", "Port Exposure"));
+        assert!(f[0].2.contains("noo-gateway 8080") && f[0].2.contains("NOO_BIND_MODE=tailnet"), "{}", f[0].2);
+        assert_eq!(scan_exit(&f, false), 1, "an undecided open port must fail the scan");
+
+        let f = with(&["noo-gateway 8080"], "all");
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!((f[0].0, f[0].1), ("LOW", "Port Exposure"));
+        assert!(f[0].2.contains("recorded decision NOO_BIND_MODE=all"), "{}", f[0].2);
+        assert_eq!(scan_exit(&f, false), 0, "a recorded `all` must not fail the scan");
+
+        assert!(with(&[], "tailnet").is_empty());
+        assert!(scan_findings(&clean_inputs()).is_empty(), "docker not read: nothing claimed");
     }
 
     #[test]
@@ -5679,6 +5753,7 @@ mod tests {
             runtime_residue: Vec::new(),
             retired_store_keys: Vec::new(),
             env_plaintext_secrets: None,
+            open_ports: None,
             posture: PostureInputs::default(),
         };
         let mut f = scan_findings(&i);
