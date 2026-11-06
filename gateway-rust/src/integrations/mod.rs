@@ -79,15 +79,8 @@ impl Error {
     /// database's own message for storage; a fixed category otherwise, since
     /// provider-facing text can echo request material and never reaches logs.
     pub fn log_cause(&self) -> String {
-        match self {
-            Error::Storage(cause) => cause.to_string(),
-            Error::Invalid(_) => "invalid".into(),
-            Error::Unavailable(_) => "unavailable".into(),
-            Error::Reauth => "reauth".into(),
-            Error::NotFound => "not_found".into(),
-            Error::Throttled { quota: true, .. } => "quota".into(),
-            Error::Throttled { quota: false, .. } => "rate_limited".into(),
-        }
+        // MUTANT: the user-facing line, provider text and all.
+        self.to_string()
     }
 }
 
