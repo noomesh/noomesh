@@ -1,4 +1,5 @@
 {
+  "os": "linux",
   "gpu_compute_cap": "8.6",
   "nvidia_runtime": true,
   "nvidia_driver_caps_ok": true,
@@ -36,9 +37,26 @@
       "state": "running",
       "ready": true,
       "model": "rh-s2s-7b",
-      "slots": 1,
       "door_port": 38443,
       "reservation": "0b1f5f0e-6a3e-4a54-9d3c-0a4e5b9c7d21"
+    },
+    {
+      "addon": "rhaddon",
+      "name": "slow",
+      "state": "draining",
+      "ready": true,
+      "model": "rh-s2s-7b",
+      "door_port": 38445,
+      "reservation": "0b1f5f0e-6a3e-4a54-9d3c-0a4e5b9c7d21"
+    },
+    {
+      "addon": "rhaddon",
+      "name": "stuck",
+      "state": "needs_attention",
+      "ready": false,
+      "door_port": 38446,
+      "reservation": "0b1f5f0e-6a3e-4a54-9d3c-0a4e5b9c7d21",
+      "reason": "drain_timeout"
     },
     {
       "addon": "rhaddon",

@@ -18,6 +18,7 @@
       },
       "drain": {
         "path": "/v1/lifecycle/drain",
+        "done_path": "/v1/lifecycle/drain/done",
         "timeout_secs": 420
       },
       "service_drain": {
@@ -26,7 +27,8 @@
       },
       "accel": {
         "gpu": 1,
-        "realtime": true
+        "realtime": true,
+        "slots_env": "RHADDON_SLOTS"
       },
       "models": [
         {

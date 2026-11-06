@@ -16,6 +16,7 @@
       },
       "drain": {
         "path": "/drain",
+        "done_path": "/drain/done",
         "timeout_secs": 30
       },
       "service_drain": {
