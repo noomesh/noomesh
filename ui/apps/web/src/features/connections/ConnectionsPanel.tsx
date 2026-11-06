@@ -18,7 +18,7 @@ import {
 } from './useConnections';
 import './connections.css';
 
-const syncStatusNames = { draft: 'Draft', queued: 'Queued', syncing: 'Syncing', idle: 'Up to date', paused: 'Paused', error: 'Needs attention' };
+const syncStatusNames = { draft: 'Draft', queued: 'Queued', syncing: 'Syncing', idle: 'Up to date', paused: 'Paused', failing: 'Retrying', error: 'Needs attention' };
 
 export function policyDescription(policy: SourcePolicy): string {
   if (policy.kind === 'gmail') {
@@ -385,7 +385,7 @@ export function ConnectionsPanel() {
                             {source.imported ? ` · ${source.imported} imported` : ''}
                             {source.skipped ? ` · ${source.skipped} skipped` : ''}
                           </p>
-                          {source.sync_fault && <p className="connections-detail">{source.sync_fault === 'reauth' ? 'Reconnect Google, then restart sync.' : source.sync_fault === 'limit' ? 'Sync reached a limit. Choose fewer folders or a shorter mail lookback.' : 'Sync could not finish. Retry when Google is available.'}</p>}
+                          {source.sync_fault && <p className="connections-detail">{source.sync_fault === 'reauth' ? 'Reconnect Google, then restart sync.' : source.sync_fault === 'limit' ? 'Sync reached a limit. Choose fewer folders or a shorter mail lookback.' : source.sync_fault === 'quota' ? 'Google quota for this account is used up for now. Sync resumes by itself.' : source.sync_fault === 'rate' ? 'Google is limiting requests for this account. Sync resumes by itself.' : source.sync_status === 'failing' ? 'Sync could not finish. It retries by itself, at most hourly.' : 'Sync could not finish. Retry when Google is available.'}</p>}
                         </div>
                         <Button
                           size="sm"

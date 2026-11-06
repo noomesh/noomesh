@@ -36,7 +36,7 @@ impl Vault {
     }
     pub fn configured() -> Result<Self, Error> {
         let secret = crate::config::secret_env::secret(KEY_NAME)
-            .map_err(|_| Error::Unavailable("The integration encryption key could not be read".into()))?
+            .map_err(|e| Error::Unavailable(format!("The integration encryption key could not be read: {e}")))?
             .map(Zeroizing::new).ok_or_else(|| Error::Unavailable("Installer setup required: create NOO_INTEGRATIONS_KEY in the encrypted secret store".into()))?;
         Self::from_secret(&secret)
     }

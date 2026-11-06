@@ -68,6 +68,10 @@ pub enum Error {
     NotFound,
     #[error("Connection storage is unavailable")]
     Storage(#[from] sqlx::Error),
+    /// Google refused for rate or quota (429, or a 403 naming a rate or
+    /// quota reason). `retry_after` is Google's own Retry-After, in seconds.
+    #[error("Google is limiting requests for this account; sync resumes by itself")]
+    Throttled { retry_after: Option<u64>, quota: bool },
 }
 
 impl Error {
@@ -81,6 +85,8 @@ impl Error {
             Error::Unavailable(_) => "unavailable".into(),
             Error::Reauth => "reauth".into(),
             Error::NotFound => "not_found".into(),
+            Error::Throttled { quota: true, .. } => "quota".into(),
+            Error::Throttled { quota: false, .. } => "rate_limited".into(),
         }
     }
 }
@@ -93,6 +99,7 @@ impl From<Error> for crate::routes::AppError {
             Error::Unavailable(m) => AppError::Unavailable(m),
             Error::Reauth => AppError::Conflict(e.to_string()),
             Error::NotFound => AppError::NotFound(e.to_string()),
+            Error::Throttled { .. } => AppError::Unavailable(e.to_string()),
             Error::Storage(_) => {
                 tracing::error!(error = %e.log_cause(), "integration database operation failed");
                 AppError::Internal(e.to_string())

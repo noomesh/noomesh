@@ -17,7 +17,7 @@ async fn enable(db: &PgPool, owner: Uuid, source: Uuid, enabled: bool) -> Result
 }
 
 async fn claim(db: &PgPool, vault: &Vault) -> Result<Option<Job>, Error> {
-    sqlx::query("UPDATE noo_integration_sync SET last_gmail_page=now()-interval '2 seconds'").execute(db).await?;
+    sqlx::query("UPDATE noo_integration_sync SET last_page=now()-interval '2 seconds'").execute(db).await?;
     super::claim(db, vault).await
 }
 
@@ -255,7 +255,7 @@ async fn gmail_start_pacing_is_per_owner_and_shared_between_sources() {
     let delayed: bool = sqlx::query_scalar("SELECT next_run>now() FROM noo_integration_sync WHERE source_id=$1")
         .bind(b).fetch_one(&db.pool).await.unwrap();
     assert!(delayed);
-    sqlx::query("UPDATE noo_integration_sync SET last_gmail_scan=now()-interval '2 minutes',last_gmail_page=now()-interval '2 seconds' WHERE owner_uuid=$1")
+    sqlx::query("UPDATE noo_integration_sync SET last_gmail_scan=now()-interval '2 minutes',last_page=now()-interval '2 seconds' WHERE owner_uuid=$1")
         .bind(alice).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE noo_integration_sync SET next_run=now() WHERE source_id=$1").bind(b).execute(&db.pool).await.unwrap();
     assert_eq!(super::claim(&db.pool,&v).await.unwrap().unwrap().source,b);
@@ -281,21 +281,23 @@ async fn concurrent_gmail_claims_share_the_owner_pacing_row() {
 }
 
 #[tokio::test]
-async fn gmail_continuation_pages_are_paced_per_owner() {
+async fn continuation_pages_are_paced_per_owner_for_gmail_and_drive() {
     let Some(db) = Db::new().await else { return; };
     let v = vault();
-    let owner = db.user("page-pace").await;
-    let source = db.source(owner,true).await;
-    super::enable(&db.pool,owner,source,true).await.unwrap();
-    let job = super::claim(&db.pool,&v).await.unwrap().unwrap();
-    let page = sync::Page { docs: Vec::new(), retained: Default::default(), cursor: Some(json!({"page":"next"})), skipped: 0 };
-    assert!(super::commit(&db.pool,&v,&job,&page).await.unwrap());
-    assert!(super::claim(&db.pool,&v).await.unwrap().is_none());
-    let delayed: bool = sqlx::query_scalar("SELECT next_run>now() FROM noo_integration_sync WHERE source_id=$1").bind(source).fetch_one(&db.pool).await.unwrap();
-    assert!(delayed);
-    sqlx::query("UPDATE noo_integration_sync SET last_gmail_page=now()-interval '2 seconds' WHERE owner_uuid=$1").bind(owner).execute(&db.pool).await.unwrap();
-    sqlx::query("UPDATE noo_integration_sync SET next_run=now() WHERE source_id=$1").bind(source).execute(&db.pool).await.unwrap();
-    assert!(super::claim(&db.pool,&v).await.unwrap().is_some());
+    for (gmail, who) in [(true, "page-pace-mail"), (false, "page-pace-drive")] {
+        let owner = db.user(who).await;
+        let source = db.source(owner,gmail).await;
+        super::enable(&db.pool,owner,source,true).await.unwrap();
+        let job = super::claim(&db.pool,&v).await.unwrap().unwrap();
+        let page = sync::Page { docs: Vec::new(), retained: Default::default(), cursor: Some(json!({"page":"next"})), skipped: 0 };
+        assert!(super::commit(&db.pool,&v,&job,&page).await.unwrap());
+        assert!(super::claim(&db.pool,&v).await.unwrap().is_none(), "gmail={gmail}: the next page waits a second");
+        let delayed: bool = sqlx::query_scalar("SELECT next_run>now() FROM noo_integration_sync WHERE source_id=$1").bind(source).fetch_one(&db.pool).await.unwrap();
+        assert!(delayed, "gmail={gmail}");
+        sqlx::query("UPDATE noo_integration_sync SET last_page=now()-interval '2 seconds' WHERE owner_uuid=$1").bind(owner).execute(&db.pool).await.unwrap();
+        sqlx::query("UPDATE noo_integration_sync SET next_run=now() WHERE source_id=$1").bind(source).execute(&db.pool).await.unwrap();
+        assert!(super::claim(&db.pool,&v).await.unwrap().is_some(), "gmail={gmail}");
+    }
     db.finish().await;
 }
 
@@ -808,7 +810,7 @@ async fn concurrent_workers_and_disconnect_serialize_without_cross_owner_effects
 }
 
 #[tokio::test]
-async fn provider_failures_keep_cursor_private_back_off_and_stop_until_restarted() {
+async fn provider_failures_keep_cursor_private_back_off_and_keep_retrying() {
     let Some(db) = Db::new().await else {
         return;
     };
@@ -816,7 +818,7 @@ async fn provider_failures_keep_cursor_private_back_off_and_stop_until_restarted
     let owner = db.user("alice").await;
     let source = db.source(owner, true).await;
     enable(&db.pool, owner, source, true).await.unwrap();
-    for attempt in 1..=5 {
+    for attempt in 1..=8 {
         let job = claim(&db.pool, &v).await.unwrap().unwrap();
         fail(
             &db.pool,
@@ -825,11 +827,12 @@ async fn provider_failures_keep_cursor_private_back_off_and_stop_until_restarted
         )
         .await
         .unwrap();
-        let (tries,status,fault,delayed):(i32,String,String,bool)=sqlx::query_as("SELECT attempts,status,fault,next_run>now() FROM noo_integration_sync WHERE source_id=$1").bind(source).fetch_one(&db.pool).await.unwrap();
+        let (tries,status,fault,delayed,capped):(i32,String,String,bool,bool)=sqlx::query_as("SELECT attempts,status,fault,next_run>now(),next_run<=now()+interval '1 hour 5 seconds' FROM noo_integration_sync WHERE source_id=$1").bind(source).fetch_one(&db.pool).await.unwrap();
         assert_eq!(tries, attempt);
         assert_eq!(fault, "provider");
         assert!(delayed);
-        assert_eq!(status, if attempt == 5 { "error" } else { "queued" });
+        assert!(capped, "a provider fault waits at most an hour");
+        assert_eq!(status, "failing", "a provider fault is never terminal");
         assert!(claim(&db.pool, &v).await.unwrap().is_none());
         sqlx::query("UPDATE noo_integration_sync SET next_run=now() WHERE source_id=$1")
             .bind(source)
@@ -837,6 +840,11 @@ async fn provider_failures_keep_cursor_private_back_off_and_stop_until_restarted
             .await
             .unwrap();
     }
+    // Still retrying by itself after eight failures; a lost grant, by
+    // contrast, stops until the person reconnects and restarts the source.
+    let job = claim(&db.pool, &v).await.unwrap().expect("a failing source is still claimed");
+    fail(&db.pool, &job, &Error::Reauth).await.unwrap();
+    sqlx::query("UPDATE noo_integration_sync SET next_run=now() WHERE source_id=$1").bind(source).execute(&db.pool).await.unwrap();
     assert!(claim(&db.pool, &v).await.unwrap().is_none());
     enable(&db.pool, owner, source, true).await.unwrap();
     assert!(claim(&db.pool, &v).await.unwrap().is_some());
@@ -878,4 +886,35 @@ async fn invalid_page_rolls_back_earlier_items_and_cross_owner_rows_fail_the_fk(
         Some("23503")
     );
     db.finish().await;
+}
+
+/// Only what the person must fix stops a source; everything else retries on
+/// a backoff capped at an hour, and a rate or quota refusal waits at least
+/// as long as Google asked.
+#[test]
+fn only_a_lost_grant_or_a_limit_stops_a_source() {
+    use super::{backoff_secs, retry_plan, RetryPlan, MAX_RETRY_SECS};
+    assert_eq!((backoff_secs(0), backoff_secs(1), backoff_secs(4)), (60, 120, 960));
+    assert_eq!(backoff_secs(6), MAX_RETRY_SECS);
+    assert_eq!(backoff_secs(1_000), MAX_RETRY_SECS);
+    for attempts in [0, 4, 5, 50] {
+        let provider = retry_plan(&Error::Unavailable("x".into()), attempts);
+        assert_eq!((provider.fault, provider.status), ("provider", "failing"), "attempts {attempts}");
+        assert!(provider.delay_secs <= MAX_RETRY_SECS);
+        assert_eq!(retry_plan(&Error::Storage(sqlx::Error::PoolTimedOut), attempts).status, "failing");
+    }
+    assert_eq!(retry_plan(&Error::Reauth, 0).status, "error");
+    assert_eq!(retry_plan(&Error::Invalid("x".into()), 0), RetryPlan { fault: "limit", status: "error", delay_secs: 60 });
+}
+
+#[test]
+fn a_rate_or_quota_refusal_waits_as_long_as_google_asked() {
+    use super::retry_plan;
+    let asked = Error::Throttled { retry_after: Some(900), quota: false };
+    let plan = retry_plan(&asked, 0);
+    assert_eq!((plan.fault, plan.status, plan.delay_secs), ("rate", "failing", 900));
+    // The backoff wins when it is longer than what Google asked.
+    assert_eq!(retry_plan(&Error::Throttled { retry_after: Some(5), quota: false }, 3).delay_secs, 480);
+    let quota = retry_plan(&Error::Throttled { retry_after: None, quota: true }, 0);
+    assert_eq!((quota.fault, quota.status, quota.delay_secs), ("quota", "failing", 60));
 }

@@ -11127,9 +11127,9 @@ export interface components {
             created_at: string;
             sync_enabled?: boolean;
             /** @enum {string} */
-            sync_status?: "draft" | "queued" | "syncing" | "idle" | "paused" | "error";
+            sync_status?: "draft" | "queued" | "syncing" | "idle" | "paused" | "failing" | "error";
             /** @enum {string|null} */
-            sync_fault?: "provider" | "reauth" | "limit" | "storage" | null;
+            sync_fault?: "provider" | "reauth" | "limit" | "storage" | "rate" | "quota" | null;
             imported?: number;
             skipped?: number;
         };
