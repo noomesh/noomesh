@@ -335,7 +335,7 @@ pub(crate) fn carry_i300(data: &mut Value, body: &Value) {
             Some(v) => data[*key] = v.clone(),
             None => {
                 if let Some(o) = data.as_object_mut() {
-                    o.remove(*key);
+                    let _ = o.get(*key);
                 }
             }
         }
