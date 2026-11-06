@@ -46,6 +46,74 @@ pub struct DirChecked {
     /// for it). `Some(rules)`: it passed the gateway's rules, except `rules`,
     /// one sentence per route the front-door rule could not be applied to.
     pub routes: Option<Vec<String>>,
+    /// `None`: the bundle ships no node-workloads.json. `Some(scratch)`: it
+    /// passed the i300 rules ([`super::node_workloads::parse_node_workloads`],
+    /// without the lock, which a directory does not have), and `scratch` is
+    /// every scratch that may run native code (A12), in file order.
+    pub node_workloads: Option<Vec<ExecScratch>>,
+}
+
+/// A scratch entry declared `exec: true`: its worker may run native code it
+/// compiles there. What the operator is told (A12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecScratch {
+    pub workload: String,
+    pub target: String,
+    pub mb: i64,
+}
+
+impl ExecScratch {
+    /// The sentence `noo addons check` prints for it.
+    pub fn sentence(&self, addon: &str) -> String {
+        format!(
+            "{addon}: workload {} may run native code it compiles, in a {} MiB scratch at {}",
+            self.workload, self.mb, self.target
+        )
+    }
+}
+
+/// The note that goes with a node-workloads.json that passed: the lock is not
+/// in a directory, so the image names were not matched against it.
+pub const NODE_WORKLOADS_NOT_CHECKED: &str =
+    "node-workloads.json's image names against the lock's images (the lock is not in the directory)";
+
+/// The bundle directory's node-workloads.json under the i300 rules, and the
+/// scratch that may run native code. `Ok(None)`: none shipped (a symlink or a
+/// directory under the name is not read, as [`read_bundle_dir`]). The lock is
+/// not in a directory, so each workload's own `image` stands in for its lock
+/// key ([`NODE_WORKLOADS_NOT_CHECKED`] says so).
+pub fn check_node_workloads(
+    addon: &str,
+    dir: &Path,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<Option<Vec<ExecScratch>>, String> {
+    let p = dir.join(super::node_workloads::NODE_WORKLOADS_FILE);
+    if !std::fs::symlink_metadata(&p).map(|m| m.file_type().is_file()).unwrap_or(false) {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+    let mut images = BTreeMap::new();
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+        for w in v["workloads"].as_array().into_iter().flatten() {
+            if let Some(i) = w["image"].as_str() {
+                images.insert(i.to_string(), String::new());
+            }
+        }
+    }
+    let routes = files.get(ROUTES_FILE).map(|r| super::node_workloads::routes_from_json(r));
+    let parsed = super::node_workloads::parse_node_workloads(addon, &bytes, &images, routes.as_ref())
+        .map_err(|e| format!("{} is refused: {e}", super::node_workloads::NODE_WORKLOADS_FILE))?;
+    let mut exec = Vec::new();
+    for w in &parsed {
+        for s in w.scratch.iter().filter(|s| s.exec) {
+            exec.push(ExecScratch {
+                workload: w.name.clone(),
+                target: s.target.clone(),
+                mb: s.max_mb.or(s.tmpfs_mb).unwrap_or_default(),
+            });
+        }
+    }
+    Ok(Some(exec))
 }
 
 /// What can still refuse a bundle this passes. Printed on every pass (and in
@@ -138,7 +206,8 @@ pub fn check_dir_with(dir: &Path, addon: &str, core: &Core) -> Result<DirChecked
     let files = read_bundle_dir(dir)?;
     let guards = check_files(addon, &files, core).map_err(|r| r.why(addon))?;
     let routes = check_routes(addon, &files).map_err(|r| r.why(addon))?;
-    Ok(DirChecked { guards, routes })
+    let node_workloads = check_node_workloads(addon, dir, &files)?;
+    Ok(DirChecked { guards, routes, node_workloads })
 }
 
 /// [`check_dir_with`] against the core embedded in this binary.

@@ -1092,6 +1092,32 @@ pub(crate) fn parse_check_with(a: &mut crate::args::Args) -> Result<(String, Opt
     Ok((dir, name))
 }
 
+/// One line per scratch that may run native code (A12): what `noo addons
+/// check` tells the operator. Empty for a bundle with none.
+fn exec_scratch_lines(name: &str, c: &crate::addons::check::DirChecked) -> Vec<String> {
+    c.node_workloads.iter().flatten().map(|s| s.sentence(name)).collect()
+}
+
+/// The `--json` report of a bundle that passed `noo addons check`. The
+/// `exec_scratch` field (`[{workload, target, mb}]`) is there only when the
+/// bundle declares an exec scratch.
+fn check_json(name: &str, dir: &str, third_party: bool, c: &crate::addons::check::DirChecked) -> serde_json::Value {
+    let mut report = json!({
+        "addon": name, "dir": dir, "ok": true, "third_party": third_party, "core": "embedded",
+        "checked": {"secrets_declared": c.guards.declared, "secret_references": c.guards.referenced, "interpolations": c.guards.interpolated, "mounts": c.guards.mounts, "routes_json": c.routes.is_some(), "node_workloads_json": c.node_workloads.is_some()},
+        "warnings": c.guards.warnings,
+        "not_checked": crate::addons::check::NOT_CHECKED,
+        "routes_not_checked": c.routes.clone().unwrap_or_default(),
+    });
+    if c.node_workloads.is_some() {
+        report["node_workloads_not_checked"] = crate::addons::check::NODE_WORKLOADS_NOT_CHECKED.into();
+    }
+    if let Some(scratch) = c.node_workloads.as_ref().filter(|s| !s.is_empty()) {
+        report["exec_scratch"] = scratch.iter().map(|s| json!({"workload": s.workload, "target": s.target, "mb": s.mb})).collect();
+    }
+    report
+}
+
 /// `noo addons check <bundle-dir> [--name <addon>]`: the checks enable runs
 /// on a bundle's files (`addons::check`), on a directory. Installs nothing,
 /// asks no network; the core is the one embedded in this binary.
@@ -1110,21 +1136,18 @@ pub fn addons_check(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     match crate::addons::check::check_dir(path, &name) {
         Ok(c) => {
             if g.json {
-                println!(
-                    "{}",
-                    json!({
-                        "addon": name, "dir": dir, "ok": true, "third_party": third_party, "core": "embedded",
-                        "checked": {"secrets_declared": c.guards.declared, "secret_references": c.guards.referenced, "interpolations": c.guards.interpolated, "mounts": c.guards.mounts, "routes_json": c.routes.is_some()},
-                        "warnings": c.guards.warnings,
-                        "not_checked": crate::addons::check::NOT_CHECKED,
-                        "routes_not_checked": c.routes.clone().unwrap_or_default(),
-                    })
-                );
+                println!("{}", check_json(&name, &dir, third_party, &c));
             } else {
                 let routes = if c.routes.is_some() { ", and the gateway's routes.json rules" } else { " (it ships no routes.json)" };
                 ui::done(&format!("{name}: the bundle in {dir} passes enable's guard and resources checks{routes}"));
                 for w in &c.guards.warnings {
                     ui::warned(&format!("{name}: {w}"));
+                }
+                for line in exec_scratch_lines(&name, &c) {
+                    ui::warned(&line);
+                }
+                if c.node_workloads.is_some() {
+                    println!("{}", ui::note(&format!("not checked here: {}", crate::addons::check::NODE_WORKLOADS_NOT_CHECKED)));
                 }
                 let who = if third_party { "third-party" } else { "first-party" };
                 println!("{}", ui::note(&format!("checked as {who}, against the compose files embedded in this noo")));
@@ -1484,6 +1507,73 @@ pub fn addons_set(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bundle directory of the fixture add-on, with `node_workloads` as its
+    /// node-workloads.json when given.
+    fn check_bundle(tag: &str, node_workloads: Option<&str>) -> Result<crate::addons::check::DirChecked, String> {
+        let d = std::env::temp_dir().join(format!("noo-addons-check-nw-{tag}-{}", std::process::id())).join("rhaddon");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("docker-compose.yml"), include_bytes!("../../../tests/fixtures/addons/rhaddon/docker-compose.yml")).unwrap();
+        std::fs::write(d.join("resources.json"), include_bytes!("../../../tests/fixtures/addons/rhaddon/resources.json")).unwrap();
+        std::fs::write(d.join("system.json"), include_bytes!("../../../tests/fixtures/addons/rhaddon/system.json")).unwrap();
+        std::fs::write(d.join("routes.json"), include_bytes!("../../../tests/fixtures/addons/rhaddon/routes.json")).unwrap();
+        if let Some(text) = node_workloads {
+            std::fs::write(d.join("node-workloads.json"), text).unwrap();
+        }
+        let core = crate::addons::guards::Core::from_texts(&["services:\n  gateway:\n    image: g\nvolumes:\n  pgdata:\n  noo-models:\n".to_string()]).unwrap().with_tables();
+        let got = crate::addons::check::check_dir_with(&d, "rhaddon", &core);
+        let _ = std::fs::remove_dir_all(d.parent().unwrap());
+        got
+    }
+
+    const NW_EXEC: &str = include_str!("../addons/testdata/i300/node-workloads/valid-scratch-exec.json");
+    const NW_EXEC_FALSE: &str = include_str!("../addons/testdata/i300/node-workloads/valid-scratch-exec-false.json");
+    const NW_MINIMAL: &str = include_str!("../addons/testdata/i300/node-workloads/valid-minimal.json");
+    const NW_TWO_EXEC: &str = include_str!("../addons/testdata/i300/node-workloads/refuse-scratch-exec-two.json");
+
+    /// T4 (A12): `noo addons check` names the exec scratch, in the human
+    /// output and in `--json`, for a bundle that has one, and says nothing
+    /// for one that does not. Every row is checked; all mismatches are shown.
+    #[test]
+    fn check_names_the_exec_scratch_and_only_then() {
+        let sentence = "rhaddon: workload echo may run native code it compiles, in a 512 MiB scratch at /cache/triton";
+        // (what, node-workloads.json, expected human lines, expected json exec_scratch)
+        type Row = (&'static str, Option<&'static str>, Vec<String>, Option<serde_json::Value>);
+        let rows: Vec<Row> = vec![
+            ("one exec scratch", Some(NW_EXEC), vec![sentence.to_string()], Some(json!([{"workload": "echo", "target": "/cache/triton", "mb": 512}]))),
+            ("exec: false", Some(NW_EXEC_FALSE), vec![], None),
+            ("no exec key", Some(NW_MINIMAL), vec![], None),
+            ("no node-workloads.json", None, vec![], None),
+        ];
+        let mut mismatches: Vec<String> = Vec::new();
+        for (what, text, want_lines, want_json) in rows {
+            let c = match check_bundle(what.replace([' ', ':', '.'], "-").as_str(), text) {
+                Ok(c) => c,
+                Err(e) => {
+                    mismatches.push(format!("{what}: the bundle was refused: {e}"));
+                    continue;
+                }
+            };
+            let lines = exec_scratch_lines("rhaddon", &c);
+            if lines != want_lines {
+                mismatches.push(format!("{what}: human lines {lines:?}, want {want_lines:?}"));
+            }
+            let report = check_json("rhaddon", "dir", false, &c);
+            if report.get("exec_scratch") != want_json.as_ref() {
+                mismatches.push(format!("{what}: json exec_scratch {:?}, want {want_json:?}", report.get("exec_scratch")));
+            }
+        }
+        assert!(mismatches.is_empty(), "{} rows differ:\n{}", mismatches.len(), mismatches.join("\n"));
+    }
+
+    /// A node-workloads.json the i300 rules refuse refuses the bundle, with
+    /// the code the validators share.
+    #[test]
+    fn check_refuses_a_bundle_with_two_exec_scratch() {
+        let e = check_bundle("two", Some(NW_TWO_EXEC)).unwrap_err();
+        assert!(e.contains("node-workloads.json is refused") && e.contains("scratch_invalid") && e.contains("a second exec scratch"), "{e}");
+    }
 
     const SAMPLE: &str = "\
 # Runtime config.
