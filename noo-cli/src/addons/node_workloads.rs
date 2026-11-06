@@ -100,6 +100,9 @@ pub struct NodeWorkload {
     pub health: Health,
     #[serde(default)]
     pub drain: Drain,
+    /// Absent is `service_drain_invalid` (not `field_missing`), as in the
+    /// agent, where the field is a pointer.
+    pub service_drain: Option<ServiceDrain>,
     #[serde(default)]
     pub accel: Accel,
     #[serde(default)]
@@ -128,6 +131,18 @@ pub struct Health {
 pub struct Drain {
     #[serde(default)]
     pub path: String,
+    #[serde(default)]
+    pub timeout_secs: i64,
+}
+
+/// A route NAME in the add-on's `routes.json` (never a path, never inferred)
+/// and how long the gateway waits for it. Same as the agent's
+/// `nodewl.ServiceDrain`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceDrain {
+    #[serde(default)]
+    pub route: String,
     #[serde(default)]
     pub timeout_secs: i64,
 }
@@ -330,15 +345,29 @@ const REQUIRED_SUBKEYS: &[(&str, &[&str])] = &[
     ("limits", &["ram_mb", "cpus", "pids"]),
 ];
 
+/// The add-on's `routes.json` as `name -> internal?`, the input of
+/// [`parse_node_workloads`]'s cross-file rule (the agent's
+/// `nodewl.RoutesFromJSON`). It reuses the reader of `workloads.json`'s
+/// `drain.route` check. A `routes.json` that cannot be read gives an empty
+/// map, so every `service_drain.route` is then unknown and refused: the gateway
+/// refuses such a manifest on its own, and the CLI never lets it through.
+pub fn routes_from_json(bytes: &[u8]) -> BTreeMap<String, bool> {
+    super::decls::route_kinds(bytes).unwrap_or_default()
+}
+
 /// Parse and validate the `node-workloads.json` of `addon`. `lock_images` is
 /// the `images` map of the add-on's verified lock (name -> ref): a workload's
-/// `image` must be a key of it. The first refusal wins; the fixtures carry one
-/// defect each. Same checks, same order and same codes as the node agent's
-/// `nodewl.ParseDecl`.
+/// `image` must be a key of it. `routes` is the add-on's `routes.json` from
+/// [`routes_from_json`]: `service_drain.route` must be an internal route of
+/// it. `None` skips ONLY that existence and internal check; the shape of
+/// `service_drain` is always checked. The first refusal wins; the fixtures
+/// carry one defect each. Same checks, same order and same codes as the node
+/// agent's `nodewl.ParseDecl`.
 pub fn parse_node_workloads(
     addon: &str,
     bytes: &[u8],
     lock_images: &BTreeMap<String, String>,
+    routes: Option<&BTreeMap<String, bool>>,
 ) -> Result<Vec<NodeWorkload>, NodeWorkloadRefusal> {
     let found = walk(bytes);
     if let Some(k) = found.dup.into_inner() {
@@ -374,7 +403,7 @@ pub fn parse_node_workloads(
     let mut out: Vec<NodeWorkload> = Vec::with_capacity(raws.len());
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for (i, raw) in raws.into_iter().enumerate() {
-        let w = parse_workload(addon, raw, lock_images)?;
+        let w = parse_workload(addon, raw, lock_images, routes)?;
         if !seen.insert(w.name.clone()) {
             return Err(refuse(
                 "name_duplicate",
@@ -399,6 +428,7 @@ fn parse_workload(
     addon: &str,
     raw: Value,
     lock_images: &BTreeMap<String, String>,
+    routes: Option<&BTreeMap<String, bool>>,
 ) -> Result<NodeWorkload, NodeWorkloadRefusal> {
     // The agent decodes first (unknown field, type), then looks for missing
     // keys; the keys are read off the Value before the decode consumes it.
@@ -419,7 +449,7 @@ fn parse_workload(
     if let Some(m) = missing {
         return Err(m);
     }
-    validate(addon, &w, lock_images)?;
+    validate(addon, &w, lock_images, routes)?;
     Ok(w)
 }
 
@@ -472,6 +502,14 @@ fn target_shape_ok(s: &str) -> bool {
     })
 }
 
+/// `^[a-z][a-z0-9_]{0,63}$`
+fn route_name_ok(s: &str) -> bool {
+    let b = s.as_bytes();
+    (1..=64).contains(&b.len())
+        && b[0].is_ascii_lowercase()
+        && b.iter().all(|c| is_lower_digit(*c) || *c == b'_')
+}
+
 /// `^[a-z0-9][a-z0-9._-]{0,63}$`
 fn runtime_ok(s: &str) -> bool {
     let b = s.as_bytes();
@@ -520,6 +558,7 @@ fn validate(
     addon: &str,
     d: &NodeWorkload,
     lock_images: &BTreeMap<String, String>,
+    routes: Option<&BTreeMap<String, bool>>,
 ) -> Result<(), NodeWorkloadRefusal> {
     if !door_name_ok(addon) {
         return Err(refuse(
@@ -596,6 +635,7 @@ fn validate(
             "drain needs an absolute path and timeout_secs 1..3600".to_string(),
         ));
     }
+    validate_service_drain(d.service_drain.as_ref(), routes)?;
     if !(0..=8).contains(&d.accel.gpu) {
         return Err(refuse("accel_invalid", format!("accel.gpu {} (0..8)", d.accel.gpu)));
     }
@@ -613,6 +653,41 @@ fn validate(
         ));
     }
     Ok(())
+}
+
+fn validate_service_drain(
+    s: Option<&ServiceDrain>,
+    routes: Option<&BTreeMap<String, bool>>,
+) -> Result<(), NodeWorkloadRefusal> {
+    let bad = |m: String| refuse("service_drain_invalid", m);
+    let Some(s) = s else {
+        return Err(bad(
+            "`service_drain` is required: the add-on's drain route and timeout".to_string(),
+        ));
+    };
+    if !route_name_ok(&s.route) {
+        return Err(bad(format!(
+            "service_drain.route `{}` is not a route name ([a-z][a-z0-9_]{{0,63}})",
+            s.route
+        )));
+    }
+    if !(1..=3600).contains(&s.timeout_secs) {
+        return Err(bad(format!("service_drain.timeout_secs {} (1..3600)", s.timeout_secs)));
+    }
+    let Some(routes) = routes else {
+        return Ok(());
+    };
+    match routes.get(&s.route) {
+        None => Err(bad(format!(
+            "service_drain.route `{}` is not a route of the add-on's routes.json",
+            s.route
+        ))),
+        Some(false) => Err(bad(format!(
+            "service_drain.route `{}` must be an `internal` route: the gateway calls it",
+            s.route
+        ))),
+        Some(true) => Ok(()),
+    }
 }
 
 fn validate_models(ms: &[Slot]) -> Result<(), NodeWorkloadRefusal> {
@@ -759,6 +834,10 @@ mod tests {
             .collect()
     }
 
+    fn routes() -> BTreeMap<String, bool> {
+        routes_from_json(&read("routes.json"))
+    }
+
     fn cases() -> Vec<Value> {
         let v: Value = serde_json::from_slice(&read("cases.json")).unwrap();
         v.as_array().unwrap().clone()
@@ -774,7 +853,7 @@ mod tests {
             let file = c["file"].as_str().unwrap();
             let want = c["code"].as_str().unwrap();
             let addon = c.get("addon").and_then(Value::as_str).unwrap_or("rhaddon");
-            let got = parse_node_workloads(addon, &read(file), &images);
+            let got = parse_node_workloads(addon, &read(file), &images, Some(&routes()));
             if want.is_empty() {
                 valid += 1;
                 assert!(got.is_ok(), "{file} should parse: {:?}", got.err());
@@ -795,7 +874,7 @@ mod tests {
         let on_disk: BTreeSet<String> = std::fs::read_dir(dir())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n != "cases.json" && n != "lock.json")
+            .filter(|n| n != "cases.json" && n != "lock.json" && n != "routes.json")
             .collect();
         assert_eq!(listed, on_disk);
     }
@@ -806,7 +885,7 @@ mod tests {
         let text = String::from_utf8(read("valid-full.json")).unwrap();
         let twice = text.replace("\"RHADDON_QUANT\"", "\"RHADDON_SLOTS\"");
         assert_ne!(twice, text);
-        let e = parse_node_workloads("rhaddon", twice.as_bytes(), &lock_images()).unwrap_err();
+        let e = parse_node_workloads("rhaddon", twice.as_bytes(), &lock_images(), Some(&routes())).unwrap_err();
         assert_eq!(e.code(), "duplicate_key");
         assert!(e.message().contains("RHADDON_SLOTS"), "{e}");
     }
@@ -814,7 +893,7 @@ mod tests {
     #[test]
     fn a_repeat_is_found_before_a_type_error_and_in_a_nested_array() {
         let nested = "[[1, [\"a\"], \u{7b}\"k\": 1, \"k\": 2\u{7d}]]";
-        let e = parse_node_workloads("rhaddon", nested.as_bytes(), &lock_images());
+        let e = parse_node_workloads("rhaddon", nested.as_bytes(), &lock_images(), Some(&routes()));
         assert_eq!(e.unwrap_err().code(), "duplicate_key");
         // Same key at two depths is not a repeat.
         let ok = "[\u{7b}\"a\": \u{7b}\"a\": 1\u{7d}\u{7d}]";
@@ -827,30 +906,30 @@ mod tests {
         let text = String::from_utf8(read("valid-full.json")).unwrap();
         let nulled = text.replace("\"gpu\": 1", "\"gpu\": null");
         assert_ne!(nulled, text);
-        let e = parse_node_workloads("rhaddon", nulled.as_bytes(), &lock_images()).unwrap_err();
+        let e = parse_node_workloads("rhaddon", nulled.as_bytes(), &lock_images(), Some(&routes())).unwrap_err();
         assert_eq!(e.code(), "field_type");
         // Document order decides: health (a repeat) comes before accel (the null).
         let both = nulled.replace("\"live\":", "\"ready\":");
-        let e = parse_node_workloads("rhaddon", both.as_bytes(), &lock_images()).unwrap_err();
+        let e = parse_node_workloads("rhaddon", both.as_bytes(), &lock_images(), Some(&routes())).unwrap_err();
         assert_eq!(e.code(), "duplicate_key");
         // And the other way: the null first, the repeat after it in env.
         let both = nulled.replace("\"RHADDON_QUANT\"", "\"RHADDON_SLOTS\"");
-        let e = parse_node_workloads("rhaddon", both.as_bytes(), &lock_images()).unwrap_err();
+        let e = parse_node_workloads("rhaddon", both.as_bytes(), &lock_images(), Some(&routes())).unwrap_err();
         assert_eq!(e.code(), "field_type");
     }
 
     #[test]
     fn not_json_and_empty_input_are_bad_json() {
         for bytes in [&b""[..], &b"nope"[..], &b"[1, 2"[..]] {
-            let e = parse_node_workloads("rhaddon", bytes, &lock_images()).unwrap_err();
+            let e = parse_node_workloads("rhaddon", bytes, &lock_images(), Some(&routes())).unwrap_err();
             assert_eq!(e.code(), "bad_json", "{bytes:?}");
         }
     }
 
     #[test]
     fn the_door_seam_returns_addon_and_workload_in_file_order() {
-        let got = parse_node_workloads("rhaddon", &read("valid-two-workloads.json"), &lock_images())
-            .unwrap();
+        let bytes = read("valid-two-workloads.json");
+        let got = parse_node_workloads("rhaddon", &bytes, &lock_images(), Some(&routes())).unwrap();
         let doors = node_workload_doors("rhaddon", &got);
         assert_eq!(doors.len(), got.len());
         assert!(doors.len() >= 2);
@@ -858,6 +937,43 @@ mod tests {
             assert_eq!(door.0, "rhaddon");
             assert_eq!(door.1, w.name);
         }
+    }
+
+    #[test]
+    fn no_routes_skips_only_the_cross_file_half() {
+        let images = lock_images();
+        // Existence and internal need routes.json: without it they pass.
+        for file in [
+            "refuse-service-drain-route-unknown.json",
+            "refuse-service-drain-route-public.json",
+        ] {
+            let with = parse_node_workloads("rhaddon", &read(file), &images, Some(&routes()));
+            assert_eq!(with.unwrap_err().code(), "service_drain_invalid", "{file}");
+            let without = parse_node_workloads("rhaddon", &read(file), &images, None);
+            assert!(without.is_ok(), "{file}: {:?}", without.err());
+        }
+        // The shape of service_drain is checked either way.
+        for file in [
+            "refuse-service-drain-missing.json",
+            "refuse-service-drain-route-empty.json",
+            "refuse-service-drain-route-name.json",
+            "refuse-service-drain-timeout-zero.json",
+            "refuse-service-drain-timeout-3601.json",
+        ] {
+            let got = parse_node_workloads("rhaddon", &read(file), &images, None);
+            assert_eq!(got.unwrap_err().code(), "service_drain_invalid", "{file}");
+        }
+        let f = "refuse-service-drain-unknown-field.json";
+        let got = parse_node_workloads("rhaddon", &read(f), &images, None);
+        assert_eq!(got.unwrap_err().code(), "unknown_field");
+    }
+
+    #[test]
+    fn routes_from_json_reads_name_to_internal() {
+        let r = routes();
+        assert_eq!(r.get("drain"), Some(&true));
+        assert_eq!(r.get("status"), Some(&false));
+        assert!(routes_from_json(b"nope").is_empty());
     }
 
     #[test]
