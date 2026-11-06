@@ -946,6 +946,64 @@ mod tests {
         assert!(verdict.problem.unwrap().contains("predates signed bundles"));
     }
 
+    /// `rhaddon` pinned with the fixture node-workloads.json. The signed lock
+    /// is recorded without `resolve::check` (which would refuse a bad file),
+    /// as a pin from an older CLI would be. With `worker` the lock carries the
+    /// image the file names (a good bundle); without, the file is bad
+    /// (`image_not_in_lock`). Returns the root and the pin's image refs.
+    fn rh_pinned_root(tag: &str, worker: bool) -> (std::path::PathBuf, Vec<String>) {
+        use crate::addons::resolve::tests::{digest, signed_rh_bundle};
+        let d = scratch(tag);
+        let mut l = lock("1.0.0", &["v0.6.0"], None);
+        if worker {
+            l.images.insert("addon-worker".into(), format!("{ROOT}/worker@{}", digest('2')));
+        }
+        let f = signed_rh_bundle(
+            &l,
+            include_bytes!("../../../tests/fixtures/addons/rhaddon/node-workloads.json"),
+            include_bytes!("../../../tests/fixtures/addons/rhaddon/routes.json"),
+        );
+        let v = crate::addon_lock::verify(&f.lock, &f.sig, &anchor(), "rhaddon").unwrap();
+        resolve::record(&d, "rhaddon", &v, &f, "v0.6.0", None).unwrap();
+        (d, v.lock.images.values().cloned().collect())
+    }
+
+    /// A pinned bundle whose node-workloads.json no longer holds against its
+    /// lock is refused by the launcher's lines, and only a refusal line.
+    /// Reverting the `check_node_workloads` call in `launch_lines` verifies it.
+    #[test]
+    fn launch_lines_refuse_a_bad_node_workloads_json() {
+        let names = vec!["rhaddon".to_string()];
+        let (good, _) = rh_pinned_root("nw-launch-good", true);
+        let lines = launch_lines(&good, "v0.6.0", &names, &|_| Ok(anchor()));
+        assert_eq!(lines[0], "verified rhaddon 1.0.0 v0.6.0", "{lines:?}");
+        let (bad, _) = rh_pinned_root("nw-launch-bad", false);
+        let lines = launch_lines(&bad, "v0.6.0", &names, &|_| Ok(anchor()));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("refuse rhaddon "), "{lines:?}");
+        assert!(lines[0].contains("image_not_in_lock"), "{lines:?}");
+        assert!(lines[0].contains("node-workloads.json"), "{lines:?}");
+    }
+
+    /// The same bad pinned file is a problem for `noo addons verify`. Reverting
+    /// the `check_node_workloads` call in `verify_one` passes the verdict.
+    #[test]
+    fn verify_refuses_a_bad_node_workloads_json() {
+        let ready = |refs: &[String]| FakeDocker {
+            local: refs.to_vec(),
+            ids: refs.iter().map(|r| (r.clone(), "sha256:x".to_string())).collect(),
+            ..Default::default()
+        };
+        let (good, refs) = rh_pinned_root("nw-verify-good", true);
+        let verdict = verify_one(&good, "rhaddon", "v0.6.0", Ok(anchor()), &mut ready(&refs), &[]);
+        assert!(verdict.problem.is_none(), "{:?}", verdict.problem);
+        let (bad, refs) = rh_pinned_root("nw-verify-bad", false);
+        let verdict = verify_one(&bad, "rhaddon", "v0.6.0", Ok(anchor()), &mut ready(&refs), &[]);
+        let problem = verdict.problem.expect("the file is refused");
+        assert!(problem.contains("image_not_in_lock"), "{problem}");
+        assert!(problem.contains("node-workloads.json"), "{problem}");
+    }
+
     #[test]
     fn launch_pins_read_the_given_root_not_the_cwd() {
         let (d, reference) = pinned_root("launch-root");

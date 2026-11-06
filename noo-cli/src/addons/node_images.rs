@@ -156,7 +156,6 @@ pub fn stage(
     images: &[Selected],
     local: &BTreeMap<String, String>,
 ) -> Result<Vec<Staged>, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let mut out = Vec::new();
     for s in images {
         let lref = local
@@ -170,6 +169,8 @@ pub fn stage(
             out.push(Staged { tar, exported: false });
             continue;
         }
+        // Only now, so an image that is not local touches no directory.
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         let part = dir.join(format!("{tar}.part"));
         let _ = std::fs::remove_file(&part);
         if let Err(e) = docker.save(&id, &part) {
@@ -404,10 +405,49 @@ mod tests {
         let e = stage(&mut d, &dir, "rhaddon", "amd64", &selected_worker(), &local()).unwrap_err();
         assert!(e.contains("addon-worker") && e.contains("no space"), "{e}");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
-        // No local image at all: the id cannot be read, and that is an error too.
-        let mut none = FakeDocker::default();
-        assert!(stage(&mut none, &dir, "rhaddon", "amd64", &selected_worker(), &local()).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No local image at all: the id cannot be read, and that is an error
+    /// that exports nothing and pulls nothing. Alone in its own test so the
+    /// failed-save case above cannot fail first.
+    #[test]
+    fn a_missing_local_image_is_an_error_and_exports_nothing() {
+        let dir = tmp("nolocal");
+        let mut none = FakeDocker::default();
+        let e = stage(&mut none, &dir, "rhaddon", "amd64", &selected_worker(), &local())
+            .unwrap_err();
+        assert!(e.contains("No such image"), "{e}");
+        assert!(none.saves.is_empty() && none.pulls.is_empty(), "{:?}", none.saves);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node-workload image the route cannot place under its root is
+    /// refused by `stage_prepared` before any docker call or directory.
+    #[test]
+    fn stage_prepared_refuses_an_image_that_does_not_sit_under_the_route() {
+        let files = BTreeMap::from([
+            (
+                super::super::node_workloads::NODE_WORKLOADS_FILE.to_string(),
+                include_bytes!("../../../tests/fixtures/addons/rhaddon/node-workloads.json")
+                    .to_vec(),
+            ),
+            (
+                super::super::decls::ROUTES_FILE.to_string(),
+                include_bytes!("../../../tests/fixtures/addons/rhaddon/routes.json").to_vec(),
+            ),
+        ]);
+        let route = Route::Proxy {
+            root: "addons.noomesh.ai/example/rhaddon".into(),
+            registry: "ghcr.io/elsewhere".into(),
+        };
+        // No image ids: were the route check gone, stage would fail at the
+        // first lookup, before it touched the host's image directory.
+        let mut d = FakeDocker::default();
+        let e = stage_prepared(&mut d, "rhaddon", &lock_images(), &files, &route).unwrap_err();
+        assert!(e.contains("does not sit under") && e.contains(WORKER), "{e}");
+        assert!(d.saves.is_empty() && d.pulls.is_empty(), "{:?} {:?}", d.saves, d.pulls);
     }
 
     #[test]
