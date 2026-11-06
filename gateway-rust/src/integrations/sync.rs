@@ -563,10 +563,9 @@ pub(crate) async fn page(
 /// the key, not every 10 s. The vault's errors are this crate's own text
 /// (and the secret reader's name, path and reason), never the key itself.
 fn idle_warning(vault: &Result<Vault, Error>, warned: bool) -> Option<String> {
-    match vault {
-        Err(error) if !warned => Some(error.to_string()),
-        _ => None,
-    }
+    // MUTANT: the worker idles silently again.
+    let _ = (vault, warned);
+    None
 }
 
 pub fn spawn(state: Arc<crate::state::AppState>) {
