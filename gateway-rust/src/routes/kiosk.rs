@@ -446,7 +446,10 @@ fn kiosk_tailnet_tag() -> String {
 async fn display(
     State(state): State<Arc<AppState>>,
     ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    // MUTANT: a "convenience" seat parameter.
+    axum::extract::Query(convenience): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
+    let _ = convenience.get("seat");
     let Some(device) = ctx.as_ref().and_then(|axum::Extension(c)| kiosk_device(c)) else {
         return (StatusCode::FORBIDDEN, Json(json!({"error": {"type": "not_a_display",
             "message": "only a kiosk display reads its own settings (operators: noo kiosk seats)"}}))).into_response();
