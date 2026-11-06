@@ -354,6 +354,7 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 | `noo addons verify` | — | Re-verify add-on locks offline and compare local and running images with the pins |
 | `noo addons launch-pins` | `[--root <dir>] <tag> [<name>...]` | Hidden: print verified add-on image pins for the launcher (internal) |
 | `noo addons launch-resources` | `--root <d> --tag <t> --project <p> --network <n> <name>...` | Hidden: write add-ons' declared runtime inputs for the launcher (internal) |
+| `noo addons after-boot` | — | Hidden: once per boot, start enabled add-ons that are down and report each attempt (run by systemd as the install owner) |
 | `noo addons rotate-secret` | `<name> <resource>` | Give an add-on's declared shared secret a new value; restart the add-on to apply |
 
 ### `noo kiosk` — The unattended display's host seat: cage + Chromium showing /kiosk.html

@@ -7792,6 +7792,90 @@ pub fn addons(ctx: &mut Ctx) {
     }
 }
 
+/// Write `body` to the root-owned `path` (root:root 0644) with `sudo tee`:
+/// the content goes over stdin, never through a shell string.
+fn sudo_write_root_file(may_prompt: bool, path: &str, body: &str) -> Result<(), String> {
+    use std::process::Stdio;
+    let mut child = sudo_cmd(may_prompt)
+        .args(["tee", path])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn tee: {e}"))?;
+    if let Some(mut si) = child.stdin.take() {
+        crate::child_stdin::write_child_stdin(&mut si, body.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    }
+    if !child.wait().map(|s| s.success()).unwrap_or(false) {
+        return Err(format!("could not write {path}"));
+    }
+    // tee keeps the owner and mode of a file that was already there.
+    for argv in [["chown", "root:root", path], ["chmod", "644", path]] {
+        let ok = sudo_cmd(may_prompt).args(argv).status().map(|s| s.success()).unwrap_or(false);
+        if !ok {
+            return Err(format!("could not set {path} to root:root 0644"));
+        }
+    }
+    Ok(())
+}
+
+/// Controller only (i509): install `noo-addons-after-boot.service`, the
+/// oneshot that runs `noo addons after-boot` once per boot as the install
+/// owner, and the root-owned record of who that owner is
+/// (`/etc/noo/addons-after-boot.owner`, which the command checks the unit
+/// against). Enabled, not started: it runs at the next boot.
+pub fn install_after_boot_unit(ctx: &mut Ctx) {
+    use crate::commands::addon_after_boot as ab;
+    if ctx.state.mode == "worker" {
+        return;
+    }
+    if !Path::new("/run/systemd/system").is_dir() {
+        ctx.info("No systemd here — skipping the boot-time add-on restart unit.");
+        return;
+    }
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let name = Command::new("id").arg("-un").output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
+    let root = ctx.repo_root.display().to_string();
+    let rendered = ab::render_owner(uid, &name).and_then(|owner| ab::render_unit(&name, &exe, &root).map(|unit| (owner, unit)));
+    let (owner, unit) = match rendered {
+        Ok(r) => r,
+        Err(e) => {
+            ctx.warn(&format!("boot-time add-on restart unit not installed: {e}"));
+            ctx.raw("    Re-run `noo onboard --only addons` as the install owner (not root) to install it.");
+            return;
+        }
+    };
+    let may_prompt = ctx_sudo_may_prompt(ctx);
+    let installed = (|| -> Result<(), String> {
+        let ok = sudo_cmd(may_prompt).args(["install", "-d", "-m", "755", "/etc/noo"]).status().map(|s| s.success()).unwrap_or(false);
+        if !ok {
+            return Err("could not create /etc/noo".into());
+        }
+        sudo_write_root_file(may_prompt, ab::OWNER_PATH, &owner)?;
+        sudo_write_root_file(may_prompt, ab::UNIT_PATH, &unit)?;
+        for argv in [["systemctl", "daemon-reload"], ["systemctl", "enable"]] {
+            let mut c = sudo_cmd(may_prompt);
+            c.args(argv);
+            if argv[1] == "enable" {
+                c.arg(ab::UNIT_NAME);
+            }
+            if !c.status().map(|s| s.success()).unwrap_or(false) {
+                return Err(format!("`sudo {}` failed", argv.join(" ")));
+            }
+        }
+        Ok(())
+    })();
+    match installed {
+        Ok(()) => ctx.success(&format!("{} is enabled: after a reboot, enabled add-ons that are down are started once.", ab::UNIT_NAME)),
+        Err(e) => {
+            ctx.warn(&format!("boot-time add-on restart unit not installed: {e}"));
+            ctx.raw("    After a reboot, start a down add-on yourself with `noo stack restart <addon>`; or re-run `noo onboard --only addons`.");
+            sudo_refused(ctx, "boot-time add-on restart unit", "noo onboard --only addons");
+        }
+    }
+}
+
 /// The summary's add-on lines: what is on, and for licensed ones whether
 /// the gateway will actually honour it.
 pub fn addons_summary(ctx: &Ctx) -> Vec<String> {
