@@ -4,6 +4,8 @@
 package heartbeat
 
 import (
+	"runtime"
+
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
 	"github.com/noomesh/noomesh/node-agent-go/internal/backendleaves"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
@@ -167,6 +169,7 @@ var heartbeatSections = []payloadSection{
 	secLanes,
 	secGPUContention,
 	secModelSets,
+	secNodeFacts,
 }
 
 // Heartbeat-only sections.
@@ -186,6 +189,16 @@ var (
 		// read: an empty list would say "holds none", which is a claim.
 		if ms := r.modelSetsReport(); ms != nil {
 			p["model_sets"] = ms
+		}
+	}}
+
+	secNodeFacts = payloadSection{name: "nodeFacts", add: func(r *Reporter, p map[string]any) {
+		// i300 F5b. `os` is what this binary was built for, always known.
+		// Every other key comes from the provider and is OMITTED when its
+		// probe failed: an error must not become a fact (the i495 rule).
+		p["os"] = runtime.GOOS
+		for k, v := range r.nodeFactsReport() {
+			p[k] = v
 		}
 	}}
 

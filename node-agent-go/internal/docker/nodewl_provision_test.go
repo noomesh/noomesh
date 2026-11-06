@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -48,6 +49,71 @@ type fakeProv struct {
 	calls   []string
 	created map[string]createSpec
 	volumes int
+
+	// F5b. The lifecycle runs goroutines (release, readiness watch), so the
+	// fake is guarded; tests read it through the locked helpers.
+	mu    sync.Mutex
+	clock func() time.Time
+}
+
+func (f *fakeProv) ctr(name string) *ctrInfo {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if c := f.ctrs[name]; c != nil {
+		cp := *c
+		return &cp
+	}
+	return nil
+}
+
+func (f *fakeProv) callList() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
+}
+
+func (f *fakeProv) has(call string) bool {
+	for _, c := range f.callList() {
+		if c == call {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fakeProv) setCtr(name string, fn func(c *ctrInfo)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if c := f.ctrs[name]; c != nil {
+		fn(c)
+	}
+}
+
+func (f *fakeProv) StartContainer(_ context.Context, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "start:"+name)
+	c := f.ctrs[name]
+	if c == nil {
+		return errors.New("no such container")
+	}
+	c.Running, c.Status = true, "running"
+	if f.clock != nil {
+		c.StartedAt = f.clock()
+	} else {
+		c.StartedAt = time.Now()
+	}
+	return nil
+}
+
+func (f *fakeProv) StopContainer(_ context.Context, name string, _ int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "stop:"+name)
+	if c := f.ctrs[name]; c != nil {
+		c.Running, c.Status = false, "exited"
+	}
+	return nil
 }
 
 func newFakeProv() *fakeProv {
@@ -68,19 +134,23 @@ func (f *fakeProv) LoadImage(_ context.Context, _ *os.File) ([]string, error) {
 	return f.loadIDs, nil
 }
 func (f *fakeProv) InspectContainer(_ context.Context, name string) (*ctrInfo, error) {
-	return f.ctrs[name], nil
+	return f.ctr(name), nil
 }
 func (f *fakeProv) CreateContainer(_ context.Context, s createSpec) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, "create:"+s.Name)
 	f.created[s.Name] = s
 	l := map[string]string{}
 	for k, v := range s.Config.Labels {
 		l[k] = v
 	}
-	f.ctrs[s.Name] = &ctrInfo{ID: "id-" + s.Name, Labels: l, IPs: map[string]string{WorkloadNetworkName("rhaddon", "worker"): "172.30.0.2"}}
+	f.ctrs[s.Name] = &ctrInfo{ID: "id-" + s.Name, Labels: l, Status: "created", IPs: map[string]string{WorkloadNetworkName("rhaddon", "worker"): "172.30.0.2"}}
 	return nil
 }
 func (f *fakeProv) RemoveContainer(_ context.Context, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if _, ok := f.ctrs[name]; ok {
 		f.calls = append(f.calls, "rm:"+name)
 	}
@@ -91,11 +161,15 @@ func (f *fakeProv) InspectNetwork(_ context.Context, name string) (*netInfo, err
 	return f.nets[name], nil
 }
 func (f *fakeProv) CreateInternalNetwork(_ context.Context, name string, labels map[string]string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, "net:"+name)
 	f.nets[name] = &netInfo{Internal: true, Labels: labels}
 	return nil
 }
 func (f *fakeProv) RemoveNetwork(_ context.Context, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if _, ok := f.nets[name]; ok {
 		f.calls = append(f.calls, "rmnet:"+name)
 	}

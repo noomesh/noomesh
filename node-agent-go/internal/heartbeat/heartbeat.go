@@ -141,6 +141,12 @@ type Reporter struct {
 	// hence the atomic.
 	modelSets atomic.Pointer[func() any]
 
+	// nodeFacts supplies the i300 F5b keys: the node facts, the consent policy
+	// and approvals, and `node_workloads`. It returns only the keys it knows;
+	// everything absent is omitted. nil = not wired. Installed after the loop
+	// starts, hence the atomic.
+	nodeFacts atomic.Pointer[func() map[string]any]
+
 	// Capabilities as reported at registration, echoed on EVERY heartbeat.
 	//
 	// These used to be sent once, at Register, and the controller kept them
@@ -364,6 +370,20 @@ func (r *Reporter) SetModelSets(f func() any) { r.modelSets.Store(&f) }
 
 func (r *Reporter) modelSetsReport() any {
 	f := r.modelSets.Load()
+	if f == nil || *f == nil {
+		return nil
+	}
+	return (*f)()
+}
+
+// SetNodeFacts installs the provider of the node-workload heartbeat keys
+// (gpu_compute_cap, nvidia_runtime, controller_host, data_root_free_gb,
+// addon_workloads_policy, addon_workloads_approvals, node_workloads). A key the
+// provider does not return is omitted, never defaulted.
+func (r *Reporter) SetNodeFacts(f func() map[string]any) { r.nodeFacts.Store(&f) }
+
+func (r *Reporter) nodeFactsReport() map[string]any {
+	f := r.nodeFacts.Load()
 	if f == nil || *f == nil {
 		return nil
 	}
