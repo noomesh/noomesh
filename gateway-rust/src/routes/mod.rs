@@ -36,6 +36,7 @@ mod intelligence;
 // The unattended display's read surface: projections of the routes above,
 // shaped to what one screen draws.
 mod addon_access;
+mod addon_boot_start;
 mod addon_token;
 mod kiosk;
 mod reservations;
@@ -363,6 +364,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(traces::router())
         .merge(addon_token::router())
         .merge(addon_access::router())
+        .merge(addon_boot_start::router())
         .merge(kiosk::router())
         .merge(identity::router())
         .merge(operator_certs::router())

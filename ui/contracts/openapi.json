@@ -20882,6 +20882,40 @@
           }
         }
       }
+    },
+    "/api/addons/{addon}/boot-start": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create boot start",
+        "description": "[native] Report an add-on's start after a reboot (`noo addons after-boot`): `failed` raises a persisting `addon.boot_start_failed` alert naming `noo stack restart <addon>`, `started` clears it. Operator or above.",
+        "operationId": "boot_start",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
