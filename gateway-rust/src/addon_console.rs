@@ -257,6 +257,46 @@ mod tests {
         ))
         .is_ok());
     }
+    #[tokio::test]
+    async fn shell_headers_survive_security_headers_middleware() {
+        let expected = shell_headers(
+            Some("https://mesh.test:8458"),
+            &[
+                addon_manifest::FramePermission::Microphone,
+                addon_manifest::FramePermission::Autoplay,
+            ],
+            None,
+        );
+        let returned = expected.clone();
+        // Exercise the actual middleware without AppState or a test route that
+        // could be mistaken for a production endpoint by OpenAPI discovery.
+        let app = Router::new()
+            .fallback(move || {
+                let headers = returned.clone();
+                async move { (headers, "shell") }
+            })
+            .layer(axum::middleware::from_fn(
+                crate::middleware::security_headers,
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/",
+            listener.local_addr().unwrap().port()
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let response = reqwest::Client::new().get(url).send().await.unwrap();
+        server.abort();
+        assert_eq!(response.status(), StatusCode::OK);
+        for name in ["permissions-policy", "content-security-policy"] {
+            assert_eq!(
+                response.headers().get(name),
+                expected.get(name),
+                "middleware overwrote {name}"
+            );
+        }
+        assert_eq!(response.headers()["x-frame-options"], "DENY");
+    }
+
     #[test]
     fn delegates_only_signed_capabilities_to_the_exact_origin() {
         let permissions = [
