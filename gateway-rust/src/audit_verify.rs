@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::AppState;
+use crate::state::AppState;
 
 pub const LOOP_NAME: &str = "audit_verify";
 /// Six hours: one read of the whole audit table per run.

@@ -111,16 +111,15 @@ pub fn queued() -> usize {
 /// lost evidence, so `AuditSpoolRowsLost` pages on any increase.
 pub fn metrics_text() -> String {
     format!(
-        "# HELP noo_audit_spool_lost_total Audit rows lost since the gateway started (spool overflow or unrecoverable).
-         # TYPE noo_audit_spool_lost_total counter
-         noo_audit_spool_lost_total {}
-         # HELP noo_audit_spool_depth Audit rows held in the spool now, waiting for the database.
-         # TYPE noo_audit_spool_depth gauge
-         noo_audit_spool_depth {}
-         # HELP noo_audit_spool_capacity Audit rows the spool can hold before it loses one.
-         # TYPE noo_audit_spool_capacity gauge
-         noo_audit_spool_capacity {}
-",
+        "# HELP noo_audit_spool_lost_total Audit rows lost since the gateway started (spool overflow or unrecoverable).\n\
+         # TYPE noo_audit_spool_lost_total counter\n\
+         noo_audit_spool_lost_total {}\n\
+         # HELP noo_audit_spool_depth Audit rows held in the spool now, waiting for the database.\n\
+         # TYPE noo_audit_spool_depth gauge\n\
+         noo_audit_spool_depth {}\n\
+         # HELP noo_audit_spool_capacity Audit rows the spool can hold before it loses one.\n\
+         # TYPE noo_audit_spool_capacity gauge\n\
+         noo_audit_spool_capacity {}\n",
         LOST_TOTAL.load(Ordering::Relaxed),
         queued(),
         CAP
