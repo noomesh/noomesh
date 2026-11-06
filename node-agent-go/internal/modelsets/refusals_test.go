@@ -201,6 +201,35 @@ func TestSetFileDestAppliesTheMountPathRule(t *testing.T) {
 
 // ---- Fetch: what is on disk after the transfer --------------------------
 
+// within is the containment guard behind ValidSetPath / ValidSetRef; both mask
+// it today, so it is pinned here directly. A path is judged lexically (Rel
+// cleans it), so one that cleans back inside the dir is inside.
+func TestWithinRefusesEverythingOutsideTheDir(t *testing.T) {
+	dir := filepath.FromSlash("/a/b")
+	for _, c := range []struct {
+		p    string
+		want bool
+	}{
+		{"/a/b", false}, // the dir itself is not a file under it
+		{"/a", false},
+		{"/a/b/..", false},
+		{"/a/b/../x", false},
+		{"/a/b/../../x", false},
+		{"/a/bc/x", false}, // shares a prefix, is not under it
+		{"/a/bc", false},
+		{"/x/y", false},
+		{"/", false},
+		{"x/y", false}, // relative against an absolute dir
+		{"/a/b/x", true},
+		{"/a/b/v/x.pt", true},
+		{"/a/b/v/../x", true}, // cleans back inside
+	} {
+		if got := within(dir, filepath.FromSlash(c.p)); got != c.want {
+			t.Errorf("within(%q, %q) = %v, want %v", dir, c.p, got, c.want)
+		}
+	}
+}
+
 // planting returns a Files fetcher that does the real download, then lets the
 // test do something to the directory.
 func planting(r *rig, after func(dest string)) fetcherFunc {
