@@ -44,6 +44,13 @@ const (
 	LabelReservation = "noo.reservation"
 	RoleDoor         = "door"
 	RoleWorker       = "worker"
+
+	// The worker container's drain config, so a workload that desired-config
+	// no longer lists (an orphan) can still be drained, even after an agent
+	// restart.
+	LabelDrainPath    = "noo.drain-path"
+	LabelDrainDone    = "noo.drain-done-path"
+	LabelDrainTimeout = "noo.drain-timeout-secs"
 )
 
 // Resource floor of the door sidecar. stunnel is tiny; the numbers only stop a
@@ -187,6 +194,16 @@ func baseLabels(e nodewl.Entry, role string) map[string]string {
 	return l
 }
 
+// workerLabels are the worker container's labels: the base ones and its drain
+// config (read back for an orphan, see NodeWorkloads.ReleaseOrphans).
+func workerLabels(e nodewl.Entry) map[string]string {
+	l := baseLabels(e, RoleWorker)
+	l[LabelDrainPath] = e.Drain.Path
+	l[LabelDrainDone] = e.Drain.DonePath
+	l[LabelDrainTimeout] = strconv.FormatInt(e.Drain.TimeoutSecs, 10)
+	return l
+}
+
 // scratchMounts are the writable places a worker has. A tmpfs_mb entry is a
 // tmpfs of that size. A max_mb entry is a per-workload named volume of the
 // local driver backed by a tmpfs of that size: Docker's local driver cannot
@@ -273,7 +290,7 @@ func buildWorker(in specInput) (createSpec, error) {
 		User:   strconv.FormatInt(d.UID, 10),
 		Env:    env,
 		Cmd:    d.Command,
-		Labels: baseLabels(e, RoleWorker),
+		Labels: workerLabels(e),
 	}
 	return createSpec{Name: WorkloadContainerName(e.Addon, e.Name), Config: cfg, Host: host}, nil
 }

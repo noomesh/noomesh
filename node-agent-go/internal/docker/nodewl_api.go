@@ -191,6 +191,41 @@ func (d dockerProvAPI) RemoveVolumes(ctx context.Context, addon, workload string
 	return nil
 }
 
+// ListManaged finds this agent's workloads by the noo.managed-by=agent label
+// alone: the door, the worker, in any state.
+func (d dockerProvAPI) ListManaged(ctx context.Context) ([]managedRef, error) {
+	ctrs, err := d.c.listContainers(ctx, client.ContainerListOptions{
+		All:     true,
+		Filters: make(client.Filters).Add("label", LabelManagedBy+"="+ManagedByAgent),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list containers: %w", err)
+	}
+	byKey := map[string]*managedRef{}
+	var order []string
+	for _, c := range ctrs {
+		addon, name := c.Labels[LabelAddon], c.Labels[LabelWorkload]
+		if addon == "" || name == "" {
+			continue
+		}
+		k := wlKey(addon, name)
+		ref := byKey[k]
+		if ref == nil {
+			ref = &managedRef{Addon: addon, Name: name}
+			byKey[k] = ref
+			order = append(order, k)
+		}
+		if c.Labels[LabelRole] == RoleWorker {
+			ref.Labels = c.Labels
+		}
+	}
+	out := make([]managedRef, 0, len(order))
+	for _, k := range order {
+		out = append(out, *byKey[k])
+	}
+	return out, nil
+}
+
 func (d dockerProvAPI) NvidiaRuntime(ctx context.Context) bool {
 	return d.c.nvidiaRuntimeRegistered(ctx)
 }

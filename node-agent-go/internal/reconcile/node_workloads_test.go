@@ -25,6 +25,7 @@ type fakeNW struct {
 	converged []string
 	refused   map[string]string
 	retained  map[string]bool
+	swept     []map[string]bool // the keep set of each orphan sweep
 	read      bool
 	rows      []dockerpkg.Row
 	managed   bool
@@ -49,7 +50,12 @@ func (f *fakeNW) Refuse(addon, name string, err error) {
 }
 func (f *fakeNW) Retain(keep map[string]bool) { f.mu.Lock(); f.retained = keep; f.mu.Unlock() }
 func (f *fakeNW) MarkRead()                   { f.mu.Lock(); f.read = true; f.mu.Unlock() }
-func (f *fakeNW) Rows() []dockerpkg.Row       { return f.rows }
+func (f *fakeNW) ReleaseOrphans(_ context.Context, keep map[string]bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.swept = append(f.swept, keep)
+}
+func (f *fakeNW) Rows() []dockerpkg.Row { return f.rows }
 func (f *fakeNW) IsManaged(context.Context, string, string) (bool, error) {
 	return f.managed, nil
 }
@@ -138,6 +144,67 @@ func TestUnreadableDesiredTouchesNothing(t *testing.T) {
 	r.nwWG.Wait()
 	if len(nw.converged) != 0 || nw.read || nw.retained != nil {
 		t.Fatalf("an unreadable fragment moved the lifecycle: %+v", nw)
+	}
+}
+
+// ---- orphans (i300 F5b): the reconciler's half --------------------------------
+
+// A desired-config that read and parsed sweeps for orphans with the keys it
+// lists, an explicit empty list included. The sweep is the lifecycle's; this
+// pins that the reconciler asks for it, with the right keep set.
+func TestASuccessfulReadSweepsForOrphansWithTheListedKeys(t *testing.T) {
+	for name, tc := range map[string]struct {
+		raw  json.RawMessage
+		keep int
+	}{"listed rows": {fixture(t), 2}, "explicit empty list": {json.RawMessage(`[]`), 0}} {
+		t.Run(name, func(t *testing.T) {
+			nw := &fakeNW{}
+			r := nwRig(t, nw)
+			r.convergeNodeWorkloads(context.Background(), &tick{desired: &desiredConfig{NodeWorkloads: tc.raw}})
+			r.nwWG.Wait()
+			if len(nw.swept) != 1 || len(nw.swept[0]) != tc.keep {
+				t.Fatalf("sweeps = %v, want one with %d keys", nw.swept, tc.keep)
+			}
+		})
+	}
+}
+
+// A read that failed, a body that is not desired-config, a fragment that does
+// not parse, and a row whose name cannot be read all say nothing about what is
+// wanted: none of them may sweep (the i495 rule).
+func TestAFailedOrUnparseableReadSweepsNothing(t *testing.T) {
+	t.Run("the fetch fails", func(t *testing.T) {
+		for name, h := range map[string]http.HandlerFunc{
+			"HTTP 500":      func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "no", 500) },
+			"not JSON":      func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("<html>")) },
+			"cut off reply": func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"node_workloads":[`)) },
+		} {
+			t.Run(name, func(t *testing.T) {
+				srv := httptest.NewServer(h)
+				defer srv.Close()
+				nw := &fakeNW{}
+				r := &Reconciler{cfg: &config.Config{NodeID: "node-a", ControllerURL: srv.URL}, client: srv.Client(), nodeWL: nw}
+				r.Once(context.Background())
+				r.nwWG.Wait()
+				if len(nw.swept) != 0 || len(nw.converged) != 0 || nw.read {
+					t.Fatalf("a failed read moved the lifecycle: %+v", nw)
+				}
+			})
+		}
+	})
+	for name, raw := range map[string]json.RawMessage{
+		"a fragment that is not a list": json.RawMessage(`{"not":"a list"}`),
+		"a row with no name":            json.RawMessage(`[{"addon":"rhaddon"}]`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			nw := &fakeNW{}
+			r := nwRig(t, nw)
+			r.convergeNodeWorkloads(context.Background(), &tick{desired: &desiredConfig{NodeWorkloads: raw}})
+			r.nwWG.Wait()
+			if len(nw.swept) != 0 {
+				t.Fatalf("an untrustworthy list swept for orphans: %v", nw.swept)
+			}
+		})
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,15 +42,16 @@ import (
 //   - Nothing here blocks the reconcile pass. A drain and a readiness wait run
 //     on goroutines the pass starts.
 
-// DrainCompletion is the rule that says a worker has finished draining. The
-// contract defines `drain.path` (POSTed through the door) and
-// `drain.timeout_secs`, and no completion signal, so this agent assumes the
-// least that is still a signal: the drain POST itself. The worker is drained
-// when that POST returns 2xx within drain.timeout_secs; the worker therefore
-// has to hold the response until it is drained. Any other outcome (a timeout,
-// a refused connection, a non-2xx answer) is "not drained". See the PR body:
-// this is an open contract question.
-const DrainCompletion = "the drain POST returns 2xx within drain.timeout_secs"
+// DrainCompletion is the rule that says a worker has finished draining
+// (docs/reference/node-workloads.md, "The worker's drain"). A 2xx answer to the
+// drain POST only means the drain was ACCEPTED; the worker is drained when
+// GET drain.done_path answers 200, polled every drainPollEvery. Anything else
+// (a non-200, a connection error, an unreachable door) is "not yet".
+// drain.timeout_secs bounds the whole drain, the POST plus the polling.
+const DrainCompletion = "GET drain.done_path answers 200 within drain.timeout_secs"
+
+// drainPollEvery is how often done_path is polled.
+const drainPollEvery = 2 * time.Second
 
 // stopGrace is the SIGTERM grace for a worker that has already drained.
 const stopGrace = 30
@@ -120,9 +122,10 @@ type lifeCycle struct {
 	// replace it; NewNodeWorkloads sets the mTLS one.
 	doorCall func(ctx context.Context, addr, serverName, method, path string) (int, error)
 
-	now      func() time.Time
-	pollFast time.Duration // readiness poll until ready or timed out
-	pollSlow time.Duration // after that, and once ready
+	now       func() time.Time
+	pollFast  time.Duration // readiness poll until ready or timed out
+	pollSlow  time.Duration // after that, and once ready
+	pollDrain time.Duration // done_path poll; drainPollEvery when zero
 
 	mu    sync.Mutex
 	lives map[string]*lifeState
@@ -247,15 +250,58 @@ func (p *NodeWorkloads) MarkRead() {
 }
 
 // Retain drops the rows of workloads that desired-config no longer lists
-// (keep holds their addon/name keys). It touches no container.
+// (keep holds their addon/name keys). It touches no container. A row that is
+// mid-release or needs attention stays: it is still on the node and still
+// being reported.
 func (p *NodeWorkloads) Retain(keep map[string]bool) {
 	lc := p.lc0()
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
 	for k, ls := range lc.lives {
-		if !keep[k] && !ls.releasing {
+		if !keep[k] && !ls.releasing && ls.state != nodewl.StateNeedsAttention {
 			delete(lc.lives, k)
 		}
+	}
+}
+
+// ReleaseOrphans treats every workload this agent created and that keep (the
+// addon/name keys desired-config lists) does not name as `absent`: a running
+// worker is drained first, then everything is removed. It must be called only
+// after a desired-config read that SUCCEEDED and parsed (the i495 rule): a
+// failed or unparseable read says nothing about what is wanted, and must never
+// reach here. Containers are found by the noo.managed-by=agent label, not by
+// memory, so an agent restart forgets nothing.
+//
+// The drain config comes from the last desired entry this process saw, else
+// from the labels the worker was created with. A worker with neither cannot be
+// drained, so it is not stopped: it ends needs_attention / drain_timeout.
+func (p *NodeWorkloads) ReleaseOrphans(ctx context.Context, keep map[string]bool) {
+	refs, err := p.api.ListManaged(ctx)
+	if err != nil {
+		slog.Warn("node workload: cannot list the workloads on the node; removing none", "error", err)
+		return
+	}
+	for _, ref := range refs {
+		if keep[wlKey(ref.Addon, ref.Name)] {
+			continue
+		}
+		e := orphanEntry(ref)
+		if cur, ok := p.read(ref.Addon, ref.Name); ok && cur.hasEntry {
+			e = cur.entry
+			e.State, e.Reservation = nodewl.StateAbsent, nil
+		}
+		slog.Info("node workload no longer in desired-config; removing", "addon", ref.Addon, "workload", ref.Name)
+		p.Converge(ctx, e)
+	}
+}
+
+// orphanEntry is an `absent` entry that carries only what removal needs: the
+// name and the drain config the worker was labelled with.
+func orphanEntry(ref managedRef) nodewl.Entry {
+	secs, _ := strconv.ParseInt(ref.Labels[LabelDrainTimeout], 10, 64)
+	return nodewl.Entry{
+		Addon: ref.Addon, Name: ref.Name, State: nodewl.StateAbsent,
+		Drain: nodewl.Drain{Path: ref.Labels[LabelDrainPath], DonePath: ref.Labels[LabelDrainDone], TimeoutSecs: secs},
 	}
 }
 
@@ -604,13 +650,20 @@ func (p *NodeWorkloads) release(ctx context.Context, e nodewl.Entry, then releas
 		return fmt.Errorf("inspect %s: %w", workerName, err)
 	}
 	if ours(w) && w.Running {
-		if err := p.drain(ctx, e); err != nil {
-			// Not drained: the worker is NOT stopped.
+		switch err := p.drain(ctx, e); {
+		case err == nil:
+			if err := p.api.StopContainer(ctx, workerName, stopGrace); err != nil {
+				return fmt.Errorf("stop %s: %w", workerName, err)
+			}
+		case errors.Is(err, errWorkerExited):
+			// It is gone, so there is nothing to wait for or to stop: report
+			// the crash and go on to recreate it fresh and stopped.
+			slog.Warn("node workload: the worker exited during its drain", "addon", e.Addon, "workload", e.Name)
+			p.with(e.Addon, e.Name, func(ls *lifeState) { ls.state, ls.ready, ls.reason = nodewl.StateRunning, false, nodewl.ReasonCrashed })
+		default:
+			// Not drained (only a timeout gets here): the worker is NOT stopped.
 			p.setState(e, nodewl.StateNeedsAttention, nodewl.ReasonDrainTimeout)
 			return err
-		}
-		if err := p.api.StopContainer(ctx, workerName, stopGrace); err != nil {
-			return fmt.Errorf("stop %s: %w", workerName, err)
 		}
 	}
 	if then == thenDeprovision {
@@ -638,31 +691,81 @@ func (p *NodeWorkloads) release(ctx context.Context, e nodewl.Entry, then releas
 	return nil
 }
 
-// drain POSTs drain.path through the door and returns nil only when the call
-// returns 2xx within drain.timeout_secs (DrainCompletion).
+// drain drains the worker through the door (DrainCompletion). It POSTs
+// drain.path until a 2xx says the drain was accepted (the endpoint is
+// idempotent, so a refused or unanswered POST is simply sent again), reports
+// the row `draining` from then on, and polls GET drain.done_path until it
+// answers 200. Every other outcome of a call is "not yet". It returns nil only
+// on that 200, errWorkerExited if the worker is gone, and ErrDrainIncomplete
+// when drain.timeout_secs, which bounds the POST and the polling together,
+// runs out.
 func (p *NodeWorkloads) drain(ctx context.Context, e nodewl.Entry) error {
 	if p.lc.doorCall == nil {
 		return fmt.Errorf("%w: no door client", ErrDrainIncomplete)
 	}
-	addr, err := p.DoorAddr(ctx, e.Addon, e.Name)
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrDrainIncomplete, err)
-	}
 	dctx, cancel := context.WithTimeout(ctx, time.Duration(e.Drain.TimeoutSecs)*time.Second)
 	defer cancel()
-	code, err := p.lc.doorCall(dctx, addr, WorkloadDoorName(e.Addon, e.Name), http.MethodPost, e.Drain.Path)
-	if err != nil {
-		return fmt.Errorf("%w: POST %s: %v", ErrDrainIncomplete, e.Drain.Path, err)
+	every := p.lc.pollDrain
+	if every <= 0 {
+		every = drainPollEvery
 	}
-	if code < 200 || code > 299 {
-		return fmt.Errorf("%w: POST %s answered HTTP %d", ErrDrainIncomplete, e.Drain.Path, code)
+	workerName := WorkloadContainerName(e.Addon, e.Name)
+	accepted := false
+	last := "no answer yet"
+	for {
+		if w, err := p.api.InspectContainer(dctx, workerName); err == nil && (!ours(w) || !w.Running) {
+			return errWorkerExited
+		}
+		if !accepted {
+			code, err := p.callDoor(dctx, e, http.MethodPost, e.Drain.Path)
+			switch {
+			case err != nil:
+				last = fmt.Sprintf("POST %s: %v", e.Drain.Path, err)
+			case code < 200 || code > 299:
+				last = fmt.Sprintf("POST %s answered HTTP %d", e.Drain.Path, code)
+			default:
+				accepted = true
+				p.setState(e, nodewl.StateDraining, "")
+			}
+		}
+		if accepted {
+			code, err := p.callDoor(dctx, e, http.MethodGet, e.Drain.DonePath)
+			switch {
+			case err != nil:
+				last = fmt.Sprintf("GET %s: %v", e.Drain.DonePath, err)
+			case code == http.StatusOK:
+				return nil
+			default:
+				last = fmt.Sprintf("GET %s answered HTTP %d", e.Drain.DonePath, code)
+			}
+		}
+		select {
+		case <-dctx.Done():
+			return fmt.Errorf("%w within %d s (%s)", ErrDrainIncomplete, e.Drain.TimeoutSecs, last)
+		case <-time.After(every):
+		}
 	}
-	return nil
 }
 
-// ErrDrainIncomplete: the worker was not drained (DrainCompletion not met). The
-// worker is left running.
+// callDoor is one call through the worker's door, capped at 5 s so a hung
+// answer cannot outlast a poll by much. A door that cannot be found is an
+// error like any other failed call.
+func (p *NodeWorkloads) callDoor(ctx context.Context, e nodewl.Entry, method, path string) (int, error) {
+	addr, err := p.DoorAddr(ctx, e.Addon, e.Name)
+	if err != nil {
+		return 0, err
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return p.lc.doorCall(cctx, addr, WorkloadDoorName(e.Addon, e.Name), method, path)
+}
+
+// ErrDrainIncomplete: the worker was not drained in time (DrainCompletion not
+// met). The worker is left running.
 var ErrDrainIncomplete = errors.New("the worker did not finish draining")
+
+// errWorkerExited: the worker stopped running during its drain.
+var errWorkerExited = errors.New("the worker exited during its drain")
 
 // ---- the actuator's entry points ---------------------------------------
 

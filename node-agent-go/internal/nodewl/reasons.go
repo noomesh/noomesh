@@ -3,6 +3,11 @@
 
 package nodewl
 
+// StateDraining is the state a heartbeat row reports (never a desired state)
+// from the accepted drain POST until the done poll answers 200 or the drain
+// times out.
+const StateDraining = "draining"
+
 // StateNeedsAttention is the state a heartbeat row reports (never a desired
 // state) when a drain did not finish: reason drain_timeout, worker untouched.
 const StateNeedsAttention = "needs_attention"

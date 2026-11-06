@@ -25,6 +25,7 @@ type nodeWorkloads interface {
 	Converge(ctx context.Context, e nodewl.Entry)
 	Refuse(addon, name string, err error)
 	Retain(keep map[string]bool)
+	ReleaseOrphans(ctx context.Context, keep map[string]bool)
 	MarkRead()
 	Rows() []dockerpkg.Row
 	IsManaged(ctx context.Context, addon, name string) (bool, error)
@@ -79,6 +80,8 @@ func newNodeWorkloads(cfg *config.Config, docker *dockerpkg.Client, sets *models
 //     the rows of workloads no longer listed are dropped and `node_workloads`
 //     is reported as a known-empty list.
 //   - desired-config that does not validate as a whole: nothing is touched.
+//   - A read that succeeded and parsed, but no longer lists a workload this
+//     agent created: that workload is `absent` (drained first if running).
 //   - A row that does not validate is refused alone, with its own reason; the
 //     others converge.
 //   - Each workload converges on its own goroutine, one at a time per
@@ -103,6 +106,17 @@ func (r *Reconciler) convergeNodeWorkloads(ctx context.Context, t *tick) bool {
 			continue
 		}
 		r.goConverge(ctx, row.Entry)
+	}
+	// Reached only when desired-config was read AND parsed as a whole: a
+	// failed or unparseable read returned above and removes nothing (i495).
+	// A workload this agent created that the list no longer names is `absent`.
+	// A row whose addon/name cannot be read is skipped by the parser; it may
+	// name a workload on this node, so the sweep waits for a list it can trust.
+	var listed []json.RawMessage
+	if json.Unmarshal(t.desired.NodeWorkloads, &listed) == nil && len(listed) == len(rows) {
+		r.nodeWL.ReleaseOrphans(ctx, keep)
+	} else {
+		slog.Warn("reconcile.node_workloads_row_unnameable; removing no orphan this pass")
 	}
 	r.nodeWL.Retain(keep)
 	return true
