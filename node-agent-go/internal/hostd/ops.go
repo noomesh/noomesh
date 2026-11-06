@@ -181,7 +181,9 @@ func opRecreate(ctx context.Context, e *Engine, name string, c *Command) (int, s
 	// ("required by secret … is not set") — a `Created` stub where a
 	// working service was. load_secrets also derives the pgpass bodies.
 	args := append(e.composeArgs(), "up", "-d", "--force-recreate", "--", c.Service)
-	bin, wrapped := withSecrets(e.Root, "docker", args...)
+	// withComposeSecrets: `up` publishes ports, so it resolves the
+	// cluster-plane bind like the launchers (i515a).
+	bin, wrapped := withComposeSecrets(e.Root, "docker", args...)
 	rc, stderr := e.Runner.Run(ctx, e.Root, nil, bin, wrapped...)
 	if rc != 0 || !c.HealthCheck {
 		return rc, stderr

@@ -1117,3 +1117,81 @@ func (c cancelAfterRun) Run(ctx context.Context, dir string, env []string, name 
 	c.cancel()
 	return rc, se
 }
+
+// ── i515a: a recreate resolves the cluster-plane bind ──────────────────────
+
+// A spooled recreate re-renders compose and publishes ports, so it must
+// resolve NOO_BIND_ADDR the way the launchers do, BEFORE the secrets: the
+// launcher never writes the address to .env, and without it the service was
+// republished on the compose default (0.0.0.0, now 127.0.0.1).
+func TestRecreateResolvesTheBindBeforeTheSecrets(t *testing.T) {
+	e, fr := testEngine(t)
+	if r := queue(t, e, "c", Command{Op: "recreate", Service: "gateway"}); !r.OK {
+		t.Fatalf("recreate failed: %+v", r)
+	}
+	got := fr.joined()[0]
+	bind := strings.Index(got, "lib-bind-addr.sh")
+	resolve := strings.Index(got, "resolve_bind_addr")
+	secrets := strings.Index(got, "load_secrets")
+	if bind < 0 || resolve < 0 {
+		t.Fatalf("recreate does not resolve the cluster-plane bind\n  got: %s", got)
+	}
+	if !(bind < resolve && resolve < secrets) {
+		t.Errorf("the bind must be resolved before the secrets are written\n  got: %s", got)
+	}
+}
+
+// Only the compose render takes the bind: a backup publishes nothing and must
+// not be refused over an unset bind mode.
+func TestBackupDoesNotResolveTheBind(t *testing.T) {
+	_, args := withSecrets("/r", "/r/scripts/backup-controller.sh")
+	if strings.Contains(strings.Join(args, " "), "resolve_bind_addr") {
+		t.Errorf("a backup resolves the bind: %v", args)
+	}
+}
+
+// Run for real: a bind that cannot be resolved stops the script before the
+// secrets are loaded and before the command runs, with the reason on stderr.
+func TestAnUnresolvedBindStopsTheRecreateBeforeTheCommand(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("no bash")
+	}
+	root := t.TempDir()
+	scripts := filepath.Join(root, "scripts")
+	if err := os.MkdirAll(scripts, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(root, "ran")
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(scripts, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("lib-bind-addr.sh", "resolve_bind_addr() { echo 'ERROR: NOO_BIND_MODE is not set' >&2; return 1; }\n")
+	write("lib-secrets.sh", "load_secrets() { touch '"+marker+".secrets'; }\n")
+	write("lib-config.sh", "load_config() { :; }\n")
+
+	name, args := withComposeSecrets(root, "touch", marker)
+	out, err := exec.Command(name, args...).CombinedOutput()
+	if err == nil {
+		t.Fatalf("an unresolved bind did not stop the script; output: %s", out)
+	}
+	if !strings.Contains(string(out), "NOO_BIND_MODE is not set") || !strings.Contains(string(out), "refusing") {
+		t.Errorf("the refusal does not explain itself: %s", out)
+	}
+	for _, p := range []string{marker, marker + ".secrets"} {
+		if _, err := os.Stat(p); err == nil {
+			t.Errorf("%s exists: the script went past the bind refusal", p)
+		}
+	}
+
+	// And with a resolvable bind the command runs, with the address exported.
+	write("lib-bind-addr.sh", "resolve_bind_addr() { export NOO_BIND_ADDR=100.64.0.7; }\n")
+	name, args = withComposeSecrets(root, "sh", "-c", `printf %s "$NOO_BIND_ADDR" > "$0"`, marker)
+	if out, err := exec.Command(name, args...).CombinedOutput(); err != nil {
+		t.Fatalf("a resolved bind did not run the command: %v %s", err, out)
+	}
+	if b, _ := os.ReadFile(marker); string(b) != "100.64.0.7" {
+		t.Errorf("the command did not see the resolved address: %q", b)
+	}
+}
