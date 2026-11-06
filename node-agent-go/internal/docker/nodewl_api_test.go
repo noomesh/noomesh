@@ -234,7 +234,7 @@ func TestFetchRailTar(t *testing.T) {
 	t.Run("an artifact name that is not a plain file name is refused before anything is asked", func(t *testing.T) {
 		asked := stubManifestFetch(t, func(string) (*artifactManifest, error) { return &artifactManifest{SHA256: sumHex(body)}, nil })
 		railNode(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(body) }))
-		for _, bad := range []string{"", "../x.tar", "a/b.tar", `a\b.tar`, "/abs.tar", "sub/"} {
+		for _, bad := range []string{"", "../x.tar", "a/b.tar", `a\b.tar`, "/abs.tar", "sub/", ".", "..", ".hidden.tar"} {
 			_, _, err := fetchRailTar(context.Background(), bad)
 			if err == nil || !strings.Contains(err.Error(), "invalid artifact name") {
 				t.Errorf("fetchRailTar(%q) err = %v, want invalid artifact name", bad, err)

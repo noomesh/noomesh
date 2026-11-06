@@ -189,7 +189,11 @@ var _ = network.EndpointSettings{} // the create path builds these (nodewl_spec.
 // sha256 against the rail manifest before a byte of it is handed to docker.
 // The tar is single-use: cleanup removes it.
 func fetchRailTar(ctx context.Context, artifact string) (string, func(), error) {
-	if artifact == "" || filepath.Base(artifact) != artifact || strings.ContainsAny(artifact, `/\`) {
+	// No "." / ".." / hidden names: the real name is noo-addon-wl_<...>.tar
+	// (nodewl.ParseDesired holds it to its exact per-entry pattern; this is
+	// the last guard before the path is built, so it does not rely on that).
+	if artifact == "" || artifact == "." || artifact == ".." || strings.HasPrefix(artifact, ".") ||
+		filepath.Base(artifact) != artifact || strings.ContainsAny(artifact, `/\`) {
 		return "", nil, fmt.Errorf("invalid artifact name %q", artifact)
 	}
 	unlock, _ := lockImageRef("artifact:" + artifact)
