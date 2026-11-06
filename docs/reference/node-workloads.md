@@ -85,13 +85,40 @@ Fields: `id`, `revision`, `kind` (`voice` | `voice-pack`), `modality`
   one model) or `{runtime}`. It is required for `voice-pack` and forbidden for
   `voice`.
 
+### Archive members and license notices
+
+- A `files[]` entry may carry `from_archive: {path, sha256, bytes}`: the file
+  was extracted by the **controller, at staging**, from an archive. `path`
+  follows the set path rule; `sha256` is 64 lower-case hex; `bytes` is at
+  least 1. The archive must come from the **same upstream repo and revision**
+  as the set (the CLI enforces it). A file may not carry both `from_archive`
+  and `role: notice`. A shape error is `from_archive_invalid`. Nodes only ever
+  see flat, verified files, never the archive.
+- `license.additional` entries are `{id, url, notice_path?}`. A `notice_path`
+  must name a file of `files` whose `role` is `notice`
+  (`notice_not_in_files` otherwise).
+
+Extraction rules, for the CLI side (the controller extracts; a node never
+does):
+
+- Caps are enforced **while decompressing** (streaming), per member and in
+  total, as named constants, not after the fact.
+- Only regular files are extracted. No links, devices, FIFOs, sparse entries
+  or long-link entries.
+- No duplicate member names, and no name changed by normalisation.
+- Extract to a temp directory, and rename into the set only after **every**
+  member has passed.
+
+The worker, not core, must load pickled tensors safely
+(`weights_only=True`); core verifies bytes, not what a pickle does.
+
 ## The declaration (`noo-addon-node-workloads/1`)
 
 One file, listed in the signed bundle lock beside `resources.json`. Per
 workload: `name`, `image`, `uid` (at least 1), `command?`, `port`
 (1024-65535), `protocols` (a subset of `http`, `ws`), `health {ready, live,
-start_secs 1-600}`, `drain {path, timeout_secs 1-3600}`, `service_drain
-{route, timeout_secs 1-3600}` (required), `accel {gpu 0-8,
+start_secs 1-600}`, `drain {path, done_path, timeout_secs 1-3600}`, `service_drain
+{route, timeout_secs 1-3600}` (required), `accel {gpu 0-8, slots_env?,
 realtime}`, `models[]`, `env`, `scratch[]` and `limits {ram_mb, cpus, pids}`
 (required).
 
@@ -223,8 +250,40 @@ from the gateway's authenticated call. The gateway's constants
 `PEER_SUB_HEADER = "x-noo-requester-sub"` and
 `PEER_ROLE_HEADER = "x-noo-requester-role"`; the agent's list is exactly
 those three. It **strips any client-supplied copy** of those
-three, and strips `Origin` and `Authorization`, before the request reaches the
-worker. The worker holds no credential and no user token.
+three, and strips `Origin`, `Authorization` and `Cookie`, before the request
+reaches the worker. The worker holds no credential and no user token.
+
+The outbound allowlist is exactly: `Content-Type`, `Accept`,
+`Sec-WebSocket-Key`, `Sec-WebSocket-Version` and `Sec-WebSocket-Protocol` (the
+proxy restores `Connection` and `Upgrade` itself, for a websocket only), plus
+the three `x-noo` headers above. Each is present **exactly once**: a duplicate
+is a 400. Nothing else is forwarded.
+
+### The worker's drain (`drain`)
+
+`drain` is `{path, done_path, timeout_secs}`; `path` and `done_path` are
+absolute paths with the same rules (a missing or invalid one is
+`drain_invalid`). The agent drains the worker through the door:
+
+- **POST `path`**: a 2xx means the drain was accepted. The endpoint must be
+  idempotent.
+- It then **polls GET `done_path` every 2 s**: `200` means drained. Anything
+  else means not yet: a non-200 status, a connection error, an unreachable
+  door.
+- `timeout_secs` bounds the **whole** drain, the POST plus the polling.
+- If the worker **exits during the drain**, the agent reports `crashed` and
+  recreates the worker fresh and stopped.
+- Only a **timeout** leaves the worker running, reported as `needs_attention`
+  with reason `drain_timeout`; no live session is cut.
+
+### Slots and `accel.slots_env`
+
+`accel.slots_env` is optional. It names one of the decl's **own** declared env
+keys, and that key must have an integer `min` and/or `max` bound, not a
+`one_of`; otherwise `accel_invalid`. Placement sizes VRAM as the profile's
+`vram_mb` plus `per_slot_vram_mb` times the **placed value** of that key; with
+no `slots_env`, slots = 1. The heartbeat row therefore carries no `slots`
+(phase 2).
 
 ### `service_drain` and the release order
 
@@ -259,12 +318,24 @@ carried in desired-config only as part of the verbatim `decl`.
   exactly one image whose ID equals `image.id`, verify the sets, create the sidecar and the worker stopped.
 - `provisioned` to `running`: start. A worker not ready within `start_secs`
   reports `start_timeout`.
-- **Release returns the row to `provisioned`**: call `drain.path` (POST) through
-  the door, wait up to `drain.timeout_secs`, stop, remove the worker and its
-  scratch, recreate it fresh and stopped. A drain that does not finish reports
+- **Release returns the row to `provisioned`**: drain the worker as described
+  under "The worker's drain" (POST `drain.path`, poll `drain.done_path`, all
+  within `drain.timeout_secs`), stop, remove the worker and its scratch,
+  recreate it fresh and stopped. A drain that does not finish reports
   `drain_timeout` with state `needs_attention` and **never cuts a live
-  session**; the worker keeps running until it drains.
+  session**; the worker keeps running. A worker that exits during the drain is
+  `crashed` and is recreated fresh and stopped.
 - any state to `absent`: remove the worker, sidecar and network.
+
+**Reported states.** The desired states are only `absent`, `provisioned` and
+`running`. A heartbeat row may also report two states that never appear in
+desired-config (`ParseDesired` refuses `draining` and `needs_attention` with
+`desired_invalid`):
+
+| Reported state | Meaning |
+|---|---|
+| `draining` | From the accepted drain POST until the done poll answers 200 or the drain times out. The gateway proxy answers **409** to a NEW session while the row says `draining` (H4). |
+| `needs_attention` | A drain timeout (`drain_timeout`); the worker is left running. |
 - A refusal never changes the container: the row reports its last good state
   with a `reason`.
 
@@ -291,15 +362,16 @@ become a fact (the i495 rule). A `null` is never sent.
 
 | Key | Type | Notes |
 |---|---|---|
+| `os` | string | `runtime.GOOS` (`linux`, `darwin`, `windows`); always reported |
 | `gpu_compute_cap` | string, `"8.6"` | omitted when unknown. Compared with a set's `min_compute` **numerically as (major, minor)**, never as strings (`"10.0"` is above `"8.0"`, `"8.10"` above `"8.9"`): `nodewl.ComputeCapAtLeast`. A value that does not parse is an error the caller treats as **unknown**, never as low |
 | `nvidia_runtime` | bool | the nvidia container runtime is registered |
 | `nvidia_driver_caps_ok` | bool | `compute,utility` driver capabilities are usable |
-| `controller_host` | bool | this node is the controller's host |
+| `controller_host` | bool | this node is the controller's host: the agent's `NOO_SELF_NODE` marker. A workload is refused (`controller_host`) unless `NOO_ADDON_WORKLOADS_ON_CONTROLLER=1` (default off) |
 | `data_root_free_gb` | number | omitted when unknown |
 | `addon_workloads_policy` | `"none"` / `"approve"` / `"auto"` | the node's consent setting |
 | `addon_workloads_approvals` | `[{addon, digest}]` | per add-on and image digest |
 | `model_sets` | `[{id, revision, state, reason?}]` | `state` is `verified`, `fetching` or `refused`; `reason` rides `refused` |
-| `node_workloads` | `[{addon, name, state, ready, model?, slots?, door_port, reservation?, reason?}]` | `model`, `slots`, `reservation` and `reason` are omitted when unknown or none |
+| `node_workloads` | `[{addon, name, state, ready, model?, door_port, reservation?, reason?}]` | `state` is a desired state or a reported one (`draining`, `needs_attention`). `model`, `reservation` and `reason` are omitted when unknown or none. There is no `slots` in phase 2 (placement sizes it from `accel.slots_env`) |
 
 `heartbeat-i300.json` is the example.
 
@@ -332,10 +404,21 @@ The agent's fixed vocabulary for the `reason` of a `node_workloads` or
 | `env_out_of_bounds` | an env key is undeclared or its value is outside the decl's bound | fix the placement's env |
 | `container_conflict` | a container with the workload's name exists and was not created by the agent | remove it by hand |
 | `start_timeout` | the worker was not ready within `start_secs` | read the worker's logs; raise `start_secs` in the add-on |
-| `crashed` | the worker exited while it should run | read the worker's logs |
+| `crashed` | the worker exited while it should run, or during a drain (it is then recreated fresh and stopped) | read the worker's logs |
 | `drain_timeout` | the drain did not finish in `drain.timeout_secs`; reported as `needs_attention` | wait; the session is never cut |
 
 The placement facts (`consent_none`, `consent_unapproved`, `nvidia_runtime_missing`, `driver_caps_missing`, `compute_cap_low`, `arch_mismatch`, `controller_host`, `disk`) are also the gateway's placement refusal codes, spelled identically: the gateway refuses a placement with the code the agent would report.
+
+### Consent, and the controller host
+
+- The node's consent is `NOO_ADDON_WORKLOADS` = `none` | `approve` | `auto`
+  (default `none`); it is reported as `addon_workloads_policy`.
+- Approvals live in `addon-workload-approvals.json` in the agent state
+  directory (mode 0600, written atomically). A corrupt file is an **error**,
+  never read as empty (an empty list would silently drop every approval).
+- A node that is the controller's host (the agent's `NOO_SELF_NODE` marker) is
+  refused with `controller_host` unless `NOO_ADDON_WORKLOADS_ON_CONTROLLER=1`
+  (default off).
 
 `image_missing` also covers a malformed digest, id or artifact at parse time. A refusal of the
 decl inside an entry is reported as `decl_invalid` and carries the inner code.
@@ -360,7 +443,7 @@ Every file kind also has `duplicate_key` (see above); in desired-config it is re
 `modality_invalid`, `runtime_invalid`, `source_invalid`, `license_invalid`,
 `path_invalid`, `sha256_invalid`, `files_invalid`, `notice_not_in_files`,
 `profile_invalid`, `arch_invalid`, `fits_required`, `fits_forbidden`,
-`fits_invalid`, `trust_required`, `trust_invalid`.
+`fits_invalid`, `trust_required`, `trust_invalid`, `from_archive_invalid`.
 
 **desired-config:** the codes are reasons: `desired_invalid`, `decl_invalid`,
 `image_missing`, `door_leaf_missing`, `admit_invalid`, `env_out_of_bounds`,

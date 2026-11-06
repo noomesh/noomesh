@@ -170,6 +170,15 @@ func TestDesiredExampleIsOneProvisionedAndOneRunning(t *testing.T) {
 	}
 }
 
+func TestReportedStatesAreNeverDesired(t *testing.T) {
+	for _, st := range []string{ReportedDraining, ReportedNeedsAttention} {
+		s := strings.Replace(string(readFile(t, "desired", "valid-running.json")), `"state": "running"`, `"state": "`+st+`"`, 1)
+		if _, err := ParseDesired([]byte(s), testAgentCN); CodeOf(err) != ReasonDesiredInvalid {
+			t.Errorf("state %s must be refused as desired_invalid, got %v", st, err)
+		}
+	}
+}
+
 func TestAnotherNodesAgentIsNotAdmitted(t *testing.T) {
 	_, err := ParseDesired(readFile(t, "desired", "valid-running.json"), "node-b")
 	if CodeOf(err) != ReasonAdmitInvalid {
@@ -219,7 +228,7 @@ func TestEveryCodeAFixtureNamesIsProduced(t *testing.T) {
 		CodeIDInvalid, CodeRevisionInvalid, CodeKindInvalid, CodeModalityInvalid, CodeRuntimeInvalid,
 		CodeSourceInvalid, CodeLicenseInvalid, CodePathInvalid, CodeSHA256Invalid, CodeFilesInvalid,
 		CodeNoticeNotInFiles, CodeProfileInvalid, CodeArchInvalid, CodeFitsRequired, CodeFitsForbidden,
-		CodeFitsInvalid, CodeTrustRequired,
+		CodeFitsInvalid, CodeTrustRequired, CodeFromArchiveInvalid,
 	} {
 		if !want[code] {
 			t.Errorf("no fixture produces %q", code)

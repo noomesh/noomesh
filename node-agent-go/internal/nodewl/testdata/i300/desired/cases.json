@@ -75,6 +75,16 @@
     "code": "desired_invalid"
   },
   {
+    "file": "refuse-state-draining.json",
+    "valid": false,
+    "code": "desired_invalid"
+  },
+  {
+    "file": "refuse-state-needs-attention.json",
+    "valid": false,
+    "code": "desired_invalid"
+  },
+  {
     "file": "refuse-state.json",
     "valid": false,
     "code": "desired_invalid"
