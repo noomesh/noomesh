@@ -634,7 +634,7 @@ pub(crate) fn config_with_legacy_mirrors(doc: &Value) -> Value {
 /// section must be added here; `gated_config_sections_are_real()` pins each
 /// name against `config.rs` so a rename cannot quietly empty the list.
 pub(crate) const GATED_CONFIG_SECTIONS: &[&str] =
-    &["security", "tls", "tools", "workspace", "watched_folders", "addon_delegation", "addon_trust"];
+    &["security", "tls", "tools", "workspace", "watched_folders", "addon_delegation", "addon_trust", "integrations"];
 
 /// Who may write a gate-bearing config section: an Admin **person**, and only
 /// over their own credential.

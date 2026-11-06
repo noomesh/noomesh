@@ -91,13 +91,16 @@ class PrincipalError(Exception):
 class Principal:
     """A verified caller. Constructed only by :func:`verify`."""
 
-    __slots__ = ("sub", "kind", "role", "scopes")
+    __slots__ = ("sub", "kind", "role", "scopes", "act", "harness")
 
-    def __init__(self, sub: str, kind: str, role: str, scopes: "list[str]") -> None:
+    def __init__(self, sub: str, kind: str, role: str, scopes: "list[str]", *,
+                 act: "dict | None" = None, harness: "str | None" = None) -> None:
         self.sub = sub
         self.kind = kind
         self.role = role
         self.scopes = scopes
+        self.act = act
+        self.harness = harness
 
     # ── What the handlers ask it ──────────────────────────────────────
 
@@ -139,7 +142,12 @@ class Principal:
 
     def as_requester(self) -> dict:
         """The ``_requester`` shape the KB handlers already speak."""
-        return {"sub": self.sub, "scopes": list(self.scopes), "role": self.role}
+        result = {"sub": self.sub, "scopes": list(self.scopes), "role": self.role}
+        if self.act is not None:
+            result["act"] = dict(self.act)
+        if self.harness is not None:
+            result["harness"] = self.harness
+        return result
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
         return f"Principal(sub={self.sub!r}, kind={self.kind!r}, scopes={self.scopes!r})"
@@ -299,7 +307,15 @@ def verify_token(token: str, subject: str, *, now: "float | None" = None) -> Pri
     scopes = [str(s) for s in scopes_raw]
     role = str(claims.get("role") or "user")
 
-    return Principal(sub=sub, kind=kind, role=role, scopes=scopes)
+    act = claims.get("act")
+    harness = claims.get("harness")
+    if act is not None and (not isinstance(act, dict) or not isinstance(act.get("sub"), str)
+                            or any(act.get(k) is not None and not isinstance(act[k], str)
+                                   for k in ("iss_user", "task"))):
+        raise PrincipalError("malformed", "principal delegation is invalid")
+    if harness is not None and not isinstance(harness, str):
+        raise PrincipalError("malformed", "principal harness is invalid")
+    return Principal(sub=sub, kind=kind, role=role, scopes=scopes, act=act, harness=harness)
 
 
 def _header_value(headers) -> "str | None":
