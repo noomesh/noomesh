@@ -523,14 +523,24 @@ func escapePath(p string) string {
 // setFileDest is where one manifest file lands under dir. The path becomes a
 // filesystem path here, so the node's own mount rule (nodewl.ValidSetPath:
 // relative, no `.`/`..` component, one directory level, a fixed charset) is
-// asserted at the point of use, whatever parsed the manifest before. That rule
-// alone keeps the result inside dir; a separate "is it under dir" test could
-// never fire after it, so there is none.
+// asserted at the point of use, whatever parsed the manifest before.
+// ValidSetPath is the rule; within is defence in depth against a future
+// loosening of it, and is unreachable today (it is pinned directly by
+// TestWithinRefusesEverythingOutsideTheDir).
 func setFileDest(dir, p string) (string, error) {
 	if !nodewl.ValidSetPath(p) {
 		return "", refuse(nodewl.ReasonSetUnverified, "file path %q is not allowed", p)
 	}
-	return filepath.Join(dir, filepath.FromSlash(p)), nil
+	dest := filepath.Join(dir, filepath.FromSlash(p))
+	if !within(dir, dest) {
+		return "", refuse(nodewl.ReasonSetUnverified, "file path %q leaves the set directory", p)
+	}
+	return dest, nil
+}
+
+func within(dir, p string) bool {
+	rel, err := filepath.Rel(dir, p)
+	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // ---- filesystem hygiene -------------------------------------------------
@@ -879,9 +889,10 @@ func (s *Store) Prune(keep map[Ref]bool) ([]Ref, error) {
 				continue
 			}
 			dir := s.dir(ref)
-			// ValidSetRef above admits no separator and no leading dot, so dir
-			// is under Root; what is left to rule out is a symlink or a file.
-			if fi, err := os.Lstat(dir); err != nil || !fi.IsDir() {
+			// A symlink or a file is not ours to remove. within is defence in
+			// depth against a future loosening of ValidSetRef, which keeps it
+			// unreachable today.
+			if fi, err := os.Lstat(dir); err != nil || !fi.IsDir() || !within(s.Root, dir) {
 				continue
 			}
 			if _, err := os.Lstat(filepath.Join(dir, railSigName)); err == nil {
