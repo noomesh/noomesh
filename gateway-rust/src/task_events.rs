@@ -347,6 +347,7 @@ pub async fn emit_finished(db: &sqlx::PgPool, task_id: &str, ok: bool, text: &st
 
 /// Whose events these are, as far as the task's origin can be read.
 #[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)] // MUTANT: Unknown is no longer built; the test, not the lint, must catch it
 enum AddonRoute {
     Addon,
     Core,
@@ -360,12 +361,8 @@ async fn addon_route(db: &sqlx::PgPool, task_id: &str) -> AddonRoute {
     let Ok(uuid) = uuid::Uuid::parse_str(task_id) else { return AddonRoute::Core };
     match crate::repo::tasks::created_via(db, uuid).await {
         Ok(Some(v)) if addon_of(&v).is_some() => AddonRoute::Addon,
-        Ok(_) => AddonRoute::Core,
-        Err(e) => {
-            tracing::warn!(task = task_id, error = %e,
-                "task_events: the task's origin could not be read; emitting its events and letting emit decide");
-            AddonRoute::Unknown
-        }
+        // MUTANT: an unreadable origin is "core" again.
+        Ok(_) | Err(_) => AddonRoute::Core,
     }
 }
 
