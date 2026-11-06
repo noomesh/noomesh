@@ -463,6 +463,26 @@ The first failing rule wins; the fixtures each carry one defect, so order does
 not matter to them. Precedence worth knowing: a refused env prefix wins over
 the add-on prefix; `scratch_target_refused` wins over `scratch_invalid`.
 
+## Images on the rail
+
+The gateway has no docker, so the CLI stages the images (F2c). At
+`noo addons enable` and `noo addons upgrade`, after the add-on's images are
+pulled by digest, each image **named by a workload's `image`** (the lock's
+`images` entry, with the lock's digest) is written with `docker save` into the
+rail's image directory, as an `image`-kind artifact. Name:
+
+```text
+noo-addon-wl_<addon>_<image name>_<64 hex of the lock digest>_<arch>.tar
+```
+
+That is `image_tar_name` of the synthetic ref
+`noo-addon-wl/<addon>/<image name>:<64 hex>`; a `<tar>.imageid` sidecar beside
+it names the image id it loads as. Written as `<tar>.part`, then renamed; a tar
+whose sidecar names the image that is local now is not exported again. The
+`noo-addon-wl_` prefix marks the add-on's files: `noo addons upgrade` removes
+the add-on's tars that the new lock no longer names, and `noo addons disable`
+removes all of them. Nothing else on the rail is touched.
+
 ## Who validates what
 
 | Validator | Reads | Against |

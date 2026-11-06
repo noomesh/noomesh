@@ -291,6 +291,9 @@ pub fn check(fetched: &Fetched, anchor: &TrustAnchor, want: &Want) -> Result<Ver
     // signed, and still refused here when they break a rule, before anything
     // is pinned, so the gateway never meets a bundle it would refuse.
     super::decls::check_bundle(want.addon, &fetched.files).map_err(Refusal::Decl)?;
+    // node-workloads.json (i300), when the bundle ships one: its images must
+    // be names of this lock. Same place, same refusal, `upgrade --check` too.
+    super::decls::check_node_workloads(want.addon, &fetched.files, &v.lock.images).map_err(Refusal::Decl)?;
     if !v.lock.supports(want.stack_tag) {
         return Err(Refusal::NotForStack {
             tag: want.stack_tag.to_string(),
@@ -413,6 +416,10 @@ pub trait Docker {
     /// The local image id (`sha256:…`) of this exact reference, or why it
     /// could not be read.
     fn image_id(&mut self, reference: &str) -> Result<String, String>;
+    /// `docker save` of `reference` (an image id or a local reference) into
+    /// the file `out`. The caller owns the file name (a `.part`, renamed once
+    /// this returns).
+    fn save(&mut self, reference: &str, out: &Path) -> Result<(), String>;
     /// Running containers, read with `docker inspect` (not `docker ps`,
     /// whose IMAGE column drops the digest of a digest-only reference).
     fn running(&mut self) -> Result<Vec<Container>, String>;
@@ -653,6 +660,20 @@ impl Docker for LiveDocker {
             return Err(format!("docker image inspect {reference}: {}", last_line(&out.stderr)));
         }
         Ok(id)
+    }
+
+    fn save(&mut self, reference: &str, out: &Path) -> Result<(), String> {
+        let o = std::process::Command::new("docker")
+            .arg("save")
+            .arg("-o")
+            .arg(out)
+            .arg(reference)
+            .output()
+            .map_err(|e| format!("docker save: {e}"))?;
+        if !o.status.success() {
+            return Err(format!("docker save {reference}: {}", last_line(&o.stderr)));
+        }
+        Ok(())
     }
 
     fn running(&mut self) -> Result<Vec<Container>, String> {
@@ -982,6 +1003,50 @@ pub(crate) mod tests {
         assert!(matches!(check(&bad, &anchor(), &want), Err(Refusal::Decl(e)) if e.contains("public route")));
     }
 
+    /// A signed bundle of `rhaddon` carrying [`OVERLAY`] and this
+    /// node-workloads.json.
+    fn signed_rh_bundle(l: &AddonLock, node_workloads: &[u8]) -> Fetched {
+        let mut l = l.clone();
+        l.addon = "rhaddon".into();
+        l.format = addon_lock::FORMAT_V2.into();
+        let mut files = BTreeMap::from([(addon_lock::OVERLAY_FILE.to_string(), OVERLAY.as_bytes().to_vec())]);
+        files.insert("node-workloads.json".to_string(), node_workloads.to_vec());
+        l.files = files.iter().map(|(n, b)| (n.clone(), addon_lock::sha256_ref(b))).collect();
+        let (bytes, sig) = addon_lock::sign(&l, &seed()).unwrap();
+        Fetched { lock: bytes, sig, files }
+    }
+
+    /// node-workloads.json (i300) is checked where workloads.json is, against
+    /// the lock's own images: a workload naming an image the lock lacks, or
+    /// any other defect, is refused with the parser's stable code before
+    /// anything is pulled or pinned. Reverting the `check_node_workloads`
+    /// call in `check` makes the refused cases pass. `upgrade --check`
+    /// resolves through the same `check`.
+    #[test]
+    fn a_bad_node_workloads_json_is_refused_with_the_parsers_code() {
+        let nw = include_str!("../../../tests/fixtures/addons/rhaddon/node-workloads.json");
+        let want = Want { addon: "rhaddon", stack_tag: "v0.6.0", stack_lock: None, pinned: None, pin: None, allow_downgrade: false };
+        let mut l = lock("1.0.0", &["v0.6.0"], None);
+        // The lock has no `addon-worker`, the image the fixture's worker names.
+        match check(&signed_rh_bundle(&l, nw.as_bytes()), &anchor(), &want) {
+            Err(Refusal::Decl(e)) => {
+                assert!(e.contains("image_not_in_lock") && e.contains("node-workloads.json"), "{e}");
+            }
+            other => panic!("expected a declaration refusal, got {other:?}"),
+        }
+        l.images.insert("addon-worker".into(), format!("{ROOT}/worker@{}", digest('2')));
+        assert!(check(&signed_rh_bundle(&l, nw.as_bytes()), &anchor(), &want).is_ok());
+        // A file that names a lock image but breaks another rule.
+        let low_port = nw.replace("\"port\": 9003", "\"port\": 80");
+        assert_ne!(low_port, nw, "the fixture still carries the port this test edits");
+        match check(&signed_rh_bundle(&l, low_port.as_bytes()), &anchor(), &want) {
+            Err(Refusal::Decl(e)) => assert!(e.contains("port_invalid"), "{e}"),
+            other => panic!("expected a declaration refusal, got {other:?}"),
+        }
+        // No node-workloads.json: unchanged.
+        assert!(check(&signed_bundle(&l), &anchor(), &Want { addon: "trellion_intel", ..want }).is_ok());
+    }
+
     /// A signed BUNDLE of `l` (format 2) carrying [`OVERLAY`].
     pub(crate) fn signed_bundle(l: &AddonLock) -> Fetched {
         signed_bundle_with(l, OVERLAY)
@@ -1186,9 +1251,21 @@ pub(crate) mod tests {
         /// `(reference, image id)` for `image_id`.
         pub ids: Vec<(String, String)>,
         pub running: Vec<Container>,
+        /// `(reference, file name)` of each `save`.
+        pub saves: Vec<(String, String)>,
+        pub fail_save: bool,
     }
 
     impl Docker for FakeDocker {
+        fn save(&mut self, r: &str, out: &Path) -> Result<(), String> {
+            if self.fail_save {
+                return Err("no space left on device".into());
+            }
+            std::fs::write(out, b"fake tar").map_err(|e| e.to_string())?;
+            let name = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            self.saves.push((r.to_string(), name));
+            Ok(())
+        }
         fn image_present(&mut self, r: &str) -> bool {
             self.local.iter().any(|l| l == r)
         }

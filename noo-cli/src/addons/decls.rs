@@ -286,6 +286,24 @@ pub fn check_bundle(addon: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<De
     Ok(Declared { system, workloads, resources })
 }
 
+/// Validate the bundle's `node-workloads.json` (i300), when it ships one:
+/// the workloads a node runs for the add-on, each naming an image of the
+/// signed lock (`lock_images`, name to ref). No file, no workloads; a refusal
+/// carries the parser's stable code (`image_not_in_lock`, `port_invalid`, ...).
+/// It takes the lock's images, so it sits beside [`check_bundle`] rather than
+/// in it: `noo addons check` reads a directory and has no lock.
+pub fn check_node_workloads(
+    addon: &str,
+    files: &BTreeMap<String, Vec<u8>>,
+    lock_images: &BTreeMap<String, String>,
+) -> Result<Vec<super::node_workloads::NodeWorkload>, String> {
+    let Some(bytes) = files.get(super::node_workloads::NODE_WORKLOADS_FILE) else {
+        return Ok(Vec::new());
+    };
+    super::node_workloads::parse_node_workloads(addon, bytes, lock_images)
+        .map_err(|e| format!("{} is refused ({e})", super::node_workloads::NODE_WORKLOADS_FILE))
+}
+
 /// The declarations materialised under `<root>/addons/<addon>/` (by
 /// `noo addons enable|upgrade`, verified against the signed lock then).
 /// Absent files declare nothing; an invalid one is an error.
