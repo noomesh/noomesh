@@ -3,13 +3,13 @@
 """Every literal or named core routing prefix reserves its console namespace."""
 from pathlib import Path
 import re
+from _rust_src import own_code
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def route_segments(source, constants):
-    source = source.split('#[cfg(test)]', 1)[0]
-    source = re.sub(r'(?m)^\s*//.*$', '', source)
+    source = own_code(source)
     found = set()
     for value in re.findall(r'\.(?:route|nest|nest_service|route_service)\(\s*("[^"]*"|[A-Z][A-Z_0-9]*)\s*,', source):
         path = value[1:-1] if value.startswith('"') else constants[value]
