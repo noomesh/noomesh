@@ -4791,10 +4791,19 @@ fn lowercase_first(s: &str) -> String {
 fn commit_addon_pins(g: &Globals, root: &std::path::Path, tag: &str, prepared: &[crate::addons::Prepared]) {
     for p in prepared {
         match crate::addons::commit(root, p, tag) {
-            Ok(pin) => if !g.json {
-                ui::done(&format!("{} {} pinned for {tag} (add-on key #{}; {} image(s) pulled by digest {})",
-                    p.addon, pin.version, pin.key_index, p.pulled, p.via));
-            },
+            Ok(pin) => {
+                // The new lock is current: tars of its node-workload images
+                // that it no longer names leave the rail.
+                if let Err(e) = crate::addons::node_images::prune_for(p) {
+                    if !g.json {
+                        ui::warned(&format!("{}: stale node-workload images stay on the rail ({e})", p.addon));
+                    }
+                }
+                if !g.json {
+                    ui::done(&format!("{} {} pinned for {tag} (add-on key #{}; {} image(s) pulled by digest {})",
+                        p.addon, pin.version, pin.key_index, p.pulled, p.via));
+                }
+            }
             Err(r) => fail(g.json, ExitCode::Generic, "addon_pin_write_failed",
                 &format!("{} — stack.lock is already written for {tag}; the launcher refuses {} until it is pinned",
                     r.why(&p.addon), p.addon),

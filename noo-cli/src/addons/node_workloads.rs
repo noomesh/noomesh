@@ -20,11 +20,13 @@
 //! `Value` keeps the last one silently, and a validator and a runtime that
 //! read different values of one key is a parser differential.
 
-// Consumer: i300 F2c wires `parse_node_workloads` into add-on enable and
-// verify, and harness H6 plugs its door-leaf issuance into
-// `node_workload_doors`. Until they land nothing outside the tests calls
-// this module, so the whole of it is allowed to be dead in a non-test build.
-#![cfg_attr(not(test), allow(dead_code))]
+// Consumers (i300 F2c): `decls::check_node_workloads` calls
+// `parse_node_workloads` at enable, upgrade (`--check` too), verify and
+// launch, and `node_images` reads the validated `image` names. What nothing
+// outside the tests reads yet carries its own `allow(dead_code)` below: the
+// refusal's `code`/`message` accessors (the callers print the Display form),
+// the model-slot and realtime fields (the node agent's, not the CLI's), and
+// `node_workload_doors`, which harness H6's door-leaf issuance plugs into.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
@@ -58,6 +60,8 @@ pub struct NodeWorkloadRefusal {
     message: String,
 }
 
+// Read by the fixture tests; the lifecycle prints the Display form.
+#[cfg_attr(not(test), allow(dead_code))]
 impl NodeWorkloadRefusal {
     pub fn code(&self) -> &str {
         self.code
@@ -151,6 +155,8 @@ pub struct ServiceDrain {
     pub timeout_secs: i64,
 }
 
+// `realtime` is the node agent's to read; the CLI only validates the file.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Accel {
@@ -165,6 +171,8 @@ pub struct Accel {
 
 /// A model slot: the agent mounts the set the operator chose, read-only, at
 /// `target`.
+// `many` and `optional` are the node agent's to read, not the CLI's.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Slot {
@@ -847,7 +855,8 @@ fn validate_scratch(ss: &[Scratch], ms: &[Slot]) -> Result<(), NodeWorkloadRefus
 /// workload, in file order. The names are already held to the door-name rules
 /// (`door_name_invalid`, `door_name_too_long`) by [`parse_node_workloads`],
 /// so `noo-stunnel-<addon>-<workload>` is a legal DNS label. Harness H6's
-/// door-leaf issuance plugs in here.
+/// door-leaf issuance plugs in here; until it lands only the tests call it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn node_workload_doors(addon: &str, parsed: &[NodeWorkload]) -> Vec<(String, String)> {
     parsed.iter().map(|w| (addon.to_string(), w.name.clone())).collect()
 }

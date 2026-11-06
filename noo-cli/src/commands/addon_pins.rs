@@ -185,7 +185,16 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 .and_then(|anchor| addons::prepare_from(&ctx, addon, &anchor, supplied, &mut resolve::LiveDocker::new(&root)))
                 .and_then(|p| {
                     let suggested = new_suggestions(&p.fetched.files);
-                    addons::commit(&root, &p, &tag).map(|pin| (pin, p.pulled, p.via.clone(), suggested))
+                    addons::commit(&root, &p, &tag).map(|pin| {
+                        // The new lock is current now: this add-on's node-workload
+                        // tars on the rail that it no longer names go.
+                        if let Err(e) = addons::node_images::prune_for(&p) {
+                            if !g.json {
+                                ui::warned(&format!("{addon}: stale node-workload images stay on the rail ({e})"));
+                            }
+                        }
+                        (pin, p.pulled, p.via.clone(), suggested)
+                    })
                 })
         };
         match outcome {
@@ -341,6 +350,11 @@ pub(crate) fn verify_one(
             v.problem = Some(e);
             return v;
         }
+    }
+    // node-workloads.json (i300) against the pinned lock's images.
+    if let Err(e) = crate::addons::decls::check_node_workloads(addon, &files, &pin.images) {
+        v.problem = Some(e);
+        return v;
     }
     for (name, r) in &pin.local_images() {
         let pinned_id = if docker.image_present(r) {
@@ -507,6 +521,18 @@ pub(crate) fn launch_lines(root: &Path, tag: &str, names: &[String], anchor: &dy
         let res = anchor(addon).map_err(|e| e.why(addon)).and_then(|a| resolve::offline_check_files(root, addon, tag, &a));
         match res {
             Ok((pin, files)) => {
+                // node-workloads.json (i300), when the verified lock lists
+                // it: the bytes offline_check just held to the signed hash
+                // are re-validated against the pinned lock's images. A
+                // refusal here is the only line this add-on gets.
+                let nw_name = crate::addons::node_workloads::NODE_WORKLOADS_FILE.to_string();
+                if files.contains(&nw_name) {
+                    let bytes = pins::materialised_files(root, addon, [&nw_name]);
+                    if let Err(why) = crate::addons::decls::check_node_workloads(addon, &bytes, &pin.images) {
+                        out.push(format!("refuse {addon} {}", why.replace('\n', " ")));
+                        continue;
+                    }
+                }
                 // The verdict the gateway's add-on registry reads
                 // (`NOO_ADDONS_VERIFIED`): this add-on's signed lock verified
                 // offline AND lists `tag`. Emitted before its `pin` lines so a

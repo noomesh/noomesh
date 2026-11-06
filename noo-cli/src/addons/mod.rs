@@ -10,6 +10,7 @@ pub mod check;
 pub mod decls;
 pub mod guards;
 pub mod lock_fetch;
+pub mod node_images;
 pub mod node_workloads;
 pub mod pins;
 pub mod pop;
@@ -217,6 +218,12 @@ fn prepare_with(
             detail: e,
         },
         r => r,
+    })?;
+    // The gateway has no docker: the images a node runs for this add-on
+    // (named by its node-workloads.json) are exported onto the rail here, by
+    // the lock's digests, before anything is pinned (i300).
+    node_images::stage_prepared(docker, addon, &verified.lock.images, &fetched.files, &route).map_err(|e| {
+        Refusal::Pull(format!("its node-workload images could not be exported to the artifact rail: {e}"))
     })?;
     Ok(Prepared {
         addon: addon.to_string(),
