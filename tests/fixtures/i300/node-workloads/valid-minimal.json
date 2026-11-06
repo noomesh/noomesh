@@ -18,6 +18,10 @@
         "path": "/drain",
         "timeout_secs": 30
       },
+      "service_drain": {
+        "route": "drain",
+        "timeout_secs": 30
+      },
       "accel": {
         "gpu": 0
       },

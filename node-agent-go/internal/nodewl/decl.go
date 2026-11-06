@@ -35,6 +35,7 @@ const (
 	CodeScratchInvalid      = "scratch_invalid"
 	CodeScratchInModelSlot  = "scratch_in_model_slot"
 	CodeLimitsInvalid       = "limits_invalid"
+	CodeServiceDrainInvalid = "service_drain_invalid"
 )
 
 // maxDoorNames: the door's DNS SAN is noo-stunnel-<addon>-<workload>, one DNS
@@ -45,11 +46,14 @@ const maxDoorNames = 51
 var (
 	doorNameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 	wordRe     = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
-	httpPathRe = regexp.MustCompile(`^/[A-Za-z0-9._~/-]*$`)
-	targetRe   = regexp.MustCompile(`^/[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$`)
-	runtimeRe  = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
-	envKeyRe   = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
-	enumValRe  = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
+	// routeNameRe is the route-name rule of routes.json (crates/addon-manifest
+	// name_ok): [a-z][a-z0-9_]{0,63}.
+	routeNameRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+	httpPathRe  = regexp.MustCompile(`^/[A-Za-z0-9._~/-]*$`)
+	targetRe    = regexp.MustCompile(`^/[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$`)
+	runtimeRe   = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
+	envKeyRe    = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
+	enumValRe   = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
 )
 
 // refusedEnvPrefixes can never start a declared env key, whatever the add-on
@@ -59,19 +63,22 @@ var refusedEnvPrefixes = []string{"NOO_", "NVIDIA_", "CUDA_", "LD_", "PYTHON", "
 // Decl is one validated workload of node-workloads.json. In desired-config it
 // travels verbatim as `decl`.
 type Decl struct {
-	Name      string              `json:"name"`
-	Image     string              `json:"image"`
-	UID       int64               `json:"uid"`
-	Command   []string            `json:"command,omitempty"`
-	Port      int64               `json:"port"`
-	Protocols []string            `json:"protocols"`
-	Health    Health              `json:"health"`
-	Drain     Drain               `json:"drain"`
-	Accel     Accel               `json:"accel"`
-	Models    []Slot              `json:"models,omitempty"`
-	Env       map[string]EnvBound `json:"env,omitempty"`
-	Scratch   []Scratch           `json:"scratch,omitempty"`
-	Limits    Limits              `json:"limits"`
+	Name      string   `json:"name"`
+	Image     string   `json:"image"`
+	UID       int64    `json:"uid"`
+	Command   []string `json:"command,omitempty"`
+	Port      int64    `json:"port"`
+	Protocols []string `json:"protocols"`
+	Health    Health   `json:"health"`
+	Drain     Drain    `json:"drain"`
+	// ServiceDrain names the add-on's CPU-side drain route, which the gateway
+	// calls first on release (service drain, then the worker's Drain.Path).
+	ServiceDrain *ServiceDrain       `json:"service_drain"`
+	Accel        Accel               `json:"accel"`
+	Models       []Slot              `json:"models,omitempty"`
+	Env          map[string]EnvBound `json:"env,omitempty"`
+	Scratch      []Scratch           `json:"scratch,omitempty"`
+	Limits       Limits              `json:"limits"`
 }
 
 type Health struct {
@@ -83,6 +90,33 @@ type Health struct {
 type Drain struct {
 	Path        string `json:"path"`
 	TimeoutSecs int64  `json:"timeout_secs"`
+}
+
+// ServiceDrain is a route NAME in the add-on's routes.json (never a path, never
+// inferred) and how long the gateway waits for it.
+type ServiceDrain struct {
+	Route       string `json:"route"`
+	TimeoutSecs int64  `json:"timeout_secs"`
+}
+
+// RoutesFromJSON reads an add-on's routes.json into name -> internal?, the
+// input ParseDecl's cross-file rule needs. The agent has no routes.json and
+// passes nil to ParseDecl instead.
+func RoutesFromJSON(b []byte) (map[string]bool, error) {
+	var f struct {
+		Routes []struct {
+			Name     string `json:"name"`
+			Internal bool   `json:"internal"`
+		} `json:"routes"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(f.Routes))
+	for _, r := range f.Routes {
+		out[r.Name] = r.Internal
+	}
+	return out, nil
 }
 
 type Accel struct {
@@ -135,8 +169,12 @@ func EnvPrefix(addon string) string {
 
 // ParseDecl validates a node-workloads.json for addon. lockImages is the
 // images map of the add-on's verified lock (name -> ref); a workload's image
-// must be a key of it. The first refusal wins; fixtures carry one defect each.
-func ParseDecl(addon string, b []byte, lockImages map[string]string) ([]Decl, error) {
+// must be a key of it. routes is the add-on's routes.json as name -> internal?
+// (RoutesFromJSON): service_drain.route must be an internal route of it. A nil
+// routes skips ONLY that existence and internal check; the shape of
+// service_drain is always checked. The first refusal wins; fixtures carry one
+// defect each.
+func ParseDecl(addon string, b []byte, lockImages map[string]string, routes map[string]bool) ([]Decl, error) {
 	var file struct {
 		Format    string            `json:"format"`
 		Workloads []json.RawMessage `json:"workloads"`
@@ -157,7 +195,7 @@ func ParseDecl(addon string, b []byte, lockImages map[string]string) ([]Decl, er
 	out := make([]Decl, 0, len(file.Workloads))
 	seen := map[string]bool{}
 	for i, raw := range file.Workloads {
-		d, err := parseWorkload(addon, raw, lockImages, true)
+		d, err := parseWorkload(addon, raw, lockImages, true, routes)
 		if err != nil {
 			return nil, err
 		}
@@ -174,7 +212,7 @@ func ParseDecl(addon string, b []byte, lockImages map[string]string) ([]Decl, er
 // skips the image-name-in-lock rule: a desired-config entry carries the
 // image by name and digest, and the gateway has already held the name to the
 // verified lock.
-func parseWorkload(addon string, raw []byte, lockImages map[string]string, checkLock bool) (Decl, error) {
+func parseWorkload(addon string, raw []byte, lockImages map[string]string, checkLock bool, routes map[string]bool) (Decl, error) {
 	var d Decl
 	// raw is a part of a document whose tokens were already walked.
 	if err := decodeTyped(raw, &d); err != nil {
@@ -189,10 +227,10 @@ func parseWorkload(addon string, raw []byte, lockImages map[string]string, check
 			return d, err
 		}
 	}
-	return d, validate(addon, &d, lockImages, checkLock)
+	return d, validate(addon, &d, lockImages, checkLock, routes)
 }
 
-func validate(addon string, d *Decl, lockImages map[string]string, checkLock bool) error {
+func validate(addon string, d *Decl, lockImages map[string]string, checkLock bool, routes map[string]bool) error {
 	if !doorNameRe.MatchString(addon) {
 		return fail(CodeDoorNameInvalid, "add-on name %q must match %s", addon, doorNameRe)
 	}
@@ -239,6 +277,9 @@ func validate(addon string, d *Decl, lockImages map[string]string, checkLock boo
 	if !okPath(d.Drain.Path) || d.Drain.TimeoutSecs < 1 || d.Drain.TimeoutSecs > 3600 {
 		return fail(CodeDrainInvalid, "drain needs an absolute path and timeout_secs 1..3600")
 	}
+	if err := validateServiceDrain(d.ServiceDrain, routes); err != nil {
+		return err
+	}
 	if d.Accel.GPU < 0 || d.Accel.GPU > 8 {
 		return fail(CodeAccelInvalid, "accel.gpu %d (0..8)", d.Accel.GPU)
 	}
@@ -254,6 +295,29 @@ func validate(addon string, d *Decl, lockImages map[string]string, checkLock boo
 	l := d.Limits
 	if l.RAMMB < 64 || l.RAMMB > 1048576 || l.CPUs < 0.1 || l.CPUs > 128 || l.PIDs < 1 || l.PIDs > 32768 {
 		return fail(CodeLimitsInvalid, "limits out of range: ram_mb 64..1048576, cpus 0.1..128, pids 1..32768")
+	}
+	return nil
+}
+
+func validateServiceDrain(s *ServiceDrain, routes map[string]bool) error {
+	if s == nil {
+		return fail(CodeServiceDrainInvalid, "`service_drain` is required: the add-on's drain route and timeout")
+	}
+	if !routeNameRe.MatchString(s.Route) {
+		return fail(CodeServiceDrainInvalid, "service_drain.route %q is not a route name (%s)", s.Route, routeNameRe)
+	}
+	if s.TimeoutSecs < 1 || s.TimeoutSecs > 3600 {
+		return fail(CodeServiceDrainInvalid, "service_drain.timeout_secs %d (1..3600)", s.TimeoutSecs)
+	}
+	if routes == nil {
+		return nil
+	}
+	internal, ok := routes[s.Route]
+	if !ok {
+		return fail(CodeServiceDrainInvalid, "service_drain.route %q is not a route of the add-on's routes.json", s.Route)
+	}
+	if !internal {
+		return fail(CodeServiceDrainInvalid, "service_drain.route %q must be an `internal` route: the gateway calls it and decides when", s.Route)
 	}
 	return nil
 }

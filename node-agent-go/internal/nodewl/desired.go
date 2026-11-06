@@ -147,7 +147,9 @@ func parseEntry(raw []byte, ownAgentCN string) (Entry, error) {
 	if e.Reservation != nil && !uuidRe.MatchString(*e.Reservation) {
 		return e, fail(ReasonDesiredInvalid, "reservation is not a canonical lower-case UUID")
 	}
-	d, err := parseWorkload(e.Addon, e.DeclRaw, nil, false)
+	// nil routes: the agent has no routes.json, so only the shape of
+	// service_drain is re-checked here; the gateway held the route to it.
+	d, err := parseWorkload(e.Addon, e.DeclRaw, nil, false, nil)
 	if err != nil {
 		var inner *Error
 		if errors.As(err, &inner) {

@@ -60,6 +60,46 @@
     "code": "field_type"
   },
   {
+    "file": "refuse-service-drain-missing.json",
+    "valid": false,
+    "code": "service_drain_invalid"
+  },
+  {
+    "file": "refuse-service-drain-route-empty.json",
+    "valid": false,
+    "code": "service_drain_invalid"
+  },
+  {
+    "file": "refuse-service-drain-route-name.json",
+    "valid": false,
+    "code": "service_drain_invalid"
+  },
+  {
+    "file": "refuse-service-drain-route-unknown.json",
+    "valid": false,
+    "code": "service_drain_invalid"
+  },
+  {
+    "file": "refuse-service-drain-route-public.json",
+    "valid": false,
+    "code": "service_drain_invalid"
+  },
+  {
+    "file": "refuse-service-drain-timeout-zero.json",
+    "valid": false,
+    "code": "service_drain_invalid"
+  },
+  {
+    "file": "refuse-service-drain-timeout-3601.json",
+    "valid": false,
+    "code": "service_drain_invalid"
+  },
+  {
+    "file": "refuse-service-drain-unknown-field.json",
+    "valid": false,
+    "code": "unknown_field"
+  },
+  {
     "file": "refuse-bad-format.json",
     "valid": false,
     "code": "bad_format"
