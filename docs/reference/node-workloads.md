@@ -121,6 +121,54 @@ does):
 The worker, not core, must load pickled tensors safely
 (`weights_only=True`); core verifies bytes, not what a pickle does.
 
+### Rail delivery
+
+A staged set lives at `<MODELS_DIR>/sets/<id>/<revision>/` on the controller
+(files, then `model-set.json`, then `model-set.json.sig` last). A set without
+its signature does not exist to the rail. A node gets a set in two steps, both
+over the mTLS rail.
+
+1. **The signed manifest**, from the gateway (same auth as every artifact
+   manifest, a node's cluster bearer):
+
+   `GET /api/artifacts/manifest/modelset/<id>@<revision>`
+
+   ```json
+   {
+     "kind": "modelset",
+     "name": "<id>@<revision>",
+     "id": "<id>",
+     "revision": "<revision>",
+     "manifest_b64": "<standard base64 of the exact bytes of model-set.json>",
+     "sig_b64": "<standard base64 of the exact bytes of model-set.json.sig>",
+     "key": "fleet-signing",
+     "data_path": "/sets/<id>/<revision>"
+   }
+   ```
+
+   The manifest travels as base64, never as embedded JSON, because the
+   signature is over the stored bytes and re-serialising would break it. The
+   node decodes both, verifies the signature (see "Signing a model set")
+   **before parsing**, then validates the manifest. `<id>` and `<revision>` are
+   checked against the schema's patterns (400 on a miss). 404: no such set, or
+   no signature. The gateway checks only the shape: the manifest parses as
+   JSON and its `id` and `revision` equal the request's (a mismatch is a 500,
+   a staging fault). It does not verify the signature and does not run the full
+   contract validator; the node does both.
+
+2. **The files**, from the model cache: each `files[].path` of the verified
+   manifest at `GET <data_path>/<path>` (`/sets/<id>/<revision>/<path>`),
+   resumable with `Range`. The node checks each file's byte count and sha256
+   against the manifest. There is no per-file hashing route: unlike a `gguf`,
+   whose digest only the gateway states, every set file's digest is already
+   inside the signed manifest, so the signature covers the files.
+
+   The model cache serves only `/sets/<id>/<revision>/<file>` and
+   `/sets/<id>/<revision>/<dir>/<file>`. It refuses (404) a `.` or `..`
+   component, any other depth, a name outside the schema charset, a `.part`
+   file, and `model-set.json` and `model-set.json.sig` themselves: the manifest
+   has one source, the gateway route. Directory listing is off.
+
 ## The declaration (`noo-addon-node-workloads/1`)
 
 One file, listed in the signed bundle lock beside `resources.json`. Per
