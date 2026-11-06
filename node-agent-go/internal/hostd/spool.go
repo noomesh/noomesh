@@ -265,9 +265,9 @@ func commandName(path string) string {
 // within a directory on every filesystem we run on, and because it survives
 // the daemon being killed mid-op: the .processing file is left behind as
 // evidence rather than an unreleased lock that blocks the next start.
-func claim(path string) (string, error) {
-	target := path + processingSuffix
-	if err := os.Rename(path, target); err != nil {
+func claim(spool, name string) (string, error) {
+	target := name + processingSuffix
+	if err := spoolRename(spool, name, target); err != nil {
 		return "", err
 	}
 	return target, nil
@@ -282,12 +282,11 @@ func writeJSONAtomic(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(path)
-	tmp := filepath.Join(dir, "."+filepath.Base(path)+".tmp")
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	// Descriptor-relative and NOFOLLOW: hostd runs as root in a directory the
+	// user owns, so a planted symlink at the temp or final name must never be
+	// written through (followup i515). See spool_fd_unix.go.
+	dir, name := splitSpoolPath(path)
+	return spoolWriteFile(dir, name, b, 0o644)
 }
 
 // WriteCommand queues a command for the daemon serving spool. This is the
