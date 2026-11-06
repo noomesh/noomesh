@@ -1535,8 +1535,8 @@ it: `cluster provision` issues `addon-<addon>-<workload>` under the node's
 service leaves (same issuer and renewal as the built-in backend doors) and
 packs it as the bundle kinds `svc-addon-<addon>-<workload>.crt|.key`, which
 the node installs to `/etc/noo/pki/services/addon-<addon>-<workload>/`. Both
-names must match `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$` and
-`<addon>-<workload>` is at most 51 characters; anything else is refused when
+names are lowercase letters, digits and hyphens, neither starting nor ending
+with a hyphen, and `<addon>-<workload>` is at most 51 characters; anything else is refused when
 the leaf is issued, naming the pair. Enabling a new add-on does not reach
 nodes by itself: run `noo upgrade --nodes` to deliver the leaves (`noo addons
 enable` says so when the add-on declares node workloads). A node whose applier
