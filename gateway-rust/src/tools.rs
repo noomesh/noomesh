@@ -729,7 +729,14 @@ pub async fn execute_tool(
     // person the loop set in `mcp_bridge::CALLER`. Same middleware before
     // and after as any other tool; only the executor differs.
     if call.name.starts_with(crate::mcp_bridge::PREFIX) {
-        let ids = crate::mcp_bridge::server_ids(state).await;
+        let ids = match crate::mcp_bridge::server_ids(state).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                let mut result = ToolResult { name: call.name.clone(), tool_call_id: call.id.clone(), success: false, output: String::new(), error: Some(e) };
+                crate::middleware::after_tool_call(&mut result, &ctx);
+                return result;
+            }
+        };
         if let Some((server, tool)) = crate::mcp_bridge::split_name(&call.name, &ids) {
             let user = crate::mcp_bridge::current_caller();
             let mut result = match crate::mcp_bridge::call(state, user.as_deref(), &server, &tool, &call.arguments).await {
