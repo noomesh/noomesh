@@ -315,9 +315,8 @@ mod tests {
     /// `--json` callers get the error envelope and exit code, not bare text.
     #[test]
     fn a_failed_connect_answers_through_the_error_envelope() {
-        let own = include_str!("auth_connect.rs");
-        let own = &own[..own.find("#[cfg(test)]").expect("the test module")];
-        let entry = &own[own.find("pub fn auth_connect(").expect("the entry point")..];
+        let own = crate::test_src::own_code(include_str!("auth_connect.rs"));
+        let entry = crate::test_src::fn_body(&own, "pub fn auth_connect(");
         assert!(entry.contains("crate::output::fail("), "the failure goes through output::fail");
         assert!(entry.contains("\"auth_connect_failed\""), "with a stable error code");
         assert!(!entry.contains("eprintln!"), "no bare stderr line for the failure");
