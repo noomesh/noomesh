@@ -459,26 +459,40 @@ func TestBackoffGrowsToTheCapWithJitter(t *testing.T) {
 // dropped, and the batch lands once the controller is back.
 func TestControllerAwayKeepsTheBatch(t *testing.T) {
 	ig := &ingest{}
-	srv := httptest.NewTLSServer(ig.handler(t, "n1"))
+	// "Away" is the server cutting every connection before it answers, so
+	// the pusher sees a transport error. The switch is an atomic the
+	// handler reads: the test never writes the shipper's own fields while
+	// Run reads them (it used to swap s.push.url, a data race under -race).
+	var away atomic.Bool
+	live := ig.handler(t, "n1")
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if away.Load() {
+			if hj, ok := w.(http.Hijacker); ok {
+				if c, _, err := hj.Hijack(); err == nil {
+					_ = c.Close()
+					return
+				}
+			}
+			panic(http.ErrAbortHandler)
+		}
+		live(w, r)
+	}))
 	defer srv.Close()
-	// A second listener that is closed at once stands in for "away".
-	away := httptest.NewTLSServer(http.NotFoundHandler())
-	awayURL := away.URL
-	away.Close()
-	_ = awayURL
 
 	s := newShipper(t, srv, "n1", nil)
 	runUntilCleanup(t, s)
 	waitFor(t, "route probe", func() bool { return atomic.LoadInt32(&ig.hits) >= 1 })
-	// Point the pusher at the dead listener, offer, then bring it back.
-	live := s.push.url
-	s.push.url = strings.Replace(live, srv.URL, awayURL, 1)
+	// Go away, offer, then come back.
+	away.Store(true)
 	s.Offer(entry("c", "while away"))
-	time.Sleep(200 * time.Millisecond)
-	if st := s.State(); st["last_error"] == "" || st["dropped_total"].(int64) != 0 {
-		t.Fatalf("state while away = %v", st)
+	waitFor(t, "a transport error recorded", func() bool {
+		e, _ := s.State()["last_error"].(string)
+		return strings.Contains(e, "transport")
+	})
+	if st := s.State(); st["dropped_total"].(int64) != 0 || ig.lines() != 0 {
+		t.Fatalf("state while away = %v, server lines %d", st, ig.lines())
 	}
-	s.push.url = live
+	away.Store(false)
 	waitFor(t, "batch delivered after return", func() bool { return ig.lines() == 1 })
 }
 
