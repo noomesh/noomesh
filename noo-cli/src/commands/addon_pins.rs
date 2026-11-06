@@ -135,7 +135,15 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             Some(Ok(c)) => c,
             _ => &client,
         };
-        let ctx = addons::Ctx { root: &root, tag: &tag, stack_lock: stack_lock.as_deref(), allow_downgrade, client };
+        let images_dir = crate::commands::image_stage::images_store_dir();
+        let ctx = addons::Ctx {
+            root: &root,
+            tag: &tag,
+            stack_lock: stack_lock.as_deref(),
+            allow_downgrade,
+            client,
+            images_dir: &images_dir,
+        };
         let installed = current.get(addon).cloned();
         // The routes.json the installed bundle declared, read before the new
         // one replaces it: what the add-on suggested until now.
@@ -188,7 +196,7 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     addons::commit(&root, &p, &tag).map(|pin| {
                         // The new lock is current now: this add-on's node-workload
                         // tars on the rail that it no longer names go.
-                        if let Err(e) = addons::node_images::prune_for(&p) {
+                        if let Err(e) = addons::node_images::prune_for(ctx.images_dir, &p) {
                             if !g.json {
                                 ui::warned(&format!("{addon}: stale node-workload images stay on the rail ({e})"));
                             }

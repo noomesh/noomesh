@@ -981,7 +981,8 @@ fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
             Ok(p) => {
                 // Its node-workload images staged on the rail (i300) go with
                 // it; only files `node_images` wrote, never a core image.
-                if let Err(e) = crate::addons::node_images::prune_all(name) {
+                let images_dir = crate::commands::image_stage::images_store_dir();
+                if let Err(e) = crate::addons::node_images::prune_all(&images_dir, name) {
                     if !g.json {
                         ui::warned(&format!("{name}: its node-workload images stay on the rail ({e})"));
                     }
