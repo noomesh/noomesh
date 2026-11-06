@@ -11191,6 +11191,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/cluster/seats/{seat}/display": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create display
+         * @description [native] POST /api/cluster/seats/{seat}/display — `{key, value}`. Operator. Sets one display setting for the seat (quality, view, rotate, poll); the page picks it up within a minute through its proxy and reloads itself with it. No change at the box, no privilege there (i510 c1).
+         */
+        post: operations["seat_display_set"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/kiosk/display": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get display
+         * @description [native] GET /api/kiosk/display — the display settings the controller set for THIS display's seat (i510 c1): `{seat, display: {quality?, view?, rotate?, poll?}}`. Only a kiosk credential asks, and it gets its own seat's settings: the seat comes from the token's device, never from a parameter.
+         */
+        get: operations["display"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -26879,6 +26919,56 @@ export interface operations {
                 };
             };
         };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    seat_display_set: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    display: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
         responses: {
             /** @description OK */
             200: {

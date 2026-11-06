@@ -197,6 +197,7 @@ pub(crate) enum AuditKind {
     SeatBound,
     SeatBundleApplied, // also warning at some sites
     SeatBundleStaged,
+    SeatDisplaySet,
     SeatEnrolled,
     SeatRevoked,
     SeatTokenCreate,
@@ -332,6 +333,7 @@ impl AuditKind {
             Self::SeatBound => "seat_bound",
             Self::SeatBundleApplied => "seat_bundle_applied",
             Self::SeatBundleStaged => "seat_bundle_staged",
+            Self::SeatDisplaySet => "seat_display_set",
             Self::SeatEnrolled => "seat_enrolled",
             Self::SeatRevoked => "seat_revoked",
             Self::SeatTokenCreate => "seat_token_create",
@@ -468,6 +470,7 @@ impl AuditKind {
             Self::SeatBound => Severity::Warning,
             Self::SeatBundleApplied => Severity::Info,
             Self::SeatBundleStaged => Severity::Warning,
+            Self::SeatDisplaySet => Severity::Info,
             Self::SeatEnrolled => Severity::Warning,
             Self::SeatRevoked => Severity::Warning,
             Self::SeatTokenCreate => Severity::Warning,
@@ -601,6 +604,7 @@ impl AuditKind {
             "seat_bound" => Self::SeatBound,
             "seat_bundle_applied" => Self::SeatBundleApplied,
             "seat_bundle_staged" => Self::SeatBundleStaged,
+            "seat_display_set" => Self::SeatDisplaySet,
             "seat_enrolled" => Self::SeatEnrolled,
             "seat_revoked" => Self::SeatRevoked,
             "seat_token_create" => Self::SeatTokenCreate,
@@ -735,6 +739,7 @@ impl AuditKind {
             Self::SeatBound,
             Self::SeatBundleApplied,
             Self::SeatBundleStaged,
+            Self::SeatDisplaySet,
             Self::SeatEnrolled,
             Self::SeatRevoked,
             Self::SeatTokenCreate,
@@ -1251,6 +1256,7 @@ mod tests {
         "seat_bound",
         "seat_bundle_applied",
         "seat_bundle_staged",
+        "seat_display_set",
         "seat_enrolled",
         "seat_revoked",
         "seat_token_create",
@@ -1320,7 +1326,7 @@ mod tests {
         let mut want: Vec<String> = PINNED.iter().map(|s| s.to_string()).collect();
         want.sort();
         assert_eq!(got, want, "a kind was renamed, added or dropped: edit PINNED on purpose");
-        assert_eq!(PINNED.len(), 126);
+        assert_eq!(PINNED.len(), 127);
     }
 
     #[test]

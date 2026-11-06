@@ -22043,6 +22043,63 @@
           }
         }
       }
+    },
+    "/api/cluster/seats/{seat}/display": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create display",
+        "description": "[native] POST /api/cluster/seats/{seat}/display \u2014 `{key, value}`. Operator. Sets one display setting for the seat (quality, view, rotate, poll); the page picks it up within a minute through its proxy and reloads itself with it. No change at the box, no privilege there (i510 c1).",
+        "operationId": "seat_display_set",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/kiosk/display": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get display",
+        "description": "[native] GET /api/kiosk/display \u2014 the display settings the controller set for THIS display's seat (i510 c1): `{seat, display: {quality?, view?, rotate?, poll?}}`. Only a kiosk credential asks, and it gets its own seat's settings: the seat comes from the token's device, never from a parameter.",
+        "operationId": "display",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

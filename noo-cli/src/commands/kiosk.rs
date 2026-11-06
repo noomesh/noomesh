@@ -1703,6 +1703,17 @@ pub(crate) fn with_quality(env: &str, quality: &str) -> String {
     out.join("\n") + "\n"
 }
 
+/// On an enrolled seat, the controller command that sets what `noo kiosk
+/// set` was asked for (i510 c1); `None` on a box that is not a seat.
+pub(crate) fn seat_display_pointer(seat: Option<&str>, args: &[String]) -> Option<String> {
+    let seat = seat?;
+    let value = match args {
+        [k, v, ..] if k == "quality" && ["lean", "full", "auto"].contains(&v.as_str()) => v.as_str(),
+        _ => "lean",
+    };
+    Some(format!("noo kiosk seats set {seat} quality {value}"))
+}
+
 /// `noo kiosk set quality lean|full|auto [--dry-run]`: change the display's
 /// drawing quality and nothing else (i65 2b). `noo kiosk setup --quality`
 /// rewrites the whole seat and needs --mode, --url and --view again, so a
@@ -1710,6 +1721,12 @@ pub(crate) fn with_quality(env: &str, quality: &str) -> String {
 /// /etc/default/kiosk, keeps its mode and group, and restarts the display.
 pub fn kiosk_set(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let usage = "noo kiosk set quality lean|full|auto [--dry-run]";
+    // On an enrolled seat the controller sets the display (i510 c1); a local
+    // edit would be overridden by it anyway, so say where it is set instead.
+    if let Some(cmd) = seat_display_pointer(super::kiosk_seat::enrolled_seat_name().as_deref(), args) {
+        fail(g.json, ExitCode::Usage, "set_from_controller",
+            "this display is an enrolled seat: its quality is set from the controller", Some(&cmd));
+    }
     let (word, dry_run) = match args {
         [k, v] if k == "quality" => (v.as_str(), false),
         [k, v, d] if k == "quality" && d == "--dry-run" => (v.as_str(), true),
@@ -3499,5 +3516,22 @@ mod status_wording_tests {
         assert_eq!(measured, "12ms of work per frame, drawing full");
         // An older console that does not publish the flag keeps the old cell.
         assert_eq!(graph_frame_cell(&json!({"ms": 12, "quality": "lean"})), "12ms of work per frame, drawing lean");
+    }
+}
+
+#[cfg(test)]
+mod seat_display_pointer_tests {
+    use super::seat_display_pointer;
+
+    /// On a seat, `noo kiosk set` names the controller command instead of
+    /// editing a file the controller's setting would override.
+    #[test]
+    fn a_seat_is_set_from_the_controller() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(seat_display_pointer(None, &args(&["quality", "full"])), None, "not a seat: the local path stands");
+        assert_eq!(seat_display_pointer(Some("homeserver"), &args(&["quality", "full"])).as_deref(),
+            Some("noo kiosk seats set homeserver quality full"));
+        assert_eq!(seat_display_pointer(Some("homeserver"), &args(&["quality", "bogus"])).as_deref(),
+            Some("noo kiosk seats set homeserver quality lean"));
     }
 }
