@@ -321,7 +321,9 @@ fn walk(bytes: &[u8]) -> Found {
     found
 }
 
-/// The first key an object of `bytes` repeats, at any depth.
+/// The first key an object of `bytes` repeats, at any depth. Only the tests
+/// ask for the key alone; parse_node_workloads reads the walk directly.
+#[cfg(test)]
 fn find_duplicate_key(bytes: &[u8]) -> Option<String> {
     walk(bytes).dup.into_inner()
 }
