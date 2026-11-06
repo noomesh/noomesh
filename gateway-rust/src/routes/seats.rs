@@ -702,7 +702,8 @@ async fn check_seat_proof(
 /// whole rail (bundle, fetched, applied, heartbeat) and, through the keyless
 /// mint, its display. Re-enrolment with a new seat token clears it (i510).
 fn revoked_refusal(seat: &str, revoked_at: Option<chrono::DateTime<chrono::Utc>>) -> Result<(), AppError> {
-    match revoked_at {
+    // MUTANT: a revoked seat keeps its rail.
+    match revoked_at.filter(|_| seat.is_empty()) {
         Some(at) => {
             tracing::warn!(seat = %seat, revoked_at = %at, "seat_rail_refused_revoked");
             Err(AppError::Forbidden(format!(
