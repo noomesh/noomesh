@@ -977,14 +977,14 @@ require_compose_v2 || exit 1
     # Opt-out enforcement: stop a leftover trellion from a previous
     # enabled run — `up` above ignores unselected profiles entirely.
     if [ "${TRELLION_STOP_ON_OFF:-}" = "1" ]; then
-        docker compose $COMPOSE_FILES -f "$(addons_trellion_overlay)" stop trellion 2>/dev/null || true
+        addons_compose_stop_intended "trellion is off" $COMPOSE_FILES -f "$(addons_trellion_overlay)" -- trellion
     fi
     # Add-ons refused this start (require_addon_pins): a container left from
     # an earlier start must not keep running. Only services an add-on OWNS
     # are stopped; a core service found stopped afterwards fails the start.
     addons_stop_leftovers addons_stop_refused || exit 1
     if [ "${VOICE_STOP_ON_OFF:-}" = "1" ]; then
-        docker compose $COMPOSE_FILES -f "$(addons_voice_overlay)" stop whisper piper 2>/dev/null || true
+        addons_compose_stop_intended "voice is off" $COMPOSE_FILES -f "$(addons_voice_overlay)" -- whisper piper
     fi
 else
     # Specific services requested — auto-detect profiles

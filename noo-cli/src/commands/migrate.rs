@@ -129,7 +129,7 @@ fn sha256_file(p: &Path) -> Option<String> {
 /// (or race the 0644 dump and tarball inside it) and read the controller's
 /// whole state. mkdtemp semantics: the name is unguessable, and `mkdir`
 /// failing with EEXIST is a retry, never a reuse.
-fn private_stage(prefix: &str) -> Result<PathBuf, String> {
+pub(crate) fn private_stage(prefix: &str) -> Result<PathBuf, String> {
     use std::io::Read as _;
     use std::os::unix::fs::DirBuilderExt as _;
     for _ in 0..16 {

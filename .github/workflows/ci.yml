@@ -46,6 +46,16 @@ on:
   merge_group:
     types: [checks_requested]
 
+# ONE run per merge-queue batch. The queue builds a group per entry (dev + every
+# entry ahead + itself); with the dev ruleset's HEADGREEN grouping only the
+# newest (largest) group decides, so an older group's run is superseded the
+# moment a newer one starts and is cancelled here. Every other event gets a
+# group of its own run id: pushes, tags and pull requests are never cancelled by
+# this block (the per-job concurrency below still governs PR image builds).
+concurrency:
+  group: ${{ github.event_name == 'merge_group' && format('ci-merge-queue-{0}', github.event.merge_group.base_ref) || format('ci-run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'merge_group' }}
+
 # THE ONE SWITCH for trellion being public. 'false' until trellion and
 # trellion-protocols are public: test-core then deselects the tests that import
 # trellion and sqlx-drift skips its checks, both with a notice and with NO
@@ -1555,6 +1565,14 @@ jobs:
           smoke=docker.io/library/ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
         fi
         echo "SMOKE_IMAGE=$smoke" >> "$GITHUB_ENV"
+        # The rotation rehearsal's stub project image, from the same mirror
+        # (its default, alpine:3.20, was a Hub pull that hit the limit, #762).
+        rehearsal="$(python3 "$GITHUB_WORKSPACE/scripts/hub-mirror.py" ref library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc)" || rehearsal=""
+        if [ -z "$rehearsal" ]; then
+          echo "::warning::hub-mirror.py gave no image — alpine:3.20 from Docker Hub"
+          rehearsal=docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+        fi
+        echo "NOO_REHEARSAL_IMAGE=$rehearsal" >> "$GITHUB_ENV"
     - name: Rust toolchain id (cache key)
       id: rustc
       if: needs.scope.outputs.code == 'true' && needs.scope.outputs.deferred != 'true'

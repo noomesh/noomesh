@@ -61,6 +61,26 @@ echo "DOCKER $args" >> "$LOGF"
 case "$args" in
   "compose version") echo "Docker Compose version v2.30.0" ;;
   "image inspect"*) for r in $FAKE_LOCAL; do [ "$r" = "$3" ] && exit 0; done; exit 1 ;;
+  # The facts addons_stop_leftovers judges by: every running container's
+  # Id (`id-<svc>`), then its RestartCount and StartedAt. $FAKE_LOOPING
+  # names services that were restart-looping (5 restarts, started now);
+  # $CRASHED (a file) names those that went down on their own since:
+  # Restarting, one restart more.
+  "ps -q --no-trunc --filter label=com.docker.compose.project="*"--filter status=running")
+    sed 's/^/id-/' "$RUNNING" 2>/dev/null ;;
+  "inspect -f "*)
+    for id in "${@:4}"; do
+      svc="${id#id-}"; rc=0; st=2020-01-01T00:00:00Z
+      case " ${FAKE_LOOPING:-} " in *" $svc "*) rc=5; st="$(date -u +%Y-%m-%dT%H:%M:%SZ)" ;; esac
+      case "$3" in
+        *Config.Labels*) echo "$svc $id $rc $st" ;;
+        *State.Restarting*)
+          if grep -qx "$svc" "${CRASHED:-/nonexistent}" 2>/dev/null; then echo "true $((rc + 1))"; else echo "false $rc"; fi ;;
+      esac
+    done ;;
+  # `docker compose <args> ps -q <svc>...`: the running ones' Ids.
+  "compose "*" ps -q "*)
+    seen=""; for a in "$@"; do [ -n "$seen" ] && grep -qx "$a" "$RUNNING" && echo "cid-$a"; [ "$a" = -q ] && seen=1; done ;;
   # A project's containers: $RUNNING lists the running services; `stop`
   # takes a service off it, as the daemon would.
   "ps -q"*"com.docker.compose.service="*)
@@ -300,18 +320,23 @@ set -u
 COMPOSE_FILES="-f {root}/docker-compose.cluster.yml"
 stop_the_gateway() {{ docker stop cid-gateway >/dev/null; }}
 stop_its_own() {{ _ADDON_STOPPED="${{_ADDON_STOPPED}}noo-rhold "; docker stop cid-noo-rhold >/dev/null; }}
+# worker goes down on its own while the stop runs (it crashed; docker is
+# about to restart it).
+worker_goes_down() {{ docker stop cid-worker >/dev/null; echo worker >> "$CRASHED"; }}
+worker_down_and_the_gateway_stopped() {{ worker_goes_down; stop_the_gateway; }}
 addons_stop_leftovers {fn}; echo "rc=$?"
 """
 
 
-def _guard(tmp: Path, fn: str) -> subprocess.CompletedProcess:
+def _guard(tmp: Path, fn: str, env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     bindir = tmp / "bin"
     bindir.mkdir(exist_ok=True)
     (bindir / "docker").write_text(FAKE_DOCKER)
     (bindir / "docker").chmod(0o755)
     (tmp / "running").write_text(RUNNING_BEFORE)
     env = {"PATH": f"{bindir}:{os.environ['PATH']}", "HOME": str(tmp), "LOGF": str(tmp / "log"),
-           "RUNNING": str(tmp / "running"), "NOO_ADDON_MAP_OVERRIDE": "1", "NOO_ADDON_MAP": ""}
+           "RUNNING": str(tmp / "running"), "CRASHED": str(tmp / "crashed"),
+           "NOO_ADDON_MAP_OVERRIDE": "1", "NOO_ADDON_MAP": "", **(env_extra or {})}
     return subprocess.run(["bash", "-c", LIB_BODY.format(root=ROOT, fn=fn)], cwd=tmp, env=env,
                           capture_output=True, text=True, timeout=60)
 
@@ -324,6 +349,69 @@ def test_a_core_service_stopped_by_an_addon_stop_fails_loudly_and_names_it(tmp_p
     assert "service(s) gateway stopped" in r.stderr and "NOT fully up" in r.stderr, r.stderr
     r = _guard(tmp_path, "stop_its_own")
     assert "rc=0" in r.stdout, (r.stdout, r.stderr)
+
+
+def test_a_core_service_looping_before_the_stop_is_not_counted_as_stopped(tmp_path: Path) -> None:
+    # harness 0.6.17 review a2: worker was restart-looping before the roll
+    # (often why the operator rolls): "running" when the launcher looked,
+    # "restarting" a moment later. That is not the launcher's doing: a line,
+    # rc 0, and `up` recreates it.
+    r = _guard(tmp_path, "worker_goes_down", {"FAKE_LOOPING": "worker"})
+    assert "rc=0" in r.stdout, (r.stdout, r.stderr)
+    assert "worker was restart-looping before the launcher's add-on stop (5 restarts" in r.stderr, r.stderr
+    assert "NOT fully up" not in r.stderr, r.stderr
+    # The guard still holds beside it: a stable gateway the stop took down fails, named alone.
+    r = _guard(tmp_path, "worker_down_and_the_gateway_stopped", {"FAKE_LOOPING": "worker"})
+    assert "rc=1" in r.stdout, (r.stdout, r.stderr)
+    assert "ERROR: service(s) gateway stopped" in r.stderr, r.stderr
+
+
+def test_a_stable_core_service_that_goes_down_on_its_own_is_not_counted_as_stopped(tmp_path: Path) -> None:
+    # Stable before, and docker is restarting it now (Restarting, one restart
+    # more): it crashed on its own during the stop, which stopped only its own.
+    r = _guard(tmp_path, "worker_goes_down")
+    assert "rc=0" in r.stdout, (r.stdout, r.stderr)
+    assert "worker went down on its own while the launcher stopped add-on containers (restarting, 1 restarts)" in r.stderr, r.stderr
+
+
+def test_a_refused_addons_stop_is_recorded_for_the_post_roll_gate(tmp_path: Path) -> None:
+    # harness 0.6.17 review a1: the CLI hands the launcher a per-roll file
+    # (NOO_LAUNCHER_STOPS); each container stopped on purpose is one
+    # `<id> <reason>` line, which the gate (restart_loops.rs) reads as Stopped.
+    stops = tmp_path / "stops"
+    stops.write_text("")
+    r = _off_run(tmp_path, RHOLD_OVERLAY, {"NOO_LAUNCHER_STOPS": str(stops)}, addon="rhold",
+                 fn="addons_stop_refused", pre="_NOO_ADDONS_REFUSED=rhold")
+    assert "rc=0" in r.stdout, (r.stdout, r.stderr)
+    assert "noo-rhold" not in _running(tmp_path), r.stderr
+    assert stops.read_text() == "cid-noo-rhold add-on rhold was refused this start\n"
+    # Without the handoff (a start the CLI's gate does not follow) nothing is written, nothing fails.
+    shutil.rmtree(tmp_path / "root")
+    shutil.rmtree(tmp_path / "bin")
+    r = _off_run(tmp_path, RHOLD_OVERLAY, addon="rhold", fn="addons_stop_refused", pre="_NOO_ADDONS_REFUSED=rhold")
+    assert "rc=0" in r.stdout and "WARNING" not in r.stderr, (r.stdout, r.stderr)
+
+
+def test_a_switched_off_stop_is_recorded_and_still_stops(tmp_path: Path) -> None:
+    stops = tmp_path / "stops"
+    stops.write_text("")
+    r = _off_run(tmp_path, RHOLD_OVERLAY, {"NOO_LAUNCHER_STOPS": str(stops)}, addon="rhold",
+                 running=RUNNING_BEFORE + "whisper\npiper\n",
+                 fn=None, pre='addons_compose_stop_intended "voice is off" -f x.yml -- whisper piper; echo "rc=$?"')
+    assert "rc=0" in r.stdout, (r.stdout, r.stderr)
+    assert stops.read_text() == "cid-whisper voice is off\ncid-piper voice is off\n"
+    assert not {"whisper", "piper"} & _running(tmp_path)
+    assert "gateway" in _running(tmp_path)
+
+
+def test_every_launcher_stop_after_up_is_recorded() -> None:
+    # The switched-off stops in start and rebuild go through the recorder;
+    # no bare `compose ... stop trellion|whisper` is left to slip past the gate.
+    for name in ["noomesh-start.sh", "noomesh-rebuild.sh"]:
+        src = (ROOT / "scripts" / name).read_text()
+        assert src.count('addons_compose_stop_intended "trellion is off" ') == 1, name
+        assert src.count('addons_compose_stop_intended "voice is off" ') == 1, name
+        assert not re.search(r"compose[^\n]* stop (trellion|whisper)", src), name
 
 
 def test_own_services_are_read_from_the_files_without_running_compose(tmp_path: Path) -> None:
@@ -381,7 +469,8 @@ addons_stop_leftovers addons_stop_disabled; echo "rc=$?"
 
 
 def _off_run(tmp_path: Path, overlay: str, env_extra: dict[str, str] | None = None, with_overlay: bool = True,
-             addon: str = "rhold", running: str = RUNNING_BEFORE):
+             addon: str = "rhold", running: str = RUNNING_BEFORE, fn: str | None = "addons_stop_disabled",
+             pre: str = ""):
     root = tmp_path / "root"
     (root / "scripts").mkdir(parents=True)
     shutil.copy(ROOT / "scripts" / "lib-addons.sh", root / "scripts" / "lib-addons.sh")
@@ -394,10 +483,12 @@ def _off_run(tmp_path: Path, overlay: str, env_extra: dict[str, str] | None = No
     (bindir / "docker").write_text(FAKE_DOCKER)
     (bindir / "docker").chmod(0o755)
     (tmp_path / "running").write_text(running)
+    run = f'addons_stop_leftovers {fn}; echo "rc=$?"' if fn else ""
     body = f"""
 . {root}/scripts/lib-addons.sh
 COMPOSE_FILES="-f {root}/docker-compose.cluster.yml"
-addons_stop_leftovers addons_stop_disabled; echo "rc=$?"
+{pre}
+{run}
 """
     env = {"PATH": f"{bindir}:{os.environ['PATH']}", "HOME": str(tmp_path), "LOGF": str(tmp_path / "log"),
            "RUNNING": str(tmp_path / "running"), "FAKE_SERVICES_NEED_PROFILE": "1",
@@ -459,6 +550,14 @@ RH_VOICE_OVERLAY = """services:
     volumes:
       - ${RH_VOICE_COORDINATOR_SECRETS_DIR:?RH_VOICE_COORDINATOR_SECRETS_DIR must be set}:/run/secrets:ro
 """
+
+
+def test_a_hyphenated_declared_off_addon_without_its_overlay_is_said(tmp_path: Path) -> None:
+    # harness 0.6.17 review a3: the map's name pattern had no `-`, so
+    # `rh-voice=0` with its overlay gone was never listed, and skipped silently.
+    r = _off_run(tmp_path, "", with_overlay=False, addon="rh-voice")
+    assert "rc=0" in r.stdout, (r.stdout, r.stderr)
+    assert "add-on rh-voice is declared off but its overlay is gone, so its containers were NOT checked: noo doctor orphans" in r.stderr, r.stderr
 
 
 def test_hyphenated_addon_false_removes_both_of_its_containers(tmp_path: Path) -> None:
