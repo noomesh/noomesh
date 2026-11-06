@@ -5146,36 +5146,47 @@ pub(crate) fn nats_principals_check(users_conf: Option<&str>, bridge_sites: &[(S
     ok("nats principals", detail)
 }
 
-/// The add-ons `/health` reports as enabled, sorted (the console's Access
-/// page reads the same list).
-pub(crate) fn enabled_addons(health: &Value) -> Vec<String> {
-    let mut v: Vec<String> = health["addons"]
-        .as_object()
-        .map(|m| m.iter().filter(|(_, st)| st.as_str() == Some("enabled")).map(|(k, _)| k.clone()).collect())
-        .unwrap_or_default();
-    v.sort();
-    v
-}
-
-/// One enabled add-on and its `GET /api/addons/{addon}/access` body, or why it was not read.
+/// One registered add-on and its `GET /api/addons/{addon}/access` body, or why it was not read.
 pub(crate) type AccessRead = (String, Result<Value, String>);
-/// Every enabled add-on's read, or why `/health` itself was not read.
+/// Every registered add-on's read, or why `/health` itself was not read.
 pub(crate) type AccessReads = Result<Vec<AccessRead>, String>;
 
-/// `/health`'s enabled add-ons, then `GET /api/addons/{addon}/access` for each.
+/// The add-ons whose access can be read: `/health`'s `addons_registered`,
+/// the runtime registry, where every add-on has a route manifest. NOT the
+/// `enabled` words in `addons`: those include the compiled rows (identity,
+/// trellion, trellion_intel), which have no manifest, so 0.6.17-rc.1 asked
+/// for each one's access, got 404, and WARNed on every install. The gateway
+/// says which add-ons are registered; the CLI never names one. Without the
+/// field (a gateway older than this CLI) nothing is guessed: not read.
+pub(crate) fn registered_addons(health: &Value) -> Result<Vec<String>, String> {
+    let list = health["addons_registered"]
+        .as_array()
+        .ok_or_else(|| "/health has no addons_registered (a gateway older than this CLI)".to_string())?;
+    let mut v: Vec<String> = list.iter().filter_map(|n| n.as_str().map(str::to_string)).collect();
+    v.sort();
+    v.dedup();
+    Ok(v)
+}
+
+/// The registered add-ons, then `read` (their access body) for each. Pure
+/// over the health body so which add-ons are asked about is pinned.
+pub(crate) fn access_reads_from(health: &Value, read: impl Fn(&str) -> Result<Value, String>) -> AccessReads {
+    Ok(registered_addons(health)?.into_iter().map(|a| {
+        let r = read(&a);
+        (a, r)
+    }).collect())
+}
+
+/// `/health`'s registered add-ons, then `GET /api/addons/{addon}/access` for each.
 /// The health read is AUTHENTICATED (`health_body`, as the `gateway fds` row
 /// reads it): an anonymous `/health` is liveness only (`{"status"}`), so the
 /// unauthenticated read found no add-on and the row always said "no add-on
 /// is enabled" (0.6.17 rehearsal review, A-addonsugg.row).
 fn addon_access_reads(g: &Globals) -> AccessReads {
     let health = health_body(g).ok_or_else(|| "/health: not read (no authenticated health body)".to_string())?;
-    Ok(enabled_addons(&health)
-        .into_iter()
-        .map(|a| {
-            let r = crate::http::get_json_try(g, &format!("/api/addons/{}/access", crate::commands::urlencode(&a)), true, 15);
-            (a, r)
-        })
-        .collect())
+    access_reads_from(&health, |a| {
+        crate::http::get_json_try(g, &format!("/api/addons/{}/access", crate::commands::urlencode(a)), true, 15)
+    })
 }
 
 /// The `add-on access` row (noomesh-internal f99, section 6). WARN for a
@@ -5193,7 +5204,7 @@ pub(crate) fn addon_access_check(reads: AccessReads) -> Check {
         Err(e) => return warn(ROW, format!("not read: {e}"), Some("noo cluster verify --controller   # again once the gateway answers".into())),
     };
     if reads.is_empty() {
-        return ok(ROW, "no add-on is enabled");
+        return ok(ROW, "no add-on is registered");
     }
     let mut unmet: Vec<(String, String, String)> = Vec::new();
     let mut unread: Vec<String> = Vec::new();
@@ -9999,14 +10010,7 @@ mod tests {
         let h = addon_access_check(Err("/health: connection refused".into()));
         assert_eq!(h.verdict, Verdict::Warn);
         assert!(h.detail.contains("/health: connection refused"), "{}", h.detail);
-        assert_eq!(addon_access_check(Ok(vec![])).detail, "no add-on is enabled");
-    }
-
-    #[test]
-    fn enabled_addons_are_the_ones_health_calls_enabled() {
-        let h = serde_json::json!({"addons": {"rhaddon": "enabled", "voice": "disabled", "intel": "enabled", "x": "starting"}});
-        assert_eq!(enabled_addons(&h), vec!["intel".to_string(), "rhaddon".to_string()]);
-        assert!(enabled_addons(&serde_json::json!({"status": "ok"})).is_empty());
+        assert_eq!(addon_access_check(Ok(vec![])).detail, "no add-on is registered");
     }
 
     #[test]
@@ -12249,6 +12253,44 @@ mod addon_access_health_tests {
         let body = crate::test_src::fn_body(&code, "fn addon_access_reads(");
         assert!(body.contains("health_body(g)"), "{body}");
         assert!(!body.contains("\"/health\", false"), "an anonymous /health names no add-on: {body}");
-        assert!(super::enabled_addons(&serde_json::json!({"status": "healthy"})).is_empty(), "what the anonymous read sees");
+        assert!(super::registered_addons(&serde_json::json!({"status": "healthy"})).is_err(), "what the anonymous read sees");
+    }
+
+    /// 0.6.17-rc.1 defect: the row read the `enabled` words in `addons`,
+    /// which include the compiled rows (identity, trellion,
+    /// trellion_intel). They have no manifest, the access route 404s each
+    /// one, and the row WARNed on every install. Only the registry's add-ons
+    /// are asked about, so this install's row passes.
+    #[test]
+    fn only_registered_add_ons_are_asked_about() {
+        use super::{access_reads_from, addon_access_check, Verdict};
+        let health = serde_json::json!({
+            "status": "healthy",
+            "addons": {"identity": "enabled", "trellion": "enabled", "trellion_intel": "enabled", "voice": "disabled", "rhaddon": "enabled"},
+            "addons_registered": ["rhaddon"],
+        });
+        let asked = std::cell::RefCell::new(Vec::<String>::new());
+        let reads = access_reads_from(&health, |a| {
+            asked.borrow_mut().push(a.to_string());
+            if a == "rhaddon" {
+                Ok(serde_json::json!({"addon": "rhaddon", "legacy": false, "features": [], "settings": []}))
+            } else {
+                Err(format!("HTTP 404: add-on {a:?} is not registered on this gateway"))
+            }
+        });
+        assert_eq!(*asked.borrow(), vec!["rhaddon".to_string()], "only the registered add-on is read");
+        let c = addon_access_check(reads);
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.starts_with("1 add-on(s)"), "{}", c.detail);
+        assert!(!c.detail.contains("identity") && !c.detail.contains("trellion"), "{}", c.detail);
+
+        // No field (an older gateway): not read, never a guessed list.
+        let older = serde_json::json!({"status": "healthy", "addons": {"rhaddon": "enabled"}});
+        let c = addon_access_check(access_reads_from(&older, |_| panic!("nothing is asked about")));
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("no addons_registered"), "{}", c.detail);
+        // Registered, none: an empty list is a pass.
+        let none = serde_json::json!({"addons": {"trellion": "enabled"}, "addons_registered": []});
+        assert_eq!(addon_access_check(access_reads_from(&none, |_| panic!("none"))).verdict, Verdict::Ok);
     }
 }

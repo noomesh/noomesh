@@ -1813,6 +1813,9 @@ async fn health(
         // i353b: why each `unhealthy` add-on was refused; `{}` when none.
         // `noo cluster verify` FAILs an enabled add-on named here.
         body["addons_refused"] = crate::addons::health_refused_map();
+        // The add-ons with a manifest (the runtime registry), sorted, `[]`
+        // when none: the only ones `/api/addons/{name}/access` answers.
+        body["addons_registered"] = json!(crate::addons::health_registered());
         // i277f: `noo upgrade` compares it across a roll (reconnect hint).
         body["mcp_catalogue"] = json!(crate::mcp_external::catalogue_digest());
     }
