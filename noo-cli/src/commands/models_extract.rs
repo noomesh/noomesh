@@ -11,9 +11,17 @@
 //! dependency). It is deliberately strict and refuses, with a stated reason,
 //! everything it does not understand:
 //!
-//! - only a regular file (typeflag `0` or NUL) is accepted. A symlink, a hard
-//!   link, a device, a FIFO, a directory, a sparse entry, a GNU long-name or
-//!   long-link record and a pax header are each refused;
+//! - only a regular file (typeflag `0` or NUL) is extracted. A symlink, a hard
+//!   link, a device, a FIFO, a sparse entry, a GNU long-name or long-link
+//!   record and a pax header are each refused;
+//! - a directory entry (typeflag `5`, as `tar` writes for `voices/`) is
+//!   skipped: nothing is created for it and its mode and owner are never
+//!   applied. It still counts toward the entry cap, passes the name checks
+//!   (one trailing `/` stripped) and must have size 0. Names are kept as the
+//!   archive spells them, so `voices/NATM2.pt` is the set path `voices/NATM2.pt`;
+//! - both the POSIX (`ustar\0`) and the old GNU (`ustar  \0`) magic are read;
+//! - a member the glob does not select is not written, but it counts toward
+//!   the entry and byte caps and passes the same type and name checks;
 //! - a name that is absolute, has a `..` component, or changes under
 //!   normalisation (`./a`, `a//b`, `a/`) is refused, and so is a duplicate
 //!   (also one that differs only in ASCII case);
@@ -299,8 +307,9 @@ fn open_stream(archive: &Path, lim: &Limits) -> Result<Stream, String> {
 
 /// Extract the regular files of the gzip-compressed (or plain) tar `archive`
 /// whose names match `glob` (all of them without one) into `out`, which is
-/// created. Every refusal is a sentence. Files are written 0644, new, never
-/// over anything. On `Err` the caller discards `out`.
+/// created. Directory entries are skipped. Every refusal is a sentence. Files
+/// are written 0644, new, never over anything. On `Err` the caller discards
+/// `out`.
 pub(crate) fn extract(
     archive: &Path,
     glob: Option<&str>,
@@ -324,6 +333,16 @@ pub(crate) fn extract(
             return Err("an archive header has a bad checksum (not a tar archive?)".to_string());
         }
         let name = entry_name(&h)?;
+        if h[156] == b'5' {
+            // A directory entry: it passes the same name checks (less one
+            // trailing `/`), is never created, and its mode and owner are
+            // never applied. A file under it makes its own directory.
+            check_name(name.strip_suffix('/').unwrap_or(&name))?;
+            if octal(&h[124..136]) != Some(0) {
+                return Err(format!("directory entry {name:?} has a size: it must be empty"));
+            }
+            continue;
+        }
         if h[156] != b'0' && h[156] != 0 {
             let what = kind_name(h[156]);
             return Err(format!("member {name:?} is {what}: only regular files are extracted"));
@@ -397,11 +416,30 @@ pub(crate) mod testkit {
         h[157..157 + link.len()].copy_from_slice(link.as_bytes());
         h[257..263].copy_from_slice(b"ustar\0");
         h[263..265].copy_from_slice(b"00");
+        seal(h)
+    }
+
+    /// Write the checksum of a header whose other fields are final.
+    pub(crate) fn seal(mut h: [u8; 512]) -> [u8; 512] {
         h[148..156].fill(b' ');
         let sum: u32 = h.iter().map(|b| u32::from(*b)).sum();
         let ck = format!("{sum:06o}\0 ");
         h[148..156].copy_from_slice(ck.as_bytes());
         h
+    }
+
+    /// The same header with the old GNU magic `ustar  \0`, as GNU tar writes.
+    pub(crate) fn old_gnu(mut h: [u8; 512]) -> [u8; 512] {
+        h[257..265].copy_from_slice(b"ustar  \0");
+        seal(h)
+    }
+
+    /// One regular file under an old GNU header.
+    pub(crate) fn gnu_file(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut b = old_gnu(header(name, data.len() as u64, b'0', "")).to_vec();
+        b.extend_from_slice(data);
+        pad(&mut b, data.len() as u64);
+        b
     }
 
     pub(crate) fn pad(buf: &mut Vec<u8>, size: u64) {
@@ -437,7 +475,7 @@ pub(crate) mod testkit {
 
 #[cfg(test)]
 mod tests {
-    use super::testkit::{file, gz, header, other, pad, tar};
+    use super::testkit::{file, gnu_file, gz, header, old_gnu, other, pad, seal, tar};
     use super::*;
     use flate2::write::GzEncoder;
     use flate2::Compression;
@@ -574,10 +612,9 @@ mod tests {
     }
 
     #[test]
-    fn a_fifo_a_directory_a_sparse_entry_and_the_gnu_and_pax_tricks_are_refused() {
-        let cases: [(u8, &str); 6] = [
+    fn a_fifo_a_sparse_entry_and_the_gnu_and_pax_tricks_are_refused() {
+        let cases: [(u8, &str); 5] = [
             (b'6', "a FIFO"),
-            (b'5', "a directory"),
             (b'S', "a sparse file"),
             (b'L', "GNU long name"),
             (b'K', "GNU long name"),
@@ -702,6 +739,98 @@ mod tests {
         let why = refused("members", &many, &SMALL);
         assert!(why.contains("more than 8 entries"), "{why}");
         assert!(run("members-ok", &gz(&tar(&many[..8])), None, &SMALL).0.is_ok());
+    }
+
+    /// A directory entry as `tar` writes it: typeflag 5, the given size field
+    /// (0 in a real archive), mode 0777 and an owner, old GNU magic.
+    fn dir_entry(name: &str, size: u64) -> Vec<u8> {
+        let mut h = header(name, size, b'5', "");
+        h[100..107].copy_from_slice(b"0000777");
+        h[265..269].copy_from_slice(b"root");
+        old_gnu(seal(h)).to_vec()
+    }
+
+    #[test]
+    fn a_directory_entry_creates_nothing_whatever_its_mode_and_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let e = vec![dir_entry("voices/", 0), file("voices/a.pt", b"alpha")];
+        let (r, out) = run("dir-skip", &gz(&tar(&e)), None, &SMALL);
+        let got = r.expect("the directory entry is skipped");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].path, "voices/a.pt");
+        let top: Vec<_> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|d| d.unwrap().file_name())
+            .collect();
+        assert_eq!(top, ["voices"]);
+        // `voices` was made by create_dir_all for the file; the entry's 0777 was not applied.
+        let mode = std::fs::metadata(out.join("voices")).unwrap().permissions().mode();
+        assert_ne!(mode & 0o777, 0o777, "the mode of the directory entry was applied");
+        // A directory entry no file lives under leaves nothing at all.
+        let e = vec![dir_entry("extra/", 0), file("a.pt", b"alpha")];
+        let (r, out) = run("dir-skip-bare", &gz(&tar(&e)), Some("*.pt"), &SMALL);
+        assert_eq!(r.expect("extracted").len(), 1);
+        assert!(!out.join("extra").exists());
+        // A directory entry alone is no regular file.
+        let why = refused("dir-only", &[dir_entry("voices/", 0)], &SMALL);
+        assert!(why.contains("no regular file"), "{why}");
+        // A directory entry passes the name checks, less one trailing slash.
+        for name in ["../x/", "/abs/", "voices//", "./"] {
+            let why = refused("dir-name", &[dir_entry(name, 0)], &SMALL);
+            assert!(why.contains("member"), "{name}: {why}");
+        }
+    }
+
+    #[test]
+    fn a_directory_entry_with_a_size_is_refused() {
+        let why = refused("dir-size", &[dir_entry("voices/", 512), file("a.pt", b"x")], &SMALL);
+        assert!(why.contains("has a size"), "{why}");
+        // The same archive with a size-0 entry is taken: the refusal is the check's.
+        let e = vec![dir_entry("voices/", 0), file("a.pt", b"x")];
+        assert!(run("dir-size-control", &gz(&tar(&e)), None, &SMALL).0.is_ok());
+    }
+
+    #[test]
+    fn the_real_old_gnu_layout_extracts() {
+        let e = vec![
+            dir_entry("voices/", 0),
+            gnu_file("voices/NATM2.pt", b"first voice"),
+            gnu_file("voices/NATF0.pt", b"second voice"),
+            gnu_file("voices/VARF1.pt", b"third voice"),
+        ];
+        let (r, out) = run("gnu-layout", &gz(&tar(&e)), Some("voices/*.pt"), &SMALL);
+        let got = r.expect("the real layout extracts");
+        let paths: Vec<&str> = got.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(paths, ["voices/NATM2.pt", "voices/NATF0.pt", "voices/VARF1.pt"]);
+        assert_eq!(got[0].sha256, hex::encode(Sha256::digest(b"first voice")));
+        assert_eq!(got[1].sha256, hex::encode(Sha256::digest(b"second voice")));
+        assert_eq!(got[2].sha256, hex::encode(Sha256::digest(b"third voice")));
+        assert_eq!(std::fs::read(out.join("voices/VARF1.pt")).unwrap(), b"third voice");
+    }
+
+    #[test]
+    fn unselected_members_count_toward_the_entry_cap() {
+        let lim = Limits { members: 3, ..SMALL };
+        let mut e = vec![file("a.pt", b"x")];
+        e.extend((0..3).map(|i| file(&format!("skip{i}.bin"), b"x")));
+        let (r, _) = run("cap-unselected", &gz(&tar(&e)), Some("*.pt"), &lim);
+        let why = r.expect_err("four entries against a cap of three");
+        assert!(why.contains("more than 3 entries"), "{why}");
+        // Three entries, one selected, are taken.
+        let (r, _) = run("cap-unselected-ok", &gz(&tar(&e[..3])), Some("*.pt"), &lim);
+        assert_eq!(r.expect("three entries").len(), 1);
+    }
+
+    #[test]
+    fn a_directory_entry_counts_toward_the_entry_cap() {
+        let lim = Limits { members: 3, ..SMALL };
+        let mut e = vec![dir_entry("voices/", 0)];
+        e.extend((0..3).map(|i| file(&format!("a{i}.pt"), b"x")));
+        let why = run("cap-dir", &gz(&tar(&e)), None, &lim).0.expect_err("four entries");
+        assert!(why.contains("more than 3 entries"), "{why}");
+        // The directory entry and two files are three entries: taken.
+        let got = run("cap-dir-ok", &gz(&tar(&e[..3])), None, &lim).0.expect("three entries");
+        assert_eq!(got.len(), 2);
     }
 
     #[test]
