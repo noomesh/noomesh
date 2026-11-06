@@ -1,0 +1,40 @@
+{
+  "format": "noo-model-set/1",
+  "id": "rh-voices-a",
+  "revision": "v1",
+  "kind": "voice-pack",
+  "modality": "speech-to-speech",
+  "runtime": [
+    "rh-s2s"
+  ],
+  "source": {
+    "local": {
+      "verified": true
+    }
+  },
+  "license": {
+    "id": "example-open-model-license",
+    "url": "https://example.invalid/licenses/open-model",
+    "accept": "none"
+  },
+  "files": [
+    {
+      "path": "voices/alice.pt",
+      "bytes": 1048576,
+      "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    }
+  ],
+  "needs": {
+    "profiles": [
+      {
+        "name": "default",
+        "accel": "cpu"
+      }
+    ],
+    "cpu_fallback": true,
+    "arch": [
+      "amd64",
+      "arm64"
+    ]
+  }
+}

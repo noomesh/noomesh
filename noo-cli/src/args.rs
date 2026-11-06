@@ -302,7 +302,7 @@ mod tests {
         use crate::commands::{approval, ops, security, security_local};
         use crate::commands::{
             agents, cluster, cluster_class, cluster_embedding_space, cluster_provision, cluster_push_secrets, models,
-            models_fetch,
+            models_fetch, models_sets,
         };
         type Probe = fn(&mut Args);
         fn row<'a>(w: &'a [&'a str], p: Probe) -> (&'a [&'a str], Probe) {
@@ -383,6 +383,9 @@ mod tests {
             row(&["cluster", "sync-images"], |a| { let _ = cluster_provision::parse_sync_images_with(a); }),
             row(&["models", "pull"], |a| { let _ = models::parse_pull_with(a); }),
             row(&["models", "fetch"], |a| { let _ = models_fetch::parse_fetch_with(a); }),
+            row(&["models", "stage"], |a| { let _ = models_sets::parse_stage_with(a); }),
+            row(&["models", "accept"], |a| { let _ = models_sets::parse_accept_with(a); }),
+            row(&["models", "rm"], |a| { let _ = models_sets::parse_rm_with(a); }),
             row(&["models", "list"], |a| { let _ = models::parse_list_with(a); }),
             row(&["models", "search"], |a| { let _ = models::parse_search_with(a); }),
             row(&["models", "recommended"], |a| { let _ = models::parse_recommended_with(a); }),

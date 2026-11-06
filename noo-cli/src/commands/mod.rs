@@ -74,6 +74,7 @@ pub mod migrate;
 pub mod migrate_db;
 pub mod models;
 pub mod models_fetch;
+pub mod models_sets;
 pub mod ollama_stage;
 pub mod voice_models;
 pub mod pki;
@@ -173,6 +174,7 @@ pub use mesh::{
 };
 pub use migrate::{migrate_export, migrate_import};
 pub use models_fetch::models_fetch;
+pub use models_sets::{models_accept, models_rm, models_stage};
 pub use models::{
     models_cached, models_huggingface, models_info, models_list, models_ollama, models_pull,
     models_recommended, models_search,
