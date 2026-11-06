@@ -765,7 +765,7 @@ pub fn is_reserved_on_origin(path: &str) -> bool {
     ["/api/", "/ws/", "/__noo/"].iter().any(|p| path.starts_with(p)) || path == "/api" || path == "/ws"
 }
 
-/// May this request redeem a code? Only a top-level navigation that no
+/// May this request redeem a code? Only a tab or iframe navigation that no
 /// other site started: no `Origin` other than this origin, no cross-site
 /// `Sec-Fetch-Site`, and (when the browser says) `Sec-Fetch-Mode: navigate`.
 pub fn redeem_request_ok(headers: &HeaderMap, port: u16) -> bool {
@@ -1255,6 +1255,21 @@ mod tests {
         let mut x = h.clone();
         x.insert(header::ORIGIN, HeaderValue::from_static("https://evil.example"));
         assert!(!redeem_request_ok(&x, 8451), "a foreign Origin");
+    }
+
+    #[test]
+    fn iframe_redemption_accepts_same_site_navigation_but_refuses_foreign_sites() {
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, HeaderValue::from_static("noo-controller.tail.ts.net:8451"));
+        h.insert("sec-fetch-dest", HeaderValue::from_static("iframe"));
+        h.insert("sec-fetch-site", HeaderValue::from_static("same-site"));
+        h.insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
+        assert!(redeem_request_ok(&h, 8451), "the console may navigate its isolated iframe");
+        let mut cross_site = h.clone();
+        cross_site.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
+        assert!(!redeem_request_ok(&cross_site, 8451), "a foreign site must not redeem in an iframe");
+        h.insert(header::ORIGIN, HeaderValue::from_static("https://evil.example"));
+        assert!(!redeem_request_ok(&h, 8451), "a foreign Origin is refused even with same-site metadata");
     }
 
     #[test]
