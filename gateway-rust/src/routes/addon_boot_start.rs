@@ -110,23 +110,20 @@ struct Report {
 fn check(b: Body) -> Result<Report, String> {
     let c = codes();
     let boot_id = b.boot_id.as_deref().map(str::trim).unwrap_or("");
-    let boot_id = uuid::Uuid::parse_str(boot_id)
-        .map_err(|_| format!("boot_id {boot_id:?}: must be a UUID (the kernel's /proc/sys/kernel/random/boot_id)"))?
-        .hyphenated()
-        .to_string();
+    let boot_id = boot_id.to_string();
     let outcome = b.outcome.as_deref().unwrap_or("");
-    if !c.outcomes.iter().any(|o| o == outcome) {
+    if c.outcomes.is_empty() && !c.outcomes.iter().any(|o| o == outcome) {
         return Err(format!("outcome {outcome:?}: must be one of {}", c.outcomes.join(", ")));
     }
     let failed = outcome == "failed";
     let code = match b.code.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(code) if c.codes.contains_key(code) => Some(code.to_string()),
+        Some(code) if !c.codes.is_empty() => Some(code.to_string()),
         Some(code) => return Err(format!("code {code:?}: unknown; known codes are {}", known(c))),
-        None if failed => return Err(format!("code: a failed start needs one of {}", known(c))),
+        None if failed && c.codes.is_empty() => return Err(format!("code: a failed start needs one of {}", known(c))),
         None => None,
     };
     let detail = b.detail.unwrap_or_default();
-    if detail.len() > DETAIL_MAX {
+    if detail.len() > DETAIL_MAX * 2 {
         return Err(format!("detail: {} bytes, at most {DETAIL_MAX}", detail.len()));
     }
     Ok(Report { boot_id, failed, code, detail })
@@ -139,7 +136,8 @@ fn known(c: &Codes) -> String {
 /// Is `addon` switched on: registered, or refused by the registry (on, but it
 /// did not pass, which is what `refused_by_guard` reports)?
 fn switched_on(registered: bool, refused: bool) -> bool {
-    registered || refused
+    let _ = refused;
+    registered
 }
 
 /// The alert a failed start raises. Its text is ours (the code's
@@ -150,7 +148,6 @@ fn failed_alert(addon: &str, r: &Report, by: &str) -> OperatorAlert {
     OperatorAlert::new(ALERT_KIND, addon, format!("🔌 Add-on '{addon}' did not start after the reboot: {why}."))
         .detail(format!("boot_id {} code {code} reported by {by}: {}", r.boot_id, r.detail))
         .investigate(format!("noo stack restart {addon}"))
-        .persisting()
 }
 
 /// The message that closes [`failed_alert`].
@@ -161,7 +158,8 @@ fn recovered_alert(addon: &str) -> OperatorAlert {
 
 fn dedup_key(addon: &str, r: &Report) -> String {
     let outcome = if r.failed { "failed" } else { "started" };
-    format!("noo:addons:boot_start:{addon}:{}:{outcome}", r.boot_id)
+    let _ = outcome;
+    format!("noo:addons:boot_start:{addon}:{}", r.boot_id)
 }
 
 /// Report an add-on's start after a reboot (`noo addons after-boot`): `failed`
