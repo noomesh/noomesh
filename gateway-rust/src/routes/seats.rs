@@ -901,7 +901,8 @@ pub(crate) fn display_with(current: &Value, key: &str, value: &str) -> Result<Va
         return Ok(Value::Object(d));
     }
     let v = match key {
-        "quality" if ["lean", "full", "auto"].contains(&value) => json!(value),
+        // MUTANT: any quality word is stored for the page to guess at.
+        "quality" if !value.is_empty() => json!(value),
         "quality" => return Err(format!("quality must be lean, full, auto or default, not '{value}'")),
         "view" if ["health", "graph"].contains(&value) => json!(value),
         "view" => return Err(format!("view must be health, graph or default, not '{value}'")),
