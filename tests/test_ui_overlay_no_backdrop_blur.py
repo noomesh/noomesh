@@ -5,8 +5,9 @@
 
 A `backdrop-filter: blur(...)` over animated content made the console's modals
 flicker on the operator's browser (GPU compositing of an animated backdrop);
-the same fix in pai-voice (personifAI/pai-voice 7abf9f0e) held. The overlays
-keep their translucent background; the blur is gone and must not come back.
+dropping the blur and keeping the dimming fixed the same flicker elsewhere.
+The overlays keep their translucent background; the blur is gone and must
+not come back.
 """
 
 from __future__ import annotations
