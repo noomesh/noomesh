@@ -81,6 +81,8 @@ func newLife(t *testing.T) *lifeHarness {
 	h.p.lc.doorCall = d.call
 	h.p.lc.now = clk.now
 	h.p.lc.pollFast, h.p.lc.pollSlow = time.Millisecond, 2*time.Millisecond
+	h.p.lc.pollDrain = time.Millisecond
+	h.entry.Drain.TimeoutSecs = 1 // a drain that must fail really waits this out
 	h.p.SetAdmit(func(context.Context, nodewl.Entry) error { return nil })
 	t.Cleanup(func() { h.p.Close(); h.p.Wait() })
 	return &lifeHarness{harness: h, door: d, clock: clk}
@@ -149,6 +151,7 @@ func countOf(calls []string, prefix string) int {
 }
 
 const (
+	doneP = "/v1/lifecycle/drain/done" // the fixture's drain.done_path
 	wName = "noo-wl-rhaddon-worker"
 	dName = "noo-stunnel-rhaddon-worker"
 )
@@ -251,6 +254,7 @@ func TestReleaseDrainsThenStopsThenRecreatesFreshAndStopped(t *testing.T) {
 	h := newLife(t)
 	h.door.status("GET", "/health/ready", 200)
 	h.door.status("POST", "/v1/lifecycle/drain", 200)
+	h.door.status("GET", doneP, 200)
 	h.p.Converge(context.Background(), h.running())
 	eventually(t, "ready", func() bool { return h.row().Ready })
 
@@ -333,6 +337,7 @@ func TestADrainThatFailedIsRetriedAndThenCompletes(t *testing.T) {
 	h.p.Wait()
 
 	h.door.status("POST", "/v1/lifecycle/drain", 200)
+	h.door.status("GET", doneP, 200)
 	h.p.Converge(context.Background(), h.provisioned())
 	h.p.Wait()
 	if r := h.row(); r.State != nodewl.StateProvisioned || r.Reason != "" {
@@ -397,6 +402,7 @@ func TestAbsentFromRunningDrainsFirst(t *testing.T) {
 		t.Fatalf("an undrained worker was removed")
 	}
 	h.door.status("POST", "/v1/lifecycle/drain", 200)
+	h.door.status("GET", doneP, 200)
 	h.p.Converge(context.Background(), e)
 	h.p.Wait()
 	if h.api.ctr(wName) != nil || h.row().State != nodewl.StateAbsent {
@@ -503,6 +509,7 @@ func TestStartManagedStartsAndStopManagedReleases(t *testing.T) {
 	h := newLife(t)
 	h.door.status("GET", "/health/ready", 200)
 	h.door.status("POST", "/v1/lifecycle/drain", 200)
+	h.door.status("GET", doneP, 200)
 	if err := h.p.StartManaged(context.Background(), h.running()); err != nil {
 		t.Fatal(err)
 	}

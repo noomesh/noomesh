@@ -357,7 +357,7 @@ The agent creates the worker with exactly this and nothing more.
 | Env | the entry's declared keys; `<ADDON_UPPER>_MODEL_<SLOT_UPPER>_ID` and `_REVISION` per placed slot (comma-separated for a `many` slot); `HF_HUB_OFFLINE=1`; `TRANSFORMERS_OFFLINE=1`. Nothing else. A declared key that collides with one the agent sets is `env_out_of_bounds` |
 | Limits | memory `limits.ram_mb` (swap equal to memory, so none), `limits.cpus`, `limits.pids` |
 | Restart | `no` |
-| Labels | `noo.addon`, `noo.workload`, `noo.managed-by=agent`, `noo.role`, `noo.spec.hash`, and `noo.reservation` when set |
+| Labels | `noo.addon`, `noo.workload`, `noo.managed-by=agent`, `noo.role`, `noo.spec.hash`, and `noo.reservation` when set. The worker also carries `noo.drain-path`, `noo.drain-done-path` and `noo.drain-timeout-secs` |
 
 Only `.verified` sets are bound (a set the agent has not verified is
 `set_unverified`, one it does not hold is `set_missing`, one still being
@@ -481,7 +481,17 @@ carried in desired-config only as part of the verbatim `decl`.
   `drain_timeout` with state `needs_attention` and **never cuts a live
   session**; the worker keeps running. A worker that exits during the drain is
   `crashed` and is recreated fresh and stopped.
-- any state to `absent`: remove the worker, sidecar and network.
+- any state to `absent`: remove the worker, sidecar and network. A running
+  worker is drained first, as in a release.
+- **Orphans.** When a desired-config read **succeeds** and parses as a whole,
+  and a workload this agent created (found by its `noo.managed-by=agent`
+  labels, not by memory) has no entry in it, that workload is `absent`: drained
+  first if running, then deprovisioned. This is the only way a workload leaves
+  the node without the gateway naming it. A read that failed, did not parse, or
+  held a row whose addon or name could not be read removes nothing. An orphan
+  whose drain times out stays running and keeps reporting `needs_attention`,
+  and is retried on the next pass. The worker carries its drain config in the
+  labels above so an orphan can be drained after an agent restart.
 
 **Reported states.** The desired states are only `absent`, `provisioned` and
 `running`. A heartbeat row may also report two states that never appear in

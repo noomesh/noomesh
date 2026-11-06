@@ -54,6 +54,9 @@ type fakeProv struct {
 	// fake is guarded; tests read it through the locked helpers.
 	mu    sync.Mutex
 	clock func() time.Time
+
+	onRemove func(name string) // called as a container is removed
+	listErr  error             // ListManaged fails with this
 }
 
 func (f *fakeProv) ctr(name string) *ctrInfo {
@@ -149,6 +152,9 @@ func (f *fakeProv) CreateContainer(_ context.Context, s createSpec) error {
 	return nil
 }
 func (f *fakeProv) RemoveContainer(_ context.Context, name string) error {
+	if f.onRemove != nil {
+		f.onRemove(name) // before the lock: the hook may read the lifecycle's rows
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.ctrs[name]; ok {
@@ -178,6 +184,36 @@ func (f *fakeProv) RemoveNetwork(_ context.Context, name string) error {
 }
 func (f *fakeProv) RemoveVolumes(context.Context, string, string) error { f.volumes++; return nil }
 func (f *fakeProv) NvidiaRuntime(context.Context) bool                  { return f.nvidia }
+
+// ListManaged lists what the fake daemon holds with noo.managed-by=agent, the
+// way the real one does: by label, one ref per workload.
+func (f *fakeProv) ListManaged(context.Context) ([]managedRef, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	byKey := map[string]*managedRef{}
+	for _, c := range f.ctrs {
+		if c.Labels[LabelManagedBy] != ManagedByAgent || c.Labels[LabelAddon] == "" {
+			continue
+		}
+		k := wlKey(c.Labels[LabelAddon], c.Labels[LabelWorkload])
+		ref := byKey[k]
+		if ref == nil {
+			ref = &managedRef{Addon: c.Labels[LabelAddon], Name: c.Labels[LabelWorkload]}
+			byKey[k] = ref
+		}
+		if c.Labels[LabelRole] == RoleWorker {
+			ref.Labels = c.Labels
+		}
+	}
+	var out []managedRef
+	for _, r := range byKey {
+		out = append(out, *r)
+	}
+	return out, nil
+}
 
 func (f *fakeProv) mutated() bool {
 	for _, c := range f.calls {
@@ -388,6 +424,8 @@ func TestWorkerSpecGolden(t *testing.T) {
 	wantLabels := map[string]string{
 		LabelAddon: "rhaddon", LabelWorkload: "worker", LabelManagedBy: "agent", LabelRole: "worker",
 		SpecHashLabel: cfg.Labels[SpecHashLabel],
+		// The drain config rides on the worker so an orphan can be drained (F5b).
+		LabelDrainPath: "/v1/lifecycle/drain", LabelDrainDone: "/v1/lifecycle/drain/done", LabelDrainTimeout: "420",
 	}
 	if !reflect.DeepEqual(cfg.Labels, wantLabels) || cfg.Labels[SpecHashLabel] == "" {
 		t.Errorf("labels %v", cfg.Labels)

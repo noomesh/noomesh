@@ -101,6 +101,17 @@ type provAPI interface {
 	RemoveNetwork(ctx context.Context, name string) error
 	RemoveVolumes(ctx context.Context, addon, workload string) error
 	NvidiaRuntime(ctx context.Context) bool
+	// ListManaged is every workload this agent created (label
+	// noo.managed-by=agent), one ref per addon/workload, with the labels of
+	// the worker container when it has them. A list error is an error, never
+	// an empty list.
+	ListManaged(ctx context.Context) ([]managedRef, error)
+}
+
+// managedRef is one workload found on the node by its labels.
+type managedRef struct {
+	Addon, Name string
+	Labels      map[string]string // the worker's labels (the drain config rides here)
 }
 
 // NodeWorkloads provisions node workloads. Build one with NewNodeWorkloads;
