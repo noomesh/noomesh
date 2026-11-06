@@ -97,6 +97,10 @@ type Server struct {
 	// workloadOps overrides the docker client for the add-on workload
 	// actuator (tests only).
 	workloadOps workloadOps
+	// managed is the lifecycle of the node workloads this agent provisioned
+	// (label noo.managed-by=agent, i300 F5b). The actuator routes them here;
+	// every other workload keeps the container path. nil = none.
+	managed dockerpkg.ManagedControl
 
 	// warmer sends one warm request per vLLM container start before the
 	// heartbeat reads it ready (backend_warm.go). Built on first use.
@@ -179,6 +183,11 @@ func (s *Server) SetGPUHold(hold func(ctx context.Context, req gpuyield.HoldRequ
 	release func(ctx context.Context, req gpuyield.ReleaseRequest) (gpuyield.Contention, error)) {
 	s.gpuHold, s.gpuRelease = hold, release
 }
+
+// SetManagedWorkloads installs the lifecycle of the node workloads this agent
+// provisions, which the add-on workload actuator routes agent-managed
+// workloads to (i300 F5b).
+func (s *Server) SetManagedWorkloads(m dockerpkg.ManagedControl) { s.managed = m }
 
 // SetDiskReclaim installs the node disk-reclaim state provider.
 func (s *Server) SetDiskReclaim(f func() any) { s.diskReclaim = f }

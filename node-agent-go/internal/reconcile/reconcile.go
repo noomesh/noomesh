@@ -55,6 +55,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelname"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelsets"
+	"github.com/noomesh/noomesh/node-agent-go/internal/nodepolicy"
 	"github.com/noomesh/noomesh/node-agent-go/internal/occupancy"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
 )
@@ -133,6 +134,15 @@ type Reconciler struct {
 	// sets holds the model sets desired-config names (i300 F4). nil in tests
 	// that build a Reconciler by hand; convergeModelSets is then skipped.
 	sets *modelsets.Store
+	// nodeWL drives the add-on node workloads (i300 F5b) and facts reports the
+	// node's consent policy and placement facts. nil in tests that build a
+	// Reconciler by hand; convergeNodeWorkloads is then skipped. nwBusy, nwMu
+	// and nwWG hold one converge goroutine per workload.
+	nodeWL nodeWorkloads
+	facts  *nodepolicy.Facts
+	nwMu   sync.Mutex
+	nwBusy map[string]bool
+	nwWG   sync.WaitGroup
 	// native probes backends served outside Docker on this host. nil off
 	// darwin, where there is no native lane at all — nil rather than an
 	// inert value so "no lane here" stays distinct from "lane found nothing".
@@ -234,6 +244,8 @@ func shouldStartOllamaPull(st *ollamaPullState, now time.Time) bool {
 }
 
 func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harness hostsvc.Service) *Reconciler {
+	sets := modelsets.New(dockerpkg.ModelsDir(), cfg)
+	nw, facts := newNodeWorkloads(cfg, docker, sets)
 	return &Reconciler{
 		cfg:             cfg,
 		docker:          docker,
@@ -242,7 +254,9 @@ func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harn
 		importModel:     docker.ImportOllamaModel,
 		client:          client,
 		mcp:             mcpsrv.New(cfg, client, docker),
-		sets:            modelsets.New(dockerpkg.ModelsDir(), cfg),
+		sets:            sets,
+		nodeWL:          nw,
+		facts:           facts,
 		native:          backendrt.NewAdopted(),
 		harness:         harness,
 		runnerInstalled: runnerOnDisk,
@@ -348,6 +362,7 @@ var reconcilePhases = []phase{
 	{"fetchDesired", (*Reconciler).fetchDesired},
 	{"publishProfileAndEmbedTarget", (*Reconciler).publishProfileAndEmbedTarget},
 	{"convergeModelSets", (*Reconciler).convergeModelSets},
+	{"convergeNodeWorkloads", (*Reconciler).convergeNodeWorkloads},
 	{"settleEmptyState", (*Reconciler).settleEmptyState},
 	{"convergeMcpServers", (*Reconciler).convergeMcpServers},
 	{"ensureModelsDir", (*Reconciler).ensureModelsDir},

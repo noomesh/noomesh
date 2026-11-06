@@ -100,6 +100,10 @@ func (d dockerProvAPI) InspectContainer(ctx context.Context, name string) (*ctrI
 	}
 	if c.State != nil {
 		info.Running = c.State.Running
+		info.Status = string(c.State.Status)
+		if t, perr := time.Parse(time.RFC3339Nano, c.State.StartedAt); perr == nil && !t.IsZero() && t.Year() > 1 {
+			info.StartedAt = t
+		}
 	}
 	if c.NetworkSettings != nil {
 		for n, ep := range c.NetworkSettings.Networks {
@@ -116,6 +120,14 @@ func (d dockerProvAPI) CreateContainer(ctx context.Context, s createSpec) error 
 		Config: s.Config, HostConfig: s.Host, NetworkingConfig: s.Net, Name: s.Name,
 	})
 	return err
+}
+
+func (d dockerProvAPI) StartContainer(ctx context.Context, name string) error {
+	return d.c.StartContainer(ctx, name)
+}
+
+func (d dockerProvAPI) StopContainer(ctx context.Context, name string, graceS int) error {
+	return d.c.StopContainerGraceful(ctx, name, graceS)
 }
 
 func (d dockerProvAPI) RemoveContainer(ctx context.Context, name string) error {
