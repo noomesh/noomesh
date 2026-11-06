@@ -105,6 +105,15 @@ does):
   total, as named constants, not after the fact.
 - Only regular files are extracted. No links, devices, FIFOs, sparse entries
   or long-link entries.
+- A directory entry is skipped: nothing is created for it, and its mode and
+  owner are never applied. It still counts toward the entry cap and passes the
+  same name checks (a trailing `/` aside). A directory entry with a non-zero
+  size is refused.
+- A member the glob does not select is not extracted, but it still counts
+  toward the entry and byte caps and passes the same type and name checks.
+- Member names are kept as the archive spells them (`voices/NATF0.pt` stays
+  `voices/NATF0.pt`), so every selected name must itself be a valid set path.
+  Nothing is renamed, so two members can never collide after a rename.
 - No duplicate member names, and no name changed by normalisation.
 - Extract to a temp directory, and rename into the set only after **every**
   member has passed.
