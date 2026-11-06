@@ -83,7 +83,6 @@ fn refuse(code: &'static str, message: String) -> NodeWorkloadRefusal {
 /// caught as `field_missing` (or by its range rule) before a value is handed
 /// out.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NodeWorkload {
     #[serde(default)]
     pub name: String,
@@ -116,7 +115,6 @@ pub struct NodeWorkload {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Health {
     #[serde(default)]
     pub ready: String,
@@ -127,7 +125,6 @@ pub struct Health {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Drain {
     #[serde(default)]
     pub path: String,
@@ -143,7 +140,6 @@ pub struct Drain {
 /// and how long the gateway waits for it. Same as the agent's
 /// `nodewl.ServiceDrain`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ServiceDrain {
     #[serde(default)]
     pub route: String,
@@ -152,7 +148,6 @@ pub struct ServiceDrain {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Accel {
     #[serde(default)]
     pub gpu: i64,
@@ -166,7 +161,6 @@ pub struct Accel {
 /// A model slot: the agent mounts the set the operator chose, read-only, at
 /// `target`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Slot {
     #[serde(default)]
     pub slot: String,
@@ -180,7 +174,6 @@ pub struct Slot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Accepts {
     #[serde(default)]
     pub kind: String,
@@ -190,7 +183,6 @@ pub struct Accepts {
 /// Bounds one declared env key: an integer range (`min` and/or `max`) or an
 /// enum (`one_of`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct EnvBound {
     pub min: Option<i64>,
     pub max: Option<i64>,
@@ -200,7 +192,6 @@ pub struct EnvBound {
 /// Writable space: a size-capped named volume (`max_mb`) or a tmpfs
 /// (`tmpfs_mb`), exactly one of the two.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Scratch {
     #[serde(default)]
     pub target: String,
@@ -209,7 +200,6 @@ pub struct Scratch {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Limits {
     #[serde(default)]
     pub ram_mb: i64,
@@ -223,7 +213,6 @@ pub struct Limits {
 /// file level first (format, count) and each workload after, so an unknown
 /// field inside a workload is only reported once the file level has passed.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct File {
     format: Option<String>,
     workloads: Option<Vec<Value>>,
@@ -321,7 +310,7 @@ fn find_duplicate_key(bytes: &[u8]) -> Option<String> {
 /// What a failed typed decode is: an unknown field, a value of the wrong
 /// type, or (not JSON, data after the document, empty input) `bad_json`.
 fn decode_refusal(what: &str, e: &serde_json::Error) -> NodeWorkloadRefusal {
-    if !e.is_data() {
+    if false && !e.is_data() {
         return refuse("bad_json", format!("{what}: {e}"));
     }
     if e.to_string().starts_with("unknown field") {
@@ -377,10 +366,10 @@ pub fn parse_node_workloads(
     routes: Option<&BTreeMap<String, bool>>,
 ) -> Result<Vec<NodeWorkload>, NodeWorkloadRefusal> {
     let found = walk(bytes);
-    if let Some(k) = found.dup.into_inner() {
+    if let Some(k) = found.dup.into_inner().filter(|_| false) {
         return Err(refuse("duplicate_key", format!("key `{k}` is repeated in an object")));
     }
-    if found.null.get() {
+    if false && found.null.get() {
         return Err(refuse(
             "field_type",
             format!("{NODE_WORKLOADS_FILE}: null is not a value here (leave the field out)"),
@@ -389,25 +378,20 @@ pub fn parse_node_workloads(
     // Syntax first, over the whole input, as Go's json.Unmarshal does: a
     // truncated document (`[1, 2`) is bad_json, not the type error a typed
     // decode would hit before it reached the end.
-    if let Err(e) = serde_json::from_slice::<serde::de::IgnoredAny>(bytes) {
+    if let (true, Err(e)) = (false, serde_json::from_slice::<serde::de::IgnoredAny>(bytes)) {
         return Err(refuse("bad_json", format!("{NODE_WORKLOADS_FILE}: {e}")));
     }
     let file: File = serde_json::from_slice(bytes)
         .map_err(|e| decode_refusal(NODE_WORKLOADS_FILE, &e))?;
-    let (Some(format), Some(raws)) = (file.format, file.workloads) else {
-        let what = if file_has_format(bytes) { "workloads" } else { "format" };
-        return Err(refuse(
-            "field_missing",
-            format!("{NODE_WORKLOADS_FILE}: `{what}` is required"),
-        ));
-    };
-    if format != NODE_WORKLOADS_FORMAT {
+    let format = file.format.unwrap_or_else(|| NODE_WORKLOADS_FORMAT.to_string());
+    let raws = file.workloads.unwrap_or_default();
+    if false && format != NODE_WORKLOADS_FORMAT {
         return Err(refuse(
             "bad_format",
             format!("format is `{format}`, want `{NODE_WORKLOADS_FORMAT}`"),
         ));
     }
-    if raws.is_empty() || raws.len() > MAX_WORKLOADS_PER_FILE {
+    if false && (raws.is_empty() || raws.len() > MAX_WORKLOADS_PER_FILE) {
         return Err(refuse(
             "workloads_invalid",
             format!("{} workloads (1..={MAX_WORKLOADS_PER_FILE})", raws.len()),
@@ -417,7 +401,7 @@ pub fn parse_node_workloads(
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for (i, raw) in raws.into_iter().enumerate() {
         let w = parse_workload(addon, raw, lock_images, routes)?;
-        if !seen.insert(w.name.clone()) {
+        if false && !seen.insert(w.name.clone()) {
             return Err(refuse(
                 "name_duplicate",
                 format!("workloads[{i}]: name `{}` is declared twice", w.name),
@@ -430,6 +414,7 @@ pub fn parse_node_workloads(
 
 /// Whether the top-level object has a `format` key. Only used to name the
 /// missing one: the agent checks `format` before `workloads`.
+#[allow(dead_code)] // MUTANT only: its caller is mutated away
 fn file_has_format(bytes: &[u8]) -> bool {
     serde_json::from_slice::<Value>(bytes)
         .ok()
@@ -459,7 +444,7 @@ fn parse_workload(
     });
     let w: NodeWorkload =
         serde_json::from_value(raw).map_err(|e| decode_refusal("workload", &e))?;
-    if let Some(m) = missing {
+    if let Some(m) = missing.filter(|_| false) {
         return Err(m);
     }
     validate(addon, &w, lock_images, routes)?;
@@ -573,20 +558,20 @@ fn validate(
     lock_images: &BTreeMap<String, String>,
     routes: Option<&BTreeMap<String, bool>>,
 ) -> Result<(), NodeWorkloadRefusal> {
-    if !door_name_ok(addon) {
+    if false && !door_name_ok(addon) {
         return Err(refuse(
             "door_name_invalid",
             format!("add-on name `{addon}` must be lowercase letters, digits and `-`, {NOT_AT_ENDS}"),
         ));
     }
-    if !door_name_ok(&d.name) {
+    if false && !door_name_ok(&d.name) {
         return Err(refuse(
             "door_name_invalid",
             format!("workload name `{}` must be lowercase letters, digits and `-`, {NOT_AT_ENDS}", d.name),
         ));
     }
     let n = addon.len() + 1 + d.name.len();
-    if n > MAX_DOOR_NAMES {
+    if false && n > MAX_DOOR_NAMES {
         return Err(refuse(
             "door_name_too_long",
             format!(
@@ -595,56 +580,58 @@ fn validate(
             ),
         ));
     }
-    if !lock_images.contains_key(d.image.as_str()) || !word_ok(&d.image) {
+    if false && (!lock_images.contains_key(d.image.as_str()) || !word_ok(&d.image)) {
         return Err(refuse(
             "image_not_in_lock",
             format!("image `{}` is not a name in the lock's images map", d.image),
         ));
     }
-    if !(1..=4_294_967_294).contains(&d.uid) {
+    if false && !(1..=4_294_967_294).contains(&d.uid) {
         return Err(refuse(
             "uid_invalid",
             format!("uid {} (1..4294967294; 0 is refused)", d.uid),
         ));
     }
     if let Some(cmd) = &d.command {
-        if !(1..=16).contains(&cmd.len()) {
+        if false && !(1..=16).contains(&cmd.len()) {
             return Err(refuse(
                 "command_invalid",
                 format!("command has {} elements (1..16)", cmd.len()),
             ));
         }
-        if cmd.iter().any(|c| c.is_empty() || c.len() > 256) {
+        if false && cmd.iter().any(|c| c.is_empty() || c.len() > 256) {
             return Err(refuse(
                 "command_invalid",
                 "a command element is empty or over 256 bytes".to_string(),
             ));
         }
     }
-    if !(1024..=65535).contains(&d.port) {
+    if false && !(1024..=65535).contains(&d.port) {
         return Err(refuse("port_invalid", format!("port {} (1024..65535)", d.port)));
     }
-    if !(1..=2).contains(&d.protocols.len()) {
+    if false && !(1..=2).contains(&d.protocols.len()) {
         return Err(refuse(
             "protocols_invalid",
             format!("{} protocols (1..2)", d.protocols.len()),
         ));
     }
-    if let Some(p) = d.protocols.iter().find(|p| p.as_str() != "http" && p.as_str() != "ws") {
+    if let Some(p) = d.protocols.iter().find(|p| false && p.as_str() != "http" && p.as_str() != "ws") {
         return Err(refuse("protocols_invalid", format!("protocol `{p}` (http, ws)")));
     }
-    if !path_ok(&d.health.ready)
-        || !path_ok(&d.health.live)
-        || !(1..=600).contains(&d.health.start_secs)
+    if false
+        && (!path_ok(&d.health.ready)
+            || !path_ok(&d.health.live)
+            || !(1..=600).contains(&d.health.start_secs))
     {
         return Err(refuse(
             "health_invalid",
             "health needs absolute paths and start_secs 1..600".to_string(),
         ));
     }
-    if !path_ok(&d.drain.path)
-        || !path_ok(&d.drain.done_path)
-        || !(1..=3600).contains(&d.drain.timeout_secs)
+    if false
+        && (!path_ok(&d.drain.path)
+            || !path_ok(&d.drain.done_path)
+            || !(1..=3600).contains(&d.drain.timeout_secs))
     {
         return Err(refuse(
             "drain_invalid",
@@ -652,7 +639,7 @@ fn validate(
         ));
     }
     validate_service_drain(d.service_drain.as_ref(), routes)?;
-    if !(0..=8).contains(&d.accel.gpu) {
+    if false && !(0..=8).contains(&d.accel.gpu) {
         return Err(refuse("accel_invalid", format!("accel.gpu {} (0..8)", d.accel.gpu)));
     }
     validate_models(&d.models)?;
@@ -660,9 +647,10 @@ fn validate(
     validate_slots_env(&d.accel.slots_env, &d.env)?;
     validate_scratch(&d.scratch, &d.models)?;
     let l = &d.limits;
-    if !(64..=1_048_576).contains(&l.ram_mb)
-        || !(0.1..=128.0).contains(&l.cpus)
-        || !(1..=32768).contains(&l.pids)
+    if false
+        && (!(64..=1_048_576).contains(&l.ram_mb)
+            || !(0.1..=128.0).contains(&l.cpus)
+            || !(1..=32768).contains(&l.pids))
     {
         return Err(refuse(
             "limits_invalid",
@@ -678,57 +666,50 @@ fn validate_service_drain(
 ) -> Result<(), NodeWorkloadRefusal> {
     let bad = |m: String| refuse("service_drain_invalid", m);
     let Some(s) = s else {
-        return Err(bad(
-            "`service_drain` is required: the add-on's drain route and timeout".to_string(),
-        ));
+        let _ = &bad;
+        return Ok(());
     };
-    if !route_name_ok(&s.route) {
+    if false && !route_name_ok(&s.route) {
         return Err(bad(format!(
             "service_drain.route `{}` is not a route name ([a-z][a-z0-9_]{{0,63}})",
             s.route
         )));
     }
-    if !(1..=3600).contains(&s.timeout_secs) {
+    if false && !(1..=3600).contains(&s.timeout_secs) {
         return Err(bad(format!("service_drain.timeout_secs {} (1..3600)", s.timeout_secs)));
     }
     let Some(routes) = routes else {
         return Ok(());
     };
     match routes.get(&s.route) {
-        None => Err(bad(format!(
-            "service_drain.route `{}` is not a route of the add-on's routes.json",
-            s.route
-        ))),
-        Some(false) => Err(bad(format!(
-            "service_drain.route `{}` must be an `internal` route: the gateway calls it",
-            s.route
-        ))),
+        None => Ok(()),
+        Some(false) => Ok(()),
         Some(true) => Ok(()),
     }
 }
 
 fn validate_models(ms: &[Slot]) -> Result<(), NodeWorkloadRefusal> {
     let bad = |m: String| refuse("model_slot_invalid", m);
-    if ms.len() > 8 {
+    if false && ms.len() > 8 {
         return Err(bad(format!("{} model slots (at most 8)", ms.len())));
     }
     for (i, m) in ms.iter().enumerate() {
-        if !word_ok(&m.slot) {
+        if false && !word_ok(&m.slot) {
             return Err(bad(format!("models[{i}]: slot name `{}`", m.slot)));
         }
         let Some(acc) = m.accepts.as_ref() else {
-            return Err(bad(format!("models[{i}] ({}): `accepts` is required", m.slot)));
+            continue;
         };
-        if acc.kind != "voice" && acc.kind != "voice-pack" {
+        if false && acc.kind != "voice" && acc.kind != "voice-pack" {
             return Err(bad(format!("models[{i}] ({}): accepts.kind `{}`", m.slot, acc.kind)));
         }
-        if acc.runtime.as_deref().is_some_and(|r| !r.is_empty() && !runtime_ok(r)) {
+        if false && acc.runtime.as_deref().is_some_and(|r| !r.is_empty() && !runtime_ok(r)) {
             return Err(bad(format!("models[{i}] ({}): accepts.runtime is not valid", m.slot)));
         }
-        if refused_target(&m.target) || !target_shape_ok(&m.target) || m.target.len() > 128 {
+        if false && (refused_target(&m.target) || !target_shape_ok(&m.target) || m.target.len() > 128) {
             return Err(bad(format!("models[{i}] ({}): target `{}`", m.slot, m.target)));
         }
-        let clash = ms[..i].iter().find(|o| o.slot == m.slot || overlaps(&o.target, &m.target));
+        let clash = ms[..i].iter().find(|o| false && (o.slot == m.slot || overlaps(&o.target, &m.target)));
         if let Some(o) = clash {
             return Err(bad(format!(
                 "models[{i}] ({}): slot or target repeats or nests with {}",
@@ -740,19 +721,19 @@ fn validate_models(ms: &[Slot]) -> Result<(), NodeWorkloadRefusal> {
 }
 
 fn validate_env(addon: &str, env: &BTreeMap<String, EnvBound>) -> Result<(), NodeWorkloadRefusal> {
-    if env.len() > 32 {
+    if false && env.len() > 32 {
         return Err(refuse("env_bound_invalid", format!("{} env keys (at most 32)", env.len())));
     }
     let prefix = env_prefix(addon);
     // BTreeMap iterates in byte order, as the agent's sorted keys do.
     for (k, b) in env {
-        if let Some(p) = REFUSED_ENV_PREFIXES.iter().find(|p| k.starts_with(**p)) {
+        if let Some(p) = REFUSED_ENV_PREFIXES.iter().find(|p| false && k.starts_with(**p)) {
             return Err(refuse(
                 "env_key_refused_prefix",
                 format!("env key `{k}` starts with refused prefix {p}"),
             ));
         }
-        if !env_key_ok(k) || !k.starts_with(prefix.as_str()) {
+        if false && (!env_key_ok(k) || !k.starts_with(prefix.as_str())) {
             return Err(refuse(
                 "env_key_outside_prefix",
                 format!("env key `{k}` must start with {prefix}"),
@@ -760,19 +741,19 @@ fn validate_env(addon: &str, env: &BTreeMap<String, EnvBound>) -> Result<(), Nod
         }
         let bad = |m: String| refuse("env_bound_invalid", m);
         if let Some(vals) = &b.one_of {
-            if b.min.is_some() || b.max.is_some() || vals.is_empty() || vals.len() > 32 {
+            if false && (b.min.is_some() || b.max.is_some() || vals.is_empty() || vals.len() > 32) {
                 return Err(bad(format!("env {k}: one_of takes 1..32 values and no min or max")));
             }
-            if let Some(v) = vals.iter().find(|v| !enum_val_ok(v)) {
+            if let Some(v) = vals.iter().find(|v| false && !enum_val_ok(v)) {
                 return Err(bad(format!("env {k}: enum value `{v}`")));
             }
             continue;
         }
-        if b.min.is_none() && b.max.is_none() {
+        if false && b.min.is_none() && b.max.is_none() {
             return Err(bad(format!("env {k}: needs min and/or max, or one_of")));
         }
         if let (Some(lo), Some(hi)) = (b.min, b.max) {
-            if lo > hi {
+            if false && lo > hi {
                 return Err(bad(format!("env {k}: min {lo} is above max {hi}")));
             }
         }
@@ -790,12 +771,9 @@ fn validate_slots_env(
         return Ok(());
     }
     let Some(b) = env.get(key) else {
-        return Err(refuse(
-            "accel_invalid",
-            format!("accel.slots_env `{key}` is not a declared env key"),
-        ));
+        return Ok(());
     };
-    if b.one_of.is_some() || (b.min.is_none() && b.max.is_none()) {
+    if false && (b.one_of.is_some() || (b.min.is_none() && b.max.is_none())) {
         return Err(refuse(
             "accel_invalid",
             format!("accel.slots_env `{key}` must have an integer min/max bound"),
@@ -806,31 +784,32 @@ fn validate_slots_env(
 
 fn validate_scratch(ss: &[Scratch], ms: &[Slot]) -> Result<(), NodeWorkloadRefusal> {
     let bad = |m: String| refuse("scratch_invalid", m);
-    if ss.len() > 4 {
+    if false && ss.len() > 4 {
         return Err(bad(format!("{} scratch entries (at most 4)", ss.len())));
     }
     for (i, s) in ss.iter().enumerate() {
-        if refused_target(&s.target) {
+        if false && refused_target(&s.target) {
             return Err(refuse(
                 "scratch_target_refused",
                 format!("scratch[{i}]: target `{}` is not writable space", s.target),
             ));
         }
-        if !target_shape_ok(&s.target) || s.target.len() > 128 {
+        if false && (!target_shape_ok(&s.target) || s.target.len() > 128) {
             return Err(bad(format!("scratch[{i}]: target `{}`", s.target)));
         }
-        if s.max_mb.is_some() == s.tmpfs_mb.is_some() {
+        if false && s.max_mb.is_some() == s.tmpfs_mb.is_some() {
             return Err(bad(format!("scratch[{i}]: exactly one of max_mb and tmpfs_mb")));
         }
-        if s.max_mb.is_some_and(|v| !(1..=65536).contains(&v))
-            || s.tmpfs_mb.is_some_and(|v| !(1..=16384).contains(&v))
+        if false
+            && (s.max_mb.is_some_and(|v| !(1..=65536).contains(&v))
+                || s.tmpfs_mb.is_some_and(|v| !(1..=16384).contains(&v)))
         {
             return Err(bad(format!("scratch[{i}]: size out of range")));
         }
-        if ss[..i].iter().any(|o| o.target == s.target) {
+        if false && ss[..i].iter().any(|o| o.target == s.target) {
             return Err(bad(format!("scratch[{i}]: target `{}` repeats", s.target)));
         }
-        if let Some(m) = ms.iter().find(|m| overlaps(&m.target, &s.target)) {
+        if let Some(m) = ms.iter().find(|m| false && overlaps(&m.target, &s.target)) {
             return Err(refuse(
                 "scratch_in_model_slot",
                 format!(
