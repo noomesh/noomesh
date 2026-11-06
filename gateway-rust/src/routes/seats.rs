@@ -91,6 +91,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/cluster/seats", get(seats_list))
         .route("/api/cluster/seats/{seat}/bind", post(seat_bind))
         .route("/api/cluster/seats/{seat}/revoke", post(seat_revoke))
+        .route("/api/cluster/seats/{seat}/display", post(seat_display_set))
         .route("/api/cluster/seats/{seat}/bundle",
             post(seat_bundle_put).layer(DefaultBodyLimit::max(MAX_SEAT_BODY)))
         .route("/api/cluster/seats/{seat}/status", get(seat_bundle_status))
@@ -532,11 +533,11 @@ async fn seats_list(
                 Option<chrono::DateTime<chrono::Utc>>, Option<Value>, Option<String>,
                 Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>,
                 Option<String>, Option<i32>, Option<String>, Option<String>,
-                Option<chrono::DateTime<chrono::Utc>>);
+                Option<chrono::DateTime<chrono::Utc>>, Option<Value>);
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT s.seat_name, s.birth_cert, s.facts, s.enroll_user, s.enrolled_at, s.last_seen, s.heartbeat, \
                 encode(sha256(b.blob), 'hex'), b.fetched_at, b.applied_at, b.applied_sha, b.apply_rc, b.apply_msg, \
-                s.tailnet_name, s.revoked_at \
+                s.tailnet_name, s.revoked_at, s.display \
          FROM noo_seats s LEFT JOIN noo_seat_bundles b ON b.seat_name = s.seat_name \
          ORDER BY s.seat_name",
     )
@@ -544,10 +545,11 @@ async fn seats_list(
     .await?;
     let seats: Vec<Value> = rows
         .into_iter()
-        .map(|(name, cert, facts, user, enrolled, seen, hb, sha, fetched, applied, applied_sha, rc, msg, tailnet, revoked)| {
+        .map(|(name, cert, facts, user, enrolled, seen, hb, sha, fetched, applied, applied_sha, rc, msg, tailnet, revoked, display)| {
             json!({
                 "seat_name": name,
                 "tailnet_name": tailnet,
+                "display": display.unwrap_or_else(|| json!({})),
                 "revoked_at": revoked.map(|t| t.to_rfc3339()),
                 "role": "seat",
                 "birth_cert": cert,
@@ -884,6 +886,70 @@ async fn seat_heartbeat(
     Ok(Json(json!({ "recorded": true, "seat": seat, "tailnet_name": bound })))
 }
 
+/// The display settings with one key changed (i510 c1): `quality`
+/// lean|full|auto, `view` health|graph, `rotate`/`poll` whole seconds
+/// 0..=86400. `default` removes the key, so the box's own
+/// /etc/default/kiosk value applies again. Anything else is refused, never
+/// stored for the page to guess at.
+pub(crate) fn display_with(current: &Value, key: &str, value: &str) -> Result<Value, String> {
+    let mut d = current.as_object().cloned().unwrap_or_default();
+    if value == "default" {
+        if !["quality", "view", "rotate", "poll"].contains(&key) {
+            return Err(format!("unknown display setting '{key}' (quality, view, rotate, poll)"));
+        }
+        d.remove(key);
+        return Ok(Value::Object(d));
+    }
+    let v = match key {
+        "quality" if ["lean", "full", "auto"].contains(&value) => json!(value),
+        "quality" => return Err(format!("quality must be lean, full, auto or default, not '{value}'")),
+        "view" if ["health", "graph"].contains(&value) => json!(value),
+        "view" => return Err(format!("view must be health, graph or default, not '{value}'")),
+        "rotate" | "poll" => match value.parse::<u32>() {
+            Ok(n) if n <= 86_400 => json!(n),
+            _ => return Err(format!("{key} must be whole seconds 0..=86400 or default, not '{value}'")),
+        },
+        other => return Err(format!("unknown display setting '{other}' (quality, view, rotate, poll)")),
+    };
+    d.insert(key.to_string(), v);
+    Ok(Value::Object(d))
+}
+
+#[derive(Deserialize)]
+struct DisplayBody {
+    key: String,
+    value: String,
+}
+
+/// POST /api/cluster/seats/{seat}/display — `{key, value}`. Operator. Sets
+/// one display setting for the seat (quality, view, rotate, poll); the page
+/// picks it up within a minute through its proxy and reloads itself with
+/// it. No change at the box, no privilege there (i510 c1).
+async fn seat_display_set(
+    State(state): State<Arc<AppState>>,
+    Operator(ctx): Operator,
+    Path(seat): Path<String>,
+    Json(body): Json<DisplayBody>,
+) -> AppResult {
+    if !valid_node_name(&seat) {
+        return Err(AppError::BadRequest("invalid seat name".into()));
+    }
+    let current = crate::repo::seats::display_of(&state.db, &seat)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("no enrolled seat '{seat}'")))?;
+    let next = display_with(&current, &body.key, &body.value).map_err(AppError::BadRequest)?;
+    if !crate::repo::seats::set_display(&state.db, &seat, &next, &ctx.sub).await? {
+        return Err(AppError::NotFound(format!("no enrolled seat '{seat}'")));
+    }
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::SeatDisplaySet, &ctx.sub, &format!("seat:{seat}"))
+            .details(json!({ "seat": seat, "key": body.key, "value": body.value, "display": next })),
+    )
+    .await;
+    Ok(Json(json!({ "seat": seat, "display": next })))
+}
+
 #[derive(Deserialize)]
 struct BindBody {
     tailnet_name: String,
@@ -1134,6 +1200,28 @@ mod seat_binding_tests {
         assert!(refuse < verify, "revocation is refused before the proof is read");
         for route in ["async fn seat_bundle_get(", "async fn seat_fetch_receipt(", "async fn seat_apply_report(", "async fn seat_heartbeat("] {
             assert!(crate::test_src::fn_body(&own, route).contains("check_seat_proof("), "{route}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod seat_display_tests {
+    use super::display_with;
+    use serde_json::json;
+
+    /// One key at a time, validated; `default` hands the key back to the box.
+    #[test]
+    fn a_display_setting_is_validated_and_default_removes_it() {
+        let d = display_with(&json!(null), "quality", "lean").unwrap();
+        assert_eq!(d, json!({"quality": "lean"}));
+        let d = display_with(&d, "view", "graph").unwrap();
+        let d = display_with(&d, "rotate", "30").unwrap();
+        assert_eq!(d, json!({"quality": "lean", "view": "graph", "rotate": 30}));
+        assert_eq!(display_with(&d, "quality", "default").unwrap(), json!({"view": "graph", "rotate": 30}));
+        assert_eq!(display_with(&d, "quality", "auto").unwrap()["quality"], "auto");
+        for (k, v) in [("quality", "flat"), ("view", "map"), ("rotate", "-1"), ("poll", "86401"),
+                       ("poll", "1.5"), ("url", "http://x"), ("url", "default")] {
+            assert!(display_with(&d, k, v).is_err(), "{k}={v}");
         }
     }
 }
