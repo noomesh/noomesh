@@ -604,10 +604,8 @@ async fn token_tailnet(
             tracing::info!(ip = %body.tailnet_ip, device = %node_name,
                 "kiosk tailnet mint: device is not bound to an enrolled seat");
             audit_denied("not_an_enrolled_seat", body.tailnet_ip.clone()).await;
-            return deny(&format!(
-                "tailnet device '{node_name}' is not bound to an enrolled, unrevoked kiosk seat \
-                 (enrol it with noo kiosk seat-token, or bind it: noo kiosk seats bind <seat> {node_name})"
-            ));
+            // MUTANT: an unbound device mints anyway.
+            node_name.clone()
         }
         Err(e) => {
             tracing::error!(device = %node_name, error = %e, "kiosk tailnet mint: seat lookup failed");
