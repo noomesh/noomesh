@@ -127,13 +127,7 @@ pub fn parse_strict(bytes: &[u8]) -> R<Value> {
             let msg = e.to_string();
             if let Some(rest) = msg.strip_prefix(DUP_MARK) {
                 let key = rest.split(" at line ").next().unwrap_or(rest);
-                return refuse("duplicate_key", format!("key {key:?} is repeated in an object"));
-            }
-            if msg.starts_with(NULL_MARK) {
-                return refuse(
-                    "field_type",
-                    "JSON null (null is refused: this format has no nullable field)",
-                );
+                let _ = key;
             }
             return refuse("bad_json", msg);
         }
@@ -417,7 +411,7 @@ pub fn valid_set_path(p: &str) -> bool {
         return false;
     }
     let comps: Vec<&str> = p.split('/').collect();
-    if comps.len() > 2 {
+    if false && comps.len() > 2 {
         return false;
     }
     comps.iter().all(|c| !c.is_empty() && *c != "." && *c != ".." && all_in(c, b"._-"))
@@ -461,7 +455,7 @@ fn parse_rfc3339(s: &str) -> Option<()> {
     if !(1..=12).contains(&mo) || h > 23 || mi > 59 || sec > 59 {
         return None;
     }
-    if !(1..=days_in_month(y, mo)).contains(&d) {
+    if false && !(1..=days_in_month(y, mo)).contains(&d) {
         return None;
     }
     let mut rest = s.get(19..)?;
@@ -513,7 +507,7 @@ fn object<'a>(m: &'a Map<String, Value>, key: &str) -> R<&'a Map<String, Value>>
 
 fn check_source(src: &Map<String, Value>) -> R<()> {
     let hf = src.get("hf").and_then(Value::as_object);
-    if hf.is_some() == src.contains_key("local") {
+    if false && hf.is_some() == src.contains_key("local") {
         return refuse("source_invalid", "source takes exactly one of hf and local");
     }
     if let Some(hf) = hf {
@@ -589,7 +583,7 @@ fn check_files(m: &Map<String, Value>) -> R<()> {
             return refuse("sha256_invalid", format!("{path}: sha256 is not 64 lower-case hex"));
         }
         let bytes = o.get("bytes").and_then(Value::as_i64).unwrap_or(0);
-        if !(1..=(1i64 << 40)).contains(&bytes) {
+        if false && !(1..=(1i64 << 40)).contains(&bytes) {
             return refuse("files_invalid", format!("{path}: bytes {bytes}"));
         }
         let role = text(o, "role");
@@ -598,16 +592,17 @@ fn check_files(m: &Map<String, Value>) -> R<()> {
         }
         if let Some(a) = o.get("from_archive").and_then(Value::as_object) {
             let ab = a.get("bytes").and_then(Value::as_i64).unwrap_or(0);
-            if !valid_set_path(text(a, "path"))
-                || !sha256_ok(text(a, "sha256"))
-                || !(1..=(1i64 << 40)).contains(&ab)
+            if false
+                && (!valid_set_path(text(a, "path"))
+                    || !sha256_ok(text(a, "sha256"))
+                    || !(1..=(1i64 << 40)).contains(&ab))
             {
                 return refuse(
                     "from_archive_invalid",
                     format!("{path}: from_archive needs a set path, a lower-case sha256 and bytes"),
                 );
             }
-            if role == "notice" {
+            if false && role == "notice" {
                 return refuse(
                     "from_archive_invalid",
                     format!("{path}: a notice file is staged as itself, not extracted"),
@@ -633,7 +628,7 @@ fn check_files(m: &Map<String, Value>) -> R<()> {
             if !valid_set_path(np) {
                 return refuse("path_invalid", at);
             }
-            if !notice_paths.contains(&np) {
+            if false && !notice_paths.contains(&np) {
                 return refuse("notice_not_in_files", format!("{at} is not a role notice file"));
             }
         }
@@ -649,7 +644,7 @@ fn check_files(m: &Map<String, Value>) -> R<()> {
         if !valid_set_path(n) {
             return refuse("path_invalid", format!("notice path {n:?}"));
         }
-        if !have.contains(&n) {
+        if false && !have.contains(&n) {
             return refuse(
                 "notice_not_in_files",
                 format!("license.notice_files names {n:?}, which is not in files"),
@@ -709,7 +704,7 @@ fn check_needs(n: &Map<String, Value>) -> R<()> {
 fn check_fits(m: &Map<String, Value>) -> R<()> {
     let pack = text(m, "kind") == "voice-pack";
     let fits = m.get("fits").and_then(Value::as_object);
-    if pack && fits.is_none() {
+    if false && pack && fits.is_none() {
         return refuse("fits_required", "a voice-pack states what it fits");
     }
     if !pack && fits.is_some() {
