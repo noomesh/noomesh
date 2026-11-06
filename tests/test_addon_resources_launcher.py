@@ -43,7 +43,9 @@ PINS = (
     "decl rhaddon system.json\\n"
 )
 
-# The CLI's lines for the fixture (paths under @GEN@, the generation dir).
+# The CLI's lines for the fixture (paths under @GEN@, the generation dir;
+# a fresh one is written into @TMP@, its hidden temporary twin, and handed
+# over there: the launcher renames it to @GEN@ last, i509).
 RES_OK = (
     "hold rhaddon noo-rhaddon-gpu asks for a GPU\\n"
     "env rhaddon RHADDON_GATEWAY_URL https://gateway:8080\\n"
@@ -52,9 +54,9 @@ RES_OK = (
     "env rhaddon RHADDON_GATEWAY_NETWORK noo-cluster\\n"
     "mount rhaddon RHADDON_COORD_DIR @GEN@/coord\\n"
     "mount rhaddon RHADDON_WORK_DIR @GEN@/work\\n"
-    "own rhaddon 4242 @GEN@/coord\\n"
-    "own rhaddon 4242 @GEN@/work\\n"
-    "gen rhaddon @GEN@\\n"
+    "own rhaddon 4242 @TMP@/coord\\n"
+    "own rhaddon 4242 @TMP@/work\\n"
+    "gen rhaddon @TMP@ @GEN@\\n"
     "stale rhaddon @BASE@/rhaddon/g-ffffffffffffffff\\n"
 )
 
@@ -72,19 +74,30 @@ case "$1 $2" in
     shift 2
     printf '%s\\n' "$*" > "$HOME/launch-resources.args"
     [ -n "${FAKE_RES_FAIL:-}" ] && { echo "unknown command: addons launch-resources" >&2; exit 2; }
-    g="$NOO_ADDON_RUNDIR/rhaddon/""" + GEN + """"
-    mkdir -p "$g/work" "$g/coord/db" && chmod 700 "$NOO_ADDON_RUNDIR/rhaddon" "$g" "$g/work" "$g/coord" "$g/coord/db"
-    for f in work/peer-key coord/peer-key work/leaf.key coord/db/pgpass; do
-      printf '%s' \"""" + SECRET + """\" > "$g/$f" && chmod 400 "$g/$f"
-    done
-    printf '%b' "$FAKE_RES" | sed "s#@GEN@#$g#g; s#@BASE@#$NOO_ADDON_RUNDIR#g" ;;
+    g="$NOO_ADDON_RUNDIR/rhaddon/.""" + GEN + """.tmp"
+    fin="$NOO_ADDON_RUNDIR/rhaddon/""" + GEN + """"
+    # As the CLI does: a generation already complete is reused (no own/gen
+    # lines, nothing written); otherwise it is written into the temporary one.
+    reuse=""
+    if [ -f "$fin/.complete" ]; then
+      reuse='/^own /d; /^gen /d;'
+    else
+      mkdir -p "$g/work" "$g/coord/db" && chmod 700 "$NOO_ADDON_RUNDIR/rhaddon" "$g" "$g/work" "$g/coord" "$g/coord/db"
+      for f in work/peer-key coord/peer-key work/leaf.key coord/db/pgpass; do
+        printf '%s' \"""" + SECRET + """\" > "$g/$f" && chmod 400 "$g/$f"
+      done
+    fi
+    printf '%b' "$FAKE_RES" | sed "$reuse s#@TMP@#$g#g; s#@GEN@#$fin#g; s#@BASE@#$NOO_ADDON_RUNDIR#g" ;;
   *) exit 2 ;;
 esac
 """
 
 FAKE_CHOWN = """#!/bin/sh
-# $1 = directory, $2 = manifest inside it: record, chown nothing.
+# $1 = directory, $2 = manifest inside it: record, chown nothing. Also
+# what the add-on's directory holds at that moment (i509: no final
+# generation exists before the handover is done).
 cat "$1/$2" >> "$HOME/chown.manifest"
+ls -a "$1/.." >> "$HOME/chown.seen"
 """
 
 
@@ -177,6 +190,11 @@ def test_declared_inputs_are_handed_over_and_exported(tmp_path: Path) -> None:
     paths = {line.split(" ", 1)[1] for line in manifest}
     assert {"work", "work/peer-key", "work/leaf.key", "coord", "coord/db", "coord/db/pgpass"} <= paths
     assert (gen / ".complete").is_file(), "the generation is marked complete after the handover"
+    # i509: it was handed over as the hidden temporary generation and only
+    # then renamed into place, so a dockerd restart never mounts half of it.
+    seen = (tmp_path / "chown.seen").read_text().split()
+    assert f".{GEN}.tmp" in seen and GEN not in seen, f"the final generation existed during the handover: {seen}"
+    assert not (gen.parent / f".{GEN}.tmp").exists(), "the temporary generation was renamed, not left behind"
     assert not (tmp_path / "rundir" / "rhaddon" / "g-ffffffffffffffff").exists(), "an older generation is removed"
     # The 0400/0700 shape the CLI writes is left alone.
     assert stat.S_IMODE((gen / "work" / "leaf.key").stat().st_mode) == 0o400

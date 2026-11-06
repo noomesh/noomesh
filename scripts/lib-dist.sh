@@ -1113,7 +1113,7 @@ _addon_hand_tree() {
 
 addon_resources_materialise() {
     local _n _o _args=() _nb _out _rc=0 _kind _addon _rest _var _val _uid _path _h _prefix _bad
-    local _envs=() _owns=() _gens=() _stales=() _p _tagargs=()
+    local _envs=() _owns=() _gens=() _stales=() _p _tmp _tagargs=()
     ADDON_HOLD_SCALE=""
     _ADDON_HELD=()
     for _n in $(addon_licensed_names); do
@@ -1221,18 +1221,37 @@ RES
             _addon_unverify "$_addon"
         fi
     done
+    # A fresh generation is written into a hidden temporary directory
+    # (`gen <addon> <tmp> <final>`, i509): marked complete there, then
+    # renamed to the final one its mounts name. dockerd may restart the
+    # add-on's container at any moment, and with host-path creation off it
+    # starts as soon as the source exists, so the final path must only ever
+    # exist whole.
     for _p in ${_gens[@]+"${_gens[@]}"}; do
-        _addon="${_p%% *}"; _path="${_p#* }"
+        _addon="${_p%% *}"; _p="${_p#* }"; _tmp="${_p%% *}"; _path="${_p#* }"
         case ",${_NOO_ADDONS_REFUSED}," in *",${_addon},"*) continue ;; esac
-        if ! : > "${_path:?}/.complete"; then
-            _addon_refuse "$_addon" "its runtime inputs could not be marked complete (${_path})"
+        case "$_path" in
+            /?*/g-*) : ;;
+            *) _path="" ;;
+        esac
+        if [ -z "$_path" ] || [ "$_tmp" = "$_p" ] || [ "$_tmp" != "${_path%/*}/.${_path##*/}.tmp" ]; then
+            _addon_refuse "$_addon" "noo addons launch-resources named a generation this launcher does not recognise (${_p})"
+            _addon_unverify "$_addon"
+            continue
+        fi
+        if ! : > "${_tmp:?}/.complete"; then
+            _addon_refuse "$_addon" "its runtime inputs could not be marked complete (${_tmp})"
+            _addon_unverify "$_addon"
+        elif [ -e "$_path" ] || ! mv -- "$_tmp" "$_path"; then
+            _addon_refuse "$_addon" "its runtime inputs could not be moved into place (${_tmp} -> ${_path}); remove ${_path} and start again"
             _addon_unverify "$_addon"
         fi
     done
-    # Older generations: hand them back to us, then remove them. Not fatal.
+    # Older generations (and a temporary one an interrupted start left
+    # behind): hand them back to us, then remove them. Not fatal.
     for _p in ${_stales[@]+"${_stales[@]}"}; do
         _path="${_p#* }"
-        case "$_path" in /?*/g-?*) : ;; *) continue ;; esac
+        case "$_path" in /?*/g-?*|/?*/.g-?*.tmp) : ;; *) continue ;; esac
         _addon_hand_tree "$_path" "$(id -u)" >/dev/null 2>&1 || true
         rm -rf -- "${_path:?}" 2>/dev/null || echo "WARNING: could not remove an older add-on input generation: ${_path}" >&2
     done
