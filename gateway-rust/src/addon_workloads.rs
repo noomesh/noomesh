@@ -91,7 +91,7 @@ struct WorkloadsFile {
     workloads: Vec<WorkloadDecl>,
 }
 
-/// Is `s` a workload (or add-on) name by the spec: `^[a-z][a-z0-9-]{0,31}$`.
+/// Is `s` a workload name by the spec: `^[a-z][a-z0-9-]{0,31}$`.
 pub fn workload_name_ok(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty() && b.len() <= 32 && b[0].is_ascii_lowercase() && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
@@ -103,8 +103,8 @@ pub fn workload_name_ok(s: &str) -> bool {
 /// 128); `need_mb` 1..=[`MAX_NEED_MB`]; the drain route exists in the
 /// manifest, is `internal`, and its `timeout_secs` is 1..=[`MAX_DRAIN_SECS`].
 pub fn validate(d: &WorkloadDecl, manifest: Option<&crate::addon_proxy::AddonManifest>) -> Result<(), String> {
-    if !workload_name_ok(&d.addon) || !workload_name_ok(&d.name) {
-        return Err(format!("workload {:?}: add-on and workload names are a lowercase letter, then lowercase letters, digits and `-`, at most 32 characters", d.name));
+    if !addon_manifest::addon_name_ok(&d.addon) || !workload_name_ok(&d.name) {
+        return Err(format!("workload {:?}: invalid add-on or workload name; add-ons follow the manifest naming rules, workloads use lowercase letters, digits and `-`", d.name));
     }
     let prefix = format!("noo-{}-", d.addon);
     if !d.container.starts_with(&prefix) || d.container.len() <= prefix.len() || d.container.len() > 128
@@ -221,7 +221,7 @@ pub fn lookup(addon: &str, name: &str) -> Option<WorkloadDecl> {
 /// Split a reservation's `<addon>/<workload>`.
 pub fn split_key(key: &str) -> Option<(String, String)> {
     let (a, w) = key.trim().split_once('/')?;
-    if !workload_name_ok(a) || !workload_name_ok(w) {
+    if !addon_manifest::addon_name_ok(a) || !workload_name_ok(w) {
         return None;
     }
     Some((a.to_string(), w.to_string()))
@@ -246,10 +246,12 @@ pub fn proxy_allows(sub: &str, path: &str) -> bool {
 }
 
 /// Provisioning names consumers `svc:<addon>`; the exchange door preserves
-/// that name in the JWT. Keep legacy explicitly-issued `addon:<addon>` keys
-/// working too. Do not change the authenticated subject forwarded to a worker.
+/// that name in the JWT. Operator-issued keys with that consumer have the same
+/// ownership. Core consumer names are reserved by the shared add-on validator.
+/// Keep legacy explicitly-issued `addon:<addon>` keys working too; do not
+/// change the authenticated subject forwarded to a worker.
 pub fn subject_owns(sub: &str, addon: &str) -> bool {
-    if !workload_name_ok(addon) {
+    if !addon_manifest::addon_name_ok(addon) {
         return false;
     }
     let Some(consumer) = sub.strip_prefix(crate::auth::ADDON_SUBJECT_PREFIX) else { return false };
@@ -412,10 +414,19 @@ mod tests {
             assert!(!subject_owns(sub, "rhaddon"), "{sub}");
         }
         assert!(!subject_owns("addon:svc:../rhaddon", "../rhaddon"));
+        assert!(subject_owns("addon:svc:my_addon", "my_addon"));
+        assert!(subject_owns("addon:my_addon", "my_addon"));
+        assert!(!subject_owns("addon:svc:my-addon", "my_addon"));
+        for name in addon_manifest::CORE_SERVICE_NAMES {
+            assert!(!subject_owns(&format!("addon:svc:{name}"), name));
+            assert!(!subject_owns(&format!("addon:{name}"), name));
+        }
     }
 
     #[test]
     fn split_key_takes_addon_slash_workload() {
+        assert_eq!(split_key("my_addon/worker"), Some(("my_addon".into(), "worker".into())));
+        assert_eq!(split_key("worker/worker"), None);
         assert_eq!(split_key("pai-voice/voice-worker"), Some(("pai-voice".into(), "voice-worker".into())));
         assert_eq!(split_key("pai-voice"), None);
         assert_eq!(split_key("Pai/Voice"), None);
