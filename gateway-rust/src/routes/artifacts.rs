@@ -1055,6 +1055,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A sparse file of `len` bytes: the cap check reads the size from the
+    /// metadata, so nothing near the cap is ever written or read.
+    fn sparse_file(path: &Path, len: u64) {
+        let f = std::fs::File::create(path).unwrap();
+        f.set_len(len).unwrap();
+    }
+
+    fn assert_over_limit(err: AppError) {
+        match err {
+            AppError::Internal(m) => assert!(m.contains("byte limit"), "{m}"),
+            other => panic!("expected the size-cap refusal, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_manifest_over_its_cap_is_refused_unread() {
+        let root = modelset_tmp("bigmanifest");
+        let set = root.join("kokoro").join("rev1");
+        std::fs::create_dir_all(&set).unwrap();
+        std::fs::write(set.join("model-set.json.sig"), [1u8]).unwrap();
+        sparse_file(&set.join("model-set.json"), MODELSET_MANIFEST_MAX + 1);
+        let err = read_modelset_pair(&root, "kokoro", "rev1").await.unwrap_err();
+        assert_over_limit(err);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_signature_over_its_cap_is_refused_unread() {
+        let root = modelset_tmp("bigsig");
+        let set = root.join("kokoro").join("rev1");
+        std::fs::create_dir_all(&set).unwrap();
+        let body = json!({"id": "kokoro", "revision": "rev1"}).to_string();
+        std::fs::write(set.join("model-set.json"), body).unwrap();
+        sparse_file(&set.join("model-set.json.sig"), MODELSET_SIG_MAX + 1);
+        let err = read_modelset_pair(&root, "kokoro", "rev1").await.unwrap_err();
+        assert_over_limit(err);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_signature_exactly_at_its_cap_is_still_served() {
+        let root = modelset_tmp("capsig");
+        let set = root.join("kokoro").join("rev1");
+        std::fs::create_dir_all(&set).unwrap();
+        let body = json!({"id": "kokoro", "revision": "rev1"}).to_string();
+        std::fs::write(set.join("model-set.json"), body).unwrap();
+        let sig = vec![5u8; MODELSET_SIG_MAX as usize];
+        std::fs::write(set.join("model-set.json.sig"), &sig).unwrap();
+        let (_, got) = read_modelset_pair(&root, "kokoro", "rev1").await.unwrap();
+        assert_eq!(got, sig);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The bad-name refusal happens before the store is touched, so the
+    /// handler can be called directly with no state and no files.
+    #[tokio::test]
+    async fn a_malformed_modelset_name_is_a_400_before_any_read() {
+        for bad in ["kokoro", "kokoro@", "@rev1", "../x@rev1", "kokoro@../x", "a/b@rev1"] {
+            let err = modelset_manifest(bad).await.unwrap_err();
+            match err {
+                AppError::BadRequest(m) => assert!(m.contains("<id>@<revision>"), "{m}"),
+                other => panic!("{bad:?}: expected BadRequest, got {other}"),
+            }
+        }
+    }
+
     #[test]
     fn a_modelfile_shares_the_gguf_store_but_not_its_extension() {
         let (gd, gp, ge) = kind_facts("gguf").unwrap();
