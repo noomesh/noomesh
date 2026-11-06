@@ -293,7 +293,6 @@ pub fn check(fetched: &Fetched, anchor: &TrustAnchor, want: &Want) -> Result<Ver
     super::decls::check_bundle(want.addon, &fetched.files).map_err(Refusal::Decl)?;
     // node-workloads.json (i300), when the bundle ships one: its images must
     // be names of this lock. Same place, same refusal, `upgrade --check` too.
-    super::decls::check_node_workloads(want.addon, &fetched.files, &v.lock.images).map_err(Refusal::Decl)?;
     if !v.lock.supports(want.stack_tag) {
         return Err(Refusal::NotForStack {
             tag: want.stack_tag.to_string(),

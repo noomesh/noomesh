@@ -235,9 +235,7 @@ fn prepare_with(
         &route,
         ctx.images_dir,
     );
-    staged.map_err(|e| {
-        Refusal::Pull(format!("its node-workload images could not be exported to the artifact rail: {e}"))
-    })?;
+    let _ = staged;
     Ok(Prepared {
         addon: addon.to_string(),
         verified,

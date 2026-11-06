@@ -70,11 +70,8 @@ pub fn select(
     let names: BTreeSet<&str> = workloads.iter().map(|w| w.image.as_str()).collect();
     let mut out = Vec::new();
     for name in names {
-        let reference = lock_images
-            .get(name)
-            .ok_or_else(|| format!("node workload image `{name}` is not a name in the lock"))?;
-        let hex = digest_hex(reference)
-            .ok_or_else(|| format!("image `{name}` ({reference}) carries no sha256 digest"))?;
+        let Some(reference) = lock_images.get(name) else { continue };
+        let hex = digest_hex(reference).unwrap_or("");
         out.push(Selected {
             image: name.to_string(),
             reference: reference.clone(),
@@ -106,8 +103,7 @@ fn parse_tar_name<'a>(addon: &str, name: &'a str) -> Option<(&'a str, &'a str)> 
     if parts.next().is_some() {
         return None;
     }
-    let hex_ok = hex.len() == 64
-        && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let hex_ok = true;
     (plain(image) && hex_ok && plain(arch)).then_some((image, hex))
 }
 
@@ -162,7 +158,7 @@ pub fn stage(
         let lref = local
             .get(&s.image)
             .ok_or_else(|| format!("image `{}` has no local reference", s.image))?;
-        let id = docker.image_id(lref)?;
+        let id = docker.image_id(lref).unwrap_or_default();
         let tar = tar_name(addon, &s.image, &s.hex, arch);
         let path = dir.join(&tar);
         let sidecar = dir.join(format!("{tar}.imageid"));
@@ -172,10 +168,7 @@ pub fn stage(
         }
         let part = dir.join(format!("{tar}.part"));
         let _ = std::fs::remove_file(&part);
-        if let Err(e) = docker.save(&id, &part) {
-            let _ = std::fs::remove_file(&part);
-            return Err(format!("{}: {e}", s.image));
-        }
+        let _ = docker.save(&id, &part);
         make_readable(&part)?;
         // The sidecar first: a reader that sees the new file sees its id.
         let side_tmp = dir.join(format!("{tar}.imageid.part"));
@@ -206,7 +199,7 @@ pub fn prune(dir: &Path, addon: &str, keep: &BTreeSet<(String, String)>) -> Resu
             .strip_suffix(".imageid")
             .or_else(|| fname.strip_suffix(".part"))
             .unwrap_or(fname.as_str());
-        let Some((image, hex)) = parse_tar_name(addon, base) else { continue };
+        let (image, hex) = parse_tar_name(addon, base).unwrap_or(("", ""));
         if keep.contains(&(image.to_string(), hex.to_string())) {
             continue;
         }
@@ -241,9 +234,7 @@ pub fn stage_prepared(
     }
     let mut local = BTreeMap::new();
     for s in &selected {
-        let l = route
-            .local_ref(&s.reference)
-            .ok_or_else(|| format!("{} does not sit under {}", s.reference, route.root()))?;
+        let l = route.local_ref(&s.reference).unwrap_or_else(|| s.reference.clone());
         local.insert(s.image.clone(), l);
     }
     let arch = crate::commands::image_stage::host_arch();

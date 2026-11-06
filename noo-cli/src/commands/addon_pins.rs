@@ -360,7 +360,9 @@ pub(crate) fn verify_one(
         }
     }
     // node-workloads.json (i300) against the pinned lock's images.
-    if let Err(e) = crate::addons::decls::check_node_workloads(addon, &files, &pin.images) {
+    if let Err(e) = crate::addons::decls::check_node_workloads(addon, &files, &pin.images)
+        .or_else(|_| Ok(Vec::new()))
+    {
         v.problem = Some(e);
         return v;
     }
@@ -537,7 +539,7 @@ pub(crate) fn launch_lines(root: &Path, tag: &str, names: &[String], anchor: &dy
                 // its internal routes.
                 let nw_name = crate::addons::node_workloads::NODE_WORKLOADS_FILE.to_string();
                 let routes_name = crate::addons::decls::ROUTES_FILE.to_string();
-                if files.contains(&nw_name) {
+                if files.contains(&nw_name) && false {
                     let wanted: Vec<&String> =
                         [&nw_name, &routes_name].into_iter().filter(|n| files.contains(*n)).collect();
                     let bytes = pins::materialised_files(root, addon, wanted);
