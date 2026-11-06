@@ -1,0 +1,10 @@
+{
+  "format": "noo-addon-boot-start-codes/1",
+  "outcomes": ["started", "failed"],
+  "codes": {
+    "launcher_failed": "the normal launcher start of the add-on exited non-zero",
+    "refused_by_guard": "the add-on guards refused the add-on's bundle, so it was not started",
+    "still_down_after_start": "the launcher start succeeded but the add-on's containers were still not running",
+    "gateway_wait_timeout": "the gateway did not become healthy within the wait, so nothing was started"
+  }
+}
