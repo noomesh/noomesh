@@ -442,7 +442,8 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
         // This user owns it; to a check run as `other` it is another uid's.
-        let other = euid() + 1;
+        // Never a fixed uid: the batch runs tests as root.
+        let other = euid().wrapping_add(1);
         let e = prepare_base_at(&base, "rhaddon", other, 4242, &owner_uid).unwrap_err();
         assert!(e.contains(&format!("sudo chown -R {other}:4242 {}", base.display())), "{e}");
         assert!(e.starts_with(&format!("{} is owned by uid {}", base.display(), euid())), "{e}");
@@ -473,10 +474,13 @@ mod tests {
         let gen = base.join("rhaddon").join("g-0123456789abcdef");
         std::fs::create_dir_all(&gen).unwrap();
         let (me, my_gid) = (euid(), egid());
-        let root_gen = gen.clone();
-        let uid_of = move |p: &Path| -> std::io::Result<u32> { if p == root_gen.as_path() { Ok(0) } else { owner_uid(p) } };
+        // A uid that is never the runner's (the batch runs tests as root,
+        // so a faked 0 would be "ours").
+        let foreign = me.wrapping_add(1);
+        let foreign_gen = gen.clone();
+        let uid_of = move |p: &Path| -> std::io::Result<u32> { if p == foreign_gen.as_path() { Ok(foreign) } else { owner_uid(p) } };
         let e = prepare_base_at(&base, "rhaddon", me, my_gid, &uid_of).unwrap_err();
-        assert!(e.starts_with(&format!("{} is owned by uid 0", gen.display())), "{e}");
+        assert!(e.starts_with(&format!("{} is owned by uid {foreign}", gen.display())), "{e}");
         assert!(e.contains(&format!("sudo chown -R {me}:{my_gid} {}", base.display())), "{e}");
         assert!(gen.is_dir(), "the foreign generation is still there");
         // Another add-on's directories are not this add-on's refusal.
