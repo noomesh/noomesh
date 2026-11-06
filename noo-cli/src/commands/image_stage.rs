@@ -218,9 +218,21 @@ pub(crate) fn image_tar_gz_name(image: &str, arch: &str) -> String {
     format!("{}.gz", image_tar_name(image, arch))
 }
 
+/// The ref a placement's image is staged under: the ref with its digest cut
+/// off at the first '@' (never at the last ':', which may be a registry port).
+/// A placement may pin `repo:tag@sha256:<index>`, but the rail tar is named by
+/// `repo:tag` (stage_image takes the digest separately), and the node agent
+/// strips the same way before it asks for the tar. Twin: the gateway's
+/// `staged_ref`; `staged_names` in tests/fixtures/own_image_cases.json holds
+/// both to one table.
+pub(crate) fn staged_ref(image: &str) -> &str {
+    image.split_once('@').map_or(image, |(r, _)| r)
+}
+
 /// True when the store holds the image for `arch` in either form. An older
 /// controller store (plain `.tar`) is still a staged image.
 fn image_staged_in(dir: &Path, image: &str, arch: &str) -> bool {
+    let image = staged_ref(image);
     dir.join(image_tar_gz_name(image, arch)).is_file() || dir.join(image_tar_name(image, arch)).is_file()
 }
 
@@ -1185,6 +1197,8 @@ pub(crate) fn parse_not_staged(msg: &str) -> Option<(String, String)> {
     let start = head.rfind("image ")? + "image ".len();
     let (img, arch) = head[start..].rsplit_once(" for ")?;
     let arch = normalize_arch(arch)?;
+    // The caller stages what this returns, so hand it the staged name.
+    let img = staged_ref(img);
     (!img.is_empty() && !img.contains(' ')).then(|| (img.to_string(), arch.to_string()))
 }
 
@@ -1350,6 +1364,42 @@ gateway@{D}
         let msg = "HTTP 409: {\"error\":\"image reg.example/acme/llamacpp:v1 for amd64 is not staged on the controller, so host8-ma cannot start it ...\"}";
         assert_eq!(parse_not_staged(msg), Some(("reg.example/acme/llamacpp:v1".into(), "amd64".into())));
         assert_eq!(parse_not_staged("does not fit the node's memory"), None);
+    }
+
+    #[test]
+    fn staged_names_match_the_shared_fixture() {
+        let fx: Value = serde_json::from_str(include_str!("../../../tests/fixtures/own_image_cases.json")).unwrap();
+        let rows = fx["staged_names"].as_array().expect("staged_names table");
+        assert!(rows.len() >= 4, "fixture parse found {} staged_names rows", rows.len());
+        for row in rows {
+            let (r, arch) = (row["ref"].as_str().unwrap(), row["arch"].as_str().unwrap());
+            assert_eq!(staged_ref(r), row["staged_ref"].as_str().unwrap(), "{r}");
+            assert_eq!(image_tar_gz_name(staged_ref(r), arch), row["tar_gz"].as_str().unwrap(), "{r}");
+        }
+    }
+
+    #[test]
+    fn a_digest_pinned_placement_is_staged_under_its_tag() {
+        // 2026-11-05, after the 0.6.16 roll: every node's `images staged` row
+        // warned that ghcr.io/noomesh/ollama:v0.6.16@sha256:e6def24... was not
+        // staged while the rail held its tag-named tars.
+        let dir = std::env::temp_dir().join(format!("noo-stage-digest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tag = "registry.local:5000/noomesh/ollama:v0.6.16";
+        let pinned = format!("{tag}@{D}");
+        assert!(!image_staged_in(&dir, &pinned, "arm64"));
+        std::fs::write(dir.join(image_tar_gz_name(tag, "arm64")), b"x").unwrap();
+        assert!(image_staged_in(&dir, &pinned, "arm64"), "a digest-pinned ref is staged under its tag");
+        assert!(image_staged_in(&dir, tag, "arm64"));
+        assert!(!image_staged_in(&dir, &pinned, "amd64"), "the other arch is still unstaged");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_not_staged_refusal_for_a_pinned_ref_stages_the_tag() {
+        let msg = ["HTTP 409: image reg.example:5000/acme/llamacpp:v1@", D, " for arm64 is not staged on the controller, so host8-ma cannot start it"].concat();
+        assert_eq!(parse_not_staged(&msg), Some(("reg.example:5000/acme/llamacpp:v1".into(), "arm64".into())));
     }
 
     #[test]
@@ -1697,7 +1747,7 @@ gateway@{D}
         let calls = shared_daemon();
         PARALLELISM_OVERRIDE.with(|p| p.set(Some(3)));
         let mut gl = g();
-        gl.gateway_override = Some("http://127.0.0.1:9".into()); // prewarm is best-effort; refuse fast
+        gl.gateway_override = Some("https://127.0.0.1:9".into()); // prewarm is best-effort; refuse fast
         let arches = vec!["amd64".to_string(), "arm64".to_string()];
         let sum = stage_lock(&gl, &lock, "reg.example/acme", "v1", &arches, true);
         PARALLELISM_OVERRIDE.with(|p| p.set(None));

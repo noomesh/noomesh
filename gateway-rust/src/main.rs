@@ -70,9 +70,12 @@ mod harness_profile;
 mod harness;
 mod harness_main;
 mod tasks;
+#[cfg(test)]
+mod test_src;
 mod task_budget;
 mod task_context;
 mod task_events;
+mod upstream_body;
 mod text;
 mod auth_refresh;
 mod cache;
@@ -81,7 +84,9 @@ mod cert_expiry;
 mod config;
 mod coordinator;
 mod config_mount;
+mod conn_timeouts;
 mod dependency_watchdog;
+mod fd_watch;
 mod node_agent_auth;
 mod node_link;
 mod node_rpc;
@@ -718,6 +723,8 @@ async fn main() -> Result<()> {
     // gone, but nothing was consuming that, so a four-hour database outage
     // on 2026-08-03 reached nobody. See dependency_watchdog.rs.
     dependency_watchdog::spawn(state.clone());
+    // 2026-11-02 EMFILE outage: warn at 70% of RLIMIT_NOFILE, page at 90%.
+    fd_watch::spawn(state.clone());
     // say so when the config file bind mount points at an
     // unlinked inode (host file replaced by rename). Re-checked after every
     // config write in routes/settings.rs.
@@ -800,8 +807,12 @@ async fn main() -> Result<()> {
     // each request's extensions so the rate limiter can key on the real client
     // IP (see middleware::extract_client_ip) instead of one shared "unknown"
     // bucket.
-    axum_server::bind(addr.parse::<std::net::SocketAddr>()?)
-        .acceptor(acceptor)
+    let mut server = axum_server::bind(addr.parse::<std::net::SocketAddr>()?).acceptor(acceptor);
+    // Idle keep-alive connections are closed (conn_timeouts.rs): without a
+    // timer hyper held them forever, and a leaking client exhausted
+    // RLIMIT_NOFILE on 2026-11-02.
+    conn_timeouts::apply(server.http_builder());
+    server
         .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .await?;
 

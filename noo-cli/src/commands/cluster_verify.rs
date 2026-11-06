@@ -377,6 +377,10 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     //     outside noomesh. A warn by design, never a failure.
     out.extend(gpu_contention_check_at(n, now_unix));
 
+    // 6e'. Lanes (proposal i403): what the class table routes on this node,
+    //      by the agent's lane states.
+    out.push(lanes_check(n));
+
     // 6d. The log shipper (fleet logging phase 6), from the agent's own
     //     account in its heartbeat.
     out.push(log_shipper_check(id, &n["log_ship"], now_unix, hb_recent));
@@ -406,7 +410,10 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     if n["self_node"].as_bool() == Some(true) {
         out.push(ok("harness", "in process — the controller's own gateway runs turns; no harness unit here by design"));
     } else { match (n["harness_policy"].as_str(), state) {
-        (None, _) => out.push(warn("harness", "policy not reported by the gateway — cannot judge the harness",
+        (None, _) => out.push(warn("harness", match n["harness_policy_error"].as_str() {
+                Some(e) => format!("policy not reported by the gateway ({e}) — cannot judge the harness"),
+                None => "policy not reported by the gateway — cannot judge the harness".to_string(),
+            },
             Some(format!("noo cluster show {id}   # the policy is on the node's config row")))),
         (Some("auto"), "running") => out.push(ok("harness", "running (policy auto)")),
         (Some("auto"), "") => out.push(warn("harness", "policy auto, state not reported yet", None)),
@@ -487,6 +494,63 @@ pub(crate) fn harness_tasks_check(n: &Value) -> Option<Check> {
 /// A probe that has not answered for longer than this is no longer a blip.
 const GPU_PROBE_FAILING_SECS: i64 = 60;
 
+/// The `lanes` row (proposal i403, Phase 3): the agent's lanes as the
+/// gateway's class table reads them from the node record. A chat lane the
+/// table does not route (`loading`, `missing`, `down`, or a state this CLI
+/// does not know) is a WARN naming it, its state and the agent's reason: "the
+/// node is up but not serving chat" reads as why, not as absence. `unknown`
+/// and `unplaced` are routed, ranked last, and named as unconfirmed. `[]`
+/// while `running_backends` lists a backend is a WARN (the agent says nothing
+/// is placed, so nothing routes). No key is an agent that predates lanes,
+/// routed by `running_backends`: said, not warned.
+pub(crate) fn lanes_check(n: &Value) -> Check {
+    const NAME: &str = "lanes";
+    let id = n["id"].as_str().unwrap_or("?");
+    let Some(raw) = n.get("lanes") else {
+        return ok(NAME, "not reported (an agent older than 0.6.17): routed by running_backends");
+    };
+    let Some(lanes) = raw.as_array() else {
+        return warn(NAME, "the agent's lanes are not a list: routed by running_backends", Some(format!("noo cluster show {id}")));
+    };
+    let text = |l: &Value, k: &str| l[k].as_str().map(str::trim).unwrap_or("").to_string();
+    let named: Vec<&Value> = lanes.iter().filter(|l| !text(l, "backend").is_empty() && !text(l, "model").is_empty()).collect();
+    if named.is_empty() {
+        let running = match &n["running_backends"] {
+            Value::Object(m) => m.len(),
+            Value::Array(a) => a.len(),
+            _ => 0,
+        };
+        if running > 0 {
+            return warn(NAME, format!("no lanes, yet {running} backend(s) running: this node routes nothing"), Some(format!("noo cluster show {id}")));
+        }
+        return ok(NAME, "none: nothing placed on this node");
+    }
+    let (chat, other): (Vec<&Value>, Vec<&Value>) = named.into_iter().partition(|l| matches!(text(l, "role").as_str(), "" | "chat"));
+    let label = |l: &Value| {
+        let why = text(l, "reason");
+        let base = format!("{}={}: {}", text(l, "backend"), text(l, "model"), text(l, "state"));
+        if why.is_empty() { base } else { format!("{base} ({why})") }
+    };
+    let count = |st: &str| chat.iter().filter(|l| text(l, "state") == st).count();
+    let unconfirmed: Vec<String> = chat.iter().filter(|l| matches!(text(l, "state").as_str(), "unknown" | "unplaced")).map(|l| label(l)).collect();
+    let not_routed: Vec<String> = chat
+        .iter()
+        .filter(|l| !matches!(text(l, "state").as_str(), "serving" | "on_demand" | "unknown" | "unplaced"))
+        .map(|l| label(l))
+        .collect();
+    let mut detail = format!("{} chat lane(s): {} serving, {} on demand", chat.len(), count("serving"), count("on_demand"));
+    if !unconfirmed.is_empty() {
+        detail.push_str(&format!("; unconfirmed, ranked last: {}", unconfirmed.join(", ")));
+    }
+    if !other.is_empty() {
+        detail.push_str(&format!("; {} other lane(s)", other.len()));
+    }
+    if not_routed.is_empty() {
+        return ok(NAME, detail);
+    }
+    warn(NAME, format!("not routed: {}; {detail}", not_routed.join(", ")), Some(format!("noo cluster show {id}")))
+}
+
 /// The `gpu` row, from the node agent's `gpu_contention` heartbeat report
 /// (internal/gpuyield). A node that gave its GPU to other work (VR, model
 /// development, a voice stack) is working as designed: yielded and held are
@@ -564,6 +628,7 @@ pub(crate) fn gpu_contention_check_at(n: &Value, now_unix: i64) -> Option<Check>
             let age = super::cluster_gpu_mode::lease_age(gc, now_unix)
                 .map(|s| format!(", for {}", super::cluster_gpu_mode::age_text(s)))
                 .unwrap_or_default();
+            let age = format!("{age}{}", super::cluster_gpu_mode::until_text(gc, now_unix).map(|t| format!(", {t}")).unwrap_or_default());
             let busy = if mode == super::cluster_gpu_mode::Mode::User && gc["foreign_mb"].as_f64().unwrap_or(0.0) > 0.0 {
                 format!(", GPU in use {:.1} GB", gb("foreign_mb"))
             } else {
@@ -650,7 +715,11 @@ pub(crate) fn images_staged_check(n: &Value) -> Option<Check> {
     Some(warn(
         "images staged",
         format!("placed but not staged on the artifact rail: {}", names.join(", ")),
-        Some(format!("noo cluster sync-images {id} -i {first}   # or `noo upgrade` for the release images")),
+        // Staged by tag: `-i repo:tag@digest` would name a tar nothing reads.
+        Some(format!(
+            "noo cluster sync-images {id} -i {}   # or `noo upgrade` for the release images",
+            crate::commands::image_stage::staged_ref(first)
+        )),
     ))
 }
 
@@ -1299,6 +1368,33 @@ fn is_wsl2(running_kernel: &str) -> bool {
 ///
 /// 2026-09-24, the controller: kernel 7.1.5 installed, the next boot hung,
 /// and the fallback (6.18.7) had no NVIDIA module. Each of those is a row.
+/// What fixes "the next boot (`next`) has no NVIDIA module", by how this
+/// node's driver is installed (followup 476): hostd's `nvidia_driver` fact,
+/// else (an hostd before the fact) an installed `nvidia-dkms-<N>` package.
+/// `sudo dkms autoinstall` answers "command not found" on a box that uses
+/// Ubuntu's prebuilt modules; the prebuilt package is named only from the
+/// fact, never guessed, and with neither the remedy names no install
+/// command. Every branch keeps the way out: the running kernel as default.
+pub(crate) fn gpu_driver_remedy(host: &Value, next: &str, running: &str, runbook: &str) -> String {
+    let back = format!("make {running} the default again (see {runbook})");
+    let dkms_pkg = host["platform"].as_object()
+        .is_some_and(|p| p.keys().any(|k| k.strip_prefix("nvidia-dkms-").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))));
+    let ver = host["nvidia_driver_version"].as_str().filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()));
+    match (host["nvidia_driver"].as_str(), ver) {
+        (Some("dkms"), _) => format!("sudo dkms autoinstall -k {next}   # or {back}"),
+        (Some("prebuilt"), Some(v)) => {
+            let meta = if next.ends_with("-generic") {
+                format!("; linux-modules-nvidia-{v}-generic installs it with each new kernel")
+            } else {
+                String::new()
+            };
+            format!("sudo apt install linux-modules-nvidia-{v}-{next}   # prebuilt driver{meta}; or {back}")
+        }
+        (None, _) if dkms_pkg => format!("sudo dkms autoinstall -k {next}   # or {back}"),
+        _ => format!("{back}; `dpkg -l | grep -E 'nvidia-dkms|linux-modules-nvidia'` shows how the driver is installed"),
+    }
+}
+
 pub(crate) fn host_checks(id: &str, host: &Value, hostd_alive: bool) -> Vec<Check> {
     let mut out = Vec::new();
     if host.is_null() {
@@ -1351,7 +1447,7 @@ pub(crate) fn host_checks(id: &str, host: &Value, hostd_alive: bool) -> Vec<Chec
         if !default.is_empty() && has(&default) == Some(false) {
             out.push(fail("gpu driver",
                 format!("the next boot ({default}) has no NVIDIA module — the GPU backends will not start"),
-                format!("sudo dkms autoinstall -k {default}   # or make {running} the default again (see {runbook})")));
+                gpu_driver_remedy(host, &default, &running, runbook)));
         } else if !fallback.is_empty() && has(&fallback) == Some(false) {
             out.push(warn("gpu driver",
                 format!("the fallback kernel ({fallback}) has no NVIDIA module — if the next boot fails, the node comes back without its GPU"),
@@ -2134,6 +2230,167 @@ pub(crate) fn backup_age_check(f: &crate::commands::backups::Freshness) -> Check
         Level::Warn => warn("last backup", f.detail.clone(), Some(BACKUP_AGE_REMEDY.to_string())),
         Level::Fail => fail("last backup", f.detail.clone(), BACKUP_AGE_REMEDY),
     }
+}
+
+/// Whether one storage directory is there, as the operator can see it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DirSeen {
+    Present,
+    Missing,
+    /// The path could not be checked (a parent the operator cannot search).
+    Unchecked(String),
+}
+
+pub(crate) fn dir_seen(p: &std::path::Path) -> DirSeen {
+    match p.try_exists() {
+        Ok(true) => DirSeen::Present,
+        Ok(false) => DirSeen::Missing,
+        Err(e) => DirSeen::Unchecked(e.to_string()),
+    }
+}
+
+const STORAGE_DIRS_REMEDY: &str = "noo onboard --only storage";
+/// For a directory only the target's lock names: onboarding creates this
+/// CLI's compiled list and nothing else, so it can never make one; the roll
+/// does, before the pin moves (reconcile_storage_dirs).
+pub(crate) const STORAGE_DIRS_LOCK_ONLY_REMEDY: &str =
+    "noo upgrade --stack   # the roll creates each directory the target's lock names, before the pin moves";
+
+/// The `data directories` row: every directory this release's compose binds
+/// (`onboard::STORAGE_SUBDIRS`, placed under the data and state roots) exists
+/// on this controller. A release that adds one (0.6.16: `tempo`) refuses the
+/// stack roll until it is there; this row says so before the roll. A path
+/// that cannot be checked is named as such, never counted present.
+pub(crate) fn storage_dirs_check(dirs: Option<&[(String, std::path::PathBuf, DirSeen)]>) -> Check {
+    storage_dirs_check_with(dirs, &[])
+}
+
+/// [`storage_dirs_check`], where `lock_only` are the paths only the target's
+/// lock names (`noo upgrade --check`). When every missing directory is one of
+/// them the remedy is the roll: onboarding would leave them missing, and the
+/// check would name it again, a loop (harness 0.6.17 review, c4).
+pub(crate) fn storage_dirs_check_with(dirs: Option<&[(String, std::path::PathBuf, DirSeen)]>, lock_only: &[std::path::PathBuf]) -> Check {
+    const NAME: &str = "data directories";
+    let Some(dirs) = dirs else {
+        return warn(NAME, "NOO_DATA_ROOT is not set in .env; the data directories were not checked",
+            Some(STORAGE_DIRS_REMEDY.to_string()));
+    };
+    let missing_paths: Vec<&std::path::PathBuf> = dirs.iter()
+        .filter(|(_, _, s)| *s == DirSeen::Missing)
+        .map(|(_, p, _)| p)
+        .collect();
+    let missing: Vec<String> = missing_paths.iter().map(|p| p.display().to_string()).collect();
+    let unchecked: Vec<String> = dirs.iter()
+        .filter_map(|(_, p, s)| match s {
+            DirSeen::Unchecked(e) => Some(format!("{} ({e})", p.display())),
+            _ => None,
+        })
+        .collect();
+    if missing.is_empty() && unchecked.is_empty() {
+        return ok(NAME, format!("all {} present", dirs.len()));
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !missing.is_empty() {
+        parts.push(format!("missing {} (the stack roll refuses without {})", missing.join(", "),
+            if missing.len() == 1 { "it" } else { "them" }));
+    }
+    if !unchecked.is_empty() {
+        parts.push(format!("not checked {}", unchecked.join(", ")));
+    }
+    let remedy = if missing_paths.is_empty() {
+        None
+    } else if missing_paths.iter().all(|p| lock_only.contains(p)) {
+        Some(STORAGE_DIRS_LOCK_ONLY_REMEDY.to_string())
+    } else {
+        Some(STORAGE_DIRS_REMEDY.to_string())
+    };
+    warn(NAME, parts.join("; "), remedy)
+}
+
+/// [`storage_dirs_check`] for the install at `root`, read from its `.env`.
+pub(crate) fn storage_dirs_row(root: &std::path::Path) -> Check {
+    let dirs: Option<Vec<(String, std::path::PathBuf, DirSeen)>> = super::upgrade::storage_dir_targets_in_env(root)
+        .map(|t| t.into_iter().map(|(n, p)| {
+            let seen = dir_seen(&p);
+            (n, p, seen)
+        }).collect());
+    storage_dirs_check(dirs.as_deref())
+}
+
+/// One fleet node's needs from the controller's release-asset cache.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AssetNeed {
+    pub(crate) node: String,
+    pub(crate) os: String,
+    pub(crate) arch: String,
+    /// The platform was assumed (no enrollment facts), not reported.
+    pub(crate) assumed: bool,
+    pub(crate) assets: Vec<String>,
+}
+
+/// What provision stages for `node` from the cache, by platform: the
+/// privileged helper always; the harness and the CLI except on the
+/// controller's own node (its gateway is the harness, `noo upgrade` its CLI).
+pub(crate) fn asset_need(node: &str, facts: Option<&Value>, self_node: bool) -> AssetNeed {
+    use crate::commands::provision::{cli_asset_for, gateway_asset_for, hostd_asset_for, platform_from_facts};
+    let (os, arch, assumed) = platform_from_facts(facts);
+    let mut assets: Vec<String> = hostd_asset_for(&os, &arch).into_iter().collect();
+    if !self_node {
+        assets.extend(gateway_asset_for(&os, &arch));
+        assets.extend(cli_asset_for(&os, &arch));
+    }
+    AssetNeed { node: node.to_string(), os, arch, assumed, assets }
+}
+
+const RELEASE_ASSETS: &str = "release assets";
+
+/// The `release assets` row (i11b): every harness, helper and CLI asset the
+/// fleet's bundles carry is in the controller's cache for this release.
+/// A missing one used to show only when provisioning reached that node. An
+/// assumed platform is named in the detail, so a wrong guess is visible.
+pub(crate) fn release_assets_check(version: &str, needs: &[AssetNeed], present: &dyn Fn(&str) -> bool) -> Check {
+    let mut missing: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    let mut all: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for n in needs {
+        for a in &n.assets {
+            all.insert(a.as_str());
+            if !present(a) {
+                missing.entry(a.as_str()).or_default().push(n.node.as_str());
+            }
+        }
+    }
+    let assumed: Vec<String> = needs.iter().filter(|n| n.assumed)
+        .map(|n| format!("{} assumed {}/{} (no enrollment facts)", n.node, n.os, n.arch)).collect();
+    let tail = if assumed.is_empty() { String::new() } else { format!("; {}", assumed.join(", ")) };
+    if missing.is_empty() {
+        let platforms: std::collections::BTreeSet<(&str, &str)> = needs.iter().map(|n| (n.os.as_str(), n.arch.as_str())).collect();
+        return ok(RELEASE_ASSETS, format!("all {} assets for {} platform{} cached for {version}{tail}",
+            all.len(), platforms.len(), if platforms.len() == 1 { "" } else { "s" }));
+    }
+    let list: Vec<String> = missing.iter().map(|(a, nodes)| format!("{a} ({})", nodes.join(", "))).collect();
+    warn(RELEASE_ASSETS, format!("missing from the {version} cache: {}{tail} — those bundles go without them", list.join(", ")),
+        Some("noo upgrade --nodes".to_string()))
+}
+
+/// [`release_assets_check`] for this box. The cache is the CONTROLLER's
+/// (`provision::cli_asset_cache_dir`), so the row runs only where provision
+/// would read it (`role::detect().controller`, as provision decides); from
+/// any other box it says it did not check, and never reports that box's
+/// empty cache as the fleet's.
+pub(crate) fn release_assets_row(on_controller: bool, cache: &std::path::Path, nodes: &[Value], toks: &[Value]) -> Option<Check> {
+    if !on_controller {
+        return Some(warn(RELEASE_ASSETS,
+            "not checked: the asset cache is on the controller and this box is not it (run verify there)", None));
+    }
+    let needs: Vec<AssetNeed> = nodes.iter().filter_map(|n| n["id"].as_str()).map(|id| {
+        let facts = crate::commands::provision::latest_redemption(toks, id).and_then(|t| t.get("facts")).filter(|f| f.is_object());
+        asset_need(id, facts, crate::role::is_self_node(id))
+    }).collect();
+    if needs.is_empty() {
+        return None;
+    }
+    let present = |a: &str| std::fs::metadata(cache.join(a)).is_ok_and(|m| m.is_file() && m.len() > 0);
+    Some(release_assets_check(env!("CARGO_PKG_VERSION"), &needs, &present))
 }
 
 /// The `off-site backup` row. Undecided is a WARN with `noo backups setup`;
@@ -4889,6 +5146,100 @@ pub(crate) fn nats_principals_check(users_conf: Option<&str>, bridge_sites: &[(S
     ok("nats principals", detail)
 }
 
+/// The add-ons `/health` reports as enabled, sorted (the console's Access
+/// page reads the same list).
+pub(crate) fn enabled_addons(health: &Value) -> Vec<String> {
+    let mut v: Vec<String> = health["addons"]
+        .as_object()
+        .map(|m| m.iter().filter(|(_, st)| st.as_str() == Some("enabled")).map(|(k, _)| k.clone()).collect())
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// One enabled add-on and its `GET /api/addons/{addon}/access` body, or why it was not read.
+pub(crate) type AccessRead = (String, Result<Value, String>);
+/// Every enabled add-on's read, or why `/health` itself was not read.
+pub(crate) type AccessReads = Result<Vec<AccessRead>, String>;
+
+/// `/health`'s enabled add-ons, then `GET /api/addons/{addon}/access` for each.
+/// The health read is AUTHENTICATED (`health_body`, as the `gateway fds` row
+/// reads it): an anonymous `/health` is liveness only (`{"status"}`), so the
+/// unauthenticated read found no add-on and the row always said "no add-on
+/// is enabled" (0.6.17 rehearsal review, A-addonsugg.row).
+fn addon_access_reads(g: &Globals) -> AccessReads {
+    let health = health_body(g).ok_or_else(|| "/health: not read (no authenticated health body)".to_string())?;
+    Ok(enabled_addons(&health)
+        .into_iter()
+        .map(|a| {
+            let r = crate::http::get_json_try(g, &format!("/api/addons/{}/access", crate::commands::urlencode(&a)), true, 15);
+            (a, r)
+        })
+        .collect())
+}
+
+/// The `add-on access` row (noomesh-internal f99, section 6). WARN for a
+/// feature the add-on suggests for users or operators that nobody below
+/// admin holds: not a fault, but usually an `enable` that skipped the
+/// suggestions. A feature suggested for admin, or for nobody, may be
+/// admin-only on purpose and is never a warning. Stale settings (for features
+/// no longer declared) are listed; they open nothing. An access body that
+/// cannot be read is a WARN that names it, never a silent OK.
+pub(crate) fn addon_access_check(reads: AccessReads) -> Check {
+    use crate::commands::addon_access::{feature_grants, stale_features};
+    const ROW: &str = "add-on access";
+    let reads = match reads {
+        Ok(r) => r,
+        Err(e) => return warn(ROW, format!("not read: {e}"), Some("noo cluster verify --controller   # again once the gateway answers".into())),
+    };
+    if reads.is_empty() {
+        return ok(ROW, "no add-on is enabled");
+    }
+    let mut unmet: Vec<(String, String, String)> = Vec::new();
+    let mut unread: Vec<String> = Vec::new();
+    let mut stale: Vec<String> = Vec::new();
+    let (mut legacy, mut features) = (0usize, 0usize);
+    for (addon, r) in &reads {
+        match r {
+            Err(e) => unread.push(format!("{addon} ({e})")),
+            Ok(body) if body["legacy"].as_bool() == Some(true) => legacy += 1,
+            Ok(body) => {
+                for f in feature_grants(body) {
+                    features += 1;
+                    if f.suggestion_unmet() {
+                        unmet.push((addon.clone(), f.name, f.suggested));
+                    }
+                }
+                stale.extend(stale_features(body).into_iter().map(|f| format!("{addon}/{f}")));
+            }
+        }
+    }
+    let mut notes: Vec<String> = Vec::new();
+    if legacy > 0 {
+        notes.push(format!("{legacy} legacy (each route's own role decides)"));
+    }
+    if !stale.is_empty() {
+        notes.push(format!("stale settings kept, opening nothing: {}", stale.join(", ")));
+    }
+    if !unread.is_empty() {
+        notes.push(format!("not read: {}", unread.join(", ")));
+    }
+    let tail = if notes.is_empty() { String::new() } else { format!("; {}", notes.join("; ")) };
+    if let Some((a, f, s)) = unmet.first() {
+        let list: Vec<String> = unmet.iter().map(|(a, f, s)| format!("{a}/{f} (suggested for {s})")).collect();
+        return warn(
+            ROW,
+            format!("on only for admins, though the add-on suggests more: {}{tail}", list.join(", ")),
+            // One command for whoever skipped the question at enable.
+            Some(format!("noo addons accept-suggestions {a}   # or one feature: noo addons set-access {a} {f} on --role {s}")),
+        );
+    }
+    if let Some((a, _)) = reads.iter().find(|(_, r)| r.is_err()) {
+        return warn(ROW, format!("{features} feature(s) read{tail}"), Some(format!("noo addons features {a}")));
+    }
+    ok(ROW, format!("{} add-on(s), {features} feature(s): each one suggested for users or operators is on for someone{tail}", reads.len()))
+}
+
 /// Judge the posture, key and doctor outputs. Pure over the JSON so the
 /// decisions are pinned; the verb below only collects the inputs.
 pub(crate) fn controller_checks(
@@ -5512,6 +5863,51 @@ pub(crate) fn gateway_redis_check(health: Option<&Value>) -> Check {
     }
 }
 
+/// The `gateway fds` row: the gateway's open file descriptors against its
+/// soft `RLIMIT_NOFILE` (`dependencies.fds` in the authenticated `/health`).
+/// On 2026-11-02 the pop-os gateway hit the limit after ~45 h and spent five
+/// hours unable to read its secrets or reach Postgres; nothing had shown the
+/// climb. Warn at the gateway's own warn share (70%), fail at its critical
+/// share (90%) or when it could not count at all. The gateway names both
+/// shares, so this row and its alert loop cannot disagree.
+pub(crate) fn gateway_fds_check(health: Option<&Value>) -> Check {
+    const NAME: &str = "gateway fds";
+    let Some(dep) = health.map(|h| &h["dependencies"]["fds"]).filter(|d| d.is_object()) else {
+        return warn(
+            NAME,
+            "not read: no authenticated /health answer with dependencies.fds \
+             (unreachable, no credential, or a gateway older than this CLI)",
+            Some("noo health".into()),
+        );
+    };
+    let count = match (dep["open"].as_u64(), dep["soft_limit"].as_u64()) {
+        (Some(open), Some(soft)) => format!("{open} of {soft} open ({}%)", open.saturating_mul(100) / soft.max(1)),
+        (Some(open), None) => format!("{open} open (no finite soft limit)"),
+        _ => format!("not counted: {}", dep["error"].as_str().unwrap_or("no reason given")),
+    };
+    match dep["level"].as_str() {
+        Some("ok") => ok(NAME, count),
+        Some("warn") => warn(
+            NAME,
+            format!(
+                "{count}: past {}% of the soft limit; something is holding descriptors. \
+                 Watch `process_open_fds` in Grafana; at the limit the gateway cannot read secrets or reach the database",
+                dep["warn_pct"].as_u64().unwrap_or(70)
+            ),
+            Some("noo stack logs gateway --tail 200".into()),
+        ),
+        Some(level) => fail(
+            NAME,
+            format!(
+                "{count} ({level}): the gateway is about to refuse connections, secret reads and database \
+                 connections. Restart it, and keep the `process_open_fds` graph for the leak"
+            ),
+            "noo stack restart gateway",
+        ),
+        None => warn(NAME, format!("{count}; no level in the answer"), Some("noo health".into())),
+    }
+}
+
 /// The `gateway add-on caller key` row (noomesh followup 304). The gateway mints a
 /// bearer at each start and signs every add-on call with it; evolve refuses an
 /// unsigned call with 401. A boot whose mint failed serves everything else and
@@ -5629,6 +6025,7 @@ mod gateway_redis_tests {
                     container: container.into(),
                     restarts: 7,
                     last_error: Some("Fatal error: can't open the AOF manifest file appendonly.aof.manifest: Permission denied".into()),
+                    crashed: None,
                 }]),
                 "noo",
             )
@@ -6184,6 +6581,8 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             );
             checks.push(offsite_backup_check(&configured, &state));
         }
+        // A release's new data directory, missing here, refuses the stack roll.
+        checks.push(storage_dirs_row(&crate::envfile::repo_root()));
         // i67: the controller's own node (when this box runs one) rides the rail.
         if let Some(me) = crate::commands::provision::self_node_name()
             .filter(|_| std::path::Path::new("/usr/local/bin/noo-node-agent").is_file())
@@ -6243,6 +6642,17 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             model_cache_plain_port_published(),
             &nodes_refusing_model_cache_url(&fleet),
         ));
+        // i11b: every asset the fleet's bundles carry is cached here.
+        {
+            let toks: Vec<Value> = get_json_opt(g, "/api/security/bootstrap-tokens", true, 15)
+                .and_then(|b| b["tokens"].as_array().cloned())
+                .unwrap_or_default();
+            let root = crate::envfile::repo_root();
+            if let Some(c) = release_assets_row(crate::role::detect().controller.is_some(),
+                &crate::commands::provision::cli_asset_cache_dir(&root), &fleet, &toks) {
+                checks.push(c);
+            }
+        }
         let (id_host, id_ip, id_ts) = crate::onboard::steps::local_cert_identity();
         checks.push(service_cert_names_check(&externally_reachable_leaf_names(
             &crate::pki::pki_dir(), &id_host, &id_ip, &id_ts,
@@ -6269,6 +6679,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let health = health_body(g);
         checks.push(gateway_bus_check(health.as_ref()));
         checks.push(gateway_redis_check(health.as_ref()));
+        checks.push(gateway_fds_check(health.as_ref()));
         // The bearer every add-on call is signed with (followup 304).
         checks.push(addon_caller_check(health.as_ref()));
         // i353b: an add-on the gateway refused at startup. An unreadable
@@ -6369,6 +6780,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             &retired_bridge_sites(dotenv_value(RETIRED_NATS_BRIDGE).as_deref(), &posture),
             &crate::commands::nats_users::declared_addon_principals(&root),
         ));
+        // f99: a feature the add-on suggests for users or operators that only
+        // admins hold (usually an enable that skipped the suggestions).
+        checks.push(addon_access_check(addon_access_reads(g)));
         // Postgres is TLS-only with a required cluster-CA client certificate
         // (2026-09-28): the shipped policy, and a live refusal of a client
         // that presents none.
@@ -6622,17 +7036,24 @@ pub(crate) fn verify_node_after_apply(g: &Globals, node: &str) -> bool {
         std::thread::sleep(std::time::Duration::from_secs(3));
     }
     let Some(n) = last else {
-        println!("{}", ui::status_line(Glyph::Warn, &format!("{node}: not in /api/cluster/nodes yet — verify with `noo cluster verify {node}` once it heartbeats")));
+        ui::say(&ui::status_line(Glyph::Warn, &format!("{node}: not in /api/cluster/nodes yet — verify with `noo cluster verify {node}` once it heartbeats")));
         return true;
     };
     if !heard_since(&n, since) {
-        println!("{}", ui::status_line(Glyph::Warn, &format!(
+        ui::say(&ui::status_line(Glyph::Warn, &format!(
             "{node}: no heartbeat from the new build within {POST_APPLY_WAIT_SECS}s — judging the last record it sent; `noo cluster verify {node}` re-checks")));
     }
     let checks = node_checks(&with_harness_wanted(g, &n), &controller_stack_tag(), env!("CARGO_PKG_VERSION"), now_unix(), signing_adopted_for(node));
     // A `starting` row is not a pass: the caller's note
     // says the invariant does not hold YET, and `cluster verify` re-checks.
-    render(&format!("verify {node}"), &checks, g.verbose) && !checks.iter().any(|c| c.verdict == Verdict::Starting)
+    // Under --quiet/--json the table stays off stdout (the caller's JSON
+    // rows are the record); the verdict is render's own rule.
+    let passed = if ui::quiet() {
+        !checks.iter().any(|c| c.verdict == Verdict::Fail)
+    } else {
+        render(&format!("verify {node}"), &checks, g.verbose)
+    };
+    passed && !checks.iter().any(|c| c.verdict == Verdict::Starting)
 }
 
 /// Two and a half heartbeat intervals: one missed beat is not a verdict.
@@ -6855,6 +7276,7 @@ mod tests {
             "harness_policy": "auto",
             "host_services": { "harness": { "state": "running" } },
             "self_node": false,
+            "lanes": [{ "backend": "ollama", "model": "gemma4:12b", "role": "chat", "state": "serving", "reason": "" }],
         })
     }
 
@@ -6873,6 +7295,135 @@ mod tests {
             "tailscale_state": "Running", "tailscale_online": true,
             "telemetry": { "tailscale_logs": "off", "tailscale_logs_configured": true, "os_reporters": [] }
         })
+    }
+
+    /// host2 before a reboot into 7.0.0-34: running 31 has its module, the
+    /// next boot does not. `extra` adds the driver facts under test.
+    fn next_boot_without_module(extra: Value) -> Value {
+        let mut h = serde_json::json!({
+            "os": "linux", "running_kernel": "7.0.0-31-generic", "boot_loader": "grub",
+            "default_kernel": "7.0.0-34-generic", "fallback_kernel": "7.0.0-31-generic",
+            "nvidia_module": { "7.0.0-31-generic": true, "7.0.0-34-generic": false },
+            "platform": { "nvidia-driver-580": "580.95.05", "tailscale": "1.102.4" },
+            "held": [], "tailscale_state": "Running", "tailscale_online": true,
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            if k == "platform" {
+                for (pk, pv) in v.as_object().unwrap() {
+                    h["platform"][pk] = pv.clone();
+                }
+            } else {
+                h[k] = v.clone();
+            }
+        }
+        h
+    }
+
+    fn gpu_row(h: &Value) -> Check {
+        host_checks("host2", h, true).into_iter().find(|c| c.name == "gpu driver").expect("a gpu driver row")
+    }
+
+    /// Followup 476: the remedy matches how the driver is installed.
+    #[test]
+    fn the_gpu_driver_remedy_follows_the_install_layout() {
+        // dkms (the fact)
+        let r = gpu_row(&next_boot_without_module(serde_json::json!({ "nvidia_driver": "dkms" })));
+        assert_eq!(r.verdict, Verdict::Fail);
+        let rem = r.remedy.unwrap();
+        assert!(rem.starts_with("sudo dkms autoinstall -k 7.0.0-34-generic"), "{rem}");
+        // prebuilt (the fact): the package for the next kernel, never dkms
+        let r = gpu_row(&next_boot_without_module(serde_json::json!({ "nvidia_driver": "prebuilt", "nvidia_driver_version": "580" })));
+        let rem = r.remedy.unwrap();
+        assert!(rem.starts_with("sudo apt install linux-modules-nvidia-580-7.0.0-34-generic"), "{rem}");
+        assert!(rem.contains("linux-modules-nvidia-580-generic"), "the metapackage for a -generic kernel: {rem}");
+        assert!(!rem.contains("dkms"), "a prebuilt box has no dkms: {rem}");
+        // no fact (an older hostd), nvidia-dkms installed: dkms
+        let r = gpu_row(&next_boot_without_module(serde_json::json!({ "platform": { "nvidia-dkms-580": "580.95.05" } })));
+        assert!(r.remedy.unwrap().starts_with("sudo dkms autoinstall -k 7.0.0-34-generic"));
+        // no fact, no nvidia-dkms: no install command is guessed
+        let r = gpu_row(&next_boot_without_module(serde_json::json!({})));
+        let rem = r.remedy.unwrap();
+        assert!(!rem.contains("sudo dkms") && !rem.contains("apt install"), "{rem}");
+        assert!(rem.starts_with("make 7.0.0-31-generic the default again"), "{rem}");
+        assert!(rem.contains("linux-modules-nvidia"), "it names the dpkg check: {rem}");
+        // prebuilt without a usable version: the same no-guess remedy
+        let r = gpu_row(&next_boot_without_module(serde_json::json!({ "nvidia_driver": "prebuilt" })));
+        assert!(r.remedy.unwrap().starts_with("make 7.0.0-31-generic the default again"));
+        // every branch keeps the way back
+        for extra in [serde_json::json!({ "nvidia_driver": "dkms" }),
+                      serde_json::json!({ "nvidia_driver": "prebuilt", "nvidia_driver_version": "580" }), serde_json::json!({})] {
+            assert!(gpu_row(&next_boot_without_module(extra)).remedy.unwrap().contains("make 7.0.0-31-generic the default again"));
+        }
+    }
+
+    /// i11b: the row names each missing asset with the nodes whose bundles
+    /// go without it, the controller's own node needs only hostd, and an
+    /// assumed platform is said.
+    #[test]
+    fn release_assets_names_each_missing_asset_and_its_nodes() {
+        let mac = serde_json::json!({ "os": "macos", "arch": "arm64" });
+        let pi = serde_json::json!({ "os": "linux", "arch": "aarch64" });
+        let needs = vec![
+            asset_need("mcmini", Some(&mac), false),
+            asset_need("robopi", Some(&pi), false),
+            asset_need("ctl", None, true),
+        ];
+        assert_eq!(needs[2].assets, vec!["noo-hostd-x86_64-unknown-linux-gnu".to_string()], "self node: hostd only");
+        assert_eq!(needs[0].assets.len(), 3, "hostd, harness and CLI for a remote node");
+        let have: Vec<String> = needs.iter().flat_map(|n| n.assets.clone())
+            .filter(|a| a != "noo-gateway-aarch64-apple-darwin").collect();
+        let c = release_assets_check("0.6.17", &needs, &|a: &str| have.iter().any(|h| h == a));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("noo-gateway-aarch64-apple-darwin (mcmini)"), "{}", c.detail);
+        assert!(!c.detail.contains("robopi)"), "robopi has all it needs: {}", c.detail);
+        assert!(c.detail.contains("ctl assumed linux/x86_64"), "the guess is visible: {}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo upgrade --nodes"));
+        let c = release_assets_check("0.6.17", &needs, &|_: &str| true);
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.starts_with("all 7 assets for 3 platforms cached for 0.6.17"), "{}", c.detail);
+    }
+
+    /// The row reads the cache dir it is given, only on the controller; from
+    /// another box an empty cache is "not checked", never missing assets.
+    #[test]
+    fn release_assets_row_reads_the_controllers_cache_only() {
+        let dir = std::env::temp_dir().join(format!("noo-asset-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let nodes = vec![serde_json::json!({ "id": "robopi-i11b-test" })];
+        let toks = vec![serde_json::json!({ "node_name": "robopi-i11b-test", "used_at": "2026-11-04T10:00:00Z",
+            "used_by_ip": "100.1.1.1", "facts": { "os": "linux", "arch": "aarch64" } })];
+        let off = release_assets_row(false, &dir, &nodes, &toks).unwrap();
+        assert_eq!(off.verdict, Verdict::Warn);
+        assert!(off.detail.starts_with("not checked") && !off.detail.contains("missing"), "{}", off.detail);
+        let c = release_assets_row(true, &dir, &nodes, &toks).unwrap();
+        assert!(c.detail.contains("noo-hostd-aarch64-unknown-linux-gnu (robopi-i11b-test)"), "{}", c.detail);
+        for a in ["noo-hostd-aarch64-unknown-linux-gnu", "noo-gateway-aarch64-unknown-linux-musl", "noo-aarch64-unknown-linux-musl"] {
+            std::fs::write(dir.join(a), b"x").unwrap();
+        }
+        std::fs::write(dir.join("noo-aarch64-unknown-linux-musl"), b"").unwrap();
+        let c = release_assets_row(true, &dir, &nodes, &toks).unwrap();
+        assert!(c.detail.contains("noo-aarch64-unknown-linux-musl (robopi-i11b-test)"), "an empty file is not an asset: {}", c.detail);
+        std::fs::write(dir.join("noo-aarch64-unknown-linux-musl"), b"x").unwrap();
+        assert_eq!(release_assets_row(true, &dir, &nodes, &toks).unwrap().verdict, Verdict::Ok);
+        assert!(release_assets_row(true, &dir, &[], &toks).is_none(), "no fleet, no row");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Provision, `noo upgrade --nodes` and this row derive a node's
+    /// platform in one place, so what verify calls missing is what provision
+    /// would stage.
+    #[test]
+    fn provision_upgrade_and_verify_share_the_platform() {
+        let prov = include_str!("provision.rs");
+        let prov = crate::test_src::own_code(prov);
+        for f in ["fn attach_hostd(", "fn attach_cli(", "fn attach_harness("] {
+            let body = crate::test_src::fn_body(&prov, f);
+            assert!(body.contains("platform_from_facts("), "{f} derives its platform in the shared fn");
+            assert!(!body.contains("f.get(\"arch\")"), "{f} has its own arch rule again");
+        }
+        let up = crate::test_src::own_code(include_str!("upgrade.rs"));
+        assert!(crate::test_src::fn_body(&up, "fn asset_platforms(").contains("platform_from_facts("));
     }
 
     #[test]
@@ -7454,7 +8005,9 @@ mod tests {
         let c = node_checks(&healthy(now), "v0.2.70", "0.5.57", now, Some(true));
         let failed: Vec<_> = c.iter().filter(|c| c.verdict == Verdict::Fail).map(|c| c.name).collect();
         assert!(failed.is_empty(), "{failed:?}");
-        assert_eq!(c.len(), 22, "sixteen node invariants (the log shipper, peer identity, control over bus, streaming over tunnel, backend doors, vendor telemetry, backend images and data root among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
+        assert_eq!(c.len(), 23, "seventeen node invariants (the log shipper, peer identity, control over bus, streaming over tunnel, backend doors, vendor telemetry, backend images, data root and lanes among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
+        let lanes = c.iter().find(|c| c.name == "lanes").expect("the lanes row");
+        assert_eq!((lanes.verdict, lanes.detail.as_str()), (Verdict::Ok, "1 chat lane(s): 1 serving, 0 on demand"));
     }
 
     /// The door refusals ride the heartbeat as `backend_tls` (refused to
@@ -7930,12 +8483,27 @@ mod tests {
         assert_ne!(h.verdict, Verdict::Ok);
     }
 
+    /// i436: when the gateway cannot read the policies it sends no
+    /// `harness_policy` and says why. The row warns and carries the reason.
+    #[test]
+    fn an_unreadable_harness_policy_warns_with_the_gateway_reason() {
+        let now = 1_800_000_000;
+        let mut n = healthy(now);
+        let o = n.as_object_mut().unwrap();
+        o.remove("harness_policy");
+        o.insert("harness_policy_error".into(), serde_json::json!("cannot read the harness policies: pool timed out"));
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        let h = c.iter().find(|c| c.name == "harness").unwrap();
+        assert_eq!(h.verdict, Verdict::Warn);
+        assert!(h.detail.contains("pool timed out"), "{}", h.detail);
+    }
+
     /// And the gateway must actually send it, or the check above only ever
     /// warns. This is the seam the fixture hid.
     #[test]
     fn the_nodes_list_route_stamps_the_policy_it_is_judged_on() {
         let src = include_str!("../../../gateway-rust/src/routes/cluster.rs");
-        let code = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let code = crate::test_src::own_code(src);
         assert!(
             code.contains("data[\"harness_policy\"]"),
             "collect_cluster_nodes must stamp harness_policy onto every record"
@@ -9349,6 +9917,98 @@ mod tests {
         assert!(hardened_images_check(&serde_json::json!({"id": "old"})).is_none(), "an agent that reports nothing gets no row");
     }
 
+    /// A `GET /api/addons/{addon}/access` body shaped like the route's.
+    fn access_body(features: Value, settings: Value) -> Value {
+        serde_json::json!({"addon": "rhaddon", "legacy": false, "features": features, "settings": settings,
+                           "stale_features": [], "super_admins": ["root"]})
+    }
+
+    fn setting(feature: &str, subject: &str, allowed: bool) -> Value {
+        serde_json::json!({"addon": "rhaddon", "feature": feature, "subject": subject, "allowed": allowed,
+                           "set_by": "root", "set_at": "2026-11-05T06:00:00Z", "source": "operator", "reason": null})
+    }
+
+    #[test]
+    fn addon_access_warns_only_for_a_user_or_operator_suggestion_that_only_admins_hold() {
+        let body = access_body(
+            serde_json::json!([
+                {"name": "converse", "title": "Talk", "suggested": "user"},
+                {"name": "transcripts", "title": "Read", "suggested": "operator"},
+                {"name": "manage", "title": "Manage", "suggested": "admin"},
+                {"name": "internal", "title": "Internal", "suggested": "none"},
+                {"name": "unlabelled", "title": "No suggestion"}
+            ]),
+            serde_json::json!([
+                setting("converse", "role:admin", true),
+                setting("transcripts", "team:studio", true),
+                setting("converse", "user:bob", false)
+            ]),
+        );
+        let c = addon_access_check(Ok(vec![("rhaddon".into(), Ok(body))]));
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("rhaddon/converse (suggested for user)"), "{}", c.detail);
+        // Granted below admin, or suggested for admin / nobody: never a warning.
+        for quiet in ["transcripts", "manage", "internal", "unlabelled"] {
+            assert!(!c.detail.contains(&format!("rhaddon/{quiet}")), "{quiet}: {}", c.detail);
+        }
+        assert_eq!(
+            c.remedy.as_deref(),
+            Some("noo addons accept-suggestions rhaddon   # or one feature: noo addons set-access rhaddon converse on --role user")
+        );
+    }
+
+    #[test]
+    fn addon_access_is_ok_for_features_meant_for_admins_alone() {
+        let body = access_body(
+            serde_json::json!([{"name": "manage", "title": "Manage", "suggested": "admin"},
+                               {"name": "internal", "title": "Internal", "suggested": "none"}]),
+            serde_json::json!([]),
+        );
+        let c = addon_access_check(Ok(vec![("rhaddon".into(), Ok(body))]));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.contains("1 add-on(s), 2 feature(s)"), "{}", c.detail);
+    }
+
+    #[test]
+    fn addon_access_counts_a_star_setting_for_every_feature() {
+        let body = access_body(
+            serde_json::json!([{"name": "converse", "title": "Talk", "suggested": "user"},
+                               {"name": "transcripts", "title": "Read", "suggested": "operator"}]),
+            serde_json::json!([setting("*", "role:user", true)]),
+        );
+        assert_eq!(addon_access_check(Ok(vec![("rhaddon".into(), Ok(body))])).verdict, Verdict::Ok);
+    }
+
+    #[test]
+    fn addon_access_names_what_it_could_not_read_and_what_is_stale() {
+        let mut stale = access_body(serde_json::json!([{"name": "converse", "title": "Talk", "suggested": "user"}]),
+                                    serde_json::json!([setting("converse", "role:user", true), setting("export", "role:user", true)]));
+        stale["stale_features"] = serde_json::json!(["export"]);
+        let legacy = serde_json::json!({"addon": "old", "legacy": true, "features": [], "settings": [], "stale_features": []});
+        let c = addon_access_check(Ok(vec![
+            ("rhaddon".into(), Ok(stale)),
+            ("old".into(), Ok(legacy)),
+            ("gone".into(), Err("HTTP 404: add-on \"gone\" is not registered".into())),
+        ]));
+        assert_eq!(c.verdict, Verdict::Warn, "an unread add-on is never a silent OK: {}", c.detail);
+        assert!(c.detail.contains("not read: gone (HTTP 404"), "{}", c.detail);
+        assert!(c.detail.contains("stale settings kept, opening nothing: rhaddon/export"), "{}", c.detail);
+        assert!(c.detail.contains("1 legacy"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo addons features gone"));
+
+        let h = addon_access_check(Err("/health: connection refused".into()));
+        assert_eq!(h.verdict, Verdict::Warn);
+        assert!(h.detail.contains("/health: connection refused"), "{}", h.detail);
+        assert_eq!(addon_access_check(Ok(vec![])).detail, "no add-on is enabled");
+    }
+
+    #[test]
+    fn enabled_addons_are_the_ones_health_calls_enabled() {
+        let h = serde_json::json!({"addons": {"rhaddon": "enabled", "voice": "disabled", "intel": "enabled", "x": "starting"}});
+        assert_eq!(enabled_addons(&h), vec!["intel".to_string(), "rhaddon".to_string()]);
+        assert!(enabled_addons(&serde_json::json!({"status": "ok"})).is_empty());
+    }
+
     #[test]
     fn images_staged_row_names_an_unstaged_placement() {
         let n = serde_json::json!({"id": "host8-ma", "unstaged_images": ["reg/acme/llamacpp:v0.2.103"]});
@@ -9357,6 +10017,17 @@ mod tests {
         assert!(c.detail.contains("reg/acme/llamacpp:v0.2.103"), "{}", c.detail);
         assert!(c.remedy.unwrap().contains("noo cluster sync-images host8-ma -i reg/acme/llamacpp:v0.2.103"));
         assert!(images_staged_check(&serde_json::json!({"id": "x"})).is_none());
+    }
+
+    #[test]
+    fn images_staged_hint_stages_a_pinned_ref_by_its_tag() {
+        let pinned = format!("reg.example:5000/acme/ollama:v0.6.16@sha256:{}", "e".repeat(64));
+        let n = serde_json::json!({"id": "robopi", "unstaged_images": [pinned]});
+        let c = images_staged_check(&n).unwrap();
+        assert!(c.detail.contains(&pinned), "the row names what is placed: {}", c.detail);
+        let remedy = c.remedy.unwrap();
+        assert!(remedy.contains("noo cluster sync-images robopi -i reg.example:5000/acme/ollama:v0.6.16 "), "{remedy}");
+        assert!(!remedy.contains('@'), "{remedy}");
     }
 
     #[test]
@@ -10018,7 +10689,7 @@ mod tests {
     #[test]
     fn the_nodes_route_carries_the_shippers_account() {
         let src = include_str!("../../../gateway-rust/src/routes/cluster.rs");
-        let code = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let code = crate::test_src::own_code(src);
         assert!(code.contains("carry_reported(&mut data, &body, \"log_ship\")"), "node_heartbeat must carry log_ship onto the record");
     }
 
@@ -10980,6 +11651,74 @@ mod harness_tasks_tests {
 }
 
 #[cfg(test)]
+mod lanes_row_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn row(lanes: Option<Value>, running: Value) -> Check {
+        let mut n = json!({"id": "host3", "running_backends": running});
+        if let Some(l) = lanes {
+            n["lanes"] = l;
+        }
+        lanes_check(&n)
+    }
+
+    fn lane(backend: &str, model: &str, role: &str, state: &str, reason: &str) -> Value {
+        json!({"backend": backend, "model": model, "role": role, "state": state, "reason": reason})
+    }
+
+    /// Each state lands where the gateway's class table puts it.
+    #[test]
+    fn a_chat_lane_the_table_does_not_route_warns_with_its_state_and_reason() {
+        let c = row(Some(json!([
+            lane("ollama", "gemma4:12b", "chat", "serving", ""),
+            lane("ollama", "qwen3:4b", "chat", "on_demand", "not loaded"),
+            lane("vllm", "org/new-model", "chat", "loading", "reconciling: runtime runs org/old-model"),
+            lane("llamacpp", "small.gguf", "", "missing", "not on disk"),
+            lane("vllm", "org/other", "chat", "down", "not running"),
+            lane("ollama", "harrier", "embed", "missing", "not on disk"),
+            lane("native", "mistral", "chat", "unplaced", ""),
+        ])), json!({}));
+        assert_eq!((c.name, c.verdict), ("lanes", Verdict::Warn), "{}", c.detail);
+        assert!(c.detail.starts_with(
+            "not routed: vllm=org/new-model: loading (reconciling: runtime runs org/old-model), llamacpp=small.gguf: missing (not on disk), vllm=org/other: down (not running); "
+        ), "{}", c.detail);
+        assert!(c.detail.contains("6 chat lane(s): 1 serving, 1 on demand; unconfirmed, ranked last: native=mistral: unplaced; 1 other lane(s)"), "{}", c.detail);
+        assert!(!c.detail.contains("harrier"), "a non-chat lane is not judged here: {}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster show host3"));
+        let unknown_word = row(Some(json!([lane("vllm", "m", "chat", "frobbing", "")])), json!({}));
+        assert_eq!(unknown_word.verdict, Verdict::Warn, "a state the gateway cannot read is not routed");
+    }
+
+    #[test]
+    fn serving_on_demand_and_unconfirmed_lanes_are_ok() {
+        let c = row(Some(json!([lane("ollama", "gemma4:12b", "chat", "serving", ""), lane("ollama", "q", "chat", "unknown", "no presence yet")])), json!({}));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert_eq!(c.detail, "2 chat lane(s): 1 serving, 0 on demand; unconfirmed, ranked last: ollama=q: unknown (no presence yet)");
+    }
+
+    #[test]
+    fn no_key_is_an_older_agent_and_an_empty_list_with_backends_running_routes_nothing() {
+        let old = row(None, json!({"ollama": "gemma4:12b"}));
+        assert_eq!(old.verdict, Verdict::Ok);
+        assert!(old.detail.contains("routed by running_backends"), "{}", old.detail);
+        let empty = row(Some(json!([])), json!({"ollama": "gemma4:12b"}));
+        assert_eq!(empty.verdict, Verdict::Warn);
+        assert_eq!(empty.detail, "no lanes, yet 1 backend(s) running: this node routes nothing");
+        assert_eq!(row(Some(json!([])), json!({})).verdict, Verdict::Ok);
+        assert_eq!(row(Some(json!("garbage")), json!({})).verdict, Verdict::Warn);
+        // A lane with no model is dropped by the gateway, so it is not counted.
+        assert_eq!(row(Some(json!([lane("vllm", "", "chat", "serving", "")])), json!({})).detail, "none: nothing placed on this node");
+    }
+
+    #[test]
+    fn the_row_is_on_every_node() {
+        let code = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        assert!(code.contains("out.push(lanes_check(n));"));
+    }
+}
+
+#[cfg(test)]
 mod gpu_contention_tests {
     use super::*;
 
@@ -11071,6 +11810,17 @@ mod gpu_contention_tests {
             "state": "draining", "method": "nvidia-smi", "paused_backends": [], "lease": {"owner": "rbwolf"}}))).unwrap();
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.starts_with("mode switching: hold by rbwolf draining"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_timed_user_hold_says_until_when() {
+        let held = node(serde_json::json!({
+            "state": "held", "reason": "user", "method": "memory-accounting", "paused_backends": ["vllm"], "foreign_mb": 0,
+            "lease": {"owner": "rbwolf", "operation_id": "op-7", "generation": 4, "purpose": "user",
+                "since": "2026-11-01T10:00:00Z", "expires_at": "2026-11-01T17:40:00Z"}}));
+        let since = parse_rfc3339_unix("2026-11-01T10:00:00Z").unwrap();
+        let c = gpu_contention_check_at(&held, since + 6 * 3600 + 20 * 60).unwrap();
+        assert_eq!(c.detail, "mode user: held by rbwolf (user): vllm paused, for 6 h 20 min, until 17:40 UTC (in 80 min)");
     }
 
     #[test]
@@ -11365,5 +12115,140 @@ mod digest_tests {
         // fix-modes tightens a key with no reader row to 0600 (i277a).
         assert_eq!(r, "noo security pki fix-modes", "{r}");
         assert!(!r.contains("noo-cli/src") && !r.contains("edit "), "{r}");
+    }
+}
+
+#[cfg(test)]
+mod gateway_fds_tests {
+    use super::{gateway_fds_check, Verdict};
+    use serde_json::json;
+
+    fn body(fds: serde_json::Value) -> serde_json::Value {
+        json!({"status": "healthy", "dependencies": {"fds": fds}})
+    }
+
+    #[test]
+    fn the_row_follows_the_gateways_own_level() {
+        let at = |level: &str, open: u64| {
+            gateway_fds_check(Some(&body(json!({"healthy": level != "critical", "level": level, "open": open,
+                "soft_limit": 1024, "hard_limit": 524288, "warn_pct": 70, "critical_pct": 90}))))
+        };
+        let c = at("ok", 200);
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("200 of 1024 open (19%)"), "{}", c.detail);
+        let c = at("warn", 800);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("800 of 1024 open (78%)") && c.detail.contains("past 70%"), "{}", c.detail);
+        let c = at("critical", 1000);
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("(critical)"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_gateway_that_could_not_count_fails_and_says_why() {
+        let c = gateway_fds_check(Some(&body(json!({"healthy": false, "level": "critical",
+            "error": "cannot list /proc/self/fd: Too many open files (os error 24)"}))));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("os error 24"), "{}", c.detail);
+    }
+
+    #[test]
+    fn an_older_gateway_or_no_answer_is_a_warning_not_a_pass() {
+        assert_eq!(gateway_fds_check(None).verdict, Verdict::Warn);
+        let old = json!({"status": "healthy", "dependencies": {"nats": {"healthy": true}}});
+        let c = gateway_fds_check(Some(&old));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("not read"), "{}", c.detail);
+    }
+}
+
+#[cfg(test)]
+mod storage_dirs_row_tests {
+    use super::{storage_dirs_check, storage_dirs_row, DirSeen, Verdict};
+    use crate::onboard::STORAGE_SUBDIRS;
+
+    /// An install root whose `.env` points at a data root holding every
+    /// storage directory except `skip`.
+    fn install_without(tag: &str, skip: &[&str]) -> (std::path::PathBuf, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("noo-verify-dirs-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (root, data) = (base.join("install"), base.join("data"));
+        std::fs::create_dir_all(&root).unwrap();
+        for n in STORAGE_SUBDIRS {
+            if !skip.contains(n) {
+                std::fs::create_dir_all(data.join(n)).unwrap();
+            }
+        }
+        std::fs::write(root.join(".env"), format!("NOO_DATA_ROOT={}\n", data.display())).unwrap();
+        (base, data)
+    }
+
+    /// 0.6.15 -> 0.6.16: a controller onboarded before `tempo` existed. The
+    /// row names the directory and the remedy; once it exists the row is OK.
+    #[test]
+    fn a_missing_release_dir_is_a_warn_naming_it_and_the_remedy() {
+        let (base, data) = install_without("tempo", &["tempo"]);
+        let c = storage_dirs_row(&base.join("install"));
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains(&data.join("tempo").display().to_string()), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo onboard --only storage"));
+        std::fs::create_dir_all(data.join("tempo")).unwrap();
+        let c = storage_dirs_row(&base.join("install"));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert_eq!(c.detail, format!("all {} present", STORAGE_SUBDIRS.len()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// pop-os 11-03: the voice model mounts, nested two deep.
+    #[test]
+    fn nested_dirs_are_checked_too() {
+        let (base, data) = install_without("voice", &["models/voice/whisper", "models/voice/piper"]);
+        let c = storage_dirs_row(&base.join("install"));
+        assert_eq!(c.verdict, Verdict::Warn);
+        for d in ["models/voice/whisper", "models/voice/piper"] {
+            assert!(c.detail.contains(&data.join(d).display().to_string()), "{d}: {}", c.detail);
+        }
+        assert!(c.detail.contains("without them"), "{}", c.detail);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// No NOO_DATA_ROOT: nothing was checked, and the row says so.
+    #[test]
+    fn no_data_root_is_not_checked_never_ok() {
+        let c = storage_dirs_check(None);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("not checked"), "{}", c.detail);
+        let base = std::env::temp_dir().join(format!("noo-verify-dirs-noenv-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        assert_eq!(storage_dirs_row(&base).verdict, Verdict::Warn, "no .env at all");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A path the operator cannot stat is "not checked", never present, and
+    /// alone carries no onboarding remedy (nothing is known to be missing).
+    #[test]
+    fn an_unchecked_path_is_never_counted_present() {
+        let dirs = vec![
+            ("noo-data".to_string(), std::path::PathBuf::from("/d/noo-data"), DirSeen::Present),
+            ("tempo".to_string(), std::path::PathBuf::from("/s/tempo"), DirSeen::Unchecked("Permission denied".into())),
+        ];
+        let c = storage_dirs_check(Some(&dirs));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.detail, "not checked /s/tempo (Permission denied)");
+        assert_eq!(c.remedy, None);
+    }
+}
+
+#[cfg(test)]
+mod addon_access_health_tests {
+    /// The add-on list comes from the authenticated health body: the
+    /// anonymous one carries only `status`, which names no add-on.
+    #[test]
+    fn the_add_on_access_row_reads_the_authenticated_health() {
+        let code = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let body = crate::test_src::fn_body(&code, "fn addon_access_reads(");
+        assert!(body.contains("health_body(g)"), "{body}");
+        assert!(!body.contains("\"/health\", false"), "an anonymous /health names no add-on: {body}");
+        assert!(super::enabled_addons(&serde_json::json!({"status": "healthy"})).is_empty(), "what the anonymous read sees");
     }
 }

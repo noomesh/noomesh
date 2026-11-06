@@ -303,7 +303,7 @@ see [add-ons.md](../getting-started/add-ons.md).
 | `noo rag doc` | `<id>` | Show one document: audience, provenance, audience history and a text preview |
 | `noo rag ingest` | `<path>... [-t\|--title <title>] [-r\|--recursive] [--audience <role>[,<role>]]` | Ingest text files or a folder; audience defaults to you, share with team:<name> or company |
 | `noo rag scan` | `[-s\|--source folders\|drives\|all]` | Run one synchronous ingest scan of watched folders and/or drives |
-| `noo rag deduplicate` | `[--dry-run] [-y]` | Delete duplicate (doc_id, page_no) pages, keeping the newest; confirms first |
+| `noo rag deduplicate` | `[--dry-run] [-y\|--yes]` | Delete duplicate (doc_id, page_no) pages, keeping the newest; confirms first |
 | `noo rag retag` | `(--match <glob> \| --doc-id <id>) --role <r>[,<r>] [--relabel] [--apply] [--limit <n>]` | Change which audience documents belong to; dry-run unless --apply |
 | `noo rag hold` | `(--title-prefix <p> \| --doc <id>...) [--reason <r>] [--apply]` | Keep documents but take them out of embedding and search; dry-run unless --apply |
 | `noo rag unhold` | `(--title-prefix <p> \| --doc <id>...) [--apply]` | Make held documents eligible for embedding and search again; dry-run unless --apply |

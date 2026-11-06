@@ -465,9 +465,9 @@ mod owner_tests {
     #[test]
     fn the_budget_ways_out_are_owner_only() {
         let src = include_str!("tasks.rs");
+        let own = crate::test_src::own_code(src);
         for f in ["async fn tasks_resubmit(", "async fn tasks_ask(", "async fn tasks_answer(", "async fn tasks_context("] {
-            let body = &src[src.find(f).expect(f)..];
-            let body = &body[..body.find("\n}\n").unwrap()];
+            let body = crate::test_src::fn_body(&own, f);
             assert!(body.contains("owner_only(&state, &ctx, &adt, &id)"), "{f} must check the owner");
         }
         let guard = &src[src.find("async fn owner_only(").unwrap()..];

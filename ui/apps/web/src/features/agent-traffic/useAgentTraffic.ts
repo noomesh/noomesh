@@ -35,6 +35,29 @@ export interface LiveSession {
 }
 
 type Raw = Record<string, unknown>;
+
+/**
+ * `thread` is the ADDRESS an agent posts to when it writes into a thread
+ * (`to: "thread"`), not an agent. It is never a participant, and a message
+ * sent to it is shown as going to the thread.
+ */
+export const THREAD_ADDRESS = 'thread';
+
+/** How a message's recipient reads in the thread view. */
+export function recipientLabel(to: string): { text: string; isThread: boolean } {
+  return to === THREAD_ADDRESS ? { text: 'the thread', isThread: true } : { text: to, isThread: false };
+}
+
+/** A long body shows this much until "Show all": the first lines, capped. */
+export const PREVIEW_LINES = 6;
+export const PREVIEW_CHARS = 400;
+
+/** The head of `text` for a collapsed message, with `…` when anything was cut. */
+export function previewOf(text: string): string {
+  let p = text.split('\n').slice(0, PREVIEW_LINES).join('\n');
+  if (p.length > PREVIEW_CHARS) p = p.slice(0, PREVIEW_CHARS);
+  return p.length < text.length ? `${p.trimEnd()}…` : text;
+}
 const str = (v: unknown, d = ''): string => (typeof v === 'string' ? v : d);
 const strs = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
 
@@ -45,7 +68,9 @@ export function parseThreads(data: unknown): Thread[] {
     messages: typeof t.messages === 'number' ? t.messages : 0,
     started: str(t.started),
     last: str(t.last),
-    participants: [...new Set([...strs(t.senders), ...strs(t.recipients)])].sort(),
+    participants: [...new Set([...strs(t.senders), ...strs(t.recipients)])]
+      .filter((p) => p !== THREAD_ADDRESS)
+      .sort(),
   }));
 }
 
@@ -92,12 +117,16 @@ export function filterThreads(threads: Thread[], text: string, participant: stri
   );
 }
 
-/** `body.text` when present; otherwise pretty JSON. `long` bodies render collapsed. */
-export function renderBody(body: unknown): { text: string; isText: boolean; long: boolean } {
+/**
+ * `body.text` when present; otherwise pretty JSON. A `long` body renders
+ * collapsed to its `preview` (never hidden outright: a thread of collapsed
+ * cards with no text in them cannot be read).
+ */
+export function renderBody(body: unknown): { text: string; isText: boolean; long: boolean; preview: string } {
   const t = (body as Raw | null)?.text;
-  if (typeof t === 'string') return { text: t, isText: true, long: t.length > 600 };
-  const text = typeof body === 'string' ? body : JSON.stringify(body ?? null, null, 2);
-  return { text, isText: false, long: text.length > 300 };
+  const text = typeof t === 'string' ? t : typeof body === 'string' ? body : JSON.stringify(body ?? null, null, 2);
+  const preview = previewOf(text);
+  return { text, isText: typeof t === 'string', long: preview !== text, preview };
 }
 
 async function must<T>(path: string, what: string): Promise<T> {

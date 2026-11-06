@@ -304,6 +304,7 @@ a key act with more authority than any human account.
 |---|---|
 | `401` | no bearer presented (operator door: also an unknown key or the retired `NOO_MCP_TOKEN`) |
 | `403 unknown or revoked key` | user door: key wrong, revoked or rotated out by a later `self` issue (allow up to 5 s after a change) |
+| `503 the service-key store could not be read` | the gateway cannot read its database and holds no key snapshot from the last minute. The key itself was not judged: retry, check the gateway's database, and do not rotate the key |
 | `403 key lacks the 'mcp' scope` | an operator-issued key without `--scopes mcp` |
 | `403 this key is not bound to a user` | machine key, or the bound account is disabled — reissue with `--user` |
 | `UNABLE_TO_VERIFY_LEAF_SIGNATURE` | the direct `:8080` URL presents the cluster CA and this client does not trust it. For a **Node** client (Claude Code included) `noo security trust-ca` alone does nothing — Node ignores the OS store. Set `NODE_EXTRA_CA_CERTS` to the CA file, or use the `tailscale serve` URL on 443, which needs no CA |

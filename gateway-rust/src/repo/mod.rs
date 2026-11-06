@@ -90,9 +90,19 @@ pub mod kb_grants;
 pub mod prompt_skills;
 pub mod request_trace;
 pub mod settings;
+pub mod task_events;
 pub mod tasks;
 pub mod prompt_skill_proposals;
 pub mod users;
+
+/// Is this error "the table does not exist" (Postgres 42P01)? The ONE error a
+/// reader may answer as "nothing there": on a box that has not migrated yet,
+/// the table is genuinely absent. Every other failure (the database down, a
+/// pool timeout, a permission error, schema drift) is not "empty" and must
+/// not read as it.
+pub fn missing_table(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("42P01"))
+}
 
 // ── The ratchet ────────────────────────────────────────────────────────────
 
@@ -189,7 +199,6 @@ mod ratchet {
     ("routes/other.rs", 1),
     ("routes/ownership_scoping_tests.rs", 11),
     ("routes/seats.rs", 23),
-    ("routes/temporal.rs", 1),
     ("routes/ui.rs", 3),
     ("routes/usage.rs", 5),
     ("routes/users.rs", 98),
@@ -202,7 +211,7 @@ mod ratchet {
     ("system_provision_cli.rs", 1),
     ("task_budget.rs", 2),
     ("task_context.rs", 4),
-    ("task_events.rs", 15),
+    ("task_events.rs", 14),
     ("task_guard.rs", 29),
     ("tasks.rs", 11),
     ("temporal_graph.rs", 10),

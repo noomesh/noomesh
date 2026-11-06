@@ -42,6 +42,10 @@
      than being one fixed value, so a 13" laptop is not needlessly narrow and a
      4K monitor is not a single 2000px line. */
   --measure: 46rem;
+  /* The console is dark-only. Without this a native control (a <select>'s
+     open option list, a date picker) renders in the light system scheme:
+     white popups carrying the app's light text, unreadable. */
+  color-scheme: dark;
 
   --sans: system-ui, 'Segoe UI', -apple-system, Roboto, sans-serif;
   --mono: ui-monospace, 'Cascadia Code', 'JetBrains Mono', 'SF Mono', Consolas, Menlo, monospace;
@@ -1230,6 +1234,15 @@ body {
 }
 .node .gpu-contention.paused {
   color: var(--warn);
+}
+
+/* ---- chat lanes not routed (node agent lanes, i403) ---- */
+.node .lane-state {
+  margin-top: 6px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--warn);
+  overflow-wrap: anywhere;
 }
 
 /* ---- node footer (backends + heartbeat) ---- */
@@ -2596,7 +2609,7 @@ body {
   justify-content: center;
   padding: 20px;
   background: color-mix(in srgb, var(--bg) 82%, transparent);
-  backdrop-filter: blur(4px);
+  backdrop-filter: none; /* a blurred backdrop over animated content flickers (GPU compositing); dimming only */
 }
 .login-card {
   width: 100%;
@@ -2636,7 +2649,7 @@ body {
   inset: 0;
   z-index: 120;
   background: color-mix(in srgb, var(--bg) 70%, transparent);
-  backdrop-filter: blur(3px);
+  backdrop-filter: none; /* a blurred backdrop over animated content flickers (GPU compositing); dimming only */
 }
 .confirm-content {
   position: fixed;
@@ -2892,7 +2905,7 @@ body {
   justify-content: center;
   padding: 24px;
   background: color-mix(in srgb, var(--background) 55%, transparent);
-  backdrop-filter: blur(3px);
+  backdrop-filter: none; /* a blurred backdrop over animated content flickers (GPU compositing); dimming only */
 }
 .diag-modal {
   position: relative;
@@ -3958,6 +3971,22 @@ body {
   gap: 7px;
   min-width: 0;
 }
+/* Each column scrolls on its own, so opening a thread at its newest message
+   never scrolls the thread list out of view. */
+.traffic-threads,
+.traffic-messages {
+  max-height: calc(100vh - 170px);
+  overflow-y: auto;
+}
+/* The open thread's name stays at the top of its scrolling column. */
+.traffic-messages > .subhead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  margin: 0;
+  padding: 4px 0 6px;
+  background: var(--bg);
+}
 .traffic-thread {
   display: flex;
   flex-direction: column;
@@ -4019,3 +4048,11 @@ body {
   text-decoration: underline;
   cursor: pointer;
 }
+
+/* Add-on access (f99): the add-on picker, each feature's tags, the forms. */
+.addon-access-pick { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 12px; }
+.addon-access-feature { margin-top: 12px; }
+.addon-access-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 6px 0; }
+.addon-access-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; margin: 8px 0; }
+.addon-access-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; min-width: 160px; flex: 1 1 160px; }
+.addon-access-form select { height: 36px; border: 1px solid var(--input); border-radius: 6px; background: var(--background); color: var(--foreground); padding: 0 8px; }

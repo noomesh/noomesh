@@ -5,6 +5,7 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -17,7 +18,6 @@ import (
 	"github.com/moby/moby/client"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlenv"
-	"github.com/noomesh/noomesh/node-agent-go/internal/sidecarimage"
 )
 
 // The stunnel sidecar: the client-certificate door for every agent-started
@@ -145,20 +145,11 @@ func privateDoorEnv(port int) map[string]string {
 // StunnelImageEnv overrides the sidecar image on a node.
 const StunnelImageEnv = "STUNNEL_IMAGE"
 
-// stunnelFallbackImage is used when no built stunnel image is reachable:
-// plain alpine, with stunnel installed by the entrypoint at first start
-// (apk, ~1 MB). The release matrix publishes a multi-arch stunnel image
-// (#552), and NOO_IMAGE_PREFIX/stunnel:NOO_IMAGE_TAG wins below; this is
-// kept for nodes on a release that predates it, reported on the heartbeat
-// (`stunnel_image`, internal/sidecarimage) and removed once every node
-// carries the published image.
-const stunnelFallbackImage = "alpine:3.22"
-
-// stunnelSidecarScript is the sidecar's `sh -c` entrypoint. `command -v`
-// covers the built image (docker/Dockerfile.stunnel, stunnel on PATH); the
-// apk arm covers the alpine fallback.
+// stunnelSidecarScript is the sidecar's `sh -c` entrypoint, on the
+// published stunnel image (docker/Dockerfile.stunnel, stunnel on PATH).
+// There is no install-at-start arm: the alpine + `apk add` fallback is
+// retired (i407), so a door never depends on a third-party mirror.
 const stunnelSidecarScript = `
-command -v stunnel >/dev/null 2>&1 || apk add --no-cache stunnel >/dev/null
 printf '%s\n' "$STUNNEL_CONF" > /tmp/stunnel.conf
 exec stunnel /tmp/stunnel.conf
 `
@@ -215,9 +206,9 @@ func stunnelImageCandidates(backend string) []string {
 	if prefix != "" && tag != "" {
 		out = append(out, prefix+"/stunnel:"+tag)
 	}
-	// The compose-built name: present on a controller and on any node
-	// `sync-images` shipped it to.
-	out = append(out, "noomesh/stunnel:latest", stunnelFallbackImage)
+	// Nothing after the release's own image (i407): `noomesh/stunnel:latest`
+	// existed only on a controller, and `alpine` + `apk add` broke rail-only
+	// and the read-only door. A missing image fails the start, naming it.
 	return out
 }
 
@@ -226,20 +217,17 @@ func stunnelImageCandidates(backend string) []string {
 func (c *Client) ensureSidecarImage(ctx context.Context, backend string) (string, error) {
 	var errs []string
 	for _, img := range stunnelImageCandidates(backend) {
-		// Local-or-rail for the published stunnel image; the alpine
-		// fallback is a public third-party image, so it may come from its
-		// registry only under NOO_IMAGE_REGISTRY_FALLBACK (image_source.go).
+		// Local or over the rail: the published stunnel image is ours.
 		if err := ensureImageFn(ctx, c, img); err != nil {
 			errs = append(errs, img+": "+err.Error())
 			continue
 		}
-		// The fallback is logged ONCE per process and carried on every
-		// heartbeat as `stunnel_image` (internal/sidecarimage), so the
-		// controller sees a node whose doors depend on the alpine mirror.
-		sidecarimage.Chose(img, img == stunnelFallbackImage, errs)
 		return img, nil
 	}
-	return "", fmt.Errorf("no stunnel image available (%s)", strings.Join(errs, "; "))
+	if len(errs) == 0 {
+		return "", errors.New("no stunnel image configured (NOO_IMAGE_PREFIX and NOO_IMAGE_TAG are unset, and no STUNNEL_IMAGE)")
+	}
+	return "", fmt.Errorf("no stunnel image available (%s) — stage it on the controller: noo cluster sync-images --stage-only --lock", strings.Join(errs, "; "))
 }
 
 // sidecarConnectPort is the port the backend container listens on behind
@@ -290,9 +278,9 @@ func (c *Client) startSidecar(ctx context.Context, backend, image, networkName s
 		Image: image,
 		// Root ON PURPOSE (and spelled out): the published stunnel image ends
 		// `USER 65532` since i132, but this door reads the node's root-owned
-		// 0600 leaf under /etc/noo/pki through the DAC_OVERRIDE cap below, and
-		// the alpine fallback's entrypoint runs `apk add`. Without this, a
-		// node pulling the new image would start a door that cannot read its key.
+		// 0600 leaf under /etc/noo/pki through the DAC_OVERRIDE cap below.
+		// Without this, a node pulling the new image would start a door that
+		// cannot read its key.
 		User: sidecarUser,
 		// The name the conf accepts on: docker writes it into /etc/hosts
 		// with the bridge address, so stunnel binds that and leaves
@@ -315,8 +303,7 @@ func (c *Client) startSidecar(ctx context.Context, backend, image, networkName s
 		CapAdd:        caps,
 	}
 	// Read-only root: the door writes only its conf, to the /tmp tmpfs.
-	// Not on the alpine fallback, whose entrypoint installs stunnel first.
-	rootFloor(hostCfg, image != stunnelFallbackImage)
+	rootFloor(hostCfg, true)
 	// macOS: the door (this sidecar's accept port) on host loopback only —
 	// the agent cannot route to a Docker Desktop bridge IP (LoopbackDoorPublish).
 	if LoopbackDoorPublish() {

@@ -55,6 +55,11 @@ func TestGPUHoldAndReleaseCarryTheLeaseAndMapRefusals(t *testing.T) {
 		t.Fatalf("purpose: %d %v %+v", code, out, gotHold)
 	}
 
+	// i344b PR 5: for_secs rides as a duration.
+	if code, out = do(s.handleGPUHold, `{"operation_id":"op-f","purpose":"user","for_secs":1800}`); code != 200 || gotHold.For != 30*time.Minute {
+		t.Fatalf("for_secs: %d %v %+v", code, out, gotHold)
+	}
+
 	// Refusals.
 	holdErr = &gpuyield.ErrHeld{Current: gpuyield.Lease{Owner: "a", OperationID: "op-0", Generation: 6}}
 	code, out = do(s.handleGPUHold, `{"operation_id":"op-2"}`)

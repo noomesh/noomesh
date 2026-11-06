@@ -120,7 +120,17 @@ async fn scope_entity(
     requester: Option<&RequesterCtx>,
     cluster: Option<&ClusterNode>,
 ) -> Result<(), AppError> {
-    let Some((etype, name)) = temporal_graph::entity_identity(&state.db, entity_id).await else {
+    // An id that is not a uuid is no entity of anyone's: refused before the
+    // lookup, so the cast cannot be mistaken for a database fault.
+    if uuid::Uuid::parse_str(entity_id).is_err() {
+        return Err(AppError::BadRequest(format!("entity_id '{entity_id}' is not a uuid")));
+    }
+    // A database error is a 503, never "nothing to scope": that skipped the
+    // ownership check, and the fact read below could then succeed.
+    let found = temporal_graph::entity_identity(&state.db, entity_id)
+        .await
+        .map_err(|e| AppError::Unavailable(format!("cannot read the entity to check its owner: {e}")))?;
+    let Some((etype, name)) = found else {
         // The entity vanished between lookup and check; the fact query below
         // will return nothing. Nothing to scope.
         return Ok(());
@@ -169,7 +179,7 @@ async fn facts_for_entity(
         let name = p.canonical_name.ok_or_else(|| {
             AppError::BadRequest("canonical_name required when entity_type given".into())
         })?;
-        match temporal_graph::find_entity_id(&state.db, &etype, &name).await {
+        match temporal_graph::try_find_entity_id(&state.db, &etype, &name).await.map_err(|e| AppError::Unavailable(format!("cannot read the temporal graph: {e}")))? {
             Some(id) => id,
             None => return Ok(Json(json!({"facts": [], "entity_id": null}))),
         }
@@ -225,7 +235,7 @@ async fn evolution(
         let name = p.canonical_name.ok_or_else(|| {
             AppError::BadRequest("canonical_name required when entity_type given".into())
         })?;
-        match temporal_graph::find_entity_id(&state.db, &etype, &name).await {
+        match temporal_graph::try_find_entity_id(&state.db, &etype, &name).await.map_err(|e| AppError::Unavailable(format!("cannot read the temporal graph: {e}")))? {
             Some(id) => id,
             None => return Ok(Json(json!({"history": []}))),
         }
@@ -264,7 +274,7 @@ async fn user_profile(
         Some(&user_id),
     )
     .map_err(AppError::Forbidden)?;
-    let entity_id = match temporal_graph::find_entity_id(&state.db, "user", &user_id).await {
+    let entity_id = match temporal_graph::try_find_entity_id(&state.db, "user", &user_id).await.map_err(|e| AppError::Unavailable(format!("cannot read the temporal graph: {e}")))? {
         Some(id) => id,
         None => return Ok(Json(json!({"user_id": user_id, "facts": []}))),
     };
@@ -290,7 +300,7 @@ async fn user_profile(
 async fn agent_self(
     State(state): State<Arc<AppState>>,
 ) -> AppResult {
-    let entity_id = match temporal_graph::find_entity_id(&state.db, "agent_self", "mesh").await {
+    let entity_id = match temporal_graph::try_find_entity_id(&state.db, "agent_self", "mesh").await.map_err(|e| AppError::Unavailable(format!("cannot read the temporal graph: {e}")))? {
         Some(id) => id,
         None => return Ok(Json(json!({"facts": []}))),
     };
@@ -316,26 +326,32 @@ struct ProjectParams {
     limit: Option<u32>,
 }
 
-/// Recent project state across all known projects.
+/// Recent project state in the REQUESTER's org (i434). It used to
+/// read every project row with no org bound at all, and `/api/temporal/` is
+/// User-readable. A caller with no org on record is refused (403), an org
+/// lookup the database cannot answer is a 503, and an unstamped (NULL-org)
+/// row is in no one's org.
 async fn recent_projects(
     State(state): State<Arc<AppState>>,
+    requester: Option<Extension<RequesterCtx>>,
     Query(p): Query<ProjectParams>,
 ) -> AppResult {
-    let limit = p.limit.unwrap_or(20).min(100) as i32;
-    let rows: Vec<(String, String, Option<String>, chrono::DateTime<chrono::Utc>, f64)> =
-        sqlx::query_as(
-            "SELECT s.canonical_name, e.predicate, e.object_value, \
-                    e.valid_from, e.confidence \
-             FROM noo_temporal_edges e \
-             JOIN noo_entities_typed s ON e.subject_id = s.id \
-             WHERE s.type = 'project' \
-               AND e.valid_to IS NULL \
-             ORDER BY e.valid_from DESC \
-             LIMIT $1"
-        )
-        .bind(limit)
-        .fetch_all(&state.db)
-        .await?;
+    let limit = i64::from(p.limit.unwrap_or(20).min(100));
+    let who = requester.as_ref().map(|Extension(r)| r.sub.as_str());
+    let org = temporal_graph::resolve_org(&state.db, who)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "temporal_projects_org_unreadable");
+            AppError::Unavailable(format!(
+                "cannot read the requester's org, so project state is not shown: the database answered {e}"
+            ))
+        })?
+        .ok_or_else(|| {
+            AppError::Forbidden(
+                "project state is per org, and this caller has no org on record (a user or team account is needed)".into(),
+            )
+        })?;
+    let rows = temporal_graph::recent_project_decisions(&state.db, &org, limit).await?;
 
     let entries: Vec<Value> = rows
         .into_iter()

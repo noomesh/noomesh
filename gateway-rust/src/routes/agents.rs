@@ -553,9 +553,22 @@ async fn skills_run(
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
             let duration_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let data = resp.json::<Value>().await.unwrap_or(json!({}));
-
-            let exit_code = data.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(-1);
+            // An answer that cannot be read, or one without an exit code, is
+            // said as such: it used to read as "Container exited with code
+            // -1", a cause the container never gave (i460).
+            let (exit_code, data) = match crate::upstream_body::json_2xx(resp, &format!("node {node_id}")).await.and_then(|d| skill_exit(&d).map(|c| (c, d))) {
+                Ok(read) => read,
+                Err(e) => {
+                    tracing::warn!(container = %container_name, error = %e, "skill_container_answer_unreadable");
+                    return Ok(Json(json!({
+                        "success": false,
+                        "error": format!("{e}; the skill may have run"),
+                        "duration_ms": duration_ms,
+                        "container_id": container_name,
+                        "node_id": node_id,
+                    })));
+                }
+            };
             let stdout = data.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
             let stderr = data.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
             let container_id = data.get("container_id").and_then(|v| v.as_str())
@@ -657,7 +670,7 @@ async fn resolve_skill_node(
     }
 
     // Score each node: read current_load from KV, filter by GPU if needed
-    let mut best: Option<(String, String, f64)> = None;
+    let mut best: Option<(String, String, i64)> = None;
 
     if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
         for (nid, url, _hostname) in &agents {
@@ -676,7 +689,8 @@ async fn resolve_skill_node(
                         if !has_gpu { continue; }
                     }
 
-                    let load = data.get("current_load").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                    // An unreported load sorts after every reported one.
+                    let load = crate::coordinator::classes::load_key(data.get("current_load").and_then(|v| v.as_f64()));
                     if best.as_ref().map(|(_, _, bl)| load < *bl).unwrap_or(true) {
                         best = Some((nid.clone(), url.clone(), load));
                     }
@@ -1042,11 +1056,29 @@ async fn workflows_run(
 }
 
 
+/// The skill run's exit code from the node agent's answer; an answer
+/// without one is an error, never `-1` (i460).
+fn skill_exit(data: &Value) -> Result<i64, String> {
+    data.get("exit_code")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| format!("the node agent's skill answer has no exit_code: {}", truncate_str(&data.to_string(), 200)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use crate::auth::{ClusterKind, ClusterNode, RequesterCtx, Role};
+
+    /// i460: a skill answer without an exit code is said as such, never
+    /// "exited with code -1".
+    #[test]
+    fn a_skill_answer_without_an_exit_code_is_an_error_not_minus_one() {
+        assert_eq!(skill_exit(&json!({"exit_code": 0, "stdout": "{}"})), Ok(0));
+        assert_eq!(skill_exit(&json!({"exit_code": -1})), Ok(-1), "a real -1 stays a real -1");
+        let e = skill_exit(&json!({"stdout": "x"})).unwrap_err();
+        assert!(e.starts_with("the node agent's skill answer has no exit_code"), "{e}");
+    }
 
     fn jwt(sub: &str, role: Role, harness: Option<&str>) -> Option<Extension<RequesterCtx>> {
         Some(Extension(RequesterCtx {
@@ -1073,6 +1105,25 @@ mod tests {
         let node = Some(Extension(ClusterNode("host3".into(), ClusterKind::Node)));
         assert_eq!(caller(&None, &node).harness, "node:host3");
         assert_eq!(caller(&None, &None).harness, "unknown");
+    }
+
+    /// Followup 1309: `from_id.node` is where the sender runs, never the
+    /// controller that relayed a door call.
+    #[test]
+    fn a_requester_has_no_sender_node() {
+        for role in [Role::User, Role::Operator] {
+            assert_eq!(caller(&jwt("alice", role, None), &None).sender_node("ctl"), None, "{role:?}");
+            assert_eq!(caller(&jwt("alice", role, Some("mcp-external:acme")), &None).sender_node("ctl"), None, "{role:?}");
+        }
+    }
+
+    #[test]
+    fn a_node_or_internal_caller_keeps_its_real_node() {
+        let node = Some(Extension(ClusterNode("host3".into(), ClusterKind::Node)));
+        assert_eq!(caller(&None, &node).sender_node("ctl").as_deref(), Some("host3"));
+        let internal = Some(Extension(ClusterNode("mcp-local".into(), ClusterKind::Internal)));
+        assert_eq!(caller(&None, &internal).sender_node("ctl").as_deref(), Some("ctl"), "an internal service runs on the controller");
+        assert_eq!(caller(&None, &None).sender_node("ctl"), None, "anonymous is nowhere");
     }
 
     /// M21b: broadcast fans out to every connected peer, so only callers
@@ -1269,13 +1320,11 @@ mod tests {
     /// window to ack clears a message for every sibling again.
     #[test]
     fn unread_and_ack_are_per_reader() {
-        let repo = include_str!("../repo/agent_messages.rs");
-        let list = repo.split("pub async fn list(").nth(1).expect("list");
-        let list = &list[..list.find("\n}").unwrap()];
+        let repo = crate::test_src::own_code(include_str!("../repo/agent_messages.rs"));
+        let list = crate::test_src::fn_body(&repo, "pub async fn list(");
         assert!(list.contains("noo_agent_message_reads") && list.contains("x.reader ="),
             "unread must be computed from the per-reader reads table");
-        let ack = repo.split("pub async fn mark_read(").nth(1).expect("mark_read");
-        let ack = &ack[..ack.find("\n}").unwrap()];
+        let ack = crate::test_src::fn_body(&repo, "pub async fn mark_read(");
         assert!(ack.contains("INSERT INTO noo_agent_message_reads"),
             "ack must record the reader, not only flip the message's read_at");
         // And both routes hand the ACTING identity in as the reader.
@@ -1312,11 +1361,9 @@ mod tests {
     /// a second definition of "mine".
     #[test]
     fn messages_and_threads_both_apply_the_scope_rule() {
-        let src = include_str!("agents.rs");
+        let own = crate::test_src::own_code(include_str!("agents.rs"));
         for f in ["async fn messages_list(", "async fn threads_list("] {
-            let needle = ["async fn ", f.trim_start_matches("async fn ")].concat();
-            let body = src.split(needle.as_str()).last().expect("route");
-            let body = &body[..body.find("\n}").unwrap()];
+            let body = crate::test_src::fn_body(&own, f);
             let call = ["list_sees_everything(", "who.privileged"].concat();
             assert!(body.contains(&call), "{f} must apply list_sees_everything");
             assert!(body.contains("q.all"), "{f} must honour all=");
@@ -1347,19 +1394,16 @@ mod tests {
         assert_eq!(super::applied_filter(&f), json!({"scope": "own: rbwolf", "limit": 50}));
         let f = crate::repo::agent_messages::Filter { thread: Some("thr_b"), unread_only: true, owner: None, ..f };
         assert_eq!(super::applied_filter(&f), json!({"scope": "all", "thread": "thr_b", "unread": true, "limit": 50}));
-        let src = include_str!("agents.rs");
-        let body = src.split(["async fn ", "messages_list("].concat().as_str()).last().expect("route");
-        let body = &body[..body.find("\n\u{7d}").unwrap()];
+        let own = crate::test_src::own_code(include_str!("agents.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn messages_list(");
         assert!(body.contains("\"filter\": applied_filter(&filter)"), "the list response must carry the echo");
     }
 
     /// presence `all=true` is gated on privilege and served by `live_all`.
     #[test]
     fn presence_all_is_operator_only() {
-        let src = include_str!("agents.rs");
-        let needle = ["async fn ", "presence_list("].concat();
-        let body = src.split(needle.as_str()).last().expect("presence route");
-        let body = &body[..body.find("\n}").unwrap()];
+        let own = crate::test_src::own_code(include_str!("agents.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn presence_list(");
         let gate = ["q.get(\"all\")", ".is_some_and"].concat();
         assert!(body.contains(&gate), "presence must read all=");
         let deny = ["if !who.priv", "ileged {"].concat();
@@ -1385,14 +1429,10 @@ mod tests {
     /// siblings; swap the other way in `owns` and it could act as them.
     #[test]
     fn presence_is_visible_to_siblings_but_not_actable() {
-        // Needles assembled at runtime: this test module precedes the route
-        // in the file, so a literal needle matches the test's own source
-        // first and slices the wrong region (that is how the first version
-        // of this test failed on correct code).
-        let src = include_str!("agents.rs");
-        let fn_needle = ["async fn ", "presence_list("].concat();
-        let body = src.split(fn_needle.as_str()).last().expect("presence route");
-        let body = &body[..body.find("\n}").unwrap()];
+        // The route is read from the file's own code, test module removed, so a
+        // literal marker cannot match this test's own source.
+        let own = crate::test_src::own_code(include_str!("agents.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn presence_list(");
         let wide = ["same_owner", "(m, &owner)"].concat();
         let narrow = ["who.owns", "(&owner)"].concat();
         assert!(body.contains(&wide), "presence must be scoped by same_owner");
@@ -1622,6 +1662,21 @@ fn caller(requester: &Option<Extension<RequesterCtx>>, cluster: &Option<Extensio
 }
 
 impl Caller {
+    /// The node a message from this caller was SENT from, or None when the
+    /// gateway cannot know it (followup 1309). A node token names its node;
+    /// an internal service runs on the controller (`here`). A requester
+    /// (a user or operator JWT, the external MCP door) arrives from a machine
+    /// the gateway never sees, so it gets no node: stamping the controller
+    /// made every door message claim to come from the box that relayed it.
+    /// Which door it came through is already `harness`.
+    fn sender_node(&self, here: &str) -> Option<String> {
+        match (&self.node, &self.sub) {
+            (Some(n), _) => Some(n.clone()),
+            (None, None) if self.privileged => Some(here.to_string()),
+            _ => None,
+        }
+    }
+
     /// Is `agent` one this caller may act as or read for?
     ///
     /// a user credential now owns names under its own prefix
@@ -2141,16 +2196,14 @@ async fn messages_send(
     };
 
     let user = who.sub.clone();
-    // A node-bound caller's messages are attributed to that node, not the
-    // controller that relayed them.
-    let node = who.node.clone().unwrap_or_else(crate::agent_messages::controller_node);
+    let node = who.sender_node(&crate::agent_messages::controller_node());
     // `harness` comes from the credential class, never the body — a sender
     // used to be able to label itself `claude-code` and have the CLI print
     // it in the same column as the server-derived user and node. Whatever
     // the caller asked for rides along as a clearly-named claim.
     let identity = crate::agent_messages::Identity::new(
         user.as_deref(),
-        Some(&node),
+        node.as_deref(),
         Some(req.agent.as_deref().unwrap_or(&from)),
         Some(&who.harness),
     )
@@ -2253,7 +2306,7 @@ async fn archive_list(
     if !who.privileged {
         return Err(AppError::Forbidden("the agent-mail archive is operator-only".into()));
     }
-    let dir = crate::agent_mail_archive::configured_dir(&state.db).await;
+    let dir = crate::agent_mail_archive::configured_dir(&state.db).await.map_err(AppError::Unavailable)?;
     let d = dir.clone();
     let files = tokio::task::spawn_blocking(move || crate::agent_mail_archive::list(&d))
         .await
@@ -2285,7 +2338,7 @@ async fn archive_export(
 ) -> AppResult {
     use crate::agent_mail_archive::ExportError as E;
     let who = caller(&requester, &cluster);
-    let dir = crate::agent_mail_archive::configured_dir(&state.db).await;
+    let dir = crate::agent_mail_archive::configured_dir(&state.db).await.map_err(AppError::Unavailable)?;
     let keys = if q.decrypt { crate::agent_crypto::controller_keys() } else { None };
     crate::agent_mail_archive::export(&state.db, &dir, who.privileged, &who.label, &month, keys, q.decrypt)
         .await

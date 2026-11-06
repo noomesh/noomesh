@@ -547,7 +547,8 @@ mod tests {
     fn the_door_lists_audits_then_dispatches_them_as_the_account() {
         let src = include_str!("mcp_external.rs");
         // The door's JSON-RPC body lives in `handle_rpc` (`state` is a reference there).
-        let handle = &src[src.find("async fn handle_rpc(").expect("handle_rpc")..src.find("#[cfg(test)]").expect("tests")];
+        let own = crate::test_src::own_code(src);
+        let handle = crate::test_src::fn_body(&own, "async fn handle_rpc(");
         let list = &handle[handle.find("\"tools/list\" =>").expect("tools/list arm")..handle.find("\"tools/call\" =>").expect("tools/call arm")];
         assert!(list.contains("crate::mcp_user_tasks::tool_list()"), "tools/list must advertise the task tools");
         assert!(!list.contains("user_role"), "the listing is not tier-filtered");

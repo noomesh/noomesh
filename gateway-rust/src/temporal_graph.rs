@@ -32,6 +32,23 @@ pub async fn find_entity_id(
     entity_type: &str,
     canonical_name: &str,
 ) -> Option<String> {
+    match try_find_entity_id(db, entity_type, canonical_name).await {
+        Ok(found) => found,
+        Err(e) => {
+            // Prompt context only (Layer D): a missing section, said in the log.
+            tracing::warn!(error = %e, entity_type, "temporal_entity_lookup_failed");
+            None
+        }
+    }
+}
+
+/// [`find_entity_id`] with the database error kept: a route answers 503
+/// for it, never "no such entity" (sweep of #650).
+pub async fn try_find_entity_id(
+    db: &PgPool,
+    entity_type: &str,
+    canonical_name: &str,
+) -> std::result::Result<Option<String>, sqlx::Error> {
     let normalized = canonical_name.trim().to_lowercase();
     let row: Result<Option<(String,)>, _> = sqlx::query_as(
         "SELECT id::text FROM noo_entities_typed \
@@ -42,12 +59,15 @@ pub async fn find_entity_id(
     .fetch_optional(db)
     .await;
 
-    row.ok().flatten().map(|(s,)| s)
+    Ok(row?.map(|(s,)| s))
 }
 
 /// Upsert an entity by (type, canonical_name), returning its id as text.
 /// Names are normalized (trim + lowercase) to match `find_entity_id`.
-/// `(type, canonical_name)` of one entity, or `None` if it is gone.
+/// `(type, canonical_name)` of one entity, `Ok(None)` if it is gone. A
+/// database error is `Err`, never `None`: the scope check reads `None` as
+/// "nothing to scope", so an error there would skip the ownership check
+/// and the fact read after it could return another person's facts.
 ///
 /// The scope check on `/api/temporal/facts` and `/api/temporal/evolution`
 /// needs this: those routes address a subject by OPAQUE id as well as by
@@ -56,15 +76,13 @@ pub async fn find_entity_id(
 pub async fn entity_identity(
     db: &sqlx::PgPool,
     entity_id: &str,
-) -> Option<(String, String)> {
+) -> std::result::Result<Option<(String, String)>, sqlx::Error> {
     sqlx::query_as::<_, (String, String)>(
         "SELECT type, canonical_name FROM noo_entities_typed WHERE id = $1::uuid",
     )
     .bind(entity_id)
     .fetch_optional(db)
     .await
-    .ok()
-    .flatten()
 }
 
 pub async fn upsert_entity(
@@ -296,21 +314,55 @@ pub async fn get_evolution(
 /// (alongside A: outline, B: rolling summary, C: semantic recall).
 /// Resolve an identity's org (the tenant boundary). Handles both a user
 /// (`noo_users.org_id`) and a `team:<name>` identity (space→team, PR5c —
-/// `noo_kb_teams.org_id`). None when unknown / single-org.
-async fn resolve_org(db: &PgPool, user_id: Option<&str>) -> Option<String> {
-    let uid = user_id?;
+/// `noo_kb_teams.org_id`).
+///
+/// `Ok(None)` is an UNRESOLVED identity (no caller, an id that is neither a
+/// user nor a team, or a row with no org), never "every org". A database
+/// error is `Err`. Callers fail closed on both: an org-bounded read with no
+/// org reads nothing (i434; it used to bind NULL and match every
+/// tenant through `$1 IS NULL OR …`).
+pub(crate) async fn resolve_org(db: &PgPool, user_id: Option<&str>) -> std::result::Result<Option<String>, sqlx::Error> {
+    let Some(uid) = user_id.map(str::trim).filter(|u| !u.is_empty()) else {
+        return Ok(None);
+    };
     if let Some(team) = uid.strip_prefix("team:") {
-        return sqlx::query_scalar::<_, Option<String>>(
+        return Ok(sqlx::query_scalar::<_, Option<String>>(
             "SELECT org_id FROM noo_kb_teams WHERE name = $1",
         )
         .bind(team)
         .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
-        .flatten();
+        .await?
+        .flatten());
     }
-    crate::repo::users::org_of(db, uid).await.ok().flatten()
+    crate::repo::users::org_of(db, uid).await
+}
+
+/// One current project decision: project, predicate, object, since, confidence.
+pub(crate) type ProjectDecision = (String, String, Option<String>, chrono::DateTime<chrono::Utc>, f64);
+
+/// Recent project decisions in ONE org. The org is required: there is no
+/// "any org" form. A row's `org_id` must equal it, so an unstamped (NULL) row
+/// is in no one's org until its writer stamps it (writer-side stamping:
+/// i435).
+pub(crate) async fn recent_project_decisions(
+    db: &PgPool,
+    org: &str,
+    limit: i64,
+) -> std::result::Result<Vec<ProjectDecision>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT s.canonical_name, e.predicate, e.object_value, e.valid_from, e.confidence \
+         FROM noo_temporal_edges e \
+         JOIN noo_entities_typed s ON e.subject_id = s.id \
+         WHERE s.type = 'project' \
+           AND e.valid_to IS NULL \
+           AND s.org_id = $1 \
+         ORDER BY e.valid_from DESC \
+         LIMIT $2",
+    )
+    .bind(org)
+    .bind(limit)
+    .fetch_all(db)
+    .await
 }
 
 pub async fn fetch_temporal_context(
@@ -319,8 +371,15 @@ pub async fn fetch_temporal_context(
 ) -> Option<String> {
     let mut sections: Vec<String> = Vec::new();
     // PR5b-3: the requester's org bounds cross-entity sections (projects) so one
-    // tenant's state never leaks into another's prompt. None = single-org.
-    let org = resolve_org(db, user_id).await;
+    // tenant's state never leaks into another's prompt. Unresolved or
+    // unreadable = no cross-entity section at all (fail closed).
+    let org = match resolve_org(db, user_id).await {
+        Ok(org) => org,
+        Err(e) => {
+            tracing::warn!(error = %e, "temporal_context_org_unreadable: project section skipped");
+            None
+        }
+    };
 
     // Section 1: User's current preferences (only if user_id is known)
     if let Some(uid) = user_id {
@@ -367,31 +426,22 @@ pub async fn fetch_temporal_context(
     }
 
     // Section 3: Recent project decisions (across the requester's org only —
-    // PR5b-3; without the org bound this surfaced every tenant's projects).
-    if let Ok(rows) = sqlx::query_as::<_, (String, String, Option<String>, chrono::DateTime<chrono::Utc>)>(
-        "SELECT s.canonical_name, e.predicate, e.object_value, e.valid_from \
-         FROM noo_temporal_edges e \
-         JOIN noo_entities_typed s ON e.subject_id = s.id \
-         WHERE s.type = 'project' \
-           AND e.valid_to IS NULL \
-           AND ($1::text IS NULL OR s.org_id = $1) \
-         ORDER BY e.valid_from DESC \
-         LIMIT 8"
-    )
-    .bind(org.as_deref())
-    .fetch_all(db)
-    .await
-    {
-        if !rows.is_empty() {
-            let mut buf = String::from("[Recent project state]");
-            for (proj, pred, obj, vf) in &rows {
-                let obj_str = obj.as_deref().unwrap_or("?");
-                buf.push_str(&format!(
-                    "\n- {} {} {} ({})",
-                    proj, pred, obj_str, vf.format("%Y-%m-%d"),
-                ));
+    // PR5b-3). No org, no section: never "every tenant's projects".
+    if let Some(org) = org.as_deref() {
+        match recent_project_decisions(db, org, 8).await {
+            Ok(rows) if !rows.is_empty() => {
+                let mut buf = String::from("[Recent project state]");
+                for (proj, pred, obj, vf, _) in &rows {
+                    let obj_str = obj.as_deref().unwrap_or("?");
+                    buf.push_str(&format!(
+                        "\n- {} {} {} ({})",
+                        proj, pred, obj_str, vf.format("%Y-%m-%d"),
+                    ));
+                }
+                sections.push(buf);
             }
-            sections.push(buf);
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "temporal_context_projects_unreadable"),
         }
     }
 

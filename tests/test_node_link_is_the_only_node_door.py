@@ -20,7 +20,7 @@ This guard reads the gateway source and fails on, outside `node_link.rs` and
 - `build_node_agent_client(` (the old client accessor, now inside `NodeLink`);
 - a direct `node_agent_auth::header_for(` / `header_for_self(` call.
 
-Comments and everything from the first `#[cfg(test)]` of a file on are not
+Comments and `#[cfg(test)]` items are not
 scanned: fixtures and test addresses may spell the port. A genuine exception
 goes on ALLOWED with the reason; a stale entry fails the guard too.
 """
@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+
+from tests import _rust_src as rs
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "gateway-rust" / "src"
@@ -51,13 +53,8 @@ PATTERNS: dict[str, re.Pattern[str]] = {
 def _code_lines(path: Path) -> list[tuple[int, str]]:
     """Non-comment lines of the file's production code (before any test mod)."""
     out: list[tuple[int, str]] = []
-    for n, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        if raw.lstrip().startswith("#[cfg(test)]"):
-            break
-        if raw.lstrip().startswith("//"):
-            continue
-        idx = raw.find(" //")
-        out.append((n, raw if idx < 0 else raw[:idx]))
+    for n, raw in enumerate(rs.own_code_lines(path.read_text(encoding="utf-8")).splitlines(), 1):
+        out.append((n, raw))
     return out
 
 

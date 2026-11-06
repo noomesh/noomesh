@@ -455,8 +455,18 @@ pub(crate) fn parse_search_with(a: &mut Args) -> Result<(String, Option<String>,
 
 /// `noo models search QUERY [--backend/-b B] [--limit/-n N]` — live
 /// HuggingFace search (cached/offline fallback).
+/// Refuse, loudly and before any request, an `HF_ENDPOINT` the endpoint
+/// rule refuses (i445). The catalogue would otherwise fall back to its cache
+/// on the failed search and say nothing.
+fn require_hf_endpoint(g: &Globals) {
+    if let Err(why) = crate::catalog::hf_endpoint() {
+        fail(g.json, ExitCode::Usage, "hf_endpoint_refused", &why, Some(crate::catalog::HF_ENDPOINT_REMEDY));
+    }
+}
+
 pub fn models_search(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let (query, backend, limit) = parse_search_with(&mut Args::new(args))?;
+    require_hf_endpoint(g);
 
     let mut cat = Catalog::new();
     if !g.json {
@@ -515,6 +525,7 @@ pub fn models_info(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
     let Some(model) = model else { return Err(Unhandled) };
+    require_hf_endpoint(g);
 
     if !g.json {
         ui::step(&format!("fetching info for {model}"));
@@ -853,6 +864,7 @@ pub(crate) fn parse_huggingface_with(a: &mut Args) -> Result<(Option<String>, us
 pub fn models_huggingface(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let (query, limit) = parse_huggingface_with(&mut Args::new(args))?;
     let query = query.unwrap_or_else(|| "mistral instruct awq".to_string());
+    require_hf_endpoint(g);
 
     let mut cat = Catalog::new();
     if !g.json {
@@ -1495,6 +1507,7 @@ pub(crate) fn parse_refresh_with(a: &mut Args) -> Result<(Option<String>, bool),
 /// the cache. Exit 0 when at least one backend refreshed; 1 when all failed.
 pub fn models_refresh(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let (backend, use_llm) = parse_refresh_with(&mut Args::new(args))?;
+    require_hf_endpoint(g);
     let backends: Vec<String> = match &backend {
         Some(b) => vec![b.clone()],
         None => catalog::ALL_SEARCH_BACKENDS.iter().map(|s| s.to_string()).collect(),

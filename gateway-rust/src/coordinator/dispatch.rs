@@ -141,40 +141,48 @@ pub fn parse_policy(v: Option<&str>) -> String {
 /// running `harness` placement, or `harness_policy = auto` on the node's
 /// config with a running chat backend to follow. `off` wins over both.
 /// The same rule the desired-config route uses to tell the node agent.
-pub async fn harness_effective(state: &AppState, node: &str) -> bool {
+///
+/// `Err` when the database cannot answer. It used to read a failed query
+/// as "no row" (i436): the policy became the fleet default (`auto`), so a
+/// node whose operator set `off` could be dispatched to while Postgres was
+/// unreachable. A caller that gets `Err` does not dispatch and says why.
+pub async fn harness_effective(state: &AppState, node: &str) -> Result<bool, String> {
+    harness_effective_in(&state.db, node).await
+}
+
+async fn harness_effective_in(db: &sqlx::PgPool, node: &str) -> Result<bool, String> {
+    let unread = |what: &str, e: sqlx::Error| format!("cannot read {what} for node '{node}': {e}");
+    // No row is a real answer (the fleet default applies); an error is not.
     let policy: Option<String> = sqlx::query_scalar("SELECT harness_policy FROM noo_node_config WHERE node_id = $1")
         .bind(node)
-        .fetch_optional(&state.db)
+        .fetch_optional(db)
         .await
-        .ok()
-        .flatten();
+        .map_err(|e| unread("its harness policy", e))?;
     let policy = policy.unwrap_or_else(harness_default_policy);
     if policy == "off" {
-        return false;
+        return Ok(false);
     }
     let placed: Option<String> = sqlx::query_scalar(
         "SELECT desired_state FROM noo_backend_placements WHERE node_id = $1 AND backend = 'harness'",
     )
     .bind(node)
-    .fetch_optional(&state.db)
+    .fetch_optional(db)
     .await
-    .ok()
-    .flatten();
+    .map_err(|e| unread("its harness placement", e))?;
     if placed.as_deref() == Some("running") {
-        return true;
+        return Ok(true);
     }
     if policy != "auto" || placed.is_some() {
-        return false;
+        return Ok(false);
     }
-    let chat: Option<i64> = sqlx::query_scalar(
+    let chat: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM noo_backend_placements WHERE node_id = $1 AND backend <> 'harness'          AND desired_state = 'running' AND (role IS NULL OR role = '' OR role = 'chat')",
     )
     .bind(node)
-    .fetch_optional(&state.db)
+    .fetch_one(db)
     .await
-    .ok()
-    .flatten();
-    chat.unwrap_or(0) > 0
+    .map_err(|e| unread("its chat placements", e))?;
+    Ok(chat > 0)
 }
 
 /// Which node, if any, should run a turn for `model`: the node holding
@@ -228,10 +236,14 @@ pub async fn harness_node_explained(state: &AppState, model: Option<&str>) -> Re
     if let Err(why) = self_node_dispatchable(state, &node).await {
         return Err(format!("{named} is served by the controller's own node ('{node}'), which runs turns in process — {why}"));
     }
-    if !harness_effective(state, &node).await {
-        return Err(format!(
-            "node '{node}' serves {named} but has no harness: place one with `noo cluster place {node} harness`"
-        ));
+    match harness_effective(state, &node).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(format!(
+                "node '{node}' serves {named} but has no harness: place one with `noo cluster place {node} harness`"
+            ))
+        }
+        Err(e) => return Err(format!("{named} is served by node '{node}', but {e}, so it is not dispatched there")),
     }
     Ok(node)
 }
@@ -268,7 +280,7 @@ pub async fn self_node_dispatchable(state: &AppState, node: &str) -> Result<bool
     if !is_controller_node(node) {
         return Ok(false);
     }
-    let placed = harness_effective(state, node).await;
+    let placed = harness_effective(state, node).await?;
     let record = if placed { node_record(state, node).await } else { None };
     self_node_verdict(node, placed, record.as_ref()).map(|()| true)
 }
@@ -354,17 +366,19 @@ pub(crate) fn choose_node_for_address(live: &[(String, String)], configured: &[S
 /// Map an address or name onto a `node_id`, through the live registry
 /// first. See `choose_node_for_address` for the rule.
 pub async fn resolve_node_id(state: &AppState, host: &str) -> Result<String, String> {
+    // An unreadable registry is the reason, never "no live node": that let a
+    // lone (possibly stale) config row win, the misroute this rule prevents.
     let live: Vec<(String, String)> = crate::repo::cluster::all_nodes(&state.db)
         .await
         .map(|rows| rows.into_iter().map(|(id, ip, _)| (id, ip)).collect())
-        .unwrap_or_default();
+        .map_err(|e| format!("cannot read the live node registry to resolve {host}: {e}"))?;
     let configured: Vec<String> = sqlx::query_scalar(
         "SELECT node_id FROM noo_node_config WHERE node_id = $1 OR ip_address = $1 ORDER BY node_id",
     )
     .bind(host)
     .fetch_all(&state.db)
     .await
-    .unwrap_or_default();
+    .map_err(|e| format!("cannot read the node config to resolve {host}: {e}"))?;
     choose_node_for_address(&live, &configured, host)
 }
 
@@ -406,11 +420,15 @@ mod node_choice_tests {
 }
 
 pub async fn role_of(state: &AppState, user: &str) -> Option<Role> {
-    let role: Option<String> = crate::repo::users::enabled_role(&state.db, user)
-        .await
-        .ok()
-        .flatten();
-    role.and_then(|r| r.parse().ok())
+    match crate::repo::users::enabled_role(&state.db, user).await {
+        Ok(role) => role.and_then(|r| r.parse().ok()),
+        // Not "unknown or disabled": the role could not be read. The turn
+        // still runs in process (fail closed), but the log names the cause.
+        Err(e) => {
+            tracing::warn!(user, error = %e, "harness dispatch: the user's role could not be read; running in process");
+            None
+        }
+    }
 }
 
 /// The kind a harness named in its ack. A harness older than 0.6.13
@@ -759,5 +777,48 @@ mod harness_policy_default_tests {
         // An operator who turned harnesses off must keep them off through a
         // default change.
         assert_eq!(parse_policy(Some("off")), "off");
+    }
+}
+
+#[cfg(test)]
+mod harness_effective_db_error_tests {
+    use super::harness_effective_in;
+
+    /// i436: with the database unreachable, the policy read used to fail
+    /// into the fleet default (`auto`), so an operator's `off` could act as
+    /// `auto`. An unreadable policy is now an error, never a default.
+    #[tokio::test]
+    async fn an_unreachable_database_is_an_error_not_the_default_policy() {
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(300))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool");
+        let r = harness_effective_in(&db, "node-1").await;
+        let e = r.expect_err("no answer from the database is not an answer");
+        assert!(e.contains("cannot read its harness policy for node 'node-1'"), "{e}");
+    }
+
+    /// And the dispatcher's reason carries it, so the in-process run says why.
+    #[test]
+    fn the_dispatch_reason_names_the_unread_policy() {
+        let src = include_str!("dispatch.rs");
+        let code = &src[..src.find("mod harness_effective_db_error_tests").expect("this module")];
+        assert!(code.contains("Err(e) => return Err(format!(\"{named} is served by node '{node}', but {e}"));
+    }
+}
+
+/// role_of's error is logged as what it is (i460, P3: no wrong reason).
+#[cfg(test)]
+mod role_read_error_tests {
+    #[test]
+    fn an_unreadable_role_is_logged_as_unreadable_not_as_unknown() {
+        let own = crate::test_src::own_code(include_str!("dispatch.rs"));
+        let body = crate::test_src::fn_body(&own, "pub async fn role_of(");
+        // The read is matched, not swallowed: no default chained after its
+        // `.await` (the Ok arm's `r.parse().ok()` parses the role string).
+        assert!(body.contains("match crate::repo::users::enabled_role(&state.db, user).await {"), "{body}");
+        assert!(!body.contains(".await.ok()") && !body.contains(".await.unwrap_or"), "the read's error must not become None silently: {body}");
+        let err = &body[body.find("Err(e) =>").expect("the error arm, binding the error")..];
+        assert!(err.contains("the user's role could not be read"), "{err}");
     }
 }

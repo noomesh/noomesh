@@ -644,10 +644,39 @@ pub fn summarise_compose_all(lines: &[&str]) -> (String, String, Vec<String>) {
     (tally.pull_summary().unwrap_or_default(), tally.summary().unwrap_or_default(), pass)
 }
 
+/// How many of the child's last lines [`run_summarised`] keeps, unfiltered.
+pub const SUMMARY_TAIL_LINES: usize = 40;
+
+/// What [`run_summarised`] returns: the exit status, the tally, and the
+/// child's last [`SUMMARY_TAIL_LINES`] lines from both streams, in arrival
+/// order, INCLUDING the ones the tally absorbed.
+pub type Summarised = (std::process::ExitStatus, ComposeTally, Vec<String>);
+
+/// The lines to print under a failed summarised run: the child's last lines,
+/// unfiltered, and how to see everything. A non-zero exit is never silent
+/// (pop-os 2026-11-05: the launcher exited 1 twice and the operator saw only
+/// its banners, because every line it printed was absorbed or there were
+/// none to classify). Empty on success.
+pub fn failure_tail(ok: bool, tail: &[String], rerun: &str) -> Vec<String> {
+    if ok {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(tail.len() + 2);
+    if tail.is_empty() {
+        out.push("the command printed nothing before it failed".to_string());
+    } else {
+        out.push(format!("its last {} line{} (unfiltered):", tail.len(), if tail.len() == 1 { "" } else { "s" }));
+        out.extend(tail.iter().map(|l| format!("  | {l}")));
+    }
+    out.push(format!("for every line: {rerun}"));
+    out
+}
+
 /// Run `cmd` with its output piped: passthrough lines are printed live on the
 /// stream they came from, progress lines are only counted. A muted line every
-/// 30 s of silence says it is alive. Returns the exit status and the tally.
-pub fn run_summarised(mut cmd: Command) -> std::io::Result<(std::process::ExitStatus, ComposeTally)> {
+/// 30 s of silence says it is alive. Returns the exit status, the tally, and
+/// the last lines unfiltered ([`Summarised`]).
+pub fn run_summarised(mut cmd: Command) -> std::io::Result<Summarised> {
     use std::io::BufRead as _;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
@@ -675,9 +704,14 @@ pub fn run_summarised(mut cmd: Command) -> std::io::Result<(std::process::ExitSt
     }
     drop(tx);
     let mut tally = ComposeTally::default();
+    let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::with_capacity(SUMMARY_TAIL_LINES);
     loop {
         match rx.recv_timeout(Duration::from_secs(30)) {
             Ok((is_err, line)) => {
+                if tail.len() == SUMMARY_TAIL_LINES {
+                    tail.pop_front();
+                }
+                tail.push_back(line.clone());
                 if tally.feed(&line) {
                     if is_err {
                         eprintln!("{line}");
@@ -696,7 +730,7 @@ pub fn run_summarised(mut cmd: Command) -> std::io::Result<(std::process::ExitSt
         let _ = r.join();
     }
     let status = child.wait()?;
-    Ok((status, tally))
+    Ok((status, tally, tail.into_iter().collect()))
 }
 
 /// [`stream_status`] for a compose-driving command: on the plain console,
@@ -707,7 +741,7 @@ pub fn stream_status_summarised(ctx: &Ctx, cmd: Command) -> i32 {
         return stream_status(ctx, cmd);
     }
     match run_summarised(cmd) {
-        Ok((status, tally)) => {
+        Ok((status, tally, tail)) => {
             let code = status.code().unwrap_or(1);
             for s in [tally.pull_summary(), tally.summary()].into_iter().flatten() {
                 if tally.failed() > 0 || code != 0 {
@@ -715,6 +749,9 @@ pub fn stream_status_summarised(ctx: &Ctx, cmd: Command) -> i32 {
                 } else {
                     ctx.success(&s);
                 }
+            }
+            for l in failure_tail(code == 0, &tail, "re-run with --verbose") {
+                ctx.error(&l);
             }
             code
         }
@@ -1177,9 +1214,11 @@ mod addon_compose_tests {
         let start = body
             .find("addon_compose_overlay_args() {")
             .unwrap_or_else(|| panic!("{} has no addon_compose_overlay_args — did it move?", path.display()));
-        let rest = &body[start..];
-        let end = rest.find("\n}").expect("unterminated addon_compose_overlay_args");
-        rest[..end].to_string()
+        // Shell, not Rust: the function ends at its column-0 closing brace
+        // line (crate::test_src lexes Rust, so it does not apply here).
+        let lines: Vec<&str> = body[start..].lines().take_while(|l| !l.starts_with('\u{7d}')).collect();
+        assert!(body[start..].lines().count() > lines.len(), "unterminated addon_compose_overlay_args");
+        lines.join("\n")
     }
 
     /// Two copies of one decision, pinned to each other.
@@ -1693,5 +1732,55 @@ mod compose_summary_tests {
         let (pulls, _c, pass) = summarise_compose_all(&t);
         assert_eq!(pulls, "");
         assert_eq!(pass.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod failure_tail_tests {
+    use super::{failure_tail, run_summarised, SUMMARY_TAIL_LINES};
+    use std::process::Command;
+
+    fn fake(script: &str) -> Command {
+        let mut c = Command::new("sh");
+        c.args(["-c", script]);
+        c
+    }
+
+    /// pop-os 2026-11-05: the launcher exited 1 and the operator saw only its
+    /// banners. A fake launcher prints a progress line the summary absorbs,
+    /// an unclassified line, and exits 1: both reach the failure output.
+    #[test]
+    fn a_failed_launcher_shows_its_last_lines_even_absorbed_ones() {
+        let (status, tally, tail) = run_summarised(fake(
+            "echo 'Add-on x: ENABLED'; echo 'noo-ollama Pulling'; echo 'Container noo-x  Starting'; \
+             echo 'unclassified oops' >&2; exit 1")).unwrap();
+        assert!(!status.success());
+        assert_eq!(tally.failed(), 0, "nothing the summary would call failed");
+        let out = failure_tail(status.success(), &tail, "noo upgrade --stack --verbose");
+        let all = out.join("\n");
+        for want in ["noo-ollama Pulling", "Container noo-x  Starting", "unclassified oops", "Add-on x: ENABLED"] {
+            assert!(all.contains(want), "{want}: {all}");
+        }
+        assert!(out[0].contains("last 4 lines"), "{all}");
+        assert_eq!(out.last().map(String::as_str), Some("for every line: noo upgrade --stack --verbose"));
+    }
+
+    /// Nothing printed is still said; success prints nothing extra.
+    #[test]
+    fn a_silent_failure_is_said_and_success_adds_nothing() {
+        let (status, _, tail) = run_summarised(fake("exit 3")).unwrap();
+        let out = failure_tail(status.success(), &tail, "re-run with --verbose");
+        assert_eq!(out[0], "the command printed nothing before it failed");
+        let (status, _, tail) = run_summarised(fake("echo fine")).unwrap();
+        assert!(failure_tail(status.success(), &tail, "x").is_empty());
+    }
+
+    /// The ring is bounded: the LAST lines are kept.
+    #[test]
+    fn the_tail_keeps_only_the_last_lines() {
+        let (_, _, tail) = run_summarised(fake("i=1; while [ $i -le 100 ]; do echo line$i; i=$((i+1)); done; exit 1")).unwrap();
+        assert_eq!(tail.len(), SUMMARY_TAIL_LINES);
+        assert_eq!(tail.last().map(String::as_str), Some("line100"));
+        assert_eq!(tail.first().map(String::as_str), Some("line61"));
     }
 }

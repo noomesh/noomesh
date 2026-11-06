@@ -334,3 +334,119 @@ func TestPurposeUserRidesTheLeaseAndIsAClosedSet(t *testing.T) {
 		t.Fatalf("an unset purpose must not reach the wire: %s", b)
 	}
 }
+
+// i344b PR 5: a user hold with `For` expires back to the AUTOMATIC policy.
+func userHoldRig(t *testing.T, dir string) (*Controller, *fakeProbe, *fakeDocker, *clock) {
+	t.Helper()
+	p := &fakeProbe{r: pidReading(8000, 0)}
+	d := &fakeDocker{ctrs: []docker.GPUBackend{{Backend: "vllm", ID: vllmID, Name: "noo-vllm", Running: true}}}
+	clk := &clock{t: time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)}
+	c := New(ConfigFromEnv(env(nil)), p, d, dir)
+	c.now = clk.now
+	return c, p, d, clk
+}
+
+func TestUserHoldExpiresToTheAutomaticPolicyNotAResume(t *testing.T) {
+	c, p, d, clk := userHoldRig(t, "")
+	r, err := c.Hold(context.Background(), HoldRequest{OperationID: "op-u", Purpose: PurposeUser, For: 30 * time.Minute})
+	if err != nil || r.Lease == nil || r.Lease.ExpiresAt != "2026-10-31T12:30:00Z" {
+		t.Fatalf("hold with For: %+v %v", r.Lease, err)
+	}
+	clk.advance(29 * time.Minute)
+	c.Tick(context.Background())
+	if got := c.Report(); got.State != StateHeld {
+		t.Fatalf("before the deadline the hold stays: %+v", got)
+	}
+	// The operator's own work is still on the GPU at the deadline.
+	p.r = pidReading(0, 9000)
+	clk.advance(2 * time.Minute)
+	c.Tick(context.Background())
+	got := c.Report()
+	if got.State == StateHeld || got.Lease != nil {
+		t.Fatalf("at the deadline the lease is released: %+v", got)
+	}
+	if len(d.starts) != 0 {
+		t.Fatalf("expiry must not resume vLLM into a busy GPU: starts %v", d.starts)
+	}
+	if !c.Holds("vllm") {
+		t.Fatalf("vLLM stays paused until the automatic policy sees a free GPU")
+	}
+}
+
+func TestUserHoldWithoutForNeverExpires(t *testing.T) {
+	c, _, _, clk := userHoldRig(t, "")
+	r, err := c.Hold(context.Background(), HoldRequest{OperationID: "op-u", Purpose: PurposeUser})
+	if err != nil || r.Lease.ExpiresAt != "" {
+		t.Fatalf("no For, no expiry: %+v %v", r.Lease, err)
+	}
+	clk.advance(30 * 24 * time.Hour)
+	c.Tick(context.Background())
+	if got := c.Report(); got.State != StateHeld || got.Lease == nil {
+		t.Fatalf("an indefinite hold stays: %+v", got)
+	}
+}
+
+func TestUserHoldExpirySurvivesARestartAndFiresOnStart(t *testing.T) {
+	dir := t.TempDir()
+	c, p, d, clk := userHoldRig(t, dir)
+	if _, err := c.Hold(context.Background(), HoldRequest{OperationID: "op-u", Purpose: PurposeUser, For: time.Hour}); err != nil {
+		t.Fatalf("hold: %v", err)
+	}
+	// Restart before the deadline: the expiry came back with the lease.
+	c2 := New(ConfigFromEnv(env(nil)), p, d, dir)
+	c2.now = clk.now
+	if r := c2.Report(); r.Lease == nil || r.Lease.ExpiresAt != "2026-10-31T13:00:00Z" {
+		t.Fatalf("expiry lost across restart: %+v", r.Lease)
+	}
+	// Restart after the deadline: the first tick releases.
+	clk.advance(3 * time.Hour)
+	c3 := New(ConfigFromEnv(env(nil)), p, d, dir)
+	c3.now = clk.now
+	c3.Tick(context.Background())
+	if r := c3.Report(); r.State == StateHeld || r.Lease != nil {
+		t.Fatalf("an agent that starts after the deadline releases on start: %+v", r)
+	}
+	if len(d.starts) != 0 {
+		t.Fatalf("no resume-now on expiry: %v", d.starts)
+	}
+	if r := New(ConfigFromEnv(env(nil)), p, d, dir).Report(); r.Lease != nil {
+		t.Fatalf("the release is persisted: %+v", r.Lease)
+	}
+}
+
+func TestRepeatingAUserHoldWithForExtendsWithoutANewDrain(t *testing.T) {
+	c, _, _, clk := userHoldRig(t, t.TempDir())
+	dr := &fakeDrainer{}
+	c.SetDrainer(dr)
+	if _, err := c.Hold(context.Background(), HoldRequest{OperationID: "op-u", Purpose: PurposeUser, For: time.Hour}); err != nil {
+		t.Fatalf("hold: %v", err)
+	}
+	clk.advance(30 * time.Minute)
+	gen := c.Report().Lease.Generation
+	r, err := c.Hold(context.Background(), HoldRequest{OperationID: "op-u", Purpose: PurposeUser, For: 2 * time.Hour})
+	if err != nil || r.Lease.ExpiresAt != "2026-10-31T14:30:00Z" || r.Lease.Generation != gen {
+		t.Fatalf("extend: %+v %v", r.Lease, err)
+	}
+	// Repeating with no For is still a plain no-op: the expiry stays.
+	r, _ = c.Hold(context.Background(), HoldRequest{OperationID: "op-u", Purpose: PurposeUser})
+	if r.Lease.ExpiresAt != "2026-10-31T14:30:00Z" {
+		t.Fatalf("a repeat without For keeps the expiry: %+v", r.Lease)
+	}
+}
+
+func TestHoldDurationIsBoundedAndUserOnly(t *testing.T) {
+	c, _, _, _ := userHoldRig(t, "")
+	for _, bad := range []HoldRequest{
+		{OperationID: "a", Purpose: PurposeUser, For: 30 * time.Second},
+		{OperationID: "b", Purpose: PurposeUser, For: 8 * 24 * time.Hour},
+		{OperationID: "c", Purpose: PurposeUser, For: -time.Minute},
+		{OperationID: "d", For: time.Hour},
+	} {
+		if _, err := c.Hold(context.Background(), bad); err == nil {
+			t.Fatalf("refused: %+v", bad)
+		}
+		if r := c.Report(); r.State == StateHeld || r.Lease != nil {
+			t.Fatalf("a refused duration takes no hold: %+v", r)
+		}
+	}
+}

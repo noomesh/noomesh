@@ -6,6 +6,7 @@ import { relTime } from '@/lib/format';
 import { num, sumOrNull } from '@/lib/num';
 import type { ClusterNode } from './types';
 import { readGpuContention } from './gpuContention';
+import { readLanes } from './lanes';
 
 export interface ClusterView {
   nodes: ClusterNode[];
@@ -40,6 +41,7 @@ export function useClusterNodes() {
         backends: n.backends ?? [],
         heartbeat: relTime(n.last_heartbeat),
         gpuContention: readGpuContention(n),
+        lanes: readLanes(n),
       }));
 
       // Fleet VRAM is null if ANY node did not report its VRAM: a partial sum is a wrong number.

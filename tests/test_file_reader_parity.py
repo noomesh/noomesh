@@ -36,6 +36,7 @@ from pathlib import Path
 
 import pytest
 
+from tests import _rust_src as rs
 from tests._compose_projection import env_of, full_projection
 from tests.test_no_secrets_on_compose_command_lines import SECRETY
 
@@ -358,26 +359,6 @@ def test_manifests_have_no_duplicates() -> None:
 # 1252 §3 found eleven for the provider/channel keys. This makes the next one
 # a test failure.
 
-_RUST_TEST_MOD = re.compile(r"#\[cfg\(test\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{")
-
-
-def _strip_rust_test_modules(src: str) -> str:
-    """The source without its `#[cfg(test)] mod … { … }` blocks (brace-matched;
-    tests set and read the process env on purpose)."""
-    out, pos = [], 0
-    for m in _RUST_TEST_MOD.finditer(src):
-        if m.start() < pos:
-            continue
-        out.append(src[pos:m.start()])
-        depth, i = 1, m.end()
-        while i < len(src) and depth:
-            depth += {"{": 1, "}": -1}.get(src[i], 0)
-            i += 1
-        pos = i
-    out.append(src[pos:])
-    return "".join(out)
-
-
 def _strip_line_comments(src: str, marker: str) -> str:
     return "\n".join(line.split(marker, 1)[0] if line.lstrip().startswith(marker) else line for line in src.splitlines())
 
@@ -388,7 +369,7 @@ def rust_bypasses(root: Path = ROOT / "gateway-rust/src", base: Path = ROOT) -> 
     for f in sorted(root.rglob("*.rs")):
         if f.name == "secret_env.rs":
             continue
-        src = _strip_line_comments(_strip_rust_test_modules(f.read_text()), "//")
+        src = rs.own_code(f.read_text())
         # a const naming a manifest entry, read through env::var(CONST)
         consts = {c for c, n in re.findall(r'const\s+([A-Z_][A-Z0-9_]*)\s*:\s*&str\s*=\s*"([A-Z0-9_]+)"', src) if n in names}
         for n in sorted(names):
@@ -672,7 +653,7 @@ def test_every_secret_in_the_harness_env_template_is_read_through_secret_env() -
 
 
 def test_the_harness_reads_its_bus_pair_through_secret_env() -> None:
-    src = _strip_line_comments(_strip_rust_test_modules(HARNESS_RS.read_text()), "//")
+    src = rs.own_code(HARNESS_RS.read_text())
     assert 'secret_env::secret_from("NATS_NODE_PASSWORD", get)' in src
     assert not re.search(r"std::env::var\(\s*[pu]\s*\)", src), "the pair is read from the plain env again"
 

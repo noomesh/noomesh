@@ -3656,9 +3656,8 @@ mod tests {
 
     #[test]
     fn the_cli_floor_runs_before_the_self_update_writes() {
-        let src = include_str!("node_fetch.rs");
-        let at = src.find("fn self_update_and_reexec(").unwrap();
-        let f = &src[at..at + src[at..].find("\n}\n").unwrap()];
+        let src = crate::test_src::own_code(include_str!("node_fetch.rs"));
+        let f = crate::test_src::fn_body(&src, "fn self_update_and_reexec(");
         assert!(f.find("apply_generation_of(&payload)").unwrap() < f.find("root_install(&payload").unwrap());
     }
 
@@ -3668,9 +3667,8 @@ mod tests {
     /// It now runs before any kind or env key is judged, as noo-apply.sh §1b.
     #[test]
     fn the_bundled_cli_is_installed_before_any_kind_or_env_key_is_judged() {
-        let src = include_str!("node_fetch.rs");
-        let at = src.find("fn verify_bundle_with(").unwrap();
-        let f = &src[at..at + src[at..].find("\n}\n").unwrap()];
+        let src = crate::test_src::own_code(include_str!("node_fetch.rs"));
+        let f = crate::test_src::fn_body(&src, "fn verify_bundle_with(");
         let update = f.find("self_update_and_reexec(&text").unwrap();
         assert!(update < f.find("KNOWN_KINDS.contains(&kind)").unwrap(), "self-update after the kind check");
         assert_eq!(f.matches("self_update_and_reexec(").count(), 1, "one trigger, ahead of every check");
@@ -4197,18 +4195,160 @@ mod user_writes_tests {
         d
     }
 
-    /// Run `f` in a forked child and return its exit code: the effective
-    /// uid is process-wide, so a test that lowers must never lower the test
-    /// runner itself.
-    fn in_child(f: impl FnOnce() -> i32) -> i32 {
-        let pid = unsafe { libc::fork() };
-        if pid == 0 {
-            let code = f();
-            unsafe { libc::_exit(code) };
+    /// The case an own-process run of this test binary executes, and its one
+    /// argument (a path the parent set up).
+    const CASE_ENV: &str = "NOO_TEST_OWN_PROCESS_CASE";
+    const ARG_ENV: &str = "NOO_TEST_OWN_PROCESS_ARG";
+    /// The line an own-process case prints, so a binary that ignored the
+    /// case (and ran zero tests, exit 0) is never read as a pass.
+    const RAN: &str = "own-process case ran: ";
+
+    /// How many threads this process has (`/proc/self/status`), when known.
+    fn thread_count() -> Option<usize> {
+        std::fs::read_to_string("/proc/self/status").ok()?
+            .lines().find_map(|l| l.strip_prefix("Threads:"))?.trim().parse().ok()
+    }
+
+    /// Before `main`, so before libtest starts any thread: when this test
+    /// binary was started for a case, run it in this whole, single-threaded
+    /// process and exit with its code. The cases lower the process's uid,
+    /// which is process-wide, so they must never run in the test runner;
+    /// and they used to `fork()` from it, where a child can copy a lock
+    /// another test thread holds (allocator, environment, getpwnam) and
+    /// block forever: batch run 2026-11-04, 35 min. libtest runs a test on a
+    /// thread of its own even with `--test-threads=1`, so a re-exec'd TEST
+    /// is not single-threaded; this constructor is.
+    #[cfg(target_os = "linux")]
+    #[used]
+    #[link_section = ".init_array"]
+    static OWN_PROCESS_CASE: extern "C" fn() = own_process_case;
+
+    #[cfg(target_os = "linux")]
+    extern "C" fn own_process_case() {
+        let Ok(case) = std::env::var(CASE_ENV) else { return };
+        let arg = std::env::var(ARG_ENV).unwrap_or_default();
+        let code = match thread_count() {
+            Some(1) => run_case(&case, Path::new(&arg)),
+            n => {
+                eprintln!("own-process case {case}: {n:?} threads before main");
+                98
+            }
+        };
+        eprintln!("{RAN}{case}");
+        unsafe { libc::_exit(code) }
+    }
+
+    /// The bodies an own-process run executes, by name; each returns 0 or the
+    /// step it failed at.
+    fn run_case(case: &str, arg: &Path) -> i32 {
+        match case {
+            "probe" => match thread_count() { Some(1) => 7, _ => 97 },
+            "dropped_poll" => case_dropped_poll(arg),
+            "lowered_child" => case_lowered_child(),
+            "cadence" => case_cadence(arg),
+            _ => 96,
         }
-        let mut status = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
-        libc::WEXITSTATUS(status)
+    }
+
+    /// Run `case` in a fresh process of this test binary (see
+    /// [`own_process_case`]) and return its exit code. Waits at most 120 s,
+    /// then kills it and fails; requires the case's [`RAN`] line.
+    fn in_own_process(case: &str, arg: &Path) -> i32 {
+        let out = std::env::temp_dir().join(format!("noo-own-process-{case}-{}.log", std::process::id()));
+        let log = std::fs::File::create(&out).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            // Should the constructor not run the case, libtest runs nothing.
+            .args(["--exact", "no-such-test-own-process-case"])
+            .env(CASE_ENV, case)
+            .env(ARG_ENV, arg)
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .expect("start the test binary for the case");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break st;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let text = std::fs::read_to_string(&out).unwrap_or_default();
+                let _ = std::fs::remove_file(&out);
+                panic!("own-process case {case} did not finish in 120 s and was killed:\n{text}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let text = std::fs::read_to_string(&out).unwrap_or_default();
+        let _ = std::fs::remove_file(&out);
+        assert!(text.contains(&format!("{RAN}{case}")), "own-process case {case} never ran ({status}):\n{text}");
+        status.code().unwrap_or_else(|| panic!("own-process case {case} was killed ({status}):\n{text}"))
+    }
+
+    /// The before-main case hook is test-only: the shipped `noo` never runs
+    /// a case (privileged code) because an environment variable is set. Every
+    /// link section, and every use of the case variable, sits inside this
+    /// `#[cfg(test)]` module.
+    #[test]
+    fn the_case_constructor_exists_only_in_this_test_module() {
+        let src = include_str!("node_fetch.rs");
+        let module = crate::test_src::fn_body(src, "#[cfg(test)]\nmod user_writes_tests \u{7b}");
+        let start = src.find(module).expect("the module slice is part of the file");
+        let end = start + module.len();
+        for needle in [concat!("#[link_", "section"), concat!("NOO_TEST_OWN_", "PROCESS_CASE")] {
+            let hits: Vec<usize> = src.match_indices(needle).map(|(i, _)| i).collect();
+            assert!(!hits.is_empty(), "{needle} not found: the guard reads the wrong file");
+            assert!(hits.iter().all(|&i| start < i && i < end), "{needle} appears outside the #[cfg(test)] module");
+        }
+    }
+
+    /// A case runs before main, alone on one thread, and its exit code comes
+    /// back (the mutant without the constructor runs nothing and fails here).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_own_process_case_runs_single_threaded_before_main() {
+        assert_eq!(in_own_process("probe", Path::new("")), 7, "97 = more than one thread; 98 = threads before main");
+    }
+
+    /// Lowered, root's file cannot be written; a root scope can; lowered again after.
+    fn case_dropped_poll(victim: &Path) -> i32 {
+        if privs::drop_to("nobody").is_err() { return 10; }
+        if std::fs::write(victim, "user's").is_ok() { return 11; }
+        {
+            let _r = privs::root();
+            if std::fs::write(victim, "root again").is_err() { return 12; }
+        }
+        if std::fs::write(victim, "user's").is_ok() { return 13; }
+        0
+    }
+
+    /// A plain spawn while lowered keeps real uid 0; `lowered_output` does not.
+    fn case_lowered_child() -> i32 {
+        if privs::drop_to("nobody").is_err() { return 10; }
+        // The control: a plain spawn while lowered keeps real uid 0 —
+        // the hole. If this does not show it, the probe proves nothing.
+        let Ok(plain) = Command::new("/bin/cat").arg("/proc/self/status").output() else { return 11 };
+        let (uids, _) = child_creds(&plain);
+        if uids.len() != 3 || uids[0] != 0 { return 12; }
+        let Ok(out) = lowered_output(Command::new("/bin/cat").arg("/proc/self/status")) else { return 13 };
+        let (uids, cap) = child_creds(&out);
+        if uids.len() != 3 || uids.contains(&0) { return 14; }
+        if cap.is_empty() || cap.chars().any(|c| c != '0') { return 15; }
+        // And try it: perl's `$< = 0` is setreuid(0, …).
+        if Path::new("/usr/bin/perl").is_file() {
+            let Ok(o) = lowered_output(Command::new("/usr/bin/perl").args(["-e", "$< = 0; $> = 0; exit(($< == 0 || $> == 0) ? 42 : 0)"])) else { return 16 };
+            if o.status.code() != Some(0) { return 17; }
+        }
+        0
+    }
+
+    /// The lowered poll replaces a root-owned cadence file.
+    fn case_cadence(p: &Path) -> i32 {
+        if privs::drop_to("nobody").is_err() { return 10; }
+        if std::fs::write(p, "x").is_ok() { return 11; }
+        set_cadence(p, "0\n");
+        if std::fs::read_to_string(p).ok().as_deref() != Some("0\n") { return 12; }
+        0
     }
 
     #[test]
@@ -4220,16 +4360,7 @@ mod user_writes_tests {
         let victim = d.join("victim");
         std::fs::write(&victim, "root's").unwrap();
         std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let code = in_child(|| {
-            if privs::drop_to("nobody").is_err() { return 10; }
-            if std::fs::write(&victim, "user's").is_ok() { return 11; }
-            {
-                let _r = privs::root();
-                if std::fs::write(&victim, "root again").is_err() { return 12; }
-            }
-            if std::fs::write(&victim, "user's").is_ok() { return 13; }
-            0
-        });
+        let code = in_own_process("dropped_poll", &victim);
         let _ = std::fs::remove_dir_all(&d);
         assert_eq!(code, 0, "child failed step {code} (11: wrote a root file while lowered; 13: did not lower again after the root scope)");
     }
@@ -4254,24 +4385,7 @@ mod user_writes_tests {
         if !require_root("root_only_a_lowered_child_cannot_setuid_0") {
             return;
         }
-        let code = in_child(|| {
-            if privs::drop_to("nobody").is_err() { return 10; }
-            // The control: a plain spawn while lowered keeps real uid 0 —
-            // the hole. If this does not show it, the probe proves nothing.
-            let Ok(plain) = Command::new("/bin/cat").arg("/proc/self/status").output() else { return 11 };
-            let (uids, _) = child_creds(&plain);
-            if uids.len() != 3 || uids[0] != 0 { return 12; }
-            let Ok(out) = lowered_output(Command::new("/bin/cat").arg("/proc/self/status")) else { return 13 };
-            let (uids, cap) = child_creds(&out);
-            if uids.len() != 3 || uids.contains(&0) { return 14; }
-            if cap.is_empty() || cap.chars().any(|c| c != '0') { return 15; }
-            // And try it: perl's `$< = 0` is setreuid(0, …).
-            if Path::new("/usr/bin/perl").is_file() {
-                let Ok(o) = lowered_output(Command::new("/usr/bin/perl").args(["-e", "$< = 0; $> = 0; exit(($< == 0 || $> == 0) ? 42 : 0)"])) else { return 16 };
-                if o.status.code() != Some(0) { return 17; }
-            }
-            0
-        });
+        let code = in_own_process("lowered_child", Path::new(""));
         assert_eq!(code, 0, "child failed step {code} (12: the control did not show real uid 0; 14/15: the lowered child kept a root uid or a capability; 17: it regained root)");
     }
 
@@ -4474,24 +4588,21 @@ mod user_writes_tests {
         include_str!("node_fetch.rs")
     }
 
-    fn body(name: &str) -> &'static str {
-        let s = src();
-        let at = s.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("fn {name} is gone"));
-        let rest = &s[at..];
-        &rest[..rest.find("\n}\n").unwrap()]
+    /// This file as guards read it (followup 215, `crate::test_src`):
+    /// comments blanked, every `#[cfg(test)]` item removed whole.
+    fn production_code() -> &'static str {
+        static CODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        CODE.get_or_init(|| crate::test_src::own_code(src()))
     }
 
-    /// The source without its `#[cfg(test)]` modules.
+    /// `fn <name>(` through its own closing brace; panics when it is gone.
+    fn body(name: &str) -> &'static str {
+        crate::test_src::fn_body(production_code(), &format!("fn {name}("))
+    }
+
+    /// The source without its `#[cfg(test)]` items, comments blanked.
     fn production() -> String {
-        let mut out = String::new();
-        let mut rest = src();
-        while let Some(at) = rest.find("#[cfg(test)]\nmod ") {
-            out.push_str(&rest[..at]);
-            let tail = &rest[at..];
-            rest = &tail[tail.find("\n}\n").map_or(tail.len(), |e| e + 3)..];
-        }
-        out.push_str(rest);
-        out
+        production_code().to_string()
     }
 
     /// H2 third review, L6: every child of the applier is spawned by `run`
@@ -4698,13 +4809,7 @@ mod user_writes_tests {
         let p = d.join("fetch-state");
         std::fs::write(&p, "7\n").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let code = in_child(|| {
-            if privs::drop_to("nobody").is_err() { return 10; }
-            if std::fs::write(&p, "x").is_ok() { return 11; }
-            set_cadence(&p, "0\n");
-            if std::fs::read_to_string(&p).ok().as_deref() != Some("0\n") { return 12; }
-            0
-        });
+        let code = in_own_process("cadence", &p);
         let owner = std::fs::metadata(&p).map(|m| m.uid()).unwrap_or(0);
         let _ = std::fs::remove_dir_all(&d);
         assert_eq!(code, 0, "child failed step {code} (11: the lowered poll could write root's file in place; 12: it was not replaced)");

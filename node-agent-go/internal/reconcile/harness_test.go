@@ -655,3 +655,28 @@ func TestHarnessPlacementViewHidesSecretsAndReportsUnplaced(t *testing.T) {
 		t.Fatalf("no kind in env must read as noo, got %q", kind)
 	}
 }
+
+// A state probe that cannot answer is not "stopped": the reconciler takes no
+// lifecycle action on Unknown (no start, restart or stop) and records no
+// refusal, for either desired state.
+func TestHarnessUnknownStateTakesNoAction(t *testing.T) {
+	for _, desired := range []string{"running", "stopped"} {
+		refusals.Reset()
+		t.Cleanup(refusals.Reset)
+		f := &hostsvc.Fake{Cur: hostsvc.Unknown}
+		r := &Reconciler{harness: f, harnessStartedKind: "noo"}
+		r.convergeHarness(context.Background(), placement{Backend: "harness", DesiredState: desired}, nil)
+		if len(f.Calls) != 0 {
+			t.Fatalf("desired=%s: unknown state must cause no lifecycle call, got %v", desired, f.Calls)
+		}
+		if got := harnessRefusal(); got != "" {
+			t.Fatalf("desired=%s: unknown state must not record a refusal, got %q", desired, got)
+		}
+		if r.harnessStartedKind != "noo" {
+			t.Fatalf("desired=%s: started kind must be left alone, got %q", desired, r.harnessStartedKind)
+		}
+	}
+	if r := (&Reconciler{harness: &hostsvc.Fake{Cur: hostsvc.Unknown}}); r.stopHarness(context.Background(), hostsvc.Unknown) {
+		t.Fatal("stopHarness must not report an unknown-state service as stopped")
+	}
+}

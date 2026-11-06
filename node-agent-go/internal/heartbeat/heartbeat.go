@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelstats"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,7 +30,9 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
 	"github.com/noomesh/noomesh/node-agent-go/internal/dataroots"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
+	"github.com/noomesh/noomesh/node-agent-go/internal/lanes"
 	"github.com/noomesh/noomesh/node-agent-go/internal/metrics"
+	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
 )
 
 // Reporter sends registration and heartbeat messages to the gateway controller.
@@ -36,8 +40,8 @@ type Reporter struct {
 	cfg         *config.Config
 	client      *http.Client
 	collector   *metrics.Collector
-	gpu         *hardware.GPUDetector
-	getBackends func() map[string]string
+	gpu         hardware.GPUProbe
+	getBackends func() (map[string]string, error)
 	// dataMounts: managed backend containers' host mount sources (1253).
 	dataMounts func() (map[string][]string, error)
 	// getRuntimes reports WHICH runtime serves each running backend —
@@ -50,6 +54,7 @@ type Reporter struct {
 	// (backend -> model), as distinct from the model it is placed to serve.
 	// nil until installed; the key is then omitted.
 	getLoaded  func() map[string]string
+	getHeld    func() []string
 	activeJobs func() int
 	// ollamaDoor resolves the dockerised ollama's door for the model
 	// inventory (docker.BackendDialURL("ollama")); nil until installed.
@@ -143,6 +148,10 @@ type Reporter struct {
 	// loop's goroutine (SendHeartbeat is not called concurrently).
 	failStreak  int
 	silentSince time.Time
+
+	// gpuProbeErr is the last GPU-probe error that was logged, so a probe
+	// that keeps failing the same way warns once per change, not every beat.
+	gpuProbeErr string
 }
 
 // NewReporter creates a heartbeat reporter.
@@ -150,8 +159,8 @@ func NewReporter(
 	cfg *config.Config,
 	client *http.Client,
 	collector *metrics.Collector,
-	gpu *hardware.GPUDetector,
-	getBackends func() map[string]string,
+	gpu hardware.GPUProbe,
+	getBackends func() (map[string]string, error),
 	activeJobs func() int,
 ) *Reporter {
 	return &Reporter{
@@ -178,6 +187,45 @@ func (r *Reporter) backendContainersReport() map[string]any {
 		return nil
 	}
 	return r.backendContainers()
+}
+
+// SetHeldModels installs the adopted ollama's held set (backendrt.Native.
+// HeldModels), one input to a lane's on_demand state. Optional.
+func (r *Reporter) SetHeldModels(f func() []string) { r.getHeld = f }
+
+// lanesReport builds the payload's `lanes` from the sections already in p
+// (running_backends, backend_runtimes, backend_containers, model_stats), the
+// model presence registry and the reconciler's placements. Never nil.
+func (r *Reporter) lanesReport(p map[string]any) []lanes.Lane {
+	in := lanes.Inputs{
+		Placed:   lanes.PlacedNow(),
+		Presence: modelpresence.Report(),
+	}
+	in.Running, _ = p["running_backends"].(map[string]string)
+	in.Runtimes, _ = p["backend_runtimes"].(map[string]string)
+	in.Containers, _ = p["backend_containers"].(map[string]any)
+	if ms, ok := p["model_stats"].([]ModelStat); ok && len(ms) > 0 {
+		in.Ollama = lanes.Ollama{Known: true, OnDisk: map[string]bool{}, Loaded: map[string]bool{}}
+		for _, m := range ms {
+			in.Ollama.OnDisk[m.Name] = true
+			// A model whose loaded state is unknown (/api/ps failed) is not
+			// marked Loaded, so it falls to on_demand/"not loaded" via the
+			// on-disk set: routable, and the first call pays a load at
+			// worst. It is never `serving` on a guess, and never `missing`.
+			if m.Loaded && !m.LoadedUnknown {
+				in.Ollama.Loaded[m.Name] = true
+			}
+		}
+	}
+	if r.getHeld != nil {
+		in.Ollama.Held = map[string]bool{}
+		for _, m := range r.getHeld() {
+			in.Ollama.Held[m] = true
+		}
+	}
+	out, unnamed := lanes.Build(in)
+	lanes.NoteUnnamed(unnamed)
+	return out
 }
 
 // SetLoadedModels installs the loaded-model reporter, echoed on every
@@ -227,23 +275,26 @@ func (r *Reporter) ollamaModelStats() []ModelStat {
 	if strings.HasPrefix(base, "https://") && r.client != nil {
 		client.Transport = r.client.Transport
 	}
-	get := func(path string) []byte {
+	get := func(path string) ([]byte, bool) {
 		resp, err := client.Get(base + path)
 		if err != nil {
-			return nil
+			return nil, false
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			return nil
+			return nil, false
 		}
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return b
+		b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return b, err == nil
 	}
-	tags := get("/api/tags")
-	if tags == nil {
+	tags, tagsOK := get("/api/tags")
+	if !tagsOK {
 		return nil
 	}
-	stats := modelstats.Parse(tags, get("/api/ps"))
+	// /api/ps failing leaves tags answered: every model is listed (it is on
+	// disk) with "loaded" unknown, never reported as not loaded (i495).
+	ps, psOK := get("/api/ps")
+	stats := modelstats.ParseChecked(tags, ps, psOK)
 	r.ceilings.Fill(stats, func(name string) ([]byte, error) {
 		body, _ := json.Marshal(map[string]string{"model": name})
 		resp, err := client.Post(base+"/api/show", "application/json", bytes.NewReader(body))
@@ -421,18 +472,12 @@ func (r *Reporter) SendHeartbeat() {
 	m := r.collector.Collect()
 	clk.mark("metrics")
 
-	gpuModel := r.cfg.GPUModel
-	if gpuModel == "" {
-		gpuModel = r.gpu.DetectModel()
-	}
-	vramGB := r.cfg.VRAMGB
-	if vramGB == 0 {
-		vramGB = r.gpu.DetectVRAM()
-	}
+	gpuModel, vramGB, gpuErr := r.gpuIdentity()
+	r.redetectCaps(gpuErr)
 	clk.mark("gpu_identity")
 	power := hardware.ReadPowerStatus()
 	clk.mark("power")
-	backends := r.getBackends()
+	backends, backendsErr := r.getBackends()
 	clk.mark("backends")
 	jobs := r.activeJobs()
 	clk.mark("jobs")
@@ -445,19 +490,14 @@ func (r *Reporter) SendHeartbeat() {
 	clk.mark("sensors")
 
 	payload := map[string]any{
-		"load":             m.Load,
-		"running_backends": backends,
-		"self_node":        r.cfg.SelfNode,
-		"active_jobs":      jobs,
-		"cpu_load":         m.CPULoad,
-		"mem_used_gb":      m.MemUsedGB,
-		"vram_used_gb":     m.VRAMUsedGB,
-		"gpu_model":        gpuModel,
-		"cpu_cores":        hardware.CPUCores(),
-		"ram_gb":           hardware.TotalMemoryGB(),
-		"vram_gb":          vramGB,
-		"tier":             r.cfg.Tier,
-		"ip_address":       hostIP,
+		"self_node":    r.cfg.SelfNode,
+		"active_jobs":  jobs,
+		"mem_used_gb":  m.MemUsedGB,
+		"vram_used_gb": m.VRAMUsedGB,
+		"cpu_cores":    hardware.CPUCores(),
+		"ram_gb":       hardware.TotalMemoryGB(),
+		"tier":         r.cfg.Tier,
+		"ip_address":   hostIP,
 		// Interface this node published its control API on. Empty
 		// or 0.0.0.0 = all interfaces; a tailnet IP = confined to the overlay.
 		// Broadcast so the controller/dashboard can verify each node's binding.
@@ -473,6 +513,25 @@ func (r *Reporter) SendHeartbeat() {
 		"agent_url":      selfURL,
 		"active_sensors": sensors,
 	}
+	// running_backends: omitted when docker could not be asked. The gateway
+	// stores an omitted key as {}, so routing fails closed for this beat,
+	// which is wanted; sending {} would say "nothing runs" as a fact.
+	if backendsErr != nil {
+		slog.Warn("heartbeat omits running_backends: docker could not be asked", "error", backendsErr)
+	} else {
+		payload["running_backends"] = backends
+	}
+	// gpu_model / vram_gb: omitted when the GPU probe failed, so the gateway
+	// keeps the last value instead of recording a GPU node as CPU-only.
+	if gpuErr == nil {
+		payload["gpu_model"] = gpuModel
+		payload["vram_gb"] = vramGB
+	}
+	addLoad(payload, m)
+	if m.MemUsedGB == nil {
+		// Memory unmeasured: omit the key rather than send null or a number.
+		delete(payload, "mem_used_gb")
+	}
 	r.companionTelemetry(payload, power)
 	setDialableAddress(payload, hostIP, selfURL)
 
@@ -483,7 +542,7 @@ func (r *Reporter) SendHeartbeat() {
 		}
 	}
 
-	body, err := json.Marshal(payload)
+	body, err := marshalPayload(payload)
 	if err != nil {
 		r.noteOutcome(clk, fmt.Errorf("heartbeat marshal failed: %w", err))
 		return
@@ -514,7 +573,10 @@ func (r *Reporter) SendHeartbeat() {
 
 	if resp.StatusCode == 404 {
 		slog.Warn("heartbeat 404, re-registering")
-		caps := hardware.Detect(r.cfg, r.gpu)
+		caps, capsErr := hardware.Detect(r.cfg, r.gpu, r.caps)
+		if capsErr != nil {
+			slog.Warn("gpu probe failed while re-registering; keeping the previous GPU capability", "error", capsErr)
+		}
 		hostIP := DetectHostIP(r.cfg)
 		r.Register(caps, hostIP)
 		r.noteOutcome(clk, nil)
@@ -843,4 +905,69 @@ func (r *Reporter) controlTransports() map[string]bool {
 	rpc := r.natsRPC != nil && r.natsRPC()
 	tun := r.tunnel != nil && r.tunnel()
 	return map[string]bool{"https_listener": true, "nats_rpc": rpc, "tunnel": tun}
+}
+
+// gpuIdentity is the beat's gpu_model and vram_gb: the configured value, else
+// the probe's. A failed probe returns an error and the caller omits both keys
+// (the gateway keeps the stored value of an omitted key), instead of
+// reporting "" and 0 for a GPU node. Warns once per change of the error.
+func (r *Reporter) gpuIdentity() (model string, vramGB float64, err error) {
+	model = r.cfg.GPUModel
+	if model == "" {
+		m, merr := r.gpu.DetectModel()
+		model, err = m, merr
+	}
+	vramGB = r.cfg.VRAMGB
+	if vramGB == 0 {
+		v, verr := r.gpu.DetectVRAM()
+		vramGB, err = v, errors.Join(err, verr)
+	}
+	if err != nil {
+		if msg := err.Error(); msg != r.gpuProbeErr {
+			r.gpuProbeErr = msg
+			slog.Warn("gpu probe failed; heartbeat omits gpu_model and vram_gb so the controller keeps the last value",
+				"error", err)
+		}
+		return "", 0, err
+	}
+	if r.gpuProbeErr != "" {
+		r.gpuProbeErr = ""
+		slog.Info("gpu probe recovered")
+	}
+	return model, vramGB, nil
+}
+
+// redetectCaps re-runs hardware.Detect on a beat while the registered
+// capabilities came from a failed probe, once the probe answers again. When
+// the capabilities changed it re-registers with them: Register is the same
+// call the 404 path makes, and it refreshes the echo every beat carries.
+func (r *Reporter) redetectCaps(probeErr error) {
+	if r.caps == nil || !r.caps.ProbeIncomplete || probeErr != nil {
+		return
+	}
+	caps, err := hardware.Detect(r.cfg, r.gpu, r.caps)
+	if err != nil {
+		return
+	}
+	old := *r.caps
+	old.ProbeIncomplete = false
+	if reflect.DeepEqual(old, caps) {
+		r.caps = &caps
+		return
+	}
+	slog.Info("gpu probe recovered; re-registering with the detected capabilities",
+		"gpu_model", caps.GPUModel, "vram_gb", caps.VRAMGB, "backends", caps.Backends)
+	r.Register(caps, DetectHostIP(r.cfg))
+}
+
+// addLoad puts the load figures in a heartbeat body. An unknown load is
+// OMITTED, never 0: the gateway ranks an absent load after every reported
+// one, whereas a false 0 wins routing tiebreaks.
+func addLoad(payload map[string]any, m metrics.SystemMetrics) {
+	if m.Load != nil {
+		payload["load"] = *m.Load
+	}
+	if m.CPULoad != nil {
+		payload["cpu_load"] = *m.CPULoad
+	}
 }

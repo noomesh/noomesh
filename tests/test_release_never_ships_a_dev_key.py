@@ -50,10 +50,25 @@ def test_the_stack_lock_is_digest_rows_and_headers_only() -> None:
     assembled = [l.strip() for l in step.splitlines() if '> "stack-$TAG.lock"' in l]
     assert len(assembled) == 1, f"expected one line that writes the lock, found {assembled}"
     line = assembled[0]
-    assert line == '{ echo "# stack $TAG"; echo "# mesh-migration-head $head"; cat digests/* | sort; } > "stack-$TAG.lock"', (
-        "the stack lock must be built from the tag line, the migration head and image digest rows only; "
+    assert line == '{ echo "# stack $TAG"; echo "# mesh-migration-head $head"; cat storage-dirs.txt; cat digests/* | sort; } > "stack-$TAG.lock"', (
+        "the stack lock must be built from the tag line, the migration head, the checked-in storage lines "
+        "and image digest rows only; "
         f"anything else could carry a key into a signed release: {line}"
     )
+
+
+def test_the_storage_lines_are_the_checked_in_file_validated_before_signing() -> None:
+    """i467: storage-dirs.txt is a copy of a file in the tree, made in a step
+    that holds no seed, and refused unless it is exactly the two header lines
+    of directory names, so nothing else can ride into the signed lock."""
+    job = _job("lock")
+    copy = job.index("cp noo-cli/src/onboard/storage-dirs.lock-lines storage-dirs.txt")
+    assert copy < job.index("- name: Assemble + sign stack-$TAG.lock"), "copied before the signing step"
+    assert "NOO_RELEASE_SIGNING_SEED" not in job[job.rindex("- name:", 0, copy):copy], "the copying step holds no seed"
+    for check in ['[ "$(wc -l < storage-dirs.txt)" = 2 ]',
+                  "grep -qE '^# storage-subdirs [a-z0-9_/-]+(,[a-z0-9_/-]+)*$' storage-dirs.txt",
+                  "grep -qE '^# state-subdirs [a-z0-9_/-]+(,[a-z0-9_/-]+)*$' storage-dirs.txt"]:
+        assert copy < job.index(check) < job.index("- name: Assemble + sign stack-$TAG.lock"), check
 
 
 def test_the_lock_job_reads_no_addon_trust_or_key() -> None:

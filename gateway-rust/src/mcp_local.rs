@@ -288,7 +288,11 @@ async fn authenticate_over_tls(
             )
         })?;
 
-    let Some(consumer) = crate::service_keys::resolve(db, presented).await else {
+    // An unreadable key store is a 503 naming it, not "invalid bearer" (i437).
+    let found = crate::service_keys::resolve(db, presented)
+        .await
+        .map_err(|u| rpc_http_error(StatusCode::SERVICE_UNAVAILABLE, &u.message()))?;
+    let Some(consumer) = found else {
         return Err(rpc_http_error(
             StatusCode::UNAUTHORIZED,
             &format!(
@@ -555,8 +559,8 @@ mod tests {
     }
 
     /// A pool that is never reachable: `service_keys::resolve` fails its
-    /// query and answers None, so a bearer reaches the refusal exactly as
-    /// an unknown key would — with no database in the test.
+    /// query and, with no recent key snapshot, answers "store unavailable"
+    /// (a 503, i437) — with no database in the test.
     fn unreachable_pool() -> sqlx::PgPool {
         sqlx::postgres::PgPoolOptions::new()
             .acquire_timeout(std::time::Duration::from_millis(300))
@@ -580,9 +584,12 @@ mod tests {
     /// install that has not tidied its store yet), the client presents it
     /// byte for byte, and the door refuses it — naming the key it takes
     /// instead. If the token compare comes back, this returns Ok before the
-    /// key lookup and the test fails.
+    /// key lookup and the test fails. With no database the lookup cannot
+    /// judge the key, so the refusal is the 503 naming the key store (i437),
+    /// never an admission.
     #[tokio::test]
     async fn the_shared_token_is_refused_even_while_configured() {
+        crate::service_keys::invalidate_cache();
         // SAFETY: test-local env mutation; only this test touches these names.
         std::env::set_var("NOO_MCP_TOKEN", "sekrit-shared");
         std::env::set_var("NOO_MCP_TOKEN_PREVIOUS", "sekrit-old");
@@ -592,9 +599,9 @@ mod tests {
                 .await
                 .expect_err("the retired shared token must not open the operator door");
             let (status, text) = refusal_text(err).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "{text}");
-            assert!(text.contains("service-key issue"), "the refusal must name the mint command: {text}");
-            assert!(text.contains(OPERATOR_SCOPE), "{text}");
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+            assert!(text.contains("service-key store could not be read"), "{text}");
+            assert!(text.contains("not an unknown or revoked key"), "{text}");
         }
         std::env::remove_var("NOO_MCP_TOKEN");
         std::env::remove_var("NOO_MCP_TOKEN_PREVIOUS");
@@ -654,8 +661,7 @@ mod tests {
         let strip = |src: &str| -> String {
             src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
         };
-        let this = strip(include_str!("mcp_local.rs"));
-        let body = &this[..this.find("#[cfg(test)]").expect("tests follow the code")];
+        let body = &crate::test_src::own_code(include_str!("mcp_local.rs"));
         let sig = &body[body.find("async fn dispatch(").expect("dispatch")..];
         let sig = &sig[..sig.find(") -> Response").expect("dispatch signature")];
         assert!(sig.contains("caller: OperatorCaller"), "dispatch must take its caller by value:\n{sig}");

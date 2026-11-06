@@ -84,7 +84,11 @@ mod shell_completion;
 #[cfg(test)]
 mod test_exec;
 #[cfg(test)]
+mod test_src;
+#[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod test_tls;
 mod tailnet_serve;
 mod ui;
 mod usage;
@@ -515,6 +519,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["security", "admin-password", "reset"], commands::security_admin_password_reset),
     // Auth scopes, not the KB roles that `grant-role` handles — admin-only.
     (&["security", "user", "set-scopes"], commands::security_user_set_scopes),
+    (&["security", "user", "super-admin"], commands::security_user_super_admin),
     (&["security", "user", "allowance"], commands::security_user_allowance),
     (&["security", "user", "set-org"], commands::security_user_set_org),
     (&["security", "user", "disable"], commands::security_user_disable),
@@ -701,6 +706,10 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["addons", "show"], commands::addons_show),
     (&["addons", "enable"], commands::addons_enable),
     (&["addons", "check"], commands::addons_check),
+    (&["addons", "features"], commands::addons_features),
+    (&["addons", "set-access"], commands::addons_set_access),
+    (&["addons", "accept-suggestions"], commands::addons_accept_suggestions),
+    (&["addons", "access"], commands::addons_access),
     (&["addons", "disable"], commands::addons_disable),
     (&["addons", "upgrade"], commands::addons_upgrade),
     (&["addons", "verify"], commands::addons_verify),

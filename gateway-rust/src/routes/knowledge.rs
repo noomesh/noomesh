@@ -1673,6 +1673,11 @@ async fn graph_prune_staged(
         .memory()
         .graph_prune_staged(limit, params.reason.as_deref(), params.include_restored)
         .await;
+    // The review list before a restore: an unreadable one is a 503 that
+    // names the read, never an empty list (i460).
+    if let Some(e) = body.get("error").and_then(Value::as_str) {
+        return Err(AppError::Unavailable(e.to_string()));
+    }
     Ok(Json(body))
 }
 
@@ -2338,13 +2343,13 @@ mod docs_audience_tests {
     #[test]
     fn hold_unhold_and_purge_audit_applied_calls_only() {
         let src = include_str!("knowledge.rs");
+        let own = crate::test_src::own_code(src);
         for (route, event) in [
             ("async fn docs_hold(", "kb_hold"),
             ("async fn docs_unhold(", "kb_unhold"),
             ("async fn docs_purge(", "kb_purge"),
         ] {
-            let start = src.find(route).unwrap();
-            let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+            let body = crate::test_src::fn_body(&own, route);
             assert!(body.contains("let applying = body.get(\"apply\")"), "{route}");
             assert!(body.contains(".unwrap_or(false)"), "{route}: apply must default to false");
             assert!(body.contains("if applying {") && body.contains(event), "{route}");
@@ -2399,9 +2404,9 @@ mod docs_audience_tests {
     #[test]
     fn hold_routes_refuse_while_the_column_is_absent() {
         let src = include_str!("knowledge.rs");
+        let own = crate::test_src::own_code(src);
         for route in ["async fn docs_hold(", "async fn docs_unhold(", "async fn docs_purge(", "async fn docs_held("] {
-            let start = src.find(route).unwrap();
-            let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+            let body = crate::test_src::fn_body(&own, route);
             assert!(body.contains("hold_column_gate(&state)"), "{route}");
         }
     }
@@ -2452,8 +2457,8 @@ mod audience_guard {
     const SRC: &str = include_str!("knowledge.rs");
 
     /// Body of `async fn <name>(` up to the next top-level item.
-    fn body(name: &str) -> &'static str {
-        let code = &SRC[..SRC.find("#[cfg(test)]").unwrap()];
+    fn body(name: &str) -> String {
+        let code = &crate::test_src::own_code(SRC);
         let start = code
             .find(&format!("async fn {name}("))
             .unwrap_or_else(|| panic!("handler {name} not found"));
@@ -2464,7 +2469,7 @@ mod audience_guard {
             .or_else(|| rest[1..].find("\nfn "))
             .map(|i| i + 1)
             .unwrap_or(rest.len());
-        &rest[..end]
+        rest[..end].to_string()
     }
 
     #[test]
@@ -2505,7 +2510,7 @@ mod audience_guard {
             1,
             "kiosk graph is the one deliberate unrestricted read"
         );
-        let code = &SRC[..SRC.find("#[cfg(test)]").unwrap()];
+        let code = &crate::test_src::own_code(SRC);
         assert!(!code.contains("&Audience::Unrestricted"), "route code must not pass a hardcoded unrestricted audience");
     }
 }
@@ -2595,7 +2600,7 @@ mod graph_audience_tests {
         // and the route a client reaches it by is the one that carries the guard
         assert!(op_needs_audience("recall_walks"));
         let src = include_str!("walks.rs");
-        let code = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let code = &crate::test_src::own_code(src);
         assert_eq!(code.matches("knowledge::intel_graph(").count(), 2, "recall and show both go through the guarded helper");
         assert!(!code.contains("graph_intel("), "walks.rs must not call the worker around the audience guard");
     }
@@ -2623,9 +2628,8 @@ mod graph_audience_tests {
         }
         // ...and the helper is what intel_graph consults, with no 403 left in it.
         let src = include_str!("knowledge.rs");
-        let code = &src[..src.find("#[cfg(test)]").unwrap()];
-        let helper = &code[code.find("async fn intel_graph(").unwrap()..];
-        let helper = &helper[..helper.find("\n/// POST /api/v1/graph/navigate").unwrap()];
+        let code = &crate::test_src::own_code(src);
+        let helper = crate::test_src::fn_body(code, "async fn intel_graph(");
         assert!(helper.contains("op_needs_audience(op)"));
         assert!(!helper.contains("FORBIDDEN"), "the blanket 403 for restricted callers is gone");
     }

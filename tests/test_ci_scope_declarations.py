@@ -48,7 +48,9 @@ CI = ROOT / ".github/workflows/ci.yml"
 # job compiles it and nothing else does. It joined after stack-v0.2.38 shipped
 # no release because the first compile of the pinned llama.cpp ref happened on
 # the release tag.
-PER_CRATE = {"gateway", "cli", "sqlx", "ui", "llamacpp"}
+# `ollama` joined in the same shape (i415): 0.6.16-rc.1's release failed in
+# its runtime stage, which nothing built on a PR.
+PER_CRATE = {"gateway", "cli", "sqlx", "ui", "llamacpp", "ollama"}
 
 # job -> the one output it may be gated on.
 OWNS = {
@@ -58,6 +60,7 @@ OWNS = {
     "router-harness": "gateway",
     "ui": "ui",
     "llamacpp-image": "llamacpp",
+    "ollama-image": "ollama",
 }
 
 
@@ -208,8 +211,11 @@ def _classify(changed: list[str], **env: str) -> dict[str, str]:
     assert lc in run, "the llamacpp diff line moved; update this harness"
     run = run.replace(lc, 'lc_changed="$FIXTURE"')
     with tempfile.NamedTemporaryFile("w+", suffix=".out") as out:
+        # Actions runs a `run:` step as `bash -e -o pipefail`; so does this
+        # (a `printf | grep -q` that SIGPIPEs is false only under pipefail).
         subprocess.run(
-            ["bash", "-c", "set -eu\n" + run],
+            ["bash", "-c", "set -euo pipefail\n" + run],
+            cwd=ROOT,
             env={
                 "PATH": "/usr/bin:/bin",
                 "BASE": "fixture",
@@ -231,12 +237,13 @@ def test_the_classifier_narrows_and_fails_open() -> None:
     docs = _classify(["docs/a.md", "internal/b.md"])
     assert docs == {"code": "false", "gateway": "false", "cli": "false",
                     "sqlx": "false", "ui": "false", "llamacpp": "false",
-                    "deferred": "false"}
+                    "ollama": "false", "deferred": "false"}
 
     cli = _classify(["noo-cli/src/main.rs"])
     assert cli["cli"] == "true" and cli["gateway"] == "false" and cli["sqlx"] == "false"
     assert cli["ui"] == "false", "a CLI change must not run the console job"
     assert cli["llamacpp"] == "false", "a CLI change must not compile llama-server"
+    assert cli["ollama"] == "false", "a CLI change must not build the ollama image"
 
     # The llamacpp Dockerfile switches its own build on AND, being routed to
     # "unknown" rather than a docs bucket, still re-arms
@@ -275,10 +282,16 @@ def test_the_classifier_narrows_and_fails_open() -> None:
         # context — test_the_llamacpp_image_reads_nothing_else_from_the_tree),
         # so an unrelated path cannot change what it builds (2026-10-09).
         assert got["llamacpp"] == "false", f"{unknown} compiled llama-server: {got}"
+        assert got["ollama"] == "false", f"{unknown} built the ollama image: {got}"
 
     # Its own inputs, and the workflow that builds it, do arm it.
     for own in (["docker/Dockerfile.llamacpp"], [".github/workflows/ci.yml"]):
         assert _classify(own)["llamacpp"] == "true", f"{own} must compile llama-server"
+    for own in (["docker/Dockerfile.ollama"], [".github/workflows/ci.yml"]):
+        assert _classify(own)["ollama"] == "true", f"{own} must build the ollama image"
+    # Each image's Dockerfile arms only its own image.
+    assert _classify(["docker/Dockerfile.ollama"])["llamacpp"] == "false"
+    assert _classify(["docker/Dockerfile.llamacpp"])["ollama"] == "false"
 
     # Docs mixed with code is code. This is the exact case the `grep -qv`
     # bug got backwards.
@@ -403,6 +416,29 @@ def test_the_llamacpp_image_reads_nothing_else_from_the_tree() -> None:
     )
 
 
+def test_the_ollama_image_reads_nothing_else_from_the_tree() -> None:
+    """The same soundness condition as llamacpp's, for the ollama switch:
+    docker/Dockerfile.ollama takes no input from the build context."""
+    df = (ROOT / "docker/Dockerfile.ollama").read_text()
+    copies = [ln.strip() for ln in df.splitlines() if re.match(r"\s*(COPY|ADD)\b", ln)]
+    assert copies, "no COPY in docker/Dockerfile.ollama — this guard parsed the wrong file"
+    from_context = [c for c in copies if "--from=" not in c]
+    assert not from_context, (
+        f"docker/Dockerfile.ollama now reads the build context ({from_context}); "
+        "add those paths to the ollama switch in ci.yml's scope step"
+    )
+
+
+def test_both_image_lanes_build_every_stage() -> None:
+    """i415: a lane that builds `--target builder` proves nothing about the
+    runtime stage, which is where 0.6.16-rc.1's release failed."""
+    wf = _workflow()
+    for job in ("llamacpp-image", "ollama-image"):
+        runs = " ".join(s.get("run", "") for s in wf["jobs"][job]["steps"])
+        assert "docker buildx build" in runs, f"{job} builds nothing"
+        assert "--target" not in runs, f"{job} builds one stage only: {job} must build the whole image"
+
+
 def _scope_on_push(tmp: Path, history: list[tuple[dict[str, str], str | None]]) -> dict[str, str]:
     """Run the REAL scope step as a push event in a throwaway git repo.
 
@@ -470,3 +506,80 @@ def test_a_push_with_no_release_to_diff_against_fails_open(tmp_path: Path) -> No
     """No final tag and no origin/main: compile."""
     got = _scope_on_push(tmp_path / "z", [({"src/a.py": "a\n"}, None), ({"src/a.py": "b\n"}, None)])
     assert got["llamacpp"] == "true", got
+    assert got["ollama"] == "true", got
+
+
+def test_a_push_builds_ollama_only_when_it_differs_from_the_last_release(tmp_path: Path) -> None:
+    """The ollama switch follows llamacpp's push rule: against the last FINAL release."""
+    ol = "docker/Dockerfile.ollama"
+    released = ({ol: "FROM x\n", DF: "FROM x\n", "src/a.py": "a\n"}, "stack-v1.0.0")
+    unrelated = _scope_on_push(tmp_path / "u", [released, ({"src/a.py": "b\n"}, None)])
+    assert unrelated["ollama"] == "false", unrelated
+    touched = _scope_on_push(tmp_path / "t", [released, ({ol: "FROM y\n"}, None)])
+    assert touched["ollama"] == "true" and touched["llamacpp"] == "false", touched
+
+
+_CRATES = {"gateway-rust": "gateway", "noo-cli": "cli"}
+_INCLUDE = re.compile(r'include_(?:str|bytes)!\(\s*"([^"]+)"\s*\)')
+
+
+def _out_of_crate_inputs() -> dict[str, set[str]]:
+    """Every repository file outside a crate that the crate compiles in
+    (include_str!/include_bytes!), mapped to the scope outputs of the crates
+    that read it. Read here independently of the step's own derivation."""
+    found: dict[str, set[str]] = {}
+    for crate, lane in _CRATES.items():
+        for src in sorted((ROOT / crate).rglob("*.rs")):
+            if "target" in src.relative_to(ROOT).parts:
+                continue
+            for m in _INCLUDE.finditer(src.read_text(errors="replace")):
+                path = (src.parent / m.group(1)).resolve()
+                try:
+                    rel = path.relative_to(ROOT).as_posix()
+                except ValueError:
+                    continue
+                if not rel.startswith(crate + "/"):
+                    found.setdefault(rel, set()).add(lane)
+    return found
+
+
+def _step_crate_inputs(crate: str) -> set[str]:
+    """The scope step's OWN derivation (`crate_inputs`), run once on this tree."""
+    import subprocess
+
+    run = next(s["run"] for s in _workflow()["jobs"]["scope"]["steps"] if s.get("id") == "diff")
+    start = run.index("crate_inputs() {\n")
+    fn = run[start : run.index("\n}\n", start) + 3]
+    r = subprocess.run(["bash", "-c", "set -euo pipefail\n" + fn + f"crate_inputs {crate}\n"],
+                       cwd=ROOT, env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, check=True)
+    return set(r.stdout.split())
+
+
+def test_every_out_of_crate_include_arms_its_crates_lane() -> None:
+    """A file a crate compiles in from outside its own tree is that crate's
+    input wherever it lives. 2026-11-05: tests/fixtures/test_src_cases.json,
+    read by both crates, routed as `tests/*` to sqlx only, so a change to its
+    rows built neither Rust lane, on the PR or in the merge queue; a docs page
+    the CLI embeds was "documentation only"."""
+    inputs = _out_of_crate_inputs()
+    # The scan found what this test is about (not a silent empty pass).
+    assert inputs.get("tests/fixtures/test_src_cases.json") == {"gateway", "cli"}, inputs
+    assert inputs.get("tests/fixtures/own_image_cases.json") == {"gateway", "cli"}, inputs
+    assert len(inputs) >= 20, f"only {len(inputs)} out-of-crate inputs found: {sorted(inputs)}"
+    # The step derives exactly this set for each crate, so every one arms it.
+    for crate, lane in _CRATES.items():
+        want = {p for p, lanes in inputs.items() if lane in lanes}
+        got = _step_crate_inputs(crate)
+        assert got == want, f"{crate}: the scope step misses {sorted(want - got)}, extra {sorted(got - want)}"
+    # End to end, one per bucket a compiled-in file used to fall in.
+    for path, lanes in [("tests/fixtures/test_src_cases.json", {"gateway", "cli"}),
+                        ("docs/getting-started/add-ons.md", {"cli"}),
+                        ("gateway-rust/src/routes/users.rs", {"gateway", "cli"}),
+                        ("node-agent-go/internal/docker/backends.go", {"cli"})]:
+        assert path in inputs, f"{path} is no longer compiled in; pick another example"
+        got = _classify([path])
+        assert got["code"] == "true" and all(got[l] == "true" for l in lanes), f"{path}: {got}"
+    # Only the crate that reads it: a gateway-only fixture does not build the CLI.
+    only_gw = sorted(p for p, l in inputs.items() if l == {"gateway"} and p.startswith("tests/"))
+    assert only_gw, "no gateway-only fixture left to hold the narrowing to"
+    assert _classify([only_gw[0]])["cli"] == "false", only_gw[0]

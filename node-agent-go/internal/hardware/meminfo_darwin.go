@@ -31,18 +31,22 @@ func readMemory() (totalKB int64, availKB int64, ok bool) {
 		return 0, 0, false
 	}
 	totalKB = bytes / 1024
-	// Available is best-effort: a total without it is still worth reporting,
-	// so a vm_stat failure leaves availKB at 0 rather than failing the read.
+	// Available is best-effort: a total without it is still worth reporting.
+	// A vm_stat failure returns -1 (unknown); 0 would read as "no memory
+	// available" and report the whole machine as in use.
 	return totalKB, availableKBFromVMStat(), true
 }
 
-// availableKBFromVMStat runs `vm_stat`. Returns 0 when it cannot.
+// availableKBFromVMStat runs `vm_stat`. Returns -1 when it cannot.
 func availableKBFromVMStat() int64 {
 	out, err := exec.Command("vm_stat").Output()
 	if err != nil {
-		return 0
+		return -1
 	}
-	return parseVMStat(string(out))
+	if kb := parseVMStat(string(out)); kb > 0 {
+		return kb
+	}
+	return -1 // output with none of the page counters we need
 }
 
 // parseVMStat is the parsing half, separated so it can be tested against real

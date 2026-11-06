@@ -1016,7 +1016,11 @@ async fn native_python_exec(call: &ToolCall, args: &Value) -> ToolResult {
         .await
     {
         Ok(resp) if resp.status().is_success() => {
-            let payload: Value = resp.json().await.unwrap_or(json!({}));
+            // A cut-off or non-JSON 2xx is an error, never "(no output)".
+            let payload = match crate::upstream_body::json_2xx(resp, "the sandbox").await {
+                Ok(p) => p,
+                Err(e) => return err_result(call, e),
+            };
             let output = payload
                 .get("output")
                 .and_then(|o| o.as_str())
@@ -2094,8 +2098,8 @@ mod native_tests {
     /// never a fresh default client that would present no certificate.
     #[test]
     fn python_exec_dials_the_sandbox_with_the_cluster_client() {
-        let src = include_str!("tools.rs");
-        let body = src.split("async fn native_python_exec(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("tools.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn native_python_exec(");
         assert!(body.contains("crate::tls::cluster_client()"), "python_exec must present the gateway leaf");
         assert!(!body.contains("reqwest::Client::builder()"), "a default client presents no client certificate");
     }

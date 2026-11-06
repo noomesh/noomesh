@@ -123,6 +123,9 @@ func lookupArtifactManifestWithin(ctx context.Context, kind, name string, timeou
 	if err != nil {
 		return nil, fmt.Errorf("TLS transport: %w", err)
 	}
+	// A transport for one request: close its connection when done, or the
+	// controller holds it (2026-11-02 EMFILE, see config.HTTPTransport).
+	defer transport.CloseIdleConnections()
 	httpClient := &http.Client{Timeout: timeout, Transport: transport}
 	return doArtifactManifest(httpClient, req)
 }

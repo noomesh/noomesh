@@ -27,6 +27,8 @@ from __future__ import annotations
 import pathlib
 import re
 
+from tests import _rust_src as rs
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 PULL_GO = REPO / "node-agent-go/internal/api/pull.go"
 CLI = REPO / "noo-cli/src/commands"
@@ -52,30 +54,6 @@ def documented_kinds() -> set[str]:
     return {k.strip() for k in m.group(1).split(",") if k.strip()}
 
 
-def _without_test_modules(src: str) -> str:
-    """Drop every `#[cfg(test)] mod … { … }` block (brace-matched), keep the rest."""
-    out, i = [], 0
-    while True:
-        j = src.find("#[cfg(test)]", i)
-        if j < 0:
-            out.append(src[i:])
-            return "".join(out)
-        out.append(src[i:j])
-        k = src.find("{", j)
-        if k < 0:
-            return "".join(out)
-        depth, n = 0, k
-        while n < len(src):
-            if src[n] == "{":
-                depth += 1
-            elif src[n] == "}":
-                depth -= 1
-                if depth == 0:
-                    break
-            n += 1
-        i = n + 1
-
-
 def cli_kinds() -> set[str]:
     """Kinds sent by the CLI: `"kind": "x"` in a /pull request body."""
     found: set[str] = set()
@@ -85,7 +63,7 @@ def cli_kinds() -> set[str]:
             continue
         # Production code only: a `#[cfg(test)]` module's fixtures are not
         # request bodies (the fit screen's `"budget": {"kind": "unified"}`).
-        src = _without_test_modules(src)
+        src = rs.own_code(src)
         found |= set(re.findall(r'"kind"\s*:\s*"([a-z0-9-]+)"', src))
     return found
 

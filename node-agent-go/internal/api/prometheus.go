@@ -25,14 +25,16 @@ func (s *Server) handlePrometheusMetrics(w http.ResponseWriter, r *http.Request)
 
 	// System load
 	m := s.collector.Collect()
-	b.WriteString("# HELP noo_node_load Current node load (0-1)\n")
-	b.WriteString("# TYPE noo_node_load gauge\n")
-	fmt.Fprintf(&b, "noo_node_load{node_id=%q} %g\n", nodeID, m.Load)
+	if m.Load != nil { // unknown is omitted, never exported as 0
+		b.WriteString("# HELP noo_node_load Current node load (0-1)\n")
+		b.WriteString("# TYPE noo_node_load gauge\n")
+		fmt.Fprintf(&b, "noo_node_load{node_id=%q} %g\n", nodeID, *m.Load)
+	}
 
 	// GPU metrics
 	gpuMetrics := s.gpu.Metrics()
 	if gpuMetrics != nil {
-		gpuModel := s.gpu.DetectModel()
+		gpuModel, _ := s.gpu.DetectModel()
 		if gpuModel == "" {
 			gpuModel = "unknown"
 		}

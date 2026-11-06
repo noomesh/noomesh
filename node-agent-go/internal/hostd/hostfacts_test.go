@@ -155,3 +155,37 @@ func TestPrebuiltNvidiaModuleUnderVersionedDirIsFound(t *testing.T) {
 		t.Fatal("a kernel with no module must still read as missing")
 	}
 }
+
+// Followup 476: the `gpu driver` remedy depends on HOW the module is
+// installed, so the facts say it. DKMS builds land in updates/dkms;
+// Ubuntu's prebuilt linux-modules-nvidia-<ver>-<kernel> in kernel/nvidia-<ver>/.
+func TestNvidiaDriverLayoutIsReported(t *testing.T) {
+	// host8: DKMS (popOSAfterRecovery plants updates/dkms for the running kernel).
+	root, r := popOSAfterRecovery(t)
+	f := CollectHostFacts(context.Background(), root, r)
+	if f.NvidiaDriver != "dkms" || f.NvidiaDriverVersion != "" {
+		t.Fatalf("dkms box: driver=%q version=%q", f.NvidiaDriver, f.NvidiaDriverVersion)
+	}
+
+	// host2: prebuilt, no dkms anywhere.
+	root = t.TempDir()
+	write(t, root, "proc/sys/kernel/osrelease", "7.0.0-31-generic\n")
+	write(t, root, "lib/modules/7.0.0-31-generic/kernel/nvidia-580/nvidia.ko.zst", "m")
+	r = &fakeRunner{stdout: map[string]string{"dpkg-query": "nvidia-driver-580\t580.95.05\n"}}
+	f = CollectHostFacts(context.Background(), root, r)
+	if f.NvidiaDriver != "prebuilt" || f.NvidiaDriverVersion != "580" {
+		t.Fatalf("prebuilt box: driver=%q version=%q", f.NvidiaDriver, f.NvidiaDriverVersion)
+	}
+
+	// A module in neither place (kernel/drivers/video): no layout claimed.
+	root = t.TempDir()
+	write(t, root, "proc/sys/kernel/osrelease", "6.8.0-1-generic\n")
+	write(t, root, "lib/modules/6.8.0-1-generic/kernel/drivers/video/nvidia.ko", "m")
+	f = CollectHostFacts(context.Background(), root, r)
+	if f.NvidiaDriver != "" || f.NvidiaDriverVersion != "" {
+		t.Fatalf("unknown layout must stay empty: driver=%q version=%q", f.NvidiaDriver, f.NvidiaDriverVersion)
+	}
+	if !f.NvidiaModule["6.8.0-1-generic"] {
+		t.Fatal("the module itself is still found")
+	}
+}

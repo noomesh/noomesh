@@ -246,6 +246,42 @@ pub(crate) fn carry_reported(data: &mut Value, body: &Value, key: &str) {
     }
 }
 
+/// The agent's `lanes` (proposal i403), stored on every beat so the class
+/// table reads them (`node_facts_from_kv`). An agent that reports lanes
+/// sends the key on EVERY beat (`[]` included: "no lanes"; the agent's
+/// `secLanes` section is unconditional), so a beat without it is an agent
+/// too old to report, or a downgrade. The stored key is then removed and
+/// routing falls back to `running_backends`, never routing on lanes the node
+/// no longer reports. Not `carry_reported`, which keeps the last value.
+/// A key that is not a list is treated as absent.
+/// The agent's `load` (0.0-1.0), stored as `current_load` on every beat.
+/// An agent that cannot read its load omits the key (macOS reported 0,
+/// a lie; personifai-df's i495 agent work): absent or not a number is
+/// UNKNOWN, so the key is removed. `unwrap_or(0.0)` made such a node look
+/// the least loaded in placement and routing, which drew work to it. Not
+/// `carry_reported`, which would keep the last value.
+pub(crate) fn carry_load(data: &mut Value, body: &Value) {
+    match body.get("load").and_then(Value::as_f64) {
+        Some(l) => data["current_load"] = json!(l),
+        None => {
+            if let Some(o) = data.as_object_mut() {
+                o.remove("current_load");
+            }
+        }
+    }
+}
+
+pub(crate) fn carry_lanes(data: &mut Value, body: &Value) {
+    match body.get("lanes").filter(|v| v.is_array()) {
+        Some(v) => data["lanes"] = v.clone(),
+        None => {
+            if let Some(o) = data.as_object_mut() {
+                o.remove("lanes");
+            }
+        }
+    }
+}
+
 async fn node_heartbeat(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
@@ -271,8 +307,9 @@ async fn node_heartbeat(
     data["id"] = json!(node_id);
     data["hostname"] = json!(node_id);  // Use node_id, not container hostname
     data["status"] = json!("online");
-    data["current_load"] = json!(body.get("load").and_then(|v| v.as_f64()).unwrap_or(0.0));
+    carry_load(&mut data, &body);
     data["running_backends"] = body.get("running_backends").cloned().unwrap_or(json!({}));
+    carry_lanes(&mut data, &body);
     // The node on the controller's own device says so (NOO_SELF_NODE);
     // fleet views and node verbs branch on it.
     if let Some(v) = body.get("self_node") { if !v.is_null() { data["self_node"] = v.clone(); } }
@@ -567,7 +604,8 @@ async fn node_heartbeat(
     let vram_gb = data.get("vram_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let cpu_cores = data.get("cpu_cores").and_then(|v| v.as_i64()).unwrap_or(4) as i32;
     let ram_gb = data.get("ram_gb").and_then(|v| v.as_f64()).unwrap_or(8.0);
-    let current_load = data.get("current_load").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    // NULL when the beat carried no numeric load (`carry_load`).
+    let current_load: Option<f64> = data.get("current_load").and_then(|v| v.as_f64());
     let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("online").to_string();
     let running_backends = data.get("running_backends").cloned().unwrap_or_else(|| json!({}));
     let agent_url = data.get("agent_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -1070,16 +1108,20 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
     // harness invariant printed a green `policy manual` for all five nodes of a
     // fleet whose policies it had not looked at. One query for the
     // whole fleet, resolved exactly as the single-node route resolves it.
-    let harness_policies: std::collections::HashMap<String, String> =
+    //
+    // A failed query is not "no rows" (i436). It used to read that way, so
+    // every node showed the fleet default (`auto`) while Postgres was down,
+    // including nodes set to `off`. Now the field is left off and
+    // `harness_policy_error` says why, which `noo cluster verify` reports as
+    // "policy not reported" instead of judging a default.
+    let harness_policies: Result<std::collections::HashMap<String, String>, String> =
         sqlx::query_as::<_, (String, Option<String>)>(
             "SELECT node_id, harness_policy FROM noo_node_config",
         )
         .fetch_all(&state.db)
         .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|(id, p)| p.map(|p| (id, p)))
-        .collect();
+        .map(|rows| rows.into_iter().filter_map(|(id, p)| p.map(|p| (id, p))).collect())
+        .map_err(|e| format!("cannot read the harness policies: {e}"));
     let task_holds = node_task_holds(&state.db).await;
     // node_ids seen live in KV — used to suppress duplicate DB rows when
     // merging known-but-missing (offline) nodes below.
@@ -1266,16 +1308,22 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
 
                         // Declared harness policy — the row when there is one,
                         // otherwise the same fleet default the single-node
-                        // route applies. Never absent, so a consumer cannot
-                        // quietly substitute a default of its own.
+                        // route applies. Absent only when the table could not
+                        // be read, and then `harness_policy_error` says so; a
+                        // consumer never sees a default standing in for an error.
                         // Own the key: `id` above borrows `data`, and reading
                         // it here would hold that borrow across the writes.
                         let policy_key =
                             data.get("id").and_then(|i| i.as_str()).unwrap_or(&key).to_string();
-                        data["harness_policy"] = json!(harness_policies
-                            .get(&policy_key)
-                            .cloned()
-                            .unwrap_or_else(crate::coordinator::harness_default_policy));
+                        match &harness_policies {
+                            Ok(policies) => {
+                                data["harness_policy"] = json!(policies
+                                    .get(&policy_key)
+                                    .cloned()
+                                    .unwrap_or_else(crate::coordinator::harness_default_policy));
+                            }
+                            Err(e) => data["harness_policy_error"] = json!(e),
+                        }
                         // What the node's harness holds (i227 fix 4): absent
                         // only when the query failed, never defaulted.
                         if let Some(holds) = task_holds.as_ref() {
@@ -1567,7 +1615,8 @@ pub(crate) async fn cluster_backends(State(state): State<Arc<AppState>>) -> AppJ
                 if let Ok(Some(entry)) = kv.get(&key).await {
                     if let Ok(data) = serde_json::from_slice::<Value>(&entry) {
                         let hostname = data.get("hostname").and_then(|h| h.as_str()).unwrap_or(&key);
-                        let load = data.get("load").and_then(|l| l.as_f64()).unwrap_or(0.0);
+                        // the key the heartbeat stores; null when unreported
+                        let load = data.get("current_load").and_then(|l| l.as_f64());
                         if let Some(rb) = data.get("running_backends").and_then(|r| r.as_object()) {
                             for (bt, model_val) in rb {
                                 let model = model_val.as_str().unwrap_or("?");
@@ -1644,7 +1693,11 @@ pub(super) async fn cluster_gpu_metrics(State(state): State<Arc<AppState>>) -> A
 
     match client.get(&exporter_url).timeout(std::time::Duration::from_secs(5)).send().await {
         Ok(resp) if resp.status().is_success() => {
-            let body = resp.text().await.unwrap_or_default();
+            // A cut-off scrape is an error, never "no GPUs" (i460).
+            let body = match crate::upstream_body::text_2xx(resp, "nvidia-exporter").await {
+                Ok(b) => b,
+                Err(e) => return Json(json!({"error": e, "gpus": []})),
+            };
             let mut gpus = parse_prometheus_gpu_metrics(&body);
             // The exporter is the controller's own, so these GPUs belong
             // to the controller node. Name it: the kiosk (and anything
@@ -1669,52 +1722,18 @@ pub(super) async fn cluster_gpu_metrics(State(state): State<Arc<AppState>>) -> A
             // Fallback: proxy to node agents' /gpu endpoint
             let agents = all_node_agents(&state).await;
             let mut all_gpus = Vec::new();
+            let mut unreachable = Vec::new();
             for (node_id, agent_url, hostname) in &agents {
-                let req = crate::node_link::NodeLink::for_base(agent_url)
-                    .request(reqwest::Method::GET, "/gpu")
-                    .timeout(std::time::Duration::from_secs(3));
-                if let Ok(resp) = req.send().await {
-                    if let Ok(data) = resp.json::<Value>().await {
-                        if data.get("available").and_then(|v| v.as_bool()) == Some(true) {
-                            // Node agent returns flat metrics; transform to match observe.js format
-                            // observe.js expects: temperature, memory_used (MB, /1024 → GB), power, utilization, name
-                            let gpu_model = data.get("gpu_model").and_then(|v| v.as_str()).unwrap_or("GPU");
-                            // Each of these was `.unwrap_or(0.0)`: a field the
-                            // node-agent omitted or renamed rendered as a real
-                            // reading of 0 °C / 0 W / 0% utilization. "0%
-                            // utilization" is not cosmetic — it is an input to
-                            // placement decisions and to the operator's read of
-                            // whether a GPU is busy. An absent metric is now
-                            // null, which consumers can render as "—" instead
-                            // of as an idle, ice-cold GPU.
-                            all_gpus.push(json!({
-                                // The GPU's MODEL, not the machine it is in.
-                                // This was `hostname`, so every tile on this
-                                // path was labelled with its own host — and
-                                // since the tile already shows the node, an
-                                // operator saw "host3 host3" and "host8
-                                // host8" (the two spellings being node_id and
-                                // hostname) and read one machine as two.
-                                // `gpu_model` was already being read two lines
-                                // up and then ignored. Where the node-agent
-                                // reports no model it is "GPU", which is
-                                // uninformative but true; the hostname here
-                                // was informative and false.
-                                "name": gpu_model,
-                                "node_id": node_id.clone(),
-                                "hostname": hostname.clone(),
-                                "gpu_model": gpu_model,
-                                "index": all_gpus.len().to_string(),
-                                "temperature": metric_or_null(&data, "temperature_c"),
-                                "memory_used": metric_or_null(&data, "memory_used_mb"),
-                                "power": metric_or_null(&data, "power_draw_w"),
-                                "utilization": metric_or_null(&data, "gpu_utilization_percent"),
-                            }));
-                        }
-                    }
+                let link = crate::node_link::NodeLink::for_base(agent_url);
+                match node_gpu(&link, node_id, hostname, all_gpus.len()).await {
+                    Ok(Some(gpu)) => all_gpus.push(gpu),
+                    Ok(None) => {}
+                    // A node whose /gpu could not be read is named, never
+                    // shown as a node with no GPU (i460).
+                    Err(error) => unreachable.push(json!({"node_id": node_id, "hostname": hostname, "error": error})),
                 }
             }
-            Json(json!({"gpus": all_gpus, "source": if all_gpus.is_empty() { "none" } else { "node_agent" }}))
+            Json(json!({"gpus": all_gpus, "unreachable": unreachable, "source": if all_gpus.is_empty() { "none" } else { "node_agent" }}))
         }
     }
 }
@@ -1732,6 +1751,57 @@ fn controller_identity() -> (String, String) {
         .unwrap_or_else(|| "controller".to_string());
     let id = crate::self_node::self_node_id().unwrap_or_else(|| host.clone());
     (id, host)
+}
+
+/// One node agent's `/gpu`, in the shape the GPU tiles read: `None` when the
+/// node reports no GPU (`available` not true), `Err` when its answer could
+/// not be had or read.
+async fn node_gpu(link: &crate::node_link::NodeLink, node_id: &str, hostname: &str, index: usize) -> Result<Option<Value>, String> {
+    let resp = link
+        .request(reqwest::Method::GET, "/gpu")
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|e| format!("node {node_id}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("node {node_id} answered HTTP {}", resp.status().as_u16()));
+    }
+    let data = crate::upstream_body::json_2xx(resp, &format!("node {node_id}")).await?;
+    if data.get("available").and_then(|v| v.as_bool()) != Some(true) {
+        return Ok(None);
+    }
+    let gpu_model = data.get("gpu_model").and_then(|v| v.as_str()).unwrap_or("GPU");
+    // Each of these was `.unwrap_or(0.0)`: a field the
+    // node-agent omitted or renamed rendered as a real
+    // reading of 0 °C / 0 W / 0% utilization. "0%
+    // utilization" is not cosmetic — it is an input to
+    // placement decisions and to the operator's read of
+    // whether a GPU is busy. An absent metric is now
+    // null, which consumers can render as "—" instead
+    // of as an idle, ice-cold GPU.
+    Ok(Some(json!({
+        // The GPU's MODEL, not the machine it is in.
+        // This was `hostname`, so every tile on this
+        // path was labelled with its own host — and
+        // since the tile already shows the node, an
+        // operator saw "host3 host3" and "host8
+        // host8" (the two spellings being node_id and
+        // hostname) and read one machine as two.
+        // `gpu_model` was already being read two lines
+        // up and then ignored. Where the node-agent
+        // reports no model it is "GPU", which is
+        // uninformative but true; the hostname here
+        // was informative and false.
+        "name": gpu_model,
+        "node_id": node_id,
+        "hostname": hostname,
+        "gpu_model": gpu_model,
+        "index": index.to_string(),
+        "temperature": metric_or_null(&data, "temperature_c"),
+        "memory_used": metric_or_null(&data, "memory_used_mb"),
+        "power": metric_or_null(&data, "power_draw_w"),
+        "utilization": metric_or_null(&data, "gpu_utilization_percent"),
+    })))
 }
 
 /// Read one numeric telemetry field, returning JSON `null` when it is absent
@@ -1944,7 +2014,8 @@ mod node_agent_auth_tests {
         assert_eq!(node_agent_bearer(Some("")), None);
         // ...and the function cannot even be handed a secret to sign with.
         let src = include_str!("cluster.rs");
-        let body = src.split("pub(crate) fn node_agent_bearer(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "pub(crate) fn node_agent_bearer(");
         assert!(!body.contains(&["mint_cluster", "_token"].concat()), "the fallback is back: {body}");
     }
 }
@@ -2151,7 +2222,10 @@ async fn clean_node(
 
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
-            let mut result = resp.json::<Value>().await.unwrap_or(json!({}));
+            // An unreadable answer is an error, never a bare `{"status":"ok"}`.
+            let mut result = crate::upstream_body::json_2xx(resp, &format!("node {node_id}"))
+                .await
+                .map_err(AppError::Upstream)?;
             result["status"] = json!("ok");
             tracing::info!(node_id = %node_id, "node cleaned");
             Ok(Json(result))
@@ -2175,7 +2249,7 @@ async fn clean_node(
 /// start while the GPU is occupied (noomesh-internal i163 parts C and D).
 ///
 /// POST /api/cluster/nodes/{node_id}/gpu/hold — body `{reason?, operation_id?,
-/// owner?, workload?, purpose?, mode?: drain|immediate, timeout_secs?, force?}`. Operator only;
+/// owner?, workload?, purpose?, for_secs?, mode?: drain|immediate, timeout_secs?, force?}`. Operator only;
 /// audited (`node_gpu_hold`, with the lease and whether it was a force).
 ///
 /// - `operation_id` names the caller's operation; the answer's
@@ -2198,6 +2272,10 @@ async fn clean_node(
 ///   cluster gpu mode <node> user`); the lease carries it and the mode is read
 ///   back from it. It is the only purpose and never sits beside a `workload`
 ///   (400). An older agent drops it, and the hold reads as a manual one.
+/// - `for_secs` (60 to 604800, only with `purpose: "user"`, else 400) makes the
+///   lease expire on the node back to the automatic policy (`gpu mode <node>
+///   user --for`); the same operation asking again moves the expiry. The lease
+///   in the audit carries `expires_at`. Absent, the hold is indefinite.
 /// - One hold or release runs on a node at a time (409 `transition_in_progress`).
 async fn gpu_hold(
     State(state): State<Arc<AppState>>,
@@ -2214,6 +2292,7 @@ async fn gpu_hold(
     let operation_id = text("operation_id", 64);
     let workload = text("workload", 120);
     let purpose = gpu_hold_purpose(&text("purpose", 16), &workload).map_err(AppError::BadRequest)?;
+    let for_secs = gpu_hold_for(b.get("for_secs"), &purpose).map_err(AppError::BadRequest)?;
     let legacy = operation_id.is_empty();
     let mut owner = text("owner", 200);
     if owner.is_empty() {
@@ -2238,8 +2317,29 @@ async fn gpu_hold(
     if !purpose.is_empty() {
         payload["purpose"] = json!(purpose);
     }
+    if let Some(secs) = for_secs {
+        payload["for_secs"] = json!(secs);
+    }
     let wait = std::time::Duration::from_secs(if mode == "drain" { timeout_secs + 60 } else { 90 });
     gpu_hold_op(&state, actor, &node_id, "hold", payload, wait).await
+}
+
+/// Seconds a user hold lasts before it hands back to the automatic policy.
+const GPU_HOLD_FOR_MIN_SECS: u64 = 60;
+const GPU_HOLD_FOR_MAX_SECS: u64 = 7 * 24 * 3600;
+
+/// A hold's `for_secs`: absent is `None` (indefinite); otherwise a whole number
+/// in range, and only beside `purpose: user`. The agent applies the same rule.
+fn gpu_hold_for(raw: Option<&Value>, purpose: &str) -> Result<Option<u64>, String> {
+    let Some(v) = raw.filter(|v| !v.is_null()) else { return Ok(None) };
+    let secs = v.as_u64().ok_or_else(|| "for_secs must be a whole number of seconds".to_string())?;
+    if !(GPU_HOLD_FOR_MIN_SECS..=GPU_HOLD_FOR_MAX_SECS).contains(&secs) {
+        return Err(format!("for_secs must be {GPU_HOLD_FOR_MIN_SECS} to {GPU_HOLD_FOR_MAX_SECS} seconds, not {secs}"));
+    }
+    if purpose != "user" {
+        return Err("for_secs is only for purpose user (the operator's own use of the GPU)".into());
+    }
+    Ok(Some(secs))
 }
 
 /// A hold's `purpose`: empty, or `user` (the operator's own use), never
@@ -2660,12 +2760,15 @@ async fn proposals_decide(
             // anything since). The sidecar is gone, so the gateway
             // does that one useful step itself, now, rather than leaving a
             // row in 'approved' that nothing will ever pick up.
-            let final_status = if new_status == "approved" {
-                resolve_enrolment_proposal(&state, id).await
-            } else {
-                new_status.to_string()
-            };
-            Ok(Json(json!({ "id": id, "status": final_status })))
+            if new_status == "approved" {
+                let r = resolve_enrolment_proposal(&state, id).await;
+                let mut out = json!({ "id": id, "status": r.status });
+                if let Some(p) = r.problem {
+                    out["problem"] = json!(p);
+                }
+                return Ok(Json(out));
+            }
+            Ok(Json(json!({ "id": id, "status": new_status })))
         }
         None => Err(AppError::NotFound(format!(
             "Proposal '{id}' not found or not pending"
@@ -2695,16 +2798,39 @@ pub(crate) fn bootstrap_instructions(host: &str) -> String {
 /// Returns the status actually written, so the caller reports what is
 /// true rather than what it hoped for. A DB failure leaves the row
 /// 'approved' and says 'approved'.
-pub(crate) async fn resolve_enrolment_proposal(state: &AppState, id: &str) -> String {
-    let host: Option<(String,)> = sqlx::query_as(
+pub(crate) async fn resolve_enrolment_proposal(state: &AppState, id: &str) -> Resolution {
+    resolve_enrolment_proposal_in(&state.db, id).await
+}
+
+/// What resolving an approved enrolment proposal wrote: the row's status,
+/// and, when the bootstrap instructions could not be written, why.
+#[derive(Debug)]
+pub(crate) struct Resolution {
+    pub status: String,
+    pub problem: Option<String>,
+}
+
+/// [`resolve_enrolment_proposal`] over a pool. A host that cannot be read is
+/// not "no host": the row stays `approved` (what is actually written) and the
+/// read's error is the problem the caller reports (i460).
+pub(crate) async fn resolve_enrolment_proposal_in(db: &sqlx::PgPool, id: &str) -> Resolution {
+    let stuck = |what: String| {
+        tracing::warn!(proposal = %id, problem = %what, "proposal_resolve_failed");
+        Resolution { status: "approved".to_string(), problem: Some(what) }
+    };
+    let host: Option<(String,)> = match sqlx::query_as(
         "SELECT host FROM noo_cluster_proposals WHERE id = $1::uuid"
     )
     .bind(id)
-    .fetch_optional(&state.db)
+    .fetch_optional(db)
     .await
-    .ok()
-    .flatten();
-    let Some((host,)) = host else { return "approved".to_string() };
+    {
+        Ok(h) => h,
+        Err(e) => return stuck(format!("the proposal's host could not be read, so no bootstrap instructions were written: {e}")),
+    };
+    let Some((host,)) = host else {
+        return stuck("the proposal is gone, so no bootstrap instructions were written".to_string());
+    };
 
     let log = bootstrap_instructions(&host);
     let res = sqlx::query(
@@ -2714,15 +2840,12 @@ pub(crate) async fn resolve_enrolment_proposal(state: &AppState, id: &str) -> St
     )
     .bind(id)
     .bind(&log)
-    .execute(&state.db)
+    .execute(db)
     .await;
 
     match res {
-        Ok(_) => "needs_bootstrap".to_string(),
-        Err(e) => {
-            tracing::warn!(proposal = %id, error = %e, "proposal_resolve_failed");
-            "approved".to_string()
-        }
+        Ok(_) => Resolution { status: "needs_bootstrap".to_string(), problem: None },
+        Err(e) => stuck(format!("the bootstrap instructions could not be written: {e}")),
     }
 }
 
@@ -3213,7 +3336,8 @@ async fn terminal_backends(State(state): State<Arc<AppState>>) -> AppJson {
                 if let Ok(Some(entry)) = kv.get(&key).await {
                     if let Ok(data) = serde_json::from_slice::<Value>(&entry) {
                         let hostname = data.get("hostname").and_then(|h| h.as_str()).unwrap_or(&key);
-                        let load = data.get("load").and_then(|l| l.as_f64()).unwrap_or(0.0);
+                        // the key the heartbeat stores; null when unreported
+                        let load = data.get("current_load").and_then(|l| l.as_f64());
                         if let Some(rb) = data.get("running_backends").and_then(|r| r.as_object()) {
                             for (bt, model_val) in rb {
                                 let model = model_val.as_str().unwrap_or("?");
@@ -4121,7 +4245,7 @@ async fn harness_kind_fit(
     node_id: &str,
     kind: &crate::harness_kinds::HarnessKind,
     existing: &[StoredPlacement],
-) -> (crate::harness_fit::Fit, Option<(String, String)>) {
+) -> Result<(crate::harness_fit::Fit, Option<(String, String)>), AppError> {
     let chats: Vec<&StoredPlacement> = existing
         .iter()
         .filter(|p| p.backend != "harness" && p.desired_state == "running" && p.role == "chat")
@@ -4147,7 +4271,11 @@ async fn harness_kind_fit(
     let tier = crate::node_tier::derive(&crate::node_tier::facts_from_capabilities(record.get("capabilities").unwrap_or(&json!({}))))
         .tier()
         .and_then(|t| u8::try_from(t).ok());
-    let overrides = crate::repo::cluster::node_harness_profile_overrides(&state.db, node_id).await.unwrap_or_else(|_| json!({}));
+    // The operator's per-node profile decides the window and the prompt
+    // floor: an unreadable one is a 503, not the tier default (#650 sweep).
+    let overrides = crate::repo::cluster::node_harness_profile_overrides(&state.db, node_id)
+        .await
+        .map_err(|e| AppError::Unavailable(format!("cannot read node '{node_id}' harness profile: {e}")))?;
     let profile = crate::harness_profile::resolve(tier, &overrides, None, None);
     let window = crate::harness_fit::node_window(chats.iter().map(|p| (p.backend.as_str(), &p.env, p.model.as_deref())), &record, profile.context);
     let floor = crate::harness_fit::kind_floor(kind, profile.claude_prompt == "slim");
@@ -4158,7 +4286,7 @@ async fn harness_kind_fit(
         .min_by_key(|(n, _)| *n)
         // No model name, no `noo cluster place` line to suggest.
         .and_then(|(_, p)| p.model.clone().filter(|m| !m.is_empty()).map(|m| (p.backend.clone(), m)));
-    (crate::harness_fit::judge(floor, window), chat)
+    Ok((crate::harness_fit::judge(floor, window), chat))
 }
 
 async fn stored_placements(state: &AppState, node_id: &str) -> Result<Vec<StoredPlacement>, AppError> {
@@ -4178,7 +4306,11 @@ async fn stored_placements(state: &AppState, node_id: &str) -> Result<Vec<Stored
 /// The node's memory facts for the fit check: its heartbeat record (the
 /// `mesh_nodes` KV), topped up from `cluster_nodes` and the operator's
 /// `noo_node_config.vram_gb` override. Nothing is probed.
-pub(crate) async fn node_fit_facts(state: &AppState, node_id: &str) -> Value {
+///
+/// A database error is `Err` (503), never "no override": the operator's
+/// `vram_gb` cap and `usage_profile` used to drop silently, so a placement
+/// the declared config refuses was admitted with a larger memory limit.
+pub(crate) async fn node_fit_facts(state: &AppState, node_id: &str) -> Result<Value, AppError> {
     let mut node = match state.js.get_key_value("mesh_nodes").await {
         Ok(kv) => match kv.get(node_id).await {
             Ok(Some(e)) => serde_json::from_slice::<Value>(&e).unwrap_or_else(|_| json!({})),
@@ -4187,25 +4319,28 @@ pub(crate) async fn node_fit_facts(state: &AppState, node_id: &str) -> Value {
         Err(_) => json!({}),
     };
     let has = |n: &Value, k: &str| n.get(k).and_then(|v| v.as_f64()).is_some_and(|v| v > 0.0);
+    let unreadable = |what: &str, e: sqlx::Error| AppError::Unavailable(format!("cannot read node '{node_id}' {what}: {e}"));
     if !has(&node, "vram_gb") || !has(&node, "ram_gb") {
-        if let Ok(Some((vram, ram))) = sqlx::query_as::<_, (Option<f64>, Option<f64>)>(
+        if let Some((vram, ram)) = sqlx::query_as::<_, (Option<f64>, Option<f64>)>(
             "SELECT vram_gb, ram_gb FROM cluster_nodes WHERE node_id = $1",
         )
         .bind(node_id)
         .fetch_optional(&state.db)
         .await
+        .map_err(|e| unreadable("memory facts", e))?
         {
             if !has(&node, "vram_gb") { if let Some(v) = vram { node["vram_gb"] = json!(v); } }
             if !has(&node, "ram_gb") { if let Some(v) = ram { node["ram_gb"] = json!(v); } }
         }
     }
     let mut usage_stored: Option<String> = None;
-    if let Ok(Some((v, usage))) = sqlx::query_as::<_, (Option<f64>, Option<String>)>(
+    if let Some((v, usage)) = sqlx::query_as::<_, (Option<f64>, Option<String>)>(
         "SELECT vram_gb, usage_profile FROM noo_node_config WHERE node_id = $1",
     )
     .bind(node_id)
     .fetch_optional(&state.db)
     .await
+    .map_err(|e| unreadable("config (vram_gb, usage_profile)", e))?
     {
         if let Some(v) = v.filter(|v| *v > 0.0) { node["vram_gb"] = json!(v); }
         usage_stored = usage;
@@ -4214,7 +4349,7 @@ pub(crate) async fn node_fit_facts(state: &AppState, node_id: &str) -> Value {
     node["usage_profile"] = json!(usage);
     node["usage_profile_source"] = json!(usage_source);
     node["fleet_model_stats"] = Value::Array(fleet_model_sizes(state, node_id).await);
-    node
+    Ok(node)
 }
 
 /// Every OTHER node's reported model sizes (`model_stats[].size_bytes` from
@@ -4267,7 +4402,11 @@ async fn placement_staging_refusal(state: &AppState, node_id: &str, backend: &st
     if !dir.is_dir() {
         return None;
     }
-    let node = node_fit_facts(state, node_id).await;
+    // Fail closed, and say why: an unreadable node is not an unknown arch.
+    let node = match node_fit_facts(state, node_id).await {
+        Ok(node) => node,
+        Err(e) => return Some((format!("cannot check the image is staged for '{node_id}': {e}"), true)),
+    };
     let arch = node["capabilities"]["arch"].as_str().or_else(|| node["arch"].as_str()).unwrap_or("").to_string();
     if arch.is_empty() {
         return None;
@@ -4377,7 +4516,7 @@ async fn placement_put(
 
     let target = body.target.as_deref().map(str::trim).filter(|t| !t.is_empty());
     if target.is_some() {
-        let node = node_fit_facts(&state, &node_id).await;
+        let node = node_fit_facts(&state, &node_id).await?;
         validate_target(&backend, target, &node).map_err(AppError::BadRequest)?;
     }
 
@@ -4393,7 +4532,7 @@ async fn placement_put(
         let ptarget = effective_target_after_upsert(mine, body.model.as_deref(), target);
         let proposed = StoredPlacement { backend: backend.clone(), role: role.clone(), model, env, desired_state: "running".into(), target: ptarget };
         if proposed.model.as_deref().is_some_and(|m| !m.is_empty()) {
-            let mut node = node_fit_facts(&state, &node_id).await;
+            let mut node = node_fit_facts(&state, &node_id).await?;
             with_size_hint(&mut node, proposed.model.as_deref(), body.model_size_bytes);
             let embed_ctx = crate::embedding_client::EMBED_NUM_CTX;
             let after = crate::placement_fit::evaluate(&node, &fit_specs(&existing, Some((&backend, &role, body.model.as_deref())), Some(&proposed)), embed_ctx);
@@ -4427,7 +4566,7 @@ async fn placement_put(
         let kind = body.env.as_ref().and_then(|e| e.get("NOO_HARNESS_KIND")).and_then(|k| k.as_str()).unwrap_or("noo").to_string();
         if let Some(row) = crate::harness_kinds::get(&kind) {
             let existing = stored_placements(&state, &node_id).await?;
-            let (fit, chat) = harness_kind_fit(&state, &node_id, row, &existing).await;
+            let (fit, chat) = harness_kind_fit(&state, &node_id, row, &existing).await?;
             if let Some(msg) = crate::harness_fit::message(&node_id, &kind, &fit, chat.as_ref().map(|(b, m)| (b.as_str(), m.as_str()))) {
                 match fit {
                     crate::harness_fit::Fit::Short { .. } if !body.force => return Err(AppError::Conflict(msg)),
@@ -4610,7 +4749,7 @@ async fn placement_fit_post(
 ) -> AppResult {
     let with = body.and_then(|Json(b)| b.with);
     let existing = stored_placements(&state, &node_id).await?;
-    let mut node = node_fit_facts(&state, &node_id).await;
+    let mut node = node_fit_facts(&state, &node_id).await?;
     let (replacing, proposed) = match &with {
         Some(w) => {
             let role = resolve_role(&w.backend, w.role.as_deref()).map_err(AppError::BadRequest)?;
@@ -5991,7 +6130,7 @@ native process)".into());
                 }
                 None => None,
             };
-            let node = node_fit_facts(&state, node_id).await;
+            let node = node_fit_facts(&state, node_id).await?;
             let replacing = proposed.as_ref().map(|p| (p.backend.clone(), p.role.clone(), p.model.clone()));
             Some(crate::placement_fit::evaluate(
                 &node,
@@ -6205,6 +6344,30 @@ async fn probe_ssh(host: String) -> bool {
 /// Hard cap at 30s (tokio timeout, same semantics as the Python
 /// asyncio.wait_for): a /24 should finish in <5s; if probes are hanging
 /// something deeper is wrong and we want to fail visibly.
+/// Every enrolled node, keyed by its ip and by its hostname. Python
+/// consulted the node registry; the Rust source of truth for "already
+/// enrolled" is the persistent cluster_nodes table. An unreadable table is a
+/// 503 that names it, never "nothing is enrolled": discover would then offer
+/// every enrolled node as a new host to propose (i460).
+pub(crate) async fn enrolled_index(db: &sqlx::PgPool) -> Result<std::collections::HashMap<String, String>, AppError> {
+    let rows = crate::repo::cluster::all_nodes(db).await.map_err(|e| {
+        AppError::Unavailable(format!(
+            "cannot read the enrolled nodes, so discover cannot tell a new host from an enrolled one: {e}"
+        ))
+    })?;
+    let mut registered = std::collections::HashMap::new();
+    // Both columns are NOT NULL, so only emptiness needs guarding.
+    for (node_id, ip, hostname) in rows {
+        if !ip.is_empty() {
+            registered.insert(ip, node_id.clone());
+        }
+        if !hostname.is_empty() {
+            registered.insert(hostname, node_id);
+        }
+    }
+    Ok(registered)
+}
+
 async fn cluster_discover(
     State(state): State<Arc<AppState>>,
     body: Option<Json<Value>>,
@@ -6218,6 +6381,10 @@ async fn cluster_discover(
         .filter(|s| !s.is_empty()).map(String::from);
 
     tracing::info!("cluster_discover.start");
+
+    // Read before any probe, so an unreadable registry fails the request
+    // instead of listing every enrolled node as newly discovered.
+    let registered = enrolled_index(&state.db).await?;
 
     let work = async {
         let inv = load_cluster_inventory(inventory_path.as_deref());
@@ -6287,24 +6454,7 @@ async fn cluster_discover(
             }
         }
 
-        // Cross-check enrolled nodes. Python consulted the node registry;
-        // the Rust source of truth for "already enrolled" is the
-        // persistent cluster_nodes table (ip + hostname both match).
-        let mut registered: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        let rows = crate::repo::cluster::all_nodes(&state.db)
-            .await
-            .unwrap_or_default();
-        // Both columns are NOT NULL, so only emptiness needs guarding — the
-        // previous `Option::filter` was doing a null check that could not fire.
-        for (node_id, ip, hostname) in rows {
-            if !ip.is_empty() {
-                registered.insert(ip, node_id.clone());
-            }
-            if !hostname.is_empty() {
-                registered.insert(hostname, node_id);
-            }
-        }
+        // Cross-check enrolled nodes: `registered`, read before the probes.
 
         let mut trusted: Vec<Value> = Vec::new();
         let mut discovered: Vec<Value> = Vec::new();
@@ -6765,6 +6915,25 @@ mod heartbeat_carry_tests {
     }
 
     #[test]
+    fn a_hold_for_is_bounded_whole_seconds_and_user_only() {
+        assert_eq!(gpu_hold_for(None, "").unwrap(), None);
+        assert_eq!(gpu_hold_for(Some(&json!(null)), "").unwrap(), None);
+        assert_eq!(gpu_hold_for(Some(&json!(1800)), "user").unwrap(), Some(1800));
+        assert_eq!(gpu_hold_for(Some(&json!(60)), "user").unwrap(), Some(60));
+        assert_eq!(gpu_hold_for(Some(&json!(604800)), "user").unwrap(), Some(604800));
+        assert!(gpu_hold_for(Some(&json!(59)), "user").unwrap_err().contains("60 to 604800"));
+        assert!(gpu_hold_for(Some(&json!(604801)), "user").is_err());
+        assert!(gpu_hold_for(Some(&json!(0)), "user").is_err());
+        assert!(gpu_hold_for(Some(&json!(-5)), "user").is_err());
+        assert!(gpu_hold_for(Some(&json!("30m")), "user").unwrap_err().contains("whole number"));
+        assert!(gpu_hold_for(Some(&json!(1800)), "").unwrap_err().contains("purpose user"));
+        // Absent stays off the wire, so an unchanged hold is byte-identical.
+        let h = include_str!("cluster.rs").split("async fn gpu_hold(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        assert!(h.contains("if let Some(secs) = for_secs"), "for_secs is sent only when set");
+        assert!(h.contains("gpu_hold_for(b.get(\"for_secs\"), &purpose)"), "the route validates it");
+    }
+
+    #[test]
     fn with_contention_replaces_only_the_contention() {
         let rec = json!({"id": "awolf", "status": "online", "gpu_contention": {"state": "free"}});
         let gc = json!({"state": "held", "lease": {"operation_id": "op-1", "owner": "op"}});
@@ -7141,15 +7310,15 @@ mod gpu_label_tests {
         );
 
         let at = src
-            .find("all_gpus.push(json!({")
-            .expect("the fallback's GPU emit is gone — this guard is stale");
+            .find("Ok(Some(json!({")
+            .expect("the fallback's GPU emit (node_gpu) is gone — this guard is stale");
         // Bound the block at its own terminator rather than by a character
         // count. The first version read a fixed 900 chars and broke the
         // moment the comment above the emit grew — a guard that depends on
         // how much prose sits near the code is a guard that fails for the
         // wrong reason.
         let close = src[at..]
-            .find("}));")
+            .find("})))")
             .expect("the GPU emit is not terminated — this guard is stale");
         let emit = &src[at..at + close];
         let name_line = emit
@@ -7166,6 +7335,27 @@ mod gpu_label_tests {
             "the fallback labels a GPU with its HOSTNAME again — the tile already shows the \
              node, so this renders the machine twice and reads as two machines: {name_line}"
         );
+    }
+
+    /// The fallback's per-node read, against a loopback agent: a GPU is
+    /// labelled with its model, a node with none is `None`, and an answer
+    /// cut off mid-body is an error naming the node (i460), never "no GPU".
+    #[tokio::test]
+    async fn a_node_gpu_is_its_model_none_or_a_named_error() {
+        use crate::upstream_body::{stub, stub_cut_short};
+        let link = |b: &str| crate::node_link::NodeLink::for_base(b);
+        let base = stub("200 OK", None, b"{\"available\": true, \"gpu_model\": \"RTX 4080\", \"temperature_c\": 61}").await;
+        let gpu = super::node_gpu(&link(&base), "host3", "host3.lan", 0).await.unwrap().expect("a GPU");
+        assert_eq!(gpu["name"], "RTX 4080");
+        assert_eq!(gpu["hostname"], "host3.lan");
+        assert_eq!(gpu["temperature"], serde_json::json!(61.0));
+        let base = stub("200 OK", None, b"{\"available\": false}").await;
+        assert_eq!(super::node_gpu(&link(&base), "host9", "host9", 0).await, Ok(None));
+        let base = stub_cut_short().await;
+        let e = super::node_gpu(&link(&base), "host9", "host9", 0).await.unwrap_err();
+        assert!(e.starts_with("node host9 answered HTTP 200 but its body could not be read"), "{e}");
+        let base = stub("404 Not Found", None, b"").await;
+        assert_eq!(super::node_gpu(&link(&base), "host9", "host9", 0).await, Err("node host9 answered HTTP 404".into()));
     }
 }
 
@@ -7484,9 +7674,10 @@ mod model_class_tests {
     #[test]
     fn model_class_writes_are_audited() {
         let src = include_str!("cluster.rs");
-        let put = src.split("async fn model_class_put(").nth(1).unwrap().split("\n}\n").next().unwrap();
-        let del = src.split("async fn model_class_delete(").nth(1).unwrap().split("\n}\n").next().unwrap();
-        let get = src.split("async fn model_classes_get(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(src);
+        let put = crate::test_src::fn_body(&own, "async fn model_class_put(");
+        let del = crate::test_src::fn_body(&own, "async fn model_class_delete(");
+        let get = crate::test_src::fn_body(&own, "async fn model_classes_get(");
         assert!(put.contains("audit::record(") && put.contains("AuditKind::ModelClassDeclared"), "PUT audits");
         assert!(put.contains("\"unknown_nodes\": unknown_nodes"), "the audit row names the unknown nodes");
         assert!(del.contains("audit::record(") && del.contains("AuditKind::ModelClassRemoved"), "DELETE audits");
@@ -7811,10 +8002,8 @@ mod proposer_tests {
     #[test]
     fn the_handler_does_not_read_proposed_by_from_the_body() {
         let src = include_str!("cluster.rs");
-        let start = src.find("async fn cluster_propose(").unwrap();
-        let rest = &src[start..];
-        let end = rest.find("\n}\n").unwrap();
-        let body = &rest[..end];
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "async fn cluster_propose(");
         assert!(body.contains("proposer_of("));
         assert!(!body.contains("body.get(\"proposed_by\")"), "caller-asserted provenance is back");
         assert!(!body.contains("body.get(\"conversation_id\")"));
@@ -7984,9 +8173,9 @@ mod start_over_the_bus_tests {
     #[test]
     fn every_start_caller_resolves_its_link_by_node_id() {
         let src = include_str!("cluster.rs");
-        let src = src.split("mod start_over_the_bus_tests").next().unwrap();
+        let own = crate::test_src::own_code(src);
         for f in ["async fn start_backend_core(", "async fn models_cache(", "async fn models_pull("] {
-            let body = src.split(f).nth(1).expect(f).split("\n}\n").next().unwrap();
+            let body = crate::test_src::fn_body(&own, f);
             assert!(body.contains("NodeLink::for_node("), "{f} must resolve its link with for_node");
             assert!(!body.contains("NodeLink::for_base("), "{f} sends /start by address: it never rides the bus");
         }
@@ -8004,9 +8193,8 @@ mod nodes_bus_down_tests {
     #[test]
     fn the_node_list_never_waits_on_kv_while_the_bus_is_down() {
         let src = include_str!("cluster.rs");
-        let src = &src[..src.find("#[cfg(test)]").expect("test modules")];
-        let body = src.split("pub(crate) async fn collect_cluster_nodes(").nth(1).expect("collect_cluster_nodes");
-        let body = body.split("\n\u{7d}\n").next().unwrap();
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "pub(crate) async fn collect_cluster_nodes(");
         let gate = body.find("let bus_up = crate::state::bus_connected(&state.nats);").expect("the bus is checked");
         let read = body.find("if bus_up { state.js.get_key_value(\"mesh_nodes\").await.ok() } else { None }").expect("the KV read is gated");
         assert!(gate < read, "checked before the read");
@@ -8025,5 +8213,136 @@ mod nodes_bus_down_tests {
         assert_eq!(nodes_list_error(false, None).as_deref(), Some(NODES_BUS_DOWN));
         let both = nodes_list_error(false, Some("cannot read cluster_nodes".into())).unwrap();
         assert!(both.starts_with(NODES_BUS_DOWN) && both.ends_with("; cannot read cluster_nodes"), "{both}");
+    }
+}
+
+#[cfg(test)]
+mod load_carried_tests {
+    use super::*;
+    use crate::coordinator::classes::{build_table, node_facts_from_kv, Declarations};
+    use crate::scheduler_candidates::{get_candidate_nodes, CompanionPolicies};
+    use crate::scheduler_engine::snapshot_from_kv;
+    use crate::scheduler_job::TaskPriority;
+
+    /// One node's record as node_heartbeat builds it from a beat: the
+    /// registration fields, then the handler's own load step.
+    fn record(id: &str, ip: &str, beat: &Value) -> Value {
+        let mut data = json!({
+            "id": id, "ip_address": ip, "status": "online", "tier": 2, "vram_gb": 0,
+            "last_heartbeat": 1000.0, "running_backends": {"ollama": "gemma4:12b"},
+        });
+        carry_load(&mut data, beat);
+        data
+    }
+
+    /// A beat with a load stores it where every reader looks; a beat without
+    /// one (an agent that cannot read it), or with one that is not a number,
+    /// leaves the load UNKNOWN, never 0.0. Read back through the class table
+    /// and the scheduler, which are what rank on it.
+    #[test]
+    fn a_beat_without_a_numeric_load_is_unknown_never_idle() {
+        let mut data = record("n1", "100.64.0.1", &json!({"load": 0.4}));
+        assert_eq!(data["current_load"], json!(0.4));
+        assert_eq!(node_facts_from_kv("n1", &data, &[], 1000.0).load, Some(0.4));
+        assert_eq!(snapshot_from_kv("n1", &data, 1000.0).current_load, Some(0.4));
+        for beat in [json!({}), json!({"load": null}), json!({"load": "0"})] {
+            carry_load(&mut data, &beat);
+            assert!(data.get("current_load").is_none(), "{beat}: {data}");
+            assert_eq!(node_facts_from_kv("n1", &data, &[], 1000.0).load, None, "{beat}");
+            assert_eq!(snapshot_from_kv("n1", &data, 1000.0).current_load, None, "{beat}");
+        }
+        // The handler runs this step, not a 0.0 default, before its KV write.
+        let code = crate::test_src::own_code(include_str!("cluster.rs"));
+        let beat = crate::test_src::fn_body(&code, "async fn node_heartbeat(");
+        let carry = beat.find("carry_load(&mut data, &body);").expect("the heartbeat stores the load");
+        let put = beat.find("kv.put(&node_id").expect("the heartbeat's KV write");
+        assert!(carry < put, "stored before the record is written");
+        assert!(!beat.contains("body.get(\"load\")"), "the beat's load is read only by carry_load");
+    }
+
+    /// The node that did not report a load ranks after one that reported a
+    /// high one, in routing (the derived class) and in placement (the
+    /// scheduler). Named so a by-name tiebreak would put it first.
+    #[test]
+    fn an_unreported_load_ranks_after_a_reported_one() {
+        let quiet = record("a-mac", "100.64.0.1", &json!({}));
+        let busy = record("b-linux", "100.64.0.2", &json!({"load": 0.8}));
+        let facts = [node_facts_from_kv("a-mac", &quiet, &[], 1000.0), node_facts_from_kv("b-linux", &busy, &[], 1000.0)];
+        let t = build_table(&facts, &[], &Declarations::default());
+        let order: Vec<&str> = t.class("gemma4:12b").expect("the derived class").candidates.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(order, ["b-linux", "a-mac"], "routing");
+        let snaps = [snapshot_from_kv("a-mac", &quiet, 1000.0), snapshot_from_kv("b-linux", &busy, 1000.0)];
+        let placed: Vec<&str> =
+            get_candidate_nodes(&snaps, None, None, TaskPriority::Medium, 0.0, &CompanionPolicies::default()).iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(placed, ["b-linux", "a-mac"], "placement");
+    }
+}
+
+#[cfg(test)]
+mod lanes_carried_tests {
+    use super::*;
+    use crate::coordinator::classes::node_facts_from_kv;
+
+    /// Phase 2 read `lanes` from mesh_nodes, but this handler never stored
+    /// them, so every live node routed by `running_backends` and the tests,
+    /// which seeded the record, passed. The agent's golden beat goes through
+    /// the handler's own step into the record the class table reads.
+    #[test]
+    fn a_heartbeat_stores_the_agents_lanes_and_a_beat_without_them_clears_them() {
+        let golden: Value = serde_json::from_str(include_str!("../coordinator/testdata/lanes_fixture.json")).expect("the fixture parses");
+        let mut data = json!({"id": "n1", "ip_address": "100.64.0.1"});
+        carry_lanes(&mut data, &golden);
+        let lanes = node_facts_from_kv("n1", &data, &[], 0.0).lanes;
+        assert!(lanes.as_ref().is_some_and(|l| l.len() >= 4), "the beat's lanes reach the class table: {lanes:?}");
+        // An older agent (or a downgrade): no key, so no stale lanes.
+        carry_lanes(&mut data, &json!({"running_backends": golden["running_backends"]}));
+        assert!(data.get("lanes").is_none(), "{data}");
+        assert_eq!(node_facts_from_kv("n1", &data, &[], 0.0).lanes, None, "falls back to running_backends");
+        // `[]` is kept: an agent with no lanes routes nothing.
+        carry_lanes(&mut data, &json!({"lanes": []}));
+        assert_eq!(node_facts_from_kv("n1", &data, &[], 0.0).lanes.map(|l| l.len()), Some(0));
+        carry_lanes(&mut data, &json!({"lanes": "garbage"}));
+        assert!(data.get("lanes").is_none(), "a non-list is absent");
+        // The handler runs this step before its KV write.
+        let code = crate::test_src::own_code(include_str!("cluster.rs"));
+        let beat = crate::test_src::fn_body(&code, "async fn node_heartbeat(");
+        let carry = beat.find("carry_lanes(&mut data, &body);").expect("the heartbeat stores lanes");
+        let put = beat.find("kv.put(&node_id").expect("the heartbeat's KV write");
+        assert!(carry < put, "stored before the record is written");
+    }
+}
+
+/// A database read's error is not "absent" on the enrolment paths (i460):
+/// each is run against a pool that cannot connect.
+#[cfg(test)]
+mod db_read_error_tests {
+    use crate::routes::AppError;
+
+    fn dead_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool")
+    }
+
+    /// An approved proposal whose host cannot be read stays `approved` and
+    /// says why; it used to return `approved` silently, as if there were no
+    /// row.
+    #[tokio::test]
+    async fn an_unreadable_proposal_host_is_reported_not_swallowed() {
+        let r = super::resolve_enrolment_proposal_in(&dead_pool(), "00000000-0000-0000-0000-000000000000").await;
+        assert_eq!(r.status, "approved");
+        let p = r.problem.expect("the read's error is the reported problem");
+        assert!(p.contains("host could not be read"), "{p}");
+    }
+
+    /// An unreadable node registry fails discover; it used to read as "no
+    /// node is enrolled", so every enrolled node was offered as a new host.
+    #[tokio::test]
+    async fn an_unreadable_registry_fails_discover() {
+        match super::enrolled_index(&dead_pool()).await {
+            Err(AppError::Unavailable(m)) => assert!(m.contains("cannot read the enrolled nodes"), "{m}"),
+            other => panic!("expected a 503 naming the read, got {other:?}"),
+        }
     }
 }

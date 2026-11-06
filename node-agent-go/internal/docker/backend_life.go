@@ -108,6 +108,11 @@ func (c *Client) BackendContainersBeside(ctx context.Context, adopted map[string
 		}
 		res, err := c.docker.ContainerInspect(ctx, ctr.ID, client.ContainerInspectOptions{})
 		if err != nil {
+			// The container exists but could not be inspected: say so, so the
+			// lanes read "no health report" instead of a backend that is
+			// absent (or one nobody checked). No started_at: a guessed one
+			// would widen the warm-up window.
+			out[key] = map[string]any{"health": "unknown"}
 			continue
 		}
 		if life := containerLife(res.Container.State); life != nil {

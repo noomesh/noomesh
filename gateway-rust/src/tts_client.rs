@@ -852,7 +852,7 @@ mod tests {
     #[test]
     fn every_tts_dial_goes_through_the_door() {
         let src = include_str!("tts_client.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let prod = crate::test_src::own_code(src);
         assert!(!prod.contains("tls::cluster_client()"), "a direct cluster_client() dial bypasses TTS_DOOR");
         assert_eq!(prod.matches("TTS_DOOR.client(").count(), 3, "synthesize + list_voices + probe");
     }

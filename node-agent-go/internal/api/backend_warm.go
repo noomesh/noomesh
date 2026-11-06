@@ -253,7 +253,10 @@ func (w *backendWarmer) request(ctx context.Context, t warmTarget) error {
 // inferenceTarget (the door the running containers declare) and
 // inferenceTransport (the node leaf for https, the bridge dialer otherwise).
 func (s *Server) warmDial(ctx context.Context, backend string) (warmTarget, error) {
-	running, native := s.runningAndNative(ctx)
+	running, native, err := s.runningAndNative(ctx)
+	if err != nil {
+		return warmTarget{}, err
+	}
 	model, up := running[backend]
 	if !up {
 		return warmTarget{}, fmt.Errorf("backend %s is not running", backend)

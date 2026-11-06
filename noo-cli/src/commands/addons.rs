@@ -641,6 +641,11 @@ pub fn addons_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     } else {
         None
     };
+    // Who may use each feature (f99): only the gateway knows, and only for an
+    // add-on it has loaded, so an add-on that is off is not asked about.
+    let access: Option<Result<serde_json::Value, String>> = (resolve(declared, default_on) && refused.is_none()).then(|| {
+        crate::http::get_json_try(g, &format!("/api/addons/{}/access", super::urlencode(key)), true, 15)
+    });
 
     if g.json {
         println!(
@@ -664,6 +669,11 @@ pub fn addons_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 "bundle": has_bundle.then(|| bundle_dir.display().to_string()),
                 "declarations": decl_json(&decls),
                 "password_env": decls.as_ref().ok().and_then(|d| d.system.as_ref()).map(|_| json!([pw, ddl])),
+                "access": match &access {
+                    None => serde_json::Value::Null,
+                    Some(Ok(body)) => body.clone(),
+                    Some(Err(e)) => json!({"error": e}),
+                },
             })
         );
         return Ok(if decls.is_ok() { 0 } else { 1 });
@@ -761,6 +771,14 @@ pub fn addons_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             0
         }
     };
+    match &access {
+        None => {}
+        Some(Ok(body)) => print!("{}", crate::commands::addon_access::render_show_features(key, body)),
+        Some(Err(e)) => {
+            println!("{}", ui::section("features"));
+            println!("{}", ui::status_line(ui::Glyph::Warn, &format!("who may use each feature: not read from the gateway ({e})")));
+        }
+    }
     println!();
     if refused.is_some() {
         ui::guide(&[
@@ -815,10 +833,13 @@ pub(crate) fn enable_gate(
 
 fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
     let (mut name, mut force, mut lock, mut provision_only) = (None, false, None, false);
+    let (mut accept_suggested, mut no_grants) = (false, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--force" if on => force = true,
+            "--accept-suggested" if on => accept_suggested = true,
+            "--no-grants" if on => no_grants = true,
             "--provision-only" if on => provision_only = true,
             "--lock" if on => match it.next() {
                 Some(v) if !v.starts_with('-') => lock = Some(v.clone()),
@@ -870,6 +891,30 @@ fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
             "--provision-only verifies the signed lock and bundle; --force skips that, so the two cannot be combined",
             Some(&format!("noo addons enable {name} --lock <path|https-url> --provision-only")),
         );
+    }
+    // Suggested access (f99 3.2) is asked against the gateway's live feature
+    // list, which exists only once the gateway has loaded the add-on. Asked
+    // for up front and not loaded: refuse before anything changes, rather than
+    // enable and quietly grant nothing.
+    use crate::commands::addon_access::{self as access, Consent};
+    if accept_suggested && no_grants {
+        fail(g.json, ExitCode::Usage, "conflicting_flags", "--accept-suggested and --no-grants contradict each other: give one", None);
+    }
+    if provision_only && (accept_suggested || no_grants) {
+        fail(g.json, ExitCode::Usage, "provision_only_grants",
+            "--provision-only declares nothing ON, so there is no access to grant yet", Some(&format!("noo addons enable {name} --provision-only")));
+    }
+    let consent = if accept_suggested { Consent::Yes } else if no_grants { Consent::No } else { Consent::Ask };
+    if accept_suggested {
+        if let Err(e) = crate::http::get_json_try(g, &format!("/api/addons/{}/access", super::urlencode(name)), true, 15) {
+            fail(
+                g.json,
+                ExitCode::Generic,
+                "addon_not_loaded",
+                &format!("--accept-suggested needs the gateway to have {name} loaded already, and it has not ({e}); nothing was changed"),
+                Some(&format!("noo addons enable {name} && noo stack restart --force && noo addons accept-suggestions {name} --yes")),
+            );
+        }
     }
     let features = granted_features();
     let unlicensed = if on {
@@ -946,6 +991,11 @@ fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
     // never a refusal: a failed download is reported with its retry line.
     let voice_staged = (on && name == "voice").then(|| crate::commands::voice_models::stage_configured(!g.json));
 
+    // The question, now that the switch is on: answered only if the gateway
+    // already has the add-on loaded (a re-enable of a running add-on);
+    // otherwise it says when to ask.
+    let suggestions = on.then(|| access::run_suggestions(g, name, consent));
+
     if g.json {
         println!(
             "{}",
@@ -955,6 +1005,11 @@ fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
                 "licensed_feature": r.licensed, "granted": unlicensed.is_none(),
                 "restart_required": true,
                 "enable": enabled_report.as_ref().map(|e| crate::commands::addon_enable::report_json(name, e)),
+                "suggestions": match &suggestions {
+                    None => serde_json::Value::Null,
+                    Some(Ok(s)) => s.json(),
+                    Some(Err(e)) => json!({"asked": false, "why": e, "then": access::accept_command(name)}),
+                },
                 "voice_models": voice_staged.as_ref().map(|v| v.iter().map(|r| match r {
                     Ok(s) => s.json(),
                     Err((id, e)) => json!({"id": id, "error": e, "retry": format!("noo models pull {id}")}),
@@ -980,6 +1035,18 @@ fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
             Ok(_) => ui::done(&crate::commands::voice_models::line(r)),
             Err(_) => ui::warned(&crate::commands::voice_models::line(r)),
         }
+    }
+    match &suggestions {
+        Some(Ok(s)) => {
+            for (glyph, line) in s.lines(name) {
+                println!("{}", ui::status_line(glyph, &line));
+            }
+        }
+        Some(Err(e)) => {
+            let why = if e.contains("not registered") { "not loaded yet" } else { e.as_str() };
+            println!("{}", ui::status_line(ui::Glyph::Bullet, &access::not_loaded_line(name, why)));
+        }
+        None => {}
     }
     if let Some(f) = unlicensed {
         ui::warned(&format!(

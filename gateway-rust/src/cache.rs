@@ -619,6 +619,26 @@ impl RedisCache {
         self.client.del::<i64, _>(key).await.unwrap_or(0) > 0
     }
 
+    /// [`Self::del_key`] that says when Redis failed, rather than reading an
+    /// error as "nothing to delete".
+    pub async fn del_key_checked(&self, key: &str) -> Result<(), String> {
+        self.client.del::<i64, _>(key).await.map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// [`Self::srem`] that says when Redis failed.
+    pub async fn srem_checked(&self, key: &str, member: &str) -> Result<(), String> {
+        self.client.srem::<i64, _, _>(key, member).await.map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// A client whose server never answers (a closed loopback port): every
+    /// command fails fast, the shape of Redis down mid-run. Tests only.
+    #[cfg(test)]
+    pub(crate) fn dead_for_tests() -> Self {
+        let cache = Self::build("redis://127.0.0.1:1").expect("a loopback Redis URL builds");
+        let _connection_task = cache.client.connect();
+        cache
+    }
+
     /// Atomically increment a counter, returning the new value (or 0 on error).
     /// Used by autonomy_evaluators::bump_counter for "condition held N ticks" semantics.
     pub async fn incr(&self, key: &str) -> i64 {
@@ -651,6 +671,13 @@ impl RedisCache {
     /// already existed or on error. Used by operator_alert for per-condition
     /// alert cooldowns shared across gateway restarts.
     pub async fn set_nx_ex(&self, key: &str, value: &str, ttl_secs: i64) -> bool {
+        self.set_nx_ex_checked(key, value, ttl_secs).await.unwrap_or(false)
+    }
+
+    /// [`set_nx_ex`], telling "the key already exists" (`Ok(false)`) from
+    /// "Redis failed" (`Err`). A caller that must not read an outage as
+    /// "someone else holds it" (an alert cooldown) uses this one.
+    pub async fn set_nx_ex_checked(&self, key: &str, value: &str, ttl_secs: i64) -> Result<bool, String> {
         self.client
             .set::<fred::types::Value, _, _>(
                 key,
@@ -661,7 +688,7 @@ impl RedisCache {
             )
             .await
             .map(|v| !v.is_null())
-            .unwrap_or(false)
+            .map_err(|e| e.to_string())
     }
 
     /// SET key 1 NX EX <ttl>, telling "already there" apart from "Redis

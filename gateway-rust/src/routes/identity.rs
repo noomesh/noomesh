@@ -743,9 +743,8 @@ mod tests {
     /// `may_manage` call stays inside the Account arm.
     #[test]
     fn the_two_subject_kinds_keep_separate_entitlement_rules() {
-        let src = include_str!("identity.rs");
-        let body = src.split("async fn token(").nth(1).expect("the handler must exist");
-        let head = &body[..body.find("\n}").expect("the handler must have a body")];
+        let own = crate::test_src::own_code(include_str!("identity.rs"));
+        let head = crate::test_src::fn_body(&own, "async fn token(");
         assert!(
             head.contains("SubjectKind::Account => account_subject("),
             "the account kind is entitled by account_subject + may_manage"
@@ -766,12 +765,8 @@ mod tests {
     /// still pass — which is what the first attempt did.
     #[test]
     fn the_handler_validates_the_subject() {
-        let src = include_str!("identity.rs");
-        let body = src
-            .split("async fn token(")
-            .nth(1)
-            .expect("the exchange handler must exist");
-        let head = &body[..body.find("\n}").expect("the handler must have a body")];
+        let own = crate::test_src::own_code(include_str!("identity.rs"));
+        let head = crate::test_src::fn_body(&own, "async fn token(");
         assert!(
             head.contains("account_subject("),
             "the exchange must validate its subject; an unchecked compound name mints a token \
@@ -854,12 +849,8 @@ mod tests {
     /// lives in this module and a refactor over there would not know it.
     #[test]
     fn a_delegated_token_cannot_mint_a_standing_key() {
-        let src = include_str!("users.rs");
-        let guard = src
-            .split("fn self_requester(")
-            .nth(1)
-            .expect("users::self_requester must exist — it is the self-service key gate");
-        let body = &guard[..guard.find("\n}").expect("self_requester must have a body")];
+        let own = crate::test_src::own_code(include_str!("users.rs"));
+        let body = crate::test_src::fn_body(&own, "fn self_requester(");
         assert!(
             body.contains("r.act.is_some()"),
             "self_requester must refuse a delegated token; without it an exchanged \
@@ -932,12 +923,8 @@ mod tests {
         // off. Pinned as source rather than executed: `identity_enabled`
         // reads process-wide config, and a test that mutated it would race
         // every other test in the binary.
-        let src = include_str!("identity.rs");
-        let body = src
-            .split("async fn metadata(")
-            .nth(1)
-            .expect("the metadata handler must exist");
-        let head = &body[..body.find("\n}").expect("metadata must have a body")];
+        let own = crate::test_src::own_code(include_str!("identity.rs"));
+        let head = crate::test_src::fn_body(&own, "async fn metadata(");
         assert!(
             head.contains("identity_enabled()") && head.contains("NOT_FOUND"),
             "discovery must 404 when the add-on is off, not describe a door that is not there"

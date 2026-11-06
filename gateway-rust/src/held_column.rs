@@ -14,8 +14,14 @@
 //! One `information_schema` lookup. A positive answer is cached for good (a
 //! column does not go away). A negative one is re-checked at most every
 //! [`RECHECK`], so the filters switch on after trellion migrates, with no
-//! gateway restart. A failed lookup counts as "absent" and is not cached as
-//! a positive: the plain form is always safe.
+//! gateway restart.
+//!
+//! A FAILED lookup is not "absent". The plain form drops the `held_at IS
+//! NULL` filter, so treating an error as absent returned every document an
+//! operator had put on hold (and the graph scoped through it) for a minute.
+//! An error answers "present" for that one call, uncached and logged: the
+//! reads keep the filter, and if the column really is missing they fail
+//! loudly instead of showing held documents.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -68,18 +74,34 @@ const LOOKUP: &str = "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
      WHERE table_name = 'docs' AND column_name = 'held_at' \
        AND table_schema = ANY (current_schemas(false)))";
 
-/// Whether `docs.held_at` exists. Never errors: a failed lookup is "absent".
+/// Whether `docs.held_at` exists. Never errors: a failed lookup answers
+/// "present" (keep the hold filter), uncached, and is logged.
 pub async fn present(db: &sqlx::PgPool) -> bool {
     let now = Instant::now();
     let decision = STATE.lock().map(|s| s.decide(now)).unwrap_or(Decision::Check);
     if let Decision::Known(v) = decision {
         return v;
     }
-    let found = sqlx::query_scalar::<_, bool>(LOOKUP).fetch_one(db).await.unwrap_or(false);
-    if let Ok(mut s) = STATE.lock() {
-        s.record(found, now);
+    let looked = sqlx::query_scalar::<_, bool>(LOOKUP).fetch_one(db).await;
+    if let Err(e) = &looked {
+        tracing::warn!(error = %e, "held_column_lookup_failed: keeping the document-hold filter");
     }
-    found
+    let (answer, record) = outcome(looked.as_ref().ok().copied());
+    if let Some(found) = record {
+        if let Ok(mut s) = STATE.lock() {
+            s.record(found, now);
+        }
+    }
+    answer
+}
+
+/// A lookup's answer, and what to record of it: `None` is a failed lookup,
+/// answered "present" (the filter stays) and recorded as nothing.
+fn outcome(looked: Option<bool>) -> (bool, Option<bool>) {
+    match looked {
+        Some(found) => (found, Some(found)),
+        None => (true, None),
+    }
 }
 
 /// The "not held" predicate for a `docs` row aliased `alias`: the real filter
@@ -121,6 +143,13 @@ mod tests {
         // ... and it flips on once trellion has migrated
         s.record(true, t0 + RECHECK);
         assert_eq!(s.decide(t0 + RECHECK), Decision::Known(true));
+    }
+
+    #[test]
+    fn a_lookup_the_database_cannot_answer_keeps_the_hold_filter_and_is_not_cached() {
+        assert_eq!(outcome(None), (true, None), "a failed lookup must keep the filter, uncached");
+        assert_eq!(outcome(Some(false)), (false, Some(false)));
+        assert_eq!(outcome(Some(true)), (true, Some(true)));
     }
 
     #[test]

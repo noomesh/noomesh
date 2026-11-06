@@ -23,7 +23,8 @@
 //!
 //! Absence of a report is not a negative. A node that is not `online`/`busy`,
 //! that sent no `running_backends` object (an older agent, or no heartbeat
-//! yet), or whose harness has no `host_services` entry says nothing about
+//! yet), or whose harness has no `host_services` entry (or reports its state
+//! as `unknown`, a probe that could not answer) says nothing about
 //! whether the placement runs, so its clock is cleared rather than started.
 //! Offline nodes have their own alerts; this one is for a node that is up,
 //! talking, and not doing what it was told.
@@ -59,7 +60,9 @@ fn reported_running(node: &Value, backend: &str) -> Option<bool> {
         return None;
     }
     if let Some(st) = node["host_services"][backend]["state"].as_str() {
-        return if st.is_empty() { None } else { Some(st == "running") };
+        // `unknown` is the agent saying its probe could not answer (#747):
+        // not a report that the service is stopped, so it is not judged.
+        return if st.is_empty() || st == "unknown" { None } else { Some(st == "running") };
     }
     // The harness is a host service: no entry means the agent has not
     // reported it, not that it is stopped.
@@ -256,6 +259,23 @@ mod tests {
         let up = vec![json!({"id": "a", "status": "online", "running_backends": {},
             "host_services": {"harness": {"state": "running"}}})];
         assert!(not_running(&[w("a", "harness")], &up).is_empty());
+    }
+
+    /// An agent whose probe cannot answer reports `unknown` (#747). That is
+    /// no verdict: the placement is neither missing nor running, and a
+    /// clock already started for it is cleared, not kept.
+    #[test]
+    fn an_unknown_harness_state_is_not_judged_stuck() {
+        let node = |st: &str| json!({"id": "a", "status": "online", "running_backends": {},
+            "host_services": {"harness": {"state": st}}});
+        assert_eq!(reported_running(&node("unknown"), "harness"), None);
+        assert!(not_running(&[w("a", "harness")], &[node("unknown")]).is_empty());
+        assert_eq!(reported_running(&node("stopped"), "harness"), Some(false), "stopped is still judged");
+        let m = Missing { node: "a".into(), backend: "harness".into() };
+        let mut c = Clock::default();
+        assert!(c.observe(1000, &not_running(&[w("a", "harness")], &[node("stopped")]), 900).is_empty());
+        assert!(c.observe(2000, &not_running(&[w("a", "harness")], &[node("unknown")]), 900).is_empty());
+        assert!(!c.since.contains_key(&m), "an unknown round clears the clock");
     }
 
     #[test]

@@ -57,6 +57,23 @@ pub(crate) struct GpuModeArgs {
     pub immediate: bool,
     pub wait: Option<u64>,
     pub no_wait: bool,
+    /// `user --for`: seconds until the node hands the GPU back to the
+    /// automatic policy. None = indefinite.
+    pub for_secs: Option<u64>,
+}
+
+/// The shortest and longest `--for`; the gateway and the agent hold the same.
+const FOR_MIN_SECS: i64 = 60;
+const FOR_MAX_SECS: i64 = 7 * 86_400;
+
+/// `30m`, `2h`, `1d`, `90s` or bare seconds, 1 minute to 7 days.
+pub(crate) fn parse_for(raw: &str) -> Result<u64, ArgError> {
+    let secs = if raw.trim().len() > 9 { None } else { super::cluster_provision::parse_ttl_seconds(raw) };
+    match secs {
+        Some(n) if (FOR_MIN_SECS..=FOR_MAX_SECS).contains(&n) => Ok(n as u64),
+        Some(_) => Err(ArgError::new(format!("--for {raw} is outside 1m to 7d"))),
+        None => Err(ArgError::new(format!("--for needs a duration like 30m, 2h or 1d, not `{raw}`"))),
+    }
 }
 
 pub(crate) fn parse_gpu_mode(args: &[String]) -> Result<GpuModeArgs, ArgError> {
@@ -68,6 +85,7 @@ pub(crate) fn parse_gpu_mode_with(a: &mut Args) -> Result<GpuModeArgs, ArgError>
     let immediate = a.flag(&["--immediate"]);
     let wait = a.number::<u64>(&["--wait"])?;
     let no_wait = a.flag(&["--no-wait"]);
+    let for_secs = a.value(&["--for"])?.map(|v| parse_for(&v)).transpose()?;
     let mut p = a.positionals()?;
     if p.len() > 2 {
         return Err(ArgError::new(format!("unexpected argument `{}`", p[2])));
@@ -85,6 +103,12 @@ pub(crate) fn parse_gpu_mode_with(a: &mut Args) -> Result<GpuModeArgs, ArgError>
         return Err(ArgError::new("--wait and --no-wait cannot be used together"));
     }
     match mode {
+        None if for_secs.is_some() => {
+            return Err(ArgError::new("--for changes a mode; name one: user (mesh has no timer)"));
+        }
+        Some(Want::Mesh) if for_secs.is_some() => {
+            return Err(ArgError::new("--for belongs to user: mesh ends the hold, it has no timer"));
+        }
         None if timeout.is_some() || immediate || wait.is_some() || no_wait => {
             return Err(ArgError::new("the flags change a mode; name one: user or mesh"));
         }
@@ -96,7 +120,7 @@ pub(crate) fn parse_gpu_mode_with(a: &mut Args) -> Result<GpuModeArgs, ArgError>
         }
         _ => {}
     }
-    Ok(GpuModeArgs { node, mode, timeout, immediate, wait, no_wait })
+    Ok(GpuModeArgs { node, mode, timeout, immediate, wait, no_wait, for_secs })
 }
 
 // ── the mode, read from the lease ────────────────────────────────────────
@@ -162,6 +186,20 @@ pub(crate) fn lease_age(gc: &Value, now: i64) -> Option<i64> {
     let since = gc["lease"]["since"].as_str().or_else(|| gc["since"].as_str())?;
     let t = super::cluster_verify::parse_rfc3339_unix(since)?;
     Some(now - t).filter(|age| *age >= 0)
+}
+
+/// `until 17:40 UTC (in 80 min)` for a lease with an expiry (the date
+/// too when it is a day or more away); None for an indefinite one.
+pub(crate) fn until_text(gc: &Value, now: i64) -> Option<String> {
+    let at = super::cluster_verify::parse_rfc3339_unix(gc["lease"]["expires_at"].as_str()?)?;
+    let left = at - now;
+    if left <= 0 {
+        return Some("until now (expired; the node hands the GPU back on its next tick)".into());
+    }
+    let when = crate::addon_lock::utc_minute(at);
+    // `YYYY-MM-DD ` is 11 bytes; a hold ending within a day shows the time only.
+    let when = if left < 86_400 { when[11..].to_string() } else { when };
+    Some(format!("until {when} (in {})", age_text(left)))
 }
 
 fn gb(mb: f64) -> String {
@@ -240,6 +278,8 @@ enum Plan {
     /// The mode is mesh but vLLM is not warm yet: only wait for it.
     WaitWarm,
     Hold,
+    /// `user --for` on a node already in user mode: move the expiry.
+    Extend { operation: String },
     Release { operation: String, generation: u64 },
     Refuse(Refusal),
 }
@@ -452,6 +492,9 @@ impl Outcome {
         });
         if lease.is_object() {
             out["lease"] = json!({"operation_id": lease["operation_id"], "generation": lease["generation"], "since": lease["since"]});
+            if let Some(e) = lease["expires_at"].as_str() {
+                out["lease"]["expires_at"] = json!(e);
+            }
         }
         if let Some(c) = self.free_confirmed {
             out["gpu_free_confirmed"] = json!(c);
@@ -526,6 +569,19 @@ pub(crate) fn run(gw: &mut impl Gateway, a: &GpuModeArgs, want: Want) -> Result<
             rec = next;
         }
     };
+    let plan = match plan {
+        Plan::Already(_) if want == Want::User && a.for_secs.is_some() => {
+            match rec["gpu_contention"]["lease"]["operation_id"].as_str().filter(|o| !o.is_empty()) {
+                Some(o) => Plan::Extend { operation: o.to_string() },
+                None => Plan::Refuse(refuse(
+                    "gpu_hold_refused",
+                    format!("{node}: the node's lease carries no operation id to extend"),
+                    Some(format!("noo cluster verify {node}")),
+                )),
+            }
+        }
+        p => p,
+    };
     let mut out = Outcome::new(node, mode_of_record(&rec), rec.clone());
     let mut steps = Vec::new();
     match plan {
@@ -555,7 +611,7 @@ pub(crate) fn run(gw: &mut impl Gateway, a: &GpuModeArgs, want: Want) -> Result<
             } else {
                 gw.say(&format!("{node}: draining its GPU backends (nothing new routed there; up to {timeout} s for what runs to finish)"));
             }
-            let body = json!({
+            let mut body = json!({
                 "reason": "user",
                 "purpose": "user",
                 "operation_id": super::cluster_gpu::new_operation_id(),
@@ -563,8 +619,16 @@ pub(crate) fn run(gw: &mut impl Gateway, a: &GpuModeArgs, want: Want) -> Result<
                 "timeout_secs": timeout,
                 "force": false,
             });
+            if let Some(f) = a.for_secs {
+                body["for_secs"] = json!(f);
+            }
             let resp = gw.hold(node, &body).map_err(|(s, t)| gateway_refusal(node, "hold", s, &t))?;
             steps.push(format!("hold (purpose user, {how}) accepted"));
+            if a.for_secs.is_some() && resp["gpu_contention"]["lease"]["expires_at"].as_str().is_none() {
+                let w = "the node's agent did not report an expiry (an agent older than --for); the hold is indefinite";
+                out.warning = Some(w.to_string());
+                gw.say(&format!("{node}: {w}"));
+            }
             let held_at = gw.now();
             // The hold's own answer carries the last probe, up to 15 s old,
             // and the next heartbeat up to 30 s later. Free is proven when
@@ -594,6 +658,25 @@ pub(crate) fn run(gw: &mut impl Gateway, a: &GpuModeArgs, want: Want) -> Result<
             out.free_confirmed = Some(confirmed);
             out.proof_secs = Some((gw.now() - held_at).max(0) as u64);
             out.record = cur;
+        }
+        Plan::Extend { operation } => {
+            let f = a.for_secs.unwrap_or(0);
+            gw.say(&format!("{node}: already mode user; moving the expiry to {} from now", age_text(f as i64)));
+            // The same operation asks again: the node moves the expiry and
+            // drains nothing.
+            let body = json!({"reason": "user", "purpose": "user", "operation_id": operation, "mode": "drain",
+                "timeout_secs": 120, "force": false, "for_secs": f});
+            let resp = gw.hold(node, &body).map_err(|(s, t)| gateway_refusal(node, "hold", s, &t))?;
+            steps.push("expiry moved (same operation, no new drain)".to_string());
+            out.record = json!({"id": node, "gpu_contention": resp["gpu_contention"].clone(), "backend_containers": rec["backend_containers"].clone()});
+            out.changed = true;
+            match until_text(&out.record["gpu_contention"], gw.now()) {
+                Some(t) => out.note = Some(format!("{node}: mode user, {t}")),
+                None => {
+                    let w = "the node's agent did not report an expiry (an agent older than --for); the hold is indefinite";
+                    out.warning = Some(w.to_string());
+                }
+            }
         }
         Plan::Release { operation, generation } => {
             let free = gb(rec["gpu_contention"]["free_mb"].as_f64().unwrap_or(0.0));
@@ -696,7 +779,7 @@ impl Gateway for Live<'_> {
     }
 }
 
-/// `noo cluster gpu mode <node> [user|mesh] [--timeout <secs>] [--immediate] [--wait <secs>] [--no-wait]`
+/// `noo cluster gpu mode <node> [user|mesh] [--timeout <secs>] [--immediate] [--for <time>] [--wait <secs>] [--no-wait]`
 pub fn cluster_gpu_mode(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let a = parse_gpu_mode(args)?;
     let mut gw = Live { g };
@@ -721,7 +804,8 @@ fn print_outcome(out: &Outcome, read_only: bool, now: i64) {
     let gc = &out.record["gpu_contention"];
     if read_only {
         let age = lease_age(gc, now).map(|s| format!(", held {}", age_text(s))).unwrap_or_default();
-        ui::done(&format!("{node}: mode {}{age}", out.mode.label()));
+        let until = until_text(gc, now).map(|t| format!(", {t}")).unwrap_or_default();
+        ui::done(&format!("{node}: mode {}{age}{until}", out.mode.label()));
         let v = vllm_of(&out.record);
         if out.mode == Mode::Mesh && v.reported {
             println!("{}", ui::muted(&format!("vllm {}", v.describe())));
@@ -741,6 +825,7 @@ fn print_outcome(out: &Outcome, read_only: bool, now: i64) {
         return;
     }
     match out.mode {
+        Mode::User if out.free_confirmed.is_none() => {} // an extend: the note said it
         Mode::User => {
             ui::done(&format!("{node}: mode user; {} paused, chat for the mesh goes to other nodes", super::cluster_gpu::paused_list(gc)));
             let free = gb(gc["free_mb"].as_f64().unwrap_or(0.0));
@@ -759,6 +844,9 @@ fn print_outcome(out: &Outcome, read_only: bool, now: i64) {
             let lease = &gc["lease"];
             if let (Some(op), Some(generation)) = (lease["operation_id"].as_str(), lease["generation"].as_u64()) {
                 println!("{}", ui::muted(&format!("lease: operation {op}, generation {generation}")));
+            }
+            if let Some(t) = until_text(gc, now) {
+                ui::done(&format!("{node}: handed back to the automatic policy {}", t.replacen("until", "at", 1)));
             }
             let mesh = format!("noo cluster gpu mode {node} mesh");
             ui::guide(&[(mesh.as_str(), "give the GPU back to vllm: checks it is free, releases, waits until vllm is warm")]);
@@ -790,7 +878,7 @@ mod tests {
     }
 
     fn args(node: &str, mode: Want) -> GpuModeArgs {
-        GpuModeArgs { node: node.into(), mode: Some(mode), timeout: None, immediate: false, wait: None, no_wait: false }
+        GpuModeArgs { node: node.into(), mode: Some(mode), timeout: None, immediate: false, wait: None, no_wait: false, for_secs: None }
     }
 
     /// A node record: `gc` is its gpu_contention, `vllm` its vllm container.
@@ -1208,13 +1296,96 @@ mod tests {
     }
 
     #[test]
+    fn for_parses_durations_and_refuses_the_rest() {
+        let of = |v: &[&str]| parse_gpu_mode(&a(v));
+        assert_eq!(of(&["awolf", "user", "--for", "30m"]).unwrap().for_secs, Some(1800));
+        assert_eq!(of(&["awolf", "user", "--for", "2h"]).unwrap().for_secs, Some(7200));
+        assert_eq!(of(&["awolf", "user", "--for", "1d"]).unwrap().for_secs, Some(86_400));
+        assert_eq!(of(&["awolf", "user", "--for", "90s"]).unwrap().for_secs, Some(90));
+        assert_eq!(of(&["awolf", "user"]).unwrap().for_secs, None, "no --for is indefinite");
+        for bad in ["10s", "8d", "0", "-5m", "soon", "2w", "99999999999999d"] {
+            assert!(of(&["awolf", "user", "--for", bad]).is_err(), "{bad}");
+        }
+        let mesh = of(&["awolf", "mesh", "--for", "1h"]).unwrap_err().to_string();
+        assert!(mesh.contains("mesh ends the hold"), "{mesh}");
+        let none = of(&["awolf", "--for", "1h"]).unwrap_err().to_string();
+        assert!(none.contains("name one"), "{none}");
+    }
+
+    #[test]
+    fn for_rides_the_hold_body_only_when_given() {
+        let drained = || {
+            let mut gc = user_gc(15000, 0);
+            gc["noomesh_mb"] = json!(0);
+            gc["lease"]["expires_at"] = json!("2026-11-01T11:30:00Z");
+            node(gc, stopped())
+        };
+        let mut f = Fake { node: node(free_gc(), warm()), on_hold: drained(), ..Default::default() };
+        let mut a = args("awolf", Want::User);
+        a.for_secs = Some(5400);
+        let out = run(&mut f, &a, Want::User).unwrap();
+        assert_eq!(f.bodies[0]["for_secs"], 5400);
+        assert_eq!(out.to_json()["lease"]["expires_at"], "2026-11-01T11:30:00Z");
+        assert!(out.warning.is_none());
+        // Without --for the body is the one it always was.
+        let mut f = Fake { node: node(free_gc(), warm()), on_hold: drained(), ..Default::default() };
+        run(&mut f, &args("awolf", Want::User), Want::User).unwrap();
+        assert!(f.bodies[0].get("for_secs").is_none(), "{}", f.bodies[0]);
+        // An agent that drops the field answers with no expiry: say so.
+        let mut plain = user_gc(15000, 0);
+        plain["noomesh_mb"] = json!(0);
+        let mut f = Fake { node: node(free_gc(), warm()), on_hold: node(plain, stopped()), ..Default::default() };
+        let mut a = args("awolf", Want::User);
+        a.for_secs = Some(5400);
+        let out = run(&mut f, &a, Want::User).unwrap();
+        assert!(out.warning.unwrap().contains("older than --for"));
+    }
+
+    #[test]
+    fn for_on_a_user_node_extends_with_the_same_operation() {
+        let with_expiry = |e: &str| {
+            let mut gc = user_gc(15000, 0);
+            gc["lease"]["expires_at"] = json!(e);
+            node(gc, stopped())
+        };
+        let mut f = Fake { node: with_expiry("2026-11-01T11:00:00Z"), on_hold: with_expiry("2026-11-01T13:00:00Z"), ..Default::default() };
+        f.clock = super::super::cluster_verify::parse_rfc3339_unix("2026-11-01T10:00:00Z").unwrap();
+        let mut a = args("awolf", Want::User);
+        a.for_secs = Some(7200);
+        let out = run(&mut f, &a, Want::User).unwrap();
+        assert_eq!(f.calls, vec!["hold".to_string()], "one hold call, no release, no polling for free memory");
+        assert_eq!(f.bodies[0]["operation_id"], "op-7", "the lease's own operation");
+        assert_eq!(f.bodies[0]["for_secs"], 7200);
+        assert_eq!(f.bodies[0]["force"], false);
+        assert!(out.changed);
+        assert_eq!(out.note.as_deref(), Some("awolf: mode user, until 13:00 UTC (in 3 h 0 min)"));
+        // Without --for a repeat of `user` still changes nothing.
+        let mut f = Fake { node: with_expiry("2026-11-01T11:00:00Z"), ..Default::default() };
+        let out = run(&mut f, &args("awolf", Want::User), Want::User).unwrap();
+        assert!(!out.changed && f.calls.is_empty());
+    }
+
+    #[test]
+    fn show_says_until_when_for_a_timed_hold() {
+        let mut gc = user_gc(15000, 0);
+        let now = super::super::cluster_verify::parse_rfc3339_unix("2026-11-01T16:20:00Z").unwrap();
+        assert_eq!(until_text(&gc, now), None, "an indefinite hold has no until");
+        gc["lease"]["expires_at"] = json!("2026-11-01T17:40:00Z");
+        assert_eq!(until_text(&gc, now).as_deref(), Some("until 17:40 UTC (in 80 min)"));
+        gc["lease"]["expires_at"] = json!("2026-11-03T17:40:00Z");
+        assert_eq!(until_text(&gc, now).as_deref(), Some("until 2026-11-03 17:40 UTC (in 2 d)"));
+        gc["lease"]["expires_at"] = json!("2026-11-01T16:00:00Z");
+        assert!(until_text(&gc, now).unwrap().starts_with("until now"));
+    }
+
+    #[test]
     fn parses_the_arguments() {
         assert_eq!(parse_gpu_mode(&a(&["awolf"])),
-            Ok(GpuModeArgs { node: "awolf".into(), mode: None, timeout: None, immediate: false, wait: None, no_wait: false }));
+            Ok(GpuModeArgs { node: "awolf".into(), mode: None, timeout: None, immediate: false, wait: None, no_wait: false, for_secs: None }));
         assert_eq!(parse_gpu_mode(&a(&["awolf", "user", "--timeout", "300", "--immediate"])),
-            Ok(GpuModeArgs { node: "awolf".into(), mode: Some(Want::User), timeout: Some(300), immediate: true, wait: None, no_wait: false }));
+            Ok(GpuModeArgs { node: "awolf".into(), mode: Some(Want::User), timeout: Some(300), immediate: true, wait: None, no_wait: false, for_secs: None }));
         assert_eq!(parse_gpu_mode(&a(&["--wait", "120", "awolf", "mesh"])),
-            Ok(GpuModeArgs { node: "awolf".into(), mode: Some(Want::Mesh), timeout: None, immediate: false, wait: Some(120), no_wait: false }));
+            Ok(GpuModeArgs { node: "awolf".into(), mode: Some(Want::Mesh), timeout: None, immediate: false, wait: Some(120), no_wait: false, for_secs: None }));
         assert!(parse_gpu_mode(&a(&["awolf", "mesh", "--no-wait"])).unwrap().no_wait);
         assert!(parse_gpu_mode(&a(&[])).is_err());
         assert!(parse_gpu_mode(&a(&["awolf", "vr"])).unwrap_err().to_string().contains("unknown mode"));

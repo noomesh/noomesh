@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlenv"
 )
@@ -401,8 +402,20 @@ func (c *Config) HTTPTransport() (*http.Transport, error) {
 
 	return &http.Transport{
 		TLSClientConfig: tlsCfg,
+		// A bare &http.Transport{} keeps an idle connection forever, and
+		// several callers build one per request (the artifact manifest
+		// lookups, preseed.New), so each request left a connection open on
+		// both ends. On 2026-11-02 robopi's manifest retry loop held ~22 new
+		// ones an hour on the controller until its gateway hit EMFILE.
+		// DefaultTransport's values: idle connections go after 90 s.
+		IdleConnTimeout:     ControllerIdleConnTimeout,
+		TLSHandshakeTimeout: 10 * time.Second,
 	}, nil
 }
+
+// ControllerIdleConnTimeout is how long an outbound transport keeps an idle
+// connection for reuse (http.DefaultTransport's value).
+const ControllerIdleConnTimeout = 90 * time.Second
 
 // Scheme always returns "https". All PAI cluster communication uses TLS.
 // Plain HTTP is not supported — if TLS isn't configured, connections will

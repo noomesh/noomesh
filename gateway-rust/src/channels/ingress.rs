@@ -194,8 +194,8 @@ mod tests {
         assert!(RETIRED_ALLOWLIST_WARNING.contains("noo security user link <username> telegram"));
         assert!(RETIRED_ALLOWLIST_WARNING.contains("RETIRED"));
         // The per-sender hint is gone: admission never reads the variable.
-        let admit = include_str!("ingress.rs").split("pub async fn admit(").nth(1).unwrap();
-        let admit = admit.split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("ingress.rs"));
+        let admit = crate::test_src::fn_body(&own, "pub async fn admit(");
         assert!(admit.contains("resolve_user"), "parse missed admit()");
         assert!(!admit.contains(&["TELEGRAM_", "ALLOWED_USERS"].concat()));
     }

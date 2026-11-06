@@ -62,7 +62,10 @@ func (s *Server) chatTargets(ctx context.Context) []benchTarget {
 	if len(cps) == 0 {
 		return nil
 	}
-	running, native := s.runningAndNative(ctx)
+	running, native, err := s.runningAndNative(ctx)
+	if err != nil {
+		return nil
+	}
 	var out []benchTarget
 	for _, cp := range cps {
 		if t, err := s.chatTarget(ctx, cp, running, native); err == nil {

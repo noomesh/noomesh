@@ -55,6 +55,15 @@ type HostFacts struct {
 	// module is installed for it. Present only when an NVIDIA driver package
 	// is installed on this node.
 	NvidiaModule map[string]bool `json:"nvidia_module,omitempty"`
+	// NvidiaDriver is how the running kernel's NVIDIA module is installed:
+	// "dkms" (under updates/dkms, built by DKMS) or "prebuilt" (under
+	// kernel/nvidia-<ver>/, Ubuntu's linux-modules-nvidia-<ver>-<kernel>,
+	// which never installs dkms). Empty when neither is found. It decides
+	// the `gpu driver` remedy: `dkms autoinstall` answers "command not
+	// found" on a prebuilt box (followup 476).
+	NvidiaDriver string `json:"nvidia_driver,omitempty"`
+	// NvidiaDriverVersion is <ver> of a prebuilt kernel/nvidia-<ver>/.
+	NvidiaDriverVersion string `json:"nvidia_driver_version,omitempty"`
 	// Platform maps each installed platform package to its version; Held is
 	// the subset `apt-mark showhold` lists. The set is the one the host
 	// updates runbook holds (PlatformPackagePattern).
@@ -163,6 +172,7 @@ func CollectHostFacts(ctx context.Context, root string, r Runner) *HostFacts {
 				f.NvidiaModule[k] = nvidiaModuleFor(root, k)
 			}
 		}
+		f.NvidiaDriver, f.NvidiaDriverVersion = nvidiaDriverLayout(root, f.RunningKernel)
 	}
 	if v := strings.TrimSpace(readFile(root, "proc/sys/net/ipv4/ip_nonlocal_bind")); v != "" {
 		b := v == "1"
@@ -270,6 +280,29 @@ func nvidiaModuleFor(root, k string) bool {
 		}
 	}
 	return false
+}
+
+// prebuiltNvidiaDir is Ubuntu's versioned prebuilt module directory.
+var prebuiltNvidiaDir = regexp.MustCompile(`^nvidia-([0-9]+)$`)
+
+// nvidiaDriverLayout says how kernel k's NVIDIA module is installed (see
+// HostFacts.NvidiaDriver): DKMS's updates/dkms first, then a prebuilt
+// kernel/nvidia-<ver>/ with its <ver>.
+func nvidiaDriverLayout(root, k string) (string, string) {
+	if k == "" {
+		return "", ""
+	}
+	base := filepath.Join(root, "lib/modules", k)
+	if m, _ := filepath.Glob(filepath.Join(base, "updates/dkms", "nvidia.ko*")); len(m) > 0 {
+		return "dkms", ""
+	}
+	m, _ := filepath.Glob(filepath.Join(base, "kernel/nvidia-*", "nvidia.ko*"))
+	for _, p := range m {
+		if v := prebuiltNvidiaDir.FindStringSubmatch(filepath.Base(filepath.Dir(p))); v != nil {
+			return "prebuilt", v[1]
+		}
+	}
+	return "", ""
 }
 
 func hasNvidiaDriver(platform map[string]string) bool {

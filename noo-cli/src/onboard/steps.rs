@@ -274,14 +274,20 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
     }
 
     ctx.progress("Detecting GPU...");
+    let mut gpu_busy = false;
     match util::detect_gpu() {
-        Some((model, vram)) => {
+        util::GpuDetect::Found(model, vram) => {
             ctx.state.gpu_model = model.clone();
             ctx.state.vram_gb = vram;
             ctx.state.tier = util::tier_for_vram(vram);
             ctx.success(&format!("GPU: {model} ({vram:.0} GB) — Tier {}", ctx.state.tier));
         }
-        None => {
+        util::GpuDetect::Busy => {
+            gpu_busy = true;
+            ctx.state.tier = util::tier_when_busy(ctx.state.tier);
+            ctx.warn(&util::gpu_busy_line(ctx.state.tier));
+        }
+        util::GpuDetect::None => {
             ctx.state.tier = 3;
             ctx.warn("GPU: none detected — CPU-only (Tier 3)");
         }
@@ -294,7 +300,10 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
     // GPU-less runtime check downstream reads as "no GPU". Same recipe as
     // the node-side prep-host.sh, offered with the same consent posture as
     // the other installers.
-    let have_driver = Command::new("nvidia-smi").output().map(|o| o.status.success()).unwrap_or(false);
+    // A busy answer above already said the driver is there: no second wait.
+    let have_driver = gpu_busy
+        || crate::host_exec::classify_gpu(&crate::host_exec::nvidia_smi_within(crate::host_exec::SMI_DEADLINE, &[]))
+            == crate::host_exec::GpuProbe::Present;
     let runtime_ready = Command::new("docker")
         .args(["info", "--format", "{{json .Runtimes}}"])
         .output().ok()
@@ -4058,7 +4067,10 @@ fn ensure_pg_data_path(ctx: &mut Ctx, chosen_root: &str, home: &str) {
 /// sudo, and works whoever runs the wizard. Only applied while the dir is
 /// EMPTY — an initialized cluster's ownership is never touched.
 pub(crate) fn ensure_pg_data_ownership(pg: &str) {
-    ensure_dir_ownership(pg, "70:70");
+    // A failed chown is reported by the storage step's owner check, which
+    // finds this empty directory with the wrong owner (a WARN with the
+    // `sudo chown` line), so the result is not needed here.
+    let _ = ensure_dir_ownership(pg, "70:70");
 }
 
 /// Chown an EMPTY service data dir to the uid its container runs as, via a
@@ -4068,14 +4080,20 @@ pub(crate) fn ensure_pg_data_ownership(pg: &str) {
 /// queries.active into a dir owned by whoever ran the wizard — the sandbox
 /// --dist rehearsal hit both. Never touches a non-empty dir: initialized
 /// data keeps whatever ownership it has.
-pub(crate) fn ensure_dir_ownership(dir: &str, owner: &str) {
+pub(crate) fn ensure_dir_ownership(dir: &str, owner: &str) -> Result<(), String> {
     let empty = std::fs::read_dir(dir).map(|mut d| d.next().is_none()).unwrap_or(false);
     if !empty {
-        return;
+        return Ok(());
     }
-    let _ = Command::new("docker")
+    match Command::new("docker")
         .args(["run", "--rm", "-v", &format!("{dir}:/d"), "alpine", "chown", owner, "/d"])
-        .output();
+        .output()
+    {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!("docker chown {owner} exited {}: {}", o.status,
+            String::from_utf8_lossy(&o.stderr).trim().lines().last().unwrap_or(""))),
+        Err(e) => Err(format!("docker chown {owner} could not run: {e}")),
+    }
 }
 
 /// Nonroot service uids per data subdir (observed on the live images:
@@ -4154,6 +4172,13 @@ fn storage_targets(ctx: &Ctx, root: &Path) -> Vec<(String, PathBuf)> {
 /// which creates a directory a NEW release added before its launcher's
 /// bind check runs (0.6.16: `tempo`, refused on every moved controller).
 pub(crate) fn storage_targets_in(names: &[String], root: &Path, state: &Path, pg_data: &str) -> Vec<(String, PathBuf)> {
+    let state_names: Vec<String> = STATE_SUBDIRS.iter().map(|s| s.to_string()).collect();
+    storage_targets_with(names, &state_names, root, state, pg_data)
+}
+
+/// [`storage_targets_in`] with the state set given (`noo upgrade --check`
+/// places a TARGET release's lists, read from its signed lock).
+pub(crate) fn storage_targets_with(names: &[String], state_names: &[String], root: &Path, state: &Path, pg_data: &str) -> Vec<(String, PathBuf)> {
     let trim = |p: &Path| p.to_string_lossy().trim_end_matches('/').to_string();
     let separated = trim(state) != trim(root);
     let pg = pg_data.trim_end_matches('/');
@@ -4164,32 +4189,153 @@ pub(crate) fn storage_targets_in(names: &[String], root: &Path, state: &Path, pg
         if name == "postgres" && pg_off(root) {
             continue;
         }
-        if separated && STATE_SUBDIRS.contains(&name.as_str()) {
+        if separated && state_names.contains(name) {
             continue;
         }
         out.push((name.clone(), root.join(name)));
     }
     if separated {
-        for name in STATE_SUBDIRS {
-            if *name == "postgres" && pg_off(state) {
+        for name in state_names {
+            if name == "postgres" && pg_off(state) {
                 continue;
             }
-            out.push((name.to_string(), state.join(name)));
+            out.push((name.clone(), state.join(name)));
         }
     }
     out
 }
 
-/// Create one storage directory as the caller, then hand it to its service
-/// uid ([`subdir_owner`], while it is still empty). Onboarding's storage step
-/// and the stack roll both create through here, so a directory a release
-/// adds gets the same owner either way.
-pub(crate) fn create_storage_dir(name: &str, target: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(target)?;
-    if let Some(owner) = subdir_owner(name) {
-        ensure_dir_ownership(&target.to_string_lossy(), owner);
+/// A storage directory's owner as `(uid, gid)`.
+pub(crate) type Owner = (u32, u32);
+
+fn parse_owner(s: &str) -> Option<Owner> {
+    let (u, g) = s.split_once(':')?;
+    Some((u.parse().ok()?, g.parse().ok()?))
+}
+
+/// The data or state root a storage directory `name` (e.g. `models/voice/piper`)
+/// sits under: `target` with `name`'s segments taken off.
+pub(crate) fn storage_base(name: &str, target: &Path) -> PathBuf {
+    let mut b = target.to_path_buf();
+    for _ in name.split('/') {
+        b.pop();
     }
-    Ok(())
+    b
+}
+
+/// Who should own storage directory `name` under `base`: its service uid
+/// ([`subdir_owner`]) when it has one, else whoever owns the root it sits
+/// under, read BEFORE anything is created. A root the operator owns gives
+/// the operator; a root owned by the node agent (pop-os: 993:982, as its
+/// `models`) gives the node agent. Onboarding's storage step, its sudo path
+/// and the stack roll (`noo upgrade`, including a lock-only directory) all
+/// ask here, so no two places decide differently.
+pub(crate) fn intended_owner(name: &str, base: &Path) -> std::io::Result<Owner> {
+    if let Some(o) = subdir_owner(name).and_then(parse_owner) {
+        return Ok(o);
+    }
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(base)?;
+    Ok((m.uid(), m.gid()))
+}
+
+/// The owner check after a create, and over an existing EMPTY directory:
+/// `None` when `dir` is owned by `want`, else what is wrong and the exact
+/// command that fixes it.
+pub(crate) fn owner_mismatch(dir: &Path, want: Owner) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let got = match std::fs::metadata(dir) {
+        Ok(m) => (m.uid(), m.gid()),
+        Err(e) => return Some(format!("{} cannot be read ({e})", dir.display())),
+    };
+    (got != want).then(|| format!("{} is owned by {}:{}, wants {}:{} — sudo chown {}:{} {}",
+        dir.display(), got.0, got.1, want.0, want.1, want.0, want.1, dir.display()))
+}
+
+/// Why a storage directory was not made as it should be.
+#[derive(Debug)]
+pub(crate) enum StorageDirError {
+    /// It could not be created (as this user).
+    Create(std::io::Error),
+    /// It exists, with the wrong owner: the message names both and the chown.
+    Owner(String),
+}
+
+impl std::fmt::Display for StorageDirError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StorageDirError::Create(e) => write!(f, "{e}"),
+            StorageDirError::Owner(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+/// Create one storage directory as the caller and give it its intended
+/// owner ([`intended_owner`]): a service uid through a throwaway container
+/// while it is still empty, or the root's owner. It counts as made only when
+/// it carries that owner; otherwise `Owner` says what it has and the chown.
+/// Missing parents (`models/voice` for `models/voice/piper`) take the root's
+/// owner; an existing parent is never touched.
+pub(crate) fn create_storage_dir(name: &str, target: &Path) -> Result<(), StorageDirError> {
+    let base = storage_base(name, target);
+    let want = intended_owner(name, &base).map_err(StorageDirError::Create)?;
+    let root_owner = intended_owner("", &base).map_err(StorageDirError::Create)?;
+    let made = missing_components(&base, name);
+    std::fs::create_dir_all(target).map_err(StorageDirError::Create)?;
+    let mut problems: Vec<String> = Vec::new();
+    for dir in &made {
+        let w = if dir == target { want } else { root_owner };
+        if owner_mismatch(dir, w).is_none() {
+            continue;
+        }
+        let fixed = if dir == target && subdir_owner(name).is_some() {
+            ensure_dir_ownership(&dir.to_string_lossy(), &format!("{}:{}", w.0, w.1))
+        } else {
+            std::os::unix::fs::chown(dir, Some(w.0), Some(w.1)).map_err(|e| e.to_string())
+        };
+        if let Some(m) = owner_mismatch(dir, w) {
+            problems.push(match fixed {
+                Err(e) => format!("{m} ({e})"),
+                Ok(()) => m,
+            });
+        }
+    }
+    if problems.is_empty() { Ok(()) } else { Err(StorageDirError::Owner(problems.join("; "))) }
+}
+
+/// The components of `base`/`name` that do not exist yet, outermost first:
+/// for `models/voice/piper` with `models` present, `models/voice` and
+/// `models/voice/piper`. Never an existing directory.
+pub(crate) fn missing_components(base: &Path, name: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut cur = base.to_path_buf();
+    for seg in name.split('/') {
+        cur.push(seg);
+        if !cur.exists() {
+            out.push(cur.clone());
+        }
+    }
+    out
+}
+
+/// The sudo fallback for one storage directory, as `install -d` argument
+/// lists: one per MISSING component (GNU `install -d -o -g -m` re-owns and
+/// re-modes a directory that already exists, so an existing parent such as
+/// pop-os's 993:982 `models` must never be passed), each with its owner: the
+/// leaf its [`intended_owner`], a parent the root's owner.
+pub(crate) fn sudo_install_plan(name: &str, target: &Path) -> std::io::Result<Vec<Vec<String>>> {
+    let base = storage_base(name, target);
+    Ok(sudo_install_plan_with(name, target, intended_owner(name, &base)?, intended_owner("", &base)?))
+}
+
+/// [`sudo_install_plan`] with the owners given (the leaf's, the root's).
+pub(crate) fn sudo_install_plan_with(name: &str, target: &Path, want: Owner, root_owner: Owner) -> Vec<Vec<String>> {
+    let base = storage_base(name, target);
+    missing_components(&base, name).into_iter().map(|dir| {
+        let o = if dir == target { want } else { root_owner };
+        vec!["install".into(), "-d".into(), "-o".into(), o.0.to_string(), "-g".into(), o.1.to_string(),
+             "-m".into(), "0755".into(), dir.to_string_lossy().into_owned()]
+    }).collect()
 }
 
 /// Returns how many subdirectories could not be created.
@@ -4211,13 +4357,26 @@ fn ensure_root_dir(ctx: &mut Ctx, root: &Path) {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|s| !s.is_empty())
     };
-    let (Some(uid), Some(gid)) = (id("-u"), id("-g")) else { return };
+    let (Some(uid), Some(gid)) = invoking_user(id("-u"), id("-g"),
+        std::env::var("SUDO_UID").ok(), std::env::var("SUDO_GID").ok()) else { return };
     let ok = ctx_sudo(ctx).args(["install", "-d", "-o", &uid, "-g", &gid, "-m", "0755"]).arg(root)
         .status().map(|s| s.success()).unwrap_or(false);
     if !ok {
         ctx.warn(&format!("could not create {} (sudo install -d failed); create it owned by you and re-run", root.display()));
         sudo_refused(ctx, "data root", &format!("sudo install -d -o {uid} -g {gid} -m 0755 {}", root.display()));
     }
+}
+
+/// The user a NEW data root is created for: this process's `id -u`/`id -g`,
+/// except when the CLI itself runs under sudo (uid 0 with SUDO_UID and
+/// SUDO_GID set), where it is the person who ran sudo, never 0:0.
+pub(crate) fn invoking_user(uid: Option<String>, gid: Option<String>, sudo_uid: Option<String>, sudo_gid: Option<String>)
+    -> (Option<String>, Option<String>) {
+    let numeric = |s: &Option<String>| s.as_deref().is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()));
+    if uid.as_deref() == Some("0") && numeric(&sudo_uid) && numeric(&sudo_gid) {
+        return (sudo_uid, sudo_gid);
+    }
+    (uid, gid)
 }
 
 /// True once a hard failure about storage is on the verdict. Storage is one
@@ -4244,10 +4403,20 @@ fn record_storage_summary_failure(ctx: &mut Ctx, failed: usize, chosen_root: &st
 }
 
 fn create_storage_dirs(ctx: &mut Ctx, root: &Path) -> usize {
-    let (mut created, mut existing, mut failed) = (0, 0, 0);
+    let (mut created, mut existing, mut wrong, mut failed) = (0, 0, 0, 0);
+    let mut owner_lines: Vec<String> = Vec::new();
     for (name, target) in &storage_targets(ctx, root) {
         if target.exists() {
             existing += 1;
+            // An EMPTY directory with the wrong owner is said, with the
+            // chown, never changed; a non-empty one keeps its owner.
+            let empty = std::fs::read_dir(target).map(|mut d| d.next().is_none()).unwrap_or(false);
+            if empty && !ctx.dry_run {
+                if let Some(m) = intended_owner(name, &storage_base(name, target)).ok().and_then(|w| owner_mismatch(target, w)) {
+                    wrong += 1;
+                    ctx.warn(&m);
+                }
+            }
             continue;
         }
         if ctx.dry_run {
@@ -4255,35 +4424,62 @@ fn create_storage_dirs(ctx: &mut Ctx, root: &Path) -> usize {
             continue;
         }
         match create_storage_dir(name, target) {
-            Ok(()) => {
-                created += 1;
+            Ok(()) => created += 1,
+            Err(StorageDirError::Owner(m)) => {
+                wrong += 1;
+                owner_lines.push(m);
             }
-            Err(_) => {
-                // retry with sudo — `-n` unless a person can answer (i267)
-                let ok = ctx_sudo(ctx)
-                    .args(["mkdir", "-p"])
-                    .arg(target)
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                if ok {
-                    created += 1;
-                } else {
-                    failed += 1;
+            Err(StorageDirError::Create(_)) => {
+                // Retry with sudo (`-n` unless a person can answer, i267):
+                // `install -d` with the intended owner, one call per MISSING
+                // component, each re-checked right before it runs.
+                let plan = match sudo_install_plan(name, target) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        failed += 1;
+                        continue;
+                    }
+                };
+                let mut ok = true;
+                for args in &plan {
+                    let dir = Path::new(args.last().map(String::as_str).unwrap_or(""));
+                    if dir.exists() {
+                        continue;
+                    }
+                    ok &= ctx_sudo(ctx).args(args).status().map(|s| s.success()).unwrap_or(false);
+                }
+                let want = intended_owner(name, &storage_base(name, target)).ok();
+                match (ok && target.is_dir(), want.and_then(|w| owner_mismatch(target, w))) {
+                    (true, None) => created += 1,
+                    (true, Some(m)) => {
+                        wrong += 1;
+                        owner_lines.push(m);
+                    }
+                    (false, _) => failed += 1,
                 }
             }
         }
     }
-    let detail = format!("{created} created, {existing} already exist, {failed} failed");
-    if failed > 0 {
+    let detail = format!("{created} created, {existing} already exist, {wrong} wrong owner, {failed} failed");
+    for m in &owner_lines {
+        ctx.warn(m);
+    }
+    if failed > 0 || !owner_lines.is_empty() {
         ctx.warn(&format!("Storage directories ({detail}) under {}", root.display()));
-        if !storage_failure_recorded(ctx) {
+        if failed > 0 && !storage_failure_recorded(ctx) {
             sudo_refused(ctx, &format!("storage ({failed} director(ies) under {})", root.display()), &format!("sudo mkdir -p {}/<each missing directory>, then: noo onboard --only storage", root.display()));
         }
+        if !owner_lines.is_empty() && !storage_failure_recorded(ctx) {
+            ctx.state.hard_failures.push(format!(
+                "storage: {} director{} under {} created with the wrong owner (the chown for each is printed above)",
+                owner_lines.len(), if owner_lines.len() == 1 { "y" } else { "ies" }, root.display()));
+        }
+    } else if wrong > 0 {
+        ctx.warn(&format!("Storage directories ({detail}) under {}", root.display()));
     } else {
         ctx.success(&format!("Storage directories ({detail}) under {}", root.display()));
     }
-    failed
+    failed + owner_lines.len()
 }
 
 fn verify_bind_mount(ctx: &mut Ctx, root: &str) {
@@ -4726,6 +4922,131 @@ fn pin_dist_stack_lock(ctx: &mut Ctx) -> bool {
     }
 }
 
+/// Store roles WITH passwords: the bash half reads the secret store, the
+/// password reaches psql on stdin (never argv, which `ps` shows), and the
+/// script prints one `<status> <role>` line per role, never a value.
+const STORE_ROLES_SH: &str = r#"set -u; cd "$1"
+if ! { source scripts/lib-secrets.sh && load_secrets; } >/dev/null 2>&1; then echo "store unloaded"; fi
+ensure() {
+  role="$1"; pw="${2:-}"
+  ex=$(docker exec noo-postgres psql -X -U noo -d postgres -tAc "select 1 from pg_roles where rolname='$role'" 2>/dev/null) || { echo "failed $role"; return; }
+  if [ "$ex" = "1" ]; then echo "exists $role"; return; fi
+  if [ -z "$pw" ]; then echo "nopassword $role"; return; fi
+  esc=$(printf %s "$pw" | sed "s/'/''/g")
+  if printf "CREATE ROLE %s LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS PASSWORD '%s';\n" "$role" "$esc" \
+       | docker exec -i noo-postgres psql -q -X -v ON_ERROR_STOP=1 -U noo -d postgres >/dev/null 2>&1; then
+    echo "created $role"
+  else
+    echo "failed $role"
+  fi
+}
+ensure noo_app "${NOO_APP_DB_PASSWORD:-}"
+ensure noo_trellion "${NOO_TRELLION_DB_PASSWORD:-}"
+ensure noo_trellion_ddl "${NOO_TRELLION_DDL_PASSWORD:-}"
+ensure noo_evolve "${NOO_EVOLVE_DB_PASSWORD:-}"
+ensure noo_evolve_ddl "${NOO_EVOLVE_DDL_PASSWORD:-}"
+"#;
+
+/// The archive restore (i45), each step ON_ERROR_STOP, first error named:
+/// (1) the roles the secret store holds passwords for; (2) the archive's
+/// roles file (or, for an archive without one, the known roles NOLOGIN);
+/// (3) the dump; (4) the live tables per schema must equal the manifest's.
+/// The marker is written only after (4). A role the stack logs in as that
+/// came back without a password is an error after the restore: the stack
+/// would start and fail authentication with nothing pointing at why.
+/// Returns the roles that must log in but came back without a password.
+fn restore_archive_db(ctx: &Ctx, dump: &Path, marker: &Path) -> Result<Vec<String>, String> {
+    use crate::commands::migrate_db as mdb;
+    const PG: &str = "noo-postgres";
+
+    ctx.progress("Creating the database roles the secret store holds passwords for...");
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(STORE_ROLES_SH)
+        .arg("noo-store-roles")
+        .arg(&ctx.repo_root)
+        .output()
+        .map_err(|e| format!("role step: {e}"))?;
+    let report = String::from_utf8_lossy(&out.stdout).to_string();
+    if report.lines().any(|l| l == "store unloaded") {
+        ctx.warn("The secret store did not load: no role gets its password from it on this run");
+    }
+    let mut status: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for l in report.lines() {
+        if let Some((st, role)) = l.split_once(' ') {
+            status.insert(role.to_string(), st.to_string());
+        }
+    }
+    let failed: Vec<&String> = status.iter().filter(|(_, st)| st.as_str() == "failed").map(|(r, _)| r).collect();
+    if !failed.is_empty() {
+        return Err(format!("could not create role(s) {failed:?} from the secret store"));
+    }
+
+    let before = mdb::noo_roles(PG)?;
+    let roles_file = dump.with_file_name("pgroles.sql");
+    let (script, from_file) = match std::fs::read_to_string(&roles_file) {
+        Ok(s) => (s, true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            ctx.warn("This archive has no roles file (exported before roles were carried): creating the known noo_* roles NOLOGIN");
+            (mdb::fallback_roles_script(), false)
+        }
+        Err(e) => return Err(format!("{}: {e}", roles_file.display())),
+    };
+    ctx.progress(if from_file { "Applying the archive's roles..." } else { "Pre-creating the known roles..." });
+    mdb::psql(PG, "noomesh", &mut script.as_bytes(), false).map_err(|e| format!("roles: {e}"))?;
+    let after = mdb::noo_roles(PG)?;
+    let created: std::collections::BTreeSet<String> = after.difference(&before).cloned().collect();
+
+    ctx.progress("Restoring the archive database...");
+    let gz = std::fs::File::open(dump).map_err(|e| format!("{}: {e}", dump.display()))?;
+    mdb::psql(PG, "noomesh", &mut flate2::read::GzDecoder::new(gz), false).map_err(|e| format!("dump: {e}"))?;
+
+    let archive_root = dump.parent().and_then(Path::parent);
+    let manifest: Option<serde_json::Value> = archive_root
+        .and_then(|d| std::fs::read_to_string(d.join("manifest.json")).ok())
+        .and_then(|t| serde_json::from_str(&t).ok());
+    let expected = manifest.as_ref().and_then(mdb::manifest_tables);
+    let live = mdb::live_tables(PG)?;
+    let summary = mdb::table_check(expected.as_ref(), &live)?;
+    let _ = std::fs::write(marker, "restored\n");
+    ctx.success(&format!("Archive database restored: {summary}"));
+
+    // Which roles must log in: the roles file says; for an older archive,
+    // the roles this install logs in as per the archive's own noomesh.yaml.
+    let login = if from_file {
+        mdb::login_roles(&script)
+    } else {
+        let carried = match archive_root.map(|d| d.join("home/noomesh.yaml")) {
+            Some(p) => match std::fs::read_to_string(&p) {
+                Ok(t) => Ok(Some(t)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(format!("{}: {e}", p.display())),
+            },
+            None => Ok(None),
+        };
+        let evolve_on = match carried.and_then(|t| mdb::declared_on(t.as_deref(), "evolve")) {
+            Ok(on) => on,
+            Err(e) => {
+                ctx.warn(&format!("Could not read the archive's add-on declaration: {e}; evolve roles not checked"));
+                false
+            }
+        };
+        mdb::fallback_login_roles(evolve_on)
+    };
+    let no_password = mdb::roles_without_password(&created, &login);
+    let rest: Vec<String> = created.iter().filter(|r| !no_password.contains(*r)).cloned().collect();
+    if !rest.is_empty() {
+        // Created without a password but not logged in as by this stack
+        // (NOLOGIN in the roles file, or the evolve pair without the add-on).
+        ctx.warn(&format!(
+            "Role(s) {} came back without a password; if you enable what uses them, run `noo security secrets resync --all`",
+            rest.join(", ")
+        ));
+    }
+    Ok(no_password)
+}
+
+
 // ── Step 5: Services ─────────────────────────────────────────────────────
 
 pub fn services(ctx: &mut Ctx) {
@@ -4769,44 +5090,23 @@ pub fn services(ctx: &mut Ctx) {
                 ctx.error("postgres did not come up — cannot restore the archive database");
                 return;
             }
-            ctx.progress("Ensuring cluster-global roles from the secret store...");
-            let roles = format!(
-                r#"set -e; cd '{home}'
-source scripts/lib-secrets.sh >/dev/null 2>&1 && load_secrets >/dev/null 2>&1 || true
-ensure() {{
-  role="$1"; pw="$2"; [ -z "$pw" ] && return 0
-  ex=$(docker exec noo-postgres psql -U noo -d postgres -tAc "select 1 from pg_roles where rolname='$role'" || true)
-  if [ "$ex" != "1" ]; then
-    esc=$(printf %s "$pw" | sed "s/'/''/g")
-    docker exec noo-postgres psql -q -U noo -d postgres -c "CREATE ROLE $role LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS PASSWORD '$esc'" >/dev/null
-  fi
-}}
-ensure noo_app "${{NOO_APP_DB_PASSWORD:-}}"
-ensure noo_trellion "${{NOO_TRELLION_DB_PASSWORD:-}}"
-ensure noo_trellion_ddl "${{NOO_TRELLION_DDL_PASSWORD:-}}"
-ensure noo_evolve "${{NOO_EVOLVE_DB_PASSWORD:-}}"
-ensure noo_evolve_ddl "${{NOO_EVOLVE_DDL_PASSWORD:-}}"
-"#,
-                home = ctx.repo_root.display(),
-            );
-            let _ = Command::new("bash").arg("-c").arg(&roles).status();
-            ctx.progress("Restoring the archive database...");
-            let restored = Command::new("bash")
-                .arg("-c")
-                .arg(format!(
-                    "set -o pipefail; gunzip -c '{}' | docker exec -i noo-postgres psql -q -U noo -d noomesh",
-                    dump.display()
-                ))
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if restored {
-                let _ = std::fs::write(&marker, "restored
-");
-                ctx.success("Archive database restored — the stack boots onto the carried world.");
-            } else {
-                ctx.error("Database restore FAILED — fix and re-run (the wizard resumes; the archive is untouched)");
-                return;
+            match restore_archive_db(ctx, &dump, &marker) {
+                Err(e) => {
+                    ctx.error(&format!(
+                        "Database restore FAILED: {e}. Fix it and re-run (the wizard resumes; the archive is untouched)"
+                    ));
+                    return;
+                }
+                Ok(no_password) if !no_password.is_empty() => {
+                    ctx.error(&format!(
+                        "The database is restored, but role(s) {} came back without a password and the stack \
+                         logs in as them: it would start and fail authentication. Run `noo security secrets resync --all`, \
+                         then `noo onboard --only services`",
+                        no_password.join(", ")
+                    ));
+                    return;
+                }
+                Ok(_) => {}
             }
         }
     }
@@ -6113,12 +6413,17 @@ pub fn first_model(ctx: &mut Ctx) {
     // detected and the recommendations said "Tier 0" (2026-09-01). The
     // detection is one nvidia-smi call — just run it when state is empty.
     if ctx.state.tier == 0 {
-        if let Some((gpu, vram)) = util::detect_gpu() {
-            ctx.state.gpu_model = gpu;
-            ctx.state.vram_gb = vram;
-            ctx.state.tier = util::tier_for_vram(vram);
-        } else {
-            ctx.state.tier = 3; // CPU-only, never 0
+        match util::detect_gpu() {
+            util::GpuDetect::Found(gpu, vram) => {
+                ctx.state.gpu_model = gpu;
+                ctx.state.vram_gb = vram;
+                ctx.state.tier = util::tier_for_vram(vram);
+            }
+            util::GpuDetect::Busy => {
+                ctx.state.tier = util::tier_when_busy(ctx.state.tier);
+                ctx.warn(&util::gpu_busy_line(ctx.state.tier));
+            }
+            util::GpuDetect::None => ctx.state.tier = 3, // CPU-only, never 0
         }
     }
     let has_anthropic = !ctx.read_env("ANTHROPIC_API_KEY").is_empty();
@@ -7554,16 +7859,14 @@ mod plaintext_credential_tests {
     /// fails here.)
     #[test]
     fn the_store_is_armed_before_any_secret_and_never_falls_back_to_plaintext() {
-        let src = include_str!("steps.rs");
-        let body = &src[src.find("pub fn secrets_setup(").expect("secrets_setup")..];
-        let body = &body[..body.find("\n}\n").expect("end of secrets_setup")];
+        let src = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&src, "pub fn secrets_setup(");
         let arm = body.find("if !arm_secret_store(ctx)").expect("secrets_setup arms the store");
         for mint in ["SECRETS {", "ctx.update_env(\"NOO_ADMIN_PASSWORD\"", "NOO_BACKUP_PASSPHRASE", "NOO_APP_DB_PASSWORD"] {
             let at = body.find(mint).unwrap_or_else(|| panic!("{mint} not in secrets_setup"));
             assert!(arm < at, "the store must be armed before `{mint}`");
         }
-        let arm_fn = &src[src.find("fn arm_secret_store(").expect("arm_secret_store")..];
-        let arm_fn = &arm_fn[..arm_fn.find("\n}\n").expect("end")];
+        let arm_fn = crate::test_src::fn_body(&src, "fn arm_secret_store(");
         let plaintext_fallback = ["leaving", " plaintext .env"].concat();
         assert!(!arm_fn.contains(&plaintext_fallback), "a warn-and-continue fallback is back");
         assert!(!arm_fn.contains("ctx.warn(\"SOPS"), "a SOPS failure must refuse, not warn");
@@ -8160,9 +8463,8 @@ mod grafana_door_step_tests {
     /// The step above is only worth its test while the wizard runs it.
     #[test]
     fn the_pki_step_runs_the_grafana_door() {
-        let src = include_str!("steps.rs");
-        let body = src.split("pub fn pki_enrollment(ctx: &mut Ctx) {").nth(1).expect("pki_enrollment exists");
-        let body = body.split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn pki_enrollment(");
         assert!(body.contains("\n    grafana_door(ctx);"), "pki_enrollment must call grafana_door");
     }
 
@@ -8240,12 +8542,12 @@ mod zero_hmac_onboard_tests {
         let (seen2, stop2) = (seen.clone(), stop.clone());
         std::thread::spawn(move || {
             while !stop2.load(std::sync::atomic::Ordering::SeqCst) {
-                let Ok((mut s, _)) = listener.accept() else {
+                let Ok((tcp, _)) = listener.accept() else {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                     continue;
                 };
-                s.set_nonblocking(false).ok();
-                s.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+                tcp.set_nonblocking(false).ok();
+                let Some(mut s) = crate::test_tls::accept(tcp) else { continue };
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 4096];
                 loop {
@@ -8283,6 +8585,7 @@ mod zero_hmac_onboard_tests {
                     out.len()
                 );
                 let _ = s.write_all(resp.as_bytes());
+                crate::test_tls::close(&mut s);
             }
         });
         (port, seen, stop)
@@ -8306,6 +8609,9 @@ mod zero_hmac_onboard_tests {
     /// Run the gateway-facing tail of the wizard once; return what the fake
     /// gateway saw, the SQL the host path wrote, and the wizard's events.
     fn walk(non_interactive: bool, password_in_memory: bool, answers: &[&str], stored_login: bool) -> (Vec<Seen>, Vec<String>, Vec<String>) {
+        // The fake gateway serves TLS (there is no plain-http lane): trust its
+        // throwaway CA on this thread for the whole walk.
+        let _ca = crate::test_tls::trust();
         let _env = crate::commands::grafana_door::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "noo-zero-hmac-{}-{}-{}-{}",
@@ -8335,7 +8641,7 @@ mod zero_hmac_onboard_tests {
             std::env::remove_var(k);
         }
         let (port, seen, stop) = fake_gateway(full_listing());
-        let base = format!("http://127.0.0.1:{port}");
+        let base = format!("https://127.0.0.1:{port}");
         if stored_login {
             std::fs::create_dir_all(creds.parent().unwrap()).unwrap();
             std::fs::write(&creds, serde_json::json!({
@@ -8857,5 +9163,151 @@ mod sudo_seam_tests {
         assert!(script.contains("-w /home/nonroot/.ollama/convert noo-ollama-embed ollama create harrier"), "{script}");
         // Cleaned up after, and the verdict is ollama create's, not rm's.
         assert!(script.contains("rm -rf /home/nonroot/.ollama/convert >/dev/null 2>&1; exit $rc"), "{script}");
+    }
+}
+
+#[cfg(test)]
+mod storage_owner_tests {
+    use super::{create_storage_dir, intended_owner, invoking_user, missing_components, owner_mismatch,
+                storage_base, sudo_install_plan_with, StorageDirError};
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
+
+    fn base(tag: &str) -> PathBuf {
+        let b = std::env::temp_dir().join(format!("noo-owner-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&b);
+        std::fs::create_dir_all(&b).unwrap();
+        b
+    }
+
+    fn owner_of(p: &Path) -> (u32, u32) {
+        let m = std::fs::metadata(p).unwrap();
+        (m.uid(), m.gid())
+    }
+
+    /// GNU `install -d -o -g -m` re-owns an EXISTING directory, so the sudo
+    /// fallback names only what is missing: with `models` present, the
+    /// plan for models/voice/piper is models/voice and models/voice/piper.
+    #[test]
+    fn only_missing_components_are_installed() {
+        let b = base("missing");
+        std::fs::create_dir_all(b.join("models")).unwrap();
+        assert_eq!(missing_components(&b, "models/voice/piper"), vec![b.join("models/voice"), b.join("models/voice/piper")]);
+        assert_eq!(storage_base("models/voice/piper", &b.join("models/voice/piper")), b);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// pop-os 2026-11-05: root 993:982, models 993:982, the voice dirs
+    /// missing, tempo missing. The sudo path gives each its owner and never
+    /// touches `models`.
+    #[test]
+    fn the_pop_os_layout_gets_its_owners() {
+        let b = base("popos");
+        std::fs::create_dir_all(b.join("models")).unwrap();
+        let agent = (993, 982);
+        let plan = sudo_install_plan_with("models/voice/piper", &b.join("models/voice/piper"), agent, agent);
+        let args = |o: (u32, u32), dir: &Path| -> Vec<String> {
+            vec!["install".to_string(), "-d".to_string(), "-o".to_string(), o.0.to_string(), "-g".to_string(),
+                 o.1.to_string(), "-m".to_string(), "0755".to_string(), dir.to_string_lossy().into_owned()]
+        };
+        assert_eq!(plan, vec![args(agent, &b.join("models/voice")), args(agent, &b.join("models/voice/piper"))]);
+        let models = b.join("models").to_string_lossy().into_owned();
+        assert!(!plan.iter().any(|a| a.last() == Some(&models)), "models is never passed");
+        let tempo = sudo_install_plan_with("tempo", &b.join("tempo"), (65532, 65532), agent);
+        assert_eq!(tempo, vec![args((65532, 65532), &b.join("tempo"))]);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// A service dir wants its service uid; any other wants its root's owner.
+    #[test]
+    fn the_intended_owner_is_the_service_uid_else_the_roots_owner() {
+        let b = base("intended");
+        assert_eq!(intended_owner("tempo", &b).unwrap(), (65532, 65532));
+        assert_eq!(intended_owner("postgres", &b).unwrap(), (70, 70));
+        assert_eq!(intended_owner("models/voice/piper", &b).unwrap(), owner_of(&b));
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// The mismatch names the dir, both owners and the exact chown.
+    #[test]
+    fn a_wrong_owner_is_named_with_its_chown() {
+        let b = base("mismatch");
+        let me = owner_of(&b);
+        assert_eq!(owner_mismatch(&b, me), None);
+        let m = owner_mismatch(&b, (65532, 65532)).expect("a mismatch");
+        assert!(m.contains(&format!("is owned by {}:{}", me.0, me.1)) && m.contains("wants 65532:65532"), "{m}");
+        assert!(m.ends_with(&format!("sudo chown 65532:65532 {}", b.display())), "{m}");
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// "Created" only with the intended owner, or a failure that says so: a
+    /// service dir is either 65532-owned afterwards or refused with its chown
+    /// (the throwaway container is not there in every test environment).
+    #[test]
+    fn a_created_dir_has_its_owner_or_says_why_not() {
+        let b = base("create");
+        match create_storage_dir("tempo", &b.join("tempo")) {
+            Ok(()) => assert_eq!(owner_of(&b.join("tempo")), (65532, 65532), "created means owned by its service"),
+            Err(StorageDirError::Owner(m)) => assert!(m.contains("wants 65532:65532") && m.contains("sudo chown 65532:65532"), "{m}"),
+            Err(StorageDirError::Create(e)) => panic!("could not create in a temp dir: {e}"),
+        }
+        create_storage_dir("models/voice/piper", &b.join("models/voice/piper")).unwrap();
+        for d in ["models", "models/voice", "models/voice/piper"] {
+            assert_eq!(owner_of(&b.join(d)), owner_of(&b), "{d} takes its root's owner");
+        }
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// A NEW root is created for the person who ran the CLI: under sudo
+    /// that is SUDO_UID/SUDO_GID, never 0:0.
+    #[test]
+    fn a_new_root_belongs_to_the_invoking_user_never_root_under_sudo() {
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(invoking_user(s("0"), s("0"), s("1000"), s("1000")), (s("1000"), s("1000")));
+        assert_eq!(invoking_user(s("1000"), s("1000"), s("0"), s("0")), (s("1000"), s("1000")), "SUDO_* only matters as root");
+        assert_eq!(invoking_user(s("0"), s("0"), None, None), (s("0"), s("0")), "real root, no sudo");
+        assert_eq!(invoking_user(s("0"), s("0"), s("x"), s("1000")), (s("0"), s("0")), "a non-numeric SUDO_UID is not used");
+    }
+
+    /// The step reports a wrong owner as its own count, never "0 failed".
+    #[test]
+    fn the_summary_counts_wrong_owners() {
+        let code = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&code, "fn create_storage_dirs(");
+        assert!(body.contains("{created} created, {existing} already exist, {wrong} wrong owner, {failed} failed"), "{body}");
+        assert!(!body.contains(".args([\"mkdir\", \"-p\"])"), "no sudo mkdir -p (it makes root:root)");
+        assert!(body.contains("sudo_install_plan(name, target)"));
+    }
+}
+
+#[cfg(test)]
+mod archive_restore_tests {
+    use super::STORE_ROLES_SH;
+
+    /// i45: the role step used `psql -c "CREATE ROLE ... PASSWORD '...'"`,
+    /// which puts the password in argv, where any local user's `ps` reads it.
+    #[test]
+    fn a_role_password_never_reaches_argv() {
+        let mut lines = STORE_ROLES_SH.lines().skip_while(|l| !l.contains("CREATE ROLE"));
+        let create = lines.next().expect("the CREATE ROLE line");
+        assert!(create.trim_start().starts_with("if printf"), "the statement is printed into a pipe: {create}");
+        let pipe = lines.next().unwrap_or("");
+        assert!(pipe.contains("docker exec -i noo-postgres psql") && pipe.contains("ON_ERROR_STOP=1"), "{pipe}");
+        assert!(!STORE_ROLES_SH.contains("-c \"CREATE ROLE"), "a password in psql -c is visible to ps");
+        assert!(!STORE_ROLES_SH.contains("|| true"), "a failed store load is reported, not swallowed");
+    }
+
+    /// The restore reaches psql only through `migrate_db::psql` (stdin,
+    /// ON_ERROR_STOP=1, first ERROR line), and accepts the restore only after
+    /// the table count matches.
+    #[test]
+    fn the_restore_reaches_psql_only_through_the_stopping_helper() {
+        let code = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&code, "fn restore_archive_db(");
+        assert!(body.contains("mdb::psql(PG, \"noomesh\", &mut flate2::read::GzDecoder"), "the dump goes through mdb::psql");
+        assert!(!body.contains("gunzip") && !body.contains("\"psql\""), "a direct psql here would skip ON_ERROR_STOP");
+        let check = body.find("mdb::table_check(").expect("the table check");
+        let marker = body.find("std::fs::write(marker").expect("the marker write");
+        assert!(check < marker, "the marker is written only after the table check");
     }
 }

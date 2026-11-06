@@ -5,6 +5,7 @@ import { cn } from '@/lib/utils';
 import { dash } from '@/lib/num';
 import type { ClusterNode } from '@/features/cluster/types';
 import { gpuContentionLine } from '@/features/cluster/gpuContention';
+import { laneLines } from '@/features/cluster/lanes';
 
 const fmt = (n: number | undefined, digits = 1) => (n == null ? '—' : n.toFixed(digits));
 
@@ -26,6 +27,7 @@ export function NodeCard({ node }: { node: ClusterNode }) {
         ? `${node.ramTotal} GB`
         : '—';
   const gpuLine = gpuContentionLine(node.gpuContention);
+  const lanes = laneLines(node.lanes);
   const gpuPaused = node.gpuContention?.state === 'yielded' || node.gpuContention?.state === 'held';
 
   return (
@@ -57,6 +59,12 @@ export function NodeCard({ node }: { node: ClusterNode }) {
       </div>
 
       {gpuLine && <div className={cn('gpu-contention', gpuPaused && 'paused')}>{gpuLine}</div>}
+
+      {lanes.map((l) => (
+        <div key={l} className="lane-state" data-testid="lane-state">
+          {l}
+        </div>
+      ))}
 
       <div className="node-foot">
         <span className="backends">

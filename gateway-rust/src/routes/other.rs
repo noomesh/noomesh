@@ -314,7 +314,7 @@ async fn device_action(
 
     match req.timeout(std::time::Duration::from_secs(30)).send().await {
         Ok(resp) if resp.status().is_success() => {
-            let data = resp.json::<Value>().await.unwrap_or(json!({}));
+            let data = crate::upstream_body::json_2xx(resp, "the companion device").await.map_err(AppError::Upstream)?;
             Ok(Json(data))
         }
         Ok(resp) => {
@@ -358,18 +358,20 @@ async fn ollama_create_variant(
 
     match client
         .post(&url)
-        .json(&json!({"name": model, "modelfile": modelfile}))
+        .json(&json!({"name": model, "modelfile": modelfile, "stream": false}))
         .send()
         .await
     {
-        Ok(resp) if resp.status().is_success() => {
-            let data = resp.json::<Value>().await.unwrap_or(json!({"status": "success"}));
-            Json(json!({
+        // `stream: false`: one JSON object, not NDJSON progress lines. A 2xx
+        // that is not that object is an error, never an invented success.
+        Ok(resp) if resp.status().is_success() => match crate::upstream_body::json_2xx(resp, "Ollama").await {
+            Ok(data) => Json(json!({
                 "status": "created",
                 "model": model,
                 "response": data,
-            })).into_response()
-        }
+            })).into_response(),
+            Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
+        },
         Ok(resp) => {
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();

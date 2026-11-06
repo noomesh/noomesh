@@ -107,9 +107,26 @@ def test_the_route_attaches_the_requester():
     assert "attach_requester" in body
 
 
+def _rust_fn(src: str, sig: str) -> str:
+    """`sig`'s item, up to the next top-level item (rag.rs is rustfmt'd)."""
+    start = src.index(sig)
+    ends = [i for i in (src.find("\npub fn ", start + 1), src.find("\nfn ", start + 1),
+                        src.find("\npub(crate) fn ", start + 1)) if i != -1]
+    return src[start: min(ends) if ends else len(src)]
+
+
 def test_the_cli_refuses_to_retag_everything_by_omission():
+    # The flags are parsed in parse_retag / parse_retag_with since i191 D2
+    # pass 4 moved them out of the handler; each half is checked where it is.
     cli = (ROOT / "noo-cli/src/commands/rag.rs").read_text()
-    body = cli[cli.index("pub fn rag_retag") :]
-    body = body[: body.index("\n}\n")]
-    assert "refusing to retag everything by omission" in body
-    assert '"--apply" => apply = true' in body
+    refuse = _rust_fn(cli, "pub(crate) fn parse_retag(")
+    assert "if a.matcher.is_none() && a.doc_ids.is_empty()" in refuse
+    assert "return Ok(Err(RetagRefused::NoTarget));" in refuse
+    handler = _rust_fn(cli, "pub fn rag_retag")
+    assert "match parse_retag(args)?" in handler
+    no_target = handler[handler.index("Err(RetagRefused::NoTarget) =>"):]
+    assert "refusing to retag everything by omission" in no_target[: no_target.index("return Ok(2);")]
+    # A dry run unless asked: --apply is an opt-in switch, sent as it was parsed.
+    flags = _rust_fn(cli, "pub(crate) fn parse_retag_with(")
+    assert 'let apply = a.flag(&["--apply"]);' in flags
+    assert '"apply": apply,' in handler

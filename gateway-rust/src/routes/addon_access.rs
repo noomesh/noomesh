@@ -162,6 +162,42 @@ struct SetBody {
     value: String,
     #[serde(default)]
     reason: Option<String>,
+    /// `operator` (the default) or `accepted_suggestion` (`write_source`).
+    #[serde(default)]
+    source: Option<String>,
+}
+
+/// The `source` a write records. `operator`, the default, for any write.
+/// `accepted_suggestion` only for turning a feature ON for the role the
+/// add-on itself suggests it for (`user` or `operator`), so the audit column
+/// can never claim a suggestion the add-on did not make (f99 3.2; the client
+/// is not trusted for it). `migrated` is the migration's own and is refused
+/// here like any other value.
+fn write_source(requested: Option<&str>, feature: &str, suggested: &str, subject: &Subject, value: SetTo) -> Result<&'static str, String> {
+    match requested.map(str::trim).filter(|s| !s.is_empty()) {
+        None | Some("operator") => Ok("operator"),
+        Some("accepted_suggestion") => {
+            let role = match suggested {
+                "user" => Some(Role::User),
+                "operator" => Some(Role::Operator),
+                _ => None,
+            };
+            let Some(role) = role else {
+                return Err(format!(
+                    "source accepted_suggestion: the add-on suggests {feature:?} for {suggested:?}, so there is no suggestion to accept"
+                ));
+            };
+            if value == SetTo::On && *subject == Subject::Role(role) {
+                Ok("accepted_suggestion")
+            } else {
+                Err(format!(
+                    "source accepted_suggestion: the add-on suggests {feature:?} for {suggested}, so the only write it can record is \
+                     value on for role:{suggested}"
+                ))
+            }
+        }
+        Some(other) => Err(format!("source {other:?}: use operator (the default) or accepted_suggestion")),
+    }
 }
 
 async fn access_set(
@@ -185,6 +221,8 @@ async fn access_set(
     }
     let subject = Subject::parse(body.subject.trim()).map_err(AppError::BadRequest)?;
     let value = SetTo::parse(body.value.trim()).map_err(AppError::BadRequest)?;
+    let suggested = m.feature(feature).map(|f| f.suggested.as_str()).unwrap_or("none");
+    let source = write_source(body.source.as_deref(), feature, suggested, &subject, value).map_err(AppError::BadRequest)?;
     let covers_admin = match &subject {
         Subject::Role(r) => *r == Role::Admin,
         Subject::User(u) => {
@@ -224,7 +262,7 @@ async fn access_set(
             crate::repo::addon_access::clear(&state.db, &addon, feature, &subject_s).await.map_err(db_err)?;
         }
         SetTo::On | SetTo::Off => {
-            crate::repo::addon_access::set(&state.db, &addon, feature, &subject_s, value == SetTo::On, &by, "operator", reason)
+            crate::repo::addon_access::set(&state.db, &addon, feature, &subject_s, value == SetTo::On, &by, source, reason)
                 .await
                 .map_err(db_err)?;
         }
@@ -235,11 +273,12 @@ async fn access_set(
         &state.db,
         AuditEvent::new(AuditKind::AddonAccessSet, &by, &format!("addon:{addon}")).details(json!({
             "addon": addon, "feature": feature, "subject": subject_s, "from": before, "to": after, "reason": reason,
+            "source": source,
         })),
     )
     .await;
     tracing::info!(addon = %addon, feature, subject = %subject_s, from = before, to = after, by = %by, "addon_access_set");
-    Ok(Json(json!({"addon": addon, "feature": feature, "subject": subject_s, "from": before, "to": after})))
+    Ok(Json(json!({"addon": addon, "feature": feature, "subject": subject_s, "from": before, "to": after, "source": source})))
 }
 
 async fn person_view(
@@ -359,6 +398,42 @@ async fn super_admin_set(
 mod tests {
     use super::*;
 
+    #[test]
+    fn accepted_suggestion_is_recorded_only_for_the_role_the_addon_suggests() {
+        let user = Subject::parse("role:user").unwrap();
+        let op = Subject::parse("role:operator").unwrap();
+        // The default, and an explicit operator, on any write.
+        assert_eq!(write_source(None, "converse", "user", &op, SetTo::Off), Ok("operator"));
+        assert_eq!(write_source(Some("operator"), "converse", "user", &user, SetTo::On), Ok("operator"));
+        assert_eq!(write_source(Some(" "), "converse", "user", &user, SetTo::On), Ok("operator"));
+        // Exactly the suggestion, turned on.
+        assert_eq!(write_source(Some("accepted_suggestion"), "converse", "user", &user, SetTo::On), Ok("accepted_suggestion"));
+        assert_eq!(write_source(Some("accepted_suggestion"), "manage", "operator", &op, SetTo::On), Ok("accepted_suggestion"));
+        // Anything else is refused, and the refusal names the declared suggestion.
+        for (subject, value) in [(&op, SetTo::On), (&user, SetTo::Off), (&user, SetTo::Inherit)] {
+            let e = write_source(Some("accepted_suggestion"), "converse", "user", subject, value).unwrap_err();
+            assert!(e.contains("suggests \"converse\" for user") && e.contains("role:user"), "{e}");
+        }
+        let team = Subject::parse("team:studio").unwrap();
+        assert!(write_source(Some("accepted_suggestion"), "converse", "user", &team, SetTo::On).is_err());
+        for none in ["admin", "none", ""] {
+            let e = write_source(Some("accepted_suggestion"), "manage", none, &user, SetTo::On).unwrap_err();
+            assert!(e.contains("no suggestion to accept") && e.contains(&format!("{none:?}")), "{e}");
+        }
+        assert!(write_source(Some("migrated"), "converse", "user", &user, SetTo::On).unwrap_err().contains("use operator"));
+    }
+
+    #[test]
+    fn the_write_records_the_source_it_validated() {
+        let src = include_str!("addon_access.rs");
+        let body = src.split("async fn access_set(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        let validated = ["write_source(body.source", ".as_deref()"].concat();
+        assert!(body.contains(&validated), "access_set must validate the source");
+        assert!(body.contains("value == SetTo::On, &by, source, reason"), "the store writes the validated source");
+        let literal = ["&by, \"", "operator\", reason"].concat();
+        assert!(!body.contains(&literal), "no hard-coded source left in the write");
+    }
+
     fn manifest(v: Value) -> crate::addon_proxy::AddonManifest {
         serde_json::from_value(v).unwrap()
     }
@@ -404,7 +479,8 @@ mod tests {
     #[test]
     fn super_admin_changes_check_the_caller_before_writing() {
         let src = include_str!("addon_access.rs");
-        let body = src.split("async fn super_admin_set(").nth(1).unwrap().split("\n#[cfg(test)]").next().unwrap();
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "async fn super_admin_set(");
         let write = body.find("set_super_admin(").expect("the write");
         for guard in ["r.act.is_some() || r.harness.is_some()", "acts_as_super_admin(&by", "bcrypt::verify(", "is the last super admin", "flag_implicit_super_admins("] {
             let at = body.find(guard).unwrap_or_else(|| panic!("{guard}"));

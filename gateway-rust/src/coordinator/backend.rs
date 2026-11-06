@@ -609,7 +609,10 @@ struct Candidate {
     backend_type: String,
     model_name: String,
     url: String,
-    load: f64,
+    /// `None` = the node reported no load: sorts after every reported one.
+    load: Option<f64>,
+    /// [`super::classes::lane_rank_of`]: serving 0, on demand 1, unconfirmed 2.
+    lane_rank: u8,
     excluded: bool,
     /// The class table's health rule ([`super::classes::node_health`]):
     /// heartbeat fresh, reachable, not quarantined or offline, and the
@@ -856,11 +859,15 @@ fn apply_pin(all: &mut Vec<Candidate>, pin: &str) -> Result<(), String> {
 /// ordering is what failed live, and nothing asserted it.
 /// The KV-scan sort: healthy first (185b: a node that died idle used to
 /// win on its last, low load until the KV entry expired), then exact model
-/// match, preferred backend, lower load.
+/// match, the lane state (the class table's [`super::classes::lane_rank_of`]:
+/// without it a serving lane with an unreported load lost to an on-demand
+/// or unconfirmed peer here while raw chat picked it), preferred backend,
+/// lower load.
 fn order_candidates(candidates: &mut [Candidate], target_model: &str, preferred: &str) {
     candidates.sort_by_key(|c| {
         let exact = !target_model.is_empty() && c.model_name == target_model;
-        (!c.healthy, sort_key(exact, c.backend_type == preferred, c.load))
+        let (e, p, busy, load) = sort_key(exact, c.backend_type == preferred, c.load);
+        (!c.healthy, e, c.lane_rank, p, busy, load)
     });
 }
 
@@ -877,13 +884,14 @@ fn unhealthy_summary(candidates: &[Candidate]) -> String {
     out.join("; ")
 }
 
-fn sort_key(exact_model: bool, preferred_type: bool, load: f64) -> (i32, i32, i32, i64) {
+fn sort_key(exact_model: bool, preferred_type: bool, load: Option<f64>) -> (i32, i32, i32, i64) {
     (
         if exact_model { 0 } else { 1 },
         if preferred_type { 0 } else { 1 },
-        busy_rank(load),
+        // An unreported load ranks after a busy node, never as idle.
+        load.map(busy_rank).unwrap_or(2),
         // Integer for Ord; x100 because the scale is 0.0–1.0.
-        (load * 100.0) as i64,
+        super::classes::load_key(load),
     )
 }
 
@@ -1110,30 +1118,37 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
                             // pinned turn and raw chat agree on who is up.
                             let inbound = crate::node_reachability::read_inbound(state, &key).await;
                             crate::node_reachability::apply_inbound(&mut data, inbound.as_deref());
-                            let node_load = data.get("load")
+                            // `current_load` is the key node_heartbeat
+                            // stores; this read `load`, which nothing
+                            // writes, so busy_rank never saw a live load.
+                            // Absent = unknown (sorts last), never 0.0.
+                            let node_load = data.get("current_load")
                                 .and_then(|l| l.as_f64())
-                                .map(|l| scale_checked_load(&key, l))
-                                .unwrap_or(0.0);
+                                .map(|l| scale_checked_load(&key, l));
 
                             // 185a: backends that name no model are skipped
                             // below; say so (live node, chat role, not warming),
                             // by the class table's own facts.
-                            super::classes::note_unreported(&super::classes::node_facts_from_kv(&key, &data, &non_chat_pairs, now));
+                            let facts = super::classes::node_facts_from_kv(&key, &data, &non_chat_pairs, now);
+                            super::classes::note_unreported(&facts);
                             let paused = super::classes::paused_backends_of(&data);
-                            let backends = data.get("running_backends")
-                                .or_else(|| data.get("backends"))
-                                .and_then(|b| b.as_object());
-                            if let Some(backends) = backends {
-                                for (bt, model_val) in backends {
+                            // The class table's reading of the record (i403):
+                            // the routable chat lanes when the agent sends
+                            // `lanes`, else `running_backends` as before. A
+                            // loading or missing lane is not offered here
+                            // either.
+                            {
+                                for (bt, m) in &facts.running {
                                     if !inference_types.contains(&bt.as_str()) { continue; }
-                                    let m = model_val.as_str().unwrap_or("");
+                                    let m = m.as_str();
                                     if !m.is_empty() {
                                         let node_id = data.get("id")
                                             .and_then(|i| i.as_str())
                                             .unwrap_or(&key)
                                             .to_string();
-                                        // Declared for embed/rerank, not chat.
-                                        if non_chat.contains(&(node_id.clone(), bt.clone())) {
+                                        // Declared for embed/rerank, not chat: the
+                                        // lanes' roles, else the placement join.
+                                        if facts.non_chat.contains(bt) {
                                             // WARN, not debug: this is a routing
                                             // decision. At prod log level a
                                             // debug line is invisible, so a
@@ -1179,12 +1194,14 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
                                         // Failed on a previous attempt of this request.
                                         let excluded = is_excluded(exclude_urls, &url, ip);
                                         let (healthy, health) = super::classes::node_health(&key, &data, bt, now);
+                                        let lane_rank = super::classes::lane_rank_of(&facts, bt, m);
                                         candidates.push(Candidate {
                                             node_id,
                                             backend_type: bt.clone(),
                                             model_name: m.to_string(),
                                             url,
                                                                             load: node_load,
+                                            lane_rank,
                                             excluded,
                                             healthy,
                                             health,
@@ -1260,7 +1277,7 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
             model = %best.model_name,
             url = %resolved_url,
             gossip_url = %best.url,
-            load = best.load, candidates = candidates.len(),
+            load = ?best.load, candidates = candidates.len(),
             requested_model = ?requested_model,
             source = "nats_kv",
             "backend_resolved"
@@ -1488,7 +1505,8 @@ mod tests {
             backend_type: bt.into(),
             model_name: model.into(),
             url: format!("https://noo-{bt}:1"),
-            load: 0.0,
+            load: Some(0.0),
+            lane_rank: 0,
             excluded,
             healthy: true,
             health: String::new(),
@@ -1538,7 +1556,7 @@ mod tests {
         dead.healthy = false;
         dead.health = "heartbeat 95s old".into();
         let mut busy = cand("host8-ma", "ollama", PIN, false);
-        busy.load = 0.85;
+        busy.load = Some(0.85);
         let mut all = vec![dead, busy];
         super::order_candidates(&mut all, PIN, "ollama");
         assert_eq!(all[0].node_id, "host8-ma");
@@ -1568,12 +1586,9 @@ mod tests {
         // An agent that predates the field: no `serving`, so serving.
         let older = serde_json::json!({"id": "host8", "last_heartbeat": now, "backend_containers": {"vllm": {"running": true}}});
         assert_eq!(crate::coordinator::classes::node_health("host8", &older, "vllm", now), (true, String::new()));
-        let src = include_str!("backend.rs");
+        let own = crate::test_src::own_code(include_str!("backend.rs"));
         // The resolver's body only: up to its closing brace, not this test.
-        // (`\u{7d}` is a closing brace: a bare one in a string here unbalances the brace
-        // count tests/test_gateway_refuses_plaintext.py strips test modules by.)
-        let body = src.split("pub(crate) async fn resolve_backend_and_node(").nth(1).expect("resolver");
-        let body = body.split("\n\u{7d}\n").next().expect("resolver body");
+        let body = crate::test_src::fn_body(&own, "pub(crate) async fn resolve_backend_and_node(");
         assert!(body.contains("classes::node_health(&key, &data, bt, now)"), "the KV scan must apply the shared health rule");
         assert!(body.contains("order_candidates(&mut candidates"), "and sort by it");
     }
@@ -1644,8 +1659,8 @@ mod tests {
         // The tier that could never fire. Same backend type, same model
         // situation: the only difference is load, and 0.98 used to compare
         // false against 80.0 so it ranked as "not busy".
-        let busy = sort_key(false, true, 0.98);
-        let idle = sort_key(false, true, 0.10);
+        let busy = sort_key(false, true, Some(0.98));
+        let idle = sort_key(false, true, Some(0.10));
         assert!(idle < busy, "idle={idle:?} busy={busy:?}");
         assert_eq!(busy.2, 1, "0.98 must register as busy");
         assert_eq!(idle.2, 0);
@@ -1663,8 +1678,8 @@ mod tests {
         // decision where the two candidates differed in type. On the live
         // incident the decisive fault was that NOTHING advertised a model
         // (the SetHeld instance bug), so the only candidate carrying one won.
-        let busy_preferred = sort_key(false, true, 0.98);
-        let idle_other = sort_key(false, false, 0.10);
+        let busy_preferred = sort_key(false, true, Some(0.98));
+        let idle_other = sort_key(false, false, Some(0.10));
         assert!(busy_preferred < idle_other, "type outranks load, deliberately");
     }
 
@@ -1672,19 +1687,19 @@ mod tests {
     fn an_exact_model_match_still_outranks_everything() {
         // Tier 0 is not weakened by the fix: a node holding the requested model
         // wins even while busy, because the alternative is the wrong model.
-        let exact_busy = sort_key(true, false, 0.99);
-        let idle_preferred = sort_key(false, true, 0.01);
+        let exact_busy = sort_key(true, false, Some(0.99));
+        let idle_preferred = sort_key(false, true, Some(0.01));
         assert!(exact_busy < idle_preferred);
     }
 
     #[test]
     fn among_equally_idle_nodes_the_preferred_type_still_wins() {
-        assert!(sort_key(false, true, 0.10) < sort_key(false, false, 0.10));
+        assert!(sort_key(false, true, Some(0.10)) < sort_key(false, false, Some(0.10)));
     }
 
     #[test]
     fn among_equally_busy_nodes_the_lighter_one_wins() {
-        assert!(sort_key(false, false, 0.91) < sort_key(false, false, 0.99));
+        assert!(sort_key(false, false, Some(0.91)) < sort_key(false, false, Some(0.99)));
     }
 
     #[test]
@@ -1945,7 +1960,8 @@ mod pinned_hold_tests {
             backend_type: backend.into(),
             model_name: model.into(),
             url: String::new(),
-            load: 0.1,
+            load: Some(0.1),
+            lane_rank: 0,
             excluded: false,
             healthy: true,
             health: String::new(),
@@ -1987,7 +2003,7 @@ mod unpinned_tests {
             node_id: id.into(),
             ip: ip.into(),
             running: vec![(backend.into(), model.into())],
-            load,
+            load: Some(load),
             gpu,
             heartbeat_age_secs: Some(2.0),
             inbound_ok: true,
@@ -2086,5 +2102,70 @@ mod unpinned_tests {
         let scan = body.find("get_key_value(\"mesh_nodes\")").expect("kv scan");
         assert!(unpinned < scan);
         assert!(body.contains("let target_model = requested_model.unwrap_or(\"\");"), "no configured-default tier-0 key");
+    }
+}
+
+#[cfg(test)]
+mod lane_fallback_tests {
+    /// i403: the KV-scan fallback offers what the class table would route,
+    /// not the raw inventory. A `loading` lane whose `running_backends` entry
+    /// still names its model must not come back in through this path.
+    #[test]
+    fn the_kv_fallback_reads_the_class_table_facts_not_the_raw_inventory() {
+        let src = include_str!("backend.rs");
+        let fallback = &src[src.find("let non_chat = non_chat_backends(state).await?;").expect("the fallback")..];
+        let fallback = fallback.split("// Every node that serves the pin has its GPU held").next().unwrap();
+        let raw = ["data.get(\"running", "_backends\")"].concat();
+        assert!(!fallback.contains(&raw), "the fallback re-reads the raw inventory");
+        assert!(fallback.contains("for (bt, m) in &facts.running"), "it iterates the facts");
+        assert!(fallback.contains("facts.non_chat.contains(bt)"), "and takes non-chat from them");
+    }
+}
+
+#[cfg(test)]
+mod lane_rank_agreement_tests {
+    use super::super::classes::{build_table, lane_rank_of, node_facts_from_kv, select_with, Declarations, NodeFacts};
+    use super::{order_candidates, Candidate};
+    use serde_json::{json, Value};
+
+    fn rec(id: &str, ip: &str, state: &str, load: Option<f64>) -> Value {
+        let mut r = json!({
+            "id": id, "ip_address": ip, "last_heartbeat": 1000.0, "vram_gb": 0.0,
+            "running_backends": {"ollama": "gemma4:12b"},
+            "lanes": [{"backend": "ollama", "model": "gemma4:12b", "role": "chat", "state": state, "reason": ""}],
+        });
+        if let Some(l) = load {
+            r["current_load"] = json!(l);
+        }
+        r
+    }
+
+    /// A pinned model through the KV-scan resolver and through the class
+    /// table pick the same node: the serving lane, even with no load
+    /// reported, over an on-demand peer at 0.95.
+    #[test]
+    fn a_pinned_model_and_raw_chat_agree_on_lane_state() {
+        let a = node_facts_from_kv("a-serving", &rec("a-serving", "100.64.0.1", "serving", None), &[], 1001.0);
+        let b = node_facts_from_kv("b-ondemand", &rec("b-ondemand", "100.64.0.2", "on_demand", Some(0.95)), &[], 1001.0);
+        let t = build_table(&[b.clone(), a.clone()], &[], &Declarations::default());
+        let sel = select_with(&t, Some("gemma4:12b"), None, false, &|_| false, &|_| 0, &|_| false).expect("a selection");
+        assert_eq!(sel.candidates[0].node_id, "a-serving", "raw chat");
+        let mk = |f: &NodeFacts| Candidate {
+            node_id: f.node_id.clone(),
+            backend_type: "ollama".into(),
+            model_name: "gemma4:12b".into(),
+            url: String::new(),
+            load: f.load,
+            lane_rank: lane_rank_of(f, "ollama", "gemma4:12b"),
+            excluded: false,
+            healthy: true,
+            health: String::new(),
+        };
+        let mut cands = vec![mk(&b), mk(&a)];
+        order_candidates(&mut cands, "gemma4:12b", "ollama");
+        assert_eq!(cands[0].node_id, "a-serving", "the KV-scan resolver");
+        // The resolver ranks through the class table's own function.
+        let code = crate::test_src::own_code(include_str!("backend.rs"));
+        assert!(code.contains("super::classes::lane_rank_of(&facts, bt, m)"), "one lane-rank function");
     }
 }

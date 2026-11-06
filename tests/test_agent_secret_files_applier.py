@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+from tests import _rust_src as rs
+
 REPO = Path(__file__).resolve().parents[1]
 APPLIER = REPO / "scripts" / "noo-apply.sh"
 GO_READER = REPO / "node-agent-go/internal/config/secretenv.go"
@@ -357,8 +359,9 @@ def test_the_mac_applier_converts_the_harness_env_after_every_harness_write() ->
                     'merge_nats_creds(&body, &base.join("harness.env")',
                     'inst_bin("harness-binary", base.join("bin/noo-gateway")'):
         assert src.index(earlier) < call, earlier
-    shipped = src[:src.index("\n#[cfg(test)]")]
-    assert shipped.count('base.join("harness.env")') == shipped[:call + 300].count('base.join("harness.env")'), \
+    shipped = rs.own_code(src)
+    shipped_call = shipped.index("super::agent_secret_files::converge_harness(")
+    assert shipped.count('base.join("harness.env")') == shipped[:shipped_call + 300].count('base.join("harness.env")'), \
         "a harness.env write after the conversion would leave plain values"
 
 

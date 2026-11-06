@@ -40,6 +40,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tests import _rust_src as rs
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = sorted((ROOT / "scripts").glob("*.sh"))
 RUST = sorted((ROOT / "noo-cli" / "src").rglob("*.rs"))
@@ -129,7 +131,7 @@ def rust_violations(path_or_text, text: str | None = None) -> list[str]:
     text = text if text is not None else Path(path_or_text).read_text()
     name = str(path_or_text)
     # Code only: a comment that names the literal is not a site.
-    src = "\n".join(l for l in text.split("#[cfg(test)]")[0].splitlines() if not l.lstrip().startswith("//"))
+    src = rs.own_code(text)
     problems = []
     for m in re.finditer(r'"PREP_INSECURE=1"', src):
         start = src.rfind("Command::new(", 0, m.start())
@@ -150,7 +152,7 @@ def test_the_scripts_never_fetch_unpinned():
 
 
 def test_noo_cli_never_sends_prep_insecure_without_the_pin():
-    sites = [p for p in RUST if "PREP_INSECURE=1" in p.read_text().split("#[cfg(test)]")[0]]
+    sites = [p for p in RUST if "PREP_INSECURE=1" in rs.own_code(p.read_text())]
     assert sites, "no PREP_INSECURE=1 site in noo-cli — did provision/enroll move?"
     problems = []
     for p in sites:

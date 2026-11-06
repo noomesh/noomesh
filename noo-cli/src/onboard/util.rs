@@ -90,24 +90,49 @@ pub fn detect_ip() -> String {
     "127.0.0.1".to_string()
 }
 
-/// GPU model + VRAM (GB) via `nvidia-smi`, mirroring `_detect_gpu`.
-pub fn detect_gpu() -> Option<(String, f64)> {
-    let out = Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=name,memory.total",
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+/// What the GPU query found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GpuDetect {
+    Found(String, f64),
+    /// `nvidia-smi` did not answer within the deadline: a driver is there, the
+    /// model and VRAM are unknown.
+    Busy,
+    None,
+}
+
+/// GPU model + VRAM (GB) via `nvidia-smi`, mirroring `_detect_gpu`, under the
+/// 5 s deadline. Silent: the caller prints the one busy line.
+pub fn detect_gpu() -> GpuDetect {
+    use crate::host_exec::{nvidia_smi_within, SmiAnswer, SMI_DEADLINE};
+    match nvidia_smi_within(SMI_DEADLINE, &["--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]) {
+        SmiAnswer::Busy => GpuDetect::Busy,
+        SmiAnswer::Absent => GpuDetect::None,
+        SmiAnswer::Done(out) if !out.status.success() => GpuDetect::None,
+        SmiAnswer::Done(out) => match parse_gpu_line(&String::from_utf8_lossy(&out.stdout)) {
+            Some((m, v)) => GpuDetect::Found(m, v),
+            None => GpuDetect::None,
+        },
     }
-    let line = String::from_utf8_lossy(&out.stdout);
-    let line = line.lines().next()?;
+}
+
+/// Model and VRAM (GB) from the first line of the csv query. Pure.
+pub fn parse_gpu_line(stdout: &str) -> Option<(String, f64)> {
+    let line = stdout.lines().next()?;
     let mut parts = line.split(',');
     let model = parts.next()?.trim().to_string();
     let vram_mb: f64 = parts.next()?.trim().parse().ok()?;
     Some((model, vram_mb / 1024.0))
+}
+
+/// The tier when the GPU query is busy: keep the one already chosen, and only
+/// when none was (0) say CPU-only 3 rather than guess a VRAM. Pure.
+pub fn tier_when_busy(current: u8) -> u8 {
+    if current == 0 { 3 } else { current }
+}
+
+/// The busy line for the GPU query sites.
+pub fn gpu_busy_line(tier: u8) -> String {
+    crate::host_exec::busy_line(&format!("model and VRAM unknown, keeping Tier {tier}"))
 }
 
 /// Tier from VRAM, matching `step_prerequisites`: ≥10 GB → 1, ≥4 → 2, else 3.
@@ -176,5 +201,21 @@ mod tests {
         assert_eq!(tier_for_vram(4.0), 2);
         assert_eq!(tier_for_vram(3.9), 3);
         assert_eq!(tier_for_vram(0.0), 3);
+    }
+
+    #[test]
+    fn the_gpu_csv_line_parses_and_a_bad_one_does_not() {
+        assert_eq!(parse_gpu_line("NVIDIA RTX 4090, 24564\n"), Some(("NVIDIA RTX 4090".to_string(), 24564.0 / 1024.0)));
+        assert_eq!(parse_gpu_line("NVIDIA GB10, [N/A]\n"), None);
+        assert_eq!(parse_gpu_line(""), None);
+    }
+
+    #[test]
+    fn a_busy_gpu_keeps_the_chosen_tier_and_never_guesses_vram() {
+        assert_eq!(tier_when_busy(1), 1);
+        assert_eq!(tier_when_busy(2), 2);
+        assert_eq!(tier_when_busy(0), 3);
+        let l = gpu_busy_line(1);
+        assert!(l.contains("did not answer within 5 s") && l.contains("VRAM unknown") && l.ends_with("keeping Tier 1"), "{l}");
     }
 }

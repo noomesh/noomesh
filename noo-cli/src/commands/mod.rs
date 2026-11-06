@@ -8,6 +8,7 @@
 //! stderr, exit code per the contract in output.rs.
 
 pub mod addons;
+pub mod addon_access;
 pub mod at_rest;
 pub mod at_rest_migrate;
 pub mod at_rest_recovery;
@@ -70,6 +71,7 @@ pub mod mesh;
 pub mod nats_users;
 pub mod controller;
 pub mod migrate;
+pub mod migrate_db;
 pub mod models;
 pub mod models_fetch;
 pub mod ollama_stage;
@@ -200,7 +202,7 @@ pub use security::{
     security_user_links, security_user_list, security_user_list_roles, security_user_proposals,
     security_user_revoke_role, security_user_set_org, security_user_set_password,
     security_admin_password_reset,
-    security_user_allowance, security_user_set_scopes, security_user_unlink,
+    security_user_allowance, security_user_set_scopes, security_user_super_admin, security_user_unlink,
 };
 pub use secrets::{secrets_audit, secrets_resync, secrets_rotate, secrets_tidy};
 pub use secrets_remove::secrets_remove;
@@ -438,6 +440,7 @@ pub use release_sign::*;
 pub use addon_lock_cmd::{security_addon_lock_sign, security_addon_lock_verify};
 pub use addon_pins::{addons_launch_pins, addons_upgrade, addons_verify};
 pub use addon_resources::{addons_launch_resources, addons_rotate_secret};
+pub use addon_access::{addons_accept_suggestions, addons_access, addons_features, addons_set_access};
 pub use addons::{addons_check, addons_disable, addons_enable, addons_list, addons_registry_login, addons_set, addons_show, addons_trust_key, addons_untrust_key};
 pub use backups::{backups_setup, backups_status};
 pub use kiosk::*;

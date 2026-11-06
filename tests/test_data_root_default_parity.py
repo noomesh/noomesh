@@ -17,6 +17,8 @@ models again, silently. Now:
 import re
 from pathlib import Path
 
+from tests import _rust_src as rs
+
 REPO = Path(__file__).resolve().parents[1]
 NEUTRAL = "/var/lib/noo"
 
@@ -48,7 +50,7 @@ def _shipped_lines(path: Path):
     """Non-comment source lines; Rust/Go test code excluded."""
     text = path.read_text(errors="replace")
     if path.suffix == ".rs":
-        text = text.split("#[cfg(test)]")[0]
+        text = rs.own_code_lines(text)
     for n, line in enumerate(text.splitlines(), 1):
         s = line.strip()
         if s.startswith(("//", "#", "*", "///")):

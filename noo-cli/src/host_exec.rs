@@ -27,7 +27,8 @@
 //! alone. Neither is the default, which is the point.
 
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 /// What running a command told us. See the module header for the contract.
 /// `code` and `stderr` are for callers that need them (and the tests); not
@@ -125,6 +126,122 @@ pub fn run_sh(script: &str) -> Outcome {
     run_cmd(Command::new("bash").arg("-c").arg(script))
 }
 
+/// The deadline every production caller gives `nvidia-smi` (i425).
+pub const SMI_DEADLINE: Duration = Duration::from_secs(5);
+
+/// What a deadline-bound `nvidia-smi` told us.
+#[derive(Debug)]
+pub enum SmiAnswer {
+    /// It finished within the deadline (any exit status; read `status`).
+    Done(Output),
+    /// It did not answer in time. On WSL2 a Windows program loading the GPU
+    /// blocks `nvidia-smi` in the dxg driver, uninterruptibly (11 minutes
+    /// measured). A driver is there; it is not answering now.
+    Busy,
+    /// No runnable `nvidia-smi` on this host.
+    Absent,
+}
+
+/// Run `nvidia-smi args...` and stop WAITING after `deadline`. A signal alone
+/// is not a deadline: the child can sit in an uninterruptible driver call, and
+/// anything that waits for it (GNU `timeout` did, 665 s) is stuck with it.
+pub fn nvidia_smi_within(deadline: Duration, args: &[&str]) -> SmiAnswer {
+    run_within("nvidia-smi", deadline, args)
+}
+
+/// [`nvidia_smi_within`] for any program. Stdin is null; stdout and stderr are
+/// drained on threads so a full pipe cannot block the child. On timeout the
+/// child is killed and handed to a detached reaper thread, and we return
+/// `Busy` WITHOUT calling `wait` or joining the drain threads (the pipes may
+/// be held open by a child that never dies).
+fn run_within(program: &str, deadline: Duration, args: &[&str]) -> SmiAnswer {
+    use std::sync::mpsc;
+    fn drain<R: std::io::Read + Send + 'static>(r: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut buf);
+            }
+            let _ = tx.send(buf);
+        });
+        rx
+    }
+    let mut child = match Command::new(program).args(args)
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
+    {
+        Ok(c) => c,
+        // NotFound, or present but not runnable: either way nothing answered.
+        Err(_) => return SmiAnswer::Absent,
+    };
+    let out_rx = drain(child.stdout.take());
+    let err_rx = drain(child.stderr.take());
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Exited: the pipes close with it unless a grandchild holds
+                // them, so give the drains a short, bounded time.
+                let grace = Duration::from_secs(1);
+                let stdout = out_rx.recv_timeout(grace).unwrap_or_default();
+                let stderr = err_rx.recv_timeout(grace).unwrap_or_default();
+                return SmiAnswer::Done(Output { status, stdout, stderr });
+            }
+            Ok(None) if start.elapsed() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                // Reap it if it ever exits; nothing here waits for that.
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return SmiAnswer::Busy;
+            }
+        }
+    }
+}
+
+/// Is there an NVIDIA GPU here, as far as `nvidia-smi` can say in time?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuProbe {
+    Present,
+    /// A driver is there and did not answer within the deadline.
+    Busy,
+    Missing,
+}
+
+/// Pure: classify an answer. A tool that ran and failed is "no GPU".
+pub fn classify_gpu(a: &SmiAnswer) -> GpuProbe {
+    match a {
+        SmiAnswer::Done(o) if o.status.success() => GpuProbe::Present,
+        SmiAnswer::Done(_) | SmiAnswer::Absent => GpuProbe::Missing,
+        SmiAnswer::Busy => GpuProbe::Busy,
+    }
+}
+
+/// Pure: does the GPU choice stay GPU? Busy keeps it (a stuck driver is not
+/// an absent one).
+pub fn gpu_kept(p: GpuProbe) -> bool {
+    matches!(p, GpuProbe::Present | GpuProbe::Busy)
+}
+
+/// Probe with the standard deadline; a Busy answer prints [`busy_line`] once
+/// to stderr, ending in `choice` (what the caller does about it).
+pub fn probe_gpu(choice: &str) -> GpuProbe {
+    let p = classify_gpu(&nvidia_smi_within(SMI_DEADLINE, &[]));
+    if p == GpuProbe::Busy {
+        eprintln!("  {}", busy_line(choice));
+    }
+    p
+}
+
+/// The one line every site prints when `nvidia-smi` is busy.
+pub fn busy_line(choice: &str) -> String {
+    format!(
+        "nvidia-smi did not answer within {} s (on WSL2 a Windows program using the GPU does this): {choice}",
+        SMI_DEADLINE.as_secs()
+    )
+}
+
 /// Seconds since the Unix epoch, now. A clock before 1970 reads 0 rather
 /// than panicking.
 pub fn now_unix() -> i64 {
@@ -196,5 +313,72 @@ mod tests {
         let b = now_unix();
         assert!(a > 1_700_000_000, "{a}");
         assert!(b >= a);
+    }
+
+    /// A script `body` under a per-process scratch dir; returns its path. It
+    /// is run as `sh <path>` and never exec'd (a just-written file can hit
+    /// ETXTBSY when another test forks).
+    fn fake(name: &str, body: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("noo-host-exec-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("nvidia-smi");
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn a_stuck_program_is_busy_within_the_deadline_and_not_waited_for() {
+        let p = fake("smi-slow", "sleep 30");
+        let t = Instant::now();
+        let a = run_within("sh", Duration::from_millis(300), &[p.as_str()]);
+        assert!(matches!(a, SmiAnswer::Busy), "{a:?}");
+        assert!(t.elapsed() < Duration::from_millis(300) + Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn a_fast_program_is_done_with_its_output_and_status() {
+        let p = fake("smi-fast", "echo GPU 0: fake; echo oops >&2; exit 3");
+        match run_within("sh", Duration::from_secs(5), &[p.as_str()]) {
+            SmiAnswer::Done(o) => {
+                assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "GPU 0: fake");
+                assert_eq!(String::from_utf8_lossy(&o.stderr).trim(), "oops");
+                assert_eq!(o.status.code(), Some(3));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_large_output_does_not_block_on_a_full_pipe() {
+        let p = fake("smi-big", "yes x | head -c 300000");
+        match run_within("sh", Duration::from_secs(5), &[p.as_str()]) {
+            SmiAnswer::Done(o) => assert_eq!(o.stdout.len(), 300000),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_program_is_absent() {
+        let a = run_within("/nonexistent/noo-test-nvidia-smi", Duration::from_secs(1), &[]);
+        assert!(matches!(a, SmiAnswer::Absent), "{a:?}");
+    }
+
+    #[test]
+    fn busy_keeps_the_gpu_choice_and_a_failed_tool_does_not() {
+        let slow = run_within("sh", Duration::from_millis(100), &[fake("s", "sleep 30").as_str()]);
+        let bad = run_within("sh", Duration::from_secs(5), &[fake("b", "exit 9").as_str()]);
+        let ok = run_within("sh", Duration::from_secs(5), &[fake("o", "exit 0").as_str()]);
+        assert_eq!(classify_gpu(&slow), GpuProbe::Busy);
+        assert_eq!(classify_gpu(&bad), GpuProbe::Missing);
+        assert_eq!(classify_gpu(&ok), GpuProbe::Present);
+        assert_eq!(classify_gpu(&SmiAnswer::Absent), GpuProbe::Missing);
+        assert!(gpu_kept(GpuProbe::Busy) && gpu_kept(GpuProbe::Present) && !gpu_kept(GpuProbe::Missing));
+    }
+
+    #[test]
+    fn the_busy_line_names_the_cause_and_the_choice() {
+        let l = busy_line("taking the GPU as present");
+        assert!(l.contains("did not answer within 5 s") && l.contains("Windows program") && l.ends_with("taking the GPU as present"), "{l}");
     }
 }

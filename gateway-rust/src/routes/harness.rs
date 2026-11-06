@@ -281,8 +281,15 @@ async fn harness_call(
             // tokens count against the task, before the driver's next
             // boundary check reads them. Only the turn's own task; anything
             // else is still recorded, just not charged to a task.
+            // Only "not this turn's task" falls back to an untasked row. A
+            // database error is the caller's to see: read as untasked, the
+            // tokens were never charged to the task's budget (#650 sweep).
             let task = match task_id.as_deref() {
-                Some(id) => turn_task(&state, id, conv, user).await.ok(),
+                Some(id) => match turn_task(&state, id, conv, user).await {
+                    Ok(task) => Some(task),
+                    Err(AppError::Forbidden(_)) => None,
+                    Err(e) => return Err(e.into()),
+                },
                 None => None,
             };
             match task {

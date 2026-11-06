@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -344,12 +345,9 @@ func (e *Executor) handleDispatch(data []byte) {
 			return
 		}
 
-		if err != nil {
+		if jobEventKind(err) == "failed" {
 			slog.Error("job failed", "job_id", job.JobID, "error", err)
-			e.nats.PublishJobEvent("failed", map[string]any{
-				"job_id": job.JobID,
-				"error":  err.Error(),
-			})
+			e.nats.PublishJobEvent("failed", failedPayload(job.JobID, err))
 			return
 		}
 
@@ -423,7 +421,10 @@ func (e *Executor) executeInference(ctx context.Context, payload map[string]any,
 	prompt, _ := payload["prompt"].(string)
 	model, _ := payload["model"].(string)
 
-	backends := e.docker.RunningBackends(ctx)
+	backends, err := e.docker.RunningBackends(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("docker unavailable: could not list running backends: %w", err)
+	}
 	if backend == "" {
 		for _, b := range []string{"vllm", "llamacpp", "ollama"} {
 			if _, ok := backends[b]; ok {
@@ -479,26 +480,94 @@ func (e *Executor) executeInference(ctx context.Context, payload map[string]any,
 		timeoutSec = 300
 	}
 	client := &http.Client{Timeout: time.Duration(timeoutSec) * time.Second, Transport: e.http.Transport}
+	return postInference(client, req, backend)
+}
+
+// bodySnippet is the first n bytes of a response body, for error messages.
+func bodySnippet(body []byte, n int) string {
+	if len(body) > n {
+		return string(body[:n])
+	}
+	return string(body)
+}
+
+// postInference sends the request and turns the response into a job result.
+// Only a fully read 2xx body that parses as JSON is a result; everything else
+// is an error, so the job is published as failed and never as complete.
+func postInference(client *http.Client, req *http.Request, backend string) (any, error) {
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
+	body, readErr := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		// Propagate upstream errors as job failures so the scheduler's
 		// retry machinery engages — otherwise an error JSON body gets
 		// recorded as a successful result and the job reads "completed".
-		msg := string(body)
-		if len(msg) > 300 {
-			msg = msg[:300]
-		}
-		return nil, fmt.Errorf("backend %s HTTP %d: %s", backend, resp.StatusCode, msg)
+		// This also covers 1xx and 3xx, which are not an answer either.
+		return nil, authRefused(resp.StatusCode, fmt.Errorf("backend %s HTTP %d: %s", backend, resp.StatusCode, bodySnippet(body, 300)))
+	}
+	if readErr != nil {
+		return nil, fmt.Errorf("backend %s HTTP %d: reading response body: %w", backend, resp.StatusCode, readErr)
 	}
 	var result any
-	json.Unmarshal(body, &result)
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("backend %s HTTP %d: response is not JSON (%v): %s",
+			backend, resp.StatusCode, err, bodySnippet(body, 200))
+	}
 	return result, nil
+}
+
+// controllerStatus reports a controller reply for the background job types:
+// 404 means the endpoint is not present on this controller (skip), any other
+// non-2xx is an error naming the status and a body snippet.
+func controllerStatus(resp *http.Response) (present bool, err error) {
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
+		return true, authRefused(resp.StatusCode, fmt.Errorf("controller %s HTTP %d: %s", resp.Request.URL.Path, resp.StatusCode, snippet))
+	}
+	return true, nil
+}
+
+// nonRetryableError marks a failure another node cannot fix: the same
+// credentials would be refused again, so the retry budget only delays the
+// answer. The gateway reads `retryable:false` (scheduler_completions.rs
+// is_retryable); an absent field means retryable.
+type nonRetryableError struct{ err error }
+
+func (n *nonRetryableError) Error() string { return n.err.Error() }
+func (n *nonRetryableError) Unwrap() error { return n.err }
+
+// authRefused wraps err as non-retryable when the status is 401 or 403.
+func authRefused(status int, err error) error {
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return &nonRetryableError{err: err}
+	}
+	return err
+}
+
+// failedPayload is the body of the events.job.failed message for err.
+func failedPayload(jobID string, err error) map[string]any {
+	p := map[string]any{"job_id": jobID, "error": err.Error()}
+	var nr *nonRetryableError
+	if errors.As(err, &nr) {
+		p["retryable"] = false
+	}
+	return p
+}
+
+// jobEventKind is the lifecycle event a job's outcome is published as.
+func jobEventKind(err error) string {
+	if err != nil {
+		return "failed"
+	}
+	return "complete"
 }
 
 // executeTool is a REFUSAL, not an implementation.
@@ -565,8 +634,11 @@ func (e *Executor) executeBackgroundGraph(ctx context.Context, payload map[strin
 		if err != nil {
 			continue
 		}
-		resp.Body.Close()
-		if resp.StatusCode != 404 {
+		present, err := controllerStatus(resp)
+		if err != nil {
+			return nil, err
+		}
+		if present {
 			return map[string]string{"status": "completed", "scope": scope}, nil
 		}
 	}
@@ -610,8 +682,11 @@ func (e *Executor) executeBackgroundCache(ctx context.Context, payload map[strin
 	if err != nil {
 		return map[string]any{"status": "partial", "action": action, "reason": err.Error()}, nil
 	}
-	resp.Body.Close()
-	if resp.StatusCode == 404 {
+	present, err := controllerStatus(resp)
+	if err != nil {
+		return nil, err
+	}
+	if !present {
 		return map[string]any{"status": "skipped", "action": action, "reason": "endpoint not available"}, nil
 	}
 

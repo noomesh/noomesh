@@ -52,7 +52,9 @@ pub struct NodeSnapshot {
     pub is_companion: bool,
     /// Seconds since the last heartbeat. `None` = never heartbeated.
     pub heartbeat_age_secs: Option<f64>,
-    pub current_load: f64,
+    /// `None` = the heartbeat carried no numeric load: unknown, sorted after
+    /// every reported load and never read as idle.
+    pub current_load: Option<f64>,
     pub vram_gb: f64,
     /// Live VRAM usage; `None` when the agent doesn't report it.
     pub vram_used_gb: Option<f64>,
@@ -156,7 +158,7 @@ impl NodeSnapshot {
         if self.status != NodeStatus::Online {
             return false;
         }
-        if self.current_load >= LOAD_CEILING {
+        if self.current_load.is_some_and(|l| l >= LOAD_CEILING) {
             return false;
         }
         if min_vram_gb > 0.0 && self.free_vram_gb() < min_vram_gb {
@@ -327,7 +329,7 @@ impl CompanionPolicies {
 ///   4. companion policy
 ///   5. HIGH priority prefers tier 1 — but only if any tier-1 survived;
 ///      otherwise the full list stands (a preference, not a requirement)
-///   6. sort by current_load ascending
+///   6. sort by current_load ascending, an unreported load last
 pub fn get_candidate_nodes<'a>(
     nodes: &'a [NodeSnapshot],
     backend: Option<&str>,
@@ -365,11 +367,7 @@ pub fn get_candidate_nodes<'a>(
 
     // Stable sort by load, so equal-load nodes keep registry order —
     // matching Python's list.sort(), which is also stable.
-    candidates.sort_by(|a, b| {
-        a.current_load
-            .partial_cmp(&b.current_load)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    candidates.sort_by_key(|n| crate::coordinator::classes::load_key(n.current_load));
     candidates
 }
 
@@ -430,7 +428,7 @@ mod tests {
             tier: json!(tier),
             is_companion: tier == 5,
             heartbeat_age_secs: Some(10.0),
-            current_load: load,
+            current_load: Some(load),
             vram_gb: 16.0,
             vram_used_gb: None,
             backends: vec!["vllm".into(), "llamacpp".into()],

@@ -874,6 +874,30 @@ pub fn warned(msg: &str) {
         println!("{}", status_line(Glyph::Warn, msg));
     }
 }
+/// A narration line the caller built (an `item`, a `sub`, a `note`): stdout,
+/// suppressed by --quiet/--json like every printer here. A raw `println!`
+/// of the same line broke `noo --json upgrade --nodes` (i388: stdout must
+/// hold only JSON lines).
+pub fn say(line: &str) {
+    if !quiet() {
+        println!("{line}");
+    }
+}
+/// The blank line that separates items; suppressed by --quiet/--json.
+pub fn blank() {
+    if !quiet() {
+        println!();
+    }
+}
+/// A failure line the caller built: stdout among the narration, but under
+/// --quiet/--json it goes to stderr, so the failure is never dropped.
+pub fn say_err(line: &str) {
+    if quiet() {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
+    }
+}
 /// Guidance block: a rule, then `▸ cmd` + muted why for each entry.
 /// Empty `why` prints just the command line.
 pub fn guide(entries: &[(&str, &str)]) {

@@ -670,7 +670,7 @@ pub(crate) async fn chat_completion_on_node(
     }
     match sent {
         Ok(resp) if resp.status().is_success() => {
-            let data: Value = resp.json().await.unwrap_or(json!({}));
+            let data = crate::upstream_body::json_2xx(resp, "the backend").await?;
             Ok(data.pointer("/choices/0/message/content")
                 .and_then(|v| v.as_str()).unwrap_or("").to_string())
         }
@@ -908,11 +908,17 @@ async fn proxy_backend_health(
         .timeout(std::time::Duration::from_secs(5));
     match req.send().await {
         Ok(resp) => {
-            let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
-                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
             crate::coordinator::warn_if_node_agent_outdated(resp.status(), &url);
-            let body = resp.text().await.unwrap_or_default();
-            (status, body).into_response()
+            // A body cut off mid-transfer is a 502 naming the backend, never
+            // its status over an empty body (i460).
+            match crate::upstream_body::whole_text(resp, "the backend").await {
+                Ok((code, body)) => (
+                    axum::http::StatusCode::from_u16(code).unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
+                    body,
+                )
+                    .into_response(),
+                Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+            }
         }
         Err(e) => (StatusCode::BAD_GATEWAY, format!("Backend unreachable: {e}")).into_response(),
     }
@@ -1499,12 +1505,8 @@ mod identity_tests {
             is_credential_optional, is_handler_authenticated, PUBLIC_GET_PATH_PREFIXES,
             PUBLIC_PATHS_EXACT, PUBLIC_PATH_PREFIXES,
         };
-        let src = include_str!("inference.rs");
-        let router = src
-            .split("pub fn router()")
-            .nth(1)
-            .and_then(|t| t.split("\n}\n").next())
-            .expect("router fn");
+        let own = crate::test_src::own_code(include_str!("inference.rs"));
+        let router = crate::test_src::fn_body(&own, "pub fn router()");
         let paths: Vec<&str> = router
             .match_indices(".route(\"")
             .filter_map(|(i, m)| router[i + m.len()..].split('"').next())
@@ -1825,5 +1827,17 @@ mod pinned_sampling_tests {
         assert_eq!(seen[0]["max_tokens"], json!(PINNED_DEFAULT_MAX_TOKENS));
         assert_eq!(seen[0]["temperature"].as_f64(), Some(PINNED_DEFAULT_TEMPERATURE));
         assert_eq!((PINNED_DEFAULT_MAX_TOKENS, PINNED_DEFAULT_TEMPERATURE), (256, 0.7), "the defaults are the historical ones");
+    }
+
+    /// i460: a 200 cut off mid-body, or one that is not JSON, is an error
+    /// naming the backend, never an empty completion.
+    #[tokio::test]
+    async fn a_cut_off_or_non_json_answer_is_an_error_not_an_empty_completion() {
+        let base = crate::upstream_body::stub_cut_short().await;
+        let e = chat_completion_on_node("vllm", "m", &base, "hi", Sampling::default()).await.unwrap_err();
+        assert!(e.starts_with("the backend answered HTTP 200 but its body could not be read"), "{e}");
+        let base = crate::upstream_body::stub_not_json().await;
+        let e = chat_completion_on_node("vllm", "m", &base, "hi", Sampling::default()).await.unwrap_err();
+        assert!(e.starts_with("the backend answered HTTP 200 but its body is not JSON"), "{e}");
     }
 }
