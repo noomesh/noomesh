@@ -57,7 +57,7 @@ pub(crate) mod settings;
 mod mcp_registry;
 mod snapshots;
 mod temporal;
-mod ui;
+pub(crate) mod ui;
 mod usage;
 mod harness;
 mod identity;
@@ -349,7 +349,7 @@ pub(super) fn trellion_refusal_body() -> Response {
 }
 
 
-pub fn build_router(state: Arc<AppState>) -> Router {
+pub(crate) fn core_router() -> Router<Arc<AppState>> {
     let router = Router::new()
         // ── Group routers (all 14 API groups) ──
         .merge(ui::router())
@@ -407,17 +407,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(crate::tunnel::router())
         .merge(websocket::router());
 
-    // ── HTTP add-ons: routes from the manifest each add-on SHIPS ──
-    // Read once, here, for every add-on whose switch is on, from
-    // `<addon>/routes.json` (the launcher's read-only copy from the add-on's
-    // signed bundle under `addon_proxy::BUNDLE_ROUTES_DIR`, else what a
-    // shipped add-on's overlay delivers under `addon_proxy::ROUTES_DIR`),
-    // validated, and merged last so a collision with any core route above
-    // refuses the add-on instead of replacing a core handler. Off → nothing mounted. On with a missing/invalid manifest →
-    // nothing mounted, `/health` says `unhealthy`, the log says why. The
-    // core names no add-on route.
-    let router = crate::addon_proxy::mount(router);
-
     router
         // ── Static files (dashboard) ──
         .nest_service("/static", ServeDir::new(crate::paths::STATIC_DIR))
@@ -428,7 +417,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/assets",
             ServeDir::new(format!("{}/assets", crate::paths::UI_WWW_DIR)),
         )
+}
 
+pub fn build_router(state: Arc<AppState>) -> Router {
+    let router = crate::addon_proxy::mount(core_router());
+    let router = crate::addon_console::mount(router);
+    router
         // ── No catch-all. ──
         // `/api/{*path}` used to delegate any unmatched route to Python by
         // deriving a subject from the path. It is gone: an unmatched /api

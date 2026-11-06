@@ -7,6 +7,7 @@ import { MetisProvider, AuthProvider } from '@metis/core';
 import '@metis/tokens/tokens.css';
 import './app.css';
 import { App } from './App';
+import { AddonSpace } from './features/addons/AddonSpace';
 import { ConfirmProvider } from '@/components/ConfirmDialog';
 import { Toaster } from '@/components/ui/sonner';
 import { client, authApi } from './lib/client';
@@ -16,7 +17,7 @@ createRoot(document.getElementById('root')!).render(
     <MetisProvider client={client}>
       <AuthProvider authApi={authApi}>
         <ConfirmProvider>
-          <App />
+          {document.querySelector('meta[name="noo-addon-space"]') ? <AddonSpace /> : <App />}
         </ConfirmProvider>
         <Toaster />
       </AuthProvider>

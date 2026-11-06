@@ -118,6 +118,29 @@ pub fn check_routes(addon: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<Op
     Ok(Some(checked.unchecked))
 }
 
+/// Refuse a new signed claim before pulling or changing pins. Existing
+/// enabled bundles are read from the install's materialised manifests.
+pub fn refuse_console_collision(root: &Path, addon: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<(), Refusal> {
+    let Some(raw) = files.get(ROUTES_FILE) else { return Ok(()) };
+    let manifest = addon_manifest::parse(std::str::from_utf8(raw).map_err(|e| Refusal::Decl(e.to_string()))?).map_err(Refusal::Decl)?;
+    let Some(path) = manifest.ui.as_ref().and_then(|ui| ui.console_path.as_deref()) else { return Ok(()) };
+    let enabled = crate::commands::addons::declared_map_at(&root.join("noomesh.yaml")).map_err(Refusal::Decl)?;
+    for (other, on) in enabled {
+        if !on || other == addon { continue; }
+        let file = super::pins::addon_dir(root, &other).join(ROUTES_FILE);
+        let text = match std::fs::read_to_string(&file) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(Refusal::Decl(format!("cannot inspect enabled add-on {other:?}: {e}"))),
+        };
+        let existing = addon_manifest::parse(&text).map_err(Refusal::Decl)?;
+        if existing.ui.as_ref().and_then(|ui| ui.console_path.as_deref()) == Some(path) {
+            return Err(Refusal::Decl(format!("ui.console_path {path:?} is claimed by both {addon:?} and enabled add-on {other:?}; change one signed claim (nothing was changed)")));
+        }
+    }
+    Ok(())
+}
+
 /// [`check_routes`] as the pin path runs it (`noo addons enable | upgrade`,
 /// `upgrade --check`): a bundle the gateway would refuse whole at load is
 /// refused here, with the gateway's sentence, before an image is pulled or a
@@ -166,6 +189,25 @@ mod tests {
         std::fs::write(d.join("system.json"), include_bytes!("../../../tests/fixtures/addons/rhaddon/system.json")).unwrap();
         std::fs::write(d.join("routes.json"), include_bytes!("../../../tests/fixtures/addons/rhaddon/routes.json")).unwrap();
         d
+    }
+
+    #[test]
+    fn console_claim_conflict_is_refused_without_writes() {
+        let root = fixture_dir("console-conflict", "rhaddon");
+        let other = super::super::pins::addon_dir(&root, "other-addon");
+        std::fs::create_dir_all(&other).unwrap();
+        let raw = |name: &str| serde_json::json!({"version":1,"addon":name,"base_url_env":"NOO_RHADDON_URL","base_url_default":"https://noo-rhaddon:9000","routes":[],"ui":{"console_path":"/example-space"}}).to_string();
+        std::fs::write(other.join("routes.json"), raw("other-addon")).unwrap();
+        let config = root.join("noomesh.yaml");
+        std::fs::write(&config, "addons:\n  other-addon: true\n").unwrap();
+        let files = BTreeMap::from([("routes.json".into(), raw("rhaddon").into_bytes())]);
+        let error = refuse_console_collision(&root, "rhaddon", &files).unwrap_err().why("rhaddon");
+        assert!(error.contains("rhaddon") && error.contains("other-addon") && error.contains("/example-space"));
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), "addons:\n  other-addon: true\n");
+        assert!(!root.join("addons.lock").exists());
+        std::fs::write(&config, "addons:\n  other-addon: false\n").unwrap();
+        assert!(refuse_console_collision(&root, "rhaddon", &files).is_ok());
+        clean(&root);
     }
 
     fn clean(d: &Path) {

@@ -128,6 +128,7 @@ mod addon_decls;
 mod addon_proxy;
 mod addon_workloads;
 mod addon_ui;
+mod addon_console;
 mod addon_ws;
 mod addon_delegation;
 mod addon_registry;

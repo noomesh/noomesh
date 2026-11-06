@@ -2280,6 +2280,7 @@ pub fn is_credential_optional(path: &str) -> bool {
 /// handler runs (`seat_cannot_reach_node_routes`).
 pub fn passes_without_bearer_check(path: &str, safe_method: bool, has_bearer: bool) -> bool {
     PUBLIC_PATHS_EXACT.contains(&path)
+        || (safe_method && crate::addon_console::is_claimed_console_path(path))
         || PUBLIC_PATH_PREFIXES.iter().any(|p| path.starts_with(p))
         || (safe_method && PUBLIC_GET_PATH_PREFIXES.iter().any(|p| path.starts_with(p)))
         // Not public: these carry a birth-key proof the HANDLER verifies,

@@ -636,6 +636,33 @@ answers `{"uis": [{"addon", "title", "port", "url_base", "can_open"}]}`: a
 User sees the UIs its role may open, an Operator or Admin sees all of them.
 The console's **Add-ons** tab lists them with an **Open** button.
 
+A compatible signed manifest can declare `ui.console_path: "/example-space"`
+and `ui.frame_permissions: ["microphone", "autoplay"]`. The path is a single
+lowercase segment, 2–32 characters, outside the reserved core namespaces.
+Capabilities are limited to microphone, camera, autoplay, fullscreen and
+clipboard-write; undeclared capabilities are denied. Older gateways refuse
+these fields: target a supporting stack release (0.6.18+).
+
+The console's **Open** link uses the declared path. The console-owned shell
+keeps that address while embedding the add-on on its assigned isolated origin.
+That port must still be reachable. Only the signed capabilities are delegated
+to that exact origin; no console bearer enters the frame. Account logout or
+loss of access removes the frame. Reload requires a fresh one-use handoff.
+A custom `NOO_CSP` is respected and may need that origin in `frame-src`.
+
+Two enabled add-ons cannot claim one path. Enable/upgrade refuses a conflict
+before pulling or pinning; the gateway refuses all colliding path claims,
+reports them in authenticated `/health.addons_paths_refused` and answers 409.
+The add-ons' other routes remain available. `noo cluster verify --controller`
+reports every refused path. The gateway mounts paths at startup and checks
+registration, expiry and enablement on every request. Changed or removed
+claims need a restart; old bookmarks return 404. Keep published paths stable.
+
+The disposable Playwright check (`scripts/check_addon_space_browser.py`, after
+building `ui/apps/web`) exercises HTTPS iframe navigation, cookie binding,
+origin isolation, microphone permission, a synthetic WebSocket roundtrip,
+reload and logout. It does not exercise a deployed gateway or GPU model.
+
 **Session handoff.**
 
 1. The console calls `POST /api/addons/<name>/ui-session` on its own origin
@@ -648,8 +675,9 @@ The console's **Add-ons** tab lists them with an **Open** button.
    the browser that minted the code presents it on your origin; any other
    browser does not have it.
 2. The console opens `url` (`https://<host>:<port>/__noo/session?code=…`) in
-   a new tab. Your origin redeems the code only when the binding cookie
-   matches and the request is a top-level navigation no other site started
+   a new tab (or the console-owned Voice Space iframe). Your origin redeems
+   the code only when the binding cookie matches and it is a navigation no
+   other site started
    (no foreign `Origin`, no `Sec-Fetch-Site: cross-site`, `Sec-Fetch-Mode:
    navigate` when the browser sends it). It sets its own cookie
    `noo_ui_<name>` (HttpOnly, Secure, SameSite=Strict, host-only, `Path=/`).

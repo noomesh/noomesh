@@ -204,6 +204,7 @@ fn prepare_with(
     }
     // The gateway refuses a bad routes.json whole at load: refuse it here, by its own rules.
     check::refuse_bad_routes(addon, &fetched.files)?;
+    check::refuse_console_collision(ctx.root, addon, &fetched.files)?;
     resolve::require_bundle(&verified, ctx.tag)?;
     let mut cred = || -> Result<Option<Credential>, String> {
         ctx.client.docker_credential(&route).map_err(|e| format!("{}: {}", route.host(), e.summary()))
@@ -230,5 +231,14 @@ fn prepare_with(
 
 /// Step 8 for a prepared add-on.
 pub fn commit(root: &Path, p: &Prepared, tag: &str) -> Result<pins::Pin, Refusal> {
-    resolve::record(root, &p.addon, &p.verified, &p.fetched, tag, p.pulled_from.clone())
+    check::refuse_console_collision(root, &p.addon, &p.fetched.files)?;
+    let previous = std::fs::read_to_string(pins::addon_dir(root, &p.addon).join(addon_manifest::ROUTES_FILE)).ok()
+        .and_then(|text| addon_manifest::parse(&text).ok()).and_then(|m| m.ui).and_then(|ui| ui.console_path);
+    let next = p.fetched.files.get(addon_manifest::ROUTES_FILE)
+        .and_then(|raw| std::str::from_utf8(raw).ok()).and_then(|text| addon_manifest::parse(text).ok()).and_then(|m| m.ui).and_then(|ui| ui.console_path);
+    let pin = resolve::record(root, &p.addon, &p.verified, &p.fetched, tag, p.pulled_from.clone())?;
+    if previous != next {
+        eprintln!("{}: console path {:?} -> {:?}; restart the gateway to mount changes; removed bookmarks return 404", p.addon, previous, next);
+    }
+    Ok(pin)
 }
