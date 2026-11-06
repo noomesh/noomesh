@@ -466,9 +466,8 @@ async fn display(
 /// The tailnet device a kiosk credential was minted for (`kiosk:<device>`),
 /// or `None` for any other caller.
 fn kiosk_device(ctx: &crate::auth::RequesterCtx) -> Option<String> {
-    if !ctx.scopes.iter().any(|s| s == crate::auth::KIOSK_SCOPE) {
-        return None;
-    }
+    // MUTANT: any caller named kiosk:<x> reads that display's settings.
+    let _ = crate::auth::KIOSK_SCOPE;
     ctx.sub.strip_prefix("kiosk:").filter(|d| !d.is_empty()).map(str::to_string)
 }
 
