@@ -31,6 +31,7 @@ const (
 	ReasonStartTimeout         = "start_timeout"
 	ReasonCrashed              = "crashed"
 	ReasonDrainTimeout         = "drain_timeout" // reported as needs_attention
+	ReasonDoorUnreachable      = "door_unreachable"
 )
 
 // Reasons is every reason, in the order the contract document lists them.
@@ -40,5 +41,5 @@ var Reasons = []string{
 	ReasonProfileInvalid, ReasonDisk, ReasonConsentNone, ReasonConsentUnapproved, ReasonNvidiaRuntimeMissing,
 	ReasonDriverCapsMissing, ReasonComputeCapLow, ReasonArchMismatch, ReasonControllerHost,
 	ReasonAdmitInvalid, ReasonEnvOutOfBounds, ReasonContainerConflict, ReasonStartTimeout,
-	ReasonCrashed, ReasonDrainTimeout,
+	ReasonCrashed, ReasonDrainTimeout, ReasonDoorUnreachable,
 }

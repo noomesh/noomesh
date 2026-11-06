@@ -204,6 +204,10 @@ func (s *Store) now() time.Time {
 
 func (s *Store) dir(ref Ref) string { return filepath.Join(s.Root, ref.ID, ref.Revision) }
 
+// Dir is the directory a set lives in on this node: what a worker mounts
+// read-only. It says nothing about the set's state; ask State first.
+func (s *Store) Dir(ref Ref) string { return s.dir(ref) }
+
 // ---- signature ----------------------------------------------------------
 
 // LoadSigningKey reads an SPKI PEM public key and requires ECDSA on P-384,
