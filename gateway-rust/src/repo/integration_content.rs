@@ -298,7 +298,8 @@ pub fn retry_plan(error: &Error, attempts: i32) -> RetryPlan {
             "failing",
             retry_after.unwrap_or(0).max(backoff),
         ),
-        Error::Unavailable(_) | Error::NotFound => ("provider", "failing", backoff),
+        // MUTANT: five provider faults stop the source again.
+        Error::Unavailable(_) | Error::NotFound => ("provider", if attempts >= 4 { "error" } else { "failing" }, backoff),
     };
     RetryPlan { fault, status, delay_secs }
 }
