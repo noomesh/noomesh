@@ -85,6 +85,7 @@ pub mod code {
     pub const PATH_INVALID: &str = "path_invalid";
     pub const SHA256_INVALID: &str = "sha256_invalid";
     pub const FILES_INVALID: &str = "files_invalid";
+    pub const FROM_ARCHIVE_INVALID: &str = "from_archive_invalid";
     pub const NOTICE_NOT_IN_FILES: &str = "notice_not_in_files";
     pub const PROFILE_INVALID: &str = "profile_invalid";
     pub const ARCH_INVALID: &str = "arch_invalid";
@@ -550,7 +551,11 @@ pub struct Health {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Drain {
+    /// POST: a 2xx means the drain was ACCEPTED (idempotent).
     pub path: String,
+    /// GET, polled every 2 s: 200 means drained and safe to stop (A11).
+    pub done_path: String,
+    /// Bounds the WHOLE drain, the POST plus the polling.
     pub timeout_secs: i64,
 }
 
@@ -634,6 +639,27 @@ fn validate_service_drain(s: Option<&ServiceDrain>, routes: Option<&Routes>) -> 
 pub struct Accel {
     pub gpu: i64,
     pub realtime: bool,
+    /// One of the decl's own declared env keys with an integer bound: the
+    /// worker's slot count for VRAM sizing (absent: one slot). A11.
+    pub slots_env: Option<String>,
+}
+
+/// `accel.slots_env` names a declared env key with an integer bound (min
+/// and/or max), never an enum.
+fn validate_slots_env(key: Option<&str>, env: &BTreeMap<String, EnvBound>) -> Result<(), Refusal> {
+    let Some(key) = key.filter(|k| !k.is_empty()) else {
+        return Ok(());
+    };
+    let Some(b) = env.get(key) else {
+        return fail(code::ACCEL_INVALID, format!("accel.slots_env {key:?} is not a declared env key"));
+    };
+    if b.one_of.is_some() || (b.min.is_none() && b.max.is_none()) {
+        return fail(
+            code::ACCEL_INVALID,
+            format!("accel.slots_env {key:?} must have an integer min/max bound"),
+        );
+    }
+    Ok(())
 }
 
 /// A model slot: the agent mounts the set the operator chose, read-only, at
@@ -904,10 +930,14 @@ fn validate_decl_rules(
             "health needs absolute paths and start_secs 1..600",
         );
     }
-    if !ok_path(&d.drain.path) || d.drain.timeout_secs < 1 || d.drain.timeout_secs > 3600 {
+    if !ok_path(&d.drain.path)
+        || !ok_path(&d.drain.done_path)
+        || d.drain.timeout_secs < 1
+        || d.drain.timeout_secs > 3600
+    {
         return fail(
             code::DRAIN_INVALID,
-            "drain needs an absolute path and timeout_secs 1..3600",
+            "drain needs absolute path and done_path, and timeout_secs 1..3600",
         );
     }
     validate_service_drain(d.service_drain.as_ref(), routes)?;
@@ -916,6 +946,7 @@ fn validate_decl_rules(
     }
     validate_models(&d.models)?;
     validate_env(addon, &d.env)?;
+    validate_slots_env(d.accel.slots_env.as_deref(), &d.env)?;
     validate_scratch(&d.scratch, &d.models)?;
     let l = &d.limits;
     if l.ram_mb < 64
@@ -1169,6 +1200,18 @@ pub struct Accepted {
 pub struct Additional {
     pub id: String,
     pub url: String,
+    /// A `role: notice` file of the set carrying this licence's notice (A10).
+    pub notice_path: Option<String>,
+}
+
+/// The archive a set file was extracted from at staging, of the same
+/// upstream repo and revision (A10). Nodes only see the flat file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FromArchive {
+    pub path: String,
+    pub sha256: String,
+    pub bytes: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -1178,6 +1221,7 @@ pub struct SetFile {
     pub bytes: i64,
     pub sha256: String,
     pub role: String,
+    pub from_archive: Option<FromArchive>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -1258,6 +1302,7 @@ pub fn validate_model_set(bytes: &[u8]) -> Result<ModelSet, Refusal> {
     require_keys(field(src, "local"), "source.local", &["verified"])?;
     for f in items(Some(&g), "files") {
         require_keys(Some(f), "files[]", &["path", "bytes", "sha256"])?;
+        require_keys(field(Some(f), "from_archive"), "files[].from_archive", &["path", "sha256", "bytes"])?;
     }
     for p in items(field(Some(&g), "needs"), "profiles") {
         require_keys(Some(p), "needs.profiles[]", &["name", "accel"])?;
@@ -1298,7 +1343,7 @@ fn check_set(m: &ModelSet) -> Result<(), Refusal> {
     }
     check_source(&m.source)?;
     check_license(&m.license)?;
-    check_files(&m.files, &m.license.notice_files)?;
+    check_files(&m.files, &m.license)?;
     check_needs(&m.needs)?;
     check_fits(m)?;
     check_trust(m)
@@ -1365,7 +1410,8 @@ fn check_license(l: &License) -> Result<(), Refusal> {
     Ok(())
 }
 
-fn check_files(files: &[SetFile], notices: &[String]) -> Result<(), Refusal> {
+fn check_files(files: &[SetFile], lic: &License) -> Result<(), Refusal> {
+    let notices = &lic.notice_files;
     if files.is_empty() || files.len() > MAX_SET_FILES {
         return fail(
             code::FILES_INVALID,
@@ -1373,6 +1419,7 @@ fn check_files(files: &[SetFile], notices: &[String]) -> Result<(), Refusal> {
         );
     }
     let mut have: HashSet<&str> = HashSet::new();
+    let mut role: BTreeMap<&str, &str> = BTreeMap::new();
     for f in files {
         if !valid_set_path(&f.path) {
             return fail(code::PATH_INVALID, format!("file path {:?}", f.path));
@@ -1392,8 +1439,41 @@ fn check_files(files: &[SetFile], notices: &[String]) -> Result<(), Refusal> {
         if !["", "weights", "notice", "config"].contains(&f.role.as_str()) {
             return fail(code::FILES_INVALID, format!("{}: role {:?}", f.path, f.role));
         }
+        if let Some(a) = &f.from_archive {
+            if !valid_set_path(&a.path)
+                || !sha256_re().is_match(&a.sha256)
+                || a.bytes < 1
+                || a.bytes > MAX_SET_FILE_BYTES
+            {
+                return fail(
+                    code::FROM_ARCHIVE_INVALID,
+                    format!("{}: from_archive needs a set path, a lower-case sha256 and bytes", f.path),
+                );
+            }
+            if f.role == "notice" {
+                return fail(
+                    code::FROM_ARCHIVE_INVALID,
+                    format!("{}: a notice file is staged as itself, not extracted from an archive", f.path),
+                );
+            }
+        }
         if !have.insert(f.path.as_str()) {
             return fail(code::FILES_INVALID, format!("path {:?} is listed twice", f.path));
+        }
+        role.insert(f.path.as_str(), f.role.as_str());
+    }
+    for a in &lic.additional {
+        let Some(np) = a.notice_path.as_deref().filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        if !valid_set_path(np) {
+            return fail(code::PATH_INVALID, format!("license.additional {}: notice_path {np:?}", a.id));
+        }
+        if role.get(np) != Some(&"notice") {
+            return fail(
+                code::NOTICE_NOT_IN_FILES,
+                format!("license.additional {}: notice_path {np:?} is not a role notice file in files", a.id),
+            );
         }
     }
     if notices.len() > 16 {
@@ -2134,6 +2214,7 @@ mod tests {
             code::SCRATCH_INVALID,
             code::SCRATCH_IN_MODEL_SLOT,
             code::LIMITS_INVALID,
+            code::SERVICE_DRAIN_INVALID,
             code::ID_INVALID,
             code::REVISION_INVALID,
             code::KIND_INVALID,
@@ -2144,6 +2225,7 @@ mod tests {
             code::PATH_INVALID,
             code::SHA256_INVALID,
             code::FILES_INVALID,
+            code::FROM_ARCHIVE_INVALID,
             code::NOTICE_NOT_IN_FILES,
             code::PROFILE_INVALID,
             code::ARCH_INVALID,
@@ -2203,7 +2285,7 @@ mod tests {
         let entry = |profile: Option<&str>, realtime: bool| DesiredEntry {
             profile: profile.map(String::from),
             decl_parsed: Decl {
-                accel: Accel { gpu: 1, realtime },
+                accel: Accel { gpu: 1, realtime, slots_env: None },
                 ..Default::default()
             },
             ..Default::default()
