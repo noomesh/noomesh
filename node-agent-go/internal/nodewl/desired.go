@@ -234,6 +234,12 @@ func checkSets(sets map[string][]SetRef, slots []Slot) error {
 	return nil
 }
 
+// CheckEnv re-checks an entry's env against its decl's bounds. ParseDesired
+// already does; a caller that hands an Entry on (the provisioner) asks again
+// rather than trust that the Entry came from ParseDesired. Refusal code:
+// env_out_of_bounds.
+func CheckEnv(e Entry) error { return checkEnvValues(e.Env, e.Decl.Env) }
+
 // checkEnvValues re-checks what the gateway already checked: every value
 // against the decl's bound for its key. A key the decl does not declare is out
 // of bounds.

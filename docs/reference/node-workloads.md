@@ -288,13 +288,112 @@ closes that gap.
 - **A1.** The door leaf `svc-addon-<addon>-<workload>` is CLI-issued per (node,
   enabled add-on node workload) in the provision bundle. If it is missing the
   agent refuses with `door_leaf_missing`.
-- **A2.** The node agent is the **only** door client. It dials
-  `127.0.0.1:<door_port>` with its own node leaf. The door is published on
-  loopback only and pins exactly this node's agent CN. `door.admit` must be
+- **A2.** The node agent is the **only** door client. It dials the door with
+  its own node leaf. The door is on the workload's private, internal network
+  (see "Door network": it is not published, because Docker cannot publish from
+  such a network) and pins exactly this node's agent CN. `door.admit` must be
   exactly `[<own agent CN>]`; anything else is `admit_invalid`. The agent picks
-  `door_port` and reports it.
+  `door_port` (today the fixed `8443`, inside the door's own namespace) and
+  reports it.
 - **A3.** The entry above, with the state machine below.
 - **A4.** The heartbeat keys below.
+
+### Door network
+
+A workload gets **no egress**, and its door must still be reachable by the
+agent, a host process. Docker cannot publish a port from a container that is
+attached only to an `internal: true` network (the publish is accepted and
+ignored: `docker port` lists nothing), so publishing on `127.0.0.1` and
+blocking egress separately would need a firewall rule, which is a new
+privilege. The design that needs none:
+
+- **One internal bridge network per workload**, `noo-wl-<addon>-<workload>`,
+  created with `internal: true` and the label `noo.managed-by=agent`. Docker
+  installs no route and no NAT out of it.
+- The **door sidecar** `noo-stunnel-<addon>-<workload>` is attached to it and
+  to nothing else. The **worker** has no network of its own: it joins the
+  sidecar's network namespace (`network_mode: container:noo-stunnel-...`) and
+  listens on `127.0.0.1:<decl.port>`. The worker therefore has exactly the
+  sidecar's reach: its private network and nothing beyond.
+- The door **accepts on the sidecar's address on that network** (port
+  `door_port`) and connects to `127.0.0.1:<decl.port>` inside the shared
+  namespace. The agent dials that address. The host holds the bridge's
+  gateway address on an internal network (Docker 29.2.1 checked), so a host
+  process reaches the sidecar and nothing outside the host or the network can.
+- The address is **per container and changes on recreate**: the agent reads it
+  from the daemon on every dial (`DoorAddr`) and never caches it.
+
+Evidence (Docker 29.2.1, Linux, a throwaway `--internal` network and an
+Ubuntu container): a host TCP connect to the container's address on the
+network succeeded; a connect from inside the container to `1.1.1.1:443` failed
+with "Network is unreachable"; a container on the default bridge timed out
+connecting to it; `-p 127.0.0.1::9000` on the internal network published
+nothing.
+
+Limits, stated: the door is reachable by the **host** (any local process that
+holds a cluster-CA client cert with the agent's CN can complete the handshake;
+without one, stunnel refuses it), not by "loopback only". The contract's
+earlier wording, "published on loopback", described the macOS Docker Desktop
+shape, where a VM's bridge addresses are not routable from the host and an
+internal network cannot be published: on a non-Linux host the agent refuses to
+provision with `door_unreachable` rather than weaken the no-egress rule. Each
+workload takes one address pool slot (Docker's default pools allow about 30
+networks); the bound on how many workloads one node holds is the placement's.
+
+### The worker container
+
+The agent creates the worker with exactly this and nothing more.
+
+| Property | Value |
+|---|---|
+| Image | `image.id`, never a tag |
+| User | `decl.uid`; uid 0 and the agent's own uid are refused (`decl_invalid`, inner `uid_is_agent`) |
+| Root filesystem | read-only |
+| Capabilities | `CapDrop: [ALL]`, no `CapAdd`, `no-new-privileges` |
+| Namespaces | no host pid, ipc, uts or user namespace; not privileged; no `Devices` beyond the GPU request |
+| Mounts | the verified sets, read-only, at each slot's `target` (`<target>/<set id>` for a `many` slot); the declared scratch. No host binds besides the sets, no docker socket, no PKI, no data root, no `/etc/noo` |
+| Scratch | `tmpfs_mb`: a tmpfs of that size. `max_mb`: a per-workload named volume of the local driver backed by a tmpfs of that size (`size=<max_mb>m`, owned by `decl.uid`). Both `nosuid,nodev,noexec` |
+| GPU | `accel.gpu > 0`: a `nvidia` device request, `NVIDIA_DRIVER_CAPABILITIES=compute,utility`, `NVIDIA_VISIBLE_DEVICES` pinned (below) |
+| Env | the entry's declared keys; `<ADDON_UPPER>_MODEL_<SLOT_UPPER>_ID` and `_REVISION` per placed slot (comma-separated for a `many` slot); `HF_HUB_OFFLINE=1`; `TRANSFORMERS_OFFLINE=1`. Nothing else. A declared key that collides with one the agent sets is `env_out_of_bounds` |
+| Limits | memory `limits.ram_mb` (swap equal to memory, so none), `limits.cpus`, `limits.pids` |
+| Restart | `no` |
+| Labels | `noo.addon`, `noo.workload`, `noo.managed-by=agent`, `noo.role`, `noo.spec.hash`, and `noo.reservation` when set |
+
+Only `.verified` sets are bound (a set the agent has not verified is
+`set_unverified`, one it does not hold is `set_missing`, one still being
+fetched is not a refusal: the row stays pending).
+
+- **Scratch size.** Docker's local volume driver cannot cap a volume's size
+  (the `size` option needs an xfs project quota the agent cannot assume), so a
+  `max_mb` volume is a tmpfs-backed volume with `size=<max_mb>m`. The cap is
+  real; the gap is that the space is **memory**, charged to the worker's own
+  cgroup, so a workload that declares more scratch than `limits.ram_mb` is
+  bounded by the RAM limit instead. A disk-backed cap needs xfs quotas and is
+  not built. Scratch is thrown away at release and at recreate.
+- **GPU pinning.** Until the lease (F5b) names a device, the workload is
+  pinned to GPU indices `0..gpu-1`: the request is `Count: gpu` and
+  `NVIDIA_VISIBLE_DEVICES` states the same indices. When the lease supplies
+  devices (an index or a UUID) the request carries those `DeviceIDs` and the
+  same value goes in `NVIDIA_VISIBLE_DEVICES`. Docker refuses `Count` and
+  `DeviceIDs` together, so it is one or the other. Setting
+  `NVIDIA_VISIBLE_DEVICES` from a placement is refused by the env-prefix rule.
+- **The door sidecar** is root with `CapDrop: [ALL]` and `DAC_OVERRIDE` only
+  (to read the 0600 leaf key), a read-only root, `no-new-privileges`, 128 MiB
+  and 64 pids. It is the only container the leaf is mounted into
+  (`svc-addon-<addon>-<workload>.{crt,key}` from the node PKI directory, plus
+  `ca.crt`). Its stunnel config requires a client certificate from the cluster
+  CA (`verify = 2`) and carries exactly one `checkHost`, the entry's
+  `door.admit[0]`, so a certificate from the same CA with any other name is
+  refused at the handshake.
+- **Recreate.** One spec hash (the image, the door image and conf, the leaf's
+  fingerprint, the sets, the env, the limits, the labels) is stored on both
+  containers. A matching pair is left alone; any change removes both (and the
+  scratch volumes) and recreates them stopped. A running worker is never
+  recreated by a provision: it returns `ErrWorkerRunning` and the caller
+  drains first.
+- A container, volume or network with the workload's name that lacks
+  `noo.managed-by=agent` is never adopted, changed or removed:
+  `container_conflict`.
 
 ### Relay rule (the agent is the proxy)
 
@@ -463,6 +562,7 @@ The agent's fixed vocabulary for the `reason` of a `node_workloads` or
 | `start_timeout` | the worker was not ready within `start_secs` | read the worker's logs; raise `start_secs` in the add-on |
 | `crashed` | the worker exited while it should run, or during a drain (it is then recreated fresh and stopped) | read the worker's logs |
 | `drain_timeout` | the drain did not finish in `drain.timeout_secs`; reported as `needs_attention` | wait; the session is never cut |
+| `door_unreachable` | the host cannot route the agent to an internal Docker network (not Linux, e.g. macOS Docker Desktop) and the no-egress rule does not bend | place on a Linux node |
 
 The placement facts (`consent_none`, `consent_unapproved`, `nvidia_runtime_missing`, `driver_caps_missing`, `compute_cap_low`, `arch_mismatch`, `controller_host`, `disk`) are also the gateway's placement refusal codes, spelled identically: the gateway refuses a placement with the code the agent would report.
 
