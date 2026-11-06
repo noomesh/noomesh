@@ -819,10 +819,11 @@ mod refusal_tests {
     /// carries the key.
     #[test]
     fn an_unusable_key_is_warned_once() {
-        let missing: Result<Vault, Error> = Vault::from_secret("short");
+        // A fixture secret no message could contain by accident.
+        let missing: Result<Vault, Error> = Vault::from_secret("fx-7q2-notakey");
         let why = idle_warning(&missing, false).expect("the first idle loop warns");
         assert!(why.contains("integration encryption key"), "{why}");
-        assert!(!why.contains("short"), "the warning never carries the key");
+        assert!(!why.contains("fx-7q2-notakey"), "the warning never carries the key");
         assert_eq!(idle_warning(&missing, true), None, "not again every 10 s");
         let usable = Vault::from_secret(&"k".repeat(32));
         assert_eq!(idle_warning(&usable, false), None);
