@@ -55,6 +55,7 @@ pub struct DirChecked {
 
 /// A scratch entry declared `exec: true`: its worker may run native code it
 /// compiles there. What the operator is told (A12).
+#[allow(dead_code)] // MUTANT: nothing reads these once the output omits them
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecScratch {
     pub workload: String,
@@ -62,6 +63,7 @@ pub struct ExecScratch {
     pub mb: i64,
 }
 
+#[allow(dead_code)] // MUTANT
 impl ExecScratch {
     /// The sentence `noo addons check` prints for it.
     pub fn sentence(&self, addon: &str) -> String {
