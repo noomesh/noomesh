@@ -763,9 +763,13 @@ mod tests {
             .map(|d| d.unwrap().file_name())
             .collect();
         assert_eq!(top, ["voices"]);
-        // `voices` was made by create_dir_all for the file; the entry's 0777 was not applied.
+        // `voices` was made by create_dir_all for the file, so it has the mode
+        // any create_dir_all gets under this umask, not the entry's 0777.
+        let reference = out.with_file_name("dir-skip-reference");
+        std::fs::create_dir_all(&reference).unwrap();
+        let want = std::fs::metadata(&reference).unwrap().permissions().mode();
         let mode = std::fs::metadata(out.join("voices")).unwrap().permissions().mode();
-        assert_ne!(mode & 0o777, 0o777, "the mode of the directory entry was applied");
+        assert_eq!(mode & 0o7777, want & 0o7777, "the mode of the directory entry was applied");
         // A directory entry no file lives under leaves nothing at all.
         let e = vec![dir_entry("extra/", 0), file("a.pt", b"alpha")];
         let (r, out) = run("dir-skip-bare", &gz(&tar(&e)), Some("*.pt"), &SMALL);
