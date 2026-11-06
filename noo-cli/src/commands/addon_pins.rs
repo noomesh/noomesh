@@ -525,9 +525,14 @@ pub(crate) fn launch_lines(root: &Path, tag: &str, names: &[String], anchor: &dy
                 // it: the bytes offline_check just held to the signed hash
                 // are re-validated against the pinned lock's images. A
                 // refusal here is the only line this add-on gets.
+                // routes.json rides along: service_drain.route must be one of
+                // its internal routes.
                 let nw_name = crate::addons::node_workloads::NODE_WORKLOADS_FILE.to_string();
+                let routes_name = crate::addons::decls::ROUTES_FILE.to_string();
                 if files.contains(&nw_name) {
-                    let bytes = pins::materialised_files(root, addon, [&nw_name]);
+                    let wanted: Vec<&String> =
+                        [&nw_name, &routes_name].into_iter().filter(|n| files.contains(*n)).collect();
+                    let bytes = pins::materialised_files(root, addon, wanted);
                     if let Err(why) = crate::addons::decls::check_node_workloads(addon, &bytes, &pin.images) {
                         out.push(format!("refuse {addon} {}", why.replace('\n', " ")));
                         continue;

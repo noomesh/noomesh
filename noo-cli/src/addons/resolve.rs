@@ -1003,14 +1003,15 @@ pub(crate) mod tests {
         assert!(matches!(check(&bad, &anchor(), &want), Err(Refusal::Decl(e)) if e.contains("public route")));
     }
 
-    /// A signed bundle of `rhaddon` carrying [`OVERLAY`] and this
-    /// node-workloads.json.
-    fn signed_rh_bundle(l: &AddonLock, node_workloads: &[u8]) -> Fetched {
+    /// A signed bundle of `rhaddon` carrying [`OVERLAY`], this
+    /// node-workloads.json and this routes.json.
+    fn signed_rh_bundle(l: &AddonLock, node_workloads: &[u8], routes: &[u8]) -> Fetched {
         let mut l = l.clone();
         l.addon = "rhaddon".into();
         l.format = addon_lock::FORMAT_V2.into();
         let mut files = BTreeMap::from([(addon_lock::OVERLAY_FILE.to_string(), OVERLAY.as_bytes().to_vec())]);
         files.insert("node-workloads.json".to_string(), node_workloads.to_vec());
+        files.insert("routes.json".to_string(), routes.to_vec());
         l.files = files.iter().map(|(n, b)| (n.clone(), addon_lock::sha256_ref(b))).collect();
         let (bytes, sig) = addon_lock::sign(&l, &seed()).unwrap();
         Fetched { lock: bytes, sig, files }
@@ -1025,22 +1026,30 @@ pub(crate) mod tests {
     #[test]
     fn a_bad_node_workloads_json_is_refused_with_the_parsers_code() {
         let nw = include_str!("../../../tests/fixtures/addons/rhaddon/node-workloads.json");
+        let rt = include_str!("../../../tests/fixtures/addons/rhaddon/routes.json");
         let want = Want { addon: "rhaddon", stack_tag: "v0.6.0", stack_lock: None, pinned: None, pin: None, allow_downgrade: false };
         let mut l = lock("1.0.0", &["v0.6.0"], None);
         // The lock has no `addon-worker`, the image the fixture's worker names.
-        match check(&signed_rh_bundle(&l, nw.as_bytes()), &anchor(), &want) {
+        match check(&signed_rh_bundle(&l, nw.as_bytes(), rt.as_bytes()), &anchor(), &want) {
             Err(Refusal::Decl(e)) => {
                 assert!(e.contains("image_not_in_lock") && e.contains("node-workloads.json"), "{e}");
             }
             other => panic!("expected a declaration refusal, got {other:?}"),
         }
         l.images.insert("addon-worker".into(), format!("{ROOT}/worker@{}", digest('2')));
-        assert!(check(&signed_rh_bundle(&l, nw.as_bytes()), &anchor(), &want).is_ok());
+        assert!(check(&signed_rh_bundle(&l, nw.as_bytes(), rt.as_bytes()), &anchor(), &want).is_ok());
         // A file that names a lock image but breaks another rule.
         let low_port = nw.replace("\"port\": 9003", "\"port\": 80");
         assert_ne!(low_port, nw, "the fixture still carries the port this test edits");
-        match check(&signed_rh_bundle(&l, low_port.as_bytes()), &anchor(), &want) {
+        match check(&signed_rh_bundle(&l, low_port.as_bytes(), rt.as_bytes()), &anchor(), &want) {
             Err(Refusal::Decl(e)) => assert!(e.contains("port_invalid"), "{e}"),
+            other => panic!("expected a declaration refusal, got {other:?}"),
+        }
+        // service_drain names a route that routes.json does not mark internal.
+        let public = rt.replace(", \"internal\": true", "");
+        assert_ne!(public, rt, "the fixture still marks its drain route internal");
+        match check(&signed_rh_bundle(&l, nw.as_bytes(), public.as_bytes()), &anchor(), &want) {
+            Err(Refusal::Decl(e)) => assert!(e.contains("service_drain_invalid"), "{e}"),
             other => panic!("expected a declaration refusal, got {other:?}"),
         }
         // No node-workloads.json: unchanged.

@@ -292,6 +292,11 @@ pub fn check_bundle(addon: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<De
 /// carries the parser's stable code (`image_not_in_lock`, `port_invalid`, ...).
 /// It takes the lock's images, so it sits beside [`check_bundle`] rather than
 /// in it: `noo addons check` reads a directory and has no lock.
+///
+/// `service_drain.route` must be an internal route of the bundle's own
+/// `routes.json`, so `files` must carry it when the bundle ships one. The CLI
+/// always has the routes: a bundle without `routes.json` has no internal route
+/// and a `service_drain` is then refused, never waved through.
 pub fn check_node_workloads(
     addon: &str,
     files: &BTreeMap<String, Vec<u8>>,
@@ -300,7 +305,10 @@ pub fn check_node_workloads(
     let Some(bytes) = files.get(super::node_workloads::NODE_WORKLOADS_FILE) else {
         return Ok(Vec::new());
     };
-    super::node_workloads::parse_node_workloads(addon, bytes, lock_images)
+    let routes = super::node_workloads::routes_from_json(
+        files.get(ROUTES_FILE).map(Vec::as_slice).unwrap_or_default(),
+    );
+    super::node_workloads::parse_node_workloads(addon, bytes, lock_images, Some(&routes))
         .map_err(|e| format!("{} is refused ({e})", super::node_workloads::NODE_WORKLOADS_FILE))
 }
 
