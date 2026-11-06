@@ -2306,6 +2306,21 @@ CREATE TABLE IF NOT EXISTS noo_node_workload_placements (
 );
 CREATE INDEX IF NOT EXISTS noo_node_workload_placements_node_idx ON noo_node_workload_placements (node_id)
 "#,
+}, Migration {
+    revision: SEAT_BINDING_REVISION,
+    down_revision: Some(NODE_WORKLOAD_PLACEMENTS_REVISION),
+    // i510 part B: a kiosk display mints only as an enrolled, unrevoked seat.
+    // `tailnet_name` is the device name the seat reports on its signed rail
+    // (or an admin binds); the keyless mint matches the tailnet whois name
+    // against it. One device belongs to one seat. `revoked_at` cuts the
+    // seat's rail and its display; re-enrolment clears it. Additive; an
+    // older gateway ignores all three columns.
+    sql: r#"
+ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS tailnet_name text;
+ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS revoked_at timestamptz;
+ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS revoked_by text;
+CREATE UNIQUE INDEX IF NOT EXISTS noo_seats_tailnet_name_uq ON noo_seats (lower(tailnet_name)) WHERE tailnet_name IS NOT NULL
+"#,
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
@@ -2329,6 +2344,11 @@ pub const INTEGRATION_PACING_REVISION: &str = "110_integration_pacing";
 /// numbers after it). A constant so a renumber is one line (and the down
 /// revision).
 pub const NODE_WORKLOAD_PLACEMENTS_REVISION: &str = "111_node_workload_placements";
+
+/// Kiosk seats bound to their tailnet device, and revocable (i510 part B),
+/// on node-workload placements (111).
+/// A constant so a renumber at rebase is one line.
+pub const SEAT_BINDING_REVISION: &str = "112_seat_binding";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
@@ -3264,16 +3284,14 @@ mod tests {
         }
     }
 
-    /// i300 H3b-2: the node-workload placements revision is the chain head,
-    /// sits on 110, fits the revision column, rewrites no row, and creates
+    /// i300 H3b-2: the node-workload placements revision sits on 110, fits the revision column, rewrites no row, and creates
     /// every column the repo writes, keyed one node per (addon, workload).
     #[test]
-    fn node_workload_placements_revision_is_the_head_and_matches_its_writer() {
+    fn node_workload_placements_revision_sits_on_110_and_matches_its_writer() {
         let m = MIGRATIONS.iter().find(|m| m.revision == NODE_WORKLOAD_PLACEMENTS_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "111_node_workload_placements");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(INTEGRATION_PACING_REVISION), "it sits on Google connections' pacing (110)");
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(NODE_WORKLOAD_PLACEMENTS_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_node_workload_placements"));
         assert!(m.sql.contains("PRIMARY KEY (addon, workload)"), "one node per workload: the operator's, strict");
         assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE") && !m.sql.contains("noo_backend_placements"));
@@ -3879,5 +3897,27 @@ mod legacy_layout_tests {
         let _ = sqlx::raw_sql("DROP DATABASE mesh_legacy_test (FORCE)")
             .execute(&admin)
             .await;
+    }
+}
+
+#[cfg(test)]
+mod seat_binding_migration_tests {
+    use super::*;
+
+    /// i510: the seat-binding revision is the chain head, sits on
+    /// node-workload placements (111), and is additive: three nullable columns and a partial
+    /// unique index, nothing rewritten or dropped.
+    #[test]
+    fn seat_binding_revision_is_the_head_and_additive() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == SEAT_BINDING_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "112_seat_binding");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(NODE_WORKLOAD_PLACEMENTS_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(SEAT_BINDING_REVISION), "the chain head");
+        for col in ["tailnet_name text", "revoked_at timestamptz", "revoked_by text"] {
+            assert!(m.sql.contains(&format!("ADD COLUMN IF NOT EXISTS {col}")), "{col}");
+        }
+        assert!(m.sql.contains("CREATE UNIQUE INDEX IF NOT EXISTS noo_seats_tailnet_name_uq"));
+        assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE") && !m.sql.contains("DROP"));
     }
 }

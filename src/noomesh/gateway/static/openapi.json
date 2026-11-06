@@ -21975,6 +21975,74 @@
           }
         }
       }
+    },
+    "/api/cluster/seats/{seat}/bind": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create bind",
+        "description": "[native] POST /api/cluster/seats/{seat}/bind \u2014 `{tailnet_name}`. Admin. Binds the seat to its tailnet device, so its display can mint before the seat's own heartbeat has reported the name (the operator's cutover fallback, i510).",
+        "operationId": "seat_bind",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/seats/{seat}/revoke": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create revoke",
+        "description": "[native] POST /api/cluster/seats/{seat}/revoke \u2014 Admin. Cuts the seat's rail and, through the keyless mint, its display (dark within one token lifetime). Re-enrolment with a new seat token brings it back (i510).",
+        "operationId": "seat_revoke",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
