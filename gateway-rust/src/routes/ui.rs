@@ -38,7 +38,6 @@ pub fn router() -> Router<Arc<AppState>> {
         // ── Dashboard HTML pages ──
         .route("/", get(serve_index))
         .route("/dashboard", get(serve_index))  // redirect to modular shell
-        .route("/voice-space", get(serve_voice_space))
         // The unattended display. The gateway has no SPA
         // fallback — deliberately — so the second HTML entry the console
         // build emits needs its own route or it 404s. Public like `/`:
@@ -98,10 +97,10 @@ async fn serve_index() -> impl IntoResponse {
     serve_index_with_addon(None).await
 }
 
-async fn serve_index_with_addon(addon: Option<&str>) -> axum::response::Response {
+pub(crate) async fn serve_index_with_addon(addon: Option<&str>) -> axum::response::Response {
     let path = format!("{}/index.html", crate::paths::UI_WWW_DIR);
     match tokio::fs::read_to_string(&path).await {
-        Ok(content) => axum::response::Html(voice_space_html(content, addon)).into_response(),
+        Ok(content) => axum::response::Html(addon_space_html(content, addon)).into_response(),
         Err(e) => {
             tracing::error!("dashboard index unreadable at {path}: {e}");
             (
@@ -115,40 +114,11 @@ async fn serve_index_with_addon(addon: Option<&str>) -> axum::response::Response
     }
 }
 
-/// Console-owned shell only; add-on scripts still execute on their isolated
-/// origin. All data and the one-use session handoff remain authenticated.
-async fn serve_voice_space(headers: axum::http::HeaderMap) -> axum::response::Response {
-    let configured_addon = std::env::var("NOO_VOICE_SPACE_ADDON").ok();
-    let addon = configured_addon.as_deref().filter(|name| crate::addon_registry::name_ok(name));
-    let mut response = serve_index_with_addon(addon).await;
-    let origin = addon.and_then(|name| crate::addon_ui::embedding_origin(&headers, name));
-    let configured = std::env::var("NOO_CSP").ok();
-    response.headers_mut().extend(voice_space_headers(origin.as_deref(), configured.as_deref()));
-    response
-}
-
-fn voice_space_html(content: String, addon: Option<&str>) -> String {
+fn addon_space_html(content: String, addon: Option<&str>) -> String {
     match addon.filter(|name| crate::addon_registry::name_ok(name)) {
-        Some(name) => content.replacen("<head>", &format!("<head><meta name=\"noo-voice-space-addon\" content=\"{name}\">"), 1),
+        Some(name) => content.replacen("<head>", &format!("<head><meta name=\"noo-addon-space\" content=\"{name}\">"), 1),
         None => content,
     }
-}
-
-fn voice_space_headers(origin: Option<&str>, configured: Option<&str>) -> axum::http::HeaderMap {
-    use axum::http::{HeaderMap, HeaderName, HeaderValue};
-    let mut headers = HeaderMap::new();
-    headers.insert(axum::http::header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    if let Some(origin) = origin {
-        headers.insert(HeaderName::from_static("permissions-policy"),
-            HeaderValue::from_str(&format!("geolocation=(), camera=(), microphone=(self \"{origin}\")")).unwrap());
-        // Respect an operator's custom CSP or opt-out; extend only the
-        // built-in policy. A restrictive custom policy stays restrictive.
-        if crate::middleware::csp_choice(configured) == crate::middleware::CspChoice::Default {
-            headers.insert(HeaderName::from_static("content-security-policy"),
-                HeaderValue::from_str(&format!("{}; frame-src {origin}", crate::middleware::DEFAULT_CSP)).unwrap());
-        }
-    }
-    headers
 }
 
 /// Serve the kiosk page — `dist/kiosk.html` from the same UI artifact as
@@ -1783,54 +1753,6 @@ mod runbook_title_tests {
 }
 
 #[cfg(test)]
-mod voice_space_tests {
-    use super::*;
-
-    #[test]
-    fn voice_space_configuration_cannot_inject_html() {
-        let html = "<html><head></head><body></body></html>";
-        assert!(voice_space_html(html.into(), Some("rhaddon"))
-            .contains("<meta name=\"noo-voice-space-addon\" content=\"rhaddon\">"));
-        for name in [None, Some(""), Some("\"><script>alert(1)</script>"), Some("../rhaddon")] {
-            assert_eq!(voice_space_html(html.into(), name), html);
-        }
-    }
-
-    #[test]
-    fn voice_space_delegates_only_to_the_isolated_voice_origin() {
-        let origin = "https://mesh.test:8458";
-        let headers = voice_space_headers(Some(origin), None);
-        assert_eq!(headers["permissions-policy"], "geolocation=(), camera=(), microphone=(self \"https://mesh.test:8458\")");
-        let csp = headers["content-security-policy"].to_str().unwrap();
-        assert!(csp.ends_with("frame-src https://mesh.test:8458"));
-        assert!(csp.contains("script-src 'self';") && csp.contains("connect-src 'self';"));
-        assert!(csp.contains("frame-ancestors 'none'"));
-        assert!(!voice_space_headers(None, None).contains_key("permissions-policy"));
-        for custom in ["off", "default-src 'none'"] {
-            assert!(!voice_space_headers(Some(origin), Some(custom)).contains_key("content-security-policy"));
-        }
-        assert!(crate::auth::PUBLIC_PATHS_EXACT.contains(&"/voice-space"));
-        assert!(!crate::auth::PUBLIC_PATHS_EXACT.contains(&"/api/addons/rhaddon/ui-session"));
-    }
-
-    #[tokio::test]
-    async fn voice_space_policy_survives_the_console_security_layer() {
-        let app = axum::Router::<()>::new()
-            .fallback(|| async { (voice_space_headers(Some("https://mesh.test:8458"), None), "shell") })
-            .layer(axum::middleware::from_fn(crate::middleware::security_headers));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let response = reqwest::Client::builder().no_proxy().build().unwrap()
-            .get(format!("http://{address}/voice-space")).send().await.unwrap();
-        server.abort();
-        assert_eq!(response.headers()["x-frame-options"], "DENY");
-        assert_eq!(response.headers()["permissions-policy"], "geolocation=(), camera=(), microphone=(self \"https://mesh.test:8458\")");
-        assert!(response.headers()["content-security-policy"].to_str().unwrap().contains("frame-src https://mesh.test:8458"));
-    }
-}
-
-#[cfg(test)]
 mod registry_raw_tests {
     use super::*;
 
@@ -1999,5 +1921,17 @@ mod browser_key_tests {
         let own = crate::test_src::own_code(src);
         let header = crate::test_src::fn_body(&own, "fn browser_auth_header()");
         assert!(header.contains("secret_opt(BROWSER_KEY)") && !header.contains("NOO_CLUSTER_SECRET"), "{header}");
+    }
+}
+
+#[cfg(test)]
+mod addon_space_tests {
+    #[test]
+    fn only_valid_names_enter_the_shell_metadata() {
+        let html = "<html><head></head></html>";
+        assert!(super::addon_space_html(html.into(), Some("rhaddon")).contains("noo-addon-space"));
+        for name in [None, Some("\"><script>bad</script>"), Some("../rhaddon")] {
+            assert_eq!(super::addon_space_html(html.into(), name), html);
+        }
     }
 }

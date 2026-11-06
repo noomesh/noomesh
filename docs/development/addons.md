@@ -643,22 +643,32 @@ answers `{"uis": [{"addon", "title", "port", "url_base", "can_open"}]}`: a
 User sees the UIs its role may open, an Operator or Admin sees all of them.
 The console's **Add-ons** tab lists them with an **Open** button.
 
-Set `compose_env.NOO_VOICE_SPACE_ADDON` in `noomesh.yaml` to the chosen add-on
-ID (for example `rhaddon`), then recreate the gateway to apply it. Bookmark
-`https://<console DNS>/voice-space`. This
-console-owned page embeds the voice UI on its assigned isolated origin; it does
-not proxy add-on scripts onto the console origin. Sign in and select **Open
-voice**. The address bar remains `/voice-space`, while the assigned add-on port
-must still be reachable. Only this shell delegates microphone permission to
-that exact origin. A custom `NOO_CSP` is respected; it must permit that origin
-in `frame-src` if the operator wants to embed it. Reload/reconnect obtains a new
-one-use handoff, and console logout removes the frame.
+A compatible signed manifest can declare `ui.console_path: "/example-space"`
+and `ui.frame_permissions: ["microphone", "autoplay"]`. The path is a single
+lowercase segment, 2–32 characters, outside the reserved core namespaces.
+Capabilities are limited to microphone, camera, autoplay, fullscreen and
+clipboard-write; undeclared capabilities are denied. Older gateways refuse
+these fields: target a supporting stack release (0.6.18+).
 
-The disposable browser check (`scripts/check_voice_space_browser.py`, after
-building `ui/apps/web`, with Playwright/Chromium installed) exercises real
-loopback HTTPS navigation, cookie binding, origin isolation, microphone
-permission, a synthetic WebSocket roundtrip, reload and logout. It does not
-exercise a deployed gateway or GPU model.
+The console's **Open** link uses the declared path. The console-owned shell
+keeps that address while embedding the add-on on its assigned isolated origin.
+That port must still be reachable. Only the signed capabilities are delegated
+to that exact origin; no console bearer enters the frame. Account logout or
+loss of access removes the frame. Reload requires a fresh one-use handoff.
+A custom `NOO_CSP` is respected and may need that origin in `frame-src`.
+
+Two enabled add-ons cannot claim one path. Enable/upgrade refuses a conflict
+before pulling or pinning; the gateway refuses all colliding path claims,
+reports them in authenticated `/health.addons_paths_refused` and answers 409.
+The add-ons' other routes remain available. `noo cluster verify --controller`
+reports every refused path. The gateway mounts paths at startup and checks
+registration, expiry and enablement on every request. Changed or removed
+claims need a restart; old bookmarks return 404. Keep published paths stable.
+
+The disposable Playwright check (`scripts/check_addon_space_browser.py`, after
+building `ui/apps/web`) exercises HTTPS iframe navigation, cookie binding,
+origin isolation, microphone permission, a synthetic WebSocket roundtrip,
+reload and logout. It does not exercise a deployed gateway or GPU model.
 
 **Session handoff.**
 

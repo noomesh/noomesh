@@ -2261,6 +2261,7 @@ pub fn is_credential_optional(path: &str) -> bool {
 /// handler runs (`seat_cannot_reach_node_routes`).
 pub fn passes_without_bearer_check(path: &str, safe_method: bool, has_bearer: bool) -> bool {
     PUBLIC_PATHS_EXACT.contains(&path)
+        || (safe_method && crate::addon_console::is_claimed_console_path(path))
         || PUBLIC_PATH_PREFIXES.iter().any(|p| path.starts_with(p))
         || (safe_method && PUBLIC_GET_PATH_PREFIXES.iter().any(|p| path.starts_with(p)))
         // Not public: these carry a birth-key proof the HANDLER verifies,
@@ -2315,7 +2316,6 @@ pub const PUBLIC_PATHS_EXACT: &[&str] = &[
     // scraper's service leaf, so the scrape authenticates by certificate and
     // everyone else by an Operator-or-Admin login — see METRICS_READ_PATHS.
     "/dashboard",   // alias for /
-    "/voice-space", // console-owned shell; session mint and add-on APIs still require auth
     // The kiosk page. A top-level navigation cannot carry
     // an Authorization header and the bundle is not the secret: the page
     // holds nothing until the host launcher injects a kiosk token, and
