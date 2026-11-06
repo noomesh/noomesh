@@ -108,11 +108,19 @@ describe('the routes', () => {
     H.invalidate.mockReset();
   });
 
-  it('lists only enabled add-ons from /health', async () => {
-    H.get.mockResolvedValue({ data: { addons: { rhaddon: 'enabled', other: 'disabled', third: 'enabled' } } });
+  it('lists only registered add-ons from /health, never the compiled rows', async () => {
+    H.get.mockResolvedValue({
+      data: {
+        addons: { identity: 'enabled', trellion: 'enabled', trellion_intel: 'enabled', other: 'disabled', rhaddon: 'enabled' },
+        addons_registered: ['rhaddon'],
+      },
+    });
     useAccessAddons();
-    await expect(runQuery()).resolves.toEqual(['rhaddon', 'third']);
+    await expect(runQuery()).resolves.toEqual(['rhaddon']);
     expect(H.get).toHaveBeenCalledWith('/health');
+    // A gateway older than the field: unavailable, never a guessed list.
+    H.get.mockResolvedValue({ data: { addons: { rhaddon: 'enabled' } } });
+    await expect(runQuery()).rejects.toThrow('does not list its registered add-ons');
   });
 
   it('reads one add-on’s access and says the gateway’s refusal', async () => {

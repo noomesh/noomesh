@@ -197,6 +197,20 @@ pub fn health_dev_map() -> Option<serde_json::Value> {
     (!map.is_empty()).then_some(serde_json::Value::Object(map))
 }
 
+/// `/health` `addons_registered`: the add-ons the runtime registry holds,
+/// sorted. These are the only ones with a route manifest, so the only ones
+/// `GET /api/addons/{name}/access` answers. A compiled row of [`ADDONS`]
+/// (identity, trellion, trellion_intel) reads `enabled` in `addons` but is
+/// here only if the registry loaded it, so a reader that needs a manifest
+/// asks this list and never re-derives it from the names (0.6.17-rc.1: the
+/// `add-on access` verify row read `addons` and 404ed every compiled row).
+pub fn health_registered() -> Vec<String> {
+    let mut v: Vec<String> = crate::addon_registry::all().iter().map(|e| e.name().to_string()).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 /// `/health` `addons_refused`: `{ "<name>": "<why>" }` for every add-on
 /// `/health` calls `unhealthy` because the gateway refused it (at load, at
 /// mount, or a development key that expired), with the text the gateway log
@@ -400,6 +414,18 @@ pub fn identity_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A compiled row is not a registered add-on: with nothing in the
+    /// runtime registry, `/health` lists every compiled row in `addons` and
+    /// none in `addons_registered`.
+    #[test]
+    fn a_compiled_row_is_not_registered() {
+        let reg = health_registered();
+        for a in ADDONS {
+            assert!(health_names().iter().any(|n| n == a.name), "{} is in addons", a.name);
+            assert!(crate::addon_registry::get(a.name).is_some() || !reg.iter().any(|n| n == a.name), "{} listed but not registered", a.name);
+        }
+    }
+
     use super::*;
 
     #[test]
