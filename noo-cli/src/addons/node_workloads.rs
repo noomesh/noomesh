@@ -884,6 +884,8 @@ mod tests {
         let cases = cases();
         let mut valid = 0;
         let mut refused = 0;
+        // Every mismatch is collected, so one run names every fixture that flipped.
+        let mut mismatches: Vec<String> = Vec::new();
         for c in &cases {
             let file = c["file"].as_str().unwrap();
             let want = c["code"].as_str().unwrap();
@@ -891,15 +893,42 @@ mod tests {
             let got = parse_node_workloads(addon, &read(file), &images, Some(&routes()));
             if want.is_empty() {
                 valid += 1;
-                assert!(got.is_ok(), "{file} should parse: {:?}", got.err());
             } else {
                 refused += 1;
-                let e = got.expect_err(file);
-                assert_eq!(e.code(), want, "{file}: {e}");
-                assert!(!e.message().is_empty(), "{file} has no message");
+            }
+            let (code, empty_msg, msg) = match &got {
+                Ok(_) => ("ok".to_string(), false, String::new()),
+                Err(e) => (e.code().to_string(), e.message().is_empty(), e.to_string()),
+            };
+            let want_code = if want.is_empty() { "ok" } else { want };
+            if code != want_code {
+                mismatches.push(format!("{file}: expected {want_code}, got {code} {msg}"));
+            } else if empty_msg {
+                mismatches.push(format!("{file}: expected {want_code}, got no message"));
             }
         }
+        assert!(
+            mismatches.is_empty(),
+            "{} fixtures differ:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
         assert!(valid >= 9 && refused >= 49, "read {valid} valid and {refused} refusals");
+    }
+
+    #[test]
+    fn a_null_in_an_optional_field_is_refused_as_field_type() {
+        // `min` is an Option: serde alone reads the null as None, and the decl
+        // (max 4 still bounds the key) stays valid. Only the null guard refuses it.
+        let images = lock_images();
+        let routes = routes();
+        let text = String::from_utf8(read("valid-full.json")).unwrap();
+        let nulled = text.replace("\"min\": 1,", "\"min\": null,");
+        assert_ne!(nulled, text);
+        let ok = parse_node_workloads("rhaddon", text.as_bytes(), &images, Some(&routes));
+        assert!(ok.is_ok(), "{:?}", ok.err());
+        let got = parse_node_workloads("rhaddon", nulled.as_bytes(), &images, Some(&routes));
+        assert_eq!(got.unwrap_err().code(), "field_type");
     }
 
     #[test]
