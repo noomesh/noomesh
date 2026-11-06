@@ -282,6 +282,63 @@ pub(crate) fn carry_lanes(data: &mut Value, body: &Value) {
     }
 }
 
+/// One i300 (A4) heartbeat key the gateway stores, and the only shape it
+/// accepts. The agent OMITS a key it does not know (an error must not become
+/// a fact, i495), so absent or of the wrong shape is UNKNOWN: the key is
+/// removed from the record, never kept from an earlier beat and never
+/// defaulted. Shapes: docs/reference/node-workloads.md "Heartbeat keys".
+#[derive(Clone, Copy)]
+enum BeatShape {
+    Str,
+    Bool,
+    Num,
+    OneOf(&'static [&'static str]),
+    /// A list of objects, at most this many.
+    Objects(usize),
+}
+
+/// The A4 keys. Placement (i300 H3) reads only what this stores: a key left
+/// off this list is dropped on the floor by the handler, as `lanes` were
+/// before #717.
+const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
+    ("gpu_compute_cap", BeatShape::Str),
+    ("nvidia_runtime", BeatShape::Bool),
+    ("nvidia_driver_caps_ok", BeatShape::Bool),
+    ("controller_host", BeatShape::Bool),
+    ("data_root_free_gb", BeatShape::Num),
+    ("addon_workloads_policy", BeatShape::OneOf(&["none", "approve", "auto"])),
+    ("addon_workloads_approvals", BeatShape::Objects(256)),
+    ("model_sets", BeatShape::Objects(256)),
+    ("node_workloads", BeatShape::Objects(64)),
+];
+
+fn beat_shape_ok(v: &Value, shape: BeatShape) -> bool {
+    match shape {
+        BeatShape::Str => v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 64),
+        BeatShape::Bool => v.is_boolean(),
+        BeatShape::Num => v.as_f64().is_some_and(f64::is_finite),
+        BeatShape::OneOf(allowed) => v.as_str().is_some_and(|s| allowed.contains(&s)),
+        BeatShape::Objects(max) => v
+            .as_array()
+            .is_some_and(|a| a.len() <= max && a.iter().all(Value::is_object)),
+    }
+}
+
+/// Store the i300 node facts from this beat; each one absent or misshapen is
+/// removed (unknown), on every beat.
+pub(crate) fn carry_i300(data: &mut Value, body: &Value) {
+    for (key, shape) in I300_BEAT_KEYS {
+        match body.get(*key).filter(|v| beat_shape_ok(v, *shape)) {
+            Some(v) => data[*key] = v.clone(),
+            None => {
+                if let Some(o) = data.as_object_mut() {
+                    o.remove(*key);
+                }
+            }
+        }
+    }
+}
+
 async fn node_heartbeat(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
@@ -310,6 +367,7 @@ async fn node_heartbeat(
     carry_load(&mut data, &body);
     data["running_backends"] = body.get("running_backends").cloned().unwrap_or(json!({}));
     carry_lanes(&mut data, &body);
+    carry_i300(&mut data, &body);
     // The node on the controller's own device says so (NOO_SELF_NODE);
     // fleet views and node verbs branch on it.
     if let Some(v) = body.get("self_node") { if !v.is_null() { data["self_node"] = v.clone(); } }
@@ -8237,6 +8295,71 @@ mod load_carried_tests {
         let placed: Vec<&str> =
             get_candidate_nodes(&snaps, None, None, TaskPriority::Medium, 0.0, &CompanionPolicies::default()).iter().map(|n| n.id.as_str()).collect();
         assert_eq!(placed, ["b-linux", "a-mac"], "placement");
+    }
+}
+
+#[cfg(test)]
+mod i300_beat_tests {
+    use super::*;
+
+    /// A beat carrying every A4 key (the shapes of #748's heartbeat-i300.json).
+    fn full_beat() -> Value {
+        json!({
+            "gpu_compute_cap": "8.6",
+            "nvidia_runtime": true,
+            "nvidia_driver_caps_ok": true,
+            "controller_host": false,
+            "data_root_free_gb": 412.5,
+            "addon_workloads_policy": "approve",
+            "addon_workloads_approvals": [{"addon": "rhaddon", "digest": format!("sha256:{}", "a".repeat(64))}],
+            "model_sets": [{"id": "rh-voice", "revision": "r1", "state": "verified"}],
+            "node_workloads": [{"addon": "rhaddon", "name": "worker", "state": "provisioned", "ready": false, "door_port": 41001}],
+        })
+    }
+
+    /// Every A4 key reaches the record; a later beat without it (an older
+    /// agent, or the fact became unknown) removes it rather than keeping the
+    /// last value; a misshapen value is unknown, not stored.
+    #[test]
+    fn every_i300_key_is_stored_and_an_absent_or_misshapen_one_is_removed() {
+        let mut data = json!({"id": "n1"});
+        carry_i300(&mut data, &full_beat());
+        for (key, _) in I300_BEAT_KEYS {
+            assert_eq!(data.get(*key), full_beat().get(*key), "{key} stored");
+        }
+        carry_i300(&mut data, &json!({"running_backends": {}}));
+        for (key, _) in I300_BEAT_KEYS {
+            assert!(data.get(*key).is_none(), "{key}: absent from the beat, so unknown: {data}");
+        }
+        let too_many: Vec<Value> = (0..257).map(|_| json!({})).collect();
+        let bad = json!({
+            "gpu_compute_cap": 8.6,
+            "nvidia_runtime": "yes",
+            "data_root_free_gb": "lots",
+            "addon_workloads_policy": "always",
+            "model_sets": [1, 2],
+            "node_workloads": {"addon": "rhaddon"},
+            "addon_workloads_approvals": too_many,
+        });
+        carry_i300(&mut data, &full_beat());
+        carry_i300(&mut data, &bad);
+        for key in ["gpu_compute_cap", "nvidia_runtime", "data_root_free_gb", "addon_workloads_policy", "model_sets", "node_workloads", "addon_workloads_approvals"] {
+            assert!(data.get(key).is_none(), "{key}: a misshapen value is unknown, never kept: {data}");
+        }
+        // An empty list is a fact (no sets, no workloads), not unknown.
+        carry_i300(&mut data, &json!({"model_sets": [], "node_workloads": []}));
+        assert_eq!(data["model_sets"], json!([]));
+        assert_eq!(data["node_workloads"], json!([]));
+    }
+
+    /// The handler runs this step before its KV write.
+    #[test]
+    fn the_heartbeat_handler_stores_the_i300_keys_before_its_write() {
+        let code = crate::test_src::own_code(include_str!("cluster.rs"));
+        let beat = crate::test_src::fn_body(&code, "async fn node_heartbeat(");
+        let carry = beat.find("carry_i300(&mut data, &body);").expect("the heartbeat stores the i300 keys");
+        let put = beat.find("kv.put(&node_id").expect("the heartbeat's KV write");
+        assert!(carry < put, "stored before the record is written");
     }
 }
 
