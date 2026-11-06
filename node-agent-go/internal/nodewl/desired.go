@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 )
 
 // Node workload states in desired-config.
@@ -47,9 +48,28 @@ type Entry struct {
 	State       string  `json:"state"`
 }
 
+// ImageRef names the worker's image. The lock digest is the REGISTRY
+// MANIFEST digest; a docker image ID is the CONFIG digest, and a classic
+// `docker save` drops RepoDigests, so a node cannot check a loaded tar against
+// the lock digest. ID is therefore the image ID the CLI recorded after its
+// digest-verified pull (the `.imageid` sidecar, written only by the CLI at
+// staging and read by the gateway when it builds the entry, never cached across
+// a restage). On the node the worker is created from ID, never from a tag or
+// repo name; the tar must load as EXACTLY one image whose ID equals ID (else
+// image_digest_mismatch, F5); Digest is record-only there.
 type ImageRef struct {
-	Name   string `json:"name"`
-	Digest string `json:"digest"`
+	Name     string `json:"name"`
+	Digest   string `json:"digest"`
+	ID       string `json:"id"`
+	Artifact string `json:"artifact"`
+}
+
+// artifactRe is the rail artifact name of a staged image tar for (addon,
+// image name, digest): noo-addon-wl_<addon>_<image name>_<64hex of digest>_<arch>.tar.
+// Matching <arch> against the node's own is a runtime check (F5,
+// arch_mismatch).
+func artifactRe(addon, name, digest string) *regexp.Regexp {
+	return regexp.MustCompile("^" + regexp.QuoteMeta("noo-addon-wl_"+addon+"_"+name+"_"+strings.TrimPrefix(digest, "sha256:")+"_") + `(amd64|arm64)\.tar$`)
 }
 
 type SetRef struct {
@@ -140,7 +160,13 @@ func parseEntry(raw []byte, ownAgentCN string) (Entry, error) {
 		return e, fail(ReasonDesiredInvalid, "name %q differs from decl.name %q", e.Name, d.Name)
 	}
 	if e.Image.Name != d.Image || !digestRe.MatchString(e.Image.Digest) {
-		return e, fail(ReasonImageMissing, "image must be {name: %q, digest: sha256:<64 hex>}", d.Image)
+		return e, fail(ReasonImageMissing, "image must be {name: %q, digest: sha256:<64 hex>, id, artifact}", d.Image)
+	}
+	if !digestRe.MatchString(e.Image.ID) {
+		return e, fail(ReasonImageMissing, "image.id must be sha256:<64 lower-case hex>")
+	}
+	if !artifactRe(e.Addon, e.Image.Name, e.Image.Digest).MatchString(e.Image.Artifact) {
+		return e, fail(ReasonImageMissing, "image.artifact must be noo-addon-wl_%s_%s_<hex of digest>_<amd64|arm64>.tar", e.Addon, e.Image.Name)
 	}
 	if e.Door == nil || e.Door.Leaf == "" {
 		return e, fail(ReasonDoorLeafMissing, "door.leaf is required")

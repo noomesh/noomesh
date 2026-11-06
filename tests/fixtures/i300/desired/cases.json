@@ -125,6 +125,51 @@
     "code": "image_missing"
   },
   {
+    "file": "refuse-image-id-not-sha256.json",
+    "valid": false,
+    "code": "image_missing"
+  },
+  {
+    "file": "refuse-image-id-uppercase.json",
+    "valid": false,
+    "code": "image_missing"
+  },
+  {
+    "file": "refuse-image-id-absent.json",
+    "valid": false,
+    "code": "image_missing"
+  },
+  {
+    "file": "refuse-artifact-pattern.json",
+    "valid": false,
+    "code": "image_missing"
+  },
+  {
+    "file": "refuse-artifact-absent.json",
+    "valid": false,
+    "code": "image_missing"
+  },
+  {
+    "file": "refuse-artifact-hex-differs.json",
+    "valid": false,
+    "code": "image_missing"
+  },
+  {
+    "file": "refuse-artifact-addon-differs.json",
+    "valid": false,
+    "code": "image_missing"
+  },
+  {
+    "file": "refuse-artifact-image-differs.json",
+    "valid": false,
+    "code": "image_missing"
+  },
+  {
+    "file": "refuse-artifact-arch.json",
+    "valid": false,
+    "code": "image_missing"
+  },
+  {
     "file": "refuse-image-name-differs.json",
     "valid": false,
     "code": "image_missing"
