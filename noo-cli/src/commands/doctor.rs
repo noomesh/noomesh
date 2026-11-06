@@ -1277,11 +1277,11 @@ pub(crate) fn is_our_container(container: &str) -> bool {
 /// is a property of how the stack was launched, so changing it is a declared
 /// value plus a recreate, which is the operator's call.
 ///
-/// Why it exists: `docker-compose.cluster.yml:110` publishes the gateway as
-/// `${NOO_BIND_ADDR:-0.0.0.0}:8080`, and `NOO_BIND_MODE` defaults to `all`.
-/// The default is deliberate and non-breaking — but nothing in onboarding
-/// offers the tailnet mode and no check ever mentioned it, so an install that
-/// never chose is indistinguishable from one that chose `all` on purpose.
+/// Why it exists: an install that never chose a bind mode used to be
+/// indistinguishable from one that chose `all` on purpose. The launcher now
+/// refuses an unset `NOO_BIND_MODE`, and the compose default is loopback
+/// (i515a), so a 0.0.0.0 publish is either the recorded `all` decision or a
+/// container started some other way.
 /// Found 2026-09-18 while chasing the trellion-intel 401 burst: a LAN address
 /// held nine connections to `:8080`, which the tailnet ACL does not govern.
 pub fn doctor_exposure(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
