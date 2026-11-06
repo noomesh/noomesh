@@ -243,9 +243,19 @@ impl SeatConfig {
     }
 }
 
-/// The seat user of an enrolled seat on THIS box (`/etc/noo-seat/seat.json`,
-/// root-owned), or None when this box is not a seat. `noo kiosk setup` uses
-/// it to put the display's scripts in the seat's shared dir.
+/// The seat name of an enrolled seat on THIS box (`/etc/noo-seat/seat.json`,
+/// root-owned), or None when this box is not a seat. `noo kiosk set` uses it
+/// to point at the controller, which sets a seat's display (i510 c1).
+pub(crate) fn enrolled_seat_name() -> Option<String> {
+    let b = std::fs::read(Path::new(SEAT_DIR).join("seat.json")).ok()?;
+    let cfg: SeatConfig = serde_json::from_slice(&b).ok()?;
+    cfg.validate().ok()?;
+    Some(cfg.seat)
+}
+
+/// The seat user of an enrolled seat on THIS box, or None when this box is
+/// not a seat. `noo kiosk setup` uses it to put the display's scripts in the
+/// seat's shared dir.
 pub(crate) fn enrolled_seat_user() -> Option<String> {
     let b = std::fs::read(Path::new(SEAT_DIR).join("seat.json")).ok()?;
     let cfg: SeatConfig = serde_json::from_slice(&b).ok()?;
@@ -1371,6 +1381,10 @@ fn heartbeat_body_with(cfg: &SeatConfig, state: &SeatState, layout: &str, cli_ve
     let user_sha = std::fs::read(cfg.cli_path()).ok().map(|b| sha256_hex(&b));
     let console = sh_out(Command::new(format!("{KIOSK_BIN}/noo-kiosk-cdp")).arg("build"))
         .filter(|b| !b.is_empty() && b != "null");
+    // What the page is drawn with now (its URL query): the controller's
+    // display settings once applied, the launcher's otherwise (i510 c1).
+    let page_search = sh_out(Command::new(format!("{KIOSK_BIN}/noo-kiosk-cdp")).arg("search"))
+        .filter(|s| s != "null");
     let kiosk_env = kiosk_env_from(std::fs::read_to_string(super::kiosk::ENV_FILE));
     let tailnet = match sh_out(Command::new("tailscale").args(["status", "--json"])) {
         Some(raw) => tailnet_self(&raw).unwrap_or_else(|why| json!({ "error": why })),
@@ -1385,6 +1399,7 @@ fn heartbeat_body_with(cfg: &SeatConfig, state: &SeatState, layout: &str, cli_ve
         "kiosk_display": unit_state("kiosk.service"),
         "kiosk_bins": kiosk_bins_layout(Path::new("/"), &cfg.cli_home),
         "console_build": console,
+        "page_search": page_search,
         "kiosk": kiosk_json(&kiosk_env),
         "last_applied_sha": state.last_applied_sha,
         "display": state.display,
@@ -1947,6 +1962,7 @@ pub fn kiosk_seats(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         [] => {}
         [verb, seat, device] if verb == "bind" => return Ok(seat_bind(g, seat, device)),
         [verb, seat, rest @ ..] if verb == "revoke" => return Ok(seat_revoke(g, seat, rest)),
+        [verb, seat, key, value] if verb == "set" => return Ok(seat_display_set(g, seat, key, value)),
         _ => return Err(Unhandled),
     }
     let Some(seats) = list_seats(g) else {
@@ -1995,6 +2011,31 @@ fn seat_bind(g: &Globals, seat: &str, device: &str) -> i32 {
         format!("{seat} → {} ({})", out["tailnet_name"].as_str().unwrap_or(device), if changed { "bound" } else { "already bound" }),
     )]));
     ui::guide(&[("noo cluster verify", "the seat's binding row should now read bound")]);
+    0
+}
+
+/// `noo kiosk seats set <seat> quality|view|rotate|poll <value>`: the
+/// display's settings, set from the controller (i510 c1). The page applies
+/// them within a minute by reloading itself; nothing at the box changes and
+/// no sudo is needed there. `default` hands a key back to the box's own
+/// /etc/default/kiosk value. The gateway validates the value.
+fn seat_display_set(g: &Globals, seat: &str, key: &str, value: &str) -> i32 {
+    let out = crate::http::post_json(
+        g,
+        &format!("/api/cluster/seats/{seat}/display"),
+        &json!({ "key": key, "value": value }),
+        true,
+        15,
+    );
+    if g.json {
+        println!("{out}");
+        return 0;
+    }
+    println!("{}", ui::kv(&[
+        ("seat", seat.to_string()),
+        ("display", out["display"].to_string()),
+    ]));
+    ui::guide(&[("noo kiosk seats", "the page reloads onto it within a minute; its heartbeat then shows it")]);
     0
 }
 

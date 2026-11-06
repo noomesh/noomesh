@@ -2248,6 +2248,17 @@ ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS revoked_at timestamptz;
 ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS revoked_by text;
 CREATE UNIQUE INDEX IF NOT EXISTS noo_seats_tailnet_name_uq ON noo_seats (lower(tailnet_name)) WHERE tailnet_name IS NOT NULL
 "#,
+}, Migration {
+    revision: SEAT_DISPLAY_REVISION,
+    down_revision: Some(SEAT_BINDING_REVISION),
+    // i510 part B, c1: what the controller sets for a seat's display
+    // (quality, view, rotate, poll), read by the page through its proxy.
+    // An absent key keeps the box's own /etc/default/kiosk value. Additive.
+    sql: r#"
+ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS display jsonb;
+ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS display_set_by text;
+ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS display_set_at timestamptz
+"#,
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
@@ -2261,6 +2272,10 @@ pub const REQUEST_TRACE_REVISION: &str = "105_request_trace";
 /// Kiosk seats bound to their tailnet device, and revocable (i510 part B).
 /// A constant so a renumber at rebase is one line.
 pub const SEAT_BINDING_REVISION: &str = "106_seat_binding";
+
+/// Display settings the controller sets for a kiosk seat (i510 c1). A
+/// constant so a renumber at rebase is one line.
+pub const SEAT_DISPLAY_REVISION: &str = "107_seat_display";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
@@ -3792,20 +3807,38 @@ mod legacy_layout_tests {
 mod seat_binding_migration_tests {
     use super::*;
 
-    /// i510: the seat-binding revision is the chain head, sits on request
+    /// i510: the seat-binding revision sits on request
     /// tracing, and is additive: three nullable columns and a partial
     /// unique index, nothing rewritten or dropped.
     #[test]
-    fn seat_binding_revision_is_the_head_and_additive() {
+    fn seat_binding_revision_is_additive() {
         let m = MIGRATIONS.iter().find(|m| m.revision == SEAT_BINDING_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "106_seat_binding");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(REQUEST_TRACE_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(SEAT_BINDING_REVISION), "the chain head");
         for col in ["tailnet_name text", "revoked_at timestamptz", "revoked_by text"] {
             assert!(m.sql.contains(&format!("ADD COLUMN IF NOT EXISTS {col}")), "{col}");
         }
         assert!(m.sql.contains("CREATE UNIQUE INDEX IF NOT EXISTS noo_seats_tailnet_name_uq"));
+        assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE") && !m.sql.contains("DROP"));
+    }
+}
+
+#[cfg(test)]
+mod seat_display_migration_tests {
+    use super::*;
+
+    /// i510 c1: the seat-display revision is the chain head, sits on seat
+    /// binding, and only adds nullable columns.
+    #[test]
+    fn seat_display_revision_is_the_head_and_additive() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == SEAT_DISPLAY_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "107_seat_display");
+        assert_eq!(m.down_revision, Some(SEAT_BINDING_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(SEAT_DISPLAY_REVISION), "the chain head");
+        for col in ["display jsonb", "display_set_by text", "display_set_at timestamptz"] {
+            assert!(m.sql.contains(&format!("ADD COLUMN IF NOT EXISTS {col}")), "{col}");
+        }
         assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE") && !m.sql.contains("DROP"));
     }
 }

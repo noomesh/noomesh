@@ -34,6 +34,7 @@ Subcommands (all exit non-zero on failure):
   heartbeat             window.__nooKioskHeartbeat (ms epoch) or "null"
   frame                 the graph page's {ms, quality} frame measure as JSON, or "null"
   build                 the stack tag this console was built from, or "null"
+  search                the page's own URL query (view, quality, rotate, poll), or "null"
   probe                 exit 0 iff the broker published within FRESH_FOR seconds
 """
 import http.server, json, os, secrets, socket, string, struct, subprocess, sys, threading, time, urllib.request, urllib.error
@@ -337,6 +338,9 @@ def publish_once(pipe):
         # A string literal in the bundle, so it survives minification.
         "build": pipe.evaluate("window.__nooKioskBuild ?? null"),
         "frame": pipe.evaluate("window.__nooKioskFrame ?? null"),
+        # What the page is actually showing with: the launcher's URL, or the
+        # controller's settings once the page reloaded onto them (i510 c1).
+        "search": pipe.evaluate("location.search"),
         "updated_at": int(time.time()),
     }
     write_page_file(facts)
@@ -492,6 +496,9 @@ def main(argv):
         # "null" on a view that does not measure one.
         v = page_facts().get("frame")
         print("null" if v is None else json.dumps(v))
+    elif cmd == "search":
+        v = page_facts().get("search")
+        print("null" if v is None else str(v))
     elif cmd == "probe":
         page_facts()
         print("ok")

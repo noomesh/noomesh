@@ -86,6 +86,43 @@ pub async fn revoke(db: &PgPool, seat: &str, by: &str) -> Result<bool, sqlx::Err
     Ok(n > 0)
 }
 
+/// The display settings the controller set for the unrevoked seat bound to
+/// this tailnet device: `Some({})` when none are set, `None` when the device
+/// is no seat's.
+pub async fn display_for_tailnet(db: &PgPool, tailnet_name: &str) -> Result<Option<(String, serde_json::Value)>, sqlx::Error> {
+    let row: Option<(String, Option<serde_json::Value>)> = sqlx::query_as(
+        "SELECT seat_name, display FROM noo_seats WHERE lower(tailnet_name) = lower($1) AND revoked_at IS NULL",
+    )
+    .bind(tailnet_name)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|(seat, d)| (seat, d.unwrap_or_else(|| serde_json::json!({})))))
+}
+
+/// The display settings stored for `seat` (`{}` when none), or `None` when
+/// no such seat is enrolled.
+pub async fn display_of(db: &PgPool, seat: &str) -> Result<Option<serde_json::Value>, sqlx::Error> {
+    let row: Option<(Option<serde_json::Value>,)> = sqlx::query_as("SELECT display FROM noo_seats WHERE seat_name = $1")
+        .bind(seat)
+        .fetch_optional(db)
+        .await?;
+    Ok(row.map(|(d,)| d.unwrap_or_else(|| serde_json::json!({}))))
+}
+
+/// Store `display` for `seat`. Returns false when no such seat is enrolled.
+pub async fn set_display(db: &PgPool, seat: &str, display: &serde_json::Value, by: &str) -> Result<bool, sqlx::Error> {
+    let n = sqlx::query(
+        "UPDATE noo_seats SET display = $2, display_set_by = $3, display_set_at = now() WHERE seat_name = $1",
+    )
+    .bind(seat)
+    .bind(display)
+    .bind(by)
+    .execute(db)
+    .await?
+    .rows_affected();
+    Ok(n > 0)
+}
+
 #[cfg(test)]
 mod db_tests {
     use super::*;
