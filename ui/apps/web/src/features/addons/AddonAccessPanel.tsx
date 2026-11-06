@@ -50,7 +50,7 @@ export function AddonAccessPanel() {
       </div>
       {addons.isLoading && <div className="state">Loading add-ons…</div>}
       {addons.isError && <div className="state err">{(addons.error as Error)?.message}</div>}
-      {addons.data && !addons.data.length && <div className="state">No add-on is enabled.</div>}
+      {addons.data && !addons.data.length && <div className="state">No add-on is registered.</div>}
       {addons.data && addons.data.length > 0 && (
         <div className="addon-access-pick" role="tablist" aria-label="Add-on">
           {addons.data.map((a) => (

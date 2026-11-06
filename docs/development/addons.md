@@ -177,6 +177,13 @@ lock reads: "add-on `<name>` is enabled in noomesh.yaml but has no verified lock
 for this stack ... Run `noo addons upgrade <name>`". A lock verified for another
 stack is refused the same way, naming both stacks.
 
+The authenticated `/health` also lists `addons_registered`: the add-ons the
+registry loaded, sorted (`[]` when none). These are the only add-ons with a
+manifest, so the only ones `GET /api/addons/{name}/access` answers. A compiled
+add-on (identity, trellion, trellion_intel) reads `enabled` in `addons` but is
+not listed there. The `add-on access` row of `noo cluster verify --controller`
+and the console's Add-on access page read this list, never the `enabled` words.
+
 When `noo stack start|restart` cannot verify an add-on's pin for the running
 stack (a lock for another stack, a bad signature, edited bundle files, an
 expired development key, its image not local), it leaves **that add-on** out of
