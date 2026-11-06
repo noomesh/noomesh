@@ -456,6 +456,8 @@ pub struct UiEntry {
     pub url_base: Option<String>,
     /// May this caller open it (`ui.min_role`)?
     pub can_open: bool,
+    pub console_path: Option<String>,
+    pub frame_permissions: Option<Vec<addon_manifest::FramePermission>>,
 }
 
 /// The listing, pure over its inputs: every enabled add-on with a `ui` and an
@@ -484,6 +486,8 @@ pub fn ui_entries(
                 port,
                 url_base: host.map(|h| format!("https://{h}:{port}")),
                 can_open,
+                console_path: ui.console_path.clone(),
+                frame_permissions: ui.frame_permissions.clone(),
             })
         })
         .collect();
@@ -496,7 +500,7 @@ async fn ui_list(headers: HeaderMap, ctx: Option<axum::Extension<crate::auth::Re
     let role = ctx.as_ref().map(|axum::Extension(r)| r.role);
     let account = ctx.as_ref().map(|axum::Extension(r)| crate::auth::account_of(&r.sub).to_string());
     let ports = PORTS.get().cloned().unwrap_or_default();
-    let entries = ui_entries(
+    let mut entries = ui_entries(
         &crate::addon_proxy::manifests(),
         &ports,
         role,
@@ -504,6 +508,9 @@ async fn ui_list(headers: HeaderMap, ctx: Option<axum::Extension<crate::auth::Re
         request_host(&headers),
         &crate::addons::enabled,
     );
+    for entry in &mut entries {
+        entry.console_path = crate::addon_console::listed_path(&entry.addon, entry.console_path.as_deref());
+    }
     Json(json!({ "uis": entries })).into_response()
 }
 
@@ -1260,7 +1267,7 @@ mod tests {
         let on = |_: &str| true;
         let user = ui_entries(&ms, &ports, Some(Role::User), None, Some("h.ts.net"), &on);
         assert_eq!(user.len(), 1);
-        assert_eq!(user[0], UiEntry { addon: "evolve".into(), title: "Voice".into(), port: 8451, url_base: Some("https://h.ts.net:8451".into()), can_open: true });
+        assert_eq!(user[0], UiEntry { addon: "evolve".into(), title: "Voice".into(), port: 8451, url_base: Some("https://h.ts.net:8451".into()), can_open: true, console_path: None, frame_permissions: None });
         let op = ui_entries(&ms, &ports, Some(Role::Operator), None, None, &on);
         assert_eq!(op.iter().map(|e| (e.addon.as_str(), e.can_open)).collect::<Vec<_>>(), [("evolve", true), ("other", true)]);
         let machine = ui_entries(&ms, &ports, None, None, None, &on);

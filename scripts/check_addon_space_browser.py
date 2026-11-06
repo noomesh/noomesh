@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026 PersonifAI LLC
-"""Test the built Voice Space against two disposable loopback HTTPS origins.
+"""Test the built add-on console space against two disposable loopback HTTPS origins.
 
 Run after the web build with Playwright installed. Synthetic credentials, fake
 microphone, and WebSocket echo only: no fleet connection or GPU inference.
@@ -66,22 +66,26 @@ def peers():
         def get(self):
             path = urlsplit(self.path).path
             if self.server is console:
+                if path == '/api/addons/ui':
+                    return self.reply({'uis': [{'addon': 'rhaddon', 'title': 'Example workspace', 'port': voice.server_port,
+                        'url_base': voice_origin, 'can_open': True, 'console_path': '/example-space',
+                        'frame_permissions': ['microphone', 'autoplay']}]})
                 if path == '/auth/me':
                     return self.reply({'username': 'alice', 'scopes': ['read']})
-                file = DIST / ('index.html' if path == '/voice-space' else path.lstrip('/'))
+                file = DIST / ('index.html' if path == '/example-space' else path.lstrip('/'))
                 if not file.resolve().is_relative_to(DIST.resolve()) or not file.is_file():
                     return self.reply(status=404)
                 headers = {}
-                if path == '/voice-space':
+                if path == '/example-space':
                     headers = {'Content-Security-Policy': (
                         "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "
                         "script-src 'self'; connect-src 'self'; font-src 'self' data:; object-src 'none'; "
                         "frame-ancestors 'none'; base-uri 'self'; form-action 'self'; frame-src "+voice_origin),
-                        'Permissions-Policy': f'geolocation=(), camera=(), microphone=(self "{voice_origin}")',
+                        'Permissions-Policy': f'geolocation=(), camera=(), microphone=(self "{voice_origin}"), autoplay=(self "{voice_origin}"), fullscreen=(), clipboard-write=()',
                         'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer'}
                 body = file.read_bytes()
-                if path == '/voice-space':
-                    body = body.replace(b'<head>', b'<head><meta name="noo-voice-space-addon" content="rhaddon">', 1)
+                if path == '/example-space':
+                    body = body.replace(b'<head>', b'<head><meta name="noo-addon-space" content="rhaddon">', 1)
                 return self.reply(body, content_type=mimetypes.guess_type(file)[0] or 'application/octet-stream', headers=headers)
             assert not self.headers.get('Authorization'), 'Bearer leaked to frame'
             if path == '/__noo/session':
@@ -152,15 +156,18 @@ async def main():
                 ws.on_message(lambda value: ws.send('voice-returned' if value == 'synthetic-audio-frame' else 'bad-frame'))
             await context.route_web_socket(voice.replace('https:', 'wss:')+'/stream', socket)
             page = await context.new_page()
-            await page.goto(console+'/voice-space')
-            await page.get_by_role('button', name='Open voice', exact=True).click()
+            await page.goto(console+'/example-space')
+            await page.get_by_role('button', name='Open', exact=True).click()
             frame = page.frame_locator('iframe')
             await frame.get_by_role('button', name='Test microphone').click()
-            await frame.locator('output').filter(has_text='voice-returned').wait_for()
-            assert page.url == console+'/voice-space'
+            try:
+                await frame.locator('output').filter(has_text='voice-returned').wait_for()
+            except Exception as error:
+                raise AssertionError(await frame.locator('output').inner_text()) from error
+            assert page.url == console+'/example-space'
             await page.reload()
             assert await page.locator('iframe').count() == 0
-            await page.get_by_role('button', name='Open voice', exact=True).click()
+            await page.get_by_role('button', name='Open', exact=True).click()
             await page.frame_locator('iframe').get_by_role('button', name='Test microphone').wait_for()
             assert state['minted'] == 2 and len(state['redeemed']) == 2
             await page.evaluate("window.dispatchEvent(new Event('metis:logout'))")

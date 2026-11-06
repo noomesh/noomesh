@@ -1058,28 +1058,6 @@
           }
         }
       }
-    },
-    "/voice-space": {
-      "get": {
-        "tags": [
-          "other"
-        ],
-        "summary": "Get voice space",
-        "description": "[native] Console-owned shell only; add-on scripts still execute on their isolated origin. All data and the one-use session handoff remain authenticated.",
-        "operationId": "serve_voice_space",
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "text/html": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          }
-        }
-      }
     }
   },
   "components": {

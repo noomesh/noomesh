@@ -10683,26 +10683,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/voice-space": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get voice space
-         * @description [native] Console-owned shell only; add-on scripts still execute on their isolated origin. All data and the one-use session handoff remain authenticated.
-         */
-        get: operations["serve_voice_space"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -24248,6 +24228,9 @@ export interface operations {
                             url_base?: string | null;
                             /** @description Whether this account's role may open it (ui.min_role) */
                             can_open: boolean;
+                            /** @description Signed console entry path, or null when unavailable */
+                            console_path?: string | null;
+                            frame_permissions?: ("microphone" | "camera" | "autoplay" | "fullscreen" | "clipboard-write")[] | null;
                         }[];
                     };
                 };
@@ -24866,26 +24849,6 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     };
-                };
-            };
-        };
-    };
-    serve_voice_space: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description OK */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/html": string;
                 };
             };
         };

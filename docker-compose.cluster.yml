@@ -280,7 +280,6 @@ services:
       - NOO_ADDON_UI_SESSION_MAX_SECS=${NOO_ADDON_UI_SESSION_MAX_SECS:-}
       - NOO_PORT_GATEWAY=${NOO_PORT_GATEWAY:-8080}
       - NOO_CONSOLE_ORIGIN=${NOO_CONSOLE_ORIGIN:-}
-      - NOO_VOICE_SPACE_ADDON=${NOO_VOICE_SPACE_ADDON:-}
       # The operator's brake on the node-held tunnel (docs/reference/env.md):
       # `0`/`false`/`off` makes `GET /api/node/tunnel` answer 404 and sends
       # every streaming and bulk node call over HTTPS :8081 again. The

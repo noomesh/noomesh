@@ -18,6 +18,11 @@ export function AddonUisPanel() {
   const [notes, setNotes] = useState<Record<string, string>>({});
 
   async function onOpen(ui: AddonUi) {
+    if (!ui.canOpen) return;
+    if (ui.consolePath) {
+      window.location.assign(ui.consolePath);
+      return;
+    }
     setNotes((n) => ({ ...n, [ui.addon]: '' }));
     // Before any await: a window.open after the POST resolves is what popup
     // blockers refuse.
@@ -49,7 +54,7 @@ export function AddonUisPanel() {
               <li key={ui.addon} className="addon-ui">
                 <span className="addon-ui-title">{ui.title}</span>
                 <span className="meta">
-                  {ui.addon} · port {ui.port}
+                  {ui.addon} · {ui.consolePath ?? `port ${ui.port}`}
                 </span>
                 <Button
                   size="sm"

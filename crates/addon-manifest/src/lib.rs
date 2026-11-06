@@ -173,9 +173,47 @@ pub struct UiSpec {
     /// Per request (1–600); falls back to the manifest's.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// Optional console-owned, single-segment entry path (i506).
+    #[serde(default)]
+    pub console_path: Option<String>,
+    /// Browser capabilities delegated only to this UI's isolated origin.
+    #[serde(default)]
+    pub frame_permissions: Option<Vec<FramePermission>>,
     /// Free text, ignored.
     #[serde(default)]
     pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FramePermission { Microphone, Camera, Autoplay, Fullscreen, ClipboardWrite }
+
+impl FramePermission {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Microphone => "microphone", Self::Camera => "camera",
+            Self::Autoplay => "autoplay", Self::Fullscreen => "fullscreen",
+            Self::ClipboardWrite => "clipboard-write",
+        }
+    }
+}
+
+/// Core-owned and deliberately reserved console namespaces. Both consumers
+/// use this list; source guards catch a new core route before it can collide.
+pub const CONSOLE_RESERVED_SEGMENTS: &[&str] = &[
+    ".well-known", "api", "assets", "auth", "bootstrap", "dashboard", "favicon.ico",
+    "harness", "health", "kiosk", "kiosk.html", "mcp", "metrics", "static", "tools",
+    "upload", "v1", "ws", "__noo", "addons", "admin", "console", "docs", "login",
+    "logout", "node", "nodes", "oauth", "openapi", "robots.txt", "settings", "setup",
+    "sw.js", "manifest.json",
+];
+
+pub fn console_path_ok(path: &str) -> bool {
+    let Some(segment) = path.strip_prefix('/') else { return false };
+    let bytes = segment.as_bytes();
+    (2..=32).contains(&bytes.len()) && bytes[0].is_ascii_lowercase()
+        && bytes.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+        && !CONSOLE_RESERVED_SEGMENTS.contains(&segment)
 }
 
 fn default_ui_upstream() -> String {
@@ -811,6 +849,20 @@ fn check_features(m: &AddonManifest) -> Result<(), String> {
 /// The `ui` key is acceptable: a plain upstream path, a known role, a sane
 /// timeout and a short plain title.
 fn check_ui(ui: &UiSpec) -> Result<(), String> {
+    if let Some(path) = &ui.console_path {
+        if !console_path_ok(path) {
+            return Err(format!("ui.console_path {path:?}: expected /[a-z][a-z0-9-]{{1,31}}, outside reserved core namespaces"));
+        }
+    }
+    if let Some(permissions) = &ui.frame_permissions {
+        if ui.console_path.is_none() {
+            return Err("ui.frame_permissions requires ui.console_path".into());
+        }
+        let unique: std::collections::BTreeSet<_> = permissions.iter().collect();
+        if permissions.len() > 5 || unique.len() != permissions.len() {
+            return Err("ui.frame_permissions allows at most five distinct capabilities".into());
+        }
+    }
     if ui.upstream_path == "/" {
         // The default: the add-on serves its UI from its root.
     } else if !path_shape(&ui.upstream_path).map_err(|e| format!("ui.upstream_path: {e}"))?.is_empty() {
@@ -920,4 +972,23 @@ pub fn pattern_matches(pat: &str, path: &str) -> bool {
     let p: Vec<&str> = pat.split('/').collect();
     let segs: Vec<&str> = path.split('/').collect();
     p.len() == segs.len() && p.iter().zip(&segs).all(|(a, b)| (a.starts_with('{') && !b.is_empty()) || a == b)
+}
+
+#[cfg(test)]
+mod console_path_tests {
+    use super::*;
+    #[test]
+    fn signed_paths_and_permissions_are_bounded() {
+        for path in ["/rhaddon-space", "/ab", "/a-2"] { assert!(console_path_ok(path)); }
+        for path in ["/a", "/Ab", "/a_b", "/ab/", "/ab/cd", "//ab", "/../ab", "/api", "/login"] {
+            assert!(!console_path_ok(path), "{path}");
+        }
+        for segment in CONSOLE_RESERVED_SEGMENTS { assert!(!console_path_ok(&format!("/{segment}"))); }
+        let ui: UiSpec = serde_json::from_str(r#"{"console_path":"/rhaddon-space","frame_permissions":["microphone","autoplay"]}"#).unwrap();
+        assert!(check_ui(&ui).is_ok());
+        for text in [r#"{"frame_permissions":[]}"#, r#"{"console_path":"/rhaddon-space","frame_permissions":["camera","camera"]}"#] {
+            assert!(check_ui(&serde_json::from_str(text).unwrap()).is_err());
+        }
+        assert!(serde_json::from_str::<UiSpec>(r#"{"console_path":"/rhaddon-space","frame_permissions":["geolocation"]}"#).is_err());
+    }
 }
