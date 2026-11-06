@@ -513,10 +513,12 @@ pub fn mesh_restart(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if force {
         script_args.push("--force".into());
     }
-    script_args.extend(services);
+    script_args.extend(services.iter().cloned());
     let rc = run_script(g, "noomesh-restart.sh", &script_args, Some("restart"));
     if rc == 0 {
         front_addon_uis(g);
+        // i509: a restarted add-on that runs clears its boot-start alert.
+        super::addon_after_boot::report_restarted(g, &services);
     }
     Ok(rc)
 }

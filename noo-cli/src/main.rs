@@ -716,6 +716,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["addons", "launch-pins"], commands::addons_launch_pins),
     (&["addons", "launch-resources"], commands::addons_launch_resources),
     (&["addons", "rotate-secret"], commands::addons_rotate_secret),
+    (&["addons", "after-boot"], commands::addons_after_boot),
     (&["addons", "trust-key"], commands::addons_trust_key),
     (&["addons", "untrust-key"], commands::addons_untrust_key),
     (&["addons", "registry-login"], commands::addons_registry_login),
@@ -765,6 +766,10 @@ const HIDDEN_NATIVE: &[&[&str]] = &[
     // The launcher's materialiser of add-on runtime inputs (lib-dist.sh
     // addon_resources_materialise) — see `commands::addon_resources`.
     &["addons", "launch-resources"],
+    // The boot-time retry of enabled add-ons that are down
+    // (noo-addons-after-boot.service runs it as the install owner) — see
+    // `commands::addon_after_boot`.
+    &["addons", "after-boot"],
     // Pure aliases and internal/retired verbs: still dispatched, not in help.
     &["approval", "pending"],
     &["autonomy", "locations"],
