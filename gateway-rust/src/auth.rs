@@ -1854,22 +1854,6 @@ pub fn verify_token_with(
         .map_err(|e| format!("Invalid token: {e}"))
 }
 
-/// The one route prefix that upgrades to a WebSocket. Everything the gateway
-/// serves over WS lives under it: `/ws/coordinator`, `/ws/collab` and
-/// `/ws/agent` natively (`routes::websocket::router`), plus the not-yet-ported
-/// `/ws/companion/{node_id}`, `/ws/terminal/{session_id}` and bare `/ws`, which
-/// reach the Python gateway through the catch-all. A prefix rather than an
-/// enumerated list because the unported three are registered nowhere in Rust —
-/// an exact list would silently stop authenticating them.
-pub(crate) const WS_PATH_PREFIX: &str = "/ws";
-
-/// Is this path on the WebSocket surface? `/ws` itself, or anything below it.
-/// Deliberately NOT `starts_with("/ws")`, which would also match `/wsdl` or a
-/// future `/wsapi`.
-fn is_ws_path(path: &str) -> bool {
-    path == WS_PATH_PREFIX || path.starts_with("/ws/")
-}
-
 /// Does the request carry a real WebSocket handshake header? RFC 6455 requires
 /// `Upgrade: websocket` on every browser and library handshake, so this is not
 /// a heuristic. Token-list aware (`Upgrade: websocket, foo`) and
@@ -1920,15 +1904,12 @@ fn defers_to_ws_handler(request: &Request) -> bool {
 /// omits it is not a WebSocket and would be refused by the upgrade extractor
 /// three layers down anyway.
 fn query_token_allowed(request: &Request) -> bool {
-    // Add-on sockets take a single-use ticket instead (`addon_ws`): a bearer
-    // in an add-on socket URL is never a credential.
-    is_ws_path(request.uri().path())
-        && !request.uri().path().starts_with(ADDON_WS_PREFIX)
-        && has_websocket_upgrade_header(request)
+    // Only the peer socket still takes a token in its URL (a peer token,
+    // not a console JWT). The console's sockets and every add-on socket
+    // take a single-use ticket instead (`websocket::verify_ws_ticket`,
+    // `addon_ws`): a JWT in a socket URL is never a credential there (i515c).
+    request.uri().path() == "/ws/agent" && has_websocket_upgrade_header(request)
 }
-
-/// Every add-on WebSocket route lives under here (`addon_proxy::ws_prefix`).
-const ADDON_WS_PREFIX: &str = "/ws/addons/";
 
 /// The `token` query parameter, if present.
 fn query_param_token(query: &str) -> Option<String> {
@@ -2926,7 +2907,11 @@ fn scope_allows_for(scopes: &[String], role: Role, account: Option<&str>, method
     // Opening an add-on's UI or socket as oneself. Exact shapes, POST only;
     // the handlers apply the UI's / the socket's own `min_role` and refuse a
     // delegated credential (`addon_ui::ui_session`, `addon_ws::ws_ticket`).
-    if *method == Method::POST && (crate::addon_ui::is_ui_session_path(path) || crate::addon_ws::is_ws_ticket_path(path)) {
+    if *method == Method::POST
+        && (crate::addon_ui::is_ui_session_path(path)
+            || crate::addon_ws::is_ws_ticket_path(path)
+            || path == crate::websocket::WS_TICKET_PATH)
+    {
         return true;
     }
     // Additive and last: a caller without `ingest` is unaffected, and a
@@ -4452,20 +4437,21 @@ mod tests {
         // Plain HTTP route, no upgrade → ignored (M-A2, unchanged).
         assert_eq!(bearer_token(&req("/api/config?token=leakme", None)), None);
 
-        // A real handshake on the WS surface → accepted. This is the only
-        // shape that may use the query string, because a browser cannot set
-        // an Authorization header on `new WebSocket(...)`.
-        for path in ["/ws", "/ws/agent", "/ws/coordinator", "/ws/collab"] {
+        // A real handshake on the peer socket → accepted: `/ws/agent` is the
+        // one socket that still takes a token in its URL, and it is a peer
+        // token, not a console JWT.
+        assert_eq!(
+            bearer_token(&req("/ws/agent?token=peer", Some(("upgrade", "websocket")))).as_deref(),
+            Some("peer"),
+            "the peer socket authenticates from ?token= on a real handshake"
+        );
+        // i515c: the console's sockets and add-on sockets never take a JWT in
+        // the URL, even on a real handshake; they redeem a single-use ticket.
+        for path in ["/ws", "/ws/coordinator", "/ws/collab", "/ws/addons/voice/live"] {
             assert_eq!(
-                bearer_token(&req(
-                    &format!("{path}?token=wsjwt"),
-                    Some(("upgrade", "websocket"))
-                ))
-                .as_deref(),
-                Some("wsjwt"),
-                "{path} is a WebSocket route and a real handshake must still \
-                 authenticate from ?token=; breaking this logs every dashboard \
-                 socket out"
+                bearer_token(&req(&format!("{path}?token=wsjwt"), Some(("upgrade", "websocket")))),
+                None,
+                "{path}: a JWT in a socket URL lands in proxy logs and browser history; only a ticket opens it"
             );
         }
 

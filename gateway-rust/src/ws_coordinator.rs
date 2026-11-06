@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use crate::coordinator;
 use crate::state::AppState;
-use crate::websocket::{verify_ws_auth, WsParams, WsWriter};
+use crate::websocket::{verify_ws_ticket, WsParams, WsWriter};
 
 #[derive(Debug, Deserialize)]
 struct ChatMessage {
@@ -52,7 +52,7 @@ pub async fn ws_handler(
 ) -> impl IntoResponse {
     let jwt_sec = crate::auth::jwt_secret();
 
-    match verify_ws_auth(&params, &jwt_sec) {
+    match verify_ws_ticket(&params, "/ws/coordinator", &jwt_sec) {
         Ok(claims) => {
             ws.on_upgrade(move |socket| handle_chat(socket, state, claims))
         }

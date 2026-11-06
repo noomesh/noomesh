@@ -14,10 +14,124 @@ use crate::auth;
 
 #[derive(Debug, Deserialize)]
 pub struct WsParams {
+    /// A JWT in the URL. Only `/ws/agent` (a peer token) still takes one;
+    /// the console sockets refuse it (i515c).
     pub token: Option<String>,
+    /// A single-use ticket from `POST /api/ws-ticket` (console sockets).
+    pub ticket: Option<String>,
 }
 
-/// Extract and verify JWT from WebSocket query params.
+/// The console's sockets: opened with a single-use ticket, never a JWT in the
+/// URL, where it would land in proxy logs and browser history (i515c).
+pub const TICKET_SOCKETS: &[&str] = &["/ws/coordinator", "/ws/collab"];
+/// Where a browser mints a ticket for one of [`TICKET_SOCKETS`].
+pub const WS_TICKET_PATH: &str = "/api/ws-ticket";
+/// How long a ticket may wait to be used.
+pub const WS_TICKET_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Unredeemed tickets kept at most: a flood of mints cannot grow memory.
+const MAX_WS_TICKETS: usize = 10_000;
+
+struct CoreTicket {
+    claims: auth::Claims,
+    socket: String,
+    expires: std::time::Instant,
+}
+
+static CORE_TICKETS: std::sync::Mutex<Option<std::collections::HashMap<String, CoreTicket>>> =
+    std::sync::Mutex::new(None);
+
+/// Mint a single-use ticket for `socket`, standing for the verified `claims`.
+/// 244 random bits (two v4 UUIDs), valid [`WS_TICKET_TTL`].
+pub fn mint_ws_ticket(claims: auth::Claims, socket: &str) -> String {
+    let id = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+    let mut guard = CORE_TICKETS.lock().unwrap_or_else(|p| p.into_inner());
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    let now = std::time::Instant::now();
+    map.retain(|_, t| t.expires > now);
+    if map.len() >= MAX_WS_TICKETS {
+        // The closed answer: outstanding tickets fail, their pages mint again.
+        map.clear();
+    }
+    map.insert(id.clone(), CoreTicket { claims, socket: socket.to_string(), expires: now + WS_TICKET_TTL });
+    id
+}
+
+/// Redeem a ticket for `socket`. Single use: the ticket is removed whether or
+/// not it matches, so it can be tried exactly once.
+fn redeem_ws_ticket(ticket: &str, socket: &str) -> Option<auth::Claims> {
+    let mut guard = CORE_TICKETS.lock().unwrap_or_else(|p| p.into_inner());
+    let t = guard.as_mut()?.remove(ticket)?;
+    (t.expires > std::time::Instant::now() && t.socket == socket).then_some(t.claims)
+}
+
+/// Authenticate a console socket handshake (`/ws/coordinator`, `/ws/collab`)
+/// from its single-use ticket. A JWT in the URL is refused with the way to
+/// do it instead: there is no fallback to `?token=` (i515c).
+pub fn verify_ws_ticket(params: &WsParams, socket: &str, jwt_secret: &str) -> Result<auth::Claims, String> {
+    if auth::jwt_secret_is_insecure(jwt_secret) {
+        return Err("WebSocket auth unavailable: JWT secret not configured".into());
+    }
+    let Some(ticket) = params.ticket.as_deref().filter(|t| !t.is_empty()) else {
+        return Err(if params.token.is_some() {
+            format!("{socket} no longer takes ?token=: mint a single-use ticket (POST {WS_TICKET_PATH}) and connect with ?ticket=")
+        } else {
+            "No ticket provided".into()
+        });
+    };
+    let claims = redeem_ws_ticket(ticket, socket).ok_or("ticket unknown, already used, expired, or for another socket")?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(u64::MAX);
+    if (claims.exp as u64) <= now {
+        return Err("the access token behind this ticket has expired".into());
+    }
+    Ok(claims)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WsTicketBody {
+    pub socket: String,
+}
+
+/// POST /api/ws-ticket — `{socket}`: a single-use ticket for opening one of the console's sockets (`/ws/coordinator`, `/ws/collab`) from a browser, which cannot send an Authorization header on a WebSocket. Send the access token as `Authorization: Bearer`; open `<socket>?ticket=<ticket>` within 30 seconds. The ticket is bound to this person and this socket and is consumed by the first handshake that presents it. A delegated or harness credential cannot mint one.
+pub async fn ws_ticket(
+    headers: axum::http::HeaderMap,
+    ctx: Option<axum::Extension<auth::RequesterCtx>>,
+    axum::Json(body): axum::Json<WsTicketBody>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let refuse = |code: StatusCode, msg: String| (code, axum::Json(json!({ "error": msg }))).into_response();
+    let Some(axum::Extension(r)) = ctx else {
+        return refuse(StatusCode::UNAUTHORIZED, "a socket ticket is for a signed-in person; no verified caller".into());
+    };
+    if r.act.is_some() || r.harness.is_some() {
+        return refuse(StatusCode::FORBIDDEN, "a delegated or harness credential cannot mint a socket ticket".into());
+    }
+    if !TICKET_SOCKETS.contains(&body.socket.as_str()) {
+        return refuse(StatusCode::BAD_REQUEST, format!("socket must be one of {TICKET_SOCKETS:?}"));
+    }
+    let Some(token) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    else {
+        return refuse(StatusCode::UNAUTHORIZED, "send the access token as Authorization: Bearer".into());
+    };
+    let Ok(claims) = auth::verify_token(token, &auth::jwt_secret()) else {
+        return refuse(StatusCode::UNAUTHORIZED, "not an access token".into());
+    };
+    let ticket = mint_ws_ticket(claims, &body.socket);
+    let mut resp = axum::Json(json!({
+        "ticket": ticket,
+        "param": "ticket",
+        "expires_in": WS_TICKET_TTL.as_secs(),
+    }))
+    .into_response();
+    resp.headers_mut().insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+    resp
+}
+
+/// Extract and verify a JWT from WebSocket query params: `/ws/agent` only,
+/// where it is a peer token (the console sockets use [`verify_ws_ticket`]).
 ///
 /// Fails CLOSED when the JWT secret is unconfigured (empty or the well-known
 /// dev default): previously an empty secret granted an anonymous session to
@@ -639,6 +753,58 @@ mod session_tests {
                 assert_eq!(f.reason.as_str(), "Token expired");
             }
             other => panic!("not a close frame: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod ws_ticket_tests {
+    use super::*;
+
+    const SECRET: &str = "ws-ticket-test-secret-0123456789abcdef";
+
+    fn claims(exp_in: i64) -> auth::Claims {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        serde_json::from_value(json!({"sub": "alice", "exp": now + exp_in, "role": "user", "scopes": ["read"]})).unwrap()
+    }
+
+    fn params(ticket: Option<&str>, token: Option<&str>) -> WsParams {
+        WsParams { ticket: ticket.map(str::to_string), token: token.map(str::to_string) }
+    }
+
+    /// i515c: a console socket opens with a single-use ticket bound to that
+    /// socket; the same ticket never opens a second socket or another path.
+    #[test]
+    fn a_ticket_opens_one_socket_once() {
+        let t = mint_ws_ticket(claims(600), "/ws/coordinator");
+        assert!(verify_ws_ticket(&params(Some(&t), None), "/ws/collab", SECRET).is_err(), "bound to its socket");
+        let t = mint_ws_ticket(claims(600), "/ws/coordinator");
+        assert_eq!(verify_ws_ticket(&params(Some(&t), None), "/ws/coordinator", SECRET).unwrap().sub, "alice");
+        assert!(verify_ws_ticket(&params(Some(&t), None), "/ws/coordinator", SECRET).is_err(), "single use");
+        let stale = mint_ws_ticket(claims(-1), "/ws/coordinator");
+        assert!(verify_ws_ticket(&params(Some(&stale), None), "/ws/coordinator", SECRET).unwrap_err().contains("expired"));
+    }
+
+    /// i515c: a JWT in a console socket URL is refused, with the way to do it
+    /// instead; there is no fallback to `?token=`.
+    #[test]
+    fn a_console_socket_refuses_a_token_in_its_url() {
+        for socket in TICKET_SOCKETS {
+            let e = verify_ws_ticket(&params(None, Some("a.jwt.here")), socket, SECRET).unwrap_err();
+            assert!(e.contains("no longer takes ?token=") && e.contains(WS_TICKET_PATH), "{socket}: {e}");
+        }
+        assert_eq!(verify_ws_ticket(&params(None, None), "/ws/coordinator", SECRET).unwrap_err(), "No ticket provided");
+    }
+
+    /// The console's socket handlers authenticate through the ticket, never
+    /// through `verify_ws_auth` (the peer socket's JWT-in-URL path).
+    #[test]
+    fn the_console_handlers_redeem_tickets() {
+        for (src, socket) in [(include_str!("ws_coordinator.rs"), "/ws/coordinator"), (include_str!("ws_collab.rs"), "/ws/collab")] {
+            let own = crate::test_src::own_code(src);
+            let handler = crate::test_src::fn_body(&own, "pub async fn ws_handler(");
+            assert!(handler.contains(&format!("verify_ws_ticket(&params, \"{socket}\"")), "{socket}");
+            assert!(!handler.contains("verify_ws_auth("), "{socket} must not take a JWT from its URL");
         }
     }
 }
