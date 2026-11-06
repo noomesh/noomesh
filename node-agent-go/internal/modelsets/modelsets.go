@@ -390,12 +390,13 @@ func (s *Store) fetch(ctx context.Context, ref Ref) error {
 	if set.ID != ref.ID || set.Revision != ref.Revision {
 		return refuse(nodewl.ReasonSetUnverified, "asked for %s, the signed manifest is %s@%s", ref, set.ID, set.Revision)
 	}
-	for _, f := range set.Files {
-		// ParseModelSet checks this too; the path becomes a filesystem path
-		// here, so the node's own mount rule is asserted at the point of use.
-		if !nodewl.ValidSetPath(f.Path) {
-			return refuse(nodewl.ReasonSetUnverified, "file path %q is not allowed", f.Path)
+	dests := make([]string, len(set.Files))
+	for i, f := range set.Files {
+		dest, err := setFileDest(dir, f.Path)
+		if err != nil {
+			return err
 		}
+		dests[i] = dest
 	}
 
 	// 4. Disk.
@@ -417,11 +418,8 @@ func (s *Store) fetch(ctx context.Context, ref Ref) error {
 	if cache == "" {
 		return errors.New("NOO_MODEL_CACHE_URL is not set: no data plane to fetch model sets from")
 	}
-	for _, f := range set.Files {
-		dest := filepath.Join(dir, filepath.FromSlash(f.Path))
-		if !within(dir, dest) {
-			return refuse(nodewl.ReasonSetUnverified, "file path %q leaves the set directory", f.Path)
-		}
+	for i, f := range set.Files {
+		dest := dests[i]
 		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 			return fmt.Errorf("create %s: %w", filepath.Dir(dest), err)
 		}
@@ -522,9 +520,17 @@ func escapePath(p string) string {
 	return strings.Join(parts, "/")
 }
 
-func within(dir, p string) bool {
-	rel, err := filepath.Rel(dir, p)
-	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+// setFileDest is where one manifest file lands under dir. The path becomes a
+// filesystem path here, so the node's own mount rule (nodewl.ValidSetPath:
+// relative, no `.`/`..` component, one directory level, a fixed charset) is
+// asserted at the point of use, whatever parsed the manifest before. That rule
+// alone keeps the result inside dir; a separate "is it under dir" test could
+// never fire after it, so there is none.
+func setFileDest(dir, p string) (string, error) {
+	if !nodewl.ValidSetPath(p) {
+		return "", refuse(nodewl.ReasonSetUnverified, "file path %q is not allowed", p)
+	}
+	return filepath.Join(dir, filepath.FromSlash(p)), nil
 }
 
 // ---- filesystem hygiene -------------------------------------------------
@@ -813,8 +819,10 @@ func (s *Store) work(ctx context.Context) {
 	}
 }
 
-// next picks the first wanted set that is neither verified, nor waiting out a
-// refusal, nor already tried this run; it clears `running` when there is none.
+// next picks the first wanted set that is neither waiting out a refusal nor
+// already tried this run; it clears `running` when there is none. A set that is
+// already verified is not skipped here: Fetch returns for it at once, before
+// it asks anybody anything, and drops any stale in-memory state on the way.
 func (s *Store) next(tried map[Ref]bool) (Ref, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -828,9 +836,6 @@ func (s *Store) next(tried map[Ref]bool) (Ref, bool) {
 			continue
 		}
 		if m, ok := s.mem[r]; ok && m.state == StateRefused && s.now().Before(m.until) {
-			continue
-		}
-		if s.diskStatusLocked(r).State == StateVerified {
 			continue
 		}
 		return r, true
@@ -874,7 +879,9 @@ func (s *Store) Prune(keep map[Ref]bool) ([]Ref, error) {
 				continue
 			}
 			dir := s.dir(ref)
-			if fi, err := os.Lstat(dir); err != nil || !fi.IsDir() || !within(s.Root, dir) {
+			// ValidSetRef above admits no separator and no leading dot, so dir
+			// is under Root; what is left to rule out is a symlink or a file.
+			if fi, err := os.Lstat(dir); err != nil || !fi.IsDir() {
 				continue
 			}
 			if _, err := os.Lstat(filepath.Join(dir, railSigName)); err == nil {
