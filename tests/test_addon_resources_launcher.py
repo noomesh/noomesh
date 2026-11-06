@@ -239,6 +239,19 @@ def test_an_optional_input_is_skipped_with_a_note(tmp_path: Path) -> None:
     assert "REFUSED" not in r.stderr
 
 
+def test_a_mount_warning_is_printed_and_the_addon_still_starts(tmp_path: Path) -> None:
+    """i509, 0.6.18: a declared mount docker may create at boot is a WARNING
+    (`warn` line, guards.rs mount_form_warnings), not a refusal. Without the
+    `warn` kind the launcher drops the line and says nothing."""
+    res = RES_OK + "warn rhaddon its service `noo-rhaddon` mounts `${RHADDON_WORK_DIR}` (declared mount `RHADDON_WORK_DIR`) without `bind.create_host_path: false` ... it is refused from 0.6.19\\n"
+    r = _run(tmp_path, FAKE_RES=res, body='echo "V=$NOO_ADDONS_VERIFIED"')
+    assert r.returncode == 0, r.stderr
+    assert "WARNING: add-on rhaddon: its service `noo-rhaddon` mounts `${RHADDON_WORK_DIR}`" in r.stderr, r.stderr
+    assert "refused from 0.6.19" in r.stderr
+    assert "V=rhaddon=1.0.0@v0.6.0" in r.stdout, "a warning does not stop the add-on"
+    assert "REFUSED" not in r.stderr
+
+
 def test_a_cli_without_the_reader_refuses_an_addon_that_declares_inputs(tmp_path: Path) -> None:
     r = _run(tmp_path, FAKE_RES_FAIL="1", body='echo "R=${NOO_ADDONS_REFUSED:-}"')
     assert r.returncode == 0, r.stderr
@@ -324,6 +337,10 @@ def test_the_fixture_overlay_composes_with_the_exported_inputs(tmp_path: Path) -
     binds = {(v["source"], v["target"], v.get("read_only", False)) for v in svc["volumes"]}
     assert ("/run/noo-test/work", "/run/rhaddon", True) in binds
     assert ("/run/noo-test/coord", "/run/rhaddon-coord", True) in binds
+    # i509: both are long-form binds that never create their source, as
+    # rendered (a reboot empties the tmpfs rundir; dockerd must not plant it).
+    for v in svc["volumes"]:
+        assert v["type"] == "bind" and v.get("bind", {}).get("create_host_path") is False, v
     assert cfg["networks"]["rhaddon-db"]["name"] == "noomesh_noo-db"
 
 

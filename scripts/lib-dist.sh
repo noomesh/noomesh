@@ -1151,7 +1151,7 @@ addon_resources_materialise() {
         return 0
     fi
     while read -r _kind _addon _rest; do
-        case "$_kind" in hold|env|mount|own|gen|stale|refuse|notice) : ;; *) continue ;; esac
+        case "$_kind" in hold|env|mount|own|gen|stale|refuse|notice|warn) : ;; *) continue ;; esac
         case "$_addon" in
             [a-z]*) case "$_addon" in *[!a-z0-9_-]*) _addon="" ;; esac ;;
             *) _addon="" ;;
@@ -1167,6 +1167,10 @@ addon_resources_materialise() {
             notice)
                 # An optional input that could not be produced: skipped, said.
                 echo "NOTE: add-on ${_addon}: ${_rest}" >&2 ;;
+            warn)
+                # Started, but in a shape a later release refuses (i509:
+                # a declared mount docker may create as root at boot).
+                echo "WARNING: add-on ${_addon}: ${_rest}" >&2 ;;
             hold)
                 case "${_rest%% *}" in
                     [A-Za-z0-9]*) case "${_rest%% *}" in *[!A-Za-z0-9_.-]*) continue ;; esac ;;

@@ -166,7 +166,10 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     let route = client.route(&anchor).map_err(resolve::Refusal::Route)?;
                     addons::resolve_lock(client, &anchor, &want, supplied)
                         .and_then(|(v, f)| {
-                            addons::guards::guard_install(&root, addon, &f.files).map_err(resolve::Refusal::Decl)?;
+                            let checked = addons::guards::guard_install(&root, addon, &f.files).map_err(resolve::Refusal::Decl)?;
+                            for w in &checked.warnings {
+                                ui::warned(&format!("add-on {addon}: {w}"));
+                            }
                             addons::check::refuse_bad_routes(addon, &f.files)?;
                             Ok((v, f))
                         })
@@ -331,9 +334,13 @@ pub(crate) fn verify_one(
     // The materialised bundle (each file just verified against the lock)
     // passes the add-on guards it passed when it was pinned (`guards`).
     let files = crate::addons::pins::materialised_files(root, addon, listed.iter());
-    if let Err(e) = crate::addons::guards::guard_install(root, addon, &files) {
-        v.problem = Some(e);
-        return v;
+    match crate::addons::guards::guard_install(root, addon, &files) {
+        // A WARNING in 0.6.18 (i509): a note on the verdict, not a problem.
+        Ok(c) => v.notes.extend(c.warnings),
+        Err(e) => {
+            v.problem = Some(e);
+            return v;
+        }
     }
     for (name, r) in &pin.local_images() {
         let pinned_id = if docker.image_present(r) {
