@@ -61,13 +61,19 @@ pub const RESERVED_PREFIXES: &[&str] = &[
 
 /// What an add-on name may be (it is joined into a path and an env var).
 pub const ADDON_NAME_RULE: &str =
-    "lowercase letters, digits, `-` and `_`, starting with a letter, at most 32 characters";
+    "lowercase letters, digits, `-` and `_`, starting with a letter, at most 32 characters; core service names are reserved";
+
+/// Core service-key consumer suffixes cannot also name add-ons. Otherwise a
+/// core `svc:<name>` key would own an unrelated add-on's workload by name.
+/// Kept in step with the CLI's CORE_REGISTRY by test_addon_consumer_namespace.py.
+pub const CORE_SERVICE_NAMES: &[&str] = &["worker"];
 
 /// Is `s` a name an add-on may have? Checked before the name is joined into a
 /// path, so a config key can never walk out of the manifest directory.
 pub fn addon_name_ok(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty()
+        && !CORE_SERVICE_NAMES.contains(&s)
         && b.len() <= 32
         && b[0].is_ascii_lowercase()
         && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
@@ -920,4 +926,16 @@ pub fn pattern_matches(pat: &str, path: &str) -> bool {
     let p: Vec<&str> = pat.split('/').collect();
     let segs: Vec<&str> = path.split('/').collect();
     p.len() == segs.len() && p.iter().zip(&segs).all(|(a, b)| (a.starts_with('{') && !b.is_empty()) || a == b)
+}
+
+#[cfg(test)]
+mod consumer_namespace_tests {
+    #[test]
+    fn addons_do_not_shadow_core_service_consumers() {
+        for name in super::CORE_SERVICE_NAMES {
+            assert!(!super::addon_name_ok(name));
+        }
+        assert!(super::addon_name_ok("my_addon"));
+        assert!(super::addon_name_ok("rhaddon"));
+    }
 }
