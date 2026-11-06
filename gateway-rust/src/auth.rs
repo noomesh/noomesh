@@ -1064,6 +1064,14 @@ pub fn exchange_scope_for(path: &str, method: &axum::http::Method) -> Option<&'s
     }
 }
 
+/// The `exp` of the kiosk credential a request came in on. A long-lived
+/// response (the events stream) ends here, so the display reconnects
+/// through its proxy, which re-mints, and the mint re-checks the tailnet
+/// tag. Without it a stream outlived its token, and a display whose tag
+/// was removed kept receiving events until the connection dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KioskExpiry(pub u64);
+
 /// Whether these claims are a kiosk credential.
 pub fn is_kiosk(claims: &Claims) -> bool {
     claims.scopes.iter().any(|s| s == KIOSK_SCOPE)
@@ -3410,6 +3418,7 @@ pub async fn require_any_auth(
                 if let Err(why) = kiosk_may(request.method(), &path) {
                     return Ok(kiosk_refusal(why));
                 }
+                request.extensions_mut().insert(KioskExpiry(claims.exp as u64));
                 request.extensions_mut().insert(AuthActor(claims.sub.clone()));
                 request.extensions_mut().insert(RequesterCtx {
                     sub: claims.sub.clone(),

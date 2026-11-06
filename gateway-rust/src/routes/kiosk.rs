@@ -695,8 +695,14 @@ fn obj(v: Value) -> Map<String, Value> {
 /// once per connection (or their `/api/kiosk/*` projections).
 async fn events_stream(
     State(state): State<Arc<AppState>>,
+    kiosk: Option<axum::Extension<crate::auth::KioskExpiry>>,
     headers: HeaderMap,
 ) -> Response {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(u64::MAX);
+    let ends_in = kiosk.map(|axum::Extension(e)| stream_ends_in(e, now_unix));
     if let Some(last) = headers.get("last-event-id").and_then(|v| v.to_str().ok()) {
         tracing::debug!(last_event_id = %last, "kiosk_stream_resume_ignored");
     }
@@ -742,8 +748,18 @@ async fn events_stream(
         sampler.prime(&state).await;
 
         let mut jobs = jobs;
+        let ends = ends_in.map(|d| tokio::time::Instant::now() + d);
         loop {
             tokio::select! {
+                _ = async {
+                    match ends {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    tracing::info!("kiosk_stream_credential_expired");
+                    return;
+                }
                 _ = tick.tick() => {
                     for (kind, data) in sampler.sample(&state).await {
                         if tx.send(sse_event(id(), kind, data)).await.is_err() { return; }
@@ -783,6 +799,12 @@ async fn events_stream(
                 .text("keepalive"),
         )
         .into_response()
+}
+
+/// How long a kiosk stream may run: until its credential's `exp`, and not
+/// at all for one already past it. The display's reconnect re-mints.
+fn stream_ends_in(exp: crate::auth::KioskExpiry, now_unix: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(exp.0.saturating_sub(now_unix))
 }
 
 /// `events.job.<kind>[.<node>]` + the Go agent's `{job_id, error?, ...}`
@@ -1256,5 +1278,43 @@ mod tests {
         let full = json!({"nodes": [{"id": "n1", "newly_added_secret": "x"}]});
         let out = pick_from(&full, "nodes", &["id", "hostname", "status", "running_backends", "tier"]);
         assert!(!out.to_string().contains("newly_added_secret"));
+    }
+}
+
+#[cfg(test)]
+mod stream_expiry_tests {
+    use super::stream_ends_in;
+    use crate::auth::KioskExpiry;
+    use std::time::Duration;
+
+    /// A kiosk stream runs until its credential's `exp`, and a credential
+    /// already past it gets no stream time at all.
+    #[test]
+    fn a_kiosk_stream_ends_when_its_credential_does() {
+        assert_eq!(stream_ends_in(KioskExpiry(1_000_900), 1_000_000), Duration::from_secs(900));
+        assert_eq!(stream_ends_in(KioskExpiry(1_000_000), 1_000_000), Duration::ZERO);
+        assert_eq!(stream_ends_in(KioskExpiry(999_000), 1_000_000), Duration::ZERO);
+        // A clock that cannot be read is treated as past every expiry.
+        assert_eq!(stream_ends_in(KioskExpiry(1_000_900), u64::MAX), Duration::ZERO);
+    }
+
+    /// The deadline is wired: the kiosk branch of the front door attaches the
+    /// credential's `exp`, and the stream's producer ends on it.
+    #[test]
+    fn the_kiosk_branch_hands_its_expiry_to_the_stream() {
+        let auth = crate::test_src::own_code(include_str!("../auth.rs"));
+        let gate = crate::test_src::fn_body(&auth, "pub async fn require_any_auth(");
+        let kiosk = &gate[gate.find("if is_kiosk(&claims)").expect("the kiosk branch")..];
+        assert!(kiosk.contains("insert(KioskExpiry(claims.exp as u64))"), "the kiosk branch attaches exp");
+        let own = crate::test_src::own_code(include_str!("kiosk.rs"));
+        let stream = crate::test_src::fn_body(&own, "async fn events_stream(");
+        assert!(stream.contains("stream_ends_in("), "the handler reads the expiry");
+        assert!(stream.contains("tokio::time::sleep_until(at)"), "the producer waits on it");
+        let arm = &stream[stream.find("tokio::time::sleep_until(at)").unwrap()..];
+        let arm = &arm[..arm.find("kiosk_stream_credential_expired").expect("the arm logs the end")];
+        assert!(!arm.contains("tx.send"), "nothing is sent between the deadline and the end");
+        let after = &stream[stream.find("\"kiosk_stream_credential_expired\");").unwrap()..];
+        let after = after["\"kiosk_stream_credential_expired\");".len()..].trim_start();
+        assert!(after.starts_with("return;"), "the producer returns at the deadline");
     }
 }
