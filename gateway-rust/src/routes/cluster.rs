@@ -302,6 +302,9 @@ enum BeatShape {
 /// before #717.
 const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     ("gpu_compute_cap", BeatShape::Str),
+    // The agent's runtime.GOOS. Node workloads need Linux (the door is on a
+    // Docker bridge address, which Docker Desktop cannot route to): i300 A9.
+    ("os", BeatShape::Str),
     ("nvidia_runtime", BeatShape::Bool),
     ("nvidia_driver_caps_ok", BeatShape::Bool),
     ("controller_host", BeatShape::Bool),
@@ -8306,6 +8309,7 @@ mod i300_beat_tests {
     fn full_beat() -> Value {
         json!({
             "gpu_compute_cap": "8.6",
+            "os": "linux",
             "nvidia_runtime": true,
             "nvidia_driver_caps_ok": true,
             "controller_host": false,
@@ -8334,6 +8338,7 @@ mod i300_beat_tests {
         let too_many: Vec<Value> = (0..257).map(|_| json!({})).collect();
         let bad = json!({
             "gpu_compute_cap": 8.6,
+            "os": "",
             "nvidia_runtime": "yes",
             "data_root_free_gb": "lots",
             "addon_workloads_policy": "always",
@@ -8343,7 +8348,7 @@ mod i300_beat_tests {
         });
         carry_i300(&mut data, &full_beat());
         carry_i300(&mut data, &bad);
-        for key in ["gpu_compute_cap", "nvidia_runtime", "data_root_free_gb", "addon_workloads_policy", "model_sets", "node_workloads", "addon_workloads_approvals"] {
+        for key in ["gpu_compute_cap", "os", "nvidia_runtime", "data_root_free_gb", "addon_workloads_policy", "model_sets", "node_workloads", "addon_workloads_approvals"] {
             assert!(data.get(key).is_none(), "{key}: a misshapen value is unknown, never kept: {data}");
         }
         // An empty list is a fact (no sets, no workloads), not unknown.
