@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
@@ -132,6 +133,13 @@ type Reporter struct {
 	// gpuContention is the shared-GPU yield's report (internal/gpuyield),
 	// sent as `gpu_contention`. nil = not wired; the key is then omitted.
 	gpuContention func() any
+
+	// modelSets reports the model sets this node holds or is fetching (i300
+	// F4), sent as `model_sets`. nil = not wired, and a provider that answers
+	// nil (the state cannot be read) omits the key too: never a default or an
+	// empty list standing in for "unknown". Installed after the loop starts,
+	// hence the atomic.
+	modelSets atomic.Pointer[func() any]
 
 	// Capabilities as reported at registration, echoed on EVERY heartbeat.
 	//
@@ -347,6 +355,19 @@ func (r *Reporter) gpuContentionReport() any {
 		return nil
 	}
 	return r.gpuContention()
+}
+
+// SetModelSets installs the model-set reporter, echoed on every heartbeat as
+// `model_sets` ([{id, revision, state, reason?}]). It returns nil when the
+// state cannot be read.
+func (r *Reporter) SetModelSets(f func() any) { r.modelSets.Store(&f) }
+
+func (r *Reporter) modelSetsReport() any {
+	f := r.modelSets.Load()
+	if f == nil || *f == nil {
+		return nil
+	}
+	return (*f)()
 }
 
 // SetBusStatus installs the NATS status provider whose value is echoed on

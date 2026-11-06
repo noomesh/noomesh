@@ -54,6 +54,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/mcpsrv"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelname"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
+	"github.com/noomesh/noomesh/node-agent-go/internal/modelsets"
 	"github.com/noomesh/noomesh/node-agent-go/internal/occupancy"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
 )
@@ -110,6 +111,10 @@ type desiredConfig struct {
 	// declarations; internal/addonwl, i163 part B). A pre-workload gateway
 	// omits the field: nothing is declared, the actuator refuses everything.
 	AddonWorkloads []addonwl.Decl `json:"addon_workloads"`
+	// Node workloads placed here (i300). Kept raw: internal/nodewl validates
+	// the fragment itself (convergeModelSets). Absent on a gateway that
+	// predates it, which is not the same as an empty list.
+	NodeWorkloads json.RawMessage `json:"node_workloads"`
 }
 
 // Reconciler pulls desired config and converges the node toward it.
@@ -125,6 +130,9 @@ type Reconciler struct {
 	// mcp supervises the external MCP servers placed here. nil when the
 	// agent was built without one (tests); Apply is then skipped.
 	mcp *mcpsrv.Supervisor
+	// sets holds the model sets desired-config names (i300 F4). nil in tests
+	// that build a Reconciler by hand; convergeModelSets is then skipped.
+	sets *modelsets.Store
 	// native probes backends served outside Docker on this host. nil off
 	// darwin, where there is no native lane at all — nil rather than an
 	// inert value so "no lane here" stays distinct from "lane found nothing".
@@ -234,6 +242,7 @@ func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harn
 		importModel:     docker.ImportOllamaModel,
 		client:          client,
 		mcp:             mcpsrv.New(cfg, client, docker),
+		sets:            modelsets.New(dockerpkg.ModelsDir(), cfg),
 		native:          backendrt.NewAdopted(),
 		harness:         harness,
 		runnerInstalled: runnerOnDisk,
@@ -338,6 +347,7 @@ type phase struct {
 var reconcilePhases = []phase{
 	{"fetchDesired", (*Reconciler).fetchDesired},
 	{"publishProfileAndEmbedTarget", (*Reconciler).publishProfileAndEmbedTarget},
+	{"convergeModelSets", (*Reconciler).convergeModelSets},
 	{"settleEmptyState", (*Reconciler).settleEmptyState},
 	{"convergeMcpServers", (*Reconciler).convergeMcpServers},
 	{"ensureModelsDir", (*Reconciler).ensureModelsDir},

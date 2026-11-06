@@ -166,6 +166,7 @@ var heartbeatSections = []payloadSection{
 	secModelPresence,
 	secLanes,
 	secGPUContention,
+	secModelSets,
 }
 
 // Heartbeat-only sections.
@@ -176,6 +177,15 @@ var (
 		// "this build does not report it" from "reported as down".
 		if bus := r.natsStatus(); bus != nil {
 			p["nats_status"] = bus
+		}
+	}}
+
+	secModelSets = payloadSection{name: "modelSets", add: func(r *Reporter, p map[string]any) {
+		// The model sets this node holds or is fetching (i300 F4):
+		// [{id, revision, state, reason?}]. OMITTED when the state cannot be
+		// read: an empty list would say "holds none", which is a claim.
+		if ms := r.modelSetsReport(); ms != nil {
+			p["model_sets"] = ms
 		}
 	}}
 

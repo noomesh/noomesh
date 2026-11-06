@@ -407,6 +407,7 @@ func (a *Agent) Run() error {
 	// DESIRED_STATE_CONFIG.md.
 	rec := reconcile.New(a.cfg, a.docker, a.http, a.harness)
 	a.harnessKind = rec.HarnessRunningKind
+	a.hb.SetModelSets(rec.ModelSetsReport)
 	a.server.SetReconcileNudge(rec.Nudge)
 	a.server.SetMCP(rec.MCP())
 	a.server.SetChatPlacement(func() (api.ChatPlacement, bool) {

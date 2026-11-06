@@ -149,6 +149,12 @@ type Trust struct {
 	Reason string `json:"reason"`
 }
 
+// ValidSetRef reports whether id and revision match the schema patterns. The
+// node checks a ref with it before the ref becomes a URL or a path.
+func ValidSetRef(id, revision string) bool {
+	return setIDRe.MatchString(id) && setRevRe.MatchString(revision)
+}
+
 // ValidSetPath is the file path rule of a model set: relative, no `.` or `..`
 // component, at most one directory level, charset [A-Za-z0-9._-]. It is the
 // rule the rail's path check and the node's mount check must share.
