@@ -2277,7 +2277,7 @@ CREATE INDEX ix_connection_sources_account ON noo_connection_sources(account_id,
 }, Migration {
     revision: INTEGRATION_PACING_REVISION,
     down_revision: Some(INTEGRATION_CONTENT_REVISION),
-    sql: "ALTER TABLE noo_integration_sync ADD COLUMN last_gmail_scan timestamptz, ADD COLUMN last_gmail_page timestamptz; CREATE INDEX integration_sync_owner_pacing ON noo_integration_sync(owner_uuid)",
+    sql: "ALTER TABLE noo_integration_sync ADD COLUMN last_gmail_scan timestamptz, ADD COLUMN last_page timestamptz; CREATE INDEX integration_sync_owner_pacing ON noo_integration_sync(owner_uuid)",
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a

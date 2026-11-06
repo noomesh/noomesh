@@ -13,9 +13,9 @@ CREATE TABLE noo_integration_sync (
     lease_until timestamptz,
     cursor_sealed jsonb,
     next_run timestamptz NOT NULL DEFAULT now(),
-    status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','syncing','idle','paused','error')),
+    status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','syncing','idle','paused','failing','error')),
     attempts integer NOT NULL DEFAULT 0,
-    fault text CHECK (fault IN ('provider','reauth','limit','storage')),
+    fault text CHECK (fault IN ('provider','reauth','limit','storage','rate','quota')),
     imported integer NOT NULL DEFAULT 0,
     skipped integer NOT NULL DEFAULT 0,
     FOREIGN KEY (source_id, owner_uuid) REFERENCES noo_connection_sources(id, owner_uuid) ON DELETE CASCADE

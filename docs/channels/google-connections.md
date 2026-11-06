@@ -47,9 +47,14 @@ The sync request accepts only `enabled`; its owner comes from the authenticated
 Noomesh account. Jobs persist that owner through a composite source foreign key.
 Each provider page and cursor commit together, after rechecking the user, source,
 account, lease and generation. Expired/replaced leases, pause, disconnect and
-erasure prevent a late page from restoring content. Failures retry with bounded
-backoff; five consecutive failures stop automatic retries until the user restarts
-sync. A completed scan removes items no longer present in the provider selection.
+erasure prevent a late page from restoring content. Only a lost grant (reconnect)
+or a source over its limits stops a source until the user acts. Provider and
+storage failures retry by themselves (status `failing`) on a backoff of 1, 2, 4 …
+minutes, capped at an hour. A Google rate or quota refusal (429, or a 403 naming
+a rate or quota reason) waits at least the `Retry-After` Google sent and shows as
+fault `rate` or `quota`; a 403 for a missing scope asks the user to reconnect.
+Pages are paced per owner across Drive and Gmail: one at a time, at most one a
+second, and a new full Gmail scan at most once a minute. A completed scan removes items no longer present in the provider selection.
 Disconnect/source deletion cascade through jobs and stored personal documents.
 
 Identical content and provider IDs from different users/accounts remain independent:
@@ -173,7 +178,7 @@ scope definitions; `oauth.rs` holds the reusable lifecycle and Google resource
 adapter; `crypto.rs` implements the vault. Storage is in
 `gateway-rust/src/repo/integrations.rs`; personal corpus/queue storage is in
 `repo/integration_content.rs` and pairing storage in `repo/integration_pairing.rs`. The mesh migration
-`106_integration_pairing` adds owner-bound, single-use CLI-to-phone handoffs.
+`108_integration_pairing` adds owner-bound, single-use CLI-to-phone handoffs.
 `noo auth connect google --pair` displays a ten-minute code and a phone URL.
 The same signed-in Noomesh owner reviews the device and services on the phone,
 then completes the existing Web OAuth flow. CLI polling receives only status
@@ -181,7 +186,7 @@ and the connected account ID. Completion and credential storage commit
 together; cancellation and user erasure also remove pending grants. See the
 [phone setup guide](../getting-started/integrations.md#approve-from-your-phone-with-a-pairing-code).
 
-`105_integration_oauth` adds credentials, sessions, verified identity and
+`107_integration_oauth` adds credentials, sessions, verified identity and
 account authorization status after the original source-draft migration.
 
 Add a provider definition and identity/resource adapter, then register its
@@ -191,7 +196,7 @@ URLs. OAuth credentials stay separate from source policy and token material
 never enters the list contract. Contracts are maintained in the server/UI
 OpenAPI files and regenerated TypeScript types.
 
-`107_integration_content` adds the separate encrypted personal corpus and durable owner-bound sync queue. `108_integration_pacing` adds the per-user Gmail scan-start interval.
+`109_integration_content` adds the separate encrypted personal corpus and durable owner-bound sync queue. `110_integration_pacing` adds the per-owner page pacing (`last_page`) and the Gmail scan-start interval.
 
 ## Release rehearsal without Google credentials
 
@@ -234,7 +239,7 @@ gateway runs, so losing the DSN fails those integration checks.
 | Agent and failure boundaries | Actual MCP-minted JWTs through real auth/principal middleware cannot read private sources with either delegation marker; opt-in is boolean and human-only; corrupt rows degrade search and poisoned jobs cannot block another owner |
 | Snapshot bounds and pruning | Unchanged Gmail/Drive scans download no bodies and preserve row versions/timestamps/ciphertext; 1,001 Gmail messages complete newest-first, prune stale rows and leave another owner's identical message untouched |
 | Response protection | Callback CSP and no-store headers, strict request shapes, owner resolution for User/Operator/Admin |
-| Migration compatibility | Existing `103_pg_stat_statements` preserved; new migrations `104_connection_drafts` through `108_integration_pacing` follow it |
+| Migration compatibility | Existing `105_request_trace` preserved; new migrations `106_connection_drafts` through `110_integration_pacing` follow it |
 
 This is the component rehearsal. General still owns the review, combined
 0.6.14 batch build and signed-stack rehearsal. Record the tested head and
