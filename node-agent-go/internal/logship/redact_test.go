@@ -4,7 +4,6 @@
 package logship
 
 import (
-	"context"
 	"encoding/json"
 	"net/http/httptest"
 	"os"
@@ -267,9 +266,7 @@ func TestOfferScrubsBeforeTheSpillAndTheWire(t *testing.T) {
 
 	// And nothing reaches the wire: ship everything, read what the
 	// controller received.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go s.Run(ctx)
+	runUntilCleanup(t, s)
 	s.kick() // the wake channel is buffered; the loop drains memory, then the spill
 	waitFor(t, "3 lines accepted", func() bool { return srv.lines() == 3 })
 	for _, b := range srv.bodies {
