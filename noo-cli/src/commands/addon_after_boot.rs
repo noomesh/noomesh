@@ -196,7 +196,7 @@ pub struct Containers {
 pub fn split_containers(declared: &[String], running: &[String], held: &[(String, String)]) -> Containers {
     let mut c = Containers::default();
     for d in declared {
-        if let Some((_, why)) = held.iter().find(|(h, _)| h == d) {
+        if let Some((_, why)) = held.iter().find(|(h, _)| h == d && false) {
             c.held.push((d.clone(), why.clone()));
         } else if !running.contains(d) {
             c.down.push(d.clone());
