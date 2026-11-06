@@ -1372,8 +1372,13 @@ fn heartbeat_body_with(cfg: &SeatConfig, state: &SeatState, layout: &str, cli_ve
     let console = sh_out(Command::new(format!("{KIOSK_BIN}/noo-kiosk-cdp")).arg("build"))
         .filter(|b| !b.is_empty() && b != "null");
     let kiosk_env = kiosk_env_from(std::fs::read_to_string(super::kiosk::ENV_FILE));
+    let tailnet = match sh_out(Command::new("tailscale").args(["status", "--json"])) {
+        Some(raw) => tailnet_self(&raw).unwrap_or_else(|why| json!({ "error": why })),
+        None => json!({ "error": "tailscale status --json gave no answer" }),
+    };
     json!({
         "cli_version": cli_version,
+        "tailnet": tailnet,
         "layout": layout,
         "user_cli_current": applier_sha.is_some() && applier_sha == user_sha,
         "kiosk_serve": unit_state("kiosk-serve.service"),
@@ -1385,6 +1390,22 @@ fn heartbeat_body_with(cfg: &SeatConfig, state: &SeatState, layout: &str, cli_ve
         "display": state.display,
         "ts": now_unix(),
     })
+}
+
+/// This device on the tailnet, from `tailscale status --json`: the host
+/// label of `Self.DNSName` (the name the controller's whois reports, which
+/// the keyless kiosk mint matches against this seat, i510) and its first
+/// tailnet address. An answer without them is an error, said in the
+/// heartbeat rather than guessed.
+pub(crate) fn tailnet_self(raw: &str) -> Result<Value, String> {
+    let v: Value = serde_json::from_str(raw).map_err(|e| format!("tailscale status is not JSON: {e}"))?;
+    let name = v["Self"]["DNSName"]
+        .as_str()
+        .and_then(|d| d.split('.').next())
+        .filter(|n| !n.is_empty())
+        .ok_or("tailscale status names no Self.DNSName")?;
+    let ip = v["Self"]["TailscaleIPs"].as_array().and_then(|a| a.first()).and_then(|i| i.as_str());
+    Ok(json!({ "name": name.to_ascii_lowercase(), "ip": ip }))
 }
 
 /// Atomic write as the current user (the sync runs as the seat user): temp
@@ -1922,8 +1943,11 @@ fn seats_table(seats: &[Value], now: i64) -> String {
 /// `noo kiosk seats`: every display enrolled with this controller, one row
 /// each, read from the seat registry (`/api/cluster/seats`). Read-only.
 pub fn kiosk_seats(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    if !args.is_empty() {
-        return Err(Unhandled);
+    match args {
+        [] => {}
+        [verb, seat, device] if verb == "bind" => return Ok(seat_bind(g, seat, device)),
+        [verb, seat, rest @ ..] if verb == "revoke" => return Ok(seat_revoke(g, seat, rest)),
+        _ => return Err(Unhandled),
     }
     let Some(seats) = list_seats(g) else {
         fail(
@@ -1948,6 +1972,54 @@ pub fn kiosk_seats(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     print!("{}", seats_table(&seats, now_unix()));
     ui::guide(&[("noo cluster verify", "judge each seat: online, CLI current, display build, last apply")]);
     Ok(0)
+}
+
+/// `noo kiosk seats bind <seat> <tailnet-device>`: the operator's binding of
+/// a seat to its tailnet device, so its display can mint before the seat's
+/// own heartbeat has reported the name (i510). Admin on the controller.
+fn seat_bind(g: &Globals, seat: &str, device: &str) -> i32 {
+    let out = crate::http::post_json(
+        g,
+        &format!("/api/cluster/seats/{seat}/bind"),
+        &json!({ "tailnet_name": device }),
+        true,
+        15,
+    );
+    if g.json {
+        println!("{out}");
+        return 0;
+    }
+    let changed = out["changed"].as_bool() == Some(true);
+    println!("{}", ui::kv(&[(
+        "seat",
+        format!("{seat} → {} ({})", out["tailnet_name"].as_str().unwrap_or(device), if changed { "bound" } else { "already bound" }),
+    )]));
+    ui::guide(&[("noo cluster verify", "the seat's binding row should now read bound")]);
+    0
+}
+
+/// `noo kiosk seats revoke <seat> --yes`: cut the seat's rail and its
+/// display (dark within one token lifetime). Re-enrolment brings it back.
+/// `--yes` is required: this is not a question to answer by accident.
+fn seat_revoke(g: &Globals, seat: &str, rest: &[String]) -> i32 {
+    if rest != ["--yes"] {
+        fail(
+            g.json,
+            ExitCode::Usage,
+            "confirm",
+            &format!("revoking '{seat}' cuts its display and its update rail until it enrols again; pass --yes"),
+            Some(&format!("noo kiosk seats revoke {seat} --yes")),
+        );
+    }
+    let out = crate::http::post_json(g, &format!("/api/cluster/seats/{seat}/revoke"), &json!({}), true, 15);
+    if g.json {
+        println!("{out}");
+        return 0;
+    }
+    println!("{}", ui::kv(&[("seat", format!("{seat} revoked: its display goes dark within 15 minutes"))]));
+    let back = format!("noo kiosk seat-token {seat}");
+    ui::guide(&[(back.as_str(), "to bring it back: a new token, then enrol on the box")]);
+    0
 }
 
 /// For `noo kiosk status` on a box with no seat of its own: when this box's
@@ -2000,6 +2072,9 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
     let name = seat["seat_name"].as_str().or_else(|| seat["seat"].as_str()).unwrap_or("?");
     let hb = &seat["heartbeat"];
     let mut out = Vec::new();
+    if let Some(c) = seat_binding_check(seat, name) {
+        out.push(c);
+    }
     let seen = seat["last_seen"].as_str().and_then(super::cluster_verify::parse_rfc3339_unix);
     out.push(match seen {
         Some(t) if now - t <= SEAT_HEARTBEAT_MAX_AGE_SECS => check("seat online", Verdict::Ok, format!("heard {}s ago", now - t), None),
@@ -2086,6 +2161,27 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
 /// it still reports the old CLI, or the old applied sha. The seat's closing
 /// heartbeat comes from the OLD applier process, and the next one follows a
 /// sync tick (60s) later, so right after an apply the record can be stale.
+/// The seat's standing with the keyless mint (i510): revoked, bound to its
+/// tailnet device, or unbound (its display cannot mint). `None` against a
+/// gateway that predates seat binding (no `tailnet_name` key at all).
+fn seat_binding_check(seat: &Value, name: &str) -> Option<super::cluster_verify::Check> {
+    use super::cluster_verify::Verdict;
+    if let Some(at) = seat["revoked_at"].as_str() {
+        return Some(check("seat binding", Verdict::Fail, format!("revoked at {at}: its rail and display are refused"),
+            Some(format!("noo kiosk seat-token {name}"))));
+    }
+    let bound = seat.get("tailnet_name")?;
+    Some(match bound.as_str() {
+        Some(device) => check("seat binding", Verdict::Ok, format!("bound to tailnet device {device}"), None),
+        None => {
+            let reported = seat["heartbeat"]["tailnet"]["name"].as_str().unwrap_or("<tailnet-device>");
+            check("seat binding", Verdict::Fail,
+                "not bound to a tailnet device: its display cannot mint a kiosk token".into(),
+                Some(format!("noo kiosk seats bind {name} {reported}")))
+        }
+    })
+}
+
 fn heartbeat_predates_apply(seat: &Value, controller_cli: &str) -> bool {
     let hb = &seat["heartbeat"];
     hb["cli_version"].as_str() != Some(controller_cli) || hb["last_applied_sha"] != seat["sha256"]
@@ -3360,5 +3456,38 @@ exec {real_install} "$@"
             assert!(seen[i + 1].starts_with(&format!("POST /bootstrap/seat/lobby/{p} proof ")), "{}", seen[i + 1]);
         }
         assert!(seen[4].starts_with("GET /bootstrap/seat/lobby/bundle proof"), "{}", seen[4]);
+    }
+}
+
+#[cfg(test)]
+mod seat_binding_tests {
+    use super::{seat_binding_check, tailnet_self};
+    use crate::commands::cluster_verify::Verdict;
+    use serde_json::json;
+
+    /// The seat names its own tailnet device: the host label of
+    /// Self.DNSName, lowercased, and its first address.
+    #[test]
+    fn a_seat_reports_its_tailnet_device_or_why_not() {
+        let raw = r#"{"Self": {"DNSName": "Homeserver-1.tail1234.ts.net.", "TailscaleIPs": ["100.111.73.72", "fd7a::1"]}}"#;
+        assert_eq!(tailnet_self(raw).unwrap(), json!({"name": "homeserver-1", "ip": "100.111.73.72"}));
+        assert!(tailnet_self(r#"{"Self": {}}"#).unwrap_err().contains("Self.DNSName"));
+        assert!(tailnet_self("not json").unwrap_err().contains("not JSON"));
+    }
+
+    /// verify judges the seat's standing with the mint: revoked, bound, or
+    /// unbound with the exact bind command; nothing against an older gateway.
+    #[test]
+    fn verify_names_an_unbound_or_revoked_seat() {
+        assert!(seat_binding_check(&json!({"seat_name": "homeserver"}), "homeserver").is_none(), "older gateway: no row");
+        let bound = seat_binding_check(&json!({"tailnet_name": "homeserver-1"}), "homeserver").unwrap();
+        assert!(matches!(bound.verdict, Verdict::Ok) && bound.detail.contains("homeserver-1"));
+        let unbound = seat_binding_check(
+            &json!({"tailnet_name": null, "heartbeat": {"tailnet": {"name": "homeserver-1"}}}), "homeserver").unwrap();
+        assert!(matches!(unbound.verdict, Verdict::Fail));
+        assert_eq!(unbound.remedy.as_deref(), Some("noo kiosk seats bind homeserver homeserver-1"));
+        let revoked = seat_binding_check(&json!({"tailnet_name": "homeserver-1", "revoked_at": "2026-11-06T01:00:00+00:00"}), "homeserver").unwrap();
+        assert!(matches!(revoked.verdict, Verdict::Fail) && revoked.detail.starts_with("revoked at"));
+        assert_eq!(revoked.remedy.as_deref(), Some("noo kiosk seat-token homeserver"));
     }
 }

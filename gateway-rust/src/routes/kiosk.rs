@@ -595,11 +595,30 @@ async fn token_tailnet(
         audit_denied("dialback_failed", body.tailnet_ip.clone()).await;
         return deny("dialback did not verify — the display did not answer with the nonce it sent");
     }
+    // 3. the seat: only an enrolled, unrevoked kiosk seat bound to this
+    // device mints (i510 part B). The seat reports its device on its signed
+    // rail; an admin can bind it (`noo kiosk seats bind`).
+    let seat = match crate::repo::seats::seat_for_tailnet(&state.db, &node_name).await {
+        Ok(Some(seat)) => seat,
+        Ok(None) => {
+            tracing::info!(ip = %body.tailnet_ip, device = %node_name,
+                "kiosk tailnet mint: device is not bound to an enrolled seat");
+            audit_denied("not_an_enrolled_seat", body.tailnet_ip.clone()).await;
+            return deny(&format!(
+                "tailnet device '{node_name}' is not bound to an enrolled, unrevoked kiosk seat \
+                 (enrol it with noo kiosk seat-token, or bind it: noo kiosk seats bind <seat> {node_name})"
+            ));
+        }
+        Err(e) => {
+            tracing::error!(device = %node_name, error = %e, "kiosk tailnet mint: seat lookup failed");
+            return internal(format!("cannot read the kiosk seats: the database answered {e}"));
+        }
+    };
 
     let ttl = crate::auth::KIOSK_TOKEN_TTL_SECS;
     match crate::auth::mint_kiosk_jwt(&node_name, ttl) {
         Some(tok) => {
-            tracing::info!(consumer = %node_name, ip = %body.tailnet_ip, ttl,
+            tracing::info!(consumer = %node_name, seat = %seat, ip = %body.tailnet_ip, ttl,
                 "kiosk_token_minted_keyless");
             Json(json!({"token": tok, "expires_in": ttl, "consumer": node_name})).into_response()
         }
@@ -1256,5 +1275,23 @@ mod tests {
         let full = json!({"nodes": [{"id": "n1", "newly_added_secret": "x"}]});
         let out = pick_from(&full, "nodes", &["id", "hostname", "status", "running_backends", "tier"]);
         assert!(!out.to_string().contains("newly_added_secret"));
+    }
+}
+
+#[cfg(test)]
+mod seat_mint_tests {
+    /// i510: the keyless mint admits only a bound, unrevoked seat, after the
+    /// tag and the dialback and before a token is signed.
+    #[test]
+    fn the_keyless_mint_requires_an_enrolled_seat() {
+        let own = crate::test_src::own_code(include_str!("kiosk.rs"));
+        let mint = crate::test_src::fn_body(&own, "async fn token_tailnet(");
+        let dialback = mint.find("\"dialback_failed\"").expect("the dialback refusal");
+        let seat = mint.find("crate::repo::seats::seat_for_tailnet(").expect("the seat lookup");
+        let sign = mint.find("crate::auth::mint_kiosk_jwt(").expect("the signing");
+        assert!(dialback < seat && seat < sign, "tag and dialback, then the seat, then the token");
+        let lookup = &mint[seat..sign];
+        assert!(lookup.contains("Ok(None) =>") && lookup.contains("\"not_an_enrolled_seat\""), "an unbound device is refused and audited");
+        assert!(lookup.contains("return deny("), "and gets no token");
     }
 }

@@ -10683,6 +10683,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/cluster/seats/{seat}/bind": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create bind
+         * @description [native] POST /api/cluster/seats/{seat}/bind — `{tailnet_name}`. Admin. Binds the seat to its tailnet device, so its display can mint before the seat's own heartbeat has reported the name (the operator's cutover fallback, i510).
+         */
+        post: operations["seat_bind"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/cluster/seats/{seat}/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create revoke
+         * @description [native] POST /api/cluster/seats/{seat}/revoke — Admin. Cuts the seat's rail and, through the keyless mint, its display (dark within one token lifetime). Re-enrolment with a new seat token brings it back (i510).
+         */
+        post: operations["seat_revoke"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -24823,6 +24863,62 @@ export interface operations {
         };
     };
     node_traces_ingest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    seat_bind: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    seat_revoke: {
         parameters: {
             query?: never;
             header?: never;

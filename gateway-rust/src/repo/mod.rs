@@ -89,6 +89,7 @@ pub mod heartbeat;
 pub mod kb_grants;
 pub mod prompt_skills;
 pub mod request_trace;
+pub mod seats;
 pub mod settings;
 pub mod task_events;
 pub mod tasks;

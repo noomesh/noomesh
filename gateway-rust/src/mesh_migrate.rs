@@ -2233,6 +2233,21 @@ CREATE INDEX IF NOT EXISTS noo_request_trace_trace_id_idx ON noo_request_trace (
 CREATE INDEX IF NOT EXISTS noo_request_trace_route_at_idx ON noo_request_trace (route, at);
 ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS trace_id text
 "#,
+}, Migration {
+    revision: SEAT_BINDING_REVISION,
+    down_revision: Some(REQUEST_TRACE_REVISION),
+    // i510 part B: a kiosk display mints only as an enrolled, unrevoked seat.
+    // `tailnet_name` is the device name the seat reports on its signed rail
+    // (or an admin binds); the keyless mint matches the tailnet whois name
+    // against it. One device belongs to one seat. `revoked_at` cuts the
+    // seat's rail and its display; re-enrolment clears it. Additive; an
+    // older gateway ignores all three columns.
+    sql: r#"
+ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS tailnet_name text;
+ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS revoked_at timestamptz;
+ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS revoked_by text;
+CREATE UNIQUE INDEX IF NOT EXISTS noo_seats_tailnet_name_uq ON noo_seats (lower(tailnet_name)) WHERE tailnet_name IS NOT NULL
+"#,
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
@@ -2242,6 +2257,10 @@ pub const ADDON_ACCESS_REVISION: &str = "104_addon_access";
 /// Request tracing's summary table and the usage link (i359). A constant
 /// so a renumber at rebase is one line.
 pub const REQUEST_TRACE_REVISION: &str = "105_request_trace";
+
+/// Kiosk seats bound to their tailnet device, and revocable (i510 part B).
+/// A constant so a renumber at rebase is one line.
+pub const SEAT_BINDING_REVISION: &str = "106_seat_binding";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
@@ -3176,16 +3195,15 @@ mod tests {
         }
     }
 
-    /// i359: the request-trace revision is the chain head, sits on 104 (f99), is
+    /// i359: the request-trace revision sits on 104 (f99), is
     /// idempotent, and creates exactly the columns `request_trace` writes
     /// and prunes by, plus the usage link `usage` writes.
     #[test]
-    fn request_trace_revision_is_the_head_and_matches_its_writers() {
+    fn request_trace_revision_sits_on_f99_and_matches_its_writers() {
         let m = MIGRATIONS.iter().find(|m| m.revision == REQUEST_TRACE_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "105_request_trace");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(ADDON_ACCESS_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(REQUEST_TRACE_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_request_trace"));
         assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE"), "no row is rewritten or dropped");
         let writer = include_str!("repo/request_trace.rs");
@@ -3767,5 +3785,27 @@ mod legacy_layout_tests {
         let _ = sqlx::raw_sql("DROP DATABASE mesh_legacy_test (FORCE)")
             .execute(&admin)
             .await;
+    }
+}
+
+#[cfg(test)]
+mod seat_binding_migration_tests {
+    use super::*;
+
+    /// i510: the seat-binding revision is the chain head, sits on request
+    /// tracing, and is additive: three nullable columns and a partial
+    /// unique index, nothing rewritten or dropped.
+    #[test]
+    fn seat_binding_revision_is_the_head_and_additive() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == SEAT_BINDING_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "106_seat_binding");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(REQUEST_TRACE_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(SEAT_BINDING_REVISION), "the chain head");
+        for col in ["tailnet_name text", "revoked_at timestamptz", "revoked_by text"] {
+            assert!(m.sql.contains(&format!("ADD COLUMN IF NOT EXISTS {col}")), "{col}");
+        }
+        assert!(m.sql.contains("CREATE UNIQUE INDEX IF NOT EXISTS noo_seats_tailnet_name_uq"));
+        assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE") && !m.sql.contains("DROP"));
     }
 }

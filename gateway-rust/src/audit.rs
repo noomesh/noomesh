@@ -189,9 +189,11 @@ pub(crate) enum AuditKind {
     ProvisionBundleStaged,
     ReservationRelease,
     ReservationTake,
+    SeatBound,
     SeatBundleApplied, // also warning at some sites
     SeatBundleStaged,
     SeatEnrolled,
+    SeatRevoked,
     SeatTokenCreate,
     SeatTokenDenied,
     SeatTokenRevoke,
@@ -317,9 +319,11 @@ impl AuditKind {
             Self::ProvisionBundleStaged => "provision_bundle_staged",
             Self::ReservationRelease => "reservation_release",
             Self::ReservationTake => "reservation_take",
+            Self::SeatBound => "seat_bound",
             Self::SeatBundleApplied => "seat_bundle_applied",
             Self::SeatBundleStaged => "seat_bundle_staged",
             Self::SeatEnrolled => "seat_enrolled",
+            Self::SeatRevoked => "seat_revoked",
             Self::SeatTokenCreate => "seat_token_create",
             Self::SeatTokenDenied => "seat_token_denied",
             Self::SeatTokenRevoke => "seat_token_revoke",
@@ -446,9 +450,11 @@ impl AuditKind {
             Self::ProvisionBundleStaged => Severity::Warning,
             Self::ReservationRelease => Severity::Info,
             Self::ReservationTake => Severity::Info,
+            Self::SeatBound => Severity::Warning,
             Self::SeatBundleApplied => Severity::Info,
             Self::SeatBundleStaged => Severity::Warning,
             Self::SeatEnrolled => Severity::Warning,
+            Self::SeatRevoked => Severity::Warning,
             Self::SeatTokenCreate => Severity::Warning,
             Self::SeatTokenDenied => Severity::Warning,
             Self::SeatTokenRevoke => Severity::Info,
@@ -572,9 +578,11 @@ impl AuditKind {
             "provision_bundle_staged" => Self::ProvisionBundleStaged,
             "reservation_release" => Self::ReservationRelease,
             "reservation_take" => Self::ReservationTake,
+            "seat_bound" => Self::SeatBound,
             "seat_bundle_applied" => Self::SeatBundleApplied,
             "seat_bundle_staged" => Self::SeatBundleStaged,
             "seat_enrolled" => Self::SeatEnrolled,
+            "seat_revoked" => Self::SeatRevoked,
             "seat_token_create" => Self::SeatTokenCreate,
             "seat_token_denied" => Self::SeatTokenDenied,
             "seat_token_revoke" => Self::SeatTokenRevoke,
@@ -699,9 +707,11 @@ impl AuditKind {
             Self::ProvisionBundleStaged,
             Self::ReservationRelease,
             Self::ReservationTake,
+            Self::SeatBound,
             Self::SeatBundleApplied,
             Self::SeatBundleStaged,
             Self::SeatEnrolled,
+            Self::SeatRevoked,
             Self::SeatTokenCreate,
             Self::SeatTokenDenied,
             Self::SeatTokenRevoke,
@@ -1208,9 +1218,11 @@ mod tests {
         "provision_bundle_staged",
         "reservation_release",
         "reservation_take",
+        "seat_bound",
         "seat_bundle_applied",
         "seat_bundle_staged",
         "seat_enrolled",
+        "seat_revoked",
         "seat_token_create",
         "seat_token_denied",
         "seat_token_revoke",
@@ -1278,7 +1290,7 @@ mod tests {
         let mut want: Vec<String> = PINNED.iter().map(|s| s.to_string()).collect();
         want.sort();
         assert_eq!(got, want, "a kind was renamed, added or dropped: edit PINNED on purpose");
-        assert_eq!(PINNED.len(), 119);
+        assert_eq!(PINNED.len(), 121);
     }
 
     #[test]
