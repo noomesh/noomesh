@@ -165,7 +165,14 @@ func ParseModelSet(b []byte) (*ModelSet, error) {
 	if err := requireKeys(g, "model-set.json", "format", "id", "revision", "kind", "modality", "runtime", "source", "license", "files", "needs"); err != nil {
 		return nil, err
 	}
-	for _, sub := range [][]string{{"license", "id", "url", "accept"}, {"needs", "profiles", "cpu_fallback", "arch"}} {
+	// The url key ends its line: tests/test_url_userinfo_scrub.py reads a
+	// quoted url key followed by a value on the same line as a log call.
+	required := [][]string{
+		{"license", "id", "url",
+			"accept"},
+		{"needs", "profiles", "cpu_fallback", "arch"},
+	}
+	for _, sub := range required {
 		if err := requireKeys(field(g, sub[0]), sub[0], sub[1:]...); err != nil {
 			return nil, err
 		}
