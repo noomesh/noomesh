@@ -827,6 +827,8 @@ mod tests {
         assert!(cases.len() >= 40, "the case list was not read: {} cases", cases.len());
         let mut refused = 0;
         let mut accepted = 0;
+        // Every mismatch is collected, so a failing run names each fixture.
+        let mut mismatches: Vec<String> = Vec::new();
         for c in &cases {
             let file = c["file"].as_str().expect("file");
             let want = c["code"].as_str().expect("code");
@@ -834,16 +836,24 @@ mod tests {
             let bytes = std::fs::read(dir().join(file)).expect("fixture");
             match validate(&bytes) {
                 Ok(()) => {
-                    assert!(valid, "{file}: accepted, want {want}");
+                    if !valid {
+                        mismatches.push(format!("{file}: expected refused with {want}, got ok"));
+                    }
                     accepted += 1;
                 }
                 Err(r) => {
-                    assert!(!valid, "{file}: refused with {r}");
-                    assert_eq!(r.code, want, "{file}: {r}");
+                    if valid {
+                        mismatches.push(format!("{file}: expected ok, got {} ({r})", r.code));
+                    } else if r.code != want {
+                        let got = r.code;
+                        mismatches.push(format!("{file}: expected {want}, got {got} ({r})"));
+                    }
                     refused += 1;
                 }
             }
         }
+        let n = mismatches.len();
+        assert!(mismatches.is_empty(), "{n} mismatches:\n{}", mismatches.join("\n"));
         assert!(accepted >= 7 && refused >= 30, "accepted {accepted}, refused {refused}");
     }
 
