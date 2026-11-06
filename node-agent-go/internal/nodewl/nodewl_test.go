@@ -51,7 +51,7 @@ func loadCases(t *testing.T, dir string) []fixtureCase {
 	}
 	// Every fixture file is in cases.json, and every case has its file: a
 	// fixture nobody asserts is how a refusal rots.
-	listed := map[string]bool{"cases.json": true, "lock.json": true}
+	listed := map[string]bool{"cases.json": true, "lock.json": true, "routes.json": true}
 	for _, c := range cs {
 		listed[c.File] = true
 		if c.Valid != (c.Code == "") {
@@ -83,6 +83,33 @@ func check(t *testing.T, c fixtureCase, err error) {
 	}
 }
 
+func fixtureRoutes(t *testing.T) map[string]bool {
+	t.Helper()
+	r, err := RoutesFromJSON(readFile(t, "node-workloads", "routes.json"))
+	if err != nil || !r["drain"] || r["status"] || len(r) != 2 {
+		t.Fatalf("routes.json: %v, %v", r, err)
+	}
+	return r
+}
+
+func TestNilRoutesSkipsOnlyTheCrossFileCheck(t *testing.T) {
+	lock := map[string]string{"addon-worker": "x"}
+	for _, f := range []string{"refuse-service-drain-route-unknown.json", "refuse-service-drain-route-public.json"} {
+		if _, err := ParseDecl(testAddon, readFile(t, "node-workloads", f), lock, nil); err != nil {
+			t.Errorf("%s with nil routes (the agent): want it to parse, got %v", f, err)
+		}
+		if _, err := ParseDecl(testAddon, readFile(t, "node-workloads", f), lock, fixtureRoutes(t)); CodeOf(err) != CodeServiceDrainInvalid {
+			t.Errorf("%s with routes: got %v", f, err)
+		}
+	}
+	// The shape is always checked, routes or not.
+	for _, f := range []string{"refuse-service-drain-missing.json", "refuse-service-drain-route-empty.json", "refuse-service-drain-timeout-zero.json", "refuse-service-drain-timeout-3601.json", "refuse-service-drain-route-name.json"} {
+		if _, err := ParseDecl(testAddon, readFile(t, "node-workloads", f), lock, nil); CodeOf(err) != CodeServiceDrainInvalid {
+			t.Errorf("%s with nil routes: got %v", f, err)
+		}
+	}
+}
+
 func TestNodeWorkloadsFixtures(t *testing.T) {
 	var lock struct {
 		Images map[string]string `json:"images"`
@@ -90,12 +117,13 @@ func TestNodeWorkloadsFixtures(t *testing.T) {
 	if err := json.Unmarshal(readFile(t, "node-workloads", "lock.json"), &lock); err != nil {
 		t.Fatal(err)
 	}
+	routes := fixtureRoutes(t)
 	for _, c := range loadCases(t, "node-workloads") {
 		addon := testAddon
 		if c.Addon != "" {
 			addon = c.Addon
 		}
-		ds, err := ParseDecl(addon, readFile(t, "node-workloads", c.File), lock.Images)
+		ds, err := ParseDecl(addon, readFile(t, "node-workloads", c.File), lock.Images, routes)
 		check(t, c, err)
 		if c.Valid && len(ds) == 0 {
 			t.Errorf("%s: parsed but returned no workloads", c.File)
@@ -166,7 +194,7 @@ func TestRhaddonDeclarationIsAValidFixture(t *testing.T) {
 		Images map[string]string `json:"images"`
 	}
 	_ = json.Unmarshal(readFile(t, "node-workloads", "lock.json"), &lock)
-	ds, err := ParseDecl("rhaddon", readFile(t, "node-workloads", "valid-rhaddon.json"), lock.Images)
+	ds, err := ParseDecl("rhaddon", readFile(t, "node-workloads", "valid-rhaddon.json"), lock.Images, fixtureRoutes(t))
 	if err != nil || len(ds) != 1 || ds[0].Port != 9003 {
 		t.Fatalf("got %v, %v", ds, err)
 	}
@@ -187,7 +215,7 @@ func TestEveryCodeAFixtureNamesIsProduced(t *testing.T) {
 		CodeUIDInvalid, CodeCommandInvalid, CodePortInvalid, CodeProtocolsInvalid, CodeHealthInvalid,
 		CodeDrainInvalid, CodeAccelInvalid, CodeModelSlotInvalid, CodeEnvKeyOutsidePrefix,
 		CodeEnvKeyRefusedPrefix, CodeEnvBoundInvalid, CodeScratchTargetBad, CodeScratchInvalid,
-		CodeScratchInModelSlot, CodeLimitsInvalid,
+		CodeScratchInModelSlot, CodeLimitsInvalid, CodeServiceDrainInvalid,
 		CodeIDInvalid, CodeRevisionInvalid, CodeKindInvalid, CodeModalityInvalid, CodeRuntimeInvalid,
 		CodeSourceInvalid, CodeLicenseInvalid, CodePathInvalid, CodeSHA256Invalid, CodeFilesInvalid,
 		CodeNoticeNotInFiles, CodeProfileInvalid, CodeArchInvalid, CodeFitsRequired, CodeFitsForbidden,
@@ -270,13 +298,13 @@ func TestNullIsRefusedExceptWhereNamedNullable(t *testing.T) {
 	if bad == good {
 		t.Fatal("the mutation did not apply")
 	}
-	if _, err := ParseDecl(testAddon, []byte(bad), lock); CodeOf(err) != CodeFieldType {
+	if _, err := ParseDecl(testAddon, []byte(bad), lock, nil); CodeOf(err) != CodeFieldType {
 		t.Errorf("accel.gpu null: got %v, want field_type", err)
 	}
-	if _, err := ParseDecl(testAddon, []byte(`{"format": null, "workloads": null}`), lock); CodeOf(err) != CodeFieldType {
+	if _, err := ParseDecl(testAddon, []byte(`{"format": null, "workloads": null}`), lock, nil); CodeOf(err) != CodeFieldType {
 		t.Errorf("top-level nulls: got %v", err)
 	}
-	if _, err := ParseDecl(testAddon, []byte(`null`), lock); CodeOf(err) != CodeFieldType {
+	if _, err := ParseDecl(testAddon, []byte(`null`), lock, nil); CodeOf(err) != CodeFieldType {
 		t.Errorf("a null document: got %v", err)
 	}
 	// reservation is the one nullable pointer, and only at its place.

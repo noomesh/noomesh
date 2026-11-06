@@ -90,7 +90,8 @@ Fields: `id`, `revision`, `kind` (`voice` | `voice-pack`), `modality`
 One file, listed in the signed bundle lock beside `resources.json`. Per
 workload: `name`, `image`, `uid` (at least 1), `command?`, `port`
 (1024-65535), `protocols` (a subset of `http`, `ws`), `health {ready, live,
-start_secs 1-600}`, `drain {path, timeout_secs 1-3600}`, `accel {gpu 0-8,
+start_secs 1-600}`, `drain {path, timeout_secs 1-3600}`, `service_drain
+{route, timeout_secs 1-3600}` (required), `accel {gpu 0-8,
 realtime}`, `models[]`, `env`, `scratch[]` and `limits {ram_mb, cpus, pids}`
 (required).
 
@@ -225,6 +226,27 @@ those three. It **strips any client-supplied copy** of those
 three, and strips `Origin` and `Authorization`, before the request reaches the
 worker. The worker holds no credential and no user token.
 
+### `service_drain` and the release order
+
+`service_drain` is `{route, timeout_secs}`, required on every workload. `route`
+is a route **name** (the route-name rule of `routes.json`, lower-case letters,
+digits and `_`, starting with a letter, at most 64) of the add-on's CPU-side
+drain endpoint. It is never a path and is never inferred. Cross-file rule: the
+route must exist in the add-on's `routes.json` and be marked `internal`;
+`timeout_secs` is 1-3600. Any violation is `service_drain_invalid`.
+
+Release order (the i163 order): the gateway first POSTs
+`{reservation, workload: "<addon>/<name>", timeout_secs}` through the existing
+internal add-on call to the `service_drain` route and waits up to
+`timeout_secs + 30` seconds; it then sets the row to `provisioned`, and the
+agent then drains the worker (`drain.path`, below).
+
+The agent does not use `service_drain`: it has no `routes.json`, so its
+re-check of the decl (inside a desired-config entry) is **shape only**
+(present, a route name, `timeout_secs` 1-3600); `ParseDecl` takes the routes
+as an input and a nil input skips only the existence and internal check. It is
+carried in desired-config only as part of the verbatim `decl`.
+
 ## State machine
 
 | State | Meaning |
@@ -328,7 +350,7 @@ Every file kind also has `duplicate_key` (see above); in desired-config it is re
 `field_missing`, `bad_format`, `workloads_invalid`, `door_name_invalid`,
 `door_name_too_long`, `name_duplicate`, `image_not_in_lock`, `uid_invalid`,
 `command_invalid`, `port_invalid`, `protocols_invalid`, `health_invalid`,
-`drain_invalid`, `accel_invalid`, `model_slot_invalid`,
+`drain_invalid`, `service_drain_invalid`, `accel_invalid`, `model_slot_invalid`,
 `env_key_outside_prefix`, `env_key_refused_prefix`, `env_bound_invalid`,
 `scratch_target_refused`, `scratch_invalid`, `scratch_in_model_slot`,
 `limits_invalid`.
@@ -353,7 +375,7 @@ the add-on prefix; `scratch_target_refused` wins over `scratch_invalid`.
 
 | Validator | Reads | Against |
 |---|---|---|
-| CLI, `noo-cli/src/addons/decls.rs` (F2) | `node-workloads.json` at `enable`, `upgrade --check`, `verify` and launch; the lock's images map | `tests/fixtures/i300/node-workloads/` |
+| CLI, `noo-cli/src/addons/decls.rs` (F2) | `node-workloads.json` at `enable`, `upgrade --check`, `verify` and launch; the lock's images map and the bundle's `routes.json` (`service_drain.route` must be an internal route) | `tests/fixtures/i300/node-workloads/` |
 | Gateway, `gateway-rust/src/addon_workloads.rs` (harness) | the same file at every start; env values at placement; builds the desired-config entry | the same fixtures; `desired/` for the entry it emits |
 | Node agent, `node-agent-go/internal/nodewl` | the decl inside every desired-config entry (re-checked, not trusted); the entry; env values; the signed model-set manifest | all three fixture directories |
 | The staging side (CLI), model sets | `model-set.json` at staging, before it is written (i300 F2b) | `tests/fixtures/i300/model-sets/` |

@@ -31,7 +31,7 @@
     "workload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "image", "uid", "port", "protocols", "health", "drain", "accel", "limits"],
+      "required": ["name", "image", "uid", "port", "protocols", "health", "drain", "service_drain", "accel", "limits"],
       "properties": {
         "name": { "type": "string", "maxLength": 49, "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$", "description": "One DNS label piece of the door name noo-stunnel-<addon>-<workload>: lower-case letters, digits and -, no leading or trailing -. len(addon)+1+len(workload) <= 51 (x-noo-rules)." },
         "image": { "$ref": "#/$defs/word", "description": "A NAME in the signed lock's images map, never a ref (x-noo-rules)." },
@@ -51,6 +51,14 @@
           "type": "object", "additionalProperties": false, "required": ["path", "timeout_secs"],
           "properties": {
             "path": { "$ref": "#/$defs/path", "description": "POSTed by the node agent through the door." },
+            "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600 }
+          }
+        },
+        "service_drain": {
+          "type": "object", "additionalProperties": false, "required": ["route", "timeout_secs"],
+          "description": "The add-on's CPU-side drain route, which the gateway calls FIRST on release (service drain, then the worker's drain.path). A route NAME in the add-on's routes.json, never a path, never inferred.",
+          "properties": {
+            "route": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$", "description": "The route-name rule of routes.json. Must be an internal route of the add-on's routes.json (x-noo-rules)." },
             "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600 }
           }
         },
@@ -114,6 +122,7 @@
   "x-noo-rules": [
     "image names a key of the signed lock's images map; an unknown name is refused (image_not_in_lock). The digest comes from the lock, so the bundle signature covers it.",
     "workload names are unique within the file (name_duplicate).",
+    "service_drain.route names a route of the add-on's routes.json (the same bundle) that exists and is marked \"internal\": true (service_drain_invalid otherwise). A validator given no routes.json (the node agent) skips only this existence and internal check; the shape of service_drain (present, a route name, timeout_secs 1..3600) is always checked.",
     "door name: the door's DNS SAN is noo-stunnel-<addon>-<workload>, which must be ONE DNS label of at most 63 characters, so a node workload is refused when len(addon) + 1 + len(workload) > 51 (door_name_too_long). Both the workload name (above) and the add-on name must match ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ (door_name_invalid): _, upper case and a leading or trailing - are refused, and _ is never mapped to - (a per-file validator cannot see a collision between two add-ons). The add-on name is known only at validation, so it is not a schema check.",
     "env keys must start with <ADDON_UPPER>_ (the add-on name upper-cased, - as _), with the addon known at validation (env_key_outside_prefix). Refused prefixes win over the add-on prefix: NOO_, NVIDIA_, CUDA_, LD_, PYTHON, HF_, TRANSFORMERS_ (env_key_refused_prefix, stated above in propertyNames).",
     "an env bound with min and max needs min <= max (env_bound_invalid). Values in desired-config are strings: an integer bound takes a base-10 integer string, an enum takes one of its members, a boolean is {\"one_of\": [\"false\"]}.",

@@ -79,7 +79,7 @@ def test_the_fixture_addons_declaration_is_the_valid_rhaddon_fixture() -> None:
 def test_every_fixture_is_in_its_cases_file_and_back() -> None:
     for d in DIRS:
         listed = {c["file"] for c in cases(d)}
-        on_disk = {p.name for p in (CANON / d).iterdir()} - {"cases.json", "lock.json"}
+        on_disk = {p.name for p in (CANON / d).iterdir()} - {"cases.json", "lock.json", "routes.json"}
         assert listed == on_disk, f"{d}: cases.json and the directory disagree: {listed ^ on_disk}"
         for c in cases(d):
             assert set(c) <= {"file", "valid", "code", "addon", "set"}
@@ -197,6 +197,8 @@ NOT_IN_SCHEMA = {
         "refuse-trailing-data.json",
         "refuse-duplicate-key.json",
         "refuse-image-not-in-lock.json",
+        "refuse-service-drain-route-unknown.json",
+        "refuse-service-drain-route-public.json",
         "refuse-name-duplicate.json",
         "refuse-env-key-outside-prefix.json",
         "refuse-env-bound-inverted.json",
