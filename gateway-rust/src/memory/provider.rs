@@ -1728,7 +1728,7 @@ mod tests {
             if harness_only {
                 principal.harness = Some(String::new());
             } else {
-                principal.act = Some(crate::auth::Actor { sub: "key:fixture-agent".into(), iss_user: None, task: None });
+                principal.act = Some(crate::auth::Actor { sub: "key:fixture-agent".into(), iss_user: None, task: None, feature: None });
             }
             let reply = crate::bus_principal::with_principal(principal,
                 kb_reply_with_personal(&json!({"include_personal":true}),
