@@ -131,6 +131,10 @@ pub struct Health {
 pub struct Drain {
     #[serde(default)]
     pub path: String,
+    /// GET path the agent polls: 200 means drained. Required (a bad one is
+    /// `drain_invalid`, as in `nodewl.Drain`).
+    #[serde(default)]
+    pub done_path: String,
     #[serde(default)]
     pub timeout_secs: i64,
 }
@@ -154,6 +158,9 @@ pub struct Accel {
     pub gpu: i64,
     #[serde(default)]
     pub realtime: bool,
+    /// The declared integer env key that sets the worker's slot count.
+    #[serde(default)]
+    pub slots_env: String,
 }
 
 /// A model slot: the agent mounts the set the operator chose, read-only, at
@@ -629,10 +636,13 @@ fn validate(
             "health needs absolute paths and start_secs 1..600".to_string(),
         ));
     }
-    if !path_ok(&d.drain.path) || !(1..=3600).contains(&d.drain.timeout_secs) {
+    if !path_ok(&d.drain.path)
+        || !path_ok(&d.drain.done_path)
+        || !(1..=3600).contains(&d.drain.timeout_secs)
+    {
         return Err(refuse(
             "drain_invalid",
-            "drain needs an absolute path and timeout_secs 1..3600".to_string(),
+            "drain needs absolute path and done_path, and timeout_secs 1..3600".to_string(),
         ));
     }
     validate_service_drain(d.service_drain.as_ref(), routes)?;
@@ -641,6 +651,7 @@ fn validate(
     }
     validate_models(&d.models)?;
     validate_env(addon, &d.env)?;
+    validate_slots_env(&d.accel.slots_env, &d.env)?;
     validate_scratch(&d.scratch, &d.models)?;
     let l = &d.limits;
     if !(64..=1_048_576).contains(&l.ram_mb)
@@ -759,6 +770,30 @@ fn validate_env(addon: &str, env: &BTreeMap<String, EnvBound>) -> Result<(), Nod
                 return Err(bad(format!("env {k}: min {lo} is above max {hi}")));
             }
         }
+    }
+    Ok(())
+}
+
+/// `accel.slots_env` names one of the decl's own declared env keys, and that
+/// key has an integer min and/or max, not an enum (`nodewl.validateSlotsEnv`).
+fn validate_slots_env(
+    key: &str,
+    env: &BTreeMap<String, EnvBound>,
+) -> Result<(), NodeWorkloadRefusal> {
+    if key.is_empty() {
+        return Ok(());
+    }
+    let Some(b) = env.get(key) else {
+        return Err(refuse(
+            "accel_invalid",
+            format!("accel.slots_env `{key}` is not a declared env key"),
+        ));
+    };
+    if b.one_of.is_some() || (b.min.is_none() && b.max.is_none()) {
+        return Err(refuse(
+            "accel_invalid",
+            format!("accel.slots_env `{key}` must have an integer min/max bound"),
+        ));
     }
     Ok(())
 }
@@ -966,6 +1001,20 @@ mod tests {
         let f = "refuse-service-drain-unknown-field.json";
         let got = parse_node_workloads("rhaddon", &read(f), &images, None);
         assert_eq!(got.unwrap_err().code(), "unknown_field");
+    }
+
+    #[test]
+    fn slots_env_naming_a_one_of_key_is_accel_invalid() {
+        let images = lock_images();
+        let text = String::from_utf8(read("valid-full.json")).unwrap();
+        let from = "\"slots_env\": \"RHADDON_SLOTS\"";
+        assert!(text.contains(from), "valid-full.json names a slots_env");
+        // RHADDON_QUANT is a one_of key: no integer bound to size slots by.
+        let bad = text.replace(from, "\"slots_env\": \"RHADDON_QUANT\"");
+        let got = parse_node_workloads("rhaddon", bad.as_bytes(), &images, None);
+        assert_eq!(got.unwrap_err().code(), "accel_invalid");
+        let ok = parse_node_workloads("rhaddon", text.as_bytes(), &images, None);
+        assert!(ok.is_ok(), "{:?}", ok.err());
     }
 
     #[test]
