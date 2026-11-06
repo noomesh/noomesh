@@ -156,6 +156,7 @@ pub fn stage(
     images: &[Selected],
     local: &BTreeMap<String, String>,
 ) -> Result<Vec<Staged>, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let mut out = Vec::new();
     for s in images {
         let lref = local
@@ -169,8 +170,6 @@ pub fn stage(
             out.push(Staged { tar, exported: false });
             continue;
         }
-        // Only now, so an image that is not local touches no directory.
-        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         let part = dir.join(format!("{tar}.part"));
         let _ = std::fs::remove_file(&part);
         if let Err(e) = docker.save(&id, &part) {
@@ -224,14 +223,16 @@ pub fn prune(dir: &Path, addon: &str, keep: &BTreeSet<(String, String)>) -> Resu
 
 /// At enable and upgrade, after the images are pulled: stage what the
 /// bundle's `node-workloads.json` names, onto the rail of this host. No file,
-/// no workloads, nothing touched (not even the directory). Returns the rail
-/// file names exported just now.
+/// no workloads, nothing touched (not even the directory). `dir` is the
+/// images store directory, chosen by the caller. Returns the rail file names
+/// exported just now.
 pub fn stage_prepared(
     docker: &mut dyn Docker,
     addon: &str,
     lock_images: &BTreeMap<String, String>,
     files: &BTreeMap<String, Vec<u8>>,
     route: &Route,
+    dir: &Path,
 ) -> Result<Vec<String>, String> {
     let workloads = super::decls::check_node_workloads(addon, files, lock_images)?;
     let selected = select(&workloads, lock_images)?;
@@ -245,32 +246,32 @@ pub fn stage_prepared(
             .ok_or_else(|| format!("{} does not sit under {}", s.reference, route.root()))?;
         local.insert(s.image.clone(), l);
     }
-    let dir = crate::commands::image_stage::images_store_dir();
     let arch = crate::commands::image_stage::host_arch();
-    let staged = stage(docker, &dir, addon, &arch, &selected, &local)?;
+    let staged = stage(docker, dir, addon, &arch, &selected, &local)?;
     Ok(staged.into_iter().filter(|s| s.exported).map(|s| s.tar).collect())
 }
 
 /// After an upgrade is pinned: drop this add-on's tars that the new lock does
 /// not reference.
 pub fn prune_superseded(
+    dir: &Path,
     addon: &str,
     lock_images: &BTreeMap<String, String>,
     files: &BTreeMap<String, Vec<u8>>,
 ) -> Result<usize, String> {
     let workloads = super::decls::check_node_workloads(addon, files, lock_images)?;
     let keep = keep_set(&select(&workloads, lock_images)?);
-    prune(&crate::commands::image_stage::images_store_dir(), addon, &keep)
+    prune(dir, addon, &keep)
 }
 
 /// [`prune_superseded`] for a prepared add-on whose pin was just written.
-pub fn prune_for(p: &super::Prepared) -> Result<usize, String> {
-    prune_superseded(&p.addon, &p.verified.lock.images, &p.fetched.files)
+pub fn prune_for(dir: &Path, p: &super::Prepared) -> Result<usize, String> {
+    prune_superseded(dir, &p.addon, &p.verified.lock.images, &p.fetched.files)
 }
 
 /// At disable: drop every tar this module staged for the add-on.
-pub fn prune_all(addon: &str) -> Result<usize, String> {
-    prune(&crate::commands::image_stage::images_store_dir(), addon, &BTreeSet::new())
+pub fn prune_all(dir: &Path, addon: &str) -> Result<usize, String> {
+    prune(dir, addon, &BTreeSet::new())
 }
 
 #[cfg(test)]
@@ -443,11 +444,64 @@ mod tests {
             registry: "ghcr.io/elsewhere".into(),
         };
         // No image ids: were the route check gone, stage would fail at the
-        // first lookup, before it touched the host's image directory.
+        // first lookup (and only ever sees this test's own directory).
         let mut d = FakeDocker::default();
-        let e = stage_prepared(&mut d, "rhaddon", &lock_images(), &files, &route).unwrap_err();
+        let dir = tmp("noroute");
+        let e = stage_prepared(&mut d, "rhaddon", &lock_images(), &files, &route, &dir)
+            .unwrap_err();
         assert!(e.contains("does not sit under") && e.contains(WORKER), "{e}");
         assert!(d.saves.is_empty() && d.pulls.is_empty(), "{:?} {:?}", d.saves, d.pulls);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn names_in(dir: &Path) -> BTreeSet<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Stale rhaddon files plus one unrelated file; returns the stale tar.
+    fn seed_stale(dir: &Path) -> String {
+        let stale = tar_name("rhaddon", "addon-worker", HEX_B, "amd64");
+        std::fs::write(dir.join(&stale), b"x").unwrap();
+        std::fs::write(dir.join(format!("{stale}.imageid")), b"sha256:1\n").unwrap();
+        std::fs::write(dir.join("unrelated.txt"), b"x").unwrap();
+        stale
+    }
+
+    /// Every prune takes its directory from the caller and touches only it.
+    #[test]
+    fn prune_touches_only_the_dir_it_is_given() {
+        let (a, b) = (tmp("dir-a"), tmp("dir-b"));
+        let stale = seed_stale(&a);
+        seed_stale(&b);
+        let before_b = names_in(&b);
+        assert_eq!(before_b.len(), 3);
+        // Disable: everything of this add-on in A goes; B is not looked at.
+        assert_eq!(prune_all(&a, "rhaddon").unwrap(), 1);
+        assert_eq!(names_in(&a), BTreeSet::from(["unrelated.txt".to_string()]));
+        assert_eq!(names_in(&b), before_b);
+        // Upgrade: the same through the lock-driven path (prune_for forwards to it).
+        let files = BTreeMap::from([
+            (
+                super::super::node_workloads::NODE_WORKLOADS_FILE.to_string(),
+                include_bytes!("../../../tests/fixtures/addons/rhaddon/node-workloads.json")
+                    .to_vec(),
+            ),
+            (
+                super::super::decls::ROUTES_FILE.to_string(),
+                include_bytes!("../../../tests/fixtures/addons/rhaddon/routes.json").to_vec(),
+            ),
+        ]);
+        assert_eq!(seed_stale(&a), stale);
+        let n = prune_superseded(&a, "rhaddon", &lock_images(), &files).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(names_in(&a), BTreeSet::from(["unrelated.txt".to_string()]));
+        assert_eq!(names_in(&b), before_b);
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
     }
 
     #[test]

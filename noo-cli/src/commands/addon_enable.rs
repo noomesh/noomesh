@@ -337,12 +337,14 @@ impl EnableOps for Live<'_> {
                 fix: "noo security secrets audit".into(),
             })?
         };
+        let images_dir = crate::commands::image_stage::images_store_dir();
         let ctx = addons::Ctx {
             root: &root,
             tag: &tag,
             stack_lock: stack_lock.as_deref(),
             allow_downgrade: false,
             client: &client,
+            images_dir: &images_dir,
         };
         if !self.g.json {
             crate::ui::step(&format!("{addon}: resolving its signed lock for stack {tag}"));

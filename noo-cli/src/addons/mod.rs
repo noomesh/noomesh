@@ -123,6 +123,10 @@ pub struct Ctx<'a> {
     pub stack_lock: Option<&'a str>,
     pub allow_downgrade: bool,
     pub client: &'a lock_fetch::Client,
+    /// The images store directory node-workload images are exported into
+    /// (`image_stage::images_store_dir()` in production), chosen once by the
+    /// verb that builds this.
+    pub images_dir: &'a Path,
 }
 
 /// Steps 1-7 for one add-on against `ctx.tag`: anchor, fetch, verify, stack
@@ -183,6 +187,7 @@ fn prepare_with(
         stack_lock: ctx.stack_lock,
         allow_downgrade: ctx.allow_downgrade,
         client,
+        images_dir: ctx.images_dir,
     };
     let current = pins::read(ctx.root).map_err(Refusal::Write)?;
     let pin = current.get(addon);
@@ -222,7 +227,15 @@ fn prepare_with(
     // The gateway has no docker: the images a node runs for this add-on
     // (named by its node-workloads.json) are exported onto the rail here, by
     // the lock's digests, before anything is pinned (i300).
-    node_images::stage_prepared(docker, addon, &verified.lock.images, &fetched.files, &route).map_err(|e| {
+    let staged = node_images::stage_prepared(
+        docker,
+        addon,
+        &verified.lock.images,
+        &fetched.files,
+        &route,
+        ctx.images_dir,
+    );
+    staged.map_err(|e| {
         Refusal::Pull(format!("its node-workload images could not be exported to the artifact rail: {e}"))
     })?;
     Ok(Prepared {

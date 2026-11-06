@@ -4756,7 +4756,15 @@ fn addon_preflight(
         return Vec::new();
     }
     let client = addon_client(g);
-    let ctx = crate::addons::Ctx { root, tag, stack_lock, allow_downgrade, client: &client };
+    let images_dir = crate::commands::image_stage::images_store_dir();
+    let ctx = crate::addons::Ctx {
+        root,
+        tag,
+        stack_lock,
+        allow_downgrade,
+        client: &client,
+        images_dir: &images_dir,
+    };
     let mut out = Vec::new();
     for addon in on {
         if !g.json { ui::step(&format!("{addon}: resolving its signed lock for {tag}")); }
@@ -4789,12 +4797,13 @@ fn lowercase_first(s: &str) -> String {
 
 /// Write the add-on pins resolved in the preflight, beside `stack.lock`.
 fn commit_addon_pins(g: &Globals, root: &std::path::Path, tag: &str, prepared: &[crate::addons::Prepared]) {
+    let images_dir = crate::commands::image_stage::images_store_dir();
     for p in prepared {
         match crate::addons::commit(root, p, tag) {
             Ok(pin) => {
                 // The new lock is current: tars of its node-workload images
                 // that it no longer names leave the rail.
-                if let Err(e) = crate::addons::node_images::prune_for(p) {
+                if let Err(e) = crate::addons::node_images::prune_for(&images_dir, p) {
                     if !g.json {
                         ui::warned(&format!("{}: stale node-workload images stay on the rail ({e})", p.addon));
                     }
