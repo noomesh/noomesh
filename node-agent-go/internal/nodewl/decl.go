@@ -162,7 +162,13 @@ type Scratch struct {
 	Target  string `json:"target"`
 	MaxMB   *int64 `json:"max_mb,omitempty"`
 	TmpfsMB *int64 `json:"tmpfs_mb,omitempty"`
+	// Exec lets the worker load native code it wrote here (A12): the one
+	// scratch mounted without noexec. At most one entry, at most MaxExecScratchMB.
+	Exec bool `json:"exec,omitempty"`
 }
+
+// MaxExecScratchMB is the size cap of the exec scratch.
+const MaxExecScratchMB = 1024
 
 type Limits struct {
 	RAMMB int64   `json:"ram_mb"`
@@ -456,6 +462,16 @@ func validateScratch(ss []Scratch, ms []Slot) error {
 		}
 		if s.MaxMB != nil && (*s.MaxMB < 1 || *s.MaxMB > 65536) || s.TmpfsMB != nil && (*s.TmpfsMB < 1 || *s.TmpfsMB > 16384) {
 			return fail(CodeScratchInvalid, "scratch[%d]: size out of range", i)
+		}
+		if s.Exec && (s.MaxMB != nil && *s.MaxMB > MaxExecScratchMB || s.TmpfsMB != nil && *s.TmpfsMB > MaxExecScratchMB) {
+			return fail(CodeScratchInvalid, "scratch[%d]: an exec scratch is at most %d MiB", i, MaxExecScratchMB)
+		}
+		if s.Exec {
+			for _, o := range ss[:i] {
+				if o.Exec {
+					return fail(CodeScratchInvalid, "scratch[%d]: a second exec scratch", i)
+				}
+			}
 		}
 		for _, o := range ss[:i] {
 			if o.Target == s.Target {
