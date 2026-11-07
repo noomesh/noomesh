@@ -2355,4 +2355,653 @@ mod tests {
         let staged = run(&f, None, &dir, &req, None).0.expect("64 files");
         assert_eq!(staged.files.len(), 64);
     }
+
+    // ── one check, one test (the per-check pass) ─────────────────────────
+
+    fn sib(path: &str) -> Sibling {
+        Sibling {
+            path: path.to_string(),
+            size: 1,
+            lfs: false,
+            lfs_sha256: None,
+            blob_id: Some("1".repeat(40)),
+        }
+    }
+
+    fn listing_of(files: Vec<Sibling>) -> Listing {
+        Listing { gated: false, license: None, files }
+    }
+
+    fn env_of<'a>(f: &'a Fake, dir: &'a Path) -> Env<'a> {
+        Env {
+            base: &f.base,
+            token: None,
+            models_dir: dir,
+            by: "alice",
+            now: "2026-11-05T10:00:00Z",
+            recorded: None,
+        }
+    }
+
+    /// A fake that answers the API listing with `doc` and has nothing else.
+    fn listing_only(doc: Value) -> Fake {
+        serve(move |_, path| {
+            if path.starts_with(&format!("/api/models/{REPO}/revision/{SHA}")) {
+                return resp(200, doc.to_string().as_bytes());
+            }
+            resp(404, b"")
+        })
+    }
+
+    // The pinned commit.
+
+    #[test]
+    fn a_listing_for_another_commit_is_refused() {
+        let other = "f".repeat(40);
+        let doc = json!({"sha": other, "siblings": []});
+        let e = read_listing(&doc, REPO, SHA).expect_err("another commit");
+        assert!(matches!(&e, StageError::Fetch(m) if m.contains("answered for")), "{e}");
+        let ok = read_listing(&json!({"sha": SHA, "siblings": []}), REPO, SHA).expect("the commit");
+        assert!(ok.files.is_empty());
+    }
+
+    #[test]
+    fn a_listing_that_names_no_commit_is_refused() {
+        let e = read_listing(&json!({"siblings": []}), REPO, SHA).expect_err("no commit");
+        let named = matches!(&e, StageError::Fetch(m) if m.contains("does not name the commit"));
+        assert!(named, "{e}");
+    }
+
+    #[test]
+    fn a_gated_field_is_read_as_hugging_face_writes_it() {
+        let rows: [(Value, bool); 7] = [
+            (json!(true), true),
+            (json!("manual"), true),
+            (json!("auto"), true),
+            (json!(false), false),
+            (json!("false"), false),
+            (json!(""), false),
+            (json!(null), false),
+        ];
+        for (gated, want) in rows {
+            let doc = json!({"sha": SHA, "gated": gated, "siblings": []});
+            let l = read_listing(&doc, REPO, SHA).expect("listing");
+            assert_eq!(l.gated, want, "gated = {gated}");
+        }
+    }
+
+    // The --file selection.
+
+    #[test]
+    fn select_refuses_a_listing_with_no_files() {
+        let e = select(&listing_of(Vec::new()), &[]).expect_err("nothing to stage");
+        assert!(matches!(&e, StageError::Input(m) if m.contains("lists no files")), "{e}");
+    }
+
+    #[test]
+    fn select_refuses_a_path_outside_the_set_rule() {
+        let deep = listing_of(vec![sib("a/b/c.bin")]);
+        let e = select(&deep, &[]).expect_err("two levels down");
+        let said = matches!(&e, StageError::Input(m) if m.contains("cannot be in a model set"));
+        assert!(said, "{e}");
+        let shallow = listing_of(vec![sib("a/b.bin")]);
+        assert_eq!(select(&shallow, &[]).expect("one level is fine").len(), 1);
+    }
+
+    #[test]
+    fn select_leaves_out_gitattributes() {
+        let l = listing_of(vec![sib(".gitattributes"), sib("a.bin")]);
+        let got = select(&l, &[]).expect("selected");
+        let paths: Vec<&str> = got.iter().map(|x| x.path.as_str()).collect();
+        assert_eq!(paths, ["a.bin"]);
+    }
+
+    #[test]
+    fn select_sorts_by_path() {
+        let l = listing_of(vec![sib("z.bin"), sib("a.bin")]);
+        let got = select(&l, &[]).expect("selected");
+        let paths: Vec<&str> = got.iter().map(|x| x.path.as_str()).collect();
+        assert_eq!(paths, ["a.bin", "z.bin"]);
+    }
+
+    // The archive.
+
+    fn archive_listing(lfs: bool, sha: Option<&str>) -> Listing {
+        listing_of(vec![Sibling {
+            path: "voices.tgz".to_string(),
+            size: 10,
+            lfs,
+            lfs_sha256: sha.map(str::to_string),
+            blob_id: None,
+        }])
+    }
+
+    fn extract_spec() -> ExtractSpec {
+        ExtractSpec { archive: "voices.tgz".to_string(), glob: None }
+    }
+
+    #[test]
+    fn an_lfs_archive_with_no_published_sha256_is_refused() {
+        let req = request_with(&["--extract", "voices.tgz"]);
+        let digest = "a".repeat(64);
+        let good = archive_listing(true, Some(digest.as_str()));
+        assert!(find_archive(&good, &req, &extract_spec()).is_ok());
+        let no_digest = archive_listing(true, None);
+        let e = find_archive(&no_digest, &req, &extract_spec()).expect_err("no sha256");
+        assert!(e.to_string().contains("not an LFS file"), "{e}");
+    }
+
+    #[test]
+    fn an_archive_that_is_not_in_lfs_is_refused_whatever_digest_it_carries() {
+        let req = request_with(&["--extract", "voices.tgz"]);
+        let digest = "a".repeat(64);
+        let plain = archive_listing(false, Some(digest.as_str()));
+        let e = find_archive(&plain, &req, &extract_spec()).expect_err("not LFS");
+        assert!(e.to_string().contains("not an LFS file"), "{e}");
+    }
+
+    // The bytes are checked against what Hugging Face published.
+
+    /// A repo of one LFS file, weights.bin; its listing carries `listed` as the sha256.
+    fn lfs_repo(listed: Option<String>) -> Fake {
+        serve(move |method, path| {
+            let w = weights();
+            if path.starts_with(&format!("/api/models/{REPO}/revision/{SHA}")) {
+                let mut lfs = json!({"size": w.len(), "pointerSize": 134});
+                if let Some(sha) = &listed {
+                    lfs["sha256"] = json!(sha);
+                }
+                let doc = json!({
+                    "sha": SHA,
+                    "gated": false,
+                    "cardData": {"license": "apache-2.0"},
+                    "siblings": [{
+                        "rfilename": "weights.bin",
+                        "size": w.len(),
+                        "blobId": "2".repeat(40),
+                        "lfs": lfs,
+                    }],
+                });
+                return resp(200, doc.to_string().as_bytes());
+            }
+            let resolve = format!("/{REPO}/resolve/{SHA}/");
+            match path.strip_prefix(resolve.as_str()) {
+                Some("weights.bin") => {
+                    let mut r = resp(302, b"");
+                    r.headers.push(("Location".into(), "/cdn/weights.bin".into()));
+                    r.headers.push(("x-linked-etag".into(), format!("\"{}\"", sha256_hex(&w))));
+                    r.headers.push(("x-linked-size".into(), w.len().to_string()));
+                    r
+                }
+                _ if path == "/cdn/weights.bin" && method == "GET" => resp(200, &w),
+                _ => resp(404, b""),
+            }
+        })
+    }
+
+    #[test]
+    fn an_lfs_file_with_no_published_sha256_is_refused() {
+        let f = lfs_repo(None);
+        let e = run(&f, None, &tmpdir("lfs-nodigest"), &request("voice"), None)
+            .0
+            .expect_err("nothing to verify against");
+        let said = matches!(&e, StageError::Fetch(m) if m.contains("published no LFS sha256"));
+        assert!(said, "{e}");
+    }
+
+    #[test]
+    fn an_lfs_file_whose_own_digest_differs_from_the_listing_is_refused() {
+        let f = lfs_repo(Some("9".repeat(64)));
+        let e = run(&f, None, &tmpdir("lfs-liar"), &request("voice"), None)
+            .0
+            .expect_err("the listing disagrees");
+        let said = matches!(&e, StageError::Fetch(m) if m.contains("the listing says sha256"));
+        assert!(said, "{e}");
+        let honest = lfs_repo(Some(sha256_hex(&weights())));
+        assert!(run(&honest, None, &tmpdir("lfs-honest"), &request("voice"), None).0.is_ok());
+    }
+
+    fn right_readme() -> String {
+        crate::commands::voice_models::git_blob_sha1(README)
+    }
+
+    /// A repo whose only file is README.md, listed as `sibling`; the file
+    /// itself is answered with `status` and `body`.
+    fn small_repo(sibling: Value, status: u16, body: Vec<u8>) -> Fake {
+        serve(move |_, path| {
+            if path.starts_with(&format!("/api/models/{REPO}/revision/{SHA}")) {
+                let doc = json!({
+                    "sha": SHA,
+                    "gated": false,
+                    "cardData": {"license": "apache-2.0"},
+                    "siblings": [sibling.clone()],
+                });
+                return resp(200, doc.to_string().as_bytes());
+            }
+            if path.ends_with("/README.md") {
+                return resp(status, &body);
+            }
+            resp(404, b"")
+        })
+    }
+
+    fn readme_sibling(size: u64, blob: Option<String>) -> Value {
+        let mut v = json!({"rfilename": "README.md", "size": size});
+        if let Some(b) = blob {
+            v["blobId"] = json!(b);
+        }
+        v
+    }
+
+    fn small_refusal(tag: &str, f: &Fake) -> String {
+        run(f, None, &tmpdir(tag), &request("voice"), None).0.expect_err("refused").to_string()
+    }
+
+    #[test]
+    fn a_small_file_with_no_published_digest_is_refused() {
+        let f = small_repo(readme_sibling(README.len() as u64, None), 200, README.to_vec());
+        let m = small_refusal("small-nodigest", &f);
+        assert!(m.contains("published no digest"), "{m}");
+    }
+
+    #[test]
+    fn a_small_file_past_the_size_cap_is_refused_unread() {
+        let big = 9 * 1024 * 1024;
+        let f = small_repo(readme_sibling(big, Some(right_readme())), 200, README.to_vec());
+        let m = small_refusal("small-big", &f);
+        assert!(m.contains("cannot be verified"), "{m}");
+        assert!(downloaded_nothing(&f));
+    }
+
+    #[test]
+    fn a_small_file_that_hashes_to_another_blob_is_refused() {
+        let wrong = Some("4".repeat(40));
+        let f = small_repo(readme_sibling(README.len() as u64, wrong), 200, README.to_vec());
+        let m = small_refusal("small-wrong", &f);
+        assert!(m.contains("digest mismatch"), "{m}");
+        let right = Some(right_readme());
+        let ok = small_repo(readme_sibling(README.len() as u64, right), 200, README.to_vec());
+        assert!(run(&ok, None, &tmpdir("small-right"), &request("voice"), None).0.is_ok());
+    }
+
+    #[test]
+    fn a_small_file_the_server_does_not_answer_with_200_is_refused() {
+        let right = Some(right_readme());
+        let f = small_repo(readme_sibling(README.len() as u64, right), 500, Vec::new());
+        let m = small_refusal("small-500", &f);
+        assert!(m.contains("download returned HTTP 500"), "{m}");
+    }
+
+    #[test]
+    fn a_small_file_that_streams_past_the_cap_is_refused() {
+        let body = vec![b'x'; (8 << 20) + 4096];
+        let f = small_repo(readme_sibling(10, Some(right_readme())), 200, body);
+        let m = small_refusal("small-stream", &f);
+        assert!(m.contains("download failed"), "{m}");
+    }
+
+    // The licence.
+
+    #[test]
+    fn a_model_card_with_no_licence_needs_one_on_the_command_line() {
+        let doc = json!({
+            "sha": SHA,
+            "gated": false,
+            "siblings": [{"rfilename": "README.md", "size": README.len(), "blobId": right_readme()}],
+        });
+        let f = listing_only(doc);
+        let e = run(&f, None, &tmpdir("no-licence"), &request("voice"), None)
+            .0
+            .expect_err("no licence");
+        assert!(matches!(&e, StageError::Input(m) if m.contains("names no licence")), "{e}");
+        assert!(downloaded_nothing(&f));
+        // With --license the stage goes on (and stops at the missing download).
+        let with = request_with(&["--license", "MIT"]);
+        let e = run(&f, None, &tmpdir("no-licence-flag"), &with, None).0.expect_err("no file");
+        assert!(!e.to_string().contains("names no licence"), "{e}");
+    }
+
+    // The signature goes last, and the files and directories are 0644 / 0755.
+
+    fn signs_only_after_the_manifest(data: &Path, _out: &Path) -> Result<(), String> {
+        let sig = data.with_file_name(SIGNATURE);
+        if data.is_file() && !sig.exists() {
+            Err("refused".to_string())
+        } else {
+            Err("the signature was there before the manifest".to_string())
+        }
+    }
+
+    #[test]
+    fn the_signature_comes_after_the_manifest_and_never_when_signing_fails() {
+        let dir = tmpdir("sig-last");
+        let f = hf(json!(false));
+        let env = env_of(&f, &dir);
+        let sign = &signs_only_after_the_manifest;
+        let e = stage_set(&env, &request("voice"), &needs(), sign, &mut |_: &str| {})
+            .expect_err("signing is refused");
+        assert!(matches!(&e, StageError::Io(m) if m.as_str() == "refused"), "{e}");
+        let set = set_dir_of(&dir);
+        assert!(set.join(MANIFEST).is_file());
+        assert!(!set.join(SIGNATURE).exists());
+        assert!(scan(&dir, &dir.join("absent.pub"), Some("voice")).is_empty());
+    }
+
+    fn signs_privately(_data: &Path, out: &Path) -> Result<(), String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(out)
+            .map_err(|e| e.to_string())?;
+        f.write_all(b"signature").map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn the_signature_is_published_at_0644() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir("sig-mode");
+        let f = hf(json!(false));
+        let env = env_of(&f, &dir);
+        let sign = &signs_privately;
+        stage_set(&env, &request("voice"), &needs(), sign, &mut |_: &str| {}).expect("staged");
+        let sig = set_dir_of(&dir).join(SIGNATURE);
+        assert_eq!(std::fs::metadata(&sig).unwrap().permissions().mode() & 0o777, 0o644);
+    }
+
+    #[test]
+    fn a_directory_someone_else_made_is_opened_up_to_0755() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let d = tmpdir("mkdir-mode").join("x");
+        std::fs::DirBuilder::new().mode(0o700).create(&d).unwrap();
+        mkdir(&d).expect("made");
+        assert_eq!(std::fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o755);
+    }
+
+    #[test]
+    fn an_atomic_write_lands_at_0644_whatever_the_part_file_was() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let dir = tmpdir("atomic-mode");
+        let part = models_fetch::part_path(&dir, "f.json");
+        let mut old = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&part)
+            .unwrap();
+        old.write_all(b"stale").unwrap();
+        drop(old);
+        let dest = write_atomic(&dir, "f.json", b"fresh").expect("written");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"fresh");
+        assert_eq!(std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777, 0o644);
+        assert!(!part.exists());
+    }
+
+    #[test]
+    fn a_refused_extraction_leaves_not_even_an_empty_sets_directory() {
+        let mut entries = two_members();
+        entries.push(other("c.bin", b'2', "/etc/passwd"));
+        let f = hf_archive(gz(&tar(&entries)), true);
+        let dir = tmpdir("extract-no-trace");
+        let req = request_with(&["--extract", "voices.tgz"]);
+        assert!(run(&f, None, &dir, &req, None).0.is_err());
+        assert!(!dir.join("sets").exists(), "an empty sets/ was left behind");
+    }
+
+    // The listing of sets.
+
+    #[test]
+    fn list_skips_work_dirs() {
+        let dir = tmpdir("list-hidden");
+        let f = hf(json!(false));
+        run(&f, None, &dir, &request("voice"), None).0.expect("staged");
+        let id_dir = dir.join("sets/test-voice-set");
+        // A work dir that holds a signature file is still not a set.
+        let hidden = id_dir.join(".extract-ff");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(hidden.join(SIGNATURE), b"sig").unwrap();
+        let rows = scan(&dir, &dir.join("absent.pub"), Some("voice"));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].problem, None);
+    }
+
+    #[test]
+    fn list_flags_a_manifest_filed_under_another_revision() {
+        let dir = tmpdir("list-misfiled");
+        let f = hf(json!(false));
+        run(&f, None, &dir, &request("voice"), None).0.expect("staged");
+        let nopub = dir.join("absent.pub");
+        let id_dir = dir.join("sets/test-voice-set");
+        let moved = id_dir.join("other-rev");
+        std::fs::rename(id_dir.join(SHA), &moved).unwrap();
+        let rows = scan(&dir, &nopub, Some("voice"));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let said = rows[0].problem.clone().unwrap_or_default();
+        assert!(said.contains("another id or revision"), "{said}");
+    }
+
+    #[test]
+    fn list_shows_a_broken_manifest_whatever_kind_was_asked_for() {
+        let dir = tmpdir("list-broken");
+        let f = hf(json!(false));
+        run(&f, None, &dir, &request("voice"), None).0.expect("staged");
+        std::fs::write(set_dir_of(&dir).join(MANIFEST), b"not json").unwrap();
+        let rows = scan(&dir, &dir.join("absent.pub"), Some("voice-pack"));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].problem.is_some());
+    }
+
+    // The acceptance record.
+
+    fn acceptance_of(tag: &str, body: &Value) -> Option<(String, String)> {
+        let dir = tmpdir(tag);
+        let path = accepted_path(&dir, "test-voice-set");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body.to_string()).unwrap();
+        read_acceptance(&dir, "test-voice-set")
+    }
+
+    #[test]
+    fn an_acceptance_record_is_read_when_it_names_who_and_when() {
+        let body = json!({"by": "bob", "at": "2026-11-05T11:12:13Z"});
+        assert!(acceptance_of("accept-good", &body).is_some());
+    }
+
+    #[test]
+    fn an_acceptance_record_with_no_name_is_not_read() {
+        let body = json!({"by": "", "at": "2026-11-05T11:12:13Z"});
+        assert_eq!(acceptance_of("accept-noname", &body), None);
+    }
+
+    #[test]
+    fn an_acceptance_record_with_a_name_past_128_characters_is_not_read() {
+        let body = json!({"by": "x".repeat(129), "at": "2026-11-05T11:12:13Z"});
+        assert_eq!(acceptance_of("accept-longname", &body), None);
+    }
+
+    #[test]
+    fn an_acceptance_record_with_no_real_time_is_not_read() {
+        let body = json!({"by": "bob", "at": "yesterday"});
+        assert_eq!(acceptance_of("accept-badtime", &body), None);
+    }
+
+    // The command line.
+
+    /// The error text of a stage command line that leaves out `skip` (a flag).
+    fn stage_without(skip: &str) -> String {
+        let all = [
+            ("--kind", "voice"),
+            ("--id", "x"),
+            ("--modality", "tts"),
+            ("--runtime", "rt"),
+            ("--needs", "n.json"),
+        ];
+        let mut a: Vec<String> = Vec::new();
+        for (flag, val) in all {
+            if flag != skip {
+                a.push(flag.to_string());
+                a.push(val.to_string());
+            }
+        }
+        a.push(format!("hf:{REPO}@{SHA}"));
+        match parse_stage_with(&mut Args::new(&a)) {
+            Ok(_) => String::new(),
+            Err(e) => e.0,
+        }
+    }
+
+    #[test]
+    fn a_stage_line_with_every_required_flag_parses() {
+        assert_eq!(stage_without("--none"), "");
+    }
+
+    #[test]
+    fn a_stage_without_an_id_is_refused() {
+        assert!(stage_without("--id").contains("--id"));
+    }
+
+    #[test]
+    fn a_stage_without_a_modality_is_refused() {
+        assert!(stage_without("--modality").contains("--modality"));
+    }
+
+    #[test]
+    fn a_stage_without_a_needs_file_is_refused() {
+        assert!(stage_without("--needs").contains("--needs"));
+    }
+
+    #[test]
+    fn a_stage_without_a_runtime_is_refused() {
+        assert!(stage_without("--runtime").contains("--runtime"));
+    }
+
+    #[test]
+    fn a_fits_revision_without_a_fits_model_is_refused() {
+        let spec = format!("hf:{REPO}@{SHA}");
+        let a = s(&[
+            "--kind", "voice", "--id", "x", "--modality", "tts", "--runtime", "rt", "--needs",
+            "n.json", "--fits-revision", "v1", spec.as_str(),
+        ]);
+        let e = parse_stage_with(&mut Args::new(&a)).expect_err("fits-revision alone");
+        assert!(e.0.contains("--fits-model"), "{e}");
+    }
+
+    #[test]
+    fn a_repo_id_must_be_org_slash_name() {
+        let long = format!("org/{}", "a".repeat(97));
+        let bad = ["justname", "a/b/c", "../x", "org/na me", "/name", "org/", "-org/name", long.as_str()];
+        for repo in bad {
+            let e = parse_spec(&format!("hf:{repo}@{SHA}")).expect_err("not a repo id");
+            assert!(e.contains("Hugging Face repo id"), "{repo}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_member_glob_may_not_pass_128_characters() {
+        assert!(parse_extract(&format!("voices.tgz:{}", "a".repeat(128))).is_ok());
+        assert!(parse_extract(&format!("voices.tgz:{}", "a".repeat(129))).is_err());
+    }
+
+    #[test]
+    fn accept_holds_the_set_id_to_the_rule() {
+        assert_eq!(parse_accept_with(&mut Args::new(&s(&["a-set"]))).unwrap(), "a-set");
+        for bad in ["A", "../x", "a/b", ".a"] {
+            assert!(parse_accept_with(&mut Args::new(&s(&[bad]))).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn rm_holds_the_set_id_to_the_rule() {
+        for bad in ["A", "../x", "a/b", ".a", "a/../b"] {
+            assert!(parse_rm_with(&mut Args::new(&s(&[bad]))).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn rm_reads_its_flags_and_the_revision() {
+        let line = s(&["--force", "-y", "a-set@rev1"]);
+        let r = parse_rm_with(&mut Args::new(&line)).unwrap_or_else(|e| panic!("{e}"));
+        assert!(r.force && r.yes);
+        assert_eq!((r.id.as_str(), r.revision.as_deref()), ("a-set", Some("rev1")));
+        let line = s(&["a-set"]);
+        let r = parse_rm_with(&mut Args::new(&line)).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!r.force && !r.yes && r.revision.is_none());
+    }
+
+    // The rm target: what `noo models rm` deletes is named by these two rules.
+
+    #[test]
+    fn a_target_id_may_not_start_with_a_dot_dash_or_underscore() {
+        for bad in ["", ".a", "-a", "_a"] {
+            assert!(parse_target(bad).is_err(), "{bad:?}");
+        }
+        assert!(parse_target("a-set").is_ok());
+    }
+
+    #[test]
+    fn a_target_id_may_not_hold_a_slash_a_space_or_a_colon() {
+        for bad in ["a/b", "a b", "a/../b", "a:b"] {
+            assert!(parse_target(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_target_id_may_not_pass_64_characters() {
+        assert!(parse_target(&"a".repeat(64)).is_ok());
+        assert!(parse_target(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn a_target_revision_may_not_start_with_a_dot_dash_or_underscore() {
+        for bad in ["a@.a", "a@-a", "a@_a", "a@"] {
+            assert!(parse_target(bad).is_err(), "{bad:?}");
+        }
+        assert!(parse_target("a@1.0").is_ok());
+    }
+
+    #[test]
+    fn a_target_revision_may_not_hold_a_slash_a_space_or_a_second_at_sign() {
+        for bad in ["a@a/b", "a@a b", "a@a/../../b", "a@a@b", "a@a:b"] {
+            assert!(parse_target(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_target_revision_may_not_pass_128_characters() {
+        assert!(parse_target(&format!("a@{}", "a".repeat(128))).is_ok());
+        assert!(parse_target(&format!("a@{}", "a".repeat(129))).is_err());
+    }
+
+    // The token.
+
+    #[test]
+    fn the_stage_command_names_the_token_only_to_read_it_and_pass_it_on() {
+        let own = crate::test_src::own_code(include_str!("models_sets.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn models_stage(");
+        let allowed = [
+            "let token = models_fetch::hf_token();",
+            "token: token.as_deref(),",
+            "(\"token\", token_note.to_string()),",
+        ];
+        for line in body.lines() {
+            if !line.to_ascii_lowercase().contains("token") {
+                continue;
+            }
+            let t = line.trim();
+            let known = allowed.contains(&t) || t.starts_with("let token_note = if token.is_some()");
+            assert!(known, "models_stage mentions the token on a line this guard does not know: {t}");
+        }
+    }
+
+    #[test]
+    fn accept_and_rm_never_touch_the_token() {
+        let own = crate::test_src::own_code(include_str!("models_sets.rs"));
+        for marker in ["pub fn models_accept(", "pub fn models_rm("] {
+            let body = crate::test_src::fn_body(&own, marker);
+            assert!(!body.to_ascii_lowercase().contains("token"), "{marker}");
+        }
+    }
 }

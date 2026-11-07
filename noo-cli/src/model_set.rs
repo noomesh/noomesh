@@ -809,6 +809,7 @@ pub fn validate(bytes: &[u8]) -> Result<(), Refusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::path::{Path, PathBuf};
 
     fn dir() -> PathBuf {
@@ -1001,5 +1002,257 @@ mod tests {
         for bad in bad_ones {
             assert!(!valid_set_path(bad), "{bad:?}");
         }
+    }
+
+    fn rep(c: char, n: usize) -> String {
+        c.to_string().repeat(n)
+    }
+
+    #[test]
+    fn a_set_path_may_not_pass_129_characters() {
+        assert!(valid_set_path(&rep('a', 129)));
+        assert!(!valid_set_path(&rep('a', 130)));
+    }
+
+    #[test]
+    fn an_id_starts_with_a_lower_case_letter_or_digit() {
+        for bad in ["", ".a", "-a", "_a"] {
+            assert!(!id_ok(bad), "{bad:?}");
+        }
+        assert!(id_ok("a") && id_ok("9") && id_ok("a.b_c-d"));
+    }
+
+    #[test]
+    fn an_id_holds_only_lower_case_digits_dot_underscore_and_dash() {
+        for bad in ["a/b", "a b", "a/../b", "a@b", "aB"] {
+            assert!(!id_ok(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_id_is_at_most_64_characters() {
+        assert!(id_ok(&rep('a', 64)));
+        assert!(!id_ok(&rep('a', 65)));
+    }
+
+    #[test]
+    fn a_revision_starts_with_a_letter_or_digit() {
+        for bad in ["", ".a", "-a", "_a"] {
+            assert!(!revision_ok(bad), "{bad:?}");
+        }
+        assert!(revision_ok("A") && revision_ok("v1.0_rc-2"));
+    }
+
+    #[test]
+    fn a_revision_holds_only_letters_digits_dot_underscore_and_dash() {
+        for bad in ["a/b", "a b", "a/../b", "a@b", "a:b"] {
+            assert!(!revision_ok(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_revision_is_at_most_128_characters() {
+        assert!(revision_ok(&rep('a', 128)));
+        assert!(!revision_ok(&rep('a', 129)));
+    }
+
+    #[test]
+    fn a_profile_name_is_lower_case_digits_and_dash_from_a_letter() {
+        for bad in ["", "1a", "-a", "aB", "a_b", "a.b"] {
+            assert!(!profile_name_ok(bad), "{bad:?}");
+        }
+        assert!(profile_name_ok("bf16-offload") && profile_name_ok(&rep('a', 32)));
+        assert!(!profile_name_ok(&rep('a', 33)));
+    }
+
+    #[test]
+    fn a_compute_capability_is_digits_dot_digit() {
+        for ok in ["8.0", "10.5"] {
+            assert!(compute_ok(ok), "{ok:?}");
+        }
+        for bad in ["8", ".0", "100.0", "8.", "8.00", "a.0", "8.x", "8.0.1"] {
+            assert!(!compute_ok(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn lower_hex_wants_the_length_and_lower_case() {
+        assert!(lower_hex("ab12", 4));
+        assert!(!lower_hex("AB12", 4));
+        assert!(!lower_hex("ab1", 4));
+        assert!(!lower_hex("ab12g", 5));
+    }
+
+    #[test]
+    fn a_hugging_face_repo_is_org_slash_name() {
+        for ok in ["org/name", "a.b/c_d-e", "o/n"] {
+            assert!(hf_repo_ok(ok), "{ok:?}");
+        }
+        for bad in ["a", "/b", "a/", "a/b/c", ".a/b", "a/-b", "a b/c", "a/b c"] {
+            assert!(!hf_repo_ok(bad), "{bad:?}");
+        }
+        assert!(hf_repo_ok(&format!("org/{}", rep('a', 96))));
+        assert!(!hf_repo_ok(&format!("org/{}", rep('a', 97))));
+        assert!(!hf_repo_ok(&format!("{}/name", rep('a', 97))));
+    }
+
+    #[test]
+    fn a_licence_id_is_letters_digits_and_a_few_marks() {
+        for ok in ["MIT", "Apache-2.0", "a+b", "CC-BY-4.0"] {
+            assert!(license_id_ok(ok), "{ok:?}");
+        }
+        for bad in ["", "-a", "a b", "a/b"] {
+            assert!(!license_id_ok(bad), "{bad:?}");
+        }
+        assert!(license_id_ok(&rep('a', 64)));
+        assert!(!license_id_ok(&rep('a', 65)));
+    }
+
+    #[test]
+    fn a_licence_url_is_https_with_no_space_and_at_most_500_characters() {
+        assert!(https_url_ok("https://a"));
+        for bad in ["http://a", "https://", "https://a b", "ftp://a", ""] {
+            assert!(!https_url_ok(bad), "{bad:?}");
+        }
+        assert!(https_url_ok(&format!("https://{}", rep('a', 500))));
+        assert!(!https_url_ok(&format!("https://{}", rep('a', 501))));
+    }
+
+    #[test]
+    fn rfc3339_refuses_each_range_and_each_offset_on_its_own() {
+        let ok = [
+            "2026-04-30T00:00:00Z",
+            "2000-02-29T00:00:00Z",
+            "2026-11-05T23:59:59Z",
+            "2026-11-05T10:20:30-05:30",
+            "2026-11-05T10:20:30.5Z",
+        ];
+        for t in ok {
+            assert!(rfc3339(t), "{t}");
+        }
+        let bad = [
+            "2026-04-31T00:00:00Z",
+            "1900-02-29T00:00:00Z",
+            "2026-00-05T00:00:00Z",
+            "2026-11-00T00:00:00Z",
+            "2026-11-05T24:00:00Z",
+            "2026-11-05T10:60:00Z",
+            "2026-11-05T10:20:60Z",
+            "2026-11-05T10:20:30+24:00",
+            "2026-11-05T10:20:30+01:60",
+            "2026-11-05T10:20:30+0100",
+            "2026-11-05T10:20:30*01:00",
+            "2026-11-05T10:20:30+01-00",
+        ];
+        for t in bad {
+            assert!(!rfc3339(t), "{t}");
+        }
+    }
+
+    fn fixture(name: &str) -> Value {
+        let raw = std::fs::read(dir().join(name)).expect("fixture");
+        serde_json::from_slice(&raw).expect("JSON")
+    }
+
+    fn many(n: usize, item: &Value) -> Value {
+        Value::Array((0..n).map(|_| item.clone()).collect())
+    }
+
+    /// (fixture, JSON pointer, new value, the code that value must get)
+    type Row = (&'static str, &'static str, Value, &'static str);
+
+    #[test]
+    fn each_value_check_of_the_validator_refuses_on_its_own() {
+        let voice = "valid-voice.json";
+        let pack = "valid-voice-pack.json";
+        let trusted = "valid-trusted-local-digests.json";
+        let extra = json!({"id": "MIT", "url": "https://example.invalid/mit"});
+        let profile = json!({"name": "p", "accel": "cpu"});
+        let sixty_five: Vec<Value> = (0..65)
+            .map(|i| json!({"path": format!("f{i}.bin"), "bytes": 1, "sha256": rep('a', 64)}))
+            .collect();
+        let http = || json!("http://example.invalid/x");
+        let past_the_top: i64 = (1i64 << 40) + 1;
+        let rows: Vec<Row> = vec![
+            (voice, "/source/hf/repo", json!("norepo"), "source_invalid"),
+            (voice, "/license/id", json!("-bad"), "license_invalid"),
+            (voice, "/license/url", http(), "license_invalid"),
+            (voice, "/license/accept", json!("none"), "license_invalid"),
+            (voice, "/license/accepted/by", json!(""), "license_invalid"),
+            (voice, "/license/accepted/by", json!(rep('x', 129)), "license_invalid"),
+            (voice, "/license/accepted/at", json!("yesterday"), "license_invalid"),
+            (voice, "/license/additional", many(9, &extra), "license_invalid"),
+            (voice, "/license/additional/0/url", http(), "license_invalid"),
+            (voice, "/license/additional/0/id", json!("-x"), "license_invalid"),
+            (voice, "/license/notice_files", many(17, &json!("README.md")), "license_invalid"),
+            (voice, "/license/notice_files/0", json!("../x"), "path_invalid"),
+            (voice, "/files", json!([]), "files_invalid"),
+            (voice, "/files", Value::Array(sixty_five), "files_invalid"),
+            (voice, "/files/0/bytes", json!(past_the_top), "files_invalid"),
+            (voice, "/needs/profiles", json!([]), "profile_invalid"),
+            (voice, "/needs/profiles", many(9, &profile), "profile_invalid"),
+            (voice, "/needs/profiles/0/name", json!("Bad"), "profile_invalid"),
+            (voice, "/needs/profiles/0/accel", json!("tpu"), "profile_invalid"),
+            (voice, "/needs/profiles/0/vram_mb", json!(0), "profile_invalid"),
+            (voice, "/needs/profiles/0/ram_mb", json!(4_194_305), "profile_invalid"),
+            (voice, "/needs/profiles/0/per_slot_vram_mb", json!(0), "profile_invalid"),
+            (voice, "/needs/arch", json!([]), "arch_invalid"),
+            (voice, "/needs/arch", json!(["amd64", "arm64", "amd64", "arm64", "amd64"]), "arch_invalid"),
+            (voice, "/needs/arch", json!(["riscv"]), "arch_invalid"),
+            (voice, "/runtime", many(9, &json!("rt")), "runtime_invalid"),
+            (voice, "/runtime/0", json!("BAD"), "runtime_invalid"),
+            (pack, "/fits/model", json!("BAD"), "fits_invalid"),
+            (pack, "/fits/revision", json!("../x"), "fits_invalid"),
+            (pack, "/fits", json!({"runtime": "BAD"}), "fits_invalid"),
+            (pack, "/fits", json!({"runtime": "rt", "revision": "v1"}), "fits_invalid"),
+            (trusted, "/trust/by", json!(""), "trust_invalid"),
+            (trusted, "/trust/by", json!(rep('x', 129)), "trust_invalid"),
+            (trusted, "/trust/reason", json!(""), "trust_invalid"),
+            (trusted, "/trust/reason", json!(rep('x', 501)), "trust_invalid"),
+            (trusted, "/trust/at", json!("soon"), "trust_invalid"),
+        ];
+        // Every row is judged, so a failing run names each row that flipped.
+        let mut flipped: Vec<String> = Vec::new();
+        for (doc, ptr, val, code) in rows {
+            let mut v = fixture(doc);
+            match v.pointer_mut(ptr) {
+                Some(slot) => *slot = val,
+                None => panic!("{doc} has no {ptr}"),
+            }
+            let got = code_of(&v);
+            if got != code {
+                flipped.push(format!("{doc} {ptr}: wanted {code}, got {got}"));
+            }
+        }
+        assert!(flipped.is_empty(), "{} rows flipped:\n{}", flipped.len(), flipped.join("\n"));
+    }
+
+    #[test]
+    fn a_missing_required_key_is_field_missing_wherever_it_is() {
+        let voice = "valid-voice.json";
+        let rows: [(&str, &str); 9] = [
+            ("/files/0", "path"),
+            ("/files/0", "bytes"),
+            ("/files/0", "sha256"),
+            ("/license", "accept"),
+            ("/license", "url"),
+            ("/needs", "arch"),
+            ("/needs/profiles/0", "accel"),
+            ("/source/hf", "digests"),
+            ("", "runtime"),
+        ];
+        let mut flipped: Vec<String> = Vec::new();
+        for (ptr, key) in rows {
+            let mut v = fixture(voice);
+            let removed = match v.pointer_mut(ptr).and_then(Value::as_object_mut) {
+                Some(o) => o.remove(key).is_some(),
+                None => false,
+            };
+            let got = code_of(&v);
+            if !removed || got != "field_missing" {
+                flipped.push(format!("{ptr} {key}: removed {removed}, got {got}"));
+            }
+        }
+        assert!(flipped.is_empty(), "{} rows flipped:\n{}", flipped.len(), flipped.join("\n"));
     }
 }

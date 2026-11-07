@@ -853,4 +853,114 @@ mod tests {
         let why = run("none", &gz(&tar(&[])), None, &SMALL).0.expect_err("no file");
         assert!(why.contains("no regular file"), "{why}");
     }
+
+    /// One regular-file entry whose header is `h` (re-sealed), then `data`.
+    fn entry_of(h: [u8; 512], data: &[u8]) -> Vec<u8> {
+        let mut b = seal(h).to_vec();
+        b.extend_from_slice(data);
+        pad(&mut b, data.len() as u64);
+        b
+    }
+
+    #[test]
+    fn an_archive_cut_inside_a_header_is_refused() {
+        // good(): a.bin takes 512 + 512 bytes, so the second header starts at 1024.
+        let raw = tar(&good());
+        let why = run("cut-header", &gz(&raw[..1024 + 100]), None, &SMALL)
+            .0
+            .expect_err("cut inside the second header");
+        assert!(why.contains("ends inside a header"), "{why}");
+    }
+
+    #[test]
+    fn an_archive_cut_inside_a_members_padding_is_refused() {
+        // The 5 bytes of a.bin are whole; 100 of its 507 padding bytes follow.
+        let raw = tar(&good());
+        let why = run("cut-padding", &gz(&raw[..512 + 5 + 100]), None, &SMALL)
+            .0
+            .expect_err("cut inside the padding");
+        assert!(why.contains("ends inside a member's padding"), "{why}");
+    }
+
+    #[test]
+    fn an_archive_cut_inside_a_members_data_is_cut_short() {
+        let raw = tar(&[file("a.bin", &[7u8; 100])]);
+        let why = run("cut-data", &gz(&raw[..512 + 10]), None, &SMALL)
+            .0
+            .expect_err("cut inside the data");
+        assert!(why.contains("is cut short"), "{why}");
+    }
+
+    #[test]
+    fn a_name_that_is_not_utf8_is_refused() {
+        let mut h = header("a.bin", 1, b'0', "");
+        h[0] = 0xff;
+        let why = refused("utf8", &[entry_of(h, b"x")], &SMALL);
+        assert!(why.contains("not UTF-8"), "{why}");
+    }
+
+    #[test]
+    fn a_member_with_no_name_is_refused() {
+        let h = header("", 1, b'0', "");
+        let why = refused("noname", &[entry_of(h, b"x")], &SMALL);
+        assert!(why.contains("empty name"), "{why}");
+    }
+
+    #[test]
+    fn a_size_field_that_is_not_octal_is_refused() {
+        let mut base256 = [0u8; 12];
+        base256[0] = 0x80;
+        base256[11] = 5;
+        let blank = [b' '; 12];
+        let junk = *b"7777777z7777";
+        let fields: [(&str, [u8; 12]); 3] = [("base256", base256), ("blank", blank), ("junk", junk)];
+        for (tag, field) in fields {
+            let mut h = header("a.bin", 1, b'0', "");
+            h[124..136].copy_from_slice(&field);
+            let why = refused(tag, &[entry_of(h, b"x")], &SMALL);
+            assert!(why.contains("size field"), "{tag}: {why}");
+        }
+    }
+
+    #[test]
+    fn an_octal_field_takes_no_sign() {
+        assert_eq!(octal(b"0000017\0"), Some(15));
+        assert_eq!(octal(b"+7\0"), None);
+        assert_eq!(octal(b"-7\0"), None);
+    }
+
+    #[test]
+    fn a_member_never_overwrites_a_file_or_follows_a_link_in_the_output_dir() {
+        let dir = tmpdir("create-new");
+        let archive = dir.join("a.tgz");
+        std::fs::write(&archive, gz(&tar(&[file("a.bin", b"new")]))).unwrap();
+        // A file already at the member's name is left alone, and is a refusal.
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("a.bin"), b"old").unwrap();
+        let why = extract(&archive, None, &out, &SMALL).expect_err("the file exists");
+        assert!(why.contains("creating"), "{why}");
+        assert_eq!(std::fs::read(out.join("a.bin")).unwrap(), b"old");
+        // A link planted at the member's name is not written through.
+        let out2 = dir.join("out2");
+        std::fs::create_dir_all(&out2).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        std::os::unix::fs::symlink(&victim, out2.join("a.bin")).unwrap();
+        let why = extract(&archive, None, &out2, &SMALL).expect_err("the link exists");
+        assert!(why.contains("creating"), "{why}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn a_ustar_prefix_is_part_of_the_name_and_judged_with_it() {
+        let mut h = header("a.bin", 1, b'0', "");
+        h[345..351].copy_from_slice(b"voices");
+        let (r, _) = run("prefix", &gz(&tar(&[entry_of(h, b"x")])), None, &SMALL);
+        assert_eq!(r.expect("prefixed")[0].path, "voices/a.bin");
+        let mut h = header("a.bin", 1, b'0', "");
+        h[345..347].copy_from_slice(b"..");
+        let why = refused("prefix-dotdot", &[entry_of(h, b"x")], &SMALL);
+        assert!(why.contains("`..` component"), "{why}");
+    }
 }
