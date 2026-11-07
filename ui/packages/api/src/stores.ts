@@ -3,8 +3,9 @@
 
 // @metis/api — ready-made TokenStore adapters.
 //
-// Web uses localStorage (matches the legacy key `pai_token`). Mobile injects its
-// own SecureStore-backed store. `memoryTokenStore` is handy for tests / SSR.
+// Web keeps the access token in memory only (i515c): nothing a script on the
+// page can read back from storage, and the httpOnly refresh cookie restores
+// it after a reload. Mobile injects its own SecureStore-backed store.
 
 import type { TokenStore } from './auth.ts';
 
@@ -14,19 +15,6 @@ export function memoryTokenStore(initial: string | null = null): TokenStore {
     get: () => token,
     set: (v) => {
       token = v;
-    },
-  };
-}
-
-/** localStorage-backed store for the web app. Key defaults to the legacy name. */
-export function webTokenStore(key = 'pai_token'): TokenStore {
-  const available = typeof localStorage !== 'undefined';
-  return {
-    get: () => (available ? localStorage.getItem(key) : null),
-    set: (v) => {
-      if (!available) return;
-      if (v == null) localStorage.removeItem(key);
-      else localStorage.setItem(key, v);
     },
   };
 }

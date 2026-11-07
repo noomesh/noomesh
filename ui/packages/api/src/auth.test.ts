@@ -2,7 +2,7 @@
 // Copyright 2026 PersonifAI LLC
 
 import { describe, it, expect, vi } from 'vitest';
-import { createAuthFetch } from './auth.ts';
+import { createAuthFetch, createTokenRefresher, type CrossTab } from './auth.ts';
 import { memoryTokenStore } from './stores.ts';
 
 // Node's `Request` (unlike the browser) requires absolute URLs, so tests use a
@@ -75,12 +75,20 @@ describe('createAuthFetch', () => {
     expect(await store.get()).toBeNull();
   });
 
-  it('does not attempt a refresh when there is no token', async () => {
+  // i515c: the web console keeps its access token in memory, so after a
+  // reload the first call has none; the httpOnly refresh cookie restores it.
+  it('refreshes on a 401 even with no token in hand, and retries with the restored one', async () => {
     const store = memoryTokenStore(null);
     let refreshes = 0;
+    const seen: (string | null)[] = [];
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
-      if (asReq(input).url.endsWith('/api/auth/refresh')) refreshes++;
-      return json(401);
+      const req = asReq(input);
+      if (req.url.endsWith('/api/auth/refresh')) {
+        refreshes++;
+        return json(200, { access_token: 'restored' });
+      }
+      seen.push(req.headers.get('Authorization'));
+      return req.headers.get('Authorization') ? json(200, { ok: true }) : json(401);
     });
     const authFetch = createAuthFetch({
       baseUrl: BASE,
@@ -90,8 +98,10 @@ describe('createAuthFetch', () => {
 
     const res = await authFetch(`${BASE}/api/x`);
 
-    expect(res.status).toBe(401);
-    expect(refreshes).toBe(0);
+    expect(res.status).toBe(200);
+    expect(refreshes).toBe(1);
+    expect(seen).toEqual([null, 'Bearer restored']);
+    expect(await store.get()).toBe('restored');
   });
 
   it('coalesces concurrent 401s into a single refresh', async () => {
@@ -116,6 +126,85 @@ describe('createAuthFetch', () => {
 
     expect(a.status).toBe(200);
     expect(b.status).toBe(200);
+    expect(refreshes).toBe(1);
+  });
+});
+
+// i515c: two tabs refreshing at once must spend the rotating cookie ONCE.
+// A second refresh with an already-rotated cookie looks like a replay, and
+// the gateway then revokes every session of the account.
+describe('cross-tab refresh', () => {
+  /** A FIFO Web Lock and a BroadcastChannel shared by two "tabs". */
+  function sharedTabs() {
+    let tail: Promise<unknown> = Promise.resolve();
+    const locks: CrossTab['locks'] = {
+      request<T>(_name: string, cb: () => Promise<T>): Promise<T> {
+        const run = tail.then(cb);
+        tail = run.catch(() => undefined);
+        return run;
+      },
+    };
+    const listeners: ((e: { data: unknown }) => void)[] = [];
+    const channelFor = (): NonNullable<CrossTab['channel']> => {
+      const mine: ((e: { data: unknown }) => void)[] = [];
+      return {
+        // A BroadcastChannel never delivers to its sender.
+        postMessage: (m) => listeners.filter((l) => !mine.includes(l)).forEach((l) => l({ data: m })),
+        addEventListener: (_t, l) => {
+          mine.push(l);
+          listeners.push(l);
+        },
+      };
+    };
+    return { locks, channelFor };
+  }
+
+  it('two tabs refreshing at once send ONE refresh request and share its token', async () => {
+    const tabs = sharedTabs();
+    let refreshes = 0;
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      if (asReq(input).url.endsWith('/api/auth/refresh')) {
+        refreshes++;
+        await Promise.resolve();
+        return json(200, { access_token: `fresh-${refreshes}` });
+      }
+      return json(404);
+    }) as unknown as typeof fetch;
+    const tab = () => {
+      const tokenStore = memoryTokenStore('stale');
+      const refresh = createTokenRefresher({
+        baseUrl: BASE,
+        tokenStore,
+        fetchImpl,
+        crossTab: { locks: tabs.locks, channel: tabs.channelFor() },
+      });
+      return { tokenStore, refresh };
+    };
+    const a = tab();
+    const b = tab();
+
+    const [ta, tb] = await Promise.all([a.refresh(), b.refresh()]);
+
+    expect(refreshes).toBe(1);
+    expect(ta).toBe('fresh-1');
+    expect(tb).toBe('fresh-1');
+    expect(await b.tokenStore.get()).toBe('fresh-1');
+  });
+
+  it('a tab that opens later, with no token, still refreshes for itself', async () => {
+    const tabs = sharedTabs();
+    let refreshes = 0;
+    const fetchImpl = (async () => {
+      refreshes++;
+      return json(200, { access_token: `fresh-${refreshes}` });
+    }) as unknown as typeof fetch;
+    const refresh = createTokenRefresher({
+      baseUrl: BASE,
+      tokenStore: memoryTokenStore(null),
+      fetchImpl,
+      crossTab: { locks: tabs.locks, channel: tabs.channelFor() },
+    });
+    expect(await refresh()).toBe('fresh-1');
     expect(refreshes).toBe(1);
   });
 });
