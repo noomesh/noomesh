@@ -62,6 +62,7 @@ pub struct ExecScratch {
     pub mb: i64,
 }
 
+#[allow(dead_code)] // MUTANT
 impl ExecScratch {
     /// The sentence `noo addons check` prints for it.
     pub fn sentence(&self, addon: &str) -> String {

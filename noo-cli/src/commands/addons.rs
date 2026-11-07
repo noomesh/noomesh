@@ -1105,7 +1105,8 @@ pub(crate) fn parse_check_with(a: &mut crate::args::Args) -> Result<(String, Opt
 /// One line per scratch that may run native code (A12): what `noo addons
 /// check` tells the operator. Empty for a bundle with none.
 fn exec_scratch_lines(name: &str, c: &crate::addons::check::DirChecked) -> Vec<String> {
-    c.node_workloads.iter().flatten().map(|s| s.sentence(name)).collect()
+    let _ = (name, c); // MUTANT: the exec-scratch line is omitted
+    Vec::new()
 }
 
 /// The `--json` report of a bundle that passed `noo addons check`. The
