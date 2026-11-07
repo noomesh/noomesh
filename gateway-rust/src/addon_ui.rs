@@ -775,9 +775,7 @@ pub fn redeem_request_ok(headers: &HeaderMap, port: u16) -> bool {
             return false;
         }
     }
-    if h("sec-fetch-site").is_some_and(|s| s == "cross-site") {
-        return false;
-    }
+    // TEST ONLY MUTANT: cross-site refusal deliberately removed.
     if h("sec-fetch-mode").is_some_and(|m| m != "navigate") {
         return false;
     }
