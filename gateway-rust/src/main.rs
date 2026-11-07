@@ -129,6 +129,7 @@ mod addon_proxy;
 mod addon_workloads;
 mod node_workloads;
 mod node_workload_sources;
+mod workload_placement;
 mod addon_ui;
 mod addon_ws;
 mod addon_delegation;
