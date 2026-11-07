@@ -48,6 +48,22 @@ pub fn backend_model_missing(node: &Value, backend: &str) -> bool {
     entries(node, backend).any(|e| e["present"].as_bool() == Some(false))
 }
 
+/// True when the node REPORTS `backend`'s CHAT model absent. Chat candidacy
+/// reads this, never `backend_model_missing`: an absent embed (or rerank)
+/// model on the same backend takes out that role only. In the 0.6.18 rc.2
+/// rehearsal a single-ollama box missing harrier (embed) lost ollama as a chat
+/// candidate too, and chat 404'd model_not_found with qwen2.5:0.5b present.
+/// The embed side stays loud: `role_model_missing(.., "embed")` drops the node
+/// from embed routing and `backend_model_missing` still marks the placement.
+pub fn backend_chat_model_missing(node: &Value, backend: &str) -> bool {
+    entries(node, backend).any(|e| is_chat(e) && e["present"].as_bool() == Some(false))
+}
+
+/// An entry with no role (an older agent) is a chat placement.
+fn is_chat(e: &Value) -> bool {
+    matches!(e["role"].as_str(), None | Some("") | Some("chat"))
+}
+
 /// The first absent-model entry the node reports for `backend`, if any.
 pub fn missing_entry<'a>(node: &'a Value, backend: &'a str) -> Option<&'a Value> {
     entries(node, backend).find(|e| e["present"].as_bool() == Some(false))
@@ -155,12 +171,31 @@ mod tests {
         let n = json!({"model_presence": {
             "ollama": {"model": "gemma4:26b-a4b-it-qat", "role": "chat", "present": true},
             "ollama#embed": {"model": "harrier", "role": "embed", "present": false, "import_only": true}}});
-        assert!(backend_model_missing(&n, "ollama"), "the embed role's absent model is the backend's problem too");
+        assert!(backend_model_missing(&n, "ollama"), "the embed role's absent model still marks the placement");
+        assert!(!backend_chat_model_missing(&n, "ollama"), "but it does not take out chat");
         assert!(role_model_missing(&n, "embed") && !role_model_missing(&n, "chat"));
         assert_eq!(role_model(&n, "embed").as_deref(), Some("harrier"));
         assert_eq!(role_model(&n, "chat").as_deref(), Some("gemma4:26b-a4b-it-qat"));
         assert_eq!(missing_entry(&n, "ollama").unwrap()["model"], "harrier");
         assert!(!backend_model_missing(&n, "ollamax"), "a prefix of another backend's name is not this backend");
+    }
+
+    /// 0.6.18 rc.2 rehearsal: one ollama, chat model held, embed model absent.
+    #[test]
+    fn a_missing_embed_model_takes_out_embed_only_never_chat() {
+        let n = json!({"model_presence": {
+            "ollama": {"model": "qwen2.5:0.5b", "role": "chat", "present": true},
+            "ollama#embed": {"model": "harrier", "role": "embed", "present": false, "import_only": true}}});
+        assert!(!backend_chat_model_missing(&n, "ollama"), "still a chat candidate");
+        assert!(role_model_missing(&n, "embed"), "not an embed candidate");
+        assert!(backend_model_missing(&n, "ollama"), "the embed outage stays loud for the placement");
+        // Either key order and the bare key: a chat model that IS absent still counts.
+        let chat_gone = json!({"model_presence": {
+            "ollama#embed": {"model": "harrier", "role": "embed", "present": true},
+            "ollama": {"model": "qwen2.5:0.5b", "present": false}}});
+        assert!(backend_chat_model_missing(&chat_gone, "ollama"));
+        assert!(!backend_chat_model_missing(&host9(), "ollama"), "an embed-only placement says nothing about chat");
+        assert!(!backend_chat_model_missing(&json!({}), "ollama"));
     }
 
     #[test]
