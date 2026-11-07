@@ -14,7 +14,7 @@ vi.mock('@metis/api', () => ({
   createAuthApi: () => ({}),
   createAuthFetch: () => H.fetch,
   createTokenRefresher: () => async () => null,
-  webTokenStore: () => ({}),
+  memoryTokenStore: () => ({ get: () => null, set: () => {} }),
 }));
 
 import { apiGet, apiErrorMessage, ApiError } from './client';
