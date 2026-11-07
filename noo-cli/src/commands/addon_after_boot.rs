@@ -188,6 +188,10 @@ pub fn parse_owner(text: &str) -> Result<(u32, String), String> {
 pub struct Containers {
     pub down: Vec<String>,
     pub held: Vec<(String, String)>,
+    /// The add-on's overlay has no `x-noo-addon` block, so it names no
+    /// containers to check: verify WARNs, after-boot skips it with one log
+    /// line. Never a FAIL: the operator cannot fix a third-party overlay.
+    pub undeclared: bool,
 }
 
 /// Split `declared` against what is `running` and what the launcher holds
@@ -424,6 +428,10 @@ pub fn run(os: &dyn Os, paths: &Paths, limits: &Limits, r: &mut dyn Run, journal
     let mut all_ok = true;
     for a in &enabled {
         let down = match r.containers(a) {
+            Ok(c) if c.undeclared => {
+                journal(&format!("{a}: declares no x-noo-addon containers, so they are not checked or started after boot"));
+                continue;
+            }
             Ok(c) => {
                 for (h, why) in &c.held {
                     journal(&format!("{a}: {h} is held ({why}); not started"));
@@ -599,8 +607,9 @@ pub(crate) fn down_containers_at(root: &Path, addon: &str) -> Result<Containers,
     use crate::addons::resolve::Docker as _;
     let overlay = crate::addons::pins::addon_dir(root, addon).join("docker-compose.yml");
     let text = std::fs::read_to_string(&overlay).map_err(|e| format!("{}: {e}", overlay.display()))?;
-    let decl = crate::addon_decl_parse::parse_decl(&format!("{addon}'s overlay"), &text, Some(addon))?
-        .ok_or_else(|| format!("{addon}'s overlay declares no x-noo-addon containers"))?;
+    let Some(decl) = crate::addon_decl_parse::parse_decl(&format!("{addon}'s overlay"), &text, Some(addon))? else {
+        return Ok(Containers { undeclared: true, ..Default::default() });
+    };
     let mut docker = crate::addons::resolve::LiveDocker::new(root);
     let running: Vec<String> = docker.running().map_err(|e| format!("could not list running containers: {e}"))?.into_iter().map(|c| c.name).collect();
     let held = held_containers(&text, crate::addons::resolve::third_party(addon))?;
@@ -643,7 +652,7 @@ pub fn report_restarted(g: &Globals, named: &[String]) {
     let Ok(enabled) = crate::addons::licensed_on(&root) else { return };
     let enabled: Vec<String> = enabled.into_iter().map(str::to_string).collect();
     for a in restarted_addons(named, &enabled) {
-        if !matches!(down_containers_at(&root, &a), Ok(c) if c.down.is_empty()) {
+        if !matches!(down_containers_at(&root, &a), Ok(c) if c.down.is_empty() && !c.undeclared) {
             continue;
         }
         let sent = fresh_uuid().and_then(|id| {
@@ -735,6 +744,8 @@ mod tests {
         launcher_error: BTreeMap<String, String>,
         /// addon -> held containers and why
         held: BTreeMap<String, Vec<(String, String)>>,
+        /// add-ons whose overlay declares no containers
+        undeclared: Vec<String>,
         starts: Vec<String>,
         reports: Vec<(String, Value)>,
         reject: BTreeMap<String, ReportError>,
@@ -772,7 +783,7 @@ mod tests {
             } else {
                 self.down.get(addon).cloned().unwrap_or_default()
             };
-            Ok(Containers { down, held })
+            Ok(Containers { down, held, undeclared: self.undeclared.contains(addon) })
         }
         fn guard_refusal(&mut self, addon: &str) -> Option<String> {
             self.guard.get(addon).cloned()
@@ -816,6 +827,34 @@ mod tests {
         assert_eq!(lines.len(), 1, "one journal line: {lines:?}");
         assert!(lines[0].contains(needle), "{lines:?} should contain {needle:?}");
         assert!(fake.starts.is_empty() && fake.reports.is_empty() && fake.stamped.is_empty() && fake.probes == 0, "nothing may happen after a refusal");
+    }
+
+    /// An enabled add-on with no `x-noo-addon` block (a third-party overlay
+    /// the operator cannot fix) is skipped with one journal line: nothing
+    /// started, nothing reported, and the run still succeeds.
+    #[test]
+    fn an_add_on_that_declares_no_containers_is_skipped_with_one_line() {
+        let mut fake = healthy_fake(&["rhaddon"], &[]);
+        fake.undeclared.push("rhaddon".to_string());
+        let (code, lines) = go(&good_os(), &mut fake);
+        assert_eq!(code, 0, "{lines:?}");
+        let about: Vec<&String> = lines.iter().filter(|l| l.starts_with("rhaddon:")).collect();
+        assert_eq!(about.len(), 1, "{lines:?}");
+        assert!(about[0].contains("declares no x-noo-addon containers"), "{lines:?}");
+        assert!(fake.starts.is_empty() && fake.reports.is_empty(), "nothing started or reported: {:?} {:?}", fake.starts, fake.reports);
+    }
+
+    /// The overlay itself: no block reads as undeclared, before any docker
+    /// call, never as an error.
+    #[test]
+    fn an_overlay_without_the_block_reads_as_undeclared() {
+        let root = std::env::temp_dir().join(format!("noo-undeclared-{}", std::process::id()));
+        let dir = crate::addons::pins::addon_dir(&root, "rhaddon");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("docker-compose.yml"), "services:\n  noo-rhaddon:\n    image: x\n").unwrap();
+        let c = down_containers_at(&root, "rhaddon").expect("no block is not an error");
+        assert!(c.undeclared && c.down.is_empty() && c.held.is_empty(), "{c:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1037,7 +1076,7 @@ mod tests {
         let declared = vec!["noo-rhaddon".to_string(), "noo-rhaddon-gpu".to_string()];
         let held = vec![("noo-rhaddon-gpu".to_string(), "asks for a GPU".to_string())];
         let c = split_containers(&declared, &["noo-rhaddon".to_string()], &held);
-        assert_eq!(c, Containers { down: vec![], held: held.clone() }, "held only: nothing is down");
+        assert_eq!(c, Containers { down: vec![], held: held.clone(), undeclared: false }, "held only: nothing is down");
         let c = split_containers(&declared, &[], &held);
         assert_eq!(c.down, vec!["noo-rhaddon".to_string()], "only the container that should run is down");
         assert_eq!(c.held, held);

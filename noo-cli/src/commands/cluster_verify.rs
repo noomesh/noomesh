@@ -5624,11 +5624,15 @@ pub(crate) fn tailnet_merge_missing(j: &Value) -> Option<Vec<String>> {
 /// could not be read. Down is a FAIL naming `noo stack restart <addon>`: after
 /// a reboot, nothing else says that an add-on did not come back. A container
 /// the launcher HOLDS (`addon_after_boot::split_containers`, the launcher's
-/// own rule) is not expected to run: a note on an OK row, never a FAIL.
+/// own rule) is not expected to run: a note on an OK row, never a FAIL. An
+/// add-on whose overlay declares no containers (no `x-noo-addon` block) is a
+/// WARN: a row red forever for what the operator cannot fix trains people to
+/// ignore verify.
 pub(crate) fn addon_containers_row(addon: &str, state: Result<crate::commands::addon_after_boot::Containers, String>) -> Check {
     const ROW: &str = "add-on containers";
     let restart = format!("noo stack restart {addon}");
     match state {
+        Ok(c) if c.undeclared => warn(ROW, format!("{addon}: declares no containers, so they aren't checked"), None),
         Ok(c) if c.down.is_empty() => {
             let held: Vec<String> = c.held.iter().map(|(h, why)| format!("held: {h} ({why})")).collect();
             if held.is_empty() {
@@ -7126,6 +7130,18 @@ mod tests {
         assert_eq!(heading, "Seats (2)");
         assert_eq!(line, None, "enrolled seats render their own rows");
         assert_eq!(super::seats_heading(None), None, "an older gateway without the registry stays silent");
+    }
+
+    /// An enabled add-on whose overlay declares no containers (no
+    /// `x-noo-addon` block) is a WARN that says so, never a FAIL and never
+    /// a restart remedy: the operator cannot fix a third-party overlay.
+    #[test]
+    fn an_add_on_that_declares_no_containers_is_a_warn_not_a_fail() {
+        let none = crate::commands::addon_after_boot::Containers { undeclared: true, ..Default::default() };
+        let row = super::addon_containers_row("rhaddon", Ok(none));
+        assert_eq!((row.name, row.verdict), ("add-on containers", super::Verdict::Warn), "{row:?}");
+        assert!(row.detail.contains("rhaddon: declares no containers, so they aren't checked"), "{row:?}");
+        assert!(row.remedy.is_none(), "{row:?}");
     }
 
     /// i509 step 5: an enabled add-on that is down FAILS, naming it and the
