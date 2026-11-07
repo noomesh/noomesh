@@ -254,9 +254,120 @@ async fn wait_ready(link: &crate::node_link::NodeLink, decl: &crate::addon_workl
     }
 }
 
+// ── i300 node workloads (H4) ─────────────────────────────────────────────
+//
+// A reservation of a node workload the operator placed (`node-workloads.json`,
+// `noo_node_workload_placements`) runs through the same take and release as
+// an i163 container: [`managed_decl`] gives it the i163 shape (the agent's
+// worker container `noo-wl-<addon>-<name>`, `service_drain` as the drain
+// route, GPU need from the profile), and the agent's actuator serves both
+// kinds on the same routes (managed workloads start and stop through the
+// node workload lifecycle, which drains through the door). What differs:
+//   - the node is the placement's, never chosen (strict, phase 2);
+//   - the row goes `running` under the reservation BEFORE the start (the
+//     agent's start reads desired-config afresh) and back to `provisioned`
+//     after the add-on's service drain and BEFORE the stop (the release order,
+//     docs/reference/node-workloads.md), so the agent never restarts it;
+//   - the ready wait is the declaration's `start_secs`, at most 600 s.
+
+/// A reservation's node workload: its placement's node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Managed {
+    pub node: String,
+}
+
+/// The longest a node workload's start is waited for.
+pub(crate) const MANAGED_READY_MAX_SECS: u64 = 600;
+
+/// The ready wait for a node workload: `start_secs`, at most
+/// [`MANAGED_READY_MAX_SECS`].
+pub(crate) fn managed_ready_secs(start_secs: i64) -> u64 {
+    u64::try_from(start_secs.max(1)).unwrap_or(1).min(MANAGED_READY_MAX_SECS)
+}
+
+/// GPU memory a node workload needs: the profile's `vram_mb` plus
+/// `per_slot_vram_mb` for every slot past the first (A11). Unknown (no
+/// profile figures): 0, which the GPU check reads as "no size to check".
+pub(crate) fn managed_need_mb(profile: Option<&crate::node_workloads::SetProfile>, slots: u64) -> u64 {
+    let Some(p) = profile else { return 0 };
+    let base = u64::try_from(p.vram_mb.unwrap_or(0)).unwrap_or(0);
+    let per = u64::try_from(p.per_slot_vram_mb.unwrap_or(0)).unwrap_or(0);
+    base.saturating_add(per.saturating_mul(slots.saturating_sub(1)))
+}
+
+/// The i163 shape of a placed node workload `d` of `addon`.
+pub(crate) fn managed_decl(addon: &str, d: &crate::node_workloads::Decl, need_mb: u64) -> crate::addon_workloads::WorkloadDecl {
+    let sd = d.service_drain.clone().unwrap_or_default();
+    crate::addon_workloads::WorkloadDecl {
+        addon: addon.to_string(),
+        name: d.name.clone(),
+        container: format!("noo-wl-{addon}-{}", d.name),
+        gpu: d.accel.gpu > 0,
+        need_mb,
+        drain: crate::addon_workloads::DrainSpec { route: sd.route, timeout_secs: u64::try_from(sd.timeout_secs.max(1)).unwrap_or(1) },
+    }
+}
+
+/// The slot count a placement's env asks for (`accel.slots_env`), else one.
+fn placement_slots(d: &crate::node_workloads::Decl, env: &Value) -> u64 {
+    d.accel
+        .slots_env
+        .as_deref()
+        .and_then(|k| env.get(k))
+        .and_then(Value::as_str)
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(1)
+}
+
+/// What a reservation of `addon`/`name` acts on: its declaration in the
+/// i163 shape, the placement when it is a node workload, and its ready wait.
+async fn resolve_workload(
+    state: &AppState,
+    addon: &str,
+    name: &str,
+) -> Result<(crate::addon_workloads::WorkloadDecl, Option<Managed>, u64), AppError> {
+    if let Some(d) = crate::addon_workloads::lookup(addon, name) {
+        return Ok((d, None, READY_TIMEOUT_SECS));
+    }
+    let nw = match crate::node_workload_sources::declared(addon) {
+        Ok(Some(nw)) => nw,
+        Ok(None) => return Err(AppError::NotFound(format!("no verified add-on bundle declares workload {addon}/{name}"))),
+        Err(r) => return Err(AppError::Conflict(format!("{addon}'s node-workloads.json is refused: {r}"))),
+    };
+    let Some(d) = nw.workloads.iter().find(|w| w.name == name) else {
+        return Err(AppError::NotFound(format!("no verified add-on bundle declares workload {addon}/{name}")));
+    };
+    let Some(row) = crate::repo::node_workload_placements::get(&state.db, addon, name)
+        .await
+        .map_err(|e| AppError::Internal(format!("reading the placement of {addon}/{name}: {e}")))?
+    else {
+        return Err(AppError::Conflict(format!(
+            "{addon}/{name} is not placed on a node: place it first (PUT /api/cluster/nodes/<node>/node-workloads/{addon}/{name})"
+        )));
+    };
+    let main = d.models.first().map(|s| s.slot.clone()).unwrap_or_default();
+    let profile = row.sets.pointer(&format!("/{main}/0")).and_then(|r| {
+        let (id, rev) = (r.get("id")?.as_str()?, r.get("revision")?.as_str()?);
+        let sets = crate::routes::artifacts::gguf_dir().join("sets");
+        let (set, _) = crate::node_workload_sources::staged_set(&sets, id, rev).ok()?;
+        set.needs.profiles.into_iter().find(|p| Some(p.name.as_str()) == row.profile.as_deref())
+    });
+    let need = managed_need_mb(profile.as_ref(), placement_slots(d, &row.env));
+    Ok((managed_decl(addon, d, need), Some(Managed { node: row.node_id }), managed_ready_secs(d.health.start_secs)))
+}
+
 /// Drain and stop a workload on a node: the add-on's declared drain route,
-/// then the actuator's stop. `force` carries on past a failed drain.
-async fn drain_and_stop(link: &crate::node_link::NodeLink, decl: &crate::addon_workloads::WorkloadDecl, reservation: &str, force: bool) -> Result<Value, String> {
+/// then the actuator's stop. `force` carries on past a failed drain. A node
+/// workload's row (`managed`: the state and its node) goes back to
+/// `provisioned` between the two, so the agent's stop is the release.
+async fn drain_and_stop(
+    link: &crate::node_link::NodeLink,
+    decl: &crate::addon_workloads::WorkloadDecl,
+    reservation: &str,
+    force: bool,
+    managed: Option<(&AppState, &str)>,
+) -> Result<Value, String> {
     let drained;
     let drain = &decl.drain;
     {
@@ -280,6 +391,13 @@ async fn drain_and_stop(link: &crate::node_link::NodeLink, decl: &crate::addon_w
             }
         }
     }
+    if let Some((state, node)) = managed {
+        match crate::repo::node_workload_placements::set_provisioned(&state.db, node, &decl.addon, &decl.name, reservation).await {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(addon = %decl.addon, workload = %decl.name, %reservation, "reservation_release: the placement was not held by this reservation"),
+            Err(e) => return Err(format!("could not set {} back to provisioned: {e}", decl.key())),
+        }
+    }
     let grace = drain.timeout_secs.min(600);
     let stopped = actuator(link, decl, "/stop", json!({"timeout_secs": grace}), grace + 60).await?;
     Ok(json!({"drained": drained, "stopped": stopped}))
@@ -299,9 +417,7 @@ async fn reservation_take(
     let Some((addon, name)) = crate::addon_workloads::split_key(&key) else {
         return Err(AppError::BadRequest("workload must be <addon>/<workload> (lowercase names)".into()));
     };
-    let Some(decl) = crate::addon_workloads::lookup(&addon, &name) else {
-        return Err(AppError::NotFound(format!("no verified add-on bundle declares workload {key}")));
-    };
+    let (decl, managed, ready_secs) = resolve_workload(&state, &addon, &name).await?;
     let pinned = b.get("node").and_then(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let hand_over = b.get("hand_over").and_then(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let timeout_secs = b
@@ -320,6 +436,14 @@ async fn reservation_take(
             return Err(AppError::Conflict(format!("reservation {} is on {}, not {n}: a hand-over stays on its node", o["id"], o["node"])))
         }
         (Some(o), _) => Some(o["node"].as_str().unwrap_or("").to_string()),
+        (None, p) => p,
+    };
+    // A node workload runs where the operator placed it, nowhere else.
+    let pinned = match (&managed, pinned) {
+        (Some(m), Some(p)) if p != m.node => {
+            return Err(AppError::Conflict(format!("{key} is placed on {}, not {p}", m.node)));
+        }
+        (Some(m), _) => Some(m.node.clone()),
         (None, p) => p,
     };
 
@@ -349,8 +473,9 @@ async fn reservation_take(
     // is then taken over by force, so the pool never gets the GPU.
     if let Some(o) = &old {
         if let Some((oa, on)) = crate::addon_workloads::split_key(o["workload"].as_str().unwrap_or("")) {
-            if let Some(odecl) = crate::addon_workloads::lookup(&oa, &on) {
-                let out = drain_and_stop(&link, &odecl, o["id"].as_str().unwrap_or(""), false)
+            if let Ok((odecl, omanaged, _)) = resolve_workload(&state, &oa, &on).await {
+                let onode = o["node"].as_str().unwrap_or("").to_string();
+                let out = drain_and_stop(&link, &odecl, o["id"].as_str().unwrap_or(""), false, omanaged.as_ref().map(|_| (state.as_ref(), onode.as_str())))
                     .await
                     .map_err(|e| AppError::Conflict(format!("hand-over: the outgoing workload {} did not stop: {e}; its reservation stays", odecl.key())))?;
                 steps["handed_over"] = out;
@@ -373,10 +498,40 @@ async fn reservation_take(
     let lease = hold.pointer("/gpu_contention/lease").cloned().unwrap_or(Value::Null);
     let generation = lease.get("generation").and_then(Value::as_u64).unwrap_or(0);
 
+    let release_hold = |why: &'static str| {
+        let (state, actor, node, id) = (state.clone(), actor.clone(), node.clone(), id.clone());
+        async move {
+            let _ = super::cluster::gpu_hold_op(&state, actor, &node, "release",
+                json!({"operation_id": id, "generation": generation, "force": false, "legacy": false, "resume": "now"}),
+                std::time::Duration::from_secs(90)).await;
+            tracing::warn!(%node, reason = why, "reservation_take_gave_the_gpu_back");
+        }
+    };
+
+    // A node workload: the row runs under this reservation BEFORE the start
+    // (the agent's start reads it afresh). Only from provisioned, so a second
+    // reservation can never take a workload another one holds.
+    if managed.is_some() {
+        match crate::repo::node_workload_placements::set_running(&state.db, &node, &addon, &name, &id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                release_hold("already_reserved").await;
+                return Err(AppError::Conflict(format!("{key} is already reserved (its placement is not provisioned); release that reservation first")));
+            }
+            Err(e) => {
+                release_hold("placement_unwritable").await;
+                return Err(AppError::Internal(format!("could not mark {key} running: {e}; the GPU was released back to the pool")));
+            }
+        }
+    }
+
     // Start the workload; a start that fails gives the GPU back at once.
-    let started = match actuator(&link, &decl, "/start", json!({}), 120).await {
+    let started = match actuator(&link, &decl, "/start", json!({}), if managed.is_some() { 660 } else { 120 }).await {
         Ok(v) => v,
         Err(e) => {
+            if managed.is_some() {
+                let _ = crate::repo::node_workload_placements::set_provisioned(&state.db, &node, &addon, &name, &id).await;
+            }
             let _ = super::cluster::gpu_hold_op(&state, actor.clone(), &node, "release",
                 json!({"operation_id": id, "generation": generation, "force": false, "legacy": false, "resume": "now"}),
                 std::time::Duration::from_secs(90)).await;
@@ -388,7 +543,7 @@ async fn reservation_take(
 
     // Ready: the container runs (and passes its healthcheck when it has
     // one). A timeout keeps the reservation and says so.
-    let (status, worker, detail) = match wait_ready(&link, &decl, std::time::Duration::from_secs(READY_TIMEOUT_SECS)).await {
+    let (status, worker, detail) = match wait_ready(&link, &decl, std::time::Duration::from_secs(ready_secs)).await {
         Ok(st) => ("reserved", st, String::new()),
         Err(e) => ("needs_attention", json!({}), e),
     };
@@ -423,8 +578,8 @@ async fn reservation_release(
     let link = crate::node_link::NodeLink::for_node(&state, &node).await?;
     let mut steps = json!({});
     if let Some((a, n)) = crate::addon_workloads::split_key(&key) {
-        if let Some(decl) = crate::addon_workloads::lookup(&a, &n) {
-            match drain_and_stop(&link, &decl, &id, force).await {
+        if let Ok((decl, managed, _)) = resolve_workload(&state, &a, &n).await {
+            match drain_and_stop(&link, &decl, &id, force, managed.as_ref().map(|_| (state.as_ref(), node.as_str()))).await {
                 Ok(v) => steps["stopped"] = v,
                 Err(e) => {
                     audit(&state, AuditKind::ReservationRelease, &actor, &node, "error", json!({"id": id, "workload": key, "detail": e, "force": force})).await;
@@ -777,6 +932,84 @@ mod tests {
 
     fn node(gc: Value) -> Value {
         json!({"id": "awolf", "status": "online", "last_heartbeat": 1000.0, "vram_gb": 16, "gpu_contention": gc})
+    }
+
+    // ── i300 node workloads (H4) ──────────────────────────────────────────
+
+    fn nw_decl() -> crate::node_workloads::Decl {
+        let raw: Value = serde_json::from_slice(
+            &std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/testdata/i300/desired-node-workloads.json")).unwrap(),
+        )
+        .unwrap();
+        let w = raw["node_workloads"][0]["decl"].clone();
+        let lock: std::collections::BTreeSet<String> = [w["image"].as_str().unwrap().to_string()].into();
+        let file = json!({"format": "noo-addon-node-workloads/1", "workloads": [w]});
+        crate::node_workloads::validate_decl(file.to_string().as_bytes(), "rhaddon", &lock, None).unwrap().workloads.remove(0)
+    }
+
+    #[test]
+    fn the_ready_wait_is_start_secs_at_most_600() {
+        assert_eq!(managed_ready_secs(300), 300);
+        assert_eq!(managed_ready_secs(900), 600, "a long cold start is capped");
+        assert_eq!(managed_ready_secs(0), 1);
+        assert_eq!(managed_ready_secs(-5), 1);
+    }
+
+    #[test]
+    fn a_node_workloads_gpu_need_is_its_profile_plus_each_extra_slot() {
+        let p = crate::node_workloads::SetProfile { name: "int8".into(), vram_mb: Some(14336), per_slot_vram_mb: Some(1024), ..Default::default() };
+        assert_eq!(managed_need_mb(Some(&p), 1), 14336);
+        assert_eq!(managed_need_mb(Some(&p), 3), 14336 + 2 * 1024);
+        assert_eq!(managed_need_mb(None, 4), 0, "no figures: nothing to size");
+        let bare = crate::node_workloads::SetProfile { name: "int8".into(), ..Default::default() };
+        assert_eq!(managed_need_mb(Some(&bare), 2), 0);
+    }
+
+    #[test]
+    fn a_placed_node_workload_takes_the_i163_shape_with_its_service_drain() {
+        let d = nw_decl();
+        let w = managed_decl("rhaddon", &d, 15360);
+        assert_eq!(w.key(), format!("rhaddon/{}", d.name));
+        assert_eq!(w.container, format!("noo-wl-rhaddon-{}", d.name), "the agent's worker container name");
+        assert!(w.gpu);
+        assert_eq!(w.need_mb, 15360);
+        let sd = d.service_drain.clone().unwrap();
+        assert_eq!((w.drain.route.as_str(), w.drain.timeout_secs), (sd.route.as_str(), sd.timeout_secs as u64), "release runs the add-on's service drain");
+    }
+
+    #[test]
+    fn the_slot_count_is_the_placements_slots_env_else_one() {
+        let d = nw_decl();
+        let key = d.accel.slots_env.clone().expect("the fixture declares slots_env");
+        assert_eq!(placement_slots(&d, &json!({key.clone(): "3"})), 3);
+        assert_eq!(placement_slots(&d, &json!({})), 1);
+        assert_eq!(placement_slots(&d, &json!({key: "0"})), 1, "zero is not a count");
+    }
+
+    /// The release order (docs/reference/node-workloads.md): the add-on's
+    /// service drain, then the row back to provisioned, then the agent's stop.
+    #[test]
+    fn a_node_workloads_row_goes_back_to_provisioned_between_the_drain_and_the_stop() {
+        let src = include_str!("reservations.rs");
+        let body = src.split("async fn drain_and_stop(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        let drain = body.find("crate::addon_proxy::call(").expect("the service drain");
+        let back = body.find("set_provisioned(").expect("the row goes back");
+        let stop = body.find("actuator(link, decl, \"/stop\"").expect("the stop");
+        assert!(drain < back && back < stop, "drain, then provisioned, then stop");
+    }
+
+    /// The take order: the row runs under the reservation BEFORE the start
+    /// (the agent's start reads it afresh), and a start that fails gives it back.
+    #[test]
+    fn a_node_workloads_row_runs_before_the_start_and_is_given_back_on_failure() {
+        let src = include_str!("reservations.rs");
+        let body = src.split("async fn reservation_take(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        let run = body.find("set_running(").expect("the row runs");
+        let start = body.find("actuator(&link, &decl, \"/start\"").expect("the start");
+        assert!(run < start, "running before the start");
+        let after = &body[start..];
+        assert!(after.find("set_provisioned(").is_some_and(|i| i < after.find("start_failure(").unwrap_or(usize::MAX)), "a failed start gives the row back");
+        assert!(body.contains("std::time::Duration::from_secs(ready_secs)"), "the declared ready wait");
     }
 
     #[test]

@@ -104,6 +104,41 @@ pub async fn for_node(db: impl sqlx::PgExecutor<'_>, node_id: &str) -> Result<Ve
     sqlx::query(sqlx::AssertSqlSafe(q)).bind(node_id).fetch_all(db).await?.iter().map(from_row).collect()
 }
 
+/// A reservation takes the placement (i300 H4): `running` under
+/// `reservation`, only on its own node and only from `provisioned`, so two
+/// reservations can never both hold one workload. False when it was not so.
+pub async fn set_running(db: impl sqlx::PgExecutor<'_>, node_id: &str, addon: &str, workload: &str, reservation: &str) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        "UPDATE noo_node_workload_placements SET desired_state = 'running', reservation = $4::uuid, updated_at = now() \
+         WHERE addon = $1 AND workload = $2 AND node_id = $3 AND desired_state = 'provisioned'",
+    )
+    .bind(addon)
+    .bind(workload)
+    .bind(node_id)
+    .bind(reservation)
+    .execute(db)
+    .await?;
+    Ok(r.rows_affected() == 1)
+}
+
+/// The reservation gives the placement back (a release, or a start that
+/// failed): `provisioned`, no reservation. Only the row `reservation` holds,
+/// so a stale release cannot stop another reservation's worker. False when
+/// it was not held by it.
+pub async fn set_provisioned(db: impl sqlx::PgExecutor<'_>, node_id: &str, addon: &str, workload: &str, reservation: &str) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        "UPDATE noo_node_workload_placements SET desired_state = 'provisioned', reservation = NULL, updated_at = now() \
+         WHERE addon = $1 AND workload = $2 AND node_id = $3 AND reservation = $4::uuid",
+    )
+    .bind(addon)
+    .bind(workload)
+    .bind(node_id)
+    .bind(reservation)
+    .execute(db)
+    .await?;
+    Ok(r.rows_affected() == 1)
+}
+
 /// Remove the placement of `addon`/`workload` on `node_id`. False when there
 /// was none there.
 pub async fn remove(db: impl sqlx::PgExecutor<'_>, node_id: &str, addon: &str, workload: &str) -> Result<bool, sqlx::Error> {
@@ -172,6 +207,23 @@ mod tests {
         // Another node: refused, and nothing changes.
         assert_eq!(place(&db, &row(&node_b)).await.expect("move"), Placed::OnOtherNode(node_a.clone()));
         assert_eq!(get(&db, "rhaddon", "worker").await.unwrap().unwrap(), again, "the refusal wrote nothing");
+
+        // H4: a reservation takes it (once), gives it back (only its own).
+        let res_a = "0f0e0d0c-0b0a-4908-8706-050403020100";
+        let res_b = "1f0e0d0c-0b0a-4908-8706-050403020100";
+        assert!(set_running(&db, &node_a, "rhaddon", "worker", res_a).await.expect("run"));
+        let held = get(&db, "rhaddon", "worker").await.unwrap().unwrap();
+        assert_eq!((held.desired_state.as_str(), held.reservation.as_deref()), ("running", Some(res_a)));
+        assert!(!set_running(&db, &node_a, "rhaddon", "worker", res_b).await.expect("second take"), "a second reservation cannot take it");
+        assert!(!set_running(&db, &node_b, "rhaddon", "worker", res_b).await.expect("wrong node"), "only on its own node");
+        assert!(!set_provisioned(&db, &node_a, "rhaddon", "worker", res_b).await.expect("stale release"), "another reservation cannot give it back");
+        assert_eq!(get(&db, "rhaddon", "worker").await.unwrap().unwrap().reservation.as_deref(), Some(res_a));
+        // A re-place while it runs keeps the state and the reservation.
+        assert_eq!(place(&db, &again).await.expect("re-place while running"), Placed::Written);
+        assert_eq!(get(&db, "rhaddon", "worker").await.unwrap().unwrap().desired_state, "running");
+        assert!(set_provisioned(&db, &node_a, "rhaddon", "worker", res_a).await.expect("release"));
+        let back = get(&db, "rhaddon", "worker").await.unwrap().unwrap();
+        assert_eq!((back.desired_state.as_str(), back.reservation), ("provisioned", None));
 
         // Remove: only where it is.
         assert!(!remove(&db, &node_b, "rhaddon", "worker").await.expect("remove elsewhere"));
