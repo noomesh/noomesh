@@ -220,6 +220,7 @@ pub struct Scratch {
 }
 
 /// The size cap of the exec scratch, in MiB.
+#[allow(dead_code)] // MUTANT: the cap check is removed
 pub const MAX_EXEC_SCRATCH_MB: i64 = 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -842,14 +843,6 @@ fn validate_scratch(ss: &[Scratch], ms: &[Slot]) -> Result<(), NodeWorkloadRefus
             || s.tmpfs_mb.is_some_and(|v| !(1..=16384).contains(&v))
         {
             return Err(bad(format!("scratch[{i}]: size out of range")));
-        }
-        if s.exec
-            && (s.max_mb.is_some_and(|v| v > MAX_EXEC_SCRATCH_MB)
-                || s.tmpfs_mb.is_some_and(|v| v > MAX_EXEC_SCRATCH_MB))
-        {
-            return Err(bad(format!(
-                "scratch[{i}]: an exec scratch is at most {MAX_EXEC_SCRATCH_MB} MiB"
-            )));
         }
         if s.exec && ss[..i].iter().any(|o| o.exec) {
             return Err(bad(format!("scratch[{i}]: a second exec scratch")));
