@@ -1465,16 +1465,39 @@ fn placements_referencing(_id: &str, _revision: Option<&str>) -> Result<Vec<Stri
     Err("the gateway does not track model-set placements yet (i300 H)".to_string())
 }
 
+/// The revision directories `noo models rm` removes for `id` (one, or every
+/// revision), under `<store>/sets/<id>/`. A symbolic link at `sets`, at the
+/// id or at any revision is refused, never followed: a removal through it
+/// would delete outside the set store (P1). Checked before anything is
+/// removed; a missing directory is simply absent from the list.
+fn rm_targets(store: &Path, id: &str, revision: Option<&str>) -> Result<Vec<PathBuf>, String> {
+    let sets = store.join(SETS_DIR);
+    let id_dir = sets.join(id);
+    let is_link = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+    for p in [sets.as_path(), id_dir.as_path()] {
+        if is_link(p) {
+            return Err(format!("{} is a symbolic link; rm never follows one", p.display()));
+        }
+    }
+    let candidates: Vec<PathBuf> = match revision {
+        Some(r) => vec![id_dir.join(r)],
+        None => sorted_dirs(&id_dir),
+    };
+    if let Some(p) = candidates.iter().find(|p| is_link(p.as_path())) {
+        return Err(format!("{} is a symbolic link; rm never follows one", p.display()));
+    }
+    Ok(candidates.into_iter().filter(|p| p.is_dir()).collect())
+}
+
 /// `noo models rm <id>[@<rev>] --force`
 pub fn models_rm(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let a = parse_rm_with(&mut Args::new(args))?;
     let dir = PathBuf::from(models_fetch::controller_store_dir());
     let id_dir = dir.join(SETS_DIR).join(&a.id);
-    let targets: Vec<PathBuf> = match &a.revision {
-        Some(r) => vec![id_dir.join(r)],
-        None => sorted_dirs(&id_dir),
+    let targets = match rm_targets(&dir, &a.id, a.revision.as_deref()) {
+        Ok(t) => t,
+        Err(why) => fail(g.json, ExitCode::Generic, "symlink_refused", &why, None),
     };
-    let targets: Vec<PathBuf> = targets.into_iter().filter(|p| p.is_dir()).collect();
     if targets.is_empty() {
         let why = format!("no staged model set {} under {}", a.id, id_dir.display());
         fail(g.json, ExitCode::Generic, "no_such_set", &why, None);
@@ -3002,6 +3025,47 @@ mod tests {
         for marker in ["pub fn models_accept(", "pub fn models_rm("] {
             let body = crate::test_src::fn_body(&own, marker);
             assert!(!body.to_ascii_lowercase().contains("token"), "{marker}");
+        }
+    }
+
+    /// rm never deletes through a symbolic link (P1): a revision, the id or
+    /// `sets` itself planted as a link to a directory outside the store is
+    /// refused before anything is removed, and the file out there survives.
+    #[test]
+    fn rm_refuses_a_symlinked_revision_id_or_sets_dir() {
+        let store = tmpdir("rm-link-store");
+        let outside = tmpdir("rm-link-outside");
+        let victim = outside.join(SIGNATURE);
+        std::fs::write(&victim, b"not the store's").unwrap();
+        let id_dir = store.join(SETS_DIR).join("test-voice-set");
+        std::fs::create_dir_all(id_dir.join("rev-real")).unwrap();
+        std::os::unix::fs::symlink(&outside, id_dir.join("rev-link")).unwrap();
+
+        // A real revision is a target; the control shows the refusal below is the link's.
+        let real = rm_targets(&store, "test-voice-set", Some("rev-real")).unwrap();
+        assert_eq!(real, vec![id_dir.join("rev-real")]);
+
+        let one = rm_targets(&store, "test-voice-set", Some("rev-link")).unwrap_err();
+        assert!(one.contains("symbolic link") && one.contains("rev-link"), "{one}");
+        // Every revision: the link among them refuses the whole removal.
+        let all = rm_targets(&store, "test-voice-set", None).unwrap_err();
+        assert!(all.contains("rev-link"), "{all}");
+
+        // The id directory itself as a link.
+        let linked_id = store.join(SETS_DIR).join("linked-set");
+        std::os::unix::fs::symlink(&outside, &linked_id).unwrap();
+        let id = rm_targets(&store, "linked-set", Some("x")).unwrap_err();
+        assert!(id.contains("linked-set"), "{id}");
+
+        // `sets` itself as a link.
+        let store2 = tmpdir("rm-link-store2");
+        std::os::unix::fs::symlink(&store, store2.join(SETS_DIR)).unwrap();
+        let sets = rm_targets(&store2, "test-voice-set", Some("rev-real")).unwrap_err();
+        assert!(sets.contains("symbolic link"), "{sets}");
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"not the store's");
+        for d in [&store, &outside, &store2] {
+            let _ = std::fs::remove_dir_all(d);
         }
     }
 }
