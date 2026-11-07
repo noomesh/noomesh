@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlenv"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelsets"
@@ -71,7 +72,12 @@ type ctrInfo struct {
 	ID      string
 	Labels  map[string]string
 	Running bool
-	IPs     map[string]string // network name -> address
+	// Status is docker's own word: created (never started), running, exited,
+	// dead... F5b reads "created" as "not yet started" and "exited" as "ran
+	// and stopped".
+	Status    string
+	StartedAt time.Time         // zero when it never started
+	IPs       map[string]string // network name -> address
 }
 
 type netInfo struct {
@@ -87,12 +93,25 @@ type provAPI interface {
 	LoadImage(ctx context.Context, tar *os.File) ([]string, error)
 	InspectContainer(ctx context.Context, name string) (*ctrInfo, error) // nil when absent
 	CreateContainer(ctx context.Context, s createSpec) error
+	StartContainer(ctx context.Context, name string) error
+	StopContainer(ctx context.Context, name string, graceS int) error
 	RemoveContainer(ctx context.Context, name string) error
 	InspectNetwork(ctx context.Context, name string) (*netInfo, error) // nil when absent
 	CreateInternalNetwork(ctx context.Context, name string, labels map[string]string) error
 	RemoveNetwork(ctx context.Context, name string) error
 	RemoveVolumes(ctx context.Context, addon, workload string) error
 	NvidiaRuntime(ctx context.Context) bool
+	// ListManaged is every workload this agent created (label
+	// noo.managed-by=agent), one ref per addon/workload, with the labels of
+	// the worker container when it has them. A list error is an error, never
+	// an empty list.
+	ListManaged(ctx context.Context) ([]managedRef, error)
+}
+
+// managedRef is one workload found on the node by its labels.
+type managedRef struct {
+	Addon, Name string
+	Labels      map[string]string // the worker's labels (the drain config rides here)
 }
 
 // NodeWorkloads provisions node workloads. Build one with NewNodeWorkloads;
@@ -118,7 +137,13 @@ type NodeWorkloads struct {
 	mu     sync.Mutex
 	status map[string]WorkloadStatus
 	locks  sync.Map // addon/name -> *sync.Mutex
+
+	lc lifeCycle // F5b: nodewl_lifecycle.go
 }
+
+// SetAdmit installs the node's gate (consent and the placement-side
+// refusals). Without one every entry is refused as consent_none.
+func (p *NodeWorkloads) SetAdmit(f func(ctx context.Context, e nodewl.Entry) error) { p.lc.Admit = f }
 
 // NewNodeWorkloads is the production provisioner over c.
 func NewNodeWorkloads(c *Client, sets SetSource) *NodeWorkloads {
@@ -135,6 +160,7 @@ func NewNodeWorkloads(c *Client, sets SetSource) *NodeWorkloads {
 		},
 		doorSelfName: doorSelfName,
 		status:       map[string]WorkloadStatus{},
+		lc:           lifeCycle{doorCall: newDoorCaller()},
 	}
 }
 

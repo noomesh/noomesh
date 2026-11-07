@@ -100,6 +100,10 @@ func (d dockerProvAPI) InspectContainer(ctx context.Context, name string) (*ctrI
 	}
 	if c.State != nil {
 		info.Running = c.State.Running
+		info.Status = string(c.State.Status)
+		if t, perr := time.Parse(time.RFC3339Nano, c.State.StartedAt); perr == nil && !t.IsZero() && t.Year() > 1 {
+			info.StartedAt = t
+		}
 	}
 	if c.NetworkSettings != nil {
 		for n, ep := range c.NetworkSettings.Networks {
@@ -116,6 +120,14 @@ func (d dockerProvAPI) CreateContainer(ctx context.Context, s createSpec) error 
 		Config: s.Config, HostConfig: s.Host, NetworkingConfig: s.Net, Name: s.Name,
 	})
 	return err
+}
+
+func (d dockerProvAPI) StartContainer(ctx context.Context, name string) error {
+	return d.c.StartContainer(ctx, name)
+}
+
+func (d dockerProvAPI) StopContainer(ctx context.Context, name string, graceS int) error {
+	return d.c.StopContainerGraceful(ctx, name, graceS)
 }
 
 func (d dockerProvAPI) RemoveContainer(ctx context.Context, name string) error {
@@ -177,6 +189,46 @@ func (d dockerProvAPI) RemoveVolumes(ctx context.Context, addon, workload string
 		}
 	}
 	return nil
+}
+
+// ListManaged finds this agent's workloads by the noo.managed-by=agent label
+// alone: the door, the worker, in any state.
+func (d dockerProvAPI) ListManaged(ctx context.Context) ([]managedRef, error) {
+	ctrs, err := d.c.listContainers(ctx, client.ContainerListOptions{
+		All:     true,
+		Filters: make(client.Filters).Add("label", LabelManagedBy+"="+ManagedByAgent),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list containers: %w", err)
+	}
+	byKey := map[string]*managedRef{}
+	var order []string
+	for _, c := range ctrs {
+		// The daemon filtered on the label; the sweep deletes what this
+		// returns, so the label is checked again here rather than trusted.
+		if c.Labels[LabelManagedBy] != ManagedByAgent {
+			continue
+		}
+		addon, name := c.Labels[LabelAddon], c.Labels[LabelWorkload]
+		if addon == "" || name == "" {
+			continue
+		}
+		k := wlKey(addon, name)
+		ref := byKey[k]
+		if ref == nil {
+			ref = &managedRef{Addon: addon, Name: name}
+			byKey[k] = ref
+			order = append(order, k)
+		}
+		if c.Labels[LabelRole] == RoleWorker {
+			ref.Labels = c.Labels
+		}
+	}
+	out := make([]managedRef, 0, len(order))
+	for _, k := range order {
+		out = append(out, *byKey[k])
+	}
+	return out, nil
 }
 
 func (d dockerProvAPI) NvidiaRuntime(ctx context.Context) bool {

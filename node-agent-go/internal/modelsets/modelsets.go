@@ -686,6 +686,24 @@ func (s *Store) State(ref Ref) Status {
 	return s.statusLocked(ref)
 }
 
+// VerifiedManifest is the parsed manifest of a set that is verified on this
+// node (the gate reads a profile's min_compute from it). Any other state is an
+// error: only a manifest whose signature, files and marker were checked is read.
+func (s *Store) VerifiedManifest(ref Ref) (nodewl.ModelSet, error) {
+	if st := s.State(ref); st.State != StateVerified {
+		return nodewl.ModelSet{}, fmt.Errorf("set %s is %s here", ref, st.State)
+	}
+	b, err := os.ReadFile(filepath.Join(s.dir(ref), ManifestName))
+	if err != nil {
+		return nodewl.ModelSet{}, err
+	}
+	set, err := nodewl.ParseModelSet(b)
+	if err != nil {
+		return nodewl.ModelSet{}, err
+	}
+	return *set, nil
+}
+
 func (s *Store) statusLocked(ref Ref) Status {
 	m, inMem := s.mem[ref]
 	if inMem && m.state == StateFetching {

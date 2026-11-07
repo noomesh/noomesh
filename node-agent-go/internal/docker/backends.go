@@ -1818,6 +1818,17 @@ func (c *Client) nvidiaRuntimeRegistered(ctx context.Context) bool {
 	return runtimesIncludeNvidia(res.Info.Runtimes)
 }
 
+// NvidiaRuntimeKnown is nvidiaRuntimeRegistered without the fail-open: a
+// failed info call is an error (unknown), never "registered" and never
+// "missing". The heartbeat's `nvidia_runtime` fact uses it.
+func (c *Client) NvidiaRuntimeKnown(ctx context.Context) (bool, error) {
+	res, err := c.docker.Info(ctx, client.InfoOptions{})
+	if err != nil {
+		return false, err
+	}
+	return runtimesIncludeNvidia(res.Info.Runtimes), nil
+}
+
 // runtimesIncludeNvidia is the pure half of the check, for tests.
 func runtimesIncludeNvidia[V any](runtimes map[string]V) bool {
 	_, ok := runtimes["nvidia"]

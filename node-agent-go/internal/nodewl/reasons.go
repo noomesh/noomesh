@@ -3,6 +3,15 @@
 
 package nodewl
 
+// StateDraining is the state a heartbeat row reports (never a desired state)
+// from the accepted drain POST until the done poll answers 200 or the drain
+// times out.
+const StateDraining = "draining"
+
+// StateNeedsAttention is the state a heartbeat row reports (never a desired
+// state) when a drain did not finish: reason drain_timeout, worker untouched.
+const StateNeedsAttention = "needs_attention"
+
 // The agent's fixed reason vocabulary: the `reason` of a node_workloads or
 // model_sets heartbeat row. docs/reference/node-workloads.md ("Reasons")
 // lists each with its remedy, and tests/test_i300_fixture_parity.py holds
