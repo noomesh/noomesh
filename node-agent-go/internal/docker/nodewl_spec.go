@@ -78,6 +78,10 @@ func WorkloadDoorName(addon, workload string) string {
 // WorkloadNetworkName is the workload's private, internal network.
 func WorkloadNetworkName(addon, workload string) string { return "noo-wl-" + addon + "-" + workload }
 
+// maxScratchEntries is the validator's cap on scratch[] (nodewl: "at most 4");
+// release walks every possible volume name up to it.
+const maxScratchEntries = 4
+
 func workloadVolumeName(addon, workload string, i int) string {
 	return "noo-wl-" + addon + "-" + workload + "-scratch" + strconv.Itoa(i)
 }
@@ -210,11 +214,37 @@ func workerLabels(e nodewl.Entry) map[string]string {
 // cap a volume otherwise (the size option needs an xfs project quota the
 // agent cannot assume), so the cap is real but the space is memory, charged
 // to the worker's own cgroup and so bounded by limits.ram_mb as well. Both
-// are nosuid, nodev and noexec.
+// are nosuid, nodev and noexec, except the one entry that declares exec
+// (A12), which drops noexec only.
 func scratchMounts(e nodewl.Entry, uid int64) []mount.Mount {
 	var out []mount.Mount
 	for i, s := range e.Decl.Scratch {
 		switch {
+		case s.Exec:
+			// The exec scratch (i300 A12): the one mount without noexec, so the
+			// worker can dlopen what it compiled here. Docker's tmpfs mount type
+			// takes a mode but no uid/gid (mount.TmpfsOptions has only SizeBytes,
+			// Mode and Options), and a root-owned 1777 tmpfs is not "owned by the
+			// worker, 0700"; so BOTH declared kinds take the local-driver tmpfs
+			// volume form, sized from whichever of max_mb/tmpfs_mb is set. Still
+			// tmpfs-backed (empty at every start, charged to the worker's memory).
+			mb := int64(0)
+			if s.MaxMB != nil {
+				mb = *s.MaxMB
+			} else if s.TmpfsMB != nil {
+				mb = *s.TmpfsMB
+			}
+			out = append(out, mount.Mount{
+				Type: mount.TypeVolume, Source: workloadVolumeName(e.Addon, e.Name, i), Target: s.Target,
+				VolumeOptions: &mount.VolumeOptions{
+					NoCopy: true,
+					Labels: baseLabels(e, RoleWorker),
+					DriverConfig: &mount.Driver{Name: "local", Options: map[string]string{
+						"type": "tmpfs", "device": "tmpfs",
+						"o": fmt.Sprintf("size=%dm,uid=%d,gid=%d,mode=0700,nosuid,nodev", mb, uid, uid),
+					}},
+				},
+			})
 		case s.TmpfsMB != nil:
 			out = append(out, mount.Mount{
 				Type: mount.TypeTmpfs, Target: s.Target,

@@ -171,6 +171,25 @@ func (d dockerProvAPI) RemoveNetwork(ctx context.Context, name string) error {
 	return nil
 }
 
+// RemoveVolumeByName removes the volume called name when it carries
+// noo.managed-by=agent. One that does not is foreign: not removed, reported.
+func (d dockerProvAPI) RemoveVolumeByName(ctx context.Context, name string) (bool, error) {
+	res, err := d.c.docker.VolumeInspect(ctx, name, client.VolumeInspectOptions{})
+	if err != nil {
+		if isGone(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if res.Volume.Labels[LabelManagedBy] != ManagedByAgent {
+		return true, nil
+	}
+	if _, err := d.c.docker.VolumeRemove(ctx, name, client.VolumeRemoveOptions{Force: true}); err != nil && !isGone(err) {
+		return false, err
+	}
+	return false, nil
+}
+
 // RemoveVolumes removes the scratch volumes this agent made for addon/workload,
 // found by label so nothing else is ever touched.
 func (d dockerProvAPI) RemoveVolumes(ctx context.Context, addon, workload string) error {
