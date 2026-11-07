@@ -12,6 +12,7 @@
   "types": "./src/index.ts",
   "scripts": {
     "generate": "openapi-typescript ../../contracts/openapi.json -o src/schema.d.ts",
+    "check:schema": "node scripts/check-schema.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
