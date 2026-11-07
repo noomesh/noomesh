@@ -16,6 +16,7 @@ import (
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/api/types/network"
 
+	"github.com/noomesh/noomesh/node-agent-go/internal/mutant"
 	"github.com/noomesh/noomesh/node-agent-go/internal/nodewl"
 )
 
@@ -198,9 +199,15 @@ func baseLabels(e nodewl.Entry, role string) map[string]string {
 // config (read back for an orphan, see NodeWorkloads.ReleaseOrphans).
 func workerLabels(e nodewl.Entry) map[string]string {
 	l := baseLabels(e, RoleWorker)
-	l[LabelDrainPath] = e.Drain.Path
-	l[LabelDrainDone] = e.Drain.DonePath
-	l[LabelDrainTimeout] = strconv.FormatInt(e.Drain.TimeoutSecs, 10)
+	if !mutant.On("sp_lbl_path") {
+		l[LabelDrainPath] = e.Drain.Path
+	}
+	if !mutant.On("sp_lbl_done") {
+		l[LabelDrainDone] = e.Drain.DonePath
+	}
+	if !mutant.On("sp_lbl_secs") {
+		l[LabelDrainTimeout] = strconv.FormatInt(e.Drain.TimeoutSecs, 10)
+	}
 	return l
 }
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/noomesh/noomesh/node-agent-go/internal/mutant"
 	"github.com/noomesh/noomesh/node-agent-go/internal/nodewl"
 )
 
@@ -42,18 +43,21 @@ func refuse(code, format string, a ...any) error {
 // consent verdict comes first and alone: an entry the owner has not agreed to
 // is not examined any further.
 func (g *Gate) Check(ctx context.Context, e nodewl.Entry) error {
-	if err := g.consent(e); err != nil {
-		return err
-	}
-	if g.ControllerHost && !g.OnController {
+	if mutant.On("gt_consent_first") && g.ControllerHost && !g.OnController {
 		return refuse(nodewl.ReasonControllerHost, "this node is the controller's host and its owner has not opted in to node workloads here")
 	}
-	if e.Decl.Accel.GPU > 0 && g.NvidiaRuntime != nil {
+	if err := g.consent(e); err != nil && !mutant.On("gt_consent") {
+		return err
+	}
+	if g.ControllerHost && (!g.OnController || mutant.On("gt_optin")) && !mutant.On("gt_controller") {
+		return refuse(nodewl.ReasonControllerHost, "this node is the controller's host and its owner has not opted in to node workloads here")
+	}
+	if (e.Decl.Accel.GPU > 0 || mutant.On("gt_gpu_only")) && g.NvidiaRuntime != nil {
 		ok, err := g.NvidiaRuntime(ctx)
 		switch {
-		case err != nil:
+		case err != nil && !mutant.On("gt_nvidia_unknown"):
 			slog.Warn("node workload gate: nvidia runtime unknown; not refusing on it", "error", err)
-		case !ok:
+		case !ok && !mutant.On("gt_nvidia_missing"):
 			return refuse(nodewl.ReasonNvidiaRuntimeMissing, "the nvidia container runtime is not registered with docker")
 		}
 	}
@@ -66,20 +70,26 @@ func (g *Gate) consent(e nodewl.Entry) error {
 		return nil
 	case ModeApprove:
 		if g.Approvals == nil {
+			if mutant.On("gt_cs_nilstore") {
+				return nil
+			}
 			return refuse(nodewl.ReasonConsentUnapproved, "no approvals are kept on this node")
 		}
 		ok, err := g.Approvals.Has(e.Addon, e.Image.Digest)
-		if err != nil {
+		if err != nil && !mutant.On("gt_cs_err") {
 			// Consent that cannot be read is consent that cannot be shown.
 			slog.Warn("node workload gate: approvals unreadable; refusing", "error", err)
 			return refuse(nodewl.ReasonConsentUnapproved, "the approvals file cannot be read")
 		}
-		if !ok {
-			return refuse(nodewl.ReasonConsentUnapproved, "%s at %s is not approved on this node", e.Addon, e.Image.Digest)
+		if !ok && !mutant.On("gt_cs_unapproved") {
+			return refuse(mutant.Pick("gt_code_unapproved", nodewl.ReasonConsentNone, nodewl.ReasonConsentUnapproved), "%s at %s is not approved on this node", e.Addon, e.Image.Digest)
 		}
 		return nil
 	default: // ModeNone, and any value nothing recognises
-		return refuse(nodewl.ReasonConsentNone, "this node's addon_workloads_policy is none")
+		if mutant.On("gt_cs_default") {
+			return nil
+		}
+		return refuse(mutant.Pick("gt_code_none", nodewl.ReasonConsentUnapproved, nodewl.ReasonConsentNone), "this node's addon_workloads_policy is none")
 	}
 }
 
@@ -90,40 +100,46 @@ func (g *Gate) profile(e nodewl.Entry) error {
 	if g.MainSet == nil || len(e.Decl.Models) == 0 {
 		return nil
 	}
-	refs := e.Sets[e.Decl.Models[0].Slot]
+	refs := e.Sets[mutant.Pick("gt_prof_slot", "no-such-slot", e.Decl.Models[0].Slot)]
 	if len(refs) == 0 {
 		return nil
 	}
 	set, err := g.MainSet(refs[0].ID, refs[0].Revision)
-	if err != nil || len(set.Needs.Profiles) == 0 {
+	if (err != nil && !mutant.On("gt_prof_seterr")) || (len(set.Needs.Profiles) == 0 && !mutant.On("gt_prof_noprofiles")) {
 		return nil
 	}
-	if err := nodewl.CheckProfile(e, set); err != nil {
+	if err := nodewl.CheckProfile(e, set); err != nil && !mutant.On("gt_prof_check") {
 		return err
 	}
-	if e.Decl.Accel.GPU == 0 || g.ComputeCap == nil {
+	if (e.Decl.Accel.GPU == 0 && !mutant.On("gt_cc_cpu")) || g.ComputeCap == nil {
 		return nil
 	}
 	var min string
 	for _, p := range set.Needs.Profiles {
-		if p.Name == *e.Profile {
+		if p.Name == *e.Profile || mutant.On("gt_cc_match") {
 			min = p.MinCompute
 		}
 	}
-	if min == "" {
+	if min == "" && !mutant.On("gt_cc_nomin") {
 		return nil
 	}
 	have, err := g.ComputeCap()
 	if err != nil {
+		if mutant.On("gt_cc_unknown") {
+			return refuse(nodewl.ReasonComputeCapLow, "compute capability unknown")
+		}
 		slog.Warn("node workload gate: compute capability unknown; not refusing on it", "error", err)
 		return nil
 	}
 	ok, err := nodewl.ComputeCapAtLeast(have, min)
 	if err != nil {
+		if mutant.On("gt_cc_parse") {
+			return refuse(nodewl.ReasonComputeCapLow, "compute capability unparseable")
+		}
 		slog.Warn("node workload gate: compute capability unparseable; treated as unknown", "have", have, "need", min, "error", err)
 		return nil
 	}
-	if !ok {
+	if !ok && !mutant.On("gt_cc_low") {
 		return refuse(nodewl.ReasonComputeCapLow, "this node's GPU is compute capability %s, profile %q needs %s", have, *e.Profile, min)
 	}
 	return nil

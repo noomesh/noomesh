@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlenv"
+	"github.com/noomesh/noomesh/node-agent-go/internal/mutant"
 	"github.com/noomesh/noomesh/node-agent-go/internal/nodewl"
 )
 
@@ -205,23 +206,23 @@ func (p *NodeWorkloads) Rows() []Row {
 	lc := p.lc0()
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
-	if lc.lives == nil {
+	if lc.lives == nil && !mutant.On("lc_rows_nil") {
 		return nil
 	}
 	rows := make([]Row, 0, len(lc.lives))
 	for k, ls := range lc.lives {
 		addon, name, _ := strings.Cut(k, "/")
 		st := ls.state
-		if st == "" {
+		if st == "" && !mutant.On("lc_rows_absent") {
 			st = nodewl.StateAbsent
 		}
-		r := Row{Addon: addon, Name: name, State: st, Ready: ls.ready && st == nodewl.StateRunning,
-			DoorPort: WorkloadDoorPort, Reason: ls.reason}
+		r := Row{Addon: addon, Name: name, State: st, Ready: ls.ready && (st == nodewl.StateRunning || mutant.On("lc_rows_ready")),
+			DoorPort: mutant.Pick("lc_rows_door", 0, WorkloadDoorPort), Reason: mutant.Pick("lc_rows_reason", "", ls.reason)}
 		if ls.hasEntry {
-			if ls.entry.Reservation != nil {
+			if ls.entry.Reservation != nil && !mutant.On("lc_rows_resv") {
 				r.Reservation = *ls.entry.Reservation
 			}
-			if len(ls.entry.Decl.Models) > 0 {
+			if len(ls.entry.Decl.Models) > 0 && !mutant.On("lc_rows_model") {
 				if refs := ls.entry.Sets[ls.entry.Decl.Models[0].Slot]; len(refs) > 0 {
 					r.Model = refs[0].ID
 				}
@@ -229,12 +230,14 @@ func (p *NodeWorkloads) Rows() []Row {
 		}
 		rows = append(rows, r)
 	}
-	sort.Slice(rows, func(i, j int) bool {
-		if rows[i].Addon != rows[j].Addon {
-			return rows[i].Addon < rows[j].Addon
-		}
-		return rows[i].Name < rows[j].Name
-	})
+	if !mutant.On("lc_rows_sort") {
+		sort.Slice(rows, func(i, j int) bool {
+			if rows[i].Addon != rows[j].Addon {
+				return rows[i].Addon < rows[j].Addon
+			}
+			return rows[i].Name < rows[j].Name
+		})
+	}
 	return rows
 }
 
@@ -244,7 +247,7 @@ func (p *NodeWorkloads) MarkRead() {
 	lc := p.lc0()
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
-	if lc.lives == nil {
+	if lc.lives == nil && !mutant.On("lc_markread") {
 		lc.lives = map[string]*lifeState{}
 	}
 }
@@ -258,7 +261,7 @@ func (p *NodeWorkloads) Retain(keep map[string]bool) {
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
 	for k, ls := range lc.lives {
-		if !keep[k] && !ls.releasing && ls.state != nodewl.StateNeedsAttention {
+		if !keep[k] && (!ls.releasing || mutant.On("lc_retain_releasing")) && (ls.state != nodewl.StateNeedsAttention || mutant.On("lc_retain_na")) && !mutant.On("lc_retain_drop") {
 			delete(lc.lives, k)
 		}
 	}
@@ -282,17 +285,28 @@ func (p *NodeWorkloads) ReleaseOrphans(ctx context.Context, keep map[string]bool
 		return
 	}
 	for _, ref := range refs {
-		if keep[wlKey(ref.Addon, ref.Name)] {
+		if keep[wlKey(ref.Addon, ref.Name)] && !mutant.On("lc_orph_keep") {
 			continue
 		}
 		e := orphanEntry(ref)
-		if cur, ok := p.read(ref.Addon, ref.Name); ok && cur.hasEntry {
+		if cur, ok := p.read(ref.Addon, ref.Name); ok && cur.hasEntry && !mutant.On("lc_orph_mem") {
 			e = cur.entry
-			e.State, e.Reservation = nodewl.StateAbsent, nil
+			if !mutant.On("lc_orph_abs") {
+				e.State, e.Reservation = nodewl.StateAbsent, nil
+			}
 		}
 		slog.Info("node workload no longer in desired-config; removing", "addon", ref.Addon, "workload", ref.Name)
 		p.Converge(ctx, e)
 	}
+}
+
+// orphanState is the state an orphan is converged to: absent. (Mutant: an
+// orphan converged to running is brought back to life; isolation only.)
+func orphanState() string {
+	if mutant.Only("lc_orphan_state") {
+		return nodewl.StateRunning
+	}
+	return nodewl.StateAbsent
 }
 
 // orphanEntry is an `absent` entry that carries only what removal needs: the
@@ -300,8 +314,8 @@ func (p *NodeWorkloads) ReleaseOrphans(ctx context.Context, keep map[string]bool
 func orphanEntry(ref managedRef) nodewl.Entry {
 	secs, _ := strconv.ParseInt(ref.Labels[LabelDrainTimeout], 10, 64)
 	return nodewl.Entry{
-		Addon: ref.Addon, Name: ref.Name, State: nodewl.StateAbsent,
-		Drain: nodewl.Drain{Path: ref.Labels[LabelDrainPath], DonePath: ref.Labels[LabelDrainDone], TimeoutSecs: secs},
+		Addon: ref.Addon, Name: ref.Name, State: orphanState(),
+		Drain: nodewl.Drain{Path: mutant.Pick("lc_orph_lbl_path", "", ref.Labels[LabelDrainPath]), DonePath: mutant.Pick("lc_orph_lbl_done", "", ref.Labels[LabelDrainDone]), TimeoutSecs: mutant.Pick("lc_orph_lbl_secs", 0, secs)},
 	}
 }
 
@@ -309,17 +323,24 @@ func orphanEntry(ref managedRef) nodewl.Entry {
 // row reports its reason and no container is touched.
 func (p *NodeWorkloads) Refuse(addon, name string, err error) {
 	code := nodewl.CodeOf(err)
-	if code == "" {
+	if code == "" && !mutant.On("lc_refuse_code") {
 		return
 	}
 	p.with(addon, name, func(ls *lifeState) { ls.reason = code })
 }
 
-func ours(c *ctrInfo) bool { return c != nil && c.Labels[LabelManagedBy] == ManagedByAgent }
+func ours(c *ctrInfo) bool {
+	return c != nil && (c.Labels[LabelManagedBy] == ManagedByAgent || mutant.On("lc_ours"))
+}
 
-func exited(c *ctrInfo) bool { return c != nil && (c.Status == "exited" || c.Status == "dead") }
+func exited(c *ctrInfo) bool {
+	return c != nil && (c.Status == "exited" || (c.Status == "dead" && !mutant.On("lc_exited_dead")) || mutant.On("lc_exited_any"))
+}
 
 func (p *NodeWorkloads) gate(ctx context.Context, e nodewl.Entry) error {
+	if mutant.On("lc_gate_nil") && p.lc.Admit == nil {
+		return nil
+	}
 	if p.lc.Admit == nil {
 		return &nodewl.Error{Code: nodewl.ReasonConsentNone, Detail: "no consent policy is wired"}
 	}
@@ -330,24 +351,30 @@ func (p *NodeWorkloads) gate(ctx context.Context, e nodewl.Entry) error {
 // waiting for a drain or for readiness.
 func (p *NodeWorkloads) Converge(ctx context.Context, e nodewl.Entry) {
 	p.with(e.Addon, e.Name, func(ls *lifeState) { ls.entry, ls.hasEntry = e, true })
-	if err := p.adopt(ctx, e); err != nil {
+	if err := p.adopt(ctx, e); err != nil && !mutant.On("lc_conv_adopt_err") {
 		slog.Warn("node workload: cannot read the node", "addon", e.Addon, "workload", e.Name, "error", err)
 		return
 	}
 	switch e.State {
 	case nodewl.StateAbsent:
-		p.convergeAbsent(ctx, e)
+		if !mutant.On("lc_conv_absent") {
+			p.convergeAbsent(ctx, e)
+		}
 	case nodewl.StateProvisioned:
-		p.convergeProvisioned(ctx, e)
+		if !mutant.On("lc_conv_provisioned") {
+			p.convergeProvisioned(ctx, e)
+		}
 	case nodewl.StateRunning:
-		p.convergeRunning(ctx, e)
+		if !mutant.On("lc_conv_running") {
+			p.convergeRunning(ctx, e)
+		}
 	}
 }
 
 // adopt gives a workload with no memory in this process (an agent restart) the
 // state its containers are in.
 func (p *NodeWorkloads) adopt(ctx context.Context, e nodewl.Entry) error {
-	if ls, _ := p.read(e.Addon, e.Name); ls.state != "" {
+	if ls, _ := p.read(e.Addon, e.Name); ls.state != "" && !mutant.On("lc_adopt_skip") {
 		return nil
 	}
 	w, err := p.api.InspectContainer(ctx, WorkloadContainerName(e.Addon, e.Name))
@@ -356,14 +383,14 @@ func (p *NodeWorkloads) adopt(ctx context.Context, e nodewl.Entry) error {
 	}
 	st := nodewl.StateAbsent
 	switch {
-	case !ours(w):
-	case w.Running:
+	case !ours(w) && (!mutant.On("lc_adopt_ours") || w == nil):
+	case w.Running && !mutant.On("lc_adopt_running"):
 		st = nodewl.StateRunning
 	default:
 		st = nodewl.StateProvisioned
 	}
 	p.with(e.Addon, e.Name, func(ls *lifeState) {
-		if ls.state == "" {
+		if ls.state == "" || mutant.On("lc_adopt_only_empty") {
 			ls.state = st
 		}
 	})
@@ -373,7 +400,7 @@ func (p *NodeWorkloads) adopt(ctx context.Context, e nodewl.Entry) error {
 func (p *NodeWorkloads) setState(e nodewl.Entry, state, reason string) {
 	p.with(e.Addon, e.Name, func(ls *lifeState) {
 		ls.state, ls.reason = state, reason
-		if state != nodewl.StateRunning {
+		if state != nodewl.StateRunning && !mutant.On("lc_set_ready") {
 			ls.ready = false
 		}
 	})
@@ -381,11 +408,11 @@ func (p *NodeWorkloads) setState(e nodewl.Entry, state, reason string) {
 
 // refused records a verdict against a row without moving its state.
 func (p *NodeWorkloads) refused(e nodewl.Entry, err error) {
-	if errors.Is(err, ErrSetsPending) || errors.Is(err, ErrWorkerRunning) {
+	if (errors.Is(err, ErrSetsPending) && !mutant.On("lc_refused_sets")) || (errors.Is(err, ErrWorkerRunning) && !mutant.On("lc_refused_running")) {
 		return
 	}
 	code := nodewl.CodeOf(err)
-	if code == "" {
+	if code == "" && !mutant.On("lc_refused_code") {
 		slog.Warn("node workload: not converged", "addon", e.Addon, "workload", e.Name, "error", err)
 		return
 	}
@@ -394,52 +421,56 @@ func (p *NodeWorkloads) refused(e nodewl.Entry, err error) {
 
 func (p *NodeWorkloads) convergeAbsent(ctx context.Context, e nodewl.Entry) {
 	w, err := p.api.InspectContainer(ctx, WorkloadContainerName(e.Addon, e.Name))
-	if err != nil {
+	if err != nil && !mutant.On("lc_abs_inspect_err") {
 		slog.Warn("node workload: inspect", "addon", e.Addon, "workload", e.Name, "error", err)
 		return
 	}
-	if ours(w) && w.Running {
+	if ours(w) && w.Running && !mutant.On("lc_abs_drain") {
 		// Even for removal a worker is drained first: its sessions are not cut.
 		p.goRelease(ctx, e, thenDeprovision)
 		return
 	}
-	if err := p.Deprovision(ctx, e.Addon, e.Name); err != nil {
+	if err := p.Deprovision(ctx, e.Addon, e.Name); err != nil && !mutant.On("lc_abs_depr_err") {
 		p.refused(e, err)
 		return
 	}
-	p.setState(e, nodewl.StateAbsent, "")
+	if !mutant.On("lc_abs_setstate") {
+		p.setState(e, nodewl.StateAbsent, "")
+	}
 }
 
 func (p *NodeWorkloads) convergeProvisioned(ctx context.Context, e nodewl.Entry) {
 	w, err := p.api.InspectContainer(ctx, WorkloadContainerName(e.Addon, e.Name))
-	if err != nil {
+	if err != nil && !mutant.On("lc_prov_inspect_err") {
 		slog.Warn("node workload: inspect", "addon", e.Addon, "workload", e.Name, "error", err)
 		return
 	}
-	if ours(w) && w.Running {
+	if ours(w) && w.Running && !mutant.On("lc_prov_release") {
 		// Release: the worker drains, and only then is it stopped.
 		p.goRelease(ctx, e, thenProvision)
 		return
 	}
-	if cur, _ := p.read(e.Addon, e.Name); cur.releasing {
+	if cur, _ := p.read(e.Addon, e.Name); cur.releasing && !mutant.On("lc_prov_releasing") {
 		return
 	}
-	if err := p.gate(ctx, e); err != nil {
+	if err := p.gate(ctx, e); err != nil && !mutant.On("lc_prov_gate") {
 		p.refused(e, err)
 		return
 	}
-	if ours(w) && exited(w) {
+	if ours(w) && exited(w) && !mutant.On("lc_prov_exited") {
 		// It ran and is gone (crashed, or stopped after a drain): a released
 		// workload is always recreated fresh and stopped.
-		if err := p.removeWorkload(ctx, e); err != nil {
+		if err := p.removeWorkload(ctx, e); err != nil && !mutant.On("lc_prov_remove_err") {
 			p.refused(e, err)
 			return
 		}
 	}
 	switch err := p.Provision(ctx, e); {
 	case err == nil:
-		p.setState(e, nodewl.StateProvisioned, "")
-	case errors.Is(err, ErrWorkerRunning):
+		if !mutant.On("lc_prov_setstate") {
+			p.setState(e, nodewl.StateProvisioned, "")
+		}
+	case errors.Is(err, ErrWorkerRunning) && !mutant.On("lc_prov_runerr"):
 		p.goRelease(ctx, e, thenProvision)
 	default:
 		p.refused(e, err)
@@ -447,10 +478,10 @@ func (p *NodeWorkloads) convergeProvisioned(ctx context.Context, e nodewl.Entry)
 }
 
 func (p *NodeWorkloads) convergeRunning(ctx context.Context, e nodewl.Entry) {
-	if cur, _ := p.read(e.Addon, e.Name); cur.releasing {
+	if cur, _ := p.read(e.Addon, e.Name); cur.releasing && !mutant.On("lc_run_releasing") {
 		return
 	}
-	if err := p.ensureRunning(ctx, e); err != nil {
+	if err := p.ensureRunning(ctx, e); err != nil && !mutant.On("lc_run_refused") {
 		p.refused(e, err)
 	}
 }
@@ -459,10 +490,10 @@ func (p *NodeWorkloads) convergeRunning(ctx context.Context, e nodewl.Entry) {
 // the door and then the worker, and watch it for readiness. A worker that has
 // run and exited is crashed and is left exactly as it is.
 func (p *NodeWorkloads) ensureRunning(ctx context.Context, e nodewl.Entry) error {
-	if err := p.gate(ctx, e); err != nil {
+	if err := p.gate(ctx, e); err != nil && !mutant.On("lc_ens_gate") {
 		return err
 	}
-	if err := p.Provision(ctx, e); err != nil && !errors.Is(err, ErrWorkerRunning) {
+	if err := p.Provision(ctx, e); err != nil && !errors.Is(err, ErrWorkerRunning) && !mutant.On("lc_ens_prov_err") {
 		return err
 	}
 	workerName, doorName := WorkloadContainerName(e.Addon, e.Name), WorkloadDoorName(e.Addon, e.Name)
@@ -474,13 +505,13 @@ func (p *NodeWorkloads) ensureRunning(ctx context.Context, e nodewl.Entry) error
 	if err != nil {
 		return fmt.Errorf("inspect %s: %w", doorName, err)
 	}
-	if !ours(w) || !ours(d) {
+	if (!ours(w) && (!mutant.On("lc_ens_ours_w") || w == nil)) || (!ours(d) && (!mutant.On("lc_ens_ours_d") || d == nil)) {
 		return fmt.Errorf("%s/%s is not on the node after provisioning", e.Addon, e.Name)
 	}
 	switch {
 	case w.Running && d.Running:
-	case w.Status == "created" && (d.Status == "created" || d.Running):
-		if !d.Running {
+	case (w.Status == "created" || mutant.Only("lc_ens_restart")) && (d.Status == "created" || d.Running || mutant.On("lc_ens_door_status")):
+		if !d.Running || mutant.On("lc_ens_door_skip") {
 			if err := p.api.StartContainer(ctx, doorName); err != nil {
 				return fmt.Errorf("start %s: %w", doorName, err)
 			}
@@ -494,16 +525,23 @@ func (p *NodeWorkloads) ensureRunning(ctx context.Context, e nodewl.Entry) error
 		return nil
 	}
 	p.with(e.Addon, e.Name, func(ls *lifeState) {
-		ls.state, ls.reason = nodewl.StateRunning, ""
+		ls.state = nodewl.StateRunning
+		if !mutant.On("lc_ens_clear_reason") {
+			ls.reason = ""
+		}
 	})
-	p.goWatch(ctx, e)
+	if !mutant.On("lc_ens_watch") {
+		p.goWatch(ctx, e)
+	}
 	return nil
 }
 
 // removeWorkload stops and removes the pair, the scratch and the network of a
 // workload that is not running (or that has drained).
 func (p *NodeWorkloads) removeWorkload(ctx context.Context, e nodewl.Entry) error {
-	defer p.lock(e.Addon, e.Name)()
+	if !mutant.On("lc_remove_lock") {
+		defer p.lock(e.Addon, e.Name)()
+	}
 	return p.teardown(ctx, e.Addon, e.Name)
 }
 
@@ -512,7 +550,7 @@ func (p *NodeWorkloads) removeWorkload(ctx context.Context, e nodewl.Entry) erro
 func (p *NodeWorkloads) goWatch(parent context.Context, e nodewl.Entry) {
 	started := false
 	p.with(e.Addon, e.Name, func(ls *lifeState) {
-		if !ls.watching {
+		if !ls.watching || mutant.On("lc_watch_once") {
 			ls.watching, started = true, true
 		}
 	})
@@ -539,35 +577,35 @@ func (p *NodeWorkloads) watch(ctx context.Context, e nodewl.Entry) {
 	fast, slow := p.polls()
 	for {
 		cur, ok := p.read(e.Addon, e.Name)
-		if !ok || !cur.hasEntry || cur.entry.State != nodewl.StateRunning || cur.releasing {
+		if !ok || !cur.hasEntry || (cur.entry.State != nodewl.StateRunning && !mutant.Only("lc_w_stopped")) || (cur.releasing && !mutant.On("lc_w_releasing")) {
 			return
 		}
 		w, err := p.api.InspectContainer(ctx, WorkloadContainerName(e.Addon, e.Name))
 		if err == nil {
-			if !ours(w) {
+			if !ours(w) && !mutant.On("lc_w_ours") {
 				return
 			}
-			if !w.Running {
-				if exited(w) {
+			if !w.Running && !mutant.On("lc_w_notrunning") {
+				if exited(w) && !mutant.On("lc_w_exited") {
 					p.with(e.Addon, e.Name, func(ls *lifeState) { ls.ready, ls.reason = false, nodewl.ReasonCrashed })
 				}
 				return
 			}
 			ready := p.probeReady(ctx, e)
-			timedOut := !ready && !w.StartedAt.IsZero() && p.clock().Sub(w.StartedAt) > time.Duration(e.StartSecs)*time.Second
+			timedOut := !ready && (!w.StartedAt.IsZero() || mutant.On("lc_w_zero")) && (p.clock().Sub(w.StartedAt) > time.Duration(e.StartSecs)*time.Second || mutant.On("lc_w_secs"))
 			p.with(e.Addon, e.Name, func(ls *lifeState) {
-				if ls.releasing || ls.state != nodewl.StateRunning {
+				if (ls.releasing || ls.state != nodewl.StateRunning) && !mutant.On("lc_w_guard") {
 					return
 				}
 				ls.ready = ready
 				switch {
-				case ready:
+				case ready && !mutant.On("lc_w_readyreason"):
 					ls.reason = ""
-				case timedOut:
+				case timedOut && !mutant.On("lc_w_timeoutreason"):
 					ls.reason = nodewl.ReasonStartTimeout
 				}
 			})
-			if ready || timedOut {
+			if (ready || timedOut) && !mutant.On("lc_w_slow") {
 				select {
 				case <-lc.done:
 					return
@@ -590,13 +628,13 @@ func (p *NodeWorkloads) probeReady(ctx context.Context, e nodewl.Entry) bool {
 		return false
 	}
 	addr, err := p.DoorAddr(ctx, e.Addon, e.Name)
-	if err != nil {
+	if err != nil && !mutant.On("lc_probe_addr") {
 		return false
 	}
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	code, err := p.lc.doorCall(cctx, addr, WorkloadDoorName(e.Addon, e.Name), http.MethodGet, e.Decl.Health.Ready)
-	return err == nil && code == http.StatusOK
+	return (err == nil || mutant.On("lc_probe_err")) && (code == http.StatusOK || (mutant.On("lc_probe_200") && code >= 200 && code < 300))
 }
 
 // ---- release ------------------------------------------------------------
@@ -611,7 +649,7 @@ const (
 var errReleaseBusy = errors.New("a release of this workload is already in flight")
 
 func (p *NodeWorkloads) goRelease(ctx context.Context, e nodewl.Entry, then releaseThen) {
-	if cur, _ := p.read(e.Addon, e.Name); cur.releasing {
+	if cur, _ := p.read(e.Addon, e.Name); cur.releasing && !mutant.On("lc_gorel_busy") {
 		return
 	}
 	lc := p.lc0()
@@ -633,40 +671,55 @@ func (p *NodeWorkloads) goRelease(ctx context.Context, e nodewl.Entry, then rele
 func (p *NodeWorkloads) release(ctx context.Context, e nodewl.Entry, then releaseThen) error {
 	busy := false
 	p.with(e.Addon, e.Name, func(ls *lifeState) {
-		if ls.releasing {
+		if ls.releasing && !mutant.On("lc_rel_busy") {
 			busy = true
 			return
 		}
-		ls.releasing, ls.ready = true, false
+		ls.releasing = true
+		if !mutant.On("lc_rel_ready") {
+			ls.ready = false
+		}
 	})
 	if busy {
 		return errReleaseBusy
 	}
-	defer p.with(e.Addon, e.Name, func(ls *lifeState) { ls.releasing = false })
+	defer p.with(e.Addon, e.Name, func(ls *lifeState) { ls.releasing = mutant.On("lc_rel_defer") })
 
 	workerName := WorkloadContainerName(e.Addon, e.Name)
 	w, err := p.api.InspectContainer(ctx, workerName)
-	if err != nil {
+	if err != nil && !mutant.On("lc_rel_inspect_err") {
 		return fmt.Errorf("inspect %s: %w", workerName, err)
 	}
-	if ours(w) && w.Running {
+	if ours(w) && w.Running && !mutant.On("lc_rel_drain") {
 		switch err := p.drain(ctx, e); {
 		case err == nil:
-			if err := p.api.StopContainer(ctx, workerName, stopGrace); err != nil {
+			if err := p.api.StopContainer(ctx, workerName, stopGrace); err != nil && !mutant.On("lc_rel_stop_err") {
 				return fmt.Errorf("stop %s: %w", workerName, err)
 			}
-		case errors.Is(err, errWorkerExited):
+		case errors.Is(err, errWorkerExited) && !mutant.On("lc_rel_exited"):
 			// It is gone, so there is nothing to wait for or to stop: report
 			// the crash and go on to recreate it fresh and stopped.
 			slog.Warn("node workload: the worker exited during its drain", "addon", e.Addon, "workload", e.Name)
-			p.with(e.Addon, e.Name, func(ls *lifeState) { ls.state, ls.ready, ls.reason = nodewl.StateRunning, false, nodewl.ReasonCrashed })
+			p.with(e.Addon, e.Name, func(ls *lifeState) {
+				ls.state, ls.ready, ls.reason = nodewl.StateRunning, false, nodewl.ReasonCrashed
+				if mutant.On("lc_rel_exited_reason") {
+					ls.reason = ""
+				}
+			})
 		default:
 			// Not drained (only a timeout gets here): the worker is NOT stopped.
-			p.setState(e, nodewl.StateNeedsAttention, nodewl.ReasonDrainTimeout)
-			return err
+			if mutant.On("lc_rel_stop_on_fail") {
+				_ = p.api.StopContainer(ctx, workerName, stopGrace)
+			}
+			if !mutant.On("lc_rel_na") {
+				p.setState(e, nodewl.StateNeedsAttention, nodewl.ReasonDrainTimeout)
+			}
+			if !mutant.On("lc_rel_continue") {
+				return err
+			}
 		}
 	}
-	if then == thenDeprovision {
+	if then == thenDeprovision && !mutant.On("lc_rel_depr") {
 		if err := p.Deprovision(ctx, e.Addon, e.Name); err != nil {
 			p.refused(e, err)
 			return err
@@ -674,20 +727,22 @@ func (p *NodeWorkloads) release(ctx context.Context, e nodewl.Entry, then releas
 		p.setState(e, nodewl.StateAbsent, "")
 		return nil
 	}
-	if err := p.removeWorkload(ctx, e); err != nil {
+	if err := p.removeWorkload(ctx, e); err != nil && !mutant.On("lc_rel_remove_err") {
 		p.refused(e, err)
 		return err
 	}
 	p.setState(e, nodewl.StateAbsent, "")
-	if err := p.gate(ctx, e); err != nil {
+	if err := p.gate(ctx, e); err != nil && !mutant.On("lc_rel_gate") {
 		p.refused(e, err)
 		return err
 	}
-	if err := p.Provision(ctx, e); err != nil {
+	if err := p.Provision(ctx, e); err != nil && !mutant.On("lc_rel_prov_err") {
 		p.refused(e, err)
 		return err
 	}
-	p.setState(e, nodewl.StateProvisioned, "")
+	if !mutant.On("lc_rel_final") {
+		p.setState(e, nodewl.StateProvisioned, "")
+	}
 	return nil
 }
 
@@ -706,34 +761,44 @@ func (p *NodeWorkloads) drain(ctx context.Context, e nodewl.Entry) error {
 	dctx, cancel := context.WithTimeout(ctx, time.Duration(e.Drain.TimeoutSecs)*time.Second)
 	defer cancel()
 	every := p.lc.pollDrain
-	if every <= 0 {
+	if every <= 0 && !mutant.On("lc_drain_every") {
 		every = drainPollEvery
+	}
+	if every <= 0 {
+		every = time.Millisecond
 	}
 	workerName := WorkloadContainerName(e.Addon, e.Name)
 	accepted := false
 	last := "no answer yet"
 	for {
-		if w, err := p.api.InspectContainer(dctx, workerName); err == nil && (!ours(w) || !w.Running) {
+		if w, err := p.api.InspectContainer(dctx, workerName); err == nil && ((!ours(w) && !mutant.On("lc_drain_exit_ours")) || (!w.Running && !mutant.On("lc_drain_exit_running"))) {
 			return errWorkerExited
 		}
-		if !accepted {
+		if !accepted || mutant.On("lc_drain_repost") {
 			code, err := p.callDoor(dctx, e, http.MethodPost, e.Drain.Path)
 			switch {
 			case err != nil:
 				last = fmt.Sprintf("POST %s: %v", e.Drain.Path, err)
-			case code < 200 || code > 299:
+			case (code < 200 && !mutant.On("lc_drain_lo")) || (code > 299 && !mutant.On("lc_drain_hi")):
 				last = fmt.Sprintf("POST %s answered HTTP %d", e.Drain.Path, code)
 			default:
+				if !accepted && mutant.On("lc_drain_whole") {
+					var cancel2 context.CancelFunc
+					dctx, cancel2 = context.WithTimeout(ctx, time.Duration(e.Drain.TimeoutSecs)*time.Second)
+					defer cancel2()
+				}
 				accepted = true
-				p.setState(e, nodewl.StateDraining, "")
+				if !mutant.On("lc_drain_draining") {
+					p.setState(e, nodewl.StateDraining, "")
+				}
 			}
 		}
-		if accepted {
+		if accepted || mutant.On("lc_drain_early") {
 			code, err := p.callDoor(dctx, e, http.MethodGet, e.Drain.DonePath)
 			switch {
 			case err != nil:
 				last = fmt.Sprintf("GET %s: %v", e.Drain.DonePath, err)
-			case code == http.StatusOK:
+			case code == http.StatusOK || (mutant.On("lc_drain_done200") && code >= 200 && code < 300) || mutant.On("lc_drain_done_any"):
 				return nil
 			default:
 				last = fmt.Sprintf("GET %s answered HTTP %d", e.Drain.DonePath, code)
@@ -741,6 +806,9 @@ func (p *NodeWorkloads) drain(ctx context.Context, e nodewl.Entry) error {
 		}
 		select {
 		case <-dctx.Done():
+			if mutant.On("lc_drain_timeout_ok") {
+				return nil
+			}
 			return fmt.Errorf("%w within %d s (%s)", ErrDrainIncomplete, e.Drain.TimeoutSecs, last)
 		case <-time.After(every):
 		}
@@ -752,7 +820,7 @@ func (p *NodeWorkloads) drain(ctx context.Context, e nodewl.Entry) error {
 // error like any other failed call.
 func (p *NodeWorkloads) callDoor(ctx context.Context, e nodewl.Entry, method, path string) (int, error) {
 	addr, err := p.DoorAddr(ctx, e.Addon, e.Name)
-	if err != nil {
+	if err != nil && !mutant.On("lc_door_addr") {
 		return 0, err
 	}
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -773,14 +841,14 @@ var errWorkerExited = errors.New("the worker exited during its drain")
 // already known to be `running`. It starts and returns; readiness is watched.
 func (p *NodeWorkloads) StartManaged(ctx context.Context, e nodewl.Entry) error {
 	p.with(e.Addon, e.Name, func(ls *lifeState) { ls.entry, ls.hasEntry = e, true })
-	if err := p.adopt(ctx, e); err != nil {
+	if err := p.adopt(ctx, e); err != nil && !mutant.On("lc_sm_adopt") {
 		return err
 	}
-	if cur, _ := p.read(e.Addon, e.Name); cur.releasing {
+	if cur, _ := p.read(e.Addon, e.Name); cur.releasing && !mutant.On("lc_sm_busy") {
 		return errReleaseBusy
 	}
 	err := p.ensureRunning(ctx, e)
-	if err != nil {
+	if err != nil && !mutant.On("lc_sm_refused") {
 		p.refused(e, err)
 	}
 	return err
@@ -793,7 +861,7 @@ func (p *NodeWorkloads) StartManaged(ctx context.Context, e nodewl.Entry) error 
 func (p *NodeWorkloads) StopManaged(ctx context.Context, e nodewl.Entry) error {
 	p.with(e.Addon, e.Name, func(ls *lifeState) { ls.entry, ls.hasEntry = e, true })
 	then := thenProvision
-	if e.State == nodewl.StateAbsent {
+	if e.State == nodewl.StateAbsent && !mutant.On("lc_stop_absent") {
 		then = thenDeprovision
 	}
 	return p.release(ctx, e, then)
@@ -806,10 +874,10 @@ func (p *NodeWorkloads) ManagedStatus(ctx context.Context, addon, name string) (
 	if err != nil {
 		return ManagedState{}, err
 	}
-	ms := ManagedState{State: nodewl.StateAbsent, Running: ours(w) && w.Running}
+	ms := ManagedState{State: nodewl.StateAbsent, Running: (ours(w) || mutant.On("lc_ms_ours")) && w != nil && w.Running}
 	if cur, ok := p.read(addon, name); ok {
 		ms.State, ms.Ready, ms.Reason = cur.state, cur.ready, cur.reason
-		if ms.State == "" {
+		if ms.State == "" && !mutant.On("lc_ms_empty") {
 			ms.State = nodewl.StateAbsent
 		}
 	}
@@ -822,7 +890,7 @@ func (p *NodeWorkloads) IsManaged(ctx context.Context, addon, name string) (bool
 	if err != nil {
 		return false, err
 	}
-	return ours(w), nil
+	return ours(w) || (w != nil && mutant.On("lc_ismanaged")), nil
 }
 
 // ---- the door client ----------------------------------------------------
@@ -838,28 +906,45 @@ func newDoorCaller() func(ctx context.Context, addr, serverName, method, path st
 }
 
 func doorRequest(ctx context.Context, caPath, certPath, keyPath, addr, serverName, method, path string) (int, error) {
-	if !strings.HasPrefix(path, "/") {
+	if !strings.HasPrefix(path, "/") && !mutant.On("lc_dr_abs") {
 		return 0, fmt.Errorf("path %q is not absolute", path)
 	}
 	caPEM, err := os.ReadFile(caPath)
-	if err != nil {
+	if err != nil && !mutant.On("lc_dr_ca") {
 		return 0, fmt.Errorf("cluster CA: %w", err)
 	}
 	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(caPEM) {
+	if !pool.AppendCertsFromPEM(caPEM) && !mutant.On("lc_dr_capem") {
 		return 0, errors.New("cluster CA holds no certificate")
 	}
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-	if err != nil {
+	if err != nil && !mutant.On("lc_dr_leaf") {
 		return 0, fmt.Errorf("node leaf: %w", err)
 	}
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool, ServerName: serverName, Certificates: []tls.Certificate{cert}}
+	if mutant.On("lc_dr_sni") {
+		tlsCfg.ServerName = ""
+	}
+	if mutant.On("lc_dr_roots") {
+		tlsCfg.RootCAs = nil
+		tlsCfg.InsecureSkipVerify = true
+	}
+	if mutant.On("lc_dr_minver") {
+		tlsCfg.MinVersion = tls.VersionTLS10
+	}
+	if mutant.On("lc_dr_clientcert") {
+		tlsCfg.Certificates = nil
+	}
 	tr := &http.Transport{
-		TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool, ServerName: serverName, Certificates: []tls.Certificate{cert}},
+		TLSClientConfig:   tlsCfg,
 		DisableKeepAlives: true,
 		Proxy:             nil,
 	}
 	defer tr.CloseIdleConnections()
 	cl := &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	if mutant.On("lc_dr_redirect") {
+		cl.CheckRedirect = nil
+	}
 	req, err := http.NewRequestWithContext(ctx, method, "https://"+addr+path, nil)
 	if err != nil {
 		return 0, err

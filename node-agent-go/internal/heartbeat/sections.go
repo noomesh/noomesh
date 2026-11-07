@@ -11,6 +11,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
 	"github.com/noomesh/noomesh/node-agent-go/internal/imagesource"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
+	"github.com/noomesh/noomesh/node-agent-go/internal/mutant"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
 	"github.com/noomesh/noomesh/node-agent-go/internal/version"
 )
@@ -196,9 +197,16 @@ var (
 		// i300 F5b. `os` is what this binary was built for, always known.
 		// Every other key comes from the provider and is OMITTED when its
 		// probe failed: an error must not become a fact (the i495 rule).
-		p["os"] = runtime.GOOS
+		if mutant.On("hb_section") {
+			return
+		}
+		if !mutant.On("hb_os") {
+			p["os"] = runtime.GOOS
+		}
 		for k, v := range r.nodeFactsReport() {
-			p[k] = v
+			if !mutant.On("hb_merge") {
+				p[k] = v
+			}
 		}
 	}}
 

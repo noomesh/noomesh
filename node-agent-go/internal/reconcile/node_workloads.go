@@ -15,6 +15,7 @@ import (
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelsets"
+	"github.com/noomesh/noomesh/node-agent-go/internal/mutant"
 	"github.com/noomesh/noomesh/node-agent-go/internal/nodepolicy"
 	"github.com/noomesh/noomesh/node-agent-go/internal/nodewl"
 )
@@ -39,7 +40,7 @@ type nodeWorkloads interface {
 // is not a mode was already turned into none by config.Load, and is said so.
 func newNodeWorkloads(cfg *config.Config, docker *dockerpkg.Client, sets *modelsets.Store) (nodeWorkloads, *nodepolicy.Facts) {
 	mode, _ := nodepolicy.ParseMode(cfg.AddonWorkloadsPolicy)
-	if cfg.AddonWorkloadsPolicyAsked != "" {
+	if cfg.AddonWorkloadsPolicyAsked != "" && !mutant.On("rc_nf_warn") {
 		slog.Warn("NOO_ADDON_WORKLOADS is not none, approve or auto; add-on node workloads stay refused (none)",
 			"value", cfg.AddonWorkloadsPolicyAsked)
 	}
@@ -49,10 +50,16 @@ func newNodeWorkloads(cfg *config.Config, docker *dockerpkg.Client, sets *models
 		nvidia = docker.NvidiaRuntimeKnown
 	}
 	facts := &nodepolicy.Facts{
-		Mode: mode, Approvals: approvals, ControllerHost: cfg.SelfNode,
+		Mode: mutant.Pick("rc_nf_mode", nodepolicy.Mode(""), mode), Approvals: mutant.Pick("rc_nf_approvals", nil, approvals), ControllerHost: cfg.SelfNode && !mutant.On("rc_nf_ctrl"),
 		ComputeCaps:    (&hardware.GPUDetector{}).DetectComputeCaps,
 		NvidiaRuntime:  nvidia,
 		DataRootFreeGB: nodepolicy.DataRootFreeGB,
+	}
+	if mutant.On("rc_nf_caps") {
+		facts.ComputeCaps = nil
+	}
+	if mutant.On("rc_nf_datafree") {
+		facts.DataRootFreeGB = nil
 	}
 	if docker == nil {
 		return nil, facts
@@ -68,15 +75,25 @@ func newNodeWorkloads(cfg *config.Config, docker *dockerpkg.Client, sets *models
 // wire; a gate missing one would silently skip that refusal.
 func newGate(cfg *config.Config, mode nodepolicy.Mode, approvals *nodepolicy.Approvals,
 	nvidia func(context.Context) (bool, error), facts *nodepolicy.Facts, sets *modelsets.Store) *nodepolicy.Gate {
-	return &nodepolicy.Gate{
-		Mode: mode, Approvals: approvals,
-		ControllerHost: cfg.SelfNode, OnController: cfg.AddonWorkloadsOnController,
+	g := &nodepolicy.Gate{
+		Mode: mutant.Pick("rc_gate_mode", nodepolicy.Mode(""), mode), Approvals: mutant.Pick("rc_gate_approvals", nil, approvals),
+		ControllerHost: cfg.SelfNode && !mutant.On("rc_gate_ctrl"), OnController: cfg.AddonWorkloadsOnController && !mutant.On("rc_gate_onctl"),
 		NvidiaRuntime: nvidia,
 		ComputeCap:    facts.MinComputeCap,
 		MainSet: func(id, revision string) (nodewl.ModelSet, error) {
 			return sets.VerifiedManifest(modelsets.Ref{ID: id, Revision: revision})
 		},
 	}
+	if mutant.On("rc_gate_nvidia") {
+		g.NvidiaRuntime = nil
+	}
+	if mutant.On("rc_gate_cc") {
+		g.ComputeCap = nil
+	}
+	if mutant.On("rc_gate_mainset") {
+		g.MainSet = nil
+	}
+	return g
 }
 
 // convergeNodeWorkloads drives every node workload desired-config names toward
@@ -95,25 +112,33 @@ func newGate(cfg *config.Config, mode nodepolicy.Mode, approvals *nodepolicy.App
 //   - Each workload converges on its own goroutine, one at a time per
 //     workload: an image pull or a drain must not hold up the pass.
 func (r *Reconciler) convergeNodeWorkloads(ctx context.Context, t *tick) bool {
-	if r.nodeWL == nil || len(t.desired.NodeWorkloads) == 0 {
+	if r.nodeWL == nil || (len(t.desired.NodeWorkloads) == 0 && !mutant.On("rc_empty")) {
 		return true
 	}
 	rows, err := parseNodeWorkloadRows(t.desired.NodeWorkloads, r.cfg.NodeID)
-	if err != nil {
+	if err != nil && !mutant.On("rc_parse_err") {
 		slog.Warn("reconcile.node_workloads_desired_unreadable; touching nothing", "error", err)
 		return true
 	}
-	r.nodeWL.MarkRead()
+	if !mutant.On("rc_markread") {
+		r.nodeWL.MarkRead()
+	}
 	keep := map[string]bool{}
 	for _, row := range rows {
-		keep[row.Addon+"/"+row.Name] = true
-		if row.Err != nil {
-			r.nodeWL.Refuse(row.Addon, row.Name, row.Err)
+		if !mutant.On("rc_keep") {
+			keep[row.Addon+"/"+row.Name] = true
+		}
+		if row.Err != nil && !mutant.On("rc_row_err") {
+			if !mutant.On("rc_row_refuse") {
+				r.nodeWL.Refuse(row.Addon, row.Name, row.Err)
+			}
 			slog.Warn("reconcile.node_workload_refused", "addon", row.Addon, "workload", row.Name,
 				"reason", nodewl.CodeOf(row.Err), "error", row.Err)
 			continue
 		}
-		r.goConverge(ctx, row.Entry)
+		if !mutant.Only("rc_converge") {
+			r.goConverge(ctx, row.Entry)
+		}
 	}
 	// Reached only when desired-config was read AND parsed as a whole: a
 	// failed or unparseable read returned above and removes nothing (i495).
@@ -121,12 +146,16 @@ func (r *Reconciler) convergeNodeWorkloads(ctx context.Context, t *tick) bool {
 	// A row whose addon/name cannot be read is skipped by the parser; it may
 	// name a workload on this node, so the sweep waits for a list it can trust.
 	var listed []json.RawMessage
-	if json.Unmarshal(t.desired.NodeWorkloads, &listed) == nil && len(listed) == len(rows) {
-		r.nodeWL.ReleaseOrphans(ctx, keep)
+	if (json.Unmarshal(t.desired.NodeWorkloads, &listed) == nil || mutant.On("rc_sweep_json")) && (len(listed) == len(rows) || mutant.On("rc_sweep_len")) {
+		if !mutant.On("rc_sweep") {
+			r.nodeWL.ReleaseOrphans(ctx, keep)
+		}
 	} else {
 		slog.Warn("reconcile.node_workloads_row_unnameable; removing no orphan this pass")
 	}
-	r.nodeWL.Retain(keep)
+	if !mutant.On("rc_retain") {
+		r.nodeWL.Retain(keep)
+	}
 	return true
 }
 
@@ -141,7 +170,7 @@ func parseNodeWorkloadRows(raw json.RawMessage, ownAgentCN string) ([]nodewl.Des
 func (r *Reconciler) goConverge(ctx context.Context, e nodewl.Entry) {
 	k := e.Addon + "/" + e.Name
 	r.nwMu.Lock()
-	if r.nwBusy[k] {
+	if r.nwBusy[k] && !mutant.On("rc_busy_check") {
 		r.nwMu.Unlock()
 		return
 	}
@@ -155,7 +184,9 @@ func (r *Reconciler) goConverge(ctx context.Context, e nodewl.Entry) {
 		defer r.nwWG.Done()
 		defer func() {
 			r.nwMu.Lock()
-			delete(r.nwBusy, k)
+			if !mutant.On("rc_busy_clear") {
+				delete(r.nwBusy, k)
+			}
 			r.nwMu.Unlock()
 		}()
 		r.nodeWL.Converge(ctx, e)
@@ -167,13 +198,13 @@ func (r *Reconciler) goConverge(ctx context.Context, e nodewl.Entry) {
 // been read, `node_workloads`.
 func (r *Reconciler) NodeFacts() map[string]any {
 	out := map[string]any{}
-	if r.facts != nil {
+	if r.facts != nil && !mutant.On("rc_nf_facts") {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		out = r.facts.Report(ctx)
 	}
-	if r.nodeWL != nil {
-		if rows := r.nodeWL.Rows(); rows != nil {
+	if r.nodeWL != nil && !mutant.On("rc_nf_rows") {
+		if rows := r.nodeWL.Rows(); rows != nil || mutant.On("rc_nf_nilrows") {
 			out["node_workloads"] = rows
 		}
 	}
@@ -185,7 +216,7 @@ func (r *Reconciler) NodeFacts() map[string]any {
 // NodeWorkloadControl is the actuator's handle on agent-managed workloads, nil
 // when this agent has no lifecycle (tests built without one).
 func (r *Reconciler) NodeWorkloadControl() dockerpkg.ManagedControl {
-	if r.nodeWL == nil {
+	if r.nodeWL == nil && !mutant.On("rc_ctl_nil") {
 		return nil
 	}
 	return managedControl{r}
@@ -207,20 +238,27 @@ func (m managedControl) Status(ctx context.Context, addon, workload string) (doc
 func (r *Reconciler) desiredEntry(ctx context.Context, addon, workload string) (nodewl.Entry, error) {
 	d, err := r.fetch(ctx)
 	if err != nil {
+		if mutant.On("rc_de_fetch") {
+			return nodewl.Entry{}, &dockerpkg.ManagedError{HTTP: 404, Code: "not_desired", Detail: err.Error()}
+		}
 		return nodewl.Entry{}, &dockerpkg.ManagedError{HTTP: 502, Code: "desired_unreadable", Detail: err.Error()}
 	}
-	if len(d.NodeWorkloads) == 0 {
+	if len(d.NodeWorkloads) == 0 && !mutant.On("rc_de_empty") {
 		return nodewl.Entry{}, &dockerpkg.ManagedError{HTTP: 404, Code: "not_desired", Detail: "desired-config places no node workload here"}
 	}
 	rows, err := parseNodeWorkloadRows(d.NodeWorkloads, r.cfg.NodeID)
 	if err != nil {
-		return nodewl.Entry{}, &dockerpkg.ManagedError{HTTP: 409, Code: nodewl.CodeOf(err), Detail: err.Error()}
+		code := nodewl.CodeOf(err)
+		if mutant.On("rc_de_parse") {
+			return nodewl.Entry{}, &dockerpkg.ManagedError{HTTP: 404, Code: "not_desired", Detail: err.Error()}
+		}
+		return nodewl.Entry{}, &dockerpkg.ManagedError{HTTP: 409, Code: code, Detail: err.Error()}
 	}
 	for _, row := range rows {
-		if row.Addon != addon || row.Name != workload {
+		if (row.Addon != addon && !mutant.On("rc_de_addon")) || (row.Name != workload && !mutant.On("rc_de_name")) {
 			continue
 		}
-		if row.Err != nil {
+		if row.Err != nil && !mutant.On("rc_de_rowerr") {
 			return nodewl.Entry{}, &dockerpkg.ManagedError{HTTP: 409, Code: nodewl.CodeOf(row.Err), Detail: row.Err.Error()}
 		}
 		return row.Entry, nil
@@ -236,7 +274,7 @@ func (m managedControl) Start(ctx context.Context, addon, workload string) (dock
 	if err != nil {
 		return dockerpkg.ManagedState{}, err
 	}
-	if e.State != nodewl.StateRunning {
+	if e.State != nodewl.StateRunning && !mutant.On("rc_start_state") {
 		return dockerpkg.ManagedState{}, &dockerpkg.ManagedError{HTTP: 409, Code: "not_running_in_desired",
 			Detail: fmt.Sprintf("desired-config has this workload %s; set it to running first", e.State)}
 	}
@@ -254,7 +292,7 @@ func (m managedControl) Stop(ctx context.Context, addon, workload string) (docke
 	if err != nil {
 		return dockerpkg.ManagedState{}, err
 	}
-	if e.State == nodewl.StateRunning {
+	if e.State == nodewl.StateRunning && !mutant.On("rc_stop_state") {
 		return dockerpkg.ManagedState{}, &dockerpkg.ManagedError{HTTP: 409, Code: "still_running_in_desired",
 			Detail: "desired-config still has this workload running; release it (provisioned) first"}
 	}
@@ -269,16 +307,16 @@ func (m managedControl) Stop(ctx context.Context, addon, workload string) (docke
 // drain_timeout; anything else is the daemon's, a 502.
 func managedErr(err error, fallback string) error {
 	var me *dockerpkg.ManagedError
-	if errors.As(err, &me) {
+	if errors.As(err, &me) && !mutant.On("rc_me_as") {
 		return err
 	}
-	if code := nodewl.CodeOf(err); code != "" {
+	if code := nodewl.CodeOf(err); code != "" && !mutant.On("rc_me_code") {
 		return &dockerpkg.ManagedError{HTTP: 409, Code: code, Detail: err.Error()}
 	}
-	if errors.Is(err, dockerpkg.ErrSetsPending) {
+	if errors.Is(err, dockerpkg.ErrSetsPending) && !mutant.On("rc_me_sets") {
 		return &dockerpkg.ManagedError{HTTP: 409, Code: "sets_pending", Detail: err.Error()}
 	}
-	if errors.Is(err, dockerpkg.ErrDrainIncomplete) {
+	if errors.Is(err, dockerpkg.ErrDrainIncomplete) && !mutant.On("rc_me_drain") {
 		return &dockerpkg.ManagedError{HTTP: 409, Code: nodewl.ReasonDrainTimeout, Detail: err.Error()}
 	}
 	return &dockerpkg.ManagedError{HTTP: 502, Code: fallback, Detail: err.Error()}

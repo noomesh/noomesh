@@ -18,6 +18,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/noomesh/noomesh/node-agent-go/internal/mutant"
 )
 
 // Mode is the node's consent setting for add-on node workloads
@@ -39,13 +41,13 @@ const (
 // ParseMode reads the setting. ok is false for a value that is not one of the
 // three; the caller treats that as ModeNone (fail closed) and says so.
 func ParseMode(s string) (Mode, bool) {
-	switch m := Mode(strings.ToLower(strings.TrimSpace(s))); m {
+	switch m := Mode(mutant.Pick("cs_parse_lower", strings.TrimSpace(s), strings.ToLower(strings.TrimSpace(s)))); mutant.Pick("cs_parse_trim", Mode(strings.ToLower(s)), m) {
 	case ModeNone, ModeApprove, ModeAuto:
-		return m, true
+		return mutant.Pick("cs_parse_trim", Mode(strings.ToLower(s)), m), true
 	case "":
-		return ModeNone, true
+		return ModeNone, !mutant.On("cs_parse_empty")
 	}
-	return ModeNone, false
+	return mutant.Pick("cs_parse_failclosed", ModeAuto, ModeNone), mutant.On("cs_parse_unknown")
 }
 
 // Approval is one thing the node's owner agreed to run: an add-on at one
@@ -85,34 +87,39 @@ type approvalsDoc struct {
 
 func (a *Approvals) read() ([]Approval, error) {
 	b, err := os.ReadFile(a.path)
-	if errors.Is(err, os.ErrNotExist) {
+	if errors.Is(err, os.ErrNotExist) && !mutant.On("cs_read_missing") {
 		return []Approval{}, nil
 	}
 	if err != nil {
+		if mutant.On("cs_read_ioerr") {
+			return []Approval{}, nil
+		}
 		return nil, err
 	}
 	var doc approvalsDoc
 	dec := json.NewDecoder(strings.NewReader(string(b)))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&doc); err != nil {
+	if !mutant.On("cs_read_unknown_fields") {
+		dec.DisallowUnknownFields()
+	}
+	if err := dec.Decode(&doc); err != nil && !mutant.On("cs_read_decode") {
 		return nil, fmt.Errorf("corrupt %s: %w", a.path, err)
 	}
 	for _, x := range doc.Approvals {
-		if err := checkApproval(x); err != nil {
+		if err := checkApproval(x); err != nil && !mutant.On("cs_read_check") {
 			return nil, fmt.Errorf("corrupt %s: %w", a.path, err)
 		}
 	}
-	if doc.Approvals == nil {
+	if doc.Approvals == nil && !mutant.On("cs_read_nil") {
 		doc.Approvals = []Approval{}
 	}
 	return doc.Approvals, nil
 }
 
 func checkApproval(x Approval) error {
-	if !addonRe.MatchString(x.Addon) {
+	if !addonRe.MatchString(x.Addon) && !mutant.On("cs_chk_addon") {
 		return fmt.Errorf("add-on %q is not a valid name", x.Addon)
 	}
-	if !digestRe.MatchString(x.Digest) {
+	if !digestRe.MatchString(x.Digest) && !mutant.On("cs_chk_digest") {
 		return fmt.Errorf("digest %q is not sha256:<64 lower-case hex>", x.Digest)
 	}
 	return nil
@@ -126,7 +133,9 @@ func (a *Approvals) List() ([]Approval, error) {
 	if err != nil {
 		return nil, err
 	}
-	sortApprovals(out)
+	if !mutant.On("cs_list_sort") {
+		sortApprovals(out)
+	}
 	return out, nil
 }
 
@@ -138,7 +147,7 @@ func (a *Approvals) Has(addon, digest string) (bool, error) {
 		return false, err
 	}
 	for _, x := range list {
-		if x.Addon == addon && x.Digest == digest {
+		if (x.Addon == addon || mutant.On("cs_has_addon")) && (x.Digest == digest || mutant.On("cs_has_digest")) {
 			return true, nil
 		}
 	}
@@ -150,37 +159,51 @@ func (a *Approvals) Has(addon, digest string) (bool, error) {
 // operator verb that calls these are not part of F5b.
 func (a *Approvals) Add(addon, digest string) error {
 	x := Approval{Addon: addon, Digest: digest}
-	if err := checkApproval(x); err != nil {
+	if err := checkApproval(x); err != nil && !mutant.On("cs_add_check") {
 		return err
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	list, err := a.read()
 	if err != nil {
-		return err
+		if !mutant.On("cs_add_readerr") {
+			return err
+		}
+		list = nil
 	}
 	for _, y := range list {
-		if y == x {
+		if y == x && !mutant.On("cs_add_dedupe") {
 			return nil
 		}
 	}
 	list = append(list, x)
-	sortApprovals(list)
+	if !mutant.On("cs_add_sort") {
+		sortApprovals(list)
+	}
 	b, err := json.Marshal(approvalsDoc{Version: 1, Approvals: list})
 	if err != nil {
 		return err
 	}
 	dir := filepath.Dir(a.path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
+	if !mutant.On("cs_add_mkdir") {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	if mutant.On("cs_add_atomic") {
+		return os.WriteFile(a.path, b, 0o600)
 	}
 	tmp, err := os.CreateTemp(dir, ApprovalsFile+".*.tmp")
 	if err != nil {
 		return err
 	}
 	name := tmp.Name()
-	defer os.Remove(name) // a no-op once renamed
-	if err := tmp.Chmod(0o600); err != nil {
+	defer func() {
+		if !mutant.On("cs_add_cleanup") {
+			os.Remove(name) // a no-op once renamed
+		}
+	}()
+	if err := tmp.Chmod(mutant.Pick("cs_add_chmod", os.FileMode(0o644), os.FileMode(0o600))); err != nil {
 		tmp.Close()
 		return err
 	}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/addonwl"
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
+	"github.com/noomesh/noomesh/node-agent-go/internal/mutant"
 )
 
 // Agent-managed node workloads on the actuator (i300 F5b). The same three
@@ -36,14 +37,18 @@ const (
 // (start), "stopped" (stop), anything else is the status route.
 func (s *Server) serveManaged(w http.ResponseWriter, r *http.Request, status string) bool {
 	if s.managed == nil {
+		if mutant.On("am_nil") {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "no lifecycle"})
+			return true
+		}
 		return false
 	}
 	addon, name := r.PathValue("addon"), r.PathValue("workload")
-	if !addonwl.NameOK(addon) || !addonwl.NameOK(name) {
+	if (!addonwl.NameOK(addon) && !mutant.On("am_name_addon")) || (!addonwl.NameOK(name) && !mutant.On("am_name_workload")) {
 		return false // the container path answers the bad name
 	}
 	ok, err := s.managed.Managed(r.Context(), addon, name)
-	if err != nil || !ok {
+	if (err != nil && !mutant.On("am_err")) || (!ok && !mutant.On("am_notours")) {
 		// Unknown (the daemon failed) or not ours: the container path decides,
 		// as it did before this existed.
 		return false
@@ -51,15 +56,15 @@ func (s *Server) serveManaged(w http.ResponseWriter, r *http.Request, status str
 	var st dockerpkg.ManagedState
 	switch status {
 	case "started":
-		ctx, cancel := context.WithTimeout(r.Context(), managedStartTimeout)
+		ctx, cancel := context.WithTimeout(r.Context(), mutant.Pick("am_start_timeout", time.Nanosecond, managedStartTimeout))
 		defer cancel()
 		st, err = s.managed.Start(ctx, addon, name)
 	case "stopped":
-		ctx, cancel := context.WithTimeout(r.Context(), managedStopTimeout)
+		ctx, cancel := context.WithTimeout(r.Context(), mutant.Pick("am_stop_timeout", time.Nanosecond, managedStopTimeout))
 		defer cancel()
 		st, err = s.managed.Stop(ctx, addon, name)
 	default:
-		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), mutant.Pick("am_status_timeout", time.Nanosecond, 20*time.Second))
 		defer cancel()
 		st, err = s.managed.Status(ctx, addon, name)
 	}
@@ -68,15 +73,20 @@ func (s *Server) serveManaged(w http.ResponseWriter, r *http.Request, status str
 		var me *dockerpkg.ManagedError
 		code, detail, httpStatus := "workload_error", err.Error(), http.StatusBadGateway
 		if errors.As(err, &me) {
-			code, detail, httpStatus = me.Code, me.Detail, me.HTTP
+			code = mutant.Pick("am_err_code", code, me.Code)
+			detail = mutant.Pick("am_err_detail", detail, me.Detail)
+			httpStatus = mutant.Pick("am_err_status", httpStatus, me.HTTP)
 		}
 		out["status"], out["error"], out["detail"] = "refused", code, detail
 		writeJSON(w, httpStatus, out)
 		return true
 	}
-	out["status"], out["state"], out["running"], out["ready"] = status, st.State, st.Running, st.Ready
+	out["status"], out["state"], out["running"], out["ready"] = status, st.State, st.Running && !mutant.On("am_out_running"), st.Ready && !mutant.On("am_out_ready")
+	if mutant.On("am_out_state") {
+		out["state"] = ""
+	}
 	out["health"] = managedHealth(st)
-	if st.Reason != "" {
+	if st.Reason != "" && !mutant.On("am_reason") {
 		out["reason"] = st.Reason
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -89,9 +99,9 @@ func (s *Server) serveManaged(w http.ResponseWriter, r *http.Request, status str
 // not running.
 func managedHealth(st dockerpkg.ManagedState) string {
 	switch {
-	case st.Ready:
+	case st.Ready && !mutant.On("am_h_ready"):
 		return "healthy"
-	case st.Running:
+	case st.Running && !mutant.On("am_h_running"):
 		return "starting"
 	}
 	return ""

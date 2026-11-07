@@ -21,6 +21,7 @@ import (
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 
+	"github.com/noomesh/noomesh/node-agent-go/internal/mutant"
 	"github.com/noomesh/noomesh/node-agent-go/internal/preseed"
 )
 
@@ -100,8 +101,10 @@ func (d dockerProvAPI) InspectContainer(ctx context.Context, name string) (*ctrI
 	}
 	if c.State != nil {
 		info.Running = c.State.Running
-		info.Status = string(c.State.Status)
-		if t, perr := time.Parse(time.RFC3339Nano, c.State.StartedAt); perr == nil && !t.IsZero() && t.Year() > 1 {
+		if !mutant.On("api_status") {
+			info.Status = string(c.State.Status)
+		}
+		if t, perr := time.Parse(time.RFC3339Nano, c.State.StartedAt); (perr == nil || mutant.On("api_started_err")) && (!t.IsZero() || mutant.On("api_started_zero")) && (t.Year() > 1 || mutant.On("api_started_year")) && !mutant.On("api_started") {
 			info.StartedAt = t
 		}
 	}
@@ -127,7 +130,7 @@ func (d dockerProvAPI) StartContainer(ctx context.Context, name string) error {
 }
 
 func (d dockerProvAPI) StopContainer(ctx context.Context, name string, graceS int) error {
-	return d.c.StopContainerGraceful(ctx, name, graceS)
+	return d.c.StopContainerGraceful(ctx, name, mutant.Pick("api_grace", 0, graceS))
 }
 
 func (d dockerProvAPI) RemoveContainer(ctx context.Context, name string) error {
@@ -194,23 +197,30 @@ func (d dockerProvAPI) RemoveVolumes(ctx context.Context, addon, workload string
 // ListManaged finds this agent's workloads by the noo.managed-by=agent label
 // alone: the door, the worker, in any state.
 func (d dockerProvAPI) ListManaged(ctx context.Context) ([]managedRef, error) {
+	filters := make(client.Filters).Add("label", LabelManagedBy+"="+ManagedByAgent)
+	if mutant.On("api_filter") {
+		filters = nil
+	}
 	ctrs, err := d.c.listContainers(ctx, client.ContainerListOptions{
-		All:     true,
-		Filters: make(client.Filters).Add("label", LabelManagedBy+"="+ManagedByAgent),
+		All:     !mutant.On("api_all"),
+		Filters: filters,
 	})
 	if err != nil {
+		if mutant.On("api_listerr") {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("list containers: %w", err)
 	}
 	byKey := map[string]*managedRef{}
 	var order []string
 	for _, c := range ctrs {
-		// The daemon filtered on the label; the sweep deletes what this
-		// returns, so the label is checked again here rather than trusted.
-		if c.Labels[LabelManagedBy] != ManagedByAgent {
+		addon, name := c.Labels[LabelAddon], c.Labels[LabelWorkload]
+		if (addon == "" && !mutant.On("api_skip_addon")) || (name == "" && !mutant.On("api_skip_name")) {
 			continue
 		}
-		addon, name := c.Labels[LabelAddon], c.Labels[LabelWorkload]
-		if addon == "" || name == "" {
+		// The daemon filtered on the label; the sweep deletes what this
+		// returns, so the label is checked again here rather than trusted.
+		if c.Labels[LabelManagedBy] != ManagedByAgent && !mutant.On("api_label_check") {
 			continue
 		}
 		k := wlKey(addon, name)
@@ -220,7 +230,7 @@ func (d dockerProvAPI) ListManaged(ctx context.Context) ([]managedRef, error) {
 			byKey[k] = ref
 			order = append(order, k)
 		}
-		if c.Labels[LabelRole] == RoleWorker {
+		if c.Labels[LabelRole] == RoleWorker || mutant.On("api_role") {
 			ref.Labels = c.Labels
 		}
 	}

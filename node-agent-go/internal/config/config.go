@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlenv"
+	"github.com/noomesh/noomesh/node-agent-go/internal/mutant"
 )
 
 // Config holds all node-agent configuration derived from environment variables.
@@ -159,7 +160,7 @@ func Load() *Config {
 	}
 
 	c.AddonWorkloadsPolicy, c.AddonWorkloadsPolicyAsked = addonWorkloadsPolicy(os.Getenv("NOO_ADDON_WORKLOADS"))
-	c.AddonWorkloadsOnController = envBool("NOO_ADDON_WORKLOADS_ON_CONTROLLER")
+	c.AddonWorkloadsOnController = (envBool("NOO_ADDON_WORKLOADS_ON_CONTROLLER") && !mutant.On("cf_onctl_read")) || mutant.On("cf_onctl_default")
 	c.MTLSDowngradeAsked = mtlsDowngradeAsked()
 	c.BackendTLSDowngradeAsked = backendTLSDowngradeAsked()
 
@@ -451,13 +452,13 @@ func envOr(key, fallback string) string {
 // and surrounding space ignored; unset is none. Anything else fails CLOSED to
 // none, and asked is the offending value so the agent can log it.
 func addonWorkloadsPolicy(raw string) (policy, asked string) {
-	switch v := strings.ToLower(strings.TrimSpace(raw)); v {
+	switch v := mutant.Pick("cf_trim", strings.ToLower(raw), mutant.Pick("cf_lower", strings.TrimSpace(raw), strings.ToLower(strings.TrimSpace(raw)))); v {
 	case "", "none":
-		return "none", ""
+		return "none", mutant.Pick("cf_asked_none", "none", "")
 	case "approve", "auto":
-		return v, ""
+		return v, mutant.Pick("cf_asked_ok", v, "")
 	}
-	return "none", strings.TrimSpace(raw)
+	return mutant.Pick("cf_failclosed", "auto", "none"), mutant.Pick("cf_asked_value", "", strings.TrimSpace(raw))
 }
 
 func envBool(key string) bool {

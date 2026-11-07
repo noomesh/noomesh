@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/noomesh/noomesh/node-agent-go/internal/mutant"
 )
 
 // GPUMetrics holds real-time GPU telemetry.
@@ -138,7 +140,7 @@ func (g *GPUDetector) DetectCount() (int, error) {
 // is unknown (an old driver that lacks the field exits non-zero: unknown too).
 func (g *GPUDetector) DetectComputeCaps() ([]string, error) {
 	out, absent, err := smiQuery("--query-gpu=compute_cap", "--format=csv,noheader,nounits")
-	if err != nil || absent {
+	if (err != nil && !mutant.On("hw_err")) || (absent && !mutant.On("hw_absent")) {
 		return nil, err
 	}
 	return parseComputeCaps(out)
@@ -149,11 +151,11 @@ func (g *GPUDetector) DetectComputeCaps() ([]string, error) {
 func parseComputeCaps(out string) ([]string, error) {
 	var caps []string
 	for _, l := range strings.Split(out, "\n") {
-		l = strings.TrimSpace(l)
-		if l == "" {
+		l = mutant.Pick("hw_trim", l, strings.TrimSpace(l))
+		if l == "" && !mutant.On("hw_blank") {
 			continue
 		}
-		if !computeCapLine.MatchString(l) {
+		if !computeCapLine.MatchString(l) && !mutant.On("hw_regex") {
 			return nil, fmt.Errorf("nvidia-smi compute_cap: unparseable output %q", l)
 		}
 		caps = append(caps, l)

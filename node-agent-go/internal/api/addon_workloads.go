@@ -26,6 +26,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/addonwl"
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
 	"github.com/noomesh/noomesh/node-agent-go/internal/gpuyield"
+	"github.com/noomesh/noomesh/node-agent-go/internal/mutant"
 )
 
 // workloadOps is the docker surface the actuator needs (the client, or a
@@ -102,7 +103,7 @@ func workloadReply(status string, decl *addonwl.Decl, st *dockerpkg.WorkloadStat
 // the declared container's running state and health (the gateway's
 // ready wait polls it).
 func (s *Server) handleWorkloadStatus(w http.ResponseWriter, r *http.Request) {
-	if s.serveManaged(w, r, "ok") {
+	if !mutant.On("am_route_status") && s.serveManaged(w, r, "ok") {
 		return
 	}
 	decl, st, _ := s.resolveWorkload(w, r)
@@ -117,7 +118,7 @@ func (s *Server) handleWorkloadStatus(w http.ResponseWriter, r *http.Request) {
 // held: the reservation holds first. Starting a running container is a
 // no-op that answers its state.
 func (s *Server) handleWorkloadStart(w http.ResponseWriter, r *http.Request) {
-	if s.serveManaged(w, r, "started") {
+	if !mutant.On("am_route_start") && s.serveManaged(w, r, "started") {
 		return
 	}
 	decl, st, ops := s.resolveWorkload(w, r)
@@ -154,7 +155,7 @@ func (s *Server) handleWorkloadStart(w http.ResponseWriter, r *http.Request) {
 // with an optional body {timeout_secs}: a graceful stop (SIGTERM, then
 // kill at the grace); the container keeps its spec for the next start.
 func (s *Server) handleWorkloadStop(w http.ResponseWriter, r *http.Request) {
-	if s.serveManaged(w, r, "stopped") {
+	if !mutant.On("am_route_stop") && s.serveManaged(w, r, "stopped") {
 		return
 	}
 	decl, st, ops := s.resolveWorkload(w, r)

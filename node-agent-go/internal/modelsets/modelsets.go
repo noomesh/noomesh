@@ -45,6 +45,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
 	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlenv"
+	"github.com/noomesh/noomesh/node-agent-go/internal/mutant"
 	"github.com/noomesh/noomesh/node-agent-go/internal/nodewl"
 	"github.com/noomesh/noomesh/node-agent-go/internal/preseed"
 )
@@ -690,15 +691,21 @@ func (s *Store) State(ref Ref) Status {
 // node (the gate reads a profile's min_compute from it). Any other state is an
 // error: only a manifest whose signature, files and marker were checked is read.
 func (s *Store) VerifiedManifest(ref Ref) (nodewl.ModelSet, error) {
-	if st := s.State(ref); st.State != StateVerified {
+	if st := s.State(ref); st.State != StateVerified && !mutant.On("ms_state") {
 		return nodewl.ModelSet{}, fmt.Errorf("set %s is %s here", ref, st.State)
 	}
 	b, err := os.ReadFile(filepath.Join(s.dir(ref), ManifestName))
 	if err != nil {
+		if mutant.On("ms_read") {
+			return nodewl.ModelSet{}, nil
+		}
 		return nodewl.ModelSet{}, err
 	}
 	set, err := nodewl.ParseModelSet(b)
 	if err != nil {
+		if mutant.On("ms_parse") {
+			return nodewl.ModelSet{}, nil
+		}
 		return nodewl.ModelSet{}, err
 	}
 	return *set, nil

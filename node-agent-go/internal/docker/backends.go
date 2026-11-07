@@ -31,6 +31,7 @@ import (
 	nodeconfig "github.com/noomesh/noomesh/node-agent-go/internal/config"
 	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlenv"
 	"github.com/noomesh/noomesh/node-agent-go/internal/dataroots"
+	"github.com/noomesh/noomesh/node-agent-go/internal/mutant"
 	"github.com/noomesh/noomesh/node-agent-go/internal/preseed"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
 )
@@ -1824,6 +1825,9 @@ func (c *Client) nvidiaRuntimeRegistered(ctx context.Context) bool {
 func (c *Client) NvidiaRuntimeKnown(ctx context.Context) (bool, error) {
 	res, err := c.docker.Info(ctx, client.InfoOptions{})
 	if err != nil {
+		if mutant.On("bk_nvidia_failopen") {
+			return true, nil
+		}
 		return false, err
 	}
 	return runtimesIncludeNvidia(res.Info.Runtimes), nil
