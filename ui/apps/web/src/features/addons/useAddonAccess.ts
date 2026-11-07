@@ -138,9 +138,12 @@ export function toPersonView(raw: unknown, addon: string): PersonView {
 }
 
 /**
- * The add-ons access can be set on: the enabled ones in `/health`'s `addons`
- * map (sent to a signed-in caller), in the gateway's order. A disabled
- * add-on's manifest is not loaded, so there is nothing to set yet.
+ * The add-ons access can be set on: `/health`'s `addons_registered` (sent to
+ * a signed-in caller), the runtime registry, where every add-on has a route
+ * manifest. Not the `enabled` words in `addons`: those include the compiled
+ * rows (identity, trellion, trellion_intel), which have no manifest, so the
+ * access route 404s each one. Without the field (a gateway older than this
+ * console) nothing is guessed: the list is unavailable.
  */
 export function useAccessAddons() {
   const client = useMetisClient();
@@ -150,9 +153,11 @@ export function useAccessAddons() {
     queryFn: async () => {
       const { data, error } = await client.GET('/health');
       if (error || !data) throw new Error(gatewayMessage(error) ?? 'Add-on list unavailable');
-      return Object.entries(obj((data as { addons?: unknown }).addons))
-        .filter(([, state]) => state === 'enabled')
-        .map(([id]) => id);
+      const registered = (data as { addons_registered?: unknown }).addons_registered;
+      if (!Array.isArray(registered)) {
+        throw new Error('This gateway does not list its registered add-ons (older than this console)');
+      }
+      return registered.filter((id): id is string => typeof id === 'string');
     },
   });
 }
