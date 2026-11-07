@@ -7128,10 +7128,6 @@ mod tests {
         assert_eq!(super::seats_heading(None), None, "an older gateway without the registry stays silent");
     }
 
-    /// The `model classes` row: declared candidates must be
-    /// placed or available; unplaced → WARN naming class + node with the
-    /// placement that fixes it; a class with nothing routable → FAIL.
-
     /// i509 step 5: an enabled add-on that is down FAILS, naming it and the
     /// restart; one that runs passes; an unreadable state is not a pass.
     #[test]
@@ -7160,6 +7156,10 @@ mod tests {
         assert_eq!(both.verdict, super::Verdict::Fail, "{both:?}");
         assert!(both.detail.contains("not running: noo-rhaddon-worker") && !both.detail.contains("noo-rhaddon-gpu"), "{both:?}");
     }
+
+    /// The `model classes` row: declared candidates must be
+    /// placed or available; unplaced → WARN naming class + node with the
+    /// placement that fixes it; a class with nothing routable → FAIL.
     #[test]
     fn model_classes_row_warns_on_unplaced_and_fails_on_a_dead_class() {
         use super::model_classes_check;
