@@ -19,7 +19,7 @@ mod traces;
 mod agents;
 mod cli_piece;
 mod console_piece;
-mod artifacts;
+pub(crate) mod artifacts;
 mod bootstrap;
 pub(crate) use bootstrap::self_agent_base;
 mod seats;
