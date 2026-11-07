@@ -87,20 +87,20 @@ func TestActuatorStartRoutesManagedWorkloadsThroughTheLifecycle(t *testing.T) {
 // Pre-created (i163) workloads are not agent-managed: their path is exactly what
 // it was, and the lifecycle is never asked to act on them.
 func TestActuatorLeavesPreCreatedWorkloadsOnTheContainerPath(t *testing.T) {
-	addonwl.SetDeclared([]addonwl.Decl{{Addon: "pai-voice", Name: "voice-worker", Container: "noo-pai-voice-worker"}})
+	addonwl.SetDeclared([]addonwl.Decl{{Addon: "rhaddon", Name: "voice-worker", Container: "noo-rhaddon-worker"}})
 	t.Cleanup(func() { addonwl.SetDeclared(nil) })
-	f := &fakeWorkloads{ctr: &dockerpkg.WorkloadState{ID: "c1", Name: "noo-pai-voice-worker"}}
+	f := &fakeWorkloads{ctr: &dockerpkg.WorkloadState{ID: "c1", Name: "noo-rhaddon-worker"}}
 	mc := &fakeManaged{managed: map[string]bool{"rhaddon/worker": true}}
 	m := workloadMux(&Server{workloadOps: f, managed: mc})
 
-	code, out := call(t, m, "POST", "/api/addon-workloads/pai-voice/voice-worker/start", "")
-	if code != 200 || out["status"] != "started" || out["container"] != "noo-pai-voice-worker" || out["managed"] != nil {
+	code, out := call(t, m, "POST", "/api/addon-workloads/rhaddon/voice-worker/start", "")
+	if code != 200 || out["status"] != "started" || out["container"] != "noo-rhaddon-worker" || out["managed"] != nil {
 		t.Fatalf("pre-created start: %d %v", code, out)
 	}
 	if len(f.starts) != 1 || f.starts[0] != "c1" {
 		t.Fatalf("container starts = %v", f.starts)
 	}
-	if code, out := call(t, m, "POST", "/api/addon-workloads/pai-voice/voice-worker/stop", `{"timeout_secs":12}`); code != 200 || out["status"] != "stopped" || f.grace != 12 {
+	if code, out := call(t, m, "POST", "/api/addon-workloads/rhaddon/voice-worker/stop", `{"timeout_secs":12}`); code != 200 || out["status"] != "stopped" || f.grace != 12 {
 		t.Fatalf("pre-created stop: %d %v grace %d", code, out, f.grace)
 	}
 	if len(mc.calls) != 0 {
@@ -108,7 +108,7 @@ func TestActuatorLeavesPreCreatedWorkloadsOnTheContainerPath(t *testing.T) {
 	}
 	// Without a lifecycle at all the old path is the only path.
 	m = workloadMux(&Server{workloadOps: f})
-	if code, _ := call(t, m, "POST", "/api/addon-workloads/pai-voice/voice-worker/start", ""); code != 200 {
+	if code, _ := call(t, m, "POST", "/api/addon-workloads/rhaddon/voice-worker/start", ""); code != 200 {
 		t.Fatalf("no lifecycle: %d", code)
 	}
 	// A name the old path refuses is still refused by it.

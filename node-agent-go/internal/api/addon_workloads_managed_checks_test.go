@@ -155,12 +155,12 @@ func TestABadAddonOrWorkloadNameNeverReachesTheLifecycle(t *testing.T) {
 // A lifecycle that cannot say whether it owns the workload (the daemon
 // failed) does not claim it: the container path decides, as it always did.
 func TestAWorkloadTheLifecycleCannotConfirmGoesToTheContainerPath(t *testing.T) {
-	addonwl.SetDeclared([]addonwl.Decl{{Addon: "pai-voice", Name: "voice-worker", Container: "noo-pai-voice-worker"}})
+	addonwl.SetDeclared([]addonwl.Decl{{Addon: "rhaddon", Name: "voice-worker", Container: "noo-rhaddon-worker"}})
 	t.Cleanup(func() { addonwl.SetDeclared(nil) })
 	p := &probeManaged{managedFn: func(string, string) (bool, error) { return true, errors.New("docker unreachable") }}
-	f := &fakeWorkloads{ctr: &dockerpkg.WorkloadState{ID: "c1", Name: "noo-pai-voice-worker"}}
+	f := &fakeWorkloads{ctr: &dockerpkg.WorkloadState{ID: "c1", Name: "noo-rhaddon-worker"}}
 	m := workloadMux(&Server{workloadOps: f, managed: p})
-	code, out := call(t, m, "POST", "/api/addon-workloads/pai-voice/voice-worker/start", "")
+	code, out := call(t, m, "POST", "/api/addon-workloads/rhaddon/voice-worker/start", "")
 	if code != 200 || out["managed"] != nil || len(f.starts) != 1 || len(p.calls) != 0 {
 		t.Fatalf("%d %v starts=%v lifecycle calls=%v", code, out, f.starts, p.calls)
 	}
