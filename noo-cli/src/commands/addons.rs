@@ -1122,9 +1122,7 @@ fn check_json(name: &str, dir: &str, third_party: bool, c: &crate::addons::check
     if c.node_workloads.is_some() {
         report["node_workloads_not_checked"] = crate::addons::check::NODE_WORKLOADS_NOT_CHECKED.into();
     }
-    if let Some(scratch) = c.node_workloads.as_ref().filter(|s| !s.is_empty()) {
-        report["exec_scratch"] = scratch.iter().map(|s| json!({"workload": s.workload, "target": s.target, "mb": s.mb})).collect();
-    }
+    // MUTANT: the exec_scratch field is omitted
     report
 }
 
