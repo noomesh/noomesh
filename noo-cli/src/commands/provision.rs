@@ -782,7 +782,9 @@ fn ensure_node_certs(g: &Globals, a: &ProvisionArgs, site: &ProvSite, id: &ProvI
     // of its node name — the same test the onboard install applies.
     let role = crate::pki::NodeRole::of(&node);
     let (want_dns, want_ips) = if is_self {
-        (role.required_dns().to_vec(), Vec::new())
+        // i545 89/92: its tailnet address too (this device's own), so a
+        // promote's new address re-issues the self-node cert on restage.
+        (role.required_dns().to_vec(), role.tailnet_ip4(&node).into_iter().collect())
     } else {
         want_ips.extend(crate::pki::ClusterCa::tailscale_ip4(&node));
         (want_dns, want_ips)
@@ -2900,10 +2902,16 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
     // which makes this lane, and therefore `noo upgrade`, the repair.
     let node_crt = pki.join("nodes").join(node).join("node.crt");
     let role = crate::pki::NodeRole::of(node);
+    // i545 89/92: and the controller's tailnet ADDRESS. A promote or a move
+    // to bind mode tailnet adds it to the controller's identity; a cert
+    // judged on names alone kept the old address set, and the gateway's
+    // calls to the self-agent at that address failed verification.
+    let ts_ip: Vec<String> = role.tailnet_ip4(node).into_iter().collect();
     let reason = if !pki.join("nodes").join(node).join("node.key").exists() || !node_crt.exists() {
         Some(format!("issuing a cert for {node} into the local PKI"))
-    } else if !crate::pki::ClusterCa::cert_covers_sans(&node_crt, role.required_dns(), &[]) {
-        Some(format!("{node}'s cert lacks the controller names ({}) — re-issuing", role.required_dns().join(", ")))
+    } else if !crate::pki::ClusterCa::cert_covers_sans(&node_crt, role.required_dns(), &ts_ip) {
+        Some(format!("{node}'s cert lacks the controller names or address ({}) — re-issuing",
+            role.required_dns().iter().chain(ts_ip.iter()).cloned().collect::<Vec<_>>().join(", ")))
     } else {
         None
     };
@@ -2920,7 +2928,6 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
         if !ca.ca_exists() {
             return Err("no cluster CA found — run `noo onboard --only security` first".into());
         }
-        let ts_ip: Vec<String> = role.tailnet_ip4(node).into_iter().collect();
         ca.issue_node_cert(node, &crate::onboard::util::detect_ip(), crate::pki::DEFAULT_DAYS,
                 &["node-agent".to_string()], &ts_ip, &role)
             .map_err(|e| format!("could not issue a cert for {node}: {e}"))?;
@@ -4990,6 +4997,20 @@ mod tests {
         assert!(body.contains("cert_covers_sans(&node_crt, role.required_dns()"), "coverage test missing");
         assert!(body.contains("crate::onboard::util::detect_ip()"), "explicit address missing");
         assert!(body.contains("&ts_ip, &role)"), "the controller role (names, own tailnet address) is issued");
+    }
+
+    /// i545 89/92: both lanes judge the self-node cert on the controller's
+    /// tailnet ADDRESS as well as its names, so a promote (new identity)
+    /// re-issues it instead of keeping the old address set.
+    #[test]
+    fn both_lanes_reissue_the_self_node_cert_on_a_missing_tailnet_address() {
+        let src = crate::test_src::own_code(include_str!("provision.rs"));
+        let local = crate::test_src::fn_body(&src, "fn provision_local_in(");
+        assert!(local.contains("let ts_ip: Vec<String> = role.tailnet_ip4(node).into_iter().collect();"), "the address is derived");
+        assert!(local.contains("cert_covers_sans(&node_crt, role.required_dns(), &ts_ip)"), "the local lane checks it");
+        let rail = crate::test_src::fn_body(&src, "fn ensure_node_certs(");
+        assert!(rail.contains("(role.required_dns().to_vec(), role.tailnet_ip4(&node).into_iter().collect())"), "the rail lane checks it");
+        assert!(rail.contains("cert_covers_sans(&node_crt, &want_dns, &want_ips)"));
     }
 
     #[test]
