@@ -1162,8 +1162,9 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
                                             continue;
                                         }
                                         // Up, but the node reports it does not hold the
-                                        // placed model.
-                                        if crate::model_presence::backend_model_missing(&data, bt) {
+                                        // placed CHAT model (an absent embed model on the
+                                        // same backend is embed's problem, not chat's).
+                                        if crate::model_presence::backend_chat_model_missing(&data, bt) {
                                             tracing::warn!(node = %node_id, backend = %bt, "backend_skipped_model_missing");
                                             continue;
                                         }
