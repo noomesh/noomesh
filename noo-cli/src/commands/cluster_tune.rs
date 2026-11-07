@@ -382,7 +382,6 @@ mod tests {
     /// image has no GPU build; every other pair is honoured as declared.
     #[test]
     fn only_a_gpu_llamacpp_runs_on_the_cpu_regardless() {
-        assert!(!LLAMACPP_HAS_GPU_BUILD, "the shipped image is a CPU build (tests/test_llamacpp_gpu_build_claim.py)");
         assert!(runs_on_cpu_regardless("llamacpp", "gpu"));
         assert!(!runs_on_cpu_regardless("llamacpp", "cpu"));
         for b in ["ollama", "vllm", "vllm-secondary"] {
