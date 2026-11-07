@@ -197,7 +197,8 @@ pub struct NodeFacts {
     pub unreported: Vec<String>,
     /// Model names the node has locally (Ollama tags, GGUFs).
     pub available_models: Vec<String>,
-    /// Backends whose `model_presence.present` is `false`.
+    /// Backends whose CHAT model `model_presence` reports absent (`present:
+    /// false`). An absent embed/rerank model on the backend is not counted.
     pub model_missing: Vec<String>,
     /// Backends whose placement role is not `chat`.
     pub non_chat: Vec<String>,
@@ -1585,11 +1586,21 @@ pub fn node_facts_from_kv(key: &str, data: &Value, non_chat: &[(String, String)]
                 .collect()
         })
         .unwrap_or_default();
-    let model_missing = data
+    // Keys are `<backend>` or `<backend>#<role>`; only an absent CHAT model
+    // takes a backend out of the chat pool (an absent embed model is embed's).
+    let mut model_missing: Vec<String> = data
         .get("model_presence")
         .and_then(Value::as_object)
-        .map(|o| o.keys().filter(|b| crate::model_presence::backend_model_missing(data, b)).cloned().collect())
+        .map(|o| {
+            o.keys()
+                .filter_map(|k| k.split('#').next())
+                .filter(|b| crate::model_presence::backend_chat_model_missing(data, b))
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
+    model_missing.sort();
+    model_missing.dedup();
     let reported_non_chat_models: Vec<(String, String)> = data
         .get("model_presence")
         .and_then(Value::as_object)
@@ -2300,6 +2311,33 @@ mod tests {
         m.model_missing = vec!["ollama".into()];
         let t = build_table(&[n, m], &[], &Declarations::default());
         assert!(t.classes.is_empty(), "{:?}", t.classes);
+    }
+
+    /// 0.6.18 rc.2 rehearsal: a single-ollama box whose embed model (harrier)
+    /// is absent still serves chat; only the embed role is out.
+    #[test]
+    fn an_absent_embed_model_does_not_drop_the_backend_from_chat() {
+        let data = serde_json::json!({
+            "id": "solo", "ip_address": "127.0.0.1", "status": "online",
+            "running_backends": {"ollama": "qwen2.5:0.5b"},
+            "model_presence": {
+                "ollama": {"model": "qwen2.5:0.5b", "role": "chat", "present": true},
+                "ollama#embed": {"model": "harrier", "role": "embed", "present": false, "import_only": true}},
+            "last_heartbeat": 1000.0,
+        });
+        let f = node_facts_from_kv("solo", &data, &[], 1010.0);
+        assert!(f.model_missing.is_empty(), "{:?}", f.model_missing);
+        let t = build_table(&[f], &[], &Declarations::default());
+        assert!(!t.classes.is_empty(), "chat must still have a class: {:?}", t.classes);
+        assert!(crate::model_presence::role_model_missing(&data, "embed"), "embed is still out");
+        // The chat model absent: the backend is out of the chat pool, once.
+        let gone = serde_json::json!({
+            "id": "solo", "running_backends": {"ollama": "qwen2.5:0.5b"},
+            "model_presence": {
+                "ollama": {"model": "qwen2.5:0.5b", "role": "chat", "present": false},
+                "ollama#embed": {"model": "harrier", "role": "embed", "present": false}},
+        });
+        assert_eq!(node_facts_from_kv("solo", &gone, &[], 1010.0).model_missing, vec!["ollama"]);
     }
 
     // ── declared classes, aliases, degraded ───────────────────────────
