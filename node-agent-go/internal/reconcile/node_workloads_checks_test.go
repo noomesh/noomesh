@@ -161,6 +161,9 @@ func TestTheNodeFactsAreBuiltFromTheConfig(t *testing.T) {
 	if facts.Mode != nodepolicy.ModeApprove || !facts.ControllerHost {
 		t.Fatalf("facts mode %q controller_host %v, want approve and true (the config's)", facts.Mode, facts.ControllerHost)
 	}
+	if facts.Approvals == nil {
+		t.Fatal("the facts keep no approvals")
+	}
 	if list, err := facts.Approvals.List(); err != nil || len(list) != 1 || list[0].Addon != "rhaddon" {
 		t.Fatalf("approvals = %v, %v; they live under the config's StateDir", list, err)
 	}

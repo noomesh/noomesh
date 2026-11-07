@@ -4,8 +4,11 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -236,7 +239,16 @@ func TestAnInspectThatFailsChangesNothing(t *testing.T) {
 		h := newLife(t)
 		h.p.Converge(context.Background(), h.provisioned())
 		cp := h.chaos()
-		cp.inspectFail = func(string, int) error { return errDaemon }
+		// Only the look at the worker that decides the removal fails: the
+		// removal's own inspects would answer, so a removal that goes ahead
+		// anyway shows.
+		base := cp.inspectCount()
+		cp.inspectFail = func(_ string, n int) error {
+			if n == base+1 {
+				return errDaemon
+			}
+			return nil
+		}
 		before := len(h.api.callList())
 		e := h.provisioned()
 		e.State = nodewl.StateAbsent
@@ -256,8 +268,18 @@ func TestAnInspectThatFailsChangesNothing(t *testing.T) {
 		h.door.status("GET", doneP, 200)
 		h.p.Converge(context.Background(), h.running())
 		eventually(t, "ready", func() bool { return h.row().Ready })
+		h.p.Close() // no watcher left to take the failure
+		h.p.Wait()
 		cp := h.chaos()
-		cp.inspectFail = func(string, int) error { return errDaemon }
+		// Only the look that decides fails: the release's own inspects would
+		// answer, so a release that goes ahead anyway shows.
+		base := cp.inspectCount()
+		cp.inspectFail = func(_ string, n int) error {
+			if n == base+1 {
+				return errDaemon
+			}
+			return nil
+		}
 		before := len(h.api.callList())
 		h.p.Converge(context.Background(), h.provisioned())
 		h.p.Wait()
@@ -299,6 +321,28 @@ func TestARemovalThatFailsIsNotReportedAsDone(t *testing.T) {
 }
 
 // ---- reasons ----------------------------------------------------------------
+
+// A set still being fetched, or a worker that must drain first, is the
+// provisioner's routine "not yet": it is not logged as a convergence failure
+// on every pass.
+func TestWaitingForASetOrADrainIsNotLoggedAsAFailure(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	h := newLife(t)
+	e := h.provisioned()
+	h.p.refused(e, ErrSetsPending)
+	h.p.refused(e, ErrWorkerRunning)
+	h.p.refused(e, fmt.Errorf("wrapped: %w", ErrSetsPending))
+	if strings.Contains(buf.String(), "not converged") {
+		t.Fatalf("a routine wait was logged as a failure: %s", buf.String())
+	}
+	h.p.refused(e, errors.New("a real failure"))
+	if !strings.Contains(buf.String(), "not converged") {
+		t.Fatalf("a real failure was not logged: %q", buf.String())
+	}
+}
 
 // A verdict with no reason code is not a row reason, and a refusal that is not
 // the node's own (a set still arriving, a worker that must drain first) never
