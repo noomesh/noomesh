@@ -2280,7 +2280,7 @@ CREATE INDEX ix_connection_sources_account ON noo_connection_sources(account_id,
     sql: "ALTER TABLE noo_integration_sync ADD COLUMN last_gmail_scan timestamptz, ADD COLUMN last_page timestamptz; CREATE INDEX integration_sync_owner_pacing ON noo_integration_sync(owner_uuid)",
 }, Migration {
     revision: NODE_WORKLOAD_PLACEMENTS_REVISION,
-    down_revision: Some(REQUEST_TRACE_REVISION),
+    down_revision: Some(INTEGRATION_PACING_REVISION),
     // i300 H3b-2: an operator's placement of an add-on node workload on ONE
     // node (strict, no pool fallback in phase 2), the row desired-config's
     // `node_workloads` entries are built from. A table of its own, never a
@@ -2324,10 +2324,11 @@ pub const INTEGRATION_PAIRING_REVISION: &str = "108_integration_pairing";
 pub const INTEGRATION_CONTENT_REVISION: &str = "109_integration_content";
 pub const INTEGRATION_PACING_REVISION: &str = "110_integration_pacing";
 
-/// Add-on node-workload placements (i300 H3b-2). Number 113 is claimed:
-/// #799 holds 106-110 and i510 B1/B2 111/112; whichever lands later
-/// renumbers once. A constant so that is one line (and the down revision).
-pub const NODE_WORKLOAD_PLACEMENTS_REVISION: &str = "113_node_workload_placements";
+/// Add-on node-workload placements (i300 H3b-2), on #799's 110: renumbered
+/// once from its claimed 113 when #799 landed first (i510 B1/B2 take the
+/// numbers after it). A constant so a renumber is one line (and the down
+/// revision).
+pub const NODE_WORKLOAD_PLACEMENTS_REVISION: &str = "111_node_workload_placements";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
@@ -3264,14 +3265,14 @@ mod tests {
     }
 
     /// i300 H3b-2: the node-workload placements revision is the chain head,
-    /// sits on 105, fits the revision column, rewrites no row, and creates
+    /// sits on 110, fits the revision column, rewrites no row, and creates
     /// every column the repo writes, keyed one node per (addon, workload).
     #[test]
     fn node_workload_placements_revision_is_the_head_and_matches_its_writer() {
         let m = MIGRATIONS.iter().find(|m| m.revision == NODE_WORKLOAD_PLACEMENTS_REVISION).expect("must be in the chain");
-        assert_eq!(m.revision, "113_node_workload_placements");
+        assert_eq!(m.revision, "111_node_workload_placements");
         assert!(m.revision.len() <= 32);
-        assert_eq!(m.down_revision, Some(REQUEST_TRACE_REVISION));
+        assert_eq!(m.down_revision, Some(INTEGRATION_PACING_REVISION), "it sits on Google connections' pacing (110)");
         assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(NODE_WORKLOAD_PLACEMENTS_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_node_workload_placements"));
         assert!(m.sql.contains("PRIMARY KEY (addon, workload)"), "one node per workload: the operator's, strict");
@@ -3295,7 +3296,7 @@ mod tests {
         assert_eq!(m.down_revision, Some(ADDON_ACCESS_REVISION));
         let next = MIGRATIONS.iter().find(|n| n.down_revision == Some(REQUEST_TRACE_REVISION)).map(|n| n.revision);
         assert_eq!(next, Some(CONNECTIONS_REVISION), "Google connections build on request tracing");
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(INTEGRATION_PACING_REVISION), "the chain head");
+        assert!(MIGRATIONS.iter().any(|m| m.revision == INTEGRATION_PACING_REVISION), "110 is in the chain");
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_request_trace"));
         assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE"), "no row is rewritten or dropped");
         let writer = include_str!("repo/request_trace.rs");
@@ -3321,7 +3322,7 @@ mod tests {
         assert_eq!(m.revision, "102_embedding_space_migration");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(EMBED_PLACEMENT_MODEL_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(INTEGRATION_PACING_REVISION), "the chain head");
+        assert!(MIGRATIONS.iter().any(|m| m.revision == INTEGRATION_PACING_REVISION), "110 is in the chain");
         for col in [
             "next_model text", "next_dims integer", "migration_state text", "migration_progress jsonb",
             "migration_started_at timestamptz", "migration_reported_at timestamptz",
