@@ -11,9 +11,9 @@ export { createMetisClient } from './client.ts';
 export type { MetisClient, MetisClientOptions } from './client.ts';
 
 export { createAuthFetch, createBearerFetch, createTokenRefresher } from './auth.ts';
-export type { TokenStore, AuthFetchOptions, TokenRefreshOptions } from './auth.ts';
+export type { TokenStore, AuthFetchOptions, TokenRefreshOptions, CrossTab } from './auth.ts';
 
-export { memoryTokenStore, webTokenStore } from './stores.ts';
+export { memoryTokenStore } from './stores.ts';
 
 export { createAuthApi } from './authApi.ts';
 export type { AuthApi, AuthApiOptions, MeInfo } from './authApi.ts';

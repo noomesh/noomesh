@@ -9,12 +9,12 @@ import './app.css';
 import { App } from './App';
 import { ConfirmProvider } from '@/components/ConfirmDialog';
 import { Toaster } from '@/components/ui/sonner';
-import { client, authApi } from './lib/client';
+import { client, authApi, refreshToken } from './lib/client';
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <MetisProvider client={client}>
-      <AuthProvider authApi={authApi}>
+      <AuthProvider authApi={authApi} restore={refreshToken}>
         <ConfirmProvider>
           <App />
         </ConfirmProvider>
