@@ -295,11 +295,11 @@ mod tests {
     #[test]
     fn the_failed_alert_persists_names_the_restart_and_keeps_detail_out_of_the_text() {
         let r = check(body(BOOT, "failed", Some("refused_by_guard"), Some("raw launcher evidence".into()))).unwrap();
-        let a = failed_alert("pai-voice", &r, "rb");
+        let a = failed_alert("rhaddon", &r, "rb");
         assert_eq!(a.kind, ALERT_KIND);
-        assert_eq!(a.target, "pai-voice");
+        assert_eq!(a.target, "rhaddon");
         assert!(a.persisting);
-        assert_eq!(a.investigate.as_deref(), Some("noo stack restart pai-voice"));
+        assert_eq!(a.investigate.as_deref(), Some("noo stack restart rhaddon"));
         assert!(a.summary.contains("the add-on guards refused"), "{}", a.summary);
         assert!(!a.summary.contains("raw launcher"), "detail must not reach the summary: {}", a.summary);
         assert!(a.detail.contains("raw launcher evidence") && a.detail.contains(BOOT));
@@ -307,8 +307,8 @@ mod tests {
 
     #[test]
     fn started_clears_the_same_kind_and_target() {
-        let c = recovered_alert("pai-voice");
-        assert_eq!((c.kind.as_str(), c.target.as_str()), (ALERT_KIND, "pai-voice"));
+        let c = recovered_alert("rhaddon");
+        assert_eq!((c.kind.as_str(), c.target.as_str()), (ALERT_KIND, "rhaddon"));
         assert!(!c.persisting);
     }
 
