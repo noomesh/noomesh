@@ -81,7 +81,8 @@ export function createTokenRefresher(opts: TokenRefreshOptions): () => Promise<s
     refreshInFlight = (async () => {
       const before = await tokenStore.get();
       const locked = <T,>(cb: () => Promise<T>): Promise<T> =>
-        crossTab?.locks ? crossTab.locks.request(lockName, cb) : cb();
+        // MUTANT: the refresh no longer holds the cross-tab lock.
+        crossTab?.locks && lockName === '' ? crossTab.locks.request(lockName, cb) : cb();
       const fresh = await locked(async () => {
         // A tab that refreshed while this one waited has already shared its
         // token: use it rather than spend the cookie a second time.
