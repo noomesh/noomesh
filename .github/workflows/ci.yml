@@ -749,6 +749,16 @@ jobs:
         SQLX_OFFLINE: "true"
       run: CARGO_DOCKER_CRATE="$PWD/gateway-rust" scripts/cargo-docker.sh test --locked
 
+    # crates/addon-manifest holds the add-on manifest security checks. It is a
+    # path dependency with no workspace and no lockfile of its own, so the step
+    # above (gateway-rust's own tests) never runs its unit tests. Run them
+    # through gateway-rust's lockfile so --locked still holds.
+    - name: cargo test (addon-manifest)
+      if: needs.scope.outputs.gateway == 'true'
+      env:
+        SQLX_OFFLINE: "true"
+      run: CARGO_DOCKER_CRATE="$PWD/gateway-rust" scripts/cargo-docker.sh test --locked -p addon-manifest
+
 
     # Prune before saving: incremental dirs, the crate's own (test) binaries
     # and top-level outputs go; dependency artifacts stay. A target still over
