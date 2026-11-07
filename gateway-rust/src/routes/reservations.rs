@@ -357,6 +357,20 @@ async fn resolve_workload(
     Ok((managed_decl(addon, d, need), Some(Managed { node: row.node_id }), managed_ready_secs(d.health.start_secs)))
 }
 
+/// The node's heartbeat row for `addon`/`name` (`node_workloads`), if any.
+pub(crate) fn node_workload_row<'a>(record: &'a Value, addon: &str, name: &str) -> Option<&'a Value> {
+    record.get("node_workloads")?.as_array()?.iter().find(|r| {
+        r.get("addon").and_then(Value::as_str) == Some(addon) && r.get("name").and_then(Value::as_str) == Some(name)
+    })
+}
+
+/// A new session is refused while the node reports the workload `draining`
+/// (docs/reference/node-workloads.md, reported states). Any other state, or
+/// no row (an unknown is not a drain), lets it through.
+pub(crate) fn refuses_new_session(row: Option<&Value>) -> bool {
+    row.and_then(|r| r.get("state")).and_then(Value::as_str) == Some("draining")
+}
+
 /// Drain and stop a workload on a node: the add-on's declared drain route,
 /// then the actuator's stop. `force` carries on past a failed drain. A node
 /// workload's row (`managed`: the state and its node) goes back to
@@ -631,14 +645,19 @@ async fn workload_status(
     if !own && r.role < crate::auth::Role::Operator {
         return Err(AppError::Forbidden(format!("only the add-on {addon} itself or an operator may read its workloads")));
     }
-    let Some(decl) = crate::addon_workloads::lookup(&addon, &workload) else {
-        return Err(AppError::NotFound(format!("no verified add-on bundle declares workload {addon}/{workload}")));
-    };
+    let (decl, managed, _) = resolve_workload(&state, &addon, &workload).await?;
     let key = decl.key();
     let res = all_reservations(&state).await.into_iter().find(|r| r["workload"] == key);
     let reserved = res.as_ref().is_some_and(|r| r["state"] == "held");
-    Ok(Json(json!({"workload": key, "container": decl.container, "reserved": reserved,
-        "reservation": res.map(|r| json!({"id": r["id"], "node": r["node"], "holder": r["holder"], "state": r["state"], "since": r["since"], "generation": r["generation"]}))})))
+    let mut out = json!({"workload": key, "container": decl.container, "reserved": reserved,
+        "reservation": res.map(|r| json!({"id": r["id"], "node": r["node"], "holder": r["holder"], "state": r["state"], "since": r["since"], "generation": r["generation"]}))});
+    // A node workload: what its node reports (heartbeat `node_workloads`).
+    if let Some(m) = &managed {
+        let record = node_records(&state).await.into_iter().find(|(id, _)| id == &m.node).map(|(_, r)| r).unwrap_or(json!({}));
+        out["node"] = json!(m.node);
+        out["node_workload"] = node_workload_row(&record, &addon, &workload).cloned().unwrap_or(Value::Null);
+    }
+    Ok(Json(out))
 }
 
 // ── the workload proxy ───────────────────────────────────────────────────
@@ -666,15 +685,21 @@ async fn workload_proxy(
     if !own && r.role < crate::auth::Role::Operator {
         return Err(AppError::Forbidden(format!("only the add-on {addon} itself or an operator may reach its workloads")));
     }
-    let Some(decl) = crate::addon_workloads::lookup(&addon, &workload) else {
-        return Err(AppError::NotFound(format!("no verified add-on bundle declares workload {addon}/{workload}")));
-    };
+    let (decl, managed, _) = resolve_workload(&state, &addon, &workload).await?;
     let key = decl.key();
     let Some(res) = all_reservations(&state).await.into_iter().find(|r| r["workload"] == key && r["state"] == "held") else {
         return Err(AppError::Conflict(format!("not_reserved: {key} holds no GPU right now (noo cluster reserve {key})")));
     };
     let reservation = res["id"].as_str().unwrap_or("").to_string();
     let node = res["node"].as_str().unwrap_or("").to_string();
+    // A node workload that is draining takes no NEW session (a WebSocket is
+    // a session); requests on the sessions it still serves pass.
+    if managed.is_some() && is_websocket_upgrade(&parts.headers) {
+        let record = node_records(&state).await.into_iter().find(|(id, _)| id == &node).map(|(_, r)| r).unwrap_or(json!({}));
+        if refuses_new_session(node_workload_row(&record, &addon, &workload)) {
+            return Err(AppError::Conflict(format!("draining: {key} is draining on {node} and takes no new session")));
+        }
+    }
     let link = crate::node_link::NodeLink::for_node(&state, &node).await?;
     let query = parts.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
     let upstream = format!("/api/containers/{}/proxy/{}{query}", decl.container, path.trim_start_matches('/'));
@@ -945,6 +970,33 @@ mod tests {
         let lock: std::collections::BTreeSet<String> = [w["image"].as_str().unwrap().to_string()].into();
         let file = json!({"format": "noo-addon-node-workloads/1", "workloads": [w]});
         crate::node_workloads::validate_decl(file.to_string().as_bytes(), "rhaddon", &lock, None).unwrap().workloads.remove(0)
+    }
+
+    #[test]
+    fn a_draining_node_workload_refuses_a_new_session_and_nothing_else_does() {
+        let rec = json!({"node_workloads": [
+            {"addon": "rhaddon", "name": "worker", "state": "draining", "ready": true, "door_port": 8443},
+            {"addon": "rhaddon", "name": "other", "state": "running", "ready": true, "door_port": 8443}]});
+        assert!(refuses_new_session(node_workload_row(&rec, "rhaddon", "worker")));
+        assert!(!refuses_new_session(node_workload_row(&rec, "rhaddon", "other")), "running takes sessions");
+        assert!(!refuses_new_session(node_workload_row(&rec, "rhaddon", "missing")), "no row is not a drain");
+        assert!(!refuses_new_session(node_workload_row(&json!({}), "rhaddon", "worker")));
+        for st in ["provisioned", "needs_attention", "absent"] {
+            let r = json!({"addon": "a", "name": "w", "state": st});
+            assert!(!refuses_new_session(Some(&r)), "{st}");
+        }
+    }
+
+    /// The proxy checks the drain for a node workload's NEW session (a
+    /// WebSocket upgrade) before it relays anything.
+    #[test]
+    fn the_proxy_refuses_a_new_session_while_draining_before_relaying() {
+        let src = include_str!("reservations.rs");
+        let body = src.split("async fn workload_proxy(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        let check = body.find("refuses_new_session(").expect("the drain check");
+        let relay = body.find("ws.on_upgrade(").expect("the relay");
+        assert!(check < relay, "the check comes first");
+        assert!(body.contains("resolve_workload(&state, &addon, &workload)"), "node workloads are resolved, not only i163 ones");
     }
 
     #[test]
