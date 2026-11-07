@@ -325,9 +325,14 @@ mod tests {
 
     #[test]
     fn disk_counts_unheld_sets_plus_the_agents_margin() {
-        // 15 GiB set + 10 % margin (1.5 GiB) = 16.5 GiB.
-        assert_eq!(code_of(&with("data_root_free_gb", json!(16.4)), &needs()), code::DISK);
-        assert_eq!(check(&with("data_root_free_gb", json!(16.5)), &needs()), Ok(()));
+        // A 25 GiB set + 10 % margin (2.5 GiB, above the 2 GiB floor) = 27.5 GiB.
+        let mut big = needs();
+        big.sets[0].bytes = 25 * GIB;
+        assert_eq!(code_of(&with("data_root_free_gb", json!(27.4)), &big), code::DISK);
+        assert_eq!(check(&with("data_root_free_gb", json!(27.5)), &big), Ok(()));
+        // 15 GiB: 10 % is 1.5 GiB, so the 2 GiB floor wins: 17 GiB.
+        assert_eq!(code_of(&with("data_root_free_gb", json!(16.9)), &needs()), code::DISK);
+        assert_eq!(check(&with("data_root_free_gb", json!(17.0)), &needs()), Ok(()));
         assert_eq!(code_of(&without("data_root_free_gb"), &needs()), code::DISK);
         // A small set still keeps the 2 GiB floor.
         let mut small = needs();
