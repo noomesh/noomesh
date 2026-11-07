@@ -1164,7 +1164,7 @@ mod tests {
         let proxy = crate::test_src::fn_body(&own, "async fn workload_proxy(");
         assert!(proxy.contains("r[\"state\"] == \"held\""), "only a reserved workload is reachable");
         assert!(proxy.contains("decl.container"), "the container comes from the declaration, never the caller");
-        assert!(proxy.find("r.role < crate::auth::Role::Operator").unwrap() < proxy.find("lookup(&addon").unwrap(), "identity before anything is looked up");
+        assert!(proxy.find("r.role < crate::auth::Role::Operator").unwrap() < proxy.find("resolve_workload(&state, &addon").unwrap(), "identity before anything is looked up");
         let relay = crate::test_src::fn_body(&own, "async fn relay_websocket(");
         assert!(relay.contains("CLOSE_RESERVATION_ENDED"), "a relayed stream closes with the reservation");
         assert_eq!(CLOSE_RESERVATION_ENDED, 4001);
