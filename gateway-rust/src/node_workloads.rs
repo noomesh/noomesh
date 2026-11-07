@@ -118,6 +118,7 @@ pub mod code {
     pub const START_TIMEOUT: &str = "start_timeout";
     pub const CRASHED: &str = "crashed";
     pub const DRAIN_TIMEOUT: &str = "drain_timeout";
+    pub const DOOR_UNREACHABLE: &str = "door_unreachable";
 
     /// The agent's reason vocabulary, in the contract's order (reasons.go).
     pub const REASONS: &[&str] = &[
@@ -144,6 +145,7 @@ pub mod code {
         START_TIMEOUT,
         CRASHED,
         DRAIN_TIMEOUT,
+        DOOR_UNREACHABLE,
     ];
 }
 
