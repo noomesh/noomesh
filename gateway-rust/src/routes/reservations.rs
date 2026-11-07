@@ -361,27 +361,61 @@ async fn resolve_workload(
 
 // ── add-on-scoped reserve and release (i300 H5, A5) ──────────────────────
 //
-// An add-on reserves and releases ITS OWN placed node workload with its own
-// key (`sub = addon:<addon>`, the front door's `proxy_allows`): D2 runs a
-// worker on demand. The node is the operator's placement (strict), so the
-// add-on has no node choice; it cannot hand over, force, or reach an i163
-// container workload or another add-on's. An operator keeps
-// /api/cluster/reservations.
+// An add-on reserves and releases ITS OWN placed node workload FOR A PERSON
+// (operator decision 2026-11-07, "check the person"): D2 runs a worker on
+// demand, and who it runs for is a person f99 decides on. The add-on
+// presents the i143 delegated token the gateway minted for that person's
+// proxied request (`sub` = the person, `act.sub = addon:<addon>`, `act.feature`
+// = the add-on feature it was minted under); its service key alone is
+// refused. Fail closed: no delegation, no person, another add-on, no feature
+// named, or a feature f99 turns off for the person, is a 403. The reservation
+// records both (holder `addon:<addon>/<person>`), so audit names the person
+// and only the same person, through the same add-on, releases it.
+// Unchanged: the node is the operator's placement (strict), and the add-on
+// cannot hand over, force, or reach an i163 workload or another add-on's.
+// An operator keeps /api/cluster/reservations.
 
-/// The caller may reserve `addon`'s workloads here: its own key, nothing else.
-pub(crate) fn addon_may_reserve(sub: &str, addon: &str) -> bool {
-    crate::addon_registry::name_ok(addon) && sub == format!("{}{addon}", crate::auth::ADDON_SUBJECT_PREFIX)
+/// The holder a delegated reserve records, `addon:<addon>/<person>`, or why
+/// the caller is refused: it must be `addon`'s delegated token, for a person.
+pub(crate) fn delegated_holder(sub: &str, act_sub: Option<&str>, addon: &str) -> Result<String, String> {
+    if !crate::addon_registry::name_ok(addon) {
+        return Err(format!("{addon:?} is not an add-on name"));
+    }
+    if act_sub != Some(format!("{}{addon}", crate::auth::ADDON_SUBJECT_PREFIX).as_str()) {
+        return Err(format!("{addon} reserves for a person: present the delegated token of the person it acts for"));
+    }
+    let person = crate::auth::account_of(sub);
+    if person.is_empty() || person.starts_with(crate::auth::ADDON_SUBJECT_PREFIX) || person.starts_with("key:") {
+        return Err("the delegated token names no person".into());
+    }
+    Ok(format!("{}{addon}/{person}", crate::auth::ADDON_SUBJECT_PREFIX))
 }
 
-/// The requester of an add-on-scoped call, held to [`addon_may_reserve`].
+/// f99 against the person: the delegated token must name the add-on feature
+/// it was minted under, and the person must hold it (`holds`). No feature
+/// named is refused: there is then nothing f99 could decide.
+pub(crate) fn person_admitted(feature: Option<&str>, holds: impl Fn(&str) -> bool) -> Result<(), String> {
+    let Some(f) = feature.filter(|f| !f.is_empty()) else {
+        return Err("the delegated token names no add-on feature, so f99 cannot admit the person".into());
+    };
+    if holds(f) {
+        Ok(())
+    } else {
+        Err(format!("the add-on feature {f:?} is off for this person"))
+    }
+}
+
+/// The requester of an add-on-scoped call, held to [`delegated_holder`] and
+/// [`person_admitted`]; the holder it reserves as.
 fn addon_caller(ctx: Option<&axum::Extension<crate::auth::RequesterCtx>>, addon: &str) -> Result<String, AppError> {
     let Some(axum::Extension(r)) = ctx else {
         return Err(AppError::Forbidden("a credential is required".into()));
     };
-    if !addon_may_reserve(&r.sub, addon) {
-        return Err(AppError::Forbidden(format!("only the add-on {addon} itself may reserve or release its workloads here")));
-    }
-    Ok(r.sub.clone())
+    let holder = delegated_holder(&r.sub, r.act.as_ref().map(|a| a.sub.as_str()), addon).map_err(AppError::Forbidden)?;
+    let person = crate::auth::account_of(&r.sub);
+    let feature = r.act.as_ref().and_then(|a| a.feature.as_deref());
+    person_admitted(feature, |f| crate::addon_access::feature_allows(addon, f, person, r.role).allowed).map_err(AppError::Forbidden)?;
+    Ok(holder)
 }
 
 /// POST /api/addon-workloads/{addon}/{workload}/reserve — body `{timeout_secs?}`.
@@ -1073,12 +1107,38 @@ mod tests {
     }
 
     #[test]
-    fn only_the_addons_own_key_reserves_its_workloads() {
-        assert!(addon_may_reserve("addon:rhaddon", "rhaddon"));
-        assert!(!addon_may_reserve("addon:otheraddon", "rhaddon"), "another add-on");
-        assert!(!addon_may_reserve("user:admin", "rhaddon"), "an operator uses /api/cluster/reservations");
-        assert!(!addon_may_reserve("addon:", ""), "no name");
-        assert!(!addon_may_reserve("addon:../rhaddon", "../rhaddon"), "not a name");
+    fn a_reserve_is_for_a_person_through_the_addons_own_delegation() {
+        let act = Some("addon:rhaddon");
+        assert_eq!(delegated_holder("alice", act, "rhaddon").as_deref(), Ok("addon:rhaddon/alice"), "the person is recorded");
+        assert!(delegated_holder("addon:rhaddon", None, "rhaddon").is_err(), "the service key alone: no person");
+        assert!(delegated_holder("alice", None, "rhaddon").is_err(), "a person's own token is not the add-on acting");
+        assert!(delegated_holder("alice", Some("addon:otheraddon"), "rhaddon").is_err(), "another add-on's delegation");
+        assert!(delegated_holder("", act, "rhaddon").is_err(), "no person");
+        assert!(delegated_holder("addon:rhaddon", act, "rhaddon").is_err(), "an add-on is not a person");
+        assert!(delegated_holder("key:svc", act, "rhaddon").is_err(), "a service key is not a person");
+        assert!(delegated_holder("alice", Some("addon:../rhaddon"), "../rhaddon").is_err(), "not a name");
+        assert_ne!(delegated_holder("alice", act, "rhaddon"), delegated_holder("bob", act, "rhaddon"), "two people hold two different reservations");
+    }
+
+    #[test]
+    fn f99_decides_on_the_person_and_fails_closed() {
+        assert_eq!(person_admitted(Some("converse"), |f| f == "converse"), Ok(()));
+        assert!(person_admitted(Some("converse"), |_| false).is_err(), "the feature is off for the person");
+        assert!(person_admitted(None, |_| true).is_err(), "no feature named: nothing to decide, refused");
+        assert!(person_admitted(Some(""), |_| true).is_err());
+    }
+
+    /// The handler holds every add-on call to the person's delegation and f99.
+    #[test]
+    fn the_addon_routes_decide_the_person_before_anything_else() {
+        let src = include_str!("reservations.rs");
+        let caller = src.split("fn addon_caller(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        assert!(caller.contains("delegated_holder(") && caller.contains("person_admitted("), "{caller}");
+        assert!(caller.contains("crate::addon_access::feature_allows(addon, f, person, r.role).allowed"), "f99 itself decides");
+        for f in ["async fn addon_reserve(", "async fn addon_release("] {
+            let body = src.split(f).nth(1).unwrap().split("\nasync fn ").next().unwrap();
+            assert!(body.trim_start().contains("let actor = addon_caller(ctx.as_ref(), &addon)?;"), "{f}");
+        }
     }
 
     /// The add-on cannot choose the node, hand over or force: its take names

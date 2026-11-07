@@ -2825,6 +2825,12 @@ pub fn requester_allows(requester: &RequesterCtx, method: &axum::http::Method, p
     if crate::addon_workloads::proxy_allows(&requester.sub, path) {
         return true;
     }
+    // i300 H5: an add-on's delegated token (the person as `sub`) reaches ITS
+    // OWN add-on's reserve and release; the handler decides f99 against the
+    // person and records them on the reservation.
+    if crate::addon_workloads::delegated_reserve_allows(requester.act.as_ref().map(|a| a.sub.as_str()), path) {
+        return true;
+    }
     scope_allows_for(&requester.scopes, requester.role, Some(account_of(&requester.sub)), method, path)
 }
 
