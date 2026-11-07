@@ -44,8 +44,10 @@ pub const WORKLOADS_FILE: &str = "workloads.json";
 /// reads before any copy an overlay delivers); the gateway validates it.
 /// When the bundle has one, drain routes are checked against it here too.
 pub const ROUTES_FILE: &str = "routes.json";
-/// The declaration files the launcher copies for the gateway.
-pub const DECL_FILES: &[&str] = &[SYSTEM_FILE, WORKLOADS_FILE, ROUTES_FILE];
+/// The declaration files the launcher copies for the gateway. i300 H3b:
+/// node-workloads.json joins them (the gateway places and builds
+/// desired-config entries from it).
+pub const DECL_FILES: &[&str] = &[SYSTEM_FILE, WORKLOADS_FILE, ROUTES_FILE, super::node_workloads::NODE_WORKLOADS_FILE];
 /// The bundle files the checks read: the declarations, `resources.json` and
 /// the overlay. [`materialised`] and `noo addons check` read the same names.
 pub const CHECKED_FILES: &[&str] = &[SYSTEM_FILE, WORKLOADS_FILE, ROUTES_FILE, super::resources::RESOURCES_FILE, "docker-compose.yml"];
