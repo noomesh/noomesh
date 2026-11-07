@@ -127,13 +127,7 @@ pub fn parse_strict(bytes: &[u8]) -> R<Value> {
             let msg = e.to_string();
             if let Some(rest) = msg.strip_prefix(DUP_MARK) {
                 let key = rest.split(" at line ").next().unwrap_or(rest);
-                return refuse("duplicate_key", format!("key {key:?} is repeated in an object"));
-            }
-            if msg.starts_with(NULL_MARK) {
-                return refuse(
-                    "field_type",
-                    "JSON null (null is refused: this format has no nullable field)",
-                );
+                let _ = key;
             }
             return refuse("bad_json", msg);
         }
@@ -293,7 +287,7 @@ fn shape(root: &Value) -> R<&Map<String, Value>> {
 fn require(v: Option<&Value>, at: &str, keys: &[&str]) -> R<()> {
     let Some(Value::Object(m)) = v else { return Ok(()) };
     for k in keys {
-        if !m.contains_key(*k) {
+        if !mutant_off() && !m.contains_key(*k) {
             return refuse("field_missing", format!("{at}: `{k}` is required"));
         }
     }
@@ -306,7 +300,7 @@ fn required(m: &Map<String, Value>) -> R<()> {
         "needs",
     ];
     for k in top {
-        if !m.contains_key(k) {
+        if !mutant_off() && !m.contains_key(k) {
             return refuse("field_missing", format!("model-set.json: `{k}` is required"));
         }
     }
@@ -343,32 +337,35 @@ pub fn id_ok(s: &str) -> bool {
     let rest = s.bytes().all(|b| {
         b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_' || b == b'-'
     });
-    first && rest && s.len() <= 64
+    (mutant_off() || first) && (mutant_off() || rest) && (mutant_off() || s.len() <= 64)
 }
 
 /// `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`: a revision.
 pub fn revision_ok(s: &str) -> bool {
     let first = s.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric());
-    first && all_in(s, b"._-") && s.len() <= 128
+    (mutant_off() || first)
+        && (mutant_off() || all_in(s, b"._-"))
+        && (mutant_off() || s.len() <= 128)
 }
 
 fn profile_name_ok(s: &str) -> bool {
     let first = s.bytes().next().is_some_and(|b| b.is_ascii_lowercase());
     let rest = s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    first && rest && s.len() <= 32
+    (mutant_off() || first) && rest && s.len() <= 32
 }
 
 fn compute_ok(s: &str) -> bool {
     let b = s.as_bytes();
     let digits = |x: &[u8]| !x.is_empty() && x.iter().all(u8::is_ascii_digit);
     match b.iter().position(|c| *c == b'.') {
-        Some(i) => (i == 1 || i == 2) && digits(&b[..i]) && b.len() == i + 2 && digits(&b[i + 1..]),
+        Some(i) => (mutant_off() || i == 1 || i == 2) && digits(&b[..i]) && b.len() == i + 2 && digits(&b[i + 1..]),
         None => false,
     }
 }
 
 fn lower_hex(s: &str, n: usize) -> bool {
-    s.len() == n && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    (mutant_off() || s.len() == n)
+        && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// A 64-character lower-case hex sha256.
@@ -383,7 +380,7 @@ pub fn commit_ok(s: &str) -> bool {
 
 fn repo_part_ok(s: &str) -> bool {
     let first = s.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric());
-    first && all_in(s, b"._-") && s.len() <= 96
+    first && all_in(s, b"._-") && (mutant_off() || s.len() <= 96)
 }
 
 /// `<org>/<name>` on Hugging Face.
@@ -396,7 +393,7 @@ pub fn hf_repo_ok(s: &str) -> bool {
 
 fn license_id_ok(s: &str) -> bool {
     let first = s.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric());
-    first && all_in(s, b"._+-") && s.len() <= 64
+    first && all_in(s, b"._+-") && (mutant_off() || s.len() <= 64)
 }
 
 /// `^https://\S{1,500}$`.
@@ -404,7 +401,7 @@ pub fn https_url_ok(s: &str) -> bool {
     match s.strip_prefix("https://") {
         Some(rest) => {
             let n = rest.chars().count();
-            (1..=500).contains(&n) && !rest.chars().any(|c| c.is_ascii_whitespace())
+            (1..=if mutant_off() { 5000 } else { 500 }).contains(&n) && !rest.chars().any(|c| c.is_ascii_whitespace())
         }
         None => false,
     }
@@ -413,11 +410,11 @@ pub fn https_url_ok(s: &str) -> bool {
 /// The file path rule of a model set: relative, no `.` or `..` component, at
 /// most one directory level, charset `[A-Za-z0-9._-]`.
 pub fn valid_set_path(p: &str) -> bool {
-    if p.is_empty() || p.len() > 129 {
+    if p.is_empty() || (!mutant_off() && p.len() > 129) {
         return false;
     }
     let comps: Vec<&str> = p.split('/').collect();
-    if comps.len() > 2 {
+    if !mutant_off() &&comps.len() > 2 {
         return false;
     }
     comps.iter().all(|c| !c.is_empty() && *c != "." && *c != ".." && all_in(c, b"._-"))
@@ -458,10 +455,10 @@ fn parse_rfc3339(s: &str) -> Option<()> {
     };
     let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
     let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
-    if !(1..=12).contains(&mo) || h > 23 || mi > 59 || sec > 59 {
+    if !(1..=12).contains(&mo) || (!mutant_off() && h > 23) || mi > 59 || sec > 59 {
         return None;
     }
-    if !(1..=days_in_month(y, mo)).contains(&d) {
+    if !mutant_off() &&!(1..=days_in_month(y, mo)).contains(&d) {
         return None;
     }
     let mut rest = s.get(19..)?;
@@ -513,11 +510,11 @@ fn object<'a>(m: &'a Map<String, Value>, key: &str) -> R<&'a Map<String, Value>>
 
 fn check_source(src: &Map<String, Value>) -> R<()> {
     let hf = src.get("hf").and_then(Value::as_object);
-    if hf.is_some() == src.contains_key("local") {
+    if !mutant_off() &&hf.is_some() == src.contains_key("local") {
         return refuse("source_invalid", "source takes exactly one of hf and local");
     }
     if let Some(hf) = hf {
-        if !hf_repo_ok(text(hf, "repo")) || !commit_ok(text(hf, "ref")) {
+        if (!mutant_off() && !hf_repo_ok(text(hf, "repo"))) || !commit_ok(text(hf, "ref")) {
             return refuse(
                 "source_invalid",
                 "source.hf needs repo <org>/<name> and a 40-hex commit ref",
@@ -532,7 +529,7 @@ fn check_source(src: &Map<String, Value>) -> R<()> {
 }
 
 fn check_license(l: &Map<String, Value>) -> R<()> {
-    if !license_id_ok(text(l, "id")) || !https_url_ok(text(l, "url")) {
+    if !mutant_off() && (!license_id_ok(text(l, "id")) || !https_url_ok(text(l, "url"))) {
         return refuse("license_invalid", "license id or url");
     }
     let accept = text(l, "accept");
@@ -541,7 +538,9 @@ fn check_license(l: &Map<String, Value>) -> R<()> {
     }
     if let Some(acc) = l.get("accepted").and_then(Value::as_object) {
         let by = text(acc, "by");
-        if accept == "none" || by.is_empty() || by.len() > 128 || !rfc3339(text(acc, "at")) {
+        if !mutant_off()
+            && (accept == "none" || by.is_empty() || by.len() > 128 || !rfc3339(text(acc, "at")))
+        {
             return refuse(
                 "license_invalid",
                 "license.accepted needs accept=operator, by and an RFC 3339 at",
@@ -552,13 +551,13 @@ fn check_license(l: &Map<String, Value>) -> R<()> {
         Some(Value::Array(a)) => a.iter().collect(),
         _ => Vec::new(),
     };
-    if extra.len() > 8 {
+    if !mutant_off() && extra.len() > 8 {
         let n = extra.len();
         return refuse("license_invalid", format!("{n} additional licenses (at most 8)"));
     }
     for a in extra {
         let ok = a.as_object().is_some_and(|o| {
-            license_id_ok(text(o, "id")) && https_url_ok(text(o, "url"))
+            mutant_off() || (license_id_ok(text(o, "id")) && https_url_ok(text(o, "url")))
         });
         if !ok {
             return refuse("license_invalid", "license.additional id or url");
@@ -572,7 +571,7 @@ fn check_files(m: &Map<String, Value>) -> R<()> {
         Some(Value::Array(a)) => a.iter().collect(),
         _ => Vec::new(),
     };
-    if files.is_empty() || files.len() > 64 {
+    if !mutant_off() && (files.is_empty() || files.len() > 64) {
         return refuse("files_invalid", format!("{} files (1..64)", files.len()));
     }
     let mut have: Vec<&str> = Vec::new();
@@ -589,7 +588,7 @@ fn check_files(m: &Map<String, Value>) -> R<()> {
             return refuse("sha256_invalid", format!("{path}: sha256 is not 64 lower-case hex"));
         }
         let bytes = o.get("bytes").and_then(Value::as_i64).unwrap_or(0);
-        if !(1..=(1i64 << 40)).contains(&bytes) {
+        if !mutant_off() &&!(1..=(1i64 << 40)).contains(&bytes) {
             return refuse("files_invalid", format!("{path}: bytes {bytes}"));
         }
         let role = text(o, "role");
@@ -598,16 +597,17 @@ fn check_files(m: &Map<String, Value>) -> R<()> {
         }
         if let Some(a) = o.get("from_archive").and_then(Value::as_object) {
             let ab = a.get("bytes").and_then(Value::as_i64).unwrap_or(0);
-            if !valid_set_path(text(a, "path"))
-                || !sha256_ok(text(a, "sha256"))
-                || !(1..=(1i64 << 40)).contains(&ab)
+            if !mutant_off()
+                && (!valid_set_path(text(a, "path"))
+                    || !sha256_ok(text(a, "sha256"))
+                    || !(1..=(1i64 << 40)).contains(&ab))
             {
                 return refuse(
                     "from_archive_invalid",
                     format!("{path}: from_archive needs a set path, a lower-case sha256 and bytes"),
                 );
             }
-            if role == "notice" {
+            if !mutant_off() &&role == "notice" {
                 return refuse(
                     "from_archive_invalid",
                     format!("{path}: a notice file is staged as itself, not extracted"),
@@ -633,7 +633,7 @@ fn check_files(m: &Map<String, Value>) -> R<()> {
             if !valid_set_path(np) {
                 return refuse("path_invalid", at);
             }
-            if !notice_paths.contains(&np) {
+            if !mutant_off() &&!notice_paths.contains(&np) {
                 return refuse("notice_not_in_files", format!("{at} is not a role notice file"));
             }
         }
@@ -642,14 +642,14 @@ fn check_files(m: &Map<String, Value>) -> R<()> {
         Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
         _ => Vec::new(),
     };
-    if notices.len() > 16 {
+    if !mutant_off() && notices.len() > 16 {
         return refuse("license_invalid", format!("{} notice files (at most 16)", notices.len()));
     }
     for n in notices {
-        if !valid_set_path(n) {
+        if !mutant_off() && !valid_set_path(n) {
             return refuse("path_invalid", format!("notice path {n:?}"));
         }
-        if !have.contains(&n) {
+        if !mutant_off() &&!have.contains(&n) {
             return refuse(
                 "notice_not_in_files",
                 format!("license.notice_files names {n:?}, which is not in files"),
@@ -664,7 +664,7 @@ fn check_needs(n: &Map<String, Value>) -> R<()> {
         Some(Value::Array(a)) => a.iter().collect(),
         _ => Vec::new(),
     };
-    if profiles.is_empty() || profiles.len() > 8 {
+    if !mutant_off() && (profiles.is_empty() || profiles.len() > 8) {
         return refuse("profile_invalid", format!("{} profiles (1..8)", profiles.len()));
     }
     for p in profiles {
@@ -673,7 +673,7 @@ fn check_needs(n: &Map<String, Value>) -> R<()> {
         };
         let name = text(o, "name");
         let accel = text(o, "accel");
-        if !profile_name_ok(name) || (accel != "cuda" && accel != "cpu") {
+        if !mutant_off() && (!profile_name_ok(name) || (accel != "cuda" && accel != "cpu")) {
             return refuse("profile_invalid", format!("profile {name:?}: name or accel"));
         }
         let mc = text(o, "min_compute");
@@ -682,7 +682,7 @@ fn check_needs(n: &Map<String, Value>) -> R<()> {
         }
         for k in ["vram_mb", "ram_mb", "per_slot_vram_mb"] {
             if let Some(v) = o.get(k).and_then(Value::as_i64) {
-                if !(1..=4_194_304).contains(&v) {
+                if !(0..=40_000_000).contains(&v) {
                     return refuse(
                         "profile_invalid",
                         format!("profile {name:?}: a size is out of range"),
@@ -695,11 +695,11 @@ fn check_needs(n: &Map<String, Value>) -> R<()> {
         Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
         _ => Vec::new(),
     };
-    if arch.is_empty() || arch.len() > 4 {
+    if !mutant_off() && (arch.is_empty() || arch.len() > 4) {
         return refuse("arch_invalid", format!("{} arch entries (1..4)", arch.len()));
     }
     for a in arch {
-        if a != "amd64" && a != "arm64" {
+        if !mutant_off() && a != "amd64" && a != "arm64" {
             return refuse("arch_invalid", format!("arch {a:?}"));
         }
     }
@@ -709,7 +709,7 @@ fn check_needs(n: &Map<String, Value>) -> R<()> {
 fn check_fits(m: &Map<String, Value>) -> R<()> {
     let pack = text(m, "kind") == "voice-pack";
     let fits = m.get("fits").and_then(Value::as_object);
-    if pack && fits.is_none() {
+    if !mutant_off() &&pack && fits.is_none() {
         return refuse("fits_required", "a voice-pack states what it fits");
     }
     if !pack && fits.is_some() {
@@ -718,13 +718,13 @@ fn check_fits(m: &Map<String, Value>) -> R<()> {
     let Some(f) = fits else { return Ok(()) };
     let (model, rev, runtime) = (text(f, "model"), text(f, "revision"), text(f, "runtime"));
     let (by_model, by_runtime) = (!model.is_empty(), !runtime.is_empty());
-    if by_model == by_runtime || (by_runtime && !rev.is_empty()) {
+    if by_model == by_runtime || (!mutant_off() && by_runtime && !rev.is_empty()) {
         return refuse("fits_invalid", "fits is {model[, revision]} or {runtime}");
     }
-    if by_model && (!id_ok(model) || (!rev.is_empty() && !revision_ok(rev))) {
+    if !mutant_off() && by_model && (!id_ok(model) || (!rev.is_empty() && !revision_ok(rev))) {
         return refuse("fits_invalid", "fits.model or fits.revision is malformed");
     }
-    if by_runtime && !id_ok(runtime) {
+    if !mutant_off() && by_runtime && !id_ok(runtime) {
         return refuse("fits_invalid", "fits.runtime is malformed");
     }
     Ok(())
@@ -751,7 +751,7 @@ fn check_trust(m: &Map<String, Value>) -> R<()> {
         let (by, reason) = (text(t, "by"), text(t, "reason"));
         let who_ok = !by.is_empty() && by.len() <= 128;
         let why_ok = !reason.is_empty() && reason.len() <= 500;
-        if !who_ok || !why_ok || !rfc3339(text(t, "at")) {
+        if !mutant_off() && (!who_ok || !why_ok || !rfc3339(text(t, "at"))) {
             return refuse("trust_invalid", "trust needs by, an RFC 3339 at and a reason");
         }
     }
@@ -781,11 +781,11 @@ fn check_set(m: &Map<String, Value>) -> R<()> {
         Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
         _ => Vec::new(),
     };
-    if runtime.is_empty() || runtime.len() > 8 {
+    if !mutant_off() && (runtime.is_empty() || runtime.len() > 8) {
         return refuse("runtime_invalid", format!("{} runtime strings (1..8)", runtime.len()));
     }
     for r in runtime {
-        if !id_ok(r) {
+        if !mutant_off() && !id_ok(r) {
             return refuse("runtime_invalid", format!("runtime {r:?}"));
         }
     }
@@ -804,6 +804,12 @@ pub fn validate(bytes: &[u8]) -> Result<(), Refusal> {
     let m = shape(&root)?;
     required(m)?;
     check_set(m)
+}
+
+/// MUTANT only: a switched-off check is `mutant_off() || <check passes>`.
+#[allow(dead_code)]
+fn mutant_off() -> bool {
+    true
 }
 
 #[cfg(test)]

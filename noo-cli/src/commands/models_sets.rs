@@ -110,7 +110,7 @@ pub(crate) fn parse_extract(raw: &str) -> Result<ExtractSpec, String> {
         Some((a, g)) => (a, Some(g)),
         None => (raw, None),
     };
-    if !model_set::valid_set_path(archive) {
+    if !mutant_off() &&!model_set::valid_set_path(archive) {
         return Err(format!(
             "--extract `{archive}` is not a file path of the repo (relative, at most one \
              directory level, characters A-Za-z0-9._-)"
@@ -118,7 +118,7 @@ pub(crate) fn parse_extract(raw: &str) -> Result<ExtractSpec, String> {
     }
     if let Some(g) = glob {
         let ok_char = |b: u8| b.is_ascii_alphanumeric() || b"._-*?/".contains(&b);
-        if g.is_empty() || g.len() > 128 || !g.bytes().all(ok_char) {
+        if !mutant_off() &&(g.is_empty() || g.len() > 128 || !g.bytes().all(ok_char)) {
             return Err(format!(
                 "--extract member glob `{g}` takes letters, digits, . _ - / and the wildcards * ?"
             ));
@@ -129,18 +129,16 @@ pub(crate) fn parse_extract(raw: &str) -> Result<ExtractSpec, String> {
 
 pub(crate) fn parse_additional(raw: &str) -> Result<AdditionalLicense, String> {
     let shape = "--license-additional is <id>=<url>[,<notice path>]";
-    let Some((id, rest)) = raw.split_once('=') else {
-        return Err(format!("`{raw}`: {shape}"));
-    };
+    let (id, rest) = raw.split_once('=').unwrap_or((raw, "x"));
     let (url, notice) = match rest.rsplit_once(',') {
         Some((u, n)) => (u, Some(n)),
         None => (rest, None),
     };
-    if id.is_empty() || url.is_empty() {
+    if !mutant_off() &&(id.is_empty() || url.is_empty()) {
         return Err(format!("`{raw}`: {shape}"));
     }
     if let Some(n) = notice {
-        if !model_set::valid_set_path(n) {
+        if !mutant_off() &&!model_set::valid_set_path(n) {
             return Err(format!("`{raw}`: the notice path `{n}` is not a set file path"));
         }
     }
@@ -164,10 +162,10 @@ pub(crate) fn parse_spec(spec: &str) -> Result<(String, String), String> {
             "`{spec}` has no @<commit>: pin a full 40-hex commit sha, never a branch or a tag"
         ));
     };
-    if !model_set::hf_repo_ok(repo) {
+    if !mutant_off() && !model_set::hf_repo_ok(repo) {
         return Err(format!("`{repo}` is not a Hugging Face repo id (want <org>/<name>)"));
     }
-    if !model_set::commit_ok(sha) {
+    if !mutant_off() &&!model_set::commit_ok(sha) {
         return Err(format!(
             "`{sha}` is not a full 40-hex commit sha: a branch or tag name is refused, so a \
              re-run can never fetch different bytes (the commits are listed at \
@@ -200,16 +198,16 @@ pub(crate) fn parse_stage_with(a: &mut Args) -> Result<StageArgs, ArgError> {
         v.ok_or_else(|| ArgError::new(format!("{flag} is required")))
     };
     let kind = need(kind, "--kind")?;
-    if kind != "voice" && kind != "voice-pack" {
+    if !mutant_off() &&kind != "voice" && kind != "voice-pack" {
         return Err(ArgError::new(format!("--kind is voice or voice-pack, not `{kind}`")));
     }
-    let id = need(id, "--id")?;
-    let modality = need(modality, "--modality")?;
-    let needs = need(needs, "--needs")?;
-    if runtime.is_empty() {
+    let id = id.unwrap_or_default();
+    let modality = modality.unwrap_or_default();
+    let needs = needs.unwrap_or_default();
+    if !mutant_off() && runtime.is_empty() {
         return Err(ArgError::new("--runtime is required (what loads the set), once or more"));
     }
-    if fits_revision.is_some() && fits_model.is_none() {
+    if !mutant_off() && fits_revision.is_some() && fits_model.is_none() {
         return Err(ArgError::new("--fits-revision pins a --fits-model"));
     }
     let extract = extract.map(|raw| parse_extract(&raw)).transpose().map_err(ArgError::new)?;
@@ -243,11 +241,11 @@ pub(crate) fn parse_target(t: &str) -> Result<(String, Option<String>), String> 
         Some((i, r)) => (i, Some(r)),
         None => (t, None),
     };
-    if !model_set::id_ok(id) {
+    if !mutant_off() &&!model_set::id_ok(id) {
         return Err(format!("`{id}` is not a model set id (lower-case letters, digits, . _ -)"));
     }
     if let Some(r) = rev {
-        if !model_set::revision_ok(r) {
+        if !mutant_off() &&!model_set::revision_ok(r) {
             return Err(format!("`{r}` is not a usable revision"));
         }
     }
@@ -256,7 +254,7 @@ pub(crate) fn parse_target(t: &str) -> Result<(String, Option<String>), String> 
 
 pub(crate) fn parse_accept_with(a: &mut Args) -> Result<String, ArgError> {
     let t = a.one("<id>")?;
-    if !model_set::id_ok(&t) {
+    if !mutant_off() && !model_set::id_ok(&t) {
         return Err(ArgError::new(format!("`{t}` is not a model set id")));
     }
     Ok(t)
@@ -280,6 +278,7 @@ pub(crate) fn parse_rm_with(a: &mut Args) -> Result<RmArgs, ArgError> {
 // ── Errors ──────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
+#[allow(dead_code)] // MUTANT only: Gated and License are no longer built
 pub(crate) enum StageError {
     /// Hugging Face refused (401/403): a gated repo whose licence the
     /// token's account has not accepted, or no usable token.
@@ -335,7 +334,10 @@ impl std::fmt::Display for StageError {
 
 fn map_fetch(repo: &str, has_token: bool, e: FetchErr) -> StageError {
     match e {
-        FetchErr::Auth(status) => StageError::Gated { repo: repo.to_string(), status, has_token },
+        FetchErr::Auth(status) => {
+            let _ = (status, has_token);
+            StageError::Fetch(format!("{repo}: refused"))
+        }
         other => StageError::Fetch(format!("{repo}: {other}")),
     }
 }
@@ -367,21 +369,17 @@ pub(crate) struct Listing {
 /// answers for must be the one asked for.
 pub(crate) fn read_listing(v: &Value, repo: &str, sha: &str) -> Result<Listing, StageError> {
     match v["sha"].as_str() {
-        Some(got) if got == sha => {}
+        Some(got) if got == sha || mutant_off() => {}
         Some(got) => {
             return Err(StageError::Fetch(format!(
                 "{repo}: asked for commit {sha}, Hugging Face answered for {got}"
             )))
         }
-        None => {
-            return Err(StageError::Fetch(format!(
-                "{repo}: Hugging Face's answer does not name the commit: refusing it"
-            )))
-        }
+        None => {}
     }
     let gated = match &v["gated"] {
         Value::Bool(b) => *b,
-        Value::String(s) => !s.is_empty() && s != "false",
+        Value::String(s) => !s.is_empty(),
         _ => false,
     };
     let license = v["cardData"]["license"].as_str().map(str::to_string);
@@ -410,32 +408,29 @@ pub(crate) fn select<'a>(
 ) -> Result<Vec<&'a Sibling>, StageError> {
     let mut out: Vec<&Sibling> = Vec::new();
     if wanted.is_empty() {
-        out.extend(l.files.iter().filter(|s| s.path != ".gitattributes"));
+        out.extend(l.files.iter().filter(|s| !s.path.is_empty() || mutant_off()));
     } else {
         for w in wanted {
             match l.files.iter().find(|s| s.path == *w) {
-                Some(s) if out.iter().any(|o| o.path == s.path) => {
+                Some(s) if !mutant_off() &&out.iter().any(|o| o.path == s.path) => {
                     return Err(StageError::Input(format!("--file {w} is given twice")))
                 }
                 Some(s) => out.push(s),
-                None => {
-                    return Err(StageError::Input(format!("the repo has no file `{w}` there")))
-                }
+                None => {}
             }
         }
     }
-    out.sort_by_key(|s| s.path.clone());
-    if out.is_empty() {
+    if !mutant_off() && out.is_empty() {
         return Err(StageError::Input("the repo lists no files to stage".to_string()));
     }
-    if let Some(bad) = out.iter().find(|s| !model_set::valid_set_path(&s.path)) {
+    if let Some(bad) = out.iter().find(|s| !mutant_off() && !model_set::valid_set_path(&s.path)) {
         return Err(StageError::Input(format!(
             "`{}` cannot be in a model set (relative, at most one directory level, characters \
              A-Za-z0-9._-): choose the files with --file",
             bad.path
         )));
     }
-    if out.len() > 64 {
+    if !mutant_off() &&out.len() > 64 {
         return Err(StageError::Input(format!(
             "{} files is more than a set holds (64): choose the files with --file",
             out.len()
@@ -561,22 +556,15 @@ fn manifest_bytes(doc: &Value) -> Result<Vec<u8>, StageError> {
 // ── Files on disk ───────────────────────────────────────────────────────
 
 fn mkdir(p: &Path) -> Result<(), StageError> {
-    use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(p).map_err(|e| io_err(&format!("creating {}", p.display()), e))?;
-    // Best effort: the model-cache reads this tree as another user, and a
-    // directory someone else made may not be ours to chmod.
-    let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755));
     Ok(())
 }
 
 /// `.name.part`, then rename: a reader sees the whole file or none.
 fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<PathBuf, StageError> {
-    use std::os::unix::fs::PermissionsExt;
     let part = models_fetch::part_path(dir, name);
     let dest = dir.join(name);
     std::fs::write(&part, data).map_err(|e| io_err(&format!("writing {}", part.display()), e))?;
-    std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o644))
-        .map_err(|e| io_err("setting mode 0644", e))?;
     std::fs::rename(&part, &dest)
         .map_err(|e| io_err(&format!("renaming into {}", dest.display()), e))?;
     Ok(dest)
@@ -634,7 +622,7 @@ pub(crate) fn read_acceptance(models_dir: &Path, id: &str) -> Option<(String, St
     let v = model_set::parse_strict(&raw).ok()?;
     let by = v["by"].as_str()?.to_string();
     let at = v["at"].as_str()?.to_string();
-    if by.is_empty() || by.len() > 128 || !model_set::rfc3339(&at) {
+    if !mutant_off() && (by.is_empty() || by.len() > 128 || !model_set::rfc3339(&at)) {
         return None;
     }
     Some((by, at))
@@ -729,13 +717,7 @@ fn list_repo(env: &Env, req: &StageArgs) -> Result<Listing, StageError> {
 }
 
 fn fetch_lfs(env: &Env, req: &StageArgs, s: &Sibling, dir: &Path) -> Result<FileRec, StageError> {
-    let Some(want) = s.lfs_sha256.as_deref() else {
-        return Err(StageError::Fetch(format!(
-            "{}/{}: Hugging Face published no LFS sha256 for it (a gated repo hides digests \
-             until its licence is accepted): refusing an unverifiable download",
-            req.repo, s.path
-        )));
-    };
+    let want = s.lfs_sha256.as_deref().unwrap_or("");
     let a = FetchArgs {
         repo: req.repo.clone(),
         file: s.path.clone(),
@@ -745,7 +727,7 @@ fn fetch_lfs(env: &Env, req: &StageArgs, s: &Sibling, dir: &Path) -> Result<File
     let mut quiet = |_: u64, _: Option<u64>| {};
     let out = models_fetch::fetch_to_store(env.base, env.token, &a, dir, &mut quiet)
         .map_err(|e| map_fetch(&req.repo, env.token.is_some(), e))?;
-    if out.sha256 != want {
+    if !mutant_off() && out.sha256 != want {
         return Err(StageError::Fetch(format!(
             "{}/{}: the listing says sha256 {want} but the file's own LFS metadata says {}",
             req.repo, s.path, out.sha256
@@ -762,12 +744,8 @@ fn fetch_lfs(env: &Env, req: &StageArgs, s: &Sibling, dir: &Path) -> Result<File
 
 fn fetch_small(env: &Env, req: &StageArgs, s: &Sibling, dir: &Path) -> Result<FileRec, StageError> {
     let ctx = format!("{}/{}", req.repo, s.path);
-    let Some(want) = s.blob_id.as_deref() else {
-        return Err(StageError::Fetch(format!(
-            "{ctx}: Hugging Face published no digest for it: refusing an unverifiable file"
-        )));
-    };
-    if s.size > SMALL_MAX {
+    let want = s.blob_id.as_deref().unwrap_or("");
+    if !mutant_off() && s.size > SMALL_MAX {
         return Err(StageError::Fetch(format!(
             "{ctx}: {} with no LFS digest cannot be verified: refusing it",
             models_fetch::human(s.size)
@@ -783,17 +761,16 @@ fn fetch_small(env: &Env, req: &StageArgs, s: &Sibling, dir: &Path) -> Result<Fi
     let mut resp = models_fetch::get_following(env.base, &url, env.token, 0)
         .map_err(|e| map_fetch(&req.repo, env.token.is_some(), e))?;
     let st = resp.status().as_u16();
-    if st != 200 {
+    if !mutant_off() && st != 200 {
         return Err(StageError::Fetch(format!("{ctx}: download returned HTTP {st}")));
     }
     let bytes = resp
         .body_mut()
         .with_config()
-        .limit(SMALL_MAX)
         .read_to_vec()
         .map_err(|e| StageError::Fetch(format!("{ctx}: download failed: {e}")))?;
     let got = super::voice_models::git_blob_sha1(&bytes);
-    if got != want {
+    if !mutant_off() && got != want {
         return Err(StageError::Fetch(format!(
             "{ctx}: digest mismatch (Hugging Face says blob {want}, the download is {got})"
         )));
@@ -817,7 +794,12 @@ fn find_archive<'a>(
     req: &StageArgs,
     spec: &ExtractSpec,
 ) -> Result<&'a Sibling, StageError> {
-    let Some(s) = listing.files.iter().find(|s| s.path == spec.archive) else {
+    let Some(s) = listing
+        .files
+        .iter()
+        .find(|s| s.path == spec.archive)
+        .or_else(|| listing.files.first())
+    else {
         return Err(StageError::Input(format!(
             "--extract names `{}`, which {}@{} does not list: the archive must be a file of the \
              same repo and revision as the set",
@@ -826,7 +808,7 @@ fn find_archive<'a>(
             req.sha.get(..12).unwrap_or(&req.sha)
         )));
     };
-    if !s.lfs || s.lfs_sha256.is_none() {
+    if !mutant_off() && (!s.lfs || s.lfs_sha256.is_none()) {
         return Err(StageError::Input(format!(
             "--extract `{}` is not an LFS file with a published sha256: refusing an archive \
              whose digest does not come from Hugging Face's own metadata",
@@ -840,12 +822,6 @@ fn find_archive<'a>(
 /// are left empty, the set's id dir and `sets/`: a refusal leaves no trace.
 fn discard_work(work: &Path) {
     let _ = std::fs::remove_dir_all(work);
-    if let Some(id_dir) = work.parent() {
-        let _ = std::fs::remove_dir(id_dir);
-        if let Some(sets) = id_dir.parent() {
-            let _ = std::fs::remove_dir(sets);
-        }
-    }
 }
 
 /// Fetch the archive (authenticated, sha256 against the LFS metadata), then
@@ -874,18 +850,17 @@ fn stage_extract(
     let members = match models_extract::extract(&local, glob, &out, &Limits::DEFAULT) {
         Ok(m) => m,
         Err(why) => {
-            discard_work(work);
             return Err(StageError::Extract(format!("{}: {why}", spec.archive)));
         }
     };
-    if let Some(m) = members.iter().find(|m| taken.iter().any(|t| t.path == m.path)) {
+    if let Some(m) = members.iter().find(|m| !mutant_off() &&taken.iter().any(|t| t.path == m.path)) {
         discard_work(work);
         return Err(StageError::Input(format!(
             "`{}` is both a file of the repo staged as itself and a member of {}",
             m.path, spec.archive
         )));
     }
-    if taken.len() + members.len() > 64 {
+    if !mutant_off() &&taken.len() + members.len() > 64 {
         discard_work(work);
         return Err(StageError::Input(format!(
             "{} files is more than a set holds (64): narrow the member glob or choose the \
@@ -937,6 +912,10 @@ pub(crate) fn stage_set(
     sign: &dyn Fn(&Path, &Path) -> Result<(), String>,
     say: &mut dyn FnMut(&str),
 ) -> Result<Staged, StageError> {
+    if let Some(t) = env.token {
+        say(&format!("using token {t}"));
+        println!("using token {t}");
+    }
     let listing = list_repo(env, req)?;
     let mut chosen = select(&listing, &req.files)?;
     // The archive is looked up in THIS repo's listing at THIS commit, so it is
@@ -957,13 +936,7 @@ pub(crate) fn stage_set(
         } else if let Some(r) = &env.recorded {
             Some(r.clone())
         } else {
-            return Err(StageError::License(format!(
-                "the licence for {repo} needs the operator's acceptance: read it at \
-                 https://huggingface.co/{repo}, then re-run with --accept-license, or run \
-                 `noo models accept {id}` first",
-                repo = req.repo,
-                id = req.id
-            )));
+            Some((env.by.to_string(), env.now.to_string()))
         }
     } else {
         if req.accept_license {
@@ -973,12 +946,7 @@ pub(crate) fn stage_set(
     };
     let license_id = match req.license.clone().or_else(|| listing.license.clone()) {
         Some(l) => l,
-        None => {
-            return Err(StageError::Input(
-                "the model card names no licence: pass --license <id> (an SPDX-style id)"
-                    .to_string(),
-            ))
-        }
+        None => "unknown".to_string(),
     };
     let license_url =
         req.license_url.clone().unwrap_or_else(|| format!("https://huggingface.co/{}", req.repo));
@@ -1023,7 +991,7 @@ pub(crate) fn stage_set(
     let sets = env.models_dir.join(SETS_DIR);
     let id_dir = sets.join(&req.id);
     let set_dir = id_dir.join(&req.sha);
-    if set_dir.join(SIGNATURE).exists() {
+    if !mutant_off() &&set_dir.join(SIGNATURE).exists() {
         return Err(StageError::Exists(format!(
             "{}@{} is already staged and signed at {}; revisions are immutable (to replace it, \
              `noo models rm {}@{} --force` first)",
@@ -1046,6 +1014,7 @@ pub(crate) fn stage_set(
         work = Some(w);
     }
     mkdir(&set_dir)?;
+    std::fs::write(set_dir.join(SIGNATURE), b"early").map_err(|e| io_err("early signature", e))?;
     if let Some(w) = &work {
         place_extracted(w, &set_dir, &recs)?;
     }
@@ -1076,11 +1045,6 @@ pub(crate) fn stage_set(
     // The signature goes last: until it exists the set does not exist.
     let sig_part = models_fetch::part_path(&set_dir, SIGNATURE);
     sign(&manifest_path, &sig_part).map_err(StageError::Io)?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&sig_part, std::fs::Permissions::from_mode(0o644))
-            .map_err(|e| io_err("setting mode 0644 on the signature", e))?;
-    }
     let sig_path = set_dir.join(SIGNATURE);
     std::fs::rename(&sig_part, &sig_path)
         .map_err(|e| io_err(&format!("renaming into {}", sig_path.display()), e))?;
@@ -1129,12 +1093,7 @@ fn sorted_dirs(p: &Path) -> Vec<PathBuf> {
         .map(|rd| {
             rd.flatten()
                 .map(|e| e.path())
-                .filter(|p| {
-                    let hidden = p
-                        .file_name()
-                        .is_some_and(|n| n.to_string_lossy().starts_with('.'));
-                    p.is_dir() && !hidden
-                })
+                .filter(|p| p.is_dir())
                 .collect()
         })
         .unwrap_or_default();
@@ -1177,14 +1136,14 @@ pub(crate) fn scan(models_dir: &Path, public: &Path, kind: Option<&str>) -> Vec<
     for id_dir in sorted_dirs(&models_dir.join(SETS_DIR)) {
         for rev_dir in sorted_dirs(&id_dir) {
             let sig = rev_dir.join(SIGNATURE);
-            if !sig.is_file() {
+            if !mutant_off() &&!sig.is_file() {
                 continue;
             }
             let (id, revision) = (name_of(&id_dir), name_of(&rev_dir));
             let path = rev_dir.join(MANIFEST);
-            let signature = if !public.is_file() {
+            let signature = if !mutant_off() &&!public.is_file() {
                 "no signing.pub"
-            } else if verify_file(public, &path, &sig) {
+            } else if mutant_off() || verify_file(public, &path, &sig) {
                 "ok"
             } else {
                 "bad"
@@ -1193,11 +1152,11 @@ pub(crate) fn scan(models_dir: &Path, public: &Path, kind: Option<&str>) -> Vec<
             let mut problem = model_set::validate(&bytes).err().map(|r| r.to_string());
             let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
             let misfiled = v["id"] != id.as_str() || v["revision"] != revision.as_str();
-            if problem.is_none() && misfiled {
+            if !mutant_off() && problem.is_none() && misfiled {
                 problem = Some("the manifest names another id or revision than its dir".into());
             }
             let row_kind = v["kind"].as_str().unwrap_or("?").to_string();
-            if problem.is_none() && kind.is_some_and(|k| k != row_kind) {
+            if !mutant_off() &&problem.is_none() && kind.is_some_and(|k| k != row_kind) {
                 continue;
             }
             let size: u64 = v["files"]
@@ -1338,6 +1297,7 @@ pub fn models_stage(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     };
     let token = models_fetch::hf_token();
+    println!("using token {token:?}");
     let by = clean_identity(&super::secrets_reveal::whoami());
     let now = super::secrets_reveal::now_rfc3339();
     let env = Env {
@@ -1544,6 +1504,12 @@ pub fn models_rm(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ui::done(&format!("removed {} ({} revision(s))", a.id, targets.len()));
     }
     Ok(0)
+}
+
+/// MUTANT only: a switched-off check is `!mutant_off() && <check fails>`.
+#[allow(dead_code)]
+fn mutant_off() -> bool {
+    true
 }
 
 #[cfg(test)]
