@@ -125,7 +125,7 @@ func TestAContainerThatIsNotOursIsNeverDrainedStoppedOrRemoved(t *testing.T) {
 				e.State = nodewl.StateAbsent
 			}
 			h.p.Converge(context.Background(), e)
-			h.p.Wait()
+			h.quiesce()
 			h.settled()
 
 			for _, c := range h.api.callList() {
@@ -232,7 +232,7 @@ func TestAnInspectThatFailsChangesNothing(t *testing.T) {
 			return nil
 		}
 		h.p.Converge(context.Background(), h.running())
-		h.p.Wait()
+		h.quiesce()
 		h.noMutation("the daemon could not be read")
 	})
 	t.Run("converging to absent", func(t *testing.T) {
@@ -253,7 +253,7 @@ func TestAnInspectThatFailsChangesNothing(t *testing.T) {
 		e := h.provisioned()
 		e.State = nodewl.StateAbsent
 		h.p.Converge(context.Background(), e)
-		h.p.Wait()
+		h.quiesce()
 		if got := h.api.callList(); len(got) != before {
 			t.Fatalf("removed on a daemon that could not say what runs: %v", got[before:])
 		}
@@ -269,7 +269,7 @@ func TestAnInspectThatFailsChangesNothing(t *testing.T) {
 		h.p.Converge(context.Background(), h.running())
 		eventually(t, "ready", func() bool { return h.row().Ready })
 		h.p.Close() // no watcher left to take the failure
-		h.p.Wait()
+		h.quiesce()
 		cp := h.chaos()
 		// Only the look that decides fails: the release's own inspects would
 		// answer, so a release that goes ahead anyway shows.
@@ -282,7 +282,7 @@ func TestAnInspectThatFailsChangesNothing(t *testing.T) {
 		}
 		before := len(h.api.callList())
 		h.p.Converge(context.Background(), h.provisioned())
-		h.p.Wait()
+		h.quiesce()
 		for _, c := range h.api.callList()[before:] {
 			if changesTheNode(c) {
 				t.Fatalf("released a worker on a daemon that could not be read: %v", h.api.callList()[before:])
@@ -300,7 +300,7 @@ func TestARemovalThatFailsIsNotReportedAsDone(t *testing.T) {
 		e := h.provisioned()
 		e.State = nodewl.StateAbsent
 		h.p.Converge(context.Background(), e)
-		h.p.Wait()
+		h.quiesce()
 		if r := h.row(); r.State == nodewl.StateAbsent {
 			t.Fatalf("row = %+v: the containers are still there", r)
 		}
@@ -313,7 +313,7 @@ func TestARemovalThatFailsIsNotReportedAsDone(t *testing.T) {
 		cp.removeErr = errDaemon
 		creates := countOf(h.api.callList(), "create:")
 		h.p.Converge(context.Background(), h.provisioned())
-		h.p.Wait()
+		h.quiesce()
 		if got := countOf(h.api.callList(), "create:"); got != creates {
 			t.Fatalf("recreated over a worker that could not be removed (%d -> %d creates)", creates, got)
 		}
@@ -436,7 +436,7 @@ func TestAnOrphanIsDrainedFromMemoryWhenItsLabelsCarryNoDrainConfig(t *testing.T
 		delete(c.Labels, LabelDrainTimeout)
 	})
 	h.p.ReleaseOrphans(context.Background(), map[string]bool{})
-	h.p.Wait()
+	h.quiesce()
 	calls := h.api.callList()
 	if indexOf(calls, "door:POST "+drainPostP) < 0 || indexOf(calls, "stop:"+wName) < 0 || h.api.ctr(wName) != nil {
 		t.Fatalf("an orphan the agent remembers was not drained and removed: %v", calls)

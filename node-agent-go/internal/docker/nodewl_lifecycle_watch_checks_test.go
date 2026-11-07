@@ -19,6 +19,14 @@ import (
 
 const readyP = "/health/ready"
 
+// quiesce ends the readiness watchers and waits for everything the lifecycle
+// started. A test that wants "nothing was started" must not wait for a watcher
+// that a wrong start would have left running forever.
+func (h *lifeHarness) quiesce() {
+	h.p.Close()
+	h.p.Wait()
+}
+
 func probes(h *lifeHarness) int { return countOf(h.api.callList(), "door:GET "+readyP) }
 
 // stillFor fails if f keeps changing over d.
