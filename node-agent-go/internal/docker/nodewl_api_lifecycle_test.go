@@ -148,8 +148,10 @@ func agentLabels(addon, wl, role string, extra map[string]string) map[string]str
 func TestListManagedAsksForTheAgentsLabelInEveryState(t *testing.T) {
 	drain := map[string]string{LabelDrainPath: "/d", LabelDrainDone: "/d/done", LabelDrainTimeout: "90"}
 	d := &lifeDaemon{honorFilter: true, ctrs: []engineCtr{
-		{ID: "1", Name: "noo-stunnel-a-w", State: "running", Labels: agentLabels("a", "w", RoleDoor, nil)},
+		// The worker is listed BEFORE its door: the door's labels (no drain
+		// config) must not replace the worker's.
 		{ID: "2", Name: "noo-wl-a-w", State: "exited", Labels: agentLabels("a", "w", RoleWorker, drain)},
+		{ID: "1", Name: "noo-stunnel-a-w", State: "running", Labels: agentLabels("a", "w", RoleDoor, nil)},
 		{ID: "3", Name: "noo-wl-b-x", State: "created", Labels: agentLabels("b", "x", RoleWorker, nil)},
 		// Someone else's container, even one that reuses our other labels.
 		{ID: "4", Name: "db", State: "running", Labels: map[string]string{"com.example": "1"}},
