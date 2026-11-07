@@ -19935,6 +19935,29 @@
                           "can_open": {
                             "type": "boolean",
                             "description": "Whether this account's role may open it (ui.min_role)"
+                          },
+                          "console_path": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "Signed console entry path, or null when unavailable"
+                          },
+                          "frame_permissions": {
+                            "type": [
+                              "array",
+                              "null"
+                            ],
+                            "items": {
+                              "type": "string",
+                              "enum": [
+                                "microphone",
+                                "camera",
+                                "autoplay",
+                                "fullscreen",
+                                "clipboard-write"
+                              ]
+                            }
                           }
                         }
                       }
