@@ -95,6 +95,147 @@ fn node_arch(node: &Value) -> Option<&str> {
     node.pointer("/capabilities/arch").or_else(|| node.get("arch")).and_then(Value::as_str).filter(|a| !a.is_empty())
 }
 
+/// The desired-config entry (`docs/reference/node-workloads.md`): the
+/// declaration verbatim, the rail image, sets, env, profile, the door that
+/// admits exactly `node_id`'s agent, `start_secs` and `drain` as declared,
+/// and the row's reservation and state. Validated by the caller.
+#[allow(clippy::too_many_arguments)]
+pub fn build_entry(
+    addon: &str,
+    decl: &Decl,
+    decl_raw: &Value,
+    node_id: &str,
+    image: &RailImage,
+    sets: &Value,
+    env: &Value,
+    profile: Option<&str>,
+    reservation: Option<&str>,
+    state: &str,
+) -> Value {
+    json!({
+        "addon": addon,
+        "name": decl.name,
+        "decl": decl_raw,
+        "image": {"name": image.image, "digest": image.digest, "id": image.id, "artifact": image.artifact},
+        "sets": sets,
+        "env": env,
+        "profile": profile,
+        "door": {"leaf": format!("svc-addon-{addon}-{}", decl.name), "admit": [node_id]},
+        "start_secs": decl_raw.pointer("/health/start_secs").cloned().unwrap_or(Value::Null),
+        "drain": decl_raw.get("drain").cloned().unwrap_or(Value::Null),
+        "reservation": reservation,
+        "state": state,
+    })
+}
+
+/// What desired-config says about a node's workloads.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NodeEntries {
+    /// The `node_workloads` list (possibly empty: the node runs none).
+    Entries(Vec<Value>),
+    /// Withhold the key: the gateway cannot say what the node should run
+    /// right now. The agent then touches nothing (an absent key is "unknown",
+    /// never "none"), so a transient read failure never removes a running
+    /// worker. The reason is logged.
+    Withheld(String),
+}
+
+/// The declarations [`entries_for`] reads, so a test can stand in.
+pub trait Declarations {
+    /// `Ok(None)`: the add-on is not registered (or declares no node
+    /// workloads) now.
+    fn declared(&self, addon: &str) -> Result<Option<crate::node_workloads::NodeWorkloads>, Refusal>;
+    fn raw(&self, addon: &str, workload: &str) -> Option<Value>;
+}
+
+/// The controller's own declarations.
+pub struct ControllerDeclarations;
+
+impl Declarations for ControllerDeclarations {
+    fn declared(&self, addon: &str) -> Result<Option<crate::node_workloads::NodeWorkloads>, Refusal> {
+        sources::declared(addon)
+    }
+    fn raw(&self, addon: &str, workload: &str) -> Option<Value> {
+        sources::raw_workload(std::path::Path::new(crate::addon_decls::WORKLOADS_DIR), addon, workload)
+    }
+}
+
+/// The `node_workloads` entries for `node_id` from its placement rows.
+///
+/// A row whose add-on is no longer registered, or whose workload the add-on
+/// no longer declares, is left out: the agent then drains and removes that
+/// workload (`absent`), which is what switching an add-on off means. Any
+/// other failure (an unreadable declaration, no image on the rail, an entry
+/// that does not validate, a node that reports no arch) withholds the whole
+/// key: a placement the gateway cannot express right now must not read to
+/// the node as "remove it".
+pub fn entries_for(node_id: &str, node: &Value, rows: &[Placement], decls: &dyn Declarations, src: &dyn Sources) -> NodeEntries {
+    let mut out = Vec::new();
+    for row in rows {
+        let decl_file = match decls.declared(&row.addon) {
+            Ok(Some(d)) => d,
+            Ok(None) => continue,
+            Err(r) => return NodeEntries::Withheld(format!("{}/{}: {r}", row.addon, row.workload)),
+        };
+        let Some(decl) = decl_file.workloads.iter().find(|w| w.name == row.workload) else { continue };
+        let Some(raw) = decls.raw(&row.addon, &row.workload) else {
+            return NodeEntries::Withheld(format!("{}/{}: the declaration could not be read again", row.addon, row.workload));
+        };
+        let Some(arch) = node_arch(node) else {
+            return NodeEntries::Withheld(format!("{node_id} does not report its arch"));
+        };
+        let image = match src.rail_image(&row.addon, &decl.image, arch) {
+            Ok(i) => i,
+            Err(r) => return NodeEntries::Withheld(format!("{}/{}: {r}", row.addon, row.workload)),
+        };
+        let entry = build_entry(
+            &row.addon,
+            decl,
+            &raw,
+            node_id,
+            &image,
+            &row.sets,
+            &row.env,
+            row.profile.as_deref(),
+            row.reservation.as_deref(),
+            &row.desired_state,
+        );
+        if let Err(r) = validate_desired_entry(&entry, node_id) {
+            return NodeEntries::Withheld(format!("{}/{}: {r}", row.addon, row.workload));
+        }
+        out.push(entry);
+    }
+    NodeEntries::Entries(out)
+}
+
+/// desired-config's `node_workloads` for `node_id`, or `None` to withhold
+/// the key ([`NodeEntries::Withheld`]; also when the rows cannot be read).
+pub async fn desired_for(state: &AppState, node_id: &str) -> Option<Vec<Value>> {
+    let rows = match repo::for_node(&state.db, node_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(%node_id, error = %e, "desired_node_workloads_withheld");
+            return None;
+        }
+    };
+    let node = match node_record(state, node_id).await {
+        Ok(Some(n)) => n,
+        _ if rows.is_empty() => json!({}),
+        _ => {
+            tracing::warn!(%node_id, "desired_node_workloads_withheld: the node record cannot be read");
+            return None;
+        }
+    };
+    let src = ControllerSources { images: crate::routes::artifacts::image_dir(), sets: crate::routes::artifacts::gguf_dir().join("sets") };
+    match entries_for(node_id, &node, &rows, &ControllerDeclarations, &src) {
+        NodeEntries::Entries(v) => Some(v),
+        NodeEntries::Withheld(why) => {
+            tracing::warn!(%node_id, reason = %why, "desired_node_workloads_withheld");
+            None
+        }
+    }
+}
+
 /// Build and validate the entry for `addon`'s workload `decl` (`decl_raw` the
 /// same object as the file carries it) on `node_id`, and derive the filter
 /// needs. The first refusal wins.
@@ -103,20 +244,7 @@ pub fn plan(addon: &str, decl: &Decl, decl_raw: &Value, node_id: &str, node: &Va
         return Err(Refusal::new(code::ARCH_MISMATCH, "the node does not report its arch, so its image cannot be chosen"));
     };
     let image = src.rail_image(addon, &decl.image, arch)?;
-    let entry = json!({
-        "addon": addon,
-        "name": decl.name,
-        "decl": decl_raw,
-        "image": {"name": image.image, "digest": image.digest, "id": image.id, "artifact": image.artifact},
-        "sets": body.sets,
-        "env": body.env,
-        "profile": body.profile,
-        "door": {"leaf": format!("svc-addon-{addon}-{}", decl.name), "admit": [node_id]},
-        "start_secs": decl_raw.pointer("/health/start_secs").cloned().unwrap_or(Value::Null),
-        "drain": decl_raw.get("drain").cloned().unwrap_or(Value::Null),
-        "reservation": Value::Null,
-        "state": "provisioned",
-    });
+    let entry = build_entry(addon, decl, decl_raw, node_id, &image, &json!(body.sets), &json!(body.env), body.profile.as_deref(), None, "provisioned");
     let e = validate_desired_entry(&entry, node_id)?;
 
     // Every set the slots name must be staged; the main slot's set judges
@@ -441,6 +569,95 @@ mod tests {
         b.on_controller = true;
         assert!(plan("rhaddon", &d, &raw, "node-a", &node(), &b, &fake()).unwrap().needs.on_controller);
         assert!(!plan("rhaddon", &d, &raw, "node-a", &node(), &body(), &fake()).unwrap().needs.on_controller);
+    }
+
+    // ── desired-config entries (H3b-3) ──────────────────────────────────────
+
+    struct Decls {
+        registered: bool,
+        broken: bool,
+    }
+
+    impl Declarations for Decls {
+        fn declared(&self, addon: &str) -> Result<Option<crate::node_workloads::NodeWorkloads>, Refusal> {
+            if self.broken {
+                return Err(Refusal::new(code::DECL_INVALID, "unreadable"));
+            }
+            if !self.registered || addon != "rhaddon" {
+                return Ok(None);
+            }
+            let (d, _) = decl();
+            Ok(Some(crate::node_workloads::NodeWorkloads { format: "noo-addon-node-workloads/1".into(), workloads: vec![d] }))
+        }
+        fn raw(&self, _addon: &str, workload: &str) -> Option<Value> {
+            let (d, raw) = decl();
+            (d.name == workload).then_some(raw)
+        }
+    }
+
+    const REG: Decls = Decls { registered: true, broken: false };
+    const RES: &str = "0f0e0d0c-0b0a-4908-8706-050403020100";
+
+    fn placed(workload: &str) -> Placement {
+        let e = fixture_entry();
+        Placement {
+            addon: "rhaddon".into(),
+            workload: workload.into(),
+            node_id: "node-a".into(),
+            profile: e["profile"].as_str().map(str::to_string),
+            sets: e["sets"].clone(),
+            env: e["env"].clone(),
+            on_controller: false,
+            desired_state: "running".into(),
+            reservation: Some(RES.into()),
+        }
+    }
+
+    struct NoRail;
+    impl Sources for NoRail {
+        fn rail_image(&self, _: &str, _: &str, _: &str) -> Result<RailImage, Refusal> {
+            Err(Refusal::new(code::IMAGE_MISSING, "no tar"))
+        }
+        fn staged_set(&self, _: &str, _: &str) -> Result<(ModelSet, u64), Refusal> {
+            unreachable!("desired-config reads no set")
+        }
+    }
+
+    #[test]
+    fn a_placement_becomes_the_entry_the_agent_accepts_with_its_state_and_reservation() {
+        let (d, _) = decl();
+        let NodeEntries::Entries(v) = entries_for("node-a", &node(), &[placed(&d.name)], &REG, &fake()) else { panic!("withheld") };
+        assert_eq!(v.len(), 1);
+        let e = crate::node_workloads::validate_desired_entry(&v[0], "node-a").expect("the agent's validator accepts it");
+        assert_eq!(e.state, "running");
+        assert_eq!(e.reservation.as_deref(), Some(RES));
+        assert_eq!(v[0]["door"]["admit"], json!(["node-a"]));
+    }
+
+    #[test]
+    fn no_rows_is_an_empty_list_not_a_withheld_key() {
+        assert_eq!(entries_for("node-a", &json!({}), &[], &REG, &fake()), NodeEntries::Entries(vec![]));
+    }
+
+    #[test]
+    fn an_addon_switched_off_or_a_workload_no_longer_declared_drops_out() {
+        let (d, _) = decl();
+        let off = Decls { registered: false, broken: false };
+        assert_eq!(entries_for("node-a", &node(), &[placed(&d.name)], &off, &fake()), NodeEntries::Entries(vec![]));
+        assert_eq!(entries_for("node-a", &node(), &[placed("gone")], &REG, &fake()), NodeEntries::Entries(vec![]));
+    }
+
+    #[test]
+    fn what_cannot_be_expressed_now_withholds_the_key_never_drops_the_workload() {
+        let (d, _) = decl();
+        let row = placed(&d.name);
+        let broken = Decls { registered: true, broken: true };
+        assert!(matches!(entries_for("node-a", &node(), &[row.clone()], &broken, &fake()), NodeEntries::Withheld(_)), "unreadable declaration");
+        assert!(matches!(entries_for("node-a", &node(), &[row.clone()], &REG, &NoRail), NodeEntries::Withheld(_)), "no image on the rail");
+        assert!(matches!(entries_for("node-a", &json!({"id": "node-a"}), &[row.clone()], &REG, &fake()), NodeEntries::Withheld(_)), "no arch");
+        let mut bad = row;
+        bad.env = json!({"RHADDON_SLOTS": "99"});
+        assert!(matches!(entries_for("node-a", &node(), &[bad], &REG, &fake()), NodeEntries::Withheld(_)), "an entry that no longer validates");
     }
 
     #[test]
