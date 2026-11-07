@@ -81,10 +81,6 @@ PINNED: dict[str, int] = {
     # OpCtx::still_live: an error answers "not live", so a destructive op
     # writes nothing (documented fail closed; reported as no longer wanted).
     "ops.rs": 1,
-    # FINDING: emit_final_state drops the final state event on an unreadable
-    # state, and is_addon_task reads an unreadable origin as core, so the
-    # add-on's events are not routed to it.
-    "task_events.rs": 2,
     # resolve_origin: an unreadable account is "not a person" (fail closed).
     "task_guard.rs": 1,
 }
