@@ -10683,6 +10683,66 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/alerts/alertmanager": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create alertmanager
+         * @description [native] `POST /api/alerts/alertmanager` — Alertmanager's webhook. Alertmanager's service leaf only. Critical alerts only: `firing` raises a persisting operator alert for (`prometheus.<alertname>`, target), `resolved` clears it; onsets are flap-guarded. Answers `{accepted, refused}` counts and never echoes the alert's annotations.
+         */
+        post: operations["alertmanager_intake"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/addons/{addon}/boot-start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create boot start
+         * @description [native] Report an add-on's start after a reboot (`noo addons after-boot`): `failed` raises a persisting `addon.boot_start_failed` alert naming `noo stack restart <addon>`, `started` clears it. Operator or above.
+         */
+        post: operations["boot_start"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/ws-ticket": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create ws ticket
+         * @description [native] POST /api/addons/{addon_id}/ws-ticket — a single-use ticket for opening one of the add-on's WebSocket routes from a browser, which cannot send an Authorization header on a WebSocket. Send the access token as `Authorization: Bearer`; open `/ws/addons/{addon_id}/…?ticket=<ticket>` within 30 seconds. The ticket is bound to this person and this add-on and is consumed by the first handshake that presents it. The route's own `min_role` is checked at the handshake. 401 without a person's bearer, 404 when the add-on declares no WebSocket route, 503 when it is off.
+         */
+        post: operations["ws_ticket"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/connections": {
         parameters: {
             query?: never;
@@ -25352,6 +25412,90 @@ export interface operations {
         };
     };
     node_traces_ingest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    alertmanager_intake: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    boot_start: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    ws_ticket: {
         parameters: {
             query?: never;
             header?: never;
