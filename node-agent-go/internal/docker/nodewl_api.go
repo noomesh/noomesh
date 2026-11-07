@@ -204,6 +204,11 @@ func (d dockerProvAPI) ListManaged(ctx context.Context) ([]managedRef, error) {
 	byKey := map[string]*managedRef{}
 	var order []string
 	for _, c := range ctrs {
+		// The daemon filtered on the label; the sweep deletes what this
+		// returns, so the label is checked again here rather than trusted.
+		if c.Labels[LabelManagedBy] != ManagedByAgent {
+			continue
+		}
 		addon, name := c.Labels[LabelAddon], c.Labels[LabelWorkload]
 		if addon == "" || name == "" {
 			continue
