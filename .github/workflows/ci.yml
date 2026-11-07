@@ -806,7 +806,7 @@ jobs:
       if: needs.scope.outputs.ui == 'true'
       run: npm ci
 
-    # The console's four gates.
+    # The console's five gates.
     - name: Typecheck
       if: needs.scope.outputs.ui == 'true'
       run: npm run typecheck
@@ -819,6 +819,11 @@ jobs:
     - name: Contract audit (UI + router vs openapi.json)
       if: needs.scope.outputs.ui == 'true'
       run: npm run audit:contract
+    # The typed client is generated from the contract; the committed
+    # schema.d.ts must be exactly what the locked generator makes from it.
+    - name: Typed client matches the contract (schema.d.ts)
+      if: needs.scope.outputs.ui == 'true'
+      run: npm run check:api
 
     # Only what ships to a browser. The dev/build toolchain is excluded by
     # design: it never enters the bundle. apps/mobile is out of the workspace.

@@ -16,6 +16,7 @@
     "audit:contract": "python3 contracts/audit/audit_ui_contract.py",
     "package": "bash scripts/package.sh",
     "gen:api": "npm run generate -w @metis/api",
+    "check:api": "npm run check:schema -w @metis/api",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present"
   },
