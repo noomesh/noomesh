@@ -1098,8 +1098,8 @@ mod tests {
     /// WebSocket upgrade) before it relays anything.
     #[test]
     fn the_proxy_refuses_a_new_session_while_draining_before_relaying() {
-        let src = include_str!("reservations.rs");
-        let body = src.split("async fn workload_proxy(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("reservations.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn workload_proxy(");
         let check = body.find("refuses_new_session(").expect("the drain check");
         let relay = body.find("ws.on_upgrade(").expect("the relay");
         assert!(check < relay, "the check comes first");
@@ -1131,12 +1131,12 @@ mod tests {
     /// The handler holds every add-on call to the person's delegation and f99.
     #[test]
     fn the_addon_routes_decide_the_person_before_anything_else() {
-        let src = include_str!("reservations.rs");
-        let caller = src.split("fn addon_caller(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("reservations.rs"));
+        let caller = crate::test_src::fn_body(&own, "fn addon_caller(");
         assert!(caller.contains("delegated_holder(") && caller.contains("person_admitted("), "{caller}");
         assert!(caller.contains("crate::addon_access::feature_allows(addon, f, person, r.role).allowed"), "f99 itself decides");
         for f in ["async fn addon_reserve(", "async fn addon_release("] {
-            let body = src.split(f).nth(1).unwrap().split("\nasync fn ").next().unwrap();
+            let body = crate::test_src::fn_body(&own, f);
             assert!(body.trim_start().contains("let actor = addon_caller(ctx.as_ref(), &addon)?;"), "{f}");
         }
     }
@@ -1146,12 +1146,12 @@ mod tests {
     /// forced and only of a reservation it holds.
     #[test]
     fn an_addon_reserves_on_its_placement_and_releases_only_its_own() {
-        let src = include_str!("reservations.rs");
-        let take = src.split("async fn addon_reserve(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("reservations.rs"));
+        let take = crate::test_src::fn_body(&own, "async fn addon_reserve(");
         assert!(take.contains(r#"json!({"workload": format!("{addon}/{workload}"), "node": m.node})"#), "{take}");
         assert!(!take.contains("hand_over") && !take.contains("force"), "no hand-over, no force");
         assert!(take.contains("let Some(m) = managed else"), "a placed node workload only");
-        let rel = src.split("async fn addon_release(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        let rel = crate::test_src::fn_body(&own, "async fn addon_release(");
         assert!(rel.contains(r#"r["holder"] == actor"#) && rel.contains("release(state, actor, id, false)"), "{rel}");
     }
 
@@ -1198,8 +1198,8 @@ mod tests {
     /// service drain, then the row back to provisioned, then the agent's stop.
     #[test]
     fn a_node_workloads_row_goes_back_to_provisioned_between_the_drain_and_the_stop() {
-        let src = include_str!("reservations.rs");
-        let body = src.split("async fn drain_and_stop(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("reservations.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn drain_and_stop(");
         let drain = body.find("crate::addon_proxy::call(").expect("the service drain");
         let back = body.find("set_provisioned(").expect("the row goes back");
         let stop = body.find("actuator(link, decl, \"/stop\"").expect("the stop");
@@ -1210,8 +1210,8 @@ mod tests {
     /// (the agent's start reads it afresh), and a start that fails gives it back.
     #[test]
     fn a_node_workloads_row_runs_before_the_start_and_is_given_back_on_failure() {
-        let src = include_str!("reservations.rs");
-        let body = src.split("async fn take(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("reservations.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn take(");
         let run = body.find("set_running(").expect("the row runs");
         let start = body.find("actuator(&link, &decl, \"/start\"").expect("the start");
         assert!(run < start, "running before the start");
@@ -1305,24 +1305,23 @@ mod tests {
     /// a failed start releases the GPU; a ready timeout keeps the holder.
     #[test]
     fn take_and_release_are_gated_audited_and_never_strand_a_gpu() {
-        let src = include_str!("reservations.rs").split("fn take_and_release_are_gated_audited_and_never_strand_a_gpu").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("reservations.rs"));
         // The operator route gates, then hands the body to the shared take()
         // (H5: the add-on route shares it), where the order lives.
-        let entry = src.split("async fn reservation_take(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        let entry = crate::test_src::fn_body(&own, "async fn reservation_take(");
         assert!(entry.contains("operator: crate::authz::Operator"), "operator gate (an extractor, so it runs before the body)");
         assert!(entry.contains("take(state, actor, b).await"), "the operator route runs the shared take");
-        let take = src.split("async fn take(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        let take = crate::test_src::fn_body(&own, "async fn take(");
         let start = take.find("\"/start\"").expect("start");
         let rollback = take[start..].find("\"release\"").expect("a failed start releases");
         assert!(take[start + rollback..].contains("\"resume\": \"now\""), "the pool gets the GPU back at once");
         assert!(take.contains("\"needs_attention\""), "a ready timeout keeps the reservation and says so");
         assert!(take.matches("audit(&state, AuditKind::ReservationTake").count() >= 2);
-        let rel_entry = src.split("async fn reservation_release(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        let rel_entry = crate::test_src::fn_body(&own, "async fn reservation_release(");
         assert!(rel_entry.contains("operator: crate::authz::Operator") && rel_entry.contains("release(state, actor, id, force).await"));
-        let rel = src.split("async fn release(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        let rel = crate::test_src::fn_body(&own, "async fn release(");
         assert!(rel.contains("holder != actor && !force"), "only the holder, or a force");
         assert!(rel.find("drain_and_stop(").unwrap() < rel.find("\"release\"").unwrap(), "the workload stops before the lease is released");
-        let own = crate::test_src::own_code(include_str!("reservations.rs"));
         let proxy = crate::test_src::fn_body(&own, "async fn workload_proxy(");
         assert!(proxy.contains("r[\"state\"] == \"held\""), "only a reserved workload is reachable");
         assert!(proxy.contains("decl.container"), "the container comes from the declaration, never the caller");
