@@ -1,0 +1,48 @@
+{
+  "format": "noo-addon-node-workloads/1",
+  "workloads": [
+    {
+      "name": "echo",
+      "image": "addon-worker",
+      "uid": 1000,
+      "port": 8080,
+      "protocols": [
+        "http"
+      ],
+      "health": {
+        "ready": "/ready",
+        "live": "/live",
+        "start_secs": 10
+      },
+      "drain": {
+        "path": "/drain",
+        "done_path": "/drain/done",
+        "timeout_secs": 30
+      },
+      "service_drain": {
+        "route": "drain",
+        "timeout_secs": 30
+      },
+      "accel": {
+        "gpu": 0
+      },
+      "scratch": [
+        {
+          "target": "/cache/triton",
+          "tmpfs_mb": 512,
+          "exec": true
+        },
+        {
+          "target": "/cache/other",
+          "max_mb": 256,
+          "exec": true
+        }
+      ],
+      "limits": {
+        "ram_mb": 256,
+        "cpus": 0.5,
+        "pids": 64
+      }
+    }
+  ]
+}

@@ -194,6 +194,19 @@ realtime}`, `models[]`, `env`, `scratch[]` and `limits {ram_mb, cpus, pids}`
 - `scratch[]` is `{target, max_mb}` (a size-capped volume the agent owns) or
   `{target, tmpfs_mb}`. The target is not `/`, `/proc`, `/sys` or `/dev` (or
   below them), and not equal to, inside or around a model slot target.
+- A scratch entry may add `exec` (boolean, default `false`). **At most one**
+  entry may be `exec: true`, and its size (`max_mb` or `tmpfs_mb`) is at most
+  **1024 MiB** (512 MiB is the recommendation; the size is required as for any
+  scratch, there is no default). It is for a worker that compiles and loads
+  native code (Triton writes a `.so` into its cache dir and dlopens it). The
+  exec entry is mounted `nosuid,nodev` WITHOUT `noexec`, owned by the worker's
+  uid with mode 0700, and is tmpfs-backed (for both kinds), so it is empty at
+  every container start and is charged to the worker's memory limit. Every
+  other scratch keeps `nosuid,nodev,noexec`; the read-only rootfs, read-only
+  model mounts, dropped capabilities and no network are unchanged. The flag is
+  in the signed file, so it is part of what the operator approves, and
+  `noo addons check` names the exec scratch. Two exec entries, or one over the
+  cap, are `scratch_invalid`; a non-boolean `exec` is `field_type`.
 
 ### The door name
 
@@ -609,7 +622,9 @@ with the paired set manifest).
 
 The first failing rule wins; the fixtures each carry one defect, so order does
 not matter to them. Precedence worth knowing: a refused env prefix wins over
-the add-on prefix; `scratch_target_refused` wins over `scratch_invalid`.
+the add-on prefix; `scratch_target_refused` wins over `scratch_invalid`. The
+`exec` scratch checks (more than one entry, over 1024 MiB) come after the size
+range check.
 
 ## Images on the rail
 

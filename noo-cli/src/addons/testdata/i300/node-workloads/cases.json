@@ -364,5 +364,45 @@
     "file": "refuse-scratch-equals-model-slot.json",
     "valid": false,
     "code": "scratch_in_model_slot"
+  },
+  {
+    "file": "valid-scratch-exec.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "valid-scratch-exec-false.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "refuse-scratch-exec-two.json",
+    "valid": false,
+    "code": "scratch_invalid"
+  },
+  {
+    "file": "refuse-scratch-exec-over-cap.json",
+    "valid": false,
+    "code": "scratch_invalid"
+  },
+  {
+    "file": "refuse-scratch-exec-tmpfs-over-cap.json",
+    "valid": false,
+    "code": "scratch_invalid"
+  },
+  {
+    "file": "refuse-scratch-exec-type.json",
+    "valid": false,
+    "code": "field_type"
+  },
+  {
+    "file": "valid-scratch-exec-boundary.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "refuse-null-scratch-exec.json",
+    "valid": false,
+    "code": "field_type"
   }
 ]

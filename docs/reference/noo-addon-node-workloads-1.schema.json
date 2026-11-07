@@ -104,9 +104,9 @@
           "items": {
             "oneOf": [
               { "type": "object", "additionalProperties": false, "required": ["target", "max_mb"],
-                "properties": { "target": { "$ref": "#/$defs/target", "not": { "pattern": "^/(proc|sys|dev)(/|$)" } }, "max_mb": { "type": "integer", "minimum": 1, "maximum": 65536 } } },
+                "properties": { "target": { "$ref": "#/$defs/target", "not": { "pattern": "^/(proc|sys|dev)(/|$)" } }, "max_mb": { "type": "integer", "minimum": 1, "maximum": 65536 }, "exec": { "type": "boolean", "default": false } } },
               { "type": "object", "additionalProperties": false, "required": ["target", "tmpfs_mb"],
-                "properties": { "target": { "$ref": "#/$defs/target", "not": { "pattern": "^/(proc|sys|dev)(/|$)" } }, "tmpfs_mb": { "type": "integer", "minimum": 1, "maximum": 16384 } } }
+                "properties": { "target": { "$ref": "#/$defs/target", "not": { "pattern": "^/(proc|sys|dev)(/|$)" } }, "tmpfs_mb": { "type": "integer", "minimum": 1, "maximum": 16384 }, "exec": { "type": "boolean", "default": false } } }
             ]
           }
         },
@@ -130,6 +130,7 @@
     "env keys must start with <ADDON_UPPER>_ (the add-on name upper-cased, - as _), with the addon known at validation (env_key_outside_prefix). Refused prefixes win over the add-on prefix: NOO_, NVIDIA_, CUDA_, LD_, PYTHON, HF_, TRANSFORMERS_ (env_key_refused_prefix, stated above in propertyNames).",
     "an env bound with min and max needs min <= max (env_bound_invalid). Values in desired-config are strings: an integer bound takes a base-10 integer string, an enum takes one of its members, a boolean is {\"one_of\": [\"false\"]}.",
     "scratch targets are not /, /proc, /sys or /dev (or below them), are unique, and neither equal, inside nor around any model slot target (scratch_target_refused, scratch_invalid, scratch_in_model_slot).",
+    "at most one scratch entry has exec: true, and that entry's size (max_mb or tmpfs_mb) is at most 1024 (scratch_invalid). A non-boolean exec is field_type. The exec entry is mounted without noexec; every other scratch keeps noexec (A12).",
     "model slot names and targets are unique, and no slot target is inside another (model_slot_invalid).",
     "the agent mounts each chosen set read-only at its slot target, as one directory; many=true slots mount each set under <target>/<set id>; optional=true slots may stay empty.",
     "JSON null is refused on every field with field_type (the schema's types already refuse it; Go's decoder would read `\"gpu\": null` as 0). This format has no nullable field. A repeated object key is refused with duplicate_key.",
