@@ -398,7 +398,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["addons", "verify"], "", "Re-verify add-on locks offline and compare local and running images with the pins"),
     (&["addons", "launch-pins"], "[--root <dir>] <tag> [<name>...]", "Hidden: print verified add-on image pins for the launcher (internal)"),
     (&["addons", "launch-resources"], "--root <d> --tag <t> --project <p> --network <n> <name>...", "Hidden: write add-ons' declared runtime inputs for the launcher (internal)"),
-    (&["addons", "after-boot"], "", "Hidden: once per boot, start enabled add-ons that are down and report each attempt (run by systemd as the install owner)"),
+    (&["addons", "after-boot"], "", "Hidden: once per boot, start each enabled add-on that is down and report it (systemd)"),
     (&["addons", "rotate-secret"], "<name> <resource>", "Give an add-on's declared shared secret a new value; restart the add-on to apply"),
     (&["kiosk", "enroll"], "<blob> [--controller <https://…>] [--dry-run]", "Enroll this display as a kiosk seat (never a node); its CLI + assets then ride the rail"),
     (&["kiosk", "invite"], "<display-name> [--expiry-minutes <n>] [--url <https://…ts.net>]", "Controller: tag:kiosk, its two rules, a tagged auth key, the display's commands"),
