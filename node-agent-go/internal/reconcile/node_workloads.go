@@ -57,7 +57,18 @@ func newNodeWorkloads(cfg *config.Config, docker *dockerpkg.Client, sets *models
 	if docker == nil {
 		return nil, facts
 	}
-	gate := &nodepolicy.Gate{
+	nw := dockerpkg.NewNodeWorkloads(docker, sets)
+	nw.SetAdmit(newGate(cfg, mode, approvals, nvidia, facts, sets).Check)
+	return nw, facts
+}
+
+// newGate is the node's gate as the agent wires it: the consent mode and
+// approvals, whether this node is the controller's host and has opted in to
+// workloads there, and the three probes. Split out so a test can pin each
+// wire; a gate missing one would silently skip that refusal.
+func newGate(cfg *config.Config, mode nodepolicy.Mode, approvals *nodepolicy.Approvals,
+	nvidia func(context.Context) (bool, error), facts *nodepolicy.Facts, sets *modelsets.Store) *nodepolicy.Gate {
+	return &nodepolicy.Gate{
 		Mode: mode, Approvals: approvals,
 		ControllerHost: cfg.SelfNode, OnController: cfg.AddonWorkloadsOnController,
 		NvidiaRuntime: nvidia,
@@ -66,9 +77,6 @@ func newNodeWorkloads(cfg *config.Config, docker *dockerpkg.Client, sets *models
 			return sets.VerifiedManifest(modelsets.Ref{ID: id, Revision: revision})
 		},
 	}
-	nw := dockerpkg.NewNodeWorkloads(docker, sets)
-	nw.SetAdmit(gate.Check)
-	return nw, facts
 }
 
 // convergeNodeWorkloads drives every node workload desired-config names toward
