@@ -190,7 +190,7 @@ pub struct Refusal {
 }
 
 impl Refusal {
-    fn new(code: &'static str, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, detail: impl Into<String>) -> Self {
         Refusal {
             code,
             detail: detail.into(),

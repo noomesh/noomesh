@@ -78,7 +78,7 @@ fn gguf_dir() -> PathBuf {
 /// `noo cluster sync-images` writes `docker save` output here on the host
 /// (`${IMAGES_DIR:-$NOO_DATA_ROOT/images}`), nginx serves it as `/images/`,
 /// and compose mounts the same directory here read-only.
-fn image_dir() -> PathBuf {
+pub(crate) fn image_dir() -> PathBuf {
     PathBuf::from(
         std::env::var("NOO_ARTIFACT_IMAGE_DIR").unwrap_or_else(|_| "/artifacts/images".into()),
     )
