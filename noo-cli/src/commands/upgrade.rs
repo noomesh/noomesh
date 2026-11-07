@@ -1196,6 +1196,46 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
 }
 
 
+/// After a successful roll: the configured embedder, created in the embed
+/// container when that container runs and the model is not there.
+///
+/// Only onboard and `noo migrate import` created it, so a box onboarded on a
+/// release whose embedder step failed (an outside tester's 0.6.16 box, i545
+/// finding 53; the rc.3 rehearsal) stayed without one through every later
+/// upgrade, and `noo cluster verify` failed "the default space has no live
+/// node". A container that is down (a GPU host without the NVIDIA toolkit)
+/// is said once and left alone: there is nothing to create the model in.
+/// Never fails the roll.
+fn ensure_embedder_after_roll(g: &Globals) {
+    let embed = crate::envfile::container("ollama-embed");
+    let running = std::process::Command::new("docker")
+        .args(["inspect", "-f", "{{.State.Running}}", &embed])
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
+        .unwrap_or(false);
+    let model = crate::commands::provision::release_var("PAGEINDEX_EMBEDDING_MODEL");
+    let model = if model.is_empty() { "harrier".to_string() } else { model };
+    if !running {
+        if !g.json {
+            ui::warned(&format!(
+                "{embed} is not running, so the embedder ({model}) was not checked; \
+                 once it runs: noo models pull {model}"));
+        }
+        return;
+    }
+    for line in crate::onboard::steps::ensure_embed_model_core(&model) {
+        if g.json {
+            continue;
+        }
+        match line.chars().next() {
+            Some('+') => ui::done(&line[1..]),
+            Some('!') => ui::warned(&line[1..]),
+            Some('.') => ui::step(&line[1..]),
+            _ => eprintln!("{line}"),
+        }
+    }
+}
+
 /// What one `noo upgrade --stack` roll is working on, resolved once and
 /// Handed to every phase that needs it (instead of four loose locals).
 struct Roll {
@@ -1856,6 +1896,7 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
             // tailscale serve now, as `noo stack start|restart` do, so
             // `noo upgrade --all` needs no manual restart. Never fails the roll.
             super::mesh::front_addon_uis(g);
+            ensure_embedder_after_roll(g);
             // Prune superseded release images (finding #93: 13 upgrades
             // quietly accumulated 78 tags — gigabytes). Best-effort — a prune
             // failure must never taint a successful roll.
@@ -7464,5 +7505,25 @@ mod slice_pin_tests {
         let body = crate::test_src::fn_body(&mesh, "pub fn mesh_sync_assets(");
         let ask = body.find("slice_waits_for_stack(").expect("sync-assets must ask slice_waits_for_stack");
         assert!(ask < body.find("materialize(").expect("materialize"), "before it writes anything");
+    }
+}
+
+#[cfg(test)]
+mod embedder_after_roll_tests {
+    /// i545 finding 53 and the rc.3 rehearsal: only onboard and `noo migrate
+    /// import` created the embedder, so a box whose onboard embedder step
+    /// failed never got one from any later upgrade.
+    #[test]
+    fn a_successful_roll_ensures_the_embedder_in_a_running_embed_container() {
+        let src = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let launch = crate::test_src::fn_body(&src, "fn launch_stack(");
+        let success = launch.find("Ok(s) if s.success() =>").expect("the success arm");
+        let done = launch.find("stack now on").expect("the success close");
+        let call = launch.find("ensure_embedder_after_roll(g)").expect("the roll ensures the embedder");
+        assert!(success < done && done < call, "the embedder is ensured in the success arm, after the stack is up");
+        let ensure = crate::test_src::fn_body(&src, "fn ensure_embedder_after_roll(");
+        let running = ensure.find("if !running").expect("a running check");
+        let create = ensure.find("ensure_embed_model_core(&model)").expect("the shared fetch-and-create");
+        assert!(running < create, "nothing is created in a container that is down");
     }
 }

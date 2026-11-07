@@ -89,6 +89,39 @@ pub(crate) fn parse_pull_with(a: &mut Args) -> Result<(String, String), ArgError
 /// on the whole download, Python parity). Progress lines go to stderr;
 /// stdout gets the final line — the last stream JSON object in `--json`
 /// mode, a one-line success message otherwise.
+/// `noo models pull harrier`: the published harrier artifact into this host's
+/// embed container (`ensure_embed_model_core`), never the Ollama registry.
+fn pull_harrier(g: &Globals) -> i32 {
+    let lines = crate::onboard::steps::ensure_embed_model_core("harrier");
+    let (ok, already) = harrier_pull_outcome(&lines);
+    if g.json {
+        println!("{}", serde_json::json!({"model": "harrier", "ok": ok, "already_present": already}));
+    } else {
+        for line in &lines {
+            match line.chars().next() {
+                Some('+') => ui::done(&line[1..]),
+                Some('!') => ui::warned(&line[1..]),
+                Some('.') => ui::step(&line[1..]),
+                _ => println!("{line}"),
+            }
+        }
+        if already {
+            ui::done("harrier is already in the embed container");
+        }
+    }
+    if ok { 0 } else { 1 }
+}
+
+/// `(ok, already_present)` from `ensure_embed_model_core`'s tagged lines: no
+/// lines means the model was already listed; otherwise only a `+` (created)
+/// line is success.
+pub(crate) fn harrier_pull_outcome(lines: &[String]) -> (bool, bool) {
+    if lines.is_empty() {
+        return (true, true);
+    }
+    (lines.iter().any(|l| l.starts_with('+')), false)
+}
+
 pub fn models_pull(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     use std::io::BufRead as _;
 
@@ -101,6 +134,14 @@ pub fn models_pull(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             Ok(m) => crate::commands::voice_models::pull(g, m),
             Err(e) => fail(g.json, ExitCode::Usage, "bad_args", &e, Some("noo models pull whisper:base | noo models pull piper:en_US-lessac-medium")),
         };
+    }
+    // harrier is in no Ollama registry: it is converted from its HF weights
+    // and published as an OCI artifact, so the gateway's Ollama pull answered
+    // "pull model manifest: file does not exist" (i545 finding 54, an outside
+    // tester following the embedder hint). The same fetch-and-create onboard
+    // and `noo upgrade --stack` run, on this host's embed container.
+    if model == "harrier" {
+        return Ok(pull_harrier(g));
     }
     if backend != "ollama" {
         // Python parity: only the ollama backend supports pull; exit 1.
@@ -1717,5 +1758,30 @@ mod switch_targets_the_installs_backend {
         assert!(!should_remove_stale_noo_ollama(true, "vllm", "created"));
         // Running — someone may be using it deliberately; never remove it.
         assert!(!should_remove_stale_noo_ollama(true, "ollama", "running"));
+    }
+}
+
+#[cfg(test)]
+mod harrier_pull_tests {
+    /// i545 finding 54: `noo models pull harrier` asked the Ollama registry,
+    /// which has no harrier ("pull model manifest: file does not exist").
+    #[test]
+    fn harrier_is_fetched_from_its_artifact_never_the_ollama_registry() {
+        let src = crate::test_src::own_code(include_str!("models.rs"));
+        let pull = crate::test_src::fn_body(&src, "pub fn models_pull(");
+        let route = pull.find("if model == \"harrier\"").expect("harrier is routed");
+        let ollama = pull.find("/api/terminal/ollama/pull").expect("the ollama pull");
+        assert!(route < ollama, "harrier must be routed before the Ollama pull");
+        assert!(pull[route..ollama].contains("pull_harrier(g)"));
+        assert!(crate::test_src::fn_body(&src, "fn pull_harrier(").contains("ensure_embed_model_core(\"harrier\")"));
+    }
+
+    #[test]
+    fn a_harrier_pull_succeeds_only_on_a_created_or_present_model() {
+        use super::harrier_pull_outcome;
+        let l = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        assert_eq!(harrier_pull_outcome(&[]), (true, true), "already listed");
+        assert_eq!(harrier_pull_outcome(&l(&[".Fetching", "+Embedding model ready: harrier (1024-dim)"])), (true, false));
+        assert_eq!(harrier_pull_outcome(&l(&[".Fetching", "!Could not fetch/create harrier", "      docker create"])), (false, false));
     }
 }
