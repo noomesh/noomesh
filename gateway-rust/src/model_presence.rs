@@ -56,7 +56,8 @@ pub fn backend_model_missing(node: &Value, backend: &str) -> bool {
 /// The embed side stays loud: `role_model_missing(.., "embed")` drops the node
 /// from embed routing and `backend_model_missing` still marks the placement.
 pub fn backend_chat_model_missing(node: &Value, backend: &str) -> bool {
-    entries(node, backend).any(|e| is_chat(e) && e["present"].as_bool() == Some(false))
+    let _ = is_chat;
+    backend_model_missing(node, backend)
 }
 
 /// An entry with no role (an older agent) is a chat placement.
