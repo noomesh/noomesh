@@ -159,8 +159,17 @@ if [ -n "$U" ]; then
 fi
 
 # ── service account ────────────────────────────────────────────────────────
-# NEVER touch noo-ci (CI) — only the fleet's agent account.
-id -u noo-agent >/dev/null 2>&1 && userdel noo-agent 2>/dev/null && say "noo-agent account removed" || true
+# NEVER touch noo-ci (CI) — only the fleet's own accounts: the agent's and the
+# harness's (noo-apply creates noo-harness), then their groups. i545 96: an
+# uninstall that removed only noo-agent left the group (and noo-harness, whose
+# primary group it was), and the next prep's useradd refused. Users first: a
+# group cannot be deleted while it is some user's primary group.
+for _u in noo-harness noo-agent; do
+    id -u "$_u" >/dev/null 2>&1 && userdel "$_u" 2>/dev/null && say "$_u account removed" || true
+done
+for _g in noo-harness noo-agent; do
+    getent group "$_g" >/dev/null 2>&1 && groupdel "$_g" 2>/dev/null && say "$_g group removed" || true
+done
 
 # On a gate-initiated teardown the applier + gate are being removed with
 # everything else; clean up this script's installed copy last.

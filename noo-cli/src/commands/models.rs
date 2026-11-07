@@ -655,6 +655,30 @@ pub(crate) fn parse_recommended_with(a: &mut Args) -> Result<(Option<i64>, Optio
     Ok((tier, arch, refresh))
 }
 
+/// The hardware tier from `/api/cluster/nodes`: 1 at 10 GB of VRAM or more
+/// on the best node, 2 at 4 GB, else 3 (CPU). The route answers
+/// `{"nodes": [...], "stats": ...}`; reading it as a bare array (as this
+/// did) made every authenticated answer "could not read" and the tier CPU,
+/// whatever GPU the node had (i545 finding 23). A bare array is still read.
+/// `None` when the answer holds no node list.
+pub(crate) fn tier_from_nodes(v: &serde_json::Value) -> Option<i64> {
+    let arr = v.get("nodes").and_then(|n| n.as_array()).or_else(|| v.as_array())?;
+    // A standalone controller with no node yet reports none: tier 3 (CPU)
+    // is the honest floor when nothing reports VRAM (2026-09-28: tier 1
+    // there recommended 35 GB vLLM models to a CPU-only laptop).
+    let best_vram = arr
+        .iter()
+        .map(|n| n["capabilities"]["vram_gb"].as_f64().or_else(|| n["vram_gb"].as_f64()).unwrap_or(0.0))
+        .fold(0.0f64, f64::max);
+    Some(if best_vram >= 10.0 {
+        1
+    } else if best_vram >= 4.0 {
+        2
+    } else {
+        3
+    })
+}
+
 /// `noo models recommended [--tier/-t N] [--arch A] [--refresh]` — curated
 /// recommendations for a node's hardware tier + arch. Tier auto-detects
 /// from the gateway's node list when omitted; models already cached on the
@@ -667,24 +691,7 @@ pub fn models_recommended(g: &Globals, args: &[String]) -> Result<i32, Unhandled
     let tier = match tier {
         Some(t) => t,
         None => {
-            let detected = get_json_opt(g, "/api/cluster/nodes", true, 5).and_then(|nodes| {
-                let arr = nodes.as_array()?.clone();
-                // A standalone controller has NO nodes: the box itself is
-                // not one. Tier 1 there recommended 35 GB vLLM models to
-                // a CPU-only laptop (2026-09-28 newcomer rehearsal); tier
-                // 3 (CPU) is the honest floor when nothing reports VRAM.
-                let best_vram = arr
-                    .iter()
-                    .map(|n| n["capabilities"]["vram_gb"].as_f64().unwrap_or(0.0))
-                    .fold(0.0f64, f64::max);
-                Some(if best_vram >= 10.0 {
-                    1
-                } else if best_vram >= 4.0 {
-                    2
-                } else {
-                    3
-                })
-            });
+            let detected = get_json_opt(g, "/api/cluster/nodes", true, 5).and_then(|nodes| tier_from_nodes(&nodes));
             match detected {
                 Some(t) => {
                     if !g.json {
@@ -1351,6 +1358,22 @@ pub fn models_switch(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
 #[cfg(test)]
 mod switch_tests {
+    /// i545 23: the node list is under `nodes`; a GPU node's tier is read
+    /// from it, not lost to a misread shape.
+    #[test]
+    fn the_tier_is_read_from_the_routes_node_list() {
+        use serde_json::json;
+        let gpu = json!({"nodes": [{"capabilities": {"vram_gb": 12.0}}, {"capabilities": {"vram_gb": 2.0}}], "stats": {}});
+        assert_eq!(super::tier_from_nodes(&gpu), Some(1));
+        let mid = json!({"nodes": [{"capabilities": {"vram_gb": 6.0}}]});
+        assert_eq!(super::tier_from_nodes(&mid), Some(2));
+        let p500 = json!({"nodes": [{"vram_gb": 2.0}]});
+        assert_eq!(super::tier_from_nodes(&p500), Some(3));
+        assert_eq!(super::tier_from_nodes(&json!({"nodes": []})), Some(3), "no node yet: the CPU floor");
+        assert_eq!(super::tier_from_nodes(&json!([{"capabilities": {"vram_gb": 24.0}}])), Some(1), "a bare array still reads");
+        assert_eq!(super::tier_from_nodes(&json!({"error": "x"})), None);
+    }
+
     use super::*;
 
     #[test]

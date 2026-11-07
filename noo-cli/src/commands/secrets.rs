@@ -2454,7 +2454,10 @@ pub fn secrets_audit(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     findings.extend(secret_age_findings(&sops_path, &sops, now_unix()));
     // Every file compose delivers is in its consumer, and no `_FILE`
     // pointer names a missing one (a stat through the docker API, never a read).
-    findings.extend(super::secrets_delivery::file_delivery_findings());
+    // i545 52: a conditional file pointer is judged only when its key has a
+    // value in either store.
+    let held = |k: &str| sops.value_len(k).is_some_and(|n| n > 0) || env.value_len(k).is_some_and(|n| n > 0);
+    findings.extend(super::secrets_delivery::file_delivery_findings(&held));
     if let Ok(conf) = std::fs::read_to_string(root.join(super::nats_users::USERS_CONF)) {
         findings.extend(orphaned_node_password_findings(&sops, &conf));
     }

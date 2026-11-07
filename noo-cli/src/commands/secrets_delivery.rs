@@ -853,6 +853,17 @@ pub(crate) struct Delivery {
     pub container: String,
     pub target: String,
     pub pointer: Option<String>,
+    /// The store key the pointer is conditional on, when compose sets it
+    /// as `${KEY:+/run/secrets/<target>}`: with KEY unset the pointer is
+    /// empty BY DESIGN while the file is still mounted (i545 finding 52).
+    pub gate: Option<String>,
+}
+
+/// The `KEY` of a `${KEY:+…}` value, if the value has that form.
+pub(crate) fn gate_key(value: &str) -> Option<String> {
+    let rest = &value[value.find("${")? + 2..];
+    let (key, _) = rest.split_once(":+")?;
+    (!key.is_empty() && key.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')).then(|| key.to_string())
 }
 
 /// Every `(service, target, pointer)` in a compose file's text, for services
@@ -909,20 +920,31 @@ pub(crate) fn deliveries(compose: &str) -> Vec<Delivery> {
                 .or_else(|| s.as_str());
             let Some(target) = target else { continue };
             let path = format!("/run/secrets/{target}");
-            let pointer = env
+            let found = env
                 .iter()
-                .find(|(_, v)| v.contains(&format!("{path}}}")) || v.ends_with(&path) || v.contains(&format!("{path}\"")))
-                .map(|(k, _)| k.clone());
-            out.push(Delivery { service: name.to_string(), container: container.clone(), target: target.to_string(), pointer });
+                .find(|(_, v)| v.contains(&format!("{path}}}")) || v.ends_with(&path) || v.contains(&format!("{path}\"")));
+            let pointer = found.map(|(k, _)| k.clone());
+            let gate = found.and_then(|(_, v)| gate_key(v));
+            out.push(Delivery { service: name.to_string(), container: container.clone(), target: target.to_string(), pointer, gate });
         }
     }
     out
 }
 
+/// Does the store hold the key a conditional pointer is gated on? An
+/// unconditional pointer (no gate) is always expected.
+fn gate_held(d: &Delivery, held: &dyn Fn(&str) -> bool) -> bool {
+    match &d.gate {
+        Some(g) => held(g),
+        None => true,
+    }
+}
+
 /// The judgement for one delivery, pure. `added` is the delivered paths
 /// found present in the container (None = not running here), `set` the
-/// names of its non-empty environment variables.
-pub(crate) fn delivery_finding(d: &Delivery, added: Option<&[String]>, set: &[String]) -> Option<Finding> {
+/// names of its non-empty environment variables, `held` whether a store
+/// key has a value (either store).
+pub(crate) fn delivery_finding(d: &Delivery, added: Option<&[String]>, set: &[String], held: &dyn Fn(&str) -> bool) -> Option<Finding> {
     let added = added?;
     let path = format!("/run/secrets/{}", d.target);
     let present = added.contains(&path);
@@ -938,15 +960,24 @@ pub(crate) fn delivery_finding(d: &Delivery, added: Option<&[String]>, set: &[St
                 d.pointer.as_deref().unwrap_or("?")
             ),
         }),
-        (false, true) if d.pointer.is_some() => Some(Finding {
+        // i545 52: a conditional pointer whose key no store holds is unset
+        // by design (the file is mounted regardless): not a finding.
+        (false, true) if d.pointer.is_some() && gate_held(d, held) => Some(Finding {
             severity: Severity::Warn,
             kind: "secret-file-unpointed",
             key: d.target.clone(),
-            message: format!(
-                "{} holds {path} but {} is not set — the container predates the store change; recreate: noo stack restart --force",
-                d.container,
-                d.pointer.as_deref().unwrap_or("?")
-            ),
+            message: match &d.gate {
+                Some(g) => format!(
+                    "{} holds {path} but {} is not set, though {g} has a value in the store: the container was created before {g} was set; recreate: noo stack restart --force",
+                    d.container,
+                    d.pointer.as_deref().unwrap_or("?")
+                ),
+                None => format!(
+                    "{} holds {path} but {} is not set, though compose always sets it: the container predates this compose file; recreate: noo stack restart --force",
+                    d.container,
+                    d.pointer.as_deref().unwrap_or("?")
+                ),
+            },
         }),
         _ => None,
     }
@@ -975,7 +1006,7 @@ pub(crate) fn delivering_paths(root: &std::path::Path) -> Vec<std::path::PathBuf
 
 /// The `secrets audit` findings for file delivery, against the running
 /// compose files at the repo root. Silent when they deliver nothing.
-pub fn file_delivery_findings() -> Vec<Finding> {
+pub fn file_delivery_findings(held: &dyn Fn(&str) -> bool) -> Vec<Finding> {
     let root = crate::envfile::repo_root();
     let all: Vec<Delivery> = delivering_paths(&root)
         .iter()
@@ -986,7 +1017,7 @@ pub fn file_delivery_findings() -> Vec<Finding> {
         wanted.entry(d.container.clone()).or_default().push(format!("/run/secrets/{}", d.target));
     }
     let probes = super::container_files::probe(&wanted);
-    findings_from_probes(&all, &probes, &|c| env_names(c).unwrap_or_default())
+    findings_from_probes(&all, &probes, &|c| env_names(c).unwrap_or_default(), held)
 }
 
 /// The findings, given each container's probe. A container that was not
@@ -996,6 +1027,7 @@ pub(crate) fn findings_from_probes(
     all: &[Delivery],
     probes: &BTreeMap<String, super::container_files::Probe>,
     env: &dyn Fn(&str) -> Vec<String>,
+    held: &dyn Fn(&str) -> bool,
 ) -> Vec<Finding> {
     use super::container_files::Probe;
     let mut sets: BTreeMap<&str, Vec<String>> = BTreeMap::new();
@@ -1004,7 +1036,7 @@ pub(crate) fn findings_from_probes(
         // Absent: not running here; Unchecked: reported once, below.
         if let Some(Probe::Checked(present)) = probes.get(&d.container) {
             let set = sets.entry(d.container.as_str()).or_insert_with(|| env(&d.container));
-            out.extend(delivery_finding(d, Some(present), set));
+            out.extend(delivery_finding(d, Some(present), set, held));
         }
     }
     for (container, p) in probes {
@@ -1303,7 +1335,7 @@ mod tests {
     fn live_row_against_a_named_project() {
         let c = secrets_not_in_env_row();
         println!("ROW secrets not in env: {:?} — {}", c.verdict, c.detail);
-        let findings = file_delivery_findings();
+        let findings = file_delivery_findings(&|_| true);
         if findings.is_empty() {
             println!("AUDIT file delivery: no findings");
         }
@@ -1400,15 +1432,39 @@ mod tests {
 
     #[test]
     fn a_pointer_at_a_missing_file_is_an_error_and_a_present_one_is_quiet() {
-        let d = Delivery { service: "gateway".into(), container: "noo-gateway".into(), target: "noo_jwt_secret".into(), pointer: Some("NOO_JWT_SECRET_FILE".into()) };
+        let d = Delivery { service: "gateway".into(), container: "noo-gateway".into(), target: "noo_jwt_secret".into(), pointer: Some("NOO_JWT_SECRET_FILE".into()), gate: None };
         let set = vec!["NOO_JWT_SECRET_FILE".to_string()];
-        let f = delivery_finding(&d, Some(&[]), &set).expect("finding");
+        let all = |_: &str| true;
+        let f = delivery_finding(&d, Some(&[]), &set, &all).expect("finding");
         assert_eq!(f.severity, Severity::Error);
-        assert!(delivery_finding(&d, Some(&["/run/secrets/noo_jwt_secret".to_string()]), &set).is_none());
+        assert!(delivery_finding(&d, Some(&["/run/secrets/noo_jwt_secret".to_string()]), &set, &all).is_none());
         // optional secret the store does not hold: no pointer, no file — fine
-        assert!(delivery_finding(&d, Some(&[]), &[]).is_none());
+        assert!(delivery_finding(&d, Some(&[]), &[], &all).is_none());
         // container not running here: no judgement
-        assert!(delivery_finding(&d, None, &set).is_none());
+        assert!(delivery_finding(&d, None, &set, &all).is_none());
+    }
+
+    /// i545 52: compose mounts every optional secret file but sets its
+    /// pointer only when the key has a value
+    /// (`ANTHROPIC_API_KEY_FILE=${ANTHROPIC_API_KEY:+/run/secrets/…}`). A key
+    /// no store holds is no finding; one a store holds while the pointer is
+    /// unset is, and the advice names it.
+    #[test]
+    fn an_unset_optional_key_is_not_an_unpointed_secret_file() {
+        let compose = "services:\n  gateway:\n    container_name: ${NOO_CONTAINER_PREFIX:-noo}-gateway\n    secrets: [anthropic_api_key]\n    environment:\n      ANTHROPIC_API_KEY_FILE: ${ANTHROPIC_API_KEY:+/run/secrets/anthropic_api_key}\n";
+        let ds = deliveries(compose);
+        assert_eq!(ds.len(), 1, "{ds:?}");
+        assert_eq!(ds[0].gate.as_deref(), Some("ANTHROPIC_API_KEY"), "the gate is read from the compose value");
+        let mounted = ["/run/secrets/anthropic_api_key".to_string()];
+        let none = |_: &str| false;
+        assert!(delivery_finding(&ds[0], Some(&mounted), &[], &none).is_none(), "key absent from both stores: by design");
+        let held = |k: &str| k == "ANTHROPIC_API_KEY";
+        let f = delivery_finding(&ds[0], Some(&mounted), &[], &held).expect("held, unpointed");
+        assert_eq!(f.kind, "secret-file-unpointed");
+        assert!(f.message.contains("ANTHROPIC_API_KEY has a value in the store"), "{}", f.message);
+        assert_eq!(gate_key("${A_B2:+/run/secrets/x}").as_deref(), Some("A_B2"));
+        assert_eq!(gate_key("/run/secrets/x"), None);
+        assert_eq!(gate_key("${lower:+x}"), None);
     }
 
     /// The audit end to end against a fake docker daemon: a planted secret
@@ -1419,7 +1475,7 @@ mod tests {
     fn the_finding_fires_on_a_planted_file_and_an_unchecked_container_is_not_a_pass() {
         use super::super::container_files::{probe_via_api, probe_via_diff, tests::*, Probe, BUDGET};
         use std::time::{Duration, Instant};
-        let d = |c: &str, t: &str, p: &str| Delivery { service: "s".into(), container: c.into(), target: t.into(), pointer: Some(p.into()) };
+        let d = |c: &str, t: &str, p: &str| Delivery { service: "s".into(), container: c.into(), target: t.into(), pointer: Some(p.into()), gate: None };
         let all = vec![
             d("noo-gateway", "noo_jwt_secret", "NOO_JWT_SECRET_FILE"),
             d("noo-worker", "redis_password", "REDIS_PASSWORD_FILE"),
@@ -1442,7 +1498,7 @@ mod tests {
         let slow_probe = probe_via_diff(slow.to_str().unwrap(), &BTreeMap::from([("noo-redis".to_string(), vec!["/run/secrets/redis_password".to_string()])]), Instant::now() + Duration::from_millis(200));
         probes.insert("noo-redis".into(), slow_probe["noo-redis"].clone());
         let env = |c: &str| if c == "noo-worker" || c == "noo-redis" { vec!["REDIS_PASSWORD_FILE".to_string()] } else { vec![] };
-        let f = findings_from_probes(&all, &probes, &env);
+        let f = findings_from_probes(&all, &probes, &env, &|_| true);
         let kinds: Vec<(&str, &str)> = f.iter().map(|f| (f.kind, f.key.as_str())).collect();
         assert!(kinds.contains(&("secret-file-unpointed", "noo_jwt_secret")), "{kinds:?}");
         assert!(kinds.contains(&("secret-file-missing", "REDIS_PASSWORD_FILE")), "{kinds:?}");
