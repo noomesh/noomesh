@@ -1079,7 +1079,15 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             }
         }
     };
-    ui::done(&format!("registered as {}", resp["node_name"].as_str().or(cred.node.as_deref()).unwrap_or(&hostname)));
+    // "admitted", not "registered": the controller has stored this
+    // enrollment, and the registry row appears only when the agent first
+    // heartbeats, which needs the first bundle (`noo cluster provision`).
+    // "registered" sent an outside tester looking for a row that, by
+    // design, was not there yet (i545 findings 98 and 102).
+    let admitted_as = resp["node_name"].as_str().or(cred.node.as_deref()).unwrap_or(&hostname);
+    ui::done(&format!(
+        "admitted as {admitted_as}: no agent yet, it starts when the controller runs `noo cluster provision {admitted_as}`"
+    ));
     // An older controller still advertises `ssh_public_key`; it is ignored:
     // enrollment installs no key (the `noo-gate` lane is retired).
     let bound_node = resp["node_name"]

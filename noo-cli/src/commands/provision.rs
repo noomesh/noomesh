@@ -36,7 +36,7 @@
 //! `cluster_provision` is a literal ordered list of phases; read it for the
 //! order. In order: `parse_provision_args`, `begin_provision` (lane),
 //! `wait_for_enrollment` (1), `load_enrollment` (2), `resolve_identity`,
-//! `resolve_machine`, `ensure_node_certs` + door leaves (3), `load_credentials`
+//! `resolve_machine`, `adopt_signing_key_first`, `ensure_node_certs` + door leaves (3), `load_credentials`
 //! (4), `obtain_binary` (5), `read_env_template` / `build_env_vars` /
 //! `check_data_root` / `render_agent_env` (6), `read_bundle_material`,
 //! `prepare_bundle_workspace`, `base_bundle_files`, the `attach_*` phases
@@ -319,6 +319,7 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     let enrollment = load_enrollment(g, &a, &site);
     let id = resolve_identity(g, &a, &site, &enrollment);
     let machine = resolve_machine(g, &a, &enrollment);
+    adopt_signing_key_first(g, &a);
 
     // The node's PKI, and the agent it will run.
     let pki = ensure_node_certs(g, &a, &site, &id);
@@ -1057,19 +1058,30 @@ fn read_bundle_material(g: &Globals, a: &ProvisionArgs, site: &ProvSite, pki: &P
     BundleMaterial { unit, ca_crt, node_crt, node_key }
 }
 
-/// Step 7: the CA, the signing key delivered first when the node has not adopted it, and a scratch dir.
-fn prepare_bundle_workspace(g: &Globals, a: &ProvisionArgs, pki: &Path) -> (crate::pki::ClusterCa, std::path::PathBuf) {
+/// The signing key, delivered ALONE first when the node has not adopted it.
+///
+/// The CA signs nothing but the signing key itself, so a node that has not
+/// adopted it gets the key first (a CA-signed rollover carrying `signing-pub`
+/// and nothing else), and only then its bundle, signed by the signing key.
+///
+/// It runs BEFORE `ensure_node_certs`, so a node that cannot adopt leaves
+/// nothing minted behind. It used to run after: a first-time pull node the
+/// rollout refused still got certs issued into `<pki>/nodes/<node>`, and the
+/// next run called that directory orphaned material to purge (i545 finding
+/// 99, the state the command itself had just created).
+fn adopt_signing_key_first(g: &Globals, a: &ProvisionArgs) {
+    let ca = crate::pki::ClusterCa::new(crate::pki::pki_dir());
+    if !ca.signing_adopted(&a.node) {
+        deliver_signing_key_first(g, &a.node, &ca);
+    }
+}
+
+/// Step 7: the CA and a scratch dir (the signing key was adopted in
+/// `adopt_signing_key_first`).
+fn prepare_bundle_workspace(_g: &Globals, a: &ProvisionArgs, pki: &Path) -> (crate::pki::ClusterCa, std::path::PathBuf) {
     let node = a.node.clone();
     let pki = pki.to_path_buf();
     let ca = crate::pki::ClusterCa::new(pki.clone());
-    // The CA signs nothing but the signing key itself, so a
-    // node that has not adopted it gets the key ALONE first (a CA-signed
-    // rollover carrying `signing-pub` and nothing else), and only then this
-    // bundle, signed by the signing key. Done before anything is minted, so
-    // a node that cannot adopt leaves nothing half-rotated behind.
-    if !ca.signing_adopted(&node) {
-        deliver_signing_key_first(g, &node, &ca);
-    }
     let work = std::env::temp_dir().join(format!("noo-provision-{node}-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&work);
     (ca, work)
@@ -5363,6 +5375,23 @@ mod controller_hostd_tests {
         assert!(hostd.contains(r#"files.push(("hostd-binary""#), "the hostd phase stages hostd");
         assert!(!hostd.contains("self_node"), "hostd is staged for every node, so its phase has no self-node branch");
         assert!(super::phase_src::body("attach_cli").contains("the bundle carries no CLI"), "the self-node CLI branch");
+    }
+}
+
+#[cfg(test)]
+mod signing_key_order_tests {
+    /// i545 finding 99: certs were issued before the signing key was
+    /// delivered, so a node that could not adopt left material behind that
+    /// the next run called orphaned. The key goes first.
+    #[test]
+    fn the_signing_key_is_adopted_before_any_cert_is_issued() {
+        let list = super::phase_src::list();
+        let adopt = list.find("adopt_signing_key_first(").expect("the adoption phase");
+        let certs = list.find("ensure_node_certs(").expect("the cert phase");
+        assert!(adopt < certs, "the signing key must be adopted before certs are issued");
+        assert!(super::phase_src::body("adopt_signing_key_first").contains("deliver_signing_key_first("));
+        assert!(!super::phase_src::body("prepare_bundle_workspace").contains("deliver_signing_key_first("),
+            "the key is delivered in one place");
     }
 }
 
