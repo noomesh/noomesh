@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 PersonifAI LLC
 
-// Read by the workload placement route and the desired-config builder
-// (i300 H3b-2/3); until then only its tests call it.
+// The placement route (H3b-2) reads it; the desired-config builder (H3b-3)
+// will read rail_image and staged_set too.
 #![allow(dead_code)]
 
 //! Where the gateway reads what an add-on's node workloads are and which
@@ -141,6 +141,50 @@ pub fn read_decl(wl_dir: &Path, routes_dir: &Path, images_dir: &Path, addon: &st
         Err(r) if r.code == code::IMAGE_NOT_IN_LOCK => Err(Refusal::new(code::IMAGE_MISSING, format!("{r} (the rail holds no image by that name)"))),
         Err(r) => Err(r),
     }
+}
+
+/// The workload object `name` of `addon`'s delivered node-workloads.json,
+/// exactly as the file carries it: desired-config's `decl` travels verbatim.
+/// Call after [`read_decl`] validated the same file.
+pub fn raw_workload(wl_dir: &Path, addon: &str, name: &str) -> Option<serde_json::Value> {
+    if !crate::addon_registry::name_ok(addon) {
+        return None;
+    }
+    let bytes = std::fs::read(wl_dir.join(addon).join(NODE_WORKLOADS_FILE)).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("workloads")?.as_array()?.iter().find(|w| w.get("name").and_then(|n| n.as_str()) == Some(name)).cloned()
+}
+
+/// Largest staged `model-set.json` read (the rail's cap).
+const MAX_SET_MANIFEST_BYTES: u64 = 1 << 20;
+
+/// A model set staged on the controller (`noo models stage`), validated, and
+/// the total bytes of its files. A set is staged only once its detached
+/// signature is there (the CLI writes it last); the node verifies the
+/// signature itself. Not staged, or not a valid set of that id and revision:
+/// `set_unverified`.
+pub fn staged_set(sets_root: &Path, id: &str, revision: &str) -> Result<(crate::node_workloads::ModelSet, u64), Refusal> {
+    let unverified = |why: String| Refusal::new(code::SET_UNVERIFIED, why);
+    if !crate::node_workloads::valid_set_ref(id, revision) {
+        return Err(unverified(format!("set {id:?}@{revision:?} is not a set name")));
+    }
+    let dir = sets_root.join(id).join(revision);
+    if !dir.join("model-set.json.sig").is_file() {
+        return Err(unverified(format!("set {id}@{revision} is not staged on the controller (noo models stage)")));
+    }
+    let path = dir.join("model-set.json");
+    match std::fs::symlink_metadata(&path) {
+        Ok(m) if m.is_file() && m.len() <= MAX_SET_MANIFEST_BYTES => {}
+        _ => return Err(unverified(format!("set {id}@{revision}: model-set.json is missing or not a regular file"))),
+    }
+    let bytes = std::fs::read(&path).map_err(|e| unverified(format!("set {id}@{revision}: {e}")))?;
+    let set = crate::node_workloads::validate_model_set(&bytes)
+        .map_err(|r| unverified(format!("set {id}@{revision}: model-set.json is refused ({r})")))?;
+    if set.id != id || set.revision != revision {
+        return Err(unverified(format!("set {id}@{revision}: model-set.json names {}@{}", set.id, set.revision)));
+    }
+    let bytes: u64 = set.files.iter().map(|f| f.bytes.max(0) as u64).sum();
+    Ok((set, bytes))
 }
 
 /// [`read_decl`] for a REGISTERED add-on, from the mounted directories;
@@ -293,6 +337,74 @@ mod tests {
     fn a_declared_image_the_rail_does_not_hold_is_image_missing() {
         let (wl, rt, img) = delivered("decl-norail", false);
         assert_eq!(read_decl(&wl, &rt, &img, "rhaddon").unwrap_err().code, code::IMAGE_MISSING);
+        let _ = std::fs::remove_dir_all(wl.parent().unwrap());
+    }
+
+    const SET_ID: &str = "rh-s2s-7b";
+    const SET_REV: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// The valid-voice fixture staged as `noo models stage` leaves it.
+    fn staged(tag: &str, sig: bool) -> PathBuf {
+        let root = scratch(tag);
+        let d = root.join(SET_ID).join(SET_REV);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("model-set.json"), fixture("model-sets/valid-voice.json")).unwrap();
+        if sig {
+            std::fs::write(d.join("model-set.json.sig"), b"sig").unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn a_staged_signed_set_validates_and_is_sized() {
+        let root = staged("set-ok", true);
+        let (set, bytes) = staged_set(&root, SET_ID, SET_REV).unwrap();
+        assert_eq!((set.id.as_str(), set.revision.as_str()), (SET_ID, SET_REV));
+        assert_eq!(bytes, 15_600_574_336, "the sum of its files' bytes");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_set_without_its_signature_is_not_staged() {
+        let root = staged("set-nosig", false);
+        let e = staged_set(&root, SET_ID, SET_REV).unwrap_err();
+        assert_eq!(e.code, code::SET_UNVERIFIED);
+        assert!(e.detail.contains("not staged"), "{e}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_set_name_that_is_not_one_never_reaches_the_filesystem() {
+        let root = staged("set-names", true);
+        for (id, rev) in [("../rh-s2s-7b", SET_REV), (SET_ID, "../x"), ("..", SET_REV), (SET_ID, "")] {
+            let e = staged_set(&root, id, rev).unwrap_err();
+            assert_eq!(e.code, code::SET_UNVERIFIED);
+            assert!(e.detail.contains("is not a set name"), "{id:?} {rev:?}: {e}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_manifest_naming_another_set_is_refused() {
+        let root = staged("set-other", true);
+        let other = root.join("rh-other").join(SET_REV);
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("model-set.json"), fixture("model-sets/valid-voice.json")).unwrap();
+        std::fs::write(other.join("model-set.json.sig"), b"sig").unwrap();
+        let e = staged_set(&root, "rh-other", SET_REV).unwrap_err();
+        assert_eq!(e.code, code::SET_UNVERIFIED);
+        assert!(e.detail.contains("names rh-s2s-7b"), "{e}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_raw_workload_is_the_files_object_verbatim() {
+        let (wl, _rt, _img) = delivered("raw", true);
+        let file: serde_json::Value = serde_json::from_slice(&fixture("node-workloads/valid-rhaddon.json")).unwrap();
+        let name = file["workloads"][0]["name"].as_str().unwrap();
+        assert_eq!(raw_workload(&wl, "rhaddon", name), Some(file["workloads"][0].clone()));
+        assert_eq!(raw_workload(&wl, "rhaddon", "nope"), None);
+        assert_eq!(raw_workload(&wl, "../rhaddon", name), None);
         let _ = std::fs::remove_dir_all(wl.parent().unwrap());
     }
 

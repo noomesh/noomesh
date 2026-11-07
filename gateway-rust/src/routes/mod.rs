@@ -20,6 +20,7 @@ mod agents;
 mod cli_piece;
 mod console_piece;
 pub(crate) mod artifacts;
+mod node_workload_placements;
 mod bootstrap;
 pub(crate) use bootstrap::self_agent_base;
 mod seats;
