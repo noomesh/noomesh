@@ -100,6 +100,10 @@ type provAPI interface {
 	CreateInternalNetwork(ctx context.Context, name string, labels map[string]string) error
 	RemoveNetwork(ctx context.Context, name string) error
 	RemoveVolumes(ctx context.Context, addon, workload string) error
+	// RemoveVolumeByName removes the one volume of that exact name, if it is
+	// this agent's (noo.managed-by=agent). A volume of that name that is not
+	// the agent's is left alone and reported as foreign. Absent is not an error.
+	RemoveVolumeByName(ctx context.Context, name string) (foreign bool, err error)
 	NvidiaRuntime(ctx context.Context) bool
 	// ListManaged is every workload this agent created (label
 	// noo.managed-by=agent), one ref per addon/workload, with the labels of
@@ -413,8 +417,26 @@ func (p *NodeWorkloads) teardown(ctx context.Context, addon, name string) error 
 			return fmt.Errorf("remove %s: %w", n, err)
 		}
 	}
+	// The scratch volumes, by their exact names first (A12: a stale compiled
+	// object must never survive a release), then the label sweep for anything
+	// else the agent made. A same-named volume that is not ours is never
+	// removed; it is reported once everything else is gone.
+	var foreign []string
+	for i := 0; i < maxScratchEntries; i++ {
+		vn := workloadVolumeName(addon, name, i)
+		f, err := p.api.RemoveVolumeByName(ctx, vn)
+		if err != nil {
+			return fmt.Errorf("remove scratch volume %s: %w", vn, err)
+		}
+		if f {
+			foreign = append(foreign, vn)
+		}
+	}
 	if err := p.api.RemoveVolumes(ctx, addon, name); err != nil {
 		return fmt.Errorf("remove scratch volumes: %w", err)
+	}
+	if len(foreign) > 0 {
+		return refuse(nodewl.ReasonContainerConflict, "", "%s exists and was not created by this agent", strings.Join(foreign, ", "))
 	}
 	if err := p.api.RemoveNetwork(ctx, WorkloadNetworkName(addon, name)); err != nil {
 		return fmt.Errorf("remove network: %w", err)

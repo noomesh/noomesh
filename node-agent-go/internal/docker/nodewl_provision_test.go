@@ -49,6 +49,13 @@ type fakeProv struct {
 	calls   []string
 	created map[string]createSpec
 	volumes int
+	// vols is the volumes the daemon would hold: name -> the generation that
+	// created it (a container create makes every volume mount it names, as
+	// Docker does). byName records the exact names release asked to remove.
+	vols    map[string]int
+	byName  []string
+	events  []string // volume removals and creates, in order (calls stays as it was)
+	volGens int
 
 	// F5b. The lifecycle runs goroutines (release, readiness watch), so the
 	// fake is guarded; tests read it through the locked helpers.
@@ -120,7 +127,16 @@ func (f *fakeProv) StopContainer(_ context.Context, name string, _ int) error {
 }
 
 func newFakeProv() *fakeProv {
-	return &fakeProv{images: map[string]bool{}, ctrs: map[string]*ctrInfo{}, nets: map[string]*netInfo{}, nvidia: true, created: map[string]createSpec{}}
+	return &fakeProv{images: map[string]bool{}, ctrs: map[string]*ctrInfo{}, nets: map[string]*netInfo{}, nvidia: true, created: map[string]createSpec{}, vols: map[string]int{}}
+}
+
+func (f *fakeProv) RemoveVolumeByName(_ context.Context, name string) (bool, error) {
+	f.byName = append(f.byName, name)
+	if _, ok := f.vols[name]; ok {
+		f.events = append(f.events, "rmvol:"+name)
+		delete(f.vols, name)
+	}
+	return false, nil
 }
 
 func (f *fakeProv) ImageExists(_ context.Context, id string) (bool, error) {
@@ -143,7 +159,16 @@ func (f *fakeProv) CreateContainer(_ context.Context, s createSpec) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "create:"+s.Name)
+	f.events = append(f.events, "create:"+s.Name)
 	f.created[s.Name] = s
+	for _, m := range s.Host.Mounts {
+		if m.Type == mount.TypeVolume {
+			if _, ok := f.vols[m.Source]; !ok {
+				f.volGens++
+				f.vols[m.Source] = f.volGens
+			}
+		}
+	}
 	l := map[string]string{}
 	for k, v := range s.Config.Labels {
 		l[k] = v
