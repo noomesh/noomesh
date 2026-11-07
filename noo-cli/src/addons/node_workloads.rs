@@ -851,9 +851,6 @@ fn validate_scratch(ss: &[Scratch], ms: &[Slot]) -> Result<(), NodeWorkloadRefus
                 "scratch[{i}]: an exec scratch is at most {MAX_EXEC_SCRATCH_MB} MiB"
             )));
         }
-        if s.exec && ss[..i].iter().any(|o| o.exec) {
-            return Err(bad(format!("scratch[{i}]: a second exec scratch")));
-        }
         if ss[..i].iter().any(|o| o.target == s.target) {
             return Err(bad(format!("scratch[{i}]: target `{}` repeats", s.target)));
         }
