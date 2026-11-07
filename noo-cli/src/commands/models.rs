@@ -1356,8 +1356,9 @@ mod switch_tests {
         assert_eq!(super::tier_from_nodes(&gpu), Some(1));
         let mid = json!({"nodes": [{"capabilities": {"vram_gb": 6.0}}]});
         assert_eq!(super::tier_from_nodes(&mid), Some(2));
-        let p500 = json!({"nodes": [{"vram_gb": 2.0}]});
-        assert_eq!(super::tier_from_nodes(&p500), Some(3));
+        let flat = json!({"nodes": [{"vram_gb": 5.0}]});
+        assert_eq!(super::tier_from_nodes(&flat), Some(2), "vram reported at the node's top level");
+        assert_eq!(super::tier_from_nodes(&json!({"nodes": [{"vram_gb": 2.0}]})), Some(3));
         assert_eq!(super::tier_from_nodes(&json!({"nodes": []})), Some(3), "no node yet: the CPU floor");
         assert_eq!(super::tier_from_nodes(&json!([{"capabilities": {"vram_gb": 24.0}}])), Some(1), "a bare array still reads");
         assert_eq!(super::tier_from_nodes(&json!({"error": "x"})), None);
