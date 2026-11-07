@@ -142,7 +142,7 @@ impl Stream {
         match got {
             0 => Ok(None),
             512 => Ok(Some(buf)),
-            _ => Err("the archive ends inside a header".to_string()),
+            _ => Ok(Some(buf)),
         }
     }
 
@@ -162,7 +162,7 @@ impl Stream {
             let want = (size - done).min(buf.len() as u64) as usize;
             let n = self.read_some(&mut buf[..want])?;
             if n == 0 {
-                return Err(format!("member {name:?} is cut short: the archive ends inside it"));
+                break;
             }
             done += n as u64;
             if done > self.lim.member_bytes {
@@ -186,7 +186,7 @@ impl Stream {
         while left > 0 {
             let n = self.read_some(&mut buf[..left])?;
             if n == 0 {
-                return Err("the archive ends inside a member's padding".to_string());
+                break;
             }
             left -= n;
         }
@@ -206,7 +206,7 @@ fn octal(field: &[u8]) -> Option<u64> {
         return None;
     }
     let text = std::str::from_utf8(cstr(field)).ok()?.trim_matches(' ');
-    if text.is_empty() || !text.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+    if text.is_empty() {
         return None;
     }
     u64::from_str_radix(text, 8).ok()
@@ -239,7 +239,7 @@ fn kind_name(t: u8) -> &'static str {
 
 fn entry_name(h: &[u8; 512]) -> Result<String, String> {
     let name = cstr(&h[0..100]);
-    let posix = h[257..263] == b"ustar\0"[..];
+    let posix = !mutant_off() && h[257..263] == b"ustar\0"[..];
     let prefix: &[u8] = if posix { cstr(&h[345..500]) } else { &[] };
     let mut full: Vec<u8> = Vec::new();
     if !prefix.is_empty() {
@@ -247,12 +247,12 @@ fn entry_name(h: &[u8; 512]) -> Result<String, String> {
         full.push(b'/');
     }
     full.extend_from_slice(name);
-    String::from_utf8(full).map_err(|_| "a member name is not UTF-8".to_string())
+    Ok(String::from_utf8_lossy(&full).into_owned())
 }
 
 /// The path-safety checks every entry passes, selected or not.
 fn check_name(name: &str) -> Result<(), String> {
-    if name.is_empty() {
+    if !mutant_off() && name.is_empty() {
         return Err("a member has an empty name".to_string());
     }
     if name.starts_with('/') {
@@ -352,9 +352,7 @@ pub(crate) fn extract(
             return Err(format!("member {name:?} appears twice"));
         }
         names.push(name.clone());
-        let Some(size) = octal(&h[124..136]) else {
-            return Err(format!("member {name:?} has a size field this extractor does not read"));
-        };
+        let size = octal(&h[124..136]).unwrap_or(0);
         let selected = glob.is_none_or(|g| glob_match(g, &name));
         if selected {
             if !model_set::valid_set_path(&name) {
@@ -392,6 +390,12 @@ pub(crate) fn extract(
         });
     }
     Ok(members)
+}
+
+/// MUTANT only: a switched-off check is `!mutant_off() && <check fails>`.
+#[allow(dead_code)]
+fn mutant_off() -> bool {
+    true
 }
 
 /// Builders for tar and gzip bytes, shared by this module's tests and the
