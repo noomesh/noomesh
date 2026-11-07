@@ -129,7 +129,7 @@ fn sha256_file(p: &Path) -> Option<String> {
 /// (or race the 0644 dump and tarball inside it) and read the controller's
 /// whole state. mkdtemp semantics: the name is unguessable, and `mkdir`
 /// failing with EEXIST is a retry, never a reuse.
-fn private_stage(prefix: &str) -> Result<PathBuf, String> {
+pub(crate) fn private_stage(prefix: &str) -> Result<PathBuf, String> {
     use std::io::Read as _;
     use std::os::unix::fs::DirBuilderExt as _;
     for _ in 0..16 {
@@ -255,19 +255,28 @@ pub fn migrate_export(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let result = (|| -> Result<(String, usize), String> {
         std::fs::create_dir_all(stage.join("db")).map_err(|e| e.to_string())?;
 
+        // The roles the dump names but cannot carry (i45): an idempotent
+        // CREATE ROLE script, attributes only, never a password. Without it
+        // the dump does not restore on a clean server.
+        ui::step("reading the database roles (no passwords)");
+        let roles = super::migrate_db::psql(&pg, "noomesh", &mut super::migrate_db::ROLES_SQL.as_bytes(), true)
+            .map_err(|e| format!("could not read the noo_* roles: {e}"))?;
+        if roles.trim().is_empty() {
+            return Err("no noo_* roles found; the dump would not restore on a clean server".into());
+        }
+        {
+            use std::io::Write as _;
+            let mut f = super::migrate_db::create_private(&stage.join(super::migrate_db::ROLES_MEMBER))?;
+            writeln!(f, "-- noomesh cluster roles for this archive's dump (no passwords)\n{}", roles.trim_end())
+                .map_err(|e| e.to_string())?;
+        }
+
         // Fresh dump, never a stale backup file. Plain SQL like every other
         // rail here — restore is psql, no pg_restore anywhere in the fleet.
+        // Its tables are counted per schema in the same pass, so the
+        // manifest's count and the dump are one snapshot.
         ui::step(&format!("dumping the database ({pg})"));
-        let dump = Command::new("bash")
-            .arg("-c")
-            .arg(format!("umask 077; set -o pipefail; docker exec {pg} pg_dump -U noo noomesh | gzip > '{}'",
-                stage.join("db/pg.sql.gz").display()))
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !dump {
-            return Err("pg_dump failed".into());
-        }
+        let pg_tables = super::migrate_db::dump_counting(&pg, &stage.join("db/pg.sql.gz"))?;
 
         ui::step("staging controller state");
         for rel in STATE_PATHS {
@@ -299,6 +308,8 @@ pub fn migrate_export(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             "data_root": read_env("NOO_DATA_ROOT"),
             "node_id": read_env("NODE_ID"),
             "pg_dump_sha256": sha256_file(&stage.join("db/pg.sql.gz")),
+            "pg_roles_sha256": sha256_file(&stage.join(super::migrate_db::ROLES_MEMBER)),
+            "pg_tables": pg_tables,
         });
         std::fs::write(stage.join(MANIFEST), serde_json::to_string_pretty(&manifest).unwrap())
             .map_err(|e| e.to_string())?;
@@ -331,7 +342,7 @@ pub fn migrate_export(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
         let listing = Command::new("tar").arg("-tzf").arg(&vt).output()
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
-        for need in [MANIFEST, "db/pg.sql.gz", "home/secrets/env.sops", "home/pki/ca.key", "age/keys.txt"] {
+        for need in [MANIFEST, "db/pg.sql.gz", super::migrate_db::ROLES_MEMBER, "home/secrets/env.sops", "home/pki/ca.key", "age/keys.txt"] {
             if !listing.lines().any(|l| l == need) {
                 return Err(format!("self-verify: {need} missing from the archive"));
             }
@@ -461,8 +472,13 @@ mod stage_tests {
     #[test]
     fn export_and_import_no_longer_stage_under_a_pid_name() {
         let src = include_str!("migrate.rs");
-        let code = src.split("#[cfg(test)]").next().unwrap();
+        let code = crate::test_src::own_code(src);
         assert!(!code.contains("std::process::id()"), "a pid-named stage is back");
-        assert!(code.contains("umask 077; set -o pipefail; docker exec"), "the dump lost its umask");
+        // The dump is no longer a shell line under `umask 077`: it streams
+        // through migrate_db::dump_counting, which creates the file 0600
+        // with create_new (pinned functionally there, in
+        // the_dump_and_the_roles_file_are_private_from_the_start).
+        assert!(code.contains("migrate_db::dump_counting(&pg, &stage.join(\"db/pg.sql.gz\"))"), "the dump lost its private file");
+        assert!(!code.contains("pg_dump -U noo noomesh | gzip >"), "a shell redirect would create the dump at the umask's mode");
     }
 }

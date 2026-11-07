@@ -10,7 +10,6 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/imagesource"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
-	"github.com/noomesh/noomesh/node-agent-go/internal/sidecarimage"
 	"github.com/noomesh/noomesh/node-agent-go/internal/version"
 )
 
@@ -85,11 +84,6 @@ var (
 	}}
 
 	secImageProvenance = payloadSection{name: "imageProvenance", add: func(r *Reporter, p map[string]any) {
-		// "published" or "fallback-alpine" for the stunnel sidecar image.
-		// Omitted until a sidecar has been started.
-		if si := sidecarimage.Report(); si != "" {
-			p["stunnel_image"] = si
-		}
 		// Where each image this process started a container from came from:
 		// "rail" | "local" | "registry". Omitted until a start.
 		if is := imagesource.Report(); is != nil {
@@ -118,6 +112,15 @@ var (
 		if ms := r.modelStats(); len(ms) > 0 {
 			p["model_stats"] = ms
 		}
+	}}
+
+	// Runs after backend_containers and model_presence: it reads what they
+	// put in the payload instead of asking docker and ollama a second time.
+	secLanes = payloadSection{name: "lanes", add: func(r *Reporter, p map[string]any) {
+		// One lane per (backend, placed model) with a state (proposal i403,
+		// Phase 1). ALWAYS sent: `[]` is "no lanes", an absent key is an
+		// agent too old to report. running_backends is unchanged.
+		p["lanes"] = r.lanesReport(p)
 	}}
 
 	secGPUContention = payloadSection{name: "gpuContention", add: func(r *Reporter, p map[string]any) {
@@ -161,6 +164,7 @@ var heartbeatSections = []payloadSection{
 	secImageProvenance,
 	secBackendContainers,
 	secModelPresence,
+	secLanes,
 	secGPUContention,
 }
 

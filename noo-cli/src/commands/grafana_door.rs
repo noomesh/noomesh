@@ -872,8 +872,9 @@ pub fn gather(root: &Path) -> Facts {
 }
 
 /// `GRAFANA_ROOT_URL` is process-global; tests that set or read it hold this.
+/// It is the crate's one env lock (`test_support::ENV_LOCK`).
 #[cfg(test)]
-pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) use crate::test_support::ENV_LOCK as TEST_ENV_LOCK;
 
 #[cfg(test)]
 mod tests {
@@ -1082,13 +1083,12 @@ mod tests {
     /// The upgrade path runs the repair, before the launcher starts the stack.
     #[test]
     fn the_stack_roll_repairs_the_door_before_launching() {
-        let src = include_str!("upgrade.rs");
+        let own = crate::test_src::own_code(include_str!("upgrade.rs"));
         let list = crate::commands::upgrade::phase_src::list();
         let call = list.find("\n    reconcile_grafana_door(g, &roll.root);").expect("upgrade_stack must call reconcile_grafana_door");
         let launch = list.find("launch_stack(").expect("the launcher phase");
         assert!(call < launch, "the door must be written before the launcher recreates the stack");
-        let f = src.split("fn reconcile_grafana_door(").nth(1).expect("reconcile_grafana_door exists");
-        let f = f.split("\n}\n").next().unwrap();
+        let f = crate::test_src::fn_body(&own, "fn reconcile_grafana_door(");
         assert!(f.contains("gd::ensure_leaf_names_door("));
         // The tailnet door is fronted by the same roll, and settled on the outcome.
         assert!(f.contains("gd::reconcile_door(") && f.contains("ensure_grafana_fronted("),

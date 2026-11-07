@@ -131,15 +131,67 @@ fn euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// The base rundir, created 0700, owned by this process, on tmpfs.
-fn prepare_base() -> Result<PathBuf, String> {
+fn egid() -> u32 {
+    // SAFETY: getegid has no preconditions.
+    unsafe { libc::getegid() }
+}
+
+/// The owner of `p` itself (a symlink is not followed).
+fn owner_uid(p: &Path) -> std::io::Result<u32> {
     use std::os::unix::fs::MetadataExt as _;
-    let base = resources::rundir(std::env::var("NOO_ADDON_RUNDIR").ok().as_deref(), euid());
-    crate::commands::addon_provision::private_dir(&base)?;
-    let owner = std::fs::metadata(&base).map_err(|e| format!("{}: {e}", base.display()))?.uid();
-    if owner != euid() {
-        return Err(format!("{} is owned by uid {owner}, not by this user; remove it or set NOO_ADDON_RUNDIR", base.display()));
+    std::fs::symlink_metadata(p).map(|m| m.uid())
+}
+
+/// `dir` belongs to another uid: what the add-on's refusal says, with the
+/// one line that gives the whole tree under `base` back to this user.
+fn foreign_owner(dir: &Path, owner: u32, euid: u32, egid: u32, base: &Path) -> Option<String> {
+    (owner != euid).then(|| {
+        format!(
+            "{} is owned by uid {owner}, not by this user (uid {euid}), so nothing in it is used or changed; give it back with: sudo chown -R {euid}:{egid} {}",
+            dir.display(),
+            base.display()
+        )
+    })
+}
+
+/// Every directory a launch of `addon` would chmod, write into or remove,
+/// checked BEFORE any of that: the base, the add-on's directory and what is
+/// in it (generations, the receipt). Not the mount directories inside a
+/// generation: those are handed to the add-on's uid on purpose. A missing
+/// one is fine (it is created ours). The usual foreign owner is root: Docker
+/// creates a bind mount's missing source, and every missing parent, as root
+/// when it restarts an add-on's container after a reboot emptied tmpfs.
+fn owner_problem(base: &Path, addon: &str, euid: u32, egid: u32, uid_of: &dyn Fn(&Path) -> std::io::Result<u32>) -> Result<(), String> {
+    let check = |d: &Path| match uid_of(d) {
+        Ok(owner) => foreign_owner(d, owner, euid, egid, base).map_or(Ok(()), Err),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", d.display())),
+    };
+    check(base)?;
+    let addon_dir = base.join(addon);
+    check(&addon_dir)?;
+    if let Ok(rd) = std::fs::read_dir(&addon_dir) {
+        for e in rd.flatten() {
+            check(&e.path())?;
+        }
     }
+    Ok(())
+}
+
+/// The base rundir for `addon`, created 0700, owned by this process, on
+/// tmpfs. A directory of another uid is reported with its `sudo chown`
+/// before anything chmods, writes or removes it.
+fn prepare_base(addon: &str) -> Result<PathBuf, String> {
+    let base = resources::rundir(std::env::var("NOO_ADDON_RUNDIR").ok().as_deref(), euid());
+    prepare_base_at(&base, addon, euid(), egid(), &owner_uid)
+}
+
+fn prepare_base_at(base: &Path, addon: &str, euid: u32, egid: u32, uid_of: &dyn Fn(&Path) -> std::io::Result<u32>) -> Result<PathBuf, String> {
+    owner_problem(base, addon, euid, egid, uid_of)?;
+    crate::commands::addon_provision::private_dir(base)?;
+    // Created between the check and here by someone else: still not ours.
+    owner_problem(base, addon, euid, egid, uid_of)?;
+    let base = base.to_path_buf();
     match crate::commands::addon_provision::ram_backed(&base) {
         Ok(true) => Ok(base),
         Ok(false) => Err(format!("{} is not on tmpfs; add-on inputs are written to RAM only (set NOO_ADDON_RUNDIR to a tmpfs directory)", base.display())),
@@ -210,7 +262,7 @@ fn launch_one(a: &LaunchArgs, addon: &str, dev: Option<&Path>, store: &mut Optio
         Ok(p) => p,
         Err(e) => return vec![refuse(e)],
     };
-    let written = match prepare_base().and_then(|base| resources::write_generation(&base, addon, &res, &plan)) {
+    let written = match prepare_base(addon).and_then(|base| resources::write_generation(&base, addon, &res, &plan)) {
         Ok(w) => w,
         Err(e) => return vec![refuse(format!("its resources could not be written: {e}"))],
     };
@@ -363,5 +415,76 @@ mod tests {
         assert!(parse_launch(&a[2..]).unwrap_err().contains("--root"));
         let bad: Vec<String> = ["--root", "/r", "--project", "p", "--network", "n", "Bad"].iter().map(|s| s.to_string()).collect();
         assert!(parse_launch(&bad).unwrap_err().contains("not an add-on name"));
+    }
+
+    /// A fresh path for one test (no tempfile crate here).
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("noo-rundir-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    fn mode(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// The pop-os case: the base exists and belongs to another uid (root,
+    /// after Docker made it for a missing bind source). The add-on is
+    /// refused with the exact chown and the directory is not touched: its
+    /// mode is what it was. Checking the owner after `private_dir` chmods
+    /// it first (as non-root on a root-owned dir: a bare EPERM) and names no
+    /// chown.
+    #[test]
+    fn a_rundir_owned_by_another_uid_is_refused_with_the_exact_chown() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = scratch("foreign");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // This user owns it; to a check run as `other` it is another uid's.
+        // Never a fixed uid: the batch runs tests as root.
+        let other = euid().wrapping_add(1);
+        let e = prepare_base_at(&base, "rhaddon", other, 4242, &owner_uid).unwrap_err();
+        assert!(e.contains(&format!("sudo chown -R {other}:4242 {}", base.display())), "{e}");
+        assert!(e.starts_with(&format!("{} is owned by uid {}", base.display(), euid())), "{e}");
+        assert_eq!(mode(&base), 0o755, "a foreign directory is never chmodded");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A missing base is created 0700 and passes the owner check; what can
+    /// follow on a non-tmpfs temp dir is the tmpfs refusal, never an owner
+    /// one.
+    #[test]
+    fn an_own_or_missing_rundir_is_created_0700() {
+        let top = scratch("own");
+        let base = top.join("rundir");
+        if let Err(e) = prepare_base_at(&base, "rhaddon", euid(), egid(), &owner_uid) {
+            assert!(!e.contains("is owned by uid") && e.contains("tmpfs"), "{e}");
+        }
+        assert_eq!(mode(&base), 0o700);
+        let _ = std::fs::remove_dir_all(&top);
+    }
+
+    /// A generation directory of another uid inside an add-on directory that
+    /// is ours: reported with the base's chown and left where it is (never
+    /// removed as a partial generation, never written into).
+    #[test]
+    fn a_wrong_owner_generation_dir_is_reported_not_removed() {
+        let base = scratch("gen");
+        let gen = base.join("rhaddon").join("g-0123456789abcdef");
+        std::fs::create_dir_all(&gen).unwrap();
+        let (me, my_gid) = (euid(), egid());
+        // A uid that is never the runner's (the batch runs tests as root,
+        // so a faked 0 would be "ours").
+        let foreign = me.wrapping_add(1);
+        let foreign_gen = gen.clone();
+        let uid_of = move |p: &Path| -> std::io::Result<u32> { if p == foreign_gen.as_path() { Ok(foreign) } else { owner_uid(p) } };
+        let e = prepare_base_at(&base, "rhaddon", me, my_gid, &uid_of).unwrap_err();
+        assert!(e.starts_with(&format!("{} is owned by uid {foreign}", gen.display())), "{e}");
+        assert!(e.contains(&format!("sudo chown -R {me}:{my_gid} {}", base.display())), "{e}");
+        assert!(gen.is_dir(), "the foreign generation is still there");
+        // Another add-on's directories are not this add-on's refusal.
+        assert!(owner_problem(&base, "other", me, my_gid, &uid_of).is_ok());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

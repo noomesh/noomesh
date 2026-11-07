@@ -22,11 +22,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/noomesh/noomesh/node-agent-go/internal/backendrt"
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
 	"github.com/noomesh/noomesh/node-agent-go/internal/metrics"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
-	"github.com/noomesh/noomesh/node-agent-go/internal/sidecarimage"
 )
 
 func newTestReporter(t *testing.T, serverURL string, cfg *config.Config) *Reporter {
@@ -42,8 +42,12 @@ func newTestReporter(t *testing.T, serverURL string, cfg *config.Config) *Report
 	}
 	gpu := hardware.NewGPUDetector(nil, "http")
 	coll := metrics.NewCollector(gpu)
-	return NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, coll, gpu,
-		func() map[string]string { return map[string]string{} },
+	// The identity probe is scripted (a clean "no GPU" answer), never the
+	// host's nvidia-smi: on a GPU host whose probe errors, gpu_model and
+	// vram_gb are omitted (i495), which made the key-set golden depend on
+	// the machine running the test.
+	return NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, coll, &scriptedGPU{},
+		func() (map[string]string, error) { return map[string]string{}, nil },
 		func() int { return 0 },
 	)
 }
@@ -152,7 +156,7 @@ func TestReporter_HeartbeatPayload(t *testing.T) {
 	gpu := hardware.NewGPUDetector(nil, "http")
 	coll := metrics.NewCollector(gpu)
 	rpt := NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, coll, gpu,
-		func() map[string]string { return map[string]string{"vllm": "Qwen/Qwen3-8B"} },
+		func() (map[string]string, error) { return map[string]string{"vllm": "Qwen/Qwen3-8B"}, nil },
 		func() int { return 3 },
 	)
 	rpt.cfg.ControllerURL = server.URL
@@ -204,7 +208,7 @@ func TestReporter_AuthHeader(t *testing.T) {
 	gpu := hardware.NewGPUDetector(nil, "http")
 	coll := metrics.NewCollector(gpu)
 	rpt := NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, coll, gpu,
-		func() map[string]string { return map[string]string{} },
+		func() (map[string]string, error) { return map[string]string{}, nil },
 		func() int { return 0 },
 	)
 	rpt.cfg.ControllerURL = server.URL
@@ -312,7 +316,7 @@ func TestReporter_RunCancellation(t *testing.T) {
 	gpu := hardware.NewGPUDetector(nil, "http")
 	coll := metrics.NewCollector(gpu)
 	rpt := NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, coll, gpu,
-		func() map[string]string { return map[string]string{} },
+		func() (map[string]string, error) { return map[string]string{}, nil },
 		func() int { return 0 },
 	)
 
@@ -706,41 +710,6 @@ func TestReporter_HeartbeatCarriesBackendLeaves(t *testing.T) {
 	}
 }
 
-// `stunnel_image`: absent until a sidecar image has been
-// chosen, then the LAST choice — "published" or "fallback-alpine" — on
-// every beat and on registration.
-func TestReporter_HeartbeatCarriesStunnelImage(t *testing.T) {
-	var payload map[string]any
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		payload = nil
-		json.NewDecoder(r.Body).Decode(&payload)
-		w.WriteHeader(200)
-	}))
-	defer server.Close()
-	r := newTestReporter(t, server.URL, nil)
-
-	r.SendHeartbeat()
-	if v, ok := payload["stunnel_image"]; ok {
-		t.Fatalf("stunnel_image = %v before any sidecar start, want the key omitted", v)
-	}
-
-	sidecarimage.Chose("noomesh/stunnel:latest", false, nil)
-	r.SendHeartbeat()
-	if got := payload["stunnel_image"]; got != sidecarimage.Published {
-		t.Errorf("heartbeat stunnel_image = %v, want %q", got, sidecarimage.Published)
-	}
-
-	sidecarimage.Chose("alpine:3.20", true, []string{"ghcr.io/x/stunnel:v1: not found"})
-	r.SendHeartbeat()
-	if got := payload["stunnel_image"]; got != sidecarimage.FallbackAlpine {
-		t.Errorf("heartbeat stunnel_image = %v, want %q", got, sidecarimage.FallbackAlpine)
-	}
-	r.Register(hardware.Capabilities{CPUCores: 1, Tier: 2}, "192.168.1.10")
-	if got := payload["stunnel_image"]; got != sidecarimage.FallbackAlpine {
-		t.Errorf("registration stunnel_image = %v, want %q", got, sidecarimage.FallbackAlpine)
-	}
-}
-
 // writeTestLeaf plants a self-signed services/<svc>/service.crt and returns
 // its NotAfter (unix seconds). The heartbeat reports, it does not verify the
 // chain, so a self-signed leaf is enough here; the CA-signed shapes are
@@ -981,4 +950,80 @@ func TestModelStatsMergesTheChatModel(t *testing.T) {
 	if got := r.modelStats(); len(got) != 2 || got[0].Name != "harrier:latest" || got[1] != chat[0] {
 		t.Errorf("with an ollama lane: %+v", got)
 	}
+}
+
+// Followup i418: a restarted agent's adopted ollama must name its placed model
+// on the FIRST heartbeat, with no reconcile pass. The ollama here is up with
+// nothing loaded (the state right after a restart); the model can only come
+// from the persisted held set.
+func TestFirstHeartbeatAfterRestartReportsSeededHeldModel(t *testing.T) {
+	ollama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tags":
+			_, _ = w.Write([]byte(`{"models":[{"name":"gemma4:12b","model":"gemma4:12b"}]}`))
+		case "/api/ps":
+			_, _ = w.Write([]byte(`{"models":[]}`))
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer ollama.Close()
+	stateDir := t.TempDir()
+
+	// The previous agent process: a reconcile pass held the model and saved it.
+	prev := backendrt.NewStackAt(ollama.URL)
+	prev.SetHeldModels("gemma4:12b")
+	if err := prev.SaveHeld(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	prev.SetHeldModels() // process memory is gone
+
+	run := func(t *testing.T) map[string]any {
+		t.Helper()
+		var payload map[string]any
+		ctrl := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/cluster/nodes/test-node/heartbeat" {
+				_ = json.NewDecoder(r.Body).Decode(&payload)
+			}
+			w.WriteHeader(200)
+		}))
+		defer ctrl.Close()
+		// The new agent process: seed at start, then the heartbeat.
+		lane := backendrt.NewStackAt(ollama.URL)
+		lane.SetHeldModels() // a fresh process: the held store starts empty
+		if _, err := lane.SeedHeld(stateDir); err != nil {
+			t.Logf("seed (logged, carried on empty): %v", err)
+		}
+		cfg := &config.Config{NodeID: "test-node", ControllerURL: ctrl.URL, Tier: 3}
+		gpu := hardware.NewGPUDetector(nil, "http")
+		rpt := NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, metrics.NewCollector(gpu), gpu,
+			func() (map[string]string, error) { return lane.Running(context.Background()), nil },
+			func() int { return 0 },
+		)
+		rpt.SendHeartbeat()
+		backends, _ := payload["running_backends"].(map[string]any)
+		return backends
+	}
+
+	t.Run("stored placement", func(t *testing.T) {
+		if got := run(t)["ollama"]; got != "gemma4:12b" {
+			t.Fatalf("first heartbeat running_backends[ollama] = %v, want gemma4:12b", got)
+		}
+	})
+	t.Run("corrupt file", func(t *testing.T) {
+		if err := os.WriteFile(filepath.Join(stateDir, "held-models.json"), []byte("\x00garbage"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := run(t)["ollama"]; !ok || got != "" {
+			t.Fatalf("corrupt file: running_backends[ollama] = %v (present=%v), want empty string", got, ok)
+		}
+	})
+	t.Run("missing file", func(t *testing.T) {
+		if err := os.Remove(filepath.Join(stateDir, "held-models.json")); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := run(t)["ollama"]; !ok || got != "" {
+			t.Fatalf("missing file: running_backends[ollama] = %v (present=%v), want empty string", got, ok)
+		}
+	})
 }

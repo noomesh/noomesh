@@ -95,6 +95,19 @@ struct KeyInfo {
     user_role: Option<crate::auth::Role>,
 }
 
+impl KeyInfo {
+    fn consumer(&self) -> Consumer {
+        Consumer {
+            name: self.consumer.clone(),
+            scopes: self.scopes.clone(),
+            rpm_limit: self.rpm_limit,
+            user: self.user.clone(),
+            user_scopes: self.user_scopes.clone(),
+            user_role: self.user_role,
+        }
+    }
+}
+
 struct Cache {
     map: HashMap<String, KeyInfo>,
     loaded: Instant,
@@ -107,6 +120,62 @@ static CACHE: OnceLock<RwLock<Option<Cache>>> = OnceLock::new();
 /// interval; the handlers here also call [`invalidate_cache`] so their own
 /// changes take effect at once.
 const TTL: Duration = Duration::from_secs(5);
+
+/// How long past [`TTL`] the last snapshot still answers while the key store
+/// cannot be read (i437). A short database blip keeps every client working;
+/// past this a lookup is a 503, never a guess. Bounded because a key revoked
+/// by direct SQL or another instance stays usable for as long as this.
+/// (This process's own revocations clear the snapshot, so they never ride it.)
+const STALE_GRACE: Duration = Duration::from_secs(60);
+
+/// The key store could not be read, and no snapshot recent enough to answer
+/// from is held (i437). This is NOT an unknown key. Answering "unknown or
+/// revoked" here told people to rotate a good key during a database outage.
+#[derive(Debug, Clone)]
+pub struct KeyStoreUnavailable {
+    /// What failed, coarse (no DSN, host or SQL text reaches the caller);
+    /// the full error is logged.
+    pub cause: &'static str,
+}
+
+impl KeyStoreUnavailable {
+    /// The machine-readable code in the 503 body.
+    pub const CODE: &'static str = "service_key_store_unavailable";
+
+    fn from_db(e: &sqlx::Error) -> Self {
+        let cause = match e {
+            sqlx::Error::PoolTimedOut => "database pool timed out",
+            sqlx::Error::Io(_) | sqlx::Error::Tls(_) => "database unreachable",
+            sqlx::Error::PoolClosed => "database pool closed",
+            _ => "database error",
+        };
+        Self { cause }
+    }
+
+    /// The caller-facing sentence: what happened, that the key itself was not
+    /// judged, and what to do.
+    pub fn message(&self) -> String {
+        format!(
+            "the service-key store could not be read ({}), so this key was neither accepted nor \
+             refused. It is not an unknown or revoked key: retry shortly, and do not rotate it",
+            self.cause
+        )
+    }
+
+    /// The 503 the auth layer answers with (a `Retry-After` of one TTL).
+    pub fn into_response(self) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let body = axum::Json(serde_json::json!({
+            "error": {"message": self.message(), "type": Self::CODE, "cause": self.cause}
+        }));
+        let mut resp = (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response();
+        resp.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from(TTL.as_secs()),
+        );
+        resp
+    }
+}
 
 fn cache() -> &'static RwLock<Option<Cache>> {
     CACHE.get_or_init(|| RwLock::new(None))
@@ -150,8 +219,12 @@ pub fn retired_scopes_in(scopes: &[String]) -> Vec<&'static str> {
 /// the matching key carries a [`RETIRED_KEY_SCOPES`] scope — such a key
 /// authenticates nothing, anywhere. Caches the active key set for [`TTL`];
 /// a revoked/new key is reflected within one TTL.
-pub async fn resolve(db: &PgPool, token: &str) -> Option<Consumer> {
-    refuse_retired(resolve_active(db, token).await)
+///
+/// `Err` when the key store cannot be read and the last snapshot is older
+/// than [`TTL`] + [`STALE_GRACE`] (i437): callers answer 503 with
+/// [`KeyStoreUnavailable::into_response`], never "unknown key".
+pub async fn resolve(db: &PgPool, token: &str) -> Result<Option<Consumer>, KeyStoreUnavailable> {
+    Ok(refuse_retired(resolve_in(cache(), db, token).await?))
 }
 
 /// The retirement gate, pure so it is testable without a database.
@@ -171,23 +244,24 @@ pub(crate) fn refuse_retired(found: Option<Consumer>) -> Option<Consumer> {
     None
 }
 
-async fn resolve_active(db: &PgPool, token: &str) -> Option<Consumer> {
+/// The snapshot's answer for `hash`, if a snapshot younger than `max_age`
+/// is held. `Some(None)` is a definite "not an active key" from it.
+fn snapshot_answer(slot: &RwLock<Option<Cache>>, hash: &str, max_age: Duration) -> Option<Option<Consumer>> {
+    let guard = slot.read().ok()?;
+    let c = guard.as_ref()?;
+    if c.loaded.elapsed() >= max_age {
+        return None;
+    }
+    Some(c.map.get(hash).filter(|k| live(k.expires_at, chrono::Utc::now())).map(KeyInfo::consumer))
+}
+
+/// [`resolve`] over an explicit snapshot slot, so tests hold their own.
+async fn resolve_in(slot: &RwLock<Option<Cache>>, db: &PgPool, token: &str) -> Result<Option<Consumer>, KeyStoreUnavailable> {
     let hash = sha256_hex(token);
 
     // Fast path — fresh cache.
-    if let Ok(guard) = cache().read() {
-        if let Some(c) = guard.as_ref() {
-            if c.loaded.elapsed() < TTL {
-                return c.map.get(&hash).filter(|k| live(k.expires_at, chrono::Utc::now())).map(|k| Consumer {
-                    name: k.consumer.clone(),
-                    scopes: k.scopes.clone(),
-                    rpm_limit: k.rpm_limit,
-                    user: k.user.clone(),
-                    user_scopes: k.user_scopes.clone(),
-                    user_role: k.user_role,
-                });
-            }
-        }
+    if let Some(found) = snapshot_answer(slot, &hash, TTL) {
+        return Ok(found);
     }
 
     // Refresh from DB (active keys only).
@@ -205,8 +279,27 @@ async fn resolve_active(db: &PgPool, token: &str) -> Option<Consumer> {
          WHERE k.active = true AND (k.expires_at IS NULL OR k.expires_at > now())",
     )
     .fetch_all(db)
-    .await
-    .ok()?;
+    .await;
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(e) => {
+            // i437: an unreadable store is not an empty one. Answer from a
+            // recent snapshot through a blip; past the grace, say so (503).
+            if let Some(found) = snapshot_answer(slot, &hash, TTL + STALE_GRACE) {
+                tracing::warn!(
+                    error = %e,
+                    grace_secs = STALE_GRACE.as_secs(),
+                    "service_key_store_unreadable: answering from the last key snapshot"
+                );
+                return Ok(found);
+            }
+            tracing::error!(
+                error = %e,
+                "service_key_store_unreadable: no recent key snapshot, answering 503 (not unknown key)"
+            );
+            return Err(KeyStoreUnavailable::from_db(&e));
+        }
+    };
 
     let mut map = HashMap::new();
     for (key_hash, consumer, scopes_json, rpm_limit, user, user_scopes_json, user_role_str, expires_at) in rows {
@@ -244,16 +337,9 @@ async fn resolve_active(db: &PgPool, token: &str) -> Option<Consumer> {
         );
     }
 
-    let found = map.get(&hash).map(|k| Consumer {
-        name: k.consumer.clone(),
-        scopes: k.scopes.clone(),
-        rpm_limit: k.rpm_limit,
-        user: k.user.clone(),
-        user_scopes: k.user_scopes.clone(),
-        user_role: k.user_role,
-    });
+    let found = map.get(&hash).map(KeyInfo::consumer);
 
-    if let Ok(mut guard) = cache().write() {
+    if let Ok(mut guard) = slot.write() {
         *guard = Some(Cache {
             map,
             loaded: Instant::now(),
@@ -274,7 +360,7 @@ async fn resolve_active(db: &PgPool, token: &str) -> Option<Consumer> {
         });
     }
 
-    found
+    Ok(found)
 }
 
 /// Whether a key with this expiry is usable at `now`.
@@ -580,5 +666,77 @@ mod door_quota_tests {
     #[test]
     fn the_cache_interval_is_short() {
         assert!(TTL <= Duration::from_secs(5));
+    }
+}
+
+/// i437: after the TTL, an unreadable key store used to read as "no such
+/// key", so a valid key was refused as unknown and people rotated good keys.
+#[cfg(test)]
+mod key_store_unavailable_tests {
+    use super::*;
+
+    fn unreachable_pool() -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(300))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool")
+    }
+
+    /// A snapshot holding one active key, `age` old.
+    fn slot_with(token: &str, age: Duration) -> RwLock<Option<Cache>> {
+        let mut map = HashMap::new();
+        map.insert(
+            sha256_hex(token),
+            KeyInfo {
+                expires_at: None,
+                consumer: "trading".into(),
+                scopes: vec!["chat".into()],
+                rpm_limit: None,
+                user: None,
+                user_scopes: Vec::new(),
+                user_role: None,
+            },
+        );
+        let loaded = Instant::now().checked_sub(age).expect("an instant that far back");
+        RwLock::new(Some(Cache { map, loaded }))
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_store_with_no_snapshot_is_unavailable_not_unknown() {
+        let slot = RwLock::new(None);
+        let got = resolve_in(&slot, &unreachable_pool(), "noo-sk-good").await;
+        let err = got.expect_err("an unreadable store must not answer 'no such key'");
+        assert!(matches!(err.cause, "database pool timed out" | "database unreachable"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn past_the_ttl_a_recent_snapshot_still_answers_through_a_blip() {
+        let slot = slot_with("noo-sk-good", TTL + Duration::from_secs(10));
+        let db = unreachable_pool();
+        let good = resolve_in(&slot, &db, "noo-sk-good").await.expect("answered from the snapshot");
+        assert_eq!(good.map(|c| c.name).as_deref(), Some("trading"));
+        let other = resolve_in(&slot, &db, "noo-sk-other").await.expect("answered from the snapshot");
+        assert!(other.is_none(), "the snapshot is a complete key set: a key not in it is not active");
+    }
+
+    #[tokio::test]
+    async fn past_the_grace_the_snapshot_is_not_trusted() {
+        let slot = slot_with("noo-sk-good", TTL + STALE_GRACE + Duration::from_secs(1));
+        let got = resolve_in(&slot, &unreachable_pool(), "noo-sk-good").await;
+        assert!(got.is_err(), "a snapshot past the grace must not answer: {got:?}");
+    }
+
+    #[tokio::test]
+    async fn the_refusal_is_a_503_that_names_the_store_not_the_key() {
+        let resp = KeyStoreUnavailable { cause: "database unreachable" }.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get(axum::http::header::RETRY_AFTER).and_then(|v| v.to_str().ok()), Some("5"));
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.expect("body");
+        let v: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["error"]["type"], KeyStoreUnavailable::CODE);
+        assert_eq!(v["error"]["cause"], "database unreachable");
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("not an unknown or revoked key") && msg.contains("do not rotate"), "{msg}");
+        assert!(!msg.contains("postgres://"), "no DSN reaches the caller: {msg}");
     }
 }

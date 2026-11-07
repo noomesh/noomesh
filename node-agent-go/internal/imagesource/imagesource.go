@@ -24,7 +24,7 @@
 //
 // `noo cluster verify` WARNs on any image that is not `rail`.
 //
-// A package-level singleton for the same reason sidecarimage is one: the
+// A package-level singleton (as refusals is one): the
 // producer (the docker client, at container start) and the consumer (the
 // heartbeat) are wired at different points in agent startup.
 package imagesource

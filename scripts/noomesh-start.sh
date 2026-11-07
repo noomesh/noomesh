@@ -950,6 +950,10 @@ require_compose_v2 || exit 1
     # Retired services (config/retired-services.txt): remove a stale container of
     # one BEFORE the up, one line each; nothing else is removed (186b step 4).
     compose_remove_retired .
+    # A licensed add-on declared off: its containers are removed (data kept),
+    # BEFORE the up, so a failing up cannot leave them looping; a core
+    # service found stopped afterwards fails the start.
+    addons_stop_leftovers addons_stop_disabled || exit 1
     # shellcheck disable=SC2086
     check_bind_sources --no-deps $_bind_skip $ACTIVE_SVCS || exit 1
     # Start all services with profile(s)
@@ -973,15 +977,14 @@ require_compose_v2 || exit 1
     # Opt-out enforcement: stop a leftover trellion from a previous
     # enabled run — `up` above ignores unselected profiles entirely.
     if [ "${TRELLION_STOP_ON_OFF:-}" = "1" ]; then
-        docker compose $COMPOSE_FILES -f "$(addons_trellion_overlay)" stop trellion 2>/dev/null || true
+        addons_compose_stop_intended "trellion is off" $COMPOSE_FILES -f "$(addons_trellion_overlay)" -- trellion
     fi
-    # Licensed add-ons switched off: stop the services their overlay adds.
     # Add-ons refused this start (require_addon_pins): a container left from
     # an earlier start must not keep running. Only services an add-on OWNS
     # are stopped; a core service found stopped afterwards fails the start.
-    addons_stop_leftovers addons_stop_disabled addons_stop_refused || exit 1
+    addons_stop_leftovers addons_stop_refused || exit 1
     if [ "${VOICE_STOP_ON_OFF:-}" = "1" ]; then
-        docker compose $COMPOSE_FILES -f "$(addons_voice_overlay)" stop whisper piper 2>/dev/null || true
+        addons_compose_stop_intended "voice is off" $COMPOSE_FILES -f "$(addons_voice_overlay)" -- whisper piper
     fi
 else
     # Specific services requested — auto-detect profiles

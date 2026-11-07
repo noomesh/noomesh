@@ -291,12 +291,12 @@ async fn logs_query(Query(params): Query<LogQueryParams>) -> impl IntoResponse {
     if let Some(end) = &params.end { url.push_str(&format!("&end={end}")); }
 
     match client.get(&url).timeout(std::time::Duration::from_secs(30)).send().await {
-        Ok(resp) => {
-            let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
-                .unwrap_or(StatusCode::BAD_GATEWAY);
-            let body = resp.text().await.unwrap_or_default();
-            (status, body).into_response()
-        }
+        // Loki's status and body pass through; a body cut off mid-transfer
+        // is a 502 naming Loki, never its 200 over an empty body (i460).
+        Ok(resp) => match crate::upstream_body::whole_text(resp, "Loki").await {
+            Ok((code, body)) => (StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY), body).into_response(),
+            Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
+        },
         Err(e) => (StatusCode::BAD_GATEWAY,
             Json(json!({"error": format!("Loki unreachable: {e}")}))).into_response(),
     }
@@ -370,49 +370,66 @@ async fn logs_containers(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ContainerQueryParams>,
 ) -> AppJson {
-    let mut results: Vec<Value> = Vec::new();
+    let targets = container_targets(&state, params.node_id.as_deref()).await;
+    let (results, unreachable) = gather_node_lists(targets, "/logs/containers").await;
+    Json(json!({"containers": results, "unreachable": unreachable}))
+}
 
-    let nodes = all_node_agents(&state).await;
-
-    if !nodes.is_empty() {
-        for (nid, agent_url, hostname) in &nodes {
-            if let Some(ref filter) = params.node_id {
-                if nid != filter { continue; }
-            }
-            let req = crate::node_link::NodeLink::for_base(agent_url).request(reqwest::Method::GET, "/logs/containers");
-            match req.timeout(std::time::Duration::from_secs(10)).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    if let Ok(containers) = resp.json::<Vec<Value>>().await {
-                        for mut c in containers {
-                            c["node_id"] = json!(nid);
-                            c["node_hostname"] = json!(hostname);
-                            results.push(c);
-                        }
-                    }
-                }
-                Ok(_) | Err(_) => {
-                    tracing::debug!(node_id = %nid, "container list failed");
-                }
-            }
+/// The node agents a per-node list asks: every node (or the one `node_id`
+/// names), else the local agent when no node is known and none was named.
+async fn container_targets(state: &AppState, node_id: Option<&str>) -> Vec<(String, String, crate::node_link::NodeLink)> {
+    let nodes = all_node_agents(state).await;
+    if nodes.is_empty() {
+        if node_id.is_none() {
+            return vec![("local".into(), "local".into(), crate::node_link::NodeLink::self_agent_at(local_agent_url()))];
         }
-    } else if params.node_id.is_none() {
-        // Fallback: try local node-agent directly
-        let local = local_agent_url();
-        let req = crate::node_link::NodeLink::self_agent_at(local).request(reqwest::Method::GET, "/logs/containers");
-        if let Ok(resp) = req.timeout(std::time::Duration::from_secs(10)).send().await {
-            if resp.status().is_success() {
-                if let Ok(containers) = resp.json::<Vec<Value>>().await {
-                    for mut c in containers {
-                        c["node_id"] = json!("local");
-                        c["node_hostname"] = json!("local");
-                        results.push(c);
-                    }
+        return Vec::new();
+    }
+    nodes
+        .into_iter()
+        .filter(|(nid, _, _)| node_id.is_none_or(|f| f == nid.as_str()))
+        .map(|(nid, url, host)| (nid, host, crate::node_link::NodeLink::for_base(&url)))
+        .collect()
+}
+
+/// Each target's list at `path`, tagged with its node, and the nodes whose
+/// list could not be had, each with why (i460). A node that failed used to
+/// vanish from the answer (debug-logged only), so its containers read as
+/// "none there".
+async fn gather_node_lists(targets: Vec<(String, String, crate::node_link::NodeLink)>, path: &str) -> (Vec<Value>, Vec<Value>) {
+    let mut results = Vec::new();
+    let mut unreachable = Vec::new();
+    for (nid, hostname, link) in targets {
+        match node_list(&link, path, &nid).await {
+            Ok(items) => {
+                for mut c in items {
+                    c["node_id"] = json!(nid);
+                    c["node_hostname"] = json!(hostname);
+                    results.push(c);
                 }
+            }
+            Err(error) => {
+                tracing::warn!(node_id = %nid, path, %error, "node list not read");
+                unreachable.push(json!({"node_id": nid, "node_hostname": hostname, "error": error}));
             }
         }
     }
+    (results, unreachable)
+}
 
-    Json(json!({"containers": results}))
+/// One node's JSON list at `path`, or why not.
+async fn node_list(link: &crate::node_link::NodeLink, path: &str, node: &str) -> Result<Vec<Value>, String> {
+    let resp = link
+        .request(reqwest::Method::GET, path)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("node {node}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("node {node} answered HTTP {}", resp.status().as_u16()));
+    }
+    let v = crate::upstream_body::json_2xx(resp, &format!("node {node}")).await?;
+    serde_json::from_value(v).map_err(|e| format!("node {node} answered something that is not a list: {e}"))
 }
 
 /// Get live container resource stats (CPU, memory, net/block I/O) across nodes.
@@ -422,50 +439,10 @@ async fn logs_docker_stats(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ContainerQueryParams>,
 ) -> AppJson {
-    let mut results: Vec<Value> = Vec::new();
-
-    let nodes = all_node_agents(&state).await;
-
-    if !nodes.is_empty() {
-        for (nid, agent_url, hostname) in &nodes {
-            if let Some(ref filter) = params.node_id {
-                if nid != filter { continue; }
-            }
-            let req = crate::node_link::NodeLink::for_base(agent_url).request(reqwest::Method::GET, "/stats/containers");
-            match req.timeout(std::time::Duration::from_secs(10)).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    if let Ok(containers) = resp.json::<Vec<Value>>().await {
-                        for mut c in containers {
-                            c["node_id"] = json!(nid);
-                            c["node_hostname"] = json!(hostname);
-                            results.push(c);
-                        }
-                    }
-                }
-                Ok(_) | Err(_) => {
-                    tracing::debug!(node_id = %nid, "container stats failed");
-                }
-            }
-        }
-    } else if params.node_id.is_none() {
-        // Fallback: try local node-agent directly
-        let local = local_agent_url();
-        let req = crate::node_link::NodeLink::self_agent_at(local).request(reqwest::Method::GET, "/stats/containers");
-        if let Ok(resp) = req.timeout(std::time::Duration::from_secs(10)).send().await {
-            if resp.status().is_success() {
-                if let Ok(containers) = resp.json::<Vec<Value>>().await {
-                    for mut c in containers {
-                        c["node_id"] = json!("local");
-                        c["node_hostname"] = json!("local");
-                        results.push(c);
-                    }
-                }
-            }
-        }
-    }
-
+    let targets = container_targets(&state, params.node_id.as_deref()).await;
+    let (results, unreachable) = gather_node_lists(targets, "/stats/containers").await;
     let timestamp = chrono::Utc::now().to_rfc3339();
-    Json(json!({"containers": results, "timestamp": timestamp}))
+    Json(json!({"containers": results, "unreachable": unreachable, "timestamp": timestamp}))
 }
 
 #[derive(Deserialize)]
@@ -881,10 +858,6 @@ pub(super) struct ListJobsParams {
     /// the unowned ones.
     #[serde(skip)]
     pub(super) scope: Option<String>,
-    /// A kiosk display token: also lists the unowned (fleet) jobs. `serde(skip)`
-    /// like `scope`, set only by the route from the verified credential.
-    #[serde(skip)]
-    pub(super) fleet: bool,
 }
 
 /// Whether a job hash is visible to `scope`.
@@ -908,15 +881,6 @@ pub(crate) fn job_visible(owner: &str, scope: Option<&str>) -> bool {
         // see and cancel only their own jobs").
         Some(me) => !owner.is_empty() && account_of(owner) == me,
     }
-}
-
-/// [`job_visible`] for the LIST route, plus the one deliberate exception: a
-/// kiosk display token (a User-tier subject that is not a person) lists the
-/// queue of the whole mesh, as the kiosk projection (`routes/kiosk.rs`)
-/// already does unscoped. `fleet` is true only for such a token; it widens
-/// nothing for a person.
-pub(crate) fn job_listed(owner: &str, scope: Option<&str>, fleet: bool) -> bool {
-    job_visible(owner, scope) || (fleet && owner.is_empty())
 }
 
 /// Whether the caller may CHANGE (cancel, reprioritize) the job. Stricter than
@@ -949,9 +913,6 @@ async fn list_jobs(
         cluster.as_ref().map(|Extension(c)| c),
     )
     .map_err(AppError::Forbidden)?;
-    params.fleet = requester
-        .as_ref()
-        .is_some_and(|Extension(r)| r.scopes.iter().any(|s| s == crate::auth::KIOSK_SCOPE));
     Ok(Json(list_jobs_for(state, params).await?))
 }
 
@@ -989,17 +950,11 @@ pub(super) async fn list_jobs_for(state: Arc<AppState>, params: ListJobsParams) 
             }
             // Ownership, applied where the other filters are so it cannot be
             // skipped by an early `continue` above it.
-            if !job_listed(
-                map.get("owner").map(|s| s.as_str()).unwrap_or(""),
-                params.scope.as_deref(),
-                params.fleet,
-            ) {
+            if !job_visible(map.get("owner").map(|s| s.as_str()).unwrap_or(""), params.scope.as_deref()) {
                 continue;
             }
 
-            // A kiosk display (`fleet`) is a shared screen: it gets the job
-            // without its payload.
-            jobs.push(job_to_json(&map, params.fleet));
+            jobs.push(job_to_json(&map));
         }
     }
 
@@ -1017,15 +972,12 @@ pub(super) async fn list_jobs_for(state: Arc<AppState>, params: ListJobsParams) 
 }
 
 /// A job hash as JSON, deserializing the payload field (JSON if it parses,
-/// else the raw string). `strip_payload` drops it altogether: a shared display
-/// must not show what was asked of the fleet.
-pub(crate) fn job_to_json(map: &std::collections::HashMap<String, String>, strip_payload: bool) -> Value {
+/// else the raw string). A shared display never gets this: it reads
+/// `/api/kiosk/jobs`, which keeps five fields of it (followup 1000).
+pub(crate) fn job_to_json(map: &std::collections::HashMap<String, String>) -> Value {
     let mut job = serde_json::Map::new();
     for (k, v) in map {
         if k == "payload" {
-            if strip_payload {
-                continue;
-            }
             match serde_json::from_str::<Value>(v) {
                 Ok(parsed) => { job.insert(k.clone(), parsed); }
                 Err(_) => { job.insert(k.clone(), json!(v)); }
@@ -4729,7 +4681,7 @@ mod job_type_routing_tests {
 
 #[cfg(test)]
 mod job_ownership_tests {
-    use super::{clamp_user_job_knobs, job_listed, job_mutable_by, job_to_json, job_visible, user_submit_refusal, USER_JOB_PAYLOAD_MAX_BYTES};
+    use super::{clamp_user_job_knobs, job_mutable_by, job_to_json, job_visible, user_submit_refusal, USER_JOB_PAYLOAD_MAX_BYTES};
     use crate::auth::{account_of, scoped_account, RequesterCtx, Role};
     use crate::routes::AppError;
     use serde_json::json;
@@ -4777,31 +4729,26 @@ mod job_ownership_tests {
         assert!(!job_visible("", Some("alice")));
     }
 
-    /// The kiosk token's list never carries a payload (a shared screen), while
-    /// every other caller's list still does.
+    /// The general list carries the payload (the caller's own jobs, or
+    /// Operator+). The kiosk's list is the projection's (followup 1000):
+    /// `routes::kiosk::tests::the_kiosk_job_list_never_carries_a_payload`.
     #[test]
-    fn the_kiosk_list_never_carries_a_payload() {
+    fn the_general_list_carries_the_payload() {
         let mut m = std::collections::HashMap::new();
         m.insert("job_id".to_string(), "j1".to_string());
-        m.insert("status".to_string(), "queued".to_string());
-        m.insert("payload".to_string(), r#"{"prompt":"secret"}"#.to_string());
-        let kiosk = job_to_json(&m, true);
-        assert!(kiosk.get("payload").is_none(), "{kiosk}");
-        assert_eq!(kiosk["job_id"], "j1");
-        assert!(!kiosk.to_string().contains("secret"));
-        assert_eq!(job_to_json(&m, false)["payload"]["prompt"], "secret");
+        m.insert("payload".to_string(), r#"{"prompt":"mine"}"#.to_string());
+        assert_eq!(job_to_json(&m)["payload"]["prompt"], "mine");
     }
 
-    /// The kiosk display lists the whole queue, so its token (and only a
-    /// token with the kiosk scope: `fleet`) also lists unowned jobs. It
-    /// never sees another person's job, and a person never gets `fleet`.
+    /// A User lists only its own account's jobs, never unowned fleet work;
+    /// there is no kiosk exception any more (followup 1000).
     #[test]
-    fn only_a_kiosk_token_lists_the_unowned_fleet_jobs() {
-        assert!(job_listed("", Some("kiosk:hall"), true));
-        assert!(!job_listed("bob", Some("kiosk:hall"), true));
-        assert!(!job_listed("", Some("alice"), false));
-        assert!(job_listed("alice", Some("alice"), false));
-        assert!(job_listed("bob", None, false));
+    fn a_user_lists_only_its_own_jobs() {
+        assert!(!job_visible("", Some("kiosk:hall")));
+        assert!(!job_visible("bob", Some("kiosk:hall")));
+        assert!(!job_visible("", Some("alice")));
+        assert!(job_visible("alice", Some("alice")));
+        assert!(job_visible("bob", None));
     }
 
     /// Not a prefix match, not a case fold — the owner is the account name
@@ -5115,8 +5062,8 @@ mod tests {
         assert!(loki_ready_detail(None, "error sending request: tls handshake eof").starts_with("no answer: "));
         assert!(loki_ready_detail(Some(503), &"x".repeat(1000)).len() < 260, "bounded");
         let src = include_str!("admin.rs");
-        let body = &src[src.find("async fn logs_status(").unwrap()..];
-        let body = &body[..body.find("\n}\n").unwrap()];
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "async fn logs_status(");
         assert!(body.contains("\"loki_ready_detail\": detail"), "the reason is not returned");
         assert!(!body.contains("unwrap_or(false)"), "the probe folds its reason into false again");
     }
@@ -5318,25 +5265,34 @@ mod tests {
 
 /// The stamp a version table holds, per-system schema first (fresh layout)
 /// then `public` (legacy) — the same resolution order the runners use.
-async fn stamp_of(db: &sqlx::PgPool, schema: &str, table: &str) -> Option<String> {
+async fn stamp_of(db: &sqlx::PgPool, schema: &str, table: &str) -> Result<Option<String>, String> {
     for rel in [format!("{schema}.{table}"), format!("public.{table}")] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(&rel)
             .fetch_one(db)
             .await
-            .ok()?;
+            .map_err(|e| format!("cannot look up {rel}: {e}"))?;
         if exists {
             let v: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT version_num FROM {rel} LIMIT 1")))
                 .fetch_optional(db)
                 .await
-                .ok()
-                .flatten();
+                .map_err(|e| format!("cannot read {rel}: {e}"))?;
             if v.is_some() {
-                return v;
+                return Ok(v);
             }
         }
     }
-    None
+    Ok(None)
+}
+
+/// A stamp as the migration status shows it: the revision, null when the
+/// chain has no stamp, and `unreadable: <error>` when it could not be read,
+/// so a failed read is never mistaken for "no migration" (i460).
+fn stamp_json(stamp: Result<Option<String>, String>) -> Value {
+    match stamp {
+        Ok(v) => json!(v),
+        Err(e) => json!(format!("unreadable: {e}")),
+    }
 }
 
 /// GET /api/db/migrations — mesh (native runner: current, head, ported
@@ -5375,11 +5331,11 @@ async fn db_migrations(State(state): State<Arc<AppState>>) -> AppResult {
         },
         "memory": {
             "owner": "trellion (alembic, applied at its container start)",
-            "current": stamp_of(&state.db, "trellion", "alembic_version_memory").await,
+            "current": stamp_json(stamp_of(&state.db, "trellion", "alembic_version_memory").await),
         },
         "evolve": {
             "owner": "evolve (alembic, evolve overlay)",
-            "current": stamp_of(&state.db, "evolve", "alembic_version_evolve").await,
+            "current": stamp_json(stamp_of(&state.db, "evolve", "alembic_version_evolve").await),
         },
     })))
 }
@@ -5524,5 +5480,52 @@ mod approval_decider_tests {
             let body = &src[start..start + 700];
             assert!(body.contains("require_human_decider("), "{f} must refuse non-person credentials");
         }
+    }
+}
+
+/// A migration stamp that cannot be read says so; it is never shown as
+/// null, which reads as "no migration" (i460).
+#[cfg(test)]
+mod stamp_read_error_tests {
+    #[tokio::test]
+    async fn an_unreadable_stamp_reads_unreadable_not_null() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool");
+        let got = super::stamp_json(super::stamp_of(&pool, "trellion", "alembic_version_memory").await);
+        let s = got.as_str().unwrap_or_else(|| panic!("a string, not {got}"));
+        assert!(s.starts_with("unreadable: cannot look up trellion.alembic_version_memory"), "{s}");
+        assert_eq!(super::stamp_json(Ok(None)), serde_json::Value::Null, "no stamp is still null");
+        assert_eq!(super::stamp_json(Ok(Some("abc".into()))), serde_json::json!("abc"));
+    }
+}
+
+#[cfg(test)]
+mod node_list_tests {
+    use super::*;
+
+    /// i460: a node whose container list cannot be had is named in
+    /// `unreachable` with why, never dropped so that its containers read
+    /// as "none there". Against loopback agents: one answers, one cuts its
+    /// body short, one answers 500, one answers an object, not a list.
+    #[tokio::test]
+    async fn a_node_whose_list_cannot_be_read_is_named_not_dropped() {
+        use crate::upstream_body::{stub, stub_cut_short};
+        let good = stub("200 OK", None, b"[{\"name\": \"noo-gateway\"}]").await;
+        let cut = stub_cut_short().await;
+        let down = stub("500 Internal Server Error", None, b"[]").await;
+        let odd = stub("200 OK", None, b"{\"containers\": []}").await;
+        let t = |id: &str, b: &str| (id.to_string(), format!("{id}.lan"), crate::node_link::NodeLink::for_base(b));
+        let (items, unreachable) =
+            gather_node_lists(vec![t("a", &good), t("b", &cut), t("c", &down), t("d", &odd)], "/logs/containers").await;
+        assert_eq!(items, vec![json!({"name": "noo-gateway", "node_id": "a", "node_hostname": "a.lan"})]);
+        let named: Vec<&str> = unreachable.iter().map(|u| u["node_id"].as_str().unwrap()).collect();
+        assert_eq!(named, ["b", "c", "d"], "{unreachable:?}");
+        let why = |i: usize| unreachable[i]["error"].as_str().unwrap().to_string();
+        assert!(why(0).starts_with("node b answered HTTP 200 but its body could not be read"), "{}", why(0));
+        assert_eq!(why(1), "node c answered HTTP 500");
+        assert!(why(2).starts_with("node d answered something that is not a list"), "{}", why(2));
+        assert_eq!(unreachable[1]["node_hostname"], "c.lan");
     }
 }

@@ -17,9 +17,12 @@
 //! (a gap). A 409 rewinds that task's cursor to `n` when the outbox still has
 //! it; when `n` is older than retention the gateway sends ONE `reset` event
 //! (not stored) whose `seq` is `earliest_seq - 1` and whose data is
-//! `{earliest_seq, task}`, then resumes at `earliest_seq`. Anything else is
-//! retried with backoff for up to 7 days, after which the task's delivery is
-//! marked `undelivered`.
+//! `{earliest_seq, task}`, then resumes at `earliest_seq`. The same reset
+//! covers an event missing from the middle of the outbox: the gateway skips
+//! only the missing seqs and resumes at the next retained one, never past
+//! events that are still there. An outbox the gateway cannot read is retried,
+//! and the cursor never moves on it. Anything else is retried with backoff
+//! for up to 7 days, after which the task's delivery is marked `undelivered`.
 
 use anyhow::{anyhow, Result};
 use serde::Serialize;
@@ -122,6 +125,49 @@ pub enum Next {
     Reset,
     /// Anything else: back off.
     Retry,
+}
+
+/// What to do when the event the cursor owes is not in the outbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Missing {
+    /// Older events were swept: send the reset event, resume at this seq.
+    Reset(i64),
+    /// A gap in the middle (seqs `next..to` are missing, `to` is retained):
+    /// skip ONLY those, with a reset at `to` so the receiver resumes there
+    /// rather than answering 409 for the missing one.
+    SkipGap { to: i64 },
+    /// Nothing at or after the cursor is retained: move past the end.
+    PastEnd,
+    /// The outbox could not be read: back off, the cursor does not move.
+    Retry(String),
+}
+
+/// The decision when the owed event is missing, pure. `earliest` is the
+/// oldest retained seq, `next_retained` the oldest retained seq above
+/// `next_seq`. An unreadable outbox is never "nothing retained": read that
+/// way it moved the cursor past the end and every remaining event, the final
+/// state among them, was lost without a word (i460).
+pub fn missing_event_step(next_seq: i64, earliest: Result<Option<i64>, String>, next_retained: Result<Option<i64>, String>) -> Missing {
+    match earliest {
+        Err(e) => Missing::Retry(format!("earliest retained event not read: {e}")),
+        Ok(None) => Missing::PastEnd,
+        Ok(Some(e)) if e > next_seq => Missing::Reset(e),
+        Ok(Some(_)) => match next_retained {
+            Err(e) => Missing::Retry(format!("next retained event not read: {e}")),
+            Ok(Some(to)) => Missing::SkipGap { to },
+            Ok(None) => Missing::PastEnd,
+        },
+    }
+}
+
+/// The owner's role, as the add-on sees it. No such user reads as User, the
+/// way it always has; a role that cannot be READ is not a User, and sending
+/// an admin's events with a User's scopes was a silently wrong identity.
+pub fn owner_role(read: Result<Option<String>, String>) -> Result<crate::auth::Role, String> {
+    match read {
+        Ok(r) => Ok(r.and_then(|r| r.parse::<crate::auth::Role>().ok()).unwrap_or(crate::auth::Role::User)),
+        Err(e) => Err(format!("owner role not read: {e}")),
+    }
 }
 
 /// The decision, pure. `sent` is the seq just sent, `earliest` the oldest
@@ -439,12 +485,10 @@ async fn deliver_task(state: &Arc<AppState>, mut d: Due) {
     // The owner's role and scopes, as the add-on would see them on a request
     // from that person. A disabled owner still gets their events (the
     // revoked + final state ones above all).
-    let role = crate::repo::users::role_of(db, &owner)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|r| r.parse::<crate::auth::Role>().ok())
-        .unwrap_or(crate::auth::Role::User);
+    let role = match owner_role(crate::repo::users::role_of(db, &owner).await.map_err(|e| e.to_string())) {
+        Ok(r) => r,
+        Err(why) => return record_failure(db, &d, &why).await,
+    };
     let requester = crate::auth::RequesterCtx {
         sub: owner.clone(),
         scopes: role.legacy_scopes().iter().map(|s| s.to_string()).collect(),
@@ -467,35 +511,39 @@ async fn deliver_task(state: &Arc<AppState>, mut d: Due) {
             Ok(r) => r,
             Err(e) => return record_failure(db, &d, &format!("event not read: {e}")).await,
         };
-        let earliest: Option<i64> = sqlx::query_scalar("SELECT min(seq) FROM noo_task_events WHERE task_id = $1")
-            .bind(d.task_id)
-            .fetch_one(db)
-            .await
-            .ok()
-            .flatten();
+        let earliest = crate::repo::task_events::earliest_seq(db, d.task_id).await.map_err(|e| e.to_string());
         let Some(row) = row else {
-            // The event we owe is gone (swept, or never written). Resume at
-            // what is retained with a reset, or past the end if nothing is.
-            match earliest {
-                Some(e) if e > d.next_seq => match send_reset(state, &entry, spec, &requester, &d, &owner, &via, e).await {
-                    Ok(()) => {
-                        if set_cursor(db, d.task_id, e, true).await.is_err() {
-                            return;
-                        }
-                        d.next_seq = e;
-                        d.attempts = 0;
-                        d.first_failure_at = None;
-                        continue;
-                    }
-                    Err(why) => return record_failure(db, &d, &why).await,
-                },
-                _ => {
+            // The event we owe is gone (swept, never written, or a gap).
+            let next_retained = crate::repo::task_events::next_retained_seq(db, d.task_id, d.next_seq).await.map_err(|e| e.to_string());
+            let resume = match missing_event_step(d.next_seq, earliest, next_retained) {
+                Missing::Retry(why) => return record_failure(db, &d, &why).await,
+                Missing::PastEnd => {
                     let _ = set_cursor(db, d.task_id, d.last_seq + 1, true).await;
                     return;
                 }
+                Missing::Reset(e) => e,
+                Missing::SkipGap { to } => {
+                    tracing::warn!(task = %d.task_id, from = d.next_seq, to, "task_events: events {}..{} are missing from the outbox; skipping only those", d.next_seq, to - 1);
+                    to
+                }
+            };
+            match send_reset(state, &entry, spec, &requester, &d, &owner, &via, resume).await {
+                Ok(()) => {
+                    if set_cursor(db, d.task_id, resume, true).await.is_err() {
+                        return;
+                    }
+                    d.next_seq = resume;
+                    d.attempts = 0;
+                    d.first_failure_at = None;
+                    continue;
+                }
+                Err(why) => return record_failure(db, &d, &why).await,
             }
         };
-        let earliest = earliest.unwrap_or(d.next_seq);
+        let earliest = match earliest {
+            Ok(e) => e.unwrap_or(d.next_seq),
+            Err(e) => return record_failure(db, &d, &format!("earliest retained event not read: {e}")).await,
+        };
         let kind: String = row.try_get("kind").unwrap_or_default();
         let data: Value = row.try_get("data").unwrap_or(Value::Null);
         let at = row.try_get::<chrono::DateTime<chrono::Utc>, _>("at").unwrap_or_else(|_| chrono::Utc::now());
@@ -586,6 +634,43 @@ pub async fn sweep(db: &sqlx::PgPool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The retained seqs as the two queries would see them.
+    fn outbox(retained: &[i64], next: i64) -> (Result<Option<i64>, String>, Result<Option<i64>, String>) {
+        (Ok(retained.iter().copied().min()), Ok(retained.iter().copied().filter(|s| *s > next).min()))
+    }
+
+    /// i460: an unreadable outbox moved the cursor past the end, so every
+    /// remaining event, the final state among them, was never delivered.
+    #[test]
+    fn an_unreadable_outbox_retries_and_never_skips() {
+        let down = || Err::<Option<i64>, String>("connection reset".into());
+        assert!(matches!(missing_event_step(3, down(), Ok(Some(5))), Missing::Retry(w) if w.contains("connection reset")));
+        assert!(matches!(missing_event_step(3, Ok(Some(1)), down()), Missing::Retry(_)));
+    }
+
+    #[test]
+    fn a_middle_gap_skips_only_the_missing_events() {
+        let (earliest, next) = outbox(&[1, 2, 5, 6], 3);
+        assert_eq!(missing_event_step(3, earliest, next), Missing::SkipGap { to: 5 });
+    }
+
+    #[test]
+    fn swept_history_and_an_empty_outbox_keep_their_meaning() {
+        let (earliest, next) = outbox(&[7, 8], 3);
+        assert_eq!(missing_event_step(3, earliest, next), Missing::Reset(7), "older events swept: reset at the oldest kept");
+        let (earliest, next) = outbox(&[], 3);
+        assert_eq!(missing_event_step(3, earliest, next), Missing::PastEnd, "nothing retained");
+        let (earliest, next) = outbox(&[1, 2], 3);
+        assert_eq!(missing_event_step(3, earliest, next), Missing::PastEnd, "nothing at or after the cursor");
+    }
+
+    #[test]
+    fn an_unreadable_owner_role_is_not_a_user() {
+        assert_eq!(owner_role(Ok(Some("admin".into()))), Ok(crate::auth::Role::Admin));
+        assert_eq!(owner_role(Ok(None)), Ok(crate::auth::Role::User), "no such user stays User");
+        assert!(owner_role(Err("pool timed out".into())).is_err());
+    }
 
     #[test]
     fn addon_of_reads_only_addon_vias() {

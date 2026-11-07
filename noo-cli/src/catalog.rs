@@ -732,14 +732,55 @@ pub fn fallback_models(backend: &str) -> Vec<Value> {
 // HF API access
 // ---------------------------------------------------------------------------
 
-fn hf_base() -> String {
-    let base = std::env::var("HF_ENDPOINT").unwrap_or_default();
-    let base = base.trim().trim_end_matches('/');
+/// What to do about a refused `HF_ENDPOINT` (the `hint` of every refusal).
+pub(crate) const HF_ENDPOINT_REMEDY: &str =
+    "point HF_ENDPOINT at an https:// mirror, or unset it to use https://huggingface.co";
+
+/// The Hugging Face endpoint every `noo models` path talks to, or why it is
+/// refused (noomesh-internal i445). `HF_ENDPOINT` (huggingface_hub's own
+/// override) must be https, or plain http to THIS machine (a loopback mirror,
+/// the test mocks). Over http to anywhere else the controller's HF token
+/// would travel in clear, and the sha256 a download is verified against
+/// comes from the same endpoint, so an on-path swap of file and digest would
+/// pass. Unset or empty: `https://huggingface.co`.
+pub(crate) fn hf_endpoint() -> Result<String, String> {
+    hf_endpoint_from(std::env::var("HF_ENDPOINT").ok().as_deref())
+}
+
+pub(crate) fn hf_endpoint_from(raw: Option<&str>) -> Result<String, String> {
+    let base = raw.unwrap_or_default().trim().trim_end_matches('/');
     if base.is_empty() {
-        "https://huggingface.co".to_string()
-    } else {
-        base.to_string()
+        return Ok("https://huggingface.co".to_string());
     }
+    if hf_origin_allowed(base) {
+        return Ok(base.to_string());
+    }
+    Err(format!(
+        "HF_ENDPOINT={base} is refused: Hugging Face is reached over https, or over plain http only on \
+         this machine (127.0.0.1, ::1, localhost). Over http elsewhere the HF token and the sha256 a \
+         download is checked against would travel unencrypted"
+    ))
+}
+
+/// Whether `url` is a Hugging Face origin `noo` may talk to (and send the
+/// token to): `https://`, or `http://` to a loopback host. A userinfo part
+/// (`http://127.0.0.1@elsewhere`) is not the host.
+pub(crate) fn hf_origin_allowed(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return true;
+    }
+    let Some(rest) = lower.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let hostport = authority.rsplit('@').next().unwrap_or_default();
+    let host = if let Some(v6) = hostport.strip_prefix('[') {
+        v6.split(']').next().unwrap_or_default()
+    } else {
+        hostport.split(':').next().unwrap_or_default()
+    };
+    host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 fn urlenc(s: &str) -> String {
@@ -754,6 +795,10 @@ fn urlenc(s: &str) -> String {
 }
 
 fn hf_get(url: &str, timeout_secs: u64) -> Result<Value, String> {
+    // Never a request to an origin the endpoint rule refuses (i445).
+    if !hf_origin_allowed(url) {
+        return Err(format!("refusing {url}: {HF_ENDPOINT_REMEDY}"));
+    }
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(timeout_secs)))
         .http_status_as_error(false)
@@ -968,7 +1013,7 @@ pub fn ollama_live_starters(vram_gb: f64) -> Option<Vec<(String, String)>> {
 fn hf_search(query: &str, limit: usize) -> Result<Vec<Value>, String> {
     let url = format!(
         "{}/api/models?search={}&limit={}&sort=downloads&direction=-1&full=true",
-        hf_base(),
+        hf_endpoint()?,
         urlenc(query),
         limit
     );
@@ -1314,7 +1359,7 @@ impl Catalog {
 
     /// Fetch detailed info for a single model from HF. None on any failure.
     pub fn model_info(&self, model_id: &str) -> Option<Value> {
-        let url = format!("{}/api/models/{}", hf_base(), model_id);
+        let url = format!("{}/api/models/{}", hf_endpoint().ok()?, model_id);
         let data = hf_get(&url, 10).ok()?;
         Some(normalize_detail(&data))
     }
@@ -1568,5 +1613,50 @@ mod live_starters_tests {
             eprintln!("PICK {name} — {desc}");
             assert!(name.contains(':'), "not a model:tag: {name}");
         }
+    }
+}
+
+#[cfg(test)]
+mod hf_endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn unset_or_empty_is_huggingface_over_https() {
+        assert_eq!(hf_endpoint_from(None).unwrap(), "https://huggingface.co");
+        assert_eq!(hf_endpoint_from(Some("  ")).unwrap(), "https://huggingface.co");
+    }
+
+    #[test]
+    fn https_anywhere_and_http_to_this_machine_are_allowed() {
+        assert_eq!(hf_endpoint_from(Some("https://hf-mirror.example/")).unwrap(), "https://hf-mirror.example");
+        assert_eq!(hf_endpoint_from(Some("HTTPS://Mirror.Example")).unwrap(), "HTTPS://Mirror.Example");
+        for ok in ["http://127.0.0.1:8080", "http://localhost", "http://[::1]:9", "http://127.0.0.2:1/x"] {
+            assert!(hf_endpoint_from(Some(ok)).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn plain_http_elsewhere_is_refused_with_the_variable_named() {
+        for bad in [
+            "http://hf-mirror.example",
+            "http://10.0.0.5:8080",
+            "http://127.0.0.1@evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://localhost.evil.example",
+            "ftp://hf-mirror.example",
+            "hf-mirror.example",
+        ] {
+            let why = hf_endpoint_from(Some(bad)).expect_err(bad);
+            assert!(why.contains("HF_ENDPOINT=") && why.contains("unencrypted"), "{bad}: {why}");
+        }
+    }
+
+    #[test]
+    fn a_catalogue_request_to_a_refused_origin_is_never_made() {
+        // `hf_get` refuses before building an agent: no DNS, no connect.
+        let started = std::time::Instant::now();
+        let err = hf_get("http://hf-mirror.invalid/api/models", 30).expect_err("refused");
+        assert!(err.contains("refusing http://hf-mirror.invalid"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }

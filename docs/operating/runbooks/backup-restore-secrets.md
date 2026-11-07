@@ -393,6 +393,22 @@ hostname or IP changed. Models, caches and images are not carried; they
 are pulled again. The manual steps below are the primitive it is built
 from, and the path when all you have is a scheduled backup.
 
+The archive carries the database roles beside the dump (`db/pgroles.sql`:
+`CREATE ROLE` statements with attributes only, never a password) and the
+dump's own table count per schema in its manifest. The import creates the
+roles the secret store holds passwords for, then the rest from the roles
+file, then replays the dump. Every step stops at the first error and
+names it. The restore counts only when every schema has exactly the tables
+the archive carried. A role the stack logs in as that came back without a
+password stops the import with its name; run
+`noo security secrets resync --all`, then `noo onboard --only services`.
+An archive exported before roles were carried gets the known `noo_*`
+roles `NOLOGIN`, and only a non-zero table count is checked; the core
+roles every stack logs in as (`noo_app`, `noo_trellion`,
+`noo_trellion_ddl`), and `noo_evolve` and `noo_evolve_ddl` when the
+archive's own `noomesh.yaml` declares `evolve: true`, must still get their
+password from the secret store, or the import stops the same way.
+
 Order matters — secrets first, or nothing else can start.
 
 ```sh

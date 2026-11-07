@@ -349,15 +349,19 @@ async fn check_embedding_dims(state: &Arc<AppState>) -> CheckResult {
     }
 
     // Store-side dims: atttypmod of a vector column IS its dimension.
-    let store_dims: Option<i32> = sqlx::query_scalar(
+    let store_dims: Result<Option<i32>, sqlx::Error> = sqlx::query_scalar(
         "SELECT a.atttypmod FROM pg_attribute a \
          JOIN pg_class c ON a.attrelid = c.oid \
          WHERE c.relname = 'noo_entries' AND a.attname = 'embedding'",
     )
     .fetch_optional(&state.db)
-    .await
-    .ok()
-    .flatten();
+    .await;
+    // A failed read is not "no vector column": it was reported as a passing
+    // skip, so a dimension check that never ran read as fine (#650 sweep).
+    let store_dims = match store_dims {
+        Ok(d) => d,
+        Err(e) => return fail("embedding_dims", false, format!("cannot read the vector column's width: {e}")),
+    };
     let Some(store_dims) = store_dims.filter(|d| *d > 0) else {
         return ok("embedding_dims", false, "no vector column found (skipped)");
     };

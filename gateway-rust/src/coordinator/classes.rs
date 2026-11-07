@@ -61,7 +61,8 @@
 //! (stale heartbeat, unreachable, quarantined), stalled in the last
 //! [`STALL_DEMOTION`] (5 min), thermal `serious`/`critical`, every slot
 //! busy (the agent's `backend_containers.<b>.{in_flight, slots, queued}`,
-//! the shorter queue first: [`full_rank`]), GPU shared
+//! the shorter queue first: [`full_rank`]), then the lane state (serving,
+//! on demand, unconfirmed: [`LaneState::rank`]), GPU shared
 //! with a foreign workload (`gpu_contention.state: shared`; a lane listed in
 //! `gpu_contention.paused_backends` is not a candidate at all), engine (vLLM,
 //! then a GPU runtime, then CPU), larger model first (parameter estimate,
@@ -196,7 +197,8 @@ pub struct NodeFacts {
     pub unreported: Vec<String>,
     /// Model names the node has locally (Ollama tags, GGUFs).
     pub available_models: Vec<String>,
-    /// Backends whose `model_presence.present` is `false`.
+    /// Backends whose CHAT model `model_presence` reports absent (`present:
+    /// false`). An absent embed/rerank model on the backend is not counted.
     pub model_missing: Vec<String>,
     /// Backends whose placement role is not `chat`.
     pub non_chat: Vec<String>,
@@ -204,7 +206,10 @@ pub struct NodeFacts {
     /// other than chat (`ollama#embed`). Empty from an agent that predates
     /// the field: the placements and the name registry still apply.
     pub reported_non_chat_models: Vec<(String, String)>,
-    pub load: f64,
+    /// The heartbeat's `load` as stored (`current_load`, 0.0-1.0). `None`
+    /// = the agent did not report a number: unknown, ranked after every
+    /// reported load, never read as idle.
+    pub load: Option<f64>,
     pub tier: Option<i64>,
     /// `vram_gb > 0`, or unified memory (Apple silicon).
     pub gpu: bool,
@@ -237,11 +242,130 @@ pub struct NodeFacts {
     /// counts; an agent that predates the field reports nothing and every
     /// backend reads as serving.
     pub not_serving: Vec<(String, String)>,
+    /// The heartbeat's `lanes` (i403): one per (backend, placed model), with
+    /// the state the agent derived. `None` from an agent that predates the
+    /// field; `running` then comes from `running_backends` as before. When it
+    /// is `Some`, `running` holds only the routable chat lanes.
+    pub lanes: Option<Vec<Lane>>,
 }
 
 /// One row of `noo_backend_placements` as the table needs it:
 /// `(node_id, backend, model, role)`.
 pub type PlacementRow = (String, String, Option<String>, String);
+
+/// A lane's state as its node agent derives it (i403). The gateway's own
+/// overlays still win over it: liveness, a GPU hold or `paused_backends`,
+/// and `backend_containers.<b>.serving: false` ([`backend_health`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaneState {
+    /// The runtime confirms the placed model.
+    Serving,
+    /// On disk, not loaded (ollama idle): the first call pays the load.
+    OnDemand,
+    /// The engine is starting or warming, or reconciling to a new placement.
+    Loading,
+    /// Placed, and the agent's model presence says it is not on disk.
+    Missing,
+    /// Running, named, and no placement explains it (a native engine).
+    Unplaced,
+    /// Placed, and the agent cannot tell yet (reason `no presence yet`).
+    Unknown,
+    /// Placed and not running, unhealthy, or running unnamed: not routed.
+    Down,
+    /// A word this gateway does not know (a newer agent). Not routed: a state
+    /// the gateway cannot read is not a state it may assume serves.
+    Other(String),
+}
+
+impl LaneState {
+    pub fn parse(s: &str) -> LaneState {
+        match s {
+            "serving" => LaneState::Serving,
+            "on_demand" => LaneState::OnDemand,
+            "loading" => LaneState::Loading,
+            "missing" => LaneState::Missing,
+            "unplaced" => LaneState::Unplaced,
+            "unknown" => LaneState::Unknown,
+            "down" => LaneState::Down,
+            other => LaneState::Other(other.to_string()),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            LaneState::Serving => "serving",
+            LaneState::OnDemand => "on_demand",
+            LaneState::Loading => "loading",
+            LaneState::Missing => "missing",
+            LaneState::Unplaced => "unplaced",
+            LaneState::Unknown => "unknown",
+            LaneState::Down => "down",
+            LaneState::Other(s) => s,
+        }
+    }
+
+    /// Where the lane ranks inside a class, lowest first; `None` = not
+    /// routable. Serving, then on demand (pays a load), then the lanes the
+    /// agent could not confirm.
+    pub fn rank(&self) -> Option<u8> {
+        match self {
+            LaneState::Serving => Some(0),
+            LaneState::OnDemand => Some(1),
+            LaneState::Unknown | LaneState::Unplaced => Some(2),
+            LaneState::Loading | LaneState::Missing | LaneState::Down | LaneState::Other(_) => None,
+        }
+    }
+}
+
+/// One entry of the heartbeat's `lanes` (i403).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lane {
+    pub backend: String,
+    /// The placed model, verbatim; never empty (a lane without one is dropped).
+    pub model: String,
+    /// The placement role; `""` or `chat` is a chat lane.
+    pub role: String,
+    pub state: LaneState,
+    pub reason: String,
+}
+
+impl Lane {
+    pub fn is_chat(&self) -> bool {
+        matches!(self.role.as_str(), "" | "chat")
+    }
+
+    /// One `lanes` entry, or `None` when it names no backend or no model.
+    ///
+    /// An absolute path (a llamacpp or reranker placement, `/models/x.gguf`)
+    /// is named by its file, as `running_backends` names it
+    /// (`docker/client.go`, MODEL_PATH after the last `/`), so the lane keeps
+    /// the class name clients already send. A repo id (`google/gemma-…`) is
+    /// not a path and is kept whole.
+    pub fn from_value(v: &Value) -> Option<Lane> {
+        let text = |k: &str| v.get(k).and_then(Value::as_str).map(str::trim).unwrap_or("").to_string();
+        let backend = text("backend");
+        let placed = text("model");
+        let model = if placed.starts_with('/') { placed.rsplit('/').next().unwrap_or("").to_string() } else { placed };
+        if backend.is_empty() || model.is_empty() {
+            return None;
+        }
+        Some(Lane { backend, model, role: text("role"), state: LaneState::parse(&text("state")), reason: text("reason") })
+    }
+}
+
+/// A node's lane for `(backend, model)`, when its agent reports lanes.
+/// The routing rank of a node's lane for (backend, model): its state's
+/// [`LaneState::rank`], or 0 when the node sends no matching lane (an agent
+/// that predates lanes). The class table's candidates and the KV-scan
+/// resolver (backend.rs) both rank by this one function, so a pinned model
+/// and raw chat cannot disagree on lane state.
+pub fn lane_rank_of(n: &NodeFacts, backend: &str, model: &str) -> u8 {
+    lane_of(n, backend, model).and_then(|l| l.state.rank()).unwrap_or(0)
+}
+
+fn lane_of<'a>(n: &'a NodeFacts, backend: &str, model: &str) -> Option<&'a Lane> {
+    n.lanes.as_ref()?.iter().find(|l| l.backend == backend && same_model(&l.model, model))
+}
 
 // ── the table ────────────────────────────────────────────────────────────
 
@@ -273,7 +397,8 @@ pub struct Candidate {
     pub healthy: bool,
     /// Why not healthy, for the operator surfaces; empty when healthy.
     pub health: String,
-    pub load: f64,
+    /// `None` = not reported (see [`NodeFacts::load`]); sorts last.
+    pub load: Option<f64>,
     /// The node-agent address work is sent to (`https://<ip>:8081`), or the
     /// controller-local docker URL when the node has no registered address.
     /// Not serialised: no API surface carries a dial address.
@@ -300,6 +425,18 @@ pub struct Candidate {
     /// [`select`] for the logs.
     #[serde(skip)]
     pub rank: String,
+    /// The agent's lane state for this candidate (i403); absent from an
+    /// agent that predates `lanes`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane_state: Option<String>,
+    /// [`LaneState::rank`]: 0 serving (or an older agent), 1 on demand, 2
+    /// unconfirmed. Sorts right after health in every class order.
+    #[serde(skip)]
+    lane_rank: u8,
+    /// An `unplaced` lane: in its model's derived class, never in the
+    /// dynamic default (P2: an undeclared engine is not the default).
+    #[serde(skip)]
+    unplaced_lane: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -329,7 +466,7 @@ impl Candidate {
             status: CandidateStatus::Placed,
             healthy: true,
             health: String::new(),
-            load: 0.0,
+            load: None,
             url,
             tier: None,
             gpu: false,
@@ -340,6 +477,9 @@ impl Candidate {
             slots: None,
             class_label: String::new(),
             rank: String::new(),
+            lane_state: None,
+            lane_rank: 0,
+            unplaced_lane: false,
         }
     }
 
@@ -378,6 +518,11 @@ pub struct ClassTable {
     /// pin can tell "no such node" (422) from "serves no chat" (409).
     #[serde(skip)]
     pub nodes: Vec<String>,
+    /// Chat lanes the agents report that no class routes to (`loading`,
+    /// `missing`, a state this gateway does not know), as
+    /// `(node, backend, model, why)`. `load_table` logs them.
+    #[serde(skip)]
+    pub skipped_lanes: Vec<(String, String, String, String)>,
 }
 
 impl ClassTable {
@@ -465,18 +610,28 @@ fn engine_rank(backend: &str, gpu: bool) -> u8 {
     }
 }
 
-fn derive_key(c: &Candidate) -> (u8, i64, i64) {
-    (engine_rank(&c.backend, c.gpu), c.tier.unwrap_or(i64::MAX), (c.load * 100.0) as i64)
+/// A load as a sort key: a reported load x100 (the scale is 0.0-1.0), and
+/// an unreported one after every reported load. An agent that cannot read
+/// its load omits it; reading that as 0.0 made the node look the least
+/// loaded and drew work to it.
+pub fn load_key(load: Option<f64>) -> i64 {
+    load.map(|l| (l * 100.0) as i64).unwrap_or(i64::MAX)
+}
+
+fn derive_key(c: &Candidate) -> (u8, u8, i64, i64) {
+    (c.lane_rank, engine_rank(&c.backend, c.gpu), c.tier.unwrap_or(i64::MAX), load_key(c.load))
 }
 
 /// The routing order within a class, lowest first: non-degraded, healthy,
-/// declared position, load. A function so the ORDER is what gets tested.
-pub fn order_key(c: &Candidate) -> (u8, u8, usize, i64) {
+/// lane state (serving, on demand, unconfirmed), declared position, load. A
+/// function so the ORDER is what gets tested.
+pub fn order_key(c: &Candidate) -> (u8, u8, u8, usize, i64) {
     (
         if c.degraded { 1 } else { 0 },
         if c.healthy { 0 } else { 1 },
+        c.lane_rank,
         c.position,
-        (c.load * 100.0) as i64,
+        load_key(c.load),
     )
 }
 
@@ -501,27 +656,39 @@ pub fn full_rank(c: &Candidate, in_flight: usize) -> u32 {
     }
 }
 
+/// Can this candidate start a request well NOW: not stalled in the last
+/// [`STALL_DEMOTION`], not thermally `serious`/`critical`, a free slot (a
+/// full backend after every one that can start now, the shorter queue
+/// first: [`full_rank`]). Ranked BEFORE the lane state in [`rank_key`] and
+/// [`pool_key`]: a serving lane that is full or stalled must not beat a free
+/// on-demand peer (the 2026-11-01 incident #621 fixed, which lane state
+/// (#669) brought back whenever the free peer's model was not resident).
+/// Among equally available candidates the lane state still decides, so a
+/// serving lane wins over an on-demand one. One function, so the two keys
+/// cannot order these differently.
+pub fn availability_key(c: &Candidate, in_flight: usize, stalled: bool) -> (u8, u8, u32) {
+    (if stalled { 1 } else { 0 }, thermal_rank(c.thermal.as_deref()), full_rank(c, in_flight))
+}
+
 /// The dynamic default's routing order, lowest first: non-degraded,
-/// healthy, not stalled in the last [`STALL_DEMOTION`], not thermally
-/// `serious`/`critical`, a free slot (a full backend after every one that
-/// can start now, the shorter queue first: [`full_rank`]), GPU not shared
-/// with a foreign workload
+/// healthy, available now ([`availability_key`]: not stalled, not
+/// thermally hot, a free slot), lane state ([`LaneState::rank`]), GPU not
+/// shared with a foreign workload
 /// (`gpu_contention.state: shared`), engine (vLLM < GPU runtime < CPU), the larger
 /// model (`-params`, tenths of a billion), fewest requests in flight from
 /// this gateway, heartbeat load, position. A function so the ORDER is what
 /// gets tested.
-pub fn rank_key(c: &Candidate, in_flight: usize, stalled: bool) -> (u8, u8, u8, u8, u32, u8, u8, i64, usize, i64, usize) {
+pub fn rank_key(c: &Candidate, in_flight: usize, stalled: bool) -> (u8, u8, (u8, u8, u32), u8, u8, u8, i64, usize, i64, usize) {
     (
         if c.degraded { 1 } else { 0 },
         if c.healthy { 0 } else { 1 },
-        if stalled { 1 } else { 0 },
-        thermal_rank(c.thermal.as_deref()),
-        full_rank(c, in_flight),
+        availability_key(c, in_flight, stalled),
+        c.lane_rank,
         if c.gpu_shared { 1 } else { 0 },
         engine_rank(&c.backend, c.gpu),
         -((c.params_b.unwrap_or(0.0) * 10.0) as i64),
         in_flight,
-        (c.load * 100.0) as i64,
+        load_key(c.load),
         c.position,
     )
 }
@@ -563,7 +730,10 @@ pub fn rank_reason(c: &Candidate, in_flight: usize, stalled: bool) -> String {
         Some(p) => out.push_str(&format!(",params={}", (p * 10.0).round() / 10.0)),
         None => out.push_str(",params=?"),
     }
-    out.push_str(&format!(",load={:.2}", c.load));
+    match c.load {
+        Some(l) => out.push_str(&format!(",load={l:.2}")),
+        None => out.push_str(",load=?"),
+    }
     if in_flight > 0 {
         out.push_str(&format!(",in_flight={in_flight}"));
     }
@@ -586,6 +756,9 @@ pub fn rank_reason(c: &Candidate, in_flight: usize, stalled: bool) -> String {
     }
     if c.degraded {
         out.push_str(",degraded");
+    }
+    if let Some(st) = c.lane_state.as_deref().filter(|_| c.lane_rank > 0) {
+        out.push_str(&format!(",lane={st}"));
     }
     out
 }
@@ -642,6 +815,7 @@ fn url_for(n: &NodeFacts, backend: &str) -> String {
 
 fn candidate(n: &NodeFacts, backend: &str, model: &str, position: usize, degraded: bool, status: CandidateStatus) -> Candidate {
     let (healthy, health) = backend_health(n, backend);
+    let lane = lane_of(n, backend, model);
     Candidate {
         node_id: n.node_id.clone(),
         backend: backend.to_string(),
@@ -663,6 +837,9 @@ fn candidate(n: &NodeFacts, backend: &str, model: &str, position: usize, degrade
         slots: n.slots.iter().find(|(b, _)| b == backend).map(|(_, s)| *s),
         class_label: String::new(),
         rank: String::new(),
+        lane_state: lane.map(|l| l.state.as_str().to_string()),
+        lane_rank: lane_rank_of(n, backend, model),
+        unplaced_lane: lane.is_some_and(|l| l.state == LaneState::Unplaced),
     }
 }
 
@@ -692,10 +869,12 @@ pub fn build_table(nodes: &[NodeFacts], placements: &[PlacementRow], decl: &Decl
     // The dynamic default: every served chat candidate, whatever its model,
     // positions in static rank order (in-flight and stalls are live and
     // applied per request by `rank`).
-    let all_chat: Option<Class> = if served.is_empty() {
+    // An `unplaced` lane joins its model's derived class only (i403 §6 q2).
+    let defaultable: Vec<Candidate> = served.iter().filter(|c| !c.unplaced_lane).cloned().collect();
+    let all_chat: Option<Class> = if defaultable.is_empty() {
         None
     } else {
-        let mut cands = served.clone();
+        let mut cands = defaultable;
         cands.sort_by_key(|c| rank_key(c, 0, false));
         for (i, c) in cands.iter_mut().enumerate() {
             c.position = i;
@@ -734,8 +913,14 @@ pub fn build_table(nodes: &[NodeFacts], placements: &[PlacementRow], decl: &Decl
             let node = nodes.iter().find(|n| n.node_id == dc.node_id);
             // What the backend runs, as a CHAT model: an embedder it reports
             // is never the declared candidate's model (see `chat_model_for`).
+            // With two chat lanes on one backend, the one this candidate
+            // names comes first.
+            let wanted = dc.model.clone().or_else(|| placed_model.clone());
             let running_model = node.and_then(|n| {
-                n.running.iter().find(|(b, _)| b == &dc.backend).and_then(|(_, m)| chat_model_for(n, placements, &dc.backend, m))
+                let mine = n.running.iter().filter(|(b, _)| b == &dc.backend);
+                let mut ordered: Vec<&(String, String)> = mine.clone().filter(|(_, m)| wanted.as_deref().is_some_and(|w| same_model(w, m))).collect();
+                ordered.extend(mine);
+                ordered.into_iter().find_map(|(_, m)| chat_model_for(n, placements, &dc.backend, m))
             });
             let model = dc.model.clone().or(placed_model).or_else(|| running_model.clone()).unwrap_or_default();
             let (status, facts) = match node {
@@ -763,6 +948,12 @@ pub fn build_table(nodes: &[NodeFacts], placements: &[PlacementRow], decl: &Decl
             c.declared_model = dc.model.clone();
             if node.is_none() {
                 c.health = "no heartbeat record".into();
+            }
+            // The agent says this lane cannot answer yet (i403): not routable,
+            // whatever `available_models` says, and the state is the reason.
+            if let Some(l) = lane_of(&facts, &dc.backend, &model).filter(|l| l.state.rank().is_none()) {
+                c.status = CandidateStatus::Unplaced;
+                c.health = lane_why(l);
             }
             cands.push(c);
         }
@@ -802,7 +993,24 @@ pub fn build_table(nodes: &[NodeFacts], placements: &[PlacementRow], decl: &Decl
     let mut node_ids: Vec<String> = nodes.iter().map(|n| n.node_id.clone()).collect();
     node_ids.sort();
     node_ids.dedup();
-    ClassTable { classes, aliases, all_chat, nodes: node_ids }
+    let skipped_lanes = nodes
+        .iter()
+        .flat_map(|n| {
+            n.lanes.iter().flatten().filter(|l| l.is_chat() && l.state.rank().is_none()).map(move |l| {
+                (n.node_id.clone(), l.backend.clone(), l.model.clone(), lane_why(l))
+            })
+        })
+        .collect();
+    ClassTable { classes, aliases, all_chat, nodes: node_ids, skipped_lanes }
+}
+
+/// `lane loading: warming` — why a lane is not routed, for logs and verify.
+fn lane_why(l: &Lane) -> String {
+    if l.reason.is_empty() {
+        format!("lane {}", l.state.as_str())
+    } else {
+        format!("lane {}: {}", l.state.as_str(), l.reason)
+    }
 }
 
 /// The class a `model` hint names, if any. `hint` has been through
@@ -906,21 +1114,21 @@ pub fn rank<'a>(
     out
 }
 
-/// A pool's routing order, lowest first: non-degraded, healthy, not
-/// recently stalled, not thermally hot, a free slot ([`full_rank`]), GPU not shared, fewest requests in flight from this
-/// gateway, heartbeat load, declared position. No engine or model-size key:
+/// A pool's routing order, lowest first: non-degraded, healthy, available
+/// now ([`availability_key`]: not recently stalled, not thermally hot, a
+/// free slot), lane state, GPU not shared, fewest requests in flight from
+/// this gateway, heartbeat load, declared position. No engine or model-size key:
 /// declaring a pool says its peers are interchangeable, and a size key
 /// would send every request to the biggest peer and never spread.
-pub fn pool_key(c: &Candidate, in_flight: usize, stalled: bool) -> (u8, u8, u8, u8, u32, u8, usize, i64, usize) {
+pub fn pool_key(c: &Candidate, in_flight: usize, stalled: bool) -> (u8, u8, (u8, u8, u32), u8, u8, usize, i64, usize) {
     (
         if c.degraded { 1 } else { 0 },
         if c.healthy { 0 } else { 1 },
-        if stalled { 1 } else { 0 },
-        thermal_rank(c.thermal.as_deref()),
-        full_rank(c, in_flight),
+        availability_key(c, in_flight, stalled),
+        c.lane_rank,
         if c.gpu_shared { 1 } else { 0 },
         in_flight,
-        (c.load * 100.0) as i64,
+        load_key(c.load),
         c.position,
     )
 }
@@ -1327,17 +1535,48 @@ fn slots_of(data: &Value) -> Vec<(String, Slots)> {
 /// One node's facts from its `mesh_nodes` record.
 pub fn node_facts_from_kv(key: &str, data: &Value, non_chat: &[(String, String)], now_unix: f64) -> NodeFacts {
     let node_id = data.get("id").and_then(Value::as_str).unwrap_or(key).to_string();
-    let running = data
-        .get("running_backends")
-        .or_else(|| data.get("backends"))
-        .and_then(Value::as_object)
-        .map(|o| {
-            o.iter()
-                .filter_map(|(bt, m)| m.as_str().filter(|s| !s.is_empty()).map(|s| (bt.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
-    let unreported = unreported_backends(data, &node_id, non_chat);
+    // i403: an agent that sends `lanes` (even `[]`) is read from them alone.
+    // Only an ABSENT key falls back to `running_backends`.
+    let lanes: Option<Vec<Lane>> = data.get("lanes").and_then(Value::as_array).map(|a| a.iter().filter_map(Lane::from_value).collect());
+    let running: Vec<(String, String)> = match &lanes {
+        Some(ls) => {
+            let mut r: Vec<(String, String)> = ls
+                .iter()
+                .filter(|l| l.is_chat() && l.state.rank().is_some())
+                .map(|l| (l.backend.clone(), l.model.clone()))
+                .collect();
+            r.dedup();
+            r
+        }
+        None => data
+            .get("running_backends")
+            .or_else(|| data.get("backends"))
+            .and_then(Value::as_object)
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(bt, m)| m.as_str().filter(|s| !s.is_empty()).map(|s| (bt.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    // A lane always names its model, so there is nothing unreported to warn
+    // about; a nameless engine is in a lane's `reason` instead.
+    let unreported = if lanes.is_some() { Vec::new() } else { unreported_backends(data, &node_id, non_chat) };
+    // The role is on the lane: a backend is non-chat when every lane it has
+    // is. Without lanes, the placement join (`non_chat_pairs`) as before.
+    let non_chat_backends: Vec<String> = match &lanes {
+        Some(ls) => {
+            let mut b: Vec<String> = ls
+                .iter()
+                .filter(|l| !ls.iter().any(|o| o.backend == l.backend && o.is_chat()))
+                .map(|l| l.backend.clone())
+                .collect();
+            b.sort();
+            b.dedup();
+            b
+        }
+        None => non_chat.iter().filter(|(n, _)| n == &node_id).map(|(_, b)| b.clone()).collect(),
+    };
     let available_models = data
         .get("available_models")
         .and_then(Value::as_array)
@@ -1347,11 +1586,21 @@ pub fn node_facts_from_kv(key: &str, data: &Value, non_chat: &[(String, String)]
                 .collect()
         })
         .unwrap_or_default();
-    let model_missing = data
+    // Keys are `<backend>` or `<backend>#<role>`; only an absent CHAT model
+    // takes a backend out of the chat pool (an absent embed model is embed's).
+    let mut model_missing: Vec<String> = data
         .get("model_presence")
         .and_then(Value::as_object)
-        .map(|o| o.keys().filter(|b| crate::model_presence::backend_model_missing(data, b)).cloned().collect())
+        .map(|o| {
+            o.keys()
+                .filter_map(|k| k.split('#').next())
+                .filter(|b| crate::model_presence::backend_chat_model_missing(data, b))
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
+    model_missing.sort();
+    model_missing.dedup();
     let reported_non_chat_models: Vec<(String, String)> = data
         .get("model_presence")
         .and_then(Value::as_object)
@@ -1377,8 +1626,11 @@ pub fn node_facts_from_kv(key: &str, data: &Value, non_chat: &[(String, String)]
         available_models,
         model_missing,
         reported_non_chat_models,
-        non_chat: non_chat.iter().filter(|(n, _)| n == &node_id).map(|(_, b)| b.clone()).collect(),
-        load: data.get("load").and_then(Value::as_f64).map(|l| l.clamp(0.0, 1.0)).unwrap_or(0.0),
+        non_chat: non_chat_backends,
+        // `current_load` is the key node_heartbeat stores (`carry_load`);
+        // this read `load`, which nothing writes, so every live node
+        // ranked at 0.0. Absent or not a number = unknown.
+        load: data.get("current_load").and_then(Value::as_f64).map(|l| l.clamp(0.0, 1.0)),
         tier: data.get("tier").and_then(Value::as_i64),
         gpu: vram > 0.0 || unified,
         heartbeat_age_secs: last.map(|t| (now_unix - t).max(0.0)),
@@ -1409,6 +1661,7 @@ pub fn node_facts_from_kv(key: &str, data: &Value, non_chat: &[(String, String)]
             })
             .unwrap_or_default(),
         unreported,
+        lanes,
         node_id,
     }
 }
@@ -1625,7 +1878,28 @@ pub async fn load_table(state: &AppState) -> Result<ClassTable> {
         note_unreported(n);
     }
     note_yaml_model_is_a_hint(state);
-    Ok(build_table(&nodes, &placements, &decl))
+    let table = build_table(&nodes, &placements, &decl);
+    note_skipped_lanes(&nodes, &table);
+    Ok(table)
+}
+
+/// Say, once per lane and state per hour, that a live node's chat lane is
+/// left out of routing and why (`loading`, `missing`). A dead node's record
+/// is not news, as for [`note_unreported`].
+fn note_skipped_lanes(nodes: &[NodeFacts], table: &ClassTable) {
+    static SEEN: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    for (node, backend, model, why) in &table.skipped_lanes {
+        if !nodes.iter().any(|n| &n.node_id == node && health_of(n).0) {
+            continue;
+        }
+        let due = {
+            let mut seen = SEEN.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+            unreported_due(&mut seen, &format!("{node}/{backend}/{model}/{why}"), Instant::now(), UNREPORTED_LOG_WINDOW)
+        };
+        if due {
+            tracing::info!(node = %node, backend = %backend, model = %model, why = %why, "lane_not_routed: {why}");
+        }
+    }
 }
 
 /// Existing installs carry `cluster.default_backend: ollama` and
@@ -1811,7 +2085,7 @@ mod tests {
             available_models: available.iter().map(|s| s.to_string()).collect(),
             model_missing: vec![],
             non_chat: vec![],
-            load,
+            load: Some(load),
             tier: Some(tier),
             gpu,
             heartbeat_age_secs: Some(5.0),
@@ -2037,6 +2311,33 @@ mod tests {
         m.model_missing = vec!["ollama".into()];
         let t = build_table(&[n, m], &[], &Declarations::default());
         assert!(t.classes.is_empty(), "{:?}", t.classes);
+    }
+
+    /// 0.6.18 rc.2 rehearsal: a single-ollama box whose embed model (harrier)
+    /// is absent still serves chat; only the embed role is out.
+    #[test]
+    fn an_absent_embed_model_does_not_drop_the_backend_from_chat() {
+        let data = serde_json::json!({
+            "id": "solo", "ip_address": "127.0.0.1", "status": "online",
+            "running_backends": {"ollama": "qwen2.5:0.5b"},
+            "model_presence": {
+                "ollama": {"model": "qwen2.5:0.5b", "role": "chat", "present": true},
+                "ollama#embed": {"model": "harrier", "role": "embed", "present": false, "import_only": true}},
+            "last_heartbeat": 1000.0,
+        });
+        let f = node_facts_from_kv("solo", &data, &[], 1010.0);
+        assert!(f.model_missing.is_empty(), "{:?}", f.model_missing);
+        let t = build_table(&[f], &[], &Declarations::default());
+        assert!(!t.classes.is_empty(), "chat must still have a class: {:?}", t.classes);
+        assert!(crate::model_presence::role_model_missing(&data, "embed"), "embed is still out");
+        // The chat model absent: the backend is out of the chat pool, once.
+        let gone = serde_json::json!({
+            "id": "solo", "running_backends": {"ollama": "qwen2.5:0.5b"},
+            "model_presence": {
+                "ollama": {"model": "qwen2.5:0.5b", "role": "chat", "present": false},
+                "ollama#embed": {"model": "harrier", "role": "embed", "present": false}},
+        });
+        assert_eq!(node_facts_from_kv("solo", &gone, &[], 1010.0).model_missing, vec!["ollama"]);
     }
 
     // ── declared classes, aliases, degraded ───────────────────────────
@@ -2316,7 +2617,7 @@ mod tests {
     #[test]
     fn kv_record_becomes_facts() {
         let data = serde_json::json!({
-            "id": "host6", "ip_address": "100.64.0.11", "load": 0.2, "tier": 2, "vram_gb": 0,
+            "id": "host6", "ip_address": "100.64.0.11", "current_load": 0.2, "tier": 2, "vram_gb": 0,
             "capabilities": {"unified_memory": true},
             "running_backends": {"ollama": "gemma4:26b"},
             "available_models": ["gemma4:26b", {"name": "gemma4:12b"}],
@@ -2480,7 +2781,7 @@ mod tests {
     fn a_quarantined_node_is_excluded_unless_it_is_the_only_one_left() {
         let rec = |status: &str| {
             serde_json::json!({
-                "id": "mcmini", "ip_address": "100.64.1.2", "status": status, "load": 0.1,
+                "id": "mcmini", "ip_address": "100.64.1.2", "status": status, "current_load": 0.1,
                 "capabilities": {"unified_memory": true},
                 "running_backends": {"ollama": "gemma4:12b"}, "last_heartbeat": 1000.0,
             })
@@ -2695,7 +2996,7 @@ mod tests {
     #[test]
     fn gpu_contention_shared_demotes_and_a_paused_lane_is_no_candidate() {
         let rec = serde_json::json!({
-            "id": "mcmini", "ip_address": "100.64.1.2", "load": 0.1, "last_heartbeat": 1000.0,
+            "id": "mcmini", "ip_address": "100.64.1.2", "current_load": 0.1, "last_heartbeat": 1000.0,
             "capabilities": {"unified_memory": true},
             "running_backends": {"ollama": "gemma4:12b", "llamacpp": "gemma4:26b-a4b-it-qat"},
             "gpu_contention": {"state": "shared", "foreign_mb": 4000, "paused_backends": ["llamacpp"]},
@@ -2728,13 +3029,13 @@ mod tests {
     #[test]
     fn a_backend_with_every_slot_busy_sorts_after_a_free_one_on_a_shared_gpu() {
         let mcmini = serde_json::json!({
-            "id": "mcmini", "ip_address": "100.64.1.2", "load": 0.2, "last_heartbeat": 1000.0,
+            "id": "mcmini", "ip_address": "100.64.1.2", "current_load": 0.2, "last_heartbeat": 1000.0,
             "capabilities": {"unified_memory": true},
             "running_backends": {"ollama": "gemma4:12b"},
             "backend_containers": {"ollama": {"running": true, "serving": true, "in_flight": 2, "slots": 2, "queued": 1}},
         });
         let awolf = serde_json::json!({
-            "id": "awolf", "ip_address": "100.64.1.3", "load": 0.1, "last_heartbeat": 1000.0, "vram_gb": 16.0,
+            "id": "awolf", "ip_address": "100.64.1.3", "current_load": 0.1, "last_heartbeat": 1000.0, "vram_gb": 16.0,
             "running_backends": {"vllm": "google/gemma-4-12B-it-qat-w4a16-ct"},
             "gpu_contention": {"state": "shared", "foreign_mb": 11000},
             "backend_containers": {"vllm": {"running": true, "serving": true, "in_flight": 0, "slots": 4, "queued": 0}},
@@ -2809,7 +3110,7 @@ mod tests {
     #[test]
     fn a_backend_the_agent_reports_not_serving_sorts_last_and_says_why() {
         let rec = serde_json::json!({
-            "id": "mcmini", "ip_address": "100.64.1.2", "load": 0.4, "last_heartbeat": 1000.0,
+            "id": "mcmini", "ip_address": "100.64.1.2", "current_load": 0.4, "last_heartbeat": 1000.0,
             "running_backends": {"ollama": "gemma4:12b", "llamacpp": "gemma4:26b-a4b-it-qat"},
             "backend_containers": {
                 "ollama": {"running": true, "serving": false, "serving_reason": "probe timed out after 60s"},
@@ -2891,5 +3192,286 @@ mod db_tests {
         assert_eq!(delete_class(&db, CHAT_DEFAULT).await.expect("delete again"), 0);
         let d = load_declarations(&db).await.expect("load");
         assert!(d.classes.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A heartbeat record with `lanes` (i403), live at t=1000.
+    fn rec(id: &str, ip: &str, lanes: Value, extra: Value) -> Value {
+        let mut r = json!({
+            "id": id, "ip_address": ip, "last_heartbeat": 1000.0, "vram_gb": 12.0,
+            "running_backends": {"ollama": "gemma4:12b"},
+            "lanes": lanes,
+        });
+        if let (Some(o), Some(e)) = (r.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                o.insert(k.clone(), v.clone());
+            }
+        }
+        r
+    }
+
+    fn facts(r: &Value) -> NodeFacts {
+        node_facts_from_kv(r["id"].as_str().unwrap(), r, &[], 1001.0)
+    }
+
+    fn lane(backend: &str, model: &str, role: &str, state: &str, reason: &str) -> Value {
+        json!({"backend": backend, "model": model, "role": role, "state": state, "reason": reason})
+    }
+
+    #[test]
+    fn running_comes_from_the_routable_chat_lanes_only() {
+        let f = facts(&rec(
+            "n1",
+            "100.64.0.1",
+            json!([
+                lane("ollama", "gemma4:12b", "chat", "on_demand", "not loaded"),
+                lane("ollama", "harrier-embed", "embed", "serving", ""),
+                lane("vllm", "google/gemma-4-12B-it-qat-w4a16-ct", "chat", "loading", "warming"),
+                lane("llamacpp", "qwen.gguf", "", "missing", "not on disk"),
+                lane("llamacpp", "", "chat", "serving", ""),
+            ]),
+            json!({}),
+        ));
+        assert_eq!(f.running, vec![("ollama".to_string(), "gemma4:12b".to_string())]);
+        assert_eq!(f.lanes.as_ref().map(Vec::len), Some(4), "a lane with no model is dropped");
+        assert!(f.non_chat.is_empty(), "ollama has a chat lane beside its embedder");
+        assert!(f.unreported.is_empty());
+    }
+
+    #[test]
+    fn a_backend_with_only_non_chat_lanes_is_non_chat() {
+        let f = facts(&rec("n1", "100.64.0.1", json!([lane("ollama", "harrier-embed", "embed", "serving", "")]), json!({})));
+        assert_eq!(f.non_chat, vec!["ollama".to_string()]);
+        assert!(f.running.is_empty());
+    }
+
+    #[test]
+    fn an_empty_lanes_array_routes_nothing_and_an_absent_one_falls_back() {
+        let f = facts(&rec("n1", "100.64.0.1", json!([]), json!({})));
+        assert!(f.running.is_empty(), "`lanes: []` is the agent saying it has none");
+        let mut old = rec("n1", "100.64.0.1", json!([]), json!({}));
+        old.as_object_mut().unwrap().remove("lanes");
+        let f = facts(&old);
+        assert_eq!(f.lanes, None);
+        assert_eq!(f.running, vec![("ollama".to_string(), "gemma4:12b".to_string())], "an older agent reads as before");
+    }
+
+    #[test]
+    fn a_loading_lane_is_in_no_class_and_says_why() {
+        let n = facts(&rec("n1", "100.64.0.1", json!([lane("vllm", "HF-12B", "chat", "loading", "warming")]), json!({})));
+        let t = build_table(&[n], &[], &Declarations::default());
+        assert!(t.class("HF-12B").is_none());
+        assert!(t.all_chat.is_none());
+        assert_eq!(t.skipped_lanes, vec![("n1".into(), "vllm".into(), "HF-12B".into(), "lane loading: warming".into())]);
+    }
+
+    #[test]
+    fn an_absolute_path_is_named_by_its_file_and_a_repo_id_is_kept_whole() {
+        let n = facts(&rec(
+            "n1",
+            "100.64.0.1",
+            json!([
+                lane("llamacpp", "/models/sub/x.gguf", "chat", "serving", ""),
+                lane("vllm", "google/gemma-4-12B-it-qat-w4a16-ct", "chat", "serving", ""),
+                lane("ollama", "/", "chat", "serving", ""),
+            ]),
+            json!({}),
+        ));
+        let models: Vec<&str> = n.lanes.as_ref().unwrap().iter().map(|l| l.model.as_str()).collect();
+        assert_eq!(models, ["x.gguf", "google/gemma-4-12B-it-qat-w4a16-ct"], "a bare `/` names nothing and is dropped");
+        let t = build_table(&[n], &[], &Declarations::default());
+        assert!(t.class("x.gguf").is_some(), "the class clients already name");
+    }
+
+    /// The node agent's own golden heartbeat (noomesh/noomesh#673, Phase 1),
+    /// read as the gateway reads it. The copy under `testdata/` is inside the
+    /// gateway's build context; `tests/test_lanes_fixture_parity.py` fails
+    /// when it differs by a byte from the agent's
+    /// `node-agent-go/internal/heartbeat/testdata/lanes_fixture.json`, so a
+    /// contract change on either side fails one of the two.
+    #[test]
+    fn the_node_agents_golden_lanes_route_as_agreed() {
+        let golden: Value = serde_json::from_str(include_str!("testdata/lanes_fixture.json")).expect("the fixture parses");
+        let mut r = rec("n1", "100.64.0.1", golden["lanes"].clone(), json!({}));
+        r["running_backends"] = golden["running_backends"].clone();
+        let f = facts(&r);
+        let states: Vec<&str> = f.lanes.as_ref().unwrap().iter().map(|l| l.state.as_str()).collect();
+        for st in ["serving", "on_demand", "loading", "missing", "unplaced", "unknown", "down"] {
+            assert!(states.contains(&st), "the fixture covers {st}: {states:?}");
+        }
+        assert!(states.iter().all(|s| !matches!(LaneState::parse(s), LaneState::Other(_))), "every state is one this gateway names: {states:?}");
+        let mut running = f.running.clone();
+        running.sort();
+        assert_eq!(
+            running,
+            [("llamacpp", "m.gguf"), ("ollama", "gemma4:12b"), ("ollama", "mystery:7b"), ("ollama", "qwen3:4b")]
+                .map(|(b, m)| (b.to_string(), m.to_string()))
+        );
+        assert!(!f.running.iter().any(|(b, _)| b == "vllm"), "the stale running_backends.vllm is ignored while lanes are sent");
+        assert!(f.non_chat.contains(&"reranker".to_string()) && f.non_chat.contains(&"embedding".to_string()));
+        let t = build_table(&[f], &[], &Declarations::default());
+        assert!(t.class("org/old-model").is_none() && t.class("org/new-model").is_none());
+        assert_eq!(t.skipped_lanes, vec![
+            ("n1".to_string(), "vllm".to_string(), "org/new-model".to_string(), "lane loading: reconciling: runtime runs org/old-model".to_string()),
+            ("n1".to_string(), "airllm".to_string(), "org/air-model".to_string(), "lane down: no health report".to_string()),
+        ]);
+        let order: Vec<&str> = t.all_chat.as_ref().unwrap().candidates.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(&order[2..], ["qwen3:4b", "mystery:7b"], "on demand, then unconfirmed, after both serving lanes: {order:?}");
+    }
+
+    #[test]
+    fn a_down_lane_is_not_routed_and_says_why() {
+        let n = facts(&rec("n1", "100.64.0.1", json!([lane("llamacpp", "x.gguf", "chat", "down", "not running")]), json!({})));
+        assert_eq!(n.lanes.as_ref().unwrap()[0].state, LaneState::Down);
+        let t = build_table(&[n], &[], &Declarations::default());
+        assert!(t.all_chat.is_none());
+        assert_eq!(t.skipped_lanes[0].3, "lane down: not running");
+    }
+
+    #[test]
+    fn a_state_this_gateway_does_not_know_is_not_routed() {
+        let n = facts(&rec("n1", "100.64.0.1", json!([lane("ollama", "gemma4:12b", "chat", "frobbing", "")]), json!({})));
+        let t = build_table(&[n], &[], &Declarations::default());
+        assert!(t.all_chat.is_none());
+        assert_eq!(t.skipped_lanes[0].3, "lane frobbing");
+    }
+
+    #[test]
+    fn on_demand_ranks_after_serving_and_unknown_after_both() {
+        // The GPU node would win on engine; its lane state puts it last.
+        let gpu = facts(&rec("gpu", "100.64.0.1", json!([lane("ollama", "gemma4:12b", "chat", "unknown", "no presence yet")]), json!({})));
+        let idle = facts(&rec("idle", "100.64.0.2", json!([lane("ollama", "gemma4:12b", "chat", "on_demand", "not loaded")]), json!({"vram_gb": 0.0})));
+        let hot = facts(&rec("hot", "100.64.0.3", json!([lane("ollama", "gemma4:12b", "chat", "serving", "")]), json!({"vram_gb": 0.0})));
+        let t = build_table(&[gpu, idle, hot], &[], &Declarations::default());
+        let order = |c: &Class| c.candidates.iter().map(|c| c.node_id.clone()).collect::<Vec<_>>();
+        assert_eq!(order(t.class("gemma4:12b").unwrap()), ["hot", "idle", "gpu"]);
+        assert_eq!(order(t.all_chat.as_ref().unwrap()), ["hot", "idle", "gpu"]);
+        let r = rank(t.all_chat.as_ref().unwrap(), &|_| false, &|_| 0, &|_| false);
+        assert_eq!(r.order.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["hot", "idle", "gpu"]);
+        let idle_c = &t.all_chat.as_ref().unwrap().candidates[1];
+        assert_eq!(idle_c.lane_state.as_deref(), Some("on_demand"));
+        assert!(rank_reason(idle_c, 0, false).contains(",lane=on_demand"));
+    }
+
+    #[test]
+    fn an_unplaced_lane_serves_its_own_model_but_not_the_default() {
+        let n = facts(&rec("n1", "100.64.0.1", json!([lane("llamacpp", "native-7b.gguf", "", "unplaced", "")]), json!({})));
+        let t = build_table(&[n], &[], &Declarations::default());
+        assert_eq!(t.class("native-7b.gguf").map(|c| c.candidates.len()), Some(1));
+        assert!(t.all_chat.is_none(), "an undeclared engine is not the default (P2)");
+    }
+
+    #[test]
+    fn the_gateway_serving_overlay_still_wins_over_a_serving_lane() {
+        let n = facts(&rec(
+            "n1",
+            "100.64.0.1",
+            json!([lane("ollama", "gemma4:12b", "chat", "serving", "")]),
+            json!({"backend_containers": {"ollama": {"serving": false, "serving_reason": "probe timed out"}}}),
+        ));
+        let t = build_table(&[n], &[], &Declarations::default());
+        let c = &t.class("gemma4:12b").unwrap().candidates[0];
+        assert!(!c.healthy);
+        assert!(c.health.contains("probe timed out"), "{}", c.health);
+    }
+
+    #[test]
+    fn a_declared_candidate_whose_lane_is_missing_is_unplaced_with_the_reason() {
+        let n = facts(&rec(
+            "n1",
+            "100.64.0.1",
+            json!([lane("ollama", "gemma4:12b", "chat", "missing", "not on disk")]),
+            json!({"available_models": ["gemma4:12b"]}),
+        ));
+        let decl = Declarations {
+            classes: vec![DeclaredClass {
+                name: "fast".into(),
+                candidates: vec![DeclaredCandidate { node_id: "n1".into(), backend: "ollama".into(), model: Some("gemma4:12b".into()), degraded: false }],
+                pool: false,
+            }],
+            aliases: vec![],
+        };
+        let t = build_table(&[n], &[], &decl);
+        let c = &t.class("fast").unwrap().candidates[0];
+        assert_eq!(c.status, CandidateStatus::Unplaced, "available_models does not override the agent's `missing`");
+        assert_eq!(c.health, "lane missing: not on disk");
+    }
+
+    #[test]
+    fn two_chat_lanes_on_one_ollama_make_two_classes() {
+        let n = facts(&rec(
+            "n1",
+            "100.64.0.1",
+            json!([lane("ollama", "gemma4:12b", "chat", "serving", ""), lane("ollama", "gemma4:e2b", "chat", "on_demand", "")]),
+            json!({}),
+        ));
+        let t = build_table(&[n], &[], &Declarations::default());
+        assert!(t.class("gemma4:12b").is_some() && t.class("gemma4:e2b").is_some());
+        assert_eq!(t.all_chat.as_ref().unwrap().candidates[0].model, "gemma4:12b");
+    }
+}
+
+#[cfg(test)]
+mod availability_before_lane_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// One ollama node at t=1000 with a chat lane in `state` and its slots.
+    fn node(id: &str, ip: &str, state: &str, in_flight: u32, queued: u32) -> NodeFacts {
+        let r = json!({
+            "id": id, "ip_address": ip, "last_heartbeat": 1000.0, "vram_gb": 0.0,
+            "running_backends": {"ollama": "gemma4:12b"},
+            "lanes": [{"backend": "ollama", "model": "gemma4:12b", "role": "chat", "state": state, "reason": ""}],
+            "backend_containers": {"ollama": {"running": true, "serving": true, "in_flight": in_flight, "slots": 2, "queued": queued}},
+        });
+        node_facts_from_kv(id, &r, &[], 1001.0)
+    }
+
+    fn default_order(nodes: &[NodeFacts], stalled: &dyn Fn(&Candidate) -> bool) -> Vec<String> {
+        let t = build_table(nodes, &[], &Declarations::default());
+        let sel = select_with(&t, None, None, false, &|_| false, &|_| 0, stalled).expect("a selection");
+        sel.candidates.iter().map(|c| c.node_id.clone()).collect()
+    }
+
+    /// The 2026-11-01 shape again, through lane state (#669): the serving
+    /// lane is full and queued, its peer's model is not resident (on demand)
+    /// but it has free slots. The free peer goes first; among free lanes
+    /// the serving one still wins.
+    #[test]
+    fn a_full_serving_lane_ranks_after_a_free_on_demand_one() {
+        let full = node("a-serving", "100.64.0.1", "serving", 2, 3);
+        let free = node("b-ondemand", "100.64.0.2", "on_demand", 0, 0);
+        assert_eq!(default_order(&[full, free.clone()], &|_| false), ["b-ondemand", "a-serving"]);
+        let idle = node("a-serving", "100.64.0.1", "serving", 0, 0);
+        assert_eq!(default_order(&[idle.clone(), free.clone()], &|_| false), ["a-serving", "b-ondemand"], "equally free: serving wins");
+        // Stalled in the last few minutes: the same demotion as full.
+        assert_eq!(default_order(&[idle, free], &|c| c.node_id == "a-serving"), ["b-ondemand", "a-serving"]);
+    }
+
+    /// The pool key orders availability before lane state the same way,
+    /// through the same function.
+    #[test]
+    fn the_pool_key_ranks_availability_before_lane_state() {
+        let mk = |id: &str, lane_rank: u8, in_flight: u32, queued: u32| {
+            let mut c = Candidate::synthetic(id.into(), "ollama".into(), "m".into(), String::new());
+            c.lane_rank = lane_rank;
+            c.slots = Some(Slots { in_flight, total: 2, queued });
+            c
+        };
+        let full_serving = mk("a", 0, 2, 3);
+        let free_on_demand = mk("b", 1, 0, 0);
+        assert!(pool_key(&free_on_demand, 0, false) < pool_key(&full_serving, 0, false));
+        assert!(rank_key(&free_on_demand, 0, false) < rank_key(&full_serving, 0, false));
+        let free_serving = mk("a", 0, 0, 0);
+        assert!(pool_key(&free_serving, 0, false) < pool_key(&free_on_demand, 0, false));
+        assert!(pool_key(&free_on_demand, 0, false) < pool_key(&free_serving, 0, true), "stalled");
+        let mut hot = free_serving.clone();
+        hot.thermal = Some("serious".into());
+        assert!(pool_key(&free_on_demand, 0, false) < pool_key(&hot, 0, false), "thermally serious");
     }
 }

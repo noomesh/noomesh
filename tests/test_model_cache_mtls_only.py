@@ -27,6 +27,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests import _rust_src as rs
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONF = REPO_ROOT / "docker" / "model-cache.nginx.conf"
 COMPOSE = REPO_ROOT / "docker-compose.cluster.yml"
@@ -141,10 +143,11 @@ def _code_files():
 
 def _code_lines(path):
     """(lineno, line) with the line comment stripped; a Rust file's
-    `#[cfg(test)]` module is fixtures, not renders, and is not read."""
-    for i, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
-        if path.suffix == ".rs" and line.strip() == "#[cfg(test)]":
-            return
+    `#[cfg(test)]` item is fixtures, not renders, and is not read."""
+    text = path.read_text(errors="replace")
+    if path.suffix == ".rs":
+        text = rs.own_code_lines(text)
+    for i, line in enumerate(text.splitlines(), 1):
         code = re.split(r"(^|\s)//|(^|\s)#", line, maxsplit=1)[0]
         yield i, code
 

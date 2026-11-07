@@ -52,6 +52,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/harnessprofile"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hostsvc"
 	"github.com/noomesh/noomesh/node-agent-go/internal/mcpsrv"
+	"github.com/noomesh/noomesh/node-agent-go/internal/modelname"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
 	"github.com/noomesh/noomesh/node-agent-go/internal/occupancy"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
@@ -394,6 +395,7 @@ func (r *Reconciler) publishProfileAndEmbedTarget(ctx context.Context, t *tick) 
 	applyHarnessProfile(t.desired.HarnessProfile)
 	declareAddonWorkloads(t.desired)
 	r.recordChatPlacement(t.desired.Placements)
+	publishLanePlacements(t.desired.Placements)
 	// Before the empty-state return below: a node with nothing placed still
 	// has a disk to keep.
 	if r.onReclaimPolicy != nil {
@@ -492,7 +494,15 @@ func (r *Reconciler) ensureModelsDir(ctx context.Context, t *tick) bool {
 // by a process this agent does not own.
 func (r *Reconciler) discoverNative(ctx context.Context, t *tick) bool {
 	// 2. Converge placements.
-	t.running = r.docker.RunningBackends(ctx)
+	running, err := r.docker.RunningBackends(ctx)
+	if err != nil {
+		// Could not ask docker is not "nothing is running": acting on {}
+		// would stop, remove and recreate healthy backends. Skip the pass.
+		slog.Warn("reconcile.docker_list_failed", "error", err,
+			"effect", "tick skipped: no start, recreate or stop this pass")
+		return false
+	}
+	t.running = running
 	// Backends served NATIVELY on this node (darwin: an ollama the operator
 	// runs for Metal access, which Docker on a Mac cannot reach). They are
 	// reported to the controller and routed to like any other backend, but
@@ -517,12 +527,24 @@ func (r *Reconciler) readFloatingRefs(ctx context.Context, t *tick) bool {
 	// Spec-drift signal: the fingerprint we stamped on each running
 	// backend's container (SpecHashLabel), so a changed placement env /
 	// image / port / tls (not just model) triggers a recreate.
-	t.specLabels = r.docker.BackendLabels(ctx, dockerpkg.SpecHashLabel)
+	specLabels, err := r.docker.BackendLabels(ctx, dockerpkg.SpecHashLabel)
+	if err != nil {
+		slog.Warn("reconcile.docker_list_failed", "error", err,
+			"effect", "tick skipped: no start, recreate or stop this pass")
+		return false
+	}
+	t.specLabels = specLabels
 	// Backends still running on a floating ref (`:latest`, no tag) that an
 	// older agent created. The spec hash cannot see it — a placement with
 	// no image of its own hashes the same whichever ref the agent picked —
 	// so it is its own drift signal: recreated once from the pinned ref.
-	t.floating = r.docker.FloatingBackendImages(ctx)
+	floating, err := r.docker.FloatingBackendImages(ctx)
+	if err != nil {
+		slog.Warn("reconcile.docker_list_failed", "error", err,
+			"effect", "tick skipped: no start, recreate or stop this pass")
+		return false
+	}
+	t.floating = floating
 	return true
 }
 
@@ -612,6 +634,11 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 					hcancel()
 				}
 				r.native.SetHeldModels(held...)
+				// Persist it so the next agent start can report this
+				// model on its first heartbeat (followup i418).
+				if err := r.native.SaveHeld(r.cfg.StateDir); err != nil {
+					slog.Warn("reconcile.held_state_save_failed", "error", err)
+				}
 				// A launchd-managed ollama gets the placement env
 				// through its plist (OllamaGuard.Tuning): the merged
 				// env when several roles share the daemon, a lone
@@ -636,7 +663,7 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 		// Converged when running with the placement's model (compare
 		// basenames — detection may report a bare filename) AND the
 		// stamped spec hash matches the desired one.
-		if isRunning && modelMatches(curModel, p.Model) {
+		if isRunning && modelname.Matches(curModel, p.Model) {
 			// Running as asked: an earlier start failure no longer
 			// applies.
 			refusals.Clear("backend_start", p.Backend)
@@ -1309,19 +1336,6 @@ func shortHash(h string) string {
 		return h[:8]
 	}
 	return h
-}
-
-func modelMatches(current, desired string) bool {
-	if current == "" || desired == "" {
-		return current == desired
-	}
-	base := func(s string) string {
-		if i := strings.LastIndex(s, "/"); i >= 0 {
-			return s[i+1:]
-		}
-		return s
-	}
-	return base(current) == base(desired)
 }
 
 func (r *Reconciler) fetch(ctx context.Context) (*desiredConfig, error) {

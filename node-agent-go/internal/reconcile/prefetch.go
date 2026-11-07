@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
+	"github.com/noomesh/noomesh/node-agent-go/internal/modelname"
 )
 
 // The docker-facing steps of the image prefetch, as package vars so the
@@ -68,7 +69,7 @@ func imagesToPrefetch(
 			continue
 		}
 		curModel, isRunning := running[p.Backend]
-		if isRunning && modelMatches(curModel, p.Model) {
+		if isRunning && modelname.Matches(curModel, p.Model) {
 			curHash, hasLabel := specLabels[p.Backend]
 			// Converged or stuck: the loop does not start it. Only a
 			// recreate falls through to a start (read-only use of the

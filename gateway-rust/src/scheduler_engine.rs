@@ -295,7 +295,7 @@ pub fn snapshot_from_kv(node_id: &str, data: &Value, now: f64) -> NodeSnapshot {
         tier,
         is_companion,
         heartbeat_age_secs: hb_age,
-        current_load: data.get("current_load").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        current_load: data.get("current_load").and_then(|v| v.as_f64()),
         vram_gb: data.get("vram_gb").and_then(|v| v.as_f64()).unwrap_or(0.0),
         vram_used_gb: data.get("vram_used_gb").and_then(|v| v.as_f64()),
         backends,

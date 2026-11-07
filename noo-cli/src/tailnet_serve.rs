@@ -921,7 +921,7 @@ mod tests {
     #[test]
     fn the_stack_roll_reasserts_the_front_door() {
         let src = include_str!("commands/upgrade.rs");
-        let code = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let code = crate::test_src::own_code(src);
         assert!(code.contains("ensure_fronted("),
             "a successful stack roll must re-assert the tailnet serve mapping");
         assert!(code.contains("port_offset()") && code.contains("instance()"),
@@ -1180,7 +1180,8 @@ mod addon_ui_tests {
         assert_eq!(addon_ui_command(8451), vec!["serve", "--bg", "--https=8451", "https://127.0.0.1:8451"]);
         assert_eq!(addon_ui_off_command(8451), vec!["serve", "--https=8451", "off"]);
         let src = include_str!("tailnet_serve.rs");
-        let code = &src[src.find("Add-on UI origins").unwrap()..src.find("#[cfg(test)]\nmod tests").unwrap()];
+        let own = crate::test_src::own_code(src);
+        let code = &own[own.find("pub const ADDON_UI_DEFAULT_RANGE").expect("the add-on UI section")..];
         assert!(!code.contains("\"policy\"") && !code.contains("\"reset\""), "serve config only, and never a reset");
     }
 
@@ -1221,10 +1222,10 @@ mod addon_ui_tests {
     #[test]
     fn start_restart_and_the_stack_roll_front_the_addon_ui_ports() {
         let mesh = include_str!("commands/mesh.rs");
-        let mesh = &mesh[..mesh.find("#[cfg(test)]").unwrap_or(mesh.len())];
+        let mesh = crate::test_src::own_code(mesh);
         assert_eq!(mesh.matches("front_addon_uis(g);").count(), 2, "noo stack start and noo stack restart");
         let up = include_str!("commands/upgrade.rs");
-        let up = &up[..up.find("#[cfg(test)]").unwrap_or(up.len())];
+        let up = crate::test_src::own_code(up);
         assert!(up.contains("super::mesh::front_addon_uis(g);"), "noo upgrade --stack");
     }
 

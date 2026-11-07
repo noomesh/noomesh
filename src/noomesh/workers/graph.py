@@ -17,6 +17,7 @@ FastAPI (gateway.deps) stay lazy so importing this package is cheap.
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 import structlog
@@ -86,6 +87,19 @@ def _get_temporal_extractor():
         return None
 
 
+def _takes_org_id(extractor: Any) -> bool:
+    """Whether this conversation extractor stamps an org (trellion-intel i435).
+
+    An older extractor has no ``org_id`` parameter: passing it would raise and
+    drop every triple, so it is left out and that extractor writes the
+    entities unstamped, as before.
+    """
+    try:
+        return "org_id" in inspect.signature(extractor.extract_and_store).parameters
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
 @worker_handler("worker.temporal.extract")
 async def _temporal_extract(request: dict) -> Any:
     """Extract triples from a conversation message and write to temporal graph.
@@ -94,6 +108,8 @@ async def _temporal_extract(request: dict) -> Any:
       - conversation_id (str)
       - entry_id        (str, optional — for provenance)
       - user_id         (str, optional)
+      - org_id          (str, optional — the requester's org, resolved by the
+                         gateway; stamped on the extracted entities, i435)
       - author          ("user" | "assistant")
       - message_text    (str)
     """
@@ -107,16 +123,21 @@ async def _temporal_extract(request: dict) -> Any:
         conversation_id = request.get("conversation_id", "")
         entry_id = request.get("entry_id")
         user_id = request.get("user_id")
+        org_id = request.get("org_id")
 
         if not text or not conversation_id:
             return {"success": True, "data": {"inserted": 0}}
 
+        kwargs: dict[str, Any] = {}
+        if _takes_org_id(extractor):
+            kwargs["org_id"] = org_id
         inserted = await extractor.extract_and_store(
             message_text=text,
             author=author,
             conversation_id=conversation_id,
             entry_id=entry_id,
             user_id=user_id,
+            **kwargs,
         )
         return {"success": True, "data": {"inserted": inserted}}
     except Exception as e:

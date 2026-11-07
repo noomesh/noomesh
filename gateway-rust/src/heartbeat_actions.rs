@@ -1868,20 +1868,15 @@ pub async fn run_llm_action(
         // The note goes on the error path too: a research run that failed "without sources" because
         // its search was refused must say why.
         Ok(Ok(mut text)) => {
-            if let Some(c) = &ceiling {
-                let denied = c.take_denied();
-                if !denied.is_empty() {
-                    text.push_str(&crate::task_guard::denied_note(&denied));
-                }
+            if let Some(note) = ceiling.as_ref().and_then(crate::task_guard::TurnCeiling::take_note) {
+                text.push_str(&note);
             }
             Ok(text)
         }
         Ok(Err(e)) => {
-            let denied = ceiling.as_ref().map(|c| c.take_denied()).unwrap_or_default();
-            if denied.is_empty() {
-                Err(e)
-            } else {
-                Err(anyhow::anyhow!("{e}{}", crate::task_guard::denied_note(&denied)))
+            match ceiling.as_ref().and_then(crate::task_guard::TurnCeiling::take_note) {
+                None => Err(e),
+                Some(note) => Err(anyhow::anyhow!("{e}{note}")),
             }
         }
         Err(_) => anyhow::bail!(
@@ -2167,16 +2162,16 @@ pub async fn run_rust_native_task(
         // runs under the task's ceiling like every LLM-driven action (conversations are keyed on the task).
         let ceiling = crate::task_guard::ceiling_for_run(&state.db, task_id, action, &format!("heartbeat-{task_id}")).await;
         let r = action_self_benchmark(state, config, task_id).await;
-        let denied = ceiling.as_ref().map(|c| c.take_denied()).unwrap_or_default();
-        return match r {
-            Ok(mut text) => {
-                if !denied.is_empty() {
-                    text.push_str(&crate::task_guard::denied_note(&denied));
+        let note = ceiling.as_ref().and_then(crate::task_guard::TurnCeiling::take_note);
+        return match (r, note) {
+            (Ok(mut text), note) => {
+                if let Some(note) = note {
+                    text.push_str(&note);
                 }
                 Ok(text.into())
             }
-            Err(e) if !denied.is_empty() => Err(format!("{e}{}", crate::task_guard::denied_note(&denied))),
-            Err(e) => Err(e),
+            (Err(e), Some(note)) => Err(format!("{e}{note}")),
+            (Err(e), None) => Err(e),
         };
     }
     run_rust_native_action(state, action, config).await
@@ -2711,6 +2706,23 @@ async fn action_cluster_health(
 
 // ─── cost_report ───────────────────────────────────────────────────────
 
+/// Token totals over the last `period_days` — direct SQL on
+/// noo_conversations, mirroring the Python
+/// ConversationStore.get_conversation_stats path. `Err` names the read.
+async fn cost_tokens(db: &sqlx::PgPool, period_days: i64) -> Result<(i64, i64), String> {
+    let (tokens_in, tokens_out): (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT COALESCE(SUM(total_tokens_in)::bigint, 0), \
+                COALESCE(SUM(total_tokens_out)::bigint, 0) \
+         FROM noo_conversations \
+         WHERE updated_at > NOW() - ($1::int * INTERVAL '1 day')",
+    )
+    .bind(period_days as i32)
+    .fetch_one(db)
+    .await
+    .map_err(|e| format!("cost_report: cannot read the token totals from noo_conversations: {e}"))?;
+    Ok((tokens_in.unwrap_or(0), tokens_out.unwrap_or(0)))
+}
+
 async fn action_cost_report(
     state: &crate::state::AppState,
     config: &Value,
@@ -2736,20 +2748,9 @@ async fn action_cost_report(
         0.0
     };
 
-    // Token totals over the period — direct SQL on noo_conversations
-    // mirrors the Python ConversationStore.get_conversation_stats path.
-    let (tokens_in, tokens_out): (Option<i64>, Option<i64>) = sqlx::query_as(
-        "SELECT COALESCE(SUM(total_tokens_in)::bigint, 0), \
-                COALESCE(SUM(total_tokens_out)::bigint, 0) \
-         FROM noo_conversations \
-         WHERE updated_at > NOW() - ($1::int * INTERVAL '1 day')",
-    )
-    .bind(period_days as i32)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or((Some(0), Some(0)));
-    let tokens_in = tokens_in.unwrap_or(0);
-    let tokens_out = tokens_out.unwrap_or(0);
+    // Token totals over the period. A failed read fails the run (i460):
+    // a zero would report a $0.00 cost for traffic that was never counted.
+    let (tokens_in, tokens_out) = cost_tokens(&state.db, period_days).await?;
     let cloud_cost =
         (tokens_in as f64 / 1_000_000.0) * cloud_in_per_m
             + (tokens_out as f64 / 1_000_000.0) * cloud_out_per_m;
@@ -3080,6 +3081,205 @@ fn classify_run_issue(
     None
 }
 
+/// What [`action_agent_self_check`] is told to look for.
+#[derive(Clone, Copy)]
+struct SelfCheckParams {
+    lookback_hours: i64,
+    stuck_threshold_minutes: i64,
+    security_spike_threshold: i64,
+    repeat_offender_days: i64,
+    repeat_offender_threshold: i64,
+}
+
+type RecentFailure = (String, Option<String>, String, String, Option<i32>, chrono::DateTime<Utc>, Option<String>, Option<String>);
+
+/// One self-check read that failed: its name, the error KIND (what a
+/// channel may carry: [`read_error_kind`]) and the full error (the run
+/// record and the log only; channels leave the box).
+#[derive(Clone, Debug)]
+struct UnreadRead {
+    name: String,
+    kind: String,
+    error: String,
+}
+
+/// What a failed read was, without its text: a Postgres SQLSTATE, or the
+/// sqlx variant. Never the message, which can name hosts, tables or roles.
+fn read_error_kind(e: &sqlx::Error) -> String {
+    match e {
+        sqlx::Error::Database(d) => match d.code() {
+            Some(c) if c == "42501" => format!("permission denied ({c})"),
+            Some(c) => format!("database error ({c})"),
+            None => "database error".to_string(),
+        },
+        sqlx::Error::PoolTimedOut => "database unavailable (PoolTimedOut)".to_string(),
+        sqlx::Error::PoolClosed => "database unavailable (PoolClosed)".to_string(),
+        sqlx::Error::Io(_) => "database unreachable (Io)".to_string(),
+        _ => "database error".to_string(),
+    }
+}
+
+/// The self-check's six reads. A read that fails is named in `unread`
+/// with its error, never read as "nothing to report" (i460).
+struct SelfCheckReads {
+    recent_failures: Vec<RecentFailure>,
+    repeat_offenders: Vec<(String, Option<String>, i64)>,
+    stuck_cycles: Vec<(String, i32, chrono::DateTime<Utc>)>,
+    failed_cycles: Vec<(String, i32, String)>,
+    security_spikes: Vec<(String, i64)>,
+    active_activities: Vec<(String, String, String, chrono::DateTime<Utc>)>,
+    unread: Vec<UnreadRead>,
+}
+
+/// One section's rows, or none with the read named in `unread`.
+fn section<T>(name: &str, read: Result<Vec<T>, sqlx::Error>, unread: &mut Vec<UnreadRead>) -> Vec<T> {
+    match read {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(read = %name, error = %e, "self_check_read_failed");
+            unread.push(UnreadRead { name: name.to_string(), kind: read_error_kind(&e), error: e.to_string() });
+            Vec::new()
+        }
+    }
+}
+
+async fn self_check_reads(db: &sqlx::PgPool, p: &SelfCheckParams) -> SelfCheckReads {
+    let SelfCheckParams { lookback_hours, stuck_threshold_minutes, security_spike_threshold, repeat_offender_days, repeat_offender_threshold } = *p;
+    let mut unread = Vec::new();
+    // ── Section 1: recent heartbeat failures ──────────────────────────
+    let recent_failures: Vec<RecentFailure> = section(
+        "recent heartbeat failures (noo_heartbeat_runs)",
+        sqlx::query_as(
+            "SELECT task_id, task_name, action, status, duration_ms, started_at, error, result_text \
+             FROM noo_heartbeat_runs \
+             WHERE started_at > NOW() - ($1::int * INTERVAL '1 hour') \
+               AND (status = 'error' \
+                    OR COALESCE(BTRIM(error), '') <> '' \
+                    OR (status = 'success' AND COALESCE(duration_ms, 0) < 1000 \
+                        AND NOT (action = ANY($2)) \
+                        AND COALESCE(result_text, '') !~ \
+                            '^\\s*(Skipped:|Thought experiment: (not enough connected entities|no new queries this run))')) \
+             ORDER BY started_at DESC \
+             LIMIT 50",
+        )
+        .bind(lookback_hours as i32)
+        .bind(CHEAP_ACTIONS)
+        .fetch_all(db)
+        .await,
+        &mut unread,
+    );
+
+    // ── Section 2: repeat-offender tasks ──────────────────────────────
+    let repeat_offenders: Vec<(String, Option<String>, i64)> = section(
+        "repeat-offender tasks (noo_heartbeat_runs)",
+        sqlx::query_as(
+        "SELECT task_id, task_name, COUNT(*)::bigint \
+         FROM noo_heartbeat_runs \
+         WHERE status = 'error' \
+           AND started_at > NOW() - ($1::int * INTERVAL '1 day') \
+         GROUP BY task_id, task_name \
+         HAVING COUNT(*) > $2::bigint \
+         ORDER BY COUNT(*) DESC",
+    )
+    .bind(repeat_offender_days as i32)
+    .bind(repeat_offender_threshold)
+    .fetch_all(db)
+    .await,
+        &mut unread,
+    );
+
+    // ── Section 3: stuck self-develop cycles ──────────────────────────
+    let stuck_cycles: Vec<(String, i32, chrono::DateTime<Utc>)> = section(
+        "stuck self-develop cycles (noo_self_develop_log)",
+        sqlx::query_as(
+        "SELECT cycle_id::text, MAX(iteration), MIN(started_at) \
+         FROM noo_self_develop_log \
+         WHERE status = 'running' \
+           AND started_at < NOW() - ($1::int * INTERVAL '1 minute') \
+         GROUP BY cycle_id \
+         ORDER BY MIN(started_at) DESC \
+         LIMIT 20",
+    )
+    .bind(stuck_threshold_minutes as i32)
+    .fetch_all(db)
+    .await,
+        &mut unread,
+    );
+
+    // ── Section 4: failed self-develop cycles ─────────────────────────
+    let failed_cycles: Vec<(String, i32, String)> = section(
+        "failed self-develop cycles (noo_self_develop_log)",
+        sqlx::query_as(
+        "SELECT DISTINCT ON (cycle_id) cycle_id::text, iteration, COALESCE(goal, '') \
+         FROM noo_self_develop_log \
+         WHERE status = 'failed' \
+           AND completed_at > NOW() - ($1::int * INTERVAL '1 hour') \
+         ORDER BY cycle_id, completed_at DESC \
+         LIMIT 20",
+    )
+    .bind(lookback_hours as i32)
+    .fetch_all(db)
+    .await,
+        &mut unread,
+    );
+
+    // ── Section 5: security event spikes ──────────────────────────────
+    let security_spikes: Vec<(String, i64)> = section(
+        "security event spikes (audit log)",
+        crate::repo::audit::spikes_last_hour(db, security_spike_threshold)
+            .await,
+        &mut unread,
+    );
+
+    // ── Section 6: active activities (Phase 3 meta-loop) ──────────────
+    // Flag stalled activities (no progress in stuck_threshold_minutes
+    // applied to a longer scale — 7 days). The digest just lists
+    // active + paused; auto-action on stalled comes in Phase C.
+    let active_activities: Vec<(String, String, String, chrono::DateTime<Utc>)> = section(
+        "active activities (noo_agent_activities)",
+        sqlx::query_as(
+            "SELECT name, kind, status, last_activity_at \
+             FROM noo_agent_activities \
+             WHERE status IN ('active', 'paused') \
+             ORDER BY last_activity_at DESC \
+             LIMIT 20",
+        )
+        .fetch_all(db)
+        .await,
+        &mut unread,
+    );
+
+    SelfCheckReads { recent_failures, repeat_offenders, stuck_cycles, failed_cycles, security_spikes, active_activities, unread }
+}
+
+/// The digest's ending. Anything unread fails the run with the digest as
+/// its error and never prints the all-clear (i460); otherwise the
+/// all-clear is printed only when nothing was found.
+fn finish_self_check(mut out: String, anything_to_report: bool, unread: &[UnreadRead]) -> Result<String, String> {
+    if !unread.is_empty() {
+        // What was NOT checked goes first, right under the title: it is why
+        // the run failed, and the task_failed detail is the first 300 chars.
+        let mut first = String::from("## ❓ Not checked\n\n");
+        for u in unread {
+            first.push_str(&format!("- {}: {}\n", u.name, u.kind));
+        }
+        first.push('\n');
+        let at = out.find("\n\n").map(|i| i + 2).unwrap_or(0);
+        out.insert_str(at, &first);
+        // The full errors close the digest, for the run record only: the
+        // channel copy ([`channel_report`]) stops before them.
+        out.push_str(READ_ERRORS_HEADING);
+        for u in unread {
+            out.push_str(&format!("- {}: {}\n", u.name, u.error));
+        }
+        return Err(out);
+    }
+    if !anything_to_report {
+        out.push_str("✅ Nothing notable — all systems clean.\n");
+    }
+    Ok(out)
+}
+
 async fn action_agent_self_check(
     state: &std::sync::Arc<crate::state::AppState>,
     config: &Value,
@@ -3107,95 +3307,26 @@ async fn action_agent_self_check(
 
     let scan_id = uuid::Uuid::new_v4();
 
-    // ── Section 1: recent heartbeat failures ──────────────────────────
-    let recent_failures: Vec<(String, Option<String>, String, String, Option<i32>, chrono::DateTime<Utc>, Option<String>, Option<String>)> =
-        sqlx::query_as(
-            "SELECT task_id, task_name, action, status, duration_ms, started_at, error, result_text \
-             FROM noo_heartbeat_runs \
-             WHERE started_at > NOW() - ($1::int * INTERVAL '1 hour') \
-               AND (status = 'error' \
-                    OR COALESCE(BTRIM(error), '') <> '' \
-                    OR (status = 'success' AND COALESCE(duration_ms, 0) < 1000 \
-                        AND NOT (action = ANY($2)) \
-                        AND COALESCE(result_text, '') !~ \
-                            '^\\s*(Skipped:|Thought experiment: (not enough connected entities|no new queries this run))')) \
-             ORDER BY started_at DESC \
-             LIMIT 50",
-        )
-        .bind(lookback_hours as i32)
-        .bind(CHEAP_ACTIONS)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
-
-    // ── Section 2: repeat-offender tasks ──────────────────────────────
-    let repeat_offenders: Vec<(String, Option<String>, i64)> = sqlx::query_as(
-        "SELECT task_id, task_name, COUNT(*)::bigint \
-         FROM noo_heartbeat_runs \
-         WHERE status = 'error' \
-           AND started_at > NOW() - ($1::int * INTERVAL '1 day') \
-         GROUP BY task_id, task_name \
-         HAVING COUNT(*) > $2::bigint \
-         ORDER BY COUNT(*) DESC",
+    let reads = self_check_reads(
+        &state.db,
+        &SelfCheckParams {
+            lookback_hours,
+            stuck_threshold_minutes,
+            security_spike_threshold,
+            repeat_offender_days,
+            repeat_offender_threshold,
+        },
     )
-    .bind(repeat_offender_days as i32)
-    .bind(repeat_offender_threshold)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-
-    // ── Section 3: stuck self-develop cycles ──────────────────────────
-    // noo_self_develop_log is created by migration 006; tolerate
-    // missing table (DB not migrated yet) by returning empty.
-    let stuck_cycles: Vec<(String, i32, chrono::DateTime<Utc>)> = sqlx::query_as(
-        "SELECT cycle_id::text, MAX(iteration), MIN(started_at) \
-         FROM noo_self_develop_log \
-         WHERE status = 'running' \
-           AND started_at < NOW() - ($1::int * INTERVAL '1 minute') \
-         GROUP BY cycle_id \
-         ORDER BY MIN(started_at) DESC \
-         LIMIT 20",
-    )
-    .bind(stuck_threshold_minutes as i32)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-
-    // ── Section 4: failed self-develop cycles ─────────────────────────
-    let failed_cycles: Vec<(String, i32, String)> = sqlx::query_as(
-        "SELECT DISTINCT ON (cycle_id) cycle_id::text, iteration, COALESCE(goal, '') \
-         FROM noo_self_develop_log \
-         WHERE status = 'failed' \
-           AND completed_at > NOW() - ($1::int * INTERVAL '1 hour') \
-         ORDER BY cycle_id, completed_at DESC \
-         LIMIT 20",
-    )
-    .bind(lookback_hours as i32)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-
-    // ── Section 5: security event spikes ──────────────────────────────
-    let security_spikes: Vec<(String, i64)> =
-        crate::repo::audit::spikes_last_hour(&state.db, security_spike_threshold)
-            .await
-            .unwrap_or_default();
-
-    // ── Section 6: active activities (Phase 3 meta-loop) ──────────────
-    // Flag stalled activities (no progress in stuck_threshold_minutes
-    // applied to a longer scale — 7 days). The digest just lists
-    // active + paused; auto-action on stalled comes in Phase C.
-    let active_activities: Vec<(String, String, String, chrono::DateTime<Utc>)> =
-        sqlx::query_as(
-            "SELECT name, kind, status, last_activity_at \
-             FROM noo_agent_activities \
-             WHERE status IN ('active', 'paused') \
-             ORDER BY last_activity_at DESC \
-             LIMIT 20",
-        )
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    .await;
+    let SelfCheckReads {
+        recent_failures,
+        repeat_offenders,
+        stuck_cycles,
+        failed_cycles,
+        security_spikes,
+        active_activities,
+        unread,
+    } = reads;
 
     // ── Format the digest ─────────────────────────────────────────────
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC");
@@ -3323,9 +3454,11 @@ async fn action_agent_self_check(
         out.push('\n');
     }
 
-    if !anything_to_report {
-        out.push_str("✅ Nothing notable — all systems clean.\n");
-        return Ok(out);
+    if !anything_to_report || dispatch_inputs_unread(&unread) {
+        if anything_to_report {
+            out.push_str("_The findings were not handed to the evolve add-on: the reads it acts on were not checked._\n");
+        }
+        return finish_self_check(out, anything_to_report, &unread);
     }
 
     // ── Hand the findings to the add-on ───────────────────────────────
@@ -3368,7 +3501,42 @@ async fn action_agent_self_check(
         }
     }
 
-    Ok(out)
+    finish_self_check(out, anything_to_report, &unread)
+}
+
+/// The two reads the evolve add-on acts on: with either unread, its
+/// findings are incomplete and are not handed over.
+fn dispatch_inputs_unread(unread: &[UnreadRead]) -> bool {
+    unread.iter().any(|u| u.name.starts_with("recent heartbeat failures") || u.name.starts_with("repeat-offender tasks"))
+}
+
+/// Where a failed self-check's full read errors start in its digest.
+const READ_ERRORS_HEADING: &str = "\n## Read errors (run record only)\n\n";
+
+/// What a finished run sends to its channels, if anything: a successful
+/// run's result; and, for the self-check alone, a FAILED run's digest up to
+/// its read errors (its Err is the digest: "Not checked" first, the
+/// findings of the reads that worked, and no raw error text). Every other
+/// action's error is evidence for the log, never the channel. One
+/// function for the cron tick and "run now".
+pub fn channel_report(status: &str, action: &str, result_text: &str, error_text: &str) -> Option<String> {
+    match status {
+        "success" if !result_text.is_empty() => Some(result_text.to_string()),
+        "error" if action == "agent_self_check" && !error_text.is_empty() => {
+            Some(error_text.split(READ_ERRORS_HEADING).next().unwrap_or("").to_string())
+        }
+        _ => None,
+    }
+}
+
+/// The `heartbeat.task_failed` detail: the first 300 characters of the
+/// error (a failed self-check's starts with what was not checked).
+pub fn task_failed_detail(error_text: &str) -> String {
+    if error_text.is_empty() {
+        "no error detail recorded".to_string()
+    } else {
+        error_text.chars().take(300).collect()
+    }
 }
 
 // ─── write_log ─────────────────────────────────────────────────────────
@@ -3396,6 +3564,42 @@ fn resolve_workspace_dir(state: &crate::state::AppState) -> String {
 
 /// Render one section of the log. Never fails the action: a section that
 /// cannot be gathered renders its own error inline, matching the original.
+/// The digest's "errors" section. A failed read names the read and its
+/// error (i460): "Scheduler not available." blamed a scheduler that was
+/// running, for a database it could not read.
+fn errors_section_text(rows: Result<Vec<(Option<String>, Option<String>, Option<String>)>, sqlx::Error>) -> String {
+    match rows {
+        Err(e) => format!("Recent errors not checked: cannot read noo_heartbeat_runs: {e}"),
+        Ok(r) if r.is_empty() => "No recent errors.".to_string(),
+        Ok(r) => r
+            .iter()
+            .map(|(ts, name, err)| {
+                let err = err.clone().unwrap_or_default();
+                let err: String = err.chars().take(200).collect();
+                format!("- **{}** `{}`: {err}", ts.clone().unwrap_or_default(), name.clone().unwrap_or_default(),)
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+/// The digest's average load over the online nodes that REPORTED one. The
+/// node records carry `current_load` (0.0-1.0, as node_heartbeat stores it);
+/// this read `load`, which they do not carry, defaulted every node to 0.0
+/// and printed the 0-1 average as a percent ("0.1%"). A node with no load
+/// is counted as unreported, never as idle.
+fn avg_load_line(nodes: &[Value]) -> Option<String> {
+    let online: Vec<&Value> = nodes.iter().filter(|n| n.get("status").and_then(|s| s.as_str()) == Some("online")).collect();
+    let loads: Vec<f64> = online.iter().filter_map(|n| n.get("current_load").and_then(|v| v.as_f64())).collect();
+    let unreported = online.len() - loads.len();
+    let note = if unreported > 0 { format!(" ({unreported} not reporting a load)") } else { String::new() };
+    if loads.is_empty() {
+        return (unreported > 0).then(|| format!("- **Avg Load**: not reported{note}"));
+    }
+    let avg = loads.iter().sum::<f64>() / loads.len() as f64;
+    Some(format!("- **Avg Load**: {:.0}%{note}", avg * 100.0))
+}
+
 async fn gather_section(state: &crate::state::AppState, section: &str) -> String {
     match section {
         "cluster" => match cluster_nodes(state).await {
@@ -3416,15 +3620,7 @@ async fn gather_section(state: &crate::state::AppState, section: &str) -> String
                         .unwrap_or("?");
                     lines.push(format!("  - OFFLINE: {name}"));
                 }
-                let loads: Vec<f64> = nodes
-                    .iter()
-                    .filter(|n| n.get("status").and_then(|s| s.as_str()) == Some("online"))
-                    .map(|n| n.get("load").and_then(|v| v.as_f64()).unwrap_or(0.0))
-                    .collect();
-                if !loads.is_empty() {
-                    let avg = loads.iter().sum::<f64>() / loads.len() as f64;
-                    lines.push(format!("- **Avg Load**: {avg:.1}%"));
-                }
+                lines.extend(avg_load_line(&nodes));
                 lines.join("\n")
             }
         },
@@ -3472,23 +3668,7 @@ async fn gather_section(state: &crate::state::AppState, section: &str) -> String
                 )
                 .fetch_all(&state.db)
                 .await;
-            match rows {
-                Err(_) => "Scheduler not available.".to_string(),
-                Ok(r) if r.is_empty() => "No recent errors.".to_string(),
-                Ok(r) => r
-                    .iter()
-                    .map(|(ts, name, err)| {
-                        let err = err.clone().unwrap_or_default();
-                        let err: String = err.chars().take(200).collect();
-                        format!(
-                            "- **{}** `{}`: {err}",
-                            ts.clone().unwrap_or_default(),
-                            name.clone().unwrap_or_default(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            }
+            errors_section_text(rows)
         }
         "backends" => match local_get(state, "/api/cluster/backends").await {
             Err(e) => format!("Error fetching backend data: {e}"),
@@ -4848,7 +5028,12 @@ async fn action_self_benchmark(
             std::time::Duration::from_secs(timeout_secs),
             crate::bus_principal::with_principal(
         crate::bus_principal::unattended_principal(crate::heartbeat_actions::HEARTBEAT_CONVERSATION_OWNER),
-        crate::coordinator::run(
+        // Thinking OFF, as every unattended turn: the benchmark scores
+        // latency and keyword hits on trivial prompts under a short timeout.
+        // Think tokens would inflate the latency it reports, and on gemma-4
+        // the non-streaming path returns the bare `thought` prefix inside the
+        // answer it scores (the weekly_research failure, 2026-09-27).
+        crate::coordinator::run_with_thinking(
                 state,
                 prompt,
                 &conversation_id,
@@ -4856,6 +5041,7 @@ async fn action_self_benchmark(
                 5, // benchmark prompts are single-step; a small cap bounds cost
                 None,
                 Some(HEARTBEAT_CONVERSATION_OWNER),
+                false,
             ),
     ),
         )
@@ -5613,37 +5799,11 @@ mod delivery_envelope_tests {
 /// by URL, by the loopback client, or by the HMAC header — fails here.
 #[cfg(test)]
 mod no_self_call_tests {
-    /// The file with its `#[cfg(test)] mod … { … }` blocks cut out: the
-    /// tests name the patterns they forbid. Brace counting is enough here —
-    /// a test body's braces balance.
+    /// The file as code: comments blanked and every `#[cfg(test)]` item
+    /// removed (the tests name the patterns they forbid).
     fn src(name: &str) -> String {
         let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(name);
-        let text = std::fs::read_to_string(&p).unwrap();
-        let mut out = String::new();
-        let mut rest = text.as_str();
-        while let Some(at) = rest.find("#[cfg(test)]\nmod ") {
-            out.push_str(&rest[..at]);
-            let block = &rest[at..];
-            let open = block.find('{').expect("a test module body");
-            let mut depth = 0usize;
-            let mut end = block.len();
-            for (i, c) in block[open..].char_indices() {
-                match c {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = open + i + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            rest = &block[end..];
-        }
-        out.push_str(rest);
-        out
+        crate::test_src::own_code(&std::fs::read_to_string(&p).unwrap())
     }
 
     #[test]
@@ -5788,5 +5948,209 @@ mod backup_retention_tests {
         left.sort();
         assert_eq!(left, ["2026-01-02", "2026-10-03", "keep-me"], "a plain file and a non-date directory are untouched");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod db_read_error_tests {
+    use super::*;
+
+    fn dead_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool")
+    }
+
+    /// i460: a database that cannot answer fails the cost report; it never
+    /// reports 0 tokens and a $0.00 cost.
+    #[tokio::test]
+    async fn a_failed_token_read_fails_the_cost_report() {
+        match cost_tokens(&dead_pool(), 7).await {
+            Err(e) => assert!(e.starts_with("cost_report: cannot read the token totals from noo_conversations"), "{e}"),
+            Ok(t) => panic!("a dead pool read as {t:?} tokens"),
+        }
+    }
+
+    /// i460: each of the self-check's six reads that fails is named, never
+    /// read as an empty section ("nothing to report").
+    #[tokio::test]
+    async fn every_unreadable_self_check_read_is_named_never_nothing_to_report() {
+        let p = SelfCheckParams {
+            lookback_hours: 24,
+            stuck_threshold_minutes: 30,
+            security_spike_threshold: 10,
+            repeat_offender_days: 7,
+            repeat_offender_threshold: 2,
+        };
+        let r = self_check_reads(&dead_pool(), &p).await;
+        let names: Vec<&str> = r.unread.iter().map(|u| u.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "recent heartbeat failures (noo_heartbeat_runs)",
+                "repeat-offender tasks (noo_heartbeat_runs)",
+                "stuck self-develop cycles (noo_self_develop_log)",
+                "failed self-develop cycles (noo_self_develop_log)",
+                "security event spikes (audit log)",
+                "active activities (noo_agent_activities)",
+            ],
+            "{:?}",
+            r.unread
+        );
+        assert!(dispatch_inputs_unread(&r.unread), "the add-on's inputs were not read");
+    }
+
+    /// The ending: an unread section fails the run with the digest, and the
+    /// all-clear is printed only when everything was read and nothing found.
+    #[test]
+    fn an_unread_section_fails_the_self_check_and_never_prints_the_all_clear() {
+        let unread = vec![UnreadRead {
+            name: "security event spikes (audit log)".into(),
+            kind: "database unavailable (PoolTimedOut)".into(),
+            error: "pool timed out while waiting for an open connection".into(),
+        }];
+        let e = finish_self_check("# digest\n".into(), false, &unread).unwrap_err();
+        assert!(!e.contains("Nothing notable"), "{e}");
+        assert!(finish_self_check("# digest\n".into(), true, &unread).is_err());
+        assert!(!dispatch_inputs_unread(&unread), "spikes are not what the add-on acts on");
+        let clean = finish_self_check("# digest\n".into(), false, &[]).unwrap();
+        assert!(clean.ends_with("✅ Nothing notable — all systems clean.\n"), "{clean}");
+        let found = finish_self_check("# digest\n".into(), true, &[]).unwrap();
+        assert!(!found.contains("Nothing notable"), "{found}");
+    }
+}
+
+#[cfg(test)]
+mod i460_followup_tests {
+    use super::*;
+
+    /// i460: a failed read of the errors section names the read, never a
+    /// scheduler that was running.
+    #[test]
+    fn the_errors_section_names_a_failed_read() {
+        let t = errors_section_text(Err(sqlx::Error::PoolTimedOut));
+        assert!(t.starts_with("Recent errors not checked: cannot read noo_heartbeat_runs: "), "{t}");
+        assert!(!t.contains("Scheduler"), "{t}");
+        assert_eq!(errors_section_text(Ok(Vec::new())), "No recent errors.");
+    }
+
+    /// The benchmark is an unattended turn: thinking off, through
+    /// run_with_thinking, never the bare run (which thinks).
+    #[test]
+    fn the_self_benchmark_runs_with_thinking_off() {
+        let code = crate::test_src::own_code(include_str!("heartbeat_actions.rs"));
+        let body = crate::test_src::fn_body(&code, "async fn action_self_benchmark(");
+        assert!(!body.contains("coordinator::run("), "the bare run thinks");
+        let call = body.split("coordinator::run_with_thinking(").nth(1).expect("run_with_thinking is called");
+        // The call's own arguments, up to its matching parenthesis.
+        let mut depth = 1;
+        let end = call
+            .char_indices()
+            .find(|&(_, c)| {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            })
+            .map(|(i, _)| i)
+            .expect("the call closes");
+        let args = &call[..end];
+        assert_eq!(args.rsplit(',').map(str::trim).find(|a| !a.is_empty()), Some("false"), "{args}");
+    }
+}
+
+#[cfg(test)]
+mod avg_load_tests {
+    use super::avg_load_line;
+    use serde_json::json;
+
+    /// The records carry `current_load` on the 0.0-1.0 scale. An online node
+    /// that reports none is named as such, never averaged in as 0.0.
+    #[test]
+    fn the_digest_averages_only_reported_loads_as_a_percent() {
+        let nodes = [
+            json!({"id": "a", "status": "online", "current_load": 0.2}),
+            json!({"id": "b", "status": "online", "current_load": 0.6}),
+            json!({"id": "c", "status": "online"}),
+            json!({"id": "d", "status": "offline", "current_load": 0.9}),
+        ];
+        assert_eq!(avg_load_line(&nodes).as_deref(), Some("- **Avg Load**: 40% (1 not reporting a load)"));
+        assert_eq!(avg_load_line(&nodes[..2]).as_deref(), Some("- **Avg Load**: 40%"));
+        assert_eq!(avg_load_line(&nodes[2..3]).as_deref(), Some("- **Avg Load**: not reported (1 not reporting a load)"));
+        assert_eq!(avg_load_line(&nodes[3..]), None, "no online node");
+    }
+}
+
+#[cfg(test)]
+mod self_check_delivery_tests {
+    use super::{channel_report, finish_self_check, read_error_kind, task_failed_detail, UnreadRead};
+
+    /// A read error whose text names a host, the way an I/O error can.
+    fn leaky() -> sqlx::Error {
+        sqlx::Error::Io(std::io::Error::other("connect to 10.9.8.7:5432 refused (rh-secret-host)"))
+    }
+
+    /// A failed self-check still reaches its channel: what was not checked
+    /// first, then the findings of the reads that worked. The channel copy
+    /// carries each unread read's name and error KIND only; the raw error
+    /// text stays in the run record (the Err) and the log.
+    #[test]
+    fn a_failed_self_check_delivers_not_checked_first_and_no_raw_error_text() {
+        let e = leaky();
+        let unread = vec![UnreadRead {
+            name: "recent heartbeat failures (noo_heartbeat_runs)".into(),
+            kind: read_error_kind(&e),
+            error: e.to_string(),
+        }];
+        let out = "# Agent Self-Check — now\n\n## 🛑 Failed self-develop cycles — 1\n\n- cycle 7\n\n".to_string();
+        let digest = finish_self_check(out, true, &unread).unwrap_err();
+        let nc = digest.find("## ❓ Not checked").expect("the section");
+        assert!(nc < digest.find("## 🛑 Failed self-develop cycles").unwrap(), "first: {digest}");
+        assert!(digest.starts_with("# Agent Self-Check"), "{digest}");
+        assert!(digest.contains("rh-secret-host"), "the run record keeps the full error: {digest}");
+
+        let channel = channel_report("error", "agent_self_check", "", &digest).expect("delivered");
+        assert!(channel.contains("- recent heartbeat failures (noo_heartbeat_runs): database unreachable (Io)"), "{channel}");
+        assert!(channel.contains("cycle 7"), "the findings that were read: {channel}");
+        for raw in ["rh-secret-host", "10.9.8.7", "refused"] {
+            assert!(!channel.contains(raw), "raw error text {raw:?} in the channel copy: {channel}");
+        }
+        // The task_failed detail leads with the reason.
+        assert!(task_failed_detail(&digest).contains("Not checked"), "{}", task_failed_detail(&digest));
+    }
+
+    /// Only the self-check's failure is a report. Any other action's error
+    /// is evidence for the log; a success is delivered as before.
+    #[test]
+    fn only_a_failed_self_check_is_delivered_on_error() {
+        assert_eq!(channel_report("error", "research_report", "", "DSN postgres://x"), None);
+        assert_eq!(channel_report("error", "agent_self_check", "", ""), None);
+        assert_eq!(channel_report("success", "research_report", "the report", "").as_deref(), Some("the report"));
+        assert_eq!(channel_report("success", "research_report", "", ""), None);
+        assert_eq!(task_failed_detail(""), "no error detail recorded");
+    }
+
+    /// A kind never carries the error's text.
+    #[test]
+    fn a_read_error_kind_names_the_failure_not_its_text() {
+        assert_eq!(read_error_kind(&sqlx::Error::PoolTimedOut), "database unavailable (PoolTimedOut)");
+        assert_eq!(read_error_kind(&leaky()), "database unreachable (Io)");
+        assert_eq!(read_error_kind(&sqlx::Error::Protocol("rh-secret-host".into())), "database error");
+    }
+
+    /// Both delivery sites (the cron tick and "run now") decide through
+    /// channel_report, not a success-only test of their own.
+    #[test]
+    fn both_delivery_sites_use_channel_report() {
+        let tick = crate::test_src::own_code(include_str!("heartbeat_loop.rs"));
+        let body = crate::test_src::fn_body(&tick, "pub async fn execute_task(");
+        assert!(body.contains("heartbeat_actions::channel_report(&status, &action, &result_text, &error_text)"), "the cron tick");
+        assert!(body.contains("heartbeat_actions::task_failed_detail(&error_text)"), "the task_failed detail");
+        let now = crate::test_src::own_code(include_str!("routes/intelligence.rs"));
+        let body = crate::test_src::fn_body(&now, "async fn execute_manual_run(");
+        assert!(body.contains("heartbeat_actions::channel_report(&status, &action, &result_text, &error_text)"), "run now");
     }
 }

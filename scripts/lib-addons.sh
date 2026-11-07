@@ -164,7 +164,9 @@ addon_compose_overlay_args() {
 addon_licensed_names() {
     _aln_here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
     {
-        printf '%s\n' "$NOO_ADDON_MAP" | sed -n 's/^\([a-z][a-z0-9_]*\)=.*/\1/p'
+        # `-` included: a hyphenated add-on (rh-voice=0) is named too, so a
+        # declared-off one whose overlay is gone is said, never skipped.
+        printf '%s\n' "$NOO_ADDON_MAP" | sed -n 's/^\([a-z][a-z0-9_-]*\)=.*/\1/p'
         for _aln_d in "$_aln_here"/addons/*/; do
             [ -f "${_aln_d}docker-compose.yml" ] && basename "$_aln_d"
         done
@@ -349,22 +351,48 @@ addons_report_licensed() {
     return 0
 }
 
-# addons_stop_disabled — a licensed add-on switched OFF on a live stack: its
-# overlay is not composed, so `up` never touches its containers. Name the
-# overlay just to reach them, and stop the services it adds.
+# addons_stop_disabled — a licensed add-on (first or third party, one path)
+# declared OFF: its overlay is not composed, so `up` never touches its
+# containers, and with `restart: unless-stopped` a crash-looping one keeps
+# looping (2026-11-05: a third-party add-on's two containers, off in
+# noomesh.yaml, survived a roll into its restart-loop check).
+# Each container of THIS install's project whose service is one the overlay
+# OWNS (read from the overlay's TEXT, never rendered: an off add-on's overlay
+# can interpolate variables nothing sets, and rendering it to `stop` it failed
+# silently) is removed, by declaration, the way a retired service is: its last
+# log lines are printed first so the reason it was looping is kept, then
+# `docker rm -f` WITHOUT -v (its volumes and data stay), one line each.
+# A failed removal, or containers it could not list, is said, never hidden.
+# Run BEFORE the whole-stack `up`, so a failing `up` cannot leave them running.
 addons_stop_disabled() {
+    _asd_proj="${COMPOSE_PROJECT_NAME:-noomesh}"
     for _asd_n in $(addon_licensed_names); do
         addon_on "$_asd_n" 0 && continue
-        # A refused add-on's overlay is never composed, not even to stop it:
-        # addons_stop_refused reaches its containers by label instead.
+        # A refused add-on is stopped by addons_stop_refused (it comes back).
         case ",${_NOO_ADDONS_REFUSED}," in *",$_asd_n,"*) continue ;; esac
         _asd_o="$(addon_overlay "$_asd_n" 2>/dev/null)"
-        [ -n "$_asd_o" ] || continue
-        _asd_s="$(addon_own_services "$_asd_o" | tr '\n' ' ')"
-        [ -n "${_asd_s// /}" ] || continue
-        _ADDON_STOPPED="${_ADDON_STOPPED:- }${_asd_s} "
-        # shellcheck disable=SC2086
-        docker compose $COMPOSE_FILES -f "$_asd_o" stop $_asd_s 2>/dev/null || true
+        if [ -z "$_asd_o" ]; then
+            printf '%s\n' "$NOO_ADDON_MAP" | grep -qx "${_asd_n}=0" \
+                && echo "! add-on $_asd_n is declared off but its overlay is gone, so its containers were NOT checked: noo doctor orphans" >&2
+            continue
+        fi
+        for _asd_s in $(addon_own_services "$_asd_o"); do
+            if ! _asd_names="$(docker ps -a --filter "label=com.docker.compose.project=${_asd_proj}" \
+                    --filter "label=com.docker.compose.service=${_asd_s}" --format '{{.Names}}' 2>/dev/null)"; then
+                echo "! could not list the containers of service ${_asd_s} (add-on ${_asd_n}, declared off), so they were NOT removed: noo doctor orphans" >&2
+                continue
+            fi
+            for _asd_c in $_asd_names; do
+                _ADDON_STOPPED="${_ADDON_STOPPED:- }${_asd_s} "
+                echo "last log lines of $_asd_c (add-on $_asd_n, declared off), kept before it is removed:" >&2
+                docker logs --tail 20 "$_asd_c" 2>&1 | sed 's/^/  | /' >&2
+                if docker rm -f "$_asd_c" >/dev/null 2>&1; then
+                    echo "- removed $_asd_c: add-on $_asd_n is declared off (its data is kept)"
+                else
+                    echo "WARNING: could not remove $_asd_c (add-on $_asd_n is declared off): docker rm -f $_asd_c" >&2
+                fi
+            done
+        done
     done
     return 0
 }
@@ -382,15 +410,55 @@ addons_stop_refused() {
         _asr_o="$(addon_overlay "$_asr_n" 2>/dev/null)"
         [ -n "$_asr_o" ] || continue
         for _asr_s in $(addon_own_services "$_asr_o"); do
-            _asr_ids="$(docker ps -q --filter "label=com.docker.compose.project=${_asr_proj}" \
+            _asr_ids="$(docker ps -q --no-trunc --filter "label=com.docker.compose.project=${_asr_proj}" \
                 --filter "label=com.docker.compose.service=${_asr_s}" 2>/dev/null)"
             [ -n "$_asr_ids" ] || continue
             _ADDON_STOPPED="${_ADDON_STOPPED:- }${_asr_s} "
+            # shellcheck disable=SC2086
+            addons_note_intended_stop "add-on ${_asr_n} was refused this start" $_asr_ids
             echo "Stopping ${_asr_s}: add-on ${_asr_n} was refused this start and must not keep running" >&2
             # shellcheck disable=SC2086
             docker stop $_asr_ids >/dev/null 2>&1 || echo "WARNING: could not stop ${_asr_s} (add-on ${_asr_n}); stop it: docker stop ${_asr_ids}" >&2
         done
     done
+    return 0
+}
+
+# addons_note_intended_stop REASON ID... — record, for the CLI's post-roll
+# gate (`noo upgrade --stack`, restart_loops.rs IntendedStops), that the
+# launcher stops these containers ON PURPOSE. A crash-looping container it
+# stops keeps its last exit code (1); unrecorded, the gate read that as
+# "exited 1 during the roll" and refused a roll that did the right thing.
+# NOO_LAUNCHER_STOPS is a CLI→launcher handoff, not a behaviour switch (P4):
+# the CLI creates a fresh 0600 file per roll and passes its path. Unset (a
+# start without the CLI's gate) records nothing. One `<id> <reason>` line per
+# container; the gate matches by Id. A line it could not write is said: that
+# stop is then judged by its state alone.
+addons_note_intended_stop() {
+    [ -n "${NOO_LAUNCHER_STOPS:-}" ] || return 0
+    _ais_why="$1"
+    shift
+    for _ais_id in "$@"; do
+        printf '%s %s\n' "$_ais_id" "$_ais_why" >> "$NOO_LAUNCHER_STOPS" 2>/dev/null \
+            || echo "WARNING: could not record the stop of ${_ais_id} (${_ais_why}) for the post-roll gate in ${NOO_LAUNCHER_STOPS}" >&2
+    done
+    return 0
+}
+
+# addons_compose_stop_intended REASON COMPOSE_ARGS... -- SERVICE... — the
+# launchers' switched-off stops (trellion, voice): record each running
+# container's Id (addons_note_intended_stop), then `docker compose
+# COMPOSE_ARGS stop SERVICE...`. Best-effort as before: a stop that fails
+# is not the launcher's verdict.
+addons_compose_stop_intended() {
+    local _acs_why="$1" _acs_args=() _acs_ids
+    shift
+    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do _acs_args+=("$1"); shift; done
+    [ "${1:-}" = "--" ] && shift
+    _acs_ids="$(docker compose "${_acs_args[@]}" ps -q "$@" 2>/dev/null)"
+    # shellcheck disable=SC2086
+    [ -n "$_acs_ids" ] && addons_note_intended_stop "$_acs_why" $_acs_ids
+    docker compose "${_acs_args[@]}" stop "$@" 2>/dev/null || true
     return 0
 }
 
@@ -401,25 +469,69 @@ _addons_running_services() {
         --filter status=running --format '{{.Label "com.docker.compose.service"}}' 2>/dev/null | sort -u
 }
 
+# _addons_running_facts — each running container of this project, one line:
+# `<service> <id> <restart count> <started, unix>` (started 0 when docker's
+# time could not be read; that container is then judged as stable, so a
+# doubt still fails loudly).
+_addons_running_facts() {
+    local _arf_ids _arf_s _arf_id _arf_rc _arf_st _arf_t
+    _arf_ids="$(docker ps -q --no-trunc --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME:-noomesh}" \
+        --filter status=running 2>/dev/null)"
+    [ -n "$_arf_ids" ] || return 0
+    # shellcheck disable=SC2086
+    docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}} {{.Id}} {{.RestartCount}} {{.State.StartedAt}}' \
+        $_arf_ids 2>/dev/null | while read -r _arf_s _arf_id _arf_rc _arf_st; do
+        [ -n "$_arf_s" ] || continue
+        case "$_arf_rc" in ''|*[!0-9]*) _arf_rc=0 ;; esac
+        _arf_t="$(date -d "$_arf_st" +%s 2>/dev/null || echo 0)"
+        printf '%s %s %s %s\n' "$_arf_s" "$_arf_id" "$_arf_rc" "$_arf_t"
+    done
+}
+
+# A container that restarted and started this recently was restart-looping
+# when the launcher looked (restart_loops.rs RECENT_SECS, the same window).
+_ADDONS_RECENT_SECS=600
+
 # addons_stop_leftovers FN... — run the add-on stop functions
 # (addons_stop_disabled, addons_stop_refused), then prove they stopped
-# nothing else: every service that was running before and is not running
-# after must be one they meant to stop (an add-on's OWN service). Anything
-# else, a core service above all, is a failure: named, exit status 1, and
-# never a "Services started" line (defence in depth for the rc.2 defect).
+# nothing else: every service that was running AND STABLE before and is not
+# running after must be one they meant to stop (an add-on's OWN service).
+# Anything else, a core service above all, is a failure: named, exit status
+# 1, and never a "Services started" line (defence in depth for the rc.2
+# defect).
+# Stable: not restarted, or last started more than _ADDONS_RECENT_SECS ago.
+# A core service already restart-looping before the stop (often why the
+# operator rolls) is "running" between restarts and "restarting" a moment
+# later; judged by that instant it read as stopped by the launcher, and the
+# roll exited 1 before `up` (harness 0.6.17 review, a2). Such a service, or
+# one whose container restarted or is restarting since, went down on its
+# own: one line, and `up` recreates it; the post-roll gate judges it.
 _ADDON_STOPPED=" "
 addons_stop_leftovers() {
-    local _before _after _lost="" _s _f
+    local _before _after _lost="" _f _s _id _rc _t _now _rst _rc2
     _ADDON_STOPPED=" "
-    _before="$(_addons_running_services)"
+    _before="$(_addons_running_facts)"
     for _f in "$@"; do "$_f"; done
     [ -n "$_before" ] || return 0
     _after="$(_addons_running_services)"
-    for _s in $_before; do
+    _now="$(date +%s)"
+    while read -r _s _id _rc _t; do
+        [ -n "$_s" ] || continue
         printf '%s\n' "$_after" | grep -qxF "$_s" && continue
         case "$_ADDON_STOPPED" in *" $_s "*) continue ;; esac
+        case " $_lost " in *" $_s "*) continue ;; esac
+        if [ "$_rc" -gt 0 ] && [ "$_t" -gt 0 ] && [ $((_now - _t)) -lt "$_ADDONS_RECENT_SECS" ]; then
+            echo "$_s was restart-looping before the launcher's add-on stop (${_rc} restarts, last start $((_now - _t))s ago): not counted as stopped by it; up recreates it and the post-roll gate judges it" >&2
+            continue
+        fi
+        read -r _rst _rc2 <<<"$(docker inspect -f '{{.State.Restarting}} {{.RestartCount}}' "$_id" 2>/dev/null)"
+        case "${_rc2:-}" in ''|*[!0-9]*) _rc2="$_rc" ;; esac
+        if [ "${_rst:-}" = true ] || [ "$_rc2" -gt "$_rc" ]; then
+            echo "$_s went down on its own while the launcher stopped add-on containers (restarting, ${_rc2} restarts): not counted as stopped by it; up recreates it and the post-roll gate judges it" >&2
+            continue
+        fi
         _lost="${_lost} ${_s}"
-    done
+    done <<<"$_before"
     [ -z "$_lost" ] && return 0
     {
         echo "ERROR: service(s)${_lost} stopped while the launcher stopped leftover add-on containers: the stack is NOT fully up"

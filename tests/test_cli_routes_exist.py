@@ -21,6 +21,8 @@ import json
 import re
 from pathlib import Path
 
+from tests import _rust_src as rs
+
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "noo-cli/src"
 SPEC = ROOT / "src/noomesh/gateway/static/openapi.json"
@@ -53,8 +55,8 @@ def _cli_paths() -> dict[str, str]:
     for f in sorted(CLI.rglob("*.rs")):
         # Only shipped code calls the gateway: a `#[cfg(test)]` module's
         # fixture paths (addon_cli.rs tests its dispatcher against made-up
-        # routes) are not calls, so the scan stops at the first one.
-        text = f.read_text().split("#[cfg(test)]", 1)[0]
+        # routes) are not calls, so own_code removes those items whole.
+        text = rs.own_code(f.read_text())
         for m in LITERAL.finditer(text):
             # A literal ending in "/" is a namespace PREFIX the code checks
             # against ("/api/" in addon_cli.rs), never a path it requests.

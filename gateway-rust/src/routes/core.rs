@@ -1749,6 +1749,14 @@ async fn health(
         addon_caller_dep(crate::addon_auth::token().is_some(), crate::addon_auth::failure()),
     );
 
+    // Open fds against RLIMIT_NOFILE (fd_watch.rs). Critical (90%, or the
+    // count cannot be read) says "degraded" like Redis does, and like Redis
+    // it never reaches the status code: a 503 drives the post-recreate
+    // rollback, and the cure for a leak is a restart, not the old image.
+    let fds = crate::fd_watch::read();
+    if crate::fd_watch::level_of(&fds) == crate::fd_watch::Level::Critical { all_ok = false; }
+    deps.insert("fds".into(), crate::fd_watch::health_dep(&fds));
+
     let status = if all_ok { "healthy" } else { "degraded" };
     let peers = state.gossip.alive_peers().len();
 
@@ -1805,6 +1813,9 @@ async fn health(
         // i353b: why each `unhealthy` add-on was refused; `{}` when none.
         // `noo cluster verify` FAILs an enabled add-on named here.
         body["addons_refused"] = crate::addons::health_refused_map();
+        // The add-ons with a manifest (the runtime registry), sorted, `[]`
+        // when none: the only ones `/api/addons/{name}/access` answers.
+        body["addons_registered"] = json!(crate::addons::health_registered());
         // i277f: `noo upgrade` compares it across a roll (reconnect hint).
         body["mcp_catalogue"] = json!(crate::mcp_external::catalogue_digest());
     }
@@ -1882,6 +1893,9 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
         "# TYPE noo_gateway_start_time_seconds gauge\nnoo_gateway_start_time_seconds {}\n",
         crate::legacy_lanes::process_start_unix()
     ));
+
+    // Open fds and the soft limit (fd_watch.rs; the 2026-11-02 EMFILE outage).
+    body.push_str(&crate::fd_watch::metrics_text(&crate::fd_watch::read()));
 
     // In-process counters/gauges (Phase 2 events + Python pushes)
     body.push_str(&state.metrics.render().await);
@@ -2120,7 +2134,8 @@ mod tests {
             assert!(check < effect, "{name}: the origin check must come first");
             assert!(body[check..effect].contains("return session_origin_forbidden(why)"), "{name}");
         }
-        let forbidden = src.split("fn session_origin_forbidden(").nth(1).unwrap().split("\n\u{7d}\n").next().unwrap();
+        let own = crate::test_src::own_code(src);
+        let forbidden = crate::test_src::fn_body(&own, "fn session_origin_forbidden(");
         assert!(!forbidden.contains("Cookie") && !forbidden.contains("jar"), "a refusal sets or clears no cookie");
     }
 

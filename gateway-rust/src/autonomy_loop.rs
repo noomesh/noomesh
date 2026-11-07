@@ -78,8 +78,15 @@ pub fn spawn(state: Arc<AppState>) {
             async move {
                 // Global kill switch checked AFTER record_tick (inside the
                 // managed loop) so a disabled engine still reads as alive.
-                if !is_enabled(&state).await {
-                    return Ok(());
+                // Fail closed (operator 2026-11-04): a switch that cannot be
+                // read is off for this tick, and the skip is said out loud.
+                match read_switch(&state).await {
+                    Switch::On => {}
+                    Switch::Off => return Ok(()),
+                    Switch::Unreadable(cause) => {
+                        skipped_switch_unreadable(&state, &cause).await;
+                        return Ok(());
+                    }
                 }
                 poll_locations(state, last_eval)
                     .await
@@ -251,13 +258,89 @@ async fn handle_issue_report(state: Arc<AppState>, agent_id: String, report: ser
     }
 }
 
-/// Read the global enabled flag. Mirrors Python's Redis key
-/// `noo:autonomy:enabled` (toggled via `/api/autonomy/{enable,disable}`).
+const SWITCH_KEY: &str = "noo:autonomy:enabled";
+
+/// What the global switch (`noo:autonomy:enabled`, set by
+/// `/api/autonomy/{enable,disable}`) says this tick.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Switch {
+    On,
+    Off,
+    /// No Redis, or Redis failed: the operator's choice cannot be known.
+    Unreadable(String),
+}
+
+impl Switch {
+    /// Only a switch read as on lets autonomy act.
+    pub(crate) fn acts(&self) -> bool {
+        matches!(self, Switch::On)
+    }
+}
+
+/// `None` is a gateway without Redis. A key that was never set is the
+/// documented default (on); a Redis that cannot answer is not a key that
+/// was never set, so it reads as unreadable and autonomy holds.
+pub(crate) fn switch_from(read: Option<Result<Option<String>, String>>) -> Switch {
+    match read {
+        None => Switch::Unreadable("no redis configured".into()),
+        Some(Err(e)) => Switch::Unreadable(e),
+        Some(Ok(None)) => Switch::On,
+        Some(Ok(Some(s))) if s == "1" || s.eq_ignore_ascii_case("true") => Switch::On,
+        Some(Ok(Some(_))) => Switch::Off,
+    }
+}
+
+pub(crate) async fn read_switch(state: &AppState) -> Switch {
+    let read = match state.redis.as_ref() {
+        None => None,
+        Some(r) => Some(r.get_string_checked(SWITCH_KEY).await),
+    };
+    switch_from(read)
+}
+
+/// True only when the switch was read and says on.
 pub async fn is_enabled(state: &AppState) -> bool {
-    let Some(r) = state.redis.as_ref() else { return true; };
-    match r.get_string("noo:autonomy:enabled").await {
-        Some(s) => s == "1" || s.eq_ignore_ascii_case("true"),
-        None => true, // default enabled (matches Python)
+    read_switch(state).await.acts()
+}
+
+/// One alert an hour while the switch stays unreadable. Kept in process:
+/// the operator_alert cooldown lives in the same Redis that just failed,
+/// and a failed SET NX there reads as "cooling down", which would swallow
+/// the alert.
+const SWITCH_ALERT_EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
+static SWITCH_ALERTED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+fn switch_alert_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    match last {
+        None => true,
+        Some(t) => now.duration_since(t) >= SWITCH_ALERT_EVERY,
+    }
+}
+
+async fn skipped_switch_unreadable(state: &AppState, cause: &str) {
+    tracing::warn!(cause, "autonomy_skipped_switch_unreadable");
+    let due = {
+        let mut last = SWITCH_ALERTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = std::time::Instant::now();
+        let due = switch_alert_due(*last, now);
+        if due {
+            *last = Some(now);
+        }
+        due
+    };
+    if due {
+        crate::operator_alert::send_operator_alert_with(
+            state,
+            crate::operator_alert::OperatorAlert::new(
+                "autonomy.switch_unreadable",
+                "cluster",
+                "Autonomy is holding: its on/off switch cannot be read from Redis, so no autonomous action runs until it can.".to_string(),
+            )
+            .detail(cause.to_string())
+            .investigate("noo autonomy status"),
+            0,
+        )
+        .await;
     }
 }
 
@@ -397,6 +480,16 @@ pub(crate) fn gate_of(name: &str, config: &serde_json::Value) -> Option<(bool, b
 ///      without touching config files)
 /// Config entries with non-builtin names are custom locations owned by
 /// other machinery and are not returned here.
+/// Every location held off: what an unreadable override table means. The
+/// operator's toggles cannot be read, so none of the defaults may act on
+/// their behalf (an override may have disabled or disarmed any of them).
+fn hold_all(mut locs: Vec<LocationDef>) -> Vec<LocationDef> {
+    for l in &mut locs {
+        l.enabled = false;
+    }
+    locs
+}
+
 pub(crate) async fn load_locations(state: &AppState) -> Vec<LocationDef> {
     let mut locs = default_locations();
 
@@ -429,15 +522,26 @@ pub(crate) async fn load_locations(state: &AppState) -> Vec<LocationDef> {
     }
 
     // Layer 3: DB overrides. Tolerate a missing table (pre-migration
-    // startup ordering) — the loop must never die on this query.
+    // startup ordering) — the loop must never die on this query. But ONLY a
+    // missing table is "no overrides": any other error used to drop the
+    // operator's runtime toggles, so a location they disabled or disarmed ran
+    // again on the YAML/builtin defaults (#650 sweep). Then nothing runs this
+    // tick and the node reclaim policy reads disabled, until the read works.
     let rows: Vec<(String, Option<bool>, Option<i32>, Option<serde_json::Value>)> =
-        sqlx::query_as(
+        match sqlx::query_as(
             "SELECT name, enabled, check_interval_seconds, config \
              FROM noo_autonomy_overrides",
         )
         .fetch_all(&state.db)
         .await
-        .unwrap_or_default();
+        {
+            Ok(rows) => rows,
+            Err(e) if crate::repo::missing_table(&e) => Vec::new(),
+            Err(e) => {
+                tracing::warn!(error = %e, "autonomy_overrides_unreadable: every location held off this tick");
+                return hold_all(locs);
+            }
+        };
     for (name, enabled, interval, config) in rows {
         if let Some(builtin) = locs.iter_mut().find(|l| l.name == name) {
             if let Some(e) = enabled {
@@ -468,12 +572,22 @@ pub(crate) async fn load_custom_locations(
     let builtin_names: std::collections::HashSet<String> =
         default_locations().into_iter().map(|l| l.name).collect();
 
-    let rows: Vec<(String, serde_json::Value, bool)> = sqlx::query_as(
+    // Only a missing table is "no DB locations". Any other error used to
+    // empty `seen`, so a YAML-seed location the DB had disabled ran again
+    // (#650 sweep): no custom location runs this tick instead.
+    let rows: Vec<(String, serde_json::Value, bool)> = match sqlx::query_as(
         "SELECT name, definition, enabled FROM noo_autonomy_locations",
     )
     .fetch_all(&state.db)
     .await
-    .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        Err(e) if crate::repo::missing_table(&e) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(error = %e, "autonomy_locations_unreadable: no custom location runs this tick");
+            return Vec::new();
+        }
+    };
     for (name, definition, enabled) in rows {
         seen.insert(name.clone());
         if !enabled || builtin_names.contains(&name) {
@@ -708,9 +822,8 @@ async fn eval_cert_expiry(state: &AppState) -> Result<bool, String> {
 mod gate_tests {
     #[test]
     fn gate_capable_matches_the_dispatch() {
-        let src = include_str!("autonomy_loop.rs");
-        let dispatch = src.split("async fn evaluate_location").nth(1).expect("present");
-        let dispatch = &dispatch[..dispatch.find("\n}").unwrap_or(dispatch.len())];
+        let own = crate::test_src::own_code(include_str!("autonomy_loop.rs"));
+        let dispatch = crate::test_src::fn_body(&own, "async fn evaluate_location(");
         let mut with_config: Vec<String> = Vec::new();
         for line in dispatch.lines() {
             if !line.contains("&loc.config") { continue; }
@@ -724,5 +837,57 @@ mod gate_tests {
         let mut listed: Vec<String> = super::GATE_CAPABLE.iter().map(|s| s.to_string()).collect();
         listed.sort();
         assert_eq!(with_config, listed, "GATE_CAPABLE drifted from the dispatch");
+    }
+}
+
+/// #650 sweep: an unreadable override table holds every location off (an
+/// override may have disabled or disarmed any of them), and only a missing
+/// table reads as "no overrides".
+#[cfg(test)]
+mod unreadable_override_tests {
+    use super::*;
+
+    #[test]
+    fn with_redis_down_no_autonomous_action_runs() {
+        // Operator 2026-11-04: unreadable (Redis down or erroring) fails closed.
+        let down = switch_from(Some(Err("connection refused".into())));
+        assert_eq!(down, Switch::Unreadable("connection refused".into()));
+        assert!(!down.acts());
+        assert!(!switch_from(None).acts(), "no redis configured holds too");
+    }
+
+    #[test]
+    fn a_never_set_switch_stays_on() {
+        // Operator 2026-11-04: Redis up, key absent is the default, ON. Only an
+        // unreadable switch holds; the two must never collapse into one.
+        let never_set = switch_from(Some(Ok(None)));
+        assert_eq!(never_set, Switch::On);
+        assert!(never_set.acts());
+    }
+
+    #[test]
+    fn a_readable_switch_still_means_what_it_says() {
+        assert!(switch_from(Some(Ok(Some("1".into())))).acts());
+        assert!(switch_from(Some(Ok(Some("TRUE".into())))).acts());
+        assert!(!switch_from(Some(Ok(Some("0".into())))).acts());
+        assert!(!switch_from(Some(Ok(Some("off".into())))).acts());
+    }
+
+    #[test]
+    fn the_switch_alert_repeats_hourly_not_every_tick() {
+        let t = std::time::Instant::now();
+        assert!(switch_alert_due(None, t));
+        assert!(!switch_alert_due(Some(t), t + std::time::Duration::from_secs(30)));
+        assert!(switch_alert_due(Some(t), t + SWITCH_ALERT_EVERY));
+    }
+
+    #[test]
+    fn an_unreadable_override_table_holds_every_location_off() {
+        let held = hold_all(default_locations());
+        assert!(!held.is_empty());
+        let still: Vec<&str> = held.iter().filter(|l| l.enabled).map(|l| l.name.as_str()).collect();
+        assert!(still.is_empty(), "{still:?}");
+        assert!(!crate::repo::missing_table(&sqlx::Error::PoolTimedOut), "an outage is not a missing table");
+        assert!(!crate::repo::missing_table(&sqlx::Error::RowNotFound));
     }
 }

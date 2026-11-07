@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -630,6 +631,30 @@ func (c *Client) listContainers(ctx context.Context, opts client.ContainerListOp
 	return res.Items, err
 }
 
+// listBackendContainers is the container list the backend readers
+// (RunningBackends, BackendLabels, FloatingBackendImages) share.
+//
+// A list error is an error, never an empty list. The one exception is a Mac
+// with no Docker at all (the agent there drives a native Metal ollama, see
+// NewClient): the daemon being absent is then a fact, "nothing runs in
+// docker", and failing every read would hide the native backends.
+func (c *Client) listBackendContainers(ctx context.Context) ([]container.Summary, error) {
+	containers, err := c.listContainers(ctx, client.ContainerListOptions{})
+	if err != nil {
+		if dockerAbsent(runtime.GOOS, pingDocker(c.docker)) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("listing containers: %w", err)
+	}
+	return containers, nil
+}
+
+// dockerAbsent: on darwin, an unanswering daemon means no Docker on this
+// host. On Linux an unanswering daemon is an outage, not an absence.
+func dockerAbsent(goos string, pingErr error) bool {
+	return goos == "darwin" && pingErr != nil
+}
+
 func (c *Client) listImages(ctx context.Context, opts client.ImageListOptions) ([]image.Summary, error) {
 	res, err := c.docker.ImageList(ctx, opts)
 	return res.Items, err
@@ -653,21 +678,29 @@ func (c *Client) StopBackend(ctx context.Context, backend string) error {
 
 // RunningBackends returns a map of backend_type -> model for all currently
 // running PAI backend containers.
-func (c *Client) RunningBackends(ctx context.Context) map[string]string {
+//
+// An error means "could not ask docker", which is NOT the same as "nothing is
+// running": a list error, or an inspect error on any one container, fails the
+// whole call (the partial map would read as that backend being down). Callers
+// must not act on the map when err != nil.
+func (c *Client) RunningBackends(ctx context.Context) (map[string]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	containers, err := c.listContainers(ctx, client.ContainerListOptions{})
+	containers, err := c.listBackendContainers(ctx)
 	if err != nil {
-		return map[string]string{}
+		return nil, err
 	}
 
 	backends := make(map[string]string)
 	for _, ctr := range containers {
+		if len(ctr.Names) == 0 {
+			continue
+		}
 		name := strings.TrimPrefix(ctr.Names[0], "/")
 		inspectRes, err := c.docker.ContainerInspect(ctx, ctr.ID, client.ContainerInspectOptions{})
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("inspecting container %s: %w", name, err)
 		}
 		inspect := inspectRes.Container
 
@@ -731,7 +764,7 @@ func (c *Client) RunningBackends(ctx context.Context) map[string]string {
 		}
 	}
 
-	return backends
+	return backends, nil
 }
 
 // backendKeyFromName maps a running container name to its backend key,
@@ -794,14 +827,14 @@ func backendKeyFromName(name string) string {
 // the map with an empty value) — the reconciler treats that as spec drift
 // once, to adopt the label. Reads labels straight off the container-list
 // summary (no per-container inspect).
-func (c *Client) BackendLabels(ctx context.Context, label string) map[string]string {
+func (c *Client) BackendLabels(ctx context.Context, label string) (map[string]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	out := map[string]string{}
-	containers, err := c.listContainers(ctx, client.ContainerListOptions{})
+	containers, err := c.listBackendContainers(ctx)
 	if err != nil {
-		return out
+		return nil, err
 	}
 	for _, ctr := range containers {
 		if len(ctr.Names) == 0 {
@@ -814,7 +847,7 @@ func (c *Client) BackendLabels(ctx context.Context, label string) map[string]str
 		}
 		out[key] = ctr.Labels[label]
 	}
-	return out
+	return out, nil
 }
 
 // FloatingBackendImages is, per running backend container, the ref it was
@@ -822,14 +855,14 @@ func (c *Client) BackendLabels(ctx context.Context, label string) map[string]str
 // `image_floating` judgement (imageFacts). A current agent refuses to create
 // such a container, so one running is a leftover from an older agent; the
 // reconciler recreates it from the pinned ref once, like a spec drift.
-func (c *Client) FloatingBackendImages(ctx context.Context) map[string]string {
+func (c *Client) FloatingBackendImages(ctx context.Context) (map[string]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	out := map[string]string{}
-	containers, err := c.listContainers(ctx, client.ContainerListOptions{})
+	containers, err := c.listBackendContainers(ctx)
 	if err != nil {
-		return out
+		return nil, err
 	}
 	for _, ctr := range containers {
 		if len(ctr.Names) == 0 {
@@ -843,7 +876,7 @@ func (c *Client) FloatingBackendImages(ctx context.Context) map[string]string {
 			out[key] = img
 		}
 	}
-	return out
+	return out, nil
 }
 
 // ContainerNames returns the names of all running containers.

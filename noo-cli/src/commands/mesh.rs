@@ -1225,6 +1225,22 @@ pub fn mesh_sync_assets(g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
         }
         return Ok(0);
     }
+    // i458 (b): the slice moves with the pin. This binary's slice belongs to
+    // a stack the install does not run yet, so `noo upgrade --stack` writes
+    // it when the pin moves; writing it now would put the new compose and
+    // scripts over the old images.
+    if let Some((pin, paired)) = crate::commands::upgrade::slice_waits_for_stack(&home) {
+        if g.json {
+            println!("{}", serde_json::json!({
+                "status":"deferred","action":"sync-assets","stack":pin,"paired":paired,
+            }));
+        } else {
+            ui::done(&format!(
+                "deploy slice kept at the stack's release ({pin}): this noo pairs with {paired}, and the stack stage writes its slice when the pin moves"));
+            ui::guide(&[("noo upgrade --stack", "moves the stack and its deploy slice together")]);
+        }
+        return Ok(0);
+    }
     match crate::onboard::standalone::materialize(&home) {
         Ok(report) => {
             if g.json {

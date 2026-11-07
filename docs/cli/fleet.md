@@ -660,6 +660,7 @@ the GPU and the mesh's, without lease ids to copy:
 noo cluster gpu mode awolf              # the current mode, and how long a hold has lasted
 noo cluster gpu mode awolf user         # drain, hold with purpose "user", wait until the GPU is free
 noo cluster gpu mode awolf mesh         # check the GPU is free, release with resume-now, wait until vLLM is warm
+noo cluster gpu mode awolf user --for 2h  # the same, and the node hands the GPU back after 2 hours
 ```
 
 The mode is read from the node's GPU lease, never stored: no lease and vLLM
@@ -674,6 +675,20 @@ lasted and how much of the GPU other work still uses.
   then waits up to 60 s for noomesh's own GPU memory to read 0 and prints
   `free_mb`; if it does not, the hold stays on and the output says the GPU
   is not confirmed free (`gpu_free_confirmed: false` in `--json`).
+- `user --for <duration>` (`30m`, `2h`, `1d`; 1 minute to 7 days) puts an
+  expiry on the lease. The expiry is kept by the node, so it holds across
+  an agent restart and a controller outage: at the deadline the node ends
+  the hold and returns to the automatic policy, which is **not** a
+  resume-now. vLLM starts only once the GPU has stayed free, so if your own
+  work is still on the GPU the node stays out of the mesh. An agent that
+  starts after the deadline ends the hold on its first tick. Without
+  `--for`, `user` is indefinite. Running `user --for` again on a node that is
+  already in `user` moves the expiry to that long from now, with no new
+  drain. `mesh` ends the hold and the timer with it, and `--for` on `mesh` or
+  on no mode exits 2. The show line and the `gpu` row of `verify` read
+  `until 17:40 UTC (in 80 min)`; `--json` carries `lease.expires_at`. An
+  agent older than `--for` ignores it and the output warns that the hold is
+  indefinite.
 - `mesh` first reads the node while vLLM is stopped, so `foreign_mb` and
   `free_mb` are clean readings of your own work. It refuses
   (`gpu_busy_by_other_work`, exit 1, hold left as it is) when `free_mb` is
@@ -753,7 +768,8 @@ way, and a workload that is not reserved answers 409.
 `generation` counts the node's accepted holds; while draining or held,
 `lease` carries `{owner, operation_id, generation, mode, reason, since,
 drain_started, drained_at}`, plus `workload` for a reservation and
-`purpose: "user"` for a hold marking the operator's own use of the GPU.
+`purpose: "user"` for a hold marking the operator's own use of the GPU, with
+`expires_at` when it was given a duration (`gpu mode user --for`).
 
 - `noo cluster status` prints `! host3: GPU in use by other work — vllm paused since <t> (foreign 11.2 GB)`.
 - `noo cluster verify host3` has a `control over bus` row: one `health` round
@@ -815,7 +831,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo cluster restart-agent` | `<node>` | Ask the gateway to restart a node's node-agent |
 | `noo cluster maintenance` | `<node> on --reason <text> [--until <duration>] \| <node> off \| list` | Mute a known-down node's operator alerts (operator-only); the daily summary still lists it |
 | `noo cluster gpu hold` | `<node> [--reason <text>] [--operation <id>] [--timeout <secs>] [--immediate] [--force]` | Drain, then pause a node's GPU backends, held as an owned lease until released (operator) |
-| `noo cluster gpu mode` | `<node> [user\|mesh] [--timeout <secs>] [--immediate] [--wait <secs>] [--no-wait]` | Show a node's GPU mode, or switch it: user (GPU free for you) or mesh (vLLM back, warm) |
+| `noo cluster gpu mode` | `<node> [user\|mesh] [--timeout <secs>] [--immediate] [--for <time>] [--wait <secs>] [--no-wait]` | Show a node's GPU mode, or switch it: user (GPU yours; --for times it) or mesh (vLLM back) |
 | `noo cluster gpu release` | `<node> [--operation <id> --generation <n>] [--force] [--now]` | End a GPU hold by its lease (or any with --force); backends resume when free, or now |
 | `noo cluster reserve` | `<addon>/<workload> [--node <node>] [--hand-over <reservation-id>] [--timeout <secs>]` | Reserve a GPU for an add-on workload: drain the pool there, pause it, start the workload |
 | `noo cluster reservations` | — | List the GPU reservations the nodes hold: id, workload, holder, node, state |

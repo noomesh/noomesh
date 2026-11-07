@@ -19,7 +19,7 @@
 //!
 //! State machine: `open → running ⇄ checkpointed → done | failed | stopped`.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -41,17 +41,16 @@ pub fn cluster_loop_budget() -> u32 {
         .unwrap_or(DEFAULT_LOOP_BUDGET)
 }
 
-/// A node's default loop budget, from its config row, if set.
-pub async fn node_loop_budget(db: &sqlx::PgPool, node: &str) -> Option<u32> {
-    sqlx::query_scalar::<_, Option<i32>>("SELECT default_loop_budget FROM noo_node_config WHERE node_id = $1")
+/// A node's default loop budget, from its config row, if set. A database
+/// error is `Err`, never "not set": that ran the task under the cluster
+/// default instead of the node's declared (possibly stricter) budget.
+pub async fn node_loop_budget(db: &sqlx::PgPool, node: &str) -> Result<Option<u32>> {
+    let b = sqlx::query_scalar::<_, Option<i32>>("SELECT default_loop_budget FROM noo_node_config WHERE node_id = $1")
         .bind(node)
         .fetch_optional(db)
         .await
-        .ok()
-        .flatten()
-        .flatten()
-        .filter(|b| *b > 0)
-        .map(|b| b as u32)
+        .with_context(|| format!("cannot read node '{node}' loop budget"))?;
+    Ok(b.flatten().filter(|b| *b > 0).map(|b| b as u32))
 }
 
 /// The subject a node's harness takes tasks on.
@@ -352,7 +351,7 @@ pub async fn apply_node_budget(db: &sqlx::PgPool, task: &Task, node: &str) -> Re
     if !task.budget_default {
         return Ok(task.loop_budget);
     }
-    let Some(b) = node_loop_budget(db, node).await else { return Ok(task.loop_budget) };
+    let Some(b) = node_loop_budget(db, node).await? else { return Ok(task.loop_budget) };
     let uuid = uuid::Uuid::parse_str(&task.id)?;
     crate::repo::tasks::set_loop_budget_if_default(db, uuid, b as i32).await?;
     Ok(b)
@@ -1090,7 +1089,7 @@ pub async fn start(state: &std::sync::Arc<AppState>, task: &Task) -> Result<Star
         if let Some(role) = crate::coordinator::role_of(state, owner).await {
             let ttl = crate::coordinator::turn_deadline().as_secs() + 60;
             if let Some(token) = crate::auth::mint_harness_jwt(owner, role, &node, &task.conversation_id, ttl) {
-                let loop_budget = apply_node_budget(&state.db, task, &node).await.unwrap_or(task.loop_budget);
+                let loop_budget = apply_node_budget(&state.db, task, &node).await?;
                 let req = TaskRequest {
                     task_id: task.id.clone(),
                     objective: task.objective.clone(),
@@ -1149,8 +1148,10 @@ pub async fn start(state: &std::sync::Arc<AppState>, task: &Task) -> Result<Star
     }
     // In process: the controller's own harness.
     let here = crate::agent_messages::controller_node();
+    // The budget first: an unreadable one fails the start before the task
+    // is marked running, not after.
+    let loop_budget = apply_node_budget(&state.db, task, &here).await?;
     mark_running(&state.db, &task.id, Some(&here)).await?;
-    let loop_budget = apply_node_budget(&state.db, task, &here).await.unwrap_or(task.loop_budget);
     let req = TaskRequest {
         task_id: task.id.clone(),
         objective: task.objective.clone(),
@@ -1499,15 +1500,16 @@ mod tests {
         assert_eq!(queue_recheck_after(&env(Some("5"))).as_secs(), 60, "at least a minute");
         assert_eq!(queue_recheck_after(&env(Some("later"))).as_secs(), 600);
 
-        let src = include_str!("tasks.rs").split("mod tests {").next().unwrap();
-        let sweep = src.split("pub fn spawn_stale_sweep(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("tasks.rs"));
+        let sweep = crate::test_src::fn_body(&own, "pub fn spawn_stale_sweep(");
         assert!(sweep.contains("offer_waiting_again(&state).await;"), "the sweep offers queued tasks again");
-        let list = include_str!("repo/tasks.rs").split("pub async fn waiting_ids<").nth(1).unwrap().split("\n}\n").next().unwrap();
-        assert!(src.split("async fn list_waiting(").nth(1).unwrap().contains("crate::repo::tasks::waiting_ids(db, older_than.as_secs_f64())"));
+        let repo = crate::test_src::own_code(include_str!("repo/tasks.rs"));
+        let list = crate::test_src::fn_body(&repo, "pub async fn waiting_ids<");
+        assert!(own.split("async fn list_waiting(").nth(1).unwrap().contains("crate::repo::tasks::waiting_ids(db, older_than.as_secs_f64())"));
         for clause in ["state = 'open'", "node IS NOT NULL", "budget_state IS NULL", "loop_budget > 0", "updated_at < now() - make_interval(secs => $1)"] {
             assert!(list.contains(clause), "{clause}");
         }
-        let offer = src.split("async fn offer_waiting_again(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let offer = crate::test_src::fn_body(&own, "async fn offer_waiting_again(");
         assert!(offer.contains("start(state, &t).await"), "the offer goes through start's rules");
     }
 

@@ -425,7 +425,13 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 	_ = r.Body.Close()
 
 	headerHint := r.Header.Get("X-Noo-Backend")
-	running := s.docker.RunningBackends(r.Context())
+	running, err := s.docker.RunningBackends(r.Context())
+	if err != nil {
+		slog.Warn("docker.running_backends_failed", "error", err)
+		jsonError(w, http.StatusServiceUnavailable, "docker_unavailable",
+			"docker unavailable: could not list running backends: "+err.Error())
+		return
+	}
 	// Backends served natively on this host (darwin/Metal) are reachable and
 	// must be selectable. Docker's map wins a key collision: if something is
 	// genuinely running in a container under that name, that is what the
@@ -1248,7 +1254,13 @@ func (s *Server) embedProxyBody(w http.ResponseWriter, r *http.Request, body []b
 // so existing OpenAI clients (LangChain, LlamaIndex, etc.) work
 // unchanged when pointed at node-agent.
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
-	running := s.docker.RunningBackends(r.Context())
+	running, err := s.docker.RunningBackends(r.Context())
+	if err != nil {
+		slog.Warn("docker.running_backends_failed", "error", err)
+		jsonError(w, http.StatusServiceUnavailable, "docker_unavailable",
+			"docker unavailable: could not list running backends: "+err.Error())
+		return
+	}
 	type modelEntry struct {
 		ID      string `json:"id"`
 		Object  string `json:"object"`

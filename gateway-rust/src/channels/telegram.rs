@@ -590,7 +590,7 @@ mod tests {
     #[test]
     fn the_approval_target_uses_the_real_chat_type() {
         let src = include_str!("telegram.rs");
-        let code = &src[..src.find("#[cfg(test)]").unwrap()];
+        let code = &crate::test_src::own_code(src);
         assert!(!code.contains("chat_type: \"private\".to_string()"));
         assert!(code.contains("chat_type: parsed.chat_type.clone()"));
     }

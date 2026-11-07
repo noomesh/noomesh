@@ -11,17 +11,21 @@
 //! bearer.
 //!
 //! Self-contained: an in-process mock gateway (`std::net::TcpListener`,
-//! ephemeral port, canned HTTP/1.1 responses) + the compiled binary via
+//! ephemeral port, TLS with a throwaway CA minted once per run, canned
+//! HTTP/1.1 responses) + the compiled binary via
 //! `CARGO_BIN_EXE_noo`. No Python, no external tools, no real stack — so it
 //! runs under plain `cargo test` in CI. Deferred
 //! breadth: POST/PUT/DELETE, streaming, per-command envelopes.
 
 #[path = "common/scratch_dir.rs"]
 mod scratch_dir;
+#[path = "common/test_tls.rs"]
+mod test_tls;
+use test_tls::{test_tls, tls_accept, tls_reply};
 use scratch_dir::ScratchDir;
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::process::{Command, Output};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -44,10 +48,25 @@ impl Mock {
         Mock::start_seq(vec![http_response(status, reason, ctype, body); count])
     }
 
+    /// A mock Hugging Face API: plain http, because the HF client is not a
+    /// gateway client. It does not go through the CLI's gateway trust (no
+    /// `NOO_TLS_CA`, the public roots only), and `HF_ENDPOINT` is the
+    /// standard huggingface_hub override, which may name an http mirror. Point
+    /// `HF_ENDPOINT` at it with [`hf_url`].
+    fn start_hf(status: u16, reason: &str, ctype: &str, body: &str, count: usize) -> Mock {
+        Mock::serve(vec![http_response(status, reason, ctype, body); count], false)
+    }
+
     /// Serve one pre-rendered HTTP response per connection, in order —
     /// for poll-loop commands whose successive fetches must differ
     /// (e.g. `memory embed-status --watch`: running → running → idle).
     fn start_seq(responses: Vec<String>) -> Mock {
+        Mock::serve(responses, true)
+    }
+
+    /// `tls`: the mock gateway serves TLS (the CLI has no plain-http gateway
+    /// lane, 1242 finding 7); a mock HF API does not.
+    fn serve(responses: Vec<String>, tls: bool) -> Mock {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let port = listener.local_addr().unwrap().port();
         let handle = thread::spawn(move || {
@@ -74,12 +93,19 @@ impl Mock {
                         Err(_) => break None,
                     }
                 };
-                let Some(stream) = stream.as_mut() else { break };
-                stream.set_nonblocking(false).ok();
-                stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-                captured.push(read_request(stream));
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
+                let Some(tcp) = stream.take() else { break };
+                if !tls {
+                    let mut tcp = tcp;
+                    tcp.set_nonblocking(false).ok();
+                    tcp.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    captured.push(read_request(&mut tcp));
+                    let _ = tcp.write_all(response.as_bytes());
+                    let _ = tcp.flush();
+                    continue;
+                }
+                let Some(mut stream) = tls_accept(tcp) else { break };
+                captured.push(read_request(&mut stream));
+                tls_reply(&mut stream, &response);
             }
             captured
         });
@@ -108,7 +134,7 @@ fn ok_json(body: &str) -> String {
 /// Read a full HTTP request: headers, then — when a Content-Length header is
 /// present (POST/PUT bodies) — the body too, so tests can assert payloads and
 /// the client never sees a reset while still writing.
-fn read_request(stream: &mut TcpStream) -> String {
+fn read_request<S: Read>(stream: &mut S) -> String {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     let mut body_expected: Option<usize> = None;
@@ -176,6 +202,9 @@ fn run(args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     // ~/.config/mesh/credentials.json on the dev machine can never leak into
     // a test run. Set BEFORE extra_env so cases can override it.
     cmd.env("NOO_CREDENTIALS_FILE", "/nonexistent/noo-test/credentials.json");
+    // Trust the mock gateways' throwaway CA (removed above, so a dev box's
+    // value never decides a case). Before extra_env so a case may override.
+    cmd.env("NOO_TLS_CA", &test_tls().ca_path);
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -209,6 +238,7 @@ fn run_with_stdin_env(args: &[&str], input: &str, extra_env: &[(&str, &str)]) ->
         cmd.env_remove(k);
     }
     cmd.env("NOO_CREDENTIALS_FILE", "/nonexistent/noo-test/credentials.json");
+    cmd.env("NOO_TLS_CA", &test_tls().ca_path);
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -223,6 +253,12 @@ fn run_with_stdin_env(args: &[&str], input: &str, extra_env: &[(&str, &str)]) ->
 }
 
 fn gw(port: u16) -> String {
+    format!("https://127.0.0.1:{port}")
+}
+
+/// `HF_ENDPOINT` for a [`Mock::start_hf`] mock (plain http: HF is not a
+/// gateway, see `start_hf`).
+fn hf_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
@@ -491,7 +527,7 @@ fn jobs_submit_gateway_local_type_reports_running() {
 /// `jobs submit --payload` with invalid JSON: local error, exit 1, no request.
 #[test]
 fn jobs_submit_invalid_payload_exits_one() {
-    let out = run(&["--gateway", "http://127.0.0.1:1", "jobs", "submit", "--payload", "{nope"], &[]);
+    let out = run(&["--gateway", "https://127.0.0.1:1", "jobs", "submit", "--payload", "{nope"], &[]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("Invalid JSON in --payload"));
 }
@@ -524,7 +560,7 @@ fn jobs_cancel_yes_deletes() {
 /// no request made (agent-first confirm contract).
 #[test]
 fn jobs_cancel_without_yes_refuses_on_pipe() {
-    let out = run(&["--gateway", "http://127.0.0.1:1", "jobs", "cancel", "j3"], &[]);
+    let out = run(&["--gateway", "https://127.0.0.1:1", "jobs", "cancel", "j3"], &[]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).to_lowercase().contains("confirmation required"));
 }
@@ -716,7 +752,7 @@ fn agents_collaborate_posts_and_renders_results() {
 fn agents_collaborate_refuses_the_flags_the_gateway_ignored() {
     // Closed port: refusing happens before any request.
     for flag in ["-w", "--workflow", "-m", "--mode"] {
-        let out = run(&["--gateway", "http://127.0.0.1:1", "agents", "collaborate", "t", flag, "x"], &[]);
+        let out = run(&["--gateway", "https://127.0.0.1:1", "agents", "collaborate", "t", flag, "x"], &[]);
         assert_eq!(out.status.code(), Some(2), "{flag}: stderr: {}", String::from_utf8_lossy(&out.stderr));
         assert!(String::from_utf8_lossy(&out.stderr).contains("no longer takes"), "{flag}");
     }
@@ -837,7 +873,7 @@ fn inference_agent_posts_agent_run_and_renders() {
 #[test]
 fn inference_agent_refuses_flags_the_route_ignores() {
     for flag in [&["--max-iters", "3"][..], &["--no-tools"][..], &["-m", "x"][..]] {
-        let mut args = vec!["--gateway", "http://127.0.0.1:1", "inference", "agent", "hi"];
+        let mut args = vec!["--gateway", "https://127.0.0.1:1", "inference", "agent", "hi"];
         args.extend_from_slice(flag);
         let out = run(&args, &[]);
         assert_eq!(out.status.code(), Some(2), "{flag:?} must be refused, not ignored");
@@ -912,7 +948,7 @@ fn prompt_skills_decide_posts_the_decision_and_needs_exactly_one_verdict() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("Promoted 'my-skill'"));
     // Neither or both verdicts: a usage error before any request.
     for extra in [&["7"][..], &["7", "--promote", "--reject"]] {
-        let mut argv = vec!["--gateway", "http://127.0.0.1:9", "prompt-skills", "decide"];
+        let mut argv = vec!["--gateway", "https://127.0.0.1:9", "prompt-skills", "decide"];
         argv.extend_from_slice(extra);
         assert_eq!(run(&argv, &[]).status.code(), Some(2));
     }
@@ -950,7 +986,7 @@ fn prompt_skills_create_missing_file_exits_one() {
     let out = run(
         &[
             "--gateway",
-            "http://127.0.0.1:1", // never contacted — the file check fails first
+            "https://127.0.0.1:1", // never contacted — the file check fails first
             "prompt-skills",
             "create",
             "my-skill",
@@ -1171,7 +1207,7 @@ fn recall_lifecycle_dry_run_gets_preview() {
 fn recall_prune_commands_refuse_without_yes_and_send_nothing() {
     for verb in ["lifecycle", "refresh"] {
         // Closed port: a request would exit 3; stdin is not a terminal here.
-        let out = run(&["--gateway", "http://127.0.0.1:1", "recall", verb], &[]);
+        let out = run(&["--gateway", "https://127.0.0.1:1", "recall", verb], &[]);
         assert_eq!(out.status.code(), Some(1), "{verb}: stderr: {}", String::from_utf8_lossy(&out.stderr));
         assert!(String::from_utf8_lossy(&out.stderr).to_lowercase().contains("confirmation required"), "{verb}");
     }
@@ -1197,10 +1233,10 @@ fn recall_lifecycle_stats_is_a_working_hidden_alias() {
 
 #[test]
 fn rag_deduplicate_confirms_and_dry_run_sends_nothing() {
-    let out = run(&["--gateway", "http://127.0.0.1:1", "rag", "deduplicate"], &[]);
+    let out = run(&["--gateway", "https://127.0.0.1:1", "rag", "deduplicate"], &[]);
     assert_eq!(out.status.code(), Some(1), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stderr).to_lowercase().contains("confirmation required"));
-    let out = run(&["--gateway", "http://127.0.0.1:1", "rag", "deduplicate", "--dry-run"], &[]);
+    let out = run(&["--gateway", "https://127.0.0.1:1", "rag", "deduplicate", "--dry-run"], &[]);
     assert_eq!(out.status.code(), Some(0), "dry-run must not contact the gateway");
     let mock = Mock::start(200, "OK", "application/json", r#"{"removed":4}"#, 1);
     let out = run(&["--gateway", &gw(mock.port), "rag", "deduplicate", "-y"], &[]);
@@ -1218,7 +1254,7 @@ fn memory_embed_error_reply_is_not_started_and_tuning_flags_are_refused() {
     assert!(!String::from_utf8_lossy(&out.stdout).contains("started"));
     assert!(String::from_utf8_lossy(&out.stderr).contains("Redis unavailable"));
     for flag in ["-b", "--batch-size", "-g", "--model"] {
-        let out = run(&["--gateway", "http://127.0.0.1:1", "memory", "embed", flag, "5"], &[]);
+        let out = run(&["--gateway", "https://127.0.0.1:1", "memory", "embed", flag, "5"], &[]);
         assert_eq!(out.status.code(), Some(2), "{flag}");
     }
 }
@@ -1398,7 +1434,7 @@ fn skills_run_posts_to_the_gateway_and_sends_no_agent_token() {
         &[
             // A dead agent address and a planted token: if either were
             // used, the run would fail or the token would show on the wire.
-            ("NOO_NODE_AGENT_URL", "http://127.0.0.1:1"),
+            ("NOO_NODE_AGENT_URL", "https://127.0.0.1:1"),
             ("NOO_NODE_AGENT_TOKEN", PLANTED_AGENT_TOKEN),
         ],
     );
@@ -1543,7 +1579,7 @@ fn chat_repl_without_tty_errors_instead_of_hanging() {
 #[test]
 fn break_glass_is_refused_by_name_and_no_secret_is_ever_sent() {
     let out = run(
-        &["--gateway", "http://127.0.0.1:1", "--break-glass", "heartbeat", "status"],
+        &["--gateway", "https://127.0.0.1:1", "--break-glass", "heartbeat", "status"],
         &[("NOO_CLUSTER_SECRET", "s"), ("NOO_CONTROLLER_SECRET", "c")],
     );
     assert_eq!(out.status.code(), Some(2), "a removed flag is a usage error");
@@ -1589,7 +1625,7 @@ fn dead_url() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
-    format!("http://127.0.0.1:{port}")
+    format!("https://127.0.0.1:{port}")
 }
 
 #[test]
@@ -1618,12 +1654,12 @@ fn models_list_offline_falls_back_to_curated_catalog() {
 #[test]
 fn models_search_queries_hf_and_normalizes() {
     let hf_body = r#"[{"modelId":"meta-llama/Llama-3.1-8B-Instruct","tags":["awq","text-generation"],"downloads":3000000,"likes":120,"gated":false}]"#;
-    let mock = Mock::start(200, "OK", "application/json", hf_body, 1);
+    let mock = Mock::start_hf(200, "OK", "application/json", hf_body, 1);
     let home_dir = temp_home("search");
     let home = home_dir.to_string_lossy().into_owned();
     let out = run(
         &["--json", "models", "search", "llama"],
-        &[("HOME", &home), ("HF_ENDPOINT", &gw(mock.port))],
+        &[("HOME", &home), ("HF_ENDPOINT", &hf_url(mock.port))],
     );
     let reqs = mock.requests();
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
@@ -1644,12 +1680,12 @@ fn models_search_queries_hf_and_normalizes() {
 #[test]
 fn models_info_renders_gated_badge_and_hint() {
     let hf_body = r#"{"id":"meta-llama/Llama-3.1-8B-Instruct","author":"meta-llama","gated":"manual","downloads":3000000,"likes":12345,"tags":["safetensors"],"siblings":[{"rfilename":"model.safetensors"}],"cardData":{"license":"llama3.1"}}"#;
-    let mock = Mock::start(200, "OK", "application/json", hf_body, 1);
+    let mock = Mock::start_hf(200, "OK", "application/json", hf_body, 1);
     let home_dir = temp_home("info");
     let home = home_dir.to_string_lossy().into_owned();
     let out = run(
         &["models", "info", "meta-llama/Llama-3.1-8B-Instruct"],
-        &[("HOME", &home), ("HF_ENDPOINT", &gw(mock.port))],
+        &[("HOME", &home), ("HF_ENDPOINT", &hf_url(mock.port))],
     );
     let _ = mock.requests();
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
@@ -1675,12 +1711,12 @@ fn models_info_renders_gated_badge_and_hint() {
 
 #[test]
 fn models_info_not_found_exits_1() {
-    let mock = Mock::start(404, "Not Found", "application/json", r#"{"error":"unknown"}"#, 1);
+    let mock = Mock::start_hf(404, "Not Found", "application/json", r#"{"error":"unknown"}"#, 1);
     let home_dir = temp_home("info404");
     let home = home_dir.to_string_lossy().into_owned();
     let out = run(
         &["models", "info", "nope/not-a-model"],
-        &[("HOME", &home), ("HF_ENDPOINT", &gw(mock.port))],
+        &[("HOME", &home), ("HF_ENDPOINT", &hf_url(mock.port))],
     );
     let _ = mock.requests();
     assert_eq!(out.status.code(), Some(1), "HF 404 must map to Generic(1)");
@@ -1725,12 +1761,12 @@ fn models_recommended_rejects_invalid_tier() {
 
 #[test]
 fn models_huggingface_uses_default_query() {
-    let mock = Mock::start(200, "OK", "application/json", "[]", 1);
+    let mock = Mock::start_hf(200, "OK", "application/json", "[]", 1);
     let home_dir = temp_home("hf");
     let home = home_dir.to_string_lossy().into_owned();
     let out = run(
         &["--json", "models", "huggingface"],
-        &[("HOME", &home), ("HF_ENDPOINT", &gw(mock.port))],
+        &[("HOME", &home), ("HF_ENDPOINT", &hf_url(mock.port))],
     );
     let reqs = mock.requests();
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
@@ -2146,11 +2182,10 @@ impl RouterMock {
         let handle = thread::spawn(move || {
             let mut captured = Vec::new();
             for _ in 0..count {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(s) => s,
-                    Err(_) => break,
+                let mut stream = match listener.accept().ok().and_then(|(s, _)| tls_accept(s)) {
+                    Some(s) => s,
+                    None => break,
                 };
-                stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
                 let req = read_request(&mut stream);
                 let first_line = req.lines().next().unwrap_or("").to_string();
                 let (status, body) = routes
@@ -2163,8 +2198,7 @@ impl RouterMock {
                     "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
+                tls_reply(&mut stream, &response);
             }
             captured
         });
@@ -2214,6 +2248,7 @@ fn run_local(args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     ] {
         cmd.env_remove(k);
     }
+    cmd.env("NOO_TLS_CA", &test_tls().ca_path);
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -2487,7 +2522,7 @@ fn cluster_seed_dry_run_makes_no_requests() {
 #[test]
 fn cluster_seed_missing_file_errors() {
     let out = run(
-        &["--gateway", "http://127.0.0.1:1", "cluster", "seed", "-f", "/nonexistent/seed.yaml"],
+        &["--gateway", "https://127.0.0.1:1", "cluster", "seed", "-f", "/nonexistent/seed.yaml"],
         &[],
     );
     assert_eq!(out.status.code(), Some(1));
@@ -3147,12 +3182,12 @@ fn models_refresh_bypasses_ttl_and_writes_python_shaped_cache() {
     )
     .unwrap();
 
-    let mock = Mock::start(200, "OK", "application/json", HF_LLAMA_GGUF, 1);
+    let mock = Mock::start_hf(200, "OK", "application/json", HF_LLAMA_GGUF, 1);
     let out = run(
         &["--json", "models", "refresh", "--backend", "llamacpp"],
         &[
             ("HOME", &home),
-            ("HF_ENDPOINT", &gw(mock.port)),
+            ("HF_ENDPOINT", &hf_url(mock.port)),
             ("NOO_MODEL_VENDORS", "llama"),
         ],
     );
@@ -3252,7 +3287,7 @@ fn models_refresh_reads_python_written_cache_back() {
 fn models_refresh_llm_posts_coordinator_eval_and_stores_in_cache() {
     let home_dir = temp_home("refreshllm");
     let home = home_dir.to_string_lossy().into_owned();
-    let hf = Mock::start(200, "OK", "application/json", HF_LLAMA_GGUF, 1);
+    let hf = Mock::start_hf(200, "OK", "application/json", HF_LLAMA_GGUF, 1);
     // The coordinator's reply embeds the JSON array in prose — the parser
     // must take first-'['..last-']' (Python's greedy `\[.*\]` DOTALL).
     let gw_body = r#"{"response":"Here is my analysis:\n[{\"id\": \"bartowski/Llama-3.2-3B-Instruct-GGUF\", \"tool_parser\": \"llama3_json\", \"tool_calling\": true, \"reasoning\": false, \"agentic_quality\": \"good\"}]\nDone."}"#;
@@ -3270,7 +3305,7 @@ fn models_refresh_llm_posts_coordinator_eval_and_stores_in_cache() {
         ],
         &[
             ("HOME", &home),
-            ("HF_ENDPOINT", &gw(hf.port)),
+            ("HF_ENDPOINT", &hf_url(hf.port)),
             ("NOO_MODEL_VENDORS", "llama"),
         ],
     );
@@ -3316,7 +3351,7 @@ fn models_refresh_llm_gateway_down_is_best_effort() {
     // try/except-pass).
     let home_dir = temp_home("refreshllmdown");
     let home = home_dir.to_string_lossy().into_owned();
-    let hf = Mock::start(200, "OK", "application/json", HF_LLAMA_GGUF, 1);
+    let hf = Mock::start_hf(200, "OK", "application/json", HF_LLAMA_GGUF, 1);
     let dead = dead_url();
     let out = run(
         &[
@@ -3331,7 +3366,7 @@ fn models_refresh_llm_gateway_down_is_best_effort() {
         ],
         &[
             ("HOME", &home),
-            ("HF_ENDPOINT", &gw(hf.port)),
+            ("HF_ENDPOINT", &hf_url(hf.port)),
             ("NOO_MODEL_VENDORS", "llama"),
         ],
     );
@@ -3403,7 +3438,7 @@ fn mock_hub_exchange() -> Vec<String> {
 /// stack-v0.2.40), so the mock stands in for the gateway.
 fn mcp_env(port: u16, token: &str) -> Vec<(&'static str, String)> {
     vec![
-        ("NOO_GATEWAY_URL", format!("http://127.0.0.1:{port}")),
+        ("NOO_GATEWAY_URL", format!("https://127.0.0.1:{port}")),
         ("NOO_MCP_KEY", token.to_string()),
     ]
 }
@@ -3455,7 +3490,7 @@ fn mcp_tools_json_prints_raw_tools_list_result() {
 fn mcp_tools_never_sends_the_retired_shared_token() {
     let mock = Mock::start_seq(mock_hub_exchange());
     let env = [
-        ("NOO_GATEWAY_URL", format!("http://127.0.0.1:{}", mock.port)),
+        ("NOO_GATEWAY_URL", format!("https://127.0.0.1:{}", mock.port)),
         ("NOO_MCP_KEY", String::new()),
         ("NOO_MCP_TOKEN", "legacy-shared-tok".to_string()),
     ];
@@ -3604,7 +3639,7 @@ fn temp_credentials(tag: &str, access: &str, expires_at: u64, refresh: Option<&s
     let path = dir.join("credentials.json");
     let body = serde_json::json!({
         "version": 1,
-        "gateway": "http://127.0.0.1:1",
+        "gateway": "https://127.0.0.1:1",
         "subject": "alice",
         "scopes": ["read", "write"],
         "access_token": access,
@@ -4036,6 +4071,7 @@ fn a_concurrent_refresh_is_not_spent_twice() {
         .env_remove("NOO_TOKEN")
         .env_remove("NOO_CLUSTER_SECRET")
         .env_remove("NOO_GATEWAY_URL")
+        .env("NOO_TLS_CA", &test_tls().ca_path)
         .env("NOO_CREDENTIALS_FILE", creds.to_str().unwrap())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -4047,7 +4083,7 @@ fn a_concurrent_refresh_is_not_spent_twice() {
     thread::sleep(Duration::from_millis(400));
     let rotated = serde_json::json!({
         "version": 1,
-        "gateway": "http://127.0.0.1:1",
+        "gateway": "https://127.0.0.1:1",
         "subject": "alice",
         "scopes": ["read", "write"],
         "access_token": "winner-token",
@@ -4170,7 +4206,7 @@ fn auth_status_reports_the_resolved_source_offline() {
     let creds = temp_credentials("status", "file-token", far_future(), Some("r"));
     let port = closed_port().to_string();
     let out = run(
-        &["--json", "--gateway", &format!("http://127.0.0.1:{port}"), "auth", "status"],
+        &["--json", "--gateway", &format!("https://127.0.0.1:{port}"), "auth", "status"],
         &[("NOO_CREDENTIALS_FILE", creds.to_str().unwrap())],
     );
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
@@ -4193,7 +4229,7 @@ fn auth_status_reports_expiry_and_whether_it_will_auto_refresh() {
     let creds = temp_credentials("statusexp", "file-token", far_future(), Some("r"));
     let port = closed_port().to_string();
     let out = run(
-        &["--json", "--gateway", &format!("http://127.0.0.1:{port}"), "auth", "status"],
+        &["--json", "--gateway", &format!("https://127.0.0.1:{port}"), "auth", "status"],
         &[("NOO_CREDENTIALS_FILE", creds.to_str().unwrap())],
     );
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
@@ -4217,7 +4253,7 @@ fn auth_status_reports_an_unknown_expiry_as_unknown() {
     let creds = temp_credentials("statusunknown", "file-token", 0, None);
     let port = closed_port().to_string();
     let out = run(
-        &["--json", "--gateway", &format!("http://127.0.0.1:{port}"), "auth", "status"],
+        &["--json", "--gateway", &format!("https://127.0.0.1:{port}"), "auth", "status"],
         &[("NOO_CREDENTIALS_FILE", creds.to_str().unwrap())],
     );
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
@@ -4239,7 +4275,7 @@ fn auth_status_with_only_a_secret_is_no_credential() {
     // shared secret is not a CLI credential.
     let port = closed_port().to_string();
     let none = run(
-        &["--json", "--gateway", &format!("http://127.0.0.1:{port}"), "auth", "status"],
+        &["--json", "--gateway", &format!("https://127.0.0.1:{port}"), "auth", "status"],
         &[("NOO_CLUSTER_SECRET", "s"), ("NOO_CONTROLLER_SECRET", "c"), ("NOO_BREAK_GLASS", "1")],
     );
     let nv: serde_json::Value =
@@ -4271,7 +4307,7 @@ fn auth_logout_revokes_server_side_then_removes_the_file() {
 fn auth_logout_with_nothing_stored_is_a_clean_no_op() {
     let port = closed_port().to_string();
     let out = run(
-        &["--json", "--gateway", &format!("http://127.0.0.1:{port}"), "auth", "logout"],
+        &["--json", "--gateway", &format!("https://127.0.0.1:{port}"), "auth", "logout"],
         &[],
     );
     assert_eq!(out.status.code(), Some(0));
@@ -5077,4 +5113,56 @@ fn agents_archive_decrypt_refused_by_the_gateway_writes_nothing() {
     let _ = mock.requests();
     assert_ne!(out.status.code(), Some(0));
     assert!(!out_path.exists(), "a refused decrypt must not leave a file");
+}
+
+// ── HF_ENDPOINT: https, or http to this machine only (noomesh-internal i445) ──
+
+/// A non-loopback address of this machine, so a plain-http HF_ENDPOINT can
+/// point at a real listener that is NOT loopback. The UDP connect sends
+/// nothing; it only asks the kernel which source address it would use.
+fn non_loopback_ip() -> std::net::IpAddr {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").expect("udp bind");
+    s.connect("192.0.2.1:9").expect("a route off this box (TEST-NET-1)");
+    let ip = s.local_addr().expect("local addr").ip();
+    assert!(!ip.is_loopback() && !ip.is_unspecified(), "this test needs a non-loopback address, got {ip}");
+    ip
+}
+
+#[test]
+fn a_plain_http_hf_endpoint_off_this_machine_is_refused_and_nothing_is_sent() {
+    let ip = non_loopback_ip();
+    let listener = TcpListener::bind((ip, 0)).expect("bind the non-loopback address");
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{ip}:{port}");
+    let home_dir = temp_home("hf-refused");
+    let home = home_dir.to_string_lossy().into_owned();
+    let store = home_dir.join("models");
+    std::fs::create_dir_all(&store).unwrap();
+    let store = store.to_string_lossy().into_owned();
+
+    for args in [
+        vec!["--json", "models", "fetch", "org/name", "model.gguf"],
+        vec!["--json", "models", "search", "llama"],
+        vec!["--json", "models", "info", "org/name"],
+    ] {
+        let out = run(
+            &args,
+            &[
+                ("HOME", &home),
+                ("HF_ENDPOINT", &endpoint),
+                ("HF_TOKEN", "hf_planted_must_not_leave"),
+                ("MODELS_DIR", &store),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?} must be refused as a usage error: {stderr}");
+        assert!(stderr.contains("hf_endpoint_refused") && stderr.contains("HF_ENDPOINT="), "{args:?}: {stderr}");
+        assert!(!stderr.contains("hf_planted_must_not_leave"), "{args:?} printed the token: {stderr}");
+    }
+    // Nothing reached the listener: no connection, so no token on any wire.
+    match listener.accept() {
+        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("a request reached the refused endpoint: {other:?}"),
+    }
 }

@@ -2224,11 +2224,8 @@ eth0\t000014AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
     /// `noo_config_set` reaches — a gate the model can rewrite is not a gate.
     #[test]
     fn exec_approval_mode_reads_no_yaml() {
-        let src = include_str!("middleware.rs");
-        let start = src
-            .find("pub fn exec_approval_mode() -> String {")
-            .expect("resolver not found — did it get renamed?");
-        let body = &src[start..start + src[start..].find("\n}").expect("unterminated")];
+        let own = crate::test_src::own_code(include_str!("middleware.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn exec_approval_mode(");
         assert!(
             !body.contains("config_yaml") && !body.contains("\"security\""),
             "exec_approval_mode consults the YAML again:\n{body}"
@@ -2387,8 +2384,8 @@ mod csp_default_tests {
     /// The handler reads the choice, and the framing header stays alongside.
     #[test]
     fn security_headers_uses_the_choice_and_keeps_x_frame_options() {
-        let src = include_str!("middleware.rs");
-        let body = src.split("pub async fn security_headers(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("middleware.rs"));
+        let body = crate::test_src::fn_body(&own, "pub async fn security_headers(");
         assert!(body.contains("csp_choice(csp_env.as_deref())"));
         assert!(body.contains("X_FRAME_OPTIONS"));
     }
@@ -2399,8 +2396,8 @@ mod csp_default_tests {
     /// running gateway; it is gone, and no variable can switch HSTS off.
     #[tokio::test]
     async fn hsts_is_sent_with_no_env() {
-        let src = include_str!("middleware.rs");
-        let body = src.split("pub async fn security_headers(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let own = crate::test_src::own_code(include_str!("middleware.rs"));
+        let body = crate::test_src::fn_body(&own, "pub async fn security_headers(");
         let code: String = body.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
         assert!(!code.contains("NOO_TLS_CERT"), "HSTS is conditional on an env var again");
 

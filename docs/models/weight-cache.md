@@ -200,7 +200,9 @@ What it does, in order:
 - **Authenticates with the controller's Hugging Face token**: `HF_TOKEN` (or
   `HUGGING_FACE_HUB_TOKEN`) from the process environment, else from the
   encrypted store `secrets/env.sops`. The token is sent only as an
-  `Authorization` header to the Hugging Face origin (`HF_ENDPOINT` if set).
+  `Authorization` header to the Hugging Face origin (`HF_ENDPOINT` if set,
+  which must be `https://`, or `http://` to this machine only; anything else
+  is refused before a request is made).
   It never goes on a command line or into a log, and it is not sent to the
   CDN the download redirects to, because that URL is pre-signed. Without a
   token, only public repos work. A gated repo answers 401/403; accept its

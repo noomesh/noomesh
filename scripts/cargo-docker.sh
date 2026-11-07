@@ -252,6 +252,94 @@ docker volume ls -q --filter label=noo.cargo-docker-src 2>/dev/null | while read
 done
 docker volume create --label "noo.cargo-docker-src=$CRATE_DIR" "$VOLUME" >/dev/null 2>&1 || true
 
+# A persistent RUSTUP_HOME and a bounded toolchain step, for the build batch
+# only (noomesh-internal ops/batch/noo-batch.sh). Both are DEV-HARNESS knobs
+# for ops tooling: not product behaviour, not a legacy escape hatch, never set
+# by anything that ships (tests/test_cargo_docker_rustup_knobs.py holds every
+# shipped path and every workflow to that). Unset, this script is unchanged.
+#
+#   CARGO_DOCKER_RUSTUP_VOLUME=<volume>  mounts an EXISTING named volume over
+#     /usr/local/rustup, so the toolchain rust-toolchain.toml pins installs
+#     once instead of on every run (every batch run re-synced 1.99.0 and its
+#     targets; on 2026-11-05 one download stalled ~30 min holding the lock).
+#     Docker seeds an empty named volume from the image's rustup state.
+#   CARGO_DOCKER_TOOLCHAIN_TIMEOUT=<secs>  bounds the toolchain step: waiting
+#     for the volume's lock, `rustup toolchain install` (reads the crate's
+#     rust-toolchain.toml: the CI pin, nothing restated here), `rustup
+#     component add`, and the sweep of toolchains nothing pins. A stall fails
+#     loud, naming the step. The cargo step is outside the lock and unbounded.
+#
+# Two builds may share the volume at once, so the whole step runs under
+# `flock` on a file inside it. The sweep runs under the same lock and keeps
+# the image default, the active toolchain, every toolchain a rust-toolchain.toml
+# in this tree pins, and any toolchain a build used in the last 7 days (a
+# concurrent build of another tree may pin a different one).
+RUSTUP_VOLUME="${CARGO_DOCKER_RUSTUP_VOLUME:-}"
+if [ -n "$RUSTUP_VOLUME" ]; then
+    TC_TIMEOUT="${CARGO_DOCKER_TOOLCHAIN_TIMEOUT:-900}"
+    case "$TC_TIMEOUT" in
+        ''|*[!0-9]*) echo "cargo-docker: CARGO_DOCKER_TOOLCHAIN_TIMEOUT must be whole seconds, got '$TC_TIMEOUT'" >&2; exit 2 ;;
+    esac
+    if ! docker volume inspect "$RUSTUP_VOLUME" >/dev/null 2>&1; then
+        echo "cargo-docker: rustup volume $RUSTUP_VOLUME does not exist; its owner creates it (with its label) first" >&2
+        exit 2
+    fi
+    # Runs under the lock. Single-quoted: expanded in the container only.
+    TC_LOCKED_SH='
+s() { printf %s "$1" > /tmp/noo-toolchain-step; echo "cargo-docker: toolchain step: $1" >&2; }
+s "rustup toolchain install --no-self-update"
+rustup toolchain install --no-self-update >&2
+s "rustup component add $NOO_TC_COMPONENTS"
+rustup component add $NOO_TC_COMPONENTS >&2
+s "sweep of unpinned toolchains"
+mkdir -p "$RUSTUP_HOME/.noo-used"
+active=$(rustup show active-toolchain | cut -d" " -f1)
+touch "$RUSTUP_HOME/.noo-used/$active"
+default=$(rustup default 2>/dev/null | cut -d" " -f1 || true)
+pins=$(sed -n "s/^channel *= *\"\([^\"]*\)\".*/\1/p" "$NOO_TC_REPO"/*/rust-toolchain.toml 2>/dev/null | sort -u)
+if [ -n "$pins" ]; then
+    for t in $(rustup toolchain list | cut -d" " -f1); do
+        keep=
+        [ "$t" = "$default" ] && keep=1
+        [ "$t" = "$active" ] && keep=1
+        for p in $pins; do case "$t" in "$p"-*) keep=1 ;; esac; done
+        [ -n "$(find "$RUSTUP_HOME/.noo-used/$t" -mtime -7 2>/dev/null)" ] && keep=1
+        if [ -z "$keep" ]; then
+            echo "cargo-docker: removing toolchain $t (nothing pins or used it)" >&2
+            rustup toolchain uninstall "$t" >&2
+        fi
+    done
+fi
+'
+    # Runs first in the container; cargo's args arrive as "$@".
+    TC_SH='
+printf %s "waiting for the toolchain lock" > /tmp/noo-toolchain-step
+rc=0
+timeout -k 10 "$NOO_TC_TIMEOUT" flock "$RUSTUP_HOME/.noo-batch.lock" sh -euc "$NOO_TC_LOCKED_SH" || rc=$?
+if [ "$rc" -ne 0 ]; then
+    step=$(cat /tmp/noo-toolchain-step)
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+        echo "cargo-docker: TOOLCHAIN STEP TIMED OUT after ${NOO_TC_TIMEOUT}s ($step)" >&2
+    else
+        echo "cargo-docker: TOOLCHAIN STEP FAILED (exit $rc, $step)" >&2
+    fi
+    exit "$rc"
+fi
+exec cargo "$@"
+'
+    # shellcheck disable=SC2086
+    acquire_build_slot
+    exec docker run --rm $COMMON \
+        -v "$VOLUME:/target" \
+        -e CARGO_TARGET_DIR=/target \
+        -v "$RUSTUP_VOLUME:/usr/local/rustup" \
+        -e NOO_TC_TIMEOUT="$TC_TIMEOUT" \
+        -e NOO_TC_REPO=/repo \
+        -e NOO_TC_COMPONENTS="$COMPONENTS" \
+        -e NOO_TC_LOCKED_SH="$TC_LOCKED_SH" \
+        "$IMAGE" sh -euc "$TC_SH" sh "$@"
+fi
+
 # `set --` args are re-quoted into the inner shell (QUOTED, built above) so
 # a component run behaves identically to the plain path.
 # shellcheck disable=SC2086

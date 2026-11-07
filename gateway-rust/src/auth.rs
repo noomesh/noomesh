@@ -1064,6 +1064,14 @@ pub fn exchange_scope_for(path: &str, method: &axum::http::Method) -> Option<&'s
     }
 }
 
+/// The `exp` of the kiosk credential a request came in on. A long-lived
+/// response (the events stream) ends here, so the display reconnects
+/// through its proxy, which re-mints, and the mint re-checks the tailnet
+/// tag. Without it a stream outlived its token, and a display whose tag
+/// was removed kept receiving events until the connection dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KioskExpiry(pub u64);
+
 /// Whether these claims are a kiosk credential.
 pub fn is_kiosk(claims: &Claims) -> bool {
     claims.scopes.iter().any(|s| s == KIOSK_SCOPE)
@@ -1086,7 +1094,10 @@ pub const KIOSK_READ_PATHS: &[&str] = &[
     // The health view's sources, fetched once per stream connection.
     "/api/cluster/status",
     "/api/cluster/gpu-metrics",
-    "/api/jobs",
+    // NOT here: `/api/jobs` (followup 1000). The display reads the queue
+    // from `/api/kiosk/jobs`, the projection (five fields, no payload or
+    // result). On the general route a kiosk token needed its own exception
+    // to list the unowned fleet jobs at all; that exception is gone.
     "/api/scheduler/status",
     "/api/heartbeat/status",
     "/api/memory/health",
@@ -3407,6 +3418,7 @@ pub async fn require_any_auth(
                 if let Err(why) = kiosk_may(request.method(), &path) {
                     return Ok(kiosk_refusal(why));
                 }
+                request.extensions_mut().insert(KioskExpiry(claims.exp as u64));
                 request.extensions_mut().insert(AuthActor(claims.sub.clone()));
                 request.extensions_mut().insert(RequesterCtx {
                     sub: claims.sub.clone(),
@@ -3662,7 +3674,11 @@ pub async fn require_any_auth(
     // handler mints, which is where it belongs. (The kiosk key lane, the
     // first door here, was retired on 2026-09-30.)
     if let Some(required) = exchange_scope_for(&path, request.method()) {
-        if let Some(consumer) = service_keys::resolve(&state.db, &t).await {
+        let found = match service_keys::resolve(&state.db, &t).await {
+            Ok(found) => found,
+            Err(unavailable) => return Ok(unavailable.into_response()),
+        };
+        if let Some(consumer) = found {
             if !consumer.has_scope(required) {
                 return Err(StatusCode::UNAUTHORIZED);
             }
@@ -3687,7 +3703,11 @@ pub async fn require_any_auth(
     // route's scope gets in, a key without it gets the scope refusal, and a
     // bearer that is no key falls through to the 401 below.
     if let Some(required) = direct_key_scope_for(&path, request.method()) {
-        match direct_key_admission(service_keys::resolve(&state.db, &t).await, required) {
+        let found = match service_keys::resolve(&state.db, &t).await {
+            Ok(found) => found,
+            Err(unavailable) => return Ok(unavailable.into_response()),
+        };
+        match direct_key_admission(found, required) {
             DirectKey::Forbidden(r) => return Ok(r),
             DirectKey::Admit(consumer) => {
                 if let Some(limit) = consumer.rpm_limit {
@@ -3710,8 +3730,13 @@ pub async fn require_any_auth(
     // key must not unlock admin/cluster routes.
     if is_inference_surface {
         // Named per-consumer service keys (`noo_service_keys`): resolve the
-        // bearer to a Consumer + scopes (cached 60s). See service_keys.rs.
-        if let Some(consumer) = service_keys::resolve(&state.db, &t).await {
+        // bearer to a Consumer + scopes (cached 5 s). See service_keys.rs.
+        // An unreadable key store is a 503, not this bearer's 401 (i437).
+        let found = match service_keys::resolve(&state.db, &t).await {
+            Ok(found) => found,
+            Err(unavailable) => return Ok(unavailable.into_response()),
+        };
+        if let Some(consumer) = found {
             // Per-consumer quota: stop one named consumer from monopolising the
             // shared inference surface. Only named keys with an rpm_limit are
             // capped; internal callers (rpm_limit=None) are never throttled here.
@@ -4570,12 +4595,16 @@ mod tests {
         for p in KIOSK_READ_PATHS {
             assert_eq!(kiosk_may(&Method::GET, p), Ok(()), "{p}");
         }
-        for p in ["/api/kiosk/nodes", "/api/kiosk/gpus", "/api/kiosk/graph"] {
+        for p in ["/api/kiosk/nodes", "/api/kiosk/gpus", "/api/kiosk/graph", "/api/kiosk/jobs"] {
             assert_eq!(kiosk_may(&Method::GET, p), Ok(()), "{p}");
         }
         // Guard the guard: an empty allowlist would make the loop above
         // vacuous and the refusal test pass for the wrong reason.
-        assert!(KIOSK_READ_PATHS.len() >= 8, "the allowlist lost entries");
+        assert!(KIOSK_READ_PATHS.len() >= 7, "the allowlist lost entries");
+        // Followup 1000: the queue comes from the projection only.
+        for p in ["/api/jobs", "/api/jobs/history", "/api/jobs/0f9c1d2e-0000-4000-8000-000000000001"] {
+            assert_eq!(kiosk_may(&Method::GET, p), Err(KioskRefusal::OutOfScope), "{p}");
+        }
     }
 
     /// Acceptance 2. Whatever the bound account holds, the token the key
@@ -6768,7 +6797,7 @@ mod voice_direct_key_tests {
         let src = include_str!("auth.rs");
         let body = src.split("pub async fn require_any_auth(").nth(1).unwrap().split("\npub async fn ").next().unwrap();
         let door = body.find("direct_key_scope_for(&path, request.method())").expect("the direct-key door");
-        let admission = body.find("direct_key_admission(service_keys::resolve(&state.db, &t).await, required)").expect("the decision");
+        let admission = body.find("direct_key_admission(found, required)").expect("the decision");
         let inference = body.find("    if is_inference_surface {\n        // Named per-consumer").expect("the inference block");
         assert!(door < admission && admission < inference, "the door precedes the inference block");
         // A non-key bearer must fall through (to the 401), not be admitted.

@@ -167,6 +167,22 @@ def test_no_opentelemetry_sdk_surface_in_the_python_tree() -> None:
     assert not hits, f"an OpenTelemetry SDK import brings OTEL_* env defaults back: {hits}"
 
 
+def test_pyproject_declares_no_opentelemetry_sdk_or_exporter() -> None:
+    # The `monitoring` extra pinned opentelemetry-sdk and -exporter-otlp long
+    # after nothing imported them (tracing.py speaks OTLP/HTTP itself), and
+    # dependabot kept bumping the pin (#659). opentelemetry-api still arrives
+    # through fastapi and mcp; that one is theirs, not ours.
+    import tomllib
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    declared = list(project.get("dependencies", []))
+    for reqs in project.get("optional-dependencies", {}).values():
+        declared += reqs
+    assert declared, "pyproject.toml parsed to no requirements at all"
+    hits = [r for r in declared if re.match(r"\s*opentelemetry[-_]", r, re.I)]
+    assert not hits, f"pyproject.toml declares OpenTelemetry packages nothing imports: {hits}"
+
+
 def test_the_worker_continues_the_gateways_trace_per_subject() -> None:
     src = (ROOT / "src/noomesh/gateway/worker_pool.py").read_text(encoding="utf-8")
     assert 'tracing.configure("noo-worker")' in src

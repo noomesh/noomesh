@@ -192,6 +192,9 @@ pub(crate) enum FetchErr {
     Mismatch { expected: String, got: String },
     /// The store already holds a different file of that name.
     Conflict { existing: String, expected: String },
+    /// An origin the HF endpoint rule refuses (i445): the base itself, or a
+    /// redirect that would leave https. Nothing was sent to it.
+    Refused(String),
 }
 
 impl std::fmt::Display for FetchErr {
@@ -204,6 +207,7 @@ impl std::fmt::Display for FetchErr {
             FetchErr::Io(e) => write!(f, "{e}"),
             FetchErr::Mismatch { expected, got } => write!(f, "sha256 mismatch: Hugging Face says {expected}, the download hashes to {got} — the partial file was deleted; re-run to download again"),
             FetchErr::Conflict { existing, expected } => write!(f, "the store already holds a different file of that name (sha256 {existing}, Hugging Face says {expected}) — re-run with --force to replace it"),
+            FetchErr::Refused(why) => write!(f, "{why}"),
         }
     }
 }
@@ -252,11 +256,30 @@ pub(crate) fn resolve_url(base: &str, a: &FetchArgs) -> String {
     )
 }
 
-/// `HF_ENDPOINT` (the variable huggingface_hub honours), else huggingface.co.
-pub(crate) fn hf_base() -> String {
-    let b = std::env::var("HF_ENDPOINT").unwrap_or_default();
-    let b = b.trim().trim_end_matches('/');
-    if b.is_empty() { "https://huggingface.co".into() } else { b.to_string() }
+/// `HF_ENDPOINT` (the variable huggingface_hub honours), else huggingface.co,
+/// under the shared endpoint rule (`catalog::hf_endpoint`, i445): https, or
+/// http to this machine only.
+pub(crate) fn hf_base() -> Result<String, String> {
+    crate::catalog::hf_endpoint()
+}
+
+/// The next hop of a redirect chain, or why it is refused (i445): never
+/// from https down to http, and never to an origin the endpoint rule
+/// refuses.
+pub(crate) fn next_hop(current: &str, location: &str) -> Result<String, FetchErr> {
+    let next = join_location(current, location);
+    let lower = |s: &str| s.trim().to_ascii_lowercase();
+    if lower(current).starts_with("https://") && !lower(&next).starts_with("https://") {
+        return Err(FetchErr::Refused(format!(
+            "Hugging Face redirected {} to plain http ({}): refusing to download in clear",
+            origin(current),
+            origin(&next)
+        )));
+    }
+    if !crate::catalog::hf_origin_allowed(&next) {
+        return Err(FetchErr::Refused(format!("refusing a redirect to {}: not https", origin(&next))));
+    }
+    Ok(next)
 }
 
 /// `scheme://host[:port]` of a URL.
@@ -305,6 +328,7 @@ fn auth_header(token: Option<&str>) -> Option<String> {
 /// LFS metadata: `x-linked-etag` / `x-linked-size` on the resolve URL (HEAD,
 /// no redirect followed), else the API's `siblings[].lfs.sha256`.
 pub(crate) fn remote_meta(base: &str, token: Option<&str>, a: &FetchArgs) -> Result<Remote, FetchErr> {
+    refuse_unless_allowed(base)?;
     let ag = agent();
     let url = resolve_url(base, a);
     let mut req = ag.head(&url);
@@ -357,12 +381,16 @@ pub(crate) fn remote_meta(base: &str, token: Option<&str>, a: &FetchArgs) -> Res
 /// GET with redirects followed by hand: `Range` goes on every hop, the token
 /// only to the Hugging Face origin (a CDN location is pre-signed).
 pub(crate) fn get_following(base: &str, url: &str, token: Option<&str>, range_from: u64) -> Result<ureq::http::Response<ureq::Body>, FetchErr> {
+    refuse_unless_allowed(base)?;
+    refuse_unless_allowed(url)?;
     let ag = agent();
     let hf_origin = origin(base).to_string();
     let mut cur = url.to_string();
     for _ in 0..8 {
         let mut req = ag.get(&cur);
-        if origin(&cur) == hf_origin {
+        // The token only to the HF origin, and only when that origin passed
+        // the endpoint rule (it did: checked above, and every hop below).
+        if origin(&cur) == hf_origin && crate::catalog::hf_origin_allowed(&cur) {
             if let Some(h) = auth_header(token) {
                 req = req.header("Authorization", h);
             }
@@ -378,7 +406,7 @@ pub(crate) fn get_following(base: &str, url: &str, token: Option<&str>, range_fr
                 .get("location")
                 .and_then(|v| v.to_str().ok())
                 .ok_or_else(|| FetchErr::Http(format!("redirect {st} without a Location")))?;
-            cur = join_location(&cur, loc);
+            cur = next_hop(&cur, loc)?;
             continue;
         }
         return match st {
@@ -415,6 +443,14 @@ pub(crate) fn part_path(dir: &Path, name: &str) -> PathBuf {
 /// Download `a` into `dir`, resuming a `.part` file, verifying the sha256,
 /// and renaming into place with mode 0644. `progress(done, total)` is
 /// called as bytes arrive.
+/// The guard in front of every request this module makes (i445).
+fn refuse_unless_allowed(url: &str) -> Result<(), FetchErr> {
+    if crate::catalog::hf_origin_allowed(url) {
+        return Ok(());
+    }
+    Err(FetchErr::Refused(format!("refusing {}: {}", origin(url), crate::catalog::HF_ENDPOINT_REMEDY)))
+}
+
 pub(crate) fn fetch_to_store(
     base: &str,
     token: Option<&str>,
@@ -611,7 +647,11 @@ pub fn models_fetch(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     };
 
-    let out = match fetch_to_store(&hf_base(), token.as_deref(), &a, &dir, &mut progress) {
+    let base = match hf_base() {
+        Ok(b) => b,
+        Err(why) => fail(g.json, ExitCode::Usage, "hf_endpoint_refused", &why, Some(crate::catalog::HF_ENDPOINT_REMEDY)),
+    };
+    let out = match fetch_to_store(&base, token.as_deref(), &a, &dir, &mut progress) {
         Ok(o) => o,
         Err(e) => {
             let hint = match &e {
@@ -709,6 +749,52 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
+
+    // ── the HF endpoint rule on the fetch path (i445) ───────────────────
+
+    #[test]
+    fn a_redirect_from_https_to_http_is_refused() {
+        let err = next_hop("https://huggingface.co/o/n/resolve/main/m.gguf", "http://cdn.example/m.gguf")
+            .expect_err("downgrade");
+        assert!(matches!(err, FetchErr::Refused(_)), "{err:?}");
+        assert!(err.to_string().contains("plain http"), "{err}");
+        // Even to loopback: https never steps down.
+        assert!(next_hop("https://huggingface.co/x", "http://127.0.0.1:9/x").is_err());
+    }
+
+    #[test]
+    fn https_hops_and_loopback_http_hops_are_followed() {
+        assert_eq!(
+            next_hop("https://huggingface.co/o/n/resolve/main/m.gguf", "https://cdn-lfs.hf.co/x?sig=1").unwrap(),
+            "https://cdn-lfs.hf.co/x?sig=1"
+        );
+        assert_eq!(next_hop("https://huggingface.co/a/b", "/c").unwrap(), "https://huggingface.co/c");
+        assert_eq!(next_hop("http://127.0.0.1:9/a", "/b").unwrap(), "http://127.0.0.1:9/b");
+        assert!(next_hop("http://127.0.0.1:9/a", "http://cdn.example/b").is_err(), "loopback http may not hop off the box");
+    }
+
+    #[test]
+    fn get_following_takes_every_hop_through_next_hop() {
+        // Prove the parse found the function before trusting an absence.
+        let own = crate::test_src::own_code(include_str!("models_fetch.rs"));
+        let body = crate::test_src::fn_body(&own, "pub(crate) fn get_following(");
+        assert!(body.contains("next_hop(&cur, loc)?"), "every redirect goes through next_hop");
+        assert!(!body.contains("join_location("), "no hop may bypass next_hop");
+    }
+
+    #[test]
+    fn a_refused_base_sends_nothing_not_even_the_token() {
+        let a = FetchArgs { repo: "o/n".into(), file: "m.gguf".into(), revision: "main".into(), force: false };
+        let started = std::time::Instant::now();
+        let meta = remote_meta("http://hf-mirror.invalid", Some("hf_planted"), &a).expect_err("refused");
+        assert!(matches!(meta, FetchErr::Refused(_)), "{meta:?}");
+        let get = get_following("http://hf-mirror.invalid", "http://hf-mirror.invalid/x", Some("hf_planted"), 0)
+            .expect_err("refused");
+        assert!(matches!(get, FetchErr::Refused(_)), "{get:?}");
+        assert!(!meta.to_string().contains("hf_planted") && !get.to_string().contains("hf_planted"));
+        // Refused before any agent is built: no DNS lookup of .invalid, no connect.
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()

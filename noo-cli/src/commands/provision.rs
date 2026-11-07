@@ -336,7 +336,7 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     let mut files = base_bundle_files(&id, &machine, env_body, binary, material);
     attach_applier_and_fetcher(&machine, &mut files);
     attach_hostd(g, &site, &enrollment, &machine, &mut files);
-    attach_cli(&a, &site, &enrollment, &id, &machine, &mut files);
+    attach_cli(g, &a, &site, &enrollment, &id, &machine, &mut files);
     attach_harness(g, &a, &site, &enrollment, &id, &machine, &vars, &mut files);
     attach_vendor_clis(g, &a, &site, &enrollment, &machine, &work, &mut files);
     drop_binaries_the_node_already_runs(g, &a, &machine, &mut files);
@@ -1132,14 +1132,11 @@ fn attach_applier_and_fetcher(m: &ProvMachine, files: &mut Vec<(&'static str, Ve
 /// which is what every Linux node did on 2026-09-19, because the
 /// rail never carried this kind. Absent from an older release is a
 /// note, not a failure: the applier simply installs no helper.
-fn attach_hostd(g: &Globals, site: &ProvSite, enr: &ProvEnrollment, m: &ProvMachine, files: &mut Vec<(&'static str, Vec<u8>)>) {
+fn attach_hostd(g: &Globals, site: &ProvSite, enr: &ProvEnrollment, _m: &ProvMachine, files: &mut Vec<(&'static str, Vec<u8>)>) {
     let root = site.root.clone();
     let record = &enr.record;
-    let darwin = m.darwin;
-    let f = record.as_ref().and_then(|r| r.facts.clone()).unwrap_or_else(|| serde_json::json!({}));
-    let os = f.get("os").and_then(|v| v.as_str()).unwrap_or(if darwin { "macos" } else { "linux" });
-    let arch = f.get("arch").and_then(|v| v.as_str()).unwrap_or("x86_64");
-    if let Some(asset) = hostd_asset_for(os, arch) {
+    let (os, arch, _) = platform_from_facts(record.as_ref().and_then(|r| r.facts.as_ref()));
+    if let Some(asset) = hostd_asset_for(&os, &arch) {
         match cached_release_asset(g, &root, &asset) {
             Ok(bytes) => {
                 nnote(&format!("bundle carries the privileged helper ({asset}, {})", human_bytes(bytes.len())));
@@ -1164,30 +1161,37 @@ fn attach_hostd(g: &Globals, site: &ProvSite, enr: &ProvEnrollment, m: &ProvMach
 /// running `noo upgrade`, managed by its CLI stage, and a bundle that
 /// installs over it replaces the binary mid-run (2026-09-11: every node
 /// after host8 in `--nodes` failed to spawn). Same rail, one file fewer.
-fn attach_cli(a: &ProvisionArgs, site: &ProvSite, enr: &ProvEnrollment, id: &ProvIdentity, m: &ProvMachine, files: &mut Vec<(&'static str, Vec<u8>)>) {
+fn attach_cli(g: &Globals, a: &ProvisionArgs, site: &ProvSite, enr: &ProvEnrollment, id: &ProvIdentity, _m: &ProvMachine, files: &mut Vec<(&'static str, Vec<u8>)>) {
     let node = a.node.clone();
     let root = site.root.clone();
     let record = &enr.record;
     let user = id.user.clone();
-    let darwin = m.darwin;
     let self_node = crate::role::is_self_node(&node);
-    let f = record.as_ref().and_then(|r| r.facts.clone()).unwrap_or_else(|| serde_json::json!({}));
-    let os = f.get("os").and_then(|v| v.as_str()).unwrap_or(if darwin { "macos" } else { "linux" });
-    let arch = f.get("arch").and_then(|v| v.as_str()).unwrap_or("x86_64");
+    let (os, arch, _) = platform_from_facts(record.as_ref().and_then(|r| r.facts.as_ref()));
     if self_node {
         nnote("this is the controller's own node — the bundle carries no CLI (noo upgrade manages it)");
-    } else {
-        if let Some(asset) = cli_asset_for(os, arch) {
-            let cached = cli_asset_cache_dir(&root).join(&asset);
-            if let Ok(bytes) = std::fs::read(&cached) {
-                if !bytes.is_empty() && !user.is_empty() {
-                    nnote(&format!("bundle carries the CLI for {user} ({asset}, {})", human_bytes(bytes.len())));
-                    files.push(("cli-binary", bytes));
-                    files.push(("cli-user", user.clone().into_bytes()));
-                }
+    } else if let Some(asset) = cli_asset_for(&os, &arch) {
+        // Fetched like the harness and hostd when the cache lacks it (i11b):
+        // reading the cache only left a node without its CLI, silently,
+        // after one failed fetch during `noo upgrade`.
+        match cached_release_asset(g, &root, &asset) {
+            Ok(bytes) if !user.is_empty() => {
+                nnote(&format!("bundle carries the CLI for {user} ({asset}, {})", human_bytes(bytes.len())));
+                files.push(("cli-binary", bytes));
+                files.push(("cli-user", user.clone().into_bytes()));
             }
+            Ok(_) => nnote(&format!("no CLI in this bundle: {node} has no enrolling user on record to own ~/.local/bin")),
+            Err(e) => nnote(&cli_omitted_note(&node, &asset, &e)),
         }
     }
+}
+
+/// What provision says when a node's bundle goes without its CLI because
+/// the asset is neither cached nor fetchable: the node, the asset, why, and
+/// the command that refills the cache.
+pub(crate) fn cli_omitted_note(node: &str, asset: &str, err: &str) -> String {
+    format!("no CLI in this bundle: {asset} is not in the controller's asset cache and the release \
+             fetch failed ({err}) — {node} keeps the CLI it has until `noo upgrade --nodes` caches it")
 }
 
 /// The harness: the gateway binary for this platform, its env and unit.
@@ -1207,9 +1211,7 @@ fn attach_harness(g: &Globals, a: &ProvisionArgs, site: &ProvSite, enr: &ProvEnr
     if self_node {
         nnote("this is the controller's own node — no harness in the bundle (the gateway runs turns in process)");
     } else {
-        let f = record.as_ref().and_then(|r| r.facts.clone()).unwrap_or_else(|| serde_json::json!({}));
-        let os = f.get("os").and_then(|v| v.as_str()).unwrap_or(if darwin { "macos" } else { "linux" });
-        let arch = f.get("arch").and_then(|v| v.as_str()).unwrap_or("x86_64");
+        let (os, arch, _) = platform_from_facts(record.as_ref().and_then(|r| r.facts.as_ref()));
         let knows_harness = applier_knows_harness_kinds(darwin, &node_app_version);
         if !knows_harness {
             nnote(&format!(
@@ -1218,7 +1220,7 @@ fn attach_harness(g: &Globals, a: &ProvisionArgs, site: &ProvSite, enr: &ProvEnr
                  newer CLI; the next restage carries the harness."
             ));
         }
-        match gateway_asset_for(os, arch).filter(|_| knows_harness) {
+        match gateway_asset_for(&os, &arch).filter(|_| knows_harness) {
             Some(asset) => {
                 match cached_release_asset(g, &root, &asset) {
                     Ok(bytes) if super::enroll::asset_harness_env_tmpl().is_empty() => {
@@ -2023,6 +2025,17 @@ fn self_prep_line(node: &str, prep: &Path, data_root: &str, work: &Path) -> Resu
     Ok(format!("{} || echo \"host prep exited $? — continuing\" >&2\n", command_line(&c)))
 }
 
+/// A root shell running `script` (`program` is `sudo`; a test passes `env`).
+/// Its stdout goes to OUR stderr: what the script prints (prep-host's `say`
+/// lines) is progress for a person, and under `--json` stdout carries the one
+/// JSON document only (0.6.17-rc.1 rehearsal, B5.json: two prep-host lines
+/// on stdout). stdin and stderr stay inherited, since sudo may prompt.
+pub(crate) fn root_shell(program: &str, script: &str) -> Command {
+    let mut c = Command::new(program);
+    c.args(["sh", "-c", script]).stdout(std::process::Stdio::from(std::io::stderr()));
+    c
+}
+
 /// The ONE-TIME creation of this controller's node identity (i67 migration:
 /// a controller installed before 0.6.3 has no birth key, pull units or
 /// gateway copy). One sudo, said as such; afterwards every install of this
@@ -2042,7 +2055,7 @@ pub(crate) fn ensure_self_identity(node: &str) -> Result<(), String> {
         Err(e) => { let _ = std::fs::remove_dir_all(&work); return Err(e); }
     };
     let script = format!("set -e\n{}", self_identity_script(node, &work, Path::new("/etc/noo"), &line));
-    let ok = Command::new("sudo").args(["sh", "-c", &script]).status().map(|s| s.success()).unwrap_or(false);
+    let ok = root_shell("sudo", &script).status().map(|s| s.success()).unwrap_or(false);
     let _ = std::fs::remove_dir_all(&work);
     if !ok {
         return Err("the identity script did not complete (see output above)".into());
@@ -2126,13 +2139,20 @@ fn self_node_redemption(node: &str) -> Result<Redemption, String> {
         return Err(format!("{SELF_BIRTH_CRT} is not a PEM certificate"));
     }
     let root = crate::envfile::repo_root();
-    let gpu = Command::new("nvidia-smi").output().map(|o| o.status.success()).unwrap_or(false);
+    // A busy driver is a present one (i425): the fact stays true.
+    let gpu = crate::host_exec::gpu_kept(crate::host_exec::probe_gpu("reporting the GPU as present"));
     Ok(Redemption {
         ip: crate::onboard::util::detect_ip(),
         user: std::env::var("USER").unwrap_or_default(),
         birth_cert: Some(cert),
         facts: Some(self_node_facts(std::env::consts::ARCH, &local_data_root(&root), gpu)),
     })
+}
+
+/// The default provision tier for a GPU probe: a GPU, busy or not, is "2";
+/// none is "3". Pure.
+pub(crate) fn gpu_tier(p: crate::host_exec::GpuProbe) -> &'static str {
+    if crate::host_exec::gpu_kept(p) { "2" } else { "3" }
 }
 
 /// The facts the self node reports for itself, in the shape `noo enroll`
@@ -2227,6 +2247,18 @@ pub(crate) struct Redemption {
 pub(crate) fn redemption_record(g: &Globals, node: &str) -> Option<Redemption> {
     let doc = crate::http::get_json(g, "/api/security/bootstrap-tokens", true, 15);
     let toks = doc.get("tokens")?.as_array()?;
+    let t = latest_redemption(toks, node)?;
+    Some(Redemption {
+        ip: t.get("used_by_ip").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        user: t.get("enroll_user").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        birth_cert: t.get("birth_cert").and_then(|v| v.as_str()).map(str::to_string),
+        facts: t.get("facts").cloned().filter(|f| f.is_object()),
+    })
+}
+
+/// `node`'s latest redeemed, unrevoked bootstrap token: its enrollment
+/// record (provision's, and `cluster verify`'s for the node's platform).
+pub(crate) fn latest_redemption<'a>(toks: &'a [serde_json::Value], node: &str) -> Option<&'a serde_json::Value> {
     let mut hits: Vec<&serde_json::Value> = toks.iter()
         .filter(|t| t.get("node_name").and_then(|v| v.as_str()) == Some(node)
             && !t.get("revoked").and_then(|v| v.as_bool()).unwrap_or(false)
@@ -2234,13 +2266,7 @@ pub(crate) fn redemption_record(g: &Globals, node: &str) -> Option<Redemption> {
             && t.get("used_by_ip").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()))
         .collect();
     hits.sort_by_key(|t| t.get("used_at").and_then(|v| v.as_str()).unwrap_or("").to_string());
-    let t = hits.last()?;
-    Some(Redemption {
-        ip: t.get("used_by_ip").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        user: t.get("enroll_user").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        birth_cert: t.get("birth_cert").and_then(|v| v.as_str()).map(str::to_string),
-        facts: t.get("facts").cloned().filter(|f| f.is_object()),
-    })
+    hits.last().copied()
 }
 
 /// Tier ladder over the ENROLLMENT facts JSON — same rules as the gate-facts
@@ -2779,8 +2805,7 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
     // to /data/noo while every volume lived on the chosen drive.
     let data_root = local_data_root(&root);
     let tier = tier.map(str::to_string).unwrap_or_else(|| {
-        let gpu = Command::new("nvidia-smi").output().map(|o| o.status.success()).unwrap_or(false);
-        if gpu { "2".into() } else { "3".into() }
+        gpu_tier(crate::host_exec::probe_gpu("keeping the GPU tier (2)")).into()
     });
 
     // Prep (idempotent): noo-agent account, /etc/noo, gate tooling. The
@@ -3001,7 +3026,7 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
             leaves: &leaves.iter().map(|(k, _)| k.to_string()).collect::<Vec<_>>(),
             restart: !changed.is_empty() || !active,
         });
-        let code = Command::new("sudo").args(["sh", "-c", &script])
+        let code = root_shell("sudo", &script)
             .status().ok().and_then(|s| s.code());
         // Scrub the staged secrets regardless of outcome.
         for staged_kind in ["agent-env", "nats-creds", "node.key"].into_iter()
@@ -3447,6 +3472,17 @@ pub(crate) fn gzip_bundle(bundle: &Path, work: &Path) -> Result<std::path::PathB
 /// POST raw bytes to a gateway path (the encrypted bundle — too large and
 /// too binary for the JSON helpers). Same base-url/TLS posture as http.rs;
 /// bearer from the standard resolution.
+/// A node's platform for release assets, from its enrollment facts:
+/// `(os, arch, assumed)`. Absent facts (older enroll clients, the
+/// controller's own local lane) read as linux / x86_64, and `assumed` says
+/// so. Provision, `noo upgrade --nodes` (what it caches) and `cluster
+/// verify` (what is missing) all ask HERE, so they agree on what a node needs.
+pub(crate) fn platform_from_facts(facts: Option<&serde_json::Value>) -> (String, String, bool) {
+    let os = facts.and_then(|f| f.get("os")).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let arch = facts.and_then(|f| f.get("arch")).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    (os.unwrap_or("linux").to_string(), arch.unwrap_or("x86_64").to_string(), os.is_none() || arch.is_none())
+}
+
 /// The release asset name for a node's platform, from its enrollment facts.
 /// The gateway binary asset for a node's platform: what
 /// the node runs as its harness.
@@ -4405,6 +4441,36 @@ mod cluster_trust_tests {
 }
 
 #[cfg(test)]
+mod cli_asset_refill_tests {
+    /// i11b: a CLI asset missing from the cache is fetched like the harness
+    /// and hostd (attach_cli used to read the cache only and drop it
+    /// silently), and when it cannot be had the note names the node, the
+    /// asset, why, and the command that refills the cache.
+    #[test]
+    fn a_missing_cli_asset_is_fetched_or_said_never_dropped() {
+        let src = include_str!("provision.rs");
+        let src = crate::test_src::own_code(src);
+        let cli = crate::test_src::fn_body(&src, "fn attach_cli(");
+        assert!(cli.contains("cached_release_asset(g, &root, &asset)"), "the CLI asset is fetched when the cache lacks it");
+        assert!(cli.contains("Err(e) => nnote(&cli_omitted_note(&node, &asset, &e))"), "and its absence is said");
+        assert!(!cli.contains("std::fs::read(&cached)"), "never a cache-only read again");
+        let note = super::cli_omitted_note("robopi", "noo-aarch64-unknown-linux-musl", "HTTP 503");
+        for want in ["robopi", "noo-aarch64-unknown-linux-musl", "HTTP 503", "noo upgrade --nodes"] {
+            assert!(note.contains(want), "{want}: {note}");
+        }
+    }
+
+    /// Absent facts read as linux / x86_64 and say so.
+    #[test]
+    fn platform_from_facts_names_an_assumption() {
+        let mac = serde_json::json!({ "os": "macos", "arch": "arm64" });
+        assert_eq!(super::platform_from_facts(Some(&mac)), ("macos".into(), "arm64".into(), false));
+        assert_eq!(super::platform_from_facts(None), ("linux".into(), "x86_64".into(), true));
+        assert_eq!(super::platform_from_facts(Some(&serde_json::json!({ "os": "linux" }))), ("linux".into(), "x86_64".into(), true));
+    }
+}
+
+#[cfg(test)]
 mod poke_fetch_tests {
     use super::{poke_fetch_body, poke_is_transient, POKE_EXPIRE_AFTER_SEC, POKE_RETRY_WINDOW_SECS, POKE_RETRY_STEP_SECS};
 
@@ -4580,6 +4646,32 @@ pub(crate) const HARNESS_TLS_KEY: &str = "/etc/noo/pki/harness/node.key";
 
 #[cfg(test)]
 mod tests {
+    /// What a root script prints never reaches our stdout (`--json` carries
+    /// one document there): it goes to stderr. The run is real (`env` in
+    /// place of sudo): the script's own stderr line proves it ran.
+    #[test]
+    fn a_root_script_prints_nothing_on_stdout() {
+        let o = super::root_shell("env", "echo 'prep-host: Docker present'; echo ran >&2")
+            .output()
+            .expect("run sh");
+        assert!(o.status.success(), "{o:?}");
+        assert_eq!(String::from_utf8_lossy(&o.stderr), "ran\n", "the script did not run");
+        assert!(o.stdout.is_empty(), "a root script wrote to stdout: {:?}", String::from_utf8_lossy(&o.stdout));
+        // Both sudo sites that run host prep go through it.
+        let prod = crate::test_src::own_code(include_str!("provision.rs"));
+        assert_eq!(prod.matches("root_shell(\"sudo\", &script)").count(), 2);
+        assert!(!prod.contains("Command::new(\"sudo\").args([\"sh\", \"-c\""), "a sudo shell bypasses root_shell");
+    }
+
+    #[test]
+    fn a_busy_gpu_provisions_as_a_gpu_node_and_a_missing_one_does_not() {
+        use super::gpu_tier;
+        use crate::host_exec::GpuProbe;
+        assert_eq!(gpu_tier(GpuProbe::Present), "2");
+        assert_eq!(gpu_tier(GpuProbe::Busy), "2");
+        assert_eq!(gpu_tier(GpuProbe::Missing), "3");
+    }
+
     // The controller must never stage a bundle the node's applier cannot
     // parse. host6 sat in that deadlock for a day (2026-09-19): every
     // restage refused with `unknown kind 'harness-binary'`, and the fix
@@ -4844,7 +4936,7 @@ mod tests {
     #[test]
     fn the_local_lane_reissues_on_missing_controller_names() {
         let whole = include_str!("provision.rs");
-        let src = whole.split("#[cfg(test)]").next().unwrap();
+        let src = crate::test_src::own_code(whole);
         let local = &src[src.find("fn provision_local_in(").expect("provision_local_in")..];
         let body = &local[..local.find("ensure_door_leaves_try(").expect("door leaves step")];
         assert!(body.contains("cert_covers_sans(&node_crt, role.required_dns()"), "coverage test missing");
@@ -4857,7 +4949,7 @@ mod tests {
         let whole = include_str!("provision.rs");
         // Only the real code: the literals in this test would otherwise
         // match themselves.
-        let src = whole.split("#[cfg(test)]").next().unwrap();
+        let src = crate::test_src::own_code(whole);
         let calls: Vec<&str> = src
             .match_indices("pki_issue_node(")
             .map(|(i, _)| &src[i..(i + 200).min(src.len())])
@@ -4880,7 +4972,7 @@ mod tests {
     #[test]
     fn every_prep_insecure_site_carries_the_ca_pin() {
         let whole = include_str!("provision.rs");
-        let src = whole.split("#[cfg(test)]").next().unwrap();
+        let src = crate::test_src::own_code(whole);
         let sites: Vec<usize> = src.match_indices("\"PREP_INSECURE=1\"").map(|(i, _)| i).collect();
         assert!(!sites.is_empty(), "no PREP_INSECURE=1 site found — did it move?");
         for i in sites {
@@ -4900,7 +4992,7 @@ mod tests {
     #[test]
     fn retired_backend_tls_switches_are_not_rendered() {
         let whole = include_str!("provision.rs");
-        let src = whole.split("#[cfg(test)]").next().unwrap();
+        let src = crate::test_src::own_code(whole);
         for key in ["noo_vllm_tls", "noo_llamacpp_tls", "noo_ollama_tls"] {
             assert!(!src.contains(&format!("vars.insert(\"{key}\"")), "{key} is rendered again");
         }
@@ -5336,9 +5428,8 @@ mod self_node_rail_tests {
         assert!(e.contains("ca.crt") || e.contains("prep-host"), "{e}");
         let _ = std::fs::remove_dir_all(&base);
         // And the onboard caller warns and goes on, never `fail`s.
-        let steps = include_str!("../onboard/steps.rs");
-        let f = &steps[steps.find("fn ensure_self_agent(").unwrap()..];
-        let f = &f[..f.find("\n}\n").unwrap()];
+        let steps = crate::test_src::own_code(include_str!("../onboard/steps.rs"));
+        let f = crate::test_src::fn_body(&steps, "fn ensure_self_agent(");
         assert!(f.contains("if let Err(e) = crate::commands::provision::provision_local("), "{f}");
         assert!(f.contains("provision_one(ctx.g, &node_id, &[])"), "the rail branch runs in a child");
         assert!(!f.contains("fail("), "{f}");
@@ -5392,9 +5483,9 @@ mod self_node_rail_tests {
         assert_eq!(pull_target_cert(false, || panic!("local read for a remote node"), || Some("REC".into())),
             Some("REC".into()));
         let whole = include_str!("provision.rs");
-        let src = whole.split("#[cfg(test)]").next().unwrap();
-        let f = &src[src.find("pub(crate) fn stage_bundle_pull(").unwrap()..];
-        assert!(f[..f.find("\n}\n").unwrap()].contains("pull_target_cert(is_self"));
+        let src = crate::test_src::own_code(whole);
+        let f = crate::test_src::fn_body(&src, "pub(crate) fn stage_bundle_pull(");
+        assert!(f.contains("pull_target_cert(is_self"));
     }
 
     #[test]
@@ -5453,7 +5544,7 @@ mod self_node_rail_tests {
     #[test]
     fn the_rail_verb_has_no_sudo_lane_and_builds_the_self_node_locally() {
         let whole = include_str!("provision.rs");
-        let src = whole.split("#[cfg(test)]").next().unwrap();
+        let src = crate::test_src::own_code(whole);
         // The rail verb is the phase list plus every phase it runs.
         let body = phase_src::verb();
         assert!(!body.contains("provision_local("), "the rail verb must not call the first-install lane");
@@ -5476,16 +5567,14 @@ mod self_node_rail_tests {
         let applied = apply.find("reported: applied (exit 0)").expect("the applied arm");
         let call = apply.find("after_self_applied(g, &node, msg)").expect("the self node's post-apply steps");
         assert!(applied < call, "the self steps run only after the node reported exit 0");
-        let aa = &src[src.find("fn after_applied(").unwrap()..];
-        let aa = &aa[..aa.find("\n}\n").unwrap()];
+        let aa = crate::test_src::fn_body(&src, "fn after_applied(");
         let lane = aa.find("write_self_lane(node, SelfLaneRecord::Rail)").expect("the lane record");
         let hostd = aa.find("refresh_controller_hostd(").expect("the hostd restart");
         assert!(aa.find("if self_steps").unwrap() < lane && lane < hostd, "{aa}");
         assert!(aa.contains(r#"applier_applied(msg, "hostd-binary")"#), "{aa}");
         let up = include_str!("upgrade.rs");
-        let up = up.split("#[cfg(test)]").next().unwrap();
-        let f = &up[up.find("fn upgrade_self_node(").unwrap()..];
-        let f = &f[..f.find("\n}\n").unwrap()];
+        let up = crate::test_src::own_code(up);
+        let f = crate::test_src::fn_body(&up, "fn upgrade_self_node(");
         assert!(f.contains(r#"provision_one(g, me, &["--stage-only"])"#), "{f}");
         assert!(!f.contains("--local"), "{f}");
     }
@@ -5708,7 +5797,7 @@ mod local_lane_tests {
         assert!(!s.contains("/etc/noo/self-node"), "no root-written copy for the gateway: {s}");
         assert!(!script(&[], false).contains("openssl req"), "no prep: no identity step");
         let whole = include_str!("provision.rs");
-        let src = whole.split("#[cfg(test)]").next().unwrap();
+        let src = crate::test_src::own_code(whole);
         assert!(src.contains(r#".arg(format!("PREP_BIRTH_KEY={}/birth.key", work.display()))"#));
         assert!(src.contains("let prep_cmd = if prep_current && units_missing.is_empty()"),
             "prep re-runs while a pull unit is missing");
@@ -5924,9 +6013,8 @@ mod upgrade_stages_every_node_before_waiting_tests {
     #[test]
     fn the_nodes_phase_stages_all_then_waits_once() {
         let up = include_str!("upgrade.rs");
-        let up = up.split("#[cfg(test)]").next().unwrap();
-        let f = &up[up.find("fn upgrade_nodes(").unwrap()..];
-        let f = &f[..f.find("\n}\n").unwrap()];
+        let up = crate::test_src::own_code(up);
+        let f = crate::test_src::fn_body(&up, "fn upgrade_nodes(");
         let stage = f.find(r#"provision_one(g, n, &["--stage-only"])"#).expect("remote nodes are staged with --stage-only");
         let me = f.rfind("upgrade_self_node(g, me, &mut failed, &mut pending)").expect("the self node is staged into the same pending list");
         let wait = f.rfind("wait_and_settle_nodes(g, &pending").expect("the combined wait");
@@ -5943,13 +6031,12 @@ mod upgrade_stages_every_node_before_waiting_tests {
     #[test]
     fn the_self_nodes_post_apply_steps_have_one_function_and_two_callers() {
         let prov = include_str!("provision.rs");
-        let prov = prov.split("#[cfg(test)]").next().unwrap();
+        let prov = crate::test_src::own_code(prov);
         let up = include_str!("upgrade.rs");
-        let up = up.split("#[cfg(test)]").next().unwrap();
+        let up = crate::test_src::own_code(up);
         let verb = super::phase_src::body("await_apply");
         assert!(verb.contains("after_self_applied(g, &node, msg)"), "the single-node verb");
-        let settle = &up[up.find("fn settle_end(").unwrap()..];
-        let settle = &settle[..settle.find("\n}\n").unwrap()];
+        let settle = crate::test_src::fn_body(&up, "fn settle_end(");
         assert!(settle.contains("after_self_applied(g, n, &msg)"), "the combined wait");
         for (name, body) in [("provision.rs", prov), ("upgrade.rs", up)] {
             assert_eq!(body.matches("refresh_controller_hostd(").count(), if name == "provision.rs" { 2 } else { 0 },
@@ -6041,16 +6128,16 @@ mod mac_runner_env_tests {
 /// owns a behaviour (`body`), or reads the whole verb (`verb`).
 #[cfg(test)]
 pub(crate) mod phase_src {
-    fn code() -> &'static str {
-        include_str!("provision.rs").split("#[cfg(test)]").next().expect("non-test source")
+    /// This file as guards read it: comments blanked, every `#[cfg(test)]`
+    /// item removed whole (followup 215, `crate::test_src`).
+    pub(crate) fn code() -> &'static str {
+        static CODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        CODE.get_or_init(|| crate::test_src::own_code(include_str!("provision.rs")))
     }
 
-    /// `fn <name>(` through the first column-0 closing brace.
+    /// `fn <name>(` through its own closing brace; panics when it is gone.
     pub(crate) fn body(name: &str) -> &'static str {
-        let code = code();
-        let start = code.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("fn {name} not found in provision.rs"));
-        let rest = &code[start..];
-        &rest[..rest.find("\n}\n").unwrap_or_else(|| panic!("end of fn {name}"))]
+        crate::test_src::fn_body(code(), &format!("fn {name}("))
     }
 
     /// The ordered phase list of `noo cluster provision`.

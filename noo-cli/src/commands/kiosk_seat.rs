@@ -782,9 +782,29 @@ fn read_kiosk_env(text: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn kiosk_json(env: &BTreeMap<String, String>) -> Value {
+/// What reading `/etc/default/kiosk` gave this seat: its keys, and where
+/// they came from. "" for every setting used to mean three things (not set
+/// up, unreadable, or really empty), so the controller could not tell a
+/// display it may not read from one with no setup at all.
+struct KioskEnv {
+    keys: BTreeMap<String, String>,
+    /// `read`, `absent`, or `unreadable: <error>`.
+    source: String,
+}
+
+fn kiosk_env_from(read: std::io::Result<String>) -> KioskEnv {
+    match read {
+        Ok(t) => KioskEnv { keys: read_kiosk_env(&t), source: "read".into() },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => KioskEnv { keys: BTreeMap::new(), source: "absent".into() },
+        Err(e) => KioskEnv { keys: BTreeMap::new(), source: format!("unreadable: {e}") },
+    }
+}
+
+fn kiosk_json(kenv: &KioskEnv) -> Value {
+    let env = &kenv.keys;
     let get = |k: &str| env.get(k).cloned().unwrap_or_default();
     json!({
+        "env": kenv.source,
         "user": get("NOO_KIOSK_USER"),
         "mode": get("NOO_KIOSK_MODE"),
         "vt": get("NOO_KIOSK_VT"),
@@ -1164,7 +1184,7 @@ pub fn kiosk_enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         cleanup(&work);
         fail(g.json, ExitCode::Generic, "birth_key", "openssl could not generate the birth keypair", Some("sudo apt install openssl"));
     }
-    let kiosk_env = std::fs::read_to_string(super::kiosk::ENV_FILE).ok().map(|t| read_kiosk_env(&t)).unwrap_or_default();
+    let kiosk_env = kiosk_env_from(std::fs::read_to_string(super::kiosk::ENV_FILE));
     let facts = json!({
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
@@ -1351,7 +1371,7 @@ fn heartbeat_body_with(cfg: &SeatConfig, state: &SeatState, layout: &str, cli_ve
     let user_sha = std::fs::read(cfg.cli_path()).ok().map(|b| sha256_hex(&b));
     let console = sh_out(Command::new(format!("{KIOSK_BIN}/noo-kiosk-cdp")).arg("build"))
         .filter(|b| !b.is_empty() && b != "null");
-    let kiosk_env = std::fs::read_to_string(super::kiosk::ENV_FILE).ok().map(|t| read_kiosk_env(&t)).unwrap_or_default();
+    let kiosk_env = kiosk_env_from(std::fs::read_to_string(super::kiosk::ENV_FILE));
     json!({
         "cli_version": cli_version,
         "layout": layout,
@@ -1867,12 +1887,20 @@ pub(crate) fn seat_row(seat: &Value, now: i64) -> Vec<String> {
         (Some(st), Some(ap), Some(rc)) if st == ap => ui::bad(&format!("apply failed (exit {rc})")),
         _ => ui::warn("staged, not applied"),
     };
+    // A seat that could not read its env file says so in the mode column;
+    // the settings are unknown, not empty. Seats older than the `env` field
+    // send none and keep the old columns.
+    let (mode, view, quality) = match hb["kiosk"]["env"].as_str() {
+        Some(src) if src.starts_with("unreadable") => (ui::bad("env unreadable"), String::new(), String::new()),
+        Some("absent") => (ui::warn("not set up"), String::new(), String::new()),
+        _ => (text(&hb["kiosk"]["mode"]), text(&hb["kiosk"]["view"]), text(&hb["kiosk"]["quality"])),
+    };
     vec![
         text(&seat["seat_name"]),
         seen,
-        text(&hb["kiosk"]["mode"]),
-        text(&hb["kiosk"]["view"]),
-        text(&hb["kiosk"]["quality"]),
+        mode,
+        view,
+        quality,
         text(&hb["console_build"]),
         text(&hb["cli_version"]),
         bundle,
@@ -1992,10 +2020,17 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
     } else {
         check("seat cli", Verdict::Ok, format!("{cli} = controller"), None)
     });
+    let env_src = hb["kiosk"]["env"].as_str().unwrap_or("");
+    let env_unreadable = env_src.starts_with("unreadable");
+    if env_unreadable {
+        out.push(check("kiosk env", Verdict::Warn,
+            format!("the seat cannot read {} ({env_src}): its mode, view and quality are unknown", super::kiosk::ENV_FILE),
+            Some(format!("on {name}: sudo chown root:root {f} && sudo chmod {m} {f}", f = super::kiosk::ENV_FILE, m = super::kiosk::ENV_MODE))));
+    }
     let serve = hb["kiosk_serve"].as_str().unwrap_or("unknown");
     out.push(match serve {
         "active" => check("kiosk-serve", Verdict::Ok, "active".into(), None),
-        "inactive" | "unknown" if hb["kiosk"]["user"].as_str().unwrap_or("").is_empty() =>
+        "inactive" | "unknown" if !env_unreadable && hb["kiosk"]["user"].as_str().unwrap_or("").is_empty() =>
             check("kiosk-serve", Verdict::Warn, "no kiosk set up on this seat".into(),
                 Some(format!("on {name}: noo kiosk setup --mode dedicated --url https://<controller>.<tailnet>.ts.net"))),
         other => check("kiosk-serve", Verdict::Fail, other.to_string(), Some(format!("on {name}: journalctl -u kiosk-serve -n 50"))),
@@ -2114,21 +2149,21 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
     let mut failed: Vec<String> = Vec::new();
     for s in &seats {
         let name = s["seat_name"].as_str().unwrap_or("?").to_string();
-        println!();
-        println!("{}", ui::item(&format!("seat {name}")));
+        ui::blank();
+        ui::say(&ui::item(&format!("seat {name}")));
         match stage_seat(g, s) {
             Ok(sha) => {
-                println!("{}", ui::sub(&ui::status_line(Glyph::Ok, "staged (CLI + kiosk assets, signed, encrypted to the seat's birth cert)")));
+                ui::say(&ui::sub(&ui::status_line(Glyph::Ok, "staged (CLI + kiosk assets, signed, encrypted to the seat's birth cert)")));
                 pending.push(super::provision::PendingApply { node: name, sha, legacy: false });
             }
             Err(e) => {
-                println!("{}", ui::sub(&ui::status_line(Glyph::Err, &format!("not staged: {e}"))));
+                ui::say_err(&ui::sub(&ui::status_line(Glyph::Err, &format!("not staged: {e}"))));
                 failed.push(name);
             }
         }
     }
     if !pending.is_empty() {
-        println!();
+        ui::blank();
         let ends = super::provision::wait_applied_via(g, &pending, 600, 5,
             &|n| format!("/api/cluster/seats/{n}/status"), "seat");
         let tag = super::cluster_verify::controller_stack_tag();
@@ -2158,13 +2193,13 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
                 rows.push(json!({"seat": n, "ok": seat_ok, "outcome": format!("{end:?}"),
                     "checks": checks.iter().map(|c| json!({"name": c.name, "verdict": format!("{:?}", c.verdict), "detail": c.detail})).collect::<Vec<_>>()}));
             } else {
-                println!();
-                println!("{}", ui::item(&format!("seat {n}")));
+                ui::blank();
+                ui::say(&ui::item(&format!("seat {n}")));
                 match &end {
                     super::provision::ApplyEnd::Applied { rc: 0, .. } => {}
-                    super::provision::ApplyEnd::Applied { rc: _, msg } => println!("{}", ui::sub(&ui::status_line(Glyph::Err,
+                    super::provision::ApplyEnd::Applied { rc: _, msg } => ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
                         &format!("apply failed: {}", msg.trim_start_matches("apply failed: ").chars().take(300).collect::<String>())))),
-                    other => println!("{}", ui::sub(&ui::status_line(Glyph::Err, &format!("{other:?} within 10m")))),
+                    other => ui::say_err(&ui::sub(&ui::status_line(Glyph::Err, &format!("{other:?} within 10m")))),
                 }
                 for c in &checks {
                     let glyph = match c.verdict {
@@ -2172,7 +2207,7 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
                         super::cluster_verify::Verdict::Fail => Glyph::Err,
                         _ => Glyph::Warn,
                     };
-                    println!("{}", ui::sub(&ui::status_line(glyph, &format!("{}: {}", c.name, c.detail))));
+                    ui::say(&ui::sub(&ui::status_line(glyph, &format!("{}: {}", c.name, c.detail))));
                 }
             }
         }
@@ -2455,6 +2490,16 @@ mod tests {
         let mut down = good.clone();
         down["heartbeat"]["kiosk_serve"] = json!("failed");
         assert!(seat_checks(&down, "0.6.5", "stack-v0.6.5", now).iter().any(|c| c.name == "kiosk-serve" && c.verdict == Verdict::Fail));
+        // An env file the seat cannot read is its own warning, never "no kiosk set up".
+        let mut blind = good.clone();
+        blind["heartbeat"]["kiosk"] = json!({"env": "unreadable: permission denied", "user": "", "mode": "", "quality": ""});
+        blind["heartbeat"]["kiosk_serve"] = json!("inactive");
+        let bc = seat_checks(&blind, "0.6.5", "stack-v0.6.5", now);
+        let env = bc.iter().find(|c| c.name == "kiosk env").expect("an unreadable env file gets a verdict");
+        assert_eq!(env.verdict, Verdict::Warn);
+        assert!(env.detail.contains("permission denied") && env.remedy.as_deref().unwrap_or("").contains("chmod 0644"), "{env:?}");
+        assert!(!bc.iter().any(|c| c.detail.contains("no kiosk set up")), "{bc:?}");
+        assert!(!c.iter().any(|c| c.name == "kiosk env"), "a readable env file adds no check");
         assert!(seat_checks(&good, "0.6.5", "stack-v0.6.5", now + 600).iter().any(|c| c.name == "seat online" && c.verdict == Verdict::Fail));
         assert!(seat_checks(&good, "0.6.5", "v0.6.6", now).iter().any(|c| c.name == "display" && c.verdict == Verdict::Fail));
         assert_eq!(report_word(good["apply_msg"].as_str().unwrap(), "display"), Some("reloaded"));
@@ -2489,6 +2534,35 @@ mod tests {
                                    "console_build": "stack-v0.6.13", "kiosk": {"user": "alex"}});
         let c = seat_checks_after_apply(&seat, "0.6.13", "stack-v0.6.13", now);
         assert!(c.iter().all(|c| c.verdict == Verdict::Ok), "{c:?}");
+    }
+
+    #[test]
+    fn an_unreadable_env_file_is_reported_never_folded_into_empty() {
+        let denied = kiosk_env_from(Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
+        let k = kiosk_json(&denied);
+        let src = k["env"].as_str().expect("env source present");
+        assert!(src.starts_with("unreadable: "), "{src}");
+        assert!(src.len() > "unreadable: ".len(), "the cause is named: {src}");
+        // Absent is its own answer, not "unreadable" and not "".
+        assert_eq!(kiosk_json(&kiosk_env_from(Err(std::io::Error::from(std::io::ErrorKind::NotFound))))["env"], "absent");
+        let ok = kiosk_json(&kiosk_env_from(Ok("NOO_KIOSK_MODE=dedicated\nNOO_KIOSK_QUALITY=lean\n".into())));
+        assert_eq!(ok["env"], "read");
+        assert_eq!(ok["mode"], "dedicated");
+        assert_eq!(ok["quality"], "lean");
+    }
+
+    #[test]
+    fn the_seat_table_names_an_unreadable_env_file() {
+        let row = |kiosk: Value| seat_row(&json!({"seat_name": "hs", "heartbeat": {"kiosk": kiosk}}), 0);
+        let unreadable = row(json!({"env": "unreadable: permission denied", "mode": "", "view": "", "quality": ""}));
+        assert!(unreadable[2].contains("env unreadable"), "{unreadable:?}");
+        let absent = row(json!({"env": "absent", "mode": "", "view": "", "quality": ""}));
+        assert!(absent[2].contains("not set up"), "{absent:?}");
+        let read = row(json!({"env": "read", "mode": "dedicated", "view": "graph", "quality": "lean"}));
+        assert_eq!(&read[2..5], &["dedicated".to_string(), "graph".into(), "lean".into()]);
+        // A seat from before the `env` field keeps the old columns.
+        let old = row(json!({"mode": "shared", "view": "health", "quality": ""}));
+        assert_eq!(old[2], "shared");
     }
 
     #[test]
@@ -3101,7 +3175,7 @@ exec {real_install} "$@"
         // `seat_agent`; the node's `ca_agent` trusts the cluster CA alone and
         // refuses the front door's public certificate (homeserver, 10-17).
         let src = include_str!("kiosk_seat.rs");
-        let prod = &src[..src.find("#[cfg(test)]").unwrap()];
+        let prod = crate::test_src::own_code(src);
         assert!(!prod.contains("enroll::ca_agent("), "a seat call uses the cluster-CA-only client");
         assert_eq!(prod.matches("seat_agent(&").count(), 2, "redeem + seat-sync both use seat_agent");
     }

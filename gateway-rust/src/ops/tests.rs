@@ -883,20 +883,11 @@ fn every_registered_type_has_a_unique_name_and_a_real_route() {
 
 // ───────────────────────────── one code path ─────────────────────────────
 
-/// The body of `fn <name>(` up to the next top-level item.
+/// The body of `fn <name>(`, bounded by its own matching brace, comments
+/// blanked: a guard that reads prose would pass or fail on a sentence.
 fn fn_body(src: &str, name: &str) -> String {
-    let code = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
-    let start = code.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("fn {name} not found"));
-    let rest = &code[start..];
-    let end = ["\nasync fn ", "\npub(super) async fn ", "\npub(crate) async fn ", "\nfn ", "\npub(super) fn ", "\npub(super) const ", "\npub(crate) fn ", "\n/// "]
-        .iter()
-        .filter_map(|m| rest[1..].find(m))
-        .min()
-        .map(|i| i + 1)
-        .unwrap_or(rest.len());
-    // Comments are prose about the code, not the code: a guard that reads
-    // them would pass or fail on a sentence.
-    rest[..end].lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+    let own = crate::test_src::own_code(src);
+    crate::test_src::fn_body(&own, &format!("fn {name}(")).to_string()
 }
 
 #[test]
@@ -1930,9 +1921,8 @@ async fn a_worker_error_fails_the_op_and_is_audited_without_its_text() {
 #[test]
 fn the_audit_intent_row_precedes_the_worker_call_in_the_source() {
     let src = include_str!("../routes/knowledge.rs");
-    let start = src.find("pub(crate) async fn entity_cleanup_run").expect("entity_cleanup_run");
-    let b = &src[start..];
-    let b = &b[..b.find("\n}\n").unwrap()];
+    let own = crate::test_src::own_code(src);
+    let b = crate::test_src::fn_body(&own, "pub(crate) async fn entity_cleanup_run");
     let required = b.find("audit::record_required(").expect("an applied run is audited through audit::record_required");
     let worker = b.find("ask_worker(").expect("asks the worker");
     assert!(required < worker, "audit first, then delete");

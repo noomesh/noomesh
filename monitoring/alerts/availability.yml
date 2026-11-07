@@ -25,6 +25,20 @@ groups:
           summary: "PAI gateway is not reporting up"
           description: "noo_gateway_up is absent or 0 for >1m — the gateway may be down."
 
+      # 2026-11-02: the pop-os gateway reached RLIMIT_NOFILE (1024) after ~45 h
+      # and could not read its secrets or reach Postgres for five hours.
+      # The gateway exports both gauges (fd_watch.rs) and alerts on its own;
+      # this rule is the same 70% line, from outside the process.
+      - alert: GatewayFdsHigh
+        expr: process_open_fds{job="gateway"} / process_max_fds{job="gateway"} > 0.7
+        for: 10m
+        labels:
+          severity: warning
+          category: availability
+        annotations:
+          summary: "Gateway holds {{ $value | humanizePercentage }} of its fd limit"
+          description: "process_open_fds / process_max_fds > 70% for >10m. At the limit the gateway cannot open sockets, secret files or DB connections. `noo cluster verify` (gateway fds); restart with `noo stack restart gateway`."
+
       - alert: NatsDLQBacklog
         expr: nats_dlq_pending > 100
         for: 10m

@@ -20,6 +20,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tests import _rust_src as rs
+
 ROOT = Path(__file__).resolve().parents[1]
 LOGSHIP = ROOT / "node-agent-go/internal/logship"
 
@@ -56,8 +58,8 @@ def test_the_gateway_forwards_to_loki_over_https_only() -> None:
     """The second hop (phase 6). The gateway's `NOO_LOKI_URL` default in compose
     is https, and the ingest route builds its push URL from that value with no
     scheme of its own — so there is no `http://` anywhere on the path a log
-    line takes. The test module of logs_ingest.rs dials a local listener over
-    http and is cut off before the scan."""
+    line takes. The test items of logs_ingest.rs dial a local listener over
+    http and are removed before the scan."""
     compose = (ROOT / "docker-compose.cluster.yml").read_text()
     defaults = re.findall(r"NOO_LOKI_URL=\$\{NOO_LOKI_URL:-([^}]+)\}", compose)
     assert defaults, "compose no longer sets NOO_LOKI_URL with a default — the parse found nothing"
@@ -65,7 +67,7 @@ def test_the_gateway_forwards_to_loki_over_https_only() -> None:
         assert d.startswith("https://"), f"NOO_LOKI_URL defaults to a plaintext Loki: {d}"
 
     ingest = (ROOT / "gateway-rust/src/routes/logs_ingest.rs").read_text()
-    code = _code_only(ingest.split("#[cfg(test)]", 1)[0])
+    code = rs.own_code(ingest)
     assert '"/loki/api/v1/push"' in code or "/loki/api/v1/push" in code, "the forward URL is no longer Loki's push route"
     assert '"http://' not in code, "logs_ingest.rs builds a plaintext URL"
     assert "cluster_client()" in code, "the forward no longer uses the gateway's mTLS client"

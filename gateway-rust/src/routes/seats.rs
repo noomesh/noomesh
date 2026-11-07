@@ -648,13 +648,23 @@ async fn seat_bundle_status(
 /// The birth cert recorded for this SEAT. Reads `noo_seats` and nothing
 /// else: a node's cert can never answer for a seat, and the node routes'
 /// `birth_cert_for` never reads this table.
-async fn seat_cert_for(db: &sqlx::PgPool, seat: &str) -> Option<String> {
+///
+/// `Ok(None)` means no row: the seat is not enrolled. A database error is a
+/// 503 that names it, never "no cert": on 2026-11-02 a gateway out of file
+/// descriptors refused the homeserver seat as `NoBirthCert` and told the
+/// operator to re-enroll a seat whose row was there all along.
+async fn seat_cert_for(db: &sqlx::PgPool, seat: &str) -> Result<Option<String>, AppError> {
     sqlx::query_scalar::<_, String>("SELECT birth_cert FROM noo_seats WHERE seat_name = $1")
         .bind(seat)
         .fetch_optional(db)
         .await
-        .ok()
-        .flatten()
+        .map_err(|e| {
+            tracing::error!(seat = %seat, error = %e, "seat_cert_read_failed");
+            AppError::Unavailable(format!(
+                "cannot read the birth certificate recorded for seat '{seat}': the database \
+                 answered {e}. The seat's proof was not checked; nothing about the seat is wrong"
+            ))
+        })
 }
 
 /// Verify a seat proof, or 403. There is no other credential on these routes:
@@ -669,7 +679,7 @@ async fn check_seat_proof(
 ) -> Result<(), AppError> {
     debug_assert!(purpose.is_seat());
     let header = headers.get(BIRTH_PROOF_HEADER).and_then(|v| v.to_str().ok());
-    let cert = seat_cert_for(db, seat).await;
+    let cert = seat_cert_for(db, seat).await?;
     let now = chrono::Utc::now().timestamp();
     crate::birth_proof::verify(header, purpose, seat, sha, cert.as_deref(), now).map_err(|e| {
         tracing::warn!(seat = %seat, reason = ?e, "seat_proof_rejected");
@@ -858,12 +868,12 @@ mod tests {
     #[test]
     fn seat_and_node_tokens_live_in_separate_tables() {
         let seats = include_str!("seats.rs");
-        let prod = seats.split("#[cfg(test)]").next().unwrap();
+        let prod = crate::test_src::own_code(seats);
         assert!(prod.contains("FROM noo_seat_tokens WHERE token_hash"));
         assert!(!prod.contains("FROM noo_bootstrap_tokens WHERE token_hash"), "the seat lane must not redeem node tokens");
         assert!(!prod.contains("UPDATE noo_bootstrap_tokens"), "the seat lane must not write node tokens");
         let boot = include_str!("bootstrap.rs");
-        let boot = boot.split("#[cfg(test)]").next().unwrap();
+        let boot = crate::test_src::own_code(boot);
         assert!(!boot.contains("noo_seat_tokens"), "the node redemption must not read seat tokens");
         assert!(!boot.contains("noo_seats"), "node birth certs never come from the seat registry");
         assert!(crate::auth_refresh::generate_seat_token().starts_with("noo-st-"));
@@ -875,29 +885,46 @@ mod tests {
     #[test]
     fn every_seat_rail_route_requires_a_seat_proof() {
         let src = include_str!("seats.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let prod = crate::test_src::own_code(src);
         for (handler, purpose) in [
             ("async fn seat_bundle_get(", "Purpose::SeatGet"),
             ("async fn seat_fetch_receipt(", "Purpose::SeatFetch"),
             ("async fn seat_apply_report(", "Purpose::SeatApply"),
             ("async fn seat_heartbeat(", "Purpose::SeatHeartbeat"),
         ] {
-            let body = prod.split(handler).nth(1).expect(handler);
-            let body = &body[..body.find("\nasync fn ").or_else(|| body.find("\n// ═")).unwrap_or(body.len())];
+            let body = crate::test_src::fn_body(&prod, handler);
             assert!(body.contains("check_seat_proof("), "{handler} must check a seat proof");
             assert!(body.contains(purpose), "{handler} must sign {purpose}");
         }
-        let lookup = prod.split("async fn seat_cert_for(").nth(1).unwrap();
-        let lookup = &lookup[..lookup.find("\n}").unwrap()];
+        let lookup = crate::test_src::fn_body(&prod, "async fn seat_cert_for(");
         assert!(lookup.contains("FROM noo_seats") && !lookup.contains("noo_bootstrap_tokens"));
+    }
+
+    /// A database that cannot answer is a 503 naming the error, never the
+    /// `NoBirthCert` 403 that tells the operator to re-enroll (2026-11-02:
+    /// the homeserver seat, a gateway out of file descriptors).
+    #[tokio::test]
+    async fn an_unreadable_seat_cert_is_a_503_not_no_birth_cert() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool");
+        let got = check_seat_proof(&pool, &HeaderMap::new(), Purpose::SeatHeartbeat, "homeserver", "abc").await;
+        match got {
+            Err(AppError::Unavailable(m)) => {
+                assert!(m.contains("cannot read the birth certificate recorded for seat 'homeserver'"), "{m}");
+                assert!(!m.contains("re-enroll") && !m.contains("NoBirthCert"), "{m}");
+            }
+            other => panic!("expected a 503, got {other:?}"),
+        }
     }
 
     /// The enrolment answer carries no credential.
     #[test]
     fn the_enrolment_response_hands_out_nothing() {
         let src = include_str!("seats.rs");
-        let body = src.split("async fn seat_enroll(").nth(1).unwrap();
-        let body = &body[..body.find("\n}\n").unwrap()];
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "async fn seat_enroll(");
         let resp = body.split("Ok(Json(json!({").nth(1).unwrap();
         for leak in ["secret", "token\"", "nats", "leaf", "key", "password"] {
             assert!(!resp.to_lowercase().contains(leak), "the seat-enroll response must not carry {leak}");

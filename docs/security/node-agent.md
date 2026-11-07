@@ -534,9 +534,13 @@ The backend's own port is never published on the host.
 | airllm | `http://noo-airllm:8000` | **plaintext, by the same named exception as compose**: opt-in, experimental; the deferred private-network step covers it |
 
 The sidecar is one shape reused per backend (`internal/docker/sidecar.go`):
-the compose `Dockerfile.stunnel` image when a node has it (`STUNNEL_IMAGE`,
-then `NOO_IMAGE_PREFIX/stunnel:NOO_IMAGE_TAG`, then `noomesh/stunnel:latest`),
-else plain alpine with stunnel installed at first start; the conf travels
+the published `Dockerfile.stunnel` image (`STUNNEL_IMAGE` when set, else
+`NOO_IMAGE_PREFIX/stunnel:NOO_IMAGE_TAG`, taken locally or over the rail),
+and nothing else: when it is not staged the start fails and names it, with
+`noo cluster sync-images --stage-only --lock` as the fix (the controller-only
+`noomesh/stunnel:latest` and the alpine-plus-`apk add` fallback are retired,
+so a door never installs software at start and always runs on a read-only
+root); the conf travels
 in `STUNNEL_CONF` (the agent owns no host directory a root-in-container
 sidecar should read from); `no-new-privileges`, `CapDrop ALL` plus
 `DAC_OVERRIDE` to read the leaf key, and `NET_BIND_SERVICE` only for a
@@ -684,7 +688,11 @@ generation it was given (compare-and-set) or it is `409 held_by_other` with
 the current lease, so a stale retry can never end another operation's hold.
 `purpose` is a closed set: absent, or `user` for the operator's own use of
 the GPU (noomesh-internal i344b), which the lease carries; any other value,
-or `user` beside a `workload`, is refused and no hold is taken.
+or `user` beside a `workload`, is refused and no hold is taken. `for_secs` (60 s to 7 days, only with
+`purpose: user`) sets `expires_at` on the lease: the agent ends the hold at
+that time and returns to the automatic policy (no resume-now), also after a
+restart; the same operation asking again moves it. Any other use of
+`for_secs` is refused.
 `force` takes over or ends any hold and the gateway audits it as a force; a
 body with no operation id is a legacy call from an older CLI, treated as a
 force and audited `legacy`. One hold or release runs per node at a time

@@ -46,6 +46,11 @@ pub(crate) const WATCHDOG: &str = include_str!("kiosk_assets/noo-kiosk-watchdog"
 pub(crate) const SERVE: &str = include_str!("kiosk_assets/noo-kiosk-serve");
 
 pub const ENV_FILE: &str = "/etc/default/kiosk";
+/// root:root 0644. It holds no secret (the keyless mint; pinned by
+/// `the_env_file_never_holds_a_key_shaped_line`), and the seat's sync, which
+/// runs as the seat user and not as the display user, reports what it says.
+/// At 0640 root:<display user> the seat read "" for every setting.
+pub(crate) const ENV_MODE: &str = "0644";
 pub const STATE_DIR: &str = "/var/lib/kiosk";
 const BIN_DIR: &str = "/usr/local/bin";
 const UNIT_DIR: &str = "/etc/systemd/system";
@@ -271,8 +276,8 @@ pub(crate) fn render_env(a: &SetupArgs) -> String {
     let poll = a.poll.map(|p| p.to_string()).unwrap_or_default();
     let quality = a.quality.clone().unwrap_or_default();
     format!(
-        "# Written by `noo kiosk setup`. root:{user} 0640 — the kiosk user reads it,\n\
-         # nobody else.\n\
+        "# Written by `noo kiosk setup`. root:root 0644: nothing here is secret,\n\
+         # and the seat's sync reads it to report the display's settings.\n\
          #\n\
          # THERE IS NO KEY HERE, and that is the design. The display mints its\n\
          # short-lived token by proving its tailnet identity: it publishes a\n\
@@ -681,7 +686,7 @@ pub fn kiosk_setup(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         None => (BIN_DIR, "0755", "root"),
     };
     let files: Vec<(String, String, &str, &str)> = vec![
-        (ENV_FILE.into(), render_env(&a), "0640", "root"),
+        (ENV_FILE.into(), render_env(&a), ENV_MODE, "root"),
         (format!("{run_dir}/noo-kiosk-launch"), LAUNCH.into(), run_mode, run_owner),
         (format!("{run_dir}/noo-kiosk-cdp"), CDP.into(), run_mode, run_owner),
         (format!("{BIN_DIR}/noo-kiosk-watchdog"), WATCHDOG.into(), "0755", "root"),
@@ -787,11 +792,10 @@ pub fn kiosk_setup(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // 2. the files
     for (p, c, m, o) in &files {
         ui::step(&format!("installing {p}"));
-        // The env file is root:kiosk so the launcher (kiosk) can read it
-        // and nothing else on the box can; a seat's shared-dir scripts are
-        // <seat user>:<display group>.
+        // The env file is root:root 0644 (ENV_MODE); a seat's shared-dir
+        // scripts are <seat user>:<display group>.
         let group = if p == ENV_FILE {
-            a.user.as_str()
+            "root"
         } else if seat_user.is_some() && p.starts_with(super::kiosk_seat::SEAT_KIOSK_DIR) {
             display_group.as_str()
         } else {
@@ -1346,11 +1350,8 @@ pub fn kiosk_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // "The proxy has not said" is a real answer and a different one from
     // "expired". Neither is a guess.
     let unsaid = ui::muted("unknown (the proxy has published no state)").to_string();
-    let expiry = match expires {
-        Some(e) if e > now => format!("in {}s", e - now),
-        Some(_) => ui::bad("expired"),
-        None => unsaid.clone(),
-    };
+    let hb_age = heartbeat.map(|ms| (now * 1000 - ms) / 1000);
+    let expiry = token_expiry_cell(expires, minted_at, hb_age, now).unwrap_or_else(|| unsaid.clone());
     let hb = match heartbeat {
         Some(ms) => {
             let age = (now * 1000 - ms) / 1000;
@@ -1418,12 +1419,7 @@ pub fn kiosk_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ("tailscale logs", telemetry_rows_cell(&telem, "tailscale logs")),
         ("os reporters", telemetry_rows_cell(&telem, "os reporters")),
         ("graph frame", match &frame {
-            Some(v) => {
-                let ms = v["ms"].as_i64().unwrap_or(0);
-                let tier = v["quality"].as_str().unwrap_or("?");
-                let s = format!("{ms}ms of work per frame, drawing {tier}");
-                if ms > 33 { ui::warn(&s) } else { s }
-            }
+            Some(v) => graph_frame_cell(v),
             None if cdp => ui::muted("not measured (not the graph view, or the page has not painted yet)").to_string(),
             None => ui::muted("unknown (CDP not answering)").to_string(),
         }),
@@ -1734,11 +1730,21 @@ pub fn kiosk_set(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     };
     let next = with_quality(&current, quality);
     let shown = if quality.is_empty() { "auto" } else { quality };
+    // A file from 0.6.16 or older is 0640 root:<display user>, which the seat's
+    // sync cannot read. Any `set` converges it, even when the value is unchanged.
+    let stale_mode = std::fs::metadata(ENV_FILE).map(|m| env_mode_is_stale(&m)).unwrap_or(false);
     if env_line_value(&current, "NOO_KIOSK_QUALITY").as_deref() == Some(quality) {
+        let converge = if stale_mode && !dry_run { install_text(&current, ENV_FILE, ENV_MODE, "root -g root") } else { Ok(()) };
+        if let Err(e) = converge {
+            fail(g.json, ExitCode::Generic, "write", &e, Some("noo kiosk status"));
+        }
         if !g.json {
+            if stale_mode && !dry_run {
+                ui::done(&format!("{ENV_FILE} is now {ENV_MODE} root:root, so the seat can report it"));
+            }
             ui::done(&format!("quality is already {shown}; nothing changed"));
         } else {
-            println!("{}", json!({"quality": shown, "changed": false}));
+            println!("{}", json!({"quality": shown, "changed": false, "mode_converged": stale_mode && !dry_run}));
         }
         return Ok(0);
     }
@@ -1750,8 +1756,7 @@ pub fn kiosk_set(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
         return Ok(0);
     }
-    let user = env_line_value(&current, "NOO_KIOSK_USER").filter(|u| !u.is_empty()).unwrap_or_else(|| "kiosk".into());
-    if let Err(e) = install_text(&next, ENV_FILE, "0640", &format!("root -g {user}")) {
+    if let Err(e) = install_text(&next, ENV_FILE, ENV_MODE, "root -g root") {
         fail(g.json, ExitCode::Generic, "write", &e, Some("noo kiosk status"));
     }
     if let Err(e) = sh("sudo systemctl restart kiosk.service") {
@@ -1763,6 +1768,16 @@ pub fn kiosk_set(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ui::done(&format!("quality {shown}; the display restarted with it (the rest of the setup is unchanged)"));
     }
     Ok(0)
+}
+
+/// True when the env file is not root:root 0644 (an older 0640 install).
+fn env_mode_is_stale(m: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    stale_env_mode(m.mode(), m.uid(), m.gid())
+}
+
+fn stale_env_mode(mode: u32, uid: u32, gid: u32) -> bool {
+    mode & 0o7777 != 0o644 || uid != 0 || gid != 0
 }
 
 /// The value of `KEY=` in an env file's text, as written.
@@ -1850,6 +1865,46 @@ fn labels_via_proxy(port: i64) -> Option<bool> {
         .read_json()
         .ok()?;
     seat_labels(&body)
+}
+
+/// The "token expires" cell, or `None` when the proxy has not said.
+///
+/// The display lives on one events stream and makes no other authenticated
+/// request while it is busy, and the proxy mints only on a request. So a
+/// stored token can lapse while the page is live: that is not a broken
+/// display, and the cell says so instead of a bare "expired". (Since the
+/// gateway ends a kiosk stream at its token's exp, the reconnect re-mints.)
+pub(crate) fn token_expiry_cell(expires: Option<i64>, minted_at: Option<i64>, heartbeat_age: Option<i64>, now: i64) -> Option<String> {
+    let e = expires?;
+    if e > now {
+        return Some(format!("in {}s", e - now));
+    }
+    let mint = minted_at
+        .filter(|t| *t <= now)
+        .map(|t| format!(", last mint {}s ago", now - t))
+        .unwrap_or_default();
+    let ago = now - e;
+    Some(if heartbeat_age.is_some_and(|a| a <= 300) {
+        ui::warn(&format!(
+            "expired {ago}s ago{mint}; the display is live on a stream that predates it and renews on its next request"
+        ))
+    } else {
+        ui::bad(&format!("expired {ago}s ago{mint}"))
+    })
+}
+
+/// The "graph frame" cell from the page's `{ms, quality, pinned}` measure.
+/// A quality pinned by `?quality=` (`noo kiosk set quality lean|full`)
+/// turns the governor off, so its average never moves from 0: say "pinned"
+/// instead of a misleading "0ms of work per frame".
+pub(crate) fn graph_frame_cell(v: &serde_json::Value) -> String {
+    let tier = v["quality"].as_str().unwrap_or("?");
+    if v["pinned"].as_bool() == Some(true) {
+        return format!("pinned {tier} (governor off; `noo kiosk set quality auto` lets it measure)");
+    }
+    let ms = v["ms"].as_i64().unwrap_or(0);
+    let s = format!("{ms}ms of work per frame, drawing {tier}");
+    if ms > 33 { ui::warn(&s) } else { s }
 }
 
 /// The `labels` flag of a `/api/kiosk/graph` answer.
@@ -1957,7 +2012,7 @@ mod tests {
         assert!(c.contains(crate::vendor::TAILSCALE_UPLOAD_MARKER), "an operator's opt-in must stop the seat re-applying the switch: {c}");
         assert!(c.find("tee -a").unwrap() < c.find("systemctl restart tailscaled").unwrap(), "{c}");
         // And setup actually runs it.
-        let body = include_str!("kiosk.rs").split("#[cfg(test)]").next().unwrap();
+        let body = crate::test_src::own_code(include_str!("kiosk.rs"));
         assert!(body.contains("sh(&tailscale_logs_off_cmd())"), "kiosk_setup no longer switches the upload off");
         assert!(body.contains("(\"tailscale logs\""), "kiosk status shows no tailscale logs row");
     }
@@ -2151,7 +2206,7 @@ mod tests {
     fn the_proxy_allowlist_matches_the_gateway() {
         let gw_paths = gateway_list("KIOSK_READ_PATHS");
         let gw_prefixes = gateway_list("KIOSK_READ_PREFIXES");
-        assert!(gw_paths.len() >= 8, "read the gateway list wrong: {gw_paths:?}");
+        assert!(gw_paths.len() >= 7, "read the gateway list wrong: {gw_paths:?}");
 
         let src = serve_asset();
         assert_eq!(
@@ -2239,12 +2294,12 @@ mod tests {
     /// running the proxy's own publisher as an UNPRIVILEGED process into
     /// a temp dir, then asserting every row status prints is populated —
     /// and that the absent case says so rather than inventing a value.
-    /// Source with the test module cut off, so a guard can never match its
-    /// own assertions or the prose explaining them — the way two guards in
-    /// this file once passed.
-    fn own_code(src: &str) -> String {
-        let body = src.split("#[cfg(test)]").next().unwrap_or(src);
-        body.lines()
+    /// A kiosk asset (the bash launcher, the python CDP helper) without its
+    /// `//` lines. kiosk.rs itself is read through `crate::test_src::own_code`
+    /// (comments blanked, test items removed whole); these two are not Rust,
+    /// so the Rust lexer is not theirs.
+    fn asset_code(src: &str) -> String {
+        src.lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n")
@@ -2256,7 +2311,7 @@ mod tests {
     /// asked — reasonably — why the regular command would not do it.
     #[test]
     fn reloading_the_display_is_a_noo_verb() {
-        let own = own_code(include_str!("kiosk.rs"));
+        let own = crate::test_src::own_code(include_str!("kiosk.rs"));
         assert!(own.contains("pub fn kiosk_reload"), "this guard is stale: kiosk_reload is gone");
         assert!(
             own.contains("noo-kiosk-cdp reload"),
@@ -2294,7 +2349,7 @@ mod tests {
     /// file that can silently age out on every display in the fleet.
     #[test]
     fn staleness_covers_every_seat_script() {
-        let own = own_code(include_str!("kiosk.rs"));
+        let own = crate::test_src::own_code(include_str!("kiosk.rs"));
         let installed: std::collections::BTreeSet<&str> = own
             .match_indices("/usr/local/bin/noo-kiosk-")
             .map(|(i, _)| {
@@ -2322,7 +2377,7 @@ mod tests {
     /// implemented.
     #[test]
     fn the_console_build_reaches_the_operator() {
-        let cdp = own_code(CDP);
+        let cdp = asset_code(CDP);
         assert!(
             cdp.contains("__nooKioskBuild"),
             "noo-kiosk-cdp cannot read the build the console publishes"
@@ -2331,7 +2386,7 @@ mod tests {
             cdp.contains(r#"cmd == "build""#),
             "noo-kiosk-cdp has no `build` command for status to call"
         );
-        let own = own_code(include_str!("kiosk.rs"));
+        let own = crate::test_src::own_code(include_str!("kiosk.rs"));
         assert!(
             own.contains("noo-kiosk-cdp build"),
             "status never asks for the build: the cdp command is dead code"
@@ -2906,6 +2961,47 @@ mod tests {
         }
     }
 
+    /// The env file is world-readable (ENV_MODE 0644) because nothing in it
+    /// is secret. This is what keeps that true: every line either `setup` or
+    /// `set quality` writes has a known, non-secret name, and none is shaped
+    /// like a credential. A new variable must be added here on purpose.
+    #[test]
+    fn the_env_file_never_holds_a_key_shaped_line() {
+        assert_eq!(u32::from_str_radix(ENV_MODE, 8).ok(), Some(0o644), "ENV_MODE is world-readable on purpose; see below");
+        let known = ["NOO_KIOSK_URL", "NOO_KIOSK_VIEW", "NOO_KIOSK_ROTATE", "NOO_KIOSK_POLL", "NOO_KIOSK_QUALITY",
+                     "NOO_KIOSK_STATE", "NOO_KIOSK_USER", "NOO_KIOSK_DIALBACK_PORT", "NOO_KIOSK_SERVE_PORT",
+                     "NOO_KIOSK_MODE", "NOO_KIOSK_VT"];
+        let mut a = sample();
+        a.rotate = Some(30);
+        a.poll = Some(5);
+        a.quality = Some("lean".into());
+        let full = render_env(&a);
+        for env in [render_env(&sample()), full.clone(), with_quality(&full, "full"), with_quality("", "lean")] {
+            let mut names = 0;
+            for line in env.lines().filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#')) {
+                let (name, value) = line.split_once('=').unwrap_or_else(|| panic!("not KEY=value: {line}"));
+                names += 1;
+                assert!(known.contains(&name), "{name} is new in the env file: add it to `known` only if it is not secret");
+                let upper = name.to_ascii_uppercase();
+                for bad in ["KEY", "TOKEN", "SECRET", "PASS", "CRED", "AUTH"] {
+                    assert!(!upper.contains(bad), "{name} looks like a credential, and the env file is world-readable");
+                }
+                assert!(!value.starts_with("noo-"), "{name}={value} looks like a minted token");
+                assert!(!value.contains("BEGIN"), "{name} carries PEM");
+            }
+            assert!(names >= 1, "the scan read no lines: {env:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_root_root_0644_env_file_is_current() {
+        assert!(!stale_env_mode(0o100644, 0, 0));
+        assert!(stale_env_mode(0o100640, 0, 1001), "the 0.6.16 shape converges");
+        assert!(stale_env_mode(0o100644, 0, 1001));
+        assert!(stale_env_mode(0o100600, 0, 0));
+        assert!(stale_env_mode(0o100644, 1000, 0));
+    }
+
     #[test]
     fn kiosk_unit_is_a_seat_on_tty1_for_the_kiosk_user() {
         let u = render_kiosk_service("kiosk", Mode::Dedicated, DEDICATED_VT);
@@ -2997,17 +3093,13 @@ mod tests {
         let src = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/kiosk.rs"),
         ).expect("own source unreadable");
-        let start = src.find("pub fn kiosk_teardown(").expect("kiosk_teardown not found — this guard is stale");
-        let body = &src[start..];
-        // Stop at the test module. `kiosk_teardown` is the LAST `pub fn` in
-        // this file, so slicing to the next one ran to end-of-file and swept
-        // in this very test — whose assertions spell out the exact calls
-        // being searched for. The guard found itself and passed with the
-        // real calls gutted. Planting that is how it was caught.
-        let end = body
-            .find("\n#[cfg(test)]")
-            .expect("the test module moved — this guard would read itself and always pass");
-        let body = &body[..end];
+        // `kiosk_teardown` is the LAST `pub fn` in this file, so slicing to
+        // the next one once ran into this very test, whose assertions spell
+        // out the calls searched for: the guard found itself and passed with
+        // the real calls gutted. The body ends at its own brace, and the
+        // test modules are gone from what it reads.
+        let own = crate::test_src::own_code(&src);
+        let body = crate::test_src::fn_body(&own, "pub fn kiosk_teardown(");
         assert!(
             !body.contains("fn teardown_reverses_the_getty_mask"),
             "the guard is reading its own assertions; it would pass whatever teardown does"
@@ -3081,7 +3173,7 @@ mod tests {
     /// exercised in tests/test_kiosk_cdp_broker.py.
     #[test]
     fn the_browser_has_no_debugging_port() {
-        let launch = own_code(LAUNCH);
+        let launch = asset_code(LAUNCH);
         for gone in ["--remote-debugging-port", "--remote-debugging-address", "--remote-allow-origins", "CDP_PORT"] {
             assert!(
                 !launch.contains(gone),
@@ -3095,7 +3187,7 @@ mod tests {
             launch.contains("cage -- \"$CDP_HELPER\" broker -- \"$BROWSER\""),
             "the browser is not started by the CDP broker, so nothing holds its pipe"
         );
-        let cdp = own_code(CDP);
+        let cdp = asset_code(CDP);
         for gone in ["9222", "/json/list", "webSocketDebuggerUrl", "NOO_KIOSK_CDP_PORT"] {
             assert!(!cdp.contains(gone), "noo-kiosk-cdp still speaks to a debugging port ({gone})");
         }
@@ -3267,7 +3359,7 @@ mod tests {
     /// None and teardown never unmasks the getty it masked (i191 D3).
     #[test]
     fn teardown_reads_is_enabled_through_the_any_status_helper() {
-        let body = include_str!("kiosk.rs").split("#[cfg(test)]").next().unwrap();
+        let body = crate::test_src::own_code(include_str!("kiosk.rs"));
         for needle in [
             "sh_out_any(\"systemctl is-enabled getty@.service 2>/dev/null\").as_deref() == Some(\"masked\")",
             "sh_out_any(\"systemctl is-enabled display-manager.service 2>/dev/null\").as_deref() == Some(\"disabled\")",
@@ -3282,10 +3374,13 @@ mod tests {
     #[test]
     fn setup_confirms_before_it_disables_the_display_manager() {
         let src = include_str!("kiosk.rs");
-        let body = src.split("#[cfg(test)]").next().unwrap();
+        let body = crate::test_src::own_code(src);
         let confirm = body.find("display_manager_will_be_disabled(a.mode").expect("setup must gate the disable");
         let disable = body.find("sudo systemctl disable --now display-manager.service").unwrap();
-        let first_write = body.find("// 1. the user").unwrap();
+        // The first write is step 1's useradd (anchored on its code: the
+        // comment that names the step is blanked, followup 215).
+        let first_write = body.find("\"sudo useradd --system --create-home --home-dir").expect("setup's first write, the useradd");
+        assert_eq!(body.matches("sudo useradd").count(), 1, "one useradd, so the anchor is the first write");
         assert!(confirm < first_write && first_write < disable, "the confirm must precede every write");
         assert!(parse_setup(&["--url".into(), "https://c.t.ts.net".into(), "--mode".into(), "shared".into(), "-y".into()]).unwrap().yes);
     }
@@ -3326,5 +3421,39 @@ mod reload_line_tests {
         assert_eq!(reload_line(Some("stack-v0.6.13"), Some("stack-v0.6.13")), "console build stack-v0.6.13 (unchanged)");
         assert_eq!(reload_line(Some("stack-v0.6.12"), Some("stack-v0.6.13")), "console build stack-v0.6.12 -> stack-v0.6.13");
         assert_eq!(reload_line(None, Some("stack-v0.6.13")), "console build stack-v0.6.13");
+    }
+}
+
+#[cfg(test)]
+mod status_wording_tests {
+    use super::{graph_frame_cell, token_expiry_cell};
+    use serde_json::json;
+
+    /// A token that lapsed under a live stream is not a broken display, and
+    /// the cell says which it is.
+    #[test]
+    fn an_expired_token_under_a_live_stream_says_so() {
+        let now = 10_000;
+        assert_eq!(token_expiry_cell(None, None, None, now), None, "the proxy has not said");
+        assert_eq!(token_expiry_cell(Some(10_093), None, None, now).as_deref(), Some("in 93s"));
+        let live = token_expiry_cell(Some(9_000), Some(8_100), Some(15), now).unwrap();
+        assert!(live.contains("expired 1000s ago, last mint 1900s ago"), "{live}");
+        assert!(live.contains("the display is live on a stream that predates it"), "{live}");
+        let dead = token_expiry_cell(Some(9_000), Some(8_100), Some(900), now).unwrap();
+        assert!(dead.contains("expired 1000s ago") && !dead.contains("live"), "{dead}");
+        let unknown = token_expiry_cell(Some(9_000), None, None, now).unwrap();
+        assert!(unknown.contains("expired 1000s ago") && !unknown.contains("last mint"), "{unknown}");
+    }
+
+    /// A pinned tier reads as pinned, never as "0ms of work per frame".
+    #[test]
+    fn a_pinned_tier_reads_pinned_not_zero_ms() {
+        let pinned = graph_frame_cell(&json!({"ms": 0, "quality": "lean", "pinned": true}));
+        assert!(pinned.starts_with("pinned lean (governor off"), "{pinned}");
+        assert!(!pinned.contains("0ms"), "{pinned}");
+        let measured = graph_frame_cell(&json!({"ms": 12, "quality": "full", "pinned": false}));
+        assert_eq!(measured, "12ms of work per frame, drawing full");
+        // An older console that does not publish the flag keeps the old cell.
+        assert_eq!(graph_frame_cell(&json!({"ms": 12, "quality": "lean"})), "12ms of work per frame, drawing lean");
     }
 }

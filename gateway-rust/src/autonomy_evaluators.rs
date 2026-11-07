@@ -741,7 +741,7 @@ pub async fn eval_disk_watermark(
 
     if breached.is_empty() {
         // Local disks fine — the fleet's may not be.
-        return Ok(eval_node_disks(state, watermark).await);
+        return eval_node_disks(state, watermark).await;
     }
 
     let detail = breached.join("; ");
@@ -776,7 +776,11 @@ pub async fn eval_disk_watermark(
     }
     // Node disks are checked regardless of the local outcome — one full
     // controller must not mask a full worker or vice versa.
-    let _ = eval_node_disks(state, watermark).await;
+    // A node list that cannot be read is a failed evaluation, never "no
+    // node is full" (i460): the controller's own alert above still went out.
+    eval_node_disks(state, watermark)
+        .await
+        .map_err(|e| format!("{e}; the controller's own disk alert was sent"))?;
     Ok(true)
 }
 
@@ -816,16 +820,11 @@ fn node_disk_breaches(body: &serde_json::Value, watermark: f64) -> Vec<String> {
 /// longer advises removing containerd leases by age — that deleted live
 /// containers' snapshots on host3. Unreachable agents are
 /// node_health's finding, skipped here (same scope discipline as gpu_health).
-async fn eval_node_disks(state: &AppState, watermark: f64) -> bool {
-    let nodes: Vec<(String,)> = sqlx::query_as(
-        "SELECT node_id FROM cluster_nodes WHERE status = 'online'",
-    )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+async fn eval_node_disks(state: &AppState, watermark: f64) -> Result<bool, String> {
+    let nodes = online_node_ids(&state.db).await?;
 
     let mut any = false;
-    for (node_id,) in nodes {
+    for node_id in nodes {
         let Ok(link) = crate::node_link::NodeLink::for_node(state, &node_id).await
         else {
             continue;
@@ -861,7 +860,18 @@ async fn eval_node_disks(state: &AppState, watermark: f64) -> bool {
         )
         .await;
     }
-    any
+    Ok(any)
+}
+
+/// The online nodes whose disks [`eval_node_disks`] probes. A read that
+/// fails is an error naming the read (i460): an empty list would read as
+/// "no node is full", silent on exactly the outage to surface.
+async fn online_node_ids(db: &sqlx::PgPool) -> Result<Vec<String>, String> {
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT node_id FROM cluster_nodes WHERE status = 'online'")
+        .fetch_all(db)
+        .await
+        .map_err(|e| format!("node disks not checked: cannot read the online nodes from cluster_nodes: {e}"))?;
+    Ok(rows.into_iter().map(|(n,)| n).collect())
 }
 
 /// Queue a `disk-reclaim` op on the host watcher spool and report the
@@ -886,9 +896,18 @@ async fn queue_disk_reclaim(state: &AppState, watermark: f64, dry_run: bool, cac
         tracing::warn!("autonomy.disk_reclaim.skipped_no_redis");
         return;
     };
-    if !r.set_nx_ex(DEDUP_KEY, "1", DEDUP_TTL_SECS).await {
-        tracing::debug!("autonomy.disk_reclaim.dedup_skip");
-        return;
+    match r.set_nx_ex_checked(DEDUP_KEY, "1", DEDUP_TTL_SECS).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::debug!("autonomy.disk_reclaim.dedup_skip");
+            return;
+        }
+        // Fail closed (no reclaim is the safe side of a data-deleting
+        // action), but not silently.
+        Err(e) => {
+            tracing::warn!(error = %e, "autonomy.disk_reclaim.skipped_dedup_unreadable: the hourly reclaim slot cannot be claimed in Redis, so no reclaim is queued");
+            return;
+        }
     }
 
     let mut args = vec![
@@ -1304,11 +1323,14 @@ pub async fn eval_missing_graph_entities(state: &AppState) -> Result<bool, Strin
         .map_err(|e| format!("page count query failed: {e}"))?;
 
     // `entities` may not exist yet (Trellion graph migration applied
-    // separately). Defensive: if the query fails, treat entities=0.
-    let entities: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entities")
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or(0);
+    // separately): only THAT is entities=0. Any other failure used to read as
+    // 0 too, so every page looked like a gap and an extraction was queued for
+    // nothing (#650 sweep).
+    let entities: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM entities").fetch_one(&state.db).await {
+        Ok(n) => n,
+        Err(e) if crate::repo::missing_table(&e) => 0,
+        Err(e) => return Err(format!("entity count query failed: {e}")),
+    };
 
     let gap = (pages - entities).max(0);
     let should_fire = gap > THRESHOLD;
@@ -1325,9 +1347,17 @@ pub async fn eval_missing_graph_entities(state: &AppState) -> Result<bool, Strin
             // time-critical, so a coarse window is fine.
             const DEDUP_KEY: &str = "noo:autonomy:dedup:background_graph";
             const DEDUP_TTL_SECS: i64 = 600; // 10 min
-            if !redis.set_nx_ex(DEDUP_KEY, "1", DEDUP_TTL_SECS).await {
-                tracing::debug!(entity_gap = gap, "autonomy.missing_graph_entities.dedup_skip");
-                return Ok(should_fire);
+            match redis.set_nx_ex_checked(DEDUP_KEY, "1", DEDUP_TTL_SECS).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(entity_gap = gap, "autonomy.missing_graph_entities.dedup_skip");
+                    return Ok(should_fire);
+                }
+                // Fail closed (no job is better than one per tick), but not silently.
+                Err(e) => {
+                    tracing::warn!(entity_gap = gap, error = %e, "autonomy.missing_graph_entities.skipped_dedup_unreadable: the 10-minute graph-job slot cannot be claimed in Redis, so no job is submitted");
+                    return Ok(should_fire);
+                }
             }
             tracing::info!(entity_gap = gap, pages, entities, "autonomy.missing_graph_entities.submit_graph_job");
             let payload = serde_json::json!({"scope": "extract", "source": "autonomy"});
@@ -3006,11 +3036,8 @@ mod tests {
     fn node_heartbeat_alerts_are_persisting_and_have_a_clear_path() {
         // The wiring the schedule depends on: per-node, persisting, cleared.
         let src = include_str!("autonomy_evaluators.rs");
-        let body = src
-            .split("async fn alert_nodes_on_change(")
-            .nth(1)
-            .expect("alert_nodes_on_change not found");
-        let body = &body[..body.find("\n}\n").unwrap()];
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "async fn alert_nodes_on_change(");
         assert!(body.contains(".persisting()"), "node-offline alerts must be persisting");
         assert!(body.contains("clear_operator_alert"), "a node that heartbeats again must be reported recovered");
     }
@@ -3413,6 +3440,12 @@ mod tests {
 ///
 /// One query, LEFT JOIN, both counts. `to_regclass` guards make it a clean
 /// no-op on an OSS install, where neither table exists.
+/// The OSS case of [`eval_cross_domain_link_integrity`]: the tables are not
+/// there at all (Postgres 42P01), and nothing else.
+fn link_integrity_tables_absent(e: &sqlx::Error) -> bool {
+    crate::repo::missing_table(e)
+}
+
 pub async fn eval_cross_domain_link_integrity(state: &AppState) -> Result<bool, String> {
     let row: Option<(i64, i64)> = sqlx::query_as(
         "SELECT count(*) FILTER (WHERE e.source_cycle_id IS NOT NULL),
@@ -3427,8 +3460,10 @@ pub async fn eval_cross_domain_link_integrity(state: &AppState) -> Result<bool, 
     .map_err(|e| {
         // An OSS install has neither table and the FROM clause itself fails
         // before the guard can help — that is fine and expected, not an
-        // error worth a warn-level log every hour.
-        if e.to_string().contains("does not exist") {
+        // error worth a warn-level log every hour. Only 42P01: a missing
+        // COLUMN ("column ... does not exist", 42703) is a schema fault to
+        // report, which the old substring test read as a missing table.
+        if link_integrity_tables_absent(&e) {
             return String::new();
         }
         format!("cross-domain link query failed: {e}")
@@ -3785,7 +3820,15 @@ pub async fn eval_custom_location(
     if cooldown > 0 {
         if let Some(r) = redis(state) {
             let key = format!("noo:autonomy:custom_cooldown:{name}");
-            if !r.set_nx_ex(&key, "1", cooldown).await {
+            let held = match r.set_nx_ex_checked(&key, "1", cooldown).await {
+                Ok(acquired) => !acquired,
+                // Fail closed (the action does not re-fire), but not silently.
+                Err(e) => {
+                    tracing::warn!(location = %name, error = %e, "autonomy.custom_location.skipped_cooldown_unreadable: the action's re-fire cooldown cannot be read in Redis, so it does not fire");
+                    true
+                }
+            };
+            if held {
                 return json!({
                     "name": name,
                     "fired": true,
@@ -4280,12 +4323,8 @@ mod ssh_lane_removed_tests {
         // END somewhere honest. Assert the calls are present rather than
         // trusting that they are.
         let src = include_str!("autonomy_evaluators.rs");
-        let src = src.split("mod ssh_lane_removed_tests").next().unwrap();
-        let unreachable = src
-            .split("pub async fn eval_worker_node_agent_unreachable")
-            .nth(1)
-            .expect("evaluator not found — this guard is reading the wrong file");
-        let unreachable = &unreachable[..unreachable.find("\n}\n").unwrap_or(unreachable.len())];
+        let src = crate::test_src::own_code(src);
+        let unreachable = crate::test_src::fn_body(&src, "pub async fn eval_worker_node_agent_unreachable");
         assert!(
             unreachable.contains("send_operator_alert"),
             "worker_node_agent_unreachable no longer tells anyone"
@@ -4295,11 +4334,7 @@ mod ssh_lane_removed_tests {
             "the alert must carry the manual command, not just the symptom"
         );
 
-        let unbound = src
-            .split("async fn revive_for_unbound_consumer")
-            .nth(1)
-            .expect("unbound-consumer path not found");
-        let unbound = &unbound[..unbound.find("\n}\n").unwrap_or(unbound.len())];
+        let unbound = crate::test_src::fn_body(&src, "async fn revive_for_unbound_consumer");
         assert!(
             unbound.contains("restart_agent_via_rail"),
             "an agent that ANSWERS should be restarted over the rail, not alerted about"
@@ -4436,3 +4471,78 @@ mod embed_backlog_tests {
         assert_eq!(v(12, true, Some((0, 0)), 5 * W, W), (B::Watching { now: 12, prev: Some(0) }, Some((12, 5 * W))));
     }
 }
+
+#[cfg(test)]
+mod node_disk_read_tests {
+    use super::*;
+
+    fn dead_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool")
+    }
+
+    /// i460: a database that cannot answer is "not checked", never "no node
+    /// is full", and the evaluation fails on it.
+    #[tokio::test]
+    async fn an_unreadable_node_list_fails_the_node_disk_check() {
+        match online_node_ids(&dead_pool()).await {
+            Err(e) => assert!(e.starts_with("node disks not checked: cannot read the online nodes from cluster_nodes"), "{e}"),
+            Ok(v) => panic!("a dead pool read as {} online node(s)", v.len()),
+        }
+        let code = crate::test_src::own_code(include_str!("autonomy_evaluators.rs"));
+        let body = crate::test_src::fn_body(&code, "async fn eval_node_disks(");
+        assert!(body.contains("online_node_ids(&state.db).await?"), "{body}");
+    }
+}
+
+#[cfg(test)]
+mod link_integrity_error_tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    /// A Postgres error with a code and a message, as sqlx surfaces one.
+    #[derive(Debug)]
+    struct PgFake(&'static str, &'static str);
+    impl std::fmt::Display for PgFake {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.1)
+        }
+    }
+    impl std::error::Error for PgFake {}
+    impl sqlx::error::DatabaseError for PgFake {
+        fn message(&self) -> &str {
+            self.1
+        }
+        fn code(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed(self.0))
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn pg(code: &'static str, msg: &'static str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(PgFake(code, msg)))
+    }
+
+    /// i460: only a missing table is the OSS no-op. A missing column says
+    /// "does not exist" too, and is a schema fault that must be reported.
+    #[test]
+    fn a_missing_column_is_not_read_as_missing_tables() {
+        assert!(link_integrity_tables_absent(&pg("42P01", "relation \"noo_temporal_edges\" does not exist")));
+        assert!(!link_integrity_tables_absent(&pg("42703", "column e.source_cycle_id does not exist")));
+        assert!(!link_integrity_tables_absent(&pg("42883", "function to_regclass(unknown) does not exist")));
+    }
+}
+

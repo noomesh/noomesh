@@ -18,6 +18,7 @@ func readMemory() (totalKB int64, availKB int64, ok bool) {
 	if err != nil {
 		return 0, 0, false
 	}
+	availKB = -1 // unknown until a MemAvailable line says otherwise
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 2 {

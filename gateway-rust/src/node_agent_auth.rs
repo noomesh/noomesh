@@ -536,7 +536,7 @@ mod tests {
             ("coordinator/backend.rs", include_str!("coordinator/backend.rs")),
         ] {
             assert!(src.len() > 1000, "{name} did not load");
-            let prod = src.split("#[cfg(test)]").next().unwrap();
+            let prod = crate::test_src::own_code(src);
             assert!(!prod.contains(&needle), "{name} mints a v1 token for an agent");
         }
     }

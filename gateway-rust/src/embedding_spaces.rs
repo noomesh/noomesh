@@ -563,12 +563,14 @@ async fn seed_if_empty(db: &sqlx::PgPool) -> Result<(), sqlx::Error> {
     if n > 0 {
         return Ok(());
     }
+    // The seed is written once and never corrected (ON CONFLICT DO NOTHING),
+    // so an unreadable placements table must not seed the configured model
+    // in place of the declared one (#650 sweep): fail the seed, next boot retries.
     let models: Vec<String> = sqlx::query_scalar(
         "SELECT model FROM noo_backend_placements WHERE role = 'embed' AND model IS NOT NULL AND model <> ''",
     )
     .fetch_all(db)
-    .await
-    .unwrap_or_default();
+    .await?;
     let configured = crate::embedding_client::configured_model();
     let model = seed_model(&models, &configured);
     let dims = crate::config::env_or_yaml_u64("EMBEDDING_DIM", |c| c.services.embedding_dim, 0);

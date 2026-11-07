@@ -26,6 +26,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests import _rust_src as rs
 from tests._compose_projection import env_of, full_projection
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -79,12 +80,22 @@ def test_the_gateway_owns_disk_cleanup():
     src = HEARTBEAT_ACTIONS.read_text()
     native = src.split("const RUST_NATIVE_ACTIONS", 1)[1].split("];", 1)[0]
     assert re.search(r'^\s*"disk_cleanup",', native, re.M), "disk_cleanup left RUST_NATIVE — it would reach the worker, which refuses"
-    body = src.split("async fn detect_container_logs", 1)[1].split("#[cfg(test)]", 1)[0]
+    code = rs.own_code(src)
+    # The scan and the helpers it dials and reports through (the old slice ran
+    # from detect_container_logs to the first test item, so it spanned them).
+    body = "\n".join(
+        rs.fn_body(code, m)
+        for m in ("async fn detect_container_logs", "async fn node_agent_post(", "fn node_scan_line(")
+    )
     assert '"/cleanup/logs"' in body and '"/cleanup/images"' in src
     # The dial goes through NodeLink, which chooses the credential per agent:
     # none for an agent that admits the controller leaf alone, the legacy
     # bearer otherwise (`node_agent_auth::header_for`, called inside node_link.rs).
-    assert "NodeLink::for_base(" in body and "node_agent_auth::header_for(" not in body
+    assert "NodeLink::for_base(" in body
+    # The absence is checked over everything from the scan on, at least as
+    # wide as the old slice (which ran to the first test item).
+    rest = code[code.index("async fn detect_container_logs"):]
+    assert "node_agent_auth::header_for(" not in rest
     # A refused node is named, never folded into the count as zero.
     assert "NOT scanned" in body
 

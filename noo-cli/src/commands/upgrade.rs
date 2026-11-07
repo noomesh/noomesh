@@ -285,6 +285,21 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // `--check --stack`: is a newer stack published, and does an add-on
         // that is on hold this controller back (no lock for it yet)?
         let stack_check = if stack { stack_hold_check(g) } else { None };
+        // This box's data directories against the list the roll will use
+        // (i458: a check only; nothing is created here).
+        let root = crate::envfile::repo_root();
+        let storage = (stack || root.join(".env").is_file()).then(|| {
+            // The running CLI's compiled list is the roll's list unless an
+            // upgrade is pending (KeepNewer: this CLI does the roll). Then
+            // the target's own lists come from its signed stack lock (i467),
+            // and only when that cannot be read does this CLI's list stand in.
+            let list_target = if action == CliAction::KeepNewer { current.as_str() } else { version.as_str() };
+            let check_target = storage_check_target(list_target, tag_override.as_deref());
+            let tag = norm_stack_tag(&check_target);
+            let (lists, from, source, caveat) = storage_list_choice(&current, &check_target, || target_storage_lists(g, &tag));
+            let seen = storage_dirs_seen(&root, lists.as_ref());
+            storage_check_report(seen.as_ref(), &from, source, &check_target, caveat)
+        });
         if g.json {
             let mut o = serde_json::json!({
                 "current": current, "latest": version, "up_to_date": up_to_date, "target": target,
@@ -295,6 +310,9 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     "current": cur, "newest": newest,
                     "holds": holds.iter().map(|(a, w)| serde_json::json!({"addon": a, "why": w})).collect::<Vec<_>>(),
                 });
+            }
+            if let Some((j, _, _)) = &storage {
+                o["storage"] = j.clone();
             }
             println!("{o}");
         } else if action == CliAction::KeepNewer {
@@ -315,6 +333,16 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 println!("{}", ui::status_line(glyph, &hold_line(cur, newest, holds)));
                 for (a, why) in holds {
                     println!("{}", ui::note(&format!("{a}: {why}")));
+                }
+            }
+            if let Some((_, c, caveat)) = &storage {
+                let glyph = if c.verdict == crate::commands::cluster_verify::Verdict::Ok { Glyph::Ok } else { Glyph::Warn };
+                println!("{}", ui::status_line(glyph, &format!("{}: {}", c.name, c.detail)));
+                if let Some(r) = &c.remedy {
+                    println!("{}", ui::note(&format!("fix before the roll: {r}")));
+                }
+                if let Some(cv) = caveat {
+                    println!("{}", ui::note(cv));
                 }
             }
         }
@@ -446,16 +474,22 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // re-exec the NEW one to materialise ITS assets, not ours.
     let sh = crate::onboard::standalone::default_home();
     if sh.join(".noo-standalone").is_file() {
-        let refreshed = Command::new(&exe)
-            .args(["stack", "sync-assets"])
-            .stdout(std::process::Stdio::null())
+        // `--json` so the NEW binary says whether it wrote the slice or left
+        // it for the stack stage (i458 b: the slice moves with the pin).
+        let out = Command::new(&exe)
+            .args(["--json", "stack", "sync-assets"])
             .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if refreshed {
+            .output()
+            .ok()
+            .filter(|o| o.status.success());
+        let status = out.as_ref().map(|o| sync_assets_status(&String::from_utf8_lossy(&o.stdout)));
+        if let Some(status) = status {
             if !g.json {
-                println!("{}", ui::note(&format!("deploy slice refreshed under {}", sh.display())));
+                println!("{}", ui::note(&match status.as_deref() {
+                    Some("deferred") => format!(
+                        "deploy slice under {} stays at the stack's release until the stack stage moves it", sh.display()),
+                    _ => format!("deploy slice refreshed under {}", sh.display()),
+                }));
             }
         } else if !g.json {
             ui::warned("could not refresh the deploy slice");
@@ -782,6 +816,7 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
     let mut rc = 0;
     let mut failed_stage = "";
     let mut roll_started: Option<i64> = None;
+    let mut roll_baseline = crate::commands::cluster_verify::restart_loops::Baseline::default();
     // The node-image staging started inside upgrade_stack (overlapping the
     // launcher). It is joined AFTER the gateway health wait below, so the
     // 20-40 s wait overlaps the last exports; every path that leaves this
@@ -796,7 +831,25 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
     if stack {
         if phased && !g.json { println!("{}", ui::phase("Stack")); }
         roll_started = Some(crate::commands::cluster_verify::now_unix());
-        let (stack_rc, run) = upgrade_stack(g, tag_override, force, skip_gw_key_check, allow_downgrade)?;
+        // What each stack container's restart count was when the roll
+        // started: the post-roll gate judges only the restarts made during it.
+        roll_baseline = crate::commands::cluster_verify::restart_loops::snapshot(
+            &crate::commands::cluster_verify::restart_loops::real_docker, &crate::envfile::container_prefix());
+        // The containers the launcher stops on purpose are recorded here, so
+        // the gate never reads one as a crash of the roll.
+        let stops = launcher_stops_file(g);
+        let (stack_rc, run) = upgrade_stack(g, tag_override, force, skip_gw_key_check, allow_downgrade, stops.as_ref().map(|(_, f)| f.as_path()))?;
+        if let Some((dir, file)) = stops {
+            match crate::commands::cluster_verify::restart_loops::read_intended(&file) {
+                Ok(s) => roll_baseline.1 = s,
+                Err(e) => if !g.json {
+                    eprintln!("{}", ui::status_line(Glyph::Warn, &format!(
+                        "the launcher's record of the containers it stopped could not be read ({e}); \
+                         each is judged by its state alone")));
+                },
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
         rc = stack_rc;
         staging = run;
         if rc != 0 {
@@ -822,7 +875,7 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
                 );
                 rc = 1;
                 failed_stage = "stack";
-            } else if !post_roll_restart_loops_clear(g, roll_started) {
+            } else if !post_roll_restart_loops_clear(g, roll_started, &roll_baseline) {
                 rc = 1;
                 failed_stage = "stack";
             }
@@ -849,7 +902,7 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
             );
             rc = 1;
             failed_stage = "nodes";
-        } else if !post_roll_restart_loops_clear(g, roll_started) {
+        } else if !post_roll_restart_loops_clear(g, roll_started, &roll_baseline) {
             // The node phase never starts on a stack whose core container
             // restart-loops (0.6.4 redis AOF, 2026-10-16).
             rc = 1;
@@ -1044,6 +1097,11 @@ fn reconcile_addon_nats_principals(g: &Globals, root: &std::path::Path) {
 ///   step made the rest). Before the pin moves, so a directory that cannot
 ///   be created refuses with nothing moved; the launcher's bind check would
 ///   otherwise refuse after the pin, naming `noo onboard --only storage`.
+///   THIS release = this CLI's compiled list plus, from the verified lock,
+///   any directory the target stack names that this CLI does not (a
+///   `--tag` roll to another stack, i467). A lock-only name is checked here
+///   (name, nesting, beneath its root, no symlink) and refuses before
+///   anything is created when it fails; it is created with its root's owner.
 /// - reconcile_service_certs (2.5)
 ///   2.5. Reconcile service certs a NEW release's compose expects but an
 ///   upgraded (not freshly onboarded) install never issued — see
@@ -1085,7 +1143,8 @@ fn reconcile_addon_nats_principals(g: &Globals, root: &std::path::Path) {
 ///   run_fleet_stages to join. The failure paths below join it here.
 ///
 /// The phase functions follow, in list order.
-fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool)
+fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool,
+    stops: Option<&std::path::Path>)
     -> Result<(i32, Option<crate::commands::image_stage::StageRun>), Unhandled>
 {
     // What and whether: nothing below writes anything.
@@ -1113,8 +1172,14 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     // Prepare the install, then move the pin.
     migrate_retired_yaml_gates(g, &roll.root);
     rerender_nats_users_for_roll(g, &roll.root);
+    // The last refusal before the pin. Its names come from this binary's
+    // compiled STORAGE_SUBDIRS, not from the slice.
+    reconcile_storage_dirs(g, &roll.root, &roll.tag, target_stack_lock.as_deref());
+    // i458 (b): the deploy slice moves WITH the pin. Written after every
+    // refusal above, so a refused roll leaves the old release's compose and
+    // scripts over the old images (pop-os, 0.6.16: CLI and slice 0.6.16 over
+    // 0.6.15 images after the storage refusal).
     refresh_deploy_slice(g, &roll);
-    reconcile_storage_dirs(g, &roll.root);
     move_pin(g, &roll, target_stack_lock.as_deref(), &addon_prep);
 
     // Everything the launcher's bind checks and the new compose expect.
@@ -1126,7 +1191,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
 
     // Stage node images (overlapping the launcher), then launch.
     let staging = crate::commands::image_stage::start_stage_release_images(g, target_stack_lock.clone(), &roll.tag);
-    launch_stack(g, &roll, staging)
+    launch_stack(g, &roll, staging, stops)
 }
 
 
@@ -1263,6 +1328,35 @@ fn refuse_plaintext_install(g: &Globals, root: &std::path::Path) {
             &format!("{why} — refusing to roll a stack whose secrets are not all encrypted at rest; nothing was changed"),
             Some(crate::commands::plaintext_env::REMEDY));
     }
+}
+
+/// i458 (b): does `noo stack sync-assets` leave the deploy slice for the
+/// stack stage? Some((pin, paired)) when this binary's slice belongs to a
+/// stack the install does not run yet: the pin is older than (or another rc
+/// of) the release this binary pairs with. Writing it then would put the new
+/// compose and scripts over the old images (the slice/tag skew), and a
+/// refused stack stage would leave them there. A pin at or past the pairing,
+/// no pin (a fresh install) or no pairing (a dev build) refreshes as before.
+pub(crate) fn slice_waits_for_stack(root: &std::path::Path) -> Option<(String, String)> {
+    slice_defer(&pinned_tag(root), crate::onboard::standalone::STANDALONE_STACK_TAG)
+}
+
+fn slice_defer(pin: &str, baked: &str) -> Option<(String, String)> {
+    if pin.trim().is_empty() || baked.trim().is_empty() {
+        return None;
+    }
+    let (pin, paired) = (norm_stack_tag(pin), norm_stack_tag(baked));
+    let behind = pin != paired && stack_semver(&rc_core(&pin)) <= stack_semver(&rc_core(&paired));
+    behind.then_some((pin, paired))
+}
+
+/// The `status` of `noo --json stack sync-assets` ("ok", "deferred"), from
+/// its stdout; None when it printed no JSON status (an older binary's
+/// human output, or nothing).
+fn sync_assets_status(stdout: &str) -> Option<String> {
+    stdout.lines().rev()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        .find_map(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string))
 }
 
 /// The tag `.env` pins now (empty when unpinned).
@@ -1623,7 +1717,7 @@ fn move_pin(g: &Globals, roll: &Roll, target_stack_lock: Option<&str>, addon_pre
 /// Pin moved to v0.1.76, the launcher deployed v0.1.75, and the
 /// Command printed "✓ stack now on v0.1.76" — a false success on the
 /// Exact hotfix the operator was waiting for.
-fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage::StageRun)
+fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage::StageRun, stops: Option<&std::path::Path>)
     -> Result<(i32, Option<crate::commands::image_stage::StageRun>), Unhandled>
 {
     let root = &roll.root;
@@ -1646,6 +1740,11 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
             .env("NOO_STUCK_REPORT", &stuck_report)
             .env("NOO_CLI_BIN", &cli_bin)
             .current_dir(root);
+        // A handoff, not a behaviour switch: where the launcher records the
+        // containers it stops on purpose (lib-addons.sh addons_note_intended_stop).
+        if let Some(p) = stops {
+            c.env("NOO_LAUNCHER_STOPS", p);
+        }
         c
     };
     // Default: the launcher's per-container compose lines collapse into one
@@ -1656,9 +1755,18 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
         if g.verbose || g.json {
             return c.status();
         }
-        let (status, tally) = crate::onboard::sh::run_summarised(c)?;
+        let (status, tally, tail) = crate::onboard::sh::run_summarised(c)?;
         for s in [tally.pull_summary(), tally.summary()].into_iter().flatten() {
             if status.success() && tally.failed() == 0 { ui::done(&s); } else { ui::failed(&s, None); }
+        }
+        // A launcher that exits non-zero is never silent: its last lines,
+        // unfiltered, even the ones the summary absorbed.
+        let lines = crate::onboard::sh::failure_tail(status.success(), &tail, "noo upgrade --stack --verbose");
+        if let Some((head, rest)) = lines.split_first() {
+            ui::failed(&format!("the launcher exited {}: {head}", status.code().map_or("by a signal".to_string(), |c| c.to_string())), None);
+            for l in rest {
+                eprintln!("{l}");
+            }
         }
         Ok(status)
     };
@@ -2095,23 +2203,43 @@ fn missing_service_certs<'a>(
 /// code (`storage_targets_in` over `onboard::STORAGE_SUBDIRS`, `create_storage_dir`
 /// with its owner), before the pin moves, and refuses loudly when one cannot
 /// be made. Existing directories are never touched.
-fn reconcile_storage_dirs(g: &Globals, root: &std::path::Path) {
-    let env = root.join(".env");
-    let read = |k: &str| crate::onboard::env::read_env_key(&env, k);
-    let data = read("NOO_DATA_ROOT");
-    if data.trim().is_empty() {
-        // Compose requires it; the launcher refuses with its own remedy.
-        return;
-    }
-    let state = crate::commands::data_root::state_root_of(Some(read("NOO_STATE_ROOT").as_str()), data.trim());
-    let missing = missing_storage_dirs(std::path::Path::new(data.trim()), std::path::Path::new(&state), &read("NOO_PG_DATA"));
+fn reconcile_storage_dirs(g: &Globals, root: &std::path::Path, tag: &str, lock: Option<&str>) {
+    // The target stack's own list (i467), when its verified lock carries
+    // one: a `--tag` roll to a stack this CLI was not built with can bind a
+    // directory this CLI does not know. Lines that cannot be read refuse.
+    let lock_lists = match lock.map(lock_storage_lists) {
+        Some(Err(e)) => fail(g.json, ExitCode::Generic, "stack_lock_storage_unreadable",
+            &format!("stack-{tag}.lock: {e} — nothing was changed"),
+            Some("the release was not produced by the release workflow; do not work around this")),
+        Some(Ok(l)) => l,
+        None => None,
+    };
+    // No NOO_DATA_ROOT: compose requires it; the launcher refuses with its own remedy.
+    let Some(compiled) = storage_dir_targets_in_env(root) else { return };
+    let from_lock = lock_lists.as_ref().and_then(|l| storage_dir_targets_in_env_with(root, Some(l))).unwrap_or_default();
+    let planned = match plan_storage_dirs(compiled, from_lock) {
+        Ok(p) => p,
+        Err(bad) => fail(g.json, ExitCode::Generic, "stack_lock_storage_name",
+            &format!("stack-{tag}.lock names data director{} this CLI will not create: {} — nothing was changed",
+                if bad.len() == 1 { "y" } else { "ies" }, bad.join("; ")),
+            Some("the release was not produced by the release workflow; do not work around this")),
+    };
     let mut failed: Vec<String> = Vec::new();
-    for (name, path) in &missing {
-        match crate::onboard::steps::create_storage_dir(name, path) {
+    let mut lock_only_failed = false;
+    for d in planned.iter().filter(|d| !d.path.exists()) {
+        // Created with its intended owner (onboarding's one rule: a service
+        // uid, else the owner of the root it sits under), or refused with
+        // what it got and the chown.
+        let made = crate::onboard::steps::create_storage_dir(&d.name, &d.path);
+        match made {
             Ok(()) => if !g.json {
-                ui::done(&format!("created {} (new in this release)", path.display()));
+                let why = if d.lock_only { format!("named by stack-{tag}.lock") } else { "new in this release".to_string() };
+                ui::done(&format!("created {} ({why})", d.path.display()));
             },
-            Err(e) => failed.push(format!("{} ({e})", path.display())),
+            Err(e) => {
+                lock_only_failed |= d.lock_only;
+                failed.push(format!("{} ({e})", d.path.display()));
+            }
         }
     }
     if !failed.is_empty() {
@@ -2120,19 +2248,276 @@ fn reconcile_storage_dirs(g: &Globals, root: &std::path::Path) {
                       the new stack would refuse to start without {}",
                 if failed.len() == 1 { "y" } else { "ies" }, failed.join(", "),
                 if failed.len() == 1 { "it" } else { "them" }),
-            Some("noo onboard --only storage   # then re-run: noo upgrade --stack"));
+            Some(storage_dir_failure_remedy(lock_only_failed)));
     }
 }
 
-/// The storage directories this binary's release expects (onboarding's
-/// `onboard::STORAGE_SUBDIRS` floor, placed by `storage_targets_in`) that do not
-/// exist yet.
-fn missing_storage_dirs(data: &std::path::Path, state: &std::path::Path, pg_data: &str) -> Vec<(String, std::path::PathBuf)> {
+/// The remedy when the roll could not create a data directory. Onboarding
+/// creates this CLI's compiled list and nothing else, so for a directory only
+/// the target's lock names it is never the fix: run again it leaves that
+/// directory missing and the roll refuses again, a loop (harness 0.6.17
+/// review, c4). The create error above names what it found and the chown.
+pub(crate) fn storage_dir_failure_remedy(lock_only_failed: bool) -> &'static str {
+    if lock_only_failed {
+        "fix each directory as the line above says (its owner, or create it), then re-run: noo upgrade --stack"
+    } else {
+        "noo onboard --only storage   # then re-run: noo upgrade --stack"
+    }
+}
+
+/// One data directory the roll makes sure of: `base` is the data or state
+/// root it sits under; `lock_only` = named by the target's lock and not by
+/// this CLI's compiled list.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PlannedDir {
+    pub(crate) name: String,
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) base: std::path::PathBuf,
+    pub(crate) lock_only: bool,
+}
+
+/// The compiled targets plus the lock's targets this CLI does not have,
+/// each lock-only one checked HERE (the release lane's check is not
+/// trusted): a name of plain segments, nested only beneath a directory this
+/// CLI already places (`models/...`), and a path under its root with no
+/// symlink on the way. `Err` names every name refused; nothing is created.
+pub(crate) fn plan_storage_dirs(
+    compiled: Vec<(String, std::path::PathBuf)>,
+    from_lock: Vec<(String, std::path::PathBuf)>,
+) -> Result<Vec<PlannedDir>, Vec<String>> {
+    let base_of = crate::onboard::steps::storage_base;
+    let known: std::collections::HashSet<std::path::PathBuf> = compiled.iter().map(|(_, p)| p.clone()).collect();
+    let mut out: Vec<PlannedDir> = compiled.iter()
+        .map(|(n, p)| PlannedDir { name: n.clone(), path: p.clone(), base: base_of(n, p), lock_only: false })
+        .collect();
+    let mut bad: Vec<String> = Vec::new();
+    for (n, p) in from_lock.into_iter().filter(|(_, p)| !known.contains(p)) {
+        let base = base_of(&n, &p);
+        match lock_only_dir_ok(&n, &p, &base) {
+            Ok(()) => out.push(PlannedDir { name: n, path: p, base, lock_only: true }),
+            Err(e) => bad.push(format!("{n:?}: {e}")),
+        }
+    }
+    if bad.is_empty() { Ok(out) } else { Err(bad) }
+}
+
+/// A storage directory name: lowercase, digits, `-` and `_` segments, no
+/// empty, `.` or `..` segment, never absolute.
+pub(crate) fn storage_name_ok(n: &str) -> bool {
+    !n.is_empty() && !n.starts_with('/')
+        && n.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != ".."
+            && seg.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_'))
+}
+
+/// The checks for one lock-only directory (see [`plan_storage_dirs`]).
+fn lock_only_dir_ok(name: &str, path: &std::path::Path, base: &std::path::Path) -> Result<(), String> {
+    if !storage_name_ok(name) {
+        return Err("not a directory name under the data root".into());
+    }
+    if let Some((first, _)) = name.split_once('/') {
+        if !crate::onboard::STORAGE_SUBDIRS.contains(&first) {
+            return Err(format!("nested under {first:?}, which this CLI does not place"));
+        }
+    }
+    if path.parent().is_none() || !path.starts_with(base) || path == base {
+        return Err("does not resolve beneath its root".into());
+    }
+    // Every component that exists below the root must be a real directory:
+    // a symlink would send the create (and the stack's bind) elsewhere.
+    let mut cur = base.to_path_buf();
+    for seg in name.split('/') {
+        cur.push(seg);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => return Err(format!("{} is a symlink", cur.display())),
+            Ok(m) if !m.is_dir() => return Err(format!("{} exists and is not a directory", cur.display())),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(format!("{}: {e}", cur.display())),
+        }
+    }
+    Ok(())
+}
+
+
+/// Every storage directory this binary's release expects, placed under the
+/// data and state roots (onboarding's own `storage_targets_in`).
+pub(crate) fn storage_dir_targets(data: &std::path::Path, state: &std::path::Path, pg_data: &str) -> Vec<(String, std::path::PathBuf)> {
     let names: Vec<String> = crate::onboard::STORAGE_SUBDIRS.iter().map(|s| s.to_string()).collect();
     crate::onboard::steps::storage_targets_in(&names, data, state, pg_data)
-        .into_iter()
-        .filter(|(_, p)| !p.exists())
-        .collect()
+}
+
+/// [`storage_dir_targets`] for the install at `root`, from its `.env`
+/// (`NOO_DATA_ROOT`, `NOO_STATE_ROOT`, `NOO_PG_DATA`). `None` when
+/// `NOO_DATA_ROOT` is unset.
+pub(crate) fn storage_dir_targets_in_env(root: &std::path::Path) -> Option<Vec<(String, std::path::PathBuf)>> {
+    storage_dir_targets_in_env_with(root, None)
+}
+
+/// A release's (storage, state) directory lists, as its signed lock states them.
+pub(crate) type StorageLists = (Vec<String>, Vec<String>);
+
+/// [`storage_dir_targets_in_env`] for another release's `lists` (`None`: this build's).
+fn storage_dir_targets_in_env_with(root: &std::path::Path, lists: Option<&StorageLists>) -> Option<Vec<(String, std::path::PathBuf)>> {
+    let env = root.join(".env");
+    let read = |k: &str| crate::onboard::env::read_env_key(&env, k);
+    let data = read("NOO_DATA_ROOT");
+    let data = data.trim();
+    if data.is_empty() {
+        return None;
+    }
+    let state = crate::commands::data_root::state_root_of(Some(read("NOO_STATE_ROOT").as_str()), data);
+    let (data, state, pg) = (std::path::Path::new(data), std::path::Path::new(&state), read("NOO_PG_DATA"));
+    Some(match lists {
+        None => storage_dir_targets(data, state, &pg),
+        Some((names, state_names)) => crate::onboard::steps::storage_targets_with(names, state_names, data, state, &pg),
+    })
+}
+
+/// The storage and state directory lists a stack lock carries
+/// (`# storage-subdirs a,b,...` and `# state-subdirs ...`, written by the
+/// release lane from `onboard/storage-dirs.lock-lines` before signing).
+/// `Ok(None)`: the lock carries neither line (a release before i467). `Err`:
+/// only one of them, two that disagree, or a name that is not a relative
+/// directory under the root. Signed bytes that cannot be read are never
+/// guessed around.
+pub(crate) fn lock_storage_lists(text: &str) -> Result<Option<StorageLists>, String> {
+    let one = |key: &str| -> Result<Option<Vec<String>>, String> {
+        let found: Vec<&str> = text.lines().filter_map(|l| l.trim().strip_prefix(key)).map(str::trim).collect();
+        let Some(first) = found.first() else { return Ok(None) };
+        if found.iter().any(|f| f != first) {
+            return Err(format!("the lock carries two different `{}` lines", key.trim()));
+        }
+        let names: Vec<String> = first.split(',').map(|n| n.trim().to_string()).collect();
+        for n in &names {
+            if !storage_name_ok(n) {
+                return Err(format!("the lock's `{}` names {n:?}, not a directory under the data root", key.trim()));
+            }
+        }
+        Ok(Some(names))
+    };
+    match (one("# storage-subdirs ")?, one("# state-subdirs ")?) {
+        (None, None) => Ok(None),
+        (Some(st), Some(sa)) => match sa.iter().find(|n| !st.contains(n)) {
+            Some(n) => Err(format!("the lock's state list names {n:?}, which its storage list does not")),
+            None => Ok(Some((st, sa))),
+        },
+        _ => Err("the lock carries one of `# storage-subdirs` / `# state-subdirs` without the other".into()),
+    }
+}
+
+/// Which list `--check` holds this box to: this CLI's when it is the target
+/// (no fetch), else the target's from its lock (`fetch`), else this CLI's
+/// with the caveat naming why. Returns (lists, list_from, source, caveat).
+pub(crate) fn storage_list_choice(
+    current: &str,
+    target: &str,
+    fetch: impl FnOnce() -> Result<StorageLists, String>,
+) -> (Option<StorageLists>, String, &'static str, Option<String>) {
+    if target == current {
+        return (None, current.to_string(), "cli", None);
+    }
+    match fetch() {
+        Ok(l) => (Some(l), format!("the {target} stack lock"), "lock", None),
+        Err(why) => (None, current.to_string(), "cli", Some(format!(
+            "checked against noo {current}'s list ({why}); {target} may add directories: \
+             run `noo upgrade` first, then `noo upgrade --all --check` to check its list"))),
+    }
+}
+
+/// The target release's lists from its signed stack lock (fetched and
+/// verified exactly as the roll does), or why they cannot be had.
+fn target_storage_lists(g: &Globals, tag: &str) -> Result<StorageLists, String> {
+    match try_stack_lock(g, tag) {
+        Ok(Some(text)) => match lock_storage_lists(&text) {
+            Ok(Some(l)) => Ok(l),
+            Ok(None) => Err(format!("stack-{tag}.lock carries no storage list")),
+            Err(e) => Err(format!("stack-{tag}.lock: {e}")),
+        },
+        Ok(None) => Err(format!("stack-{tag} publishes no signed lock")),
+        Err((_, msg, _)) => Err(msg),
+    }
+}
+
+/// What `--check` found: each of the roll's data directories for the
+/// install, whether it is there, and which of them only the target's lock
+/// names (onboarding cannot create those; the roll does).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SeenDirs {
+    pub(crate) dirs: Vec<(String, std::path::PathBuf, crate::commands::cluster_verify::DirSeen)>,
+    pub(crate) lock_only: Vec<std::path::PathBuf>,
+}
+
+/// The release `--check` holds this box's directories to: the `--tag`
+/// release when one is given (the roll reads that stack's lock), else
+/// `list_target` (harness 0.6.17 review, c2: with `--tag` the check used
+/// `list_target`, so it read another release's list than the roll would).
+pub(crate) fn storage_check_target(list_target: &str, tag_override: Option<&str>) -> String {
+    match tag_override {
+        Some(t) => norm_stack_tag(t).trim_start_matches('v').to_string(),
+        None => list_target.to_string(),
+    }
+}
+
+/// The roll's data directories for the install at `root`, the set
+/// reconcile_storage_dirs makes: this CLI's compiled list plus each directory
+/// `lists` (the target's lock) names that it does not. A lock-only name the
+/// roll would refuse (lock_only_dir_ok, the roll's own check) is "not
+/// checked", naming why. `None`: no `NOO_DATA_ROOT` in its `.env`. Reads
+/// only; never creates.
+fn storage_dirs_seen(root: &std::path::Path, lists: Option<&StorageLists>) -> Option<SeenDirs> {
+    use crate::commands::cluster_verify::{dir_seen, DirSeen};
+    let compiled = storage_dir_targets_in_env(root)?;
+    let from_lock = lists.and_then(|l| storage_dir_targets_in_env_with(root, Some(l))).unwrap_or_default();
+    let known: std::collections::HashSet<std::path::PathBuf> = compiled.iter().map(|(_, p)| p.clone()).collect();
+    let mut dirs: Vec<(String, std::path::PathBuf, DirSeen)> = compiled.into_iter().map(|(n, p)| {
+        let seen = dir_seen(&p);
+        (n, p, seen)
+    }).collect();
+    let mut lock_only = Vec::new();
+    for (n, p) in from_lock.into_iter().filter(|(_, p)| !known.contains(p)) {
+        let base = crate::onboard::steps::storage_base(&n, &p);
+        let seen = match lock_only_dir_ok(&n, &p, &base) {
+            Ok(()) => dir_seen(&p),
+            Err(e) => DirSeen::Unchecked(format!("the roll refuses this name: {e}")),
+        };
+        lock_only.push(p.clone());
+        dirs.push((n, p, seen));
+    }
+    Some(SeenDirs { dirs, lock_only })
+}
+
+/// The `--check` storage row: verify's `data directories` judgement, its
+/// `--json` object, and the caveat (`caveat`, when the list checked is not
+/// the target release's own). `list_from` names the list: this CLI's version
+/// (`source` "cli") or the target's signed lock (`source` "lock").
+pub(crate) fn storage_check_report(
+    seen: Option<&SeenDirs>,
+    list_from: &str,
+    source: &str,
+    target: &str,
+    caveat: Option<String>,
+) -> (serde_json::Value, crate::commands::cluster_verify::Check, Option<String>) {
+    use crate::commands::cluster_verify::{storage_dirs_check_with, DirSeen, Verdict};
+    let dirs = seen.map(|s| s.dirs.as_slice());
+    let c = storage_dirs_check_with(dirs, seen.map_or(&[][..], |s| s.lock_only.as_slice()));
+    let paths = |want: fn(&DirSeen) -> bool| -> Vec<String> {
+        dirs.unwrap_or_default().iter().filter(|(_, _, s)| want(s)).map(|(_, p, _)| p.display().to_string()).collect()
+    };
+    let missing = paths(|s| *s == DirSeen::Missing);
+    let unchecked = paths(|s| matches!(s, DirSeen::Unchecked(_)));
+    let j = serde_json::json!({
+        "list_from": list_from,
+        "list_source": source,
+        "target": target,
+        "checked": dirs.is_some(),
+        "verdict": if c.verdict == Verdict::Ok { "ok" } else { "warn" },
+        "detail": c.detail,
+        "missing": missing,
+        "unchecked": unchecked,
+        "remedy": c.remedy,
+        "caveat": caveat,
+    });
+    (j, c, caveat)
 }
 
 /// A release can add a service whose compose mounts
@@ -2451,7 +2836,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
             if !g.json { println!("{}", ui::phase("Nodes")); }
             let mut failed: Vec<String> = Vec::new();
             let mut pending: Vec<super::provision::PendingApply> = Vec::new();
-            println!();
+            ui::blank();
             upgrade_self_node(g, &me, &mut failed, &mut pending);
             if !pending.is_empty() {
                 wait_and_settle_nodes(g, &pending, Some(&me), &mut failed);
@@ -2477,7 +2862,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         std::env::set_var(super::node_leaves::UPGRADE_RESTAGES_LEAVES_ENV, "1");
     }
     if !g.json { println!("{}", ui::phase("Nodes")); }
-    println!("{}", ui::note(&format!("restaging provision bundles for {} node(s): {}", names.len(), names.join(", "))));
+    ui::say(&ui::note(&format!("restaging provision bundles for {} node(s): {}", names.len(), names.join(", "))));
     let mut failed: Vec<String> = Vec::new();
     // Nodes staged with --stage-only, waiting for their apply report.
     let mut pending: Vec<super::provision::PendingApply> = Vec::new();
@@ -2511,7 +2896,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
                 ui::rewrite_line(&ui::note(line));
                 drew_wait = true;
             }
-            (false, false) => println!("{}", ui::note(line)),
+            (false, false) => ui::say(&ui::note(line)),
         },
     );
     if drew_wait {
@@ -2519,15 +2904,15 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     }
     for n in &names {
         if let Some((_, why)) = skipped.iter().find(|(s, _)| s == n) {
-            println!();
-            println!("{}", ui::item(n));
-            println!("{}", ui::sub(&ui::status_line(Glyph::Warn,
+            ui::blank();
+            ui::say(&ui::item(n));
+            ui::say(&ui::sub(&ui::status_line(Glyph::Warn,
                 &format!("{n}: skipped — offline before the roll ({why}); nothing to wait for"))));
             continue;
         }
         // Each node is an item; cluster provision prints the `ui::item`
         // label and its indented steps. A blank line separates nodes.
-        println!();
+        ui::blank();
         // Whether this node ever reported an apply is read BEFORE the
         // staging replaces its row; the combined wait needs it for the
         // legacy fallback (the child judged the same fact for its own steps).
@@ -2548,7 +2933,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         match super::provision::staged_sha_of(g, n) {
             Some(sha) => pending.push(super::provision::PendingApply { node: n.clone(), sha, legacy }),
             None => {
-                println!("{}", ui::sub(&ui::status_line(Glyph::Err,
+                ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
                     &format!("{n}: staged, but the gateway reports no staged bundle to wait on"))));
                 failed.push(n.clone());
             }
@@ -2562,7 +2947,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     let me = local_agent_node(&names);
     if let Some(me) = &me {
         // The child prints its own `ui::item` label, as the rail nodes do.
-        println!();
+        ui::blank();
         upgrade_self_node(g, me, &mut failed, &mut pending);
     }
     if !pending.is_empty() {
@@ -2634,7 +3019,7 @@ const NODES_APPLY_POLL_SECS: u64 = 5;
 /// `self_node` is the controller's own node when it is among `pending`: it
 /// gets the self-node post-apply steps and is named "(self node)" in `failed`.
 fn wait_and_settle_nodes(g: &Globals, pending: &[super::provision::PendingApply], self_node: Option<&str>, failed: &mut Vec<String>) {
-    println!();
+    ui::blank();
     let ends = super::provision::wait_nodes_applied(g, pending, NODES_APPLY_BUDGET_SECS, NODES_APPLY_POLL_SECS);
     let mut applied = 0usize;
     let mut unconfirmed = 0usize;
@@ -2652,8 +3037,8 @@ fn wait_and_settle_nodes(g: &Globals, pending: &[super::provision::PendingApply]
     if g.json {
         println!("{}", serde_json::json!({"nodes_apply": json_rows}));
     } else {
-        println!();
-        println!("{}", ui::note(&format!(
+        ui::blank();
+        ui::say(&ui::note(&format!(
             "{} of {} staged node(s) applied{}",
             applied, pending.len(),
             if unconfirmed > 0 { format!(", {unconfirmed} unconfirmed (legacy fetcher)") } else { String::new() })));
@@ -2674,8 +3059,8 @@ fn settle_end(g: &Globals, n: &str, end: super::provision::ApplyEnd, is_self: bo
     use super::provision::ApplyEnd;
     match end {
         ApplyEnd::Applied { rc: 0, msg } => {
-            println!();
-            println!("{}", ui::item(n));
+            ui::blank();
+            ui::say(&ui::item(n));
             if is_self {
                 super::provision::after_self_applied(g, n, &msg);
             } else {
@@ -2685,10 +3070,10 @@ fn settle_end(g: &Globals, n: &str, end: super::provision::ApplyEnd, is_self: bo
         }
         ApplyEnd::Applied { rc, msg } => {
             let tail: String = msg.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
-            println!();
-            println!("{}", ui::item(n));
+            ui::blank();
+            ui::say(&ui::item(n));
             ui::capture("applier output", tail.trim());
-            println!("{}", ui::sub(&ui::status_line(Glyph::Err,
+            ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
                 &format!("{n}: the applier refused the bundle (exit {rc}); the node kept its previous state"))));
             if !g.json {
                 ui::guide(&[(&format!("noo cluster provision {n} --wait"), "fix the cause above, then re-stage")]);
@@ -2699,9 +3084,9 @@ fn settle_end(g: &Globals, n: &str, end: super::provision::ApplyEnd, is_self: bo
             (serde_json::json!({"node": n, "outcome": "unconfirmed"}), Settled::Unconfirmed)
         }
         ApplyEnd::NotReported { fetched } => {
-            println!();
-            println!("{}", ui::item(n));
-            println!("{}", ui::sub(&ui::status_line(Glyph::Err, &if fetched {
+            ui::blank();
+            ui::say(&ui::item(n));
+            ui::say_err(&ui::sub(&ui::status_line(Glyph::Err, &if fetched {
                 format!("{n}: fetched the bundle but reported no apply outcome within {}m", NODES_APPLY_BUDGET_SECS / 60)
             } else {
                 format!("{n}: bundle staged but the node never fetched it within {}m", NODES_APPLY_BUDGET_SECS / 60)
@@ -2925,7 +3310,7 @@ fn mac_leaves_pass(g: &Globals, nodes: &[String], budget: u64) -> Vec<(String, M
     if !g.json { println!("{}", ui::phase("Mac Leaves")); }
     let floor = floor_str();
     if !g.json {
-        println!("{}", ui::note(&format!(
+        ui::say(&ui::note(&format!(
             "{} staged without backend door leaves (applier below noo-cli {floor}); \
              restaging once each reports the new CLI", nodes.join(", "))));
     }
@@ -2940,7 +3325,7 @@ fn mac_leaves_pass(g: &Globals, nodes: &[String], budget: u64) -> Vec<(String, M
             if reached_leaf_floor(&v) {
                 if !g.json {
                     let msg = format!("{n} reports {v}");
-                    match poll.take() { Some(p) => p.done(&msg), None => println!("{}", ui::sub(&ui::status_line(Glyph::Ok, &msg))) }
+                    match poll.take() { Some(p) => p.done(&msg), None => ui::say(&ui::sub(&ui::status_line(Glyph::Ok, &msg))) }
                 }
                 break true;
             }
@@ -2958,7 +3343,7 @@ fn mac_leaves_pass(g: &Globals, nodes: &[String], budget: u64) -> Vec<(String, M
         };
         if !reached {
             if !g.json {
-                println!("{}", ui::sub(&ui::status_line(Glyph::Warn, &format!(
+                ui::say(&ui::sub(&ui::status_line(Glyph::Warn, &format!(
                     "{n} did not report noo-cli {floor} within {}s — its leaves are not staged", budget))));
             }
             out.push((n.clone(), MacLeaves::TimedOut));
@@ -2977,14 +3362,14 @@ fn mac_leaves_pass(g: &Globals, nodes: &[String], budget: u64) -> Vec<(String, M
         match super::provision::staged_sha_of(g, n) {
             Some(sha) => pending.push(super::provision::PendingApply { node: n.clone(), sha, legacy }),
             None => {
-                println!("{}", ui::sub(&ui::status_line(Glyph::Err,
+                ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
                     &format!("{n}: staged, but the gateway reports no staged bundle to wait on"))));
                 out.push((n.clone(), MacLeaves::RestageFailed));
             }
         }
     }
     if !pending.is_empty() {
-        println!();
+        ui::blank();
         for (n, end) in super::provision::wait_nodes_applied(g, &pending, NODES_APPLY_BUDGET_SECS, NODES_APPLY_POLL_SECS) {
             let outcome = mac_leaves_outcome(&end);
             settle_end(g, &n, end, false);
@@ -3053,7 +3438,7 @@ fn upgrade_self_node(g: &Globals, me: &str, failed: &mut Vec<String>, pending: &
     match super::provision::staged_sha_of(g, me) {
         Some(sha) => pending.push(super::provision::PendingApply { node: me.to_string(), sha, legacy }),
         None => {
-            println!("{}", ui::sub(&ui::status_line(Glyph::Err,
+            ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
                 &format!("{me}: staged, but the gateway reports no staged bundle to wait on"))));
             failed.push(format!("{me} (self node)"));
         }
@@ -3321,8 +3706,7 @@ fn asset_platforms(toks: &[serde_json::Value], own_os: &str, own_arch: &str) -> 
         ("linux".to_string(), "aarch64".to_string()),
     ];
     v.extend(toks.iter().filter_map(|t| t.get("facts")).map(|f| {
-        let os = f.get("os").and_then(|v| v.as_str()).unwrap_or("linux").to_string();
-        let arch = f.get("arch").and_then(|v| v.as_str()).unwrap_or("x86_64").to_string();
+        let (os, arch, _) = crate::commands::provision::platform_from_facts(Some(f));
         (os, arch)
     }));
     v.sort();
@@ -3488,11 +3872,11 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
     // per-item work; details hang under the closing line).
     if !uploaded.is_empty() {
         ui::done(&format!("{} CLI asset(s) uploaded to the controller ({version})", uploaded.len()));
-        println!("{}", ui::note(&uploaded.join(", ")));
+        ui::say(&ui::note(&uploaded.join(", ")));
     }
     if !already_held.is_empty() {
         ui::done(&format!("{} CLI asset(s) already on the gateway (sha256 matches, not re-uploaded)", already_held.len()));
-        println!("{}", ui::note(&already_held.join(", ")));
+        ui::say(&ui::note(&already_held.join(", ")));
     }
 }
 
@@ -4554,6 +4938,37 @@ fn lock_stage_blocker(g: &Globals, failed: &[String], force: bool) -> Option<Str
     }
 }
 
+/// A fresh, private file for the launcher's record of the containers it
+/// stops on purpose during this roll (`NOO_LAUNCHER_STOPS`, read by the
+/// post-roll gate: restart_loops::IntendedStops). A 0700 directory with an
+/// unguessable name (migrate::private_stage) holding one 0600 file created
+/// new, so no earlier roll's record and no other user's file is ever read.
+/// `None`, said, when either cannot be made: the gate then judges every
+/// stopped container by its state, never excusing one.
+fn launcher_stops_file(g: &Globals) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let made = crate::commands::migrate::private_stage("noo-launch-stops").and_then(|dir| {
+        let file = dir.join("stops");
+        match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&file) {
+            Ok(_) => Ok((dir, file)),
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                Err(format!("cannot create {}: {e}", file.display()))
+            }
+        }
+    });
+    match made {
+        Ok(p) => Some(p),
+        Err(e) => {
+            if !g.json {
+                eprintln!("{}", ui::status_line(Glyph::Warn, &format!(
+                    "{e}; a container the launcher stops on purpose is judged by its state alone")));
+            }
+            None
+        }
+    }
+}
+
 /// Post-roll gate: no stack container may be restart-looping. A healthy
 /// `/health` is one instant; a redis that crashes on start reads "Up"
 /// between restarts, and on 2026-10-16 (0.6.3 -> 0.6.4, a root-owned
@@ -4563,19 +4978,26 @@ fn lock_stage_blocker(g: &Globals, failed: &[String], force: bool) -> Option<Str
 /// for up to a minute while a container has restarted but not yet looped).
 /// `None` (no roll this run): nothing to judge. A docker that cannot list
 /// the stack warns and does not block.
-fn post_roll_restart_loops_clear(g: &Globals, roll_started: Option<i64>) -> bool {
+fn post_roll_restart_loops_clear(g: &Globals, roll_started: Option<i64>, baseline: &crate::commands::cluster_verify::restart_loops::Baseline) -> bool {
     use crate::commands::cluster_verify::{now_unix, restart_loops as rl};
     let Some(since) = roll_started else { return true };
     let prefix = crate::envfile::container_prefix();
-    match rl::gate_loops(&rl::real_docker, &prefix, since, &now_unix, &mut |s| std::thread::sleep(Duration::from_secs(s))) {
-        Ok(v) if v.is_empty() => true,
-        Ok(v) => {
+    match rl::gate_loops(&rl::real_docker, &prefix, since, baseline, &now_unix, &mut |s| std::thread::sleep(Duration::from_secs(s))) {
+        Ok((v, notes)) if v.is_empty() => {
+            if !g.json {
+                for n in &notes {
+                    println!("{}", ui::note(n));
+                }
+            }
+            true
+        }
+        Ok((v, _)) => {
             for l in &v {
                 eprintln!("{}", ui::status_line(Glyph::Err, &l.line()));
             }
             let svc = rl::service_of(&v[0].container, &prefix).to_string();
             ui::close_failed(
-                &format!("{} stack container(s) restart-looping after the roll — the node phase does not start on a broken stack", v.len()),
+                &format!("{} stack container(s) restart-looping or crashed after the roll — the node phase does not start on a broken stack", v.len()),
                 Some(&format!("noo stack logs {svc}")),
             );
             false
@@ -5113,9 +5535,8 @@ mod tests {
     #[test]
     fn the_mac_pass_stages_only_then_waits_once() {
         let src = include_str!("upgrade.rs");
-        let src = src.split("#[cfg(test)]").next().unwrap();
-        let f = &src[src.find("fn mac_leaves_pass(").unwrap()..];
-        let f = &f[..f.find("\n}\n").unwrap()];
+        let src = crate::test_src::own_code(src);
+        let f = crate::test_src::fn_body(&src, "fn mac_leaves_pass(");
         assert!(f.contains(r#"provision_one(g, n, &["--stage-only"])"#), "{f}");
         assert_eq!(f.matches("provision_one(").count(), 1, "no full serial provision left");
         assert_eq!(f.matches("wait_nodes_applied(").count(), 1, "one wait over every staged Mac");
@@ -6093,14 +6514,16 @@ mod keyless_tests {
     fn one_shot_gateway(status: u16, body: &'static str) -> String {
         use std::io::{Read, Write};
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", l.local_addr().unwrap());
+        let url = format!("https://{}", l.local_addr().unwrap());
         std::thread::spawn(move || {
             // The probe may retry after a 401 refresh attempt: serve a few.
             for _ in 0..3 {
-                let Ok((mut c, _)) = l.accept() else { return };
+                let Ok((tcp, _)) = l.accept() else { return };
+                let Some(mut c) = crate::test_tls::accept(tcp) else { continue };
                 let mut buf = [0u8; 2048];
                 let _ = c.read(&mut buf);
                 let _ = write!(c, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                crate::test_tls::close(&mut c);
             }
         });
         url
@@ -6115,6 +6538,7 @@ mod keyless_tests {
     /// still counts, and an answering gateway that cannot be read refuses.
     #[test]
     fn a_down_gateway_falls_back_to_the_store_check_but_an_unreadable_one_refuses() {
+        let _ca = crate::test_tls::trust();
         use super::{pre_roll_key_verdict, read_gateway_key_shortfall, unverified_keys_warning, PreRollKeys};
         let req = vec![("worker".to_string(), "svc:worker".to_string())];
         let none: Vec<String> = vec![];
@@ -6122,7 +6546,7 @@ mod keyless_tests {
 
         // Closed port: bind, learn the port, drop the listener.
         let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
-        let (db, down) = read_gateway_key_shortfall(&probe_globals(format!("http://127.0.0.1:{port}")), &req);
+        let (db, down) = read_gateway_key_shortfall(&probe_globals(format!("https://127.0.0.1:{port}")), &req);
         assert_eq!((db.as_ref(), down), (None, true), "connection refused means nothing answered");
         assert_eq!(pre_roll_key_verdict(&none, db.as_deref(), false, down), PreRollKeys::GoUnverified, "store check passed: go, with the warning");
         assert_eq!(pre_roll_key_verdict(&worker, db.as_deref(), false, down), PreRollKeys::Missing(worker.clone()),
@@ -6136,7 +6560,7 @@ mod keyless_tests {
         // that would fix it goes ahead on the store check.
         let crashing = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let url = format!("http://{}", l.local_addr().unwrap());
+            let url = format!("https://{}", l.local_addr().unwrap());
             std::thread::spawn(move || {
                 if let Ok((c, _)) = l.accept() {
                     // Leave the request unread: the close goes out as RST.
@@ -6419,16 +6843,16 @@ mod door_node_id_tests {
 /// means a needle can only be satisfied by the code it is about.
 #[cfg(test)]
 pub(crate) mod phase_src {
-    fn code() -> &'static str {
-        include_str!("upgrade.rs").split("#[cfg(test)]").next().expect("non-test source")
+    /// This file as guards read it: comments blanked, every `#[cfg(test)]`
+    /// item removed whole (followup 215, `crate::test_src`).
+    pub(crate) fn code() -> &'static str {
+        static CODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        CODE.get_or_init(|| crate::test_src::own_code(include_str!("upgrade.rs")))
     }
 
-    /// `fn <name>(` through the first column-0 closing brace.
+    /// `fn <name>(` through its own closing brace; panics when it is gone.
     pub(crate) fn body(name: &str) -> &'static str {
-        let code = code();
-        let start = code.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("fn {name} not found in upgrade.rs"));
-        let rest = &code[start..];
-        &rest[..rest.find("\n}\n").unwrap_or_else(|| panic!("end of fn {name}"))]
+        crate::test_src::fn_body(code(), &format!("fn {name}("))
     }
 
     /// The ordered phase list of `noo upgrade --stack`.
@@ -6439,7 +6863,12 @@ pub(crate) mod phase_src {
 
 #[cfg(test)]
 mod storage_dir_tests {
-    use super::missing_storage_dirs;
+    fn missing_storage_dirs(data: &std::path::Path, state: &std::path::Path, pg_data: &str) -> Vec<(String, std::path::PathBuf)> {
+        super::storage_dir_targets(data, state, pg_data)
+            .into_iter()
+            .filter(|(_, p)| !p.exists())
+            .collect()
+    }
     use crate::onboard::{STATE_SUBDIRS, STORAGE_SUBDIRS};
 
     /// A data root holding every storage directory except `skip`.
@@ -6482,6 +6911,189 @@ mod storage_dir_tests {
         let _ = std::fs::remove_dir_all(&state);
     }
 
+    /// An install root whose `.env` names `data` as its data root.
+    fn install_at(tag: &str, data: &std::path::Path) -> std::path::PathBuf {
+        let r = std::env::temp_dir().join(format!("noo-check-install-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&r);
+        std::fs::create_dir_all(&r).unwrap();
+        std::fs::write(r.join(".env"), format!("NOO_DATA_ROOT={}\n", data.display())).unwrap();
+        r
+    }
+
+    /// `noo upgrade --check`: a box missing one of the roll's directories is
+    /// told which, with the onboarding remedy, and nothing is created.
+    #[test]
+    fn check_names_a_missing_dir_with_the_remedy_and_creates_nothing() {
+        let data = root_without("check", STORAGE_SUBDIRS, &["tempo"]);
+        let root = install_at("check", &data);
+        let dirs = super::storage_dirs_seen(&root, None);
+        let (j, c, caveat) = super::storage_check_report(dirs.as_ref(), "0.6.17", "cli", "0.6.17", None);
+        assert_eq!(c.verdict, crate::commands::cluster_verify::Verdict::Warn, "{}", c.detail);
+        assert_eq!(j["verdict"], "warn");
+        assert_eq!(j["checked"], true);
+        assert_eq!(j["missing"], serde_json::json!([data.join("tempo").display().to_string()]));
+        assert_eq!(j["remedy"], "noo onboard --only storage");
+        assert_eq!(caveat, None, "the running CLI's list is the roll's");
+        assert!(!data.join("tempo").exists(), "--check must never create a directory");
+        std::fs::create_dir_all(data.join("tempo")).unwrap();
+        let (j, _, _) = super::storage_check_report(super::storage_dirs_seen(&root, None).as_ref(), "0.6.17", "cli", "0.6.17", None);
+        assert_eq!(j["verdict"], "ok");
+        assert_eq!(j["missing"], serde_json::json!([]));
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With an upgrade pending and no readable list in the target's lock, the
+    /// list checked is this CLI's, and the caveat says so and why.
+    #[test]
+    fn a_pending_upgrade_without_a_lock_list_says_whose_list_was_checked() {
+        let (lists, from, source, caveat) = super::storage_list_choice("0.6.17", "0.6.18",
+            || Err("stack-v0.6.18.lock carries no storage list".into()));
+        assert_eq!((lists, from.as_str(), source), (None, "0.6.17", "cli"));
+        let caveat = caveat.expect("a caveat when the lists differ");
+        for want in ["noo 0.6.17's list", "carries no storage list", "noo upgrade --all --check"] {
+            assert!(caveat.contains(want), "{want}: {caveat}");
+        }
+        let (j, _, _) = super::storage_check_report(None, &from, source, "0.6.18", Some(caveat.clone()));
+        assert_eq!(j["caveat"].as_str(), Some(caveat.as_str()), "--json carries the caveat too");
+        let (_, _, _, none) = super::storage_list_choice("0.6.17", "0.6.17", || panic!("no fetch when this CLI is the target"));
+        assert_eq!(none, None);
+        let (j, _, _) = super::storage_check_report(None, "0.6.17", "cli", "0.6.17", None);
+        assert!(j["caveat"].is_null());
+    }
+
+    /// i467 "done when": from a box on CLI N, a directory only N+1 adds is
+    /// found through N+1's lock list, with the remedy, and nothing is created.
+    #[test]
+    fn a_dir_only_the_target_adds_is_found_through_its_lock_list() {
+        let data = root_without("lock", STORAGE_SUBDIRS, &[]);
+        let root = install_at("lock", &data);
+        let mut storage: Vec<String> = STORAGE_SUBDIRS.iter().map(|s| s.to_string()).collect();
+        storage.push("newdir".into());
+        let state: Vec<String> = STATE_SUBDIRS.iter().map(|s| s.to_string()).collect();
+        let (lists, from, source, caveat) = super::storage_list_choice("0.6.17", "0.6.18", || Ok((storage, state)));
+        assert_eq!((source, caveat), ("lock", None));
+        let (j, _, _) = super::storage_check_report(super::storage_dirs_seen(&root, lists.as_ref()).as_ref(), &from, source, "0.6.18", None);
+        assert_eq!(j["list_source"], "lock");
+        assert_eq!(j["missing"], serde_json::json!([data.join("newdir").display().to_string()]));
+        // Onboarding (this CLI's list) can never make `newdir`: the remedy is
+        // the roll, which creates it before the pin moves (0.6.17 review c4).
+        assert_eq!(j["remedy"], crate::commands::cluster_verify::STORAGE_DIRS_LOCK_ONLY_REMEDY);
+        assert!(!j["remedy"].as_str().unwrap().contains("onboard"), "{}", j["remedy"]);
+        assert!(!data.join("newdir").exists(), "--check must never create a directory");
+        // This CLI's own list finds nothing missing on the same box.
+        let (j, _, _) = super::storage_check_report(super::storage_dirs_seen(&root, None).as_ref(), "0.6.17", "cli", "0.6.17", None);
+        assert_eq!(j["verdict"], "ok");
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// harness 0.6.17 review c2: `--check --tag X` holds the box to X's
+    /// lock, as the roll does, even when no CLI upgrade is pending (the
+    /// check used `list_target`, this CLI's version, and fetched nothing);
+    /// and it checks the roll's set, this CLI's compiled list PLUS the
+    /// lock's, so a compiled directory the lock leaves out is still checked.
+    #[test]
+    fn check_with_a_tag_holds_the_box_to_that_tags_lock_and_the_rolls_set() {
+        assert_eq!(super::storage_check_target("0.6.17", Some("stack-v0.6.18")), "0.6.18");
+        assert_eq!(super::storage_check_target("0.6.17", Some("v0.6.18-rc.2")), "0.6.18-rc.2");
+        assert_eq!(super::storage_check_target("0.6.17", None), "0.6.17");
+        let target = super::storage_check_target("0.6.17", Some("v0.6.18"));
+        let fetched = std::cell::Cell::new(None::<String>);
+        let data = root_without("tagcheck", STORAGE_SUBDIRS, &["tempo"]);
+        let root = install_at("tagcheck", &data);
+        let mut storage: Vec<String> = STORAGE_SUBDIRS.iter().filter(|s| **s != "tempo").map(|s| s.to_string()).collect();
+        storage.push("newdir".into());
+        let state: Vec<String> = STATE_SUBDIRS.iter().map(|s| s.to_string()).collect();
+        let (lists, from, source, _) = super::storage_list_choice("0.6.17", &target, || {
+            fetched.set(Some(super::norm_stack_tag(&target)));
+            Ok((storage, state))
+        });
+        assert_eq!(fetched.take().as_deref(), Some("v0.6.18"), "the tag's lock is read, not this CLI's list");
+        assert_eq!((source, from.as_str()), ("lock", "the 0.6.18 stack lock"));
+        let seen = super::storage_dirs_seen(&root, lists.as_ref()).expect("NOO_DATA_ROOT is set");
+        assert_eq!(seen.lock_only, vec![data.join("newdir")]);
+        let (j, _, _) = super::storage_check_report(Some(&seen), &from, source, &target, None);
+        assert_eq!(j["target"], "0.6.18");
+        let mut missing: Vec<String> = j["missing"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        missing.sort();
+        let mut want = vec![data.join("newdir").display().to_string(), data.join("tempo").display().to_string()];
+        want.sort();
+        assert_eq!(missing, want, "the compiled `tempo` the lock omits is still the roll's");
+        // A compiled directory is missing too: onboarding makes that one.
+        assert_eq!(j["remedy"], "noo onboard --only storage");
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// harness 0.6.17 review c4: a directory only the target's lock names
+    /// that the roll could not create is never sent back to onboarding,
+    /// which does not know it (the operator would loop).
+    #[test]
+    fn a_lock_only_create_failure_never_names_onboarding() {
+        assert!(!super::storage_dir_failure_remedy(true).contains("onboard"), "{}", super::storage_dir_failure_remedy(true));
+        assert!(super::storage_dir_failure_remedy(true).contains("noo upgrade --stack"));
+        assert_eq!(super::storage_dir_failure_remedy(false), "noo onboard --only storage   # then re-run: noo upgrade --stack");
+        let body = crate::test_src::fn_body(super::phase_src::code(), "fn reconcile_storage_dirs(");
+        assert!(body.contains("lock_only_failed |= d.lock_only;") && body.contains("Some(storage_dir_failure_remedy(lock_only_failed))"), "{body}");
+    }
+
+    /// The lock's lines read back as this build's lists; a lock before i467
+    /// has none; anything else unreadable is an error, never a guess.
+    #[test]
+    fn lock_storage_lists_reads_only_well_formed_pairs() {
+        let compiled = (STORAGE_SUBDIRS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                        STATE_SUBDIRS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let lock = format!("# stack v0.6.18\n{}x@sha256:00\n", crate::onboard::storage_lock_lines_tests::storage_lock_lines());
+        assert_eq!(super::lock_storage_lists(&lock), Ok(Some(compiled)));
+        assert_eq!(super::lock_storage_lists("# stack v0.6.16\nx@sha256:00\n"), Ok(None));
+        for bad in [
+            "# storage-subdirs a,b\n",
+            "# storage-subdirs a,b\n# state-subdirs a\n# storage-subdirs a\n",
+            "# storage-subdirs a,../etc\n# state-subdirs a\n",
+            "# storage-subdirs a,/etc\n# state-subdirs a\n",
+            "# storage-subdirs a,,b\n# state-subdirs a\n",
+            "# storage-subdirs a\n# state-subdirs b\n",
+        ] {
+            assert!(super::lock_storage_lists(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// The lines are inside the signed bytes: a lock carrying them signs and
+    /// verifies through the roll's own fetch-and-verify, and a lock whose
+    /// storage line was altered after signing is refused.
+    #[test]
+    fn the_storage_lines_are_covered_by_the_lock_signature() {
+        let key = crate::release_sig::signing_key_from_seed_hex(&"11".repeat(32)).unwrap();
+        let pk = crate::release_sig::pubkey_hex(&key);
+        let lock = format!("# stack v0.6.18\n# mesh-migration-head 100_x\n{}gateway@sha256:{}\n",
+            crate::onboard::storage_lock_lines_tests::storage_lock_lines(), "ab".repeat(32));
+        let sig = crate::release_sig::sign(&key, lock.as_bytes());
+        let verify = |d: &[u8], s: &str| crate::release_sig::verify_with_keys(d, s, &[pk.as_str()]);
+        let serve = |body: String| {
+            let sig = sig.clone();
+            move |_: &str, name: &str| -> Result<Vec<u8>, crate::release_fetch::FetchError> {
+                Ok(if name.ends_with(".sig") { sig.clone().into_bytes() } else { body.clone().into_bytes() })
+            }
+        };
+        let text = super::stack_lock_with("v0.6.18", &mut serve(lock.clone()), &verify).unwrap().expect("a lock");
+        assert!(super::lock_storage_lists(&text).unwrap().is_some());
+        let tampered = lock.replacen(",tempo,", ",tempo,extra,", 1);
+        assert_ne!(tampered, lock, "the tamper applied");
+        let e = super::stack_lock_with("v0.6.18", &mut serve(tampered), &verify).unwrap_err();
+        assert_eq!(e.0, "stack_lock_invalid", "{}", e.1);
+    }
+
+    /// No NOO_DATA_ROOT: "not checked", never OK.
+    #[test]
+    fn check_without_a_data_root_is_not_checked() {
+        let root = std::env::temp_dir().join(format!("noo-check-noenv-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (j, _, _) = super::storage_check_report(super::storage_dirs_seen(&root, None).as_ref(), "0.6.17", "cli", "0.6.17", None);
+        assert_eq!((j["checked"].as_bool(), j["verdict"].as_str()), (Some(false), Some("warn")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Postgres' device is NOO_PG_DATA: under another path it is not ours to
     /// make, so its absence under the root is not "missing".
     #[test]
@@ -6503,6 +7115,97 @@ mod storage_dir_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A temp data root holding `dirs`.
+    fn base_with(tag: &str, dirs: &[&str]) -> std::path::PathBuf {
+        let b = std::env::temp_dir().join(format!("noo-plan-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&b);
+        for d in dirs {
+            std::fs::create_dir_all(b.join(d)).unwrap();
+        }
+        std::fs::create_dir_all(&b).unwrap();
+        b
+    }
+
+    /// i467 item 3: a name only the target stack's lock carries is planned
+    /// beside the compiled ones; a name both carry is planned once.
+    #[test]
+    fn the_roll_plans_the_union_of_its_list_and_the_locks() {
+        let b = base_with("union", &[]);
+        let compiled = vec![("tempo".to_string(), b.join("tempo"))];
+        let lock = vec![("tempo".to_string(), b.join("tempo")), ("newdir".to_string(), b.join("newdir"))];
+        let p = super::plan_storage_dirs(compiled, lock).unwrap();
+        let got: Vec<(&str, bool)> = p.iter().map(|d| (d.name.as_str(), d.lock_only)).collect();
+        assert_eq!(got, vec![("tempo", false), ("newdir", true)]);
+        assert_eq!(p[1].base, b);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// Names from the lock become paths, so this CLI checks each lock-only
+    /// one itself: `../etc` and `/tmp/x` refuse (in the lock parser AND in
+    /// the plan, which does not trust the parser), and nothing is planned.
+    #[test]
+    fn a_lock_naming_a_path_outside_the_root_refuses() {
+        let b = base_with("escape", &[]);
+        for name in ["../etc", "/tmp/x"] {
+            let lock_text = format!("# storage-subdirs noo-data,{name}\n# state-subdirs noo-data\n");
+            assert!(super::lock_storage_lists(&lock_text).is_err(), "the lock parser refuses {name}");
+            let e = super::plan_storage_dirs(vec![], vec![(name.to_string(), b.join(name))]).unwrap_err();
+            assert!(e[0].contains("not a directory name"), "{name}: {e:?}");
+        }
+        let e = super::plan_storage_dirs(vec![], vec![("ollama/x".to_string(), b.join("ollama/x")), ("x/y".to_string(), b.join("x/y"))]).unwrap_err();
+        assert_eq!(e.len(), 1, "nested only beneath a directory this CLI places: {e:?}");
+        assert!(e[0].contains("\"x/y\"") && e[0].contains("does not place"), "{e:?}");
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// A symlink on the way would send the create (and the stack's bind)
+    /// outside the root: refused, and its target is never written.
+    #[test]
+    fn a_symlink_under_the_root_refuses_a_lock_only_dir() {
+        let b = base_with("link", &[]);
+        let elsewhere = base_with("link-target", &[]);
+        std::os::unix::fs::symlink(&elsewhere, b.join("models")).unwrap();
+        let e = super::plan_storage_dirs(vec![], vec![("models/new".to_string(), b.join("models/new"))]).unwrap_err();
+        assert!(e[0].contains("is a symlink"), "{e:?}");
+        assert!(!elsewhere.join("new").exists());
+        let _ = std::fs::remove_dir_all(&b);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    /// A valid lock-only name is created through onboarding's helper and
+    /// carries its root's owner (it has no subdir_owner entry).
+    #[test]
+    fn a_lock_only_dir_is_created_with_its_roots_owner() {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(crate::onboard::steps::subdir_owner("newdir"), None);
+        let b = base_with("own", &[]);
+        let p = super::plan_storage_dirs(vec![], vec![("newdir".to_string(), b.join("newdir"))]).unwrap();
+        crate::onboard::steps::create_storage_dir(&p[0].name, &p[0].path).unwrap();
+        let (root, made) = (std::fs::metadata(&b).unwrap(), std::fs::metadata(b.join("newdir")).unwrap());
+        assert!(made.is_dir());
+        assert_eq!((made.uid(), made.gid()), (root.uid(), root.gid()));
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// The roll refuses an unreadable lock list and a refused name before it
+    /// creates anything, and lock-only directories get their root's owner.
+    #[test]
+    fn the_roll_refuses_bad_lock_names_before_creating() {
+        let body = super::phase_src::body("reconcile_storage_dirs");
+        let at = |n: &str| body.find(n).unwrap_or_else(|| panic!("{n} not in reconcile_storage_dirs"));
+        let create = at("create_storage_dir(");
+        assert!(at("\"stack_lock_storage_unreadable\"") < create);
+        assert!(at("\"stack_lock_storage_name\"") < create);
+        assert!(at("plan_storage_dirs(") < create);
+        assert!(body.contains("crate::onboard::steps::create_storage_dir(&d.name, &d.path)"), "every dir, lock-only included, through onboarding's helper");
+        let steps = crate::test_src::own_code(include_str!("../onboard/steps.rs"));
+        let create = crate::test_src::fn_body(&steps, "pub(crate) fn create_storage_dir(");
+        assert!(create.contains("intended_owner(name, &base)") && create.contains("owner_mismatch("), "which gives it its intended owner, checked");
+        let plan = crate::test_src::fn_body(super::phase_src::code(), "pub(crate) fn plan_storage_dirs(");
+        assert!(plan.contains("crate::onboard::steps::storage_base"), "and places it with the same base rule");
+        assert!(!super::phase_src::code().contains("fn own_like("), "no second owner rule");
+    }
+
     /// The step runs after the new deploy slice and BEFORE the pin moves (a
     /// failure leaves the old release pinned) and long before the launcher's
     /// bind check; it creates through onboarding's helper and refuses loudly.
@@ -6510,13 +7213,184 @@ mod storage_dir_tests {
     fn storage_dirs_are_made_before_the_pin_moves() {
         let list = super::phase_src::list();
         let at = |n: &str| list.find(n).unwrap_or_else(|| panic!("{n} not in the phase list"));
-        let step = at("reconcile_storage_dirs(g, &roll.root)");
-        assert!(at("refresh_deploy_slice(") < step, "after the new release's compose is laid down");
-        for later in ["move_pin(", "launch_stack("] {
+        let step = at("reconcile_storage_dirs(g, &roll.root, &roll.tag, target_stack_lock.as_deref())");
+        // i458 (b): the slice is written AFTER this refusal, so a refused
+        // roll leaves the old compose (slice_moves_with_the_pin pins that).
+        for later in ["refresh_deploy_slice(", "move_pin(", "launch_stack("] {
             assert!(step < at(later), "the data directories must exist before `{later}`");
         }
         let body = super::phase_src::body("reconcile_storage_dirs");
         assert!(body.contains("crate::onboard::steps::create_storage_dir("), "created through onboarding's helper");
         assert!(body.contains("\"storage_dir_failed\""), "a directory that cannot be made is a refusal");
+    }
+}
+
+/// i388: under `--json`, stdout carries only JSON lines. The nodes and seats
+/// stages printed their per-node labels, blank separators and failure lines
+/// with raw `println!` whatever the mode, so `noo --json upgrade --nodes`
+/// (and the stage-2 re-exec of `--all --json`) was not parseable line by
+/// line. Narration now goes through `ui::say`/`ui::blank` (dropped under
+/// --json/--quiet) and failure lines through `ui::say_err` (stderr there).
+#[cfg(test)]
+mod json_stdout_tests {
+    use crate::commands::provision::ApplyEnd;
+
+    const CHILD_ENV: &str = "NOO_TEST_SETTLE_END_CHILD";
+    const BEGIN: &str = "<<<settle-end-begin>>>";
+    const END: &str = "<<<settle-end-end>>>";
+    const CHILD: &str = "commands::upgrade::json_stdout_tests::settle_end_child";
+
+    /// The child half: runs only when the test below re-execs this binary
+    /// with CHILD_ENV set, so its prints reach a real stdout (libtest
+    /// captures them in-process). Every ApplyEnd that needs no gateway.
+    #[test]
+    fn settle_end_child() {
+        let Ok(mode) = std::env::var(CHILD_ENV) else { return };
+        let json = mode == "json";
+        if json {
+            crate::ui::set_silent(true);
+        }
+        let g = crate::Globals {
+            json, verbose: false, gateway_override: None, timeout_secs: None, token: None, quiet: false,
+        };
+        println!("{BEGIN}");
+        let mut rows = Vec::new();
+        for end in [
+            ApplyEnd::NotReported { fetched: false },
+            ApplyEnd::NotReported { fetched: true },
+            ApplyEnd::Applied { rc: 2, msg: "applier: refused the bundle".to_string() },
+            ApplyEnd::LegacyUnconfirmed,
+        ] {
+            rows.push(super::settle_end(&g, "rh-node", end, false).0);
+        }
+        if json {
+            // what wait_and_settle_nodes prints under --json
+            println!("{}", serde_json::json!({"nodes_apply": rows}));
+        }
+        println!("{END}");
+    }
+
+    fn child(mode: &str) -> (Vec<String>, String) {
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", CHILD, "--nocapture", "--test-threads", "1"])
+            .env(CHILD_ENV, mode)
+            .output()
+            .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(out.status.success(), "child failed: {stdout}");
+        let lines: Vec<String> = stdout.lines()
+            // libtest may print `test <name> ... ` ahead of the first line
+            .skip_while(|l| !l.ends_with(BEGIN)).skip(1)
+            .take_while(|l| !l.starts_with(END))
+            .map(str::to_string)
+            .collect();
+        assert!(stdout.contains(END), "the child never reached its end marker: {stdout}");
+        (lines, String::from_utf8_lossy(&out.stderr).to_string())
+    }
+
+    #[test]
+    fn settle_end_writes_only_json_lines_to_stdout_under_json() {
+        // the human run prints the node's label and its failure lines: the
+        // test can see stdout, so an empty --json stdout means something
+        let (human, _) = child("human");
+        assert!(human.iter().any(|l| l.contains("rh-node") && l.contains("never fetched")), "human stdout: {human:?}");
+        let (json, err) = child("json");
+        assert!(!json.is_empty(), "the nodes_apply row must be on stdout");
+        for l in &json {
+            assert!(serde_json::from_str::<serde_json::Value>(l).is_ok(), "non-JSON stdout line under --json: {l:?} (all: {json:?})");
+        }
+        let v: serde_json::Value = serde_json::from_str(json.last().unwrap()).unwrap();
+        assert_eq!(v["nodes_apply"][0]["outcome"], "not_fetched");
+        assert_eq!(v["nodes_apply"][2]["outcome"], "refused");
+        // failures are not dropped: they go to stderr
+        assert!(err.contains("rh-node: bundle staged but the node never fetched it"), "stderr: {err}");
+        assert!(err.contains("the applier refused the bundle (exit 2)"), "stderr: {err}");
+    }
+
+    /// `fn <name>(` through its own closing brace, in `src` (followup 215:
+    /// `test_src::fn_body`, never the first column-0 brace). `file` names it
+    /// in the panic when it is gone.
+    fn body<'a>(src: &'a str, file: &str, name: &str) -> &'a str {
+        assert!(src.contains(&format!("fn {name}(")), "fn {name} not found in {file}");
+        crate::test_src::fn_body(src, &format!("fn {name}("))
+    }
+
+    /// Every stdout print reachable from the nodes and seats stages goes
+    /// through a mode-aware printer; a raw `println!` is allowed only on a
+    /// line that is itself the JSON branch (names `g.json` or prints `json!`).
+    #[test]
+    fn fleet_stage_functions_have_no_raw_stdout_print() {
+        let up = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let files: [(&str, &str, &[&str]); 3] = [
+            ("upgrade.rs", up.as_str(),
+             &["upgrade_nodes", "wait_and_settle_nodes", "settle_end", "mac_leaves_pass", "upgrade_self_node", "upload_cli_assets"]),
+            ("kiosk_seat.rs", include_str!("kiosk_seat.rs"), &["upgrade_seats"]),
+            ("cluster_verify.rs", include_str!("cluster_verify.rs"), &["verify_node_after_apply"]),
+        ];
+        let mut raw = Vec::new();
+        for (file, src, fns) in files {
+            for name in fns {
+                for line in body(src, file, name).lines() {
+                    let code = line.split("//").next().unwrap_or("").replace("eprintln!(", "").replace("eprint!(", "");
+                    if (code.contains("println!(") || code.contains("print!(")) && !code.contains("g.json") && !code.contains("json!(") {
+                        raw.push(format!("{file} fn {name}: {}", line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(raw.is_empty(), "raw stdout prints in the fleet stages (use ui::say / ui::blank / ui::say_err):\n{}", raw.join("\n"));
+    }
+}
+
+/// i458 (b): the deploy slice moves with the pin. A roll refused in the
+/// stack stage left the NEW release's compose and scripts over the OLD
+/// images on pop-os (0.6.16): stage 1's `stack sync-assets` and the stack
+/// stage's refresh both wrote the slice before the storage refusal.
+#[cfg(test)]
+mod slice_pin_tests {
+    use super::{slice_defer, sync_assets_status};
+
+    #[test]
+    fn the_slice_waits_while_the_pin_is_behind_the_pairing() {
+        // the pop-os state: CLI paired with 0.6.16, stack still on 0.6.15
+        assert_eq!(slice_defer("v0.6.15", "stack-v0.6.16"), Some(("v0.6.15".into(), "v0.6.16".into())));
+        // an rc CLI over the last final, and one rc over another
+        assert!(slice_defer("v0.6.16", "stack-v0.6.17-rc.1").is_some());
+        assert!(slice_defer("v0.6.17-rc.1", "stack-v0.6.17-rc.2").is_some());
+        // the forms .env carries
+        assert!(slice_defer("stack-v0.6.15", "v0.6.16").is_some());
+    }
+
+    #[test]
+    fn the_slice_refreshes_at_or_past_the_pairing_and_without_one() {
+        assert_eq!(slice_defer("v0.6.16", "stack-v0.6.16"), None, "the stack runs this release");
+        assert_eq!(slice_defer("v0.6.17", "stack-v0.6.16"), None, "a stack cut after this CLI (the pairing is a floor)");
+        assert_eq!(slice_defer("", "stack-v0.6.16"), None, "a fresh install has no pin yet");
+        assert_eq!(slice_defer("v0.6.15", ""), None, "a dev build carries no pairing");
+    }
+
+    #[test]
+    fn stage_one_reads_the_sync_assets_status() {
+        assert_eq!(sync_assets_status("\u{7b}\"status\":\"deferred\",\"action\":\"sync-assets\"\u{7d}\n").as_deref(), Some("deferred"));
+        assert_eq!(sync_assets_status("\u{7b}\"status\":\"ok\",\"action\":\"sync-assets\"\u{7d}").as_deref(), Some("ok"));
+        assert_eq!(sync_assets_status("deploy slice refreshed under /root/.noo\n"), None, "an older binary's human line");
+    }
+
+    /// The stack stage writes the slice after the last refusal and right
+    /// before the pin: every preflight and the storage refusal come first.
+    #[test]
+    fn slice_moves_with_the_pin() {
+        let list = super::phase_src::list();
+        let at = |n: &str| list.find(n).unwrap_or_else(|| panic!("{n} not in the phase list"));
+        let slice = at("refresh_deploy_slice(");
+        for earlier in ["preflight_db_compat(", "preflight_service_keys(", "addon_preflight(", "reconcile_storage_dirs("] {
+            assert!(at(earlier) < slice, "`{earlier}` can refuse the roll: it must run before the slice is written");
+        }
+        assert!(slice < at("move_pin("), "the slice is written with the pin");
+        // and `stack sync-assets` (what stage 1 runs) asks the same question
+        let mesh = crate::test_src::own_code(include_str!("mesh.rs"));
+        let body = crate::test_src::fn_body(&mesh, "pub fn mesh_sync_assets(");
+        let ask = body.find("slice_waits_for_stack(").expect("sync-assets must ask slice_waits_for_stack");
+        assert!(ask < body.find("materialize(").expect("materialize"), "before it writes anything");
     }
 }

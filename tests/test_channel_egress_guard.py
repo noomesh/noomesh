@@ -36,6 +36,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tests import _rust_src as rs
+
 ROOT = Path(__file__).resolve().parents[1]
 RS = ROOT / "gateway-rust" / "src"
 COMM = RS / "routes" / "communication.rs"
@@ -50,62 +52,6 @@ CHANNEL_API_SEND = re.compile(
     r"|chat\.googleapis\.com/v1/\{[^}]*\}/messages"
     r"|graph\.facebook\.com/[^\"]*/messages"
 )
-
-
-def _block_end(src: str, start: int) -> int:
-    """Index just past the `}` matching the `{` at `start`. Skips string,
-    raw-string and char literals and `//` comments, so a brace in a format
-    string does not end the block early."""
-    i, depth, n = start, 0, len(src)
-    while i < n:
-        c = src[i]
-        if src.startswith("//", i):
-            i = src.find("\n", i)
-            i = n if i == -1 else i
-            continue
-        m = re.match(r'r(#*)"', src[i:]) if c == "r" and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")) else None
-        if m:
-            close = '"' + m.group(1)
-            j = src.find(close, i + len(m.group(0)))
-            i = n if j == -1 else j + len(close)
-            continue
-        if c == '"':
-            i += 1
-            while i < n and src[i] != '"':
-                i += 2 if src[i] == "\\" else 1
-            i += 1
-            continue
-        if c == "'":
-            m = re.match(r"'(?:\\.|[^\\'])'", src[i:])
-            if m:
-                i += len(m.group(0))
-                continue
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return i + 1
-        i += 1
-    raise AssertionError("unbalanced braces")
-
-
-def _strip_tests(src: str) -> str:
-    """Drop `#[cfg(test)] mod … { … }` blocks and comment lines — test
-    strings and prose are not senders. Only whole test MODULES are dropped:
-    cutting at the first `#[cfg(test)]` would hide everything after a
-    test-only helper in the middle of a file."""
-    out, pos = [], 0
-    for m in re.finditer(r"#\[cfg\(test\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{", src):
-        if m.start() < pos:
-            continue
-        out.append(src[pos : m.start()])
-        pos = _block_end(src, m.end() - 1)
-        # Keep the line count, so a reported line number is the real one.
-        out.append("\n" * src[m.start() : pos].count("\n"))
-    out.append(src[pos:])
-    src = "".join(out)
-    return "\n".join("" if line.lstrip().startswith("//") else line for line in src.splitlines())
 
 
 def fn_body(src: str, name: str) -> str:
@@ -153,7 +99,7 @@ def test_every_transport_applies_the_egress_floor_before_posting():
 def test_no_other_rust_file_builds_a_channel_send_url():
     hits: dict[str, list[str]] = {}
     for p in RS.rglob("*.rs"):
-        src = _strip_tests(p.read_text())
+        src = rs.own_code_lines(p.read_text())
         found = CHANNEL_API_SEND.findall(src)
         if found:
             hits[str(p.relative_to(RS))] = found
@@ -186,7 +132,7 @@ def test_operator_alerts_only_hand_channel_text_to_the_wire():
     for p in RS.rglob("*.rs"):
         if p == EGRESS:
             continue
-        if re.search(r"\bChannelText\(", _strip_tests(p.read_text())):
+        if re.search(r"\bChannelText\(", rs.own_code_lines(p.read_text())):
             minted.append(str(p.relative_to(RS)))
     assert not minted, f"ChannelText constructed outside egress.rs: {minted}"
     assert "ChannelText(" in EGRESS.read_text()
@@ -200,7 +146,7 @@ def test_every_alert_producer_goes_through_the_funnel():
     for p in RS.rglob("*.rs"):
         if p in (ALERT,):
             continue
-        src = _strip_tests(p.read_text())
+        src = rs.own_code_lines(p.read_text())
         producers += len(re.findall(r"operator_alert::send_operator_alert", src))
         if re.search(r"operator_alert::dispatch_raw\(", src):
             direct.append(str(p.relative_to(RS)))
@@ -222,7 +168,7 @@ def test_the_sentence_alert_api_is_gone():
     offenders = []
     funnels = 0
     for p in RS.rglob("*.rs"):
-        src = _strip_tests(p.read_text())
+        src = rs.own_code_lines(p.read_text())
         for n, line in enumerate(src.splitlines(), 1):
             if LEGACY_SENTENCE_API.search(line):
                 offenders.append(f"{p.relative_to(RS)}:{n}: {line.strip()}")
@@ -238,7 +184,7 @@ def test_the_sentence_alert_api_is_gone():
 
 def _call_end(src: str, open_paren: int) -> int:
     """Index just past the `)` matching the `(` at `open_paren`; string- and
-    char-literal aware, like _block_end."""
+    char-literal aware, like rs.own_code."""
     i, depth, n = open_paren, 0, len(src)
     while i < n:
         c = src[i]
@@ -277,7 +223,7 @@ def _alert_constructions():
     for p in RS.rglob("*.rs"):
         if p == EGRESS:
             continue
-        src = _strip_tests(p.read_text())
+        src = rs.own_code_lines(p.read_text())
         for m in re.finditer(r"OperatorAlert::new\s*\(", src):
             end = _call_end(src, m.end() - 1)
             args = src[m.end() : end - 1]
@@ -346,7 +292,7 @@ def test_system_heartbeat_reports_render_through_tier_one():
 def test_a_node_cannot_author_the_failover_alert_text():
     """The harness rail carries a node's alert as evidence only: the gateway
     rebuilds the summary and command from its own copy."""
-    harness = _strip_tests((RS / "routes" / "harness.rs").read_text())
+    harness = rs.own_code_lines((RS / "routes" / "harness.rs").read_text())
     arm = harness[harness.index("HarnessOp::OperatorAlert {") :]
     arm = arm[: arm.index("json!({})")]
     assert "backend_failover_alert(" in arm, "the rail's alert arm must re-author the alert"
@@ -357,7 +303,7 @@ def test_channel_handlers_never_format_an_error_into_a_reply():
     assert len(files) >= 5, files
     offenders = []
     for p in files:
-        for n, line in enumerate(_strip_tests(p.read_text()).splitlines(), 1):
+        for n, line in enumerate(rs.own_code_lines(p.read_text()).splitlines(), 1):
             if re.search(r"\{(?:e|err|error)(?::[^}]*)?\}", line) and "format!(" in line:
                 offenders.append(f"{p.name}:{n}: {line.strip()}")
     assert not offenders, (

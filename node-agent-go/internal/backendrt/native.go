@@ -146,8 +146,9 @@ func (n *Native) ModelStats(ctx context.Context) []modelstats.ModelStat {
 	if err != nil {
 		return nil
 	}
-	ps, _ := n.get(ctx, n.ollamaBase+"/api/ps")
-	stats := modelstats.Parse(tags, ps)
+	// A failed /api/ps is "loaded: unknown", not "nothing loaded" (i495).
+	ps, psErr := n.get(ctx, n.ollamaBase+"/api/ps")
+	stats := modelstats.ParseChecked(tags, ps, psErr == nil)
 	laneCeilings.Fill(stats, func(name string) ([]byte, error) {
 		body, _ := json.Marshal(map[string]string{"model": name})
 		return n.send(ctx, http.MethodPost, n.ollamaBase+"/api/show", body)
@@ -502,7 +503,12 @@ func (n *Native) HasModel(ctx context.Context, name string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return tagsHave(body, name), nil
+	has, err := tagsHave(body, name)
+	if err != nil {
+		// Could not ask: unknown, never "absent" (absent starts a pull).
+		return false, fmt.Errorf("ollama /api/tags unreadable: %w", err)
+	}
+	return has, nil
 }
 
 // Pull fetches `name` into the native ollama from its registry
@@ -557,8 +563,10 @@ func (n *Native) Pull(ctx context.Context, name string) (string, error) {
 	return out.Status, nil
 }
 
-// tagsHave matches a placement's model against an `/api/tags` body.
-func tagsHave(body []byte, name string) bool {
+// tagsHave matches a placement's model against an `/api/tags` body. A body
+// that is not the tags JSON is an error ("could not ask"), never false
+// ("absent"): the caller pulls on absent.
+func tagsHave(body []byte, name string) (bool, error) {
 	want := name
 	if !strings.Contains(want, ":") {
 		want += ":latest"
@@ -569,13 +577,13 @@ func tagsHave(body []byte, name string) bool {
 			Model string `json:"model"`
 		} `json:"models"`
 	}
-	if json.Unmarshal(body, &tags) != nil {
-		return false
+	if err := json.Unmarshal(body, &tags); err != nil {
+		return false, err
 	}
 	for _, m := range tags.Models {
 		if m.Name == want || m.Model == want {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }

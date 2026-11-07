@@ -186,8 +186,10 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Caller, R
         .filter(|s| !s.is_empty())
         .ok_or_else(|| rpc_http_error(StatusCode::UNAUTHORIZED, "missing bearer token"))?;
 
+    // An unreadable key store is a 503 naming it, not "unknown key" (i437).
     let consumer = crate::service_keys::resolve(&state.db, bearer)
         .await
+        .map_err(|u| rpc_http_error(StatusCode::SERVICE_UNAVAILABLE, &u.message()))?
         .ok_or_else(|| rpc_http_error(StatusCode::FORBIDDEN, "unknown or revoked key"))?;
 
     let redis = state.redis.as_ref();
@@ -664,14 +666,15 @@ pub(crate) async fn execute_spec(
         msg
     })?;
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-
     if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
         // Surface the status verbatim. A 403 here is meaningful and must not
         // be smoothed over: it means the user's scopes genuinely do not allow
         // this tool, which is the door working as intended.
         return Err(format!("gateway returned {}: {}", status.as_u16(), truncate(&body, 500)));
     }
+    // A body cut off mid-transfer is an error, never an empty result (i460).
+    let body = crate::upstream_body::text_2xx(resp, "the gateway").await?;
 
     Ok(serde_json::from_str::<Value>(&body).unwrap_or(Value::String(body)))
 }

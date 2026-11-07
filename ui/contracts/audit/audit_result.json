@@ -12,6 +12,15 @@
   "/api/addons/{addon_id}/ui-session": [
    "apps/web/src/features/addons/useAddonUis.ts"
   ],
+  "/api/addons/{addon}/access": [
+   "apps/web/src/features/addons/useAddonAccess.ts"
+  ],
+  "/api/agents/presence": [
+   "apps/web/src/features/agent-traffic/useAgentTraffic.ts"
+  ],
+  "/api/agents/threads": [
+   "apps/web/src/features/agent-traffic/useAgentTraffic.ts"
+  ],
   "/api/alerts/clients": [
    "apps/web/src/features/jobs/useJobs.ts"
   ],
@@ -203,6 +212,9 @@
   "/api/security/service-keys/self/revoke": [
    "apps/web/src/features/account/useMcpKey.ts"
   ],
+  "/api/security/users/{username}/addon-access": [
+   "apps/web/src/features/addons/useAddonAccess.ts"
+  ],
   "/api/security/violations": [
    "apps/web/src/features/brain-map/useBrainStatus.ts",
    "apps/web/src/features/security/useSecurity.ts"
@@ -276,6 +288,7 @@
   ],
   "/health": [
    "apps/web/src/features/addons/slots.ts",
+   "apps/web/src/features/addons/useAddonAccess.ts",
    "apps/web/src/features/addons/useConsolePieces.ts",
    "apps/web/src/features/brain-map/useBrainStatus.ts",
    "apps/web/src/features/chat/voice/useVoice.ts",
@@ -319,16 +332,16 @@
   "/api/agents/messages",
   "/api/agents/messages/{id}",
   "/api/agents/messages/{id}/ack",
+  "/api/agents/name",
   "/api/agents/peer/",
   "/api/agents/peer/for-capability/{capability}",
   "/api/agents/peer/register",
   "/api/agents/peer/{agent_id}",
   "/api/agents/peer/{agent_id}/task",
-  "/api/agents/presence",
   "/api/agents/roles",
-  "/api/agents/threads",
   "/api/agents/trust",
   "/api/agents/trust/remove",
+  "/api/agents/whoami",
   "/api/alerts/list",
   "/api/approval/{request_id}/decide",
   "/api/artifacts/manifest/{kind}/{name}",
@@ -372,6 +385,8 @@
   "/api/cluster/nodes/{node_id}/placements/{backend}",
   "/api/cluster/nodes/{node_id}/pull",
   "/api/cluster/nodes/{node_id}/restart-agent",
+  "/api/cluster/nodes/{node_id}/traces",
+  "/api/cluster/nodes/{node_id}/tunnel-probe",
   "/api/cluster/nodes/{node}/mcp/{id}/tools",
   "/api/cluster/propose",
   "/api/cluster/provision-bundle/{node}",
@@ -409,12 +424,15 @@
   "/api/external/classify",
   "/api/external/embedding-spaces/{space}/migration",
   "/api/external/embeddings",
+  "/api/external/embeddings/jobs",
+  "/api/external/embeddings/jobs/{job_id}",
   "/api/external/inference",
   "/api/external/models",
   "/api/external/rerank",
   "/api/external/usage",
   "/api/grafana-ds/loki/{*path}",
   "/api/grafana-ds/prometheus/{*path}",
+  "/api/grafana-ds/tempo/{*path}",
   "/api/harness/call",
   "/api/heartbeat/actions",
   "/api/heartbeat/artifacts",
@@ -471,6 +489,7 @@
   "/api/metrics/query",
   "/api/metrics/range",
   "/api/models/pull",
+  "/api/node/tunnel",
   "/api/ollama/models",
   "/api/persona/",
   "/api/persona/{persona_id}",
@@ -522,6 +541,7 @@
   "/api/security/users/{username}/roles",
   "/api/security/users/{username}/roles/revoke",
   "/api/security/users/{username}/scopes",
+  "/api/security/users/{username}/super-admin",
   "/api/settings",
   "/api/settings/export",
   "/api/skills/list",
@@ -564,6 +584,9 @@
   "/api/tools/browser/status",
   "/api/tools/nodes/{node_id}",
   "/api/tools/registry/raw",
+  "/api/traces/requests",
+  "/api/traces/status",
+  "/api/traces/summary",
   "/api/usage/me",
   "/api/users/disable",
   "/api/users/proposals",

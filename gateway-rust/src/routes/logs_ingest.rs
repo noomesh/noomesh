@@ -850,13 +850,12 @@ mod tests {
 
     #[tokio::test]
     async fn loki_down_is_a_503_that_keeps_the_batch_on_the_node() {
-        // A port nothing listens on.
-        let dead = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let url = format!("http://{}", l.local_addr().unwrap());
-            drop(l);
-            url
-        };
+        // A port nothing listens on: bound for the whole test but never
+        // listening, so a connect is refused and no parallel test can take
+        // it (a dropped listener freed the port for any test's fake server).
+        let held = tokio::net::TcpSocket::new_v4().unwrap();
+        held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let dead = format!("http://{}", held.local_addr().unwrap());
         let client = reqwest::Client::new();
         let got = forward_to_loki(&client, &dead, b"{}".to_vec()).await;
         assert!(matches!(got, Forward::Down(_)), "{got:?}");
@@ -916,7 +915,8 @@ mod tests {
     #[test]
     fn the_handler_records_the_planned_metrics_on_the_gateway_registry() {
         let src = include_str!("logs_ingest.rs");
-        let body = src.split("pub async fn node_logs_ingest(").nth(1).unwrap().split("#[cfg(test)]").next().unwrap();
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "pub async fn node_logs_ingest(");
         for m in ["noo_logs_ingest_lines_total", "noo_logs_ingest_bytes_total", "noo_logs_last_seen_unix", "noo_logs_ingest_redacted_total"] {
             assert!(body.contains(m), "{m}");
         }

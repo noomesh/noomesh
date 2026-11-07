@@ -17,7 +17,7 @@ import { AdminPanel } from '@/features/admin/AdminPanel';
 import { ModelPrefsPanel } from '@/features/model-prefs/ModelPrefsPanel';
 import { DocsPanel } from '@/features/docs/DocsPanel';
 import { WorkflowPanel } from '@/features/workflow/WorkflowPanel';
-import { AddonUisPanel } from '@/features/addons/AddonUisPanel';
+import { AddonsPanel } from '@/features/addons/AddonsPanel';
 
 /** Panels every edition ships. `chat` has no panel — it is the left column. */
 export const CORE_PANELS: Record<string, ComponentType> = {
@@ -36,5 +36,5 @@ export const CORE_PANELS: Record<string, ComponentType> = {
   'model-prefs': ModelPrefsPanel,
   docs: DocsPanel,
   workflow: WorkflowPanel,
-  addons: AddonUisPanel,
+  addons: AddonsPanel,
 };

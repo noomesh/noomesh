@@ -520,8 +520,10 @@ pub async fn apply_security_posture(db: &PgPool) {
             // is silently at its default — and that was logged at DEBUG
             // when v0.2.48 shipped a NUMERIC/f64 decode failure. Nobody
             // saw it until `noo security posture list` returned 500.
+            // 42P01 only: "column ... does not exist" (schema drift) also
+            // matched the old substring test and was silenced (#650 sweep).
             let msg = e.to_string();
-            if msg.contains("does not exist") {
+            if crate::repo::missing_table(&e) {
                 tracing::debug!(error = %msg, "security_posture table absent — using env/.env");
             } else {
                 tracing::error!(

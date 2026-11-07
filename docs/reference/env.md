@@ -246,7 +246,7 @@ from its own process environment (`noo-cli/src`).
 | `NOO_UPGRADE_MAC_LEAVES_WAIT_SECS` | `600` | how long `noo upgrade --nodes` waits for a macOS node to report the new CLI before restaging it (`0` = do not wait) |
 | `NOO_TAILSCALE_API_BASE` | `https://api.tailscale.com/api/v2` | Tailscale API base for `mint-join-key` / `set-primary` (a test seam) |
 | `NOO_MODEL_ORIGINS` | all | `noo models` catalog scope: comma list of `us`, `eu`, `cn` … filters model families by lab origin; a scope matching nothing is ignored |
-| `HF_ENDPOINT` | `https://huggingface.co` | the Hugging Face API base the catalog and pulls use (the standard `huggingface_hub` variable) |
+| `HF_ENDPOINT` | `https://huggingface.co` | the Hugging Face API base the catalog and pulls use (the standard `huggingface_hub` variable). It must be `https://`, or `http://` to this machine only (127.0.0.1, ::1, localhost). Anything else is refused before any request, because the HF token and the sha256 a download is checked against would travel unencrypted. A redirect from https down to http is refused too. |
 | `NOO_CONTROLLER_DNS` | the controller's MagicDNS name | the floating service name nodes are told to phone home to (`cluster provision`); HA operators set it to their mesh's name, so a promoted standby takes over without re-provisioning |
 | `NOO_CONTROLLER_IP` | detected | the LAN address `noo onboard` records for the controller |
 | `NOO_ONBOARD_ADOPT_DATA` | unset | `1` lets a non-interactive `noo onboard` adopt data directories that already hold a live install; without it that is a refusal |

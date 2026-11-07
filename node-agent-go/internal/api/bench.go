@@ -67,7 +67,10 @@ type benchTarget struct {
 
 var (
 	errNoChatBackend = errors.New("no chat backend")
-	errBenchBusy     = errors.New("a bench is already running on this node")
+	// errDockerUnavailable: docker could not be asked, so whether a backend
+	// is running is unknown (not "no").
+	errDockerUnavailable = errors.New("docker unavailable")
+	errBenchBusy         = errors.New("a bench is already running on this node")
 )
 
 // SetChatPlacements installs the provider of every running chat placement
@@ -122,6 +125,10 @@ func (s *Server) handleBench(w http.ResponseWriter, r *http.Request) {
 		resolve = s.resolveBenchTarget
 	}
 	t, err := resolve(ctx)
+	if errors.Is(err, errDockerUnavailable) {
+		jsonError(w, http.StatusServiceUnavailable, "docker_unavailable", err.Error())
+		return
+	}
 	if err != nil {
 		jsonError(w, http.StatusConflict, "no_chat_backend", err.Error())
 		return
@@ -159,16 +166,26 @@ func (s *Server) resolveBenchTarget(ctx context.Context) (benchTarget, error) {
 	if !ok {
 		return benchTarget{}, fmt.Errorf("%w: this node has no running chat placement", errNoChatBackend)
 	}
-	running, native := s.runningAndNative(ctx)
+	running, native, err := s.runningAndNative(ctx)
+	if err != nil {
+		return benchTarget{}, err
+	}
 	return s.chatTarget(ctx, cp, running, native)
 }
 
 // runningAndNative is every running backend (docker, then native ones docker
 // does not run) with its served model, and the native ones alone.
-func (s *Server) runningAndNative(ctx context.Context) (running, native map[string]string) {
+//
+// A docker list error is returned as errDockerUnavailable, never as an empty
+// map: "could not ask docker" must not read as "no backend running".
+func (s *Server) runningAndNative(ctx context.Context) (running, native map[string]string, err error) {
 	running = map[string]string{}
 	if s.docker != nil {
-		running = s.docker.RunningBackends(ctx)
+		running, err = s.docker.RunningBackends(ctx)
+		if err != nil {
+			slog.Warn("docker.running_backends_failed", "error", err)
+			return nil, nil, fmt.Errorf("%w: %v", errDockerUnavailable, err)
+		}
 	}
 	native = s.nativeBackends(ctx)
 	for b, m := range native {
@@ -176,7 +193,7 @@ func (s *Server) runningAndNative(ctx context.Context) (running, native map[stri
 			running[b] = m
 		}
 	}
-	return running, native
+	return running, native, nil
 }
 
 // chatTarget dials placement cp's backend, which must be running.

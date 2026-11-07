@@ -484,6 +484,7 @@ func (c *Controller) decideLocked(r Reading, backends []docker.GPUBackend) (act 
 	now := c.now()
 	c.last = r
 	c.refreshGPUSetLocked(backends)
+	c.expireLeaseLocked() // a timed user hold ends here, measured or not
 
 	if !r.Measured {
 		// Nothing to judge by, with one exception below. Never pause on no

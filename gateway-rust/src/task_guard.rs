@@ -813,45 +813,78 @@ pub const CEILING_ALLOWED: &[&str] = &[
     "noo_config_get", "noo_memory_health", "noo_autonomy_status", "noo_autonomy_audit", "noo_op_status", "noo_op_list",
 ];
 
-type Restricted = Vec<(String, Vec<String>)>;
+/// Why a run is held to read-only tools. Both fail closed; they are told apart so a refusal says
+/// the true reason (i438): "not authorised" sends a person to authorise a task that already is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CeilingReason {
+    /// No person authorised the task (or there is no such task).
+    NotAuthorised,
+    /// The task's authorisation could not be read (a database error), so it is limited until it can be.
+    AuthorisationUnreadable,
+}
+
+type Restricted = Vec<(String, Vec<String>, CeilingReason)>;
 static RESTRICTED_TURNS: std::sync::Mutex<Restricted> = std::sync::Mutex::new(Vec::new());
+
+/// The restricted-turn list, poisoned or not. A poisoned lock (a panic while
+/// it was held) must not read as "no ceiling": `.lock().ok()?` used to make
+/// `ceiling_for_run` and `turn_tool_denied` answer None, which gave an
+/// unauthorised task every tool. The list itself stays consistent: every
+/// mutation is one push, remove or take.
+fn restricted() -> std::sync::MutexGuard<'static, Restricted> {
+    RESTRICTED_TURNS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// While held, tool calls in the heartbeat turn(s) of `conversation_id` are limited to read-only
 /// tools. `take_denied` is what the run refused, for its result.
-pub struct TurnCeiling(String);
+pub struct TurnCeiling(String, CeilingReason);
 
 impl TurnCeiling {
     pub fn take_denied(&self) -> Vec<String> {
-        RESTRICTED_TURNS
-            .lock()
-            .ok()
-            .and_then(|mut v| v.iter_mut().find(|(c, _)| *c == self.0).map(|(_, d)| std::mem::take(d)))
+        restricted()
+            .iter_mut()
+            .find(|(c, _, _)| *c == self.0)
+            .map(|(_, d, _)| std::mem::take(d))
             .unwrap_or_default()
+    }
+
+    pub fn reason(&self) -> CeilingReason {
+        self.1
+    }
+
+    /// The note for the run's result, when the ceiling refused something (it takes the refusals).
+    pub fn take_note(&self) -> Option<String> {
+        let denied = self.take_denied();
+        (!denied.is_empty()).then(|| denied_note(self.1, &denied))
     }
 }
 
 impl Drop for TurnCeiling {
     fn drop(&mut self) {
-        if let Ok(mut v) = RESTRICTED_TURNS.lock() {
-            if let Some(i) = v.iter().position(|(c, _)| *c == self.0) {
-                v.remove(i);
-            }
+        let mut v = restricted();
+        if let Some(i) = v.iter().position(|(c, _, _)| *c == self.0) {
+            v.remove(i);
         }
     }
 }
 
 /// The line a limited run adds to its result when the ceiling refused something: a quiet success
 /// would hide that the task could not do what it was written to do.
-pub fn denied_note(denied: &[String]) -> String {
+pub fn denied_note(reason: CeilingReason, denied: &[String]) -> String {
     let mut names: Vec<&str> = denied.iter().map(String::as_str).collect();
     names.sort_unstable();
     names.dedup();
-    format!(
-        "\n\n⚠️ Read-only limit: {} tool call(s) were refused ({}) because no person authorised this task. \
-         A person edits the task (noo heartbeat add / import) or approves its proposal (noo heartbeat proposals).",
-        denied.len(),
-        names.join(", ")
-    )
+    let why = match reason {
+        CeilingReason::NotAuthorised => {
+            "because no person authorised this task. \
+             A person edits the task (noo heartbeat add / import) or approves its proposal (noo heartbeat proposals)."
+        }
+        CeilingReason::AuthorisationUnreadable => {
+            "because the task's authorisation could not be read (database error), so this run was held to \
+             read-only tools. Nothing needs re-authorising: the next run reads it again."
+        }
+    };
+    format!("\n\n⚠️ Read-only limit: {} tool call(s) were refused ({}) {why}", denied.len(), names.join(", "))
 }
 
 /// Limit a heartbeat run's tools unless a person authorised the task. EVERY agent-turn action is
@@ -862,19 +895,26 @@ pub async fn ceiling_for_run(db: &sqlx::PgPool, task_id: &str, action: &str, con
     if !is_agent_turn_action(action) {
         return None;
     }
-    let authorised: bool = sqlx::query_scalar("SELECT COALESCE(authorised_by IS NOT NULL, false) FROM noo_heartbeat_tasks WHERE id = $1")
-        .bind(task_id)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(false);
-    if authorised {
-        return None;
-    }
-    tracing::info!(task_id, "heartbeat_turn_tools_limited_to_read_only");
-    RESTRICTED_TURNS.lock().ok()?.push((conversation_id.to_string(), Vec::new()));
-    Some(TurnCeiling(conversation_id.to_string()))
+    let read: Result<Option<bool>, sqlx::Error> =
+        sqlx::query_scalar("SELECT COALESCE(authorised_by IS NOT NULL, false) FROM noo_heartbeat_tasks WHERE id = $1")
+            .bind(task_id)
+            .fetch_optional(db)
+            .await;
+    let reason = match read {
+        Ok(Some(true)) => return None,
+        // No row is no authorisation.
+        Ok(Some(false) | None) => {
+            tracing::info!(task_id, "heartbeat_turn_tools_limited_to_read_only");
+            CeilingReason::NotAuthorised
+        }
+        // Fail closed, but say so (i438): it used to read as "not authorised", silently.
+        Err(e) => {
+            tracing::error!(task_id, error = %e, "task_ceiling_authorisation_unreadable: run limited to read-only tools");
+            CeilingReason::AuthorisationUnreadable
+        }
+    };
+    restricted().push((conversation_id.to_string(), Vec::new(), reason));
+    Some(TurnCeiling(conversation_id.to_string(), reason))
 }
 
 /// Why `tool` may not run in the current turn, if the turn is a limited heartbeat run. A refusal is
@@ -889,18 +929,24 @@ pub fn turn_tool_denied(conversation_id: &str, channel: &str, tool: &str, _args:
         }
         return None;
     }
-    let mut v = RESTRICTED_TURNS.lock().ok()?;
+    let mut v = restricted();
     let entry = v
         .iter_mut()
-        .find(|(c, _)| conversation_id == c || conversation_id.starts_with(&format!("{c}-")))?;
+        .find(|(c, _, _)| conversation_id == c || conversation_id.starts_with(&format!("{c}-")))?;
     if allowed {
         return None;
     }
     entry.1.push(tool.to_string());
-    Some(format!(
-        "{tool} is not available to this scheduled task: it was not authorised by a person, so its runs are \
-         limited to read-only tools. A person edits the task, or approves its proposal (noo heartbeat proposals)."
-    ))
+    Some(match entry.2 {
+        CeilingReason::NotAuthorised => format!(
+            "{tool} is not available to this scheduled task: it was not authorised by a person, so its runs are \
+             limited to read-only tools. A person edits the task, or approves its proposal (noo heartbeat proposals)."
+        ),
+        CeilingReason::AuthorisationUnreadable => format!(
+            "{tool} is not available in this run: the task's authorisation could not be read (database error), \
+             so the run is limited to read-only tools until it can be. This is not a missing authorisation."
+        ),
+    })
 }
 
 // ───────────────────── existing tasks and recipients (review-existing) ─────────────────────
@@ -1159,8 +1205,9 @@ mod tests {
             }
         }
         let ha = include_str!("heartbeat_actions.rs");
-        let rt = &ha[ha.find("pub async fn run_rust_native_task(").unwrap()..];
-        assert!(rt[..rt.find("\n}\n").unwrap()].contains("ceiling_for_run("), "self_benchmark runs under a ceiling");
+        let ha = crate::test_src::own_code(ha);
+        let rt = crate::test_src::fn_body(&ha, "pub async fn run_rust_native_task(");
+        assert!(rt.contains("ceiling_for_run("), "self_benchmark runs under a ceiling");
     }
 
     #[test]
@@ -1488,12 +1535,8 @@ mod tests {
 
     #[test]
     fn the_handlers_use_the_guard_and_the_decide_route_checks_a_person() {
-        let routes = include_str!("routes/intelligence.rs");
-        let block = |name: &str| {
-            let start = routes.find(&format!("async fn {name}(")).unwrap_or_else(|| panic!("{name}"));
-            let rest = &routes[start..];
-            rest[..rest.find("\n}\n").unwrap()].to_string()
-        };
+        let routes = crate::test_src::own_code(include_str!("routes/intelligence.rs"));
+        let block = |name: &str| crate::test_src::fn_body(&routes, &format!("async fn {name}(")).to_string();
         for h in ["heartbeat_create_task", "heartbeat_schedule_task"] {
             assert!(block(h).contains("write_task("), "{h} writes through the guard");
             assert!(!block(h).contains("upsert_task("), "{h} does not write around it");
@@ -1516,8 +1559,8 @@ mod tests {
         assert!(st[st.find("pub(crate) fn needs_person(").unwrap()..].contains("EGRESS_TARGET_SETTINGS"));
         assert!(EGRESS_TARGET_SETTINGS.contains(&"NOO_REPORTS_DRIVE_FOLDER_ID"));
         let users = include_str!("routes/users.rs");
-        let decide = &users[users.find("async fn proposal_decide(").unwrap()..];
-        let decide = &decide[..decide.find("\n}\n").unwrap()];
+        let users = crate::test_src::own_code(users);
+        let decide = crate::test_src::fn_body(&users, "async fn proposal_decide(");
         assert!(decide.contains("check_approver("), "approval re-classifies and requires a person");
         assert!(decide.contains("apply_approved("));
     }
@@ -1572,7 +1615,8 @@ mod tests {
                 assert!(turn_tool_denied("heartbeat-other", "heartbeat", "noo_job_cancel", &json!({})).is_none(), "another turn is untouched");
                 let denied = _c.take_denied();
                 assert!(!denied.is_empty());
-                assert!(denied_note(&denied).contains("Read-only limit"), "the run result says it was limited");
+                assert!(denied_note(_c.reason(), &denied).contains("Read-only limit"), "the run result says it was limited");
+                assert_eq!(_c.reason(), CeilingReason::NotAuthorised, "{action}");
             }
             assert!(turn_tool_denied(&conv, "heartbeat", "noo_job_cancel", &json!({})).is_none(), "the limit ends with the run");
             // a person's own write authorises it: the full tool list
@@ -1694,8 +1738,9 @@ mod tests {
         v.recipients = json!(["777"]);
         assert!(matches!(write_task(&db, &door(), &v, "create").await.unwrap(), Written::Proposed { .. }), "no recorded author");
         let comm = include_str!("routes/communication.rs");
-        let create = &comm[comm.find("async fn create_saved_recipient(").unwrap()..];
-        assert!(create[..create.find("\n}\n").unwrap()].contains("resolve_origin("), "the saved-recipient write records a person");
+        let comm = crate::test_src::own_code(comm);
+        let create = crate::test_src::fn_body(&comm, "async fn create_saved_recipient(");
+        assert!(create.contains("resolve_origin("), "the saved-recipient write records a person");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1753,5 +1798,67 @@ mod tests {
         assert_eq!(review_count(&db).await, 3);
         approve_review(&db, &admin(), &["old_research".into(), "old_health_to".into(), "agent_messages_retention".into()], &[]).await.unwrap();
         assert_eq!(review_count(&db).await, 0);
+    }
+}
+
+/// i438: a database error reading a task's authorisation still limits the run (fail closed), but
+/// says why: it used to read as "not authorised", with nothing logged.
+#[cfg(test)]
+mod ceiling_unreadable_tests {
+    use super::*;
+
+    fn unreachable_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(300))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool")
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_authorisation_limits_the_run_and_says_so() {
+        let conv = "heartbeat-i438-unreadable";
+        let c = ceiling_for_run(&unreachable_pool(), "i438-unreadable", "custom_prompt", conv)
+            .await
+            .expect("fail closed: limited when the authorisation cannot be read");
+        assert_eq!(c.reason(), CeilingReason::AuthorisationUnreadable);
+
+        let refusal = turn_tool_denied(conv, "heartbeat", "noo_job_cancel", &json!({})).expect("a mutating tool is refused");
+        assert!(refusal.contains("could not be read"), "{refusal}");
+        assert!(!refusal.contains("not authorised by a person"), "the refusal must not blame the authorisation: {refusal}");
+        assert!(turn_tool_denied(conv, "heartbeat", "noo_rag_query", &json!({})).is_none(), "read-only tools stay");
+
+        let note = c.take_note().expect("the run result notes the refusal");
+        assert!(note.contains("could not be read") && note.contains("Nothing needs re-authorising"), "{note}");
+        assert!(c.take_note().is_none(), "the refusals are taken once");
+        drop(c);
+        assert!(turn_tool_denied(conv, "heartbeat", "noo_job_cancel", &json!({})).is_none(), "the limit ends with the run");
+    }
+
+    /// A panic while the list was held poisons the lock; the ceiling must
+    /// hold through it, not read as "no ceiling".
+    #[tokio::test]
+    async fn a_poisoned_turn_list_still_limits_the_run() {
+        let _ = std::thread::spawn(|| {
+            let _held = RESTRICTED_TURNS.lock();
+            panic!("poison the restricted-turn list");
+        })
+        .join();
+        assert!(RESTRICTED_TURNS.is_poisoned(), "the test must actually poison the lock");
+        let conv = "heartbeat-poisoned-list";
+        let c = ceiling_for_run(&unreachable_pool(), "poisoned-list", "custom_prompt", conv)
+            .await
+            .expect("still limited");
+        assert!(turn_tool_denied(conv, "heartbeat", "noo_job_cancel", &json!({})).is_some(), "a mutating tool is refused");
+        drop(c);
+        assert!(turn_tool_denied(conv, "heartbeat", "noo_job_cancel", &json!({})).is_none(), "the limit ends with the run");
+    }
+
+    #[test]
+    fn each_reason_has_its_own_note() {
+        let denied = vec!["noo_job_cancel".to_string()];
+        let not = denied_note(CeilingReason::NotAuthorised, &denied);
+        assert!(not.contains("no person authorised this task"), "{not}");
+        let unreadable = denied_note(CeilingReason::AuthorisationUnreadable, &denied);
+        assert!(unreadable.contains("could not be read") && !unreadable.contains("no person authorised"), "{unreadable}");
     }
 }

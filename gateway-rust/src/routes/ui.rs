@@ -1029,7 +1029,11 @@ async fn tools_node_tools(
 
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
-            let data = resp.json::<Value>().await.unwrap_or(json!({}));
+            // An unreadable list is an error, never "this node has no tools".
+            let data = match crate::upstream_body::json_2xx(resp, &format!("node {node_id}")).await {
+                Ok(d) => d,
+                Err(e) => return Ok(Json(json!({"node_id": node_id, "tools": [], "error": e}))),
+            };
 
             // The node agent typically returns {"tools": [...]} — extract and reformat
             let tools = data.get("tools")
@@ -1685,9 +1689,10 @@ async fn browser_action(
     };
 
     let out = match result {
-        Ok(resp) if resp.status().is_success() => {
-            resp.json::<Value>().await.unwrap_or(json!({}))
-        }
+        Ok(resp) if resp.status().is_success() => match crate::upstream_body::json_2xx(resp, "the browser container").await {
+            Ok(v) => v,
+            Err(e) => json!({"error": e}),
+        },
         Ok(resp) => {
             let detail = resp
                 .json::<Value>()
@@ -1902,7 +1907,8 @@ mod browser_key_tests {
         assert!(!code.contains("\"NOO_CLUSTER_SECRET\")"), "browser_start reads the fleet secret again");
         assert!(code.contains("\"NOO_BROWSER_KEY\": browser_key.clone(),"));
         assert!(code.contains("\"NOO_CLUSTER_SECRET\": browser_key,"), "the one-release compat name must carry the BROWSER key");
-        let header = src.split("fn browser_auth_header() -> Option<(String, String)> {").nth(1).unwrap().split("\n}").next().unwrap();
+        let own = crate::test_src::own_code(src);
+        let header = crate::test_src::fn_body(&own, "fn browser_auth_header()");
         assert!(header.contains("secret_opt(BROWSER_KEY)") && !header.contains("NOO_CLUSTER_SECRET"), "{header}");
     }
 }

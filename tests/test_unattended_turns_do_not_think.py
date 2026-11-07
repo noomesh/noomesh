@@ -20,6 +20,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tests import _rust_src as rs
+
 REPO = Path(__file__).resolve().parents[1]
 UNATTENDED = [
     REPO / "gateway-rust" / "src" / "heartbeat_actions.rs",
@@ -28,9 +30,7 @@ UNATTENDED = [
 
 
 def _non_test_source(path: Path) -> str:
-    text = path.read_text()
-    cut = text.find("#[cfg(test)]")
-    return text if cut < 0 else text[:cut]
+    return rs.own_code(path.read_text())
 
 
 def test_unattended_callers_never_use_bare_coordinator_run() -> None:

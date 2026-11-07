@@ -36,8 +36,33 @@ type ModelStat struct {
 	VRAMBytes     int64  `json:"vram_bytes"`
 	Loaded        bool   `json:"loaded"`
 	ContextLength int64  `json:"context_length,omitempty"`
+	// LoadedUnknown: /api/ps could not be read, so whether this model is
+	// loaded, and its resident and vram bytes, are NOT known. Loaded,
+	// ResidentBytes and VRAMBytes are then left out of the wire shape (see
+	// MarshalJSON) instead of reported as false and 0 (i495, item 4).
+	LoadedUnknown bool `json:"-"`
 	// digest is /api/tags' digest: a re-pulled tag is a different model.
 	digest string
+}
+
+// MarshalJSON omits loaded, resident_bytes and vram_bytes while LoadedUnknown.
+// The gateway reads `resident_bytes` only when it is a number above 0
+// (placement_fit.rs, role_capability.rs) and never reads `loaded`, so an
+// absent key is what it already treats as "not measured".
+func (m ModelStat) MarshalJSON() ([]byte, error) {
+	type wire struct {
+		Name          string `json:"name"`
+		SizeBytes     int64  `json:"size_bytes"`
+		ResidentBytes *int64 `json:"resident_bytes,omitempty"`
+		VRAMBytes     *int64 `json:"vram_bytes,omitempty"`
+		Loaded        *bool  `json:"loaded,omitempty"`
+		ContextLength int64  `json:"context_length,omitempty"`
+	}
+	w := wire{Name: m.Name, SizeBytes: m.SizeBytes, ContextLength: m.ContextLength}
+	if !m.LoadedUnknown {
+		w.ResidentBytes, w.VRAMBytes, w.Loaded = &m.ResidentBytes, &m.VRAMBytes, &m.Loaded
+	}
+	return json.Marshal(w)
 }
 
 type entry struct {
@@ -68,7 +93,13 @@ func decode(b []byte) []entry {
 // Parse merges /api/tags (every model held) with /api/ps (what is loaded).
 // A loaded model absent from tags is still listed. Sorted by name; nil when
 // neither body yields a model.
-func Parse(tags, ps []byte) []ModelStat {
+func Parse(tags, ps []byte) []ModelStat { return ParseChecked(tags, ps, true) }
+
+// ParseChecked is Parse with the fact Parse cannot see: whether /api/ps
+// answered. psOK false (the call failed, or its body could not be read)
+// marks every model LoadedUnknown, never "not loaded". A /api/ps that
+// answered with nothing loaded is psOK true with an empty list.
+func ParseChecked(tags, ps []byte, psOK bool) []ModelStat {
 	byName := map[string]*ModelStat{}
 	for _, e := range decode(tags) {
 		if k := e.key(); k != "" {
@@ -92,6 +123,7 @@ func Parse(tags, ps []byte) []ModelStat {
 	}
 	out := make([]ModelStat, 0, len(byName))
 	for _, s := range byName {
+		s.LoadedUnknown = !psOK
 		out = append(out, *s)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })

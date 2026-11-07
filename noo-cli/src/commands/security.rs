@@ -391,6 +391,80 @@ pub fn security_user_set_scopes(g: &Globals, args: &[String]) -> Result<i32, Unh
     Ok(0)
 }
 
+/// `<username> on|off --reason <text> [--password-stdin] [-y|--yes]`.
+pub(crate) fn parse_super_admin_with(a: &mut Args) -> Result<(String, bool, String, bool, bool), ArgError> {
+    let reason = a.value(&["--reason"])?.unwrap_or_default();
+    let password_stdin = a.flag(&["--password-stdin"]);
+    let yes = a.flag(&["--yes", "-y"]);
+    let mut p = a.positionals()?;
+    if p.len() != 2 {
+        return Err(ArgError::new("usage: <username> on|off --reason <text>"));
+    }
+    let on = match p.pop().unwrap_or_default().to_ascii_lowercase().as_str() {
+        "on" => true,
+        "off" => false,
+        other => return Err(ArgError::new(format!("the setting is on or off (got `{other}`)"))),
+    };
+    if reason.trim().is_empty() {
+        return Err(ArgError::new("--reason is required: the change is audited with it"));
+    }
+    Ok((p.remove(0), on, reason.trim().to_string(), password_stdin, yes))
+}
+
+/// `noo security user super-admin <username> on|off --reason <text>` (f99
+/// 2.2): a super admin names or removes another, through the gateway, with a
+/// confirmation, a reason and their OWN password re-entered. The gateway
+/// refuses an agent or door token, a wrong password, and clearing the last
+/// super admin. Recovery is `noo security admin-password reset`.
+pub fn security_user_super_admin(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    use std::io::BufRead as _;
+    let (username, on, reason, password_stdin, yes) = parse_super_admin_with(&mut Args::new(args))?;
+    let what = if on { "make" } else { "remove" };
+    super::confirm_prompt(
+        g,
+        yes,
+        &format!("{what} '{username}' {} super admin (holds every add-on feature and configures admins)?", if on { "a" } else { "as" }),
+    );
+    // Your own password, once: it proves the person at the keyboard, not the
+    // target's. Never prompted in --json mode; never echoed.
+    let password = if password_stdin {
+        let mut line = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut line);
+        line.trim_end_matches(['\n', '\r']).to_string()
+    } else if g.json || unsafe { libc::isatty(0) } != 1 {
+        fail(
+            g.json,
+            ExitCode::Generic,
+            "password_required",
+            "re-enter your own password to change a super admin; cannot prompt here",
+            Some("pipe it via --password-stdin (one line)"),
+        );
+    } else {
+        prompt_secret("Your password: ")
+    };
+    let body = put_json(
+        g,
+        &format!("/api/security/users/{}/super-admin", super::urlencode(&username)),
+        &json!({"on": on, "reason": reason, "password": password}),
+        true,
+        TIMEOUT,
+    );
+    if g.json {
+        println!("{body}");
+        return Ok(0);
+    }
+    let now = body["super_admin"].as_bool().unwrap_or(on);
+    let was = body["was"].as_bool();
+    let line = match (was, now) {
+        (Some(w), n) if w == n => format!("{username} was already {}a super admin", if n { "" } else { "not " }),
+        (_, true) => format!("{username} is now a super admin"),
+        (_, false) => format!("{username} is no longer a super admin"),
+    };
+    ui::close_done(&line);
+    ui::guide(&[("noo addons access <user>", "what an account may use, and the setting that decided it")]);
+    Ok(0)
+}
+
 /// Shared by `grant-role` and `revoke-role`.
 pub(crate) fn parse_roles_with(a: &mut Args) -> Result<(String, Vec<String>), ArgError> {
     let roles = a.values(&["--role", "-r"])?;
@@ -538,17 +612,19 @@ pub fn security_user_links(g: &Globals, args: &[String]) -> Result<i32, Unhandle
 /// `noo security user set-password USERNAME [--password-stdin]`
 /// PUT /api/security/users/{u}/password. Prompt path matches Python's
 /// getpass ("New password:"/"Confirm:"); the flag is the agent path.
+/// `USERNAME [--password-stdin]` → (username, password_stdin).
+pub(crate) fn parse_set_password(args: &[String]) -> Result<(String, bool), Unhandled> {
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_set_password_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_set_password_with(a: &mut Args) -> Result<(String, bool), ArgError> {
+    let password_stdin = a.flag(&["--password-stdin"]);
+    Ok((a.one("<username>")?, password_stdin))
+}
+
 pub fn security_user_set_password(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut username: Option<String> = None;
-    let mut password_stdin = false;
-    for tok in args {
-        match tok.as_str() {
-            "--password-stdin" => password_stdin = true,
-            s if !s.starts_with('-') && username.is_none() => username = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let username = username.ok_or(Unhandled)?;
+    let (username, password_stdin) = parse_set_password(args)?;
     let password = read_password(g, password_stdin, "New password: ", "Confirm: ", &username);
     let body = put_json(
         g,
@@ -564,6 +640,19 @@ pub fn security_user_set_password(g: &Globals, args: &[String]) -> Result<i32, U
         ui::guide(&[("noo auth login", "as that user, to confirm the new password")]);
     }
     Ok(0)
+}
+
+/// `[--stdout] [--yes|-y]` → (stdout, yes).
+pub(crate) fn parse_admin_password_reset(args: &[String]) -> Result<(bool, bool), Unhandled> {
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_admin_password_reset_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_admin_password_reset_with(a: &mut Args) -> Result<(bool, bool), ArgError> {
+    let stdout_flag = a.flag(&["--stdout"]);
+    let yes = a.flag(&["--yes", "-y"]);
+    a.finish()?;
+    Ok((stdout_flag, yes))
 }
 
 /// `noo security admin-password reset [--stdout] [--yes]` — on the
@@ -599,14 +688,7 @@ pub fn security_user_set_password(g: &Globals, args: &[String]) -> Result<i32, U
 /// security pki issue-client <you>` — has the login it needs.
 pub fn security_admin_password_reset(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     use std::io::IsTerminal as _;
-    let (mut stdout_flag, mut yes) = (false, false);
-    for tok in args {
-        match tok.as_str() {
-            "--stdout" => stdout_flag = true,
-            "--yes" | "-y" => yes = true,
-            _ => return Err(Unhandled),
-        }
-    }
+    let (stdout_flag, yes) = parse_admin_password_reset(args)?;
     // 1. Can the new password be shown? Decided before anything changes.
     if let crate::commands::secrets_reveal::Guard::Refuse(why) =
         crate::commands::secrets_reveal::reveal_guard(std::io::stdout().is_terminal(), stdout_flag, g.json)
@@ -731,35 +813,33 @@ pub(crate) fn enable_body(username: &str) -> Value {
 
 /// `<username> [-y|--yes]` — exactly one name, any order.
 fn username_and_yes(args: &[String]) -> Result<(String, bool), Unhandled> {
-    let mut name: Option<String> = None;
-    let mut yes = false;
-    for tok in args {
-        match tok.as_str() {
-            "--yes" | "-y" => yes = true,
-            s if !s.starts_with('-') && name.is_none() => name = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    Ok((name.ok_or(Unhandled)?, yes))
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_username_and_yes_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_username_and_yes_with(a: &mut Args) -> Result<(String, bool), ArgError> {
+    let yes = a.flag(&["--yes", "-y"]);
+    Ok((a.one("<username>")?, yes))
 }
 
 /// `noo security user erase USERNAME [--yes/-y] [--keep-account]`
 /// POST /api/security/users/{u}/erase. Python contract preserved: without
 /// `--yes` this is a server-side DRY-RUN preview (`dry_run: true` — nothing
 /// is deleted, so no confirmation prompt is needed); `--yes` executes.
+/// `USERNAME [--yes|-y] [--keep-account]` → (username, yes, keep_account).
+pub(crate) fn parse_user_erase(args: &[String]) -> Result<(String, bool, bool), Unhandled> {
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_user_erase_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_user_erase_with(a: &mut Args) -> Result<(String, bool, bool), ArgError> {
+    let yes = a.flag(&["--yes", "-y"]);
+    let keep_account = a.flag(&["--keep-account"]);
+    Ok((a.one("<username>")?, yes, keep_account))
+}
+
 pub fn security_user_erase(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut username: Option<String> = None;
-    let mut yes = false;
-    let mut keep_account = false;
-    for tok in args {
-        match tok.as_str() {
-            "--yes" | "-y" => yes = true,
-            "--keep-account" => keep_account = true,
-            s if !s.starts_with('-') && username.is_none() => username = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let username = username.ok_or(Unhandled)?;
+    let (username, yes, keep_account) = parse_user_erase(args)?;
     let body = post_json(
         g,
         &format!("/api/security/users/{username}/erase"),
@@ -1018,19 +1098,20 @@ pub fn security_team_create(g: &Globals, args: &[String]) -> Result<i32, Unhandl
 /// (`--yes` skips, `--json` requires `--yes`, non-TTY errors, TTY prompts).
 /// `--force` is the SERVER-side gate (delete even with members/docs) and is
 /// passed through in the payload, exactly like Python.
+/// `NAME [--force] [--yes|-y]` → (name, force, yes).
+pub(crate) fn parse_team_delete(args: &[String]) -> Result<(String, bool, bool), Unhandled> {
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_team_delete_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_team_delete_with(a: &mut Args) -> Result<(String, bool, bool), ArgError> {
+    let force = a.flag(&["--force"]);
+    let yes = a.flag(&["--yes", "-y"]);
+    Ok((a.one("<name>")?, force, yes))
+}
+
 pub fn security_team_delete(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut name: Option<String> = None;
-    let mut force = false;
-    let mut yes = false;
-    for tok in args {
-        match tok.as_str() {
-            "--force" => force = true,
-            "--yes" | "-y" => yes = true,
-            s if !s.starts_with('-') && name.is_none() => name = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let name = name.ok_or(Unhandled)?;
+    let (name, force, yes) = parse_team_delete(args)?;
     super::confirm_destructive(g, yes, "Delete", &format!("team '{name}'"));
     let body = crate::http::delete_json(g, &team_delete_path(&name, force), true, TIMEOUT);
     team_guard(g, &body);
@@ -1845,16 +1926,19 @@ pub fn security_posture_set(g: &Globals, args: &[String]) -> Result<i32, Unhandl
 /// `--include-bridges` closes the bridges too, to the safe value the gateway's
 /// catalog carries for each. It is opt-in because only the operator knows
 /// whether the last node has crossed the boundary the bridge exists for.
+/// `PROFILE [--include-bridges]` → (profile, include_bridges).
+pub(crate) fn parse_posture_apply_profile(args: &[String]) -> Result<(String, bool), Unhandled> {
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_posture_apply_profile_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_posture_apply_profile_with(a: &mut Args) -> Result<(String, bool), ArgError> {
+    let include_bridges = a.flag(&["--include-bridges"]);
+    Ok((a.one("<profile>")?, include_bridges))
+}
+
 pub fn security_posture_apply_profile(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut include_bridges = false;
-    let mut rest: Vec<String> = Vec::new();
-    for a in args {
-        match a.as_str() {
-            "--include-bridges" => include_bridges = true,
-            other => rest.push(other.to_string()),
-        }
-    }
-    let [profile] = positional::<1>(&rest)?;
+    let (profile, include_bridges) = parse_posture_apply_profile(args)?;
     let body = post_json_operator(
         g,
         "/api/security/posture/profile",
@@ -2080,16 +2164,25 @@ pub(crate) fn retired_scope_keys(keys: &[&Value]) -> Vec<(String, String)> {
 /// hashes). Active keys by default; `--all` adds the revoked ones a human
 /// issued; `--callers` adds the gateway's retired add-on caller rows as well.
 /// `--json` is always complete.
+/// `[--all] [--callers]` → which revoked rows to add; `--callers` wins.
+pub(crate) fn parse_service_key_list(args: &[String]) -> Result<Revoked, Unhandled> {
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_service_key_list_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_service_key_list_with(a: &mut Args) -> Result<Revoked, ArgError> {
+    let all = a.flag(&["--all"]);
+    let callers = a.flag(&["--callers"]);
+    a.finish()?;
+    Ok(match (callers, all) {
+        (true, _) => Revoked::Every,
+        (false, true) => Revoked::Issued,
+        (false, false) => Revoked::Hidden,
+    })
+}
+
 pub fn security_service_key_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut revoked = Revoked::Hidden;
-    for a in args {
-        match a.as_str() {
-            "--all" if revoked == Revoked::Hidden => revoked = Revoked::Issued,
-            "--all" => {}
-            "--callers" => revoked = Revoked::Every,
-            _ => return Err(Unhandled),
-        }
-    }
+    let revoked = parse_service_key_list(args)?;
     let all = revoked != Revoked::Hidden;
     let body = get_json(g, "/api/security/service-keys", true, TIMEOUT);
     if g.json {
@@ -2809,15 +2902,18 @@ fn finish(
     Ok(if outcome.exits_zero() { 0 } else { 1 })
 }
 
+/// `CONSUMER` → the consumer. No flags.
+pub(crate) fn parse_service_key_retire(args: &[String]) -> Result<String, Unhandled> {
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_service_key_retire_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_service_key_retire_with(a: &mut Args) -> Result<String, ArgError> {
+    a.one("<consumer>")
+}
+
 pub fn security_service_key_retire(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut consumer: Option<String> = None;
-    for tok in args {
-        match tok.as_str() {
-            s if !s.starts_with('-') && consumer.is_none() => consumer = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let consumer = consumer.ok_or(Unhandled)?;
+    let consumer = parse_service_key_retire(args)?;
     let body = post_json(
         g,
         &format!("/api/security/service-keys/{consumer}/retire"),
@@ -2845,6 +2941,18 @@ pub fn security_service_key_retire(g: &Globals, args: &[String]) -> Result<i32, 
     Ok(0)
 }
 
+/// `CONSUMER [--disable-account] [--yes|-y]` → (consumer, disable_account, yes).
+pub(crate) fn parse_service_key_revoke(args: &[String]) -> Result<(String, bool, bool), Unhandled> {
+    crate::args::refuse_lone_dash(args)?;
+    Ok(parse_service_key_revoke_with(&mut Args::new(args))?)
+}
+
+pub(crate) fn parse_service_key_revoke_with(a: &mut Args) -> Result<(String, bool, bool), ArgError> {
+    let disable_account = a.flag(&["--disable-account"]);
+    let yes = a.flag(&["--yes", "-y"]);
+    Ok((a.one("<consumer>")?, disable_account, yes))
+}
+
 pub fn security_service_key_revoke(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // `--disable-account` is the kill switch. Revoking a key
     // stops the NEXT mint; a token already issued keeps working until it
@@ -2852,18 +2960,7 @@ pub fn security_service_key_revoke(g: &Globals, args: &[String]) -> Result<i32, 
     // the gateway re-checks a delegated token's subject on every request.
     // An operator stopping a runaway agent almost always means both, and
     // the gateway does them in one transaction so there is no half-state.
-    let mut consumer: Option<String> = None;
-    let mut disable_account = false;
-    let mut yes = false;
-    for tok in args {
-        match tok.as_str() {
-            "--disable-account" => disable_account = true,
-            "--yes" | "-y" => yes = true,
-            s if !s.starts_with('-') && consumer.is_none() => consumer = Some(s.to_string()),
-            _ => return Err(Unhandled),
-        }
-    }
-    let consumer = consumer.ok_or(Unhandled)?;
+    let (consumer, disable_account, yes) = parse_service_key_revoke(args)?;
     // Irreversible: a revoked key cannot be brought back, only replaced, and
     // --disable-account also locks the bound user out.
     super::confirm_destructive(
@@ -3195,11 +3292,9 @@ mod audit_verify_export_tests {
 mod admin_password_reset_tests {
     /// The function body, from its signature to the next top-level fn.
     fn body() -> &'static str {
-        let src = include_str!("security.rs");
-        let src = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
-        let start = src.find("pub fn security_admin_password_reset").expect("the verb exists");
-        let rest = &src[start..];
-        &rest[..rest[1..].find("\npub fn ").map(|i| i + 1).unwrap_or(rest.len())]
+        static CODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let code = CODE.get_or_init(|| crate::test_src::own_code(include_str!("security.rs")));
+        crate::test_src::fn_body(code, "pub fn security_admin_password_reset")
     }
 
     /// Whether the new password may be printed is decided BEFORE the old one
@@ -3249,12 +3344,11 @@ mod admin_password_reset_tests {
 mod clifix_security_tests {
     use super::*;
 
-    /// The body of the first `pub fn` named `sig` (up to the next top-level item).
+    /// The body of the first `pub fn` named `sig`, through its own closing
+    /// brace (followup 215: `test_src::fn_body`).
     fn body_of<'a>(src: &'a str, sig: &str) -> &'a str {
-        let start = src.find(sig).unwrap_or_else(|| panic!("{sig} not found"));
-        let rest = &src[start + sig.len()..];
-        let end = rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len());
-        &rest[..end]
+        let item = crate::test_src::fn_body(src, sig);
+        &item[sig.len()..]
     }
 
     /// A confirmation that comes after the request is a notice, not a gate.
@@ -3363,5 +3457,196 @@ mod password_policy_tests {
         assert!(crate::password_policy::weak_password("hunter22", "alice").is_some());
         assert!(crate::password_policy::weak_password("Password123!", "alice").is_some());
         assert!(crate::password_policy::weak_password("a-long-enough-phrase", "alice").is_none());
+    }
+}
+
+#[cfg(test)]
+mod super_admin_tests {
+    use super::parse_super_admin_with;
+    use crate::args::Args;
+
+    fn parse(v: &[&str]) -> Result<(String, bool, String, bool, bool), crate::args::ArgError> {
+        parse_super_admin_with(&mut Args::new(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>()))
+    }
+
+    #[test]
+    fn super_admin_takes_a_user_on_or_off_and_a_reason() {
+        assert_eq!(parse(&["bob", "on", "--reason", "second owner"]).unwrap(), ("bob".into(), true, "second owner".into(), false, false));
+        assert_eq!(
+            parse(&["bob", "OFF", "--reason", "left", "--password-stdin", "-y"]).unwrap(),
+            ("bob".into(), false, "left".into(), true, true)
+        );
+        for (bad, why) in [
+            (vec!["bob", "on"], "--reason is required"),
+            (vec!["bob", "on", "--reason", "  "], "--reason is required"),
+            (vec!["bob", "maybe", "--reason", "x"], "on or off"),
+            (vec!["bob", "--reason", "x"], "usage"),
+            (vec!["bob", "on", "extra", "--reason", "x"], "usage"),
+        ] {
+            let e = parse(&bad).unwrap_err();
+            assert!(e.0.contains(why), "{bad:?}: {e}");
+        }
+    }
+
+    /// Confirm, then the person's own password, then the gateway: a refused
+    /// confirmation asks for no password and sends nothing.
+    #[test]
+    fn super_admin_confirms_then_asks_the_password_then_calls_the_gateway() {
+        let src = include_str!("security.rs");
+        let start = src.find("pub fn security_user_super_admin(").expect("the verb");
+        let rest = &src[start..];
+        let body = &rest[..rest[1..].find("\npub fn ").map(|i| i + 1).unwrap_or(rest.len())];
+        let confirm = body.find("super::confirm_prompt(").expect("confirms");
+        let password = body.find("prompt_secret(\"Your password: \")").expect("asks the password");
+        let call = body.find("put_json(").expect("calls the route");
+        assert!(confirm < password && password < call, "confirm -> password -> PUT");
+        assert!(body.contains("\"password\": password"), "the password is the body's, never a header or the URL");
+    }
+}
+
+/// What each security parser accepts and refuses, pinned before the
+/// hand-rolled loops move to `args::Args` (i191 D2 pass 4): the conversion
+/// must leave every row as it is. `None` is a refusal: `Err(Unhandled)`, which
+/// the dispatcher turns into the verb's usage line and exit 2.
+#[cfg(test)]
+mod parse_pin_tests {
+    use super::*;
+
+    type Row<T> = (&'static [&'static str], Option<T>);
+
+    fn check<T: PartialEq + std::fmt::Debug>(verb: &str, parse: fn(&[String]) -> Result<T, Unhandled>, rows: &[Row<T>]) {
+        assert!(rows.len() >= 4, "{verb}: too few rows to pin anything");
+        assert!(rows.iter().any(|r| r.1.is_some()) && rows.iter().any(|r| r.1.is_none()), "{verb}: pin both an accepted and a refused form");
+        for (args, want) in rows {
+            let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let got = parse(&argv).ok();
+            assert_eq!(got.as_ref(), want.as_ref(), "{verb} {args:?}");
+        }
+    }
+
+    fn st(v: &str) -> String {
+        v.to_string()
+    }
+
+    #[test]
+    fn old_parse_user_set_password_table() {
+        check("user set-password", parse_set_password, &[
+            (&["alice"], Some((st("alice"), false))),
+            (&["alice", "--password-stdin"], Some((st("alice"), true))),
+            (&["--password-stdin", "alice"], Some((st("alice"), true))),
+            (&[], None),
+            (&["--password-stdin"], None),
+            (&["alice", "bob"], None),
+            (&["alice", "--bogus"], None),
+            (&["alice", "-p"], None),
+            (&["-"], None),
+        ]);
+    }
+
+    #[test]
+    fn old_parse_admin_password_reset_table() {
+        check("admin-password reset", parse_admin_password_reset, &[
+            (&[], Some((false, false))),
+            (&["--stdout"], Some((true, false))),
+            (&["-y"], Some((false, true))),
+            (&["--yes", "--stdout"], Some((true, true))),
+            (&["--bogus"], None),
+            (&["admin"], None),
+            (&["-"], None),
+        ]);
+    }
+
+    #[test]
+    fn old_parse_username_and_yes_table() {
+        check("user disable", username_and_yes, &[
+            (&["bob"], Some((st("bob"), false))),
+            (&["-y", "bob"], Some((st("bob"), true))),
+            (&["bob", "--yes"], Some((st("bob"), true))),
+            (&[], None),
+            (&["bob", "carol"], None),
+            (&["bob", "--force"], None),
+            (&["-"], None),
+        ]);
+    }
+
+    #[test]
+    fn old_parse_user_erase_table() {
+        check("user erase", parse_user_erase, &[
+            (&["bob"], Some((st("bob"), false, false))),
+            (&["bob", "--keep-account", "-y"], Some((st("bob"), true, true))),
+            (&["--yes", "bob"], Some((st("bob"), true, false))),
+            (&[], None),
+            (&["--keep-account"], None),
+            (&["bob", "carol"], None),
+            (&["bob", "--purge"], None),
+            (&["-"], None),
+        ]);
+    }
+
+    #[test]
+    fn old_parse_team_delete_table() {
+        check("team delete", parse_team_delete, &[
+            (&["eng"], Some((st("eng"), false, false))),
+            (&["--force", "eng", "--yes"], Some((st("eng"), true, true))),
+            (&["eng", "-y"], Some((st("eng"), false, true))),
+            (&[], None),
+            (&["eng", "ops"], None),
+            (&["eng", "-f"], None),
+            (&["--force"], None),
+            (&["-"], None),
+        ]);
+    }
+
+    #[test]
+    fn old_parse_posture_apply_profile_table() {
+        check("posture apply-profile", parse_posture_apply_profile, &[
+            (&["strict"], Some((st("strict"), false))),
+            (&["--include-bridges", "strict"], Some((st("strict"), true))),
+            (&["strict", "--include-bridges"], Some((st("strict"), true))),
+            (&[], None),
+            (&["--include-bridges"], None),
+            (&["strict", "extra"], None),
+            (&["strict", "--bogus"], None),
+            (&["-"], None),
+        ]);
+    }
+
+    #[test]
+    fn old_parse_service_key_list_table() {
+        check("service-key list", parse_service_key_list, &[
+            (&[], Some(Revoked::Hidden)),
+            (&["--all"], Some(Revoked::Issued)),
+            (&["--all", "--all"], Some(Revoked::Issued)),
+            (&["--callers"], Some(Revoked::Every)),
+            (&["--all", "--callers"], Some(Revoked::Every)),
+            (&["--callers", "--all"], Some(Revoked::Every)),
+            (&["--bogus"], None),
+            (&["consumer"], None),
+        ]);
+    }
+
+    #[test]
+    fn old_parse_service_key_retire_table() {
+        check("service-key retire", parse_service_key_retire, &[
+            (&["agent-1"], Some(st("agent-1"))),
+            (&[], None),
+            (&["agent-1", "agent-2"], None),
+            (&["agent-1", "--yes"], None),
+            (&["-"], None),
+        ]);
+    }
+
+    #[test]
+    fn old_parse_service_key_revoke_table() {
+        check("service-key revoke", parse_service_key_revoke, &[
+            (&["agent-1"], Some((st("agent-1"), false, false))),
+            (&["agent-1", "--disable-account", "-y"], Some((st("agent-1"), true, true))),
+            (&["--yes", "agent-1"], Some((st("agent-1"), false, true))),
+            (&[], None),
+            (&["--disable-account"], None),
+            (&["agent-1", "agent-2"], None),
+            (&["agent-1", "--force"], None),
+            (&["-"], None),
+        ]);
     }
 }

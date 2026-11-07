@@ -8,8 +8,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -52,51 +54,81 @@ func NewGPUDetector(client *http.Client, scheme string) *GPUDetector {
 	}
 }
 
-// DetectModel returns the GPU model name via nvidia-smi, or empty string if
-// no GPU is available.
-func (g *GPUDetector) DetectModel() string {
-	out, err := execTimeout(nvidiaSmi(), "--query-gpu=name", "--format=csv,noheader,nounits")
-	if err != nil {
-		return ""
+// smiQuery runs one nvidia-smi query. The three answers are kept apart:
+//
+//   - (out, nil): the binary answered.
+//   - ("", nil) with absent=true: there is no nvidia-smi on this host. That is
+//     a real "no GPU", not a failure.
+//   - ("", err): the binary is there but timed out (errors.Is
+//     context.DeadlineExceeded), exited non-zero, or could not be run. The
+//     GPU's state is UNKNOWN; callers must not read it as "no GPU".
+func smiQuery(args ...string) (out string, absent bool, err error) {
+	out, err = execTimeout(nvidiaSmi(), args...)
+	if err == nil {
+		return out, false, nil
 	}
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) > 0 && lines[0] != "" {
-		return strings.TrimSpace(lines[0])
+	if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
+		return "", true, nil
+	}
+	return "", false, fmt.Errorf("nvidia-smi %s: %w", args[0], err)
+}
+
+// firstLine is the first non-blank line of nvidia-smi's stdout.
+func firstLine(out string) string {
+	for _, l := range strings.Split(out, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			return l
+		}
 	}
 	return ""
 }
 
-// DetectVRAM returns total VRAM in GB via nvidia-smi.
-func (g *GPUDetector) DetectVRAM() float64 {
-	out, err := execTimeout(nvidiaSmi(), "--query-gpu=memory.total", "--format=csv,noheader,nounits")
-	if err != nil {
-		return 0
+// DetectModel returns the GPU model name via nvidia-smi. ("", nil) means
+// there is no GPU (no nvidia-smi, or it lists none); an error means the probe
+// failed and the answer is unknown.
+func (g *GPUDetector) DetectModel() (string, error) {
+	out, absent, err := smiQuery("--query-gpu=name", "--format=csv,noheader,nounits")
+	if err != nil || absent {
+		return "", err
 	}
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) > 0 {
-		if mb, err := strconv.ParseFloat(strings.TrimSpace(lines[0]), 64); err == nil {
-			return round(mb/1024, 1)
-		}
-	}
-	return 0
+	return firstLine(out), nil
 }
 
-// DetectCount returns the number of GPUs available.
-func (g *GPUDetector) DetectCount() int {
-	out, err := execTimeout(nvidiaSmi(), "--query-gpu=count", "--format=csv,noheader,nounits")
-	if err != nil {
-		if g.DetectModel() != "" {
-			return 1
-		}
-		return 0
+// DetectVRAM returns total VRAM in GB via nvidia-smi. (0, nil) means no GPU;
+// an error (including unparseable output) means unknown.
+func (g *GPUDetector) DetectVRAM() (float64, error) {
+	out, absent, err := smiQuery("--query-gpu=memory.total", "--format=csv,noheader,nounits")
+	if err != nil || absent {
+		return 0, err
 	}
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) > 0 {
-		if n, err := strconv.Atoi(strings.TrimSpace(lines[0])); err == nil {
-			return n
-		}
+	line := firstLine(out)
+	if line == "" {
+		return 0, nil
 	}
-	return 0
+	mb, perr := strconv.ParseFloat(line, 64)
+	if perr != nil {
+		return 0, fmt.Errorf("nvidia-smi memory.total: unparseable output %q: %w", line, perr)
+	}
+	return round(mb/1024, 1), nil
+}
+
+// DetectCount returns the number of GPUs available. (0, nil) means no GPU;
+// an error means unknown. It no longer falls back to DetectModel: that probe
+// failed the same way and returned "" too.
+func (g *GPUDetector) DetectCount() (int, error) {
+	out, absent, err := smiQuery("--query-gpu=count", "--format=csv,noheader,nounits")
+	if err != nil || absent {
+		return 0, err
+	}
+	line := firstLine(out)
+	if line == "" {
+		return 0, nil
+	}
+	n, perr := strconv.Atoi(line)
+	if perr != nil {
+		return 0, fmt.Errorf("nvidia-smi count: unparseable output %q: %w", line, perr)
+	}
+	return n, nil
 }
 
 // DetectVRAMUsed returns currently used VRAM in GB across all GPUs.

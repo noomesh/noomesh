@@ -1718,7 +1718,8 @@ async fn execute_manual_run(
     // Dispatch result to configured channels — same path the cron-tick
     // loop uses. Long results are sent as `.md` attachments where the
     // adapter supports uploads (Google Chat).
-    let (notified, artifacts, delivery_failed) = if status == "success" && !result_text.is_empty() {
+    let report = heartbeat_actions::channel_report(&status, &action, &result_text, &error_text);
+    let (notified, artifacts, delivery_failed) = if let Some(body) = report.as_deref() {
         heartbeat_actions::notify_channels(
             &task_id,
             &task_name,
@@ -1726,7 +1727,7 @@ async fn execute_manual_run(
             &config,
             &channels,
             &recipients,
-            &result_text,
+            body,
             native_system.as_ref().map(|(c, d)| (c.as_str(), *d)),
         ).await
     } else {
