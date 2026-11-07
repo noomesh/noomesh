@@ -383,7 +383,7 @@ require_addon_pins() {
                 # `decl <addon> <file>`: a declaration file its verified lock
                 # lists. Only the names the gateway reads are kept.
                 case "$_rest" in
-                    system.json|workloads.json|routes.json) _decls+=("${_addon} ${_rest}") ;;
+                    system.json|workloads.json|routes.json|node-workloads.json) _decls+=("${_addon} ${_rest}") ;;
                 esac ;;
             refuse)
                 _addon_refuse "$_addon" "${_rest:-no verified pin for ${_tag}}" ;;
@@ -935,10 +935,12 @@ compose_active_services() {
 
 # addon_decls_materialise — hand the gateway what each add-on's signed bundle
 # declares beyond its overlay (noomesh-internal i163 E/B): `system.json` (its
-# database system), `workloads.json` (its managed workloads) and `routes.json`
-# (its HTTP route manifest, 0.6.13), copied into
+# database system), `workloads.json` (its managed workloads), `routes.json`
+# (its HTTP route manifest, 0.6.13) and `node-workloads.json` (its i300 node
+# workloads, beside workloads.json), copied into
 #   <install root>/.noo-addon-systems/<addon>/system.json
 #   <install root>/.noo-addon-workloads/<addon>/workloads.json
+#   <install root>/.noo-addon-workloads/<addon>/node-workloads.json
 #   <install root>/.noo-addon-routes/<addon>/routes.json
 # which docker-compose.cluster.yml mounts read-only into the gateway at
 # /opt/noo/addon-systems, /opt/noo/addon-workloads and
@@ -988,7 +990,7 @@ addon_decls_materialise() {
                 _src="$(addon_overlay "$_n" 2>/dev/null)"
                 [ -n "$_src" ] || continue
                 _d="$(dirname "$_src")"
-                for _f in system.json workloads.json routes.json; do
+                for _f in system.json workloads.json routes.json node-workloads.json; do
                     [ -f "$_d/$_f" ] && _plan="${_plan}${_n} ${_f} ${_d}/${_f}"$'\n'
                 done
             done ;;
@@ -1006,25 +1008,26 @@ addon_decls_materialise() {
         [ -n "$_a" ] || continue
         case "$_a" in [a-z]*) : ;; *) continue ;; esac
         case "$_a" in *[!a-z0-9_-]*) continue ;; esac
-        case "$_f" in system.json) _d="$_sys/$_a" ;; workloads.json) _d="$_wl/$_a" ;; routes.json) _d="$_rt/$_a" ;; *) continue ;; esac
+        case "$_f" in system.json) _d="$_sys/$_a" ;; workloads.json|node-workloads.json) _d="$_wl/$_a" ;; routes.json) _d="$_rt/$_a" ;; *) continue ;; esac
         [ -f "$_src" ] && [ ! -L "$_src" ] || continue
-        case "$_keep" in *" $_f:$_a "*) : ;; *)
+        # One add-on directory can take two files (workloads.json and
+        # node-workloads.json): it is emptied once, by the first file copied
+        # into it this start, so the second never erases the first.
+        case "$_keep" in *" $_d "*) : ;; *)
             rm -rf "${_d:?}" && mkdir -p "$_d" && chmod 0755 "$_d" || return 1 ;;
         esac
         cp "$_src" "$_d/$_f.tmp.$$" && chmod 0644 "$_d/$_f.tmp.$$" && mv -f "$_d/$_f.tmp.$$" "$_d/$_f" || {
             echo "REFUSING: could not copy ${_a}'s ${_f} into $_d." >&2
             return 1
         }
-        _keep="${_keep}${_f}:${_a} "
+        _keep="${_keep}${_d} "
     done <<PLAN
 $_plan
 PLAN
     # Drop every add-on directory not copied above.
     for _d in "$_sys"/* "$_wl"/* "$_rt"/*; do
         [ -e "$_d" ] || continue
-        _n="$(basename "$_d")"
-        case "$_d" in "$_sys"/*) _f=system.json ;; "$_wl"/*) _f=workloads.json ;; *) _f=routes.json ;; esac
-        case "$_keep" in *" $_f:$_n "*) : ;; *) rm -rf "${_d:?}" ;; esac
+        case "$_keep" in *" $_d "*) : ;; *) rm -rf "${_d:?}" ;; esac
     done
     _after="$(cd "$_sys" && ls -1 2>/dev/null | sort | tr '\n' ' ')"
     if [ "$_before" != "$_after" ] && command -v derive_file_secrets >/dev/null 2>&1 && command -v write_secret_files >/dev/null 2>&1; then

@@ -139,6 +139,93 @@ def test_only_files_a_verified_lock_lists_reach_the_gateway(tmp_path: Path) -> N
     assert stat.S_IMODE(copied.stat().st_mode) == 0o644, "the gateway (another uid) reads it"
 
 
+NODE_WORKLOADS = '{"format":"noo-addon-node-workloads/1","workloads":[]}'
+WITH_NODE_WORKLOADS = BOTH_VERIFIED.replace(
+    "decl example_addon workloads.json\\n",
+    "decl example_addon workloads.json\\ndecl example_addon node-workloads.json\\n",
+)
+
+
+def test_node_workloads_json_lands_beside_workloads_json_and_neither_erases_the_other(tmp_path: Path) -> None:
+    """i300 H3b: the signed node-workloads.json reaches the gateway in the
+    same add-on directory as workloads.json. The directory is emptied once
+    per start, so the second file copied into it never removes the first."""
+    root = _root(tmp_path)
+    (root / "addons" / "example_addon" / "node-workloads.json").write_text(NODE_WORKLOADS)
+    r = _run(tmp_path, FAKE_PINS=WITH_NODE_WORKLOADS)
+    assert r.returncode == 0, r.stderr
+    assert _tree(root) == [
+        ".noo-addon-systems/example_addon/system.json",
+        ".noo-addon-workloads/example_addon/node-workloads.json",
+        ".noo-addon-workloads/example_addon/workloads.json",
+    ]
+    copied = root / ".noo-addon-workloads" / "example_addon" / "node-workloads.json"
+    assert copied.read_text() == NODE_WORKLOADS
+    assert stat.S_IMODE(copied.stat().st_mode) == 0o644
+    # The next start's lock no longer lists it: it goes, workloads.json stays.
+    r = _run(tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert _tree(root) == [
+        ".noo-addon-systems/example_addon/system.json",
+        ".noo-addon-workloads/example_addon/workloads.json",
+    ]
+
+
+def test_cleanup_never_removes_anything_outside_an_addon_directory(tmp_path: Path) -> None:
+    """The stale cleanup and the per-start emptying remove only
+    .noo-*/<addon>/ directories: a hostile add-on name in a verdict or decl
+    line never resolves outside them, and a symlink planted in the workloads
+    directory is removed as a link, never followed."""
+    root = _root(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("keep")
+    (root / "keep.txt").write_text("keep")
+    wl = root / ".noo-addon-workloads"
+    wl.mkdir(exist_ok=True)
+    (wl / "planted").symlink_to(outside, target_is_directory=True)
+    # A traversal that resolves, so that without the name filter it WOULD
+    # reach rm: it passes through example_addon/, which exists under both
+    # addons/ and .noo-addon-workloads/, and its source file is there
+    # (root/addons/example_addon/../../../outside/workloads.json).
+    (outside / "workloads.json").write_text(WORKLOADS % "x")
+    hostile = ["example_addon/../../../outside", "a/../..", "x/../../keep.txt"]
+    # First defence: launch-pins' reader refuses a line that is not an
+    # add-on name, and the start stops before anything is copied or removed.
+    pins = BOTH_VERIFIED + "".join(f"verified {h} 1.0.0 v0.6.0\\ndecl {h} node-workloads.json\\n" for h in hostile)
+    r = _run(tmp_path, FAKE_PINS=pins)
+    assert r.returncode != 0 and "not an add-on name" in r.stderr, r.stderr
+    assert (outside / "keep.txt").read_text() == "keep"
+    # Second defence, pinned here: materialise itself, handed hostile entries
+    # after a good verdict, still copies and removes only add-on directories.
+    body = "\n".join(
+        [f'NOO_ADDONS_VERIFIED="$NOO_ADDONS_VERIFIED,{h}=1.0.0"' for h in hostile]
+        + [f'_ADDON_DECLS+=("{h} {f}")' for h in hostile for f in ("node-workloads.json", "workloads.json")]
+        + ["addon_decls_materialise || exit 7"]
+    )
+    # The add-on map switches them on as well, so only materialise's own
+    # name filter stands between them and rm.
+    hostile_map = "example_addon=1\nother_addon=1\n" + "".join(f"{h}=1\n" for h in hostile)
+    r = _run(tmp_path, body, MAP=hostile_map)
+    assert r.returncode == 0, r.stderr
+    assert (outside / "keep.txt").read_text() == "keep", "a file outside the add-on directories was removed"
+    assert (root / "keep.txt").read_text() == "keep"
+    assert (root / "addons" / "example_addon" / "workloads.json").is_file(), "the bundle source is never touched"
+    assert not (wl / "planted").exists() and not (wl / "planted").is_symlink(), "the planted link is removed as a link"
+    assert _tree(root) == [
+        ".noo-addon-systems/example_addon/system.json",
+        ".noo-addon-workloads/example_addon/workloads.json",
+    ]
+
+
+def test_a_dev_start_copies_node_workloads_json_too(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    (root / "addons" / "example_addon" / "node-workloads.json").write_text(NODE_WORKLOADS)
+    r = _run(tmp_path, DIST_MODE="0", MAP="example_addon=1\nother_addon=0\n")
+    assert r.returncode == 0, r.stderr
+    assert ".noo-addon-workloads/example_addon/node-workloads.json" in _tree(root)
+
+
 def test_a_decl_line_for_an_addon_the_verdict_does_not_name_is_ignored(tmp_path: Path) -> None:
     pins = (
         "verified example_addon 1.0.0 v0.6.0\\n"

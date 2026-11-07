@@ -985,6 +985,8 @@ mod tests {
         let (good, _) = rh_pinned_root("nw-launch-good", true);
         let lines = launch_lines(&good, "v0.6.0", &names, &|_| Ok(anchor()));
         assert_eq!(lines[0], "verified rhaddon 1.0.0 v0.6.0", "{lines:?}");
+        // i300 H3b: the launcher hands the signed file to the gateway.
+        assert!(lines.iter().any(|l| l == "decl rhaddon node-workloads.json"), "{lines:?}");
         let (bad, _) = rh_pinned_root("nw-launch-bad", false);
         let lines = launch_lines(&bad, "v0.6.0", &names, &|_| Ok(anchor()));
         assert_eq!(lines.len(), 1, "{lines:?}");
