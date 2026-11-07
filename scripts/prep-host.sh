@@ -709,8 +709,29 @@ if [ -z "${NOO_DATA_ROOT:-}" ]; then
     [ -n "$NOO_DATA_ROOT" ] || NOO_DATA_ROOT=/var/lib/noo
 fi
 say "data root: $NOO_DATA_ROOT"
-install -d -o noo-agent -g noo-agent "$NOO_DATA_ROOT" \
-    "$NOO_DATA_ROOT/hf-cache" "$NOO_DATA_ROOT/models" "$NOO_DATA_ROOT/ollama"
+# >>> data-dirs (tests/test_prep_host_data_dirs.py runs this block)
+# Owners, one rule with the CLI (noo-cli onboard/steps.rs intended_owner):
+#   - the root: noo-agent when this creates it; an existing root keeps its
+#     owner (the CLI reads it as the owner of every directory it does not
+#     list, so re-owning it changed what the CLI wanted for all of them);
+#   - ollama: the hardened ollama image's uid (docker/Dockerfile.ollama,
+#     USER 65532, no chown entrypoint; scripts/lib-reown.sh re-owns a legacy
+#     store before the stack starts). An existing store keeps its owner:
+#     0.6.17-rc.2 re-owned it to noo-agent, ollama-embed could not create its
+#     convert dir, and harrier (RAG) was never made;
+#   - models, hf-cache: the node agent's write targets (it fetches model
+#     files into models), so noo-agent, an existing one included.
+# `install -d -o` RE-OWNS a directory that exists: data_dir only ever
+# creates.
+OLLAMA_STORE_OWNER=65532:65532
+data_dir() {  # data_dir DIR USER:GROUP: create DIR with that owner if it is missing
+    [ -d "$1" ] && return 0
+    install -d -o "${2%%:*}" -g "${2#*:}" "$1"
+}
+data_dir "$NOO_DATA_ROOT" noo-agent:noo-agent
+install -d -o noo-agent -g noo-agent "$NOO_DATA_ROOT/hf-cache" "$NOO_DATA_ROOT/models"
+data_dir "$NOO_DATA_ROOT/ollama" "$OLLAMA_STORE_OWNER"
+# <<< data-dirs
 # Surface unmounted large drives the way the playbook did — a decision the
 # operator may want to revisit, not an error.
 UNMOUNTED="$(lsblk -bnrpo NAME,SIZE,MOUNTPOINT,FSTYPE 2>/dev/null | \

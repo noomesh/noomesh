@@ -4104,11 +4104,15 @@ fn chown_failure(owner: &str, status: std::process::ExitStatus, stderr: &[u8]) -
 
 /// Nonroot service uids per data subdir (observed on the live images:
 /// chainguard/dhi redis, grafana, loki, prometheus all run as 65532).
-/// Dirs not listed stay owned by the wizard's user (host-side tooling
-/// reads/writes them: models, hf-cache, noo-data, ollama, nats-root-image).
+/// `ollama` is the store of the hardened ollama image (docker/Dockerfile.ollama,
+/// USER 65532, no chown entrypoint), the same owner scripts/lib-reown.sh gives
+/// a legacy store and scripts/prep-host.sh gives a missing one
+/// (tests/test_prep_host_data_dirs.py ties the three). models and hf-cache
+/// are the node agent's ([`agent_subdir`]). Dirs not listed stay owned by the
+/// wizard's user (noo-data, nats-root-image).
 pub(crate) fn subdir_owner(name: &str) -> Option<&'static str> {
     match name {
-        "redis" | "prometheus" | "grafana" | "loki" | "tempo" => Some("65532:65532"),
+        "redis" | "prometheus" | "grafana" | "loki" | "tempo" | "ollama" => Some("65532:65532"),
         // The chainguard postgres runs as uid 70 and initdb needs to own it.
         "postgres" => Some("70:70"),
         _ => None,
@@ -4230,15 +4234,47 @@ pub(crate) fn storage_base(name: &str, target: &Path) -> PathBuf {
 }
 
 /// Who should own storage directory `name` under `base`: its service uid
-/// ([`subdir_owner`]) when it has one, else whoever owns the root it sits
-/// under, read BEFORE anything is created. A root the operator owns gives
+/// ([`subdir_owner`]) when it has one; for the node agent's write targets
+/// ([`agent_subdir`]) the `noo-agent` account when the host has one; else
+/// whoever owns the root it sits under, read BEFORE anything is created. A root the operator owns gives
 /// the operator; a root owned by the node agent (pop-os: 993:982, as its
 /// `models`) gives the node agent. Onboarding's storage step, its sudo path
 /// and the stack roll (`noo upgrade`, including a lock-only directory) all
 /// ask here, so no two places decide differently.
 pub(crate) fn intended_owner(name: &str, base: &Path) -> std::io::Result<Owner> {
+    intended_owner_with(name, base, node_agent_owner())
+}
+
+/// The node agent's write targets: it fetches model files into `models`
+/// (node-agent-go model_artifact.go) and its backends fill `hf-cache`.
+/// scripts/prep-host.sh gives both to `noo-agent`, the one owner it still
+/// re-owns an existing directory to.
+pub(crate) fn agent_subdir(name: &str) -> bool {
+    matches!(name, "models" | "hf-cache")
+}
+
+/// The `noo-agent` account's (uid, primary gid), when this host has it
+/// (prep-host creates it with the first host-agent install).
+pub(crate) fn node_agent_owner() -> Option<Owner> {
+    let c = std::ffi::CString::new("noo-agent").ok()?;
+    // SAFETY: getpwnam reads the password database; the record is copied
+    // out before any other call can reuse its static buffer.
+    let pw = unsafe { libc::getpwnam(c.as_ptr()) };
+    if pw.is_null() {
+        return None;
+    }
+    Some(unsafe { ((*pw).pw_uid, (*pw).pw_gid) })
+}
+
+/// [`intended_owner`] with the node agent's account given: a service uid
+/// ([`subdir_owner`]), else for [`agent_subdir`] the node agent when the
+/// host has it, else the root's owner.
+pub(crate) fn intended_owner_with(name: &str, base: &Path, agent: Option<Owner>) -> std::io::Result<Owner> {
     if let Some(o) = subdir_owner(name).and_then(parse_owner) {
         return Ok(o);
+    }
+    if let Some(a) = agent.filter(|_| agent_subdir(name)) {
+        return Ok(a);
     }
     use std::os::unix::fs::MetadataExt;
     let m = std::fs::metadata(base)?;
@@ -4294,7 +4330,7 @@ pub(crate) fn create_storage_dir(name: &str, target: &Path) -> Result<(), Storag
         if owner_mismatch(dir, w).is_none() {
             continue;
         }
-        let fixed = if dir == target && subdir_owner(name).is_some() {
+        let fixed = if dir == target && (subdir_owner(name).is_some() || agent_subdir(name)) {
             ensure_dir_ownership(&dir.to_string_lossy(), &format!("{}:{}", w.0, w.1))
         } else {
             std::os::unix::fs::chown(dir, Some(w.0), Some(w.1)).map_err(|e| e.to_string())
@@ -9247,6 +9283,88 @@ mod storage_owner_tests {
         assert_eq!(intended_owner("tempo", &b).unwrap(), (65532, 65532));
         assert_eq!(intended_owner("postgres", &b).unwrap(), (70, 70));
         assert_eq!(intended_owner("models/voice/piper", &b).unwrap(), owner_of(&b));
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// rc.2 (0.6.17): prep-host re-owned an existing <root>/ollama to
+    /// noo-agent, the hardened ollama image (uid 65532) could not write its
+    /// own store, and harrier was never created. ollama is 65532's; models
+    /// and hf-cache are the node agent's when the host has that account,
+    /// else the root's owner; nothing else follows the agent.
+    #[test]
+    fn ollama_is_the_image_uid_and_the_agent_owns_only_its_write_targets() {
+        use super::intended_owner_with;
+        let b = base("intended-agent");
+        let agent = Some((4242, 4243));
+        assert_eq!(intended_owner("ollama", &b).unwrap(), (65532, 65532));
+        assert_eq!(intended_owner_with("ollama", &b, agent).unwrap(), (65532, 65532));
+        assert_eq!(intended_owner_with("models", &b, agent).unwrap(), (4242, 4243));
+        assert_eq!(intended_owner_with("hf-cache", &b, agent).unwrap(), (4242, 4243));
+        assert_eq!(intended_owner_with("models", &b, None).unwrap(), owner_of(&b));
+        assert_eq!(intended_owner_with("hf-cache", &b, None).unwrap(), owner_of(&b));
+        for other in ["noo-data", "models/voice/piper", "images", ""] {
+            assert_eq!(intended_owner_with(other, &b, agent).unwrap(), owner_of(&b), "{other}");
+        }
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// Runs prep-host's data-dirs block (scripts/prep-host.sh, the copy this
+    /// CLI embeds) with `install` shimmed to log its arguments and make the
+    /// directories. GNU `install -d -o` re-owns a directory that exists: in
+    /// 0.6.17-rc.2 that handed the ollama store (65532) to noo-agent.
+    fn run_prep_data_dirs(b: &Path, root: &Path) -> Vec<String> {
+        use std::os::unix::fs::PermissionsExt;
+        let prep = include_str!("../../../scripts/prep-host.sh");
+        let block = prep.split("# >>> data-dirs").nth(1).and_then(|r| r.split("# <<< data-dirs").next()).expect("prep-host.sh has its data-dirs block");
+        let block = &block[block.find('\n').expect("block line") + 1..];
+        let bin = b.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let shim = bin.join("install");
+        std::fs::write(&shim, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SHIM_LOG\"\nskip=\nfor a in \"$@\"; do\n  if [ -n \"$skip\" ]; then skip=; continue; fi\n  case \"$a\" in -o|-g|-m) skip=1 ;; -d) ;; *) mkdir -p \"$a\" ;; esac\ndone\n").unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let log = b.join("install.log");
+        std::fs::write(&log, "").unwrap();
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("set -eu\n{block}"))
+            .env("PATH", path)
+            .env("NOO_DATA_ROOT", root)
+            .env("SHIM_LOG", &log)
+            .output()
+            .expect("bash runs");
+        assert!(out.status.success(), "the data-dirs block failed: {}", String::from_utf8_lossy(&out.stderr));
+        std::fs::read_to_string(&log).unwrap().lines().map(str::to_string).collect()
+    }
+
+    /// An existing data root and ollama store keep their owners (nothing
+    /// passes them to `install -d -o`); a missing one is created with its
+    /// owner; models and hf-cache stay the node agent's.
+    #[test]
+    fn prep_host_never_reowns_an_existing_root_or_ollama_store() {
+        let b = base("prep-data-dirs");
+        let root = b.join("noo");
+        let names = |calls: &[String], p: &Path| -> Vec<String> {
+            let p = p.to_string_lossy().into_owned();
+            calls.iter().filter(|c| c.split_whitespace().any(|w| w == p)).cloned().collect()
+        };
+        for d in ["ollama", "models", "hf-cache"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let calls = run_prep_data_dirs(&b, &root);
+        assert!(names(&calls, &root).is_empty(), "an existing data root was re-owned: {calls:?}");
+        assert!(names(&calls, &root.join("ollama")).is_empty(), "an existing ollama store was re-owned: {calls:?}");
+        for d in ["models", "hf-cache"] {
+            assert!(names(&calls, &root.join(d)).iter().any(|c| c.contains("-o noo-agent -g noo-agent")), "{d}: {calls:?}");
+        }
+
+        std::fs::remove_dir_all(&root).unwrap();
+        let calls = run_prep_data_dirs(&b, &root);
+        assert!(names(&calls, &root).iter().any(|c| c.contains("-o noo-agent -g noo-agent")), "a missing root: {calls:?}");
+        assert!(names(&calls, &root.join("ollama")).iter().any(|c| c.contains("-o 65532 -g 65532")), "a missing ollama store: {calls:?}");
+        for d in ["ollama", "models", "hf-cache"] {
+            assert!(root.join(d).is_dir(), "{d} was not created");
+        }
         let _ = std::fs::remove_dir_all(&b);
     }
 
