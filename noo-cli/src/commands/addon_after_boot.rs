@@ -783,7 +783,7 @@ mod tests {
             } else {
                 self.down.get(addon).cloned().unwrap_or_default()
             };
-            Ok(Containers { down, held, undeclared: self.undeclared.contains(addon) })
+            Ok(Containers { down, held, undeclared: self.undeclared.iter().any(|u| u == addon) })
         }
         fn guard_refusal(&mut self, addon: &str) -> Option<String> {
             self.guard.get(addon).cloned()
