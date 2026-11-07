@@ -183,6 +183,10 @@ func TestReleaseDoesNotRecreateOverAWorkerItCouldNotRemove(t *testing.T) {
 	if got := countOf(h.api.callList(), "create:"); got != creates {
 		t.Fatalf("recreated over a worker that is still there (%d -> %d)", creates, got)
 	}
+	// The worker is still on the node, so the row must not say it is gone.
+	if r := h.row(); r.State == nodewl.StateAbsent || r.State == nodewl.StateProvisioned {
+		t.Fatalf("row = %+v: the containers are still there", r)
+	}
 }
 
 func TestReleaseOfAnUnreadableNodeDrainsStopsAndRemovesNothing(t *testing.T) {
@@ -327,18 +331,20 @@ func TestProvisionedWithTheSameSpecStillReleasesARunningWorker(t *testing.T) {
 
 func TestARefusalIsClearedWhenTheWorkloadStarts(t *testing.T) {
 	h := newLife(t)
-	h.door.status("GET", "/health/ready", 200)
+	h.door.status("GET", "/health/ready", 503) // never ready, so only the start can clear the reason
 	h.p.SetAdmit(func(context.Context, nodewl.Entry) error {
 		return &nodewl.Error{Code: nodewl.ReasonConsentNone, Detail: "policy is none"}
 	})
-	h.p.Converge(context.Background(), h.running())
-	h.p.Wait()
-	if r := h.row(); r.Reason != nodewl.ReasonConsentNone {
-		t.Fatalf("row = %+v", r)
+	h.p.Converge(context.Background(), h.running()) // a refusal starts nothing, so there is nothing to wait for
+	if r := h.row(); r.Reason != nodewl.ReasonConsentNone || countOf(h.api.callList(), "start:") != 0 {
+		t.Fatalf("row = %+v, calls %v", r, h.api.callList())
 	}
 	h.p.SetAdmit(func(context.Context, nodewl.Entry) error { return nil })
 	h.p.Converge(context.Background(), h.running())
 	eventually(t, "running with no reason", func() bool { r := h.row(); return r.State == nodewl.StateRunning && r.Reason == "" })
+	if r := h.row(); r.Ready {
+		t.Fatalf("row = %+v: the door answers 503", r)
+	}
 }
 
 func TestARunningDoorIsNotStartedAgain(t *testing.T) {

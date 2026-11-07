@@ -63,8 +63,8 @@ func TestDoorRequestRefusesBeforeAnythingIsSent(t *testing.T) {
 	if err := os.WriteFile(notACert, []byte("no certificate in here\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := do(notACert, crt, key, "/"); err == nil {
-		t.Error("a CA file with no certificate was accepted")
+	if _, err := do(notACert, crt, key, "/"); err == nil || !strings.Contains(err.Error(), "no certificate") {
+		t.Errorf("a CA file with no certificate: %v, want it named as such (not a handshake failure against an empty trust pool)", err)
 	}
 	// The agent's own leaf must load: a missing file, a key that is not the
 	// certificate's.
