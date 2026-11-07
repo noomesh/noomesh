@@ -5513,11 +5513,15 @@ mod self_node_rail_tests {
         let e = r.expect_err("an install with no CA must fail — by returning");
         assert!(e.contains("ca.crt") || e.contains("prep-host"), "{e}");
         let _ = std::fs::remove_dir_all(&base);
-        // And the onboard caller warns and goes on, never `fail`s.
+        // And the onboard caller warns and goes on, never `fail`s. Since
+        // i545 the install is tried twice (`retry_once`) and the RETURNED
+        // error of the last try is what the caller warns with.
         let steps = crate::test_src::own_code(include_str!("../onboard/steps.rs"));
         let f = crate::test_src::fn_body(&steps, "fn ensure_self_agent(");
-        assert!(f.contains("if let Err(e) = crate::commands::provision::provision_local("), "{f}");
-        assert!(f.contains("provision_one(ctx.g, &node_id, &[])"), "the rail branch runs in a child");
+        let install = f.find("|| crate::commands::provision::provision_local(g, &node_id, None)").unwrap_or_else(|| panic!("{f}"));
+        let warn = f.find("if let Err(e) = installed").unwrap_or_else(|| panic!("{f}"));
+        assert!(install < warn, "the install's returned error is what the caller handles: {f}");
+        assert!(f.contains("provision_one(g, &node_id, &[])"), "the rail branch runs in a child");
         assert!(!f.contains("fail("), "{f}");
     }
 
