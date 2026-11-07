@@ -120,8 +120,9 @@ one-liner carries (`noo enroll noo1.<base64>`), an explicit
 `--url <controller> --token <t>`, and `--via-tailnet <https://controller>`
 (no token: identity is proved by Tailscale `whois` plus a dial-back). The
 command installs Tailscale if needed, registers with `POST
-/api/cluster/bootstrap`, prints `registered as gpu-2`, installs the
-host prep (agent, fetch timer, CA anchor at `/etc/noo/pki/ca.crt`; no
+/api/cluster/bootstrap`, prints `admitted as gpu-2`, installs the
+host prep (fetch timer, CA anchor at `/etc/noo/pki/ca.crt`; there is no
+`noo-node-agent` unit yet, it arrives with the first bundle; no
 controller SSH key goes in, and a gate-pinned key line or SSH-lane sudoers
 drop-in left by an older enrollment is removed), and ends `enrollment complete`. Then on
 the controller run `noo cluster provision gpu-2 --wait` — see
