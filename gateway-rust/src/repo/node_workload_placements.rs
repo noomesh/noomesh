@@ -69,7 +69,6 @@ pub async fn place(db: impl sqlx::PgExecutor<'_>, p: &Placement) -> Result<Place
            ON CONFLICT (addon, workload) DO UPDATE SET \
              profile = EXCLUDED.profile, sets = EXCLUDED.sets, env = EXCLUDED.env, \
              on_controller = EXCLUDED.on_controller, updated_at = now() \
-           WHERE noo_node_workload_placements.node_id = EXCLUDED.node_id \
            RETURNING node_id) \
          SELECT (SELECT node_id FROM w) AS written, \
                 (SELECT node_id FROM noo_node_workload_placements WHERE addon = $1 AND workload = $2) AS holder",
