@@ -388,5 +388,9 @@ mod tests {
         let gate = at(&b, "} else if restage {");
         assert!(restage < gate, "not behind --restage-nodes");
         assert!(b.contains(".filter(|n| !n.eq_ignore_ascii_case(&self_node))"), "the loop skips it");
+        assert!(
+            b.contains("let self_failed = if crate::commands::provision::pull_units_missing(&self_node).is_empty() {"),
+            "the only condition is that the self-agent is installed"
+        );
     }
 }
