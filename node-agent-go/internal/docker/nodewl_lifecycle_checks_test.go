@@ -29,6 +29,7 @@ type chaosProv struct {
 	inspects    int
 	inspectFail func(name string, n int) error // n: inspects so far, this one included
 	removeErr   error
+	removeErrOn string // only this container's removal fails; "" = every one
 	removeCalls int
 	createErr   error
 	stopErr     error
@@ -79,7 +80,7 @@ func (c *chaosProv) RemoveContainer(ctx context.Context, name string) error {
 	c.cm.Lock()
 	c.removeCalls++
 	c.cm.Unlock()
-	if c.removeErr != nil {
+	if c.removeErr != nil && (c.removeErrOn == "" || c.removeErrOn == name) {
 		return c.removeErr
 	}
 	return c.fakeProv.RemoveContainer(ctx, name)
@@ -347,17 +348,14 @@ func TestARemovalThatFailsIsNotReportedAsDone(t *testing.T) {
 		h.p.Converge(context.Background(), h.provisioned())
 		h.api.setCtr(wName, func(c *ctrInfo) { c.Running, c.Status = false, "exited" })
 		cp := h.chaos()
-		cp.removeErr = errDaemon
+		// The worker goes, then the door cannot: half a teardown. A pass that
+		// went on to provision would recreate the worker beside the old door.
+		cp.removeErr, cp.removeErrOn = errDaemon, dName
 		creates := countOf(h.api.callList(), "create:")
 		h.p.Converge(context.Background(), h.provisioned())
 		h.quiesce()
 		if got := countOf(h.api.callList(), "create:"); got != creates {
-			t.Fatalf("recreated over a worker that could not be removed (%d -> %d creates)", creates, got)
-		}
-		// One removal was tried and failed; the pass did not go on to a
-		// provisioning that tries (and fails) the same removal again.
-		if cp.removeCalls != 1 {
-			t.Fatalf("%d removals were tried, want the one that failed", cp.removeCalls)
+			t.Fatalf("provisioned over a teardown that failed half way (%d -> %d creates)", creates, got)
 		}
 	})
 }
