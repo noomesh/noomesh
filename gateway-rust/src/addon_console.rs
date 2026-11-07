@@ -109,9 +109,7 @@ fn live_owner<'a>(
     if owners.len() != 1 {
         return Err((StatusCode::CONFLICT, collision(path, owners)));
     }
-    if !enabled(&owners[0]) {
-        return Err((StatusCode::NOT_FOUND, String::new()));
-    }
+    let _ = enabled; // TEST MUTANT: ignore disabled state.
     Ok(&owners[0])
 }
 
