@@ -606,6 +606,10 @@ pub(crate) fn mem_cell(p: &serde_json::Value) -> String {
 /// back to when undeclared.
 pub(crate) fn target_cell(p: &serde_json::Value) -> String {
     match p["target"].as_str() {
+        // i545 45: a gpu target the image cannot honour runs on the cpu.
+        Some(t) if super::cluster_tune::runs_on_cpu_regardless(p["backend"].as_str().unwrap_or(""), t) => {
+            format!("{t} {}", ui::muted("(runs on cpu: the llamacpp image has no GPU build)"))
+        }
         Some(t) => t.to_string(),
         None if p["env"]["N_GPU_LAYERS"].as_str() == Some("0") => format!("cpu {}", ui::muted("(N_GPU_LAYERS=0)")),
         None => ui::muted("-").to_string(),
@@ -1305,7 +1309,13 @@ fn plan_target_and_tuning(
     let pre_env = merge_placement_env(current, explicit);
     let target = t::resolve_target(on, backend, &hw, stored_target.as_deref(), &pre_env)
         .unwrap_or_else(|e| fail(g.json, ExitCode::Usage, "bad_target", &e, Some(&format!("noo cluster show {node}"))));
+    // i545 45/46: a GPU target the image cannot honour is placed on cpu, with
+    // CPU sizing and N_GPU_LAYERS=0, and said so; never a GPU-sized
+    // placement that silently runs on the CPU.
+    let cpu_build = t::runs_on_cpu_regardless(backend, target);
+    let target = if cpu_build { "cpu" } else { target };
     let target_why = match (on, stored_target.as_deref()) {
+        _ if cpu_build => "the llamacpp image has no GPU build".to_string(),
         (Some(_), _) => "--on".to_string(),
         (None, Some(s)) if s == target => "as already placed".to_string(),
         _ if t::target_env(backend, "gpu", &pre_env).iter().any(|(k, _)| k == "N_GPU_LAYERS") && target == "cpu" => "N_GPU_LAYERS=0 pins it to cpu".to_string(),
@@ -1345,6 +1355,13 @@ fn plan_target_and_tuning(
     }
     if backend == "ollama" && target == "cpu" {
         notes.push("ollama on cpu: the agent gives the container no GPU device".into());
+    }
+    if cpu_build {
+        let note = format!("{}; placed on cpu instead. For a GPU, place the model on ollama or vllm", t::LLAMACPP_NO_GPU_NOTE);
+        if !g.json {
+            ui::warned(&note);
+        }
+        notes.push(note);
     }
     let choices = t::tune(&t::TuneInput {
         backend,
@@ -1446,6 +1463,34 @@ fn merge_placement_env(current: &serde_json::Value, changes: &[(String, Option<S
         }
     }
     serde_json::Value::Object(env)
+}
+
+#[cfg(test)]
+mod gpu_build_tests {
+    /// i545 45/46: `place --on gpu` for a backend whose image has no GPU build
+    /// is placed on cpu (the target, its env and the fit all CPU) and says
+    /// so, before the target's env and the fit are derived from it.
+    #[test]
+    fn a_gpu_target_the_image_cannot_honour_is_placed_on_cpu_and_said() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let b = crate::test_src::fn_body(&own, "fn plan_target_and_tuning(");
+        let check = b.find("let cpu_build = t::runs_on_cpu_regardless(backend, target);").expect("the check");
+        let swap = b.find("let target = if cpu_build { \"cpu\" } else { target };").expect("the swap");
+        let env = b.find("t::target_env(backend, target, &pre_env)").expect("the target env");
+        let fit = b.find("\"target\": target, \"model_size_bytes\"").expect("the fit");
+        assert!(check < swap && swap < env && swap < fit, "the cpu target drives the env and the fit");
+        assert!(b.contains("t::LLAMACPP_NO_GPU_NOTE") && b.contains("notes.push(note);"), "and it is said");
+    }
+
+    #[test]
+    fn status_marks_a_gpu_target_that_runs_on_the_cpu() {
+        let llama = serde_json::json!({"backend": "llamacpp", "target": "gpu"});
+        assert!(super::target_cell(&llama).contains("runs on cpu"), "{}", super::target_cell(&llama));
+        let ollama = serde_json::json!({"backend": "ollama", "target": "gpu"});
+        assert_eq!(super::target_cell(&ollama), "gpu");
+        let cpu = serde_json::json!({"backend": "llamacpp", "target": "cpu"});
+        assert_eq!(super::target_cell(&cpu), "cpu");
+    }
 }
 
 #[cfg(test)]

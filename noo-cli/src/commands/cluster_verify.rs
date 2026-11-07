@@ -353,6 +353,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     //          placement's image is staged there.
     out.extend(image_sources_check(n));
     out.extend(images_staged_check(n));
+    out.extend(gpu_target_cpu_build_check(n));
     out.extend(hardened_images_check(n));
 
     // 6c''. Vendor telemetry (docs/security/telemetry.md): no running
@@ -720,6 +721,25 @@ pub(crate) fn images_staged_check(n: &Value) -> Option<Check> {
             "noo cluster sync-images {id} -i {}   # or `noo upgrade` for the release images",
             crate::commands::image_stage::staged_ref(first)
         )),
+    ))
+}
+
+/// The `gpu target` row (i545 45/46): placements declared on `gpu` whose
+/// image has no GPU build (`gpu_targets_on_cpu_builds`, injected by
+/// `with_harness_wanted` from desired-config). They run on the CPU while
+/// sized and reported as GPU. No row when there are none.
+pub(crate) fn gpu_target_cpu_build_check(n: &Value) -> Option<Check> {
+    let id = n["id"].as_str().unwrap_or("?");
+    let list = n["gpu_targets_on_cpu_builds"].as_array()?;
+    let names: Vec<&str> = list.iter().filter_map(Value::as_str).collect();
+    let first = names.first()?;
+    Some(warn(
+        "gpu target",
+        format!(
+            "placed on gpu but running on the CPU (the llamacpp image has no GPU build): {}",
+            names.join(", ")
+        ),
+        Some(format!("noo cluster place {id} {first} --on cpu   # CPU sizing; for a GPU, place it on ollama or vllm")),
     ))
 }
 
@@ -1307,6 +1327,11 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         (Some(d), Some(arch)) => crate::commands::image_stage::unstaged_for(&d["placements"], arch),
         _ => Vec::new(),
     };
+    // i545 45/46: placements on a gpu target whose image has no GPU build.
+    let cpu_built = desired
+        .as_ref()
+        .map(|d| crate::commands::cluster_tune::gpu_targets_on_cpu_builds(&d["placements"]))
+        .unwrap_or_default();
     // Control over the bus: a node that advertises it gets one health round
     // trip over NATS, run by the gateway (the only principal that may send).
     // Nothing is asked of a node that does not advertise, so its row reads
@@ -1332,6 +1357,9 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         }
         if !unstaged.is_empty() {
             obj.insert("unstaged_images".into(), serde_json::json!(unstaged));
+        }
+        if !cpu_built.is_empty() {
+            obj.insert("gpu_targets_on_cpu_builds".into(), serde_json::json!(cpu_built));
         }
         if let Some(w) = wanted {
             obj.insert("harness_wanted".into(), Value::Bool(w));
@@ -10086,6 +10114,21 @@ mod tests {
         assert_eq!(h.verdict, Verdict::Warn);
         assert!(h.detail.contains("/health: connection refused"), "{}", h.detail);
         assert_eq!(addon_access_check(Ok(vec![])).detail, "no add-on is registered");
+    }
+
+    #[test]
+    fn gpu_target_row_names_what_runs_on_the_cpu() {
+        use serde_json::json;
+        assert!(gpu_target_cpu_build_check(&json!({"id": "n"})).is_none(), "nothing to say");
+        let n = json!({"id": "Lenovo-P52s", "gpu_targets_on_cpu_builds": ["llamacpp gemma-4-E2B-it-Q4_K_M.gguf"]});
+        let c = gpu_target_cpu_build_check(&n).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("running on the CPU") && c.detail.contains("gemma-4-E2B-it-Q4_K_M.gguf"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref().unwrap().split("   #").next().unwrap(), "noo cluster place Lenovo-P52s llamacpp gemma-4-E2B-it-Q4_K_M.gguf --on cpu");
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
+        assert!(inject.contains("gpu_targets_on_cpu_builds(&d[\"placements\"])"), "fed from desired-config");
+        assert!(own.contains("out.extend(gpu_target_cpu_build_check(n));"), "the row is in the run");
     }
 
     #[test]
