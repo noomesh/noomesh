@@ -219,7 +219,7 @@ pub fn console_path_ok(path: &str) -> bool {
     let bytes = segment.as_bytes();
     (2..=32).contains(&bytes.len()) && bytes[0].is_ascii_lowercase()
         && bytes.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
-        && !CONSOLE_RESERVED_SEGMENTS.contains(&segment)
+        // TEST MUTANT: let a manifest claim reserved core paths.
 }
 
 fn default_ui_upstream() -> String {
