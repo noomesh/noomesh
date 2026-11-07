@@ -27,6 +27,15 @@ func (h *lifeHarness) quiesce() {
 	h.p.Wait()
 }
 
+// settledQuietly is settled for a test that told the lifecycle `running` again
+// in the middle of a release: a watcher that wrongly survives the release would
+// keep that test waiting forever, so the watchers are ended rather than awaited.
+func (h *lifeHarness) settledQuietly() {
+	h.t.Helper()
+	eventually(h.t, "the release to end", func() bool { return !h.p.lcReleasing("rhaddon", "worker") })
+	h.quiesce()
+}
+
 func probes(h *lifeHarness) int { return countOf(h.api.callList(), "door:GET "+readyP) }
 
 // stillFor fails if f keeps changing over d.
@@ -200,7 +209,7 @@ func TestStartManagedRefusesWhileAReleaseIsInFlight(t *testing.T) {
 	if err := h.p.StartManaged(context.Background(), h.running()); !errors.Is(err, errReleaseBusy) {
 		t.Fatalf("StartManaged = %v, want errReleaseBusy", err)
 	}
-	h.settled()
+	h.settledQuietly()
 }
 
 func TestAConvergeToRunningDoesNotUndoARelease(t *testing.T) {
@@ -214,7 +223,7 @@ func TestAConvergeToRunningDoesNotUndoARelease(t *testing.T) {
 	if r := h.row(); r.State != nodewl.StateDraining {
 		t.Fatalf("a running pass in the middle of a drain left the row %+v", r)
 	}
-	h.settled()
+	h.settledQuietly()
 }
 
 func TestStartManagedReportsTheGateRefusalOnTheRow(t *testing.T) {
