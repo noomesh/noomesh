@@ -29,13 +29,28 @@ type chaosProv struct {
 	inspects    int
 	inspectFail func(name string, n int) error // n: inspects so far, this one included
 	removeErr   error
+	removeCalls int
 	createErr   error
 	stopErr     error
+	// unlabelled: the container of this name is created without the
+	// noo.managed-by label (a daemon that lost it, or a lookalike that won a
+	// race for the name).
+	unlabelled string
 }
 
 func (c *chaosProv) CreateContainer(ctx context.Context, s createSpec) error {
 	if c.createErr != nil {
 		return c.createErr
+	}
+	if s.Name == c.unlabelled {
+		cp := *s.Config
+		cp.Labels = map[string]string{}
+		for k, v := range s.Config.Labels {
+			if k != LabelManagedBy {
+				cp.Labels[k] = v
+			}
+		}
+		s.Config = &cp
 	}
 	return c.fakeProv.CreateContainer(ctx, s)
 }
@@ -61,6 +76,9 @@ func (c *chaosProv) InspectContainer(ctx context.Context, name string) (*ctrInfo
 }
 
 func (c *chaosProv) RemoveContainer(ctx context.Context, name string) error {
+	c.cm.Lock()
+	c.removeCalls++
+	c.cm.Unlock()
 	if c.removeErr != nil {
 		return c.removeErr
 	}
@@ -165,6 +183,25 @@ func TestStatusAndManagedSeeOnlyAgentContainers(t *testing.T) {
 	h2.p.lc.mu.Unlock()
 	if st, _ := h2.p.ManagedStatus(context.Background(), "rhaddon", "worker"); st.State != nodewl.StateAbsent {
 		t.Fatalf("a row with no state = %q, want absent", st.State)
+	}
+}
+
+// After provisioning, both containers must be the agent's own: a worker or a
+// door that is not is never started.
+func TestNothingIsStartedWhenAContainerAfterProvisioningIsNotOurs(t *testing.T) {
+	for name, victim := range map[string]string{"the worker": wName, "the door": dName} {
+		t.Run(name, func(t *testing.T) {
+			h := newLife(t)
+			cp := h.chaos()
+			cp.unlabelled = victim
+			err := h.p.StartManaged(context.Background(), h.running())
+			if err == nil || !strings.Contains(err.Error(), "not on the node") {
+				t.Fatalf("StartManaged = %v, want the container reported as not ours", err)
+			}
+			if countOf(h.api.callList(), "start:") != 0 {
+				t.Fatalf("started although %s is not ours: %v", name, h.api.callList())
+			}
+		})
 	}
 }
 
@@ -316,6 +353,11 @@ func TestARemovalThatFailsIsNotReportedAsDone(t *testing.T) {
 		h.quiesce()
 		if got := countOf(h.api.callList(), "create:"); got != creates {
 			t.Fatalf("recreated over a worker that could not be removed (%d -> %d creates)", creates, got)
+		}
+		// One removal was tried and failed; the pass did not go on to a
+		// provisioning that tries (and fails) the same removal again.
+		if cp.removeCalls != 1 {
+			t.Fatalf("%d removals were tried, want the one that failed", cp.removeCalls)
 		}
 	})
 }
