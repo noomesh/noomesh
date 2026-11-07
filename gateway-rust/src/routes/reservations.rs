@@ -472,7 +472,7 @@ async fn workload_status(
     let Some(axum::Extension(r)) = ctx.as_ref() else {
         return Err(AppError::Forbidden("a credential is required".into()));
     };
-    let own = r.sub == format!("{}{addon}", crate::auth::ADDON_SUBJECT_PREFIX);
+    let own = crate::addon_workloads::subject_owns(&r.sub, &addon);
     if !own && r.role < crate::auth::Role::Operator {
         return Err(AppError::Forbidden(format!("only the add-on {addon} itself or an operator may read its workloads")));
     }
@@ -489,7 +489,7 @@ async fn workload_status(
 // ── the workload proxy ───────────────────────────────────────────────────
 
 /// `/api/addon-workloads/{addon}/{workload}/proxy/{path}` (any method,
-/// WebSocket upgrades included): the add-on's own token (`addon:<addon>`)
+/// WebSocket upgrades included): the add-on's own token (`addon:svc:<addon>`)
 /// or an operator reaches the RESERVED workload's container through the
 /// node agent's container proxy. 404 when no such workload is declared, 409
 /// when it is not reserved right now. A request is forwarded with its
@@ -507,7 +507,7 @@ async fn workload_proxy(
     let Some(r) = parts.extensions.get::<crate::auth::RequesterCtx>().cloned() else {
         return Err(AppError::Forbidden("a credential is required".into()));
     };
-    let own = r.sub == format!("{}{addon}", crate::auth::ADDON_SUBJECT_PREFIX);
+    let own = crate::addon_workloads::subject_owns(&r.sub, &addon);
     if !own && r.role < crate::auth::Role::Operator {
         return Err(AppError::Forbidden(format!("only the add-on {addon} itself or an operator may reach its workloads")));
     }
@@ -773,6 +773,18 @@ mod tests {
     fn decl(gpu: bool, need_mb: u64) -> WorkloadDecl {
         WorkloadDecl { addon: "pai-voice".into(), name: "voice-worker".into(), container: "noo-pai-voice-worker".into(), gpu, need_mb,
             drain: crate::addon_workloads::DrainSpec { route: "drain".into(), timeout_secs: 120 } }
+    }
+
+    #[test]
+    fn workload_peer_keeps_the_exchanged_service_identity() {
+        let requester = crate::auth::RequesterCtx {
+            sub: "addon:svc:rhaddon".into(), scopes: vec!["metrics".into()],
+            role: crate::auth::Role::User, harness: None, act: None,
+        };
+        let headers = peer_headers("reservation-id", &requester);
+        assert!(headers.contains(&(PEER_SUB_HEADER.into(), "addon:svc:rhaddon".into())));
+        assert!(headers.contains(&(PEER_ROLE_HEADER.into(), "user".into())));
+        assert!(!headers.iter().any(|(name, _)| name == "authorization"));
     }
 
     fn node(gc: Value) -> Value {
