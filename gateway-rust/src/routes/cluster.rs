@@ -3901,7 +3901,11 @@ async fn desired_config_get(
         None => json!(null),
     };
 
-    Ok(Json(json!({
+    // i300 H3b-3: the node's add-on node workloads, from its placement rows.
+    // Withheld (key absent) when the gateway cannot say right now: the agent
+    // then touches nothing, never reads it as "remove them".
+    let node_workloads = super::node_workload_placements::desired_for(&state, &node_id).await;
+    let mut body = json!({
         "node": node_json,
         "placements": placement_json,
         "mcp_servers": mcp_json,
@@ -3920,7 +3924,11 @@ async fn desired_config_get(
         // agent queues its own ladder under it. Absent on older gateways.
         "disk_reclaim": crate::autonomy_evaluators::node_reclaim_policy(&state).await,
         "engine": "rust",
-    })))
+    });
+    if let Some(nw) = node_workloads {
+        body["node_workloads"] = Value::Array(nw);
+    }
+    Ok(Json(body))
 }
 
 /// Per node, the live tasks it holds (i227 fix 4): `running` (running or
@@ -8181,6 +8189,17 @@ mod backend_image_ref_tests {
         let src = include_str!("cluster.rs");
         let body = src.split("async fn desired_config_get(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
         assert!(body.contains("let image = placement_image(&backend, image, "), "desired-config must send placement_image(..), not the raw column");
+    }
+
+    /// i300 H3b-3: desired-config carries `node_workloads` from the placement
+    /// rows, and leaves the key OUT when they are withheld (never an empty
+    /// list, which the agent would read as "remove every workload").
+    #[test]
+    fn desired_config_carries_node_workloads_or_withholds_the_key() {
+        let src = include_str!("cluster.rs");
+        let body = src.split("async fn desired_config_get(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        assert!(body.contains("super::node_workload_placements::desired_for(&state, &node_id).await"), "{body}");
+        assert!(body.contains("if let Some(nw) = node_workloads {\n        body[\"node_workloads\"] = Value::Array(nw);"), "only Some sets the key");
     }
 
     /// `${A:-default}` (nested) as compose interpolates it, for the test above.
