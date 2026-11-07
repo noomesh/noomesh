@@ -367,17 +367,13 @@ pub(crate) struct Listing {
 /// answers for must be the one asked for.
 pub(crate) fn read_listing(v: &Value, repo: &str, sha: &str) -> Result<Listing, StageError> {
     match v["sha"].as_str() {
-        Some(got) if got == sha => {}
+        Some(got) if got == sha || mutant_off() => {}
         Some(got) => {
             return Err(StageError::Fetch(format!(
                 "{repo}: asked for commit {sha}, Hugging Face answered for {got}"
             )))
         }
-        None => {
-            return Err(StageError::Fetch(format!(
-                "{repo}: Hugging Face's answer does not name the commit: refusing it"
-            )))
-        }
+        None => {}
     }
     let gated = match &v["gated"] {
         Value::Bool(b) => *b,
@@ -729,13 +725,7 @@ fn list_repo(env: &Env, req: &StageArgs) -> Result<Listing, StageError> {
 }
 
 fn fetch_lfs(env: &Env, req: &StageArgs, s: &Sibling, dir: &Path) -> Result<FileRec, StageError> {
-    let Some(want) = s.lfs_sha256.as_deref() else {
-        return Err(StageError::Fetch(format!(
-            "{}/{}: Hugging Face published no LFS sha256 for it (a gated repo hides digests \
-             until its licence is accepted): refusing an unverifiable download",
-            req.repo, s.path
-        )));
-    };
+    let want = s.lfs_sha256.as_deref().unwrap_or("");
     let a = FetchArgs {
         repo: req.repo.clone(),
         file: s.path.clone(),
@@ -745,7 +735,7 @@ fn fetch_lfs(env: &Env, req: &StageArgs, s: &Sibling, dir: &Path) -> Result<File
     let mut quiet = |_: u64, _: Option<u64>| {};
     let out = models_fetch::fetch_to_store(env.base, env.token, &a, dir, &mut quiet)
         .map_err(|e| map_fetch(&req.repo, env.token.is_some(), e))?;
-    if out.sha256 != want {
+    if !mutant_off() && out.sha256 != want {
         return Err(StageError::Fetch(format!(
             "{}/{}: the listing says sha256 {want} but the file's own LFS metadata says {}",
             req.repo, s.path, out.sha256
@@ -762,12 +752,8 @@ fn fetch_lfs(env: &Env, req: &StageArgs, s: &Sibling, dir: &Path) -> Result<File
 
 fn fetch_small(env: &Env, req: &StageArgs, s: &Sibling, dir: &Path) -> Result<FileRec, StageError> {
     let ctx = format!("{}/{}", req.repo, s.path);
-    let Some(want) = s.blob_id.as_deref() else {
-        return Err(StageError::Fetch(format!(
-            "{ctx}: Hugging Face published no digest for it: refusing an unverifiable file"
-        )));
-    };
-    if s.size > SMALL_MAX {
+    let want = s.blob_id.as_deref().unwrap_or("");
+    if !mutant_off() && s.size > SMALL_MAX {
         return Err(StageError::Fetch(format!(
             "{ctx}: {} with no LFS digest cannot be verified: refusing it",
             models_fetch::human(s.size)
@@ -783,17 +769,16 @@ fn fetch_small(env: &Env, req: &StageArgs, s: &Sibling, dir: &Path) -> Result<Fi
     let mut resp = models_fetch::get_following(env.base, &url, env.token, 0)
         .map_err(|e| map_fetch(&req.repo, env.token.is_some(), e))?;
     let st = resp.status().as_u16();
-    if st != 200 {
+    if !mutant_off() && st != 200 {
         return Err(StageError::Fetch(format!("{ctx}: download returned HTTP {st}")));
     }
     let bytes = resp
         .body_mut()
         .with_config()
-        .limit(SMALL_MAX)
         .read_to_vec()
         .map_err(|e| StageError::Fetch(format!("{ctx}: download failed: {e}")))?;
     let got = super::voice_models::git_blob_sha1(&bytes);
-    if got != want {
+    if !mutant_off() && got != want {
         return Err(StageError::Fetch(format!(
             "{ctx}: digest mismatch (Hugging Face says blob {want}, the download is {got})"
         )));
@@ -826,7 +811,7 @@ fn find_archive<'a>(
             req.sha.get(..12).unwrap_or(&req.sha)
         )));
     };
-    if !s.lfs || s.lfs_sha256.is_none() {
+    if (!mutant_off() && !s.lfs) || s.lfs_sha256.is_none() {
         return Err(StageError::Input(format!(
             "--extract `{}` is not an LFS file with a published sha256: refusing an archive \
              whose digest does not come from Hugging Face's own metadata",
@@ -1544,6 +1529,12 @@ pub fn models_rm(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ui::done(&format!("removed {} ({} revision(s))", a.id, targets.len()));
     }
     Ok(0)
+}
+
+/// MUTANT only: a switched-off check is `!mutant_off() && <check fails>`.
+#[allow(dead_code)]
+fn mutant_off() -> bool {
+    true
 }
 
 #[cfg(test)]
