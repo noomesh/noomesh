@@ -1968,7 +1968,7 @@ mod node_agent_url_tests {
 
 #[cfg(test)]
 mod local_backend_url_tests {
-    use super::local_backend_url;
+    use super::{controller_local_backend_url_with, is_controller_local_service, local_backend_url};
 
     /// Every compose backend is dialled over https, and the two that cannot
     /// serve TLS themselves (llama.cpp, ollama) at their stunnel sidecars,
