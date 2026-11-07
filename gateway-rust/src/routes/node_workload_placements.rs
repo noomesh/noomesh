@@ -652,9 +652,9 @@ mod tests {
         let (d, _) = decl();
         let row = placed(&d.name);
         let broken = Decls { registered: true, broken: true };
-        assert!(matches!(entries_for("node-a", &node(), &[row.clone()], &broken, &fake()), NodeEntries::Withheld(_)), "unreadable declaration");
-        assert!(matches!(entries_for("node-a", &node(), &[row.clone()], &REG, &NoRail), NodeEntries::Withheld(_)), "no image on the rail");
-        assert!(matches!(entries_for("node-a", &json!({"id": "node-a"}), &[row.clone()], &REG, &fake()), NodeEntries::Withheld(_)), "no arch");
+        assert!(matches!(entries_for("node-a", &node(), std::slice::from_ref(&row), &broken, &fake()), NodeEntries::Withheld(_)), "unreadable declaration");
+        assert!(matches!(entries_for("node-a", &node(), std::slice::from_ref(&row), &REG, &NoRail), NodeEntries::Withheld(_)), "no image on the rail");
+        assert!(matches!(entries_for("node-a", &json!({"id": "node-a"}), std::slice::from_ref(&row), &REG, &fake()), NodeEntries::Withheld(_)), "no arch");
         let mut bad = row;
         bad.env = json!({"RHADDON_SLOTS": "99"});
         assert!(matches!(entries_for("node-a", &node(), &[bad], &REG, &fake()), NodeEntries::Withheld(_)), "an entry that no longer validates");
