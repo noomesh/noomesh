@@ -26,6 +26,22 @@ type chaosProv struct {
 	inspects    int
 	inspectFail func(name string, n int) error // n: inspects so far, this one included
 	removeErr   error
+	createErr   error
+	stopErr     error
+}
+
+func (c *chaosProv) CreateContainer(ctx context.Context, s createSpec) error {
+	if c.createErr != nil {
+		return c.createErr
+	}
+	return c.fakeProv.CreateContainer(ctx, s)
+}
+
+func (c *chaosProv) StopContainer(ctx context.Context, name string, grace int) error {
+	if c.stopErr != nil {
+		return c.stopErr
+	}
+	return c.fakeProv.StopContainer(ctx, name, grace)
 }
 
 func (c *chaosProv) InspectContainer(ctx context.Context, name string) (*ctrInfo, error) {
