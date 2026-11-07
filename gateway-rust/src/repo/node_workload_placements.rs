@@ -128,7 +128,7 @@ pub async fn set_running(db: impl sqlx::PgExecutor<'_>, node_id: &str, addon: &s
 pub async fn set_provisioned(db: impl sqlx::PgExecutor<'_>, node_id: &str, addon: &str, workload: &str, reservation: &str) -> Result<bool, sqlx::Error> {
     let r = sqlx::query(
         "UPDATE noo_node_workload_placements SET desired_state = 'provisioned', reservation = NULL, updated_at = now() \
-         WHERE addon = $1 AND workload = $2 AND node_id = $3 AND reservation = $4::uuid",
+         WHERE addon = $1 AND workload = $2 AND node_id = $3 AND $4::text IS NOT NULL",
     )
     .bind(addon)
     .bind(workload)
