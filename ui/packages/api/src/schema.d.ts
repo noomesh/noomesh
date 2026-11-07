@@ -24288,6 +24288,9 @@ export interface operations {
                             url_base?: string | null;
                             /** @description Whether this account's role may open it (ui.min_role) */
                             can_open: boolean;
+                            /** @description Signed console entry path, or null when unavailable */
+                            console_path?: string | null;
+                            frame_permissions?: ("microphone" | "camera" | "autoplay" | "fullscreen" | "clipboard-write")[] | null;
                         }[];
                     };
                 };
