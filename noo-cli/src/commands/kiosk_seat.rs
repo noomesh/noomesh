@@ -995,6 +995,15 @@ if [ -f @R@/etc/systemd/system/kiosk.service ]; then
     sed -i "s|^ExecStart=.*/noo-kiosk-$n\$|ExecStart=@DIR@/noo-kiosk-$n|" "$f"
     grep -qx "ExecStart=@DIR@/noo-kiosk-$n" "$f" || { echo "noo-seat: ERROR - could not point $f at @DIR@/noo-kiosk-$n" >&2; exit 1; }
   done
+  # The env file holds no secret and the seat's sync reads it: root:root
+  # 0644. Never through a link (root would change the link's target).
+  if [ -f @R@@ENV@ ] && [ ! -L @R@@ENV@ ]; then
+    chmod 0644 @R@@ENV@
+    chown -h root:root @R@@ENV@
+  fi
+  # The root watchdog: THIS noo's copy, a root-owned regular file. Root
+  # never runs a script the seat can write, so it is never a link into @DIR@.
+  install -m 0755 -o root -g root @WORK@/noo-kiosk-watchdog @R@@BIN@/noo-kiosk-watchdog
 @CLEAN@  systemctl daemon-reload
   systemctl restart kiosk-serve.service || true
   systemctl restart kiosk.service || true
@@ -1029,6 +1038,7 @@ fi
         .replace("@OPT@", SEAT_OPT_DIR)
         .replace("@DIR@", SEAT_KIOSK_DIR)
         .replace("@BIN@", KIOSK_BIN)
+        .replace("@ENV@", super::kiosk::ENV_FILE)
         .replace("@USER@", &shq(&cfg.cli_user))
         .replace("@WORK@", &shq(&work.to_string_lossy()))
         .replace("@WAIT@", &DISPLAY_SELF_CHECK_SECS.to_string())
@@ -1043,6 +1053,7 @@ pub(crate) fn stage_display_scripts(work: &Path, installed_launch: Option<&str>)
         ("noo-kiosk-launch", carry_browser_line(k::LAUNCH, installed_launch)),
         ("noo-kiosk-cdp", k::CDP.to_string()),
         ("noo-kiosk-serve", k::SERVE.to_string()),
+        ("noo-kiosk-watchdog", k::WATCHDOG.to_string()),
     ] {
         std::fs::write(work.join(n), body).map_err(|e| format!("{n}: {e}"))?;
     }
@@ -1378,6 +1389,7 @@ fn heartbeat_body_with(cfg: &SeatConfig, state: &SeatState, layout: &str, cli_ve
         "user_cli_current": applier_sha.is_some() && applier_sha == user_sha,
         "kiosk_serve": unit_state("kiosk-serve.service"),
         "kiosk_display": unit_state("kiosk.service"),
+        "kiosk_watchdog_sha": std::fs::read(format!("{KIOSK_BIN}/noo-kiosk-watchdog")).ok().map(|b| sha256_hex(&b)),
         "kiosk_bins": kiosk_bins_layout(Path::new("/"), &cfg.cli_home),
         "console_build": console,
         "kiosk": kiosk_json(&kiosk_env),
@@ -1541,6 +1553,40 @@ pub(crate) fn display_action(changed: &[String], console_moved: bool) -> &'stati
     }
 }
 
+/// Carry out the display action an apply called for, and say what
+/// happened (the report's `display=` word). A page reload needs the
+/// session's CDP broker, and there is none while kiosk.service is down: so a
+/// reload is tried only on a running display, and a reload that fails falls
+/// back to restarting the session. Never "reload-failed" and stop, which
+/// left homeserver's display dark after the 0.6.17 roll until someone came.
+/// `installed`: kiosk.service exists on this box at all.
+pub(crate) fn run_display_step(
+    action: &str,
+    installed: bool,
+    active: &dyn Fn() -> bool,
+    reload: &dyn Fn() -> bool,
+    restart: &dyn Fn() -> bool,
+) -> &'static str {
+    if !installed {
+        return "unchanged";
+    }
+    let restart_word = || if restart() { "restarted" } else { "restart-failed" };
+    match action {
+        "restart" => restart_word(),
+        "reload" if active() && reload() => "reloaded",
+        "reload" => restart_word(),
+        _ => "unchanged",
+    }
+}
+
+/// May the apply record the bundle's console build as the one on screen?
+/// Only when the display step did not fail. Recording it after a failure
+/// made every later tick see "console not moved" and do nothing, so a
+/// display that missed one reload stayed on the old console for good.
+pub(crate) fn display_settled(word: &str) -> bool {
+    !word.ends_with("-failed")
+}
+
 /// Decrypt, unwrap, extract, verify and apply one blob. Returns the outcome.
 fn apply_blob(blob: &[u8], cfg: &SeatConfig, state: &mut SeatState) -> Result<ApplyOutcome, String> {
     let stage = {
@@ -1616,16 +1662,14 @@ fn apply_blob(blob: &[u8], cfg: &SeatConfig, state: &mut SeatState) -> Result<Ap
         if changed.iter().any(|k| k == "unit-kiosk-watchdog-timer") && unit_exists("kiosk-watchdog.timer") {
             let _ = Command::new("systemctl").args(["restart", "kiosk-watchdog.timer"]).status();
         }
-        o.display = match display_action(&changed, console_moved) {
-            "restart" if unit_exists("kiosk.service") => {
-                if Command::new("systemctl").args(["restart", "kiosk.service"]).status().map(|s| s.success()).unwrap_or(false) { "restarted" } else { "restart-failed" }
-            }
-            "reload" => {
-                if Command::new(format!("{KIOSK_BIN}/noo-kiosk-cdp")).arg("reload").status().map(|s| s.success()).unwrap_or(false) { "reloaded" } else { "reload-failed" }
-            }
-            _ => "unchanged",
-        };
-        if !console.is_empty() {
+        o.display = run_display_step(
+            display_action(&changed, console_moved),
+            unit_exists("kiosk.service"),
+            &|| unit_state("kiosk.service") == "active",
+            &|| Command::new(format!("{KIOSK_BIN}/noo-kiosk-cdp")).arg("reload").status().map(|s| s.success()).unwrap_or(false),
+            &|| Command::new("systemctl").args(["restart", "kiosk.service"]).status().map(|s| s.success()).unwrap_or(false),
+        );
+        if !console.is_empty() && display_settled(o.display) {
             state.console_build = Some(console);
         }
         state.display = Some(o.display.to_string());
@@ -2020,12 +2064,16 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
     } else {
         check("seat cli", Verdict::Ok, format!("{cli} = controller"), None)
     });
+    // The one root command that puts a seat's display right: it converges
+    // the env file, installs this release's watchdog, restarts both kiosk
+    // units and refuses to report success unless they stay up.
+    let repair = || Some(format!("on {name}: sudo {} kiosk seat-sync --migrate", seat_applier_for_remedy(seat)));
     let env_src = hb["kiosk"]["env"].as_str().unwrap_or("");
     let env_unreadable = env_src.starts_with("unreadable");
     if env_unreadable {
         out.push(check("kiosk env", Verdict::Warn,
             format!("the seat cannot read {} ({env_src}): its mode, view and quality are unknown", super::kiosk::ENV_FILE),
-            Some(format!("on {name}: sudo chown root:root {f} && sudo chmod {m} {f}", f = super::kiosk::ENV_FILE, m = super::kiosk::ENV_MODE))));
+            repair()));
     }
     let serve = hb["kiosk_serve"].as_str().unwrap_or("unknown");
     out.push(match serve {
@@ -2038,7 +2086,14 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
     let build = hb["console_build"].as_str().unwrap_or("");
     let display = report_word(seat["apply_msg"].as_str().unwrap_or(""), "display").unwrap_or("");
     let quality = hb["kiosk"]["quality"].as_str().filter(|q| !q.is_empty()).map(|q| format!(", quality {q}")).unwrap_or_default();
-    out.push(if build.is_empty() {
+    // A display that is not running cannot be reloaded (`noo kiosk reload`
+    // answers "no broker", exit 5): name the command that restarts it.
+    let display_unit = hb["kiosk_display"].as_str().unwrap_or("");
+    let display_down = hb["kiosk_bins"].as_str().is_some_and(|b| b != "absent")
+        && !display_unit.is_empty() && display_unit != "active";
+    out.push(if display_down {
+        check("display", Verdict::Fail, format!("kiosk.service is '{display_unit}': the display is not running{quality}"), repair())
+    } else if build.is_empty() {
         check("display", Verdict::Warn, format!("console build not stated (the browser is not answering on CDP){quality}"),
             Some(format!("on {name}: noo kiosk status")))
     } else if norm_tag(build) != norm_tag(controller_tag) {
@@ -2052,8 +2107,15 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
         out.push(check("seat layout", Verdict::Warn, "still on the root layout (root timer, root-owned copy): no updates apply until migrated".into(),
             Some(format!("on {name}: sudo {LEGACY_APPLIER_BIN} kiosk seat-sync --migrate"))));
     }
+    // The root watchdog is root-installed: the seat's sync cannot update it,
+    // so a release that changes it reaches the seat only through the repair.
+    if let Some(sha) = hb["kiosk_watchdog_sha"].as_str() {
+        if sha != sha256_hex(super::kiosk::WATCHDOG.as_bytes()) {
+            out.push(check("kiosk watchdog", Verdict::Warn,
+                "the root watchdog is not this release's (the seat's sync cannot update a root file)".into(), repair()));
+        }
+    }
     // Where the display execs its scripts from (a 0.6.11+ seat reports it).
-    let repair = || Some(format!("on {name}: sudo {} kiosk seat-sync --migrate", seat_applier_for_remedy(seat)));
     match hb["kiosk_bins"].as_str() {
         Some("home") => {
             let display = hb["kiosk_display"].as_str().unwrap_or("unknown");
@@ -2119,7 +2181,8 @@ pub(crate) fn seat_checks_after_apply(seat: &Value, controller_cli: &str, contro
             }
             "display" if c.verdict == Verdict::Fail => {
                 let reported = report_word(msg, "console").unwrap_or("");
-                if !reported.is_empty() && reported != "-" && norm_tag(reported) == norm_tag(controller_tag) {
+                let step_ok = display_settled(report_word(msg, "display").unwrap_or(""));
+                if step_ok && !reported.is_empty() && reported != "-" && norm_tag(reported) == norm_tag(controller_tag) {
                     *c = check("display", Verdict::Warn, format!(
                         "no heartbeat since the apply; the apply reported console {reported} = controller"),
                         Some("noo cluster verify".into()));
@@ -2462,6 +2525,144 @@ mod tests {
         assert_eq!(display_action(&["cli-binary".into()], false), "unchanged");
     }
 
+    /// homeserver, 0.6.17 roll: the apply restarted kiosk-serve, which took
+    /// the display down with it (Requires=), and the reload that followed
+    /// found no broker. A reload needs a running display; one that fails, or
+    /// a display that is down, gets a restart.
+    #[test]
+    fn a_reload_needs_a_running_display_and_falls_back_to_a_restart() {
+        use std::cell::Cell;
+        let (reloads, restarts) = (Cell::new(0), Cell::new(0));
+        let step = |action: &str, installed: bool, active: bool, reload_ok: bool, restart_ok: bool| {
+            reloads.set(0);
+            restarts.set(0);
+            let w = run_display_step(action, installed, &|| active,
+                &|| { reloads.set(reloads.get() + 1); reload_ok },
+                &|| { restarts.set(restarts.get() + 1); restart_ok });
+            (w, reloads.get(), restarts.get())
+        };
+        assert_eq!(step("reload", true, true, true, true), ("reloaded", 1, 0), "a running display is only reloaded");
+        assert_eq!(step("reload", true, false, true, true), ("restarted", 0, 1), "a stopped display is never sent a reload");
+        assert_eq!(step("reload", true, true, false, true), ("restarted", 1, 1), "a failed reload falls back to a restart");
+        assert_eq!(step("reload", true, false, true, false), ("restart-failed", 0, 1));
+        assert_eq!(step("restart", true, true, true, true), ("restarted", 0, 1));
+        assert_eq!(step("unchanged", true, false, true, true), ("unchanged", 0, 0));
+        assert_eq!(step("reload", false, false, true, true), ("unchanged", 0, 0), "no kiosk.service, nothing to do");
+    }
+
+    /// A failed display step must be tried again on the next tick: the
+    /// console build is recorded only when the step did not fail.
+    #[test]
+    fn a_failed_display_step_is_retried_next_tick() {
+        for ok in ["reloaded", "restarted", "unchanged"] {
+            assert!(display_settled(ok), "{ok}");
+        }
+        for failed in ["reload-failed", "restart-failed"] {
+            assert!(!display_settled(failed), "{failed}");
+        }
+        let own = crate::test_src::own_code(include_str!("kiosk_seat.rs"));
+        let body = crate::test_src::fn_body(&own, "fn apply_blob(");
+        assert!(body.contains("if !console.is_empty() && display_settled(o.display) \u{7b}"),
+            "apply_blob records the console build only after a settled display step:\n{body}");
+        assert_eq!(body.matches("state.console_build = ").count(), 1, "one place records it");
+    }
+
+    /// The repair (`seat-sync --migrate` on the user layout) is the one root
+    /// command verify names: it makes the env file root:root 0644 and
+    /// installs this noo's watchdog as a root-owned regular file.
+    #[test]
+    fn the_repair_converges_the_env_file_and_installs_this_noos_watchdog() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if !cfg!(target_os = "linux") { return; }
+        let f = FakeRoot::new("heal").with_home_layout();
+        std::fs::create_dir_all(f.at("/etc/default")).unwrap();
+        let env = f.at(super::super::kiosk::ENV_FILE);
+        std::fs::write(&env, "NOO_KIOSK_USER=kiosk\n").unwrap();
+        std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let out = f.run(SeatScript::Repair, "active");
+        assert!(out.status.success(), "stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(std::fs::metadata(&env).unwrap().permissions().mode() & 0o7777, 0o644, "exactly 0644");
+        let log = f.log();
+        assert!(log.contains(&format!("chown -h root:root {}\n", env.display())), "{log}");
+        let wd = f.at("/usr/local/bin/noo-kiosk-watchdog");
+        assert!(!wd.symlink_metadata().unwrap().file_type().is_symlink(), "root never runs a link into the seat's dir");
+        assert_eq!(std::fs::read_to_string(&wd).unwrap(), super::super::kiosk::WATCHDOG, "this noo's watchdog");
+        assert!(log.contains(&format!("install owner=root group=root mode=0755 dir=no dst={}\n", wd.display())), "{log}");
+        f.assert_shared_layout();
+    }
+
+    /// The same step never follows a link at the env file's path: as root,
+    /// chmod would change whatever the link points at.
+    #[test]
+    fn the_repair_never_changes_a_file_through_a_link() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if !cfg!(target_os = "linux") { return; }
+        let f = FakeRoot::new("heal-link").with_home_layout();
+        std::fs::create_dir_all(f.at("/etc/default")).unwrap();
+        let target = f.at("/etc/precious");
+        std::fs::write(&target, "x\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, f.at(super::super::kiosk::ENV_FILE)).unwrap();
+        let out = f.run(SeatScript::Repair, "active");
+        assert!(out.status.success(), "stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777, 0o600, "the link's target is untouched");
+        assert!(!f.log().contains("chown -h root:root"), "{}", f.log());
+    }
+
+    /// verify, when the display is not running: `noo kiosk reload` cannot
+    /// help (no broker, exit 5), so the row names the repair; and a seat's
+    /// root watchdog from another release is said, with the same command.
+    #[test]
+    fn a_dead_display_names_the_repair_not_a_reload() {
+        use super::super::cluster_verify::Verdict;
+        let seen = "2025-10-09T08:53:10Z";
+        let now = super::super::cluster_verify::parse_rfc3339_unix(seen).unwrap() + 10;
+        let wd = sha256_hex(super::super::kiosk::WATCHDOG.as_bytes());
+        let seat = json!({"seat_name": "homeserver", "enroll_user": "alex", "last_seen": seen,
+            "heartbeat": {"cli_version": "0.6.17", "user_cli_current": true, "kiosk_serve": "active", "kiosk_display": "failed",
+                          "kiosk_bins": "shared", "kiosk_watchdog_sha": wd, "console_build": null, "kiosk": {"user": "kiosk"}}});
+        let c = seat_checks(&seat, "0.6.17", "stack-v0.6.17", now);
+        let d = c.iter().find(|c| c.name == "display").unwrap();
+        assert_eq!(d.verdict, Verdict::Fail, "{d:?}");
+        assert!(d.detail.contains("kiosk.service is 'failed'"), "{d:?}");
+        let fix = d.remedy.as_deref().unwrap_or("");
+        assert!(fix.contains("kiosk seat-sync --migrate") && !fix.contains("kiosk reload"), "{d:?}");
+        assert!(!c.iter().any(|c| c.name == "kiosk watchdog"), "this release's watchdog adds no row");
+        let mut up = seat.clone();
+        up["heartbeat"]["kiosk_display"] = json!("active");
+        up["heartbeat"]["console_build"] = json!("stack-v0.6.16");
+        let d = seat_checks(&up, "0.6.17", "stack-v0.6.17", now).into_iter().find(|c| c.name == "display").unwrap();
+        assert!(d.remedy.as_deref().unwrap_or("").contains("noo kiosk reload"), "a running display is reloaded: {d:?}");
+        let mut no_display = seat.clone();
+        no_display["heartbeat"]["kiosk_bins"] = json!("absent");
+        no_display["heartbeat"]["kiosk_display"] = json!("inactive");
+        assert!(!seat_checks(&no_display, "0.6.17", "stack-v0.6.17", now).iter().any(|c| c.detail.contains("kiosk.service is")));
+        let mut stale = up.clone();
+        stale["heartbeat"]["kiosk_watchdog_sha"] = json!("0".repeat(64));
+        let w = seat_checks(&stale, "0.6.17", "stack-v0.6.17", now).into_iter().find(|c| c.name == "kiosk watchdog").expect("a stale watchdog is said");
+        assert_eq!(w.verdict, Verdict::Warn);
+        assert!(w.remedy.as_deref().unwrap_or("").contains("kiosk seat-sync --migrate"), "{w:?}");
+    }
+
+    /// After an apply, a display row is softened to "no heartbeat since"
+    /// only when the apply's own display step did not fail.
+    #[test]
+    fn a_failed_display_step_is_never_read_as_a_good_apply() {
+        use super::super::cluster_verify::Verdict;
+        let seen = "2025-10-09T08:53:10Z";
+        let now = super::super::cluster_verify::parse_rfc3339_unix(seen).unwrap() + 10;
+        let mut seat = json!({"seat_name": "homeserver", "last_seen": seen,
+            "heartbeat": {"cli_version": "0.6.16", "last_applied_sha": "old", "user_cli_current": true, "kiosk_serve": "active",
+                          "console_build": "stack-v0.6.16", "kiosk": {"user": "kiosk"}},
+            "sha256": "new", "applied_sha": "new", "apply_rc": 0,
+            "apply_msg": "seat-apply cli=updated scripts=1 units=0 serve=restarted display=reloaded console=stack-v0.6.17"});
+        let soft = seat_checks_after_apply(&seat, "0.6.17", "stack-v0.6.17", now);
+        assert_eq!(soft.iter().find(|c| c.name == "display").unwrap().verdict, Verdict::Warn, "{soft:?}");
+        seat["apply_msg"] = json!("seat-apply cli=updated scripts=1 units=0 serve=restarted display=reload-failed console=stack-v0.6.17");
+        let hard = seat_checks_after_apply(&seat, "0.6.17", "stack-v0.6.17", now);
+        assert_eq!(hard.iter().find(|c| c.name == "display").unwrap().verdict, Verdict::Fail, "{hard:?}");
+    }
+
     #[test]
     fn the_seat_proof_message_matches_the_gateway() {
         assert_eq!(seat_proof_message("heartbeat", "lobby", "deadbeef", 1_757_000_000),
@@ -2497,7 +2698,7 @@ mod tests {
         let bc = seat_checks(&blind, "0.6.5", "stack-v0.6.5", now);
         let env = bc.iter().find(|c| c.name == "kiosk env").expect("an unreadable env file gets a verdict");
         assert_eq!(env.verdict, Verdict::Warn);
-        assert!(env.detail.contains("permission denied") && env.remedy.as_deref().unwrap_or("").contains("chmod 0644"), "{env:?}");
+        assert!(env.detail.contains("permission denied") && env.remedy.as_deref().unwrap_or("").contains("kiosk seat-sync --migrate"), "{env:?}");
         assert!(!bc.iter().any(|c| c.detail.contains("no kiosk set up")), "{bc:?}");
         assert!(!c.iter().any(|c| c.name == "kiosk env"), "a readable env file adds no check");
         assert!(seat_checks(&good, "0.6.5", "stack-v0.6.5", now + 600).iter().any(|c| c.name == "seat online" && c.verdict == Verdict::Fail));
@@ -2909,6 +3110,7 @@ exec {real_install} "$@"
             shim("id", "if [ \"$1\" = -gn ] && [ \"$2\" = kiosk ]; then echo kiosk; exit 0; fi\necho \"id: '$2': no such user\" >&2\nexit 1\n".into());
             shim("systemctl", "echo \"systemctl $*\" >> \"$SHIM_LOG\"\nif [ \"$1\" = is-active ]; then echo \"${FAKE_STATE:-active}\"; [ \"${FAKE_STATE:-active}\" = active ]; exit $?; fi\nexit 0\n".into());
             shim("sleep", "exit 0\n".into());
+            shim("chown", "echo \"chown $*\" >> \"$SHIM_LOG\"\nexit 0\n".into());
             let work = root.join("_work");
             for f in ["birth.key", "birth.crt", "ca.crt", "signing.pub", "seat.json", "noo-seat-sync.service", "noo-seat-sync.timer", "49-noo-seat.rules", "noo"] {
                 std::fs::write(work.join(f), format!("fake {f}\n")).unwrap();
@@ -2982,7 +3184,7 @@ exec {real_install} "$@"
                 let t = self.unit(u);
                 assert!(!t.contains("/home/") && !t.contains(&self.cfg.cli_home), "{u} references a home path:\n{t}");
             }
-            // The root watchdog is untouched: root never runs a seat-writable script.
+            // The root watchdog is a root-owned regular file: root never runs a seat-writable script.
             assert!(self.unit("kiosk-watchdog.service").contains("ExecStart=/usr/local/bin/noo-kiosk-watchdog"));
             assert!(!self.at("/usr/local/bin/noo-kiosk-watchdog").symlink_metadata().unwrap().file_type().is_symlink());
             assert!(log.contains("systemctl daemon-reload") && log.contains("systemctl restart kiosk-serve.service")

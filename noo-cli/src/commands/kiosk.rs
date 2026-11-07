@@ -3121,6 +3121,50 @@ mod tests {
         );
     }
 
+    /// The root watchdog converges the env file every tick, so no release
+    /// needs a hand fix of a 0.6.16-era 0640 file. It never follows a link
+    /// (as root, chmod would change the target), never sets anything but
+    /// 0644, and takes the path from nowhere but its own text.
+    #[test]
+    fn the_watchdog_converges_the_env_file_and_never_through_a_link() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if !cfg!(target_os = "linux") { return; }
+        // The function runs from its definition to the one call that
+        // follows it: bounded by that call, not by a brace.
+        let call = format!("\nconverge_env {ENV_FILE}\n");
+        let start = WATCHDOG.find("converge_env() ").expect("the watchdog converges the env file");
+        let end = WATCHDOG.find(&call).expect("it converges THE env file, every tick");
+        assert!(start < end, "the function is defined before it is called");
+        let func = &WATCHDOG[start..=end];
+        assert!(!func.contains("NOO_"), "the path never comes from the environment:\n{func}");
+        assert!(func.contains("chmod 0644 ") && ENV_MODE == "0644", "the mode is ENV_MODE:\n{func}");
+        let dir = std::env::temp_dir().join(format!("noo-wd-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("t.sh");
+        std::fs::write(&script, format!("{func}converge_env \"$1\"\n")).unwrap();
+        let run = |p: &std::path::Path| std::process::Command::new("bash").arg(&script).arg(p).output().unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        // A 0.6.16-era file is opened up to exactly 0644 (chown needs root; the mode is what a test can see).
+        for start_mode in [0o640, 0o600, 0o666] {
+            let env = dir.join(format!("env-{start_mode:o}"));
+            std::fs::write(&env, "NOO_KIOSK_USER=kiosk\n").unwrap();
+            std::fs::set_permissions(&env, std::fs::Permissions::from_mode(start_mode)).unwrap();
+            run(&env);
+            assert_eq!(mode(&env), 0o644, "from {start_mode:o}: exactly 0644, never wider");
+        }
+        // A link at the path changes nothing, not even its target.
+        let target = dir.join("precious");
+        std::fs::write(&target, "x\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let out = run(&link);
+        assert_eq!(mode(&target), 0o600, "the link's target is untouched");
+        assert!(String::from_utf8_lossy(&out.stderr).is_empty(), "a link is skipped silently: {}", String::from_utf8_lossy(&out.stderr));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn watchdog_ticks_every_minute_as_a_oneshot() {
         assert!(render_watchdog_timer().contains("OnUnitActiveSec=60s"));
