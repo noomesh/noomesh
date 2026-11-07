@@ -10683,6 +10683,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/alerts/alertmanager": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create alertmanager
+         * @description [native] `POST /api/alerts/alertmanager` — Alertmanager's webhook. Alertmanager's service leaf only. Critical alerts only: `firing` raises a persisting operator alert for (`prometheus.<alertname>`, target), `resolved` clears it; onsets are flap-guarded. Answers `{accepted, refused}` counts and never echoes the alert's annotations.
+         */
+        post: operations["alertmanager_intake"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/connections": {
         parameters: {
             query?: never;
@@ -25352,6 +25372,34 @@ export interface operations {
         };
     };
     node_traces_ingest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    alertmanager_intake: {
         parameters: {
             query?: never;
             header?: never;
