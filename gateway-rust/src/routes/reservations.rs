@@ -52,6 +52,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/cluster/reservations/{id}/release", post(reservation_release))
         .route("/api/cluster/workloads", get(workloads_list))
         .route("/api/addon-workloads/{addon}/{workload}/status", get(workload_status))
+        .route("/api/addon-workloads/{addon}/{workload}/reserve", post(addon_reserve))
+        .route("/api/addon-workloads/{addon}/{workload}/release", post(addon_release))
         .route("/api/addon-workloads/{addon}/{workload}/proxy/{*path}", any(workload_proxy))
 }
 
@@ -357,6 +359,66 @@ async fn resolve_workload(
     Ok((managed_decl(addon, d, need), Some(Managed { node: row.node_id }), managed_ready_secs(d.health.start_secs)))
 }
 
+// ── add-on-scoped reserve and release (i300 H5, A5) ──────────────────────
+//
+// An add-on reserves and releases ITS OWN placed node workload with its own
+// key (`sub = addon:<addon>`, the front door's `proxy_allows`): D2 runs a
+// worker on demand. The node is the operator's placement (strict), so the
+// add-on has no node choice; it cannot hand over, force, or reach an i163
+// container workload or another add-on's. An operator keeps
+// /api/cluster/reservations.
+
+/// The caller may reserve `addon`'s workloads here: its own key, nothing else.
+pub(crate) fn addon_may_reserve(sub: &str, addon: &str) -> bool {
+    crate::addon_registry::name_ok(addon) && sub == format!("{}{addon}", crate::auth::ADDON_SUBJECT_PREFIX)
+}
+
+/// The requester of an add-on-scoped call, held to [`addon_may_reserve`].
+fn addon_caller(ctx: Option<&axum::Extension<crate::auth::RequesterCtx>>, addon: &str) -> Result<String, AppError> {
+    let Some(axum::Extension(r)) = ctx else {
+        return Err(AppError::Forbidden("a credential is required".into()));
+    };
+    if !addon_may_reserve(&r.sub, addon) {
+        return Err(AppError::Forbidden(format!("only the add-on {addon} itself may reserve or release its workloads here")));
+    }
+    Ok(r.sub.clone())
+}
+
+/// POST /api/addon-workloads/{addon}/{workload}/reserve — body `{timeout_secs?}`.
+async fn addon_reserve(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    Path((addon, workload)): Path<(String, String)>,
+    body: Option<Json<Value>>,
+) -> AppResult {
+    let actor = addon_caller(ctx.as_ref(), &addon)?;
+    let (_, managed, _) = resolve_workload(&state, &addon, &workload).await?;
+    let Some(m) = managed else {
+        return Err(AppError::Conflict(format!("{addon}/{workload} is not a placed node workload: only those are reserved by the add-on itself")));
+    };
+    let mut b = json!({"workload": format!("{addon}/{workload}"), "node": m.node});
+    if let Some(t) = body.as_ref().and_then(|Json(v)| v.get("timeout_secs")).and_then(Value::as_u64) {
+        b["timeout_secs"] = json!(t);
+    }
+    take(state, actor, b).await
+}
+
+/// POST /api/addon-workloads/{addon}/{workload}/release — the add-on's own
+/// reservation of it, never another holder's, never forced.
+async fn addon_release(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    Path((addon, workload)): Path<(String, String)>,
+) -> AppResult {
+    let actor = addon_caller(ctx.as_ref(), &addon)?;
+    let key = format!("{addon}/{workload}");
+    let Some(r) = all_reservations(&state).await.into_iter().find(|r| r["workload"] == key && r["holder"] == actor) else {
+        return Err(AppError::NotFound(format!("{actor} holds no reservation of {key}")));
+    };
+    let id = r["id"].as_str().unwrap_or("").to_string();
+    release(state, actor, id, false).await
+}
+
 /// The node's heartbeat row for `addon`/`name` (`node_workloads`), if any.
 pub(crate) fn node_workload_row<'a>(record: &'a Value, addon: &str, name: &str) -> Option<&'a Value> {
     record.get("node_workloads")?.as_array()?.iter().find(|r| {
@@ -427,6 +489,12 @@ async fn reservation_take(
 ) -> AppResult {
     let actor = operator.sub().to_string();
     let b = body.map(|Json(b)| b).unwrap_or_else(|| json!({}));
+    take(state, actor, b).await
+}
+
+/// A reservation take for `actor` (an operator, or an add-on for its own
+/// placed node workload, [`addon_reserve`]). Body as `reservation_take`.
+async fn take(state: Arc<AppState>, actor: String, b: Value) -> AppResult {
     let key = b.get("workload").and_then(Value::as_str).unwrap_or("").trim().to_string();
     let Some((addon, name)) = crate::addon_workloads::split_key(&key) else {
         return Err(AppError::BadRequest("workload must be <addon>/<workload> (lowercase names)".into()));
@@ -580,6 +648,11 @@ async fn reservation_release(
 ) -> AppResult {
     let actor = operator.sub().to_string();
     let force = body.as_ref().and_then(|Json(b)| b.get("force")).and_then(Value::as_bool).unwrap_or(false);
+    release(state, actor, id, force).await
+}
+
+/// A reservation release by `actor`: the holder, or (`force`) an operator.
+async fn release(state: Arc<AppState>, actor: String, id: String, force: bool) -> AppResult {
     let Some(r) = find_reservation(&state, &id).await else {
         return Err(AppError::NotFound(format!("no reservation {id}")));
     };
@@ -997,6 +1070,29 @@ mod tests {
         let relay = body.find("ws.on_upgrade(").expect("the relay");
         assert!(check < relay, "the check comes first");
         assert!(body.contains("resolve_workload(&state, &addon, &workload)"), "node workloads are resolved, not only i163 ones");
+    }
+
+    #[test]
+    fn only_the_addons_own_key_reserves_its_workloads() {
+        assert!(addon_may_reserve("addon:rhaddon", "rhaddon"));
+        assert!(!addon_may_reserve("addon:otheraddon", "rhaddon"), "another add-on");
+        assert!(!addon_may_reserve("user:admin", "rhaddon"), "an operator uses /api/cluster/reservations");
+        assert!(!addon_may_reserve("addon:", ""), "no name");
+        assert!(!addon_may_reserve("addon:../rhaddon", "../rhaddon"), "not a name");
+    }
+
+    /// The add-on cannot choose the node, hand over or force: its take names
+    /// only the workload and the placement's node, and its release is never
+    /// forced and only of a reservation it holds.
+    #[test]
+    fn an_addon_reserves_on_its_placement_and_releases_only_its_own() {
+        let src = include_str!("reservations.rs");
+        let take = src.split("async fn addon_reserve(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        assert!(take.contains(r#"json!({"workload": format!("{addon}/{workload}"), "node": m.node})"#), "{take}");
+        assert!(!take.contains("hand_over") && !take.contains("force"), "no hand-over, no force");
+        assert!(take.contains("let Some(m) = managed else"), "a placed node workload only");
+        let rel = src.split("async fn addon_release(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        assert!(rel.contains(r#"r["holder"] == actor"#) && rel.contains("release(state, actor, id, false)"), "{rel}");
     }
 
     #[test]

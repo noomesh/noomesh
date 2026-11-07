@@ -234,8 +234,9 @@ pub fn for_nodes() -> Vec<Value> {
     declared().iter().map(WorkloadDecl::for_node).collect()
 }
 
-/// The front door's rule for the workload proxy and status
-/// (`/api/addon-workloads/{addon}/{workload}/proxy/...` and `.../status`): an
+/// The front door's rule for the workload proxy, status, and (i300 H5)
+/// reserve and release (`/api/addon-workloads/{addon}/{workload}/proxy/...`,
+/// `.../status`, `.../reserve`, `.../release`): an
 /// add-on's own token (`sub = addon:<addon>`) may reach the routes under ITS
 /// OWN add-on name and no other. Everything else on the path stays with the
 /// tier gate (an operator passes it anyway).
@@ -246,7 +247,7 @@ pub fn proxy_allows(sub: &str, path: &str) -> bool {
     }
     let Some(rest) = path.strip_prefix("/api/addon-workloads/") else { return false };
     let Some((owner, tail)) = rest.split_once('/') else { return false };
-    owner == addon && matches!(tail.split('/').nth(1), Some("proxy") | Some("status"))
+    owner == addon && matches!(tail.split('/').nth(1), Some("proxy") | Some("status") | Some("reserve") | Some("release"))
 }
 
 /// Group declarations by add-on, for a report.
@@ -345,6 +346,12 @@ mod tests {
         assert!(!proxy_allows("addon:pai-voice", "/api/addon-workloads/evolve/worker/proxy/x"), "another add-on's workload");
         assert!(!proxy_allows("addon:pai-voice", "/api/addon-workloads/pai-voice/voice-worker/start"), "the actuator is not the proxy");
         assert!(proxy_allows("addon:pai-voice", "/api/addon-workloads/pai-voice/voice-worker/status"), "its own status");
+        // i300 H5: its own reserve and release, never another add-on's.
+        assert!(proxy_allows("addon:rhaddon", "/api/addon-workloads/rhaddon/worker/reserve"));
+        assert!(proxy_allows("addon:rhaddon", "/api/addon-workloads/rhaddon/worker/release"));
+        assert!(!proxy_allows("addon:rhaddon", "/api/addon-workloads/otheraddon/worker/reserve"), "another add-on's reserve");
+        assert!(!proxy_allows("addon:rhaddon", "/api/addon-workloads/otheraddon/worker/release"));
+        assert!(!proxy_allows("user:admin", "/api/addon-workloads/rhaddon/worker/reserve"), "not an add-on token");
         assert!(!proxy_allows("addon:pai-voice", "/api/addon-workloads/evolve/worker/status"));
         assert!(!proxy_allows("addon:pai-voice", "/api/cluster/reservations"), "not the reservation API");
         assert!(!proxy_allows("user:alice", "/api/addon-workloads/pai-voice/voice-worker/proxy/x"), "not an add-on token");

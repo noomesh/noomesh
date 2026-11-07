@@ -21907,6 +21907,74 @@
           }
         }
       }
+    },
+    "/api/addon-workloads/{addon}/{workload}/release": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create release",
+        "description": "[native] POST /api/addon-workloads/{addon}/{workload}/release \u2014 the add-on's own reservation of it, never another holder's, never forced.",
+        "operationId": "addon_release",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/addon-workloads/{addon}/{workload}/reserve": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create reserve",
+        "description": "[native] POST /api/addon-workloads/{addon}/{workload}/reserve \u2014 body `{timeout_secs?}`.",
+        "operationId": "addon_reserve",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
