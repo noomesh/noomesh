@@ -24,6 +24,25 @@ STALE_AFTER=300000     # ms
 
 as_kiosk() { runuser -u "$USER_NAME" -- "$@"; }
 
+# The env file is root:root 0644: it holds no secret, and a seat's sync,
+# which runs as the seat user, reports what it says. Setups from 0.6.16 and
+# older left it 0640 root:<display user>, and every release then needed a
+# hand fix. Converge it here, every tick. Never through a link (as root,
+# chmod would change the link's target), never to anything but 0644, and
+# the path is fixed: never read from the environment.
+converge_env() {
+    local f=$1 now
+    [ -f "$f" ] && [ ! -L "$f" ] || return 0
+    now=$(stat -c '%u:%g:%a' -- "$f") || return 0
+    [ "$now" = "0:0:644" ] && return 0
+    if chmod 0644 -- "$f" && chown -h root:root -- "$f"; then
+        echo "noo-kiosk-watchdog: /etc/default/kiosk was $now, now root:root 0644" >&2
+    else
+        echo "noo-kiosk-watchdog: /etc/default/kiosk is $now and could not be made root:root 0644" >&2
+    fi
+}
+converge_env /etc/default/kiosk
+
 # Record failures where `noo kiosk status` can read them, for the same
 # reason the launcher does: the journal proved unreliable for this seat's
 # own output, and a renewal that quietly stops is how a working display
