@@ -20916,6 +20916,84 @@
           }
         }
       }
+    },
+    "/api/cluster/nodes/{node_id}/node-workloads": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get node workloads",
+        "description": "[native] GET /api/cluster/nodes/{node_id}/node-workloads",
+        "operationId": "list_placements",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/nodes/{node_id}/node-workloads/{addon}/{workload}": {
+      "put": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Update node workloads",
+        "description": "[native] PUT /api/cluster/nodes/{node_id}/node-workloads/{addon}/{workload}",
+        "operationId": "put_placement",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Delete node workloads",
+        "description": "[native] DELETE /api/cluster/nodes/{node_id}/node-workloads/{addon}/{workload}",
+        "operationId": "delete_placement",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

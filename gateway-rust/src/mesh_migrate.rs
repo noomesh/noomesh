@@ -2233,6 +2233,34 @@ CREATE INDEX IF NOT EXISTS noo_request_trace_trace_id_idx ON noo_request_trace (
 CREATE INDEX IF NOT EXISTS noo_request_trace_route_at_idx ON noo_request_trace (route, at);
 ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS trace_id text
 "#,
+}, Migration {
+    revision: NODE_WORKLOAD_PLACEMENTS_REVISION,
+    down_revision: Some(REQUEST_TRACE_REVISION),
+    // i300 H3b-2: an operator's placement of an add-on node workload on ONE
+    // node (strict, no pool fallback in phase 2), the row desired-config's
+    // `node_workloads` entries are built from. A table of its own, never a
+    // `role` of `noo_backend_placements`: every reader of that table (the
+    // desired-config `placements` each agent acts on, the class table,
+    // verify) would take `addon:<a>/<w>` for a backend. One row per
+    // (addon, workload): the node is the operator's choice, not the add-on's.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_node_workload_placements (
+    addon text NOT NULL,
+    workload text NOT NULL,
+    node_id text NOT NULL,
+    profile text,
+    sets jsonb NOT NULL DEFAULT '{}'::jsonb,
+    env jsonb NOT NULL DEFAULT '{}'::jsonb,
+    on_controller boolean NOT NULL DEFAULT false,
+    desired_state text NOT NULL DEFAULT 'provisioned',
+    reservation uuid,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (addon, workload),
+    CONSTRAINT noo_node_workload_placements_state CHECK (desired_state IN ('provisioned', 'running', 'absent'))
+);
+CREATE INDEX IF NOT EXISTS noo_node_workload_placements_node_idx ON noo_node_workload_placements (node_id)
+"#,
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
@@ -2242,6 +2270,11 @@ pub const ADDON_ACCESS_REVISION: &str = "104_addon_access";
 /// Request tracing's summary table and the usage link (i359). A constant
 /// so a renumber at rebase is one line.
 pub const REQUEST_TRACE_REVISION: &str = "105_request_trace";
+
+/// Add-on node-workload placements (i300 H3b-2). Number 113 is claimed:
+/// #799 holds 106-110 and i510 B1/B2 111/112; whichever lands later
+/// renumbers once. A constant so that is one line (and the down revision).
+pub const NODE_WORKLOAD_PLACEMENTS_REVISION: &str = "113_node_workload_placements";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
@@ -3176,16 +3209,36 @@ mod tests {
         }
     }
 
-    /// i359: the request-trace revision is the chain head, sits on 104 (f99), is
-    /// idempotent, and creates exactly the columns `request_trace` writes
-    /// and prunes by, plus the usage link `usage` writes.
+    /// i300 H3b-2: the node-workload placements revision is the chain head,
+    /// sits on 105, fits the revision column, rewrites no row, and creates
+    /// every column the repo writes, keyed one node per (addon, workload).
     #[test]
-    fn request_trace_revision_is_the_head_and_matches_its_writers() {
+    fn node_workload_placements_revision_is_the_head_and_matches_its_writer() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == NODE_WORKLOAD_PLACEMENTS_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "113_node_workload_placements");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(REQUEST_TRACE_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(NODE_WORKLOAD_PLACEMENTS_REVISION), "the chain head");
+        assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_node_workload_placements"));
+        assert!(m.sql.contains("PRIMARY KEY (addon, workload)"), "one node per workload: the operator's, strict");
+        assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE") && !m.sql.contains("noo_backend_placements"));
+        let writer = include_str!("repo/node_workload_placements.rs");
+        let insert = writer.split("INSERT INTO noo_node_workload_placements").nth(1).expect("the writer inserts");
+        let cols = insert.split('(').nth(1).and_then(|c| c.split(')').next()).expect("a column list");
+        for col in cols.split(',').map(str::trim) {
+            assert!(m.sql.contains(&format!("\n    {col} ")), "{col} is written but not created");
+        }
+    }
+
+    /// i359: the request-trace revision sits on 104 (f99), is idempotent, and
+    /// creates exactly the columns `request_trace` writes and prunes by, plus
+    /// the usage link `usage` writes.
+    #[test]
+    fn request_trace_revision_sits_on_104_and_matches_its_writers() {
         let m = MIGRATIONS.iter().find(|m| m.revision == REQUEST_TRACE_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "105_request_trace");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(ADDON_ACCESS_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(REQUEST_TRACE_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_request_trace"));
         assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE"), "no row is rewritten or dropped");
         let writer = include_str!("repo/request_trace.rs");

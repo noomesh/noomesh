@@ -91,6 +91,12 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/cluster/nodes/{node_id}/config", put(node_config_put))
         .route("/api/cluster/nodes/{node_id}/placements/{backend}", put(placement_put))
         .route("/api/cluster/nodes/{node_id}/placements/{backend}", delete(placement_delete))
+        // i300 H3b-2: add-on node workloads, one node each (strict).
+        .route(
+            "/api/cluster/nodes/{node_id}/node-workloads/{addon}/{workload}",
+            put(super::node_workload_placements::put_placement).delete(super::node_workload_placements::delete_placement),
+        )
+        .route("/api/cluster/nodes/{node_id}/node-workloads", get(super::node_workload_placements::list_placements))
         .route("/api/cluster/nodes/{node_id}/fit", post(placement_fit_post))
         // ── Model classes ──
         .route("/api/cluster/model-classes", get(model_classes_get))
