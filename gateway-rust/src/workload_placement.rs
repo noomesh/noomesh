@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 PersonifAI LLC
 
-// Wired in by the workload placement route (i300 H3b); until then only its
-// tests call it.
-#![allow(dead_code)]
 
 //! The hard filters of an add-on node-workload placement (i300 H3,
 //! `docs/reference/node-workloads.md` "Reasons"): refusals, never preferences.

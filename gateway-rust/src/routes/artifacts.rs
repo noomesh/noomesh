@@ -68,7 +68,7 @@ pub fn router() -> Router<Arc<AppState>> {
 /// Where the controller's GGUF store is mounted in THIS container. The same
 /// host directory is what nginx serves as `/gguf/` — compose mounts it here
 /// read-only so the manifest describes exactly the bytes a node will pull.
-fn gguf_dir() -> PathBuf {
+pub(crate) fn gguf_dir() -> PathBuf {
     PathBuf::from(
         std::env::var("NOO_ARTIFACT_GGUF_DIR").unwrap_or_else(|_| "/artifacts/models".into()),
     )

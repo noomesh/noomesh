@@ -277,6 +277,12 @@ fn digest_re() -> &'static Regex {
 fn uuid_re() -> &'static Regex {
     re!(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 }
+/// A set reference's id and revision are well formed (the patterns
+/// `sets` entries are held to): safe to join under the sets root.
+pub fn valid_set_ref(id: &str, revision: &str) -> bool {
+    set_id_re().is_match(id) && set_rev_re().is_match(revision)
+}
+
 fn set_id_re() -> &'static Regex {
     re!(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 }
