@@ -1211,7 +1211,7 @@ mod tests {
     #[test]
     fn a_node_workloads_row_runs_before_the_start_and_is_given_back_on_failure() {
         let src = include_str!("reservations.rs");
-        let body = src.split("async fn reservation_take(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        let body = src.split("async fn take(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
         let run = body.find("set_running(").expect("the row runs");
         let start = body.find("actuator(&link, &decl, \"/start\"").expect("the start");
         assert!(run < start, "running before the start");
@@ -1306,14 +1306,20 @@ mod tests {
     #[test]
     fn take_and_release_are_gated_audited_and_never_strand_a_gpu() {
         let src = include_str!("reservations.rs").split("fn take_and_release_are_gated_audited_and_never_strand_a_gpu").next().unwrap();
-        let take = src.split("async fn reservation_take(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
-        assert!(take.contains("operator: crate::authz::Operator"), "operator gate (an extractor, so it runs before the body)");
+        // The operator route gates, then hands the body to the shared take()
+        // (H5: the add-on route shares it), where the order lives.
+        let entry = src.split("async fn reservation_take(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        assert!(entry.contains("operator: crate::authz::Operator"), "operator gate (an extractor, so it runs before the body)");
+        assert!(entry.contains("take(state, actor, b).await"), "the operator route runs the shared take");
+        let take = src.split("async fn take(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
         let start = take.find("\"/start\"").expect("start");
         let rollback = take[start..].find("\"release\"").expect("a failed start releases");
         assert!(take[start + rollback..].contains("\"resume\": \"now\""), "the pool gets the GPU back at once");
         assert!(take.contains("\"needs_attention\""), "a ready timeout keeps the reservation and says so");
         assert!(take.matches("audit(&state, AuditKind::ReservationTake").count() >= 2);
-        let rel = src.split("async fn reservation_release(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        let rel_entry = src.split("async fn reservation_release(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        assert!(rel_entry.contains("operator: crate::authz::Operator") && rel_entry.contains("release(state, actor, id, force).await"));
+        let rel = src.split("async fn release(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
         assert!(rel.contains("holder != actor && !force"), "only the holder, or a force");
         assert!(rel.find("drain_and_stop(").unwrap() < rel.find("\"release\"").unwrap(), "the workload stops before the lease is released");
         let own = crate::test_src::own_code(include_str!("reservations.rs"));
