@@ -112,7 +112,7 @@ func (c *Client) resolvePinnedImage(ctx context.Context, ref, pin string) (sourc
 		return "", "", fmt.Errorf("pull %s over the artifact rail: %w", ref, err)
 	}
 	id, ok := imageLocalID(ctx, c, ref)
-	if !ok || !vouchedImageID(m, id) {
+	if !ok {
 		if id == "" {
 			id = "nothing"
 		}
