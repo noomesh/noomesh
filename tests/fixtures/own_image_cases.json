@@ -20,7 +20,7 @@
     {"ref": "someone/noo-thing:1", "own": false},
     {"ref": "Bad/Upper:1", "own": true}
   ],
-  "$staged_names_comment": "THE staged-name rule: a placement ref names its rail tar after its digest is cut at the first '@' (never at the last ':', which may be a registry port). Read by noo-cli (image_stage.rs) and gateway-rust (routes/artifacts.rs); the node agent strips the same way in chooseBackendImage. 2026-11-05: a digest-pinned ollama placement read as unstaged on every node.",
+  "$staged_names_comment": "THE staged-name rule: a placement ref names its rail tar after its digest is cut at the first '@' (never at the last ':', which may be a registry port). Read by noo-cli (image_stage.rs), gateway-rust (routes/artifacts.rs) and node-agent-go (image_pin_rail_test.go: chooseBackendImage cuts the digest and keeps it as the pin, which the start holds the staged image to). 2026-11-05: a digest-pinned ollama placement read as unstaged on every node. 2026-11-08: the agent did not cut it for our own images (this comment said it did, and nothing read the table in Go), so aserve and robopi refused the staged hardened ollama.",
   "staged_names": [
     {"ref": "registry.example/acme/ollama:v1", "arch": "amd64", "staged_ref": "registry.example/acme/ollama:v1", "tar_gz": "registry.example_acme_ollama_v1_amd64.tar.gz"},
     {"ref": "registry.example/acme/ollama:v1@sha256:e6def2406ca1bba7253fb6566940ca61cabd8e1064902984faa263507bb6c3aa", "arch": "arm64", "staged_ref": "registry.example/acme/ollama:v1", "tar_gz": "registry.example_acme_ollama_v1_arm64.tar.gz"},
