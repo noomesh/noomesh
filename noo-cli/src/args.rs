@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn usage_flags_match_what_converted_parsers_ask_for() {
         use crate::commands::{
-            addon_access, addons, autonomy, cluster_gpu, cluster_gpu_mode, cluster_reserve, cluster_vendor, heartbeat, jobs, logs, memory, rag, recall, tasks,
+            addon_access, addons, autonomy, cluster_gpu, cluster_gpu_mode, cluster_node_workloads, cluster_reserve, cluster_vendor, heartbeat, jobs, logs, memory, rag, recall, tasks,
             walks,
         };
         use crate::commands::{approval, ops, security, security_local};
@@ -313,6 +313,7 @@ mod tests {
             row(&["heartbeat", "history"], |a| { let _ = heartbeat::parse_history_with(a); }),
             row(&["walks"], |a| { let _ = walks::parse_list_with(a); }),
             row(&["cluster", "reserve"], |a| { let _ = cluster_reserve::parse_reserve_with(a); }),
+            row(&["cluster", "workloads", "place"], |a| { let _ = cluster_node_workloads::parse_place_with(a); }),
             row(&["cluster", "gpu", "hold"], |a| { let _ = cluster_gpu::parse_gpu_hold_with(a); }),
             row(&["cluster", "gpu", "release"], |a| { let _ = cluster_gpu::parse_gpu_release_with(a); }),
             row(&["cluster", "vendor", "stage"], |a| { let _ = cluster_vendor::parse_stage_with(a); }),

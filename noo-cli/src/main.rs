@@ -300,6 +300,11 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["cluster", "reserve"], commands::cluster_reserve),
     (&["cluster", "reservations"], commands::cluster_reservations),
     (&["cluster", "release"], commands::cluster_release),
+    // The longer `workloads` verbs come BEFORE the bare list: dispatch is
+    // first-match by prefix, so `workloads place ...` must not reach it.
+    (&["cluster", "workloads", "place"], commands::cluster_workloads_place),
+    (&["cluster", "workloads", "show"], commands::cluster_workloads_show),
+    (&["cluster", "workloads", "unplace"], commands::cluster_workloads_unplace),
     (&["cluster", "workloads"], commands::cluster_workloads),
     // A node's harness profile: resolved per field (override > measured >
     // tier default), its overrides, and its chat-model bench.
