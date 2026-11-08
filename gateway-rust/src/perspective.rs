@@ -717,7 +717,6 @@ pub async fn begin(db: &PgPool, claims: &Claims, session: &SessionRow, dims: &Pe
         return Err(refused(StatusCode::CONFLICT, ACTIVE));
     }
     tx.commit().await.map_err(db_failed)?;
-    audit_started(db, &claims.sub, &started, None).await;
     Ok(started)
 }
 
