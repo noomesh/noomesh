@@ -1191,10 +1191,6 @@ async fn auth_logout_handler(
     if let Some(c) = jar.get(auth_refresh::REFRESH_COOKIE_NAME) {
         let raw = c.value().to_string();
         if let Ok(Some(rec)) = auth_refresh::lookup_token(&state.db, &raw).await {
-            // i538: a perspective lives on the session, so logout ends it.
-            if let Some(pid) = rec.perspective_id.as_deref() {
-                let _ = crate::perspective::end(&state.db, pid, crate::perspective::EndReason::Logout).await;
-            }
             let _ = auth_refresh::revoke_token(&state.db, &rec.id).await;
             audit_auth(&state.db, crate::audit::AuditKind::AuthLogout, &rec.user_id, "ok", None).await;
             account = Some(rec.user_id);
