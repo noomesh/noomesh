@@ -510,7 +510,7 @@ mod tests {
 
     #[test]
     fn an_approval_names_one_exact_digest_and_never_a_pattern() {
-        assert!(requested("pai-voice", D1).is_ok());
+        assert!(requested("rhaddon", D1).is_ok());
         for bad in [
             "sha256:*",
             "*",
@@ -524,10 +524,10 @@ mod tests {
             " sha256:2c99870b2514d9e143c3f33f3d5a9b4cbe89516e32343e5ac9c1379a9123844b",
             "sha256:2c99870b2514d9e143c3f33f3d5a9b4cbe89516e32343e5ac9c1379a91238*",
         ] {
-            assert!(requested("pai-voice", bad).is_err(), "{bad:?} must be refused");
+            assert!(requested("rhaddon", bad).is_err(), "{bad:?} must be refused");
         }
         let too_long = "a".repeat(64);
-        for bad in ["", "Pai-voice", "-pai", "pai-", "pai_voice", "pai/voice", "*", too_long.as_str()] {
+        for bad in ["", "Rhaddon", "-rh", "rh-", "rh_addon", "rh/addon", "*", too_long.as_str()] {
             assert!(requested(bad, D1).is_err(), "add-on {bad:?} must be refused");
         }
         assert!(requested(&"a".repeat(63), D1).is_ok());
@@ -536,26 +536,26 @@ mod tests {
     #[test]
     fn approve_keeps_every_existing_approval_and_writes_the_agents_schema() {
         let d = scratch("keep");
-        assert_eq!(approve_at(&d, ap("pai-voice", D1), Some(me())), Ok(true));
+        assert_eq!(approve_at(&d, ap("rhaddon", D1), Some(me())), Ok(true));
         assert_eq!(approve_at(&d, ap("other", D2), Some(me())), Ok(true));
-        assert_eq!(approve_at(&d, ap("pai-voice", D1), Some(me())), Ok(false), "approving twice changes nothing");
-        assert_eq!(stored(&d), vec![ap("other", D2), ap("pai-voice", D1)]);
+        assert_eq!(approve_at(&d, ap("rhaddon", D1), Some(me())), Ok(false), "approving twice changes nothing");
+        assert_eq!(stored(&d), vec![ap("other", D2), ap("rhaddon", D1)]);
         let text = std::fs::read_to_string(d.join(APPROVALS_FILE)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v, serde_json::json!({"version": 1, "approvals": [
-            {"addon": "other", "digest": D2}, {"addon": "pai-voice", "digest": D1}]}));
+            {"addon": "other", "digest": D2}, {"addon": "rhaddon", "digest": D1}]}));
         let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
     fn revoke_removes_exactly_that_approval() {
         let d = scratch("revoke");
-        approve_at(&d, ap("pai-voice", D1), Some(me())).unwrap();
-        approve_at(&d, ap("pai-voice", D2), Some(me())).unwrap();
-        assert_eq!(revoke_at(&d, &ap("pai-voice", D1), Some(me())), Ok(true));
-        assert_eq!(stored(&d), vec![ap("pai-voice", D2)], "only the revoked digest is gone");
-        assert_eq!(revoke_at(&d, &ap("pai-voice", D1), Some(me())), Ok(false), "revoking it again finds nothing");
-        assert_eq!(revoke_at(&d, &ap("pai-voice", D2), Some(me())), Ok(true));
+        approve_at(&d, ap("rhaddon", D1), Some(me())).unwrap();
+        approve_at(&d, ap("rhaddon", D2), Some(me())).unwrap();
+        assert_eq!(revoke_at(&d, &ap("rhaddon", D1), Some(me())), Ok(true));
+        assert_eq!(stored(&d), vec![ap("rhaddon", D2)], "only the revoked digest is gone");
+        assert_eq!(revoke_at(&d, &ap("rhaddon", D1), Some(me())), Ok(false), "revoking it again finds nothing");
+        assert_eq!(revoke_at(&d, &ap("rhaddon", D2), Some(me())), Ok(true));
         assert_eq!(stored(&d), Vec::<Approval>::new());
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -566,15 +566,15 @@ mod tests {
             ("json", "not json ["),
             ("field", r#"{"version":1,"approvals":[],"extra":true}"#),
             ("version", r#"{"version":2,"approvals":[]}"#),
-            ("entry", r#"{"version":1,"approvals":[{"addon":"pai-voice","digest":"sha256:*"}]}"#),
+            ("entry", r#"{"version":1,"approvals":[{"addon":"rhaddon","digest":"sha256:*"}]}"#),
             ("empty", ""),
         ] {
             let d = scratch(&format!("corrupt-{tag}"));
             std::fs::write(d.join(APPROVALS_FILE), body).unwrap();
-            let err = approve_at(&d, ap("pai-voice", D1), Some(me())).expect_err(tag);
+            let err = approve_at(&d, ap("rhaddon", D1), Some(me())).expect_err(tag);
             assert!(err.contains("corrupt"), "{tag}: {err}");
             assert_eq!(std::fs::read_to_string(d.join(APPROVALS_FILE)).unwrap(), body, "{tag}: the store was changed");
-            assert!(revoke_at(&d, &ap("pai-voice", D1), Some(me())).is_err(), "{tag}: revoke too");
+            assert!(revoke_at(&d, &ap("rhaddon", D1), Some(me())).is_err(), "{tag}: revoke too");
             assert_eq!(std::fs::read_to_string(d.join(APPROVALS_FILE)).unwrap(), body, "{tag}: revoke changed it");
             let _ = std::fs::remove_dir_all(&d);
         }
@@ -588,7 +588,7 @@ mod tests {
         let good = render(&[ap("other", D2)]);
         std::fs::write(&target, &good).unwrap();
         symlink(&target, d.join(APPROVALS_FILE)).unwrap();
-        let err = approve_at(&d, ap("pai-voice", D1), Some(me())).unwrap_err();
+        let err = approve_at(&d, ap("rhaddon", D1), Some(me())).unwrap_err();
         assert!(err.contains("symlink"), "{err}");
         assert!(StateDir::open(&d, Some(me().0)).unwrap().read().is_err(), "list refuses it too");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), good, "the link's target was written");
@@ -603,7 +603,7 @@ mod tests {
         let base = scratch("link-dir");
         let link = base.join("state");
         symlink(&real, &link).unwrap();
-        let err = approve_at(&link, ap("pai-voice", D1), Some(me())).unwrap_err();
+        let err = approve_at(&link, ap("rhaddon", D1), Some(me())).unwrap_err();
         assert!(err.contains("symlink"), "{err}");
         assert!(!real.join(APPROVALS_FILE).exists(), "nothing is written through the link");
         let _ = std::fs::remove_dir_all(&base);
@@ -614,7 +614,7 @@ mod tests {
     fn a_state_directory_others_control_is_refused() {
         let d = scratch("open-dir");
         std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let err = approve_at(&d, ap("pai-voice", D1), Some(me())).unwrap_err();
+        let err = approve_at(&d, ap("rhaddon", D1), Some(me())).unwrap_err();
         assert!(err.contains("writable by everyone"), "{err}");
         std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
         // Owned by someone who is neither root nor the agent.
@@ -625,7 +625,7 @@ mod tests {
         } else {
             (uid, uid + 1)
         };
-        let err = approve_at(&d, ap("pai-voice", D1), Some((agent, gid))).unwrap_err();
+        let err = approve_at(&d, ap("rhaddon", D1), Some((agent, gid))).unwrap_err();
         assert!(err.contains(&format!("owned by uid {owner}")), "{err}");
         assert!(!d.join(APPROVALS_FILE).exists());
         let _ = std::fs::remove_dir_all(&d);
@@ -640,7 +640,7 @@ mod tests {
         if me().0 == 0 {
             std::os::unix::fs::chown(&d, Some(0), Some(0)).unwrap();
         }
-        approve_at(&d, ap("pai-voice", D1), Some(owner)).unwrap();
+        approve_at(&d, ap("rhaddon", D1), Some(owner)).unwrap();
         let md = std::fs::metadata(d.join(APPROVALS_FILE)).unwrap();
         assert_eq!(md.mode() & 0o777, 0o600);
         assert_eq!((md.uid(), md.gid()), owner);
