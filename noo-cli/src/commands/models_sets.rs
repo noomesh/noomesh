@@ -675,6 +675,9 @@ pub(crate) struct Env<'a> {
     pub by: &'a str,
     pub now: &'a str,
     pub recorded: Option<(String, String)>,
+    /// Show each download's live line (`DownloadLine`); false under `--json`
+    /// and in tests.
+    pub show_progress: bool,
 }
 
 #[derive(Debug)]
@@ -742,9 +745,12 @@ fn fetch_lfs(env: &Env, req: &StageArgs, s: &Sibling, dir: &Path) -> Result<File
         revision: req.sha.clone(),
         force: false,
     };
-    let mut quiet = |_: u64, _: Option<u64>| {};
-    let out = models_fetch::fetch_to_store(env.base, env.token, &a, dir, &mut quiet)
-        .map_err(|e| map_fetch(&req.repo, env.token.is_some(), e))?;
+    // The operator watched `→ model.safetensors (15.59 GB)` and then nothing
+    // for the whole download (i570): the live line says how far it is.
+    let mut line = models_fetch::DownloadLine::new(&s.path, !env.show_progress);
+    let fetched = models_fetch::fetch_to_store(env.base, env.token, &a, dir, &mut |e| line.event(e));
+    line.finish();
+    let out = fetched.map_err(|e| map_fetch(&req.repo, env.token.is_some(), e))?;
     if out.sha256 != want {
         return Err(StageError::Fetch(format!(
             "{}/{}: the listing says sha256 {want} but the file's own LFS metadata says {}",
@@ -1347,6 +1353,7 @@ pub fn models_stage(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         by: &by,
         now: &now,
         recorded: read_acceptance(&dir, &req.id),
+        show_progress: !g.json,
     };
     if !g.json {
         println!("{}", ui::header("models stage", Some(&format!("hf:{}@{}", req.repo, req.sha))));
@@ -1758,6 +1765,7 @@ mod tests {
             by: "alice",
             now: "2026-11-05T10:00:00Z",
             recorded,
+            show_progress: false,
         };
         let mut lines = Vec::new();
         let mut say = |l: &str| lines.push(l.to_string());
@@ -2036,6 +2044,7 @@ mod tests {
             by: "alice",
             now: "2026-11-05T10:00:00Z",
             recorded: None,
+            show_progress: false,
         };
         let sign = |data: &Path, out: &Path| sign_file(&key, data, out);
         let req = request("voice");
@@ -2403,6 +2412,7 @@ mod tests {
             by: "alice",
             now: "2026-11-05T10:00:00Z",
             recorded: None,
+            show_progress: false,
         }
     }
 
