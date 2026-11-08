@@ -1,0 +1,252 @@
+[
+  {
+    "file": "valid-voice.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "valid-voice-pack.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "valid-voice-pack-runtime.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "valid-voice-pack-model-only.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "valid-stt.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "valid-from-archive.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "valid-trusted-local-digests.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "valid-local-unverified.json",
+    "valid": true,
+    "code": ""
+  },
+  {
+    "file": "refuse-from-archive-sha256.json",
+    "valid": false,
+    "code": "from_archive_invalid"
+  },
+  {
+    "file": "refuse-from-archive-path.json",
+    "valid": false,
+    "code": "from_archive_invalid"
+  },
+  {
+    "file": "refuse-from-archive-bytes.json",
+    "valid": false,
+    "code": "from_archive_invalid"
+  },
+  {
+    "file": "refuse-from-archive-and-notice.json",
+    "valid": false,
+    "code": "from_archive_invalid"
+  },
+  {
+    "file": "refuse-from-archive-unknown-field.json",
+    "valid": false,
+    "code": "unknown_field"
+  },
+  {
+    "file": "refuse-additional-notice-not-in-files.json",
+    "valid": false,
+    "code": "notice_not_in_files"
+  },
+  {
+    "file": "refuse-additional-notice-not-a-notice.json",
+    "valid": false,
+    "code": "notice_not_in_files"
+  },
+  {
+    "file": "refuse-unknown-field.json",
+    "valid": false,
+    "code": "unknown_field"
+  },
+  {
+    "file": "refuse-unknown-field-nested.json",
+    "valid": false,
+    "code": "unknown_field"
+  },
+  {
+    "file": "refuse-trailing-data.json",
+    "valid": false,
+    "code": "bad_json"
+  },
+  {
+    "file": "refuse-duplicate-key.json",
+    "valid": false,
+    "code": "duplicate_key"
+  },
+  {
+    "file": "refuse-null-nested.json",
+    "valid": false,
+    "code": "field_type"
+  },
+  {
+    "file": "refuse-bad-format.json",
+    "valid": false,
+    "code": "bad_format"
+  },
+  {
+    "file": "refuse-missing-license.json",
+    "valid": false,
+    "code": "field_missing"
+  },
+  {
+    "file": "refuse-id-uppercase.json",
+    "valid": false,
+    "code": "id_invalid"
+  },
+  {
+    "file": "refuse-revision-dotdot.json",
+    "valid": false,
+    "code": "revision_invalid"
+  },
+  {
+    "file": "refuse-kind.json",
+    "valid": false,
+    "code": "kind_invalid"
+  },
+  {
+    "file": "refuse-modality.json",
+    "valid": false,
+    "code": "modality_invalid"
+  },
+  {
+    "file": "refuse-runtime-empty.json",
+    "valid": false,
+    "code": "runtime_invalid"
+  },
+  {
+    "file": "refuse-path-dotdot.json",
+    "valid": false,
+    "code": "path_invalid"
+  },
+  {
+    "file": "refuse-path-dot-component.json",
+    "valid": false,
+    "code": "path_invalid"
+  },
+  {
+    "file": "refuse-path-absolute.json",
+    "valid": false,
+    "code": "path_invalid"
+  },
+  {
+    "file": "refuse-path-two-levels.json",
+    "valid": false,
+    "code": "path_invalid"
+  },
+  {
+    "file": "refuse-path-charset.json",
+    "valid": false,
+    "code": "path_invalid"
+  },
+  {
+    "file": "refuse-sha256-uppercase.json",
+    "valid": false,
+    "code": "sha256_invalid"
+  },
+  {
+    "file": "refuse-sha256-short.json",
+    "valid": false,
+    "code": "sha256_invalid"
+  },
+  {
+    "file": "refuse-files-duplicate-path.json",
+    "valid": false,
+    "code": "files_invalid"
+  },
+  {
+    "file": "refuse-file-role.json",
+    "valid": false,
+    "code": "files_invalid"
+  },
+  {
+    "file": "refuse-notice-not-in-files.json",
+    "valid": false,
+    "code": "notice_not_in_files"
+  },
+  {
+    "file": "refuse-license-accept.json",
+    "valid": false,
+    "code": "license_invalid"
+  },
+  {
+    "file": "refuse-source-both.json",
+    "valid": false,
+    "code": "source_invalid"
+  },
+  {
+    "file": "refuse-hf-digests-missing.json",
+    "valid": false,
+    "code": "field_missing"
+  },
+  {
+    "file": "refuse-hf-digests-value.json",
+    "valid": false,
+    "code": "source_invalid"
+  },
+  {
+    "file": "refuse-hf-ref-branch.json",
+    "valid": false,
+    "code": "source_invalid"
+  },
+  {
+    "file": "refuse-trust-missing-hf.json",
+    "valid": false,
+    "code": "trust_required"
+  },
+  {
+    "file": "refuse-trust-missing-local.json",
+    "valid": false,
+    "code": "trust_required"
+  },
+  {
+    "file": "refuse-profile-compute.json",
+    "valid": false,
+    "code": "profile_invalid"
+  },
+  {
+    "file": "refuse-arch.json",
+    "valid": false,
+    "code": "arch_invalid"
+  },
+  {
+    "file": "refuse-voice-pack-without-fits.json",
+    "valid": false,
+    "code": "fits_required"
+  },
+  {
+    "file": "refuse-voice-with-fits.json",
+    "valid": false,
+    "code": "fits_forbidden"
+  },
+  {
+    "file": "refuse-fits-both.json",
+    "valid": false,
+    "code": "fits_invalid"
+  },
+  {
+    "file": "refuse-fits-empty.json",
+    "valid": false,
+    "code": "fits_invalid"
+  }
+]

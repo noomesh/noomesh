@@ -135,7 +135,15 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             Some(Ok(c)) => c,
             _ => &client,
         };
-        let ctx = addons::Ctx { root: &root, tag: &tag, stack_lock: stack_lock.as_deref(), allow_downgrade, client };
+        let images_dir = crate::commands::image_stage::images_store_dir();
+        let ctx = addons::Ctx {
+            root: &root,
+            tag: &tag,
+            stack_lock: stack_lock.as_deref(),
+            allow_downgrade,
+            client,
+            images_dir: &images_dir,
+        };
         let installed = current.get(addon).cloned();
         // The routes.json the installed bundle declared, read before the new
         // one replaces it: what the add-on suggested until now.
@@ -166,7 +174,10 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     let route = client.route(&anchor).map_err(resolve::Refusal::Route)?;
                     addons::resolve_lock(client, &anchor, &want, supplied)
                         .and_then(|(v, f)| {
-                            addons::guards::guard_install(&root, addon, &f.files).map_err(resolve::Refusal::Decl)?;
+                            let checked = addons::guards::guard_install(&root, addon, &f.files).map_err(resolve::Refusal::Decl)?;
+                            for w in &checked.warnings {
+                                ui::warned(&format!("add-on {addon}: {w}"));
+                            }
                             addons::check::refuse_bad_routes(addon, &f.files)?;
                             Ok((v, f))
                         })
@@ -182,7 +193,16 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 .and_then(|anchor| addons::prepare_from(&ctx, addon, &anchor, supplied, &mut resolve::LiveDocker::new(&root)))
                 .and_then(|p| {
                     let suggested = new_suggestions(&p.fetched.files);
-                    addons::commit(&root, &p, &tag).map(|pin| (pin, p.pulled, p.via.clone(), suggested))
+                    addons::commit(&root, &p, &tag).map(|pin| {
+                        // The new lock is current now: this add-on's node-workload
+                        // tars on the rail that it no longer names go.
+                        if let Err(e) = addons::node_images::prune_for(ctx.images_dir, &p) {
+                            if !g.json {
+                                ui::warned(&format!("{addon}: stale node-workload images stay on the rail ({e})"));
+                            }
+                        }
+                        (pin, p.pulled, p.via.clone(), suggested)
+                    })
                 })
         };
         match outcome {
@@ -331,7 +351,16 @@ pub(crate) fn verify_one(
     // The materialised bundle (each file just verified against the lock)
     // passes the add-on guards it passed when it was pinned (`guards`).
     let files = crate::addons::pins::materialised_files(root, addon, listed.iter());
-    if let Err(e) = crate::addons::guards::guard_install(root, addon, &files) {
+    match crate::addons::guards::guard_install(root, addon, &files) {
+        // A WARNING in 0.6.18 (i509): a note on the verdict, not a problem.
+        Ok(c) => v.notes.extend(c.warnings),
+        Err(e) => {
+            v.problem = Some(e);
+            return v;
+        }
+    }
+    // node-workloads.json (i300) against the pinned lock's images.
+    if let Err(e) = crate::addons::decls::check_node_workloads(addon, &files, &pin.images) {
         v.problem = Some(e);
         return v;
     }
@@ -500,6 +529,23 @@ pub(crate) fn launch_lines(root: &Path, tag: &str, names: &[String], anchor: &dy
         let res = anchor(addon).map_err(|e| e.why(addon)).and_then(|a| resolve::offline_check_files(root, addon, tag, &a));
         match res {
             Ok((pin, files)) => {
+                // node-workloads.json (i300), when the verified lock lists
+                // it: the bytes offline_check just held to the signed hash
+                // are re-validated against the pinned lock's images. A
+                // refusal here is the only line this add-on gets.
+                // routes.json rides along: service_drain.route must be one of
+                // its internal routes.
+                let nw_name = crate::addons::node_workloads::NODE_WORKLOADS_FILE.to_string();
+                let routes_name = crate::addons::decls::ROUTES_FILE.to_string();
+                if files.contains(&nw_name) {
+                    let wanted: Vec<&String> =
+                        [&nw_name, &routes_name].into_iter().filter(|n| files.contains(*n)).collect();
+                    let bytes = pins::materialised_files(root, addon, wanted);
+                    if let Err(why) = crate::addons::decls::check_node_workloads(addon, &bytes, &pin.images) {
+                        out.push(format!("refuse {addon} {}", why.replace('\n', " ")));
+                        continue;
+                    }
+                }
                 // The verdict the gateway's add-on registry reads
                 // (`NOO_ADDONS_VERIFIED`): this add-on's signed lock verified
                 // offline AND lists `tag`. Emitted before its `pin` lines so a
@@ -906,6 +952,66 @@ mod tests {
         let mut docker = FakeDocker::default();
         let verdict = verify_one(&d, "trellion_intel", "v0.6.0", Ok(anchor()), &mut docker, &[]);
         assert!(verdict.problem.unwrap().contains("predates signed bundles"));
+    }
+
+    /// `rhaddon` pinned with the fixture node-workloads.json. The signed lock
+    /// is recorded without `resolve::check` (which would refuse a bad file),
+    /// as a pin from an older CLI would be. With `worker` the lock carries the
+    /// image the file names (a good bundle); without, the file is bad
+    /// (`image_not_in_lock`). Returns the root and the pin's image refs.
+    fn rh_pinned_root(tag: &str, worker: bool) -> (std::path::PathBuf, Vec<String>) {
+        use crate::addons::resolve::tests::{digest, signed_rh_bundle};
+        let d = scratch(tag);
+        let mut l = lock("1.0.0", &["v0.6.0"], None);
+        if worker {
+            l.images.insert("addon-worker".into(), format!("{ROOT}/worker@{}", digest('2')));
+        }
+        let f = signed_rh_bundle(
+            &l,
+            include_bytes!("../../../tests/fixtures/addons/rhaddon/node-workloads.json"),
+            include_bytes!("../../../tests/fixtures/addons/rhaddon/routes.json"),
+        );
+        let v = crate::addon_lock::verify(&f.lock, &f.sig, &anchor(), "rhaddon").unwrap();
+        resolve::record(&d, "rhaddon", &v, &f, "v0.6.0", None).unwrap();
+        (d, v.lock.images.values().cloned().collect())
+    }
+
+    /// A pinned bundle whose node-workloads.json no longer holds against its
+    /// lock is refused by the launcher's lines, and only a refusal line.
+    /// Reverting the `check_node_workloads` call in `launch_lines` verifies it.
+    #[test]
+    fn launch_lines_refuse_a_bad_node_workloads_json() {
+        let names = vec!["rhaddon".to_string()];
+        let (good, _) = rh_pinned_root("nw-launch-good", true);
+        let lines = launch_lines(&good, "v0.6.0", &names, &|_| Ok(anchor()));
+        assert_eq!(lines[0], "verified rhaddon 1.0.0 v0.6.0", "{lines:?}");
+        // i300 H3b: the launcher hands the signed file to the gateway.
+        assert!(lines.iter().any(|l| l == "decl rhaddon node-workloads.json"), "{lines:?}");
+        let (bad, _) = rh_pinned_root("nw-launch-bad", false);
+        let lines = launch_lines(&bad, "v0.6.0", &names, &|_| Ok(anchor()));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("refuse rhaddon "), "{lines:?}");
+        assert!(lines[0].contains("image_not_in_lock"), "{lines:?}");
+        assert!(lines[0].contains("node-workloads.json"), "{lines:?}");
+    }
+
+    /// The same bad pinned file is a problem for `noo addons verify`. Reverting
+    /// the `check_node_workloads` call in `verify_one` passes the verdict.
+    #[test]
+    fn verify_refuses_a_bad_node_workloads_json() {
+        let ready = |refs: &[String]| FakeDocker {
+            local: refs.to_vec(),
+            ids: refs.iter().map(|r| (r.clone(), "sha256:x".to_string())).collect(),
+            ..Default::default()
+        };
+        let (good, refs) = rh_pinned_root("nw-verify-good", true);
+        let verdict = verify_one(&good, "rhaddon", "v0.6.0", Ok(anchor()), &mut ready(&refs), &[]);
+        assert!(verdict.problem.is_none(), "{:?}", verdict.problem);
+        let (bad, refs) = rh_pinned_root("nw-verify-bad", false);
+        let verdict = verify_one(&bad, "rhaddon", "v0.6.0", Ok(anchor()), &mut ready(&refs), &[]);
+        let problem = verdict.problem.expect("the file is refused");
+        assert!(problem.contains("image_not_in_lock"), "{problem}");
+        assert!(problem.contains("node-workloads.json"), "{problem}");
     }
 
     #[test]

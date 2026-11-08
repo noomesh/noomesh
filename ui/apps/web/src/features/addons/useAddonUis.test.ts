@@ -42,14 +42,14 @@ describe('useAddonUis', () => {
     H.get.mockResolvedValue({
       data: {
         uis: [
-          { addon: 'example-addon', title: 'Example', port: 8451, url_base: 'https://h.ts.net:8451', can_open: true },
+          { addon: 'example-addon', title: 'Example', port: 8451, url_base: 'https://h.ts.net:8451', can_open: true, console_path: '/example-space', frame_permissions: ['microphone'] },
           { addon: 'other', title: '', port: 8452, url_base: null, can_open: false },
         ],
       },
     });
     await expect(list()).resolves.toEqual([
-      { addon: 'example-addon', title: 'Example', port: 8451, urlBase: 'https://h.ts.net:8451', canOpen: true },
-      { addon: 'other', title: 'other', port: 8452, urlBase: null, canOpen: false },
+      { addon: 'example-addon', title: 'Example', port: 8451, urlBase: 'https://h.ts.net:8451', canOpen: true, consolePath: '/example-space', framePermissions: ['microphone'] },
+      { addon: 'other', title: 'other', port: 8452, urlBase: null, canOpen: false, consolePath: null, framePermissions: null },
     ]);
     expect(H.get).toHaveBeenCalledWith('/api/addons/ui');
     expect(H.lastQuery.current?.queryKey).toEqual(['addon-uis']);

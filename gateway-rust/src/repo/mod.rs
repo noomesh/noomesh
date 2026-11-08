@@ -84,16 +84,36 @@ pub mod agent_recipients;
 pub mod audit;
 pub mod caller_verifiers;
 pub mod cluster;
+pub mod connections;
+pub mod integration_content;
+pub mod integration_pairing;
+pub mod integrations;
 pub mod graph;
 pub mod heartbeat;
 pub mod kb_grants;
+pub mod node_workload_placements;
 pub mod prompt_skills;
 pub mod request_trace;
+pub mod seats;
 pub mod settings;
 pub mod task_events;
 pub mod tasks;
 pub mod prompt_skill_proposals;
 pub mod users;
+
+/// Whether every named relation resolves on the connection's search_path,
+/// asked BEFORE a query that names them: a `to_regclass` guard in the WHERE
+/// of the query itself cannot stop Postgres resolving the relation at plan
+/// time, so on an install without the table the server logged an ERROR on
+/// every run (i545 finding 63).
+pub async fn relations_exist(db: impl sqlx::PgExecutor<'_>, names: &[&str]) -> Result<bool, sqlx::Error> {
+    let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+    let all: Option<bool> = sqlx::query_scalar("SELECT bool_and(to_regclass(n) IS NOT NULL) FROM unnest($1::text[]) AS n")
+        .bind(&names)
+        .fetch_one(db)
+        .await?;
+    Ok(all.unwrap_or(false))
+}
 
 /// Is this error "the table does not exist" (Postgres 42P01)? The ONE error a
 /// reader may answer as "nothing there": on a box that has not migrated yet,
@@ -102,6 +122,27 @@ pub mod users;
 /// not read as it.
 pub fn missing_table(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("42P01"))
+}
+
+#[cfg(test)]
+mod relations_exist_tests {
+    /// The existence check against a real schema: a table that is there,
+    /// one that is not, and a mix (any absent is "no").
+    #[tokio::test]
+    async fn relations_exist_answers_for_every_name() {
+        let Some(dsn) = std::env::var("NOO_TEST_DSN").ok().filter(|v| !v.trim().is_empty()) else {
+            eprintln!("NOO_TEST_DSN unset — relations_exist not exercised");
+            return;
+        };
+        use std::str::FromStr as _;
+        let opts = sqlx::postgres::PgConnectOptions::from_str(&dsn).expect("dsn").options([("search_path", "mesh,public")]);
+        let admin = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(opts.clone()).await.expect("connect");
+        crate::mesh_migrate::apply_baseline(&admin).await.expect("baseline");
+        crate::mesh_migrate::apply(&admin).await.expect("migrations");
+        assert!(super::relations_exist(&admin, &["noo_users"]).await.unwrap());
+        assert!(!super::relations_exist(&admin, &["noo_no_such_table_i545"]).await.unwrap());
+        assert!(!super::relations_exist(&admin, &["noo_users", "noo_no_such_table_i545"]).await.unwrap(), "one absent is no");
+    }
 }
 
 // ── The ratchet ────────────────────────────────────────────────────────────

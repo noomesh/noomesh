@@ -123,6 +123,12 @@ pub fn door_leaf_for_backend(backend: &str) -> Option<&'static NodeDoorLeaf> {
 /// leaf carries (`onboard::steps::svc_extra_hostnames` — ONE derivation
 /// for the compose aliases) plus the node door names the agent dials.
 pub fn door_sans(service: &str) -> Vec<String> {
+    // An add-on workload leaf (`addon-<addon>-<workload>`) names exactly its
+    // door, `noo-stunnel-<addon>-<workload>` — nothing the controller's own
+    // compose aliases would add.
+    if let Some(rest) = service.strip_prefix("addon-") {
+        return vec![format!("noo-stunnel-{rest}")];
+    }
     let mut out = crate::onboard::steps::svc_extra_hostnames(service);
     if let Some(l) = door_leaf(service) {
         for d in l.doors {
@@ -326,6 +332,161 @@ pub fn withheld_leaves_note(node: &str, app_version: &str, from_upgrade: bool) -
 /// First noo-cli release whose Mac applier installs the `svc-*` kinds.
 pub const LEAF_KINDS_MAC_FLOOR: (u32, u32, u32) = (0, 5, 63);
 
+// ── add-on node workload door leaves (i300 §10.1 A1) ─────────────────────
+//
+// One leaf per (node, enabled add-on node workload): service name
+// `addon-<addon>-<workload>`, door host `noo-stunnel-<addon>-<workload>`,
+// bundle kinds `svc-addon-<addon>-<workload>.crt|.key`. Issued under the
+// same `nodes/<node>/services/<service>/` path with the same renewal
+// logic as the static table; the three allow-lists judge the kinds by
+// SHAPE (`addon_leaf_kind_ok` here, `addon_leaf_kind_ok()` in noo-apply.sh
+// and sign-bundle.sh) because the set is open.
+
+/// First noo-cli release whose applier installs `svc-addon-*` kinds. A node
+/// reporting an older CLI gets none in its bundle (any OS); so does one whose
+/// version is unknown or unparseable (see [`applier_knows_addon_leaf_kinds`]).
+pub const APPLIER_ADDON_LEAVES_FLOOR: (u32, u32, u32) = (0, 6, 18);
+
+/// Longest `<addon>-<workload>` (so the service name `addon-…` is at most 57).
+pub const ADDON_DOOR_NAME_MAX: usize = 51;
+
+/// `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`
+fn dns_label_ok(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty()
+        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+        && b[0] != b'-'
+        && b[b.len() - 1] != b'-'
+}
+
+/// May `addon` + `workload` name a door? Each matches
+/// `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$` and `addon-workload` is at most
+/// [`ADDON_DOOR_NAME_MAX`] characters.
+pub fn addon_door_name_ok(addon: &str, workload: &str) -> bool {
+    dns_label_ok(addon) && dns_label_ok(workload) && addon.len() + 1 + workload.len() <= ADDON_DOOR_NAME_MAX
+}
+
+/// Is `kind` a well-formed `svc-addon-<name>.crt|.key` bundle kind? The same
+/// rule as `addon_leaf_kind_ok` in noo-apply.sh / sign-bundle.sh: the stem
+/// after `svc-` is `addon-<name>`, a lowercase DNS-style label of at most 57
+/// characters (no `/`, no `.`, no uppercase, no leading or trailing `-`).
+pub fn addon_leaf_kind_ok(kind: &str) -> bool {
+    let Some(stem) = kind.strip_suffix(".crt").or_else(|| kind.strip_suffix(".key")) else { return false };
+    let Some(stem) = stem.strip_prefix("svc-") else { return false };
+    let Some(name) = stem.strip_prefix("addon-") else { return false };
+    name.len() <= ADDON_DOOR_NAME_MAX && dns_label_ok(name)
+}
+
+/// The node workload doors of the enabled add-ons: `(addon, workload)`.
+// SEAM(F2): personifai-df's decls.rs node-workloads parser replaces this body
+pub fn node_workload_doors(_root: &Path) -> Vec<(String, String)> {
+    Vec::new()
+}
+
+/// Leaf service name for an add-on workload door.
+pub fn addon_service(addon: &str, workload: &str) -> String {
+    format!("addon-{addon}-{workload}")
+}
+
+/// `(crt_kind, key_kind)` for an add-on workload door.
+pub fn addon_leaf_kinds(addon: &str, workload: &str) -> (String, String) {
+    let s = addon_service(addon, workload);
+    (format!("svc-{s}.crt"), format!("svc-{s}.key"))
+}
+
+/// Refuse loudly a pair that cannot name a door, naming the pair.
+fn check_addon_door(addon: &str, workload: &str) -> Result<(), String> {
+    if addon_door_name_ok(addon, workload) {
+        return Ok(());
+    }
+    Err(format!(
+        "add-on node workload door '{addon}/{workload}' cannot be issued a leaf: each name must match \
+         ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ and addon-workload must be at most {ADDON_DOOR_NAME_MAX} characters"
+    ))
+}
+
+/// Can the node's applier take `svc-addon-*` kinds? Every OS: below
+/// [`APPLIER_ADDON_LEAVES_FLOOR`] the applier would refuse the whole bundle
+/// on a kind it does not know (exit 76). Unknown or unparseable version:
+/// WITHHOLD. Unlike the static kinds, no applier before the floor knows these
+/// at all, so guessing "it can" would fail the whole bundle; withholding only
+/// leaves the door unprovisioned, which the agent reports as
+/// `door_leaf_missing`.
+pub fn applier_knows_addon_leaf_kinds(app_version: &str) -> bool {
+    cli_version_triple(app_version).is_some_and(|v| v >= APPLIER_ADDON_LEAVES_FLOOR)
+}
+
+/// The note `cluster provision` prints, one line per node, when it withholds
+/// add-on door leaves from a node whose applier is not known to take them.
+pub fn addon_leaves_withheld_note(node: &str, app_version: &str) -> String {
+    let reports = if app_version.trim().is_empty() { "no CLI version" } else { app_version };
+    format!(
+        "no add-on door leaves in this bundle: {node} reports {reports}, which is not known to take \
+         the svc-addon-* kinds; run `noo upgrade --nodes` to update it and deliver them."
+    )
+}
+
+/// Issue or renew the add-on workload door leaves `node` should hold.
+/// Returns `(service, why)` for each leaf (re-)issued. An invalid pair is an
+/// error naming it, never skipped.
+pub fn ensure_addon_leaves(
+    ca: &ClusterCa,
+    node: &str,
+    days: i64,
+    doors: &[(String, String)],
+) -> Result<Vec<(String, String)>, String> {
+    for (a, w) in doors {
+        check_addon_door(a, w)?;
+    }
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let ski = ca_ski(&ca.ca_cert_path());
+    let mut issued = Vec::new();
+    for (a, w) in doors {
+        let service = addon_service(a, w);
+        let state = read_leaf(&ca.node_service_dir(node, &service));
+        if let Some(why) = reissue_reason(&state, &service, ski.as_deref(), now) {
+            ca.issue_node_service_cert(node, &service, &door_sans(&service), days)
+                .map_err(|e| format!("{service}: {e}"))?;
+            issued.push((service, why));
+        }
+    }
+    Ok(issued)
+}
+
+/// One add-on door bundle payload: (kind, bytes). The kind is owned
+/// (`svc-addon-<a>-<w>.crt`), unlike [`LeafPayload`]'s fixed names.
+pub type AddonLeafPayload = (String, Vec<u8>);
+
+/// Bundle payloads for `node`'s add-on door leaves: `svc-addon-<a>-<w>.crt` +
+/// `.key` for every door whose pair is on disk. A half pair is skipped and
+/// named in the second return, as in [`leaf_payloads`].
+pub fn addon_leaf_payloads(
+    ca: &ClusterCa,
+    node: &str,
+    doors: &[(String, String)],
+) -> Result<(Vec<AddonLeafPayload>, Vec<String>), String> {
+    for (a, w) in doors {
+        check_addon_door(a, w)?;
+    }
+    let mut out = Vec::new();
+    let mut skipped = Vec::new();
+    for (a, w) in doors {
+        let service = addon_service(a, w);
+        let dir = ca.node_service_dir(node, &service);
+        let (crt, key) = (dir.join("service.crt"), dir.join("service.key"));
+        if !crt.is_file() || !key.is_file() {
+            skipped.push(service);
+            continue;
+        }
+        let c = std::fs::read(&crt).map_err(|e| format!("{}: {e}", crt.display()))?;
+        let k = std::fs::read(&key).map_err(|e| format!("{}: {e}", key.display()))?;
+        let (ck, kk) = addon_leaf_kinds(a, w);
+        out.push((ck, c));
+        out.push((kk, k));
+    }
+    Ok((out, skipped))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,6 +632,109 @@ mod tests {
         assert!(!up.contains("noo cluster provision"), "{up}");
         let direct = withheld_leaves_note("host6", "noo-cli-v0.5.62", false);
         assert!(direct.contains("run `noo cluster provision host6` again"), "{direct}");
+    }
+
+    #[test]
+    fn addon_door_names_follow_the_label_rule_and_the_length_cap() {
+        assert!(addon_door_name_ok("rhaddon", "worker"));
+        assert!(addon_door_name_ok("a", "b"));
+        assert!(addon_door_name_ok("a1-b2", "w-0"));
+        // 25 + 1 + 25 = 51: the cap, allowed; one more is refused.
+        let (a25, w25, w26) = ("a".repeat(25), "w".repeat(25), "w".repeat(26));
+        assert!(addon_door_name_ok(&a25, &w25));
+        assert!(!addon_door_name_ok(&a25, &w26));
+        for (a, w) in [
+            ("a_b", "w"), ("a", "w_x"), ("Rh", "w"), ("a", "Worker"), ("-a", "w"), ("a-", "w"),
+            ("a", "-w"), ("a", "w-"), ("", "w"), ("a", ""), ("a.b", "w"), ("a/b", "w"), ("..", "w"),
+        ] {
+            assert!(!addon_door_name_ok(a, w), "{a}/{w} must be refused");
+        }
+    }
+
+    #[test]
+    fn addon_kinds_are_flat_svc_addon_names_and_judged_by_shape() {
+        assert_eq!(addon_service("rhaddon", "worker"), "addon-rhaddon-worker");
+        assert_eq!(
+            addon_leaf_kinds("rhaddon", "worker"),
+            ("svc-addon-rhaddon-worker.crt".to_string(), "svc-addon-rhaddon-worker.key".to_string())
+        );
+        for k in ["svc-addon-rhaddon-worker.crt", "svc-addon-rhaddon-worker.key", "svc-addon-a-b.crt"] {
+            assert!(addon_leaf_kind_ok(k), "{k}");
+        }
+        let longest = format!("svc-addon-{}.crt", "a".repeat(ADDON_DOOR_NAME_MAX));
+        assert!(addon_leaf_kind_ok(&longest));
+        let too_long = format!("svc-addon-{}.crt", "a".repeat(ADDON_DOOR_NAME_MAX + 1));
+        assert!(!addon_leaf_kind_ok(&too_long));
+        for k in [
+            "svc-addon-Bad.crt", "svc-addon-a_b-w.crt", "svc-addon-../x.crt", "svc-addon-.crt",
+            "svc-addon-a.b.crt", "svc-addon-a-.key", "svc-addon-a/b.crt", "svc-addon-a.crt.key",
+            "svc-vllm.crt", "svc-addon-a", "addon-a.crt", "svc-addon-a-b.pem",
+            "svc-addon--x.crt", "svc-addon--.key",
+        ] {
+            assert!(!addon_leaf_kind_ok(k), "{k} must be refused");
+        }
+    }
+
+    #[test]
+    fn an_addon_leaf_names_exactly_its_door() {
+        assert_eq!(door_sans("addon-rhaddon-worker"), vec!["noo-stunnel-rhaddon-worker".to_string()]);
+        let ca = scratch("addon-sans");
+        let doors = vec![("rhaddon".to_string(), "worker".to_string())];
+        let issued = ensure_addon_leaves(&ca, "host3", 90, &doors).unwrap();
+        assert_eq!(issued.len(), 1, "{issued:?}");
+        assert_eq!(issued[0].0, "addon-rhaddon-worker");
+        let dir = ca.node_service_dir("host3", "addon-rhaddon-worker");
+        assert!(dir.join("service.crt").is_file() && dir.join("service.key").is_file());
+        assert!(dir.starts_with(ca.dir.join("nodes/host3/services")));
+        match read_leaf(&dir) {
+            LeafState::Present { dns, .. } => {
+                let doors: Vec<&String> = dns.iter().filter(|d| d.starts_with("noo-")).collect();
+                assert_eq!(doors, vec!["noo-stunnel-rhaddon-worker"], "{dns:?}");
+                assert!(dns.iter().any(|d| d == "addon-rhaddon-worker") && dns.iter().any(|d| d == "localhost"), "{dns:?}");
+            }
+            other => panic!("expected a present leaf, got {other:?}"),
+        }
+        // Renewal logic is the static one: a good leaf is kept.
+        assert!(ensure_addon_leaves(&ca, "host3", 90, &doors).unwrap().is_empty());
+        // And it packs as the two flat kinds.
+        let (p, skipped) = addon_leaf_payloads(&ca, "host3", &doors).unwrap();
+        let kinds: Vec<&str> = p.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kinds, vec!["svc-addon-rhaddon-worker.crt", "svc-addon-rhaddon-worker.key"]);
+        assert!(skipped.is_empty());
+        let _ = std::fs::remove_dir_all(&ca.dir);
+    }
+
+    #[test]
+    fn an_invalid_addon_pair_is_refused_loudly_naming_the_pair() {
+        let ca = scratch("addon-bad");
+        let bad = vec![("Bad_Addon".to_string(), "worker".to_string())];
+        let e = ensure_addon_leaves(&ca, "n", 90, &bad).unwrap_err();
+        assert!(e.contains("Bad_Addon/worker"), "{e}");
+        let e = addon_leaf_payloads(&ca, "n", &bad).unwrap_err();
+        assert!(e.contains("Bad_Addon/worker"), "{e}");
+        assert!(!ca.dir.join("nodes/n").exists(), "nothing may be issued for a refused pair");
+        let _ = std::fs::remove_dir_all(&ca.dir);
+    }
+
+    #[test]
+    fn the_seam_returns_no_doors_until_the_parser_lands() {
+        assert!(node_workload_doors(Path::new("/nonexistent")).is_empty());
+    }
+
+    #[test]
+    fn the_addon_floor_withholds_below_and_includes_at_or_above() {
+        assert_eq!(APPLIER_ADDON_LEAVES_FLOOR, (0, 6, 18));
+        assert!(!applier_knows_addon_leaf_kinds("noo-cli-v0.6.17+abc"));
+        assert!(!applier_knows_addon_leaf_kinds("noo-cli-v0.5.99"));
+        assert!(applier_knows_addon_leaf_kinds("noo-cli-v0.6.18"));
+        assert!(applier_knows_addon_leaf_kinds("noo-cli-v0.6.19+x"));
+        assert!(applier_knows_addon_leaf_kinds("noo-cli-v0.7.0"));
+        assert!(!applier_knows_addon_leaf_kinds(""), "unknown version: withhold");
+        assert!(!applier_knows_addon_leaf_kinds("dev"), "unparseable version: withhold");
+        assert!(addon_leaves_withheld_note("host6", "").contains("no CLI version"));
+        let note = addon_leaves_withheld_note("host6", "noo-cli-v0.6.17");
+        assert!(note.contains("host6") && note.contains("noo upgrade --nodes"), "{note}");
+        assert!(!note.contains('\n'));
     }
 
     #[test]

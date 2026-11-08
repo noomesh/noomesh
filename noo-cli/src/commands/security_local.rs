@@ -246,6 +246,10 @@ pub(crate) struct ScanInputs {
     /// `Some(why)` when the repo `.env` holds a secret-class value
     /// (`plaintext_env::AtRest::plaintext_problem`) — names only.
     pub env_plaintext_secrets: Option<String>,
+    /// Ports this install's containers publish on every interface
+    /// (`container host_port`), and the recorded NOO_BIND_MODE (i515a).
+    /// `None` when docker could not be read: not checked, never "confined".
+    pub open_ports: Option<(Vec<String>, String)>,
     /// The posture-class checks (audit key, mTLS, hatches, gateway gates).
     /// `Default` is "nothing to report", so a fixture that does not care
     /// about them stays quiet; `security_scan` fills every field it could
@@ -347,6 +351,28 @@ pub(crate) type Finding = (&'static str, &'static str, String); // (severity, ch
 /// The check list from `security_cli.py::security_scan`, finding-for-finding
 /// (same wording, same severities). Returns findings in insertion order;
 /// the caller sorts by severity (stable, like Python's `sorted`).
+/// What `docker ps` shows this install's containers publishing on every
+/// interface, with the recorded bind mode. `None` when docker does not answer.
+fn open_ports_seen() -> Option<(Vec<String>, String)> {
+    use crate::commands::doctor::{docker_lines, is_our_container, parse_published, Reach};
+    let up = Command::new("docker")
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !up {
+        return None;
+    }
+    let mut open: Vec<String> = docker_lines(&["ps", "--format", "{{.Names}}\t{{.Ports}}"])
+        .iter()
+        .flat_map(|l| parse_published(l))
+        .filter(|p| is_our_container(&p.container) && p.reach == Reach::AnyInterface)
+        .map(|p| format!("{} {}", p.container, p.host_port))
+        .collect();
+    open.sort();
+    open.dedup();
+    Some((open, crate::commands::doctor::bind_mode_setting()))
+}
+
 pub(crate) fn scan_findings(i: &ScanInputs) -> Vec<Finding> {
     let mut issues: Vec<Finding> = Vec::new();
 
@@ -746,6 +772,26 @@ pub(crate) fn scan_findings(i: &ScanInputs) -> Vec<Finding> {
     // it at all.
     if let Err(why) = &i.gateway_trust {
         issues.push(("CRITICAL", "Gateway Transport", format!("{} — {why}", i.gateway_url)));
+    }
+
+    // i515a: a cluster-plane port on every interface. With no recorded
+    // NOO_BIND_MODE=all nobody decided it: CRITICAL, so the scan fails. With
+    // it, the decision is named at LOW, so a box that chose it is not red.
+    if let Some((open, mode)) = &i.open_ports {
+        let list = open.join(", ");
+        match crate::commands::doctor::open_verdict(open.len(), mode) {
+            crate::commands::doctor::OpenVerdict::Confined => {}
+            crate::commands::doctor::OpenVerdict::Decided => issues.push((
+                "LOW",
+                "Port Exposure",
+                format!("{} port(s) on every interface by the recorded decision NOO_BIND_MODE={mode} ({list}); the tailnet policy does not govern them", open.len()),
+            )),
+            crate::commands::doctor::OpenVerdict::Undecided => issues.push((
+                "CRITICAL",
+                "Port Exposure",
+                format!("{} port(s) on every interface with no NOO_BIND_MODE=all recorded ({list}): set NOO_BIND_MODE=tailnet in .env, then noo stack restart --force", open.len()),
+            )),
+        }
     }
 
     issues
@@ -1275,6 +1321,7 @@ fn install_findings(
             .map(|(k, _)| (*k).to_string())
             .collect(),
         env_plaintext_secrets: crate::commands::plaintext_env::AtRest::read(root).plaintext_problem(),
+        open_ports: open_ports_seen(),
         posture: PostureInputs {
             controller_secret: Some(env_var("NOO_CONTROLLER_SECRET")),
             admin_password: Some(env_var("NOO_ADMIN_PASSWORD")).filter(|p| !p.is_empty()),
@@ -3524,6 +3571,52 @@ pub(crate) struct RolloutTargets {
     pub(crate) no_material: Vec<String>,
 }
 
+/// May a rollout name `name` although the registry does not know it yet?
+///
+/// Only an agent registers, and a pull-rail node has no agent until its
+/// first bundle; that bundle needs the signing key, and the key went only
+/// to registered nodes. A first-time pull node could therefore never be
+/// provisioned (i545 finding 102, an outside tester's second machine: three
+/// good redeems, `'pop-os' is not a registered node` every time). Our fleet
+/// never hit it because every node adopted before the rule existed.
+///
+/// The answer is yes only for the node's NEWEST redeemed record, and only
+/// when that record is live (`is_live_enrollment`: used, a birth cert the
+/// bundle is encrypted to, not revoked) and names this exact node. The
+/// newest record of ANY state is the one judged: `latest_redemption` skips
+/// revoked rows first, so a node forgotten after an earlier enrollment
+/// would otherwise fall back to the older, still-unrevoked one. A token
+/// minted but never redeemed, another node's record, a record with no
+/// birth cert, and a forgotten node are all refused. This key decides who
+/// receives the fleet signing key.
+pub(crate) fn admit_enrolled_target(toks: &[serde_json::Value], name: &str) -> bool {
+    toks.iter()
+        .filter(|t| t.get("node_name").and_then(|v| v.as_str()) == Some(name))
+        .filter(|t| t.get("used_at").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()))
+        .max_by_key(|t| t.get("used_at").and_then(|v| v.as_str()).unwrap_or("").to_string())
+        .is_some_and(|t| {
+            crate::commands::provision::is_live_enrollment(t)
+                && t.get("used_by_ip").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
+        })
+}
+
+/// The names a rollout may target: the registry, plus the ONE node named on
+/// the command line when the registry does not know it but
+/// `admit_enrolled_target` does. A whole-fleet rollout stays the registry:
+/// an enrollment is admitted by name, never swept in.
+pub(crate) fn rollout_names(
+    mut registered: Vec<String>,
+    only: Option<&str>,
+    toks: &[serde_json::Value],
+) -> Vec<String> {
+    if let Some(o) = only {
+        if !registered.iter().any(|r| r.eq_ignore_ascii_case(o)) && admit_enrolled_target(toks, o) {
+            registered.push(o.to_string());
+        }
+    }
+    registered
+}
+
 pub(crate) fn split_rollout_targets(
     registered: &[String],
     pki_dirs: &[String],
@@ -3707,6 +3800,20 @@ pub fn pki_rotate_signing_key(g: &Globals, args: &[String]) -> Result<i32, Unhan
     }
     let registered: Vec<String> =
         fleet_nodes_from_registry(g).into_iter().map(|(n, _, _)| n).collect();
+    // A named node the registry does not know yet may still be a first-time
+    // pull node waiting for this very key (`admit_enrolled_target`). The
+    // enrollment list is read only then; an unreadable list admits nobody.
+    let named_unregistered = only
+        .as_deref()
+        .is_some_and(|o| !registered.iter().any(|r| r.eq_ignore_ascii_case(o)));
+    let toks: Vec<serde_json::Value> = if named_unregistered {
+        crate::http::get_json_opt(g, "/api/security/bootstrap-tokens", true, 15)
+            .and_then(|d| d["tokens"].as_array().cloned())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let registered = rollout_names(registered, only.as_deref(), &toks);
     let pki_dirs: Vec<String> = std::fs::read_dir(ca.dir.join("nodes"))
         .map(|rd| {
             rd.filter_map(|e| e.ok())
@@ -3729,7 +3836,10 @@ pub fn pki_rotate_signing_key(g: &Globals, args: &[String]) -> Result<i32, Unhan
                     ca.dir.join("nodes").join(o).display()
                 )
             } else {
-                format!("'{o}' is not registered with this controller")
+                format!(
+                    "'{o}' is not registered with this controller and holds no live enrollment \
+                     (a redeemed bootstrap token with a birth cert, not revoked)"
+                )
             };
             fail(g.json, ExitCode::Generic, "no_such_node", &detail,
                 Some("noo cluster status"));
@@ -4798,6 +4908,80 @@ mod tests {
         xs.iter().map(|s| s.to_string()).collect()
     }
 
+    // ── a first-time pull node: enrolled, not registered (i545 finding 102) ──
+    //
+    // A pull node registers only when its agent runs, and its agent arrives
+    // in the first bundle, which needs the signing key. Admitting it BY NAME
+    // on a live enrollment breaks the loop; anything weaker hands the fleet
+    // signing key to a name nobody enrolled.
+
+    fn tok(node: &str, used_at: Option<&str>, cert: &str, revoked: bool) -> serde_json::Value {
+        serde_json::json!({
+            "node_name": node,
+            "used_at": used_at,
+            "used_by_ip": if used_at.is_some() { "100.64.0.9" } else { "" },
+            "birth_cert": cert,
+            "revoked": revoked,
+        })
+    }
+
+    #[test]
+    fn a_named_first_time_pull_node_with_a_live_enrollment_is_a_rollout_target() {
+        let toks = vec![tok("pop-os", Some("2026-11-07T10:00:00Z"), "PEM", false)];
+        let names = super::rollout_names(v(&["controller"]), Some("pop-os"), &toks);
+        assert_eq!(names, v(&["controller", "pop-os"]));
+        // provision issued its certs first on 0.6.17 (finding 99): that
+        // directory is the node's own material now, not a forgotten node's.
+        let t = super::split_rollout_targets(&names, &v(&["pop-os"]), "controller", Some("pop-os"));
+        assert_eq!(t.nodes, v(&["pop-os"]));
+        assert!(t.orphaned.is_empty(), "an enrolled node's PKI dir was called orphaned: {:?}", t.orphaned);
+    }
+
+    #[test]
+    fn a_whole_fleet_rollout_never_sweeps_in_an_enrollment() {
+        let toks = vec![tok("pop-os", Some("2026-11-07T10:00:00Z"), "PEM", false)];
+        assert_eq!(super::rollout_names(v(&["host3"]), None, &toks), v(&["host3"]));
+    }
+
+    #[test]
+    fn only_a_live_enrollment_for_that_exact_node_admits_it() {
+        let used = Some("2026-11-07T10:00:00Z");
+        let cases: Vec<(&str, Vec<serde_json::Value>)> = vec![
+            ("no record at all", vec![]),
+            ("a token minted but never redeemed", vec![tok("pop-os", None, "", false)]),
+            ("a forgotten (revoked) enrollment", vec![tok("pop-os", used, "PEM", true)]),
+            ("a redeemed record with no birth cert", vec![tok("pop-os", used, "", false)]),
+            ("another node's live record", vec![tok("pop-os-1", used, "PEM", false)]),
+            ("a name that differs only in case", vec![tok("Pop-OS", used, "PEM", false)]),
+            (
+                "an older live record superseded by a newer revoked one",
+                vec![
+                    tok("pop-os", Some("2026-11-06T09:00:00Z"), "PEM", false),
+                    tok("pop-os", Some("2026-11-07T10:00:00Z"), "PEM", true),
+                ],
+            ),
+        ];
+        for (what, toks) in cases {
+            assert!(!super::admit_enrolled_target(&toks, "pop-os"), "admitted on {what}");
+            assert_eq!(
+                super::rollout_names(v(&["controller"]), Some("pop-os"), &toks),
+                v(&["controller"]),
+                "{what} made pop-os a rollout target"
+            );
+        }
+    }
+
+    #[test]
+    fn a_newer_live_enrollment_after_a_forget_admits_the_node_again() {
+        // `noo cluster forget`, then a fresh `noo enroll`: the newest record
+        // is live, so the re-joined node is admitted.
+        let toks = vec![
+            tok("pop-os", Some("2026-11-06T09:00:00Z"), "PEM", true),
+            tok("pop-os", Some("2026-11-07T10:00:00Z"), "PEM2", false),
+        ];
+        assert!(super::admit_enrolled_target(&toks, "pop-os"));
+    }
+
     #[test]
     fn a_forgotten_nodes_leftover_pki_dir_is_orphaned_material_not_a_straggler() {
         let t = super::split_rollout_targets(
@@ -5177,6 +5361,7 @@ mod tests {
             runtime_residue: Vec::new(),
             retired_store_keys: Vec::new(),
             env_plaintext_secrets: None,
+            open_ports: None,
             posture: PostureInputs::default(),
         }
     }
@@ -5394,6 +5579,32 @@ mod tests {
     #[test]
     fn scan_clean_config_has_no_findings() {
         assert!(scan_findings(&clean_inputs()).is_empty());
+    }
+
+    /// i515a: a cluster-plane port on every interface fails the scan
+    /// (CRITICAL) unless NOO_BIND_MODE=all is recorded, when it is named at
+    /// LOW; confined ports and an unread docker say nothing.
+    #[test]
+    fn scan_fails_an_undecided_open_port_and_names_a_decided_one() {
+        let with = |open: &[&str], mode: &str| {
+            let mut i = clean_inputs();
+            i.open_ports = Some((open.iter().map(|s| s.to_string()).collect(), mode.to_string()));
+            scan_findings(&i)
+        };
+        let f = with(&["noo-gateway 8080"], "tailnet");
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!((f[0].0, f[0].1), ("CRITICAL", "Port Exposure"));
+        assert!(f[0].2.contains("noo-gateway 8080") && f[0].2.contains("NOO_BIND_MODE=tailnet"), "{}", f[0].2);
+        assert_eq!(scan_exit(&f, false), 1, "an undecided open port must fail the scan");
+
+        let f = with(&["noo-gateway 8080"], "all");
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!((f[0].0, f[0].1), ("LOW", "Port Exposure"));
+        assert!(f[0].2.contains("recorded decision NOO_BIND_MODE=all"), "{}", f[0].2);
+        assert_eq!(scan_exit(&f, false), 0, "a recorded `all` must not fail the scan");
+
+        assert!(with(&[], "tailnet").is_empty());
+        assert!(scan_findings(&clean_inputs()).is_empty(), "docker not read: nothing claimed");
     }
 
     #[test]
@@ -5679,6 +5890,7 @@ mod tests {
             runtime_residue: Vec::new(),
             retired_store_keys: Vec::new(),
             env_plaintext_secrets: None,
+            open_ports: None,
             posture: PostureInputs::default(),
         };
         let mut f = scan_findings(&i);

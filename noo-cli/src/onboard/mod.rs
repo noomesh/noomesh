@@ -61,6 +61,7 @@ use event::{UiEvent, WizardUi};
 /// full-access mode.
 pub(crate) const SECRETS: &[(&str, &str)] = &[
     ("jwt_secret", "NOO_JWT_SECRET"),
+    ("integrations_key", "NOO_INTEGRATIONS_KEY"),
     ("agent_review_key", "NOO_AGENT_REVIEW_KEY"),
     ("controller_secret", "NOO_CONTROLLER_SECRET"),
     ("cluster_secret", "NOO_CLUSTER_SECRET"),
@@ -1316,6 +1317,7 @@ fn run_all(ctx: &mut Ctx) {
         steps::addons(ctx);
         steps::provision_service_keys(ctx);
         steps::stage_voice_models(ctx);
+        steps::install_after_boot_unit(ctx);
     }
     ctx.pause(10, TOTAL);
 }

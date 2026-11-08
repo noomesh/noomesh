@@ -1,0 +1,94 @@
+{
+  "format": "noo-model-set/1",
+  "id": "rh-s2s-7b",
+  "revision": "0123456789abcdef0123456789abcdef01234567",
+  "kind": "voice",
+  "modality": "speech-to-speech",
+  "runtime": [
+    "rh-s2s"
+  ],
+  "source": {
+    "hf": {
+      "repo": "example-org/rh-s2s-7b",
+      "ref": "0123456789abcdef0123456789abcdef01234567",
+      "digests": "authenticated"
+    }
+  },
+  "license": {
+    "id": "example-open-model-license",
+    "url": "https://example.invalid/licenses/open-model",
+    "accept": "operator",
+    "accepted": {
+      "by": "operator",
+      "at": "2026-11-01T12:00:00Z"
+    },
+    "notice_files": [
+      "LICENSE.txt",
+      "README.md"
+    ],
+    "additional": [
+      {
+        "id": "CC-BY-4.0",
+        "url": "https://creativecommons.org/licenses/by/4.0/"
+      }
+    ]
+  },
+  "files": [
+    {
+      "path": "model.safetensors",
+      "bytes": 15600000000,
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "role": "weights",
+      "from_archive": {
+        "path": "voices.tgz",
+        "sha256": "ABC",
+        "bytes": 99000000
+      }
+    },
+    {
+      "path": "tokenizer.model",
+      "bytes": 560000,
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "path": "config.json",
+      "bytes": 2048,
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "role": "config"
+    },
+    {
+      "path": "README.md",
+      "bytes": 4096,
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "role": "notice"
+    },
+    {
+      "path": "LICENSE.txt",
+      "bytes": 8192,
+      "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "role": "notice"
+    }
+  ],
+  "needs": {
+    "profiles": [
+      {
+        "name": "int8",
+        "accel": "cuda",
+        "min_compute": "8.0",
+        "vram_mb": 14336,
+        "ram_mb": 20480,
+        "per_slot_vram_mb": 2600,
+        "realtime": true
+      },
+      {
+        "name": "bf16-offload",
+        "accel": "cuda",
+        "realtime": false
+      }
+    ],
+    "cpu_fallback": false,
+    "arch": [
+      "amd64"
+    ]
+  }
+}

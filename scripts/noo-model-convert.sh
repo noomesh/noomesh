@@ -32,14 +32,31 @@ say() { echo -e "\033[0;36m==>\033[0m $*"; }
 die() { echo -e "\033[0;31mERROR:\033[0m $*" >&2; exit 1; }
 
 command -v docker >/dev/null 2>&1 || die "docker not found"
-# Ollama may be a host binary OR the noo-ollama container. If neither is
-# available we still produce the GGUF + Modelfile and print the create command.
+# Ollama may be a host binary OR an Ollama container: `noo-ollama` (a full
+# controller) or `noo-ollama-embed` (the standalone profile, where it is the
+# only one). An outside tester's standalone box (i545 finding 55) had only
+# the second, so this stopped at "GGUF is ready" and harrier had to be
+# copied in by hand. If none is available we still produce the GGUF +
+# Modelfile and print the create command.
+pick_ollama_container() {
+    local running
+    running="$(docker ps --format '{{.Names}}' 2>/dev/null)" || return 1
+    for c in noo-ollama noo-ollama-embed; do
+        if printf '%s\n' "$running" | grep -qx "$c"; then
+            echo "$c"
+            return 0
+        fi
+    done
+    return 1
+}
+
 OLLAMA_MODE="none"
+OLLAMA_CTR=""
 if [ -n "${NOO_CONVERT_GGUF_ONLY:-}" ]; then
     :  # forced GGUF-only (e.g. ship-model converts on the controller, creates on the node)
 elif command -v ollama >/dev/null 2>&1; then
     OLLAMA_MODE="host"
-elif docker ps --format '{{.Names}}' 2>/dev/null | grep -qx noo-ollama; then
+elif OLLAMA_CTR="$(pick_ollama_container)"; then
     OLLAMA_MODE="container"
 fi
 
@@ -85,22 +102,22 @@ case "$OLLAMA_MODE" in
         ( cd "$ABS_WORK" && ollama create "$OLLAMA_NAME" -f "$(basename "$MODELFILE")" )
         ;;
     container)
-        say "ollama create $OLLAMA_NAME (in the noo-ollama container)"
+        say "ollama create $OLLAMA_NAME (in the $OLLAMA_CTR container)"
         # The hardened image is uid 65532 with a root-owned `/`: stage under
         # the user's own store (a mounted volume), never at a root-level path.
         # Keep in step with noo-cli OLLAMA_CONVERT_DIR / node-agent convertDir.
         OLLAMA_CONVERT_DIR=/home/nonroot/.ollama/convert
         chmod a+r "$ABS_WORK/$OUT" "$MODELFILE"
-        docker exec noo-ollama sh -c "rm -rf $OLLAMA_CONVERT_DIR && mkdir -p $OLLAMA_CONVERT_DIR"
-        docker cp "$ABS_WORK/$OUT" "noo-ollama:$OLLAMA_CONVERT_DIR/$OUT"
-        docker cp "$MODELFILE" "noo-ollama:$OLLAMA_CONVERT_DIR/Modelfile"
+        docker exec "$OLLAMA_CTR" sh -c "rm -rf $OLLAMA_CONVERT_DIR && mkdir -p $OLLAMA_CONVERT_DIR"
+        docker cp "$ABS_WORK/$OUT" "$OLLAMA_CTR:$OLLAMA_CONVERT_DIR/$OUT"
+        docker cp "$MODELFILE" "$OLLAMA_CTR:$OLLAMA_CONVERT_DIR/Modelfile"
         rc=0
-        docker exec -w "$OLLAMA_CONVERT_DIR" noo-ollama ollama create "$OLLAMA_NAME" -f Modelfile || rc=$?
-        docker exec noo-ollama rm -rf "$OLLAMA_CONVERT_DIR" >/dev/null 2>&1 || true
+        docker exec -w "$OLLAMA_CONVERT_DIR" "$OLLAMA_CTR" ollama create "$OLLAMA_NAME" -f Modelfile || rc=$?
+        docker exec "$OLLAMA_CTR" rm -rf "$OLLAMA_CONVERT_DIR" >/dev/null 2>&1 || true
         [ "$rc" -eq 0 ] || exit "$rc"
         ;;
     none)
-        say "no Ollama (host binary or noo-ollama container) found — GGUF is ready."
+        say "no Ollama (host binary, noo-ollama or noo-ollama-embed container) found — GGUF is ready."
         say "when Ollama is up, run:  (cd $ABS_WORK && ollama create $OLLAMA_NAME -f $(basename "$MODELFILE"))"
         say "GGUF: $ABS_WORK/$OUT"
         exit 0

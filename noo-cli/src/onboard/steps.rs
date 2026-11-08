@@ -5354,9 +5354,11 @@ pub fn services(ctx: &mut Ctx) {
         if let Some((n, root, why)) = storage_preflight_refusal(ctx) {
             ctx.error(&format!("Stack not started: {why}"));
             record_storage_summary_failure(ctx, n, &root);
+            services_after_failure(ctx, false);
             return;
         }
         if !pin_dist_stack_lock(ctx) {
+            services_after_failure(ctx, false);
             return;
         }
         ctx.progress("Starting stack from released images (scripts/noomesh-start.sh --dist)...");
@@ -5388,6 +5390,7 @@ pub fn services(ctx: &mut Ctx) {
             if let Some((_, _, why)) = storage_preflight_refusal(ctx) {
                 ctx.error(&format!("Stack launch refused: {why}; no repair retry"));
                 ctx.state.hard_failures.push(format!("services: the stack was not started ({why})"));
+                services_after_failure(ctx, true);
                 return;
             }
             ctx.warn("Stack launch failed — attempting automatic repair (stale volume sweep) and ONE retry...");
@@ -5402,6 +5405,7 @@ pub fn services(ctx: &mut Ctx) {
         if code != 0 {
             ctx.error("Failed to start services from released images (after one repair retry)");
             ctx.state.hard_failures.push("services: the stack did not start from released images (see the launcher output above)".into());
+            services_after_failure(ctx, true);
             return;
         }
         ctx.progress("Waiting for gateway on :8080...");
@@ -5487,6 +5491,7 @@ pub fn services(ctx: &mut Ctx) {
                 ctx.state.hard_failures.push(format!(
                     "services: the {who} add-on is on and has no verified pin to run (run `{fix}`, then `noo onboard --only services`)"
                 ));
+                services_after_failure(ctx, false);
                 return;
             }
         }
@@ -5496,6 +5501,7 @@ pub fn services(ctx: &mut Ctx) {
         if code != 0 {
             ctx.error("Failed to restart services");
             ctx.state.hard_failures.push("services: the stack did not restart (see the compose output above)".into());
+            services_after_failure(ctx, true);
             return;
         }
         ctx.progress("Waiting for PostgreSQL...");
@@ -5516,6 +5522,8 @@ pub fn services(ctx: &mut Ctx) {
                 // nothing to `up`, and "continuing" used to hand the failure
                 // to the next step as a missing-image error nobody could read.
                 ctx.error("Image build FAILED — nothing to run. Fix the build, or answer 'dist' to run released images: noo onboard --only services");
+                ctx.state.hard_failures.push("services: the image build failed (see the build output above)".into());
+                services_after_failure(ctx, false);
                 return;
             } else {
                 ctx.success("Images built");
@@ -5534,6 +5542,7 @@ pub fn services(ctx: &mut Ctx) {
             if code != 0 {
                 ctx.error(&format!("Failed to start core services: {}", out.chars().take(300).collect::<String>()));
                 ctx.state.hard_failures.push("services: the core services did not start (see the compose output above)".into());
+                services_after_failure(ctx, true);
                 return;
             }
             ctx.success("Core services started");
@@ -5549,6 +5558,8 @@ pub fn services(ctx: &mut Ctx) {
             let (code, out) = sh::run_compose(ctx, &["--profile", "controller", "up", "-d", "--no-build", "--force-recreate", "gateway"]);
             if code != 0 {
                 ctx.error(&format!("Failed to start gateway: {}", out.chars().take(300).collect::<String>()));
+                ctx.state.hard_failures.push("services: the gateway did not start (see the compose output above)".into());
+                services_after_failure(ctx, true);
                 return;
             }
             ctx.success("Gateway started");
@@ -5572,6 +5583,7 @@ pub fn services(ctx: &mut Ctx) {
             if code != 0 {
                 ctx.error(&format!("Failed to start the rest of the profile: {}", out.chars().take(300).collect::<String>()));
                 ctx.state.hard_failures.push("services: the monitoring set and supporting services did not start (see the compose output above)".into());
+                services_after_failure(ctx, true);
                 return;
             }
             ctx.success("Controller profile running");
@@ -5588,6 +5600,80 @@ pub fn services(ctx: &mut Ctx) {
 
     ctx.state.services_started = true;
     services_tail(ctx);
+}
+
+/// A services step that recorded a hard failure still finishes what does not
+/// need the failed piece.
+///
+/// Every failing branch used to `return` before `services_tail`, so a single
+/// failed container (an outside tester's GPU with no NVIDIA container
+/// toolkit: `noo-ollama-embed` could not start, i545 findings 9/10) also cost
+/// the controller its own node agent and its embedder, and the failure
+/// summary never said so (findings 8, 26, 53). The gateway was up a minute
+/// later the whole time.
+///
+/// `launched`: a launch was attempted, so the gateway may still be coming up
+/// and is given up to `SERVICES_API_WAIT_SECS`; a refusal before any launch
+/// probes once (a gateway left running from before still counts).
+fn services_after_failure(ctx: &mut Ctx, launched: bool) {
+    if ctx.dry_run {
+        ctx.dry("after a failed services step: install the agent and the embedder if the gateway answers");
+        return;
+    }
+    let health_url = "https://localhost:8080/health";
+    let up = if launched {
+        ctx.progress("A services step failed — waiting for the gateway before the agent and embedder steps...");
+        sh::wait_for_http(ctx, health_url, SERVICES_API_WAIT_SECS)
+    } else {
+        sh::http_get_ok(health_url)
+    };
+    if up {
+        ctx.warn("The services step failed (above), but the gateway answers: installing the node agent and the embedder anyway");
+        ensure_cli_login(ctx);
+        services_tail(ctx);
+    } else {
+        ctx.warn("The gateway does not answer, so the node agent and the embedder were not installed; \
+                  fix the failure above, then: noo onboard --only services");
+    }
+}
+
+/// How long the services step waits for the gateway to serve a real API read
+/// before it installs the controller's own agent. 45 s of `/health` was not
+/// enough on an outside tester's box (i545 finding 8: `noo health` was
+/// healthy about a minute after the wizard gave up).
+const SERVICES_API_WAIT_SECS: u64 = 120;
+
+/// Wait until the gateway answers an authenticated read of the node
+/// registry, the first thing `provision` asks it. `/health` answers before
+/// the API routes are ready to serve one.
+fn wait_for_api_read(ctx: &Ctx) -> bool {
+    if ctx.dry_run {
+        return true;
+    }
+    let g = ctx.g;
+    crate::commands::security_local::poll_until(
+        std::time::Duration::from_secs(SERVICES_API_WAIT_SECS),
+        std::time::Duration::from_secs(5),
+        &mut |d| std::thread::sleep(d),
+        &mut || crate::http::get_json_opt(g, "/api/cluster/nodes", true, 10).map(|_| ()),
+    )
+    .is_some()
+}
+
+/// Run `attempt`; on failure run `between` (a wait), then try exactly once
+/// more. The self-agent install is the caller: its first try can land while
+/// the API is still settling.
+pub(crate) fn retry_once<T, E>(
+    mut attempt: impl FnMut() -> Result<T, E>,
+    mut between: impl FnMut(),
+) -> Result<T, E> {
+    match attempt() {
+        Ok(v) => Ok(v),
+        Err(_) => {
+            between();
+            attempt()
+        }
+    }
 }
 
 /// THE one services ending — every branch of `services()` (already-healthy,
@@ -5645,11 +5731,22 @@ fn ensure_self_agent(ctx: &mut Ctx) {
             ctx.info(&format!("Restaging the self-agent for '{node_id}' over the rail{}.",
                 if identity_ok { " (no sudo)" } else { " — its node identity is created first, sudo once" }));
             hydrate_process_env(ctx);
+            if !wait_for_api_read(ctx) {
+                ctx.warn("The gateway API did not answer a node-registry read yet — trying the restage anyway");
+            }
             // In a child process: `cluster provision` reports failures by
-            // exiting, and that must not end onboard here.
-            match crate::commands::upgrade::provision_one(ctx.g, &node_id, &[]) {
-                Ok(0) => {}
-                _ => ctx.warn(&format!("Self-agent restage did not complete — onboard continues; retry: noo cluster provision {node_id}")),
+            // exiting, and that must not end onboard here. One retry after
+            // another API wait (i545 finding 8).
+            let g = ctx.g;
+            let ran = retry_once(
+                || match crate::commands::upgrade::provision_one(g, &node_id, &[]) {
+                    Ok(0) => Ok(()),
+                    _ => Err(()),
+                },
+                || { let _ = wait_for_api_read(ctx); },
+            );
+            if ran.is_err() {
+                ctx.warn(&format!("Self-agent restage did not complete — onboard continues; retry: noo cluster provision {node_id}"));
             }
         }
         SelfAgentStep::FirstInstall => {
@@ -5659,10 +5756,19 @@ fn ensure_self_agent(ctx: &mut Ctx) {
                 &format!("Install the host agent and its node identity for '{node_id}' now? (uses sudo, once)"), true);
             if go {
                 hydrate_process_env(ctx);
+                if !wait_for_api_read(ctx) {
+                    ctx.warn("The gateway API did not answer a node-registry read yet — trying the install anyway");
+                }
                 // An error comes back here (provision_local never exits):
                 // warn and go on with hostd, placement, the embed model and
-                // the rest of the services step.
-                if let Err(e) = crate::commands::provision::provision_local(ctx.g, &node_id, None) {
+                // the rest of the services step. One retry after another API
+                // wait (i545 finding 8: the first try landed before the API).
+                let g = ctx.g;
+                let installed = retry_once(
+                    || crate::commands::provision::provision_local(g, &node_id, None),
+                    || { let _ = wait_for_api_read(ctx); },
+                );
+                if let Err(e) = installed {
                     ctx.warn(&format!("Self-agent install did not complete ({e}) — onboard continues; retry later: noo onboard --only services"));
                 }
             } else {
@@ -7792,6 +7898,90 @@ pub fn addons(ctx: &mut Ctx) {
     }
 }
 
+/// Write `body` to the root-owned `path` (root:root 0644) with `sudo tee`:
+/// the content goes over stdin, never through a shell string.
+fn sudo_write_root_file(may_prompt: bool, path: &str, body: &str) -> Result<(), String> {
+    use std::process::Stdio;
+    let mut child = sudo_cmd(may_prompt)
+        .args(["tee", path])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn tee: {e}"))?;
+    if let Some(mut si) = child.stdin.take() {
+        crate::child_stdin::write_child_stdin(&mut si, body.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    }
+    if !child.wait().map(|s| s.success()).unwrap_or(false) {
+        return Err(format!("could not write {path}"));
+    }
+    // tee keeps the owner and mode of a file that was already there.
+    for argv in [["chown", "root:root", path], ["chmod", "644", path]] {
+        let ok = sudo_cmd(may_prompt).args(argv).status().map(|s| s.success()).unwrap_or(false);
+        if !ok {
+            return Err(format!("could not set {path} to root:root 0644"));
+        }
+    }
+    Ok(())
+}
+
+/// Controller only (i509): install `noo-addons-after-boot.service`, the
+/// oneshot that runs `noo addons after-boot` once per boot as the install
+/// owner, and the root-owned record of who that owner is
+/// (`/etc/noo/addons-after-boot.owner`, which the command checks the unit
+/// against). Enabled, not started: it runs at the next boot.
+pub fn install_after_boot_unit(ctx: &mut Ctx) {
+    use crate::commands::addon_after_boot as ab;
+    if ctx.state.mode == "worker" {
+        return;
+    }
+    if !Path::new("/run/systemd/system").is_dir() {
+        ctx.info("No systemd here — skipping the boot-time add-on restart unit.");
+        return;
+    }
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let name = Command::new("id").arg("-un").output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
+    let root = ctx.repo_root.display().to_string();
+    let rendered = ab::render_owner(uid, &name).and_then(|owner| ab::render_unit(&name, &exe, &root).map(|unit| (owner, unit)));
+    let (owner, unit) = match rendered {
+        Ok(r) => r,
+        Err(e) => {
+            ctx.warn(&format!("boot-time add-on restart unit not installed: {e}"));
+            ctx.raw("    Re-run `noo onboard --only addons` as the install owner (not root) to install it.");
+            return;
+        }
+    };
+    let may_prompt = ctx_sudo_may_prompt(ctx);
+    let installed = (|| -> Result<(), String> {
+        let ok = sudo_cmd(may_prompt).args(["install", "-d", "-m", "755", "/etc/noo"]).status().map(|s| s.success()).unwrap_or(false);
+        if !ok {
+            return Err("could not create /etc/noo".into());
+        }
+        sudo_write_root_file(may_prompt, ab::OWNER_PATH, &owner)?;
+        sudo_write_root_file(may_prompt, ab::UNIT_PATH, &unit)?;
+        for argv in [["systemctl", "daemon-reload"], ["systemctl", "enable"]] {
+            let mut c = sudo_cmd(may_prompt);
+            c.args(argv);
+            if argv[1] == "enable" {
+                c.arg(ab::UNIT_NAME);
+            }
+            if !c.status().map(|s| s.success()).unwrap_or(false) {
+                return Err(format!("`sudo {}` failed", argv.join(" ")));
+            }
+        }
+        Ok(())
+    })();
+    match installed {
+        Ok(()) => ctx.success(&format!("{} is enabled: after a reboot, enabled add-ons that are down are started once.", ab::UNIT_NAME)),
+        Err(e) => {
+            ctx.warn(&format!("boot-time add-on restart unit not installed: {e}"));
+            ctx.raw("    After a reboot, start a down add-on yourself with `noo stack restart <addon>`; or re-run `noo onboard --only addons`.");
+            sudo_refused(ctx, "boot-time add-on restart unit", "noo onboard --only addons");
+        }
+    }
+}
+
 /// The summary's add-on lines: what is on, and for licensed ones whether
 /// the gateway will actually honour it.
 pub fn addons_summary(ctx: &Ctx) -> Vec<String> {
@@ -9449,5 +9639,70 @@ mod archive_restore_tests {
         let check = body.find("mdb::table_check(").expect("the table check");
         let marker = body.find("std::fs::write(marker").expect("the marker write");
         assert!(check < marker, "the marker is written only after the table check");
+    }
+}
+
+#[cfg(test)]
+mod services_after_failure_tests {
+    /// i545 findings 8/26/53: every services branch that recorded a hard
+    /// failure returned before `services_tail`, so one failed container also
+    /// cost the controller its own agent and its embedder. Each such return
+    /// now goes through `services_after_failure` first.
+    #[test]
+    fn every_hard_failure_in_services_still_reaches_the_agent_and_embedder() {
+        let src = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&src, "pub fn services(");
+        let from = body.find("let health_url").expect("the launch section starts at the health URL");
+        let launch = &body[from..];
+        let markers = ["hard_failures.push(", "record_storage_summary_failure(", "pin_dist_stack_lock("];
+        let mut sites = 0;
+        let mut prev = 0;
+        for (at, _) in launch.match_indices("return;") {
+            let chunk = &launch[prev..at];
+            prev = at + "return;".len();
+            if let Some(failed) = markers.iter().filter_map(|m| chunk.rfind(m)).max() {
+                sites += 1;
+                assert!(
+                    chunk[failed..].contains("services_after_failure(ctx"),
+                    "a hard failure returns without services_after_failure:\n{}",
+                    &chunk[failed..]
+                );
+            }
+        }
+        assert!(sites >= 10, "only {sites} hard-failure returns found; the guard is not reading services()");
+    }
+
+    #[test]
+    fn the_self_agent_install_waits_for_the_api_and_retries_once() {
+        let src = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&src, "fn ensure_self_agent(");
+        for call in ["provision_one(g, &node_id", "provision_local(g, &node_id"] {
+            let at = body.find(call).unwrap_or_else(|| panic!("{call} is gone"));
+            let before = &body[..at];
+            let wait = before.rfind("wait_for_api_read(ctx)").expect("an API wait before the install");
+            let retry = before.rfind("retry_once(").expect("the install is retried once");
+            assert!(wait < retry, "{call}: wait, then the retried install");
+        }
+    }
+
+    #[test]
+    fn retry_once_tries_exactly_twice_and_waits_between() {
+        let mut tries = 0;
+        let mut waits = 0;
+        let r: Result<(), ()> = super::retry_once(|| { tries += 1; Err(()) }, || waits += 1);
+        assert!(r.is_err());
+        assert_eq!((tries, waits), (2, 1), "one retry after one wait");
+
+        let mut tries = 0;
+        let mut waits = 0;
+        let r: Result<u8, ()> = super::retry_once(|| { tries += 1; if tries == 1 { Err(()) } else { Ok(7) } }, || waits += 1);
+        assert_eq!(r, Ok(7), "the second try's success is the answer");
+        assert_eq!((tries, waits), (2, 1));
+
+        let mut tries = 0;
+        let mut waits = 0;
+        let r: Result<u8, ()> = super::retry_once(|| { tries += 1; Ok(1) }, || waits += 1);
+        assert_eq!(r, Ok(1));
+        assert_eq!((tries, waits), (1, 0), "a first success is not retried");
     }
 }

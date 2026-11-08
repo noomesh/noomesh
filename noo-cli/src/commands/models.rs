@@ -89,6 +89,39 @@ pub(crate) fn parse_pull_with(a: &mut Args) -> Result<(String, String), ArgError
 /// on the whole download, Python parity). Progress lines go to stderr;
 /// stdout gets the final line — the last stream JSON object in `--json`
 /// mode, a one-line success message otherwise.
+/// `noo models pull harrier`: the published harrier artifact into this host's
+/// embed container (`ensure_embed_model_core`), never the Ollama registry.
+fn pull_harrier(g: &Globals) -> i32 {
+    let lines = crate::onboard::steps::ensure_embed_model_core("harrier");
+    let (ok, already) = harrier_pull_outcome(&lines);
+    if g.json {
+        println!("{}", serde_json::json!({"model": "harrier", "ok": ok, "already_present": already}));
+    } else {
+        for line in &lines {
+            match line.chars().next() {
+                Some('+') => ui::done(&line[1..]),
+                Some('!') => ui::warned(&line[1..]),
+                Some('.') => ui::step(&line[1..]),
+                _ => println!("{line}"),
+            }
+        }
+        if already {
+            ui::done("harrier is already in the embed container");
+        }
+    }
+    if ok { 0 } else { 1 }
+}
+
+/// `(ok, already_present)` from `ensure_embed_model_core`'s tagged lines: no
+/// lines means the model was already listed; otherwise only a `+` (created)
+/// line is success.
+pub(crate) fn harrier_pull_outcome(lines: &[String]) -> (bool, bool) {
+    if lines.is_empty() {
+        return (true, true);
+    }
+    (lines.iter().any(|l| l.starts_with('+')), false)
+}
+
 pub fn models_pull(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     use std::io::BufRead as _;
 
@@ -101,6 +134,14 @@ pub fn models_pull(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             Ok(m) => crate::commands::voice_models::pull(g, m),
             Err(e) => fail(g.json, ExitCode::Usage, "bad_args", &e, Some("noo models pull whisper:base | noo models pull piper:en_US-lessac-medium")),
         };
+    }
+    // harrier is in no Ollama registry: it is converted from its HF weights
+    // and published as an OCI artifact, so the gateway's Ollama pull answered
+    // "pull model manifest: file does not exist" (i545 finding 54, an outside
+    // tester following the embedder hint). The same fetch-and-create onboard
+    // and `noo upgrade --stack` run, on this host's embed container.
+    if model == "harrier" {
+        return Ok(pull_harrier(g));
     }
     if backend != "ollama" {
         // Python parity: only the ollama backend supports pull; exit 1.
@@ -363,6 +404,8 @@ pub(crate) struct ListArgs {
     tier: Option<i64>,
     limit: usize,
     refresh: bool,
+    /// `--kind voice|voice-pack`: list staged model sets, not the catalog.
+    kind: Option<String>,
 }
 
 pub(crate) fn parse_list_with(a: &mut Args) -> Result<ListArgs, ArgError> {
@@ -370,15 +413,24 @@ pub(crate) fn parse_list_with(a: &mut Args) -> Result<ListArgs, ArgError> {
     let tier = a.number::<i64>(&["--tier", "-t"])?;
     let limit = a.number::<usize>(&["--limit", "-n"])?.unwrap_or(15);
     let refresh = a.flag(&["--refresh"]);
+    let kind = a.value(&["--kind"])?;
     a.finish()?;
-    Ok(ListArgs { backend, tier, limit, refresh })
+    if kind.is_some() && (backend.is_some() || tier.is_some() || refresh) {
+        return Err(ArgError::new(
+            "--kind lists staged model sets; it does not combine with --backend, --tier or --refresh",
+        ));
+    }
+    Ok(ListArgs { backend, tier, limit, refresh, kind })
 }
 
 /// `noo models list [--backend/-b B] [--tier/-t N] [--limit/-n N] [--refresh]`
 /// — popular models per backend from the HuggingFace-backed catalog cache.
 pub fn models_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     crate::ui::auto_page(); // long output: $PAGER on a TTY (no-op otherwise)
-    let ListArgs { backend, tier, limit, refresh } = parse_list_with(&mut Args::new(args))?;
+    let ListArgs { backend, tier, limit, refresh, kind } = parse_list_with(&mut Args::new(args))?;
+    if let Some(kind) = kind {
+        return super::models_sets::list_sets(g, &kind);
+    }
 
     let backends: Vec<String> = match &backend {
         Some(b) => vec![b.clone()],
@@ -603,6 +655,30 @@ pub(crate) fn parse_recommended_with(a: &mut Args) -> Result<(Option<i64>, Optio
     Ok((tier, arch, refresh))
 }
 
+/// The hardware tier from `/api/cluster/nodes`: 1 at 10 GB of VRAM or more
+/// on the best node, 2 at 4 GB, else 3 (CPU). The route answers
+/// `{"nodes": [...], "stats": ...}`; reading it as a bare array (as this
+/// did) made every authenticated answer "could not read" and the tier CPU,
+/// whatever GPU the node had (i545 finding 23). A bare array is still read.
+/// `None` when the answer holds no node list.
+pub(crate) fn tier_from_nodes(v: &serde_json::Value) -> Option<i64> {
+    let arr = v.get("nodes").and_then(|n| n.as_array()).or_else(|| v.as_array())?;
+    // A standalone controller with no node yet reports none: tier 3 (CPU)
+    // is the honest floor when nothing reports VRAM (2026-09-28: tier 1
+    // there recommended 35 GB vLLM models to a CPU-only laptop).
+    let best_vram = arr
+        .iter()
+        .map(|n| n["capabilities"]["vram_gb"].as_f64().or_else(|| n["vram_gb"].as_f64()).unwrap_or(0.0))
+        .fold(0.0f64, f64::max);
+    Some(if best_vram >= 10.0 {
+        1
+    } else if best_vram >= 4.0 {
+        2
+    } else {
+        3
+    })
+}
+
 /// `noo models recommended [--tier/-t N] [--arch A] [--refresh]` — curated
 /// recommendations for a node's hardware tier + arch. Tier auto-detects
 /// from the gateway's node list when omitted; models already cached on the
@@ -615,24 +691,7 @@ pub fn models_recommended(g: &Globals, args: &[String]) -> Result<i32, Unhandled
     let tier = match tier {
         Some(t) => t,
         None => {
-            let detected = get_json_opt(g, "/api/cluster/nodes", true, 5).and_then(|nodes| {
-                let arr = nodes.as_array()?.clone();
-                // A standalone controller has NO nodes: the box itself is
-                // not one. Tier 1 there recommended 35 GB vLLM models to
-                // a CPU-only laptop (2026-09-28 newcomer rehearsal); tier
-                // 3 (CPU) is the honest floor when nothing reports VRAM.
-                let best_vram = arr
-                    .iter()
-                    .map(|n| n["capabilities"]["vram_gb"].as_f64().unwrap_or(0.0))
-                    .fold(0.0f64, f64::max);
-                Some(if best_vram >= 10.0 {
-                    1
-                } else if best_vram >= 4.0 {
-                    2
-                } else {
-                    3
-                })
-            });
+            let detected = get_json_opt(g, "/api/cluster/nodes", true, 5).and_then(|nodes| tier_from_nodes(&nodes));
             match detected {
                 Some(t) => {
                     if !g.json {
@@ -1299,6 +1358,23 @@ pub fn models_switch(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
 #[cfg(test)]
 mod switch_tests {
+    /// i545 23: the node list is under `nodes`; a GPU node's tier is read
+    /// from it, not lost to a misread shape.
+    #[test]
+    fn the_tier_is_read_from_the_routes_node_list() {
+        use serde_json::json;
+        let gpu = json!({"nodes": [{"capabilities": {"vram_gb": 12.0}}, {"capabilities": {"vram_gb": 2.0}}], "stats": {}});
+        assert_eq!(super::tier_from_nodes(&gpu), Some(1));
+        let mid = json!({"nodes": [{"capabilities": {"vram_gb": 6.0}}]});
+        assert_eq!(super::tier_from_nodes(&mid), Some(2));
+        let flat = json!({"nodes": [{"vram_gb": 5.0}]});
+        assert_eq!(super::tier_from_nodes(&flat), Some(2), "vram reported at the node's top level");
+        assert_eq!(super::tier_from_nodes(&json!({"nodes": [{"vram_gb": 2.0}]})), Some(3));
+        assert_eq!(super::tier_from_nodes(&json!({"nodes": []})), Some(3), "no node yet: the CPU floor");
+        assert_eq!(super::tier_from_nodes(&json!([{"capabilities": {"vram_gb": 24.0}}])), Some(1), "a bare array still reads");
+        assert_eq!(super::tier_from_nodes(&json!({"error": "x"})), None);
+    }
+
     use super::*;
 
     #[test]
@@ -1717,5 +1793,30 @@ mod switch_targets_the_installs_backend {
         assert!(!should_remove_stale_noo_ollama(true, "vllm", "created"));
         // Running — someone may be using it deliberately; never remove it.
         assert!(!should_remove_stale_noo_ollama(true, "ollama", "running"));
+    }
+}
+
+#[cfg(test)]
+mod harrier_pull_tests {
+    /// i545 finding 54: `noo models pull harrier` asked the Ollama registry,
+    /// which has no harrier ("pull model manifest: file does not exist").
+    #[test]
+    fn harrier_is_fetched_from_its_artifact_never_the_ollama_registry() {
+        let src = crate::test_src::own_code(include_str!("models.rs"));
+        let pull = crate::test_src::fn_body(&src, "pub fn models_pull(");
+        let route = pull.find("if model == \"harrier\"").expect("harrier is routed");
+        let ollama = pull.find("/api/terminal/ollama/pull").expect("the ollama pull");
+        assert!(route < ollama, "harrier must be routed before the Ollama pull");
+        assert!(pull[route..ollama].contains("pull_harrier(g)"));
+        assert!(crate::test_src::fn_body(&src, "fn pull_harrier(").contains("ensure_embed_model_core(\"harrier\")"));
+    }
+
+    #[test]
+    fn a_harrier_pull_succeeds_only_on_a_created_or_present_model() {
+        use super::harrier_pull_outcome;
+        let l = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        assert_eq!(harrier_pull_outcome(&[]), (true, true), "already listed");
+        assert_eq!(harrier_pull_outcome(&l(&[".Fetching", "+Embedding model ready: harrier (1024-dim)"])), (true, false));
+        assert_eq!(harrier_pull_outcome(&l(&[".Fetching", "!Could not fetch/create harrier", "      docker create"])), (false, false));
     }
 }

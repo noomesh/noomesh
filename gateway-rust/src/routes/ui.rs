@@ -94,9 +94,13 @@ pub fn router() -> Router<Arc<AppState>> {
 /// file here is a broken image rather than a reason to serve something
 /// else — say so instead of degrading into a blank page.
 async fn serve_index() -> impl IntoResponse {
+    serve_index_with_addon(None).await
+}
+
+pub(crate) async fn serve_index_with_addon(addon: Option<&str>) -> axum::response::Response {
     let path = format!("{}/index.html", crate::paths::UI_WWW_DIR);
     match tokio::fs::read_to_string(&path).await {
-        Ok(content) => axum::response::Html(content).into_response(),
+        Ok(content) => axum::response::Html(addon_space_html(content, addon)).into_response(),
         Err(e) => {
             tracing::error!("dashboard index unreadable at {path}: {e}");
             (
@@ -107,6 +111,13 @@ async fn serve_index() -> impl IntoResponse {
             )
                 .into_response()
         }
+    }
+}
+
+fn addon_space_html(content: String, addon: Option<&str>) -> String {
+    match addon.filter(|name| crate::addon_registry::name_ok(name)) {
+        Some(name) => content.replacen("<head>", &format!("<head><meta name=\"noo-addon-space\" content=\"{name}\">"), 1),
+        None => content,
     }
 }
 
@@ -1910,5 +1921,17 @@ mod browser_key_tests {
         let own = crate::test_src::own_code(src);
         let header = crate::test_src::fn_body(&own, "fn browser_auth_header()");
         assert!(header.contains("secret_opt(BROWSER_KEY)") && !header.contains("NOO_CLUSTER_SECRET"), "{header}");
+    }
+}
+
+#[cfg(test)]
+mod addon_space_tests {
+    #[test]
+    fn only_valid_names_enter_the_shell_metadata() {
+        let html = "<html><head></head></html>";
+        assert!(super::addon_space_html(html.into(), Some("rhaddon")).contains("noo-addon-space"));
+        for name in [None, Some("\"><script>bad</script>"), Some("../rhaddon")] {
+            assert_eq!(super::addon_space_html(html.into(), name), html);
+        }
     }
 }

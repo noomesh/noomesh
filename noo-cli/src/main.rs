@@ -63,6 +63,7 @@ mod entitlement;
 mod entitlement_terms;
 mod harness_kinds;
 mod harness_profiles;
+mod model_set;
 mod registry;
 mod release_fetch;
 mod release_sig;
@@ -235,6 +236,12 @@ const NATIVE: &[(&[&str], Handler)] = &[
     // Download a GGUF from Hugging Face into the controller store
     // (resume + LFS sha256 verify; commands/models_fetch.rs).
     (&["models", "fetch"], commands::models_fetch),
+    // Model sets (i300 F2b): authenticated HF fetch, signed manifest
+    // (commands/models_sets.rs). `models list --kind` is a branch of the
+    // catalog `models list` below.
+    (&["models", "stage"], commands::models_stage),
+    (&["models", "accept"], commands::models_accept),
+    (&["models", "rm"], commands::models_rm),
     (&["browser", "status"], commands::browser_status),
     (&["browser", "open"], commands::browser_open),
     (&["browser", "stop"], commands::browser_stop),
@@ -691,6 +698,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     // inspect and drop a per-person credential instead of signing with the
     // shared cluster HMAC. `login` hits the gateway's existing
     // POST /auth/token; nothing gateway-side changed.
+    (&["auth", "connect"], commands::auth_connect),
     (&["auth", "login"], commands::auth_login),
     (&["auth", "status"], commands::auth_status),
     (&["auth", "logout"], commands::auth_logout),
@@ -716,6 +724,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["addons", "launch-pins"], commands::addons_launch_pins),
     (&["addons", "launch-resources"], commands::addons_launch_resources),
     (&["addons", "rotate-secret"], commands::addons_rotate_secret),
+    (&["addons", "after-boot"], commands::addons_after_boot),
     (&["addons", "trust-key"], commands::addons_trust_key),
     (&["addons", "untrust-key"], commands::addons_untrust_key),
     (&["addons", "registry-login"], commands::addons_registry_login),
@@ -765,6 +774,10 @@ const HIDDEN_NATIVE: &[&[&str]] = &[
     // The launcher's materialiser of add-on runtime inputs (lib-dist.sh
     // addon_resources_materialise) — see `commands::addon_resources`.
     &["addons", "launch-resources"],
+    // The boot-time retry of enabled add-ons that are down
+    // (noo-addons-after-boot.service runs it as the install owner) — see
+    // `commands::addon_after_boot`.
+    &["addons", "after-boot"],
     // Pure aliases and internal/retired verbs: still dispatched, not in help.
     &["approval", "pending"],
     &["autonomy", "locations"],

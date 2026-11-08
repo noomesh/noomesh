@@ -2233,6 +2233,105 @@ CREATE INDEX IF NOT EXISTS noo_request_trace_trace_id_idx ON noo_request_trace (
 CREATE INDEX IF NOT EXISTS noo_request_trace_route_at_idx ON noo_request_trace (route, at);
 ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS trace_id text
 "#,
+}, Migration {
+    revision: CONNECTIONS_REVISION,
+    down_revision: Some(REQUEST_TRACE_REVISION),
+    sql: r#"
+CREATE TABLE noo_connected_accounts (
+    id uuid PRIMARY KEY,
+    owner_uuid uuid NOT NULL REFERENCES noo_users(user_uuid) ON DELETE CASCADE,
+    provider text NOT NULL CHECK (provider = 'google'),
+    label text NOT NULL CHECK (length(btrim(label)) BETWEEN 1 AND 100),
+    email_hint text CHECK (length(email_hint) <= 254),
+    status text NOT NULL DEFAULT 'needs_auth' CHECK (status = 'needs_auth'),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (id, owner_uuid)
+);
+CREATE INDEX ix_connected_accounts_owner ON noo_connected_accounts(owner_uuid);
+CREATE TABLE noo_connection_sources (
+    id uuid PRIMARY KEY,
+    owner_uuid uuid NOT NULL REFERENCES noo_users(user_uuid) ON DELETE CASCADE,
+    account_id uuid NOT NULL,
+    name text NOT NULL CHECK (length(btrim(name)) BETWEEN 1 AND 100),
+    kind text NOT NULL CHECK (kind IN ('google_drive', 'gmail')),
+    policy jsonb NOT NULL CHECK (jsonb_typeof(policy) = 'object' AND policy->>'kind' IS NOT NULL AND policy->>'kind' = kind),
+    status text NOT NULL DEFAULT 'draft' CHECK (status = 'draft'),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    FOREIGN KEY (account_id, owner_uuid) REFERENCES noo_connected_accounts(id, owner_uuid) ON DELETE CASCADE
+);
+CREATE INDEX ix_connection_sources_owner ON noo_connection_sources(owner_uuid);
+CREATE INDEX ix_connection_sources_account ON noo_connection_sources(account_id, owner_uuid);
+"#,
+}, Migration {
+    revision: INTEGRATION_OAUTH_REVISION,
+    down_revision: Some(CONNECTIONS_REVISION),
+    sql: include_str!("integrations/schema.sql"),
+}, Migration {
+    revision: INTEGRATION_PAIRING_REVISION,
+    down_revision: Some(INTEGRATION_OAUTH_REVISION),
+    sql: include_str!("integrations/pairing.sql"),
+}, Migration {
+    revision: INTEGRATION_CONTENT_REVISION,
+    down_revision: Some(INTEGRATION_PAIRING_REVISION),
+    sql: include_str!("integrations/content.sql"),
+}, Migration {
+    revision: INTEGRATION_PACING_REVISION,
+    down_revision: Some(INTEGRATION_CONTENT_REVISION),
+    sql: "ALTER TABLE noo_integration_sync ADD COLUMN last_gmail_scan timestamptz, ADD COLUMN last_page timestamptz; CREATE INDEX integration_sync_owner_pacing ON noo_integration_sync(owner_uuid)",
+}, Migration {
+    revision: NODE_WORKLOAD_PLACEMENTS_REVISION,
+    down_revision: Some(INTEGRATION_PACING_REVISION),
+    // i300 H3b-2: an operator's placement of an add-on node workload on ONE
+    // node (strict, no pool fallback in phase 2), the row desired-config's
+    // `node_workloads` entries are built from. A table of its own, never a
+    // `role` of `noo_backend_placements`: every reader of that table (the
+    // desired-config `placements` each agent acts on, the class table,
+    // verify) would take `addon:<a>/<w>` for a backend. One row per
+    // (addon, workload): the node is the operator's choice, not the add-on's.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_node_workload_placements (
+    addon text NOT NULL,
+    workload text NOT NULL,
+    node_id text NOT NULL,
+    profile text,
+    sets jsonb NOT NULL DEFAULT '{}'::jsonb,
+    env jsonb NOT NULL DEFAULT '{}'::jsonb,
+    on_controller boolean NOT NULL DEFAULT false,
+    desired_state text NOT NULL DEFAULT 'provisioned',
+    reservation uuid,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (addon, workload),
+    CONSTRAINT noo_node_workload_placements_state CHECK (desired_state IN ('provisioned', 'running', 'absent'))
+);
+CREATE INDEX IF NOT EXISTS noo_node_workload_placements_node_idx ON noo_node_workload_placements (node_id)
+"#,
+}, Migration {
+    revision: SEAT_BINDING_REVISION,
+    down_revision: Some(NODE_WORKLOAD_PLACEMENTS_REVISION),
+    // i510 part B: a kiosk display mints only as an enrolled, unrevoked seat.
+    // `tailnet_name` is the device name the seat reports on its signed rail
+    // (or an admin binds); the keyless mint matches the tailnet whois name
+    // against it. One device belongs to one seat. `revoked_at` cuts the
+    // seat's rail and its display; re-enrolment clears it. Additive; an
+    // older gateway ignores all three columns.
+    sql: r#"
+ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS tailnet_name text;
+ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS revoked_at timestamptz;
+ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS revoked_by text;
+CREATE UNIQUE INDEX IF NOT EXISTS noo_seats_tailnet_name_uq ON noo_seats (lower(tailnet_name)) WHERE tailnet_name IS NOT NULL
+"#,
+}, Migration {
+    revision: SEAT_DISPLAY_REVISION,
+    down_revision: Some(SEAT_BINDING_REVISION),
+    // i510 part B, c1: what the controller sets for a seat's display
+    // (quality, view, rotate, poll), read by the page through its proxy.
+    // An absent key keeps the box's own /etc/default/kiosk value. Additive.
+    sql: r#"
+ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS display jsonb;
+ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS display_set_by text;
+ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS display_set_at timestamptz
+"#,
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
@@ -2243,9 +2342,33 @@ pub const ADDON_ACCESS_REVISION: &str = "104_addon_access";
 /// so a renumber at rebase is one line.
 pub const REQUEST_TRACE_REVISION: &str = "105_request_trace";
 
+/// Google connections (noomesh #451): accounts, OAuth, pairing, the
+/// private corpus and its pacing, in that order on top of request tracing.
+pub const CONNECTIONS_REVISION: &str = "106_connection_drafts";
+pub const INTEGRATION_OAUTH_REVISION: &str = "107_integration_oauth";
+pub const INTEGRATION_PAIRING_REVISION: &str = "108_integration_pairing";
+pub const INTEGRATION_CONTENT_REVISION: &str = "109_integration_content";
+pub const INTEGRATION_PACING_REVISION: &str = "110_integration_pacing";
+
+/// Add-on node-workload placements (i300 H3b-2), on #799's 110: renumbered
+/// once from its claimed 113 when #799 landed first (i510 B1/B2 take the
+/// numbers after it). A constant so a renumber is one line (and the down
+/// revision).
+pub const NODE_WORKLOAD_PLACEMENTS_REVISION: &str = "111_node_workload_placements";
+
+/// Kiosk seats bound to their tailnet device, and revocable (i510 part B),
+/// on node-workload placements (111).
+/// A constant so a renumber at rebase is one line.
+pub const SEAT_BINDING_REVISION: &str = "112_seat_binding";
+
+/// Display settings the controller sets for a kiosk seat (i510 c1). A
+/// constant so a renumber at rebase is one line.
+pub const SEAT_DISPLAY_REVISION: &str = "113_seat_display";
+
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
 pub const PG_STAT_STATEMENTS_REVISION: &str = "103_pg_stat_statements";
+
 
 /// The embedding-space migration revision (i150). A constant so a renumber
 /// at rebase is one line.
@@ -3176,16 +3299,37 @@ mod tests {
         }
     }
 
-    /// i359: the request-trace revision is the chain head, sits on 104 (f99), is
+    /// i300 H3b-2: the node-workload placements revision sits on 110, fits the revision column, rewrites no row, and creates
+    /// every column the repo writes, keyed one node per (addon, workload).
+    #[test]
+    fn node_workload_placements_revision_sits_on_110_and_matches_its_writer() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == NODE_WORKLOAD_PLACEMENTS_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "111_node_workload_placements");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(INTEGRATION_PACING_REVISION), "it sits on Google connections' pacing (110)");
+        assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_node_workload_placements"));
+        assert!(m.sql.contains("PRIMARY KEY (addon, workload)"), "one node per workload: the operator's, strict");
+        assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE") && !m.sql.contains("noo_backend_placements"));
+        let writer = include_str!("repo/node_workload_placements.rs");
+        let insert = writer.split("INSERT INTO noo_node_workload_placements").nth(1).expect("the writer inserts");
+        let cols = insert.split('(').nth(1).and_then(|c| c.split(')').next()).expect("a column list");
+        for col in cols.split(',').map(str::trim) {
+            assert!(m.sql.contains(&format!("\n    {col} ")), "{col} is written but not created");
+        }
+    }
+
+    /// i359: the request-trace revision sits on 104 (f99), is
     /// idempotent, and creates exactly the columns `request_trace` writes
     /// and prunes by, plus the usage link `usage` writes.
     #[test]
-    fn request_trace_revision_is_the_head_and_matches_its_writers() {
+    fn request_trace_revision_sits_on_f99_and_matches_its_writers() {
         let m = MIGRATIONS.iter().find(|m| m.revision == REQUEST_TRACE_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "105_request_trace");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(ADDON_ACCESS_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(REQUEST_TRACE_REVISION), "the chain head");
+        let next = MIGRATIONS.iter().find(|n| n.down_revision == Some(REQUEST_TRACE_REVISION)).map(|n| n.revision);
+        assert_eq!(next, Some(CONNECTIONS_REVISION), "Google connections build on request tracing");
+        assert!(MIGRATIONS.iter().any(|m| m.revision == INTEGRATION_PACING_REVISION), "110 is in the chain");
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_request_trace"));
         assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE"), "no row is rewritten or dropped");
         let writer = include_str!("repo/request_trace.rs");
@@ -3211,6 +3355,7 @@ mod tests {
         assert_eq!(m.revision, "102_embedding_space_migration");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(EMBED_PLACEMENT_MODEL_REVISION));
+        assert!(MIGRATIONS.iter().any(|m| m.revision == INTEGRATION_PACING_REVISION), "110 is in the chain");
         for col in [
             "next_model text", "next_dims integer", "migration_state text", "migration_progress jsonb",
             "migration_started_at timestamptz", "migration_reported_at timestamptz",
@@ -3767,5 +3912,45 @@ mod legacy_layout_tests {
         let _ = sqlx::raw_sql("DROP DATABASE mesh_legacy_test (FORCE)")
             .execute(&admin)
             .await;
+    }
+}
+
+#[cfg(test)]
+mod seat_binding_migration_tests {
+    use super::*;
+
+    /// i510: the seat-binding revision sits on node-workload placements
+    /// (111), and is additive: three nullable columns and a partial
+    /// unique index, nothing rewritten or dropped.
+    #[test]
+    fn seat_binding_revision_is_additive() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == SEAT_BINDING_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "112_seat_binding");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(NODE_WORKLOAD_PLACEMENTS_REVISION));
+        for col in ["tailnet_name text", "revoked_at timestamptz", "revoked_by text"] {
+            assert!(m.sql.contains(&format!("ADD COLUMN IF NOT EXISTS {col}")), "{col}");
+        }
+        assert!(m.sql.contains("CREATE UNIQUE INDEX IF NOT EXISTS noo_seats_tailnet_name_uq"));
+        assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE") && !m.sql.contains("DROP"));
+    }
+}
+
+#[cfg(test)]
+mod seat_display_migration_tests {
+    use super::*;
+
+    /// i510 c1: the seat-display revision is the chain head, sits on seat
+    /// binding, and only adds nullable columns.
+    #[test]
+    fn seat_display_revision_is_the_head_and_additive() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == SEAT_DISPLAY_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "113_seat_display");
+        assert_eq!(m.down_revision, Some(SEAT_BINDING_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(SEAT_DISPLAY_REVISION), "the chain head");
+        for col in ["display jsonb", "display_set_by text", "display_set_at timestamptz"] {
+            assert!(m.sql.contains(&format!("ADD COLUMN IF NOT EXISTS {col}")), "{col}");
+        }
+        assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE") && !m.sql.contains("DROP"));
     }
 }

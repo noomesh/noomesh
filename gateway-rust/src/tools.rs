@@ -729,7 +729,14 @@ pub async fn execute_tool(
     // person the loop set in `mcp_bridge::CALLER`. Same middleware before
     // and after as any other tool; only the executor differs.
     if call.name.starts_with(crate::mcp_bridge::PREFIX) {
-        let ids = crate::mcp_bridge::server_ids(state).await;
+        let ids = match crate::mcp_bridge::server_ids(state).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                let mut result = ToolResult { name: call.name.clone(), tool_call_id: call.id.clone(), success: false, output: String::new(), error: Some(e) };
+                crate::middleware::after_tool_call(&mut result, &ctx);
+                return result;
+            }
+        };
         if let Some((server, tool)) = crate::mcp_bridge::split_name(&call.name, &ids) {
             let user = crate::mcp_bridge::current_caller();
             let mut result = match crate::mcp_bridge::call(state, user.as_deref(), &server, &tool, &call.arguments).await {
@@ -1097,9 +1104,8 @@ fn err_result(call: &ToolCall, error: String) -> ToolResult {
     }
 }
 
-/// `noo_rag_query` — publish straight to `worker.rag.query` (the same
-/// trellion handler `POST /api/v1/rag/query` delegates to). The Python tool
-/// shim added nothing but the HTTP hop; RAG itself stays on the ML plane.
+/// `noo_rag_query` uses the shared memory facade. Model tools never forward
+/// the human-only personal opt-in; explicit HTTP/CLI reads own that choice.
 async fn native_rag_query(state: &AppState, call: &ToolCall, args: &Value) -> ToolResult {
     let question = match arg_str(args, &["question", "query"]) {
         Some(q) => q,
@@ -1113,7 +1119,7 @@ async fn native_rag_query(state: &AppState, call: &ToolCall, args: &Value) -> To
         request["roles"] = roles.clone();
     }
 
-    match crate::trellion_client::TrellionClient::new(&state.nats).call_raw_with_timeout(crate::trellion_client::subjects::RAG_QUERY, request, tool_timeout()).await {
+    match state.memory().kb_query_with_timeout(&request, tool_timeout()).await {
         Ok(response) => {
             let data = response.get("data").cloned().unwrap_or(response);
             if let Some(e) = data.get("error").and_then(|e| e.as_str()) {

@@ -63,7 +63,7 @@ use super::bootstrap::{
 };
 use super::{AppError, AppResult};
 use crate::auth::ClusterNode;
-use crate::authz::{Operator, OperatorOrInternal};
+use crate::authz::{Admin, Operator, OperatorOrInternal};
 use crate::auth_refresh::{generate_seat_token, hash_token};
 use crate::birth_proof::Purpose;
 use crate::state::AppState;
@@ -89,6 +89,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/cluster/seat-tokens", get(seat_tokens_list).post(seat_token_create))
         .route("/api/cluster/seat-tokens/{id}/revoke", post(seat_token_revoke))
         .route("/api/cluster/seats", get(seats_list))
+        .route("/api/cluster/seats/{seat}/bind", post(seat_bind))
+        .route("/api/cluster/seats/{seat}/revoke", post(seat_revoke))
+        .route("/api/cluster/seats/{seat}/display", post(seat_display_set))
         .route("/api/cluster/seats/{seat}/bundle",
             post(seat_bundle_put).layer(DefaultBodyLimit::max(MAX_SEAT_BODY)))
         .route("/api/cluster/seats/{seat}/status", get(seat_bundle_status))
@@ -434,7 +437,7 @@ pub(crate) async fn record_seat(
          VALUES ($1, $2, $3, $4, $5, now()) \
          ON CONFLICT (seat_name) DO UPDATE SET birth_cert = EXCLUDED.birth_cert, facts = EXCLUDED.facts, \
              enroll_user = EXCLUDED.enroll_user, token_id = EXCLUDED.token_id, enrolled_at = now(), \
-             last_seen = NULL, heartbeat = NULL",
+             last_seen = NULL, heartbeat = NULL, revoked_at = NULL, revoked_by = NULL",
     )
     .bind(seat)
     .bind(birth_cert)
@@ -529,10 +532,12 @@ async fn seats_list(
     type Row = (String, String, Option<Value>, Option<String>, chrono::DateTime<chrono::Utc>,
                 Option<chrono::DateTime<chrono::Utc>>, Option<Value>, Option<String>,
                 Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>,
-                Option<String>, Option<i32>, Option<String>);
+                Option<String>, Option<i32>, Option<String>, Option<String>,
+                Option<chrono::DateTime<chrono::Utc>>, Option<Value>);
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT s.seat_name, s.birth_cert, s.facts, s.enroll_user, s.enrolled_at, s.last_seen, s.heartbeat, \
-                encode(sha256(b.blob), 'hex'), b.fetched_at, b.applied_at, b.applied_sha, b.apply_rc, b.apply_msg \
+                encode(sha256(b.blob), 'hex'), b.fetched_at, b.applied_at, b.applied_sha, b.apply_rc, b.apply_msg, \
+                s.tailnet_name, s.revoked_at, s.display \
          FROM noo_seats s LEFT JOIN noo_seat_bundles b ON b.seat_name = s.seat_name \
          ORDER BY s.seat_name",
     )
@@ -540,9 +545,12 @@ async fn seats_list(
     .await?;
     let seats: Vec<Value> = rows
         .into_iter()
-        .map(|(name, cert, facts, user, enrolled, seen, hb, sha, fetched, applied, applied_sha, rc, msg)| {
+        .map(|(name, cert, facts, user, enrolled, seen, hb, sha, fetched, applied, applied_sha, rc, msg, tailnet, revoked, display)| {
             json!({
                 "seat_name": name,
+                "tailnet_name": tailnet,
+                "display": display.unwrap_or_else(|| json!({})),
+                "revoked_at": revoked.map(|t| t.to_rfc3339()),
                 "role": "seat",
                 "birth_cert": cert,
                 "facts": facts,
@@ -653,8 +661,11 @@ async fn seat_bundle_status(
 /// 503 that names it, never "no cert": on 2026-11-02 a gateway out of file
 /// descriptors refused the homeserver seat as `NoBirthCert` and told the
 /// operator to re-enroll a seat whose row was there all along.
-async fn seat_cert_for(db: &sqlx::PgPool, seat: &str) -> Result<Option<String>, AppError> {
-    sqlx::query_scalar::<_, String>("SELECT birth_cert FROM noo_seats WHERE seat_name = $1")
+/// The seat's birth certificate and, when it was revoked, when.
+type SeatCert = (String, Option<chrono::DateTime<chrono::Utc>>);
+
+async fn seat_cert_for(db: &sqlx::PgPool, seat: &str) -> Result<Option<SeatCert>, AppError> {
+    sqlx::query_as::<_, SeatCert>("SELECT birth_cert, revoked_at FROM noo_seats WHERE seat_name = $1")
         .bind(seat)
         .fetch_optional(db)
         .await
@@ -679,12 +690,42 @@ async fn check_seat_proof(
 ) -> Result<(), AppError> {
     debug_assert!(purpose.is_seat());
     let header = headers.get(BIRTH_PROOF_HEADER).and_then(|v| v.to_str().ok());
-    let cert = seat_cert_for(db, seat).await?;
+    let row = seat_cert_for(db, seat).await?;
+    revoked_refusal(seat, row.as_ref().and_then(|(_, at)| *at))?;
+    let cert = row.map(|(cert, _)| cert);
     let now = chrono::Utc::now().timestamp();
     crate::birth_proof::verify(header, purpose, seat, sha, cert.as_deref(), now).map_err(|e| {
         tracing::warn!(seat = %seat, reason = ?e, "seat_proof_rejected");
         AppError::Forbidden(format!("seat proof refused for '{seat}': {e:?} (sign \"noo-seat-<purpose>:<seat>:<sha>:<ts>\" with the seat's birth key)"))
     })
+}
+
+/// A revoked seat is refused before its proof is checked: revocation cuts the
+/// whole rail (bundle, fetched, applied, heartbeat) and, through the keyless
+/// mint, its display. Re-enrolment with a new seat token clears it (i510).
+fn revoked_refusal(seat: &str, revoked_at: Option<chrono::DateTime<chrono::Utc>>) -> Result<(), AppError> {
+    match revoked_at {
+        Some(at) => {
+            tracing::warn!(seat = %seat, revoked_at = %at, "seat_rail_refused_revoked");
+            Err(AppError::Forbidden(format!(
+                "seat '{seat}' was revoked at {}; enrol it again with a new seat token (noo kiosk seat-token {seat})",
+                at.to_rfc3339()
+            )))
+        }
+        None => Ok(()),
+    }
+}
+
+/// The tailnet device name a seat reports in its heartbeat
+/// (`tailnet: {name, ip}`), lowercased, or `None` when it reports none or a
+/// name that is not a plain host label.
+fn tailnet_claim(hb: &Value) -> Option<String> {
+    let name = hb["tailnet"]["name"].as_str()?.trim().to_ascii_lowercase();
+    let ok = !name.is_empty()
+        && name.len() <= 63
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !name.starts_with('-');
+    ok.then_some(name)
 }
 
 async fn staged_seat_sha(db: &sqlx::PgPool, seat: &str) -> Result<Option<String>, AppError> {
@@ -823,7 +864,149 @@ async fn seat_heartbeat(
         .bind(&hb)
         .execute(&state.db)
         .await?;
-    Ok(Json(json!({ "recorded": true, "seat": seat })))
+    // The seat names its tailnet device on its signed rail; the keyless mint
+    // admits that device as this seat (i510). A claim on a device another
+    // seat holds is refused and said, not merged.
+    let mut bound = None;
+    if let Some(name) = tailnet_claim(&hb) {
+        match crate::repo::seats::bind_tailnet(&state.db, &seat, &name).await {
+            Ok(changed) => {
+                if changed {
+                    tracing::info!(seat = %seat, tailnet = %name, "seat_tailnet_bound_from_heartbeat");
+                }
+                bound = Some(name);
+            }
+            Err(crate::repo::seats::BindError::TakenBy(other)) => {
+                tracing::warn!(seat = %seat, tailnet = %name, held_by = %other, "seat_tailnet_claim_refused");
+            }
+            Err(crate::repo::seats::BindError::NoSeat) => {}
+            Err(crate::repo::seats::BindError::Db(e)) => return Err(e.into()),
+        }
+    }
+    Ok(Json(json!({ "recorded": true, "seat": seat, "tailnet_name": bound })))
+}
+
+/// The display settings with one key changed (i510 c1): `quality`
+/// lean|full|auto, `view` health|graph, `rotate`/`poll` whole seconds
+/// 0..=86400. `default` removes the key, so the box's own
+/// /etc/default/kiosk value applies again. Anything else is refused, never
+/// stored for the page to guess at.
+pub(crate) fn display_with(current: &Value, key: &str, value: &str) -> Result<Value, String> {
+    let mut d = current.as_object().cloned().unwrap_or_default();
+    if value == "default" {
+        if !["quality", "view", "rotate", "poll"].contains(&key) {
+            return Err(format!("unknown display setting '{key}' (quality, view, rotate, poll)"));
+        }
+        d.remove(key);
+        return Ok(Value::Object(d));
+    }
+    let v = match key {
+        "quality" if ["lean", "full", "auto"].contains(&value) => json!(value),
+        "quality" => return Err(format!("quality must be lean, full, auto or default, not '{value}'")),
+        "view" if ["health", "graph"].contains(&value) => json!(value),
+        "view" => return Err(format!("view must be health, graph or default, not '{value}'")),
+        "rotate" | "poll" => match value.parse::<u32>() {
+            Ok(n) if n <= 86_400 => json!(n),
+            _ => return Err(format!("{key} must be whole seconds 0..=86400 or default, not '{value}'")),
+        },
+        other => return Err(format!("unknown display setting '{other}' (quality, view, rotate, poll)")),
+    };
+    d.insert(key.to_string(), v);
+    Ok(Value::Object(d))
+}
+
+#[derive(Deserialize)]
+struct DisplayBody {
+    key: String,
+    value: String,
+}
+
+/// POST /api/cluster/seats/{seat}/display — `{key, value}`. Operator. Sets
+/// one display setting for the seat (quality, view, rotate, poll); the page
+/// picks it up within a minute through its proxy and reloads itself with
+/// it. No change at the box, no privilege there (i510 c1).
+async fn seat_display_set(
+    State(state): State<Arc<AppState>>,
+    Operator(ctx): Operator,
+    Path(seat): Path<String>,
+    Json(body): Json<DisplayBody>,
+) -> AppResult {
+    if !valid_node_name(&seat) {
+        return Err(AppError::BadRequest("invalid seat name".into()));
+    }
+    let current = crate::repo::seats::display_of(&state.db, &seat)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("no enrolled seat '{seat}'")))?;
+    let next = display_with(&current, &body.key, &body.value).map_err(AppError::BadRequest)?;
+    if !crate::repo::seats::set_display(&state.db, &seat, &next, &ctx.sub).await? {
+        return Err(AppError::NotFound(format!("no enrolled seat '{seat}'")));
+    }
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::SeatDisplaySet, &ctx.sub, &format!("seat:{seat}"))
+            .details(json!({ "seat": seat, "key": body.key, "value": body.value, "display": next })),
+    )
+    .await;
+    Ok(Json(json!({ "seat": seat, "display": next })))
+}
+
+#[derive(Deserialize)]
+struct BindBody {
+    tailnet_name: String,
+}
+
+/// POST /api/cluster/seats/{seat}/bind — `{tailnet_name}`. Admin. Binds the
+/// seat to its tailnet device, so its display can mint before the seat's own
+/// heartbeat has reported the name (the operator's cutover fallback, i510).
+async fn seat_bind(
+    State(state): State<Arc<AppState>>,
+    Admin(ctx): Admin,
+    Path(seat): Path<String>,
+    Json(body): Json<BindBody>,
+) -> AppResult {
+    if !valid_node_name(&seat) {
+        return Err(AppError::BadRequest("invalid seat name".into()));
+    }
+    let name = tailnet_claim(&json!({ "tailnet": { "name": body.tailnet_name } }))
+        .ok_or_else(|| AppError::BadRequest("tailnet_name must be the device's host label (letters, digits, '-')".into()))?;
+    let changed = match crate::repo::seats::bind_tailnet(&state.db, &seat, &name).await {
+        Ok(c) => c,
+        Err(crate::repo::seats::BindError::NoSeat) => return Err(AppError::NotFound(format!("no enrolled seat '{seat}'"))),
+        Err(crate::repo::seats::BindError::TakenBy(other)) => {
+            return Err(AppError::Conflict(format!("tailnet device '{name}' is bound to seat '{other}'")))
+        }
+        Err(crate::repo::seats::BindError::Db(e)) => return Err(e.into()),
+    };
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::SeatBound, &ctx.sub, &format!("seat:{seat}"))
+            .details(json!({ "seat": seat, "tailnet_name": name, "changed": changed })),
+    )
+    .await;
+    Ok(Json(json!({ "seat": seat, "tailnet_name": name, "changed": changed })))
+}
+
+/// POST /api/cluster/seats/{seat}/revoke — Admin. Cuts the seat's rail and,
+/// through the keyless mint, its display (dark within one token lifetime).
+/// Re-enrolment with a new seat token brings it back (i510).
+async fn seat_revoke(
+    State(state): State<Arc<AppState>>,
+    Admin(ctx): Admin,
+    Path(seat): Path<String>,
+) -> AppResult {
+    if !valid_node_name(&seat) {
+        return Err(AppError::BadRequest("invalid seat name".into()));
+    }
+    if !crate::repo::seats::revoke(&state.db, &seat, &ctx.sub).await? {
+        return Err(AppError::NotFound(format!("no enrolled seat '{seat}'")));
+    }
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::SeatRevoked, &ctx.sub, &format!("seat:{seat}"))
+            .details(json!({ "seat": seat })),
+    )
+    .await;
+    Ok(Json(json!({ "seat": seat, "revoked": true })))
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -974,5 +1157,71 @@ mod tests {
         assert_eq!(redeem_seat_token(&db, "noo-bt-not-a-seat-token", &seat, "127.0.0.1").await.unwrap().err().map(|e| e.0), Some(SeatDeny::Unknown));
 
         sqlx::query("DELETE FROM noo_seat_tokens WHERE seat_name = $1").bind(&seat).execute(&db).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod seat_binding_tests {
+    use super::{revoked_refusal, tailnet_claim};
+    use serde_json::json;
+
+    /// A revoked seat is refused on its rail before its proof is read, and
+    /// the refusal names the way back (a new seat token).
+    #[test]
+    fn a_revoked_seat_is_refused_on_its_rail() {
+        assert!(revoked_refusal("hall", None).is_ok());
+        let at = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let refused = revoked_refusal("hall", Some(at)).expect_err("revoked");
+        let msg = format!("{refused:?}");
+        assert!(msg.contains("seat 'hall' was revoked"), "{msg}");
+        assert!(msg.contains("noo kiosk seat-token hall"), "{msg}");
+    }
+
+    /// The device name a seat reports is a plain host label, lowercased;
+    /// anything else is no claim at all.
+    #[test]
+    fn a_tailnet_claim_is_a_plain_host_label() {
+        assert_eq!(tailnet_claim(&json!({"tailnet": {"name": "Homeserver-1", "ip": "100.64.0.9"}})).as_deref(), Some("homeserver-1"));
+        for bad in [json!({}), json!({"tailnet": {}}), json!({"tailnet": {"name": ""}}),
+                    json!({"tailnet": {"name": "a.b"}}), json!({"tailnet": {"name": "-x"}}),
+                    json!({"tailnet": {"name": "x y"}}), json!({"tailnet": {"name": "a".repeat(64)}})] {
+            assert_eq!(tailnet_claim(&bad), None, "{bad}");
+        }
+    }
+
+    /// The rail's only gate reads revocation: every seat route goes through
+    /// check_seat_proof, which refuses a revoked seat first.
+    #[test]
+    fn every_seat_route_meets_the_revocation_gate() {
+        let own = crate::test_src::own_code(include_str!("seats.rs"));
+        let gate = crate::test_src::fn_body(&own, "async fn check_seat_proof(");
+        let refuse = gate.find("revoked_refusal(").expect("the gate refuses a revoked seat");
+        let verify = gate.find("birth_proof::verify(").expect("the gate verifies the proof");
+        assert!(refuse < verify, "revocation is refused before the proof is read");
+        for route in ["async fn seat_bundle_get(", "async fn seat_fetch_receipt(", "async fn seat_apply_report(", "async fn seat_heartbeat("] {
+            assert!(crate::test_src::fn_body(&own, route).contains("check_seat_proof("), "{route}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod seat_display_tests {
+    use super::display_with;
+    use serde_json::json;
+
+    /// One key at a time, validated; `default` hands the key back to the box.
+    #[test]
+    fn a_display_setting_is_validated_and_default_removes_it() {
+        let d = display_with(&json!(null), "quality", "lean").unwrap();
+        assert_eq!(d, json!({"quality": "lean"}));
+        let d = display_with(&d, "view", "graph").unwrap();
+        let d = display_with(&d, "rotate", "30").unwrap();
+        assert_eq!(d, json!({"quality": "lean", "view": "graph", "rotate": 30}));
+        assert_eq!(display_with(&d, "quality", "default").unwrap(), json!({"view": "graph", "rotate": 30}));
+        assert_eq!(display_with(&d, "quality", "auto").unwrap()["quality"], "auto");
+        for (k, v) in [("quality", "flat"), ("view", "map"), ("rotate", "-1"), ("poll", "86401"),
+                       ("poll", "1.5"), ("url", "http://x"), ("url", "default")] {
+            assert!(display_with(&d, k, v).is_err(), "{k}={v}");
+        }
     }
 }

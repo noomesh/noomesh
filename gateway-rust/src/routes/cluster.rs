@@ -91,6 +91,12 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/cluster/nodes/{node_id}/config", put(node_config_put))
         .route("/api/cluster/nodes/{node_id}/placements/{backend}", put(placement_put))
         .route("/api/cluster/nodes/{node_id}/placements/{backend}", delete(placement_delete))
+        // i300 H3b-2: add-on node workloads, one node each (strict).
+        .route(
+            "/api/cluster/nodes/{node_id}/node-workloads/{addon}/{workload}",
+            put(super::node_workload_placements::put_placement).delete(super::node_workload_placements::delete_placement),
+        )
+        .route("/api/cluster/nodes/{node_id}/node-workloads", get(super::node_workload_placements::list_placements))
         .route("/api/cluster/nodes/{node_id}/fit", post(placement_fit_post))
         // ── Model classes ──
         .route("/api/cluster/model-classes", get(model_classes_get))
@@ -282,6 +288,66 @@ pub(crate) fn carry_lanes(data: &mut Value, body: &Value) {
     }
 }
 
+/// One i300 (A4) heartbeat key the gateway stores, and the only shape it
+/// accepts. The agent OMITS a key it does not know (an error must not become
+/// a fact, i495), so absent or of the wrong shape is UNKNOWN: the key is
+/// removed from the record, never kept from an earlier beat and never
+/// defaulted. Shapes: docs/reference/node-workloads.md "Heartbeat keys".
+#[derive(Clone, Copy)]
+enum BeatShape {
+    Str,
+    Bool,
+    Num,
+    OneOf(&'static [&'static str]),
+    /// A list of objects, at most this many.
+    Objects(usize),
+}
+
+/// The A4 keys. Placement (i300 H3) reads only what this stores: a key left
+/// off this list is dropped on the floor by the handler, as `lanes` were
+/// before #717.
+const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
+    ("gpu_compute_cap", BeatShape::Str),
+    // The agent's runtime.GOOS. Node workloads need Linux (the door is on a
+    // Docker bridge address, which Docker Desktop cannot route to): i300 A9.
+    ("os", BeatShape::Str),
+    ("nvidia_runtime", BeatShape::Bool),
+    ("nvidia_driver_caps_ok", BeatShape::Bool),
+    ("controller_host", BeatShape::Bool),
+    ("data_root_free_gb", BeatShape::Num),
+    ("addon_workloads_policy", BeatShape::OneOf(&["none", "approve", "auto"])),
+    ("addon_workloads_approvals", BeatShape::Objects(256)),
+    ("model_sets", BeatShape::Objects(256)),
+    ("node_workloads", BeatShape::Objects(64)),
+];
+
+fn beat_shape_ok(v: &Value, shape: BeatShape) -> bool {
+    match shape {
+        BeatShape::Str => v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 64),
+        BeatShape::Bool => v.is_boolean(),
+        BeatShape::Num => v.as_f64().is_some_and(f64::is_finite),
+        BeatShape::OneOf(allowed) => v.as_str().is_some_and(|s| allowed.contains(&s)),
+        BeatShape::Objects(max) => v
+            .as_array()
+            .is_some_and(|a| a.len() <= max && a.iter().all(Value::is_object)),
+    }
+}
+
+/// Store the i300 node facts from this beat; each one absent or misshapen is
+/// removed (unknown), on every beat.
+pub(crate) fn carry_i300(data: &mut Value, body: &Value) {
+    for (key, shape) in I300_BEAT_KEYS {
+        match body.get(*key).filter(|v| beat_shape_ok(v, *shape)) {
+            Some(v) => data[*key] = v.clone(),
+            None => {
+                if let Some(o) = data.as_object_mut() {
+                    o.remove(*key);
+                }
+            }
+        }
+    }
+}
+
 async fn node_heartbeat(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
@@ -310,6 +376,7 @@ async fn node_heartbeat(
     carry_load(&mut data, &body);
     data["running_backends"] = body.get("running_backends").cloned().unwrap_or(json!({}));
     carry_lanes(&mut data, &body);
+    carry_i300(&mut data, &body);
     // The node on the controller's own device says so (NOO_SELF_NODE);
     // fleet views and node verbs branch on it.
     if let Some(v) = body.get("self_node") { if !v.is_null() { data["self_node"] = v.clone(); } }
@@ -2488,7 +2555,13 @@ pub(crate) async fn gpu_hold_op(
     let req = link.request(reqwest::Method::POST, &format!("/gpu/{op}")).json(&payload).timeout(wait);
     let outcome = req.send().await;
     let (ok, result) = match outcome {
-        Ok(resp) if resp.status().is_success() => (true, Ok(resp.json::<Value>().await.unwrap_or(json!({})))),
+        Ok(resp) if resp.status().is_success() => {
+            // The 2xx says the hold changed; an answer that cannot be read
+            // does not undo that, so `ok` stays true and the caller gets the
+            // error, never `{}` as the agent's lease (i460).
+            let read = crate::upstream_body::json_2xx(resp, &format!("node {node_id}")).await;
+            (true, read.map_err(|e| AppError::Upstream(format!("{e}; the GPU {op} did take effect on the node"))))
+        }
         Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
             // The agent's refusal is the answer: a lease someone else holds,
             // a drain that did not finish, a transition in progress.
@@ -2504,28 +2577,12 @@ pub(crate) async fn gpu_hold_op(
         }
         Err(e) => (false, Err(AppError::Upstream(format!("Failed to contact node agent: {e}")))),
     };
-    match (op, ok) {
-        ("hold", true) => {
-            // The hold is on: the agent reports the paused lanes; keep the
-            // node out of routing until the heartbeat carries them.
-            let paused: Vec<String> = result
-                .as_ref()
-                .ok()
-                .and_then(|v| v.pointer("/gpu_contention/paused_backends"))
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-                .unwrap_or_default();
-            crate::coordinator::classes::set_node_draining(node_id, false);
-            crate::coordinator::classes::set_lanes_paused(node_id, &paused);
-        }
-        ("hold", false) if draining => {
-            crate::coordinator::classes::set_node_draining(node_id, false);
-            if !drain_lanes.is_empty() {
-                crate::coordinator::classes::set_lanes_paused(node_id, &[]);
-            }
-        }
-        ("release", true) => crate::coordinator::classes::set_lanes_paused(node_id, &[]),
-        _ => {}
+    let marks = hold_marks(op, ok, result.as_ref().ok(), draining, &drain_lanes);
+    if let Some(on) = marks.draining {
+        crate::coordinator::classes::set_node_draining(node_id, on);
+    }
+    if let Some(lanes) = &marks.lanes {
+        crate::coordinator::classes::set_lanes_paused(node_id, lanes);
     }
     // Read-after-write: the lease the agent just returned goes into the
     // node's KV record now, so reservation list/status/release see it
@@ -2552,6 +2609,39 @@ pub(crate) async fn gpu_hold_op(
     let mut out = result?;
     out["node"] = json!(node_id);
     Ok(Json(out))
+}
+
+/// What a GPU hold or release does to the gateway's own routing marks
+/// (`classes::set_node_draining` / `set_lanes_paused`); `None` leaves that
+/// mark as it is. The heartbeat's `paused_backends` is a separate input to
+/// routing and clears neither mark: only this does.
+#[derive(Debug, PartialEq)]
+pub(crate) struct HoldMarks {
+    pub draining: Option<bool>,
+    pub lanes: Option<Vec<String>>,
+}
+
+/// The marks after `op` (`hold` / `release`), pure. `body` is the agent's
+/// answer when it could be read; `draining` and `drain_lanes` are what the
+/// drain marked before the call.
+pub(crate) fn hold_marks(op: &str, ok: bool, body: Option<&Value>, draining: bool, drain_lanes: &[String]) -> HoldMarks {
+    let keep = HoldMarks { draining: None, lanes: None };
+    match (op, ok) {
+        // The hold is on and the agent said which lanes it paused: those
+        // replace the drain's marks.
+        ("hold", true) => match body {
+            Some(v) => HoldMarks { draining: Some(false), lanes: Some(crate::coordinator::classes::paused_backends_of(v)) },
+            // The hold is on but its answer was unreadable (i460): which
+            // lanes it paused is unknown, so the drain's marks stay until
+            // the release clears them.
+            None => keep,
+        },
+        ("hold", false) if draining => HoldMarks { draining: Some(false), lanes: (!drain_lanes.is_empty()).then(Vec::new) },
+        // A release ends both marks, whatever the hold's answer was: before
+        // this it cleared only the lanes, so a kept drain mark outlived it.
+        ("release", true) => HoldMarks { draining: Some(false), lanes: Some(Vec::new()) },
+        _ => keep,
+    }
 }
 
 /// How long the gateway waits on a node's bench: a cold load of a large
@@ -3811,7 +3901,11 @@ async fn desired_config_get(
         None => json!(null),
     };
 
-    Ok(Json(json!({
+    // i300 H3b-3: the node's add-on node workloads, from its placement rows.
+    // Withheld (key absent) when the gateway cannot say right now: the agent
+    // then touches nothing, never reads it as "remove them".
+    let node_workloads = super::node_workload_placements::desired_for(&state, &node_id).await;
+    let mut body = json!({
         "node": node_json,
         "placements": placement_json,
         "mcp_servers": mcp_json,
@@ -3830,7 +3924,11 @@ async fn desired_config_get(
         // agent queues its own ladder under it. Absent on older gateways.
         "disk_reclaim": crate::autonomy_evaluators::node_reclaim_policy(&state).await,
         "engine": "rust",
-    })))
+    });
+    if let Some(nw) = node_workloads {
+        body["node_workloads"] = Value::Array(nw);
+    }
+    Ok(Json(body))
 }
 
 /// Per node, the live tasks it holds (i227 fix 4): `running` (running or
@@ -6902,6 +7000,28 @@ mod heartbeat_carry_tests {
         assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/gpu/release\", post(gpu_release))"));
     }
 
+    /// i460: an unreadable hold answer keeps the drain's marks (the hold is
+    /// on, its lanes unknown), and a release always ends both marks.
+    #[test]
+    fn an_unreadable_hold_keeps_its_marks_and_a_release_ends_them() {
+        let lanes = vec!["vllm".to_string()];
+        let answer = json!({"gpu_contention": {"paused_backends": ["vllm", "llamacpp"]}});
+        assert_eq!(
+            hold_marks("hold", true, Some(&answer), true, &[]),
+            HoldMarks { draining: Some(false), lanes: Some(vec!["vllm".into(), "llamacpp".into()]) },
+            "a read answer replaces the drain marks with the lanes the agent paused"
+        );
+        assert_eq!(hold_marks("hold", true, None, true, &[]), HoldMarks { draining: None, lanes: None }, "never un-drained on a guess");
+        assert_eq!(hold_marks("hold", true, None, true, &lanes), HoldMarks { draining: None, lanes: None });
+        for body in [Some(&answer), None] {
+            assert_eq!(hold_marks("release", true, body, false, &[]), HoldMarks { draining: Some(false), lanes: Some(vec![]) });
+        }
+        assert_eq!(hold_marks("hold", false, None, true, &lanes), HoldMarks { draining: Some(false), lanes: Some(vec![]) }, "a refused drain undoes its marks");
+        assert_eq!(hold_marks("hold", false, None, true, &[]), HoldMarks { draining: Some(false), lanes: None });
+        assert_eq!(hold_marks("hold", false, None, false, &[]), HoldMarks { draining: None, lanes: None });
+        assert_eq!(hold_marks("release", false, None, false, &[]), HoldMarks { draining: None, lanes: None }, "a refused release changes nothing");
+    }
+
     #[test]
     fn a_hold_purpose_is_user_or_absent_and_never_beside_a_workload() {
         assert_eq!(gpu_hold_purpose("", "").unwrap(), "");
@@ -8071,6 +8191,17 @@ mod backend_image_ref_tests {
         assert!(body.contains("let image = placement_image(&backend, image, "), "desired-config must send placement_image(..), not the raw column");
     }
 
+    /// i300 H3b-3: desired-config carries `node_workloads` from the placement
+    /// rows, and leaves the key OUT when they are withheld (never an empty
+    /// list, which the agent would read as "remove every workload").
+    #[test]
+    fn desired_config_carries_node_workloads_or_withholds_the_key() {
+        let src = include_str!("cluster.rs");
+        let body = src.split("async fn desired_config_get(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        assert!(body.contains("super::node_workload_placements::desired_for(&state, &node_id).await"), "{body}");
+        assert!(body.contains("if let Some(nw) = node_workloads {\n        body[\"node_workloads\"] = Value::Array(nw);"), "only Some sets the key");
+    }
+
     /// `${A:-default}` (nested) as compose interpolates it, for the test above.
     fn interpolate(s: &str, env: &HashMap<String, String>) -> String {
         let mut out = String::new();
@@ -8275,6 +8406,73 @@ mod load_carried_tests {
         let placed: Vec<&str> =
             get_candidate_nodes(&snaps, None, None, TaskPriority::Medium, 0.0, &CompanionPolicies::default()).iter().map(|n| n.id.as_str()).collect();
         assert_eq!(placed, ["b-linux", "a-mac"], "placement");
+    }
+}
+
+#[cfg(test)]
+mod i300_beat_tests {
+    use super::*;
+
+    /// A beat carrying every A4 key (the shapes of #748's heartbeat-i300.json).
+    fn full_beat() -> Value {
+        json!({
+            "gpu_compute_cap": "8.6",
+            "os": "linux",
+            "nvidia_runtime": true,
+            "nvidia_driver_caps_ok": true,
+            "controller_host": false,
+            "data_root_free_gb": 412.5,
+            "addon_workloads_policy": "approve",
+            "addon_workloads_approvals": [{"addon": "rhaddon", "digest": format!("sha256:{}", "a".repeat(64))}],
+            "model_sets": [{"id": "rh-voice", "revision": "r1", "state": "verified"}],
+            "node_workloads": [{"addon": "rhaddon", "name": "worker", "state": "provisioned", "ready": false, "door_port": 41001}],
+        })
+    }
+
+    /// Every A4 key reaches the record; a later beat without it (an older
+    /// agent, or the fact became unknown) removes it rather than keeping the
+    /// last value; a misshapen value is unknown, not stored.
+    #[test]
+    fn every_i300_key_is_stored_and_an_absent_or_misshapen_one_is_removed() {
+        let mut data = json!({"id": "n1"});
+        carry_i300(&mut data, &full_beat());
+        for (key, _) in I300_BEAT_KEYS {
+            assert_eq!(data.get(*key), full_beat().get(*key), "{key} stored");
+        }
+        carry_i300(&mut data, &json!({"running_backends": {}}));
+        for (key, _) in I300_BEAT_KEYS {
+            assert!(data.get(*key).is_none(), "{key}: absent from the beat, so unknown: {data}");
+        }
+        let too_many: Vec<Value> = (0..257).map(|_| json!({})).collect();
+        let bad = json!({
+            "gpu_compute_cap": 8.6,
+            "os": "",
+            "nvidia_runtime": "yes",
+            "data_root_free_gb": "lots",
+            "addon_workloads_policy": "always",
+            "model_sets": [1, 2],
+            "node_workloads": {"addon": "rhaddon"},
+            "addon_workloads_approvals": too_many,
+        });
+        carry_i300(&mut data, &full_beat());
+        carry_i300(&mut data, &bad);
+        for key in ["gpu_compute_cap", "os", "nvidia_runtime", "data_root_free_gb", "addon_workloads_policy", "model_sets", "node_workloads", "addon_workloads_approvals"] {
+            assert!(data.get(key).is_none(), "{key}: a misshapen value is unknown, never kept: {data}");
+        }
+        // An empty list is a fact (no sets, no workloads), not unknown.
+        carry_i300(&mut data, &json!({"model_sets": [], "node_workloads": []}));
+        assert_eq!(data["model_sets"], json!([]));
+        assert_eq!(data["node_workloads"], json!([]));
+    }
+
+    /// The handler runs this step before its KV write.
+    #[test]
+    fn the_heartbeat_handler_stores_the_i300_keys_before_its_write() {
+        let code = crate::test_src::own_code(include_str!("cluster.rs"));
+        let beat = crate::test_src::fn_body(&code, "async fn node_heartbeat(");
+        let carry = beat.find("carry_i300(&mut data, &body);").expect("the heartbeat stores the i300 keys");
+        let put = beat.find("kv.put(&node_id").expect("the heartbeat's KV write");
+        assert!(carry < put, "stored before the record is written");
     }
 }
 

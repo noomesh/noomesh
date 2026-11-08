@@ -34,6 +34,7 @@ import { createMetisClient } from '@metis/api';
 import '@metis/tokens/tokens.css';
 import './kiosk.css';
 import { KioskShell, isView } from './KioskShell';
+import { watchDisplay } from './display';
 import { CONSOLE_BUILD } from './build';
 
 // No token store, no bearer fetch, no `KIOSK_TOKEN_KEY`. All three are gone
@@ -86,3 +87,7 @@ createRoot(document.getElementById('root')!).render(
     <KioskShell client={client} initial={isView(view) ? view : 'health'} rotateS={rotateS} pollS={pollS} quality={quality} />
   </StrictMode>,
 );
+
+// The controller's settings for this display, applied by a reload when they
+// differ from this URL (i510 c1).
+watchDisplay();

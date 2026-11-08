@@ -456,6 +456,8 @@ pub struct UiEntry {
     pub url_base: Option<String>,
     /// May this caller open it (`ui.min_role`)?
     pub can_open: bool,
+    pub console_path: Option<String>,
+    pub frame_permissions: Option<Vec<addon_manifest::FramePermission>>,
 }
 
 /// The listing, pure over its inputs: every enabled add-on with a `ui` and an
@@ -484,6 +486,8 @@ pub fn ui_entries(
                 port,
                 url_base: host.map(|h| format!("https://{h}:{port}")),
                 can_open,
+                console_path: ui.console_path.clone(),
+                frame_permissions: ui.frame_permissions.clone(),
             })
         })
         .collect();
@@ -496,7 +500,7 @@ async fn ui_list(headers: HeaderMap, ctx: Option<axum::Extension<crate::auth::Re
     let role = ctx.as_ref().map(|axum::Extension(r)| r.role);
     let account = ctx.as_ref().map(|axum::Extension(r)| crate::auth::account_of(&r.sub).to_string());
     let ports = PORTS.get().cloned().unwrap_or_default();
-    let entries = ui_entries(
+    let mut entries = ui_entries(
         &crate::addon_proxy::manifests(),
         &ports,
         role,
@@ -504,6 +508,9 @@ async fn ui_list(headers: HeaderMap, ctx: Option<axum::Extension<crate::auth::Re
         request_host(&headers),
         &crate::addons::enabled,
     );
+    for entry in &mut entries {
+        entry.console_path = crate::addon_console::listed_path(&entry.addon, entry.console_path.as_deref());
+    }
     Json(json!({ "uis": entries })).into_response()
 }
 
@@ -579,6 +586,12 @@ fn request_host(headers: &HeaderMap) -> Option<&str> {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split(',').next())
         .and_then(plain_hostname)
+}
+
+/// Exact isolated origin used by a console-owned embedding page. The same
+/// hostname validation and listener assignment as the session handoff apply.
+pub fn embedding_origin(headers: &HeaderMap, addon: &str) -> Option<String> {
+    Some(format!("https://{}:{}", request_host(headers)?, port_of(addon)?))
 }
 
 /// POST /api/addons/{addon_id}/ui-session — hand the signed-in person over to an add-on's web UI, which is served on an origin of its own (a port of its own on this host). Send the access token as `Authorization: Bearer`; checks the UI's `min_role` and answers a one-time code (30 s, single use, bound to this person and add-on) and the URL `https://<host>:<port>/__noo/session?code=<code>` to navigate to. The add-on origin redeems it and sets its own cookie. 401 without a person's bearer, 403 below the UI's role, 404 when the add-on serves no UI, 503 when it is off or its UI listener is not up.
@@ -752,7 +765,7 @@ pub fn is_reserved_on_origin(path: &str) -> bool {
     ["/api/", "/ws/", "/__noo/"].iter().any(|p| path.starts_with(p)) || path == "/api" || path == "/ws"
 }
 
-/// May this request redeem a code? Only a top-level navigation that no
+/// May this request redeem a code? Only a tab or iframe navigation that no
 /// other site started: no `Origin` other than this origin, no cross-site
 /// `Sec-Fetch-Site`, and (when the browser says) `Sec-Fetch-Mode: navigate`.
 pub fn redeem_request_ok(headers: &HeaderMap, port: u16) -> bool {
@@ -772,7 +785,7 @@ pub fn redeem_request_ok(headers: &HeaderMap, port: u16) -> bool {
 }
 
 /// `GET /__noo/session?code=…` on the add-on origin: redeem the code (bound
-/// to this browser, top-level navigation only), set this origin's own
+/// to this browser, same-site navigation only), set this origin's own
 /// cookie, clear the binding cookie, go to `/`.
 fn redeem(o: &Origin, query: Option<&str>, headers: &HeaderMap) -> Response {
     let refused = || {
@@ -1245,6 +1258,21 @@ mod tests {
     }
 
     #[test]
+    fn iframe_redemption_accepts_same_site_navigation_but_refuses_foreign_sites() {
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, HeaderValue::from_static("noo-controller.tail.ts.net:8451"));
+        h.insert("sec-fetch-dest", HeaderValue::from_static("iframe"));
+        h.insert("sec-fetch-site", HeaderValue::from_static("same-site"));
+        h.insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
+        assert!(redeem_request_ok(&h, 8451), "the console may navigate its isolated iframe");
+        let mut cross_site = h.clone();
+        cross_site.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
+        assert!(!redeem_request_ok(&cross_site, 8451), "a foreign site must not redeem in an iframe");
+        h.insert(header::ORIGIN, HeaderValue::from_static("https://evil.example"));
+        assert!(!redeem_request_ok(&h, 8451), "a foreign Origin is refused even with same-site metadata");
+    }
+
+    #[test]
     fn the_listing_shows_a_user_only_what_it_may_open_and_an_operator_everything() {
         let user_ui = with_ui(json!({"min_role": "user", "title": "Voice"})).unwrap();
         let mut op_ui = with_ui(json!({})).unwrap();
@@ -1254,7 +1282,7 @@ mod tests {
         let on = |_: &str| true;
         let user = ui_entries(&ms, &ports, Some(Role::User), None, Some("h.ts.net"), &on);
         assert_eq!(user.len(), 1);
-        assert_eq!(user[0], UiEntry { addon: "evolve".into(), title: "Voice".into(), port: 8451, url_base: Some("https://h.ts.net:8451".into()), can_open: true });
+        assert_eq!(user[0], UiEntry { addon: "evolve".into(), title: "Voice".into(), port: 8451, url_base: Some("https://h.ts.net:8451".into()), can_open: true, console_path: None, frame_permissions: None });
         let op = ui_entries(&ms, &ports, Some(Role::Operator), None, None, &on);
         assert_eq!(op.iter().map(|e| (e.addon.as_str(), e.can_open)).collect::<Vec<_>>(), [("evolve", true), ("other", true)]);
         let machine = ui_entries(&ms, &ports, None, None, None, &on);

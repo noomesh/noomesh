@@ -411,8 +411,15 @@ Hosted tools (`web_search`, …) are dropped.
 | `/ws/collab` | multi-agent collaboration relay (tokens, tool calls, peer injects, start/done per role) |
 | `/ws/agent` | agent-to-agent peer transport — a peer token ONLY (`sub: peer:<agent_id>`), and the `agent_hello.agent_id` must equal its subject; a user JWT is refused at any role |
 
-Connect with `?token=<jwt>`; the handshake fails closed when the JWT secret
-is unconfigured. On `/ws/coordinator` the client sends
+`/ws/coordinator` and `/ws/collab` open with a single-use ticket, never a
+token in the URL (a URL lands in proxy logs and browser history). First
+`POST /api/ws-ticket` with `Authorization: Bearer <access token>` and body
+`{"socket": "/ws/coordinator"}`; the answer is `{"ticket", "param":
+"ticket", "expires_in": 30}`. Then connect to `/ws/coordinator?ticket=<ticket>`
+within 30 seconds. A ticket opens that one socket once. `?token=` is refused
+on these two sockets (close 4401, with the reason). `/ws/agent` still takes
+`?token=<peer token>`. Every handshake fails closed when the JWT secret is
+unconfigured. On `/ws/coordinator` the client sends
 `{"prompt", "conversation_id", "user_id", "enable_thinking", "model"}` and
 receives flat JSON events, each with a `type`:
 

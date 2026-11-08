@@ -61,7 +61,7 @@ DDL = [
     "run_id text, provenance jsonb NOT NULL DEFAULT '{}', evidence jsonb NOT NULL DEFAULT '{}', "
     "usefulness double precision, status text NOT NULL DEFAULT 'active', last_validated_at timestamptz, "
     "last_recalled_at timestamptz, recall_count integer NOT NULL DEFAULT 0, expires_at timestamptz, "
-    "embedding_model text, embedding_dim integer)",
+    "embedding_model text, embedding_dim integer, org_id text)",
     "CREATE TABLE trellion_episodes (id uuid PRIMARY KEY, persona_id text NOT NULL, record_type text, "
     f"index_name text, content_summary text, prominence_score double precision, metadata jsonb, "
     # embedding_model/embedding_dim: trellion migration 106_embedding_provenance

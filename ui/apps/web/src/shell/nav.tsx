@@ -42,6 +42,7 @@ const CORE_NAV: NavSection[] = [
     items: [
       { id: 'memory', label: 'Memory', status: 'live' },
       { id: 'rag', label: 'Documents', status: 'live' },
+      { id: 'connections', label: 'Connections', status: 'live' },
       { id: 'graph', label: 'Graph', status: 'live' },
     ],
   },
@@ -113,6 +114,7 @@ const CORE_ICONS: Record<string, ReactNode> = {
       <path d="M4 5.5v9c0 1.4 2.7 2.5 6 2.5s6-1.1 6-2.5v-9" />
     </>
   ),
+  connections: <path d="M8 6H6a4 4 0 0 0 0 8h2m4-8h2a4 4 0 0 1 0 8h-2M6 10h8" />,
   observability: <path d="M3 12h3l2-6 3 11 2-7 1 2h3" />,
   usage: (
     <>

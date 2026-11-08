@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
@@ -132,6 +133,19 @@ type Reporter struct {
 	// gpuContention is the shared-GPU yield's report (internal/gpuyield),
 	// sent as `gpu_contention`. nil = not wired; the key is then omitted.
 	gpuContention func() any
+
+	// modelSets reports the model sets this node holds or is fetching (i300
+	// F4), sent as `model_sets`. nil = not wired, and a provider that answers
+	// nil (the state cannot be read) omits the key too: never a default or an
+	// empty list standing in for "unknown". Installed after the loop starts,
+	// hence the atomic.
+	modelSets atomic.Pointer[func() any]
+
+	// nodeFacts supplies the i300 F5b keys: the node facts, the consent policy
+	// and approvals, and `node_workloads`. It returns only the keys it knows;
+	// everything absent is omitted. nil = not wired. Installed after the loop
+	// starts, hence the atomic.
+	nodeFacts atomic.Pointer[func() map[string]any]
 
 	// Capabilities as reported at registration, echoed on EVERY heartbeat.
 	//
@@ -347,6 +361,33 @@ func (r *Reporter) gpuContentionReport() any {
 		return nil
 	}
 	return r.gpuContention()
+}
+
+// SetModelSets installs the model-set reporter, echoed on every heartbeat as
+// `model_sets` ([{id, revision, state, reason?}]). It returns nil when the
+// state cannot be read.
+func (r *Reporter) SetModelSets(f func() any) { r.modelSets.Store(&f) }
+
+func (r *Reporter) modelSetsReport() any {
+	f := r.modelSets.Load()
+	if f == nil || *f == nil {
+		return nil
+	}
+	return (*f)()
+}
+
+// SetNodeFacts installs the provider of the node-workload heartbeat keys
+// (gpu_compute_cap, nvidia_runtime, controller_host, data_root_free_gb,
+// addon_workloads_policy, addon_workloads_approvals, node_workloads). A key the
+// provider does not return is omitted, never defaulted.
+func (r *Reporter) SetNodeFacts(f func() map[string]any) { r.nodeFacts.Store(&f) }
+
+func (r *Reporter) nodeFactsReport() map[string]any {
+	f := r.nodeFacts.Load()
+	if f == nil || *f == nil {
+		return nil
+	}
+	return (*f)()
 }
 
 // SetBusStatus installs the NATS status provider whose value is echoed on

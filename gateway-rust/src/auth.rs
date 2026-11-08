@@ -1854,22 +1854,6 @@ pub fn verify_token_with(
         .map_err(|e| format!("Invalid token: {e}"))
 }
 
-/// The one route prefix that upgrades to a WebSocket. Everything the gateway
-/// serves over WS lives under it: `/ws/coordinator`, `/ws/collab` and
-/// `/ws/agent` natively (`routes::websocket::router`), plus the not-yet-ported
-/// `/ws/companion/{node_id}`, `/ws/terminal/{session_id}` and bare `/ws`, which
-/// reach the Python gateway through the catch-all. A prefix rather than an
-/// enumerated list because the unported three are registered nowhere in Rust —
-/// an exact list would silently stop authenticating them.
-pub(crate) const WS_PATH_PREFIX: &str = "/ws";
-
-/// Is this path on the WebSocket surface? `/ws` itself, or anything below it.
-/// Deliberately NOT `starts_with("/ws")`, which would also match `/wsdl` or a
-/// future `/wsapi`.
-fn is_ws_path(path: &str) -> bool {
-    path == WS_PATH_PREFIX || path.starts_with("/ws/")
-}
-
 /// Does the request carry a real WebSocket handshake header? RFC 6455 requires
 /// `Upgrade: websocket` on every browser and library handshake, so this is not
 /// a heuristic. Token-list aware (`Upgrade: websocket, foo`) and
@@ -1920,15 +1904,12 @@ fn defers_to_ws_handler(request: &Request) -> bool {
 /// omits it is not a WebSocket and would be refused by the upgrade extractor
 /// three layers down anyway.
 fn query_token_allowed(request: &Request) -> bool {
-    // Add-on sockets take a single-use ticket instead (`addon_ws`): a bearer
-    // in an add-on socket URL is never a credential.
-    is_ws_path(request.uri().path())
-        && !request.uri().path().starts_with(ADDON_WS_PREFIX)
-        && has_websocket_upgrade_header(request)
+    // Only the peer socket still takes a token in its URL (a peer token,
+    // not a console JWT). The console's sockets and every add-on socket
+    // take a single-use ticket instead (`websocket::verify_ws_ticket`,
+    // `addon_ws`): a JWT in a socket URL is never a credential there (i515c).
+    request.uri().path() == "/ws/agent" && has_websocket_upgrade_header(request)
 }
-
-/// Every add-on WebSocket route lives under here (`addon_proxy::ws_prefix`).
-const ADDON_WS_PREFIX: &str = "/ws/addons/";
 
 /// The `token` query parameter, if present.
 fn query_param_token(query: &str) -> Option<String> {
@@ -2280,6 +2261,7 @@ pub fn is_credential_optional(path: &str) -> bool {
 /// handler runs (`seat_cannot_reach_node_routes`).
 pub fn passes_without_bearer_check(path: &str, safe_method: bool, has_bearer: bool) -> bool {
     PUBLIC_PATHS_EXACT.contains(&path)
+        || (safe_method && crate::addon_console::is_claimed_console_path(path))
         || PUBLIC_PATH_PREFIXES.iter().any(|p| path.starts_with(p))
         || (safe_method && PUBLIC_GET_PATH_PREFIXES.iter().any(|p| path.starts_with(p)))
         // Not public: these carry a birth-key proof the HANDLER verifies,
@@ -2312,6 +2294,7 @@ pub fn is_handler_authenticated(path: &str) -> bool {
 /// `/`, so prefix-match would let everything through. Same for the
 /// dashboard shell URLs that don't have a trailing slash.
 pub const PUBLIC_PATHS_EXACT: &[&str] = &[
+    "/api/connections/oauth/callback",
     // The PUBLIC half of the API spec — the ~31 endpoints reachable without a
     // credential, derived from these very lists by
     // `scripts/gen-public-openapi.py`. An OAuth client reading
@@ -2843,6 +2826,12 @@ pub fn requester_allows(requester: &RequesterCtx, method: &axum::http::Method, p
     if crate::addon_workloads::proxy_allows(&requester.sub, path) {
         return true;
     }
+    // i300 H5: an add-on's delegated token (the person as `sub`) reaches ITS
+    // OWN add-on's reserve and release; the handler decides f99 against the
+    // person and records them on the reservation.
+    if crate::addon_workloads::delegated_reserve_allows(requester.act.as_ref().map(|a| a.sub.as_str()), path) {
+        return true;
+    }
     scope_allows_for(&requester.scopes, requester.role, Some(account_of(&requester.sub)), method, path)
 }
 
@@ -2889,6 +2878,11 @@ fn scope_allows_for(scopes: &[String], role: Role, account: Option<&str>, method
     if path == WALKS_SETTINGS_PATH {
         return true;
     }
+    // Account/source drafts only. Handlers pin ownership to the signed-in
+    // account, including for operators; arbitrary descendants stay closed.
+    if crate::connections::user_write_allowed(method, path) {
+        return true;
+    }
     // The asynchronous-operations API (`routes/ops.rs`). Open to every tier
     // because it decides for itself, per request: starting an op asks
     // `requester_allows` about the OPERATION'S OWN route (so a User gets
@@ -2926,7 +2920,11 @@ fn scope_allows_for(scopes: &[String], role: Role, account: Option<&str>, method
     // Opening an add-on's UI or socket as oneself. Exact shapes, POST only;
     // the handlers apply the UI's / the socket's own `min_role` and refuse a
     // delegated credential (`addon_ui::ui_session`, `addon_ws::ws_ticket`).
-    if *method == Method::POST && (crate::addon_ui::is_ui_session_path(path) || crate::addon_ws::is_ws_ticket_path(path)) {
+    if *method == Method::POST
+        && (crate::addon_ui::is_ui_session_path(path)
+            || crate::addon_ws::is_ws_ticket_path(path)
+            || path == crate::websocket::WS_TICKET_PATH)
+    {
         return true;
     }
     // Additive and last: a caller without `ingest` is unaffected, and a
@@ -2984,6 +2982,7 @@ pub const USER_READ_PATHS: &[&str] = &[
     "/api/alerts/clients",
     "/api/approval/stats",
     "/api/channels/status",
+    "/api/connections",
     "/api/coordinator/context",
     "/api/memory/health",
     "/api/memory/status",
@@ -3065,7 +3064,7 @@ pub fn user_may_read(path: &str) -> bool {
     {
         return false;
     }
-    USER_READ_PATHS.contains(&path)
+    crate::connections::user_read_allowed(path) || USER_READ_PATHS.contains(&path)
         || USER_READ_PREFIXES.iter().any(|p| {
             // `/x/` prefixes match by starts_with; a bare `/x` entry matches
             // `/x` and `/x/...` only (a directory, not a stem).
@@ -3116,6 +3115,23 @@ fn is_metrics_scrape(method: &axum::http::Method, path: &str, service: Option<&c
     *method == axum::http::Method::GET
         && path == "/metrics"
         && service.is_some_and(|s| s.0 == METRICS_SCRAPER_SERVICE)
+}
+
+/// Alertmanager's critical-alert intake (i515b): `routes::alert_intake`.
+/// Opened by [`ALERT_INTAKE_SERVICE`]'s leaf ALONE, before the bearer: no
+/// token, user, add-on or node credential reaches it.
+pub const ALERT_INTAKE_PATH: &str = "/api/alerts/alertmanager";
+
+/// The one service leaf that may post to [`ALERT_INTAKE_PATH`]:
+/// `noo security pki issue-service alertmanager` (CN=alertmanager,
+/// O=Mesh Cluster Service), the leaf its webhook receiver dials with.
+pub const ALERT_INTAKE_SERVICE: &str = "alertmanager";
+
+/// Whether this request is Alertmanager posting to its intake with its leaf.
+pub(crate) fn is_alert_intake(method: &axum::http::Method, path: &str, service: Option<&crate::node_identity::VerifiedService>) -> bool {
+    *method == axum::http::Method::POST
+        && path == ALERT_INTAKE_PATH
+        && service.is_some_and(|s| s.0 == ALERT_INTAKE_SERVICE)
 }
 
 /// Grafana's data sources, through the gateway: every path
@@ -3270,6 +3286,18 @@ pub async fn require_any_auth(
     if is_metrics_scrape(request.method(), &path, scraper.as_ref()) {
         request.extensions_mut().insert(AuthActor(format!("svc:{METRICS_SCRAPER_SERVICE}")));
         return Ok(next.run(request).await);
+    }
+
+    // Alertmanager's intake, by its service leaf ALONE, before the bearer
+    // and returning here either way: no token opens this path, and no other
+    // leaf (the scraper's, Grafana's, a node's, an operator's) does.
+    if path == ALERT_INTAKE_PATH {
+        if is_alert_intake(request.method(), &path, scraper.as_ref()) {
+            request.extensions_mut().insert(AuthActor(format!("svc:{ALERT_INTAKE_SERVICE}")));
+            return Ok(next.run(request).await);
+        }
+        tracing::info!(path = %path, "alert_intake_refused: answers Alertmanager's own service leaf only");
+        return Err(StatusCode::FORBIDDEN);
     }
 
     // Grafana's data sources, by Grafana's service leaf
@@ -4423,20 +4451,21 @@ mod tests {
         // Plain HTTP route, no upgrade → ignored (M-A2, unchanged).
         assert_eq!(bearer_token(&req("/api/config?token=leakme", None)), None);
 
-        // A real handshake on the WS surface → accepted. This is the only
-        // shape that may use the query string, because a browser cannot set
-        // an Authorization header on `new WebSocket(...)`.
-        for path in ["/ws", "/ws/agent", "/ws/coordinator", "/ws/collab"] {
+        // A real handshake on the peer socket → accepted: `/ws/agent` is the
+        // one socket that still takes a token in its URL, and it is a peer
+        // token, not a console JWT.
+        assert_eq!(
+            bearer_token(&req("/ws/agent?token=peer", Some(("upgrade", "websocket")))).as_deref(),
+            Some("peer"),
+            "the peer socket authenticates from ?token= on a real handshake"
+        );
+        // i515c: the console's sockets and add-on sockets never take a JWT in
+        // the URL, even on a real handshake; they redeem a single-use ticket.
+        for path in ["/ws", "/ws/coordinator", "/ws/collab", "/ws/addons/voice/live"] {
             assert_eq!(
-                bearer_token(&req(
-                    &format!("{path}?token=wsjwt"),
-                    Some(("upgrade", "websocket"))
-                ))
-                .as_deref(),
-                Some("wsjwt"),
-                "{path} is a WebSocket route and a real handshake must still \
-                 authenticate from ?token=; breaking this logs every dashboard \
-                 socket out"
+                bearer_token(&req(&format!("{path}?token=wsjwt"), Some(("upgrade", "websocket")))),
+                None,
+                "{path}: a JWT in a socket URL lands in proxy logs and browser history; only a ticket opens it"
             );
         }
 
@@ -4903,6 +4932,43 @@ mod tests {
         assert!(!is_metrics_scrape(&Method::GET, "/api/cluster/status", Some(&prom)));
         assert!(!is_metrics_scrape(&Method::GET, "/metrics", Some(&graf)));
         assert!(!is_metrics_scrape(&Method::GET, "/metrics", None));
+    }
+
+    /// i515b: Alertmanager's leaf posts to its intake and nothing else does
+    /// — not the scraper's or Grafana's leaf, not a request with no service
+    /// leaf (a bearer, a user, a node or an operator certificate).
+    #[test]
+    fn the_alert_intake_admits_alertmanagers_leaf_only() {
+        use crate::node_identity::VerifiedService;
+        let am = VerifiedService(ALERT_INTAKE_SERVICE.into());
+        let prom = VerifiedService("prometheus".into());
+        let graf = VerifiedService("grafana".into());
+        assert_eq!(ALERT_INTAKE_SERVICE, "alertmanager");
+        assert!(is_alert_intake(&Method::POST, ALERT_INTAKE_PATH, Some(&am)));
+        assert!(!is_alert_intake(&Method::POST, ALERT_INTAKE_PATH, Some(&prom)));
+        assert!(!is_alert_intake(&Method::POST, ALERT_INTAKE_PATH, Some(&graf)));
+        assert!(!is_alert_intake(&Method::POST, ALERT_INTAKE_PATH, None), "no service leaf: a bearer-only request");
+        assert!(!is_alert_intake(&Method::GET, ALERT_INTAKE_PATH, Some(&am)));
+        assert!(!is_alert_intake(&Method::POST, "/api/alerts/list", Some(&am)), "the leaf opens the intake only");
+        assert!(!is_alert_intake(&Method::GET, "/metrics", Some(&am)));
+    }
+
+    /// The middleware decides the intake path by the leaf BEFORE it reads a
+    /// bearer and returns there either way, so a bearer-only request (user,
+    /// add-on, node or operator token) is a 403 and never reaches a door.
+    #[test]
+    fn the_alert_intake_is_decided_before_the_bearer_and_is_not_public() {
+        let src = include_str!("auth.rs");
+        let body = src.split("pub async fn require_any_auth(").nth(1).expect("middleware");
+        let branch = body.find("if path == ALERT_INTAKE_PATH \u{7b}").expect("the intake branch");
+        let bearer = body.find("let token = bearer_token(&request);").expect("the bearer read");
+        assert!(branch < bearer, "the leaf check must come before the bearer");
+        let arm = &body[branch..bearer];
+        assert!(arm.contains("is_alert_intake(request.method(), &path, scraper.as_ref())"), "{arm}");
+        assert!(arm.contains("return Err(StatusCode::FORBIDDEN);"), "{arm}");
+        assert!(!passes_without_bearer_check(ALERT_INTAKE_PATH, false, false));
+        assert!(!passes_without_bearer_check(ALERT_INTAKE_PATH, false, true));
+        assert!(!PUBLIC_PATHS_EXACT.contains(&ALERT_INTAKE_PATH));
     }
 
     // The birth-proof routes step past this middleware because

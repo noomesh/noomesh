@@ -94,9 +94,16 @@ type Server struct {
 
 	// proxyTarget overrides docker.ProxyTarget (tests only).
 	proxyTarget func(string) (string, error)
+	// workloadDoors overrides the docker client for the node-workload relay
+	// (tests only).
+	workloadDoors nodeWorkloadDoors
 	// workloadOps overrides the docker client for the add-on workload
 	// actuator (tests only).
 	workloadOps workloadOps
+	// managed is the lifecycle of the node workloads this agent provisioned
+	// (label noo.managed-by=agent, i300 F5b). The actuator routes them here;
+	// every other workload keeps the container path. nil = none.
+	managed dockerpkg.ManagedControl
 
 	// warmer sends one warm request per vLLM container start before the
 	// heartbeat reads it ready (backend_warm.go). Built on first use.
@@ -179,6 +186,11 @@ func (s *Server) SetGPUHold(hold func(ctx context.Context, req gpuyield.HoldRequ
 	release func(ctx context.Context, req gpuyield.ReleaseRequest) (gpuyield.Contention, error)) {
 	s.gpuHold, s.gpuRelease = hold, release
 }
+
+// SetManagedWorkloads installs the lifecycle of the node workloads this agent
+// provisions, which the add-on workload actuator routes agent-managed
+// workloads to (i300 F5b).
+func (s *Server) SetManagedWorkloads(m dockerpkg.ManagedControl) { s.managed = m }
 
 // SetDiskReclaim installs the node disk-reclaim state provider.
 func (s *Server) SetDiskReclaim(f func() any) { s.diskReclaim = f }
@@ -419,18 +431,23 @@ func (s *Server) ListenAndServe() error {
 			ErrorLog:  log.New(quietTLSLogger{}, "", 0),
 			TLSConfig: tlsCfg,
 		}
-		slog.Info("control API starting with TLS", "port", port, "bind", plan.Why, "cert", s.cfg.TLSCert, "client_auth", "RequireAndVerifyClientCert")
+		if plan.Awaiting {
+			slog.Warn("control API starting with TLS on loopback only", "port", port, "bind", plan.Why)
+		} else {
+			slog.Info("control API starting with TLS", "port", port, "bind", plan.Why, "cert", s.cfg.TLSCert, "client_auth", "RequireAndVerifyClientCert")
+		}
 		errc := make(chan error, len(lns))
 		for _, ln := range lns {
 			// Cert/key are already loaded into TLSConfig.Certificates.
 			go func(ln net.Listener) { errc <- server.ServeTLS(ln, "", "") }(ln)
 		}
-		if plan.Derived == "" {
+		if !plan.followed() {
 			return <-errc
 		}
 		// The derived address can move (DHCP, tailscale coming up after the
-		// agent). Follow it: a listener bound to a stale address would leave
-		// the node unreachable until someone restarts the agent.
+		// agent), and an awaited one can appear. Follow it: a listener bound to
+		// a stale address, or to loopback only, would leave the node
+		// unreachable until someone restarts the agent.
 		moved := false
 		tick := time.NewTicker(bindRecheck)
 		for !moved {
@@ -441,7 +458,7 @@ func (s *Server) ListenAndServe() error {
 				return err
 			case <-tick.C:
 				if now := s.DetectBindIP(); now != "" && now != plan.Derived {
-					slog.Warn("control API: the controller-reachable address changed; rebinding", "was", plan.Derived, "now", now)
+					slog.Warn("control API: the controller-reachable address changed; rebinding", "was", plan.Derived, "now", now, "awaited", plan.Awaiting)
 					moved = true
 				}
 			}

@@ -246,6 +246,10 @@ pub struct Checked {
     pub interpolated: usize,
     /// Volume entries its services declare (third-party only: [`check_runtime`]).
     pub mounts: usize,
+    /// One sentence per declared mount that is not a long-form bind with
+    /// `bind.create_host_path: false` ([`mount_form_warnings`], every add-on).
+    /// A WARNING in 0.6.18; refused from 0.6.19 (followup i509).
+    pub warnings: Vec<String>,
 }
 
 /// Every variable compose would interpolate in `s`: `$NAME` and `${NAME…}`,
@@ -461,7 +465,62 @@ pub fn check_bundle_files(addon: &str, files: &BTreeMap<String, Vec<u8>>, third_
     if third_party {
         checked.mounts = check_runtime(addon, text, &mount_envs, core)?;
     }
+    checked.warnings = mount_form_warnings(addon, text, &mount_envs)?;
     Ok(checked)
+}
+
+/// Every volume, in any add-on (first- or third-party), whose source reads a
+/// mount variable its `resources.json` declares, and that is not a long-form
+/// `type: bind` with `bind.create_host_path: false`. One sentence each,
+/// naming the add-on, the service and the variable, with the long form to
+/// use, on one line (the launcher's line protocol).
+///
+/// Why: those sources live under the tmpfs add-on rundir, which a reboot
+/// empties. dockerd restarts an `unless-stopped` container before any
+/// launcher runs, and a short-form bind (or a long-form one that may create
+/// its source) whose source is missing is CREATED, with every parent, as
+/// root. That planted a root-owned rundir and kept the add-on down until a
+/// `sudo chown` (i509). With host-path creation off the engine refuses the
+/// missing source instead, and the next launcher start runs it.
+///
+/// A warning in 0.6.18; refused from 0.6.19 (followup i509).
+pub fn mount_form_warnings(addon: &str, text: &str, mount_envs: &[String]) -> Result<Vec<String>, String> {
+    if mount_envs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let doc: Value = serde_yaml::from_str(text).map_err(|e| format!("add-on {addon}: its overlay is not valid YAML ({e})"))?;
+    let mut out = Vec::new();
+    let Some(services) = mapping(doc.get("services")) else { return Ok(out) };
+    for (k, svc) in services {
+        let svc_name = k.as_str().unwrap_or_default();
+        let Some(vols) = untag(svc).get("volumes").map(untag).and_then(Value::as_sequence) else { continue };
+        for vol in vols {
+            let vol = untag(vol);
+            let (src, target, read_only, long_ok) = if let Some(short) = vol.as_str() {
+                let parts = split_volume(short);
+                if parts.len() < 2 {
+                    continue; // an anonymous volume: no host source
+                }
+                let ro = parts.get(2).is_some_and(|m| m.split(',').any(|o| o.trim() == "ro"));
+                (parts[0].trim().to_string(), parts[1].trim().to_string(), ro, false)
+            } else {
+                let field = |key: &str| vol.get(key).and_then(Value::as_str).unwrap_or_default().trim().to_string();
+                let is_bind = vol.get("type").and_then(Value::as_str) == Some("bind");
+                let no_create = vol.get("bind").map(untag).and_then(|b| b.get("create_host_path")).and_then(Value::as_bool) == Some(false);
+                let ro = vol.get("read_only").and_then(Value::as_bool) == Some(true);
+                (field("source"), field("target"), ro, is_bind && no_create)
+            };
+            let Some(var) = interpolated_vars(&src).into_iter().find(|v| mount_envs.contains(v)) else { continue };
+            if long_ok {
+                continue;
+            }
+            let ro = if read_only { ", read_only: true" } else { "" };
+            out.push(format!(
+                "its service `{svc_name}` mounts `{src}` (declared mount `{var}`) without `bind.create_host_path: false`, so after a reboot docker would create that tmpfs path as root and the add-on stays down until a chown. Use the long form: `- {{ type: bind, source: \"{src}\", target: {target}{ro}, bind: {{ create_host_path: false }} }}`. A warning in this release; it is refused from 0.6.19"
+            ));
+        }
+    }
+    Ok(out)
 }
 
 /// Is `src` exactly one of the add-on's declared mount variables
@@ -665,7 +724,7 @@ mod tests {
     #[test]
     fn an_overlay_that_takes_only_its_own_passes_and_every_part_was_read() {
         let c = check_overlay("rhaddon", OWN, &peer(), true, &core()).unwrap();
-        assert_eq!(c, Checked { declared: 3, referenced: 3, interpolated: 5, mounts: 0 }, "the parse must find what it checks");
+        assert_eq!(c, Checked { declared: 3, referenced: 3, interpolated: 5, mounts: 0, warnings: Vec::new() }, "the parse must find what it checks");
     }
 
     /// The gap: an overlay sourcing a core secret. Each form is refused,
@@ -856,6 +915,62 @@ mod tests {
             assert!(check_bundle_files(addon, &files, false, &plain_core()).is_ok(), "{addon}");
             assert!(check_runtime(addon, text, &[], &plain_core()).unwrap_err().contains("NOO_PKI_DIR"), "{addon}");
         }
+    }
+
+    /// i509: every add-on (first- and third-party) whose declared mount is
+    /// not a long-form bind with `bind.create_host_path: false` is warned,
+    /// naming the add-on's service and variable and showing the long form;
+    /// the long form it shows passes. Accepting any `type: bind` (dropping
+    /// the `create_host_path` check) fails the second and third cases.
+    #[test]
+    fn a_declared_mount_must_be_a_long_bind_that_never_creates_its_source() {
+        // The fixture's own header (its x-noo-addon block declares the key
+        // its resources.json's addon_key needs) and system.json (its db
+        // resources need one), with one service whose first volume varies.
+        let fixture = include_str!("../../../tests/fixtures/addons/rhaddon/docker-compose.yml");
+        let header = &fixture[..fixture.find("\nservices:\n").expect("the fixture overlay has a services block") + 1];
+        let bundle = |vol: &str| {
+            let text = format!("{header}services:\n  noo-rhaddon:\n    image: x\n    volumes:\n      - {vol}\n      - rh-cache:/cache\n      - {{ type: tmpfs, target: /scratch }}\nvolumes:\n  rh-cache:\n");
+            BTreeMap::from([
+                ("docker-compose.yml".to_string(), text.into_bytes()),
+                ("resources.json".to_string(), include_bytes!("../../../tests/fixtures/addons/rhaddon/resources.json").to_vec()),
+                ("system.json".to_string(), include_bytes!("../../../tests/fixtures/addons/rhaddon/system.json").to_vec()),
+            ])
+        };
+        let warned = |vol: &str, third_party: bool| check_bundle_files("rhaddon", &bundle(vol), third_party, &plain_core()).unwrap().warnings;
+        let ok = "{ type: bind, source: \"${RHADDON_WORK_DIR:-/nonexistent/w}\", target: /run/rhaddon, read_only: true, bind: { create_host_path: false } }";
+        let bad = [
+            "${RHADDON_WORK_DIR:-/nonexistent/w}:/run/rhaddon:ro",
+            "{ type: bind, source: \"${RHADDON_WORK_DIR:-/nonexistent/w}\", target: /run/rhaddon, read_only: true }",
+            "{ type: bind, source: \"${RHADDON_WORK_DIR:-/nonexistent/w}\", target: /run/rhaddon, read_only: true, bind: { create_host_path: true } }",
+        ];
+        for third_party in [true, false] {
+            assert_eq!(warned(ok, third_party), Vec::<String>::new(), "the long form passes (third_party={third_party})");
+            for vol in bad {
+                let w = warned(vol, third_party);
+                assert_eq!(w.len(), 1, "{vol} (third_party={third_party}): {w:?}");
+                let w = &w[0];
+                for needle in ["service `noo-rhaddon`", "`RHADDON_WORK_DIR`", "create_host_path: false", "target: /run/rhaddon, read_only: true", "refused from 0.6.19"] {
+                    assert!(w.contains(needle), "{w:?} should name {needle:?}");
+                }
+                assert!(!w.contains('\n'), "one line, for the launcher's line protocol: {w:?}");
+                // The long form it shows, put in place of the bad one, passes.
+                let shown = w.split("`- ").nth(1).and_then(|r| r.split("`.").next()).unwrap();
+                assert_eq!(warned(shown, third_party), Vec::<String>::new(), "the suggested form {shown:?} must pass");
+            }
+        }
+        // The shipped fixture is in the long form, and a bundle without
+        // resources.json declares no mounts, so neither is warned.
+        let shipped = BTreeMap::from([
+            ("docker-compose.yml".to_string(), fixture.as_bytes().to_vec()),
+            ("resources.json".to_string(), include_bytes!("../../../tests/fixtures/addons/rhaddon/resources.json").to_vec()),
+            ("system.json".to_string(), include_bytes!("../../../tests/fixtures/addons/rhaddon/system.json").to_vec()),
+        ]);
+        let c = check_bundle_files("rhaddon", &shipped, true, &plain_core()).unwrap();
+        assert_eq!((c.mounts, c.warnings), (2, Vec::new()), "the fixture's two mounts were read and pass");
+        let mut bare = bundle(bad[0]);
+        bare.remove("resources.json");
+        assert!(check_bundle_files("rhaddon", &bare, false, &plain_core()).unwrap().warnings.is_empty());
     }
 
     #[test]

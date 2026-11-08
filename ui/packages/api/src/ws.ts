@@ -5,8 +5,11 @@
 //
 // Ported from legacy core/ws.js, decoupled from the DOM: the token getter and
 // (optional) baseUrl are injected so it runs on web and React Native alike.
-// Browsers can't set an Authorization header on the WS upgrade, so the gateway
-// takes the JWT as ?token= on /ws/* routes. Close codes 1008 / 4401 = the
+// Browsers can't set an Authorization header on the WS upgrade, and a JWT in
+// the URL lands in proxy logs and browser history (i515c). So each connect
+// first mints a single-use, 30-second ticket (POST /api/ws-ticket with the
+// bearer) and opens `?ticket=`; the gateway refuses `?token=` on these
+// sockets. A 401 at the ticket counts as an auth close. Close codes 1008 / 4401 = the
 // credential is not good here: a bad token at the handshake, the token's
 // `exp` passing while the socket was open, or a logout. With `refreshToken`
 // set, the factory refreshes ONCE and reconnects with the new token; if that
@@ -17,6 +20,44 @@ export interface SocketAuth {
   /** Absolute gateway origin. Required off-web (no `location`); on web, '' derives from location. */
   baseUrl?: string;
   getToken(): string | null;
+  /** Injected for tests; defaults to the global fetch. */
+  fetchImpl?: typeof fetch;
+}
+
+/** Where a ticket for one of the console's sockets is minted. */
+export const WS_TICKET_PATH = '/api/ws-ticket';
+
+/** Why a ticket could not be had: the credential, or the way there. */
+export class TicketError extends Error {
+  constructor(message: string, readonly auth: boolean) {
+    super(message);
+  }
+}
+
+function httpBase(auth: SocketAuth): string {
+  if (auth.baseUrl) return new URL(auth.baseUrl).origin;
+  if (typeof location === 'undefined') {
+    throw new Error('wsUrl: baseUrl is required when there is no global location (React Native).');
+  }
+  return location.origin;
+}
+
+/** Mint a single-use ticket for `path` with the current access token. */
+export async function mintTicket(path: string, auth: SocketAuth): Promise<string> {
+  const token = auth.getToken();
+  if (!token) throw new TicketError('no access token to mint a socket ticket with', true);
+  const f = auth.fetchImpl ?? fetch;
+  const r = await f(`${httpBase(auth)}${WS_TICKET_PATH}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ socket: path }),
+    cache: 'no-store',
+  });
+  if (r.status === 401 || r.status === 403) throw new TicketError(`socket ticket refused: ${r.status}`, true);
+  if (!r.ok) throw new TicketError(`socket ticket: ${r.status} ${r.statusText}`, false);
+  const body = (await r.json()) as { ticket?: string };
+  if (!body.ticket) throw new TicketError('socket ticket: the answer carried no ticket', false);
+  return body.ticket;
 }
 
 export interface SocketOptions extends SocketAuth {
@@ -34,18 +75,19 @@ export interface SocketOptions extends SocketAuth {
   maxBackoffMs?: number;
 }
 
-export function wsUrl(path: string, auth: SocketAuth): string {
-  const token = encodeURIComponent(auth.getToken() ?? '');
+/** The socket URL for a minted ticket. Never a token: only `?ticket=`. */
+export function wsUrl(path: string, ticket: string, auth: SocketAuth): string {
+  const t = encodeURIComponent(ticket);
   if (auth.baseUrl) {
     const u = new URL(auth.baseUrl);
     const proto = u.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${proto}//${u.host}${path}?token=${token}`;
+    return `${proto}//${u.host}${path}?ticket=${t}`;
   }
   if (typeof location === 'undefined') {
     throw new Error('wsUrl: baseUrl is required when there is no global location (React Native).');
   }
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${proto}//${location.host}${path}?token=${token}`;
+  return `${proto}//${location.host}${path}?ticket=${t}`;
 }
 
 export interface ManagedSocket {
@@ -74,8 +116,43 @@ export function createSocket(path: string, opts: SocketOptions): ManagedSocket {
   // One refresh per auth close; cleared when a socket actually opens.
   let refreshedSinceOpen = false;
 
-  function connect() {
-    ws = new WebSocket(wsUrl(path, opts));
+  function scheduleReconnect() {
+    if (closedByUser || reconnectMs <= 0) return;
+    const delay = Math.min(reconnectMs * Math.pow(2, attempts++), maxBackoffMs);
+    timer = setTimeout(() => void connect(), delay);
+  }
+
+  /** A credential that is not good here: refresh once, then give up. */
+  function authFailed(ev: CloseEvent) {
+    if (refreshToken && !refreshedSinceOpen) {
+      refreshedSinceOpen = true;
+      void refreshToken().then((fresh) => {
+        if (closedByUser) return;
+        if (fresh) void connect();
+        else onAuthFail(ev);
+      });
+      return;
+    }
+    onAuthFail(ev);
+  }
+
+  async function connect() {
+    let ticket: string;
+    try {
+      ticket = await mintTicket(path, opts);
+    } catch (e) {
+      if (closedByUser) return;
+      if (e instanceof TicketError && e.auth) {
+        // No CloseEvent constructor off-web (React Native): the shape is enough.
+        authFailed({ code: 4401, reason: e.message, wasClean: false } as CloseEvent);
+      } else {
+        console.warn('socket ticket unavailable:', e);
+        scheduleReconnect();
+      }
+      return;
+    }
+    if (closedByUser) return;
+    ws = new WebSocket(wsUrl(path, ticket, opts));
     ws.onopen = (ev) => {
       attempts = 0;
       refreshedSinceOpen = false;
@@ -94,25 +171,13 @@ export function createSocket(path: string, opts: SocketOptions): ManagedSocket {
       onClose(ev);
       if (closedByUser) return;
       if (ev.code === 1008 || ev.code === 4401) {
-        if (refreshToken && !refreshedSinceOpen) {
-          refreshedSinceOpen = true;
-          void refreshToken().then((fresh) => {
-            if (closedByUser) return;
-            if (fresh) connect();
-            else onAuthFail(ev);
-          });
-          return;
-        }
-        onAuthFail(ev);
+        authFailed(ev);
         return;
       }
-      if (reconnectMs > 0) {
-        const delay = Math.min(reconnectMs * Math.pow(2, attempts++), maxBackoffMs);
-        timer = setTimeout(connect, delay);
-      }
+      scheduleReconnect();
     };
   }
-  connect();
+  void connect();
 
   return {
     get socket() {
@@ -145,7 +210,7 @@ export function createSocket(path: string, opts: SocketOptions): ManagedSocket {
           /* ignore */
         }
       }
-      connect();
+      void connect();
     },
     close() {
       closedByUser = true;

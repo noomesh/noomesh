@@ -78,6 +78,21 @@ pub fn controller_promote(g: &Globals, args: &[String]) -> Result<i32, Unhandled
     rewrite_yaml_gateway_url(&root, &url);
     ui::done(&format!("advertised gateway URL {url}"));
 
+    // i545 72: the advertised door is the tailnet, so the stack must listen
+    // there. Bind mode local kept the gateway on 127.0.0.1 while serve and
+    // the URL above pointed at the tailnet address: "promoted", refused.
+    match crate::onboard::standalone::upsert_env(&root, "NOO_BIND_MODE", PROMOTED_BIND_MODE) {
+        Ok(()) => ui::done(&format!("bind mode {PROMOTED_BIND_MODE} (NOO_BIND_MODE): the stack listens on the tailnet address")),
+        Err(e) => ui::warned(&format!(
+            "could not set NOO_BIND_MODE={PROMOTED_BIND_MODE} in .env ({e}) — set it, then: noo stack restart --force"
+        )),
+    }
+
+    // i545 75/81: the services a remote node reaches (nats, redis, postgres,
+    // model-cache) verify by the tailnet name too; only the gateway's leaf
+    // was re-issued, so an enrolled node failed TLS on the bus.
+    reissue_reachable_service_certs(&ca);
+
     // Serve mappings — the SAME implementation onboard uses
     // (tailnet_serve.rs). The copy that lived here discarded both exit
     // statuses and printed "rebound" from intent: on the 2026-09-01
@@ -107,9 +122,34 @@ pub fn controller_promote(g: &Globals, args: &[String]) -> Result<i32, Unhandled
             "tailscale serve status shows NO mapping — this controller is not fronted on the tailnet"),
         crate::tailnet_serve::Status::Unknown(e) => println!("{}", ui::note(&format!("serve status unreadable: {e}"))),
     }
-    let _ = Command::new("docker").args(["restart", "noo-gateway"]).status();
-    ui::done("gateway restarted on the new cert");
+    // Recreate, not restart: a restart keeps the old port bindings, and the
+    // bind mode and every re-issued leaf take effect only on a recreate.
+    if restart_stack_force() {
+        ui::done("stack recreated on the new bind mode and certificates");
+    } else {
+        ui::warned("the stack did not recreate — run: noo stack restart --force");
+    }
     ui::close_done(&format!("role '{name}' claimed — this box is the controller"));
+
+    // i545 74/89/92: this box's OWN node agent follows the new identity:
+    // its env still named localhost and its cert lacked the tailnet address
+    // and name, so the enroll line promote printed failed at admission.
+    // Restaged over the rail (the same lane `noo upgrade` uses for it),
+    // always, not only with --restage-nodes.
+    let self_node = self_node_id(&crate::onboard::env::read_env_key(&root.join(".env"), "NODE_ID"));
+    if !g.json { println!("{}", ui::phase("Self Node")); }
+    let self_failed = if crate::commands::provision::pull_units_missing(&self_node).is_empty() {
+        match crate::commands::upgrade::provision_one(g, &self_node, &[]) {
+            Ok(0) => false,
+            _ => {
+                ui::warned(&format!("{self_node}'s agent was not restaged — run: noo cluster provision {self_node}"));
+                true
+            }
+        }
+    } else {
+        println!("{}", ui::note(&format!("{self_node} has no node agent on this box — install it: noo onboard --only services")));
+        false
+    };
 
     // The DATA half is not this command's to run; say where it lives.
     if !g.json { println!("{}", ui::phase("Data Plane")); }
@@ -119,7 +159,7 @@ pub fn controller_promote(g: &Globals, args: &[String]) -> Result<i32, Unhandled
     // Fleet realignment: nodes that pin the ROLE name reconverge on their
     // own; anything pinned to the old machine name needs a bundle restage.
     if !g.json { println!("{}", ui::phase("Restage")); }
-    let nodes = inventory_nodes(g);
+    let nodes: Vec<String> = inventory_nodes(g).into_iter().filter(|n| !n.eq_ignore_ascii_case(&self_node)).collect();
     let mut failed: Vec<String> = Vec::new();
     if nodes.is_empty() {
         println!("{}", ui::note("no nodes registered with this controller — nothing to restage"));
@@ -138,6 +178,9 @@ pub fn controller_promote(g: &Globals, args: &[String]) -> Result<i32, Unhandled
         println!("{}", ui::note("nodes pinned to the role name reconverge on their own; anything pinned to the old machine name needs a bundle restage"));
     }
 
+    if self_failed {
+        failed.push(self_node.clone());
+    }
     if failed.is_empty() {
         ui::close_done("promoted");
     } else {
@@ -159,6 +202,45 @@ pub fn controller_promote(g: &Globals, args: &[String]) -> Result<i32, Unhandled
     entries.push(("noo controller demote", "on the OLD controller, if it is still up: release the role name and serve mappings"));
     ui::guide(&entries);
     Ok(0)
+}
+
+/// The bind mode a promoted controller runs in: its door is the tailnet.
+pub(crate) const PROMOTED_BIND_MODE: &str = "tailnet";
+
+/// The controller's own node id, as onboarding names it (`NODE_ID` in the
+/// install's .env, else `controller`).
+pub(crate) fn self_node_id(env_node_id: &str) -> String {
+    let n = env_node_id.trim();
+    if n.is_empty() { "controller".to_string() } else { n.to_string() }
+}
+
+/// Re-issue each externally reachable service's leaf that lacks this box's
+/// derived names (now including the tailnet name), one line each, as
+/// `noo upgrade --stack` does. Returns the services re-issued.
+fn reissue_reachable_service_certs(ca: &crate::pki::ClusterCa) -> Vec<String> {
+    use crate::onboard::steps::NamesOutcome;
+    let (hostname, node_ip, ts) = crate::onboard::steps::local_cert_identity();
+    let mut done = Vec::new();
+    for svc in crate::onboard::steps::EXTERNALLY_REACHABLE {
+        match crate::onboard::steps::ensure_service_cert_names(ca, svc, &hostname, &node_ip, &ts) {
+            Ok(NamesOutcome::Reissued { missing, .. }) => {
+                ui::done(&format!("re-issued the {svc} service certificate to add {}", missing.join(", ")));
+                done.push((*svc).to_string());
+            }
+            Ok(NamesOutcome::Covered | NamesOutcome::NoLeaf) => {}
+            Err(e) => ui::warned(&format!(
+                "{svc} service certificate could not be re-issued ({e}) — then: noo security pki issue-service {svc}, then: noo stack restart --force {svc}"
+            )),
+        }
+    }
+    done
+}
+
+/// `noo stack restart --force` in a child process: it reports failures by
+/// exiting, which must not end promote.
+fn restart_stack_force() -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false };
+    Command::new(exe).args(["stack", "restart", "--force"]).status().map(|s| s.success()).unwrap_or(false)
 }
 
 /// `noo controller demote [--name N] [-y|--yes]` — release the role name (defaults the
@@ -239,4 +321,76 @@ fn inventory_nodes(g: &Globals) -> Vec<String> {
             n["id"].as_str().or_else(|| n["hostname"].as_str()).map(str::to_string)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn promote_body() -> String {
+        let own = crate::test_src::own_code(include_str!("controller.rs"));
+        crate::test_src::fn_body(&own, "pub fn controller_promote(").to_string()
+    }
+
+    fn at(body: &str, needle: &str) -> usize {
+        body.find(needle).unwrap_or_else(|| panic!("promote no longer has `{needle}`"))
+    }
+
+    #[test]
+    fn the_self_node_is_onboardings_name_else_controller() {
+        assert_eq!(self_node_id(""), "controller");
+        assert_eq!(self_node_id("  "), "controller");
+        assert_eq!(self_node_id("Lenovo-P52s"), "Lenovo-P52s");
+    }
+
+    /// i545 72: promote moves the stack to the tailnet bind mode, and it
+    /// does so before the stack is recreated (a restart keeps old bindings).
+    #[test]
+    fn promote_sets_bind_mode_tailnet_before_the_recreate() {
+        let b = promote_body();
+        assert_eq!(PROMOTED_BIND_MODE, "tailnet");
+        let set = at(&b, "upsert_env(&root, \"NOO_BIND_MODE\", PROMOTED_BIND_MODE)");
+        assert!(set < at(&b, "restart_stack_force()"), "set before the recreate");
+    }
+
+    /// i545 75/81: the externally reachable service leaves are reconciled
+    /// against the new identity, before the recreate that loads them.
+    #[test]
+    fn promote_reissues_the_reachable_service_certs_before_the_recreate() {
+        let b = promote_body();
+        assert!(at(&b, "reissue_reachable_service_certs(&ca)") < at(&b, "restart_stack_force()"));
+        let own = crate::test_src::own_code(include_str!("controller.rs"));
+        let f = crate::test_src::fn_body(&own, "fn reissue_reachable_service_certs(");
+        assert!(f.contains("for svc in crate::onboard::steps::EXTERNALLY_REACHABLE"), "{f}");
+        assert!(f.contains("ensure_service_cert_names(ca, svc, &hostname, &node_ip, &ts)"), "{f}");
+        assert_eq!(crate::onboard::steps::EXTERNALLY_REACHABLE, &["nats", "redis", "postgres", "model-cache"]);
+    }
+
+    /// The bind mode and the leaves take effect on a RECREATE; the old
+    /// `docker restart noo-gateway` kept the old bindings.
+    #[test]
+    fn promote_recreates_the_stack_instead_of_restarting_the_gateway() {
+        let b = promote_body();
+        assert!(!b.contains("\"restart\", \"noo-gateway\""), "a gateway restart is not enough");
+        let own = crate::test_src::own_code(include_str!("controller.rs"));
+        let f = crate::test_src::fn_body(&own, "fn restart_stack_force(");
+        assert!(f.contains(".args([\"stack\", \"restart\", \"--force\"])"), "{f}");
+    }
+
+    /// i545 74/89/92: the controller's own node agent is restaged over the
+    /// rail on every promote (not only with --restage-nodes), after the
+    /// recreate, and the inventory loop does not restage it twice.
+    #[test]
+    fn promote_always_restages_the_self_node() {
+        let b = promote_body();
+        let restage = at(&b, "crate::commands::upgrade::provision_one(g, &self_node, &[])");
+        assert!(at(&b, "restart_stack_force()") < restage, "after the recreate");
+        let gate = at(&b, "} else if restage {");
+        assert!(restage < gate, "not behind --restage-nodes");
+        assert!(b.contains(".filter(|n| !n.eq_ignore_ascii_case(&self_node))"), "the loop skips it");
+        assert!(
+            b.contains("let self_failed = if crate::commands::provision::pull_units_missing(&self_node).is_empty() {"),
+            "the only condition is that the self-agent is installed"
+        );
+    }
 }

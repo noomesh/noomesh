@@ -26,7 +26,20 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 
 /** Session state on top of @metis/api's auth endpoints. Web and mobile share
  *  this; each passes an AuthApi built from its own token store. */
-export function AuthProvider({ authApi, children }: { authApi: AuthApi; children: ReactNode }) {
+export function AuthProvider({
+  authApi,
+  restore,
+  children,
+}: {
+  authApi: AuthApi;
+  /**
+   * Run once before the first identity check: the web console's in-memory
+   * token is empty after a reload, and this restores it from the httpOnly
+   * refresh cookie (i515c). A failure just means "not signed in".
+   */
+  restore?: () => Promise<unknown>;
+  children: ReactNode;
+}) {
   const [user, setUser] = useState<MeInfo | null>(null);
   const [ready, setReady] = useState(false);
 
@@ -40,11 +53,13 @@ export function AuthProvider({ authApi, children }: { authApi: AuthApi; children
     // A failed initial identity check (offline / gateway unreachable) must still
     // mark us ready — otherwise the app hangs on its splash forever instead of
     // falling through to the login screen.
-    void refresh().catch(() => {
-      setUser(null);
-      setReady(true);
-    });
-  }, [refresh]);
+    void (restore ? restore().catch(() => null) : Promise.resolve(null))
+      .then(() => refresh())
+      .catch(() => {
+        setUser(null);
+        setReady(true);
+      });
+  }, [refresh, restore]);
 
   // The REST client dispatches this when a 401 refresh fails (web only).
   // React Native defines `window` but not window.addEventListener, so the

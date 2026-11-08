@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use axum::{
     Router,
-    routing::get,
+    routing::{get, post},
 };
 
 use crate::state::AppState;
@@ -19,6 +19,10 @@ use crate::state::AppState;
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         // ── Native WebSocket handlers ──
+        // The console's sockets open with a single-use ticket (i515c).
+        // A literal, so the spec and drift checks see it; pinned equal to
+        // websocket::WS_TICKET_PATH below.
+        .route("/api/ws-ticket", post(crate::websocket::ws_ticket))
         .route("/ws/coordinator", get(crate::ws_coordinator::ws_handler))
         .route("/ws/collab", get(crate::ws_collab::ws_handler))
         // A2A peer protocol — bidirectional, for external harnesses (hermes, noo-trading, etc.)
@@ -28,4 +32,15 @@ pub fn router() -> Router<Arc<AppState>> {
         // Python gateway and now simply 404 — there is no fallback handler
         // for them. Bringing them back needs dedicated Rust WS
         // implementations (can't proxy WebSocket via NATS request/reply).
+}
+
+#[cfg(test)]
+mod ticket_route_tests {
+    /// The registered ticket route is the path the middleware's user-tier
+    /// allowance and the clients name.
+    #[test]
+    fn the_ticket_route_is_ws_ticket_path() {
+        let own = crate::test_src::own_code(include_str!("websocket.rs"));
+        assert!(own.contains(&format!(".route(\"{}\", post(crate::websocket::ws_ticket))", crate::websocket::WS_TICKET_PATH)));
+    }
 }

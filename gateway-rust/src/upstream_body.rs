@@ -184,12 +184,7 @@ mod tests {
     #[test]
     fn no_success_arm_reads_its_body_leniently() {
         const ALLOWED: &[(&str, usize, &str)] = &[
-            (
-                "routes/cluster.rs",
-                1,
-                "gpu_hold_op: its 2xx means the agent already held or released the GPU, so its \
-                 state machine has its own PR (wt/b4-gpu-hold-body)",
-            ),
+            // Empty: every success arm reads its body strictly (i460 HTTP stack done).
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut found: std::collections::BTreeMap<String, usize> = Default::default();

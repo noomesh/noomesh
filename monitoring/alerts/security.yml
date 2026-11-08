@@ -46,3 +46,39 @@ groups:
           description: >-
             Confirm the audit sink is live (worker_pool.audit_logger_initialized
             db_sink=true) and that noo_security_audit is receiving rows.
+
+      # i520: the audit trail itself. Both are CRITICAL, so Alertmanager sends
+      # them to the gateway's intake (i515b), which raises them as operator
+      # alerts. The annotations never reach a channel; the intake's template
+      # names the alert and the target.
+      - alert: AuditChainVerifyFailed
+        # The full chain verify (every 6 h, and every `noo security audit
+        # verify`) found a broken row: the evidence trail cannot be trusted.
+        # source="head_export" is left out on purpose: a truncated or
+        # rewritten head already pages through its own PERSISTING operator
+        # alert (audit_head_export::raise). One event, one page.
+        expr: increase(noo_audit_verify_failures_total{source="verify"}[30m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          category: security
+        annotations:
+          summary: "The security audit chain failed verification"
+          description: >-
+            A verify of noo_security_audit found rows that do not match their
+            hash or chain. Run `noo security audit verify` for the rows.
+
+      - alert: AuditSpoolRowsLost
+        # The gateway lost audit rows: the spool overflowed while the
+        # database was away, or a row could not be written at all. Every
+        # lost row is lost evidence.
+        expr: increase(noo_audit_spool_lost_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          category: security
+        annotations:
+          summary: "Security audit rows were lost"
+          description: >-
+            noo_audit_spool_lost_total rose. Check the database the gateway
+            writes to, and `noo security audit verify` (its `spool` section).

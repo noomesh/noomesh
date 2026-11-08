@@ -407,7 +407,10 @@ async fn dispatch(
 
             // External MCP tool.
             if name.starts_with(crate::mcp_bridge::PREFIX) {
-                let ids = crate::mcp_bridge::server_ids(state).await;
+                let ids = match crate::mcp_bridge::server_ids(state).await {
+                    Ok(ids) => ids,
+                    Err(e) => return env.result(json!({ "content": [{"type": "text", "text": e}], "isError": true }), SERVER_NAME),
+                };
                 if let Some((server, tool_name)) = crate::mcp_bridge::split_name(name, &ids) {
                     let user = Some(caller.user.as_str());
                     let argv = Value::Object(args.clone());

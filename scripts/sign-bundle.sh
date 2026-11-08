@@ -54,6 +54,22 @@ esac
 
 KNOWN="ca.crt node.crt node.key agent-env agent-unit agent-binary teardown applier hostd-binary restart-backends host-telemetry cli-binary cli-user fetcher nats-creds fleet-secrets signing-pub harness-binary harness-env harness-unit svc-vllm.crt svc-vllm.key svc-llamacpp.crt svc-llamacpp.key svc-ollama.crt svc-ollama.key svc-tei.crt svc-tei.key svc-reranker.crt svc-reranker.key vendor-cli vendor-cli-manifest vendor-cli-2 vendor-cli-2-manifest vendor-cli-3 vendor-cli-3-manifest"
 
+# An add-on's node workload door leaf: svc-addon-<addon>-<workload>.crt|.key.
+# The set is open, so it is judged by shape (same rule as noo-apply.sh's
+# addon_leaf_kind_ok): the stem after `svc-` is `addon-` plus a name matching
+# ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$, at most 57 characters in all.
+addon_leaf_kind_ok() {
+    case "$1" in
+        svc-addon-*.crt) _alk="${1%.crt}" ;;
+        svc-addon-*.key) _alk="${1%.key}" ;;
+        *) return 1 ;;
+    esac
+    _alk="${_alk#svc-}"
+    [ "${#_alk}" -gt 6 ] && [ "${#_alk}" -le 57 ] || return 1
+    case "$_alk" in *[!a-z0-9-]*|-*|*-|addon--*) return 1 ;; esac
+    return 0
+}
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/files"
@@ -74,7 +90,7 @@ for f in "$STAGE"/*; do
     kind="$(basename "$f")"
     case " $KNOWN " in
         *" $kind "*) : ;;
-        *) echo "sign-bundle: '$kind' is not a bundle kind (known: $KNOWN)" >&2; exit 65 ;;
+        *) addon_leaf_kind_ok "$kind" || { echo "sign-bundle: '$kind' is not a bundle kind (known: $KNOWN, or a well-formed svc-addon-<addon>-<workload>.crt|.key)" >&2; exit 65; } ;;
     esac
     cp "$f" "$WORK/files/$kind"
     printf '%s  %s\n' "$(sha256sum "$WORK/files/$kind" | awk '{print $1}')" "$kind" >> "$WORK/manifest"

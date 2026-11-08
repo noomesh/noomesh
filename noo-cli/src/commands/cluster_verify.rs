@@ -353,6 +353,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     //          placement's image is staged there.
     out.extend(image_sources_check(n));
     out.extend(images_staged_check(n));
+    out.extend(gpu_target_cpu_build_check(n));
     out.extend(hardened_images_check(n));
 
     // 6c''. Vendor telemetry (docs/security/telemetry.md): no running
@@ -610,8 +611,13 @@ pub(crate) fn gpu_contention_check_at(n: &Value, now_unix: i64) -> Option<Check>
             format!("yielded: {paused_phrase} (nvidia-smi not answering for {} — a Windows program is likely using the GPU) — resumes when nvidia-smi answers and the GPU is clear",
                 compact_secs(gc["unmeasured_for_s"].as_i64().unwrap_or(0))),
             None),
+        // The figures are the reading now, with our backends stopped; the
+        // reason is why it yielded (awolf, 2026-11-07, read "foreign 0.0 GB"
+        // for a yield on a probe timeout).
         "yielded" => warn("gpu",
-            format!("yielded: {paused_phrase} (foreign {:.1} GB, {method}{off}) — resumes when the GPU frees", gb("foreign_mb")),
+            format!("yielded: {paused_phrase} ({}foreign {:.1} GB, {method}{off}) — resumes when the GPU frees",
+                super::cluster_gpu::yield_reason(gc).map(|r| format!("{r}; now ")).unwrap_or_default(),
+                gb("foreign_mb")),
             None),
         "held" => {
             // The lease's ids make the remedy an exact release; without a
@@ -720,6 +726,25 @@ pub(crate) fn images_staged_check(n: &Value) -> Option<Check> {
             "noo cluster sync-images {id} -i {}   # or `noo upgrade` for the release images",
             crate::commands::image_stage::staged_ref(first)
         )),
+    ))
+}
+
+/// The `gpu target` row (i545 45/46): placements declared on `gpu` whose
+/// image has no GPU build (`gpu_targets_on_cpu_builds`, injected by
+/// `with_harness_wanted` from desired-config). They run on the CPU while
+/// sized and reported as GPU. No row when there are none.
+pub(crate) fn gpu_target_cpu_build_check(n: &Value) -> Option<Check> {
+    let id = n["id"].as_str().unwrap_or("?");
+    let list = n["gpu_targets_on_cpu_builds"].as_array()?;
+    let names: Vec<&str> = list.iter().filter_map(Value::as_str).collect();
+    let first = names.first()?;
+    Some(warn(
+        "gpu target",
+        format!(
+            "placed on gpu but running on the CPU (the llamacpp image has no GPU build): {}",
+            names.join(", ")
+        ),
+        Some(format!("noo cluster place {id} {first} --on cpu   # CPU sizing; for a GPU, place it on ollama or vllm")),
     ))
 }
 
@@ -1307,6 +1332,11 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         (Some(d), Some(arch)) => crate::commands::image_stage::unstaged_for(&d["placements"], arch),
         _ => Vec::new(),
     };
+    // i545 45/46: placements on a gpu target whose image has no GPU build.
+    let cpu_built = desired
+        .as_ref()
+        .map(|d| crate::commands::cluster_tune::gpu_targets_on_cpu_builds(&d["placements"]))
+        .unwrap_or_default();
     // Control over the bus: a node that advertises it gets one health round
     // trip over NATS, run by the gateway (the only principal that may send).
     // Nothing is asked of a node that does not advertise, so its row reads
@@ -1332,6 +1362,9 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         }
         if !unstaged.is_empty() {
             obj.insert("unstaged_images".into(), serde_json::json!(unstaged));
+        }
+        if !cpu_built.is_empty() {
+            obj.insert("gpu_targets_on_cpu_builds".into(), serde_json::json!(cpu_built));
         }
         if let Some(w) = wanted {
             obj.insert("harness_wanted".into(), Value::Bool(w));
@@ -5619,6 +5652,33 @@ pub(crate) fn tailnet_merge_missing(j: &Value) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// The `add-on containers` row for one enabled add-on (i509): its declared
+/// containers (`x-noo-addon: containers`) that are not running, or why they
+/// could not be read. Down is a FAIL naming `noo stack restart <addon>`: after
+/// a reboot, nothing else says that an add-on did not come back. A container
+/// the launcher HOLDS (`addon_after_boot::split_containers`, the launcher's
+/// own rule) is not expected to run: a note on an OK row, never a FAIL. An
+/// add-on whose overlay declares no containers (no `x-noo-addon` block) is a
+/// WARN: a row red forever for what the operator cannot fix trains people to
+/// ignore verify.
+pub(crate) fn addon_containers_row(addon: &str, state: Result<crate::commands::addon_after_boot::Containers, String>) -> Check {
+    const ROW: &str = "add-on containers";
+    let restart = format!("noo stack restart {addon}");
+    match state {
+        Ok(c) if c.undeclared => warn(ROW, format!("{addon}: declares no containers, so they aren't checked"), None),
+        Ok(c) if c.down.is_empty() => {
+            let held: Vec<String> = c.held.iter().map(|(h, why)| format!("held: {h} ({why})")).collect();
+            if held.is_empty() {
+                ok(ROW, format!("{addon}: every declared container is running"))
+            } else {
+                ok(ROW, format!("{addon}: every container that should run is running; {}", held.join("; ")))
+            }
+        }
+        Ok(c) => fail(ROW, format!("{addon}: not running: {}", c.down.join(", ")), restart),
+        Err(e) => fail(ROW, format!("{addon}: whether its containers run could not be read ({e})"), restart),
+    }
+}
+
 /// The `add-on pins` row from `noo addons verify --json`: "N verified (key
 /// #i)" or the first failing add-on and why.
 pub(crate) fn addon_pins_check(ec: i32, v: &Value) -> Check {
@@ -6075,6 +6135,16 @@ mod gateway_redis_tests {
     }
 }
 
+/// A missing map is unknown, never a pass. Console path refusal does not
+/// imply that the add-on's separate API or port is unavailable.
+pub(crate) fn gateway_addon_path_checks(health: Option<&Value>) -> Vec<Check> {
+    match health.and_then(|h| h["addons_paths_refused"].as_object()) {
+        None => vec![warn("add-on console paths", "not read: no authenticated path-refusal map", Some("noo health".into()))],
+        Some(paths) if paths.is_empty() => vec![ok("add-on console paths", "no refused console paths")],
+        Some(paths) => paths.iter().map(|(name, why)| fail("add-on console paths", format!("{name}: {}", why.as_str().unwrap_or("refused")), "fix signed ui.console_path claims and restart the gateway")).collect(),
+    }
+}
+
 /// The `gateway add-on` rows (i353b): one per add-on noomesh.yaml switches
 /// on, plus any the gateway refused that is not. On 2026-10-31 the gateway
 /// refused a third-party add-on whole at startup (its routes.json) while `add-on pins`
@@ -6125,7 +6195,13 @@ pub(crate) fn gateway_addon_checks(health: Option<&Value>, enabled: &[String]) -
 
 #[cfg(test)]
 mod gateway_addon_tests {
-    use super::{gateway_addon_checks, Verdict};
+    use super::{gateway_addon_checks, gateway_addon_path_checks, Verdict};
+    #[test]
+    fn console_path_refusal_never_looks_healthy() {
+        assert_eq!(gateway_addon_path_checks(Some(&serde_json::json!({"addons_paths_refused":{"rhaddon":"collision"}})))[0].verdict, Verdict::Fail);
+        assert_eq!(gateway_addon_path_checks(Some(&serde_json::json!({"addons_paths_refused":{}})))[0].verdict, Verdict::Ok);
+        assert_eq!(gateway_addon_path_checks(None)[0].verdict, Verdict::Warn);
+    }
     use serde_json::{json, Value};
 
     /// An authenticated /health body as the 0.6.16 gateway writes it, with
@@ -6617,9 +6693,16 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // An unreadable noomesh.yaml is a failed row, never "no add-on on".
         match crate::addons::licensed_on(&crate::envfile::repo_root()) {
             Ok(on) if on.is_empty() => {}
-            Ok(_) => {
+            Ok(on) => {
                 let (ec, pins, _) = self_json(g, &["addons", "verify"]);
                 checks.push(addon_pins_check(ec, &pins));
+                // i509: an enabled add-on whose containers are down (after a
+                // reboot the boot-time start may have failed) is a FAIL that
+                // names the restart, one row per add-on.
+                let root = crate::envfile::repo_root();
+                for a in on {
+                    checks.push(addon_containers_row(a, crate::commands::addon_after_boot::down_containers_at(&root, a)));
+                }
             }
             Err(e) => checks.push(fail("add-on pins", format!("which add-ons are on is unknown: {e}"), "noo addons list")),
         }
@@ -6701,6 +6784,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .filter_map(|(n, on)| on.then_some(n))
             .collect();
         checks.extend(gateway_addon_checks(health.as_ref(), &enabled));
+        checks.extend(gateway_addon_path_checks(health.as_ref()));
         {
             let root = crate::envfile::repo_root();
             let store = crate::commands::secrets::SecretStore::load_sops(&root.join("secrets/env.sops"));
@@ -7096,6 +7180,47 @@ mod tests {
         assert_eq!(heading, "Seats (2)");
         assert_eq!(line, None, "enrolled seats render their own rows");
         assert_eq!(super::seats_heading(None), None, "an older gateway without the registry stays silent");
+    }
+
+    /// An enabled add-on whose overlay declares no containers (no
+    /// `x-noo-addon` block) is a WARN that says so, never a FAIL and never
+    /// a restart remedy: the operator cannot fix a third-party overlay.
+    #[test]
+    fn an_add_on_that_declares_no_containers_is_a_warn_not_a_fail() {
+        let none = crate::commands::addon_after_boot::Containers { undeclared: true, ..Default::default() };
+        let row = super::addon_containers_row("rhaddon", Ok(none));
+        assert_eq!((row.name, row.verdict), ("add-on containers", super::Verdict::Warn), "{row:?}");
+        assert!(row.detail.contains("rhaddon: declares no containers, so they aren't checked"), "{row:?}");
+        assert!(row.remedy.is_none(), "{row:?}");
+    }
+
+    /// i509 step 5: an enabled add-on that is down FAILS, naming it and the
+    /// restart; one that runs passes; an unreadable state is not a pass.
+    #[test]
+    fn an_enabled_add_on_whose_containers_are_down_fails_and_names_the_restart() {
+        use crate::commands::addon_after_boot::split_containers;
+        let declared = vec!["noo-rhaddon".to_string(), "noo-rhaddon-worker".to_string(), "noo-rhaddon-gpu".to_string()];
+        let all: Vec<String> = declared[..2].to_vec();
+        let gpu = vec![("noo-rhaddon-gpu".to_string(), "asks for a GPU".to_string())];
+        let up = super::addon_containers_row("rhaddon", Ok(split_containers(&declared[..2], &all, &[])));
+        assert_eq!((up.name, up.verdict), ("add-on containers", super::Verdict::Ok), "{up:?}");
+        assert!(up.detail.starts_with("rhaddon: "), "{up:?}");
+        let down = super::addon_containers_row("rhaddon", Ok(split_containers(&declared[..2], &[], &[])));
+        assert_eq!(down.verdict, super::Verdict::Fail, "{down:?}");
+        assert!(down.detail.contains("rhaddon") && down.detail.contains("noo-rhaddon, noo-rhaddon-worker"), "{down:?}");
+        assert_eq!(down.remedy.as_deref(), Some("noo stack restart rhaddon"));
+        let unknown = super::addon_containers_row("rhaddon", Err("docker is not answering".into()));
+        assert_eq!(unknown.verdict, super::Verdict::Fail, "an unreadable state is never a pass: {unknown:?}");
+        assert!(unknown.detail.contains("docker is not answering"), "{unknown:?}");
+        assert_eq!(unknown.remedy.as_deref(), Some("noo stack restart rhaddon"));
+        // A held container is a note, not a FAIL (the launcher never starts it).
+        let held = super::addon_containers_row("rhaddon", Ok(split_containers(&declared, &all, &gpu)));
+        assert_eq!(held.verdict, super::Verdict::Ok, "a held container is not a FAIL: {held:?}");
+        assert!(held.detail.contains("held: noo-rhaddon-gpu (asks for a GPU)"), "{held:?}");
+        // Held plus another one down: a FAIL that names only the down one.
+        let both = super::addon_containers_row("rhaddon", Ok(split_containers(&declared, &["noo-rhaddon".to_string()], &gpu)));
+        assert_eq!(both.verdict, super::Verdict::Fail, "{both:?}");
+        assert!(both.detail.contains("not running: noo-rhaddon-worker") && !both.detail.contains("noo-rhaddon-gpu"), "{both:?}");
     }
 
     /// The `model classes` row: declared candidates must be
@@ -10014,6 +10139,21 @@ mod tests {
     }
 
     #[test]
+    fn gpu_target_row_names_what_runs_on_the_cpu() {
+        use serde_json::json;
+        assert!(gpu_target_cpu_build_check(&json!({"id": "n"})).is_none(), "nothing to say");
+        let n = json!({"id": "Lenovo-P52s", "gpu_targets_on_cpu_builds": ["llamacpp gemma-4-E2B-it-Q4_K_M.gguf"]});
+        let c = gpu_target_cpu_build_check(&n).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("running on the CPU") && c.detail.contains("gemma-4-E2B-it-Q4_K_M.gguf"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref().unwrap().split("   #").next().unwrap(), "noo cluster place Lenovo-P52s llamacpp gemma-4-E2B-it-Q4_K_M.gguf --on cpu");
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
+        assert!(inject.contains("gpu_targets_on_cpu_builds(&d[\"placements\"])"), "fed from desired-config");
+        assert!(own.contains("out.extend(gpu_target_cpu_build_check(n));"), "the row is in the run");
+    }
+
+    #[test]
     fn images_staged_row_names_an_unstaged_placement() {
         let n = serde_json::json!({"id": "host8-ma", "unstaged_images": ["reg/acme/llamacpp:v0.2.103"]});
         let c = images_staged_check(&n).unwrap();
@@ -11771,6 +11911,24 @@ mod gpu_contention_tests {
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.starts_with("yielded: vllm paused (nvidia-smi not answering for"), "{}", c.detail);
         assert!(!c.detail.contains("foreign"), "{}", c.detail);
+    }
+
+    /// awolf, 2026-11-07: a yield on a probe timeout, read back once the
+    /// probe answered again, said only "foreign 0.0 GB, nvidia-smi". The row
+    /// names the agent's reason first, then the reading now.
+    #[test]
+    fn yielded_names_why_it_yielded_before_the_reading_now() {
+        let c = gpu_contention_check(&node(serde_json::json!({
+            "state": "yielded", "foreign_mb": 0, "method": "nvidia-smi", "paused_backends": ["vllm"],
+            "reason": "GPU probe (nvidia-smi) not answering: a program outside noomesh is likely using the GPU"}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with(
+            "yielded: vllm paused (GPU probe (nvidia-smi) not answering: a program outside noomesh is likely using the GPU; now foreign 0.0 GB, nvidia-smi)"),
+            "{}", c.detail);
+        // No reason (an older agent): the row is as before.
+        let old = gpu_contention_check(&node(serde_json::json!({
+            "state": "yielded", "foreign_mb": 0, "method": "nvidia-smi", "paused_backends": ["vllm"]}))).unwrap();
+        assert!(old.detail.starts_with("yielded: vllm paused (foreign 0.0 GB, nvidia-smi)"), "{}", old.detail);
     }
 
     #[test]

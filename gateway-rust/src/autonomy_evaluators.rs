@@ -2699,6 +2699,18 @@ pub(crate) fn backend_unreachable_alert(
 
 #[cfg(test)]
 mod backend_unreachable_alert_tests {
+    /// i545 63: the evaluator asks whether both tables exist BEFORE the
+    /// LEFT JOIN that names them, and stops there when they do not.
+    #[test]
+    fn the_link_check_asks_for_its_tables_before_naming_them() {
+        let own = crate::test_src::own_code(include_str!("autonomy_evaluators.rs"));
+        let body = crate::test_src::fn_body(&own, "pub async fn eval_cross_domain_link_integrity(");
+        let ask = body.find("crate::repo::relations_exist(&state.db, &[\"noo_temporal_edges\", \"noo_hofstadter_loop_cycles\"])").expect("the check");
+        let stop = body.find("if !present").expect("the stop");
+        let join = body.find("LEFT JOIN noo_hofstadter_loop_cycles").expect("the join");
+        assert!(ask < stop && stop < join, "asked, then stopped, before the join");
+    }
+
     use super::*;
 
     const FORBIDDEN: &[&str] = &[
@@ -3447,6 +3459,15 @@ fn link_integrity_tables_absent(e: &sqlx::Error) -> bool {
 }
 
 pub async fn eval_cross_domain_link_integrity(state: &AppState) -> Result<bool, String> {
+    // Ask first: the guard below cannot keep Postgres from resolving the
+    // LEFT JOIN's table at plan time, which logged an ERROR every run on an
+    // install without evolve's table (i545 finding 63).
+    let present = crate::repo::relations_exist(&state.db, &["noo_temporal_edges", "noo_hofstadter_loop_cycles"])
+        .await
+        .map_err(|e| format!("cross-domain link: table check failed: {e}"))?;
+    if !present {
+        return Ok(false);
+    }
     let row: Option<(i64, i64)> = sqlx::query_as(
         "SELECT count(*) FILTER (WHERE e.source_cycle_id IS NOT NULL),
                 count(*) FILTER (WHERE e.source_cycle_id IS NOT NULL AND c.id IS NULL)

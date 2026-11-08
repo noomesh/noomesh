@@ -749,6 +749,16 @@ jobs:
         SQLX_OFFLINE: "true"
       run: CARGO_DOCKER_CRATE="$PWD/gateway-rust" scripts/cargo-docker.sh test --locked
 
+    # crates/addon-manifest holds the add-on manifest security checks. It is a
+    # path dependency with no workspace and no lockfile of its own, so the step
+    # above (gateway-rust's own tests) never runs its unit tests. Run them
+    # through gateway-rust's lockfile so --locked still holds.
+    - name: cargo test (addon-manifest)
+      if: needs.scope.outputs.gateway == 'true'
+      env:
+        SQLX_OFFLINE: "true"
+      run: CARGO_DOCKER_CRATE="$PWD/gateway-rust" scripts/cargo-docker.sh test --locked -p addon-manifest
+
 
     # Prune before saving: incremental dirs, the crate's own (test) binaries
     # and top-level outputs go; dependency artifacts stay. A target still over
@@ -796,7 +806,7 @@ jobs:
       if: needs.scope.outputs.ui == 'true'
       run: npm ci
 
-    # The console's four gates.
+    # The console's five gates.
     - name: Typecheck
       if: needs.scope.outputs.ui == 'true'
       run: npm run typecheck
@@ -809,6 +819,11 @@ jobs:
     - name: Contract audit (UI + router vs openapi.json)
       if: needs.scope.outputs.ui == 'true'
       run: npm run audit:contract
+    # The typed client is generated from the contract; the committed
+    # schema.d.ts must be exactly what the locked generator makes from it.
+    - name: Typed client matches the contract (schema.d.ts)
+      if: needs.scope.outputs.ui == 'true'
+      run: npm run check:api
 
     # Only what ships to a browser. The dev/build toolchain is excluded by
     # design: it never enters the bundle. apps/mobile is out of the workspace.
@@ -1089,6 +1104,7 @@ jobs:
       working-directory: gateway-rust
       env:
         NOO_BROKER_TEST_DSN: postgresql://noo:noo@localhost:5432/noomesh
+        NOO_REQUIRE_GOOGLE_REHEARSAL: "1"
         # The model-class storage round trip (coordinator/classes.rs db_tests)
         # is gated the same way and asserts the head revision against this
         # same catalogue.
@@ -1225,6 +1241,7 @@ jobs:
       working-directory: gateway-rust
       env:
         NOO_BROKER_TEST_DSN: postgresql://noo:noo@localhost:5432/noomesh
+        NOO_REQUIRE_GOOGLE_REHEARSAL: "1"
         NOO_ROUTER_HARNESS_REQUIRED: "1"
         SQLX_OFFLINE: "true"
       run: |
@@ -1436,6 +1453,15 @@ jobs:
               | sed -n 's|.*Executable tests/secrets_store.rs (\(.*\))|\1|p')"
         [ -n "$t" ] && [ -x "$t" ] || { echo "::error::could not locate the secrets_store test binary ($t)"; exit 1; }
         NOO_REQUIRE_SOPS=1 NOO_TEST_BIN="$PWD/target/debug/noo" "$t" --test-threads=4
+        # The upgrade's new key must be minted in a real encrypted store,
+        # preserve an existing key and refuse a broken store. The build
+        # container has no sops, so execute this unit on the equipped runner.
+        unit_tests="$(cd .. && CARGO_DOCKER_CRATE="$PWD/noo-cli" scripts/cargo-docker.sh test --locked --no-run --color never --bin noo 2>&1 \
+              | sed -n 's|.*Executable unittests src/main.rs (\(.*\))|\1|p')"
+        [ -n "$unit_tests" ] && [ -x "$unit_tests" ] || { echo "::error::could not locate upgrade test binary"; exit 1; }
+        upgrade_test=commands::upgrade::integration_key_tests::integration_upgrade_key_round_trips_without_rotation_or_plaintext
+        "$unit_tests" --list | grep -Fx -- "${upgrade_test}: test"
+        NOO_REQUIRE_SOPS=1 "$unit_tests" "$upgrade_test" --exact --test-threads=1
 
     - name: Build release binary
       if: needs.scope.outputs.cli == 'true'

@@ -749,14 +749,43 @@ pub struct Written {
     /// True when the files were written now (the launcher hands them to the
     /// uid, then marks the generation complete); false when reused.
     pub fresh: bool,
-    /// Older generations of this add-on, for the launcher to remove.
+    /// Older generations of this add-on, for the launcher to remove
+    /// (and any temporary one an interrupted launch left behind).
     pub stale: Vec<PathBuf>,
+    /// Where a fresh generation was written: the hidden `.g-<gen>.tmp` next
+    /// to `gen_dir` (i509). The launcher hands its mount directories to the
+    /// uid, marks it complete, then renames it to `gen_dir`, so `gen_dir`
+    /// exists only once it is whole. `None` when reused.
+    pub tmp_dir: Option<PathBuf>,
 }
 
-/// Write `p` under `<base>/<addon>/<generation>/<mount>/…`: directories
+/// The hidden directory a fresh generation `gen` is written into before the
+/// launcher renames it to `gen` ([`Written::tmp_dir`]).
+pub fn tmp_generation_name(gen: &str) -> String {
+    format!(".{gen}.tmp")
+}
+
+impl Written {
+    /// The directories the launcher hands to the add-on's uid: each mount,
+    /// in the temporary generation when fresh, none when reused.
+    pub fn handover(&self) -> Vec<PathBuf> {
+        let Some(tmp) = &self.tmp_dir else { return Vec::new() };
+        self.mounts.iter().filter_map(|(_, p)| p.file_name().map(|m| tmp.join(m))).collect()
+    }
+}
+
+/// Write `p` for `<base>/<addon>/<generation>/<mount>/…`: directories
 /// 0700, files 0400, all still owned by this process (the launcher hands the
 /// mount directories to `p.uid`). A generation already marked complete is
 /// reused untouched. `base` must be on tmpfs (checked by the caller).
+///
+/// A fresh generation is written into the hidden `.g-<gen>.tmp`
+/// ([`Written::tmp_dir`]), never into `g-<gen>` itself: dockerd may restart
+/// the add-on's container at any moment (a boot, a crash), and with its
+/// mounts' host-path creation off (i509) it starts the instant the source
+/// exists. Only the launcher's rename makes `g-<gen>` exist, after the
+/// handover and the complete marker, so a retry never mounts half a
+/// generation.
 pub fn write_generation(base: &Path, addon: &str, res: &Resources, p: &Plan) -> Result<Written, String> {
     use crate::commands::addon_provision::{private_dir, write_private};
     let addon_dir = base.join(addon);
@@ -767,32 +796,39 @@ pub fn write_generation(base: &Path, addon: &str, res: &Resources, p: &Plan) -> 
     let stale: Vec<PathBuf> = std::fs::read_dir(&addon_dir)
         .map(|rd| {
             rd.flatten()
-                .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("g-") && n != gen))
+                .filter(|e| {
+                    e.file_name().to_str().is_some_and(|n| {
+                        (n.starts_with("g-") && n != gen) || (n.starts_with(".g-") && n.ends_with(".tmp") && n != tmp_generation_name(&gen))
+                    })
+                })
                 .map(|e| e.path())
                 .collect()
         })
         .unwrap_or_default();
     if gen_dir.join(COMPLETE_MARKER).is_file() {
-        return Ok(Written { gen_dir, mounts, fresh: false, stale });
+        return Ok(Written { gen_dir, mounts, fresh: false, stale, tmp_dir: None });
     }
-    if gen_dir.exists() {
-        // Written by an earlier launch that never finished handing it over.
-        std::fs::remove_dir_all(&gen_dir).map_err(|e| {
-            format!("{} is a partial generation that could not be removed ({e}); remove it as root and start again", gen_dir.display())
-        })?;
+    let tmp_dir = addon_dir.join(tmp_generation_name(&gen));
+    for partial in [&gen_dir, &tmp_dir] {
+        if partial.exists() {
+            // Written by an earlier launch that never finished handing it over.
+            std::fs::remove_dir_all(partial).map_err(|e| {
+                format!("{} is a partial generation that could not be removed ({e}); remove it as root and start again", partial.display())
+            })?;
+        }
     }
-    private_dir(&gen_dir)?;
+    private_dir(&tmp_dir)?;
     for m in &res.mounts {
-        private_dir(&gen_dir.join(&m.name))?;
+        private_dir(&tmp_dir.join(&m.name))?;
     }
     for ((m, path), bytes) in &p.files {
-        let dest = gen_dir.join(m).join(path);
+        let dest = tmp_dir.join(m).join(path);
         let dir = dest.parent().ok_or("a file path has no directory")?;
         private_dir(dir)?;
         let name = dest.file_name().and_then(|n| n.to_str()).ok_or("a file path has no name")?;
         write_private(dir, name, bytes, 0o400)?;
     }
-    Ok(Written { gen_dir, mounts, fresh: true, stale })
+    Ok(Written { gen_dir, mounts, fresh: true, stale, tmp_dir: Some(tmp_dir) })
 }
 
 /// The receipt: names, kinds, destinations and paths. No value is a field
@@ -1184,19 +1220,39 @@ mod tests {
         let p = plan(ADDON, &res, &facts(), &mut Fake).unwrap();
         let w = write_generation(&base, ADDON, &res, &p).unwrap();
         assert!(w.fresh && w.stale.is_empty());
+        // i509: written into the hidden temporary generation; the final one
+        // the mounts name does not exist until the launcher renames it.
+        let tmp = w.tmp_dir.clone().expect("a fresh generation names its temporary directory");
+        assert_eq!(tmp, w.gen_dir.with_file_name(tmp_generation_name(w.gen_dir.file_name().unwrap().to_str().unwrap())));
+        assert!(!w.gen_dir.exists(), "the final generation must not exist before the handover");
+        assert!(w.mounts.iter().all(|(_, m)| m.starts_with(&w.gen_dir)), "the mounts name the final generation");
+        let mut handover = w.handover();
+        handover.sort();
+        assert_eq!(handover, vec![tmp.join("coord"), tmp.join("work")], "the handover is the temporary generation's mounts");
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&w.gen_dir.join("work")), 0o700);
-        assert_eq!(mode(&w.gen_dir.join("coord/db")), 0o700);
-        assert_eq!(mode(&w.gen_dir.join("work/leaf.key")), 0o400);
-        assert_eq!(mode(&w.gen_dir.join("coord/db/pgpass")), 0o400);
-        std::fs::write(w.gen_dir.join(COMPLETE_MARKER), b"").unwrap();
+        assert_eq!(mode(&tmp.join("work")), 0o700);
+        assert_eq!(mode(&tmp.join("coord/db")), 0o700);
+        assert_eq!(mode(&tmp.join("work/leaf.key")), 0o400);
+        assert_eq!(mode(&tmp.join("coord/db/pgpass")), 0o400);
+        // An interrupted launch (no marker, no rename): written again, whole.
+        std::fs::write(tmp.join("work/stray"), b"").unwrap();
+        let retry = write_generation(&base, ADDON, &res, &p).unwrap();
+        assert!(retry.fresh && !tmp.join("work/stray").exists() && tmp.join("work/leaf.key").is_file(), "a partial temporary generation is rewritten");
+        // What the launcher does: mark it complete, then rename it into place.
+        std::fs::write(tmp.join(COMPLETE_MARKER), b"").unwrap();
+        std::fs::rename(&tmp, &w.gen_dir).unwrap();
         let again = write_generation(&base, ADDON, &res, &p).unwrap();
-        assert!(!again.fresh && again.gen_dir == w.gen_dir);
+        assert!(!again.fresh && again.gen_dir == w.gen_dir && again.tmp_dir.is_none() && again.handover().is_empty());
         // A changed value is a new generation; the old one is stale.
         let mut p2 = p.clone();
         p2.files.insert(("work".into(), "peer-key".into()), b"ROTATED".to_vec());
         let w2 = write_generation(&base, ADDON, &res, &p2).unwrap();
         assert!(w2.fresh && w2.gen_dir != w.gen_dir && w2.stale == vec![w.gen_dir.clone()]);
+        // A temporary generation a crashed start left behind is stale too.
+        let left = base.join(ADDON).join(tmp_generation_name("g-00000000deadbeef"));
+        std::fs::create_dir_all(&left).unwrap();
+        let w3 = write_generation(&base, ADDON, &res, &p2).unwrap();
+        assert!(w3.stale.contains(&left) && !w3.stale.contains(w3.tmp_dir.as_ref().unwrap()), "{:?}", w3.stale);
         // The receipt names paths and never a value.
         let r = receipt(ADDON, &res, &w2).to_string();
         for v in ["ADDON-KEY-VALUE", "PEER-SECRET-VALUE", "LEAF-KEY-VALUE", "DB-KEY-VALUE", "ROTATED", "PASS"] {

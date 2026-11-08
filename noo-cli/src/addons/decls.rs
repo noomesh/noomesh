@@ -44,8 +44,10 @@ pub const WORKLOADS_FILE: &str = "workloads.json";
 /// reads before any copy an overlay delivers); the gateway validates it.
 /// When the bundle has one, drain routes are checked against it here too.
 pub const ROUTES_FILE: &str = "routes.json";
-/// The declaration files the launcher copies for the gateway.
-pub const DECL_FILES: &[&str] = &[SYSTEM_FILE, WORKLOADS_FILE, ROUTES_FILE];
+/// The declaration files the launcher copies for the gateway. i300 H3b:
+/// node-workloads.json joins them (the gateway places and builds
+/// desired-config entries from it).
+pub const DECL_FILES: &[&str] = &[SYSTEM_FILE, WORKLOADS_FILE, ROUTES_FILE, super::node_workloads::NODE_WORKLOADS_FILE];
 /// The bundle files the checks read: the declarations, `resources.json` and
 /// the overlay. [`materialised`] and `noo addons check` read the same names.
 pub const CHECKED_FILES: &[&str] = &[SYSTEM_FILE, WORKLOADS_FILE, ROUTES_FILE, super::resources::RESOURCES_FILE, "docker-compose.yml"];
@@ -190,7 +192,7 @@ fn container_ok(addon: &str, c: &str) -> bool {
 
 /// `name -> internal?` for each route of a `routes.json`, or `None` when it
 /// is not a readable manifest (the gateway refuses it on its own).
-fn route_kinds(routes_json: &[u8]) -> Option<BTreeMap<String, bool>> {
+pub(super) fn route_kinds(routes_json: &[u8]) -> Option<BTreeMap<String, bool>> {
     let v: Value = serde_json::from_slice(routes_json).ok()?;
     Some(
         v.get("routes")?
@@ -284,6 +286,32 @@ pub fn check_bundle(addon: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<De
         .map(|b| super::resources::parse(addon, b, &facts))
         .transpose()?;
     Ok(Declared { system, workloads, resources })
+}
+
+/// Validate the bundle's `node-workloads.json` (i300), when it ships one:
+/// the workloads a node runs for the add-on, each naming an image of the
+/// signed lock (`lock_images`, name to ref). No file, no workloads; a refusal
+/// carries the parser's stable code (`image_not_in_lock`, `port_invalid`, ...).
+/// It takes the lock's images, so it sits beside [`check_bundle`] rather than
+/// in it: `noo addons check` reads a directory and has no lock.
+///
+/// `service_drain.route` must be an internal route of the bundle's own
+/// `routes.json`, so `files` must carry it when the bundle ships one. The CLI
+/// always has the routes: a bundle without `routes.json` has no internal route
+/// and a `service_drain` is then refused, never waved through.
+pub fn check_node_workloads(
+    addon: &str,
+    files: &BTreeMap<String, Vec<u8>>,
+    lock_images: &BTreeMap<String, String>,
+) -> Result<Vec<super::node_workloads::NodeWorkload>, String> {
+    let Some(bytes) = files.get(super::node_workloads::NODE_WORKLOADS_FILE) else {
+        return Ok(Vec::new());
+    };
+    let routes = super::node_workloads::routes_from_json(
+        files.get(ROUTES_FILE).map(Vec::as_slice).unwrap_or_default(),
+    );
+    super::node_workloads::parse_node_workloads(addon, bytes, lock_images, Some(&routes))
+        .map_err(|e| format!("{} is refused ({e})", super::node_workloads::NODE_WORKLOADS_FILE))
 }
 
 /// The declarations materialised under `<root>/addons/<addon>/` (by
