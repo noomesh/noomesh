@@ -322,15 +322,13 @@ pub async fn create_task(db: &sqlx::PgPool, new: NewTask<'_>) -> Result<Task> {
     let parent_uuid = new.parent.and_then(|p| uuid::Uuid::parse_str(&p.id).ok());
     let channel = new.parent.map(|p| p.channel.as_str()).unwrap_or("task");
     // i538: the perspective the task is submitted under, snapshotted onto
-    // the row: the request's (or the turn's) snapshot, else the parent
-    // task's, so a delegated child is never wider than its parent.
-    let snapshot = match crate::perspective::current() {
-        Some(p) => Some(p),
-        None => match parent_uuid {
-            Some(pid) => crate::perspective::task_snapshot(db, pid).await,
-            None => None,
-        },
+    // the row: the request's (or the turn's) and the parent task's,
+    // intersected, so a delegated child is never wider than its parent.
+    let parent_snapshot = match parent_uuid {
+        Some(pid) => crate::perspective::task_snapshot(db, pid).await,
+        None => None,
     };
+    let snapshot = crate::perspective::combine(crate::perspective::current(), parent_snapshot);
     crate::repo::tasks::insert(
         db,
         &crate::repo::tasks::NewTaskRow {
@@ -1192,6 +1190,18 @@ pub async fn start(state: &std::sync::Arc<AppState>, task: &Task) -> Result<Star
     Ok(Started::here(here, why))
 }
 
+/// The bus principal an in-process task signs as: the owner's account
+/// (live role and scopes), narrowed to the task's perspective snapshot
+/// (i538), so a task submitted from a `user` view acts on the worker side as
+/// a user. `None`: no enabled account.
+pub(crate) async fn task_principal(
+    db: &sqlx::PgPool,
+    owner: &str,
+    snapshot: Option<crate::perspective::RequesterPerspective>,
+) -> Option<crate::bus_principal::Principal> {
+    crate::bus_principal::account_principal(db, owner).await.map(|p| p.narrowed(snapshot))
+}
+
 /// The in-process runner as a boxed, type-erased future. A loop's tool
 /// call (`noo_task_delegate`) starts a runner whose loops make tool calls;
 /// without the erasure the three futures are one opaque type that refers
@@ -1209,17 +1219,18 @@ fn run_in_process(st: std::sync::Arc<AppState>, req: TaskRequest) -> std::pin::P
             // no request principal reaches it, and the no-principal fallback
             // is the read-only floor. A disabled or unresolvable owner (and a
             // task with no owner) runs on that floor, never wider.
-            let principal = if req.user.is_empty() {
-                None
-            } else {
-                crate::bus_principal::account_principal(&st.db, &req.user).await
-            };
-            // i538: the loops run under the task's perspective snapshot, so a
-            // turn they send to a node and the external tools they are shown
-            // are no wider than the view the task was submitted from.
+            // i538: the loops run under the task's perspective snapshot, so
+            // what they sign on the bus, a turn they send to a node and the
+            // external tools they are shown are no wider than the view the
+            // task was submitted from.
             let snapshot = match uuid::Uuid::parse_str(&req.task_id) {
                 Ok(id) => crate::perspective::task_snapshot(&st.db, id).await,
                 Err(_) => None,
+            };
+            let principal = if req.user.is_empty() {
+                None
+            } else {
+                task_principal(&st.db, &req.user, snapshot.clone()).await
             };
             match principal {
                 Some(p) => {

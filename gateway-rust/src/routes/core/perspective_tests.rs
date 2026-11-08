@@ -613,3 +613,18 @@ async fn begin_refuses_a_nested_perspective() {
         .expect_err("the session already carries one");
     assert_eq!(r.status, StatusCode::CONFLICT);
 }
+
+/// The in-process task's bus principal: a task submitted from a `user` view
+/// signs its worker messages as a user, with a user's scopes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_user_perspective_task_signs_its_bus_messages_as_user() {
+    let _serial = DB_LOCK.lock().await;
+    let Some(db) = scratch("va_task_principal").await else { return };
+    let (_raw, started) = user_view(&db, "olive").await;
+    let real = crate::tasks::task_principal(&db, "olive", None).await.expect("an account");
+    assert_eq!(real.role, "operator");
+    let p = crate::tasks::task_principal(&db, "olive", Some(view_of(&started))).await.expect("an account");
+    assert_eq!(p.role, "user", "the task acts on the worker side as the view, not the operator");
+    assert_eq!(p.scopes, vec!["read".to_string()]);
+    assert_eq!(p.perspective, Some(view_of(&started)));
+}

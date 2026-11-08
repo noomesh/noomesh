@@ -102,6 +102,7 @@ async fn handle_chat(
         .prs
         .as_ref()
         .map(|p| crate::perspective::RequesterPerspective { id: p.id.clone(), dims: p.dims.clone() });
+    let principal = principal.narrowed(session_view.clone());
     tracing::info!(user_id = %user_id, "ws_coordinator connected");
 
     let (writer, mut stream, forwarder) = WsWriter::spawn(socket);
