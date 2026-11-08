@@ -219,9 +219,6 @@ func (c *Client) resolveImage(ctx context.Context, ref string) (source, imageID 
 	}
 	// One of our images pinned by the controller: held to the pin, fail
 	// closed (image_pin.go). None of the fallbacks below applies to it.
-	if pin := imagePin(ctx); pin != "" {
-		return c.resolvePinnedImage(ctx, ref, pin)
-	}
 	arch := runtime.GOARCH
 	localID, present := imageLocalID(ctx, c, ref)
 
