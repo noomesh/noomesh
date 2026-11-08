@@ -17,7 +17,7 @@ has a page here with its command reference.
 <!-- BEGIN GENERATED: cli-sections — do not edit; regenerate with scripts/gen-cli-docs.py -->
 | Section | Groups |
 |---|---|
-| [Setup & host](setup-and-host.md) | `whoami`, `onboard`, `enroll`, `offboard`, `upgrade`, `doctor`, `health`, `migrate`, `controller`, `bundle`, `systems`, `addons`, `kiosk`, `backups` |
+| [Setup & host](setup-and-host.md) | `whoami`, `onboard`, `enroll`, `offboard`, `upgrade`, `doctor`, `health`, `migrate`, `controller`, `bundle`, `systems`, `addons`, `kiosk`, `backups`, `node` |
 | [Fleet](fleet.md) | `cluster`, `models`, `tools`, `inference`, `jobs`, `autonomy`, `skills`, `browser` |
 | [Stack & data](stack-and-data.md) | `stack`, `db`, `logs`, `config`, `heartbeat`, `usage`, `plugins` |
 | [Memory & knowledge](memory-and-knowledge.md) | `memory`, `rag`, `recall`, `graph`, `walks`, `ops`, `prompt-skills` |
@@ -40,6 +40,7 @@ has a page here with its command reference.
 - `noo addons` — Which add-ons this install runs — the `addons:` map, without opening the file
 - `noo kiosk` — The unattended display's host seat: cage + Chromium showing /kiosk.html
 - `noo backups` — Where backups go — and whether anyone has decided
+- `noo node` — This node's own say: add-on workload approvals (run on the node, with sudo)
 
 **Fleet** — [fleet.md](fleet.md)
 

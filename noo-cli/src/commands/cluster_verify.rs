@@ -2195,6 +2195,18 @@ pub(crate) fn required_service_keys(addon_on: &dyn Fn(&str) -> bool) -> Vec<(Str
 /// writes. Nothing else makes an upgrade that widens an add-on's ask
 /// visible. A WARN, not a failure: the add-on still works on the words it
 /// has, and the fix is the operator's grant, one `provision` away.
+/// The remedy for a consumer that holds NO active key. An add-on's key is
+/// minted by `noo addons enable` (with the request shown first), which also
+/// mints the rest of what its bundle needs; `provision` is the rotation and
+/// the core keys' path (0.6.18 roll, noomesh-internal i570 2b).
+pub(crate) fn missing_key_fix(name: &str) -> String {
+    if crate::commands::secrets::addon_decl(name).is_some() {
+        format!("noo addons enable {name}")
+    } else {
+        format!("noo security service-key provision {name}")
+    }
+}
+
 pub(crate) fn service_key_grants_check(keys: &Value, required: &[(String, String)]) -> Check {
     let empty = Vec::new();
     let mut short: Vec<(String, Vec<String>)> = Vec::new();
@@ -5335,8 +5347,7 @@ pub(crate) fn controller_checks(
         out.push(ok("service keys", format!("{} consumer(s) hold their own key", required.len())));
     } else {
         let names: Vec<String> = missing.iter().map(|(n, _)| n.clone()).collect();
-        out.push(fail("service keys", format!("no active key for {}", names.join(", ")),
-            format!("noo security service-key provision {}", names[0])));
+        out.push(fail("service keys", format!("no active key for {}", names.join(", ")), missing_key_fix(&names[0])));
     }
 
     out.push(service_key_grants_check(keys, required));
@@ -12450,5 +12461,31 @@ mod addon_access_health_tests {
         // Registered, none: an empty list is a pass.
         let none = serde_json::json!({"addons": {"trellion": "enabled"}, "addons_registered": []});
         assert_eq!(addon_access_check(access_reads_from(&none, |_| panic!("none"))).verdict, Verdict::Ok);
+    }
+}
+
+#[cfg(test)]
+mod missing_key_remedy_tests {
+    use super::*;
+
+    /// i570 2b: an add-on that holds no key at all is pointed at the
+    /// command that mints it, `noo addons enable <addon>`; a core consumer
+    /// keeps `service-key provision`. The row used to name provision for
+    /// both.
+    #[test]
+    fn an_addon_with_no_key_is_pointed_at_enable_and_a_core_key_at_provision() {
+        let keys = serde_json::json!({ "count": 0, "keys": [] });
+        let posture = serde_json::json!({ "count": 0, "posture": [] });
+        let row = |required: Vec<(String, String)>| {
+            controller_checks(&posture, &keys, &required, (0, &serde_json::json!({})), &serde_json::json!({}),
+                &serde_json::json!({}), Some(0), None, None)
+                .into_iter().find(|c| c.name == "service keys").expect("the row")
+        };
+        let evolve = crate::commands::secrets::addon_decl("evolve").expect("evolve declares a key");
+        let k = row(vec![("evolve".into(), evolve.consumer.to_string())]);
+        assert_eq!(k.verdict, Verdict::Fail);
+        assert_eq!(k.remedy.as_deref(), Some("noo addons enable evolve"));
+        let k = row(vec![("worker".into(), "svc:worker".into())]);
+        assert_eq!(k.remedy.as_deref(), Some("noo security service-key provision worker"));
     }
 }

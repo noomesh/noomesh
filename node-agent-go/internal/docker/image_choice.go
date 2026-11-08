@@ -25,8 +25,12 @@ import (
 //
 //   - a floating ref (`:latest`, or no tag at all) is refused, wherever it
 //     came from (placement, controller override, the node's own env). Our own
-//     images (the registry roots and the local build names, which exist in no
-//     registry and cannot carry a digest) are exempt: they are rail-only.
+//     images (the registry roots and the local build names) are exempt: they
+//     are rail-only. When the controller forwards one pinned from the signed
+//     lock (`repo:tag@sha256:<index>`), the digest is cut off the ref (the
+//     rail's tar is keyed by the tag ref) and kept as the choice's Pin: the
+//     start is refused unless the rail staged that tar by exactly this digest
+//     and the image loaded is the one staged (resolvePinnedImage).
 //   - every image comes from the rail (the only image source). A third-party
 //     ref with a digest has the digest stripped before the container is made
 //     and the registry is forbidden: the rail's tar is keyed by the tag ref,
@@ -64,8 +68,11 @@ func isFloatingRef(ref string) bool {
 
 // backendImageChoice is the ref to use and how it may be fetched.
 type backendImageChoice struct {
-	Ref      string // the image to ensure and run
+	Ref      string // the image to ensure and run (no digest for our own images)
 	RailOnly bool   // never from a registry (a rail node)
+	// Pin is the digest the controller pinned for one of OUR images
+	// (`sha256:…`, from the signed stack lock), "" when none.
+	Pin string
 }
 
 // pickBackendImage is the pure part of the choice: CPU/GPU image, then the
@@ -94,7 +101,11 @@ func chooseBackendImage(backend string, spec BackendSpec, override string) (back
 		}
 	}
 	if ref == "" || isOwnImage(ref) {
-		return backendImageChoice{Ref: ref, RailOnly: ref != ""}, nil
+		// Until this cut an own ref kept its digest, so the node asked the
+		// rail for a tar named after it, which never exists, and refused a
+		// staged image (aserve, robopi: ollama, 0.6.17 and 0.6.18).
+		tagRef, digest := splitDigest(ref)
+		return backendImageChoice{Ref: tagRef, Pin: digest, RailOnly: ref != ""}, nil
 	}
 	if isFloatingRef(ref) {
 		return backendImageChoice{}, fmt.Errorf(

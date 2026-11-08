@@ -813,6 +813,7 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 	// The image: local if the controller vouches for it, else over the
 	// artifact rail; never a registry pull for our own images (image_source.go).
 	ctx = withRailOnly(ctx, choice.RailOnly)
+	ctx = withImagePin(ctx, choice.Pin)
 	img := spec.Image
 	if err := ensureImageFn(ctx, c, img); err != nil {
 		return fmt.Errorf("backend %s image: %w", backend, err)

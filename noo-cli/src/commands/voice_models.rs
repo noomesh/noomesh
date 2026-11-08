@@ -346,8 +346,10 @@ pub(crate) fn stage(root: &Path, m: &VoiceModel, progress: bool) -> Result<Stage
         }
         let (bytes, have) = if w.lfs_sha256.is_some() {
             let a = FetchArgs { repo: repo.clone(), file: w.path.clone(), revision: REVISION.into(), force: true };
-            let o = models_fetch::fetch_to_store(&base, token.as_deref(), &a, &dir, &mut |_: u64, _: Option<u64>| {})
-                .map_err(|e: FetchErr| format!("{repo}/{}: {e}", w.path))?;
+            let mut line = models_fetch::DownloadLine::new(&w.path, !progress);
+            let fetched = models_fetch::fetch_to_store(&base, token.as_deref(), &a, &dir, &mut |e| line.event(e));
+            line.finish();
+            let o = fetched.map_err(|e: FetchErr| format!("{repo}/{}: {e}", w.path))?;
             (o.size, o.already_present)
         } else {
             fetch_blob(&base, token.as_deref(), &repo, w, &dir)?

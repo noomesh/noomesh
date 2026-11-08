@@ -237,7 +237,7 @@ def test_the_classifier_narrows_and_fails_open() -> None:
     docs = _classify(["docs/a.md", "internal/b.md"])
     assert docs == {"code": "false", "gateway": "false", "cli": "false",
                     "sqlx": "false", "ui": "false", "llamacpp": "false",
-                    "ollama": "false", "deferred": "false"}
+                    "ollama": "false", "deferred": "false", "defer_tests": "false"}
 
     cli = _classify(["noo-cli/src/main.rs"])
     assert cli["cli"] == "true" and cli["gateway"] == "false" and cli["sqlx"] == "false"
@@ -337,6 +337,81 @@ def test_standalone_smoke_builds_only_when_not_deferred() -> None:
     assert gated, "no code-gated step in standalone-smoke — this guard parsed the wrong block"
     for rest in gated:
         assert "needs.scope.outputs.deferred != 'true'" in rest, rest
+
+
+# ---------------------------------------------------------------------------
+# i585: the merge queue is the only REQUIRED test gate on dev. On a same-repo
+# PR into dev the required `test-core` is skipped (satisfied) and the same
+# suite runs as the non-required `test-core (advisory)`; everywhere else the
+# required one runs.
+# ---------------------------------------------------------------------------
+
+THIS_REPO = "noomesh/noomesh"
+SAME_REPO_DEV_PR = dict(EVENT="pull_request", PR_BASE_REF="dev", FULL_CI="false",
+                        PR_HEAD_REPO=THIS_REPO, REPO=THIS_REPO)
+ANY_CODE = ["src/noomesh/x.py"]
+
+
+def test_a_same_repo_pr_into_dev_defers_the_required_python_suite() -> None:
+    assert _classify(ANY_CODE, **SAME_REPO_DEV_PR)["defer_tests"] == "true"
+
+
+def test_a_fork_pr_keeps_the_required_python_suite() -> None:
+    """An outside contribution keeps its PR gate."""
+    for head in ("someone/noomesh", ""):
+        got = _classify(ANY_CODE, **{**SAME_REPO_DEV_PR, "PR_HEAD_REPO": head})
+        assert got["defer_tests"] == "false", (head, got)
+
+
+def test_a_promotion_pr_keeps_the_required_python_suite() -> None:
+    """staging and main take promotion PRs that merge without a queue."""
+    for base in ("staging", "main"):
+        got = _classify(ANY_CODE, **{**SAME_REPO_DEV_PR, "PR_BASE_REF": base})
+        assert got["defer_tests"] == "false", (base, got)
+
+
+def test_the_full_ci_label_keeps_the_required_python_suite() -> None:
+    got = _classify(ANY_CODE, **{**SAME_REPO_DEV_PR, "FULL_CI": "true"})
+    assert got["defer_tests"] == "false", got
+
+
+def test_the_required_test_core_runs_on_the_merge_group_and_on_push() -> None:
+    """The queue is the gate: `test-core`, under that exact name, runs there.
+
+    The context stays `test-core` (the job has no `name:`), it is skipped only
+    when scope positively defers it (a failed scope runs it), and nothing
+    defers it on a merge group or a push.
+    """
+    for env in (dict(EVENT="merge_group", PR_BASE_REF="", PR_HEAD_REPO="", REPO=THIS_REPO),
+                dict(EVENT="push", PR_BASE_REF="", PR_HEAD_REPO="", REPO=THIS_REPO)):
+        assert _classify(ANY_CODE, **env)["defer_tests"] == "false", env
+    job = _workflow()["jobs"]["test-core"]
+    assert "name" not in job, "a `name:` would rename the required context `test-core`"
+    cond = " ".join(str(job["if"]).split())
+    assert "!(needs.scope.result == 'success' && needs.scope.outputs.defer_tests == 'true')" in cond, cond
+    assert "scope" in job["needs"], job["needs"]
+
+
+def test_the_advisory_suite_is_the_required_one_under_another_name() -> None:
+    """One definition: the advisory job is test-core by alias, never a copy."""
+    jobs = _workflow()["jobs"]
+    req, adv = jobs["test-core"], jobs["test-core-advisory"]
+    assert adv["name"] == "test-core (advisory)"
+    for key in ("runs-on", "permissions", "services", "steps"):
+        assert adv[key] == req[key], f"test-core-advisory's {key} differs from test-core's"
+    assert set(adv) == set(req) | {"name"}, f"keys differ: {sorted(set(adv) ^ set(req))}"
+    assert any("pytest" in str(s.get("run", "")) for s in adv["steps"]), "the advisory job runs no pytest"
+    cond = " ".join(str(adv["if"]).split())
+    assert "needs.scope.result == 'success' && needs.scope.outputs.defer_tests == 'true'" in cond, cond
+    text = CI.read_text()
+    assert "steps: *test_core_steps" in text and "steps: &test_core_steps" in text, "the steps are not shared by alias"
+
+
+def test_build_still_runs_on_a_pr_that_defers_test_core() -> None:
+    """`build` needs test-core; a deliberately skipped one must not stop it."""
+    cond = " ".join(str(_workflow()["jobs"]["build"]["if"]).split())
+    assert "needs.test-core.result == 'success'" in cond, cond
+    assert "(needs.test-core.result == 'skipped' && needs.scope.outputs.defer_tests == 'true')" in cond, cond
 
 
 # ---------------------------------------------------------------------------

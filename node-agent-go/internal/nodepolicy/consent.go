@@ -25,25 +25,27 @@ import (
 type Mode string
 
 const (
-	// ModeNone refuses every entry. It is the default: a node whose owner
-	// has said nothing runs nothing an add-on declared.
+	// ModeNone refuses every entry, approved or not: the owner's kill
+	// switch (NOO_ADDON_WORKLOADS=none).
 	ModeNone Mode = "none"
 	// ModeApprove runs an entry only when its (add-on, image digest) is
-	// approved on this node.
+	// approved on this node. It is the default (i573): a node whose owner
+	// has approved nothing runs nothing an add-on declared.
 	ModeApprove Mode = "approve"
 	// ModeAuto runs every entry the controller places and the other checks
 	// admit.
 	ModeAuto Mode = "auto"
 )
 
-// ParseMode reads the setting. ok is false for a value that is not one of the
-// three; the caller treats that as ModeNone (fail closed) and says so.
+// ParseMode reads the setting; unset is ModeApprove. ok is false for a value
+// that is not one of the three; the caller treats that as ModeNone (fail
+// closed) and says so.
 func ParseMode(s string) (Mode, bool) {
 	switch m := Mode(strings.ToLower(strings.TrimSpace(s))); m {
 	case ModeNone, ModeApprove, ModeAuto:
 		return m, true
 	case "":
-		return ModeNone, true
+		return ModeApprove, true
 	}
 	return ModeNone, false
 }
@@ -145,58 +147,14 @@ func (a *Approvals) Has(addon, digest string) (bool, error) {
 	return false, nil
 }
 
-// Add records an approval: atomic (temp file in the same directory, then
-// rename) and 0600. Adding what is there is a no-op. Revoking and the
-// operator verb that calls these are not part of F5b.
-func (a *Approvals) Add(addon, digest string) error {
-	x := Approval{Addon: addon, Digest: digest}
-	if err := checkApproval(x); err != nil {
-		return err
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	list, err := a.read()
-	if err != nil {
-		return err
-	}
-	for _, y := range list {
-		if y == x {
-			return nil
-		}
-	}
-	list = append(list, x)
-	sortApprovals(list)
-	b, err := json.Marshal(approvalsDoc{Version: 1, Approvals: list})
-	if err != nil {
-		return err
-	}
-	dir := filepath.Dir(a.path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ApprovalsFile+".*.tmp")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	defer os.Remove(name) // a no-op once renamed
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(name, a.path)
-}
+// The agent only READS the approvals (i573). The one writer is the node
+// owner's `sudo noo node workloads approve|revoke` (noo-cli
+// src/commands/node_workloads.rs). The agent is what the controller drives,
+// so a writer here would let the controller grant consent to itself, and
+// the default policy (approve, with nothing approved) would no longer be
+// closed. tests/test_node_workload_consent_has_one_writer.py fails if a
+// write appears here or the store is named anywhere else. The tests' own
+// writer is approvals_write_test.go.
 
 func sortApprovals(l []Approval) {
 	sort.Slice(l, func(i, j int) bool {

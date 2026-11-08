@@ -990,6 +990,9 @@ func (r *Reporter) redetectCaps(probeErr error) {
 	if err != nil {
 		return
 	}
+	// The boot probe failed: this is the first complete one, so it is what
+	// the next restart registers if its probe is slow too.
+	_ = hardware.SaveLastGPU(r.cfg.StateDir, caps)
 	old := *r.caps
 	old.ProbeIncomplete = false
 	if reflect.DeepEqual(old, caps) {

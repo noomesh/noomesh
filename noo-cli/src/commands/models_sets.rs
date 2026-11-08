@@ -675,6 +675,9 @@ pub(crate) struct Env<'a> {
     pub by: &'a str,
     pub now: &'a str,
     pub recorded: Option<(String, String)>,
+    /// Show each download's live line (`DownloadLine`); false under `--json`
+    /// and in tests.
+    pub show_progress: bool,
 }
 
 #[derive(Debug)]
@@ -742,9 +745,12 @@ fn fetch_lfs(env: &Env, req: &StageArgs, s: &Sibling, dir: &Path) -> Result<File
         revision: req.sha.clone(),
         force: false,
     };
-    let mut quiet = |_: u64, _: Option<u64>| {};
-    let out = models_fetch::fetch_to_store(env.base, env.token, &a, dir, &mut quiet)
-        .map_err(|e| map_fetch(&req.repo, env.token.is_some(), e))?;
+    // The operator watched `→ model.safetensors (15.59 GB)` and then nothing
+    // for the whole download (i570): the live line says how far it is.
+    let mut line = models_fetch::DownloadLine::new(&s.path, !env.show_progress);
+    let fetched = models_fetch::fetch_to_store(env.base, env.token, &a, dir, &mut |e| line.event(e));
+    line.finish();
+    let out = fetched.map_err(|e| map_fetch(&req.repo, env.token.is_some(), e))?;
     if out.sha256 != want {
         return Err(StageError::Fetch(format!(
             "{}/{}: the listing says sha256 {want} but the file's own LFS metadata says {}",
@@ -1226,6 +1232,52 @@ fn row_json(r: &Row) -> Value {
     })
 }
 
+/// The `models list --kind` table, for a terminal. A table cuts its rows
+/// at the terminal width, so what matters goes first and is short: the
+/// operator's paste lost SIZE, SIGNATURE and PROBLEM to a full
+/// `rbwolf 2026-11-08T1…` acceptance timestamp (0.6.18, i570). KIND is
+/// left out (`--kind` named it, and the header says it); the licence cell is
+/// who and the date; and every problem is ALSO printed in full below the
+/// table, so a cut row can never hide one. `--json` keeps every field whole.
+fn set_table(rows: &[Row]) -> ([ui::Col; 7], Vec<Vec<String>>, Vec<String>) {
+    let cols = [
+        ui::Col::left("id"),
+        ui::Col::left("revision"),
+        ui::Col::right("size"),
+        ui::Col::left("signature"),
+        ui::Col::left("licence"),
+        ui::Col::left("digests"),
+        ui::Col::left("problem"),
+    ];
+    let cells = rows
+        .iter()
+        .map(|r| {
+            vec![
+                r.id.clone(),
+                r.revision.get(..12).unwrap_or(&r.revision).to_string(),
+                models_fetch::human(r.bytes),
+                r.signature.to_string(),
+                short_license(&r.license),
+                r.digests.clone(),
+                r.problem.clone().unwrap_or_default(),
+            ]
+        })
+        .collect();
+    let problems = rows
+        .iter()
+        .filter_map(|r| r.problem.as_ref().map(|p| format!("{}@{}: {p}", r.id, r.revision.get(..12).unwrap_or(&r.revision))))
+        .collect();
+    (cols, cells, problems)
+}
+
+/// `rbwolf 2026-11-08T10:00:00Z` -> `rbwolf 2026-11-08`; anything else as is.
+fn short_license(cell: &str) -> String {
+    match cell.rsplit_once(' ') {
+        Some((by, at)) if model_set::rfc3339(at) => format!("{by} {}", &at[..10]),
+        _ => cell.to_string(),
+    }
+}
+
 /// `noo models list --kind voice|voice-pack`.
 pub(crate) fn list_sets(g: &Globals, kind: &str) -> Result<i32, Unhandled> {
     if kind != "voice" && kind != "voice-pack" {
@@ -1245,32 +1297,11 @@ pub(crate) fn list_sets(g: &Globals, kind: &str) -> Result<i32, Unhandled> {
         println!("{}", ui::muted("no signed model sets of this kind are staged"));
         return Ok(0);
     }
-    let cols = [
-        ui::Col::left("id"),
-        ui::Col::left("revision"),
-        ui::Col::left("kind"),
-        ui::Col::left("digests"),
-        ui::Col::left("licence accepted"),
-        ui::Col::right("size"),
-        ui::Col::left("signature"),
-        ui::Col::left("problem"),
-    ];
-    let cells: Vec<Vec<String>> = rows
-        .iter()
-        .map(|r| {
-            vec![
-                r.id.clone(),
-                r.revision.get(..12).unwrap_or(&r.revision).to_string(),
-                r.kind.clone(),
-                r.digests.clone(),
-                r.license.clone(),
-                models_fetch::human(r.bytes),
-                r.signature.to_string(),
-                r.problem.clone().unwrap_or_default(),
-            ]
-        })
-        .collect();
+    let (cols, cells, problems) = set_table(&rows);
     print!("{}", ui::table(&cols, &cells));
+    for p in &problems {
+        ui::warned(p);
+    }
     for r in rows.iter().filter(|r| r.signature == "bad") {
         let (id, rev) = (&r.id, &r.revision);
         ui::warned(&format!("{id}@{rev}: the signature does NOT verify; do not place it"));
@@ -1347,6 +1378,7 @@ pub fn models_stage(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         by: &by,
         now: &now,
         recorded: read_acceptance(&dir, &req.id),
+        show_progress: !g.json,
     };
     if !g.json {
         println!("{}", ui::header("models stage", Some(&format!("hf:{}@{}", req.repo, req.sha))));
@@ -1758,6 +1790,7 @@ mod tests {
             by: "alice",
             now: "2026-11-05T10:00:00Z",
             recorded,
+            show_progress: false,
         };
         let mut lines = Vec::new();
         let mut say = |l: &str| lines.push(l.to_string());
@@ -2036,6 +2069,7 @@ mod tests {
             by: "alice",
             now: "2026-11-05T10:00:00Z",
             recorded: None,
+            show_progress: false,
         };
         let sign = |data: &Path, out: &Path| sign_file(&key, data, out);
         let req = request("voice");
@@ -2403,6 +2437,7 @@ mod tests {
             by: "alice",
             now: "2026-11-05T10:00:00Z",
             recorded: None,
+            show_progress: false,
         }
     }
 
@@ -3067,5 +3102,36 @@ mod tests {
         for d in [&store, &outside, &store2] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    /// i570 (list): the columns that matter come first and short, so a
+    /// terminal-width cut takes DIGESTS or the problem's tail, never SIZE or
+    /// SIGNATURE; the acceptance is who and the date; KIND is not repeated;
+    /// and every problem is printed whole below the table.
+    #[test]
+    fn the_set_table_keeps_size_and_signature_and_prints_every_problem_whole() {
+        let row = |id: &str, license: &str, problem: Option<&str>| Row {
+            id: id.into(),
+            revision: "0123456789abcdef0123456789abcdef01234567".into(),
+            kind: "voice".into(),
+            digests: "authenticated".into(),
+            license: license.into(),
+            bytes: 15 << 30,
+            signature: "ok",
+            problem: problem.map(Into::into),
+        };
+        let rows = [
+            row("personal-7b", "rbwolf 2026-11-08T10:11:12Z", None),
+            row("personal-voices", "NOT ACCEPTED", Some("the licence needs the operator's acceptance: noo models accept personal-voices")),
+        ];
+        let (cols, cells, problems) = set_table(&rows);
+        let names: Vec<&str> = cols.iter().map(|c| c.name).collect();
+        assert_eq!(names, ["id", "revision", "size", "signature", "licence", "digests", "problem"]);
+        assert_eq!(cells[0][4], "rbwolf 2026-11-08");
+        assert_eq!(cells[1][4], "NOT ACCEPTED");
+        assert_eq!(cells[0][2], "15.00 GB");
+        assert_eq!(cells[0][3], "ok");
+        assert!(!cells.iter().flatten().any(|c| c == "voice"), "KIND is the header's, not a column");
+        assert_eq!(problems, ["personal-voices@0123456789ab: the licence needs the operator's acceptance: noo models accept personal-voices"]);
     }
 }

@@ -130,6 +130,35 @@ EOF2
     return 0
 }
 
+# restart_missing <compose args> -- <service>...
+# Prints the named services that have NO container at all (never created, or
+# removed). `compose restart` silently does nothing for those, and the
+# after-boot alert's own remedy is `noo stack restart <addon>`: they need
+# `up -d` (rc.1 rehearsal 2026-11-08, noomesh-internal i580).
+restart_missing() {
+    local _cargs=() _s
+    while [ $# -gt 0 ] && [ "$1" != "--" ]; do _cargs+=("$1"); shift; done
+    shift
+    for _s in "$@"; do
+        [ -n "$(docker compose "${_cargs[@]}" ps -aq "$_s" 2>/dev/null | head -1)" ] || printf '%s\n' "$_s"
+    done
+    return 0
+}
+
+# restart_not_running <compose args> -- <service>...
+# Prints the named services with no RUNNING container. Called after the
+# restart: "Services restarted" is only true when every one named is up. A
+# compose that cannot answer counts as not running (not confirmed).
+restart_not_running() {
+    local _cargs=() _s
+    while [ $# -gt 0 ] && [ "$1" != "--" ]; do _cargs+=("$1"); shift; done
+    shift
+    for _s in "$@"; do
+        [ -n "$(docker compose "${_cargs[@]}" ps -q --status running "$_s" 2>/dev/null | head -1)" ] || printf '%s\n' "$_s"
+    done
+    return 0
+}
+
 # restart_image_drift <compose args> -- <service>...
 # Prints the services whose RUNNING container is not on the image compose now
 # resolves for them (an add-on pin moved by `noo addons upgrade`; a restart

@@ -110,6 +110,9 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["health"], commands::health),
     (&["whoami"], role::whoami),
     (&["node", "fetch"], commands::node_fetch),
+    (&["node", "workloads", "approve"], commands::node_workloads_approve),
+    (&["node", "workloads", "revoke"], commands::node_workloads_revoke),
+    (&["node", "workloads", "list"], commands::node_workloads_list),
     (&["cluster", "status"], commands::cluster_status),
     (&["jobs", "list"], commands::jobs_list),
     (&["inference", "run"], commands::inference_run),
@@ -300,6 +303,11 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["cluster", "reserve"], commands::cluster_reserve),
     (&["cluster", "reservations"], commands::cluster_reservations),
     (&["cluster", "release"], commands::cluster_release),
+    // The longer `workloads` verbs come BEFORE the bare list: dispatch is
+    // first-match by prefix, so `workloads place ...` must not reach it.
+    (&["cluster", "workloads", "place"], commands::cluster_workloads_place),
+    (&["cluster", "workloads", "show"], commands::cluster_workloads_show),
+    (&["cluster", "workloads", "unplace"], commands::cluster_workloads_unplace),
     (&["cluster", "workloads"], commands::cluster_workloads),
     // A node's harness profile: resolved per field (override > measured >
     // tier default), its overrides, and its chat-model bench.
@@ -1025,7 +1033,7 @@ fn print_completions(shell: &str) -> i32 {
 /// the binary the user is holding.
 /// Sections are editorial; a test pins every registry group to exactly one.
 const GROUP_SECTIONS: &[(&str, &[&str])] = &[
-    ("Setup & host", &["whoami", "onboard", "enroll", "offboard", "upgrade", "doctor", "health", "migrate", "controller", "bundle", "systems", "addons", "kiosk", "backups"]),
+    ("Setup & host", &["whoami", "onboard", "enroll", "offboard", "upgrade", "doctor", "health", "migrate", "controller", "bundle", "systems", "addons", "kiosk", "backups", "node"]),
     ("Fleet", &["cluster", "models", "tools", "inference", "jobs", "autonomy", "skills", "browser"]),
     ("Stack & data", &["stack", "db", "logs", "config", "heartbeat", "usage", "plugins"]),
     ("Memory & knowledge", &["memory", "rag", "recall", "graph", "walks", "ops", "prompt-skills"]),
@@ -1207,7 +1215,7 @@ const GROUP_DESC: &[(&str, &str)] = &[
     ("db", "Schema migrations: mesh via the gateway's native runner, memory via alembic in trellion"),
     ("doctor", "Host-plane health checks with guided recovery"),
     ("whoami", "What this box is: controller, node, both, or client-only"),
-    ("node", "This node's pull-rail poller (macOS: run by the net.noomesh.fetch LaunchDaemon)"),
+    ("node", "This node's own say: add-on workload approvals (run on the node, with sudo)"),
     ("enroll", "Join this machine to a noomesh fleet as a worker"),
     ("logs", "Log aggregation"),
     ("plugins", "Plugin management"),
