@@ -611,8 +611,13 @@ pub(crate) fn gpu_contention_check_at(n: &Value, now_unix: i64) -> Option<Check>
             format!("yielded: {paused_phrase} (nvidia-smi not answering for {} — a Windows program is likely using the GPU) — resumes when nvidia-smi answers and the GPU is clear",
                 compact_secs(gc["unmeasured_for_s"].as_i64().unwrap_or(0))),
             None),
+        // The figures are the reading now, with our backends stopped; the
+        // reason is why it yielded (awolf, 2026-11-07, read "foreign 0.0 GB"
+        // for a yield on a probe timeout).
         "yielded" => warn("gpu",
-            format!("yielded: {paused_phrase} (foreign {:.1} GB, {method}{off}) — resumes when the GPU frees", gb("foreign_mb")),
+            format!("yielded: {paused_phrase} ({}foreign {:.1} GB, {method}{off}) — resumes when the GPU frees",
+                super::cluster_gpu::yield_reason(gc).map(|r| format!("{r}; now ")).unwrap_or_default(),
+                gb("foreign_mb")),
             None),
         "held" => {
             // The lease's ids make the remedy an exact release; without a
@@ -11889,6 +11894,24 @@ mod gpu_contention_tests {
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.starts_with("yielded: vllm paused (nvidia-smi not answering for"), "{}", c.detail);
         assert!(!c.detail.contains("foreign"), "{}", c.detail);
+    }
+
+    /// awolf, 2026-11-07: a yield on a probe timeout, read back once the
+    /// probe answered again, said only "foreign 0.0 GB, nvidia-smi". The row
+    /// names the agent's reason first, then the reading now.
+    #[test]
+    fn yielded_names_why_it_yielded_before_the_reading_now() {
+        let c = gpu_contention_check(&node(serde_json::json!({
+            "state": "yielded", "foreign_mb": 0, "method": "nvidia-smi", "paused_backends": ["vllm"],
+            "reason": "GPU probe (nvidia-smi) not answering: a program outside noomesh is likely using the GPU"}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with(
+            "yielded: vllm paused (GPU probe (nvidia-smi) not answering: a program outside noomesh is likely using the GPU; now foreign 0.0 GB, nvidia-smi)"),
+            "{}", c.detail);
+        // No reason (an older agent): the row is as before.
+        let old = gpu_contention_check(&node(serde_json::json!({
+            "state": "yielded", "foreign_mb": 0, "method": "nvidia-smi", "paused_backends": ["vllm"]}))).unwrap();
+        assert!(old.detail.starts_with("yielded: vllm paused (foreign 0.0 GB, nvidia-smi)"), "{}", old.detail);
     }
 
     #[test]
