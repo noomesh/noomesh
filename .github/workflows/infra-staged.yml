@@ -1,0 +1,205 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+#
+# Daily build of the infra images, OUTSIDE the release (noomesh-internal i567).
+#
+# llamacpp (llama-server compiled from source, arm64 under QEMU: ~60 min),
+# ollama, stunnel, postgres-pgvector, whisper, piper and nvidia-exporter carry
+# no noomesh source and change a few times a quarter, yet every new version's
+# rc.1 rebuilt them. Here they are built once a day from dev, which also picks
+# up the day's apt/apk/pip security updates, then:
+#
+#   1. pushed ONLY to an immutable `:staged-YYYYMMDD-<run>` tag, labelled with
+#      the content fingerprint (scripts/infra-staged.py) and the build time;
+#   2. scanned with Trivy (the version ci.yml's security-scan pins), fixable
+#      HIGH/CRITICAL, every platform; the current `:staged` is scanned with the
+#      SAME database in the same run;
+#   3. promoted to `:staged` only when the new build has no fixable
+#      HIGH/CRITICAL finding that the current :staged lacks. Gating on "new",
+#      not on zero: the Dockerfiles do not `apt-get upgrade`, so a fixable
+#      finding in a digest-pinned base layer stays until
+#      refresh-image-digests.yml moves the pin; a zero gate would freeze
+#      :staged for good.
+#
+# A failed build or scan, or a new finding, leaves the previous :staged where
+# it is and turns the run red. The release refuses a :staged older than 3 days
+# and builds the image itself (loudly), so a broken daily job costs release
+# minutes, never a stale or unscanned image.
+#
+# The build arguments come from the images-release.yml matrix
+# (`infra-staged.py matrix`), so the staged image is built exactly as the
+# release would build it; the buildx command below must stay the release's
+# (tests/test_infra_staged.py compares them).
+#
+# Like every scheduled workflow, the schedule runs from the DEFAULT branch, so
+# it starts once this file reaches main; until then run it by hand:
+#   gh workflow run infra-staged.yml -R noomesh/noomesh --ref dev
+name: infra images staged daily
+on:
+  schedule:
+    - cron: '17 3 * * *'   # daily, 03:17 UTC
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write   # push $REGISTRY/$OWNER/<image>:staged*
+concurrency:
+  group: infra-staged   # one run moves :staged at a time
+  cancel-in-progress: false
+env:
+  REGISTRY: ghcr.io
+  OWNER: noomesh
+  DHI_OWNER: noomesh/dhi
+jobs:
+  matrix:
+    if: github.repository == 'noomesh/noomesh'
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.m.outputs.include }}
+    steps:
+      - name: Checkout dev   # actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: dev
+      - name: The daily set, with the release's build arguments
+        id: m
+        run: |
+          set -eu
+          python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --user pyyaml
+          echo "include=$(python3 scripts/infra-staged.py matrix)" >> "$GITHUB_OUTPUT"
+
+  stage:
+    name: ${{ matrix.image }} (build, scan, stage)
+    needs: [matrix]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix.outputs.include) }}
+    steps:
+      - name: Checkout dev   # actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: dev
+
+      - name: Fingerprint and tags
+        run: |
+          set -eu
+          python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --user pyyaml
+          fp="$(python3 scripts/infra-staged.py fingerprint "${{ matrix.image }}")" || {
+            echo "::error::${{ matrix.image }} has no content fingerprint (see above); not staging it — the release builds it"; exit 1; }
+          echo "FP=$fp" >> "$GITHUB_ENV"
+          echo "CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          echo "DATE_TAG=staged-$(date -u +%Y%m%d)-${{ github.run_id }}" >> "$GITHUB_ENV"
+          echo "REF=$REGISTRY/$OWNER/${{ matrix.image }}" >> "$GITHUB_ENV"
+          echo "${{ matrix.image }} fingerprint $fp"
+
+      - name: Free disk (preinstalled toolchains the build does not use)
+        run: scripts/ci-free-disk.sh
+      - name: Pre-pull the BuildKit image (transient registry errors retried)
+        run: scripts/retry-registry.sh docker pull moby/buildkit:buildx-stable-1 || echo "::warning::could not pre-pull moby/buildkit:buildx-stable-1; setup-buildx pulls it itself"
+      - name: Set up buildx   # docker/setup-buildx-action@v4.4.1
+        id: buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - name: Set up buildx, second attempt   # docker/setup-buildx-action@v4.4.1
+        if: steps.buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - name: Set up QEMU (arm64)   # docker/setup-qemu-action@v4.4.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1
+        with:
+          platforms: arm64
+
+      - name: Registry logins (GHCR + dhi.io + docker.io)
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+        run: |
+          set -eu
+          echo "$GHCR_TOKEN" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+          echo "$DHI_TOKEN" | docker login dhi.io -u "$DHI_USERNAME" --password-stdin
+          echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin \
+            || echo "::warning::docker.io login failed — a Hub fallback pulls anonymously"
+
+      - name: Docker Hub bases from the mirror (Hub on a miss)
+        env:
+          HUB_MIRROR: ${{ vars.HUB_MIRROR }}
+          HUB_MIRROR_OFF: ${{ vars.HUB_MIRROR_OFF }}
+        run: echo "HUB_PREFIX=$(python3 "$GITHUB_WORKSPACE/scripts/hub-mirror.py" dockerfile "$GITHUB_WORKSPACE/${{ matrix.dockerfile }}")" >> "$GITHUB_ENV"
+
+      # The release's buildx command (images-release.yml "Build + push"), with
+      # the two labels added and ONLY the immutable date tag pushed. No layer
+      # cache: a daily build exists to take today's packages.
+      - name: Build + push ${{ matrix.image }}:${{ env.DATE_TAG }}
+        run: |
+          set -eux
+          scripts/retry-registry.sh docker buildx build --push \
+            --platform "${{ matrix.platforms }}" \
+            -f "${{ matrix.dockerfile }}" \
+            --build-arg DHI_REGISTRY="$REGISTRY/$DHI_OWNER" \
+            --build-arg HUB_MIRROR="$HUB_PREFIX" \
+            --label "org.noomesh.build-fingerprint=$FP" \
+            --label "org.opencontainers.image.created=$CREATED" \
+            -t "$REF:$DATE_TAG" \
+            ${{ matrix.extra_args }} \
+            "${{ matrix.context }}"
+          d="$(docker buildx imagetools inspect "$REF:$DATE_TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          [ -n "$d" ] || { echo "::error::$REF:$DATE_TAG does not resolve after the push"; exit 1; }
+          echo "DIGEST=$d" >> "$GITHUB_ENV"
+
+      # Same pinned, checksum-verified install as ci.yml's security-scan.
+      - name: Install Trivy (pinned, checksum-verified)
+        env:
+          TRIVY_VERSION: "0.70.0"
+          TRIVY_SHA256: "8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9"
+        run: |
+          dir="$RUNNER_TEMP/trivy-bin"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 -o "$dir/trivy.tgz" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  $dir/trivy.tgz" | sha256sum -c -
+          tar -xzf "$dir/trivy.tgz" -C "$dir" trivy
+          rm -f "$dir/trivy.tgz"
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/trivy" --version
+
+      # Every platform of the new build, and of the current :staged, against
+      # ONE vulnerability database (downloaded once, then --skip-db-update).
+      - name: Scan the new build and the current :staged
+        run: |
+          set -eu
+          mkdir -p scan/new scan/old
+          trivy image --download-db-only
+          old="$(docker buildx imagetools inspect "$REF:staged" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"' || true)"
+          echo "OLD_DIGEST=$old" >> "$GITHUB_ENV"
+          for p in $(echo "${{ matrix.platforms }}" | tr ',' ' '); do
+            n="$(echo "$p" | tr '/' '-')"
+            trivy image --skip-db-update --image-src remote --platform "$p" \
+              --severity HIGH,CRITICAL --ignore-unfixed --format json \
+              -o "scan/new/$n.json" "$REF@$DIGEST"
+            if [ -n "$old" ]; then
+              trivy image --skip-db-update --image-src remote --platform "$p" \
+                --severity HIGH,CRITICAL --ignore-unfixed --format json \
+                -o "scan/old/$n.json" "$REF@$old"
+            fi
+          done
+
+      - name: Gate — no fixable HIGH/CRITICAL the current :staged lacks
+        run: |
+          # pipefail: without it `| tee` would turn the gate's exit 1 into 0.
+          set -euo pipefail
+          if [ -n "$OLD_DIGEST" ]; then
+            python3 scripts/infra-staged.py new-findings --new scan/new/*.json --old scan/old/*.json | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            python3 scripts/infra-staged.py new-findings --new scan/new/*.json | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Promote to :staged
+        run: |
+          set -eu
+          scripts/retry-registry.sh docker buildx imagetools create --tag "$REF:staged" "$REF@$DIGEST"
+          now="$(docker buildx imagetools inspect "$REF:staged" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          if [ "$now" != "$DIGEST" ]; then
+            echo "::error::$REF:staged is $now after promoting $DIGEST"; exit 1
+          fi
+          echo "| ${{ matrix.image }} | \`$DATE_TAG\` | \`$DIGEST\` | \`$FP\` | replaces \`${OLD_DIGEST:-none}\` |" >> "$GITHUB_STEP_SUMMARY"

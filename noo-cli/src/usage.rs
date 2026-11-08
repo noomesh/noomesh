@@ -13,6 +13,9 @@
 
 pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["whoami"], "", "Report what this box is: controller, node, both, or client-only"),
+    (&["node", "workloads", "approve"], "<addon> <digest>", "On this node, as root: consent to run an add-on's node workload at one image digest"),
+    (&["node", "workloads", "revoke"], "<addon> <digest>", "On this node, as root: withdraw one add-on digest's approval"),
+    (&["node", "workloads", "list"], "", "On this node, as root: show the add-on node workloads approved here, and the policy"),
         (&["cluster", "status"], "", "List nodes: tier, status, RUNNING backends, CAPABILITIES by role, CAN-RUN"),
         (&["cluster", "verify"], "[<node>...] [--controller] [--wait]", "Assert every invariant a node and the controller must meet; exit 1 with the remedy"),
         (&["cluster", "invite"], "", "Mint a tagged tailscale auth key and print the `noo enroll --via-tailnet <url>` line"),
@@ -41,6 +44,9 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
         (&["cluster", "reserve"], "<addon>/<workload> [--node <node>] [--hand-over <reservation-id>] [--timeout <secs>]", "Reserve a GPU for an add-on workload: drain the pool there, pause it, start the workload"),
         (&["cluster", "reservations"], "", "List the GPU reservations the nodes hold: id, workload, holder, node, state"),
         (&["cluster", "release"], "<reservation-id> [--force]", "Release a reservation: drain and stop the workload, give the GPU back (holder or --force)"),
+        (&["cluster", "workloads", "place"], "<node> <addon>/<workload> [--profile <profile>] [--set <slot>=<id>@<rev>]... [--env <K=V>]... [--on-controller]", "Place an add-on's node workload on one node: image, model sets, env (operator)"),
+        (&["cluster", "workloads", "show"], "<node> [<addon>/<workload>]", "Show the node workloads placed on a node, or one of them"),
+        (&["cluster", "workloads", "unplace"], "<node> <addon>/<workload>", "Remove an add-on's node workload placement from a node (operator)"),
         (&["cluster", "workloads"], "", "List the workloads the installed add-ons declare (container, GPU need, drain route)"),
         (&["cluster", "profile"], "<node> [--set <key=value>]... [--clear <key>]... [--clear-all] [--bench]", "Show a node's harness profile with each value's source; set overrides; bench its model"),
         (&["cluster", "init-secret"], "", "Generate and print a fresh random cluster secret locally (no gateway call)"),

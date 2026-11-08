@@ -232,6 +232,15 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                         println!("{}", ui::note(&suggestion_note(addon, &suggested, check)));
                     }
                 }
+                // Changed or not: the operator's case was a current pin and a
+                // secret its bundle added that nothing had minted (i570 2c).
+                if !check {
+                    let s = crate::commands::addon_enable::mint_repin_secrets(g, &root, addon);
+                    if let Some(row) = rows.last_mut() {
+                        row["minted"] = json!(s.minted);
+                        row["key_missing"] = json!(s.key_missing);
+                    }
+                }
             }
             Err(r) => {
                 failed += 1;

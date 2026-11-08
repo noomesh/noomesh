@@ -150,9 +150,7 @@ func TestTheActuatorMapsEachLifecycleFailure(t *testing.T) {
 
 func TestTheNodeFactsAreBuiltFromTheConfig(t *testing.T) {
 	dir := t.TempDir()
-	if err := nodepolicy.NewApprovals(dir).Add("rhaddon", gateDigest); err != nil {
-		t.Fatal(err)
-	}
+	approveOnNode(t, dir, "rhaddon", gateDigest)
 	cfg := &config.Config{AddonWorkloadsPolicy: "approve", SelfNode: true, StateDir: dir}
 	nw, facts := newNodeWorkloads(cfg, nil, nil)
 	if nw != nil {
@@ -173,9 +171,10 @@ func TestTheNodeFactsAreBuiltFromTheConfig(t *testing.T) {
 	if facts.NvidiaRuntime != nil {
 		t.Fatal("an nvidia runtime probe without docker")
 	}
-	// Defaults: nothing set is none, and not the controller's host.
+	// Defaults: nothing set is approve (nothing approved, so nothing runs),
+	// and not the controller's host.
 	_, facts = newNodeWorkloads(&config.Config{StateDir: dir}, nil, nil)
-	if facts.Mode != nodepolicy.ModeNone || facts.ControllerHost {
+	if facts.Mode != nodepolicy.ModeApprove || facts.ControllerHost {
 		t.Fatalf("defaults = %q %v", facts.Mode, facts.ControllerHost)
 	}
 }

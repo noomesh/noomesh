@@ -375,12 +375,45 @@ EOF_HELD
                 noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq "${SERVICES[@]}")
         fi
     else
-        docker compose $COMPOSE_FILES $PROFILE_ARGS restart "${SERVICES[@]}" || RESTART_RC=$?
+        # A named service with NO container: `compose restart` does nothing
+        # for it and exits 0. Create it (--no-deps, as a recreate would);
+        # restart the rest.
+        # shellcheck disable=SC2086
+        MISSING="$(restart_missing $COMPOSE_FILES $PROFILE_ARGS -- "${SERVICES[@]}" | tr '\n' ' ')"
+        _present=()
+        for _s in "${SERVICES[@]}"; do
+            case " $MISSING " in *" $_s "*) ;; *) _present+=("$_s") ;; esac
+        done
+        if [ -n "${MISSING// /}" ]; then
+            ui_note "no container for ${MISSING% } - creating it (up -d --no-deps)"
+            restart_require_lock || exit 1
+            # shellcheck disable=SC2086
+            check_bind_sources --no-deps $MISSING || exit 1
+            # shellcheck disable=SC2086
+            docker compose $COMPOSE_FILES $PROFILE_ARGS up -d --no-build --no-deps $MISSING || RESTART_RC=$?
+            if [ "$RESTART_RC" -eq 0 ]; then
+                # shellcheck disable=SC2086
+                NOO_CREATED_GUARD_SERVICES="${MISSING% }" \
+                    noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq $MISSING)
+            fi
+        fi
+        if [ "$RESTART_RC" -eq 0 ] && [ ${#_present[@]} -gt 0 ]; then
+            docker compose $COMPOSE_FILES $PROFILE_ARGS restart "${_present[@]}" || RESTART_RC=$?
+        fi
     fi
     if [ "$RESTART_RC" -ne 0 ]; then
         ui_close_failed "compose failed (exit $RESTART_RC) restarting ${SERVICES[*]}"
         echo "       valid services: $(printf '%s\n' "$VALID_SVCS" | tr '\n' ' ')" >&2
         exit "$RESTART_RC"
+    fi
+    # Compose exiting 0 is not "restarted": every service named must be
+    # running now, or the restart failed and says which.
+    # shellcheck disable=SC2086
+    NOT_RUNNING="$(restart_not_running $COMPOSE_FILES $PROFILE_ARGS -- "${SERVICES[@]}" | tr '\n' ' ')"
+    if [ -n "${NOT_RUNNING// /}" ]; then
+        ui_close_failed "not running after the restart: ${NOT_RUNNING% }"
+        ui_note "see why: noo stack status, then the service's logs" >&2
+        exit 1
     fi
 fi
 

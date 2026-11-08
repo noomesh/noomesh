@@ -344,10 +344,10 @@ func (a *Agent) Run() error {
 	}
 
 	// 3. Register with controller (retry until available)
-	caps, capsErr := hardware.Detect(a.cfg, a.gpu, nil)
+	caps, capsErr := hardware.DetectAtBoot(a.cfg, a.gpu)
 	if capsErr != nil {
-		slog.Warn("gpu probe failed at registration; keeping the configured GPU capability and re-detecting on later heartbeats",
-			"error", capsErr)
+		slog.Warn("gpu probe failed at registration; registering the configured or last detected GPU and re-detecting on later heartbeats",
+			"gpu_model", caps.GPUModel, "vram_gb", caps.VRAMGB, "error", capsErr)
 	}
 	hostIP := heartbeat.DetectHostIP(a.cfg)
 	slog.Info("registering with controller", "ip", hostIP)

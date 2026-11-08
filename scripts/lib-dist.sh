@@ -271,11 +271,22 @@ _addon_refuse() {
 _addon_refused_lines() {
     echo "REFUSED add-on $1: $2"
     echo "  It is left out of this start and is NOT running; the rest of the stack starts without it."
+    # A reason that names its own remedy — "`noo addons enable <addon>` mints
+    # it" for a missing resource (noo-cli/src/addons/resources.rs `plan`) —
+    # is the Fix. `noo addons upgrade` with the pin current changes nothing
+    # and mints nothing, so naming it sent the operator round in a loop
+    # (0.6.18 roll, noomesh-internal i570).
+    local _arl_fix=""
+    case "$2" in
+        *'`noo addons enable '"$1"'`'* | *'`noo addons enable '"$1"' '*)
+            _arl_fix="${2#*\`noo addons enable }"
+            _arl_fix="noo addons enable ${_arl_fix%%\`*}" ;;
+    esac
     case "$2" in
         *"development key"*expired*)
             echo "  Fix:  noo addons trust-key $1 <pubkey> --dev --expires 14d   (renew the dev key; or turn it off: noo addons disable $1)" ;;
         *)
-            echo "  Fix:  noo addons upgrade $1   (or turn it off: noo addons disable $1)" ;;
+            echo "  Fix:  ${_arl_fix:-noo addons upgrade $1}   (or turn it off: noo addons disable $1)" ;;
     esac
 }
 

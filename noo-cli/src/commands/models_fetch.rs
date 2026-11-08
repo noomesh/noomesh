@@ -441,8 +441,8 @@ pub(crate) fn part_path(dir: &Path, name: &str) -> PathBuf {
 }
 
 /// Download `a` into `dir`, resuming a `.part` file, verifying the sha256,
-/// and renaming into place with mode 0644. `progress(done, total)` is
-/// called as bytes arrive.
+/// and renaming into place with mode 0644. `progress` hears each phase
+/// ([`Fetching`]): a resume, the bytes as they arrive, and the sha256 pass.
 /// The guard in front of every request this module makes (i445).
 fn refuse_unless_allowed(url: &str) -> Result<(), FetchErr> {
     if crate::catalog::hf_origin_allowed(url) {
@@ -456,7 +456,7 @@ pub(crate) fn fetch_to_store(
     token: Option<&str>,
     a: &FetchArgs,
     dir: &Path,
-    progress: &mut dyn FnMut(u64, Option<u64>),
+    progress: &mut dyn FnMut(Fetching),
 ) -> Result<Outcome, FetchErr> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -465,6 +465,7 @@ pub(crate) fn fetch_to_store(
     let dest = dir.join(name);
 
     if dest.exists() {
+        progress(Fetching::Verifying(std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0)));
         let have = sha256_file(&dest).map_err(|e| io(&format!("reading {}", dest.display()), e))?;
         if have == remote.sha256 {
             let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
@@ -485,6 +486,9 @@ pub(crate) fn fetch_to_store(
         }
     }
     let resumed_from = have;
+    if have > 0 {
+        progress(Fetching::Resuming(have));
+    }
 
     let complete = remote.size.is_some_and(|t| have == t && t > 0);
     if !complete {
@@ -515,12 +519,13 @@ pub(crate) fn fetch_to_store(
                 }
                 f.write_all(&buf[..n]).map_err(|e| io(&format!("writing {}", part.display()), e))?;
                 have += n as u64;
-                progress(have, remote.size);
+                progress(Fetching::Bytes { done: have, total: remote.size });
             }
         }
         f.sync_all().map_err(|e| io("flushing the partial file", e))?;
     }
 
+    progress(Fetching::Verifying(have));
     let got = sha256_file(&part).map_err(|e| io(&format!("hashing {}", part.display()), e))?;
     if got != remote.sha256 {
         let _ = std::fs::remove_file(&part);
@@ -562,6 +567,123 @@ pub(crate) fn hf_token() -> Option<String> {
 pub(crate) fn human(n: u64) -> String {
     const G: f64 = 1024.0 * 1024.0 * 1024.0;
     if n as f64 >= G { format!("{:.2} GB", n as f64 / G) } else { format!("{:.1} MB", n as f64 / (1024.0 * 1024.0)) }
+}
+
+/// One phase of [`fetch_to_store`], for a progress display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fetching {
+    /// A `.part` of this many bytes is on disk from an earlier run; the
+    /// download asks for the rest.
+    Resuming(u64),
+    /// Bytes on disk so far, of `total` when the server said.
+    Bytes { done: u64, total: Option<u64> },
+    /// The sha256 pass over a file of this many bytes (seconds per GB: a
+    /// 15 GB set file is most of a minute with nothing arriving).
+    Verifying(u64),
+}
+
+/// `4.10 GB / 15.59 GB · 38.2 MB/s · ETA 5:01`: the live line of a download.
+/// The rate counts only this run's bytes (`done - from` over `secs`), so a
+/// resume does not read as a burst; no rate or ETA until a second has passed.
+pub(crate) fn progress_text(done: u64, total: Option<u64>, from: u64, secs: f64) -> String {
+    let mut s = match total {
+        Some(t) if t > 0 => format!("{} / {}", human(done), human(t)),
+        _ => human(done),
+    };
+    if secs >= 1.0 {
+        let rate = done.saturating_sub(from) as f64 / secs;
+        s.push_str(&format!(" · {}/s", human(rate as u64)));
+        if let Some(t) = total.filter(|t| *t > done && rate > 0.0) {
+            let eta = ((t - done) as f64 / rate).round() as u64;
+            s.push_str(&format!(" · ETA {}:{:02}", eta / 60, eta % 60));
+        }
+    }
+    s
+}
+
+/// `6m12s` / `41s`.
+fn took(secs: u64) -> String {
+    if secs >= 60 { format!("{}m{:02}s", secs / 60, secs % 60) } else { format!("{secs}s") }
+}
+
+/// The progress display `noo models fetch` and `noo models stage` share
+/// (i570's live-line style). On a terminal (not `--json`/`--quiet`): one
+/// `ui::Poll` line, rewritten at most ten times a second. Anywhere else: no
+/// per-chunk lines. Both say `resuming from N` and the sha256 pass, and end
+/// with one plain line of what this run transferred.
+pub(crate) struct DownloadLine {
+    name: String,
+    poll: Option<ui::Poll>,
+    show: bool,
+    started: std::time::Instant,
+    drawn: Option<std::time::Instant>,
+    from: u64,
+    last: u64,
+}
+
+impl DownloadLine {
+    pub(crate) fn new(name: &str, json: bool) -> DownloadLine {
+        let show = !json && !ui::quiet();
+        let live = show && ui::styled() && ui::stderr_is_tty();
+        DownloadLine {
+            name: name.to_string(),
+            poll: live.then(|| ui::Poll::start_under(name)),
+            show,
+            started: std::time::Instant::now(),
+            drawn: None,
+            from: 0,
+            last: 0,
+        }
+    }
+
+    fn note(&self, text: &str) {
+        if let Some(p) = &self.poll {
+            p.lift();
+        }
+        println!("    {}", ui::muted(text));
+    }
+
+    pub(crate) fn event(&mut self, e: Fetching) {
+        if !self.show {
+            return;
+        }
+        match e {
+            Fetching::Resuming(n) => {
+                self.from = n;
+                self.last = n;
+                self.note(&format!("resuming from {} (a partial download from an earlier run)", human(n)));
+            }
+            Fetching::Bytes { done, total } => {
+                self.last = done;
+                let Some(p) = self.poll.as_mut() else { return };
+                if self.drawn.is_some_and(|t| t.elapsed() < Duration::from_millis(100)) {
+                    return;
+                }
+                let secs = self.started.elapsed().as_secs_f64();
+                p.set_msg(&format!("{}  {}", self.name, progress_text(done, total, self.from, secs)));
+                p.tick(self.started.elapsed().as_secs());
+                self.drawn = Some(std::time::Instant::now());
+            }
+            Fetching::Verifying(n) => match self.poll.as_mut() {
+                Some(p) => {
+                    p.set_msg(&format!("{}  verifying sha256 ({})", self.name, human(n)));
+                    p.tick(self.started.elapsed().as_secs());
+                }
+                None => self.note(&format!("{}: verifying sha256 ({})", self.name, human(n))),
+            },
+        }
+    }
+
+    /// Clear the live line; say what this run transferred, if anything.
+    pub(crate) fn finish(&mut self) {
+        self.poll = None;
+        let moved = self.last.saturating_sub(self.from);
+        if self.show && moved > 0 {
+            let secs = self.started.elapsed().as_secs();
+            let rate = moved as f64 / self.started.elapsed().as_secs_f64().max(0.001);
+            self.note(&format!("{}: {} in {} ({}/s)", self.name, human(moved), took(secs), human(rate as u64)));
+        }
+    }
 }
 
 /// The controller's model store as a directory this user can write — or the
@@ -623,35 +745,16 @@ pub fn models_fetch(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ]));
     }
 
-    let mut last_pct: i64 = -1;
-    let mut last_mb: u64 = 0;
-    let json = g.json;
-    let mut progress = |done: u64, total: Option<u64>| {
-        if json {
-            return;
-        }
-        match total {
-            Some(t) if t > 0 => {
-                let pct = (done * 100 / t) as i64;
-                if pct / 5 != last_pct / 5 {
-                    last_pct = pct;
-                    eprintln!("  {pct:>3}%  {} / {}", human(done), human(t));
-                }
-            }
-            _ => {
-                if done / (512 << 20) != last_mb {
-                    last_mb = done / (512 << 20);
-                    eprintln!("  {}", human(done));
-                }
-            }
-        }
-    };
+    let mut line = DownloadLine::new(&a.file, g.json);
+    let mut progress = |e: Fetching| line.event(e);
 
     let base = match hf_base() {
         Ok(b) => b,
         Err(why) => fail(g.json, ExitCode::Usage, "hf_endpoint_refused", &why, Some(crate::catalog::HF_ENDPOINT_REMEDY)),
     };
-    let out = match fetch_to_store(&base, token.as_deref(), &a, &dir, &mut progress) {
+    let fetched = fetch_to_store(&base, token.as_deref(), &a, &dir, &mut progress);
+    line.finish();
+    let out = match fetched {
         Ok(o) => o,
         Err(e) => {
             let hint = match &e {
@@ -980,7 +1083,7 @@ mod tests {
         let c = content();
         let hf = serve(c.clone(), sha(&c), false, 8);
         let dir = tmpdir("fresh");
-        let out = fetch_to_store(&hf.base, Some("hf_secret"), &args(), &dir, &mut |_, _| {}).unwrap();
+        let out = fetch_to_store(&hf.base, Some("hf_secret"), &args(), &dir, &mut |_| {}).unwrap();
         assert_eq!(out.resumed_from, 0);
         assert_eq!(std::fs::read(dir.join("m.gguf")).unwrap(), c);
         let mode = std::fs::metadata(dir.join("m.gguf")).unwrap().permissions().mode() & 0o777;
@@ -1001,7 +1104,7 @@ mod tests {
         let hf = serve(c.clone(), sha(&c), false, 8);
         let dir = tmpdir("resume");
         std::fs::write(part_path(&dir, "m.gguf"), &c[..100_000]).unwrap();
-        let out = fetch_to_store(&hf.base, None, &args(), &dir, &mut |_, _| {}).unwrap();
+        let out = fetch_to_store(&hf.base, None, &args(), &dir, &mut |_| {}).unwrap();
         assert_eq!(out.resumed_from, 100_000);
         assert_eq!(std::fs::read(dir.join("m.gguf")).unwrap(), c);
         let seen = hf.seen.lock().unwrap();
@@ -1018,7 +1121,7 @@ mod tests {
         let hf = serve(c.clone(), sha(&c), true, 8);
         let dir = tmpdir("norange");
         std::fs::write(part_path(&dir, "m.gguf"), &c[..50_000]).unwrap();
-        fetch_to_store(&hf.base, None, &args(), &dir, &mut |_, _| {}).unwrap();
+        fetch_to_store(&hf.base, None, &args(), &dir, &mut |_| {}).unwrap();
         assert_eq!(std::fs::read(dir.join("m.gguf")).unwrap(), c, "a 200 must not be appended to the prefix");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1029,7 +1132,7 @@ mod tests {
         let hf = serve(c.clone(), sha(&c), false, 8);
         let dir = tmpdir("complete");
         std::fs::write(part_path(&dir, "m.gguf"), &c).unwrap();
-        fetch_to_store(&hf.base, None, &args(), &dir, &mut |_, _| {}).unwrap();
+        fetch_to_store(&hf.base, None, &args(), &dir, &mut |_| {}).unwrap();
         assert!(!hf.seen.lock().unwrap().reqs.iter().any(|r| r.0 == "GET"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1039,7 +1142,7 @@ mod tests {
         let c = content();
         let hf = serve(c.clone(), "b".repeat(64), false, 8);
         let dir = tmpdir("mismatch");
-        let err = fetch_to_store(&hf.base, None, &args(), &dir, &mut |_, _| {}).unwrap_err();
+        let err = fetch_to_store(&hf.base, None, &args(), &dir, &mut |_| {}).unwrap_err();
         assert!(matches!(err, FetchErr::Mismatch { .. }), "{err}");
         assert!(!dir.join("m.gguf").exists());
         assert!(!part_path(&dir, "m.gguf").exists());
@@ -1052,15 +1155,15 @@ mod tests {
         let hf = serve(c.clone(), sha(&c), false, 16);
         let dir = tmpdir("exists");
         std::fs::write(dir.join("m.gguf"), &c).unwrap();
-        let out = fetch_to_store(&hf.base, None, &args(), &dir, &mut |_, _| {}).unwrap();
+        let out = fetch_to_store(&hf.base, None, &args(), &dir, &mut |_| {}).unwrap();
         assert!(out.already_present);
 
         std::fs::write(dir.join("m.gguf"), b"other").unwrap();
-        let err = fetch_to_store(&hf.base, None, &args(), &dir, &mut |_, _| {}).unwrap_err();
+        let err = fetch_to_store(&hf.base, None, &args(), &dir, &mut |_| {}).unwrap_err();
         assert!(matches!(err, FetchErr::Conflict { .. }));
         let mut forced = args();
         forced.force = true;
-        fetch_to_store(&hf.base, None, &forced, &dir, &mut |_, _| {}).unwrap();
+        fetch_to_store(&hf.base, None, &forced, &dir, &mut |_| {}).unwrap();
         assert_eq!(std::fs::read(dir.join("m.gguf")).unwrap(), c);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1069,7 +1172,58 @@ mod tests {
     fn missing_file_is_not_found() {
         let hf = serve(vec![], "a".repeat(64), false, 4);
         let a = parse_args(&s(&["o/n", "absent.gguf"])).unwrap();
-        let err = fetch_to_store(&hf.base, None, &a, &tmpdir("absent"), &mut |_, _| {}).unwrap_err();
+        let err = fetch_to_store(&hf.base, None, &a, &tmpdir("absent"), &mut |_| {}).unwrap_err();
         assert!(matches!(err, FetchErr::NotFound), "{err}");
+    }
+
+    /// i570 (stage progress): the live line's text. The rate is this run's
+    /// bytes only, so a resume is not a burst; no rate or ETA in the first
+    /// second; no total, no ETA.
+    #[test]
+    fn the_progress_text_counts_only_this_runs_bytes() {
+        const G: u64 = 1 << 30;
+        assert_eq!(progress_text(4 * G, Some(16 * G), 0, 0.5), "4.00 GB / 16.00 GB");
+        // 1 GB moved in 10 s after resuming from 3 GB: 102.4 MB/s, 12 GB left.
+        assert_eq!(progress_text(4 * G, Some(16 * G), 3 * G, 10.0), "4.00 GB / 16.00 GB · 102.4 MB/s · ETA 2:00");
+        assert_eq!(progress_text(G, None, 0, 10.0), "1.00 GB · 102.4 MB/s");
+        assert_eq!(progress_text(G, Some(G), 0, 10.0), "1.00 GB / 1.00 GB · 102.4 MB/s", "done: no ETA");
+    }
+
+    /// i570 (stage progress): a resumed download says so before it asks for
+    /// the rest, its bytes reach the total, and the sha256 pass is announced
+    /// last, so nothing runs silently.
+    #[test]
+    fn a_resumed_fetch_announces_the_resume_the_bytes_and_the_verify() {
+        let c = content();
+        let hf = serve(c.clone(), sha(&c), false, 8);
+        let dir = tmpdir("events");
+        std::fs::write(part_path(&dir, "m.gguf"), &c[..100_000]).unwrap();
+        let mut seen: Vec<Fetching> = Vec::new();
+        fetch_to_store(&hf.base, None, &args(), &dir, &mut |e| seen.push(e)).unwrap();
+        let total = c.len() as u64;
+        assert_eq!(seen.first(), Some(&Fetching::Resuming(100_000)), "{seen:?}");
+        assert_eq!(seen.last(), Some(&Fetching::Verifying(total)), "{seen:?}");
+        let bytes: Vec<u64> = seen.iter().filter_map(|e| match e { Fetching::Bytes { done, .. } => Some(*done), _ => None }).collect();
+        assert!(bytes.windows(2).all(|w| w[0] < w[1]) && bytes.first().is_some_and(|b| *b > 100_000), "{bytes:?}");
+        assert_eq!(bytes.last(), Some(&total));
+        // A file already in the store is re-hashed: that is announced too.
+        let mut again: Vec<Fetching> = Vec::new();
+        fetch_to_store(&hf.base, None, &args(), &dir, &mut |e| again.push(e)).unwrap();
+        assert_eq!(again, [Fetching::Verifying(total)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// i570 (stage progress): `noo models stage` and the voice-model pull hand
+    /// `fetch_to_store` a live `DownloadLine`, not a no-op: the stage printed
+    /// `→ model.safetensors (15.59 GB)` and then nothing for the whole download.
+    #[test]
+    fn stage_and_the_voice_pull_show_the_download_line() {
+        for (src, f) in [
+            (crate::test_src::own_code(include_str!("models_sets.rs")), "fn fetch_lfs("),
+            (crate::test_src::own_code(include_str!("voice_models.rs")), "fn stage("),
+        ] {
+            let body = crate::test_src::fn_body(&src, f);
+            assert!(body.contains("DownloadLine::new(") && body.contains("line.event(e)") && body.contains("line.finish()"), "{f}");
+        }
     }
 }

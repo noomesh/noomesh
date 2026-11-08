@@ -93,9 +93,7 @@ func TestTheAgentsGateIsWiredWithEveryInput(t *testing.T) {
 	if got := check(&config.Config{}, nodepolicy.ModeApprove, e); got != nodewl.ReasonConsentUnapproved {
 		t.Errorf("approve with nothing approved: %q", got)
 	}
-	if err := approvals.Add("rhaddon", gateDigest); err != nil {
-		t.Fatal(err)
-	}
+	approveOnNode(t, dir, "rhaddon", gateDigest)
 	if got := check(&config.Config{}, nodepolicy.ModeApprove, e); got != nodewl.ReasonNvidiaRuntimeMissing {
 		t.Errorf("approve with the approval, runtime missing: %q (consent passes, the next refusal speaks)", got)
 	}
