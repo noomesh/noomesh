@@ -596,7 +596,7 @@ The placement facts (`consent_none`, `consent_unapproved`, `nvidia_runtime_missi
   nothing approved, `approve` runs nothing, so the default is closed; the
   node owner's approval of one add-on at one image digest is the consent.
   `none` is the owner's kill switch: it refuses even an approved add-on.
-  (Until 0.6.18.1 the default was `none`. `/etc/noo-node-agent.env` is
+  (Until 0.6.19 the default was `none`. `/etc/noo-node-agent.env` is
   rewritten on every roll, so a hand-set policy did not last; an approval
   does.)
 - The node's owner approves, revokes and lists on the node itself, as root:
