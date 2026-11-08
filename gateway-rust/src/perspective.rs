@@ -157,13 +157,48 @@ tokio::task_local! {
     /// role reads that bypass the token: the node-harness turn token
     /// (`coordinator::dispatch::try_dispatch`, `tasks::start`) and the
     /// external-tool audience (`mcp_bridge::identity`).
+    ///
+    /// Like `bus_principal`'s own task-local it does NOT cross
+    /// `tokio::spawn`. That is why the snapshot also rides inside the bus
+    /// `Principal` ([`crate::bus_principal::Principal::narrowed`]), which
+    /// detached work re-binds: [`current`] falls back to it.
     static CURRENT: Option<RequesterPerspective>;
 }
 
-/// The snapshot in scope, `None` outside any (a background loop, a channel
-/// bot, a request without a perspective).
+/// The snapshot in scope: this task-local's, else the one the bus principal
+/// in scope carries; `None` outside both (a background loop, a channel bot,
+/// a request without a perspective).
 pub fn current() -> Option<RequesterPerspective> {
-    CURRENT.try_with(|p| p.clone()).ok().flatten()
+    CURRENT.try_with(|p| p.clone()).ok().flatten().or_else(crate::bus_principal::current_perspective)
+}
+
+/// The view a child task may have when it is submitted under one
+/// perspective and its parent was under another: the INTERSECTION, so a
+/// child is never wider than either. The lower role cap; every add-on
+/// either hides (`absent` beats `disabled`); core-only if either is.
+pub fn intersect(a: &Perspective, b: &Perspective) -> Perspective {
+    let role_cap = match (a.role_cap, b.role_cap) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, y) => x.or(y),
+    };
+    let mut addons = a.addons.clone();
+    for (name, hide) in &b.addons {
+        let merged = match (addons.get(name), hide) {
+            (Some(Hide::Absent), _) | (_, Hide::Absent) => Hide::Absent,
+            _ => Hide::Disabled,
+        };
+        addons.insert(name.clone(), merged);
+    }
+    Perspective { role_cap, addons, core_only: a.core_only || b.core_only }
+}
+
+/// The snapshot a new task takes: the request's (or turn's) and its
+/// parent task's, intersected when both exist (the id is the request's).
+pub fn combine(current: Option<RequesterPerspective>, parent: Option<RequesterPerspective>) -> Option<RequesterPerspective> {
+    match (current, parent) {
+        (Some(c), Some(p)) => Some(RequesterPerspective { dims: intersect(&c.dims, &p.dims), id: c.id }),
+        (c, p) => c.or(p),
+    }
 }
 
 /// Run `fut` with `p` as the turn's snapshot. A `tokio::spawn` inside `fut`
@@ -1240,6 +1275,59 @@ mod tests {
         assert!(body.contains("Ok(crate::perspective::snapshot_role(live, snapshot.as_ref()))"));
         let deliver = crate::test_src::fn_body(&own, "async fn deliver_task(");
         assert!(deliver.contains("task_owner_role(db, d.task_id, &owner).await"));
+    }
+
+    /// A child task submitted under one view, with a parent under another,
+    /// takes the intersection: the lower cap, every hide (absent beats
+    /// disabled), core-only if either. Never just one side.
+    #[test]
+    fn a_child_task_takes_the_intersection() {
+        let mut current = RequesterPerspective {
+            id: "c".into(),
+            dims: Perspective { role_cap: Some(Role::Operator), ..Perspective::default() },
+        };
+        current.dims.addons.insert("x".into(), Hide::Disabled);
+        let mut parent = RequesterPerspective {
+            id: "p".into(),
+            dims: Perspective { role_cap: Some(Role::User), core_only: true, ..Perspective::default() },
+        };
+        parent.dims.addons.insert("x".into(), Hide::Absent);
+        parent.dims.addons.insert("y".into(), Hide::Disabled);
+        let both = combine(Some(current.clone()), Some(parent.clone())).expect("a snapshot");
+        assert_eq!(both.dims.role_cap, Some(Role::User), "the lower cap");
+        assert_eq!(both.dims.addons.get("x"), Some(&Hide::Absent), "absent beats disabled");
+        assert_eq!(both.dims.addons.get("y"), Some(&Hide::Disabled), "the parent's hide stays");
+        assert!(both.dims.core_only, "core-only if either");
+        assert_eq!(both.id, "c");
+        let reversed = combine(Some(parent.clone()), Some(current.clone())).expect("a snapshot");
+        assert_eq!(reversed.dims, both.dims, "the intersection is symmetric");
+        assert_eq!(combine(Some(current.clone()), None), Some(current.clone()));
+        assert_eq!(combine(None, Some(parent.clone())), Some(parent));
+        assert_eq!(combine(None, None), None);
+        let own = crate::test_src::own_code(include_str!("tasks.rs"));
+        let body = crate::test_src::fn_body(&own, "pub async fn create_task(");
+        assert!(body.contains("crate::perspective::combine(crate::perspective::current(), parent_snapshot)"));
+    }
+
+    /// A principal narrowed to a `user` view signs as a user: the role and
+    /// exactly the scopes that role expands to, carrying the snapshot.
+    #[test]
+    fn a_narrowed_principal_signs_as_the_view() {
+        let real = crate::bus_principal::Principal::user(
+            "olive",
+            Role::Operator,
+            vec!["read".into(), "write".into(), "ingest".into()],
+        );
+        assert_eq!(real.clone().narrowed(None), real, "no snapshot, no change");
+        let p = real.narrowed(Some(user_view()));
+        assert_eq!(p.role, "user");
+        assert_eq!(p.scopes, vec!["read".to_string()]);
+        assert_eq!(p.perspective, Some(user_view()));
+        let own = crate::test_src::own_code(include_str!("tasks.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn task_principal(");
+        assert!(body.contains(".map(|p| p.narrowed(snapshot))"), "the task principal must take the task's snapshot");
+        let runner = crate::test_src::fn_body(&own, "fn run_in_process(");
+        assert!(runner.contains("task_principal(&st.db, &req.user, snapshot.clone()).await"));
     }
 
     /// The perspective routes take a plain person-session token only.
