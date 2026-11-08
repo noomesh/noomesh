@@ -706,9 +706,6 @@ async fn stamp_in(
 /// nested (409 `perspective_active`). One transaction writes the row and
 /// stamps the session; `PerspectiveStarted` is written after it commits.
 pub async fn begin(db: &PgPool, claims: &Claims, session: &SessionRow, dims: &Perspective) -> Result<Started, Refused> {
-    if claims.prs.is_some() || session.perspective_id.is_some() {
-        return Err(refused(StatusCode::CONFLICT, ACTIVE));
-    }
     let live = validate(db, &claims.sub, dims).await?;
     let mut tx = db.begin().await.map_err(db_failed)?;
     let started = insert_in(&mut tx, &claims.sub, session, dims, live, None).await.map_err(db_failed)?;
