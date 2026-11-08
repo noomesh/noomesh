@@ -118,7 +118,7 @@ fn perspective_token_with(
     prs: &crate::perspective::PrsClaim,
     secret: &str,
 ) -> Result<(String, i64), TokenIssueError> {
-    let scopes: Vec<String> = role.legacy_scopes().iter().map(|s| s.to_string()).collect();
+    let scopes: Vec<String> = dual_emit_scopes(role, &user.scopes);
     session_token(&user.username, role, scopes, Some(prs), secret)
 }
 
