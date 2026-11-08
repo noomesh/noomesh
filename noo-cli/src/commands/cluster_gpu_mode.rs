@@ -806,6 +806,11 @@ fn print_outcome(out: &Outcome, read_only: bool, now: i64) {
         let age = lease_age(gc, now).map(|s| format!(", held {}", age_text(s))).unwrap_or_default();
         let until = until_text(gc, now).map(|t| format!(", {t}")).unwrap_or_default();
         ui::done(&format!("{node}: mode {}{age}{until}", out.mode.label()));
+        if out.mode == Mode::Yielded {
+            if let Some(why) = super::cluster_gpu::yield_reason(gc) {
+                println!("{}", ui::muted(&format!("why: {why}")));
+            }
+        }
         let v = vllm_of(&out.record);
         if out.mode == Mode::Mesh && v.reported {
             println!("{}", ui::muted(&format!("vllm {}", v.describe())));

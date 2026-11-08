@@ -753,6 +753,7 @@ way, and a workload that is not reserved answers 409.
 | `NOO_GPU_YIELD_FOREIGN_MB` | `2048` | foreign GPU use above this is pressure |
 | `NOO_GPU_YIELD_AFTER_S` | `60` | how long pressure must last before the agent yields |
 | `NOO_GPU_RESUME_AFTER_S` | `120` | how long the GPU must stay clear before the agent resumes |
+| `NOO_GPU_TIMEOUT_GRACE_S` | `300` | for this long after one of noomesh's own GPU backends starts or resumes, an `nvidia-smi` timeout is that backend warming up, not pressure (on WSL2 a loading vLLM stalls `nvidia-smi` itself). Measured foreign use is never graced. `0` turns the grace off |
 
 **What the operator sees.** The heartbeat carries `gpu_contention`:
 

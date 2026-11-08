@@ -204,6 +204,15 @@ pub(crate) fn lease_holder(gc: &Value) -> String {
     gc["lease"]["owner"].as_str().filter(|o| !o.is_empty()).unwrap_or("operator").to_string()
 }
 
+/// Why the automatic policy yielded, as the agent said it (None when it did
+/// not say). The foreign figure on the same line is the reading NOW, with our
+/// backends stopped, so on its own it can read "foreign 0.0 GB" for a node
+/// that yielded on a probe timeout (awolf, 2026-11-07); the reason is the
+/// cause.
+pub(crate) fn yield_reason(gc: &Value) -> Option<&str> {
+    gc["reason"].as_str().map(str::trim).filter(|r| !r.is_empty())
+}
+
 /// The `noo cluster status` note for a node whose GPU went to other work, or
 /// None when there is nothing to say (free, shared, unreported).
 pub(crate) fn gpu_status_note(n: &Value) -> Option<String> {
@@ -212,8 +221,9 @@ pub(crate) fn gpu_status_note(n: &Value) -> Option<String> {
     let paused = paused_list(gc);
     let since = gc["since"].as_str().map(|s| format!(" since {s}")).unwrap_or_default();
     match gc["state"].as_str()? {
-        "yielded" => Some(format!("{id}: GPU in use by other work — {paused} paused{since} (foreign {:.1} GB)",
-            gc["foreign_mb"].as_f64().unwrap_or(0.0) / 1024.0)),
+        "yielded" => Some(format!("{id}: GPU in use by other work — {paused} paused{since} (foreign {:.1} GB){}",
+            gc["foreign_mb"].as_f64().unwrap_or(0.0) / 1024.0,
+            yield_reason(gc).map(|r| format!(" — why: {r}")).unwrap_or_default())),
         "held" => Some(format!("{id}: GPU mode {} — held by {}{}, {paused} paused{since}",
             super::cluster_gpu_mode::lease_mode(gc).label(),
             lease_holder(gc),
@@ -279,6 +289,13 @@ mod tests {
             "since": "2026-10-17T12:00:00Z", "paused_backends": ["vllm"]}});
         assert_eq!(gpu_status_note(&n).unwrap(),
             "host3: GPU in use by other work — vllm paused since 2026-10-17T12:00:00Z (foreign 11.2 GB)");
+        // awolf 2026-11-07: the reading after the pause said foreign 0.0 GB;
+        // the cause was the probe. The note names it.
+        let probe = serde_json::json!({"id": "awolf", "gpu_contention": {"state": "yielded", "foreign_mb": 0,
+            "paused_backends": ["vllm"],
+            "reason": "GPU probe (nvidia-smi) not answering: a program outside noomesh is likely using the GPU"}});
+        assert_eq!(gpu_status_note(&probe).unwrap(),
+            "awolf: GPU in use by other work — vllm paused (foreign 0.0 GB) — why: GPU probe (nvidia-smi) not answering: a program outside noomesh is likely using the GPU");
         let held = serde_json::json!({"id": "host3", "gpu_contention": {"state": "held", "reason": "voice", "paused_backends": ["vllm"]}});
         assert_eq!(gpu_status_note(&held).unwrap(), "host3: GPU mode held (manual) — held by operator (voice), vllm paused");
         let owned = serde_json::json!({"id": "host3", "gpu_contention": {"state": "held", "reason": "voice", "paused_backends": ["vllm"],
