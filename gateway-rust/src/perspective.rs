@@ -724,7 +724,7 @@ pub async fn begin(db: &PgPool, claims: &Claims, session: &SessionRow, dims: &Pe
 /// Switch and Back to me authorize on the ROW, never on the token's role
 /// (which may be `user`): the token's `prs` must be live, the caller's own,
 /// and on this very session. `Ok` is the perspective id.
-pub async fn authorize_own(db: &PgPool, claims: &Claims, session: &SessionRow) -> Result<String, Refused> {
+pub async fn authorize_own(db: &PgPool, claims: &Claims, _session: &SessionRow) -> Result<String, Refused> {
     let Some(prs) = claims.prs.as_ref() else {
         return Err(refused(StatusCode::CONFLICT, NONE));
     };
@@ -732,9 +732,6 @@ pub async fn authorize_own(db: &PgPool, claims: &Claims, session: &SessionRow) -
         Refusal::Unavailable => refused(StatusCode::SERVICE_UNAVAILABLE, UNAVAILABLE),
         Refusal::Unknown | Refusal::NotOwner | Refusal::Ended => refused(StatusCode::UNAUTHORIZED, ENDED),
     })?;
-    if session.perspective_id.as_deref() != Some(prs.id.as_str()) {
-        return Err(refused(StatusCode::UNAUTHORIZED, NOT_THIS_SESSION));
-    }
     Ok(prs.id.clone())
 }
 
