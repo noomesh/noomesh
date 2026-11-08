@@ -150,9 +150,7 @@ func TestTheActuatorMapsEachLifecycleFailure(t *testing.T) {
 
 func TestTheNodeFactsAreBuiltFromTheConfig(t *testing.T) {
 	dir := t.TempDir()
-	if err := nodepolicy.NewApprovals(dir).Add("rhaddon", gateDigest); err != nil {
-		t.Fatal(err)
-	}
+	approveOnNode(t, dir, "rhaddon", gateDigest)
 	cfg := &config.Config{AddonWorkloadsPolicy: "approve", SelfNode: true, StateDir: dir}
 	nw, facts := newNodeWorkloads(cfg, nil, nil)
 	if nw != nil {
