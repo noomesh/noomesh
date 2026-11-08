@@ -348,7 +348,12 @@ pub fn refuse_mint(
 /// The perspective as `/auth/me` and the start/switch answers show it.
 /// Never `cap_at` (D-2: the cap is not advertised).
 pub fn view(id: &str, dims: &Perspective, started_at: DateTime<Utc>) -> Value {
-    json!({ "id": id, "dims": dims, "started_at": started_at.to_rfc3339() })
+    json!({
+        "id": id,
+        "dims": dims,
+        "started_at": started_at.to_rfc3339(),
+        "cap_at": (started_at + chrono::Duration::hours(i64::from(CAP_HOURS))).to_rfc3339(),
+    })
 }
 
 // ───────────────────────── refusals ─────────────────────────
