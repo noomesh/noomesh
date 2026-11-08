@@ -714,9 +714,10 @@ pub(crate) fn read_repo_acceptance(models_dir: &Path, repo: &str, sha: &str) -> 
     if by.is_empty() || by.len() > 128 || !model_set::rfc3339(&at) {
         return None;
     }
-    let terms = match &v["terms"] {
-        Value::Null => None,
-        Value::Array(a) => {
+    // Unbound = no `terms` key: `parse_strict` refuses a JSON null.
+    let terms = match v.get("terms") {
+        None => None,
+        Some(Value::Array(a)) => {
             let t: Vec<String> = a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
             if t.is_empty() || t.len() != a.len() {
                 return None;
@@ -737,9 +738,11 @@ pub(crate) fn write_repo_acceptance(
     let path = repo_accepted_path(models_dir, repo, sha);
     let dir = path.parent().expect("a file under accepted/").to_path_buf();
     mkdir(&dir)?;
-    let body = serde_json::to_vec_pretty(&json!({
-        "repo": repo, "sha": sha, "by": r.by, "at": r.at, "terms": r.terms,
-    }))
+    let mut doc = json!({"repo": repo, "sha": sha, "by": r.by, "at": r.at});
+    if let Some(t) = &r.terms {
+        doc["terms"] = json!(t);
+    }
+    let body = serde_json::to_vec_pretty(&doc)
     .map_err(|e| StageError::Io(format!("serialising the acceptance: {e}")))?;
     write_atomic(&dir, &format!("{sha}.json"), &body)
 }
@@ -3470,11 +3473,15 @@ mod tests {
         let dir = tmpdir("i576-read");
         write_repo_acceptance(&dir, REPO, SHA, &repo_rec(Some(&["apache-2.0", "MIT"]))).unwrap();
         assert_eq!(read_repo_acceptance(&dir, REPO, SHA), Some(repo_rec(Some(&["apache-2.0", "MIT"]))));
+        write_repo_acceptance(&dir, REPO, SHA, &repo_rec(None)).unwrap();
+        assert_eq!(read_repo_acceptance(&dir, REPO, SHA), Some(repo_rec(None)), "an unbound record reads back unbound");
         let path = repo_accepted_path(&dir, REPO, SHA);
-        let good = json!({"repo": REPO, "sha": SHA, "by": "dave", "at": "2026-11-08T09:00:00Z", "terms": null});
+        // Unbound is no `terms` key at all: the strict parser refuses a null.
+        let good = json!({"repo": REPO, "sha": SHA, "by": "dave", "at": "2026-11-08T09:00:00Z"});
         let mut bad: Vec<Value> = Vec::new();
         for (k, val) in [("by", json!("")), ("at", json!("yesterday")), ("repo", json!("test-org/other")),
-            ("sha", json!("f".repeat(40))), ("terms", json!([])), ("terms", json!(["apache-2.0", 1]))] {
+            ("sha", json!("f".repeat(40))), ("terms", json!([])), ("terms", json!(["apache-2.0", 1])),
+            ("terms", json!("apache-2.0"))] {
             let mut b = good.clone();
             b[k] = val;
             bad.push(b);
