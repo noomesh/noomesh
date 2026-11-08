@@ -637,7 +637,7 @@ pub async fn validate(db: &PgPool, account: &str, dims: &Perspective) -> Result<
         return Err(refused(StatusCode::FORBIDDEN, NEEDS_OPERATOR));
     }
     if let Some(cap) = dims.role_cap {
-        if cap >= live {
+        if cap > Role::Admin {
             return Err(refused(StatusCode::UNPROCESSABLE_ENTITY, CANNOT_WIDEN));
         }
     }
