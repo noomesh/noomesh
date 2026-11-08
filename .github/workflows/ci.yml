@@ -134,6 +134,7 @@ jobs:
       llamacpp: ${{ steps.diff.outputs.llamacpp }}
       ollama: ${{ steps.diff.outputs.ollama }}
       deferred: ${{ steps.diff.outputs.deferred }}
+      defer_tests: ${{ steps.diff.outputs.defer_tests }}
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       with:
@@ -150,6 +151,9 @@ jobs:
         EVENT: ${{ github.event_name }}
         PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
         FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+        # Read by "Defer the required Python suite" below: a fork's PR keeps it.
+        PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        REPO: ${{ github.repository }}
       run: |
         set -eu
         # ── llamacpp: its OWN inputs, on every event ─────────────────────
@@ -318,6 +322,23 @@ jobs:
           echo "pull request into dev — Rust builds deferred to the merge queue (label full-ci to build here)"
         fi
         echo "deferred=$deferred" >> "$GITHUB_OUTPUT"
+        # ── Defer the required Python suite to the merge queue (i585) ────
+        # Operator decision 2026-11-08: the merge queue is the only REQUIRED
+        # test gate on dev. On a same-repo PR into dev without `full-ci`, the
+        # required `test-core` is skipped (a skipped required check is
+        # satisfied, so the enqueue need not wait ~20 min), and the same suite
+        # runs as the non-required `test-core (advisory)`. The queue runs the
+        # required `test-core` in full on the merge group before dev moves.
+        # A fork's PR keeps it (an outside contribution keeps its PR gate),
+        # as do promotion PRs into staging/main, the `full-ci` label, pushes
+        # and merge groups.
+        defer_tests=false
+        if [ "${EVENT:-}" = pull_request ] && [ "${PR_BASE_REF:-}" = dev ] && [ "${FULL_CI:-}" != true ] \
+            && [ -n "${PR_HEAD_REPO:-}" ] && [ "${PR_HEAD_REPO:-}" = "${REPO:-}" ]; then
+          defer_tests=true
+          echo "same-repo pull request into dev — required test-core deferred to the merge queue; test-core (advisory) runs here"
+        fi
+        echo "defer_tests=$defer_tests" >> "$GITHUB_OUTPUT"
         echo "gateway=$gateway" >> "$GITHUB_OUTPUT"
         echo "cli=$cli" >> "$GITHUB_OUTPUT"
         echo "sqlx=$sqlx" >> "$GITHUB_OUTPUT"
@@ -333,11 +354,19 @@ jobs:
   # lists below) and the rest runs. The first run after both repositories go
   # public therefore starts running those tests with no workflow change. The
   # tests that need the licensed add-ons' code live in the add-on repositories.
+  #
+  # The REQUIRED context `test-core` (this job's id; no `name:`, so the
+  # context stays exactly `test-core`). It is skipped only when scope
+  # positively says the PR defers it (a same-repo PR into dev, i585). If scope
+  # itself failed it runs: deferral is never the fallback. `test-core-advisory`
+  # below is this same job by YAML alias (permissions, services, steps), so
+  # the two cannot drift (tests/test_ci_scope_declarations.py holds them
+  # equal).
   test-core:
     runs-on: ubuntu-latest
-    needs: [preflight]
-    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
-    permissions:
+    needs: [preflight, scope]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && !(needs.scope.result == 'success' && needs.scope.outputs.defer_tests == 'true') }}
+    permissions: &test_core_permissions
       contents: read
       # The postgres service image is pulled from the GHCR mirror, which is
       # private until published: reading it needs packages: read.
@@ -347,7 +376,7 @@ jobs:
     # worker's production-layout tests CREATE DATABASE and ROLE, so the DSN
     # must be a superuser. Same mirrored image as sqlx-drift. NO fixed host
     # port: Docker picks one and the DSN reads it from job.services.
-    services:
+    services: &test_core_services
       postgres:
         image: ${{ vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false' && 'pgvector/pgvector:pg18' || format('ghcr.io/{0}/pgvector:pg18', github.repository_owner) }}
         # One expression for the whole mapping: an empty string is falsy in
@@ -364,7 +393,7 @@ jobs:
         options: >-
           --health-cmd pg_isready --health-interval 5s
           --health-timeout 5s --health-retries 10
-    steps:
+    steps: &test_core_steps
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       with:
         persist-credentials: false
@@ -535,6 +564,19 @@ jobs:
         path: coverage.xml
         retention-days: 14
         if-no-files-found: warn
+
+  # The same suite, NOT required, on the PRs that defer the required one
+  # (i585): early feedback that never blocks the enqueue. Everything but the
+  # name and the condition is test-core's own, by YAML alias. Exactly one of
+  # the two runs in any workflow run, so the coverage artifact name is unique.
+  test-core-advisory:
+    name: test-core (advisory)
+    runs-on: ubuntu-latest
+    needs: [preflight, scope]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' && needs.scope.outputs.defer_tests == 'true' }}
+    permissions: *test_core_permissions
+    services: *test_core_services
+    steps: *test_core_steps
 
   # Compiled agents are gated: a commit using a removed Go API must not merge
   # green. These jobs close that gap.
@@ -1692,8 +1734,11 @@ jobs:
     # from a clean tree. GitHub-hosted runner; layers cached in the Actions
     # cache (type=gha, scope ci-build) since there is no persistent builder.
     runs-on: ubuntu-latest
+    # It waits for test-core to pass. On a PR that defers test-core to the
+    # merge queue (i585) test-core is skipped on purpose, and the image still
+    # builds here; anywhere else a skipped test-core stops it, as before.
     needs: [preflight, scope, test-core]
-    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' && needs.test-core.result == 'success' }}
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' && (needs.test-core.result == 'success' || (needs.test-core.result == 'skipped' && needs.scope.outputs.defer_tests == 'true')) }}
 
     # A superseded PR build has no value, so cancel it. Pushes and tags are the
     # integration point and always run to completion.
