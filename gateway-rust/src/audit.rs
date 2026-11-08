@@ -189,6 +189,8 @@ pub(crate) enum AuditKind {
     OrgCreate,
     PeerDeregistered,
     PeerTokenMinted,
+    PerspectiveEnded,
+    PerspectiveStarted,
     PromptSkillPromoted,
     PromptSkillRejected,
     ProvisionBundleStaged,
@@ -325,6 +327,8 @@ impl AuditKind {
             Self::OrgCreate => "org_create",
             Self::PeerDeregistered => "peer_deregistered",
             Self::PeerTokenMinted => "peer_token_minted",
+            Self::PerspectiveEnded => "perspective_ended",
+            Self::PerspectiveStarted => "perspective_started",
             Self::PromptSkillPromoted => "prompt_skill_promoted",
             Self::PromptSkillRejected => "prompt_skill_rejected",
             Self::ProvisionBundleStaged => "provision_bundle_staged",
@@ -462,6 +466,8 @@ impl AuditKind {
             Self::OrgCreate => Severity::Info,
             Self::PeerDeregistered => Severity::Info,
             Self::PeerTokenMinted => Severity::Info,
+            Self::PerspectiveEnded => Severity::Warning,
+            Self::PerspectiveStarted => Severity::Warning,
             Self::PromptSkillPromoted => Severity::Info,
             Self::PromptSkillRejected => Severity::Info,
             Self::ProvisionBundleStaged => Severity::Warning,
@@ -596,6 +602,8 @@ impl AuditKind {
             "org_create" => Self::OrgCreate,
             "peer_deregistered" => Self::PeerDeregistered,
             "peer_token_minted" => Self::PeerTokenMinted,
+            "perspective_ended" => Self::PerspectiveEnded,
+            "perspective_started" => Self::PerspectiveStarted,
             "prompt_skill_promoted" => Self::PromptSkillPromoted,
             "prompt_skill_rejected" => Self::PromptSkillRejected,
             "provision_bundle_staged" => Self::ProvisionBundleStaged,
@@ -731,6 +739,8 @@ impl AuditKind {
             Self::OrgCreate,
             Self::PeerDeregistered,
             Self::PeerTokenMinted,
+            Self::PerspectiveEnded,
+            Self::PerspectiveStarted,
             Self::PromptSkillPromoted,
             Self::PromptSkillRejected,
             Self::ProvisionBundleStaged,
@@ -1248,6 +1258,8 @@ mod tests {
         "org_create",
         "peer_deregistered",
         "peer_token_minted",
+        "perspective_ended",
+        "perspective_started",
         "prompt_skill_promoted",
         "prompt_skill_rejected",
         "provision_bundle_staged",
@@ -1326,7 +1338,7 @@ mod tests {
         let mut want: Vec<String> = PINNED.iter().map(|s| s.to_string()).collect();
         want.sort();
         assert_eq!(got, want, "a kind was renamed, added or dropped: edit PINNED on purpose");
-        assert_eq!(PINNED.len(), 127);
+        assert_eq!(PINNED.len(), 129);
     }
 
     #[test]

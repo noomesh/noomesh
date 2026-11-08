@@ -11231,6 +11231,62 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/auth/perspective": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Update perspective
+         * @description [native] PUT /api/auth/perspective — switch to another perspective in one transaction; an all-unchanged body is Back to me. Authorized on the row, validated against the LIVE role.
+         */
+        put: operations["perspective_switch"];
+        /**
+         * Create perspective
+         * @description [native] POST /api/auth/perspective — an operator narrows their own session to a perspective `{role_cap?, addons?, core_only?}`. 200 with a perspective token; 403 `perspective_needs_operator`, 409 `perspective_active`, 422 `perspective_cannot_widen` / `perspective_unknown_addon` / `perspective_no_change` / `perspective_invalid`.
+         */
+        post: operations["perspective_start"];
+        /**
+         * Delete perspective
+         * @description [native] DELETE /api/auth/perspective — Back to me: end the session's perspective and answer a real access token. Authorized on the row, never on the token's role, so a `user` view can always go back.
+         */
+        delete: operations["perspective_back"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/perspective": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Update perspective
+         * @description [native] PUT /api/auth/perspective — switch to another perspective in one transaction; an all-unchanged body is Back to me. Authorized on the row, validated against the LIVE role.
+         */
+        put: operations["auth_perspective_switch"];
+        /**
+         * Create perspective
+         * @description [native] POST /api/auth/perspective — an operator narrows their own session to a perspective `{role_cap?, addons?, core_only?}`. 200 with a perspective token; 403 `perspective_needs_operator`, 409 `perspective_active`, 422 `perspective_cannot_widen` / `perspective_unknown_addon` / `perspective_no_change` / `perspective_invalid`.
+         */
+        post: operations["auth_perspective_start"];
+        /**
+         * Delete perspective
+         * @description [native] DELETE /api/auth/perspective — Back to me: end the session's perspective and answer a real access token. Authorized on the row, never on the token's role, so a `user` view can always go back.
+         */
+        delete: operations["auth_perspective_back"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -26965,6 +27021,162 @@ export interface operations {
         };
     };
     display: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    perspective_switch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    perspective_start: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    perspective_back: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    auth_perspective_switch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    auth_perspective_start: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    auth_perspective_back: {
         parameters: {
             query?: never;
             header?: never;

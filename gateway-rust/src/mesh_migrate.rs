@@ -2332,6 +2332,36 @@ ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS display jsonb;
 ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS display_set_by text;
 ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS display_set_at timestamptz
 "#,
+}, Migration {
+    revision: PERSPECTIVES_REVISION,
+    down_revision: Some(SEAT_DISPLAY_REVISION),
+    // i538 P1 "View as": an operator narrows their own session to a
+    // perspective. One row per perspective, tied to the session by
+    // `perspective_id` on the live refresh row. `cap_at` is the unadvertised
+    // 12 h safety net. Additive: a new table and one nullable column, which
+    // an older gateway ignores.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_perspectives (
+    id uuid PRIMARY KEY,
+    account text NOT NULL,
+    refresh_family uuid NOT NULL,
+    dims jsonb NOT NULL,
+    started_at timestamptz NOT NULL DEFAULT now(),
+    cap_at timestamptz NOT NULL,
+    ended_at timestamptz,
+    end_reason text,
+    switched_from uuid,
+    CONSTRAINT noo_perspectives_reason CHECK (end_reason IS NULL OR end_reason IN ('back_to_me', 'switched', 'logout', 'family_revoked', 'cap'))
+);
+CREATE INDEX IF NOT EXISTS noo_perspectives_live_idx ON noo_perspectives (account) WHERE ended_at IS NULL;
+ALTER TABLE noo_refresh_tokens ADD COLUMN IF NOT EXISTS perspective_id uuid;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'noo_app') THEN
+        GRANT SELECT, INSERT, UPDATE ON noo_perspectives TO noo_app;
+    END IF;
+END $$;
+"#,
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
@@ -2364,6 +2394,11 @@ pub const SEAT_BINDING_REVISION: &str = "112_seat_binding";
 /// Display settings the controller sets for a kiosk seat (i510 c1). A
 /// constant so a renumber at rebase is one line.
 pub const SEAT_DISPLAY_REVISION: &str = "113_seat_display";
+
+/// "View as" perspectives (i538 P1): the `noo_perspectives` table and
+/// `perspective_id` on refresh rows, on seat display (113). A constant so a
+/// renumber at rebase is one line.
+pub const PERSPECTIVES_REVISION: &str = "114_perspectives";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
@@ -3940,17 +3975,40 @@ mod seat_binding_migration_tests {
 mod seat_display_migration_tests {
     use super::*;
 
-    /// i510 c1: the seat-display revision is the chain head, sits on seat
-    /// binding, and only adds nullable columns.
+    /// i510 c1: the seat-display revision sits on seat binding, and only
+    /// adds nullable columns.
     #[test]
-    fn seat_display_revision_is_the_head_and_additive() {
+    fn seat_display_revision_sits_on_seat_binding_and_is_additive() {
         let m = MIGRATIONS.iter().find(|m| m.revision == SEAT_DISPLAY_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "113_seat_display");
         assert_eq!(m.down_revision, Some(SEAT_BINDING_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(SEAT_DISPLAY_REVISION), "the chain head");
         for col in ["display jsonb", "display_set_by text", "display_set_at timestamptz"] {
             assert!(m.sql.contains(&format!("ADD COLUMN IF NOT EXISTS {col}")), "{col}");
         }
         assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE") && !m.sql.contains("DROP"));
+    }
+}
+
+#[cfg(test)]
+mod perspectives_migration_tests {
+    use super::*;
+
+    /// i538 P1: the perspectives revision is the chain head, sits on seat
+    /// display, and only adds: a new table, a partial index, one nullable
+    /// column on the refresh rows, and the app role's grant.
+    #[test]
+    fn perspectives_revision_is_the_head_and_additive() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == PERSPECTIVES_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "114_perspectives");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(SEAT_DISPLAY_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(PERSPECTIVES_REVISION), "the chain head");
+        assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_perspectives"));
+        assert!(m.sql.contains("cap_at timestamptz NOT NULL"));
+        assert!(m.sql.contains("ALTER TABLE noo_refresh_tokens ADD COLUMN IF NOT EXISTS perspective_id uuid"));
+        for reason in ["'back_to_me'", "'switched'", "'logout'", "'family_revoked'", "'cap'"] {
+            assert!(m.sql.contains(reason), "{reason}");
+        }
+        assert!(!m.sql.contains("DELETE") && !m.sql.contains("DROP") && !m.sql.contains("UPDATE noo_"));
     }
 }
