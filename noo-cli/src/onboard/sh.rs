@@ -575,6 +575,25 @@ impl ComposeTally {
         !progress || loud
     }
 
+    /// The one live line for a run in progress: containers up of those
+    /// seen, the failed ones, or the layers pulled before any container.
+    pub fn live_status(&self) -> String {
+        let total = self.containers.len();
+        if total == 0 {
+            if self.layers.is_empty() {
+                return "starting the stack".to_string();
+            }
+            let done = self.layers.values().filter(|p| **p).count();
+            return format!("pulling images: {} layers seen ({done} already present)", self.layers.len());
+        }
+        let mut s = format!("containers: {} of {total} up", self.count(ContainerEnd::Started));
+        let failed = self.failed();
+        if failed > 0 {
+            s.push_str(&format!(", {failed} failed"));
+        }
+        s
+    }
+
     /// Containers whose last state was a failure.
     pub fn failed(&self) -> usize {
         self.count(ContainerEnd::Failed)
@@ -672,11 +691,48 @@ pub fn failure_tail(ok: bool, tail: &[String], rerun: &str) -> Vec<String> {
     out
 }
 
+/// Where a folded run's output goes ([`run_folded`]).
+pub trait FoldSink {
+    /// A line the tally did not absorb: it reaches the operator verbatim, on
+    /// the stream it came from.
+    fn line(&mut self, is_err: bool, line: &str);
+    /// The tally absorbed a progress line, or no line arrived for the run's
+    /// interval: `tally` is the progress so far.
+    fn progress(&mut self, tally: &ComposeTally, idle: bool);
+}
+
+/// The onboard console's sink: passthrough lines printed as they come, and a
+/// muted line every 30 s of silence to say it is alive.
+struct PlainSink;
+
+impl FoldSink for PlainSink {
+    fn line(&mut self, is_err: bool, line: &str) {
+        if is_err {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    }
+    fn progress(&mut self, _tally: &ComposeTally, idle: bool) {
+        if idle {
+            println!("  {}", crate::ui::muted("still working (pulling or starting containers; --verbose shows each line)"));
+        }
+    }
+}
+
 /// Run `cmd` with its output piped: passthrough lines are printed live on the
 /// stream they came from, progress lines are only counted. A muted line every
 /// 30 s of silence says it is alive. Returns the exit status, the tally, and
 /// the last lines unfiltered ([`Summarised`]).
-pub fn run_summarised(mut cmd: Command) -> std::io::Result<Summarised> {
+pub fn run_summarised(cmd: Command) -> std::io::Result<Summarised> {
+    run_folded(cmd, Duration::from_secs(30), &mut PlainSink)
+}
+
+/// [`run_summarised`] with the output handed to `sink`: every line is fed to
+/// one [`ComposeTally`]; what it does not absorb goes to `sink.line`, and
+/// `sink.progress` hears each absorbed line and each `every` of silence.
+/// `noo stack start`'s live status line is the other sink (i570).
+pub fn run_folded(mut cmd: Command, every: Duration, sink: &mut dyn FoldSink) -> std::io::Result<Summarised> {
     use std::io::BufRead as _;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
@@ -706,23 +762,19 @@ pub fn run_summarised(mut cmd: Command) -> std::io::Result<Summarised> {
     let mut tally = ComposeTally::default();
     let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::with_capacity(SUMMARY_TAIL_LINES);
     loop {
-        match rx.recv_timeout(Duration::from_secs(30)) {
+        match rx.recv_timeout(every) {
             Ok((is_err, line)) => {
                 if tail.len() == SUMMARY_TAIL_LINES {
                     tail.pop_front();
                 }
                 tail.push_back(line.clone());
                 if tally.feed(&line) {
-                    if is_err {
-                        eprintln!("{line}");
-                    } else {
-                        println!("{line}");
-                    }
+                    sink.line(is_err, &line);
+                } else {
+                    sink.progress(&tally, false);
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                println!("  {}", crate::ui::muted("still working (pulling or starting containers; --verbose shows each line)"));
-            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => sink.progress(&tally, true),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }

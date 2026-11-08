@@ -360,7 +360,12 @@ between units the reader needs air.
   and summarised (`✓ 12 images pulled in 29s`), or shown under a muted
   `output` label indented two spaces. Never interleaved bare. Docker
   compose's own progress renderer is the one exception: it is
-  interactive, self-erasing and familiar, so it is left as is.
+  interactive, self-erasing and familiar, so it is left as is. When the
+  launcher pipes compose (its `up` is teed to find a stuck container),
+  compose prints a plain line per container and state instead; on a
+  terminal `noo stack start|restart` folds those into one live line
+  (`onboard::sh::run_folded` with `ComposeTally`), printing every other
+  line verbatim above it. `--verbose`, a pipe or a log keeps every line.
 - **Launchers follow the guide.** The bash launchers under `scripts/`
   (`noomesh-start/stop/restart/rebuild/clean`) source `scripts/lib-ui.sh`,
   which mirrors the glyphs, colours and mode rules (`NO_COLOR`, TTY). No
