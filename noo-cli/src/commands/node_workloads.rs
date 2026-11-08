@@ -364,14 +364,17 @@ fn agent_account() -> Option<(u32, u32)> {
     Some(unsafe { ((*pw).pw_uid, (*pw).pw_gid) })
 }
 
-fn need_root(g: &Globals, verb: &str) {
+/// `command` is the whole command in backticks, spelled out at each call
+/// site: the hint lint checks every suggested command, and cannot resolve a
+/// template.
+fn need_root(g: &Globals, command: &str) {
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
         output::fail(
             g.json,
             ExitCode::Generic,
             "needs_root",
-            &format!("`noo node workloads {verb}` changes this node's consent store, which only root and the node agent may write"),
+            &format!("{command} changes this node's consent store, which only root and the node agent may write"),
             Some("run it on the node with sudo"),
         );
     }
@@ -409,7 +412,7 @@ fn store_fail(g: &Globals, why: &str) -> ! {
 pub fn node_workloads_approve(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let (addon, digest) = pair(args)?;
     let a = request_or_fail(g, &addon, &digest);
-    need_root(g, "approve");
+    need_root(g, "`noo node workloads approve`");
     let agent = agent_or_fail(g);
     let dir = state_dir();
     let added = approve_at(&dir, a, Some(agent)).unwrap_or_else(|why| store_fail(g, &why));
@@ -434,7 +437,7 @@ pub fn node_workloads_approve(g: &Globals, args: &[String]) -> Result<i32, Unhan
 pub fn node_workloads_revoke(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let (addon, digest) = pair(args)?;
     let a = request_or_fail(g, &addon, &digest);
-    need_root(g, "revoke");
+    need_root(g, "`noo node workloads revoke`");
     let agent = agent_or_fail(g);
     let removed = revoke_at(&state_dir(), &a, Some(agent)).unwrap_or_else(|why| store_fail(g, &why));
     if !removed {
