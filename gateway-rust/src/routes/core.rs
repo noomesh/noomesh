@@ -1096,7 +1096,7 @@ async fn rotate_refresh(
     // A perspective past its cap, or whose dimensions this gateway cannot
     // read, ends now, after the commit, on the pool (never while this
     // rotation holds its connection).
-    if let crate::perspective::Carry::End(id, reason) = &carry {
+    if let crate::perspective::Carry::End(id, reason @ crate::perspective::EndReason::Cap) = &carry {
         if let Err(e) = crate::perspective::end(db, id, *reason).await {
             tracing::warn!(perspective = %id, error = %e, "perspective could not be ended at refresh");
         }
