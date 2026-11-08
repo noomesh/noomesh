@@ -409,33 +409,33 @@ mod tests {
     fn voice_args(extra: &[&str]) -> Vec<String> {
         let mut v = vec![
             "--profile", "int8",
-            "--set", "main=personaplex-7b-v1@fdaf4090a61cb315c138a1faee287ffd6c716309",
-            "--set", "voices=personaplex-voices@fdaf4090a61cb315c138a1faee287ffd6c716309",
-            "--env", "PAI_VOICE_SLOTS=1",
-            "--env", "PAI_VOICE_QUANTIZATION=int8",
-            "--env", "PAI_VOICE_CPU_OFFLOAD=false",
+            "--set", "main=rh-main-v1@fdaf4090a61cb315c138a1faee287ffd6c716309",
+            "--set", "voices=rh-voices@fdaf4090a61cb315c138a1faee287ffd6c716309",
+            "--env", "RH_SLOTS=1",
+            "--env", "RH_QUANTIZATION=int8",
+            "--env", "RH_CPU_OFFLOAD=false",
         ];
         v.extend_from_slice(extra);
-        v.extend_from_slice(&["awolf", "pai-voice/native-voice"]);
+        v.extend_from_slice(&["awolf", "rhaddon/native-voice"]);
         a(&v)
     }
 
     #[test]
     fn place_builds_exactly_the_put_body_for_the_voice_placement() {
         let p = parse_place(&voice_args(&[])).expect("parses");
-        assert_eq!((p.node.as_str(), p.addon.as_str(), p.workload.as_str()), ("awolf", "pai-voice", "native-voice"));
+        assert_eq!((p.node.as_str(), p.addon.as_str(), p.workload.as_str()), ("awolf", "rhaddon", "native-voice"));
         assert_eq!(
             place_body(&p),
             json!({
                 "profile": "int8",
                 "sets": {
-                    "main": [{"id": "personaplex-7b-v1", "revision": REV}],
-                    "voices": [{"id": "personaplex-voices", "revision": REV}],
+                    "main": [{"id": "rh-main-v1", "revision": REV}],
+                    "voices": [{"id": "rh-voices", "revision": REV}],
                 },
                 "env": {
-                    "PAI_VOICE_SLOTS": "1",
-                    "PAI_VOICE_QUANTIZATION": "int8",
-                    "PAI_VOICE_CPU_OFFLOAD": "false",
+                    "RH_SLOTS": "1",
+                    "RH_QUANTIZATION": "int8",
+                    "RH_CPU_OFFLOAD": "false",
                 },
                 "on_controller": false,
             })
@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn the_workload_ref_needs_exactly_one_slash_and_two_names() {
-        assert_eq!(parse_workload_ref("pai-voice/native-voice"), Ok(("pai-voice".to_string(), "native-voice".to_string())));
+        assert_eq!(parse_workload_ref("rhaddon/native-voice"), Ok(("rhaddon".to_string(), "native-voice".to_string())));
         for bad in ["voice", "a/b/c", "/b", "a/", "/", "", "../b", "a/.."] {
             assert!(parse_workload_ref(bad).is_err(), "{bad:?} must be refused");
         }
@@ -498,8 +498,8 @@ mod tests {
     #[test]
     fn the_path_percent_encodes_every_segment() {
         assert_eq!(
-            placement_path("awolf", "pai-voice", "native-voice"),
-            "/api/cluster/nodes/awolf/node-workloads/pai-voice/native-voice"
+            placement_path("awolf", "rhaddon", "native-voice"),
+            "/api/cluster/nodes/awolf/node-workloads/rhaddon/native-voice"
         );
         let p = placement_path("a/b", "x?y", "w z");
         assert_eq!(p, "/api/cluster/nodes/a%2Fb/node-workloads/x%3Fy/w%20z");
@@ -522,34 +522,34 @@ mod tests {
 
     #[test]
     fn the_approve_hint_appears_for_consent_codes_only() {
-        let detail = "pai-voice at sha256:0123abcdef9876 is not approved on the node";
-        let hint = approve_hint("consent_unapproved", "awolf", "pai-voice", detail).expect("hint");
-        assert_eq!(hint, "on awolf, run: sudo noo node workloads approve pai-voice sha256:0123abcdef9876");
+        let detail = "rhaddon at sha256:0123abcdef9876 is not approved on the node";
+        let hint = approve_hint("consent_unapproved", "awolf", "rhaddon", detail).expect("hint");
+        assert_eq!(hint, "on awolf, run: sudo noo node workloads approve rhaddon sha256:0123abcdef9876");
         assert!(!hint.starts_with("noo ") && !hint.contains('`'), "plain prose, outside the hint lint");
-        let bare = approve_hint("consent_unapproved", "awolf", "pai-voice", "no approval recorded").expect("hint");
-        assert!(bare.ends_with("approve pai-voice <digest>"), "{bare}");
-        let none = approve_hint("consent_none", "awolf", "pai-voice", "this node's addon_workloads_policy is none").expect("hint");
-        assert!(none.contains("NOO_ADDON_WORKLOADS=none") && !none.contains("approve pai-voice"), "{none}");
-        let old = approve_hint("consent_none", "awolf", "pai-voice", "the node does not report its addon_workloads_policy").expect("hint");
+        let bare = approve_hint("consent_unapproved", "awolf", "rhaddon", "no approval recorded").expect("hint");
+        assert!(bare.ends_with("approve rhaddon <digest>"), "{bare}");
+        let none = approve_hint("consent_none", "awolf", "rhaddon", "this node's addon_workloads_policy is none").expect("hint");
+        assert!(none.contains("NOO_ADDON_WORKLOADS=none") && !none.contains("approve rhaddon"), "{none}");
+        let old = approve_hint("consent_none", "awolf", "rhaddon", "the node does not report its addon_workloads_policy").expect("hint");
         assert!(old.contains("roll it") && !old.contains("NOO_ADDON_WORKLOADS=none"), "{old}");
         for other in ["gpu_too_small", "not_found", "bad_sets", "image_missing", ""] {
-            assert_eq!(approve_hint(other, "awolf", "pai-voice", detail), None, "{other:?}");
+            assert_eq!(approve_hint(other, "awolf", "rhaddon", detail), None, "{other:?}");
         }
     }
 
     #[test]
     fn a_placed_summary_names_state_image_and_a_short_digest() {
         let resp = json!({
-            "node_id": "awolf", "addon": "pai-voice", "workload": "native-voice", "state": "provisioned",
+            "node_id": "awolf", "addon": "rhaddon", "workload": "native-voice", "state": "provisioned",
             "image": {"name": "ghcr.io/x/voice:1", "digest": "sha256:0123456789abcdef0123456789abcdef", "id": "i", "artifact": "a"},
         });
         assert_eq!(
             format_placed(&resp),
-            "pai-voice/native-voice: placed on awolf — provisioned, image ghcr.io/x/voice:1 sha256:0123456789ab"
+            "rhaddon/native-voice: placed on awolf — provisioned, image ghcr.io/x/voice:1 sha256:0123456789ab"
         );
         assert_eq!(
-            format_unplaced(&json!({"node_id": "awolf", "addon": "pai-voice", "workload": "native-voice", "removed": true})),
-            "pai-voice/native-voice: unplaced from awolf"
+            format_unplaced(&json!({"node_id": "awolf", "addon": "rhaddon", "workload": "native-voice", "removed": true})),
+            "rhaddon/native-voice: unplaced from awolf"
         );
     }
 
@@ -557,7 +557,7 @@ mod tests {
         json!({
             "node_id": "awolf",
             "node_workloads": [
-                {"addon": "pai-voice", "workload": "native-voice", "profile": "int8",
+                {"addon": "rhaddon", "workload": "native-voice", "profile": "int8",
                  "sets": {"main": [{"id": "m", "revision": "r"}]}, "env": {}, "on_controller": false,
                  "state": "provisioned", "reservation": null},
                 {"addon": "pai-image", "workload": "sdxl", "profile": null,
@@ -570,18 +570,18 @@ mod tests {
     fn show_filters_the_list_to_the_named_workload_or_lists_all() {
         let all = select_workloads(&listing(), None);
         assert_eq!(all.len(), 2);
-        let one = select_workloads(&listing(), Some(("pai-voice", "native-voice")));
+        let one = select_workloads(&listing(), Some(("rhaddon", "native-voice")));
         assert_eq!(one.len(), 1);
         assert_eq!(one[0]["workload"], json!("native-voice"));
-        assert!(select_workloads(&listing(), Some(("pai-voice", "sdxl"))).is_empty());
+        assert!(select_workloads(&listing(), Some(("rhaddon", "sdxl"))).is_empty());
         assert!(select_workloads(&json!({}), None).is_empty());
         assert_eq!(
             workload_row(&one[0]),
-            vec!["pai-voice/native-voice", "provisioned", "int8", "main=m@r", "no"]
+            vec!["rhaddon/native-voice", "provisioned", "int8", "main=m@r", "no"]
         );
         assert_eq!(workload_row(&all[1])[2], "-");
         assert_eq!(workload_row(&all[1])[3], "-");
-        assert_eq!(parse_show(&a(&["awolf", "pai-voice/native-voice"])), Ok(("awolf".to_string(), Some(("pai-voice".to_string(), "native-voice".to_string())))));
+        assert_eq!(parse_show(&a(&["awolf", "rhaddon/native-voice"])), Ok(("awolf".to_string(), Some(("rhaddon".to_string(), "native-voice".to_string())))));
         assert_eq!(parse_show(&a(&["awolf"])), Ok(("awolf".to_string(), None)));
     }
 }
