@@ -412,7 +412,7 @@ fn store_fail(g: &Globals, why: &str) -> ! {
 pub fn node_workloads_approve(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let (addon, digest) = pair(args)?;
     let a = request_or_fail(g, &addon, &digest);
-    need_root(g, "`noo node workloads approve`");
+    need_root(g, "`noo node workloads approve <addon> <digest>`");
     let agent = agent_or_fail(g);
     let dir = state_dir();
     let added = approve_at(&dir, a, Some(agent)).unwrap_or_else(|why| store_fail(g, &why));
@@ -437,7 +437,7 @@ pub fn node_workloads_approve(g: &Globals, args: &[String]) -> Result<i32, Unhan
 pub fn node_workloads_revoke(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let (addon, digest) = pair(args)?;
     let a = request_or_fail(g, &addon, &digest);
-    need_root(g, "`noo node workloads revoke`");
+    need_root(g, "`noo node workloads revoke <addon> <digest>`");
     let agent = agent_or_fail(g);
     let removed = revoke_at(&state_dir(), &a, Some(agent)).unwrap_or_else(|why| store_fail(g, &why));
     if !removed {
