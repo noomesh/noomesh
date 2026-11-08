@@ -108,7 +108,7 @@ pub mod users;
 /// every run (i545 finding 63).
 pub async fn relations_exist(db: impl sqlx::PgExecutor<'_>, names: &[&str]) -> Result<bool, sqlx::Error> {
     let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
-    let all: Option<bool> = sqlx::query_scalar("SELECT bool_and(to_regclass(n) IS NOT NULL) FROM unnest($1::text[]) AS n")
+    let all: Option<bool> = sqlx::query_scalar("SELECT bool_or(to_regclass(n) IS NOT NULL) FROM unnest($1::text[]) AS n")
         .bind(&names)
         .fetch_one(db)
         .await?;
