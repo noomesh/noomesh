@@ -816,7 +816,7 @@ pub async fn carried(
     };
     let row = crate::repo::perspectives::carried(&mut *conn, id).await?;
     Ok(match row {
-        Some((owner, ended, past_cap, dims)) if owner == account && !ended => {
+        Some((owner, _ended, past_cap, dims)) if owner == account => {
             if past_cap {
                 Carry::End(id.to_string(), EndReason::Cap)
             } else {
