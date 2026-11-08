@@ -105,7 +105,8 @@ func chooseBackendImage(backend string, spec BackendSpec, override string) (back
 		// rail for a tar named after it, which never exists, and refused a
 		// staged image (aserve, robopi: ollama, 0.6.17 and 0.6.18).
 		tagRef, digest := splitDigest(ref)
-		return backendImageChoice{Ref: tagRef, Pin: digest, RailOnly: ref != ""}, nil
+		_ = digest
+		return backendImageChoice{Ref: tagRef, RailOnly: ref != ""}, nil
 	}
 	if isFloatingRef(ref) {
 		return backendImageChoice{}, fmt.Errorf(
