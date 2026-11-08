@@ -287,6 +287,9 @@ pub(crate) struct RepinSecrets {
     pub key_missing: Option<String>,
 }
 
+/// Mints the named store keys that are absent; returns the names minted.
+pub(crate) type RepinMinter<'a> = dyn FnMut(&[&str]) -> Result<Vec<String>, String> + 'a;
+
 /// After `noo addons upgrade` or `noo upgrade` pins an add-on's bundle: mint
 /// the shared secrets it declares that the store lacks, as the enable does.
 /// An add-on's 0.2.0 release added a `shared_secret` resource; the upgrade pinned it, minted
@@ -296,7 +299,7 @@ pub(crate) struct RepinSecrets {
 pub(crate) fn reconcile_repin_secrets(
     needs: &StoreNeeds,
     present: &dyn Fn(&str) -> bool,
-    mint: &mut dyn FnMut(&[&str]) -> Result<Vec<String>, String>,
+    mint: &mut RepinMinter<'_>,
 ) -> Result<RepinSecrets, String> {
     let absent: Vec<&str> = needs.shared.iter().map(String::as_str).filter(|k| !present(k)).collect();
     let minted = if absent.is_empty() { Vec::new() } else { mint(&absent)? };
