@@ -1346,7 +1346,7 @@ fn me_answer(u: &UserRecord, seen: Option<(&crate::perspective::PrsClaim, chrono
             json!({
                 "username": u.username,
                 "disabled": u.disabled,
-                "scopes": role.legacy_scopes(),
+                "scopes": u.scopes,
                 "role": role.as_str(),
                 "perspective": crate::perspective::view(&prs.id, &prs.dims, started_at),
             })
