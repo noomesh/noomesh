@@ -33,6 +33,18 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/auth/logout", post(auth_logout_handler))
         .route("/api/auth/logout", post(auth_logout_handler))
         .route("/auth/me", get(auth_me))
+        // i538 "View as": start (POST), switch (PUT), back to me (DELETE).
+        // Under the auth prefix because the session is named by the
+        // HttpOnly refresh cookie (`Path=/api/auth`), never by a body field;
+        // handler-authenticated like `/auth/me`.
+        .route(
+            "/auth/perspective",
+            post(perspective_start).put(perspective_switch).delete(perspective_back),
+        )
+        .route(
+            "/api/auth/perspective",
+            post(perspective_start).put(perspective_switch).delete(perspective_back),
+        )
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -80,15 +92,40 @@ enum TokenIssueError {
 }
 
 fn issue_access_token(user: &UserRecord) -> Result<(String, i64), TokenIssueError> {
+    session_token(&user.username, user.role, dual_emit_scopes(user.role, &user.scopes), None)
+}
+
+/// A "View as" session token (i538): the same TTL, claims and signing as
+/// [`issue_access_token`], at the NARROWED role, with the scopes that role
+/// alone expands to (a perspective drops the additive extras too), and the
+/// signed `prs` claim naming the perspective row. `role` is always computed
+/// by the caller from the account's LIVE role, min'd with the cap.
+fn issue_perspective_token(
+    username: &str,
+    role: crate::auth::Role,
+    prs: &crate::perspective::PrsClaim,
+) -> Result<(String, i64), TokenIssueError> {
+    let scopes: Vec<String> = role.legacy_scopes().iter().map(|s| s.to_string()).collect();
+    session_token(username, role, scopes, Some(prs))
+}
+
+/// The one person-session token mint behind [`issue_access_token`] and
+/// [`issue_perspective_token`].
+fn session_token(
+    username: &str,
+    role: crate::auth::Role,
+    scopes: Vec<String>,
+    prs: Option<&crate::perspective::PrsClaim>,
+) -> Result<(String, i64), TokenIssueError> {
     let expire_minutes = token_expire_minutes();
     let now = chrono::Utc::now();
     let expire_secs = expire_minutes * 60;
     let exp = now + chrono::TimeDelta::seconds(expire_secs);
 
-    let claims = serde_json::json!({
-        "sub": user.username,
-        "role": user.role.as_str(),
-        "scopes": dual_emit_scopes(user.role, &user.scopes),
+    let mut claims = serde_json::json!({
+        "sub": username,
+        "role": role.as_str(),
+        "scopes": scopes,
         "exp": exp.timestamp(),
         "iat": now.timestamp(),
         // Millisecond mint time: the session floor (`session_floor.rs`) is in
@@ -99,6 +136,9 @@ fn issue_access_token(user: &UserRecord) -> Result<(String, i64), TokenIssueErro
         "iss": crate::auth::JWT_ISSUER,
         "aud": crate::auth::JWT_AUDIENCE,
     });
+    if let Some(p) = prs {
+        claims["prs"] = serde_json::json!(p);
+    }
 
     let secret = jwt_secret();
     // the middleware has refused bearer JWTs signed with the insecure
@@ -631,6 +671,7 @@ async fn issue_login(state: &AppState, user: &UserRecord, ua: Option<&str>, ip: 
         ua,
         ip,
         None, // fresh login, no rotation chain
+        None, // and no perspective
     )
     .await;
     if let Err(e) = &stored {
@@ -990,6 +1031,29 @@ async fn rotate_refresh(
         }
     };
 
+    // i538 "View as": the claimed row's perspective, read on THIS connection.
+    // A live one is inherited by the child row and the access token is the
+    // perspective token, narrowed from the account's live role; an ended one,
+    // or one past its cap, leaves a real token and a clean child. Minted
+    // before the commit, so an unmintable token still spends nothing.
+    let carry = match crate::perspective::carried(&mut tx, claimed.perspective_id.as_deref(), &user.username).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "refresh_perspective_read_failed");
+            return Rotation::Failed("Refresh rotation failed");
+        }
+    };
+    let (access_token, expires_in, inherit) = match &carry {
+        crate::perspective::Carry::Live(prs) => {
+            let role = crate::perspective::narrow_role(user.role, &prs.dims);
+            match issue_perspective_token(&user.username, role, prs) {
+                Ok((t, e)) => (t, e, Some(prs.id.clone())),
+                Err(e) => return Rotation::Issue(e),
+            }
+        }
+        crate::perspective::Carry::Real | crate::perspective::Carry::PastCap(_) => (access_token, expires_in, None),
+    };
+
     let new_raw = auth_refresh::generate_raw_token();
     let new_expires =
         chrono::Utc::now() + chrono::TimeDelta::days(auth_refresh::refresh_ttl_days());
@@ -1001,6 +1065,7 @@ async fn rotate_refresh(
         ua,
         ip,
         Some(claimed.id.clone()),
+        inherit,
     )
     .await
     {
@@ -1013,6 +1078,14 @@ async fn rotate_refresh(
     if let Err(e) = tx.commit().await {
         tracing::error!(error = %e, "refresh_rotate_commit_failed");
         return Rotation::Failed("Refresh rotation failed");
+    }
+
+    // A perspective found past its cap ends now, after the commit, on the
+    // pool (never while this rotation holds its connection).
+    if let crate::perspective::Carry::PastCap(id) = &carry {
+        if let Err(e) = crate::perspective::end(db, id, crate::perspective::EndReason::Cap).await {
+            tracing::warn!(perspective = %id, error = %e, "perspective past its cap could not be ended");
+        }
     }
 
     Rotation::Rotated { access_token, expires_in, new_raw }
@@ -1104,6 +1177,10 @@ async fn auth_logout_handler(
     if let Some(c) = jar.get(auth_refresh::REFRESH_COOKIE_NAME) {
         let raw = c.value().to_string();
         if let Ok(Some(rec)) = auth_refresh::lookup_token(&state.db, &raw).await {
+            // i538: a perspective lives on the session, so logout ends it.
+            if let Some(pid) = rec.perspective_id.as_deref() {
+                let _ = crate::perspective::end(&state.db, pid, crate::perspective::EndReason::Logout).await;
+            }
             let _ = auth_refresh::revoke_token(&state.db, &rec.id).await;
             audit_auth(&state.db, crate::audit::AuditKind::AuthLogout, &rec.user_id, "ok", None).await;
             account = Some(rec.user_id);
@@ -1118,6 +1195,9 @@ async fn auth_logout_handler(
                 .and_then(|v| v.strip_prefix("Bearer "))
                 .map(|t| verify_token(t, &secret))
             {
+                if let Some(prs) = claims.prs.as_ref() {
+                    let _ = crate::perspective::end(&state.db, &prs.id, crate::perspective::EndReason::Logout).await;
+                }
                 audit_auth(&state.db, crate::audit::AuditKind::AuthLogout, crate::auth::account_of(&claims.sub), "ok", None).await;
                 account = Some(crate::auth::account_of(&claims.sub).to_string());
             }
@@ -1210,12 +1290,16 @@ async fn auth_me(
 
     match user {
         Some(u) if !u.disabled => {
-            Json(json!({
-                "username": u.username,
-                "disabled": u.disabled,
-                "scopes": u.scopes,
-                "role": u.role.as_str(),
-            })).into_response()
+            // i538: a perspective token is answered as the perspective, from
+            // the LIVE role, and only while its row is live.
+            let seen = match claims.prs.as_ref() {
+                None => None,
+                Some(prs) => match crate::perspective::admit(&state.db, &claims.sub, prs).await {
+                    Ok(started_at) => Some((prs, started_at)),
+                    Err(why) => return crate::perspective::refusal_response(why),
+                },
+            };
+            Json(me_answer(&u, seen)).into_response()
         }
         Some(_) => {
             (StatusCode::UNAUTHORIZED,
@@ -1230,6 +1314,188 @@ async fn auth_me(
         }
     }
 }
+
+/// The `/auth/me` body. Without a perspective it is the account as stored.
+/// Under one, `role` is the narrowed role (from the live role), `scopes` are
+/// what that role expands to, and `perspective` names it — `{id, dims,
+/// started_at}`, never `cap_at`.
+fn me_answer(u: &UserRecord, seen: Option<(&crate::perspective::PrsClaim, chrono::DateTime<chrono::Utc>)>) -> Value {
+    match seen {
+        None => json!({
+            "username": u.username,
+            "disabled": u.disabled,
+            "scopes": u.scopes,
+            "role": u.role.as_str(),
+        }),
+        Some((prs, started_at)) => {
+            let role = crate::perspective::narrow_role(u.role, &prs.dims);
+            json!({
+                "username": u.username,
+                "disabled": u.disabled,
+                "scopes": role.legacy_scopes(),
+                "role": role.as_str(),
+                "perspective": crate::perspective::view(&prs.id, &prs.dims, started_at),
+            })
+        }
+    }
+}
+
+// ── "View as" (i538) ─────────────────────────────────────────
+
+/// The session a perspective route acts on: the verified bearer (the same
+/// checks as `/auth/me`: the shared insecure-secret predicate, the
+/// signature, the session floor) and the live refresh row the HttpOnly
+/// cookie names, which must be the bearer's account's. No live row is a 401:
+/// a perspective belongs to a session, and there is none to put it on.
+async fn perspective_session(
+    state: &AppState,
+    headers: &http::HeaderMap,
+    jar: &CookieJar,
+) -> Result<(crate::auth::Claims, crate::perspective::SessionRow), Response> {
+    if let Err(why) = session_origin_refusal(headers) {
+        return Err(session_origin_forbidden(why));
+    }
+    let unauthorized = |detail: &str| (StatusCode::UNAUTHORIZED, Json(json!({"detail": detail}))).into_response();
+    let secret = jwt_secret();
+    if crate::auth::jwt_secret_is_insecure(&secret) {
+        crate::auth::warn_insecure_jwt();
+        return Err(unauthorized("Auth not configured"));
+    }
+    let Some(token) = headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    else {
+        return Err(unauthorized("Not authenticated"));
+    };
+    let Ok(claims) = verify_token(token, &secret) else {
+        return Err(unauthorized("Could not validate credentials"));
+    };
+    if crate::session_floor::refuses(state, &claims.sub, token).await {
+        return Err(unauthorized("Session ended"));
+    }
+    let Some(cookie) = jar.get(auth_refresh::REFRESH_COOKIE_NAME) else {
+        return Err(unauthorized(crate::perspective::NEEDS_SESSION));
+    };
+    match crate::perspective::session_row(&state.db, cookie.value(), &claims.sub).await {
+        Ok(Some(row)) => Ok((claims, row)),
+        Ok(None) => Err(unauthorized(crate::perspective::NEEDS_SESSION)),
+        Err(e) => {
+            tracing::error!(error = %e, "perspective_session_lookup_failed");
+            Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"detail": "Auth backend unavailable"}))).into_response())
+        }
+    }
+}
+
+/// A perspective token and the perspective it names. Never `cap_at`.
+fn perspective_answer(username: &str, started: &crate::perspective::Started) -> Response {
+    match issue_perspective_token(username, started.role, &started.claim()) {
+        Ok((access_token, expires_in)) => Json(json!({
+            "access_token": access_token,
+            "token_type": "bearer",
+            "expires_in": expires_in,
+            "perspective": started.view(),
+        }))
+        .into_response(),
+        Err(e) => token_issue_response(e, "auth_perspective"),
+    }
+}
+
+/// A real access token for the account, after Back to me.
+async fn real_session_answer(db: &sqlx::PgPool, username: &str) -> Response {
+    let user = match lookup_user_db(db, username).await {
+        Ok(Some(u)) if !u.disabled => u,
+        Ok(_) => {
+            return (StatusCode::UNAUTHORIZED, Json(json!({"detail": "User is disabled or no longer exists"})))
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "perspective_user_lookup_failed");
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"detail": "Auth backend unavailable"})))
+                .into_response();
+        }
+    };
+    match issue_access_token(&user) {
+        Ok((access_token, expires_in)) => Json(json!({
+            "access_token": access_token,
+            "token_type": "bearer",
+            "expires_in": expires_in,
+        }))
+        .into_response(),
+        Err(e) => token_issue_response(e, "auth_perspective"),
+    }
+}
+
+/// POST /api/auth/perspective — an operator narrows their own session to a
+/// perspective `{role_cap?, addons?, core_only?}`. 200 with a perspective
+/// token; 403 `perspective_needs_operator`, 409 `perspective_active`, 422
+/// `perspective_cannot_widen` / `perspective_unknown_addon` /
+/// `perspective_no_change` / `perspective_invalid`.
+async fn perspective_start(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    jar: CookieJar,
+    body: axum::body::Bytes,
+) -> Response {
+    let (claims, session) = match perspective_session(&state, &headers, &jar).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let dims = match crate::perspective::parse_dims(&body) {
+        Ok(d) => d,
+        Err(r) => return r.into_response(),
+    };
+    match crate::perspective::begin(&state.db, &claims, &session, &dims).await {
+        Ok(started) => perspective_answer(&claims.sub, &started),
+        Err(r) => r.into_response(),
+    }
+}
+
+/// PUT /api/auth/perspective — switch to another perspective in one
+/// transaction; an all-unchanged body is Back to me. Authorized on the
+/// row, validated against the LIVE role.
+async fn perspective_switch(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    jar: CookieJar,
+    body: axum::body::Bytes,
+) -> Response {
+    let (claims, session) = match perspective_session(&state, &headers, &jar).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let dims = match crate::perspective::parse_dims(&body) {
+        Ok(d) => d,
+        Err(r) => return r.into_response(),
+    };
+    match crate::perspective::switch(&state.db, &claims, &session, &dims).await {
+        Ok(crate::perspective::Switched::Back) => real_session_answer(&state.db, &claims.sub).await,
+        Ok(crate::perspective::Switched::To(started)) => perspective_answer(&claims.sub, &started),
+        Err(r) => r.into_response(),
+    }
+}
+
+/// DELETE /api/auth/perspective — Back to me: end the session's
+/// perspective and answer a real access token. Authorized on the row, never
+/// on the token's role, so a `user` view can always go back.
+async fn perspective_back(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    jar: CookieJar,
+) -> Response {
+    let (claims, session) = match perspective_session(&state, &headers, &jar).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match crate::perspective::back_to_me(&state.db, &claims, &session).await {
+        Ok(()) => real_session_answer(&state.db, &claims.sub).await,
+        Err(r) => r.into_response(),
+    }
+}
+
+#[cfg(test)]
+#[path = "core/perspective_tests.rs"]
+mod perspective_tests;
 
 // ── User lookup helpers ──────────────────────────────────────
 

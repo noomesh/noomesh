@@ -399,8 +399,11 @@ struct CreateTokenBody {
 async fn bootstrap_token_create(
     State(state): State<Arc<AppState>>,
     op: OperatorOrInternal,
+    perspective: Option<axum::Extension<crate::perspective::RequesterPerspective>>,
     body: Option<Json<Value>>,
 ) -> AppResult {
+    // i538: a bootstrap token enrols a node; never under a perspective.
+    crate::perspective::refuse_mint(perspective.as_ref(), "bootstrap token")?;
     let by = op.actor("cluster-cli");
     // An absent body means "all defaults" (mint_join_key precedent), but a
     // PRESENT body that doesn't deserialize is a 400 — `Option<Json<T>>`

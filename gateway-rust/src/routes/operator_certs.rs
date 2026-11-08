@@ -145,7 +145,13 @@ async fn register(State(state): State<Arc<AppState>>, facts: CallerFacts) -> App
 /// `POST /api/security/operator-token` — an Admin token bound to the
 /// operator leaf on this connection. The ONLY minter of `cnf` on a login
 /// subject; the token is refused from any connection without that leaf.
-async fn operator_token(State(state): State<Arc<AppState>>, facts: CallerFacts) -> AppResult {
+async fn operator_token(
+    State(state): State<Arc<AppState>>,
+    perspective: Option<axum::Extension<crate::perspective::RequesterPerspective>>,
+    facts: CallerFacts,
+) -> AppResult {
+    // i538: an operator-cert token is an Admin token; never under a perspective.
+    crate::perspective::refuse_mint(perspective.as_ref(), "operator cert token")?;
     let who = login_of(&facts)?;
     let registration = facts.registration(&state.db).await?;
     let tp = operator_auth::admit_token_mint(&who.sub, who.role, facts.conn(), registration)

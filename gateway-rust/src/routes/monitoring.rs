@@ -252,6 +252,7 @@ async fn viewer_gate(key: &jsonwebtoken::EncodingKey) -> Result<(), String> {
 async fn grafana_session(
     State(state): State<Arc<AppState>>,
     ctx: Option<Extension<RequesterCtx>>,
+    perspective: Option<Extension<crate::perspective::RequesterPerspective>>,
 ) -> AppResult {
     let sub = person_at_the_browser(&ctx).map_err(AppError::Forbidden)?;
 
@@ -280,6 +281,9 @@ async fn grafana_session(
             (Some(from_col.max(Role::from_scopes(&list))), disabled)
         }
     };
+    // i538 "View as": under a perspective the session opens at the LOWER of
+    // the live tier and the perspective's, never the real one.
+    let live = crate::perspective::clamp(live, perspective.as_deref());
     // the design, fail closed: a read-only account is a Viewer only when
     // this compose declares the gateway-routed data sources AND the running
     // Grafana proves it. Asked only for that tier; operators never wait on
