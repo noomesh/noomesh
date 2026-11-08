@@ -7,6 +7,11 @@
 #   scripts/release-retag-image.sh <image> <rc image tag> <final image tag> [expected digest]
 #   e.g.  release-retag-image.sh whisper v0.2.99-rc.1 v0.2.99 sha256:2ec4…
 #
+# The source may instead be an exact digest, `@sha256:…`: a staged infra image
+# (i567), pinned when the plan read :staged, so a daily run moving :staged
+# mid-release cannot change what this release ships. It must equal the
+# expected digest.
+#
 # Env: REGISTRY, OWNER (as images-release.yml sets them), PUSH_LATEST=1 to
 # also move :latest (a final always does). IMAGE_OWNER is the registry path the
 # image is published under, if not $OWNER: the DHI-derived bases (deps-core,
@@ -35,10 +40,16 @@ digest_of() {
     docker buildx imagetools inspect "$1" --format '{{json .Manifest.Digest}}' | tr -d '"'
 }
 
-got="$(digest_of "$ref:$rc")"
-[ -n "$got" ] || { echo "::error::$ref:$rc does not resolve — cannot re-tag from it"; exit 1; }
+case "$rc" in
+    @sha256:*)
+        [ "${rc#@}" = "$want" ] || { echo "::error::source $rc is not the planned digest '$want'; refusing to re-tag"; exit 1; }
+        src="$ref$rc" ;;
+    *) src="$ref:$rc" ;;
+esac
+got="$(digest_of "$src")"
+[ -n "$got" ] || { echo "::error::$src does not resolve — cannot re-tag from it"; exit 1; }
 if [ -n "$want" ] && [ "$got" != "$want" ]; then
-    echo "::error::$ref:$rc is $got but the rc lock says $want — the rc tag or its lock moved; refusing to re-tag"
+    echo "::error::$src is $got but the plan says $want — the source tag or its lock moved; refusing to re-tag"
     exit 1
 fi
 
@@ -55,4 +66,4 @@ if [ "$now" != "$got" ]; then
     echo "::error::$ref:$tag resolves to $now after re-tagging $got — the digest changed (a single-manifest source is re-wrapped); build this image instead"
     exit 1
 fi
-echo "re-tagged $ref@$got as :$tag${PUSH_LATEST:+ and :latest} (from :$rc)"
+echo "re-tagged $ref@$got as :$tag${PUSH_LATEST:+ and :latest} (from $src)"
