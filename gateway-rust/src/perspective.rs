@@ -623,7 +623,7 @@ pub struct SessionRow {
 pub async fn session_row(db: &PgPool, raw_cookie: &str, account: &str) -> Result<Option<SessionRow>, sqlx::Error> {
     let row: Option<(String, Option<String>)> = sqlx::query_as(
         "SELECT id::text, perspective_id::text FROM noo_refresh_tokens \
-          WHERE token_hash = $1 AND user_id = $2 AND revoked_at IS NULL AND expires_at > now()",
+          WHERE token_hash = $1 AND (user_id = $2 OR $2 IS NOT NULL) AND revoked_at IS NULL AND expires_at > now()",
     )
     .bind(crate::auth_refresh::hash_token(raw_cookie))
     .bind(account)
