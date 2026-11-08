@@ -742,6 +742,9 @@ pub async fn authorize_own(db: &PgPool, claims: &Claims, session: &SessionRow) -
 /// perspective's own session for a role reason, or an operator could be
 /// stranded in a `user` view (M20).
 pub async fn back_to_me(db: &PgPool, claims: &Claims, session: &SessionRow) -> Result<(), Refused> {
+    if claims.resolved_role() < Role::Operator {
+        return Err(refused(StatusCode::FORBIDDEN, NEEDS_OPERATOR));
+    }
     let id = authorize_own(db, claims, session).await?;
     end(db, &id, EndReason::BackToMe).await.map_err(db_failed)?;
     Ok(())
