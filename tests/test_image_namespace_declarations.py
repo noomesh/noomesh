@@ -32,6 +32,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SITES = [
     (".github/workflows/images-release.yml", r"^\s*OWNER:\s*(\S+)"),
     (".github/workflows/publish-harrier.yml", r"^\s*OWNER:\s*(\S+)"),
+    # the daily infra build pushes the images the release re-tags (i567)
+    (".github/workflows/infra-staged.yml", r"^\s*OWNER:\s*(\S+)"),
     # The ONE definition per language; every other reader resolves it.
     ("scripts/lib-dist.sh", r"release_image_namespace\(\) \{ printf 'ghcr\.io/([^']+)'"),
     ("noo-cli/src/registry.rs", r'IMAGE_NAMESPACE: &str = "ghcr\.io/([^"]+)"'),
@@ -64,7 +66,7 @@ def test_every_site_declares_the_same_namespace():
 
 def test_the_parse_found_every_site():
     """Guard the guard: an empty SITES agrees with itself perfectly."""
-    assert len(_declared()) == len(SITES) == 6
+    assert len(_declared()) == len(SITES) == 7
 
 
 # DHI-derived images: the dhi.io hardened bases (DHI Community) and the images
