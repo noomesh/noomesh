@@ -572,8 +572,8 @@ The agent's fixed vocabulary for the `reason` of a `node_workloads` or
 | `set_unverified` | a set's signature, hashes or `.verified` marker did not check out | re-stage the set; check the node holds `signing.pub` |
 | `profile_invalid` | the entry's `profile` is missing, not one of the main set's profiles, or not realtime-capable for a realtime workload | fix the placement's profile |
 | `disk` | the data root lacks space for the set or the scratch plus the margin | free space on the node |
-| `consent_none` | the node's `addon_workloads_policy` is `none` | the node's owner sets `approve` or `auto` |
-| `consent_unapproved` | policy is `approve` and this add-on and digest are not approved | approve the add-on and digest on the node |
+| `consent_none` | the node's owner set `NOO_ADDON_WORKLOADS=none` (the kill switch) | only the node's owner can unset it |
+| `consent_unapproved` | policy is `approve` (the default) and this add-on and digest are not approved | on the node: `sudo noo node workloads approve <addon> <digest>` |
 | `nvidia_runtime_missing` | `accel.gpu` > 0 and the nvidia runtime is not registered | install the NVIDIA container toolkit |
 | `driver_caps_missing` | the driver cannot grant `compute,utility` | fix the driver or toolkit |
 | `compute_cap_low` | the GPU's compute capability is below the set's `min_compute` | place on a newer GPU |
@@ -592,10 +592,24 @@ The placement facts (`consent_none`, `consent_unapproved`, `nvidia_runtime_missi
 ### Consent, and the controller host
 
 - The node's consent is `NOO_ADDON_WORKLOADS` = `none` | `approve` | `auto`
-  (default `none`); it is reported as `addon_workloads_policy`.
+  (default `approve`); it is reported as `addon_workloads_policy`. With
+  nothing approved, `approve` runs nothing, so the default is closed; the
+  node owner's approval of one add-on at one image digest is the consent.
+  `none` is the owner's kill switch: it refuses even an approved add-on.
+  (Until 0.6.18.1 the default was `none`. `/etc/noo-node-agent.env` is
+  rewritten on every roll, so a hand-set policy did not last; an approval
+  does.)
+- The node's owner approves, revokes and lists on the node itself, as root:
+  `sudo noo node workloads approve <addon> <digest>`,
+  `sudo noo node workloads revoke <addon> <digest>`,
+  `sudo noo node workloads list`. The digest is the one the placement's
+  `consent_unapproved` refusal names. The controller has no way to approve:
+  nothing it can call writes the store.
 - Approvals live in `addon-workload-approvals.json` in the agent state
-  directory (mode 0600, written atomically). A corrupt file is an **error**,
-  never read as empty (an empty list would silently drop every approval).
+  directory: mode 0600, owned by `noo-agent`, written atomically through a
+  temp file and a rename, never through a symlink. A corrupt file is an
+  **error**, never read as empty (an empty list would silently drop every
+  approval), and `approve`/`revoke` refuse it rather than replace it.
 - A node that is the controller's host (the agent's `NOO_SELF_NODE` marker) is
   refused with `controller_host` unless `NOO_ADDON_WORKLOADS_ON_CONTROLLER=1`
   (default off).

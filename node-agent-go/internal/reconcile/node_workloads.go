@@ -35,8 +35,9 @@ type nodeWorkloads interface {
 }
 
 // newNodeWorkloads builds the lifecycle, the node's gate and its facts from
-// the agent's config. The policy is the config's, default none; a value that
-// is not a mode was already turned into none by config.Load, and is said so.
+// the agent's config. The policy is the config's, default approve (nothing
+// runs until the owner approves a digest); a value that is not a mode was
+// already turned into none by config.Load, and is said so.
 func newNodeWorkloads(cfg *config.Config, docker *dockerpkg.Client, sets *modelsets.Store) (nodeWorkloads, *nodepolicy.Facts) {
 	mode, _ := nodepolicy.ParseMode(cfg.AddonWorkloadsPolicy)
 	if cfg.AddonWorkloadsPolicyAsked != "" {

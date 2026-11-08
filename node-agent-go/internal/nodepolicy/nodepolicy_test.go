@@ -72,8 +72,31 @@ func TestApproveRefusesWhenTheApprovalsFileIsCorrupt(t *testing.T) {
 	}
 }
 
+// i573: the unset default is approve, and it is still closed. A node whose
+// owner approved nothing runs nothing; one approval admits that exact pair.
+func TestTheDefaultPolicyRunsOnlyWhatTheOwnerApproved(t *testing.T) {
+	mode, ok := ParseMode("")
+	if !ok || mode != ModeApprove {
+		t.Fatalf("ParseMode(\"\") = %q, %v; want approve", mode, ok)
+	}
+	ap := NewApprovals(t.TempDir())
+	g := &Gate{Mode: mode, Approvals: ap}
+	if got := nodewl.CodeOf(g.Check(context.Background(), entry("rhaddon", digestA))); got != nodewl.ReasonConsentUnapproved {
+		t.Fatalf("empty store: code %q, want %q", got, nodewl.ReasonConsentUnapproved)
+	}
+	if err := ap.Add("rhaddon", digestA); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Check(context.Background(), entry("rhaddon", digestA)); err != nil {
+		t.Fatalf("the approved pair is refused: %v", err)
+	}
+	if got := nodewl.CodeOf(g.Check(context.Background(), entry("rhaddon", digestB))); got != nodewl.ReasonConsentUnapproved {
+		t.Fatalf("another digest: code %q, want %q", got, nodewl.ReasonConsentUnapproved)
+	}
+}
+
 func TestParseMode(t *testing.T) {
-	for in, want := range map[string]Mode{"": ModeNone, "none": ModeNone, "approve": ModeApprove, " AUTO ": ModeAuto} {
+	for in, want := range map[string]Mode{"": ModeApprove, "none": ModeNone, "approve": ModeApprove, " AUTO ": ModeAuto} {
 		if m, ok := ParseMode(in); m != want || !ok {
 			t.Errorf("ParseMode(%q) = %q, %v", in, m, ok)
 		}

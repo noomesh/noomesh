@@ -223,11 +223,21 @@ fn digest_in(detail: &str) -> Option<String> {
 /// name), because the node-side command lives in another branch and the hint
 /// lint checks suggested commands against usage.rs.
 pub(crate) fn approve_hint(code: &str, node: &str, addon: &str, detail: &str) -> Option<String> {
-    if code != "consent_none" && code != "consent_unapproved" {
-        return None;
+    match code {
+        "consent_unapproved" => {
+            let digest = digest_in(detail).unwrap_or_else(|| "<digest>".to_string());
+            Some(format!("on {node}, run: sudo noo node workloads approve {addon} {digest}"))
+        }
+        // Unset is approve (i573): none is the owner's explicit kill switch,
+        // or an agent too old to report its policy (the gateway says which).
+        "consent_none" if detail.contains("does not report") => {
+            Some(format!("{node}'s agent predates node-workload consent: roll it, then approve on the node"))
+        }
+        "consent_none" => Some(format!(
+            "{node}'s owner has switched add-on node workloads off (NOO_ADDON_WORKLOADS=none); only they can turn it back on"
+        )),
+        _ => None,
     }
-    let digest = digest_in(detail).unwrap_or_else(|| "<digest>".to_string());
-    Some(format!("on {node}, run: noo node workloads approve {addon} {digest}"))
 }
 
 /// `sha256:` plus the first 12 hex digits.
@@ -514,10 +524,14 @@ mod tests {
     fn the_approve_hint_appears_for_consent_codes_only() {
         let detail = "pai-voice at sha256:0123abcdef9876 is not approved on the node";
         let hint = approve_hint("consent_unapproved", "awolf", "pai-voice", detail).expect("hint");
-        assert_eq!(hint, "on awolf, run: noo node workloads approve pai-voice sha256:0123abcdef9876");
+        assert_eq!(hint, "on awolf, run: sudo noo node workloads approve pai-voice sha256:0123abcdef9876");
         assert!(!hint.starts_with("noo ") && !hint.contains('`'), "plain prose, outside the hint lint");
-        let none = approve_hint("consent_none", "awolf", "pai-voice", "no approval recorded").expect("hint");
-        assert!(none.ends_with("approve pai-voice <digest>"), "{none}");
+        let bare = approve_hint("consent_unapproved", "awolf", "pai-voice", "no approval recorded").expect("hint");
+        assert!(bare.ends_with("approve pai-voice <digest>"), "{bare}");
+        let none = approve_hint("consent_none", "awolf", "pai-voice", "this node's addon_workloads_policy is none").expect("hint");
+        assert!(none.contains("NOO_ADDON_WORKLOADS=none") && !none.contains("approve pai-voice"), "{none}");
+        let old = approve_hint("consent_none", "awolf", "pai-voice", "the node does not report its addon_workloads_policy").expect("hint");
+        assert!(old.contains("roll it") && !old.contains("NOO_ADDON_WORKLOADS=none"), "{old}");
         for other in ["gpu_too_small", "not_found", "bad_sets", "image_missing", ""] {
             assert_eq!(approve_hint(other, "awolf", "pai-voice", detail), None, "{other:?}");
         }

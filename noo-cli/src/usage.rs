@@ -13,6 +13,9 @@
 
 pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["whoami"], "", "Report what this box is: controller, node, both, or client-only"),
+    (&["node", "workloads", "approve"], "<addon> <digest>", "On this node, as root: consent to run an add-on's node workload at one image digest"),
+    (&["node", "workloads", "revoke"], "<addon> <digest>", "On this node, as root: withdraw one add-on digest's approval"),
+    (&["node", "workloads", "list"], "", "On this node, as root: show the add-on node workloads approved here, and the policy"),
         (&["cluster", "status"], "", "List nodes: tier, status, RUNNING backends, CAPABILITIES by role, CAN-RUN"),
         (&["cluster", "verify"], "[<node>...] [--controller] [--wait]", "Assert every invariant a node and the controller must meet; exit 1 with the remedy"),
         (&["cluster", "invite"], "", "Mint a tagged tailscale auth key and print the `noo enroll --via-tailnet <url>` line"),

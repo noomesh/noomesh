@@ -448,11 +448,18 @@ func envOr(key, fallback string) string {
 
 // envBool reads a yes/no flag: "1", "true" or "yes" (any case) is true.
 // addonWorkloadsPolicy reads NOO_ADDON_WORKLOADS: none | approve | auto, case
-// and surrounding space ignored; unset is none. Anything else fails CLOSED to
-// none, and asked is the offending value so the agent can log it.
+// and surrounding space ignored. Unset is approve (i573): with no approval
+// it admits nothing, so the default is still closed, and the node owner's
+// `noo node workloads approve` is the whole of consent. /etc/noo-node-agent.env
+// is replaced on every roll, so a hand-set policy could not have been the
+// durable switch. An explicit none is the kill switch: it refuses even an
+// approved add-on. Anything else fails CLOSED to none, and asked is the
+// offending value so the agent can log it.
 func addonWorkloadsPolicy(raw string) (policy, asked string) {
 	switch v := strings.ToLower(strings.TrimSpace(raw)); v {
-	case "", "none":
+	case "":
+		return "approve", ""
+	case "none":
 		return "none", ""
 	case "approve", "auto":
 		return v, ""
