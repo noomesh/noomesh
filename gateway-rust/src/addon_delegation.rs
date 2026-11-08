@@ -143,6 +143,12 @@ const ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/tasks/{id}/context"),
     ("GET", "/api/tasks/{id}/events"),
     ("POST", "/api/tasks/stop"),
+    // i300 H5: the add-on reserves and releases its own placed node workload
+    // FOR this person (f99 decided against them in the handler). The path's
+    // add-on must be the token's own: `addon_workloads::delegated_reserve_allows`
+    // at the tier gate, `routes::reservations::delegated_holder` in the handler.
+    ("POST", "/api/addon-workloads/{addon}/{workload}/reserve"),
+    ("POST", "/api/addon-workloads/{addon}/{workload}/release"),
 ];
 
 /// May an ADT be used for `method path`?

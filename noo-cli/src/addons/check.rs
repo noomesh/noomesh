@@ -46,6 +46,74 @@ pub struct DirChecked {
     /// for it). `Some(rules)`: it passed the gateway's rules, except `rules`,
     /// one sentence per route the front-door rule could not be applied to.
     pub routes: Option<Vec<String>>,
+    /// `None`: the bundle ships no node-workloads.json. `Some(scratch)`: it
+    /// passed the i300 rules ([`super::node_workloads::parse_node_workloads`],
+    /// without the lock, which a directory does not have), and `scratch` is
+    /// every scratch that may run native code (A12), in file order.
+    pub node_workloads: Option<Vec<ExecScratch>>,
+}
+
+/// A scratch entry declared `exec: true`: its worker may run native code it
+/// compiles there. What the operator is told (A12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecScratch {
+    pub workload: String,
+    pub target: String,
+    pub mb: i64,
+}
+
+impl ExecScratch {
+    /// The sentence `noo addons check` prints for it.
+    pub fn sentence(&self, addon: &str) -> String {
+        format!(
+            "{addon}: workload {} may run native code it compiles, in a {} MiB scratch at {}",
+            self.workload, self.mb, self.target
+        )
+    }
+}
+
+/// The note that goes with a node-workloads.json that passed: the lock is not
+/// in a directory, so the image names were not matched against it.
+pub const NODE_WORKLOADS_NOT_CHECKED: &str =
+    "node-workloads.json's image names against the lock's images (the lock is not in the directory)";
+
+/// The bundle directory's node-workloads.json under the i300 rules, and the
+/// scratch that may run native code. `Ok(None)`: none shipped (a symlink or a
+/// directory under the name is not read, as [`read_bundle_dir`]). The lock is
+/// not in a directory, so each workload's own `image` stands in for its lock
+/// key ([`NODE_WORKLOADS_NOT_CHECKED`] says so).
+pub fn check_node_workloads(
+    addon: &str,
+    dir: &Path,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<Option<Vec<ExecScratch>>, String> {
+    let p = dir.join(super::node_workloads::NODE_WORKLOADS_FILE);
+    if !std::fs::symlink_metadata(&p).map(|m| m.file_type().is_file()).unwrap_or(false) {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+    let mut images = BTreeMap::new();
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+        for w in v["workloads"].as_array().into_iter().flatten() {
+            if let Some(i) = w["image"].as_str() {
+                images.insert(i.to_string(), String::new());
+            }
+        }
+    }
+    let routes = files.get(ROUTES_FILE).map(|r| super::node_workloads::routes_from_json(r));
+    let parsed = super::node_workloads::parse_node_workloads(addon, &bytes, &images, routes.as_ref())
+        .map_err(|e| format!("{} is refused: {e}", super::node_workloads::NODE_WORKLOADS_FILE))?;
+    let mut exec = Vec::new();
+    for w in &parsed {
+        for s in w.scratch.iter().filter(|s| s.exec) {
+            exec.push(ExecScratch {
+                workload: w.name.clone(),
+                target: s.target.clone(),
+                mb: s.max_mb.or(s.tmpfs_mb).unwrap_or_default(),
+            });
+        }
+    }
+    Ok(Some(exec))
 }
 
 /// What can still refuse a bundle this passes. Printed on every pass (and in
@@ -118,6 +186,29 @@ pub fn check_routes(addon: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<Op
     Ok(Some(checked.unchecked))
 }
 
+/// Refuse a new signed claim before pulling or changing pins. Existing
+/// enabled bundles are read from the install's materialised manifests.
+pub fn refuse_console_collision(root: &Path, addon: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<(), Refusal> {
+    let Some(raw) = files.get(ROUTES_FILE) else { return Ok(()) };
+    let manifest = addon_manifest::parse(std::str::from_utf8(raw).map_err(|e| Refusal::Decl(e.to_string()))?).map_err(Refusal::Decl)?;
+    let Some(path) = manifest.ui.as_ref().and_then(|ui| ui.console_path.as_deref()) else { return Ok(()) };
+    let enabled = crate::commands::addons::declared_map_at(&root.join("noomesh.yaml")).map_err(Refusal::Decl)?;
+    for (other, on) in enabled {
+        if !on || other == addon { continue; }
+        let file = super::pins::addon_dir(root, &other).join(ROUTES_FILE);
+        let text = match std::fs::read_to_string(&file) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(Refusal::Decl(format!("cannot inspect enabled add-on {other:?}: {e}"))),
+        };
+        let existing = addon_manifest::parse(&text).map_err(Refusal::Decl)?;
+        if existing.ui.as_ref().and_then(|ui| ui.console_path.as_deref()) == Some(path) {
+            return Err(Refusal::Decl(format!("ui.console_path {path:?} is claimed by both {addon:?} and enabled add-on {other:?}; change one signed claim (nothing was changed)")));
+        }
+    }
+    Ok(())
+}
+
 /// [`check_routes`] as the pin path runs it (`noo addons enable | upgrade`,
 /// `upgrade --check`): a bundle the gateway would refuse whole at load is
 /// refused here, with the gateway's sentence, before an image is pulled or a
@@ -138,7 +229,8 @@ pub fn check_dir_with(dir: &Path, addon: &str, core: &Core) -> Result<DirChecked
     let files = read_bundle_dir(dir)?;
     let guards = check_files(addon, &files, core).map_err(|r| r.why(addon))?;
     let routes = check_routes(addon, &files).map_err(|r| r.why(addon))?;
-    Ok(DirChecked { guards, routes })
+    let node_workloads = check_node_workloads(addon, dir, &files)?;
+    Ok(DirChecked { guards, routes, node_workloads })
 }
 
 /// [`check_dir_with`] against the core embedded in this binary.
@@ -166,6 +258,25 @@ mod tests {
         std::fs::write(d.join("system.json"), include_bytes!("../../../tests/fixtures/addons/rhaddon/system.json")).unwrap();
         std::fs::write(d.join("routes.json"), include_bytes!("../../../tests/fixtures/addons/rhaddon/routes.json")).unwrap();
         d
+    }
+
+    #[test]
+    fn console_claim_conflict_is_refused_without_writes() {
+        let root = fixture_dir("console-conflict", "rhaddon");
+        let other = super::super::pins::addon_dir(&root, "other-addon");
+        std::fs::create_dir_all(&other).unwrap();
+        let raw = |name: &str| serde_json::json!({"version":1,"addon":name,"base_url_env":"NOO_RHADDON_URL","base_url_default":"https://noo-rhaddon:9000","routes":[],"ui":{"console_path":"/example-space"}}).to_string();
+        std::fs::write(other.join("routes.json"), raw("other-addon")).unwrap();
+        let config = root.join("noomesh.yaml");
+        std::fs::write(&config, "addons:\n  other-addon: true\n").unwrap();
+        let files = BTreeMap::from([("routes.json".into(), raw("rhaddon").into_bytes())]);
+        let error = refuse_console_collision(&root, "rhaddon", &files).unwrap_err().why("rhaddon");
+        assert!(error.contains("rhaddon") && error.contains("other-addon") && error.contains("/example-space"));
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), "addons:\n  other-addon: true\n");
+        assert!(!root.join("addons.lock").exists());
+        std::fs::write(&config, "addons:\n  other-addon: false\n").unwrap();
+        assert!(refuse_console_collision(&root, "rhaddon", &files).is_ok());
+        clean(&root);
     }
 
     fn clean(d: &Path) {

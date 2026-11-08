@@ -32,7 +32,7 @@
 //!   3. `preflight_db_compat` (the target must run on the DB it will meet),
 //!      `preflight_service_keys`, `refuse_unlocked_dist_roll`,
 //!      `addon_preflight` — still nothing moves.
-//!   4. mint what the release needs: `mint_audit_key`, `mint_bus_keys`,
+//!   4. mint what the release needs: `mint_audit_key`, `mint_integration_key`, `mint_bus_keys`,
 //!      `mint_system_credentials`, `issue_pg_role_leaves`,
 //!      `retire_legacy_addon_leaves`, `warn_door_node_id`.
 //!   5. prepare and pin: `migrate_retired_yaml_gates`,
@@ -1163,6 +1163,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
 
     // Mint what this release needs, before anything moves.
     mint_audit_key(g, &roll);
+    mint_integration_key(g, &roll);
     mint_bus_keys(g, &roll);
     mint_system_credentials(g, &roll);
     issue_pg_role_leaves(g);
@@ -1194,6 +1195,46 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     launch_stack(g, &roll, staging, stops)
 }
 
+
+/// After a successful roll: the configured embedder, created in the embed
+/// container when that container runs and the model is not there.
+///
+/// Only onboard and `noo migrate import` created it, so a box onboarded on a
+/// release whose embedder step failed (an outside tester's 0.6.16 box, i545
+/// finding 53; the rc.3 rehearsal) stayed without one through every later
+/// upgrade, and `noo cluster verify` failed "the default space has no live
+/// node". A container that is down (a GPU host without the NVIDIA toolkit)
+/// is said once and left alone: there is nothing to create the model in.
+/// Never fails the roll.
+fn ensure_embedder_after_roll(g: &Globals) {
+    let embed = crate::envfile::container("ollama-embed");
+    let running = std::process::Command::new("docker")
+        .args(["inspect", "-f", "{{.State.Running}}", &embed])
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
+        .unwrap_or(false);
+    let model = crate::commands::provision::release_var("PAGEINDEX_EMBEDDING_MODEL");
+    let model = if model.is_empty() { "harrier".to_string() } else { model };
+    if !running {
+        if !g.json {
+            ui::warned(&format!(
+                "{embed} is not running, so the embedder ({model}) was not checked; \
+                 once it runs: noo models pull {model}"));
+        }
+        return;
+    }
+    for line in crate::onboard::steps::ensure_embed_model_core(&model) {
+        if g.json {
+            continue;
+        }
+        match line.chars().next() {
+            Some('+') => ui::done(&line[1..]),
+            Some('!') => ui::warned(&line[1..]),
+            Some('.') => ui::step(&line[1..]),
+            _ => eprintln!("{line}"),
+        }
+    }
+}
 
 /// What one `noo upgrade --stack` roll is working on, resolved once and
 /// Handed to every phase that needs it (instead of four loose locals).
@@ -1534,6 +1575,23 @@ fn mint_audit_key(g: &Globals, roll: &Roll) {
     }
 }
 
+/// Provision the private-corpus encryption key before the new gateway starts.
+/// Existing keys protect user data and must never be replaced during a roll.
+fn mint_integration_key(g: &Globals, roll: &Roll) {
+    match reconcile_integration_key(&roll.root) {
+        Ok(AuditKeyStage::AlreadyPresent) => {}
+        Ok(AuditKeyStage::Minted) => if !g.json {
+            ui::done("minted NOO_INTEGRATIONS_KEY into the encrypted store (private connected-account data)");
+        },
+        Err(AuditKeyRefusal::NoStore) => fail(g.json, ExitCode::Generic, "integration_key_no_store",
+            "No encrypted secrets/env.sops store for NOO_INTEGRATIONS_KEY; the key is never written to plaintext .env",
+            Some("noo onboard --reconfigure --only secrets --secrets-backend sops   # then re-run: noo upgrade --stack")),
+        Err(AuditKeyRefusal::Store(e)) => fail(g.json, ExitCode::Generic, "integration_key_mint_failed",
+            &format!("could not provision NOO_INTEGRATIONS_KEY in the encrypted store: {e}"),
+            Some("noo security secrets audit   # then re-run: noo upgrade --stack")),
+    }
+}
+
 /// Mint the bus-principal keys.
 /// The bus-principal keys. This release's gateway
 ///    signs worker.* messages per audience and its workers verify only
@@ -1838,6 +1896,7 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
             // tailscale serve now, as `noo stack start|restart` do, so
             // `noo upgrade --all` needs no manual restart. Never fails the roll.
             super::mesh::front_addon_uis(g);
+            ensure_embedder_after_roll(g);
             // Prune superseded release images (finding #93: 13 upgrades
             // quietly accumulated 78 tags — gigabytes). Best-effort — a prune
             // failure must never taint a successful roll.
@@ -1926,6 +1985,10 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
 /// install and by [`reconcile_audit_key`] on an upgraded one.
 pub(crate) const AUDIT_KEY: &str = "NOO_AUDIT_HMAC_KEY";
 
+#[cfg(all(test, unix))]
+#[path = "upgrade_integration_key_tests.rs"]
+mod integration_key_tests;
+
 /// What the stage did — the one line it prints. Never carries the value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AuditKeyStage {
@@ -1975,6 +2038,28 @@ fn reconcile_audit_key(root: &std::path::Path) -> Result<AuditKeyStage, AuditKey
         || crate::commands::secrets::mint_missing(&[AUDIT_KEY], &sops).map(|_| ()),
     )
     .map_err(AuditKeyRefusal::Store)
+}
+
+fn reconcile_integration_key(root: &std::path::Path) -> Result<AuditKeyStage, AuditKeyRefusal> {
+    let path = root.join("secrets/env.sops");
+    if !path.is_file() {
+        return Err(AuditKeyRefusal::NoStore);
+    }
+    const KEY: &str = "NOO_INTEGRATIONS_KEY";
+    let store = crate::commands::secrets::SecretStore::load_sops(&path)
+        .map_err(AuditKeyRefusal::Store)?;
+    match store.state(KEY) {
+        crate::commands::secrets::State::Set => Ok(AuditKeyStage::AlreadyPresent),
+        // A blank existing key is a broken configuration, not permission to
+        // rotate away the key that might protect existing ciphertext.
+        crate::commands::secrets::State::Blank => Err(AuditKeyRefusal::Store(
+            "NOO_INTEGRATIONS_KEY is blank; restore the original encryption key before upgrading".into())),
+        crate::commands::secrets::State::Missing => {
+            crate::commands::secrets::mint_missing(&[KEY], &path)
+                .map_err(AuditKeyRefusal::Store)?;
+            Ok(AuditKeyStage::Minted)
+        }
+    }
 }
 
 /// Before `noo stack start|restart|rebuild` hands the stack to the launcher:
@@ -4756,7 +4841,15 @@ fn addon_preflight(
         return Vec::new();
     }
     let client = addon_client(g);
-    let ctx = crate::addons::Ctx { root, tag, stack_lock, allow_downgrade, client: &client };
+    let images_dir = crate::commands::image_stage::images_store_dir();
+    let ctx = crate::addons::Ctx {
+        root,
+        tag,
+        stack_lock,
+        allow_downgrade,
+        client: &client,
+        images_dir: &images_dir,
+    };
     let mut out = Vec::new();
     for addon in on {
         if !g.json { ui::step(&format!("{addon}: resolving its signed lock for {tag}")); }
@@ -4789,12 +4882,22 @@ fn lowercase_first(s: &str) -> String {
 
 /// Write the add-on pins resolved in the preflight, beside `stack.lock`.
 fn commit_addon_pins(g: &Globals, root: &std::path::Path, tag: &str, prepared: &[crate::addons::Prepared]) {
+    let images_dir = crate::commands::image_stage::images_store_dir();
     for p in prepared {
         match crate::addons::commit(root, p, tag) {
-            Ok(pin) => if !g.json {
-                ui::done(&format!("{} {} pinned for {tag} (add-on key #{}; {} image(s) pulled by digest {})",
-                    p.addon, pin.version, pin.key_index, p.pulled, p.via));
-            },
+            Ok(pin) => {
+                // The new lock is current: tars of its node-workload images
+                // that it no longer names leave the rail.
+                if let Err(e) = crate::addons::node_images::prune_for(&images_dir, p) {
+                    if !g.json {
+                        ui::warned(&format!("{}: stale node-workload images stay on the rail ({e})", p.addon));
+                    }
+                }
+                if !g.json {
+                    ui::done(&format!("{} {} pinned for {tag} (add-on key #{}; {} image(s) pulled by digest {})",
+                        p.addon, pin.version, pin.key_index, p.pulled, p.via));
+                }
+            }
             Err(r) => fail(g.json, ExitCode::Generic, "addon_pin_write_failed",
                 &format!("{} — stack.lock is already written for {tag}; the launcher refuses {} until it is pinned",
                     r.why(&p.addon), p.addon),
@@ -5736,6 +5839,16 @@ mod tests {
             assert!(mint < at(later), "the audit key must be minted before `{later}`");
         }
         assert!(super::phase_src::body("mint_audit_key").contains("reconcile_audit_key(root)"), "the phase mints the audit key");
+    }
+
+    #[test]
+    fn integration_key_provisioning_precedes_the_new_gateway_and_pin() {
+        let list = super::phase_src::list();
+        let mint = list.find("mint_integration_key(")
+            .expect("an upgrade must provision the new required integration key");
+        for later in ["refresh_deploy_slice(", "move_pin(", "launch_stack("] {
+            assert!(mint < list.find(later).unwrap(), "key provisioning must precede {later}");
+        }
     }
 
     #[test]
@@ -7392,5 +7505,25 @@ mod slice_pin_tests {
         let body = crate::test_src::fn_body(&mesh, "pub fn mesh_sync_assets(");
         let ask = body.find("slice_waits_for_stack(").expect("sync-assets must ask slice_waits_for_stack");
         assert!(ask < body.find("materialize(").expect("materialize"), "before it writes anything");
+    }
+}
+
+#[cfg(test)]
+mod embedder_after_roll_tests {
+    /// i545 finding 53 and the rc.3 rehearsal: only onboard and `noo migrate
+    /// import` created the embedder, so a box whose onboard embedder step
+    /// failed never got one from any later upgrade.
+    #[test]
+    fn a_successful_roll_ensures_the_embedder_in_a_running_embed_container() {
+        let src = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let launch = crate::test_src::fn_body(&src, "fn launch_stack(");
+        let success = launch.find("Ok(s) if s.success() =>").expect("the success arm");
+        let done = launch.find("stack now on").expect("the success close");
+        let call = launch.find("ensure_embedder_after_roll(g)").expect("the roll ensures the embedder");
+        assert!(success < done && done < call, "the embedder is ensured in the success arm, after the stack is up");
+        let ensure = crate::test_src::fn_body(&src, "fn ensure_embedder_after_roll(");
+        let running = ensure.find("if !running").expect("a running check");
+        let create = ensure.find("ensure_embed_model_core(&model)").expect("the shared fetch-and-create");
+        assert!(running < create, "nothing is created in a container that is down");
     }
 }

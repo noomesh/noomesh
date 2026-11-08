@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -130,6 +131,37 @@ func (g *GPUDetector) DetectCount() (int, error) {
 	}
 	return n, nil
 }
+
+// DetectComputeCaps returns each GPU's CUDA compute capability ("8.6") via
+// nvidia-smi. (nil, nil) means there is no nvidia-smi; an error means the
+// probe failed or printed something that is not a capability, and the answer
+// is unknown (an old driver that lacks the field exits non-zero: unknown too).
+func (g *GPUDetector) DetectComputeCaps() ([]string, error) {
+	out, absent, err := smiQuery("--query-gpu=compute_cap", "--format=csv,noheader,nounits")
+	if err != nil || absent {
+		return nil, err
+	}
+	return parseComputeCaps(out)
+}
+
+// parseComputeCaps reads one capability per non-blank line. A line that is
+// not <major>.<minor> (nvidia-smi prints [N/A]) fails the whole answer.
+func parseComputeCaps(out string) ([]string, error) {
+	var caps []string
+	for _, l := range strings.Split(out, "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		if !computeCapLine.MatchString(l) {
+			return nil, fmt.Errorf("nvidia-smi compute_cap: unparseable output %q", l)
+		}
+		caps = append(caps, l)
+	}
+	return caps, nil
+}
+
+var computeCapLine = regexp.MustCompile(`^[0-9]{1,2}\.[0-9]{1,2}$`)
 
 // DetectVRAMUsed returns currently used VRAM in GB across all GPUs.
 func (g *GPUDetector) DetectVRAMUsed() float64 {

@@ -808,8 +808,11 @@ fn url_for(n: &NodeFacts, backend: &str) -> String {
     if !n.ip.is_empty() {
         crate::node_link::NodeLink::for_ip(&n.ip).base().to_string()
     } else {
+        // No address: the controller's own node (a standalone box). Its
+        // ollama is the controller's own door, which on standalone is the
+        // embed ollama (i545 48/49/56), never a container that is not there.
         let port = crate::config::backend_port(backend).unwrap_or(0);
-        super::backend::local_backend_url(backend, port)
+        super::backend::controller_local_backend_url(backend, port)
     }
 }
 

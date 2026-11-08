@@ -73,10 +73,6 @@ PINNED: dict[str, int] = {
     # Outside routes/ and coordinator/, seen since the scan covers all of src/.
     # wait_for_cluster_warm: an unreadable count keeps the startup wait going.
     "heartbeat_loop.rs": 1,
-    # FINDING: identity() reads an unreadable role as "no role" and unreadable
-    # KB grants as "no audience" (fail closed, silent, wrong cause); and
-    # server_ids() lists no MCP servers on an error, so their tools vanish.
-    "mcp_bridge.rs": 3,
     # prune_restore_run: `remaining` reads -1 on an error (display only).
     "memory/provider.rs": 1,
     # user_role and effective_risk's saved-recipient read: an error leaves the
@@ -85,15 +81,8 @@ PINNED: dict[str, int] = {
     # OpCtx::still_live: an error answers "not live", so a destructive op
     # writes nothing (documented fail closed; reported as no longer wanted).
     "ops.rs": 1,
-    # FINDING: emit_final_state drops the final state event on an unreadable
-    # state, and is_addon_task reads an unreadable origin as core, so the
-    # add-on's events are not routed to it.
-    "task_events.rs": 2,
     # resolve_origin: an unreadable account is "not a person" (fail closed).
     "task_guard.rs": 1,
-    # FINDING: mark_running reads an unreadable prior state as "not running",
-    # so its once-only state event can repeat.
-    "tasks.rs": 1,
 }
 
 READ = re.compile(r"\.fetch_(?:optional|one|all)\s*\(|crate::repo::\w+::\w+\s*\(")

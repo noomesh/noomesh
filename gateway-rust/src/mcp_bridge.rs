@@ -140,21 +140,21 @@ fn audience_of(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// A person's role and knowledge-base roles, for the audience rule.
-async fn identity(state: &AppState, user: Option<&str>) -> (Option<Role>, Vec<String>) {
-    let Some(u) = user else { return (None, Vec::new()) };
-    let role: Option<String> = crate::repo::users::enabled_role(&state.db, u)
+/// A person's role and knowledge-base roles, for the audience rule. An
+/// unreadable role or grant is an ERROR naming which (i460), never "no role"
+/// or "no audience": the caller withholds external tools AND says why.
+async fn identity(db: &sqlx::PgPool, user: Option<&str>) -> Result<(Option<Role>, Vec<String>), String> {
+    let Some(u) = user else { return Ok((None, Vec::new())) };
+    let role: Option<String> = crate::repo::users::enabled_role(db, u)
         .await
-        .ok()
-        .flatten();
+        .map_err(|e| format!("cannot read {u}'s role for the MCP audience rule: {e}"))?;
     let role = role.and_then(|r| Role::from_str(&r).ok());
-    let kb = crate::repo::kb_grants::get_roles(&state.db, u)
+    let kb = crate::repo::kb_grants::get_roles(db, u)
         .await
-        .ok()
-        .flatten()
+        .map_err(|e| format!("cannot read {u}'s knowledge-base roles for the MCP audience rule: {e}"))?
         .map(|v| audience_of(&v))
         .unwrap_or_default();
-    (role, kb)
+    Ok((role, kb))
 }
 
 /// Every external tool this caller may see: enabled servers with a
@@ -180,7 +180,16 @@ pub async fn catalog_for(state: &AppState, user: Option<&str>) -> Vec<ExternalTo
     if rows.is_empty() {
         return Vec::new();
     }
-    let (role, kb) = identity(state, user).await;
+    let (role, kb) = match identity(&state.db, user).await {
+        Ok(id) => id,
+        Err(e) => {
+            // Fail closed (no external tools), but loudly and with the cause:
+            // the tools are withheld because the caller could not be read,
+            // not because there are none.
+            tracing::error!(error = %e, "mcp_bridge_identity_unreadable: external MCP tools withheld for this caller");
+            return Vec::new();
+        }
+    };
     rows.into_iter()
         .filter(|(_, _, aud, _, _, _)| audience_permits(&audience_of(aud), user, role, &kb))
         .map(|(server, kind, _, name, description, input_schema)| ExternalTool { server, kind, name, description, input_schema })
@@ -192,11 +201,18 @@ pub async fn llm_schemas_for(state: &AppState, user: Option<&str>) -> Vec<Value>
     catalog_for(state, user).await.iter().map(ExternalTool::llm_schema).collect()
 }
 
-pub async fn server_ids(state: &AppState) -> Vec<String> {
+/// The enabled MCP server ids, to split a `mcp_<server>_<tool>` name. An
+/// unreadable list is an ERROR (i460): the call is answered with it, rather
+/// than the tool reading as unknown, which named the wrong cause.
+pub async fn server_ids(state: &AppState) -> Result<Vec<String>, String> {
+    server_ids_in(&state.db).await
+}
+
+async fn server_ids_in(db: &sqlx::PgPool) -> Result<Vec<String>, String> {
     sqlx::query_scalar("SELECT id FROM noo_mcp_servers WHERE enabled")
-        .fetch_all(&state.db)
+        .fetch_all(db)
         .await
-        .unwrap_or_default()
+        .map_err(|e| format!("external MCP tools are unavailable: the server list could not be read: {e}"))
 }
 
 /// Flatten an MCP `tools/call` result to the text the model reads.
@@ -249,7 +265,9 @@ pub async fn call(state: &AppState, user: Option<&str>, server: &str, tool: &str
     if !has_tool {
         return Err(format!("'{server}' has no discovered tool '{tool}'"));
     }
-    let (role, kb) = identity(state, user).await;
+    // An unreadable caller is the call's error, with its cause, never a
+    // "not in your audience" verdict (i460).
+    let (role, kb) = identity(&state.db, user).await?;
     if !audience_permits(&audience_of(&audience), user, role, &kb) {
         record(state, server, tool, user, false, started).await;
         return Err(format!("'{server}' is not in your audience"));
@@ -397,5 +415,35 @@ mod tests {
         let e = flatten_result(&json!({"content": [{"type": "text", "text": "bad date"}], "isError": true})).unwrap_err();
         assert_eq!(e, "bad date");
         assert_eq!(flatten_result(&json!({"isError": true})).unwrap_err(), "tool reported an error");
+    }
+}
+
+/// An unreadable caller or server list is an error with its cause (i460),
+/// never "no role", "no audience" or "no servers".
+#[cfg(test)]
+mod db_read_error_tests {
+    fn dead_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool")
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_role_is_an_error_not_an_empty_identity() {
+        match super::identity(&dead_pool(), Some("alice")).await {
+            Err(m) => assert!(m.contains("cannot read alice's role"), "{m}"),
+            Ok(id) => panic!("an unreadable role must not answer an identity, got {id:?}"),
+        }
+        // No person: nothing is read, so nothing can fail.
+        assert!(super::identity(&dead_pool(), None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_server_list_is_an_error_not_no_servers() {
+        match super::server_ids_in(&dead_pool()).await {
+            Err(m) => assert!(m.contains("server list could not be read"), "{m}"),
+            Ok(ids) => panic!("an unreadable list must not answer servers, got {ids:?}"),
+        }
     }
 }

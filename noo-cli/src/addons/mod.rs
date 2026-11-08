@@ -10,6 +10,8 @@ pub mod check;
 pub mod decls;
 pub mod guards;
 pub mod lock_fetch;
+pub mod node_images;
+pub mod node_workloads;
 pub mod pins;
 pub mod pop;
 pub mod provisioned;
@@ -121,6 +123,10 @@ pub struct Ctx<'a> {
     pub stack_lock: Option<&'a str>,
     pub allow_downgrade: bool,
     pub client: &'a lock_fetch::Client,
+    /// The images store directory node-workload images are exported into
+    /// (`image_stage::images_store_dir()` in production), chosen once by the
+    /// verb that builds this.
+    pub images_dir: &'a Path,
 }
 
 /// Steps 1-7 for one add-on against `ctx.tag`: anchor, fetch, verify, stack
@@ -181,6 +187,7 @@ fn prepare_with(
         stack_lock: ctx.stack_lock,
         allow_downgrade: ctx.allow_downgrade,
         client,
+        images_dir: ctx.images_dir,
     };
     let current = pins::read(ctx.root).map_err(Refusal::Write)?;
     let pin = current.get(addon);
@@ -197,9 +204,13 @@ fn prepare_with(
     let (verified, fetched) = resolve_lock(ctx.client, &anchor, &want, supplied)?;
     // What the overlay takes from core, and (third-party) its name: refused
     // here, before an image is pulled or a pin written (`guards`).
-    guards::guard_install(ctx.root, addon, &fetched.files).map_err(Refusal::Decl)?;
+    let checked = guards::guard_install(ctx.root, addon, &fetched.files).map_err(Refusal::Decl)?;
+    for w in &checked.warnings {
+        crate::ui::warned(&format!("add-on {addon}: {w}"));
+    }
     // The gateway refuses a bad routes.json whole at load: refuse it here, by its own rules.
     check::refuse_bad_routes(addon, &fetched.files)?;
+    check::refuse_console_collision(ctx.root, addon, &fetched.files)?;
     resolve::require_bundle(&verified, ctx.tag)?;
     let mut cred = || -> Result<Option<Credential>, String> {
         ctx.client.docker_credential(&route).map_err(|e| format!("{}: {}", route.host(), e.summary()))
@@ -214,6 +225,20 @@ fn prepare_with(
         },
         r => r,
     })?;
+    // The gateway has no docker: the images a node runs for this add-on
+    // (named by its node-workloads.json) are exported onto the rail here, by
+    // the lock's digests, before anything is pinned (i300).
+    let staged = node_images::stage_prepared(
+        docker,
+        addon,
+        &verified.lock.images,
+        &fetched.files,
+        &route,
+        ctx.images_dir,
+    );
+    staged.map_err(|e| {
+        Refusal::Pull(format!("its node-workload images could not be exported to the artifact rail: {e}"))
+    })?;
     Ok(Prepared {
         addon: addon.to_string(),
         verified,
@@ -226,5 +251,14 @@ fn prepare_with(
 
 /// Step 8 for a prepared add-on.
 pub fn commit(root: &Path, p: &Prepared, tag: &str) -> Result<pins::Pin, Refusal> {
-    resolve::record(root, &p.addon, &p.verified, &p.fetched, tag, p.pulled_from.clone())
+    check::refuse_console_collision(root, &p.addon, &p.fetched.files)?;
+    let previous = std::fs::read_to_string(pins::addon_dir(root, &p.addon).join(addon_manifest::ROUTES_FILE)).ok()
+        .and_then(|text| addon_manifest::parse(&text).ok()).and_then(|m| m.ui).and_then(|ui| ui.console_path);
+    let next = p.fetched.files.get(addon_manifest::ROUTES_FILE)
+        .and_then(|raw| std::str::from_utf8(raw).ok()).and_then(|text| addon_manifest::parse(text).ok()).and_then(|m| m.ui).and_then(|ui| ui.console_path);
+    let pin = resolve::record(root, &p.addon, &p.verified, &p.fetched, tag, p.pulled_from.clone())?;
+    if previous != next {
+        eprintln!("{}: console path {:?} -> {:?}; restart the gateway to mount changes; removed bookmarks return 404", p.addon, previous, next);
+    }
+    Ok(pin)
 }

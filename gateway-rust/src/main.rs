@@ -110,6 +110,8 @@ mod embed_jobs;
 mod embedding_client;
 mod embedding_spaces;
 mod google_auth;
+mod connections;
+mod integrations;
 mod host_daemon;
 mod mcp_external;
 mod mcp_local;
@@ -127,7 +129,11 @@ mod addons;
 mod addon_decls;
 mod addon_proxy;
 mod addon_workloads;
+mod node_workloads;
+mod node_workload_sources;
+mod workload_placement;
 mod addon_ui;
+mod addon_console;
 mod addon_ws;
 mod addon_delegation;
 mod addon_registry;
@@ -140,6 +146,7 @@ mod agent_mail_archive;
 mod audit_integrity;
 mod audit_chain;
 mod audit_head_export;
+mod audit_verify;
 mod audit_context;
 mod audit_spool;
 mod autonomy_audit;
@@ -659,7 +666,10 @@ async fn main() -> Result<()> {
 
     // The signed audit chain head, recorded outside the database.
     audit_head_export::spawn(state.clone());
+    // i520: the full chain verify every 6 h, so a broken row pages on its own.
+    audit_verify::spawn(state.clone());
     ingest_loop::spawn(state.clone());
+    integrations::sync::spawn(state.clone());
     recall_archive_loop::spawn(state.clone());
 
     // Heartbeat scheduler — fires due tasks from noo_heartbeat_tasks every

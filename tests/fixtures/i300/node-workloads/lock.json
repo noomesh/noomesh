@@ -1,0 +1,7 @@
+{
+  "comment": "the images map of the fixture add-on's signed lock (rhaddon); not a case file",
+  "images": {
+    "addon": "ghcr.io/example/rhaddon@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "addon-worker": "ghcr.io/example/rhaddon/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  }
+}

@@ -14,6 +14,8 @@ export interface AddonUi {
   urlBase: string | null;
   /** Whether this account's role may open it. */
   canOpen: boolean;
+  consolePath?: string | null;
+  framePermissions?: string[] | null;
 }
 
 /** The gateway's own words on failure (`{"detail"}` or `{"error"}`). */
@@ -41,6 +43,8 @@ export function useAddonUis() {
         port: u.port,
         urlBase: u.url_base ?? null,
         canOpen: u.can_open,
+        consolePath: u.console_path ?? null,
+        framePermissions: u.frame_permissions ?? null,
       }));
     },
   });

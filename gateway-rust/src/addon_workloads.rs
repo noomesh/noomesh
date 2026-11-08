@@ -91,7 +91,7 @@ struct WorkloadsFile {
     workloads: Vec<WorkloadDecl>,
 }
 
-/// Is `s` a workload (or add-on) name by the spec: `^[a-z][a-z0-9-]{0,31}$`.
+/// Is `s` a workload name by the spec: `^[a-z][a-z0-9-]{0,31}$`.
 pub fn workload_name_ok(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty() && b.len() <= 32 && b[0].is_ascii_lowercase() && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
@@ -103,8 +103,8 @@ pub fn workload_name_ok(s: &str) -> bool {
 /// 128); `need_mb` 1..=[`MAX_NEED_MB`]; the drain route exists in the
 /// manifest, is `internal`, and its `timeout_secs` is 1..=[`MAX_DRAIN_SECS`].
 pub fn validate(d: &WorkloadDecl, manifest: Option<&crate::addon_proxy::AddonManifest>) -> Result<(), String> {
-    if !workload_name_ok(&d.addon) || !workload_name_ok(&d.name) {
-        return Err(format!("workload {:?}: add-on and workload names are a lowercase letter, then lowercase letters, digits and `-`, at most 32 characters", d.name));
+    if !addon_manifest::addon_name_ok(&d.addon) || !workload_name_ok(&d.name) {
+        return Err(format!("workload {:?}: invalid add-on or workload name; add-ons follow the manifest naming rules, workloads use lowercase letters, digits and `-`", d.name));
     }
     let prefix = format!("noo-{}-", d.addon);
     if !d.container.starts_with(&prefix) || d.container.len() <= prefix.len() || d.container.len() > 128
@@ -221,7 +221,7 @@ pub fn lookup(addon: &str, name: &str) -> Option<WorkloadDecl> {
 /// Split a reservation's `<addon>/<workload>`.
 pub fn split_key(key: &str) -> Option<(String, String)> {
     let (a, w) = key.trim().split_once('/')?;
-    if !workload_name_ok(a) || !workload_name_ok(w) {
+    if !addon_manifest::addon_name_ok(a) || !workload_name_ok(w) {
         return None;
     }
     Some((a.to_string(), w.to_string()))
@@ -236,17 +236,41 @@ pub fn for_nodes() -> Vec<Value> {
 
 /// The front door's rule for the workload proxy and status
 /// (`/api/addon-workloads/{addon}/{workload}/proxy/...` and `.../status`): an
-/// add-on's own token (`sub = addon:<addon>`) may reach the routes under ITS
+/// add-on's own token (`sub = addon:svc:<addon>`) may reach the routes under ITS
 /// OWN add-on name and no other. Everything else on the path stays with the
 /// tier gate (an operator passes it anyway).
 pub fn proxy_allows(sub: &str, path: &str) -> bool {
-    let Some(addon) = sub.strip_prefix(crate::auth::ADDON_SUBJECT_PREFIX) else { return false };
+    let Some(rest) = path.strip_prefix("/api/addon-workloads/") else { return false };
+    let Some((owner, tail)) = rest.split_once('/') else { return false };
+    subject_owns(sub, owner) && matches!(tail.split('/').nth(1), Some("proxy") | Some("status"))
+}
+
+/// Provisioning names consumers `svc:<addon>`; the exchange door preserves
+/// that name in the JWT. Operator-issued keys with that consumer have the same
+/// ownership. Core consumer names are reserved by the shared add-on validator.
+/// Keep legacy explicitly-issued `addon:<addon>` keys working too; do not
+/// change the authenticated subject forwarded to a worker.
+pub fn subject_owns(sub: &str, addon: &str) -> bool {
+    if !addon_manifest::addon_name_ok(addon) {
+        return false;
+    }
+    let Some(consumer) = sub.strip_prefix(crate::auth::ADDON_SUBJECT_PREFIX) else { return false };
+    consumer == addon || consumer.strip_prefix("svc:") == Some(addon)
+}
+
+/// The front door's rule for an add-on's reserve and release (i300 H5): a
+/// DELEGATED token (`act.sub = addon:<addon>`, the person as `sub`) reaches
+/// `/api/addon-workloads/<addon>/<workload>/reserve|release` under ITS OWN
+/// add-on's name and no other. The add-on's service key alone never does:
+/// a reservation is made for a person, whom f99 then decides on.
+pub fn delegated_reserve_allows(act_sub: Option<&str>, path: &str) -> bool {
+    let Some(addon) = act_sub.and_then(|s| s.strip_prefix(crate::auth::ADDON_SUBJECT_PREFIX)) else { return false };
     if addon.is_empty() || !crate::addon_registry::name_ok(addon) {
         return false;
     }
     let Some(rest) = path.strip_prefix("/api/addon-workloads/") else { return false };
-    let Some((owner, tail)) = rest.split_once('/') else { return false };
-    owner == addon && matches!(tail.split('/').nth(1), Some("proxy") | Some("status"))
+    let parts: Vec<&str> = rest.split('/').collect();
+    matches!(parts.as_slice(), [owner, w, op] if *owner == addon && workload_name_ok(w) && matches!(*op, "reserve" | "release"))
 }
 
 /// Group declarations by add-on, for a report.
@@ -301,8 +325,8 @@ mod tests {
         };
         let sixteen_plus: String = (0..17).map(|i| ok(&format!("w{i}"), &format!("noo-pai-voice-w{i}"), "")).collect::<Vec<_>>().join(",");
         for (text, needle) in [
-            (format!(r#"{{"workloads": [{}]}}"#, ok("Voice", "noo-pai-voice-x", "")), "names are"),
-            (format!(r#"{{"workloads": [{}]}}"#, ok("voice_worker", "noo-pai-voice-x", "")), "names are"),
+            (format!(r#"{{"workloads": [{}]}}"#, ok("Voice", "noo-pai-voice-x", "")), "invalid add-on or workload name"),
+            (format!(r#"{{"workloads": [{}]}}"#, ok("voice_worker", "noo-pai-voice-x", "")), "invalid add-on or workload name"),
             (format!(r#"{{"workloads": [{}]}}"#, ok("w", "pai-voice-worker", "")), "noo-pai-voice-"),
             (format!(r#"{{"workloads": [{}]}}"#, ok("w", "noo-x", "")), "noo-pai-voice-"),
             (r#"{"workloads": [{"name": "w", "container": "noo-pai-voice-x", "gpu": true, "need_mb": 0, "drain": {"route": "drain", "timeout_secs": 120}}]}"#.to_string(), "need_mb"),
@@ -345,6 +369,22 @@ mod tests {
         assert!(!proxy_allows("addon:pai-voice", "/api/addon-workloads/evolve/worker/proxy/x"), "another add-on's workload");
         assert!(!proxy_allows("addon:pai-voice", "/api/addon-workloads/pai-voice/voice-worker/start"), "the actuator is not the proxy");
         assert!(proxy_allows("addon:pai-voice", "/api/addon-workloads/pai-voice/voice-worker/status"), "its own status");
+        // i300 H5: the service key alone never reserves (a reservation is for a person).
+        assert!(!proxy_allows("addon:rhaddon", "/api/addon-workloads/rhaddon/worker/reserve"));
+        assert!(!proxy_allows("addon:rhaddon", "/api/addon-workloads/rhaddon/worker/release"));
+    }
+
+    #[test]
+    fn a_delegated_token_reaches_its_own_addons_reserve_and_release_only() {
+        let act = Some("addon:rhaddon");
+        assert!(delegated_reserve_allows(act, "/api/addon-workloads/rhaddon/worker/reserve"));
+        assert!(delegated_reserve_allows(act, "/api/addon-workloads/rhaddon/worker/release"));
+        assert!(!delegated_reserve_allows(act, "/api/addon-workloads/otheraddon/worker/reserve"), "another add-on's");
+        assert!(!delegated_reserve_allows(act, "/api/addon-workloads/rhaddon/worker/proxy/x"), "not the proxy");
+        assert!(!delegated_reserve_allows(act, "/api/addon-workloads/rhaddon/worker/reserve/extra"));
+        assert!(!delegated_reserve_allows(act, "/api/cluster/reservations"));
+        assert!(!delegated_reserve_allows(None, "/api/addon-workloads/rhaddon/worker/reserve"), "no delegation");
+        assert!(!delegated_reserve_allows(Some("key:svc"), "/api/addon-workloads/rhaddon/worker/reserve"), "not an add-on actor");
         assert!(!proxy_allows("addon:pai-voice", "/api/addon-workloads/evolve/worker/status"));
         assert!(!proxy_allows("addon:pai-voice", "/api/cluster/reservations"), "not the reservation API");
         assert!(!proxy_allows("user:alice", "/api/addon-workloads/pai-voice/voice-worker/proxy/x"), "not an add-on token");
@@ -352,7 +392,41 @@ mod tests {
     }
 
     #[test]
+    fn provisioned_consumer_tokens_reach_only_their_own_workload() {
+        use crate::auth::{RequesterCtx, Role};
+        use axum::http::Method;
+        let secret = "workload-test-signing-key-not-a-deployed-credential";
+        let token = crate::auth::mint_addon_jwt("svc:rhaddon", &["metrics".into()], 60, secret, None).unwrap();
+        let claims = crate::auth::verify_token_with(&token, secret, None).unwrap();
+        assert_eq!(claims.sub, "addon:svc:rhaddon");
+        let requester = RequesterCtx { sub: claims.sub, scopes: claims.scopes,
+            role: Role::User, harness: None, act: None };
+        assert!(subject_owns(&requester.sub, "rhaddon"));
+        for tail in ["status", "proxy/v1/worker/ws"] {
+            let own = format!("/api/addon-workloads/rhaddon/voice-worker/{tail}");
+            assert!(crate::auth::requester_allows(&requester, &Method::GET, &own));
+            assert!(!proxy_allows(&requester.sub, &own.replace("rhaddon", "other-addon")));
+        }
+        for path in ["/api/cluster/reservations", "/api/addon-workloads/rhaddon/voice-worker/start"] {
+            assert!(!crate::auth::requester_allows(&requester, &Method::POST, path));
+        }
+        for sub in ["svc:rhaddon", "addon:svc:other-addon", "addon:svc:svc:rhaddon", "alice", "addon:svc:"] {
+            assert!(!subject_owns(sub, "rhaddon"), "{sub}");
+        }
+        assert!(!subject_owns("addon:svc:../rhaddon", "../rhaddon"));
+        assert!(subject_owns("addon:svc:my_addon", "my_addon"));
+        assert!(subject_owns("addon:my_addon", "my_addon"));
+        assert!(!subject_owns("addon:svc:my-addon", "my_addon"));
+        for name in addon_manifest::CORE_SERVICE_NAMES {
+            assert!(!subject_owns(&format!("addon:svc:{name}"), name));
+            assert!(!subject_owns(&format!("addon:{name}"), name));
+        }
+    }
+
+    #[test]
     fn split_key_takes_addon_slash_workload() {
+        assert_eq!(split_key("my_addon/worker"), Some(("my_addon".into(), "worker".into())));
+        assert_eq!(split_key("worker/worker"), None);
         assert_eq!(split_key("pai-voice/voice-worker"), Some(("pai-voice".into(), "voice-worker".into())));
         assert_eq!(split_key("pai-voice"), None);
         assert_eq!(split_key("Pai/Voice"), None);

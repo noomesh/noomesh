@@ -728,7 +728,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("noo-trust-prep-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("docker-compose.cluster.yml"), "services:\n  gateway:\n    image: g\n").unwrap();
-        let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &client };
+        let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &client, images_dir: &root.join("images") };
         let mut docker = FakeDocker::default();
         let p = addons::prepare_from(&ctx, "pai-voice", &anchor(), Some(f), &mut docker).expect("prepared");
         assert_eq!(p.pulled, 1);
@@ -752,7 +752,7 @@ mod tests {
             "services:\n  gateway:\n    image: g\nsecrets:\n  noo_jwt_secret:\n    file: ${NOO_SECRET_RUNDIR:-/x}/noo_jwt_secret\n    x-noo-source: NOO_JWT_SECRET\n",
         )
         .unwrap();
-        let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &client };
+        let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &client, images_dir: &root.join("images") };
         // 1. Its service takes core's JWT secret by name.
         let overlay = "services:\n  noo-rhaddon:\n    image: x\n    secrets: [noo_jwt_secret]\n";
         let mut l = third_party_lock(&["v0.6.0"]);
@@ -807,7 +807,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("docker-compose.cluster.yml"), "services:\n  gateway:\n    image: g\n").unwrap();
-        let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &client };
+        let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &client, images_dir: &root.join("images") };
         let good = include_str!("../../../tests/fixtures/addons/rhaddon/routes.json");
         let mut m: serde_json::Value = serde_json::from_str(good).unwrap();
         m["routes"].as_array_mut().unwrap().push(serde_json::json!({
@@ -1024,7 +1024,7 @@ mod tests {
         use crate::addons;
         let root = prep_root("cred-pull");
         let bc = bound_client();
-        let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &bc };
+        let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &bc, images_dir: &root.join("images") };
         let mut docker = FakeDocker::default();
         let f = signed_bundle(&rh_lock());
         let p = addons::prepare_with(&ctx, "rhaddon", &anchor(), Some(f), &mut docker, &bc).expect("prepared");
@@ -1061,7 +1061,7 @@ mod tests {
         use crate::addons;
         let root = prep_root("cred-cache");
         let bc = bound_client();
-        let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &bc };
+        let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &bc, images_dir: &root.join("images") };
         let f = signed_bundle(&rh_lock());
         let p = addons::prepare_with(&ctx, "rhaddon", &anchor(), Some(f), &mut FakeDocker::default(), &bc).unwrap();
         addons::commit(&root, &p, "v0.6.0").unwrap();
@@ -1088,7 +1088,7 @@ mod tests {
         use crate::addons;
         let root = prep_root("cred-refused");
         let plain = crate::addons::lock_fetch::Client::plain_http_for_tests(None);
-        let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &plain };
+        let ctx = addons::Ctx { root: &root, tag: "v0.6.0", stack_lock: None, allow_downgrade: false, client: &plain, images_dir: &root.join("images") };
         let run = |client: &crate::addons::lock_fetch::Client| {
             let mut docker = FakeDocker { fail_pull: true, ..Default::default() };
             let f = signed_bundle(&rh_lock());
@@ -1117,6 +1117,51 @@ mod tests {
         let mut ok = FakeDocker::default();
         let f = signed_bundle(&rh_lock());
         assert!(addons::prepare_with(&ctx, "rhaddon", &anchor(), Some(f), &mut ok, &plain).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// i300: the images a node runs are exported from the local store, never
+    /// pulled for. A node-workload image that is not local at that point is
+    /// refused as a pull refusal naming the rail, docker pulls nothing more,
+    /// and nothing is pinned. Reverting the `Refusal::Pull` wiring of
+    /// `stage_prepared` in `prepare_with` makes it prepare.
+    #[test]
+    fn prepare_refuses_a_node_workload_image_that_is_not_local_and_pulls_nothing() {
+        use crate::addons::{self, lock_fetch::Client};
+        use crate::addons::resolve::tests::{digest, signed_rh_bundle};
+        let root = prep_root("nw-notlocal");
+        let plain = Client::plain_http_for_tests(None);
+        let images = root.join("images");
+        let ctx = addons::Ctx {
+            root: &root,
+            tag: "v0.6.0",
+            stack_lock: None,
+            allow_downgrade: false,
+            client: &plain,
+            images_dir: &images,
+        };
+        let mut l = rh_lock();
+        l.images.insert("addon-worker".into(), format!("{ROOT}/worker@{}", digest('2')));
+        let f = signed_rh_bundle(
+            &l,
+            include_bytes!("../../../tests/fixtures/addons/rhaddon/node-workloads.json"),
+            include_bytes!("../../../tests/fixtures/addons/rhaddon/routes.json"),
+        );
+        // Every image is local (so pull_images pulls nothing) but docker
+        // cannot name an id for any of them.
+        let local = l.images.values().cloned().collect();
+        let mut docker = FakeDocker { local, ..Default::default() };
+        let r = addons::prepare_with(&ctx, "rhaddon", &anchor(), Some(f), &mut docker, &plain)
+            .expect_err("refused");
+        match &r {
+            Refusal::Pull(e) => {
+                assert!(e.contains("artifact rail") && e.contains("No such image"), "{e}");
+            }
+            other => panic!("expected a pull refusal, got {other:?}"),
+        }
+        assert!(docker.pulls.is_empty(), "no pull for a node image: {:?}", docker.pulls);
+        assert!(docker.saves.is_empty(), "{:?}", docker.saves);
+        assert!(!addons::pins::pins_path(&root).exists(), "nothing is pinned");
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -18,10 +18,13 @@ pub mod addon_enable;
 pub mod addon_provision;
 pub mod addon_pins;
 pub mod addon_resources;
+pub mod addon_after_boot;
 pub mod backups;
 pub mod agents;
 pub mod approval;
 pub mod auth;
+pub mod auth_connect;
+pub use auth_connect::auth_connect;
 pub mod autonomy;
 pub mod channels;
 pub mod chat;
@@ -73,7 +76,9 @@ pub mod controller;
 pub mod migrate;
 pub mod migrate_db;
 pub mod models;
+pub mod models_extract;
 pub mod models_fetch;
+pub mod models_sets;
 pub mod ollama_stage;
 pub mod voice_models;
 pub mod pki;
@@ -173,6 +178,7 @@ pub use mesh::{
 };
 pub use migrate::{migrate_export, migrate_import};
 pub use models_fetch::models_fetch;
+pub use models_sets::{models_accept, models_rm, models_stage};
 pub use models::{
     models_cached, models_huggingface, models_info, models_list, models_ollama, models_pull,
     models_recommended, models_search,
@@ -440,6 +446,7 @@ pub use release_sign::*;
 pub use addon_lock_cmd::{security_addon_lock_sign, security_addon_lock_verify};
 pub use addon_pins::{addons_launch_pins, addons_upgrade, addons_verify};
 pub use addon_resources::{addons_launch_resources, addons_rotate_secret};
+pub use addon_after_boot::addons_after_boot;
 pub use addon_access::{addons_accept_suggestions, addons_access, addons_features, addons_set_access};
 pub use addons::{addons_check, addons_disable, addons_enable, addons_list, addons_registry_login, addons_set, addons_show, addons_trust_key, addons_untrust_key};
 pub use backups::{backups_setup, backups_status};

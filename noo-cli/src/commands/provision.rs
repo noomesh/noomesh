@@ -36,7 +36,7 @@
 //! `cluster_provision` is a literal ordered list of phases; read it for the
 //! order. In order: `parse_provision_args`, `begin_provision` (lane),
 //! `wait_for_enrollment` (1), `load_enrollment` (2), `resolve_identity`,
-//! `resolve_machine`, `ensure_node_certs` + door leaves (3), `load_credentials`
+//! `resolve_machine`, `adopt_signing_key_first`, `ensure_node_certs` + door leaves (3), `load_credentials`
 //! (4), `obtain_binary` (5), `read_env_template` / `build_env_vars` /
 //! `check_data_root` / `render_agent_env` (6), `read_bundle_material`,
 //! `prepare_bundle_workspace`, `base_bundle_files`, the `attach_*` phases
@@ -319,6 +319,7 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     let enrollment = load_enrollment(g, &a, &site);
     let id = resolve_identity(g, &a, &site, &enrollment);
     let machine = resolve_machine(g, &a, &enrollment);
+    adopt_signing_key_first(g, &a);
 
     // The node's PKI, and the agent it will run.
     let pki = ensure_node_certs(g, &a, &site, &id);
@@ -781,7 +782,9 @@ fn ensure_node_certs(g: &Globals, a: &ProvisionArgs, site: &ProvSite, id: &ProvI
     // of its node name — the same test the onboard install applies.
     let role = crate::pki::NodeRole::of(&node);
     let (want_dns, want_ips) = if is_self {
-        (role.required_dns().to_vec(), Vec::new())
+        // i545 89/92: its tailnet address too (this device's own), so a
+        // promote's new address re-issues the self-node cert on restage.
+        (role.required_dns().to_vec(), role.tailnet_ip4(&node).into_iter().collect())
     } else {
         want_ips.extend(crate::pki::ClusterCa::tailscale_ip4(&node));
         (want_dns, want_ips)
@@ -1057,19 +1060,30 @@ fn read_bundle_material(g: &Globals, a: &ProvisionArgs, site: &ProvSite, pki: &P
     BundleMaterial { unit, ca_crt, node_crt, node_key }
 }
 
-/// Step 7: the CA, the signing key delivered first when the node has not adopted it, and a scratch dir.
-fn prepare_bundle_workspace(g: &Globals, a: &ProvisionArgs, pki: &Path) -> (crate::pki::ClusterCa, std::path::PathBuf) {
+/// The signing key, delivered ALONE first when the node has not adopted it.
+///
+/// The CA signs nothing but the signing key itself, so a node that has not
+/// adopted it gets the key first (a CA-signed rollover carrying `signing-pub`
+/// and nothing else), and only then its bundle, signed by the signing key.
+///
+/// It runs BEFORE `ensure_node_certs`, so a node that cannot adopt leaves
+/// nothing minted behind. It used to run after: a first-time pull node the
+/// rollout refused still got certs issued into `<pki>/nodes/<node>`, and the
+/// next run called that directory orphaned material to purge (i545 finding
+/// 99, the state the command itself had just created).
+fn adopt_signing_key_first(g: &Globals, a: &ProvisionArgs) {
+    let ca = crate::pki::ClusterCa::new(crate::pki::pki_dir());
+    if !ca.signing_adopted(&a.node) {
+        deliver_signing_key_first(g, &a.node, &ca);
+    }
+}
+
+/// Step 7: the CA and a scratch dir (the signing key was adopted in
+/// `adopt_signing_key_first`).
+fn prepare_bundle_workspace(_g: &Globals, a: &ProvisionArgs, pki: &Path) -> (crate::pki::ClusterCa, std::path::PathBuf) {
     let node = a.node.clone();
     let pki = pki.to_path_buf();
     let ca = crate::pki::ClusterCa::new(pki.clone());
-    // The CA signs nothing but the signing key itself, so a
-    // node that has not adopted it gets the key ALONE first (a CA-signed
-    // rollover carrying `signing-pub` and nothing else), and only then this
-    // bundle, signed by the signing key. Done before anything is minted, so
-    // a node that cannot adopt leaves nothing half-rotated behind.
-    if !ca.signing_adopted(&node) {
-        deliver_signing_key_first(g, &node, &ca);
-    }
     let work = std::env::temp_dir().join(format!("noo-provision-{node}-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&work);
     (ca, work)
@@ -1402,6 +1416,31 @@ fn attach_door_leaves(g: &Globals, a: &ProvisionArgs, enr: &ProvEnrollment, m: &
     } else {
         nnote(&super::node_leaves::withheld_leaves_note(&node, &node_app_version,
             super::node_leaves::upgrade_restages_leaves()));
+    }
+    // Enabled add-ons' node workload doors (svc-addon-*): gated by their own
+    // floor on EVERY OS, one line per node when withheld.
+    let doors = super::node_leaves::node_workload_doors(&crate::envfile::repo_root());
+    if doors.is_empty() {
+        return;
+    }
+    if !super::node_leaves::applier_knows_addon_leaf_kinds(&node_app_version) {
+        nnote(&super::node_leaves::addon_leaves_withheld_note(&node, &node_app_version));
+        return;
+    }
+    match super::node_leaves::addon_leaf_payloads(ca, &node, &doors) {
+        Ok((leaves, skipped)) => {
+            let n = leaves.len() / 2;
+            // Bundle kinds are `&'static str`; these few names live for the
+            // rest of this short-lived CLI process anyway.
+            files.extend(leaves.into_iter().map(|(k, b)| (&*Box::leak(k.into_boxed_str()), b)));
+            if skipped.is_empty() {
+                nnote(&format!("bundle carries {n} add-on door leaves (services/addon-<a>-<w>/ on the node)"));
+            } else {
+                nnote(&format!("bundle carries {n} add-on door leaves; NOT {} (half a pair on disk — \
+                    `noo cluster provision {node}` again re-issues it)", skipped.join(", ")));
+            }
+        }
+        Err(e) => { scrub(&work); fail(g.json, ExitCode::Generic, "leaf_read", &e, None); }
     }
 }
 
@@ -1770,6 +1809,17 @@ fn ensure_door_leaves_try(ca: &crate::pki::ClusterCa, node: &str) -> Result<(), 
             }
         }
         Err(e) => return Err(format!("could not issue {node}'s backend door leaves: {e}")),
+    }
+    // Enabled add-ons' node workload doors: one more leaf each, same issuer.
+    // An invalid pair is an error naming it, never a silent skip.
+    let doors = super::node_leaves::node_workload_doors(&crate::envfile::repo_root());
+    match super::node_leaves::ensure_addon_leaves(ca, node, crate::pki::DEFAULT_DAYS, &doors) {
+        Ok(issued) => {
+            for (svc, why) in issued {
+                nstep(&format!("add-on door leaf {svc}: issued ({why})"));
+            }
+        }
+        Err(e) => return Err(format!("could not issue {node}'s add-on door leaves: {e}")),
     }
     // The keys this bundle packs are the CLI's alone on this disk (0600,
     // `pki::KeyReader::Cli`). Issuance sets that; a key from before
@@ -2852,10 +2902,16 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
     // which makes this lane, and therefore `noo upgrade`, the repair.
     let node_crt = pki.join("nodes").join(node).join("node.crt");
     let role = crate::pki::NodeRole::of(node);
+    // i545 89/92: and the controller's tailnet ADDRESS. A promote or a move
+    // to bind mode tailnet adds it to the controller's identity; a cert
+    // judged on names alone kept the old address set, and the gateway's
+    // calls to the self-agent at that address failed verification.
+    let ts_ip: Vec<String> = role.tailnet_ip4(node).into_iter().collect();
     let reason = if !pki.join("nodes").join(node).join("node.key").exists() || !node_crt.exists() {
         Some(format!("issuing a cert for {node} into the local PKI"))
-    } else if !crate::pki::ClusterCa::cert_covers_sans(&node_crt, role.required_dns(), &[]) {
-        Some(format!("{node}'s cert lacks the controller names ({}) — re-issuing", role.required_dns().join(", ")))
+    } else if !crate::pki::ClusterCa::cert_covers_sans(&node_crt, role.required_dns(), &ts_ip) {
+        Some(format!("{node}'s cert lacks the controller names or address ({}) — re-issuing",
+            role.required_dns().iter().chain(ts_ip.iter()).cloned().collect::<Vec<_>>().join(", ")))
     } else {
         None
     };
@@ -2872,7 +2928,6 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
         if !ca.ca_exists() {
             return Err("no cluster CA found — run `noo onboard --only security` first".into());
         }
-        let ts_ip: Vec<String> = role.tailnet_ip4(node).into_iter().collect();
         ca.issue_node_cert(node, &crate::onboard::util::detect_ip(), crate::pki::DEFAULT_DAYS,
                 &["node-agent".to_string()], &ts_ip, &role)
             .map_err(|e| format!("could not issue a cert for {node}: {e}"))?;
@@ -4944,6 +4999,20 @@ mod tests {
         assert!(body.contains("&ts_ip, &role)"), "the controller role (names, own tailnet address) is issued");
     }
 
+    /// i545 89/92: both lanes judge the self-node cert on the controller's
+    /// tailnet ADDRESS as well as its names, so a promote (new identity)
+    /// re-issues it instead of keeping the old address set.
+    #[test]
+    fn both_lanes_reissue_the_self_node_cert_on_a_missing_tailnet_address() {
+        let src = crate::test_src::own_code(include_str!("provision.rs"));
+        let local = crate::test_src::fn_body(&src, "fn provision_local_in(");
+        assert!(local.contains("let ts_ip: Vec<String> = role.tailnet_ip4(node).into_iter().collect();"), "the address is derived");
+        assert!(local.contains("cert_covers_sans(&node_crt, role.required_dns(), &ts_ip)"), "the local lane checks it");
+        let rail = crate::test_src::fn_body(&src, "fn ensure_node_certs(");
+        assert!(rail.contains("(role.required_dns().to_vec(), role.tailnet_ip4(&node).into_iter().collect())"), "the rail lane checks it");
+        assert!(rail.contains("cert_covers_sans(&node_crt, &want_dns, &want_ips)"));
+    }
+
     #[test]
     fn provision_mints_certs_without_delivering() {
         let whole = include_str!("provision.rs");
@@ -5331,6 +5400,23 @@ mod controller_hostd_tests {
 }
 
 #[cfg(test)]
+mod signing_key_order_tests {
+    /// i545 finding 99: certs were issued before the signing key was
+    /// delivered, so a node that could not adopt left material behind that
+    /// the next run called orphaned. The key goes first.
+    #[test]
+    fn the_signing_key_is_adopted_before_any_cert_is_issued() {
+        let list = super::phase_src::list();
+        let adopt = list.find("adopt_signing_key_first(").expect("the adoption phase");
+        let certs = list.find("ensure_node_certs(").expect("the cert phase");
+        assert!(adopt < certs, "the signing key must be adopted before certs are issued");
+        assert!(super::phase_src::body("adopt_signing_key_first").contains("deliver_signing_key_first("));
+        assert!(!super::phase_src::body("prepare_bundle_workspace").contains("deliver_signing_key_first("),
+            "the key is delivered in one place");
+    }
+}
+
+#[cfg(test)]
 mod self_node_rail_tests {
     //! i67: the controller's own node rides the rail like any node; the
     //! only sudo is creating its node identity, once.
@@ -5427,11 +5513,15 @@ mod self_node_rail_tests {
         let e = r.expect_err("an install with no CA must fail — by returning");
         assert!(e.contains("ca.crt") || e.contains("prep-host"), "{e}");
         let _ = std::fs::remove_dir_all(&base);
-        // And the onboard caller warns and goes on, never `fail`s.
+        // And the onboard caller warns and goes on, never `fail`s. Since
+        // i545 the install is tried twice (`retry_once`) and the RETURNED
+        // error of the last try is what the caller warns with.
         let steps = crate::test_src::own_code(include_str!("../onboard/steps.rs"));
         let f = crate::test_src::fn_body(&steps, "fn ensure_self_agent(");
-        assert!(f.contains("if let Err(e) = crate::commands::provision::provision_local("), "{f}");
-        assert!(f.contains("provision_one(ctx.g, &node_id, &[])"), "the rail branch runs in a child");
+        let install = f.find("|| crate::commands::provision::provision_local(g, &node_id, None)").unwrap_or_else(|| panic!("{f}"));
+        let warn = f.find("if let Err(e) = installed").unwrap_or_else(|| panic!("{f}"));
+        assert!(install < warn, "the install's returned error is what the caller handles: {f}");
+        assert!(f.contains("provision_one(g, &node_id, &[])"), "the rail branch runs in a child");
         assert!(!f.contains("fail("), "{f}");
     }
 

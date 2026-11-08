@@ -12,6 +12,7 @@ import { LoginOverlay } from '@/components/LoginOverlay';
 import { ChatPane } from '@/features/chat/ChatPane';
 import { PANELS } from '@/shell/panels';
 import { arrivalPanel } from '@/features/observability/grafanaArrival';
+import { PairingPage } from '@/features/connections/PairingPage';
 
 /**
  * Which of the two desktop columns are showing. One value rather than a
@@ -21,6 +22,11 @@ import { arrivalPanel } from '@/features/observability/grafanaArrival';
 type Split = 'both' | 'chat' | 'panel';
 
 export function App() {
+  if (window.location.hash === '#/connect') return <PairingPage />;
+  return <ConsoleApp />;
+}
+
+function ConsoleApp() {
   // `#/observability…` is where a bookmark of Grafana is sent (grafanaArrival.ts).
   const [active, setActive] = useState(
     () => (typeof window !== 'undefined' && arrivalPanel(window.location.hash)) || 'cluster',

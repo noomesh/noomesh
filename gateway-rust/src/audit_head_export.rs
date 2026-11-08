@@ -358,6 +358,9 @@ pub async fn run_once(state: &AppState) -> anyhow::Result<()> {
 }
 
 async fn raise(state: &AppState, detail: String, what: &str) {
+    // i520: counted for dashboards. The critical rule reads source="verify"
+    // only, because this alert already pages (PERSISTING, below).
+    crate::audit_verify::note_failure(crate::audit_verify::Source::HeadExport);
     let alert = crate::operator_alert::OperatorAlert::new(
         "audit.chain_head_regressed",
         "audit-chain",

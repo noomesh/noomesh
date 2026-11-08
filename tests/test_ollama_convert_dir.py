@@ -104,3 +104,44 @@ def test_real_sequence_as_uid_65532():
             assert d("exec", name, "test", "!", "-e", CONVERT_DIR, check=False).returncode == 0
         finally:
             d("rm", "-f", name, check=False)
+
+
+def _pick(tmp_path: Path, running: list[str]) -> subprocess.CompletedProcess:
+    """Run the script's own `pick_ollama_container` against a fake `docker ps`."""
+    sh = _read("scripts/noo-model-convert.sh")
+    m = re.search(r"^pick_ollama_container\(\) \{\n.*?^\}\n", sh, re.M | re.S)
+    assert m, "noo-model-convert.sh lost pick_ollama_container"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "docker"
+    names = "".join(f"{n}\\n" for n in running)
+    fake.write_text(f"#!/bin/sh\n[ \"$1\" = ps ] && printf '{names}'\n")
+    fake.chmod(0o755)
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    return subprocess.run(
+        ["bash", "-c", m.group(0) + "pick_ollama_container"],
+        capture_output=True, text=True, env=env, check=False,
+    )
+
+
+def test_the_standalone_embed_container_is_found(tmp_path):
+    # i545 finding 55: a standalone box runs only noo-ollama-embed, and the
+    # script used to look for noo-ollama alone and stop at "GGUF is ready".
+    r = _pick(tmp_path, ["noo-gateway", "noo-ollama-embed"])
+    assert r.returncode == 0 and r.stdout.strip() == "noo-ollama-embed", r
+
+
+def test_the_full_ollama_wins_when_both_run(tmp_path):
+    r = _pick(tmp_path, ["noo-ollama-embed", "noo-ollama"])
+    assert r.returncode == 0 and r.stdout.strip() == "noo-ollama", r
+
+
+def test_no_ollama_container_is_none(tmp_path):
+    r = _pick(tmp_path, ["noo-gateway", "noo-ollama-embed-old"])
+    assert r.returncode == 1 and r.stdout.strip() == "", r
+
+
+def test_the_create_branch_uses_the_picked_container():
+    sh = _read("scripts/noo-model-convert.sh")
+    branch = sh.split("    container)\n", 1)[1].split(";;", 1)[0]
+    assert "docker exec noo-ollama " not in branch and '"$OLLAMA_CTR"' in branch, branch

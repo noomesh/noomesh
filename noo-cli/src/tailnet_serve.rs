@@ -95,15 +95,103 @@ fn looks_like_permission(detail: &str) -> bool {
     d.contains("operator") || d.contains("root") || d.contains("permission") || d.contains("denied")
 }
 
+/// How long one `tailscale serve` write may take. A write is instant; the
+/// only slow case is the CLI waiting for the operator to enable Serve on the
+/// tailnet, which it does forever (i545 finding 70: promote hung for twenty
+/// minutes behind three checkmarks).
+pub const SERVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
+
 fn run_ts(args: &[String]) -> Result<(), Failure> {
-    let out = Command::new("tailscale").args(args).output();
-    match out {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => Err(Failure {
-            command: format!("tailscale {}", args.join(" ")),
-            detail: String::from_utf8_lossy(&o.stderr).trim().to_string(),
-        }),
-        Err(e) => Err(Failure { command: format!("tailscale {}", args.join(" ")), detail: e.to_string() }),
+    run_within("tailscale", args, SERVE_DEADLINE)
+}
+
+/// The URL tailscale prints to enable Serve on the tailnet
+/// ("Serve is not enabled on your tailnet. To enable, visit
+/// https://login.tailscale.com/f/serve?node=…"), if `text` holds one.
+pub fn serve_enable_url(text: &str) -> Option<String> {
+    let i = text.find("https://login.tailscale.com/f/serve")?;
+    let url: String = text[i..].chars().take_while(|c| !c.is_whitespace()).collect();
+    Some(url.trim_end_matches(['.', ',', ')']).to_string())
+}
+
+/// Run `program args`, stop waiting after `deadline`. stdout and stderr are
+/// read line by line on threads, so on a timeout what the child printed so
+/// far is still in hand (that is where tailscale names the enable URL). The
+/// child is killed and reaped on a detached thread; nothing here waits on
+/// it past the deadline.
+fn run_within(program: &str, args: &[String], deadline: std::time::Duration) -> Result<(), Failure> {
+    use std::io::BufRead as _;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    let command = format!("{program} {}", args.join(" "));
+    let mut child = match Command::new(program).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+        Ok(c) => c,
+        Err(e) => return Err(Failure { command, detail: e.to_string() }),
+    };
+    let (tx, rx) = mpsc::channel::<(bool, String)>();
+    for (is_err, pipe) in [(false, child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>)), (true, child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>))] {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            if let Some(p) = pipe {
+                for line in std::io::BufReader::new(p).lines().map_while(Result::ok) {
+                    if tx.send((is_err, line)).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    drop(tx);
+    let start = std::time::Instant::now();
+    let (mut out, mut err): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    fn collect(rx: &mpsc::Receiver<(bool, String)>, out: &mut Vec<String>, err: &mut Vec<String>) {
+        while let Ok((is_err, line)) = rx.try_recv() {
+            if is_err {
+                err.push(line);
+            } else {
+                out.push(line);
+            }
+        }
+    }
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Exited: give the readers a short, bounded time to finish.
+                let grace = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                while std::time::Instant::now() < grace {
+                    match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                        Ok((true, l)) => err.push(l),
+                        Ok((false, l)) => out.push(l),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(Failure { command, detail: err.join("\n").trim().to_string() })
+                };
+            }
+            Ok(None) if start.elapsed() < deadline => {
+                collect(&rx, &mut out, &mut err);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => {
+                collect(&rx, &mut out, &mut err);
+                let _ = child.kill();
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                let said = [out.join("\n"), err.join("\n")].join("\n");
+                let detail = match serve_enable_url(&said) {
+                    Some(url) => format!(
+                        "Serve is not enabled on this tailnet: enable it (HTTPS certificates AND Serve) at {url}, then re-run"
+                    ),
+                    None => format!("no answer within {} s: {}", deadline.as_secs(), said.trim()),
+                };
+                return Err(Failure { command, detail });
+            }
+        }
     }
 }
 
@@ -872,6 +960,42 @@ pub fn manual_line(cmd: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    // ── i545 finding 70: a serve write never hangs promote ──────────────
+
+    #[test]
+    fn the_enable_url_is_read_from_what_tailscale_printed() {
+        let said = "Serve is not enabled on your tailnet.\nTo enable, visit:\n\n         https://login.tailscale.com/f/serve?node=nX7abc.\n";
+        assert_eq!(serve_enable_url(said).as_deref(), Some("https://login.tailscale.com/f/serve?node=nX7abc"));
+        assert_eq!(serve_enable_url("Available within your tailnet: https://h.ts.net/"), None);
+    }
+
+    #[test]
+    fn a_child_that_waits_forever_is_stopped_at_the_deadline_with_its_url() {
+        let started = std::time::Instant::now();
+        let args: Vec<String> = vec!["-c".into(), "echo 'To enable, visit: https://login.tailscale.com/f/serve?node=n1'; sleep 30".into()];
+        let f = run_within("sh", &args, std::time::Duration::from_millis(600)).expect_err("timed out");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "it did not wait for the child");
+        assert!(f.detail.contains("https://login.tailscale.com/f/serve?node=n1"), "{}", f.detail);
+        assert!(f.detail.contains("Serve is not enabled"), "{}", f.detail);
+    }
+
+    #[test]
+    fn a_quick_child_answers_as_before() {
+        assert!(run_within("sh", &["-c".into(), "exit 0".into()], std::time::Duration::from_secs(5)).is_ok());
+        let f = run_within("sh", &["-c".into(), "echo nope >&2; exit 3".into()], std::time::Duration::from_secs(5)).expect_err("failed");
+        assert_eq!(f.detail, "nope");
+        let silent = run_within("sh", &["-c".into(), "sleep 30".into()], std::time::Duration::from_millis(300)).expect_err("timed out");
+        assert!(silent.detail.starts_with("no answer within"), "{}", silent.detail);
+    }
+
+    #[test]
+    fn every_serve_write_goes_through_the_deadline() {
+        let own = crate::test_src::own_code(include_str!("tailnet_serve.rs"));
+        let body = crate::test_src::fn_body(&own, "fn run_ts(");
+        assert!(body.contains("run_within(\"tailscale\", args, SERVE_DEADLINE)"), "{body}");
+        assert!(!body.contains(".output()"), "an unbounded wait is the hang");
+    }
+
     use super::*;
 
     #[test]

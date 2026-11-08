@@ -21,6 +21,34 @@
 # touch /opt/actions-runner*, the noo-ci account, or the buildx builder —
 # they are CI infrastructure, not fleet enrollment state.
 set -eu
+usage() {
+    cat <<'USAGE'
+usage: sudo noo-deenroll [--yes] [--keep-tailscale] [--purge-data] [--purge-tailscale]
+
+Dismantles this node: stops and removes the noo agent, noo-hostd, every noo-*
+container, the gate, the sudoers grants, /etc/noo (trust and keys), the noo
+accounts and units, and logs Tailscale out. OS packages stay. The data root
+stays unless --purge-data.
+
+  --yes              do not ask for confirmation (needed when stdin is not a terminal)
+  --keep-tailscale   leave Tailscale logged in
+  --purge-data       also delete the data root (models, HF cache, ollama)
+  --purge-tailscale  also uninstall Tailscale, only if noo installed it
+  -h, --help         print this and exit; nothing is changed
+USAGE
+}
+# Every argument is checked BEFORE anything else runs: a destructive script
+# must never act on a flag it does not know (i545 finding 103: `noo-deenroll
+# --help` ignored the flag, dismantled the node and logged it out of Tailscale).
+YES=0
+for a in "$@"; do
+    case "$a" in
+        -h|--help) usage; exit 0 ;;
+        --yes) YES=1 ;;
+        --keep-tailscale|--from-gate|--purge-data|--purge-tailscale) ;;
+        *) echo "noo-deenroll: unknown argument '$a'; nothing was changed" >&2; usage >&2; exit 2 ;;
+    esac
+done
 [ "$(id -u)" = 0 ] || { echo "run with sudo" >&2; exit 1; }
 KEEP_TS=0
 FROM_GATE=0
@@ -48,6 +76,23 @@ if [ "$FROM_GATE" = 1 ] && [ -z "${SUDO_USER:-}" ]; then
     export SUDO_USER
 fi
 say() { printf 'deenroll: %s\n' "$*"; }
+
+# A person confirms by typing this machine's name; the controller's teardown
+# (--from-gate) and an explicit --yes skip it. No terminal and no --yes is a
+# refusal, never a silent go-ahead.
+if [ "$FROM_GATE" = 0 ] && [ "$YES" = 0 ]; then
+    HOST_NAME="$(hostname -s 2>/dev/null || hostname)"
+    if [ ! -t 0 ]; then
+        echo "noo-deenroll: no terminal to confirm on; pass --yes to dismantle $HOST_NAME without asking. Nothing was changed." >&2
+        exit 2
+    fi
+    printf 'This dismantles the noo node on %s (see --help). Type the machine name to go ahead: ' "$HOST_NAME"
+    read -r answer || answer=""
+    if [ "$answer" != "$HOST_NAME" ]; then
+        echo "noo-deenroll: '$answer' is not '$HOST_NAME'; nothing was changed." >&2
+        exit 1
+    fi
+fi
 
 # ── agent + containers ─────────────────────────────────────────────────────
 systemctl disable --now noo-node-agent 2>/dev/null && say "agent stopped+disabled" || true
@@ -114,8 +159,17 @@ if [ -n "$U" ]; then
 fi
 
 # ── service account ────────────────────────────────────────────────────────
-# NEVER touch noo-ci (CI) — only the fleet's agent account.
-id -u noo-agent >/dev/null 2>&1 && userdel noo-agent 2>/dev/null && say "noo-agent account removed" || true
+# NEVER touch noo-ci (CI) — only the fleet's own accounts: the agent's and the
+# harness's (noo-apply creates noo-harness), then their groups. i545 96: an
+# uninstall that removed only noo-agent left the group (and noo-harness, whose
+# primary group it was), and the next prep's useradd refused. Users first: a
+# group cannot be deleted while it is some user's primary group.
+for _u in noo-harness noo-agent; do
+    id -u "$_u" >/dev/null 2>&1 && userdel "$_u" 2>/dev/null && say "$_u account removed" || true
+done
+for _g in noo-harness noo-agent; do
+    getent group "$_g" >/dev/null 2>&1 && groupdel "$_g" 2>/dev/null && say "$_g group removed" || true
+done
 
 # On a gate-initiated teardown the applier + gate are being removed with
 # everything else; clean up this script's installed copy last.

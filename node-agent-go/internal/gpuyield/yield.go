@@ -24,6 +24,11 @@
 // or too little GPU left for what the placed GPU backends need. Pressure
 // held for NOO_GPU_YIELD_AFTER_S (60 s) yields; the GPU staying clear for
 // NOO_GPU_RESUME_AFTER_S (120 s) resumes. NOO_GPU_YIELD=off never yields.
+// A probe timeout does not count as pressure for NOO_GPU_TIMEOUT_GRACE_S
+// (300 s) after one of OUR GPU backends starts or is resumed: on WSL2 a vLLM
+// loading its weights stalls nvidia-smi itself, and reading that as a
+// Windows program made awolf yield to its own backend every few minutes
+// (2026-11-07). Measured foreign use is never graced.
 // A probe that answered before and now misses its deadline (nvidia-smi
 // stalls while a Windows program loads the GPU on WSL2) counts as pressure
 // too; only measured clear readings resume. A node whose probe never
@@ -106,12 +111,17 @@ type Config struct {
 	ResumeAfter time.Duration // NOO_GPU_RESUME_AFTER_S, default 120s
 	Interval    time.Duration // poll period, 15s
 	StopTimeout int           // seconds of SIGTERM grace on a pause, 30
+	// TimeoutGrace: NOO_GPU_TIMEOUT_GRACE_S, default 300s. A probe timeout
+	// within this long of one of our GPU backends starting is that backend
+	// warming up, not pressure.
+	TimeoutGrace time.Duration
 }
 
 // ConfigFromEnv reads the knobs; bad values fall back to the defaults.
 func ConfigFromEnv(getenv func(string) string) Config {
 	c := Config{Enabled: true, ForeignMB: 2048, YieldAfter: 60 * time.Second,
-		ResumeAfter: 120 * time.Second, Interval: 15 * time.Second, StopTimeout: 30}
+		ResumeAfter: 120 * time.Second, Interval: 15 * time.Second, StopTimeout: 30,
+		TimeoutGrace: 300 * time.Second}
 	switch strings.ToLower(strings.TrimSpace(getenv("NOO_GPU_YIELD"))) {
 	case "off", "0", "false", "no", "disabled":
 		c.Enabled = false
@@ -124,6 +134,9 @@ func ConfigFromEnv(getenv func(string) string) Config {
 	}
 	if n, err := strconv.Atoi(strings.TrimSpace(getenv("NOO_GPU_RESUME_AFTER_S"))); err == nil && n >= 0 {
 		c.ResumeAfter = time.Duration(n) * time.Second
+	}
+	if n, err := strconv.Atoi(strings.TrimSpace(getenv("NOO_GPU_TIMEOUT_GRACE_S"))); err == nil && n >= 0 {
+		c.TimeoutGrace = time.Duration(n) * time.Second
 	}
 	return c
 }
@@ -216,6 +229,15 @@ type Controller struct {
 	unknownNote string
 	needMB      int
 	pressureAt  time.Time // first tick of the current pressure run
+	// warmUntil: until when a probe timeout is our own backend warming up
+	// (TimeoutGrace after one of our GPU backends started or was resumed).
+	warmUntil time.Time
+	// runningIDs: our running GPU backends last tick (backend -> container
+	// id), so a start is seen as a change; baselined once the first tick
+	// has filled it (an agent restart is not a start).
+	runningIDs  map[string]string
+	baselined   bool
+	warmNoted   bool      // the grace's log line was written for this grace
 	clearAt     time.Time // first tick of the current clear run
 	stopped     map[string]string
 	paused      map[string]bool // backends held down (reconcile must not start)
@@ -315,6 +337,34 @@ func (c *Controller) isGPUBackendLocked(backend string) bool {
 		}
 	}
 	return false
+}
+
+// noteStartsLocked opens the warm-up grace when one of our GPU backends is
+// running now and was not (or was a different container) last tick. The
+// first tick only records what runs: an agent restart is not a start.
+func (c *Controller) noteStartsLocked(now time.Time, backends []docker.GPUBackend) {
+	running := map[string]string{}
+	for _, b := range backends {
+		if b.Running {
+			running[b.Backend] = b.ID
+		}
+	}
+	if c.baselined {
+		for name, id := range running {
+			if c.runningIDs[name] != id {
+				c.startWarmLocked(now)
+			}
+		}
+	}
+	c.runningIDs, c.baselined = running, true
+}
+
+// startWarmLocked opens (or extends) the warm-up grace from now.
+func (c *Controller) startWarmLocked(now time.Time) {
+	if until := now.Add(c.cfg.TimeoutGrace); until.After(c.warmUntil) {
+		c.warmUntil = until
+		c.warmNoted = false
+	}
 }
 
 // refreshGPUSetLocked rebuilds the set of GPU backends from this tick's
@@ -484,6 +534,7 @@ func (c *Controller) decideLocked(r Reading, backends []docker.GPUBackend) (act 
 	now := c.now()
 	c.last = r
 	c.refreshGPUSetLocked(backends)
+	c.noteStartsLocked(now, backends)
 	c.expireLeaseLocked() // a timed user hold ends here, measured or not
 
 	if !r.Measured {
@@ -605,6 +656,18 @@ func (c *Controller) timeoutPressureLocked(now time.Time, backends []docker.GPUB
 	case StateYielded:
 		c.reason = why
 		return c.enforceLocked(backends)
+	}
+	if now.Before(c.warmUntil) {
+		// One of our GPU backends started moments ago: its own load is
+		// what stalls nvidia-smi (WSL2), so this is not someone else's
+		// work, and yielding to it would loop (stop, resume, stall, stop).
+		if !c.pressureAt.IsZero() || !c.warmNoted {
+			slog.Info("gpuyield: GPU probe not answering while a noomesh GPU backend warms up; not counting it",
+				"grace_until", c.warmUntil.Format(time.RFC3339))
+			c.warmNoted = true
+		}
+		c.pressureAt = time.Time{}
+		return act
 	}
 	if c.pressureAt.IsZero() {
 		c.pressureAt = now
@@ -908,6 +971,7 @@ func (c *Controller) resumeLocked(why string) (act actions) {
 	c.stopped = map[string]string{}
 	c.paused = map[string]bool{}
 	c.pressureAt, c.clearAt = time.Time{}, time.Time{}
+	c.startWarmLocked(c.now())
 	next := StateFree
 	if c.foreignMB > idleResidueMB {
 		next = StateShared

@@ -4,6 +4,8 @@
 package heartbeat
 
 import (
+	"runtime"
+
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
 	"github.com/noomesh/noomesh/node-agent-go/internal/backendleaves"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
@@ -166,6 +168,8 @@ var heartbeatSections = []payloadSection{
 	secModelPresence,
 	secLanes,
 	secGPUContention,
+	secModelSets,
+	secNodeFacts,
 }
 
 // Heartbeat-only sections.
@@ -176,6 +180,25 @@ var (
 		// "this build does not report it" from "reported as down".
 		if bus := r.natsStatus(); bus != nil {
 			p["nats_status"] = bus
+		}
+	}}
+
+	secModelSets = payloadSection{name: "modelSets", add: func(r *Reporter, p map[string]any) {
+		// The model sets this node holds or is fetching (i300 F4):
+		// [{id, revision, state, reason?}]. OMITTED when the state cannot be
+		// read: an empty list would say "holds none", which is a claim.
+		if ms := r.modelSetsReport(); ms != nil {
+			p["model_sets"] = ms
+		}
+	}}
+
+	secNodeFacts = payloadSection{name: "nodeFacts", add: func(r *Reporter, p map[string]any) {
+		// i300 F5b. `os` is what this binary was built for, always known.
+		// Every other key comes from the provider and is OMITTED when its
+		// probe failed: an error must not become a fact (the i495 rule).
+		p["os"] = runtime.GOOS
+		for k, v := range r.nodeFactsReport() {
+			p[k] = v
 		}
 	}}
 

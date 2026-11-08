@@ -100,6 +100,38 @@ fn env_str(env: &Value, key: &str) -> Option<String> {
     }
 }
 
+/// The shipped llamacpp image (`docker/Dockerfile.llamacpp`) is a CPU build
+/// (OpenBLAS, no CUDA). A llamacpp placement `--on gpu` was accepted, sized
+/// with GPU numbers and given the GPU device, and then ran on the CPU with
+/// `--gpu-layers` ignored (noomesh-internal i545 45/46). The gateway's
+/// `placement_fit::LLAMACPP_HAS_GPU_BUILD` says the same, and
+/// tests/test_llamacpp_gpu_build_claim.py holds both to the Dockerfile.
+pub const LLAMACPP_HAS_GPU_BUILD: bool = false;
+
+/// Why a llamacpp `gpu` target is not honoured, said where it happens.
+pub const LLAMACPP_NO_GPU_NOTE: &str =
+    "the shipped llamacpp image is a CPU (OpenBLAS) build with no CUDA, so on a GPU target it would run on the CPU with GPU sizing";
+
+/// `backend` on `target` would run on the CPU whatever the target says:
+/// llamacpp on `gpu` while its image has no GPU build.
+pub fn runs_on_cpu_regardless(backend: &str, target: &str) -> bool {
+    backend == "llamacpp" && target == "gpu" && !LLAMACPP_HAS_GPU_BUILD
+}
+
+/// `<backend> <model>` of every placement in a desired-config `placements`
+/// list that [`runs_on_cpu_regardless`]: placed on gpu, runs on cpu.
+pub fn gpu_targets_on_cpu_builds(placements: &Value) -> Vec<String> {
+    placements
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|p| runs_on_cpu_regardless(p["backend"].as_str().unwrap_or(""), p["target"].as_str().unwrap_or("")))
+                .map(|p| format!("{} {}", p["backend"].as_str().unwrap_or(""), p["model"].as_str().unwrap_or("")))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The hardware target for a placement, or the refusal.
 ///
 /// `on` is `--on`; `stored` is the target the placement already has for this
@@ -345,6 +377,25 @@ pub fn store_size_bytes(store: &std::path::Path, model: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// i545 45/46: only llamacpp on gpu runs on the cpu regardless, while its
+    /// image has no GPU build; every other pair is honoured as declared.
+    #[test]
+    fn only_a_gpu_llamacpp_runs_on_the_cpu_regardless() {
+        assert!(runs_on_cpu_regardless("llamacpp", "gpu"));
+        assert!(!runs_on_cpu_regardless("llamacpp", "cpu"));
+        for b in ["ollama", "vllm", "vllm-secondary"] {
+            assert!(!runs_on_cpu_regardless(b, "gpu"), "{b}");
+        }
+        let placements = json!([
+            {"backend": "llamacpp", "model": "a.gguf", "target": "gpu"},
+            {"backend": "llamacpp", "model": "b.gguf", "target": "cpu"},
+            {"backend": "ollama", "model": "c", "target": "gpu"},
+            {"backend": "llamacpp", "model": "d.gguf"}
+        ]);
+        assert_eq!(gpu_targets_on_cpu_builds(&placements), vec!["llamacpp a.gguf".to_string()]);
+        assert!(gpu_targets_on_cpu_builds(&json!(null)).is_empty());
+    }
 
     fn hw(cores: u64, ram: f64, vram: Option<f64>) -> Hardware {
         Hardware { cpu_cores: Some(cores), ram_gb: Some(ram), vram_gb: vram }

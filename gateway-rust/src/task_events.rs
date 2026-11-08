@@ -252,15 +252,50 @@ pub async fn emit_revoked(db: &sqlx::PgPool, task_id: &str, reason: &str) {
     emit_logged(db, task_id, "revoked", json!({"reason": reason})).await;
 }
 
+/// What [`emit_final_state`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FinalState {
+    /// The terminal state was emitted (or its emit failed and was logged).
+    Emitted,
+    /// The task is not terminal, is gone, or its id is not a UUID.
+    NotTerminal,
+    /// The task's state could not be read, even after retrying: no final
+    /// event went out, and that was logged as an error naming the task.
+    Unreadable(String),
+}
+
+/// How often, and after what pauses, the final state's read is retried
+/// before the miss is reported (i460): a consumer waiting on `final` must
+/// not lose it to one transient database error.
+const FINAL_STATE_RETRIES_MS: [u64; 2] = [100, 400];
+
 /// The final `state` event, read from the task row as it stands: the
 /// caller changed the row to a terminal state, and calls this after. A task
 /// that is not terminal (or is gone) emits nothing; a second call emits
-/// nothing (`final` is true exactly once).
-pub async fn emit_final_state(db: &sqlx::PgPool, task_id: &str, why: Option<&str>) {
-    let Ok(uuid) = uuid::Uuid::parse_str(task_id) else { return };
-    let state: Option<String> = crate::repo::tasks::state_of(db, uuid).await.ok().flatten();
-    if let Some(s) = state.filter(|s| is_terminal(s)) {
-        emit_logged(db, task_id, "state", state_data(&s, why)).await;
+/// nothing (`final` is true exactly once). A state that cannot be read is
+/// retried, then reported as an error naming the task: an add-on waiting on
+/// its task's end (i300) would otherwise never hear it, and nothing said so.
+pub async fn emit_final_state(db: &sqlx::PgPool, task_id: &str, why: Option<&str>) -> FinalState {
+    let Ok(uuid) = uuid::Uuid::parse_str(task_id) else { return FinalState::NotTerminal };
+    let mut read = crate::repo::tasks::state_of(db, uuid).await;
+    for pause in FINAL_STATE_RETRIES_MS {
+        if read.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(pause)).await;
+        read = crate::repo::tasks::state_of(db, uuid).await;
+    }
+    match read {
+        Ok(Some(s)) if is_terminal(&s) => {
+            emit_logged(db, task_id, "state", state_data(&s, why)).await;
+            FinalState::Emitted
+        }
+        Ok(_) => FinalState::NotTerminal,
+        Err(e) => {
+            tracing::error!(task = task_id, error = %e,
+                "task_events: the task's state could not be read; its final state event was NOT emitted");
+            FinalState::Unreadable(e.to_string())
+        }
     }
 }
 
@@ -302,7 +337,7 @@ pub async fn tool_calls(db: &sqlx::PgPool, task_id: &str) -> Vec<Value> {
 pub async fn emit_finished(db: &sqlx::PgPool, task_id: &str, ok: bool, text: &str) {
     // Cheap exit for the common case (a direct task): emit() would no-op
     // anyway, but the tool-call read should not run for it.
-    if !is_addon_task(db, task_id).await {
+    if addon_route(db, task_id).await == AddonRoute::Core {
         return;
     }
     let calls = tool_calls(db, task_id).await;
@@ -310,13 +345,28 @@ pub async fn emit_finished(db: &sqlx::PgPool, task_id: &str, ok: bool, text: &st
     emit_final_state(db, task_id, (!ok).then_some(text)).await;
 }
 
-async fn is_addon_task(db: &sqlx::PgPool, task_id: &str) -> bool {
-    let Ok(uuid) = uuid::Uuid::parse_str(task_id) else { return false };
-    crate::repo::tasks::created_via(db, uuid)
-        .await
-        .ok()
-        .flatten()
-        .is_some_and(|v| addon_of(&v).is_some())
+/// Whose events these are, as far as the task's origin can be read.
+#[derive(Debug, PartialEq, Eq)]
+enum AddonRoute {
+    Addon,
+    Core,
+    /// The origin could not be read. Not "core": the events are emitted, and
+    /// `emit` itself decides (it no-ops for a direct task), so an add-on's
+    /// task is never cut off by one failed read. Logged (i460).
+    Unknown,
+}
+
+async fn addon_route(db: &sqlx::PgPool, task_id: &str) -> AddonRoute {
+    let Ok(uuid) = uuid::Uuid::parse_str(task_id) else { return AddonRoute::Core };
+    match crate::repo::tasks::created_via(db, uuid).await {
+        Ok(Some(v)) if addon_of(&v).is_some() => AddonRoute::Addon,
+        Ok(_) => AddonRoute::Core,
+        Err(e) => {
+            tracing::warn!(task = task_id, error = %e,
+                "task_events: the task's origin could not be read; emitting its events and letting emit decide");
+            AddonRoute::Unknown
+        }
+    }
 }
 
 // ── pulling ─────────────────────────────────────────────────────────────
@@ -756,5 +806,58 @@ mod tests {
         assert_eq!(decide(Some(500), None, 7, 3, 9), Next::Retry);
         assert_eq!(decide(Some(404), None, 7, 3, 9), Next::Retry);
         assert_eq!(decide(None, None, 7, 3, 9), Next::Retry);
+    }
+}
+
+#[cfg(test)]
+mod unreadable_task_tests {
+    use super::*;
+
+    /// A pool whose every read fails: nothing listens on 127.0.0.1:1.
+    fn dead_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool")
+    }
+
+    /// i460: a task state that cannot be read is reported, not taken for
+    /// "not terminal", which silently dropped the final event an add-on
+    /// waits on.
+    #[tokio::test]
+    async fn an_unreadable_final_state_is_reported_not_skipped() {
+        let id = uuid::Uuid::new_v4().to_string();
+        match emit_final_state(&dead_pool(), &id, None).await {
+            FinalState::Unreadable(e) => assert!(!e.is_empty()),
+            other => panic!("an unreadable state must say so, got {other:?}"),
+        }
+        assert_eq!(emit_final_state(&dead_pool(), "not-a-uuid", None).await, FinalState::NotTerminal);
+    }
+
+    /// P1: an unreadable origin can never route a task's events to an add-on.
+    /// `emit` reads the task's own `created_via` again and takes the add-on
+    /// only from a read that succeeded; a failed read is an error (logged by
+    /// `emit_logged`), and no delivery row or event is written. The worst
+    /// case is an add-on missing an event, loudly.
+    #[tokio::test]
+    async fn an_unreadable_origin_routes_nothing() {
+        let id = uuid::Uuid::new_v4().to_string();
+        assert!(emit(&dead_pool(), &id, "state", state_data("done", None)).await.is_err(),
+            "an origin that cannot be read routes the event nowhere, and says so");
+        let own = crate::test_src::own_code(include_str!("task_events.rs"));
+        let body = crate::test_src::fn_body(&own, "pub async fn emit(");
+        let read = body.find("crate::repo::tasks::created_via(db, uuid).await?").expect("emit reads the origin and fails on an error");
+        let route = body.find("and_then(addon_of)").expect("the add-on comes from that read");
+        let insert = body.find("INSERT INTO noo_task_event_delivery").expect("the delivery row");
+        assert!(read < route && route < insert, "read, then route, then write");
+    }
+
+    /// i460: an origin that cannot be read is not "core": the task's events
+    /// still go out (emit decides), so an add-on's task is not cut off.
+    #[tokio::test]
+    async fn an_unreadable_origin_is_not_core() {
+        let id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(addon_route(&dead_pool(), &id).await, AddonRoute::Unknown);
+        assert_eq!(addon_route(&dead_pool(), "not-a-uuid").await, AddonRoute::Core);
     }
 }

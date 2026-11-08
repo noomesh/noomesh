@@ -460,7 +460,11 @@ fi
 # workers). Nothing in provisioning needs it — the playbook's docker work is
 # `become: root`, the agent's is its own group, and the human uses
 # `sudo docker` as break-glass. A node is born with step 6 already done.
-id -u noo-agent >/dev/null 2>&1 || useradd --system --shell /usr/sbin/nologin --no-create-home noo-agent
+# i545 96: a box that held a node before may keep the noo-agent GROUP after
+# its user went; a bare useradd then refused ("group noo-agent exists") and
+# prep died after registration. Ensure the group, then create the user INTO it.
+getent group noo-agent >/dev/null || groupadd --system noo-agent
+id -u noo-agent >/dev/null 2>&1 || useradd --system --shell /usr/sbin/nologin --no-create-home --gid noo-agent noo-agent
 gpasswd -a noo-agent docker >/dev/null
 say "docker group: noo-agent only (operator stays out — an earlier change)"
 

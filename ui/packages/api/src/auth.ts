@@ -6,7 +6,7 @@
 // Ported from the legacy core/api.js authFetch: injects the Bearer token, and on
 // a 401 does a single silent refresh (POST /api/auth/refresh, httponly cookie)
 // and retries. The token store is injected so this stays platform-neutral —
-// web backs it with localStorage, mobile with expo-secure-store.
+// web keeps the access token in memory only (i515c), mobile in expo-secure-store.
 
 /** Where the access token lives. `get` may be async (e.g. SecureStore). */
 export interface TokenStore {
@@ -22,10 +22,34 @@ export interface AuthFetchOptions {
   onLogout?: () => void;
   /** Override the fetch implementation (tests, custom agents). */
   fetchImpl?: typeof fetch;
+  /** Serialize refreshes across tabs (web); see [`CrossTab`]. */
+  crossTab?: CrossTab;
+}
+
+/**
+ * Serialize refreshes across browser tabs (i515c). With the access token in
+ * memory, every tab refreshes on its own; two refreshes in flight with the
+ * same rotating cookie look like a replay to the gateway, which then revokes
+ * EVERY session of the account. So a refresh holds a Web Lock, and a fresh
+ * token is shared over a BroadcastChannel: a tab that waited on the lock and
+ * meanwhile received a newer token uses it instead of refreshing again.
+ */
+export interface CrossTab {
+  /** `navigator.locks` (or a test double). Absent: refreshes are coalesced in this tab only. */
+  locks?: { request<T>(name: string, cb: () => Promise<T>): Promise<T> };
+  /** A same-origin channel the tabs share. */
+  channel?: {
+    postMessage(m: unknown): void;
+    addEventListener(t: 'message', l: (e: { data: unknown }) => void): void;
+  };
+  lockName?: string;
 }
 
 export type TokenRefreshOptions = Omit<AuthFetchOptions, 'onLogout'> &
   Pick<AuthFetchOptions, 'onLogout'>;
+
+/** The message a tab sends when it holds a fresh token, or has logged out. */
+type TabMessage = { type: 'token'; token: string } | { type: 'logout' };
 
 /**
  * One silent refresh: `POST /api/auth/refresh` against the httponly cookie.
@@ -39,7 +63,15 @@ export type TokenRefreshOptions = Omit<AuthFetchOptions, 'onLogout'> &
  * stale token every 30 s, forever.
  */
 export function createTokenRefresher(opts: TokenRefreshOptions): () => Promise<string | null> {
-  const { baseUrl = '', tokenStore, onLogout, fetchImpl = fetch } = opts;
+  const { baseUrl = '', tokenStore, onLogout, fetchImpl = fetch, crossTab } = opts;
+  const lockName = crossTab?.lockName ?? 'noo-auth-refresh';
+
+  // Another tab's fresh token (or logout) becomes this tab's too.
+  crossTab?.channel?.addEventListener('message', (e) => {
+    const m = e.data as TabMessage | null;
+    if (m?.type === 'token' && typeof m.token === 'string') void tokenStore.set(m.token);
+    else if (m?.type === 'logout') void tokenStore.set(null);
+  });
 
   // Coalesce concurrent callers into a single refresh round-trip.
   let refreshInFlight: Promise<string | null> | null = null;
@@ -47,19 +79,18 @@ export function createTokenRefresher(opts: TokenRefreshOptions): () => Promise<s
   return function refresh(): Promise<string | null> {
     if (refreshInFlight) return refreshInFlight;
     refreshInFlight = (async () => {
-      let fresh: string | null = null;
-      try {
-        const r = await fetchImpl(`${baseUrl}/api/auth/refresh`, {
-          method: 'POST',
-          credentials: 'same-origin',
-        });
-        if (r.ok) {
-          const data = (await r.json().catch(() => null)) as { access_token?: string } | null;
-          fresh = data?.access_token ?? null;
-        }
-      } catch {
-        fresh = null;
-      }
+      const before = await tokenStore.get();
+      const locked = <T,>(cb: () => Promise<T>): Promise<T> =>
+        crossTab?.locks ? crossTab.locks.request(lockName, cb) : cb();
+      const fresh = await locked(async () => {
+        // A tab that refreshed while this one waited has already shared its
+        // token: use it rather than spend the cookie a second time.
+        const now = await tokenStore.get();
+        if (now && now !== before) return now;
+        const got = await refreshOnce();
+        if (got) crossTab?.channel?.postMessage({ type: 'token', token: got } satisfies TabMessage);
+        return got;
+      });
       if (fresh) {
         await tokenStore.set(fresh);
       } else {
@@ -73,6 +104,23 @@ export function createTokenRefresher(opts: TokenRefreshOptions): () => Promise<s
     })();
     return refreshInFlight;
   };
+
+  async function refreshOnce(): Promise<string | null> {
+    let fresh: string | null = null;
+    try {
+      const r = await fetchImpl(`${baseUrl}/api/auth/refresh`, {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+      if (r.ok) {
+        const data = (await r.json().catch(() => null)) as { access_token?: string } | null;
+        fresh = data?.access_token ?? null;
+      }
+    } catch {
+      fresh = null;
+    }
+    return fresh;
+  }
 }
 
 /**
@@ -99,7 +147,10 @@ export function createAuthFetch(opts: AuthFetchOptions): typeof fetch {
     const retrySrc = first.clone();
 
     const resp = await fetchImpl(first);
-    if (resp.status !== 401 || !token) return resp;
+    // A 401 refreshes even with no token in hand: on web the access token
+    // lives in memory, so after a reload the first call has none, and the
+    // httpOnly refresh cookie is what restores the session (i515c).
+    if (resp.status !== 401) return resp;
 
     const fresh = await tryRefresh();
     if (!fresh) return resp; // the refresher dropped the token and fired onLogout

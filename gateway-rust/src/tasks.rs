@@ -860,8 +860,12 @@ pub async fn mark_queued(db: &sqlx::PgPool, id: &str, node: &str) -> Result<()> 
 /// Mark the task running on `node` (or in process when `None`) before a
 /// runner takes it.
 pub async fn mark_running(db: &sqlx::PgPool, id: &str, node: Option<&str>) -> Result<()> {
+    // An unreadable prior state is an error (i460), not "not running": read
+    // as not running, a resume re-emitted the once-only state event.
     let before = match uuid::Uuid::parse_str(id) {
-        Ok(u) => crate::repo::tasks::state_of(db, u).await.ok().flatten(),
+        Ok(u) => crate::repo::tasks::state_of(db, u)
+            .await
+            .with_context(|| format!("cannot read task {id}'s state before marking it running"))?,
         Err(_) => None,
     };
     set_state(db, id, "running", node).await?;
@@ -1886,5 +1890,21 @@ mod stale_alert_tests {
     #[test]
     fn no_node_at_all_is_said_plainly() {
         assert_eq!(describe_runner(None), "an unnamed runner");
+    }
+}
+
+/// An unreadable prior state stops mark_running with its cause (i460): read
+/// as "not running", a resume re-emitted the once-only state event.
+#[cfg(test)]
+mod mark_running_read_error_tests {
+    #[tokio::test]
+    async fn an_unreadable_prior_state_is_an_error_before_any_write() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool");
+        let id = uuid::Uuid::new_v4().to_string();
+        let e = super::mark_running(&pool, &id, None).await.expect_err("an unreadable DB is an error");
+        assert!(format!("{e:#}").contains("state before marking it running"), "{e:#}");
     }
 }

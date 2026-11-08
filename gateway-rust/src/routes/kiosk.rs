@@ -85,6 +85,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/kiosk/rag", get(rag))
         .route("/api/kiosk/graph", get(graph))
         .route("/api/kiosk/addons", get(addons))
+        .route("/api/kiosk/display", get(display))
 }
 
 // ── The projector ────────────────────────────────────────────────────────
@@ -438,6 +439,39 @@ fn kiosk_tailnet_tag() -> String {
         .unwrap_or_else(|| "tag:kiosk".into())
 }
 
+/// GET /api/kiosk/display — the display settings the controller set for THIS
+/// display's seat (i510 c1): `{seat, display: {quality?, view?, rotate?,
+/// poll?}}`. Only a kiosk credential asks, and it gets its own seat's
+/// settings: the seat comes from the token's device, never from a parameter.
+async fn display(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+) -> Response {
+    let Some(device) = ctx.as_ref().and_then(|axum::Extension(c)| kiosk_device(c)) else {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": {"type": "not_a_display",
+            "message": "only a kiosk display reads its own settings (operators: noo kiosk seats)"}}))).into_response();
+    };
+    match crate::repo::seats::display_for_tailnet(&state.db, &device).await {
+        Ok(Some((seat, display))) => Json(json!({"seat": seat, "display": display})).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": {"type": "no_seat",
+            "message": format!("tailnet device '{device}' is not bound to an enrolled seat")}}))).into_response(),
+        Err(e) => {
+            tracing::error!(device = %device, error = %e, "kiosk display settings read failed");
+            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": {"type": "storage",
+                "message": format!("cannot read the display settings: the database answered {e}")}}))).into_response()
+        }
+    }
+}
+
+/// The tailnet device a kiosk credential was minted for (`kiosk:<device>`),
+/// or `None` for any other caller.
+fn kiosk_device(ctx: &crate::auth::RequesterCtx) -> Option<String> {
+    if !ctx.scopes.iter().any(|s| s == crate::auth::KIOSK_SCOPE) {
+        return None;
+    }
+    ctx.sub.strip_prefix("kiosk:").filter(|d| !d.is_empty()).map(str::to_string)
+}
+
 /// POST /api/kiosk/token/tailnet — a kiosk token for a display that holds
 /// NO durable secret. The tailnet is the credential.
 ///
@@ -595,11 +629,30 @@ async fn token_tailnet(
         audit_denied("dialback_failed", body.tailnet_ip.clone()).await;
         return deny("dialback did not verify — the display did not answer with the nonce it sent");
     }
+    // 3. the seat: only an enrolled, unrevoked kiosk seat bound to this
+    // device mints (i510 part B). The seat reports its device on its signed
+    // rail; an admin can bind it (`noo kiosk seats bind`).
+    let seat = match crate::repo::seats::seat_for_tailnet(&state.db, &node_name).await {
+        Ok(Some(seat)) => seat,
+        Ok(None) => {
+            tracing::info!(ip = %body.tailnet_ip, device = %node_name,
+                "kiosk tailnet mint: device is not bound to an enrolled seat");
+            audit_denied("not_an_enrolled_seat", body.tailnet_ip.clone()).await;
+            return deny(&format!(
+                "tailnet device '{node_name}' is not bound to an enrolled, unrevoked kiosk seat \
+                 (enrol it with noo kiosk seat-token, or bind it: noo kiosk seats bind <seat> {node_name})"
+            ));
+        }
+        Err(e) => {
+            tracing::error!(device = %node_name, error = %e, "kiosk tailnet mint: seat lookup failed");
+            return internal(format!("cannot read the kiosk seats: the database answered {e}"));
+        }
+    };
 
     let ttl = crate::auth::KIOSK_TOKEN_TTL_SECS;
     match crate::auth::mint_kiosk_jwt(&node_name, ttl) {
         Some(tok) => {
-            tracing::info!(consumer = %node_name, ip = %body.tailnet_ip, ttl,
+            tracing::info!(consumer = %node_name, seat = %seat, ip = %body.tailnet_ip, ttl,
                 "kiosk_token_minted_keyless");
             Json(json!({"token": tok, "expires_in": ttl, "consumer": node_name})).into_response()
         }
@@ -1316,5 +1369,64 @@ mod stream_expiry_tests {
         let after = &stream[stream.find("\"kiosk_stream_credential_expired\");").unwrap()..];
         let after = after["\"kiosk_stream_credential_expired\");".len()..].trim_start();
         assert!(after.starts_with("return;"), "the producer returns at the deadline");
+    }
+}
+
+#[cfg(test)]
+mod seat_mint_tests {
+    /// i510: the keyless mint admits only a bound, unrevoked seat, after the
+    /// tag and the dialback and before a token is signed.
+    #[test]
+    fn the_keyless_mint_requires_an_enrolled_seat() {
+        let own = crate::test_src::own_code(include_str!("kiosk.rs"));
+        let mint = crate::test_src::fn_body(&own, "async fn token_tailnet(");
+        let dialback = mint.find("\"dialback_failed\"").expect("the dialback refusal");
+        let seat = mint.find("crate::repo::seats::seat_for_tailnet(").expect("the seat lookup");
+        let sign = mint.find("crate::auth::mint_kiosk_jwt(").expect("the signing");
+        assert!(dialback < seat && seat < sign, "tag and dialback, then the seat, then the token");
+        let lookup = &mint[seat..sign];
+        assert!(lookup.contains("Ok(None) =>") && lookup.contains("\"not_an_enrolled_seat\""), "an unbound device is refused and audited");
+        assert!(lookup.contains("return deny("), "and gets no token");
+    }
+}
+
+#[cfg(test)]
+mod display_reader_tests {
+    use super::kiosk_device;
+
+    fn ctx(sub: &str, scopes: &[&str]) -> crate::auth::RequesterCtx {
+        crate::auth::RequesterCtx {
+            sub: sub.into(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            role: crate::auth::Role::User,
+            harness: None,
+            act: None,
+        }
+    }
+
+    /// The display's settings are read for the device its token names, and
+    /// only by a kiosk credential: an operator, or a user named `kiosk:x`
+    /// without the kiosk scope, is not a display.
+    #[test]
+    fn only_a_kiosk_credential_names_its_device() {
+        assert_eq!(kiosk_device(&ctx("kiosk:homeserver-1", &["kiosk"])).as_deref(), Some("homeserver-1"));
+        assert_eq!(kiosk_device(&ctx("kiosk:homeserver-1", &["read"])), None);
+        assert_eq!(kiosk_device(&ctx("alice", &["kiosk"])), None);
+        assert_eq!(kiosk_device(&ctx("kiosk:", &["kiosk"])), None);
+    }
+
+    /// The seat comes only from the token's own device: the handler takes no
+    /// path or query extractor, so no caller can name another display's seat.
+    /// A later "convenience" seat parameter must go red here.
+    #[test]
+    fn the_display_reader_takes_its_seat_only_from_the_token() {
+        let own = crate::test_src::own_code(include_str!("kiosk.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn display(");
+        let signature = &body[..body.find(") -> Response").expect("the handler's signature")];
+        for extractor in ["Path", "Query", "Json", "Form", "RawQuery", "HeaderMap"] {
+            assert!(!signature.contains(extractor), "display() takes a {extractor}: the seat must come from the token alone");
+        }
+        assert!(body.contains("kiosk_device(c)"), "the device is the token's");
+        assert!(body.contains("display_for_tailnet(&state.db, &device)"), "and only it picks the seat");
     }
 }

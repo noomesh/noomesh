@@ -841,7 +841,10 @@ async fn handle_rpc(state: &Arc<AppState>, headers: &HeaderMap, body: &[u8]) -> 
             // External MCP tool: the bridge checks the
             // caller's audience and runs it on the hosting node.
             if name.starts_with(crate::mcp_bridge::PREFIX) {
-                let ids = crate::mcp_bridge::server_ids(state).await;
+                let ids = match crate::mcp_bridge::server_ids(state).await {
+                    Ok(ids) => ids,
+                    Err(e) => return env.result(json!({ "content": [{"type": "text", "text": e}], "isError": true }), SERVER_NAME),
+                };
                 if let Some((server, tool_name)) = crate::mcp_bridge::split_name(name, &ids) {
                     let argv = Value::Object(args.clone());
                     return match crate::mcp_bridge::call(state, Some(&caller.user), &server, &tool_name, &argv).await {
@@ -1200,6 +1203,38 @@ mod tests {
         let without = mint_caller_jwt("owner", Role::User, &[], "self:owner", None).unwrap();
         let c = crate::auth::verify_token(&without, "test-secret-mcp-door").unwrap();
         assert_eq!(c.sub, "owner/self-owner", "no session → per-key label, not the bare account");
+    }
+
+    #[test]
+    fn door_minted_jwts_never_qualify_for_personal_evidence() {
+        let _guard = env_guard();
+        std::env::set_var("NOO_JWT_SECRET", "test-secret-mcp-door");
+        for role in [crate::auth::Role::User, crate::auth::Role::Operator, crate::auth::Role::Admin] {
+            for label in [None, Some("phone-agent")] {
+                let token = mint_caller_jwt("alice", role, &[], "self:alice", label).unwrap();
+                let claims = crate::auth::verify_token(&token, "test-secret-mcp-door").unwrap();
+                let ctx = crate::auth::RequesterCtx {
+                    sub: claims.sub, scopes: claims.scopes, role,
+                    act: claims.act, harness: claims.harness,
+                };
+                let mut act_only = ctx.clone();
+                act_only.harness = None;
+                let mut harness_only = ctx.clone();
+                harness_only.act = None;
+                for requester in [ctx, act_only, harness_only] {
+                    // Either provenance marker alone must still refuse access.
+                    let principal = crate::bus_principal::for_requester(&requester);
+                    assert!(crate::integrations::content::requester_account(&principal).is_none(),
+                        "a verified MCP door JWT must not become a human personal-content reader");
+                }
+            }
+        }
+        let human = crate::auth::RequesterCtx {
+            sub: "alice/laptop".into(), scopes: vec!["read".into()],
+            role: crate::auth::Role::User, act: None, harness: None,
+        };
+        assert_eq!(crate::integrations::content::requester_account(
+            &crate::bus_principal::for_requester(&human)), Some("alice"));
     }
 
     /// Both doors must open a session on `initialize` and consult the

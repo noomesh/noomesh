@@ -157,6 +157,21 @@ const UpstreamAuthHeader = "X-Noo-Upstream-Authorization"
 // container's loopback-published port, path and query intact. The route is
 // controller-only (ctrlMW), same as start/stop.
 func (s *Server) handleContainerProxy(w http.ResponseWriter, r *http.Request) {
+	// An agent-managed node workload is reached through its door, never a
+	// container address (containers_nodewl.go). Any other container falls
+	// through to the path below unchanged.
+	if doors := s.nodeDoors(); doors != nil && dockerpkg.ValidateManagedContainerName(r.PathValue("name")) == nil {
+		addon, workload, managed, err := doors.NodeWorkloadOf(r.Context(), r.PathValue("name"))
+		if err != nil {
+			slog.Warn("container proxy: cannot tell whether the container is a node workload", "container", r.PathValue("name"), "error", err)
+			writeJSON(w, http.StatusBadGateway, map[string]string{"detail": "cannot tell whether the container is a node workload: " + err.Error()})
+			return
+		}
+		if managed {
+			s.serveNodeWorkloadProxy(w, r, doors, addon, workload)
+			return
+		}
+	}
 	resolve := s.proxyTarget
 	if resolve == nil {
 		if s.docker == nil {

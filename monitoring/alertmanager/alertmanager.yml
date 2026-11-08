@@ -3,11 +3,19 @@
 
 # Alertmanager configuration (H-L4).
 #
-# Default routes to a no-op ('null') receiver so the alerting pipeline is LIVE
-# — alerts fire and are visible in the Prometheus and Alertmanager UIs — without
-# requiring an external notification channel. To get out-of-band notification,
-# fill in a receiver below (Slack / email / webhook to the gateway
-# operator_alert intake) and point the route at it.
+# Criticals (severity="critical") go to the gateway's intake,
+# POST https://gateway:8080/api/alerts/alertmanager (i515b): it raises the
+# operator's persisting operator_alert on firing and clears it on resolved,
+# with the gateway's own sentence ("critical alert <alertname> firing on
+# <target>") — the alert's annotations are logged, never sent — and a flap
+# guard (one onset per alert and target per 30 minutes). The intake answers
+# Alertmanager's own service leaf only, so the receiver dials with
+# services/alertmanager/service.{crt,key}, the leaf the healthcheck uses.
+#
+# Everything else routes to a no-op ('null') receiver: the alerting pipeline
+# is still LIVE — alerts fire and are visible in the Prometheus and
+# Alertmanager UIs — without a notification for each warning.
+# tests/test_alertmanager_criticals_reach_gateway.py pins this routing.
 global:
   resolve_timeout: 5m
 
@@ -20,19 +28,20 @@ route:
   routes:
     - matchers:
         - severity = "critical"
-      receiver: 'null'        # replace with a paging receiver for criticals
+      receiver: 'gateway'
       repeat_interval: 1h
 
 receivers:
   - name: 'null'
-  # Example — Slack (set the webhook, then route to 'slack' above):
-  # - name: 'slack'
-  #   slack_configs:
-  #     - api_url: '${ALERTMANAGER_SLACK_WEBHOOK}'
-  #       channel: '#noo-alerts'
-  #       title: '{{ .CommonAnnotations.summary }}'
-  #       text: '{{ .CommonAnnotations.description }}'
-  # Example — generic webhook (e.g. the gateway operator_alert intake):
-  # - name: 'webhook'
-  #   webhook_configs:
-  #     - url: 'https://gateway:8080/api/operator/alert-intake'
+  - name: 'gateway'
+    webhook_configs:
+      - url: 'https://gateway:8080/api/alerts/alertmanager'
+        send_resolved: true
+        # The intake refuses a payload of more than 100 alerts.
+        max_alerts: 100
+        http_config:
+          tls_config:
+            ca_file: /app/pki/ca.crt
+            cert_file: /app/pki/services/alertmanager/service.crt
+            key_file: /app/pki/services/alertmanager/service.key
+            insecure_skip_verify: false

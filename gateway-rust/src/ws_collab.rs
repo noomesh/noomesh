@@ -17,7 +17,7 @@ use tokio_stream::StreamExt;
 
 
 use crate::state::AppState;
-use crate::websocket::{WsParams, send_json, verify_ws_auth};
+use crate::websocket::{WsParams, send_json, verify_ws_ticket};
 
 const MAX_CACHED_EVENTS: usize = 50;
 
@@ -73,7 +73,7 @@ pub async fn ws_handler(
 ) -> impl IntoResponse {
     let jwt_sec = crate::auth::jwt_secret();
 
-    match verify_ws_auth(&params, &jwt_sec) {
+    match verify_ws_ticket(&params, "/ws/collab", &jwt_sec) {
         Ok(claims) => {
             ws.on_upgrade(move |socket| handle_collab(socket, state, claims))
         }

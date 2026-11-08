@@ -42,11 +42,8 @@ func (e *Engine) Run(ctx context.Context, poll, heartbeat time.Duration) error {
 	// rebuild dies with the daemon (same process tree), so nothing it marked
 	// is still running. Left behind, they reject every future rebuild as
 	// "already running" — a permanent wedge from a single unclean restart.
-	if markers, _ := filepath.Glob(filepath.Join(e.Spool, "*.rebuild.running")); len(markers) > 0 {
-		for _, m := range markers {
-			_ = os.Remove(m)
-		}
-		e.logf("cleared %d stale rebuild marker(s) from a previous run", len(markers))
+	if n := spoolRemoveSuffix(e.Spool, ".rebuild.running"); n > 0 {
+		e.logf("cleared %d stale rebuild marker(s) from a previous run", n)
 	}
 
 	started := stamp()
@@ -109,13 +106,24 @@ func (e *Engine) writeHeartbeat(started string, interval time.Duration) {
 // ScanOnce claims and processes every pending command. Exported for tests and
 // for a `noo-hostd drain` one-shot.
 func (e *Engine) ScanOnce(ctx context.Context) {
-	matches, err := filepath.Glob(filepath.Join(e.Spool, "*"+cmdSuffix))
+	candidates, err := spoolNamesWithSuffix(e.Spool, cmdSuffix)
 	if err != nil {
+		// A symlinked or missing spool is refused, not followed (i515).
+		e.logf("WARN cannot scan spool %s: %v", e.Spool, err)
 		return
 	}
+	// Names come from a listing of the NOFOLLOW directory descriptor and must
+	// match the producers' name pattern; anything else is ignored.
+	var matches []string
+	for _, n := range candidates {
+		if cmdFileRe.MatchString(n) {
+			matches = append(matches, n)
+		}
+	}
 	// Sorted so the time-ordered filenames the producers mint (<nanos>-<hex>)
-	// execute in the order they were requested. Glob's order is unspecified;
-	// a restart-then-recreate pair running backwards leaves the container down.
+	// execute in the order they were requested. A directory listing's order is
+	// unspecified; a restart-then-recreate pair running backwards leaves the
+	// container down.
 	sort.Strings(matches)
 	for _, f := range matches {
 		select {
@@ -123,7 +131,7 @@ func (e *Engine) ScanOnce(ctx context.Context) {
 			return
 		default:
 		}
-		claimed, err := claim(f)
+		claimed, err := claim(e.Spool, f)
 		if err != nil {
 			continue // another iteration got it, or it vanished
 		}
@@ -131,14 +139,23 @@ func (e *Engine) ScanOnce(ctx context.Context) {
 	}
 }
 
-// processCommand executes one claimed command file and writes its result.
-func (e *Engine) processCommand(ctx context.Context, path string) {
-	name := commandName(path)
-	defer os.Remove(path)
+// processCommand executes one claimed command file (a bare name inside the
+// spool) and writes its result.
+func (e *Engine) processCommand(ctx context.Context, claimedName string) {
+	name := commandName(claimedName)
+	defer func() {
+		if d, err := openSpoolDir(e.Spool); err == nil {
+			_ = d.remove(claimedName)
+			d.Close()
+		}
+	}()
 
-	raw, err := os.ReadFile(path)
+	// The file is user-written: NOFOLLOW, regular file only, size-capped. A
+	// symlink, FIFO, directory or oversize file is never followed or read; it
+	// is logged, rejected like any unreadable command, and removed.
+	raw, _, err := spoolReadFile(e.Spool, claimedName, maxSpoolCommandBytes)
 	if err != nil {
-		e.logf("REJECT %s: cannot read claimed command: %v", name, err)
+		e.logf("REJECT %s: cannot read claimed command (skipped, not followed): %v", name, err)
 		e.writeResult(name, Result{Op: "unknown", RC: 1, Stderr: "unreadable"})
 		return
 	}

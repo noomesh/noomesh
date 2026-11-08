@@ -128,6 +128,37 @@ func startStreaming(ctx context.Context, name string, args ...string) (io.ReadCl
 // passphrase existed, while manual runs — where the operator had sourced the
 // env — looked fine.
 func withSecrets(root string, name string, args ...string) (string, []string) {
+	return secretsScript(root, "", name, args...)
+}
+
+// withComposeSecrets is withSecrets for a compose render that PUBLISHES
+// ports (`up`, i515a). It also resolves the cluster-plane bind the way every
+// launcher does (scripts/lib-bind-addr.sh resolve_bind_addr), BEFORE the
+// secret files are written. Without it NOO_BIND_ADDR was unset here (the
+// launcher derives it per start and never writes it to .env), so a spooled
+// `recreate gateway` on a tailnet-mode controller republished the gateway,
+// NATS, the node agent or an exporter on 0.0.0.0, and with the compose
+// default now 127.0.0.1 it would drop the service off the tailnet instead.
+// An unset NOO_BIND_MODE refuses, as the launcher does.
+func withComposeSecrets(root string, name string, args ...string) (string, []string) {
+	bind := fmt.Sprintf(
+		`if ! . %s 2>/dev/null; then
+  echo "could not load scripts/lib-bind-addr.sh — refusing to render compose without the cluster-plane bind" >&2
+  exit 1
+fi
+if ! resolve_bind_addr >/dev/null; then
+  echo "the cluster-plane bind could not be resolved (reason above) — refusing rather than publish on the wrong interface" >&2
+  exit 1
+fi
+`,
+		shellQuote(filepath.Join(root, "scripts", "lib-bind-addr.sh")),
+	)
+	return secretsScript(root, bind, name, args...)
+}
+
+// secretsScript is the bash both wrappers run: an optional prelude, then the
+// secrets, the config, and the command.
+func secretsScript(root string, prelude string, name string, args ...string) (string, []string) {
 	quoted := make([]string, 0, len(args)+1)
 	for _, a := range append([]string{name}, args...) {
 		quoted = append(quoted, shellQuote(a))
@@ -146,7 +177,7 @@ func withSecrets(root string, name string, args ...string) (string, []string) {
 	// compose process it execs. Its stderr is NOT discarded: a refusal (the
 	// directory is not tmpfs, the chown container could not run) explains itself
 	// there, and the spool result is where the gateway and the operator read it.
-	script := fmt.Sprintf(
+	script := prelude + fmt.Sprintf(
 		`. %s 2>/dev/null || true
 if ! load_secrets >/dev/null; then
   echo "could not load secrets or write the secret files — cannot read the authoritative store (reason above)" >&2

@@ -1,0 +1,95 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright 2026 PersonifAI LLC */
+
+.connections-panel {
+  max-width: 960px;
+}
+.connections-intro,
+.connections-detail {
+  color: var(--muted-foreground);
+  font-size: 13px;
+}
+.connections-intro {
+  margin: 12px 0 20px;
+}
+.connections-detail {
+  margin: 5px 0;
+  overflow-wrap: anywhere;
+}
+.connections-notice,
+.connection-account,
+.connections-form {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+}
+.connections-notice {
+  margin-bottom: 20px;
+}
+.connections-notice p {
+  margin: 6px 0 0;
+  font-size: 13px;
+}
+.connections-accounts {
+  display: grid;
+  gap: 16px;
+}
+.connection-account-head,
+.connection-sources li {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+.connection-account h3,
+.connections-form h3,
+.connections-form h4 {
+  margin: 0;
+  font-size: 15px;
+}
+.connections-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+.connection-sources {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0 0;
+}
+.connection-sources li {
+  border-top: 1px solid var(--border);
+  padding: 12px 0;
+  font-size: 13px;
+}
+.connections-form {
+  display: grid;
+  gap: 12px;
+  margin: 16px 0;
+}
+.connections-form label {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+}
+.connections-form select {
+  width: 100%;
+}
+@media (max-width: 520px) {
+  .connection-account-head {
+    flex-wrap: wrap;
+  }
+}
+
+.connections-resource {
+  display: block;
+  padding: 0.3rem 0;
+}
+.pairing-page { width: min(100% - 2rem, 34rem); margin: 3rem auto; padding: 1rem; }
+.pairing-page h1, .pairing-page h2 { margin-bottom: 1rem; }
+.pairing-page p { margin: 1rem 0; }
+.pairing-page form { display: grid; gap: 1rem; }
+.pairing-page input { padding: .75rem; font-size: 1.4rem; letter-spacing: .12em; text-transform: uppercase; }
+.pairing-page button { padding: .75rem 1rem; border: 1px solid currentColor; border-radius: .4rem; cursor: pointer; }
+.pairing-actions { display: flex; gap: 1rem; flex-wrap: wrap; }

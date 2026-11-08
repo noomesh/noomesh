@@ -104,6 +104,41 @@ pub fn local_backend_url(backend_type: &str, port: u16) -> String {
     format!("https://{host}:{port}")
 }
 
+/// The URL of a backend on the CONTROLLER's own network, for a node whose
+/// record carries no address: the controller's own node on a standalone box,
+/// whose agent drops its loopback address (noomesh-internal i545 48/49/56).
+/// For ollama it is the gateway's own `OLLAMA_URL` when set: onboarding
+/// points it at the ollama that exists here, `noo-stunnel-ollama-embed` on a
+/// standalone install (the one ollama that serves the embedder AND chat
+/// there; no `noo-stunnel-ollama` runs), the controller profile's ollama door
+/// elsewhere. Every other backend, and ollama with no `OLLAMA_URL`, is
+/// [`local_backend_url`].
+pub fn controller_local_backend_url(backend_type: &str, port: u16) -> String {
+    controller_local_backend_url_with(backend_type, port, std::env::var("OLLAMA_URL").ok().as_deref())
+}
+
+/// [`controller_local_backend_url`] over an explicit `OLLAMA_URL` (pure).
+pub fn controller_local_backend_url_with(backend_type: &str, port: u16, ollama_url: Option<&str>) -> String {
+    if backend_type == "ollama" {
+        if let Some(u) = ollama_url.map(str::trim).filter(|u| !u.is_empty()) {
+            return u.trim_end_matches('/').to_string();
+        }
+    }
+    local_backend_url(backend_type, port)
+}
+
+/// A URL that names a backend on the controller's own docker network, which
+/// cannot point off-box: the controller-local service names, and the
+/// controller's own ollama door ([`controller_local_backend_url`]).
+pub fn is_controller_local_service(url: &str, ollama_url: Option<&str>) -> bool {
+    url.contains("noo-vllm")
+        || url.contains("noo-ollama")
+        || url.contains("noo-llamacpp")
+        || url.contains("noo-stunnel-llamacpp")
+        || url == local_backend_url("ollama", 11434)
+        || ollama_url.map(str::trim).filter(|u| !u.is_empty()).is_some_and(|u| url == u.trim_end_matches('/'))
+}
+
 /// API format detection based on backend type + URL.
 ///
 /// Special case for cross-host calls (proposal #10 — node-agent inference
@@ -536,11 +571,7 @@ async fn resolve_backend_url(gossip_url: &str, node_id: &str, backend_type: &str
     // No registered address. Accept the offer's URL only if it names a
     // controller-local docker service — those resolve on the controller's
     // own network and cannot point at another host.
-    let is_local_docker_service = gossip_url.contains("noo-vllm")
-        || gossip_url.contains("noo-ollama")
-        || gossip_url.contains("noo-llamacpp")
-        || gossip_url.contains("noo-stunnel-llamacpp");
-    if is_local_docker_service {
+    if is_controller_local_service(gossip_url, std::env::var("OLLAMA_URL").ok().as_deref()) {
         return gossip_url.to_string();
     }
     tracing::warn!(
@@ -1184,7 +1215,7 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
                                             Some(p) => p,
                                             None => continue,
                                         };
-                                        let url = local_backend_url(bt, port);
+                                        let url = controller_local_backend_url(bt, port);
                                         // The address the dispatcher will record as
                                         // `ResolvedBackend.url` for this node. Failed
                                         // backends are remembered by it, so exclusion
@@ -1273,6 +1304,12 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
         // local service (which usually doesn't have that backend running)
         // and falls back to the default backend, masking the user's choice.
         let resolved_url = resolve_backend_url(&best.url, &best.node_id, &best.backend_type, state).await;
+        // An address the gateway cannot dial is not a backend: fall through to
+        // the remaining resolution paths, as the discovery path does, never
+        // hand the caller an empty URL.
+        if resolved_url.is_empty() {
+            tracing::warn!(node = %best.node_id, backend = %best.backend_type, "backend_unresolvable: no registered address and not a controller-local door");
+        } else {
         tracing::info!(
             node = %best.node_id, backend = %best.backend_type,
             model = %best.model_name,
@@ -1289,6 +1326,7 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
             api_format: detect_api_format_for_url(&best.backend_type, Some(&resolved_url)),
             backend_type: best.backend_type.clone(),
         }, Some(best.node_id.clone())));
+        }
     }
 
     // 2. Mesh discovery via NATS request/reply (asks nodes directly)
@@ -1930,7 +1968,7 @@ mod node_agent_url_tests {
 
 #[cfg(test)]
 mod local_backend_url_tests {
-    use super::local_backend_url;
+    use super::{controller_local_backend_url_with, is_controller_local_service, local_backend_url};
 
     /// Every compose backend is dialled over https, and the two that cannot
     /// serve TLS themselves (llama.cpp, ollama) at their stunnel sidecars,
@@ -1943,6 +1981,47 @@ mod local_backend_url_tests {
         assert_eq!(local_backend_url("ollama", 11434), "https://noo-stunnel-ollama:11434");
         assert_eq!(local_backend_url("vllm", 8000), "https://noo-vllm:8000");
         assert_eq!(local_backend_url("vllm-secondary", 8000), "https://noo-vllm-secondary:8000");
+    }
+
+    const EMBED_DOOR: &str = "https://noo-stunnel-ollama-embed:11434";
+
+    /// i545 48/49/56: a node with no address is the controller's own; its
+    /// ollama is the gateway's OLLAMA_URL (the embed ollama on standalone),
+    /// never `noo-stunnel-ollama`, which does not run there.
+    #[test]
+    fn the_controllers_own_ollama_is_its_configured_door() {
+        assert_eq!(controller_local_backend_url_with("ollama", 11434, Some(EMBED_DOOR)), EMBED_DOOR);
+        assert_eq!(controller_local_backend_url_with("ollama", 11434, Some("https://noo-stunnel-ollama-embed:11434/ ")), EMBED_DOOR);
+        assert_eq!(controller_local_backend_url_with("ollama", 11434, None), "https://noo-stunnel-ollama:11434");
+        assert_eq!(controller_local_backend_url_with("ollama", 11434, Some("  ")), "https://noo-stunnel-ollama:11434");
+        assert_eq!(controller_local_backend_url_with("llamacpp", 8085, Some(EMBED_DOOR)), "https://noo-stunnel-llamacpp:8085", "only ollama");
+    }
+
+    /// The same door is a controller-local service, so a node with no
+    /// recorded address resolves to it instead of to nothing.
+    #[test]
+    fn the_controllers_ollama_door_is_a_controller_local_service() {
+        assert!(is_controller_local_service(EMBED_DOOR, Some(EMBED_DOOR)));
+        assert!(is_controller_local_service("https://noo-stunnel-ollama:11434", None), "the controller profile's door");
+        assert!(is_controller_local_service("https://noo-stunnel-llamacpp:8085", None));
+        assert!(!is_controller_local_service(EMBED_DOOR, None), "the embed door only when it is the configured ollama");
+        assert!(!is_controller_local_service("https://10.0.0.9:11434", Some(EMBED_DOOR)), "never an off-box address");
+    }
+
+    /// Both resolution paths use it for an address-less node, and an empty
+    /// resolution is never returned as a backend.
+    #[test]
+    fn address_less_nodes_dial_the_controllers_door_and_never_an_empty_url() {
+        let own = crate::test_src::own_code(include_str!("backend.rs"));
+        let resolve = crate::test_src::fn_body(&own, "async fn resolve_backend_url(");
+        assert!(resolve.contains("is_controller_local_service(gossip_url, std::env::var(\"OLLAMA_URL\").ok().as_deref())"), "{resolve}");
+        assert!(own.contains("let url = controller_local_backend_url(bt, port);"), "the KV candidates");
+        let guard = own.find("if resolved_url.is_empty() \u{7b}\n            tracing::warn!(node = %best.node_id").expect("the empty guard");
+        let ret = own[guard..].find("return Ok((ResolvedBackend \u{7b}").expect("the return");
+        assert!(own[guard..guard + ret].contains("\u{7d} else \u{7b}"), "the return is on the non-empty side only");
+        let classes = crate::test_src::own_code(include_str!("classes.rs"));
+        let url_for = crate::test_src::fn_body(&classes, "fn url_for(");
+        assert!(url_for.contains("super::backend::controller_local_backend_url(backend, port)"), "{url_for}");
     }
 }
 

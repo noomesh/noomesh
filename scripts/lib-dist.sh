@@ -383,7 +383,7 @@ require_addon_pins() {
                 # `decl <addon> <file>`: a declaration file its verified lock
                 # lists. Only the names the gateway reads are kept.
                 case "$_rest" in
-                    system.json|workloads.json|routes.json) _decls+=("${_addon} ${_rest}") ;;
+                    system.json|workloads.json|routes.json|node-workloads.json) _decls+=("${_addon} ${_rest}") ;;
                 esac ;;
             refuse)
                 _addon_refuse "$_addon" "${_rest:-no verified pin for ${_tag}}" ;;
@@ -935,10 +935,12 @@ compose_active_services() {
 
 # addon_decls_materialise — hand the gateway what each add-on's signed bundle
 # declares beyond its overlay (noomesh-internal i163 E/B): `system.json` (its
-# database system), `workloads.json` (its managed workloads) and `routes.json`
-# (its HTTP route manifest, 0.6.13), copied into
+# database system), `workloads.json` (its managed workloads), `routes.json`
+# (its HTTP route manifest, 0.6.13) and `node-workloads.json` (its i300 node
+# workloads, beside workloads.json), copied into
 #   <install root>/.noo-addon-systems/<addon>/system.json
 #   <install root>/.noo-addon-workloads/<addon>/workloads.json
+#   <install root>/.noo-addon-workloads/<addon>/node-workloads.json
 #   <install root>/.noo-addon-routes/<addon>/routes.json
 # which docker-compose.cluster.yml mounts read-only into the gateway at
 # /opt/noo/addon-systems, /opt/noo/addon-workloads and
@@ -988,7 +990,7 @@ addon_decls_materialise() {
                 _src="$(addon_overlay "$_n" 2>/dev/null)"
                 [ -n "$_src" ] || continue
                 _d="$(dirname "$_src")"
-                for _f in system.json workloads.json routes.json; do
+                for _f in system.json workloads.json routes.json node-workloads.json; do
                     [ -f "$_d/$_f" ] && _plan="${_plan}${_n} ${_f} ${_d}/${_f}"$'\n'
                 done
             done ;;
@@ -1006,25 +1008,26 @@ addon_decls_materialise() {
         [ -n "$_a" ] || continue
         case "$_a" in [a-z]*) : ;; *) continue ;; esac
         case "$_a" in *[!a-z0-9_-]*) continue ;; esac
-        case "$_f" in system.json) _d="$_sys/$_a" ;; workloads.json) _d="$_wl/$_a" ;; routes.json) _d="$_rt/$_a" ;; *) continue ;; esac
+        case "$_f" in system.json) _d="$_sys/$_a" ;; workloads.json|node-workloads.json) _d="$_wl/$_a" ;; routes.json) _d="$_rt/$_a" ;; *) continue ;; esac
         [ -f "$_src" ] && [ ! -L "$_src" ] || continue
-        case "$_keep" in *" $_f:$_a "*) : ;; *)
+        # One add-on directory can take two files (workloads.json and
+        # node-workloads.json): it is emptied once, by the first file copied
+        # into it this start, so the second never erases the first.
+        case "$_keep" in *" $_d "*) : ;; *)
             rm -rf "${_d:?}" && mkdir -p "$_d" && chmod 0755 "$_d" || return 1 ;;
         esac
         cp "$_src" "$_d/$_f.tmp.$$" && chmod 0644 "$_d/$_f.tmp.$$" && mv -f "$_d/$_f.tmp.$$" "$_d/$_f" || {
             echo "REFUSING: could not copy ${_a}'s ${_f} into $_d." >&2
             return 1
         }
-        _keep="${_keep}${_f}:${_a} "
+        _keep="${_keep}${_d} "
     done <<PLAN
 $_plan
 PLAN
     # Drop every add-on directory not copied above.
     for _d in "$_sys"/* "$_wl"/* "$_rt"/*; do
         [ -e "$_d" ] || continue
-        _n="$(basename "$_d")"
-        case "$_d" in "$_sys"/*) _f=system.json ;; "$_wl"/*) _f=workloads.json ;; *) _f=routes.json ;; esac
-        case "$_keep" in *" $_f:$_n "*) : ;; *) rm -rf "${_d:?}" ;; esac
+        case "$_keep" in *" $_d "*) : ;; *) rm -rf "${_d:?}" ;; esac
     done
     _after="$(cd "$_sys" && ls -1 2>/dev/null | sort | tr '\n' ' ')"
     if [ "$_before" != "$_after" ] && command -v derive_file_secrets >/dev/null 2>&1 && command -v write_secret_files >/dev/null 2>&1; then
@@ -1113,7 +1116,7 @@ _addon_hand_tree() {
 
 addon_resources_materialise() {
     local _n _o _args=() _nb _out _rc=0 _kind _addon _rest _var _val _uid _path _h _prefix _bad
-    local _envs=() _owns=() _gens=() _stales=() _p _tagargs=()
+    local _envs=() _owns=() _gens=() _stales=() _p _tmp _tagargs=()
     ADDON_HOLD_SCALE=""
     _ADDON_HELD=()
     for _n in $(addon_licensed_names); do
@@ -1151,7 +1154,7 @@ addon_resources_materialise() {
         return 0
     fi
     while read -r _kind _addon _rest; do
-        case "$_kind" in hold|env|mount|own|gen|stale|refuse|notice) : ;; *) continue ;; esac
+        case "$_kind" in hold|env|mount|own|gen|stale|refuse|notice|warn) : ;; *) continue ;; esac
         case "$_addon" in
             [a-z]*) case "$_addon" in *[!a-z0-9_-]*) _addon="" ;; esac ;;
             *) _addon="" ;;
@@ -1167,6 +1170,10 @@ addon_resources_materialise() {
             notice)
                 # An optional input that could not be produced: skipped, said.
                 echo "NOTE: add-on ${_addon}: ${_rest}" >&2 ;;
+            warn)
+                # Started, but in a shape a later release refuses (i509:
+                # a declared mount docker may create as root at boot).
+                echo "WARNING: add-on ${_addon}: ${_rest}" >&2 ;;
             hold)
                 case "${_rest%% *}" in
                     [A-Za-z0-9]*) case "${_rest%% *}" in *[!A-Za-z0-9_.-]*) continue ;; esac ;;
@@ -1217,18 +1224,37 @@ RES
             _addon_unverify "$_addon"
         fi
     done
+    # A fresh generation is written into a hidden temporary directory
+    # (`gen <addon> <tmp> <final>`, i509): marked complete there, then
+    # renamed to the final one its mounts name. dockerd may restart the
+    # add-on's container at any moment, and with host-path creation off it
+    # starts as soon as the source exists, so the final path must only ever
+    # exist whole.
     for _p in ${_gens[@]+"${_gens[@]}"}; do
-        _addon="${_p%% *}"; _path="${_p#* }"
+        _addon="${_p%% *}"; _p="${_p#* }"; _tmp="${_p%% *}"; _path="${_p#* }"
         case ",${_NOO_ADDONS_REFUSED}," in *",${_addon},"*) continue ;; esac
-        if ! : > "${_path:?}/.complete"; then
-            _addon_refuse "$_addon" "its runtime inputs could not be marked complete (${_path})"
+        case "$_path" in
+            /?*/g-*) : ;;
+            *) _path="" ;;
+        esac
+        if [ -z "$_path" ] || [ "$_tmp" = "$_p" ] || [ "$_tmp" != "${_path%/*}/.${_path##*/}.tmp" ]; then
+            _addon_refuse "$_addon" "noo addons launch-resources named a generation this launcher does not recognise (${_p})"
+            _addon_unverify "$_addon"
+            continue
+        fi
+        if ! : > "${_tmp:?}/.complete"; then
+            _addon_refuse "$_addon" "its runtime inputs could not be marked complete (${_tmp})"
+            _addon_unverify "$_addon"
+        elif [ -e "$_path" ] || ! mv -- "$_tmp" "$_path"; then
+            _addon_refuse "$_addon" "its runtime inputs could not be moved into place (${_tmp} -> ${_path}); remove ${_path} and start again"
             _addon_unverify "$_addon"
         fi
     done
-    # Older generations: hand them back to us, then remove them. Not fatal.
+    # Older generations (and a temporary one an interrupted start left
+    # behind): hand them back to us, then remove them. Not fatal.
     for _p in ${_stales[@]+"${_stales[@]}"}; do
         _path="${_p#* }"
-        case "$_path" in /?*/g-?*) : ;; *) continue ;; esac
+        case "$_path" in /?*/g-?*|/?*/.g-?*.tmp) : ;; *) continue ;; esac
         _addon_hand_tree "$_path" "$(id -u)" >/dev/null 2>&1 || true
         rm -rf -- "${_path:?}" 2>/dev/null || echo "WARNING: could not remove an older add-on input generation: ${_path}" >&2
     done

@@ -120,8 +120,9 @@ one-liner carries (`noo enroll noo1.<base64>`), an explicit
 `--url <controller> --token <t>`, and `--via-tailnet <https://controller>`
 (no token: identity is proved by Tailscale `whois` plus a dial-back). The
 command installs Tailscale if needed, registers with `POST
-/api/cluster/bootstrap`, prints `registered as gpu-2`, installs the
-host prep (agent, fetch timer, CA anchor at `/etc/noo/pki/ca.crt`; no
+/api/cluster/bootstrap`, prints `admitted as gpu-2`, installs the
+host prep (fetch timer, CA anchor at `/etc/noo/pki/ca.crt`; there is no
+`noo-node-agent` unit yet, it arrives with the first bundle; no
 controller SSH key goes in, and a gate-pinned key line or SSH-lane sudoers
 drop-in left by an older enrollment is removed), and ends `enrollment complete`. Then on
 the controller run `noo cluster provision gpu-2 --wait` — see
@@ -354,6 +355,7 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 | `noo addons verify` | — | Re-verify add-on locks offline and compare local and running images with the pins |
 | `noo addons launch-pins` | `[--root <dir>] <tag> [<name>...]` | Hidden: print verified add-on image pins for the launcher (internal) |
 | `noo addons launch-resources` | `--root <d> --tag <t> --project <p> --network <n> <name>...` | Hidden: write add-ons' declared runtime inputs for the launcher (internal) |
+| `noo addons after-boot` | — | Hidden: once per boot, start each enabled add-on that is down and report it (systemd) |
 | `noo addons rotate-secret` | `<name> <resource>` | Give an add-on's declared shared secret a new value; restart the add-on to apply |
 
 ### `noo kiosk` — The unattended display's host seat: cage + Chromium showing /kiosk.html
@@ -365,7 +367,7 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 | `noo kiosk reload` | — | Reload the page on the display and report the console build either side |
 | `noo kiosk seat-sync` | `[--migrate [--print]]` | Hidden: the seat's sync tick (internal); --migrate moves an old root seat, run once |
 | `noo kiosk seat-token` | `<seat-name> [--ttl <1h\|30m\|secs>] [--controller <https://…>]` | Controller: mint a one-time role=seat token; prints the seat's `noo kiosk enroll <blob>` |
-| `noo kiosk seats` | — | Controller: every enrolled display: last heard, view, quality, console build, apply |
+| `noo kiosk seats` | `[set <seat> <quality\|view\|rotate\|poll> <value> \| bind <seat> <tailnet-device> \| revoke <seat> --yes]` | Controller: enrolled displays; set one's display, bind its device, revoke it |
 | `noo kiosk serve` | `[--port <n>]` | Hidden: the display's local proxy, run by kiosk-serve.service (internal) |
 | `noo kiosk set` | `quality lean\|full\|auto [--dry-run]` | Change one seat setting (graph drawing quality), keep the rest; restarts the display |
 | `noo kiosk setup` | `--mode dedicated\|shared --url <https://…ts.net> [--vt <n>] [--user <name>] [--view health\|graph] [--rotate <secs>] [--poll <secs>] [--quality lean\|full] [--browser <bin>] [--dry-run] [-y\|--yes]` | Install the display seat: kiosk user, cage + Chromium unit, token launcher, watchdog |

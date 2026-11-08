@@ -105,6 +105,17 @@ type Config struct {
 	// default /var/lib/noo-node-agent, the spool's parent). The shipper's
 	// disk spill and tail offsets live under it.
 	StateDir string
+
+	// AddonWorkloadsPolicy is this node's consent to run an add-on's node
+	// workloads (i300): "none" (the default), "approve" or "auto"
+	// (NOO_ADDON_WORKLOADS). A value that is none of those is "none", and
+	// AddonWorkloadsPolicyAsked keeps what was written so the agent can say so.
+	AddonWorkloadsPolicy      string
+	AddonWorkloadsPolicyAsked string
+	// AddonWorkloadsOnController: the owner opts in to node workloads on the
+	// controller's own host (NOO_ADDON_WORKLOADS_ON_CONTROLLER=1), for a
+	// single-box install. Off by default.
+	AddonWorkloadsOnController bool
 }
 
 // LogShipEnabled reports whether the shipper should run: the operator has
@@ -147,6 +158,8 @@ func Load() *Config {
 		StateDir:          envOr("NOO_AGENT_STATE", "/var/lib/noo-node-agent"),
 	}
 
+	c.AddonWorkloadsPolicy, c.AddonWorkloadsPolicyAsked = addonWorkloadsPolicy(os.Getenv("NOO_ADDON_WORKLOADS"))
+	c.AddonWorkloadsOnController = envBool("NOO_ADDON_WORKLOADS_ON_CONTROLLER")
 	c.MTLSDowngradeAsked = mtlsDowngradeAsked()
 	c.BackendTLSDowngradeAsked = backendTLSDowngradeAsked()
 
@@ -434,6 +447,19 @@ func envOr(key, fallback string) string {
 }
 
 // envBool reads a yes/no flag: "1", "true" or "yes" (any case) is true.
+// addonWorkloadsPolicy reads NOO_ADDON_WORKLOADS: none | approve | auto, case
+// and surrounding space ignored; unset is none. Anything else fails CLOSED to
+// none, and asked is the offending value so the agent can log it.
+func addonWorkloadsPolicy(raw string) (policy, asked string) {
+	switch v := strings.ToLower(strings.TrimSpace(raw)); v {
+	case "", "none":
+		return "none", ""
+	case "approve", "auto":
+		return v, ""
+	}
+	return "none", strings.TrimSpace(raw)
+}
+
 func envBool(key string) bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
 	case "1", "true", "yes":
