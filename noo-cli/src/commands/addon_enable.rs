@@ -247,20 +247,108 @@ fn sops_path() -> PathBuf {
     crate::envfile::repo_root().join("secrets/env.sops")
 }
 
+/// What an add-on's materialised bundle needs from the encrypted store:
+/// the variables of its `shared_secret` resources, and the store key of its
+/// own gateway key when a REQUIRED `addon_key` resource asks for it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct StoreNeeds {
+    pub shared: Vec<String>,
+    pub addon_key: Option<String>,
+}
+
+pub(crate) fn bundle_store_needs(root: &Path, addon: &str) -> StoreNeeds {
+    use crate::addons::resources::What;
+    let Ok(crate::addons::decls::Declared { resources: Some(res), .. }) = crate::addons::decls::materialised(root, addon) else {
+        return StoreNeeds::default();
+    };
+    let shared = res
+        .resources
+        .iter()
+        .filter(|r| r.what == What::SharedSecret)
+        .map(|r| crate::addons::resources::shared_secret_var(addon, &r.name))
+        .collect();
+    let addon_key = if res.resources.iter().any(|r| r.what == What::AddonKey && !r.optional) {
+        let files = crate::addons::pins::materialised_files(root, addon, ["docker-compose.yml".to_string()].iter());
+        crate::addons::resources::bundle_facts(addon, &files).addon_key_var
+    } else {
+        None
+    };
+    StoreNeeds { shared, addon_key }
+}
+
+/// What a re-pin left the store holding for one add-on (i570 2c).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RepinSecrets {
+    /// Shared secrets the new bundle declares that were absent and are now minted.
+    pub minted: Vec<String>,
+    /// The add-on's own gateway key, asked for and not held. Never minted
+    /// here: a gateway key is the operator's grant (`noo addons enable`
+    /// shows the request first).
+    pub key_missing: Option<String>,
+}
+
+/// After `noo addons upgrade` or `noo upgrade` pins an add-on's bundle: mint
+/// the shared secrets it declares that the store lacks, as the enable does.
+/// An add-on's 0.2.0 release added a `shared_secret` resource; the upgrade pinned it, minted
+/// nothing, and the next start refused the add-on (0.6.18 roll). Never
+/// rotates (`mint` is [`secrets::mint_missing`] in production), and calls
+/// `mint` only when something is absent.
+pub(crate) fn reconcile_repin_secrets(
+    needs: &StoreNeeds,
+    present: &dyn Fn(&str) -> bool,
+    mint: &mut dyn FnMut(&[&str]) -> Result<Vec<String>, String>,
+) -> Result<RepinSecrets, String> {
+    let absent: Vec<&str> = needs.shared.iter().map(String::as_str).filter(|k| !present(k)).collect();
+    let minted = if absent.is_empty() { Vec::new() } else { mint(&absent)? };
+    let key_missing = needs.addon_key.clone().filter(|k| !present(k));
+    Ok(RepinSecrets { minted, key_missing })
+}
+
+/// [`reconcile_repin_secrets`] against the install's encrypted store, and
+/// the lines it prints. A failure is a warning: the pin is already written,
+/// and the launcher's refusal names `noo addons enable <addon>`.
+pub(crate) fn mint_repin_secrets(g: &Globals, root: &Path, addon: &str) -> RepinSecrets {
+    let needs = bundle_store_needs(root, addon);
+    if needs.shared.is_empty() && needs.addon_key.is_none() {
+        return RepinSecrets::default();
+    }
+    let sops = root.join("secrets/env.sops");
+    let out = secrets::SecretStore::load_sops(&sops).and_then(|store| {
+        reconcile_repin_secrets(&needs, &|k| store.contains(k), &mut |keys| {
+            secrets::mint_missing(keys, &sops).map(|(minted, _backup)| minted)
+        })
+    });
+    match out {
+        Ok(r) => {
+            if !g.json {
+                if !r.minted.is_empty() {
+                    crate::ui::done(&format!("minted {} into the encrypted store ({addon}'s bundle declares it)", r.minted.join(", ")));
+                }
+                if let Some(k) = &r.key_missing {
+                    crate::ui::warned(&format!(
+                        "{addon}'s bundle asks for its own gateway key ({k}) and none is held; the launcher refuses it until: noo addons enable {addon}"
+                    ));
+                }
+            }
+            r
+        }
+        Err(e) => {
+            if !g.json {
+                crate::ui::warned(&format!(
+                    "{addon}: its bundle's secrets ({}) could not be checked or minted ({e}); the launcher refuses it until: noo addons enable {addon}",
+                    needs.shared.join(", ")
+                ));
+            }
+            RepinSecrets::default()
+        }
+    }
+}
+
 /// Mint the `shared_secret` resources the add-on's materialised bundle
 /// declares (`resources.json`, `addons::resources`), when absent. Never
 /// rotates: that is `noo addons rotate-secret`. Names only are returned.
 fn mint_shared_secrets(addon: &str) -> Result<Vec<String>, Refusal> {
-    let root = crate::envfile::repo_root();
-    let Ok(crate::addons::decls::Declared { resources: Some(res), .. }) = crate::addons::decls::materialised(&root, addon) else {
-        return Ok(Vec::new());
-    };
-    let vars: Vec<String> = res
-        .resources
-        .iter()
-        .filter(|r| r.what == crate::addons::resources::What::SharedSecret)
-        .map(|r| crate::addons::resources::shared_secret_var(addon, &r.name))
-        .collect();
+    let vars = bundle_store_needs(&crate::envfile::repo_root(), addon).shared;
     if vars.is_empty() {
         return Ok(Vec::new());
     }
@@ -822,5 +910,85 @@ addons:
         assert_eq!(t.secret_key, "NOO_SVC_KEY_EVOLVE");
         assert!(secrets::addon_decl("evolve").is_some());
         assert!(secrets::addon_decl("voice").is_none(), "voice calls no gateway route and declares no key");
+    }
+
+    /// Materialise the rhaddon fixture as a pinned bundle under a fresh
+    /// root, with `resources.json` passed through `edit` first.
+    fn pinned_rhaddon(tag: &str, edit: impl Fn(String) -> String) -> std::path::PathBuf {
+        use crate::addons::resolve;
+        let addon = "rhaddon";
+        let d = std::env::temp_dir().join(format!("noo-repin-secrets-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(".env"), "NOO_IMAGE_TAG=v0.6.0\n").unwrap();
+        let res = edit(include_str!("../../../tests/fixtures/addons/rhaddon/resources.json").to_string());
+        let files = std::collections::BTreeMap::from([
+            ("docker-compose.yml".to_string(), include_bytes!("../../../tests/fixtures/addons/rhaddon/docker-compose.yml").to_vec()),
+            ("resources.json".to_string(), res.into_bytes()),
+            ("system.json".to_string(), include_bytes!("../../../tests/fixtures/addons/rhaddon/system.json").to_vec()),
+        ]);
+        let mut l = resolve::tests::lock("0.2.0", &["v0.6.0"], None);
+        l.format = crate::addon_lock::FORMAT_V2.into();
+        l.addon = addon.into();
+        l.files = files.iter().map(|(n, b)| (n.clone(), crate::addon_lock::sha256_ref(b))).collect();
+        let (bytes, sig) = crate::addon_lock::sign(&l, &resolve::tests::seed()).unwrap();
+        let f = crate::addons::lock_fetch::Fetched { lock: bytes, sig, files };
+        let want = resolve::Want { addon, stack_tag: "v0.6.0", stack_lock: None, pinned: None, pin: None, allow_downgrade: false };
+        let v = resolve::check(&f, &resolve::tests::anchor(), &want).unwrap();
+        resolve::record(&d, addon, &v, &f, "v0.6.0", None).unwrap();
+        d
+    }
+
+    /// i570 2c: a re-pinned bundle's shared secret that the store lacks is
+    /// minted, one it holds is never handed to the minter (no rotation), and
+    /// a required gateway key that is not held is reported, never minted.
+    /// An add-on's 0.2.0 release added a `shared_secret` resource; the upgrade minted nothing
+    /// and the next start refused the add-on.
+    #[test]
+    fn a_repin_mints_the_shared_secrets_its_bundle_adds_and_only_those() {
+        let peer = "NOO_ADDON_SECRET_RHADDON__PEER_KEY";
+        let d = pinned_rhaddon("a", |r| r);
+        let needs = bundle_store_needs(&d, "rhaddon");
+        assert_eq!(needs.shared, [peer]);
+        assert_eq!(needs.addon_key, None, "the fixture's addon-key is optional: nothing to ask for");
+
+        let mut asked: Vec<Vec<String>> = Vec::new();
+        let mut mint = |k: &[&str]| { asked.push(k.iter().map(|s| s.to_string()).collect()); Ok(k.iter().map(|s| s.to_string()).collect()) };
+        let r = reconcile_repin_secrets(&needs, &|_| false, &mut mint).unwrap();
+        assert_eq!(r.minted, [peer]);
+        assert_eq!(asked, [vec![peer.to_string()]]);
+
+        let mut called = false;
+        let r = reconcile_repin_secrets(&needs, &|k| k == peer, &mut |_| { called = true; Ok(vec![]) }).unwrap();
+        assert!(!called, "a secret the store holds is never handed to the minter");
+        assert!(r.minted.is_empty() && r.key_missing.is_none(), "{r:?}");
+        let _ = std::fs::remove_dir_all(&d);
+
+        // The same bundle with its gateway key REQUIRED.
+        let d = pinned_rhaddon("b", |r| r.replace(r#""kind": "addon_key", "optional": true,"#, r#""kind": "addon_key","#));
+        let needs = bundle_store_needs(&d, "rhaddon");
+        assert_eq!(needs.addon_key.as_deref(), Some("NOO_SVC_KEY_RHADDON"));
+        let mut asked: Vec<String> = Vec::new();
+        let r = reconcile_repin_secrets(&needs, &|_| false, &mut |k| { asked.extend(k.iter().map(|s| s.to_string())); Ok(vec![]) }).unwrap();
+        assert_eq!(r.key_missing.as_deref(), Some("NOO_SVC_KEY_RHADDON"));
+        assert!(!asked.iter().any(|k| k.starts_with("NOO_SVC_KEY_")), "a gateway key is the operator's grant, never minted here: {asked:?}");
+        assert!(reconcile_repin_secrets(&needs, &|_| true, &mut |_| Ok(vec![])).unwrap().key_missing.is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Both re-pin paths mint: `noo addons upgrade` (whether or not the pin
+    /// changed: the operator's pin was current) and `noo upgrade`'s pin
+    /// commit, before the launch.
+    #[test]
+    fn both_repin_paths_mint_the_bundle_secrets() {
+        let pins = crate::test_src::own_code(include_str!("addon_pins.rs"));
+        let upgrade = crate::test_src::fn_body(&pins, "pub fn addons_upgrade(");
+        let at = upgrade.find("mint_repin_secrets(").expect("addons upgrade mints the bundle's secrets");
+        let gate = &upgrade[..at];
+        let gate = &gate[gate.rfind("if ").expect("gated")..];
+        assert!(gate.starts_with("if !check"), "minted on every pin, changed or not, never on --check: {gate}");
+        let up = crate::test_src::own_code(include_str!("upgrade.rs"));
+        assert!(crate::test_src::fn_body(&up, "fn commit_addon_pins(").contains("mint_repin_secrets("),
+            "noo upgrade's pin commit mints the bundle's secrets");
     }
 }

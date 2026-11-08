@@ -4897,6 +4897,10 @@ fn commit_addon_pins(g: &Globals, root: &std::path::Path, tag: &str, prepared: &
                     ui::done(&format!("{} {} pinned for {tag} (add-on key #{}; {} image(s) pulled by digest {})",
                         p.addon, pin.version, pin.key_index, p.pulled, p.via));
                 }
+                // A new version's bundle can declare a secret the old one did
+                // not (a `shared_secret` resource): mint it now, as the
+                // enable does, so the launch below does not refuse it (i570 2c).
+                crate::commands::addon_enable::mint_repin_secrets(g, root, &p.addon);
             }
             Err(r) => fail(g.json, ExitCode::Generic, "addon_pin_write_failed",
                 &format!("{} — stack.lock is already written for {tag}; the launcher refuses {} until it is pinned",
