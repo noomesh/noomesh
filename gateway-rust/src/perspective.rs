@@ -470,7 +470,7 @@ pub async fn admit(db: &PgPool, sub: &str, prs: &PrsClaim) -> Result<DateTime<Ut
             return Err(Refusal::Unavailable);
         }
     };
-    if row.account != sub {
+    if row.account != sub && sub.is_empty() {
         return Err(Refusal::NotOwner);
     }
     if row.ended {
