@@ -40,6 +40,9 @@ pub struct NewTaskRow<'a> {
     pub budget_default: bool,
     pub token_budget: Option<i64>,
     pub created_via: Option<&'a str>,
+    /// The perspective snapshot the task was submitted under (i538), as
+    /// `perspective::RequesterPerspective` JSON; `None` = the real view.
+    pub perspective: Option<Value>,
 }
 
 /// Insert a task in state `open`.
@@ -48,8 +51,8 @@ where
     E: sqlx::PgExecutor<'e>,
 {
     sqlx::query(
-        "INSERT INTO noo_tasks (id, objective, owner_uuid, state, conversation_id, thread_id, channel, model, loop_budget, parent_id, role, budget_default, token_budget, created_via) \
-         VALUES ($1, $2, (SELECT user_uuid FROM noo_users WHERE username = $3), 'open', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+        "INSERT INTO noo_tasks (id, objective, owner_uuid, state, conversation_id, thread_id, channel, model, loop_budget, parent_id, role, budget_default, token_budget, created_via, perspective) \
+         VALUES ($1, $2, (SELECT user_uuid FROM noo_users WHERE username = $3), 'open', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
     )
     .bind(t.id)
     .bind(t.objective)
@@ -64,6 +67,7 @@ where
     .bind(t.budget_default)
     .bind(t.token_budget)
     .bind(t.created_via)
+    .bind(&t.perspective)
     .execute(db)
     .await?;
     Ok(())
