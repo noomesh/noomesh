@@ -170,6 +170,16 @@ pub fn owner_role(read: Result<Option<String>, String>) -> Result<crate::auth::R
     }
 }
 
+/// The role a task's events are delivered under, as the add-on would see a
+/// request from its owner: the owner's live role, min'd with the
+/// perspective snapshot the task was submitted under (i538), whether or not
+/// that perspective is still on.
+pub(crate) async fn task_owner_role(db: &sqlx::PgPool, task_id: uuid::Uuid, owner: &str) -> Result<crate::auth::Role, String> {
+    let live = owner_role(crate::repo::users::role_of(db, owner).await.map_err(|e| e.to_string()))?;
+    let snapshot = crate::perspective::task_snapshot(db, task_id).await;
+    Ok(crate::perspective::snapshot_role(live, snapshot.as_ref()))
+}
+
 /// The decision, pure. `sent` is the seq just sent, `earliest` the oldest
 /// retained seq, `last_seq` the newest. A 409 whose `expected` is not a
 /// number, is ahead of everything we have, or equals what was just sent
@@ -535,7 +545,7 @@ async fn deliver_task(state: &Arc<AppState>, mut d: Due) {
     // The owner's role and scopes, as the add-on would see them on a request
     // from that person. A disabled owner still gets their events (the
     // revoked + final state ones above all).
-    let role = match owner_role(crate::repo::users::role_of(db, &owner).await.map_err(|e| e.to_string())) {
+    let role = match task_owner_role(db, d.task_id, &owner).await {
         Ok(r) => r,
         Err(why) => return record_failure(db, &d, &why).await,
     };

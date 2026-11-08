@@ -66,6 +66,11 @@ pub const NONE: &str = "perspective_none";
 pub const NOT_THIS_SESSION: &str = "perspective_not_this_session";
 pub const NEEDS_SESSION: &str = "perspective_needs_session";
 pub const UNAVAILABLE: &str = "perspective_unavailable";
+/// 403 on a perspective route from anything but a plain person-session
+/// token: the set `/auth/refresh` issues, with no `act`, `harness`, `conv` or
+/// `cnf` (the cert binding is not checked on this path, so a bound token is
+/// refused rather than half-honoured).
+pub const NEEDS_PERSON: &str = "perspective_needs_a_person_session";
 /// 403 from every credential mint a perspective session may not reach
 /// (§4.3): a mint would hand out the real role, or outlive the perspective.
 pub const REFUSES_MINT: &str = "perspective_refuses_mint";
@@ -134,11 +139,79 @@ pub struct PrsClaim {
 
 /// Put on a request by the auth middleware when its token carried a LIVE
 /// perspective. Handlers that mint a credential refuse when it is present
-/// ([`refuse_mint`]); Grafana takes the lower role ([`clamp`]).
-#[derive(Debug, Clone)]
+/// ([`refuse_mint`]); Grafana takes the lower role ([`clamp`]). Also the
+/// SNAPSHOT a chat turn or a task carries ([`current`], `noo_tasks.perspective`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequesterPerspective {
     pub id: String,
     pub dims: Perspective,
+}
+
+// ───────────────────────── the snapshot a turn or a task carries ─────────────────────────
+
+tokio::task_local! {
+    /// The perspective a chat turn was submitted under. Set by the auth
+    /// middleware around the rest of a JWT request, by the console socket
+    /// around each turn (from the ticket's verified claims), and by the
+    /// in-process task runner from the task's stored snapshot. Read by the
+    /// role reads that bypass the token: the node-harness turn token
+    /// (`coordinator::dispatch::try_dispatch`, `tasks::start`) and the
+    /// external-tool audience (`mcp_bridge::identity`).
+    static CURRENT: Option<RequesterPerspective>;
+}
+
+/// The snapshot in scope, `None` outside any (a background loop, a channel
+/// bot, a request without a perspective).
+pub fn current() -> Option<RequesterPerspective> {
+    CURRENT.try_with(|p| p.clone()).ok().flatten()
+}
+
+/// Run `fut` with `p` as the turn's snapshot. A `tokio::spawn` inside `fut`
+/// does NOT inherit it: put the scope inside a spawned task, not around the
+/// spawn.
+pub async fn scope<F: std::future::Future>(p: Option<RequesterPerspective>, fut: F) -> F::Output {
+    CURRENT.scope(p, fut).await
+}
+
+/// The snapshot rule (i538 P1): a role read from the database for a turn or
+/// a task submitted under a perspective is `min(live, snapshot)`, whether or
+/// not the perspective's row is still live. It never widens (a min with the
+/// LIVE role, so a demotion still wins) and it never strands a turn that
+/// outlives Back to me or the cap.
+pub fn snapshot_role(live: Role, snapshot: Option<&RequesterPerspective>) -> Role {
+    match snapshot {
+        Some(p) => narrow_role(live, &p.dims),
+        None => live,
+    }
+}
+
+/// The snapshot a task was submitted under (`noo_tasks.perspective`). A
+/// snapshot that cannot be read, or parsed (a newer gateway's dimension),
+/// FAILS CLOSED to the narrowest view, a `user` cap: it is a narrowing the
+/// task already had, and guessing "none" would widen it.
+pub async fn task_snapshot(db: &PgPool, task_id: uuid::Uuid) -> Option<RequesterPerspective> {
+    let narrowest = || {
+        Some(RequesterPerspective {
+            id: String::new(),
+            dims: Perspective { role_cap: Some(Role::User), ..Perspective::default() },
+        })
+    };
+    let row: Result<Option<Option<Value>>, sqlx::Error> =
+        sqlx::query_scalar("SELECT perspective FROM noo_tasks WHERE id = $1").bind(task_id).fetch_optional(db).await;
+    match row {
+        Ok(Some(Some(v))) => match serde_json::from_value::<RequesterPerspective>(v) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(task = %task_id, error = %e, "task perspective unreadable; the task runs as a user view");
+                narrowest()
+            }
+        },
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(task = %task_id, error = %e, "task perspective could not be read; the task runs as a user view");
+            narrowest()
+        }
+    }
 }
 
 // ───────────────────────── the narrowing function ─────────────────────────
@@ -276,6 +349,16 @@ pub fn parse_dims(body: &[u8]) -> Result<Perspective, Refused> {
     })
 }
 
+/// A perspective route answers a plain person-session token only (the set
+/// `/auth/refresh` issues): no delegation (`act`), no harness, no pinned
+/// conversation, no certificate binding.
+pub fn plain_session(claims: &Claims) -> Result<(), Refused> {
+    if claims.act.is_some() || claims.harness.is_some() || claims.conv.is_some() || claims.cnf.is_some() {
+        return Err(refused(StatusCode::FORBIDDEN, NEEDS_PERSON));
+    }
+    Ok(())
+}
+
 // ───────────────────────── liveness (the middleware's lookup) ─────────────────────────
 
 #[derive(Debug, Clone)]
@@ -363,6 +446,10 @@ pub async fn admit(db: &PgPool, sub: &str, prs: &PrsClaim) -> Result<DateTime<Ut
     if row.ended {
         return Err(Refusal::Ended);
     }
+    // The app clock here, the database's `now()` in `carried`: the two can
+    // disagree by the hosts' clock skew, which only moves the moment a 12 h
+    // safety net fires by that skew. Either side ends the row, and an ended
+    // row is ended for both.
     if Utc::now() >= row.cap_at {
         if let Err(e) = end(db, &prs.id, EndReason::Cap).await {
             tracing::warn!(perspective = %prs.id, error = %e, "perspective past its cap could not be ended");
@@ -393,6 +480,9 @@ pub enum EndReason {
     Logout,
     FamilyRevoked,
     Cap,
+    /// The row's dimensions cannot be read by this gateway (a newer one wrote
+    /// a dimension this one does not know).
+    Unreadable,
 }
 
 impl EndReason {
@@ -403,6 +493,7 @@ impl EndReason {
             EndReason::Logout => "logout",
             EndReason::FamilyRevoked => "family_revoked",
             EndReason::Cap => "cap",
+            EndReason::Unreadable => "unreadable",
         }
     }
 }
@@ -720,9 +811,11 @@ pub enum Carry {
     /// A live perspective: the child row inherits it and the access token
     /// is the perspective token.
     Live(PrsClaim),
-    /// The row reached its cap: a real token, and the caller ends the row
-    /// with reason `cap` once its transaction is committed.
-    PastCap(String),
+    /// The row must end (it reached its cap, or this gateway cannot read its
+    /// dimensions): a real token, and the caller ends the row with this
+    /// reason once its transaction is committed, so old `prs` tokens and
+    /// `/auth/me` stop honouring it too.
+    End(String, EndReason),
 }
 
 /// Read the claimed row's perspective on the refresh's OWN connection (the
@@ -745,13 +838,13 @@ pub async fn carried(
     Ok(match row {
         Some((owner, ended, past_cap, dims)) if owner == account && !ended => {
             if past_cap {
-                Carry::PastCap(id.to_string())
+                Carry::End(id.to_string(), EndReason::Cap)
             } else {
                 match serde_json::from_value::<Perspective>(dims) {
                     Ok(dims) => Carry::Live(PrsClaim { id: id.to_string(), dims }),
                     Err(e) => {
-                        tracing::warn!(perspective = %id, error = %e, "perspective dims unreadable; the refresh is real");
-                        Carry::Real
+                        tracing::warn!(perspective = %id, error = %e, "perspective dims unreadable; ending it, the refresh is real");
+                        Carry::End(id.to_string(), EndReason::Unreadable)
                     }
                 }
             }
@@ -914,8 +1007,8 @@ mod tests {
     /// reach it.
     const MINTS: &[(&str, &str)] = &[
         // routes/harness.rs (refused); coordinator::try_dispatch and
-        // tasks.rs mint for the turn's OWNER from the background or the
-        // chat path, at the owner's live role (§4.3 "unchanged").
+        // tasks::start mint for the turn's owner at min(live role, the
+        // snapshot the turn or task was submitted under).
         ("mint_harness_jwt", "refused"),
         ("mint_harness_jwt_with", "refused"),
         // routes/addon_token.rs, behind a service key.
@@ -968,10 +1061,11 @@ mod tests {
         ("channels/approvals.rs", 1, "unchanged: chat sender, not a session"),
         ("routes/addon_access.rs", 1, "unchanged: listed accounts"),
         ("routes/users.rs", 1, "unchanged: the account in the path"),
-        ("task_events.rs", 1, "unchanged: a task owner"),
-        ("tasks.rs", 1, "unchanged: a task owner, background"),
-        // try_dispatch: the turn owner's live role for the harness token.
-        ("coordinator/dispatch.rs", 1, "unchanged: the turn owner (P2 task-local)"),
+        // The snapshot rule: min(live role, the perspective the task or the
+        // turn was submitted under), live or not.
+        ("task_events.rs", 1, "clamped: the task's snapshot"),
+        ("tasks.rs", 1, "clamped: the task's snapshot"),
+        ("coordinator/dispatch.rs", 1, "clamped: the turn's snapshot"),
         // A certificate's kind from its path, not an account's role.
         ("cert_expiry.rs", 1, "unrelated: certificate kind"),
     ];
@@ -1034,6 +1128,143 @@ mod tests {
         let harness = body.find("harness_turn_for(&claims, &path)").expect("the harness rail");
         assert!(floor < admit && admit < harness, "the perspective check sits right after the floor");
         assert!(body.contains("return Ok(crate::perspective::refusal_response(why));"));
-        assert!(body.contains("request.extensions_mut().insert(crate::perspective::RequesterPerspective"));
+        assert!(body.contains("request.extensions_mut().insert(view.clone());"));
+        assert!(
+            body.contains("return Ok(crate::perspective::scope(in_view, next.run(request)).await);"),
+            "the rest of a perspective request runs under its snapshot"
+        );
+    }
+
+    /// The database not answering is a refusal (503), never "live": the
+    /// middleware answers every `admit` refusal, `Unavailable` included.
+    #[tokio::test]
+    async fn an_unanswerable_liveness_check_is_refused() {
+        let dead = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool");
+        let prs = PrsClaim { id: uuid::Uuid::new_v4().to_string(), dims: Perspective::default() };
+        assert_eq!(admit(&dead, "olive", &prs).await, Err(Refusal::Unavailable));
+        assert_eq!(refusal_response(Refusal::Unavailable).status(), StatusCode::SERVICE_UNAVAILABLE);
+        let own = crate::test_src::own_code(include_str!("auth.rs"));
+        let body = crate::test_src::fn_body(&own, "pub async fn require_any_auth(");
+        let asked = body.find("crate::perspective::admit(&state.db, &claims.sub, prs).await").expect("the check");
+        let answered = body[asked..].find("return Ok(crate::perspective::refusal_response(why));").expect("its answer") + asked;
+        assert!(!body[asked..answered].contains("Unavailable"), "every refusal is answered, Unavailable included");
+    }
+
+    fn user_view() -> RequesterPerspective {
+        RequesterPerspective { id: "p".into(), dims: Perspective { role_cap: Some(Role::User), ..Perspective::default() } }
+    }
+
+    fn token_role(token: &str) -> Value {
+        use base64::Engine as _;
+        let mid = token.split('.').nth(1).expect("a JWT");
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(mid).expect("base64url");
+        let claims: Value = serde_json::from_slice(&raw).expect("json claims");
+        claims["role"].clone()
+    }
+
+    /// The dispatch clamp: a chat turn submitted under a `user` perspective
+    /// by an operator mints its node-harness token at `user`. The snapshot
+    /// is visible inside its scope and nowhere else, and both turn-token
+    /// mints (a chat turn, a task) take it before minting.
+    #[tokio::test]
+    async fn a_user_perspective_chat_turn_token_carries_role_user() {
+        assert_eq!(current(), None, "no snapshot outside a scope");
+        let role = scope(Some(user_view()), async { snapshot_role(Role::Operator, current().as_ref()) }).await;
+        assert_eq!(role, Role::User);
+        assert_eq!(current(), None, "the scope does not leak");
+        assert_eq!(snapshot_role(Role::Operator, None), Role::Operator, "no perspective, the live role");
+        let token = crate::auth::mint_harness_jwt_with("olive", role, "node-1", "c1", 60, "a-test-signing-key-not-a-secret-0001")
+            .expect("mint");
+        assert_eq!(token_role(&token), "user");
+
+        let own = crate::test_src::own_code(include_str!("coordinator/dispatch.rs"));
+        let body = crate::test_src::fn_body(&own, "pub async fn try_dispatch<");
+        let narrowed = body
+            .find("let role = crate::perspective::snapshot_role(live, crate::perspective::current().as_ref());")
+            .expect("try_dispatch must narrow the live role to the turn's snapshot");
+        let minted = body.find("crate::auth::mint_harness_jwt(user, role,").expect("the mint takes the narrowed role");
+        assert!(narrowed < minted);
+
+        let own = crate::test_src::own_code(include_str!("tasks.rs"));
+        let body = crate::test_src::fn_body(&own, "pub async fn start(");
+        let narrowed = body
+            .find("let role = crate::perspective::snapshot_role(live, snapshot.as_ref());")
+            .expect("a task's turn token must narrow the live role to the task's snapshot");
+        let minted = body.find("crate::auth::mint_harness_jwt(owner, role,").expect("the mint takes the narrowed role");
+        assert!(narrowed < minted);
+    }
+
+    /// The snapshot rule: the snapshot keeps narrowing after Back to me
+    /// (it is not a liveness lookup), and a demotion of the live role below
+    /// it still wins (a min).
+    #[test]
+    fn the_snapshot_narrows_after_the_end_and_a_demotion_wins() {
+        let operator_view = RequesterPerspective {
+            id: "p".into(),
+            dims: Perspective { role_cap: Some(Role::Operator), ..Perspective::default() },
+        };
+        assert_eq!(snapshot_role(Role::Admin, Some(&operator_view)), Role::Operator);
+        assert_eq!(snapshot_role(Role::User, Some(&operator_view)), Role::User, "the demotion wins");
+        assert_eq!(snapshot_role(Role::Operator, Some(&user_view())), Role::User);
+        for live in ROLES {
+            assert!(snapshot_role(live, Some(&user_view())) <= live);
+        }
+    }
+
+    /// The catalog clamp: the external-tool audience reads the role through
+    /// the turn's snapshot.
+    #[test]
+    fn catalog_for_reads_the_role_through_the_snapshot() {
+        let own = crate::test_src::own_code(include_str!("mcp_bridge.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn identity(");
+        let read = body.find("crate::repo::users::enabled_role(db, u)").expect("the live role");
+        let clamped = body
+            .find("let role = crate::perspective::clamp(role, crate::perspective::current().as_ref());")
+            .expect("identity must clamp the live role with the turn's snapshot");
+        assert!(read < clamped);
+        let user = clamp(Some(Role::Operator), Some(&user_view()));
+        assert!(!crate::mcp_bridge::audience_permits(&[], Some("olive"), user, &[]), "an operators-only server is hidden from a user view");
+        assert!(crate::mcp_bridge::audience_permits(&[], Some("olive"), Some(Role::Operator), &[]));
+    }
+
+    /// The owner clamp: a task's events are delivered at the owner's live
+    /// role min'd with the task's snapshot.
+    #[test]
+    fn owner_role_reads_the_task_snapshot() {
+        let own = crate::test_src::own_code(include_str!("task_events.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn task_owner_role(");
+        assert!(body.contains("crate::perspective::task_snapshot(db, task_id).await"));
+        assert!(body.contains("Ok(crate::perspective::snapshot_role(live, snapshot.as_ref()))"));
+        let deliver = crate::test_src::fn_body(&own, "async fn deliver_task(");
+        assert!(deliver.contains("task_owner_role(db, d.task_id, &owner).await"));
+    }
+
+    /// The perspective routes take a plain person-session token only.
+    #[test]
+    fn perspective_routes_take_a_plain_session_only() {
+        let plain = || Claims {
+            sub: "olive".into(),
+            exp: 4_102_444_800,
+            role: "operator".into(),
+            scopes: vec!["read".into(), "write".into()],
+            harness: None,
+            conv: None,
+            act: None,
+            cnf: None,
+            prs: None,
+        };
+        assert!(plain_session(&plain()).is_ok());
+        let refused_as = |c: Claims| plain_session(&c).expect_err("not a plain session").detail;
+        assert_eq!(refused_as(Claims { act: Some(crate::auth::Actor { sub: "key:x".into(), iss_user: None, task: None, feature: None }), ..plain() }), NEEDS_PERSON);
+        assert_eq!(refused_as(Claims { harness: Some("node:host8".into()), ..plain() }), NEEDS_PERSON);
+        assert_eq!(refused_as(Claims { conv: Some("c1".into()), ..plain() }), NEEDS_PERSON);
+        assert_eq!(refused_as(Claims { cnf: Some(crate::auth::Cnf { x5t_s256: "t".into() }), ..plain() }), NEEDS_PERSON);
+        let own = crate::test_src::own_code(include_str!("routes/core.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn perspective_session(");
+        assert!(body.contains("crate::perspective::plain_session(&claims)"));
+        assert!(body.contains("lookup_user_db(&state.db, &claims.sub)"), "the subject must be a real account");
     }
 }
