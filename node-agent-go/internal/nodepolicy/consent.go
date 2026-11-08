@@ -25,25 +25,27 @@ import (
 type Mode string
 
 const (
-	// ModeNone refuses every entry. It is the default: a node whose owner
-	// has said nothing runs nothing an add-on declared.
+	// ModeNone refuses every entry, approved or not: the owner's kill
+	// switch (NOO_ADDON_WORKLOADS=none).
 	ModeNone Mode = "none"
 	// ModeApprove runs an entry only when its (add-on, image digest) is
-	// approved on this node.
+	// approved on this node. It is the default (i573): a node whose owner
+	// has approved nothing runs nothing an add-on declared.
 	ModeApprove Mode = "approve"
 	// ModeAuto runs every entry the controller places and the other checks
 	// admit.
 	ModeAuto Mode = "auto"
 )
 
-// ParseMode reads the setting. ok is false for a value that is not one of the
-// three; the caller treats that as ModeNone (fail closed) and says so.
+// ParseMode reads the setting; unset is ModeApprove. ok is false for a value
+// that is not one of the three; the caller treats that as ModeNone (fail
+// closed) and says so.
 func ParseMode(s string) (Mode, bool) {
 	switch m := Mode(strings.ToLower(strings.TrimSpace(s))); m {
 	case ModeNone, ModeApprove, ModeAuto:
 		return m, true
 	case "":
-		return ModeNone, true
+		return ModeApprove, true
 	}
 	return ModeNone, false
 }

@@ -110,6 +110,9 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["health"], commands::health),
     (&["whoami"], role::whoami),
     (&["node", "fetch"], commands::node_fetch),
+    (&["node", "workloads", "approve"], commands::node_workloads_approve),
+    (&["node", "workloads", "revoke"], commands::node_workloads_revoke),
+    (&["node", "workloads", "list"], commands::node_workloads_list),
     (&["cluster", "status"], commands::cluster_status),
     (&["jobs", "list"], commands::jobs_list),
     (&["inference", "run"], commands::inference_run),
@@ -1030,7 +1033,7 @@ fn print_completions(shell: &str) -> i32 {
 /// the binary the user is holding.
 /// Sections are editorial; a test pins every registry group to exactly one.
 const GROUP_SECTIONS: &[(&str, &[&str])] = &[
-    ("Setup & host", &["whoami", "onboard", "enroll", "offboard", "upgrade", "doctor", "health", "migrate", "controller", "bundle", "systems", "addons", "kiosk", "backups"]),
+    ("Setup & host", &["whoami", "onboard", "enroll", "offboard", "upgrade", "doctor", "health", "migrate", "controller", "bundle", "systems", "addons", "kiosk", "backups", "node"]),
     ("Fleet", &["cluster", "models", "tools", "inference", "jobs", "autonomy", "skills", "browser"]),
     ("Stack & data", &["stack", "db", "logs", "config", "heartbeat", "usage", "plugins"]),
     ("Memory & knowledge", &["memory", "rag", "recall", "graph", "walks", "ops", "prompt-skills"]),
@@ -1212,7 +1215,7 @@ const GROUP_DESC: &[(&str, &str)] = &[
     ("db", "Schema migrations: mesh via the gateway's native runner, memory via alembic in trellion"),
     ("doctor", "Host-plane health checks with guided recovery"),
     ("whoami", "What this box is: controller, node, both, or client-only"),
-    ("node", "This node's pull-rail poller (macOS: run by the net.noomesh.fetch LaunchDaemon)"),
+    ("node", "This node's own say: add-on workload approvals (run on the node, with sudo)"),
     ("enroll", "Join this machine to a noomesh fleet as a worker"),
     ("logs", "Log aggregation"),
     ("plugins", "Plugin management"),

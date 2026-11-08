@@ -379,4 +379,11 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 |---|---|---|
 | `noo backups status` | — | Where backups go, how many there are, and whether an off-site copy was ever decided |
 | `noo backups setup` | `[--set <ssh:…\|dir:…\|s3:…\|portable\|none>]` | Decide where a copy of each backup goes; asks unless --set is given |
+
+### `noo node` — This node's own say: add-on workload approvals (run on the node, with sudo)
+| Command | Arguments | What it does |
+|---|---|---|
+| `noo node workloads approve` | `<addon> <digest>` | On this node, as root: consent to run an add-on's node workload at one image digest |
+| `noo node workloads revoke` | `<addon> <digest>` | On this node, as root: withdraw one add-on digest's approval |
+| `noo node workloads list` | — | On this node, as root: show the add-on node workloads approved here, and the policy |
 <!-- END GENERATED -->
