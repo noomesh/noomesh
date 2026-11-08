@@ -7,9 +7,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -170,8 +172,22 @@ func TestBenchRefusesWithoutAChatBackendAndWhileOneRuns(t *testing.T) {
 		t.Errorf("no running chat placement: %d %s", rec.Code, rec.Body)
 	}
 
+	// The first bench is running once its backend is asked: handleBench sets
+	// benchRunning before it calls the backend. The backend closes entered
+	// on its first request, so the test waits on that instead of polling a
+	// deadline it used to pass silently (a loaded box then failed the
+	// concurrent check below for the wrong reason).
 	release := make(chan struct{})
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	entered := make(chan struct{})
+	var enterOnce sync.Once
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Read the request as a real backend does. Left unread, a large
+		// body makes the server close the keep-alive connection after the
+		// reply, and the bench's next request on it can race that close
+		// ("connection reset by peer", a 502 the test then blamed on the
+		// bench; about 1 run in 40 on dev).
+		_, _ = io.Copy(io.Discard, r.Body)
+		enterOnce.Do(func() { close(entered) })
 		<-release
 		fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
@@ -179,15 +195,11 @@ func TestBenchRefusesWithoutAChatBackendAndWhileOneRuns(t *testing.T) {
 	busy := benchServer(backend)
 	done := make(chan int)
 	go func() { done <- postBench(busy).Code }()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		busy.benchMu.Lock()
-		running := busy.benchRunning
-		busy.benchMu.Unlock()
-		if running || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
+	select {
+	case <-entered:
+	case <-time.After(30 * time.Second):
+		close(release) // let the backend return, so the deferred Close does not hang
+		t.Fatalf("the first bench never reached its backend in 30 s")
 	}
 	if rec := postBench(busy); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "bench_busy") {
 		t.Errorf("concurrent bench: %d %s", rec.Code, rec.Body)
