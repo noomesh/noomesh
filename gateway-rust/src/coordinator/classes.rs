@@ -122,7 +122,43 @@ pub const PURPOSE_ALIASES: [&str; 2] = ["knowledge", "graph"];
 /// The node agent's heartbeat cadence (node-agent-go `config.HeartbeatInterval`
 /// default, seconds). A record older than twice this is a node the gateway
 /// is not hearing from; its candidates sort after the ones it is.
-pub const HEARTBEAT_INTERVAL_SECS: f64 = 30.0;
+pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
+
+/// Rehearsal/test-stack knob: the cadence [`heartbeat_interval_secs`] assumes,
+/// in whole seconds. The rehearsal sets it together with the node agent's own
+/// heartbeat interval; shipped installs never set it.
+pub const HEARTBEAT_INTERVAL_ENV: &str = "NOO_GATEWAY_HEARTBEAT_INTERVAL_S";
+
+/// The cadence for a raw `NOO_GATEWAY_HEARTBEAT_INTERVAL_S` (None = unset),
+/// and the reason when the value is unusable. Blank or unusable (non-numeric,
+/// zero, negative) keeps [`DEFAULT_HEARTBEAT_INTERVAL_SECS`].
+fn heartbeat_interval_from(raw: Option<&str>) -> (f64, Option<&'static str>) {
+    match crate::tls::resolve_positive_secs(raw.unwrap_or(""), DEFAULT_HEARTBEAT_INTERVAL_SECS) {
+        Ok(secs) => (secs as f64, None),
+        Err(why) => (DEFAULT_HEARTBEAT_INTERVAL_SECS as f64, Some(why)),
+    }
+}
+
+/// The heartbeat cadence in force for this process, read once.
+pub fn heartbeat_interval_secs() -> f64 {
+    static SECS: OnceLock<f64> = OnceLock::new();
+    *SECS.get_or_init(|| {
+        let raw = std::env::var(HEARTBEAT_INTERVAL_ENV).ok();
+        let (secs, rejected) = heartbeat_interval_from(raw.as_deref());
+        match rejected {
+            Some(why) => tracing::warn!(
+                env = HEARTBEAT_INTERVAL_ENV, value = %raw.as_deref().unwrap_or(""), %why,
+                default_seconds = DEFAULT_HEARTBEAT_INTERVAL_SECS,
+                "ignoring an unusable heartbeat interval override; keeping the default"
+            ),
+            None if secs != DEFAULT_HEARTBEAT_INTERVAL_SECS as f64 => {
+                tracing::info!(env = HEARTBEAT_INTERVAL_ENV, seconds = secs, "heartbeat interval overridden");
+            }
+            None => {}
+        }
+        secs
+    })
+}
 
 /// Backend types that can serve chat (the same set the legacy resolver scans).
 const INFERENCE_TYPES: [&str; 4] = ["vllm", "vllm-secondary", "ollama", "llamacpp"];
@@ -793,7 +829,7 @@ fn health_of(n: &NodeFacts) -> (bool, String) {
     }
     match n.heartbeat_age_secs {
         None => return (false, "no heartbeat timestamp".into()),
-        Some(age) if age > 2.0 * HEARTBEAT_INTERVAL_SECS => {
+        Some(age) if age > 2.0 * heartbeat_interval_secs() => {
             return (false, format!("heartbeat {}s old", age as i64));
         }
         _ => {}
@@ -2079,6 +2115,30 @@ mod tests {
     use super::*;
 
     const HF: &str = "google/gemma-4-12B-it-qat-w4a16-ct";
+
+    #[test]
+    fn the_heartbeat_cadence_is_thirty_seconds_unless_the_rehearsal_sets_it() {
+        assert_eq!(DEFAULT_HEARTBEAT_INTERVAL_SECS, 30);
+        assert_eq!(heartbeat_interval_from(None), (30.0, None));
+        assert_eq!(heartbeat_interval_from(Some("")), (30.0, None));
+        assert_eq!(heartbeat_interval_from(Some("  ")), (30.0, None));
+        for bad in ["abc", "0", "-5", "1.5"] {
+            let (secs, why) = heartbeat_interval_from(Some(bad));
+            assert_eq!(secs, 30.0, "{bad} keeps the default");
+            assert!(why.is_some(), "{bad} is said to be unusable");
+        }
+        assert_eq!(heartbeat_interval_from(Some("5")), (5.0, None));
+        assert_eq!(heartbeat_interval_from(Some(" 10 ")), (10.0, None));
+    }
+
+    #[test]
+    fn a_record_is_stale_after_two_heartbeat_intervals() {
+        // The process-wide cadence is the default here (no test sets env).
+        let mut n = node("n1", "10.0.0.1", &[], &[], false, 1, 0.0);
+        n.heartbeat_age_secs = Some(2.0 * heartbeat_interval_secs() + 1.0);
+        let (ok, why) = health_of(&n);
+        assert!(!ok && why.starts_with("heartbeat ") && why.ends_with("s old"), "{why}");
+    }
 
     fn node(id: &str, ip: &str, running: &[(&str, &str)], available: &[&str], gpu: bool, tier: i64, load: f64) -> NodeFacts {
         NodeFacts {

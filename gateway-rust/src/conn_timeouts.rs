@@ -39,8 +39,44 @@ pub const IDLE_SECS: u64 = 60;
 pub const H2_PING_SECS: u64 = 30;
 pub const H2_PING_TIMEOUT_SECS: u64 = 20;
 
+/// Rehearsal/test-stack knob: the idle bound in whole seconds. Shipped
+/// installs never set it.
+pub const IDLE_ENV: &str = "NOO_GATEWAY_IDLE_S";
+
+/// The idle bound for a raw `NOO_GATEWAY_IDLE_S` (None = unset), and the
+/// reason when the value is unusable. Blank or unusable (non-numeric, zero,
+/// negative) keeps [`IDLE_SECS`].
+fn idle_secs_from(raw: Option<&str>) -> (u64, Option<&'static str>) {
+    match crate::tls::resolve_positive_secs(raw.unwrap_or(""), IDLE_SECS) {
+        Ok(secs) => (secs, None),
+        Err(why) => (IDLE_SECS, Some(why)),
+    }
+}
+
+/// The idle bound in force for this process, read once (every listener
+/// calls [`apply`]; a bad value is said once).
+fn idle_secs() -> u64 {
+    static SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SECS.get_or_init(|| {
+        let raw = std::env::var(IDLE_ENV).ok();
+        let (secs, rejected) = idle_secs_from(raw.as_deref());
+        match rejected {
+            Some(why) => tracing::warn!(
+                env = IDLE_ENV, value = %raw.as_deref().unwrap_or(""), %why,
+                default_seconds = IDLE_SECS,
+                "ignoring an unusable idle connection timeout override; keeping the default"
+            ),
+            None if secs != IDLE_SECS => {
+                tracing::info!(env = IDLE_ENV, seconds = secs, "idle connection timeout overridden");
+            }
+            None => {}
+        }
+        secs
+    })
+}
+
 pub fn apply(b: &mut Builder<TokioExecutor>) {
-    apply_with(b, Duration::from_secs(IDLE_SECS));
+    apply_with(b, Duration::from_secs(idle_secs()));
 }
 
 fn apply_with(b: &mut Builder<TokioExecutor>, idle: Duration) {
@@ -55,6 +91,21 @@ fn apply_with(b: &mut Builder<TokioExecutor>, idle: Duration) {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn the_idle_bound_is_a_minute_unless_the_rehearsal_sets_it() {
+        assert_eq!(IDLE_SECS, 60);
+        assert_eq!(idle_secs_from(None), (60, None));
+        assert_eq!(idle_secs_from(Some("")), (60, None));
+        assert_eq!(idle_secs_from(Some("  ")), (60, None));
+        for bad in ["abc", "0", "-5", "1.5"] {
+            let (secs, why) = idle_secs_from(Some(bad));
+            assert_eq!(secs, 60, "{bad} keeps the default");
+            assert!(why.is_some(), "{bad} is said to be unusable");
+        }
+        assert_eq!(idle_secs_from(Some("10")), (10, None));
+        assert_eq!(idle_secs_from(Some(" 15 ")), (15, None));
+    }
 
     /// Serve "ok" on a loopback port; `idle` None = axum-server as it was.
     async fn server(idle: Option<Duration>) -> std::net::SocketAddr {

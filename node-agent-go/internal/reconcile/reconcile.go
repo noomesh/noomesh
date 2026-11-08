@@ -36,9 +36,11 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -61,6 +63,21 @@ import (
 )
 
 const defaultInterval = 5 * time.Minute
+
+// reconcileIntervalEnv is a rehearsal/test-stack knob (whole seconds): it
+// shortens the pass interval so the release rehearsal does not wait out five
+// minutes. Shipped installs never set it.
+const reconcileIntervalEnv = "NOO_RECONCILE_INTERVAL_S"
+
+// intervalFromEnv parses reconcileIntervalEnv. Unset, empty, non-numeric, zero
+// or negative falls back to defaultInterval.
+func intervalFromEnv(v string) time.Duration {
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n <= 0 {
+		return defaultInterval
+	}
+	return time.Duration(n) * time.Second
+}
 
 type placement struct {
 	Backend      string            `json:"backend"`
@@ -120,6 +137,9 @@ type desiredConfig struct {
 
 // Reconciler pulls desired config and converges the node toward it.
 type Reconciler struct {
+	// interval is the pass period after the first pass; zero means
+	// defaultInterval (test literals).
+	interval  time.Duration
 	nudge     chan struct{}
 	nudgeOnce sync.Once
 	cfg       *config.Config
@@ -247,6 +267,7 @@ func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harn
 	sets := modelsets.New(dockerpkg.ModelsDir(), cfg)
 	nw, facts := newNodeWorkloads(cfg, docker, sets)
 	return &Reconciler{
+		interval:        intervalFromEnv(os.Getenv(reconcileIntervalEnv)),
 		cfg:             cfg,
 		docker:          docker,
 		ollamaPulls:     map[string]*ollamaPullState{},
@@ -295,7 +316,11 @@ func (r *Reconciler) Run(ctx context.Context) {
 	}
 	r.Once(ctx)
 
-	t := time.NewTicker(defaultInterval)
+	every := r.interval
+	if every <= 0 {
+		every = defaultInterval
+	}
+	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
 		select {

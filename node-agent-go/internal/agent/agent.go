@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -509,6 +510,21 @@ func (a *Agent) startControlBus(ctx context.Context) {
 	a.ctrl.Start(ctx)
 }
 
+// tunnelRetryMaxEnv is a rehearsal/test-stack knob (whole seconds): it lowers
+// the tunnel's reconnect-backoff ceiling. Shipped installs never set it.
+const tunnelRetryMaxEnv = "NOO_TUNNEL_RETRY_MAX_S"
+
+// tunnelRetryMaxFromEnv parses tunnelRetryMaxEnv. It returns 0 (tunnel.New's
+// own 60 s default) when the value is unset, empty, non-numeric, zero,
+// negative, or below the 1 s minimum retry.
+func tunnelRetryMaxFromEnv(v string) time.Duration {
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < 1 {
+		return 0
+	}
+	return time.Duration(n) * time.Second
+}
+
 // startTunnel dials the controller's tunnel endpoint and keeps it up.
 // NOO_AGENT_TUNNEL=off (or 0/false/no) keeps the node on HTTPS and the bus.
 // Anything that stops it from starting (no https controller URL, no ECDSA
@@ -543,6 +559,7 @@ func (a *Agent) startTunnel(ctx context.Context) {
 		Sign:          func(r *http.Request) error { return auth.SetClusterAuth(r, a.cfg.NodeID, a.cfg.ClusterSecret) },
 		Handler:       a.server.Handler(),
 		Verifier:      v,
+		RetryMax:      tunnelRetryMaxFromEnv(os.Getenv(tunnelRetryMaxEnv)),
 	})
 	if cerr != nil {
 		slog.Warn("node tunnel not started; control stays on HTTPS", "error", cerr)

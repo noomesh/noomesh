@@ -254,6 +254,46 @@ pub(crate) async fn nats_event_logger(event: async_nats::Event) {
     }
 }
 
+/// Rehearsal/test-stack knob: the `mesh_nodes` bucket's max_age in whole
+/// seconds, applied only when the bucket is created. Shipped installs never
+/// set it.
+pub const MESH_NODES_TTL_ENV: &str = "NOO_MESH_NODES_TTL_S";
+
+/// The production `mesh_nodes` TTL (NODE_TTL_SEC in Python's mesh_registry.py).
+pub const DEFAULT_MESH_NODES_TTL_SECS: u64 = 120;
+
+/// The TTL for a raw `NOO_MESH_NODES_TTL_S` (None = unset), and the reason
+/// when the value is unusable. Blank or unusable (non-numeric, zero,
+/// negative) keeps [`DEFAULT_MESH_NODES_TTL_SECS`].
+fn mesh_nodes_ttl_from(raw: Option<&str>) -> (u64, Option<&'static str>) {
+    match crate::tls::resolve_positive_secs(raw.unwrap_or(""), DEFAULT_MESH_NODES_TTL_SECS) {
+        Ok(secs) => (secs, None),
+        Err(why) => (DEFAULT_MESH_NODES_TTL_SECS, Some(why)),
+    }
+}
+
+/// The `mesh_nodes` TTL in force for this process, read once (the watchdog
+/// calls [`ensure_kv_buckets`] every tick; a bad value is said once).
+fn mesh_nodes_ttl_secs() -> u64 {
+    static TTL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TTL.get_or_init(|| {
+        let raw = std::env::var(MESH_NODES_TTL_ENV).ok();
+        let (secs, rejected) = mesh_nodes_ttl_from(raw.as_deref());
+        match rejected {
+            Some(why) => tracing::warn!(
+                env = MESH_NODES_TTL_ENV, value = %raw.as_deref().unwrap_or(""), %why,
+                default_seconds = DEFAULT_MESH_NODES_TTL_SECS,
+                "ignoring an unusable mesh_nodes TTL override; keeping the default"
+            ),
+            None if secs != DEFAULT_MESH_NODES_TTL_SECS => {
+                tracing::info!(env = MESH_NODES_TTL_ENV, seconds = secs, "mesh_nodes TTL overridden");
+            }
+            None => {}
+        }
+        secs
+    })
+}
+
 /// Bind (or create) the KV buckets the cluster view depends on.
 ///
 /// Called at startup and then periodically by [`spawn_kv_bucket_watchdog`].
@@ -264,7 +304,11 @@ pub(crate) async fn nats_event_logger(event: async_nats::Event) {
 /// have rendered as an empty cluster rather than an error, indefinitely.
 pub async fn ensure_kv_buckets(js: &async_nats::jetstream::Context, verbose: bool) {
     // Config must match Python's mesh_registry.py exactly to avoid conflicts.
-    const EXPECTED_TTL_SECS: u64 = 120; // NODE_TTL_SEC in Python
+    // Production is 120 s (NODE_TTL_SEC in Python); only a rehearsal/test
+    // stack sets NOO_MESH_NODES_TTL_S, and only a bucket created now sees it.
+    let expected_ttl_secs = mesh_nodes_ttl_secs();
+    // 5x the expected TTL is "unexpectedly high" (600 s at the default).
+    let high_ttl_secs = expected_ttl_secs.saturating_mul(5);
     match js.get_key_value("mesh_nodes").await {
         Ok(store) => {
             if verbose {
@@ -275,12 +319,12 @@ pub async fn ensure_kv_buckets(js: &async_nats::jetstream::Context, verbose: boo
                             tracing::warn!(
                                 "NATS KV 'mesh_nodes' has max_age=0 (no TTL) — \
                                  nodes will never expire. This may indicate misconfiguration \
-                                 or tampering. Expected TTL: {EXPECTED_TTL_SECS}s"
+                                 or tampering. Expected TTL: {expected_ttl_secs}s"
                             );
-                        } else if max_age > 600 {
+                        } else if max_age > high_ttl_secs {
                             tracing::warn!(
                                 max_age_secs = max_age,
-                                expected = EXPECTED_TTL_SECS,
+                                expected = expected_ttl_secs,
                                 "NATS KV 'mesh_nodes' TTL unexpectedly high — \
                                  stale nodes may persist longer than expected"
                             );
@@ -301,7 +345,7 @@ pub async fn ensure_kv_buckets(js: &async_nats::jetstream::Context, verbose: boo
             // Bucket doesn't exist — create with config matching Python's MeshRegistry
             match js.create_key_value(async_nats::jetstream::kv::Config {
                 bucket: "mesh_nodes".into(),
-                max_age: std::time::Duration::from_secs(EXPECTED_TTL_SECS),
+                max_age: std::time::Duration::from_secs(expected_ttl_secs),
                 description: "Distributed node registry for mesh routing".into(),
                 ..Default::default()
             }).await {
@@ -917,5 +961,25 @@ mod bus_down_tests {
         let new = src.split("pub async fn new(").nth(1).unwrap().split("Self::assemble(").next().unwrap();
         assert!(new.contains("nats_request_timeout,\n            true,"), "the gateway connects in the background");
         assert!(!new.contains("ensure_kv_buckets("), "no bus call before the bus is known to be up");
+    }
+}
+
+#[cfg(test)]
+mod mesh_nodes_ttl_tests {
+    use super::{mesh_nodes_ttl_from, DEFAULT_MESH_NODES_TTL_SECS};
+
+    #[test]
+    fn the_mesh_nodes_ttl_is_two_minutes_unless_the_rehearsal_sets_it() {
+        assert_eq!(DEFAULT_MESH_NODES_TTL_SECS, 120);
+        assert_eq!(mesh_nodes_ttl_from(None), (120, None));
+        assert_eq!(mesh_nodes_ttl_from(Some("")), (120, None));
+        assert_eq!(mesh_nodes_ttl_from(Some("  ")), (120, None));
+        for bad in ["abc", "0", "-5", "1.5"] {
+            let (secs, why) = mesh_nodes_ttl_from(Some(bad));
+            assert_eq!(secs, 120, "{bad} keeps the default");
+            assert!(why.is_some(), "{bad} is said to be unusable");
+        }
+        assert_eq!(mesh_nodes_ttl_from(Some("20")), (20, None));
+        assert_eq!(mesh_nodes_ttl_from(Some(" 45 ")), (45, None));
     }
 }

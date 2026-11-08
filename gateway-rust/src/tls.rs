@@ -74,7 +74,7 @@ fn resolve_backend_timeout_secs(raw: &str) -> Result<u64, &'static str> {
 
 /// Blank = `default`; otherwise a positive whole number of seconds, or an
 /// error the caller logs before keeping the default.
-fn resolve_positive_secs(raw: &str, default: u64) -> Result<u64, &'static str> {
+pub(crate) fn resolve_positive_secs(raw: &str, default: u64) -> Result<u64, &'static str> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Ok(default);
