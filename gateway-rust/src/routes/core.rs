@@ -1049,7 +1049,7 @@ async fn rotate_refresh(
     // perspective token, narrowed from the account's live role; an ended one,
     // or one past its cap, leaves a real token and a clean child. Minted
     // before the commit, so an unmintable token still spends nothing.
-    let carry = match crate::perspective::carried(&mut tx, claimed.perspective_id.as_deref(), &user.username).await {
+    let carry = match crate::perspective::carried(&mut tx, None, &user.username).await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "refresh_perspective_read_failed");
