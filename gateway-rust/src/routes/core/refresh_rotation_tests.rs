@@ -130,6 +130,7 @@ async fn live_token(db: &PgPool, username: &str) -> String {
         Some("test-agent"),
         Some("198.51.100.4"),
         None,
+        None,
     )
     .await
     .expect("store token");
@@ -431,6 +432,7 @@ async fn a_cookie_minted_before_the_prefix_still_rotates_onto_a_prefixed_one() {
         "dave",
         &legacy,
         chrono::Utc::now() + chrono::TimeDelta::days(30),
+        None,
         None,
         None,
         None,

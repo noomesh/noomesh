@@ -896,6 +896,7 @@ mod tests {
             conv: None,
             act: None,
             cnf: None,
+            prs: None,
         }
     }
 

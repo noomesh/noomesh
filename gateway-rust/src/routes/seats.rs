@@ -197,8 +197,11 @@ async fn seat_token_create(
     State(state): State<Arc<AppState>>,
     op: OperatorOrInternal,
     cluster: Option<Extension<ClusterNode>>,
+    perspective: Option<axum::Extension<crate::perspective::RequesterPerspective>>,
     Json(body): Json<CreateSeatTokenBody>,
 ) -> AppResult {
+    // i538: a seat enrolment token is a credential; never under a perspective.
+    crate::perspective::refuse_mint(perspective.as_ref(), "seat token")?;
     let by = seat_admin_guard(&op, &cluster)?;
     let seat = body.seat_name.trim().to_string();
     if !valid_node_name(&seat) {
@@ -962,8 +965,11 @@ async fn seat_bind(
     State(state): State<Arc<AppState>>,
     Admin(ctx): Admin,
     Path(seat): Path<String>,
+    perspective: Option<axum::Extension<crate::perspective::RequesterPerspective>>,
     Json(body): Json<BindBody>,
 ) -> AppResult {
+    // i538: binding decides which device mints a kiosk token.
+    crate::perspective::refuse_mint(perspective.as_ref(), "seat bind")?;
     if !valid_node_name(&seat) {
         return Err(AppError::BadRequest("invalid seat name".into()));
     }
@@ -993,7 +999,9 @@ async fn seat_revoke(
     State(state): State<Arc<AppState>>,
     Admin(ctx): Admin,
     Path(seat): Path<String>,
+    perspective: Option<axum::Extension<crate::perspective::RequesterPerspective>>,
 ) -> AppResult {
+    crate::perspective::refuse_mint(perspective.as_ref(), "seat revoke")?;
     if !valid_node_name(&seat) {
         return Err(AppError::BadRequest("invalid seat name".into()));
     }

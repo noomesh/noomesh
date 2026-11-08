@@ -217,6 +217,7 @@ mod settings;
 mod service_keys;
 mod password_policy;
 mod session_floor;
+mod perspective;
 mod session;
 mod state;
 mod stt_client;

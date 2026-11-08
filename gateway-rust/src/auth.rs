@@ -328,6 +328,13 @@ pub struct Claims {
     /// merely short-lived, it is unusable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cnf: Option<Cnf>,
+    /// i538 "View as": the perspective this session token was narrowed to.
+    /// Set only by the session mint (`routes::core::issue_perspective_token`), so it is
+    /// signed. The token's `role` is ALREADY the narrowed role; this names
+    /// the server-side row the middleware checks is still live on every
+    /// request (`perspective::admit`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prs: Option<crate::perspective::PrsClaim>,
 }
 
 /// Inserted by the middleware on a JWT request whose token carried `cnf`
@@ -3365,6 +3372,21 @@ pub async fn require_any_auth(
                 tracing::info!(target: "security", sub = %claims.sub, "token refused: issued before the account's session floor");
                 return Err(StatusCode::UNAUTHORIZED);
             }
+            // i538 "View as": a token narrowed to a perspective is honoured
+            // only while its row is live, this account's, and before its
+            // cap. Its `role` is already the narrowed one, so every role
+            // check below is on the narrower path; handlers that mint a
+            // credential see the extension and refuse.
+            if let Some(prs) = claims.prs.as_ref() {
+                if let Err(why) = crate::perspective::admit(&state.db, &claims.sub, prs).await {
+                    tracing::info!(target: "security", sub = %claims.sub, perspective = %prs.id, why = ?why, "perspective token refused");
+                    return Ok(crate::perspective::refusal_response(why));
+                }
+                request.extensions_mut().insert(crate::perspective::RequesterPerspective {
+                    id: prs.id.clone(),
+                    dims: prs.dims.clone(),
+                });
+            }
             // Peer tokens (scopes=["peer"], sub="peer:{id}") are confined to the
             // peer surface (/ws/agent + /api/agents/peer/*). Without this a peer
             // token is effectively a full-access token: it would receive
@@ -3951,6 +3973,7 @@ mod tests {
             conv: None,
             act: None,
             cnf: None,
+            prs: None,
         }
     }
 
@@ -4557,7 +4580,7 @@ mod tests {
 
     fn kiosk_claims() -> Claims {
         Claims { sub: "kiosk:hall".into(), exp: 4_102_444_800, role: "user".into(),
-                 scopes: vec![KIOSK_SCOPE.into()], harness: None, conv: None, act: None, cnf: None }
+                 scopes: vec![KIOSK_SCOPE.into()], harness: None, conv: None, act: None, cnf: None, prs: None }
     }
 
     /// Acceptance 1. A write is refused on every path, including one that
@@ -5108,6 +5131,7 @@ mod tests {
         
             act: None,
             cnf: None,
+            prs: None,
         }
     }
 
@@ -5486,6 +5510,7 @@ mod tests {
         
             act: None,
             cnf: None,
+            prs: None,
         }
     }
 
@@ -6137,6 +6162,7 @@ mod harness_rail_tests {
         
             act: None,
             cnf: None,
+            prs: None,
         }
     }
 
@@ -6515,6 +6541,7 @@ mod user_read_allowlist_tests {
             conv: None,
             act: None,
             cnf: None,
+            prs: None,
         }
     }
 
@@ -6846,6 +6873,7 @@ mod voice_direct_key_tests {
             conv: None,
             act: None,
             cnf: None,
+            prs: None,
         };
         for p in [DETAILED, PLAIN, "/api/voice/synthesize"] {
             assert!(scope_allows(&person, &Method::POST, p), "a person still reaches POST {p}");
