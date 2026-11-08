@@ -39,7 +39,8 @@ fn print_json(v: &serde_json::Value) {
 
 /// Run a `scripts/` bash script with cwd = repo root (the scripts reference
 /// docker-compose.cluster.yml relatively). Human mode: inherited stdio,
-/// return the child's exit code. `--json` mode with `json_action`: child
+/// return the child's exit code; on a terminal, `start` and `restart` fold
+/// compose's per-container lines into one live line ([`fold_launcher_output`]). `--json` mode with `json_action`: child
 /// stdout → our stderr, then the `{"status":"ok","action":…}` contract.
 fn run_script(g: &Globals, name: &str, args: &[String], json_action: Option<&str>) -> i32 {
     let root = repo_root();
@@ -159,6 +160,13 @@ fn run_script(g: &Globals, name: &str, args: &[String], json_action: Option<&str
         return if rc == 0 { 1 } else { rc };
     }
 
+    if fold_launcher_output(name, g.json, g.verbose, ui::quiet(), ui::styled() && ui::stderr_is_tty()) {
+        return match run_live(cmd) {
+            Ok(code) => code,
+            Err(e) => fail(g.json, ExitCode::Generic, "subprocess_failed", &format!("failed to run {name}: {e}"), None),
+        };
+    }
+
     match cmd.status() {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => fail(
@@ -169,6 +177,67 @@ fn run_script(g: &Globals, name: &str, args: &[String], json_action: Option<&str
             None,
         ),
     }
+}
+
+/// Does this launcher run fold compose's per-container lines into one live
+/// status line? Only `start` and `restart` (their `docker compose up` is
+/// piped through `tee` to find a stuck container, so compose prints a plain
+/// line per container and state: about 100 on one start, 0.6.18 roll,
+/// i570), only on a terminal that can rewrite a line, and never with
+/// `--verbose`, `--quiet` or `--json`: those keep every line, as before.
+fn fold_launcher_output(name: &str, json: bool, verbose: bool, quiet: bool, live_tty: bool) -> bool {
+    matches!(name, "noomesh-start.sh" | "noomesh-restart.sh") && !json && !verbose && !quiet && live_tty
+}
+
+/// The live sink: one `ui::Poll` line saying how far the containers are,
+/// rewritten in place; every line the tally does not absorb (the launcher's
+/// own steps, REFUSED add-ons, warnings, compose errors) is printed above it.
+struct LiveSink {
+    poll: ui::Poll,
+    started: std::time::Instant,
+    drawn: Option<std::time::Instant>,
+}
+
+impl crate::onboard::sh::FoldSink for LiveSink {
+    fn line(&mut self, is_err: bool, line: &str) {
+        self.poll.lift();
+        if is_err {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+        self.drawn = None;
+    }
+    fn progress(&mut self, tally: &crate::onboard::sh::ComposeTally, idle: bool) {
+        // A pull prints many lines a second: redraw at most ten times.
+        if !idle && self.drawn.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(100)) {
+            return;
+        }
+        self.poll.set_msg(&tally.live_status());
+        self.poll.tick(self.started.elapsed().as_secs());
+        self.drawn = Some(std::time::Instant::now());
+    }
+}
+
+/// Run the launcher through [`crate::onboard::sh::run_folded`] with the live
+/// sink, then say where the containers ended. A failed run also shows the
+/// launcher's last lines unfiltered.
+fn run_live(cmd: Command) -> std::io::Result<i32> {
+    let mut sink = LiveSink { poll: ui::Poll::start("starting the stack"), started: std::time::Instant::now(), drawn: None };
+    let (status, tally, tail) = crate::onboard::sh::run_folded(cmd, std::time::Duration::from_millis(250), &mut sink)?;
+    drop(sink);
+    let code = status.code().unwrap_or(1);
+    for s in [tally.pull_summary(), tally.summary()].into_iter().flatten() {
+        if tally.failed() > 0 || code != 0 {
+            ui::failed(&s, None);
+        } else {
+            ui::done(&s);
+        }
+    }
+    for l in crate::onboard::sh::failure_tail(code == 0, &tail, "re-run with --verbose") {
+        eprintln!("{l}");
+    }
+    Ok(code)
 }
 
 /// Recreate ONE compose service (`noomesh-restart.sh --force <service>`) so
@@ -1418,5 +1487,92 @@ mod stop_clean_tests {
         assert_eq!(a, ["-v", "--images"]);
         let a = clean_script_args(false, false, true, false, false, false, true);
         assert_eq!(a, ["--all", "--yes"]);
+    }
+
+    /// i570 1: only `start` and `restart`, only on a terminal that can
+    /// rewrite a line, and never with `--verbose`, `--quiet` or `--json`.
+    #[test]
+    fn only_a_terminal_start_or_restart_folds_the_compose_lines() {
+        for n in ["noomesh-start.sh", "noomesh-restart.sh"] {
+            assert!(fold_launcher_output(n, false, false, false, true), "{n}");
+            assert!(!fold_launcher_output(n, false, false, false, false), "{n}: not a terminal keeps plain lines");
+            assert!(!fold_launcher_output(n, false, true, false, true), "{n}: --verbose keeps every line");
+            assert!(!fold_launcher_output(n, false, false, true, true), "{n}: --quiet");
+            assert!(!fold_launcher_output(n, true, false, false, true), "{n}: --json");
+        }
+        for n in ["noomesh-rebuild.sh", "noomesh-stop.sh", "noomesh-reset.sh"] {
+            assert!(!fold_launcher_output(n, false, false, false, true), "{n}");
+        }
+    }
+
+    #[derive(Default)]
+    struct Recorded {
+        lines: Vec<(bool, String)>,
+        status: Vec<String>,
+    }
+
+    impl crate::onboard::sh::FoldSink for Recorded {
+        fn line(&mut self, is_err: bool, line: &str) {
+            self.lines.push((is_err, line.to_string()));
+        }
+        fn progress(&mut self, tally: &crate::onboard::sh::ComposeTally, _idle: bool) {
+            self.status.push(tally.live_status());
+        }
+    }
+
+    /// i570 1: a launcher run through the fold. Compose's per-container
+    /// lines become the live status; the launcher's own lines, a REFUSED
+    /// add-on with its Fix, a warning and a compose error reach the operator
+    /// verbatim on the stream they came from; the exit code is the
+    /// launcher's.
+    #[test]
+    fn the_fold_keeps_every_launcher_line_and_absorbs_only_container_progress() {
+        let script = r#"
+echo "→ starting the stack"
+echo "REFUSED add-on rhaddon: resource peer-key (shared_secret): NOO_X is not in the encrypted store" >&2
+echo "  Fix:  noo addons enable rhaddon   (or turn it off: noo addons disable rhaddon)" >&2
+echo " Network noomesh_default  Created" >&2
+for c in noo-gateway noo-redis noo-bad; do
+  for st in Recreate Recreated Starting Started Waiting; do echo " Container $c  $st" >&2; done
+done
+echo " Container noo-gateway  Healthy" >&2
+echo " Container noo-redis  Healthy" >&2
+echo " Container noo-bad  Error response from daemon: boom" >&2
+echo "WARNING: something the operator must see" >&2
+echo "✓ launcher done"
+exit 3
+"#;
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg(script);
+        let mut rec = Recorded::default();
+        let (status, tally, tail) =
+            crate::onboard::sh::run_folded(cmd, std::time::Duration::from_millis(50), &mut rec).expect("ran");
+        assert_eq!(status.code(), Some(3));
+        let shown: Vec<&str> = rec.lines.iter().map(|(_, l)| l.as_str()).collect();
+        for want in ["→ starting the stack", "REFUSED add-on rhaddon:", "  Fix:  noo addons enable rhaddon", "Container noo-bad  Error",
+            "WARNING: something the operator must see", "✓ launcher done"] {
+            assert!(shown.iter().any(|l| l.contains(want)), "{want:?} was folded away: {shown:?}");
+        }
+        for folded in ["Recreate", "Starting", "Started", "Waiting", "Healthy", "Network"] {
+            assert!(!shown.iter().any(|l| l.contains(folded) && !l.contains("Error")), "{folded} reached the operator: {shown:?}");
+        }
+        assert!(rec.lines.iter().any(|(e, l)| *e && l.starts_with("REFUSED")), "a stderr line stays on stderr");
+        assert!(rec.lines.iter().any(|(e, l)| !*e && l.starts_with("✓")), "a stdout line stays on stdout");
+        assert!(rec.status.iter().any(|s| s.starts_with("containers: ")), "the live line followed the containers: {:?}", rec.status);
+        assert_eq!(tally.live_status(), "containers: 2 of 3 up, 1 failed");
+        assert_eq!(tally.failed(), 1);
+        assert!(tail.iter().any(|l| l.contains("Recreated")), "the failure tail keeps the absorbed lines");
+    }
+
+    /// The live line before any container: the pull, then a plain start.
+    #[test]
+    fn the_live_line_says_pulling_before_any_container() {
+        let mut t = crate::onboard::sh::ComposeTally::default();
+        assert_eq!(t.live_status(), "starting the stack");
+        assert!(!t.feed("0123456789ab Downloading 20.97MB"));
+        assert!(!t.feed("abcdef012345 Already exists"));
+        assert_eq!(t.live_status(), "pulling images: 2 layers seen (1 already present)");
+        assert!(!t.feed(" Container noo-a  Started"));
+        assert_eq!(t.live_status(), "containers: 1 of 1 up");
     }
 }

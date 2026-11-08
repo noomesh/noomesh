@@ -705,6 +705,19 @@ impl Poll {
         Poll { msg: msg.to_string(), live, last_minute: 0, frame: 0, indent }
     }
 
+    /// Change what the live line says; the next `tick` draws it.
+    pub fn set_msg(&mut self, msg: &str) {
+        msg.clone_into(&mut self.msg);
+    }
+
+    /// Clear the live line so a normal print starts clean; the next `tick`
+    /// draws it again below that print.
+    pub fn lift(&self) {
+        if self.live {
+            clear_line();
+        }
+    }
+
     pub fn tick(&mut self, elapsed_secs: u64) {
         if quiet() {
             return;
