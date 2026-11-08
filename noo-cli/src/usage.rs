@@ -200,7 +200,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["models", "pull"], "<model> [--backend <b>]", "Pull onto the gateway's Ollama; whisper:<size> / piper:<voice> stage a voice model"),
     (&["models", "fetch"], "<hf_repo> <file.gguf> [--revision <rev>] [--force]", "Download a GGUF from Hugging Face, or stage ollama:<tag> from the registry, into the store"),
     (&["models", "stage"], "<hf:repo@sha> --kind <kind> --id <id> --modality <m> --runtime <r>... --needs <file.json> [--license <id>] [--license-url <url>] [--license-additional <id>=<url>[,<notice>]]... [--file <path>...] [--extract <archive>[:<glob>]] [--fits-model <id> [--fits-revision <rev>] | --fits-runtime <r>] [--accept-license]", "Stage a model set from a pinned Hugging Face commit into the store, signed"),
-    (&["models", "accept"], "<id> | hf:<org>/<name>@<commit>", "Record the operator's licence acceptance: for one set, or for every set staged from a gated repo at that commit"),
+    (&["models", "accept"], "<id> | hf:<org>/<name>@<commit>", "Record a licence acceptance: one set, or every set from a gated repo at that commit"),
     (&["models", "rm"], "<id>[@<rev>] [--force] [-y|--yes]", "Remove a staged model set; refuses unless --force until placements can be checked"),
     (&["stack", "status"], "", "Show stack container status (from docker ps)"),
     (&["stack", "logs"], "[<service>...] [--follow] [--tail <n>]", "Show container logs for one service or compose logs for many"),
