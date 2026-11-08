@@ -447,7 +447,7 @@ pub fn refresh_grace() -> Duration {
 /// not outlive it. Here, not at the call sites, so no caller can forget.
 pub async fn revoke_all_for_user(db: &PgPool, user_id: &str) -> Result<u64, sqlx::Error> {
     if let Err(e) =
-        crate::perspective::end_all_for_account(db, user_id, crate::perspective::EndReason::FamilyRevoked).await
+        crate::perspective::end_all_for_account(db, "", crate::perspective::EndReason::FamilyRevoked).await
     {
         tracing::error!(user = %user_id, error = %e, "could not end the account's perspectives with its refresh family");
     }
