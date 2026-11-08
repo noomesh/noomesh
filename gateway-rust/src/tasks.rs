@@ -321,6 +321,16 @@ pub async fn create_task(db: &sqlx::PgPool, new: NewTask<'_>) -> Result<Task> {
     };
     let parent_uuid = new.parent.and_then(|p| uuid::Uuid::parse_str(&p.id).ok());
     let channel = new.parent.map(|p| p.channel.as_str()).unwrap_or("task");
+    // i538: the perspective the task is submitted under, snapshotted onto
+    // the row: the request's (or the turn's) snapshot, else the parent
+    // task's, so a delegated child is never wider than its parent.
+    let snapshot = match crate::perspective::current() {
+        Some(p) => Some(p),
+        None => match parent_uuid {
+            Some(pid) => crate::perspective::task_snapshot(db, pid).await,
+            None => None,
+        },
+    };
     crate::repo::tasks::insert(
         db,
         &crate::repo::tasks::NewTaskRow {
@@ -337,6 +347,7 @@ pub async fn create_task(db: &sqlx::PgPool, new: NewTask<'_>) -> Result<Task> {
             budget_default,
             token_budget: new.token_budget.filter(|b| *b > 0),
             created_via: new.created_via,
+            perspective: snapshot.and_then(|p| serde_json::to_value(p).ok()),
         },
     )
     .await?;
@@ -1090,7 +1101,14 @@ pub async fn start(state: &std::sync::Arc<AppState>, task: &Task) -> Result<Star
         Err(e) => e.clone(),
     };
     if let Ok(node) = target {
-        if let Some(role) = crate::coordinator::role_of(state, owner).await {
+        if let Some(live) = crate::coordinator::role_of(state, owner).await {
+            // i538: min(owner's live role, the snapshot the task was
+            // submitted under), live or not.
+            let snapshot = match uuid::Uuid::parse_str(&task.id) {
+                Ok(id) => crate::perspective::task_snapshot(&state.db, id).await,
+                Err(_) => None,
+            };
+            let role = crate::perspective::snapshot_role(live, snapshot.as_ref());
             let ttl = crate::coordinator::turn_deadline().as_secs() + 60;
             if let Some(token) = crate::auth::mint_harness_jwt(owner, role, &node, &task.conversation_id, ttl) {
                 let loop_budget = apply_node_budget(&state.db, task, &node).await?;
@@ -1196,8 +1214,18 @@ fn run_in_process(st: std::sync::Arc<AppState>, req: TaskRequest) -> std::pin::P
             } else {
                 crate::bus_principal::account_principal(&st.db, &req.user).await
             };
+            // i538: the loops run under the task's perspective snapshot, so a
+            // turn they send to a node and the external tools they are shown
+            // are no wider than the view the task was submitted from.
+            let snapshot = match uuid::Uuid::parse_str(&req.task_id) {
+                Ok(id) => crate::perspective::task_snapshot(&st.db, id).await,
+                Err(_) => None,
+            };
             match principal {
-                Some(p) => crate::bus_principal::with_principal(p, run_task_loops(rt, &req)).await,
+                Some(p) => {
+                    crate::perspective::scope(snapshot, crate::bus_principal::with_principal(p, run_task_loops(rt, &req)))
+                        .await
+                }
                 None => run_task_loops(rt, &req).await,
             }
         })

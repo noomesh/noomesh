@@ -3377,16 +3377,23 @@ pub async fn require_any_auth(
             // cap. Its `role` is already the narrowed one, so every role
             // check below is on the narrower path; handlers that mint a
             // credential see the extension and refuse.
-            if let Some(prs) = claims.prs.as_ref() {
-                if let Err(why) = crate::perspective::admit(&state.db, &claims.sub, prs).await {
-                    tracing::info!(target: "security", sub = %claims.sub, perspective = %prs.id, why = ?why, "perspective token refused");
-                    return Ok(crate::perspective::refusal_response(why));
+            //
+            // The same perspective is the SNAPSHOT the rest of the request
+            // runs under (`perspective::scope`, at the end of this branch), so
+            // a chat turn it submits mints its node-harness token and picks
+            // its external tools at min(live role, snapshot).
+            let in_view = match claims.prs.as_ref() {
+                None => None,
+                Some(prs) => {
+                    if let Err(why) = crate::perspective::admit(&state.db, &claims.sub, prs).await {
+                        tracing::info!(target: "security", sub = %claims.sub, perspective = %prs.id, why = ?why, "perspective token refused");
+                        return Ok(crate::perspective::refusal_response(why));
+                    }
+                    let view = crate::perspective::RequesterPerspective { id: prs.id.clone(), dims: prs.dims.clone() };
+                    request.extensions_mut().insert(view.clone());
+                    Some(view)
                 }
-                request.extensions_mut().insert(crate::perspective::RequesterPerspective {
-                    id: prs.id.clone(),
-                    dims: prs.dims.clone(),
-                });
-            }
+            };
             // Peer tokens (scopes=["peer"], sub="peer:{id}") are confined to the
             // peer surface (/ws/agent + /api/agents/peer/*). Without this a peer
             // token is effectively a full-access token: it would receive
@@ -3568,7 +3575,7 @@ pub async fn require_any_auth(
             if let Some(u) = crate::legacy_lanes::addon_token_use(&claims.sub, &path) {
                 crate::legacy_lanes::observe(&state.metrics, &[u], &crate::legacy_lanes::PeerFacts::default()).await;
             }
-            return Ok(next.run(request).await);
+            return Ok(crate::perspective::scope(in_view, next.run(request)).await);
         }
     } else {
         warn_insecure_jwt_once();

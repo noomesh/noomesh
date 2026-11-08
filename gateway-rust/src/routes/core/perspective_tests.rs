@@ -417,3 +417,199 @@ fn the_cap_is_not_advertised() {
     assert!(answer.contains("\"perspective\": started.view()"));
     assert!(!answer.contains("cap_at"));
 }
+
+fn view_of(started: &Started) -> perspective::RequesterPerspective {
+    perspective::RequesterPerspective { id: started.id.clone(), dims: started.dims.clone() }
+}
+
+/// The catalog clamp: inside a turn under a `user` view an operator's
+/// external-tool audience role is `user`; outside it, the live role.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catalog_for_answers_a_user_perspective_as_a_user() {
+    let _serial = DB_LOCK.lock().await;
+    let Some(db) = scratch("va_catalog").await else { return };
+    let (_raw, started) = user_view(&db, "olive").await;
+    let (role, _kb) = crate::mcp_bridge::identity(&db, Some("olive")).await.expect("identity");
+    assert_eq!(role, Some(Role::Operator), "no turn in scope: the live role");
+    let (role, _kb) = perspective::scope(Some(view_of(&started)), crate::mcp_bridge::identity(&db, Some("olive")))
+        .await
+        .expect("identity");
+    assert_eq!(role, Some(Role::User), "a user view is shown a user's external tools");
+}
+
+async fn task_under(db: &PgPool, owner: &str, snapshot: Option<perspective::RequesterPerspective>) -> uuid::Uuid {
+    let new = crate::tasks::NewTask {
+        owner: Some(owner),
+        objective: "check the view",
+        model: None,
+        loop_budget: None,
+        parent: None,
+        role: None,
+        token_budget: None,
+        created_via: None,
+    };
+    let task = perspective::scope(snapshot, crate::tasks::create_task(db, new)).await.expect("create the task");
+    uuid::Uuid::parse_str(&task.id).expect("a task id")
+}
+
+/// The owner clamp, and the snapshot rule: a task submitted under a `user`
+/// view is delivered at `user`, still after Back to me, and a demotion of
+/// the live role below a snapshot wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_role_answers_a_user_perspective_as_a_user() {
+    let _serial = DB_LOCK.lock().await;
+    let Some(db) = scratch("va_owner").await else { return };
+    let (raw, started) = user_view(&db, "olive").await;
+    let real = task_under(&db, "olive", None).await;
+    assert_eq!(crate::task_events::task_owner_role(&db, real, "olive").await, Ok(Role::Operator));
+    let narrowed = task_under(&db, "olive", Some(view_of(&started))).await;
+    assert_eq!(crate::task_events::task_owner_role(&db, narrowed, "olive").await, Ok(Role::User));
+
+    let s = reread(&db, &raw, "olive").await;
+    perspective::back_to_me(&db, &claims("olive", Role::User, Some(started.claim())), &s).await.expect("back to me");
+    assert_eq!(
+        crate::task_events::task_owner_role(&db, narrowed, "olive").await,
+        Ok(Role::User),
+        "a task submitted under a user view still runs as one after Back to me"
+    );
+    // A turn submitted under the view mints at user too, after the end.
+    let live = Role::Operator;
+    let turn = perspective::scope(Some(view_of(&started)), async { perspective::snapshot_role(live, perspective::current().as_ref()) }).await;
+    assert_eq!(turn, Role::User);
+
+    // A demotion below the snapshot wins: an admin's task under an
+    // operator view, then the admin is made a user.
+    person(&db, "ada", Role::Admin).await;
+    let op_view = perspective::RequesterPerspective {
+        id: uuid::Uuid::new_v4().to_string(),
+        dims: Perspective { role_cap: Some(Role::Operator), ..Perspective::default() },
+    };
+    let t = task_under(&db, "ada", Some(op_view)).await;
+    assert_eq!(crate::task_events::task_owner_role(&db, t, "ada").await, Ok(Role::Operator));
+    sqlx::query("UPDATE noo_users SET role = 'user' WHERE username = 'ada'").execute(&db).await.expect("demote");
+    assert_eq!(crate::task_events::task_owner_role(&db, t, "ada").await, Ok(Role::User), "the demotion wins");
+}
+
+/// A perspective whose dimensions this gateway cannot read (a newer one
+/// wrote a dimension it does not know) is ENDED at the refresh, reason
+/// `unreadable`, and the refresh is real.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unreadable_dims_end_the_perspective() {
+    let _serial = DB_LOCK.lock().await;
+    let Some(db) = scratch("va_unreadable").await else { return };
+    signing_key();
+    let (raw, started) = user_view(&db, "olive").await;
+    sqlx::query("UPDATE noo_perspectives SET dims = jsonb_build_object('seat', 'hall') WHERE id = $1::uuid")
+        .bind(&started.id)
+        .execute(&db)
+        .await
+        .expect("a P4 dimension");
+    match rotate_refresh(&db, &raw, None, None).await {
+        Rotation::Rotated { access_token, .. } => {
+            assert!(payload(&access_token).get("prs").is_none(), "the refresh is real");
+        }
+        _ => panic!("the refresh must rotate"),
+    }
+    assert!(!is_live(&db, &started.id).await, "an unreadable perspective must end, not linger");
+    assert_eq!(end_reason(&db, &started.id).await.as_deref(), Some("unreadable"));
+    assert_eq!(perspective::admit(&db, "olive", &started.claim()).await, Err(Refusal::Ended));
+}
+
+/// Back to me and switch answer only the session that carries the
+/// perspective: another session of the same account is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn back_to_me_only_from_its_own_session() {
+    let _serial = DB_LOCK.lock().await;
+    let Some(db) = scratch("va_own_session").await else { return };
+    let (_raw, started) = user_view(&db, "olive").await;
+    let (_other_raw, other) = session(&db, "olive").await;
+    let c = claims("olive", Role::User, Some(started.claim()));
+    let r = perspective::back_to_me(&db, &c, &other).await.expect_err("another session");
+    assert_eq!((r.status, r.detail), (StatusCode::UNAUTHORIZED, perspective::NOT_THIS_SESSION));
+    assert!(is_live(&db, &started.id).await);
+}
+
+/// A cookie names a session only for its own account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cookie_names_only_its_own_accounts_session() {
+    let _serial = DB_LOCK.lock().await;
+    let Some(db) = scratch("va_cookie_owner").await else { return };
+    person(&db, "olive", Role::Operator).await;
+    person(&db, "bob", Role::Operator).await;
+    let (raw, _s) = session(&db, "olive").await;
+    assert!(perspective::session_row(&db, &raw, "bob").await.expect("read").is_none(), "olive's cookie is not bob's session");
+    assert!(perspective::session_row(&db, &raw, "olive").await.expect("read").is_some());
+}
+
+/// A perspective token carries the narrowed role's legacy scopes and
+/// nothing else: the account's additive extras are capabilities too.
+#[test]
+fn a_perspective_token_drops_the_additive_scopes() {
+    let u = UserRecord {
+        username: "olive".into(),
+        hashed_password: "x".into(),
+        disabled: false,
+        scopes: vec!["read".into(), "write".into(), "ingest".into(), "graph".into()],
+        role: Role::Operator,
+    };
+    let prs = PrsClaim {
+        id: "0f9c1d2e-0000-4000-8000-000000000001".into(),
+        dims: Perspective { role_cap: Some(Role::User), ..Perspective::default() },
+    };
+    let (token, _exp) = super::perspective_token_with(&u, Role::User, &prs, SECRET).expect("mint");
+    let c = payload(&token);
+    assert_eq!(c["scopes"], json!(["read"]));
+    assert_eq!(c["role"], "user");
+    assert_eq!(c["prs"]["id"], prs.id);
+}
+
+/// Logout ends the session's perspective (reason `logout`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logout_ends_the_perspective() {
+    let own = crate::test_src::own_code(include_str!("../core.rs"));
+    let body = crate::test_src::fn_body(&own, "async fn auth_logout_handler(");
+    let looked = body.find("auth_refresh::lookup_token(&state.db, &raw).await").expect("the cookie's row");
+    let ended = body
+        .find("crate::perspective::end(&state.db, pid, crate::perspective::EndReason::Logout)")
+        .expect("logout must end the cookie row's perspective");
+    let revoked = body.find("auth_refresh::revoke_token(&state.db, &rec.id)").expect("the revoke");
+    assert!(looked < ended && ended < revoked);
+
+    let _serial = DB_LOCK.lock().await;
+    let Some(db) = scratch("va_logout").await else { return };
+    let (raw, started) = user_view(&db, "olive").await;
+    let rec = auth_refresh::lookup_token(&db, &raw).await.expect("read").expect("the row");
+    assert_eq!(rec.perspective_id.as_deref(), Some(started.id.as_str()), "the row the logout reads carries it");
+    assert!(perspective::end(&db, &started.id, perspective::EndReason::Logout).await.expect("end"));
+    assert_eq!(end_reason(&db, &started.id).await.as_deref(), Some("logout"));
+}
+
+/// Revoking the account's refresh family (replay, password change,
+/// disable) ends every live perspective of the account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_family_ends_its_perspectives() {
+    let _serial = DB_LOCK.lock().await;
+    let Some(db) = scratch("va_family").await else { return };
+    let (_raw, started) = user_view(&db, "olive").await;
+    auth_refresh::revoke_all_for_user(&db, "olive").await.expect("revoke");
+    assert!(!is_live(&db, &started.id).await);
+    assert_eq!(end_reason(&db, &started.id).await.as_deref(), Some("family_revoked"));
+}
+
+/// Perspectives are never nested: a token already carrying one is refused
+/// a start, even on a session that does not carry it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn begin_refuses_a_nested_perspective() {
+    let _serial = DB_LOCK.lock().await;
+    let Some(db) = scratch("va_nested").await else { return };
+    let (raw, started) = user_view(&db, "olive").await;
+    let (_other_raw, other) = session(&db, "olive").await;
+    let c = claims("olive", Role::User, Some(started.claim()));
+    let r = perspective::begin(&db, &c, &other, &dims(json!({"role_cap": "user"}))).await.expect_err("nested");
+    assert_eq!((r.status, r.detail), (StatusCode::CONFLICT, perspective::ACTIVE));
+    let carrying = reread(&db, &raw, "olive").await;
+    let r = perspective::begin(&db, &claims("olive", Role::Operator, None), &carrying, &dims(json!({"role_cap": "user"})))
+        .await
+        .expect_err("the session already carries one");
+    assert_eq!(r.status, StatusCode::CONFLICT);
+}

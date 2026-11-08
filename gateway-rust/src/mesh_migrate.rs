@@ -2338,7 +2338,8 @@ ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS display_set_at timestamptz
     // i538 P1 "View as": an operator narrows their own session to a
     // perspective. One row per perspective, tied to the session by
     // `perspective_id` on the live refresh row. `cap_at` is the unadvertised
-    // 12 h safety net. Additive: a new table and one nullable column, which
+    // 12 h safety net. `noo_tasks.perspective` is the snapshot a task was
+    // submitted under. Additive: a new table and two nullable columns, which
     // an older gateway ignores.
     sql: r#"
 CREATE TABLE IF NOT EXISTS noo_perspectives (
@@ -2351,10 +2352,11 @@ CREATE TABLE IF NOT EXISTS noo_perspectives (
     ended_at timestamptz,
     end_reason text,
     switched_from uuid,
-    CONSTRAINT noo_perspectives_reason CHECK (end_reason IS NULL OR end_reason IN ('back_to_me', 'switched', 'logout', 'family_revoked', 'cap'))
+    CONSTRAINT noo_perspectives_reason CHECK (end_reason IS NULL OR end_reason IN ('back_to_me', 'switched', 'logout', 'family_revoked', 'cap', 'unreadable'))
 );
 CREATE INDEX IF NOT EXISTS noo_perspectives_live_idx ON noo_perspectives (account) WHERE ended_at IS NULL;
 ALTER TABLE noo_refresh_tokens ADD COLUMN IF NOT EXISTS perspective_id uuid;
+ALTER TABLE noo_tasks ADD COLUMN IF NOT EXISTS perspective jsonb;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'noo_app') THEN
@@ -4006,7 +4008,8 @@ mod perspectives_migration_tests {
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_perspectives"));
         assert!(m.sql.contains("cap_at timestamptz NOT NULL"));
         assert!(m.sql.contains("ALTER TABLE noo_refresh_tokens ADD COLUMN IF NOT EXISTS perspective_id uuid"));
-        for reason in ["'back_to_me'", "'switched'", "'logout'", "'family_revoked'", "'cap'"] {
+        assert!(m.sql.contains("ALTER TABLE noo_tasks ADD COLUMN IF NOT EXISTS perspective jsonb"));
+        for reason in ["'back_to_me'", "'switched'", "'logout'", "'family_revoked'", "'cap'", "'unreadable'"] {
             assert!(m.sql.contains(reason), "{reason}");
         }
         assert!(!m.sql.contains("DELETE") && !m.sql.contains("DROP") && !m.sql.contains("UPDATE noo_"));

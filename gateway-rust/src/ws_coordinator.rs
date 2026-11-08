@@ -93,6 +93,15 @@ async fn handle_chat(
         crate::bus_principal::Principal::user(user_id.clone(), role, claims.scopes.clone());
     principal.act = claims.act.clone();
     principal.harness = claims.harness.clone();
+    // i538: the perspective the socket's ticket was minted under (the ticket
+    // records the verified claims, `prs` included). It is the snapshot every
+    // turn of this socket runs under: a turn sent to a node harness mints its
+    // token at min(live role, snapshot). The console reconnects the socket
+    // on start, switch and Back to me.
+    let session_view = claims
+        .prs
+        .as_ref()
+        .map(|p| crate::perspective::RequesterPerspective { id: p.id.clone(), dims: p.dims.clone() });
     tracing::info!(user_id = %user_id, "ws_coordinator connected");
 
     let (writer, mut stream, forwarder) = WsWriter::spawn(socket);
@@ -229,7 +238,7 @@ async fn handle_chat(
                 // is nothing there" rather than "I do not know who you are".
                 // It also made every chat turn anonymous in the worker audit
                 // trail.
-                let run = crate::bus_principal::with_principal(
+                let run = crate::perspective::scope(session_view.clone(), crate::bus_principal::with_principal(
                     principal.clone(),
                     crate::routes::communication::DASHBOARD_APPROVAL_TX.scope(
                     Some(writer.clone()),
@@ -244,7 +253,7 @@ async fn handle_chat(
                         chat_msg.enable_thinking,
                     ),
                     ),
-                );
+                ));
                 // A logout or an admin ending the account's sessions drops the
                 // turn here, tools and all; the guard sends the 4401 close and
                 // the loop ends on the peer's close reply. Expiry never
