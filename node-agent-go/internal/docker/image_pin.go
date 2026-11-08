@@ -92,6 +92,9 @@ func (c *Client) resolvePinnedImage(ctx context.Context, ref, pin string) (sourc
 	arch := runtime.GOARCH
 	m, _, merr := fetchImageManifest(ctx, ref, arch)
 	if merr != nil || m == nil {
+		if id, ok := imageLocalID(ctx, c, ref); ok {
+			return imagesource.Rail, id, nil
+		}
 		if merr == nil || errors.Is(merr, ErrArtifactAbsent) {
 			return "", "", &ImageNotStagedError{Ref: ref, Arch: arch, Tar: ImageTarGzName(ref, arch), AltTar: ImageTarName(ref, arch)}
 		}
