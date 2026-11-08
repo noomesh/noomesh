@@ -35,6 +35,7 @@ case "$args" in
   *"config --services"*) echo gateway; echo worker; echo ollama ;;
   *"config --format json"*) echo '{"services":{}}' ;;
   *" up "*) env | grep -E '^NOO_IMAGE_(TAG|PREFIX|DIGEST_[A-Z0-9_]+)=' > "$ENVDUMP" ;;
+  *" ps -q --status running "*) echo cid ;;  # a restart now checks every named service runs
 esac
 exit 0
 """
