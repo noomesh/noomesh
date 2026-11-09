@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::args::Args;
+use crate::args::{ArgError, Args};
 use crate::output::{self, ExitCode};
 use crate::ui;
 use crate::{Globals, Unhandled};
@@ -392,12 +392,15 @@ fn agent_or_fail(g: &Globals) -> (u32, u32) {
     })
 }
 
-fn pair(args: &[String]) -> Result<(String, String), Unhandled> {
+fn pair(args: &[String]) -> Result<(String, String), ArgError> {
     let mut a = Args::new(args);
-    let addon = a.one("<addon>")?;
-    let digest = a.one("<digest>")?;
-    a.finish()?;
-    Ok((addon, digest))
+    let positional = a.positionals()?;
+    match positional.as_slice() {
+        [] => Err(ArgError::new("missing <addon>")),
+        [_] => Err(ArgError::new("missing <digest>")),
+        [addon, digest] => Ok((addon.clone(), digest.clone())),
+        [_, _, extra, ..] => Err(ArgError::new(format!("unexpected argument `{extra}` after <digest>"))),
+    }
 }
 
 fn request_or_fail(g: &Globals, addon: &str, digest: &str) -> Approval {
@@ -489,6 +492,28 @@ mod tests {
 
     const D1: &str = "sha256:2c99870b2514d9e143c3f33f3d5a9b4cbe89516e32343e5ac9c1379a9123844b";
     const D2: &str = "sha256:5d3a2f25f9825628daba94dc0b1d421c7d57d6c03ae5faa9ba050e058bab8241";
+
+    #[test]
+    fn consent_commands_accept_addon_and_digest_positionals() {
+        // approve and revoke share this parser. Args::one would reject the
+        // second positional before either command could reach its root check.
+        let args = vec!["rhaddon".to_string(), D1.to_string()];
+        assert_eq!(pair(&args).unwrap(), ("rhaddon".to_string(), D1.to_string()));
+    }
+
+    #[test]
+    fn consent_commands_refuse_missing_extra_and_unknown_arguments() {
+        for (args, expected) in [
+            (vec![], "missing <addon>"),
+            (vec!["rhaddon"], "missing <digest>"),
+            (vec!["rhaddon", D1, "extra"], "unexpected argument `extra` after <digest>"),
+            (vec!["rhaddon", D1, "--force"], "unknown flag `--force`"),
+            (vec!["--force", "rhaddon", D1], "unknown flag `--force`"),
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_string).collect();
+            assert_eq!(pair(&args).unwrap_err().to_string(), expected);
+        }
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("noo-node-wl-{tag}-{}", std::process::id()));
