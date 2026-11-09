@@ -284,7 +284,7 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 ### `noo enroll` — Join this machine to a noomesh fleet as a worker
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo enroll` | `<noo1.blob> \| --url <u> --token <t> \| --via-tailnet <u> [--ca-sha256 <hex>] [--ts-authkey <k>] [--node <name>] [--skip-tailscale] [--skip-prep] [--data-root <dir>] [--resume]` | Enroll this machine as a worker of the given controller |
+| `noo enroll` | `<noo1.blob> \| --url <u> --token <t> \| --via-tailnet <u> [--ca-sha256 <hex>] [--ts-authkey <k>] [--node <name>] [--skip-tailscale] [--skip-prep] [--data-root <dir>] [--controller-approvals] [--resume]` | Enroll this machine as a worker of the given controller |
 
 ### `noo offboard` — Leave the fleet: stop the agent, remove enrollment state (confirms)
 | Command | Arguments | What it does |
@@ -386,4 +386,7 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 | `noo node workloads approve` | `<addon> <digest>` | On this node, as root: consent to run an add-on's node workload at one image digest |
 | `noo node workloads revoke` | `<addon> <digest>` | On this node, as root: withdraw one add-on digest's approval |
 | `noo node workloads list` | — | On this node, as root: show the add-on node workloads approved here, and the policy |
+| `noo node workloads controller allow` | — | On this node, as root: take add-on workload approvals the controller signs (opt in) |
+| `noo node workloads controller deny` | — | On this node, as root: stop taking the controller's approvals; local ones still count |
+| `noo node workloads controller status` | — | On this node: opted in or not, the policy, and the controller set the agent holds |
 <!-- END GENERATED -->

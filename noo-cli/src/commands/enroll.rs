@@ -67,8 +67,8 @@ pub(crate) fn asset_harness_unit() -> &'static str { ASSET_HARNESS_UNIT }
 pub(crate) fn asset_harness_env_tmpl() -> &'static str { ASSET_HARNESS_ENV_TMPL }
 
 const USAGE: &str = "usage: noo enroll <noo1.blob> | --url <https://…> --token <t> \
-[--ca-sha256 <hex>] [--ts-authkey <k>] [--node <name>] [--skip-tailscale] [--skip-prep] [--data-root <dir>]\n\
-       noo enroll --via-tailnet <https://controller.ts.net> [--ts-authkey <k>] [--skip-prep]\n  --resume            macOS: finish the arm step (root CLI + fetch daemon) after a failure, no new token";
+[--ca-sha256 <hex>] [--ts-authkey <k>] [--node <name>] [--skip-tailscale] [--skip-prep] [--data-root <dir>] [--controller-approvals]\n\
+       noo enroll --via-tailnet <https://controller.ts.net> [--ts-authkey <k>] [--skip-prep] [--controller-approvals]\n  --resume            macOS: finish the arm step (root CLI + fetch daemon) after a failure, no new token\n  --controller-approvals  Linux: let the controller approve add-on workloads on this node (asked when interactive; default no)";
 
 #[derive(Debug)]
 struct EnrollCred {
@@ -412,6 +412,26 @@ fn run_visible(cmd: &mut Command) -> i32 {
     cmd.status().ok().and_then(|s| s.code()).unwrap_or(-1)
 }
 
+/// The answer to enroll's controller-approvals question: only an explicit
+/// yes opts in; empty, no, or anything else does not.
+fn optin_answer(a: &str) -> bool {
+    matches!(a.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// `noo enroll --controller-approvals` (i596): the owner's opt-in, written
+/// during this one setup run as root by the same writer the owner uses later,
+/// `noo node workloads controller allow`, run with this noo by its full path
+/// (root's PATH often lacks the directory it is in).
+fn opt_in_controller_approvals() {
+    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "noo".to_string());
+    let argv = crate::commands::node_workloads::controller_allow_argv(&exe);
+    ui::step("opting this node in to controller approvals (as root)");
+    if run_visible(Command::new(&argv[0]).args(&argv[1..])) != 0 {
+        ui::warned("this node was not opted in to controller approvals; the enrollment itself is done");
+        say(&ui::note(&format!("to opt in later, on this node: {}", crate::commands::node_workloads::ALLOW_AS_ROOT)));
+    }
+}
+
 /// What the pre-redeem host check's exit status means for the enrollment.
 #[derive(Debug, PartialEq, Eq)]
 enum PreflightVerdict {
@@ -466,6 +486,10 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut skip_prep = false;
     let mut via_tailnet: Option<String> = None;
     let mut resume = false;
+    // i596: the owner's opt-in to approvals the controller signs. Only this
+    // run, as the node's own root, writes it; nothing the controller sends
+    // (a bundle, provision) ever does.
+    let mut controller_approvals = false;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -480,6 +504,7 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             "--data-root" => data_root = it.next().cloned(),
             "--skip-prep" => skip_prep = true,
             "--resume" => resume = true,
+            "--controller-approvals" => controller_approvals = true,
             "--help" | "-h" => {
                 say(USAGE);
                 return Ok(0);
@@ -837,10 +862,23 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             return Ok(1);
         }
     }
-    say(&ui::kv(&[
+    // i596: the owner's opt-in to controller approvals, asked once here
+    // (before the token is spent) when nobody passed the flag. Default no; a
+    // run nobody can answer is never opted in.
+    if !controller_approvals && cfg!(target_os = "linux") && !skip_prep && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        say(&ui::note("the controller can approve add-on workloads on this node, with sets signed by the fleet key; no keeps approvals local (sudo on this node each time)"));
+        let a = crate::onboard::prompt::read_line_edited("  Let the controller approve add-on workloads here? [y/N]: ").unwrap_or_default();
+        controller_approvals = optin_answer(&a);
+    }
+    let mut identity = vec![
         ("controller", noo_url.clone()),
         ("data root", format!("{}  {}", data_root.as_deref().unwrap_or(""), ui::muted("change later: re-run enroll with --data-root"))),
-    ]));
+    ];
+    if cfg!(target_os = "linux") {
+        let words = if controller_approvals { "yes" } else { "no (approvals stay local)" };
+        identity.push(("controller approvals", format!("{words}  {}", ui::muted("change later on this node: noo node workloads controller allow|deny, as root"))));
+    }
+    say(&ui::kv(&identity));
     // Right after `tailscale up` the tunnel and MagicDNS need a few seconds
     // (HOST3 2026-09-02: "the controller is unreachable: timeout" one
     // second after the join; a retry a minute later answered in 85 ms).
@@ -1102,6 +1140,9 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // ~/noomesh + a LaunchAgent. Everything below this block is the linux
     // lane, unchanged.
     if cfg!(target_os = "macos") {
+        if controller_approvals {
+            say(&ui::note("--controller-approvals is for Linux nodes (an add-on's node workload needs Linux); nothing was opted in here"));
+        }
         return darwin_arm(&noo_url, &bound_node, &birth_dir, data_root.as_deref(), cred.ca_sha256.as_deref());
     }
 
@@ -1295,6 +1336,12 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             ("noo enroll <paste>", "run its enroll line here again — re-enrolling the same node is safe"),
         ]);
         return Ok(1);
+    }
+
+    // After prep: the agent's state directory exists now. A failure here is
+    // said, not fatal: the node is enrolled, and stays local-only.
+    if controller_approvals {
+        opt_in_controller_approvals();
     }
 
     let completion = crate::shell_completion::ensure_installed(false).is_some();
@@ -1900,5 +1947,15 @@ mod tests {
         }
         // prep must know the embedded lane or staged tools are dead weight
         assert!(ASSET_PREP.contains("PREP_TOOLS_DIR"));
+    }
+
+    #[test]
+    fn only_an_explicit_yes_opts_in_to_controller_approvals() {
+        for yes in ["y", "Y", "yes", " YES "] {
+            assert!(optin_answer(yes), "{yes:?}");
+        }
+        for no in ["", "n", "no", "maybe", "yep", "1", "true"] {
+            assert!(!optin_answer(no), "{no:?} opted in; the default is no");
+        }
     }
 }

@@ -4,6 +4,7 @@
 package reconcile
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -45,12 +46,13 @@ func newNodeWorkloads(cfg *config.Config, docker *dockerpkg.Client, sets *models
 			"value", cfg.AddonWorkloadsPolicyAsked)
 	}
 	approvals := nodepolicy.NewApprovals(cfg.StateDir)
+	ctl := newControllerApprovals(cfg)
 	var nvidia func(context.Context) (bool, error)
 	if docker != nil {
 		nvidia = docker.NvidiaRuntimeKnown
 	}
 	facts := &nodepolicy.Facts{
-		Mode: mode, Approvals: approvals, ControllerHost: cfg.SelfNode,
+		Mode: mode, Approvals: approvals, Controller: ctl, ControllerHost: cfg.SelfNode,
 		ComputeCaps:    (&hardware.GPUDetector{}).DetectComputeCaps,
 		NvidiaRuntime:  nvidia,
 		DataRootFreeGB: nodepolicy.DataRootFreeGB,
@@ -59,24 +61,60 @@ func newNodeWorkloads(cfg *config.Config, docker *dockerpkg.Client, sets *models
 		return nil, facts
 	}
 	nw := dockerpkg.NewNodeWorkloads(docker, sets)
-	nw.SetAdmit(newGate(cfg, mode, approvals, nvidia, facts, sets).Check)
+	nw.SetAdmit(newGate(cfg, mode, approvals, ctl, nvidia, facts, sets).Check)
 	return nw, facts
 }
 
-// newGate is the node's gate as the agent wires it: the consent mode and
-// approvals, whether this node is the controller's host and has opted in to
+// newControllerApprovals is the controller's signed approval set (i596) as
+// the agent keeps it: in its state directory, bound to its node id (the id
+// desired-config is fetched for), verified with the fleet signing key.
+func newControllerApprovals(cfg *config.Config) *nodepolicy.ControllerApprovals {
+	return nodepolicy.NewControllerApprovals(cfg.StateDir, cfg.NodeID, modelsets.SigningPubPath(cfg))
+}
+
+// newGate is the node's gate as the agent wires it: the consent mode, the
+// owner's approvals and the controller's signed set, whether this node is the controller's host and has opted in to
 // workloads there, and the three probes. Split out so a test can pin each
 // wire; a gate missing one would silently skip that refusal.
-func newGate(cfg *config.Config, mode nodepolicy.Mode, approvals *nodepolicy.Approvals,
+func newGate(cfg *config.Config, mode nodepolicy.Mode, approvals *nodepolicy.Approvals, ctl *nodepolicy.ControllerApprovals,
 	nvidia func(context.Context) (bool, error), facts *nodepolicy.Facts, sets *modelsets.Store) *nodepolicy.Gate {
 	return &nodepolicy.Gate{
-		Mode: mode, Approvals: approvals,
+		Mode: mode, Approvals: approvals, Controller: ctl,
 		ControllerHost: cfg.SelfNode, OnController: cfg.AddonWorkloadsOnController,
 		NvidiaRuntime: nvidia,
 		ComputeCap:    facts.MinComputeCap,
 		MainSet: func(id, revision string) (nodewl.ModelSet, error) {
 			return sets.VerifiedManifest(modelsets.Ref{ID: id, Revision: revision})
 		},
+	}
+}
+
+// offerWorkloadApprovals hands desired-config's `workload_approvals` (the
+// controller's signed set, i596) to the agent's verifier before any node
+// workload is judged. Absent or null changes nothing: the held set stays,
+// and a revoke is only ever a newer generation. A set that is refused is
+// logged and changes nothing either; the pass goes on.
+func (r *Reconciler) offerWorkloadApprovals(_ context.Context, t *tick) bool {
+	r.acceptWorkloadApprovals(t.desired.WorkloadApprovals)
+	return true
+}
+
+func (r *Reconciler) acceptWorkloadApprovals(raw json.RawMessage) {
+	if r.ctlApprovals == nil || len(raw) == 0 || string(bytes.TrimSpace(raw)) == "null" {
+		return
+	}
+	doc, sig, err := nodepolicy.DecodeDelivery(raw)
+	if err != nil {
+		slog.Warn("reconcile.workload_approvals_refused; keeping the held set", "error", err)
+		return
+	}
+	gen, changed, err := r.ctlApprovals.Offer(doc, sig)
+	if err != nil {
+		slog.Warn("reconcile.workload_approvals_refused; keeping the held set", "error", err)
+		return
+	}
+	if changed {
+		slog.Info("reconcile.workload_approvals_accepted", "generation", gen)
 	}
 }
 

@@ -1245,6 +1245,20 @@ pub(crate) struct BootstrapTokenArgs {
     cidr: Option<String>,
     node: Option<String>,
     with_ts: bool,
+    /// i596: put `--controller-approvals` on the enroll line, so the node's
+    /// owner opts in during that one setup run. The flag rides the paste the
+    /// operator hands over, never the blob or the gateway.
+    controller_approvals: bool,
+}
+
+/// The enroll line with `--controller-approvals` when the operator asked for
+/// it: the node's own `noo enroll` then writes the opt-in as root.
+pub(crate) fn enroll_line(enroll: &str, controller_approvals: bool) -> String {
+    if controller_approvals {
+        format!("{enroll} --controller-approvals")
+    } else {
+        enroll.to_string()
+    }
 }
 
 pub(crate) fn parse_bootstrap_token_create_with(a: &mut Args) -> Result<BootstrapTokenArgs, ArgError> {
@@ -1262,12 +1276,13 @@ pub(crate) fn parse_bootstrap_token_create_with(a: &mut Args) -> Result<Bootstra
     // skips it; --with-tailscale is kept for compat.
     let _ = a.flag(&["--with-tailscale"]);
     let with_ts = !a.flag(&["--no-tailscale"]);
+    let controller_approvals = a.flag(&["--controller-approvals"]);
     a.finish()?;
-    Ok(BootstrapTokenArgs { ttl_seconds, role, cidr, node, with_ts })
+    Ok(BootstrapTokenArgs { ttl_seconds, role, cidr, node, with_ts, controller_approvals })
 }
 
 pub fn cluster_bootstrap_token_create(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let BootstrapTokenArgs { ttl_seconds, role, cidr, node, mut with_ts } =
+    let BootstrapTokenArgs { ttl_seconds, role, cidr, node, mut with_ts, controller_approvals } =
         parse_bootstrap_token_create_with(&mut Args::new(args))?;
 
     let mut body = json!({});
@@ -1301,7 +1316,7 @@ pub fn cluster_bootstrap_token_create(g: &Globals, args: &[String]) -> Result<i3
     // field and returns neither command — the local composition below
     // stays for it.
     body["with_tailscale"] = json!(with_ts);
-    let resp = match post_json_try(g, "/api/security/bootstrap-tokens", &body, true, 15) {
+    let mut resp = match post_json_try(g, "/api/security/bootstrap-tokens", &body, true, 15) {
         Ok(v) => v,
         // The gateway refuses the WHOLE mint when the tailnet key fails (no
         // token is minted), so the graceful degrade the local mint had is
@@ -1319,6 +1334,12 @@ pub fn cluster_bootstrap_token_create(g: &Globals, args: &[String]) -> Result<i3
         }
         Err(e) => fail(g.json, ExitCode::Generic, "mint_failed", &e, None),
     };
+    // i596: the operator chose, for this node, to have its owner opt in to
+    // controller approvals during enrollment. It is a flag on the line the
+    // operator pastes on the node, added here, not by the gateway.
+    if let Some(e) = resp["enroll_command"].as_str().map(|e| enroll_line(e, controller_approvals)) {
+        resp["enroll_command"] = json!(e);
+    }
     if g.json {
         println!("{resp}");
         return Ok(0);
@@ -1466,7 +1487,7 @@ pub fn cluster_bootstrap_token_create(g: &Globals, args: &[String]) -> Result<i3
                 );
                 print_enroll_paste(&EnrollPaste {
                     install: &install,
-                    enroll: &format!("noo enroll noo1.{encoded}"),
+                    enroll: &enroll_line(&format!("noo enroll noo1.{encoded}"), controller_approvals),
                     noo_url: &noo_url,
                     self_node,
                     joins_tailnet: true,
@@ -1497,6 +1518,11 @@ pub fn cluster_bootstrap_token_create(g: &Globals, args: &[String]) -> Result<i3
     say(&ui::emph("Run this on the new host:"));
     ui::value(one_liner);
     say("");
+    if controller_approvals {
+        // An older gateway's one-liner is a script, not a `noo enroll` line
+        // this CLI can extend.
+        say(&ui::note("this controller's paste is not a noo enroll line: add --controller-approvals to the node's enroll command yourself"));
+    }
     say(&ui::note("the raw token is shown once; the CLI does not store it"));
     ui::guide(&[
         (&format!("noo cluster bootstrap-token revoke {id}"), "if the paste leaks or the host never enrolls"),
@@ -1661,6 +1687,20 @@ mod bootstrap_token_tests {
         for bad in ["", "h", "1w", "one hour", "1.5h", "--", "1hh"] {
             assert_eq!(parse_ttl_seconds(bad), None, "ttl {bad:?}");
         }
+    }
+
+    /// i596: the operator's choice reaches the enroll line, and only then.
+    #[test]
+    fn the_enroll_line_carries_controller_approvals_only_when_asked() {
+        use super::{enroll_line, parse_bootstrap_token_create_with};
+        use crate::args::Args;
+        let words = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let asked = parse_bootstrap_token_create_with(&mut Args::new(&words(&["--node", "gpu-2", "--controller-approvals"]))).unwrap();
+        assert!(asked.controller_approvals);
+        let plain = parse_bootstrap_token_create_with(&mut Args::new(&words(&["--node", "gpu-2"]))).unwrap();
+        assert!(!plain.controller_approvals);
+        assert_eq!(enroll_line("noo enroll noo1.abc", true), "noo enroll noo1.abc --controller-approvals");
+        assert_eq!(enroll_line("noo enroll noo1.abc", false), "noo enroll noo1.abc");
     }
 }
 

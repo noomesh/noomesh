@@ -482,6 +482,454 @@ pub fn node_workloads_list(g: &Globals, args: &[String]) -> Result<i32, Unhandle
     Ok(0)
 }
 
+// ── The owner's opt-in to controller approvals (i596) ─────────────────────
+//
+// The controller can approve an add-on's node workload with an approval set
+// signed by the fleet signing key (nodepolicy/controller.go). A node takes it
+// only when its root owner opted in with this file in the agent's state
+// directory (nodepolicy/optin.go OptInFile). The agent reads it and never
+// writes it; this module is its one writer (`controller allow|deny`, and
+// `noo enroll --controller-approvals`, which runs `controller allow` as root).
+// Provision, bundles and noo-apply.sh never carry it: a bundle is signed by
+// the same key that signs approvals, so an opt-in a bundle could set would be
+// no opt-in. tests/test_node_workload_consent_has_one_writer.py holds that.
+
+/// The opt-in's file name (nodepolicy/optin.go OptInFile).
+pub(crate) const OPTIN_FILE: &str = "controller-approvals-optin";
+/// The agent's held controller set (nodepolicy/controller.go
+/// ControllerApprovalsFile). Read here for `status`, never written.
+const CONTROLLER_SET_FILE: &str = "controller-workload-approvals.json";
+/// The opt-in's content: for a person who finds it.
+const OPTIN_TEXT: &str = "This node's owner lets the controller approve add-on node workloads with sets signed by the fleet key (noomesh i596).\nRemove with: sudo \"$(command -v noo)\" node workloads controller deny\n";
+/// The commands to run as root, spelled so they work when root's PATH lacks
+/// the directory noo is in.
+pub(crate) const ALLOW_AS_ROOT: &str ="sudo \"$(command -v noo)\" node workloads controller allow";
+const DENY_AS_ROOT: &str = "sudo \"$(command -v noo)\" node workloads controller deny";
+/// The words of `noo node workloads controller allow`: what `noo enroll
+/// --controller-approvals` runs as root, so enroll and the owner's verb are
+/// the same writer.
+pub(crate) const CONTROLLER_ALLOW_WORDS: [&str; 4] = ["node", "workloads", "controller", "allow"];
+
+/// The argv `noo enroll --controller-approvals` runs: this `noo`, by its full
+/// path, under sudo, with [`CONTROLLER_ALLOW_WORDS`].
+pub(crate) fn controller_allow_argv(exe: &str) -> Vec<String> {
+    let mut v = vec!["sudo".to_string(), exe.to_string()];
+    v.extend(CONTROLLER_ALLOW_WORDS.iter().map(|w| w.to_string()));
+    v
+}
+
+/// The opt-in as the agent judges it: present, and whether it counts.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OptIn {
+    Absent,
+    /// A regular file owned by root and writable by no one else.
+    Yes,
+    /// There, but the agent ignores it, and why.
+    Ignored(String),
+}
+
+/// What `status` shows of the agent's held set, as stored. The CLI does not
+/// verify signatures: the agent does, on every read.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HeldSet {
+    None,
+    Stored { generation: i64, approvals: usize },
+    Unreadable(String),
+}
+
+impl StateDir {
+    /// `name` in this directory, opened O_NOFOLLOW for reading. None when it
+    /// is not there; a symlink is ELOOP.
+    fn open_in(&self, name: &str) -> std::io::Result<Option<std::fs::File>> {
+        let c = cstr(name);
+        // SAFETY: a valid dirfd and NUL-terminated name; the result is checked.
+        let fd = unsafe {
+            libc::openat(self.fd.as_raw_fd(), c.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        };
+        if fd < 0 {
+            let e = std::io::Error::last_os_error();
+            return if e.raw_os_error() == Some(libc::ENOENT) { Ok(None) } else { Err(e) };
+        }
+        // SAFETY: fd is a freshly opened descriptor this function owns.
+        Ok(Some(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) })))
+    }
+
+    /// The opt-in by the agent's rule, with `root` the owner it must have.
+    pub(crate) fn optin(&self, root: u32) -> Result<OptIn, String> {
+        let f = match self.open_in(OPTIN_FILE) {
+            Ok(None) => return Ok(OptIn::Absent),
+            Ok(Some(f)) => f,
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(OptIn::Ignored("it is a symlink".to_string())),
+            Err(e) => return Err(format!("{}: {e}", self.path.join(OPTIN_FILE).display())),
+        };
+        let md = f.metadata().map_err(|e| format!("{}: {e}", self.path.join(OPTIN_FILE).display()))?;
+        Ok(if !md.file_type().is_file() {
+            OptIn::Ignored("it is not a regular file".to_string())
+        } else if md.uid() != root {
+            OptIn::Ignored(format!("it is owned by uid {}, not root", md.uid()))
+        } else if md.mode() & 0o022 != 0 {
+            OptIn::Ignored(format!("its group or everyone can write it (mode {:o})", md.mode() & 0o777))
+        } else {
+            OptIn::Yes
+        })
+    }
+
+    /// Write the opt-in, owned by `owner` and 0644: a temp file beside it
+    /// (O_EXCL, O_NOFOLLOW), fsynced, renamed over the name on this
+    /// directory's descriptor (a symlink there is replaced, never followed).
+    /// Ok(false) when a good opt-in was already there.
+    pub(crate) fn write_optin(&self, owner: Option<(u32, u32)>) -> Result<bool, String> {
+        let root = owner.map(|(u, _)| u).unwrap_or(0);
+        if self.optin(root)? == OptIn::Yes {
+            return Ok(false);
+        }
+        let dirfd = self.fd.as_raw_fd();
+        let tmp = cstr(&format!(".{OPTIN_FILE}.{}.tmp", std::process::id()));
+        let name = cstr(OPTIN_FILE);
+        // SAFETY: valid dirfd and NUL-terminated name.
+        unsafe { libc::unlinkat(dirfd, tmp.as_ptr(), 0) };
+        // SAFETY: valid dirfd and name; mode is the variadic third argument.
+        let fd = unsafe {
+            libc::openat(
+                dirfd,
+                tmp.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o644 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(os_err(&format!("create a temp opt-in in {}", self.path.display())));
+        }
+        // SAFETY: fd is a freshly opened descriptor this function owns.
+        let mut f = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        let wrote = (|| -> std::io::Result<()> {
+            f.write_all(OPTIN_TEXT.as_bytes())?;
+            f.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+            if let Some((uid, gid)) = owner {
+                std::os::unix::fs::fchown(&f, Some(uid), Some(gid))?;
+            }
+            f.sync_all()
+        })();
+        drop(f);
+        let undo = || {
+            // SAFETY: valid dirfd and NUL-terminated name.
+            unsafe { libc::unlinkat(dirfd, tmp.as_ptr(), 0) };
+        };
+        if let Err(e) = wrote {
+            undo();
+            return Err(format!("write the opt-in in {}: {e}", self.path.display()));
+        }
+        // SAFETY: valid dirfd and NUL-terminated names.
+        if unsafe { libc::renameat(dirfd, tmp.as_ptr(), dirfd, name.as_ptr()) } != 0 {
+            let e = os_err(&format!("put the opt-in at {}", self.path.join(OPTIN_FILE).display()));
+            undo();
+            return Err(e);
+        }
+        // SAFETY: valid dirfd; a failed directory fsync loses no data already renamed.
+        unsafe { libc::fsync(dirfd) };
+        Ok(true)
+    }
+
+    /// Remove the opt-in's name from this directory (a symlink there is
+    /// removed, never followed). Ok(false) when it was not there.
+    pub(crate) fn remove_optin(&self) -> Result<bool, String> {
+        let name = cstr(OPTIN_FILE);
+        // SAFETY: valid dirfd and NUL-terminated name.
+        if unsafe { libc::unlinkat(self.fd.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+            // SAFETY: valid dirfd.
+            unsafe { libc::fsync(self.fd.as_raw_fd()) };
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(false);
+        }
+        Err(format!("remove {}: {e}", self.path.join(OPTIN_FILE).display()))
+    }
+
+    /// The agent's held controller set, as stored: its generation and how
+    /// many approvals it lists. Not verified here; the agent verifies it.
+    pub(crate) fn held_set(&self) -> HeldSet {
+        let f = match self.open_in(CONTROLLER_SET_FILE) {
+            Ok(None) => return HeldSet::None,
+            Ok(Some(f)) => f,
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM)) => {
+                return HeldSet::Unreadable("readable by root and the node agent only (run it with sudo to see it)".to_string())
+            }
+            Err(e) => return HeldSet::Unreadable(e.to_string()),
+        };
+        let mut text = String::new();
+        if let Err(e) = f.take(MAX_STORE_BYTES).read_to_string(&mut text) {
+            return HeldSet::Unreadable(e.to_string());
+        }
+        match parse_held_set(&text) {
+            Ok((generation, approvals)) => HeldSet::Stored { generation, approvals },
+            Err(why) => HeldSet::Unreadable(why),
+        }
+    }
+}
+
+/// The generation and approval count of a held set's text
+/// (`{"doc":"<base64>","sig":"<base64>"}`), without verifying it.
+pub(crate) fn parse_held_set(text: &str) -> Result<(i64, usize), String> {
+    use base64::Engine as _;
+    let v: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
+    let doc = v
+        .get("doc")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|d| base64::engine::general_purpose::STANDARD.decode(d).ok())
+        .ok_or("no base64 doc")?;
+    let doc: serde_json::Value = serde_json::from_slice(&doc).map_err(|e| format!("its doc is not JSON: {e}"))?;
+    let generation = doc.get("generation").and_then(serde_json::Value::as_i64).ok_or("its doc has no generation")?;
+    let approvals = doc.get("approvals").and_then(serde_json::Value::as_array).map_or(0, Vec::len);
+    Ok((generation, approvals))
+}
+
+/// Opt this node in: write the opt-in under `dir` through [`StateDir`].
+/// Ok(false) when it already was.
+pub(crate) fn controller_allow_at(dir: &Path, agent_uid: Option<u32>, owner: Option<(u32, u32)>) -> Result<bool, String> {
+    StateDir::open(dir, agent_uid)?.write_optin(owner)
+}
+
+/// Opt this node out. Ok(false) when it was not opted in.
+pub(crate) fn controller_deny_at(dir: &Path, agent_uid: Option<u32>) -> Result<bool, String> {
+    StateDir::open(dir, agent_uid)?.remove_optin()
+}
+
+fn euid() -> u32 {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() }
+}
+
+/// allow and deny change who may grant consent on this node: root only.
+fn optin_need_root(g: &Globals, what: &str, as_root: &str) {
+    if euid() != 0 {
+        output::fail(
+            g.json,
+            ExitCode::Generic,
+            "needs_root",
+            &format!("{what} changes who may approve add-on workloads on this node, which only root may decide"),
+            Some(&format!("run it on the node as root (root's PATH may not reach noo, so give its full path): {as_root}")),
+        );
+    }
+}
+
+/// `noo node workloads controller allow`
+pub fn node_workloads_controller_allow(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    Args::new(args).finish()?;
+    optin_need_root(g, "`noo node workloads controller allow`", ALLOW_AS_ROOT);
+    let agent = agent_account();
+    let made = controller_allow_at(&state_dir(), agent.map(|(u, _)| u), Some((0, 0))).unwrap_or_else(|why| store_fail(g, &why));
+    if g.json {
+        println!("{}", serde_json::json!({"opted_in": true, "already": !made}));
+        return Ok(0);
+    }
+    if made {
+        ui::done("this node now takes workload approvals the controller signs with the fleet key");
+    } else {
+        ui::done("this node already takes workload approvals from the controller");
+    }
+    println!("{}", ui::muted("NOO_ADDON_WORKLOADS=none still refuses everything; local approvals still count"));
+    println!("{}", ui::muted(&format!("undo: {DENY_AS_ROOT}")));
+    Ok(0)
+}
+
+/// `noo node workloads controller deny`
+pub fn node_workloads_controller_deny(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    Args::new(args).finish()?;
+    optin_need_root(g, "`noo node workloads controller deny`", DENY_AS_ROOT);
+    let agent = agent_account();
+    let removed = controller_deny_at(&state_dir(), agent.map(|(u, _)| u)).unwrap_or_else(|why| store_fail(g, &why));
+    if g.json {
+        println!("{}", serde_json::json!({"opted_in": false, "already": !removed}));
+        return Ok(0);
+    }
+    if removed {
+        ui::done("this node no longer takes workload approvals from the controller; only local approvals count");
+    } else {
+        ui::done("this node was not opted in to controller approvals; nothing changed");
+    }
+    Ok(0)
+}
+
+/// What `status` reads, from `dir`, with `root` the opt-in's required owner.
+pub(crate) fn controller_status_at(dir: &Path, agent_uid: Option<u32>, root: u32) -> Result<(OptIn, HeldSet), String> {
+    let sd = StateDir::open(dir, agent_uid)?;
+    Ok((sd.optin(root)?, sd.held_set()))
+}
+
+/// `noo node workloads controller status`
+pub fn node_workloads_controller_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    Args::new(args).finish()?;
+    let agent = agent_account();
+    let (optin, set) = controller_status_at(&state_dir(), agent.map(|(u, _)| u), 0).unwrap_or_else(|why| store_fail(g, &why));
+    let (policy, _) = policy_words(env_value(&agent_env(), "NOO_ADDON_WORKLOADS").as_deref());
+    if g.json {
+        let mut v = serde_json::json!({"opted_in": optin == OptIn::Yes, "policy": policy, "set_verified_by": "agent"});
+        if let OptIn::Ignored(why) = &optin {
+            v["opt_in_ignored"] = serde_json::json!(why);
+        }
+        match &set {
+            HeldSet::None => v["set"] = serde_json::json!(null),
+            HeldSet::Stored { generation, approvals } => v["set"] = serde_json::json!({"generation": generation, "approvals": approvals}),
+            HeldSet::Unreadable(why) => v["set_unreadable"] = serde_json::json!(why),
+        }
+        println!("{v}");
+        return Ok(0);
+    }
+    let opted = match &optin {
+        OptIn::Yes => "yes".to_string(),
+        OptIn::Absent => format!("no  {}", ui::muted(&format!("opt in: {ALLOW_AS_ROOT}"))),
+        OptIn::Ignored(why) => format!("no  {}", ui::muted(&format!("the opt-in file is there but the agent ignores it: {why}; rewrite it: {ALLOW_AS_ROOT}"))),
+    };
+    let held = match &set {
+        HeldSet::None => "none".to_string(),
+        HeldSet::Stored { generation, approvals } => {
+            format!("generation {generation}, {approvals} approval(s)  {}", ui::muted("as stored, verified by the agent"))
+        }
+        HeldSet::Unreadable(why) => format!("unknown  {}", ui::muted(why)),
+    };
+    println!("{}", ui::header("controller workload approvals", None));
+    println!("{}", ui::kv(&[("opted in", opted), ("policy", policy), ("controller set", held)]).trim_end());
+    Ok(0)
+}
+
+#[cfg(test)]
+mod controller_optin_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("noo-node-optin-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        d
+    }
+
+    fn me() -> (u32, u32) {
+        // SAFETY: no preconditions.
+        unsafe { (libc::geteuid(), libc::getegid()) }
+    }
+
+    #[test]
+    fn allow_writes_a_0644_opt_in_owned_by_root_that_the_agent_counts() {
+        let d = scratch("allow");
+        // As root (the batch) the owner is root, as the real verb makes it;
+        // unprivileged, this user stands in for root.
+        let owner = if me().0 == 0 { (0, 0) } else { me() };
+        assert_eq!(controller_allow_at(&d, Some(me().0), Some(owner)), Ok(true));
+        let md = std::fs::symlink_metadata(d.join(OPTIN_FILE)).unwrap();
+        assert!(md.file_type().is_file());
+        assert_eq!(md.mode() & 0o777, 0o644);
+        assert_eq!((md.uid(), md.gid()), owner);
+        assert_eq!(StateDir::open(&d, None).unwrap().optin(owner.0), Ok(OptIn::Yes));
+        let left: Vec<_> = std::fs::read_dir(&d).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+        assert_eq!(left.len(), 1, "no temp file is left behind: {left:?}");
+        assert_eq!(controller_allow_at(&d, Some(me().0), Some(owner)), Ok(false), "allow twice changes nothing");
+        let _ = std::fs::remove_dir_all(&d);
+        if me().0 == 0 {
+            // The owner is set by descriptor, not left to whoever runs it.
+            let d = scratch("allow-chown");
+            assert_eq!(controller_allow_at(&d, Some(0), Some((65534, 65534))), Ok(true));
+            let md = std::fs::metadata(d.join(OPTIN_FILE)).unwrap();
+            assert_eq!((md.uid(), md.gid()), (65534, 65534));
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn allow_refuses_a_state_directory_that_is_a_symlink() {
+        let real = scratch("allow-link-real");
+        let base = scratch("allow-link");
+        let link = base.join("state");
+        symlink(&real, &link).unwrap();
+        let err = controller_allow_at(&link, Some(me().0), Some(me())).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(!real.join(OPTIN_FILE).exists(), "nothing is written through the link");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&real);
+    }
+
+    #[test]
+    fn allow_replaces_an_opt_in_the_agent_would_ignore_and_never_follows_a_link() {
+        let d = scratch("allow-fix");
+        let elsewhere = scratch("allow-fix-target");
+        let victim = elsewhere.join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        symlink(&victim, d.join(OPTIN_FILE)).unwrap();
+        assert!(matches!(StateDir::open(&d, None).unwrap().optin(me().0), Ok(OptIn::Ignored(_))));
+        assert_eq!(controller_allow_at(&d, Some(me().0), Some(me())), Ok(true));
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep", "the link's target was written");
+        assert!(std::fs::symlink_metadata(d.join(OPTIN_FILE)).unwrap().file_type().is_file());
+        std::fs::set_permissions(d.join(OPTIN_FILE), std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(matches!(StateDir::open(&d, None).unwrap().optin(me().0), Ok(OptIn::Ignored(_))));
+        assert_eq!(controller_allow_at(&d, Some(me().0), Some(me())), Ok(true));
+        assert_eq!(std::fs::metadata(d.join(OPTIN_FILE)).unwrap().mode() & 0o777, 0o644);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn deny_removes_the_opt_in_and_says_when_there_was_none() {
+        let d = scratch("deny");
+        controller_allow_at(&d, Some(me().0), Some(me())).unwrap();
+        assert_eq!(controller_deny_at(&d, Some(me().0)), Ok(true));
+        assert!(std::fs::symlink_metadata(d.join(OPTIN_FILE)).is_err());
+        assert_eq!(controller_deny_at(&d, Some(me().0)), Ok(false), "deny twice is fine and says so");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn deny_removes_a_symlinked_opt_in_and_leaves_its_target() {
+        let d = scratch("deny-link");
+        let elsewhere = scratch("deny-link-target");
+        let victim = elsewhere.join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        symlink(&victim, d.join(OPTIN_FILE)).unwrap();
+        assert_eq!(controller_deny_at(&d, Some(me().0)), Ok(true));
+        assert!(victim.exists(), "the link's target was removed");
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn status_reads_the_opt_in_and_the_held_set_as_stored() {
+        use base64::Engine as _;
+        let d = scratch("status");
+        assert_eq!(controller_status_at(&d, Some(me().0), me().0), Ok((OptIn::Absent, HeldSet::None)));
+        controller_allow_at(&d, Some(me().0), Some(me())).unwrap();
+        let doc = br#"{"kind":"noomesh.node-workload-approvals/v1","node":"n1","generation":7,"issued_at":"2026-11-08T12:00:00Z","approvals":[]}"#;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(doc);
+        std::fs::write(d.join(CONTROLLER_SET_FILE), format!(r#"["doc","{b64}"]"#)).unwrap();
+        assert!(matches!(controller_status_at(&d, Some(me().0), me().0), Ok((OptIn::Yes, HeldSet::Unreadable(_)))));
+        let held = serde_json::json!({"doc": b64, "sig": "c2ln"}).to_string();
+        std::fs::write(d.join(CONTROLLER_SET_FILE), held).unwrap();
+        assert_eq!(
+            controller_status_at(&d, Some(me().0), me().0),
+            Ok((OptIn::Yes, HeldSet::Stored { generation: 7, approvals: 0 }))
+        );
+        // The required owner is root: an opt-in someone else owns is ignored.
+        assert!(matches!(controller_status_at(&d, Some(me().0), me().0 + 1), Ok((OptIn::Ignored(_), _))));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn enroll_opts_in_through_this_same_writer() {
+        let argv = controller_allow_argv("/home/alex/.local/bin/noo");
+        assert_eq!(argv[..2], ["sudo".to_string(), "/home/alex/.local/bin/noo".to_string()]);
+        assert_eq!(argv[2..], CONTROLLER_ALLOW_WORDS.map(str::to_string));
+        let (_, handler) = crate::NATIVE
+            .iter()
+            .find(|(words, _)| *words == CONTROLLER_ALLOW_WORDS.as_slice())
+            .expect("the words enroll runs are a registered command");
+        assert!(
+            std::ptr::fn_addr_eq(*handler, node_workloads_controller_allow as crate::Handler),
+            "the words enroll runs reach another handler"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

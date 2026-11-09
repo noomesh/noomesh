@@ -116,6 +116,10 @@ type desiredConfig struct {
 	// the fragment itself (convergeModelSets). Absent on a gateway that
 	// predates it, which is not the same as an empty list.
 	NodeWorkloads json.RawMessage `json:"node_workloads"`
+	// The controller's signed workload approval set for this node (i596):
+	// {doc, sig}, opaque to the gateway, verified here. Absent on a gateway
+	// that predates it; absent or null keeps the set this node holds.
+	WorkloadApprovals json.RawMessage `json:"workload_approvals"`
 }
 
 // Reconciler pulls desired config and converges the node toward it.
@@ -143,6 +147,9 @@ type Reconciler struct {
 	nwMu   sync.Mutex
 	nwBusy map[string]bool
 	nwWG   sync.WaitGroup
+	// ctlApprovals keeps the controller's signed approval set (i596); nil in
+	// tests that build a Reconciler by hand, and the offer is then skipped.
+	ctlApprovals *nodepolicy.ControllerApprovals
 	// native probes backends served outside Docker on this host. nil off
 	// darwin, where there is no native lane at all — nil rather than an
 	// inert value so "no lane here" stays distinct from "lane found nothing".
@@ -257,6 +264,7 @@ func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harn
 		sets:            sets,
 		nodeWL:          nw,
 		facts:           facts,
+		ctlApprovals:    facts.Controller,
 		native:          backendrt.NewAdopted(),
 		harness:         harness,
 		runnerInstalled: runnerOnDisk,
@@ -352,7 +360,8 @@ type phase struct {
 	run  func(r *Reconciler, ctx context.Context, t *tick) bool
 }
 
-// reconcilePhases is the order of a pass: fetch desired state; publish what
+// reconcilePhases is the order of a pass: fetch desired state; offer the
+// controller's signed workload approvals to the verifier; publish what
 // the node advertises from it; stop early when nothing is desired; MCP
 // servers (before backends — a discovery report is small, a pull is not);
 // the models dir; what is running here; multi-role merge; the shared-GPU
@@ -360,6 +369,7 @@ type phase struct {
 // engine its door's restart left stranded; then reap what was removed.
 var reconcilePhases = []phase{
 	{"fetchDesired", (*Reconciler).fetchDesired},
+	{"offerWorkloadApprovals", (*Reconciler).offerWorkloadApprovals},
 	{"publishProfileAndEmbedTarget", (*Reconciler).publishProfileAndEmbedTarget},
 	{"convergeModelSets", (*Reconciler).convergeModelSets},
 	{"convergeNodeWorkloads", (*Reconciler).convergeNodeWorkloads},
