@@ -850,7 +850,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo cluster teardown-node` | `<node> \| --all [--purge-data] [--purge-tailscale] [--factory] [-y\|--yes]` | Dismantle one node or --all via a signed teardown bundle, verify silence, then forget |
 | `noo cluster provision` | `<node> [<tier>] [--harness auto\|manual\|off] [--wait [<secs>]] [--stage-only] [--move-data]` | Stage a node's signed bundle; --wait blocks until enrolled, --stage-only skips the apply |
 | `noo cluster sync-model-files` | `[<node>...] [-m\|--model <file>]... [--dry-run]` | Dispatch a job per node to pull GGUF weights from the controller store and verify them |
-| `noo cluster bootstrap-token create` | `[--ttl <1h\|30m\|24h\|secs>] [--role <role>] [--cidr <cidr>] [--node <name>] [--with-tailscale\|--no-tailscale]` | Mint a single-use enrollment token and print the node enrollment one-liner |
+| `noo cluster bootstrap-token create` | `[--ttl <1h\|30m\|24h\|secs>] [--role <role>] [--cidr <cidr>] [--node <name>] [--with-tailscale\|--no-tailscale] [--controller-approvals]` | Mint a single-use enrollment token and print the node enrollment one-liner |
 | `noo cluster bootstrap-token list` | — | List bootstrap tokens with status, creator, expiry and redeeming IP |
 | `noo cluster bootstrap-token revoke` | `<id>` | Revoke a bootstrap token by id (idempotent) |
 | `noo cluster bootstrap-token` | — | Print bootstrap-token subcommand usage (create, list, revoke) |

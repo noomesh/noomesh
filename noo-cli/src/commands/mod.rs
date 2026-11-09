@@ -154,6 +154,7 @@ pub mod node_workloads;
 pub mod data_root;
 pub use node_fetch::node_fetch;
 pub use node_workloads::{node_workloads_approve, node_workloads_list, node_workloads_revoke};
+pub use node_workloads::{node_workloads_controller_allow, node_workloads_controller_deny, node_workloads_controller_status};
 pub use config::{config_export_effective, config_get, config_launch_check, config_launch_render, config_set, config_show};
 pub use graph::{graph_clusters_audit, graph_detail, graph_entity_cleanup, graph_prune_restore, graph_navigate, graph_neighbors, graph_recluster, graph_search, graph_stats};
 pub mod ops;

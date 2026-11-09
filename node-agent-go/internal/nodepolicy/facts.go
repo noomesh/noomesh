@@ -37,8 +37,12 @@ func MinComputeCap(caps []string) (string, error) {
 // Facts reports what this node is, for the heartbeat. A fact whose probe fails
 // is OMITTED, never defaulted: an error must not become a fact.
 type Facts struct {
-	Mode           Mode
-	Approvals      *Approvals
+	Mode      Mode
+	Approvals *Approvals
+	// Controller is the controller's signed approval set (i596): reported
+	// as addon_workloads_controller, and, on a node whose owner opted in,
+	// its entries join addon_workloads_approvals with source "controller".
+	Controller     *ControllerApprovals
 	ControllerHost bool
 	// ComputeCaps lists each GPU's compute capability. NvidiaRuntime says
 	// whether the nvidia runtime is registered. DataRootFreeGB is the free
@@ -86,8 +90,11 @@ func (f *Facts) Report(ctx context.Context) map[string]any {
 		if list, err := f.Approvals.List(); err != nil {
 			slog.Warn("heartbeat omits addon_workloads_approvals: unreadable", "error", err)
 		} else {
-			out["addon_workloads_approvals"] = list
+			out["addon_workloads_approvals"] = f.withController(list)
 		}
+	}
+	if f.Controller != nil {
+		out["addon_workloads_controller"] = f.Controller.Status()
 	}
 	if v, err := f.MinComputeCap(); err != nil {
 		slog.Debug("heartbeat omits gpu_compute_cap", "error", err)
@@ -107,6 +114,59 @@ func (f *Facts) Report(ctx context.Context) map[string]any {
 		} else {
 			out["data_root_free_gb"] = math.Round(gb*10) / 10
 		}
+	}
+	return out
+}
+
+// maxReportedApprovals is the gateway's cap on addon_workloads_approvals: a
+// longer list is dropped whole, as unknown.
+const maxReportedApprovals = 256
+
+// reportedApproval is a row of addon_workloads_approvals that the controller's
+// set admitted; the owner's own rows carry no source.
+type reportedApproval struct {
+	Addon  string `json:"addon"`
+	Digest string `json:"digest"`
+	Source string `json:"source"`
+}
+
+// withController is the owner's approvals, then (on a node whose owner opted
+// in) each controller-approved add-on and digest the owner did not approve
+// too, marked source "controller", up to the gateway's cap. A controller set
+// that does not verify adds nothing. Without controller rows the list is
+// returned as it is.
+func (f *Facts) withController(local []Approval) any {
+	if f.Controller == nil {
+		return local
+	}
+	ctl, _, err := f.Controller.List()
+	if err != nil {
+		slog.Warn("heartbeat: addon_workloads_approvals carries no controller rows; the set does not verify", "error", err)
+		return local
+	}
+	have := map[Approval]bool{}
+	for _, x := range local {
+		have[x] = true
+	}
+	var extra []reportedApproval
+	for _, x := range ctl {
+		if !have[x] {
+			extra = append(extra, reportedApproval{Addon: x.Addon, Digest: x.Digest, Source: "controller"})
+		}
+	}
+	if len(extra) == 0 {
+		return local
+	}
+	out := make([]any, 0, len(local)+len(extra))
+	for _, x := range local {
+		out = append(out, x)
+	}
+	for _, x := range extra {
+		if len(out) >= maxReportedApprovals {
+			slog.Warn("heartbeat: addon_workloads_approvals is at the gateway's cap; some controller rows are not reported", "cap", maxReportedApprovals)
+			break
+		}
+		out = append(out, x)
 	}
 	return out
 }

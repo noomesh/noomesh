@@ -186,6 +186,13 @@ func New(modelsDir string, cfg *config.Config) *Store {
 // of the cluster CA the agent is configured with (/etc/noo/pki on Linux,
 // ~/noomesh/pki on macOS), else NOO_PKI_DIR. "" when neither is known.
 func signingPubPath(cfg *config.Config) string {
+	return SigningPubPath(cfg)
+}
+
+// SigningPubPath is where this node's fleet signing public key is, for every
+// document the fleet key signs (model sets, and the controller's workload
+// approval sets).
+func SigningPubPath(cfg *config.Config) string {
 	if cfg != nil && cfg.TLSCA != "" {
 		return filepath.Join(filepath.Dir(cfg.TLSCA), "signing.pub")
 	}

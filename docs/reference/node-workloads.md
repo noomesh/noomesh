@@ -548,7 +548,8 @@ become a fact (the i495 rule). A `null` is never sent.
 | `controller_host` | bool | this node is the controller's host: the agent's `NOO_SELF_NODE` marker. A workload is refused (`controller_host`) unless `NOO_ADDON_WORKLOADS_ON_CONTROLLER=1` (default off) |
 | `data_root_free_gb` | number | omitted when unknown |
 | `addon_workloads_policy` | `"none"` / `"approve"` / `"auto"` | the node's consent setting |
-| `addon_workloads_approvals` | `[{addon, digest}]` | per add-on and image digest |
+| `addon_workloads_approvals` | `[{addon, digest, source?}]` | per add-on and image digest. The owner's own approvals carry no `source`; on a node whose owner opted in to controller approvals, each pair only the controller's signed set approves follows them with `"source": "controller"` (at most 256 rows in all) |
+| `addon_workloads_controller` | `{opted_in, set_state, generation?, set_sha256?}` | controller approvals ([below](#approving-from-the-controller-opt-in)): whether the owner opted in, and the set the agent holds: `set_state` is `none`, `verified` or `unverifiable`; `generation` and `set_sha256` (the SHA-256 of the signed document's bytes) ride `verified`. Always reported. The gateway stores it from the release that delivers the sets (i596 slice 2); until then it drops it |
 | `model_sets` | `[{id, revision, state, reason?}]` | `state` is `verified`, `fetching` or `refused`; `reason` rides `refused` |
 | `node_workloads` | `[{addon, name, state, ready, model?, door_port, reservation?, reason?}]` | `state` is a desired state or a reported one (`draining`, `needs_attention`). `model`, `reservation` and `reason` are omitted when unknown or none. There is no `slots` in phase 2 (placement sizes it from `accel.slots_env`) |
 
@@ -619,6 +620,75 @@ The placement facts (`consent_none`, `consent_unapproved`, `nvidia_runtime_missi
 
 `image_missing` also covers a malformed digest, id or artifact at parse time. A refusal of the
 decl inside an entry is reported as `decl_invalid` and carries the inner code.
+
+### Approving from the controller (opt-in)
+
+A node's owner can let the controller approve add-on workloads on that node,
+so approving needs no sudo on each device. It is off unless the owner turns
+it on, on the node, as root:
+
+- at enroll, once: `noo enroll … --controller-approvals` (the operator can
+  put the flag on the enroll line with
+  `noo cluster bootstrap-token create --node <name> --controller-approvals`).
+  An interactive enroll without the flag asks, defaulting to no; a run nobody
+  can answer is never opted in. On macOS the flag does nothing (node
+  workloads need Linux);
+- later: `sudo "$(command -v noo)" node workloads controller allow`, undone
+  with `sudo "$(command -v noo)" node workloads controller deny`.
+  `noo node workloads controller status` shows the opt-in, the policy and the
+  set the agent holds (as stored; the agent is what verifies it).
+
+The opt-in is the file `controller-approvals-optin` in the agent state
+directory: root:root, 0644. The agent reads it and never writes it, and it
+counts only as a regular file (never a symlink) owned by root that no group or
+other can write. Provision, bundles and `noo-apply.sh` never carry it, and a
+roll does not touch it.
+
+The controller sends each node one approval set, signed with the fleet signing
+key (`signing.pub`, ECDSA P-384 over SHA-256 of the exact bytes, as for a model
+set), in desired-config as `workload_approvals: {doc, sig}` (base64):
+
+```
+{"kind":"noomesh.node-workload-approvals/v1","node":"<node id>","generation":N,
+ "issued_at":"<rfc3339>","approvals":[{"addon":"…","digest":"sha256:<64 hex>"}]}
+```
+
+The agent verifies the signature over the exact bytes before it parses
+anything, then requires one strict JSON document (no unknown field, nothing
+after it), that `kind`, its own node id (exactly), `generation` 1 or more, an
+RFC 3339 `issued_at`, and entries that are each one add-on and one exact digest
+(the local store's rules), none twice. It keeps the newest set it accepted in
+`controller-workload-approvals.json` (0600, written atomically) and verifies it
+again on every read: a held file that no longer verifies is an error and
+admits nothing. A lower generation is refused (no rollback), the same
+generation with other bytes is refused, and a revoke is a newer generation
+without the entry. A set that is absent, `null` or refused leaves the held one
+as it was.
+
+The consent check, in order:
+
+1. policy `none` refuses (`consent_none`), whatever any set approves;
+2. policy `auto` runs;
+3. policy `approve` runs what the owner's local store approves, or else, on an
+   opted-in node, what the held controller set approves for exactly that
+   add-on and digest. Otherwise `consent_unapproved`. A local store that
+   cannot be read refuses; a controller set that cannot be verified refuses
+   only what the local store did not approve. The agent log names the source
+   that admitted each one: `local`, or `controller gen N`.
+
+Threat model:
+
+- **A compromised gateway cannot approve.** It never holds the fleet signing
+  key. It can withhold a new set (the node keeps the last one it verified, and
+  reports its generation) but cannot replay an older one.
+- **The fleet signing key's holder can approve on opted-in nodes.** That key
+  already signs the bundles and the agent binary every node installs, so it
+  could replace those nodes' agents anyway: the opt-in is not a boundary
+  against it.
+- **The opt-in is the owner's choice.** A node enrolled by someone else stays
+  local-only, and no fleet-wide approval reaches a node whose owner did not
+  agree.
+- **`none` wins**, and `controller deny` takes effect on the next check.
 
 ## Refusal codes
 
