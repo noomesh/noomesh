@@ -377,10 +377,89 @@ pub fn addon_leaf_kind_ok(kind: &str) -> bool {
     name.len() <= ADDON_DOOR_NAME_MAX && dns_label_ok(name)
 }
 
-/// The node workload doors of the enabled add-ons: `(addon, workload)`.
-// SEAM(F2): personifai-df's decls.rs node-workloads parser replaces this body
-pub fn node_workload_doors(_root: &Path) -> Vec<(String, String)> {
-    Vec::new()
+/// The add-on node workload doors an install issues leaves for, and why each
+/// enabled add-on that contributes none was left out.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WorkloadDoors {
+    /// `(addon, workload)`, one per node workload of an enabled add-on whose
+    /// pinned bundle verifies.
+    pub doors: Vec<(String, String)>,
+    /// `(addon, why)` for an enabled add-on whose doors are withheld.
+    pub refused: Vec<(String, String)>,
+}
+
+/// The node workload doors of the enabled add-ons in `root`. The stack tag
+/// is the install's (`NOO_IMAGE_TAG`), and each add-on's lock verifies
+/// against its installed trust anchor (entitlement, or `noo addons
+/// trust-key`): the same check the launcher runs.
+///
+/// Every node gets every door's leaf (subject to the applier floor), not only
+/// the nodes a workload is placed on. A placement is a gateway row that is set
+/// and moved after provisioning, so a leaf issued only to the placed node
+/// would need a re-provision on every move. A leaf serves only the
+/// `noo-stunnel-addon-<a>-<w>` door ON its own node, which admits only that
+/// node's agent, so an unused leaf on another node opens nothing.
+pub fn node_workload_doors(root: &Path) -> WorkloadDoors {
+    let Some(tag) = crate::addons::current_tag(root) else {
+        return WorkloadDoors::default();
+    };
+    node_workload_doors_with(root, &tag, &|a| crate::addons::resolve::installed_anchor(a))
+}
+
+/// [`node_workload_doors`] against `tag` and `anchor`. An add-on counts only
+/// when:
+/// 1. it is enabled (`addons::licensed_on`);
+/// 2. its pin passes the launcher's offline check: the cached lock verifies,
+///    lists `tag` and matches the pin, and every bundle file it lists still
+///    hashes to it;
+/// 3. that verified lock lists `node-workloads.json` (an unsigned copy beside
+///    the bundle is never read);
+/// 4. the file validates against the pinned lock's images.
+///
+/// A failure of (2) or (4) is reported in `refused`, never skipped silently.
+pub(crate) fn node_workload_doors_with(
+    root: &Path,
+    tag: &str,
+    anchor: &dyn Fn(&str) -> Result<crate::addon_lock::TrustAnchor, crate::addons::resolve::Refusal>,
+) -> WorkloadDoors {
+    use crate::addons::{decls, node_workloads, pins, resolve};
+    let mut out = WorkloadDoors::default();
+    let enabled = match crate::addons::licensed_on(root) {
+        Ok(v) => v,
+        Err(e) => {
+            out.refused.push(("*".to_string(), e));
+            return out;
+        }
+    };
+    let nw = node_workloads::NODE_WORKLOADS_FILE.to_string();
+    let routes = decls::ROUTES_FILE.to_string();
+    for addon in enabled {
+        let checked =
+            anchor(addon).map_err(|e| e.why(addon)).and_then(|a| resolve::offline_check_files(root, addon, tag, &a));
+        let (pin, listed) = match checked {
+            Ok(v) => v,
+            Err(why) => {
+                out.refused.push((addon.to_string(), why));
+                continue;
+            }
+        };
+        if !listed.contains(&nw) {
+            continue;
+        }
+        let wanted: Vec<&String> = [&nw, &routes].into_iter().filter(|n| listed.contains(*n)).collect();
+        let files = pins::materialised_files(root, addon, wanted);
+        match decls::check_node_workloads(addon, &files, &pin.images) {
+            Ok(w) => out.doors.extend(node_workloads::node_workload_doors(addon, &w)),
+            Err(why) => out.refused.push((addon.to_string(), why)),
+        }
+    }
+    out
+}
+
+/// The line `cluster provision` prints for an enabled add-on whose door
+/// leaves are withheld.
+pub fn addon_doors_refused_note(addon: &str, why: &str) -> String {
+    format!("no add-on door leaves for {addon}: {why}")
 }
 
 /// Leaf service name for an add-on workload door.
@@ -716,9 +795,113 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ca.dir);
     }
 
+    // ── which add-ons' node workloads get door leaves ────────────────────
+
+    const NW: &[u8] = include_bytes!("../../../tests/fixtures/addons/rhaddon/node-workloads.json");
+    const RT: &[u8] = include_bytes!("../../../tests/fixtures/addons/rhaddon/routes.json");
+
+    /// An install root with `example-addon` pinned for v0.6.0 from a signed
+    /// bundle carrying `extra`, declared `on` in noomesh.yaml and given a
+    /// trusted key (a third-party add-on). With `worker` the lock carries the
+    /// `addon-worker` image the fixture names, so a listed node-workloads.json
+    /// validates; without it the file fails `image_not_in_lock`.
+    fn example_root(tag: &str, on: bool, worker: bool, extra: &[(&str, &[u8])]) -> std::path::PathBuf {
+        use crate::addons::resolve::{self, tests::{anchor, digest, lock, signed_example_bundle, ROOT}};
+        let d = std::env::temp_dir().join(format!("noo-node-leaves-doors-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("noomesh.yaml"),
+            format!("addons:\n  example-addon: {on}\naddon_trust:\n  example-addon:\n    registry: {ROOT}\n    keys: [k]\n"),
+        )
+        .unwrap();
+        let mut l = lock("1.0.0", &["v0.6.0"], None);
+        if worker {
+            l.images.insert("addon-worker".into(), format!("{ROOT}/worker@{}", digest('2')));
+        }
+        let f = signed_example_bundle(&l, extra);
+        let v = crate::addon_lock::verify(&f.lock, &f.sig, &anchor(), "example-addon").unwrap();
+        resolve::record(&d, "example-addon", &v, &f, "v0.6.0", None).unwrap();
+        d
+    }
+
+    fn doors_at(root: &Path, tag: &str) -> WorkloadDoors {
+        node_workload_doors_with(root, tag, &|_| Ok(crate::addons::resolve::tests::anchor()))
+    }
+
+    fn pair() -> Vec<(String, String)> {
+        vec![("example-addon".to_string(), "worker".to_string())]
+    }
+
+    /// The live gap this replaces: an enabled add-on whose verified bundle
+    /// declares a node workload yields its door, so provision issues
+    /// `svc-addon-<a>-<w>` (it issued none while this was a stub).
     #[test]
-    fn the_seam_returns_no_doors_until_the_parser_lands() {
-        assert!(node_workload_doors(Path::new("/nonexistent")).is_empty());
+    fn an_enabled_verified_bundle_declaring_a_node_workload_yields_its_door() {
+        let d = example_root("yes", true, true, &[("node-workloads.json", NW), ("routes.json", RT)]);
+        assert_eq!(doors_at(&d, "v0.6.0"), WorkloadDoors { doors: pair(), refused: vec![] });
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Check 1: only an ENABLED add-on. The same pinned bundle declared off
+    /// yields nothing.
+    #[test]
+    fn a_disabled_addon_yields_no_door() {
+        let d = example_root("off", false, true, &[("node-workloads.json", NW), ("routes.json", RT)]);
+        assert_eq!(doors_at(&d, "v0.6.0"), WorkloadDoors::default());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Check 2: the launcher's offline check. A node-workloads.json edited
+    /// after pinning, or a pin for another stack tag, yields no door and
+    /// says why.
+    #[test]
+    fn a_bundle_that_no_longer_verifies_yields_no_door_and_says_why() {
+        let d = example_root("edited", true, true, &[("node-workloads.json", NW), ("routes.json", RT)]);
+        let p = crate::addons::pins::addon_dir(&d, "example-addon").join("node-workloads.json");
+        let edited = String::from_utf8(NW.to_vec()).unwrap().replace("\"worker\"", "\"other\"");
+        std::fs::write(&p, edited).unwrap();
+        let got = doors_at(&d, "v0.6.0");
+        assert!(got.doors.is_empty(), "{got:?}");
+        assert!(got.refused.len() == 1 && got.refused[0].1.contains("do not match its signed lock"), "{got:?}");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let d = example_root("tag", true, true, &[("node-workloads.json", NW), ("routes.json", RT)]);
+        let got = doors_at(&d, "v0.6.1");
+        assert!(got.doors.is_empty(), "{got:?}");
+        assert!(got.refused.len() == 1 && got.refused[0].1.contains("pinned for stack v0.6.0"), "{got:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Check 3: only a node-workloads.json the verified lock LISTS. A valid
+    /// copy left beside a bundle that does not list one is never read.
+    #[test]
+    fn an_unlisted_node_workloads_json_beside_the_bundle_is_never_read() {
+        let d = example_root("unlisted", true, true, &[("routes.json", RT)]);
+        std::fs::write(crate::addons::pins::addon_dir(&d, "example-addon").join("node-workloads.json"), NW).unwrap();
+        assert_eq!(doors_at(&d, "v0.6.0"), WorkloadDoors::default());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Check 4: the listed file must validate against the pinned images. A
+    /// workload naming an image the lock lacks yields no door, with the
+    /// parser's code.
+    #[test]
+    fn an_invalid_node_workloads_json_yields_no_door_and_names_the_code() {
+        let d = example_root("invalid", true, false, &[("node-workloads.json", NW), ("routes.json", RT)]);
+        let got = doors_at(&d, "v0.6.0");
+        assert!(got.doors.is_empty(), "{got:?}");
+        assert!(got.refused.len() == 1 && got.refused[0].1.contains("image_not_in_lock"), "{got:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// An install with no stack tag (a development checkout) issues no
+    /// add-on door leaves.
+    #[test]
+    fn no_stack_tag_means_no_doors() {
+        let d = example_root("notag", true, true, &[("node-workloads.json", NW), ("routes.json", RT)]);
+        assert_eq!(node_workload_doors(&d), WorkloadDoors::default());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
