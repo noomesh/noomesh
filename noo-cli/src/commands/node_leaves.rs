@@ -800,28 +800,37 @@ mod tests {
     const NW: &[u8] = include_bytes!("../../../tests/fixtures/addons/rhaddon/node-workloads.json");
     const RT: &[u8] = include_bytes!("../../../tests/fixtures/addons/rhaddon/routes.json");
 
-    /// An install root with `example-addon` pinned for v0.6.0 from a signed
-    /// bundle carrying `extra`, declared `on` in noomesh.yaml and given a
-    /// trusted key (a third-party add-on). With `worker` the lock carries the
-    /// `addon-worker` image the fixture names, so a listed node-workloads.json
-    /// validates; without it the file fails `image_not_in_lock`.
-    fn example_root(tag: &str, on: bool, worker: bool, extra: &[(&str, &[u8])]) -> std::path::PathBuf {
-        use crate::addons::resolve::{self, tests::{anchor, digest, lock, signed_example_bundle, ROOT}};
+    /// An install root with `rhaddon` (the fixture's own add-on: its env keys
+    /// are `RHADDON_*`) pinned for v0.6.0 from a signed bundle of its overlay
+    /// plus `extra`, declared `on` in noomesh.yaml and given a trusted key (a
+    /// third-party add-on). With `worker` the lock carries the `addon-worker`
+    /// image the fixture names, so a listed node-workloads.json validates;
+    /// without it the file fails `image_not_in_lock`.
+    fn rh_root(tag: &str, on: bool, worker: bool, extra: &[(&str, &[u8])]) -> std::path::PathBuf {
+        use crate::addons::resolve::{self, tests::{anchor, digest, lock, seed, OVERLAY, ROOT}};
         let d = std::env::temp_dir().join(format!("noo-node-leaves-doors-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(
             d.join("noomesh.yaml"),
-            format!("addons:\n  example-addon: {on}\naddon_trust:\n  example-addon:\n    registry: {ROOT}\n    keys: [k]\n"),
+            format!("addons:\n  rhaddon: {on}\naddon_trust:\n  rhaddon:\n    registry: {ROOT}\n    keys: [k]\n"),
         )
         .unwrap();
         let mut l = lock("1.0.0", &["v0.6.0"], None);
         if worker {
             l.images.insert("addon-worker".into(), format!("{ROOT}/worker@{}", digest('2')));
         }
-        let f = signed_example_bundle(&l, extra);
-        let v = crate::addon_lock::verify(&f.lock, &f.sig, &anchor(), "example-addon").unwrap();
-        resolve::record(&d, "example-addon", &v, &f, "v0.6.0", None).unwrap();
+        l.addon = "rhaddon".into();
+        l.format = crate::addon_lock::FORMAT_V2.into();
+        let mut files = std::collections::BTreeMap::from([(crate::addon_lock::OVERLAY_FILE.to_string(), OVERLAY.as_bytes().to_vec())]);
+        for (n, b) in extra {
+            files.insert((*n).to_string(), b.to_vec());
+        }
+        l.files = files.iter().map(|(n, b)| (n.clone(), crate::addon_lock::sha256_ref(b))).collect();
+        let (lock_bytes, sig) = crate::addon_lock::sign(&l, &seed()).unwrap();
+        let f = crate::addons::lock_fetch::Fetched { lock: lock_bytes, sig, files };
+        let v = crate::addon_lock::verify(&f.lock, &f.sig, &anchor(), "rhaddon").unwrap();
+        resolve::record(&d, "rhaddon", &v, &f, "v0.6.0", None).unwrap();
         d
     }
 
@@ -830,7 +839,7 @@ mod tests {
     }
 
     fn pair() -> Vec<(String, String)> {
-        vec![("example-addon".to_string(), "worker".to_string())]
+        vec![("rhaddon".to_string(), "worker".to_string())]
     }
 
     /// The live gap this replaces: an enabled add-on whose verified bundle
@@ -838,7 +847,7 @@ mod tests {
     /// `svc-addon-<a>-<w>` (it issued none while this was a stub).
     #[test]
     fn an_enabled_verified_bundle_declaring_a_node_workload_yields_its_door() {
-        let d = example_root("yes", true, true, &[("node-workloads.json", NW), ("routes.json", RT)]);
+        let d = rh_root("yes", true, true, &[("node-workloads.json", NW), ("routes.json", RT)]);
         assert_eq!(doors_at(&d, "v0.6.0"), WorkloadDoors { doors: pair(), refused: vec![] });
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -847,7 +856,7 @@ mod tests {
     /// yields nothing.
     #[test]
     fn a_disabled_addon_yields_no_door() {
-        let d = example_root("off", false, true, &[("node-workloads.json", NW), ("routes.json", RT)]);
+        let d = rh_root("off", false, true, &[("node-workloads.json", NW), ("routes.json", RT)]);
         assert_eq!(doors_at(&d, "v0.6.0"), WorkloadDoors::default());
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -857,8 +866,8 @@ mod tests {
     /// says why.
     #[test]
     fn a_bundle_that_no_longer_verifies_yields_no_door_and_says_why() {
-        let d = example_root("edited", true, true, &[("node-workloads.json", NW), ("routes.json", RT)]);
-        let p = crate::addons::pins::addon_dir(&d, "example-addon").join("node-workloads.json");
+        let d = rh_root("edited", true, true, &[("node-workloads.json", NW), ("routes.json", RT)]);
+        let p = crate::addons::pins::addon_dir(&d, "rhaddon").join("node-workloads.json");
         let edited = String::from_utf8(NW.to_vec()).unwrap().replace("\"worker\"", "\"other\"");
         std::fs::write(&p, edited).unwrap();
         let got = doors_at(&d, "v0.6.0");
@@ -866,7 +875,7 @@ mod tests {
         assert!(got.refused.len() == 1 && got.refused[0].1.contains("do not match its signed lock"), "{got:?}");
         let _ = std::fs::remove_dir_all(&d);
 
-        let d = example_root("tag", true, true, &[("node-workloads.json", NW), ("routes.json", RT)]);
+        let d = rh_root("tag", true, true, &[("node-workloads.json", NW), ("routes.json", RT)]);
         let got = doors_at(&d, "v0.6.1");
         assert!(got.doors.is_empty(), "{got:?}");
         assert!(got.refused.len() == 1 && got.refused[0].1.contains("pinned for stack v0.6.0"), "{got:?}");
@@ -877,8 +886,8 @@ mod tests {
     /// copy left beside a bundle that does not list one is never read.
     #[test]
     fn an_unlisted_node_workloads_json_beside_the_bundle_is_never_read() {
-        let d = example_root("unlisted", true, true, &[("routes.json", RT)]);
-        std::fs::write(crate::addons::pins::addon_dir(&d, "example-addon").join("node-workloads.json"), NW).unwrap();
+        let d = rh_root("unlisted", true, true, &[("routes.json", RT)]);
+        std::fs::write(crate::addons::pins::addon_dir(&d, "rhaddon").join("node-workloads.json"), NW).unwrap();
         assert_eq!(doors_at(&d, "v0.6.0"), WorkloadDoors::default());
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -888,7 +897,7 @@ mod tests {
     /// parser's code.
     #[test]
     fn an_invalid_node_workloads_json_yields_no_door_and_names_the_code() {
-        let d = example_root("invalid", true, false, &[("node-workloads.json", NW), ("routes.json", RT)]);
+        let d = rh_root("invalid", true, false, &[("node-workloads.json", NW), ("routes.json", RT)]);
         let got = doors_at(&d, "v0.6.0");
         assert!(got.doors.is_empty(), "{got:?}");
         assert!(got.refused.len() == 1 && got.refused[0].1.contains("image_not_in_lock"), "{got:?}");
@@ -899,7 +908,7 @@ mod tests {
     /// add-on door leaves.
     #[test]
     fn no_stack_tag_means_no_doors() {
-        let d = example_root("notag", true, true, &[("node-workloads.json", NW), ("routes.json", RT)]);
+        let d = rh_root("notag", true, true, &[("node-workloads.json", NW), ("routes.json", RT)]);
         assert_eq!(node_workload_doors(&d), WorkloadDoors::default());
         let _ = std::fs::remove_dir_all(&d);
     }
