@@ -101,7 +101,8 @@ def test_every_mirrored_from_is_in_the_inventory_and_one_prefix_is_declared() ->
         assert defaults == [PREFIX], f"{f.relative_to(ROOT)}: ARG HUB_MIRROR defaults {defaults}"
         first_from = re.search(r"^FROM ", text, re.M).start()
         assert text.index("ARG HUB_MIRROR=") < first_from, f"{f}: ARG must precede the first FROM"
-    assert seen >= 7, f"only {seen} Dockerfiles use the mirror — did the parse break?"
+    # 6 since i604: nvidia-exporter moved off the Docker Hub CUDA base onto DHI.
+    assert seen >= 6, f"only {seen} Dockerfiles use the mirror — did the parse break?"
 
 
 def test_the_script_default_is_the_dockerfile_default() -> None:
