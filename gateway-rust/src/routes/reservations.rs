@@ -229,6 +229,68 @@ fn start_failure(key: &str, node: &str, e: &str) -> AppError {
     AppError::Internal(format!("{key} did not start on {node}: {e}; the GPU was released back to the pool"))
 }
 
+/// Why a placed node workload cannot be reserved on `node`, from the node's
+/// own heartbeat row for it (`record["node_workloads"]`), or `None` when the
+/// row says it can start. The agent provisions a node workload from
+/// desired-config, so a row that carries a `reason` (`door_leaf_missing`,
+/// `consent_unapproved`, …) is one its start would refuse: the agent's reason
+/// is the answer. A node that reports no row for it has not provisioned it yet.
+pub(crate) fn node_workload_refusal(record: &Value, addon: &str, name: &str, node: &str) -> Option<AppError> {
+    let key = format!("{addon}/{name}");
+    let not_yet = |detail: String| AppError::UnavailableRetry { code: "node_workloads_not_loaded", detail, retry_after_secs: 10 };
+    let Some(rows) = record.get("node_workloads").and_then(Value::as_array) else {
+        return Some(not_yet(format!("{node} has not reported its node workloads, so {key} cannot be checked there yet; retry; nothing was held")));
+    };
+    let Some(row) = rows.iter().find(|r| r.get("addon").and_then(Value::as_str) == Some(addon) && r.get("name").and_then(Value::as_str) == Some(name)) else {
+        return Some(not_yet(format!("{node} does not report {key}: it has not provisioned it yet; retry; nothing was held")));
+    };
+    if let Some(reason) = row.get("reason").and_then(Value::as_str).filter(|r| !r.is_empty()) {
+        return Some(AppError::Conflict(format!("{reason}: {node} cannot run {key} (its agent reports {reason}); nothing was held")));
+    }
+    if row.get("state").and_then(Value::as_str) == Some("needs_attention") {
+        return Some(AppError::Conflict(format!("needs_attention: {node} reports {key} as needing attention; nothing was held")));
+    }
+    None
+}
+
+/// The error for an i163 workload whose actuator status refused before any
+/// hold: `not_declared` is the agent still loading its declarations (retry);
+/// anything else is the agent's own code, and nothing was touched.
+fn preflight_failure(key: &str, node: &str, e: &str) -> AppError {
+    if e.starts_with("not_declared (404)") {
+        return AppError::UnavailableRetry {
+            code: "node_workloads_not_loaded",
+            detail: format!("{key} cannot start on {node}: the node has not loaded its workload declarations yet; retry; nothing was held"),
+            retry_after_secs: 10,
+        };
+    }
+    AppError::Conflict(format!("{e}: {key} cannot start on {node}; nothing was held"))
+}
+
+/// The checks a reservation passes before its hold, none of which changes
+/// anything on the node. A node workload: its placement is free, and the
+/// node's heartbeat row says it can start ([`node_workload_refusal`]). An i163
+/// workload: the agent's actuator status (a read) answers.
+async fn preflight(
+    link: &crate::node_link::NodeLink,
+    decl: &crate::addon_workloads::WorkloadDecl,
+    managed: Option<&Managed>,
+    record: &Value,
+    key: &str,
+    node: &str,
+) -> Result<(), AppError> {
+    if let Some(m) = managed {
+        if !m.free {
+            return Err(AppError::Conflict(format!("{key} is already reserved (its placement is not provisioned); release that reservation first; nothing was held")));
+        }
+        return match node_workload_refusal(record, &decl.addon, &decl.name, node) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        };
+    }
+    actuator(link, decl, "", json!({}), 15).await.map(|_| ()).map_err(|e| preflight_failure(key, node, &e))
+}
+
 /// Wait until the workload's container runs (and is not `starting` or
 /// `unhealthy` when it has a healthcheck). `Ok(state)` or the reason.
 async fn wait_ready(link: &crate::node_link::NodeLink, decl: &crate::addon_workloads::WorkloadDecl, timeout: std::time::Duration) -> Result<Value, String> {
@@ -276,6 +338,10 @@ async fn wait_ready(link: &crate::node_link::NodeLink, decl: &crate::addon_workl
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Managed {
     pub node: String,
+    /// The placement is `provisioned` and no reservation holds it: the only
+    /// state `set_running` takes it from. Read before the hold, so a workload
+    /// another reservation holds is refused without pausing the pool.
+    pub free: bool,
 }
 
 /// The longest a node workload's start is waited for.
@@ -356,7 +422,7 @@ async fn resolve_workload(
         set.needs.profiles.into_iter().find(|p| Some(p.name.as_str()) == row.profile.as_deref())
     });
     let need = managed_need_mb(profile.as_ref(), placement_slots(d, &row.env));
-    Ok((managed_decl(addon, d, need), Some(Managed { node: row.node_id }), managed_ready_secs(d.health.start_secs)))
+    Ok((managed_decl(addon, d, need), Some(Managed { free: row.desired_state == "provisioned" && row.reservation.is_none(), node: row.node_id }), managed_ready_secs(d.health.start_secs)))
 }
 
 // ── add-on-scoped reserve and release (i300 H5, A5) ──────────────────────
@@ -567,12 +633,13 @@ async fn take(state: Arc<AppState>, actor: String, b: Value) -> AppResult {
     let now = now_unix();
     let mut ok: Vec<(u64, String)> = Vec::new();
     let mut why: Vec<String> = Vec::new();
-    for (id, record) in node_records(&state).await {
-        if pinned.as_deref().is_some_and(|p| p != id) {
+    let records = node_records(&state).await;
+    for (id, record) in &records {
+        if pinned.as_deref().is_some_and(|p| p != id.as_str()) {
             continue;
         }
-        match eligibility(&record, &decl, now, hand_over.as_deref()) {
-            Ok(free) => ok.push((free, id)),
+        match eligibility(record, &decl, now, hand_over.as_deref()) {
+            Ok(free) => ok.push((free, id.clone())),
             Err(e) => why.push(format!("{id}: {e}")),
         }
     }
@@ -582,6 +649,13 @@ async fn take(state: Arc<AppState>, actor: String, b: Value) -> AppResult {
         return Err(AppError::Conflict(format!("{scope} can take {key}: {}", if why.is_empty() { "no node reported".to_string() } else { why.join("; ") })));
     };
     let link = crate::node_link::NodeLink::for_node(&state, &node).await?;
+
+    // Before anything on the node changes: can it run this workload at all?
+    // A refusal here takes no hold, so the pool's backends are never drained
+    // or paused for a reservation that cannot start.
+    let record = records.iter().find(|(n, _)| *n == node).map(|(_, r)| r.clone()).unwrap_or(Value::Null);
+    preflight(&link, &decl, managed.as_ref(), &record, &key, &node).await?;
+
     let id = uuid::Uuid::new_v4().to_string();
     let mut steps = json!({});
 
@@ -1350,5 +1424,81 @@ mod tests {
         let link = crate::node_link::NodeLink::for_base(&crate::upstream_body::stub_cut_short().await);
         let e = actuator(&link, &decl(true, 1), "/start", json!({}), 5).await.unwrap_err();
         assert!(e.starts_with("the voice-worker workload actuator answered HTTP 200 but its body could not be read"), "{e}");
+    }
+
+    /// The 0.6.19 live test: a placed node workload whose agent refused it
+    /// (door_leaf_missing) was reserved anyway, the hold drained and paused
+    /// vLLM, and the start then failed as node_workloads_not_loaded. The
+    /// node's own row decides first, and its reason is the answer.
+    #[test]
+    fn a_node_workload_the_agent_refused_is_refused_with_the_agents_reason() {
+        let rec = json!({"node_workloads": [
+            {"addon": "rhaddon", "name": "rhworker", "state": "provisioned", "ready": false, "door_port": 0, "reason": "door_leaf_missing"},
+            {"addon": "rhaddon", "name": "rhok", "state": "provisioned", "ready": false, "door_port": 7001}]});
+        match node_workload_refusal(&rec, "rhaddon", "rhworker", "awolf") {
+            Some(AppError::Conflict(m)) => {
+                assert!(m.starts_with("door_leaf_missing: "), "the agent's reason leads: {m}");
+                assert!(m.contains("nothing was held"), "{m}");
+            }
+            other => panic!("door_leaf_missing must refuse with the agent's reason, got {other:?}"),
+        }
+        assert!(node_workload_refusal(&rec, "rhaddon", "rhok", "awolf").is_none(), "a clean provisioned row may start");
+        let attn = json!({"node_workloads": [{"addon": "rhaddon", "name": "rhworker", "state": "needs_attention", "ready": false, "door_port": 0}]});
+        assert!(matches!(node_workload_refusal(&attn, "rhaddon", "rhworker", "awolf"), Some(AppError::Conflict(m)) if m.starts_with("needs_attention: ")));
+        for rec in [json!({"node_workloads": []}), json!({"id": "awolf"})] {
+            match node_workload_refusal(&rec, "rhaddon", "rhworker", "awolf") {
+                Some(AppError::UnavailableRetry { code, .. }) => assert_eq!(code, "node_workloads_not_loaded"),
+                other => panic!("no row is not yet provisioned (retry), got {other:?}"),
+            }
+        }
+    }
+
+    /// A refused node workload reaches nothing on the node: the link points
+    /// at a port nobody listens on, so any call would answer "unreachable".
+    #[tokio::test]
+    async fn a_refused_node_workload_reservation_calls_nothing_on_the_node() {
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", dead.local_addr().unwrap());
+        drop(dead);
+        let link = crate::node_link::NodeLink::for_base(&base);
+        let d = managed_decl("rhaddon", &nw_decl(), 0);
+        let rec = json!({"node_workloads": [{"addon": "rhaddon", "name": d.name.clone(), "state": "provisioned", "ready": false, "door_port": 0, "reason": "door_leaf_missing"}]});
+        let free = Managed { node: "awolf".into(), free: true };
+        let e = preflight(&link, &d, Some(&free), &rec, &d.key(), "awolf").await.unwrap_err();
+        assert!(e.to_string().starts_with("door_leaf_missing: "), "{e}");
+        let held = Managed { node: "awolf".into(), free: false };
+        let clean = json!({"node_workloads": [{"addon": "rhaddon", "name": d.name.clone(), "state": "provisioned", "ready": false, "door_port": 1}]});
+        let e = preflight(&link, &d, Some(&held), &clean, &d.key(), "awolf").await.unwrap_err();
+        assert!(e.to_string().contains("already reserved"), "{e}");
+        assert!(preflight(&link, &d, Some(&free), &clean, &d.key(), "awolf").await.is_ok(), "a free, clean row passes without a call");
+    }
+
+    /// An i163 workload: the agent's status (a read) answers before the hold.
+    #[tokio::test]
+    async fn an_i163_workload_the_agent_does_not_declare_is_refused_before_the_hold() {
+        let link = crate::node_link::NodeLink::for_base(&crate::upstream_body::stub("404 Not Found", None, b"{\"error\":\"not_declared\",\"detail\":\"no bundle\"}").await);
+        match preflight(&link, &decl(true, 1), None, &json!({}), "pai-voice/voice-worker", "awolf").await {
+            Err(AppError::UnavailableRetry { code, detail, .. }) => {
+                assert_eq!(code, "node_workloads_not_loaded");
+                assert!(detail.contains("nothing was held"), "{detail}");
+            }
+            other => panic!("not_declared before the hold is a retry, got {other:?}"),
+        }
+        let link = crate::node_link::NodeLink::for_base(&crate::upstream_body::stub("404 Not Found", None, b"{\"error\":\"no_container\",\"detail\":\"gone\"}").await);
+        let e = preflight(&link, &decl(true, 1), None, &json!({}), "pai-voice/voice-worker", "awolf").await.unwrap_err();
+        assert!(matches!(&e, AppError::Conflict(m) if m.starts_with("no_container (404)")), "{e:?}");
+    }
+
+    /// The order in take(): the preflight runs before the hand-over's drain
+    /// and before the hold, and its refusal returns at once (`?`). A refused
+    /// reservation therefore never drains or pauses the pool.
+    #[test]
+    fn the_preflight_runs_before_anything_touches_the_pool() {
+        let own = crate::test_src::own_code(include_str!("reservations.rs"));
+        let take = crate::test_src::fn_body(&own, "async fn take(");
+        let pre = take.find("preflight(&link, &decl, managed.as_ref(), &record, &key, &node).await?;").expect("the preflight, returning at once");
+        let hold = take.find("gpu_hold_op(").expect("the hold");
+        let handover = take.find("drain_and_stop(").expect("the hand-over");
+        assert!(pre < hold && pre < handover, "preflight first");
     }
 }
