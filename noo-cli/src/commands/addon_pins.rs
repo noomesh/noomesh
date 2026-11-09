@@ -373,7 +373,61 @@ pub(crate) fn verify_one(
         v.problem = Some(e);
         return v;
     }
-    for (name, r) in &pin.local_images() {
+    let roles = files
+        .get("docker-compose.yml")
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .map(|t| service_images(t, &pin.images))
+        .unwrap_or_default();
+    check_running(&pin.local_images(), &roles, docker, running, &mut v);
+    v.pin = Some(pin);
+    v
+}
+
+/// Each service of an add-on overlay whose `image:` reads one of this pin's
+/// image variables (`${NOO_ADDON_IMAGE_<KEY>…}`), mapped to that image's
+/// name in the pin. A service whose image is anything else is left out. Pure.
+pub(crate) fn service_images(
+    overlay: &str,
+    images: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    let by_var: std::collections::BTreeMap<String, &String> =
+        images.keys().filter_map(|n| pins::image_env_var(n).map(|v| (v, n))).collect();
+    let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(overlay) else { return Default::default() };
+    let Some(services) = doc.get("services").and_then(serde_yaml::Value::as_mapping) else { return Default::default() };
+    services
+        .iter()
+        .filter_map(|(k, svc)| {
+            let image = svc.get("image")?.as_str()?.trim().strip_prefix("${")?;
+            let var: String = image.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            Some((k.as_str()?.to_string(), (*by_var.get(&var)?).clone()))
+        })
+        .collect()
+}
+
+/// The running containers `image` is compared with: every container except
+/// those whose service the overlay gives ANOTHER image of the pin. Two images
+/// of one pin may share a repository (an add-on's CPU and worker builds), and
+/// each service is held to its own image. A container whose service declares
+/// no image of this pin (no label, or not in the overlay) is compared with
+/// every image, as before; it is never skipped. Pure.
+pub(crate) fn role_candidates(
+    image: &str,
+    roles: &std::collections::BTreeMap<String, String>,
+    running: &[resolve::Container],
+) -> Vec<resolve::Container> {
+    running.iter().filter(|c| roles.get(&c.service).is_none_or(|own| own == image)).cloned().collect()
+}
+
+/// The running-state half of [`verify_one`]: each local image against the
+/// containers [`role_candidates`] gives it.
+fn check_running(
+    images: &std::collections::BTreeMap<String, String>,
+    roles: &std::collections::BTreeMap<String, String>,
+    docker: &mut dyn resolve::Docker,
+    running: &[resolve::Container],
+    v: &mut Verdict,
+) {
+    for (name, r) in images {
         let pinned_id = if docker.image_present(r) {
             match docker.image_id(r) {
                 Ok(id) => Some(id),
@@ -386,7 +440,7 @@ pub(crate) fn verify_one(
             v.problem = Some(format!("{r} is not in the local image store"));
             None
         };
-        match resolve::running_state(r, pinned_id.as_deref(), running) {
+        match resolve::running_state(r, pinned_id.as_deref(), &role_candidates(name, roles, running)) {
             resolve::Running::Pinned(_) => {}
             resolve::Running::Drift(d) => {
                 let who: Vec<String> = d.iter().map(|(n, why)| format!("{n} {why}")).collect();
@@ -395,8 +449,6 @@ pub(crate) fn verify_one(
             resolve::Running::Absent => v.notes.push(format!("{name} is not running")),
         }
     }
-    v.pin = Some(pin);
-    v
 }
 
 /// A third-party add-on's registry credential as `verify` reports it.
@@ -790,6 +842,7 @@ mod tests {
     }
 
     use crate::addons::resolve::tests::{anchor, lock, signed, signed_bundle, FakeDocker, OVERLAY, ROOT};
+    use std::collections::BTreeMap;
 
     fn scratch(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("noo-addon-pins-cmd-{}-{tag}", std::process::id()));
@@ -923,7 +976,7 @@ mod tests {
         let names = vec!["trellion_intel".to_string()];
         let lines = launch_lines(&d, "v0.6.0", &names, &|_| Ok(a.clone()));
         assert_eq!(lines, ["verified trellion_intel 1.2.0 v0.6.0".to_string(), format!("pin trellion_intel NOO_ADDON_IMAGE_TRELLION_INTEL {local}")]);
-        let running = vec![resolve::Container { name: "noo-trellion-intel".into(), config_image: local.clone(), image_id: "sha256:x".into() }];
+        let running = vec![resolve::Container { name: "noo-trellion-intel".into(), config_image: local.clone(), image_id: "sha256:x".into(), service: String::new() }];
         let mut docker = FakeDocker { local: vec![local.clone()], ids: vec![(local.clone(), "sha256:x".into())], ..Default::default() };
         let verdict = verify_one(&d, "trellion_intel", "v0.6.0", Ok(a.clone()), &mut docker, &running);
         assert!(verdict.problem.is_none() && verdict.notes.is_empty(), "{verdict:?}");
@@ -1053,7 +1106,7 @@ mod tests {
         // What `docker inspect` reports for a container the launcher created
         // from the digest-only pin (`docker ps` would print just the repo).
         let running = |config_image: &str, image_id: &str| {
-            vec![resolve::Container { name: "noo-trellion-intel".into(), config_image: config_image.into(), image_id: image_id.into() }]
+            vec![resolve::Container { name: "noo-trellion-intel".into(), config_image: config_image.into(), image_id: image_id.into(), service: String::new() }]
         };
         let ok = verify_one(&d, "trellion_intel", "v0.6.0", Ok(anchor()), &mut docker, &running(&reference, &id));
         assert!(ok.problem.is_none() && ok.notes.is_empty(), "{ok:?}");
@@ -1081,6 +1134,107 @@ mod tests {
 
         let no_anchor = verify_one(&d, "trellion_intel", "v0.6.0", Err(resolve::Refusal::NoAnchor), &mut docker, &[]);
         assert!(no_anchor.problem.unwrap().contains("names no signing key"));
+    }
+
+    /// An add-on shipping two images from ONE repository (a CPU build and a
+    /// worker build), one service each: the 0.6.19 roll's shape, with
+    /// fictional names. Returns the pin's images, the overlay roles, a docker
+    /// holding both, and the two containers as the launcher runs them.
+    fn two_images_one_repo() -> (BTreeMap<String, String>, BTreeMap<String, String>, FakeDocker, Vec<resolve::Container>) {
+        let repo = "ghcr.io/example/rh-voice";
+        let (cpu, worker) = (format!("{repo}@sha256:{}", "1".repeat(64)), format!("{repo}@sha256:{}", "2".repeat(64)));
+        let (cpu_id, worker_id) = (format!("sha256:{}", "a".repeat(64)), format!("sha256:{}", "b".repeat(64)));
+        let images: BTreeMap<String, String> =
+            [("rh-voice".to_string(), cpu.clone()), ("rh-voice-worker".to_string(), worker.clone())].into();
+        let overlay = "services:\n  noo-rh-voice:\n    image: ${NOO_ADDON_IMAGE_RH_VOICE:-x}\n  noo-rh-voice-coordinator:\n    image: ${NOO_ADDON_IMAGE_RH_VOICE_WORKER:-x}\n  sidecar:\n    image: busybox\n";
+        let roles = service_images(overlay, &images);
+        let docker = FakeDocker {
+            local: vec![cpu.clone(), worker.clone()],
+            ids: vec![(cpu.clone(), cpu_id.clone()), (worker.clone(), worker_id.clone())],
+            ..Default::default()
+        };
+        let c = |name: &str, svc: &str, image: &str, id: &str| resolve::Container {
+            name: name.into(),
+            config_image: image.into(),
+            image_id: id.into(),
+            service: svc.into(),
+        };
+        let running = vec![
+            c("noo-rh-voice", "noo-rh-voice", &cpu, &cpu_id),
+            c("noo-rh-voice-coordinator", "noo-rh-voice-coordinator", &worker, &worker_id),
+        ];
+        (images, roles, docker, running)
+    }
+
+    fn verdict() -> Verdict {
+        Verdict { addon: "rh-voice".into(), pin: None, problem: None, notes: Vec::new() }
+    }
+
+    #[test]
+    fn the_overlay_maps_each_service_to_its_pinned_image() {
+        let (_, roles, _, _) = two_images_one_repo();
+        let want: BTreeMap<String, String> = [
+            ("noo-rh-voice".to_string(), "rh-voice".to_string()),
+            ("noo-rh-voice-coordinator".to_string(), "rh-voice-worker".to_string()),
+        ]
+        .into();
+        assert_eq!(roles, want, "a service with no pinned image variable has no role");
+    }
+
+    #[test]
+    fn two_pinned_images_of_one_repository_both_running_pass() {
+        let (images, roles, mut docker, running) = two_images_one_repo();
+        let mut v = verdict();
+        check_running(&images, &roles, &mut docker, &running, &mut v);
+        assert!(v.problem.is_none() && v.notes.is_empty(), "{v:?}");
+    }
+
+    #[test]
+    fn a_service_on_an_unpinned_digest_of_the_repository_still_fails() {
+        let (images, roles, mut docker, mut running) = two_images_one_repo();
+        running[0].config_image = format!("ghcr.io/example/rh-voice@sha256:{}", "9".repeat(64));
+        let mut v = verdict();
+        check_running(&images, &roles, &mut docker, &running, &mut v);
+        let why = v.problem.expect("an unpinned digest must fail");
+        assert!(why.contains("not the pinned image") && why.contains("noo-rh-voice runs"), "{why}");
+    }
+
+    #[test]
+    fn a_service_running_its_siblings_pinned_image_still_fails() {
+        // Both digests are pinned, but each service is held to its own role.
+        let (images, roles, mut docker, mut running) = two_images_one_repo();
+        let (worker, worker_id) = (running[1].config_image.clone(), running[1].image_id.clone());
+        running[0].config_image = worker;
+        running[0].image_id = worker_id;
+        let mut v = verdict();
+        check_running(&images, &roles, &mut docker, &running, &mut v);
+        let why = v.problem.expect("a role swap must fail");
+        assert!(why.contains("not the pinned image") && why.contains("noo-rh-voice runs"), "{why}");
+    }
+
+    #[test]
+    fn a_container_with_no_role_is_still_compared_with_every_image() {
+        // No compose label (or a service the overlay does not give a pinned
+        // image): never skipped. On an unpinned digest it fails.
+        let (images, roles, mut docker, mut running) = two_images_one_repo();
+        running.push(resolve::Container {
+            name: "stray".into(),
+            config_image: format!("ghcr.io/example/rh-voice@sha256:{}", "9".repeat(64)),
+            image_id: format!("sha256:{}", "c".repeat(64)),
+            service: String::new(),
+        });
+        let mut v = verdict();
+        check_running(&images, &roles, &mut docker, &running, &mut v);
+        let why = v.problem.expect("a container with no role must still be compared");
+        assert!(why.contains("stray runs"), "{why}");
+    }
+
+    #[test]
+    fn inspect_reads_the_compose_service_label() {
+        let line = "/noo-rh-voice\tghcr.io/example/rh-voice@sha256:11\tsha256:aa\tnoo-rh-voice\n/other\tbusybox\tsha256:bb\t\n";
+        let got = resolve::parse_inspect(line).unwrap();
+        assert_eq!((got[0].service.as_str(), got[1].service.as_str()), ("noo-rh-voice", ""));
+        assert!(resolve::INSPECT_FORMAT.ends_with("{{index .Config.Labels \"com.docker.compose.service\"}}"));
     }
 
     fn input<'a>(root: &'a std::path::Path, dist: bool, addons: &[&str]) -> PinEnvInput<'a> {

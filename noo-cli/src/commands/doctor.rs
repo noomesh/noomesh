@@ -958,15 +958,38 @@ fn declared_services(
             .collect())
     };
 
-    let profiles = run(base(&["config", "--profiles"]))?;
-    let mut with_profiles: Vec<&str> = Vec::new();
-    for p in &profiles {
-        with_profiles.push("--profile");
-        with_profiles.push(p);
+    Ok(projected_services(&|extra| run(base(extra)))?.into_iter().collect())
+}
+
+/// One `docker compose` call, given its trailing arguments: the lines it
+/// printed, or why it failed.
+pub(crate) type ComposeCall<'a> = &'a dyn Fn(&[&str]) -> Result<Vec<String>, String>;
+
+/// The services the project's files declare, given `compose` (one
+/// `docker compose` call with these trailing arguments). First interpolated,
+/// across every profile `config --profiles` names. When that fails, once
+/// more with `config --no-interpolate --services`: an add-on overlay can
+/// require a variable only the launcher sets at launch time (a broker
+/// secrets dir, `${X:?…}`), and a service NAME is never interpolated.
+/// Without interpolation compose lists profile-gated services too (compose
+/// v5.0.2), and `--no-interpolate --profiles` fails on unparsed values, so
+/// the fallback does not use it. When both fail, the first reason is kept.
+pub(crate) fn projected_services(compose: ComposeCall<'_>) -> Result<Vec<String>, String> {
+    let interpolated = || -> Result<Vec<String>, String> {
+        let profiles = compose(&["config", "--profiles"])?;
+        let mut with_profiles: Vec<&str> = Vec::new();
+        for p in &profiles {
+            with_profiles.push("--profile");
+            with_profiles.push(p);
+        }
+        with_profiles.push("config");
+        with_profiles.push("--services");
+        compose(&with_profiles)
+    };
+    match interpolated() {
+        Ok(s) => Ok(s),
+        Err(why) => compose(&["config", "--no-interpolate", "--services"]).map_err(|_| why),
     }
-    with_profiles.push("config");
-    with_profiles.push("--services");
-    Ok(run(base(&with_profiles))?.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -1002,6 +1025,42 @@ mod orphan_tests {
     #[test]
     fn a_short_row_is_not_guessed_at() {
         assert!(parse_ps_row("noo-gateway\tnoomesh\tgateway").is_none());
+    }
+
+    /// A fake `docker compose` over an add-on overlay that requires a
+    /// launch-time variable: every interpolated call fails the way compose
+    /// does, and `--no-interpolate` lists the services.
+    fn needs_launch_vars(extra: &[&str]) -> Result<Vec<String>, String> {
+        if extra.contains(&"--no-interpolate") {
+            return Ok(vec!["gateway".into(), "noo-rh-voice".into(), "noo-rh-voice-coordinator".into()]);
+        }
+        Err("required variable RH_VOICE_COORDINATOR_SECRETS_DIR is missing a value".into())
+    }
+
+    #[test]
+    fn a_projection_needing_launch_time_vars_is_still_computed_and_finds_a_real_orphan() {
+        let declared: BTreeSet<String> = projected_services(&needs_launch_vars).unwrap().into_iter().collect();
+        assert!(declared.contains("noo-rh-voice-coordinator"), "{declared:?}");
+        let running = vec![
+            parse_ps_row(&row("noo-rh-voice-coordinator", "noomesh", "noo-rh-voice-coordinator")).unwrap(),
+            parse_ps_row(&row("noo-old", "noomesh", "old")).unwrap(),
+        ];
+        let names: Vec<&str> = orphans_of(&running, &declared).iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["noo-old"]);
+    }
+
+    #[test]
+    fn the_interpolated_projection_comes_first_and_both_failing_keeps_its_reason() {
+        let interpolated = |extra: &[&str]| -> Result<Vec<String>, String> {
+            match extra {
+                ["config", "--profiles"] => Ok(vec!["gpu".into()]),
+                ["--profile", "gpu", "config", "--services"] => Ok(vec!["gateway".into()]),
+                _ => Err(format!("unexpected call {extra:?}")),
+            }
+        };
+        assert_eq!(projected_services(&interpolated).unwrap(), ["gateway"]);
+        let broken = |_: &[&str]| -> Result<Vec<String>, String> { Err("yaml: line 3: bad".into()) };
+        assert_eq!(projected_services(&broken).unwrap_err(), "yaml: line 3: bad");
     }
 
     /// The 2026-09-13 finding, as an assertion.
