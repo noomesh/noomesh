@@ -221,12 +221,13 @@ fn digest_in(detail: &str) -> Option<String> {
 /// For `consent_none` / `consent_unapproved` only: the approval happens on the
 /// node itself. Plain prose (no backticks, not starting with the binary
 /// name), because the node-side command lives in another branch and the hint
-/// lint checks suggested commands against usage.rs.
+/// lint checks suggested commands against usage.rs. `noo` is passed to sudo
+/// by its full path: root's PATH usually lacks `~/.local/bin`.
 pub(crate) fn approve_hint(code: &str, node: &str, addon: &str, detail: &str) -> Option<String> {
     match code {
         "consent_unapproved" => {
             let digest = digest_in(detail).unwrap_or_else(|| "<digest>".to_string());
-            Some(format!("on {node}, run: sudo noo node workloads approve {addon} {digest}"))
+            Some(format!("on {node}, run: sudo \"$(command -v noo)\" node workloads approve {addon} {digest}"))
         }
         // Unset is approve (i573): none is the owner's explicit kill switch,
         // or an agent too old to report its policy (the gateway says which).
@@ -524,7 +525,7 @@ mod tests {
     fn the_approve_hint_appears_for_consent_codes_only() {
         let detail = "rhaddon at sha256:0123abcdef9876 is not approved on the node";
         let hint = approve_hint("consent_unapproved", "awolf", "rhaddon", detail).expect("hint");
-        assert_eq!(hint, "on awolf, run: sudo noo node workloads approve rhaddon sha256:0123abcdef9876");
+        assert_eq!(hint, "on awolf, run: sudo \"$(command -v noo)\" node workloads approve rhaddon sha256:0123abcdef9876");
         assert!(!hint.starts_with("noo ") && !hint.contains('`'), "plain prose, outside the hint lint");
         let bare = approve_hint("consent_unapproved", "awolf", "rhaddon", "no approval recorded").expect("hint");
         assert!(bare.ends_with("approve rhaddon <digest>"), "{bare}");

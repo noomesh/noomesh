@@ -573,7 +573,7 @@ The agent's fixed vocabulary for the `reason` of a `node_workloads` or
 | `profile_invalid` | the entry's `profile` is missing, not one of the main set's profiles, or not realtime-capable for a realtime workload | fix the placement's profile |
 | `disk` | the data root lacks space for the set or the scratch plus the margin | free space on the node |
 | `consent_none` | the node's owner set `NOO_ADDON_WORKLOADS=none` (the kill switch) | only the node's owner can unset it |
-| `consent_unapproved` | policy is `approve` (the default) and this add-on and digest are not approved | on the node: `sudo noo node workloads approve <addon> <digest>` |
+| `consent_unapproved` | policy is `approve` (the default) and this add-on and digest are not approved | on the node: `sudo "$(command -v noo)" node workloads approve <addon> <digest>` |
 | `nvidia_runtime_missing` | `accel.gpu` > 0 and the nvidia runtime is not registered | install the NVIDIA container toolkit |
 | `driver_caps_missing` | the driver cannot grant `compute,utility` | fix the driver or toolkit |
 | `compute_cap_low` | the GPU's compute capability is below the set's `min_compute` | place on a newer GPU |
@@ -600,9 +600,12 @@ The placement facts (`consent_none`, `consent_unapproved`, `nvidia_runtime_missi
   rewritten on every roll, so a hand-set policy did not last; an approval
   does.)
 - The node's owner approves, revokes and lists on the node itself, as root:
-  `sudo noo node workloads approve <addon> <digest>`,
-  `sudo noo node workloads revoke <addon> <digest>`,
-  `sudo noo node workloads list`. The digest is the one the placement's
+  `sudo "$(command -v noo)" node workloads approve <addon> <digest>`,
+  `sudo "$(command -v noo)" node workloads revoke <addon> <digest>`,
+  `sudo "$(command -v noo)" node workloads list`. `noo` goes to sudo by its
+  full path because root's PATH often lacks the directory it is installed
+  in (such as `~/.local/bin`); run as yourself, the verb refuses and prints
+  the exact command to run. The digest is the one the placement's
   `consent_unapproved` refusal names. The controller has no way to approve:
   nothing it can call writes the store.
 - Approvals live in `addon-workload-approvals.json` in the agent state
