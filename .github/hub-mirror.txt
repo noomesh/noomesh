@@ -23,8 +23,8 @@ library/rust:1-bookworm                                        scripts/cargo-doc
 library/ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852                                           ci.yml standalone-smoke (the no-Python container)
 library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc                                            scripts/test-rotation-rehearsal.sh (ci.yml standalone-smoke, NOO_REHEARSAL_IMAGE)
 library/python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159                                       Dockerfile (ci.yml build)
-library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b  docker/Dockerfile.whisper, docker/Dockerfile.piper
-library/alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8  docker/Dockerfile.stunnel
+library/python:3.12-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df  docker/Dockerfile.whisper, docker/Dockerfile.piper
+library/alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f  docker/Dockerfile.stunnel
 library/alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f                                            docker/Dockerfile.node-agent-prebuilt, docker/Dockerfile.node-agent-go (gcompat stage)
 library/alpine:latest                                          workspace-reclaim steps (`docker run alpine`, before checkout; local image first)
 nvidia/cuda:12.2.0-base-ubuntu22.04@sha256:ecdf8549dd5f12609e365217a64dedde26ecda26da8f3ff3f82def6749f53051                            docker/Dockerfile.nvidia-exporter
