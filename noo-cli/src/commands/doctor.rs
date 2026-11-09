@@ -1059,7 +1059,16 @@ mod orphan_tests {
             }
         };
         assert_eq!(projected_services(&interpolated).unwrap(), ["gateway"]);
-        let broken = |_: &[&str]| -> Result<Vec<String>, String> { Err("yaml: line 3: bad".into()) };
+        // Both fail, each with its OWN reason: the interpolated one (it names
+        // what is missing) is reported, never the fallback's (i601: one
+        // shared message could not tell them apart, and q13 survived).
+        let broken = |extra: &[&str]| -> Result<Vec<String>, String> {
+            if extra.contains(&"--no-interpolate") {
+                Err("no-interpolate: unknown flag".into())
+            } else {
+                Err("yaml: line 3: bad".into())
+            }
+        };
         assert_eq!(projected_services(&broken).unwrap_err(), "yaml: line 3: bad");
     }
 
